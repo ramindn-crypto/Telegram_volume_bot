@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Telegram bot: CoinEx spot+futures USD-volume screener with 3 priorities
+Telegram bot: CoinEx spot+futures USD-volume screener with 3 priorities (robust volumes)
 
 Priorities (all returned in one /screen):
-  P1: Futures >= $5,000,000 AND Spot >= $500,000   (sorted by Futures USD vol)
-  P2: Futures >= $2,000,000                        (sorted by Futures USD vol) [excluding P1 coins]
-  P3: Spot    >= $1,000,000                        (sorted by Spot USD vol)    [excluding P1 & P2 coins]
+  P1: Futures >= $5,000,000 AND Spot >= $500,000   (sorted by Futures USD)
+  P2: Futures >= $2,000,000                        (sorted by Futures USD) [excluding P1]
+  P3: Spot    >= $1,000,000                        (sorted by Spot USD)    [excluding P1 & P2]
 
 Commands:
   /start
@@ -30,13 +30,14 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ---- Defaults (USD) ----
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "coinex").lower()
-P1_SPOT_MIN = float(os.getenv("SPOT_MIN_USD", 500_000))   # P1 spot threshold
-P1_FUT_MIN  = float(os.getenv("FUTURES_MIN_USD", 5_000_000))  # P1 futures threshold
+P1_SPOT_MIN = float(os.getenv("SPOT_MIN_USD", 500_000))      # P1 spot threshold
+P1_FUT_MIN  = float(os.getenv("FUTURES_MIN_USD", 5_000_000)) # P1 futures threshold
 P2_FUT_MIN  = float(os.getenv("FUTURES_MIN_USD_P2", 2_000_000))  # P2 futures-only threshold
 P3_SPOT_MIN = float(os.getenv("SPOT_MIN_USD_P3", 1_000_000))     # P3 spot-only threshold
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
+# Treat these quotes as USD-like
 STABLES = {"USD", "USDT", "USDC", "TUSD", "FDUSD", "USDD", "USDE", "DAI", "PYUSD"}
 
 @dataclass
@@ -46,7 +47,8 @@ class MarketVol:
     quote: str
     last: float
     base_vol: float
-    quote_vol: float  # in quote units; for stable quotes, treat as USD
+    quote_vol: float  # as reported by ccxt (may be 0/missing)
+    vwap: float       # may be None/0 in some exchanges
 
 def safe_split_symbol(sym: Optional[str]) -> Optional[Tuple[str, str]]:
     """Return (base, quote) if symbol looks like 'BASE/QUOTE[:QUOTE]'; else None."""
@@ -66,10 +68,25 @@ def to_marketvol(t: dict) -> Optional[MarketVol]:
     if not split:
         return None
     base, quote = split
+    # pull fields safely
     last = float(t.get("last") or t.get("close") or 0.0)
     base_vol = float(t.get("baseVolume") or 0.0)
     quote_vol = float(t.get("quoteVolume") or 0.0)
-    return MarketVol(symbol=sym, base=base, quote=quote, last=last, base_vol=base_vol, quote_vol=quote_vol)
+    vwap = float(t.get("vwap") or 0.0)
+    return MarketVol(symbol=sym, base=base, quote=quote, last=last, base_vol=base_vol, quote_vol=quote_vol, vwap=vwap)
+
+def usd_notional(mv: MarketVol) -> float:
+    """
+    Robust USD-like 24h notional:
+    - prefer quote_vol when quote is USD-like and > 0
+    - else fallback to base_vol * (vwap or last)
+    """
+    # if stable-quoted and quote_volume present, use it
+    if mv.quote in STABLES and mv.quote_vol and mv.quote_vol > 0:
+        return mv.quote_vol
+    # fallback: baseVolume * price
+    price = mv.vwap if mv.vwap and mv.vwap > 0 else mv.last
+    return float(mv.base_vol * price) if price and mv.base_vol else 0.0
 
 def fmt_money(x: float) -> str:
     try:
@@ -78,7 +95,7 @@ def fmt_money(x: float) -> str:
         return str(x)
 
 def load_best_by_base() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol]]:
-    """Return (best_spot_by_base, best_futures_by_base), keeping highest quote_vol per base."""
+    """Return (best_spot_by_base, best_futures_by_base), keeping HIGHEST USD notional per base."""
     # Spot
     spot = ccxt.__dict__[EXCHANGE_ID]({"enableRateLimit": True, "options": {"defaultType": "spot"}})
     spot.load_markets()
@@ -90,10 +107,11 @@ def load_best_by_base() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol]]:
             mv = to_marketvol(t)
             if not mv:
                 continue
-            if mv.quote not in STABLES:  # keep USD-like quotes only
+            # Keep only USD-like quotes for spot to avoid weird conversions
+            if mv.quote not in STABLES:
                 continue
-            prev = best_spot.get(mv.base)
-            if prev is None or mv.quote_vol > prev.quote_vol:
+            # Keep max USD notional per base
+            if (prev := best_spot.get(mv.base)) is None or usd_notional(mv) > usd_notional(prev):
                 best_spot[mv.base] = mv
         except Exception:
             continue
@@ -109,10 +127,8 @@ def load_best_by_base() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol]]:
             mv = to_marketvol(t)
             if not mv:
                 continue
-            if mv.quote not in STABLES:
-                continue
-            prev = best_fut.get(mv.base)
-            if prev is None or mv.quote_vol > prev.quote_vol:
+            # For linear swaps on CoinEx, quote should be USDT/USDC; still compute USD notional robustly
+            if (prev := best_fut.get(mv.base)) is None or usd_notional(mv) > usd_notional(prev):
                 best_fut[mv.base] = mv
         except Exception:
             continue
@@ -132,33 +148,39 @@ def build_priorities(
     for base in sorted(set(best_spot.keys()) & set(best_fut.keys())):
         s = best_spot[base]
         f = best_fut[base]
-        if f.quote_vol >= p1_fut_min and s.quote_vol >= p1_spot_min:
-            p1.append([base, f.symbol, f.quote_vol, s.symbol, s.quote_vol, f.last or s.last])
-    # sort by futures USD volume desc
+        fut_usd = usd_notional(f)
+        spot_usd = usd_notional(s)
+        if fut_usd >= p1_fut_min and spot_usd >= p1_spot_min:
+            p1.append([base, f.symbol, fut_usd, s.symbol, spot_usd, f.last or s.last])
     p1.sort(key=lambda r: r[2], reverse=True)
 
     used_bases = {row[0] for row in p1}
 
-    # Priority 2: futures-only >= p2_fut_min (exclude P1 bases)
+    # Priority 2: futures-only >= p2_fut_min (exclude P1)
     p2 = []
     for base, f in best_fut.items():
         if base in used_bases:
             continue
-        if f.quote_vol >= p2_fut_min:
+        fut_usd = usd_notional(f)
+        if fut_usd >= p2_fut_min:
             s = best_spot.get(base)
-            p2.append([base, f.symbol, f.quote_vol, s.symbol if s else "-", s.quote_vol if s else 0.0, f.last])
+            spot_sym = s.symbol if s else "-"
+            spot_usd = usd_notional(s) if s else 0.0
+            p2.append([base, f.symbol, fut_usd, spot_sym, spot_usd, f.last])
     p2.sort(key=lambda r: r[2], reverse=True)
     used_bases.update({row[0] for row in p2})
 
-    # Priority 3: spot-only >= p3_spot_min (exclude P1 & P2 bases)
+    # Priority 3: spot-only >= p3_spot_min (exclude P1 & P2)
     p3 = []
     for base, s in best_spot.items():
         if base in used_bases:
             continue
-        if s.quote_vol >= p3_spot_min:
+        spot_usd = usd_notional(s)
+        if spot_usd >= p3_spot_min:
             f = best_fut.get(base)
-            p3.append([base, f.symbol if f else "-", f.quote_vol if f else 0.0, s.symbol, s.quote_vol, s.last])
-    # sort by spot USD volume desc (index 4)
+            fut_sym = f.symbol if f else "-"
+            fut_usd = usd_notional(f) if f else 0.0
+            p3.append([base, fut_sym, fut_usd, s.symbol, spot_usd, s.last])
     p3.sort(key=lambda r: r[4], reverse=True)
 
     return p1, p2, p3
@@ -171,7 +193,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Priority 2: Futures ≥ $2M (ignore spot)\n"
         "• Priority 3: Spot ≥ $1M (ignore futures)\n\n"
         "Use /screen to get all three, sorted by USD volume.\n"
-        "You can override thresholds e.g. `/screen spot=600000 fut=7000000 fut2=3000000`"
+        "Overrides: `/screen spot=600000 fut=7000000 fut2=3000000 spot3=1200000`"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
