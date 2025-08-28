@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
 Telegram bot: CoinEx screener with 3 priorities
-- /screen → shows tables in chat (SYMBOL + USD amount, 10 rows max per priority)
-- /excel → sends an Excel .xlsx file for Excel (priority,symbol,usd_24h)
+- /screen → shows tables in chat (SYMBOL + USD amount, max 10 rows per priority)
+- /excel  → sends an Excel .xlsx file for Excel (priority,symbol,usd_24h)
+
+Priorities:
+  P1: Futures >= $5,000,000 AND Spot >= $500,000
+  P2: Futures >= $2,000,000  (ignore spot)
+  P3: Spot    >= $1,000,000  (ignore futures)
 """
 
 import asyncio, logging, os, time, io
@@ -87,34 +92,39 @@ def load_best() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol]]:
     return best_spot,best_fut
 
 def build_priorities(best_spot,best_fut):
-    p1,p2,p3=[],[],[]
-    # P1
+    # Build full lists
+    p1_full,p2_full,p3_full=[],[],[]
+
+    # Priority 1
     for base in set(best_spot)&set(best_fut):
         s,f=best_spot[base],best_fut[base]
-        fut_usd=usd_notional(f); spot_usd=usd_notional(s)
+        fut_usd,spot_usd=usd_notional(f),usd_notional(s)
         if fut_usd>=P1_FUT_MIN and spot_usd>=P1_SPOT_MIN:
-            p1.append([base,fut_usd])
-    p1.sort(key=lambda r:r[1],reverse=True)
-    used={r[0] for r in p1}
+            p1_full.append([base,fut_usd])
+    p1_full.sort(key=lambda r:r[1],reverse=True)
+    p1=p1_full[:TOP_N]
+    used={r[0] for r in p1}  # exclude only what we actually show
 
-    # P2
+    # Priority 2
     for base,f in best_fut.items():
         if base in used: continue
         fut_usd=usd_notional(f)
         if fut_usd>=P2_FUT_MIN:
-            p2.append([base,fut_usd])
-    p2.sort(key=lambda r:r[1],reverse=True)
+            p2_full.append([base,fut_usd])
+    p2_full.sort(key=lambda r:r[1],reverse=True)
+    p2=p2_full[:TOP_N]
     used.update({r[0] for r in p2})
 
-    # P3
+    # Priority 3
     for base,s in best_spot.items():
         if base in used: continue
         spot_usd=usd_notional(s)
         if spot_usd>=P3_SPOT_MIN:
-            p3.append([base,spot_usd])
-    p3.sort(key=lambda r:r[1],reverse=True)
+            p3_full.append([base,spot_usd])
+    p3_full.sort(key=lambda r:r[1],reverse=True)
+    p3=p3_full[:TOP_N]
 
-    return p1[:TOP_N],p2[:TOP_N],p3[:TOP_N]
+    return p1,p2,p3
 
 def fmt_table(rows: List[List], title: str) -> str:
     if not rows: return f"*{title}*: _None_\n"
@@ -150,6 +160,7 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         best_spot,best_fut=await asyncio.to_thread(load_best)
         p1,p2,p3=build_priorities(best_spot,best_fut)
 
+        from openpyxl import Workbook
         wb = Workbook()
         ws = wb.active
         ws.title = "Screener"
