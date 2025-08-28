@@ -20,7 +20,7 @@ P1_SPOT_MIN = 500_000      # Priority 1 spot
 P1_FUT_MIN  = 5_000_000    # Priority 1 futures
 P2_FUT_MIN  = 2_000_000    # Priority 2 futures
 P3_SPOT_MIN = 1_000_000    # Priority 3 spot
-TOP_N       = 10
+TOP_N       = 15
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 EXCHANGE_ID = "coinex"
