@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram bot: CoinEx spot+futures USD-volume screener (Render-friendly)
+Telegram bot: CoinEx spot+futures USD-volume screener (robust symbol parsing)
 
 Commands:
   /start
@@ -15,7 +15,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from tabulate import tabulate  # type: ignore
 import ccxt  # type: ignore
@@ -40,21 +40,35 @@ class MarketVol:
     base_vol: float
     quote_vol: float
 
-def parse_symbol(sym: str) -> Tuple[str, str]:
-    pair = sym.split(":")[0]
-    base, quote = pair.split("/")
+def safe_split_symbol(sym: Optional[str]) -> Optional[Tuple[str, str]]:
+    """Return (base, quote) if symbol looks like 'BASE/QUOTE[:QUOTE]'; else None."""
+    if not sym:
+        return None
+    pair = sym.split(":")[0]  # drop margin suffix like ':USDT'
+    if "/" not in pair:
+        return None
+    base, quote = pair.split("/", 1)
+    if not base or not quote:
+        return None
     return base, quote
 
-def to_marketvol(t: dict) -> MarketVol:
+def to_marketvol(t: dict) -> Optional[MarketVol]:
     sym = t.get("symbol")
-    base, quote = parse_symbol(sym)
+    split = safe_split_symbol(sym)
+    if not split:
+        return None
+    base, quote = split
+    # Some tickers may miss fields; default to 0.0
     last = float(t.get("last") or t.get("close") or 0.0)
     base_vol = float(t.get("baseVolume") or 0.0)
     quote_vol = float(t.get("quoteVolume") or 0.0)
     return MarketVol(symbol=sym, base=base, quote=quote, last=last, base_vol=base_vol, quote_vol=quote_vol)
 
 def fmt_money(x: float) -> str:
-    return f"{x:,.0f}"
+    try:
+        return f"{x:,.0f}"
+    except Exception:
+        return str(x)
 
 def screen_coinex(spot_min_usd: float, fut_min_usd: float):
     # Spot
@@ -63,14 +77,20 @@ def screen_coinex(spot_min_usd: float, fut_min_usd: float):
     spot_tickers = spot.fetch_tickers()
 
     best_spot: Dict[str, MarketVol] = {}
-    for sym, t in spot_tickers.items():
-        mv = to_marketvol(t)
-        if mv.quote not in STABLES:
+    for _, t in spot_tickers.items():
+        try:
+            mv = to_marketvol(t)
+            if not mv:
+                continue  # skip symbols without BASE/QUOTE
+            if mv.quote not in STABLES:
+                continue
+            if mv.quote_vol >= spot_min_usd:
+                prev = best_spot.get(mv.base)
+                if prev is None or mv.quote_vol > prev.quote_vol:
+                    best_spot[mv.base] = mv
+        except Exception:
+            # Skip any odd ticker without breaking the whole run
             continue
-        if mv.quote_vol >= spot_min_usd:
-            prev = best_spot.get(mv.base)
-            if prev is None or mv.quote_vol > prev.quote_vol:
-                best_spot[mv.base] = mv
 
     # Futures (swap)
     swap = ccxt.__dict__[EXCHANGE_ID]({"enableRateLimit": True, "options": {"defaultType": "swap"}})
@@ -78,14 +98,19 @@ def screen_coinex(spot_min_usd: float, fut_min_usd: float):
     swap_tickers = swap.fetch_tickers()
 
     best_fut: Dict[str, MarketVol] = {}
-    for sym, t in swap_tickers.items():
-        mv = to_marketvol(t)
-        if mv.quote not in STABLES:
+    for _, t in swap_tickers.items():
+        try:
+            mv = to_marketvol(t)
+            if not mv:
+                continue
+            if mv.quote not in STABLES:
+                continue
+            if mv.quote_vol >= fut_min_usd:
+                prev = best_fut.get(mv.base)
+                if prev is None or mv.quote_vol > prev.quote_vol:
+                    best_fut[mv.base] = mv
+        except Exception:
             continue
-        if mv.quote_vol >= fut_min_usd:
-            prev = best_fut.get(mv.base)
-            if prev is None or mv.quote_vol > prev.quote_vol:
-                best_fut[mv.base] = mv
 
     bases = sorted(set(best_spot.keys()) & set(best_fut.keys()))
     rows = []
@@ -145,7 +170,6 @@ def main() -> None:
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("screen", screen))
-    # Proper polling call for python-telegram-bot v21+
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
