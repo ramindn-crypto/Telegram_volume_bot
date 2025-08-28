@@ -25,8 +25,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ---- Config ----
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "coinex").lower()
-DEFAULT_SPOT_MIN = float(os.getenv("SPOT_MIN_USD", 1_000_000))
-DEFAULT_FUT_MIN = float(os.getenv("FUTURES_MIN_USD", 5_000_000))
+DEFAULT_SPOT_MIN = float(os.getenv("SPOT_MIN_USD", 5000_000))
+DEFAULT_FUT_MIN = float(os.getenv("FUTURES_MIN_USD", 4_000_000))
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 STABLES = {"USD", "USDT", "USDC", "TUSD", "FDUSD", "USDD", "USDE", "DAI", "PYUSD"}
