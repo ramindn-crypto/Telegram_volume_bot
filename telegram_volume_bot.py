@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
 Telegram bot: CoinEx screener with 3 priorities
-Simplified output: only SYMBOL + USD AMOUNT
-Max 10 rows per priority
+- /screen → shows tables in chat (SYMBOL + USD amount, 10 rows max per priority)
+- /excel → sends an Excel .xlsx file for Excel (priority,symbol,usd_24h)
 """
 
-import asyncio, logging, os, re, time
+import asyncio, logging, os, time, io
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
 import ccxt  # type: ignore
 from tabulate import tabulate  # type: ignore
-from telegram import Update
+from openpyxl import Workbook  # type: ignore
+from telegram import Update, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # Thresholds
-P1_SPOT_MIN = 500_000      # Priority 1 spot
-P1_FUT_MIN  = 5_000_000    # Priority 1 futures
-P2_FUT_MIN  = 2_000_000    # Priority 2 futures
-P3_SPOT_MIN = 1_000_000    # Priority 3 spot
-TOP_N       = 15
+P1_SPOT_MIN = 500_000
+P1_FUT_MIN  = 5_000_000
+P2_FUT_MIN  = 2_000_000
+P3_SPOT_MIN = 1_000_000
+TOP_N       = 10
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 EXCHANGE_ID = "coinex"
@@ -90,35 +91,41 @@ def build_priorities(best_spot,best_fut):
     # P1
     for base in set(best_spot)&set(best_fut):
         s,f=best_spot[base],best_fut[base]
-        if usd_notional(f)>=P1_FUT_MIN and usd_notional(s)>=P1_SPOT_MIN:
-            p1.append([base,usd_notional(f)])
+        fut_usd=usd_notional(f); spot_usd=usd_notional(s)
+        if fut_usd>=P1_FUT_MIN and spot_usd>=P1_SPOT_MIN:
+            p1.append([base,fut_usd])
     p1.sort(key=lambda r:r[1],reverse=True)
     used={r[0] for r in p1}
 
     # P2
     for base,f in best_fut.items():
         if base in used: continue
-        if usd_notional(f)>=P2_FUT_MIN:
-            p2.append([base,usd_notional(f)])
+        fut_usd=usd_notional(f)
+        if fut_usd>=P2_FUT_MIN:
+            p2.append([base,fut_usd])
     p2.sort(key=lambda r:r[1],reverse=True)
     used.update({r[0] for r in p2})
 
     # P3
     for base,s in best_spot.items():
         if base in used: continue
-        if usd_notional(s)>=P3_SPOT_MIN:
-            p3.append([base,usd_notional(s)])
+        spot_usd=usd_notional(s)
+        if spot_usd>=P3_SPOT_MIN:
+            p3.append([base,spot_usd])
     p3.sort(key=lambda r:r[1],reverse=True)
 
     return p1[:TOP_N],p2[:TOP_N],p3[:TOP_N]
 
+def fmt_table(rows: List[List], title: str) -> str:
+    if not rows: return f"*{title}*: _None_\n"
+    pretty=[[r[0],f"${r[1]:,.0f}"] for r in rows]
+    return f"*{title}*:\n```\n"+tabulate(pretty,headers=["SYMBOL","USD 24h"],tablefmt="github")+"\n```\n"
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 /screen will show:\n"
-        "• Priority 1: Futures ≥ $5M AND Spot ≥ $500k\n"
-        "• Priority 2: Futures ≥ $2M\n"
-        "• Priority 3: Spot ≥ $1M\n"
-        "Only 10 rows each, with SYMBOL + USD amount."
+        "👋 Commands:\n"
+        "• /screen → show 3 lists (SYMBOL + USD amount, 10 rows each)\n"
+        "• /excel → download Excel file (.xlsx)"
     )
 
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -127,16 +134,10 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         best_spot,best_fut=await asyncio.to_thread(load_best)
         p1,p2,p3=build_priorities(best_spot,best_fut)
         dt=time.time()-t0
-
-        def fmt(rows,title):
-            if not rows: return f"*{title}*: _None_\n"
-            pretty=[[r[0],f"${r[1]:,.0f}"] for r in rows]
-            return f"*{title}*:\n```\n"+tabulate(pretty,headers=["SYMBOL","USD 24h"],tablefmt="github")+"\n```\n"
-
         text=(
-            fmt(p1,"Priority 1 (Fut≥$5M & Spot≥$500k)")+
-            fmt(p2,"Priority 2 (Fut≥$2M)")+
-            fmt(p3,"Priority 3 (Spot≥$1M)")+
+            fmt_table(p1,"Priority 1 (Fut≥$5M & Spot≥$500k)")+
+            fmt_table(p2,"Priority 2 (Fut≥$2M)")+
+            fmt_table(p3,"Priority 3 (Spot≥$1M)")+
             f"⏱️ {dt:.1f}s • CoinEx via CCXT"
         )
         await update.message.reply_text(text,parse_mode=ParseMode.MARKDOWN)
@@ -144,11 +145,37 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("screen error")
         await update.message.reply_text(f"Error: {e}")
 
+async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        best_spot,best_fut=await asyncio.to_thread(load_best)
+        p1,p2,p3=build_priorities(best_spot,best_fut)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Screener"
+        ws.append(["priority","symbol","usd_24h"])
+        for sym,usd in p1: ws.append(["P1", sym, usd])
+        for sym,usd in p2: ws.append(["P2", sym, usd])
+        for sym,usd in p3: ws.append(["P3", sym, usd])
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        await update.message.reply_document(
+            document=InputFile(buf, filename="screener.xlsx"),
+            caption="Excel export: priority,symbol,usd_24h"
+        )
+    except Exception as e:
+        logging.exception("excel error")
+        await update.message.reply_text(f"Error: {e}")
+
 def main():
     if not TOKEN: raise RuntimeError("Set TELEGRAM_TOKEN env var")
     app=Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start",start))
     app.add_handler(CommandHandler("screen",screen))
+    app.add_handler(CommandHandler("excel",excel_cmd))
     app.run_polling(drop_pending_updates=True)
 
 if __name__=="__main__":
