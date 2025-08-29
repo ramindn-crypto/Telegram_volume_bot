@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-CoinEx screener bot (vertical view)
-- /screen → vertical blocks with: sym, fut($M), spot($M), %24h (top 5 per priority)
+CoinEx screener bot
+Output columns (Telegram /screen):
+  SYM | FUT | SPOT | % (with emoji)
+
+- Excludes: BTC, ETH, XRP, SOL, DOGE, ADA, PEPE, LINK
+- /screen → 3 lists, top 5 rows each
 - /excel  → Excel .xlsx (priority,symbol,usd_24h)
 - /diag   → diagnostics
-
-Rules:
-  P1: Futures >= $5,000,000 AND Spot >= $500,000   (sorted by futures)
-  P2: Futures >= $2,000,000                        (sorted by futures)
-  P3: Spot    >= $3,000,000                        (sorted by spot)
-Excludes: BTC, ETH, XRP, SOL, DOGE, ADA, PEPE, LINK
 """
 
 import asyncio, logging, os, time, io, traceback
@@ -17,6 +15,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
 import ccxt  # type: ignore
+from tabulate import tabulate  # type: ignore
 from openpyxl import Workbook  # type: ignore
 from telegram import Update, InputFile
 from telegram.constants import ParseMode
@@ -26,12 +25,14 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 P1_SPOT_MIN = 500_000
 P1_FUT_MIN  = 5_000_000
 P2_FUT_MIN  = 2_000_000
-P3_SPOT_MIN = 3_000_000
+P3_SPOT_MIN = 3_000_000   # Spot threshold raised
 TOP_N       = 5
 
 EXCHANGE_ID = "coinex"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 STABLES = {"USD","USDT","USDC","TUSD","FDUSD","USDD","USDE","DAI","PYUSD"}
+
+# Exclusions
 EXCLUDE_BASES = {"BTC","ETH","XRP","SOL","DOGE","ADA","PEPE","LINK"}
 
 LAST_ERROR: Optional[str] = None
@@ -87,6 +88,12 @@ def pct_change(mv_spot: Optional[MarketVol], mv_fut: Optional[MarketVol]) -> flo
         return (mv.last - mv.open) / mv.open * 100.0
     return 0.0
 
+def pct_with_emoji(p: float) -> str:
+    if p <= -3: emoji = "🔴"
+    elif p >= 3: emoji = "🟢"
+    else: emoji = "🟡"
+    return f"{p:+.1f}% {emoji}"
+
 def m_dollars(x: float) -> str:
     m = x / 1_000_000.0
     return f"{m:.0f}" if abs(m) >= 10 else f"{m:.1f}"
@@ -123,7 +130,7 @@ def load_best() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol], int, int]:
         if prev is None or usd_notional(mv) > usd_notional(prev):
             best_spot[mv.base] = mv
 
-    # FUTURES (swap)
+    # FUTURES
     ex_fut = build_exchange("swap")
     fut_tickers = safe_fetch_tickers(ex_fut)
     best_fut: Dict[str, MarketVol] = {}
@@ -138,10 +145,6 @@ def load_best() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol], int, int]:
     return best_spot, best_fut, len(spot_tickers), len(fut_tickers)
 
 def build_priorities(best_spot, best_fut):
-    """
-    Returns rows as [base, fut_usd, spot_usd, pct]
-    P1/P2 sorted by fut_usd desc; P3 by spot_usd desc
-    """
     p1_full, p2_full, p3_full = [], [], []
 
     # P1
@@ -178,27 +181,24 @@ def build_priorities(best_spot, best_fut):
 
     return p1, p2, p3
 
-# ---- pretty printing (VERTICAL) ----
-def fmt_vertical(rows: List[List]) -> str:
-    """Return a compact vertical block for each row."""
-    if not rows:
-        return "_None_\n"
-    parts = []
-    for base, fut_usd, spot_usd, pct in rows:
-        parts.append(
-            f"sym: {base}\n"
-            f"fut($M): {m_dollars(fut_usd)}\n"
-            f"spot($M): {m_dollars(spot_usd)}\n"
-            f"%24h: {pct:+.1f}%"
-        )
-    return "```\n" + "\n\n".join(parts) + "\n```"
+def fmt_table(rows: List[List], title: str) -> str:
+    if not rows: return f"*{title}*: _None_\n"
+    pretty = [[r[0], m_dollars(r[1]), m_dollars(r[2]), pct_with_emoji(r[3])] for r in rows]
+    return (
+        f"*{title}*:\n"
+        "```\n" + tabulate(pretty,
+            headers=["SYM","FUT","SPOT","%"],
+            tablefmt="github"
+        ) + "\n```\n"
+    )
 
 # ---- Telegram handlers ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 /screen shows vertical blocks per coin with: sym, fut($M), spot($M), %24h\n"
-        "Top 5 per priority • Excludes BTC/ETH/XRP/SOL/DOGE/ADA/PEPE/LINK\n"
-        "Other cmds: /excel (xlsx), /diag (diagnostics)"
+        "👋 Commands:\n"
+        "• /screen → SYM | FUT | SPOT | % (emoji)\n"
+        "• /excel  → Excel file (.xlsx)\n"
+        "• /diag   → diagnostics"
     )
 
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -210,9 +210,9 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
         dt = time.time() - t0
         text = (
-            "*Priority 1* (Fut≥$5M & Spot≥$500k)\n" + fmt_vertical(p1) + "\n" +
-            "*Priority 2* (Fut≥$2M)\n" + fmt_vertical(p2) + "\n" +
-            "*Priority 3* (Spot≥$3M)\n" + fmt_vertical(p3) + "\n" +
+            fmt_table(p1, "Priority 1 (Fut≥$5M & Spot≥$500k)") +
+            fmt_table(p2, "Priority 2 (Fut≥$2M)") +
+            fmt_table(p3, "Priority 3 (Spot≥$3M)") +
             f"⏱️ {dt:.1f}s • CoinEx via CCXT • tickers: spot={raw_spot_count}, fut={raw_fut_count}"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
