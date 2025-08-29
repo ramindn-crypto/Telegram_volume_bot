@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
 CoinEx screener bot
+Output columns (Telegram /screen):
+  SYMBOL | FUT 24h (M$) | SPOT 24h (M$) | % 24h
+
 - Excludes: BTC, ETH, XRP, SOL, DOGE, ADA, PEPE, LINK
-- /screen → 3 lists, SYMBOL + USD 24h, max 5 rows each
-- /excel  → Excel .xlsx (priority,symbol,usd_24h)
+- /screen → 3 lists, top 5 rows each
+- /excel  → Excel .xlsx (priority,symbol,usd_24h)  [unchanged]
 - /diag   → diagnostics (counts, thresholds, last error)
 """
 
@@ -22,7 +25,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 P1_SPOT_MIN = 500_000
 P1_FUT_MIN  = 5_000_000
 P2_FUT_MIN  = 2_000_000
-P3_SPOT_MIN = 3_000_000   # changed from 1M → 3M
+P3_SPOT_MIN = 3_000_000   # per your latest change
 TOP_N       = 5
 
 EXCHANGE_ID = "coinex"
@@ -41,6 +44,8 @@ class MarketVol:
     base: str
     quote: str
     last: float
+    open: float
+    percentage: float
     base_vol: float
     quote_vol: float
     vwap: float
@@ -56,20 +61,43 @@ def to_mv(t: dict) -> Optional[MarketVol]:
     split = safe_split_symbol(sym)
     if not split: return None
     base, quote = split
+    last = float(t.get("last") or t.get("close") or 0.0)
+    open_ = float(t.get("open") or 0.0)
+    percentage = float(t.get("percentage") or 0.0)
+    base_vol = float(t.get("baseVolume") or 0.0)
+    quote_vol = float(t.get("quoteVolume") or 0.0)
+    vwap = float(t.get("vwap") or 0.0)
     return MarketVol(
         symbol=sym, base=base, quote=quote,
-        last=float(t.get("last") or t.get("close") or 0.0),
-        base_vol=float(t.get("baseVolume") or 0.0),
-        quote_vol=float(t.get("quoteVolume") or 0.0),
-        vwap=float(t.get("vwap") or 0.0),
+        last=last, open=open_, percentage=percentage,
+        base_vol=base_vol, quote_vol=quote_vol, vwap=vwap
     )
 
 def usd_notional(mv: Optional[MarketVol]) -> float:
+    """Robust USD-like 24h notional."""
     if not mv: return 0.0
-    if mv.quote in STABLES and mv.quote_vol > 0:
+    if mv.quote in STABLES and mv.quote_vol and mv.quote_vol > 0:
         return mv.quote_vol
-    price = mv.vwap if mv.vwap > 0 else mv.last
+    price = mv.vwap if mv.vwap and mv.vwap > 0 else mv.last
     return mv.base_vol * price if price and mv.base_vol else 0.0
+
+def pct_change(mv_spot: Optional[MarketVol], mv_fut: Optional[MarketVol]) -> float:
+    """Prefer exchange-provided 24h percentage from SPOT; else FUT; else compute from open/last."""
+    # Prefer spot ticker's percentage
+    for mv in (mv_spot, mv_fut):
+        if mv and mv.percentage:
+            return float(mv.percentage)
+    # compute from open if available
+    mv = mv_spot or mv_fut
+    if mv and mv.open and mv.open > 0 and mv.last:
+        return (mv.last - mv.open) / mv.open * 100.0
+    return 0.0
+
+def m_dollars(x: float) -> str:
+    """Render millions as plain number (e.g., 20.0 -> '20', 2.6 -> '2.6')."""
+    m = x / 1_000_000.0
+    # show 0 decimals if >= 10, else 1 decimal
+    return f"{m:.0f}" if abs(m) >= 10 else f"{m:.1f}"
 
 def build_exchange(default_type: str):
     klass = ccxt.__dict__[EXCHANGE_ID]
@@ -89,12 +117,12 @@ def safe_fetch_tickers(ex: ccxt.Exchange) -> Dict[str, dict]:
         logging.exception("fetch_tickers failed")
         return {}
 
-def load_best() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol], int, int]:
+def load_best() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol], int, int, Dict[str, dict], Dict[str, dict]]:
     # SPOT
     ex_spot = build_exchange("spot")
-    spot_tickers = safe_fetch_tickers(ex_spot)
+    spot_tickers_raw = safe_fetch_tickers(ex_spot)
     best_spot: Dict[str, MarketVol] = {}
-    for _, t in spot_tickers.items():
+    for sym, t in spot_tickers_raw.items():
         mv = to_mv(t)
         if not mv: continue
         if mv.quote not in STABLES: continue
@@ -103,11 +131,11 @@ def load_best() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol], int, int]:
         if prev is None or usd_notional(mv) > usd_notional(prev):
             best_spot[mv.base] = mv
 
-    # FUTURES
+    # FUTURES (swap)
     ex_fut = build_exchange("swap")
-    fut_tickers = safe_fetch_tickers(ex_fut)
+    fut_tickers_raw = safe_fetch_tickers(ex_fut)
     best_fut: Dict[str, MarketVol] = {}
-    for _, t in fut_tickers.items():
+    for sym, t in fut_tickers_raw.items():
         mv = to_mv(t)
         if not mv: continue
         if mv.base in EXCLUDE_BASES: continue
@@ -115,9 +143,15 @@ def load_best() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol], int, int]:
         if prev is None or usd_notional(mv) > usd_notional(prev):
             best_fut[mv.base] = mv
 
-    return best_spot, best_fut, len(spot_tickers), len(fut_tickers)
+    return best_spot, best_fut, len(spot_tickers_raw), len(fut_tickers_raw), spot_tickers_raw, fut_tickers_raw
 
 def build_priorities(best_spot, best_fut):
+    """
+    Returns rows formatted as:
+      [base, fut_usd, spot_usd, pct_24h]
+    Sorting:
+      P1 & P2 by fut_usd desc; P3 by spot_usd desc
+    """
     p1_full, p2_full, p3_full = [], [], []
 
     # P1
@@ -126,42 +160,51 @@ def build_priorities(best_spot, best_fut):
         s, f = best_spot[base], best_fut[base]
         fut_usd, spot_usd = usd_notional(f), usd_notional(s)
         if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
-            p1_full.append([base, fut_usd])
-    p1_full.sort(key=lambda r:r[1], reverse=True)
+            p1_full.append([base, fut_usd, spot_usd, pct_change(s, f)])
+    p1_full.sort(key=lambda r: r[1], reverse=True)
     p1 = p1_full[:TOP_N]
     used = {r[0] for r in p1}
 
-    # P2
+    # P2 (exclude only what we actually showed in P1)
     for base, f in best_fut.items():
         if base in used or base in EXCLUDE_BASES: continue
         fut_usd = usd_notional(f)
         if fut_usd >= P2_FUT_MIN:
-            p2_full.append([base, fut_usd])
-    p2_full.sort(key=lambda r:r[1], reverse=True)
+            s = best_spot.get(base)
+            p2_full.append([base, fut_usd, usd_notional(s) if s else 0.0, pct_change(s, f)])
+    p2_full.sort(key=lambda r: r[1], reverse=True)
     p2 = p2_full[:TOP_N]
     used.update({r[0] for r in p2})
 
-    # P3
+    # P3 (exclude shown P1/P2)
     for base, s in best_spot.items():
         if base in used or base in EXCLUDE_BASES: continue
         spot_usd = usd_notional(s)
         if spot_usd >= P3_SPOT_MIN:
-            p3_full.append([base, spot_usd])
-    p3_full.sort(key=lambda r:r[1], reverse=True)
+            f = best_fut.get(base)
+            p3_full.append([base, usd_notional(f) if f else 0.0, spot_usd, pct_change(s, f)])
+    p3_full.sort(key=lambda r: r[2], reverse=True)  # by spot
     p3 = p3_full[:TOP_N]
 
     return p1, p2, p3
 
 def fmt_table(rows: List[List], title: str) -> str:
     if not rows: return f"*{title}*: _None_\n"
-    pretty = [[r[0], f"${r[1]:,.0f}"] for r in rows]
-    return f"*{title}*:\n```\n" + tabulate(pretty, headers=["SYMBOL","USD 24h"], tablefmt="github") + "\n```\n"
+    # Convert to display units: millions + percentage
+    pretty = [[r[0], m_dollars(r[1]), m_dollars(r[2]), f"{r[3]:+.1f}%"] for r in rows]
+    return (
+        f"*{title}*:\n"
+        "```\n" + tabulate(pretty,
+            headers=["SYMBOL","FUT 24h (M$)","SPOT 24h (M$)","% 24h"],
+            tablefmt="github"
+        ) + "\n```\n"
+    )
 
 # ---- Telegram handlers ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Commands:\n"
-        "• /screen → 3 lists (SYMBOL + USD amount, 5 rows each, excludes BTC/ETH/XRP/SOL/DOGE/ADA/PEPE/LINK)\n"
+        "• /screen → SYMBOL | FUT 24h (M$) | SPOT 24h (M$) | % 24h — top 5 each priority\n"
         "• /excel  → Excel file (.xlsx)\n"
         "• /diag   → diagnostics"
     )
@@ -171,7 +214,7 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     LAST_ERROR = None
     try:
         t0 = time.time()
-        best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best)
+        best_spot, best_fut, raw_spot_count, raw_fut_count, *_ = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
         dt = time.time() - t0
         text = (
@@ -195,9 +238,9 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ws = wb.active
         ws.title = "Screener"
         ws.append(["priority","symbol","usd_24h"])
-        for sym, usd in p1: ws.append(["P1", sym, usd])
-        for sym, usd in p2: ws.append(["P2", sym, usd])
-        for sym, usd in p3: ws.append(["P3", sym, usd])
+        for sym, fut_usd, spot_usd, _ in p1: ws.append(["P1", sym, fut_usd])
+        for sym, fut_usd, spot_usd, _ in p2: ws.append(["P2", sym, fut_usd])
+        for sym, fut_usd, spot_usd, _ in p3: ws.append(["P3", sym, spot_usd])
 
         buf = io.BytesIO()
         wb.save(buf)
@@ -205,7 +248,7 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_document(
             document=InputFile(buf, filename="screener.xlsx"),
-            caption="Excel export: priority,symbol,usd_24h (excludes BTC/ETH/XRP/SOL/DOGE/ADA/PEPE/LINK)"
+            caption="Excel export (priority,symbol,usd_24h) — excludes BTC/ETH/XRP/SOL/DOGE/ADA/PEPE/LINK"
         )
     except Exception as e:
         logging.exception("excel error")
@@ -213,7 +256,7 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best)
+        best_spot, best_fut, raw_spot_count, raw_fut_count, *_ = await asyncio.to_thread(load_best)
         msg = (
             "*Diag*\n"
             f"- thresholds: P1 Fut≥${P1_FUT_MIN:,} & Spot≥${P1_SPOT_MIN:,} | "
