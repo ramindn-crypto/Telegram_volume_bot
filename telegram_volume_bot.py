@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CoinEx screener bot (robust logs + diag)
-- Excludes: BTC, ETH, XRP, SOL, DOGE
+- Excludes: BTC, ETH, XRP, SOL, DOGE, ADA, LINK, PEPE
 - /screen → 3 lists, SYMBOL + USD 24h, max 5 rows each
 - /excel  → Excel .xlsx (priority,symbol,usd_24h)
 - /diag   → diagnostics (counts, thresholds, last error if any)
