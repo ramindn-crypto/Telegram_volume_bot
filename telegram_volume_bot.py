@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-Telegram bot: CoinEx screener with 3 priorities
+CoinEx screener bot (robust logs + diag)
 - Excludes: BTC, ETH, XRP, SOL, DOGE
-- /screen → shows tables in chat (SYMBOL + USD amount, max 5 rows per priority)
-- /excel  → sends an Excel .xlsx file (priority,symbol,usd_24h)
-
-Priorities:
-  P1: Futures >= $5,000,000 AND Spot >= $500,000
-  P2: Futures >= $2,000,000  (ignore spot)
-  P3: Spot    >= $1,000,000  (ignore futures)
+- /screen → 3 lists, SYMBOL + USD 24h, max 5 rows each
+- /excel  → Excel .xlsx (priority,symbol,usd_24h)
+- /diag   → diagnostics (counts, thresholds, last error if any)
 """
 
-import asyncio, logging, os, time, io
+import asyncio, logging, os, time, io, traceback
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -22,19 +18,20 @@ from telegram import Update, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Thresholds
+# ---- Config / thresholds ----
 P1_SPOT_MIN = 500_000
 P1_FUT_MIN  = 5_000_000
 P2_FUT_MIN  = 2_000_000
 P3_SPOT_MIN = 1_000_000
-TOP_N       = 5  # << limit to 5 rows per priority
+TOP_N       = 5
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
 EXCHANGE_ID = "coinex"
-STABLES = {"USD", "USDT", "USDC", "TUSD", "FDUSD", "USDD", "USDE", "DAI", "PYUSD"}
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+STABLES = {"USD","USDT","USDC","TUSD","FDUSD","USDD","USDE","DAI","PYUSD"}
+EXCLUDE_BASES = {"BTC","ETH","XRP","SOL","DOGE"}
 
-# Exclusions (bases not to show anywhere)
-EXCLUDE_BASES = {"BTC", "ETH", "XRP", "SOL", "DOGE"}
+# store last error string for /diag
+LAST_ERROR: Optional[str] = None
 
 @dataclass
 class MarketVol:
@@ -72,25 +69,46 @@ def usd_notional(mv: Optional[MarketVol]) -> float:
     price = mv.vwap if mv.vwap > 0 else mv.last
     return mv.base_vol * price if price and mv.base_vol else 0.0
 
-def load_best() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol]]:
+def build_exchange(default_type: str):
+    # more robust: timeout + rateLimit
+    klass = ccxt.__dict__[EXCHANGE_ID]
+    return klass({
+        "enableRateLimit": True,
+        "timeout": 20000,  # 20s
+        "options": {"defaultType": default_type},
+    })
+
+def safe_fetch_tickers(ex: ccxt.Exchange) -> Dict[str, dict]:
+    # wrap fetch_tickers with clear error propagation
+    try:
+        ex.load_markets()
+        return ex.fetch_tickers()
+    except Exception as e:
+        global LAST_ERROR
+        LAST_ERROR = f"{type(e).__name__}: {e}"
+        logging.exception("fetch_tickers failed")
+        return {}  # return empty so downstream handles gracefully
+
+def load_best() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol], int, int]:
     # SPOT
-    ex_spot = ccxt.__dict__[EXCHANGE_ID]({"enableRateLimit": True,"options":{"defaultType":"spot"}})
-    ex_spot.load_markets()
-    spot_tickers = ex_spot.fetch_tickers()
+    ex_spot = build_exchange("spot")
+    spot_tickers = safe_fetch_tickers(ex_spot)
     best_spot: Dict[str, MarketVol] = {}
     for _, t in spot_tickers.items():
         mv = to_mv(t)
-        if not mv or mv.quote not in STABLES: 
+        if not mv: 
+            continue
+        if mv.quote not in STABLES: 
             continue
         if mv.base in EXCLUDE_BASES: 
             continue
-        if mv.base not in best_spot or usd_notional(mv) > usd_notional(best_spot[mv.base]):
+        prev = best_spot.get(mv.base)
+        if prev is None or usd_notional(mv) > usd_notional(prev):
             best_spot[mv.base] = mv
 
     # FUTURES (swap)
-    ex_fut = ccxt.__dict__[EXCHANGE_ID]({"enableRateLimit": True,"options":{"defaultType":"swap"}})
-    ex_fut.load_markets()
-    fut_tickers = ex_fut.fetch_tickers()
+    ex_fut = build_exchange("swap")
+    fut_tickers = safe_fetch_tickers(ex_fut)
     best_fut: Dict[str, MarketVol] = {}
     for _, t in fut_tickers.items():
         mv = to_mv(t)
@@ -98,10 +116,11 @@ def load_best() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol]]:
             continue
         if mv.base in EXCLUDE_BASES: 
             continue
-        if mv.base not in best_fut or usd_notional(mv) > usd_notional(best_fut[mv.base]):
+        prev = best_fut.get(mv.base)
+        if prev is None or usd_notional(mv) > usd_notional(prev):
             best_fut[mv.base] = mv
 
-    return best_spot, best_fut
+    return best_spot, best_fut, len(spot_tickers), len(fut_tickers)
 
 def build_priorities(best_spot, best_fut):
     # Build full lists
@@ -119,7 +138,7 @@ def build_priorities(best_spot, best_fut):
     p1 = p1_full[:TOP_N]
     used = {r[0] for r in p1}  # exclude only what we actually show
 
-    # P2 (futures-only, excluding shown P1)
+    # P2 (futures-only)
     for base, f in best_fut.items():
         if base in used or base in EXCLUDE_BASES: 
             continue
@@ -130,7 +149,7 @@ def build_priorities(best_spot, best_fut):
     p2 = p2_full[:TOP_N]
     used.update({r[0] for r in p2})
 
-    # P3 (spot-only, excluding shown P1/P2)
+    # P3 (spot-only)
     for base, s in best_spot.items():
         if base in used or base in EXCLUDE_BASES: 
             continue
@@ -144,37 +163,43 @@ def build_priorities(best_spot, best_fut):
 
 def fmt_table(rows: List[List], title: str) -> str:
     if not rows: return f"*{title}*: _None_\n"
-    pretty = [[r[0], f"${r[1]:,.0f}"]]  # seed header fix
     pretty = [[r[0], f"${r[1]:,.0f}"] for r in rows]
     return f"*{title}*:\n```\n" + tabulate(pretty, headers=["SYMBOL","USD 24h"], tablefmt="github") + "\n```\n"
 
+# ---- Telegram handlers ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Commands:\n"
         "• /screen → 3 lists (SYMBOL + USD amount, 5 rows each, excludes BTC/ETH/XRP/SOL/DOGE)\n"
-        "• /excel  → Excel file (.xlsx) of the same data"
+        "• /excel  → Excel file (.xlsx)\n"
+        "• /diag   → diagnostics"
     )
 
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global LAST_ERROR
+    LAST_ERROR = None
     try:
         t0 = time.time()
-        best_spot, best_fut = await asyncio.to_thread(load_best)
+        best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
         dt = time.time() - t0
         text = (
             fmt_table(p1, "Priority 1 (Fut≥$5M & Spot≥$500k)") +
             fmt_table(p2, "Priority 2 (Fut≥$2M)") +
             fmt_table(p3, "Priority 3 (Spot≥$1M)") +
-            f"⏱️ {dt:.1f}s • CoinEx via CCXT"
+            f"⏱️ {dt:.1f}s • CoinEx via CCXT • tickers: spot={raw_spot_count}, fut={raw_fut_count}"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
+        LAST_ERROR = f"{type(e).__name__}: {e}\n" + traceback.format_exc(limit=3)
         logging.exception("screen error")
-        await update.message.reply_text(f"Error: {e}")
+        await update.message.reply_text(f"Error: {LAST_ERROR}")
 
 async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global LAST_ERROR
+    LAST_ERROR = None
     try:
-        best_spot, best_fut = await asyncio.to_thread(load_best)
+        best_spot, best_fut, *_ = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
 
         wb = Workbook()
@@ -194,17 +219,36 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption="Excel export: priority,symbol,usd_24h (excludes BTC/ETH/XRP/SOL/DOGE)"
         )
     except Exception as e:
+        LAST_ERROR = f"{type(e).__name__}: {e}\n" + traceback.format_exc(limit=3)
         logging.exception("excel error")
-        await update.message.reply_text(f"Error: {e}")
+        await update.message.reply_text(f"Error: {LAST_ERROR}")
+
+async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Lightweight health check
+    try:
+        best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best)
+        msg = (
+            "*Diag*\n"
+            f"- thresholds: P1 Fut≥${P1_FUT_MIN:,} & Spot≥${P1_SPOT_MIN:,} | "
+            f"P2 Fut≥${P2_FUT_MIN:,} | P3 Spot≥${P3_SPOT_MIN:,}\n"
+            f"- excludes: {', '.join(sorted(EXCLUDE_BASES))}\n"
+            f"- tickers fetched: spot={raw_spot_count}, fut={raw_fut_count}\n"
+            f"- bases kept: spot={len(best_spot)}, fut={len(best_fut)}\n"
+            f"- last_error: {LAST_ERROR or '_None_'}"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"Diag error: {type(e).__name__}: {e}")
 
 def main():
     if not TOKEN: raise RuntimeError("Set TELEGRAM_TOKEN env var")
+    logging.basicConfig(level=logging.INFO)
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("screen", screen))
     app.add_handler(CommandHandler("excel", excel_cmd))
+    app.add_handler(CommandHandler("diag", diag))
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     main()
