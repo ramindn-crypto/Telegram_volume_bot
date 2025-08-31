@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CoinEx screener bot
+CoinEx screener bot (resilient)
 Table columns (Telegram):
   SYM | FUT | SPOT | % | FUT(4h) | %(4h)
 - FUT/SPOT are 24h notionals in $M (integers)
@@ -10,7 +10,7 @@ Table columns (Telegram):
 Features:
 - /screen → P1: 10 rows, P2: 5 rows, P3: 5 rows
 - Send a coin ticker (e.g., PYTH) → same table just for that coin (ignores exclusions)
-- /excel → Excel .xlsx (priority,symbol,usd_24h)
+- /excel → Excel .xlsx (priority,symbol,usd_24h)  [kept simple on purpose]
 - /diag  → diagnostics
 
 Lists EXCLUDE bases: BTC, ETH, XRP, SOL, DOGE, ADA, PEPE, LINK
@@ -20,7 +20,7 @@ Thresholds:
   P3: Spot   ≥ $3M
 """
 
-import asyncio, logging, os, time, io, traceback, re
+import asyncio, logging, os, time, io, traceback, re, signal
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -174,6 +174,7 @@ def fut_4h_metrics_thread(symbol: str, fut_usd_24h: float) -> Tuple[float, float
     """
     Thread worker: new exchange per call (thread-safe), fetch 4×1h candles.
     Returns (usd_volume_4h, pct_change_4h), capped to 24h fut notional.
+    Handles contract markets by multiplying candle volume (contracts) by contractSize.
     """
     try:
         ex = build_exchange("swap")
@@ -207,10 +208,7 @@ def fut_4h_metrics_thread(symbol: str, fut_usd_24h: float) -> Tuple[float, float
         return 0.0, 0.0
 
 async def build_fut4_map(bases: List[str], best_fut: Dict[str, MarketVol], fut_usd_map: Dict[str, float]) -> Dict[str, Tuple[float,float]]:
-    """
-    Compute FUT(4h) and %(4h) in parallel with timeouts.
-    Returns dict base -> (usd4h, pct4h). Defaults to (0,0) on timeout/fail.
-    """
+    """Compute FUT(4h)/%(4h) in parallel with timeouts; default to zeros on timeout."""
     tasks = []
     for base in bases:
         mvf = best_fut.get(base)
@@ -218,13 +216,11 @@ async def build_fut4_map(bases: List[str], best_fut: Dict[str, MarketVol], fut_u
             continue
         symbol = mvf.symbol
         fut_usd_24h = fut_usd_map.get(base, 0.0)
-        # Run each CCXT call in a worker thread with per-call timeout
         coro = asyncio.wait_for(asyncio.to_thread(fut_4h_metrics_thread, symbol, fut_usd_24h),
                                 timeout=FOUR_H_PER_SYMBOL_TIMEOUT)
         tasks.append((base, coro))
 
     results: Dict[str, Tuple[float,float]] = {b: (0.0, 0.0) for b in bases}
-
     if not tasks:
         return results
 
@@ -233,3 +229,49 @@ async def build_fut4_map(bases: List[str], best_fut: Dict[str, MarketVol], fut_u
         for base, coro in tasks:
             try:
                 v4, p4 = await coro
+            except Exception:
+                v4, p4 = 0.0, 0.0
+            pairs.append((base, (v4, p4)))
+        return dict(pairs)
+
+    try:
+        gathered = await asyncio.wait_for(gather_with_overall_timeout(), timeout=FOUR_H_OVERALL_TIMEOUT)
+        results.update(gathered)
+    except asyncio.TimeoutError:
+        logging.warning("4h metrics overall timeout; returning partial zeros")
+    return results
+
+# --- Build lists (P1/P2/P3) ---
+def build_priorities(best_spot, best_fut):
+    """Return rows as [base, fut_usd, spot_usd, pct_24h]."""
+    p1_full, p2_full, p3_full = [], [], []
+
+    # P1
+    for base in set(best_spot) & set(best_fut):
+        if base in EXCLUDE_BASES: continue
+        s, f = best_spot[base], best_fut[base]
+        fut_usd, spot_usd = usd_notional(f), usd_notional(s)
+        if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
+            p1_full.append([base, fut_usd, spot_usd, pct_change(s, f)])
+    p1_full.sort(key=lambda r: r[1], reverse=True)
+    p1 = p1_full[:TOP_N_P1]
+    used = {r[0] for r in p1}
+
+    # P2
+    for base, f in best_fut.items():
+        if base in used or base in EXCLUDE_BASES: continue
+        fut_usd = usd_notional(f)
+        if fut_usd >= P2_FUT_MIN:
+            s = best_spot.get(base)
+            p2_full.append([base, fut_usd, usd_notional(s) if s else 0.0, pct_change(s, f)])
+    p2_full.sort(key=lambda r: r[1], reverse=True)
+    p2 = p2_full[:TOP_N_P2]
+    used.update({r[0] for r in p2})
+
+    # P3
+    for base, s in best_spot.items():
+        if base in used or base in EXCLUDE_BASES: continue
+        spot_usd = usd_notional(s)
+        if spot_usd >= P3_SPOT_MIN:
+            f = best_fut.get(base)
+            p3_full.append([base, usd_notional(f) if f_]()_
