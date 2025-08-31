@@ -108,8 +108,8 @@ def pct_change(mv_spot: Optional[MarketVol], mv_fut: Optional[MarketVol]) -> flo
 
 def pct_with_emoji(p: float) -> str:
     p_rounded = round(p)  # integer only
-    if p_rounded <= -3: emoji = "🔴"
-    elif p_rounded >= 3: emoji = "🟢"
+    if p_rounded <= -5: emoji = "🔴"
+    elif p_rounded >= 5: emoji = "🟢"
     else: emoji = "🟡"
     return f"{p_rounded:+d}% {emoji}"
 
