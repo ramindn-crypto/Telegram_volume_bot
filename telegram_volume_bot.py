@@ -4,7 +4,7 @@ CoinEx screener bot
 Table columns (Telegram):
   SYM | FUT | SPOT | % | FUT(4h) | %(4h)
 - FUT/SPOT are 24h notionals in $M (integers)
-- % and %(4h) are rounded integers with emoji using thresholds:
+- % and %(4h) are rounded integers with emoji
   🟢 >= +5%, 🟡 between -4.99%..+4.99%, 🔴 <= -5%
 
 Features:
@@ -166,252 +166,48 @@ def load_best(apply_exclusions: bool = True) -> Tuple[Dict[str, MarketVol], Dict
     return best_spot, best_fut, len(spot_tickers), len(fut_tickers)
 
 # --- 4h futures metrics (volume + % change) ---
-def fut_4h_metrics(ex_fut: ccxt.Exchange, mv_fut: Optional[MarketVol]) -> Tuple[float, float]:
+def fut_4h_metrics(ex_fut: ccxt.Exchange, mv_fut: Optional[MarketVol], fut_usd_24h: float) -> Tuple[float, float]:
     """
     For the futures symbol, pull 1h candles (last 4).
     Returns (usd_volume_4h, pct_change_4h).
-    Volume approximated as sum(base_volume * typical_price).
+    Candle volume is often in CONTRACTS for swaps; convert using market.contractSize when contract==True.
+    We also cap 4h volume at the 24h futures notional for sanity.
     """
     if not mv_fut:
         return 0.0, 0.0
-    symbol = mv_fut.symbol  # e.g., "PYTH/USDT:USDT"
+    symbol = mv_fut.symbol  # e.g., "AAVE/USDT:USDT"
     try:
-        # Some exchanges require market to be loaded
         ex_fut.load_markets()
+        market = ex_fut.market(symbol)
+        is_contract = bool(market.get("contract"))
+        contract_size = float(market.get("contractSize") or 1.0)
+
         ohlcv = ex_fut.fetch_ohlcv(symbol, timeframe="1h", limit=4)
-        if not ohlcv or len(ohlcv) == 0:
+        if not ohlcv:
             return 0.0, 0.0
+
         usd_vol = 0.0
         first_open = None
         last_close = None
         for i, c in enumerate(ohlcv):
             ts, o, h, l, cl, vol = c
-            typical = (h + l + cl) / 3.0
-            usd_vol += float(vol or 0.0) * float(typical or 0.0)
+            vol = float(vol or 0.0)
+            # If contract market, 'vol' is contracts → convert to base units
+            base_qty = vol * contract_size if is_contract else vol
+            typical = (float(h or 0.0) + float(l or 0.0) + float(cl or 0.0)) / 3.0
+            usd_vol += base_qty * typical
             if i == 0:
                 first_open = float(o or 0.0)
             last_close = float(cl or 0.0)
+
         pct4 = 0.0
         if first_open and first_open > 0 and last_close is not None:
             pct4 = (last_close - first_open) / first_open * 100.0
+
+        # Sanity: 4h must not exceed 24h
+        if fut_usd_24h and fut_usd_24h > 0:
+            usd_vol = min(usd_vol, fut_usd_24h)
+
         return usd_vol, pct4
     except Exception as e:
         logging.exception(f"4h metrics failed for {symbol}: {e}")
-        return 0.0, 0.0
-
-# --- Build lists (P1/P2/P3) ---
-def build_priorities(best_spot, best_fut):
-    """Return rows as [base, fut_usd, spot_usd, pct_24h]."""
-    p1_full, p2_full, p3_full = [], [], []
-
-    # P1
-    for base in set(best_spot) & set(best_fut):
-        if base in EXCLUDE_BASES: continue
-        s, f = best_spot[base], best_fut[base]
-        fut_usd, spot_usd = usd_notional(f), usd_notional(s)
-        if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
-            p1_full.append([base, fut_usd, spot_usd, pct_change(s, f)])
-    p1_full.sort(key=lambda r: r[1], reverse=True)
-    p1 = p1_full[:TOP_N_P1]
-    used = {r[0] for r in p1}
-
-    # P2
-    for base, f in best_fut.items():
-        if base in used or base in EXCLUDE_BASES: continue
-        fut_usd = usd_notional(f)
-        if fut_usd >= P2_FUT_MIN:
-            s = best_spot.get(base)
-            p2_full.append([base, fut_usd, usd_notional(s) if s else 0.0, pct_change(s, f)])
-    p2_full.sort(key=lambda r: r[1], reverse=True)
-    p2 = p2_full[:TOP_N_P2]
-    used.update({r[0] for r in p2})
-
-    # P3
-    for base, s in best_spot.items():
-        if base in used or base in EXCLUDE_BASES: continue
-        spot_usd = usd_notional(s)
-        if spot_usd >= P3_SPOT_MIN:
-            f = best_fut.get(base)
-            p3_full.append([base, usd_notional(f) if f else 0.0, spot_usd, pct_change(s, f)])
-    p3_full.sort(key=lambda r: r[2], reverse=True)
-    p3 = p3_full[:TOP_N_P3]
-
-    return p1, p2, p3
-
-# --- Formatting ---
-def fmt_table(rows: List[List], title: str, fut4h_map: Dict[str, Tuple[float,float]]) -> str:
-    if not rows: return f"*{title}*: _None_\n"
-    pretty = []
-    for r in rows:
-        base, fut_usd, spot_usd, pct24 = r
-        v4, p4 = fut4h_map.get(base, (0.0, 0.0))
-        pretty.append([base, m_dollars_int(fut_usd), m_dollars_int(spot_usd), pct_with_emoji(pct24),
-                       m_dollars_int(v4), pct_with_emoji(p4)])
-    return (
-        f"*{title}*:\n"
-        "```\n" + tabulate(pretty,
-            headers=["SYM","FUT","SPOT","%","FUT(4h)","%(4h)"],
-            tablefmt="github"
-        ) + "\n```\n"
-    )
-
-def fmt_table_single(sym: str, fut_usd: float, spot_usd: float, pct: float,
-                     fut4_usd: float, pct4: float, title: str) -> str:
-    rows = [[sym.upper(), m_dollars_int(fut_usd), m_dollars_int(spot_usd), pct_with_emoji(pct),
-             m_dollars_int(fut4_usd), pct_with_emoji(pct4)]]
-    return (
-        f"*{title}*:\n"
-        "```\n" + tabulate(rows, headers=["SYM","FUT","SPOT","%","FUT(4h)","%(4h)"], tablefmt="github") + "\n```\n"
-    )
-
-# ---- Telegram handlers ----
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Commands:\n"
-        "• /screen → P1(10), P2(5), P3(5) lists\n"
-        "• /excel  → Excel file (.xlsx)\n"
-        "• /diag   → diagnostics\n"
-        "Tip: Send a coin ticker (e.g., PYTH or $PYTH) to get its table."
-    )
-
-async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global LAST_ERROR
-    LAST_ERROR = None
-    try:
-        t0 = time.time()
-        best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best, True)
-        p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
-
-        # compute 4h metrics only for displayed rows to keep it fast
-        ex_fut = build_exchange("swap")
-        fut4_map: Dict[str, Tuple[float,float]] = {}
-        for rows in (p1, p2, p3):
-            for base, *_ in rows:
-                mvf = best_fut.get(base)
-                v4, p4 = fut_4h_metrics(ex_fut, mvf)
-                fut4_map[base] = (v4, p4)
-
-        dt = time.time() - t0
-        text = (
-            fmt_table(p1, f"Priority 1 (Fut≥$5M & Spot≥$500k) — Top {TOP_N_P1}", fut4_map) +
-            fmt_table(p2, f"Priority 2 (Fut≥$2M) — Top {TOP_N_P2}", fut4_map) +
-            fmt_table(p3, f"Priority 3 (Spot≥$3M) — Top {TOP_N_P3}", fut4_map) +
-            f"⏱️ {dt:.1f}s • CoinEx via CCXT • tickers: spot={raw_spot_count}, fut={raw_fut_count}"
-        )
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        LAST_ERROR = f"{type(e).__name__}: {e}\n" + traceback.format_exc(limit=3)
-        logging.exception("screen error")
-        await update.message.reply_text(f"Error: {LAST_ERROR}")
-
-async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # (kept simple to preserve your existing workbook mapping)
-    try:
-        best_spot, best_fut, *_ = await asyncio.to_thread(load_best, True)
-        p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Screener"
-        ws.append(["priority","symbol","usd_24h"])
-        for sym, fut_usd, spot_usd, _ in p1: ws.append(["P1", sym, fut_usd])
-        for sym, fut_usd, spot_usd, _ in p2: ws.append(["P2", sym, fut_usd])
-        for sym, fut_usd, spot_usd, _ in p3: ws.append(["P3", sym, spot_usd])
-
-        buf = io.BytesIO()
-        wb.save(buf)
-        buf.seek(0)
-
-        await update.message.reply_document(
-            document=InputFile(buf, filename="screener.xlsx"),
-            caption="Excel export (priority,symbol,usd_24h)"
-        )
-    except Exception as e:
-        logging.exception("excel error")
-        await update.message.reply_text(f"Error: {e}")
-
-async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best, True)
-        msg = (
-            "*Diag*\n"
-            f"- thresholds: P1 Fut≥${P1_FUT_MIN:,} & Spot≥${P1_SPOT_MIN:,} | "
-            f"P2 Fut≥${P2_FUT_MIN:,} | P3 Spot≥${P3_SPOT_MIN:,}\n"
-            f"- P1 rows: {TOP_N_P1}, P2 rows: {TOP_N_P2}, P3 rows: {TOP_N_P3}\n"
-            f"- excludes (lists): {', '.join(sorted(EXCLUDE_BASES))}\n"
-            f"- tickers fetched: spot={raw_spot_count}, fut={raw_fut_count}\n"
-            f"- last_error: {LAST_ERROR or '_None_'}"
-        )
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        await update.message.reply_text(f"Diag error: {type(e).__name__}: {e}")
-
-# --- Symbol lookup (free text and /coin) ---
-def normalize_symbol_text(text: str) -> Optional[str]:
-    # Accept "$PYTH", "pyth", "pyth/usdt", "PYTH.", etc. → "PYTH"
-    if not text: return None
-    s = text.strip()
-    candidates = re.findall(r"[A-Za-z$]{2,10}", s)
-    if not candidates: return None
-    token = candidates[0].upper().lstrip("$")
-    token = token.replace(".", "").replace(",", "")
-    return token if 2 <= len(token) <= 10 else None
-
-async def coin_query(update: Update, symbol_text: str):
-    try:
-        base = normalize_symbol_text(symbol_text)
-        if not base:
-            await update.message.reply_text("Please provide a coin ticker, e.g. `PYTH`.", parse_mode=ParseMode.MARKDOWN)
-            return
-
-        # Ignore exclusions for direct query
-        best_spot, best_fut, *_ = await asyncio.to_thread(load_best, False)
-        s = best_spot.get(base)
-        f = best_fut.get(base)
-
-        fut_usd = usd_notional(f) if f else 0.0
-        spot_usd = usd_notional(s) if s else 0.0
-        pct24 = pct_change(s, f)
-
-        # 4h metrics
-        ex_fut = build_exchange("swap")
-        fut4_usd, pct4 = fut_4h_metrics(ex_fut, f)
-
-        if fut_usd == 0.0 and spot_usd == 0.0 and fut4_usd == 0.0:
-            await update.message.reply_text(f"Couldn't find data for `{base}`.", parse_mode=ParseMode.MARKDOWN)
-            return
-
-        title = f"{base} (24h & 4h)"
-        text = fmt_table_single(base, fut_usd, spot_usd, pct24, fut4_usd, pct4, title)
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-    except Exception as e:
-        logging.exception("coin query error")
-        await update.message.reply_text(f"Error: {type(e).__name__}: {e}")
-
-async def coin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    arg = " ".join(context.args) if context.args else ""
-    await coin_query(update, arg or "")
-
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await coin_query(update, update.message.text or "")
-
-def main():
-    if not TOKEN: raise RuntimeError("Set TELEGRAM_TOKEN env var")
-    logging.basicConfig(level=logging.INFO)
-    app = Application.builder().token(TOKEN).build()
-
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("screen", screen))
-    app.add_handler(CommandHandler("excel", excel_cmd))
-    app.add_handler(CommandHandler("diag", diag))
-    app.add_handler(CommandHandler("coin", coin_cmd))  # /coin PYTH
-
-    # Plain-text symbol lookups
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    main()
