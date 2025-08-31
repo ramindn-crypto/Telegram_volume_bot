@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
 CoinEx screener bot
-Output columns (Telegram /screen or symbol lookup):
-  SYM | FUT | SPOT | % (with emoji, integers only)
+Table columns (Telegram):
+  SYM | FUT | SPOT | % | FUT(4h) | %(4h)
+- FUT/SPOT are 24h notionals in $M (integers)
+- % and %(4h) are rounded integers with emoji using thresholds:
+  🟢 >= +5%, 🟡 between -4.99%..+4.99%, 🔴 <= -5%
 
 Features:
 - /screen → P1: 10 rows, P2: 5 rows, P3: 5 rows
-- Type a coin ticker/name (e.g., "PYTH" or "$PYTH") → same table for that coin (ignores exclusions)
-- /excel  → Excel .xlsx (priority,symbol,usd_24h)
-- /diag   → diagnostics
+- Send a coin ticker (e.g., PYTH) → same table just for that coin (ignores exclusions)
+- /excel → Excel .xlsx (priority,symbol,usd_24h)
+- /diag  → diagnostics
 
-Exclusions for lists only: BTC, ETH, XRP, SOL, DOGE, ADA, PEPE, LINK
+Lists EXCLUDE bases: BTC, ETH, XRP, SOL, DOGE, ADA, PEPE, LINK
 Thresholds:
   P1: Futures ≥ $5M & Spot ≥ $500k
   P2: Futures ≥ $2M
@@ -43,7 +46,7 @@ EXCHANGE_ID = "coinex"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 STABLES = {"USD","USDT","USDC","TUSD","FDUSD","USDD","USDE","DAI","PYUSD"}
 
-# Exclusions (lists only — NOT applied to direct symbol query)
+# Exclusions (apply to lists only — NOT to direct symbol lookup)
 EXCLUDE_BASES = {"BTC","ETH","XRP","SOL","DOGE","ADA","PEPE","LINK"}
 
 LAST_ERROR: Optional[str] = None
@@ -92,6 +95,7 @@ def usd_notional(mv: Optional[MarketVol]) -> float:
     return mv.base_vol * price if price and mv.base_vol else 0.0
 
 def pct_change(mv_spot: Optional[MarketVol], mv_fut: Optional[MarketVol]) -> float:
+    """Prefer exchange-provided 24h percentage; else compute from open/last."""
     for mv in (mv_spot, mv_fut):
         if mv and mv.percentage:
             return float(mv.percentage)
@@ -100,17 +104,19 @@ def pct_change(mv_spot: Optional[MarketVol], mv_fut: Optional[MarketVol]) -> flo
         return (mv.last - mv.open) / mv.open * 100.0
     return 0.0
 
+# --- Display helpers (rounded integers & emoji thresholds) ---
 def pct_with_emoji(p: float) -> str:
-    p_rounded = round(p)  # integer only
-    if p_rounded <= -3: emoji = "🔴"
-    elif p_rounded >= 3: emoji = "🟢"
+    pr = round(p)
+    if pr <= -5: emoji = "🔴"
+    elif pr >= 5: emoji = "🟢"
     else: emoji = "🟡"
-    return f"{p_rounded:+d}% {emoji}"
+    return f"{pr:+d}% {emoji}"
 
 def m_dollars_int(x: float) -> str:
     """Return millions as integer (rounded)."""
     return str(round(x / 1_000_000.0))
 
+# --- CCXT wrappers ---
 def build_exchange(default_type: str):
     klass = ccxt.__dict__[EXCHANGE_ID]
     return klass({
@@ -130,8 +136,8 @@ def safe_fetch_tickers(ex: ccxt.Exchange) -> Dict[str, dict]:
         return {}
 
 def load_best(apply_exclusions: bool = True) -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol], int, int]:
-    """Return best spot/fut tickers per BASE.
-       If apply_exclusions=False, EXCLUDE_BASES is ignored (used for direct symbol query)."""
+    """Return 'best' spot/fut ticker per BASE (highest USD notional).
+       If apply_exclusions=False, EXCLUDE_BASES is ignored (for direct symbol lookup)."""
     # SPOT
     ex_spot = build_exchange("spot")
     spot_tickers = safe_fetch_tickers(ex_spot)
@@ -159,6 +165,41 @@ def load_best(apply_exclusions: bool = True) -> Tuple[Dict[str, MarketVol], Dict
 
     return best_spot, best_fut, len(spot_tickers), len(fut_tickers)
 
+# --- 4h futures metrics (volume + % change) ---
+def fut_4h_metrics(ex_fut: ccxt.Exchange, mv_fut: Optional[MarketVol]) -> Tuple[float, float]:
+    """
+    For the futures symbol, pull 1h candles (last 4).
+    Returns (usd_volume_4h, pct_change_4h).
+    Volume approximated as sum(base_volume * typical_price).
+    """
+    if not mv_fut:
+        return 0.0, 0.0
+    symbol = mv_fut.symbol  # e.g., "PYTH/USDT:USDT"
+    try:
+        # Some exchanges require market to be loaded
+        ex_fut.load_markets()
+        ohlcv = ex_fut.fetch_ohlcv(symbol, timeframe="1h", limit=4)
+        if not ohlcv or len(ohlcv) == 0:
+            return 0.0, 0.0
+        usd_vol = 0.0
+        first_open = None
+        last_close = None
+        for i, c in enumerate(ohlcv):
+            ts, o, h, l, cl, vol = c
+            typical = (h + l + cl) / 3.0
+            usd_vol += float(vol or 0.0) * float(typical or 0.0)
+            if i == 0:
+                first_open = float(o or 0.0)
+            last_close = float(cl or 0.0)
+        pct4 = 0.0
+        if first_open and first_open > 0 and last_close is not None:
+            pct4 = (last_close - first_open) / first_open * 100.0
+        return usd_vol, pct4
+    except Exception as e:
+        logging.exception(f"4h metrics failed for {symbol}: {e}")
+        return 0.0, 0.0
+
+# --- Build lists (P1/P2/P3) ---
 def build_priorities(best_spot, best_fut):
     """Return rows as [base, fut_usd, spot_usd, pct_24h]."""
     p1_full, p2_full, p3_full = [], [], []
@@ -197,22 +238,30 @@ def build_priorities(best_spot, best_fut):
 
     return p1, p2, p3
 
-def fmt_table(rows: List[List], title: str) -> str:
+# --- Formatting ---
+def fmt_table(rows: List[List], title: str, fut4h_map: Dict[str, Tuple[float,float]]) -> str:
     if not rows: return f"*{title}*: _None_\n"
-    pretty = [[r[0], m_dollars_int(r[1]), m_dollars_int(r[2]), pct_with_emoji(r[3])] for r in rows]
+    pretty = []
+    for r in rows:
+        base, fut_usd, spot_usd, pct24 = r
+        v4, p4 = fut4h_map.get(base, (0.0, 0.0))
+        pretty.append([base, m_dollars_int(fut_usd), m_dollars_int(spot_usd), pct_with_emoji(pct24),
+                       m_dollars_int(v4), pct_with_emoji(p4)])
     return (
         f"*{title}*:\n"
         "```\n" + tabulate(pretty,
-            headers=["SYM","FUT","SPOT","%"],
+            headers=["SYM","FUT","SPOT","%","FUT(4h)","%(4h)"],
             tablefmt="github"
         ) + "\n```\n"
     )
 
-def fmt_table_single(sym: str, fut_usd: float, spot_usd: float, pct: float, title: str) -> str:
-    rows = [[sym.upper(), m_dollars_int(fut_usd), m_dollars_int(spot_usd), pct_with_emoji(pct)]]
+def fmt_table_single(sym: str, fut_usd: float, spot_usd: float, pct: float,
+                     fut4_usd: float, pct4: float, title: str) -> str:
+    rows = [[sym.upper(), m_dollars_int(fut_usd), m_dollars_int(spot_usd), pct_with_emoji(pct),
+             m_dollars_int(fut4_usd), pct_with_emoji(pct4)]]
     return (
         f"*{title}*:\n"
-        "```\n" + tabulate(rows, headers=["SYM","FUT","SPOT","%"], tablefmt="github") + "\n```\n"
+        "```\n" + tabulate(rows, headers=["SYM","FUT","SPOT","%","FUT(4h)","%(4h)"], tablefmt="github") + "\n```\n"
     )
 
 # ---- Telegram handlers ----
@@ -232,11 +281,21 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t0 = time.time()
         best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best, True)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
+
+        # compute 4h metrics only for displayed rows to keep it fast
+        ex_fut = build_exchange("swap")
+        fut4_map: Dict[str, Tuple[float,float]] = {}
+        for rows in (p1, p2, p3):
+            for base, *_ in rows:
+                mvf = best_fut.get(base)
+                v4, p4 = fut_4h_metrics(ex_fut, mvf)
+                fut4_map[base] = (v4, p4)
+
         dt = time.time() - t0
         text = (
-            fmt_table(p1, f"Priority 1 (Fut≥$5M & Spot≥$500k) — Top {TOP_N_P1}") +
-            fmt_table(p2, f"Priority 2 (Fut≥$2M) — Top {TOP_N_P2}") +
-            fmt_table(p3, f"Priority 3 (Spot≥$3M) — Top {TOP_N_P3}") +
+            fmt_table(p1, f"Priority 1 (Fut≥$5M & Spot≥$500k) — Top {TOP_N_P1}", fut4_map) +
+            fmt_table(p2, f"Priority 2 (Fut≥$2M) — Top {TOP_N_P2}", fut4_map) +
+            fmt_table(p3, f"Priority 3 (Spot≥$3M) — Top {TOP_N_P3}", fut4_map) +
             f"⏱️ {dt:.1f}s • CoinEx via CCXT • tickers: spot={raw_spot_count}, fut={raw_fut_count}"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -246,6 +305,7 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {LAST_ERROR}")
 
 async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # (kept simple to preserve your existing workbook mapping)
     try:
         best_spot, best_fut, *_ = await asyncio.to_thread(load_best, True)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
@@ -280,7 +340,6 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- P1 rows: {TOP_N_P1}, P2 rows: {TOP_N_P2}, P3 rows: {TOP_N_P3}\n"
             f"- excludes (lists): {', '.join(sorted(EXCLUDE_BASES))}\n"
             f"- tickers fetched: spot={raw_spot_count}, fut={raw_fut_count}\n"
-            f"- bases kept: spot={len(best_spot)}, fut={len(best_fut)}\n"
             f"- last_error: {LAST_ERROR or '_None_'}"
         )
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -289,14 +348,12 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Symbol lookup (free text and /coin) ---
 def normalize_symbol_text(text: str) -> Optional[str]:
-    # Accept "$PYTH", "pyth", "PYTH.", "pyth/usdt", etc. → "PYTH"
+    # Accept "$PYTH", "pyth", "pyth/usdt", "PYTH.", etc. → "PYTH"
     if not text: return None
     s = text.strip()
-    # If user pasted a sentence, take the first token that looks like a ticker
     candidates = re.findall(r"[A-Za-z$]{2,10}", s)
     if not candidates: return None
     token = candidates[0].upper().lstrip("$")
-    # strip common suffixes
     token = token.replace(".", "").replace(",", "")
     return token if 2 <= len(token) <= 10 else None
 
@@ -307,27 +364,25 @@ async def coin_query(update: Update, symbol_text: str):
             await update.message.reply_text("Please provide a coin ticker, e.g. `PYTH`.", parse_mode=ParseMode.MARKDOWN)
             return
 
-        # Load without exclusions so you can query BTC/ETH/etc.
-        best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best, False)
+        # Ignore exclusions for direct query
+        best_spot, best_fut, *_ = await asyncio.to_thread(load_best, False)
         s = best_spot.get(base)
         f = best_fut.get(base)
 
-        # If not found in best maps (because no USD-quoted spot etc.), try a fallback scan:
-        if not s or not f:
-            # quick pass through markets to find any symbol that matches base
-            # This keeps it lightweight; main path already covers most cases.
-            pass  # keeping it simple; best_* maps usually have the base if listed
-
         fut_usd = usd_notional(f) if f else 0.0
         spot_usd = usd_notional(s) if s else 0.0
-        pct = pct_change(s, f)
+        pct24 = pct_change(s, f)
 
-        if fut_usd == 0.0 and spot_usd == 0.0:
+        # 4h metrics
+        ex_fut = build_exchange("swap")
+        fut4_usd, pct4 = fut_4h_metrics(ex_fut, f)
+
+        if fut_usd == 0.0 and spot_usd == 0.0 and fut4_usd == 0.0:
             await update.message.reply_text(f"Couldn't find data for `{base}`.", parse_mode=ParseMode.MARKDOWN)
             return
 
-        title = f"{base} (24h)"
-        text = fmt_table_single(base, fut_usd, spot_usd, pct, title)
+        title = f"{base} (24h & 4h)"
+        text = fmt_table_single(base, fut_usd, spot_usd, pct24, fut4_usd, pct4, title)
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
@@ -339,7 +394,6 @@ async def coin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await coin_query(update, arg or "")
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # If it's plain text (not a command), treat it as a coin query
     await coin_query(update, update.message.text or "")
 
 def main():
@@ -354,7 +408,7 @@ def main():
     app.add_handler(CommandHandler("diag", diag))
     app.add_handler(CommandHandler("coin", coin_cmd))  # /coin PYTH
 
-    # Plain-text symbol lookups (must be after commands)
+    # Plain-text symbol lookups
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     app.run_polling(drop_pending_updates=True)
