@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 CoinEx screener bot
-Output columns (Telegram /screen or symbol lookup):
-  SYM | FUT | SPOT | % (with emoji, integers only)
+Table columns (Telegram):
+  SYM | FUT | SPOT | % | FUT4H | %4H
+  - FUT, SPOT, FUT4H are in *million USD*, rounded to integers
+  - % and %4H are integers with emoji (🟢/🟡/🔴)
 
 Features:
-- /screen → P1: 10 rows, P2: 5 rows, P3: 5 rows
-- Type a coin ticker/name (e.g., "PYTH" or "$PYTH") → same table for that coin (ignores exclusions)
-- /excel  → Excel .xlsx (priority,symbol,usd_24h)
+- /screen → P1 (10 rows), P2 (5), P3 (5)
+- Type a ticker (e.g., PYTH or $PYTH) → one-row table for that coin (ignores exclusions)
+- /excel  → Excel .xlsx (legacy 3-col export to keep compatibility)
 - /diag   → diagnostics
 
 Exclusions for lists only: BTC, ETH, XRP, SOL, DOGE, ADA, PEPE, LINK
@@ -43,10 +45,13 @@ EXCHANGE_ID = "coinex"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 STABLES = {"USD","USDT","USDC","TUSD","FDUSD","USDD","USDE","DAI","PYUSD"}
 
-# Exclusions (lists only — NOT applied to direct symbol query)
+# Exclusions for lists (NOT for direct symbol query)
 EXCLUDE_BASES = {"BTC","ETH","XRP","SOL","DOGE","ADA","PEPE","LINK"}
 
 LAST_ERROR: Optional[str] = None
+
+# simple cache for 4H metrics to avoid repeated OHLCV calls in one run
+FOUR_H_CACHE: Dict[str, Tuple[float, float]] = {}  # symbol -> (fut4h_usd, pct4h)
 
 @dataclass
 class MarketVol:
@@ -92,6 +97,7 @@ def usd_notional(mv: Optional[MarketVol]) -> float:
     return mv.base_vol * price if price and mv.base_vol else 0.0
 
 def pct_change(mv_spot: Optional[MarketVol], mv_fut: Optional[MarketVol]) -> float:
+    """24h %: prefer ticker's percentage (spot then fut), else compute from open/last."""
     for mv in (mv_spot, mv_fut):
         if mv and mv.percentage:
             return float(mv.percentage)
@@ -130,8 +136,7 @@ def safe_fetch_tickers(ex: ccxt.Exchange) -> Dict[str, dict]:
         return {}
 
 def load_best(apply_exclusions: bool = True) -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol], int, int]:
-    """Return best spot/fut tickers per BASE.
-       If apply_exclusions=False, EXCLUDE_BASES is ignored (used for direct symbol query)."""
+    """Return best spot/fut tickers per BASE."""
     # SPOT
     ex_spot = build_exchange("spot")
     spot_tickers = safe_fetch_tickers(ex_spot)
@@ -159,8 +164,66 @@ def load_best(apply_exclusions: bool = True) -> Tuple[Dict[str, MarketVol], Dict
 
     return best_spot, best_fut, len(spot_tickers), len(fut_tickers)
 
-def build_priorities(best_spot, best_fut):
-    """Return rows as [base, fut_usd, spot_usd, pct_24h]."""
+# ---- 4H metrics from futures OHLCV(1h) ----
+def compute_4h_for_symbol(fut_symbol: str) -> Tuple[float, float]:
+    """
+    For a futures market symbol (e.g., 'PYTH/USDT:USDT'):
+      - FUT4H USD notional: sum of last 4 completed hourly candles' baseVolume * close
+      - %4H: (last_close - close_4h_ago) / close_4h_ago * 100
+    Returns (fut4h_usd, pct4h).
+    """
+    if fut_symbol in FOUR_H_CACHE:
+        return FOUR_H_CACHE[fut_symbol]
+
+    try:
+        ex = build_exchange("swap")
+        ex.load_markets()
+        # fetch 5-6 candles to be safe
+        candles = ex.fetch_ohlcv(fut_symbol, timeframe="1h", limit=6)
+        if not candles or len(candles) < 2:
+            FOUR_H_CACHE[fut_symbol] = (0.0, 0.0)
+            return FOUR_H_CACHE[fut_symbol]
+
+        # Use all but the last *partial* candle if necessary:
+        # CCXT usually returns only closed candles for 1h; if last is partial we still handle robustly.
+        # We'll consider the last 4 fully closed candles (i.e., the last 4 entries excluding the very last if partial).
+        # For simplicity, use the last 4 entries excluding the most recent one if we have 6; else last 4.
+        series = candles
+        if len(series) >= 6:
+            series = series[-5:]  # drop earliest; keep 5 to have 4h span and a ref
+        # Now, last index is the most recent closed; we sum the previous 4 for 4h volume and use first & last closes
+        # Ensure at least 5 entries; if only 5, indices [-5]..[-1]
+        closes = [c[4] for c in series]
+        vols   = [c[5] for c in series]  # base volume per hour
+        # Compute 4h USD notional: sum of last 4 hours baseVol * close
+        fut4h_usd = 0.0
+        for i in range(-4, 0):  # last 4 entries
+            price = closes[i]
+            basev = vols[i] or 0.0
+            fut4h_usd += (basev or 0.0) * (price or 0.0)
+
+        # %4h using close_now vs close_4h_ago
+        close_now = closes[-1]
+        close_4h_ago = closes[-5] if len(series) >= 5 else closes[0]
+        pct4h = ((close_now - close_4h_ago) / close_4h_ago * 100.0) if close_4h_ago else 0.0
+
+        FOUR_H_CACHE[fut_symbol] = (fut4h_usd, pct4h)
+        return FOUR_H_CACHE[fut_symbol]
+    except Exception as e:
+        logging.exception("compute_4h_for_symbol failed for %s", fut_symbol)
+        FOUR_H_CACHE[fut_symbol] = (0.0, 0.0)
+        return FOUR_H_CACHE[fut_symbol]
+
+def pct_with_emoji_int(p: float) -> str:
+    """Same as pct_with_emoji, kept for clarity."""
+    return pct_with_emoji(p)
+
+# ---- Priority builders ----
+def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVol]):
+    """
+    Rows are [base, fut_usd, spot_usd, pct_24h, fut4h_usd, pct_4h]
+    Sorting: P1 & P2 by fut_usd desc; P3 by spot_usd desc
+    """
     p1_full, p2_full, p3_full = [], [], []
 
     # P1
@@ -169,7 +232,8 @@ def build_priorities(best_spot, best_fut):
         s, f = best_spot[base], best_fut[base]
         fut_usd, spot_usd = usd_notional(f), usd_notional(s)
         if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
-            p1_full.append([base, fut_usd, spot_usd, pct_change(s, f)])
+            fut4h_usd, pct4h = compute_4h_for_symbol(f.symbol)
+            p1_full.append([base, fut_usd, spot_usd, pct_change(s, f), fut4h_usd, pct4h])
     p1_full.sort(key=lambda r: r[1], reverse=True)
     p1 = p1_full[:TOP_N_P1]
     used = {r[0] for r in p1}
@@ -180,7 +244,8 @@ def build_priorities(best_spot, best_fut):
         fut_usd = usd_notional(f)
         if fut_usd >= P2_FUT_MIN:
             s = best_spot.get(base)
-            p2_full.append([base, fut_usd, usd_notional(s) if s else 0.0, pct_change(s, f)])
+            fut4h_usd, pct4h = compute_4h_for_symbol(f.symbol)
+            p2_full.append([base, fut_usd, usd_notional(s) if s else 0.0, pct_change(s, f), fut4h_usd, pct4h])
     p2_full.sort(key=lambda r: r[1], reverse=True)
     p2 = p2_full[:TOP_N_P2]
     used.update({r[0] for r in p2})
@@ -191,46 +256,65 @@ def build_priorities(best_spot, best_fut):
         spot_usd = usd_notional(s)
         if spot_usd >= P3_SPOT_MIN:
             f = best_fut.get(base)
-            p3_full.append([base, usd_notional(f) if f else 0.0, spot_usd, pct_change(s, f)])
+            fut4h_usd, pct4h = compute_4h_for_symbol(f.symbol) if f else (0.0, 0.0)
+            p3_full.append([base, usd_notional(f) if f else 0.0, spot_usd, pct_change(s, f), fut4h_usd, pct4h])
     p3_full.sort(key=lambda r: r[2], reverse=True)
     p3 = p3_full[:TOP_N_P3]
 
     return p1, p2, p3
 
+# ---- Formatting ----
 def fmt_table(rows: List[List], title: str) -> str:
     if not rows: return f"*{title}*: _None_\n"
-    pretty = [[r[0], m_dollars_int(r[1]), m_dollars_int(r[2]), pct_with_emoji(r[3])] for r in rows]
+    pretty = [
+        [
+            r[0],
+            m_dollars_int(r[1]),                  # FUT M$
+            m_dollars_int(r[2]),                  # SPOT M$
+            pct_with_emoji(int(round(r[3]))),     # % 24h integer w/ emoji
+            m_dollars_int(r[4]),                  # FUT4H M$
+            pct_with_emoji(int(round(r[5]))),     # %4H integer w/ emoji
+        ] for r in rows
+    ]
     return (
         f"*{title}*:\n"
         "```\n" + tabulate(pretty,
-            headers=["SYM","FUT","SPOT","%"],
+            headers=["SYM","FUT","SPOT","%","FUT4H","%4H"],
             tablefmt="github"
         ) + "\n```\n"
     )
 
-def fmt_table_single(sym: str, fut_usd: float, spot_usd: float, pct: float, title: str) -> str:
-    rows = [[sym.upper(), m_dollars_int(fut_usd), m_dollars_int(spot_usd), pct_with_emoji(pct)]]
+def fmt_table_single(sym: str, fut_usd: float, spot_usd: float, pct: float,
+                     fut4h_usd: float, pct4h: float, title: str) -> str:
+    row = [[sym.upper(),
+            m_dollars_int(fut_usd),
+            m_dollars_int(spot_usd),
+            pct_with_emoji(int(round(pct))),
+            m_dollars_int(fut4h_usd),
+            pct_with_emoji(int(round(pct4h)))]]
     return (
         f"*{title}*:\n"
-        "```\n" + tabulate(rows, headers=["SYM","FUT","SPOT","%"], tablefmt="github") + "\n```\n"
+        "```\n" + tabulate(row, headers=["SYM","FUT","SPOT","%","FUT4H","%4H"], tablefmt="github") + "\n```\n"
     )
 
 # ---- Telegram handlers ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Commands:\n"
-        "• /screen → P1(10), P2(5), P3(5) lists\n"
+        "• /screen → P1(10), P2(5), P3(5) with columns: SYM | FUT | SPOT | % | FUT4H | %4H\n"
         "• /excel  → Excel file (.xlsx)\n"
         "• /diag   → diagnostics\n"
-        "Tip: Send a coin ticker (e.g., PYTH or $PYTH) to get its table."
+        "Tip: Send a ticker (e.g., PYTH) to get a one-row table for that coin."
     )
 
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global LAST_ERROR
+    global LAST_ERROR, FOUR_H_CACHE
     LAST_ERROR = None
+    FOUR_H_CACHE = {}  # reset cache each run
     try:
         t0 = time.time()
         best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best, True)
+        # Compute priorities (this will also compute 4H for needed futures symbols)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
         dt = time.time() - t0
         text = (
@@ -253,10 +337,11 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wb = Workbook()
         ws = wb.active
         ws.title = "Screener"
+        # keep legacy schema to avoid breaking any existing Excel connections you set up
         ws.append(["priority","symbol","usd_24h"])
-        for sym, fut_usd, spot_usd, _ in p1: ws.append(["P1", sym, fut_usd])
-        for sym, fut_usd, spot_usd, _ in p2: ws.append(["P2", sym, fut_usd])
-        for sym, fut_usd, spot_usd, _ in p3: ws.append(["P3", sym, spot_usd])
+        for sym, fut_usd, spot_usd, _, _, _ in p1: ws.append(["P1", sym, fut_usd])
+        for sym, fut_usd, spot_usd, _, _, _ in p2: ws.append(["P2", sym, fut_usd])
+        for sym, fut_usd, spot_usd, _, _, _ in p3: ws.append(["P3", sym, spot_usd])
 
         buf = io.BytesIO()
         wb.save(buf)
@@ -292,15 +377,14 @@ def normalize_symbol_text(text: str) -> Optional[str]:
     # Accept "$PYTH", "pyth", "PYTH.", "pyth/usdt", etc. → "PYTH"
     if not text: return None
     s = text.strip()
-    # If user pasted a sentence, take the first token that looks like a ticker
     candidates = re.findall(r"[A-Za-z$]{2,10}", s)
     if not candidates: return None
     token = candidates[0].upper().lstrip("$")
-    # strip common suffixes
     token = token.replace(".", "").replace(",", "")
     return token if 2 <= len(token) <= 10 else None
 
 async def coin_query(update: Update, symbol_text: str):
+    global FOUR_H_CACHE
     try:
         base = normalize_symbol_text(symbol_text)
         if not base:
@@ -308,26 +392,25 @@ async def coin_query(update: Update, symbol_text: str):
             return
 
         # Load without exclusions so you can query BTC/ETH/etc.
+        FOUR_H_CACHE = {}
         best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best, False)
         s = best_spot.get(base)
         f = best_fut.get(base)
-
-        # If not found in best maps (because no USD-quoted spot etc.), try a fallback scan:
-        if not s or not f:
-            # quick pass through markets to find any symbol that matches base
-            # This keeps it lightweight; main path already covers most cases.
-            pass  # keeping it simple; best_* maps usually have the base if listed
 
         fut_usd = usd_notional(f) if f else 0.0
         spot_usd = usd_notional(s) if s else 0.0
         pct = pct_change(s, f)
 
-        if fut_usd == 0.0 and spot_usd == 0.0:
+        fut4h_usd, pct4h = (0.0, 0.0)
+        if f:
+            fut4h_usd, pct4h = await asyncio.to_thread(compute_4h_for_symbol, f.symbol)
+
+        if fut_usd == 0.0 and spot_usd == 0.0 and fut4h_usd == 0.0:
             await update.message.reply_text(f"Couldn't find data for `{base}`.", parse_mode=ParseMode.MARKDOWN)
             return
 
-        title = f"{base} (24h)"
-        text = fmt_table_single(base, fut_usd, spot_usd, pct, title)
+        title = f"{base} (24h / 4h)"
+        text = fmt_table_single(base, fut_usd, spot_usd, pct, fut4h_usd, pct4h, title)
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
