@@ -42,6 +42,10 @@ TOP_N_P1    = 10
 TOP_N_P2    = 5
 TOP_N_P3    = 5
 
+# Timeouts for 4h metrics
+FOUR_H_PER_SYMBOL_TIMEOUT = 5.0   # seconds per symbol
+FOUR_H_OVERALL_TIMEOUT    = 12.0  # seconds overall cap
+
 EXCHANGE_ID = "coinex"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 STABLES = {"USD","USDT","USDC","TUSD","FDUSD","USDD","USDE","DAI","PYUSD"}
@@ -166,48 +170,66 @@ def load_best(apply_exclusions: bool = True) -> Tuple[Dict[str, MarketVol], Dict
     return best_spot, best_fut, len(spot_tickers), len(fut_tickers)
 
 # --- 4h futures metrics (volume + % change) ---
-def fut_4h_metrics(ex_fut: ccxt.Exchange, mv_fut: Optional[MarketVol], fut_usd_24h: float) -> Tuple[float, float]:
+def fut_4h_metrics_thread(symbol: str, fut_usd_24h: float) -> Tuple[float, float]:
     """
-    For the futures symbol, pull 1h candles (last 4).
-    Returns (usd_volume_4h, pct_change_4h).
-    Candle volume is often in CONTRACTS for swaps; convert using market.contractSize when contract==True.
-    We also cap 4h volume at the 24h futures notional for sanity.
+    Thread worker: new exchange per call (thread-safe), fetch 4×1h candles.
+    Returns (usd_volume_4h, pct_change_4h), capped to 24h fut notional.
     """
-    if not mv_fut:
-        return 0.0, 0.0
-    symbol = mv_fut.symbol  # e.g., "AAVE/USDT:USDT"
     try:
-        ex_fut.load_markets()
-        market = ex_fut.market(symbol)
+        ex = build_exchange("swap")
+        ex.load_markets()
+        market = ex.market(symbol)
         is_contract = bool(market.get("contract"))
         contract_size = float(market.get("contractSize") or 1.0)
-
-        ohlcv = ex_fut.fetch_ohlcv(symbol, timeframe="1h", limit=4)
+        ohlcv = ex.fetch_ohlcv(symbol, timeframe="1h", limit=4)
         if not ohlcv:
             return 0.0, 0.0
-
         usd_vol = 0.0
         first_open = None
         last_close = None
         for i, c in enumerate(ohlcv):
-            ts, o, h, l, cl, vol = c
+            _, o, h, l, cl, vol = c
             vol = float(vol or 0.0)
-            # If contract market, 'vol' is contracts → convert to base units
             base_qty = vol * contract_size if is_contract else vol
             typical = (float(h or 0.0) + float(l or 0.0) + float(cl or 0.0)) / 3.0
             usd_vol += base_qty * typical
             if i == 0:
                 first_open = float(o or 0.0)
             last_close = float(cl or 0.0)
-
         pct4 = 0.0
         if first_open and first_open > 0 and last_close is not None:
             pct4 = (last_close - first_open) / first_open * 100.0
-
-        # Sanity: 4h must not exceed 24h
         if fut_usd_24h and fut_usd_24h > 0:
             usd_vol = min(usd_vol, fut_usd_24h)
-
         return usd_vol, pct4
-    except Exception as e:
-        logging.exception(f"4h metrics failed for {symbol}: {e}")
+    except Exception:
+        logging.exception(f"4h metrics failed for {symbol}")
+        return 0.0, 0.0
+
+async def build_fut4_map(bases: List[str], best_fut: Dict[str, MarketVol], fut_usd_map: Dict[str, float]) -> Dict[str, Tuple[float,float]]:
+    """
+    Compute FUT(4h) and %(4h) in parallel with timeouts.
+    Returns dict base -> (usd4h, pct4h). Defaults to (0,0) on timeout/fail.
+    """
+    tasks = []
+    for base in bases:
+        mvf = best_fut.get(base)
+        if not mvf:
+            continue
+        symbol = mvf.symbol
+        fut_usd_24h = fut_usd_map.get(base, 0.0)
+        # Run each CCXT call in a worker thread with per-call timeout
+        coro = asyncio.wait_for(asyncio.to_thread(fut_4h_metrics_thread, symbol, fut_usd_24h),
+                                timeout=FOUR_H_PER_SYMBOL_TIMEOUT)
+        tasks.append((base, coro))
+
+    results: Dict[str, Tuple[float,float]] = {b: (0.0, 0.0) for b in bases}
+
+    if not tasks:
+        return results
+
+    async def gather_with_overall_timeout():
+        pairs = []
+        for base, coro in tasks:
+            try:
+                v4, p4 = await coro
