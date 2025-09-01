@@ -44,7 +44,7 @@ EXCHANGE_ID = "coinex"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 STABLES = {"USD","USDT","USDC","TUSD","FDUSD","USDD","USDE","DAI","PYUSD"}
 
-EXCLUDE_BASES = {"BTC","ETH","XRP","SOL","DOGE","ADA","PEPE","LINK"}
+EXCLUDE_BASES = {"BTC","ETH","XRP","SOL","DOGE","ADA","PEPE","LINK"}  # lists only
 
 LAST_ERROR: Optional[str] = None
 PCT4H_CACHE: Dict[Tuple[str,str], float] = {}
@@ -203,10 +203,7 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
         spot_usd = usd_notional(s)
         if spot_usd >= P3_SPOT_MIN:
             f = best_fut.get(base)
-            if f:
-                pct4h = compute_pct4h_for_symbol(f.symbol, True)
-            else:
-                pct4h = compute_pct4h_for_symbol(s.symbol, False)
+            pct4h = compute_pct4h_for_symbol(f.symbol, True) if f else compute_pct4h_for_symbol(s.symbol, False)
             p3_full.append([base, usd_notional(f) if f else 0.0, spot_usd, pct_change(s, f), pct4h])
     p3_full.sort(key=lambda r: r[2], reverse=True)
     p3 = p3_full[:TOP_N_P3]
@@ -225,7 +222,13 @@ def fmt_table_single(sym: str, fut_usd: float, spot_usd: float, pct: float, pct4
 
 # ---- Telegram handlers ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Commands:\n• /screen → P1(10), P2(5), P3(5)\n• /excel  → Excel file\n• /diag   → diagnostics\nTip: Send a ticker (e.g., PYTH) to get info.")
+    await update.message.reply_text(
+        "👋 Commands:\n"
+        "• /screen → P1(10), P2(5), P3(5) with columns: SYM | F | S | % | %4H\n"
+        "• /excel  → Excel file (.xlsx)\n"
+        "• /diag   → diagnostics\n"
+        "Tip: Send a ticker (e.g., PYTH) to get a one-row table for that coin."
+    )
 
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LAST_ERROR, PCT4H_CACHE
@@ -236,10 +239,12 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best, True)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
         dt = time.time() - t0
-        text = fmt_table(p1, f"Priority 1 (F≥$5M & S≥$500k) — Top {TOP_N_P1}") + \
-               fmt_table(p2, f"Priority 2 (F≥$2M) — Top {TOP_N_P2}") + \
-               fmt_table(p3, f"Priority 3 (S≥$3M) — Top {TOP_N_P3}") + \
-               f"⏱️ {dt:.1f}s • CoinEx via CCXT • tickers: spot={raw_spot_count}, fut={raw_fut_count}"
+        text = (
+            fmt_table(p1, f"Priority 1 (F≥$5M & S≥$500k) — Top {TOP_N_P1}") +
+            fmt_table(p2, f"Priority 2 (F≥$2M) — Top {TOP_N_P2}") +
+            fmt_table(p3, f"Priority 3 (S≥$3M) — Top {TOP_N_P3}") +
+            f"⏱️ {dt:.1f}s • CoinEx via CCXT • tickers: spot={raw_spot_count}, fut={raw_fut_count}"
+        )
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         LAST_ERROR = f"{type(e).__name__}: {e}\n" + traceback.format_exc(limit=3)
@@ -250,13 +255,23 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         best_spot, best_fut, *_ = await asyncio.to_thread(load_best, True)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
-        wb = Workbook(); ws = wb.active; ws.title = "Screener"
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Screener"
+        # Keep legacy schema (priority,symbol,usd_24h) for compatibility
         ws.append(["priority","symbol","usd_24h"])
         for sym, fut_usd, spot_usd, _, _ in p1: ws.append(["P1", sym, fut_usd])
         for sym, fut_usd, spot_usd, _, _ in p2: ws.append(["P2", sym, fut_usd])
         for sym, fut_usd, spot_usd, _, _ in p3: ws.append(["P3", sym, spot_usd])
-        buf = io.BytesIO(); wb.save(buf); buf.seek(0)
-        await update.message.reply_document(document=InputFile(buf, filename="screener.xlsx"), caption="Excel export")
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        await update.message.reply_document(
+            document=InputFile(buf, filename="screener.xlsx"),
+            caption="Excel export (priority,symbol,usd_24h)"
+        )
     except Exception as e:
         logging.exception("excel error")
         await update.message.reply_text(f"Error: {e}")
@@ -264,10 +279,19 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best, True)
-        msg = f"*Diag*\n- thresholds: P1 F≥{P1_FUT_MIN:,}, S≥{P1_SPOT_MIN:,} | P2 F≥{P2_FUT_MIN:,} | P3 S≥{P3_SPOT_MIN:,}\n- P1 rows: {TOP_N_P1}, P2: {TOP_N_P2}, P3: {TOP_N_P3}\n- excludes: {', '.join(sorted(EXCLUDE_BASES))}\n- tickers fetched: spot={raw_spot_count}, fut={raw_fut_count}\n- kept: spot={len(best_spot)}, fut={len(best_fut)}\n- last_error: {LAST_ERROR or '_None_'}"
+        msg = (
+            "*Diag*\n"
+            f"- thresholds: P1 F≥${P1_FUT_MIN:,} & S≥${P1_SPOT_MIN:,} | "
+            f"P2 F≥${P2_FUT_MIN:,} | P3 S≥${P3_SPOT_MIN:,}\n"
+            f"- P1 rows: {TOP_N_P1}, P2: {TOP_N_P2}, P3: {TOP_N_P3}\n"
+            f"- excludes (lists): {', '.join(sorted(EXCLUDE_BASES))}\n"
+            f"- tickers fetched: spot={raw_spot_count}, fut={raw_fut_count}\n"
+            f"- kept: spot={len(best_spot)}, fut={len(best_fut)}\n"
+            f"- last_error: {LAST_ERROR or '_None_'}"
+        )
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        await update.message.reply_text(f"Diag error: {e}")
+        await update.message.reply_text(f"Diag error: {type(e).__name__}: {e}")
 
 # --- Symbol lookup ---
 def normalize_symbol_text(text: str) -> Optional[str]:
@@ -276,6 +300,7 @@ def normalize_symbol_text(text: str) -> Optional[str]:
     candidates = re.findall(r"[A-Za-z$]{2,10}", s)
     if not candidates: return None
     token = candidates[0].upper().lstrip("$")
+    token = token.replace(".", "").replace(",", "")
     return token if 2 <= len(token) <= 10 else None
 
 async def coin_query(update: Update, symbol_text: str):
@@ -288,11 +313,14 @@ async def coin_query(update: Update, symbol_text: str):
         PCT4H_CACHE = {}
         best_spot, best_fut, *_ = await asyncio.to_thread(load_best, False)
         s, f = best_spot.get(base), best_fut.get(base)
-        fut_usd, spot_usd = usd_notional(f) if f else 0.0, usd_notional(s) if s else 0.0
+        fut_usd = usd_notional(f) if f else 0.0
+        spot_usd = usd_notional(s) if s else 0.0
         pct = pct_change(s, f)
         pct4h = 0.0
-        if f: pct4h = await asyncio.to_thread(compute_pct4h_for_symbol, f.symbol, True)
-        elif s: pct4h = await asyncio.to_thread(compute_pct4h_for_symbol, s.symbol, False)
+        if f:
+            pct4h = await asyncio.to_thread(compute_pct4h_for_symbol, f.symbol, True)
+        elif s:
+            pct4h = await asyncio.to_thread(compute_pct4h_for_symbol, s.symbol, False)
         if fut_usd == 0.0 and spot_usd == 0.0:
             await update.message.reply_text(f"Couldn't find data for `{base}`.", parse_mode=ParseMode.MARKDOWN)
             return
@@ -300,14 +328,32 @@ async def coin_query(update: Update, symbol_text: str):
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logging.exception("coin query error")
-        await update.message.reply_text(f"Error: {e}")
+        await update.message.reply_text(f"Error: {type(e).__name__}: {e}")
 
 async def coin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = " ".join(context.args) if context.args else ""
-    await coin_query(update, arg)
+    await coin_query(update, arg or "")
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await coin_query(update, update.message.text or "")
 
 def main():
-    if not TOKEN: raise RuntimeError("
+    if not TOKEN:
+        raise RuntimeError("Set TELEGRAM_TOKEN env var")
+    logging.basicConfig(level=logging.INFO)
+    app = Application.builder().token(TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("screen", screen))
+    app.add_handler(CommandHandler("excel", excel_cmd))
+    app.add_handler(CommandHandler("diag", diag))
+    app.add_handler(CommandHandler("coin", coin_cmd))  # /coin PYTH
+
+    # Plain-text symbol lookups (must be after commands)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
