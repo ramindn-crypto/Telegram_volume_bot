@@ -13,8 +13,8 @@ Features:
 - /diag   → diagnostics
 
 Priority rules:
-  P1: Futures ≥ $5M & Spot ≥ $500k (EXCLUDES pinned)
-  P2: Futures ≥ $2M             (EXCLUDES pinned)
+  P1: Futures ≥ $5M & Spot ≥ $500k (EXCLUDES pinned; pinned can NEVER appear in P1)
+  P2: Futures ≥ $2M             (EXCLUDES pinned; pinned can NEVER appear in P2)
   P3: Always include pinned + Spot ≥ $3M (pinned first), TOTAL 10 rows
 """
 
@@ -45,6 +45,7 @@ STABLES = {"USD","USDT","USDC","TUSD","FDUSD","USDD","USDE","DAI","PYUSD"}
 
 # Pinned coins: must appear only in P3 (never in P1/P2)
 PINNED_P3 = ["BTC","ETH","XRP","SOL","DOGE","ADA","PEPE","LINK"]
+PINNED_SET = set(PINNED_P3)
 
 LAST_ERROR: Optional[str] = None
 PCT4H_CACHE: Dict[Tuple[str,str], float] = {}
@@ -155,32 +156,34 @@ def load_best() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol], int, int]:
     return best_spot, best_fut, len(spot_tickers), len(fut_tickers)
 
 # ---- 4H % from 1h OHLCV ----
-PCT4H_CACHE: Dict[Tuple[str,str], float] = {}
-
 def compute_pct4h_for_symbol(market_symbol: str, prefer_swap: bool = True) -> float:
     """
     Compute % change over the last 4 completed hours using 1h candles.
     Prefer futures ('swap') series; fall back to spot if needed.
     """
+    cache_key = ("swap" if prefer_swap else "spot", market_symbol)
+    if cache_key in PCT4H_CACHE:
+        return PCT4H_CACHE[cache_key]
+
     try_order = ["swap", "spot"] if prefer_swap else ["spot", "swap"]
     for dtype in try_order:
-        cache_key = (dtype, market_symbol)
-        if cache_key in PCT4H_CACHE:
-            return PCT4H_CACHE[cache_key]
+        ck = (dtype, market_symbol)
+        if ck in PCT4H_CACHE:
+            return PCT4H_CACHE[ck]
         try:
             ex = build_exchange(dtype)
             ex.load_markets()
             candles = ex.fetch_ohlcv(market_symbol, timeframe="1h", limit=5)
             if not candles or len(candles) < 5:
-                PCT4H_CACHE[cache_key] = 0.0
+                PCT4H_CACHE[ck] = 0.0
                 continue
             closes = [c[4] for c in candles]
             pct4h = ((closes[-1] - closes[0]) / closes[0] * 100.0) if closes[0] else 0.0
-            PCT4H_CACHE[cache_key] = pct4h
+            PCT4H_CACHE[ck] = pct4h
             return pct4h
         except Exception:
             logging.exception("compute_pct4h_for_symbol failed for %s (%s)", market_symbol, dtype)
-            PCT4H_CACHE[cache_key] = 0.0
+            PCT4H_CACHE[ck] = 0.0
             continue
     return 0.0
 
@@ -193,37 +196,43 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
       P1 & P2 by FUT USD desc (EXCLUDE pinned).
       P3 always includes pinned coins + others with SPOT ≥ $3M; pinned first; cap to 10.
     """
-    p1_full, p2_full, p3_full = [], [], []
+    p1_full, p2_full = [], []
+    used = set()  # bases already placed in P1 or P2
 
-    pinned_set = set(PINNED_P3)
-
-    # P1: Fut≥5M & Spot≥500k (EXCLUDING pinned)
+    # --- P1: Fut≥5M & Spot≥500k (EXCLUDING pinned) ---
     for base in set(best_spot) & set(best_fut):
-        if base in pinned_set:
-            continue
+        if base in PINNED_SET:
+            continue  # hard exclude pinned from P1
         s, f = best_spot[base], best_fut[base]
         fut_usd, spot_usd = usd_notional(f), usd_notional(s)
         if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
             pct4h = compute_pct4h_for_symbol(f.symbol, True)
             p1_full.append([base, fut_usd, spot_usd, pct_change(s, f), pct4h])
+
+    # Sort and slice
     p1_full.sort(key=lambda r: r[1], reverse=True)
     p1 = p1_full[:TOP_N_P1]
-    used = {r[0] for r in p1}
+    # Safety filter: ensure no pinned in final P1
+    p1 = [row for row in p1 if row[0] not in PINNED_SET]
+    used.update({r[0] for r in p1})
 
-    # P2: Fut≥2M (EXCLUDING pinned and already used)
+    # --- P2: Fut≥2M (EXCLUDING pinned and already used) ---
     for base, f in best_fut.items():
-        if base in used or base in pinned_set:
-            continue
+        if base in used or base in PINNED_SET:
+            continue  # hard exclude pinned from P2
         fut_usd = usd_notional(f)
         if fut_usd >= P2_FUT_MIN:
             s = best_spot.get(base)
             pct4h = compute_pct4h_for_symbol(f.symbol, True)
             p2_full.append([base, fut_usd, usd_notional(s) if s else 0.0, pct_change(s, f), pct4h])
+
     p2_full.sort(key=lambda r: r[1], reverse=True)
     p2 = p2_full[:TOP_N_P2]
+    # Safety filter: ensure no pinned in final P2
+    p2 = [row for row in p2 if row[0] not in PINNED_SET]
     used.update({r[0] for r in p2})
 
-    # P3: Always include pinned + Spot≥3M others (not already used), pinned first
+    # --- P3: Always include pinned + Spot≥3M others (not already used), pinned first ---
     p3_dict: Dict[str, List] = {}
 
     # Add pinned coins (even if they don't meet P3_SPOT_MIN)
@@ -231,7 +240,7 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
         s = best_spot.get(base)
         f = best_fut.get(base)
         if not s and not f:
-            continue  # no data
+            continue  # no data available
         fut_usd = usd_notional(f) if f else 0.0
         spot_usd = usd_notional(s) if s else 0.0
         pct = pct_change(s, f)
@@ -240,7 +249,7 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
 
     # Add non-pinned others meeting Spot≥3M (not already used)
     for base, s in best_spot.items():
-        if base in used or base in pinned_set:
+        if base in used or base in PINNED_SET:
             continue
         spot_usd = usd_notional(s)
         if spot_usd >= P3_SPOT_MIN:
@@ -250,8 +259,8 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
 
     # Sort: pinned first by spot desc, then others by spot desc; cap to TOP_N_P3
     all_rows = list(p3_dict.values())
-    pinned_rows = [r for r in all_rows if r[0] in pinned_set]
-    other_rows  = [r for r in all_rows if r[0] not in pinned_set]
+    pinned_rows = [r for r in all_rows if r[0] in PINNED_SET]
+    other_rows  = [r for r in all_rows if r[0] not in PINNED_SET]
     pinned_rows.sort(key=lambda r: r[2], reverse=True)
     other_rows.sort(key=lambda r: r[2], reverse=True)
     p3 = (pinned_rows + other_rows)[:TOP_N_P3]
@@ -288,8 +297,8 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
         dt = time.time() - t0
         text = (
-            fmt_table(p1, f"Priority 1 (F≥$5M & S≥$500k) — Top {TOP_N_P1}") +
-            fmt_table(p2, f"Priority 2 (F≥$2M) — Top {TOP_N_P2}") +
+            fmt_table(p1, f"Priority 1 (F≥$5M & S≥$500k — pinned excluded) — Top {TOP_N_P1}") +
+            fmt_table(p2, f"Priority 2 (F≥$2M — pinned excluded) — Top {TOP_N_P2}") +
             fmt_table(p3, f"Priority 3 (Pinned + S≥$3M) — Top {TOP_N_P3}") +
             f"⏱️ {dt:.1f}s • CoinEx via CCXT • tickers: spot={raw_spot_count}, fut={raw_fut_count}"
         )
