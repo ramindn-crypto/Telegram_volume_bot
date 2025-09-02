@@ -3,19 +3,19 @@
 CoinEx screener bot
 Table columns (Telegram):
   SYM | F | S | % | %4H
-  - F, S are *million USD*, rounded integers
+  - F, S are *million USD*, rounded to integers
   - % and %4H are integers with emoji (🟢/🟡/🔴)
 
 Features:
-- /screen → P1 (10 rows), P2 (5), P3 (10; includes pinned: BTC,ETH,XRP,SOL,DOGE,ADA,PEPE,LINK)
-- Type a ticker (e.g., PYTH or $PYTH) → one-row table for that coin (no exclusions)
+- /screen → P1 (10 rows), P2 (5), P3 (10; P3 always includes pinned: BTC,ETH,XRP,SOL,DOGE,ADA,PEPE,LINK)
+- Type a ticker (e.g., PYTH or $PYTH) → one-row table for that coin
 - /excel  → Excel .xlsx (legacy 3-col export kept)
 - /diag   → diagnostics
 
-Thresholds:
-  P1: Futures ≥ $5M & Spot ≥ $500k
-  P2: Futures ≥ $2M
-  P3: Spot   ≥ $3M   (+ always include pinned coins regardless of threshold)
+Priority rules:
+  P1: Futures ≥ $5M & Spot ≥ $500k (EXCLUDES pinned)
+  P2: Futures ≥ $2M             (EXCLUDES pinned)
+  P3: Always include pinned + Spot ≥ $3M (pinned first), TOTAL 10 rows
 """
 
 import asyncio, logging, os, time, io, traceback, re
@@ -37,14 +37,14 @@ P3_SPOT_MIN = 3_000_000
 
 TOP_N_P1 = 10
 TOP_N_P2 = 5
-TOP_N_P3 = 10  # changed to 10
+TOP_N_P3 = 10
 
 EXCHANGE_ID = "coinex"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 STABLES = {"USD","USDT","USDC","TUSD","FDUSD","USDD","USDE","DAI","PYUSD"}
 
-# No exclusions for lists anymore
-PINNED_P3 = ["BTC","ETH","XRP","SOL","DOGE","ADA","PEPE","LINK"]  # always included in P3
+# Pinned coins: must appear only in P3 (never in P1/P2)
+PINNED_P3 = ["BTC","ETH","XRP","SOL","DOGE","ADA","PEPE","LINK"]
 
 LAST_ERROR: Optional[str] = None
 PCT4H_CACHE: Dict[Tuple[str,str], float] = {}
@@ -81,6 +81,7 @@ def to_mv(t: dict) -> Optional[MarketVol]:
     return MarketVol(sym, base, quote, last, open_, percentage, base_vol, quote_vol, vwap)
 
 def usd_notional(mv: Optional[MarketVol]) -> float:
+    """24h notional in USD terms. Prefer quoteVolume if USD-quoted; else baseVolume * (vwap or last)."""
     if not mv: return 0.0
     if mv.quote in STABLES and mv.quote_vol and mv.quote_vol > 0:
         return mv.quote_vol
@@ -88,6 +89,7 @@ def usd_notional(mv: Optional[MarketVol]) -> float:
     return mv.base_vol * price if price and mv.base_vol else 0.0
 
 def pct_change(mv_spot: Optional[MarketVol], mv_fut: Optional[MarketVol]) -> float:
+    """24h % change: prefer ticker 'percentage' (spot then futures); else compute from open/last."""
     for mv in (mv_spot, mv_fut):
         if mv and mv.percentage:
             return float(mv.percentage)
@@ -97,20 +99,21 @@ def pct_change(mv_spot: Optional[MarketVol], mv_fut: Optional[MarketVol]) -> flo
     return 0.0
 
 def pct_with_emoji(p: float) -> str:
-    p_rounded = round(p)
+    p_rounded = round(p)  # integer only
     if p_rounded <= -3: emoji = "🔴"
     elif p_rounded >= 3: emoji = "🟢"
     else: emoji = "🟡"
     return f"{p_rounded:+d}% {emoji}"
 
 def m_dollars_int(x: float) -> str:
+    """Return millions as an integer (rounded)."""
     return str(round(x / 1_000_000.0))
 
 def build_exchange(default_type: str):
     klass = ccxt.__dict__[EXCHANGE_ID]
     return klass({
         "enableRateLimit": True,
-               "timeout": 20000,
+        "timeout": 20000,
         "options": {"defaultType": default_type},
     })
 
@@ -124,8 +127,8 @@ def safe_fetch_tickers(ex: ccxt.Exchange) -> Dict[str, dict]:
         logging.exception("fetch_tickers failed")
         return {}
 
-def load_best(apply_exclusions: bool = False) -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol], int, int]:
-    """Return best spot/fut tickers per base (no exclusions)."""
+def load_best() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol], int, int]:
+    """Return best spot/futures tickers per BASE (no exclusions)."""
     # SPOT
     ex_spot = build_exchange("spot")
     spot_tickers = safe_fetch_tickers(ex_spot)
@@ -134,23 +137,31 @@ def load_best(apply_exclusions: bool = False) -> Tuple[Dict[str, MarketVol], Dic
         mv = to_mv(t)
         if not mv: continue
         if mv.quote not in STABLES: continue
-        if mv.base not in best_spot or usd_notional(mv) > usd_notional(best_spot[mv.base]):
+        prev = best_spot.get(mv.base)
+        if prev is None or usd_notional(mv) > usd_notional(prev):
             best_spot[mv.base] = mv
 
-    # FUTURES
+    # FUTURES (swap)
     ex_fut = build_exchange("swap")
     fut_tickers = safe_fetch_tickers(ex_fut)
     best_fut: Dict[str, MarketVol] = {}
     for _, t in fut_tickers.items():
         mv = to_mv(t)
         if not mv: continue
-        if mv.base not in best_fut or usd_notional(mv) > usd_notional(best_fut[mv.base]):
+        prev = best_fut.get(mv.base)
+        if prev is None or usd_notional(mv) > usd_notional(prev):
             best_fut[mv.base] = mv
 
     return best_spot, best_fut, len(spot_tickers), len(fut_tickers)
 
-# ---- 4H % ----
+# ---- 4H % from 1h OHLCV ----
+PCT4H_CACHE: Dict[Tuple[str,str], float] = {}
+
 def compute_pct4h_for_symbol(market_symbol: str, prefer_swap: bool = True) -> float:
+    """
+    Compute % change over the last 4 completed hours using 1h candles.
+    Prefer futures ('swap') series; fall back to spot if needed.
+    """
     try_order = ["swap", "spot"] if prefer_swap else ["spot", "swap"]
     for dtype in try_order:
         cache_key = (dtype, market_symbol)
@@ -179,12 +190,17 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
     Returns:
       p1, p2, p3  where each row = [base, fut_usd, spot_usd, pct_24h, pct_4h]
     Sorting:
-      P1 & P2 by futures USD desc; P3 by spot USD desc, with pinned coins always included.
+      P1 & P2 by FUT USD desc (EXCLUDE pinned).
+      P3 always includes pinned coins + others with SPOT ≥ $3M; pinned first; cap to 10.
     """
     p1_full, p2_full, p3_full = [], [], []
 
-    # P1: Fut≥5M & Spot≥500k
+    pinned_set = set(PINNED_P3)
+
+    # P1: Fut≥5M & Spot≥500k (EXCLUDING pinned)
     for base in set(best_spot) & set(best_fut):
+        if base in pinned_set:
+            continue
         s, f = best_spot[base], best_fut[base]
         fut_usd, spot_usd = usd_notional(f), usd_notional(s)
         if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
@@ -194,9 +210,10 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
     p1 = p1_full[:TOP_N_P1]
     used = {r[0] for r in p1}
 
-    # P2: Fut≥2M (not already used)
+    # P2: Fut≥2M (EXCLUDING pinned and already used)
     for base, f in best_fut.items():
-        if base in used: continue
+        if base in used or base in pinned_set:
+            continue
         fut_usd = usd_notional(f)
         if fut_usd >= P2_FUT_MIN:
             s = best_spot.get(base)
@@ -206,42 +223,38 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
     p2 = p2_full[:TOP_N_P2]
     used.update({r[0] for r in p2})
 
-    # P3: Spot≥3M (not already used) + always include pinned (regardless of threshold)
-    # First, regular candidates by threshold:
-    for base, s in best_spot.items():
-        if base in used: continue
-        spot_usd = usd_notional(s)
-        if spot_usd >= P3_SPOT_MIN:
-            f = best_fut.get(base)
-            pct4h = compute_pct4h_for_symbol(f.symbol, True) if f else compute_pct4h_for_symbol(s.symbol, False)
-            p3_full.append([base, usd_notional(f) if f else 0.0, spot_usd, pct_change(s, f), pct4h])
+    # P3: Always include pinned + Spot≥3M others (not already used), pinned first
+    p3_dict: Dict[str, List] = {}
 
-    # Now force-add pinned coins (even if under threshold)
-    # Remove duplicates if they already exist in p3_full
-    p3_dict = {row[0]: row for row in p3_full}
+    # Add pinned coins (even if they don't meet P3_SPOT_MIN)
     for base in PINNED_P3:
-        if base in used:  # already shown in P1 or P2
-            continue
-        if base not in best_spot and base not in best_fut:
-            continue  # nothing to show
         s = best_spot.get(base)
         f = best_fut.get(base)
+        if not s and not f:
+            continue  # no data
         fut_usd = usd_notional(f) if f else 0.0
         spot_usd = usd_notional(s) if s else 0.0
         pct = pct_change(s, f)
         pct4h = compute_pct4h_for_symbol(f.symbol, True) if f else (compute_pct4h_for_symbol(s.symbol, False) if s else 0.0)
         p3_dict[base] = [base, fut_usd, spot_usd, pct, pct4h]
 
-    # Split pinned vs others and sort by spot desc
-    pinned_set = set(PINNED_P3)
-    p3_all = list(p3_dict.values())
-    p3_pinned = [row for row in p3_all if row[0] in pinned_set]
-    p3_others = [row for row in p3_all if row[0] not in pinned_set]
-    p3_pinned.sort(key=lambda r: r[2], reverse=True)  # spot desc
-    p3_others.sort(key=lambda r: r[2], reverse=True)
+    # Add non-pinned others meeting Spot≥3M (not already used)
+    for base, s in best_spot.items():
+        if base in used or base in pinned_set:
+            continue
+        spot_usd = usd_notional(s)
+        if spot_usd >= P3_SPOT_MIN:
+            f = best_fut.get(base)
+            pct4h = compute_pct4h_for_symbol(f.symbol, True) if f else compute_pct4h_for_symbol(s.symbol, False)
+            p3_dict[base] = [base, usd_notional(f) if f else 0.0, spot_usd, pct_change(s, f), pct4h]
 
-    # Final P3: pinned first, then others, capped to TOP_N_P3
-    p3 = (p3_pinned + p3_others)[:TOP_N_P3]
+    # Sort: pinned first by spot desc, then others by spot desc; cap to TOP_N_P3
+    all_rows = list(p3_dict.values())
+    pinned_rows = [r for r in all_rows if r[0] in pinned_set]
+    other_rows  = [r for r in all_rows if r[0] not in pinned_set]
+    pinned_rows.sort(key=lambda r: r[2], reverse=True)
+    other_rows.sort(key=lambda r: r[2], reverse=True)
+    p3 = (pinned_rows + other_rows)[:TOP_N_P3]
 
     return p1, p2, p3
 
@@ -271,13 +284,13 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PCT4H_CACHE = {}
     try:
         t0 = time.time()
-        best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best, False)
+        best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
         dt = time.time() - t0
         text = (
             fmt_table(p1, f"Priority 1 (F≥$5M & S≥$500k) — Top {TOP_N_P1}") +
             fmt_table(p2, f"Priority 2 (F≥$2M) — Top {TOP_N_P2}") +
-            fmt_table(p3, f"Priority 3 (S≥$3M + pinned) — Top {TOP_N_P3}") +
+            fmt_table(p3, f"Priority 3 (Pinned + S≥$3M) — Top {TOP_N_P3}") +
             f"⏱️ {dt:.1f}s • CoinEx via CCXT • tickers: spot={raw_spot_count}, fut={raw_fut_count}"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -288,7 +301,7 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        best_spot, best_fut, *_ = await asyncio.to_thread(load_best, False)
+        best_spot, best_fut, *_ = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
 
         wb = Workbook()
@@ -313,7 +326,7 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best, False)
+        best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best)
         msg = (
             "*Diag*\n"
             f"- thresholds: P1 F≥${P1_FUT_MIN:,} & S≥${P1_SPOT_MIN:,} | "
@@ -345,7 +358,7 @@ async def coin_query(update: Update, symbol_text: str):
             await update.message.reply_text("Please provide a ticker, e.g. `PYTH`.", parse_mode=ParseMode.MARKDOWN)
             return
         PCT4H_CACHE = {}
-        best_spot, best_fut, *_ = await asyncio.to_thread(load_best, False)
+        best_spot, best_fut, *_ = await asyncio.to_thread(load_best)
         s, f = best_spot.get(base), best_fut.get(base)
         fut_usd = usd_notional(f) if f else 0.0
         spot_usd = usd_notional(s) if s else 0.0
