@@ -3,7 +3,7 @@
 CoinEx screener bot → Telegram
 Also appends /screen results to Google Sheets (if enabled).
 
-Columns:
+Columns in Telegram:
   SYM | F | S | % | %4H
   - F, S: million USD (rounded ints)
   - % and %4H: integer with emoji (🟢/🟡/🔴)
@@ -15,9 +15,7 @@ Priorities:
   P2 (Top 5, non-pinned): Futures ≥ $2M
   P3 (Top 10): Always include pinned [BTC, ETH, XRP, SOL, DOGE, ADA, PEPE, LINK] + others Spot ≥ $3M (pinned first)
 
-Notes:
-- Pinned coins NEVER appear in P1/P2. They’re forced to P3 only.
-- /excel export keeps legacy 3-col schema.
+Pinned coins NEVER appear in P1/P2. They’re forced into P3 only.
 """
 
 import asyncio, logging, os, time, io, traceback, re, json
@@ -38,13 +36,17 @@ GSHEET_TAB = os.environ.get("GSHEET_TAB", "Journal")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
 if ENABLE_SHEET_APPEND:
-    import gspread  # type: ignore
-    from google.oauth2.service_account import Credentials  # type: ignore
+    try:
+        import gspread  # type: ignore
+        from google.oauth2.service_account import Credentials  # type: ignore
+    except Exception:
+        # If libs are missing, keep bot alive; just log later on append
+        ENABLE_SHEET_APPEND = False
 
 # ---- Thresholds / settings ----
 P1_SPOT_MIN = 500_000
 P1_FUT_MIN  = 5_000_000
-P1_ALT_MIN  = 500_000     # your new rule: >= $500k (either F or S) AND %4H >= +10%
+P1_ALT_MIN  = 500_000     # alt rule: >= $500k (either F or S) AND %4H >= +10%
 P1_ALT_PCT4H_MIN = 10.0
 
 P2_FUT_MIN  = 2_000_000
@@ -190,8 +192,7 @@ def compute_pct4h_for_symbol(market_symbol: str, prefer_swap: bool = True) -> fl
 # ---- Priorities ----
 def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVol]):
     """
-    Returns:
-      p1, p2, p3 with rows: [base, fut_usd, spot_usd, pct_24h, pct_4h]
+    Returns p1, p2, p3, each row: [base, fut_usd, spot_usd, pct_24h, pct_4h]
     """
     p1_candidates = []
     used = set()
@@ -218,13 +219,13 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
 
         # Rule A (original): F ≥ $5M AND S ≥ $500k
         rule_a = (fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN)
-        # Rule B (your new rule): max(F,S) ≥ $500k AND %4H ≥ +10
+        # Rule B (new): max(F,S) ≥ $500k AND %4H ≥ +10
         rule_b = (max(fut_usd, spot_usd) >= P1_ALT_MIN and pct4h >= P1_ALT_PCT4H_MIN)
 
         if rule_a or rule_b:
             p1_candidates.append([base, fut_usd, spot_usd, pct24, pct4h])
 
-    # Sort by F USD (desc) to keep consistency; cap to TOP_N_P1
+    # Sort by FUT USD desc; cap to TOP_N_P1
     p1_candidates.sort(key=lambda r: r[1], reverse=True)
     p1 = p1_candidates[:TOP_N_P1]
     used.update({r[0] for r in p1})
@@ -319,11 +320,15 @@ def build_journal_rows(now_iso: str, p1, p2, p3) -> List[List[str]]:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Commands:\n"
+        "• /ping   → quick health check\n"
         "• /screen → P1(10), P2(5), P3(10) | Columns: SYM | F | S | % | %4H\n"
         "• /excel  → Excel export (.xlsx)\n"
         "• /diag   → diagnostics\n"
         "Tip: Send a ticker (e.g., PYTH) to get a one-row table."
     )
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ I'm alive. Send /screen to fetch data.")
 
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LAST_ERROR, PCT4H_CACHE
@@ -437,14 +442,23 @@ async def coin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await coin_query(update, update.message.text or "")
 
+# --- Ensure webhook is removed before polling (fixes "nothing happens" if webhook set elsewhere) ---
+async def _post_init(app: Application):
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        logging.info("Webhook deleted (if any). Starting polling …")
+    except Exception as e:
+        logging.exception("delete_webhook failed: %s", e)
+
 def main():
     if not TOKEN:
         raise RuntimeError("Set TELEGRAM_TOKEN env var")
     logging.basicConfig(level=logging.INFO)
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(_post_init).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("screen", screen))
     app.add_handler(CommandHandler("excel", excel_cmd))
     app.add_handler(CommandHandler("diag", diag))
