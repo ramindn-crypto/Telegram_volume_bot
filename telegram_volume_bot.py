@@ -5,14 +5,16 @@ Table columns (Telegram):
   SYM | F | S | % | %4H | Signal
   - F, S are *million USD*, rounded to integers
   - % and %4H are integers with emoji (🟢/🟡/🔴)
-  - Signal (4h-based): Buy / Sell / No signal
+  - Signal (4h-based): Buy / Sell / No signal (see method below)
 
-Signal method (4h timeframe; intraday-friendly):
+Signal method (4h timeframe; intraday-friendly, adjustable via env):
 - Fetch up to 1000 *4h* candles (exchange limit).
 - Forward 1-bar return r[t] = close[t+1]/close[t] - 1
-- P(+3%) = share(r >= +0.03), P(-3%) = share(r <= -0.03)
-- Signal = Buy if P(+3%) > 0.5; Sell if P(-3%) > 0.5; else No signal.
-- Needs >= 200 valid 4h candles; else No signal.
+- P(+X%) = share(r >= +SIGNAL_MOVE_FRAC), P(-X%) = share(r <= -SIGNAL_MOVE_FRAC)
+- Signal = Buy  if P(+X%) > SIGNAL_MIN_PROB
+           Sell if P(-X%) > SIGNAL_MIN_PROB
+           else No signal.
+- Needs >= SIGNAL_MIN_BARS 4h candles; else No signal.
 - Prefer futures (swap) series; fallback to spot.
 
 Features:
@@ -22,8 +24,8 @@ Features:
 - /diag  → diagnostics
 
 Priority rules:
-  P1: F ≥ $5M & S ≥ $500k (EXCLUDES pinned; pinned can NEVER appear in P1)
-  P2: F ≥ $2M           (EXCLUDES pinned; pinned can NEVER appear in P2)
+  P1: F ≥ $5M & S ≥ $500k (EXCLUDES pinned; pinned NEVER appear in P1)
+  P2: F ≥ $2M           (EXCLUDES pinned; pinned NEVER appear in P2)
   P3: Always include pinned + S ≥ $3M (pinned first), TOTAL 10 rows
 """
 
@@ -57,6 +59,11 @@ PINNED_P3 = ["BTC","ETH","XRP","SOL","DOGE","ADA","PEPE","LINK"]
 PINNED_SET = set(PINNED_P3)
 
 LAST_ERROR: Optional[str] = None
+
+# ---- Signal tuning (adjust via env on Render) ----
+SIGNAL_MOVE_FRAC = float(os.environ.get("SIGNAL_MOVE_FRAC", "0.02"))  # 0.02 = 2%
+SIGNAL_MIN_PROB  = float(os.environ.get("SIGNAL_MIN_PROB",  "0.40"))  # 0.40 = 40%
+SIGNAL_MIN_BARS  = int(os.environ.get("SIGNAL_MIN_BARS", "200"))      # require at least 200 4h bars
 
 # Caches to cut API calls per /screen run
 PCT4H_CACHE: Dict[Tuple[str,str], float] = {}
@@ -199,13 +206,13 @@ def compute_pct4h_for_symbol(market_symbol: str, prefer_swap: bool = True) -> fl
             continue
     return 0.0
 
-# ---- Signal from 4h OHLCV (±3%) ----
+# ---- Signal from 4h OHLCV (adjustable) ----
 def compute_signal_for_symbol(market_symbol: str, prefer_swap: bool = True) -> str:
     """
-    Estimate probability of next 4h +3% / -3% using full 4h history (up to 1000 bars).
-    Buy  if P(+3%) > 0.5
-    Sell if P(-3%) > 0.5
-    else No signal
+    4h-signal with adjustable thresholds via env:
+      SIGNAL_MOVE_FRAC (e.g., 0.02 for 2%)
+      SIGNAL_MIN_PROB  (e.g., 0.40 for 40%)
+      SIGNAL_MIN_BARS  (e.g., 200)
     """
     try_order = ["swap", "spot"] if prefer_swap else ["spot", "swap"]
     for dtype in try_order:
@@ -216,29 +223,33 @@ def compute_signal_for_symbol(market_symbol: str, prefer_swap: bool = True) -> s
             ex = build_exchange(dtype)
             ex.load_markets()
             candles = ex.fetch_ohlcv(market_symbol, timeframe="4h", limit=1000)
-            if not candles or len(candles) < 200:
+            if not candles or len(candles) < SIGNAL_MIN_BARS:
                 SIGNAL_CACHE[ck] = "No signal"
                 continue
+
             closes = [c[4] for c in candles if c and c[4]]
-            if len(closes) < 200:
+            if len(closes) < SIGNAL_MIN_BARS:
                 SIGNAL_CACHE[ck] = "No signal"
                 continue
+
             fwd = []
             for i in range(len(closes) - 1):
                 a, b = closes[i], closes[i+1]
                 if a:
                     fwd.append((b / a) - 1.0)
-            if len(fwd) < 199:
+            if len(fwd) < max(1, SIGNAL_MIN_BARS - 1):
                 SIGNAL_CACHE[ck] = "No signal"
                 continue
-            plus = sum(1 for r in fwd if r >= 0.03)
-            minus = sum(1 for r in fwd if r <= -0.03)
+
+            plus  = sum(1 for r in fwd if r >= SIGNAL_MOVE_FRAC)
+            minus = sum(1 for r in fwd if r <= -SIGNAL_MOVE_FRAC)
             n = len(fwd)
-            p_plus = plus / n
+            p_plus  = plus / n
             p_minus = minus / n
-            if p_plus > 0.5 and p_plus > p_minus:
+
+            if p_plus > SIGNAL_MIN_PROB and p_plus > p_minus:
                 SIGNAL_CACHE[ck] = "Buy"
-            elif p_minus > 0.5 and p_minus > p_plus:
+            elif p_minus > SIGNAL_MIN_PROB and p_minus > p_plus:
                 SIGNAL_CACHE[ck] = "Sell"
             else:
                 SIGNAL_CACHE[ck] = "No signal"
@@ -269,7 +280,7 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
         fut_usd, spot_usd = usd_notional(f), usd_notional(s)
         if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
             pct4h = compute_pct4h_for_symbol(f.symbol, True)
-            signal = compute_signal_for_symbol(f.symbol, True)  # 4h-based
+            signal = compute_signal_for_symbol(f.symbol, True)
             p1_full.append([base, fut_usd, spot_usd, pct_change(s, f), pct4h, signal])
 
     p1_full.sort(key=lambda r: r[1], reverse=True)
@@ -405,6 +416,7 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "*Diag*\n"
             f"- thresholds: P1 F≥${P1_FUT_MIN:,} & S≥${P1_SPOT_MIN:,} | "
             f"P2 F≥${P2_FUT_MIN:,} | P3 S≥${P3_SPOT_MIN:,} (+ pinned)\n"
+            f"- signal: move>={SIGNAL_MOVE_FRAC:.3f} ({SIGNAL_MOVE_FRAC*100:.1f}%), prob>{SIGNAL_MIN_PROB:.2f}, bars>={SIGNAL_MIN_BARS}\n"
             f"- rows: P1={TOP_N_P1}, P2={TOP_N_P2}, P3={TOP_N_P3}\n"
             f"- tickers fetched: spot={raw_spot_count}, fut={raw_fut_count}\n"
             f"- last_error: {LAST_ERROR or '_None_'}"
