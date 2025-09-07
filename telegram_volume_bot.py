@@ -2,31 +2,20 @@
 """
 CoinEx screener bot
 Table columns (Telegram):
-  SYM | F | S | % | %4H | Signal
+  SYM | F | S | % | %4H
   - F, S are *million USD*, rounded to integers
   - % and %4H are integers with emoji (🟢/🟡/🔴)
-  - Signal (4h-based): Buy / Sell / No signal (see method below)
-
-Signal method (4h timeframe; intraday-friendly, adjustable via env):
-- Fetch up to 1000 *4h* candles (exchange limit).
-- Forward 1-bar return r[t] = close[t+1]/close[t] - 1
-- P(+X%) = share(r >= +SIGNAL_MOVE_FRAC), P(-X%) = share(r <= -SIGNAL_MOVE_FRAC)
-- Signal = Buy  if P(+X%) > SIGNAL_MIN_PROB
-           Sell if P(-X%) > SIGNAL_MIN_PROB
-           else No signal.
-- Needs >= SIGNAL_MIN_BARS 4h candles; else No signal.
-- Prefer futures (swap) series; fallback to spot.
 
 Features:
 - /screen → P1 (10 rows), P2 (5), P3 (10; P3 always includes pinned: BTC,ETH,XRP,SOL,DOGE,ADA,PEPE,LINK)
-- Plain-text ticker (e.g., PYTH) → one-row table for that coin
-- /excel → Excel .xlsx (legacy 3-col export kept)
-- /diag  → diagnostics
+- Type a ticker (e.g., PYTH or $PYTH) → one-row table for that coin
+- /excel  → Excel .xlsx (legacy 3-col export kept)
+- /diag   → diagnostics
 
 Priority rules:
-  P1: F ≥ $5M & S ≥ $500k (EXCLUDES pinned; pinned NEVER appear in P1)
-  P2: F ≥ $2M           (EXCLUDES pinned; pinned NEVER appear in P2)
-  P3: Always include pinned + S ≥ $3M (pinned first), TOTAL 10 rows
+  P1: Futures ≥ $5M & Spot ≥ $500k (EXCLUDES pinned; pinned can NEVER appear in P1)
+  P2: Futures ≥ $2M             (EXCLUDES pinned; pinned can NEVER appear in P2)
+  P3: Always include pinned + Spot ≥ $3M (pinned first), TOTAL 10 rows
 """
 
 import asyncio, logging, os, time, io, traceback, re
@@ -59,15 +48,7 @@ PINNED_P3 = ["BTC","ETH","XRP","SOL","DOGE","ADA","PEPE","LINK"]
 PINNED_SET = set(PINNED_P3)
 
 LAST_ERROR: Optional[str] = None
-
-# ---- Signal tuning (adjust via env on Render) ----
-SIGNAL_MOVE_FRAC = float(os.environ.get("SIGNAL_MOVE_FRAC", "0.02"))  # 0.02 = 2%
-SIGNAL_MIN_PROB  = float(os.environ.get("SIGNAL_MIN_PROB",  "0.40"))  # 0.40 = 40%
-SIGNAL_MIN_BARS  = int(os.environ.get("SIGNAL_MIN_BARS", "200"))      # require at least 200 4h bars
-
-# Caches to cut API calls per /screen run
 PCT4H_CACHE: Dict[Tuple[str,str], float] = {}
-SIGNAL_CACHE: Dict[Tuple[str,str], str] = {}
 
 @dataclass
 class MarketVol:
@@ -174,7 +155,7 @@ def load_best() -> Tuple[Dict[str, MarketVol], Dict[str, MarketVol], int, int]:
 
     return best_spot, best_fut, len(spot_tickers), len(fut_tickers)
 
-# ---- %4H from 1h OHLCV ----
+# ---- 4H % from 1h OHLCV ----
 def compute_pct4h_for_symbol(market_symbol: str, prefer_swap: bool = True) -> float:
     """
     Compute % change over the last 4 completed hours using 1h candles.
@@ -206,65 +187,11 @@ def compute_pct4h_for_symbol(market_symbol: str, prefer_swap: bool = True) -> fl
             continue
     return 0.0
 
-# ---- Signal from 4h OHLCV (adjustable) ----
-def compute_signal_for_symbol(market_symbol: str, prefer_swap: bool = True) -> str:
-    """
-    4h-signal with adjustable thresholds via env:
-      SIGNAL_MOVE_FRAC (e.g., 0.02 for 2%)
-      SIGNAL_MIN_PROB  (e.g., 0.40 for 40%)
-      SIGNAL_MIN_BARS  (e.g., 200)
-    """
-    try_order = ["swap", "spot"] if prefer_swap else ["spot", "swap"]
-    for dtype in try_order:
-        ck = (dtype, market_symbol)
-        if ck in SIGNAL_CACHE:
-            return SIGNAL_CACHE[ck]
-        try:
-            ex = build_exchange(dtype)
-            ex.load_markets()
-            candles = ex.fetch_ohlcv(market_symbol, timeframe="4h", limit=1000)
-            if not candles or len(candles) < SIGNAL_MIN_BARS:
-                SIGNAL_CACHE[ck] = "No signal"
-                continue
-
-            closes = [c[4] for c in candles if c and c[4]]
-            if len(closes) < SIGNAL_MIN_BARS:
-                SIGNAL_CACHE[ck] = "No signal"
-                continue
-
-            fwd = []
-            for i in range(len(closes) - 1):
-                a, b = closes[i], closes[i+1]
-                if a:
-                    fwd.append((b / a) - 1.0)
-            if len(fwd) < max(1, SIGNAL_MIN_BARS - 1):
-                SIGNAL_CACHE[ck] = "No signal"
-                continue
-
-            plus  = sum(1 for r in fwd if r >= SIGNAL_MOVE_FRAC)
-            minus = sum(1 for r in fwd if r <= -SIGNAL_MOVE_FRAC)
-            n = len(fwd)
-            p_plus  = plus / n
-            p_minus = minus / n
-
-            if p_plus > SIGNAL_MIN_PROB and p_plus > p_minus:
-                SIGNAL_CACHE[ck] = "Buy"
-            elif p_minus > SIGNAL_MIN_PROB and p_minus > p_plus:
-                SIGNAL_CACHE[ck] = "Sell"
-            else:
-                SIGNAL_CACHE[ck] = "No signal"
-            return SIGNAL_CACHE[ck]
-        except Exception:
-            logging.exception("compute_signal_for_symbol failed for %s (%s)", market_symbol, dtype)
-            SIGNAL_CACHE[ck] = "No signal"
-            continue
-    return "No signal"
-
 # ---- Priorities ----
 def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVol]):
     """
     Returns:
-      p1, p2, p3  where each row = [base, fut_usd, spot_usd, pct_24h, pct_4h, signal]
+      p1, p2, p3  where each row = [base, fut_usd, spot_usd, pct_24h, pct_4h]
     Sorting:
       P1 & P2 by FUT USD desc (EXCLUDE pinned).
       P3 always includes pinned coins + others with SPOT ≥ $3M; pinned first; cap to 10.
@@ -275,37 +202,40 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
     # --- P1: Fut≥5M & Spot≥500k (EXCLUDING pinned) ---
     for base in set(best_spot) & set(best_fut):
         if base in PINNED_SET:
-            continue
+            continue  # hard exclude pinned from P1
         s, f = best_spot[base], best_fut[base]
         fut_usd, spot_usd = usd_notional(f), usd_notional(s)
         if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
             pct4h = compute_pct4h_for_symbol(f.symbol, True)
-            signal = compute_signal_for_symbol(f.symbol, True)
-            p1_full.append([base, fut_usd, spot_usd, pct_change(s, f), pct4h, signal])
+            p1_full.append([base, fut_usd, spot_usd, pct_change(s, f), pct4h])
 
+    # Sort and slice
     p1_full.sort(key=lambda r: r[1], reverse=True)
-    p1 = [row for row in p1_full if row[0] not in PINNED_SET][:TOP_N_P1]
+    p1 = p1_full[:TOP_N_P1]
+    # Safety filter: ensure no pinned in final P1
+    p1 = [row for row in p1 if row[0] not in PINNED_SET]
     used.update({r[0] for r in p1})
 
     # --- P2: Fut≥2M (EXCLUDING pinned and already used) ---
     for base, f in best_fut.items():
         if base in used or base in PINNED_SET:
-            continue
+            continue  # hard exclude pinned from P2
         fut_usd = usd_notional(f)
         if fut_usd >= P2_FUT_MIN:
             s = best_spot.get(base)
             pct4h = compute_pct4h_for_symbol(f.symbol, True)
-            signal = compute_signal_for_symbol(f.symbol, True)
-            p2_full.append([base, fut_usd, usd_notional(s) if s else 0.0, pct_change(s, f), pct4h, signal])
+            p2_full.append([base, fut_usd, usd_notional(s) if s else 0.0, pct_change(s, f), pct4h])
 
     p2_full.sort(key=lambda r: r[1], reverse=True)
-    p2 = [row for row in p2_full if row[0] not in PINNED_SET][:TOP_N_P2]
+    p2 = p2_full[:TOP_N_P2]
+    # Safety filter: ensure no pinned in final P2
+    p2 = [row for row in p2 if row[0] not in PINNED_SET]
     used.update({r[0] for r in p2})
 
     # --- P3: Always include pinned + Spot≥3M others (not already used), pinned first ---
     p3_dict: Dict[str, List] = {}
 
-    # Add pinned coins
+    # Add pinned coins (even if they don't meet P3_SPOT_MIN)
     for base in PINNED_P3:
         s = best_spot.get(base)
         f = best_fut.get(base)
@@ -315,8 +245,7 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
         spot_usd = usd_notional(s) if s else 0.0
         pct = pct_change(s, f)
         pct4h = compute_pct4h_for_symbol(f.symbol, True) if f else (compute_pct4h_for_symbol(s.symbol, False) if s else 0.0)
-        signal = compute_signal_for_symbol(f.symbol, True) if f else (compute_signal_for_symbol(s.symbol, False) if s else "No signal")
-        p3_dict[base] = [base, fut_usd, spot_usd, pct, pct4h, signal]
+        p3_dict[base] = [base, fut_usd, spot_usd, pct, pct4h]
 
     # Add non-pinned others meeting Spot≥3M (not already used)
     for base, s in best_spot.items():
@@ -326,8 +255,7 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
         if spot_usd >= P3_SPOT_MIN:
             f = best_fut.get(base)
             pct4h = compute_pct4h_for_symbol(f.symbol, True) if f else compute_pct4h_for_symbol(s.symbol, False)
-            signal = compute_signal_for_symbol(f.symbol, True) if f else compute_signal_for_symbol(s.symbol, False)
-            p3_dict[base] = [base, usd_notional(f) if f else 0.0, spot_usd, pct_change(s, f), pct4h, signal]
+            p3_dict[base] = [base, usd_notional(f) if f else 0.0, spot_usd, pct_change(s, f), pct4h]
 
     # Sort: pinned first by spot desc, then others by spot desc; cap to TOP_N_P3
     all_rows = list(p3_dict.values())
@@ -342,31 +270,27 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
 # ---- Formatting ----
 def fmt_table(rows: List[List], title: str) -> str:
     if not rows: return f"*{title}*: _None_\n"
-    pretty = [
-        [r[0], m_dollars_int(r[1]), m_dollars_int(r[2]), pct_with_emoji(r[3]), pct_with_emoji(r[4]), r[5]]
-        for r in rows
-    ]
-    return f"*{title}*:\n```\n" + tabulate(pretty, headers=["SYM","F","S","%","%4H","Signal"], tablefmt="github") + "\n```\n"
+    pretty = [[r[0], m_dollars_int(r[1]), m_dollars_int(r[2]), pct_with_emoji(r[3]), pct_with_emoji(r[4])] for r in rows]
+    return f"*{title}*:\n```\n" + tabulate(pretty, headers=["SYM","F","S","%","%4H"], tablefmt="github") + "\n```\n"
 
-def fmt_table_single(sym: str, fut_usd: float, spot_usd: float, pct: float, pct4h: float, signal: str, title: str) -> str:
-    row = [[sym.upper(), m_dollars_int(fut_usd), m_dollars_int(spot_usd), pct_with_emoji(pct), pct_with_emoji(pct4h), signal]]
-    return f"*{title}*:\n```\n" + tabulate(row, headers=["SYM","F","S","%","%4H","Signal"], tablefmt="github") + "\n```\n"
+def fmt_table_single(sym: str, fut_usd: float, spot_usd: float, pct: float, pct4h: float, title: str) -> str:
+    row = [[sym.upper(), m_dollars_int(fut_usd), m_dollars_int(spot_usd), pct_with_emoji(pct), pct_with_emoji(pct4h)]]
+    return f"*{title}*:\n```\n" + tabulate(row, headers=["SYM","F","S","%","%4H"], tablefmt="github") + "\n```\n"
 
 # ---- Telegram handlers ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Commands:\n"
-        "• /screen → P1(10), P2(5), P3(10) with columns: SYM | F | S | % | %4H | Signal (4h)\n"
+        "• /screen → P1(10), P2(5), P3(10) with columns: SYM | F | S | % | %4H\n"
         "• /excel  → Excel file (.xlsx)\n"
         "• /diag   → diagnostics\n"
         "Tip: Send a ticker (e.g., PYTH) to get a one-row table for that coin."
     )
 
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global LAST_ERROR, PCT4H_CACHE, SIGNAL_CACHE
+    global LAST_ERROR, PCT4H_CACHE
     LAST_ERROR = None
     PCT4H_CACHE = {}
-    SIGNAL_CACHE = {}
     try:
         t0 = time.time()
         best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best)
@@ -394,9 +318,9 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ws.title = "Screener"
         # Keep legacy schema (priority,symbol,usd_24h) for compatibility
         ws.append(["priority","symbol","usd_24h"])
-        for sym, fut_usd, spot_usd, _, _, _ in p1: ws.append(["P1", sym, fut_usd])
-        for sym, fut_usd, spot_usd, _, _, _ in p2: ws.append(["P2", sym, fut_usd])
-        for sym, fut_usd, spot_usd, _, _, _ in p3: ws.append(["P3", sym, spot_usd])
+        for sym, fut_usd, spot_usd, _, _ in p1: ws.append(["P1", sym, fut_usd])
+        for sym, fut_usd, spot_usd, _, _ in p2: ws.append(["P2", sym, fut_usd])
+        for sym, fut_usd, spot_usd, _, _ in p3: ws.append(["P3", sym, spot_usd])
 
         buf = io.BytesIO()
         wb.save(buf)
@@ -416,14 +340,14 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "*Diag*\n"
             f"- thresholds: P1 F≥${P1_FUT_MIN:,} & S≥${P1_SPOT_MIN:,} | "
             f"P2 F≥${P2_FUT_MIN:,} | P3 S≥${P3_SPOT_MIN:,} (+ pinned)\n"
-            f"- signal: move>={SIGNAL_MOVE_FRAC:.3f} ({SIGNAL_MOVE_FRAC*100:.1f}%), prob>{SIGNAL_MIN_PROB:.2f}, bars>={SIGNAL_MIN_BARS}\n"
             f"- rows: P1={TOP_N_P1}, P2={TOP_N_P2}, P3={TOP_N_P3}\n"
             f"- tickers fetched: spot={raw_spot_count}, fut={raw_fut_count}\n"
+            f"- kept bases: spot={len(best_spot)}, fut={len(best_fut)}\n"
             f"- last_error: {LAST_ERROR or '_None_'}"
         )
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        await update.message.reply_text(f"Diag error: {e}")
+        await update.message.reply_text(f"Diag error: {type(e).__name__}: {e}")
 
 # --- Symbol lookup (no exclusions) ---
 def normalize_symbol_text(text: str) -> Optional[str]:
@@ -436,14 +360,13 @@ def normalize_symbol_text(text: str) -> Optional[str]:
     return token if 2 <= len(token) <= 10 else None
 
 async def coin_query(update: Update, symbol_text: str):
-    global PCT4H_CACHE, SIGNAL_CACHE
+    global PCT4H_CACHE
     try:
         base = normalize_symbol_text(symbol_text)
         if not base:
             await update.message.reply_text("Please provide a ticker, e.g. `PYTH`.", parse_mode=ParseMode.MARKDOWN)
             return
         PCT4H_CACHE = {}
-        SIGNAL_CACHE = {}
         best_spot, best_fut, *_ = await asyncio.to_thread(load_best)
         s, f = best_spot.get(base), best_fut.get(base)
         fut_usd = usd_notional(f) if f else 0.0
@@ -452,18 +375,10 @@ async def coin_query(update: Update, symbol_text: str):
         pct4h = 0.0
         if f: pct4h = await asyncio.to_thread(compute_pct4h_for_symbol, f.symbol, True)
         elif s: pct4h = await asyncio.to_thread(compute_pct4h_for_symbol, s.symbol, False)
-        # Signal from 4h history (prefer futures)
-        if f:
-            signal = await asyncio.to_thread(compute_signal_for_symbol, f.symbol, True)
-        elif s:
-            signal = await asyncio.to_thread(compute_signal_for_symbol, s.symbol, False)
-        else:
-            signal = "No signal"
-
         if fut_usd == 0.0 and spot_usd == 0.0:
             await update.message.reply_text(f"Couldn't find data for `{base}`.", parse_mode=ParseMode.MARKDOWN)
             return
-        text = fmt_table_single(base, fut_usd, spot_usd, pct, pct4h, signal, f"{base} (24h / 4h)")
+        text = fmt_table_single(base, fut_usd, spot_usd, pct, pct4h, f"{base} (24h / 4h)")
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logging.exception("coin query error")
