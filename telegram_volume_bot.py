@@ -7,7 +7,7 @@ Table columns (Telegram):
   - % and %4H are integers with emoji (🟢/🟡/🔴)
 
 Features:
-- /screen → P1 (10 rows), P2 (5), P3 (10; P3 always includes pinned: BTC,ETH,XRP,SOL,DOGE,ADA,PEPE,LINK)
+- /screen → P1 (10 rows), P2 (10), P3 (10; P3 always includes pinned: BTC,ETH,XRP,SOL,DOGE,ADA,PEPE,LINK)
 - Type a ticker (e.g., PYTH or $PYTH) → one-row table for that coin
 - /excel  → Excel .xlsx (legacy 3-col export kept)
 - /diag   → diagnostics
@@ -36,7 +36,7 @@ P2_FUT_MIN  = 2_000_000
 P3_SPOT_MIN = 3_000_000
 
 TOP_N_P1 = 10
-TOP_N_P2 = 5
+TOP_N_P2 = 10
 TOP_N_P3 = 10
 
 EXCHANGE_ID = "coinex"
