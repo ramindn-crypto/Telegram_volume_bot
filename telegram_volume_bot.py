@@ -7,7 +7,7 @@ Table columns (Telegram):
   - % and %4H are integers with emoji (🟢/🟡/🔴)
 
 Features:
-- /screen → P1 (10 rows), P2 (15), P3 (10; P3 always includes pinned: BTC,ETH,XRP,SOL,DOGE,ADA,PEPE,LINK)
+- /screen → P1 (10 rows), P2 (15), P3 (15; P3 always includes pinned: BTC,ETH,XRP,SOL,DOGE,ADA,PEPE,LINK)
 - Type a ticker (e.g., PYTH or $PYTH) → one-row table for that coin
 - /excel  → Excel .xlsx (legacy 3-col export kept)
 - /diag   → diagnostics
@@ -15,7 +15,7 @@ Features:
 Priority rules:
   P1: Futures ≥ $5M & Spot ≥ $500k (EXCLUDES pinned; pinned can NEVER appear in P1)
   P2: Futures ≥ $2M             (EXCLUDES pinned; pinned can NEVER appear in P2)
-  P3: Always include pinned + Spot ≥ $3M (pinned first), TOTAL 10 rows
+  P3: Always include pinned + Spot ≥ $2M (pinned first), TOTAL 15 rows
 """
 
 import asyncio, logging, os, time, io, traceback, re
@@ -33,11 +33,11 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 P1_SPOT_MIN = 500_000
 P1_FUT_MIN  = 5_000_000
 P2_FUT_MIN  = 2_000_000
-P3_SPOT_MIN = 3_000_000
+P3_SPOT_MIN = 2_000_000
 
 TOP_N_P1 = 10
 TOP_N_P2 = 15
-TOP_N_P3 = 10
+TOP_N_P3 = 15
 
 EXCHANGE_ID = "coinex"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
