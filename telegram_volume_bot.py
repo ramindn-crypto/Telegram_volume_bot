@@ -13,7 +13,7 @@ Features:
 - /diag   → diagnostics
 
 Priority rules:
-  P1: Futures ≥ $5M & Spot ≥ $500k (EXCLUDES pinned; pinned can NEVER appear in P1)
+  P1: Futures ≥ $5M (EXCLUDES pinned; pinned can NEVER appear in P1)
   P2: Futures ≥ $2M             (EXCLUDES pinned; pinned can NEVER appear in P2)
   P3: Always include pinned + Spot ≥ $2M (pinned first), TOTAL 15 rows
 """
@@ -30,8 +30,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # ---- Config / thresholds ----
-P1_SPOT_MIN = 500_000
-P1_FUT_MIN  = 5_000_000
+P1_FUT_MIN  = 10_000_000
 P2_FUT_MIN  = 2_000_000
 P3_SPOT_MIN = 2_000_000
 
@@ -199,15 +198,15 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
     p1_full, p2_full = [], []
     used = set()  # bases already placed in P1 or P2
 
-    # --- P1: Fut≥5M & Spot≥500k (EXCLUDING pinned) ---
+    # --- P1: Fut≥5M (EXCLUDING pinned) ---
     for base in set(best_spot) & set(best_fut):
         if base in PINNED_SET:
             continue  # hard exclude pinned from P1
-        s, f = best_spot[base], best_fut[base]
-        fut_usd, spot_usd = usd_notional(f), usd_notional(s)
-        if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
+        s, f = best_fut[base]
+        fut_usd = usd_notional(f)
+        if fut_usd >= P1_FUT_MIN:
             pct4h = compute_pct4h_for_symbol(f.symbol, True)
-            p1_full.append([base, fut_usd, spot_usd, pct_change(s, f), pct4h])
+            p1_full.append([base, fut_usd, pct_change(f), pct4h])
 
     # Sort and slice
     p1_full.sort(key=lambda r: r[1], reverse=True)
