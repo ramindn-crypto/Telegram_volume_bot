@@ -89,7 +89,7 @@ def usd_notional(mv: Optional[MarketVol]) -> float:
     return mv.base_vol * price if price and mv.base_vol else 0.0
 
 def pct_change(mv_spot: Optional[MarketVol], mv_fut: Optional[MarketVol]) -> float:
-    """24h % change: prefer ticker 'percentage' (spot then futures); else compute from open/last."""
+    """24h % change: prefer ticker 'percentage' (spot then futures); else compute from open/last)."""
     for mv in (mv_spot, mv_fut):
         if mv and mv.percentage:
             return float(mv.percentage)
@@ -257,50 +257,4 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
     other_rows.sort(key=lambda r: r[2], reverse=True)
     p3 = (pinned_rows + other_rows)[:TOP_N_P3]
 
-    return p1, p2, p3
-
-# ---- Formatting ----
-def fmt_table(rows: List[List], title: str) -> str:
-    if not rows: return f"*{title}*: _None_\n"
-    pretty = [[r[0], m_dollars_int(r[1]), m_dollars_int(r[2]), pct_with_emoji(r[3]), pct_with_emoji(r[4])] for r in rows]
-    return f"*{title}*:\n```\n" + tabulate(pretty, headers=["SYM","F","S","%","%4H"], tablefmt="github") + "\n```\n"
-
-def fmt_table_single(sym: str, fut_usd: float, spot_usd: float, pct: float, pct4h: float, title: str) -> str:
-    row = [[sym.upper(), m_dollars_int(fut_usd), m_dollars_int(spot_usd), pct_with_emoji(pct), pct_with_emoji(pct4h)]]
-    return f"*{title}*:\n```\n" + tabulate(row, headers=["SYM","F","S","%","%4H"], tablefmt="github") + "\n```\n"
-
-# ---- Telegram handlers ----
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Commands:\n"
-        "• /screen → P1(10), P2(5), P3(10) with columns: SYM | F | S | % | %4H\n"
-        "• /excel  → Excel file (.xlsx)\n"
-        "• /diag   → diagnostics\n"
-        "Tip: Send a ticker (e.g., PYTH) to get a one-row table for that coin."
-    )
-
-async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global LAST_ERROR, PCT4H_CACHE
-    LAST_ERROR = None
-    PCT4H_CACHE = {}
-    try:
-        t0 = time.time()
-        best_spot, best_fut, raw_spot_count, raw_fut_count = await asyncio.to_thread(load_best)
-        p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
-        dt = time.time() - t0
-        text = (
-            fmt_table(p1, f"Priority 1 (F≥$10M — pinned excluded) — Top {TOP_N_P1}") +
-            fmt_table(p2, f"Priority 2 (F≥$2M — pinned excluded) — Top {TOP_N_P2}") +
-            fmt_table(p3, f"Priority 3 (Pinned + S≥$3M) — Top {TOP_N_P3}") +
-            f"⏱️ {dt:.1f}s • CoinEx via CCXT • tickers: spot={raw_spot_count}, fut={raw_fut_count}"
-        )
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        LAST_ERROR = f"{type(e).__name__}: {e}\n" + traceback.format_exc(limit=3)
-        logging.exception("screen error")
-        await update.message.reply_text(f"Error: {LAST_ERROR}")
-
-async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        best_spot, best_fut, *_ = await asyncio.to_thread(load_best)
-        p1, p2, p3 =
+    return p1, p2
