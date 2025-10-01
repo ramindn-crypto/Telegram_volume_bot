@@ -13,7 +13,7 @@ Features:
 - /diag   → diagnostics
 
 Priority rules:
-  P1: Futures ≥ $10M (EXCLUDES pinned; pinned can NEVER appear in P1)
+  P1: Futures ≥ $5M & Spot ≥ $500k (EXCLUDES pinned; pinned can NEVER appear in P1)
   P2: Futures ≥ $2M             (EXCLUDES pinned; pinned can NEVER appear in P2)
   P3: Always include pinned + Spot ≥ $3M (pinned first), TOTAL 10 rows
 """
@@ -30,6 +30,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # ---- Config / thresholds ----
+P1_SPOT_MIN = 500_000
 P1_FUT_MIN  = 5_000_000
 P2_FUT_MIN  = 2_000_000
 P3_SPOT_MIN = 3_000_000
