@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
 """
-CoinEx screener bot
+CoinEx screener bot with email alerts
 Table columns (Telegram):
   SYM | F | S | % | %4H
   - F, S are *million USD*, rounded to integers
   - % and %4H are integers with emoji (🟢/🟡/🔴)
 
 Features:
-- /screen → P1 (15 rows), P2 (10), P3 (10; P3 always includes pinned: BTC,ETH,XRP,SOL,DOGE,ADA,PEPE,LINK)
+- /screen  → P1 (10 rows), P2 (5), P3 (10; P3 always includes pinned: BTC,ETH,XRP,SOL,DOGE,ADA,PEPE,LINK)
 - Type a ticker (e.g., PYTH or $PYTH) → one-row table for that coin
-- /excel  → Excel .xlsx (legacy 3-col export kept)
-- /diag   → diagnostics
+- /excel   → Excel .xlsx (legacy 3-col export kept)
+- /diag    → diagnostics
+- /notify_on  → enable email alerts
+- /notify_off → disable email alerts
+- /notify     → show email alert status
+
+Email alerts:
+- Condition: for any coin inside P1/P2/P3, if *both* 24h % ≥ +5 and 4h % ≥ +5
+- Sends one email listing matches by priority
+- Throttled: one email per (priority, symbol) every 6 hours
 
 Priority rules:
-  P1: Futures ≥ $5M & Spot ≥ $500k (EXCLUDES pinned; pinned can NEVER appear in P1)
-  P2: Futures ≥ $2M             (EXCLUDES pinned; pinned can NEVER appear in P2)
+  P1: Futures ≥ $5M & Spot ≥ $500k (EXCLUDES pinned; pinned NEVER in P1)
+  P2: Futures ≥ $2M             (EXCLUDES pinned; pinned NEVER in P2)
   P3: Always include pinned + Spot ≥ $3M (pinned first), TOTAL 10 rows
 """
 
-import asyncio, logging, os, time, io, traceback, re
+import asyncio, logging, os, time, io, traceback, re, ssl, smtplib
+from email.message import EmailMessage
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -35,20 +44,37 @@ P1_FUT_MIN  = 5_000_000
 P2_FUT_MIN  = 2_000_000
 P3_SPOT_MIN = 3_000_000
 
-TOP_N_P1 = 15
-TOP_N_P2 = 10
+TOP_N_P1 = 10
+TOP_N_P2 = 5
 TOP_N_P3 = 10
 
 EXCHANGE_ID = "coinex"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 STABLES = {"USD","USDT","USDC","TUSD","FDUSD","USDD","USDE","DAI","PYUSD"}
 
-# Pinned coins: must appear only in P3 (never in P1/P2)
+# Pinned coins MUST appear only in P3 (never P1/P2)
 PINNED_P3 = ["BTC","ETH","XRP","SOL","DOGE","ADA","PEPE","LINK"]
 PINNED_SET = set(PINNED_P3)
 
+# Email settings (set these as Render env vars)
+EMAIL_ENABLED_DEFAULT = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "")      # e.g. smtp.gmail.com
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465"))  # 465 for SSL, 587 for STARTTLS
+EMAIL_USER = os.environ.get("EMAIL_USER", "")      # your email/login
+EMAIL_PASS = os.environ.get("EMAIL_PASS", "")      # app password
+EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)  # from address
+EMAIL_TO   = os.environ.get("EMAIL_TO", EMAIL_USER)    # destination address
+
+# How often the alert job runs (minutes)
+CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "10"))
+ALERT_PCT_24H_MIN  = 5.0
+ALERT_PCT_4H_MIN   = 5.0
+ALERT_THROTTLE_SEC = 6 * 60 * 60  # 6 hours per (priority,symbol)
+
 LAST_ERROR: Optional[str] = None
 PCT4H_CACHE: Dict[Tuple[str,str], float] = {}
+ALERT_SENT_CACHE: Dict[Tuple[str,str], float] = {}  # (priority, symbol) -> last_sent_epoch
+NOTIFY_ON: bool = EMAIL_ENABLED_DEFAULT  # can be toggled via Telegram
 
 @dataclass
 class MarketVol:
@@ -202,24 +228,21 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
     # --- P1: Fut≥5M & Spot≥500k (EXCLUDING pinned) ---
     for base in set(best_spot) & set(best_fut):
         if base in PINNED_SET:
-            continue  # hard exclude pinned from P1
+            continue
         s, f = best_spot[base], best_fut[base]
         fut_usd, spot_usd = usd_notional(f), usd_notional(s)
         if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
             pct4h = compute_pct4h_for_symbol(f.symbol, True)
             p1_full.append([base, fut_usd, spot_usd, pct_change(s, f), pct4h])
 
-    # Sort and slice
     p1_full.sort(key=lambda r: r[1], reverse=True)
-    p1 = p1_full[:TOP_N_P1]
-    # Safety filter: ensure no pinned in final P1
-    p1 = [row for row in p1 if row[0] not in PINNED_SET]
+    p1 = [row for row in p1_full if row[0] not in PINNED_SET][:TOP_N_P1]
     used.update({r[0] for r in p1})
 
     # --- P2: Fut≥2M (EXCLUDING pinned and already used) ---
     for base, f in best_fut.items():
         if base in used or base in PINNED_SET:
-            continue  # hard exclude pinned from P2
+            continue
         fut_usd = usd_notional(f)
         if fut_usd >= P2_FUT_MIN:
             s = best_spot.get(base)
@@ -227,9 +250,7 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
             p2_full.append([base, fut_usd, usd_notional(s) if s else 0.0, pct_change(s, f), pct4h])
 
     p2_full.sort(key=lambda r: r[1], reverse=True)
-    p2 = p2_full[:TOP_N_P2]
-    # Safety filter: ensure no pinned in final P2
-    p2 = [row for row in p2 if row[0] not in PINNED_SET]
+    p2 = [row for row in p2_full if row[0] not in PINNED_SET][:TOP_N_P2]
     used.update({r[0] for r in p2})
 
     # --- P3: Always include pinned + Spot≥3M others (not already used), pinned first ---
@@ -268,14 +289,74 @@ def build_priorities(best_spot: Dict[str,MarketVol], best_fut: Dict[str,MarketVo
     return p1, p2, p3
 
 # ---- Formatting ----
+def pct_with_emoji_str(p: float) -> str:
+    return pct_with_emoji(p)
+
 def fmt_table(rows: List[List], title: str) -> str:
     if not rows: return f"*{title}*: _None_\n"
-    pretty = [[r[0], m_dollars_int(r[1]), m_dollars_int(r[2]), pct_with_emoji(r[3]), pct_with_emoji(r[4])] for r in rows]
+    pretty = [[r[0], m_dollars_int(r[1]), m_dollars_int(r[2]), pct_with_emoji_str(r[3]), pct_with_emoji_str(r[4])] for r in rows]
     return f"*{title}*:\n```\n" + tabulate(pretty, headers=["SYM","F","S","%","%4H"], tablefmt="github") + "\n```\n"
 
 def fmt_table_single(sym: str, fut_usd: float, spot_usd: float, pct: float, pct4h: float, title: str) -> str:
-    row = [[sym.upper(), m_dollars_int(fut_usd), m_dollars_int(spot_usd), pct_with_emoji(pct), pct_with_emoji(pct4h)]]
+    row = [[sym.upper(), m_dollars_int(fut_usd), m_dollars_int(spot_usd), pct_with_emoji_str(pct), pct_with_emoji_str(pct4h)]]
     return f"*{title}*:\n```\n" + tabulate(row, headers=["SYM","F","S","%","%4H"], tablefmt="github") + "\n```\n"
+
+# ---- Email helpers ----
+def email_config_ok() -> bool:
+    return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO])
+
+def send_email(subject: str, body: str) -> bool:
+    if not email_config_ok():
+        logging.warning("Email config incomplete; skipping email.")
+        return False
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+        msg.set_content(body)
+
+        if EMAIL_PORT == 465:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT, context=context) as server:
+                server.login(EMAIL_USER, EMAIL_PASS)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as server:
+                server.starttls()
+                server.login(EMAIL_USER, EMAIL_PASS)
+                server.send_message(msg)
+        return True
+    except Exception as e:
+        logging.exception("send_email failed: %s", e)
+        return False
+
+def should_alert(priority: str, symbol: str) -> bool:
+    now = time.time()
+    key = (priority, symbol)
+    last = ALERT_SENT_CACHE.get(key, 0)
+    if now - last >= ALERT_THROTTLE_SEC:
+        ALERT_SENT_CACHE[key] = now
+        return True
+    return False
+
+def scan_for_alerts(p1, p2, p3) -> Optional[str]:
+    """
+    Returns email body text if there are any matches; otherwise None.
+    Match condition: %24h >= +5 and %4h >= +5.
+    """
+    lines = []
+    for label, rows in (("P1", p1), ("P2", p2), ("P3", p3)):
+        hits = []
+        for sym, fut_usd, spot_usd, pct24, pct4h in rows:
+            if pct24 >= ALERT_PCT_24H_MIN and pct4h >= ALERT_PCT_4H_MIN:
+                if should_alert(label, sym):
+                    hits.append(sym)
+        if hits:
+            lines.append(f"{label}: " + ", ".join(sorted(set(hits))))
+    if not lines:
+        return None
+    return "Coins meeting +5% (24h) AND +5% (4h):\n\n" + "\n".join(lines)
 
 # ---- Telegram handlers ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -284,6 +365,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /screen → P1(10), P2(5), P3(10) with columns: SYM | F | S | % | %4H\n"
         "• /excel  → Excel file (.xlsx)\n"
         "• /diag   → diagnostics\n"
+        "• /notify_on  → enable email alerts\n"
+        "• /notify_off → disable email alerts\n"
+        "• /notify     → show alert status\n"
         "Tip: Send a ticker (e.g., PYTH) to get a one-row table for that coin."
     )
 
@@ -316,7 +400,7 @@ async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wb = Workbook()
         ws = wb.active
         ws.title = "Screener"
-        # Keep legacy schema (priority,symbol,usd_24h) for compatibility
+        # Legacy schema (priority,symbol,usd_24h) for compatibility
         ws.append(["priority","symbol","usd_24h"])
         for sym, fut_usd, spot_usd, _, _ in p1: ws.append(["P1", sym, fut_usd])
         for sym, fut_usd, spot_usd, _, _ in p2: ws.append(["P2", sym, fut_usd])
@@ -342,6 +426,7 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"P2 F≥${P2_FUT_MIN:,} | P3 S≥${P3_SPOT_MIN:,} (+ pinned)\n"
             f"- rows: P1={TOP_N_P1}, P2={TOP_N_P2}, P3={TOP_N_P3}\n"
             f"- tickers fetched: spot={raw_spot_count}, fut={raw_fut_count}\n"
+            f"- email: {'ON' if NOTIFY_ON else 'OFF'} | host={EMAIL_HOST or 'n/a'} to={EMAIL_TO or 'n/a'}\n"
             f"- kept bases: spot={len(best_spot)}, fut={len(best_fut)}\n"
             f"- last_error: {LAST_ERROR or '_None_'}"
         )
@@ -349,7 +434,6 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Diag error: {type(e).__name__}: {e}")
 
-# --- Symbol lookup (no exclusions) ---
 def normalize_symbol_text(text: str) -> Optional[str]:
     if not text: return None
     s = text.strip()
@@ -391,6 +475,41 @@ async def coin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await coin_query(update, update.message.text or "")
 
+# ---- Alert scheduler ----
+async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+    """Runs periodically; if conditions are met, sends one email."""
+    try:
+        if not NOTIFY_ON:
+            return
+        if not email_config_ok():
+            logging.info("Email not configured; alert job skipping.")
+            return
+        best_spot, best_fut, *_ = await asyncio.to_thread(load_best)
+        p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
+        body = scan_for_alerts(p1, p2, p3)
+        if body:
+            subject = "Crypto Alert: +5% (24h) & +5% (4h)"
+            ok = send_email(subject, body)
+            logging.info("Alert email sent: %s", ok)
+    except Exception as e:
+        logging.exception("alert_job error: %s", e)
+
+# ---- Notification commands ----
+async def notify_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global NOTIFY_ON
+    NOTIFY_ON = True
+    await update.message.reply_text("Email alerts: ON")
+
+async def notify_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global NOTIFY_ON
+    NOTIFY_ON = False
+    await update.message.reply_text("Email alerts: OFF")
+
+async def notify_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = "ON" if NOTIFY_ON else "OFF"
+    dest = EMAIL_TO or "n/a"
+    await update.message.reply_text(f"Email alerts: {status} → {dest}\nInterval: {CHECK_INTERVAL_MIN} min\nRule: +5% (24h) AND +5% (4h)")
+
 def main():
     if not TOKEN:
         raise RuntimeError("Set TELEGRAM_TOKEN env var")
@@ -403,9 +522,15 @@ def main():
     app.add_handler(CommandHandler("excel", excel_cmd))
     app.add_handler(CommandHandler("diag", diag))
     app.add_handler(CommandHandler("coin", coin_cmd))  # /coin PYTH
+    app.add_handler(CommandHandler("notify_on", notify_on_cmd))
+    app.add_handler(CommandHandler("notify_off", notify_off_cmd))
+    app.add_handler(CommandHandler("notify", notify_status_cmd))
 
     # Plain-text symbol lookups (must be after commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    # Schedule repeating alert job
+    app.job_queue.run_repeating(alert_job, interval=CHECK_INTERVAL_MIN * 60, first=10)
 
     app.run_polling(drop_pending_updates=True)
 
