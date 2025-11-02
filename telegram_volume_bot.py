@@ -66,10 +66,13 @@ EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)  # from address
 EMAIL_TO   = os.environ.get("EMAIL_TO", EMAIL_USER)    # destination address
 
 # How often the alert job runs (minutes)
-CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "10"))
-ALERT_PCT_24H_MIN  = 5.0
-ALERT_PCT_4H_MIN   = 5.0
-ALERT_THROTTLE_SEC = 6 * 60 * 60  # 6 hours per (priority,symbol)
+CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "1")) # check every 1 minute
+ALERT_PCT_24H_MIN = 5.0
+ALERT_PCT_4H_MIN = 5.0
+
+# allow up to ~100 emails per day per (priority,symbol)
+# 24h = 1440 min → 1440 / 15 ≈ 96 triggers/day
+ALERT_THROTTLE_SEC = 15 * 60 # 15 minutes per (priority,symbol)
 
 LAST_ERROR: Optional[str] = None
 PCT4H_CACHE: Dict[Tuple[str,str], float] = {}
