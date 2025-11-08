@@ -2,20 +2,27 @@
 """
 Telegram crypto screener & alert bot (CoinEx via CCXT)
 
-🧩 Features:
+Features:
 - Shows 3 priorities of coins (P1, P2, P3)
-- Table columns: SYM | F | S | %24H | %4H | %1H
-- Email alerts if 4h ≥ +5% AND 1h ≥ +5%
-- Sends emails only 11 AM – 11 PM (Melbourne)
-- Max 2 emails/hour, 20 emails/day, 15 min cool-down
+- Table: SYM | F | S | %24H | %4H | %1H
+- Email alerts if (4h >= +5%) AND (1h >= +5%)
+- Emails only 11:00–23:00 (Australia/Melbourne)
+- Max 2 emails/hour, 20 emails/day, 15-min cooldown per (priority,symbol)
 - Check interval = 5 min
-- Commands: /screen /notify_on /notify_off /notify /diag
-- You can also just type a coin name (e.g. PYTH)
+- Commands: /start /screen /notify_on /notify_off /notify /diag
+- Typing a symbol (e.g. PYTH) gives a one-row table
 
-Pinned coins (BTC ETH XRP SOL DOGE ADA PEPE LINK) appear ONLY in P3.
+Pinned coins (BTC, ETH, XRP, SOL, DOGE, ADA, PEPE, LINK) appear ONLY in P3.
 """
 
-import asyncio, logging, os, time, traceback, re, ssl, smtplib, io
+import asyncio
+import logging
+import os
+import time
+import traceback
+import re
+import ssl
+import smtplib
 from email.message import EmailMessage
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
@@ -26,61 +33,69 @@ import ccxt
 from tabulate import tabulate
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes,
-    MessageHandler, filters, ErrorHandler
-)
 from telegram.error import Conflict
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # ================== CONFIG ==================
 
 EXCHANGE_ID = "coinex"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
-# --- thresholds ---
+# Priority thresholds
 P1_SPOT_MIN = 500_000
-P1_FUT_MIN  = 5_000_000
-P2_FUT_MIN  = 2_000_000
+P1_FUT_MIN = 5_000_000
+P2_FUT_MIN = 2_000_000
 P3_SPOT_MIN = 3_000_000
 
 TOP_N_P1 = 10
 TOP_N_P2 = 5
 TOP_N_P3 = 10
 
-STABLES = {"USD","USDT","USDC","TUSD","FDUSD","USDD","USDE","DAI","PYUSD"}
+STABLES = {"USD", "USDT", "USDC", "TUSD", "FDUSD", "USDD", "USDE", "DAI", "PYUSD"}
 
-# --- pinned coins (only in P3) ---
-PINNED_P3 = ["BTC","ETH","XRP","SOL","DOGE","ADA","PEPE","LINK"]
+# Pinned coins (P3 only)
+PINNED_P3 = ["BTC", "ETH", "XRP", "SOL", "DOGE", "ADA", "PEPE", "LINK"]
 PINNED_SET = set(PINNED_P3)
 
-# --- email configuration (set in Render env vars) ---
+# Email config (set in Render env)
 EMAIL_ENABLED_DEFAULT = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
 EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465"))
 EMAIL_USER = os.environ.get("EMAIL_USER", "")
 EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
-EMAIL_TO   = os.environ.get("EMAIL_TO", EMAIL_USER)
+EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 
-# --- scheduler / alerts ---
-CHECK_INTERVAL_MIN = 5                   # run every 5 min
+# Scheduler / alerts
+CHECK_INTERVAL_MIN = 5  # run every 5 minutes
 ALERT_PCT_4H_MIN = 5.0
 ALERT_PCT_1H_MIN = 5.0
-ALERT_THROTTLE_SEC = 15 * 60             # 15 min cool-down per symbol & priority
+ALERT_THROTTLE_SEC = 15 * 60  # 15 minutes per (priority,symbol)
+
 EMAIL_DAILY_LIMIT = 20
 EMAIL_HOURLY_LIMIT = 2
 EMAIL_DAILY_WINDOW_SEC = 24 * 60 * 60
 EMAIL_HOURLY_WINDOW_SEC = 60 * 60
 
-# --- globals ---
+# Globals
 LAST_ERROR: Optional[str] = None
 NOTIFY_ON: bool = EMAIL_ENABLED_DEFAULT
-PCT4H_CACHE: Dict[Tuple[str,str], float] = {}
-PCT1H_CACHE: Dict[Tuple[str,str], float] = {}
-ALERT_SENT_CACHE: Dict[Tuple[str,str], float] = {}
-EMAIL_SEND_LOG: List[float] = []
 
-# ================== HELPERS ==================
+# caches: (dtype, symbol) -> pct
+PCT4H_CACHE: Dict[Tuple[str, str], float] = {}
+PCT1H_CACHE: Dict[Tuple[str, str], float] = {}
+
+ALERT_SENT_CACHE: Dict[Tuple[str, str], float] = {}  # (priority, symbol) -> last_sent_time
+EMAIL_SEND_LOG: List[float] = []  # timestamps of sent emails
+
+
+# ================== DATA STRUCTURES ==================
 
 @dataclass
 class MarketVol:
@@ -94,61 +109,89 @@ class MarketVol:
     quote_vol: float
     vwap: float
 
+
+# ================== HELPERS ==================
+
 def safe_split_symbol(sym: Optional[str]):
-    if not sym: return None
+    if not sym:
+        return None
     pair = sym.split(":")[0]
-    if "/" not in pair: return None
+    if "/" not in pair:
+        return None
     return tuple(pair.split("/", 1))
+
 
 def to_mv(t: dict) -> Optional[MarketVol]:
     sym = t.get("symbol")
     sp = safe_split_symbol(sym)
-    if not sp: return None
+    if not sp:
+        return None
     base, quote = sp
     return MarketVol(
-        sym, base, quote,
-        float(t.get("last") or 0.0),
-        float(t.get("open") or 0.0),
-        float(t.get("percentage") or 0.0),
-        float(t.get("baseVolume") or 0.0),
-        float(t.get("quoteVolume") or 0.0),
-        float(t.get("vwap") or 0.0),
+        symbol=sym,
+        base=base,
+        quote=quote,
+        last=float(t.get("last") or 0.0),
+        open=float(t.get("open") or 0.0),
+        percentage=float(t.get("percentage") or 0.0),
+        base_vol=float(t.get("baseVolume") or 0.0),
+        quote_vol=float(t.get("quoteVolume") or 0.0),
+        vwap=float(t.get("vwap") or 0.0),
     )
+
 
 def usd_notional(mv: Optional[MarketVol]) -> float:
     """Return 24h notional volume in USD."""
-    if not mv: return 0.0
+    if not mv:
+        return 0.0
     if mv.quote in STABLES and mv.quote_vol:
         return mv.quote_vol
     price = mv.vwap if mv.vwap else mv.last
-    return mv.base_vol * price if mv.base_vol else 0.0
+    if not price or not mv.base_vol:
+        return 0.0
+    return mv.base_vol * price
 
-def pct_change(mv_spot: Optional[MarketVol], mv_fut: Optional[MarketVol]) -> float:
+
+def pct_change_24h(mv_spot: Optional[MarketVol], mv_fut: Optional[MarketVol]) -> float:
     """24h % change (prefer ticker.percentage)."""
     for mv in (mv_spot, mv_fut):
         if mv and mv.percentage:
-            return mv.percentage
+            return float(mv.percentage)
     mv = mv_spot or mv_fut
     if mv and mv.open:
-        return (mv.last - mv.open) / mv.open * 100
+        return (mv.last - mv.open) / mv.open * 100.0
     return 0.0
+
 
 def pct_with_emoji(p: float) -> str:
     val = round(p)
-    if val >= 3: emo = "🟢"
-    elif val <= -3: emo = "🔴"
-    else: emo = "🟡"
+    if val >= 3:
+        emo = "🟢"
+    elif val <= -3:
+        emo = "🔴"
+    else:
+        emo = "🟡"
     return f"{val:+d}% {emo}"
 
+
 def m_dollars(x: float) -> str:
+    """Return millions as a rounded integer string."""
     return str(round(x / 1_000_000))
+
 
 def build_exchange(default_type: str):
     klass = ccxt.__dict__[EXCHANGE_ID]
-    return klass({"enableRateLimit": True, "timeout": 20000,
-                  "options": {"defaultType": default_type}})
+    return klass(
+        {
+            "enableRateLimit": True,
+            "timeout": 20000,
+            "options": {"defaultType": default_type},
+        }
+    )
+
 
 def safe_fetch_tickers(ex):
+    """Fetch tickers; on error, log and return {}."""
     try:
         ex.load_markets()
         return ex.fetch_tickers()
@@ -158,263 +201,447 @@ def safe_fetch_tickers(ex):
         logging.exception("fetch_tickers failed")
         return {}
 
-# ================== PERCENTAGE FETCH (4H / 1H) ==================
 
-def compute_pct_for_symbol(symbol: str, hours: int, prefer_swap=True) -> float:
+# ================== PERCENTAGE (4H / 1H) ==================
+
+def compute_pct_for_symbol(symbol: str, hours: int, prefer_swap: bool = True) -> float:
     """
     Compute % change over the last N completed hours using 1h candles.
+    Cache results per (dtype, symbol).
     """
     try_order = ["swap", "spot"] if prefer_swap else ["spot", "swap"]
     for dtype in try_order:
-        ck = (dtype, symbol, hours)
-        if hours == 4 and ck in PCT4H_CACHE:
-            return PCT4H_CACHE[ck]
-        if hours == 1 and ck in PCT1H_CACHE:
-            return PCT1H_CACHE[ck]
+        cache_key = (dtype, symbol)
+        if hours == 4 and cache_key in PCT4H_CACHE:
+            return PCT4H_CACHE[cache_key]
+        if hours == 1 and cache_key in PCT1H_CACHE:
+            return PCT1H_CACHE[cache_key]
         try:
             ex = build_exchange(dtype)
             ex.load_markets()
             candles = ex.fetch_ohlcv(symbol, timeframe="1h", limit=hours + 1)
             if not candles or len(candles) <= hours:
                 continue
-            closes = [c[4] for c in candles][- (hours + 1) :]
-            pct = ((closes[-1] - closes[0]) / closes[0] * 100.0) if closes[0] else 0.0
-            if hours == 4:
-                PCT4H_CACHE[ck] = pct
+            closes = [c[4] for c in candles][- (hours + 1):]
+            if not closes or not closes[0]:
+                pct = 0.0
             else:
-                PCT1H_CACHE[ck] = pct
+                pct = (closes[-1] - closes[0]) / closes[0] * 100.0
+            if hours == 4:
+                PCT4H_CACHE[cache_key] = pct
+            else:
+                PCT1H_CACHE[cache_key] = pct
             return pct
         except Exception:
-            logging.exception("pct_%dh failed for %s (%s)", hours, symbol, dtype)
+            logging.exception("compute_pct_for_symbol: %dh failed for %s (%s)", hours, symbol, dtype)
             continue
     return 0.0
 
-# ================== BUILD PRIORITIES ==================
+
+# ================== PRIORITIES ==================
 
 def load_best():
-    """Load top tickers for spot and futures (swap)."""
+    """Load top spot & futures markets per BASE symbol."""
     ex_spot = build_exchange("spot")
     ex_fut = build_exchange("swap")
     spot_tickers = safe_fetch_tickers(ex_spot)
     fut_tickers = safe_fetch_tickers(ex_fut)
 
-    best_spot, best_fut = {}, {}
+    best_spot: Dict[str, MarketVol] = {}
+    best_fut: Dict[str, MarketVol] = {}
+
     for t in spot_tickers.values():
         mv = to_mv(t)
         if mv and mv.quote in STABLES:
             if mv.base not in best_spot or usd_notional(mv) > usd_notional(best_spot[mv.base]):
                 best_spot[mv.base] = mv
+
     for t in fut_tickers.values():
         mv = to_mv(t)
         if mv:
             if mv.base not in best_fut or usd_notional(mv) > usd_notional(best_fut[mv.base]):
                 best_fut[mv.base] = mv
+
     return best_spot, best_fut, len(spot_tickers), len(fut_tickers)
 
-def build_priorities(best_spot, best_fut):
+
+def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, MarketVol]):
     """
     Build P1, P2, P3 lists.
     Each row: [SYM, FUSD, SUSD, %24H, %4H, %1H]
     """
-    p1, p2, p3 = [], [], []
+    p1: List[List] = []
+    p2: List[List] = []
+    p3: List[List] = []
     used = set()
 
-    # P1
-    for b in set(best_spot) & set(best_fut):
-        if b in PINNED_SET: continue
-        s, f = best_spot[b], best_fut[b]
-        fut, spot = usd_notional(f), usd_notional(s)
-        if fut >= P1_FUT_MIN and spot >= P1_SPOT_MIN:
-            p1.append([b, fut, spot, pct_change(s,f),
-                       compute_pct_for_symbol(f.symbol,4),
-                       compute_pct_for_symbol(f.symbol,1)])
+    # ---- P1: F≥5M & S≥500k (pinned excluded) ----
+    for base in set(best_spot) & set(best_fut):
+        if base in PINNED_SET:
+            continue
+        s = best_spot[base]
+        f = best_fut[base]
+        fut_usd = usd_notional(f)
+        spot_usd = usd_notional(s)
+        if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
+            pct24 = pct_change_24h(s, f)
+            pct4 = compute_pct_for_symbol(f.symbol, 4)
+            pct1 = compute_pct_for_symbol(f.symbol, 1)
+            p1.append([base, fut_usd, spot_usd, pct24, pct4, pct1])
+
     p1.sort(key=lambda x: x[1], reverse=True)
     p1 = p1[:TOP_N_P1]
     used |= {r[0] for r in p1}
 
-    # P2
-    for b,f in best_fut.items():
-        if b in used or b in PINNED_SET: continue
-        fut = usd_notional(f)
-        if fut >= P2_FUT_MIN:
-            s = best_spot.get(b)
-            p2.append([b, fut, usd_notional(s) if s else 0,
-                       pct_change(s,f),
-                       compute_pct_for_symbol(f.symbol,4),
-                       compute_pct_for_symbol(f.symbol,1)])
-    p2.sort(key=lambda x:x[1], reverse=True)
+    # ---- P2: F≥2M (pinned & already used excluded) ----
+    for base, f in best_fut.items():
+        if base in used or base in PINNED_SET:
+            continue
+        fut_usd = usd_notional(f)
+        if fut_usd >= P2_FUT_MIN:
+            s = best_spot.get(base)
+            spot_usd = usd_notional(s) if s else 0.0
+            pct24 = pct_change_24h(s, f)
+            pct4 = compute_pct_for_symbol(f.symbol, 4)
+            pct1 = compute_pct_for_symbol(f.symbol, 1)
+            p2.append([base, fut_usd, spot_usd, pct24, pct4, pct1])
+
+    p2.sort(key=lambda x: x[1], reverse=True)
     p2 = p2[:TOP_N_P2]
     used |= {r[0] for r in p2}
 
-    # P3: pinned + others by spot≥3M
-    temp = {}
-    for b in PINNED_P3:
-        s,f = best_spot.get(b), best_fut.get(b)
-        if not s and not f: continue
-        temp[b] = [b,
-                   usd_notional(f) if f else 0,
-                   usd_notional(s) if s else 0,
-                   pct_change(s,f),
-                   compute_pct_for_symbol(f.symbol if f else s.symbol,4),
-                   compute_pct_for_symbol(f.symbol if f else s.symbol,1)]
-    for b,s in best_spot.items():
-        if b in used or b in PINNED_SET: continue
-        if usd_notional(s)>=P3_SPOT_MIN:
-            f=best_fut.get(b)
-            temp[b]=[b,usd_notional(f) if f else 0,usd_notional(s),
-                     pct_change(s,f),
-                     compute_pct_for_symbol(f.symbol if f else s.symbol,4),
-                     compute_pct_for_symbol(f.symbol if f else s.symbol,1)]
-    allr=list(temp.values())
-    pins=[r for r in allr if r[0] in PINNED_SET]
-    others=[r for r in allr if r[0] not in PINNED_SET]
-    pins.sort(key=lambda r:r[2],reverse=True)
-    others.sort(key=lambda r:r[2],reverse=True)
-    p3=(pins+others)[:TOP_N_P3]
-    return p1,p2,p3
+    # ---- P3: pinned + others with Spot≥3M (pinned only in P3) ----
+    tmp: Dict[str, List] = {}
+
+    # pinned first
+    for base in PINNED_P3:
+        s = best_spot.get(base)
+        f = best_fut.get(base)
+        if not s and not f:
+            continue
+        fut_usd = usd_notional(f) if f else 0.0
+        spot_usd = usd_notional(s) if s else 0.0
+        pct24 = pct_change_24h(s, f)
+        symbol_for_pct = f.symbol if f else (s.symbol if s else "")
+        pct4 = compute_pct_for_symbol(symbol_for_pct, 4) if symbol_for_pct else 0.0
+        pct1 = compute_pct_for_symbol(symbol_for_pct, 1) if symbol_for_pct else 0.0
+        tmp[base] = [base, fut_usd, spot_usd, pct24, pct4, pct1]
+
+    # non-pinned, not used, Spot≥3M
+    for base, s in best_spot.items():
+        if base in used or base in PINNED_SET:
+            continue
+        spot_usd = usd_notional(s)
+        if spot_usd >= P3_SPOT_MIN:
+            f = best_fut.get(base)
+            fut_usd = usd_notional(f) if f else 0.0
+            pct24 = pct_change_24h(s, f)
+            symbol_for_pct = f.symbol if f else s.symbol
+            pct4 = compute_pct_for_symbol(symbol_for_pct, 4)
+            pct1 = compute_pct_for_symbol(symbol_for_pct, 1)
+            tmp[base] = [base, fut_usd, spot_usd, pct24, pct4, pct1]
+
+    all_rows = list(tmp.values())
+    pinned_rows = [r for r in all_rows if r[0] in PINNED_SET]
+    other_rows = [r for r in all_rows if r[0] not in PINNED_SET]
+
+    pinned_rows.sort(key=lambda r: r[2], reverse=True)
+    other_rows.sort(key=lambda r: r[2], reverse=True)
+    p3 = (pinned_rows + other_rows)[:TOP_N_P3]
+
+    return p1, p2, p3
+
 
 # ================== FORMATTING ==================
 
-def fmt_table(rows,title):
-    if not rows: return f"*{title}*: _None_\n"
-    pretty=[[r[0],m_dollars(r[1]),m_dollars(r[2]),
-             pct_with_emoji(r[3]),pct_with_emoji(r[4]),pct_with_emoji(r[5])] for r in rows]
-    return f"*{title}*:\n```\n"+tabulate(pretty,headers=["SYM","F","S","%24H","%4H","%1H"],tablefmt="github")+"\n```\n"
+def fmt_table(rows: List[List], title: str) -> str:
+    if not rows:
+        return f"*{title}*: _None_\n"
+    pretty = [
+        [
+            r[0],
+            m_dollars(r[1]),
+            m_dollars(r[2]),
+            pct_with_emoji(r[3]),
+            pct_with_emoji(r[4]),
+            pct_with_emoji(r[5]),
+        ]
+        for r in rows
+    ]
+    return (
+        f"*{title}*:\n"
+        "```\n"
+        + tabulate(pretty, headers=["SYM", "F", "S", "%24H", "%4H", "%1H"], tablefmt="github")
+        + "\n```\n"
+    )
 
-def fmt_single(sym,fusd,susd,p24,p4,p1):
-    row=[[sym,m_dollars(fusd),m_dollars(susd),
-          pct_with_emoji(p24),pct_with_emoji(p4),pct_with_emoji(p1)]]
-    return "```\n"+tabulate(row,headers=["SYM","F","S","%24H","%4H","%1H"],tablefmt="github")+"\n```"
+
+def fmt_single(sym: str, fusd: float, susd: float, p24: float, p4: float, p1: float) -> str:
+    row = [[sym, m_dollars(fusd), m_dollars(susd),
+            pct_with_emoji(p24), pct_with_emoji(p4), pct_with_emoji(p1)]]
+    return (
+        "```\n"
+        + tabulate(row, headers=["SYM", "F", "S", "%24H", "%4H", "%1H"], tablefmt="github")
+        + "\n```"
+    )
+
 
 # ================== EMAIL HELPERS ==================
 
-def email_config_ok():
-    return all([EMAIL_HOST,EMAIL_PORT,EMAIL_USER,EMAIL_PASS,EMAIL_FROM,EMAIL_TO])
+def email_config_ok() -> bool:
+    return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO])
 
-def send_email(subject,body):
+
+def send_email(subject: str, body: str) -> bool:
     if not email_config_ok():
         logging.warning("Email not configured.")
         return False
     try:
-        msg=EmailMessage();msg["Subject"]=subject;msg["From"]=EMAIL_FROM;msg["To"]=EMAIL_TO
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
         msg.set_content(body)
-        if EMAIL_PORT==465:
-            ctx=ssl.create_default_context()
-            with smtplib.SMTP_SSL(EMAIL_HOST,EMAIL_PORT,context=ctx) as s:
-                s.login(EMAIL_USER,EMAIL_PASS);s.send_message(msg)
+
+        if EMAIL_PORT == 465:
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT, context=ctx) as s:
+                s.login(EMAIL_USER, EMAIL_PASS)
+                s.send_message(msg)
         else:
-            with smtplib.SMTP(EMAIL_HOST,EMAIL_PORT) as s:
-                s.starttls();s.login(EMAIL_USER,EMAIL_PASS);s.send_message(msg)
+            with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as s:
+                s.starttls()
+                s.login(EMAIL_USER, EMAIL_PASS)
+                s.send_message(msg)
         return True
     except Exception as e:
-        logging.exception("send_email failed: %s",e)
+        logging.exception("send_email failed: %s", e)
         return False
 
-def melbourne_ok():
+
+def melbourne_ok() -> bool:
+    """Return True only if local time is between 11:00–23:00 in Melbourne."""
     try:
-        hr=datetime.now(ZoneInfo("Australia/Melbourne")).hour
-        return 11<=hr<23
+        hr = datetime.now(ZoneInfo("Australia/Melbourne")).hour
+        return 11 <= hr < 23
     except Exception:
+        # If timezone fails, default to allow
+        logging.exception("Melbourne time failed; defaulting to allowed.")
         return True
 
-def email_quota_ok():
-    now=time.time()
-    EMAIL_SEND_LOG[:]=[x for x in EMAIL_SEND_LOG if now-x<EMAIL_DAILY_WINDOW_SEC]
-    if len(EMAIL_SEND_LOG)>=EMAIL_DAILY_LIMIT: return False
-    if sum(1 for x in EMAIL_SEND_LOG if now-x<EMAIL_HOURLY_WINDOW_SEC)>=EMAIL_HOURLY_LIMIT: return False
+
+def email_quota_ok() -> bool:
+    """Check daily + hourly global email caps."""
+    now = time.time()
+    # purge >24h
+    recent = [x for x in EMAIL_SEND_LOG if now - x < EMAIL_DAILY_WINDOW_SEC]
+    EMAIL_SEND_LOG[:] = recent
+
+    if len(EMAIL_SEND_LOG) >= EMAIL_DAILY_LIMIT:
+        return False
+
+    hourly = sum(1 for x in EMAIL_SEND_LOG if now - x < EMAIL_HOURLY_WINDOW_SEC)
+    if hourly >= EMAIL_HOURLY_LIMIT:
+        return False
+
     return True
 
-def record_email(): EMAIL_SEND_LOG.append(time.time())
 
-def should_alert(prio,sym):
-    now=time.time();key=(prio,sym)
-    last=ALERT_SENT_CACHE.get(key,0)
-    if now-last>=ALERT_THROTTLE_SEC:
-        ALERT_SENT_CACHE[key]=now;return True
+def record_email():
+    EMAIL_SEND_LOG.append(time.time())
+
+
+def should_alert(priority: str, symbol: str) -> bool:
+    """Per (priority,symbol) cool-down."""
+    now = time.time()
+    key = (priority, symbol)
+    last = ALERT_SENT_CACHE.get(key, 0)
+    if now - last >= ALERT_THROTTLE_SEC:
+        ALERT_SENT_CACHE[key] = now
+        return True
     return False
 
-def scan_for_alerts(p1,p2,p3):
-    lines=[]
-    for lbl,rows in (("P1",p1),("P2",p2),("P3",p3)):
-        hit=[]
-        for s,_,_,_,p4,p1h in rows:
-            if p4>=ALERT_PCT_4H_MIN and p1h>=ALERT_PCT_1H_MIN and should_alert(lbl,s):
-                hit.append(s)
-        if hit: lines.append(f"{lbl}: "+", ".join(hit))
-    return None if not lines else "Coins +5% (4h & 1h):\n\n"+"\n".join(lines)
+
+def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List]) -> Optional[str]:
+    """
+    Build email body if we have coins with:
+      4h >= ALERT_PCT_4H_MIN AND 1h >= ALERT_PCT_1H_MIN
+    """
+    lines: List[str] = []
+    for label, rows in (("P1", p1), ("P2", p2), ("P3", p3)):
+        hits: List[str] = []
+        for sym, _, _, _, pct4, pct1 in rows:
+            if pct4 >= ALERT_PCT_4H_MIN and pct1 >= ALERT_PCT_1H_MIN:
+                if should_alert(label, sym):
+                    hits.append(sym)
+        if hits:
+            lines.append(f"{label}: " + ", ".join(sorted(set(hits))))
+    if not lines:
+        return None
+    return "Coins +5% (4h & 1h):\n\n" + "\n".join(lines)
+
 
 # ================== TELEGRAM HANDLERS ==================
 
-async def start(u,c): await u.message.reply_text("Use /screen • /notify_on • /notify_off • /notify • /diag\nType a symbol (e.g. PYTH) to get its data.")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Commands:\n"
+        "• /screen — show P1, P2, P3\n"
+        "• /notify_on /notify_off /notify\n"
+        "• /diag — short diagnostics\n"
+        "• Type a symbol (e.g. PYTH) for its row"
+    )
 
-async def screen(u,c):
+
+async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        PCT4H_CACHE.clear();PCT1H_CACHE.clear()
-        bs,bf,_,_=await asyncio.to_thread(load_best)
-        p1,p2,p3=await asyncio.to_thread(build_priorities,bs,bf)
-        msg=fmt_table(p1,"P1 (F≥5M,S≥0.5M)")+fmt_table(p2,"P2 (F≥2M)")+fmt_table(p3,"P3 (Pinned+S≥3M)")
-        await u.message.reply_text(msg,parse_mode=ParseMode.MARKDOWN)
+        PCT4H_CACHE.clear()
+        PCT1H_CACHE.clear()
+        best_spot, best_fut, raw_spot, raw_fut = await asyncio.to_thread(load_best)
+        p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
+        msg = (
+            fmt_table(p1, "P1 (F≥5M & S≥0.5M — pinned excluded)")
+            + fmt_table(p2, "P2 (F≥2M — pinned excluded)")
+            + fmt_table(p3, "P3 (Pinned + S≥3M)")
+            + f"tickers: spot={raw_spot}, fut={raw_fut}"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        logging.exception("screen");await u.message.reply_text(f"Error: {e}")
+        logging.exception("screen error")
+        await update.message.reply_text(f"Error: {e}")
 
-async def diag(u,c):
-    msg=f"*Diag*  Rule: +5% (4h & 1h)  Interval: {CHECK_INTERVAL_MIN}min\nEmail: {'ON' if NOTIFY_ON else 'OFF'}"
-    await u.message.reply_text(msg,parse_mode=ParseMode.MARKDOWN)
 
-async def notify_on(u,c): 
-    global NOTIFY_ON;NOTIFY_ON=True;await u.message.reply_text("Email alerts: ON")
-async def notify_off(u,c):
-    global NOTIFY_ON;NOTIFY_ON=False;await u.message.reply_text("Email alerts: OFF")
-async def notify(u,c):
-    await u.message.reply_text(f"Email alerts: {'ON' if NOTIFY_ON else 'OFF'} → {EMAIL_TO}")
+async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        f"*Diag*\n"
+        f"- rule: +5% (4h & 1h)\n"
+        f"- interval: {CHECK_INTERVAL_MIN} min\n"
+        f"- email: {'ON' if NOTIFY_ON else 'OFF'}"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-async def text_router(u,c):
-    sym=re.sub(r'[^A-Za-z$]','',u.message.text or '').upper().lstrip('$')
-    if len(sym)<2: return
-    bs,bf,_,_=await asyncio.to_thread(load_best)
-    s,f=bs.get(sym),bf.get(sym)
-    fusd,susd=usd_notional(f) if f else 0,usd_notional(s) if s else 0
-    if not fusd and not susd:
-        await u.message.reply_text("Not found.");return
-    msg=fmt_single(sym,fusd,susd,
-                   pct_change(s,f),
-                   compute_pct_for_symbol(f.symbol if f else s.symbol,4),
-                   compute_pct_for_symbol(f.symbol if f else s.symbol,1))
-    await u.message.reply_text(msg,parse_mode=ParseMode.MARKDOWN)
+
+async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global NOTIFY_ON
+    NOTIFY_ON = True
+    await update.message.reply_text("Email alerts: ON")
+
+
+async def notify_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global NOTIFY_ON
+    NOTIFY_ON = False
+    await update.message.reply_text("Email alerts: OFF")
+
+
+async def notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Email alerts: {'ON' if NOTIFY_ON else 'OFF'} → {EMAIL_TO or 'n/a'}"
+    )
+
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    # keep only letters and $
+    token = re.sub(r"[^A-Za-z$]", "", text).upper().lstrip("$")
+    if len(token) < 2:
+        return
+    try:
+        best_spot, best_fut, _, _ = await asyncio.to_thread(load_best)
+        s = best_spot.get(token)
+        f = best_fut.get(token)
+        fusd = usd_notional(f) if f else 0.0
+        susd = usd_notional(s) if s else 0.0
+        if fusd == 0.0 and susd == 0.0:
+            await update.message.reply_text("Symbol not found.")
+            return
+        pct24 = pct_change_24h(s, f)
+        symbol_for_pct = f.symbol if f else (s.symbol if s else "")
+        pct4 = compute_pct_for_symbol(symbol_for_pct, 4) if symbol_for_pct else 0.0
+        pct1 = compute_pct_for_symbol(symbol_for_pct, 1) if symbol_for_pct else 0.0
+        msg = fmt_single(token, fusd, susd, pct24, pct4, pct1)
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logging.exception("text_router error")
+        await update.message.reply_text(f"Error: {e}")
+
 
 # ================== ALERT JOB ==================
 
-async def alert_job(c):
-    if not NOTIFY_ON or not melbourne_ok() or not email_config_ok(): return
-    if not email_quota_ok(): return
-    bs,bf,_,_=await asyncio.to_thread(load_best)
-    p1,p2,p3=await asyncio.to_thread(build_priorities,bs,bf)
-    body=scan_for_alerts(p1,p2,p3)
-    if body and send_email("Crypto Alert: +5% (4h) & +5% (1h)",body):
-        record_email()
+async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not NOTIFY_ON:
+            return
+        if not melbourne_ok():
+            return
+        if not email_config_ok():
+            return
+        if not email_quota_ok():
+            return
+
+        PCT4H_CACHE.clear()
+        PCT1H_CACHE.clear()
+
+        best_spot, best_fut, _, _ = await asyncio.to_thread(load_best)
+        p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
+        body = scan_for_alerts(p1, p2, p3)
+        if not body:
+            return
+
+        if send_email("Crypto Alert: +5% (4h) & +5% (1h)", body):
+            record_email()
+    except Exception as e:
+        logging.exception("alert_job error: %s", e)
+
+
+# ================== ERROR HANDLER ==================
+
+async def log_err(update: object, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        raise context.error
+    except Conflict:
+        logging.warning("Conflict: another instance already polling.")
+    except Exception as e:
+        logging.exception("Unhandled error: %s", e)
+
 
 # ================== MAIN ==================
 
-async def log_err(u,c):
-    if isinstance(c.error,Conflict):
-        logging.warning("Conflict: duplicate polling.");return
-    logging.exception("Error: %s",c.error)
-
 def main():
-    if not TOKEN: raise RuntimeError("TELEGRAM_TOKEN missing")
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN missing")
     logging.basicConfig(level=logging.INFO)
-    app=Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start",start))
-    app.add_handler(CommandHandler("screen",screen))
-    app.add_handler(CommandHandler("diag",diag))
-    app.add_handler(CommandHandler("notify_on",notify_on))
-    app.add_handler(CommandHandler("notify_off",notify_off))
-    app.add_handler(CommandHandler("notify",notify))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_router))
-    app.add_error_handler(ErrorHandler(log_err))
-    if getattr(app,"job_queue",None):
-        app.job_queue.run_repeating(alert_job,interval=CHECK_INTERVAL_MIN*60,first=10)
+
+    app = Application.builder().token(TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("screen", screen))
+    app.add_handler(CommandHandler("diag", diag))
+    app.add_handler(CommandHandler("notify_on", notify_on))
+    app.add_handler(CommandHandler("notify_off", notify_off))
+    app.add_handler(CommandHandler("notify", notify))
+
+    # Text symbol lookup
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    # Error handler
+    app.add_error_handler(log_err)
+
+    # Job queue for alerts
+    if getattr(app, "job_queue", None):
+        app.job_queue.run_repeating(
+            alert_job,
+            interval=CHECK_INTERVAL_MIN * 60,
+            first=10,
+        )
+    else:
+        logging.warning(
+            "JobQueue not available. Make sure you installed "
+            '"python-telegram-bot[job-queue]" in requirements.txt.'
+        )
+
     app.run_polling(drop_pending_updates=True)
 
-if __name__=="__main__": main()
 
+if __name__ == "__main__":
+    main()
