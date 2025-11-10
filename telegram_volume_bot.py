@@ -420,7 +420,7 @@ def send_email(subject: str, body: str) -> bool:
 
 
 def melbourne_ok() -> bool:
-    """Return True only if local time is between 11:00–23:00 in Melbourne."""
+    """Return True only if local time is between 08:00–23:30 in Melbourne."""
     try:
         hr = datetime.now(ZoneInfo("Australia/Melbourne")).hour
         return 11 <= hr < 23
