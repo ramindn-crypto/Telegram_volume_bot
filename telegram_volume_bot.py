@@ -6,7 +6,7 @@ Features:
 - Shows 3 priorities of coins (P1, P2, P3)
 - Table: SYM | F | S | %24H | %4H | %1H
 - Email alerts if (4h >= +5%) AND (1h >= +5%)
-- Emails only 11:00–23:00 (Australia/Melbourne)
+- Emails only 08:00–23:00 (Australia/Melbourne)
 - Max 2 emails/hour, 20 emails/day, 15-min cooldown per (priority,symbol)
 - Check interval = 5 min
 - Commands: /start /screen /notify_on /notify_off /notify /diag
