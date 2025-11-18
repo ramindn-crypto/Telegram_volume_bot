@@ -3,23 +3,25 @@
 Telegram crypto screener & alert bot (CoinEx via CCXT)
 
 Features:
-- Shows 3 priorities of coins (P1, P2, P3)
+- Shows 3 priorities of coins (P1, P2, P3) using CoinEx volumes
 - Table: SYM | F | S | %24H | %4H | %1H
 - Email alerts if (4h >= +5%) AND (1h >= +5%)
-- Emails only 08:00–23:00 (Australia/Melbourne)
+- Emails only 07:00–23:00 (Australia/Melbourne)
 - Max 2 emails/hour, 20 emails/day, 15-min cooldown per (priority,symbol)
 - Check interval = 5 min
 - Commands: /start /screen /notify_on /notify_off /notify /diag
 - Typing a symbol (e.g. PYTH) gives a one-row table
 
-Pinned coins (BTC, ETH, XRP, SOL, DOGE, ADA, PEPE, LINK) appear ONLY in P3.
+This version also:
+- Calculates simple LONG and SHORT scores based on %24h, %4h, %1h, and futures volume
+- Picks 1 best BUY and 1 best SELL from all P1/P2/P3 rows
+- Generates Entry / Exit / Stop Loss for both, shown at bottom of /screen and in email alerts
 """
 
 import asyncio
 import logging
 import os
 import time
-import traceback
 import re
 import ssl
 import smtplib
@@ -47,7 +49,7 @@ from telegram.ext import (
 EXCHANGE_ID = "coinex"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
-# Priority thresholds
+# Priority thresholds (USD notional)
 P1_SPOT_MIN = 500_000
 P1_FUT_MIN = 5_000_000
 P2_FUT_MIN = 2_000_000
@@ -59,7 +61,7 @@ TOP_N_P3 = 10
 
 STABLES = {"USD", "USDT", "USDC", "TUSD", "FDUSD", "USDD", "USDE", "DAI", "PYUSD"}
 
-# Pinned coins (P3 only)
+# Pinned coins (only appear in P3)
 PINNED_P3 = ["BTC", "ETH", "XRP", "SOL", "DOGE", "ADA", "PEPE", "LINK"]
 PINNED_SET = set(PINNED_P3)
 
@@ -87,7 +89,6 @@ EMAIL_HOURLY_WINDOW_SEC = 60 * 60
 LAST_ERROR: Optional[str] = None
 NOTIFY_ON: bool = EMAIL_ENABLED_DEFAULT
 
-# caches: (dtype, symbol) -> pct
 PCT4H_CACHE: Dict[Tuple[str, str], float] = {}
 PCT1H_CACHE: Dict[Tuple[str, str], float] = {}
 
@@ -210,12 +211,11 @@ def compute_pct_for_symbol(symbol: str, hours: int, prefer_swap: bool = True) ->
     Cache results per (dtype, symbol).
     """
     try_order = ["swap", "spot"] if prefer_swap else ["spot", "swap"]
+    cache = PCT4H_CACHE if hours == 4 else PCT1H_CACHE
     for dtype in try_order:
         cache_key = (dtype, symbol)
-        if hours == 4 and cache_key in PCT4H_CACHE:
-            return PCT4H_CACHE[cache_key]
-        if hours == 1 and cache_key in PCT1H_CACHE:
-            return PCT1H_CACHE[cache_key]
+        if cache_key in cache:
+            return cache[cache_key]
         try:
             ex = build_exchange(dtype)
             ex.load_markets()
@@ -227,10 +227,7 @@ def compute_pct_for_symbol(symbol: str, hours: int, prefer_swap: bool = True) ->
                 pct = 0.0
             else:
                 pct = (closes[-1] - closes[0]) / closes[0] * 100.0
-            if hours == 4:
-                PCT4H_CACHE[cache_key] = pct
-            else:
-                PCT1H_CACHE[cache_key] = pct
+            cache[cache_key] = pct
             return pct
         except Exception:
             logging.exception("compute_pct_for_symbol: %dh failed for %s (%s)", hours, symbol, dtype)
@@ -241,7 +238,7 @@ def compute_pct_for_symbol(symbol: str, hours: int, prefer_swap: bool = True) ->
 # ================== PRIORITIES ==================
 
 def load_best():
-    """Load top spot & futures markets per BASE symbol."""
+    """Load top spot & futures markets per BASE symbol from CoinEx."""
     ex_spot = build_exchange("spot")
     ex_fut = build_exchange("swap")
     spot_tickers = safe_fetch_tickers(ex_spot)
@@ -268,7 +265,8 @@ def load_best():
 def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, MarketVol]):
     """
     Build P1, P2, P3 lists.
-    Each row: [SYM, FUSD, SUSD, %24H, %4H, %1H]
+    Each row: [SYM, FUSD, SUSD, %24H, %4H, %1H, LASTPRICE]
+      - LASTPRICE is internal, not shown in table.
     """
     p1: List[List] = []
     p2: List[List] = []
@@ -287,7 +285,8 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
             pct24 = pct_change_24h(s, f)
             pct4 = compute_pct_for_symbol(f.symbol, 4)
             pct1 = compute_pct_for_symbol(f.symbol, 1)
-            p1.append([base, fut_usd, spot_usd, pct24, pct4, pct1])
+            last_price = f.last or s.last or 0.0
+            p1.append([base, fut_usd, spot_usd, pct24, pct4, pct1, last_price])
 
     p1.sort(key=lambda x: x[1], reverse=True)
     p1 = p1[:TOP_N_P1]
@@ -304,7 +303,8 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
             pct24 = pct_change_24h(s, f)
             pct4 = compute_pct_for_symbol(f.symbol, 4)
             pct1 = compute_pct_for_symbol(f.symbol, 1)
-            p2.append([base, fut_usd, spot_usd, pct24, pct4, pct1])
+            last_price = f.last or (s.last if s else 0.0)
+            p2.append([base, fut_usd, spot_usd, pct24, pct4, pct1, last_price])
 
     p2.sort(key=lambda x: x[1], reverse=True)
     p2 = p2[:TOP_N_P2]
@@ -325,7 +325,8 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
         symbol_for_pct = f.symbol if f else (s.symbol if s else "")
         pct4 = compute_pct_for_symbol(symbol_for_pct, 4) if symbol_for_pct else 0.0
         pct1 = compute_pct_for_symbol(symbol_for_pct, 1) if symbol_for_pct else 0.0
-        tmp[base] = [base, fut_usd, spot_usd, pct24, pct4, pct1]
+        last_price = (f.last if f else (s.last if s else 0.0))
+        tmp[base] = [base, fut_usd, spot_usd, pct24, pct4, pct1, last_price]
 
     # non-pinned, not used, Spot≥3M
     for base, s in best_spot.items():
@@ -339,7 +340,8 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
             symbol_for_pct = f.symbol if f else s.symbol
             pct4 = compute_pct_for_symbol(symbol_for_pct, 4)
             pct1 = compute_pct_for_symbol(symbol_for_pct, 1)
-            tmp[base] = [base, fut_usd, spot_usd, pct24, pct4, pct1]
+            last_price = (f.last if f else s.last)
+            tmp[base] = [base, fut_usd, spot_usd, pct24, pct4, pct1, last_price]
 
     all_rows = list(tmp.values())
     pinned_rows = [r for r in all_rows if r[0] in PINNED_SET]
@@ -352,11 +354,144 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
     return p1, p2, p3
 
 
+# ================== SCORING & RECOMMENDATIONS ==================
+
+def score_long(row: List) -> float:
+    """
+    Long (BUY) score based on:
+    - Positive 24h, 4h, 1h momentum
+    - Futures liquidity
+    """
+    _, fut_usd, _, pct24, pct4, pct1, _ = row
+    score = 0.0
+
+    # Momentum
+    if pct24 > 0:
+        score += min(pct24 / 5.0, 3.0)
+    if pct4 > 0:
+        score += min(pct4 / 2.0, 3.0)
+    if pct1 > 0:
+        score += min(pct1 / 1.0, 2.0)
+
+    # Volume bonus
+    if fut_usd > 10_000_000:
+        score += 2.0
+    elif fut_usd > 5_000_000:
+        score += 1.0
+
+    return max(score, 0.0)
+
+
+def score_short(row: List) -> float:
+    """
+    Short (SELL) score based on:
+    - Negative 24h, 4h, 1h momentum
+    - Futures liquidity
+    """
+    _, fut_usd, _, pct24, pct4, pct1, _ = row
+    score = 0.0
+
+    # Downside momentum
+    if pct24 < 0:
+        score += min(abs(pct24) / 5.0, 3.0)
+    if pct4 < 0:
+        score += min(abs(pct4) / 2.0, 3.0)
+    if pct1 < 0:
+        score += min(abs(pct1) / 1.0, 2.0)
+
+    # Volume bonus
+    if fut_usd > 10_000_000:
+        score += 2.0
+    elif fut_usd > 5_000_000:
+        score += 1.0
+
+    return max(score, 0.0)
+
+
+def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]):
+    """
+    From all rows in P1/P2/P3, pick:
+    - best BUY (highest long score)
+    - best SELL (highest short score)
+    Returns:
+      (buy_sym, buy_entry, buy_exit, buy_sl),
+      (sell_sym, sell_entry, sell_exit, sell_sl)
+    May return None for one side if no candidate.
+    """
+    all_rows = p1 + p2 + p3
+    best_buy = None  # (score, row)
+    best_sell = None
+
+    for r in all_rows:
+        sym, _, _, _, _, _, last_price = r
+        if not last_price or last_price <= 0:
+            continue
+
+        ls = score_long(r)
+        ss = score_short(r)
+
+        if ls > 0:
+            if best_buy is None or ls > best_buy[0]:
+                best_buy = (ls, r)
+        if ss > 0:
+            if best_sell is None or ss > best_sell[0]:
+                best_sell = (ss, r)
+
+    def make_levels(side: str, row: List, score: float):
+        sym, _, _, _, _, _, last_price = row
+        # Medium stop-loss style ~3–5%
+        if side == "BUY":
+            sl_pct = 0.04
+            tp_pct = 0.08
+            entry = last_price
+            sl = entry * (1.0 - sl_pct)
+            exit = entry * (1.0 + tp_pct)
+        else:  # SELL
+            sl_pct = 0.04
+            tp_pct = 0.06
+            entry = last_price
+            sl = entry * (1.0 + sl_pct)
+            exit = entry * (1.0 - tp_pct)
+        return sym, entry, exit, sl, score
+
+    buy_trade = None
+    sell_trade = None
+
+    if best_buy is not None:
+        buy_trade = make_levels("BUY", best_buy[1], best_buy[0])
+    if best_sell is not None:
+        sell_trade = make_levels("SELL", best_sell[1], best_sell[0])
+
+    return buy_trade, sell_trade
+
+
+def format_recommended_trades(buy_trade, sell_trade) -> str:
+    """
+    Build a short text block for recommended trades.
+    """
+    if not buy_trade and not sell_trade:
+        return "_No strong BUY/SELL candidates right now._"
+
+    lines = []
+    if buy_trade:
+        sym, entry, exit, sl, score = buy_trade
+        lines.append(
+            f"BUY: {sym} — Entry {entry:.6g} — Exit {exit:.6g} — SL {sl:.6g} (score {score:.1f})"
+        )
+    if sell_trade:
+        sym, entry, exit, sl, score = sell_trade
+        lines.append(
+            f"SELL: {sym} — Entry {entry:.6g} — Exit {exit:.6g} — SL {sl:.6g} (score {score:.1f})"
+        )
+    return "\n".join(lines)
+
+
 # ================== FORMATTING ==================
 
 def fmt_table(rows: List[List], title: str) -> str:
     if not rows:
         return f"*{title}*: _None_\n"
+    # Only show first 6 columns (SYM, F, S, %24H, %4H, %1H), skip LASTPRICE
     pretty = [
         [
             r[0],
@@ -420,7 +555,7 @@ def send_email(subject: str, body: str) -> bool:
 
 
 def melbourne_ok() -> bool:
-    """Return True only if local time is between 08:00–23:30 in Melbourne."""
+    """Return True only if local time is between 11:00–23:00 in Melbourne."""
     try:
         hr = datetime.now(ZoneInfo("Australia/Melbourne")).hour
         return 11 <= hr < 23
@@ -433,7 +568,6 @@ def melbourne_ok() -> bool:
 def email_quota_ok() -> bool:
     """Check daily + hourly global email caps."""
     now = time.time()
-    # purge >24h
     recent = [x for x in EMAIL_SEND_LOG if now - x < EMAIL_DAILY_WINDOW_SEC]
     EMAIL_SEND_LOG[:] = recent
 
@@ -462,23 +596,33 @@ def should_alert(priority: str, symbol: str) -> bool:
     return False
 
 
-def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List]) -> Optional[str]:
+def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: str) -> Optional[str]:
     """
     Build email body if we have coins with:
       4h >= ALERT_PCT_4H_MIN AND 1h >= ALERT_PCT_1H_MIN
+    Also append recommended trades at the end.
     """
     lines: List[str] = []
     for label, rows in (("P1", p1), ("P2", p2), ("P3", p3)):
         hits: List[str] = []
-        for sym, _, _, _, pct4, pct1 in rows:
+        for r in rows:
+            sym, _, _, _, pct4, pct1, _ = r
             if pct4 >= ALERT_PCT_4H_MIN and pct1 >= ALERT_PCT_1H_MIN:
                 if should_alert(label, sym):
                     hits.append(sym)
         if hits:
             lines.append(f"{label}: " + ", ".join(sorted(set(hits))))
-    if not lines:
+    if not lines and not rec_text:
         return None
-    return "Coins +5% (4h & 1h):\n\n" + "\n".join(lines)
+    body_parts = []
+    if lines:
+        body_parts.append("Coins +5% (4h & 1h):\n\n" + "\n".join(lines))
+    if rec_text:
+        if lines:
+            body_parts.append("\n\nRecommended trades:\n" + rec_text)
+        else:
+            body_parts.append("Recommended trades:\n" + rec_text)
+    return "".join(body_parts) if body_parts else None
 
 
 # ================== TELEGRAM HANDLERS ==================
@@ -486,7 +630,7 @@ def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List]) -> Optional[
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Commands:\n"
-        "• /screen — show P1, P2, P3\n"
+        "• /screen — show P1, P2, P3 + recommended trades\n"
         "• /notify_on /notify_off /notify\n"
         "• /diag — short diagnostics\n"
         "• Type a symbol (e.g. PYTH) for its row"
@@ -499,11 +643,17 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PCT1H_CACHE.clear()
         best_spot, best_fut, raw_spot, raw_fut = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
+
+        buy_trade, sell_trade = pick_best_trades(p1, p2, p3)
+        rec_text = format_recommended_trades(buy_trade, sell_trade)
+
         msg = (
             fmt_table(p1, "P1 (F≥5M & S≥0.5M — pinned excluded)")
             + fmt_table(p2, "P2 (F≥2M — pinned excluded)")
             + fmt_table(p3, "P3 (Pinned + S≥3M)")
-            + f"tickers: spot={raw_spot}, fut={raw_fut}"
+            + f"tickers: spot={raw_spot}, fut={raw_fut}\n\n"
+            + "*Recommended trades:*\n"
+            + rec_text
         )
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -541,7 +691,6 @@ async def notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    # keep only letters and $
     token = re.sub(r"[^A-Za-z$]", "", text).upper().lstrip("$")
     if len(token) < 2:
         return
@@ -583,7 +732,10 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
         best_spot, best_fut, _, _ = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
-        body = scan_for_alerts(p1, p2, p3)
+        buy_trade, sell_trade = pick_best_trades(p1, p2, p3)
+        rec_text = format_recommended_trades(buy_trade, sell_trade)
+
+        body = scan_for_alerts(p1, p2, p3, rec_text)
         if not body:
             return
 
