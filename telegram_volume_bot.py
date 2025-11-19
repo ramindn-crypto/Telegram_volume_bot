@@ -7,7 +7,7 @@ Features:
 - Table: SYM | F | S | %24H | %4H | %1H
 - Email alerts if (4h >= +5%) AND (1h >= +5%)
 - Emails only 07:00–23:00 (Australia/Melbourne)
-- Max 2 emails/hour, 20 emails/day, 15-min cooldown per (priority,symbol)
+- Max 4 emails/hour, 20 emails/day, 15-min cooldown per (priority,symbol)
 - Check interval = 5 min
 - Commands: /start /screen /notify_on /notify_off /notify /diag
 - Typing a symbol (e.g. PYTH) gives a one-row table
@@ -81,7 +81,7 @@ ALERT_PCT_1H_MIN = 5.0
 ALERT_THROTTLE_SEC = 15 * 60  # 15 minutes per (priority,symbol)
 
 EMAIL_DAILY_LIMIT = 20
-EMAIL_HOURLY_LIMIT = 2
+EMAIL_HOURLY_LIMIT = 4
 EMAIL_DAILY_WINDOW_SEC = 24 * 60 * 60
 EMAIL_HOURLY_WINDOW_SEC = 60 * 60
 
