@@ -30,7 +30,7 @@ Extra logic:
 
 Alerts:
 - Trigger if 4h >= +5% AND 1h >= +5%.
-- Only between 08:00–18:00 (Australia/Melbourne).
+- Only between 10:00–17:00 (Australia/Melbourne).
 - Max 4 emails/hour, 20 emails/day, 15-minute cooldown per (priority,symbol).
 - NEW: if recommended BUY+SELL symbols are the same as in last email,
         no new email is sent.
@@ -707,7 +707,7 @@ def send_email(subject: str, body: str) -> bool:
 
 
 def melbourne_ok() -> bool:
-    """Return True only if local time is between 08:00–19:00 in Melbourne."""
+    """Return True only if local time is between 10:00–17:00 in Melbourne."""
     try:
         hr = datetime.now(ZoneInfo("Australia/Melbourne")).hour
         return 11 <= hr < 23
