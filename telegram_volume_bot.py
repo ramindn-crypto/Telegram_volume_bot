@@ -30,8 +30,10 @@ Extra logic:
 
 Alerts:
 - Trigger if 4h >= +5% AND 1h >= +5%.
-- Only between 11:00–23:00 (Australia/Melbourne).
-- Max 2 emails/hour, 20 emails/day, 15-minute cooldown per (priority,symbol).
+- Only between 08:00–18:00 (Australia/Melbourne).
+- Max 4 emails/hour, 20 emails/day, 15-minute cooldown per (priority,symbol).
+- NEW: if recommended BUY+SELL symbols are the same as in last email,
+        no new email is sent.
 """
 
 import asyncio
@@ -98,7 +100,7 @@ ALERT_PCT_1H_MIN = 5.0
 ALERT_THROTTLE_SEC = 15 * 60  # 15 minutes per (priority,symbol)
 
 EMAIL_DAILY_LIMIT = 20
-EMAIL_HOURLY_LIMIT = 2
+EMAIL_HOURLY_LIMIT = 4
 EMAIL_DAILY_WINDOW_SEC = 24 * 60 * 60
 EMAIL_HOURLY_WINDOW_SEC = 60 * 60
 
@@ -111,6 +113,11 @@ PCT1H_CACHE: Dict[Tuple[str, str], float] = {}
 
 ALERT_SENT_CACHE: Dict[Tuple[str, str], float] = {}  # (priority, symbol) -> last_sent_time
 EMAIL_SEND_LOG: List[float] = []  # timestamps of sent emails
+
+# NEW: Remember last recommended BUY/SELL symbols used in an email,
+# so we don't spam if they haven't changed.
+LAST_REC_BUY_SYM: Optional[str] = None
+LAST_REC_SELL_SYM: Optional[str] = None
 
 
 # ================== DATA STRUCTURES ==================
@@ -700,7 +707,7 @@ def send_email(subject: str, body: str) -> bool:
 
 
 def melbourne_ok() -> bool:
-    """Return True only if local time is between 11:00–23:00 in Melbourne."""
+    """Return True only if local time is between 08:00–19:00 in Melbourne."""
     try:
         hr = datetime.now(ZoneInfo("Australia/Melbourne")).hour
         return 11 <= hr < 23
@@ -861,6 +868,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== ALERT JOB ==================
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+    global LAST_REC_BUY_SYM, LAST_REC_SELL_SYM
     try:
         if not NOTIFY_ON:
             return
@@ -879,12 +887,27 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         buy_trade, sell_trade = await asyncio.to_thread(pick_best_trades, p1, p2, p3)
         rec_text = format_recommended_trades(buy_trade, sell_trade)
 
+        # Determine current recommended symbols (may be None)
+        buy_sym_now = buy_trade[0] if buy_trade else None
+        sell_sym_now = sell_trade[0] if sell_trade else None
+
         body = scan_for_alerts(p1, p2, p3, rec_text)
         if not body:
             return
 
+        # NEW: if current recommended BUY+SELL symbols are the same as last time,
+        # and at least one is present, skip sending to avoid duplicates.
+        if (buy_sym_now or sell_sym_now) and \
+           (buy_sym_now == LAST_REC_BUY_SYM) and \
+           (sell_sym_now == LAST_REC_SELL_SYM):
+            logging.info("Skipping email: recommended symbols unchanged (BUY=%s, SELL=%s)",
+                         buy_sym_now, sell_sym_now)
+            return
+
         if send_email("Crypto Alert: +5% (4h) & +5% (1h)", body):
             record_email()
+            LAST_REC_BUY_SYM = buy_sym_now
+            LAST_REC_SELL_SYM = sell_sym_now
     except Exception as e:
         logging.exception("alert_job error: %s", e)
 
