@@ -1,4 +1,4 @@
-=== PART 1/5 START ===
+
 import os
 import time
 import math
@@ -123,10 +123,6 @@ def pct_change(a, b):
     if a == 0:
         return 0
     return (b - a) / a * 100
-=== PART 1/5 END ===
-
-
-=== PART 2/5 START ===
 
 # ---------------------------------------------------
 # FETCH PRICE, PERCENTAGES & ATR
@@ -256,10 +252,6 @@ async def get_all_futures_symbols():
         if "USDT" in s and markets[s]["type"] == "future":
             result.append(s)
     return result
-
-=== PART 2/5 END ===
-
-=== PART 3/5 START ===
 
 # ---------------------------------------------------
 # SCORING SYSTEM
@@ -412,11 +404,6 @@ def make_recommendation_text(recs):
 
     return "\n".join(out)
 
-=== PART 3/5 END ===
-
-
-=== PART 4/5 START ===
-
 # ---------------------------------------------------
 # TELEGRAM HANDLERS
 # ---------------------------------------------------
@@ -508,7 +495,6 @@ async def alert_task(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Alert task error: {e}")
 
-=== PART 4/5 END ====== PART 5/5 START ===
 
 # ---------------------------------------------------
 # MAIN APP + SCHEDULER
@@ -548,7 +534,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-=== PART 5/5 END ===
+
 
 
 
