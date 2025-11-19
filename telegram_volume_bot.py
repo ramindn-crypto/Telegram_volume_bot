@@ -700,13 +700,27 @@ async def query_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #           MAIN
 # =========================
 
+async def post_init(app: Application):
+    # Start background alert loop
+    async def run_alerts():
+        while True:
+            try:
+                await alert_job(app)
+            except Exception as e:
+                logging.error(f"Alert job error: {e}")
+            await asyncio.sleep(CHECK_INTERVAL_MIN * 60)
+
+    # Now safe to create background task
+    asyncio.create_task(run_alerts())
+
+
 def main():
     if not TOKEN:
         raise RuntimeError("Set TELEGRAM_TOKEN env var")
 
     logging.basicConfig(level=logging.INFO)
 
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
@@ -718,15 +732,7 @@ def main():
     # Symbol text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, query_symbol))
 
-    # Scheduler job (5 minutes)
-    async def run_alerts():
-        while True:
-            await alert_job(app)
-            await asyncio.sleep(CHECK_INTERVAL_MIN * 60)
-
-    app.create_task(run_alerts())
-
-    # Start bot
+    # Start bot (this creates and manages event loop internally)
     app.run_polling()
 
 
