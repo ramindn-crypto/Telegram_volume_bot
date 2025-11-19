@@ -129,7 +129,7 @@ def round_int(x: float) -> int:
 
 coinex = ccxt.coinex({"enableRateLimit": True})
 binance = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
-
+binance_spot = ccxt.binance({"enableRateLimit": True})
 
 # =========================
 #  OHLCV HELPERS (%1h / %4h)
@@ -273,13 +273,29 @@ def parse_symbol(sym: str) -> Optional[Tuple[str, str]]:
 
 async def build_priorities():
     """
-    Builds P1, P2, P3 based on:
-    - Futures USD volume
-    - Spot USD volume
-    - %24h, %4h, %1h
+    Build P1 / P2 / P3 using BINANCE data instead of CoinEx.
+
+    - Futures: from binance (USDT-margined futures)
+    - Spot: from binance_spot
+    - Same thresholds:
+        P1: fut >= 5M AND spot >= 500k
+        P2: fut >= 2M
+        P3: pinned coins (BTC, ETH, etc) with spot >= 3M
     """
 
-    spot_tk, fut_tk = await fetch_coinex_tickers()
+    # --- get tickers from binance ---
+    try:
+        spot_tk = binance_spot.fetch_tickers()
+    except Exception as e:
+        logging.warning(f"Binance spot fetch_tickers failed: {type(e).__name__}: {e}")
+        spot_tk = {}
+
+    try:
+        fut_tk = binance.fetch_tickers()
+    except Exception as e:
+        logging.warning(f"Binance futures fetch_tickers failed: {type(e).__name__}: {e}")
+        fut_tk = {}
+
     rows_p1 = []
     rows_p2 = []
     rows_p3 = []
@@ -288,18 +304,27 @@ async def build_priorities():
         parsed = parse_symbol(sym)
         if not parsed:
             continue
+
         base, quote = parsed
         if quote not in STABLES:
             continue
 
-        spot = spot_tk.get(sym, None)
-        fut_usd = usd_notional(ft)
-        spot_usd = usd_notional(spot) if spot else 0
+        # Spot symbol key on binance is usually "BASE/QUOTE"
+        spot_sym = f"{base}/{quote}"
+        spot = spot_tk.get(spot_sym)
 
-        # % changes
-        pct24 = float(ft.get("percentage", 0))
-        pct4 = await pct_change(coinex, sym, base, quote, 4)
-        pct1 = await pct_change(coinex, sym, base, quote, 1)
+        fut_usd = usd_notional(ft)
+        spot_usd = usd_notional(spot) if spot else 0.0
+
+        # % changes from futures ticker
+        try:
+            pct24 = float(ft.get("percentage", 0.0))
+        except Exception:
+            pct24 = 0.0
+
+        # use binance futures candles for 4h & 1h change
+        pct4 = await pct_change(binance, sym, base, quote, 4)
+        pct1 = await pct_change(binance, sym, base, quote, 1)
 
         # P1
         if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
@@ -309,11 +334,11 @@ async def build_priorities():
         if fut_usd >= P2_FUT_MIN:
             rows_p2.append((base, fut_usd, spot_usd, pct24, pct4, pct1))
 
-        # P3
+        # P3 (pinned coins — BTC, ETH, etc — with big spot volume)
         if base in PINNED_SET and spot_usd >= P3_SPOT_MIN:
             rows_p3.append((base, fut_usd, spot_usd, pct24, pct4, pct1))
 
-    # Sort by futures USD
+    # Sort by futures notional
     rows_p1.sort(key=lambda x: x[1], reverse=True)
     rows_p2.sort(key=lambda x: x[1], reverse=True)
     rows_p3.sort(key=lambda x: x[1], reverse=True)
@@ -323,6 +348,7 @@ async def build_priorities():
         rows_p2[:TOP_N_P2],
         rows_p3[:TOP_N_P3],
     )
+
 # =========================
 #   SCORING ENGINE
 # =========================
