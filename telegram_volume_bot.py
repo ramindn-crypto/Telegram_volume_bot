@@ -204,7 +204,6 @@ async def fetch_binance_oi_change_24h(symbol: str) -> float:
     except:
         return 0.0
 
-
 # =========================
 #     COINEX DATA
 #  (Spot & Futures)
@@ -214,7 +213,7 @@ async def fetch_coinex_tickers():
     """
     Fetch all CoinEx spot & futures markets.
     If one side fails, return {} for that side but do NOT crash.
-    Log as WARNING instead of ERROR to avoid noisy logs.
+    Log as WARNING instead of ERROR.
     """
     spot = {}
     fut = {}
@@ -234,7 +233,6 @@ async def fetch_coinex_tickers():
     return spot, fut
 
 
-
 def parse_symbol(sym: str) -> Optional[Tuple[str, str]]:
     """
     Handle CoinEx / ccxt symbols in forms like:
@@ -246,7 +244,7 @@ def parse_symbol(sym: str) -> Optional[Tuple[str, str]]:
     # Case 1: "BTC/USDT" or "BTC/USDT:USDT"
     if "/" in sym:
         base, quote = sym.split("/", 1)
-        # Handle "USDT:USDT"
+        # e.g. "USDT:USDT"
         if ":" in quote:
             quote = quote.split(":", 1)[0]
         if quote in STABLES:
@@ -260,16 +258,6 @@ def parse_symbol(sym: str) -> Optional[Tuple[str, str]]:
                 return base, st
 
     return None
-
-
-
-def usd_notional(tick: dict) -> float:
-    try:
-        p = float(tick.get("last", 0))
-        v = float(tick.get("baseVolume", 0))
-        return p * v
-    except:
-        return 0.0
 
 
 # =========================
