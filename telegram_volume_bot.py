@@ -211,14 +211,28 @@ async def fetch_binance_oi_change_24h(symbol: str) -> float:
 # =========================
 
 async def fetch_coinex_tickers():
-    """Fetch all CoinEx spot & futures markets."""
+    """
+    Fetch all CoinEx spot & futures markets.
+    If one side fails, return {} for that side but do NOT crash.
+    Log as WARNING instead of ERROR to avoid noisy logs.
+    """
+    spot = {}
+    fut = {}
+
+    # Spot tickers
     try:
         spot = coinex.fetch_tickers()
-        fut = coinex.fetch_tickers({"market": "swap"})
-        return spot, fut
     except Exception as e:
-        logging.error(f"CoinEx error: {e}")
-        return {}, {}
+        logging.warning(f"CoinEx spot fetch_tickers failed: {type(e).__name__}: {e}")
+
+    # Futures (swap) tickers
+    try:
+        fut = coinex.fetch_tickers({"market": "swap"})
+    except Exception as e:
+        logging.warning(f"CoinEx futures fetch_tickers failed: {type(e).__name__}: {e}")
+
+    return spot, fut
+
 
 
 def parse_symbol(sym: str) -> Optional[Tuple[str, str]]:
