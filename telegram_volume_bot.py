@@ -24,9 +24,9 @@ from telegram.ext import (
 # CONFIGURATION
 # ---------------------------------------------------
 
-BINANCE_FUT = ccxt.binance({
-    "options": {"defaultType": "future"},
-    "enableRateLimit": True
+BINANCE_FUT = ccxt.coinex({
+    "options": {"defaultType": "swap"},  # futures در CoinEx = swap
+    "enableRateLimit": True,
 })
 
 # telegram token from environment
@@ -244,13 +244,16 @@ def normalize_symbol(sym):
 
 async def get_all_futures_symbols():
     """
-    Gets all USDT-margined futures symbols from Binance.
+    Gets all USDT-margined swap (futures) symbols from CoinEx.
     """
     markets = await BINANCE_FUT.load_markets()
     result = []
-    for s in markets:
-        if "USDT" in s and markets[s]["type"] == "future":
-            result.append(s)
+    for symbol, m in markets.items():
+        # در CoinEx، فیوچرز معمولاً به صورت swap و با quote=USDT هست
+        is_swap = m.get("swap", False)
+        quote = m.get("quote", "")
+        if is_swap and quote == "USDT":
+            result.append(symbol)
     return result
 
 # ---------------------------------------------------
