@@ -135,31 +135,38 @@ binance = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "fut
 #  OHLCV HELPERS (%1h / %4h)
 # =========================
 
-async def pct_change(exchange, symbol: str, base: str, quote: str, hours: int) -> float:
-    """Compute % change for last 'hours' via 1h candles."""
+async def fetch_coinex_tickers():
+    """
+    Fetch CoinEx spot & futures tickers in a safe way:
+
+    - load_markets() to get metadata (spot / swap)
+    - fetch_tickers() once (all markets)
+    - split into spot/futures based on market['spot'] / market['swap']
+    """
     try:
-        if (base, quote, hours) in PCT4H_CACHE and hours == 4:
-            return PCT4H_CACHE[(base, quote, hours)]
-        if (base, quote, hours) in PCT1H_CACHE and hours == 1:
-            return PCT1H_CACHE[(base, quote, hours)]
+        # markets: e.g. {"BTC/USDT": {"spot": True}, "BTC/USDT:USDT": {"swap": True}, ...}
+        markets = coinex.load_markets()
+        all_tickers = coinex.fetch_tickers()
+    except Exception as e:
+        logging.warning(f"CoinEx fetch_markets/fetch_tickers failed: {type(e).__name__}: {e}")
+        return {}, {}
 
-        mk = f"{base}/{quote}"
-        ohlcv = exchange.fetch_ohlcv(mk, timeframe="1h", limit=hours + 1)
-        if not ohlcv:
-            return 0.0
+    spot = {}
+    fut = {}
 
-        old = ohlcv[0][1]
-        new = ohlcv[-1][1]
-        pct = ((new - old) / old) * 100
+    for sym, tk in all_tickers.items():
+        m = markets.get(sym)
+        if not m:
+            continue
 
-        if hours == 4:
-            PCT4H_CACHE[(base, quote, hours)] = pct
-        if hours == 1:
-            PCT1H_CACHE[(base, quote, hours)] = pct
+        # ccxt marks them like: m['spot'] == True or m['swap'] == True
+        if m.get("swap"):
+            fut[sym] = tk
+        elif m.get("spot"):
+            spot[sym] = tk
 
-        return pct
-    except:
-        return 0.0
+    return spot, fut
+
 
 
 # =========================
