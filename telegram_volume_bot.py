@@ -237,17 +237,30 @@ async def fetch_coinex_tickers():
 
 def parse_symbol(sym: str) -> Optional[Tuple[str, str]]:
     """
-    Convert CoinEx symbols into (BASE, QUOTE).
-    Examples:
-      BTCUSDT -> (BTC, USDT)
-      ETHUSD -> (ETH, USD)
+    Handle CoinEx / ccxt symbols in forms like:
+    - "BTC/USDT"
+    - "BTC/USDT:USDT"
+    - "BTCUSDT"
+    and return (BASE, QUOTE) if quote is a stable.
     """
+    # Case 1: "BTC/USDT" or "BTC/USDT:USDT"
+    if "/" in sym:
+        base, quote = sym.split("/", 1)
+        # Handle "USDT:USDT"
+        if ":" in quote:
+            quote = quote.split(":", 1)[0]
+        if quote in STABLES:
+            return base, quote
+
+    # Case 2: fallback like "BTCUSDT"
     for st in STABLES:
         if sym.endswith(st):
             base = sym[: -len(st)]
             if base:
                 return base, st
+
     return None
+
 
 
 def usd_notional(tick: dict) -> float:
