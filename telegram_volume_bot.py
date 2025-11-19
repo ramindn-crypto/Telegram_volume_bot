@@ -1,21 +1,37 @@
 #!/usr/bin/env python3
 """
-Telegram crypto screener & alert bot (CoinEx via CCXT)
+Telegram crypto screener & alert bot
 
-Features:
-- Shows 3 priorities of coins (P1, P2, P3) using CoinEx volumes
-- Table: SYM | F | S | %24H | %4H | %1H
-- Email alerts if (4h >= +5%) AND (1h >= +5%)
-- Emails only 07:00–23:00 (Australia/Melbourne)
-- Max 4 emails/hour, 20 emails/day, 15-min cooldown per (priority,symbol)
-- Check interval = 5 min
-- Commands: /start /screen /notify_on /notify_off /notify /diag
-- Typing a symbol (e.g. PYTH) gives a one-row table
+Data sources:
+- CoinEx (via ccxt) for:
+  * Spot & futures 24h volume (USD)
+  * 24h % change (ticker)
+  * 4h & 1h % change (from 1h candles)
+  * P1 / P2 / P3 priorities
 
-This version also:
-- Calculates simple LONG and SHORT scores based on %24h, %4h, %1h, and futures volume
-- Picks 1 best BUY and 1 best SELL from all P1/P2/P3 rows
-- Generates Entry / Exit / Stop Loss for both, shown at bottom of /screen and in email alerts
+- Binance USDT-M futures (via ccxt) for:
+  * Funding rate
+  * Open interest history (used to compute OI change 24h & 4h)
+
+This approximates Coinalyze-style indicators INSIDE the scoring engine
+but keeps your Telegram table short:
+
+  SYM | F | S | %24H | %4H | %1H
+
+Extra logic:
+- Scores each coin for LONG (BUY) and SHORT (SELL) using:
+  * Momentum (%24H, %4H, %1H)
+  * Futures liquidity (CoinEx)
+  * Binance funding & OI trend
+
+- Picks 1 best BUY + 1 best SELL from P1/P2/P3.
+- Generates Entry / Exit / StopLoss (medium risk: ~4% SL, ~6–8% TP).
+- Shows these at bottom of /screen and in email alerts.
+
+Alerts:
+- Trigger if 4h >= +5% AND 1h >= +5%.
+- Only between 11:00–23:00 (Australia/Melbourne).
+- Max 2 emails/hour, 20 emails/day, 15-minute cooldown per (priority,symbol).
 """
 
 import asyncio
@@ -46,7 +62,8 @@ from telegram.ext import (
 
 # ================== CONFIG ==================
 
-EXCHANGE_ID = "coinex"
+COINEX_ID = "coinex"
+BINANCE_ID = "binance"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 # Priority thresholds (USD notional)
@@ -56,7 +73,7 @@ P2_FUT_MIN = 2_000_000
 P3_SPOT_MIN = 3_000_000
 
 TOP_N_P1 = 10
-TOP_N_P2 = 15
+TOP_N_P2 = 5
 TOP_N_P3 = 10
 
 STABLES = {"USD", "USDT", "USDC", "TUSD", "FDUSD", "USDD", "USDE", "DAI", "PYUSD"}
@@ -81,7 +98,7 @@ ALERT_PCT_1H_MIN = 5.0
 ALERT_THROTTLE_SEC = 15 * 60  # 15 minutes per (priority,symbol)
 
 EMAIL_DAILY_LIMIT = 20
-EMAIL_HOURLY_LIMIT = 4
+EMAIL_HOURLY_LIMIT = 2
 EMAIL_DAILY_WINDOW_SEC = 24 * 60 * 60
 EMAIL_HOURLY_WINDOW_SEC = 60 * 60
 
@@ -111,7 +128,14 @@ class MarketVol:
     vwap: float
 
 
-# ================== HELPERS ==================
+@dataclass
+class BinanceMetrics:
+    oi24: float    # OI change 24h (%)
+    oi4: float     # OI change 4h (%)
+    funding: float # current funding rate (% per 8h approx)
+
+
+# ================== HELPERS: COINEX ==================
 
 def safe_split_symbol(sym: Optional[str]):
     if not sym:
@@ -142,7 +166,7 @@ def to_mv(t: dict) -> Optional[MarketVol]:
 
 
 def usd_notional(mv: Optional[MarketVol]) -> float:
-    """Return 24h notional volume in USD."""
+    """Return 24h notional volume in USD-equivalent."""
     if not mv:
         return 0.0
     if mv.quote in STABLES and mv.quote_vol:
@@ -180,8 +204,8 @@ def m_dollars(x: float) -> str:
     return str(round(x / 1_000_000))
 
 
-def build_exchange(default_type: str):
-    klass = ccxt.__dict__[EXCHANGE_ID]
+def build_coinex(default_type: str):
+    klass = ccxt.__dict__[COINEX_ID]
     return klass(
         {
             "enableRateLimit": True,
@@ -203,11 +227,75 @@ def safe_fetch_tickers(ex):
         return {}
 
 
-# ================== PERCENTAGE (4H / 1H) ==================
+# ================== HELPERS: BINANCE FUTURES ==================
+
+def build_binance_futures():
+    """Create a Binance USDT-M futures client."""
+    klass = ccxt.__dict__[BINANCE_ID]
+    return klass(
+        {
+            "enableRateLimit": True,
+            "timeout": 20000,
+            "options": {"defaultType": "future"},
+        }
+    )
+
+
+def binance_symbol_from_base(base: str) -> str:
+    """Map base -> 'BASE/USDT' for Binance futures."""
+    return f"{base}/USDT"
+
+
+def fetch_binance_metrics(ex, base: str) -> BinanceMetrics:
+    """
+    Approximate Coinalyze-style data from Binance futures:
+    - OI change 24h (%)
+    - OI change 4h (%)
+    - Funding rate (%)
+
+    If any call fails, returns zeros.
+    """
+    sym = binance_symbol_from_base(base)
+    oi24 = 0.0
+    oi4 = 0.0
+    funding = 0.0
+
+    # Funding rate
+    try:
+        fr = ex.fetch_funding_rate(sym)
+        if fr and "fundingRate" in fr:
+            funding = float(fr["fundingRate"]) * 100.0  # convert fraction -> %
+    except Exception:
+        logging.debug("fetch_funding_rate failed for %s", sym)
+
+    # OI history via 1h candles (approx)
+    try:
+        # Some ccxt versions support fetch_open_interest_history
+        hist = ex.fetch_open_interest_history(sym, timeframe="1h", limit=25)
+        # hist: list of [timestamp, openInterest]
+        if hist and len(hist) >= 2:
+            oi_end = hist[-1][1]
+            # 24h approx => 24 steps
+            if len(hist) >= 25:
+                oi_start_24 = hist[-25][1]
+                if oi_start_24:
+                    oi24 = (oi_end - oi_start_24) / oi_start_24 * 100.0
+            # 4h approx => 4 steps
+            if len(hist) >= 5:
+                oi_start_4 = hist[-5][1]
+                if oi_start_4:
+                    oi4 = (oi_end - oi_start_4) / oi_start_4 * 100.0
+    except Exception:
+        logging.debug("fetch_open_interest_history failed for %s", sym)
+
+    return BinanceMetrics(oi24=oi24, oi4=oi4, funding=funding)
+
+
+# ================== PERCENTAGE (4H / 1H, COINEX) ==================
 
 def compute_pct_for_symbol(symbol: str, hours: int, prefer_swap: bool = True) -> float:
     """
-    Compute % change over the last N completed hours using 1h candles.
+    Compute % change over the last N completed hours using 1h candles from CoinEx.
     Cache results per (dtype, symbol).
     """
     try_order = ["swap", "spot"] if prefer_swap else ["spot", "swap"]
@@ -217,7 +305,7 @@ def compute_pct_for_symbol(symbol: str, hours: int, prefer_swap: bool = True) ->
         if cache_key in cache:
             return cache[cache_key]
         try:
-            ex = build_exchange(dtype)
+            ex = build_coinex(dtype)
             ex.load_markets()
             candles = ex.fetch_ohlcv(symbol, timeframe="1h", limit=hours + 1)
             if not candles or len(candles) <= hours:
@@ -235,12 +323,12 @@ def compute_pct_for_symbol(symbol: str, hours: int, prefer_swap: bool = True) ->
     return 0.0
 
 
-# ================== PRIORITIES ==================
+# ================== PRIORITIES (COINEX VOLUME) ==================
 
 def load_best():
     """Load top spot & futures markets per BASE symbol from CoinEx."""
-    ex_spot = build_exchange("spot")
-    ex_fut = build_exchange("swap")
+    ex_spot = build_coinex("spot")
+    ex_fut = build_coinex("swap")
     spot_tickers = safe_fetch_tickers(ex_spot)
     fut_tickers = safe_fetch_tickers(ex_fut)
 
@@ -356,16 +444,17 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
 
 # ================== SCORING & RECOMMENDATIONS ==================
 
-def score_long(row: List) -> float:
+def score_long(row: List, bm: BinanceMetrics) -> float:
     """
     Long (BUY) score based on:
     - Positive 24h, 4h, 1h momentum
     - Futures liquidity
+    - Binance OI trend & funding
     """
     _, fut_usd, _, pct24, pct4, pct1, _ = row
     score = 0.0
 
-    # Momentum
+    # Momentum (basic trend/momentum)
     if pct24 > 0:
         score += min(pct24 / 5.0, 3.0)
     if pct4 > 0:
@@ -373,20 +462,36 @@ def score_long(row: List) -> float:
     if pct1 > 0:
         score += min(pct1 / 1.0, 2.0)
 
-    # Volume bonus
+    # Volume bonus (CoinEx futures liquidity)
     if fut_usd > 10_000_000:
         score += 2.0
     elif fut_usd > 5_000_000:
         score += 1.0
 
+    # Binance OI trend: rising OI supports continuation
+    if bm.oi24 > 0:
+        score += min(bm.oi24 / 10.0, 1.5)
+    if bm.oi4 > 0:
+        score += min(bm.oi4 / 5.0, 1.0)
+
+    # Funding: we PREFER not-too-positive (avoid overheated longs)
+    if bm.funding > 0.1:  # very high funding
+        score -= 1.0
+    elif 0.0 <= bm.funding <= 0.05:
+        score += 0.5
+    elif bm.funding < 0.0:
+        # slightly negative funding can be nice for longs
+        score += 0.5
+
     return max(score, 0.0)
 
 
-def score_short(row: List) -> float:
+def score_short(row: List, bm: BinanceMetrics) -> float:
     """
     Short (SELL) score based on:
     - Negative 24h, 4h, 1h momentum
     - Futures liquidity
+    - Binance OI trend & funding
     """
     _, fut_usd, _, pct24, pct4, pct1, _ = row
     score = 0.0
@@ -405,6 +510,20 @@ def score_short(row: List) -> float:
     elif fut_usd > 5_000_000:
         score += 1.0
 
+    # OI: rising OI with downside can support short
+    if bm.oi24 > 0:
+        score += min(bm.oi24 / 10.0, 1.0)
+    if bm.oi4 > 0:
+        score += min(bm.oi4 / 5.0, 1.0)
+
+    # Funding: positive extremes good for shorts, very negative is risky
+    if bm.funding > 0.1:  # overheated longs
+        score += 1.0
+    elif bm.funding > 0.05:
+        score += 0.5
+    elif bm.funding < -0.05:  # overheated shorts, not ideal to short
+        score -= 1.0
+
     return max(score, 0.0)
 
 
@@ -413,29 +532,56 @@ def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]):
     From all rows in P1/P2/P3, pick:
     - best BUY (highest long score)
     - best SELL (highest short score)
+
+    Uses Binance metrics (funding + OI trend) for each base.
     Returns:
-      (buy_sym, buy_entry, buy_exit, buy_sl),
-      (sell_sym, sell_entry, sell_exit, sell_sl)
+      (buy_sym, entry, exit, sl, score),
+      (sell_sym, entry, exit, sl, score)
     May return None for one side if no candidate.
     """
     all_rows = p1 + p2 + p3
-    best_buy = None  # (score, row)
-    best_sell = None
+    if not all_rows:
+        return None, None
+
+    try:
+        binance = build_binance_futures()
+        binance.load_markets()
+    except Exception:
+        binance = None
+        logging.exception("Failed to build/load Binance futures client")
+
+    metrics_cache: Dict[str, BinanceMetrics] = {}
+    def get_metrics(base: str) -> BinanceMetrics:
+        if base in metrics_cache:
+            return metrics_cache[base]
+        if not binance:
+            bm = BinanceMetrics(0.0, 0.0, 0.0)
+        else:
+            try:
+                bm = fetch_binance_metrics(binance, base)
+            except Exception:
+                bm = BinanceMetrics(0.0, 0.0, 0.0)
+        metrics_cache[base] = bm
+        return bm
+
+    best_buy = None   # (score, row, bm)
+    best_sell = None  # (score, row, bm)
 
     for r in all_rows:
         sym, _, _, _, _, _, last_price = r
         if not last_price or last_price <= 0:
             continue
 
-        ls = score_long(r)
-        ss = score_short(r)
+        bm = get_metrics(sym)
+        ls = score_long(r, bm)
+        ss = score_short(r, bm)
 
         if ls > 0:
             if best_buy is None or ls > best_buy[0]:
-                best_buy = (ls, r)
+                best_buy = (ls, r, bm)
         if ss > 0:
             if best_sell is None or ss > best_sell[0]:
-                best_sell = (ss, r)
+                best_sell = (ss, r, bm)
 
     def make_levels(side: str, row: List, score: float):
         sym, _, _, _, _, _, last_price = row
@@ -491,7 +637,6 @@ def format_recommended_trades(buy_trade, sell_trade) -> str:
 def fmt_table(rows: List[List], title: str) -> str:
     if not rows:
         return f"*{title}*: _None_\n"
-    # Only show first 6 columns (SYM, F, S, %24H, %4H, %1H), skip LASTPRICE
     pretty = [
         [
             r[0],
@@ -560,7 +705,6 @@ def melbourne_ok() -> bool:
         hr = datetime.now(ZoneInfo("Australia/Melbourne")).hour
         return 11 <= hr < 23
     except Exception:
-        # If timezone fails, default to allow
         logging.exception("Melbourne time failed; defaulting to allowed.")
         return True
 
@@ -644,7 +788,7 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         best_spot, best_fut, raw_spot, raw_fut = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
 
-        buy_trade, sell_trade = pick_best_trades(p1, p2, p3)
+        buy_trade, sell_trade = await asyncio.to_thread(pick_best_trades, p1, p2, p3)
         rec_text = format_recommended_trades(buy_trade, sell_trade)
 
         msg = (
@@ -732,7 +876,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
         best_spot, best_fut, _, _ = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
-        buy_trade, sell_trade = pick_best_trades(p1, p2, p3)
+        buy_trade, sell_trade = await asyncio.to_thread(pick_best_trades, p1, p2, p3)
         rec_text = format_recommended_trades(buy_trade, sell_trade)
 
         body = scan_for_alerts(p1, p2, p3, rec_text)
