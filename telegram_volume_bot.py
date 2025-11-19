@@ -500,7 +500,7 @@ async def alert_task(context: ContextTypes.DEFAULT_TYPE):
 # MAIN APP + SCHEDULER
 # ---------------------------------------------------
 
-async def run_bot():
+def main():
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=logging.INFO,
@@ -509,7 +509,7 @@ async def run_bot():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN is missing")
 
-    # Build Telegram app
+    # Build Telegram app (python-telegram-bot manages its own event loop)
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     # Commands
@@ -521,20 +521,11 @@ async def run_bot():
     job_queue.run_repeating(alert_task, interval=60, first=10)
 
     logging.info("Bot started successfully.")
-    await app.run_polling()
-
-
-def main():
-    try:
-        asyncio.run(run_bot())
-    except Exception as e:
-        logging.error(f"FATAL ERROR in main(): {e}")
+    app.run_polling()
 
 
 if __name__ == "__main__":
     main()
-
-
 
 
 
