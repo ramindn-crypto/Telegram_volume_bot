@@ -13,9 +13,9 @@ Features:
 - Typing a symbol (e.g. PYTH) gives a one-row table
 
 This version also:
-- Calculates simple LONG and SHORT scores based on %24h, %4h, %1h, and futures volume
-- Picks 1 best BUY and 1 best SELL from all P1/P2/P3 rows
-- Generates Entry / Exit / Stop Loss for both, shown at bottom of /screen and in email alerts
+- Calculates LONG and SHORT scores based on %24h, %4h, %1h, and futures volume
+- Picks TOP 4 trades (BUY or SELL) from all P1/P2/P3 rows
+- Generates Entry / Exit / Stop Loss for them, shown at bottom of /screen and in email alerts
 """
 
 import asyncio
@@ -407,19 +407,19 @@ def score_short(row: List) -> float:
 
     return max(score, 0.0)
 
-def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]):
+
+def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]) -> List[Tuple]:
     """
     Instead of 1 BUY + 1 SELL, return TOP 4 trades overall (BUY or SELL).
     Scoring:
       - long score → BUY
       - short score → SELL
 
-    Returns a list of 4 items:
+    Returns a list of up to 4 items:
         [(side, sym, entry, exit, sl, score), ...]
     """
-
     rows = p1 + p2 + p3
-    scored = []
+    scored: List[Tuple[str, str, float, float, float, float]] = []
 
     for r in rows:
         sym, _, _, _, _, _, last_price = r
@@ -447,7 +447,7 @@ def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]):
 
     # Sort by score descending, pick top 4
     scored.sort(key=lambda x: x[5], reverse=True)
-    return scored[:4]    # top 4 recommendations
+    return scored[:4]
 
 
 def format_recommended_trades(recs: List[Tuple]) -> str:
@@ -620,9 +620,8 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         best_spot, best_fut, raw_spot, raw_fut = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
 
-recs = pick_best_trades(p1, p2, p3)
-rec_text = format_recommended_trades(recs)
-
+        recs = pick_best_trades(p1, p2, p3)
+        rec_text = format_recommended_trades(recs)
 
         msg = (
             fmt_table(p1, "P1 (F≥5M & S≥0.5M — pinned excluded)")
@@ -709,8 +708,9 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
         best_spot, best_fut, _, _ = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
-        buy_trade, sell_trade = pick_best_trades(p1, p2, p3)
-        rec_text = format_recommended_trades(buy_trade, sell_trade)
+
+        recs = pick_best_trades(p1, p2, p3)
+        rec_text = format_recommended_trades(recs)
 
         body = scan_for_alerts(p1, p2, p3, rec_text)
         if not body:
