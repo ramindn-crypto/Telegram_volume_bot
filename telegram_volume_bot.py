@@ -407,81 +407,57 @@ def score_short(row: List) -> float:
 
     return max(score, 0.0)
 
-
 def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]):
     """
-    From all rows in P1/P2/P3, pick:
-    - best BUY (highest long score)
-    - best SELL (highest short score)
-    Returns:
-      (buy_sym, buy_entry, buy_exit, buy_sl),
-      (sell_sym, sell_entry, sell_exit, sell_sl)
-    May return None for one side if no candidate.
-    """
-    all_rows = p1 + p2 + p3
-    best_buy = None  # (score, row)
-    best_sell = None
+    Instead of 1 BUY + 1 SELL, return TOP 4 trades overall (BUY or SELL).
+    Scoring:
+      - long score → BUY
+      - short score → SELL
 
-    for r in all_rows:
+    Returns a list of 4 items:
+        [(side, sym, entry, exit, sl, score), ...]
+    """
+
+    rows = p1 + p2 + p3
+    scored = []
+
+    for r in rows:
         sym, _, _, _, _, _, last_price = r
         if not last_price or last_price <= 0:
             continue
 
-        ls = score_long(r)
-        ss = score_short(r)
+        long_s = score_long(r)
+        short_s = score_short(r)
 
-        if ls > 0:
-            if best_buy is None or ls > best_buy[0]:
-                best_buy = (ls, r)
-        if ss > 0:
-            if best_sell is None or ss > best_sell[0]:
-                best_sell = (ss, r)
-
-    def make_levels(side: str, row: List, score: float):
-        sym, _, _, _, _, _, last_price = row
-        # Medium stop-loss style ~3–5%
-        if side == "BUY":
-            sl_pct = 0.04
-            tp_pct = 0.08
+        # BUY candidate
+        if long_s > 0:
+            score = long_s
             entry = last_price
-            sl = entry * (1.0 - sl_pct)
-            exit = entry * (1.0 + tp_pct)
-        else:  # SELL
-            sl_pct = 0.04
-            tp_pct = 0.06
+            sl = entry * 0.96          # 4% SL
+            exit = entry * 1.08         # 8% TP
+            scored.append(("BUY", sym, entry, exit, sl, score))
+
+        # SELL candidate
+        if short_s > 0:
+            score = short_s
             entry = last_price
-            sl = entry * (1.0 + sl_pct)
-            exit = entry * (1.0 - tp_pct)
-        return sym, entry, exit, sl, score
+            sl = entry * 1.04          # 4% SL
+            exit = entry * 0.94         # 6% TP
+            scored.append(("SELL", sym, entry, exit, sl, score))
 
-    buy_trade = None
-    sell_trade = None
-
-    if best_buy is not None:
-        buy_trade = make_levels("BUY", best_buy[1], best_buy[0])
-    if best_sell is not None:
-        sell_trade = make_levels("SELL", best_sell[1], best_sell[0])
-
-    return buy_trade, sell_trade
+    # Sort by score descending, pick top 4
+    scored.sort(key=lambda x: x[5], reverse=True)
+    return scored[:4]    # top 4 recommendations
 
 
-def format_recommended_trades(buy_trade, sell_trade) -> str:
-    """
-    Build a short text block for recommended trades.
-    """
-    if not buy_trade and not sell_trade:
-        return "_No strong BUY/SELL candidates right now._"
+def format_recommended_trades(recs: List[Tuple]) -> str:
+    if not recs:
+        return "_No strong recommendations right now._"
 
-    lines = []
-    if buy_trade:
-        sym, entry, exit, sl, score = buy_trade
+    lines = ["*Top 4 Recommendations:*"]
+    for side, sym, entry, exit, sl, score in recs:
         lines.append(
-            f"BUY: {sym} — Entry {entry:.6g} — Exit {exit:.6g} — SL {sl:.6g} (score {score:.1f})"
-        )
-    if sell_trade:
-        sym, entry, exit, sl, score = sell_trade
-        lines.append(
-            f"SELL: {sym} — Entry {entry:.6g} — Exit {exit:.6g} — SL {sl:.6g} (score {score:.1f})"
+            f"{side} {sym} — Entry {entry:.6g} — Exit {exit:.6g} — SL {sl:.6g} (score {score:.1f})"
         )
     return "\n".join(lines)
 
@@ -644,8 +620,9 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         best_spot, best_fut, raw_spot, raw_fut = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
 
-        buy_trade, sell_trade = pick_best_trades(p1, p2, p3)
-        rec_text = format_recommended_trades(buy_trade, sell_trade)
+recs = pick_best_trades(p1, p2, p3)
+rec_text = format_recommended_trades(recs)
+
 
         msg = (
             fmt_table(p1, "P1 (F≥5M & S≥0.5M — pinned excluded)")
