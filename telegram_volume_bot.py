@@ -4,12 +4,14 @@ Telegram crypto screener & alert bot (CoinEx via CCXT)
 
 Features:
 - Shows 3 priorities of coins (P1, P2, P3) using CoinEx volumes
-- Table: SYM | F | S | %4H | %1H | %15M
+- Table: SYM | F | S | %24H | %4H | %1H | %15M
 - Email alerts based on:
     BUY  when  1h >= +3%  AND  15m >= +3%
     SELL when  1h <= -3%  AND  15m <= -3%
 - Emails only 07:00–23:00 (Australia/Melbourne)
-- Max 1 email / 15 minutes, 30 emails/day
+- Max 1 email / 15 minutes, 20 emails/day
+- Only send an email if at least one symbol meets the criteria
+- Skip email if the BUY/SELL symbol sets are unchanged from previous email
 - Check interval = 5 min
 - Commands: /start /screen /notify_on /notify_off /notify /diag
 - Typing a symbol (e.g. PYTH) gives a one-row table
@@ -88,7 +90,7 @@ SELL_PCT_15M_MAX = -3.0
 ALERT_THROTTLE_SEC = 15 * 60  # 15 minutes per (priority,symbol)
 
 # Email global limits
-EMAIL_DAILY_LIMIT = 30
+EMAIL_DAILY_LIMIT = 20
 EMAIL_DAILY_WINDOW_SEC = 24 * 60 * 60
 EMAIL_MIN_GAP_SEC = 15 * 60  # max 1 email every 15 minutes (global)
 
@@ -96,12 +98,15 @@ EMAIL_MIN_GAP_SEC = 15 * 60  # max 1 email every 15 minutes (global)
 LAST_ERROR: Optional[str] = None
 NOTIFY_ON: bool = EMAIL_ENABLED_DEFAULT
 
-PCT4H_CACHE: Dict[Tuple[str, str], float] = {}
-PCT1H_CACHE: Dict[Tuple[str, str], float] = {}
-PCT15M_CACHE: Dict[Tuple[str, str], float] = {}
+PCT4H_CACHE: Dict[Tuple[str, str, int], float] = {}
+PCT1H_CACHE: Dict[Tuple[str, str, int], float] = {}
+PCT15M_CACHE: Dict[Tuple[str, str, int], float] = {}
 
-ALERT_SENT_CACHE: Dict[Tuple[str, str], float] = {}  # (priority, symbol) -> last_sent_time
+ALERT_SENT_CACHE: Dict[Tuple[str, str], float] = {}  # (priority_side, symbol) -> last_sent_time
 EMAIL_SEND_LOG: List[float] = []  # timestamps of sent emails
+
+# For "only send if symbols/directions changed"
+LAST_SIGNAL_SIGNATURE: Optional[Tuple[Tuple[str, ...], Tuple[str, ...]]] = None
 
 
 # ================== DATA STRUCTURES ==================
@@ -162,7 +167,7 @@ def usd_notional(mv: Optional[MarketVol]) -> float:
 
 
 def pct_change_24h(mv_spot: Optional[MarketVol], mv_fut: Optional[MarketVol]) -> float:
-    """24h % change (currently unused but kept for reference)."""
+    """24h % change (prefer ticker.percentage)."""
     for mv in (mv_spot, mv_fut):
         if mv and mv.percentage:
             return float(mv.percentage)
@@ -308,7 +313,7 @@ def load_best():
 def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, MarketVol]):
     """
     Build P1, P2, P3 lists.
-    Each row: [SYM, FUSD, SUSD, %4H, %1H, %15M, LASTPRICE]
+    Each row: [SYM, FUSD, SUSD, %24H, %4H, %1H, %15M, LASTPRICE]
       - LASTPRICE is internal, not shown in table.
     """
     p1: List[List] = []
@@ -325,12 +330,13 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
         fut_usd = usd_notional(f)
         spot_usd = usd_notional(s)
         if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
+            pct24 = pct_change_24h(s, f)
             symbol_for_pct = f.symbol
             pct4 = compute_pct_for_symbol_1h(symbol_for_pct, 4)
             pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1)
             pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15)
             last_price = f.last or s.last or 0.0
-            p1.append([base, fut_usd, spot_usd, pct4, pct1, pct15, last_price])
+            p1.append([base, fut_usd, spot_usd, pct24, pct4, pct1, pct15, last_price])
 
     p1.sort(key=lambda x: x[1], reverse=True)
     p1 = p1[:TOP_N_P1]
@@ -344,12 +350,13 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
         if fut_usd >= P2_FUT_MIN:
             s = best_spot.get(base)
             spot_usd = usd_notional(s) if s else 0.0
+            pct24 = pct_change_24h(s, f)
             symbol_for_pct = f.symbol
             pct4 = compute_pct_for_symbol_1h(symbol_for_pct, 4)
             pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1)
             pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15)
             last_price = f.last or (s.last if s else 0.0)
-            p2.append([base, fut_usd, spot_usd, pct4, pct1, pct15, last_price])
+            p2.append([base, fut_usd, spot_usd, pct24, pct4, pct1, pct15, last_price])
 
     p2.sort(key=lambda x: x[1], reverse=True)
     p2 = p2[:TOP_N_P2]
@@ -366,12 +373,13 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
             continue
         fut_usd = usd_notional(f) if f else 0.0
         spot_usd = usd_notional(s) if s else 0.0
+        pct24 = pct_change_24h(s, f)
         symbol_for_pct = f.symbol if f else (s.symbol if s else "")
         pct4 = compute_pct_for_symbol_1h(symbol_for_pct, 4) if symbol_for_pct else 0.0
         pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1) if symbol_for_pct else 0.0
         pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15) if symbol_for_pct else 0.0
         last_price = (f.last if f else (s.last if s else 0.0))
-        tmp[base] = [base, fut_usd, spot_usd, pct4, pct1, pct15, last_price]
+        tmp[base] = [base, fut_usd, spot_usd, pct24, pct4, pct1, pct15, last_price]
 
     # non-pinned, not used, Spot≥3M
     for base, s in best_spot.items():
@@ -381,12 +389,13 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
         if spot_usd >= P3_SPOT_MIN:
             f = best_fut.get(base)
             fut_usd = usd_notional(f) if f else 0.0
+            pct24 = pct_change_24h(s, f)
             symbol_for_pct = f.symbol if f else s.symbol
             pct4 = compute_pct_for_symbol_1h(symbol_for_pct, 4)
             pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1)
             pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15)
             last_price = (f.last if f else s.last)
-            tmp[base] = [base, fut_usd, spot_usd, pct4, pct1, pct15, last_price]
+            tmp[base] = [base, fut_usd, spot_usd, pct24, pct4, pct1, pct15, last_price]
 
     all_rows = list(tmp.values())
     pinned_rows = [r for r in all_rows if r[0] in PINNED_SET]
@@ -407,10 +416,10 @@ def score_long(row: List) -> float:
     - Positive 4h, 1h, 15m momentum
     - Futures liquidity
     """
-    _, fut_usd, _, pct4, pct1, pct15, _ = row
+    _, fut_usd, _, pct24, pct4, pct1, pct15, _ = row
     score = 0.0
 
-    # Momentum
+    # Momentum (we ignore 24h here, use intraday moves)
     if pct4 > 0:
         score += min(pct4 / 2.0, 3.0)
     if pct1 > 0:
@@ -433,7 +442,7 @@ def score_short(row: List) -> float:
     - Negative 4h, 1h, 15m momentum
     - Futures liquidity
     """
-    _, fut_usd, _, pct4, pct1, pct15, _ = row
+    _, fut_usd, _, pct24, pct4, pct1, pct15, _ = row
     score = 0.0
 
     # Downside momentum
@@ -467,7 +476,7 @@ def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]) -> List[Tup
     scored: List[Tuple[str, str, float, float, float, float]] = []
 
     for r in rows:
-        sym, _, _, _, _, _, last_price = r
+        sym, _, _, pct24, pct4, pct1, pct15, last_price = r
         if not last_price or last_price <= 0:
             continue
 
@@ -512,7 +521,7 @@ def format_recommended_trades(recs: List[Tuple]) -> str:
 def fmt_table(rows: List[List], title: str) -> str:
     if not rows:
         return f"*{title}*: _None_\n"
-    # Show: SYM, F, S, %4H, %1H, %15M
+    # Show: SYM, F, S, %24H, %4H, %1H, %15M
     pretty = [
         [
             r[0],
@@ -521,23 +530,33 @@ def fmt_table(rows: List[List], title: str) -> str:
             pct_with_emoji(r[3]),
             pct_with_emoji(r[4]),
             pct_with_emoji(r[5]),
+            pct_with_emoji(r[6]),
         ]
         for r in rows
     ]
     return (
         f"*{title}*:\n"
         "```\n"
-        + tabulate(pretty, headers=["SYM", "F", "S", "%4H", "%1H", "%15M"], tablefmt="github")
+        + tabulate(
+            pretty,
+            headers=["SYM", "F", "S", "%24H", "%4H", "%1H", "%15M"],
+            tablefmt="github",
+        )
         + "\n```\n"
     )
 
 
-def fmt_single(sym: str, fusd: float, susd: float, p4: float, p1: float, p15: float) -> str:
-    row = [[sym, m_dollars(fusd), m_dollars(susd),
-            pct_with_emoji(p4), pct_with_emoji(p1), pct_with_emoji(p15)]]
+def fmt_single(sym: str, fusd: float, susd: float, p24: float, p4: float, p1: float, p15: float) -> str:
+    row = [[sym,
+            m_dollars(fusd),
+            m_dollars(susd),
+            pct_with_emoji(p24),
+            pct_with_emoji(p4),
+            pct_with_emoji(p1),
+            pct_with_emoji(p15)]]
     return (
         "```\n"
-        + tabulate(row, headers=["SYM", "F", "S", "%4H", "%1H", "%15M"], tablefmt="github")
+        + tabulate(row, headers=["SYM", "F", "S", "%24H", "%4H", "%1H", "%15M"], tablefmt="github")
         + "\n```"
     )
 
@@ -576,10 +595,10 @@ def send_email(subject: str, body: str) -> bool:
 
 
 def melbourne_ok() -> bool:
-    """Return True only if local time is between 12:01–20:00 in Melbourne."""
+    """Return True only if local time is between 11:00–23:00 in Melbourne."""
     try:
         hr = datetime.now(ZoneInfo("Australia/Melbourne")).hour
-        return 12 <= hr < 20
+        return 11 <= hr < 23
     except Exception:
         # If timezone fails, default to allow
         logging.exception("Melbourne time failed; defaulting to allowed.")
@@ -589,7 +608,7 @@ def melbourne_ok() -> bool:
 def email_quota_ok() -> bool:
     """
     Global email limit:
-    - Max 30 per 24h
+    - Max 20 per 24h
     - Max 1 email every 15 minutes (global gap)
     """
     now = time.time()
@@ -613,11 +632,11 @@ def record_email():
     EMAIL_SEND_LOG.append(time.time())
 
 
-def should_alert(priority: str, symbol: str) -> bool:
-    """Per (priority,symbol) cool-down."""
+def should_alert(priority: str, symbol: str, side: str) -> bool:
+    """Per (priority,side,symbol) cool-down."""
     now = time.time()
-    key = (priority, symbol)
-    last = ALERT_SENT_CACHE.get(key, 0)
+    key = (f"{priority}_{side}", symbol)
+    last = ALERT_SENT_CACHE.get(key, 0.0)
     if now - last >= ALERT_THROTTLE_SEC:
         ALERT_SENT_CACHE[key] = now
         return True
@@ -630,41 +649,62 @@ def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: st
       BUY  when  1h >= +3%  AND  15m >= +3%
       SELL when  1h <= -3%  AND  15m <= -3%
     Also append recommended trades at the end.
+
+    Email is sent ONLY if:
+    - There is at least one BUY or SELL signal, AND
+    - The set of BUY/SELL symbols is different from the previous email.
     """
+    global LAST_SIGNAL_SIGNATURE
+
     lines: List[str] = []
+    overall_buy: set[str] = set()
+    overall_sell: set[str] = set()
+
     for label, rows in (("P1", p1), ("P2", p2), ("P3", p3)):
         buy_hits: List[str] = []
         sell_hits: List[str] = []
         for r in rows:
-            sym, _, _, _, pct1, pct15, _ = r
+            sym, _, _, pct24, pct4, pct1, pct15, _ = r
             # BUY condition
             if pct1 >= BUY_PCT_1H_MIN and pct15 >= BUY_PCT_15M_MIN:
-                if should_alert(label + "_BUY", sym):
+                if should_alert(label, sym, "BUY"):
                     buy_hits.append(sym)
             # SELL condition
             if pct1 <= SELL_PCT_1H_MAX and pct15 <= SELL_PCT_15M_MAX:
-                if should_alert(label + "_SELL", sym):
+                if should_alert(label, sym, "SELL"):
                     sell_hits.append(sym)
         if buy_hits or sell_hits:
             parts = []
             if buy_hits:
                 parts.append("BUY: " + ", ".join(sorted(set(buy_hits))))
+                overall_buy.update(buy_hits)
             if sell_hits:
                 parts.append("SELL: " + ", ".join(sorted(set(sell_hits))))
+                overall_sell.update(sell_hits)
             lines.append(f"{label}: " + " | ".join(parts))
 
-    if not lines and not rec_text:
+    # If no signals at all -> do NOT send email
+    if not lines:
         return None
 
-    body_parts = []
-    if lines:
-        body_parts.append("Signals (1h & 15m):\n\n" + "\n".join(lines))
+    # Build signature of current signals (BUY set + SELL set)
+    signature = (tuple(sorted(overall_buy)), tuple(sorted(overall_sell)))
+
+    # If same as last email -> skip
+    if LAST_SIGNAL_SIGNATURE == signature:
+        return None
+
+    # Update signature because we are going to send
+    LAST_SIGNAL_SIGNATURE = signature
+
+    # Build email body (now we know we have new signals)
+    body_parts: List[str] = []
+    body_parts.append("Signals (1h & 15m):\n\n" + "\n".join(lines))
+
     if rec_text:
-        if lines:
-            body_parts.append("\n\nRecommended trades:\n" + rec_text)
-        else:
-            body_parts.append("Recommended trades:\n" + rec_text)
-    return "".join(body_parts) if body_parts else None
+        body_parts.append("\n\nRecommended trades:\n" + rec_text)
+
+    return "".join(body_parts)
 
 
 # ================== TELEGRAM HANDLERS ==================
@@ -708,7 +748,8 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"*Diag*\n"
-        f"- rule: BUY ≥ +3% (1h & 15m), SELL ≤ -3% (1h & 15m)\n"
+        f"- BUY rule: 1h ≥ +3% AND 15m ≥ +3%\n"
+        f"- SELL rule: 1h ≤ -3% AND 15m ≤ -3%\n"
         f"- interval: {CHECK_INTERVAL_MIN} min\n"
         f"- email: {'ON' if NOTIFY_ON else 'OFF'}"
     )
@@ -748,12 +789,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Symbol not found.")
             return
 
+        pct24 = pct_change_24h(s, f)
         symbol_for_pct = f.symbol if f else (s.symbol if s else "")
         pct4 = compute_pct_for_symbol_1h(symbol_for_pct, 4) if symbol_for_pct else 0.0
         pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1) if symbol_for_pct else 0.0
         pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15) if symbol_for_pct else 0.0
 
-        msg = fmt_single(token, fusd, susd, pct4, pct1, pct15)
+        msg = fmt_single(token, fusd, susd, pct24, pct4, pct1, pct15)
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logging.exception("text_router error")
@@ -784,6 +826,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         rec_text = format_recommended_trades(recs)
 
         body = scan_for_alerts(p1, p2, p3, rec_text)
+        # If no new signals or same as last time -> body is None
         if not body:
             return
 
