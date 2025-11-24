@@ -9,7 +9,7 @@ Features:
     BUY  when  1h >= +3%  AND  15m >= +3%
     SELL when  1h <= -3%  AND  15m <= -3%
 - Emails only 07:00–23:00 (Australia/Melbourne)
-- Max 1 email / 15 minutes, 20 emails/day
+- Max 1 email / 15 minutes, 30 emails/day
 - Check interval = 5 min
 - Commands: /start /screen /notify_on /notify_off /notify /diag
 - Typing a symbol (e.g. PYTH) gives a one-row table
@@ -88,7 +88,7 @@ SELL_PCT_15M_MAX = -3.0
 ALERT_THROTTLE_SEC = 15 * 60  # 15 minutes per (priority,symbol)
 
 # Email global limits
-EMAIL_DAILY_LIMIT = 20
+EMAIL_DAILY_LIMIT = 30
 EMAIL_DAILY_WINDOW_SEC = 24 * 60 * 60
 EMAIL_MIN_GAP_SEC = 15 * 60  # max 1 email every 15 minutes (global)
 
@@ -576,10 +576,10 @@ def send_email(subject: str, body: str) -> bool:
 
 
 def melbourne_ok() -> bool:
-    """Return True only if local time is between 11:00–23:00 in Melbourne."""
+    """Return True only if local time is between 12:01–20:00 in Melbourne."""
     try:
         hr = datetime.now(ZoneInfo("Australia/Melbourne")).hour
-        return 11 <= hr < 23
+        return 12 <= hr < 20
     except Exception:
         # If timezone fails, default to allow
         logging.exception("Melbourne time failed; defaulting to allowed.")
@@ -589,7 +589,7 @@ def melbourne_ok() -> bool:
 def email_quota_ok() -> bool:
     """
     Global email limit:
-    - Max 20 per 24h
+    - Max 30 per 24h
     - Max 1 email every 15 minutes (global gap)
     """
     now = time.time()
