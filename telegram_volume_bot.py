@@ -5,20 +5,22 @@ Telegram crypto screener & alert bot (CoinEx via CCXT)
 Features:
 - Shows 3 priorities of coins (P1, P2, P3) using CoinEx volumes
 - Table: SYM | F | S | %24H | %4H | %1H | %15M
-- Email alerts based on:
-    BUY  when  1h >= +3%  AND  15m >= +3%
-    SELL when  1h <= -3%  AND  15m <= -3%
-- Emails only 07:00–23:00 (Australia/Melbourne)
-- Max 1 email / 15 minutes, 20 emails/day
-- Only send an email if at least one symbol meets the criteria
-- Skip email if the BUY/SELL symbol sets are unchanged from previous email
+- BUY alert when:
+    1h change >= +3% AND 15m change >= +3%
+- SELL alert when:
+    1h change <= -3% AND 15m change <= -3%
+- BUY and SELL are mutually exclusive per symbol
+- Emails only 11:00–23:00 (Australia/Melbourne)
+- Max 1 email every 15 minutes, max 40 emails/day
+- Email sent only if there is at least one signal
+- Email skipped if BUY/SELL symbol sets are the same as last email
 - Check interval = 5 min
 - Commands: /start /screen /notify_on /notify_off /notify /diag
 - Typing a symbol (e.g. PYTH) gives a one-row table
 
 This version also:
 - Calculates LONG and SHORT scores based on %4h, %1h, %15m, and futures volume
-- Picks TOP 4 trades (BUY or SELL) from all P1/P2/P3 rows
+- Picks TOP 2 trades (BUY or SELL) from all P1/P2/P3 rows
 - Generates Entry / Exit / Stop Loss for them, shown at bottom of /screen and in email alerts
 """
 
@@ -81,18 +83,18 @@ EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 # Scheduler / alerts
 CHECK_INTERVAL_MIN = 5  # run every 5 minutes
 
-# ALERT THRESHOLDS (BUY / SELL rules)
+# ALERT THRESHOLDS
 BUY_PCT_1H_MIN = 3.0
 BUY_PCT_15M_MIN = 3.0
 SELL_PCT_1H_MAX = -3.0
 SELL_PCT_15M_MAX = -3.0
 
-ALERT_THROTTLE_SEC = 15 * 60  # 15 minutes per (priority,symbol)
+ALERT_THROTTLE_SEC = 15 * 60  # 15 minutes per (priority,side,symbol)
 
 # Email global limits
-EMAIL_DAILY_LIMIT = 20
+EMAIL_DAILY_LIMIT = 40             # max 40 / day
 EMAIL_DAILY_WINDOW_SEC = 24 * 60 * 60
-EMAIL_MIN_GAP_SEC = 15 * 60  # max 1 email every 15 minutes (global)
+EMAIL_MIN_GAP_SEC = 15 * 60        # 1 email every 15 minutes (global)
 
 # Globals
 LAST_ERROR: Optional[str] = None
@@ -224,8 +226,8 @@ def compute_pct_for_symbol_1h(symbol: str, hours: int, prefer_swap: bool = True)
     Used for %4H (hours=4) and %1H (hours=1).
     """
     try_order = ["swap", "spot"] if prefer_swap else ["spot", "swap"]
-
     cache = PCT4H_CACHE if hours == 4 else PCT1H_CACHE
+
     for dtype in try_order:
         cache_key = (dtype, symbol, hours)
         if cache_key in cache:
@@ -258,6 +260,7 @@ def compute_pct_for_symbol_15m(symbol: str, minutes: int = 15, prefer_swap: bool
     """
     try_order = ["swap", "spot"] if prefer_swap else ["spot", "swap"]
     cache = PCT15M_CACHE
+
     for dtype in try_order:
         cache_key = (dtype, symbol, minutes)
         if cache_key in cache:
@@ -419,7 +422,7 @@ def score_long(row: List) -> float:
     _, fut_usd, _, pct24, pct4, pct1, pct15, _ = row
     score = 0.0
 
-    # Momentum (we ignore 24h here, use intraday moves)
+    # Momentum (intraday)
     if pct4 > 0:
         score += min(pct4 / 2.0, 3.0)
     if pct1 > 0:
@@ -464,13 +467,7 @@ def score_short(row: List) -> float:
 
 def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]) -> List[Tuple]:
     """
-    Return TOP 4 trades overall (BUY or SELL).
-    Scoring:
-      - long score → BUY
-      - short score → SELL
-
-    Returns a list of up to 4 items:
-        [(side, sym, entry, exit, sl, score), ...]
+    Score BUY/SELL and return ONLY TOP 2 recommendations.
     """
     rows = p1 + p2 + p3
     scored: List[Tuple[str, str, float, float, float, float]] = []
@@ -485,30 +482,27 @@ def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]) -> List[Tup
 
         # BUY candidate
         if long_s > 0:
-            score = long_s
             entry = last_price
-            sl = entry * 0.96          # 4% SL
-            exit = entry * 1.08         # 8% TP
-            scored.append(("BUY", sym, entry, exit, sl, score))
+            sl = entry * 0.96       # 4% SL
+            tp = entry * 1.08       # 8% TP
+            scored.append(("BUY", sym, entry, tp, sl, long_s))
 
         # SELL candidate
         if short_s > 0:
-            score = short_s
             entry = last_price
-            sl = entry * 1.04          # 4% SL
-            exit = entry * 0.94         # 6% TP
-            scored.append(("SELL", sym, entry, exit, sl, score))
+            sl = entry * 1.04       # 4% SL
+            tp = entry * 0.94       # 6% TP
+            scored.append(("SELL", sym, entry, tp, sl, short_s))
 
-    # Sort by score descending, pick top 4
     scored.sort(key=lambda x: x[5], reverse=True)
-    return scored[:4]
+    return scored[:2]  # only top 2 trades
 
 
 def format_recommended_trades(recs: List[Tuple]) -> str:
     if not recs:
         return "_No strong recommendations right now._"
 
-    lines = ["*Top 4 Recommendations:*"]
+    lines = ["*Top 2 Recommendations:*"]
     for side, sym, entry, exit, sl, score in recs:
         lines.append(
             f"{side} {sym} — Entry {entry:.6g} — Exit {exit:.6g} — SL {sl:.6g} (score {score:.1f})"
@@ -600,7 +594,6 @@ def melbourne_ok() -> bool:
         hr = datetime.now(ZoneInfo("Australia/Melbourne")).hour
         return 11 <= hr < 23
     except Exception:
-        # If timezone fails, default to allow
         logging.exception("Melbourne time failed; defaulting to allowed.")
         return True
 
@@ -608,7 +601,7 @@ def melbourne_ok() -> bool:
 def email_quota_ok() -> bool:
     """
     Global email limit:
-    - Max 20 per 24h
+    - Max 40 per 24h
     - Max 1 email every 15 minutes (global gap)
     """
     now = time.time()
@@ -645,66 +638,62 @@ def should_alert(priority: str, symbol: str, side: str) -> bool:
 
 def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: str) -> Optional[str]:
     """
-    Build email body if we have coins with:
-      BUY  when  1h >= +3%  AND  15m >= +3%
-      SELL when  1h <= -3%  AND  15m <= -3%
-    Also append recommended trades at the end.
-
-    Email is sent ONLY if:
-    - There is at least one BUY or SELL signal, AND
-    - The set of BUY/SELL symbols is different from the previous email.
+    BUY if: 1h >= +3% AND 15m >= +3%
+    SELL if: 1h <= -3% AND 15m <= -3%
+    BUY and SELL can never happen for same symbol (mutually exclusive).
+    Email is sent only if signal set changed.
     """
     global LAST_SIGNAL_SIGNATURE
 
-    lines: List[str] = []
     overall_buy: set[str] = set()
     overall_sell: set[str] = set()
+    lines: List[str] = []
 
     for label, rows in (("P1", p1), ("P2", p2), ("P3", p3)):
         buy_hits: List[str] = []
         sell_hits: List[str] = []
+
         for r in rows:
             sym, _, _, pct24, pct4, pct1, pct15, _ = r
-            # BUY condition
+
+            # BUY logic (exclusive)
             if pct1 >= BUY_PCT_1H_MIN and pct15 >= BUY_PCT_15M_MIN:
                 if should_alert(label, sym, "BUY"):
                     buy_hits.append(sym)
-            # SELL condition
+                continue  # don't check SELL if BUY matched
+
+            # SELL logic (exclusive)
             if pct1 <= SELL_PCT_1H_MAX and pct15 <= SELL_PCT_15M_MAX:
                 if should_alert(label, sym, "SELL"):
                     sell_hits.append(sym)
+
         if buy_hits or sell_hits:
             parts = []
             if buy_hits:
-                parts.append("BUY: " + ", ".join(sorted(set(buy_hits))))
                 overall_buy.update(buy_hits)
+                parts.append("BUY: " + ", ".join(sorted(buy_hits)))
             if sell_hits:
-                parts.append("SELL: " + ", ".join(sorted(set(sell_hits))))
                 overall_sell.update(sell_hits)
+                parts.append("SELL: " + ", ".join(sorted(sell_hits)))
             lines.append(f"{label}: " + " | ".join(parts))
 
-    # If no signals at all -> do NOT send email
+    # No signals → do not send email
     if not lines:
         return None
 
-    # Build signature of current signals (BUY set + SELL set)
+    # Check for duplicate signals
     signature = (tuple(sorted(overall_buy)), tuple(sorted(overall_sell)))
-
-    # If same as last email -> skip
     if LAST_SIGNAL_SIGNATURE == signature:
         return None
 
-    # Update signature because we are going to send
     LAST_SIGNAL_SIGNATURE = signature
 
-    # Build email body (now we know we have new signals)
-    body_parts: List[str] = []
-    body_parts.append("Signals (1h & 15m):\n\n" + "\n".join(lines))
-
+    # Build email
+    body = "Signals (1h & 15m):\n\n" + "\n".join(lines)
     if rec_text:
-        body_parts.append("\n\nRecommended trades:\n" + rec_text)
+        body += "\n\nRecommended trades:\n" + rec_text
 
-    return "".join(body_parts)
+    return body
 
 
 # ================== TELEGRAM HANDLERS ==================
@@ -826,7 +815,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         rec_text = format_recommended_trades(recs)
 
         body = scan_for_alerts(p1, p2, p3, rec_text)
-        # If no new signals or same as last time -> body is None
+        # No new signals or same as last time -> no email
         if not body:
             return
 
