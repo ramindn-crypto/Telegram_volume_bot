@@ -2,7 +2,7 @@
 """
 Telegram crypto screener & alert bot (CoinEx via CCXT)
 
-Best-practice logic (your current version):
+Best-practice logic (current version):
 
 Core idea:
 - Use 4h 200 EMA as trend direction filter
@@ -36,20 +36,27 @@ Signal logic:
 - Does NOT decide if there is a signal.
 - Only affects the ranking score (recommendations).
 
+Coin-type factor (new):
+- BTC, SOL                 → BLUE   (big, deep, trending)   → score ×1.2
+- ZEC, DASH, ZEN           → LEGACY (older alts)            → neutral
+- SUI, SUPER               → MID    (mid caps)              → neutral
+- FARTCOIN, PUMP           → MEME   (noisy, thin)           → score ×0.6
+- Others                   → OTHER  → neutral
+
 Extra:
 - (Stub) Coinalyze OI 4h change function, currently returns None (no effect).
 - Mutually exclusive per symbol (no symbol is both BUY and SELL).
 
 Emails:
 - Alert ANYTIME (no time-of-day limit).
-- Max 1 email every 15 minutes (global).
-- Only sent when:
-    * There is at least one BUY/SELL signal, AND
-    * The set of BUY/SELL symbols changed since last email.
+- NO global 1-email-per-15-min limit anymore.
+- Still:
+    * per-symbol cooldown (15 min per (priority,side,symbol))
+    * only sent when BUY/SELL symbol sets change vs last email
 
 Telegram:
 /start
-/screen   → ALWAYS full P1/P2/P3 tables; "Recommended trades" only if signals exist.
+/screen   → ALWAYS full P1/P2/P3 tables; at the end show recommendations ONLY if signals exist.
 /notify_on /notify_off /notify
 /diag
 Typing a symbol (e.g. PYTH) → one-row table with all %s.
@@ -122,9 +129,6 @@ TREND_SHORT_THRESHOLD = -5.0   # < -5% → disable BUY
 
 # Per-symbol alert cooldown (per priority+side+symbol)
 ALERT_THROTTLE_SEC = 15 * 60  # 15 minutes
-
-# Global email gap
-EMAIL_MIN_GAP_SEC = 15 * 60  # 1 email every 15 minutes
 
 # Globals
 LAST_ERROR: Optional[str] = None
@@ -369,6 +373,24 @@ def get_oi_change_4h_from_coinalyze(base_symbol: str) -> Optional[float]:
     return OI4H_CACHE.get(base_symbol, None)
 
 
+# ================== COIN TYPE FACTOR ==================
+
+def get_coin_class(base: str) -> str:
+    """
+    Classify base symbols into BLUE / LEGACY / MID / MEME / OTHER.
+    """
+    b = (base or "").upper()
+    if b in {"BTC", "SOL"}:
+        return "BLUE"
+    if b in {"ZEC", "DASH", "ZEN"}:
+        return "LEGACY"
+    if b in {"SUI", "SUPER"}:
+        return "MID"
+    if b in {"FARTCOIN", "PUMP"}:
+        return "MEME"
+    return "OTHER"
+
+
 # ================== PRIORITIES ==================
 
 def load_best():
@@ -526,8 +548,10 @@ def score_long(row: List) -> float:
     Long (BUY) score based on:
     - Positive 4h, 1h, 15m momentum
     - Futures liquidity
+    - Coin type factor (BLUE gets boost, MEME gets penalty)
     Weights: 1h > 4h > 15m (approx)
     """
+    base = row[0]
     _, fut_usd, _, pct24, pct4, pct1, pct15, _, _ = row
     score = 0.0
 
@@ -545,6 +569,13 @@ def score_long(row: List) -> float:
     elif fut_usd > 5_000_000:
         score += 2.0
 
+    # Coin type factor
+    ctype = get_coin_class(base)
+    if ctype == "BLUE":
+        score *= 1.2
+    elif ctype == "MEME":
+        score *= 0.6
+
     return max(score, 0.0)
 
 
@@ -553,7 +584,9 @@ def score_short(row: List) -> float:
     Short (SELL) score based on:
     - Negative 4h, 1h, 15m momentum
     - Futures liquidity
+    - Coin type factor
     """
+    base = row[0]
     _, fut_usd, _, pct24, pct4, pct1, pct15, _, _ = row
     score = 0.0
 
@@ -570,6 +603,13 @@ def score_short(row: List) -> float:
         score += 5.0
     elif fut_usd > 5_000_000:
         score += 2.0
+
+    # Coin type factor
+    ctype = get_coin_class(base)
+    if ctype == "BLUE":
+        score *= 1.2
+    elif ctype == "MEME":
+        score *= 0.6
 
     return max(score, 0.0)
 
@@ -731,13 +771,9 @@ def send_email(subject: str, body: str) -> bool:
 def email_quota_ok() -> bool:
     """
     Global email limit:
-    - Max 1 email every 15 minutes (no daily cap, no time-of-day limit)
+    - Now: NO global time-based limit.
+    - Per-symbol cooldown + signature-change logic still applies.
     """
-    now = time.time()
-    if EMAIL_SEND_LOG:
-        last_sent = EMAIL_SEND_LOG[-1]
-        if now - last_sent < EMAIL_MIN_GAP_SEC:
-            return False
     return True
 
 
@@ -799,7 +835,7 @@ def detect_signals(p1: List[List], p2: List[List], p3: List[List]):
                 elif last_price < ema_4h and pct1 <= SELL_PCT_1H_MAX:
                     sell_ok = True
             else:
-                # Fallback if EMA missing: use 1h only (very rare)
+                # Fallback if EMA missing: use 1h only (rare)
                 if pct1 >= BUY_PCT_1H_MIN:
                     buy_ok = True
                 elif pct1 <= SELL_PCT_1H_MAX:
@@ -814,7 +850,7 @@ def detect_signals(p1: List[List], p2: List[List], p3: List[List]):
             # Optional OI filter (currently no effect)
             oi_change_4h = get_oi_change_4h_from_coinalyze(sym)
             if oi_change_4h is not None and oi_change_4h <= 0:
-                # If you want OI to be required, uncomment below:
+                # Uncomment if you want OI required:
                 # buy_ok = False
                 # sell_ok = False
                 pass
@@ -826,7 +862,6 @@ def detect_signals(p1: List[List], p2: List[List], p3: List[List]):
                 elif pct24 < 0:
                     buy_ok = False
                 else:
-                    # Decide by 1h direction
                     if pct1 >= 0:
                         sell_ok = False
                     else:
@@ -961,7 +996,7 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- EMA: 4h 200\n"
         f"- OI: Coinalyze hook (currently inactive / stub)\n"
         f"- interval: {CHECK_INTERVAL_MIN} min\n"
-        f"- email: {'ON' if NOTIFY_ON else 'OFF'} (max 1 per 15 min)"
+        f"- email: {'ON' if NOTIFY_ON else 'OFF'} (no global time limit; per-symbol cooldown + changed-symbol condition)"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
