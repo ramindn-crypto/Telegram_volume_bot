@@ -3,33 +3,50 @@
 Telegram crypto screener & alert bot (CoinEx via CCXT)
 
 Features:
-- Shows 3 priorities of coins (P1, P2, P3) using CoinEx volumes
-- Table: SYM | F | S | %24H | %4H | %1H | %15M
-- BUY alert (when 24h is neutral):
-    1h change ≥ +2% AND 15m change ≥ +2%
-- SELL alert (when 24h is neutral):
-    1h change ≤ -2% AND 15m change ≤ -2%
+- Uses CoinEx via CCXT for 24h volume & price
+- Priorities:
+    P1: F≥5M & S≥0.5M (pinned excluded)
+    P2: F≥2M (pinned excluded)
+    P3: Pinned + S≥3M
+- Table columns: SYM | F | S | %24H | %4H | %1H | %15M
+- Intraday alert rules (base logic):
+    BUY (neutral 24h):  1h ≥ +2% AND 15m ≥ +2%
+    SELL (neutral 24h): 1h ≤ -2% AND 15m ≤ -2%
 - 24h trend filter (Interpretation B):
-    If 24h > +5%  → SHORT (SELL) alerts disabled, but BUY still needs 1h & 15m confirmation
-    If 24h < -5%  → LONG (BUY) alerts disabled, but SELL still needs 1h & 15m confirmation
-- BUY and SELL are mutually exclusive per symbol
-- Emails can be sent ANYTIME (no time window)
-- No daily limit on email count
+    If 24h > +5%  → SELL disabled (but BUY still needs confirmation)
+    If 24h < -5%  → BUY disabled (but SELL still needs confirmation)
+
+Extra filters:
+- 4h 200 EMA trend:
+    If last_price > EMA200(4h) → only BUY allowed
+    If last_price < EMA200(4h) → only SELL allowed
+- Coinalyze OI filter hook:
+    get_oi_change_4h_from_coinalyze(base_symbol) → if implemented and ≤ 0, disables signals
+    (currently stubbed to return None so it never blocks)
+
+Signals:
+- BUY & SELL are mutually exclusive per symbol.
+- Only symbols that pass ALL filters are considered for alerts & recommendations.
+
+Emails:
+- Email alerts ANYTIME (no time-of-day limit)
 - Max 1 email every 15 minutes (global)
 - Email sent only if:
-    * There is at least one signal, AND
-    * BUY/SELL symbol sets changed vs last email
-- /screen:
-    * Only shows rows that meet the same alert rules
-    * If no signals → short "no signals" message
-- Check interval = 5 min
-- Commands: /start /screen /notify_on /notify_off /notify /diag
-- Typing a symbol (e.g. PYTH) gives a one-row table
+    * At least one signal (after all filters), AND
+    * The set of BUY/SELL symbols changed since last email
 
-This version also:
-- Calculates LONG and SHORT scores based on %4h, %1h, %15m, and futures volume
-- Picks TOP 2 trades (BUY or SELL) only among coins that meet alert rules
-- Generates Entry / Exit / Stop Loss for them, shown at bottom of /screen and in email alerts
+Recommendations:
+- From symbols that pass alert rules:
+    → Score BUY/SELL candidates
+    → Pick TOP 2 recommendations (BUY or SELL)
+    → Provide Entry / Exit / SL
+
+Telegram:
+/start
+/screen   → ALWAYS show full P1/P2/P3, but "Recommended trades" only if there is at least 1 signal
+/notify_on /notify_off /notify
+/diag
+Typing a symbol (e.g. PYTH) → one-row table for that symbol
 """
 
 import asyncio
@@ -87,22 +104,23 @@ EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
 EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 
 # Scheduler / alerts
-CHECK_INTERVAL_MIN = 5  # run every 5 minutes
+CHECK_INTERVAL_MIN = 5  # run alert job every 5 minutes
 
-# ALERT THRESHOLDS (intraday)
+# Intraday alert thresholds
 BUY_PCT_1H_MIN = 2.0
 BUY_PCT_15M_MIN = 2.0
 SELL_PCT_1H_MAX = -2.0
 SELL_PCT_15M_MAX = -2.0
 
 # 24h trend filter (Interpretation B)
-TREND_LONG_THRESHOLD = 5.0    # > +5% → filter out SELL signals
-TREND_SHORT_THRESHOLD = -5.0  # < -5% → filter out BUY signals
+TREND_LONG_THRESHOLD = 5.0     # > +5% → disable SELL
+TREND_SHORT_THRESHOLD = -5.0   # < -5% → disable BUY
 
+# Per-symbol alert cooldown
 ALERT_THROTTLE_SEC = 15 * 60  # 15 minutes per (priority,side,symbol)
 
-# Email global limit: only 1 email per 15 minutes
-EMAIL_MIN_GAP_SEC = 15 * 60  # 1 email every 15 minutes (global)
+# Global email gap
+EMAIL_MIN_GAP_SEC = 15 * 60  # 1 email every 15 minutes (no daily cap)
 
 # Globals
 LAST_ERROR: Optional[str] = None
@@ -111,6 +129,9 @@ NOTIFY_ON: bool = EMAIL_ENABLED_DEFAULT
 PCT4H_CACHE: Dict[Tuple[str, str, int], float] = {}
 PCT1H_CACHE: Dict[Tuple[str, str, int], float] = {}
 PCT15M_CACHE: Dict[Tuple[str, str, int], float] = {}
+
+EMA4H_CACHE: Dict[str, float] = {}
+OI4H_CACHE: Dict[str, Optional[float]] = {}
 
 ALERT_SENT_CACHE: Dict[Tuple[str, str], float] = {}  # (priority_side, symbol) -> last_sent_time
 EMAIL_SEND_LOG: List[float] = []  # timestamps of sent emails
@@ -294,6 +315,67 @@ def compute_pct_for_symbol_15m(symbol: str, minutes: int = 15, prefer_swap: bool
     return 0.0
 
 
+# ================== EMA + OI HELPERS ==================
+
+def get_ema_4h_200(symbol: str) -> float:
+    """
+    Compute 200 EMA on 4h candles for the given trading symbol.
+    We prefer swap markets for futures symbols like 'BTC/USDT:USDT'.
+    Cached per symbol.
+    """
+    if not symbol:
+        return 0.0
+    if symbol in EMA4H_CACHE:
+        return EMA4H_CACHE[symbol]
+
+    try:
+        # crude detection: if it has ':', assume futures (swap)
+        default_type = "swap" if ":" in symbol else "spot"
+        ex = build_exchange(default_type)
+        ex.load_markets()
+        candles = ex.fetch_ohlcv(symbol, timeframe="4h", limit=210)
+        if not candles or len(candles) < 200:
+            EMA4H_CACHE[symbol] = 0.0
+            return 0.0
+
+        closes = [c[4] for c in candles]
+        # standard EMA
+        k = 2 / (200 + 1)
+        ema = closes[0]
+        for price in closes[1:]:
+            ema = price * k + ema * (1 - k)
+
+        EMA4H_CACHE[symbol] = float(ema)
+        return float(ema)
+    except Exception:
+        logging.exception("get_ema_4h_200 failed for %s", symbol)
+        EMA4H_CACHE[symbol] = 0.0
+        return 0.0
+
+
+def get_oi_change_4h_from_coinalyze(base_symbol: str) -> Optional[float]:
+    """
+    Placeholder for Coinalyze OI 4h change.
+    Return percentage OI change over last 4h or None if unavailable.
+
+    IMPORTANT:
+      - Currently returns None so it DOES NOT block any signals.
+      - When you have Coinalyze API access, implement the HTTP call here:
+          1) Build URL with your API key & symbol
+          2) Fetch OI history
+          3) Compute % change over 4h
+          4) Cache result in OI4H_CACHE[base_symbol]
+
+    Example logic (pseudo):
+        if base_symbol in OI4H_CACHE:
+            return OI4H_CACHE[base_symbol]
+        ...
+        OI4H_CACHE[base_symbol] = oi_pct_change
+        return oi_pct_change
+    """
+    return OI4H_CACHE.get(base_symbol, None)
+
+
 # ================== PRIORITIES ==================
 
 def load_best():
@@ -324,7 +406,8 @@ def load_best():
 def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, MarketVol]):
     """
     Build P1, P2, P3 lists.
-    Each row: [SYM, FUSD, SUSD, %24H, %4H, %1H, %15M, LASTPRICE]
+    Each row: [SYM, FUSD, SUSD, %24H, %4H, %1H, %15M, LASTPRICE, MKTSYM]
+      - MKTSYM is the futures (swap) symbol if exists, else spot symbol
       - LASTPRICE is internal, not shown in table.
     """
     p1: List[List] = []
@@ -347,7 +430,9 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
             pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1)
             pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15)
             last_price = f.last or s.last or 0.0
-            p1.append([base, fut_usd, spot_usd, pct24, pct4, pct1, pct15, last_price])
+            p1.append(
+                [base, fut_usd, spot_usd, pct24, pct4, pct1, pct15, last_price, symbol_for_pct]
+            )
 
     p1.sort(key=lambda x: x[1], reverse=True)
     p1 = p1[:TOP_N_P1]
@@ -367,7 +452,9 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
             pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1)
             pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15)
             last_price = f.last or (s.last if s else 0.0)
-            p2.append([base, fut_usd, spot_usd, pct24, pct4, pct1, pct15, last_price])
+            p2.append(
+                [base, fut_usd, spot_usd, pct24, pct4, pct1, pct15, last_price, symbol_for_pct]
+            )
 
     p2.sort(key=lambda x: x[1], reverse=True)
     p2 = p2[:TOP_N_P2]
@@ -390,7 +477,17 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
         pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1) if symbol_for_pct else 0.0
         pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15) if symbol_for_pct else 0.0
         last_price = (f.last if f else (s.last if s else 0.0))
-        tmp[base] = [base, fut_usd, spot_usd, pct24, pct4, pct1, pct15, last_price]
+        tmp[base] = [
+            base,
+            fut_usd,
+            spot_usd,
+            pct24,
+            pct4,
+            pct1,
+            pct15,
+            last_price,
+            symbol_for_pct,
+        ]
 
     # non-pinned, not used, Spot≥3M
     for base, s in best_spot.items():
@@ -406,7 +503,17 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
             pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1)
             pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15)
             last_price = (f.last if f else s.last)
-            tmp[base] = [base, fut_usd, spot_usd, pct24, pct4, pct1, pct15, last_price]
+            tmp[base] = [
+                base,
+                fut_usd,
+                spot_usd,
+                pct24,
+                pct4,
+                pct1,
+                pct15,
+                last_price,
+                symbol_for_pct,
+            ]
 
     all_rows = list(tmp.values())
     pinned_rows = [r for r in all_rows if r[0] in PINNED_SET]
@@ -427,7 +534,7 @@ def score_long(row: List) -> float:
     - Positive 4h, 1h, 15m momentum
     - Futures liquidity
     """
-    _, fut_usd, _, pct24, pct4, pct1, pct15, _ = row
+    _, fut_usd, _, pct24, pct4, pct1, pct15, _, _ = row
     score = 0.0
 
     if pct4 > 0:
@@ -451,7 +558,7 @@ def score_short(row: List) -> float:
     - Negative 4h, 1h, 15m momentum
     - Futures liquidity
     """
-    _, fut_usd, _, pct24, pct4, pct1, pct15, _ = row
+    _, fut_usd, _, pct24, pct4, pct1, pct15, _, _ = row
     score = 0.0
 
     if pct4 < 0:
@@ -472,35 +579,30 @@ def score_short(row: List) -> float:
 def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]) -> List[Tuple]:
     """
     Score BUY/SELL and return ONLY TOP 2 recommendations.
-    Uses the same 24h trend filter logic as alerts:
-      - If 24h > +5% → SELL discouraged (score forced to 0)
-      - If 24h < -5% → BUY discouraged (score forced to 0)
-      - Else both allowed, but symbol can't be both BUY and SELL;
-        in that case we pick the stronger side.
-    Only called on rows that already meet the alert rules.
+    Assumes rows already passed the alert filters.
+    Uses 24h trend to resolve conflicts.
     """
     rows = p1 + p2 + p3
     scored: List[Tuple[str, str, float, float, float, float]] = []
 
     for r in rows:
-        sym, _, _, pct24, pct4, pct1, pct15, last_price = r
+        sym, _, _, pct24, pct4, pct1, pct15, last_price, _ = r
         if not last_price or last_price <= 0:
             continue
 
         long_s = score_long(r)
         short_s = score_short(r)
 
-        # Apply 24h trend filter to recommendations
+        # 24h filter for recommendations
         if pct24 > TREND_LONG_THRESHOLD:
-            short_s = 0.0  # don't recommend shorts in a strong uptrend
+            short_s = 0.0
         elif pct24 < TREND_SHORT_THRESHOLD:
-            long_s = 0.0   # don't recommend longs in a strong downtrend
+            long_s = 0.0
 
         side: Optional[str] = None
         score: float = 0.0
 
         if long_s > 0 and short_s > 0:
-            # Both sides look good → choose based on 24h & score
             if pct24 > 0:
                 side = "BUY"
                 score = long_s
@@ -655,13 +757,15 @@ def should_alert(priority: str, symbol: str, side: str) -> bool:
     return False
 
 
-# ================== SIGNAL DETECTION (for screen + email) ==================
+# ================== SIGNAL DETECTION ==================
 
 def detect_signals(p1: List[List], p2: List[List], p3: List[List]):
     """
-    Detect BUY/SELL signals based purely on:
+    Detect BUY/SELL signals based on:
       - intraday rules (1h & 15m)
       - 24h trend filter
+      - 4h EMA200 trend filter
+      - (optional) Coinalyze OI 4h filter
       - mutual exclusivity per symbol
 
     Returns:
@@ -681,7 +785,7 @@ def detect_signals(p1: List[List], p2: List[List], p3: List[List]):
 
     for label, rows in priority_map:
         for r in rows:
-            sym, _, _, pct24, pct4, pct1, pct15, _ = r
+            sym, _, _, pct24, pct4, pct1, pct15, last_price, mkt_symbol = r
 
             buy_ok = False
             sell_ok = False
@@ -692,20 +796,36 @@ def detect_signals(p1: List[List], p2: List[List], p3: List[List]):
             if pct1 <= SELL_PCT_1H_MAX and pct15 <= SELL_PCT_15M_MAX:
                 sell_ok = True
 
-            # Apply 24h trend filter (Interpretation B)
+            # 24h trend filter
             if pct24 > TREND_LONG_THRESHOLD:
                 sell_ok = False
             elif pct24 < TREND_SHORT_THRESHOLD:
                 buy_ok = False
 
-            # Mutual exclusivity
+            # 4h EMA200 trend filter
+            ema_4h = get_ema_4h_200(mkt_symbol)
+            if ema_4h > 0 and last_price > 0:
+                if last_price > ema_4h:
+                    # Uptrend → don't short
+                    sell_ok = False
+                elif last_price < ema_4h:
+                    # Downtrend → don't long
+                    buy_ok = False
+
+            # Coinalyze OI 4h filter (if available)
+            oi_change_4h = get_oi_change_4h_from_coinalyze(sym)
+            if oi_change_4h is not None and oi_change_4h <= 0:
+                # If OI not increasing, skip both sides
+                buy_ok = False
+                sell_ok = False
+
+            # Mutual exclusivity resolution
             if buy_ok and sell_ok:
                 if pct24 > 0:
                     sell_ok = False
                 elif pct24 < 0:
                     buy_ok = False
                 else:
-                    # Neutral 24h → choose by stronger intraday move
                     if abs(pct1) >= abs(pct15):
                         if pct1 >= 0:
                             sell_ok = False
@@ -730,7 +850,7 @@ def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: st
     Use detect_signals() to find coins that meet alert rules.
     Then apply:
       - per-symbol cooldown (should_alert)
-      - global signature change (only send if new combination)
+      - global signature change (only send if BUY/SELL sets changed)
     """
     global LAST_SIGNAL_SIGNATURE
 
@@ -770,7 +890,7 @@ def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: st
         return None
     LAST_SIGNAL_SIGNATURE = signature
 
-    body = "Signals (24h filter + 1h & 15m):\n\n" + "\n".join(lines)
+    body = "Signals (24h filter + EMA + 1h & 15m):\n\n" + "\n".join(lines)
     if rec_text:
         body += "\n\nRecommended trades:\n" + rec_text
 
@@ -782,7 +902,7 @@ def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: st
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Commands:\n"
-        "• /screen — show ONLY coins that meet email alert rules\n"
+        "• /screen — show P1, P2, P3 (full tables) and ONLY show recommendations if alert rules are met\n"
         "• /notify_on /notify_off /notify\n"
         "• /diag — short diagnostics\n"
         "• Type a symbol (e.g. PYTH) for its row"
@@ -793,19 +913,29 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /screen:
     - Load P1/P2/P3
-    - Detect signals using SAME logic as email alerts
-    - Show only rows whose symbol is in BUY/SELL sets
-    - If no signals → short text, no tables
+    - ALWAYS show full tables (all rows that passed volume filters)
+    - Then compute signals
+    - Only if at least one symbol meets alert rules, show "Recommended trades" at the end.
+      If no symbol matches, no recommendations section is printed.
     """
     try:
         PCT4H_CACHE.clear()
         PCT1H_CACHE.clear()
         PCT15M_CACHE.clear()
+        EMA4H_CACHE.clear()
+        # OI4H_CACHE is not cleared; it's conceptually slower-changing (stub anyway).
 
         best_spot, best_fut, raw_spot, raw_fut = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
 
-        # Detect signals
+        msg = (
+            fmt_table(p1, "P1 (F≥5M & S≥0.5M — pinned excluded)")
+            + fmt_table(p2, "P2 (F≥2M — pinned excluded)")
+            + fmt_table(p3, "P3 (Pinned + S≥3M)")
+            + f"tickers: spot={raw_spot}, fut={raw_fut}\n\n"
+        )
+
+        # ---- Detect signals & build recommendations ONLY if there are signals ----
         signals = detect_signals(p1, p2, p3)
 
         def filter_rows(rows: List[List], label: str) -> List[List]:
@@ -816,24 +946,12 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p2_sig = filter_rows(p2, "P2")
         p3_sig = filter_rows(p3, "P3")
 
-        if not p1_sig and not p2_sig and not p3_sig:
-            await update.message.reply_text(
-                "No symbols currently meet the email alert rules (24h + 1h + 15m)."
-            )
-            return
+        if p1_sig or p2_sig or p3_sig:
+            recs = pick_best_trades(p1_sig, p2_sig, p3_sig)
+            if recs:
+                rec_text = format_recommended_trades(recs)
+                msg += "*Recommended trades:*\n" + rec_text
 
-        # Recommendations only among coins that meet alert rules
-        recs = pick_best_trades(p1_sig, p2_sig, p3_sig)
-        rec_text = format_recommended_trades(recs)
-
-        msg = (
-            fmt_table(p1_sig, "P1 signals")
-            + fmt_table(p2_sig, "P2 signals")
-            + fmt_table(p3_sig, "P3 signals")
-            + f"tickers: spot={raw_spot}, fut={raw_fut}\n\n"
-            + "*Recommended trades:*\n"
-            + rec_text
-        )
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logging.exception("screen error")
@@ -843,9 +961,11 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"*Diag*\n"
-        f"- BUY rule (neutral 24h): 1h ≥ +{BUY_PCT_1H_MIN:.0f}% AND 15m ≥ +{BUY_PCT_15M_MIN:.0f}%\n"
-        f"- SELL rule (neutral 24h): 1h ≤ {SELL_PCT_1H_MAX:.0f}% AND 15m ≤ {SELL_PCT_15M_MAX:.0f}%\n"
+        f"- BUY (neutral 24h): 1h ≥ +{BUY_PCT_1H_MIN:.0f}% & 15m ≥ +{BUY_PCT_15M_MIN:.0f}%\n"
+        f"- SELL (neutral 24h): 1h ≤ {SELL_PCT_1H_MAX:.0f}% & 15m ≤ {SELL_PCT_15M_MAX:.0f}%\n"
         f"- 24h filter: > +{TREND_LONG_THRESHOLD:.0f}% → disable SELL, < {TREND_SHORT_THRESHOLD:.0f}% → disable BUY\n"
+        f"- EMA filter: 4h 200 EMA (long above, short below)\n"
+        f"- OI filter: Coinalyze hook (currently inactive / stub)\n"
         f"- interval: {CHECK_INTERVAL_MIN} min\n"
         f"- email: {'ON' if NOTIFY_ON else 'OFF'}\n"
         f"- global gap: 1 email / 15 min"
@@ -913,11 +1033,12 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         PCT4H_CACHE.clear()
         PCT1H_CACHE.clear()
         PCT15M_CACHE.clear()
+        EMA4H_CACHE.clear()
 
         best_spot, best_fut, _, _ = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
 
-        # For emails we still consider recommendations among alert-qualified coins
+        # For emails, recommendations only among coins that meet alert rules
         signals = detect_signals(p1, p2, p3)
 
         def filter_rows(rows: List[List], label: str) -> List[List]:
@@ -929,13 +1050,13 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         p3_sig = filter_rows(p3, "P3")
 
         recs = pick_best_trades(p1_sig, p2_sig, p3_sig)
-        rec_text = format_recommended_trades(recs)
+        rec_text = format_recommended_trades(recs) if recs else ""
 
         body = scan_for_alerts(p1, p2, p3, rec_text)
         if not body:
             return
 
-        if send_email("Crypto Alert: 24h filter + intraday signals", body):
+        if send_email("Crypto Alert: EMA + 24h + intraday", body):
             record_email()
     except Exception as e:
         logging.exception("alert_job error: %s", e)
