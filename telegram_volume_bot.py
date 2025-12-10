@@ -5,20 +5,20 @@ Telegram crypto screener & alert bot (CoinEx via CCXT)
 Features:
 - Shows 3 priorities of coins (P1, P2, P3) using CoinEx volumes
 - Table: SYM | F | S | %24H | %4H | %1H | %15M
-- Base rules:
-    BUY (when no strong 24h trend):
-        1h change >= +2% AND 15m change >= +2%
-    SELL (when no strong 24h trend):
-        1h change <= -2% AND 15m change <= -2%
-- Strong 24h trend override:
-    If 24h >= +5% → ONLY alert LONG for that symbol
-    If 24h <= -5% → ONLY alert SHORT for that symbol
+- BUY alert (when 24h is neutral):
+    1h change ≥ +2% AND 15m change ≥ +2%
+- SELL alert (when 24h is neutral):
+    1h change ≤ -2% AND 15m change ≤ -2%
+- 24h trend filter (Interpretation B):
+    If 24h > +5%  → SHORT (SELL) alerts disabled, but BUY still needs 1h & 15m confirmation
+    If 24h < -5%  → LONG (BUY) alerts disabled, but SELL still needs 1h & 15m confirmation
 - BUY and SELL are mutually exclusive per symbol
 - Emails can be sent ANYTIME (no time window)
 - No daily limit on email count
 - Max 1 email every 15 minutes (global)
-- Email sent only if there is at least one signal
-- Email skipped if BUY/SELL symbol sets are the same as last email
+- Email sent only if:
+    * There is at least one signal, AND
+    * BUY/SELL symbol sets changed vs last email
 - Check interval = 5 min
 - Commands: /start /screen /notify_on /notify_off /notify /diag
 - Typing a symbol (e.g. PYTH) gives a one-row table
@@ -86,15 +86,15 @@ EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 # Scheduler / alerts
 CHECK_INTERVAL_MIN = 5  # run every 5 minutes
 
-# ALERT THRESHOLDS
+# ALERT THRESHOLDS (intraday)
 BUY_PCT_1H_MIN = 2.0
 BUY_PCT_15M_MIN = 2.0
 SELL_PCT_1H_MAX = -2.0
 SELL_PCT_15M_MAX = -2.0
 
-# Strong 24h trend override
-STRONG_UP_24H = 5.0    # >= +5% → only LONG alerts
-STRONG_DOWN_24H = -5.0 # <= -5% → only SHORT alerts
+# 24h trend filter (Interpretation B)
+TREND_LONG_THRESHOLD = 5.0    # > +5% → filter out SELL signals
+TREND_SHORT_THRESHOLD = -5.0  # < -5% → filter out BUY signals
 
 ALERT_THROTTLE_SEC = 15 * 60  # 15 minutes per (priority,side,symbol)
 
@@ -105,7 +105,6 @@ EMAIL_MIN_GAP_SEC = 15 * 60  # 1 email every 15 minutes (global)
 LAST_ERROR: Optional[str] = None
 NOTIFY_ON: bool = EMAIL_ENABLED_DEFAULT
 
-# caches: (dtype, symbol, window) → pct
 PCT4H_CACHE: Dict[Tuple[str, str, int], float] = {}
 PCT1H_CACHE: Dict[Tuple[str, str, int], float] = {}
 PCT15M_CACHE: Dict[Tuple[str, str, int], float] = {}
@@ -470,6 +469,11 @@ def score_short(row: List) -> float:
 def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]) -> List[Tuple]:
     """
     Score BUY/SELL and return ONLY TOP 2 recommendations.
+    Uses the same 24h trend filter logic as alerts:
+      - If 24h > +5% → SELL discouraged (score forced to 0)
+      - If 24h < -5% → BUY discouraged (score forced to 0)
+      - Else both allowed, but symbol can't be both BUY and SELL;
+        in that case we pick the stronger side.
     """
     rows = p1 + p2 + p3
     scored: List[Tuple[str, str, float, float, float, float]] = []
@@ -482,17 +486,49 @@ def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]) -> List[Tup
         long_s = score_long(r)
         short_s = score_short(r)
 
-        if long_s > 0:
-            entry = last_price
+        # Apply 24h trend filter to recommendations
+        if pct24 > TREND_LONG_THRESHOLD:
+            short_s = 0.0  # don't recommend shorts in a strong uptrend
+        elif pct24 < TREND_SHORT_THRESHOLD:
+            long_s = 0.0   # don't recommend longs in a strong downtrend
+
+        side: Optional[str] = None
+        score: float = 0.0
+
+        if long_s > 0 and short_s > 0:
+            # Both sides look good → choose based on 24h & score
+            if pct24 > 0:
+                side = "BUY"
+                score = long_s
+            elif pct24 < 0:
+                side = "SELL"
+                score = short_s
+            else:
+                if long_s >= short_s:
+                    side = "BUY"
+                    score = long_s
+                else:
+                    side = "SELL"
+                    score = short_s
+        elif long_s > 0:
+            side = "BUY"
+            score = long_s
+        elif short_s > 0:
+            side = "SELL"
+            score = short_s
+
+        if side is None:
+            continue
+
+        entry = last_price
+        if side == "BUY":
             sl = entry * 0.96
             tp = entry * 1.08
-            scored.append(("BUY", sym, entry, tp, sl, long_s))
-
-        if short_s > 0:
-            entry = last_price
+        else:
             sl = entry * 1.04
             tp = entry * 0.94
-            scored.append(("SELL", sym, entry, tp, sl, short_s))
+
+        scored.append((side, sym, entry, tp, sl, score))
 
     scored.sort(key=lambda x: x[5], reverse=True)
     return scored[:2]
@@ -503,9 +539,9 @@ def format_recommended_trades(recs: List[Tuple]) -> str:
         return "_No strong recommendations right now._"
 
     lines = ["*Top 2 Recommendations:*"]
-    for side, sym, entry, exit, sl, score in recs:
+    for side, sym, entry, exit_price, sl, score in recs:
         lines.append(
-            f"{side} {sym} — Entry {entry:.6g} — Exit {exit:.6g} — SL {sl:.6g} (score {score:.1f})"
+            f"{side} {sym} — Entry {entry:.6g} — Exit {exit_price:.6g} — SL {sl:.6g} (score {score:.1f})"
         )
     return "\n".join(lines)
 
@@ -617,15 +653,18 @@ def should_alert(priority: str, symbol: str, side: str) -> bool:
 
 def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: str) -> Optional[str]:
     """
-    BUY if (no strong 24h trend AND 1h >= +2% & 15m >= +2%)
-    SELL if (no strong 24h trend AND 1h <= -2% & 15m <= -2%)
+    BUY if (after 24h trend filter):
+      - 1h ≥ +2% AND 15m ≥ +2%
 
-    Strong 24h override:
-      If 24h >= +5% → force LONG side for alerts (even if 1h/15m < -2)
-      If 24h <= -5% → force SHORT side for alerts (even if 1h/15m > +2)
+    SELL if (after 24h trend filter):
+      - 1h ≤ -2% AND 15m ≤ -2%
 
-    BUY and SELL are mutually exclusive per symbol.
-    Email is sent only if signal set changed.
+    24h filter (Interpretation B):
+      - If 24h > +5%  → SELL blocked (no short signals), BUY still needs 1h & 15m
+      - If 24h < -5%  → BUY blocked (no long signals), SELL still needs 1h & 15m
+
+    BUY and SELL can never occur for the same symbol in one scan.
+    Email is sent only if symbol sets (BUY/SELL) changed vs last email.
     """
     global LAST_SIGNAL_SIGNATURE
 
@@ -640,26 +679,46 @@ def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: st
         for r in rows:
             sym, _, _, pct24, pct4, pct1, pct15, _ = r
 
-            side: Optional[str] = None
+            buy_ok = False
+            sell_ok = False
 
-            # --- Strong 24h override ---
-            if pct24 >= STRONG_UP_24H:
-                side = "BUY"
-            elif pct24 <= STRONG_DOWN_24H:
-                side = "SELL"
-            else:
-                # --- Normal intraday rules (no strong 24h trend) ---
-                if pct1 >= BUY_PCT_1H_MIN and pct15 >= BUY_PCT_15M_MIN:
-                    side = "BUY"
-                elif pct1 <= SELL_PCT_1H_MAX and pct15 <= SELL_PCT_15M_MAX:
-                    side = "SELL"
+            # Intraday conditions
+            if pct1 >= BUY_PCT_1H_MIN and pct15 >= BUY_PCT_15M_MIN:
+                buy_ok = True
+            if pct1 <= SELL_PCT_1H_MAX and pct15 <= SELL_PCT_15M_MAX:
+                sell_ok = True
 
-            if side == "BUY":
-                if should_alert(label, sym, "BUY"):
-                    buy_hits.append(sym)
-            elif side == "SELL":
-                if should_alert(label, sym, "SELL"):
-                    sell_hits.append(sym)
+            # Apply 24h trend filter (Interpretation B)
+            if pct24 > TREND_LONG_THRESHOLD:
+                # Strong uptrend → block shorts
+                sell_ok = False
+            elif pct24 < TREND_SHORT_THRESHOLD:
+                # Strong downtrend → block longs
+                buy_ok = False
+
+            # Mutual exclusivity: never both BUY and SELL for same symbol
+            if buy_ok and sell_ok:
+                if pct24 > 0:
+                    sell_ok = False
+                elif pct24 < 0:
+                    buy_ok = False
+                else:
+                    # Neutral 24h → choose by stronger intraday move
+                    if abs(pct1) >= abs(pct15):
+                        if pct1 >= 0:
+                            sell_ok = False
+                        else:
+                            buy_ok = False
+                    else:
+                        if pct15 >= 0:
+                            sell_ok = False
+                        else:
+                            buy_ok = False
+
+            if buy_ok and should_alert(label, sym, "BUY"):
+                buy_hits.append(sym)
+            if sell_ok and should_alert(label, sym, "SELL"):
+                sell_hits.append(sym)
 
         if buy_hits or sell_hits:
             parts = []
@@ -671,18 +730,16 @@ def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: st
                 parts.append("SELL: " + ", ".join(sorted(sell_hits)))
             lines.append(f"{label}: " + " | ".join(parts))
 
-    # No signals → no email
     if not lines:
         return None
 
-    # Avoid duplicates: same BUY/SELL sets as last time
     signature = (tuple(sorted(overall_buy)), tuple(sorted(overall_sell)))
     if LAST_SIGNAL_SIGNATURE == signature:
         return None
 
     LAST_SIGNAL_SIGNATURE = signature
 
-    body = "Signals (24h trend + 1h & 15m):\n\n" + "\n".join(lines)
+    body = "Signals (24h filter + 1h & 15m):\n\n" + "\n".join(lines)
     if rec_text:
         body += "\n\nRecommended trades:\n" + rec_text
 
@@ -730,9 +787,9 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"*Diag*\n"
-        f"- BUY rule (no strong 24h): 1h ≥ +{BUY_PCT_1H_MIN:.0f}% AND 15m ≥ +{BUY_PCT_15M_MIN:.0f}%\n"
-        f"- SELL rule (no strong 24h): 1h ≤ {SELL_PCT_1H_MAX:.0f}% AND 15m ≤ {SELL_PCT_15M_MAX:.0f}%\n"
-        f"- Strong 24h override: 24h ≥ +{STRONG_UP_24H:.0f}% → LONG only, 24h ≤ {STRONG_DOWN_24H:.0f}% → SHORT only\n"
+        f"- BUY rule (neutral 24h): 1h ≥ +{BUY_PCT_1H_MIN:.0f}% AND 15m ≥ +{BUY_PCT_15M_MIN:.0f}%\n"
+        f"- SELL rule (neutral 24h): 1h ≤ {SELL_PCT_1H_MAX:.0f}% AND 15m ≤ {SELL_PCT_15M_MAX:.0f}%\n"
+        f"- 24h filter: > +{TREND_LONG_THRESHOLD:.0f}% → disable SELL, < {TREND_SHORT_THRESHOLD:.0f}% → disable BUY\n"
         f"- interval: {CHECK_INTERVAL_MIN} min\n"
         f"- email: {'ON' if NOTIFY_ON else 'OFF'}\n"
         f"- global gap: 1 email / 15 min"
@@ -811,7 +868,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not body:
             return
 
-        if send_email("Crypto Alert: 24h + 1h & 15m signals", body):
+        if send_email("Crypto Alert: 24h filter + intraday signals", body):
             record_email()
     except Exception as e:
         logging.exception("alert_job error: %s", e)
