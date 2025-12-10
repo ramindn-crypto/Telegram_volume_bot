@@ -19,13 +19,16 @@ Features:
 - Email sent only if:
     * There is at least one signal, AND
     * BUY/SELL symbol sets changed vs last email
+- /screen:
+    * Only shows rows that meet the same alert rules
+    * If no signals → short "no signals" message
 - Check interval = 5 min
 - Commands: /start /screen /notify_on /notify_off /notify /diag
 - Typing a symbol (e.g. PYTH) gives a one-row table
 
 This version also:
 - Calculates LONG and SHORT scores based on %4h, %1h, %15m, and futures volume
-- Picks TOP 2 trades (BUY or SELL) from all P1/P2/P3 rows
+- Picks TOP 2 trades (BUY or SELL) only among coins that meet alert rules
 - Generates Entry / Exit / Stop Loss for them, shown at bottom of /screen and in email alerts
 """
 
@@ -474,6 +477,7 @@ def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]) -> List[Tup
       - If 24h < -5% → BUY discouraged (score forced to 0)
       - Else both allowed, but symbol can't be both BUY and SELL;
         in that case we pick the stronger side.
+    Only called on rows that already meet the alert rules.
     """
     rows = p1 + p2 + p3
     scored: List[Tuple[str, str, float, float, float, float]] = []
@@ -651,31 +655,31 @@ def should_alert(priority: str, symbol: str, side: str) -> bool:
     return False
 
 
-def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: str) -> Optional[str]:
+# ================== SIGNAL DETECTION (for screen + email) ==================
+
+def detect_signals(p1: List[List], p2: List[List], p3: List[List]):
     """
-    BUY if (after 24h trend filter):
-      - 1h ≥ +2% AND 15m ≥ +2%
+    Detect BUY/SELL signals based purely on:
+      - intraday rules (1h & 15m)
+      - 24h trend filter
+      - mutual exclusivity per symbol
 
-    SELL if (after 24h trend filter):
-      - 1h ≤ -2% AND 15m ≤ -2%
-
-    24h filter (Interpretation B):
-      - If 24h > +5%  → SELL blocked (no short signals), BUY still needs 1h & 15m
-      - If 24h < -5%  → BUY blocked (no long signals), SELL still needs 1h & 15m
-
-    BUY and SELL can never occur for the same symbol in one scan.
-    Email is sent only if symbol sets (BUY/SELL) changed vs last email.
+    Returns:
+      {
+        "P1": {"BUY": set(...), "SELL": set(...)},
+        "P2": {"BUY": ...},
+        "P3": ...
+      }
     """
-    global LAST_SIGNAL_SIGNATURE
+    signals = {
+        "P1": {"BUY": set(), "SELL": set()},
+        "P2": {"BUY": set(), "SELL": set()},
+        "P3": {"BUY": set(), "SELL": set()},
+    }
 
-    overall_buy: set[str] = set()
-    overall_sell: set[str] = set()
-    lines: List[str] = []
+    priority_map = [("P1", p1), ("P2", p2), ("P3", p3)]
 
-    for label, rows in (("P1", p1), ("P2", p2), ("P3", p3)):
-        buy_hits: List[str] = []
-        sell_hits: List[str] = []
-
+    for label, rows in priority_map:
         for r in rows:
             sym, _, _, pct24, pct4, pct1, pct15, _ = r
 
@@ -690,13 +694,11 @@ def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: st
 
             # Apply 24h trend filter (Interpretation B)
             if pct24 > TREND_LONG_THRESHOLD:
-                # Strong uptrend → block shorts
                 sell_ok = False
             elif pct24 < TREND_SHORT_THRESHOLD:
-                # Strong downtrend → block longs
                 buy_ok = False
 
-            # Mutual exclusivity: never both BUY and SELL for same symbol
+            # Mutual exclusivity
             if buy_ok and sell_ok:
                 if pct24 > 0:
                     sell_ok = False
@@ -715,9 +717,39 @@ def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: st
                         else:
                             buy_ok = False
 
-            if buy_ok and should_alert(label, sym, "BUY"):
+            if buy_ok:
+                signals[label]["BUY"].add(sym)
+            if sell_ok:
+                signals[label]["SELL"].add(sym)
+
+    return signals
+
+
+def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: str) -> Optional[str]:
+    """
+    Use detect_signals() to find coins that meet alert rules.
+    Then apply:
+      - per-symbol cooldown (should_alert)
+      - global signature change (only send if new combination)
+    """
+    global LAST_SIGNAL_SIGNATURE
+
+    overall_buy: set[str] = set()
+    overall_sell: set[str] = set()
+    lines: List[str] = []
+
+    signals = detect_signals(p1, p2, p3)
+    priority_map = [("P1", p1), ("P2", p2), ("P3", p3)]
+
+    for label, rows in priority_map:
+        buy_hits: List[str] = []
+        sell_hits: List[str] = []
+
+        for sym in signals[label]["BUY"]:
+            if should_alert(label, sym, "BUY"):
                 buy_hits.append(sym)
-            if sell_ok and should_alert(label, sym, "SELL"):
+        for sym in signals[label]["SELL"]:
+            if should_alert(label, sym, "SELL"):
                 sell_hits.append(sym)
 
         if buy_hits or sell_hits:
@@ -736,7 +768,6 @@ def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: st
     signature = (tuple(sorted(overall_buy)), tuple(sorted(overall_sell)))
     if LAST_SIGNAL_SIGNATURE == signature:
         return None
-
     LAST_SIGNAL_SIGNATURE = signature
 
     body = "Signals (24h filter + 1h & 15m):\n\n" + "\n".join(lines)
@@ -751,7 +782,7 @@ def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: st
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Commands:\n"
-        "• /screen — show P1, P2, P3 + recommended trades\n"
+        "• /screen — show ONLY coins that meet email alert rules\n"
         "• /notify_on /notify_off /notify\n"
         "• /diag — short diagnostics\n"
         "• Type a symbol (e.g. PYTH) for its row"
@@ -759,6 +790,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /screen:
+    - Load P1/P2/P3
+    - Detect signals using SAME logic as email alerts
+    - Show only rows whose symbol is in BUY/SELL sets
+    - If no signals → short text, no tables
+    """
     try:
         PCT4H_CACHE.clear()
         PCT1H_CACHE.clear()
@@ -767,13 +805,31 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         best_spot, best_fut, raw_spot, raw_fut = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
 
-        recs = pick_best_trades(p1, p2, p3)
+        # Detect signals
+        signals = detect_signals(p1, p2, p3)
+
+        def filter_rows(rows: List[List], label: str) -> List[List]:
+            active_syms = signals[label]["BUY"] | signals[label]["SELL"]
+            return [r for r in rows if r[0] in active_syms]
+
+        p1_sig = filter_rows(p1, "P1")
+        p2_sig = filter_rows(p2, "P2")
+        p3_sig = filter_rows(p3, "P3")
+
+        if not p1_sig and not p2_sig and not p3_sig:
+            await update.message.reply_text(
+                "No symbols currently meet the email alert rules (24h + 1h + 15m)."
+            )
+            return
+
+        # Recommendations only among coins that meet alert rules
+        recs = pick_best_trades(p1_sig, p2_sig, p3_sig)
         rec_text = format_recommended_trades(recs)
 
         msg = (
-            fmt_table(p1, "P1 (F≥5M & S≥0.5M — pinned excluded)")
-            + fmt_table(p2, "P2 (F≥2M — pinned excluded)")
-            + fmt_table(p3, "P3 (Pinned + S≥3M)")
+            fmt_table(p1_sig, "P1 signals")
+            + fmt_table(p2_sig, "P2 signals")
+            + fmt_table(p3_sig, "P3 signals")
             + f"tickers: spot={raw_spot}, fut={raw_fut}\n\n"
             + "*Recommended trades:*\n"
             + rec_text
@@ -861,7 +917,18 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         best_spot, best_fut, _, _ = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
 
-        recs = pick_best_trades(p1, p2, p3)
+        # For emails we still consider recommendations among alert-qualified coins
+        signals = detect_signals(p1, p2, p3)
+
+        def filter_rows(rows: List[List], label: str) -> List[List]:
+            active_syms = signals[label]["BUY"] | signals[label]["SELL"]
+            return [r for r in rows if r[0] in active_syms]
+
+        p1_sig = filter_rows(p1, "P1")
+        p2_sig = filter_rows(p2, "P2")
+        p3_sig = filter_rows(p3, "P3")
+
+        recs = pick_best_trades(p1_sig, p2_sig, p3_sig)
         rec_text = format_recommended_trades(recs)
 
         body = scan_for_alerts(p1, p2, p3, rec_text)
