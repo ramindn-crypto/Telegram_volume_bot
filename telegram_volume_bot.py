@@ -36,27 +36,29 @@ Signal logic:
 - Does NOT decide if there is a signal.
 - Only affects the ranking score (recommendations).
 
-Coin-type factor (new):
+Coin-type factor:
 - BTC, SOL                 → BLUE   (big, deep, trending)   → score ×1.2
 - ZEC, DASH, ZEN           → LEGACY (older alts)            → neutral
 - SUI, SUPER               → MID    (mid caps)              → neutral
 - FARTCOIN, PUMP           → MEME   (noisy, thin)           → score ×0.6
 - Others                   → OTHER  → neutral
 
+Time filter (NEW):
+- Email alerts only between 17:00 and 02:00 Australia/Melbourne local time.
+- Outside this window, the alert job runs but skips sending emails.
+
 Extra:
 - (Stub) Coinalyze OI 4h change function, currently returns None (no effect).
 - Mutually exclusive per symbol (no symbol is both BUY and SELL).
 
 Emails:
-- Alert ANYTIME (no time-of-day limit).
-- NO global 1-email-per-15-min limit anymore.
-- Still:
-    * per-symbol cooldown (15 min per (priority,side,symbol))
-    * only sent when BUY/SELL symbol sets change vs last email
+- No global daily/hourly limit.
+- Per-symbol cooldown: 15 min per (priority,side,symbol)
+- Only sent when BUY/SELL symbol sets change vs last email (signature).
 
 Telegram:
 /start
-/screen   → ALWAYS full P1/P2/P3 tables; at the end show recommendations ONLY if signals exist.
+/screen   → ALWAYS full P1, P2, P3 tables; at the end show recommendations ONLY if signals exist.
 /notify_on /notify_off /notify
 /diag
 Typing a symbol (e.g. PYTH) → one-row table with all %s.
@@ -72,6 +74,8 @@ import smtplib
 from email.message import EmailMessage
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import ccxt
 from tabulate import tabulate
@@ -389,6 +393,28 @@ def get_coin_class(base: str) -> str:
     if b in {"FARTCOIN", "PUMP"}:
         return "MEME"
     return "OTHER"
+
+
+# ================== TIME WINDOW (MELBOURNE) ==================
+
+def trading_time_ok() -> bool:
+    """
+    Allow alerts only in the 'prime' window:
+      17:00–02:00 Australia/Melbourne local time.
+
+    This roughly covers late EU + US sessions,
+    where research shows higher volume and volatility.
+    """
+    try:
+        now = datetime.now(ZoneInfo("Australia/Melbourne"))
+        hr = now.hour
+        # window that crosses midnight: hr >= 17 OR hr < 2
+        if hr >= 17 or hr < 2:
+            return True
+        return False
+    except Exception:
+        logging.exception("trading_time_ok failed; defaulting to allowed.")
+        return True
 
 
 # ================== PRIORITIES ==================
@@ -850,7 +876,7 @@ def detect_signals(p1: List[List], p2: List[List], p3: List[List]):
             # Optional OI filter (currently no effect)
             oi_change_4h = get_oi_change_4h_from_coinalyze(sym)
             if oi_change_4h is not None and oi_change_4h <= 0:
-                # Uncomment if you want OI required:
+                # Example if you want OI required:
                 # buy_ok = False
                 # sell_ok = False
                 pass
@@ -995,6 +1021,7 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- 15m: only affects ranking (not hard filter)\n"
         f"- EMA: 4h 200\n"
         f"- OI: Coinalyze hook (currently inactive / stub)\n"
+        f"- alert window (Melbourne): 17:00–02:00\n"
         f"- interval: {CHECK_INTERVAL_MIN} min\n"
         f"- email: {'ON' if NOTIFY_ON else 'OFF'} (no global time limit; per-symbol cooldown + changed-symbol condition)"
     )
@@ -1056,6 +1083,9 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not email_config_ok():
             return
         if not email_quota_ok():
+            return
+        # NEW: only trade in prime times for Melbourne
+        if not trading_time_ok():
             return
 
         PCT4H_CACHE.clear()
