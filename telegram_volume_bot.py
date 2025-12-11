@@ -2,13 +2,22 @@
 """
 Telegram crypto screener & alert bot (CoinEx via CCXT)
 
-Best-practice logic (current version):
+Strategy (current version):
 
 Core idea:
 - Use 4h 200 EMA as trend direction filter
 - Use 1h % change as main trigger
-- Use 24h % as bias filter (no SELL in very strong up days, no BUY in strong down days)
-- Use 15m % only as a scoring/tie-breaker factor, NOT as a hard filter
+- Use 24h % as bias filter (no SELL in strong up days, no BUY in strong down days)
+- Use 15m % only in the scoring (ranking), not as a hard filter
+- Two time-based modes (Melbourne time):
+    * Conservative: 19:00–22:00
+    * Aggressive:   22:00–01:00
+
+Email window (Melbourne):
+- Email alerts ONLY:
+    * Monday–Saturday
+    * Between 19:00 and 01:00
+- No email alerts at all on SUNDAY (local date Sunday, including 00:00–01:00).
 
 Features:
 - Uses CoinEx via CCXT for 24h volume & price
@@ -21,11 +30,11 @@ Features:
 Signal logic:
 - BUY:
     - 4h EMA uptrend (price > 4h EMA200)
-    - 1h change ≥ +2%
+    - 1h change ≥ buy_thr (base 2%, looser in aggressive mode)
     - 24h filter does NOT block BUY (24h > -5%)
 - SELL:
     - 4h EMA downtrend (price < 4h EMA200)
-    - 1h change ≤ -2%
+    - 1h change ≤ sell_thr (base -2%, looser in aggressive mode)
     - 24h filter does NOT block SELL (24h < +5%)
 
 24h bias filter:
@@ -33,35 +42,31 @@ Signal logic:
 - If 24h < -5% → disable BUY (no longs)
 
 15m:
-- Does NOT decide if there is a signal.
-- Only affects the ranking score (recommendations).
+- NOT a hard condition.
+- Only affects ranking score (for recommendations).
 
 Coin-type factor:
-- BTC, SOL                 → BLUE   (big, deep, trending)   → score ×1.2
-- ZEC, DASH, ZEN           → LEGACY (older alts)            → neutral
-- SUI, SUPER               → MID    (mid caps)              → neutral
-- FARTCOIN, PUMP           → MEME   (noisy, thin)           → score ×0.6
+- BTC, SOL                 → BLUE   → score ×1.2 (big, deep, trending)
+- ZEC, DASH, ZEN           → LEGACY → neutral
+- SUI, SUPER               → MID    → neutral
+- FARTCOIN, PUMP           → MEME   → score ×0.6 (noisy / thin)
 - Others                   → OTHER  → neutral
 
-Time filter (NEW):
-- Email alerts only between 17:00 and 02:00 Australia/Melbourne local time.
-- Outside this window, the alert job runs but skips sending emails.
-
-Extra:
-- (Stub) Coinalyze OI 4h change function, currently returns None (no effect).
-- Mutually exclusive per symbol (no symbol is both BUY and SELL).
+Time filter (Melbourne):
+- Email alerts only between 19:00 and 01:00, Monday–Saturday.
+- No alerts at all on local Sunday.
 
 Emails:
-- No global daily/hourly limit.
-- Per-symbol cooldown: 15 min per (priority,side,symbol)
-- Only sent when BUY/SELL symbol sets change vs last email (signature).
+- No global daily/hourly cap.
+- Per-(priority, side, symbol) cooldown: 15 min
+- Only send if symbol sets (BUY/SELL) changed vs last email.
 
 Telegram:
 /start
 /screen   → ALWAYS full P1, P2, P3 tables; at the end show recommendations ONLY if signals exist.
 /notify_on /notify_off /notify
 /diag
-Typing a symbol (e.g. PYTH) → one-row table with all %s.
+Typing a symbol (e.g. PYTH) → one-row table with all %’s.
 """
 
 import asyncio
@@ -95,6 +100,8 @@ from telegram.ext import (
 EXCHANGE_ID = "coinex"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
+MEL_TZ = ZoneInfo("Australia/Melbourne")
+
 # Priority thresholds (USD notional)
 P1_SPOT_MIN = 500_000
 P1_FUT_MIN = 5_000_000
@@ -123,9 +130,12 @@ EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 # Scheduler / alerts
 CHECK_INTERVAL_MIN = 5  # alert job interval in minutes
 
-# Intraday alert thresholds (hard conditions for 1h only)
-BUY_PCT_1H_MIN = 2.0
-SELL_PCT_1H_MAX = -2.0
+# Intraday alert base thresholds (hard conditions for 1h only)
+BUY_PCT_1H_MIN_BASE = 2.0
+SELL_PCT_1H_MAX_BASE = -2.0
+
+# In aggressive mode, we relax thresholds slightly
+AGGRESSIVE_MULTIPLIER = 0.7  # 2% → 1.4%, -2% → -1.4%
 
 # 24h trend bias filter
 TREND_LONG_THRESHOLD = 5.0     # > +5% → disable SELL
@@ -399,22 +409,44 @@ def get_coin_class(base: str) -> str:
 
 def trading_time_ok() -> bool:
     """
-    Allow alerts only in the 'prime' window:
-      17:00–02:00 Australia/Melbourne local time.
+    Allow email alerts only in the 'prime' window:
+      - Monday–Saturday
+      - 19:00–01:00 local Melbourne time
 
-    This roughly covers late EU + US sessions,
-    where research shows higher volume and volatility.
+    Note: local Sunday (weekday==6) is fully excluded,
+    including 00:00–01:00.
     """
     try:
-        now = datetime.now(ZoneInfo("Australia/Melbourne"))
+        now = datetime.now(MEL_TZ)
+        # weekday: Monday=0 ... Sunday=6
+        if now.weekday() == 6:  # Sunday
+            return False
         hr = now.hour
-        # window that crosses midnight: hr >= 17 OR hr < 2
-        if hr >= 17 or hr < 2:
-            return True
-        return False
+        # window that crosses midnight: hr >= 19 OR hr < 1
+        return (hr >= 19) or (hr < 1)
     except Exception:
         logging.exception("trading_time_ok failed; defaulting to allowed.")
         return True
+
+
+def trading_mode() -> str:
+    """
+    Two modes (Melbourne time):
+      - CONSERVATIVE: 19:00–22:00
+      - AGGRESSIVE:   22:00–01:00
+      - OFF: outside 19:00–01:00 (used only for /diag, not for filter)
+    """
+    try:
+        now = datetime.now(MEL_TZ)
+        hr = now.hour
+        if 19 <= hr < 22:
+            return "CONSERVATIVE"
+        if (22 <= hr) or (hr < 1):
+            return "AGGRESSIVE"
+        return "OFF"
+    except Exception:
+        logging.exception("trading_mode failed; defaulting to AGGRESSIVE.")
+        return "AGGRESSIVE"
 
 
 # ================== PRIORITIES ==================
@@ -575,7 +607,7 @@ def score_long(row: List) -> float:
     - Positive 4h, 1h, 15m momentum
     - Futures liquidity
     - Coin type factor (BLUE gets boost, MEME gets penalty)
-    Weights: 1h > 4h > 15m (approx)
+    Weights: 1h > 4h > 15m
     """
     base = row[0]
     _, fut_usd, _, pct24, pct4, pct1, pct15, _, _ = row
@@ -795,11 +827,7 @@ def send_email(subject: str, body: str) -> bool:
 
 
 def email_quota_ok() -> bool:
-    """
-    Global email limit:
-    - Now: NO global time-based limit.
-    - Per-symbol cooldown + signature-change logic still applies.
-    """
+    """No global quota now; always True (we rely on per-symbol cooldown + signature)."""
     return True
 
 
@@ -824,7 +852,7 @@ def detect_signals(p1: List[List], p2: List[List], p3: List[List]):
     """
     Detect BUY/SELL signals based on:
       - 4h EMA trend (hard)
-      - 1h % change (hard)
+      - 1h % change (hard; thresholds depend on mode)
       - 24h bias filter
       - optional OI filter (currently inactive / stub)
       - mutual exclusivity per symbol
@@ -844,6 +872,13 @@ def detect_signals(p1: List[List], p2: List[List], p3: List[List]):
         "P3": {"BUY": set(), "SELL": set()},
     }
 
+    mode = trading_mode()
+    buy_thr = BUY_PCT_1H_MIN_BASE
+    sell_thr = SELL_PCT_1H_MAX_BASE
+    if mode == "AGGRESSIVE":
+        buy_thr *= AGGRESSIVE_MULTIPLIER
+        sell_thr *= AGGRESSIVE_MULTIPLIER
+
     priority_map = [("P1", p1), ("P2", p2), ("P3", p3)]
 
     for label, rows in priority_map:
@@ -853,18 +888,18 @@ def detect_signals(p1: List[List], p2: List[List], p3: List[List]):
             buy_ok = False
             sell_ok = False
 
-            # 4h EMA trend filter + 1h hard condition
+            # 4h EMA trend filter + 1h hard condition (threshold depends on mode)
             ema_4h = get_ema_4h_200(mkt_symbol)
             if ema_4h > 0 and last_price > 0:
-                if last_price > ema_4h and pct1 >= BUY_PCT_1H_MIN:
+                if last_price > ema_4h and pct1 >= buy_thr:
                     buy_ok = True
-                elif last_price < ema_4h and pct1 <= SELL_PCT_1H_MAX:
+                elif last_price < ema_4h and pct1 <= sell_thr:
                     sell_ok = True
             else:
                 # Fallback if EMA missing: use 1h only (rare)
-                if pct1 >= BUY_PCT_1H_MIN:
+                if pct1 >= buy_thr:
                     buy_ok = True
-                elif pct1 <= SELL_PCT_1H_MAX:
+                elif pct1 <= sell_thr:
                     sell_ok = True
 
             # 24h bias filter
@@ -876,7 +911,7 @@ def detect_signals(p1: List[List], p2: List[List], p3: List[List]):
             # Optional OI filter (currently no effect)
             oi_change_4h = get_oi_change_4h_from_coinalyze(sym)
             if oi_change_4h is not None and oi_change_4h <= 0:
-                # Example if you want OI required:
+                # Example if you want to require positive OI:
                 # buy_ok = False
                 # sell_ok = False
                 pass
@@ -1013,17 +1048,25 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = trading_mode()
     msg = (
         f"*Diag*\n"
-        f"- BUY: 4h EMA up & 1h ≥ +{BUY_PCT_1H_MIN:.0f}%\n"
-        f"- SELL: 4h EMA down & 1h ≤ {SELL_PCT_1H_MAX:.0f}%\n"
-        f"- 24h bias: > +{TREND_LONG_THRESHOLD:.0f}% → no SELL; < {TREND_SHORT_THRESHOLD:.0f}% → no BUY\n"
+        f"- Mode now: {mode}\n"
+        f"- Time windows (Melbourne):\n"
+        f"  • Conservative: 19:00–22:00\n"
+        f"  • Aggressive:   22:00–01:00\n"
+        f"  • Email alerts: Mon–Sat, 19:00–01:00 (no Sunday)\n"
+        f"- BUY base rule: 4h EMA up & 1h ≥ +{BUY_PCT_1H_MIN_BASE:.1f}% "
+        f"(looser in AGGRESSIVE ×{AGGRESSIVE_MULTIPLIER})\n"
+        f"- SELL base rule: 4h EMA down & 1h ≤ {SELL_PCT_1H_MAX_BASE:.1f}% "
+        f"(looser in AGGRESSIVE ×{AGGRESSIVE_MULTIPLIER})\n"
+        f"- 24h bias: > +{TREND_LONG_THRESHOLD:.0f}% → no SELL; "
+        f"< {TREND_SHORT_THRESHOLD:.0f}% → no BUY\n"
         f"- 15m: only affects ranking (not hard filter)\n"
         f"- EMA: 4h 200\n"
         f"- OI: Coinalyze hook (currently inactive / stub)\n"
-        f"- alert window (Melbourne): 17:00–02:00\n"
         f"- interval: {CHECK_INTERVAL_MIN} min\n"
-        f"- email: {'ON' if NOTIFY_ON else 'OFF'} (no global time limit; per-symbol cooldown + changed-symbol condition)"
+        f"- email alerts: {'ON' if NOTIFY_ON else 'OFF'}"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -1084,7 +1127,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             return
         if not email_quota_ok():
             return
-        # NEW: only trade in prime times for Melbourne
+        # Only alert in Mon–Sat, 19:00–01:00 Melbourne
         if not trading_time_ok():
             return
 
@@ -1113,7 +1156,9 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not body:
             return
 
-        if send_email("Crypto Alert: 4h EMA + 1h + 24h", body):
+        mode = trading_mode()
+        subj = f"Crypto Alert ({mode}) 4h EMA + 1h + 24h"
+        if send_email(subj, body):
             record_email()
     except Exception as e:
         logging.exception("alert_job error: %s", e)
