@@ -2,71 +2,14 @@
 """
 Telegram crypto screener & alert bot (CoinEx via CCXT)
 
-Strategy (current version):
-
-Core idea:
-- Use 4h 200 EMA as trend direction filter
-- Use 1h % change as main trigger
-- Use 24h % as bias filter (no SELL in strong up days, no BUY in strong down days)
-- Use 15m % only in the scoring (ranking), not as a hard filter
-- Two time-based modes (Melbourne time):
-    * Conservative: 19:00–22:00
-    * Aggressive:   22:00–01:00
-
-Email window (Melbourne):
-- Email alerts ONLY:
-    * Monday–Saturday
-    * Between 19:00 and 01:00
-- No email alerts at all on SUNDAY (local date Sunday, including 00:00–01:00).
-
 Features:
-- Uses CoinEx via CCXT for 24h volume & price
-- Priorities:
-    P1: F≥5M & S≥0.5M (pinned excluded)
-    P2: F≥2M (pinned excluded)
-    P3: Pinned + S≥3M
-- Table columns: SYM | F | S | %24H | %4H | %1H | %15M
-
-Signal logic:
-- BUY:
-    - 4h EMA uptrend (price > 4h EMA200)
-    - 1h change ≥ buy_thr (base 2%, looser in aggressive mode)
-    - 24h filter does NOT block BUY (24h > -5%)
-- SELL:
-    - 4h EMA downtrend (price < 4h EMA200)
-    - 1h change ≤ sell_thr (base -2%, looser in aggressive mode)
-    - 24h filter does NOT block SELL (24h < +5%)
-
-24h bias filter:
-- If 24h > +5% → disable SELL (no shorts)
-- If 24h < -5% → disable BUY (no longs)
-
-15m:
-- NOT a hard condition.
-- Only affects ranking score (for recommendations).
-
-Coin-type factor:
-- BTC, SOL                 → BLUE   → score ×1.2 (big, deep, trending)
-- ZEC, DASH, ZEN           → LEGACY → neutral
-- SUI, SUPER               → MID    → neutral
-- FARTCOIN, PUMP           → MEME   → score ×0.6 (noisy / thin)
-- Others                   → OTHER  → neutral
-
-Time filter (Melbourne):
-- Email alerts only between 19:00 and 01:00, Monday–Saturday.
-- No alerts at all on local Sunday.
-
-Emails:
-- No global daily/hourly cap.
-- Per-(priority, side, symbol) cooldown: 15 min
-- Only send if symbol sets (BUY/SELL) changed vs last email.
-
-Telegram:
-/start
-/screen   → ALWAYS full P1, P2, P3 tables; at the end show recommendations ONLY if signals exist.
-/notify_on /notify_off /notify
-/diag
-Typing a symbol (e.g. PYTH) → one-row table with all %’s.
+- Shows 3 priorities of coins (P1, P2, P3) using CoinEx volumes
+- Table: SYM | F | S | %24H | %4H | %1H
+- Email alerts when there are strong BUY/SELL signals (based on 24h, 4h, 1h momentum)
+- Email alerts only 12:30–01:00 (Australia/Melbourne), no Sundays
+- Max 1 email per 15 minutes (no daily limit)
+- Commands: /start /screen /notify_on /notify_off /notify /diag
+- Typing a symbol (e.g. PYTH) gives its row
 """
 
 import asyncio
@@ -100,8 +43,6 @@ from telegram.ext import (
 EXCHANGE_ID = "coinex"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
-MEL_TZ = ZoneInfo("Australia/Melbourne")
-
 # Priority thresholds (USD notional)
 P1_SPOT_MIN = 500_000
 P1_FUT_MIN = 5_000_000
@@ -128,39 +69,18 @@ EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
 EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 
 # Scheduler / alerts
-CHECK_INTERVAL_MIN = 5  # alert job interval in minutes
+CHECK_INTERVAL_MIN = 5  # run every 5 minutes
 
-# Intraday alert base thresholds (hard conditions for 1h only)
-BUY_PCT_1H_MIN_BASE = 2.0
-SELL_PCT_1H_MAX_BASE = -2.0
-
-# In aggressive mode, we relax thresholds slightly
-AGGRESSIVE_MULTIPLIER = 0.7  # 2% → 1.4%, -2% → -1.4%
-
-# 24h trend bias filter
-TREND_LONG_THRESHOLD = 5.0     # > +5% → disable SELL
-TREND_SHORT_THRESHOLD = -5.0   # < -5% → disable BUY
-
-# Per-symbol alert cooldown (per priority+side+symbol)
-ALERT_THROTTLE_SEC = 15 * 60  # 15 minutes
+# One email every 15 minutes (no daily limit)
+EMAIL_MIN_INTERVAL_SEC = 15 * 60
+LAST_EMAIL_TS: float = 0.0
 
 # Globals
 LAST_ERROR: Optional[str] = None
 NOTIFY_ON: bool = EMAIL_ENABLED_DEFAULT
 
-PCT4H_CACHE: Dict[Tuple[str, str, int], float] = {}
-PCT1H_CACHE: Dict[Tuple[str, str, int], float] = {}
-PCT15M_CACHE: Dict[Tuple[str, str, int], float] = {}
-
-EMA4H_CACHE: Dict[str, float] = {}
-OI4H_CACHE: Dict[str, Optional[float]] = {}
-
-ALERT_SENT_CACHE: Dict[Tuple[str, str], float] = {}  # (priority_side, symbol) -> last_time
-EMAIL_SEND_LOG: List[float] = []  # timestamps of sent emails
-
-# For "only send if symbols/directions changed"
-LAST_SIGNAL_SIGNATURE: Optional[Tuple[Tuple[str, ...], Tuple[str, ...]]] = None
-
+PCT4H_CACHE: Dict[Tuple[str, str], float] = {}
+PCT1H_CACHE: Dict[Tuple[str, str], float] = {}
 
 # ================== DATA STRUCTURES ==================
 
@@ -269,18 +189,17 @@ def safe_fetch_tickers(ex):
         return {}
 
 
-# ================== PERCENTAGES (4H / 1H / 15M) ==================
+# ================== PERCENTAGE (4H / 1H) ==================
 
-def compute_pct_for_symbol_1h(symbol: str, hours: int, prefer_swap: bool = True) -> float:
+def compute_pct_for_symbol(symbol: str, hours: int, prefer_swap: bool = True) -> float:
     """
-    Compute % change over the last N hours using 1h candles.
-    Used for %4H (hours=4) and %1H (hours=1).
+    Compute % change over the last N completed hours using 1h candles.
+    Cache results per (dtype, symbol).
     """
     try_order = ["swap", "spot"] if prefer_swap else ["spot", "swap"]
     cache = PCT4H_CACHE if hours == 4 else PCT1H_CACHE
-
     for dtype in try_order:
-        cache_key = (dtype, symbol, hours)
+        cache_key = (dtype, symbol)
         if cache_key in cache:
             return cache[cache_key]
         try:
@@ -297,156 +216,9 @@ def compute_pct_for_symbol_1h(symbol: str, hours: int, prefer_swap: bool = True)
             cache[cache_key] = pct
             return pct
         except Exception:
-            logging.exception(
-                "compute_pct_for_symbol_1h: %dh failed for %s (%s)", hours, symbol, dtype
-            )
+            logging.exception("compute_pct_for_symbol: %dh failed for %s (%s)", hours, symbol, dtype)
             continue
     return 0.0
-
-
-def compute_pct_for_symbol_15m(symbol: str, minutes: int = 15, prefer_swap: bool = True) -> float:
-    """
-    Compute % change over the last N minutes using 15m candles.
-    For 15 min window we only need 2 candles (last & previous).
-    """
-    try_order = ["swap", "spot"] if prefer_swap else ["spot", "swap"]
-    cache = PCT15M_CACHE
-
-    for dtype in try_order:
-        cache_key = (dtype, symbol, minutes)
-        if cache_key in cache:
-            return cache[cache_key]
-        try:
-            ex = build_exchange(dtype)
-            ex.load_markets()
-            candles = ex.fetch_ohlcv(symbol, timeframe="15m", limit=2)
-            if not candles or len(candles) < 2:
-                continue
-            c0, c1 = candles[-2], candles[-1]
-            if not c0[4]:
-                pct = 0.0
-            else:
-                pct = (c1[4] - c0[4]) / c0[4] * 100.0
-            cache[cache_key] = pct
-            return pct
-        except Exception:
-            logging.exception(
-                "compute_pct_for_symbol_15m: %dmin failed for %s (%s)", minutes, symbol, dtype
-            )
-            continue
-    return 0.0
-
-
-# ================== EMA + OI HELPERS ==================
-
-def get_ema_4h_200(symbol: str) -> float:
-    """
-    Compute 200 EMA on 4h candles for the given trading symbol.
-    We prefer swap markets for futures symbols like 'BTC/USDT:USDT'.
-    Cached per symbol.
-    """
-    if not symbol:
-        return 0.0
-    if symbol in EMA4H_CACHE:
-        return EMA4H_CACHE[symbol]
-
-    try:
-        default_type = "swap" if ":" in symbol else "spot"
-        ex = build_exchange(default_type)
-        ex.load_markets()
-        candles = ex.fetch_ohlcv(symbol, timeframe="4h", limit=210)
-        if not candles or len(candles) < 200:
-            EMA4H_CACHE[symbol] = 0.0
-            return 0.0
-
-        closes = [c[4] for c in candles]
-        k = 2 / (200 + 1)
-        ema = closes[0]
-        for price in closes[1:]:
-            ema = price * k + ema * (1 - k)
-
-        EMA4H_CACHE[symbol] = float(ema)
-        return float(ema)
-    except Exception:
-        logging.exception("get_ema_4h_200 failed for %s", symbol)
-        EMA4H_CACHE[symbol] = 0.0
-        return 0.0
-
-
-def get_oi_change_4h_from_coinalyze(base_symbol: str) -> Optional[float]:
-    """
-    Placeholder for Coinalyze OI 4h change.
-    Return percentage OI change over last 4h or None if unavailable.
-
-    Currently returns None so it DOES NOT block any signals.
-
-    When you have Coinalyze API access, implement the HTTP call here and:
-        OI4H_CACHE[base_symbol] = oi_pct_change
-        return oi_pct_change
-    """
-    return OI4H_CACHE.get(base_symbol, None)
-
-
-# ================== COIN TYPE FACTOR ==================
-
-def get_coin_class(base: str) -> str:
-    """
-    Classify base symbols into BLUE / LEGACY / MID / MEME / OTHER.
-    """
-    b = (base or "").upper()
-    if b in {"BTC", "SOL"}:
-        return "BLUE"
-    if b in {"ZEC", "DASH", "ZEN"}:
-        return "LEGACY"
-    if b in {"SUI", "SUPER"}:
-        return "MID"
-    if b in {"FARTCOIN", "PUMP"}:
-        return "MEME"
-    return "OTHER"
-
-
-# ================== TIME WINDOW (MELBOURNE) ==================
-
-def trading_time_ok() -> bool:
-    """
-    Allow email alerts only in the 'prime' window:
-      - Monday–Saturday
-      - 19:00–01:00 local Melbourne time
-
-    Note: local Sunday (weekday==6) is fully excluded,
-    including 00:00–01:00.
-    """
-    try:
-        now = datetime.now(MEL_TZ)
-        # weekday: Monday=0 ... Sunday=6
-        if now.weekday() == 6:  # Sunday
-            return False
-        hr = now.hour
-        # window that crosses midnight: hr >= 19 OR hr < 1
-        return (hr >= 19) or (hr < 1)
-    except Exception:
-        logging.exception("trading_time_ok failed; defaulting to allowed.")
-        return True
-
-
-def trading_mode() -> str:
-    """
-    Two modes (Melbourne time):
-      - CONSERVATIVE: 19:00–22:00
-      - AGGRESSIVE:   22:00–01:00
-      - OFF: outside 19:00–01:00 (used only for /diag, not for filter)
-    """
-    try:
-        now = datetime.now(MEL_TZ)
-        hr = now.hour
-        if 19 <= hr < 22:
-            return "CONSERVATIVE"
-        if (22 <= hr) or (hr < 1):
-            return "AGGRESSIVE"
-        return "OFF"
-    except Exception:
-        logging.exception("trading_mode failed; defaulting to AGGRESSIVE.")
-        return "AGGRESSIVE"
 
 
 # ================== PRIORITIES ==================
@@ -479,9 +251,8 @@ def load_best():
 def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, MarketVol]):
     """
     Build P1, P2, P3 lists.
-    Each row: [SYM, FUSD, SUSD, %24H, %4H, %1H, %15M, LASTPRICE, MKTSYM]
-      - MKTSYM is the futures (swap) symbol if exists, else spot symbol.
-      - LASTPRICE is internal, not shown in the table.
+    Each row: [SYM, FUSD, SUSD, %24H, %4H, %1H, LASTPRICE]
+      - LASTPRICE is internal, not shown in table.
     """
     p1: List[List] = []
     p2: List[List] = []
@@ -498,14 +269,10 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
         spot_usd = usd_notional(s)
         if fut_usd >= P1_FUT_MIN and spot_usd >= P1_SPOT_MIN:
             pct24 = pct_change_24h(s, f)
-            symbol_for_pct = f.symbol
-            pct4 = compute_pct_for_symbol_1h(symbol_for_pct, 4)
-            pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1)
-            pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15)
+            pct4 = compute_pct_for_symbol(f.symbol, 4)
+            pct1 = compute_pct_for_symbol(f.symbol, 1)
             last_price = f.last or s.last or 0.0
-            p1.append(
-                [base, fut_usd, spot_usd, pct24, pct4, pct1, pct15, last_price, symbol_for_pct]
-            )
+            p1.append([base, fut_usd, spot_usd, pct24, pct4, pct1, last_price])
 
     p1.sort(key=lambda x: x[1], reverse=True)
     p1 = p1[:TOP_N_P1]
@@ -520,20 +287,16 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
             s = best_spot.get(base)
             spot_usd = usd_notional(s) if s else 0.0
             pct24 = pct_change_24h(s, f)
-            symbol_for_pct = f.symbol
-            pct4 = compute_pct_for_symbol_1h(symbol_for_pct, 4)
-            pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1)
-            pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15)
+            pct4 = compute_pct_for_symbol(f.symbol, 4)
+            pct1 = compute_pct_for_symbol(f.symbol, 1)
             last_price = f.last or (s.last if s else 0.0)
-            p2.append(
-                [base, fut_usd, spot_usd, pct24, pct4, pct1, pct15, last_price, symbol_for_pct]
-            )
+            p2.append([base, fut_usd, spot_usd, pct24, pct4, pct1, last_price])
 
     p2.sort(key=lambda x: x[1], reverse=True)
     p2 = p2[:TOP_N_P2]
     used |= {r[0] for r in p2}
 
-    # ---- P3: pinned + others with Spot≥3M ----
+    # ---- P3: pinned + others with Spot≥3M (pinned only in P3) ----
     tmp: Dict[str, List] = {}
 
     # pinned first
@@ -546,21 +309,10 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
         spot_usd = usd_notional(s) if s else 0.0
         pct24 = pct_change_24h(s, f)
         symbol_for_pct = f.symbol if f else (s.symbol if s else "")
-        pct4 = compute_pct_for_symbol_1h(symbol_for_pct, 4) if symbol_for_pct else 0.0
-        pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1) if symbol_for_pct else 0.0
-        pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15) if symbol_for_pct else 0.0
+        pct4 = compute_pct_for_symbol(symbol_for_pct, 4) if symbol_for_pct else 0.0
+        pct1 = compute_pct_for_symbol(symbol_for_pct, 1) if symbol_for_pct else 0.0
         last_price = (f.last if f else (s.last if s else 0.0))
-        tmp[base] = [
-            base,
-            fut_usd,
-            spot_usd,
-            pct24,
-            pct4,
-            pct1,
-            pct15,
-            last_price,
-            symbol_for_pct,
-        ]
+        tmp[base] = [base, fut_usd, spot_usd, pct24, pct4, pct1, last_price]
 
     # non-pinned, not used, Spot≥3M
     for base, s in best_spot.items():
@@ -572,21 +324,10 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
             fut_usd = usd_notional(f) if f else 0.0
             pct24 = pct_change_24h(s, f)
             symbol_for_pct = f.symbol if f else s.symbol
-            pct4 = compute_pct_for_symbol_1h(symbol_for_pct, 4)
-            pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1)
-            pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15)
+            pct4 = compute_pct_for_symbol(symbol_for_pct, 4)
+            pct1 = compute_pct_for_symbol(symbol_for_pct, 1)
             last_price = (f.last if f else s.last)
-            tmp[base] = [
-                base,
-                fut_usd,
-                spot_usd,
-                pct24,
-                pct4,
-                pct1,
-                pct15,
-                last_price,
-                symbol_for_pct,
-            ]
+            tmp[base] = [base, fut_usd, spot_usd, pct24, pct4, pct1, last_price]
 
     all_rows = list(tmp.values())
     pinned_rows = [r for r in all_rows if r[0] in PINNED_SET]
@@ -604,35 +345,23 @@ def build_priorities(best_spot: Dict[str, MarketVol], best_fut: Dict[str, Market
 def score_long(row: List) -> float:
     """
     Long (BUY) score based on:
-    - Positive 4h, 1h, 15m momentum
+    - Positive 24h, 4h, 1h momentum
     - Futures liquidity
-    - Coin type factor (BLUE gets boost, MEME gets penalty)
-    Weights: 1h > 4h > 15m
     """
-    base = row[0]
-    _, fut_usd, _, pct24, pct4, pct1, pct15, _, _ = row
+    _, fut_usd, _, pct24, pct4, pct1, _ = row
     score = 0.0
 
-    # Weighted positive momentum
-    if pct1 > 0:
-        score += 0.5 * pct1
+    if pct24 > 0:
+        score += min(pct24 / 5.0, 3.0)
     if pct4 > 0:
-        score += 0.3 * pct4
-    if pct15 > 0:
-        score += 0.2 * pct15
+        score += min(pct4 / 2.0, 3.0)
+    if pct1 > 0:
+        score += min(pct1 / 1.0, 2.0)
 
-    # Volume bonus
     if fut_usd > 10_000_000:
-        score += 5.0
-    elif fut_usd > 5_000_000:
         score += 2.0
-
-    # Coin type factor
-    ctype = get_coin_class(base)
-    if ctype == "BLUE":
-        score *= 1.2
-    elif ctype == "MEME":
-        score *= 0.6
+    elif fut_usd > 5_000_000:
+        score += 1.0
 
     return max(score, 0.0)
 
@@ -640,110 +369,118 @@ def score_long(row: List) -> float:
 def score_short(row: List) -> float:
     """
     Short (SELL) score based on:
-    - Negative 4h, 1h, 15m momentum
+    - Negative 24h, 4h, 1h momentum
     - Futures liquidity
-    - Coin type factor
     """
-    base = row[0]
-    _, fut_usd, _, pct24, pct4, pct1, pct15, _, _ = row
+    _, fut_usd, _, pct24, pct4, pct1, _ = row
     score = 0.0
 
-    # Weighted downside momentum
-    if pct1 < 0:
-        score += 0.5 * abs(pct1)
+    if pct24 < 0:
+        score += min(abs(pct24) / 5.0, 3.0)
     if pct4 < 0:
-        score += 0.3 * abs(pct4)
-    if pct15 < 0:
-        score += 0.2 * abs(pct15)
+        score += min(abs(pct4) / 2.0, 3.0)
+    if pct1 < 0:
+        score += min(abs(pct1) / 1.0, 2.0)
 
-    # Volume bonus
     if fut_usd > 10_000_000:
-        score += 5.0
-    elif fut_usd > 5_000_000:
         score += 2.0
-
-    # Coin type factor
-    ctype = get_coin_class(base)
-    if ctype == "BLUE":
-        score *= 1.2
-    elif ctype == "MEME":
-        score *= 0.6
+    elif fut_usd > 5_000_000:
+        score += 1.0
 
     return max(score, 0.0)
 
 
-def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]) -> List[Tuple]:
+def classify_row(row: List) -> Tuple[bool, bool]:
     """
-    Score BUY/SELL and return ONLY TOP 2 recommendations.
-    Uses 24h trend to avoid conflict with very strong days.
-    Assumes rows already passed alert filters.
+    Decide if a row is a LONG or SHORT candidate based on 24h, 4h, 1h.
+
+    - Basic thresholds:
+        LONG: 1h >= +2 and 4h >= 0
+        SHORT: 1h <= -2 and 4h <= 0
+    - 24h bias:
+        If 24h > +5 → only LONG allowed
+        If 24h < -5 → only SHORT allowed
+    - If both would be allowed → tie-break using 24h then 1h.
     """
+    _, _, _, pct24, pct4, pct1, _ = row
+    long_ok = False
+    short_ok = False
+
+    # 24h bias override
+    if pct24 > 5.0:
+        long_ok = True
+        short_ok = False
+    elif pct24 < -5.0:
+        short_ok = True
+        long_ok = False
+    else:
+        # Normal 1h / 4h rules
+        if pct1 >= 2.0 and pct4 >= 0.0:
+            long_ok = True
+        if pct1 <= -2.0 and pct4 <= 0.0:
+            short_ok = True
+
+    # If still both, resolve conflict
+    if long_ok and short_ok:
+        if pct24 > 0:
+            short_ok = False
+        elif pct24 < 0:
+            long_ok = False
+        else:
+            if pct1 >= 0:
+                short_ok = False
+            else:
+                long_ok = False
+
+    return long_ok, short_ok
+
+
+def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]):
+    """
+    Return TOP 2 trades overall (BUY or SELL).
+    Uses classify_row() to decide LONG/SHORT candidates and score_long/score_short for ranking.
+
+    Returns list of up to 2 items:
+        [(side, sym, entry, exit, sl, score), ...]
+    """
+
     rows = p1 + p2 + p3
-    scored: List[Tuple[str, str, float, float, float, float]] = []
+    candidates: List[Tuple[str, str, float, float, float, float]] = []
 
     for r in rows:
-        sym, _, _, pct24, pct4, pct1, pct15, last_price, _ = r
+        sym, _, _, pct24, pct4, pct1, last_price = r
         if not last_price or last_price <= 0:
             continue
 
-        long_s = score_long(r)
-        short_s = score_short(r)
+        long_ok, short_ok = classify_row(r)
 
-        # 24h bias for recommendations (same idea)
-        if pct24 > TREND_LONG_THRESHOLD:
-            short_s = 0.0
-        elif pct24 < TREND_SHORT_THRESHOLD:
-            long_s = 0.0
+        if long_ok:
+            score = score_long(r)
+            if score > 0:
+                entry = last_price
+                sl = entry * 0.94   # 6% SL
+                tp = entry * 1.12   # 12% TP
+                candidates.append(("BUY", sym, entry, tp, sl, score))
 
-        side: Optional[str] = None
-        score: float = 0.0
+        if short_ok:
+            score = score_short(r)
+            if score > 0:
+                entry = last_price
+                sl = entry * 1.06   # 6% SL
+                tp = entry * 0.91   # 9% TP
+                candidates.append(("SELL", sym, entry, tp, sl, score))
 
-        if long_s > 0 and short_s > 0:
-            if pct24 > 0:
-                side = "BUY"
-                score = long_s
-            elif pct24 < 0:
-                side = "SELL"
-                score = short_s
-            else:
-                if long_s >= short_s:
-                    side = "BUY"
-                    score = long_s
-                else:
-                    side = "SELL"
-                    score = short_s
-        elif long_s > 0:
-            side = "BUY"
-            score = long_s
-        elif short_s > 0:
-            side = "SELL"
-            score = short_s
-
-        if side is None:
-            continue
-
-        entry = last_price
-        if side == "BUY":
-            sl = entry * 0.96   # 4% SL
-            tp = entry * 1.08   # 8% TP  (R/R ~ 2)
-        else:
-            sl = entry * 1.04
-            tp = entry * 0.94   # 6% TP
-
-        scored.append((side, sym, entry, tp, sl, score))
-
-    scored.sort(key=lambda x: x[5], reverse=True)
-    return scored[:2]
+    candidates.sort(key=lambda x: x[5], reverse=True)
+    return candidates[:2]  # top 2 recommendations
 
 
 def format_recommended_trades(recs: List[Tuple]) -> str:
     if not recs:
         return "_No strong recommendations right now._"
-
-    lines = ["*Top 2 Recommendations:*"]
-    for side, sym, entry, exit_price, sl, score in recs:
+    lines = ["*Top Recommendations:*"]
+    for side, sym, entry, exit_px, sl, score in recs:
         lines.append(
-            f"{side} {sym} — Entry {entry:.6g} — Exit {exit_price:.6g} — SL {sl:.6g} (score {score:.1f})"
+            f"{side} {sym} — Entry {entry:.6g} — Exit {exit_px:.6g} — SL {sl:.6g} (score {score:.1f})"
         )
     return "\n".join(lines)
 
@@ -761,34 +498,23 @@ def fmt_table(rows: List[List], title: str) -> str:
             pct_with_emoji(r[3]),
             pct_with_emoji(r[4]),
             pct_with_emoji(r[5]),
-            pct_with_emoji(r[6]),
         ]
         for r in rows
     ]
     return (
         f"*{title}*:\n"
         "```\n"
-        + tabulate(
-            pretty,
-            headers=["SYM", "F", "S", "%24H", "%4H", "%1H", "%15M"],
-            tablefmt="github",
-        )
+        + tabulate(pretty, headers=["SYM", "F", "S", "%24H", "%4H", "%1H"], tablefmt="github")
         + "\n```\n"
     )
 
 
-def fmt_single(sym: str, fusd: float, susd: float,
-               p24: float, p4: float, p1: float, p15: float) -> str:
-    row = [[sym,
-            m_dollars(fusd),
-            m_dollars(susd),
-            pct_with_emoji(p24),
-            pct_with_emoji(p4),
-            pct_with_emoji(p1),
-            pct_with_emoji(p15)]]
+def fmt_single(sym: str, fusd: float, susd: float, p24: float, p4: float, p1: float) -> str:
+    row = [[sym, m_dollars(fusd), m_dollars(susd),
+            pct_with_emoji(p24), pct_with_emoji(p4), pct_with_emoji(p1)]]
     return (
         "```\n"
-        + tabulate(row, headers=["SYM", "F", "S", "%24H", "%4H", "%1H", "%15M"], tablefmt="github")
+        + tabulate(row, headers=["SYM", "F", "S", "%24H", "%4H", "%1H"], tablefmt="github")
         + "\n```"
     )
 
@@ -826,166 +552,27 @@ def send_email(subject: str, body: str) -> bool:
         return False
 
 
-def email_quota_ok() -> bool:
-    """No global quota now; always True (we rely on per-symbol cooldown + signature)."""
-    return True
+def melbourne_ok() -> bool:
+    """
+    Return True only if local time is between 12:30–01:00 in Melbourne,
+    and it is NOT Sunday (local Melbourne date).
+    """
+    try:
+        now_mel = datetime.now(ZoneInfo("Australia/Melbourne"))
+        dow = now_mel.weekday()  # Monday=0 ... Sunday=6
+        if dow == 6:  # Sunday
+            return False
 
+        h = now_mel.hour
+        m = now_mel.minute
 
-def record_email():
-    EMAIL_SEND_LOG.append(time.time())
+        after_1230 = (h > 12) or (h == 12 and m >= 30)
+        before_1am = h < 1
 
-
-def should_alert(priority: str, symbol: str, side: str) -> bool:
-    """Per (priority,side,symbol) cool-down."""
-    now = time.time()
-    key = (f"{priority}_{side}", symbol)
-    last = ALERT_SENT_CACHE.get(key, 0.0)
-    if now - last >= ALERT_THROTTLE_SEC:
-        ALERT_SENT_CACHE[key] = now
+        return after_1230 or before_1am
+    except Exception:
+        logging.exception("Melbourne time failed; defaulting to allowed.")
         return True
-    return False
-
-
-# ================== SIGNAL DETECTION ==================
-
-def detect_signals(p1: List[List], p2: List[List], p3: List[List]):
-    """
-    Detect BUY/SELL signals based on:
-      - 4h EMA trend (hard)
-      - 1h % change (hard; thresholds depend on mode)
-      - 24h bias filter
-      - optional OI filter (currently inactive / stub)
-      - mutual exclusivity per symbol
-
-    15m is NOT used as a hard condition here.
-
-    Returns:
-      {
-        "P1": {"BUY": set(...), "SELL": set(...)},
-        "P2": {...},
-        "P3": {...}
-      }
-    """
-    signals = {
-        "P1": {"BUY": set(), "SELL": set()},
-        "P2": {"BUY": set(), "SELL": set()},
-        "P3": {"BUY": set(), "SELL": set()},
-    }
-
-    mode = trading_mode()
-    buy_thr = BUY_PCT_1H_MIN_BASE
-    sell_thr = SELL_PCT_1H_MAX_BASE
-    if mode == "AGGRESSIVE":
-        buy_thr *= AGGRESSIVE_MULTIPLIER
-        sell_thr *= AGGRESSIVE_MULTIPLIER
-
-    priority_map = [("P1", p1), ("P2", p2), ("P3", p3)]
-
-    for label, rows in priority_map:
-        for r in rows:
-            sym, _, _, pct24, pct4, pct1, pct15, last_price, mkt_symbol = r
-
-            buy_ok = False
-            sell_ok = False
-
-            # 4h EMA trend filter + 1h hard condition (threshold depends on mode)
-            ema_4h = get_ema_4h_200(mkt_symbol)
-            if ema_4h > 0 and last_price > 0:
-                if last_price > ema_4h and pct1 >= buy_thr:
-                    buy_ok = True
-                elif last_price < ema_4h and pct1 <= sell_thr:
-                    sell_ok = True
-            else:
-                # Fallback if EMA missing: use 1h only (rare)
-                if pct1 >= buy_thr:
-                    buy_ok = True
-                elif pct1 <= sell_thr:
-                    sell_ok = True
-
-            # 24h bias filter
-            if pct24 > TREND_LONG_THRESHOLD:
-                sell_ok = False
-            elif pct24 < TREND_SHORT_THRESHOLD:
-                buy_ok = False
-
-            # Optional OI filter (currently no effect)
-            oi_change_4h = get_oi_change_4h_from_coinalyze(sym)
-            if oi_change_4h is not None and oi_change_4h <= 0:
-                # Example if you want to require positive OI:
-                # buy_ok = False
-                # sell_ok = False
-                pass
-
-            # Mutual exclusivity resolution if both True
-            if buy_ok and sell_ok:
-                if pct24 > 0:
-                    sell_ok = False
-                elif pct24 < 0:
-                    buy_ok = False
-                else:
-                    if pct1 >= 0:
-                        sell_ok = False
-                    else:
-                        buy_ok = False
-
-            if buy_ok:
-                signals[label]["BUY"].add(sym)
-            if sell_ok:
-                signals[label]["SELL"].add(sym)
-
-    return signals
-
-
-def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: str) -> Optional[str]:
-    """
-    Use detect_signals() to find coins that meet alert rules.
-    Then apply:
-      - per-symbol cooldown (should_alert)
-      - global signature change (only send if BUY/SELL sets changed)
-    """
-    global LAST_SIGNAL_SIGNATURE
-
-    overall_buy: set[str] = set()
-    overall_sell: set[str] = set()
-    lines: List[str] = []
-
-    signals = detect_signals(p1, p2, p3)
-    priority_map = [("P1", p1), ("P2", p2), ("P3", p3)]
-
-    for label, rows in priority_map:
-        buy_hits: List[str] = []
-        sell_hits: List[str] = []
-
-        for sym in signals[label]["BUY"]:
-            if should_alert(label, sym, "BUY"):
-                buy_hits.append(sym)
-        for sym in signals[label]["SELL"]:
-            if should_alert(label, sym, "SELL"):
-                sell_hits.append(sym)
-
-        if buy_hits or sell_hits:
-            parts = []
-            if buy_hits:
-                overall_buy.update(buy_hits)
-                parts.append("BUY: " + ", ".join(sorted(buy_hits)))
-            if sell_hits:
-                overall_sell.update(sell_hits)
-                parts.append("SELL: " + ", ".join(sorted(sell_hits)))
-            lines.append(f"{label}: " + " | ".join(parts))
-
-    if not lines:
-        return None
-
-    signature = (tuple(sorted(overall_buy)), tuple(sorted(overall_sell)))
-    if LAST_SIGNAL_SIGNATURE == signature:
-        return None
-    LAST_SIGNAL_SIGNATURE = signature
-
-    body = "Signals (4h EMA + 1h + 24h bias):\n\n" + "\n".join(lines)
-    if rec_text:
-        body += "\n\nRecommended trades:\n" + rec_text
-
-    return body
 
 
 # ================== TELEGRAM HANDLERS ==================
@@ -993,54 +580,31 @@ def scan_for_alerts(p1: List[List], p2: List[List], p3: List[List], rec_text: st
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Commands:\n"
-        "• /screen — show full P1, P2, P3 tables + (if any) recommended trades\n"
+        "• /screen — show P1, P2, P3 + recommendations\n"
         "• /notify_on /notify_off /notify\n"
-        "• /diag — show strategy settings\n"
+        "• /diag — short diagnostics\n"
         "• Type a symbol (e.g. PYTH) for its row"
     )
 
 
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /screen:
-    - Load P1/P2/P3
-    - ALWAYS show full tables (all rows that passed volume filters)
-    - Then compute signals
-    - Only if at least one symbol meets alert rules, show "Recommended trades" at the end.
-    """
     try:
         PCT4H_CACHE.clear()
         PCT1H_CACHE.clear()
-        PCT15M_CACHE.clear()
-        EMA4H_CACHE.clear()
-
         best_spot, best_fut, raw_spot, raw_fut = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
+
+        recs = pick_best_trades(p1, p2, p3)
+        rec_text = format_recommended_trades(recs)
 
         msg = (
             fmt_table(p1, "P1 (F≥5M & S≥0.5M — pinned excluded)")
             + fmt_table(p2, "P2 (F≥2M — pinned excluded)")
             + fmt_table(p3, "P3 (Pinned + S≥3M)")
             + f"tickers: spot={raw_spot}, fut={raw_fut}\n\n"
+            + "*Recommended trades:*\n"
+            + rec_text
         )
-
-        # Detect signals & build recommendations ONLY if there are signals
-        signals = detect_signals(p1, p2, p3)
-
-        def filter_rows(rows: List[List], label: str) -> List[List]:
-            active_syms = signals[label]["BUY"] | signals[label]["SELL"]
-            return [r for r in rows if r[0] in active_syms]
-
-        p1_sig = filter_rows(p1, "P1")
-        p2_sig = filter_rows(p2, "P2")
-        p3_sig = filter_rows(p3, "P3")
-
-        if p1_sig or p2_sig or p3_sig:
-            recs = pick_best_trades(p1_sig, p2_sig, p3_sig)
-            if recs:
-                rec_text = format_recommended_trades(recs)
-                msg += "*Recommended trades:*\n" + rec_text
-
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logging.exception("screen error")
@@ -1048,25 +612,11 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mode = trading_mode()
     msg = (
         f"*Diag*\n"
-        f"- Mode now: {mode}\n"
-        f"- Time windows (Melbourne):\n"
-        f"  • Conservative: 19:00–22:00\n"
-        f"  • Aggressive:   22:00–01:00\n"
-        f"  • Email alerts: Mon–Sat, 19:00–01:00 (no Sunday)\n"
-        f"- BUY base rule: 4h EMA up & 1h ≥ +{BUY_PCT_1H_MIN_BASE:.1f}% "
-        f"(looser in AGGRESSIVE ×{AGGRESSIVE_MULTIPLIER})\n"
-        f"- SELL base rule: 4h EMA down & 1h ≤ {SELL_PCT_1H_MAX_BASE:.1f}% "
-        f"(looser in AGGRESSIVE ×{AGGRESSIVE_MULTIPLIER})\n"
-        f"- 24h bias: > +{TREND_LONG_THRESHOLD:.0f}% → no SELL; "
-        f"< {TREND_SHORT_THRESHOLD:.0f}% → no BUY\n"
-        f"- 15m: only affects ranking (not hard filter)\n"
-        f"- EMA: 4h 200\n"
-        f"- OI: Coinalyze hook (currently inactive / stub)\n"
+        f"- time window: 12:30–01:00 Melbourne (no Sundays)\n"
         f"- interval: {CHECK_INTERVAL_MIN} min\n"
-        f"- email alerts: {'ON' if NOTIFY_ON else 'OFF'}"
+        f"- email: {'ON' if NOTIFY_ON else 'OFF'} → {EMAIL_TO or 'n/a'}"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -1103,14 +653,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if fusd == 0.0 and susd == 0.0:
             await update.message.reply_text("Symbol not found.")
             return
-
         pct24 = pct_change_24h(s, f)
         symbol_for_pct = f.symbol if f else (s.symbol if s else "")
-        pct4 = compute_pct_for_symbol_1h(symbol_for_pct, 4) if symbol_for_pct else 0.0
-        pct1 = compute_pct_for_symbol_1h(symbol_for_pct, 1) if symbol_for_pct else 0.0
-        pct15 = compute_pct_for_symbol_15m(symbol_for_pct, 15) if symbol_for_pct else 0.0
-
-        msg = fmt_single(token, fusd, susd, pct24, pct4, pct1, pct15)
+        pct4 = compute_pct_for_symbol(symbol_for_pct, 4) if symbol_for_pct else 0.0
+        pct1 = compute_pct_for_symbol(symbol_for_pct, 1) if symbol_for_pct else 0.0
+        msg = fmt_single(token, fusd, susd, pct24, pct4, pct1)
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logging.exception("text_router error")
@@ -1120,46 +667,34 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== ALERT JOB ==================
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+    global LAST_EMAIL_TS
     try:
         if not NOTIFY_ON:
             return
+        if not melbourne_ok():
+            return
         if not email_config_ok():
             return
-        if not email_quota_ok():
-            return
-        # Only alert in Mon–Sat, 19:00–01:00 Melbourne
-        if not trading_time_ok():
+
+        now = time.time()
+        if now - LAST_EMAIL_TS < EMAIL_MIN_INTERVAL_SEC:
             return
 
         PCT4H_CACHE.clear()
         PCT1H_CACHE.clear()
-        PCT15M_CACHE.clear()
-        EMA4H_CACHE.clear()
 
         best_spot, best_fut, _, _ = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
+        recs = pick_best_trades(p1, p2, p3)
 
-        signals = detect_signals(p1, p2, p3)
-
-        def filter_rows(rows: List[List], label: str) -> List[List]:
-            active_syms = signals[label]["BUY"] | signals[label]["SELL"]
-            return [r for r in rows if r[0] in active_syms]
-
-        p1_sig = filter_rows(p1, "P1")
-        p2_sig = filter_rows(p2, "P2")
-        p3_sig = filter_rows(p3, "P3")
-
-        recs = pick_best_trades(p1_sig, p2_sig, p3_sig)
-        rec_text = format_recommended_trades(recs) if recs else ""
-
-        body = scan_for_alerts(p1, p2, p3, rec_text)
-        if not body:
+        if not recs:
             return
 
-        mode = trading_mode()
-        subj = f"Crypto Alert ({mode}) 4h EMA + 1h + 24h"
-        if send_email(subj, body):
-            record_email()
+        rec_text = format_recommended_trades(recs)
+        body = "Recommended trades:\n\n" + rec_text
+
+        if send_email("Crypto Alert: Momentum Signals", body):
+            LAST_EMAIL_TS = now
     except Exception as e:
         logging.exception("alert_job error: %s", e)
 
