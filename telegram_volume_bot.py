@@ -6,7 +6,7 @@ Features:
 - Shows 3 priorities of coins (P1, P2, P3) using CoinEx volumes
 - Table: SYM | F | S | %24H | %4H | %1H
 - Email alerts when there are strong BUY/SELL signals (based on 24h, 4h, 1h momentum)
-- Additional alert: coins with F volume > 1M and 24h change > +10%
+- Additional alert: coins with F volume > 1M and 24h change > +10% (24h movers)
 - Email alerts only 12:30–01:00 (Australia/Melbourne), no Sundays
 - Max 1 email per 15 minutes
 - No email if the set of symbols is the same as the last email
@@ -738,7 +738,13 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
         body = "\n\n".join(parts)
 
-        if send_email("Crypto Alert: Signals & 24h Movers", body):
+        # Subject logic: if only movers, make it clear
+        if big_movers and not recs:
+            subject = "Crypto Alert: 24h +10% Movers"
+        else:
+            subject = "Crypto Alert: Signals & 24h Movers"
+
+        if send_email(subject, body):
             LAST_EMAIL_TS = now
             LAST_EMAIL_SYMBOLS = email_symbols
     except Exception as e:
