@@ -6,8 +6,10 @@ Features:
 - Shows 3 priorities of coins (P1, P2, P3) using CoinEx volumes
 - Table: SYM | F | S | %24H | %4H | %1H
 - Email alerts when there are strong BUY/SELL signals (based on 24h, 4h, 1h momentum)
+- Additional alert: coins with F volume > 1M and 24h change > +10%
 - Email alerts only 12:30–01:00 (Australia/Melbourne), no Sundays
-- Max 1 email per 15 minutes (no daily limit)
+- Max 1 email per 15 minutes
+- No email if the set of symbols is the same as the last email
 - Commands: /start /screen /notify_on /notify_off /notify /diag
 - Typing a symbol (e.g. PYTH) gives its row
 """
@@ -21,7 +23,7 @@ import ssl
 import smtplib
 from email.message import EmailMessage
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -74,6 +76,7 @@ CHECK_INTERVAL_MIN = 5  # run every 5 minutes
 # One email every 15 minutes (no daily limit)
 EMAIL_MIN_INTERVAL_SEC = 15 * 60
 LAST_EMAIL_TS: float = 0.0
+LAST_EMAIL_SYMBOLS: Set[str] = set()  # all symbols included in the last alert email
 
 # Globals
 LAST_ERROR: Optional[str] = None
@@ -406,7 +409,6 @@ def classify_row(row: List) -> Tuple[bool, bool]:
     long_ok = False
     short_ok = False
 
-    # 24h bias override
     if pct24 > 5.0:
         long_ok = True
         short_ok = False
@@ -414,13 +416,11 @@ def classify_row(row: List) -> Tuple[bool, bool]:
         short_ok = True
         long_ok = False
     else:
-        # Normal 1h / 4h rules
         if pct1 >= 2.0 and pct4 >= 0.0:
             long_ok = True
         if pct1 <= -2.0 and pct4 <= 0.0:
             short_ok = True
 
-    # If still both, resolve conflict
     if long_ok and short_ok:
         if pct24 > 0:
             short_ok = False
@@ -437,13 +437,12 @@ def classify_row(row: List) -> Tuple[bool, bool]:
 
 def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]):
     """
-    Return TOP 2 trades overall (BUY or SELL).
+    Return TOP 3 trades overall (BUY or SELL).
     Uses classify_row() to decide LONG/SHORT candidates and score_long/score_short for ranking.
 
-    Returns list of up to 2 items:
+    Returns list of up to 3 items:
         [(side, sym, entry, exit, sl, score), ...]
     """
-
     rows = p1 + p2 + p3
     candidates: List[Tuple[str, str, float, float, float, float]] = []
 
@@ -471,18 +470,37 @@ def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]):
                 candidates.append(("SELL", sym, entry, tp, sl, score))
 
     candidates.sort(key=lambda x: x[5], reverse=True)
-    return candidates[:2]  # top 2 recommendations
+    return candidates[:3]  # top 3 recommendations
 
 
 def format_recommended_trades(recs: List[Tuple]) -> str:
     if not recs:
         return "_No strong recommendations right now._"
-    lines = ["*Top Recommendations:*"]
+    lines = ["*Top 3 Recommendations:*"]
     for side, sym, entry, exit_px, sl, score in recs:
         lines.append(
             f"{side} {sym} — Entry {entry:.6g} — Exit {exit_px:.6g} — SL {sl:.6g} (score {score:.1f})"
         )
     return "\n".join(lines)
+
+
+def scan_big_movers(best_spot: Dict[str, MarketVol], best_fut: Dict[str, MarketVol]) -> List[str]:
+    """
+    Find coins with:
+      - futures notional volume > 1M (24h)
+      - 24h % change > +10%
+    Return list of BASE symbols.
+    """
+    movers: List[str] = []
+    for base, f in best_fut.items():
+        fut_usd = usd_notional(f)
+        if fut_usd < 1_000_000:
+            continue
+        s = best_spot.get(base)
+        pct24 = pct_change_24h(s, f)
+        if pct24 > 10.0:
+            movers.append(base)
+    return sorted(set(movers))
 
 
 # ================== FORMATTING ==================
@@ -597,6 +615,11 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         recs = pick_best_trades(p1, p2, p3)
         rec_text = format_recommended_trades(recs)
 
+        big_movers = scan_big_movers(best_spot, best_fut)
+        movers_text = ""
+        if big_movers:
+            movers_text = "\n\n*24h +10% movers (F vol >1M):*\n" + ", ".join(big_movers)
+
         msg = (
             fmt_table(p1, "P1 (F≥5M & S≥0.5M — pinned excluded)")
             + fmt_table(p2, "P2 (F≥2M — pinned excluded)")
@@ -604,6 +627,7 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + f"tickers: spot={raw_spot}, fut={raw_fut}\n\n"
             + "*Recommended trades:*\n"
             + rec_text
+            + movers_text
         )
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -667,7 +691,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== ALERT JOB ==================
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
-    global LAST_EMAIL_TS
+    global LAST_EMAIL_TS, LAST_EMAIL_SYMBOLS
     try:
         if not NOTIFY_ON:
             return
@@ -685,16 +709,38 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
         best_spot, best_fut, _, _ = await asyncio.to_thread(load_best)
         p1, p2, p3 = await asyncio.to_thread(build_priorities, best_spot, best_fut)
-        recs = pick_best_trades(p1, p2, p3)
 
-        if not recs:
+        recs = pick_best_trades(p1, p2, p3)
+        big_movers = scan_big_movers(best_spot, best_fut)
+
+        # If nothing to say, skip email
+        if not recs and not big_movers:
             return
 
-        rec_text = format_recommended_trades(recs)
-        body = "Recommended trades:\n\n" + rec_text
+        # Build symbol set for this email (recommendations + big movers)
+        email_symbols: Set[str] = set()
+        for side, sym, entry, exit_px, sl, score in recs:
+            email_symbols.add(sym)
+        for sym in big_movers:
+            email_symbols.add(sym)
 
-        if send_email("Crypto Alert: Momentum Signals", body):
+        # If symbols are the same as last time, don't send
+        if email_symbols and email_symbols == LAST_EMAIL_SYMBOLS:
+            return
+
+        parts = []
+        if recs:
+            parts.append(format_recommended_trades(recs))
+        if big_movers:
+            parts.append(
+                "24h +10% movers (F vol >1M):\n" + ", ".join(big_movers)
+            )
+
+        body = "\n\n".join(parts)
+
+        if send_email("Crypto Alert: Signals & 24h Movers", body):
             LAST_EMAIL_TS = now
+            LAST_EMAIL_SYMBOLS = email_symbols
     except Exception as e:
         logging.exception("alert_job error: %s", e)
 
