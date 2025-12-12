@@ -9,7 +9,9 @@ Features:
 - Additional alert: coins with F volume > 1M and 24h change > +10% (24h movers)
 - Email alerts only 12:30–01:00 (Australia/Melbourne), no Sundays
 - Max 1 email per 15 minutes
-- No email if the set of symbols is the same as the last email
+- NO EMAIL if:
+    * the set of (side, symbol) recommendations is the same as last email AND
+    * the set of 24h movers is the same as last email
 - Commands: /start /screen /notify_on /notify_off /notify /diag
 - Typing a symbol (e.g. PYTH) gives its row
 """
@@ -73,10 +75,11 @@ EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 # Scheduler / alerts
 CHECK_INTERVAL_MIN = 5  # run every 5 minutes
 
-# One email every 15 minutes (no daily limit)
+# One email every 15 minutes (no daily cap)
 EMAIL_MIN_INTERVAL_SEC = 15 * 60
 LAST_EMAIL_TS: float = 0.0
-LAST_EMAIL_SYMBOLS: Set[str] = set()  # all symbols included in the last alert email
+LAST_RECS_KEYS: Set[Tuple[str, str]] = set()   # (side, symbol) of recommendations
+LAST_MOVERS: Set[str] = set()                  # 24h +10% movers (symbols)
 
 # Globals
 LAST_ERROR: Optional[str] = None
@@ -84,6 +87,9 @@ NOTIFY_ON: bool = EMAIL_ENABLED_DEFAULT
 
 PCT4H_CACHE: Dict[Tuple[str, str], float] = {}
 PCT1H_CACHE: Dict[Tuple[str, str], float] = {}
+
+ALERT_SENT_CACHE: Dict[Tuple[str, str], float] = {}  # not used now but kept for compatibility
+EMAIL_SEND_LOG: List[float] = []  # not used for limits now but left in case you want back
 
 # ================== DATA STRUCTURES ==================
 
@@ -691,7 +697,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== ALERT JOB ==================
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
-    global LAST_EMAIL_TS, LAST_EMAIL_SYMBOLS
+    global LAST_EMAIL_TS, LAST_RECS_KEYS, LAST_MOVERS
     try:
         if not NOTIFY_ON:
             return
@@ -701,6 +707,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             return
 
         now = time.time()
+        # 1 email max per 15 minutes
         if now - LAST_EMAIL_TS < EMAIL_MIN_INTERVAL_SEC:
             return
 
@@ -717,15 +724,12 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not recs and not big_movers:
             return
 
-        # Build symbol set for this email (recommendations + big movers)
-        email_symbols: Set[str] = set()
-        for side, sym, entry, exit_px, sl, score in recs:
-            email_symbols.add(sym)
-        for sym in big_movers:
-            email_symbols.add(sym)
+        # Build keys for recommendations and movers separately
+        rec_keys: Set[Tuple[str, str]] = {(side, sym) for side, sym, _, _, _, _ in recs}
+        movers_set: Set[str] = set(big_movers)
 
-        # If symbols are the same as last time, don't send
-        if email_symbols and email_symbols == LAST_EMAIL_SYMBOLS:
+        # If both recs and movers sets are identical to last time, skip
+        if rec_keys == LAST_RECS_KEYS and movers_set == LAST_MOVERS:
             return
 
         parts = []
@@ -733,12 +737,12 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             parts.append(format_recommended_trades(recs))
         if big_movers:
             parts.append(
-                "24h +10% movers (F vol >1M):\n" + ", ".join(big_movers)
+                "24h +10% movers (F vol >1M):\n" + ", ".join(sorted(movers_set))
             )
 
         body = "\n\n".join(parts)
 
-        # Subject logic: if only movers, make it clear
+        # Subject logic
         if big_movers and not recs:
             subject = "Crypto Alert: 24h +10% Movers"
         else:
@@ -746,7 +750,8 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
         if send_email(subject, body):
             LAST_EMAIL_TS = now
-            LAST_EMAIL_SYMBOLS = email_symbols
+            LAST_RECS_KEYS = rec_keys
+            LAST_MOVERS = movers_set
     except Exception as e:
         logging.exception("alert_job error: %s", e)
 
