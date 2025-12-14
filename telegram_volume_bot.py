@@ -2,34 +2,22 @@
 """
 PulseFutures — Telegram Futures Signals Bot + Stripe Paywall (Single Service, Render-friendly)
 
-✅ What’s included:
-- Telegram bot (polling) in a background thread
-- FastAPI server (main process) for Stripe paywall:
-    - GET  /health
-    - GET  /pay?plan=pro&tg_user_id=123  -> Stripe Checkout redirect
-    - POST /stripe/webhook              -> activates plan in SQLite
-- Futures-only (CoinEx swap via CCXT)
-- Universe Filter (by futures notional volume)
-- /screen redesigned: Market Leaders + Movers (+ Setups for Pro)
-- Confidence Score + Multi-TP for Conf >= 75
-- Trading Window Guard (default London+NY)
-- Risk Ledger:
-    /equity, /limits, /risk, /open, /closepnl, /status
-- Optional email alerts with anti-duplicate (RAM-based, can be DB-backed later)
+Key Fixes for Render + Python 3.11:
+- Bot runs inside a background thread WITH its own asyncio event loop
+- run_polling(stop_signals=None) to avoid signal-handler crash in non-main thread
 
-⚠️ This is not financial advice. No profit guarantees.
+Endpoints:
+- GET  /health
+- GET  /pay?plan=pro&tg_user_id=123  (Stripe Checkout redirect)
+- POST /stripe/webhook
 
-ENV required:
-- TELEGRAM_TOKEN
-- PUBLIC_BASE_URL                 e.g. https://pulsefutures.onrender.com
-- STRIPE_SECRET_KEY               sk_test_... or sk_live_...
-- STRIPE_WEBHOOK_SECRET           whsec_...
-- STRIPE_PRICE_PRO                price_...
-- STRIPE_PRICE_ELITE              price_...
+Telegram:
+- /start /help /screen /upgrade /diag /session
+- Pro-only: /equity /limits /risk /open /closepnl /status
 
-Optional email:
-- EMAIL_ENABLED=true/false
-- EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO
+Futures-only (CoinEx swap via CCXT), Universe Filter, Leaders+Movers, Pro setups, confidence+multiTP.
+
+Disclaimer: No financial advice. No profit guarantees.
 """
 
 import asyncio
@@ -94,7 +82,7 @@ LEADERS_TOP_N = 7
 MOVERS_TOP_N = 10
 SETUPS_TOP_N = 3
 
-# Multi-TP
+# Multi-TP threshold (confidence)
 CONF_MULTI_TP_MIN = 75
 
 # Trading Sessions in UTC
@@ -369,7 +357,6 @@ def trading_window_warning() -> Optional[str]:
         return "⚠️ Outside optimal trading window (London + New York)\nSignals may be limited.\n\n"
     return None
 
-
 # =========================================================
 # Exchange Helpers (Futures-only)
 # =========================================================
@@ -474,7 +461,6 @@ def compute_pct_for_symbol(symbol: str, hours: int) -> float:
         logging.exception("compute_pct_for_symbol failed for %s (%dh)", symbol, hours)
         PCT_CACHE[cache_key] = 0.0
         return 0.0
-
 
 # =========================================================
 # Universe / Leaders / Movers / Setups
@@ -881,8 +867,8 @@ async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = (
         "💳 Upgrade PulseFutures\n\n"
-        f"Pro ($39/mo): {PUBLIC_BASE_URL}/pay?plan=pro&tg_user_id={uid}\n"
-        f"Elite ($99/mo): {PUBLIC_BASE_URL}/pay?plan=elite&tg_user_id={uid}\n\n"
+        f"Pro:   {PUBLIC_BASE_URL}/pay?plan=pro&tg_user_id={uid}\n"
+        f"Elite: {PUBLIC_BASE_URL}/pay?plan=elite&tg_user_id={uid}\n\n"
         "After payment, come back and run /start or /screen."
     )
     await update.message.reply_text(msg)
@@ -919,7 +905,7 @@ async def session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Usage: /session both|london|ny|off")
 
-# ---------------- Pro-only commands ----------------
+# --- Pro-only ---
 
 async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, msg = require_pro(update)
@@ -1353,14 +1339,14 @@ def run_api_server():
 
 
 # =========================================================
-# Run BOT in background, API as main (Render-friendly)
+# Bot runner (Thread-safe for Py3.11)
 # =========================================================
 
 def run_bot():
-    import asyncio
+    # ✅ Create a dedicated event loop for this thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
@@ -1384,7 +1370,13 @@ def run_bot():
     if getattr(app, "job_queue", None):
         app.job_queue.run_repeating(alert_job, interval=CHECK_INTERVAL_MIN * 60, first=10)
 
-    app.run_polling(drop_pending_updates=True)
+    # ✅ IMPORTANT: disable stop_signals in non-main thread
+    app.run_polling(drop_pending_updates=True, stop_signals=None)
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
     if not TOKEN:
@@ -1395,11 +1387,11 @@ def main():
 
     db_init()
 
-    # ✅ BOT background
+    # ✅ Start Telegram bot in background thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
 
-    # ✅ API main
+    # ✅ Run API in main thread (Render-friendly)
     run_api_server()
 
 if __name__ == "__main__":
