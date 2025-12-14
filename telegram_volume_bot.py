@@ -12,10 +12,12 @@ PulseFutures — Futures-only Telegram crypto scanner + trade setups + risk tool
 - Email alerts optional (if EMAIL_* configured):
   - NO emails on Sundays (Melbourne time)
   - No duplicate emails (same set of symbols)
+  - Email includes per-setup Market Snapshot (F + 24/4/1h)
+  - Optional chart snapshots (inline + attach) if CHARTS_ENABLED=true
 - Risk tools + manual ledger:
   /equity /limits /status /risk /open /closepnl
-- Manual trades supported:
-  /risk BTC 1% 65000 64000  -> opens a MANUAL ledger position with a clear warning
+- Manual trades supported with warning:
+  /risk BTC 1% 65000 64000
 
 ENV:
 Required:
@@ -25,6 +27,8 @@ Render:
 Optional email:
 - EMAIL_ENABLED=true
 - EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO
+Optional charts:
+- CHARTS_ENABLED=true  (requires matplotlib in requirements)
 """
 
 import asyncio
@@ -56,6 +60,17 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+# Optional charts (matplotlib)
+CHARTS_ENABLED = os.environ.get("CHARTS_ENABLED", "false").lower() == "true"
+try:
+    if CHARTS_ENABLED:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+except Exception:
+    CHARTS_ENABLED = False
+
 
 # =========================================================
 # CONFIG
@@ -202,21 +217,10 @@ def db_init():
           opened_ts INTEGER,
           closed_ts INTEGER,
           close_result TEXT,
-          pnl_usd REAL
+          pnl_usd REAL,
+          origin TEXT                   -- BOT | MANUAL
         );
         """)
-
-        # Add origin column (BOT vs MANUAL) if missing (safe migration)
-        try:
-            conn.execute("ALTER TABLE signals ADD COLUMN origin TEXT;")
-        except Exception:
-            pass
-
-        # Default any NULL origin to BOT
-        try:
-            conn.execute("UPDATE signals SET origin='BOT' WHERE origin IS NULL;")
-        except Exception:
-            pass
 
         conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_signals_symbol_status_ts
@@ -238,6 +242,8 @@ def db_init():
         ON executions(ts DESC);
         """)
 
+        # Backfill
+        conn.execute("UPDATE signals SET origin='BOT' WHERE origin IS NULL;")
         conn.commit()
 
 def db_get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -538,6 +544,35 @@ def compute_pct(symbol: str, timeframe: str, bars: int) -> float:
 
 
 # =========================================================
+# Charts (Snapshot images)
+# =========================================================
+
+def fetch_ohlcv_for_chart(fut_symbol: str, timeframe: str = "1h", limit: int = 48) -> List[List]:
+    ex = build_exchange_swap()
+    ex.load_markets()
+    return ex.fetch_ohlcv(fut_symbol, timeframe=timeframe, limit=limit)
+
+def make_chart_png(fut_symbol: str, title: str, out_path: str, timeframe: str = "1h", limit: int = 48):
+    if not CHARTS_ENABLED:
+        return
+    candles = fetch_ohlcv_for_chart(fut_symbol, timeframe=timeframe, limit=limit)
+    if not candles:
+        return
+
+    xs = [c[0] for c in candles]
+    closes = [c[4] for c in candles]
+
+    # Simple, clean mini chart
+    plt.figure(figsize=(5.2, 2.2), dpi=160)
+    plt.plot(xs, closes, linewidth=1.2)
+    plt.title(title, fontsize=9)
+    plt.xticks([])
+    plt.tight_layout()
+    plt.savefig(out_path, bbox_inches="tight")
+    plt.close()
+
+
+# =========================================================
 # Universe / Leaders / Movers / Setups
 # =========================================================
 
@@ -756,9 +791,28 @@ def format_trade_setups(recs: List[Tuple]) -> str:
             )
     return "\n".join(lines).strip()
 
+def snapshot_for_symbol(universe: List[List], sym: str) -> Optional[str]:
+    # universe row: [BASE, fut_usd, pct24, pct4h, pct1h, pct15m, last_price, fut_symbol]
+    for r in universe:
+        if r[0] == sym:
+            _, fut_usd, pct24, pct4h, pct1h, *_ = r
+            bias = side_hint(pct4h, pct1h)
+            return (
+                f"Market Snapshot: F~{m_dollars(fut_usd)}M | "
+                f"24H {pct_with_emoji(pct24)} | 4H {pct_with_emoji(pct4h)} | 1H {pct_with_emoji(pct1h)} | "
+                f"{bias}"
+            )
+    return None
+
+def fut_symbol_for_base(universe: List[List], sym: str) -> Optional[str]:
+    for r in universe:
+        if r[0] == sym:
+            return r[7]
+    return None
+
 
 # =========================================================
-# Email helpers (optional)
+# Email helpers (optional) — supports inline charts
 # =========================================================
 
 def email_config_ok() -> bool:
@@ -768,7 +822,10 @@ def melbourne_is_sunday() -> bool:
     now = datetime.now(ZoneInfo("Australia/Melbourne"))
     return now.weekday() == 6  # Sunday
 
-def send_email(subject: str, body: str) -> bool:
+def send_email(subject: str, text_body: str, html_body: Optional[str] = None, inline_images: Optional[List[Tuple[str, str]]] = None) -> bool:
+    """
+    inline_images: list of (cid, filepath)
+    """
     if not email_config_ok():
         return False
     try:
@@ -776,7 +833,27 @@ def send_email(subject: str, body: str) -> bool:
         msg["Subject"] = subject
         msg["From"] = EMAIL_FROM
         msg["To"] = EMAIL_TO
-        msg.set_content(body)
+
+        msg.set_content(text_body)
+
+        if html_body:
+            msg.add_alternative(html_body, subtype="html")
+
+            # Attach inline images to the LAST part (html)
+            if inline_images:
+                for cid, path in inline_images:
+                    try:
+                        with open(path, "rb") as f:
+                            data = f.read()
+                        msg.get_payload()[-1].add_related(
+                            data,
+                            maintype="image",
+                            subtype="png",
+                            cid=f"<{cid}>",
+                            filename=os.path.basename(path),
+                        )
+                    except Exception:
+                        logging.exception("inline image attach failed")
 
         if EMAIL_PORT == 465:
             ctx = ssl.create_default_context()
@@ -812,6 +889,7 @@ What you get:
 • Trading Window Guard: warns when outside London/NY sessions
 • Risk Tools: equity, risk limits, position sizing
 • Manual Trade Ledger: you can also size ANY trade manually (with a warning)
+• Optional chart snapshots (if enabled)
 
 What this bot does NOT do:
 • It does NOT place trades for you (no auto-trading)
@@ -881,6 +959,7 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- leaders_top_n: `{LEADERS_TOP_N}` movers_top_n: `{MOVERS_TOP_N}` setups_top_n: `{SETUPS_TOP_N}`\n"
         f"- trigger: 1h>={TRIGGER_1H_PCT}%, confirm_15m_sign: `{CONFIRM_15M_SIGN}`\n"
         f"- email_configured: `{email_config_ok()}` notify_on=`{NOTIFY_ON}` sunday_block=`{melbourne_is_sunday()}`\n"
+        f"- charts_enabled: `{CHARTS_ENABLED}`\n"
         f"- last_error: `{LAST_ERROR or 'none'}`\n"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -1200,6 +1279,25 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"\n\n`tickers: fut={raw_fut}`"
 
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+        # Optional: send chart snapshots for setups
+        if CHARTS_ENABLED and recs:
+            for idx, (side, sym, entry, tp, sl, conf) in enumerate(recs, start=1):
+                fut_sym = fut_symbol_for_base(universe, sym)
+                if not fut_sym:
+                    continue
+                out_path = f"/tmp/{BOT_NAME}_{sym}_{idx}.png"
+                title = f"{sym} {side} | Conf {conf}/100 | 1H snapshot"
+                try:
+                    await asyncio.to_thread(make_chart_png, fut_sym, title, out_path, "1h", 48)
+                    if os.path.exists(out_path):
+                        await update.message.reply_photo(
+                            photo=open(out_path, "rb"),
+                            caption=f"Setup #{idx}: {side} {sym} — Conf {conf}/100",
+                        )
+                except Exception:
+                    logging.exception("chart send failed")
+
     except Exception as e:
         logging.exception("screen_cmd error")
         await update.message.reply_text(f"Error: {e}")
@@ -1228,7 +1326,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# Email Alert Job (optional)
+# Email Alert Job (optional) — now includes per-setup snapshot + optional charts
 # =========================================================
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1267,21 +1365,78 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if keys and keys == LAST_EMAIL_KEYS:
             return
 
-        body_parts = []
+        # Build text + HTML
+        text_parts = []
+        html_parts = [f"<h2>{BOT_NAME} Alert</h2>"]
+
+        inline_images: List[Tuple[str, str]] = []
+
         if recs:
-            # strip markdown emphasis for email
-            body_parts.append("Trade Setups (Confidence-based):\n" + re.sub(r"\*+", "", format_trade_setups(recs)))
+            text_lines = ["Trade Setups (Confidence-based):"]
+            html_parts.append("<h3>Trade Setups</h3>")
+
+            for idx, (side, sym, entry, tp, sl, conf) in enumerate(recs, start=1):
+                text_lines.append(f"\nSetup #{idx}: {side} {sym} — Confidence {conf}/100")
+                text_lines.append(f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | TP {fmt_price(tp)}")
+
+                snap = snapshot_for_symbol(universe, sym)
+                if snap:
+                    text_lines.append(snap)
+
+                plan = multi_tp_plan(entry, sl, side, conf)
+                if plan:
+                    text_lines.append(f"Multi-TP: {plan['weights']}")
+                    text_lines.append(f"TP1 {fmt_price(plan['tp1'])} | TP2 {fmt_price(plan['tp2'])}")
+                    text_lines.append(plan["runner_text"])
+
+                # HTML block
+                html_block = f"""
+                <div style="margin-bottom:14px;padding:10px;border:1px solid #ddd;border-radius:10px;">
+                  <b>Setup #{idx}</b>: {side} {sym} — <b>Confidence {conf}/100</b><br/>
+                  Entry <b>{fmt_price(entry)}</b> | SL <b>{fmt_price(sl)}</b> | TP <b>{fmt_price(tp)}</b><br/>
+                """
+                if snap:
+                    html_block += f"<div style='margin-top:6px;font-size:12px;color:#333;'>{snap}</div>"
+
+                if plan:
+                    html_block += f"<div style='margin-top:6px;font-size:12px;'>Multi-TP: {plan['weights']}<br/>TP1 {fmt_price(plan['tp1'])} | TP2 {fmt_price(plan['tp2'])}<br/>{plan['runner_text']}</div>"
+
+                # Optional chart
+                if CHARTS_ENABLED:
+                    fut_sym = fut_symbol_for_base(universe, sym)
+                    if fut_sym:
+                        out_path = f"/tmp/{BOT_NAME}_email_{sym}_{idx}.png"
+                        cid = f"chart_{sym}_{idx}"
+                        try:
+                            await asyncio.to_thread(make_chart_png, fut_sym, f"{sym} 1H snapshot", out_path, "1h", 48)
+                            if os.path.exists(out_path):
+                                inline_images.append((cid, out_path))
+                                html_block += f"<div style='margin-top:10px;'><img src='cid:{cid}' style='max-width:520px;border-radius:10px;'/></div>"
+                        except Exception:
+                            logging.exception("email chart failed")
+
+                html_block += "</div>"
+                html_parts.append(html_block)
+
+            text_parts.append("\n".join(text_lines).strip())
+
         if movers:
             mv_lines = "\n".join(
                 [f"{sym} | F~{m_dollars(fusd)}M | {pct_with_emoji(p24)}"
                  for sym, fusd, p24 in movers]
             )
-            body_parts.append("Strong Movers (24h — context only):\n" + mv_lines)
+            text_parts.append("Strong Movers (24h — context only):\n" + mv_lines)
 
-        body = "\n\n".join(body_parts).strip()
+            html_parts.append("<h3>Strong Movers (24h — context only)</h3>")
+            html_parts.append("<pre style='background:#f6f6f6;padding:10px;border-radius:10px;'>"
+                              + mv_lines + "</pre>")
+
+        text_body = "\n\n".join(text_parts).strip()
+        html_body = "\n".join(html_parts).strip()
+
         subject = f"{BOT_NAME} Alert: Setups & Movers"
 
-        if send_email(subject, body):
+        if send_email(subject, text_body, html_body=html_body, inline_images=inline_images):
             LAST_EMAIL_TS = now
             LAST_EMAIL_KEYS = keys
 
@@ -1338,7 +1493,6 @@ def run_bot():
     app.add_handler(CommandHandler("notify_off", notify_off_cmd))
     app.add_handler(CommandHandler("notify", notify_cmd))
 
-    # Risk tools / ledger
     app.add_handler(CommandHandler("equity", equity_cmd))
     app.add_handler(CommandHandler("limits", limits_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
@@ -1352,7 +1506,6 @@ def run_bot():
     if getattr(app, "job_queue", None):
         app.job_queue.run_repeating(alert_job, interval=CHECK_INTERVAL_MIN * 60, first=10)
 
-    # IMPORTANT: disable stop_signals in non-main thread
     app.run_polling(drop_pending_updates=True, stop_signals=None)
 
 
@@ -1369,11 +1522,9 @@ def main():
 
     db_init()
 
-    # Start Telegram bot in background thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
 
-    # Run API in main thread (Render-friendly)
     run_api_server()
 
 
