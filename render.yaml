@@ -13,11 +13,9 @@ services:
       - key: TELEGRAM_TOKEN
         sync: false
 
-      # Web base URL of your Render app:
       - key: PUBLIC_BASE_URL
         sync: false
 
-      # Stripe
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_WEBHOOK_SECRET
@@ -27,7 +25,6 @@ services:
       - key: STRIPE_PRICE_ELITE
         sync: false
 
-      # Optional email
       - key: EMAIL_ENABLED
         value: "false"
       - key: EMAIL_HOST
