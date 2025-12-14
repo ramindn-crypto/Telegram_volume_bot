@@ -1,26 +1,27 @@
 services:
-  - type: worker
+  - type: web
     name: coinex-telegram-bot
     runtime: python
-    plan: starter
-    branch: main
-    buildCommand: pip install -r requirements.txt
-    startCommand: python Telegram-volume-bot.py
-    autoDeploy: true
-
+    region: singapore   # نزدیک به CoinEx و تلگرام، latency کمتر
+    plan: starter       # برای شروع کافیه
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: |
+      Telegram-volume-bot.py
     envVars:
-      - key: PYTHONUNBUFFERED
-        value: "1"
-
-      # ---- Telegram ----
       - key: TELEGRAM_TOKEN
         sync: false
 
-      # ---- DB path (persisted disk) ----
-      - key: BOT_DB_PATH
-        value: /var/data/signals.db
+      # Optional logging
+      - key: LOG_LEVEL
+        value: INFO
 
-      # ---- Email (optional) ----
+      # Database (SQLite on disk)
+      - key: DB_PATH
+        value: bot.db
+
+      # ===== OPTIONAL EMAIL ALERTS =====
       - key: EMAIL_ENABLED
         value: "false"
       - key: EMAIL_HOST
@@ -35,8 +36,3 @@ services:
         sync: false
       - key: EMAIL_TO
         sync: false
-
-    disk:
-      name: bot-data
-      mountPath: /var/data
-      sizeGB: 1
