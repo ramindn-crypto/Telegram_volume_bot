@@ -2,22 +2,18 @@
 """
 PulseFutures — Telegram Futures Signals Bot + Stripe Paywall (Single Service, Render-friendly)
 
-Key Fixes for Render + Python 3.11:
-- Bot runs inside a background thread WITH its own asyncio event loop
+✅ Render/Python 3.11 safe:
+- Telegram bot runs in a background thread with its own asyncio event loop
 - run_polling(stop_signals=None) to avoid signal-handler crash in non-main thread
+- FastAPI/Uvicorn runs in main thread (for /health + Stripe webhooks)
 
-Endpoints:
-- GET  /health
-- GET  /pay?plan=pro&tg_user_id=123  (Stripe Checkout redirect)
-- POST /stripe/webhook
-
-Telegram:
-- /start /help /screen /upgrade /diag /session
-- Pro-only: /equity /limits /risk /open /closepnl /status
-
-Futures-only (CoinEx swap via CCXT), Universe Filter, Leaders+Movers, Pro setups, confidence+multiTP.
-
-Disclaimer: No financial advice. No profit guarantees.
+✅ Your requested changes included:
+1) User Guide: ENGLISH ONLY (no Farsi anywhere)
+2) TEST MODE: unlock EVERYTHING for you during testing
+   - set env: TEST_MODE=true
+3) No email on Sundays (Melbourne time)
+4) Remove "score" from user-facing outputs (only Confidence shown)
+5) Dynamic price decimals (no ridiculous long decimals)
 """
 
 import asyncio
@@ -34,7 +30,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from email.message import EmailMessage
 from typing import Dict, List, Tuple, Optional, Set
-
 from zoneinfo import ZoneInfo
 
 import ccxt
@@ -64,6 +59,9 @@ EXCHANGE_ID = "coinex"
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
+
+# ✅ Test Mode (unlock everything)
+TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 
 # Stripe / Paywall
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
@@ -128,6 +126,43 @@ class MarketVol:
     base_vol: float
     quote_vol: float
     vwap: float
+
+
+# =========================================================
+# UTILS: formatting
+# =========================================================
+
+def fmt_price(px: float) -> str:
+    """Dynamic decimals for price-like numbers (trader-friendly)."""
+    try:
+        px = float(px)
+    except Exception:
+        return str(px)
+    if px >= 1000:
+        return f"{px:.1f}"
+    elif px >= 100:
+        return f"{px:.2f}"
+    elif px >= 1:
+        return f"{px:.3f}"
+    elif px >= 0.1:
+        return f"{px:.4f}"
+    elif px >= 0.01:
+        return f"{px:.5f}"
+    else:
+        return f"{px:.6f}"
+
+def pct_with_emoji(p: float) -> str:
+    val = int(round(p))
+    if val >= 3:
+        emo = "🟢"
+    elif val <= -3:
+        emo = "🔴"
+    else:
+        emo = "🟡"
+    return f"{val:+d}% {emo}"
+
+def m_dollars(x: float) -> str:
+    return str(round(float(x) / 1_000_000))
 
 
 # =========================================================
@@ -251,10 +286,15 @@ def set_user_plan(tg_user_id: int, plan: str, expires_ts: int, email: Optional[s
         conn.commit()
 
 def require_pro(update: Update) -> Tuple[bool, str]:
+    # ✅ Test Mode bypass: unlock everything for you while testing
+    if TEST_MODE:
+        return True, ""
+
     uid = update.effective_user.id if update.effective_user else 0
     plan, exp = get_user_plan(uid)
     if is_active_paid(plan, exp):
         return True, ""
+
     if PUBLIC_BASE_URL:
         return False, (
             "🔒 Pro feature.\n\n"
@@ -263,6 +303,7 @@ def require_pro(update: Update) -> Tuple[bool, str]:
             f"- Elite: {PUBLIC_BASE_URL}/pay?plan=elite&tg_user_id={uid}\n"
         )
     return False, "🔒 Pro feature. (Server missing PUBLIC_BASE_URL env var.)"
+
 
 # -------- Risk Ledger --------
 
@@ -318,6 +359,7 @@ def db_open_count() -> int:
         r = conn.execute("SELECT COUNT(*) AS c FROM signals WHERE status='OPEN'", ()).fetchone()
         return int(r["c"] or 0)
 
+
 # =========================================================
 # Trading Window Guard
 # =========================================================
@@ -356,6 +398,7 @@ def trading_window_warning() -> Optional[str]:
     if not is_in_trading_window(mode):
         return "⚠️ Outside optimal trading window (London + New York)\nSignals may be limited.\n\n"
     return None
+
 
 # =========================================================
 # Exchange Helpers (Futures-only)
@@ -461,6 +504,7 @@ def compute_pct_for_symbol(symbol: str, hours: int) -> float:
         logging.exception("compute_pct_for_symbol failed for %s (%dh)", symbol, hours)
         PCT_CACHE[cache_key] = 0.0
         return 0.0
+
 
 # =========================================================
 # Universe / Leaders / Movers / Setups
@@ -628,21 +672,8 @@ def pick_best_trades_u(universe: List[List], top_n: int = SETUPS_TOP_N):
 
 
 # =========================================================
-# Formatting
+# Formatting blocks
 # =========================================================
-
-def pct_with_emoji(p: float) -> str:
-    val = int(round(p))
-    if val >= 3:
-        emo = "🟢"
-    elif val <= -3:
-        emo = "🔴"
-    else:
-        emo = "🟡"
-    return f"{val:+d}% {emo}"
-
-def m_dollars(x: float) -> str:
-    return str(round(x / 1_000_000))
 
 def fmt_leaders_u(rows: List[List]) -> str:
     if not rows:
@@ -655,7 +686,7 @@ def fmt_leaders_u(rows: List[List]) -> str:
     return (
         "*🔥 Market Leaders (Liquidity + Momentum)*:\n"
         "```\n"
-        + tabulate(pretty, headers=["SYM", "F", "BIAS", "%24H", "%4H", "%1H"], tablefmt="github")
+        + tabulate(pretty, headers=["SYM", "F(M)", "BIAS", "%24H", "%4H", "%1H"], tablefmt="github")
         + "\n```\n"
     )
 
@@ -668,28 +699,29 @@ def fmt_movers(movers: List[Tuple[str, float, float]]) -> str:
     return (
         "*🚀 Strong Movers (24h, F vol > $1M & +10%)*:\n"
         "```\n"
-        + tabulate(pretty, headers=["SYM", "F", "%24H"], tablefmt="github")
+        + tabulate(pretty, headers=["SYM", "F(M)", "%24H"], tablefmt="github")
         + "\n```\n"
     )
 
 def format_trade_setups(recs: List[Tuple]) -> str:
     if not recs:
         return "_No strong setups right now._"
+
     lines = []
-    for side, sym, entry, tp, sl, score, conf in recs:
+    for side, sym, entry, tp, sl, _score, conf in recs:
         plan = multi_tp_plan(entry, sl, side, conf)
         if plan:
             lines.append(
-                f"{side} {sym} — Conf {conf}/100 🔥 — score {score:.1f}\n"
-                f"Entry {entry:.6g} | SL {sl:.6g}\n"
+                f"{side} {sym} — Confidence {conf}/100 🔥\n"
+                f"Entry {fmt_price(entry)} | SL {fmt_price(sl)}\n"
                 f"TP plan: {plan['weights']}\n"
-                f"TP1 {plan['tp1']:.6g} | TP2 {plan['tp2']:.6g}\n"
+                f"TP1 {fmt_price(plan['tp1'])} | TP2 {fmt_price(plan['tp2'])}\n"
                 f"{plan['runner_text']}\n"
             )
         else:
             lines.append(
-                f"{side} {sym} — Conf {conf}/100 — score {score:.1f}\n"
-                f"Entry {entry:.6g} | SL {sl:.6g} | TP {tp:.6g}\n"
+                f"{side} {sym} — Confidence {conf}/100\n"
+                f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | TP {fmt_price(tp)}\n"
             )
     return "\n".join(lines).strip()
 
@@ -770,11 +802,15 @@ def db_closepnl_open_symbol(sym: str, pnl: float) -> Optional[dict]:
 
 
 # =========================================================
-# Email (optional)
+# Email (optional) helpers
 # =========================================================
 
 def email_config_ok() -> bool:
     return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO])
+
+def melbourne_is_sunday() -> bool:
+    now = datetime.now(ZoneInfo("Australia/Melbourne"))
+    return now.weekday() == 6  # Monday=0 ... Sunday=6
 
 def send_email(subject: str, body: str) -> bool:
     if not email_config_ok():
@@ -803,27 +839,80 @@ def send_email(subject: str, body: str) -> bool:
 
 
 # =========================================================
-# Bot Text / Guide
+# Bot Guide (ENGLISH ONLY)
 # =========================================================
 
-HELP_TEXT = """📘 User Guide — PulseFutures (FA/EN)
+HELP_TEXT = f"""📘 {BOT_NAME} — User Guide (English)
 
-🇮🇷 فارسی:
-• /screen → Market Leaders + Movers (رایگان) | + Setups (Pro)
-• /upgrade → لینک پرداخت
-• /session both|london|ny|off → گارد سشن
-• /equity 1000 → ثبت سرمایه (Pro)
-• /limits 5 200 300 → محدودیت‌ها (Pro)
-• /risk BTC 1% یا /risk BTC 10 → سایز پوزیشن با ریسک (Pro)
-• /open → پوزیشن‌های باز (Pro)
-• /closepnl BTC +23.5 → بستن و آپدیت Equity (Pro)
-• /status → وضعیت ریسک روزانه و ریسک باز (Pro)
+What this bot is:
+{BOT_NAME} is a futures-only crypto scanner + trade setup assistant for day traders.
+It focuses on liquidity + momentum, and shows a small number of high-confidence setups.
 
-🇺🇸 English:
-Free: Leaders + Movers
-Pro: + Setups + Multi-TP + Risk tools + Email alerts
+What you get:
+• Market Leaders: top liquid contracts with momentum snapshot
+• Strong Movers (24h): coins with strong 24h moves (filtered by futures liquidity)
+• Trade Setups (Top {SETUPS_TOP_N}): entry / SL / TP ideas with a Confidence score
+• Multi-TP (Confidence ≥ {CONF_MULTI_TP_MIN}): TP1 + TP2 + Runner guidance
+• Trading Window Guard: warns when outside London/NY optimal window
+• Risk Tools: equity, risk limits, position sizing
+• Manual Trade Ledger: /risk to “open”, /closepnl to “close” and update equity
 
-Disclaimer: Decision-support tool. No guaranteed profits.
+What this bot does NOT do:
+• No auto-trading (it does not place trades)
+• No exchange account connection
+• No guaranteed profit (no hype, no promises)
+
+Recommended workflow:
+1) Run /screen
+   - Review Leaders + Movers + Setups
+2) Set your equity (once):
+   - /equity 1000
+3) Set your limits (once):
+   - /limits 5 200 300
+4) When you like a setup, size it:
+   - /risk BTC 1%   (or /risk BTC 10)
+5) Track open positions:
+   - /open
+6) Close and update equity:
+   - /closepnl BTC +23.5   (or /closepnl BTC -10)
+
+Commands:
+• /start
+  Quick intro + your current access status.
+
+• /help
+  This guide.
+
+• /screen
+  Shows Leaders + Movers + Setups.
+  In paid mode (or TEST MODE), setups are stored so you can use /risk later.
+
+• /session [both|london|ny|off]
+  Controls the trading window guard.
+
+• /diag
+  Diagnostics (plan/session/last error/config flags).
+
+Risk & Journal:
+• /equity <amount>
+  Set your account equity (used for % risk sizing).
+
+• /limits <maxTradesDay> <maxDailyRiskUSD> <maxOpenRiskUSD>
+  Set risk caps to prevent over-trading.
+
+• /status
+  Shows daily risk used, open risk used, and your open positions count.
+
+• /risk <SYMBOL> <RISK>
+  Calculates position size using the latest stored signal for that symbol.
+  Example: /risk BTC 1%   OR   /risk BTC 10
+
+• /open
+  Lists OPEN positions in your ledger.
+
+• /closepnl <SYMBOL> <PNL>
+  Closes a position and updates your equity.
+  Example: /closepnl BTC +23.5
 """
 
 # =========================================================
@@ -834,18 +923,17 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
     plan, exp = get_user_plan(uid)
-    active = is_active_paid(plan, exp)
+    active = is_active_paid(plan, exp) or TEST_MODE
 
     msg = (
         f"Welcome to {BOT_NAME} 🚀\n\n"
-        "Clean futures signals for day traders. No noise.\n\n"
+        "Futures-only market leaders, movers, and high-confidence day-trade setups.\n\n"
         "Commands:\n"
-        "• /screen — Leaders + Movers (Free) + Setups (Pro)\n"
-        "• /upgrade — Upgrade to Pro/Elite\n"
+        "• /screen — Leaders + Movers + Setups\n"
         "• /help\n"
         "• /session [both|london|ny|off]\n"
-        "• /diag\n"
-        "\nPro tools:\n"
+        "• /diag\n\n"
+        "Risk & journal:\n"
         "• /equity 1000\n"
         "• /limits 5 200 300\n"
         "• /risk BTC 1%\n"
@@ -853,13 +941,22 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /closepnl BTC +23.5\n"
         "• /status\n"
     )
-    msg += f"\nYour plan: {plan} ({'ACTIVE' if active else 'inactive/free'})"
+
+    if TEST_MODE:
+        msg += "\n✅ TEST MODE is ON: all features unlocked."
+    else:
+        msg += f"\nYour plan: {plan} ({'ACTIVE' if active else 'inactive/free'})"
+
     await update.message.reply_text(msg)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
 
 async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if TEST_MODE:
+        await update.message.reply_text("✅ TEST MODE is ON: paywall is bypassed for testing.")
+        return
+
     uid = update.effective_user.id
     ensure_user(uid)
     if not PUBLIC_BASE_URL:
@@ -876,12 +973,14 @@ async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     plan, exp = get_user_plan(uid)
-    active = is_active_paid(plan, exp)
+    active = is_active_paid(plan, exp) or TEST_MODE
     msg = (
         f"*Diag*\n"
+        f"- test_mode: `{TEST_MODE}`\n"
         f"- plan: `{plan}` active=`{active}`\n"
         f"- expires_ts: `{exp}`\n"
         f"- session_mode: `{get_session_mode()}` in_window=`{is_in_trading_window(get_session_mode())}`\n"
+        f"- email_enabled: `{EMAIL_ENABLED_DEFAULT}` notify_on=`{NOTIFY_ON}` sunday_block=`{melbourne_is_sunday()}`\n"
         f"- stripe: secret_key=`{bool(STRIPE_SECRET_KEY)}` webhook_secret=`{bool(STRIPE_WEBHOOK_SECRET)}`\n"
         f"- public_base_url: `{PUBLIC_BASE_URL or 'not set'}`\n"
         f"- last_error: `{LAST_ERROR or 'none'}`\n"
@@ -905,7 +1004,7 @@ async def session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Usage: /session both|london|ny|off")
 
-# --- Pro-only ---
+# --- Pro-only (bypassed in TEST_MODE via require_pro) ---
 
 async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, msg = require_pro(update)
@@ -975,7 +1074,7 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     with db_conn() as conn:
         rows = conn.execute("""
-            SELECT symbol, side, entry, sl, tp, confidence, score, risk_usd, opened_ts, ts
+            SELECT symbol, side, entry, sl, tp, confidence, risk_usd, opened_ts, ts
             FROM signals WHERE status='OPEN'
             ORDER BY COALESCE(opened_ts, ts) DESC
         """).fetchall()
@@ -989,8 +1088,8 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         age_hr = (now_ts - opened) / 3600.0
         lines.append(
             f"{r['symbol']:6} {r['side']:4} conf {int(r['confidence'] or 0):3d} "
-            f"E:{float(r['entry'] or 0):.6g} SL:{float(r['sl'] or 0):.6g} "
-            f"TP:{float(r['tp'] or 0):.6g} risk:${float(r['risk_usd'] or 0):,.2f} "
+            f"E:{fmt_price(float(r['entry'] or 0))} SL:{fmt_price(float(r['sl'] or 0))} "
+            f"TP:{fmt_price(float(r['tp'] or 0))} risk:${float(r['risk_usd'] or 0):,.2f} "
             f"age:{age_hr:.1f}h"
         )
     lines.append("")
@@ -1106,22 +1205,23 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "```\n"
-        f"{sym} {sig['side']} | Entry {entry:.6g} | SL {sl:.6g}\n"
+        f"{sym} {sig['side']} | Entry {fmt_price(entry)} | SL {fmt_price(sl)}\n"
         f"Risk ${risk_usd:,.2f} -> Qty {qty:.6g} | Notional ${notional:,.2f}\n"
         "Close with /closepnl SYMBOL +/-PnL\n"
         "```",
         parse_mode=ParseMode.MARKDOWN
     )
 
+
 # =========================================================
-# /screen (Free vs Pro gating)
+# /screen (TEST MODE unlock + later paywall-ready)
 # =========================================================
 
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
     plan, exp = get_user_plan(uid)
-    active = is_active_paid(plan, exp)
+    active = is_active_paid(plan, exp) or TEST_MODE  # ✅ unlock in TEST_MODE
 
     PCT_CACHE.clear()
     best_fut, raw_fut = await asyncio.to_thread(load_best_futures)
@@ -1132,17 +1232,18 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     warn = trading_window_warning() or ""
     msg = (warn or "") + fmt_leaders_u(leaders) + fmt_movers(movers)
 
+    # If later paywall is enabled (TEST_MODE off), we can lock setups here.
     if not active:
         if PUBLIC_BASE_URL:
             msg += (
-                "*🎯 Trade Setups (Top 3)*:\n"
+                f"*🎯 Trade Setups (Top {SETUPS_TOP_N})*:\n"
                 "🔒 Locked on Free plan.\n\n"
                 "Upgrade to Pro:\n"
                 f"{PUBLIC_BASE_URL}/pay?plan=pro&tg_user_id={uid}\n\n"
                 f"`tickers: fut={raw_fut}`"
             )
         else:
-            msg += "*🎯 Trade Setups (Top 3)*:\n🔒 Locked on Free plan.\n(Server missing PUBLIC_BASE_URL)\n"
+            msg += f"*🎯 Trade Setups (Top {SETUPS_TOP_N})*:\n🔒 Locked on Free plan.\n(Server missing PUBLIC_BASE_URL)\n"
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
         return
 
@@ -1152,13 +1253,13 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_in_trading_window(mode) and recs:
         await asyncio.to_thread(db_store_setups_as_signals, recs)
 
-    msg += "*🎯 Trade Setups (Top 3)*:\n" + format_trade_setups(recs)
+    msg += f"*🎯 Trade Setups (Top {SETUPS_TOP_N})*:\n" + format_trade_setups(recs)
     msg += f"\n\n`tickers: fut={raw_fut}`"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
 # =========================================================
-# Text router
+# Text router: show latest stored signal (if any)
 # =========================================================
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1168,20 +1269,20 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     sig = await asyncio.to_thread(db_get_latest_signal, token)
     if not sig:
-        await update.message.reply_text("No stored signal. Run /screen first (Pro stores signals).")
+        await update.message.reply_text("No stored signal. Run /screen first.")
         return
     await update.message.reply_text(
         "```\n"
         f"{sig['symbol']} ({sig['status']}) {sig['side']}\n"
-        f"Entry {float(sig['entry'] or 0):.6g} | SL {float(sig['sl'] or 0):.6g} | TP {float(sig['tp'] or 0):.6g}\n"
-        f"Conf {int(sig['confidence'] or 0)} | score {float(sig['score'] or 0):.1f}\n"
+        f"Entry {fmt_price(float(sig['entry'] or 0))} | SL {fmt_price(float(sig['sl'] or 0))} | TP {fmt_price(float(sig['tp'] or 0))}\n"
+        f"Confidence {int(sig['confidence'] or 0)}/100\n"
         "```",
         parse_mode=ParseMode.MARKDOWN
     )
 
 
 # =========================================================
-# Email Alert Job (optional)
+# Email Alert Job (optional) — No Sundays (Melbourne)
 # =========================================================
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1190,6 +1291,10 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not NOTIFY_ON:
             return
         if not email_config_ok():
+            return
+
+        # ✅ No emails on Sundays (Melbourne)
+        if melbourne_is_sunday():
             return
 
         mode = get_session_mode()
@@ -1218,13 +1323,17 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
         body_parts = []
         if recs:
-            body_parts.append("Top Trade Setups:\n" + format_trade_setups(recs))
+            # ✅ user-facing: Confidence only (no score)
+            body_parts.append(f"Top Trade Setups (Confidence-based):\n{format_trade_setups(recs)}")
         if movers:
-            mv_lines = "\n".join([f"{sym} | F~{m_dollars(fusd)}M | {pct_with_emoji(p24)}" for sym, fusd, p24 in movers])
+            mv_lines = "\n".join(
+                [f"{sym} | F~{m_dollars(fusd)}M | {pct_with_emoji(p24)}"
+                 for sym, fusd, p24 in movers]
+            )
             body_parts.append("Strong Movers (24h):\n" + mv_lines)
 
         body = "\n\n".join(body_parts)
-        subject = "PulseFutures Alert: Setups & Movers"
+        subject = f"{BOT_NAME} Alert: Setups & Movers"
 
         if send_email(subject, body):
             LAST_EMAIL_TS = now
@@ -1255,10 +1364,13 @@ app_api = FastAPI()
 
 @app_api.get("/health")
 async def health():
-    return {"ok": True, "name": BOT_NAME}
+    return {"ok": True, "name": BOT_NAME, "test_mode": TEST_MODE}
 
 @app_api.get("/pay")
 async def pay(plan: str, tg_user_id: int):
+    if TEST_MODE:
+        return PlainTextResponse("TEST_MODE is ON. Paywall is bypassed.", status_code=200)
+
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY not set")
     if not PUBLIC_BASE_URL:
@@ -1296,6 +1408,9 @@ async def cancel(tg_user_id: int, plan: str):
 
 @app_api.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
+    if TEST_MODE:
+        return PlainTextResponse("TEST_MODE is ON. Webhook ignored.", status_code=200)
+
     if not STRIPE_WEBHOOK_SECRET or not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="Stripe webhook not configured")
 
@@ -1356,7 +1471,7 @@ def run_bot():
     app.add_handler(CommandHandler("session", session_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
 
-    # Pro tools
+    # Risk tools / ledger
     app.add_handler(CommandHandler("equity", equity_cmd))
     app.add_handler(CommandHandler("limits", limits_cmd))
     app.add_handler(CommandHandler("risk", risk_cmd))
