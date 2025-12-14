@@ -1,0 +1,42 @@
+services:
+  - type: worker
+    name: coinex-telegram-bot
+    runtime: python
+    plan: starter
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: true
+
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+      # ---- Telegram ----
+      - key: TELEGRAM_TOKEN
+        sync: false
+
+      # ---- DB path (persisted disk) ----
+      - key: BOT_DB_PATH
+        value: /var/data/signals.db
+
+      # ---- Email (optional) ----
+      - key: EMAIL_ENABLED
+        value: "false"
+      - key: EMAIL_HOST
+        sync: false
+      - key: EMAIL_PORT
+        value: "465"
+      - key: EMAIL_USER
+        sync: false
+      - key: EMAIL_PASS
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: EMAIL_TO
+        sync: false
+
+    disk:
+      name: bot-data
+      mountPath: /var/data
+      sizeGB: 1
