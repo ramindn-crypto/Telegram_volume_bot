@@ -8,7 +8,7 @@ services:
       pip install --upgrade pip
       pip install -r requirements.txt
     startCommand: |
-      python Telegram_volume_bot.py
+      python telegram_volume_bot.py
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false
