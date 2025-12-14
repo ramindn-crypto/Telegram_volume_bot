@@ -10,8 +10,7 @@ Features:
 - Email alerts only 12:30–01:00 (Australia/Melbourne), no Sundays
 - Max 1 email per 15 minutes
 - NO EMAIL if:
-    * the set of (side, symbol) recommendations is the same as last email AND
-    * the set of 24h movers is the same as last email
+    * the set of ALL symbols (recs + 24h movers) is the same as in the last email
 - Commands: /start /screen /notify_on /notify_off /notify /diag
 - Typing a symbol (e.g. PYTH) gives its row
 """
@@ -78,8 +77,7 @@ CHECK_INTERVAL_MIN = 5  # run every 5 minutes
 # One email every 15 minutes (no daily cap)
 EMAIL_MIN_INTERVAL_SEC = 15 * 60
 LAST_EMAIL_TS: float = 0.0
-LAST_RECS_KEYS: Set[Tuple[str, str]] = set()   # (side, symbol) of recommendations
-LAST_MOVERS: Set[str] = set()                  # 24h +10% movers (symbols)
+LAST_ALL_SYMBOLS: Set[str] = set()  # ALL symbols in last email (recs + movers)
 
 # Globals
 LAST_ERROR: Optional[str] = None
@@ -88,8 +86,9 @@ NOTIFY_ON: bool = EMAIL_ENABLED_DEFAULT
 PCT4H_CACHE: Dict[Tuple[str, str], float] = {}
 PCT1H_CACHE: Dict[Tuple[str, str], float] = {}
 
-ALERT_SENT_CACHE: Dict[Tuple[str, str], float] = {}  # not used now but kept for compatibility
-EMAIL_SEND_LOG: List[float] = []  # not used for limits now but left in case you want back
+ALERT_SENT_CACHE: Dict[Tuple[str, str], float] = {}
+EMAIL_SEND_LOG: List[float] = []  # kept for possible future use
+
 
 # ================== DATA STRUCTURES ==================
 
@@ -444,15 +443,16 @@ def classify_row(row: List) -> Tuple[bool, bool]:
 def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]):
     """
     Return TOP 3 trades overall (BUY or SELL).
-    Uses classify_row() to decide LONG/SHORT candidates and score_long/score_short for ranking.
-
-    Returns list of up to 3 items:
-        [(side, sym, entry, exit, sl, score), ...]
+    Each candidate: (side, sym, entry, exit, sl, score, priority_label)
     """
-    rows = p1 + p2 + p3
-    candidates: List[Tuple[str, str, float, float, float, float]] = []
+    rows_with_label: List[Tuple[List, str]] = []
+    rows_with_label += [(r, "P1") for r in p1]
+    rows_with_label += [(r, "P2") for r in p2]
+    rows_with_label += [(r, "P3") for r in p3]
 
-    for r in rows:
+    candidates: List[Tuple[str, str, float, float, float, float, str]] = []
+
+    for r, label in rows_with_label:
         sym, _, _, pct24, pct4, pct1, last_price = r
         if not last_price or last_price <= 0:
             continue
@@ -465,7 +465,7 @@ def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]):
                 entry = last_price
                 sl = entry * 0.94   # 6% SL
                 tp = entry * 1.12   # 12% TP
-                candidates.append(("BUY", sym, entry, tp, sl, score))
+                candidates.append(("BUY", sym, entry, tp, sl, score, label))
 
         if short_ok:
             score = score_short(r)
@@ -473,20 +473,33 @@ def pick_best_trades(p1: List[List], p2: List[List], p3: List[List]):
                 entry = last_price
                 sl = entry * 1.06   # 6% SL
                 tp = entry * 0.91   # 9% TP
-                candidates.append(("SELL", sym, entry, tp, sl, score))
+                candidates.append(("SELL", sym, entry, tp, sl, score, label))
 
     candidates.sort(key=lambda x: x[5], reverse=True)
     return candidates[:3]  # top 3 recommendations
 
 
 def format_recommended_trades(recs: List[Tuple]) -> str:
+    """
+    Group recs by P1/P2/P3 for display.
+    """
     if not recs:
         return "_No strong recommendations right now._"
-    lines = ["*Top 3 Recommendations:*"]
-    for side, sym, entry, exit_px, sl, score in recs:
-        lines.append(
+
+    sections: Dict[str, List[str]] = {"P1": [], "P2": [], "P3": []}
+    for side, sym, entry, exit_px, sl, score, label in recs:
+        if label not in sections:
+            sections[label] = []
+        sections[label].append(
             f"{side} {sym} — Entry {entry:.6g} — Exit {exit_px:.6g} — SL {sl:.6g} (score {score:.1f})"
         )
+
+    lines = ["*Top 3 Recommendations:*"]
+    for label in ("P1", "P2", "P3"):
+        if sections[label]:
+            lines.append(f"\n_{label}_:")
+            lines.extend(sections[label])
+
     return "\n".join(lines)
 
 
@@ -697,7 +710,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== ALERT JOB ==================
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
-    global LAST_EMAIL_TS, LAST_RECS_KEYS, LAST_MOVERS
+    global LAST_EMAIL_TS, LAST_ALL_SYMBOLS
     try:
         if not NOTIFY_ON:
             return
@@ -720,29 +733,31 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         recs = pick_best_trades(p1, p2, p3)
         big_movers = scan_big_movers(best_spot, best_fut)
 
-        # If nothing to say, skip email
+        # If nothing at all, skip
         if not recs and not big_movers:
             return
 
-        # Build keys for recommendations and movers separately
-        rec_keys: Set[Tuple[str, str]] = {(side, sym) for side, sym, _, _, _, _ in recs}
-        movers_set: Set[str] = set(big_movers)
+        # Build the NEW full symbol set for this email
+        rec_symbols: Set[str] = {sym for _, sym, _, _, _, _, _ in recs}
+        mover_symbols: Set[str] = set(big_movers)
+        current_symbols: Set[str] = rec_symbols | mover_symbols
 
-        # If both recs and movers sets are identical to last time, skip
-        if rec_keys == LAST_RECS_KEYS and movers_set == LAST_MOVERS:
+        # If the symbols are exactly the same as last email, skip
+        if current_symbols and current_symbols == LAST_ALL_SYMBOLS:
             return
 
+        # Build body grouped by P1/P2/P3 + movers
         parts = []
         if recs:
             parts.append(format_recommended_trades(recs))
         if big_movers:
             parts.append(
-                "24h +10% movers (F vol >1M):\n" + ", ".join(sorted(movers_set))
+                "*24h +10% movers (F vol >1M):*\n" + ", ".join(sorted(mover_symbols))
             )
 
         body = "\n\n".join(parts)
 
-        # Subject logic
+        # Subject
         if big_movers and not recs:
             subject = "Crypto Alert: 24h +10% Movers"
         else:
@@ -750,8 +765,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
         if send_email(subject, body):
             LAST_EMAIL_TS = now
-            LAST_RECS_KEYS = rec_keys
-            LAST_MOVERS = movers_set
+            LAST_ALL_SYMBOLS = current_symbols
     except Exception as e:
         logging.exception("alert_job error: %s", e)
 
