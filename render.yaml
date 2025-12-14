@@ -5,7 +5,7 @@ services:
     plan: starter
     branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python Telegram-volume-bot.py
     autoDeploy: true
 
     envVars:
