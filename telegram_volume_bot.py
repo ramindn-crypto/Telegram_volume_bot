@@ -2,30 +2,29 @@
 """
 PulseFutures — Futures-only Telegram crypto scanner + trade setups + risk tools (Render-friendly)
 
-✅ What you asked (current state):
-- NO paywall / NO "Locked on Free Plan" anywhere (pure testing mode)
-- User Guide: ENGLISH ONLY
+✅ Current testing mode (NO paywall / NO locks):
 - Market Leaders: Top 10 (simple)
-- Strong Movers (24h): shown for context (Top 10)
-- Trade Setups: Top 3 with Setup numbering (#1..#3)
-- Confidence ONLY (no "Score" in user outputs)
-- Dynamic price decimals (clean trader-friendly formatting)
-- Trigger on 1H + confirmation on 15M (futures-only)
-- Trading Window Guard (default: London + NY). Warns when outside.
-- Email alerts optional:
-  - No emails on Sundays (Melbourne time)
+- Strong Movers (24h): Top 10 (context only)
+- Trade Setups: Top 3 + Setup numbering (#1..#3)
+- Confidence ONLY (no score shown)
+- Trigger on 1H, confirmation on 15M
+- Trading Window Guard (default: London + NY) with WARNING
+- Email alerts optional (if EMAIL_* configured):
+  - NO emails on Sundays (Melbourne time)
   - No duplicate emails (same set of symbols)
 - Risk tools + manual ledger:
   /equity /limits /status /risk /open /closepnl
-- Render safe:
-  - Telegram bot runs in a background thread with its own asyncio loop
-  - FastAPI/Uvicorn runs in main thread (health endpoint)
+- Manual trades supported:
+  /risk BTC 1% 65000 64000  -> opens a MANUAL ledger position with a clear warning
 
-ENV you typically need:
-- TELEGRAM_TOKEN (required)
-- PORT (Render provides)
-Optional:
-- EMAIL_* (if you want email alerts)
+ENV:
+Required:
+- TELEGRAM_TOKEN
+Render:
+- PORT is provided by Render (or defaults to 10000)
+Optional email:
+- EMAIL_ENABLED=true
+- EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO
 """
 
 import asyncio
@@ -74,13 +73,13 @@ PORT = int(os.environ.get("PORT", "10000"))
 UNIVERSE_MIN_FUT_USD = 2_000_000
 LEADERS_MIN_FUT_USD = 5_000_000
 
-LEADERS_TOP_N = 10        # ✅ fixed as requested
+LEADERS_TOP_N = 10        # ✅ fixed
 MOVERS_TOP_N = 10
 SETUPS_TOP_N = 3
 
 # Trigger/Confirm logic
 TRIGGER_1H_PCT = 2.0       # trigger threshold on 1H
-CONFIRM_15M_SIGN = True    # confirm direction on 15m (>=0 for long, <=0 for short)
+CONFIRM_15M_SIGN = True    # confirm direction on 15m sign
 
 # Multi-TP threshold
 CONF_MULTI_TP_MIN = 75
@@ -111,6 +110,7 @@ LAST_ERROR: Optional[str] = None
 
 # OHLC % cache
 PCT_CACHE: Dict[Tuple[str, str, str], float] = {}  # (dtype, symbol, tf) -> pct
+
 
 # =========================================================
 # DATA
@@ -205,6 +205,18 @@ def db_init():
           pnl_usd REAL
         );
         """)
+
+        # Add origin column (BOT vs MANUAL) if missing (safe migration)
+        try:
+            conn.execute("ALTER TABLE signals ADD COLUMN origin TEXT;")
+        except Exception:
+            pass
+
+        # Default any NULL origin to BOT
+        try:
+            conn.execute("UPDATE signals SET origin='BOT' WHERE origin IS NULL;")
+        except Exception:
+            pass
 
         conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_signals_symbol_status_ts
@@ -301,12 +313,13 @@ def db_store_setups_as_signals(recs: List[Tuple]):
     with db_conn() as conn:
         for side, sym, entry, tp, sl, conf in recs:
             conn.execute("""
-                INSERT INTO signals(ts, symbol, side, entry, sl, tp, confidence, status)
-                VALUES(?,?,?,?,?,?,?, 'SIGNAL')
+                INSERT INTO signals(ts, symbol, side, entry, sl, tp, confidence, status, origin)
+                VALUES(?,?,?,?,?,?,?, 'SIGNAL', 'BOT')
             """, (now_ts, sym, side, float(entry), float(sl), float(tp), int(conf)))
         conn.commit()
 
 def db_get_latest_signal(sym: str) -> Optional[sqlite3.Row]:
+    """Prefer latest SIGNAL; if none, return latest OPEN."""
     with db_conn() as conn:
         r = conn.execute("""
             SELECT * FROM signals
@@ -330,6 +343,15 @@ def db_open_from_signal(sig_id: int, risk_usd: float):
             SET status='OPEN', risk_usd=?, opened_ts=?
             WHERE id=? AND status='SIGNAL'
         """, (float(risk_usd), now_ts, int(sig_id)))
+        conn.commit()
+
+def db_open_manual(sym: str, side: str, entry: float, sl: float, tp: float, risk_usd: float):
+    now_ts = int(time.time())
+    with db_conn() as conn:
+        conn.execute("""
+            INSERT INTO signals(ts, symbol, side, entry, sl, tp, confidence, status, risk_usd, opened_ts, origin)
+            VALUES(?,?,?,?,?,?,?, 'OPEN', ?, ?, 'MANUAL')
+        """, (now_ts, sym, side, float(entry), float(sl), float(tp), 0, float(risk_usd), now_ts))
         conn.commit()
 
 def db_closepnl_open_symbol(sym: str, pnl: float) -> Optional[dict]:
@@ -532,7 +554,7 @@ def build_universe(best_fut: Dict[str, MarketVol]) -> List[List]:
         pct24 = pct_change_24h(f)
         pct4h = compute_pct(f.symbol, "1h", 4)
         pct1h = compute_pct(f.symbol, "1h", 1)
-        pct15m = compute_pct(f.symbol, "15m", 1)  # ✅ confirmation timeframe
+        pct15m = compute_pct(f.symbol, "15m", 1)  # confirmation timeframe
         last_price = f.last or 0.0
 
         rows.append([base, fut_usd, pct24, pct4h, pct1h, pct15m, last_price, f.symbol])
@@ -578,7 +600,6 @@ def score_long(row: List) -> float:
     if pct1h > 0: score += min(pct1h / 1.0, 2.0)
     if fut_usd > 10_000_000: score += 2.0
     elif fut_usd > 5_000_000: score += 1.0
-    # small boost if 15m confirmation is positive
     if pct15m > 0: score += 0.5
     return max(score, 0.0)
 
@@ -590,39 +611,33 @@ def score_short(row: List) -> float:
     if pct1h < 0: score += min(abs(pct1h) / 1.0, 2.0)
     if fut_usd > 10_000_000: score += 2.0
     elif fut_usd > 5_000_000: score += 1.0
-    # small boost if 15m confirmation is negative
     if pct15m < 0: score += 0.5
     return max(score, 0.0)
 
 def confidence_from_score(score: float) -> int:
-    # Map internal score into 0..100 for user
     s = max(0.0, min(score, 10.0))
     return int(round((s / 10.0) * 100))
 
 def classify_row(row: List) -> Tuple[bool, bool]:
     """
-    ✅ Trigger: 1H threshold + 4H bias
-    ✅ Confirm: 15m sign must agree (optional but enabled by default)
+    Trigger: 1H threshold + 4H bias
+    Confirm: 15m sign must agree
     """
     _, _, pct24, pct4h, pct1h, pct15m, *_ = row
 
     long_ok = False
     short_ok = False
 
-    # 24h bias gates extremes
     if pct24 > 5.0:
         long_ok = True
-        short_ok = False
     elif pct24 < -5.0:
         short_ok = True
-        long_ok = False
     else:
         if pct1h >= TRIGGER_1H_PCT and pct4h >= 0.0:
             long_ok = True
         if pct1h <= -TRIGGER_1H_PCT and pct4h <= 0.0:
             short_ok = True
 
-    # 15m confirmation
     if CONFIRM_15M_SIGN:
         if long_ok and pct15m < 0:
             long_ok = False
@@ -634,10 +649,7 @@ def classify_row(row: List) -> Tuple[bool, bool]:
 def multi_tp_plan(entry: float, sl: float, side: str, confidence: int):
     if confidence < CONF_MULTI_TP_MIN:
         return None
-    try:
-        entry = float(entry); sl = float(sl)
-    except Exception:
-        return None
+    entry = float(entry); sl = float(sl)
     R = abs(entry - sl)
     if R <= 0:
         return None
@@ -658,9 +670,6 @@ def multi_tp_plan(entry: float, sl: float, side: str, confidence: int):
     }
 
 def pick_best_trades(universe: List[List], top_n: int = SETUPS_TOP_N):
-    """
-    returns list of tuples: (side, sym, entry, tp, sl, confidence)
-    """
     candidates = []
     for r in universe:
         sym, _, _, _, _, _, last_price, _ = r
@@ -802,7 +811,7 @@ What you get:
 • Multi-TP (Confidence ≥ {CONF_MULTI_TP_MIN}): TP1 + TP2 + Runner guidance
 • Trading Window Guard: warns when outside London/NY sessions
 • Risk Tools: equity, risk limits, position sizing
-• Manual Trade Ledger: /risk to “open”, /closepnl to “close” and update equity
+• Manual Trade Ledger: you can also size ANY trade manually (with a warning)
 
 What this bot does NOT do:
 • It does NOT place trades for you (no auto-trading)
@@ -813,9 +822,10 @@ Recommended workflow:
 1) /screen
 2) /equity 1000
 3) /limits 5 200 300
-4) When you like a setup: /risk BTC 1%   (or /risk BTC 10)
-5) Track open positions: /open
-6) Close and update equity: /closepnl BTC +23.5
+4) Pick a setup and size it: /risk BTC 1%
+5) Or size your own idea (manual): /risk BTC 1% 65000 64000
+6) Track open positions: /open
+7) Close and update equity: /closepnl BTC +23.5
 
 Commands:
 • /start — Quick intro
@@ -829,7 +839,7 @@ Risk & Journal:
 • /equity <amount>
 • /limits <maxTradesDay> <maxDailyRiskUSD> <maxOpenRiskUSD>
 • /status
-• /risk <SYMBOL> <RISK>
+• /risk <SYMBOL> <RISK> [ENTRY SL]
 • /open
 • /closepnl <SYMBOL> <PNL>
 """
@@ -852,6 +862,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /equity 1000\n"
         "• /limits 5 200 300\n"
         "• /risk BTC 1%\n"
+        "• /risk BTC 1% 65000 64000 (manual)\n"
         "• /open\n"
         "• /closepnl BTC +23.5\n"
         "• /status\n\n"
@@ -921,7 +932,9 @@ async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         mt, md, mo = get_limits()
-        await update.message.reply_text(f"Limits: trades/day={mt}, daily=${md:,.2f}, open=${mo:,.2f}\nSet: /limits 5 200 300")
+        await update.message.reply_text(
+            f"Limits: trades/day={mt}, daily=${md:,.2f}, open=${mo:,.2f}\nSet: /limits 5 200 300"
+        )
         return
     if len(context.args) < 3:
         await update.message.reply_text("Usage: /limits <maxTradesDay> <maxDailyRiskUSD> <maxOpenRiskUSD>")
@@ -958,7 +971,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db_conn() as conn:
         rows = conn.execute("""
-            SELECT symbol, side, entry, sl, tp, confidence, risk_usd, opened_ts, ts
+            SELECT symbol, side, entry, sl, tp, confidence, risk_usd, opened_ts, ts, origin
             FROM signals WHERE status='OPEN'
             ORDER BY COALESCE(opened_ts, ts) DESC
         """).fetchall()
@@ -971,8 +984,11 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         opened = int(r["opened_ts"] or r["ts"] or now_ts)
         age_hr = (now_ts - opened) / 3600.0
+        origin = (r["origin"] or "BOT").upper()
+        tag = "MANUAL" if origin == "MANUAL" else "BOT"
         lines.append(
-            f"{r['symbol']:6} {r['side']:4} conf {int(r['confidence'] or 0):3d} "
+            f"{r['symbol']:6} {r['side']:4} [{tag}] "
+            f"conf {int(r['confidence'] or 0):3d} "
             f"E:{fmt_price(float(r['entry'] or 0))} SL:{fmt_price(float(r['sl'] or 0))} "
             f"TP:{fmt_price(float(r['tp'] or 0))} risk:${float(r['risk_usd'] or 0):,.2f} "
             f"age:{age_hr:.1f}h"
@@ -1004,8 +1020,17 @@ async def closepnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Two modes:
+
+    1) BOT signal sizing:
+       /risk BTC 1%
+
+    2) Manual sizing (NOT a bot signal) with warning:
+       /risk BTC 1% 65000 64000
+    """
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /risk BTC 1%   OR   /risk BTC 10")
+        await update.message.reply_text("Usage:\n/risk BTC 1%\n/risk BTC 1% 65000 64000 (manual)")
         return
 
     sym = safe_token(context.args[0])
@@ -1016,6 +1041,7 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Set equity first: /equity 1000")
         return
 
+    # Parse risk
     risk_usd = None
     if risk_txt.endswith("%"):
         try:
@@ -1033,6 +1059,7 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid risk amount.")
         return
 
+    # Enforce limits
     mt, md, mo = get_limits()
     day_start = mel_day_start_ts()
     daily_used = db_daily_used_risk(day_start)
@@ -1049,26 +1076,76 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Open risk cap exceeded.")
         return
 
+    # Try to use BOT signal
     sig = db_get_latest_signal(sym)
-    if not sig or sig["status"] != "SIGNAL":
-        await update.message.reply_text(f"No stored SIGNAL for {sym}. Run /screen first.")
+
+    # --- Manual path if no SIGNAL ---
+    if (not sig) or (sig["status"] != "SIGNAL"):
+        if len(context.args) < 4:
+            await update.message.reply_text(
+                f"⚠️ {sym} is NOT a PulseFutures signal.\n"
+                f"Risk management only — trade responsibility is yours.\n\n"
+                f"To size it manually, provide ENTRY and SL:\n"
+                f"/risk {sym} <RISK> <ENTRY> <SL>\n"
+                f"Example: /risk {sym} 1% 65000 64000"
+            )
+            return
+
+        try:
+            entry = float(context.args[2].replace(",", ""))
+            sl = float(context.args[3].replace(",", ""))
+        except Exception:
+            await update.message.reply_text("ENTRY and SL must be numbers. Example: /risk BTC 1% 65000 64000")
+            return
+
+        if entry <= 0 or sl <= 0 or entry == sl:
+            await update.message.reply_text("Invalid ENTRY/SL.")
+            return
+
+        side = "BUY" if sl < entry else "SELL"
+        tp = entry * (1.12 if side == "BUY" else 0.91)
+
+        stop_dist = abs(entry - sl)
+        qty = risk_usd / stop_dist
+        notional = qty * entry
+
+        # open manual in ledger
+        await asyncio.to_thread(db_open_manual, sym, side, entry, sl, tp, risk_usd)
+
+        # record execution
+        now_ts = int(time.time())
+        with db_conn() as conn:
+            conn.execute(
+                "INSERT INTO executions(ts, symbol, side, risk_usd) VALUES(?,?,?,?)",
+                (now_ts, sym, side, float(risk_usd))
+            )
+            conn.commit()
+
+        await update.message.reply_text(
+            "⚠️ Manual position (NOT a PulseFutures signal)\n"
+            "Risk management only — trade responsibility is yours.\n\n"
+            "```\n"
+            f"{sym} {side} [MANUAL]\n"
+            f"Entry {fmt_price(entry)} | SL {fmt_price(sl)}\n"
+            f"Risk ${risk_usd:,.2f} -> Qty {qty:.6g} | Notional ${notional:,.2f}\n"
+            "Close with /closepnl SYMBOL +/-PnL\n"
+            "```",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
+    # --- BOT signal sizing path ---
     entry = float(sig["entry"] or 0)
     sl = float(sig["sl"] or 0)
-    if not entry or not sl:
+    if not entry or not sl or entry == sl:
         await update.message.reply_text("Signal missing entry/SL. Run /screen again.")
         return
 
     stop_dist = abs(entry - sl)
-    if stop_dist <= 0:
-        await update.message.reply_text("Invalid SL distance.")
-        return
-
     qty = risk_usd / stop_dist
     notional = qty * entry
 
-    db_open_from_signal(int(sig["id"]), risk_usd)
+    await asyncio.to_thread(db_open_from_signal, int(sig["id"]), risk_usd)
 
     # record execution
     now_ts = int(time.time())
@@ -1081,7 +1158,8 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "```\n"
-        f"{sym} {sig['side']} | Entry {fmt_price(entry)} | SL {fmt_price(sl)}\n"
+        f"{sym} {sig['side']} [BOT]\n"
+        f"Entry {fmt_price(entry)} | SL {fmt_price(sl)}\n"
         f"Risk ${risk_usd:,.2f} -> Qty {qty:.6g} | Notional ${notional:,.2f}\n"
         "Close with /closepnl SYMBOL +/-PnL\n"
         "```",
@@ -1098,20 +1176,27 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         movers = await asyncio.to_thread(scan_strong_movers, best_fut)
         recs = await asyncio.to_thread(pick_best_trades, universe, SETUPS_TOP_N)
 
-        # store setups so /risk can work
+        # store setups so /risk can use SIGNAL entries
         if is_in_trading_window(get_session_mode()) and recs:
             await asyncio.to_thread(db_store_setups_as_signals, recs)
 
         warn = trading_window_warning() or ""
 
+        # ✅ spacing: after each table add a blank line before next sentence/section
         msg = ""
         msg += warn or ""
         msg += "ℹ️ Market Leaders show where liquidity and momentum are concentrated right now.\n\n"
         msg += fmt_leaders(leaders)
+        msg += "\n"  # extra gap after leaders table
+
         msg += "ℹ️ Strong Movers are for market context only — not trade signals.\n\n"
         msg += fmt_movers(movers)
+        msg += "\n"  # extra gap after movers table
+
         msg += "ℹ️ Trade Setups are the only actionable ideas (entry, SL, TP).\n\n"
-        msg += f"*🎯 Trade Setups (Top {SETUPS_TOP_N})*:\n" + format_trade_setups(recs)
+        msg += f"*🎯 Trade Setups (Top {SETUPS_TOP_N})*\n\n"
+        msg += format_trade_setups(recs)
+
         msg += f"\n\n`tickers: fut={raw_fut}`"
 
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -1126,11 +1211,15 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     sig = await asyncio.to_thread(db_get_latest_signal, token)
     if not sig:
-        await update.message.reply_text("No stored signal. Run /screen first.")
+        await update.message.reply_text("No stored signal/position. Run /screen first (or use /risk SYMBOL RISK ENTRY SL).")
         return
+
+    origin = (sig["origin"] or "BOT").upper()
+    tag = "MANUAL" if origin == "MANUAL" else "BOT"
+
     await update.message.reply_text(
         "```\n"
-        f"{sig['symbol']} ({sig['status']}) {sig['side']}\n"
+        f"{sig['symbol']} ({sig['status']}) {sig['side']} [{tag}]\n"
         f"Entry {fmt_price(float(sig['entry'] or 0))} | SL {fmt_price(float(sig['sl'] or 0))} | TP {fmt_price(float(sig['tp'] or 0))}\n"
         f"Confidence {int(sig['confidence'] or 0)}/100\n"
         "```",
@@ -1180,6 +1269,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
         body_parts = []
         if recs:
+            # strip markdown emphasis for email
             body_parts.append("Trade Setups (Confidence-based):\n" + re.sub(r"\*+", "", format_trade_setups(recs)))
         if movers:
             mv_lines = "\n".join(
@@ -1229,7 +1319,7 @@ def run_api_server():
 
 
 # =========================================================
-# Bot runner (Thread-safe for Py3.11)
+# Bot runner (Thread-safe for Py3.11 + Render)
 # =========================================================
 
 def run_bot():
