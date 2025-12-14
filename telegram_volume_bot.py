@@ -14,6 +14,7 @@ Core principles:
 - Risk Ledger: /equity, /limits, /risk, /open, /closepnl, /status
 - Multi-TP for high-confidence setups (Conf >= 75): TP1/TP2 + Runner suggestion
 - Optional email alerts (/notify_on /notify_off) + scheduled job via JobQueue
+- Bilingual /help (FA + EN)
 
 Required env vars:
 - TELEGRAM_TOKEN
@@ -22,7 +23,7 @@ Optional email env vars:
 - EMAIL_ENABLED=true/false
 - EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO
 
-Install:
+Install (requirements.txt):
 - python-telegram-bot[job-queue]>=20.7,<22.0
 - ccxt>=4.0.0
 - tabulate>=0.9.0
@@ -38,7 +39,7 @@ import smtplib
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from email.message import EmailMessage
 from typing import Dict, List, Tuple, Optional, Set
 
@@ -99,11 +100,12 @@ LAST_EMAIL_KEYS: Set[str] = set()
 LAST_ERROR: Optional[str] = None
 NOTIFY_ON: bool = EMAIL_ENABLED_DEFAULT
 
-# Cache for OHLC % changes (keep small)
+# Cache for OHLC % changes
 PCT_CACHE: Dict[Tuple[str, str, str], float] = {}  # (dtype, symbol, tf) -> pct
 
 # DB path
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
+
 
 # =========================================================
 # DATA STRUCTURES
@@ -221,9 +223,6 @@ def set_limits(max_trades: int, max_daily: float, max_open: float):
     db_set_setting("max_open_risk_usd", str(float(max_open)))
 
 def mel_day_start_ts() -> int:
-    """
-    Start of 'today' in Australia/Melbourne as unix ts.
-    """
     tz = ZoneInfo("Australia/Melbourne")
     now = datetime.now(tz)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -249,21 +248,6 @@ def db_open_count() -> int:
         r = conn.execute("SELECT COUNT(*) AS c FROM signals WHERE status='OPEN'", ()).fetchone()
         return int(r["c"] or 0)
 
-def db_apply_pnl_to_equity(pnl_usd: float) -> float:
-    with db_conn() as conn:
-        r = conn.execute("SELECT value FROM settings WHERE key='equity'").fetchone()
-        if not r or r["value"] is None:
-            raise RuntimeError("Equity not set")
-        eq = float(r["value"])
-        new_eq = eq + float(pnl_usd)
-        conn.execute(
-            "INSERT INTO settings(key,value) VALUES('equity',?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (str(new_eq),)
-        )
-        conn.commit()
-        return new_eq
-
 
 # =========================================================
 # SESSION MODE (Trading Window Guard)
@@ -279,13 +263,8 @@ def set_session_mode(mode: str):
     db_set_setting("session_mode", mode)
 
 def is_in_trading_window(session_mode: str) -> bool:
-    """
-    session_mode: both | london | ny | off
-    all in UTC
-    """
     if session_mode == "off":
         return True
-
     now_utc = datetime.utcnow()
     h = now_utc.hour + now_utc.minute / 60.0
 
@@ -299,7 +278,7 @@ def is_in_trading_window(session_mode: str) -> bool:
         return in_london
     if session_mode == "ny":
         return in_ny
-    return in_london or in_ny  # both
+    return in_london or in_ny
 
 def trading_window_warning() -> Optional[str]:
     mode = get_session_mode()
@@ -357,7 +336,6 @@ def usd_notional(mv: Optional[MarketVol]) -> float:
     return mv.base_vol * price
 
 def pct_change_24h(mv_spot: Optional[MarketVol], mv_fut: Optional[MarketVol]) -> float:
-    # futures only here; keep signature for compatibility
     mv = mv_fut or mv_spot
     if not mv:
         return 0.0
@@ -378,10 +356,6 @@ def safe_fetch_tickers_swap(ex):
         return {}
 
 def load_best_futures():
-    """
-    Load best futures market per BASE from CoinEx swap.
-    Returns best_fut dict + raw count.
-    """
     ex = build_exchange_swap()
     fut_tickers = safe_fetch_tickers_swap(ex)
 
@@ -395,10 +369,7 @@ def load_best_futures():
 
     return best_fut, len(fut_tickers)
 
-def compute_pct_for_symbol(symbol: str, hours: int, prefer_swap: bool = True) -> float:
-    """
-    % change over last N hours using 1h candles.
-    """
+def compute_pct_for_symbol(symbol: str, hours: int) -> float:
     dtype = "swap"
     tf_key = f"{hours}h"
     cache_key = (dtype, symbol, tf_key)
@@ -431,7 +402,6 @@ def compute_pct_for_symbol(symbol: str, hours: int, prefer_swap: bool = True) ->
 
 def build_universe(best_fut: Dict[str, MarketVol]) -> List[List]:
     """
-    Futures-only eligible universe
     row: [BASE, fut_usd, pct24, pct4, pct1, last_price, fut_symbol]
     """
     rows: List[List] = []
@@ -441,8 +411,8 @@ def build_universe(best_fut: Dict[str, MarketVol]) -> List[List]:
             continue
 
         pct24 = pct_change_24h(None, f)
-        pct4 = compute_pct_for_symbol(f.symbol, 4, prefer_swap=True)
-        pct1 = compute_pct_for_symbol(f.symbol, 1, prefer_swap=True)
+        pct4 = compute_pct_for_symbol(f.symbol, 4)
+        pct1 = compute_pct_for_symbol(f.symbol, 1)
 
         last_price = f.last or 0.0
         rows.append([base, fut_usd, pct24, pct4, pct1, last_price, f.symbol])
@@ -525,31 +495,19 @@ def classify_row_u(row: List) -> Tuple[bool, bool]:
     return long_ok, short_ok
 
 def confidence_from_score(score: float) -> int:
-    """
-    Map internal score (~0..10) to 0..100
-    """
     s = max(0.0, min(score, 10.0))
     return int(round((s / 10.0) * 100))
 
 def multi_tp_plan(entry: float, sl: float, side: str, confidence: int):
-    """
-    If confidence >= 75:
-      TP1 = 1R, TP2 = 2R, Runner suggestion
-    else:
-      None
-    """
     if confidence < CONF_MULTI_TP_MIN:
         return None
-
     try:
         entry = float(entry); sl = float(sl)
     except Exception:
         return None
-
     R = abs(entry - sl)
     if R <= 0:
         return None
-
     side = (side or "").upper()
     if side == "BUY":
         tp1 = entry + 1.0 * R
@@ -559,7 +517,6 @@ def multi_tp_plan(entry: float, sl: float, side: str, confidence: int):
         tp1 = entry - 1.0 * R
         tp2 = entry - 2.0 * R
         runner = "Runner (20%) — trail EMA20 (1H) or last 15m swing-high"
-
     return {
         "R": R,
         "tp1": tp1,
@@ -569,13 +526,9 @@ def multi_tp_plan(entry: float, sl: float, side: str, confidence: int):
     }
 
 def pick_best_trades_u(universe: List[List], top_n: int = SETUPS_TOP_N):
-    """
-    Return top N trade setups from Universe.
-    Each candidate: (side, sym, entry, tp, sl, score, confidence)
-    """
     candidates = []
     for r in universe:
-        base, _, pct24, pct4, pct1, last_price, _ = r
+        base, _, _, pct4, pct1, last_price, _ = r
         if not last_price or last_price <= 0:
             continue
 
@@ -590,7 +543,7 @@ def pick_best_trades_u(universe: List[List], top_n: int = SETUPS_TOP_N):
                 conf = confidence_from_score(sc)
                 plan = multi_tp_plan(entry, sl, "BUY", conf)
                 if plan:
-                    tp = plan["tp2"]  # store TP2 as main TP
+                    tp = plan["tp2"]
                 candidates.append(("BUY", base, entry, tp, sl, sc, conf))
 
         if short_ok:
@@ -665,10 +618,6 @@ def fmt_movers(movers: List[Tuple[str, float, float]]) -> str:
     )
 
 def format_trade_setups(recs: List[Tuple]) -> str:
-    """
-    recs: (side, sym, entry, tp, sl, score, conf)
-    show Multi-TP if conf>=75
-    """
     if not recs:
         return "_No strong setups right now._"
 
@@ -696,10 +645,6 @@ def format_trade_setups(recs: List[Tuple]) -> str:
 # =========================================================
 
 def db_store_setups_as_signals(recs: List[Tuple]):
-    """
-    recs: (side, sym, entry, tp, sl, score, conf)
-    Store as status=SIGNAL
-    """
     now_ts = int(time.time())
     with db_conn() as conn:
         for side, sym, entry, tp, sl, score, conf in recs:
@@ -710,9 +655,6 @@ def db_store_setups_as_signals(recs: List[Tuple]):
         conn.commit()
 
 def db_get_latest_signal(sym: str) -> Optional[sqlite3.Row]:
-    """
-    Find latest SIGNAL for symbol (any side), else latest OPEN.
-    """
     with db_conn() as conn:
         r = conn.execute("""
             SELECT *
@@ -733,10 +675,6 @@ def db_get_latest_signal(sym: str) -> Optional[sqlite3.Row]:
         return r2
 
 def db_open_from_signal(sig_id: int, risk_usd: float) -> int:
-    """
-    Convert SIGNAL->OPEN and attach risk_usd/opened_ts.
-    returns id
-    """
     now_ts = int(time.time())
     with db_conn() as conn:
         conn.execute("""
@@ -748,9 +686,6 @@ def db_open_from_signal(sig_id: int, risk_usd: float) -> int:
     return sig_id
 
 def db_close_open_symbol(sym: str, result: str) -> bool:
-    """
-    Close latest OPEN for symbol without pnl.
-    """
     now_ts = int(time.time())
     with db_conn() as conn:
         r = conn.execute("""
@@ -770,10 +705,6 @@ def db_close_open_symbol(sym: str, result: str) -> bool:
         return True
 
 def db_closepnl_open_symbol(sym: str, pnl: float) -> Optional[dict]:
-    """
-    Close latest OPEN for symbol with pnl and equity update.
-    returns details dict
-    """
     now_ts = int(time.time())
     result = "win" if pnl > 0 else ("loss" if pnl < 0 else "flat")
 
@@ -860,13 +791,77 @@ def send_email(subject: str, body: str) -> bool:
 
 
 # =========================================================
-# TELEGRAM COMMANDS
+# COMMANDS: /start + /help (bilingual)
 # =========================================================
+
+HELP_TEXT = """📘 User Guide — راهنمای استفاده از ربات (FA/EN)
+
+━━━━━━━━━━━━━━━━━━━━
+🇮🇷 فارسی
+━━━━━━━━━━━━━━━━━━━━
+این ربات برای «دید کلی بازار + بهترین ستاپ‌های قابل‌اجرا» ساخته شده (فقط Futures).
+ربات خودش معامله باز نمی‌کند؛ فقط سیگنال + مدیریت ریسک + دفتر ثبت (Ledger) است.
+
+1) خروجی اصلی
+/screen
+- 🔥 Market Leaders (BIAS: LONG/SHORT/NEUTRAL)
+- 🚀 Strong Movers (24h)
+- 🎯 Trade Setups (Top 3) + Confidence
+- اگر Confidence ≥ 75 باشد: Multi-TP (TP1/TP2/Runner)
+
+اگر ستاپی نبود: No strong setups right now.  (یعنی فیلترها سخت‌گیر هستند)
+
+2) Trading Window Guard
+/session both|london|ny|off
+پیش‌فرض: London + NY (بهترین حجم/حرکت)
+
+3) شروع مدیریت ریسک
+/equity 1000
+/limits 5 200 300   (maxTrades/day, maxDailyRisk$, maxOpenRisk$)
+/screen
+/risk BTC 1%   یا   /risk BTC 10
+
+4) پوزیشن‌ها و بستن
+/open
+/closepnl BTC +23.5   (equity را آپدیت می‌کند)
+/close BTC win|loss|flat   (بدون عدد دقیق)
+
+5) وضعیت ریسک امروز
+/status
+
+━━━━━━━━━━━━━━━━━━━━
+🇺🇸 English
+━━━━━━━━━━━━━━━━━━━━
+This bot provides market overview + high-quality futures setups. It does NOT place trades for you.
+
+Main:
+/screen
+- Leaders + Movers + Top 3 Setups (Confidence 0–100)
+- Confidence ≥ 75 → Multi-TP (TP1/TP2/Runner)
+
+Trading sessions:
+/session both|london|ny|off
+
+Risk setup:
+/equity 1000
+/limits 5 200 300
+/screen
+/risk BTC 1%  or  /risk BTC 10
+
+Open/Close ledger:
+/open
+/closepnl BTC +20  (updates equity)
+/close BTC win|loss|flat
+
+Daily status:
+/status
+"""
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Commands:\n"
         "• /screen — Market Leaders + Movers + Top Setups\n"
+        "• /help — User Guide (FA/EN)\n"
         "• /session [both|london|ny|off]\n"
         "• /equity 1000\n"
         "• /limits 5 200 300   (maxTrades/day, maxDailyRisk$, maxOpenRisk$)\n"
@@ -879,6 +874,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /diag\n"
     )
     await update.message.reply_text(text)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
 
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = get_session_mode()
@@ -1012,7 +1010,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         eq = get_equity()
-        mt, md, mo = get_limits()
+        _, _, mo = get_limits()
 
         def _fetch_open():
             with db_conn() as conn:
@@ -1052,7 +1050,6 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 risk_pct = f" ({(risk / eq) * 100.0:.2f}%)"
 
             plan = multi_tp_plan(entry, sl, side, conf)
-
             if plan:
                 tp_block = f"TP1 {plan['tp1']:.6g} | TP2 {plan['tp2']:.6g} | Runner"
             else:
@@ -1149,7 +1146,6 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Equity is not set. Set it first: /equity 1000")
         return
 
-    # Parse risk
     risk_usd = None
     if risk_txt.endswith("%"):
         try:
@@ -1189,6 +1185,10 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No stored signal found for {sym}. Run /screen first.")
         return
 
+    if sig["status"] != "SIGNAL":
+        await update.message.reply_text(f"{sym} already has an OPEN position in ledger. Use /open or /closepnl.")
+        return
+
     entry = float(sig["entry"] or 0)
     sl = float(sig["sl"] or 0)
     tp = float(sig["tp"] or 0)
@@ -1208,14 +1208,8 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     qty = risk_usd / stop_dist
     notional = qty * entry
 
-    # Convert SIGNAL -> OPEN if possible; otherwise if already OPEN just record execution
     sig_id = int(sig["id"])
-    if sig["status"] == "SIGNAL":
-        await asyncio.to_thread(db_open_from_signal, sig_id, risk_usd)
-    else:
-        # If latest is OPEN, do NOT open again
-        await update.message.reply_text(f"{sym} already has an OPEN position in ledger. Use /open or /closepnl.")
-        return
+    await asyncio.to_thread(db_open_from_signal, sig_id, risk_usd)
 
     # Record execution for daily risk + trades/day
     now_ts = int(time.time())
@@ -1258,13 +1252,6 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /screen shows:
-    - Leaders
-    - Movers
-    - Setups (Top 3)
-    Also stores setups into DB as SIGNAL, but only if inside trading window.
-    """
     try:
         PCT_CACHE.clear()
 
@@ -1275,9 +1262,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         recs = await asyncio.to_thread(pick_best_trades_u, universe, SETUPS_TOP_N)
 
         warn = trading_window_warning() or ""
-
-        # Store signals only if inside trading window (guard)
         mode = get_session_mode()
+
+        # store signals only when inside session window (unless session off)
         if is_in_trading_window(mode) and recs:
             await asyncio.to_thread(db_store_setups_as_signals, recs)
 
@@ -1299,9 +1286,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {e}")
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    If user types a symbol like BTC -> show latest stored SIGNAL/OPEN details.
-    """
     text = (update.message.text or "").strip()
     token = re.sub(r"[^A-Za-z$]", "", text).upper().lstrip("$")
     if len(token) < 2:
@@ -1369,14 +1353,12 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not recs and not movers:
             return
 
-        # Dedup: keys based on symbols + side for recs and symbols for movers
         rec_keys = {f"{side}:{sym}" for side, sym, *_ in recs}
         mov_keys = {f"M:{sym}" for sym, *_ in movers}
         keys = rec_keys | mov_keys
         if keys and keys == LAST_EMAIL_KEYS:
             return
 
-        # store setups as signals (so /risk can use)
         if recs:
             await asyncio.to_thread(db_store_setups_as_signals, recs)
 
@@ -1428,6 +1410,7 @@ def main():
 
     # core
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("screen", screen_cmd))
     app.add_handler(CommandHandler("session", session_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
