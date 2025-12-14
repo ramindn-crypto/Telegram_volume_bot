@@ -126,6 +126,9 @@ LAST_ERROR: Optional[str] = None
 # OHLC % cache
 PCT_CACHE: Dict[Tuple[str, str, str], float] = {}  # (dtype, symbol, tf) -> pct
 
+# Leverage guide thresholds
+EFFECTIVE_LEV_WARN = 5.0   # warn if Notional/Equity > 5x
+
 
 # =========================================================
 # DATA
@@ -182,6 +185,34 @@ def m_dollars(x: float) -> str:
 
 def safe_token(s: str) -> str:
     return re.sub(r"[^A-Za-z$]", "", s).upper().lstrip("$")
+
+
+def leverage_guide_block(notional: float, equity: float) -> str:
+    """
+    Returns a text block:
+    - Effective Leverage
+    - Margin guide for common leverages
+    - Warning if aggressive
+    """
+    if equity <= 0:
+        return ""
+    eff = notional / equity
+
+    # margin estimate for typical leverages
+    levels = [3, 5, 10, 20]
+    margins = []
+    for L in levels:
+        margins.append(f"{L}x≈${(notional / L):,.2f}")
+
+    warn = ""
+    if eff >= EFFECTIVE_LEV_WARN:
+        warn = f"⚠️ Effective leverage is high ({eff:.1f}x). Consider smaller Qty or wider SL.\n"
+
+    return (
+        f"{warn}"
+        f"Effective Leverage: {eff:.2f}x  (Notional/Equity)\n"
+        f"Margin guide: " + " | ".join(margins)
+    )
 
 
 # =========================================================
@@ -242,7 +273,6 @@ def db_init():
         ON executions(ts DESC);
         """)
 
-        # Backfill
         conn.execute("UPDATE signals SET origin='BOT' WHERE origin IS NULL;")
         conn.commit()
 
@@ -325,7 +355,6 @@ def db_store_setups_as_signals(recs: List[Tuple]):
         conn.commit()
 
 def db_get_latest_signal(sym: str) -> Optional[sqlite3.Row]:
-    """Prefer latest SIGNAL; if none, return latest OPEN."""
     with db_conn() as conn:
         r = conn.execute("""
             SELECT * FROM signals
@@ -562,7 +591,6 @@ def make_chart_png(fut_symbol: str, title: str, out_path: str, timeframe: str = 
     xs = [c[0] for c in candles]
     closes = [c[4] for c in candles]
 
-    # Simple, clean mini chart
     plt.figure(figsize=(5.2, 2.2), dpi=160)
     plt.plot(xs, closes, linewidth=1.2)
     plt.title(title, fontsize=9)
@@ -589,7 +617,7 @@ def build_universe(best_fut: Dict[str, MarketVol]) -> List[List]:
         pct24 = pct_change_24h(f)
         pct4h = compute_pct(f.symbol, "1h", 4)
         pct1h = compute_pct(f.symbol, "1h", 1)
-        pct15m = compute_pct(f.symbol, "15m", 1)  # confirmation timeframe
+        pct15m = compute_pct(f.symbol, "15m", 1)
         last_price = f.last or 0.0
 
         rows.append([base, fut_usd, pct24, pct4h, pct1h, pct15m, last_price, f.symbol])
@@ -654,10 +682,6 @@ def confidence_from_score(score: float) -> int:
     return int(round((s / 10.0) * 100))
 
 def classify_row(row: List) -> Tuple[bool, bool]:
-    """
-    Trigger: 1H threshold + 4H bias
-    Confirm: 15m sign must agree
-    """
     _, _, pct24, pct4h, pct1h, pct15m, *_ = row
 
     long_ok = False
@@ -733,7 +757,7 @@ def pick_best_trades(universe: List[List], top_n: int = SETUPS_TOP_N):
                 tp = (plan["tp2"] if plan else entry * 0.91)
                 candidates.append(("SELL", sym, entry, tp, sl, conf))
 
-    candidates.sort(key=lambda x: x[5], reverse=True)  # confidence desc
+    candidates.sort(key=lambda x: x[5], reverse=True)
     return candidates[:top_n]
 
 
@@ -792,7 +816,6 @@ def format_trade_setups(recs: List[Tuple]) -> str:
     return "\n".join(lines).strip()
 
 def snapshot_for_symbol(universe: List[List], sym: str) -> Optional[str]:
-    # universe row: [BASE, fut_usd, pct24, pct4h, pct1h, pct15m, last_price, fut_symbol]
     for r in universe:
         if r[0] == sym:
             _, fut_usd, pct24, pct4h, pct1h, *_ = r
@@ -823,9 +846,6 @@ def melbourne_is_sunday() -> bool:
     return now.weekday() == 6  # Sunday
 
 def send_email(subject: str, text_body: str, html_body: Optional[str] = None, inline_images: Optional[List[Tuple[str, str]]] = None) -> bool:
-    """
-    inline_images: list of (cid, filepath)
-    """
     if not email_config_ok():
         return False
     try:
@@ -838,8 +858,6 @@ def send_email(subject: str, text_body: str, html_body: Optional[str] = None, in
 
         if html_body:
             msg.add_alternative(html_body, subtype="html")
-
-            # Attach inline images to the LAST part (html)
             if inline_images:
                 for cid, path in inline_images:
                     try:
@@ -890,6 +908,14 @@ What you get:
 • Risk Tools: equity, risk limits, position sizing
 • Manual Trade Ledger: you can also size ANY trade manually (with a warning)
 • Optional chart snapshots (if enabled)
+
+Leverage & Notional (important):
+• Qty = how many coins/contracts you trade
+• Notional = Qty × Entry (the position size in USD at entry price)
+• Effective Leverage = Notional / Equity (your real exposure vs your account)
+• The bot also shows a Margin guide for common leverages (3x/5x/10x/20x):
+  Margin ≈ Notional / Leverage
+If Effective Leverage is high (e.g. > {EFFECTIVE_LEV_WARN:.0f}x), the bot will warn you.
 
 What this bot does NOT do:
 • It does NOT place trades for you (no auto-trading)
@@ -1155,14 +1181,13 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Open risk cap exceeded.")
         return
 
-    # Try to use BOT signal
     sig = db_get_latest_signal(sym)
 
     # --- Manual path if no SIGNAL ---
     if (not sig) or (sig["status"] != "SIGNAL"):
         if len(context.args) < 4:
             await update.message.reply_text(
-                f"⚠️ {sym} is NOT a PulseFutures signal.\n"
+                f"⚠️ {sym} is NOT a {BOT_NAME} signal.\n"
                 f"Risk management only — trade responsibility is yours.\n\n"
                 f"To size it manually, provide ENTRY and SL:\n"
                 f"/risk {sym} <RISK> <ENTRY> <SL>\n"
@@ -1188,7 +1213,6 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qty = risk_usd / stop_dist
         notional = qty * entry
 
-        # open manual in ledger
         await asyncio.to_thread(db_open_manual, sym, side, entry, sl, tp, risk_usd)
 
         # record execution
@@ -1200,6 +1224,8 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             conn.commit()
 
+        lev_block = leverage_guide_block(notional, eq)
+
         await update.message.reply_text(
             "⚠️ Manual position (NOT a PulseFutures signal)\n"
             "Risk management only — trade responsibility is yours.\n\n"
@@ -1207,6 +1233,7 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{sym} {side} [MANUAL]\n"
             f"Entry {fmt_price(entry)} | SL {fmt_price(sl)}\n"
             f"Risk ${risk_usd:,.2f} -> Qty {qty:.6g} | Notional ${notional:,.2f}\n"
+            f"{lev_block}\n"
             "Close with /closepnl SYMBOL +/-PnL\n"
             "```",
             parse_mode=ParseMode.MARKDOWN
@@ -1235,11 +1262,14 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
 
+    lev_block = leverage_guide_block(notional, eq)
+
     await update.message.reply_text(
         "```\n"
         f"{sym} {sig['side']} [BOT]\n"
         f"Entry {fmt_price(entry)} | SL {fmt_price(sl)}\n"
         f"Risk ${risk_usd:,.2f} -> Qty {qty:.6g} | Notional ${notional:,.2f}\n"
+        f"{lev_block}\n"
         "Close with /closepnl SYMBOL +/-PnL\n"
         "```",
         parse_mode=ParseMode.MARKDOWN
@@ -1255,22 +1285,20 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         movers = await asyncio.to_thread(scan_strong_movers, best_fut)
         recs = await asyncio.to_thread(pick_best_trades, universe, SETUPS_TOP_N)
 
-        # store setups so /risk can use SIGNAL entries
         if is_in_trading_window(get_session_mode()) and recs:
             await asyncio.to_thread(db_store_setups_as_signals, recs)
 
         warn = trading_window_warning() or ""
 
-        # ✅ spacing: after each table add a blank line before next sentence/section
         msg = ""
         msg += warn or ""
         msg += "ℹ️ Market Leaders show where liquidity and momentum are concentrated right now.\n\n"
         msg += fmt_leaders(leaders)
-        msg += "\n"  # extra gap after leaders table
+        msg += "\n"
 
         msg += "ℹ️ Strong Movers are for market context only — not trade signals.\n\n"
         msg += fmt_movers(movers)
-        msg += "\n"  # extra gap after movers table
+        msg += "\n"
 
         msg += "ℹ️ Trade Setups are the only actionable ideas (entry, SL, TP).\n\n"
         msg += f"*🎯 Trade Setups (Top {SETUPS_TOP_N})*\n\n"
@@ -1326,7 +1354,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# Email Alert Job (optional) — now includes per-setup snapshot + optional charts
+# Email Alert Job (optional) — includes per-setup snapshot + optional charts
 # =========================================================
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1365,7 +1393,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if keys and keys == LAST_EMAIL_KEYS:
             return
 
-        # Build text + HTML
         text_parts = []
         html_parts = [f"<h2>{BOT_NAME} Alert</h2>"]
 
@@ -1389,7 +1416,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     text_lines.append(f"TP1 {fmt_price(plan['tp1'])} | TP2 {fmt_price(plan['tp2'])}")
                     text_lines.append(plan["runner_text"])
 
-                # HTML block
                 html_block = f"""
                 <div style="margin-bottom:14px;padding:10px;border:1px solid #ddd;border-radius:10px;">
                   <b>Setup #{idx}</b>: {side} {sym} — <b>Confidence {conf}/100</b><br/>
@@ -1401,7 +1427,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if plan:
                     html_block += f"<div style='margin-top:6px;font-size:12px;'>Multi-TP: {plan['weights']}<br/>TP1 {fmt_price(plan['tp1'])} | TP2 {fmt_price(plan['tp2'])}<br/>{plan['runner_text']}</div>"
 
-                # Optional chart
                 if CHARTS_ENABLED:
                     fut_sym = fut_symbol_for_base(universe, sym)
                     if fut_sym:
