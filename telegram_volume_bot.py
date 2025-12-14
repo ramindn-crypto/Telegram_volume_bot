@@ -1357,6 +1357,10 @@ def run_api_server():
 # =========================================================
 
 def run_bot():
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
