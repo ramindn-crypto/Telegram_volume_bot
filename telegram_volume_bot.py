@@ -1,34 +1,24 @@
 #!/usr/bin/env python3
 """
-PulseFutures — Futures-only Telegram crypto scanner + trade setups + risk tools (Render-friendly)
+PulseFutures — Futures-only Telegram scanner + day-trader setups + risk tools (Render-friendly)
 
-✅ Current testing mode (NO paywall / NO locks):
-- Market Leaders: Top 10 (simple)
-- Strong Movers (24h): Top 10 (context only)
-- Trade Setups: Top 3 + Setup numbering (#1..#3)
-- Confidence ONLY (no score shown)
-- Trigger on 1H, confirmation on 15M
-- Trading Window Guard (default: London + NY) with WARNING
-- Email alerts optional (if EMAIL_* configured):
-  - NO emails on Sundays (Melbourne time)
-  - No duplicate emails (same set of symbols)
-  - Email includes per-setup Market Snapshot (F + 24/4/1h)
-  - Optional chart snapshots (inline + attach) if CHARTS_ENABLED=true
-- Risk tools + manual ledger:
-  /equity /limits /status /risk /open /closepnl
-- Manual trades supported with warning:
-  /risk BTC 1% 65000 64000
+Key changes (Day Trader optimized):
+- SL/TP smaller: SL=3%, TP=6%
+- Signal expiry (time-stop): SIGNAL older than 24h -> EXPIRED (not actionable)
+- Email:
+  - Min interval: 60 minutes
+  - Only if at least one setup with Confidence >= 75
+  - Per-symbol cooldown: 6 hours (avoid fatigue)
+  - Persist last email + symbol timestamps in SQLite (no duplicates after restart)
+  - Only inside London/NY sessions (unless session_mode=off)
+  - Email sends Top 2 setups (screen can still show Top 3)
 
-ENV:
-Required:
-- TELEGRAM_TOKEN
-Render:
-- PORT is provided by Render (or defaults to 10000)
-Optional email:
-- EMAIL_ENABLED=true
-- EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO
+Risk tools:
+- /equity /limits /status /risk /open /closepnl
+- /risk supports manual sizing with warning: /risk BTC 1% 65000 64000
+
 Optional charts:
-- CHARTS_ENABLED=true  (requires matplotlib in requirements)
+- CHARTS_ENABLED=true (requires matplotlib in requirements)
 """
 
 import asyncio
@@ -61,7 +51,7 @@ from telegram.ext import (
     filters,
 )
 
-# Optional charts (matplotlib)
+# Optional charts
 CHARTS_ENABLED = os.environ.get("CHARTS_ENABLED", "false").lower() == "true"
 try:
     if CHARTS_ENABLED:
@@ -81,23 +71,31 @@ EXCHANGE_ID = "coinex"
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
-
 PORT = int(os.environ.get("PORT", "10000"))
 
 # Futures-only Universe / Display sizes
 UNIVERSE_MIN_FUT_USD = 2_000_000
 LEADERS_MIN_FUT_USD = 5_000_000
 
-LEADERS_TOP_N = 10        # ✅ fixed
+LEADERS_TOP_N = 10
 MOVERS_TOP_N = 10
-SETUPS_TOP_N = 3
+SETUPS_TOP_N_SCREEN = 3
+SETUPS_TOP_N_EMAIL = 2
 
 # Trigger/Confirm logic
-TRIGGER_1H_PCT = 2.0       # trigger threshold on 1H
-CONFIRM_15M_SIGN = True    # confirm direction on 15m sign
+TRIGGER_1H_PCT = 2.0
+CONFIRM_15M_SIGN = True
 
-# Multi-TP threshold
+# Confidence thresholds
 CONF_MULTI_TP_MIN = 75
+EMAIL_CONF_GATE = 75
+
+# Day-trader SL/TP (%)
+SL_PCT = 0.03
+TP_PCT = 0.06
+
+# Signal expiry (time-stop) for signals not opened
+SIGNAL_EXPIRY_HOURS = 24
 
 # Trading sessions in UTC
 SESSION_LONDON = (7, 16)    # 07:00–16:00 UTC
@@ -107,7 +105,7 @@ DEFAULT_SESSION_MODE = "both"  # both | london | ny | off
 # Scheduler
 CHECK_INTERVAL_MIN = 5
 
-# Email (optional)
+# Email
 EMAIL_ENABLED_DEFAULT = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
 EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465"))
@@ -116,18 +114,20 @@ EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
 EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 
-EMAIL_MIN_INTERVAL_SEC = 15 * 60
-LAST_EMAIL_TS: float = 0.0
-LAST_EMAIL_KEYS: Set[str] = set()
+# ✅ 60 minutes interval
+EMAIL_MIN_INTERVAL_SEC = 60 * 60
+
+# ✅ Per-symbol cooldown (seconds)
+EMAIL_SYMBOL_COOLDOWN_SEC = 6 * 60 * 60
 
 NOTIFY_ON: bool = EMAIL_ENABLED_DEFAULT
 LAST_ERROR: Optional[str] = None
 
 # OHLC % cache
-PCT_CACHE: Dict[Tuple[str, str, str], float] = {}  # (dtype, symbol, tf) -> pct
+PCT_CACHE: Dict[Tuple[str, str, str], float] = {}
 
 # Leverage guide thresholds
-EFFECTIVE_LEV_WARN = 5.0   # warn if Notional/Equity > 5x
+EFFECTIVE_LEV_WARN = 5.0
 
 
 # =========================================================
@@ -148,11 +148,10 @@ class MarketVol:
 
 
 # =========================================================
-# UTILS: formatting
+# UTILS
 # =========================================================
 
 def fmt_price(px: float) -> str:
-    """Dynamic decimals for price-like numbers (trader-friendly)."""
     try:
         px = float(px)
     except Exception:
@@ -186,28 +185,18 @@ def m_dollars(x: float) -> str:
 def safe_token(s: str) -> str:
     return re.sub(r"[^A-Za-z$]", "", s).upper().lstrip("$")
 
+def now_ts() -> int:
+    return int(time.time())
 
 def leverage_guide_block(notional: float, equity: float) -> str:
-    """
-    Returns a text block:
-    - Effective Leverage
-    - Margin guide for common leverages
-    - Warning if aggressive
-    """
     if equity <= 0:
         return ""
     eff = notional / equity
-
-    # margin estimate for typical leverages
     levels = [3, 5, 10, 20]
-    margins = []
-    for L in levels:
-        margins.append(f"{L}x≈${(notional / L):,.2f}")
-
+    margins = [f"{L}x≈${(notional / L):,.2f}" for L in levels]
     warn = ""
     if eff >= EFFECTIVE_LEV_WARN:
         warn = f"⚠️ Effective leverage is high ({eff:.1f}x). Consider smaller Qty or wider SL.\n"
-
     return (
         f"{warn}"
         f"Effective Leverage: {eff:.2f}x  (Notional/Equity)\n"
@@ -232,7 +221,6 @@ def db_init():
           value TEXT
         );
         """)
-
         conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -243,7 +231,7 @@ def db_init():
           sl REAL,
           tp REAL,
           confidence INTEGER,
-          status TEXT NOT NULL,          -- SIGNAL | OPEN | CLOSED
+          status TEXT NOT NULL,          -- SIGNAL | OPEN | CLOSED | EXPIRED
           risk_usd REAL,
           opened_ts INTEGER,
           closed_ts INTEGER,
@@ -252,12 +240,10 @@ def db_init():
           origin TEXT                   -- BOT | MANUAL
         );
         """)
-
         conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_signals_symbol_status_ts
         ON signals(symbol, status, ts DESC);
         """)
-
         conn.execute("""
         CREATE TABLE IF NOT EXISTS executions (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,12 +253,10 @@ def db_init():
           risk_usd REAL NOT NULL
         );
         """)
-
         conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_exec_ts
         ON executions(ts DESC);
         """)
-
         conn.execute("UPDATE signals SET origin='BOT' WHERE origin IS NULL;")
         conn.commit()
 
@@ -290,7 +274,37 @@ def db_set_setting(key: str, value: str):
         )
         conn.commit()
 
-# -------- Risk Ledger --------
+# ---------- Email persistence ----------
+def db_get_last_email_ts() -> int:
+    v = db_get_setting("email_last_ts", "0")
+    try:
+        return int(float(v))
+    except Exception:
+        return 0
+
+def db_set_last_email_ts(ts: int):
+    db_set_setting("email_last_ts", str(int(ts)))
+
+def db_get_last_email_keys() -> Set[str]:
+    v = db_get_setting("email_last_keys", "")
+    if not v:
+        return set()
+    return set([x for x in v.split(",") if x.strip()])
+
+def db_set_last_email_keys(keys: Set[str]):
+    db_set_setting("email_last_keys", ",".join(sorted(keys)))
+
+def db_get_symbol_last_emailed(sym: str) -> int:
+    v = db_get_setting(f"email_sym_ts_{sym}", "0")
+    try:
+        return int(float(v))
+    except Exception:
+        return 0
+
+def db_set_symbol_last_emailed(sym: str, ts: int):
+    db_set_setting(f"email_sym_ts_{sym}", str(int(ts)))
+
+# -------- Risk ledger --------
 
 def get_equity() -> Optional[float]:
     v = db_get_setting("equity")
@@ -344,18 +358,30 @@ def db_open_count() -> int:
         r = conn.execute("SELECT COUNT(*) AS c FROM signals WHERE status='OPEN'", ()).fetchone()
         return int(r["c"] or 0)
 
+def db_expire_old_signals():
+    """Mark SIGNAL rows older than SIGNAL_EXPIRY_HOURS as EXPIRED."""
+    cutoff = now_ts() - SIGNAL_EXPIRY_HOURS * 3600
+    with db_conn() as conn:
+        conn.execute("""
+            UPDATE signals
+            SET status='EXPIRED'
+            WHERE status='SIGNAL' AND ts < ?
+        """, (cutoff,))
+        conn.commit()
+
 def db_store_setups_as_signals(recs: List[Tuple]):
-    now_ts = int(time.time())
+    ts = now_ts()
     with db_conn() as conn:
         for side, sym, entry, tp, sl, conf in recs:
             conn.execute("""
                 INSERT INTO signals(ts, symbol, side, entry, sl, tp, confidence, status, origin)
                 VALUES(?,?,?,?,?,?,?, 'SIGNAL', 'BOT')
-            """, (now_ts, sym, side, float(entry), float(sl), float(tp), int(conf)))
+            """, (ts, sym, side, float(entry), float(sl), float(tp), int(conf)))
         conn.commit()
 
 def db_get_latest_signal(sym: str) -> Optional[sqlite3.Row]:
     with db_conn() as conn:
+        # Prefer latest SIGNAL that is not expired
         r = conn.execute("""
             SELECT * FROM signals
             WHERE symbol=? AND status='SIGNAL'
@@ -363,6 +389,7 @@ def db_get_latest_signal(sym: str) -> Optional[sqlite3.Row]:
         """, (sym,)).fetchone()
         if r:
             return r
+        # Otherwise latest OPEN
         r2 = conn.execute("""
             SELECT * FROM signals
             WHERE symbol=? AND status='OPEN'
@@ -371,28 +398,27 @@ def db_get_latest_signal(sym: str) -> Optional[sqlite3.Row]:
         return r2
 
 def db_open_from_signal(sig_id: int, risk_usd: float):
-    now_ts = int(time.time())
+    ts = now_ts()
     with db_conn() as conn:
         conn.execute("""
             UPDATE signals
             SET status='OPEN', risk_usd=?, opened_ts=?
             WHERE id=? AND status='SIGNAL'
-        """, (float(risk_usd), now_ts, int(sig_id)))
+        """, (float(risk_usd), ts, int(sig_id)))
         conn.commit()
 
 def db_open_manual(sym: str, side: str, entry: float, sl: float, tp: float, risk_usd: float):
-    now_ts = int(time.time())
+    ts = now_ts()
     with db_conn() as conn:
         conn.execute("""
             INSERT INTO signals(ts, symbol, side, entry, sl, tp, confidence, status, risk_usd, opened_ts, origin)
             VALUES(?,?,?,?,?,?,?, 'OPEN', ?, ?, 'MANUAL')
-        """, (now_ts, sym, side, float(entry), float(sl), float(tp), 0, float(risk_usd), now_ts))
+        """, (ts, sym, side, float(entry), float(sl), float(tp), 0, float(risk_usd), ts))
         conn.commit()
 
 def db_closepnl_open_symbol(sym: str, pnl: float) -> Optional[dict]:
-    now_ts = int(time.time())
+    ts = now_ts()
     result = "win" if pnl > 0 else ("loss" if pnl < 0 else "flat")
-
     with db_conn() as conn:
         eq_row = conn.execute("SELECT value FROM settings WHERE key='equity'").fetchone()
         if not eq_row or eq_row["value"] is None:
@@ -411,7 +437,7 @@ def db_closepnl_open_symbol(sym: str, pnl: float) -> Optional[dict]:
             UPDATE signals
             SET status='CLOSED', closed_ts=?, close_result=?, pnl_usd=?
             WHERE id=?
-        """, (now_ts, result, float(pnl), int(sig["id"])))
+        """, (ts, result, float(pnl), int(sig["id"])))
 
         new_eq = old_eq + float(pnl)
         conn.execute(
@@ -544,7 +570,6 @@ def load_best_futures():
     return best_fut, len(fut_tickers)
 
 def compute_pct(symbol: str, timeframe: str, bars: int) -> float:
-    """Compute % change over the last N completed candles for a given timeframe."""
     dtype = "swap"
     cache_key = (dtype, symbol, f"{timeframe}:{bars}")
     if cache_key in PCT_CACHE:
@@ -573,7 +598,7 @@ def compute_pct(symbol: str, timeframe: str, bars: int) -> float:
 
 
 # =========================================================
-# Charts (Snapshot images)
+# Charts (optional)
 # =========================================================
 
 def fetch_ohlcv_for_chart(fut_symbol: str, timeframe: str = "1h", limit: int = 48) -> List[List]:
@@ -587,7 +612,6 @@ def make_chart_png(fut_symbol: str, title: str, out_path: str, timeframe: str = 
     candles = fetch_ohlcv_for_chart(fut_symbol, timeframe=timeframe, limit=limit)
     if not candles:
         return
-
     xs = [c[0] for c in candles]
     closes = [c[4] for c in candles]
 
@@ -683,10 +707,10 @@ def confidence_from_score(score: float) -> int:
 
 def classify_row(row: List) -> Tuple[bool, bool]:
     _, _, pct24, pct4h, pct1h, pct15m, *_ = row
-
     long_ok = False
     short_ok = False
 
+    # Bias from 24h
     if pct24 > 5.0:
         long_ok = True
     elif pct24 < -5.0:
@@ -697,6 +721,7 @@ def classify_row(row: List) -> Tuple[bool, bool]:
         if pct1h <= -TRIGGER_1H_PCT and pct4h <= 0.0:
             short_ok = True
 
+    # 15m confirmation
     if CONFIRM_15M_SIGN:
         if long_ok and pct15m < 0:
             long_ok = False
@@ -728,7 +753,7 @@ def multi_tp_plan(entry: float, sl: float, side: str, confidence: int):
         "weights": "TP1 40% | TP2 40% | Runner 20%",
     }
 
-def pick_best_trades(universe: List[List], top_n: int = SETUPS_TOP_N):
+def pick_best_trades(universe: List[List], top_n: int):
     candidates = []
     for r in universe:
         sym, _, _, _, _, _, last_price, _ = r
@@ -739,22 +764,22 @@ def pick_best_trades(universe: List[List], top_n: int = SETUPS_TOP_N):
 
         if long_ok:
             sc = score_long(r)
-            if sc > 0:
+            conf = confidence_from_score(sc)
+            if sc > 0 and conf >= 70:  # mild gate for signal quality
                 entry = last_price
-                sl = entry * 0.94
-                conf = confidence_from_score(sc)
+                sl = entry * (1.0 - SL_PCT)
                 plan = multi_tp_plan(entry, sl, "BUY", conf)
-                tp = (plan["tp2"] if plan else entry * 1.12)
+                tp = (plan["tp2"] if plan else entry * (1.0 + TP_PCT))
                 candidates.append(("BUY", sym, entry, tp, sl, conf))
 
         if short_ok:
             sc = score_short(r)
-            if sc > 0:
+            conf = confidence_from_score(sc)
+            if sc > 0 and conf >= 70:
                 entry = last_price
-                sl = entry * 1.06
-                conf = confidence_from_score(sc)
+                sl = entry * (1.0 + SL_PCT)
                 plan = multi_tp_plan(entry, sl, "SELL", conf)
-                tp = (plan["tp2"] if plan else entry * 0.91)
+                tp = (plan["tp2"] if plan else entry * (1.0 - TP_PCT))
                 candidates.append(("SELL", sym, entry, tp, sl, conf))
 
     candidates.sort(key=lambda x: x[5], reverse=True)
@@ -770,7 +795,7 @@ def fmt_leaders(rows: List[List]) -> str:
         return "*🔥 Market Leaders*: _None_\n"
     pretty = []
     for r in rows:
-        base, fut_usd, pct24, pct4h, pct1h, pct15m, *_ = r
+        base, fut_usd, pct24, pct4h, pct1h, *_ = r
         pretty.append([base, m_dollars(fut_usd), side_hint(pct4h, pct1h),
                        pct_with_emoji(pct24), pct_with_emoji(pct4h), pct_with_emoji(pct1h)])
     return (
@@ -835,7 +860,7 @@ def fut_symbol_for_base(universe: List[List], sym: str) -> Optional[str]:
 
 
 # =========================================================
-# Email helpers (optional) — supports inline charts
+# Email helpers
 # =========================================================
 
 def email_config_ok() -> bool:
@@ -843,7 +868,7 @@ def email_config_ok() -> bool:
 
 def melbourne_is_sunday() -> bool:
     now = datetime.now(ZoneInfo("Australia/Melbourne"))
-    return now.weekday() == 6  # Sunday
+    return now.weekday() == 6
 
 def send_email(subject: str, text_body: str, html_body: Optional[str] = None, inline_images: Optional[List[Tuple[str, str]]] = None) -> bool:
     if not email_config_ok():
@@ -890,60 +915,44 @@ def send_email(subject: str, text_body: str, html_body: Optional[str] = None, in
 
 
 # =========================================================
-# User Guide (ENGLISH ONLY)
+# User Guide (EN only)
 # =========================================================
 
 HELP_TEXT = f"""📘 {BOT_NAME} — User Guide (English)
 
-What this bot is:
-{BOT_NAME} is a futures-only crypto scanner + trade setup assistant for day traders.
-It focuses on liquidity + momentum, and shows a small number of high-confidence setups.
+This is a futures-only crypto scanner + day-trade setup assistant.
 
-What you get:
-• Market Leaders: top liquid contracts with momentum snapshot
-• Strong Movers (24h): market context only (NOT trade signals)
-• Trade Setups (Top {SETUPS_TOP_N}): entry / SL / TP ideas with Confidence
-• Multi-TP (Confidence ≥ {CONF_MULTI_TP_MIN}): TP1 + TP2 + Runner guidance
-• Trading Window Guard: warns when outside London/NY sessions
-• Risk Tools: equity, risk limits, position sizing
-• Manual Trade Ledger: you can also size ANY trade manually (with a warning)
-• Optional chart snapshots (if enabled)
+Day-trader design:
+• Trigger: 1H momentum
+• Confirmation: 15m direction confirmation
+• Targets: Smaller SL/TP for faster resolution (aiming for < 24h)
+• Signals expire after {SIGNAL_EXPIRY_HOURS}h if not opened
 
-Leverage & Notional (important):
+Leverage & Notional:
 • Qty = how many coins/contracts you trade
-• Notional = Qty × Entry (the position size in USD at entry price)
-• Effective Leverage = Notional / Equity (your real exposure vs your account)
-• The bot also shows a Margin guide for common leverages (3x/5x/10x/20x):
-  Margin ≈ Notional / Leverage
-If Effective Leverage is high (e.g. > {EFFECTIVE_LEV_WARN:.0f}x), the bot will warn you.
+• Notional = Qty × Entry (position size in USD)
+• Effective Leverage = Notional / Equity
+• Margin guide: Margin ≈ Notional / Leverage
+If Effective Leverage is high (> {EFFECTIVE_LEV_WARN:.0f}x), you get a warning.
 
 What this bot does NOT do:
-• It does NOT place trades for you (no auto-trading)
-• It does NOT connect to your exchange account
-• It does NOT guarantee profit
-
-Recommended workflow:
-1) /screen
-2) /equity 1000
-3) /limits 5 200 300
-4) Pick a setup and size it: /risk BTC 1%
-5) Or size your own idea (manual): /risk BTC 1% 65000 64000
-6) Track open positions: /open
-7) Close and update equity: /closepnl BTC +23.5
+• No auto-trading, no exchange connection, no profit guarantees.
 
 Commands:
-• /start — Quick intro
-• /help — This guide
+• /start
+• /help
 • /screen — Leaders + Movers + Setups
-• /session [both|london|ny|off] — Trading window guard
-• /diag — diagnostics
-• /notify_on /notify_off /notify — email alert switch (if email is configured)
+• /session [both|london|ny|off]
+• /diag
+• /notify_on /notify_off /notify
 
 Risk & Journal:
 • /equity <amount>
 • /limits <maxTradesDay> <maxDailyRiskUSD> <maxOpenRiskUSD>
 • /status
 • /risk <SYMBOL> <RISK> [ENTRY SL]
+  - Bot signal sizing: /risk BTC 1%
+  - Manual sizing (warning): /risk BTC 1% 65000 64000
 • /open
 • /closepnl <SYMBOL> <PNL>
 """
@@ -964,7 +973,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /diag\n\n"
         "Risk & journal:\n"
         "• /equity 1000\n"
-        "• /limits 5 200 300\n"
+        "• /limits 3 150 200   (example)\n"
         "• /risk BTC 1%\n"
         "• /risk BTC 1% 65000 64000 (manual)\n"
         "• /open\n"
@@ -978,13 +987,17 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
 
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    last_ts = db_get_last_email_ts()
+    last_keys = db_get_last_email_keys()
+    last_ts_str = datetime.fromtimestamp(last_ts, tz=ZoneInfo("Australia/Melbourne")).isoformat() if last_ts else "none"
     msg = (
         f"*Diag*\n"
         f"- session_mode: `{get_session_mode()}` in_window=`{is_in_trading_window(get_session_mode())}`\n"
-        f"- universe_min_fut_usd: `{UNIVERSE_MIN_FUT_USD}`\n"
-        f"- leaders_top_n: `{LEADERS_TOP_N}` movers_top_n: `{MOVERS_TOP_N}` setups_top_n: `{SETUPS_TOP_N}`\n"
-        f"- trigger: 1h>={TRIGGER_1H_PCT}%, confirm_15m_sign: `{CONFIRM_15M_SIGN}`\n"
+        f"- interval: `{CHECK_INTERVAL_MIN}m` email_min_interval: `{EMAIL_MIN_INTERVAL_SEC//60}m`\n"
         f"- email_configured: `{email_config_ok()}` notify_on=`{NOTIFY_ON}` sunday_block=`{melbourne_is_sunday()}`\n"
+        f"- email_conf_gate: `{EMAIL_CONF_GATE}` symbol_cooldown_h: `{EMAIL_SYMBOL_COOLDOWN_SEC/3600:.0f}`\n"
+        f"- last_email_ts: `{last_ts_str}`\n"
+        f"- last_email_keys_count: `{len(last_keys)}`\n"
         f"- charts_enabled: `{CHARTS_ENABLED}`\n"
         f"- last_error: `{LAST_ERROR or 'none'}`\n"
     )
@@ -1019,7 +1032,7 @@ async def notify_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def notify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"Email alerts: {'ON' if NOTIFY_ON else 'OFF'} | configured={'YES' if email_config_ok() else 'NO'}"
+        f"Email alerts: {'ON' if NOTIFY_ON else 'OFF'} | configured={'YES' if email_config_ok() else 'NO'} | min_interval={EMAIL_MIN_INTERVAL_SEC//60}m"
     )
 
 async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1038,7 +1051,7 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         mt, md, mo = get_limits()
         await update.message.reply_text(
-            f"Limits: trades/day={mt}, daily=${md:,.2f}, open=${mo:,.2f}\nSet: /limits 5 200 300"
+            f"Limits: trades/day={mt}, daily=${md:,.2f}, open=${mo:,.2f}\nSet: /limits 3 150 200"
         )
         return
     if len(context.args) < 3:
@@ -1051,7 +1064,7 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_limits(mt, md, mo)
         await update.message.reply_text(f"✅ Limits set: trades/day={mt}, daily=${md:,.2f}, open=${mo:,.2f}")
     except Exception:
-        await update.message.reply_text("Usage: /limits 5 200 300")
+        await update.message.reply_text("Usage: /limits 3 150 200")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     eq = get_equity()
@@ -1070,6 +1083,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Daily risk used: ${daily_used:,.2f}/${md:,.2f}\n"
         f"Open risk used:  ${open_used:,.2f}/${mo:,.2f}\n"
         f"Open positions: {open_count}\n"
+        f"Signal expiry: {SIGNAL_EXPIRY_HOURS}h\n"
     )
     await update.message.reply_text((warn or "") + "```\n" + text + "```", parse_mode=ParseMode.MARKDOWN)
 
@@ -1085,18 +1099,19 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = ["OPEN POSITIONS", "----------------------------"]
-    now_ts = int(time.time())
+    t = now_ts()
     for r in rows:
-        opened = int(r["opened_ts"] or r["ts"] or now_ts)
-        age_hr = (now_ts - opened) / 3600.0
+        opened = int(r["opened_ts"] or r["ts"] or t)
+        age_hr = (t - opened) / 3600.0
         origin = (r["origin"] or "BOT").upper()
         tag = "MANUAL" if origin == "MANUAL" else "BOT"
+        note = "⚠️ aged>24h" if age_hr >= SIGNAL_EXPIRY_HOURS else ""
         lines.append(
             f"{r['symbol']:6} {r['side']:4} [{tag}] "
             f"conf {int(r['confidence'] or 0):3d} "
             f"E:{fmt_price(float(r['entry'] or 0))} SL:{fmt_price(float(r['sl'] or 0))} "
             f"TP:{fmt_price(float(r['tp'] or 0))} risk:${float(r['risk_usd'] or 0):,.2f} "
-            f"age:{age_hr:.1f}h"
+            f"age:{age_hr:.1f}h {note}"
         )
     lines.append("")
     lines.append("Close: /closepnl BTC +23.5   (or -10)")
@@ -1126,13 +1141,8 @@ async def closepnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Two modes:
-
-    1) BOT signal sizing:
-       /risk BTC 1%
-
-    2) Manual sizing (NOT a bot signal) with warning:
-       /risk BTC 1% 65000 64000
+    /risk BTC 1%            -> sizes latest BOT SIGNAL (if exists)
+    /risk BTC 1% 65000 64000 -> manual sizing (warning)
     """
     if len(context.args) < 2:
         await update.message.reply_text("Usage:\n/risk BTC 1%\n/risk BTC 1% 65000 64000 (manual)")
@@ -1146,7 +1156,6 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Set equity first: /equity 1000")
         return
 
-    # Parse risk
     risk_usd = None
     if risk_txt.endswith("%"):
         try:
@@ -1164,7 +1173,7 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid risk amount.")
         return
 
-    # Enforce limits
+    # limits
     mt, md, mo = get_limits()
     day_start = mel_day_start_ts()
     daily_used = db_daily_used_risk(day_start)
@@ -1183,7 +1192,7 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sig = db_get_latest_signal(sym)
 
-    # --- Manual path if no SIGNAL ---
+    # manual if no SIGNAL exists
     if (not sig) or (sig["status"] != "SIGNAL"):
         if len(context.args) < 4:
             await update.message.reply_text(
@@ -1207,7 +1216,7 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         side = "BUY" if sl < entry else "SELL"
-        tp = entry * (1.12 if side == "BUY" else 0.91)
+        tp = entry * (1.0 + TP_PCT) if side == "BUY" else entry * (1.0 - TP_PCT)
 
         stop_dist = abs(entry - sl)
         qty = risk_usd / stop_dist
@@ -1215,12 +1224,10 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await asyncio.to_thread(db_open_manual, sym, side, entry, sl, tp, risk_usd)
 
-        # record execution
-        now_ts = int(time.time())
         with db_conn() as conn:
             conn.execute(
                 "INSERT INTO executions(ts, symbol, side, risk_usd) VALUES(?,?,?,?)",
-                (now_ts, sym, side, float(risk_usd))
+                (now_ts(), sym, side, float(risk_usd))
             )
             conn.commit()
 
@@ -1231,7 +1238,7 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Risk management only — trade responsibility is yours.\n\n"
             "```\n"
             f"{sym} {side} [MANUAL]\n"
-            f"Entry {fmt_price(entry)} | SL {fmt_price(sl)}\n"
+            f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | TP {fmt_price(tp)}\n"
             f"Risk ${risk_usd:,.2f} -> Qty {qty:.6g} | Notional ${notional:,.2f}\n"
             f"{lev_block}\n"
             "Close with /closepnl SYMBOL +/-PnL\n"
@@ -1240,7 +1247,7 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- BOT signal sizing path ---
+    # open from BOT signal (not expired)
     entry = float(sig["entry"] or 0)
     sl = float(sig["sl"] or 0)
     if not entry or not sl or entry == sl:
@@ -1253,12 +1260,10 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await asyncio.to_thread(db_open_from_signal, int(sig["id"]), risk_usd)
 
-    # record execution
-    now_ts = int(time.time())
     with db_conn() as conn:
         conn.execute(
             "INSERT INTO executions(ts, symbol, side, risk_usd) VALUES(?,?,?,?)",
-            (now_ts, sym, sig["side"], float(risk_usd))
+            (now_ts(), sym, sig["side"], float(risk_usd))
         )
         conn.commit()
 
@@ -1267,7 +1272,7 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "```\n"
         f"{sym} {sig['side']} [BOT]\n"
-        f"Entry {fmt_price(entry)} | SL {fmt_price(sl)}\n"
+        f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | TP {fmt_price(float(sig['tp'] or 0))}\n"
         f"Risk ${risk_usd:,.2f} -> Qty {qty:.6g} | Notional ${notional:,.2f}\n"
         f"{lev_block}\n"
         "Close with /closepnl SYMBOL +/-PnL\n"
@@ -1277,14 +1282,18 @@ async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        # expire old signals before new ones
+        await asyncio.to_thread(db_expire_old_signals)
+
         PCT_CACHE.clear()
         best_fut, raw_fut = await asyncio.to_thread(load_best_futures)
         universe = await asyncio.to_thread(build_universe, best_fut)
 
         leaders = await asyncio.to_thread(build_market_leaders, universe)
         movers = await asyncio.to_thread(scan_strong_movers, best_fut)
-        recs = await asyncio.to_thread(pick_best_trades, universe, SETUPS_TOP_N)
+        recs = await asyncio.to_thread(pick_best_trades, universe, SETUPS_TOP_N_SCREEN)
 
+        # store setups only if in window
         if is_in_trading_window(get_session_mode()) and recs:
             await asyncio.to_thread(db_store_setups_as_signals, recs)
 
@@ -1301,14 +1310,14 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += "\n"
 
         msg += "ℹ️ Trade Setups are the only actionable ideas (entry, SL, TP).\n\n"
-        msg += f"*🎯 Trade Setups (Top {SETUPS_TOP_N})*\n\n"
+        msg += f"*🎯 Trade Setups (Top {SETUPS_TOP_N_SCREEN})*\n\n"
         msg += format_trade_setups(recs)
 
         msg += f"\n\n`tickers: fut={raw_fut}`"
 
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-        # Optional: send chart snapshots for setups
+        # optional charts to telegram
         if CHARTS_ENABLED and recs:
             for idx, (side, sym, entry, tp, sl, conf) in enumerate(recs, start=1):
                 fut_sym = fut_symbol_for_base(universe, sym)
@@ -1354,116 +1363,137 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# Email Alert Job (optional) — includes per-setup snapshot + optional charts
+# Email Alert Job (optimized)
 # =========================================================
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
-    global LAST_EMAIL_TS, LAST_EMAIL_KEYS
     try:
         if not NOTIFY_ON:
             return
         if not email_config_ok():
             return
 
-        # ✅ no emails on Sundays (Melbourne)
+        # no emails on Sundays (Melbourne)
         if melbourne_is_sunday():
             return
 
-        # only email in window (default London+NY)
+        # Only in trading window
         if not is_in_trading_window(get_session_mode()):
             return
 
-        now = time.time()
-        if now - LAST_EMAIL_TS < EMAIL_MIN_INTERVAL_SEC:
+        # Expire old signals
+        await asyncio.to_thread(db_expire_old_signals)
+
+        now = now_ts()
+
+        # DB-persisted min interval
+        last_ts = db_get_last_email_ts()
+        if now - last_ts < EMAIL_MIN_INTERVAL_SEC:
             return
 
         PCT_CACHE.clear()
 
         best_fut, _ = await asyncio.to_thread(load_best_futures)
         universe = await asyncio.to_thread(build_universe, best_fut)
-        recs = await asyncio.to_thread(pick_best_trades, universe, SETUPS_TOP_N)
+
+        recs = await asyncio.to_thread(pick_best_trades, universe, SETUPS_TOP_N_EMAIL)
         movers = await asyncio.to_thread(scan_strong_movers, best_fut)
 
-        if not recs and not movers:
+        # Gate: at least one setup with high confidence
+        strong_recs = [r for r in recs if int(r[5]) >= EMAIL_CONF_GATE]
+        if not strong_recs:
             return
 
+        # Per-symbol cooldown
+        filtered_recs = []
+        for side, sym, entry, tp, sl, conf in strong_recs:
+            last_sym_ts = db_get_symbol_last_emailed(sym)
+            if now - last_sym_ts < EMAIL_SYMBOL_COOLDOWN_SEC:
+                continue
+            filtered_recs.append((side, sym, entry, tp, sl, conf))
+
+        if not filtered_recs:
+            return
+
+        # Newness check vs last email keys (persisted)
         keys = set()
-        keys |= {f"S:{side}:{sym}" for side, sym, *_ in recs}
-        keys |= {f"M:{sym}" for sym, *_ in movers}
-        if keys and keys == LAST_EMAIL_KEYS:
+        keys |= {f"S:{side}:{sym}:{int(conf)}" for side, sym, _, _, _, conf in filtered_recs}
+        # movers are context; include only symbols (not required to gate)
+        keys |= {f"M:{sym}" for sym, *_ in movers[:MOVERS_TOP_N]}
+
+        last_keys = db_get_last_email_keys()
+        if keys == last_keys:
             return
 
-        text_parts = []
-        html_parts = [f"<h2>{BOT_NAME} Alert</h2>"]
-
+        # Build email body with snapshots
+        text_lines = [f"{BOT_NAME} Alert", "", "Trade Setups (Confidence-based):"]
+        html_parts = [f"<h2>{BOT_NAME} Alert</h2>", "<h3>Trade Setups</h3>"]
         inline_images: List[Tuple[str, str]] = []
 
-        if recs:
-            text_lines = ["Trade Setups (Confidence-based):"]
-            html_parts.append("<h3>Trade Setups</h3>")
+        for idx, (side, sym, entry, tp, sl, conf) in enumerate(filtered_recs, start=1):
+            text_lines.append(f"\nSetup #{idx}: {side} {sym} — Confidence {conf}/100")
+            text_lines.append(f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | TP {fmt_price(tp)}")
 
-            for idx, (side, sym, entry, tp, sl, conf) in enumerate(recs, start=1):
-                text_lines.append(f"\nSetup #{idx}: {side} {sym} — Confidence {conf}/100")
-                text_lines.append(f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | TP {fmt_price(tp)}")
+            snap = snapshot_for_symbol(universe, sym)
+            if snap:
+                text_lines.append(snap)
 
-                snap = snapshot_for_symbol(universe, sym)
-                if snap:
-                    text_lines.append(snap)
+            plan = multi_tp_plan(entry, sl, side, conf)
+            if plan:
+                text_lines.append(f"Multi-TP: {plan['weights']}")
+                text_lines.append(f"TP1 {fmt_price(plan['tp1'])} | TP2 {fmt_price(plan['tp2'])}")
+                text_lines.append(plan["runner_text"])
 
-                plan = multi_tp_plan(entry, sl, side, conf)
-                if plan:
-                    text_lines.append(f"Multi-TP: {plan['weights']}")
-                    text_lines.append(f"TP1 {fmt_price(plan['tp1'])} | TP2 {fmt_price(plan['tp2'])}")
-                    text_lines.append(plan["runner_text"])
+            html_block = f"""
+            <div style="margin-bottom:14px;padding:10px;border:1px solid #ddd;border-radius:10px;">
+              <b>Setup #{idx}</b>: {side} {sym} — <b>Confidence {conf}/100</b><br/>
+              Entry <b>{fmt_price(entry)}</b> | SL <b>{fmt_price(sl)}</b> | TP <b>{fmt_price(tp)}</b><br/>
+            """
+            if snap:
+                html_block += f"<div style='margin-top:6px;font-size:12px;color:#333;'>{snap}</div>"
 
-                html_block = f"""
-                <div style="margin-bottom:14px;padding:10px;border:1px solid #ddd;border-radius:10px;">
-                  <b>Setup #{idx}</b>: {side} {sym} — <b>Confidence {conf}/100</b><br/>
-                  Entry <b>{fmt_price(entry)}</b> | SL <b>{fmt_price(sl)}</b> | TP <b>{fmt_price(tp)}</b><br/>
-                """
-                if snap:
-                    html_block += f"<div style='margin-top:6px;font-size:12px;color:#333;'>{snap}</div>"
+            if plan:
+                html_block += f"<div style='margin-top:6px;font-size:12px;'>Multi-TP: {plan['weights']}<br/>TP1 {fmt_price(plan['tp1'])} | TP2 {fmt_price(plan['tp2'])}<br/>{plan['runner_text']}</div>"
 
-                if plan:
-                    html_block += f"<div style='margin-top:6px;font-size:12px;'>Multi-TP: {plan['weights']}<br/>TP1 {fmt_price(plan['tp1'])} | TP2 {fmt_price(plan['tp2'])}<br/>{plan['runner_text']}</div>"
+            if CHARTS_ENABLED:
+                fut_sym = fut_symbol_for_base(universe, sym)
+                if fut_sym:
+                    out_path = f"/tmp/{BOT_NAME}_email_{sym}_{idx}.png"
+                    cid = f"chart_{sym}_{idx}"
+                    try:
+                        await asyncio.to_thread(make_chart_png, fut_sym, f"{sym} 1H snapshot", out_path, "1h", 48)
+                        if os.path.exists(out_path):
+                            inline_images.append((cid, out_path))
+                            html_block += f"<div style='margin-top:10px;'><img src='cid:{cid}' style='max-width:520px;border-radius:10px;'/></div>"
+                    except Exception:
+                        logging.exception("email chart failed")
 
-                if CHARTS_ENABLED:
-                    fut_sym = fut_symbol_for_base(universe, sym)
-                    if fut_sym:
-                        out_path = f"/tmp/{BOT_NAME}_email_{sym}_{idx}.png"
-                        cid = f"chart_{sym}_{idx}"
-                        try:
-                            await asyncio.to_thread(make_chart_png, fut_sym, f"{sym} 1H snapshot", out_path, "1h", 48)
-                            if os.path.exists(out_path):
-                                inline_images.append((cid, out_path))
-                                html_block += f"<div style='margin-top:10px;'><img src='cid:{cid}' style='max-width:520px;border-radius:10px;'/></div>"
-                        except Exception:
-                            logging.exception("email chart failed")
+            html_block += "</div>"
+            html_parts.append(html_block)
 
-                html_block += "</div>"
-                html_parts.append(html_block)
-
-            text_parts.append("\n".join(text_lines).strip())
-
+        # Context movers (optional section, no gating)
         if movers:
-            mv_lines = "\n".join(
-                [f"{sym} | F~{m_dollars(fusd)}M | {pct_with_emoji(p24)}"
-                 for sym, fusd, p24 in movers]
-            )
-            text_parts.append("Strong Movers (24h — context only):\n" + mv_lines)
-
+            mv_lines = "\n".join([f"{sym} | F~{m_dollars(fusd)}M | {pct_with_emoji(p24)}"
+                                  for sym, fusd, p24 in movers[:MOVERS_TOP_N]])
+            text_lines.append("\nStrong Movers (24h — context only):")
+            text_lines.append(mv_lines)
             html_parts.append("<h3>Strong Movers (24h — context only)</h3>")
             html_parts.append("<pre style='background:#f6f6f6;padding:10px;border-radius:10px;'>"
                               + mv_lines + "</pre>")
 
-        text_body = "\n\n".join(text_parts).strip()
+        text_body = "\n".join(text_lines).strip()
         html_body = "\n".join(html_parts).strip()
 
-        subject = f"{BOT_NAME} Alert: Setups & Movers"
+        subject = f"{BOT_NAME} Alert: High-Confidence Setups"
 
-        if send_email(subject, text_body, html_body=html_body, inline_images=inline_images):
-            LAST_EMAIL_TS = now
-            LAST_EMAIL_KEYS = keys
+        ok = send_email(subject, text_body, html_body=html_body, inline_images=inline_images)
+        if ok:
+            # persist state
+            db_set_last_email_ts(now)
+            db_set_last_email_keys(keys)
+            # update per-symbol timestamps
+            for _, sym, *_ in filtered_recs:
+                db_set_symbol_last_emailed(sym, now)
 
     except Exception:
         logging.exception("alert_job error")
@@ -1483,7 +1513,7 @@ async def log_err(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# FastAPI (health only)
+# FastAPI health
 # =========================================================
 
 app_api = FastAPI()
@@ -1492,14 +1522,13 @@ app_api = FastAPI()
 async def health():
     return {"ok": True, "name": BOT_NAME}
 
-
 def run_api_server():
     import uvicorn
     uvicorn.run(app_api, host="0.0.0.0", port=PORT, log_level="info")
 
 
 # =========================================================
-# Bot runner (Thread-safe for Py3.11 + Render)
+# Bot runner (Render + Py3.11 thread safe)
 # =========================================================
 
 def run_bot():
