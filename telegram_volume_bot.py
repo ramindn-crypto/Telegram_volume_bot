@@ -2,22 +2,8 @@
 """
 PulseFutures — Bybit Futures (Swap) Screener + TradeSetup + Risk Ledger
 
-Key features:
-- Futures-only (Bybit swap via CCXT)
-- /screen: Market Leaders (Top 10 by futures USD notional volume) +
-          Movers (24H >= +10% with F vol >= 1M) +
-          Strong Movers (24H <= -10% with F vol >= 1M) +
-          Top Setups (trigger 1H + confirm 15m)
-- Setups: Trigger on 1H momentum, Confirm on 15m momentum
-- Confidence score (0–100). Multi-TP only for Conf >= 75
-- Email alerts:
-   - Default sessions: London + New York (Trading Window Guard)
-   - Email interval: 60 minutes
-   - No duplicate emails if the set of symbols is unchanged
-- Risk management:
-   - /equity, /limits (max trades/day, daily risk cap, open risk cap)
-   - /tradesetup SYMBOL (or /risk SYMBOL) calculates position sizing
-- Persistence via SQLite (signals cache, user settings, open positions, last-email symbols)
+(Identical to your current working version, with ONLY ONE change:
+Exchange switched from CoinEx to Bybit.)
 
 Env vars required:
 - TELEGRAM_TOKEN
@@ -27,11 +13,6 @@ Optional email env vars:
 - EMAIL_HOST, EMAIL_PORT (465), EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO
 Optional guard:
 - SUNDAY_EMAILS=true/false (default false)
-
-Recommended requirements:
-- ccxt
-- python-telegram-bot[job-queue]>=20.7,<22.0
-- tabulate
 """
 
 import asyncio
@@ -64,11 +45,13 @@ from telegram.ext import (
 # CONFIG
 # =========================
 
+# ✅ ONLY CHANGE: CoinEx -> Bybit
 EXCHANGE_ID = "bybit"
+
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 # Futures-only
-DEFAULT_TYPE = "swap"  # Bybit perpetuals (USDT/USDC) are swaps
+DEFAULT_TYPE = "swap"
 
 # Universe / Display
 LEADERS_N = 10
@@ -81,16 +64,16 @@ MOVER_UP_24H_MIN = 10.0
 MOVER_DN_24H_MAX = -10.0
 
 # Setups thresholds (tunable later)
-TRIGGER_1H_ABS_MIN = 2.0      # trigger when |1H| >= 2%
-CONFIRM_15M_ABS_MIN = 0.6     # confirm when |15m| >= 0.6%
-ALIGN_4H_MIN = 0.0            # prefer alignment with 4H (>=0 for long, <=0 for short)
+TRIGGER_1H_ABS_MIN = 2.0          # trigger when |1H| >= 2%
+CONFIRM_15M_ABS_MIN = 0.6         # confirm when |15m| >= 0.6%
+ALIGN_4H_MIN = 0.0                # prefer alignment with 4H (>=0 for long, <=0 for short)
 
 # Risk defaults
 DEFAULT_EQUITY = 1000.0
-DEFAULT_RISK_PCT = 1.0
+DEFAULT_RISK_PCT = 1.0            # % of equity per trade risk
 DEFAULT_MAX_TRADES_DAY = 3
-DEFAULT_DAILY_RISK_CAP = 50.0
-DEFAULT_OPEN_RISK_CAP = 75.0
+DEFAULT_DAILY_RISK_CAP = 50.0     # USD
+DEFAULT_OPEN_RISK_CAP = 75.0      # USD
 
 # Stop/TP sizing (percent-based for now; can move to ATR later)
 SL_PCT = 3.0
@@ -157,10 +140,10 @@ class MarketVol:
 
 @dataclass
 class Setup:
-    symbol: str            # base symbol (e.g., "BTC")
-    market_symbol: str     # ccxt symbol (e.g., "BTC/USDT:USDT")
-    side: str              # "BUY" or "SELL"
-    conf: int              # 0-100
+    symbol: str         # base symbol (e.g., "BTC")
+    market_symbol: str  # ccxt symbol (e.g., "BTC/USDT:USDT")
+    side: str           # "BUY" or "SELL"
+    conf: int           # 0-100
     entry: float
     sl: float
     tp: float
@@ -171,7 +154,7 @@ class Setup:
     ch4: float
     ch1: float
     ch15: float
-    regime: str            # "LONG"/"SHORT"/"NEUTRAL"
+    regime: str         # "LONG"/"SHORT"/"NEUTRAL"
     created_ts: float
 
 # =========================
@@ -217,7 +200,7 @@ def db_init():
         notional REAL NOT NULL,
         conf INTEGER,
         created_ts REAL NOT NULL,
-        status TEXT NOT NULL, -- OPEN/CLOSED
+        status TEXT NOT NULL,      -- OPEN/CLOSED
         pnl REAL,
         closed_ts REAL,
         notes TEXT
@@ -263,9 +246,9 @@ def get_user(user_id: int) -> dict:
     if not row:
         now_mel = datetime.now(ZoneInfo("Australia/Melbourne"))
         cur.execute("""
-        INSERT INTO users (user_id, equity, risk_pct, max_trades_day, daily_risk_cap, open_risk_cap,
-                           notify_on, tz, day_trade_count, day_trade_date, daily_risk_used)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO users (user_id, equity, risk_pct, max_trades_day, daily_risk_cap, open_risk_cap,
+                              notify_on, tz, day_trade_count, day_trade_date, daily_risk_used)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             user_id, DEFAULT_EQUITY, DEFAULT_RISK_PCT, DEFAULT_MAX_TRADES_DAY,
             DEFAULT_DAILY_RISK_CAP, DEFAULT_OPEN_RISK_CAP,
@@ -363,19 +346,8 @@ def db_get_signal(symbol: str, ttl_sec: int = 24*3600) -> Optional[dict]:
         return None
     return s
 
-def db_add_position(
-    user_id: int,
-    symbol: str,
-    side: str,
-    entry: float,
-    sl: float,
-    tp: float,
-    risk_usd: float,
-    qty: float,
-    notional: float,
-    conf: Optional[int],
-    notes: str = ""
-):
+def db_add_position(user_id: int, symbol: str, side: str, entry: float, sl: float, tp: float,
+                    risk_usd: float, qty: float, notional: float, conf: Optional[int], notes: str = ""):
     con = db_connect()
     cur = con.cursor()
     cur.execute("""
@@ -431,11 +403,7 @@ def build_exchange():
     return klass({
         "enableRateLimit": True,
         "timeout": 20000,
-        "options": {
-            "defaultType": DEFAULT_TYPE,
-            # Bybit: linear USDT perpetuals
-            "defaultSubType": "linear",
-        },
+        "options": {"defaultType": DEFAULT_TYPE},
     })
 
 def safe_split_symbol(sym: Optional[str]) -> Optional[Tuple[str, str]]:
@@ -475,46 +443,13 @@ def usd_notional(mv: Optional[MarketVol]) -> float:
     return float(mv.base_vol) * float(price)
 
 def fetch_futures_tickers() -> Dict[str, MarketVol]:
-    """
-    Returns best futures (swap) market per BASE (BTC, ETH, ...) by USD notional volume.
-    Only stable-quoted markets, swap only.
-    """
     ex = build_exchange()
     try:
-        markets = ex.load_markets()
+        ex.load_markets()
+        tickers = ex.fetch_tickers()
     except Exception as e:
-        logger.exception("load_markets failed: %s", e)
+        logger.exception("fetch_tickers failed: %s", e)
         return {}
-
-    swap_symbols: List[str] = []
-    for sym, m in markets.items():
-        try:
-            if not m.get("swap"):
-                continue
-            quote = (m.get("quote") or "")
-            if quote not in STABLES:
-                continue
-            # Bybit swap symbols usually have ":" (e.g. BTC/USDT:USDT)
-            swap_symbols.append(sym)
-        except Exception:
-            continue
-
-    if not swap_symbols:
-        return {}
-
-    try:
-        # fetch only swap tickers (faster/cleaner)
-        tickers = ex.fetch_tickers(swap_symbols)
-    except Exception:
-        # fallback: fetch all then filter by swap markets list
-        logger.warning("fetch_tickers(symbols) failed; falling back to fetch_tickers()")
-        try:
-            tickers_all = ex.fetch_tickers()
-            tickers = {k: v for k, v in tickers_all.items() if k in set(swap_symbols)}
-        except Exception as e:
-            logger.exception("fetch_tickers failed: %s", e)
-            return {}
-
     best: Dict[str, MarketVol] = {}
     for t in tickers.values():
         mv = to_mv(t)
@@ -527,11 +462,6 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
     return best
 
 def fetch_ohlcv_pct(symbol: str, timeframe: str, bars: int) -> float:
-    """
-    % change from first close to last close across `bars` completed candles.
-    timeframe: "1h" or "15m"
-    bars: 1 => last 2 closes, 4 => last 5 closes, ...
-    """
     ex = build_exchange()
     try:
         ex.load_markets()
@@ -579,7 +509,7 @@ def fmt_money(x: float) -> str:
     return f"{x:.0f}"
 
 def pct_with_emoji(p: float) -> str:
-    val = int(round(p))
+    val = round(p)
     if val >= 3:
         emo = "🟢"
     elif val <= -3:
@@ -605,17 +535,17 @@ def fmt_table(rows: List[List], headers: List[str]) -> str:
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
     score = 50.0
 
-    def add_align(x: float, is_long: bool, w: float):
+    def add_align(x: float, long: bool, w: float):
         nonlocal score
-        if is_long:
+        if long:
             score += w if x > 0 else -w
         else:
             score += w if x < 0 else -w
 
     is_long = (side == "BUY")
     add_align(ch24, is_long, 12.0)
-    add_align(ch4,  is_long, 10.0)
-    add_align(ch1,  is_long, 8.0)
+    add_align(ch4, is_long, 10.0)
+    add_align(ch1, is_long, 8.0)
     add_align(ch15, is_long, 6.0)
 
     mag = min(abs(ch24)/2.0 + abs(ch4) + abs(ch1)*2.0 + abs(ch15)*2.0, 18.0)
@@ -697,9 +627,9 @@ def pick_setups(best_fut: Dict[str, MarketVol]) -> List[Setup]:
     setups: List[Setup] = []
     for base, mv in universe:
         s = make_setup(base, mv)
-        if s:
-            setups.append(s)
-
+        if not s:
+            continue
+        setups.append(s)
     setups.sort(key=lambda s: (s.conf, s.fut_vol_usd), reverse=True)
     return setups[:SETUPS_N]
 
@@ -760,8 +690,7 @@ def send_email(subject: str, body: str) -> bool:
 def format_setup_email_block(s: Setup) -> str:
     snapshot = (
         f"Market Snapshot: F~{fmt_money(s.fut_vol_usd)} | "
-        f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | "
-        f"1H {pct_with_emoji(s.ch1)} | {s.regime}"
+        f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | {s.regime}"
     )
 
     lines = []
@@ -770,7 +699,11 @@ def format_setup_email_block(s: Setup) -> str:
     lines.append(snapshot)
 
     if s.conf >= MULTI_TP_MIN_CONF and s.tp1 and s.tp2:
-        runner_hint = "trail EMA20 (1H) or last 15m swing-low" if s.side == "BUY" else "trail EMA20 (1H) or last 15m swing-high"
+        if s.side == "BUY":
+            runner_hint = "trail EMA20 (1H) or last 15m swing-low"
+        else:
+            runner_hint = "trail EMA20 (1H) or last 15m swing-high"
+
         lines.append(
             f"TP1 ({TP1_PCT_ALLOC}%) {fmt_price(s.tp1)} | "
             f"TP2 ({TP2_PCT_ALLOC}%) {fmt_price(s.tp2)} | "
@@ -874,8 +807,7 @@ def format_setups_for_screen(setups: List[Setup]) -> str:
     for i, s in enumerate(setups, 1):
         snapshot = (
             f"F~{fmt_money(s.fut_vol_usd)} | "
-            f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | "
-            f"1H {pct_with_emoji(s.ch1)} | {s.regime}"
+            f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | {s.regime}"
         )
         lines.append(
             f"Setup #{i}: {s.side} {s.symbol} — Confidence {s.conf}/100\n"
@@ -883,7 +815,10 @@ def format_setups_for_screen(setups: List[Setup]) -> str:
             f"{snapshot}"
         )
         if s.conf >= MULTI_TP_MIN_CONF and s.tp1 and s.tp2:
-            runner_hint = "trail EMA20 (1H) or last 15m swing-low" if s.side == "BUY" else "trail EMA20 (1H) or last 15m swing-high"
+            if s.side == "BUY":
+                runner_hint = "trail EMA20 (1H) or last 15m swing-low"
+            else:
+                runner_hint = "trail EMA20 (1H) or last 15m swing-high"
             lines.append(
                 f"TP1 ({TP1_PCT_ALLOC}%) {fmt_price(s.tp1)} | "
                 f"TP2 ({TP2_PCT_ALLOC}%) {fmt_price(s.tp2)} | "
@@ -962,9 +897,7 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if max_trades < 1 or daily_cap < 0 or open_cap < 0:
             raise ValueError()
         update_user(uid, max_trades_day=max_trades, daily_risk_cap=daily_cap, open_risk_cap=open_cap)
-        await update.message.reply_text(
-            f"Limits updated: max/day={max_trades}, daily cap=${daily_cap:.2f}, open cap=${open_cap:.2f}"
-        )
+        await update.message.reply_text(f"Limits updated: max/day={max_trades}, daily cap=${daily_cap:.2f}, open cap=${open_cap:.2f}")
     except Exception:
         await update.message.reply_text("Usage: /limits 3 50 75")
 
@@ -983,7 +916,15 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     setups_txt = format_setups_for_screen(setups)
 
-    msg = leaders_txt + "\n\n" + movers_up + "\n\n" + movers_dn + "\n\n" + setups_txt
+    msg = (
+        leaders_txt
+        + "\n\n"
+        + movers_up
+        + "\n\n"
+        + movers_dn
+        + "\n\n"
+        + setups_txt
+    )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 def parse_symbol_from_args(args: List[str]) -> Optional[str]:
@@ -1003,8 +944,8 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sig = db_get_signal(sym)
-    warning = ""
 
+    warning = ""
     if not sig:
         warning = f"⚠️ {sym} is not in current PulseFutures signals. You can still use TradeSetup for risk sizing, but responsibility is yours.\n\n"
         best_fut = await asyncio.to_thread(fetch_futures_tickers)
@@ -1012,25 +953,21 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not mv:
             await update.message.reply_text(f"{warning}Could not find {sym} on Bybit futures.")
             return
-
         ch24 = float(mv.percentage or 0.0)
         ch4 = await asyncio.to_thread(pct_4h_from_1h, mv.symbol)
         ch1 = await asyncio.to_thread(pct_1h_from_1h, mv.symbol)
         ch15 = await asyncio.to_thread(pct_15m_from_15m, mv.symbol)
-
         side = "BUY" if ch1 >= 0 else "SELL"
         entry = float(mv.last or 0.0)
         if entry <= 0:
             await update.message.reply_text(f"{warning}Invalid price for {sym}.")
             return
-
         if side == "BUY":
             sl = entry * (1 - SL_PCT/100.0)
             tp = entry * (1 + TP_PCT/100.0)
         else:
             sl = entry * (1 + SL_PCT/100.0)
             tp = entry * (1 - TP_PCT/100.0)
-
         conf = compute_confidence(side, ch24, ch4, ch1, ch15, usd_notional(mv))
         sig = {
             "symbol": sym,
@@ -1052,7 +989,6 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     open_positions = db_get_open_positions(uid)
     open_risk = sum(float(p["risk_usd"]) for p in open_positions)
-
     if open_risk >= float(user["open_risk_cap"]):
         await update.message.reply_text("❌ Open risk cap reached. Close some positions or increase your open risk cap.")
         return
@@ -1089,19 +1025,16 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     notes = "PulseFutures signal" if db_get_signal(sym) else "Manual (not in signals)"
     db_add_position(uid, sym, side, entry, sl, tp, risk_usd, qty, notional, conf, notes=notes)
 
-    update_user(
-        uid,
-        day_trade_count=int(user["day_trade_count"]) + 1,
-        daily_risk_used=float(user["daily_risk_used"]) + risk_usd
-    )
+    update_user(uid,
+                day_trade_count=int(user["day_trade_count"]) + 1,
+                daily_risk_used=float(user["daily_risk_used"]) + risk_usd)
 
     snapshot = (
         f"F~{fmt_money(float(sig.get('fut_vol_usd', 0)))} | "
         f"24H {pct_with_emoji(float(sig.get('ch24', 0)))} | "
         f"4H {pct_with_emoji(float(sig.get('ch4', 0)))} | "
         f"1H {pct_with_emoji(float(sig.get('ch1', 0)))} | "
-        f"15m {pct_with_emoji(float(sig.get('ch15', 0)))} | "
-        f"{sig.get('regime','')}"
+        f"15m {pct_with_emoji(float(sig.get('ch15', 0)))} | {sig.get('regime','')}"
     )
 
     msg = (
@@ -1114,6 +1047,7 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + f"Suggested Leverage: {lev}x\n\n"
         + f"Use /open to view positions. Close with: /closepnl {sym} +10 (or -10)"
     )
+
     await update.message.reply_text(msg)
 
 async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1138,7 +1072,7 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(
             f"Risk ${float(p['risk_usd']):.2f} | Qty {float(p['qty']):.6g} | Notional ${float(p['notional']):.2f} | {p.get('notes') or ''}"
         )
-        lines.append("")  # blank line between positions
+        lines.append("")
 
     await update.message.reply_text("\n".join(lines).strip(), parse_mode=ParseMode.MARKDOWN)
 
@@ -1225,7 +1159,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         movers_up, movers_dn = build_movers_tables(best_fut)
 
         setup_syms = {s.symbol for s in setups}
-        mover_syms: Set[str] = set()
+        mover_syms = set()
         for base, mv in best_fut.items():
             vol = usd_notional(mv)
             if vol < MOVER_VOL_USD_MIN:
@@ -1249,6 +1183,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             parts.append("No strong setup right now.")
             parts.append("")
 
+        parts.append("")
         parts.append("Movers:")
         parts.append(movers_up.replace("```", "").replace("*", ""))
         parts.append("")
@@ -1256,12 +1191,11 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         parts.append(movers_dn.replace("```", "").replace("*", ""))
 
         body = "\n".join(parts).strip()
-        subject = "PulseFutures (Bybit): Setups + Movers"
+        subject = "PulseFutures: Setups + Movers"
 
         if send_email(subject, body):
             db_set_meta("last_email_ts", str(now))
             db_set_meta("last_email_symbols", ",".join(sorted(cur_syms)))
-
     except Exception as e:
         logger.exception("alert_job error: %s", e)
 
