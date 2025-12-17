@@ -1,9 +1,27 @@
 #!/usr/bin/env python3
 """
-PulseFutures — Bybit Futures (Swap) Screener + TradeSetup + Risk Ledger
+PulseFutures — bybit Futures (Swap) Screener + TradeSetup + Risk Ledger
 
-(Identical to your current working version, with ONLY ONE change:
-Exchange switched from CoinEx to Bybit.)
+Key features (current build):
+- Futures-only (bybit swap via CCXT)
+- /screen: Market Leaders (Top 10 by futures USD notional volume) +
+          Movers (24H >= +10% with F vol >= 1M) +
+          Strong Movers (24H <= -10% with F vol >= 1M) +
+          Top Setups (trigger 1H + confirm 15m)
+- Setups: Trigger on 1H momentum, Confirm on 15m momentum
+- Confidence score (0–100). Multi-TP only for Conf >= 75
+- Email alerts:
+   - Default sessions: London + New York (Trading Window Guard)
+   - Email interval: 60 minutes
+   - No duplicate emails if the set of symbols is unchanged
+- Risk management:
+   - /equity, /limits (max trades/day, daily risk cap, open risk cap)
+   - /tradesetup SYMBOL (or /risk SYMBOL) calculates position sizing
+   - User can open trades even if symbol not in signals -> warning shown
+   - /open lists open positions (blank line between positions)
+   - /closepnl SYMBOL +/-PnL closes position and updates equity
+- Persistence via SQLite (signals cache, user settings, open positions, last-email symbols)
+- Help/UserGuide: English only, no Margin Guide/Effective Leverage sections
 
 Env vars required:
 - TELEGRAM_TOKEN
@@ -26,7 +44,7 @@ import time
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Dict, List, Optional, Tuple, Set
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import ccxt
@@ -45,9 +63,7 @@ from telegram.ext import (
 # CONFIG
 # =========================
 
-# ✅ ONLY CHANGE: CoinEx -> Bybit
 EXCHANGE_ID = "bybit"
-
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 # Futures-only
@@ -338,6 +354,7 @@ def db_get_signal(symbol: str, ttl_sec: int = 24*3600) -> Optional[dict]:
         return None
     s = dict(row)
     if time.time() - float(s["created_ts"]) > ttl_sec:
+        # expired
         con = db_connect()
         cur = con.cursor()
         cur.execute("DELETE FROM signals WHERE symbol=?", (symbol.upper(),))
@@ -371,6 +388,7 @@ def db_get_open_positions(user_id: int) -> List[dict]:
     return [dict(r) for r in rows]
 
 def db_close_position(user_id: int, symbol: str, pnl: float) -> Optional[dict]:
+    # close oldest matching open position
     con = db_connect()
     cur = con.cursor()
     cur.execute("""
@@ -455,13 +473,20 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
         mv = to_mv(t)
         if not mv:
             continue
+        # prefer stable quotes
         if mv.quote not in STABLES:
             continue
+        # best market per base by USD notional
         if mv.base not in best or usd_notional(mv) > usd_notional(best[mv.base]):
             best[mv.base] = mv
     return best
 
 def fetch_ohlcv_pct(symbol: str, timeframe: str, bars: int) -> float:
+    """
+    % change from first close to last close across `bars` completed candles.
+    timeframe: "1h" or "15m"
+    bars: 2 means last two closes, etc.
+    """
     ex = build_exchange()
     try:
         ex.load_markets()
@@ -477,12 +502,15 @@ def fetch_ohlcv_pct(symbol: str, timeframe: str, bars: int) -> float:
         return 0.0
 
 def pct_4h_from_1h(symbol: str) -> float:
+    # 4h change using 1h candles over 4 hours -> bars=4
     return fetch_ohlcv_pct(symbol, "1h", 4)
 
 def pct_1h_from_1h(symbol: str) -> float:
+    # 1h change using last 1 hour -> bars=1 (two closes)
     return fetch_ohlcv_pct(symbol, "1h", 1)
 
 def pct_15m_from_15m(symbol: str) -> float:
+    # 15m change -> bars=1 (two closes)
     return fetch_ohlcv_pct(symbol, "15m", 1)
 
 # =========================
@@ -490,6 +518,14 @@ def pct_15m_from_15m(symbol: str) -> float:
 # =========================
 
 def fmt_price(x: float) -> str:
+    """
+    Dynamic decimals:
+    - >= 1000 -> 2dp
+    - >= 100  -> 3dp
+    - >= 1    -> 4dp
+    - >= 0.1  -> 5dp
+    - else    -> 6dp
+    """
     ax = abs(x)
     if ax >= 1000:
         return f"{x:.2f}"
@@ -519,6 +555,7 @@ def pct_with_emoji(p: float) -> str:
     return f"{val:+d}% {emo}"
 
 def regime_label(ch24: float, ch4: float) -> str:
+    # simple regime: both same direction => LONG/SHORT else NEUTRAL
     if ch24 >= 3 and ch4 >= 2:
         return "LONG 🟢"
     if ch24 <= -3 and ch4 <= -2:
@@ -533,6 +570,7 @@ def fmt_table(rows: List[List], headers: List[str]) -> str:
 # =========================
 
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
+    # Base points from alignment
     score = 50.0
 
     def add_align(x: float, long: bool, w: float):
@@ -548,9 +586,11 @@ def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: flo
     add_align(ch1, is_long, 8.0)
     add_align(ch15, is_long, 6.0)
 
+    # Magnitude bonus (cap)
     mag = min(abs(ch24)/2.0 + abs(ch4) + abs(ch1)*2.0 + abs(ch15)*2.0, 18.0)
     score += mag
 
+    # Liquidity bonus
     if fut_vol_usd >= 15_000_000:
         score += 8
     elif fut_vol_usd >= 6_000_000:
@@ -560,6 +600,7 @@ def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: flo
     elif fut_vol_usd >= 1_000_000:
         score += 2
 
+    # Clamp
     score = max(0.0, min(100.0, score))
     return int(round(score))
 
@@ -573,13 +614,18 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
     ch1 = pct_1h_from_1h(mv.symbol)
     ch15 = pct_15m_from_15m(mv.symbol)
 
+    # Trigger: 1H momentum
     if abs(ch1) < TRIGGER_1H_ABS_MIN:
         return None
+
+    # Confirm: 15m in same direction
     if abs(ch15) < CONFIRM_15M_ABS_MIN:
         return None
 
+    # Determine side by 1H direction
     side = "BUY" if ch1 > 0 else "SELL"
 
+    # Alignment preference with 4H
     if side == "BUY" and ch4 < ALIGN_4H_MIN:
         return None
     if side == "SELL" and ch4 > -ALIGN_4H_MIN:
@@ -623,6 +669,7 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
     )
 
 def pick_setups(best_fut: Dict[str, MarketVol]) -> List[Setup]:
+    # Evaluate setups over top-volume universe for speed
     universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[: max(50, LEADERS_N)]
     setups: List[Setup] = []
     for base, mv in universe:
@@ -630,7 +677,11 @@ def pick_setups(best_fut: Dict[str, MarketVol]) -> List[Setup]:
         if not s:
             continue
         setups.append(s)
+
+    # Sort by confidence then liquidity
     setups.sort(key=lambda s: (s.conf, s.fut_vol_usd), reverse=True)
+
+    # Keep top N, but only those with decent confidence
     return setups[:SETUPS_N]
 
 # =========================
@@ -639,6 +690,7 @@ def pick_setups(best_fut: Dict[str, MarketVol]) -> List[Setup]:
 
 def _in_window_local(tz: ZoneInfo, start: Tuple[int,int], end: Tuple[int,int]) -> bool:
     now = datetime.now(tz)
+    # Sunday guard
     if now.weekday() == 6 and not SUNDAY_EMAILS:
         return False
 
@@ -647,11 +699,13 @@ def _in_window_local(tz: ZoneInfo, start: Tuple[int,int], end: Tuple[int,int]) -
     start_m = sh*60 + sm
     end_m = eh*60 + em
     now_m = now.hour*60 + now.minute
+
     return start_m <= now_m <= end_m
 
 def window_ok() -> bool:
     if not GUARD_ENABLED:
         return True
+    # Allowed if in London OR in New York window
     return _in_window_local(LONDON_TZ, LONDON_START, LONDON_END) or _in_window_local(NY_TZ, NY_START, NY_END)
 
 # =========================
@@ -688,6 +742,7 @@ def send_email(subject: str, body: str) -> bool:
         return False
 
 def format_setup_email_block(s: Setup) -> str:
+    # Multi-TP only if conf >= threshold
     snapshot = (
         f"Market Snapshot: F~{fmt_money(s.fut_vol_usd)} | "
         f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | {s.regime}"
@@ -699,6 +754,7 @@ def format_setup_email_block(s: Setup) -> str:
     lines.append(snapshot)
 
     if s.conf >= MULTI_TP_MIN_CONF and s.tp1 and s.tp2:
+        # TP1/TP2 percent + numbers on same line
         if s.side == "BUY":
             runner_hint = "trail EMA20 (1H) or last 15m swing-low"
         else:
@@ -716,6 +772,11 @@ def format_setup_email_block(s: Setup) -> str:
 # =========================
 
 def calc_position_size(entry: float, sl: float, risk_usd: float) -> Tuple[float, float]:
+    """
+    Returns (qty, notional).
+    qty = risk_usd / |entry - sl|
+    notional = qty * entry
+    """
     risk_per_unit = abs(entry - sl)
     if risk_per_unit <= 0:
         return 0.0, 0.0
@@ -724,6 +785,12 @@ def calc_position_size(entry: float, sl: float, risk_usd: float) -> Tuple[float,
     return qty, notional
 
 def suggested_leverage(notional: float, equity: float) -> int:
+    """
+    Simple suggestion:
+      - keep notional <= 3x equity => 3
+      - <= 5x => 5
+      - else => 10 (cap)
+    """
     if equity <= 0:
         return 1
     x = notional / equity
@@ -756,7 +823,7 @@ HELP_TEXT = """\
 - /diag — Diagnostics
 
 **Notes**
-- Futures-only setups (Bybit swap).
+- Futures-only setups (bybit swap).
 - If you TradeSetup a symbol that is not in current PulseFutures signals, you will get a warning (you can still use the risk sizing).
 - This is not financial advice.
 """
@@ -791,7 +858,7 @@ def build_movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
             dn.append((base, vol, ch24, float(mv.last or 0.0)))
 
     up.sort(key=lambda x: (x[2], x[1]), reverse=True)
-    dn.sort(key=lambda x: (x[2], x[1]))
+    dn.sort(key=lambda x: (x[2], x[1]))  # most negative first
 
     up_rows = [[b, fmt_money(v), pct_with_emoji(c), fmt_price(px)] for b, v, c, px in up[:MOVERS_N]]
     dn_rows = [[b, fmt_money(v), pct_with_emoji(c), fmt_price(px)] for b, v, c, px in dn[:MOVERS_N]]
@@ -824,7 +891,7 @@ def format_setups_for_screen(setups: List[Setup]) -> str:
                 f"TP2 ({TP2_PCT_ALLOC}%) {fmt_price(s.tp2)} | "
                 f"Runner ({RUNNER_PCT_ALLOC}%) — {runner_hint}"
             )
-        lines.append("")
+        lines.append("")  # spacing between setups
     return "\n".join(lines).strip()
 
 # =========================
@@ -843,7 +910,7 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     notify = "ON" if user["notify_on"] else "OFF"
     msg = (
         f"*Diag*\n"
-        f"- Futures: Bybit swap\n"
+        f"- Futures: bybit swap\n"
         f"- Email notify: {notify}\n"
         f"- Guard: {'ON' if GUARD_ENABLED else 'OFF'} (London+NY)\n"
         f"- Sunday emails: {'YES' if SUNDAY_EMAILS else 'NO'}\n"
@@ -902,6 +969,7 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /limits 3 50 75")
 
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Clear old-ish signals? We'll keep TTL-based in db_get_signal.
     best_fut = await asyncio.to_thread(fetch_futures_tickers)
     if not best_fut:
         await update.message.reply_text("Error: could not fetch futures tickers.")
@@ -911,6 +979,7 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     movers_up, movers_dn = build_movers_tables(best_fut)
 
     setups = await asyncio.to_thread(pick_setups, best_fut)
+    # persist setups to signals cache
     for s in setups:
         db_upsert_signal(s)
 
@@ -943,16 +1012,19 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /tradesetup BTC")
         return
 
+    # Try to load latest PulseFutures signal for this symbol (no need to run /screen)
     sig = db_get_signal(sym)
 
     warning = ""
     if not sig:
         warning = f"⚠️ {sym} is not in current PulseFutures signals. You can still use TradeSetup for risk sizing, but responsibility is yours.\n\n"
+        # We still need a market symbol to compute entry/sl/tp; use live ticker if possible
         best_fut = await asyncio.to_thread(fetch_futures_tickers)
         mv = best_fut.get(sym)
         if not mv:
-            await update.message.reply_text(f"{warning}Could not find {sym} on Bybit futures.")
+            await update.message.reply_text(f"{warning}Could not find {sym} on bybit futures.")
             return
+        # create a synthetic setup from live snapshot
         ch24 = float(mv.percentage or 0.0)
         ch4 = await asyncio.to_thread(pct_4h_from_1h, mv.symbol)
         ch1 = await asyncio.to_thread(pct_1h_from_1h, mv.symbol)
@@ -987,6 +1059,7 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "regime": regime_label(ch24, ch4),
         }
 
+    # Risk checks
     open_positions = db_get_open_positions(uid)
     open_risk = sum(float(p["risk_usd"]) for p in open_positions)
     if open_risk >= float(user["open_risk_cap"]):
@@ -997,6 +1070,7 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Max trades per day reached. Try again tomorrow or increase your daily limit.")
         return
 
+    # Determine risk per trade: min(risk_pct*equity, remaining daily cap, remaining open cap)
     equity = float(user["equity"])
     risk_pct = float(user["risk_pct"])
     risk_by_pct = equity * (risk_pct / 100.0)
@@ -1022,9 +1096,11 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lev = suggested_leverage(notional, equity)
 
+    # Save position
     notes = "PulseFutures signal" if db_get_signal(sym) else "Manual (not in signals)"
     db_add_position(uid, sym, side, entry, sl, tp, risk_usd, qty, notional, conf, notes=notes)
 
+    # Update daily counters
     update_user(uid,
                 day_trade_count=int(user["day_trade_count"]) + 1,
                 daily_risk_used=float(user["daily_risk_used"]) + risk_usd)
@@ -1051,6 +1127,7 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # alias to tradesetup
     await tradesetup(update, context)
 
 async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1072,7 +1149,7 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(
             f"Risk ${float(p['risk_usd']):.2f} | Qty {float(p['qty']):.6g} | Notional ${float(p['notional']):.2f} | {p.get('notes') or ''}"
         )
-        lines.append("")
+        lines.append("")  # <-- blank line between positions (per your request)
 
     await update.message.reply_text("\n".join(lines).strip(), parse_mode=ParseMode.MARKDOWN)
 
@@ -1105,6 +1182,7 @@ async def closepnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Allow typing "BTC" -> show if in signal cache; otherwise guidance
     text = (update.message.text or "").strip()
     token = re.sub(r"[^A-Za-z0-9$]", "", text).upper().lstrip("$")
     if len(token) < 2:
@@ -1134,9 +1212,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     try:
+        # Use meta for last email timestamp + symbols
         last_ts = float(db_get_meta("last_email_ts", "0") or "0")
         last_syms = set((db_get_meta("last_email_symbols", "") or "").split(",")) if db_get_meta("last_email_symbols", "") else set()
 
+        # We don't have a single "user" for email, it's global; but we can respect EMAIL_ENABLED + window.
         if not EMAIL_ENABLED_DEFAULT:
             return
         if not email_config_ok():
@@ -1158,7 +1238,9 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
         movers_up, movers_dn = build_movers_tables(best_fut)
 
+        # Choose email symbols set: setups only (primary) + movers up/dn symbols (secondary)
         setup_syms = {s.symbol for s in setups}
+        # parse movers tables: too heavy. We'll build movers list again quickly:
         mover_syms = set()
         for base, mv in best_fut.items():
             vol = usd_notional(mv)
@@ -1174,23 +1256,26 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if cur_syms and cur_syms == last_syms:
             return
 
+        # Build email body
         parts: List[str] = []
         if setups:
             for i, s in enumerate(setups, 1):
                 parts.append(f"Setup #{i}:\n" + format_setup_email_block(s))
-                parts.append("")
+                parts.append("")  # spacing between setups
         else:
             parts.append("No strong setup right now.")
             parts.append("")
 
-        parts.append("")
+        # Add movers snapshot blocks
+        parts.append("")  # spacing after setups section
         parts.append("Movers:")
-        parts.append(movers_up.replace("```", "").replace("*", ""))
+        parts.append(movers_up.replace("```", "").replace("*", ""))  # keep plain for email
         parts.append("")
         parts.append("Strong Movers:")
         parts.append(movers_dn.replace("```", "").replace("*", ""))
 
         body = "\n".join(parts).strip()
+
         subject = "PulseFutures: Setups + Movers"
 
         if send_email(subject, body):
@@ -1238,6 +1323,7 @@ def main():
             '"python-telegram-bot[job-queue]>=20.7,<22.0"'
         )
 
+    # IMPORTANT: run_polling in main thread (no threads/uvicorn)
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
