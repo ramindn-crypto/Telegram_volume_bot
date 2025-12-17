@@ -2,15 +2,10 @@
 """
 PulseFutures — Bybit Futures (Swap) Screener + TradeSetup + Risk Ledger
 
-✅ Fixes in this final build
-1) TP1/TP2/TP3 no longer collapse to the same price when TP_MAX_PCT cap is hit.
-   - We cap TP3 only, then scale TP1/TP2 proportionally.
-
-2) /screen speed-up (big)
-   - For each symbol metrics, we fetch only:
-     - 1H candles ONCE (derives: 1H%, 4H%, ATR)
-     - 15m candles ONCE (derives: 15m%)
-   - Less CCXT calls = much faster.
+✅ Fixes included
+1) /help (and /start) now ALWAYS responds (robust send_message via effective_chat)
+2) TP1/TP2/TP3 no longer collapse to same price when TP cap hits
+3) /screen speed-up: per symbol metrics uses only 2 fetches (1h + 15m) and setups universe limited
 
 Core features
 - Futures-only (Bybit swap via CCXT)
@@ -36,7 +31,6 @@ Charts:
 - CHART_IMG_ENABLED=true/false
 """
 
-import asyncio
 import logging
 import os
 import re
@@ -769,7 +763,6 @@ def multi_tp_from_r(entry: float, side: str, r: float) -> Tuple[float, float, fl
     d1 = d3 * (r1 / r3)
     d2 = d3 * (r2 / r3)
 
-    # enforce strict ordering in weird edge cases
     if d1 >= d2:
         d1 = d2 * 0.98
     if d2 >= d3:
@@ -923,7 +916,6 @@ def market_bias(best_fut: Dict[str, MarketVol]) -> str:
         if vol <= 0:
             continue
 
-        # fast: 1h candles gives ch4
         ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol)
         ch24 = float(mv.percentage or 0.0)
 
@@ -1007,7 +999,6 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
 
     ch24 = float(mv.percentage or 0.0)
 
-    # FAST: only 2 fetches
     ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol)
 
     if abs(ch1) < TRIGGER_1H_ABS_MIN:
@@ -1073,7 +1064,6 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
 
 
 def pick_setups(best_fut: Dict[str, MarketVol]) -> List[Setup]:
-    # faster universe
     universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:30]
     setups: List[Setup] = []
     for base, mv in universe:
@@ -1179,7 +1169,6 @@ def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tupl
         if ch24 < MOVER_UP_24H_MIN and ch24 > MOVER_DN_24H_MAX:
             continue
 
-        # Only fetch 1h candles for the reduced mover set (fast enough)
         ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol)
 
         if ch24 >= MOVER_UP_24H_MIN:
@@ -1323,11 +1312,12 @@ HELP_TEXT = """\
 # TELEGRAM HANDLERS
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+    # Robust: works even if update.message is None
+    logger.info("START/HELP called by user_id=%s", update.effective_user.id if update.effective_user else None)
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return
+    await context.bot.send_message(chat_id=chat_id, text=HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 
 async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1508,8 +1498,6 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # NOTE: We do not use to_thread here because ccxt is blocking anyway,
-    # but total calls are reduced heavily now.
     best_fut = fetch_futures_tickers()
     if not best_fut:
         await update.message.reply_text("Error: could not fetch futures tickers.")
@@ -1548,7 +1536,7 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
-    # charts after message (so user sees results fast)
+    # Send charts after message so results appear fast
     for s in setups:
         png = build_chart_png_for_market(s.symbol, s.market_symbol)
         if png:
@@ -1895,8 +1883,9 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
+    # ✅ IMPORTANT: Make /help and /start bulletproof & registered first
+    app.add_handler(CommandHandler(["help", "start"], start))
+
     app.add_handler(CommandHandler("screen", screen))
     app.add_handler(CommandHandler("diag", diag))
     app.add_handler(CommandHandler("notify_on", notify_on))
