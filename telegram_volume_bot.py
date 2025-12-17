@@ -3,21 +3,19 @@
 PulseFutures — Futures Screener + TradeSetup + Risk Ledger
 Exchange: Bybit or Binance USD-M Futures (via CCXT)
 
-Env:
-- TELEGRAM_TOKEN (required)
-- EXCHANGE_ID = bybit | binanceusdm (default bybit)
+Required Env:
+- TELEGRAM_TOKEN
 
-Optional Email:
+Optional Env:
+- EXCHANGE_ID=bybit | binanceusdm (default bybit)
 - EMAIL_ENABLED=true/false (default false)
 - EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO
-
-Optional:
 - SUNDAY_EMAILS=true/false (default false)
 - DB_PATH (default pulsefutures.db)
 
 Notes:
 - Futures-only
-- Public endpoints (fetch_tickers / fetch_ohlcv) usually work without API keys
+- Uses public endpoints (fetch_tickers / fetch_ohlcv) -> usually no API keys needed
 """
 
 import asyncio
@@ -53,7 +51,6 @@ from telegram.ext import (
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 EXCHANGE_ID = os.environ.get("EXCHANGE_ID", "bybit").strip().lower()  # bybit | binanceusdm
 
-# Display / Universe
 LEADERS_N = 10
 MOVERS_N = 10
 SETUPS_N = 3
@@ -94,7 +91,8 @@ EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
 EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 
-EMAIL_MIN_INTERVAL_SEC = 60 * 60  # 60 minutes
+# Email frequency: 60 minutes
+EMAIL_MIN_INTERVAL_SEC = 60 * 60
 
 # Trading Window Guard (London + NY)
 GUARD_ENABLED = True
@@ -117,6 +115,9 @@ STABLES = {"USDT", "USDC", "USD", "FDUSD", "TUSD", "DAI", "PYUSD"}
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pulsefutures")
+
+# Debug (shows details if /screen fails)
+LAST_FETCH_ERROR = ""
 
 # =========================
 # DATA STRUCTURES
@@ -397,19 +398,23 @@ def db_close_position(user_id: int, symbol: str, pnl: float) -> Optional[dict]:
 def build_exchange():
     """
     Futures-only exchange client.
-    - bybit: linear USDT perpetual via defaultType='swap'
-    - binanceusdm: USD-M futures via defaultType='swap' works; 'future' also works in some setups
+    - bybit: linear USDT perpetual via defaultType='swap' + defaultSubType='linear'
+    - binanceusdm: USD-M futures via defaultType='swap'
     """
     if EXCHANGE_ID not in {"bybit", "binanceusdm"}:
         raise RuntimeError("EXCHANGE_ID must be 'bybit' or 'binanceusdm'")
 
     klass = ccxt.__dict__[EXCHANGE_ID]
+
+    opts = {"defaultType": "swap"}
+    if EXCHANGE_ID == "bybit":
+        # Critical for USDT perpetual markets stability
+        opts["defaultSubType"] = "linear"
+
     ex = klass({
         "enableRateLimit": True,
-        "timeout": 20000,
-        "options": {
-            "defaultType": "swap",
-        },
+        "timeout": 30000,
+        "options": opts,
     })
     return ex
 
@@ -450,12 +455,15 @@ def usd_notional(mv: Optional[MarketVol]) -> float:
     return float(mv.base_vol) * float(price)
 
 def fetch_futures_tickers() -> Dict[str, MarketVol]:
+    global LAST_FETCH_ERROR
+    LAST_FETCH_ERROR = ""
     ex = build_exchange()
     try:
         ex.load_markets()
         tickers = ex.fetch_tickers()
     except Exception as e:
-        logger.exception("fetch_tickers failed: %s", e)
+        LAST_FETCH_ERROR = f"{type(e).__name__}: {e}"
+        logger.exception("fetch_tickers failed")
         return {}
 
     best: Dict[str, MarketVol] = {}
@@ -465,7 +473,6 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
             continue
         if mv.quote not in STABLES:
             continue
-        # best market per base by USD notional
         if mv.base not in best or usd_notional(mv) > usd_notional(best[mv.base]):
             best[mv.base] = mv
     return best
@@ -481,8 +488,8 @@ def fetch_ohlcv_pct(symbol: str, timeframe: str, bars: int) -> float:
         if not closes or not closes[0]:
             return 0.0
         return (closes[-1] - closes[0]) / closes[0] * 100.0
-    except Exception:
-        logger.exception("fetch_ohlcv_pct failed: %s %s", symbol, timeframe)
+    except Exception as e:
+        logger.exception("fetch_ohlcv_pct failed: %s %s (%s)", symbol, timeframe, e)
         return 0.0
 
 def pct_4h_from_1h(symbol: str) -> float:
@@ -614,7 +621,8 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
     )
 
 def pick_setups(best_fut: Dict[str, MarketVol]) -> List[Setup]:
-    universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[: max(50, LEADERS_N)]
+    # Focus on liquid universe
+    universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:max(50, LEADERS_N)]
     setups: List[Setup] = []
     for base, mv in universe:
         s = make_setup(base, mv)
@@ -627,15 +635,15 @@ def pick_setups(best_fut: Dict[str, MarketVol]) -> List[Setup]:
 # WINDOW GUARD
 # =========================
 
-def _in_window_local(tz: ZoneInfo, start: Tuple[int,int], end: Tuple[int,int]) -> bool:
+def _in_window_local(tz: ZoneInfo, start: Tuple[int, int], end: Tuple[int, int]) -> bool:
     now = datetime.now(tz)
     if now.weekday() == 6 and not SUNDAY_EMAILS:
         return False
     sh, sm = start
     eh, em = end
-    start_m = sh*60 + sm
-    end_m = eh*60 + em
-    now_m = now.hour*60 + now.minute
+    start_m = sh * 60 + sm
+    end_m = eh * 60 + em
+    now_m = now.hour * 60 + now.minute
     return start_m <= now_m <= end_m
 
 def window_ok() -> bool:
@@ -873,7 +881,10 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     best_fut = await asyncio.to_thread(fetch_futures_tickers)
     if not best_fut:
-        await update.message.reply_text("Error: could not fetch futures tickers.")
+        await update.message.reply_text(
+            "Error: could not fetch futures tickers.\n"
+            f"Details: {LAST_FETCH_ERROR or 'unknown'}"
+        )
         return
 
     leaders_txt = build_leaders_table(best_fut)
