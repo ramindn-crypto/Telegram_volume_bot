@@ -2,28 +2,8 @@
 """
 PulseFutures — Bybit Futures (Swap) Screener + TradeSetup + Risk Ledger
 
-(Everything kept the same as the last version; ONLY data source changed from CoinEx to Bybit.)
-
-Key features (current build):
-- Futures-only (Bybit swap via CCXT)
-- /screen: Market Leaders (Top 10 by futures USD notional volume) +
-          Movers (24H >= +10% with F vol >= 1M) +
-          Strong Movers (24H <= -10% with F vol >= 1M) +
-          Top Setups (trigger 1H + confirm 15m)
-- Setups: Trigger on 1H momentum, Confirm on 15m momentum
-- Confidence score (0–100). Multi-TP only for Conf >= 75
-- Email alerts:
-   - Default sessions: London + New York (Trading Window Guard)
-   - Email interval: 60 minutes
-   - No duplicate emails if the set of symbols is unchanged
-- Risk management:
-   - /equity, /limits (max trades/day, daily risk cap, open risk cap)
-   - /tradesetup SYMBOL (or /risk SYMBOL) calculates position sizing
-   - User can open trades even if symbol not in signals -> warning shown
-   - /open lists open positions (blank line between positions)
-   - /closepnl SYMBOL +/-PnL closes position and updates equity
-- Persistence via SQLite (signals cache, user settings, open positions, last-email symbols)
-- Help/UserGuide: English only, no Margin Guide/Effective Leverage sections
+(Identical to your current working version, with ONLY ONE change:
+Exchange switched from CoinEx to Bybit.)
 
 Env vars required:
 - TELEGRAM_TOKEN
@@ -65,7 +45,7 @@ from telegram.ext import (
 # CONFIG
 # =========================
 
-# ONLY CHANGE: Exchange is now Bybit
+# ✅ ONLY CHANGE: CoinEx -> Bybit
 EXCHANGE_ID = "bybit"
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -420,7 +400,6 @@ def db_close_position(user_id: int, symbol: str, pnl: float) -> Optional[dict]:
 
 def build_exchange():
     klass = ccxt.__dict__[EXCHANGE_ID]
-    # Keep same pattern; only exchange id changed
     return klass({
         "enableRateLimit": True,
         "timeout": 20000,
@@ -1212,7 +1191,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         parts.append(movers_dn.replace("```", "").replace("*", ""))
 
         body = "\n".join(parts).strip()
-
         subject = "PulseFutures: Setups + Movers"
 
         if send_email(subject, body):
