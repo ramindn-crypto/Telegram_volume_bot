@@ -2,6 +2,19 @@
 """
 PulseFutures — Bybit Futures (Swap) Screener + TradeSetup + Risk Ledger
 
+Key features:
+- Futures-only (Bybit swap via CCXT)
+- /screen: Market Leaders + Directional Leaders/Losers + Top Setups (shiny Telegram layout)
+- Setups: Trigger on 1H momentum + Confirm on 15m momentum
+- Confidence score (0–100)
+- SL/TP: ATR-based with confidence-dynamic SL multiplier + capped TP distance
+- Multi-TP (TP1/TP2/TP3) only for Conf >= 75 (R-based and intraday-friendly)
+- Email alerts (optional): pretty format + chart links + chart PNG attachments
+- Trading window guard: London + New York
+- Email interval: 60 minutes + dedupe by set of symbols
+- Risk mgmt: /equity, /limits, /tradesetup, /open, /closepnl
+- Time-stop for trade management: default 18h, shows EXPIRED in /open
+
 Env vars required:
 - TELEGRAM_TOKEN
 
@@ -9,29 +22,30 @@ Optional email env vars:
 - EMAIL_ENABLED=true/false (default false)
 - EMAIL_HOST, EMAIL_PORT (465), EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO
 
-Optional guard:
-- SUNDAY_EMAILS=true/false (default false)
-
 Optional charts:
 - CHART_IMG_ENABLED=true/false (default true)
 - CHART_TIMEFRAME=1h (default 1h)
 - CHART_BARS=120 (default 120)
 - CHART_WIDTH=900, CHART_HEIGHT=500
 
-Optional ATR:
+ATR:
 - USE_ATR_SLTP=true/false (default true)
 - ATR_TIMEFRAME=1h, ATR_PERIOD=14
-- ATR_SL_MULT=1.5, ATR_TP_MULT=2.5
 - ATR_MIN_PCT=0.6, ATR_MAX_PCT=6.0
+- TP_MAX_PCT=4.5
 
-Optional bias:
+Multi-TP:
+- MULTI_TP_MIN_CONF=75
+- TP_R_MULTS="0.8,1.4,2.0" (optional)
+
+Bias:
 - BIAS_UNIVERSE_N=20, BIAS_STRONG_TH=0.6
 
-Optional time-stop:
+Time-stop:
 - SETUP_TIME_STOP_HOURS=18
 
-Requirements notes:
-- python-telegram-bot[job-queue]>=20.7,<22.0 (for JobQueue)
+Requires:
+- python-telegram-bot[job-queue]>=20.7,<22.0
 """
 
 import asyncio
@@ -105,16 +119,25 @@ SETUP_TIME_STOP_HOURS = int(os.environ.get("SETUP_TIME_STOP_HOURS", "18"))
 USE_ATR_SLTP = os.environ.get("USE_ATR_SLTP", "true").lower() == "true"
 ATR_TIMEFRAME = os.environ.get("ATR_TIMEFRAME", "1h")
 ATR_PERIOD = int(os.environ.get("ATR_PERIOD", "14"))
-ATR_SL_MULT = float(os.environ.get("ATR_SL_MULT", "1.5"))
-ATR_TP_MULT = float(os.environ.get("ATR_TP_MULT", "2.5"))
+
+# SL clamp (distance as % of entry)
 ATR_MIN_PCT = float(os.environ.get("ATR_MIN_PCT", "0.6"))
 ATR_MAX_PCT = float(os.environ.get("ATR_MAX_PCT", "6.0"))
 
+# TP cap (distance as % of entry) – prevents “space TP”
+TP_MAX_PCT = float(os.environ.get("TP_MAX_PCT", "4.5"))
+
 # Multi-TP only when Conf >= 75
-MULTI_TP_MIN_CONF = 75
-TP1_PCT_ALLOC = 40
-TP2_PCT_ALLOC = 40
-RUNNER_PCT_ALLOC = 20
+MULTI_TP_MIN_CONF = int(os.environ.get("MULTI_TP_MIN_CONF", "75"))
+TP_ALLOCS = (40, 40, 20)  # TP1/TP2/TP3
+# R-multipliers for TP1/TP2/TP3 (intraday-friendly)
+try:
+    _rm = os.environ.get("TP_R_MULTS", "0.8,1.4,2.0")
+    TP_R_MULTS = tuple(float(x.strip()) for x in _rm.split(","))  # (0.8,1.4,2.0)
+    if len(TP_R_MULTS) != 3:
+        TP_R_MULTS = (0.8, 1.4, 2.0)
+except Exception:
+    TP_R_MULTS = (0.8, 1.4, 2.0)
 
 # Email / Alerts
 EMAIL_ENABLED_DEFAULT = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
@@ -124,7 +147,6 @@ EMAIL_USER = os.environ.get("EMAIL_USER", "")
 EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
 EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
-NOTIFY_ON_DEFAULT = EMAIL_ENABLED_DEFAULT
 EMAIL_MIN_INTERVAL_SEC = 60 * 60  # 60 minutes
 
 # Email formatting
@@ -193,7 +215,7 @@ class Setup:
     conf: int
     entry: float
     sl: float
-    tp: float
+    tp: float                 # TP3 if multi, else single TP
     tp1: Optional[float]
     tp2: Optional[float]
     fut_vol_usd: float
@@ -324,7 +346,7 @@ def get_user(user_id: int) -> dict:
                 DEFAULT_MAX_TRADES_DAY,
                 DEFAULT_DAILY_RISK_CAP,
                 DEFAULT_OPEN_RISK_CAP,
-                1 if NOTIFY_ON_DEFAULT else 0,
+                1 if EMAIL_ENABLED_DEFAULT else 0,
                 "Australia/Melbourne",
                 0,
                 now_mel.date().isoformat(),
@@ -677,16 +699,37 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
-def sl_tp_from_atr(entry: float, side: str, atr: float) -> Tuple[float, float, float]:
+def sl_mult_from_conf(conf: int) -> float:
+    # Confidence-dynamic SL multiplier (more room for higher-quality setups)
+    if conf > 80:
+        return 1.9
+    if conf >= 70:
+        return 1.6
+    return 1.3
+
+
+def sl_tp_from_atr(entry: float, side: str, atr: float, conf: int) -> Tuple[float, float, float]:
+    """
+    returns (sl, tp_single, r_abs)
+    - SL = (SL_mult(conf) * ATR) clamped between ATR_MIN_PCT..ATR_MAX_PCT
+    - Single TP = 1.4R by default but capped by TP_MAX_PCT (used when no multi-tp)
+    """
     if entry <= 0 or atr <= 0:
         return 0.0, 0.0, 0.0
 
-    sl_dist = ATR_SL_MULT * atr
+    sl_mult = sl_mult_from_conf(conf)
+    sl_dist = sl_mult * atr
+
     min_dist = (ATR_MIN_PCT / 100.0) * entry
     max_dist = (ATR_MAX_PCT / 100.0) * entry
     sl_dist = clamp(sl_dist, min_dist, max_dist)
 
-    tp_dist = ATR_TP_MULT * atr
+    r = sl_dist  # risk distance
+
+    # single TP target ~1.4R (intraday), capped by TP_MAX_PCT
+    tp_dist = 1.4 * r
+    tp_max_dist = (TP_MAX_PCT / 100.0) * entry
+    tp_dist = min(tp_dist, tp_max_dist)
 
     if side == "BUY":
         sl = entry - sl_dist
@@ -695,7 +738,27 @@ def sl_tp_from_atr(entry: float, side: str, atr: float) -> Tuple[float, float, f
         sl = entry + sl_dist
         tp = entry - tp_dist
 
-    return sl, tp, sl_dist
+    return sl, tp, r
+
+
+def multi_tp_from_r(entry: float, side: str, r: float) -> Tuple[float, float, float]:
+    """
+    TP1/TP2/TP3 from R, each TP distance capped by TP_MAX_PCT.
+    """
+    if r <= 0:
+        return 0.0, 0.0, 0.0
+
+    d1 = TP_R_MULTS[0] * r
+    d2 = TP_R_MULTS[1] * r
+    d3 = TP_R_MULTS[2] * r
+
+    maxd = (TP_MAX_PCT / 100.0) * entry
+    d1, d2, d3 = min(d1, maxd), min(d2, maxd), min(d3, maxd)
+
+    if side == "BUY":
+        return (entry + d1, entry + d2, entry + d3)
+    else:
+        return (entry - d1, entry - d2, entry - d3)
 
 
 # =========================
@@ -825,13 +888,24 @@ def fmt_kv(key: str, val: str) -> str:
 
 
 def fmt_inline_setup_card(i: int, s: Setup) -> str:
-    return (
+    # Shows TP single or TP1/TP2/TP3 allocations
+    if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
+        tp_line = f"TP1 {fmt_price(s.tp1)} ({TP_ALLOCS[0]}%) | TP2 {fmt_price(s.tp2)} ({TP_ALLOCS[1]}%) | TP3 {fmt_price(s.tp)} ({TP_ALLOCS[2]}%)"
+        rule = "Rule: after TP1 → SL to BE"
+    else:
+        tp_line = f"TP {fmt_price(s.tp)}"
+        rule = ""
+
+    base = (
         f"🔥 *Setup #{i}*  •  *{s.side} {s.symbol}*  •  Conf *{s.conf}/100*\n"
-        f"{fmt_kv('Entry', fmt_price(s.entry))}  |  {fmt_kv('SL', fmt_price(s.sl))}  |  {fmt_kv('TP', fmt_price(s.tp))}\n"
-        f"{fmt_kv('24H', pct_with_emoji(s.ch24))}  |  {fmt_kv('4H', pct_with_emoji(s.ch4))}  |  "
-        f"{fmt_kv('1H', pct_with_emoji(s.ch1))}  |  {fmt_kv('F Vol', '≈'+fmt_money(s.fut_vol_usd))}\n"
+        f"{fmt_kv('Entry', fmt_price(s.entry))}  |  {fmt_kv('SL', fmt_price(s.sl))}\n"
+        f"{tp_line}\n"
+        f"{fmt_kv('24H', pct_with_emoji(s.ch24))}  |  {fmt_kv('4H', pct_with_emoji(s.ch4))}  |  {fmt_kv('1H', pct_with_emoji(s.ch1))}  |  {fmt_kv('F Vol', '≈'+fmt_money(s.fut_vol_usd))}\n"
         f"🧭 {s.regime}"
     )
+    if rule:
+        base += f"\n🧠 {rule}"
+    return base
 
 
 # =========================
@@ -943,32 +1017,34 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
     if entry <= 0:
         return None
 
-    if USE_ATR_SLTP:
-        atr = atr_value(mv.symbol, ATR_TIMEFRAME, ATR_PERIOD)
-        sl, tp, _ = sl_tp_from_atr(entry, side, atr)
-        if sl <= 0 or tp <= 0:
-            return None
-        if side == "BUY":
-            tp1 = entry + (tp - entry) * 0.5
-            tp2 = tp
-        else:
-            tp1 = entry - (entry - tp) * 0.5
-            tp2 = tp
-    else:
-        # Fallback (not recommended)
-        if side == "BUY":
-            sl = entry * 0.97
-            tp = entry * 1.06
-            tp1 = entry * 1.03
-            tp2 = tp
-        else:
-            sl = entry * 1.03
-            tp = entry * 0.94
-            tp1 = entry * 0.97
-            tp2 = tp
-
+    # confidence first (affects SL multiplier)
     conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
     reg = regime_label(ch24, ch4)
+
+    if USE_ATR_SLTP:
+        atr = atr_value(mv.symbol, ATR_TIMEFRAME, ATR_PERIOD)
+        sl, tp_single, r = sl_tp_from_atr(entry, side, atr, conf)
+        if sl <= 0 or tp_single <= 0 or r <= 0:
+            return None
+
+        tp1 = tp2 = None
+        tp = tp_single
+
+        if conf >= MULTI_TP_MIN_CONF:
+            _tp1, _tp2, _tp3 = multi_tp_from_r(entry, side, r)
+            if _tp1 > 0 and _tp2 > 0 and _tp3 > 0:
+                tp1, tp2, tp = _tp1, _tp2, _tp3  # tp = TP3
+    else:
+        # fallback
+        if side == "BUY":
+            sl = entry * 0.97
+            r = entry - sl
+            tp = entry + 1.4 * r
+        else:
+            sl = entry * 1.03
+            r = sl - entry
+            tp = entry - 1.4 * r
+        tp1 = tp2 = None
 
     return Setup(
         symbol=base,
@@ -1071,7 +1147,15 @@ def format_setup_email_block_pretty(s: Setup) -> str:
     lines.append(f"{s.side} {s.symbol} — Confidence {s.conf}/100")
     lines.append(f"Entry: {fmt_price(s.entry)}")
     lines.append(f"SL:    {fmt_price(s.sl)}")
-    lines.append(f"TP:    {fmt_price(s.tp)}")
+
+    if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
+        lines.append(f"TP1:   {fmt_price(s.tp1)} ({TP_ALLOCS[0]}%)")
+        lines.append(f"TP2:   {fmt_price(s.tp2)} ({TP_ALLOCS[1]}%)")
+        lines.append(f"TP3:   {fmt_price(s.tp)} ({TP_ALLOCS[2]}%)")
+        lines.append("Rule: After TP1 → move SL to BE")
+    else:
+        lines.append(f"TP:    {fmt_price(s.tp)}")
+
     lines.append("")
     lines.append(
         f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | F~{fmt_money(s.fut_vol_usd)}"
@@ -1185,16 +1269,17 @@ HELP_TEXT = """\
 **Risk & Trading**
 - /equity <amount> — Set your equity (e.g., /equity 1000)
 - /limits <maxTradesPerDay> <dailyRiskCapUSD> <openRiskCapUSD> — e.g. /limits 3 50 75
-- /tradesetup <SYMBOL> — Create a TradeSetup using PulseFutures signal if available
+- /tradesetup <SYMBOL> — Create a TradeSetup using current market data (and signal if available)
 - /risk <SYMBOL> — Same as /tradesetup
-- /open — Show open positions
+- /open — Show open positions (shows ⏱️EXPIRED if time-stop passed)
 - /closepnl <SYMBOL> <pnlUSD> — Close oldest open position for SYMBOL and update equity (e.g. /closepnl BTC +23.5)
 **Alerts**
 - /notify_on /notify_off — Email alerts (if configured)
 - /diag — Diagnostics
 **Notes**
 - Bybit swap futures.
-- SL/TP uses ATR by default.
+- SL/TP uses ATR with confidence-dynamic SL multiplier.
+- Multi-TP (0.8R / 1.4R / 2.0R) only for Conf >= 75.
 - This is not financial advice.
 """
 
@@ -1228,6 +1313,8 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- Open risk cap: ${user['open_risk_cap']:.2f}\n"
         f"- Time-stop: {SETUP_TIME_STOP_HOURS}h\n"
         f"- SL/TP mode: {'ATR' if USE_ATR_SLTP else 'Fixed %'}\n"
+        f"- TP cap: {TP_MAX_PCT}%\n"
+        f"- Multi-TP: Conf >= {MULTI_TP_MIN_CONF} | TP R-mults {TP_R_MULTS}\n"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -1372,21 +1459,32 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{warning}Invalid price for {sym}.")
         return
 
+    fut_vol = usd_notional(mv)
+    conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
+
     if USE_ATR_SLTP:
         atr = await asyncio.to_thread(atr_value, mv.symbol, ATR_TIMEFRAME, ATR_PERIOD)
-        sl, tp, _ = sl_tp_from_atr(entry, side, atr)
-        if sl <= 0 or tp <= 0:
+        sl, tp_single, r = sl_tp_from_atr(entry, side, atr, conf)
+        if sl <= 0 or tp_single <= 0 or r <= 0:
             await update.message.reply_text(f"{warning}Could not compute ATR-based SL/TP for {sym}.")
             return
+        tp1 = tp2 = None
+        tp = tp_single
+        if conf >= MULTI_TP_MIN_CONF:
+            _tp1, _tp2, _tp3 = multi_tp_from_r(entry, side, r)
+            if _tp1 > 0 and _tp2 > 0 and _tp3 > 0:
+                tp1, tp2, tp = _tp1, _tp2, _tp3
     else:
+        # fallback
         if side == "BUY":
             sl = entry * 0.97
-            tp = entry * 1.06
+            r = entry - sl
+            tp = entry + 1.4 * r
         else:
             sl = entry * 1.03
-            tp = entry * 0.94
-
-    conf = compute_confidence(side, ch24, ch4, ch1, ch15, usd_notional(mv))
+            r = sl - entry
+            tp = entry - 1.4 * r
+        tp1 = tp2 = None
 
     open_positions = db_get_open_positions(uid)
     open_risk = sum(float(p["risk_usd"]) for p in open_positions)
@@ -1438,10 +1536,16 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tz = ZoneInfo(user.get("tz") or "Australia/Melbourne")
     deadline = datetime.fromtimestamp(time_stop_ts, tz=tz).strftime("%Y-%m-%d %H:%M")
 
+    if tp1 and tp2 and conf >= MULTI_TP_MIN_CONF:
+        tp_line = f"TP1 {fmt_price(tp1)} ({TP_ALLOCS[0]}%) | TP2 {fmt_price(tp2)} ({TP_ALLOCS[1]}%) | TP3 {fmt_price(tp)} ({TP_ALLOCS[2]}%)\n🧠 Rule: after TP1 → SL to BE"
+    else:
+        tp_line = f"TP {fmt_price(tp)}"
+
     msg = (
         warning
         + f"✅ *TradeSetup* — *{side} {sym}*  •  Conf *{conf}/100*\n"
-        + f"{fmt_kv('Entry', fmt_price(entry))}  |  {fmt_kv('SL', fmt_price(sl))}  |  {fmt_kv('TP', fmt_price(tp))}\n"
+        + f"{fmt_kv('Entry', fmt_price(entry))}  |  {fmt_kv('SL', fmt_price(sl))}\n"
+        + f"{tp_line}\n"
         + f"{fmt_kv('Risk', f'${risk_usd:.2f}')}  |  {fmt_kv('Qty', f'{qty:.6g}')}  |  {fmt_kv('Notional', f'${notional:.2f}')}  |  {fmt_kv('Lev', f'{lev}x')}\n"
         + f"🧭 {regime_label(ch24, ch4)}\n"
         + f"⏱️ Time-Stop: {SETUP_TIME_STOP_HOURS}h (Deadline: {deadline})\n"
@@ -1526,10 +1630,19 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sig = db_get_signal(token)
     if sig:
+        # show multi-tp if exists
+        tp1 = sig.get("tp1")
+        tp2 = sig.get("tp2")
+        if tp1 and tp2 and int(sig.get("conf") or 0) >= MULTI_TP_MIN_CONF:
+            tp_line = f"TP1 {fmt_price(float(tp1))} ({TP_ALLOCS[0]}%) | TP2 {fmt_price(float(tp2))} ({TP_ALLOCS[1]}%) | TP3 {fmt_price(float(sig['tp']))} ({TP_ALLOCS[2]}%)"
+        else:
+            tp_line = f"TP {fmt_price(float(sig['tp']))}"
+
         msg = (
             f"🔎 *{token}* in PulseFutures signals\n"
             f"*{sig['side']}* — Conf *{sig['conf']}/100*\n"
-            f"{fmt_kv('Entry', fmt_price(float(sig['entry'])))}  |  {fmt_kv('SL', fmt_price(float(sig['sl'])))}  |  {fmt_kv('TP', fmt_price(float(sig['tp'])))}\n"
+            f"{fmt_kv('Entry', fmt_price(float(sig['entry'])))}  |  {fmt_kv('SL', fmt_price(float(sig['sl'])))}\n"
+            f"{tp_line}\n"
             f"{fmt_kv('F Vol', '≈'+fmt_money(float(sig['fut_vol_usd'])))}  |  "
             f"{fmt_kv('24H', pct_with_emoji(float(sig['ch24'])))}  |  {fmt_kv('4H', pct_with_emoji(float(sig['ch4'])))}\n"
             f"📈 {tv_chart_url(token)}\n\n"
@@ -1547,15 +1660,15 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        last_ts = float(db_get_meta("last_email_ts", "0") or "0")
-        last_syms = set((db_get_meta("last_email_symbols", "") or "").split(",")) if db_get_meta("last_email_symbols", "") else set()
-
         if not EMAIL_ENABLED_DEFAULT:
             return
         if not email_config_ok():
             return
         if not window_ok():
             return
+
+        last_ts = float(db_get_meta("last_email_ts", "0") or "0")
+        last_syms = set((db_get_meta("last_email_symbols", "") or "").split(",")) if db_get_meta("last_email_symbols", "") else set()
 
         now = time.time()
         if now - last_ts < EMAIL_MIN_INTERVAL_SEC:
@@ -1667,7 +1780,7 @@ def main():
     app.add_handler(CommandHandler("equity", equity_cmd))
     app.add_handler(CommandHandler("limits", limits_cmd))
     app.add_handler(CommandHandler("tradesetup", tradesetup))
-    app.add_handler(CommandHandler("risk", risk_cmd))
+    app.add_handler(CommandHandler("risk", tradesetup))
     app.add_handler(CommandHandler("open", open_cmd))
     app.add_handler(CommandHandler("closepnl", closepnl_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
