@@ -2,7 +2,7 @@
 """
 PulseFutures — Bybit Futures (Swap) Screener + TradeSetup + FULL Trade Journal + Risk Manager (Telegram)
 
-GOAL (your latest requirements):
+GOAL:
 ✅ Telegram becomes a professional trading journal:
 - Trader can OPEN any trade (manual) and CLOSE it later
 - Risk per trade is tracked, open risk is tracked, daily risk budget is tracked
@@ -16,21 +16,17 @@ GOAL (your latest requirements):
 
 ✅ Speed:
 - All heavy CCXT/market work is moved to background threads (asyncio.to_thread)
-- Database ops are fast and local
-- /help and journal commands are instant
 
 ✅ Fixes:
-- Multi-TP sometimes equal: fixed by enforcing strict separation with epsilon
-- Equity resetting: usually caused by non-persistent filesystem or multiple instances.
-  -> Use a persistent disk and set DB_PATH to that mounted path.
-  -> Also enables WAL mode for better concurrency.
+- Multi-TP equality issues fixed by enforcing strict separation
+- Equity “reset” usually is non-persistent disk / redeploy -> use persistent disk and DB_PATH.
 
 ENV (required):
 - TELEGRAM_TOKEN
 
 Optional:
 - DB_PATH=/path/to/persistent/pulsefutures.db
-- CHECK_INTERVAL_MIN=5
+- CHECK_INTERVAL_MIN=0 (default off)
 - EXCHANGE_TIMEOUT_MS=20000
 
 NOT FINANCIAL ADVICE.
@@ -42,7 +38,6 @@ import os
 import re
 import sqlite3
 import time
-import json
 import math
 import html
 from dataclasses import dataclass
@@ -56,6 +51,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 
@@ -98,7 +94,7 @@ MULTI_TP_MIN_CONF = 75
 TP_ALLOCS = (40, 40, 20)
 TP_R_MULTS = (0.9, 1.6, 2.4)  # TP1/TP2/TP3 in R
 
-# Risk defaults (IMPORTANT: equity default must be ZERO per your request)
+# Risk defaults (IMPORTANT: equity default must be ZERO)
 DEFAULT_EQUITY = 0.0
 DEFAULT_RISK_MODE = "USD"     # USD or PCT
 DEFAULT_RISK_VALUE = 40.0     # if USD -> $40, if PCT -> %
@@ -107,11 +103,10 @@ DEFAULT_DAILY_CAP_VALUE = 5.0
 DEFAULT_OPEN_RISK_CAP_USD = 200.0
 DEFAULT_MAX_TRADES_DAY = 5
 
-# Market bias (used for signal direction sanity)
+# Market bias
 BIAS_UNIVERSE_N = 20
 BIAS_STRONG_TH = 0.6
 
-# Stable quote
 STABLES = {"USDT", "USDC", "USD", "TUSD", "FDUSD", "DAI", "PYUSD"}
 
 HDR = "━━━━━━━━━━━━━━━━━━━━"
@@ -120,7 +115,6 @@ SEP = "────────────────────"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pulsefutures")
 
-# Prevent overlapping heavy jobs
 ALERT_LOCK = asyncio.Lock()
 
 
@@ -166,7 +160,6 @@ class Setup:
 def db_connect() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     con.row_factory = sqlite3.Row
-    # WAL is important on Render/multi-thread
     try:
         con.execute("PRAGMA journal_mode=WAL;")
         con.execute("PRAGMA synchronous=NORMAL;")
@@ -219,7 +212,7 @@ def db_init():
             tp3 REAL,
 
             risk_usd REAL NOT NULL,
-            qty REAL NOT NULL,                -- can be computed if not provided
+            qty REAL NOT NULL,
             notes TEXT,
             tags TEXT,
 
@@ -400,7 +393,7 @@ def db_get_signal(symbol: str, ttl_sec: int = 24 * 3600) -> Optional[dict]:
 def db_open_trade(
     user_id: int,
     symbol: str,
-    side: str,           # LONG/SHORT
+    side: str,
     entry: float,
     sl: float,
     tp1: Optional[float],
@@ -508,6 +501,23 @@ def db_close_trade(
     return t
 
 
+def db_journal_last(user_id: int, limit: int = 20) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT * FROM trades
+        WHERE user_id=?
+        ORDER BY opened_ts DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
 def db_journal_range(user_id: int, start_ts: float, end_ts: float, limit: int = 200) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
@@ -520,23 +530,6 @@ def db_journal_range(user_id: int, start_ts: float, end_ts: float, limit: int = 
         LIMIT ?
         """,
         (user_id, start_ts, end_ts, limit),
-    )
-    rows = cur.fetchall()
-    con.close()
-    return [dict(r) for r in rows]
-
-
-def db_journal_last(user_id: int, limit: int = 20) -> List[dict]:
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute(
-        """
-        SELECT * FROM trades
-        WHERE user_id=?
-        ORDER BY opened_ts DESC
-        LIMIT ?
-        """,
-        (user_id, limit),
     )
     rows = cur.fetchall()
     con.close()
@@ -607,7 +600,6 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
             continue
         if mv.quote not in STABLES:
             continue
-        # Pick best contract per base by highest USD notional
         if mv.base not in best or usd_notional(mv) > usd_notional(best[mv.base]):
             best[mv.base] = mv
     return best
@@ -661,7 +653,7 @@ def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float
 
 
 # =========================
-# FORMATTING
+# FORMAT / UTILS
 # =========================
 def fmt_price(x: float) -> str:
     ax = abs(x)
@@ -701,13 +693,37 @@ def regime_label(ch24: float, ch4: float) -> str:
     return "NEUTRAL 🟡"
 
 
-def h(text: str) -> str:
-    # HTML escape helper for Telegram ParseMode.HTML
-    return html.escape(text, quote=False)
+def parse_kv_args(text: str) -> dict:
+    out = {}
+    for part in text.split():
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        out[k.strip().lower()] = v.strip()
+    return out
+
+
+def parse_side(s: str) -> Optional[str]:
+    s = s.strip().lower()
+    if s in {"long", "buy"}:
+        return "LONG"
+    if s in {"short", "sell"}:
+        return "SHORT"
+    return None
+
+
+def parse_float(x: str) -> float:
+    x = x.strip().replace(",", "")
+    return float(x)
+
+
+def parse_symbol(x: str) -> str:
+    x = re.sub(r"[^A-Za-z0-9]", "", x).upper().lstrip("$")
+    return x
 
 
 # =========================
-# MARKET BIAS
+# MARKET BIAS + SETUP MATH
 # =========================
 def market_bias(best_fut: Dict[str, MarketVol]) -> str:
     top = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:BIAS_UNIVERSE_N]
@@ -719,12 +735,12 @@ def market_bias(best_fut: Dict[str, MarketVol]) -> str:
     long_n = 0
     short_n = 0
 
-    for base, mv in top:
+    for _base, mv in top:
         vol = usd_notional(mv)
         if vol <= 0:
             continue
 
-        ch1, ch4, ch15, _atr = metrics_from_candles_1h_15m(mv.symbol)
+        _ch1, ch4, _ch15, _atr = metrics_from_candles_1h_15m(mv.symbol)
         ch24 = float(mv.percentage or 0.0)
 
         if ch4 > 0:
@@ -755,19 +771,6 @@ def market_bias(best_fut: Dict[str, MarketVol]) -> str:
     return f"Market Bias: {label} | Top{BIAS_UNIVERSE_N}: Long {long_n} / Short {short_n}"
 
 
-def bias_tag(bias_line: str) -> str:
-    if "LONG 🟢" in bias_line:
-        return "LONG"
-    if "SHORT 🔴" in bias_line:
-        return "SHORT"
-    if "MIXED 🟡" in bias_line:
-        return "MIXED"
-    return "UNKNOWN"
-
-
-# =========================
-# SL/TP + MULTI-TP (STRICT)
-# =========================
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -807,20 +810,14 @@ def sl_tp_from_atr(entry: float, side: str, atr: float, conf: int) -> Tuple[floa
 
 
 def enforce_strict_levels(entry: float, side: str, tps: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    """
-    Fix equality issues (TP1==TP2, TP2==TP3, etc.) by enforcing strict separation.
-    Uses a small epsilon relative to price.
-    """
     tp1, tp2, tp3 = tps
-    eps = max(entry * 0.0002, 1e-9)  # 0.02% or tiny
+    eps = max(entry * 0.0002, 1e-9)  # 0.02%
 
     if side == "BUY":
-        # ensure tp1 < tp2 < tp3
         tp1 = max(tp1, entry + eps)
         tp2 = max(tp2, tp1 + eps)
         tp3 = max(tp3, tp2 + eps)
     else:
-        # ensure tp1 > tp2 > tp3 (for SELL, profit is lower)
         tp1 = min(tp1, entry - eps)
         tp2 = min(tp2, tp1 - eps)
         tp3 = min(tp3, tp2 - eps)
@@ -837,10 +834,7 @@ def multi_tp_from_r(entry: float, side: str, r: float) -> Tuple[float, float, fl
         r1, r2, r3 = (0.9, 1.6, 2.4)
 
     maxd = (TP_MAX_PCT / 100.0) * entry
-    d3_raw = r3 * r
-    d3 = min(d3_raw, maxd)
-
-    # scale d1/d2 proportionally
+    d3 = min(r3 * r, maxd)
     d1 = d3 * (r1 / r3)
     d2 = d3 * (r2 / r3)
 
@@ -852,9 +846,6 @@ def multi_tp_from_r(entry: float, side: str, r: float) -> Tuple[float, float, fl
     return enforce_strict_levels(entry, side, (tp1, tp2, tp3))
 
 
-# =========================
-# SETUP ENGINE
-# =========================
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
     score = 50.0
 
@@ -895,23 +886,15 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
     ch24 = float(mv.percentage or 0.0)
     ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol)
 
-    # Trigger/confirm
     if abs(ch1) < TRIGGER_1H_ABS_MIN:
         return None
     if abs(ch15) < CONFIRM_15M_ABS_MIN:
         return None
 
-    # Direction: ensure we do NOT suggest SHORT in rising regime and vice-versa
-    # BUY requires ch1>0 and (ch4>=0), SELL requires ch1<0 and (ch4<=0)
     side = "BUY" if ch1 > 0 else "SELL"
     if side == "BUY" and ch4 < 0:
         return None
     if side == "SELL" and ch4 > 0:
-        return None
-
-    if side == "BUY" and ch4 < ALIGN_4H_MIN:
-        return None
-    if side == "SELL" and ch4 > -ALIGN_4H_MIN:
         return None
 
     entry = float(mv.last or 0.0)
@@ -926,11 +909,9 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
         return None
 
     tp1 = tp2 = None
-    tp = tp_single
+    tp3 = tp_single
     if conf >= MULTI_TP_MIN_CONF:
-        _tp1, _tp2, _tp3 = multi_tp_from_r(entry, side, r)
-        if _tp1 > 0 and _tp2 > 0 and _tp3 > 0:
-            tp1, tp2, tp = _tp1, _tp2, _tp3
+        tp1, tp2, tp3 = multi_tp_from_r(entry, side, r)
 
     return Setup(
         symbol=base.upper(),
@@ -939,7 +920,7 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
         conf=conf,
         entry=entry,
         sl=sl,
-        tp=tp,
+        tp=tp3,
         tp1=tp1,
         tp2=tp2,
         fut_vol_usd=fut_vol,
@@ -954,13 +935,13 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
 
 def pick_setups(best_fut: Dict[str, MarketVol]) -> List[Setup]:
     universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:35]
-    setups: List[Setup] = []
+    out: List[Setup] = []
     for base, mv in universe:
         s = make_setup(base, mv)
         if s:
-            setups.append(s)
-    setups.sort(key=lambda s: (s.conf, s.fut_vol_usd), reverse=True)
-    return setups[:SETUPS_N]
+            out.append(s)
+    out.sort(key=lambda s: (s.conf, s.fut_vol_usd), reverse=True)
+    return out[:SETUPS_N]
 
 
 def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tuple], List[Tuple]]:
@@ -970,12 +951,10 @@ def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tupl
         vol = usd_notional(mv)
         if vol < MOVER_VOL_USD_MIN:
             continue
-
         ch24 = float(mv.percentage or 0.0)
         if ch24 < MOVER_UP_24H_MIN and ch24 > MOVER_DN_24H_MAX:
             continue
-
-        ch1, ch4, ch15, _atr = metrics_from_candles_1h_15m(mv.symbol)
+        _ch1, ch4, _ch15, _atr = metrics_from_candles_1h_15m(mv.symbol)
 
         if ch24 >= MOVER_UP_24H_MIN and ch4 >= 0:
             up.append((base.upper(), vol, ch24, ch4, float(mv.last or 0.0)))
@@ -988,7 +967,7 @@ def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tupl
 
 
 # =========================
-# RISK LOGIC
+# RISK
 # =========================
 def compute_trade_risk_usd(user: dict) -> float:
     equity = float(user.get("equity") or 0.0)
@@ -1020,44 +999,6 @@ def open_risk_usd(open_trades: List[dict]) -> float:
 
 
 # =========================
-# PARSERS
-# =========================
-def parse_kv_args(text: str) -> dict:
-    """
-    Parses tokens like: entry=98100 sl=97200 risk=40 tp1=...
-    """
-    out = {}
-    for part in text.split():
-        if "=" not in part:
-            continue
-        k, v = part.split("=", 1)
-        k = k.strip().lower()
-        v = v.strip()
-        out[k] = v
-    return out
-
-
-def parse_side(s: str) -> Optional[str]:
-    s = s.strip().lower()
-    if s in {"long", "buy"}:
-        return "LONG"
-    if s in {"short", "sell"}:
-        return "SHORT"
-    return None
-
-
-def parse_float(x: str) -> float:
-    x = x.strip()
-    x = x.replace(",", "")
-    return float(x)
-
-
-def parse_symbol(x: str) -> str:
-    x = re.sub(r"[^A-Za-z0-9]", "", x).upper().lstrip("$")
-    return x
-
-
-# =========================
 # HELP TEXT
 # =========================
 HELP_TEXT = """\
@@ -1069,26 +1010,26 @@ Core
 - /status
 
 Risk settings
-- /riskmode usd 40        (risk per trade)
+- /riskmode usd 40
 - /riskmode pct 2.0
-- /dailycap usd 200       (daily risk budget)
+- /dailycap usd 200
 - /dailycap pct 5
-- /opencap 200            (max open risk at once)
-- /maxtrades 5            (max trades/day)
+- /opencap 200
+- /maxtrades 5
 
 Journal
 - /open BTC long entry=98100 sl=97200 risk=40 notes=breakout
-- /open BTC long entry=98100 sl=97200            (risk from your riskmode)
+- /open BTC long entry=98100 sl=97200   (risk from your /riskmode)
 - /close 17 exit=98950
 - /close 17 pnl=+65
-- /close 17 r=+1.2        (pnl = r * risk_usd)
+- /close 17 r=+1.2
 - /journal today
 - /journal week
 - /journal last 20
 
-Market tools (optional)
-- /screen                (leaders/losers + top setups)
-- /tradesetup BTC        (suggestion only; does NOT open a trade)
+Market
+- /screen
+- /tradesetup BTC   (suggestion only)
 
 Notes
 - Equity starts at 0. Set it once using /equity.
@@ -1098,7 +1039,7 @@ Notes
 
 
 # =========================
-# TELEGRAM HANDLERS
+# COMMANDS
 # =========================
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
@@ -1189,9 +1130,7 @@ async def opencap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
     if not context.args:
-        await update.message.reply_text(
-            f"Open risk cap: ${float(user['open_risk_cap']):.2f}\nSet: /opencap 200"
-        )
+        await update.message.reply_text(f"Open risk cap: ${float(user['open_risk_cap']):.2f}\nSet: /opencap 200")
         return
     try:
         v = float(context.args[0])
@@ -1207,9 +1146,7 @@ async def maxtrades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
     if not context.args:
-        await update.message.reply_text(
-            f"Max trades/day: {int(user['max_trades_day'])}\nSet: /maxtrades 5"
-        )
+        await update.message.reply_text(f"Max trades/day: {int(user['max_trades_day'])}\nSet: /maxtrades 5")
         return
     try:
         n = int(context.args[0])
@@ -1226,7 +1163,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = reset_daily_if_needed(get_user(uid))
 
     open_trades = db_get_open_trades(uid)
-    open_risk = open_risk_usd(open_trades)
+    o_risk = open_risk_usd(open_trades)
 
     equity = float(user["equity"])
     daily_cap = compute_daily_cap_usd(user)
@@ -1239,20 +1176,20 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     warn = []
     if trades_today >= max_trades:
         warn.append("⚠️ Max trades/day reached.")
-    if open_risk >= float(user["open_risk_cap"]):
+    if o_risk >= float(user["open_risk_cap"]):
         warn.append("⚠️ Open risk cap reached.")
-    if daily_used >= daily_cap and daily_cap > 0:
+    if daily_cap > 0 and daily_used >= daily_cap:
         warn.append("⚠️ Daily risk cap reached.")
 
     lines = []
-    lines.append(f"{HDR}")
+    lines.append(HDR)
     lines.append("📒 PulseFutures — Status")
-    lines.append(f"{HDR}")
+    lines.append(HDR)
     lines.append(f"Equity: ${equity:.2f}")
     lines.append(f"Risk/Trade: {user['risk_mode']} {float(user['risk_value']):.2f} (≈ ${compute_trade_risk_usd(user):.2f})")
     lines.append(f"Daily Cap: {user['daily_cap_mode']} {float(user['daily_cap_value']):.2f} (≈ ${daily_cap:.2f})")
     lines.append(f"Daily Used: ${daily_used:.2f} | Remaining: ${daily_rem:.2f}")
-    lines.append(f"Open Risk: ${open_risk:.2f} / ${float(user['open_risk_cap']):.2f}")
+    lines.append(f"Open Risk: ${o_risk:.2f} / ${float(user['open_risk_cap']):.2f}")
     lines.append(f"Trades Today: {trades_today} / {max_trades}")
     if warn:
         lines.append("")
@@ -1262,23 +1199,17 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(SEP)
     lines.append("OPEN Trades")
     lines.append(SEP)
-
     if not open_trades:
         lines.append("None")
     else:
         now_ts = time.time()
         for t in open_trades:
             age_min = int((now_ts - float(t["opened_ts"])) / 60)
-            tp3 = t.get("tp3")
             tp_line = ""
-            if t.get("tp1") is not None or t.get("tp2") is not None or tp3 is not None:
-                tp_line = f" | TP: {fmt_price(float(t.get('tp1') or 0))}/{fmt_price(float(t.get('tp2') or 0))}/{fmt_price(float(tp3 or 0))}"
-            lines.append(
-                f"#{t['id']} {t['symbol']} {t['side']} | Entry {fmt_price(float(t['entry']))} | SL {fmt_price(float(t['sl']))}{tp_line}"
-            )
-            lines.append(
-                f"Risk ${float(t['risk_usd']):.2f} | Qty {float(t['qty']):.6g} | Age {age_min}m"
-            )
+            if t.get("tp1") or t.get("tp2") or t.get("tp3"):
+                tp_line = f" | TP: {fmt_price(float(t.get('tp1') or 0))}/{fmt_price(float(t.get('tp2') or 0))}/{fmt_price(float(t.get('tp3') or 0))}"
+            lines.append(f"#{t['id']} {t['symbol']} {t['side']} | Entry {fmt_price(float(t['entry']))} | SL {fmt_price(float(t['sl']))}{tp_line}")
+            lines.append(f"Risk ${float(t['risk_usd']):.2f} | Qty {float(t['qty']):.6g} | Age {age_min}m")
             if t.get("notes"):
                 lines.append(f"Notes: {t['notes']}")
             if t.get("tags"):
@@ -1289,11 +1220,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /open BTC long entry=98100 sl=97200 risk=40 notes=...
-    /open BTC long entry=98100 sl=97200             -> uses user riskmode
-    Optional: qty=..., tp1=..., tp2=..., tp3=..., tags=...
-    """
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
 
@@ -1319,19 +1245,17 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Missing/invalid entry or sl. Example: entry=98100 sl=97200")
         return
 
-    if entry <= 0 or sl <= 0 or entry == sl:
-        await update.message.reply_text("Invalid entry/SL.")
-        return
-
-    # Equity must be set
     if float(user["equity"]) <= 0:
         await update.message.reply_text("❌ Equity is 0. Set it first: /equity 5000")
         return
 
-    open_trades = db_get_open_trades(uid)
-    open_risk = open_risk_usd(open_trades)
+    if entry <= 0 or sl <= 0 or entry == sl:
+        await update.message.reply_text("Invalid entry/SL.")
+        return
 
-    # Enforce max trades/day
+    open_trades = db_get_open_trades(uid)
+    o_risk = open_risk_usd(open_trades)
+
     trades_today = int(user["day_trade_count"])
     max_trades = int(user["max_trades_day"])
     if trades_today >= max_trades:
@@ -1341,18 +1265,14 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     daily_cap = compute_daily_cap_usd(user)
     daily_used = float(user["daily_risk_used"])
     daily_remaining = max(0.0, daily_cap - daily_used) if daily_cap > 0 else float("inf")
+    open_remaining = max(0.0, float(user["open_risk_cap"]) - o_risk)
 
-    open_cap = float(user["open_risk_cap"])
-    open_remaining = max(0.0, open_cap - open_risk)
-
-    # Risk input: risk=... OR use user setting
     risk_usd = None
     if "risk" in kv:
         try:
             risk_usd = float(parse_float(kv["risk"]))
         except Exception:
             risk_usd = None
-
     if risk_usd is None:
         risk_usd = compute_trade_risk_usd(user)
 
@@ -1360,13 +1280,11 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Risk per trade is 0. Set it: /riskmode usd 40 OR /riskmode pct 2")
         return
 
-    # Apply caps
     risk_usd = min(risk_usd, daily_remaining, open_remaining)
     if risk_usd <= 0:
         await update.message.reply_text("❌ No risk budget remaining (daily cap or open cap).")
         return
 
-    # Qty: optional or compute
     qty = None
     if "qty" in kv:
         try:
@@ -1376,11 +1294,6 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if qty is None or qty <= 0:
         qty = calc_qty_from_risk(entry, sl, risk_usd)
 
-    if qty <= 0:
-        await update.message.reply_text("❌ Could not compute qty (check entry/sl).")
-        return
-
-    # Optional TPs
     def opt_f(k: str) -> Optional[float]:
         if k not in kv:
             return None
@@ -1393,47 +1306,26 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tp1 = opt_f("tp1")
     tp2 = opt_f("tp2")
     tp3 = opt_f("tp3")
-
     notes = kv.get("notes", "")
     tags = kv.get("tags", "")
 
-    trade_id = db_open_trade(
-        uid, sym, side, entry, sl, tp1, tp2, tp3, risk_usd, qty, notes=notes, tags=tags
-    )
+    trade_id = db_open_trade(uid, sym, side, entry, sl, tp1, tp2, tp3, risk_usd, qty, notes=notes, tags=tags)
+    update_user(uid, day_trade_count=trades_today + 1, daily_risk_used=float(user["daily_risk_used"]) + float(risk_usd))
 
-    # Update daily counters
-    update_user(
-        uid,
-        day_trade_count=trades_today + 1,
-        daily_risk_used=float(user["daily_risk_used"]) + float(risk_usd),
-    )
-
-    # Reply
-    tp_line = ""
-    if tp1 or tp2 or tp3:
-        tp_line = f"\nTPs: {fmt_price(tp1 or 0)} / {fmt_price(tp2 or 0)} / {fmt_price(tp3 or 0)}"
     msg = (
         f"✅ Trade OPENED (Journal)\n"
         f"ID: #{trade_id}\n"
         f"{sym} {side}\n"
         f"Entry: {fmt_price(entry)}\n"
-        f"SL:    {fmt_price(sl)}"
-        f"{tp_line}\n"
+        f"SL:    {fmt_price(sl)}\n"
         f"Risk:  ${risk_usd:.2f}\n"
         f"Qty:   {qty:.6g}\n"
-        f"Daily Used: ${(float(user['daily_risk_used']) + float(risk_usd)):.2f} / ${compute_daily_cap_usd(get_user(uid)):.2f}\n"
-        f"Open Risk: ${open_risk_usd(db_get_open_trades(uid)):.2f} / ${float(get_user(uid)['open_risk_cap']):.2f}\n"
         f"Trades Today: {get_user(uid)['day_trade_count']} / {get_user(uid)['max_trades_day']}"
     )
     await update.message.reply_text(msg)
 
 
 async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /close 17 exit=98950
-    /close 17 pnl=+65
-    /close 17 r=+1.2
-    """
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
 
@@ -1453,11 +1345,9 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     kv = parse_kv_args(" ".join(context.args[1:]))
-
     exit_price = None
     pnl = None
 
-    # Priority: pnl=..., then exit=..., then r=...
     if "pnl" in kv:
         try:
             pnl = float(parse_float(kv["pnl"]))
@@ -1472,8 +1362,7 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if exit_price and exit_price > 0:
             entry = float(t["entry"])
             qty = float(t["qty"])
-            side = (t["side"] or "").upper()
-            if side == "LONG":
+            if (t["side"] or "").upper() == "LONG":
                 pnl = (exit_price - entry) * qty
             else:
                 pnl = (entry - exit_price) * qty
@@ -1494,27 +1383,16 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Trade not found or already closed.")
         return
 
-    # Update equity
     new_eq = float(user["equity"]) + float(pnl)
     update_user(uid, equity=new_eq)
 
-    msg = (
-        f"✅ Trade CLOSED\n"
-        f"ID: #{trade_id}  ({t['symbol']} {t['side']})\n"
-        f"PnL: {pnl:+.2f}\n"
-        f"Equity: ${new_eq:.2f}"
+    await update.message.reply_text(
+        f"✅ Trade CLOSED\nID: #{trade_id} ({t['symbol']} {t['side']})\nPnL: {pnl:+.2f}\nEquity: ${new_eq:.2f}"
     )
-    await update.message.reply_text(msg)
 
 
 async def journal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /journal today
-    /journal week
-    /journal last 20
-    """
     uid = update.effective_user.id
-    _user = get_user(uid)
 
     arg = (context.args[0].lower() if context.args else "last")
     now = datetime.utcnow()
@@ -1525,13 +1403,11 @@ async def journal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = db_journal_range(uid, start.timestamp(), end.timestamp(), limit=200)
         title = "Journal — Today"
     elif arg == "week":
-        # last 7 days
         start = now - timedelta(days=7)
         end = now
         rows = db_journal_range(uid, start.timestamp(), end.timestamp(), limit=200)
         title = "Journal — Last 7 Days"
     else:
-        # last N
         n = 20
         if len(context.args) >= 2:
             try:
@@ -1546,21 +1422,16 @@ async def journal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{title}\n\nNone")
         return
 
-    # Summaries
     closed = [r for r in rows if r.get("status") == "CLOSED" and r.get("pnl_usd") is not None]
     pnl_sum = sum(float(r["pnl_usd"]) for r in closed) if closed else 0.0
     wins = sum(1 for r in closed if float(r["pnl_usd"]) > 0)
     losses = sum(1 for r in closed if float(r["pnl_usd"]) < 0)
 
-    lines = []
-    lines.append(HDR)
-    lines.append(f"📒 {title}")
-    lines.append(HDR)
+    lines = [HDR, f"📒 {title}", HDR]
     if closed:
         lines.append(f"Closed: {len(closed)} | Wins: {wins} | Losses: {losses} | PnL: {pnl_sum:+.2f}")
     lines.append(SEP)
 
-    # List
     for r in rows[:50]:
         st = "🟩" if r["status"] == "OPEN" else ("🟢" if (r.get("pnl_usd") or 0) > 0 else ("🔴" if (r.get("pnl_usd") or 0) < 0 else "⚪"))
         opened = datetime.utcfromtimestamp(float(r["opened_ts"])).strftime("%m-%d %H:%M")
@@ -1569,14 +1440,10 @@ async def journal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             line += f" | PnL {float(r['pnl_usd']):+.2f}"
         lines.append(line)
 
-    if len(rows) > 50:
-        lines.append(f"... (+{len(rows)-50} more)")
-
     await update.message.reply_text("\n".join(lines).strip())
 
 
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # heavy work in thread for speed
     try:
         best_fut = await asyncio.to_thread(fetch_futures_tickers)
     except Exception as e:
@@ -1594,67 +1461,32 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for s in setups:
         db_upsert_signal(s)
 
-    # Build message (plain text to avoid Telegram entity issues)
-    lines = []
-    lines.append(HDR)
-    lines.append("📊 PulseFutures — Market Scan")
-    lines.append(HDR)
-    lines.append(bias_line)
-    lines.append("")
-
-    lines.append(SEP)
-    lines.append("🔥 Top Setups (Suggestion)")
-    lines.append(SEP)
+    lines = [HDR, "📊 PulseFutures — Market Scan", HDR, bias_line, ""]
+    lines += [SEP, "🔥 Top Setups (Suggestion)", SEP]
     if not setups:
         lines.append("None")
     else:
         for i, s in enumerate(setups, 1):
-            tps = ""
             if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
                 tps = f"TP1 {fmt_price(s.tp1)} | TP2 {fmt_price(s.tp2)} | TP3 {fmt_price(s.tp)}"
             else:
                 tps = f"TP {fmt_price(s.tp)}"
-            lines.append(
-                f"{i}) {s.side} {s.symbol} | Conf {s.conf}/100 | Entry {fmt_price(s.entry)} | SL {fmt_price(s.sl)} | {tps}"
-            )
+            lines.append(f"{i}) {s.side} {s.symbol} | Conf {s.conf}/100 | Entry {fmt_price(s.entry)} | SL {fmt_price(s.sl)} | {tps}")
             lines.append(f"   24H {pct_emoji(s.ch24)} | 4H {pct_emoji(s.ch4)} | 1H {pct_emoji(s.ch1)} | F~{fmt_money(s.fut_vol_usd)}")
-            lines.append(f"   Use: /tradesetup {s.symbol}   then /open ... to journal it")
+            lines.append(f"   Tap button or use: /tradesetup {s.symbol}")
             lines.append("")
 
-    lines.append(SEP)
-    lines.append("📈 Directional Leaders (Top 10)")
-    lines.append(SEP)
-    if up:
-        for b, v, c24, c4, px in up[:MOVERS_N]:
-            lines.append(f"{b:<6} 24H {pct_emoji(c24)} | 4H {pct_emoji(c4)} | F~{fmt_money(v)} | Last {fmt_price(px)}")
-    else:
-        lines.append("None")
+    lines += ["", SEP, "📈 Directional Leaders (Top 10)", SEP]
+    lines += [f"{b:<6} 24H {pct_emoji(c24)} | 4H {pct_emoji(c4)} | F~{fmt_money(v)} | Last {fmt_price(px)}" for b, v, c24, c4, px in up[:MOVERS_N]] or ["None"]
 
-    lines.append("")
-    lines.append(SEP)
-    lines.append("📉 Directional Losers (Top 10)")
-    lines.append(SEP)
-    if dn:
-        for b, v, c24, c4, px in dn[:MOVERS_N]:
-            lines.append(f"{b:<6} 24H {pct_emoji(c24)} | 4H {pct_emoji(c4)} | F~{fmt_money(v)} | Last {fmt_price(px)}")
-    else:
-        lines.append("None")
+    lines += ["", SEP, "📉 Directional Losers (Top 10)", SEP]
+    lines += [f"{b:<6} 24H {pct_emoji(c24)} | 4H {pct_emoji(c4)} | F~{fmt_money(v)} | Last {fmt_price(px)}" for b, v, c24, c4, px in dn[:MOVERS_N]] or ["None"]
 
-    msg = "\n".join(lines).strip()
-
-    # Keyboard: quick TradeSetup buttons
-    kb_rows = []
-    for s in setups[:SETUPS_N]:
-        kb_rows.append([InlineKeyboardButton(text=f"⚙️ TradeSetup {s.symbol}", callback_data=f"ts:{s.symbol}")])
-
-    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None)
+    kb_rows = [[InlineKeyboardButton(text=f"⚙️ TradeSetup {s.symbol}", callback_data=f"ts:{s.symbol}")] for s in setups[:SETUPS_N]]
+    await update.message.reply_text("\n".join(lines).strip(), reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None)
 
 
 async def tradesetup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Suggest sizing for a symbol based on user's risk settings.
-    DOES NOT open a trade.
-    """
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
 
@@ -1671,7 +1503,6 @@ async def tradesetup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Equity is 0. Set it first: /equity 5000")
         return
 
-    # Light path: if exists in signals, use it; else fetch market and compute
     sig = db_get_signal(sym)
     if sig:
         entry = float(sig["entry"])
@@ -1681,9 +1512,8 @@ async def tradesetup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tp2 = sig.get("tp2")
         tp3 = sig.get("tp")
         conf = int(sig.get("conf") or 0)
-        note_sig = "✅ From latest PulseFutures signals"
+        note_sig = "✅ From latest signal cache"
     else:
-        # compute quickly for this symbol
         best_fut = await asyncio.to_thread(fetch_futures_tickers)
         mv = best_fut.get(sym)
         if not mv:
@@ -1704,18 +1534,16 @@ async def tradesetup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tp1 = tp2 = None
         tp3 = tp_single
         if conf >= MULTI_TP_MIN_CONF:
-            _tp1, _tp2, _tp3 = multi_tp_from_r(entry, buy_side, r)
-            tp1, tp2, tp3 = _tp1, _tp2, _tp3
+            tp1, tp2, tp3 = multi_tp_from_r(entry, buy_side, r)
         side = "LONG" if buy_side == "BUY" else "SHORT"
-        note_sig = f"⚠️ Computed live (not in signal cache). {bias_line}"
+        note_sig = f"⚠️ Live compute (not cached). {bias_line}"
 
-    # Risk budgets
     open_trades = db_get_open_trades(uid)
-    open_risk = open_risk_usd(open_trades)
+    o_risk = open_risk_usd(open_trades)
     daily_cap = compute_daily_cap_usd(user)
     daily_used = float(user["daily_risk_used"])
     daily_rem = max(0.0, daily_cap - daily_used) if daily_cap > 0 else float("inf")
-    open_rem = max(0.0, float(user["open_risk_cap"]) - open_risk)
+    open_rem = max(0.0, float(user["open_risk_cap"]) - o_risk)
 
     risk_target = compute_trade_risk_usd(user)
     risk_usd = min(risk_target, daily_rem, open_rem)
@@ -1729,8 +1557,6 @@ async def tradesetup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Could not compute qty (invalid entry/SL).")
         return
 
-    # Build message
-    tps = ""
     if tp1 and tp2 and conf >= MULTI_TP_MIN_CONF:
         tps = f"TP1 {fmt_price(float(tp1))} ({TP_ALLOCS[0]}%) | TP2 {fmt_price(float(tp2))} ({TP_ALLOCS[1]}%) | TP3 {fmt_price(float(tp3))} ({TP_ALLOCS[2]}%)\nRule: after TP1 → move SL to BE"
     else:
@@ -1745,9 +1571,9 @@ async def tradesetup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Entry: {fmt_price(entry)}\n"
         f"SL:    {fmt_price(sl)}\n"
         f"{tps}\n\n"
-        f"Risk used: ${risk_usd:.2f} (limited by caps)\n"
+        f"Risk used: ${risk_usd:.2f}\n"
         f"Qty:      {qty:.6g}\n\n"
-        f"To record this trade in your journal:\n"
+        f"To journal this trade:\n"
         f"/open {sym} {'long' if side=='LONG' else 'short'} entry={fmt_price(entry)} sl={fmt_price(sl)} risk={risk_usd:.2f}\n"
     )
     await update.message.reply_text(msg)
@@ -1761,27 +1587,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
     if data.startswith("ts:"):
         sym = data.split(":", 1)[1].strip()
-        # simulate /tradesetup
-        fake_update = Update(update.update_id, message=query.message)
-        # hack: put args into context for this call
         context.args = [sym]
+        # Use the message object as target to reply
+        fake_update = Update(update.update_id, message=query.message)
         await tradesetup_cmd(fake_update, context)
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Light convenience:
-    If user just sends "BTC" we show if in current signals, and suggest tradesetup.
-    """
-    text = (update.message.text or "").strip()
-    token = parse_symbol(text)
+    token = parse_symbol((update.message.text or "").strip())
     if len(token) < 2:
         return
     sig = db_get_signal(token)
     if not sig:
         await update.message.reply_text(f"{token}: not in current signals.\nUse: /tradesetup {token}")
         return
-
     side = "LONG" if sig["side"] == "BUY" else "SHORT"
     conf = int(sig["conf"])
     entry = float(sig["entry"])
@@ -1789,32 +1608,24 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tp = float(sig["tp"])
     tp1 = sig.get("tp1")
     tp2 = sig.get("tp2")
-
     if tp1 and tp2 and conf >= MULTI_TP_MIN_CONF:
         tps = f"TP1 {fmt_price(float(tp1))} | TP2 {fmt_price(float(tp2))} | TP3 {fmt_price(tp)}"
     else:
         tps = f"TP {fmt_price(tp)}"
-
-    msg = (
-        f"{token} in signals:\n"
-        f"{side} | Conf {conf}/100\n"
-        f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | {tps}\n"
-        f"Use: /tradesetup {token}"
+    await update.message.reply_text(
+        f"{token} in signals:\n{side} | Conf {conf}/100\nEntry {fmt_price(entry)} | SL {fmt_price(sl)} | {tps}\nUse: /tradesetup {token}"
     )
-    await update.message.reply_text(msg)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled exception", exc_info=context.error)
 
 
-# Optional background job (kept minimal)
 async def background_job(context: ContextTypes.DEFAULT_TYPE):
     if ALERT_LOCK.locked():
         return
     async with ALERT_LOCK:
         try:
-            # warm cache for signals (optional)
             best_fut = await asyncio.to_thread(fetch_futures_tickers)
             if not best_fut:
                 return
@@ -1826,9 +1637,6 @@ async def background_job(context: ContextTypes.DEFAULT_TYPE):
             logger.exception("background_job failed")
 
 
-# =========================
-# MAIN
-# =========================
 def main():
     if not TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN missing")
@@ -1844,18 +1652,17 @@ def main():
     app.add_handler(CommandHandler("dailycap", dailycap_cmd))
     app.add_handler(CommandHandler("opencap", opencap_cmd))
     app.add_handler(CommandHandler("maxtrades", maxtrades_cmd))
-
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("open", open_cmd))
     app.add_handler(CommandHandler("close", close_cmd))
     app.add_handler(CommandHandler("journal", journal_cmd))
-
     app.add_handler(CommandHandler("screen", screen_cmd))
     app.add_handler(CommandHandler("tradesetup", tradesetup_cmd))
 
+    # ✅ Correct callback handler
+    app.add_handler(CallbackQueryHandler(callback_router))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-    app.add_handler(MessageHandler(filters.StatusUpdate.ALL, lambda u, c: None))
-    app.add_handler(MessageHandler(filters.UpdateType.CALLBACK_QUERY, callback_router))
 
     if CHECK_INTERVAL_MIN > 0 and getattr(app, "job_queue", None):
         app.job_queue.run_repeating(background_job, interval=CHECK_INTERVAL_MIN * 60, first=10, name="background_job")
