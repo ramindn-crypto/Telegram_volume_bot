@@ -2,19 +2,36 @@
 """
 PulseFutures — Bybit Futures (Swap) Screener + TradeSetup + Risk Ledger
 
-Key changes in this build (per Ramin requirements):
-✅ SL/TP widened (noise-stop reduced): ATR_MIN_PCT increased + ATR multipliers higher + RR improved
-✅ Chart IMAGES removed from Telegram & Email (speed-first). TradingView link only.
-✅ Sessions redesigned: no "sleep schedule" sessions.
-   -> Uses market sessions: ASIA / LONDON / NEWYORK (UTC windows)
-   -> Users only enable/disable sessions (default: LONDON + NEWYORK)
-✅ Email cap per session is FIXED to 3 (user cannot set it)
-✅ No repeated symbol within a session
-✅ Direction gate:
-   - If 24H>0 and 4H>0 => only BUY setups
-   - If 24H<0 and 4H<0 => only SELL setups
-   - Else => Mixed => NO setups (high probability only)
-✅ Speed: market scan runs with ONE exchange instance per scan (no per-symbol load_markets)
+✅ Focus of this build (based on your latest feedback):
+1) TP1/TP2/TP3 NEVER become equal (even after rounding):
+   - Quantize to tick-size
+   - Enforce minimum gaps between TP levels
+
+2) Speed:
+   - Heavy network/ccxt/ohlcv work runs in background threads (asyncio.to_thread)
+   - alert_job never overlaps (asyncio.Lock)
+   - Chart images are DISABLED by default (to avoid slowing /screen and Telegram)
+   - TradingView link is provided instead
+
+3) Risk tool behavior:
+   - You can override risk per trade when opening a position:
+       /tradesetup BTC 40
+     (means: risk $40 for THIS trade only, still respecting daily/open caps)
+   - /status shows:
+       - daily cap, daily used, daily remaining
+       - open risk cap, open risk now, open remaining
+       - trades today / max trades
+       - list of open positions
+
+4) Trade discipline:
+   - No counter-trend side: BUY only when momentum aligns, SELL only when bearish aligns
+   - Best setups only (high confidence ranking)
+
+5) Email:
+   - Session logic stays (user defines trading windows)
+   - Fixed: max 3 emails per session
+   - Fixed: minimum 60 minutes between emails
+   - No repeated symbols within the same session
 
 ENV:
 - TELEGRAM_TOKEN (required)
@@ -26,6 +43,8 @@ Email ENV (optional):
 Other optional:
 - CHECK_INTERVAL_MIN=5
 - DB_PATH=pulsefutures.db
+
+Not financial advice.
 """
 
 import asyncio
@@ -37,6 +56,8 @@ import smtplib
 import sqlite3
 import time
 import json
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Dict, List, Optional, Tuple
@@ -47,7 +68,6 @@ import ccxt
 from tabulate import tabulate
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -67,25 +87,26 @@ LEADERS_N = 10
 MOVERS_N = 10
 SETUPS_N = 3
 
-# Directional (24h) thresholds
+# Directional Leaders/Losers thresholds
 MOVER_VOL_USD_MIN = 5_000_000
 MOVER_UP_24H_MIN = 10.0
 MOVER_DN_24H_MAX = -10.0
 
-# 4H alignment for Directional Leaders/Losers
+# Optional 4H alignment for Directional Leaders/Losers
 MOVER_4H_TREND_FILTER = os.environ.get("MOVER_4H_TREND_FILTER", "true").lower() == "true"
 MOVER_4H_ALIGN_MIN = float(os.environ.get("MOVER_4H_ALIGN_MIN", "1.0"))
 
-# Setups thresholds
+# Setups thresholds (momentum trigger/confirm)
 TRIGGER_1H_ABS_MIN = 2.0
 CONFIRM_15M_ABS_MIN = 0.6
+ALIGN_4H_MIN = 0.0  # keep 0.0 but direction logic below enforces sign consistency
 
 # Risk defaults
 DEFAULT_EQUITY = 1000.0
-DEFAULT_MAX_TRADES_DAY = 3
+DEFAULT_MAX_TRADES_DAY = 5
 DEFAULT_OPEN_RISK_CAP_USD = 75.0
 
-# Risk controls
+# Risk controls (user can change via commands)
 DEFAULT_RISK_MODE = "PCT"       # PCT or USD
 DEFAULT_RISK_VALUE = 1.5        # if PCT -> % per trade, if USD -> $ value
 DEFAULT_DAILY_CAP_MODE = "PCT"  # PCT or USD
@@ -95,25 +116,23 @@ DEFAULT_RISK_AUTO = 0           # OFF by default
 # Time-stop
 SETUP_TIME_STOP_HOURS = int(os.environ.get("SETUP_TIME_STOP_HOURS", "18"))
 
-# ATR-based SL/TP (WIDENED)
+# ATR-based SL/TP
 USE_ATR_SLTP = os.environ.get("USE_ATR_SLTP", "true").lower() == "true"
 ATR_PERIOD = int(os.environ.get("ATR_PERIOD", "14"))
-
-# >>> widened to reduce noise stops:
-ATR_MIN_PCT = float(os.environ.get("ATR_MIN_PCT", "1.2"))   # was 0.6
-ATR_MAX_PCT = float(os.environ.get("ATR_MAX_PCT", "10.0"))  # was 6.0
-TP_MAX_PCT  = float(os.environ.get("TP_MAX_PCT",  "8.0"))   # was 4.5
+ATR_MIN_PCT = float(os.environ.get("ATR_MIN_PCT", "0.9"))  # slightly wider than before (avoid ultra-tight SL)
+ATR_MAX_PCT = float(os.environ.get("ATR_MAX_PCT", "7.5"))
+TP_MAX_PCT = float(os.environ.get("TP_MAX_PCT", "6.5"))
 
 MULTI_TP_MIN_CONF = int(os.environ.get("MULTI_TP_MIN_CONF", "75"))
 TP_ALLOCS = (40, 40, 20)
 
 try:
-    _rm = os.environ.get("TP_R_MULTS", "0.8,1.4,2.0")
+    _rm = os.environ.get("TP_R_MULTS", "0.9,1.6,2.4")
     TP_R_MULTS = tuple(float(x.strip()) for x in _rm.split(","))
     if len(TP_R_MULTS) != 3:
-        TP_R_MULTS = (0.8, 1.4, 2.0)
+        TP_R_MULTS = (0.9, 1.6, 2.4)
 except Exception:
-    TP_R_MULTS = (0.8, 1.4, 2.0)
+    TP_R_MULTS = (0.9, 1.6, 2.4)
 
 # Email
 EMAIL_ENABLED_DEFAULT = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
@@ -124,21 +143,18 @@ EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
 EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 
-# Email content
+# Email content controls
 INCLUDE_MOVERS_IN_EMAIL = True
 EMAIL_MOVERS_TOP_N = 5
 
-# Sessions redesigned: Market sessions (UTC)
-SESSION_WINDOWS_UTC = {
-    "ASIA":   ("00:00", "07:59"),
-    "LONDON": ("07:00", "15:59"),
-    "NEWYORK":("13:00", "21:59"),
-}
-DEFAULT_ENABLED_SESSIONS = ["LONDON", "NEWYORK"]
+# Sessions (user local time); can be configured per user
+DEFAULT_SESSIONS = [{"start": "18:00", "end": "23:30"}]
 
-# Email cap: FIXED (user cannot change)
-EMAILS_PER_SESSION_FIXED = 3
-DEFAULT_EMAIL_GAP_MIN = int(os.environ.get("DEFAULT_EMAIL_GAP_MIN", "60"))  # minutes
+# FIXED email policy (as requested):
+MAX_EMAILS_PER_SESSION_FIXED = 3
+EMAIL_GAP_MIN_FIXED = 60  # minutes
+
+# Symbol cooldown PER SESSION (no repeats inside same session)
 SYMBOL_COOLDOWN_PER_SESSION = True
 
 # Market bias
@@ -151,8 +167,12 @@ CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "5"))
 # DB
 DB_PATH = os.environ.get("DB_PATH", "pulsefutures.db")
 
-# Charts: removed for speed
-CHART_IMG_ENABLED = False  # forced off
+# Charts: disabled by default for speed (TradingView link is enough)
+CHART_IMG_ENABLED = os.environ.get("CHART_IMG_ENABLED", "false").lower() == "true"
+CHART_TIMEFRAME = os.environ.get("CHART_TIMEFRAME", "1h")
+CHART_BARS = int(os.environ.get("CHART_BARS", "120"))
+CHART_WIDTH = int(os.environ.get("CHART_WIDTH", "900"))
+CHART_HEIGHT = int(os.environ.get("CHART_HEIGHT", "500"))
 
 HDR = "━━━━━━━━━━━━━━━━━━━━"
 SEP = "────────────────────"
@@ -164,6 +184,9 @@ STABLES = {"USDT", "USDC", "USD", "TUSD", "FDUSD", "DAI", "PYUSD"}
 
 # Prevent overlapping alert_job runs
 ALERT_LOCK = asyncio.Lock()
+
+# Global cache for market tick sizes (updated on load_markets)
+MARKET_TICKS: Dict[str, float] = {}
 
 
 # =========================
@@ -234,8 +257,7 @@ def db_init():
             daily_cap_mode TEXT,
             daily_cap_value REAL,
             risk_auto INTEGER,
-            trade_sessions TEXT,
-            email_gap_min INTEGER
+            trade_sessions TEXT
         )
         """
     )
@@ -325,13 +347,8 @@ def _normalize_user_row(d: dict) -> dict:
         d["daily_cap_value"] = float(DEFAULT_DAILY_CAP_VALUE)
     if d.get("risk_auto") is None:
         d["risk_auto"] = int(DEFAULT_RISK_AUTO)
-
-    # trade_sessions now stores enabled market sessions
-    # Example: {"enabled":["LONDON","NEWYORK"]}
     if not d.get("trade_sessions"):
-        d["trade_sessions"] = json.dumps({"enabled": DEFAULT_ENABLED_SESSIONS})
-    if d.get("email_gap_min") is None:
-        d["email_gap_min"] = int(DEFAULT_EMAIL_GAP_MIN)
+        d["trade_sessions"] = json.dumps(DEFAULT_SESSIONS)
     return d
 
 
@@ -349,9 +366,9 @@ def get_user(user_id: int) -> dict:
                 user_id, equity, risk_pct, max_trades_day, daily_risk_cap, open_risk_cap,
                 notify_on, tz, day_trade_count, day_trade_date, daily_risk_used,
                 risk_mode, risk_value, daily_cap_mode, daily_cap_value, risk_auto,
-                trade_sessions, email_gap_min
+                trade_sessions
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -370,8 +387,7 @@ def get_user(user_id: int) -> dict:
                 DEFAULT_DAILY_CAP_MODE,
                 float(DEFAULT_DAILY_CAP_VALUE),
                 int(DEFAULT_RISK_AUTO),
-                json.dumps({"enabled": DEFAULT_ENABLED_SESSIONS}),
-                int(DEFAULT_EMAIL_GAP_MIN),
+                json.dumps(DEFAULT_SESSIONS),
             ),
         )
         con.commit()
@@ -440,9 +456,22 @@ def db_upsert_signal(setup: Setup):
             created_ts=excluded.created_ts
         """,
         (
-            setup.symbol, setup.market_symbol, setup.side, setup.conf, setup.entry, setup.sl, setup.tp,
-            setup.tp1, setup.tp2, setup.fut_vol_usd, setup.ch24, setup.ch4, setup.ch1, setup.ch15,
-            setup.regime, setup.created_ts,
+            setup.symbol,
+            setup.market_symbol,
+            setup.side,
+            setup.conf,
+            setup.entry,
+            setup.sl,
+            setup.tp,
+            setup.tp1,
+            setup.tp2,
+            setup.fut_vol_usd,
+            setup.ch24,
+            setup.ch4,
+            setup.ch1,
+            setup.ch15,
+            setup.regime,
+            setup.created_ts,
         ),
     )
     con.commit()
@@ -493,8 +522,19 @@ def db_add_position(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
         """,
         (
-            user_id, symbol, side, entry, sl, tp, risk_usd, qty, notional, conf,
-            time.time(), time_stop_ts, notes,
+            user_id,
+            symbol,
+            side,
+            entry,
+            sl,
+            tp,
+            risk_usd,
+            qty,
+            notional,
+            conf,
+            time.time(),
+            time_stop_ts,
+            notes,
         ),
     )
     con.commit()
@@ -604,19 +644,17 @@ def mark_emailed_symbols_in_session(user_id: int, session_key: str, symbols: Lis
 
 
 # =========================
-# EXCHANGE HELPERS (single instance per scan)
+# EXCHANGE HELPERS
 # =========================
 def build_exchange():
     klass = ccxt.__dict__[EXCHANGE_ID]
-    ex = klass(
+    return klass(
         {
             "enableRateLimit": True,
             "timeout": 20000,
             "options": {"defaultType": DEFAULT_TYPE},
         }
     )
-    ex.load_markets()
-    return ex
 
 
 def safe_split_symbol(sym: Optional[str]) -> Optional[Tuple[str, str]]:
@@ -656,13 +694,34 @@ def to_mv(t: dict) -> Optional[MarketVol]:
     )
 
 
-def fetch_futures_tickers(ex) -> Dict[str, MarketVol]:
+def _update_market_ticks(ex) -> None:
+    global MARKET_TICKS
     try:
+        ticks = {}
+        for sym, m in ex.markets.items():
+            prec = (m.get("precision") or {}).get("price", None)
+            if isinstance(prec, int) and prec >= 0:
+                ticks[sym] = 10 ** (-prec)
+        MARKET_TICKS = ticks
+    except Exception:
+        pass
+
+
+def tick_for_market(market_symbol: str) -> float:
+    return float(MARKET_TICKS.get(market_symbol, 0.0) or 0.0)
+
+
+def fetch_futures_tickers() -> Dict[str, MarketVol]:
+    ex = build_exchange()
+    try:
+        ex.load_markets()
+        _update_market_ticks(ex)
         tickers = ex.fetch_tickers()
     except Exception as e:
         logger.exception("fetch_tickers failed: %s", e)
         return {}
 
+    # choose best USDT-like quote per base
     best: Dict[str, MarketVol] = {}
     for t in tickers.values():
         mv = to_mv(t)
@@ -675,7 +734,10 @@ def fetch_futures_tickers(ex) -> Dict[str, MarketVol]:
     return best
 
 
-def fetch_ohlcv(ex, symbol: str, timeframe: str, limit: int):
+def fetch_ohlcv(symbol: str, timeframe: str, limit: int):
+    ex = build_exchange()
+    ex.load_markets()
+    _update_market_ticks(ex)
     return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
 
 
@@ -694,9 +756,9 @@ def compute_atr_from_ohlcv(candles: List[List[float]], period: int) -> float:
     return sum(trs[-period:]) / period
 
 
-def metrics_from_candles_1h_15m(ex, market_symbol: str) -> Tuple[float, float, float, float]:
+def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float, float]:
     need_1h = max(ATR_PERIOD + 5, 30)
-    c1 = fetch_ohlcv(ex, market_symbol, "1h", limit=need_1h)
+    c1 = fetch_ohlcv(market_symbol, "1h", limit=need_1h)
     if not c1 or len(c1) < 6:
         return 0.0, 0.0, 0.0, 0.0
 
@@ -709,7 +771,7 @@ def metrics_from_candles_1h_15m(ex, market_symbol: str) -> Tuple[float, float, f
     ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
     atr = compute_atr_from_ohlcv(c1, ATR_PERIOD)
 
-    c15 = fetch_ohlcv(ex, market_symbol, "15m", limit=3)
+    c15 = fetch_ohlcv(market_symbol, "15m", limit=3)
     if not c15 or len(c15) < 2:
         ch15 = 0.0
     else:
@@ -721,21 +783,51 @@ def metrics_from_candles_1h_15m(ex, market_symbol: str) -> Tuple[float, float, f
 
 
 # =========================
-# SL/TP + MULTI TP (widened)
+# SL/TP + MULTI TP (NO EQUAL TPS)
 # =========================
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
 def sl_mult_from_conf(conf: int) -> float:
-    # Wider SL: reduce 15m–1h noise stop-outs
-    if conf >= 85:
-        return 2.4
+    if conf > 85:
+        return 2.2
     if conf >= 75:
-        return 2.1
-    if conf >= 65:
         return 1.9
-    return 1.7
+    if conf >= 65:
+        return 1.6
+    return 1.4
+
+
+def quantize_price(x: float, tick: float) -> float:
+    if x <= 0 or tick <= 0:
+        return x
+    return round(x / tick) * tick
+
+
+def enforce_distinct_tps(entry: float, side: str, tp1: float, tp2: float, tp3: float, tick: float) -> Tuple[float, float, float]:
+    """
+    Ensure tp1 < tp2 < tp3 for BUY (reverse for SELL) after quantization.
+    Enforce a minimum gap so formatted values won't look equal.
+    """
+    if entry <= 0:
+        return tp1, tp2, tp3
+
+    min_gap = 0.0
+    if tick > 0:
+        min_gap = max(min_gap, 2 * tick)  # at least 2 ticks
+    min_gap = max(min_gap, entry * 0.0005)  # at least 0.05%
+
+    if side == "BUY":
+        a = max(tp1, entry + min_gap)
+        b = max(tp2, a + min_gap)
+        c = max(tp3, b + min_gap)
+        return a, b, c
+    else:
+        a = min(tp1, entry - min_gap)
+        b = min(tp2, a - min_gap)
+        c = min(tp3, b - min_gap)
+        return a, b, c
 
 
 def sl_tp_from_atr(entry: float, side: str, atr: float, conf: int) -> Tuple[float, float, float]:
@@ -748,8 +840,7 @@ def sl_tp_from_atr(entry: float, side: str, atr: float, conf: int) -> Tuple[floa
     sl_dist = clamp(sl_dist, min_dist, max_dist)
 
     r = sl_dist
-    # Better RR; still capped by TP_MAX_PCT
-    tp_dist = 1.8 * r
+    tp_dist = 1.6 * r  # slightly larger than before to reduce “TP too close”
     tp_max_dist = (TP_MAX_PCT / 100.0) * entry
     tp_dist = min(tp_dist, tp_max_dist)
 
@@ -769,7 +860,7 @@ def multi_tp_from_r(entry: float, side: str, r: float) -> Tuple[float, float, fl
 
     r1, r2, r3 = TP_R_MULTS
     if r3 <= 0:
-        r1, r2, r3 = (0.8, 1.4, 2.0)
+        r1, r2, r3 = (0.9, 1.6, 2.4)
 
     maxd = (TP_MAX_PCT / 100.0) * entry
     d3_raw = r3 * r
@@ -778,6 +869,7 @@ def multi_tp_from_r(entry: float, side: str, r: float) -> Tuple[float, float, fl
     d1 = d3 * (r1 / r3)
     d2 = d3 * (r2 / r3)
 
+    # ensure strictly increasing before tick-enforcement
     if d1 >= d2:
         d1 = d2 * 0.98
     if d2 >= d3:
@@ -787,6 +879,50 @@ def multi_tp_from_r(entry: float, side: str, r: float) -> Tuple[float, float, fl
         return (entry + d1, entry + d2, entry + d3)
     else:
         return (entry - d1, entry - d2, entry - d3)
+
+
+# =========================
+# CHARTS (TradingView link)
+# =========================
+def tv_chart_url(symbol_base: str) -> str:
+    return f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol_base.upper()}USDT.P"
+
+
+def quickchart_png_bytes(title: str, labels: List[str], closes: List[float]) -> Optional[bytes]:
+    if not CHART_IMG_ENABLED:
+        return None
+    chart_cfg = {
+        "type": "line",
+        "data": {"labels": labels, "datasets": [{"label": title, "data": closes, "fill": False, "pointRadius": 0, "borderWidth": 2, "tension": 0.25}]},
+        "options": {"legend": {"display": False}, "scales": {"xAxes": [{"display": False}], "yAxes": [{"ticks": {"maxTicksLimit": 6}}]}},
+    }
+    qs = urllib.parse.quote(json.dumps(chart_cfg), safe="")
+    url = f"https://quickchart.io/chart?c={qs}&format=png&width={CHART_WIDTH}&height={CHART_HEIGHT}"
+    try:
+        with urllib.request.urlopen(url, timeout=20) as r:
+            return r.read()
+    except Exception:
+        logger.exception("quickchart fetch failed")
+        return None
+
+
+def build_chart_png_for_market(symbol_base: str, market_symbol: str) -> Optional[bytes]:
+    if not CHART_IMG_ENABLED:
+        return None
+    try:
+        candles = fetch_ohlcv(market_symbol, CHART_TIMEFRAME, CHART_BARS)
+        if len(candles) < 10:
+            return None
+        labels, closes = [], []
+        for ts, o, h, l, c, v in candles:
+            dt = datetime.fromtimestamp(ts / 1000, tz=ZoneInfo("UTC"))
+            labels.append(dt.strftime("%m-%d %H:%M"))
+            closes.append(float(c))
+        title = f"{symbol_base.upper()} ({CHART_TIMEFRAME})"
+        return quickchart_png_bytes(title, labels, closes)
+    except Exception:
+        logger.exception("build_chart_png_for_market failed")
+        return None
 
 
 # =========================
@@ -823,12 +959,11 @@ def pct_with_emoji(p: float) -> str:
 
 
 def regime_label(ch24: float, ch4: float) -> str:
-    # stricter regime definition
-    if ch24 > 0 and ch4 > 0:
-        return "UPTREND 🟢"
-    if ch24 < 0 and ch4 < 0:
-        return "DOWNTREND 🔴"
-    return "MIXED 🟡"
+    if ch24 >= 3 and ch4 >= 2:
+        return "LONG 🟢"
+    if ch24 <= -3 and ch4 <= -2:
+        return "SHORT 🔴"
+    return "NEUTRAL 🟡"
 
 
 def fmt_table(rows: List[List], headers: List[str]) -> str:
@@ -845,10 +980,6 @@ def fmt_section(title: str) -> str:
 
 def fmt_kv(key: str, val: str) -> str:
     return f"*{key}:* {val}"
-
-
-def tv_chart_url(symbol_base: str) -> str:
-    return f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol_base.upper()}USDT.P"
 
 
 def fmt_inline_setup_card(i: int, s: Setup) -> str:
@@ -876,7 +1007,7 @@ def fmt_inline_setup_card(i: int, s: Setup) -> str:
 # =========================
 # MARKET BIAS
 # =========================
-def market_bias(ex, best_fut: Dict[str, MarketVol]) -> str:
+def market_bias(best_fut: Dict[str, MarketVol]) -> str:
     top = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:BIAS_UNIVERSE_N]
     if not top:
         return "Market Bias: UNKNOWN"
@@ -891,7 +1022,7 @@ def market_bias(ex, best_fut: Dict[str, MarketVol]) -> str:
         if vol <= 0:
             continue
 
-        ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(ex, mv.symbol)
+        ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol)
         ch24 = float(mv.percentage or 0.0)
 
         if ch4 > 0:
@@ -933,7 +1064,7 @@ def bias_tag(bias_line: str) -> str:
 
 
 # =========================
-# SETUP ENGINE (high probability only)
+# SETUP ENGINE
 # =========================
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
     score = 50.0
@@ -967,37 +1098,31 @@ def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: flo
     return int(round(score))
 
 
-def trend_allowed_side(ch24: float, ch4: float) -> Optional[str]:
-    # strict directional gate
-    if ch24 > 0 and ch4 > 0:
-        return "BUY"
-    if ch24 < 0 and ch4 < 0:
-        return "SELL"
-    return None  # mixed -> no setup
-
-
-def make_setup(ex, base: str, mv: MarketVol) -> Optional[Setup]:
+def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
     fut_vol = usd_notional(mv)
     if fut_vol <= 0:
         return None
 
     ch24 = float(mv.percentage or 0.0)
-    ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(ex, mv.symbol)
+    ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol)
 
-    # strict regime gate
-    allowed = trend_allowed_side(ch24, ch4)
-    if not allowed:
-        return None
-
-    # momentum trigger
+    # must have meaningful 1H + 15m momentum
     if abs(ch1) < TRIGGER_1H_ABS_MIN:
         return None
     if abs(ch15) < CONFIRM_15M_ABS_MIN:
         return None
 
+    # side by 1H direction
     side = "BUY" if ch1 > 0 else "SELL"
-    if side != allowed:
-        return None
+
+    # Directional discipline: do NOT counter-trend
+    # BUY requires 4H >= 0 (or >= ALIGN_4H_MIN), SELL requires 4H <= 0 (or <= -ALIGN_4H_MIN)
+    if side == "BUY":
+        if ch4 < ALIGN_4H_MIN:
+            return None
+    else:
+        if ch4 > -ALIGN_4H_MIN:
+            return None
 
     entry = float(mv.last or 0.0)
     if entry <= 0:
@@ -1010,11 +1135,21 @@ def make_setup(ex, base: str, mv: MarketVol) -> Optional[Setup]:
     if sl <= 0 or tp_single <= 0 or r <= 0:
         return None
 
+    # quantize to tick + enforce distinct
+    tick = tick_for_market(mv.symbol)
+    sl = quantize_price(sl, tick)
+    tp_single = quantize_price(tp_single, tick)
+
     tp1 = tp2 = None
     tp = tp_single
+
     if conf >= MULTI_TP_MIN_CONF:
         _tp1, _tp2, _tp3 = multi_tp_from_r(entry, side, r)
         if _tp1 > 0 and _tp2 > 0 and _tp3 > 0:
+            _tp1 = quantize_price(_tp1, tick)
+            _tp2 = quantize_price(_tp2, tick)
+            _tp3 = quantize_price(_tp3, tick)
+            _tp1, _tp2, _tp3 = enforce_distinct_tps(entry, side, _tp1, _tp2, _tp3, tick)
             tp1, tp2, tp = _tp1, _tp2, _tp3
 
     return Setup(
@@ -1037,18 +1172,18 @@ def make_setup(ex, base: str, mv: MarketVol) -> Optional[Setup]:
     )
 
 
-def pick_setups(ex, best_fut: Dict[str, MarketVol]) -> List[Setup]:
+def pick_setups(best_fut: Dict[str, MarketVol]) -> List[Setup]:
     universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:30]
     setups: List[Setup] = []
     for base, mv in universe:
-        s = make_setup(ex, base, mv)
+        s = make_setup(base, mv)
         if s:
             setups.append(s)
     setups.sort(key=lambda s: (s.conf, s.fut_vol_usd), reverse=True)
     return setups[:SETUPS_N]
 
 
-def compute_directional_lists(ex, best_fut: Dict[str, MarketVol]) -> Tuple[List[Tuple], List[Tuple]]:
+def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tuple], List[Tuple]]:
     up = []
     dn = []
     for base, mv in best_fut.items():
@@ -1060,7 +1195,7 @@ def compute_directional_lists(ex, best_fut: Dict[str, MarketVol]) -> Tuple[List[
         if ch24 < MOVER_UP_24H_MIN and ch24 > MOVER_DN_24H_MAX:
             continue
 
-        ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(ex, mv.symbol)
+        ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol)
 
         if ch24 >= MOVER_UP_24H_MIN:
             if (not MOVER_4H_TREND_FILTER) or (ch4 >= MOVER_4H_ALIGN_MIN):
@@ -1082,8 +1217,8 @@ def build_leaders_table(best_fut: Dict[str, MarketVol]) -> str:
     return "*Market Leaders (Top 10 by Futures Volume)*\n" + fmt_table(rows, ["SYM", "F Vol", "24H", "Last"])
 
 
-def build_movers_tables(ex, best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
-    up, dn = compute_directional_lists(ex, best_fut)
+def build_movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
+    up, dn = compute_directional_lists(best_fut)
 
     up_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4), fmt_price(px)] for b, v, c24, c4, px in up[:MOVERS_N]]
     dn_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4), fmt_price(px)] for b, v, c24, c4, px in dn[:MOVERS_N]]
@@ -1095,7 +1230,7 @@ def build_movers_tables(ex, best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
 
 def format_setups_for_screen_cards(setups: List[Setup]) -> str:
     if not setups:
-        return "No high-probability setup right now (strict trend filter active)."
+        return "No high-quality setup right now."
     out = []
     for i, s in enumerate(setups, 1):
         out.append(fmt_inline_setup_card(i, s))
@@ -1157,7 +1292,7 @@ def suggested_leverage(notional: float, equity: float) -> int:
 
 
 # =========================
-# MARKET SESSION HELPERS
+# SESSION TIME HELPERS
 # =========================
 def parse_hhmm(s: str) -> Tuple[int, int]:
     m = re.match(r"^(\d{1,2}):(\d{2})$", s.strip())
@@ -1170,52 +1305,54 @@ def parse_hhmm(s: str) -> Tuple[int, int]:
     return hh, mm
 
 
-def load_enabled_sessions(user: dict) -> List[str]:
-    raw = user.get("trade_sessions")
+def load_sessions(user: dict) -> List[dict]:
     try:
-        data = json.loads(raw) if raw else {}
-        if isinstance(data, dict) and isinstance(data.get("enabled"), list) and data["enabled"]:
-            enabled = [str(x).upper().strip() for x in data["enabled"]]
-            enabled = [x for x in enabled if x in SESSION_WINDOWS_UTC]
-            return enabled or DEFAULT_ENABLED_SESSIONS
+        data = user.get("trade_sessions") or json.dumps(DEFAULT_SESSIONS)
+        ses = json.loads(data)
+        if not isinstance(ses, list) or not ses:
+            return DEFAULT_SESSIONS
+        out = []
+        for x in ses:
+            if not isinstance(x, dict):
+                continue
+            st = str(x.get("start", "")).strip()
+            en = str(x.get("end", "")).strip()
+            parse_hhmm(st)
+            parse_hhmm(en)
+            out.append({"start": st, "end": en})
+        return out or DEFAULT_SESSIONS
     except Exception:
-        pass
-    return DEFAULT_ENABLED_SESSIONS
+        return DEFAULT_SESSIONS
 
 
-def active_market_session_for_user(user: dict) -> Optional[dict]:
+def active_session_for_user(user: dict) -> Optional[dict]:
     tz = ZoneInfo(user.get("tz") or "Australia/Melbourne")
-    now_local = datetime.now(tz)
+    now = datetime.now(tz)
+    sessions = load_sessions(user)
 
-    enabled = load_enabled_sessions(user)
+    for s in sessions:
+        sh, sm = parse_hhmm(s["start"])
+        eh, em = parse_hhmm(s["end"])
 
-    for name in enabled:
-        st_utc, en_utc = SESSION_WINDOWS_UTC[name]
-        sh, sm = parse_hhmm(st_utc)
-        eh, em = parse_hhmm(en_utc)
+        start_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_dt = now.replace(hour=eh, minute=em, second=0, microsecond=0)
 
-        now_utc = datetime.now(ZoneInfo("UTC"))
+        if end_dt <= start_dt:
+            end_dt = end_dt + timedelta(days=1)
+            if now < start_dt:
+                start_dt = start_dt - timedelta(days=1)
+                end_dt = end_dt - timedelta(days=1)
 
-        start_utc = now_utc.replace(hour=sh, minute=sm, second=0, microsecond=0)
-        end_utc = now_utc.replace(hour=eh, minute=em, second=0, microsecond=0)
-
-        if end_utc <= start_utc:
-            end_utc += timedelta(days=1)
-            if now_utc < start_utc:
-                start_utc -= timedelta(days=1)
-                end_utc -= timedelta(days=1)
-
-        start_local = start_utc.astimezone(tz)
-        end_local = end_utc.astimezone(tz)
-
-        if start_local <= now_local <= end_local:
-            session_key = f"{start_utc.strftime('%Y-%m-%d')}_{name}"
+        if start_dt <= now <= end_dt:
+            session_key = f"{start_dt.strftime('%Y-%m-%d')}_{s['start']}"
             return {
-                "name": name,
-                "start_local": start_local,
-                "end_local": end_local,
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "start_str": s["start"],
+                "end_str": s["end"],
                 "session_key": session_key,
             }
+
     return None
 
 
@@ -1226,7 +1363,7 @@ def email_config_ok() -> bool:
     return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO])
 
 
-def send_email(subject: str, body: str) -> bool:
+def send_email(subject: str, body: str, attachments: Optional[List[Tuple[str, bytes, str]]] = None) -> bool:
     if not email_config_ok():
         logger.warning("Email not configured.")
         return False
@@ -1236,6 +1373,11 @@ def send_email(subject: str, body: str) -> bool:
         msg["From"] = EMAIL_FROM
         msg["To"] = EMAIL_TO
         msg.set_content(body)
+
+        if attachments:
+            for fn, data, mime in attachments:
+                maintype, subtype = mime.split("/", 1)
+                msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=fn)
 
         if EMAIL_PORT == 465:
             ctx = ssl.create_default_context()
@@ -1267,50 +1409,51 @@ def format_setup_email_block_pretty(s: Setup) -> str:
     else:
         lines.append(f"TP:    {fmt_price(s.tp)}")
 
+    lines.append("")
     lines.append(f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | F~{fmt_money(s.fut_vol_usd)}")
     lines.append(f"Chart: {tv_chart_url(s.symbol)}")
     return "\n".join(lines)
 
 
 # =========================
-# HELP (PLAIN TEXT — NO MARKDOWN)
+# HELP (PLAIN TEXT)
 # =========================
 HELP_TEXT = """\
 PulseFutures — Commands
 
 Market
-- /screen        => Market Leaders + Directional Leaders/Losers + Top Setups (FAST)
+- /screen                    => Market Leaders + Directional Leaders/Losers + Top Setups
 
-Sessions (Market Sessions)
-- /sessions      => Show enabled market sessions (ASIA/LONDON/NEWYORK)
-- /sessions_set  => Enable sessions. Example:
-                   /sessions_set london,newyork
-                   /sessions_set asia,london,newyork
-
-Email
-- /notify_on
-- /notify_off
-- /emailgap 60   => Minimum minutes between emails (per session)
-Notes:
-- Emails per session is FIXED to 3.
-- No repeated symbol inside a session.
+Sessions (email window)
+- /sessions
+- /sessions_set 18:00-23:30,07:00-10:00
 
 Risk & Trading
+- /status                    => daily cap + open risk + trades/day + open positions
 - /equity 1000
 - /riskmode pct 2.5
 - /riskmode usd 25
 - /dailycap pct 5
 - /dailycap usd 60
 - /riskauto on|off
-- /tradesetup BTC
-- /risk BTC
-- /open
-- /closepnl BTC +23.5
+- /maxtrades 5
 
-Direction rule (important)
-- If trend is UP (24H>0 & 4H>0): bot will NOT propose SELL
-- If trend is DOWN (24H<0 & 4H<0): bot will NOT propose BUY
-- If MIXED: bot avoids setups (high probability only)
+TradeSetup
+- /tradesetup BTC            => open using your default risk settings
+- /tradesetup BTC 40          => open BTC with $40 risk for THIS trade only
+- /risk BTC                  => same as tradesetup
+- /closepnl BTC +23.5
+- /open                      => list open positions
+
+Alerts
+- /notify_on
+- /notify_off
+- /diag
+
+Email rules (fixed)
+- Max 3 emails per session
+- Minimum 60 minutes between emails
+- No repeated symbols within the same session
 
 Not financial advice.
 """
@@ -1320,14 +1463,7 @@ Not financial advice.
 # TELEGRAM HANDLERS
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("START/HELP called by user_id=%s", update.effective_user.id if update.effective_user else None)
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id is None:
-        return
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=HELP_TEXT)
-    except BadRequest:
-        await context.bot.send_message(chat_id=chat_id, text=re.sub(r"[*_`]", "", HELP_TEXT))
+    await update.message.reply_text(HELP_TEXT)
 
 
 async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1345,28 +1481,82 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dc_value = float(user.get("daily_cap_value") or DEFAULT_DAILY_CAP_VALUE)
     dc_desc = f"${dc_value:.2f} / day" if dc_mode == "USD" else f"{dc_value:.2f}% / day"
 
-    enabled = load_enabled_sessions(user)
+    ses = load_sessions(user)
+    ses_txt = ", ".join([f"{x['start']}-{x['end']}" for x in ses])
+
     msg = (
         f"*Diag*\n"
         f"- Futures: Bybit swap\n"
         f"- Email notify: {notify}\n"
         f"- Your TZ: {user.get('tz')}\n"
-        f"- Enabled sessions: {', '.join(enabled)}\n"
-        f"- Emails/session: {EMAILS_PER_SESSION_FIXED} (fixed)\n"
-        f"- Email gap: {int(user.get('email_gap_min') or DEFAULT_EMAIL_GAP_MIN)} min\n"
+        f"- Sessions: {ses_txt}\n"
+        f"- Email cap/session: {MAX_EMAILS_PER_SESSION_FIXED}\n"
+        f"- Email gap: {EMAIL_GAP_MIN_FIXED} min\n"
         f"- Equity: ${equity:.2f}\n"
         f"- Risk per trade: {risk_desc}\n"
         f"- Daily cap: {dc_desc} (≈ ${daily_cap:.2f})\n"
         f"- Risk auto: {'ON' if int(user.get('risk_auto') or 0)==1 else 'OFF'}\n"
-        f"- Max trades/day: {user['max_trades_day']}\n"
+        f"- Max trades/day: {int(user['max_trades_day'])}\n"
         f"- Daily risk used: ${user['daily_risk_used']:.2f}\n"
         f"- Open risk cap (USD): ${user['open_risk_cap']:.2f}\n"
         f"- Time-stop: {SETUP_TIME_STOP_HOURS}h\n"
         f"- TP cap: {TP_MAX_PCT}%\n"
         f"- Multi-TP: Conf >= {MULTI_TP_MIN_CONF} | TP R-mults {TP_R_MULTS}\n"
-        f"- Symbol cooldown: PER SESSION\n"
+        f"- Symbol cooldown: {'PER SESSION' if SYMBOL_COOLDOWN_PER_SESSION else 'OFF'}\n"
+        f"- Chart images: {'ON' if CHART_IMG_ENABLED else 'OFF'}\n"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = reset_daily_counters_if_needed(get_user(uid))
+
+    equity = float(user["equity"])
+    daily_cap_usd = compute_daily_cap_usd(user, equity)
+    daily_used = float(user["daily_risk_used"])
+    daily_rem = daily_cap_usd - daily_used
+
+    pos = db_get_open_positions(uid)
+    open_risk = sum(float(p["risk_usd"]) for p in pos)
+    open_cap = float(user["open_risk_cap"])
+    open_rem = open_cap - open_risk
+
+    trades_today = int(user["day_trade_count"])
+    max_trades = int(user["max_trades_day"])
+
+    warn = ""
+    if trades_today >= max_trades:
+        warn = f"\n⚠️ هشدار: امروز {trades_today} ترید ثبت کردی (حداکثر {max_trades})."
+
+    lines = []
+    lines.append("*Status*")
+    lines.append(f"- Equity: ${equity:.2f}")
+    lines.append(f"- Daily cap: ${daily_cap_usd:.2f} | Used: ${daily_used:.2f} | Remaining: ${daily_rem:.2f}")
+    lines.append(f"- Open risk cap: ${open_cap:.2f} | Open now: ${open_risk:.2f} | Remaining: ${open_rem:.2f}")
+    lines.append(f"- Trades today: {trades_today}/{max_trades}")
+    if warn:
+        lines.append(warn)
+
+    if not pos:
+        lines.append("\nNo open positions.")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    lines.append("\n*Open Positions*")
+    now_ts = time.time()
+
+    for i, p in enumerate(pos, 1):
+        expired_tag = ""
+        tst = p.get("time_stop_ts")
+        if tst and now_ts > float(tst):
+            expired_tag = " ⏱️EXPIRED"
+        lines.append(
+            f"#{i} {p['symbol']} {p['side']}{expired_tag} | Entry {fmt_price(float(p['entry']))} | "
+            f"SL {fmt_price(float(p['sl']))} | TP {fmt_price(float(p['tp']))} | Risk ${float(p['risk_usd']):.2f}"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1381,46 +1571,39 @@ async def notify_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
-    enabled = load_enabled_sessions(user)
+    ses = load_sessions(user)
+    ses_txt = "\n".join([f"- {x['start']}-{x['end']}" for x in ses])
     await update.message.reply_text(
-        f"Enabled market sessions (TZ: {user.get('tz')}):\n- " + "\n- ".join(enabled) +
-        "\n\nSet: /sessions_set london,newyork  OR  /sessions_set asia,london,newyork"
+        f"Your sessions (TZ: {user.get('tz')}):\n{ses_txt}\n\nSet: /sessions_set 18:00-23:30,07:00-10:00"
     )
 
 
 async def sessions_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not context.args:
-        await update.message.reply_text("Usage: /sessions_set london,newyork  OR  /sessions_set asia,london,newyork")
+        await update.message.reply_text("Usage: /sessions_set 18:00-23:30,07:00-10:00")
         return
 
-    raw = " ".join(context.args).strip().lower()
-    parts = [p.strip().upper() for p in raw.split(",") if p.strip()]
-    parts = [p for p in parts if p in SESSION_WINDOWS_UTC]
-    if not parts:
-        await update.message.reply_text("Bad sessions. Use: asia,london,newyork")
-        return
-
-    update_user(uid, trade_sessions=json.dumps({"enabled": parts}))
-    await update.message.reply_text(f"✅ Enabled sessions saved: {', '.join(parts)}")
-
-
-async def emailgap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user = get_user(uid)
-    if not context.args:
-        await update.message.reply_text(
-            f"Email min gap: {int(user.get('email_gap_min') or DEFAULT_EMAIL_GAP_MIN)} minutes\nSet: /emailgap 60"
-        )
-        return
+    raw = " ".join(context.args).strip()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    sessions = []
     try:
-        m = int(context.args[0])
-        if m < 0 or m > 360:
+        for p in parts:
+            if "-" not in p:
+                raise ValueError()
+            st, en = [x.strip() for x in p.split("-", 1)]
+            parse_hhmm(st)
+            parse_hhmm(en)
+            sessions.append({"start": st, "end": en})
+        if not sessions:
             raise ValueError()
-        update_user(uid, email_gap_min=m)
-        await update.message.reply_text(f"✅ Email min gap set to {m} minutes")
     except Exception:
-        await update.message.reply_text("Usage: /emailgap 60  (0..360)")
+        await update.message.reply_text("Bad format. Example: /sessions_set 18:00-23:30,07:00-10:00")
+        return
+
+    update_user(uid, trade_sessions=json.dumps(sessions))
+    saved = ", ".join([f"{x['start']}-{x['end']}" for x in sessions])
+    await update.message.reply_text(f"✅ Sessions saved: {saved}")
 
 
 async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1437,6 +1620,22 @@ async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Equity updated: ${eq:.2f}")
     except Exception:
         await update.message.reply_text("Usage: /equity 1000")
+
+
+async def maxtrades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not context.args:
+        await update.message.reply_text(f"Max trades/day: {int(user['max_trades_day'])}\nSet: /maxtrades 5")
+        return
+    try:
+        n = int(context.args[0])
+        if n < 1 or n > 20:
+            raise ValueError()
+        update_user(uid, max_trades_day=n)
+        await update.message.reply_text(f"✅ Max trades/day set to {n}")
+    except Exception:
+        await update.message.reply_text("Usage: /maxtrades 5  (1..20)")
 
 
 async def riskmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1533,36 +1732,29 @@ async def riskauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Risk auto: {'ON' if val==1 else 'OFF'}")
 
 
-# ===== SPEED: compute scan in one thread, one exchange instance =====
-def _compute_scan_bundle() -> Tuple[Dict[str, MarketVol], str, str, str, List[Setup]]:
-    ex = build_exchange()
-    best_fut = fetch_futures_tickers(ex)
-    if not best_fut:
-        return {}, "Market Bias: UNKNOWN", "", "", []
-
-    bias_line = market_bias(ex, best_fut)
-    leaders_txt = build_leaders_table(best_fut)
-    dir_up_txt, dir_dn_txt = build_movers_tables(ex, best_fut)
-    setups = pick_setups(ex, best_fut)
-    return best_fut, bias_line, leaders_txt, dir_up_txt + "\n\n" + dir_dn_txt, setups
-
-
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    best_fut, bias_line, leaders_txt, movers_txt, setups = await asyncio.to_thread(_compute_scan_bundle)
+    best_fut = await asyncio.to_thread(fetch_futures_tickers)
     if not best_fut:
         await update.message.reply_text("Error: could not fetch futures tickers.")
         return
 
+    bias_line = await asyncio.to_thread(market_bias, best_fut)
+    leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
+    dir_up_txt, dir_dn_txt = await asyncio.to_thread(build_movers_tables, best_fut)
+
+    setups = await asyncio.to_thread(pick_setups, best_fut)
     for s in setups:
         db_upsert_signal(s)
 
     parts = []
     parts.append(fmt_header("PulseFutures — Market Scan"))
     parts.append(f"🧠 *{bias_line}*")
-    parts.append(fmt_section("Top Trade Setups (High Probability)"))
+    parts.append(fmt_section("Top Trade Setups"))
     parts.append(format_setups_for_screen_cards(setups))
     parts.append(fmt_section("Directional Leaders / Losers"))
-    parts.append(movers_txt)
+    parts.append(dir_up_txt)
+    parts.append("")
+    parts.append(dir_dn_txt)
     parts.append(fmt_section("Market Leaders (Volume)"))
     parts.append(leaders_txt)
 
@@ -1585,64 +1777,79 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = reset_daily_counters_if_needed(get_user(uid))
 
     if not context.args:
-        await update.message.reply_text("Usage: /tradesetup BTC")
+        await update.message.reply_text("Usage: /tradesetup BTC   OR   /tradesetup BTC 40")
         return
 
     sym = re.sub(r"[^A-Za-z0-9]", "", context.args[0]).upper().lstrip("$")
     if not sym:
-        await update.message.reply_text("Usage: /tradesetup BTC")
+        await update.message.reply_text("Usage: /tradesetup BTC   OR   /tradesetup BTC 40")
         return
+
+    # optional per-trade risk override in USD: /tradesetup BTC 40
+    risk_override = None
+    if len(context.args) >= 2:
+        try:
+            rv = float(context.args[1])
+            if rv > 0:
+                risk_override = rv
+        except Exception:
+            risk_override = None
 
     sig = db_get_signal(sym)
     warning = ""
     if not sig:
-        warning = f"⚠️ {sym} is NOT in current PulseFutures signals. I will still compute sizing, but this is manual.\n\n"
+        warning = (
+            f"⚠️ {sym} is not in current PulseFutures signals.\n"
+            f"You can still use TradeSetup for sizing, but responsibility is yours.\n\n"
+        )
 
-    # compute fresh metrics fast with one exchange
-    def _compute_one(symbol_base: str):
-        ex = build_exchange()
-        best_fut = fetch_futures_tickers(ex)
-        mv = best_fut.get(symbol_base)
-        if not mv:
-            return None
-        bias_line = market_bias(ex, best_fut)
-        ch24 = float(mv.percentage or 0.0)
-        ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(ex, mv.symbol)
-        return mv, bias_line, ch24, ch1, ch4, ch15, atr, usd_notional(mv)
-
-    out = await asyncio.to_thread(_compute_one, sym)
-    if not out:
+    best_fut = await asyncio.to_thread(fetch_futures_tickers)
+    mv = best_fut.get(sym)
+    if not mv:
         await update.message.reply_text(f"{warning}Could not find {sym} on Bybit futures.")
         return
-    mv, bias_line, ch24, ch1, ch4, ch15, atr, fut_vol = out
 
-    # strict direction: no long in downtrend, no short in uptrend
-    allowed = trend_allowed_side(ch24, ch4)
-    if not allowed:
-        await update.message.reply_text(
-            f"{warning}⚠️ Trend is MIXED (24H and 4H not aligned). For high probability, bot will NOT propose a direction.\n"
-            f"Try another symbol or wait for cleaner trend.\n"
-            f"📈 {tv_chart_url(sym)}"
-        )
+    bias_line = await asyncio.to_thread(market_bias, best_fut)
+
+    ch24 = float(mv.percentage or 0.0)
+    ch1, ch4, ch15, atr = await asyncio.to_thread(metrics_from_candles_1h_15m, mv.symbol)
+
+    side = "BUY" if ch1 >= 0 else "SELL"
+
+    # directional discipline (no counter trend)
+    if side == "BUY" and ch4 < 0:
+        await update.message.reply_text(f"{warning}❌ {sym}: 1H looks up but 4H is down. No counter-trend LONG.")
+        return
+    if side == "SELL" and ch4 > 0:
+        await update.message.reply_text(f"{warning}❌ {sym}: 1H looks down but 4H is up. No counter-trend SHORT.")
         return
 
-    side = allowed  # enforce
     entry = float(mv.last or 0.0)
     if entry <= 0:
         await update.message.reply_text(f"{warning}Invalid price for {sym}.")
         return
 
+    fut_vol = usd_notional(mv)
     conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
+
     sl, tp_single, r = sl_tp_from_atr(entry, side, atr, conf)
     if sl <= 0 or tp_single <= 0 or r <= 0:
         await update.message.reply_text(f"{warning}Could not compute ATR-based SL/TP for {sym}.")
         return
+
+    tick = tick_for_market(mv.symbol)
+    sl = quantize_price(sl, tick)
+    tp_single = quantize_price(tp_single, tick)
 
     tp1 = tp2 = None
     tp = tp_single
     if conf >= MULTI_TP_MIN_CONF:
         _tp1, _tp2, _tp3 = multi_tp_from_r(entry, side, r)
         if _tp1 > 0 and _tp2 > 0 and _tp3 > 0:
+            _tp1 = quantize_price(_tp1, tick)
+            _tp2 = quantize_price(_tp2, tick)
+            _tp3 = quantize_price(_tp3, tick)
+            _tp1, _tp2, _tp3 = enforce_distinct_tps(entry, side, _tp1, _tp2, _tp3, tick)
             tp1, tp2, tp = _tp1, _tp2, _tp3
 
     open_positions = db_get_open_positions(uid)
@@ -1651,8 +1858,9 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Open risk cap reached. Close some positions or increase your open risk cap.")
         return
 
-    if int(user["day_trade_count"]) >= int(user["max_trades_day"]):
-        await update.message.reply_text("❌ Max trades per day reached. Try again tomorrow or increase your daily limit.")
+    max_trades = int(user["max_trades_day"])
+    if int(user["day_trade_count"]) >= max_trades:
+        await update.message.reply_text(f"❌ Max trades/day reached ({max_trades}).")
         return
 
     equity = float(user["equity"])
@@ -1661,6 +1869,9 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     open_remaining = float(user["open_risk_cap"]) - open_risk
 
     trade_risk_target = compute_trade_risk_usd(user, equity, bias_line, conf)
+    if risk_override is not None:
+        trade_risk_target = risk_override
+
     risk_usd = min(trade_risk_target, daily_remaining, open_remaining)
 
     if risk_usd <= 0:
@@ -1673,7 +1884,7 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lev = suggested_leverage(notional, equity)
-    notes = "PulseFutures signal" if sig else "Manual (not in signals)"
+    notes = "PulseFutures signal" if db_get_signal(sym) else "Manual (not in signals)"
     time_stop_ts = time.time() + SETUP_TIME_STOP_HOURS * 3600
 
     db_add_position(uid, sym, side, entry, sl, tp, risk_usd, qty, notional, conf, time_stop_ts=time_stop_ts, notes=notes)
@@ -1694,7 +1905,6 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + f"{tp_line}\n"
         + f"{fmt_kv('Risk', f'${risk_usd:.2f}')}  |  {fmt_kv('Qty', f'{qty:.6g}')}  |  {fmt_kv('Notional', f'${notional:.2f}')}  |  {fmt_kv('Lev', f'{lev}x')}\n"
         + f"🧠 {bias_line}\n"
-        + f"🧭 Trend gate: {regime_label(ch24, ch4)}\n"
         + f"⏱️ Time-Stop: {SETUP_TIME_STOP_HOURS}h (Deadline: {deadline})\n"
         + f"📈 Chart: {tv_chart_url(sym)}"
     )
@@ -1787,15 +1997,15 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{fmt_kv('F Vol', '≈'+fmt_money(float(sig['fut_vol_usd'])))}  |  "
             f"{fmt_kv('24H', pct_with_emoji(float(sig['ch24'])))}  |  {fmt_kv('4H', pct_with_emoji(float(sig['ch4'])))}\n"
             f"📈 {tv_chart_url(token)}\n\n"
-            f"TradeSetup: /tradesetup {token}"
+            f"TradeSetup: /tradesetup {token}  (or /tradesetup {token} 40)"
         )
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
     else:
-        await update.message.reply_text(f"{token} not found in current PulseFutures signals.\nYou can still size risk: /tradesetup {token}")
+        await update.message.reply_text(f"{token} not found in current PulseFutures signals.\nYou can still size risk: /tradesetup {token}  (or /tradesetup {token} 40)")
 
 
 # =========================
-# EMAIL JOB (PER USER, PER MARKET SESSION)
+# EMAIL JOB (PER USER, PER SESSION)
 # =========================
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     if ALERT_LOCK.locked():
@@ -1812,28 +2022,21 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             if not users:
                 return
 
-            # compute all once (fast)
-            def _email_bundle():
-                ex = build_exchange()
-                best_fut = fetch_futures_tickers(ex)
-                if not best_fut:
-                    return None
-                bias_line = market_bias(ex, best_fut)
-                dir_up, dir_dn = compute_directional_lists(ex, best_fut)
-                setups = pick_setups(ex, best_fut)
-                return bias_line, dir_up, dir_dn, setups
-
-            bundle = await asyncio.to_thread(_email_bundle)
-            if not bundle:
+            t0 = time.time()
+            best_fut = await asyncio.to_thread(fetch_futures_tickers)
+            if not best_fut:
                 return
-            bias_line, dir_up, dir_dn, setups = bundle
 
+            bias_line = await asyncio.to_thread(market_bias, best_fut)
+            dir_up, dir_dn = await asyncio.to_thread(compute_directional_lists, best_fut)
+            setups = await asyncio.to_thread(pick_setups, best_fut)
             for s in setups:
                 db_upsert_signal(s)
+            logger.info("alert_job: market compute in %.2fs", time.time() - t0)
 
             for user in users:
                 uid = int(user["user_id"])
-                sess = active_market_session_for_user(user)
+                sess = active_session_for_user(user)
                 if not sess:
                     continue
 
@@ -1842,15 +2045,16 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     email_state_set(uid, session_key=sess["session_key"], sent_count=0, last_email_ts=0.0, last_symbols="")
                     st = email_state_get(uid)
 
-                max_emails = EMAILS_PER_SESSION_FIXED  # fixed
-                gap_min = int(user.get("email_gap_min") or DEFAULT_EMAIL_GAP_MIN)
-                gap_sec = max(0, gap_min) * 60
+                # FIXED policy
+                max_emails = MAX_EMAILS_PER_SESSION_FIXED
+                gap_min = EMAIL_GAP_MIN_FIXED
+                gap_sec = gap_min * 60
 
                 if int(st["sent_count"]) >= max_emails:
                     continue
 
                 now_ts = time.time()
-                if gap_sec > 0 and (now_ts - float(st["last_email_ts"] or 0.0)) < gap_sec:
+                if (now_ts - float(st["last_email_ts"] or 0.0)) < gap_sec:
                     continue
 
                 session_key = sess["session_key"]
@@ -1873,15 +2077,15 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
                 parts: List[str] = []
                 parts.append(HDR)
-                parts.append(f"📊 PulseFutures — {sess['name']} Session Update ({now_local} {user.get('tz')})")
+                parts.append(f"📊 PulseFutures — Session Update ({now_local} {user.get('tz')})")
                 parts.append(HDR)
                 parts.append("")
                 parts.append(bias_line)
-                parts.append(f"Session: {sess['name']} | Email {int(st['sent_count'])+1}/{max_emails} | Gap {gap_min}m")
+                parts.append(f"Session: {sess['start_str']}-{sess['end_str']} | Email {int(st['sent_count'])+1}/{max_emails} | Gap {gap_min}m")
                 parts.append("")
 
                 parts.append(SEP)
-                parts.append("🔥 Top Trade Setups (High Probability)")
+                parts.append("🔥 Top Trade Setups")
                 parts.append(SEP)
                 parts.append("")
 
@@ -1916,9 +2120,9 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 parts.append(HDR)
 
                 body = "\n".join(parts).strip()
-                subject = f"PulseFutures • {sess['name']} Setups"
+                subject = f"PulseFutures • Setups ({sess['start_str']}-{sess['end_str']})"
 
-                ok = await asyncio.to_thread(send_email, subject, body)
+                ok = await asyncio.to_thread(send_email, subject, body, None)
                 if ok:
                     email_state_set(
                         uid,
@@ -1955,17 +2159,18 @@ def main():
     app.add_handler(CommandHandler(["help", "start"], start))
     app.add_handler(CommandHandler("screen", screen))
     app.add_handler(CommandHandler("diag", diag))
+    app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("notify_on", notify_on))
     app.add_handler(CommandHandler("notify_off", notify_off))
 
     app.add_handler(CommandHandler("sessions", sessions_cmd))
     app.add_handler(CommandHandler("sessions_set", sessions_set_cmd))
-    app.add_handler(CommandHandler("emailgap", emailgap_cmd))
 
     app.add_handler(CommandHandler("equity", equity_cmd))
     app.add_handler(CommandHandler("riskmode", riskmode_cmd))
     app.add_handler(CommandHandler("dailycap", dailycap_cmd))
     app.add_handler(CommandHandler("riskauto", riskauto_cmd))
+    app.add_handler(CommandHandler("maxtrades", maxtrades_cmd))
 
     app.add_handler(CommandHandler("tradesetup", tradesetup))
     app.add_handler(CommandHandler("risk", risk_cmd))
