@@ -2,24 +2,30 @@
 """
 PulseFutures — Bybit Futures (Swap) Screener + TradeSetup + Risk Ledger
 
-✅ Latest fixes in this version:
-- /help and /start no longer use Telegram MARKDOWN (fixes: Can't parse entities)
-- Added global Telegram error handler (so bot won't die on unexpected errors)
-- Session-based email cap + min gap
-- Symbol cooldown PER SESSION (no repeat until next session)
+✅ Fixes & features in this version:
+- /help and /start are PLAIN TEXT (no Telegram Markdown parse errors)
+- Global Telegram error handler added
 - Movers/Losers min volume = $5M
-- Multi-TP fixed (TP1/TP2/TP3 won't collapse)
+- Directional Leaders/Losers naming
+- Multi-TP fixed (TP1/TP2/TP3 won’t collapse)
 - /screen faster (2 OHLCV calls per symbol: 1h + 15m)
-- Optional charts: quickchart png + TradingView link
+- Per-user sessions + per-session email cap + minimum gap between emails
+- Symbol cooldown PER SESSION (no repeats inside same session)
+- Risk per trade: percent of equity OR fixed USD
+- Daily risk cap: percent of equity OR fixed USD
+- Optional charts: QuickChart PNG + TradingView link
 
 ENV:
 - TELEGRAM_TOKEN (required)
-Email ENV (if you want emails):
+
+Email ENV (optional):
 - EMAIL_ENABLED=true/false
 - EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO
-Optional:
+
+Other optional:
 - CHECK_INTERVAL_MIN=5
 - CHART_IMG_ENABLED=true/false
+- DB_PATH=pulsefutures.db
 
 Not financial advice.
 """
@@ -281,7 +287,6 @@ def db_init():
         """
     )
 
-    # Per-user email state (session cap + gap)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS email_state (
@@ -294,7 +299,6 @@ def db_init():
         """
     )
 
-    # Symbol cooldown PER SESSION
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS emailed_symbols (
@@ -355,7 +359,7 @@ def get_user(user_id: int) -> dict:
                 DEFAULT_EQUITY,
                 1.0,
                 DEFAULT_MAX_TRADES_DAY,
-                50.0,  # legacy
+                50.0,
                 DEFAULT_OPEN_RISK_CAP_USD,
                 1 if EMAIL_ENABLED_DEFAULT else 0,
                 "Australia/Melbourne",
@@ -570,7 +574,6 @@ def db_close_position(user_id: int, symbol: str, pnl: float) -> Optional[dict]:
     return pos
 
 
-# ---------- Email State / Symbol Cooldown (PER SESSION) ----------
 def email_state_get(user_id: int) -> dict:
     con = db_connect()
     cur = con.cursor()
@@ -649,6 +652,15 @@ def safe_split_symbol(sym: Optional[str]) -> Optional[Tuple[str, str]]:
     return tuple(pair.split("/", 1))
 
 
+def usd_notional(mv: MarketVol) -> float:
+    if mv.quote in STABLES and mv.quote_vol:
+        return float(mv.quote_vol)
+    price = mv.vwap if mv.vwap else mv.last
+    if not price or not mv.base_vol:
+        return 0.0
+    return float(mv.base_vol) * float(price)
+
+
 def to_mv(t: dict) -> Optional[MarketVol]:
     sym = t.get("symbol")
     sp = safe_split_symbol(sym)
@@ -666,17 +678,6 @@ def to_mv(t: dict) -> Optional[MarketVol]:
         quote_vol=float(t.get("quoteVolume") or 0.0),
         vwap=float(t.get("vwap") or 0.0),
     )
-
-
-def usd_notional(mv: Optional[MarketVol]) -> float:
-    if not mv:
-        return 0.0
-    if mv.quote in STABLES and mv.quote_vol:
-        return float(mv.quote_vol)
-    price = mv.vwap if mv.vwap else mv.last
-    if not price or not mv.base_vol:
-        return 0.0
-    return float(mv.base_vol) * float(price)
 
 
 def fetch_futures_tickers() -> Dict[str, MarketVol]:
@@ -721,15 +722,7 @@ def compute_atr_from_ohlcv(candles: List[List[float]], period: int) -> float:
     return sum(trs[-period:]) / period
 
 
-# =========================
-# SPEED-UP METRICS (2 calls only)
-# =========================
 def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float, float]:
-    """
-    Returns (ch1, ch4, ch15, atr) using only 2 fetches:
-      - 1h candles -> ch1, ch4, atr
-      - 15m candles -> ch15
-    """
     need_1h = max(ATR_PERIOD + 5, 30)
     c1 = fetch_ohlcv(market_symbol, "1h", limit=need_1h)
     if not c1 or len(c1) < 6:
@@ -771,9 +764,6 @@ def sl_mult_from_conf(conf: int) -> float:
 
 
 def sl_tp_from_atr(entry: float, side: str, atr: float, conf: int) -> Tuple[float, float, float]:
-    """
-    returns (sl, tp_single, r_abs)
-    """
     if entry <= 0 or atr <= 0:
         return 0.0, 0.0, 0.0
 
@@ -798,11 +788,6 @@ def sl_tp_from_atr(entry: float, side: str, atr: float, conf: int) -> Tuple[floa
 
 
 def multi_tp_from_r(entry: float, side: str, r: float) -> Tuple[float, float, float]:
-    """
-    Prevent TP1/TP2/TP3 collapsing to same value when TP cap hits.
-    - cap only TP3 distance
-    - scale TP1/TP2 relative to capped TP3
-    """
     if r <= 0 or entry <= 0:
         return 0.0, 0.0, 0.0
 
@@ -811,7 +796,6 @@ def multi_tp_from_r(entry: float, side: str, r: float) -> Tuple[float, float, fl
         r1, r2, r3 = (0.8, 1.4, 2.0)
 
     maxd = (TP_MAX_PCT / 100.0) * entry
-
     d3_raw = r3 * r
     d3 = min(d3_raw, maxd)
 
@@ -1070,28 +1054,16 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
     conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
     reg = regime_label(ch24, ch4)
 
-    if USE_ATR_SLTP:
-        sl, tp_single, r = sl_tp_from_atr(entry, side, atr, conf)
-        if sl <= 0 or tp_single <= 0 or r <= 0:
-            return None
+    sl, tp_single, r = sl_tp_from_atr(entry, side, atr, conf)
+    if sl <= 0 or tp_single <= 0 or r <= 0:
+        return None
 
-        tp1 = tp2 = None
-        tp = tp_single
-
-        if conf >= MULTI_TP_MIN_CONF:
-            _tp1, _tp2, _tp3 = multi_tp_from_r(entry, side, r)
-            if _tp1 > 0 and _tp2 > 0 and _tp3 > 0:
-                tp1, tp2, tp = _tp1, _tp2, _tp3
-    else:
-        if side == "BUY":
-            sl = entry * 0.97
-            r = entry - sl
-            tp = entry + 1.4 * r
-        else:
-            sl = entry * 1.03
-            r = sl - entry
-            tp = entry - 1.4 * r
-        tp1 = tp2 = None
+    tp1 = tp2 = None
+    tp = tp_single
+    if conf >= MULTI_TP_MIN_CONF:
+        _tp1, _tp2, _tp3 = multi_tp_from_r(entry, side, r)
+        if _tp1 > 0 and _tp2 > 0 and _tp3 > 0:
+            tp1, tp2, tp = _tp1, _tp2, _tp3
 
     return Setup(
         symbol=base,
@@ -1124,9 +1096,6 @@ def pick_setups(best_fut: Dict[str, MarketVol]) -> List[Setup]:
     return setups[:SETUPS_N]
 
 
-# =========================
-# DIRECTIONAL LISTS
-# =========================
 def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tuple], List[Tuple]]:
     up = []
     dn = []
@@ -1153,9 +1122,6 @@ def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tupl
     return up, dn
 
 
-# =========================
-# SCREEN FORMATTERS
-# =========================
 def build_leaders_table(best_fut: Dict[str, MarketVol]) -> str:
     leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:LEADERS_N]
     rows = []
@@ -1273,11 +1239,6 @@ def load_sessions(user: dict) -> List[dict]:
 
 
 def active_session_for_user(user: dict) -> Optional[dict]:
-    """
-    Returns dict: {start_dt, end_dt, start_str, end_str, session_key}
-    or None if now is outside all sessions.
-    Supports overnight sessions (end <= start means ends next day).
-    """
     tz = ZoneInfo(user.get("tz") or "Australia/Melbourne")
     now = datetime.now(tz)
     sessions = load_sessions(user)
@@ -1414,7 +1375,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id is None:
         return
-    # ✅ send as plain text to avoid Markdown parse errors
     try:
         await context.bot.send_message(chat_id=chat_id, text=HELP_TEXT)
     except BadRequest:
@@ -1486,6 +1446,7 @@ async def sessions_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /sessions_set 18:00-23:30,07:00-09:00")
         return
+
     raw = " ".join(context.args).strip()
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     sessions = []
@@ -1504,7 +1465,8 @@ async def sessions_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     update_user(uid, trade_sessions=json.dumps(sessions))
-    await update.message.reply_text(f"✅ Sessions saved: {', '.join([f\"{x['start']}-{x['end']}\" for x in sessions])}")
+    saved = ", ".join([f"{x['start']}-{x['end']}" for x in sessions])
+    await update.message.reply_text(f"✅ Sessions saved: {saved}")
 
 
 async def emailcap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1904,7 +1866,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# EMAIL JOB (PER USER, PER SESSION) + SYMBOL COOLDOWN PER SESSION
+# EMAIL JOB (PER USER, PER SESSION)
 # =========================
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1934,7 +1896,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             st = email_state_get(uid)
-
             if st["session_key"] != sess["session_key"]:
                 email_state_set(uid, session_key=sess["session_key"], sent_count=0, last_email_ts=0.0, last_symbols="")
                 st = email_state_get(uid)
@@ -2028,7 +1989,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     last_email_ts=now_ts,
                     last_symbols=",".join(sorted(cur_syms)),
                 )
-
                 if SYMBOL_COOLDOWN_PER_SESSION:
                     mark_emailed_symbols_in_session(uid, session_key, [s.symbol for s in filtered_setups])
 
@@ -2041,7 +2001,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 # =========================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled exception in Telegram handler", exc_info=context.error)
-    # (optional) If you want to notify admin, you can send message here.
 
 
 # =========================
@@ -2054,7 +2013,6 @@ def main():
     db_init()
 
     app = Application.builder().token(TOKEN).build()
-
     app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler(["help", "start"], start))
