@@ -2,17 +2,19 @@
 """
 PulseFutures — Bybit Futures (Swap) Screener + TradeSetup + Risk Ledger
 
-✅ Fixes & features in this version:
-- /help and /start are PLAIN TEXT (no Telegram Markdown parse errors)
-- Global Telegram error handler added
-- Movers/Losers min volume = $5M
-- Directional Leaders/Losers naming
-- Multi-TP fixed (TP1/TP2/TP3 won’t collapse)
-- /screen faster (2 OHLCV calls per symbol: 1h + 15m)
+✅ This version fixes the 4–5 minute Telegram lag by:
+- Moving ALL heavy CCXT/network/chart work to background threads via asyncio.to_thread()
+- Adding an asyncio.Lock so alert_job never overlaps itself
+- Keeping /help plain text (no Telegram Markdown entity errors)
+- Adding a global error handler
+
+Also includes:
+- Directional Leaders / Losers (24H ±10%, min futures vol >= $5M, optional 4H align)
+- Multi-TP fixed (TP1/TP2/TP3 won’t be equal)
 - Per-user sessions + per-session email cap + minimum gap between emails
 - Symbol cooldown PER SESSION (no repeats inside same session)
-- Risk per trade: percent of equity OR fixed USD
-- Daily risk cap: percent of equity OR fixed USD
+- Risk per trade: % of equity OR fixed USD
+- Daily cap: % of equity OR fixed USD
 - Optional charts: QuickChart PNG + TradingView link
 
 ENV:
@@ -30,6 +32,7 @@ Other optional:
 Not financial advice.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -156,6 +159,10 @@ CHART_BARS = int(os.environ.get("CHART_BARS", "120"))
 CHART_WIDTH = int(os.environ.get("CHART_WIDTH", "900"))
 CHART_HEIGHT = int(os.environ.get("CHART_HEIGHT", "500"))
 
+# Perf knobs (to keep bot snappy)
+CHART_ATTACH_TOP_N = int(os.environ.get("CHART_ATTACH_TOP_N", "1"))   # for EMAIL attachments
+CHART_ATTACH_MIN_CONF = int(os.environ.get("CHART_ATTACH_MIN_CONF", "80"))
+
 HDR = "━━━━━━━━━━━━━━━━━━━━"
 SEP = "────────────────────"
 
@@ -163,6 +170,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pulsefutures")
 
 STABLES = {"USDT", "USDC", "USD", "TUSD", "FDUSD", "DAI", "PYUSD"}
+
+# Prevent overlapping alert_job runs
+ALERT_LOCK = asyncio.Lock()
 
 
 # =========================
@@ -1616,17 +1626,17 @@ async def riskauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    best_fut = fetch_futures_tickers()
+    # ✅ heavy work in threads to keep Telegram instant
+    best_fut = await asyncio.to_thread(fetch_futures_tickers)
     if not best_fut:
         await update.message.reply_text("Error: could not fetch futures tickers.")
         return
 
-    bias_line = market_bias(best_fut)
+    bias_line = await asyncio.to_thread(market_bias, best_fut)
+    leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
+    dir_up_txt, dir_dn_txt = await asyncio.to_thread(build_movers_tables, best_fut)
 
-    leaders_txt = build_leaders_table(best_fut)
-    dir_up_txt, dir_dn_txt = build_movers_tables(best_fut)
-
-    setups = pick_setups(best_fut)
+    setups = await asyncio.to_thread(pick_setups, best_fut)
     for s in setups:
         db_upsert_signal(s)
 
@@ -1655,8 +1665,9 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
+    # Optional chart images: do NOT block loop
     for s in setups:
-        png = build_chart_png_for_market(s.symbol, s.market_symbol)
+        png = await asyncio.to_thread(build_chart_png_for_market, s.symbol, s.market_symbol)
         if png:
             cap = f"{s.symbol} • {s.side} • Conf {s.conf}/100 • {CHART_TIMEFRAME}"
             await context.bot.send_photo(chat_id=update.effective_chat.id, photo=BytesIO(png), caption=cap)
@@ -1680,16 +1691,16 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not sig:
         warning = f"⚠️ {sym} is not in current PulseFutures signals. You can still use TradeSetup for sizing, but responsibility is yours.\n\n"
 
-    best_fut = fetch_futures_tickers()
+    best_fut = await asyncio.to_thread(fetch_futures_tickers)
     mv = best_fut.get(sym)
     if not mv:
         await update.message.reply_text(f"{warning}Could not find {sym} on Bybit futures.")
         return
 
-    bias_line = market_bias(best_fut)
+    bias_line = await asyncio.to_thread(market_bias, best_fut)
 
     ch24 = float(mv.percentage or 0.0)
-    ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol)
+    ch1, ch4, ch15, atr = await asyncio.to_thread(metrics_from_candles_1h_15m, mv.symbol)
 
     side = "BUY" if ch1 >= 0 else "SELL"
 
@@ -1769,7 +1780,7 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📈 Chart (TV)", url=tv_chart_url(sym))]])
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb, disable_web_page_preview=True)
 
-    png = build_chart_png_for_market(sym, mv.symbol)
+    png = await asyncio.to_thread(build_chart_png_for_market, sym, mv.symbol)
     if png:
         await context.bot.send_photo(chat_id=update.effective_chat.id, photo=BytesIO(png), caption=f"{sym} • {CHART_TIMEFRAME}")
 
@@ -1869,131 +1880,142 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # EMAIL JOB (PER USER, PER SESSION)
 # =========================
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not EMAIL_ENABLED_DEFAULT:
-            return
-        if not email_config_ok():
-            return
+    # ✅ no overlap: if running, skip
+    if ALERT_LOCK.locked():
+        return
 
-        users = list_users_notify_on()
-        if not users:
-            return
+    async with ALERT_LOCK:
+        try:
+            if not EMAIL_ENABLED_DEFAULT:
+                return
+            if not email_config_ok():
+                return
 
-        best_fut = fetch_futures_tickers()
-        if not best_fut:
-            return
+            users = list_users_notify_on()
+            if not users:
+                return
 
-        bias_line = market_bias(best_fut)
-        dir_up, dir_dn = compute_directional_lists(best_fut)
-        setups = pick_setups(best_fut)
-        for s in setups:
-            db_upsert_signal(s)
-
-        for user in users:
-            uid = int(user["user_id"])
-            sess = active_session_for_user(user)
-            if not sess:
-                continue
-
-            st = email_state_get(uid)
-            if st["session_key"] != sess["session_key"]:
-                email_state_set(uid, session_key=sess["session_key"], sent_count=0, last_email_ts=0.0, last_symbols="")
-                st = email_state_get(uid)
-
-            max_emails = int(user.get("max_emails_per_session") or DEFAULT_MAX_EMAILS_PER_SESSION)
-            gap_min = int(user.get("email_gap_min") or DEFAULT_EMAIL_GAP_MIN)
-            gap_sec = max(0, gap_min) * 60
-
-            if int(st["sent_count"]) >= max_emails:
-                continue
-
-            now_ts = time.time()
-            if gap_sec > 0 and (now_ts - float(st["last_email_ts"] or 0.0)) < gap_sec:
-                continue
-
-            session_key = sess["session_key"]
-            filtered_setups: List[Setup] = []
+            # ✅ heavy work in threads
+            t0 = time.time()
+            best_fut = await asyncio.to_thread(fetch_futures_tickers)
+            if not best_fut:
+                return
+            bias_line = await asyncio.to_thread(market_bias, best_fut)
+            dir_up, dir_dn = await asyncio.to_thread(compute_directional_lists, best_fut)
+            setups = await asyncio.to_thread(pick_setups, best_fut)
             for s in setups:
-                if SYMBOL_COOLDOWN_PER_SESSION and has_emailed_symbol_in_session(uid, session_key, s.symbol):
+                db_upsert_signal(s)
+            logger.info("alert_job: market compute in %.2fs", time.time() - t0)
+
+            for user in users:
+                uid = int(user["user_id"])
+                sess = active_session_for_user(user)
+                if not sess:
                     continue
-                filtered_setups.append(s)
 
-            if not filtered_setups:
-                continue
+                st = email_state_get(uid)
+                if st["session_key"] != sess["session_key"]:
+                    email_state_set(uid, session_key=sess["session_key"], sent_count=0, last_email_ts=0.0, last_symbols="")
+                    st = email_state_get(uid)
 
-            last_syms = set([x for x in (st["last_symbols"] or "").split(",") if x])
-            cur_syms = set([s.symbol for s in filtered_setups])
-            if cur_syms and cur_syms == last_syms:
-                continue
+                max_emails = int(user.get("max_emails_per_session") or DEFAULT_MAX_EMAILS_PER_SESSION)
+                gap_min = int(user.get("email_gap_min") or DEFAULT_EMAIL_GAP_MIN)
+                gap_sec = max(0, gap_min) * 60
 
-            attachments = []
-            for s in filtered_setups:
-                png = build_chart_png_for_market(s.symbol, s.market_symbol)
-                if png:
-                    attachments.append((f"chart_{s.symbol}_{CHART_TIMEFRAME}.png", png, "image/png"))
+                if int(st["sent_count"]) >= max_emails:
+                    continue
 
-            tz = ZoneInfo(user.get("tz") or "Australia/Melbourne")
-            now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+                now_ts = time.time()
+                if gap_sec > 0 and (now_ts - float(st["last_email_ts"] or 0.0)) < gap_sec:
+                    continue
 
-            parts: List[str] = []
-            parts.append(HDR)
-            parts.append(f"📊 PulseFutures — Session Update ({now_local} {user.get('tz')})")
-            parts.append(HDR)
-            parts.append("")
-            parts.append(bias_line)
-            parts.append(f"Session: {sess['start_str']}-{sess['end_str']} | Email {int(st['sent_count'])+1}/{max_emails} | Gap {gap_min}m")
-            parts.append("")
+                session_key = sess["session_key"]
+                filtered_setups: List[Setup] = []
+                for s in setups:
+                    if SYMBOL_COOLDOWN_PER_SESSION and has_emailed_symbol_in_session(uid, session_key, s.symbol):
+                        continue
+                    filtered_setups.append(s)
 
-            parts.append(SEP)
-            parts.append("🔥 Top Trade Setups")
-            parts.append(SEP)
-            parts.append("")
+                if not filtered_setups:
+                    continue
 
-            for i, s in enumerate(filtered_setups, 1):
-                parts.append(f"{i}) {format_setup_email_block_pretty(s)}")
+                last_syms = set([x for x in (st["last_symbols"] or "").split(",") if x])
+                cur_syms = set([s.symbol for s in filtered_setups])
+                if cur_syms and cur_syms == last_syms:
+                    continue
+
+                # ✅ charts are heavy: only attach top N and only if conf >= threshold
+                attachments = []
+                attach_pool = [s for s in filtered_setups if s.conf >= CHART_ATTACH_MIN_CONF][:CHART_ATTACH_TOP_N]
+                for s in attach_pool:
+                    png = await asyncio.to_thread(build_chart_png_for_market, s.symbol, s.market_symbol)
+                    if png:
+                        attachments.append((f"chart_{s.symbol}_{CHART_TIMEFRAME}.png", png, "image/png"))
+
+                tz = ZoneInfo(user.get("tz") or "Australia/Melbourne")
+                now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+
+                parts: List[str] = []
+                parts.append(HDR)
+                parts.append(f"📊 PulseFutures — Session Update ({now_local} {user.get('tz')})")
+                parts.append(HDR)
                 parts.append("")
-                parts.append(SEP)
-
-            if INCLUDE_MOVERS_IN_EMAIL:
+                parts.append(bias_line)
+                parts.append(f"Session: {sess['start_str']}-{sess['end_str']} | Email {int(st['sent_count'])+1}/{max_emails} | Gap {gap_min}m")
                 parts.append("")
-                parts.append("📈 Directional Leaders (Top 5)")
+
                 parts.append(SEP)
-                if dir_up:
-                    for b, v, c24, c4, _ in dir_up[:EMAIL_MOVERS_TOP_N]:
-                        parts.append(f"{b:<6} {pct_with_emoji(c24)} | 4H {pct_with_emoji(c4)} | F~{fmt_money(v)}")
-                else:
-                    parts.append("None")
+                parts.append("🔥 Top Trade Setups")
+                parts.append(SEP)
+                parts.append("")
+
+                for i, s in enumerate(filtered_setups, 1):
+                    parts.append(f"{i}) {format_setup_email_block_pretty(s)}")
+                    parts.append("")
+                    parts.append(SEP)
+
+                if INCLUDE_MOVERS_IN_EMAIL:
+                    parts.append("")
+                    parts.append("📈 Directional Leaders (Top 5)")
+                    parts.append(SEP)
+                    if dir_up:
+                        for b, v, c24, c4, _ in dir_up[:EMAIL_MOVERS_TOP_N]:
+                            parts.append(f"{b:<6} {pct_with_emoji(c24)} | 4H {pct_with_emoji(c4)} | F~{fmt_money(v)}")
+                    else:
+                        parts.append("None")
+
+                    parts.append("")
+                    parts.append("📉 Directional Losers (Top 5)")
+                    parts.append(SEP)
+                    if dir_dn:
+                        for b, v, c24, c4, _ in dir_dn[:EMAIL_MOVERS_TOP_N]:
+                            parts.append(f"{b:<6} {pct_with_emoji(c24)} | 4H {pct_with_emoji(c4)} | F~{fmt_money(v)}")
+                    else:
+                        parts.append("None")
 
                 parts.append("")
-                parts.append("📉 Directional Losers (Top 5)")
-                parts.append(SEP)
-                if dir_dn:
-                    for b, v, c24, c4, _ in dir_dn[:EMAIL_MOVERS_TOP_N]:
-                        parts.append(f"{b:<6} {pct_with_emoji(c24)} | 4H {pct_with_emoji(c4)} | F~{fmt_money(v)}")
-                else:
-                    parts.append("None")
+                parts.append(HDR)
+                parts.append("This is not financial advice.")
+                parts.append("PulseFutures • Bybit Futures")
+                parts.append(HDR)
 
-            parts.append("")
-            parts.append(HDR)
-            parts.append("This is not financial advice.")
-            parts.append("PulseFutures • Bybit Futures")
-            parts.append(HDR)
+                body = "\n".join(parts).strip()
+                subject = f"PulseFutures • Setups ({sess['start_str']}-{sess['end_str']})"
 
-            body = "\n".join(parts).strip()
-            subject = f"PulseFutures • Setups ({sess['start_str']}-{sess['end_str']})"
+                # ✅ send_email is blocking IO -> thread it too
+                ok = await asyncio.to_thread(send_email, subject, body, attachments)
+                if ok:
+                    email_state_set(
+                        uid,
+                        sent_count=int(st["sent_count"]) + 1,
+                        last_email_ts=now_ts,
+                        last_symbols=",".join(sorted(cur_syms)),
+                    )
+                    if SYMBOL_COOLDOWN_PER_SESSION:
+                        mark_emailed_symbols_in_session(uid, session_key, [s.symbol for s in filtered_setups])
 
-            if send_email(subject, body, attachments=attachments):
-                email_state_set(
-                    uid,
-                    sent_count=int(st["sent_count"]) + 1,
-                    last_email_ts=now_ts,
-                    last_symbols=",".join(sorted(cur_syms)),
-                )
-                if SYMBOL_COOLDOWN_PER_SESSION:
-                    mark_emailed_symbols_in_session(uid, session_key, [s.symbol for s in filtered_setups])
-
-    except Exception as e:
-        logger.exception("alert_job error: %s", e)
+        except Exception as e:
+            logger.exception("alert_job error: %s", e)
 
 
 # =========================
@@ -2039,7 +2061,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     if getattr(app, "job_queue", None):
-        app.job_queue.run_repeating(alert_job, interval=CHECK_INTERVAL_MIN * 60, first=10)
+        app.job_queue.run_repeating(alert_job, interval=CHECK_INTERVAL_MIN * 60, first=10, name="alert_job")
     else:
         logger.warning('JobQueue not available. Install "python-telegram-bot[job-queue]>=20.7,<22.0"')
 
