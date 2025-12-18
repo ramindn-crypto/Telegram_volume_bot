@@ -2,48 +2,24 @@
 """
 PulseFutures — Bybit Futures (Swap) Screener + TradeSetup + Risk Ledger
 
-✅ Your latest requirements (implemented)
-1) Multi-user: each user has their own timezone + trading session(s)
-2) Email limiting is PER SESSION (not per 24h):
-   - max emails per session (default 3, user-configurable)
-   - min gap between emails inside session (default 60 min, user-configurable)
-3) NO symbol repetition until NEXT SESSION:
-   - if a symbol was emailed once in a session, it will NOT be emailed again in the same session
-   - next session -> allowed again (for that user)
-4) Email + Telegram: include chart (generated image) for setups:
-   - Telegram: sends QuickChart PNG after /screen and /tradesetup
-   - Email: attaches QuickChart PNG(s) for setup symbols
-5) Movers / Strong movers: min futures volume 5M USD
-6) Prettier email + nicer Telegram formatting
-7) /help fixed and reliable
+✅ Latest fixes in this version:
+- /help and /start no longer use Telegram MARKDOWN (fixes: Can't parse entities)
+- Added global Telegram error handler (so bot won't die on unexpected errors)
+- Session-based email cap + min gap
+- Symbol cooldown PER SESSION (no repeat until next session)
+- Movers/Losers min volume = $5M
+- Multi-TP fixed (TP1/TP2/TP3 won't collapse)
+- /screen faster (2 OHLCV calls per symbol: 1h + 15m)
+- Optional charts: quickchart png + TradingView link
 
-Commands:
-- /help, /start
-- /screen
-- /tradesetup BTC   (or /risk BTC)
-- /open
-- /closepnl BTC +23.5
-
-Session/email controls:
-- /sessions
-- /sessions_set 18:00-23:30,07:00-09:00
-- /emailcap 3
-- /emailgap 60
-
-Risk controls:
-- /equity 1000
-- /riskmode pct 2.5   | /riskmode usd 25 | /riskmode
-- /dailycap pct 5     | /dailycap usd 60 | /dailycap
-- /riskauto on|off
-- /limits 3 50 75 (legacy)
-
-Env:
+ENV:
 - TELEGRAM_TOKEN (required)
-
-Email env:
+Email ENV (if you want emails):
 - EMAIL_ENABLED=true/false
 - EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO
+Optional:
 - CHECK_INTERVAL_MIN=5
+- CHART_IMG_ENABLED=true/false
 
 Not financial advice.
 """
@@ -69,6 +45,7 @@ import ccxt
 from tabulate import tabulate
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -95,7 +72,7 @@ MOVER_DN_24H_MAX = -10.0
 
 # 4H alignment for Directional Leaders/Losers
 MOVER_4H_TREND_FILTER = os.environ.get("MOVER_4H_TREND_FILTER", "true").lower() == "true"
-MOVER_4H_ALIGN_MIN = float(os.environ.get("MOVER_4H_ALIGN_MIN", "1.0"))  # +1% / -1%
+MOVER_4H_ALIGN_MIN = float(os.environ.get("MOVER_4H_ALIGN_MIN", "1.0"))
 
 # Setups thresholds
 TRIGGER_1H_ABS_MIN = 2.0
@@ -107,11 +84,11 @@ DEFAULT_EQUITY = 1000.0
 DEFAULT_MAX_TRADES_DAY = 3
 DEFAULT_OPEN_RISK_CAP_USD = 75.0
 
-# Risk controls (new)
+# Risk controls
 DEFAULT_RISK_MODE = "PCT"       # PCT or USD
-DEFAULT_RISK_VALUE = 1.5        # if PCT -> 1.5% per trade, if USD -> $ value
+DEFAULT_RISK_VALUE = 1.5        # if PCT -> % per trade, if USD -> $ value
 DEFAULT_DAILY_CAP_MODE = "PCT"  # PCT or USD
-DEFAULT_DAILY_CAP_VALUE = 4.5   # if PCT -> 4.5% per day, if USD -> $ value
+DEFAULT_DAILY_CAP_VALUE = 4.5   # if PCT -> % per day, if USD -> $ value
 DEFAULT_RISK_AUTO = 0           # OFF by default
 
 # Time-stop
@@ -129,8 +106,9 @@ TP_ALLOCS = (40, 40, 20)
 
 try:
     _rm = os.environ.get("TP_R_MULTS", "0.8,1.4,2.0")
-    _t = tuple(float(x.strip()) for x in _rm.split(","))
-    TP_R_MULTS = _t if len(_t) == 3 else (0.8, 1.4, 2.0)
+    TP_R_MULTS = tuple(float(x.strip()) for x in _rm.split(","))
+    if len(TP_R_MULTS) != 3:
+        TP_R_MULTS = (0.8, 1.4, 2.0)
 except Exception:
     TP_R_MULTS = (0.8, 1.4, 2.0)
 
@@ -152,7 +130,7 @@ DEFAULT_SESSIONS = [{"start": "18:00", "end": "23:30"}]  # user local time
 DEFAULT_MAX_EMAILS_PER_SESSION = int(os.environ.get("DEFAULT_MAX_EMAILS_PER_SESSION", "3"))
 DEFAULT_EMAIL_GAP_MIN = int(os.environ.get("DEFAULT_EMAIL_GAP_MIN", "60"))  # minutes
 
-# Symbol cooldown: don't email same symbol again UNTIL NEXT SESSION (per user)
+# Symbol cooldown PER SESSION (no repeats inside same session)
 SYMBOL_COOLDOWN_PER_SESSION = True
 
 # Market bias
@@ -316,10 +294,10 @@ def db_init():
         """
     )
 
-    # Session-based symbol cooldown (NEW TABLE NAME to avoid DB migration issues)
+    # Symbol cooldown PER SESSION
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS emailed_symbols_session (
+        CREATE TABLE IF NOT EXISTS emailed_symbols (
             user_id INTEGER NOT NULL,
             session_key TEXT NOT NULL,
             symbol TEXT NOT NULL,
@@ -592,7 +570,7 @@ def db_close_position(user_id: int, symbol: str, pnl: float) -> Optional[dict]:
     return pos
 
 
-# ---------- Email State / Session-based Symbol Cooldown ----------
+# ---------- Email State / Symbol Cooldown (PER SESSION) ----------
 def email_state_get(user_id: int) -> dict:
     con = db_connect()
     cur = con.cursor()
@@ -626,7 +604,7 @@ def has_emailed_symbol_in_session(user_id: int, session_key: str, symbol: str) -
     con = db_connect()
     cur = con.cursor()
     cur.execute(
-        "SELECT 1 FROM emailed_symbols_session WHERE user_id=? AND session_key=? AND symbol=?",
+        "SELECT 1 FROM emailed_symbols WHERE user_id=? AND session_key=? AND symbol=?",
         (user_id, session_key, symbol.upper()),
     )
     row = cur.fetchone()
@@ -641,7 +619,7 @@ def mark_emailed_symbols_in_session(user_id: int, session_key: str, symbols: Lis
     cur = con.cursor()
     for sym in symbols:
         cur.execute(
-            "INSERT OR IGNORE INTO emailed_symbols_session (user_id, session_key, symbol) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO emailed_symbols (user_id, session_key, symbol) VALUES (?, ?, ?)",
             (user_id, session_key, sym.upper()),
         )
     con.commit()
@@ -821,9 +799,9 @@ def sl_tp_from_atr(entry: float, side: str, atr: float, conf: int) -> Tuple[floa
 
 def multi_tp_from_r(entry: float, side: str, r: float) -> Tuple[float, float, float]:
     """
-    FIX: prevent TP1/TP2/TP3 collapsing to same value when TP_MAX_PCT cap is hit.
+    Prevent TP1/TP2/TP3 collapsing to same value when TP cap hits.
     - cap only TP3 distance
-    - scale TP1/TP2 based on capped TP3 ratio
+    - scale TP1/TP2 relative to capped TP3
     """
     if r <= 0 or entry <= 0:
         return 0.0, 0.0, 0.0
@@ -1390,47 +1368,40 @@ def format_setup_email_block_pretty(s: Setup) -> str:
 
 
 # =========================
-# HELP
+# HELP (PLAIN TEXT — NO MARKDOWN)
 # =========================
 HELP_TEXT = """\
-**PulseFutures — Commands**
-**Market**
-- /screen — Market Leaders + Directional Leaders/Losers + Top Setups
+PulseFutures — Commands
 
-**Email Session Controls (per user)**
-- /sessions — Show your trading sessions
-- /sessions_set 18:00-23:30,07:00-09:00 — Set sessions (your local time)
-- /emailcap 3 — Max emails per session
-- /emailgap 60 — Min gap between emails (minutes)
+Market
+- /screen  => Market Leaders + Directional Leaders/Losers + Top Setups
 
-**Risk & Trading**
-- /equity <amount> — Set equity (e.g., /equity 1000)
+Email Session Controls (per user)
+- /sessions
+- /sessions_set 18:00-23:30,07:00-09:00
+- /emailcap 3
+- /emailgap 60
 
-- /riskmode pct <percent> — Risk per trade as % (e.g., /riskmode pct 2.5)
-- /riskmode usd <amount>  — Risk per trade as USD (e.g., /riskmode usd 25)
-- /riskmode               — Show risk settings
+Risk & Trading
+- /equity 1000
+- /riskmode pct 2.5
+- /riskmode usd 25
+- /dailycap pct 5
+- /dailycap usd 60
+- /riskauto on|off
+- /tradesetup BTC
+- /risk BTC
+- /open
+- /closepnl BTC +23.5
 
-- /dailycap pct <percent> — Daily risk cap as % (e.g., /dailycap pct 5)
-- /dailycap usd <amount>  — Daily risk cap as USD (e.g., /dailycap usd 60)
-- /dailycap               — Show daily cap
+Alerts
+- /notify_on
+- /notify_off
+- /diag
 
-- /riskauto on|off — Auto-adjust risk (MIXED -> 0.7x, Conf>=85 -> 1.1x)
-
-- /limits <maxTradesPerDay> <dailyRiskCapUSD> <openRiskCapUSD>
-  (Legacy: sets daily cap to USD mode)
-
-- /tradesetup <SYMBOL> — TradeSetup with your risk rules
-- /risk <SYMBOL> — Same as /tradesetup
-- /open — Show open positions
-- /closepnl <SYMBOL> <pnlUSD> — Close position + update equity
-
-**Alerts**
-- /notify_on /notify_off — Email alerts (if configured)
-- /diag — Diagnostics
-
-**Notes**
+Notes
 - Emails only send inside YOUR sessions.
-- A symbol that was emailed in the current session will not repeat until your next session.
+- A symbol emailed once in a session will NOT be emailed again until the NEXT session.
 - Not financial advice.
 """
 
@@ -1443,7 +1414,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id is None:
         return
-    await context.bot.send_message(chat_id=chat_id, text=HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+    # ✅ send as plain text to avoid Markdown parse errors
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=HELP_TEXT)
+    except BadRequest:
+        await context.bot.send_message(chat_id=chat_id, text=re.sub(r"[*_`]", "", HELP_TEXT))
 
 
 async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1482,7 +1457,7 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- Time-stop: {SETUP_TIME_STOP_HOURS}h\n"
         f"- TP cap: {TP_MAX_PCT}%\n"
         f"- Multi-TP: Conf >= {MULTI_TP_MIN_CONF} | TP R-mults {TP_R_MULTS}\n"
-        f"- Symbol cooldown (per session): {'ON' if SYMBOL_COOLDOWN_PER_SESSION else 'OFF'}\n"
+        f"- Symbol cooldown: {'PER SESSION' if SYMBOL_COOLDOWN_PER_SESSION else 'OFF'}\n"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -1529,8 +1504,7 @@ async def sessions_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     update_user(uid, trade_sessions=json.dumps(sessions))
-    pretty = ", ".join([f"{x['start']}-{x['end']}" for x in sessions])
-    await update.message.reply_text(f"✅ Sessions saved: {pretty}")
+    await update.message.reply_text(f"✅ Sessions saved: {', '.join([f\"{x['start']}-{x['end']}\" for x in sessions])}")
 
 
 async def emailcap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1679,27 +1653,6 @@ async def riskauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Risk auto: {'ON' if val==1 else 'OFF'}")
 
 
-async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user = get_user(uid)
-    if len(context.args) != 3:
-        await update.message.reply_text(
-            f"Usage: /limits <maxTradesDay> <dailyRiskCapUSD> <openRiskCapUSD>\n"
-            f"Current: max/day={user['max_trades_day']} | daily_cap_mode={user.get('daily_cap_mode')} {user.get('daily_cap_value')} | open_cap=${float(user['open_risk_cap']):.2f}"
-        )
-        return
-    try:
-        max_trades = int(context.args[0])
-        daily_cap_usd = float(context.args[1])
-        open_cap = float(context.args[2])
-        if max_trades < 1 or daily_cap_usd < 0 or open_cap < 0:
-            raise ValueError()
-        update_user(uid, max_trades_day=max_trades, daily_cap_mode="USD", daily_cap_value=daily_cap_usd, open_risk_cap=open_cap)
-        await update.message.reply_text(f"✅ Limits updated: max/day={max_trades}, daily cap=USD ${daily_cap_usd:.2f}, open cap=USD ${open_cap:.2f}")
-    except Exception:
-        await update.message.reply_text("Usage: /limits 3 50 75")
-
-
 async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     best_fut = fetch_futures_tickers()
     if not best_fut:
@@ -1740,7 +1693,6 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
-    # Send charts after message (so user sees results fast)
     for s in setups:
         png = build_chart_png_for_market(s.symbol, s.market_symbol)
         if png:
@@ -1748,18 +1700,15 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_photo(chat_id=update.effective_chat.id, photo=BytesIO(png), caption=cap)
 
 
-def parse_symbol_from_args(args: List[str]) -> Optional[str]:
-    if not args:
-        return None
-    token = re.sub(r"[^A-Za-z0-9]", "", args[0]).upper().lstrip("$")
-    return token if token else None
-
-
 async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = reset_daily_counters_if_needed(get_user(uid))
 
-    sym = parse_symbol_from_args(context.args)
+    if not context.args:
+        await update.message.reply_text("Usage: /tradesetup BTC")
+        return
+
+    sym = re.sub(r"[^A-Za-z0-9]", "", context.args[0]).upper().lstrip("$")
     if not sym:
         await update.message.reply_text("Usage: /tradesetup BTC")
         return
@@ -1790,27 +1739,17 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fut_vol = usd_notional(mv)
     conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
 
-    if USE_ATR_SLTP:
-        sl, tp_single, r = sl_tp_from_atr(entry, side, atr, conf)
-        if sl <= 0 or tp_single <= 0 or r <= 0:
-            await update.message.reply_text(f"{warning}Could not compute ATR-based SL/TP for {sym}.")
-            return
-        tp1 = tp2 = None
-        tp = tp_single
-        if conf >= MULTI_TP_MIN_CONF:
-            _tp1, _tp2, _tp3 = multi_tp_from_r(entry, side, r)
-            if _tp1 > 0 and _tp2 > 0 and _tp3 > 0:
-                tp1, tp2, tp = _tp1, _tp2, _tp3
-    else:
-        if side == "BUY":
-            sl = entry * 0.97
-            r = entry - sl
-            tp = entry + 1.4 * r
-        else:
-            sl = entry * 1.03
-            r = sl - entry
-            tp = entry - 1.4 * r
-        tp1 = tp2 = None
+    sl, tp_single, r = sl_tp_from_atr(entry, side, atr, conf)
+    if sl <= 0 or tp_single <= 0 or r <= 0:
+        await update.message.reply_text(f"{warning}Could not compute ATR-based SL/TP for {sym}.")
+        return
+
+    tp1 = tp2 = None
+    tp = tp_single
+    if conf >= MULTI_TP_MIN_CONF:
+        _tp1, _tp2, _tp3 = multi_tp_from_r(entry, side, r)
+        if _tp1 > 0 and _tp2 > 0 and _tp3 > 0:
+            tp1, tp2, tp = _tp1, _tp2, _tp3
 
     open_positions = db_get_open_positions(uid)
     open_risk = sum(float(p["risk_usd"]) for p in open_positions)
@@ -1841,10 +1780,9 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lev = suggested_leverage(notional, equity)
     notes = "PulseFutures signal" if db_get_signal(sym) else "Manual (not in signals)"
-
     time_stop_ts = time.time() + SETUP_TIME_STOP_HOURS * 3600
-    db_add_position(uid, sym, side, entry, sl, tp, risk_usd, qty, notional, conf, time_stop_ts=time_stop_ts, notes=notes)
 
+    db_add_position(uid, sym, side, entry, sl, tp, risk_usd, qty, notional, conf, time_stop_ts=time_stop_ts, notes=notes)
     update_user(uid, day_trade_count=int(user["day_trade_count"]) + 1, daily_risk_used=float(user["daily_risk_used"]) + risk_usd)
 
     tz = ZoneInfo(user.get("tz") or "Australia/Melbourne")
@@ -1855,13 +1793,6 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         tp_line = f"TP {fmt_price(tp)}"
 
-    rm = (user.get("risk_mode") or DEFAULT_RISK_MODE).upper()
-    rv = float(user.get("risk_value") or DEFAULT_RISK_VALUE)
-    dc_m = (user.get("daily_cap_mode") or DEFAULT_DAILY_CAP_MODE).upper()
-    dc_v = float(user.get("daily_cap_value") or DEFAULT_DAILY_CAP_VALUE)
-    risk_auto_txt = "ON" if int(user.get("risk_auto") or 0) == 1 else "OFF"
-    settings_line = f"🎛️ Risk: {rm} {rv:.2f} | DailyCap: {dc_m} {dc_v:.2f} | Auto: {risk_auto_txt}"
-
     msg = (
         warning
         + f"✅ *TradeSetup* — *{side} {sym}*  •  Conf *{conf}/100*\n"
@@ -1869,7 +1800,6 @@ async def tradesetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + f"{tp_line}\n"
         + f"{fmt_kv('Risk', f'${risk_usd:.2f}')}  |  {fmt_kv('Qty', f'{qty:.6g}')}  |  {fmt_kv('Notional', f'${notional:.2f}')}  |  {fmt_kv('Lev', f'{lev}x')}\n"
         + f"🧠 {bias_line}\n"
-        + f"{settings_line}\n"
         + f"⏱️ Time-Stop: {SETUP_TIME_STOP_HOURS}h (Deadline: {deadline})\n"
         + f"📈 Chart: {tv_chart_url(sym)}"
     )
@@ -1921,7 +1851,7 @@ async def closepnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /closepnl BTC +23.5")
         return
-    sym = parse_symbol_from_args([context.args[0]])
+    sym = re.sub(r"[^A-Za-z0-9]", "", context.args[0]).upper().lstrip("$")
     if not sym:
         await update.message.reply_text("Usage: /closepnl BTC +23.5")
         return
@@ -1987,7 +1917,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not users:
             return
 
-        # Compute market scan ONCE per tick (shared across all users)
         best_fut = fetch_futures_tickers()
         if not best_fut:
             return
@@ -1998,19 +1927,16 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         for s in setups:
             db_upsert_signal(s)
 
-        # For each user: decide independently
         for user in users:
             uid = int(user["user_id"])
             sess = active_session_for_user(user)
             if not sess:
-                continue  # outside user's sessions
+                continue
 
-            session_key = sess["session_key"]
             st = email_state_get(uid)
 
-            # Reset counters when session changes
-            if st["session_key"] != session_key:
-                email_state_set(uid, session_key=session_key, sent_count=0, last_email_ts=0.0, last_symbols="")
+            if st["session_key"] != sess["session_key"]:
+                email_state_set(uid, session_key=sess["session_key"], sent_count=0, last_email_ts=0.0, last_symbols="")
                 st = email_state_get(uid)
 
             max_emails = int(user.get("max_emails_per_session") or DEFAULT_MAX_EMAILS_PER_SESSION)
@@ -2024,7 +1950,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             if gap_sec > 0 and (now_ts - float(st["last_email_ts"] or 0.0)) < gap_sec:
                 continue
 
-            # Symbol cooldown UNTIL NEXT SESSION (per user)
+            session_key = sess["session_key"]
             filtered_setups: List[Setup] = []
             for s in setups:
                 if SYMBOL_COOLDOWN_PER_SESSION and has_emailed_symbol_in_session(uid, session_key, s.symbol):
@@ -2034,20 +1960,17 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             if not filtered_setups:
                 continue
 
-            # Dedupe within session by symbol set (so same set won't email again)
             last_syms = set([x for x in (st["last_symbols"] or "").split(",") if x])
             cur_syms = set([s.symbol for s in filtered_setups])
             if cur_syms and cur_syms == last_syms:
                 continue
 
-            # Build attachments (charts) for setups being emailed
             attachments = []
             for s in filtered_setups:
                 png = build_chart_png_for_market(s.symbol, s.market_symbol)
                 if png:
                     attachments.append((f"chart_{s.symbol}_{CHART_TIMEFRAME}.png", png, "image/png"))
 
-            # Email body
             tz = ZoneInfo(user.get("tz") or "Australia/Melbourne")
             now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
@@ -2106,12 +2029,19 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     last_symbols=",".join(sorted(cur_syms)),
                 )
 
-                # Mark symbols as emailed in THIS SESSION (cooldown per session)
                 if SYMBOL_COOLDOWN_PER_SESSION:
                     mark_emailed_symbols_in_session(uid, session_key, [s.symbol for s in filtered_setups])
 
     except Exception as e:
         logger.exception("alert_job error: %s", e)
+
+
+# =========================
+# GLOBAL ERROR HANDLER
+# =========================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception in Telegram handler", exc_info=context.error)
+    # (optional) If you want to notify admin, you can send message here.
 
 
 # =========================
@@ -2125,9 +2055,9 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # IMPORTANT: add help/start early + robust
-    app.add_handler(CommandHandler(["help", "start"], start))
+    app.add_error_handler(on_error)
 
+    app.add_handler(CommandHandler(["help", "start"], start))
     app.add_handler(CommandHandler("screen", screen))
     app.add_handler(CommandHandler("diag", diag))
     app.add_handler(CommandHandler("notify_on", notify_on))
@@ -2142,7 +2072,6 @@ def main():
     app.add_handler(CommandHandler("riskmode", riskmode_cmd))
     app.add_handler(CommandHandler("dailycap", dailycap_cmd))
     app.add_handler(CommandHandler("riskauto", riskauto_cmd))
-    app.add_handler(CommandHandler("limits", limits_cmd))
 
     app.add_handler(CommandHandler("tradesetup", tradesetup))
     app.add_handler(CommandHandler("risk", risk_cmd))
