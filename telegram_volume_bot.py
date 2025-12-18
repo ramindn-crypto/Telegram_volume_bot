@@ -2,33 +2,50 @@
 """
 PulseFutures — Bybit Futures (Swap) Screener + TradeSetup + Risk Ledger
 
-✅ Fixes included
-1) /help (and /start) now ALWAYS responds (robust send_message via effective_chat)
-2) TP1/TP2/TP3 no longer collapse to same price when TP cap hits
-3) /screen speed-up: per symbol metrics uses only 2 fetches (1h + 15m) and setups universe limited
+✅ Your latest requirements (implemented)
+1) Multi-user: each user has their own timezone + trading session(s)
+2) Email limiting is PER SESSION (not per 24h):
+   - max emails per session (default 3, user-configurable)
+   - min gap between emails inside session (default 60 min, user-configurable)
+3) NO symbol repetition until NEXT SESSION:
+   - if a symbol was emailed once in a session, it will NOT be emailed again in the same session
+   - next session -> allowed again (for that user)
+4) Email + Telegram: include chart (generated image) for setups:
+   - Telegram: sends QuickChart PNG after /screen and /tradesetup
+   - Email: attaches QuickChart PNG(s) for setup symbols
+5) Movers / Strong movers: min futures volume 5M USD
+6) Prettier email + nicer Telegram formatting
+7) /help fixed and reliable
 
-Core features
-- Futures-only (Bybit swap via CCXT)
-- /screen: Market Leaders + Directional Leaders/Losers + Top Setups
-- Setups: Trigger on 1H momentum + Confirm on 15m momentum
-- Confidence score (0–100). Multi-TP only for Conf >= 75
-- Email alerts (optional): pretty format + chart link + chart PNG attachments
-- Trading window guard: London + New York
-- Risk management:
-  - /riskmode pct|usd
-  - /dailycap pct|usd
-  - /riskauto on|off
-  - /tradesetup SYMBOL
+Commands:
+- /help, /start
+- /screen
+- /tradesetup BTC   (or /risk BTC)
+- /open
+- /closepnl BTC +23.5
+
+Session/email controls:
+- /sessions
+- /sessions_set 18:00-23:30,07:00-09:00
+- /emailcap 3
+- /emailgap 60
+
+Risk controls:
+- /equity 1000
+- /riskmode pct 2.5   | /riskmode usd 25 | /riskmode
+- /dailycap pct 5     | /dailycap usd 60 | /dailycap
+- /riskauto on|off
+- /limits 3 50 75 (legacy)
 
 Env:
-- TELEGRAM_TOKEN
+- TELEGRAM_TOKEN (required)
 
-Optional email env:
+Email env:
 - EMAIL_ENABLED=true/false
 - EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO
+- CHECK_INTERVAL_MIN=5
 
-Charts:
-- CHART_IMG_ENABLED=true/false
+Not financial advice.
 """
 
 import logging
@@ -44,7 +61,7 @@ import urllib.parse
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from io import BytesIO
 
@@ -90,7 +107,7 @@ DEFAULT_EQUITY = 1000.0
 DEFAULT_MAX_TRADES_DAY = 3
 DEFAULT_OPEN_RISK_CAP_USD = 75.0
 
-# NEW risk controls
+# Risk controls (new)
 DEFAULT_RISK_MODE = "PCT"       # PCT or USD
 DEFAULT_RISK_VALUE = 1.5        # if PCT -> 1.5% per trade, if USD -> $ value
 DEFAULT_DAILY_CAP_MODE = "PCT"  # PCT or USD
@@ -103,7 +120,6 @@ SETUP_TIME_STOP_HOURS = int(os.environ.get("SETUP_TIME_STOP_HOURS", "18"))
 # ATR-based SL/TP
 USE_ATR_SLTP = os.environ.get("USE_ATR_SLTP", "true").lower() == "true"
 ATR_PERIOD = int(os.environ.get("ATR_PERIOD", "14"))
-
 ATR_MIN_PCT = float(os.environ.get("ATR_MIN_PCT", "0.6"))
 ATR_MAX_PCT = float(os.environ.get("ATR_MAX_PCT", "6.0"))
 TP_MAX_PCT = float(os.environ.get("TP_MAX_PCT", "4.5"))
@@ -113,13 +129,12 @@ TP_ALLOCS = (40, 40, 20)
 
 try:
     _rm = os.environ.get("TP_R_MULTS", "0.8,1.4,2.0")
-    TP_R_MULTS = tuple(float(x.strip()) for x in _rm.split(","))
-    if len(TP_R_MULTS) != 3:
-        TP_R_MULTS = (0.8, 1.4, 2.0)
+    _t = tuple(float(x.strip()) for x in _rm.split(","))
+    TP_R_MULTS = _t if len(_t) == 3 else (0.8, 1.4, 2.0)
 except Exception:
     TP_R_MULTS = (0.8, 1.4, 2.0)
 
-# Email / Alerts
+# Email
 EMAIL_ENABLED_DEFAULT = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
 EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465"))
@@ -127,27 +142,25 @@ EMAIL_USER = os.environ.get("EMAIL_USER", "")
 EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
 EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
-EMAIL_MIN_INTERVAL_SEC = 60 * 60
 
+# Email content
 INCLUDE_MOVERS_IN_EMAIL = True
 EMAIL_MOVERS_TOP_N = 5
 
-# Trading window guard
-GUARD_ENABLED = True
-SUNDAY_EMAILS = os.environ.get("SUNDAY_EMAILS", "false").lower() == "true"
-LONDON_TZ = ZoneInfo("Europe/London")
-NY_TZ = ZoneInfo("America/New_York")
-LONDON_START = (7, 0)
-LONDON_END = (16, 0)
-NY_START = (9, 0)
-NY_END = (17, 0)
+# Per-user email session defaults
+DEFAULT_SESSIONS = [{"start": "18:00", "end": "23:30"}]  # user local time
+DEFAULT_MAX_EMAILS_PER_SESSION = int(os.environ.get("DEFAULT_MAX_EMAILS_PER_SESSION", "3"))
+DEFAULT_EMAIL_GAP_MIN = int(os.environ.get("DEFAULT_EMAIL_GAP_MIN", "60"))  # minutes
+
+# Symbol cooldown: don't email same symbol again UNTIL NEXT SESSION (per user)
+SYMBOL_COOLDOWN_PER_SESSION = True
 
 # Market bias
 BIAS_UNIVERSE_N = int(os.environ.get("BIAS_UNIVERSE_N", "20"))
 BIAS_STRONG_TH = float(os.environ.get("BIAS_STRONG_TH", "0.6"))
 
 # Bot runtime
-CHECK_INTERVAL_MIN = 5
+CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "5"))
 
 # DB
 DB_PATH = os.environ.get("DB_PATH", "pulsefutures.db")
@@ -230,22 +243,18 @@ def db_init():
             tz TEXT NOT NULL,
             day_trade_count INTEGER NOT NULL,
             day_trade_date TEXT NOT NULL,
-            daily_risk_used REAL NOT NULL
+            daily_risk_used REAL NOT NULL,
+            risk_mode TEXT,
+            risk_value REAL,
+            daily_cap_mode TEXT,
+            daily_cap_value REAL,
+            risk_auto INTEGER,
+            trade_sessions TEXT,
+            max_emails_per_session INTEGER,
+            email_gap_min INTEGER
         )
         """
     )
-
-    for ddl in [
-        "ALTER TABLE users ADD COLUMN risk_mode TEXT",
-        "ALTER TABLE users ADD COLUMN risk_value REAL",
-        "ALTER TABLE users ADD COLUMN daily_cap_mode TEXT",
-        "ALTER TABLE users ADD COLUMN daily_cap_value REAL",
-        "ALTER TABLE users ADD COLUMN risk_auto INTEGER",
-    ]:
-        try:
-            cur.execute(ddl)
-        except Exception:
-            pass
 
     cur.execute(
         """
@@ -265,15 +274,11 @@ def db_init():
             status TEXT NOT NULL,
             pnl REAL,
             closed_ts REAL,
-            notes TEXT
+            notes TEXT,
+            time_stop_ts REAL
         )
         """
     )
-
-    try:
-        cur.execute("ALTER TABLE positions ADD COLUMN time_stop_ts REAL")
-    except Exception:
-        pass
 
     cur.execute(
         """
@@ -298,11 +303,27 @@ def db_init():
         """
     )
 
+    # Per-user email state (session cap + gap)
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS meta (
-            k TEXT PRIMARY KEY,
-            v TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS email_state (
+            user_id INTEGER PRIMARY KEY,
+            session_key TEXT NOT NULL,
+            sent_count INTEGER NOT NULL,
+            last_email_ts REAL NOT NULL,
+            last_symbols TEXT NOT NULL
+        )
+        """
+    )
+
+    # Session-based symbol cooldown (NEW TABLE NAME to avoid DB migration issues)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS emailed_symbols_session (
+            user_id INTEGER NOT NULL,
+            session_key TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            PRIMARY KEY (user_id, session_key, symbol)
         )
         """
     )
@@ -322,6 +343,14 @@ def _normalize_user_row(d: dict) -> dict:
         d["daily_cap_value"] = float(DEFAULT_DAILY_CAP_VALUE)
     if d.get("risk_auto") is None:
         d["risk_auto"] = int(DEFAULT_RISK_AUTO)
+
+    if not d.get("trade_sessions"):
+        d["trade_sessions"] = json.dumps(DEFAULT_SESSIONS)
+    if d.get("max_emails_per_session") is None:
+        d["max_emails_per_session"] = int(DEFAULT_MAX_EMAILS_PER_SESSION)
+    if d.get("email_gap_min") is None:
+        d["email_gap_min"] = int(DEFAULT_EMAIL_GAP_MIN)
+
     return d
 
 
@@ -338,9 +367,10 @@ def get_user(user_id: int) -> dict:
             INSERT INTO users (
                 user_id, equity, risk_pct, max_trades_day, daily_risk_cap, open_risk_cap,
                 notify_on, tz, day_trade_count, day_trade_date, daily_risk_used,
-                risk_mode, risk_value, daily_cap_mode, daily_cap_value, risk_auto
+                risk_mode, risk_value, daily_cap_mode, daily_cap_value, risk_auto,
+                trade_sessions, max_emails_per_session, email_gap_min
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -359,6 +389,9 @@ def get_user(user_id: int) -> dict:
                 DEFAULT_DAILY_CAP_MODE,
                 float(DEFAULT_DAILY_CAP_VALUE),
                 int(DEFAULT_RISK_AUTO),
+                json.dumps(DEFAULT_SESSIONS),
+                int(DEFAULT_MAX_EMAILS_PER_SESSION),
+                int(DEFAULT_EMAIL_GAP_MIN),
             ),
         )
         con.commit()
@@ -367,6 +400,15 @@ def get_user(user_id: int) -> dict:
 
     con.close()
     return _normalize_user_row(dict(row))
+
+
+def list_users_notify_on() -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM users WHERE notify_on=1")
+    rows = cur.fetchall()
+    con.close()
+    return [_normalize_user_row(dict(r)) for r in rows]
 
 
 def update_user(user_id: int, **kwargs):
@@ -388,26 +430,6 @@ def reset_daily_counters_if_needed(user: dict) -> dict:
         update_user(user["user_id"], day_trade_count=0, day_trade_date=today, daily_risk_used=0.0)
         user = get_user(user["user_id"])
     return user
-
-
-def db_set_meta(k: str, v: str):
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO meta (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-        (k, v),
-    )
-    con.commit()
-    con.close()
-
-
-def db_get_meta(k: str, default: str = "") -> str:
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute("SELECT v FROM meta WHERE k=?", (k,))
-    row = cur.fetchone()
-    con.close()
-    return row["v"] if row else default
 
 
 def db_upsert_signal(setup: Setup):
@@ -570,6 +592,62 @@ def db_close_position(user_id: int, symbol: str, pnl: float) -> Optional[dict]:
     return pos
 
 
+# ---------- Email State / Session-based Symbol Cooldown ----------
+def email_state_get(user_id: int) -> dict:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM email_state WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute(
+            "INSERT INTO email_state (user_id, session_key, sent_count, last_email_ts, last_symbols) VALUES (?, ?, ?, ?, ?)",
+            (user_id, "NONE", 0, 0.0, ""),
+        )
+        con.commit()
+        cur.execute("SELECT * FROM email_state WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+    con.close()
+    return dict(row)
+
+
+def email_state_set(user_id: int, **kwargs):
+    if not kwargs:
+        return
+    con = db_connect()
+    cur = con.cursor()
+    sets = ", ".join([f"{k}=?" for k in kwargs.keys()])
+    vals = list(kwargs.values()) + [user_id]
+    cur.execute(f"UPDATE email_state SET {sets} WHERE user_id=?", vals)
+    con.commit()
+    con.close()
+
+
+def has_emailed_symbol_in_session(user_id: int, session_key: str, symbol: str) -> bool:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT 1 FROM emailed_symbols_session WHERE user_id=? AND session_key=? AND symbol=?",
+        (user_id, session_key, symbol.upper()),
+    )
+    row = cur.fetchone()
+    con.close()
+    return bool(row)
+
+
+def mark_emailed_symbols_in_session(user_id: int, session_key: str, symbols: List[str]):
+    if not symbols:
+        return
+    con = db_connect()
+    cur = con.cursor()
+    for sym in symbols:
+        cur.execute(
+            "INSERT OR IGNORE INTO emailed_symbols_session (user_id, session_key, symbol) VALUES (?, ?, ?)",
+            (user_id, session_key, sym.upper()),
+        )
+    con.commit()
+    con.close()
+
+
 # =========================
 # EXCHANGE HELPERS
 # =========================
@@ -727,7 +805,6 @@ def sl_tp_from_atr(entry: float, side: str, atr: float, conf: int) -> Tuple[floa
     sl_dist = clamp(sl_dist, min_dist, max_dist)
 
     r = sl_dist
-
     tp_dist = 1.4 * r
     tp_max_dist = (TP_MAX_PCT / 100.0) * entry
     tp_dist = min(tp_dist, tp_max_dist)
@@ -781,10 +858,6 @@ def tv_chart_url(symbol_base: str) -> str:
     return f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol_base.upper()}USDT.P"
 
 
-def fetch_ohlcv_series(market_symbol: str, timeframe: str, limit: int):
-    return fetch_ohlcv(market_symbol, timeframe=timeframe, limit=limit)
-
-
 def quickchart_png_bytes(title: str, labels: List[str], closes: List[float]) -> Optional[bytes]:
     chart_cfg = {
         "type": "line",
@@ -805,7 +878,7 @@ def build_chart_png_for_market(symbol_base: str, market_symbol: str) -> Optional
     if not CHART_IMG_ENABLED:
         return None
     try:
-        candles = fetch_ohlcv_series(market_symbol, CHART_TIMEFRAME, CHART_BARS)
+        candles = fetch_ohlcv(market_symbol, CHART_TIMEFRAME, CHART_BARS)
         if len(candles) < 10:
             return None
         labels, closes = [], []
@@ -998,7 +1071,6 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
         return None
 
     ch24 = float(mv.percentage or 0.0)
-
     ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol)
 
     if abs(ch1) < TRIGGER_1H_ABS_MIN:
@@ -1072,86 +1144,6 @@ def pick_setups(best_fut: Dict[str, MarketVol]) -> List[Setup]:
             setups.append(s)
     setups.sort(key=lambda s: (s.conf, s.fut_vol_usd), reverse=True)
     return setups[:SETUPS_N]
-
-
-# =========================
-# TRADING WINDOW GUARD
-# =========================
-def _in_window_local(tz: ZoneInfo, start: Tuple[int, int], end: Tuple[int, int]) -> bool:
-    now = datetime.now(tz)
-    if now.weekday() == 6 and not SUNDAY_EMAILS:
-        return False
-    sh, sm = start
-    eh, em = end
-    start_m = sh * 60 + sm
-    end_m = eh * 60 + em
-    now_m = now.hour * 60 + now.minute
-    return start_m <= now_m <= end_m
-
-
-def window_ok() -> bool:
-    if not GUARD_ENABLED:
-        return True
-    return _in_window_local(LONDON_TZ, LONDON_START, LONDON_END) or _in_window_local(NY_TZ, NY_START, NY_END)
-
-
-# =========================
-# EMAIL HELPERS
-# =========================
-def email_config_ok() -> bool:
-    return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO])
-
-
-def send_email(subject: str, body: str, attachments: Optional[List[Tuple[str, bytes, str]]] = None) -> bool:
-    if not email_config_ok():
-        logger.warning("Email not configured.")
-        return False
-    try:
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = EMAIL_FROM
-        msg["To"] = EMAIL_TO
-        msg.set_content(body)
-
-        if attachments:
-            for fn, data, mime in attachments:
-                maintype, subtype = mime.split("/", 1)
-                msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=fn)
-
-        if EMAIL_PORT == 465:
-            ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT, context=ctx) as s:
-                s.login(EMAIL_USER, EMAIL_PASS)
-                s.send_message(msg)
-        else:
-            with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as s:
-                s.starttls()
-                s.login(EMAIL_USER, EMAIL_PASS)
-                s.send_message(msg)
-        return True
-    except Exception as e:
-        logger.exception("send_email failed: %s", e)
-        return False
-
-
-def format_setup_email_block_pretty(s: Setup) -> str:
-    lines = []
-    lines.append(f"{s.side} {s.symbol} — Confidence {s.conf}/100")
-    lines.append(f"Entry: {fmt_price(s.entry)}")
-    lines.append(f"SL:    {fmt_price(s.sl)}")
-
-    if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
-        lines.append(f"TP1:   {fmt_price(s.tp1)} ({TP_ALLOCS[0]}%)")
-        lines.append(f"TP2:   {fmt_price(s.tp2)} ({TP_ALLOCS[1]}%)")
-        lines.append(f"TP3:   {fmt_price(s.tp)} ({TP_ALLOCS[2]}%)")
-        lines.append("Rule: After TP1 → move SL to BE")
-    else:
-        lines.append(f"TP:    {fmt_price(s.tp)}")
-
-    lines.append("")
-    lines.append(f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | F~{fmt_money(s.fut_vol_usd)}")
-    lines.append(f"Chart: {tv_chart_url(s.symbol)}")
-    return "\n".join(lines)
 
 
 # =========================
@@ -1269,12 +1261,147 @@ def suggested_leverage(notional: float, equity: float) -> int:
 
 
 # =========================
+# SESSION TIME HELPERS
+# =========================
+def parse_hhmm(s: str) -> Tuple[int, int]:
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s.strip())
+    if not m:
+        raise ValueError("bad time")
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        raise ValueError("bad time")
+    return hh, mm
+
+
+def load_sessions(user: dict) -> List[dict]:
+    try:
+        data = user.get("trade_sessions") or json.dumps(DEFAULT_SESSIONS)
+        ses = json.loads(data)
+        if not isinstance(ses, list) or not ses:
+            return DEFAULT_SESSIONS
+        out = []
+        for x in ses:
+            if not isinstance(x, dict):
+                continue
+            st = str(x.get("start", "")).strip()
+            en = str(x.get("end", "")).strip()
+            parse_hhmm(st)
+            parse_hhmm(en)
+            out.append({"start": st, "end": en})
+        return out or DEFAULT_SESSIONS
+    except Exception:
+        return DEFAULT_SESSIONS
+
+
+def active_session_for_user(user: dict) -> Optional[dict]:
+    """
+    Returns dict: {start_dt, end_dt, start_str, end_str, session_key}
+    or None if now is outside all sessions.
+    Supports overnight sessions (end <= start means ends next day).
+    """
+    tz = ZoneInfo(user.get("tz") or "Australia/Melbourne")
+    now = datetime.now(tz)
+    sessions = load_sessions(user)
+
+    for s in sessions:
+        sh, sm = parse_hhmm(s["start"])
+        eh, em = parse_hhmm(s["end"])
+
+        start_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_dt = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+
+        if end_dt <= start_dt:
+            end_dt = end_dt + timedelta(days=1)
+            if now < start_dt:
+                start_dt = start_dt - timedelta(days=1)
+                end_dt = end_dt - timedelta(days=1)
+
+        if start_dt <= now <= end_dt:
+            session_key = f"{start_dt.strftime('%Y-%m-%d')}_{s['start']}"
+            return {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "start_str": s["start"],
+                "end_str": s["end"],
+                "session_key": session_key,
+            }
+
+    return None
+
+
+# =========================
+# EMAIL HELPERS
+# =========================
+def email_config_ok() -> bool:
+    return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO])
+
+
+def send_email(subject: str, body: str, attachments: Optional[List[Tuple[str, bytes, str]]] = None) -> bool:
+    if not email_config_ok():
+        logger.warning("Email not configured.")
+        return False
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+        msg.set_content(body)
+
+        if attachments:
+            for fn, data, mime in attachments:
+                maintype, subtype = mime.split("/", 1)
+                msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=fn)
+
+        if EMAIL_PORT == 465:
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT, context=ctx) as s:
+                s.login(EMAIL_USER, EMAIL_PASS)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as s:
+                s.starttls()
+                s.login(EMAIL_USER, EMAIL_PASS)
+                s.send_message(msg)
+        return True
+    except Exception as e:
+        logger.exception("send_email failed: %s", e)
+        return False
+
+
+def format_setup_email_block_pretty(s: Setup) -> str:
+    lines = []
+    lines.append(f"{s.side} {s.symbol} — Confidence {s.conf}/100")
+    lines.append(f"Entry: {fmt_price(s.entry)}")
+    lines.append(f"SL:    {fmt_price(s.sl)}")
+
+    if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
+        lines.append(f"TP1:   {fmt_price(s.tp1)} ({TP_ALLOCS[0]}%)")
+        lines.append(f"TP2:   {fmt_price(s.tp2)} ({TP_ALLOCS[1]}%)")
+        lines.append(f"TP3:   {fmt_price(s.tp)} ({TP_ALLOCS[2]}%)")
+        lines.append("Rule: After TP1 → move SL to BE")
+    else:
+        lines.append(f"TP:    {fmt_price(s.tp)}")
+
+    lines.append("")
+    lines.append(f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | F~{fmt_money(s.fut_vol_usd)}")
+    lines.append(f"Chart: {tv_chart_url(s.symbol)}")
+    return "\n".join(lines)
+
+
+# =========================
 # HELP
 # =========================
 HELP_TEXT = """\
 **PulseFutures — Commands**
 **Market**
 - /screen — Market Leaders + Directional Leaders/Losers + Top Setups
+
+**Email Session Controls (per user)**
+- /sessions — Show your trading sessions
+- /sessions_set 18:00-23:30,07:00-09:00 — Set sessions (your local time)
+- /emailcap 3 — Max emails per session
+- /emailgap 60 — Min gap between emails (minutes)
 
 **Risk & Trading**
 - /equity <amount> — Set equity (e.g., /equity 1000)
@@ -1302,8 +1429,8 @@ HELP_TEXT = """\
 - /diag — Diagnostics
 
 **Notes**
-- SL/TP uses ATR + capped TP distance.
-- Multi-TP uses TP1/TP2/TP3 only for Conf >= 75.
+- Emails only send inside YOUR sessions.
+- A symbol that was emailed in the current session will not repeat until your next session.
 - Not financial advice.
 """
 
@@ -1312,7 +1439,6 @@ HELP_TEXT = """\
 # TELEGRAM HANDLERS
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Robust: works even if update.message is None
     logger.info("START/HELP called by user_id=%s", update.effective_user.id if update.effective_user else None)
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id is None:
@@ -1335,13 +1461,17 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dc_value = float(user.get("daily_cap_value") or DEFAULT_DAILY_CAP_VALUE)
     dc_desc = f"${dc_value:.2f} / day" if dc_mode == "USD" else f"{dc_value:.2f}% / day"
 
+    ses = load_sessions(user)
+    ses_txt = ", ".join([f"{x['start']}-{x['end']}" for x in ses])
+
     msg = (
         f"*Diag*\n"
         f"- Futures: Bybit swap\n"
         f"- Email notify: {notify}\n"
-        f"- Guard: {'ON' if GUARD_ENABLED else 'OFF'} (London+NY)\n"
-        f"- Sunday emails: {'YES' if SUNDAY_EMAILS else 'NO'}\n"
-        f"- Email interval: {EMAIL_MIN_INTERVAL_SEC//60} min\n"
+        f"- Your TZ: {user.get('tz')}\n"
+        f"- Sessions: {ses_txt}\n"
+        f"- Email cap/session: {int(user.get('max_emails_per_session') or DEFAULT_MAX_EMAILS_PER_SESSION)}\n"
+        f"- Email gap: {int(user.get('email_gap_min') or DEFAULT_EMAIL_GAP_MIN)} min\n"
         f"- Equity: ${equity:.2f}\n"
         f"- Risk per trade: {risk_desc}\n"
         f"- Daily cap: {dc_desc} (≈ ${daily_cap:.2f})\n"
@@ -1352,6 +1482,7 @@ async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- Time-stop: {SETUP_TIME_STOP_HOURS}h\n"
         f"- TP cap: {TP_MAX_PCT}%\n"
         f"- Multi-TP: Conf >= {MULTI_TP_MIN_CONF} | TP R-mults {TP_R_MULTS}\n"
+        f"- Symbol cooldown (per session): {'ON' if SYMBOL_COOLDOWN_PER_SESSION else 'OFF'}\n"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -1364,6 +1495,78 @@ async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def notify_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user(update.effective_user.id, notify_on=0)
     await update.message.reply_text("Email alerts: OFF")
+
+
+async def sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    ses = load_sessions(user)
+    ses_txt = "\n".join([f"- {x['start']}-{x['end']}" for x in ses])
+    await update.message.reply_text(
+        f"Your sessions (TZ: {user.get('tz')}):\n{ses_txt}\n\nSet: /sessions_set 18:00-23:30,07:00-09:00"
+    )
+
+
+async def sessions_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("Usage: /sessions_set 18:00-23:30,07:00-09:00")
+        return
+    raw = " ".join(context.args).strip()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    sessions = []
+    try:
+        for p in parts:
+            if "-" not in p:
+                raise ValueError()
+            st, en = [x.strip() for x in p.split("-", 1)]
+            parse_hhmm(st)
+            parse_hhmm(en)
+            sessions.append({"start": st, "end": en})
+        if not sessions:
+            raise ValueError()
+    except Exception:
+        await update.message.reply_text("Bad format. Example: /sessions_set 18:00-23:30,07:00-09:00")
+        return
+
+    update_user(uid, trade_sessions=json.dumps(sessions))
+    pretty = ", ".join([f"{x['start']}-{x['end']}" for x in sessions])
+    await update.message.reply_text(f"✅ Sessions saved: {pretty}")
+
+
+async def emailcap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not context.args:
+        await update.message.reply_text(
+            f"Email cap/session: {int(user.get('max_emails_per_session') or DEFAULT_MAX_EMAILS_PER_SESSION)}\nSet: /emailcap 3"
+        )
+        return
+    try:
+        n = int(context.args[0])
+        if n < 1 or n > 20:
+            raise ValueError()
+        update_user(uid, max_emails_per_session=n)
+        await update.message.reply_text(f"✅ Email cap/session set to {n}")
+    except Exception:
+        await update.message.reply_text("Usage: /emailcap 3  (1..20)")
+
+
+async def emailgap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not context.args:
+        await update.message.reply_text(
+            f"Email min gap: {int(user.get('email_gap_min') or DEFAULT_EMAIL_GAP_MIN)} minutes\nSet: /emailgap 60"
+        )
+        return
+    try:
+        m = int(context.args[0])
+        if m < 0 or m > 360:
+            raise ValueError()
+        update_user(uid, email_gap_min=m)
+        await update.message.reply_text(f"✅ Email min gap set to {m} minutes")
+    except Exception:
+        await update.message.reply_text("Usage: /emailgap 60  (0..360)")
 
 
 async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1504,10 +1707,11 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     bias_line = market_bias(best_fut)
+
     leaders_txt = build_leaders_table(best_fut)
     dir_up_txt, dir_dn_txt = build_movers_tables(best_fut)
-    setups = pick_setups(best_fut)
 
+    setups = pick_setups(best_fut)
     for s in setups:
         db_upsert_signal(s)
 
@@ -1536,7 +1740,7 @@ async def screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
-    # Send charts after message so results appear fast
+    # Send charts after message (so user sees results fast)
     for s in setups:
         png = build_chart_png_for_market(s.symbol, s.market_symbol)
         if png:
@@ -1770,7 +1974,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# ALERT JOB (EMAIL)
+# EMAIL JOB (PER USER, PER SESSION) + SYMBOL COOLDOWN PER SESSION
 # =========================
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1778,95 +1982,133 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             return
         if not email_config_ok():
             return
-        if not window_ok():
+
+        users = list_users_notify_on()
+        if not users:
             return
 
-        last_ts = float(db_get_meta("last_email_ts", "0") or "0")
-        last_syms = set((db_get_meta("last_email_symbols", "") or "").split(",")) if db_get_meta("last_email_symbols", "") else set()
-
-        now = time.time()
-        if now - last_ts < EMAIL_MIN_INTERVAL_SEC:
-            return
-
+        # Compute market scan ONCE per tick (shared across all users)
         best_fut = fetch_futures_tickers()
         if not best_fut:
             return
 
+        bias_line = market_bias(best_fut)
+        dir_up, dir_dn = compute_directional_lists(best_fut)
         setups = pick_setups(best_fut)
         for s in setups:
             db_upsert_signal(s)
 
-        bias_line = market_bias(best_fut)
-        dir_up, dir_dn = compute_directional_lists(best_fut)
+        # For each user: decide independently
+        for user in users:
+            uid = int(user["user_id"])
+            sess = active_session_for_user(user)
+            if not sess:
+                continue  # outside user's sessions
 
-        setup_syms = {s.symbol for s in setups}
-        mover_syms = {b for (b, _, _, _, _) in dir_up} | {b for (b, _, _, _, _) in dir_dn}
-        cur_syms = setup_syms | mover_syms
-        cur_syms.discard("")
+            session_key = sess["session_key"]
+            st = email_state_get(uid)
 
-        if cur_syms and cur_syms == last_syms:
-            return
+            # Reset counters when session changes
+            if st["session_key"] != session_key:
+                email_state_set(uid, session_key=session_key, sent_count=0, last_email_ts=0.0, last_symbols="")
+                st = email_state_get(uid)
 
-        attachments = []
-        for s in setups:
-            png = build_chart_png_for_market(s.symbol, s.market_symbol)
-            if png:
-                attachments.append((f"chart_{s.symbol}_{CHART_TIMEFRAME}.png", png, "image/png"))
+            max_emails = int(user.get("max_emails_per_session") or DEFAULT_MAX_EMAILS_PER_SESSION)
+            gap_min = int(user.get("email_gap_min") or DEFAULT_EMAIL_GAP_MIN)
+            gap_sec = max(0, gap_min) * 60
 
-        parts: List[str] = []
-        parts.append(HDR)
-        parts.append("📊 PulseFutures — Market Update")
-        parts.append(HDR)
-        parts.append("")
-        parts.append(bias_line)
-        parts.append("")
+            if int(st["sent_count"]) >= max_emails:
+                continue
 
-        parts.append(SEP)
-        parts.append("🔥 Top Trade Setups")
-        parts.append(SEP)
-        parts.append("")
+            now_ts = time.time()
+            if gap_sec > 0 and (now_ts - float(st["last_email_ts"] or 0.0)) < gap_sec:
+                continue
 
-        if setups:
-            for i, s in enumerate(setups, 1):
+            # Symbol cooldown UNTIL NEXT SESSION (per user)
+            filtered_setups: List[Setup] = []
+            for s in setups:
+                if SYMBOL_COOLDOWN_PER_SESSION and has_emailed_symbol_in_session(uid, session_key, s.symbol):
+                    continue
+                filtered_setups.append(s)
+
+            if not filtered_setups:
+                continue
+
+            # Dedupe within session by symbol set (so same set won't email again)
+            last_syms = set([x for x in (st["last_symbols"] or "").split(",") if x])
+            cur_syms = set([s.symbol for s in filtered_setups])
+            if cur_syms and cur_syms == last_syms:
+                continue
+
+            # Build attachments (charts) for setups being emailed
+            attachments = []
+            for s in filtered_setups:
+                png = build_chart_png_for_market(s.symbol, s.market_symbol)
+                if png:
+                    attachments.append((f"chart_{s.symbol}_{CHART_TIMEFRAME}.png", png, "image/png"))
+
+            # Email body
+            tz = ZoneInfo(user.get("tz") or "Australia/Melbourne")
+            now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+
+            parts: List[str] = []
+            parts.append(HDR)
+            parts.append(f"📊 PulseFutures — Session Update ({now_local} {user.get('tz')})")
+            parts.append(HDR)
+            parts.append("")
+            parts.append(bias_line)
+            parts.append(f"Session: {sess['start_str']}-{sess['end_str']} | Email {int(st['sent_count'])+1}/{max_emails} | Gap {gap_min}m")
+            parts.append("")
+
+            parts.append(SEP)
+            parts.append("🔥 Top Trade Setups")
+            parts.append(SEP)
+            parts.append("")
+
+            for i, s in enumerate(filtered_setups, 1):
                 parts.append(f"{i}) {format_setup_email_block_pretty(s)}")
                 parts.append("")
                 parts.append(SEP)
-        else:
-            parts.append("No high-quality setup at the moment.")
+
+            if INCLUDE_MOVERS_IN_EMAIL:
+                parts.append("")
+                parts.append("📈 Directional Leaders (Top 5)")
+                parts.append(SEP)
+                if dir_up:
+                    for b, v, c24, c4, _ in dir_up[:EMAIL_MOVERS_TOP_N]:
+                        parts.append(f"{b:<6} {pct_with_emoji(c24)} | 4H {pct_with_emoji(c4)} | F~{fmt_money(v)}")
+                else:
+                    parts.append("None")
+
+                parts.append("")
+                parts.append("📉 Directional Losers (Top 5)")
+                parts.append(SEP)
+                if dir_dn:
+                    for b, v, c24, c4, _ in dir_dn[:EMAIL_MOVERS_TOP_N]:
+                        parts.append(f"{b:<6} {pct_with_emoji(c24)} | 4H {pct_with_emoji(c4)} | F~{fmt_money(v)}")
+                else:
+                    parts.append("None")
+
             parts.append("")
-            parts.append(SEP)
+            parts.append(HDR)
+            parts.append("This is not financial advice.")
+            parts.append("PulseFutures • Bybit Futures")
+            parts.append(HDR)
 
-        if INCLUDE_MOVERS_IN_EMAIL:
-            parts.append("")
-            parts.append("📈 Directional Leaders (Top 5)")
-            parts.append(SEP)
-            if dir_up:
-                for b, v, c24, c4, _ in dir_up[:EMAIL_MOVERS_TOP_N]:
-                    parts.append(f"{b:<6} {pct_with_emoji(c24)} | 4H {pct_with_emoji(c4)} | F~{fmt_money(v)}")
-            else:
-                parts.append("None")
+            body = "\n".join(parts).strip()
+            subject = f"PulseFutures • Setups ({sess['start_str']}-{sess['end_str']})"
 
-            parts.append("")
-            parts.append("📉 Directional Losers (Top 5)")
-            parts.append(SEP)
-            if dir_dn:
-                for b, v, c24, c4, _ in dir_dn[:EMAIL_MOVERS_TOP_N]:
-                    parts.append(f"{b:<6} {pct_with_emoji(c24)} | 4H {pct_with_emoji(c4)} | F~{fmt_money(v)}")
-            else:
-                parts.append("None")
+            if send_email(subject, body, attachments=attachments):
+                email_state_set(
+                    uid,
+                    sent_count=int(st["sent_count"]) + 1,
+                    last_email_ts=now_ts,
+                    last_symbols=",".join(sorted(cur_syms)),
+                )
 
-        parts.append("")
-        parts.append(HDR)
-        parts.append("This is not financial advice.")
-        parts.append("PulseFutures • Bybit Futures")
-        parts.append(HDR)
-
-        body = "\n".join(parts).strip()
-        subject = "PulseFutures • Trade Setups & Market Bias"
-
-        if send_email(subject, body, attachments=attachments):
-            db_set_meta("last_email_ts", str(now))
-            db_set_meta("last_email_symbols", ",".join(sorted(cur_syms)))
+                # Mark symbols as emailed in THIS SESSION (cooldown per session)
+                if SYMBOL_COOLDOWN_PER_SESSION:
+                    mark_emailed_symbols_in_session(uid, session_key, [s.symbol for s in filtered_setups])
 
     except Exception as e:
         logger.exception("alert_job error: %s", e)
@@ -1883,25 +2125,30 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # ✅ IMPORTANT: Make /help and /start bulletproof & registered first
+    # IMPORTANT: add help/start early + robust
     app.add_handler(CommandHandler(["help", "start"], start))
 
     app.add_handler(CommandHandler("screen", screen))
     app.add_handler(CommandHandler("diag", diag))
     app.add_handler(CommandHandler("notify_on", notify_on))
     app.add_handler(CommandHandler("notify_off", notify_off))
-    app.add_handler(CommandHandler("equity", equity_cmd))
 
+    app.add_handler(CommandHandler("sessions", sessions_cmd))
+    app.add_handler(CommandHandler("sessions_set", sessions_set_cmd))
+    app.add_handler(CommandHandler("emailcap", emailcap_cmd))
+    app.add_handler(CommandHandler("emailgap", emailgap_cmd))
+
+    app.add_handler(CommandHandler("equity", equity_cmd))
     app.add_handler(CommandHandler("riskmode", riskmode_cmd))
     app.add_handler(CommandHandler("dailycap", dailycap_cmd))
     app.add_handler(CommandHandler("riskauto", riskauto_cmd))
-
     app.add_handler(CommandHandler("limits", limits_cmd))
 
     app.add_handler(CommandHandler("tradesetup", tradesetup))
     app.add_handler(CommandHandler("risk", risk_cmd))
     app.add_handler(CommandHandler("open", open_cmd))
     app.add_handler(CommandHandler("closepnl", closepnl_cmd))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     if getattr(app, "job_queue", None):
