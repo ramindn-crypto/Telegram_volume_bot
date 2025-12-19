@@ -869,6 +869,7 @@ def multi_tp(entry: float, side: str, R: float) -> Tuple[float, float, float]:
 # =========================================================
 # SETUP ENGINE
 # =========================================================
+
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
     score = 50.0
     is_long = (side == "BUY")
@@ -877,14 +878,26 @@ def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: flo
         nonlocal score
         score += w if ((x > 0) == is_long) else -w
 
+    # Direction alignment weights (unchanged logic)
     align(ch24, 12)
     align(ch4, 10)
     align(ch1, 9)
     align(ch15, 6)
 
-    mag = min(abs(ch24) * 0.7 + abs(ch4) * 1.1 + abs(ch1) * 1.6 + abs(ch15) * 1.2, 22.0)
+    # ✅ FIX: Make momentum magnitude direction-aware (no more abs() bonus for opposite direction)
+    def signed_mag(x: float, k: float) -> float:
+        return abs(x) * k if ((x > 0) == is_long) else -abs(x) * k
+
+    mag = (
+        signed_mag(ch24, 0.7) +
+        signed_mag(ch4,  1.1) +
+        signed_mag(ch1,  1.6) +
+        signed_mag(ch15, 1.2)
+    )
+    mag = clamp(mag, -22.0, 22.0)
     score += mag
 
+    # Liquidity bonus (unchanged)
     if fut_vol_usd >= 20_000_000:
         score += 9
     elif fut_vol_usd >= 8_000_000:
@@ -959,6 +972,23 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
     if side == "BUY" and ch4 < ALIGN_4H_MIN:
         return None
     if side == "SELL" and ch4 > -ALIGN_4H_MIN:
+        return None
+
+    # =========================================================
+    # 🔒 Soft 24H contradiction gate (Dynamic, based on ATR%)
+    #
+    # هدف: جلوگیری از سیگنال BUY وقتی فشار فروش روزانه خیلی سنگینه
+    #      و جلوگیری از سیگنال SELL وقتی پامپ روزانه خیلی سنگینه
+    #
+    # Dynamic threshold = clamp(max(12, 2.5 * ATR%), 12, 22)
+    # ATR% = (atr / entry) * 100
+    # =========================================================
+    atr_pct = (atr / entry) * 100.0 if (atr and entry) else 0.0
+    thr = clamp(max(12.0, 2.5 * atr_pct), 12.0, 22.0)
+
+    if side == "BUY" and ch24 <= -thr:
+        return None
+    if side == "SELL" and ch24 >= +thr:
         return None
 
     conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
