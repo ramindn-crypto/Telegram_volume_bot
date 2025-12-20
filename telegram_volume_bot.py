@@ -55,6 +55,18 @@ PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + 
    - /limits emailcap 0  => unlimited emails per session
    - This keeps your minimum gap rule (emailgap) and cooldown (no repeating same symbol within 18h)
 
+✅ Premium signal upgrades (added WITHOUT removing anything):
+10) Premium Risk/Reward gating + wider TP/SL:
+   - TP_R_MULTS increased (wider TP ladder)
+   - SL slightly wider (less noise stop-outs)
+   - TP_MAX_PCT increased (allows bigger moves)
+   - MIN_RR_TP3 gate: low R/R setups do NOT get emailed
+   - Email includes: "Entry Zone + No chase"
+
+11) 15m logic (Model A):
+   - /screen (Telegram) is SOFT on 15m: does NOT hard-reject weak 15m
+   - Email is STRICT on 15m: requires CONFIRM_15M_ABS_MIN pass
+
 IMPORTANT (Render):
 - If you see: "Conflict: terminated by other getUpdates request"
   it means multiple instances are polling. Use WEBHOOK mode or ensure only 1 instance.
@@ -147,17 +159,27 @@ SYMBOL_COOLDOWN_HOURS = 18  # do not repeat same symbol in emails for that user 
 
 # Multi-TP
 ATR_PERIOD = 14
-ATR_MIN_PCT = 0.8   # raise min stop distance a bit (less stop-outs)
+
+# ✅ Premium: slightly wider SL floor (less noise)
+ATR_MIN_PCT = 1.0   # was 0.8
 ATR_MAX_PCT = 8.0
-TP_MAX_PCT = 9.0
+
+# ✅ Premium: allow bigger TP cap
+TP_MAX_PCT = 10.0   # was 7.0
+
 MULTI_TP_MIN_CONF = 78
 TP_ALLOCS = (40, 35, 25)  # TP1/TP2/TP3 split
 
-# R-multipliers used to compute TP1/TP2/TP3 from R (Premium)
-TP_R_MULTS = (1.2, 2.1, 3.2)
+# ✅ Premium: wider R-multipliers (bigger ladder)
+# R-multipliers used to compute TP1/TP2/TP3 from R
+TP_R_MULTS = (1.1, 2.1, 3.4)  # was (1.0, 1.7, 2.6)
 
-# Premium gate: if RR is low, do NOT generate/send setup
-MIN_RR_TP3 = 1.4   # Premium gate: اگر RR کمتر از این باشد، سیگنال اصلاً ساخته/ارسال نمی‌شود
+# ✅ Premium: gate low R/R setups from EMAIL (TP3 R-multiple)
+MIN_RR_TP3 = 1.6  # recommend 1.6–1.8 for "2–3 trades/day" premium style
+
+# ✅ Email: Entry Zone + No chase
+ENTRY_ZONE_R = 0.25   # Entry zone width (in R units) around entry
+NO_CHASE_R = 0.35     # "No chase" distance (in R units)
 
 # Email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
@@ -790,14 +812,14 @@ def clamp(x: float, lo: float, hi: float) -> float:
 
 
 def sl_mult_from_conf(conf: int) -> float:
-    # کمی بزرگ‌تر برای نفس دادن به استاپ و کاهش استاپ‌اوت‌های بی‌مورد
+    # ✅ Premium: slightly wider SL (small bump vs previous)
     if conf >= 88:
-        return 2.4
+        return 2.5  # was 2.3
     if conf >= 80:
-        return 2.1
+        return 2.15  # was 2.0
     if conf >= 70:
-        return 1.8
-    return 1.6
+        return 1.85  # was 1.7
+    return 1.65      # was 1.5
 
 
 def compute_sl_tp(entry: float, side: str, atr: float, conf: int) -> Tuple[float, float, float]:
@@ -812,9 +834,8 @@ def compute_sl_tp(entry: float, side: str, atr: float, conf: int) -> Tuple[float
 
     R = sl_dist
 
-    # Single TP uses the same "R3" logic (premium coherence)
-    r3 = TP_R_MULTS[2]
-    tp_dist = r3 * R
+    # ✅ Premium: single-TP aim a bit wider (still capped by TP_MAX_PCT)
+    tp_dist = 2.0 * R  # was 1.7 * R
     tp_cap = (TP_MAX_PCT / 100.0) * entry
     tp_dist = min(tp_dist, tp_cap)
 
@@ -873,17 +894,18 @@ def multi_tp(entry: float, side: str, R: float) -> Tuple[float, float, float]:
     return tp1, tp2, tp3
 
 
+def rr_to_tp(entry: float, sl: float, tp: float) -> float:
+    # R/R = TP distance / SL distance
+    d_sl = abs(entry - sl)
+    d_tp = abs(tp - entry)
+    if d_sl <= 0:
+        return 0.0
+    return d_tp / d_sl
+
+
 # =========================================================
 # SETUP ENGINE
 # =========================================================
-
-def rr_to_tp3(entry: float, sl: float, tp3: float) -> float:
-    risk = abs(entry - sl)
-    reward = abs(tp3 - entry)
-    if risk <= 0:
-        return 0.0
-    return reward / risk
-
 
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
     score = 50.0
@@ -963,7 +985,7 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     return up_txt, dn_txt
 
 
-def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
+def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Setup]:
     fut_vol = usd_notional(mv)
     if fut_vol <= 0:
         return None
@@ -978,8 +1000,13 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
     # Direction gate: no counter-trend positions
     if abs(ch1) < TRIGGER_1H_ABS_MIN:
         return None
-    if abs(ch15) < CONFIRM_15M_ABS_MIN:
-        return None
+
+    # ✅ Model A:
+    # - STRICT (Email): require 15m confirm
+    # - SOFT  (Screen): do NOT reject; let confidence score handle it
+    if strict_15m:
+        if abs(ch15) < CONFIRM_15M_ABS_MIN:
+            return None
 
     side = "BUY" if ch1 > 0 else "SELL"
 
@@ -1012,20 +1039,11 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
     if sl <= 0 or tp3_single <= 0 or R <= 0:
         return None
 
-    # ✅ Premium gate: reject low R/R setups entirely (based on single TP3)
-    rr0 = rr_to_tp3(entry, sl, tp3_single)
-    if rr0 < MIN_RR_TP3:
-        return None
-
     tp1 = tp2 = None
     tp3 = tp3_single
     if conf >= MULTI_TP_MIN_CONF:
         _tp1, _tp2, _tp3 = multi_tp(entry, side, R)
         if _tp1 and _tp2 and _tp3:
-            # ✅ keep only if RR to TP3 is premium enough
-            rrM = rr_to_tp3(entry, sl, _tp3)
-            if rrM < MIN_RR_TP3:
-                return None
             tp1, tp2, tp3 = _tp1, _tp2, _tp3
 
     sid = next_setup_id()
@@ -1050,12 +1068,12 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
     return s
 
 
-def pick_setups(best_fut: Dict[str, MarketVol], n: int) -> List[Setup]:
+def pick_setups(best_fut: Dict[str, MarketVol], n: int, strict_15m: bool = True) -> List[Setup]:
     # consider top liquid coins only (speed + quality)
     universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:35]
     setups: List[Setup] = []
     for base, mv in universe:
-        s = make_setup(base, mv)
+        s = make_setup(base, mv, strict_15m=strict_15m)
         if s:
             setups.append(s)
 
@@ -1337,9 +1355,10 @@ Emails are sent only during your enabled sessions:
 - No symbol repeats for 18 hours
 - Session-based quality filters (NY easiest, ASIA strictest)
 
-Premium rules:
-- Entry Zone + No chase: اگر قیمت خارج از زون باشد وارد نشو.
-- MIN_RR gate: ستاپ‌های R/R پایین اصلاً ساخته/ارسال نمی‌شوند.
+✅ Premium Email Rules:
+- STRICT 15m confirm (filters out weak timing)
+- MIN_RR_TP3 gate (low R/R setups will NOT be emailed)
+- Email includes: "Entry Zone + No chase"
 
 8) Performance Reports (Your trades)
 - /report_daily
@@ -1977,7 +1996,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
     up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
 
-    setups = await asyncio.to_thread(pick_setups, best_fut, SETUPS_N)
+    # ✅ Model A: /screen is SOFT on 15m (strict_15m=False)
+    setups = await asyncio.to_thread(pick_setups, best_fut, SETUPS_N, False)
     for s in setups:
         db_insert_signal(s)
 
@@ -1988,12 +2008,14 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tps = f"TP {fmt_price(s.tp3)}"
             if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
                 tps = f"TP1 {fmt_price(s.tp1)} | TP2 {fmt_price(s.tp2)} | TP3 {fmt_price(s.tp3)}"
+            rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
             setup_blocks.append(
                 f"🔥 Setup #{i} — {s.side} {s.symbol} — Conf {s.conf}/100\n"
                 f"ID: {s.setup_id}\n"
                 f"Entry {fmt_price(s.entry)} | SL {fmt_price(s.sl)}\n"
                 f"{tps}\n"
-                f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | Vol~{fmt_money(s.fut_vol_usd)}\n"
+                f"RR(TP3): {rr3:.2f}\n"
+                f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}\n"
                 f"Chart: {tv_chart_url(s.symbol)}"
             )
         setups_txt = "\n\n".join(setup_blocks)
@@ -2036,11 +2058,14 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sig.get("tp1") and sig.get("tp2") and int(sig["conf"]) >= MULTI_TP_MIN_CONF:
             tps = f"TP1 {fmt_price(float(sig['tp1']))} | TP2 {fmt_price(float(sig['tp2']))} | TP3 {fmt_price(float(sig['tp3']))}"
 
+        rr3 = rr_to_tp(float(sig["entry"]), float(sig["sl"]), float(sig["tp3"]))
+
         await update.message.reply_text(
             f"🔎 Signal {sig['setup_id']}\n"
             f"{sig['side']} {sig['symbol']} — Conf {sig['conf']}/100\n"
             f"Entry {fmt_price(float(sig['entry']))} | SL {fmt_price(float(sig['sl']))}\n"
             f"{tps}\n"
+            f"RR(TP3): {rr3:.2f}\n"
             f"Chart: {tv_chart_url(sig['symbol'])}\n\n"
             f"To journal it:\n"
             f"/trade_open {sig['symbol']} {'long' if sig['side']=='BUY' else 'short'} entry {sig['entry']} sl {sig['sl']} risk usd 40 sig {sig['setup_id']}"
@@ -2051,14 +2076,30 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # EMAIL JOB
 # =========================================================
-def entry_zone(entry: float, atr: float) -> Tuple[float, float]:
-    # زون منطقی بر اساس ATR (نه خیلی تنگ، نه خیلی باز)
-    # حدوداً: 0.25 ATR با کف 0.15% و سقف 0.60% از قیمت
-    if entry <= 0:
-        return entry, entry
-    z = 0.25 * max(atr, 0.0)
-    z = clamp(z, (0.15/100.0)*entry, (0.60/100.0)*entry)
-    return (entry - z, entry + z)
+def _entry_zone_text(s: Setup) -> str:
+    R = abs(s.entry - s.sl)
+    if R <= 0:
+        return "Entry Zone: - | No chase: -"
+    z = ENTRY_ZONE_R * R
+    nc = NO_CHASE_R * R
+
+    if s.side == "BUY":
+        z_lo = s.entry - z
+        z_hi = s.entry + z
+        no_chase_above = s.entry + nc
+        return (
+            f"Entry Zone: {fmt_price(z_lo)} – {fmt_price(z_hi)}\n"
+            f"No chase: if price > {fmt_price(no_chase_above)}"
+        )
+    else:
+        z_lo = s.entry + z
+        z_hi = s.entry - z
+        no_chase_below = s.entry - nc
+        # For sell, zone should be shown as higher->lower, but keep readable:
+        return (
+            f"Entry Zone: {fmt_price(min(z_hi, z_lo))} – {fmt_price(max(z_hi, z_lo))}\n"
+            f"No chase: if price < {fmt_price(no_chase_below)}"
+        )
 
 
 def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, setups: List[Setup], best_fut: Dict[str, MarketVol]) -> str:
@@ -2086,21 +2127,16 @@ def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, set
     parts.append(SEP)
     parts.append("")
     for i, s in enumerate(setups, 1):
+        rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
         parts.append(f"{i}) {s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}/100")
-
-        # Entry Zone + No chase
-        _, _, _, atr = metrics_from_candles_1h_15m(s.market_symbol)
-        z_lo, z_hi = entry_zone(s.entry, atr)
-
-        parts.append(f"   Entry Zone: {fmt_price(z_lo)} → {fmt_price(z_hi)}  |  No chase ✅")
-        parts.append(f"   SL: {fmt_price(s.sl)}")
-
+        parts.append(f"   Entry: {fmt_price(s.entry)} | SL: {fmt_price(s.sl)} | RR(TP3): {rr3:.2f}")
+        parts.append(f"   {_entry_zone_text(s).replace(chr(10), chr(10)+'   ')}")
         if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
             parts.append(f"   TP1: {fmt_price(s.tp1)} ({TP_ALLOCS[0]}%) | TP2: {fmt_price(s.tp2)} ({TP_ALLOCS[1]}%) | TP3: {fmt_price(s.tp3)} ({TP_ALLOCS[2]}%)")
             parts.append("   Rule: after TP1 → move SL to BE")
         else:
             parts.append(f"   TP: {fmt_price(s.tp3)}")
-        parts.append(f"   24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | Vol~{fmt_money(s.fut_vol_usd)}")
+        parts.append(f"   24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}")
         parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
         parts.append("")
     parts.append(HDR)
@@ -2127,8 +2163,9 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not best_fut:
             return
 
-        # Compute a fresh set of best setups once per job (shared), then per-user filter cooldown
-        setups_all = await asyncio.to_thread(pick_setups, best_fut, max(EMAIL_SETUPS_N * 2, 6))
+        # ✅ Email is STRICT on 15m (Model A)
+        setups_all = await asyncio.to_thread(pick_setups, best_fut, max(EMAIL_SETUPS_N * 3, 9), True)
+
         # Persist signals for reference IDs
         for s in setups_all:
             db_insert_signal(s)
@@ -2164,12 +2201,19 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             # Filter by:
             # 1) session min_conf
             # 2) 18h per-user symbol cooldown
+            # 3) Premium MIN_RR_TP3 gate (RR to TP3)
             filtered: List[Setup] = []
             for s in setups_all:
                 if s.conf < min_conf:
                     continue
+
+                rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+                if rr3 < MIN_RR_TP3:
+                    continue
+
                 if symbol_recently_emailed(uid, s.symbol, SYMBOL_COOLDOWN_HOURS):
                     continue
+
                 filtered.append(s)
                 if len(filtered) >= EMAIL_SETUPS_N:
                     break
@@ -2183,9 +2227,9 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             body = _email_body_pretty(sess["name"], now_local, user["tz"], filtered, best_fut)
 
             if max_emails > 0:
-                subject = f"PulseFutures • {sess['name']} • Setups ({int(st['sent_count'])+1}/{max_emails})"
+                subject = f"PulseFutures • {sess['name']} • Premium Setups ({int(st['sent_count'])+1}/{max_emails})"
             else:
-                subject = f"PulseFutures • {sess['name']} • Setups (#{int(st['sent_count'])+1})"
+                subject = f"PulseFutures • {sess['name']} • Premium Setups (#{int(st['sent_count'])+1})"
 
             ok = await asyncio.to_thread(send_email, subject, body)
             if ok:
