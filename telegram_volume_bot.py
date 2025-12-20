@@ -2,35 +2,66 @@
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
 
-================================================================================
-✅ WHAT YOU ASKED (ALL APPLIED, NOTHING REMOVED)
-================================================================================
+✅ What you asked (implemented):
+1) Position sizing from Risk + StopLoss:
+   - /size BTC long risk usd 40 sl 42000
+   - /size BTC short risk pct 2.5 sl 43210
+   Bot fetches current futures price as Entry (unless you provide entry manually).
+   It returns Qty (contracts/base units) so user can open the position.
 
-A) Previous chat changes (applied)
-1) ✅ Confidence scoring fixed (NO more abs() bonus for opposite direction):
-   - Momentum "magnitude" is now direction-aware (signed) so counter-trend 24H doesn't inflate Conf.
+2) Full Trade Journal (open + close) and Equity auto-update:
+   - /trade_open BTC long entry 43000 sl 42000 risk usd 40 note "breakout" sig PF-20251219-0007
+   - /trade_close 12 pnl +85.5
+   Equity updates ONLY when you close trades, and stays persistent until /equity_reset.
 
-2) ✅ Soft 24H contradiction gate (optional -> now ENABLED with dynamic threshold):
-   - Prevents extreme counter-day setups from passing.
-   - Threshold is dynamic based on ATR% and clamped between 12%..22%.
+3) Emails per user timezone: 3–4 emails per active session (min 60m gap), best setups only.
+   Default enabled session is chosen based on user's TZ (Americas→NY, Europe/Africa→LON, Asia/Oceania→ASIA).
+   User can enable other sessions:
+   - /sessions
+   - /sessions_on NY
+   - /sessions_on LON
+   - /sessions_on ASIA
+   - /sessions_off LON
 
-B) Your latest request (applied)
-3) ✅ Wider TPs + better R/R:
-   - TP_R_MULTS increased to (1.2, 2.2, 3.5)
-   - TP_MAX_PCT increased to 12%
-   - Base TP3 target in compute_sl_tp is now 3.0R (before caps)
+4) Daily/Weekly user performance summary + advice:
+   - /report_daily
+   - /report_weekly
+   Includes win/loss, net PnL, win rate, avg R, biggest loss, and practical advice.
 
-4) ✅ SL slightly bigger (less noise stop-outs):
-   - sl_mult_from_conf() bumped up.
+5) Unique Setup IDs for emailed signals + signal summaries:
+   - Every emailed setup has a unique ID like PF-YYYYMMDD-0001
+   - Users can reference it in your Telegram channel, or attach it to trades
+   - Signal summary (sent signals, and performance if users link trades):
+     - /signals_daily
+     - /signals_weekly
 
-5) ✅ Quality gate: if TP3 RR is squeezed too much -> no email / no setup:
-   - MIN_RR_TP3 = 2.4 (only best signals)
+6) Speed + Render stability:
+   - Heavy CCXT + OHLCV work runs in asyncio.to_thread()
+   - In-memory TTL caching for tickers and OHLCV
+   - Alert job lock prevents overlapping runs
+   - Optional WEBHOOK mode (recommended on Render) to avoid 409 conflicts
 
-6) ✅ Entry Zone (so user is not forced to enter immediately):
-   - Each setup includes Entry Zone based on ATR (default 0.25 ATR).
-   - Email shows Entry Zone + "no chase" rule.
+✅ New additions (per your latest request, WITHOUT removing anything):
+7) Fixed session priority ordering (professional):
+   - Priority: NY > LON > ASIA (no accidental alphabetic sorting)
+   - Used consistently when enabling/disabling sessions and when listing enabled sessions
 
-================================================================================
+8) Professional definition of "best signals with session priority":
+   - Different strictness per session using MIN confidence:
+     NY: easier (more signals)  | LON: stricter | ASIA: strictest (highest quality)
+   - The bot still scans the FULL session window continuously (not only first 3 hours)
+
+9) Optional "unlimited email cap" support:
+   - /limits emailcap 0  => unlimited emails per session
+   - This keeps your minimum gap rule (emailgap) and cooldown (no repeating same symbol within 18h)
+
+✅ PREMIUM v2 additions:
+10) Premium signals tuning:
+   - Wider SL (sl_mult_from_conf increased)
+   - Bigger TP_R_MULTS + higher TP_MAX_PCT
+   - MIN_RR_TP3 gate: low R/R setups are rejected (not emailed)
+   - Email includes “Entry Zone + No chase” guidance
+
 IMPORTANT (Render):
 - If you see: "Conflict: terminated by other getUpdates request"
   it means multiple instances are polling. Use WEBHOOK mode or ensure only 1 instance.
@@ -116,31 +147,36 @@ DEFAULT_DAILY_CAP_MODE = "PCT"
 DEFAULT_DAILY_CAP_VALUE = 5.0
 DEFAULT_MAX_TRADES_DAY = 5
 DEFAULT_MIN_EMAIL_GAP_MIN = 60
-DEFAULT_MAX_EMAILS_PER_SESSION = 4
+DEFAULT_MAX_EMAILS_PER_SESSION = 4  # user can set 0 for unlimited (new feature)
 
 # Cooldown
 SYMBOL_COOLDOWN_HOURS = 18  # do not repeat same symbol in emails for that user within 18h
 
-# Multi-TP
+# Multi-TP / ATR / Premium tuning
 ATR_PERIOD = 14
 ATR_MIN_PCT = 0.8   # raise min stop distance a bit (less stop-outs)
-ATR_MAX_PCT = 8.0
+ATR_MAX_PCT = 10.0  # ✅ Premium: allow slightly wider SL if ATR demands it (was 8.0)
 
-# ✅ Wider TP cap (requested)
+# ✅ Premium: allow bigger targets if the move is there (was 7.0)
 TP_MAX_PCT = 12.0
 
-# ✅ Multi-TP minimum confidence
+# Multi-TP minimum confidence
 MULTI_TP_MIN_CONF = 78
 TP_ALLOCS = (40, 35, 25)  # TP1/TP2/TP3 split
 
-# ✅ Wider R-multipliers (requested)
-TP_R_MULTS = (1.2, 2.2, 3.5)
+# ✅ Premium: bigger R-multipliers for TP ladder (was (1.0, 1.7, 2.6))
+TP_R_MULTS = (1.2, 2.2, 3.4)
 
-# ✅ Best-signals-only quality gate
-MIN_RR_TP3 = 2.4
+# ✅ Premium: single TP3 distance in R (was 1.7 * R inside compute_sl_tp)
+TP3_SINGLE_R = 2.0
 
-# ✅ Entry zone for email + UX (not forced to market-enter)
-ENTRY_ZONE_ATR_MULT = 0.25  # 0.20..0.40 recommended
+# ✅ Premium gate: if TP3 R/R is low (often due to TP cap), reject the setup
+MIN_RR_TP3 = 1.6
+
+# ✅ Premium: Entry Zone parameters (no chase)
+# Zone uses R (stop distance) so it scales with volatility.
+ENTRY_ZONE_BELOW_R = 0.25   # entry - 0.25R
+ENTRY_ZONE_ABOVE_R = 0.10   # entry + 0.10R
 
 # Email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
@@ -176,6 +212,16 @@ SESSIONS_UTC = {
     "NY":   {"start": "13:00", "end": "20:00"},  # 13-20 UTC
 }
 
+# ✅ New: Priority order for sessions (best -> worst)
+SESSION_PRIORITY = ["NY", "LON", "ASIA"]
+
+# ✅ New: Stricter filters by session to make "NY best then LON then ASIA" professional
+SESSION_MIN_CONF = {
+    "NY": 72,     # more signals, still quality
+    "LON": 78,    # stricter
+    "ASIA": 82,   # strictest (highest quality)
+}
+
 # =========================================================
 # DATA STRUCTURES
 # =========================================================
@@ -200,14 +246,10 @@ class Setup:
     side: str
     conf: int
     entry: float
-    entry_lo: float
-    entry_hi: float
     sl: float
     tp1: Optional[float]
     tp2: Optional[float]
     tp3: float
-    r_dist: float
-    rr_tp3: float
     fut_vol_usd: float
     ch24: float
     ch4: float
@@ -247,12 +289,6 @@ def db_connect() -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     return con
 
-def _safe_alter(con: sqlite3.Connection, sql: str):
-    try:
-        con.execute(sql)
-        con.commit()
-    except Exception:
-        pass
 
 def db_init():
     con = db_connect()
@@ -304,14 +340,10 @@ def db_init():
         side TEXT NOT NULL,
         conf INTEGER NOT NULL,
         entry REAL NOT NULL,
-        entry_lo REAL,
-        entry_hi REAL,
         sl REAL NOT NULL,
         tp1 REAL,
         tp2 REAL,
         tp3 REAL NOT NULL,
-        r_dist REAL,
-        rr_tp3 REAL,
         fut_vol_usd REAL NOT NULL,
         ch24 REAL NOT NULL,
         ch4 REAL NOT NULL,
@@ -319,12 +351,6 @@ def db_init():
         ch15 REAL NOT NULL
     )
     """)
-
-    # migrations (older DBs)
-    _safe_alter(con, "ALTER TABLE signals ADD COLUMN entry_lo REAL")
-    _safe_alter(con, "ALTER TABLE signals ADD COLUMN entry_hi REAL")
-    _safe_alter(con, "ALTER TABLE signals ADD COLUMN r_dist REAL")
-    _safe_alter(con, "ALTER TABLE signals ADD COLUMN rr_tp3 REAL")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS email_state (
@@ -347,6 +373,7 @@ def db_init():
     con.commit()
     con.close()
 
+
 def _default_sessions_for_tz(tz_name: str) -> List[str]:
     s = tz_name.lower()
     if "america" in s or s.startswith("us/") or "new_york" in s:
@@ -354,6 +381,16 @@ def _default_sessions_for_tz(tz_name: str) -> List[str]:
     if "europe" in s or "london" in s or "africa" in s:
         return ["LON"]
     return ["ASIA"]
+
+
+def _order_sessions(xs: List[str]) -> List[str]:
+    cleaned = []
+    for x in xs:
+        x = str(x).strip().upper()
+        if x in SESSIONS_UTC and x not in cleaned:
+            cleaned.append(x)
+    return [s for s in SESSION_PRIORITY if s in cleaned]
+
 
 def get_user(user_id: int) -> dict:
     con = db_connect()
@@ -364,6 +401,7 @@ def get_user(user_id: int) -> dict:
     if not row:
         tz_name = "Australia/Melbourne"
         sessions = _default_sessions_for_tz(tz_name)
+        sessions = _order_sessions(sessions) or sessions
         now_local = datetime.now(ZoneInfo(tz_name)).date().isoformat()
         cur.execute("""
             INSERT INTO users (
@@ -397,6 +435,7 @@ def get_user(user_id: int) -> dict:
     con.close()
     return dict(row)
 
+
 def update_user(user_id: int, **kwargs):
     if not kwargs:
         return
@@ -408,6 +447,7 @@ def update_user(user_id: int, **kwargs):
     con.commit()
     con.close()
 
+
 def reset_daily_if_needed(user: dict) -> dict:
     tz = ZoneInfo(user["tz"])
     today = datetime.now(tz).date().isoformat()
@@ -416,6 +456,7 @@ def reset_daily_if_needed(user: dict) -> dict:
         user = get_user(user["user_id"])
     return user
 
+
 def list_users_notify_on() -> List[dict]:
     con = db_connect()
     cur = con.cursor()
@@ -423,6 +464,7 @@ def list_users_notify_on() -> List[dict]:
     rows = cur.fetchall()
     con.close()
     return [dict(r) for r in rows]
+
 
 def email_state_get(user_id: int) -> dict:
     con = db_connect()
@@ -438,6 +480,7 @@ def email_state_get(user_id: int) -> dict:
     con.close()
     return dict(row)
 
+
 def email_state_set(user_id: int, **kwargs):
     if not kwargs:
         return
@@ -448,6 +491,7 @@ def email_state_set(user_id: int, **kwargs):
     cur.execute(f"UPDATE email_state SET {sets} WHERE user_id=?", vals)
     con.commit()
     con.close()
+
 
 def mark_symbol_emailed(user_id: int, symbol: str):
     con = db_connect()
@@ -460,6 +504,7 @@ def mark_symbol_emailed(user_id: int, symbol: str):
     con.commit()
     con.close()
 
+
 def symbol_recently_emailed(user_id: int, symbol: str, cooldown_hours: float) -> bool:
     con = db_connect()
     cur = con.cursor()
@@ -470,24 +515,22 @@ def symbol_recently_emailed(user_id: int, symbol: str, cooldown_hours: float) ->
         return False
     return (time.time() - float(row["emailed_ts"])) < (cooldown_hours * 3600)
 
+
 def db_insert_signal(s: Setup):
     con = db_connect()
     cur = con.cursor()
     cur.execute("""
         INSERT OR REPLACE INTO signals (
-            setup_id, created_ts, symbol, side, conf,
-            entry, entry_lo, entry_hi,
-            sl, tp1, tp2, tp3, r_dist, rr_tp3,
+            setup_id, created_ts, symbol, side, conf, entry, sl, tp1, tp2, tp3,
             fut_vol_usd, ch24, ch4, ch1, ch15
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        s.setup_id, s.created_ts, s.symbol, s.side, s.conf,
-        s.entry, s.entry_lo, s.entry_hi,
-        s.sl, s.tp1, s.tp2, s.tp3, s.r_dist, s.rr_tp3,
-        s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+        s.setup_id, s.created_ts, s.symbol, s.side, s.conf, s.entry, s.sl,
+        s.tp1, s.tp2, s.tp3, s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
     ))
     con.commit()
     con.close()
+
 
 def db_get_signal(setup_id: str) -> Optional[dict]:
     con = db_connect()
@@ -497,6 +540,7 @@ def db_get_signal(setup_id: str) -> Optional[dict]:
     con.close()
     return dict(row) if row else None
 
+
 def db_list_signals_since(ts_from: float) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
@@ -504,6 +548,7 @@ def db_list_signals_since(ts_from: float) -> List[dict]:
     rows = cur.fetchall()
     con.close()
     return [dict(r) for r in rows]
+
 
 def db_trade_open(user_id: int, symbol: str, side: str, entry: float, sl: float,
                   risk_usd: float, qty: float, note: str = "", signal_id: str = "") -> int:
@@ -520,6 +565,7 @@ def db_trade_open(user_id: int, symbol: str, side: str, entry: float, sl: float,
     con.commit()
     con.close()
     return int(trade_id)
+
 
 def db_trade_close(user_id: int, trade_id: int, pnl: float) -> Optional[dict]:
     con = db_connect()
@@ -546,6 +592,7 @@ def db_trade_close(user_id: int, trade_id: int, pnl: float) -> Optional[dict]:
     t["r_mult"] = r_mult
     return t
 
+
 def db_open_trades(user_id: int) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
@@ -553,6 +600,7 @@ def db_open_trades(user_id: int) -> List[dict]:
     rows = cur.fetchall()
     con.close()
     return [dict(r) for r in rows]
+
 
 def db_trades_since(user_id: int, ts_from: float) -> List[dict]:
     con = db_connect()
@@ -578,6 +626,7 @@ def build_exchange():
         "options": {"defaultType": DEFAULT_TYPE},
     })
 
+
 def safe_split_symbol(sym: Optional[str]) -> Optional[Tuple[str, str]]:
     if not sym:
         return None
@@ -586,6 +635,7 @@ def safe_split_symbol(sym: Optional[str]) -> Optional[Tuple[str, str]]:
         return None
     return tuple(pair.split("/", 1))
 
+
 def usd_notional(mv: MarketVol) -> float:
     if mv.quote in STABLES and mv.quote_vol:
         return float(mv.quote_vol)
@@ -593,6 +643,7 @@ def usd_notional(mv: MarketVol) -> float:
     if not price or not mv.base_vol:
         return 0.0
     return float(mv.base_vol) * float(price)
+
 
 def to_mv(t: dict) -> Optional[MarketVol]:
     sym = t.get("symbol")
@@ -611,6 +662,7 @@ def to_mv(t: dict) -> Optional[MarketVol]:
         quote_vol=float(t.get("quoteVolume") or 0.0),
         vwap=float(t.get("vwap") or 0.0),
     )
+
 
 def fetch_futures_tickers() -> Dict[str, MarketVol]:
     if cache_valid("tickers_best_fut", TICKERS_TTL_SEC):
@@ -633,6 +685,7 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
     cache_set("tickers_best_fut", best)
     return best
 
+
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     key = f"ohlcv:{symbol}:{timeframe}:{limit}"
     if cache_valid(key, OHLCV_TTL_SEC):
@@ -643,6 +696,7 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
     cache_set(key, data)
     return data
+
 
 def compute_atr_from_ohlcv(candles: List[List[float]], period: int) -> float:
     if not candles or len(candles) < period + 2:
@@ -657,6 +711,7 @@ def compute_atr_from_ohlcv(candles: List[List[float]], period: int) -> float:
     if len(trs) < period:
         return 0.0
     return sum(trs[-period:]) / period
+
 
 def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float, float]:
     need_1h = max(ATR_PERIOD + 6, 35)
@@ -697,6 +752,7 @@ def fmt_price(x: float) -> str:
         return f"{x:.5f}"
     return f"{x:.6f}"
 
+
 def fmt_money(x: float) -> str:
     ax = abs(x)
     if ax >= 1_000_000:
@@ -704,6 +760,7 @@ def fmt_money(x: float) -> str:
     if ax >= 1_000:
         return f"{x/1_000:.1f}K"
     return f"{x:.0f}"
+
 
 def pct_with_emoji(p: float) -> str:
     val = int(round(p))
@@ -715,8 +772,10 @@ def pct_with_emoji(p: float) -> str:
         emo = "🟡"
     return f"{val:+d}% {emo}"
 
+
 def tv_chart_url(symbol_base: str) -> str:
     return f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol_base.upper()}USDT.P"
+
 
 def table_md(rows: List[List[Any]], headers: List[str]) -> str:
     return "```\n" + tabulate(rows, headers=headers, tablefmt="github") + "\n```"
@@ -741,43 +800,33 @@ def next_setup_id() -> str:
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-# ✅ Bigger SL multipliers (requested)
+
 def sl_mult_from_conf(conf: int) -> float:
-    if conf >= 90:
-        return 2.8
-    if conf >= 82:
-        return 2.4
-    if conf >= 72:
+    # ✅ Premium: slightly wider stops across the board (was 2.3/2.0/1.7/1.5)
+    if conf >= 88:
+        return 2.6
+    if conf >= 80:
+        return 2.3
+    if conf >= 70:
         return 2.0
     return 1.8
 
-# ✅ compute_sl_tp now aims for larger RR, and rejects low-RR setups
-def compute_sl_tp(entry: float, side: str, atr: float, conf: int) -> Tuple[float, float, float, float]:
-    # returns (sl, tp3, R, rr_tp3)
+
+def compute_sl_tp(entry: float, side: str, atr: float, conf: int) -> Tuple[float, float, float]:
+    # returns (sl, tp3, R)
     if entry <= 0 or atr <= 0:
-        return 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     sl_dist = sl_mult_from_conf(conf) * atr
-
     min_dist = (ATR_MIN_PCT / 100.0) * entry
     max_dist = (ATR_MAX_PCT / 100.0) * entry
     sl_dist = clamp(sl_dist, min_dist, max_dist)
 
     R = sl_dist
-
-    # Wider base TP target
-    target_tp_mult = 3.0
-    tp_dist = target_tp_mult * R
-
-    # cap by percent
+    # ✅ Premium: target a bigger TP3 baseline in R (was 1.7*R)
+    tp_dist = TP3_SINGLE_R * R
     tp_cap = (TP_MAX_PCT / 100.0) * entry
     tp_dist = min(tp_dist, tp_cap)
-
-    rr_tp3 = (tp_dist / R) if R > 0 else 0.0
-
-    # Best-only gate
-    if rr_tp3 < MIN_RR_TP3:
-        return 0.0, 0.0, 0.0, 0.0
 
     if side == "BUY":
         sl = entry - sl_dist
@@ -786,7 +835,8 @@ def compute_sl_tp(entry: float, side: str, atr: float, conf: int) -> Tuple[float
         sl = entry + sl_dist
         tp3 = entry - tp_dist
 
-    return sl, tp3, R, rr_tp3
+    return sl, tp3, R
+
 
 def _distinctify(a: float, b: float, c: float, entry: float, side: str) -> Tuple[float, float, float]:
     if entry <= 0:
@@ -801,13 +851,14 @@ def _distinctify(a: float, b: float, c: float, entry: float, side: str) -> Tuple
     else:
         if a <= b: a = b + eps
         if b <= c: b = c + eps
-        if a <= b: a = a + eps
+        if a <= b: a = b + eps
 
     if abs(a - b) < eps: a = a - eps if side == "BUY" else a + eps
     if abs(b - c) < eps: b = b - eps if side == "BUY" else b + eps
     if abs(a - c) < eps: a = a - 2*eps if side == "BUY" else a + 2*eps
 
     return a, b, c
+
 
 def multi_tp(entry: float, side: str, R: float) -> Tuple[float, float, float]:
     if entry <= 0 or R <= 0:
@@ -829,10 +880,26 @@ def multi_tp(entry: float, side: str, R: float) -> Tuple[float, float, float]:
     return tp1, tp2, tp3
 
 
+def rr_tp3(entry: float, sl: float, tp3: float) -> float:
+    risk = abs(entry - sl)
+    reward = abs(tp3 - entry)
+    if risk <= 0:
+        return 0.0
+    return reward / risk
+
+
+def entry_zone(entry: float, side: str, R: float) -> Tuple[float, float]:
+    if entry <= 0 or R <= 0:
+        return entry, entry
+    lo = entry - (ENTRY_ZONE_BELOW_R * R)
+    hi = entry + (ENTRY_ZONE_ABOVE_R * R)
+    # For SELL, zone is still a "price band" around entry; we keep lo<hi for readability
+    return (min(lo, hi), max(lo, hi))
+
+
 # =========================================================
 # SETUP ENGINE
 # =========================================================
-# ✅ Confidence scoring fixed (direction-aware magnitude)
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
     score = 50.0
     is_long = (side == "BUY")
@@ -868,12 +935,14 @@ def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: flo
     score = clamp(score, 0, 100)
     return int(round(score))
 
+
 def build_leaders_table(best_fut: Dict[str, MarketVol]) -> str:
     leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:LEADERS_N]
     rows = []
     for base, mv in leaders:
         rows.append([base, fmt_money(usd_notional(mv)), pct_with_emoji(float(mv.percentage or 0.0)), fmt_price(float(mv.last or 0.0))])
     return "*Market Leaders (Top 10 by Futures Volume)*\n" + table_md(rows, ["SYM", "F Vol", "24H", "Last"])
+
 
 def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tuple], List[Tuple]]:
     up, dn = [], []
@@ -896,6 +965,7 @@ def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tupl
     dn.sort(key=lambda x: (x[2], x[1]))
     return up, dn
 
+
 def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     up, dn = compute_directional_lists(best_fut)
     up_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4), fmt_price(px)] for b, v, c24, c4, px in up[:10]]
@@ -903,6 +973,7 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     up_txt = "*Directional Leaders (24H ≥ +10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(up_rows, ["SYM", "F Vol", "24H", "4H", "Last"]) if up_rows else "_None_")
     dn_txt = "*Directional Losers (24H ≤ -10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(dn_rows, ["SYM", "F Vol", "24H", "4H", "Last"]) if dn_rows else "_None_")
     return up_txt, dn_txt
+
 
 def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
     fut_vol = usd_notional(mv)
@@ -916,7 +987,6 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
     ch24 = float(mv.percentage or 0.0)
     ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol)
 
-    # Direction gate: must have 1H + 15m momentum
     if abs(ch1) < TRIGGER_1H_ABS_MIN:
         return None
     if abs(ch15) < CONFIRM_15M_ABS_MIN:
@@ -924,14 +994,11 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
 
     side = "BUY" if ch1 > 0 else "SELL"
 
-    # trend filter (no short if 4H bullish, no long if 4H bearish)
     if side == "BUY" and ch4 < ALIGN_4H_MIN:
         return None
     if side == "SELL" and ch4 > -ALIGN_4H_MIN:
         return None
 
-    # ✅ Soft 24H contradiction gate (dynamic, based on ATR%)
-    # threshold = clamp(max(12, 2.5*ATR%), 12, 22)
     atr_pct = (atr / entry) * 100.0 if (atr and entry) else 0.0
     thr = clamp(max(12.0, 2.5 * atr_pct), 12.0, 22.0)
 
@@ -942,20 +1009,22 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
 
     conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
 
-    sl, tp3_single, R, rr_tp3 = compute_sl_tp(entry, side, atr, conf)
+    sl, tp3_single, R = compute_sl_tp(entry, side, atr, conf)
     if sl <= 0 or tp3_single <= 0 or R <= 0:
         return None
 
-    # ✅ Entry Zone (ATR-based)
-    ez = ENTRY_ZONE_ATR_MULT * atr if atr > 0 else 0.0
-    entry_lo = max(0.0, entry - ez)
-    entry_hi = entry + ez
+    # ✅ Premium gate: reject low RR (usually caused by TP cap or too-wide SL)
+    if rr_tp3(entry, sl, tp3_single) < MIN_RR_TP3:
+        return None
 
     tp1 = tp2 = None
     tp3 = tp3_single
     if conf >= MULTI_TP_MIN_CONF:
         _tp1, _tp2, _tp3 = multi_tp(entry, side, R)
         if _tp1 and _tp2 and _tp3:
+            # gate again after multi-TP (cap could still reduce)
+            if rr_tp3(entry, sl, _tp3) < MIN_RR_TP3:
+                return None
             tp1, tp2, tp3 = _tp1, _tp2, _tp3
 
     sid = next_setup_id()
@@ -966,14 +1035,10 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
         side=side,
         conf=conf,
         entry=entry,
-        entry_lo=entry_lo,
-        entry_hi=entry_hi,
         sl=sl,
         tp1=tp1,
         tp2=tp2,
         tp3=tp3,
-        r_dist=R,
-        rr_tp3=rr_tp3,
         fut_vol_usd=fut_vol,
         ch24=ch24,
         ch4=ch4,
@@ -982,6 +1047,7 @@ def make_setup(base: str, mv: MarketVol) -> Optional[Setup]:
         created_ts=time.time(),
     )
     return s
+
 
 def pick_setups(best_fut: Dict[str, MarketVol], n: int) -> List[Setup]:
     universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:35]
@@ -1000,6 +1066,7 @@ def pick_setups(best_fut: Dict[str, MarketVol], n: int) -> List[Setup]:
 # =========================================================
 def email_config_ok() -> bool:
     return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO])
+
 
 def send_email(subject: str, body: str) -> bool:
     if not email_config_ok():
@@ -1042,18 +1109,16 @@ def parse_hhmm(s: str) -> Tuple[int, int]:
         raise ValueError("bad time")
     return hh, mm
 
+
 def user_enabled_sessions(user: dict) -> List[str]:
     try:
         xs = json.loads(user["sessions_enabled"])
         if isinstance(xs, list) and xs:
-            out = []
-            for x in xs:
-                x = str(x).strip().upper()
-                if x in SESSIONS_UTC:
-                    out.append(x)
-            return out or _default_sessions_for_tz(user["tz"])
+            ordered = _order_sessions(xs)
+            return ordered or _default_sessions_for_tz(user["tz"])
     except Exception:
         return _default_sessions_for_tz(user["tz"])
+
 
 def in_session_now(user: dict) -> Optional[dict]:
     tz = ZoneInfo(user["tz"])
@@ -1100,11 +1165,13 @@ def compute_risk_usd(user: dict, mode: str, value: float) -> float:
         return 0.0
     return max(0.0, eq * (float(value) / 100.0))
 
+
 def calc_qty(entry: float, sl: float, risk_usd: float) -> float:
     d = abs(entry - sl)
     if entry <= 0 or d <= 0 or risk_usd <= 0:
         return 0.0
     return risk_usd / d
+
 
 def daily_cap_usd(user: dict) -> float:
     mode = user["daily_cap_mode"].upper()
@@ -1143,6 +1210,7 @@ def _stats_from_trades(trades: List[dict]) -> dict:
         "biggest_win": biggest_win,
     }
 
+
 def _advice(user: dict, stats: dict) -> List[str]:
     adv = []
     if stats["closed_n"] < 5:
@@ -1176,7 +1244,6 @@ PulseFutures — Commands (Telegram)
 
 3) Trade Journal (Open / Close) + Equity auto-update
 - /equity [amount]
-- /equity_reset
 - /trade_open ...
 - /trade_close ...
 
@@ -1184,25 +1251,18 @@ PulseFutures — Commands (Telegram)
 - /status
 
 5) Risk Settings
-- /riskmode pct 2.5
-- /riskmode usd 25
-- /dailycap pct 5
-- /dailycap usd 60
-- /limits maxtrades 5
-- /limits emailcap 4
-- /limits emailgap 60
+- /riskmode ...
+- /dailycap ...
+- /limits ...
 
-6) Sessions (Emails by session)
+6) Sessions
 - /sessions
-- /sessions_on NY|LON|ASIA
-- /sessions_off NY|LON|ASIA
+- /sessions_on ...
+- /sessions_off ...
 
 7) Email Alerts
 - /notify_on
 - /notify_off
-Notes:
-- Best signals only (TP3 RR must be >= MIN_RR_TP3)
-- Entry Zone included (no chase)
 
 8) Performance Reports
 - /report_daily
@@ -1211,6 +1271,10 @@ Notes:
 9) Signal Reports
 - /signals_daily
 - /signals_weekly
+
+Premium notes:
+- Wider SL + higher TP caps + MIN_RR_TP3 gate (low R/R setups are rejected)
+- Emails include Entry Zone + No chase (do not chase price outside zone)
 
 Not financial advice.
 """
@@ -1221,6 +1285,7 @@ Not financial advice.
 # =========================================================
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
+
 
 async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1234,8 +1299,10 @@ async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Invalid TZ. Example: /tz Australia/Melbourne  or  /tz America/New_York")
         return
-    update_user(uid, tz=tz_name, sessions_enabled=json.dumps(_default_sessions_for_tz(tz_name)))
+    sessions = _order_sessions(_default_sessions_for_tz(tz_name)) or _default_sessions_for_tz(tz_name)
+    update_user(uid, tz=tz_name, sessions_enabled=json.dumps(sessions))
     await update.message.reply_text(f"✅ TZ set to {tz_name}\nDefault sessions updated. Use /sessions to view.")
+
 
 async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1252,10 +1319,12 @@ async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Usage: /equity 1000")
 
+
 async def equity_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     update_user(uid, equity=0.0)
     await update.message.reply_text("✅ Equity reset to $0.00")
+
 
 async def riskmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1280,6 +1349,7 @@ async def riskmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     update_user(uid, risk_mode=mode, risk_value=val)
     await update.message.reply_text(f"✅ Risk mode updated: {mode} {val:.2f}")
+
 
 async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1307,6 +1377,7 @@ async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
     await update.message.reply_text(f"✅ Daily cap updated. (≈ ${daily_cap_usd(user):.2f})")
 
+
 async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -1315,11 +1386,12 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Limits:\n"
             f"- maxtrades: {int(user['max_trades_day'])}\n"
-            f"- emailcap: {int(user['max_emails_per_session'])}\n"
+            f"- emailcap: {int(user['max_emails_per_session'])} (0 = unlimited)\n"
             f"- emailgap: {int(user['email_gap_min'])} min\n\n"
             f"Set examples:\n"
             f"/limits maxtrades 5\n"
             f"/limits emailcap 4\n"
+            f"/limits emailcap 0   (unlimited)\n"
             f"/limits emailgap 60"
         )
         return
@@ -1337,20 +1409,24 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         update_user(uid, max_trades_day=val)
         await update.message.reply_text(f"✅ maxtrades/day set to {val}")
+
     elif key == "emailcap":
-        if not (0 <= val <= 25):
-            await update.message.reply_text("emailcap must be 0..25 (0 = unlimited)")
+        if not (0 <= val <= 50):
+            await update.message.reply_text("emailcap must be 0..50 (0 = unlimited)")
             return
         update_user(uid, max_emails_per_session=val)
-        await update.message.reply_text(f"✅ emailcap/session set to {val} ({'unlimited' if val==0 else 'capped'})")
+        await update.message.reply_text(f"✅ emailcap/session set to {val} (0 = unlimited)")
+
     elif key == "emailgap":
         if not (0 <= val <= 360):
             await update.message.reply_text("emailgap must be 0..360 minutes")
             return
         update_user(uid, email_gap_min=val)
         await update.message.reply_text(f"✅ emailgap set to {val} minutes")
+
     else:
         await update.message.reply_text("Unknown key. Use: maxtrades | emailcap | emailgap")
+
 
 async def sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1361,11 +1437,12 @@ async def sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Your TZ: {user['tz']}\n"
         f"{now_txt}\n\n"
-        f"Enabled sessions: {', '.join(enabled)}\n"
+        f"Enabled sessions (priority): {', '.join(enabled)}\n"
         f"Available: ASIA, LON, NY\n\n"
         f"Enable: /sessions_on NY\n"
         f"Disable: /sessions_off LON"
     )
+
 
 async def sessions_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1377,10 +1454,15 @@ async def sessions_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if name not in SESSIONS_UTC:
         await update.message.reply_text("Session must be one of: ASIA, LON, NY")
         return
-    enabled = set(user_enabled_sessions(user))
-    enabled.add(name)
-    update_user(uid, sessions_enabled=json.dumps(sorted(enabled)))
-    await update.message.reply_text(f"✅ Enabled sessions: {', '.join(sorted(enabled))}")
+
+    enabled = user_enabled_sessions(user)
+    if name not in enabled:
+        enabled.append(name)
+
+    enabled = _order_sessions(enabled) or enabled
+    update_user(uid, sessions_enabled=json.dumps(enabled))
+    await update.message.reply_text(f"✅ Enabled sessions: {', '.join(enabled)}")
+
 
 async def sessions_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1389,23 +1471,27 @@ async def sessions_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /sessions_off LON")
         return
     name = context.args[0].strip().upper()
-    enabled = set(user_enabled_sessions(user))
-    if name in enabled:
-        enabled.remove(name)
+
+    enabled = [s for s in user_enabled_sessions(user) if s != name]
     if not enabled:
-        enabled = set(_default_sessions_for_tz(user["tz"]))
-    update_user(uid, sessions_enabled=json.dumps(sorted(enabled)))
-    await update.message.reply_text(f"✅ Enabled sessions: {', '.join(sorted(enabled))}")
+        enabled = _default_sessions_for_tz(user["tz"])
+
+    enabled = _order_sessions(enabled) or enabled
+    update_user(uid, sessions_enabled=json.dumps(enabled))
+    await update.message.reply_text(f"✅ Enabled sessions: {', '.join(enabled)}")
+
 
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     update_user(uid, notify_on=1)
     await update.message.reply_text("✅ Email alerts: ON")
 
+
 async def notify_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     update_user(uid, notify_on=0)
     await update.message.reply_text("✅ Email alerts: OFF")
+
 
 async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1490,6 +1576,7 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- Qty: {qty:.6g}\n\n"
         f"Chart: {tv_chart_url(sym)}"
     )
+
 
 async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1585,6 +1672,7 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- Note: {note if note else '-'}"
     )
 
+
 async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -1627,6 +1715,7 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- New Equity: ${float(user['equity']):.2f}"
     )
 
+
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
@@ -1660,6 +1749,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text("\n".join(lines))
 
+
 async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -1684,6 +1774,7 @@ async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg.extend([f"- {x}" for x in adv])
 
     await update.message.reply_text("\n".join(msg))
+
 
 async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1713,6 +1804,7 @@ async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(msg))
 
+
 async def signals_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -1738,6 +1830,7 @@ async def signals_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg.append("Your linked signal trades closed today: 0")
 
     await update.message.reply_text("\n".join(msg))
+
 
 async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1767,6 +1860,7 @@ async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text("\n".join(msg))
 
+
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Scanning market…")
 
@@ -1785,15 +1879,19 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if setups:
         setup_blocks = []
         for i, s in enumerate(setups, 1):
+            rr = rr_tp3(s.entry, s.sl, s.tp3)
+            zlo, zhi = entry_zone(s.entry, s.side, abs(s.entry - s.sl))
+
             tps = f"TP {fmt_price(s.tp3)}"
             if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
                 tps = f"TP1 {fmt_price(s.tp1)} | TP2 {fmt_price(s.tp2)} | TP3 {fmt_price(s.tp3)}"
+
             setup_blocks.append(
                 f"🔥 Setup #{i} — {s.side} {s.symbol} — Conf {s.conf}/100\n"
                 f"ID: {s.setup_id}\n"
-                f"Entry Zone {fmt_price(s.entry_lo)} .. {fmt_price(s.entry_hi)} | SL {fmt_price(s.sl)}\n"
+                f"Entry {fmt_price(s.entry)} | SL {fmt_price(s.sl)} | RR(TP3) {rr:.2f}\n"
                 f"{tps}\n"
-                f"RR(TP3): {s.rr_tp3:.2f}R\n"
+                f"Entry Zone: {fmt_price(zlo)} – {fmt_price(zhi)} (No chase)\n"
                 f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | Vol~{fmt_money(s.fut_vol_usd)}\n"
                 f"Chart: {tv_chart_url(s.symbol)}"
             )
@@ -1808,7 +1906,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"✨ PulseFutures — Market Scan\n"
         f"{HDR}\n"
-        f"— Top Trade Setups\n"
+        f"— Top Trade Setups (Premium)\n"
         f"{setups_txt}\n\n"
         f"— Directional Leaders / Losers\n"
         f"{up_txt}\n\n{dn_txt}\n\n"
@@ -1823,6 +1921,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(kb) if kb else None,
     )
 
+
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text.startswith("PF-"):
@@ -1831,20 +1930,22 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Signal ID not found.")
             return
 
-        tps = f"TP {fmt_price(float(sig['tp3']))}"
-        if sig.get("tp1") and sig.get("tp2") and int(sig["conf"]) >= MULTI_TP_MIN_CONF:
-            tps = f"TP1 {fmt_price(float(sig['tp1']))} | TP2 {fmt_price(float(sig['tp2']))} | TP3 {fmt_price(float(sig['tp3']))}"
+        entry = float(sig["entry"])
+        sl = float(sig["sl"])
+        tp3 = float(sig["tp3"])
+        rr = rr_tp3(entry, sl, tp3)
+        zlo, zhi = entry_zone(entry, str(sig["side"]), abs(entry - sl))
 
-        entry_lo = float(sig.get("entry_lo") or sig["entry"])
-        entry_hi = float(sig.get("entry_hi") or sig["entry"])
-        rr = float(sig.get("rr_tp3") or 0.0)
+        tps = f"TP {fmt_price(tp3)}"
+        if sig.get("tp1") and sig.get("tp2") and int(sig["conf"]) >= MULTI_TP_MIN_CONF:
+            tps = f"TP1 {fmt_price(float(sig['tp1']))} | TP2 {fmt_price(float(sig['tp2']))} | TP3 {fmt_price(tp3)}"
 
         await update.message.reply_text(
             f"🔎 Signal {sig['setup_id']}\n"
             f"{sig['side']} {sig['symbol']} — Conf {sig['conf']}/100\n"
-            f"Entry Zone {fmt_price(entry_lo)} .. {fmt_price(entry_hi)} | SL {fmt_price(float(sig['sl']))}\n"
+            f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | RR(TP3) {rr:.2f}\n"
             f"{tps}\n"
-            f"RR(TP3): {rr:.2f}R\n"
+            f"Entry Zone: {fmt_price(zlo)} – {fmt_price(zhi)} (No chase)\n"
             f"Chart: {tv_chart_url(sig['symbol'])}\n\n"
             f"To journal it:\n"
             f"/trade_open {sig['symbol']} {'long' if sig['side']=='BUY' else 'short'} entry {sig['entry']} sl {sig['sl']} risk usd 40 sig {sig['setup_id']}"
@@ -1859,6 +1960,7 @@ def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, set
     parts = []
     parts.append(HDR)
     parts.append(f"📩 PulseFutures • {session_name} Session • {now_local.strftime('%Y-%m-%d %H:%M')} ({user_tz})")
+    parts.append("Premium Mode: Wider SL + Bigger TP + MIN_RR gate + Entry Zone (No chase)")
     parts.append(HDR)
     parts.append("")
 
@@ -1875,27 +1977,31 @@ def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, set
         parts.append("Losers:  " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in dn[:3]]))
     parts.append("")
 
-    parts.append("Top Setups (Reference IDs)")
+    parts.append("Top Setups (Entry Zone + No chase)")
     parts.append(SEP)
     parts.append("")
     for i, s in enumerate(setups, 1):
+        rr = rr_tp3(s.entry, s.sl, s.tp3)
+        zlo, zhi = entry_zone(s.entry, s.side, abs(s.entry - s.sl))
+
         parts.append(f"{i}) {s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}/100")
-        parts.append(f"   Entry Zone: {fmt_price(s.entry_lo)} .. {fmt_price(s.entry_hi)} | SL: {fmt_price(s.sl)}")
+        parts.append(f"   Entry: {fmt_price(s.entry)} | SL: {fmt_price(s.sl)} | RR(TP3): {rr:.2f}")
+        parts.append(f"   Entry Zone: {fmt_price(zlo)} – {fmt_price(zhi)}  |  No chase: اگر قیمت خارج از زون است، دنبال نکن.")
         if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
             parts.append(f"   TP1: {fmt_price(s.tp1)} ({TP_ALLOCS[0]}%) | TP2: {fmt_price(s.tp2)} ({TP_ALLOCS[1]}%) | TP3: {fmt_price(s.tp3)} ({TP_ALLOCS[2]}%)")
             parts.append("   Rule: after TP1 → move SL to BE")
         else:
             parts.append(f"   TP: {fmt_price(s.tp3)}")
-        parts.append(f"   RR(TP3): {s.rr_tp3:.2f}R | R(dist): {fmt_price(s.r_dist)}")
         parts.append(f"   24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | Vol~{fmt_money(s.fut_vol_usd)}")
-        parts.append("   Plan: Prefer LIMIT entry in zone. If price runs away beyond zone, skip (no chase).")
         parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
         parts.append("")
+
     parts.append(HDR)
     parts.append("Not financial advice.")
     parts.append("PulseFutures")
     parts.append(HDR)
     return "\n".join(parts).strip()
+
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     if ALERT_LOCK.locked():
@@ -1914,7 +2020,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not best_fut:
             return
 
-        setups_all = await asyncio.to_thread(pick_setups, best_fut, max(EMAIL_SETUPS_N * 2, 8))
+        setups_all = await asyncio.to_thread(pick_setups, best_fut, max(EMAIL_SETUPS_N * 2, 6))
         for s in setups_all:
             db_insert_signal(s)
 
@@ -1934,17 +2040,23 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             gap_min = int(user["email_gap_min"])
             gap_sec = gap_min * 60
 
-            # emailcap==0 => unlimited
-            if max_emails != 0 and int(st["sent_count"]) >= max_emails:
+            if max_emails > 0 and int(st["sent_count"]) >= max_emails:
                 continue
 
             now_ts = time.time()
             if gap_sec > 0 and (now_ts - float(st["last_email_ts"])) < gap_sec:
                 continue
 
+            min_conf = SESSION_MIN_CONF.get(sess["name"], 78)
+
             filtered: List[Setup] = []
             for s in setups_all:
+                if s.conf < min_conf:
+                    continue
                 if symbol_recently_emailed(uid, s.symbol, SYMBOL_COOLDOWN_HOURS):
+                    continue
+                # Premium gate already applied inside make_setup (RR gate), but keep safe:
+                if rr_tp3(s.entry, s.sl, s.tp3) < MIN_RR_TP3:
                     continue
                 filtered.append(s)
                 if len(filtered) >= EMAIL_SETUPS_N:
@@ -1958,8 +2070,10 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
             body = _email_body_pretty(sess["name"], now_local, user["tz"], filtered, best_fut)
 
-            cap_txt = "∞" if max_emails == 0 else f"{max_emails}"
-            subject = f"PulseFutures • {sess['name']} • Setups ({int(st['sent_count'])+1}/{cap_txt})"
+            if max_emails > 0:
+                subject = f"PulseFutures • {sess['name']} • Premium Setups ({int(st['sent_count'])+1}/{max_emails})"
+            else:
+                subject = f"PulseFutures • {sess['name']} • Premium Setups (#{int(st['sent_count'])+1})"
 
             ok = await asyncio.to_thread(send_email, subject, body)
             if ok:
@@ -1979,7 +2093,6 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler(["help", "start"], cmd_help))
     app.add_handler(CommandHandler("tz", tz_cmd))
 
@@ -2013,7 +2126,6 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
-    # job queue
     if getattr(app, "job_queue", None):
         app.job_queue.run_repeating(alert_job, interval=CHECK_INTERVAL_MIN * 60, first=15, name="alert_job")
     else:
@@ -2037,6 +2149,7 @@ def main():
     else:
         logger.info("Starting POLLING mode (ensure ONLY ONE instance running).")
         app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
