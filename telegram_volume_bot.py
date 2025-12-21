@@ -77,6 +77,13 @@ PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + 
      so users don’t get spammed even on strong market days.
    - This is independent from per-session emailcap and keeps your emailgap + 18h symbol cooldown.
 
+✅ NEW (your latest request, WITHOUT removing anything):
+13) Trend-follow Email filter (avoid counter-trend reversals like RESOLV):
+   - Emails only when 24H supports the trade direction:
+       BUY  => 24H >= +0.5%
+       SELL => 24H <= -0.5%
+   - /screen stays unchanged (still shows setups for awareness)
+
 IMPORTANT (Render):
 - If you see: "Conflict: terminated by other getUpdates request"
   it means multiple instances are polling. Use WEBHOOK mode or ensure only 1 instance.
@@ -160,6 +167,9 @@ EARLY_1H_ABS_MIN = 3.8         # "very strong" 1H momentum gate
 EARLY_CONF_PENALTY = 6         # reduce conf a bit if 15m is weak (still eligible if very strong)
 EARLY_EMAIL_EXTRA_CONF = 4     # EARLY requires higher confidence than session min_conf
 EARLY_EMAIL_MAX_FILL = 1       # at most 1 EARLY setup used to fill the email (keeps quality)
+
+# ✅ NEW: Trend-follow Email filter (avoid counter-trend reversals)
+TREND_24H_TOL = 0.5  # percent; BUY needs >= +0.5%, SELL needs <= -0.5%
 
 # Risk defaults (user controlled; equity starts at 0 by design)
 DEFAULT_EQUITY = 0.0
@@ -1426,6 +1436,11 @@ Emails are sent only during your enabled sessions:
 ✅ NEW:
 - Daily email cap across all sessions (default 3) to keep users at ~2–3 trades/day style.
 
+✅ NEW:
+- Trend-follow Email filter:
+  BUY only if 24H >= +0.5%
+  SELL only if 24H <= -0.5%
+
 8) Performance Reports (Your trades)
 - /report_daily
 - /report_weekly
@@ -2288,6 +2303,14 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
             for s in setups_all:
                 if s.conf < min_conf:
+                    continue
+
+                # ✅ NEW: Trend-follow filter for EMAIL (avoid counter-trend reversals)
+                # BUY  => 24H must be >= +0.5%
+                # SELL => 24H must be <= -0.5%
+                if s.side == "BUY" and float(s.ch24) < float(TREND_24H_TOL):
+                    continue
+                if s.side == "SELL" and float(s.ch24) > -float(TREND_24H_TOL):
                     continue
 
                 rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
