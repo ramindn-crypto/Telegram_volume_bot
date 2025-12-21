@@ -67,6 +67,13 @@ PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + 
    - /screen (Telegram) is SOFT on 15m: does NOT hard-reject weak 15m
    - Email is STRICT on 15m: requires CONFIRM_15M_ABS_MIN pass
 
+✅ NEW (the “fix above” you asked to apply, WITHOUT removing anything):
+12) Quality-only delivery + “2–3 trades/day style” control:
+   - No forced/minimum emailing. If there’s no premium setup, bot sends nothing (already behavior).
+   - Added a DAILY EMAIL CAP (per user, across ALL sessions) default = 3
+     so users don’t get spammed even on strong market days.
+   - This is independent from per-session emailcap and keeps your emailgap + 18h symbol cooldown.
+
 IMPORTANT (Render):
 - If you see: "Conflict: terminated by other getUpdates request"
   it means multiple instances are polling. Use WEBHOOK mode or ensure only 1 instance.
@@ -153,6 +160,9 @@ DEFAULT_DAILY_CAP_VALUE = 5.0
 DEFAULT_MAX_TRADES_DAY = 5
 DEFAULT_MIN_EMAIL_GAP_MIN = 60
 DEFAULT_MAX_EMAILS_PER_SESSION = 4  # user can set 0 for unlimited (new feature)
+
+# ✅ NEW: DAILY email cap per user across ALL sessions (quality-only “2–3 trades/day style”)
+DEFAULT_MAX_EMAILS_PER_DAY = 3
 
 # Cooldown
 SYMBOL_COOLDOWN_HOURS = 18  # do not repeat same symbol in emails for that user within 18h
@@ -374,6 +384,16 @@ def db_init():
     )
     """)
 
+    # ✅ NEW: daily email cap tracking (per user, across all sessions)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS email_daily (
+        user_id INTEGER NOT NULL,
+        day_local TEXT NOT NULL,
+        sent_count INTEGER NOT NULL,
+        PRIMARY KEY (user_id, day_local)
+    )
+    """)
+
     con.commit()
     con.close()
 
@@ -521,6 +541,33 @@ def symbol_recently_emailed(user_id: int, symbol: str, cooldown_hours: float) ->
     if not row:
         return False
     return (time.time() - float(row["emailed_ts"])) < (cooldown_hours * 3600)
+
+
+# ✅ NEW: daily email counter helpers (per user, local day)
+def _email_daily_get(user_id: int, day_local: str) -> int:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT sent_count FROM email_daily WHERE user_id=? AND day_local=?", (user_id, day_local))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO email_daily (user_id, day_local, sent_count) VALUES (?, ?, ?)", (user_id, day_local, 0))
+        con.commit()
+        con.close()
+        return 0
+    con.close()
+    return int(row["sent_count"])
+
+
+def _email_daily_inc(user_id: int, day_local: str, inc: int = 1):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO email_daily (user_id, day_local, sent_count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, day_local) DO UPDATE SET sent_count = sent_count + excluded.sent_count
+    """, (user_id, day_local, int(inc)))
+    con.commit()
+    con.close()
 
 
 def db_insert_signal(s: Setup):
@@ -1360,6 +1407,9 @@ Emails are sent only during your enabled sessions:
 - MIN_RR_TP3 gate (low R/R setups will NOT be emailed)
 - Email includes: "Entry Zone + No chase"
 
+✅ NEW:
+- Daily email cap across all sessions (default 3) to keep users at ~2–3 trades/day style.
+
 8) Performance Reports (Your trades)
 - /report_daily
 - /report_weekly
@@ -1490,7 +1540,9 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/limits maxtrades 5\n"
             f"/limits emailcap 4\n"
             f"/limits emailcap 0   (unlimited)\n"
-            f"/limits emailgap 60"
+            f"/limits emailgap 60\n\n"
+            f"Note:\n"
+            f"- Daily email cap (across all sessions) is {DEFAULT_MAX_EMAILS_PER_DAY} by default (code-level)."
         )
         return
 
@@ -2187,7 +2239,14 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             gap_min = int(user["email_gap_min"])
             gap_sec = gap_min * 60
 
-            # ✅ NEW: unlimited support
+            # ✅ NEW: daily email cap across all sessions (per user)
+            tz = ZoneInfo(user["tz"])
+            day_local = datetime.now(tz).date().isoformat()
+            sent_today = _email_daily_get(uid, day_local)
+            if sent_today >= int(DEFAULT_MAX_EMAILS_PER_DAY):
+                continue
+
+            # ✅ NEW: unlimited support (per session)
             if max_emails > 0 and int(st["sent_count"]) >= max_emails:
                 continue
 
@@ -2221,7 +2280,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             if not filtered:
                 continue
 
-            tz = ZoneInfo(user["tz"])
             now_local = datetime.now(tz)
 
             body = _email_body_pretty(sess["name"], now_local, user["tz"], filtered, best_fut)
@@ -2234,6 +2292,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             ok = await asyncio.to_thread(send_email, subject, body)
             if ok:
                 email_state_set(uid, sent_count=int(st["sent_count"]) + 1, last_email_ts=now_ts)
+                _email_daily_inc(uid, day_local, 1)  # ✅ NEW: count daily emails (across sessions)
                 for s in filtered:
                     mark_symbol_emailed(uid, s.symbol)
 
