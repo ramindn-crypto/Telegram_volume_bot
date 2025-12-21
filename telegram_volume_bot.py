@@ -63,9 +63,12 @@ PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + 
    - MIN_RR_TP3 gate: low R/R setups do NOT get emailed
    - Email includes: "Entry Zone + No chase"
 
-11) 15m logic (Model A):
-   - /screen (Telegram) is SOFT on 15m: does NOT hard-reject weak 15m
-   - Email is STRICT on 15m: requires CONFIRM_15M_ABS_MIN pass
+11) 15m logic (Model A) — UPDATED to Soft Confirm (no removal):
+   - /screen (Telegram) remains SOFT on 15m (does NOT hard-reject weak 15m)
+   - Email becomes SOFT on 15m:
+       • CONFIRMED if 15m meets threshold
+       • EARLY if 15m is weak BUT 1H is very strong (extra gates apply)
+     Email body clearly labels each setup as CONFIRMED vs EARLY.
 
 ✅ NEW (the “fix above” you asked to apply, WITHOUT removing anything):
 12) Quality-only delivery + “2–3 trades/day style” control:
@@ -150,6 +153,13 @@ MOVER_DN_24H_MAX = -10.0
 TRIGGER_1H_ABS_MIN = 2.0
 CONFIRM_15M_ABS_MIN = 0.6
 ALIGN_4H_MIN = 0.0  # require same direction on 4H
+
+# ✅ NEW (requested): Soft-confirm 15m for EMAIL (without removing anything)
+# Email can include EARLY setups only if 1H is very strong + extra gates.
+EARLY_1H_ABS_MIN = 3.8         # "very strong" 1H momentum gate
+EARLY_CONF_PENALTY = 6         # reduce conf a bit if 15m is weak (still eligible if very strong)
+EARLY_EMAIL_EXTRA_CONF = 4     # EARLY requires higher confidence than session min_conf
+EARLY_EMAIL_MAX_FILL = 1       # at most 1 EARLY setup used to fill the email (keeps quality)
 
 # Risk defaults (user controlled; equity starts at 0 by design)
 DEFAULT_EQUITY = 0.0
@@ -1048,13 +1058,6 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
     if abs(ch1) < TRIGGER_1H_ABS_MIN:
         return None
 
-    # ✅ Model A:
-    # - STRICT (Email): require 15m confirm
-    # - SOFT  (Screen): do NOT reject; let confidence score handle it
-    if strict_15m:
-        if abs(ch15) < CONFIRM_15M_ABS_MIN:
-            return None
-
     side = "BUY" if ch1 > 0 else "SELL"
 
     # trend filter (no short if 4H bullish, no long if 4H bearish)
@@ -1065,12 +1068,6 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
 
     # =========================================================
     # 🔒 Soft 24H contradiction gate (Dynamic, based on ATR%)
-    #
-    # هدف: جلوگیری از سیگنال BUY وقتی فشار فروش روزانه خیلی سنگینه
-    #      و جلوگیری از سیگنال SELL وقتی پامپ روزانه خیلی سنگینه
-    #
-    # Dynamic threshold = clamp(max(12, 2.5 * ATR%), 12, 22)
-    # ATR% = (atr / entry) * 100
     # =========================================================
     atr_pct = (atr / entry) * 100.0 if (atr and entry) else 0.0
     thr = clamp(max(12.0, 2.5 * atr_pct), 12.0, 22.0)
@@ -1080,7 +1077,23 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
     if side == "SELL" and ch24 >= +thr:
         return None
 
+    # ✅ Soft-confirm logic (NO REMOVAL):
+    # - CONFIRMED if abs(ch15) >= CONFIRM_15M_ABS_MIN
+    # - If strict_15m=True (email), allow EARLY only when abs(ch1) is very strong
+    is_confirm_15m = abs(ch15) >= CONFIRM_15M_ABS_MIN
+    is_early_allowed = (abs(ch1) >= EARLY_1H_ABS_MIN)
+
+    if strict_15m:
+        # previously: hard reject if weak 15m
+        # now: accept if confirmed OR strong-1H early
+        if (not is_confirm_15m) and (not is_early_allowed):
+            return None
+
     conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
+
+    # Apply a small penalty for EARLY (keeps ranking sane, still possible to pass if truly strong)
+    if strict_15m and (not is_confirm_15m):
+        conf = max(0, int(conf) - int(EARLY_CONF_PENALTY))
 
     sl, tp3_single, R = compute_sl_tp(entry, side, atr, conf)
     if sl <= 0 or tp3_single <= 0 or R <= 0:
@@ -1403,9 +1416,12 @@ Emails are sent only during your enabled sessions:
 - Session-based quality filters (NY easiest, ASIA strictest)
 
 ✅ Premium Email Rules:
-- STRICT 15m confirm (filters out weak timing)
 - MIN_RR_TP3 gate (low R/R setups will NOT be emailed)
 - Email includes: "Entry Zone + No chase"
+
+✅ UPDATED:
+- 15m is SOFT for email:
+  CONFIRMED (1H+15m) OR EARLY (Strong 1H, 15m pending with extra gates)
 
 ✅ NEW:
 - Daily email cap across all sessions (default 3) to keep users at ~2–3 trades/day style.
@@ -2048,7 +2064,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
     up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
 
-    # ✅ Model A: /screen is SOFT on 15m (strict_15m=False)
+    # ✅ /screen remains SOFT on 15m (strict_15m=False)
     setups = await asyncio.to_thread(pick_setups, best_fut, SETUPS_N, False)
     for s in setups:
         db_insert_signal(s)
@@ -2154,6 +2170,13 @@ def _entry_zone_text(s: Setup) -> str:
         )
 
 
+def _setup_status_text(s: Setup) -> str:
+    is_confirm_15m = abs(float(s.ch15)) >= CONFIRM_15M_ABS_MIN
+    if is_confirm_15m:
+        return "Status: CONFIRMED (1H + 15m)"
+    return "Status: EARLY (Strong 1H, 15m pending)"
+
+
 def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, setups: List[Setup], best_fut: Dict[str, MarketVol]) -> str:
     parts = []
     parts.append(HDR)
@@ -2181,6 +2204,7 @@ def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, set
     for i, s in enumerate(setups, 1):
         rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
         parts.append(f"{i}) {s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}/100")
+        parts.append(f"   {_setup_status_text(s)}")
         parts.append(f"   Entry: {fmt_price(s.entry)} | SL: {fmt_price(s.sl)} | RR(TP3): {rr3:.2f}")
         parts.append(f"   {_entry_zone_text(s).replace(chr(10), chr(10)+'   ')}")
         if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
@@ -2215,7 +2239,8 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not best_fut:
             return
 
-        # ✅ Email is STRICT on 15m (Model A)
+        # ✅ Email now uses Soft-confirm in make_setup(strict_15m=True):
+        # it will include CONFIRMED, and also EARLY if very strong 1H (extra gates later).
         setups_all = await asyncio.to_thread(pick_setups, best_fut, max(EMAIL_SETUPS_N * 3, 9), True)
 
         # Persist signals for reference IDs
@@ -2257,11 +2282,10 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             # ✅ NEW: session-based min confidence (NY easiest, ASIA strictest)
             min_conf = SESSION_MIN_CONF.get(sess["name"], 78)
 
-            # Filter by:
-            # 1) session min_conf
-            # 2) 18h per-user symbol cooldown
-            # 3) Premium MIN_RR_TP3 gate (RR to TP3)
-            filtered: List[Setup] = []
+            # Build CONFIRMED first, then optionally fill with EARLY (max 1) if needed.
+            confirmed: List[Setup] = []
+            early: List[Setup] = []
+
             for s in setups_all:
                 if s.conf < min_conf:
                     continue
@@ -2273,15 +2297,30 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if symbol_recently_emailed(uid, s.symbol, SYMBOL_COOLDOWN_HOURS):
                     continue
 
-                filtered.append(s)
-                if len(filtered) >= EMAIL_SETUPS_N:
+                is_confirm_15m = abs(float(s.ch15)) >= CONFIRM_15M_ABS_MIN
+
+                if is_confirm_15m:
+                    confirmed.append(s)
+                else:
+                    # Extra gates for EARLY:
+                    if abs(float(s.ch1)) < EARLY_1H_ABS_MIN:
+                        continue
+                    if s.conf < (min_conf + EARLY_EMAIL_EXTRA_CONF):
+                        continue
+                    early.append(s)
+
+                if len(confirmed) >= EMAIL_SETUPS_N:
                     break
+
+            filtered: List[Setup] = confirmed[:EMAIL_SETUPS_N]
+            if len(filtered) < EMAIL_SETUPS_N and early:
+                need = EMAIL_SETUPS_N - len(filtered)
+                filtered.extend(early[:min(need, EARLY_EMAIL_MAX_FILL)])
 
             if not filtered:
                 continue
 
             now_local = datetime.now(tz)
-
             body = _email_body_pretty(sess["name"], now_local, user["tz"], filtered, best_fut)
 
             if max_emails > 0:
