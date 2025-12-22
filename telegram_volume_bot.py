@@ -1534,9 +1534,8 @@ def _advice(user: dict, stats: dict) -> List[str]:
         adv.append("✅ محدودیت ترید روزانه کمک می‌کند overtrade نکنی. فقط بهترین‌ها را بگیر.")
     return adv[:6]
 
-
 # =========================================================
-# HELP TEXT (Plain)
+# HELP TEXT (FULL - DO NOT SHORTEN)
 # =========================================================
 HELP_TEXT = """\
 PulseFutures — Commands (Telegram)
@@ -1594,6 +1593,11 @@ Equity behavior:
 
 4) Status (Open trades + daily count + limits)
 - /status
+Shows:
+• Open trades (IDs)
+• Daily trade count (limit default 5)
+• Daily risk cap (based on your settings)
+• Equity
 
 5) Risk Settings
 - /riskmode pct 2.5
@@ -1605,17 +1609,68 @@ Equity behavior:
 - /limits emailgap 60
 
 6) Sessions (Emails by session)
+Default enabled session depends on your timezone:
+- Americas → NY
+- Europe/Africa → LON
+- Asia/Oceania → ASIA
+
+✅ Session priority (best first):
+NY > LON > ASIA
+
+View enabled sessions:
 - /sessions
-- /sessions_on NY | /sessions_on LON | /sessions_on ASIA
+
+Enable/Disable sessions:
+- /sessions_on NY
+- /sessions_on LON
+- /sessions_on ASIA
 - /sessions_off LON
 
 7) Email Alerts
 - /notify_on
 - /notify_off
+Emails are sent only during your enabled sessions:
+- emailcap per session (0 = unlimited)
+- Minimum emailgap minutes
+- No symbol repeats for 18 hours
+- Session-based quality filters (NY easiest, ASIA strictest)
+
+✅ Premium Email Rules:
+- MIN_RR_TP3 gate (low R/R setups will NOT be emailed)
+- Email includes: "Entry Zone + No chase"
+
+✅ UPDATED:
+- 15m is SOFT for email:
+  CONFIRMED (1H+15m) OR EARLY (Strong 1H, 15m pending with extra gates)
+
+✅ NEW:
+- Daily email cap across all sessions (default 3) to keep users at ~2–3 trades/day style.
+
+✅ NEW:
+- Trend-follow Email filter:
+  BUY only if 24H >= +0.5%
+  SELL only if 24H <= -0.5%
+
+✅ NEW:
+- Reject Diagnostics (optional)
+  DEBUG_REJECTS=true to include sample symbols + metrics in /screen
+
+8) Performance Reports (Your trades)
+- /report_daily
+- /report_weekly
+Includes wins/losses, net PnL, win rate, avg R and advice.
+
+9) Signal Reports (Global signals that were generated)
+- /signals_daily
+- /signals_weekly
+Shows how many setups were generated + (if users link trades to signal IDs) aggregated outcomes.
+
+Tip:
+- Every email setup has a unique ID: PF-YYYYMMDD-0001
+  You can reference it in your PulseFutures channel and also attach it to /trade_open with "sig".
 
 Not financial advice.
 """
-
 
 # =========================================================
 # TELEGRAM COMMANDS
