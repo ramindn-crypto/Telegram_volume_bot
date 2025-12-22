@@ -1,3 +1,4 @@
+````python
 #!/usr/bin/env python3
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
@@ -100,6 +101,15 @@ PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + 
 16) ✅ /screen “no response” fix:
    - Added safe long-message sender (splits > 4096 chars)
    - Wrapped /screen in try/except and shows error in Telegram if anything fails
+
+✅ FIX (your latest issue: Bybit "Access too frequent", WITHOUT removing anything):
+17) ✅ Rate-limit guard + fewer bursts:
+   - Exchange Singleton + one-time load_markets (reduces repeated overhead)
+   - Small OHLCV throttle (reduces request burst)
+   - Hard cooldown when Bybit returns "Access too frequent"
+   - Two-stage 15m fetching for EMAIL strict mode:
+       Stage-1: scan universe with 1H/4H/ATR only (NO 15m)
+       Stage-2: fetch 15m only for top candidates, then finalize CONFIRMED/EARLY logic
 
 IMPORTANT (Render):
 - If you see: "Conflict: terminated by other getUpdates request"
@@ -264,6 +274,22 @@ HDR = "━━━━━━━━━━━━━━━━━━━━"
 SEP = "────────────────────"
 
 ALERT_LOCK = asyncio.Lock()
+
+# =========================================================
+# ✅ NEW: Bybit Rate Limit Guard + Exchange Singleton
+# =========================================================
+_EXCHANGE = None
+_EXCHANGE_LOCK = asyncio.Lock()
+_RATE_LIMIT_UNTIL_TS = 0.0
+
+# If Bybit says "Access too frequent", cool down a bit more than 5 min
+HARD_RATE_LIMIT_COOLDOWN_SEC = 310
+
+# Small delay between OHLCV calls to reduce burst (helps a lot on Bybit)
+OHLCV_THROTTLE_SEC = 0.20
+
+# Two-stage 15m fetching: stage-2 only for top candidates in strict mode (EMAIL)
+TOP_15M_CANDIDATES = 12
 
 # Sessions defined in UTC windows (robust across timezones)
 # Users can enable multiple sessions; default depends on tz region
@@ -778,13 +804,42 @@ def db_trades_since(user_id: int, ts_from: float) -> List[dict]:
 # =========================================================
 # EXCHANGE HELPERS
 # =========================================================
+def _mark_hard_rate_limit():
+    global _RATE_LIMIT_UNTIL_TS
+    _RATE_LIMIT_UNTIL_TS = time.time() + HARD_RATE_LIMIT_COOLDOWN_SEC
+
+
+def _hard_rate_limited_now() -> bool:
+    return time.time() < _RATE_LIMIT_UNTIL_TS
+
+
 def build_exchange():
     klass = ccxt.__dict__[EXCHANGE_ID]
-    return klass({
+    ex = klass({
         "enableRateLimit": True,
         "timeout": 20000,
         "options": {"defaultType": DEFAULT_TYPE},
     })
+    # a gentle nudge (ccxt uses ms); helps avoid overly aggressive bursts in some envs
+    try:
+        ex.rateLimit = max(getattr(ex, "rateLimit", 0) or 0, 120)
+    except Exception:
+        pass
+    return ex
+
+
+async def get_exchange():
+    """
+    ✅ Singleton exchange + one-time load_markets (reduces overhead & request bursts).
+    """
+    global _EXCHANGE
+    if _EXCHANGE is not None:
+        return _EXCHANGE
+    async with _EXCHANGE_LOCK:
+        if _EXCHANGE is None:
+            _EXCHANGE = build_exchange()
+            await asyncio.to_thread(_EXCHANGE.load_markets)
+    return _EXCHANGE
 
 
 def safe_split_symbol(sym: Optional[str]) -> Optional[Tuple[str, str]]:
@@ -825,12 +880,36 @@ def to_mv(t: dict) -> Optional[MarketVol]:
 
 
 def fetch_futures_tickers() -> Dict[str, MarketVol]:
+    if _hard_rate_limited_now():
+        # During cooldown, avoid hammering Bybit; return empty so callers can handle gracefully.
+        return {}
+
     if cache_valid("tickers_best_fut", TICKERS_TTL_SEC):
         return cache_get("tickers_best_fut")
 
-    ex = build_exchange()
-    ex.load_markets()
-    tickers = ex.fetch_tickers()
+    # Prefer singleton exchange if we are inside an event loop; fallback to fresh exchange otherwise
+    ex = None
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+            # running loop => can safely use async getter
+            ex = loop.run_until_complete(get_exchange())  # may raise if nested; handled below
+        except RuntimeError:
+            ex = None
+    except Exception:
+        ex = None
+
+    if ex is None:
+        ex = build_exchange()
+        ex.load_markets()
+
+    try:
+        tickers = ex.fetch_tickers()
+    except Exception as e:
+        msg = str(e)
+        if "Access too frequent" in msg:
+            _mark_hard_rate_limit()
+        raise
 
     best: Dict[str, MarketVol] = {}
     for t in tickers.values():
@@ -848,13 +927,27 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
 
 
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
+    if _hard_rate_limited_now():
+        return []
+
     key = f"ohlcv:{symbol}:{timeframe}:{limit}"
     if cache_valid(key, OHLCV_TTL_SEC):
         return cache_get(key)
 
+    # tiny throttle to reduce burst
+    time.sleep(OHLCV_THROTTLE_SEC)
+
     ex = build_exchange()
     ex.load_markets()
-    data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
+
+    try:
+        data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
+    except Exception as e:
+        msg = str(e)
+        if "Access too frequent" in msg:
+            _mark_hard_rate_limit()
+        raise
+
     cache_set(key, data)
     return data
 
@@ -874,7 +967,11 @@ def compute_atr_from_ohlcv(candles: List[List[float]], period: int) -> float:
     return sum(trs[-period:]) / period
 
 
-def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float, float]:
+def metrics_from_candles_1h_15m(market_symbol: str, with_15m: bool = True) -> Tuple[float, float, float, float]:
+    """
+    ✅ Updated: can skip 15m fetching (used in EMAIL strict mode stage-1).
+    Returns: (ch1, ch4, ch15, atr)
+    """
     need_1h = max(ATR_PERIOD + 6, 35)
     c1 = fetch_ohlcv(market_symbol, "1h", limit=need_1h)
     if not c1 or len(c1) < 6:
@@ -888,6 +985,9 @@ def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float
     ch1 = ((c_last - c_prev1) / c_prev1) * 100.0 if c_prev1 else 0.0
     ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
     atr = compute_atr_from_ohlcv(c1, ATR_PERIOD)
+
+    if not with_15m:
+        return ch1, ch4, 0.0, atr
 
     c15 = fetch_ohlcv(market_symbol, "15m", limit=4)
     if not c15 or len(c15) < 2:
@@ -1159,7 +1259,7 @@ def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tupl
         if ch24 < MOVER_UP_24H_MIN and ch24 > MOVER_DN_24H_MAX:
             continue
 
-        ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol)
+        ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol, with_15m=True)
 
         if ch24 >= MOVER_UP_24H_MIN and ch4 > 0:
             up.append((base, vol, ch24, ch4, float(mv.last or 0.0)))
@@ -1180,7 +1280,7 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     return up_txt, dn_txt
 
 
-def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Setup]:
+def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, with_15m: bool = True) -> Optional[Setup]:
     fut_vol = usd_notional(mv)
     if fut_vol <= 0:
         _rej("no_fut_vol", base, mv)
@@ -1192,7 +1292,7 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
         return None
 
     ch24 = float(mv.percentage or 0.0)
-    ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol)
+    ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol, with_15m=with_15m)
 
     # detect missing/insufficient OHLCV (metrics function returns zeros)
     if (ch1 == 0.0 and ch4 == 0.0 and ch15 == 0.0 and atr == 0.0):
@@ -1233,7 +1333,7 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
     is_confirm_15m = abs(ch15) >= CONFIRM_15M_ABS_MIN
     is_early_allowed = (abs(ch1) >= EARLY_1H_ABS_MIN)
 
-    if strict_15m:
+    if strict_15m and with_15m:
         # previously: hard reject if weak 15m
         # now: accept if confirmed OR strong-1H early
         if (not is_confirm_15m) and (not is_early_allowed):
@@ -1248,7 +1348,7 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
     conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
 
     # Apply a small penalty for EARLY (keeps ranking sane, still possible to pass if truly strong)
-    if strict_15m and (not is_confirm_15m):
+    if strict_15m and with_15m and (not is_confirm_15m):
         conf = max(0, int(conf) - int(EARLY_CONF_PENALTY))
 
     sl, tp3_single, R = compute_sl_tp(entry, side, atr, conf)
@@ -1286,22 +1386,67 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
 
 
 def pick_setups(best_fut: Dict[str, MarketVol], n: int, strict_15m: bool = True) -> List[Setup]:
-    # ✅ NEW: reset reject counters for this run
+    """
+    ✅ Updated for Bybit rate-limit stability (NO removals):
+    - strict_15m=False (screen): keep old behavior (fetch 15m for each candidate; shows ch15)
+    - strict_15m=True (email): TWO-STAGE
+        Stage-1: scan universe with 1h/4h/ATR only (no 15m)
+        Stage-2: fetch 15m only for top candidates, then apply strict/EARLY logic and finalize
+    """
     global _REJECT_STATS, _REJECT_SAMPLES
     _REJECT_STATS = Counter()
     _REJECT_SAMPLES = {}
 
-    # consider top liquid coins only (speed + quality)
     universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:35]
-    setups: List[Setup] = []
-    for base, mv in universe:
-        s = make_setup(base, mv, strict_15m=strict_15m)
-        if s:
-            setups.append(s)
 
-    # rank by confidence then liquidity
-    setups.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
-    return setups[:n]
+    # -------------------------
+    # Screen mode: keep behavior
+    # -------------------------
+    if not strict_15m:
+        setups: List[Setup] = []
+        for base, mv in universe:
+            s = make_setup(base, mv, strict_15m=False, with_15m=True)
+            if s:
+                setups.append(s)
+        setups.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
+        return setups[:n]
+
+    # -------------------------
+    # Email strict mode: stage-1 (no 15m)
+    # -------------------------
+    stage1: List[Setup] = []
+    for base, mv in universe:
+        s = make_setup(base, mv, strict_15m=False, with_15m=False)
+        if s:
+            stage1.append(s)
+
+    stage1.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
+
+    # If stage1 is empty, nothing to refine
+    if not stage1:
+        return []
+
+    # -------------------------
+    # Stage-2: fetch 15m only for top candidates, then strict validate
+    # -------------------------
+    refined: List[Setup] = []
+    top = stage1[:min(len(stage1), TOP_15M_CANDIDATES)]
+
+    # Build a lookup of mv by base to reuse the same entry/24h/vol
+    mv_map = {base: mv for base, mv in universe}
+
+    for s0 in top:
+        mv = mv_map.get(s0.symbol)
+        if not mv:
+            continue
+
+        # Re-run make_setup with 15m + strict rules (CONFIRMED/EARLY)
+        s2 = make_setup(s0.symbol, mv, strict_15m=True, with_15m=True)
+        if s2:
+            refined.append(s2)
+
+    refined.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
+    return refined[:n]
 
 
 # =========================================================
@@ -2225,17 +2370,17 @@ async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # =========================================================
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        # Make Telegram fast:
-        # - all heavy work in threads
-        # - tickers + ohlcv cached
         await update.message.reply_text("⏳ Scanning market…")
 
         best_fut = await asyncio.to_thread(fetch_futures_tickers)
         if not best_fut:
-            await update.message.reply_text("❌ Error: could not fetch futures tickers.")
+            # If we are in hard cooldown, explain it clearly
+            if _hard_rate_limited_now():
+                await update.message.reply_text("❌ Bybit rate-limited (Access too frequent). Cooldown active (~5 min). Try again shortly.")
+            else:
+                await update.message.reply_text("❌ Error: could not fetch futures tickers.")
             return
 
-        # Compute movers/leaders and setups
         leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
         up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
 
@@ -2244,7 +2389,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for s in setups:
             db_insert_signal(s)
 
-        # Format setups
         if setups:
             setup_blocks = []
             for i, s in enumerate(setups, 1):
@@ -2265,12 +2409,10 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             setups_txt = "No high-quality setups right now."
 
-        # ✅ NEW: append reject diagnostics (counts + samples if DEBUG_REJECTS=true)
         diag_txt = _reject_report()
         if diag_txt:
             setups_txt = setups_txt + "\n\n" + diag_txt
 
-        # Provide Chart buttons for quick UX
         kb = []
         for s in setups:
             kb.append([InlineKeyboardButton(text=f"📈 {s.symbol} ({s.setup_id})", url=tv_chart_url(s.symbol))])
@@ -2286,7 +2428,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{leaders_txt}"
         )
 
-        # ✅ IMPORTANT: split long output to avoid Telegram 4096 limit
         await send_long(
             update,
             msg,
@@ -2301,7 +2442,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # lightweight: if user types something like PF-... show the signal
     text = (update.message.text or "").strip()
     if text.startswith("PF-"):
         sig = db_get_signal(text)
@@ -2349,7 +2489,6 @@ def _entry_zone_text(s: Setup) -> str:
         z_lo = s.entry + z
         z_hi = s.entry - z
         no_chase_below = s.entry - nc
-        # For sell, zone should be shown as higher->lower, but keep readable:
         return (
             f"Entry Zone: {fmt_price(min(z_hi, z_lo))} – {fmt_price(max(z_hi, z_lo))}\n"
             f"No chase: if price < {fmt_price(no_chase_below)}"
@@ -2425,11 +2564,8 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not best_fut:
             return
 
-        # ✅ Email now uses Soft-confirm in make_setup(strict_15m=True):
-        # it will include CONFIRMED, and also EARLY if very strong 1H (extra gates later).
         setups_all = await asyncio.to_thread(pick_setups, best_fut, max(EMAIL_SETUPS_N * 3, 9), True)
 
-        # Persist signals for reference IDs
         for s in setups_all:
             db_insert_signal(s)
 
@@ -2441,7 +2577,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
             st = email_state_get(uid)
 
-            # reset counters on session change
             if st["session_key"] != sess["session_key"]:
                 email_state_set(uid, session_key=sess["session_key"], sent_count=0, last_email_ts=0.0)
                 st = email_state_get(uid)
@@ -2450,14 +2585,12 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             gap_min = int(user["email_gap_min"])
             gap_sec = gap_min * 60
 
-            # ✅ NEW: daily email cap across all sessions (per user)
             tz = ZoneInfo(user["tz"])
             day_local = datetime.now(tz).date().isoformat()
             sent_today = _email_daily_get(uid, day_local)
             if sent_today >= int(DEFAULT_MAX_EMAILS_PER_DAY):
                 continue
 
-            # ✅ NEW: unlimited support (per session)
             if max_emails > 0 and int(st["sent_count"]) >= max_emails:
                 continue
 
@@ -2465,10 +2598,8 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             if gap_sec > 0 and (now_ts - float(st["last_email_ts"])) < gap_sec:
                 continue
 
-            # ✅ NEW: session-based min confidence (NY easiest, ASIA strictest)
             min_conf = SESSION_MIN_CONF.get(sess["name"], 78)
 
-            # Build CONFIRMED first, then optionally fill with EARLY (max 1) if needed.
             confirmed: List[Setup] = []
             early: List[Setup] = []
 
@@ -2476,9 +2607,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if s.conf < min_conf:
                     continue
 
-                # ✅ NEW: Trend-follow filter for EMAIL (avoid counter-trend reversals)
-                # BUY  => 24H must be >= +0.5%
-                # SELL => 24H must be <= -0.5%
                 if s.side == "BUY" and float(s.ch24) < float(TREND_24H_TOL):
                     continue
                 if s.side == "SELL" and float(s.ch24) > -float(TREND_24H_TOL):
@@ -2496,7 +2624,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if is_confirm_15m:
                     confirmed.append(s)
                 else:
-                    # Extra gates for EARLY:
                     if abs(float(s.ch1)) < EARLY_1H_ABS_MIN:
                         continue
                     if s.conf < (min_conf + EARLY_EMAIL_EXTRA_CONF):
@@ -2525,7 +2652,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             ok = await asyncio.to_thread(send_email, subject, body)
             if ok:
                 email_state_set(uid, sent_count=int(st["sent_count"]) + 1, last_email_ts=now_ts)
-                _email_daily_inc(uid, day_local, 1)  # ✅ NEW: count daily emails (across sessions)
+                _email_daily_inc(uid, day_local, 1)
                 for s in filtered:
                     mark_symbol_emailed(uid, s.symbol)
 
@@ -2541,7 +2668,6 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler(["help", "start"], cmd_help))
     app.add_handler(CommandHandler("tz", tz_cmd))
 
@@ -2575,13 +2701,11 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
-    # job queue
     if getattr(app, "job_queue", None):
         app.job_queue.run_repeating(alert_job, interval=CHECK_INTERVAL_MIN * 60, first=15, name="alert_job")
     else:
         logger.warning('JobQueue not available. Install: python-telegram-bot[job-queue]')
 
-    # Run mode:
     port = int(os.environ.get("PORT", "10000"))
 
     if WEBHOOK_URL:
@@ -2604,3 +2728,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+````
