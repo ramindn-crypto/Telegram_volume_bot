@@ -96,6 +96,11 @@ PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + 
    - next_setup_id() uses BEGIN IMMEDIATE + increment (atomic) so PF-YYYYMMDD-#### is always unique
    - Fixes duplicated IDs like PF-20251222-0004 appearing twice
 
+✅ FIX (your latest issue, WITHOUT removing anything):
+16) ✅ /screen “no response” fix:
+   - Added safe long-message sender (splits > 4096 chars)
+   - Wrapped /screen in try/except and shows error in Telegram if anything fails
+
 IMPORTANT (Render):
 - If you see: "Conflict: terminated by other getUpdates request"
   it means multiple instances are polling. Use WEBHOOK mode or ensure only 1 instance.
@@ -935,6 +940,38 @@ def tv_chart_url(symbol_base: str) -> str:
 
 def table_md(rows: List[List[Any]], headers: List[str]) -> str:
     return "```\n" + tabulate(rows, headers=headers, tablefmt="github") + "\n```"
+
+
+# =========================================================
+# ✅ NEW: TELEGRAM LONG MESSAGE SAFE SENDER (4096 limit fix)
+# =========================================================
+TELEGRAM_MAX = 4000  # safe under 4096
+
+async def send_long(update: Update, text: str, *, parse_mode=None, disable_preview=True, reply_markup=None):
+    """
+    Sends long text in multiple Telegram messages to avoid 4096 limit.
+    Only attaches reply_markup to the LAST chunk.
+    """
+    if not text:
+        return
+
+    chunks = []
+    s = text
+    while len(s) > TELEGRAM_MAX:
+        cut = s.rfind("\n", 0, TELEGRAM_MAX)
+        if cut < 800:  # if no good newline, hard cut
+            cut = TELEGRAM_MAX
+        chunks.append(s[:cut])
+        s = s[cut:].lstrip("\n")
+    chunks.append(s)
+
+    for i, ch in enumerate(chunks):
+        await update.message.reply_text(
+            ch,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_preview,
+            reply_markup=reply_markup if i == len(chunks) - 1 else None,
+        )
 
 
 # =========================================================
@@ -2183,74 +2220,84 @@ async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("\n".join(msg))
 
 
+# =========================================================
+# ✅ FIXED: /screen (splits long messages + try/except)
+# =========================================================
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Make Telegram fast:
-    # - all heavy work in threads
-    # - tickers + ohlcv cached
-    await update.message.reply_text("⏳ Scanning market…")
+    try:
+        # Make Telegram fast:
+        # - all heavy work in threads
+        # - tickers + ohlcv cached
+        await update.message.reply_text("⏳ Scanning market…")
 
-    best_fut = await asyncio.to_thread(fetch_futures_tickers)
-    if not best_fut:
-        await update.message.reply_text("Error: could not fetch futures tickers.")
-        return
+        best_fut = await asyncio.to_thread(fetch_futures_tickers)
+        if not best_fut:
+            await update.message.reply_text("❌ Error: could not fetch futures tickers.")
+            return
 
-    # Compute movers/leaders and setups
-    leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
-    up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
+        # Compute movers/leaders and setups
+        leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
+        up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
 
-    # ✅ /screen remains SOFT on 15m (strict_15m=False)
-    setups = await asyncio.to_thread(pick_setups, best_fut, SETUPS_N, False)
-    for s in setups:
-        db_insert_signal(s)
+        # ✅ /screen remains SOFT on 15m (strict_15m=False)
+        setups = await asyncio.to_thread(pick_setups, best_fut, SETUPS_N, False)
+        for s in setups:
+            db_insert_signal(s)
 
-    # Format setups
-    if setups:
-        setup_blocks = []
-        for i, s in enumerate(setups, 1):
-            tps = f"TP {fmt_price(s.tp3)}"
-            if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
-                tps = f"TP1 {fmt_price(s.tp1)} | TP2 {fmt_price(s.tp2)} | TP3 {fmt_price(s.tp3)}"
-            rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
-            setup_blocks.append(
-                f"🔥 Setup #{i} — {s.side} {s.symbol} — Conf {s.conf}/100\n"
-                f"ID: {s.setup_id}\n"
-                f"Entry {fmt_price(s.entry)} | SL {fmt_price(s.sl)}\n"
-                f"{tps}\n"
-                f"RR(TP3): {rr3:.2f}\n"
-                f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}\n"
-                f"Chart: {tv_chart_url(s.symbol)}"
-            )
-        setups_txt = "\n\n".join(setup_blocks)
-    else:
-        setups_txt = "No high-quality setups right now."
+        # Format setups
+        if setups:
+            setup_blocks = []
+            for i, s in enumerate(setups, 1):
+                tps = f"TP {fmt_price(s.tp3)}"
+                if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
+                    tps = f"TP1 {fmt_price(s.tp1)} | TP2 {fmt_price(s.tp2)} | TP3 {fmt_price(s.tp3)}"
+                rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+                setup_blocks.append(
+                    f"🔥 Setup #{i} — {s.side} {s.symbol} — Conf {s.conf}/100\n"
+                    f"ID: {s.setup_id}\n"
+                    f"Entry {fmt_price(s.entry)} | SL {fmt_price(s.sl)}\n"
+                    f"{tps}\n"
+                    f"RR(TP3): {rr3:.2f}\n"
+                    f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}\n"
+                    f"Chart: {tv_chart_url(s.symbol)}"
+                )
+            setups_txt = "\n\n".join(setup_blocks)
+        else:
+            setups_txt = "No high-quality setups right now."
 
-    # ✅ NEW: append reject diagnostics (counts + samples if DEBUG_REJECTS=true)
-    diag_txt = _reject_report()
-    if diag_txt:
-        setups_txt = setups_txt + "\n\n" + diag_txt
+        # ✅ NEW: append reject diagnostics (counts + samples if DEBUG_REJECTS=true)
+        diag_txt = _reject_report()
+        if diag_txt:
+            setups_txt = setups_txt + "\n\n" + diag_txt
 
-    # Provide Chart buttons for quick UX
-    kb = []
-    for s in setups:
-        kb.append([InlineKeyboardButton(text=f"📈 {s.symbol} ({s.setup_id})", url=tv_chart_url(s.symbol))])
+        # Provide Chart buttons for quick UX
+        kb = []
+        for s in setups:
+            kb.append([InlineKeyboardButton(text=f"📈 {s.symbol} ({s.setup_id})", url=tv_chart_url(s.symbol))])
 
-    msg = (
-        f"✨ PulseFutures — Market Scan\n"
-        f"{HDR}\n"
-        f"— Top Trade Setups\n"
-        f"{setups_txt}\n\n"
-        f"— Directional Leaders / Losers\n"
-        f"{up_txt}\n\n{dn_txt}\n\n"
-        f"— Market Leaders\n"
-        f"{leaders_txt}"
-    )
+        msg = (
+            f"✨ PulseFutures — Market Scan\n"
+            f"{HDR}\n"
+            f"— Top Trade Setups\n"
+            f"{setups_txt}\n\n"
+            f"— Directional Leaders / Losers\n"
+            f"{up_txt}\n\n{dn_txt}\n\n"
+            f"— Market Leaders\n"
+            f"{leaders_txt}"
+        )
 
-    await update.message.reply_text(
-        msg,
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-        reply_markup=InlineKeyboardMarkup(kb) if kb else None,
-    )
+        # ✅ IMPORTANT: split long output to avoid Telegram 4096 limit
+        await send_long(
+            update,
+            msg,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_preview=True,
+            reply_markup=InlineKeyboardMarkup(kb) if kb else None,
+        )
+
+    except Exception as e:
+        logger.exception("screen_cmd failed: %s", e)
+        await update.message.reply_text(f"❌ /screen failed:\n{type(e).__name__}: {e}")
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
