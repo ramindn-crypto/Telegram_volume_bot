@@ -2306,8 +2306,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ /screen failed: {e}")
         except Exception:
             pass
- 
- async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # lightweight: if user types something like PF-... show the signal
     text = (update.message.text or "").strip()
     if text.startswith("PF-"):
@@ -2315,6 +2316,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not sig:
             await update.message.reply_text("Signal ID not found.")
             return
+
         tps = f"TP {fmt_price(float(sig['tp3']))}"
         if sig.get("tp1") and sig.get("tp2") and int(sig["conf"]) >= MULTI_TP_MIN_CONF:
             tps = f"TP1 {fmt_price(float(sig['tp1']))} | TP2 {fmt_price(float(sig['tp2']))} | TP3 {fmt_price(float(sig['tp3']))}"
@@ -2332,6 +2334,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/trade_open {sig['symbol']} {'long' if sig['side']=='BUY' else 'short'} entry {sig['entry']} sl {sig['sl']} risk usd 40 sig {sig['setup_id']}"
         )
         return
+
 
 
 # =========================================================
