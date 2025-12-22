@@ -90,6 +90,12 @@ PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + 
    - Always counts reject reasons per /screen run (in-memory)
    - /screen appends a short Reject Diagnostics block (counts + samples if enabled)
 
+✅ FIX (your latest issue, WITHOUT removing anything):
+15) ✅ Atomic Unique Setup IDs (no duplicates in same run)
+   - Added setup_seq table (day -> seq)
+   - next_setup_id() uses BEGIN IMMEDIATE + increment (atomic) so PF-YYYYMMDD-#### is always unique
+   - Fixes duplicated IDs like PF-20251222-0004 appearing twice
+
 IMPORTANT (Render):
 - If you see: "Conflict: terminated by other getUpdates request"
   it means multiple instances are polling. Use WEBHOOK mode or ensure only 1 instance.
@@ -477,6 +483,14 @@ def db_init():
         day_local TEXT NOT NULL,
         sent_count INTEGER NOT NULL,
         PRIMARY KEY (user_id, day_local)
+    )
+    """)
+
+    # ✅ FIX: atomic daily sequence for unique PF-YYYYMMDD-#### ids
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS setup_seq (
+        day TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL
     )
     """)
 
@@ -927,14 +941,25 @@ def table_md(rows: List[List[Any]], headers: List[str]) -> str:
 # SIGNAL IDs
 # =========================================================
 def next_setup_id() -> str:
-    # PF-YYYYMMDD-#### (global sequence per day, stored in DB by checking current day count)
+    """
+    ✅ FIX: Atomic PF-YYYYMMDD-#### generator (no duplicates within same run).
+    Uses setup_seq(day, seq) with BEGIN IMMEDIATE transaction.
+    """
     today = datetime.utcnow().strftime("%Y%m%d")
     con = db_connect()
     cur = con.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM signals WHERE setup_id LIKE ?", (f"PF-{today}-%",))
-    n = int(cur.fetchone()["c"])
+    cur.execute("BEGIN IMMEDIATE")
+    cur.execute("SELECT seq FROM setup_seq WHERE day=?", (today,))
+    row = cur.fetchone()
+    if not row:
+        seq = 1
+        cur.execute("INSERT INTO setup_seq (day, seq) VALUES (?, ?)", (today, seq))
+    else:
+        seq = int(row["seq"]) + 1
+        cur.execute("UPDATE setup_seq SET seq=? WHERE day=?", (seq, today))
+    con.commit()
     con.close()
-    return f"PF-{today}-{n+1:04d}"
+    return f"PF-{today}-{seq:04d}"
 
 
 # =========================================================
