@@ -936,6 +936,45 @@ def tv_chart_url(symbol_base: str) -> str:
 def table_md(rows: List[List[Any]], headers: List[str]) -> str:
     return "```\n" + tabulate(rows, headers=headers, tablefmt="github") + "\n```"
 
+# =========================================================
+# TELEGRAM SAFE SEND (chunking + markdown fallback)
+# =========================================================
+TELEGRAM_MAX = 4096
+SAFE_CHUNK = 3500  # keep some margin for markdown/entities
+
+async def send_long_message(update: Update, text: str, parse_mode: Optional[str] = None,
+                            disable_web_page_preview: bool = True, reply_markup=None):
+    """
+    Sends long Telegram messages safely by splitting into chunks.
+    If markdown parsing fails, fallback to plain text for that chunk.
+    """
+    if not update or not update.message:
+        return
+
+    chunks = []
+    s = text or ""
+    while s:
+        chunks.append(s[:SAFE_CHUNK])
+        s = s[SAFE_CHUNK:]
+
+    first = True
+    for ch in chunks:
+        try:
+            await update.message.reply_text(
+                ch,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+                reply_markup=reply_markup if first else None,
+            )
+        except Exception as e:
+            logger.exception("send_long_message markdown failed, fallback plain. err=%s", e)
+            # Fallback: send without parse_mode
+            await update.message.reply_text(
+                ch,
+                disable_web_page_preview=disable_web_page_preview,
+                reply_markup=reply_markup if first else None,
+            )
+        first = False
 
 # =========================================================
 # SIGNAL IDs
@@ -2190,76 +2229,85 @@ async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Make Telegram fast:
-    # - all heavy work in threads
-    # - tickers + ohlcv cached
-    await update.message.reply_text("⏳ Scanning market…")
+    try:
+        # Make Telegram fast:
+        # - all heavy work in threads
+        # - tickers + ohlcv cached
+        await update.message.reply_text("⏳ Scanning market…")
 
-    best_fut = await asyncio.to_thread(fetch_futures_tickers)
-    if not best_fut:
-        await update.message.reply_text("Error: could not fetch futures tickers.")
-        return
+        best_fut = await asyncio.to_thread(fetch_futures_tickers)
+        if not best_fut:
+            await update.message.reply_text("Error: could not fetch futures tickers.")
+            return
 
-    # Compute movers/leaders and setups
-    leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
-    up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
+        # Compute movers/leaders and setups
+        leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
+        up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
 
-    # ✅ /screen remains SOFT on 15m (strict_15m=False)
-    setups = await asyncio.to_thread(pick_setups, best_fut, SETUPS_N, False)
-    for s in setups:
-        db_insert_signal(s)
+        # ✅ /screen remains SOFT on 15m (strict_15m=False)
+        setups = await asyncio.to_thread(pick_setups, best_fut, SETUPS_N, False)
+        for s in setups:
+            db_insert_signal(s)
 
-    # Format setups
-    if setups:
-        setup_blocks = []
-        for i, s in enumerate(setups, 1):
-            tps = f"TP {fmt_price(s.tp3)}"
-            if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
-                tps = f"TP1 {fmt_price(s.tp1)} | TP2 {fmt_price(s.tp2)} | TP3 {fmt_price(s.tp3)}"
-            rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
-            setup_blocks.append(
-                f"🔥 Setup #{i} — {s.side} {s.symbol} — Conf {s.conf}/100\n"
-                f"ID: {s.setup_id}\n"
-                f"Entry {fmt_price(s.entry)} | SL {fmt_price(s.sl)}\n"
-                f"{tps}\n"
-                f"RR(TP3): {rr3:.2f}\n"
-                f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}\n"
-                f"Chart: {tv_chart_url(s.symbol)}"
-            )
-        setups_txt = "\n\n".join(setup_blocks)
-    else:
-        setups_txt = "No high-quality setups right now."
+        # Format setups
+        if setups:
+            setup_blocks = []
+            for i, s in enumerate(setups, 1):
+                tps = f"TP {fmt_price(s.tp3)}"
+                if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
+                    tps = f"TP1 {fmt_price(s.tp1)} | TP2 {fmt_price(s.tp2)} | TP3 {fmt_price(s.tp3)}"
+                rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+                setup_blocks.append(
+                    f"🔥 Setup #{i} — {s.side} {s.symbol} — Conf {s.conf}/100\n"
+                    f"ID: {s.setup_id}\n"
+                    f"Entry {fmt_price(s.entry)} | SL {fmt_price(s.sl)}\n"
+                    f"{tps}\n"
+                    f"RR(TP3): {rr3:.2f}\n"
+                    f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}\n"
+                    f"Chart: {tv_chart_url(s.symbol)}"
+                )
+            setups_txt = "\n\n".join(setup_blocks)
+        else:
+            setups_txt = "No high-quality setups right now."
 
-    # ✅ NEW: append reject diagnostics (counts + samples if DEBUG_REJECTS=true)
-    diag_txt = _reject_report()
-    if diag_txt:
-        setups_txt = setups_txt + "\n\n" + diag_txt
+        # ✅ NEW: append reject diagnostics (counts + samples if DEBUG_REJECTS=true)
+        diag_txt = _reject_report()
+        if diag_txt:
+            setups_txt = setups_txt + "\n\n" + diag_txt
 
-    # Provide Chart buttons for quick UX
-    kb = []
-    for s in setups:
-        kb.append([InlineKeyboardButton(text=f"📈 {s.symbol} ({s.setup_id})", url=tv_chart_url(s.symbol))])
+        # Provide Chart buttons for quick UX
+        kb = []
+        for s in setups:
+            kb.append([InlineKeyboardButton(text=f"📈 {s.symbol} ({s.setup_id})", url=tv_chart_url(s.symbol))])
 
-    msg = (
-        f"✨ PulseFutures — Market Scan\n"
-        f"{HDR}\n"
-        f"— Top Trade Setups\n"
-        f"{setups_txt}\n\n"
-        f"— Directional Leaders / Losers\n"
-        f"{up_txt}\n\n{dn_txt}\n\n"
-        f"— Market Leaders\n"
-        f"{leaders_txt}"
-    )
+        msg = (
+            f"✨ PulseFutures — Market Scan\n"
+            f"{HDR}\n"
+            f"— Top Trade Setups\n"
+            f"{setups_txt}\n\n"
+            f"— Directional Leaders / Losers\n"
+            f"{up_txt}\n\n{dn_txt}\n\n"
+            f"— Market Leaders\n"
+            f"{leaders_txt}"
+        )
 
-    await update.message.reply_text(
-        msg,
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-        reply_markup=InlineKeyboardMarkup(kb) if kb else None,
-    )
+        # ✅ SAFE SEND (chunking + markdown fallback)
+        await send_long_message(
+            update,
+            msg,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(kb) if kb else None,
+        )
 
-
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    except Exception as e:
+        logger.exception("screen_cmd failed: %s", e)
+        try:
+            await update.message.reply_text(f"⚠️ /screen failed: {e}")
+        except Exception:
+            pass
+ 
+ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # lightweight: if user types something like PF-... show the signal
     text = (update.message.text or "").strip()
     if text.startswith("PF-"):
