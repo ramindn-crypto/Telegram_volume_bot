@@ -84,6 +84,12 @@ PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + 
        SELL => 24H <= -0.5%
    - /screen stays unchanged (still shows setups for awareness)
 
+✅ NEW (your latest request, WITHOUT removing anything):
+14) Reject Diagnostics (why only 1 setup?)
+   - Optional DEBUG_REJECTS=true to include sample rejects
+   - Always counts reject reasons per /screen run (in-memory)
+   - /screen appends a short Reject Diagnostics block (counts + samples if enabled)
+
 IMPORTANT (Render):
 - If you see: "Conflict: terminated by other getUpdates request"
   it means multiple instances are polling. Use WEBHOOK mode or ensure only 1 instance.
@@ -106,6 +112,10 @@ Optional:
 - DB_PATH=pulsefutures.db
 - WEBHOOK_URL=https://your-service.onrender.com   (recommended on Render)
 - PORT=10000 (Render sets it)
+
+Reject diagnostics optional:
+- DEBUG_REJECTS=true
+- REJECT_TOP_N=12
 """
 
 import asyncio
@@ -122,6 +132,7 @@ from email.message import EmailMessage
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from collections import Counter
 
 import ccxt
 from tabulate import tabulate
@@ -227,6 +238,12 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
 TICKERS_TTL_SEC = 45
 OHLCV_TTL_SEC = 60
 
+# =========================================================
+# ✅ NEW: DEBUG / REJECT REASONS
+# =========================================================
+DEBUG_REJECTS = os.environ.get("DEBUG_REJECTS", "false").lower() == "true"
+REJECT_TOP_N = int(os.environ.get("REJECT_TOP_N", "12"))  # how many sample rejects to show
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pulsefutures")
 
@@ -313,6 +330,55 @@ def cache_valid(key: str, ttl: int) -> bool:
         return False
     ts, _ = v
     return (time.time() - ts) <= ttl
+
+
+# =========================================================
+# ✅ NEW: REJECT TRACKER (in-memory per run)
+# =========================================================
+_REJECT_STATS = Counter()
+_REJECT_SAMPLES: Dict[str, List[str]] = {}  # reason -> list of examples
+
+
+def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
+    """
+    Collect reject stats + (optional) sample lines for /screen diagnosis.
+    Not stored in DB. Only for current process memory.
+    """
+    global _REJECT_STATS, _REJECT_SAMPLES
+    _REJECT_STATS[reason] += 1
+    if DEBUG_REJECTS:
+        try:
+            last = fmt_price(float(mv.last or 0.0))
+        except Exception:
+            last = str(mv.last)
+        line = f"{base} | {mv.symbol} | last={last} | {extra}".strip()
+        xs = _REJECT_SAMPLES.get(reason, [])
+        if len(xs) < REJECT_TOP_N:
+            xs.append(line)
+            _REJECT_SAMPLES[reason] = xs
+
+
+def _reject_report() -> str:
+    """
+    Build a short report of reject reasons + few sample symbols.
+    Used in /screen output.
+    """
+    if not _REJECT_STATS:
+        return ""
+
+    parts = []
+    parts.append("🧩 Reject Diagnostics (why setups were filtered)")
+    parts.append(SEP)
+
+    top = _REJECT_STATS.most_common(10)
+    for reason, cnt in top:
+        parts.append(f"- {reason}: {cnt}")
+        if DEBUG_REJECTS and reason in _REJECT_SAMPLES and _REJECT_SAMPLES[reason]:
+            smp = _REJECT_SAMPLES[reason][:3]
+            for s in smp:
+                parts.append(f"    • {s}")
+
+    return "\n".join(parts).strip()
 
 
 # =========================================================
@@ -1055,25 +1121,35 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
 def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Setup]:
     fut_vol = usd_notional(mv)
     if fut_vol <= 0:
+        _rej("no_fut_vol", base, mv)
         return None
 
     entry = float(mv.last or 0.0)
     if entry <= 0:
+        _rej("bad_entry", base, mv)
         return None
 
     ch24 = float(mv.percentage or 0.0)
     ch1, ch4, ch15, atr = metrics_from_candles_1h_15m(mv.symbol)
 
+    # detect missing/insufficient OHLCV (metrics function returns zeros)
+    if (ch1 == 0.0 and ch4 == 0.0 and ch15 == 0.0 and atr == 0.0):
+        _rej("ohlcv_missing_or_insufficient", base, mv, "metrics all zero")
+        return None
+
     # Direction gate: no counter-trend positions
     if abs(ch1) < TRIGGER_1H_ABS_MIN:
+        _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% < {TRIGGER_1H_ABS_MIN:.2f}%")
         return None
 
     side = "BUY" if ch1 > 0 else "SELL"
 
     # trend filter (no short if 4H bullish, no long if 4H bearish)
     if side == "BUY" and ch4 < ALIGN_4H_MIN:
+        _rej("4h_not_aligned_for_long", base, mv, f"side=BUY ch4={ch4:+.2f}% < {ALIGN_4H_MIN:.2f}%")
         return None
     if side == "SELL" and ch4 > -ALIGN_4H_MIN:
+        _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4:+.2f}% > {-ALIGN_4H_MIN:.2f}%")
         return None
 
     # =========================================================
@@ -1083,8 +1159,10 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
     thr = clamp(max(12.0, 2.5 * atr_pct), 12.0, 22.0)
 
     if side == "BUY" and ch24 <= -thr:
+        _rej("24h_contradiction_for_long", base, mv, f"ch24={ch24:+.1f}% <= -{thr:.1f}% (atr%={atr_pct:.2f})")
         return None
     if side == "SELL" and ch24 >= +thr:
+        _rej("24h_contradiction_for_short", base, mv, f"ch24={ch24:+.1f}% >= +{thr:.1f}% (atr%={atr_pct:.2f})")
         return None
 
     # ✅ Soft-confirm logic (NO REMOVAL):
@@ -1097,6 +1175,12 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
         # previously: hard reject if weak 15m
         # now: accept if confirmed OR strong-1H early
         if (not is_confirm_15m) and (not is_early_allowed):
+            _rej(
+                "15m_weak_and_not_early",
+                base,
+                mv,
+                f"ch15={ch15:+.2f}% < {CONFIRM_15M_ABS_MIN:.2f}% and ch1={ch1:+.2f}% < {EARLY_1H_ABS_MIN:.2f}%"
+            )
             return None
 
     conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
@@ -1107,6 +1191,7 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
 
     sl, tp3_single, R = compute_sl_tp(entry, side, atr, conf)
     if sl <= 0 or tp3_single <= 0 or R <= 0:
+        _rej("bad_sl_tp_or_atr", base, mv, f"atr={atr:.6g} entry={entry:.6g}")
         return None
 
     tp1 = tp2 = None
@@ -1139,6 +1224,11 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
 
 
 def pick_setups(best_fut: Dict[str, MarketVol], n: int, strict_15m: bool = True) -> List[Setup]:
+    # ✅ NEW: reset reject counters for this run
+    global _REJECT_STATS, _REJECT_SAMPLES
+    _REJECT_STATS = Counter()
+    _REJECT_SAMPLES = {}
+
     # consider top liquid coins only (speed + quality)
     universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:35]
     setups: List[Setup] = []
@@ -1440,6 +1530,10 @@ Emails are sent only during your enabled sessions:
 - Trend-follow Email filter:
   BUY only if 24H >= +0.5%
   SELL only if 24H <= -0.5%
+
+✅ NEW:
+- Reject Diagnostics (optional)
+  DEBUG_REJECTS=true to include sample symbols + metrics in /screen
 
 8) Performance Reports (Your trades)
 - /report_daily
@@ -2104,6 +2198,11 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         setups_txt = "\n\n".join(setup_blocks)
     else:
         setups_txt = "No high-quality setups right now."
+
+    # ✅ NEW: append reject diagnostics (counts + samples if DEBUG_REJECTS=true)
+    diag_txt = _reject_report()
+    if diag_txt:
+        setups_txt = setups_txt + "\n\n" + diag_txt
 
     # Provide Chart buttons for quick UX
     kb = []
