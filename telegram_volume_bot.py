@@ -199,7 +199,7 @@ DEFAULT_MIN_EMAIL_GAP_MIN = 60
 DEFAULT_MAX_EMAILS_PER_SESSION = 4  # user can set 0 for unlimited (new feature)
 
 # ✅ NEW: DAILY email cap per user across ALL sessions (quality-only “2–3 trades/day style”)
-DEFAULT_MAX_EMAILS_PER_DAY = 3
+DEFAULT_MAX_EMAILS_PER_DAY = 12
 
 # Cooldown
 SYMBOL_COOLDOWN_HOURS = 18  # do not repeat same symbol in emails for that user within 18h
@@ -222,7 +222,7 @@ TP_ALLOCS = (40, 35, 25)  # TP1/TP2/TP3 split
 TP_R_MULTS = (1.1, 2.1, 3.4)  # was (1.0, 1.7, 2.6)
 
 # ✅ Premium: gate low R/R setups from EMAIL (TP3 R-multiple)
-MIN_RR_TP3 = 1.25  # recommend 1.6–1.8 for "2–3 trades/day" premium style
+MIN_RR_TP3 = 1.25 # recommend 1.6–1.8 for "2–3 trades/day" premium style
 
 # ✅ Email: Entry Zone + No chase
 ENTRY_ZONE_R = 0.25   # Entry zone width (in R units) around entry
