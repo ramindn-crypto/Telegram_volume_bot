@@ -212,7 +212,7 @@ ATR_MIN_PCT = 1.0   # was 0.8
 ATR_MAX_PCT = 8.0
 
 # ✅ Premium: allow bigger TP cap
-TP_MAX_PCT = 10.0   # was 7.0
+TP_MAX_PCT = 20.0   # was 7.0
 
 MULTI_TP_MIN_CONF = 78
 TP_ALLOCS = (40, 35, 25)  # TP1/TP2/TP3 split
@@ -222,11 +222,11 @@ TP_ALLOCS = (40, 35, 25)  # TP1/TP2/TP3 split
 TP_R_MULTS = (1.1, 2.1, 3.4)  # was (1.0, 1.7, 2.6)
 
 # ✅ Premium: gate low R/R setups from EMAIL (TP3 R-multiple)
-MIN_RR_TP3 = 1.25 # recommend 1.6–1.8 for "2–3 trades/day" premium style
+MIN_RR_TP3 = 1.5 # recommend 1.6–1.8 for "2–3 trades/day" premium style
 
 # ✅ Email: Entry Zone + No chase
-ENTRY_ZONE_R = 0.25   # Entry zone width (in R units) around entry
-NO_CHASE_R = 0.35     # "No chase" distance (in R units)
+ENTRY_ZONE_R = 0.28   # Entry zone width (in R units) around entry
+NO_CHASE_R = 0.32     # "No chase" distance (in R units)
 
 # Email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
