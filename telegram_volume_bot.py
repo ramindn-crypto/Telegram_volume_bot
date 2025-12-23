@@ -2527,11 +2527,8 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             now_local = datetime.now(tz)
             body = _email_body_pretty(sess["name"], now_local, user["tz"], filtered, best_fut)
 
-            if max_emails > 0:
-                subject = f"PulseFutures • {sess['name']} • Premium Setups ({int(st['sent_count'])+1}/{max_emails})"
-            else:
-                subject = f"PulseFutures • {sess['name']} • Premium Setups (#{int(st['sent_count'])+1})"
-
+            subject = f"PulseFutures • {sess['name']} • Premium Setups ({int(st['sent_count'])+1})"
+            
             ok = await asyncio.to_thread(send_email, subject, body)
             if ok:
                 email_state_set(uid, sent_count=int(st["sent_count"]) + 1, last_email_ts=now_ts)
