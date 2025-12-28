@@ -1,3 +1,4 @@
+````python
 #!/usr/bin/env python3
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
@@ -95,6 +96,13 @@ PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + 
    - Added SQLite daily counter table with atomic increment (setup_counter)
    - next_setup_id() now uses BEGIN IMMEDIATE + UPSERT increment to guarantee uniqueness
    - Works for /screen and email cycles even when multiple setups are created before inserts
+
+✅ NEW (your latest request — IMPORTANT):
+16) ✅ Daily Email Cap is now USER-CONTROLLABLE via Telegram:
+   - /limits emaildaycap 4     => cap total emails/day (across all sessions)
+   - /limits emaildaycap 0     => unlimited daily emails
+   - Stored per-user in DB: users.max_emails_per_day
+   - Migration included (ALTER TABLE if missing)
 
 IMPORTANT (Render):
 - If you see: "Conflict: terminated by other getUpdates request"
@@ -199,7 +207,8 @@ DEFAULT_MIN_EMAIL_GAP_MIN = 60
 DEFAULT_MAX_EMAILS_PER_SESSION = 4  # user can set 0 for unlimited (new feature)
 
 # ✅ NEW: DAILY email cap per user across ALL sessions (quality-only “2–3 trades/day style”)
-DEFAULT_MAX_EMAILS_PER_DAY = 12
+# Now user-controllable via /limits emaildaycap <N> (0=unlimited)
+DEFAULT_MAX_EMAILS_PER_DAY = 4
 
 # Cooldown
 SYMBOL_COOLDOWN_HOURS = 18  # do not repeat same symbol in emails for that user within 18h
@@ -414,10 +423,17 @@ def db_init():
         sessions_enabled TEXT NOT NULL,
         max_emails_per_session INTEGER NOT NULL,
         email_gap_min INTEGER NOT NULL,
+        max_emails_per_day INTEGER NOT NULL,
         day_trade_date TEXT NOT NULL,
         day_trade_count INTEGER NOT NULL
     )
     """)
+
+    # ✅ MIGRATION: add max_emails_per_day if missing (for existing DBs)
+    cur.execute("PRAGMA table_info(users)")
+    cols = {r[1] for r in cur.fetchall()}  # r[1] = column name
+    if "max_emails_per_day" not in cols:
+        cur.execute(f"ALTER TABLE users ADD COLUMN max_emails_per_day INTEGER NOT NULL DEFAULT {int(DEFAULT_MAX_EMAILS_PER_DAY)}")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trades (
@@ -536,9 +552,10 @@ def get_user(user_id: int) -> dict:
                 daily_cap_mode, daily_cap_value,
                 max_trades_day, notify_on,
                 sessions_enabled, max_emails_per_session, email_gap_min,
+                max_emails_per_day,
                 day_trade_date, day_trade_count
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             user_id,
             tz_name,
@@ -552,6 +569,7 @@ def get_user(user_id: int) -> dict:
             json.dumps(sessions),
             int(DEFAULT_MAX_EMAILS_PER_SESSION),
             int(DEFAULT_MIN_EMAIL_GAP_MIN),
+            int(DEFAULT_MAX_EMAILS_PER_DAY),
             now_local,
             0
         ))
@@ -1557,6 +1575,7 @@ Shows:
 - /limits maxtrades 5
 - /limits emailcap 4        (0 = unlimited)
 - /limits emailgap 60
+- /limits emaildaycap 4     (0 = unlimited)
 
 6) Sessions (Emails by session)
 Default enabled session depends on your timezone:
@@ -1584,6 +1603,7 @@ Emails are sent only during your enabled sessions:
 - Minimum emailgap minutes
 - No symbol repeats for 18 hours
 - Session-based quality filters (NY easiest, ASIA strictest)
+- ✅ Daily email cap across all sessions (user-controlled): /limits emaildaycap <N> (0 = unlimited)
 
 ✅ Premium Email Rules:
 - MIN_RR_TP3 gate (low R/R setups will NOT be emailed)
@@ -1592,9 +1612,6 @@ Emails are sent only during your enabled sessions:
 ✅ UPDATED:
 - 15m is SOFT for email:
   CONFIRMED (1H+15m) OR EARLY (Strong 1H, 15m pending with extra gates)
-
-✅ NEW:
-- Daily email cap across all sessions (default 3) to keep users at ~2–3 trades/day style.
 
 ✅ NEW:
 - Trend-follow Email filter:
@@ -1730,14 +1747,15 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Limits:\n"
             f"- maxtrades: {int(user['max_trades_day'])}\n"
             f"- emailcap: {int(user['max_emails_per_session'])} (0 = unlimited)\n"
-            f"- emailgap: {int(user['email_gap_min'])} min\n\n"
+            f"- emailgap: {int(user['email_gap_min'])} min\n"
+            f"- emaildaycap: {int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0 = unlimited)\n\n"
             f"Set examples:\n"
             f"/limits maxtrades 5\n"
             f"/limits emailcap 4\n"
             f"/limits emailcap 0   (unlimited)\n"
-            f"/limits emailgap 60\n\n"
-            f"Note:\n"
-            f"- Daily email cap (across all sessions) is {DEFAULT_MAX_EMAILS_PER_DAY} by default (code-level)."
+            f"/limits emailgap 60\n"
+            f"/limits emaildaycap 4\n"
+            f"/limits emaildaycap 0   (unlimited)\n"
         )
         return
 
@@ -1770,8 +1788,16 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_user(uid, email_gap_min=val)
         await update.message.reply_text(f"✅ emailgap set to {val} minutes")
 
+    elif key in {"emaildaycap", "dailyemailcap", "emailcapday"}:
+        # ✅ NEW: daily email cap (across all sessions), 0 = unlimited
+        if not (0 <= val <= 50):
+            await update.message.reply_text("emaildaycap must be 0..50 (0 = unlimited)")
+            return
+        update_user(uid, max_emails_per_day=val)
+        await update.message.reply_text(f"✅ daily email cap set to {val} (0 = unlimited)")
+
     else:
-        await update.message.reply_text("Unknown key. Use: maxtrades | emailcap | emailgap")
+        await update.message.reply_text("Unknown key. Use: maxtrades | emailcap | emailgap | emaildaycap")
 
 
 async def sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2100,6 +2126,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Daily cap: {user['daily_cap_mode']} {float(user['daily_cap_value']):.2f} (≈ ${cap:.2f})")
     lines.append(f"Email alerts: {'ON' if int(user['notify_on'])==1 else 'OFF'}")
     lines.append(f"Sessions enabled: {', '.join(enabled)} | Now: {now_txt}")
+    lines.append(f"Email caps: session={int(user['max_emails_per_session'])} (0=∞), day={int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0=∞), gap={int(user['email_gap_min'])}m")
     lines.append(HDR)
 
     if not opens:
@@ -2460,11 +2487,12 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             gap_min = int(user["email_gap_min"])
             gap_sec = gap_min * 60
 
-            # ✅ NEW: daily email cap across all sessions (per user)
+            # ✅ NEW: daily email cap across all sessions (per user, user-controllable)
             tz = ZoneInfo(user["tz"])
             day_local = datetime.now(tz).date().isoformat()
             sent_today = _email_daily_get(uid, day_local)
-            if sent_today >= int(DEFAULT_MAX_EMAILS_PER_DAY):
+            day_cap = int(user.get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY))
+            if day_cap > 0 and sent_today >= day_cap:
                 continue
 
             # ✅ NEW: unlimited support (per session)
@@ -2528,7 +2556,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             body = _email_body_pretty(sess["name"], now_local, user["tz"], filtered, best_fut)
 
             subject = f"PulseFutures • {sess['name']} • Premium Setups ({int(st['sent_count'])+1})"
-            
+
             ok = await asyncio.to_thread(send_email, subject, body)
             if ok:
                 email_state_set(uid, sent_count=int(st["sent_count"]) + 1, last_email_ts=now_ts)
@@ -2611,3 +2639,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+````
