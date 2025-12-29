@@ -254,9 +254,9 @@ HOT_CH24_ABS = 15.0
 EMA12_PERIOD = 12
 
 # maximum allowed distance from EMA12 (derived from ATR%), clamped
-EMA12_MAX_DIST_ATR_MULT = 0.35  # threshold_pct = (0.35*ATR/entry)*100
-EMA12_MAX_DIST_PCT_MIN = 0.15   # percent
-EMA12_MAX_DIST_PCT_MAX = 0.90   # percent
+EMA12_MAX_DIST_ATR_MULT = 0.7  # threshold_pct = (0.35*ATR/entry)*100
+EMA12_MAX_DIST_PCT_MIN = 0.25   # percent
+EMA12_MAX_DIST_PCT_MAX = 1.5   # percent
 
 # Sharp 1H move gating
 SHARP_1H_MOVE_PCT = 20.0
@@ -939,21 +939,28 @@ def tp_cap_pct_for_coin(fut_vol_usd: float, ch24: float) -> float:
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-def ema12_proximity_ok(entry: float, ema12_val: float, atr_1h: float) -> bool:
+def ema12_proximity_ok(entry: float, ema12_val: float, atr_1h: float):
     """
     Require entry to be near EMA12(15m).
-    Threshold is derived from ATR% (1H ATR proxy) and clamped to sensible bounds.
+    Returns:
+      (ok: bool, dist_pct: float, thr_pct: float, atr_pct: float)
     """
     if entry <= 0 or ema12_val <= 0:
-        return False
+        return False, 999.0, 0.0, 0.0
+
     dist = abs(entry - ema12_val)
-    pct_dist = (dist / entry) * 100.0
+    dist_pct = (dist / entry) * 100.0
 
-    # derive threshold from ATR%, then clamp
     atr_pct = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
-    thr_pct = clamp(EMA12_MAX_DIST_ATR_MULT * atr_pct, EMA12_MAX_DIST_PCT_MIN, EMA12_MAX_DIST_PCT_MAX)
+    thr_pct = clamp(
+        EMA12_MAX_DIST_ATR_MULT * atr_pct,
+        EMA12_MAX_DIST_PCT_MIN,
+        EMA12_MAX_DIST_PCT_MAX,
+    )
 
-    return pct_dist <= thr_pct
+    ok = dist_pct <= thr_pct
+    return ok, dist_pct, thr_pct, atr_pct
+
 
 def ema12_reaction_ok_15m(c15: List[List[float]], ema12_val: float, side: str) -> bool:
     """
@@ -1304,9 +1311,13 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
         return None
 
     # EMA12 proximity mandatory (15m)
-    if not ema12_proximity_ok(entry, ema12_15m, atr_1h):
-        d_pct = abs(entry - ema12_15m) / entry * 100.0 if ema12_15m > 0 else 999.0
-        _rej("price_not_near_ema12_15m", base, mv, f"dist={d_pct:.2f}%")
+    ok_ema, dist_pct, thr_pct, atr_pct = ema12_proximity_ok(entry, ema12_15m, atr_1h)
+    if not ok_ema:
+        _rej(
+            "price_not_near_ema12_15m",
+            base,
+            mv,
+         ) 
         return None
 
     # Sharp 1H move gating: must show EMA reaction, not immediate spike-chase
