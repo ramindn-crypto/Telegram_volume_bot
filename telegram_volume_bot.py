@@ -1,3 +1,4 @@
+````python
 #!/usr/bin/env python3
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
@@ -208,6 +209,9 @@ DEFAULT_MAX_EMAILS_PER_SESSION = 4  # user can set 0 for unlimited (new feature)
 # ✅ NEW: DAILY email cap per user across ALL sessions (quality-only “2–3 trades/day style”)
 # Now user-controllable via /limits emaildaycap <N> (0=unlimited)
 DEFAULT_MAX_EMAILS_PER_DAY = 4
+
+# ✅ NEW (Your request): Default risk limit for /size (if user doesn't specify risk)
+DEFAULT_SIZE_RISK_PCT = 2.0  # aim to keep users <= 2% per trade unless they override
 
 # Cooldown
 SYMBOL_COOLDOWN_HOURS = 18  # do not repeat same symbol in emails for that user within 18h
@@ -1515,20 +1519,25 @@ PulseFutures — Commands (Telegram)
   • Market Leaders by futures volume
 
 2) Position Sizing (Risk + SL => Qty)
-- /size <SYMBOL> <long|short> risk <usd|pct> <VALUE> sl <STOP> [entry <ENTRY>]
+- /size <SYMBOL> <long|short> sl <STOP> [entry <ENTRY>] [risk <usd|pct> <VALUE>]
 
 Examples:
+- /size BTC long sl 42000
+  → Default risk is 2% of Equity (recommended max per trade).
+  → If your equity is 0, set it first: /equity 1000
+
 - /size BTC long risk usd 40 sl 42000
-  → Bot uses current Bybit futures price as Entry and returns Qty for $40 risk.
+  → Uses current Bybit futures price as Entry and returns Qty for $40 risk.
 
 - /size ETH short risk pct 2.5 sl 2480
-  → Uses Equity. If your equity is 0, set it first:
-    /equity 1000
+  → Allowed, but you will get a warning because it is above 2% default risk.
 
 Manual entry example:
+- /size BTC long sl 42000 entry 43000
 - /size BTC long risk usd 50 sl 42000 entry 43000
 
 Notes:
+- Default /size risk is 2% Equity unless you set risk manually.
 - pct uses your Equity
 - Qty = RiskUSD / |Entry - SL|
 - This command does NOT open a trade. It only gives position size.
@@ -1604,23 +1613,6 @@ Emails are sent only during your enabled sessions:
 - Session-based quality filters (NY easiest, ASIA strictest)
 - ✅ Daily email cap across all sessions (user-controlled): /limits emaildaycap <N> (0 = unlimited)
 
-✅ Premium Email Rules:
-- MIN_RR_TP3 gate (low R/R setups will NOT be emailed)
-- Email includes: "Entry Zone + No chase"
-
-✅ UPDATED:
-- 15m is SOFT for email:
-  CONFIRMED (1H+15m) OR EARLY (Strong 1H, 15m pending with extra gates)
-
-✅ NEW:
-- Trend-follow Email filter:
-  BUY only if 24H >= +0.5%
-  SELL only if 24H <= -0.5%
-
-✅ NEW:
-- Reject Diagnostics (optional)
-  DEBUG_REJECTS=true to include sample symbols + metrics in /screen
-
 8) Performance Reports (Your trades)
 - /report_daily
 - /report_weekly
@@ -1630,10 +1622,6 @@ Includes wins/losses, net PnL, win rate, avg R and advice.
 - /signals_daily
 - /signals_weekly
 Shows how many setups were generated + (if users link trades to signal IDs) aggregated outcomes.
-
-Tip:
-- Every email setup has a unique ID: PF-YYYYMMDD-0001
-  You can reference it in your PulseFutures channel and also attach it to /trade_open with "sig".
 
 Not financial advice.
 """
@@ -1866,20 +1854,20 @@ async def notify_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /size BTC long risk usd 40 sl 42000 [entry 43000]
+    /size BTC long sl 42000 [entry 43000] [risk <usd|pct> <value>]
+    Default risk if not provided: 2% equity (recommended max per trade).
     """
     uid = update.effective_user.id
     user = get_user(uid)
 
     raw = " ".join(context.args).strip()
     if not raw:
-        await update.message.reply_text("Usage: /size BTC long risk usd 40 sl 42000  (optional: entry 43000)")
+        await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: entry 43000)  (optional: risk pct 2 | risk usd 40)")
         return
 
-    # parse simple tokens
     tokens = raw.split()
-    if len(tokens) < 7:
-        await update.message.reply_text("Usage: /size BTC long risk usd 40 sl 42000  (optional: entry 43000)")
+    if len(tokens) < 4:
+        await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: entry 43000)  (optional: risk pct 2 | risk usd 40)")
         return
 
     sym = re.sub(r"[^A-Za-z0-9]", "", tokens[0]).upper()
@@ -1889,29 +1877,49 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     side = "BUY" if direction == "long" else "SELL"
 
+    # parse tokens flexibly
+    def find_idx(x: str) -> Optional[int]:
+        try:
+            return tokens.index(x)
+        except ValueError:
+            return None
+
+    sl_i = find_idx("sl")
+    if sl_i is None or sl_i + 1 >= len(tokens):
+        await update.message.reply_text("Missing sl. Example: /size BTC long sl 42000")
+        return
     try:
-        # find "risk <usd|pct> <value>" and "sl <stop>" and optional "entry <entry>"
-        def idx(x): return tokens.index(x)
-
-        r_i = idx("risk")
-        risk_mode = tokens[r_i + 1].upper()
-        risk_val = float(tokens[r_i + 2])
-
-        sl_i = idx("sl")
         sl = float(tokens[sl_i + 1])
-
-        entry = None
-        if "entry" in tokens:
-            e_i = idx("entry")
-            entry = float(tokens[e_i + 1])
-
     except Exception:
-        await update.message.reply_text("Bad format. Example: /size BTC long risk usd 40 sl 42000  (entry 43000)")
+        await update.message.reply_text("Bad sl value. Example: /size BTC long sl 42000")
         return
 
-    if risk_mode not in {"USD", "PCT"}:
-        await update.message.reply_text("risk mode must be usd or pct")
-        return
+    entry = None
+    e_i = find_idx("entry")
+    if e_i is not None and e_i + 1 < len(tokens):
+        try:
+            entry = float(tokens[e_i + 1])
+        except Exception:
+            await update.message.reply_text("Bad entry value. Example: entry 43000")
+            return
+
+    # risk optional
+    risk_mode = None
+    risk_val = None
+    r_i = find_idx("risk")
+    if r_i is not None:
+        if r_i + 2 >= len(tokens):
+            await update.message.reply_text("Bad risk format. Example: risk pct 2  OR  risk usd 40")
+            return
+        risk_mode = tokens[r_i + 1].upper()
+        try:
+            risk_val = float(tokens[r_i + 2])
+        except Exception:
+            await update.message.reply_text("Bad risk value. Example: risk pct 2  OR  risk usd 40")
+            return
+        if risk_mode not in {"USD", "PCT"}:
+            await update.message.reply_text("risk mode must be usd or pct")
+            return
 
     if entry is None:
         # fetch current price
@@ -1921,11 +1929,6 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Could not fetch price for {sym}. Provide entry manually: entry 43000")
             return
         entry = float(mv.last)
-
-    risk_usd = compute_risk_usd(user, risk_mode, risk_val)
-    if risk_usd <= 0:
-        await update.message.reply_text("Risk USD computed as 0. If you used pct, set your equity first: /equity 1000")
-        return
 
     if entry <= 0 or sl <= 0 or entry == sl:
         await update.message.reply_text("Entry/SL invalid. Ensure entry and sl are positive and not equal.")
@@ -1939,21 +1942,55 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("For SHORT, SL should be ABOVE entry.")
         return
 
+    # Default risk if not provided: 2% equity
+    warning_lines = []
+    if risk_mode is None:
+        risk_mode = "PCT"
+        risk_val = float(DEFAULT_SIZE_RISK_PCT)
+        if float(user["equity"]) <= 0:
+            await update.message.reply_text("Equity is 0. Set it first for default 2% sizing: /equity 1000  (or provide risk usd ...)")
+            return
+
+    # compute risk usd
+    risk_usd = compute_risk_usd(user, risk_mode, risk_val)
+    if risk_usd <= 0:
+        await update.message.reply_text("Risk USD computed as 0. If you used pct, set your equity first: /equity 1000")
+        return
+
+    # Warn if above 2% of equity (even if user overrides)
+    eq = float(user["equity"])
+    if eq > 0:
+        recommended_max_usd = eq * (DEFAULT_SIZE_RISK_PCT / 100.0)
+        if risk_usd > recommended_max_usd * 1.000001:
+            if risk_mode == "PCT":
+                warning_lines.append(
+                    f"⚠️ Warning: You are risking {float(risk_val):.2f}% of equity. Recommended max per trade is {DEFAULT_SIZE_RISK_PCT:.2f}%."
+                )
+            else:
+                pct_equiv = (risk_usd / eq) * 100.0
+                warning_lines.append(
+                    f"⚠️ Warning: Your risk is ${risk_usd:.2f} (~{pct_equiv:.2f}% of equity). Recommended max per trade is {DEFAULT_SIZE_RISK_PCT:.2f}%."
+                )
+
     qty = calc_qty(entry, sl, risk_usd)
     if qty <= 0:
         await update.message.reply_text("Could not compute qty. Check entry/sl/risk.")
         return
 
-    await update.message.reply_text(
+    msg = (
         f"✅ Position Size\n"
         f"- Symbol: {sym}\n"
         f"- Side: {side}\n"
         f"- Entry: {fmt_price(entry)}\n"
         f"- SL: {fmt_price(sl)}\n"
         f"- Risk: ${risk_usd:.2f}\n"
-        f"- Qty: {qty:.6g}\n\n"
-        f"Chart: {tv_chart_url(sym)}"
+        f"- Qty: {qty:.6g}\n"
     )
+    if warning_lines:
+        msg += "\n" + "\n".join(warning_lines) + "\n"
+    msg += f"\nChart: {tv_chart_url(sym)}"
+
+    await update.message.reply_text(msg)
 
 
 async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2392,13 +2429,6 @@ def _entry_zone_text(s: Setup) -> str:
         )
 
 
-def _setup_status_text(s: Setup) -> str:
-    is_confirm_15m = abs(float(s.ch15)) >= CONFIRM_15M_ABS_MIN
-    if is_confirm_15m:
-        return "Status: CONFIRMED (1H + 15m)"
-    return "Status: EARLY (Strong 1H, 15m pending)"
-
-
 def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, setups: List[Setup], best_fut: Dict[str, MarketVol]) -> str:
     parts = []
     parts.append(HDR)
@@ -2412,21 +2442,22 @@ def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, set
     parts.append("Market Snapshot")
     parts.append(SEP)
     if leaders:
-        parts.append("Top Volume:")
-        parts.append("  " + ", ".join([f"{b}({pct_with_emoji(float(mv.percentage or 0.0))})" for b, mv in leaders]))
+        # ✅ FIX: Top Volume in the same line (no line break)
+        parts.append("Top Volume: " + ", ".join([f"{b}({pct_with_emoji(float(mv.percentage or 0.0))})" for b, mv in leaders]))
     if up:
         parts.append("Leaders: " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in up[:3]]))
     if dn:
         parts.append("Losers:  " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in dn[:3]]))
     parts.append("")
 
-    parts.append("Top Setups (Reference IDs)")
+    # ✅ FIX: Rename to "Top Setups"
+    parts.append("Top Setups")
     parts.append(SEP)
     parts.append("")
     for i, s in enumerate(setups, 1):
         rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
         parts.append(f"{i}) {s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}/100")
-        parts.append(f"   {_setup_status_text(s)}")
+        # ✅ FIX: Remove status line from email
         parts.append(f"   Entry: {fmt_price(s.entry)} | SL: {fmt_price(s.sl)} | RR(TP3): {rr3:.2f}")
         parts.append(f"   {_entry_zone_text(s).replace(chr(10), chr(10)+'   ')}")
         if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
@@ -2437,6 +2468,12 @@ def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, set
         parts.append(f"   24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}")
         parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
         parts.append("")
+
+    # ✅ FIX: Add Telegram bot link + sizing note at end
+    parts.append(HDR)
+    parts.append("🤖 Position Sizing & Risk Control")
+    parts.append("Use the PulseFutures Telegram bot to calculate safe position size based on your Stop Loss.")
+    parts.append("👉 https://t.me/PulseFuturesBot")
     parts.append(HDR)
     parts.append("Not financial advice.")
     parts.append("PulseFutures")
@@ -2638,3 +2675,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+````
