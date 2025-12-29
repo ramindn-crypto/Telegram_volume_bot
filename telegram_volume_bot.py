@@ -1,4 +1,3 @@
-````python
 #!/usr/bin/env python3
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
@@ -2675,4 +2674,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-````
