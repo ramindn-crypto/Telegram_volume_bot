@@ -1577,30 +1577,70 @@ Examples:
     /equity 1000
 
 - /size BTC long risk usd 40 sl 42000
+  → Bot uses current Bybit futures price as Entry and returns Qty for $40 risk.
+
 - /size ETH short risk pct 2.5 sl 2480
+  → Uses Equity. If your equity is 0, set it first:
+    /equity 1000
+
+Manual entry examples:
+- /size BTC long sl 42000 entry 43000
+- /size BTC long risk usd 50 sl 42000 entry 43000
 
 Notes:
 - If you do NOT specify "risk", the bot uses 2% of your Equity by default.
 - If you specify risk above 2% of Equity, the bot will warn you.
+- pct uses your Equity
 - Qty = RiskUSD / |Entry - SL|
+- This command does NOT open a trade.
 
 3) Trade Journal (Open / Close) + Equity auto-update
+Set equity:
 - /equity 1000
+
+Open trade:
 - /trade_open <SYMBOL> <long|short> entry <ENTRY> sl <SL> risk <usd|pct> <VALUE> [note "..."] [sig <SETUP_ID>]
+
+Examples:
+- /trade_open BTC long entry 43000 sl 42000 risk usd 40 note breakout sig PF-20251219-0007
+- /trade_open ETH short entry 2520 sl 2575 risk pct 2 note trend
+
+Close trade:
 - /trade_close <TRADE_ID> pnl <PNL>
+
+Equity behavior:
+- Equity updates ONLY when trades are closed
+- Persistent until reset:
+  /equity_reset
 
 4) Status
 - /status
+Shows:
+• Open trades
+• Daily trade count
+• Daily risk used & remaining
+• Equity
 
 5) Risk Settings
 - /riskmode pct 2.5
+- /riskmode usd 25
 - /dailycap pct 5
+- /dailycap usd 60
 - /limits maxtrades 5
-- /limits emailcap 4 (0=unlimited)
+- /limits emailcap 4        (0 = unlimited)
 - /limits emailgap 60
-- /limits emaildaycap 4 (0=unlimited)
+- /limits emaildaycap 4     (0 = unlimited)
 
-6) Sessions
+6) Sessions (Emails by session)
+Default by timezone:
+- Americas → NY
+- Europe/Africa → LON
+- Asia/Oceania → ASIA
+
+Session priority:
+NY > LON > ASIA
+
+Commands:
 - /sessions
 - /sessions_on NY
 - /sessions_off LON
@@ -1608,6 +1648,20 @@ Notes:
 7) Email Alerts
 - /notify_on
 - /notify_off
+
+Email rules:
+- Sent only during enabled sessions
+- Session-based quality filters
+- No same symbol for 18h
+- Daily email cap supported
+
+8) Performance Reports
+- /report_daily
+- /report_weekly
+
+9) Signal Reports
+- /signals_daily
+- /signals_weekly
 
 Not financial advice.
 """
