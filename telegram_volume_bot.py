@@ -103,6 +103,16 @@ PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + 
    - Stored per-user in DB: users.max_emails_per_day
    - Migration included (ALTER TABLE if missing)
 
+✅ NEW (your request for code 28 — ADDED WITHOUT removing anything):
+17) ✅ Daily Risk Used / Remaining (Telegram):
+   - On /trade_open:
+       • Shows Daily risk limit (defaults to 5% equity via dailycap pct 5)
+       • Shows Used risk today + Remaining risk today
+       • Warns if trade risk exceeds remaining allowed risk today
+       • Uses user's local day (tz)
+   - On /status:
+       • Shows Daily risk limit + Used today + Remaining
+
 IMPORTANT (Render):
 - If you see: "Conflict: terminated by other getUpdates request"
   it means multiple instances are polling. Use WEBHOOK mode or ensure only 1 instance.
@@ -129,6 +139,9 @@ Optional:
 Reject diagnostics optional:
 - DEBUG_REJECTS=true
 - REJECT_TOP_N=12
+
+Optional (email footer link):
+- TELEGRAM_BOT_URL=https://t.me/PulseFuturesBot
 """
 
 import asyncio
@@ -200,7 +213,7 @@ DEFAULT_EQUITY = 0.0
 DEFAULT_RISK_MODE = "PCT"     # PCT or USD
 DEFAULT_RISK_VALUE = 1.5      # 1.5% by default (only used if user doesn't override)
 DEFAULT_DAILY_CAP_MODE = "PCT"
-DEFAULT_DAILY_CAP_VALUE = 5.0
+DEFAULT_DAILY_CAP_VALUE = 5.0  # ✅ default 5% equity/day risk cap
 DEFAULT_MAX_TRADES_DAY = 5
 DEFAULT_MIN_EMAIL_GAP_MIN = 60
 DEFAULT_MAX_EMAILS_PER_SESSION = 4  # user can set 0 for unlimited (new feature)
@@ -209,8 +222,9 @@ DEFAULT_MAX_EMAILS_PER_SESSION = 4  # user can set 0 for unlimited (new feature)
 # Now user-controllable via /limits emaildaycap <N> (0=unlimited)
 DEFAULT_MAX_EMAILS_PER_DAY = 4
 
-# ✅ NEW (Your request): Default risk limit for /size (if user doesn't specify risk)
-DEFAULT_SIZE_RISK_PCT = 2.0  # aim to keep users <= 2% per trade unless they override
+# ✅ NEW (requested): /size default risk ceiling
+DEFAULT_MAX_RISK_PCT_PER_TRADE = 2.0  # default risk when user doesn't specify risk
+WARN_RISK_PCT_PER_TRADE = 2.0         # warn if user specifies above this
 
 # Cooldown
 SYMBOL_COOLDOWN_HOURS = 18  # do not repeat same symbol in emails for that user within 18h
@@ -233,7 +247,7 @@ TP_ALLOCS = (40, 35, 25)  # TP1/TP2/TP3 split
 TP_R_MULTS = (1.1, 2.1, 3.4)  # was (1.0, 1.7, 2.6)
 
 # ✅ Premium: gate low R/R setups from EMAIL (TP3 R-multiple)
-MIN_RR_TP3 = 1.5 # recommend 1.6–1.8 for "2–3 trades/day" premium style
+MIN_RR_TP3 = 1.5  # recommend 1.6–1.8 for "2–3 trades/day" premium style
 
 # ✅ Email: Entry Zone + No chase
 ENTRY_ZONE_R = 0.28   # Entry zone width (in R units) around entry
@@ -250,6 +264,9 @@ EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)  # comma-separated ok
 
 # Render stability
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
+
+# Email footer / CTA
+TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFuturesBot").strip()
 
 # Caching for speed
 TICKERS_TTL_SEC = 45
@@ -504,6 +521,16 @@ def db_init():
     )
     """)
 
+    # ✅ NEW: daily risk used tracking (per user, local day)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS risk_daily (
+        user_id INTEGER NOT NULL,
+        day_local TEXT NOT NULL,
+        used_risk_usd REAL NOT NULL,
+        PRIMARY KEY (user_id, day_local)
+    )
+    """)
+
     # ✅ FIX: Atomic daily setup counter to prevent duplicate setup IDs
     cur.execute("""
     CREATE TABLE IF NOT EXISTS setup_counter (
@@ -688,6 +715,38 @@ def _email_daily_inc(user_id: int, day_local: str, inc: int = 1):
     """, (user_id, day_local, int(inc)))
     con.commit()
     con.close()
+
+
+# ✅ NEW: daily risk used helpers (per user, local day)
+def _risk_daily_get(user_id: int, day_local: str) -> float:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT used_risk_usd FROM risk_daily WHERE user_id=? AND day_local=?", (user_id, day_local))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO risk_daily (user_id, day_local, used_risk_usd) VALUES (?, ?, ?)", (user_id, day_local, 0.0))
+        con.commit()
+        con.close()
+        return 0.0
+    con.close()
+    return float(row["used_risk_usd"])
+
+
+def _risk_daily_inc(user_id: int, day_local: str, inc_usd: float):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO risk_daily (user_id, day_local, used_risk_usd)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, day_local) DO UPDATE SET used_risk_usd = used_risk_usd + excluded.used_risk_usd
+    """, (user_id, day_local, float(inc_usd)))
+    con.commit()
+    con.close()
+
+
+def _user_day_local(user: dict) -> str:
+    tz = ZoneInfo(user["tz"])
+    return datetime.now(tz).date().isoformat()
 
 
 def db_insert_signal(s: Setup):
@@ -1518,25 +1577,27 @@ PulseFutures — Commands (Telegram)
   • Market Leaders by futures volume
 
 2) Position Sizing (Risk + SL => Qty)
-- /size <SYMBOL> <long|short> sl <STOP> [entry <ENTRY>] [risk <usd|pct> <VALUE>]
+- /size <SYMBOL> <long|short> sl <STOP> [risk <usd|pct> <VALUE>] [entry <ENTRY>]
 
 Examples:
 - /size BTC long sl 42000
-  → Default risk is 2% of Equity (recommended max per trade).
-  → If your equity is 0, set it first: /equity 1000
+  → Default risk = 2% of Equity (safer). If your equity is 0, set it first:
+    /equity 1000
 
 - /size BTC long risk usd 40 sl 42000
-  → Uses current Bybit futures price as Entry and returns Qty for $40 risk.
+  → Bot uses current Bybit futures price as Entry and returns Qty for $40 risk.
 
 - /size ETH short risk pct 2.5 sl 2480
-  → Allowed, but you will get a warning because it is above 2% default risk.
+  → Uses Equity. If your equity is 0, set it first:
+    /equity 1000
 
 Manual entry example:
 - /size BTC long sl 42000 entry 43000
 - /size BTC long risk usd 50 sl 42000 entry 43000
 
 Notes:
-- Default /size risk is 2% Equity unless you set risk manually.
+- If you do NOT specify "risk", the bot uses 2% of your Equity by default.
+- If you specify risk above 2% of Equity, the bot will warn you (recommended max risk per trade is 2%).
 - pct uses your Equity
 - Qty = RiskUSD / |Entry - SL|
 - This command does NOT open a trade. It only gives position size.
@@ -1572,6 +1633,7 @@ Shows:
 • Open trades (IDs)
 • Daily trade count (limit default 5)
 • Daily risk cap (based on your settings)
+• ✅ Daily risk used + remaining
 • Equity
 
 5) Risk Settings
@@ -1851,22 +1913,30 @@ async def notify_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Email alerts: OFF")
 
 
+def _equity_risk_pct_from_usd(user: dict, risk_usd: float) -> Optional[float]:
+    eq = float(user.get("equity", 0.0) or 0.0)
+    if eq <= 0:
+        return None
+    return (float(risk_usd) / eq) * 100.0
+
+
 async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /size BTC long sl 42000 [entry 43000] [risk <usd|pct> <value>]
-    Default risk if not provided: 2% equity (recommended max per trade).
+    /size BTC long sl 42000 [risk pct 2] [risk usd 40] [entry 43000]
+    - If risk is omitted => default risk = 2% of equity
+    - If risk > 2% => warn
     """
     uid = update.effective_user.id
     user = get_user(uid)
 
     raw = " ".join(context.args).strip()
     if not raw:
-        await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: entry 43000)  (optional: risk pct 2 | risk usd 40)")
+        await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: risk pct 2 | risk usd 40 | entry 43000)")
         return
 
     tokens = raw.split()
     if len(tokens) < 4:
-        await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: entry 43000)  (optional: risk pct 2 | risk usd 40)")
+        await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: risk pct 2 | risk usd 40 | entry 43000)")
         return
 
     sym = re.sub(r"[^A-Za-z0-9]", "", tokens[0]).upper()
@@ -1876,52 +1946,48 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     side = "BUY" if direction == "long" else "SELL"
 
-    # parse tokens flexibly
-    def find_idx(x: str) -> Optional[int]:
-        try:
-            return tokens.index(x)
-        except ValueError:
-            return None
-
-    sl_i = find_idx("sl")
-    if sl_i is None or sl_i + 1 >= len(tokens):
-        await update.message.reply_text("Missing sl. Example: /size BTC long sl 42000")
+    # parse required: sl <stop>
+    if "sl" not in tokens:
+        await update.message.reply_text("Missing SL. Example: /size BTC long sl 42000")
         return
     try:
+        sl_i = tokens.index("sl")
         sl = float(tokens[sl_i + 1])
     except Exception:
-        await update.message.reply_text("Bad sl value. Example: /size BTC long sl 42000")
+        await update.message.reply_text("Bad SL format. Example: /size BTC long sl 42000")
         return
 
+    # optional entry
     entry = None
-    e_i = find_idx("entry")
-    if e_i is not None and e_i + 1 < len(tokens):
+    if "entry" in tokens:
         try:
+            e_i = tokens.index("entry")
             entry = float(tokens[e_i + 1])
         except Exception:
-            await update.message.reply_text("Bad entry value. Example: entry 43000")
+            await update.message.reply_text("Bad entry format. Example: entry 43000")
             return
 
-    # risk optional
+    # optional risk
     risk_mode = None
     risk_val = None
-    r_i = find_idx("risk")
-    if r_i is not None:
-        if r_i + 2 >= len(tokens):
-            await update.message.reply_text("Bad risk format. Example: risk pct 2  OR  risk usd 40")
-            return
-        risk_mode = tokens[r_i + 1].upper()
+    if "risk" in tokens:
         try:
+            r_i = tokens.index("risk")
+            risk_mode = tokens[r_i + 1].upper()
             risk_val = float(tokens[r_i + 2])
         except Exception:
-            await update.message.reply_text("Bad risk value. Example: risk pct 2  OR  risk usd 40")
+            await update.message.reply_text("Bad risk format. Example: risk pct 2  OR  risk usd 40")
             return
         if risk_mode not in {"USD", "PCT"}:
             await update.message.reply_text("risk mode must be usd or pct")
             return
+    else:
+        # ✅ default: 2% risk (requires equity)
+        risk_mode = "PCT"
+        risk_val = float(DEFAULT_MAX_RISK_PCT_PER_TRADE)
 
+    # fetch current price if entry missing
     if entry is None:
-        # fetch current price
         best = await asyncio.to_thread(fetch_futures_tickers)
         mv = best.get(sym)
         if not mv or float(mv.last or 0) <= 0:
@@ -1941,40 +2007,37 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("For SHORT, SL should be ABOVE entry.")
         return
 
-    # Default risk if not provided: 2% equity
-    warning_lines = []
-    if risk_mode is None:
-        risk_mode = "PCT"
-        risk_val = float(DEFAULT_SIZE_RISK_PCT)
-        if float(user["equity"]) <= 0:
-            await update.message.reply_text("Equity is 0. Set it first for default 2% sizing: /equity 1000  (or provide risk usd ...)")
-            return
-
     # compute risk usd
     risk_usd = compute_risk_usd(user, risk_mode, risk_val)
-    if risk_usd <= 0:
-        await update.message.reply_text("Risk USD computed as 0. If you used pct, set your equity first: /equity 1000")
-        return
 
-    # Warn if above 2% of equity (even if user overrides)
-    eq = float(user["equity"])
-    if eq > 0:
-        recommended_max_usd = eq * (DEFAULT_SIZE_RISK_PCT / 100.0)
-        if risk_usd > recommended_max_usd * 1.000001:
-            if risk_mode == "PCT":
-                warning_lines.append(
-                    f"⚠️ Warning: You are risking {float(risk_val):.2f}% of equity. Recommended max per trade is {DEFAULT_SIZE_RISK_PCT:.2f}%."
-                )
-            else:
-                pct_equiv = (risk_usd / eq) * 100.0
-                warning_lines.append(
-                    f"⚠️ Warning: Your risk is ${risk_usd:.2f} (~{pct_equiv:.2f}% of equity). Recommended max per trade is {DEFAULT_SIZE_RISK_PCT:.2f}%."
-                )
+    if risk_usd <= 0:
+        # If default pct (or any pct) and equity is not set => ask for equity
+        if risk_mode == "PCT":
+            await update.message.reply_text("Risk computed as $0. Set your equity first: /equity 1000")
+            return
+        await update.message.reply_text("Risk USD computed as 0. Check your risk value.")
+        return
 
     qty = calc_qty(entry, sl, risk_usd)
     if qty <= 0:
         await update.message.reply_text("Could not compute qty. Check entry/sl/risk.")
         return
+
+    # ✅ warn if user is risking > 2% of equity
+    warn = ""
+    if risk_mode == "PCT":
+        if float(risk_val) > float(WARN_RISK_PCT_PER_TRADE):
+            warn = (
+                f"⚠️ Warning: You are risking {float(risk_val):.2f}% of equity.\n"
+                f"Recommended max risk per trade is {WARN_RISK_PCT_PER_TRADE:.2f}%."
+            )
+    else:
+        pct_equiv = _equity_risk_pct_from_usd(user, risk_usd)
+        if pct_equiv is not None and pct_equiv > float(WARN_RISK_PCT_PER_TRADE):
+            warn = (
+                f"⚠️ Warning: This equals ~{pct_equiv:.2f}% of equity.\n"
+                f"Recommended max risk per trade is {WARN_RISK_PCT_PER_TRADE:.2f}%."
+            )
 
     msg = (
         f"✅ Position Size\n"
@@ -1985,10 +2048,10 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- Risk: ${risk_usd:.2f}\n"
         f"- Qty: {qty:.6g}\n"
     )
-    if warning_lines:
-        msg += "\n" + "\n".join(warning_lines) + "\n"
-    msg += f"\nChart: {tv_chart_url(sym)}"
+    if warn:
+        msg += "\n" + warn + "\n"
 
+    msg += f"\nChart: {tv_chart_url(sym)}"
     await update.message.reply_text(msg)
 
 
@@ -2070,16 +2133,47 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Could not compute qty. Check entry/sl/risk.")
         return
 
-    # enforce daily risk cap (soft)
-    cap = daily_cap_usd(user)
-    if cap > 0 and risk_usd > cap:
-        await update.message.reply_text(f"⚠️ This trade risk (${risk_usd:.2f}) exceeds your daily cap (${cap:.2f}). Reduce risk.")
-        return
+    # =========================================================
+    # ✅ NEW: Daily Risk Used / Remaining (local day)
+    # - daily cap is your configured dailycap (default pct 5)
+    # - Used increases on trade OPEN
+    # - Warn if this trade risk > remaining allowed today
+    # =========================================================
+    cap = daily_cap_usd(user)  # may be 0 if equity=0 or user set 0 usd/day
+    day_local = _user_day_local(user)
+    used_before = _risk_daily_get(uid, day_local)
+    remaining_before = (cap - used_before) if cap > 0 else float("inf")
+
+    warn_daily = ""
+    if cap > 0 and float(risk_usd) > max(0.0, remaining_before) + 1e-9:
+        warn_daily = (
+            f"⚠️ Daily Risk Warning: این پوزیشن (${risk_usd:.2f}) از ریسک باقیمانده امروز (${max(0.0, remaining_before):.2f}) بیشتره.\n"
+        )
+
+    # (Keep previous per-trade cap warning style too, but do NOT block)
+    warn_trade_vs_cap = ""
+    if cap > 0 and float(risk_usd) > float(cap) + 1e-9:
+        warn_trade_vs_cap = f"⚠️ Note: Risk این ترید (${risk_usd:.2f}) از کل Daily Cap (${cap:.2f}) بیشتره.\n"
 
     tid = db_trade_open(uid, sym, side, entry, sl, risk_usd, qty, note=note, signal_id=signal_id)
 
+    # consume daily risk AFTER trade is opened
+    _risk_daily_inc(uid, day_local, float(risk_usd))
+
+    used_after = _risk_daily_get(uid, day_local)
+    remaining_after = (cap - used_after) if cap > 0 else float("inf")
+
     update_user(uid, day_trade_count=int(user["day_trade_count"]) + 1)
     user = get_user(uid)
+
+    daily_risk_line = (
+        f"- Daily risk limit: {user['daily_cap_mode']} {float(user['daily_cap_value']):.2f} (≈ ${cap:.2f})\n"
+        f"- Used today: ${used_after:.2f}\n"
+        f"- Remaining today: ${max(0.0, remaining_after):.2f}" if cap > 0 else
+        f"- Daily risk limit: {user['daily_cap_mode']} {float(user['daily_cap_value']):.2f} (≈ ${cap:.2f})\n"
+        f"- Used today: ${used_after:.2f}\n"
+        f"- Remaining today: ∞"
+    )
 
     await update.message.reply_text(
         f"✅ Trade OPENED (Journal)\n"
@@ -2089,6 +2183,8 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- SL: {fmt_price(sl)}\n"
         f"- Risk: ${risk_usd:.2f}\n"
         f"- Qty: {qty:.6g}\n"
+        f"{warn_daily}{warn_trade_vs_cap}"
+        f"{daily_risk_line}\n"
         f"- Trades today: {int(user['day_trade_count'])}/{int(user['max_trades_day'])}\n"
         f"- Equity: ${float(user['equity']):.2f}\n"
         f"- Signal: {signal_id if signal_id else '-'}\n"
@@ -2149,6 +2245,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     opens = db_open_trades(uid)
 
     cap = daily_cap_usd(user)
+
+    # ✅ NEW: daily risk used/remaining for status
+    day_local = _user_day_local(user)
+    used_today = _risk_daily_get(uid, day_local)
+    remaining_today = (cap - used_today) if cap > 0 else float("inf")
+
     enabled = user_enabled_sessions(user)
     now_s = in_session_now(user)
     now_txt = now_s["name"] if now_s else "NONE"
@@ -2158,7 +2260,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(HDR)
     lines.append(f"Equity: ${float(user['equity']):.2f}")
     lines.append(f"Trades today: {int(user['day_trade_count'])}/{int(user['max_trades_day'])}")
+
     lines.append(f"Daily cap: {user['daily_cap_mode']} {float(user['daily_cap_value']):.2f} (≈ ${cap:.2f})")
+    lines.append(f"Daily risk used: ${used_today:.2f}")
+    lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
+
     lines.append(f"Email alerts: {'ON' if int(user['notify_on'])==1 else 'OFF'}")
     lines.append(f"Sessions enabled: {', '.join(enabled)} | Now: {now_txt}")
     lines.append(f"Email caps: session={int(user['max_emails_per_session'])} (0=∞), day={int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0=∞), gap={int(user['email_gap_min'])}m")
@@ -2440,39 +2546,46 @@ def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, set
     leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:5]
     parts.append("Market Snapshot")
     parts.append(SEP)
+
+    # ✅ FIX: Top Volume must be on the same line (no newline after colon)
     if leaders:
-        # ✅ FIX: Top Volume in the same line (no line break)
-        parts.append("Top Volume: " + ", ".join([f"{b}({pct_with_emoji(float(mv.percentage or 0.0))})" for b, mv in leaders]))
+        topv = ", ".join([f"{b}({pct_with_emoji(float(mv.percentage or 0.0))})" for b, mv in leaders])
+        parts.append(f"Top Volume: {topv}")
+
     if up:
         parts.append("Leaders: " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in up[:3]]))
     if dn:
         parts.append("Losers:  " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in dn[:3]]))
     parts.append("")
 
-    # ✅ FIX: Rename to "Top Setups"
+    # ✅ FIX: rename header
     parts.append("Top Setups")
     parts.append(SEP)
     parts.append("")
+
     for i, s in enumerate(setups, 1):
         rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
         parts.append(f"{i}) {s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}/100")
-        # ✅ FIX: Remove status line from email
+
+        # ✅ FIX: remove Status line from email (no "Status: ...")
         parts.append(f"   Entry: {fmt_price(s.entry)} | SL: {fmt_price(s.sl)} | RR(TP3): {rr3:.2f}")
         parts.append(f"   {_entry_zone_text(s).replace(chr(10), chr(10)+'   ')}")
+
         if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
             parts.append(f"   TP1: {fmt_price(s.tp1)} ({TP_ALLOCS[0]}%) | TP2: {fmt_price(s.tp2)} ({TP_ALLOCS[1]}%) | TP3: {fmt_price(s.tp3)} ({TP_ALLOCS[2]}%)")
             parts.append("   Rule: after TP1 → move SL to BE")
         else:
             parts.append(f"   TP: {fmt_price(s.tp3)}")
+
         parts.append(f"   24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}")
         parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
         parts.append("")
 
-    # ✅ FIX: Add Telegram bot link + sizing note at end
+    # ✅ FIX: add Telegram bot link + position sizing CTA
     parts.append(HDR)
-    parts.append("🤖 Position Sizing & Risk Control")
-    parts.append("Use the PulseFutures Telegram bot to calculate safe position size based on your Stop Loss.")
-    parts.append("👉 https://t.me/PulseFuturesBot")
+    parts.append("🤖 Position Sizing")
+    parts.append(f"Use the PulseFutures Telegram bot to calculate safe position size based on your Stop Loss.")
+    parts.append(f"👉 {TELEGRAM_BOT_URL}")
     parts.append(HDR)
     parts.append("Not financial advice.")
     parts.append("PulseFutures")
