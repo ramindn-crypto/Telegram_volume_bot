@@ -825,7 +825,7 @@ def db_trades_since(user_id: int, ts_from: float) -> List[dict]:
 
 
 # =========================================================
-# EXCHANGE HELPERS
+# EXCHANGE ERS
 # =========================================================
 def build_exchange():
     klass = ccxt.__dict__[EXCHANGE_ID]
@@ -1553,10 +1553,10 @@ def _advice(user: dict, stats: dict) -> List[str]:
         adv.append("✅ محدودیت ترید روزانه کمک می‌کند overtrade نکنی. فقط بهترین‌ها را بگیر.")
     return adv[:6]
 
+# =========================
+# HELP TEXTS (MULTI LEVEL)
+# =========================
 
-# =========================================================
-# HELP TEXT
-# =========================================================
 HELP_TEXT = """\
 PulseFutures — Commands (Telegram)
 
@@ -1576,30 +1576,70 @@ Examples:
     /equity 1000
 
 - /size BTC long risk usd 40 sl 42000
+  → Bot uses current Bybit futures price as Entry and returns Qty for $40 risk.
+
 - /size ETH short risk pct 2.5 sl 2480
+  → Uses Equity. If your equity is 0, set it first:
+    /equity 1000
+
+Manual entry examples:
+- /size BTC long sl 42000 entry 43000
+- /size BTC long risk usd 50 sl 42000 entry 43000
 
 Notes:
 - If you do NOT specify "risk", the bot uses 2% of your Equity by default.
 - If you specify risk above 2% of Equity, the bot will warn you.
+- pct uses your Equity
 - Qty = RiskUSD / |Entry - SL|
+- This command does NOT open a trade.
 
 3) Trade Journal (Open / Close) + Equity auto-update
+Set equity:
 - /equity 1000
+
+Open trade:
 - /trade_open <SYMBOL> <long|short> entry <ENTRY> sl <SL> risk <usd|pct> <VALUE> [note "..."] [sig <SETUP_ID>]
+
+Examples:
+- /trade_open BTC long entry 43000 sl 42000 risk usd 40 note breakout sig PF-20251219-0007
+- /trade_open ETH short entry 2520 sl 2575 risk pct 2 note trend
+
+Close trade:
 - /trade_close <TRADE_ID> pnl <PNL>
+
+Equity behavior:
+- Equity updates ONLY when trades are closed
+- Persistent until reset:
+  /equity_reset
 
 4) Status
 - /status
+Shows:
+• Open trades
+• Daily trade count
+• Daily risk used & remaining
+• Equity
 
 5) Risk Settings
 - /riskmode pct 2.5
+- /riskmode usd 25
 - /dailycap pct 5
+- /dailycap usd 60
 - /limits maxtrades 5
-- /limits emailcap 4 (0=unlimited)
+- /limits emailcap 4        (0 = unlimited)
 - /limits emailgap 60
-- /limits emaildaycap 4 (0=unlimited)
+- /limits emaildaycap 4     (0 = unlimited)
 
-6) Sessions
+6) Sessions (Emails by session)
+Default by timezone:
+- Americas → NY
+- Europe/Africa → LON
+- Asia/Oceania → ASIA
+
+Session priority:
+NY > LON > ASIA
+
+Commands:
 - /sessions
 - /sessions_on NY
 - /sessions_off LON
@@ -1608,8 +1648,88 @@ Notes:
 - /notify_on
 - /notify_off
 
+Email rules:
+- Sent only during enabled sessions
+- Session-based quality filters
+- No same symbol for 18h
+- Daily email cap supported
+
+8) Performance Reports
+- /report_daily
+- /report_weekly
+
+9) Signal Reports
+- /signals_daily
+- /signals_weekly
+
 Not financial advice.
 """
+
+HELP_SHORT = """\
+PulseFutures — Quick Help
+
+/screen        Market scan
+/size          Position sizing
+/trade_open   Open trade
+/trade_close  Close trade
+/status       Account status
+/sessions     Email sessions
+/limits       Risk & email limits
+/report_daily Performance
+"""
+
+HELP_PRO = """\
+PulseFutures — Pro Logic Guide
+
+Signal Logic:
+- Signals ONLY when price is near EMA12 on 15m
+- No EMA chase → avoids fake breakouts
+- Sharp 1H move (>20%) requires EMA reaction
+
+Time Filters:
+- No signals between 10–12 Melbourne
+- Avoids low-liquidity chop
+
+Sessions:
+- NY easiest (more signals)
+- LON medium
+- ASIA strictest (quality only)
+
+Risk & RR:
+- TP ladder 40% / 40% / 20%
+- TP3 ≈ 12–15%
+- RR target ≈ 2.0–2.5
+- Hot coins → TP3 can trail
+
+Emails:
+- Session-based
+- Daily cap supported
+- No spam, no duplicates
+
+Built for traders who want
+2–3 high-quality trades/day.
+"""
+
+# =========================
+# HELP COMMAND HANDLERS
+# =========================
+
+async def help_cmd(update, context):
+    await update.message.reply_text(HELP_TEXT)
+
+async def help_short_cmd(update, context):
+    await update.message.reply_text(HELP_SHORT)
+
+async def help_pro_cmd(update, context):
+    await update.message.reply_text(HELP_PRO)
+
+# =========================
+# REGISTER HANDLERS
+# =========================
+app.add_handler(CommandHandler(["help", "start"], help_cmd))
+app.add_handler(CommandHandler("help_short", help_short_cmd))
+app.add_handler(CommandHandler("help_pro", help_pro_cmd))
+
 
 # =========================================================
 # TELEGRAM COMMANDS
@@ -2548,7 +2668,7 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler(["help", "start"], cmd_help))
+    app.add_handler(CommandHandler(["", "start"], cmd_))
     app.add_handler(CommandHandler("tz", tz_cmd))
 
     app.add_handler(CommandHandler("screen", screen_cmd))
