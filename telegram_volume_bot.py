@@ -1723,14 +1723,6 @@ async def help_short_cmd(update, context):
 async def help_pro_cmd(update, context):
     await update.message.reply_text(HELP_PRO)
 
-# =========================
-# REGISTER HANDLERS
-# =========================
-app.add_handler(CommandHandler(["help", "start"], help_cmd))
-app.add_handler(CommandHandler("help_short", help_short_cmd))
-app.add_handler(CommandHandler("help_pro", help_pro_cmd))
-
-
 # =========================================================
 # TELEGRAM COMMANDS
 # =========================================================
@@ -2668,6 +2660,11 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
+    app.add_handler(CommandHandler(["help", "start"], help_cmd))
+    app.add_handler(CommandHandler("help_short", help_short_cmd))
+    app.add_handler(CommandHandler("help_pro", help_pro_cmd))
+
+   
     app.add_handler(CommandHandler(["", "start"], cmd_))
     app.add_handler(CommandHandler("tz", tz_cmd))
 
@@ -2700,7 +2697,9 @@ def main():
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+   
 
+   
     if getattr(app, "job_queue", None):
         app.job_queue.run_repeating(alert_job, interval=CHECK_INTERVAL_MIN * 60, first=15, name="alert_job")
     else:
