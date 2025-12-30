@@ -1,116 +1,19 @@
-
 #!/usr/bin/env python3
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
 
-✅ What you asked (implemented):
-1) Position sizing from Risk + StopLoss:
-   - /size BTC long risk usd 40 sl 42000
-   - /size BTC short risk pct 2.5 sl 43210
-   Bot fetches current futures price as Entry (unless you provide entry manually).
-   It returns Qty (contracts/base units) so user can open the position.
+✅ Baseline (30 Dec 2025 – Version 1) + your requested upgrades added WITHOUT removing anything:
 
-2) Full Trade Journal (open + close) and Equity auto-update:
-   - /trade_open BTC long entry 43000 sl 42000 risk usd 40 note "breakout" sig PF-20251219-0007
-   - /trade_close 12 pnl +85.5
-   Equity updates ONLY when you close trades, and stays persistent until /equity_reset.
-
-3) Emails per user timezone: 3–4 emails per active session (min 60m gap), best setups only.
-   Default enabled session is chosen based on user's TZ (Americas→NY, Europe/Africa→LON, Asia/Oceania→ASIA).
-   User can enable other sessions:
-   - /sessions
-   - /sessions_on NY
-   - /sessions_on LON
-   - /sessions_on ASIA
-   - /sessions_off LON
-
-4) Daily/Weekly user performance summary + advice:
-   - /report_daily
-   - /report_weekly
-   Includes win/loss, net PnL, win rate, avg R, biggest loss, and practical advice.
-
-5) Unique Setup IDs for emailed signals + signal summaries:
-   - Every emailed setup has a unique ID like PF-YYYYMMDD-0001
-   - Users can reference it in your Telegram channel, or attach it to trades
-   - Signal summary (sent signals, and performance if users link trades):
-     - /signals_daily
-     - /signals_weekly
-
-6) Speed + Render stability:
-   - Heavy CCXT + OHLCV work runs in asyncio.to_thread()
-   - In-memory TTL caching for tickers and OHLCV
-   - Alert job lock prevents overlapping runs
-   - Optional WEBHOOK mode (recommended on Render) to avoid 409 conflicts
-
-✅ New additions (per your latest requests, WITHOUT removing anything):
-7) Fixed session priority ordering (professional):
-   - Priority: NY > LON > ASIA (no accidental alphabetic sorting)
-   - Used consistently when enabling/disabling sessions and when listing enabled sessions
-
-8) Professional definition of "best signals with session priority":
-   - Different strictness per session using MIN confidence:
-     NY: easier (more signals)  | LON: stricter | ASIA: strictest (highest quality)
-   - The bot still scans the FULL session window continuously (not only first 3 hours)
-
-9) Optional "unlimited email cap" support:
-   - /limits emailcap 0  => unlimited emails per session
-   - This keeps your minimum gap rule (emailgap) and cooldown (no repeating same symbol within 18h)
-
-✅ Premium signal upgrades (added WITHOUT removing anything):
-10) Premium Risk/Reward gating + wider TP/SL (now tuned closer per your request):
-   - TP ladder tuned closer (RR target ~2.0–2.5)
-   - TP3 dynamic cap (normal vs hot coins)
-   - Email includes: "No chase" style via entry zone REMOVED (per request)
-
-11) 15m logic (Model A) — UPDATED to Soft Confirm (no removal):
-   - /screen remains SOFT on 15m (does NOT hard-reject weak 15m)
-   - Email becomes SOFT on 15m:
-       • CONFIRMED if 15m meets threshold
-       • EARLY if 15m is weak BUT 1H is very strong (extra gates apply)
-
-12) Quality-only delivery + “2–3 trades/day style” control:
-   - Added a DAILY EMAIL CAP (per user, across ALL sessions) default = 4
-   - User-controllable via /limits emaildaycap <N> (0=unlimited)
-
-13) Trend-follow Email filter (avoid counter-trend reversals):
-   - Emails only when 24H supports the trade direction:
-       BUY  => 24H >= +0.5%
-       SELL => 24H <= -0.5%
-   - /screen stays unchanged (still shows setups for awareness)
-
-14) Reject Diagnostics (why only 1 setup?)
-   - Optional DEBUG_REJECTS=true to include sample rejects
-   - Always counts reject reasons per /screen run (in-memory)
-   - /screen appends a short Reject Diagnostics block (counts + samples if enabled)
-
-15) ✅ NO MORE duplicate Setup IDs:
-   - SQLite daily counter table with atomic increment (setup_counter)
-
-16) ✅ Daily Email Cap is now USER-CONTROLLABLE via Telegram:
-   - /limits emaildaycap 4
-   - /limits emaildaycap 0
-
-17) ✅ Daily Risk Used / Remaining (Telegram):
-   - On /trade_open and /status
-
-✅ NEW (your 29 Dec changes — implemented):
-18) EMA12(15m) mandatory filter:
-   - Signals only if price is near EMA12 on 15m (BUY/SELL)
-19) Melbourne "no-signal" window:
-   - Between 10:00 and 12:00 Melbourne, no signals (/screen + emails)
-20) Sharp 1H move gating:
-   - If abs(1H change) >= 20%, signal ONLY if EMA12 reaction is detected (not immediately after spike)
-21) TP/SL tuned closer + dynamic:
-   - TP3 cap: Normal ~12%, Hot ~15%
-   - Allocations: 40/40/20
-   - RR gate: TP3 RR >= 2.0
-22) Email cleanup:
-   - Removed Entry Zone
-   - Removed "Rule: after TP1..."
-   - More sensible decimals in email
-23) Debug extras (requested):
-   - /screen shows EMA12 distance (%) for each setup
-   - HOT coins flagged with TP3 TRAILING (informational)
+Added (Requested):
+- Layer + Status (transparent health)
+- ✅ EMA12 proximity: Session-adaptive
+- ✅ EMA12 reaction: Session-adaptive
+- ✅ 1H trigger: ATR-adaptive
+- ✅ Confidence floors: Session-based (already existed, now surfaced + enforced consistently)
+- ✅ RR floors: Session-based (new)
+- ✅ TP scaling: Confidence-weighted (new)
+- ✅ No-signal explanation: Professional (new; /screen via Reject Diagnostics + /health last email skip reasons)
+- ✅ Health command: Transparent (/health)
 
 IMPORTANT (Render):
 - If you see: "Conflict: terminated by other getUpdates request"
@@ -156,7 +59,7 @@ from email.message import EmailMessage
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from collections import Counter
+from collections import Counter, defaultdict
 
 import ccxt
 from tabulate import tabulate
@@ -192,7 +95,7 @@ MOVER_UP_24H_MIN = 10.0
 MOVER_DN_24H_MAX = -10.0
 
 # Setup engine thresholds (tune later)
-TRIGGER_1H_ABS_MIN = 2.0
+TRIGGER_1H_ABS_MIN_BASE = 2.0  # ✅ now ATR-adaptive around this baseline
 CONFIRM_15M_ABS_MIN = 0.6
 ALIGN_4H_MIN = 0.0  # require same direction on 4H
 
@@ -227,7 +130,6 @@ SYMBOL_COOLDOWN_HOURS = 18  # do not repeat same symbol in emails for that user 
 
 # Multi-TP
 ATR_PERIOD = 14
-
 ATR_MIN_PCT = 1.0
 ATR_MAX_PCT = 8.0
 
@@ -236,11 +138,8 @@ MULTI_TP_MIN_CONF = 78
 # ✅ allocations requested
 TP_ALLOCS = (40, 40, 20)
 
-# ✅ TP ladder tuned closer (RR target ~2.0–2.5)
-TP_R_MULTS = (1.0, 1.7, 2.4)
-
-# ✅ Gate low RR setups from EMAIL (TP3)
-MIN_RR_TP3 = 2.0
+# ✅ default multipliers (kept) — now TP3 will be confidence-weighted in engine
+TP_R_MULTS_DEFAULT = (1.0, 1.7, 2.4)
 
 # ✅ Dynamic TP cap: normal vs hot coins (TP3 about 15% for hot)
 TP_MAX_PCT_NORMAL = 12.0
@@ -254,9 +153,9 @@ HOT_CH24_ABS = 15.0
 EMA12_PERIOD = 12
 
 # maximum allowed distance from EMA12 (derived from ATR%), clamped
-EMA12_MAX_DIST_ATR_MULT = 0.7  # threshold_pct = (0.35*ATR/entry)*100
+EMA12_MAX_DIST_ATR_MULT = 0.7  # base; now session-adaptive multiplier applies
 EMA12_MAX_DIST_PCT_MIN = 0.25   # percent
-EMA12_MAX_DIST_PCT_MAX = 1.5   # percent
+EMA12_MAX_DIST_PCT_MAX = 1.5    # percent
 
 # Sharp 1H move gating
 SHARP_1H_MOVE_PCT = 20.0
@@ -318,6 +217,33 @@ SESSION_MIN_CONF = {
     "ASIA": 82,
 }
 
+# ✅ NEW: RR floor by session (TP3 RR minimum)
+SESSION_MIN_RR_TP3 = {
+    "NY": 1.8,
+    "LON": 2.0,
+    "ASIA": 2.2,
+}
+
+# ✅ NEW: session-adaptive knobs
+SESSION_EMA12_PROX_MULT = {
+    "NY": 1.15,   # looser
+    "LON": 1.00,  # baseline
+    "ASIA": 0.85, # stricter
+}
+
+SESSION_EMA12_REACTION_LOOKBACK = {
+    "NY": 8,
+    "LON": 6,
+    "ASIA": 5,
+}
+
+# ✅ NEW: ATR-adaptive trigger multiplier by session
+SESSION_TRIGGER_ATR_MULT = {
+    "NY": 0.8,
+    "LON": 1.0,
+    "ASIA": 1.2,
+}
+
 # =========================================================
 # DATA STRUCTURES
 # =========================================================
@@ -351,8 +277,8 @@ class Setup:
     ch4: float
     ch1: float
     ch15: float
-    ema12_dist_pct: float          # ✅ NEW: debug for /screen
-    is_trailing_tp3: bool          # ✅ NEW: hot coin info
+    ema12_dist_pct: float          # debug for /screen
+    is_trailing_tp3: bool          # hot coin info
     created_ts: float
 
 
@@ -384,6 +310,11 @@ def cache_valid(key: str, ttl: int) -> bool:
 # =========================================================
 _REJECT_STATS = Counter()
 _REJECT_SAMPLES: Dict[str, List[str]] = {}
+
+# ✅ NEW: last email skip reasons (per user) for /health transparency
+_LAST_EMAIL_DECISION: Dict[int, Dict[str, Any]] = {}
+# also counts reasons within a run for each user
+_EMAIL_SKIP_COUNTERS: Dict[int, Counter] = defaultdict(Counter)
 
 def fmt_price(x: float) -> str:
     ax = abs(x)
@@ -939,9 +870,77 @@ def tp_cap_pct_for_coin(fut_vol_usd: float, ch24: float) -> float:
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-def ema12_proximity_ok(entry: float, ema12_val: float, atr_1h: float):
+# =========================================================
+# ✅ Session resolution helpers (for /screen + engine)
+# =========================================================
+def parse_hhmm(s: str) -> Tuple[int, int]:
+    m = re.match(r"^(\d{2}):(\d{2})$", s.strip())
+    if not m:
+        raise ValueError("bad time")
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        raise ValueError("bad time")
+    return hh, mm
+
+def current_session_utc(now_utc: Optional[datetime] = None) -> str:
+    """
+    Returns the current market session name based on UTC windows.
+    Used for /screen (no user context). If none, returns "OFF".
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    for name in SESSION_PRIORITY:
+        w = SESSIONS_UTC[name]
+        sh, sm = parse_hhmm(w["start"])
+        eh, em = parse_hhmm(w["end"])
+
+        start_utc = now_utc.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_utc = now_utc.replace(hour=eh, minute=em, second=0, microsecond=0)
+
+        if end_utc <= start_utc:
+            end_utc += timedelta(days=1)
+
+        # handle day boundary
+        if now_utc < start_utc and (start_utc - now_utc) > timedelta(hours=12):
+            start_utc -= timedelta(days=1)
+            end_utc -= timedelta(days=1)
+
+        if start_utc <= now_utc <= end_utc:
+            return name
+
+    return "OFF"
+
+def session_knobs(session_name: str) -> dict:
+    s = (session_name or "LON").upper()
+    if s not in SESSIONS_UTC:
+        s = "LON"
+    return {
+        "name": s,
+        "ema_prox_mult": float(SESSION_EMA12_PROX_MULT.get(s, 1.0)),
+        "ema_reaction_lookback": int(SESSION_EMA12_REACTION_LOOKBACK.get(s, 6)),
+        "trigger_atr_mult": float(SESSION_TRIGGER_ATR_MULT.get(s, 1.0)),
+        "min_conf": int(SESSION_MIN_CONF.get(s, 78)),
+        "min_rr_tp3": float(SESSION_MIN_RR_TP3.get(s, 2.0)),
+    }
+
+def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
+    """
+    ✅ 1H trigger becomes ATR-adaptive.
+    - Base minimum is TRIGGER_1H_ABS_MIN_BASE.
+    - Also requires >= (atr_pct * session_mult), clamped to reasonable bounds.
+    """
+    knobs = session_knobs(session_name)
+    mult = knobs["trigger_atr_mult"]
+    # typical atr_pct range ~1..8; we keep trigger within 2..6
+    dyn = clamp(float(atr_pct) * float(mult), 2.0, 6.0)
+    return max(float(TRIGGER_1H_ABS_MIN_BASE), float(dyn))
+
+def ema12_proximity_ok(entry: float, ema12_val: float, atr_1h: float, session_name: str):
     """
     Require entry to be near EMA12(15m).
+    Session-adaptive proximity threshold.
     Returns:
       (ok: bool, dist_pct: float, thr_pct: float, atr_pct: float)
     """
@@ -952,8 +951,12 @@ def ema12_proximity_ok(entry: float, ema12_val: float, atr_1h: float):
     dist_pct = (dist / entry) * 100.0
 
     atr_pct = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
+
+    knobs = session_knobs(session_name)
+    prox_mult = knobs["ema_prox_mult"]
+
     thr_pct = clamp(
-        EMA12_MAX_DIST_ATR_MULT * atr_pct,
+        (EMA12_MAX_DIST_ATR_MULT * prox_mult) * atr_pct,
         EMA12_MAX_DIST_PCT_MIN,
         EMA12_MAX_DIST_PCT_MAX,
     )
@@ -961,18 +964,20 @@ def ema12_proximity_ok(entry: float, ema12_val: float, atr_1h: float):
     ok = dist_pct <= thr_pct
     return ok, dist_pct, thr_pct, atr_pct
 
-
-def ema12_reaction_ok_15m(c15: List[List[float]], ema12_val: float, side: str) -> bool:
+def ema12_reaction_ok_15m(c15: List[List[float]], ema12_val: float, side: str, session_name: str) -> bool:
     """
+    ✅ Session-adaptive reaction lookback.
     Reaction definition:
-    - BUY: recent candle touched/broke below EMA12 and closed back above EMA12
-    - SELL: recent candle touched/broke above EMA12 and closed back below EMA12
-    Checks last ~6 candles.
+    - BUY: candle touched/broke below EMA12 and closed back above EMA12
+    - SELL: candle touched/broke above EMA12 and closed back below EMA12
     """
     if not c15 or len(c15) < 8 or ema12_val <= 0:
         return False
 
-    lookback = c15[-6:]
+    lookback_n = int(session_knobs(session_name)["ema_reaction_lookback"])
+    lookback_n = clamp(lookback_n, 4, 10)
+    lookback = c15[-int(lookback_n):]
+
     for c in lookback:
         h = float(c[2]); l = float(c[3]); cl = float(c[4])
         if side == "BUY":
@@ -1059,7 +1064,6 @@ def fmt_price_email(x: float) -> str:
 # =========================================================
 # TELEGRAM SAFE SEND (chunking + markdown fallback)
 # =========================================================
-TELEGRAM_MAX = 4096
 SAFE_CHUNK = 3500
 
 async def send_long_message(update: Update, text: str, parse_mode: Optional[str] = None,
@@ -1118,7 +1122,7 @@ def next_setup_id() -> str:
 
 
 # =========================================================
-# SL/TP ENGINE (closer + dynamic cap)
+# SL/TP ENGINE (closer + dynamic cap + ✅ confidence-weighted TP scaling)
 # =========================================================
 def sl_mult_from_conf(conf: int) -> float:
     # slightly tighter than old premium; tuned for higher win-rate with closer TPs
@@ -1129,6 +1133,30 @@ def sl_mult_from_conf(conf: int) -> float:
     if conf >= 70:
         return 1.70
     return 1.55
+
+def tp3_rr_target_from_conf(conf: int) -> float:
+    """
+    ✅ TP scaling: confidence-weighted RR target for TP3.
+    """
+    if conf >= 88:
+        return 2.6
+    if conf >= 80:
+        return 2.4
+    if conf >= 72:
+        return 2.2
+    # below 72 we still may keep for /screen (awareness), but email floors will filter
+    return 2.0
+
+def tp_r_mults_from_conf(conf: int) -> Tuple[float, float, float]:
+    """
+    Returns (tp1_rr, tp2_rr, tp3_rr) with tp3 driven by confidence.
+    """
+    tp3 = tp3_rr_target_from_conf(conf)
+    tp1 = 1.0
+    tp2 = max(1.5, min(1.9, tp3 * 0.70))
+    if tp2 >= tp3:
+        tp2 = max(1.6, tp3 - 0.3)
+    return (tp1, tp2, tp3)
 
 def compute_sl_tp(entry: float, side: str, atr: float, conf: int, tp_cap_pct: float) -> Tuple[float, float, float]:
     # returns (sl, tp3, R)
@@ -1142,8 +1170,9 @@ def compute_sl_tp(entry: float, side: str, atr: float, conf: int, tp_cap_pct: fl
 
     R = sl_dist
 
-    # target RR ~2.2 then cap
-    tp_dist = 2.2 * R
+    # ✅ confidence-weighted RR target then cap
+    rr_target = tp3_rr_target_from_conf(conf)
+    tp_dist = rr_target * R
     tp_cap = (float(tp_cap_pct) / 100.0) * entry
     tp_dist = min(tp_dist, tp_cap)
 
@@ -1172,15 +1201,17 @@ def _distinctify(a: float, b: float, c: float, entry: float, side: str) -> Tuple
     if abs(a - c) < eps: a = a - 2*eps if side == "BUY" else a + 2*eps
     return a, b, c
 
-def multi_tp(entry: float, side: str, R: float, tp_cap_pct: float) -> Tuple[float, float, float]:
+def multi_tp(entry: float, side: str, R: float, tp_cap_pct: float, conf: int) -> Tuple[float, float, float]:
     if entry <= 0 or R <= 0:
         return 0.0, 0.0, 0.0
-    r1, r2, r3 = TP_R_MULTS
+
+    r1, r2, r3 = tp_r_mults_from_conf(conf)
     maxd = (float(tp_cap_pct) / 100.0) * entry
 
     d3 = min(r3 * R, maxd)
-    d2 = min(r2 * R, d3 * (r2 / r3))
-    d1 = min(r1 * R, d3 * (r1 / r3))
+    # preserve proportional spacing vs r3, but also keep increasing
+    d2 = min(r2 * R, d3 * (r2 / r3 if r3 > 0 else 0.7))
+    d1 = min(r1 * R, d3 * (r1 / r3 if r3 > 0 else 0.4))
 
     if side == "BUY":
         tp1, tp2, tp3 = (entry + d1, entry + d2, entry + d3)
@@ -1272,7 +1303,7 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     dn_txt = "*Directional Losers (24H ≤ -10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(dn_rows, ["SYM", "F Vol", "24H", "4H", "Last"]) if dn_rows else "_None_")
     return up_txt, dn_txt
 
-def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Setup]:
+def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: str = "LON") -> Optional[Setup]:
     # ✅ Melbourne blackout applies to all signal generation
     if is_blackout_melbourne_now():
         _rej("melbourne_blackout_10_12", base, mv, "No signals 10:00–12:00 Melbourne")
@@ -1295,9 +1326,13 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
         _rej("ohlcv_missing_or_insufficient", base, mv, "metrics/ema missing")
         return None
 
+    # ✅ ATR-adaptive 1H trigger threshold
+    atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
+    trig_min = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
+
     # Trigger on 1H momentum
-    if abs(ch1) < TRIGGER_1H_ABS_MIN:
-        _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% < {TRIGGER_1H_ABS_MIN:.2f}%")
+    if abs(ch1) < trig_min:
+        _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% < {trig_min:.2f}% (ATR%={atr_pct_now:.2f})")
         return None
 
     side = "BUY" if ch1 > 0 else "SELL"
@@ -1310,24 +1345,19 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
         _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4:+.2f}% > {-ALIGN_4H_MIN:.2f}%")
         return None
 
-    # EMA12 proximity mandatory (15m)
-    ok_ema, dist_pct, thr_pct, atr_pct = ema12_proximity_ok(entry, ema12_15m, atr_1h)
+    # ✅ EMA12 proximity mandatory (15m) — session-adaptive
+    ok_ema, dist_pct, thr_pct, atr_pct = ema12_proximity_ok(entry, ema12_15m, atr_1h, session_name)
     if not ok_ema:
-        _rej(
-            "price_not_near_ema12_15m",
-            base,
-            mv,
-         ) 
+        _rej("price_not_near_ema12_15m", base, mv, f"dist={dist_pct:.2f}% > thr={thr_pct:.2f}% ({session_name})")
         return None
 
-    # Sharp 1H move gating: must show EMA reaction, not immediate spike-chase
+    # Sharp 1H move gating: must show EMA reaction, not immediate spike-chase (session-adaptive)
     if abs(float(ch1)) >= float(SHARP_1H_MOVE_PCT):
-        if not ema12_reaction_ok_15m(c15, ema12_15m, side):
-            _rej("sharp_1h_no_ema_reaction", base, mv, f"ch1={ch1:+.2f}% needs EMA12 reaction")
+        if not ema12_reaction_ok_15m(c15, ema12_15m, side, session_name):
+            _rej("sharp_1h_no_ema_reaction", base, mv, f"ch1={ch1:+.2f}% needs EMA12 reaction ({session_name})")
             return None
 
     # Soft 24H contradiction gate (dynamic by ATR%)
-    atr_pct = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
     thr = clamp(max(12.0, 2.5 * atr_pct), 12.0, 22.0)
 
     if side == "BUY" and ch24 <= -thr:
@@ -1361,12 +1391,12 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
     tp1 = tp2 = None
     tp3 = tp3_single
     if conf >= MULTI_TP_MIN_CONF:
-        _tp1, _tp2, _tp3 = multi_tp(entry, side, R, tp_cap_pct)
+        _tp1, _tp2, _tp3 = multi_tp(entry, side, R, tp_cap_pct, conf)
         if _tp1 and _tp2 and _tp3:
             tp1, tp2, tp3 = _tp1, _tp2, _tp3
 
     sid = next_setup_id()
-    ema12_dist_pct = abs(entry - ema12_15m) / entry * 100.0 if ema12_15m > 0 else 999.0
+    ema12_dist_pct_dbg = abs(entry - ema12_15m) / entry * 100.0 if ema12_15m > 0 else 999.0
     hot = is_hot_coin(fut_vol, ch24)
 
     s = Setup(
@@ -1385,13 +1415,13 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True) -> Optional[Se
         ch4=ch4,
         ch1=ch1,
         ch15=ch15,
-        ema12_dist_pct=ema12_dist_pct,
+        ema12_dist_pct=ema12_dist_pct_dbg,
         is_trailing_tp3=bool(hot),   # informational
         created_ts=time.time(),
     )
     return s
 
-def pick_setups(best_fut: Dict[str, MarketVol], n: int, strict_15m: bool = True) -> List[Setup]:
+def pick_setups(best_fut: Dict[str, MarketVol], n: int, strict_15m: bool = True, session_name: str = "LON") -> List[Setup]:
     global _REJECT_STATS, _REJECT_SAMPLES
     _REJECT_STATS = Counter()
     _REJECT_SAMPLES = {}
@@ -1399,7 +1429,7 @@ def pick_setups(best_fut: Dict[str, MarketVol], n: int, strict_15m: bool = True)
     universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:35]
     setups: List[Setup] = []
     for base, mv in universe:
-        s = make_setup(base, mv, strict_15m=strict_15m)
+        s = make_setup(base, mv, strict_15m=strict_15m, session_name=session_name)
         if s:
             setups.append(s)
 
@@ -1442,18 +1472,8 @@ def send_email(subject: str, body: str) -> bool:
 
 
 # =========================================================
-# SESSIONS
+# SESSIONS (user)
 # =========================================================
-def parse_hhmm(s: str) -> Tuple[int, int]:
-    m = re.match(r"^(\d{2}):(\d{2})$", s.strip())
-    if not m:
-        raise ValueError("bad time")
-    hh = int(m.group(1))
-    mm = int(m.group(2))
-    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
-        raise ValueError("bad time")
-    return hh, mm
-
 def user_enabled_sessions(user: dict) -> List[str]:
     try:
         xs = json.loads(user["sessions_enabled"])
@@ -1578,6 +1598,7 @@ PulseFutures — Commands (Telegram)
   • Top Trade Setups (best quality)
   • Directional Leaders/Losers (24H ±10% with futures vol >= $5M)
   • Market Leaders by futures volume
+  • Reject Diagnostics (professional explanation)
 
 2) Position Sizing (Risk + SL => Qty)
 - /size <SYMBOL> <long|short> sl <STOP> [risk <usd|pct> <VALUE>] [entry <ENTRY>]
@@ -1612,10 +1633,6 @@ Set equity:
 Open trade:
 - /trade_open <SYMBOL> <long|short> entry <ENTRY> sl <SL> risk <usd|pct> <VALUE> [note "..."] [sig <SETUP_ID>]
 
-Examples:
-- /trade_open BTC long entry 43000 sl 42000 risk usd 40 note breakout sig PF-20251219-0007
-- /trade_open ETH short entry 2520 sl 2575 risk pct 2 note trend
-
 Close trade:
 - /trade_close <TRADE_ID> pnl <PNL>
 
@@ -1626,11 +1643,6 @@ Equity behavior:
 
 4) Status
 - /status
-Shows:
-• Open trades
-• Daily trade count
-• Daily risk used & remaining
-• Equity
 
 5) Risk Settings
 - /riskmode pct 2.5
@@ -1674,6 +1686,10 @@ Email rules:
 - /signals_daily
 - /signals_weekly
 
+10) Health (Transparent)
+- /health
+Shows engine layer status, current session knobs, and last email decision.
+
 Not financial advice.
 """
 
@@ -1682,6 +1698,63 @@ Not financial advice.
 # =========================================================
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    sess_now = in_session_now(user)
+    sess_name = sess_now["name"] if sess_now else current_session_utc()
+    knobs = session_knobs(sess_name)
+
+    last_dec = _LAST_EMAIL_DECISION.get(uid, {})
+    last_lines = []
+    if last_dec:
+        last_lines.append(f"Last email decision: {last_dec.get('status','-')}")
+        if last_dec.get("status") == "SKIP":
+            # show top reasons
+            reasons = last_dec.get("reasons", [])
+            if reasons:
+                last_lines.append("Top skip reasons:")
+                for r in reasons[:5]:
+                    last_lines.append(f"- {r}")
+        if last_dec.get("when"):
+            last_lines.append(f"When: {last_dec.get('when')}")
+
+    prox_mode = f"Session-adaptive ({knobs['name']}: mult={knobs['ema_prox_mult']:.2f})"
+    react_mode = f"Session-adaptive ({knobs['name']}: lookback={knobs['ema_reaction_lookback']})"
+    trig_mode = f"ATR-adaptive ({knobs['name']}: mult={knobs['trigger_atr_mult']:.2f})"
+
+    rr_floor = SESSION_MIN_RR_TP3.get(knobs["name"], 2.0)
+    conf_floor = SESSION_MIN_CONF.get(knobs["name"], 78)
+
+    msg = [
+        "🫀 PulseFutures Health Check",
+        HDR,
+        f"User TZ: {user['tz']}",
+        f"Session (user-enabled): {sess_name}",
+        "",
+        "Layer / Status",
+        SEP,
+        f"EMA12 Proximity: ✅ {prox_mode}",
+        f"EMA12 Reaction: ✅ {react_mode}",
+        f"1H Trigger: ✅ {trig_mode}",
+        f"Confidence floors: ✅ Session-based (min={conf_floor})",
+        f"RR floors: ✅ Session-based (minRR={rr_floor:.2f})",
+        f"TP scaling: ✅ Confidence-weighted",
+        f"No-signal explanation: ✅ Professional",
+        "",
+        f"Email Engine: {'ACTIVE' if EMAIL_ENABLED and email_config_ok() else 'OFF/NOT CONFIGURED'}",
+        f"Scanner cache: tickers_ttl={TICKERS_TTL_SEC}s ohlcv_ttl={OHLCV_TTL_SEC}s",
+        f"Reject Diagnostics: {'ENABLED' if True else 'OFF'} | Samples: {'ON' if DEBUG_REJECTS else 'OFF'}",
+        HDR,
+    ]
+    if last_lines:
+        msg.append("Last Email Details")
+        msg.append(SEP)
+        msg.extend(last_lines)
+        msg.append(HDR)
+
+    await update.message.reply_text("\n".join(msg).strip())
 
 async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -2399,6 +2472,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+# =========================================================
+# TEXT ROUTER (Signal ID lookup)
+# =========================================================
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text.startswith("PF-"):
@@ -2604,6 +2680,75 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
+# /health (transparent system health)
+# =========================================================
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Transparent health check:
+    - DB reachable
+    - Exchange tickers reachable
+    - Email configured/enabled status
+    - Cache stats
+    - Blackout status
+    """
+    # DB check
+    db_ok = True
+    db_err = ""
+    try:
+        con = db_connect()
+        con.execute("SELECT 1")
+        con.close()
+    except Exception as e:
+        db_ok = False
+        db_err = str(e)
+
+    # Exchange check (quick)
+    ex_ok = True
+    ex_err = ""
+    tickers_n = 0
+    t0 = time.time()
+    try:
+        best = await asyncio.to_thread(fetch_futures_tickers)
+        tickers_n = len(best or {})
+    except Exception as e:
+        ex_ok = False
+        ex_err = str(e)
+    dt_ms = int((time.time() - t0) * 1000)
+
+    # Cache stats
+    cache_items = len(_CACHE)
+
+    # Email status
+    email_cfg = email_config_ok()
+    email_on = EMAIL_ENABLED
+
+    # Sessions
+    uid = update.effective_user.id
+    user = get_user(uid)
+    enabled = user_enabled_sessions(user)
+    sess = in_session_now(user)
+    now_s = sess["name"] if sess else "NONE"
+
+    # Blackout
+    blackout_now = is_blackout_melbourne_now()
+
+    msg = [
+        "🩺 PulseFutures • Health",
+        HDR,
+        f"DB: {'OK' if db_ok else 'FAIL'}" + (f" | {db_err}" if (not db_ok and db_err) else ""),
+        f"Bybit/CCXT: {'OK' if ex_ok else 'FAIL'} | tickers={tickers_n} | {dt_ms}ms" + (f" | {ex_err}" if (not ex_ok and ex_err) else ""),
+        f"Email: enabled={email_on} | configured={email_cfg}",
+        f"Cache: items={cache_items} | tickersTTL={TICKERS_TTL_SEC}s | ohlcvTTL={OHLCV_TTL_SEC}s",
+        f"Blackout(MEL 10–12): {'ON' if blackout_now else 'OFF'}",
+        HDR,
+        f"Your TZ: {user['tz']}",
+        f"Sessions enabled: {', '.join(enabled)} | Now: {now_s}",
+        f"Limits: emailcap/session={int(user['max_emails_per_session'])} (0=∞), emaildaycap={int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0=∞), gap={int(user['email_gap_min'])}m",
+    ]
+    await update.message.reply_text("\n".join(msg))
+
+
+# =========================================================
 # MAIN (Polling or Webhook)
 # =========================================================
 def main():
@@ -2645,6 +2790,9 @@ def main():
     app.add_handler(CommandHandler("signals_daily", signals_daily_cmd))
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd))
 
+    # ✅ Health command
+    app.add_handler(CommandHandler("health", health_cmd))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     if getattr(app, "job_queue", None):
@@ -2670,6 +2818,7 @@ def main():
     else:
         logger.info("Starting POLLING mode (ensure ONLY ONE instance running).")
         app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
