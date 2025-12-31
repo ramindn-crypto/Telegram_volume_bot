@@ -2019,8 +2019,9 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("risk mode must be usd or pct")
             return
     else:
-        risk_mode = "PCT"
-        risk_val = float(DEFAULT_MAX_RISK_PCT_PER_TRADE)
+        # Use user's configured defaults
+        risk_mode = str(user.get("risk_mode", "PCT")).upper()
+        risk_val = float(user.get("risk_value", DEFAULT_RISK_VALUE))
 
     if entry is None:
         best = await asyncio.to_thread(fetch_futures_tickers)
@@ -2394,6 +2395,123 @@ async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text("\n".join(msg))
 
+# =========================================================
+# TREND ENGINE (EMA7) — SAFE ADDON (NO CRASH)
+# =========================================================
+
+TREND_EMA_PULLBACK_ATR = 1.2
+TREND_MAX_CONFIDENCE = 90
+
+
+def ema_series(values, period):
+    if not values or len(values) < period:
+        return []
+    k = 2.0 / (period + 1.0)
+    ema_vals = [values[0]]
+    for v in values[1:]:
+        ema_vals.append(v * k + ema_vals[-1] * (1 - k))
+    return ema_vals
+
+
+def ema_slope(series, n=3):
+    if len(series) < n + 1:
+        return 0.0
+    return series[-1] - series[-1 - n]
+
+
+def trend_dynamic_confidence(base_conf, price, ema7_last, atr_15m, ch24_pct, reclaimed):
+    score = base_conf
+
+    if reclaimed:
+        score += 8
+
+    dist_atr = abs(price - ema7_last) / atr_15m
+    if dist_atr < 0.4:
+        score += 8
+    elif dist_atr < 0.8:
+        score += 4
+
+    score += min(10, abs(ch24_pct) / 2)
+
+    return int(min(score, TREND_MAX_CONFIDENCE))
+
+
+def trend_watch_for_symbol(base, mv, session_name):
+    try:
+        c4h = fetch_ohlcv(mv.symbol, "4h", 60)
+        c1h = fetch_ohlcv(mv.symbol, "1h", 60)
+        c15 = fetch_ohlcv(mv.symbol, "15m", 120)
+        if not c4h or not c15:
+            return None
+
+        closes_4h = [x[4] for x in c4h]
+        closes_15 = [x[4] for x in c15]
+
+        ch24 = float(mv.percentage or 0.0)
+        side = "BUY" if ch24 > 0 else "SELL"
+
+        ema12_4h = ema(closes_4h[-40:], 12)
+        ema28_4h = ema(closes_4h[-40:], 28)
+
+        if side == "BUY" and ema12_4h <= ema28_4h:
+            return None
+        if side == "SELL" and ema12_4h >= ema28_4h:
+            return None
+
+        ema7 = ema_series(closes_15[-80:], 7)
+        ema21 = ema_series(closes_15[-80:], 21)
+        ema50 = ema_series(closes_15[-80:], 50)
+        if not ema7 or not ema21 or not ema50:
+            return None
+
+        if side == "BUY":
+            if not (ema7[-1] > ema21[-1] > ema50[-1]):
+                return None
+            if ema_slope(ema7, 3) <= 0:
+                return None
+        else:
+            if not (ema7[-1] < ema21[-1] < ema50[-1]):
+                return None
+            if ema_slope(ema7, 3) >= 0:
+                return None
+
+        atr_15m = compute_atr_from_ohlcv(c15, ATR_PERIOD)
+        if atr_15m <= 0:
+            return None
+
+        price = float(mv.last or closes_15[-1])
+        dist_atr = abs(price - ema7[-1]) / atr_15m
+        if dist_atr > TREND_EMA_PULLBACK_ATR:
+            return None
+
+        reclaimed = False
+        if side == "BUY":
+            reclaimed = closes_15[-2] < ema7[-2] and price > ema7[-1]
+        else:
+            reclaimed = closes_15[-2] > ema7[-2] and price < ema7[-1]
+
+        fut_vol = usd_notional(mv)
+        base_conf = 55 + (15 if fut_vol >= MOVER_VOL_USD_MIN else 0)
+
+        conf = trend_dynamic_confidence(
+            base_conf,
+            price,
+            ema7[-1],
+            atr_15m,
+            ch24,
+            reclaimed
+        )
+
+        return {
+            "symbol": base,
+            "side": side,
+            "confidence": conf,
+            "ch24": ch24
+        }
+
+    except Exception:
+        return None
+
 
 # =========================================================
 # /screen
@@ -2436,7 +2554,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # =========================================================
         # Main Trade Setups (existing engine)
         # =========================================================
-        setups = await asyncio.to_thread(pick_setups, best_fut, SETUPS_N, False)
+        sn = current_session_utc()
+        setups = await asyncio.to_thread(pick_setups, best_fut, SETUPS_N, False, sn)
         for s in setups:
             db_insert_signal(s)
 
@@ -2601,7 +2720,6 @@ def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, set
     parts.append(HDR)
     return "\n".join(parts).strip()
 
-
 # =========================================================
 # EMAIL JOB
 # =========================================================
@@ -2626,15 +2744,42 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not best_fut:
             return
 
-        setups_all = await asyncio.to_thread(pick_setups, best_fut, max(EMAIL_SETUPS_N * 3, 9), True)
-
-        for s in setups_all:
-            db_insert_signal(s)
+        # ✅ Build setups per session (session-aware engine knobs)
+        setups_by_session: Dict[str, List[Setup]] = {}
+        for sess_name in ["NY", "LON", "ASIA"]:
+            setups = await asyncio.to_thread(
+                pick_setups,
+                best_fut,
+                max(EMAIL_SETUPS_N * 3, 9),
+                True,
+                sess_name
+            )
+            setups_by_session[sess_name] = setups
+            for s in setups:
+                db_insert_signal(s)
 
         for user in users:
             uid = int(user["user_id"])
+            tz = ZoneInfo(user["tz"])
+
+            # Track reasons for /health transparency
+            # (we’ll overwrite per decision)
             sess = in_session_now(user)
             if not sess:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": ["not_in_enabled_session"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            setups_all = setups_by_session.get(sess["name"], [])
+            if not setups_all:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"no_setups_generated_for_session ({sess['name']})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
                 continue
 
             st = email_state_get(uid)
@@ -2647,41 +2792,66 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             gap_min = int(user["email_gap_min"])
             gap_sec = gap_min * 60
 
-            tz = ZoneInfo(user["tz"])
             day_local = datetime.now(tz).date().isoformat()
             sent_today = _email_daily_get(uid, day_local)
             day_cap = int(user.get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY))
+
             if day_cap > 0 and sent_today >= day_cap:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"daily_email_cap_reached ({sent_today}/{day_cap})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
                 continue
 
             if max_emails > 0 and int(st["sent_count"]) >= max_emails:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"session_email_cap_reached ({int(st['sent_count'])}/{max_emails})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
                 continue
 
             now_ts = time.time()
             if gap_sec > 0 and (now_ts - float(st["last_email_ts"])) < gap_sec:
+                remain = int(gap_sec - (now_ts - float(st["last_email_ts"])))
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"email_gap_active (remain {remain}s)"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
                 continue
 
             min_conf = SESSION_MIN_CONF.get(sess["name"], 78)
+            min_rr = SESSION_MIN_RR_TP3.get(sess["name"], 2.0)
 
             confirmed: List[Setup] = []
             early: List[Setup] = []
 
+            skip_reasons_counter = Counter()
+
             for s in setups_all:
                 if s.conf < min_conf:
+                    skip_reasons_counter["below_session_conf_floor"] += 1
                     continue
 
                 # Trend-follow filter
                 if s.side == "BUY" and float(s.ch24) < float(TREND_24H_TOL):
+                    skip_reasons_counter["trend_filter_buy_24h_too_low"] += 1
                     continue
                 if s.side == "SELL" and float(s.ch24) > -float(TREND_24H_TOL):
+                    skip_reasons_counter["trend_filter_sell_24h_too_high"] += 1
                     continue
 
-               min_rr = SESSION_MIN_RR_TP3.get(sess["name"], 2.0)
-               if rr3 < min_rr:
+                # RR floor by session (TP3)
+                rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+                if rr3 < min_rr:
+                    skip_reasons_counter["below_session_rr_floor"] += 1
                     continue
 
-
+                # Symbol cooldown
                 if symbol_recently_emailed(uid, s.symbol, SYMBOL_COOLDOWN_HOURS):
+                    skip_reasons_counter["symbol_cooldown_18h"] += 1
                     continue
 
                 is_confirm_15m = abs(float(s.ch15)) >= CONFIRM_15M_ABS_MIN
@@ -2690,8 +2860,10 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     confirmed.append(s)
                 else:
                     if abs(float(s.ch1)) < EARLY_1H_ABS_MIN:
+                        skip_reasons_counter["early_gate_ch1_not_strong"] += 1
                         continue
                     if s.conf < (min_conf + EARLY_EMAIL_EXTRA_CONF):
+                        skip_reasons_counter["early_gate_conf_not_high_enough"] += 1
                         continue
                     early.append(s)
 
@@ -2704,11 +2876,17 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 filtered.extend(early[:min(need, EARLY_EMAIL_MAX_FILL)])
 
             if not filtered:
+                # show top skip reasons (best effort)
+                top_reasons = [f"{k}: {v}" for k, v in skip_reasons_counter.most_common(5)]
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": ["no_setups_after_filters"] + (top_reasons if top_reasons else []),
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
                 continue
 
             now_local = datetime.now(tz)
             body = _email_body_pretty(sess["name"], now_local, user["tz"], filtered, best_fut)
-
             subject = f"PulseFutures • {sess['name']} • Premium Setups ({int(st['sent_count'])+1})"
 
             ok = await asyncio.to_thread(send_email, subject, body)
@@ -2718,6 +2896,17 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 for s in filtered:
                     mark_symbol_emailed(uid, s.symbol)
 
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SENT",
+                    "reasons": [f"sent {len(filtered)} setups"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+            else:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": ["send_email_failed (smtp/config)"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
 
 # =========================================================
 # /health (transparent system health)
@@ -2865,120 +3054,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# =========================================================
-# TREND ENGINE (EMA7) — SAFE ADDON (NO CRASH)
-# =========================================================
-
-TREND_EMA_PULLBACK_ATR = 1.2
-TREND_MAX_CONFIDENCE = 90
-
-
-def ema_series(values, period):
-    if not values or len(values) < period:
-        return []
-    k = 2.0 / (period + 1.0)
-    ema_vals = [values[0]]
-    for v in values[1:]:
-        ema_vals.append(v * k + ema_vals[-1] * (1 - k))
-    return ema_vals
-
-
-def ema_slope(series, n=3):
-    if len(series) < n + 1:
-        return 0.0
-    return series[-1] - series[-1 - n]
-
-
-def trend_dynamic_confidence(base_conf, price, ema7_last, atr_15m, ch24_pct, reclaimed):
-    score = base_conf
-
-    if reclaimed:
-        score += 8
-
-    dist_atr = abs(price - ema7_last) / atr_15m
-    if dist_atr < 0.4:
-        score += 8
-    elif dist_atr < 0.8:
-        score += 4
-
-    score += min(10, abs(ch24_pct) / 2)
-
-    return int(min(score, TREND_MAX_CONFIDENCE))
-
-
-def trend_watch_for_symbol(base, mv, session_name):
-    try:
-        c4h = fetch_ohlcv(mv.symbol, "4h", 60)
-        c1h = fetch_ohlcv(mv.symbol, "1h", 60)
-        c15 = fetch_ohlcv(mv.symbol, "15m", 120)
-        if not c4h or not c15:
-            return None
-
-        closes_4h = [x[4] for x in c4h]
-        closes_15 = [x[4] for x in c15]
-
-        ch24 = float(mv.percentage or 0.0)
-        side = "BUY" if ch24 > 0 else "SELL"
-
-        ema12_4h = ema(closes_4h[-40:], 12)
-        ema28_4h = ema(closes_4h[-40:], 28)
-
-        if side == "BUY" and ema12_4h <= ema28_4h:
-            return None
-        if side == "SELL" and ema12_4h >= ema28_4h:
-            return None
-
-        ema7 = ema_series(closes_15[-80:], 7)
-        ema21 = ema_series(closes_15[-80:], 21)
-        ema50 = ema_series(closes_15[-80:], 50)
-        if not ema7 or not ema21 or not ema50:
-            return None
-
-        if side == "BUY":
-            if not (ema7[-1] > ema21[-1] > ema50[-1]):
-                return None
-            if ema_slope(ema7, 3) <= 0:
-                return None
-        else:
-            if not (ema7[-1] < ema21[-1] < ema50[-1]):
-                return None
-            if ema_slope(ema7, 3) >= 0:
-                return None
-
-        atr_15m = compute_atr_from_ohlcv(c15, ATR_PERIOD)
-        if atr_15m <= 0:
-            return None
-
-        price = float(mv.last or closes_15[-1])
-        dist_atr = abs(price - ema7[-1]) / atr_15m
-        if dist_atr > TREND_EMA_PULLBACK_ATR:
-            return None
-
-        reclaimed = False
-        if side == "BUY":
-            reclaimed = closes_15[-2] < ema7[-2] and price > ema7[-1]
-        else:
-            reclaimed = closes_15[-2] > ema7[-2] and price < ema7[-1]
-
-        fut_vol = usd_notional(mv)
-        base_conf = 55 + (15 if fut_vol >= MOVER_VOL_USD_MIN else 0)
-
-        conf = trend_dynamic_confidence(
-            base_conf,
-            price,
-            ema7[-1],
-            atr_15m,
-            ch24,
-            reclaimed
-        )
-
-        return {
-            "symbol": base,
-            "side": side,
-            "confidence": conf,
-            "ch24": ch24
-        }
-
-    except Exception:
-        return None
 
