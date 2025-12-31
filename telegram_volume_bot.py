@@ -1249,18 +1249,6 @@ def current_session_utc(now_utc: Optional[datetime] = None) -> str:
     return "OFF"
 
 
-def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
-    """
-    ✅ 1H trigger becomes ATR-adaptive.
-    - Base minimum is TRIGGER_1H_ABS_MIN_BASE.
-    - Also requires >= (atr_pct * session_mult), clamped to reasonable bounds.
-    """
-    knobs = session_knobs(session_name)
-    mult = knobs["trigger_atr_mult"]
-    # typical atr_pct range ~1..8; we keep trigger within 2..6
-    dyn = clamp(float(atr_pct) * float(mult), 2.0, 6.0)
-    return max(float(TRIGGER_1H_ABS_MIN_BASE), float(dyn))
-
 
 
 def ema_support_proximity_ok(entry: float, ema_val: float, atr_1h: float, session_name: str):
@@ -1491,22 +1479,37 @@ def tp_r_mults_from_conf(conf: int) -> Tuple[float, float, float]:
         tp2 = max(1.6, tp3 - 0.3)
     return (tp1, tp2, tp3)
 
-def compute_sl_tp(entry: float, side: str, atr: float, conf: int, tp_cap_pct: float) -> Tuple[float, float, float]:
-    # returns (sl, tp3, R)
+
+
+def compute_sl_tp(
+    entry: float,
+    side: str,
+    atr: float,
+    conf: int,
+    tp_cap_pct: float,
+    rr_bonus: float = 0.0,
+    tp_cap_bonus_pct: float = 0.0,
+) -> Tuple[float, float, float]:
+    """
+    Returns (sl, tp3, R)
+    """
     if entry <= 0 or atr <= 0:
         return 0.0, 0.0, 0.0
 
     sl_dist = sl_mult_from_conf(conf) * atr
+
     min_dist = (ATR_MIN_PCT / 100.0) * entry
     max_dist = (ATR_MAX_PCT / 100.0) * entry
     sl_dist = clamp(sl_dist, min_dist, max_dist)
 
     R = sl_dist
 
-    # ✅ confidence-weighted RR target then cap
-    rr_target = tp3_rr_target_from_conf(conf)
+    # ✅ confidence-weighted RR + engine bonus
+    rr_target = tp3_rr_target_from_conf(conf) + rr_bonus
     tp_dist = rr_target * R
-    tp_cap = (float(tp_cap_pct) / 100.0) * entry
+
+    # ✅ TP cap with engine bonus
+    tp_cap = ((tp_cap_pct + tp_cap_bonus_pct) / 100.0) * entry
     tp_dist = min(tp_dist, tp_cap)
 
     if side == "BUY":
@@ -1515,7 +1518,11 @@ def compute_sl_tp(entry: float, side: str, atr: float, conf: int, tp_cap_pct: fl
     else:
         sl = entry + sl_dist
         tp3 = entry - tp_dist
+
     return sl, tp3, R
+
+
+
 
 def _distinctify(a: float, b: float, c: float, entry: float, side: str) -> Tuple[float, float, float]:
     if entry <= 0:
@@ -1534,15 +1541,25 @@ def _distinctify(a: float, b: float, c: float, entry: float, side: str) -> Tuple
     if abs(a - c) < eps: a = a - 2*eps if side == "BUY" else a + 2*eps
     return a, b, c
 
-def multi_tp(entry: float, side: str, R: float, tp_cap_pct: float, conf: int) -> Tuple[float, float, float]:
+
+def multi_tp(
+    entry: float,
+    side: str,
+    R: float,
+    tp_cap_pct: float,
+    conf: int,
+    rr_bonus: float = 0.0,
+    tp_cap_bonus_pct: float = 0.0,
+) -> Tuple[float, float, float]:
     if entry <= 0 or R <= 0:
         return 0.0, 0.0, 0.0
 
     r1, r2, r3 = tp_r_mults_from_conf(conf)
-    maxd = (float(tp_cap_pct) / 100.0) * entry
+    r3 += rr_bonus  # ✅ Engine B bonus
+
+    maxd = ((tp_cap_pct + tp_cap_bonus_pct) / 100.0) * entry
 
     d3 = min(r3 * R, maxd)
-    # preserve proportional spacing vs r3, but also keep increasing
     d2 = min(r2 * R, d3 * (r2 / r3 if r3 > 0 else 0.7))
     d1 = min(r1 * R, d3 * (r1 / r3 if r3 > 0 else 0.4))
 
@@ -1551,8 +1568,11 @@ def multi_tp(entry: float, side: str, R: float, tp_cap_pct: float, conf: int) ->
     else:
         tp1, tp2, tp3 = (entry - d1, entry - d2, entry - d3)
 
-    tp1, tp2, tp3 = _distinctify(tp1, tp2, tp3, entry, side)
-    return tp1, tp2, tp3
+    return _distinctify(tp1, tp2, tp3, entry, side)
+
+
+
+
 
 def rr_to_tp(entry: float, sl: float, tp: float) -> float:
     d_sl = abs(entry - sl)
