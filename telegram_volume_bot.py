@@ -890,15 +890,36 @@ def db_trades_since(user_id: int, ts_from: float) -> List[dict]:
 
 
 # =========================================================
-# EXCHANGE HELPERS
+# EXCHANGE HELPERS (FAST: singleton exchange + no repeated load_markets)
 # =========================================================
-def build_exchange():
-    klass = ccxt.__dict__[EXCHANGE_ID]
-    return klass({
-        "enableRateLimit": True,
-        "timeout": 20000,
-        "options": {"defaultType": DEFAULT_TYPE},
-    })
+import threading
+
+_EX: Optional[ccxt.Exchange] = None
+_EX_LOCK = threading.Lock()
+_EX_MARKETS_LOADED = False
+
+def get_exchange() -> ccxt.Exchange:
+    """
+    ✅ SINGLETON exchange instance
+    - Avoids building a new exchange per request
+    - Avoids calling load_markets() repeatedly
+    """
+    global _EX, _EX_MARKETS_LOADED
+    with _EX_LOCK:
+        if _EX is None:
+            klass = ccxt.__dict__[EXCHANGE_ID]
+            _EX = klass({
+                "enableRateLimit": True,
+                "timeout": 20000,
+                "options": {"defaultType": DEFAULT_TYPE},
+            })
+            _EX_MARKETS_LOADED = False
+
+        if not _EX_MARKETS_LOADED:
+            _EX.load_markets()
+            _EX_MARKETS_LOADED = True
+
+        return _EX
 
 def safe_split_symbol(sym: Optional[str]) -> Optional[Tuple[str, str]]:
     if not sym:
@@ -935,11 +956,13 @@ def to_mv(t: dict) -> Optional[MarketVol]:
     )
 
 def fetch_futures_tickers() -> Dict[str, MarketVol]:
+    """
+    ✅ Uses singleton exchange (no repeated load_markets)
+    """
     if cache_valid("tickers_best_fut", TICKERS_TTL_SEC):
         return cache_get("tickers_best_fut")
 
-    ex = build_exchange()
-    ex.load_markets()
+    ex = get_exchange()
     tickers = ex.fetch_tickers()
 
     best: Dict[str, MarketVol] = {}
@@ -956,52 +979,19 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
     return best
 
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
+    """
+    ✅ Uses singleton exchange (no repeated build + load_markets)
+    ✅ TTL cache already exists
+    """
     key = f"ohlcv:{symbol}:{timeframe}:{limit}"
     if cache_valid(key, OHLCV_TTL_SEC):
         return cache_get(key)
 
-    ex = build_exchange()
-    ex.load_markets()
+    ex = get_exchange()
     data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
     cache_set(key, data)
     return data
 
-def compute_atr_from_ohlcv(candles: List[List[float]], period: int) -> float:
-    if not candles or len(candles) < period + 2:
-        return 0.0
-    trs = []
-    for i in range(1, len(candles)):
-        prev_close = float(candles[i - 1][4])
-        high = float(candles[i][2])
-        low = float(candles[i][3])
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-    if len(trs) < period:
-        return 0.0
-    return sum(trs[-period:]) / period
-
-def ema(values: List[float], period: int) -> float:
-    if not values or len(values) < period:
-        return 0.0
-    k = 2.0 / (period + 1.0)
-    e = float(values[0])
-    for v in values[1:]:
-        e = (float(v) * k) + (e * (1.0 - k))
-    return float(e)
-
-def is_blackout_melbourne_now() -> bool:
-    tz = ZoneInfo(BLACKOUT_TZ)
-    now = datetime.now(tz)
-    return (BLACKOUT_START_HH <= now.hour < BLACKOUT_END_HH)
-
-def is_hot_coin(fut_vol_usd: float, ch24: float) -> bool:
-    return (float(fut_vol_usd) >= float(HOT_VOL_USD)) and (abs(float(ch24)) >= float(HOT_CH24_ABS))
-
-def tp_cap_pct_for_coin(fut_vol_usd: float, ch24: float) -> float:
-    return TP_MAX_PCT_HOT if is_hot_coin(fut_vol_usd, ch24) else TP_MAX_PCT_NORMAL
-
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
 
 # =========================================================
 # ✅ Session resolution helpers (for /screen + engine)
@@ -1408,16 +1398,32 @@ def build_leaders_table(best_fut: Dict[str, MarketVol]) -> str:
     return "*Market Leaders (Top 10 by Futures Volume)*\n" + table_md(rows, ["SYM", "F Vol", "24H", "Last"])
 
 def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tuple], List[Tuple]]:
+    """
+    ✅ FAST version:
+    - For leaders/losers we only need: volume, 24H move, and 4H alignment
+    - So we fetch ONLY 4H candles (limit=2) instead of full 1H+15m metrics
+    """
     up, dn = [], []
+
     for base, mv in best_fut.items():
         vol = usd_notional(mv)
         if vol < MOVER_VOL_USD_MIN:
             continue
+
         ch24 = float(mv.percentage or 0.0)
         if ch24 < MOVER_UP_24H_MIN and ch24 > MOVER_DN_24H_MAX:
             continue
 
-        ch1, ch4, ch15, atr_1h, ema12_15m, c15 = metrics_from_candles_1h_15m(mv.symbol)
+        # ✅ 4H alignment using real 4H candles (very light)
+        c4h = fetch_ohlcv(mv.symbol, "4h", limit=2)
+        if not c4h or len(c4h) < 2:
+            continue
+
+        c_last = float(c4h[-1][4])
+        c_prev = float(c4h[-2][4])
+        if c_prev <= 0:
+            continue
+        ch4 = ((c_last - c_prev) / c_prev) * 100.0
 
         if ch24 >= MOVER_UP_24H_MIN and ch4 > 0:
             up.append((base, vol, ch24, ch4, float(mv.last or 0.0)))
@@ -1427,6 +1433,7 @@ def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tupl
     up.sort(key=lambda x: (x[2], x[1]), reverse=True)
     dn.sort(key=lambda x: (x[2], x[1]))
     return up, dn
+
 
 def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     up, dn = compute_directional_lists(best_fut)
@@ -2743,27 +2750,34 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
 
         # =========================================================
-        # Trend Continuation Watch (EMA7)
+        # Trend Continuation Watch (EMA7) — FAST (concurrent + limited)
         # =========================================================
         trend_watch = []
 
         up_list, dn_list = compute_directional_lists(best_fut)
 
-        for base, *_ in up_list[:15]:
-            mv = best_fut.get(base)
-            if mv:
-                tw = trend_watch_for_symbol(base, mv, current_session_utc())
-                if tw:
-                    trend_watch.append(tw)
+        # pick fewer symbols to watch (reduces load a lot)
+        watch_bases = [b for b, *_ in up_list[:10]] + [b for b, *_ in dn_list[:10]]
+        watch_bases = list(dict.fromkeys(watch_bases))[:20]  # unique, cap 20
 
-        for base, *_ in dn_list[:15]:
+        sem = asyncio.Semaphore(5)  # limit concurrency (safe for Bybit rate limit)
+
+        async def _one_trend(base: str):
             mv = best_fut.get(base)
-            if mv:
-                tw = trend_watch_for_symbol(base, mv, current_session_utc())
-                if tw:
-                    trend_watch.append(tw)
+            if not mv:
+                return None
+            async with sem:
+                return await asyncio.to_thread(trend_watch_for_symbol, base, mv, current_session_utc())
+
+        tasks = [asyncio.create_task(_one_trend(b)) for b in watch_bases]
+        res = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for r in res:
+            if isinstance(r, dict):
+                trend_watch.append(r)
 
         trend_watch = sorted(trend_watch, key=lambda x: x["confidence"], reverse=True)[:6]
+
 
         # =========================================================
         # Main Trade Setups (existing engine)
