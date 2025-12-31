@@ -3205,14 +3205,13 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
+    # ================= Handlers =================
     app.add_handler(CommandHandler(["help", "start"], cmd_help))
     app.add_handler(CommandHandler("tz", tz_cmd))
-
     app.add_handler(CommandHandler("screen", screen_cmd))
 
     app.add_handler(CommandHandler("equity", equity_cmd))
     app.add_handler(CommandHandler("equity_reset", equity_reset_cmd))
-
     app.add_handler(CommandHandler("riskmode", riskmode_cmd))
     app.add_handler(CommandHandler("dailycap", dailycap_cmd))
     app.add_handler(CommandHandler("limits", limits_cmd))
@@ -3225,52 +3224,51 @@ def main():
     app.add_handler(CommandHandler("notify_off", notify_off))
 
     app.add_handler(CommandHandler("size", size_cmd))
-
     app.add_handler(CommandHandler("trade_open", trade_open_cmd))
     app.add_handler(CommandHandler("trade_close", trade_close_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
 
     app.add_handler(CommandHandler("report_daily", report_daily_cmd))
     app.add_handler(CommandHandler("report_weekly", report_weekly_cmd))
-
     app.add_handler(CommandHandler("signals_daily", signals_daily_cmd))
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd))
 
-    # ✅ Health command (user-friendly)
     app.add_handler(CommandHandler("health", health_cmd))
-
-    # ✅ System health command (technical)
     app.add_handler(CommandHandler("health_sys", health_sys_cmd))
-
-    # ✅ Diagnostics visibility controls (anti-copy)
     app.add_handler(CommandHandler("diag_on", diag_on_cmd))
     app.add_handler(CommandHandler("diag_off", diag_off_cmd))
-
-    # ✅ Admin SMTP test
     app.add_handler(CommandHandler("email_test", email_test_cmd))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
-    if getattr(app, "job_queue", None):
-        app.job_queue.run_repeating(alert_job, interval=CHECK_INTERVAL_MIN * 60, first=15, name="alert_job")
-    else:
-        logger.warning('JobQueue not available. Install: python-telegram-bot[job-queue]')
-
-    port = int(os.environ.get("PORT", "10000"))
-
-    if WEBHOOK_URL:
-        if not WEBHOOK_URL.startswith("https://"):
-            raise RuntimeError("WEBHOOK_URL must start with https://")
-        path = f"/telegram/{TOKEN[:12]}"
-        webhook_full = WEBHOOK_URL.rstrip("/") + path
-        logger.info("Starting WEBHOOK mode: %s", webhook_full)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=path.lstrip("/"),
-            webhook_url=webhook_full,
-            drop_pending_updates=True,
+    # ================= JobQueue =================
+    if app.job_queue:
+        app.job_queue.run_repeating(
+            alert_job,
+            interval=CHECK_INTERVAL_MIN * 60,
+            first=30,
+            name="alert_job"
         )
     else:
-        logger.info("Starting POLLING mode (ensure ONLY ONE instance running).")
-        app.run_polling(drop_pending_updates=True)
+        logger.error("JobQueue NOT available – install python-telegram-bot[job-queue]")
+
+    # ================= WEBHOOK ONLY (Render safe) =================
+    port = int(os.environ.get("PORT", "10000"))
+    webhook_url = os.environ.get("WEBHOOK_URL")
+
+    if not webhook_url or not webhook_url.startswith("https://"):
+        raise RuntimeError("WEBHOOK_URL must be set and start with https://")
+
+    path = f"/telegram/{TOKEN[:16]}"
+    full_webhook = webhook_url.rstrip("/") + path
+
+    logger.info("Starting Telegram webhook at %s", full_webhook)
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=path.lstrip("/"),
+        webhook_url=full_webhook,
+        drop_pending_updates=True,
+    )
+
