@@ -91,10 +91,15 @@ CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "5"))
 ADMIN_USER_IDS = set(
     int(x.strip()) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
 )
-# Public users see friendly reasons only (no thresholds/params). Admin sees technical details.
-PUBLIC_DIAGNOSTICS_MODE = os.environ.get("PUBLIC_DIAGNOSTICS_MODE", "friendly").strip().lower()
-# "friendly" (recommended) or "off" (hide reject reasons completely for non-admin)
-# Admin always sees full.
+
+# IMPORTANT CHANGE:
+# System sends signals only. It does NOT show reject reasons to public users.
+# Admin can still see internals if you set PUBLIC_DIAGNOSTICS_MODE=admin
+PUBLIC_DIAGNOSTICS_MODE = os.environ.get("PUBLIC_DIAGNOSTICS_MODE", "off").strip().lower()
+# values:
+# - "off"    => hide reject diagnostics completely for non-admin
+# - "admin"  => only admins can see diagnostics (recommended)
+# Admin always sees full if needed.
 
 # -------------------------
 # Screen output sizes
@@ -108,68 +113,86 @@ MOVER_VOL_USD_MIN = 5_000_000
 MOVER_UP_24H_MIN = 10.0
 MOVER_DN_24H_MAX = -10.0
 
-# Setup engine thresholds (tune later)
-TRIGGER_1H_ABS_MIN_BASE = 2.0  # ✅ now ATR-adaptive around this baseline
-CONFIRM_15M_ABS_MIN = 0.6
-ALIGN_4H_MIN = 0.0  # require same direction on 4H
+# =========================================================
+# ✅ ENGINES
+# =========================================================
+ENGINE_A_PULLBACK_ENABLED = True     # pullback / mean-reversion near adaptive EMA
+ENGINE_B_MOMENTUM_ENABLED = True     # pump / expansion
 
-# ✅ Soft-confirm 15m for EMAIL (without removing anything)
-EARLY_1H_ABS_MIN = 3.8         # "very strong" 1H momentum gate
-EARLY_CONF_PENALTY = 6         # reduce conf a bit if 15m is weak (still eligible if very strong)
-EARLY_EMAIL_EXTRA_CONF = 4     # EARLY requires higher confidence than session min_conf
-EARLY_EMAIL_MAX_FILL = 1       # at most 1 EARLY setup used to fill the email (keeps quality)
+# =========================================================
+# ✅ 1H MOMENTUM INTENSITY (LOOSENED)
+# =========================================================
+# Was too conservative; now it triggers more often
+TRIGGER_1H_ABS_MIN_BASE = 1.2        # was 2.0
+CONFIRM_15M_ABS_MIN = 0.45           # was 0.6 (slightly easier)
+ALIGN_4H_MIN = 0.0                   # keep alignment
 
-# ✅ Trend-follow Email filter (avoid counter-trend reversals)
-TREND_24H_TOL = 0.5  # percent; BUY needs >= +0.5%, SELL needs <= -0.5%
+# "EARLY" filler (email only) — also loosened slightly
+EARLY_1H_ABS_MIN = 2.8               # was 3.8
+EARLY_CONF_PENALTY = 6
+EARLY_EMAIL_EXTRA_CONF = 4
+EARLY_EMAIL_MAX_FILL = 1
 
-# Risk defaults (user controlled; equity starts at 0 by design)
+# Trend-follow Email filter (avoid counter-trend reversals)
+TREND_24H_TOL = 0.5
+
+# =========================================================
+# ✅ ENGINE B (MOMENTUM / EXPANSION) SETTINGS (for pumps)
+# =========================================================
+MOMENTUM_MIN_CH1 = 1.8               # pump gate for 1H (easier than before)
+MOMENTUM_MIN_24H = 10.0              # must be moving
+MOMENTUM_VOL_MULT = 1.2              # volume spike vs mover min
+MOMENTUM_ATR_BODY_MULT = 0.95        # expansion vs ATR% (easier)
+MOMENTUM_MAX_ADAPTIVE_EMA_DIST = 7.5 # allow being far from EMA (pumps)
+
+# Higher TP behavior for Engine B (pumps)
+ENGINE_B_TP_CAP_BONUS_PCT = 4.0      # adds to TP cap %
+ENGINE_B_RR_BONUS = 0.35             # adds to RR target (TP3)
+
+# =========================================================
+# RISK DEFAULTS
+# =========================================================
 DEFAULT_EQUITY = 0.0
-DEFAULT_RISK_MODE = "PCT"     # PCT or USD
-DEFAULT_RISK_VALUE = 1.5      # 1.5% by default (only used if user doesn't override)
+DEFAULT_RISK_MODE = "PCT"
+DEFAULT_RISK_VALUE = 1.5
 DEFAULT_DAILY_CAP_MODE = "PCT"
-DEFAULT_DAILY_CAP_VALUE = 5.0  # ✅ default 5% equity/day risk cap
+DEFAULT_DAILY_CAP_VALUE = 5.0
 DEFAULT_MAX_TRADES_DAY = 5
 DEFAULT_MIN_EMAIL_GAP_MIN = 60
-DEFAULT_MAX_EMAILS_PER_SESSION = 4  # user can set 0 for unlimited
-
-# ✅ DAILY email cap per user across ALL sessions (user-controllable)
+DEFAULT_MAX_EMAILS_PER_SESSION = 4
 DEFAULT_MAX_EMAILS_PER_DAY = 4
 
-# ✅ /size default risk ceiling
 DEFAULT_MAX_RISK_PCT_PER_TRADE = 2.0
 WARN_RISK_PCT_PER_TRADE = 2.0
 
-# Cooldown
-SYMBOL_COOLDOWN_HOURS = 18  # do not repeat same symbol in emails for that user within 18h
+SYMBOL_COOLDOWN_HOURS = 18
 
 # Multi-TP
 ATR_PERIOD = 14
 ATR_MIN_PCT = 1.0
 ATR_MAX_PCT = 8.0
-
 MULTI_TP_MIN_CONF = 78
-
-# ✅ allocations requested
 TP_ALLOCS = (40, 40, 20)
 
-# ✅ default multipliers (kept) — now TP3 will be confidence-weighted in engine
 TP_R_MULTS_DEFAULT = (1.0, 1.7, 2.4)
 
-# ✅ Dynamic TP cap: normal vs hot coins (TP3 about 15% for hot)
+# Dynamic TP cap: normal vs hot coins
 TP_MAX_PCT_NORMAL = 12.0
 TP_MAX_PCT_HOT = 15.0
 HOT_VOL_USD = 50_000_000
 HOT_CH24_ABS = 15.0
 
 # =========================================================
-# ✅ EMA12 (15m) proximity + sharp move gating
+# ✅ ADAPTIVE EMA SUPPORT (global)
 # =========================================================
-EMA12_PERIOD = 12
+# Minimum/maximum adaptive EMA period bounds
+ADAPTIVE_EMA_MIN = 8
+ADAPTIVE_EMA_MAX = 21
 
-# maximum allowed distance from EMA12 (derived from ATR%), clamped
-EMA12_MAX_DIST_ATR_MULT = 0.7  # base; now session-adaptive multiplier applies
-EMA12_MAX_DIST_PCT_MIN = 0.25   # percent
-EMA12_MAX_DIST_PCT_MAX = 1.5    # percent
+# Proximity threshold (derived from ATR%), clamped
+EMA_SUPPORT_MAX_DIST_ATR_MULT = 0.7
+EMA_SUPPORT_MAX_DIST_PCT_MIN = 0.25
+EMA_SUPPORT_MAX_DIST_PCT_MAX = 1.8
 
 # Sharp 1H move gating
 SHARP_1H_MOVE_PCT = 20.0
@@ -186,12 +209,9 @@ EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465"))
 EMAIL_USER = os.environ.get("EMAIL_USER", "")
 EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
-EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)  # comma-separated ok
+EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 
-# Render stability
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
-
-# Email footer / CTA
 TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFuturesBot").strip()
 
 # Caching for speed
@@ -199,8 +219,9 @@ TICKERS_TTL_SEC = 45
 OHLCV_TTL_SEC = 60
 
 # =========================================================
-# DEBUG / REJECT REASONS
+# DEBUG / REJECT REASONS (INTERNAL ONLY)
 # =========================================================
+# Keep internal reject stats for you, but DO NOT show to public
 DEBUG_REJECTS = os.environ.get("DEBUG_REJECTS", "false").lower() == "true"
 REJECT_TOP_N = int(os.environ.get("REJECT_TOP_N", "12"))
 
@@ -216,135 +237,75 @@ ALERT_LOCK = asyncio.Lock()
 
 
 
-# =========================================================
-# ✅ EMA12 (15m) proximity + sharp move gating
-# =========================================================
-EMA12_PERIOD = 12
 
-# maximum allowed distance from EMA12 (derived from ATR%), clamped
-EMA12_MAX_DIST_ATR_MULT = 0.7  # base; now session-adaptive multiplier applies
-EMA12_MAX_DIST_PCT_MIN = 0.25   # percent
-EMA12_MAX_DIST_PCT_MAX = 1.5    # percent
 
-# Sharp 1H move gating
-SHARP_1H_MOVE_PCT = 20.0
-
-# Melbourne blackout window
-BLACKOUT_TZ = "Australia/Melbourne"
-BLACKOUT_START_HH = 10
-BLACKOUT_END_HH = 12
-
-# Email
-EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
-EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
-EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465"))
-EMAIL_USER = os.environ.get("EMAIL_USER", "")
-EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
-EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
-EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)  # comma-separated ok
-
-# Render stability
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
-
-# Email footer / CTA
-TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFuturesBot").strip()
-
-# Caching for speed
-TICKERS_TTL_SEC = 45
-OHLCV_TTL_SEC = 60
-
-# =========================================================
-# DEBUG / REJECT REASONS
-# =========================================================
-DEBUG_REJECTS = os.environ.get("DEBUG_REJECTS", "false").lower() == "true"
-REJECT_TOP_N = int(os.environ.get("REJECT_TOP_N", "12"))
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("pulsefutures")
-
-STABLES = {"USDT", "USDC", "USD", "TUSD", "FDUSD", "DAI", "PYUSD"}
-
-HDR = "━━━━━━━━━━━━━━━━━━━━"
-SEP = "────────────────────"
-
-ALERT_LOCK = asyncio.Lock()
 
 # Sessions defined in UTC windows
 SESSIONS_UTC = {
-    "ASIA": {"start": "00:00", "end": "06:00"},  # 00-06 UTC
-    "LON":  {"start": "07:00", "end": "12:00"},  # 07-12 UTC
-    "NY":   {"start": "13:00", "end": "20:00"},  # 13-20 UTC
+    "ASIA": {"start": "00:00", "end": "06:00"},
+    "LON":  {"start": "07:00", "end": "12:00"},
+    "NY":   {"start": "13:00", "end": "20:00"},
 }
 
-# Priority order for sessions
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
-# Stricter filters by session (NY easiest, ASIA strictest)
 SESSION_MIN_CONF = {
     "NY": 72,
     "LON": 78,
     "ASIA": 82,
 }
 
-# ✅ NEW: RR floor by session (TP3 RR minimum)
 SESSION_MIN_RR_TP3 = {
     "NY": 1.8,
     "LON": 2.0,
     "ASIA": 2.2,
 }
 
-# ✅ NEW: session-adaptive knobs
-SESSION_EMA12_PROX_MULT = {
-    "NY": 1.15,   # looser
-    "LON": 1.00,  # baseline
-    "ASIA": 0.85, # stricter
+SESSION_EMA_PROX_MULT = {
+    "NY": 1.20,
+    "LON": 1.00,
+    "ASIA": 0.85,
 }
 
-SESSION_EMA12_REACTION_LOOKBACK = {
-    "NY": 8,
-    "LON": 6,
-    "ASIA": 5,
+SESSION_EMA_REACTION_LOOKBACK = {
+    "NY": 9,
+    "LON": 7,
+    "ASIA": 6,
 }
 
-# ✅ NEW: ATR-adaptive trigger multiplier by session
+# ✅ 1H trigger loosened per session (overall easier)
 SESSION_TRIGGER_ATR_MULT = {
-    "NY": 0.8,
-    "LON": 1.0,
-    "ASIA": 1.2,
+    "NY": 0.65,
+    "LON": 0.85,
+    "ASIA": 1.00,
 }
 
-# =========================================================
-# BLACKOUT (Melbourne) — helper
-# =========================================================
-def is_blackout_melbourne_now(now: Optional[datetime] = None) -> bool:
+def session_knobs(session_name: str) -> dict:
+    s = (session_name or "LON").upper()
+    if s not in SESSIONS_UTC:
+        s = "LON"
+    return {
+        "name": s,
+        "ema_prox_mult": float(SESSION_EMA_PROX_MULT.get(s, 1.0)),
+        "ema_reaction_lookback": int(SESSION_EMA_REACTION_LOOKBACK.get(s, 7)),
+        "trigger_atr_mult": float(SESSION_TRIGGER_ATR_MULT.get(s, 0.85)),
+        "min_conf": int(SESSION_MIN_CONF.get(s, 78)),
+        "min_rr_tp3": float(SESSION_MIN_RR_TP3.get(s, 2.0)),
+    }
+
+def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
     """
-    Returns True if current time in Melbourne is within blackout window.
-    BLACKOUT window is [BLACKOUT_START_HH, BLACKOUT_END_HH) in Australia/Melbourne.
-    Example: start=10, end=12 -> blocks 10:00:00 up to 11:59:59
+    Loosened trigger:
+    - clamp down to 1.0..4.5 (was 2..6)
     """
-    try:
-        tz = ZoneInfo(BLACKOUT_TZ)
-    except Exception:
-        tz = ZoneInfo("Australia/Melbourne")
+    knobs = session_knobs(session_name)
+    mult = knobs["trigger_atr_mult"]
+    dyn = clamp(float(atr_pct) * float(mult), 1.0, 4.5)
+    return max(float(TRIGGER_1H_ABS_MIN_BASE), float(dyn))
 
-    if now is None:
-        now = datetime.now(tz)
-    else:
-        # ensure timezone-aware in Melbourne TZ
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=tz)
-        else:
-            now = now.astimezone(tz)
 
-    start_h = int(BLACKOUT_START_HH)
-    end_h = int(BLACKOUT_END_HH)
 
-    # Standard case (e.g., 10 -> 12)
-    if end_h > start_h:
-        return start_h <= now.hour < end_h
 
-    # If blackout crosses midnight (e.g., 22 -> 2)
-    return (now.hour >= start_h) or (now.hour < end_h)
 
 
 
@@ -381,8 +342,15 @@ class Setup:
     ch4: float
     ch1: float
     ch15: float
-    ema12_dist_pct: float          # debug for /screen
-    is_trailing_tp3: bool          # hot coin info
+
+    # ✅ adaptive EMA support (replaces fixed EMA12)
+    ema_support_period: int
+    ema_support_dist_pct: float
+
+    # ✅ engine label (A pullback / B momentum)
+    engine: str
+
+    is_trailing_tp3: bool
     created_ts: float
 
 
@@ -494,6 +462,42 @@ def tp_cap_pct_for_coin(fut_vol_usd: float, ch24: float) -> float:
     Dynamic TP3 cap % based on coin hotness.
     """
     return float(TP_MAX_PCT_HOT) if is_hot_coin(fut_vol_usd, ch24) else float(TP_MAX_PCT_NORMAL)
+
+
+# =========================================================
+# ADAPTIVE EMA SUPPORT
+# =========================================================
+def adaptive_ema_period(atr_pct: float) -> int:
+    """
+    Volatility-aware EMA period:
+    Higher ATR% => faster EMA (smaller period)
+    Lower ATR%  => slower EMA (larger period)
+    """
+    try:
+        a = float(atr_pct)
+    except Exception:
+        a = 2.0
+
+    if a >= 6.0:
+        p = 8
+    elif a >= 4.0:
+        p = 10
+    elif a >= 2.0:
+        p = 12
+    else:
+        p = 16
+
+    return int(clamp(p, ADAPTIVE_EMA_MIN, ADAPTIVE_EMA_MAX))
+
+def adaptive_ema_value(closes: List[float], atr_pct: float) -> Tuple[float, int]:
+    """
+    Returns: (ema_value, period_used)
+    """
+    if not closes:
+        return 0.0, adaptive_ema_period(atr_pct)
+    p = adaptive_ema_period(atr_pct)
+    lookback = min(len(closes), p + 30)
+    return ema(closes[-lookback:], p), p
 
 
 
@@ -1183,17 +1187,17 @@ def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
     dyn = clamp(float(atr_pct) * float(mult), 2.0, 6.0)
     return max(float(TRIGGER_1H_ABS_MIN_BASE), float(dyn))
 
-def ema12_proximity_ok(entry: float, ema12_val: float, atr_1h: float, session_name: str):
+
+
+def ema_support_proximity_ok(entry: float, ema_val: float, atr_1h: float, session_name: str):
     """
-    Require entry to be near EMA12(15m).
-    Session-adaptive proximity threshold.
-    Returns:
-      (ok: bool, dist_pct: float, thr_pct: float, atr_pct: float)
+    Adaptive EMA proximity check.
+    Returns: (ok, dist_pct, thr_pct, atr_pct)
     """
-    if entry <= 0 or ema12_val <= 0:
+    if entry <= 0 or ema_val <= 0:
         return False, 999.0, 0.0, 0.0
 
-    dist = abs(entry - ema12_val)
+    dist = abs(entry - ema_val)
     dist_pct = (dist / entry) * 100.0
 
     atr_pct = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
@@ -1202,46 +1206,51 @@ def ema12_proximity_ok(entry: float, ema12_val: float, atr_1h: float, session_na
     prox_mult = knobs["ema_prox_mult"]
 
     thr_pct = clamp(
-        (EMA12_MAX_DIST_ATR_MULT * prox_mult) * atr_pct,
-        EMA12_MAX_DIST_PCT_MIN,
-        EMA12_MAX_DIST_PCT_MAX,
+        (EMA_SUPPORT_MAX_DIST_ATR_MULT * prox_mult) * atr_pct,
+        EMA_SUPPORT_MAX_DIST_PCT_MIN,
+        EMA_SUPPORT_MAX_DIST_PCT_MAX,
     )
 
     ok = dist_pct <= thr_pct
     return ok, dist_pct, thr_pct, atr_pct
 
-def ema12_reaction_ok_15m(c15: List[List[float]], ema12_val: float, side: str, session_name: str) -> bool:
+def ema_support_reaction_ok_15m(c15: List[List[float]], ema_val: float, side: str, session_name: str) -> bool:
     """
-    ✅ Session-adaptive reaction lookback.
-    Reaction definition:
-    - BUY: candle touched/broke below EMA12 and closed back above EMA12
-    - SELL: candle touched/broke above EMA12 and closed back below EMA12
+    Adaptive EMA reaction:
+    - BUY: touched/broke below EMA and closed back above
+    - SELL: touched/broke above EMA and closed back below
     """
-    if not c15 or len(c15) < 8 or ema12_val <= 0:
+    if not c15 or len(c15) < 10 or ema_val <= 0:
         return False
 
     lookback_n = int(session_knobs(session_name)["ema_reaction_lookback"])
-    lookback_n = clamp(lookback_n, 4, 10)
-    lookback = c15[-int(lookback_n):]
+    lookback_n = int(clamp(lookback_n, 4, 12))
+    lookback = c15[-lookback_n:]
 
     for c in lookback:
         h = float(c[2]); l = float(c[3]); cl = float(c[4])
         if side == "BUY":
-            if (l <= ema12_val) and (cl > ema12_val):
+            if (l <= ema_val) and (cl > ema_val):
                 return True
         else:
-            if (h >= ema12_val) and (cl < ema12_val):
+            if (h >= ema_val) and (cl < ema_val):
                 return True
     return False
 
-def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float, float, float, List[List[float]]]:
+
+
+
+
+
+
+def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float, float, float, int, List[List[float]]]:
     """
-    returns: ch1, ch4, ch15, atr_1h, ema12_15m, c15
+    returns: ch1, ch4, ch15, atr_1h, ema_support_15m, ema_support_period, c15
     """
     need_1h = max(ATR_PERIOD + 6, 35)
     c1 = fetch_ohlcv(market_symbol, "1h", limit=need_1h)
     if not c1 or len(c1) < 6:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, []
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0, []
 
     closes_1h = [float(x[4]) for x in c1]
     c_last = closes_1h[-1]
@@ -1252,18 +1261,22 @@ def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float
     ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
     atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
 
-    c15 = fetch_ohlcv(market_symbol, "15m", limit=60)
-    if not c15 or len(c15) < 15:
-        return ch1, ch4, 0.0, atr_1h, 0.0, []
+    c15 = fetch_ohlcv(market_symbol, "15m", limit=80)
+    if not c15 or len(c15) < 20:
+        return ch1, ch4, 0.0, atr_1h, 0.0, 0, []
 
     closes_15 = [float(x[4]) for x in c15]
-    ema12_15m = ema(closes_15[-(EMA12_PERIOD + 20):], EMA12_PERIOD)
+    entry_proxy = float(closes_15[-1]) if closes_15 else 0.0
+    atr_pct_proxy = (atr_1h / entry_proxy) * 100.0 if (atr_1h and entry_proxy) else 2.0
+
+    ema_support_15m, ema_period = adaptive_ema_value(closes_15, atr_pct_proxy)
 
     c15_last = float(c15[-1][4])
     c15_prev = float(c15[-2][4])
     ch15 = ((c15_last - c15_prev) / c15_prev) * 100.0 if c15_prev else 0.0
 
-    return ch1, ch4, ch15, atr_1h, ema12_15m, c15
+    return ch1, ch4, ch15, atr_1h, ema_support_15m, int(ema_period), c15
+
 
 
 # =========================================================
@@ -1566,8 +1579,10 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     dn_txt = "*Directional Losers (24H ≤ -10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(dn_rows, ["SYM", "F Vol", "24H", "4H", "Last"]) if dn_rows else "_None_")
     return up_txt, dn_txt
 
+
+
+
 def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: str = "LON") -> Optional[Setup]:
-    # ✅ Melbourne blackout applies to all signal generation
     if is_blackout_melbourne_now():
         _rej("melbourne_blackout_10_12", base, mv, "No signals 10:00–12:00 Melbourne")
         return None
@@ -1583,17 +1598,16 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: 
         return None
 
     ch24 = float(mv.percentage or 0.0)
-    ch1, ch4, ch15, atr_1h, ema12_15m, c15 = metrics_from_candles_1h_15m(mv.symbol)
 
-    if (ch1 == 0.0 and ch4 == 0.0 and ch15 == 0.0 and atr_1h == 0.0) or (not c15) or (ema12_15m == 0.0):
+    ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15 = metrics_from_candles_1h_15m(mv.symbol)
+    if (ch1 == 0.0 and ch4 == 0.0 and ch15 == 0.0 and atr_1h == 0.0) or (not c15) or (ema_support_15m == 0.0):
         _rej("ohlcv_missing_or_insufficient", base, mv, "metrics/ema missing")
         return None
 
-    # ✅ ATR-adaptive 1H trigger threshold
+    # --------- SOFT 1H TRIGGER (loosened) ----------
     atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
     trig_min = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
 
-    # Trigger on 1H momentum
     if abs(ch1) < trig_min:
         _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% < {trig_min:.2f}% (ATR%={atr_pct_now:.2f})")
         return None
@@ -1602,51 +1616,79 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: 
 
     # 4H alignment
     if side == "BUY" and ch4 < ALIGN_4H_MIN:
-        _rej("4h_not_aligned_for_long", base, mv, f"side=BUY ch4={ch4:+.2f}% < {ALIGN_4H_MIN:.2f}%")
+        _rej("4h_not_aligned_for_long", base, mv, f"side=BUY ch4={ch4:+.2f}%")
         return None
     if side == "SELL" and ch4 > -ALIGN_4H_MIN:
-        _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4:+.2f}% > {-ALIGN_4H_MIN:.2f}%")
+        _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4:+.2f}%")
         return None
 
-    # ✅ EMA12 proximity mandatory (15m) — session-adaptive
-    ok_ema, dist_pct, thr_pct, atr_pct = ema12_proximity_ok(entry, ema12_15m, atr_1h, session_name)
-    if not ok_ema:
-        _rej("price_not_near_ema12_15m", base, mv, f"dist={dist_pct:.2f}% > thr={thr_pct:.2f}% ({session_name})")
+    # =========================================================
+    # ENGINE A — PULLBACK near Adaptive EMA
+    # =========================================================
+    engine_a_ok = False
+    ema_ok, dist_pct, thr_pct, atr_pct = ema_support_proximity_ok(entry, ema_support_15m, atr_1h, session_name)
+    if ENGINE_A_PULLBACK_ENABLED and ema_ok:
+        engine_a_ok = True
+
+    # =========================================================
+    # ENGINE B — MOMENTUM / EXPANSION (pumps allowed far from EMA)
+    # =========================================================
+    engine_b_ok = False
+    if ENGINE_B_MOMENTUM_ENABLED:
+        if abs(ch1) >= MOMENTUM_MIN_CH1 and abs(ch24) >= MOMENTUM_MIN_24H:
+            if fut_vol >= (MOVER_VOL_USD_MIN * MOMENTUM_VOL_MULT):
+                # expansion vs ATR%
+                body_pct = abs(ch1)
+                if atr_pct_now > 0 and body_pct >= (MOMENTUM_ATR_BODY_MULT * atr_pct_now):
+                    # allow being far from EMA up to MOMENTUM_MAX_ADAPTIVE_EMA_DIST
+                    if dist_pct <= MOMENTUM_MAX_ADAPTIVE_EMA_DIST:
+                        engine_b_ok = True
+
+    if not engine_a_ok and not engine_b_ok:
+        _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} dist={dist_pct:.2f}")
         return None
 
-    # Sharp 1H move gating: must show EMA reaction, not immediate spike-chase (session-adaptive)
-    if abs(float(ch1)) >= float(SHARP_1H_MOVE_PCT):
-        if not ema12_reaction_ok_15m(c15, ema12_15m, side, session_name):
-            _rej("sharp_1h_no_ema_reaction", base, mv, f"ch1={ch1:+.2f}% needs EMA12 reaction ({session_name})")
+    engine = "B" if engine_b_ok else "A"
+
+    # Sharp 1H move gating (only for Engine A; Engine B is pump-tolerant)
+    if engine == "A" and abs(float(ch1)) >= float(SHARP_1H_MOVE_PCT):
+        if not ema_support_reaction_ok_15m(c15, ema_support_15m, side, session_name):
+            _rej("sharp_1h_no_ema_reaction", base, mv, f"ch1={ch1:+.2f}% needs EMA reaction")
             return None
 
     # Soft 24H contradiction gate (dynamic by ATR%)
     thr = clamp(max(12.0, 2.5 * atr_pct), 12.0, 22.0)
-
     if side == "BUY" and ch24 <= -thr:
-        _rej("24h_contradiction_for_long", base, mv, f"ch24={ch24:+.1f}% <= -{thr:.1f}% (atr%={atr_pct:.2f})")
+        _rej("24h_contradiction_for_long", base, mv, f"ch24={ch24:+.1f}% <= -{thr:.1f}%")
         return None
     if side == "SELL" and ch24 >= +thr:
-        _rej("24h_contradiction_for_short", base, mv, f"ch24={ch24:+.1f}% >= +{thr:.1f}% (atr%={atr_pct:.2f})")
+        _rej("24h_contradiction_for_short", base, mv, f"ch24={ch24:+.1f}% >= +{thr:.1f}%")
         return None
 
-    # 15m confirm logic (soft confirm)
+    # 15m confirm logic (email strictness only)
     is_confirm_15m = abs(ch15) >= CONFIRM_15M_ABS_MIN
     is_early_allowed = (abs(ch1) >= EARLY_1H_ABS_MIN)
 
     if strict_15m:
         if (not is_confirm_15m) and (not is_early_allowed):
-            _rej("15m_weak_and_not_early", base, mv, f"ch15={ch15:+.2f}% < {CONFIRM_15M_ABS_MIN:.2f}% and ch1={ch1:+.2f}% < {EARLY_1H_ABS_MIN:.2f}%")
+            _rej("15m_weak_and_not_early", base, mv, f"ch15={ch15:+.2f}% ch1={ch1:+.2f}%")
             return None
 
     conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
 
+    # Early penalty only for emails
     if strict_15m and (not is_confirm_15m):
         conf = max(0, int(conf) - int(EARLY_CONF_PENALTY))
 
-    # Dynamic TP cap by coin "hotness"
+    # Dynamic TP cap by coin hotness
     tp_cap_pct = tp_cap_pct_for_coin(fut_vol, ch24)
-    sl, tp3_single, R = compute_sl_tp(entry, side, atr_1h, conf, tp_cap_pct)
+
+    # ✅ Engine B gets higher TP expectation
+    rr_bonus = ENGINE_B_RR_BONUS if engine == "B" else 0.0
+    tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine == "B" else 0.0
+
+    sl, tp3_single, R = compute_sl_tp(entry, side, atr_1h, conf, tp_cap_pct,
+                                      rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus)
     if sl <= 0 or tp3_single <= 0 or R <= 0:
         _rej("bad_sl_tp_or_atr", base, mv, f"atr={atr_1h:.6g} entry={entry:.6g}")
         return None
@@ -1654,20 +1696,20 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: 
     tp1 = tp2 = None
     tp3 = tp3_single
     if conf >= MULTI_TP_MIN_CONF:
-        _tp1, _tp2, _tp3 = multi_tp(entry, side, R, tp_cap_pct, conf)
+        _tp1, _tp2, _tp3 = multi_tp(entry, side, R, tp_cap_pct, conf,
+                                    rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus)
         if _tp1 and _tp2 and _tp3:
             tp1, tp2, tp3 = _tp1, _tp2, _tp3
 
     sid = next_setup_id()
-    ema12_dist_pct_dbg = abs(entry - ema12_15m) / entry * 100.0 if ema12_15m > 0 else 999.0
     hot = is_hot_coin(fut_vol, ch24)
 
-    s = Setup(
+    return Setup(
         setup_id=sid,
         symbol=base,
         market_symbol=mv.symbol,
         side=side,
-        conf=conf,
+        conf=int(conf),
         entry=entry,
         sl=sl,
         tp1=tp1,
@@ -1678,11 +1720,16 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: 
         ch4=ch4,
         ch1=ch1,
         ch15=ch15,
-        ema12_dist_pct=ema12_dist_pct_dbg,
-        is_trailing_tp3=bool(hot),   # informational
+        ema_support_period=int(ema_period),
+        ema_support_dist_pct=float(dist_pct),
+        engine=engine,
+        is_trailing_tp3=bool(hot),
         created_ts=time.time(),
     )
-    return s
+
+
+
+
 
 def pick_setups(best_fut: Dict[str, MarketVol], n: int, strict_15m: bool = True, session_name: str = "LON") -> List[Setup]:
     global _REJECT_STATS, _REJECT_SAMPLES
@@ -2738,13 +2785,14 @@ async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text("\n".join(msg))
 
+
+
 # =========================================================
-# TREND ENGINE (EMA7) — SAFE ADDON (NO CRASH)
+# TREND ENGINE — ADAPTIVE EMA (NO FIXED EMA7/21/50)
 # =========================================================
 
 TREND_EMA_PULLBACK_ATR = 1.2
 TREND_MAX_CONFIDENCE = 90
-
 
 def ema_series(values, period):
     if not values or len(values) < period:
@@ -2755,105 +2803,85 @@ def ema_series(values, period):
         ema_vals.append(v * k + ema_vals[-1] * (1 - k))
     return ema_vals
 
-
 def ema_slope(series, n=3):
     if len(series) < n + 1:
         return 0.0
     return series[-1] - series[-1 - n]
 
-
-def trend_dynamic_confidence(base_conf, price, ema7_last, atr_15m, ch24_pct, reclaimed):
+def trend_dynamic_confidence(base_conf, price, ema_fast_last, atr_15m, ch24_pct, reclaimed):
     score = base_conf
-
     if reclaimed:
         score += 8
 
-    dist_atr = abs(price - ema7_last) / atr_15m
+    dist_atr = abs(price - ema_fast_last) / atr_15m
     if dist_atr < 0.4:
         score += 8
     elif dist_atr < 0.8:
         score += 4
 
     score += min(10, abs(ch24_pct) / 2)
-
     return int(min(score, TREND_MAX_CONFIDENCE))
-
 
 def trend_watch_for_symbol(base, mv, session_name):
     try:
         c4h = fetch_ohlcv(mv.symbol, "4h", 60)
-        c1h = fetch_ohlcv(mv.symbol, "1h", 60)
-        c15 = fetch_ohlcv(mv.symbol, "15m", 120)
-        if not c4h or not c15:
+        c15 = fetch_ohlcv(mv.symbol, "15m", 140)
+        if not c4h or not c15 or len(c15) < 40:
             return None
 
-        closes_4h = [x[4] for x in c4h]
-        closes_15 = [x[4] for x in c15]
+        closes_4h = [float(x[4]) for x in c4h]
+        closes_15 = [float(x[4]) for x in c15]
 
         ch24 = float(mv.percentage or 0.0)
         side = "BUY" if ch24 > 0 else "SELL"
 
-        ema12_4h = ema(closes_4h[-40:], 12)
-        ema28_4h = ema(closes_4h[-40:], 28)
+        # volatility proxy for adaptive EMA
+        atr_15m = compute_atr_from_ohlcv(c15, ATR_PERIOD)
+        price = float(mv.last or closes_15[-1])
+        atr_pct = (atr_15m / price) * 100.0 if (atr_15m and price) else 2.0
 
-        if side == "BUY" and ema12_4h <= ema28_4h:
-            return None
-        if side == "SELL" and ema12_4h >= ema28_4h:
-            return None
+        # adaptive EMA periods
+        p_fast = adaptive_ema_period(atr_pct)          # 8..21
+        p_slow = int(clamp(p_fast * 2, 16, 55))        # adaptive slow
 
-        ema7 = ema_series(closes_15[-80:], 7)
-        ema21 = ema_series(closes_15[-80:], 21)
-        ema50 = ema_series(closes_15[-80:], 50)
-        if not ema7 or not ema21 or not ema50:
+        ema_fast = ema_series(closes_15[-120:], p_fast)
+        ema_slow = ema_series(closes_15[-120:], p_slow)
+        if not ema_fast or not ema_slow:
             return None
 
         if side == "BUY":
-            if not (ema7[-1] > ema21[-1] > ema50[-1]):
+            if not (ema_fast[-1] > ema_slow[-1]):
                 return None
-            if ema_slope(ema7, 3) <= 0:
+            if ema_slope(ema_fast, 3) <= 0:
                 return None
         else:
-            if not (ema7[-1] < ema21[-1] < ema50[-1]):
+            if not (ema_fast[-1] < ema_slow[-1]):
                 return None
-            if ema_slope(ema7, 3) >= 0:
+            if ema_slope(ema_fast, 3) >= 0:
                 return None
 
-        atr_15m = compute_atr_from_ohlcv(c15, ATR_PERIOD)
-        if atr_15m <= 0:
-            return None
-
-        price = float(mv.last or closes_15[-1])
-        dist_atr = abs(price - ema7[-1]) / atr_15m
+        dist_atr = abs(price - ema_fast[-1]) / atr_15m if atr_15m > 0 else 999
         if dist_atr > TREND_EMA_PULLBACK_ATR:
             return None
 
         reclaimed = False
         if side == "BUY":
-            reclaimed = closes_15[-2] < ema7[-2] and price > ema7[-1]
+            reclaimed = closes_15[-2] < ema_fast[-2] and price > ema_fast[-1]
         else:
-            reclaimed = closes_15[-2] > ema7[-2] and price < ema7[-1]
+            reclaimed = closes_15[-2] > ema_fast[-2] and price < ema_fast[-1]
 
         fut_vol = usd_notional(mv)
         base_conf = 55 + (15 if fut_vol >= MOVER_VOL_USD_MIN else 0)
 
-        conf = trend_dynamic_confidence(
-            base_conf,
-            price,
-            ema7[-1],
-            atr_15m,
-            ch24,
-            reclaimed
-        )
+        conf = trend_dynamic_confidence(base_conf, price, ema_fast[-1], atr_15m, ch24, reclaimed)
 
-        return {
-            "symbol": base,
-            "side": side,
-            "confidence": conf,
-            "ch24": ch24
-        }
+        return {"symbol": base, "side": side, "confidence": conf, "ch24": ch24}
 
     except Exception:
         return None
+
+
+
 
 
 # =========================================================
@@ -2916,15 +2944,18 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tps = f"TP {fmt_price(s.tp3)}"
                 if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
                     tps = f"TP1 {fmt_price(s.tp1)} | TP2 {fmt_price(s.tp2)} | TP3 {fmt_price(s.tp3)}"
+
                 rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
                 tp3_mode = "TRAILING (hot coin)" if s.is_trailing_tp3 else "FIXED"
+
                 setup_blocks.append(
                     f"🔥 Setup #{i} — {s.side} {s.symbol} — Conf {s.conf}/100\n"
                     f"ID: {s.setup_id}\n"
+                    f"Engine: {s.engine}\n"
                     f"Entry {fmt_price(s.entry)} | SL {fmt_price(s.sl)}\n"
                     f"{tps}\n"
                     f"RR(TP3): {rr3:.2f}\n"
-                    f"EMA12 dist (15m): {s.ema12_dist_pct:.2f}%\n"
+                    f"Adaptive EMA({s.ema_support_period}) dist (15m): {s.ema_support_dist_pct:.2f}%\n"
                     f"TP3 Mode: {tp3_mode}\n"
                     f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}\n"
                     f"Chart: {tv_chart_url(s.symbol)}"
@@ -2932,6 +2963,14 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             setups_txt = "\n\n".join(setup_blocks)
         else:
             setups_txt = "No high-quality setups right now."
+
+        # HARD RULE: don't show reject reasons to users
+        uid = update.effective_user.id
+        mode = user_diag_mode(uid)  # off for non-admin
+        diag_txt = _reject_report(mode)
+        if diag_txt:
+            setups_txt = setups_txt + "\n\n" + diag_txt
+
 
         # =========================================================
         # Reject diagnostics visibility (anti-copy)
@@ -2942,6 +2981,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if diag_txt:
             setups_txt = setups_txt + "\n\n" + diag_txt
 
+
+
+      
         # =========================================================
         # Trend Watch text block
         # =========================================================
