@@ -1214,34 +1214,27 @@ def parse_hhmm(s: str) -> Tuple[int, int]:
         raise ValueError("bad time")
     return hh, mm
 
-def current_session_utc(now_utc: Optional[datetime] = None) -> str:
+
+def current_session_utc(now_utc: datetime) -> str:
     """
-    Returns the current market session name based on UTC windows.
-    Used for /screen (no user context). If none, returns "OFF".
+    24H coverage (no gaps) in UTC:
+    - ASIA: 20:00–06:00
+    - LON : 06:00–13:00
+    - NY  : 13:00–20:00
     """
-    if now_utc is None:
-        now_utc = datetime.now(timezone.utc)
+    h = now_utc.hour
 
-    for name in SESSION_PRIORITY:
-        w = SESSIONS_UTC[name]
-        sh, sm = parse_hhmm(w["start"])
-        eh, em = parse_hhmm(w["end"])
+    # ASIA crosses midnight
+    if (h >= 20) or (h < 6):
+        return "ASIA"
+    if 6 <= h < 13:
+        return "LON"
+    if 13 <= h < 20:
+        return "NY"
 
-        start_utc = now_utc.replace(hour=sh, minute=sm, second=0, microsecond=0)
-        end_utc = now_utc.replace(hour=eh, minute=em, second=0, microsecond=0)
+    # Should never happen, but safe fallback
+    return "ASIA"
 
-        if end_utc <= start_utc:
-            end_utc += timedelta(days=1)
-
-        # handle day boundary
-        if now_utc < start_utc and (start_utc - now_utc) > timedelta(hours=12):
-            start_utc -= timedelta(days=1)
-            end_utc -= timedelta(days=1)
-
-        if start_utc <= now_utc <= end_utc:
-            return name
-
-    return "OFF"
 
 
 
