@@ -84,7 +84,21 @@ DB_PATH = os.environ.get("DB_PATH", "pulsefutures.db")
 
 CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "5"))
 
+# -------------------------
+# ✅ Admin / Visibility (anti-copy)
+# -------------------------
+# Put your Telegram user id(s) here, comma-separated (example: "123,456")
+ADMIN_USER_IDS = set(
+    int(x.strip()) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
+)
+# Public users see friendly reasons only (no thresholds/params). Admin sees technical details.
+PUBLIC_DIAGNOSTICS_MODE = os.environ.get("PUBLIC_DIAGNOSTICS_MODE", "friendly").strip().lower()
+# "friendly" (recommended) or "off" (hide reject reasons completely for non-admin)
+# Admin always sees full.
+
+# -------------------------
 # Screen output sizes
+# -------------------------
 LEADERS_N = 10
 SETUPS_N = 3
 EMAIL_SETUPS_N = 3
@@ -146,6 +160,61 @@ TP_MAX_PCT_NORMAL = 12.0
 TP_MAX_PCT_HOT = 15.0
 HOT_VOL_USD = 50_000_000
 HOT_CH24_ABS = 15.0
+
+# =========================================================
+# ✅ EMA12 (15m) proximity + sharp move gating
+# =========================================================
+EMA12_PERIOD = 12
+
+# maximum allowed distance from EMA12 (derived from ATR%), clamped
+EMA12_MAX_DIST_ATR_MULT = 0.7  # base; now session-adaptive multiplier applies
+EMA12_MAX_DIST_PCT_MIN = 0.25   # percent
+EMA12_MAX_DIST_PCT_MAX = 1.5    # percent
+
+# Sharp 1H move gating
+SHARP_1H_MOVE_PCT = 20.0
+
+# Melbourne blackout window
+BLACKOUT_TZ = "Australia/Melbourne"
+BLACKOUT_START_HH = 10
+BLACKOUT_END_HH = 12
+
+# Email
+EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465"))
+EMAIL_USER = os.environ.get("EMAIL_USER", "")
+EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
+EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)  # comma-separated ok
+
+# Render stability
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
+
+# Email footer / CTA
+TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFuturesBot").strip()
+
+# Caching for speed
+TICKERS_TTL_SEC = 45
+OHLCV_TTL_SEC = 60
+
+# =========================================================
+# DEBUG / REJECT REASONS
+# =========================================================
+DEBUG_REJECTS = os.environ.get("DEBUG_REJECTS", "false").lower() == "true"
+REJECT_TOP_N = int(os.environ.get("REJECT_TOP_N", "12"))
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("pulsefutures")
+
+STABLES = {"USDT", "USDC", "USD", "TUSD", "FDUSD", "DAI", "PYUSD"}
+
+HDR = "━━━━━━━━━━━━━━━━━━━━"
+SEP = "────────────────────"
+
+ALERT_LOCK = asyncio.Lock()
+
+
 
 # =========================================================
 # ✅ EMA12 (15m) proximity + sharp move gating
@@ -313,8 +382,51 @@ _REJECT_SAMPLES: Dict[str, List[str]] = {}
 
 # ✅ NEW: last email skip reasons (per user) for /health transparency
 _LAST_EMAIL_DECISION: Dict[int, Dict[str, Any]] = {}
-# also counts reasons within a run for each user
 _EMAIL_SKIP_COUNTERS: Dict[int, Counter] = defaultdict(Counter)
+
+# ✅ NEW: last SMTP error (per run) to debug "email didn't arrive"
+_LAST_SMTP_ERROR: Dict[int, str] = {}  # user_id -> last error text
+
+# ✅ NEW: per-user diagnostics preference (runtime)
+# - admin always "full"
+# - non-admin default based on PUBLIC_DIAGNOSTICS_MODE: "friendly" or "off"
+_USER_DIAG_MODE: Dict[int, str] = {}  # user_id -> "full" | "friendly" | "off"
+
+# -------------------------
+# Friendly reject titles (no thresholds / params)
+# -------------------------
+REJECT_FRIENDLY_FA = {
+    "melbourne_blackout_10_12": "⛔️ در بازه‌ی ۱۰ تا ۱۲ (ملبورن) سیگنال‌ها غیرفعال هستند.",
+    "no_fut_vol": "📉 حجم معاملات کافی نبود.",
+    "bad_entry": "⚠️ قیمت/داده‌ی ورود معتبر نبود.",
+    "ohlcv_missing_or_insufficient": "⚠️ داده‌ی کندلی کافی نبود (دوباره تلاش کن).",
+    "ch1_below_trigger": "🧊 مومنتوم ۱ساعته هنوز به اندازه‌ی کافی قوی نبود.",
+    "4h_not_aligned_for_long": "↔️ جهت ۴ساعته با لانگ هم‌راستا نبود.",
+    "4h_not_aligned_for_short": "↔️ جهت ۴ساعته با شورت هم‌راستا نبود.",
+    "price_not_near_ema12_15m": "📍 قیمت نزدیک EMA12 (15m) نبود (ورود مناسب نبود).",
+    "sharp_1h_no_ema_reaction": "⚡️ جهش شدید بود ولی برگشت/ری‌اکشن روی EMA دیده نشد.",
+    "24h_contradiction_for_long": "🚫 روند ۲۴ساعته با لانگ تناقض داشت.",
+    "24h_contradiction_for_short": "🚫 روند ۲۴ساعته با شورت تناقض داشت.",
+    "15m_weak_and_not_early": "🟡 تایید ۱۵دقیقه ضعیف بود و ستاپ هم «خیلی قوی» نبود.",
+}
+
+def is_admin_user(user_id: int) -> bool:
+    return int(user_id) in ADMIN_USER_IDS if ADMIN_USER_IDS else False
+
+def user_diag_mode(user_id: int) -> str:
+    """
+    Returns "full" | "friendly" | "off"
+    Admin always full.
+    """
+    uid = int(user_id)
+    if is_admin_user(uid):
+        return "full"
+    if uid in _USER_DIAG_MODE:
+        return _USER_DIAG_MODE[uid]
+    # default for non-admin
+    if PUBLIC_DIAGNOSTICS_MODE in {"off", "none"}:
+        return "off"
+    return "friendly"
 
 def fmt_price(x: float) -> str:
     ax = abs(x)
@@ -340,20 +452,41 @@ def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
             xs.append(line)
             _REJECT_SAMPLES[reason] = xs
 
-def _reject_report() -> str:
+def _reject_report(diag_mode: str = "friendly") -> str:
+    """
+    diag_mode:
+      - "full": technical keys + counts (+ samples if DEBUG_REJECTS)
+      - "friendly": Persian friendly titles + counts (no thresholds/params)
+      - "off": ""
+    """
+    if diag_mode == "off":
+        return ""
     if not _REJECT_STATS:
         return ""
+
     parts = []
-    parts.append("🧩 Reject Diagnostics (why setups were filtered)")
+    parts.append("🧩 Reject Diagnostics")
     parts.append(SEP)
+
     top = _REJECT_STATS.most_common(10)
+
     for reason, cnt in top:
-        parts.append(f"- {reason}: {cnt}")
-        if DEBUG_REJECTS and reason in _REJECT_SAMPLES and _REJECT_SAMPLES[reason]:
-            smp = _REJECT_SAMPLES[reason][:3]
-            for s in smp:
-                parts.append(f"    • {s}")
+        if diag_mode == "full":
+            parts.append(f"- {reason}: {cnt}")
+            if DEBUG_REJECTS and reason in _REJECT_SAMPLES and _REJECT_SAMPLES[reason]:
+                smp = _REJECT_SAMPLES[reason][:3]
+                for s in smp:
+                    parts.append(f"    • {s}")
+        else:
+            # friendly
+            title = REJECT_FRIENDLY_FA.get(reason, "❓ مورد فیلتر شد (جزئیات پنهان)")
+            parts.append(f"- {title}  (×{cnt})")
+
+    if diag_mode != "full":
+        parts.append("")
+        parts.append("🔒 جزئیات فنی برای محافظت از استراتژی نمایش داده نمی‌شود.")
     return "\n".join(parts).strip()
+
 
 
 # =========================================================
@@ -1443,10 +1576,16 @@ def pick_setups(best_fut: Dict[str, MarketVol], n: int, strict_15m: bool = True,
 def email_config_ok() -> bool:
     return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO])
 
-def send_email(subject: str, body: str) -> bool:
+def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None) -> bool:
+    """
+    Sends email and stores last SMTP error per user (for /health).
+    """
     if not email_config_ok():
         logger.warning("Email not configured.")
+        if user_id_for_debug is not None:
+            _LAST_SMTP_ERROR[int(user_id_for_debug)] = "Email not configured (missing env vars)."
         return False
+
     try:
         msg = EmailMessage()
         msg["Subject"] = subject
@@ -1456,19 +1595,55 @@ def send_email(subject: str, body: str) -> bool:
 
         if EMAIL_PORT == 465:
             ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT, context=ctx) as s:
+            with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT, context=ctx, timeout=30) as s:
                 s.login(EMAIL_USER, EMAIL_PASS)
                 s.send_message(msg)
         else:
-            with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as s:
+            with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT, timeout=30) as s:
+                s.ehlo()
                 s.starttls()
+                s.ehlo()
                 s.login(EMAIL_USER, EMAIL_PASS)
                 s.send_message(msg)
 
+        if user_id_for_debug is not None:
+            _LAST_SMTP_ERROR.pop(int(user_id_for_debug), None)
         return True
+
     except Exception as e:
         logger.exception("send_email failed: %s", e)
+        if user_id_for_debug is not None:
+            _LAST_SMTP_ERROR[int(user_id_for_debug)] = f"{type(e).__name__}: {str(e)}"
         return False
+
+async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /email_test
+    Sends a test email NOW (admin only).
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ این دستور فقط برای Admin فعال است.")
+        return
+
+    if not EMAIL_ENABLED:
+        await update.message.reply_text("⚠️ EMAIL_ENABLED=false است. اول فعالش کن.")
+        return
+
+    if not email_config_ok():
+        await update.message.reply_text("⚠️ Email ENV ناقص است. EMAIL_HOST/PORT/USER/PASS/FROM/TO را چک کن.")
+        return
+
+    now = datetime.now(ZoneInfo("Australia/Melbourne"))
+    subject = f"PulseFutures • EMAIL TEST • {now.strftime('%Y-%m-%d %H:%M')}"
+    body = "This is a test email from PulseFutures.\n\nIf you received this, SMTP is OK."
+
+    ok = await asyncio.to_thread(send_email, subject, body, uid)
+    if ok:
+        await update.message.reply_text("✅ Test email sent. Inbox/Spam را چک کن.")
+    else:
+        err = _LAST_SMTP_ERROR.get(uid, "unknown")
+        await update.message.reply_text(f"❌ Test email failed.\nError: {err}")
 
 
 # =========================================================
@@ -1702,20 +1877,22 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
+
     sess_now = in_session_now(user)
     sess_name = sess_now["name"] if sess_now else current_session_utc()
     knobs = session_knobs(sess_name)
 
     last_dec = _LAST_EMAIL_DECISION.get(uid, {})
+    diag_mode = user_diag_mode(uid)
+
     last_lines = []
     if last_dec:
         last_lines.append(f"Last email decision: {last_dec.get('status','-')}")
         if last_dec.get("status") == "SKIP":
-            # show top reasons
             reasons = last_dec.get("reasons", [])
             if reasons:
                 last_lines.append("Top skip reasons:")
-                for r in reasons[:5]:
+                for r in reasons[:6]:
                     last_lines.append(f"- {r}")
         if last_dec.get("when"):
             last_lines.append(f"When: {last_dec.get('when')}")
@@ -1727,11 +1904,14 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rr_floor = SESSION_MIN_RR_TP3.get(knobs["name"], 2.0)
     conf_floor = SESSION_MIN_CONF.get(knobs["name"], 78)
 
+    smtp_err = _LAST_SMTP_ERROR.get(uid, "")
+
     msg = [
         "🫀 PulseFutures Health Check",
         HDR,
         f"User TZ: {user['tz']}",
         f"Session (user-enabled): {sess_name}",
+        f"Diagnostics mode: {('FULL' if is_admin_user(uid) else diag_mode)}",
         "",
         "Layer / Status",
         SEP,
@@ -1741,11 +1921,11 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Confidence floors: ✅ Session-based (min={conf_floor})",
         f"RR floors: ✅ Session-based (minRR={rr_floor:.2f})",
         f"TP scaling: ✅ Confidence-weighted",
-        f"No-signal explanation: ✅ Professional",
         "",
         f"Email Engine: {'ACTIVE' if EMAIL_ENABLED and email_config_ok() else 'OFF/NOT CONFIGURED'}",
+        f"SMTP last error: {smtp_err if smtp_err else '-'}",
         f"Scanner cache: tickers_ttl={TICKERS_TTL_SEC}s ohlcv_ttl={OHLCV_TTL_SEC}s",
-        f"Reject Diagnostics: {'ENABLED' if True else 'OFF'} | Samples: {'ON' if DEBUG_REJECTS else 'OFF'}",
+        f"Reject Diagnostics: {'ON' if diag_mode != 'off' or is_admin_user(uid) else 'OFF'} | Samples: {'ON' if DEBUG_REJECTS else 'OFF'}",
         HDR,
     ]
     if last_lines:
@@ -1755,6 +1935,36 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg.append(HDR)
 
     await update.message.reply_text("\n".join(msg).strip())
+
+
+async def diag_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /diag_on [friendly|off]
+    Non-admin can only choose friendly/off. Admin always full.
+    """
+    uid = update.effective_user.id
+    if is_admin_user(uid):
+        _USER_DIAG_MODE[uid] = "full"
+        await update.message.reply_text("✅ Diagnostics: FULL (admin).")
+        return
+
+    mode = (context.args[0].strip().lower() if context.args else "friendly")
+    if mode not in {"friendly", "off"}:
+        await update.message.reply_text("Usage: /diag_on friendly  OR  /diag_on off")
+        return
+    _USER_DIAG_MODE[uid] = mode
+    await update.message.reply_text(f"✅ Diagnostics set to: {mode}")
+
+async def diag_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /diag_off  -> hides diagnostics for this user (non-admin).
+    """
+    uid = update.effective_user.id
+    if is_admin_user(uid):
+        await update.message.reply_text("✅ Admin diagnostics همیشه FULL است.")
+        return
+    _USER_DIAG_MODE[uid] = "off"
+    await update.message.reply_text("✅ Diagnostics: OFF")
 
 async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -2516,6 +2726,7 @@ def trend_watch_for_symbol(base, mv, session_name):
 # =========================================================
 # /screen
 # =========================================================
+
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("⏳ Scanning market…")
@@ -2582,7 +2793,12 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             setups_txt = "No high-quality setups right now."
 
-        diag_txt = _reject_report()
+        # =========================================================
+        # Reject diagnostics visibility (anti-copy)
+        # =========================================================
+        uid = update.effective_user.id
+        mode = "full" if is_admin_user(uid) else user_diag_mode(uid)
+        diag_txt = _reject_report(mode)
         if diag_txt:
             setups_txt = setups_txt + "\n\n" + diag_txt
 
@@ -2727,7 +2943,9 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     if ALERT_LOCK.locked():
         return
     async with ALERT_LOCK:
+        # Store decisions per user for /health transparency
         if not EMAIL_ENABLED:
+            # no users loop; but keep bot quiet
             return
         if not email_config_ok():
             return
@@ -2762,8 +2980,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             uid = int(user["user_id"])
             tz = ZoneInfo(user["tz"])
 
-            # Track reasons for /health transparency
-            # (we’ll overwrite per decision)
+            # session gate
             sess = in_session_now(user)
             if not sess:
                 _LAST_EMAIL_DECISION[uid] = {
@@ -2783,7 +3000,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             st = email_state_get(uid)
-
             if st["session_key"] != sess["session_key"]:
                 email_state_set(uid, session_key=sess["session_key"], sent_count=0, last_email_ts=0.0)
                 st = email_state_get(uid)
@@ -2876,8 +3092,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 filtered.extend(early[:min(need, EARLY_EMAIL_MAX_FILL)])
 
             if not filtered:
-                # show top skip reasons (best effort)
-                top_reasons = [f"{k}: {v}" for k, v in skip_reasons_counter.most_common(5)]
+                top_reasons = [f"{k}: {v}" for k, v in skip_reasons_counter.most_common(6)]
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
                     "reasons": ["no_setups_after_filters"] + (top_reasons if top_reasons else []),
@@ -2889,7 +3104,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             body = _email_body_pretty(sess["name"], now_local, user["tz"], filtered, best_fut)
             subject = f"PulseFutures • {sess['name']} • Premium Setups ({int(st['sent_count'])+1})"
 
-            ok = await asyncio.to_thread(send_email, subject, body)
+            ok = await asyncio.to_thread(send_email, subject, body, uid)
             if ok:
                 email_state_set(uid, sent_count=int(st["sent_count"]) + 1, last_email_ts=now_ts)
                 _email_daily_inc(uid, day_local, 1)
@@ -2902,9 +3117,10 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
             else:
+                err = _LAST_SMTP_ERROR.get(uid, "unknown")
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
-                    "reasons": ["send_email_failed (smtp/config)"],
+                    "reasons": [f"send_email_failed ({err})"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
 
@@ -2980,6 +3196,7 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # MAIN (Polling or Webhook)
 # =========================================================
+
 def main():
     if not TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN missing")
@@ -3019,10 +3236,18 @@ def main():
     app.add_handler(CommandHandler("signals_daily", signals_daily_cmd))
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd))
 
-    # ✅ Health command
+    # ✅ Health command (user-friendly)
     app.add_handler(CommandHandler("health", health_cmd))
 
+    # ✅ System health command (technical)
     app.add_handler(CommandHandler("health_sys", health_sys_cmd))
+
+    # ✅ Diagnostics visibility controls (anti-copy)
+    app.add_handler(CommandHandler("diag_on", diag_on_cmd))
+    app.add_handler(CommandHandler("diag_off", diag_off_cmd))
+
+    # ✅ Admin SMTP test
+    app.add_handler(CommandHandler("email_test", email_test_cmd))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
@@ -3049,9 +3274,3 @@ def main():
     else:
         logger.info("Starting POLLING mode (ensure ONLY ONE instance running).")
         app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    main()
-
-
