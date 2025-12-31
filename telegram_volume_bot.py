@@ -267,6 +267,7 @@ def session_knobs(session_name: str) -> dict:
         "min_rr_tp3": float(SESSION_MIN_RR_TP3.get(s, 2.0)),
     }
 
+
 def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
     """
     Loosened trigger:
@@ -1247,18 +1248,6 @@ def current_session_utc(now_utc: Optional[datetime] = None) -> str:
 
     return "OFF"
 
-def session_knobs(session_name: str) -> dict:
-    s = (session_name or "LON").upper()
-    if s not in SESSIONS_UTC:
-        s = "LON"
-    return {
-        "name": s,
-        "ema_prox_mult": float(SESSION_EMA12_PROX_MULT.get(s, 1.0)),
-        "ema_reaction_lookback": int(SESSION_EMA12_REACTION_LOOKBACK.get(s, 6)),
-        "trigger_atr_mult": float(SESSION_TRIGGER_ATR_MULT.get(s, 1.0)),
-        "min_conf": int(SESSION_MIN_CONF.get(s, 78)),
-        "min_rr_tp3": float(SESSION_MIN_RR_TP3.get(s, 2.0)),
-    }
 
 def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
     """
