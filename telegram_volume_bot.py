@@ -1,48 +1,6 @@
 #!/usr/bin/env python3
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
-
-✅ Baseline (30 Dec 2025 – Version 1) + your requested upgrades added WITHOUT removing anything:
-
-Added (Requested):
-- Layer + Status (transparent health)
-- ✅ EMA12 proximity: Session-adaptive
-- ✅ EMA12 reaction: Session-adaptive
-- ✅ 1H trigger: ATR-adaptive
-- ✅ Confidence floors: Session-based (already existed, now surfaced + enforced consistently)
-- ✅ RR floors: Session-based (new)
-- ✅ TP scaling: Confidence-weighted (new)
-- ✅ No-signal explanation: Professional (new; /screen via Reject Diagnostics + /health last email skip reasons)
-- ✅ Health command: Transparent (/health)
-
-IMPORTANT (Render):
-- If you see: "Conflict: terminated by other getUpdates request"
-  it means multiple instances are polling. Use WEBHOOK mode or ensure only 1 instance.
-
-ENV:
-- TELEGRAM_TOKEN (required)
-
-Email ENV (required to actually send):
-- EMAIL_ENABLED=true
-- EMAIL_HOST (e.g., smtp.gmail.com)
-- EMAIL_PORT (465 or 587)
-- EMAIL_USER
-- EMAIL_PASS (app password)
-- EMAIL_FROM
-- EMAIL_TO (can be same as EMAIL_USER or comma separated list)
-
-Optional:
-- CHECK_INTERVAL_MIN=5
-- DB_PATH=pulsefutures.db
-- WEBHOOK_URL=https://your-service.onrender.com   (recommended on Render)
-- PORT=10000 (Render sets it)
-
-Reject diagnostics optional:
-- DEBUG_REJECTS=true
-- REJECT_TOP_N=12
-
-Optional (email footer link):
-- TELEGRAM_BOT_URL=https://t.me/PulseFuturesBot
 """
 
 import asyncio
