@@ -160,6 +160,22 @@ BLACKOUT_TZ = "Australia/Melbourne"
 BLACKOUT_START_HH = 10
 BLACKOUT_END_HH = 12
 
+
+def is_blackout_melbourne_now() -> bool:
+    """
+    Returns True if current Melbourne local time is inside the blackout window.
+    Blackout window is [BLACKOUT_START_HH, BLACKOUT_END_HH).
+    """
+    try:
+        tz = ZoneInfo(BLACKOUT_TZ)
+        now = datetime.now(tz)
+        return BLACKOUT_START_HH <= now.hour < BLACKOUT_END_HH
+    except Exception:
+        # Fail-safe: if timezone fails, do NOT block signals
+        return False
+
+
+
 # Email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
