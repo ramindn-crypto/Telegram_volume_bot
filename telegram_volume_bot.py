@@ -408,6 +408,94 @@ def cache_valid(key: str, ttl: int) -> bool:
     ts, _ = v
     return (time.time() - ts) <= ttl
 
+# =========================================================
+# MATH / INDICATORS HELPERS (MISSING FIX)
+# =========================================================
+def clamp(x: float, lo: float, hi: float) -> float:
+    try:
+        x = float(x)
+    except Exception:
+        return lo
+    return max(lo, min(hi, x))
+
+
+def ema(values: List[float], period: int) -> float:
+    """
+    Returns the LAST EMA value (not full series).
+    Safe for short lists.
+    """
+    if not values or period <= 0:
+        return 0.0
+    if len(values) < 2:
+        return float(values[-1])
+
+    k = 2.0 / (period + 1.0)
+    e = float(values[0])
+    for v in values[1:]:
+        e = (float(v) * k) + (e * (1.0 - k))
+    return float(e)
+
+
+def compute_atr_from_ohlcv(ohlcv: List[List[float]], period: int = 14) -> float:
+    """
+    ATR (Wilder's smoothing) from OHLCV.
+    ohlcv rows: [ts, open, high, low, close, vol]
+    Returns last ATR value.
+    """
+    if not ohlcv or period <= 0:
+        return 0.0
+
+    # need at least period+1 candles for a stable ATR
+    if len(ohlcv) < period + 1:
+        return 0.0
+
+    highs = []
+    lows = []
+    closes = []
+    for c in ohlcv:
+        try:
+            highs.append(float(c[2]))
+            lows.append(float(c[3]))
+            closes.append(float(c[4]))
+        except Exception:
+            return 0.0
+
+    trs: List[float] = []
+    for i in range(1, len(ohlcv)):
+        h = highs[i]
+        l = lows[i]
+        pc = closes[i - 1]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(float(tr))
+
+    if len(trs) < period:
+        return 0.0
+
+    # Wilder: first ATR = SMA(TR, period), then recursive smoothing
+    atr = sum(trs[:period]) / float(period)
+    for tr in trs[period:]:
+        atr = ((atr * (period - 1)) + tr) / float(period)
+
+    return float(atr)
+
+
+def is_hot_coin(fut_vol_usd: float, ch24: float) -> bool:
+    """
+    Hot coin definition for TP cap logic.
+    """
+    try:
+        return (float(fut_vol_usd) >= float(HOT_VOL_USD)) or (abs(float(ch24)) >= float(HOT_CH24_ABS))
+    except Exception:
+        return False
+
+
+def tp_cap_pct_for_coin(fut_vol_usd: float, ch24: float) -> float:
+    """
+    Dynamic TP3 cap % based on coin hotness.
+    """
+    return float(TP_MAX_PCT_HOT) if is_hot_coin(fut_vol_usd, ch24) else float(TP_MAX_PCT_NORMAL)
+
+
 
 # =========================================================
 # REJECT TRACKER (in-memory per run)
