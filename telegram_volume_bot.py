@@ -395,19 +395,19 @@ _USER_DIAG_MODE: Dict[int, str] = {}  # user_id -> "full" | "friendly" | "off"
 # -------------------------
 # Friendly reject titles (no thresholds / params)
 # -------------------------
-REJECT_FRIENDLY_FA = {
-    "melbourne_blackout_10_12": "⛔️ در بازه‌ی ۱۰ تا ۱۲ (ملبورن) سیگنال‌ها غیرفعال هستند.",
-    "no_fut_vol": "📉 حجم معاملات کافی نبود.",
-    "bad_entry": "⚠️ قیمت/داده‌ی ورود معتبر نبود.",
-    "ohlcv_missing_or_insufficient": "⚠️ داده‌ی کندلی کافی نبود (دوباره تلاش کن).",
-    "ch1_below_trigger": "🧊 مومنتوم ۱ساعته هنوز به اندازه‌ی کافی قوی نبود.",
-    "4h_not_aligned_for_long": "↔️ جهت ۴ساعته با لانگ هم‌راستا نبود.",
-    "4h_not_aligned_for_short": "↔️ جهت ۴ساعته با شورت هم‌راستا نبود.",
-    "price_not_near_ema12_15m": "📍 قیمت نزدیک EMA12 (15m) نبود (ورود مناسب نبود).",
-    "sharp_1h_no_ema_reaction": "⚡️ جهش شدید بود ولی برگشت/ری‌اکشن روی EMA دیده نشد.",
-    "24h_contradiction_for_long": "🚫 روند ۲۴ساعته با لانگ تناقض داشت.",
-    "24h_contradiction_for_short": "🚫 روند ۲۴ساعته با شورت تناقض داشت.",
-    "15m_weak_and_not_early": "🟡 تایید ۱۵دقیقه ضعیف بود و ستاپ هم «خیلی قوی» نبود.",
+REJECT_FRIENDLY_EN = {
+    "melbourne_blackout_10_12": "⛔️ Signals are disabled between 10:00–12:00 (Melbourne time).",
+    "no_fut_vol": "📉 Insufficient futures trading volume.",
+    "bad_entry": "⚠️ Invalid or unreliable entry price data.",
+    "ohlcv_missing_or_insufficient": "⚠️ Not enough candle data available (try again later).",
+    "ch1_below_trigger": "🧊 1H momentum is not strong enough yet.",
+    "4h_not_aligned_for_long": "↔️ 4H trend is not aligned with LONG direction.",
+    "4h_not_aligned_for_short": "↔️ 4H trend is not aligned with SHORT direction.",
+    "price_not_near_ema12_15m": "📍 Price is not close enough to EMA12 (15m) for a quality entry.",
+    "sharp_1h_no_ema_reaction": "⚡️ Strong 1H move detected, but no EMA reaction confirmation.",
+    "24h_contradiction_for_long": "🚫 24H trend contradicts LONG bias.",
+    "24h_contradiction_for_short": "🚫 24H trend contradicts SHORT bias.",
+    "15m_weak_and_not_early": "🟡 15m confirmation is weak and the setup is not strong enough to qualify as early.",
 }
 
 def is_admin_user(user_id: int) -> bool:
@@ -479,12 +479,12 @@ def _reject_report(diag_mode: str = "friendly") -> str:
                     parts.append(f"    • {s}")
         else:
             # friendly
-            title = REJECT_FRIENDLY_FA.get(reason, "❓ مورد فیلتر شد (جزئیات پنهان)")
+            title = REJECT_FRIENDLY_EN.get(reason, "❓ Filtered by strategy rules (details hidden)")
             parts.append(f"- {title}  (×{cnt})")
 
     if diag_mode != "full":
         parts.append("")
-        parts.append("🔒 جزئیات فنی برای محافظت از استراتژی نمایش داده نمی‌شود.")
+        parts.append("🔒 Technical details are hidden to protect the strategy.")
     return "\n".join(parts).strip()
 
 
@@ -1749,16 +1749,17 @@ def _stats_from_trades(trades: List[dict]) -> dict:
 def _advice(user: dict, stats: dict) -> List[str]:
     adv = []
     if stats["closed_n"] < 5:
-        adv.append("📌 Data کم است: حداقل 5–10 ترید ببند تا آمار معنی‌دار شود.")
+        adv.append("📌 Not enough data yet: close at least 5–10 trades for meaningful statistics.")
     if stats["win_rate"] < 45 and stats["closed_n"] >= 5:
-        adv.append("⚠️ وین‌ریت پایین است: تعداد ستاپ‌ها را کمتر کن و فقط Conf بالا را ترید کن.")
+        adv.append("⚠️ Low win rate detected: reduce trade frequency and only take high-confidence setups.")
     if stats["avg_r"] is not None and stats["avg_r"] < 0.2 and stats["closed_n"] >= 5:
-        adv.append("⚠️ R پایین است: یا استاپ خیلی نزدیک است یا تی‌پی‌ها زود بسته می‌شوند.")
+        adv.append("⚠️ Low R-multiple: stop-loss may be too tight or profits are taken too early.")
     if stats["biggest_loss"] < -0.9 * max(1.0, float(user["equity"]) * 0.01):
-        adv.append("🛑 یک باخت بزرگ داری: روی اجرای حد ضرر و اسلیپیج/ری‌انتر کنترل بگذار.")
+        adv.append("🛑 A large loss detected: review stop-loss execution and slippage/re-entry discipline.")
     if int(user["max_trades_day"]) <= 5:
-        adv.append("✅ محدودیت ترید روزانه کمک می‌کند overtrade نکنی. فقط بهترین‌ها را بگیر.")
+        adv.append("✅ Daily trade limits help prevent overtrading. Focus only on top-quality setups.")
     return adv[:6]
+
 
 
 # =========================================================
@@ -2373,12 +2374,14 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     warn_daily = ""
     if cap > 0 and float(risk_usd) > max(0.0, remaining_before) + 1e-9:
         warn_daily = (
-            f"⚠️ Daily Risk Warning: این پوزیشن (${risk_usd:.2f}) از ریسک باقیمانده امروز (${max(0.0, remaining_before):.2f}) بیشتره.\n"
+            f"⚠️ Daily Risk Warning: "
+            f"This position (${risk_usd:.2f}) exceeds today's remaining risk "
+            f"(${max(0.0, remaining_before):.2f}).\n"
         )
 
     warn_trade_vs_cap = ""
     if cap > 0 and float(risk_usd) > float(cap) + 1e-9:
-        warn_trade_vs_cap = f"⚠️ Note: Risk این ترید (${risk_usd:.2f}) از کل Daily Cap (${cap:.2f}) بیشتره.\n"
+        warn_trade_vs_cap = f"⚠️ Note: This trade risk (${risk_usd:.2f}) exceeds the total Daily Risk Cap (${cap:.2f}).\n"
 
     tid = db_trade_open(uid, sym, side, entry, sl, risk_usd, qty, note=note, signal_id=signal_id)
     _risk_daily_inc(uid, day_local, float(risk_usd))
