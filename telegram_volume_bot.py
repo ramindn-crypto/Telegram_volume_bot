@@ -501,9 +501,14 @@ def adaptive_ema_value(closes: List[float], atr_pct: float) -> Tuple[float, int]
 
 
 
+
 # =========================================================
-# REJECT TRACKER (in-memory per run)
+# REJECT TRACKER (in-memory per run) — COMPLETE
 # =========================================================
+from collections import Counter, defaultdict
+from typing import Any, Dict, List, Optional
+
+# Track counts + (optional) sample lines per reject reason
 _REJECT_STATS = Counter()
 _REJECT_SAMPLES: Dict[str, List[str]] = {}
 
@@ -519,30 +524,55 @@ _LAST_SMTP_ERROR: Dict[int, str] = {}  # user_id -> last error text
 # - non-admin default based on PUBLIC_DIAGNOSTICS_MODE: "friendly" or "off"
 _USER_DIAG_MODE: Dict[int, str] = {}  # user_id -> "full" | "friendly" | "off"
 
+
 # -------------------------
-# Friendly reject titles (no thresholds / params)
+# Friendly reject titles (NO thresholds / params shown)
+# IMPORTANT: keep this map COMPLETE for all _rej() keys used in make_setup/pick_setups
 # -------------------------
 REJECT_FRIENDLY_EN = {
+    # global / admin gating
     "melbourne_blackout_10_12": "⛔️ Signals are disabled between 10:00–12:00 (Melbourne time).",
+
+    # data / market availability
     "no_fut_vol": "📉 Insufficient futures trading volume.",
     "bad_entry": "⚠️ Invalid or unreliable entry price data.",
     "ohlcv_missing_or_insufficient": "⚠️ Not enough candle data available (try again later).",
+
+    # primary gates
     "ch1_below_trigger": "🧊 1H momentum is not strong enough yet.",
     "4h_not_aligned_for_long": "↔️ 4H trend is not aligned with LONG direction.",
     "4h_not_aligned_for_short": "↔️ 4H trend is not aligned with SHORT direction.",
-    "price_not_near_ema12_15m": "📍 Price is not close enough to EMA12 (15m) for a quality entry.",
+
+    # adaptive EMA / engines
+    "price_not_near_ema12_15m": "📍 Price is not close enough to Adaptive EMA (15m) for a quality entry.",
+    "no_engine_passed": "🧩 Setup did not pass Engine A (pullback) or Engine B (momentum) rules.",
     "sharp_1h_no_ema_reaction": "⚡️ Strong 1H move detected, but no EMA reaction confirmation.",
+
+    "no_engine_passed": "🚫 Setup failed both engines (pullback + momentum filters).",
+    "bad_sl_tp_or_atr": "⚠️ Could not compute SL/TP reliably (ATR/price issue).",
+
+    # direction / bias filters
     "24h_contradiction_for_long": "🚫 24H trend contradicts LONG bias.",
     "24h_contradiction_for_short": "🚫 24H trend contradicts SHORT bias.",
+
+    # micro confirmation (email strictness)
     "15m_weak_and_not_early": "🟡 15m confirmation is weak and the setup is not strong enough to qualify as early.",
+
+    # SL/TP validity
+    "bad_sl_tp_or_atr": "⚠️ Could not compute SL/TP reliably (ATR/price issue).",
+
+    # fallback / unknown
+    "unknown": "❓ Filtered by strategy rules (details hidden).",
 }
+
 
 def is_admin_user(user_id: int) -> bool:
     return int(user_id) in ADMIN_USER_IDS if ADMIN_USER_IDS else False
 
+
 def user_diag_mode(user_id: int) -> str:
     """
-    Returns "full" | "friendly" | "off"
+    Returns: "full" | "friendly" | "off"
     Admin always full.
     """
     uid = int(user_id)
@@ -550,13 +580,13 @@ def user_diag_mode(user_id: int) -> str:
         return "full"
     if uid in _USER_DIAG_MODE:
         return _USER_DIAG_MODE[uid]
-    # default for non-admin
     if PUBLIC_DIAGNOSTICS_MODE in {"off", "none"}:
         return "off"
     return "friendly"
 
+
 def fmt_price(x: float) -> str:
-    ax = abs(x)
+    ax = abs(float(x))
     if ax >= 100:
         return f"{x:.2f}"
     if ax >= 1:
@@ -565,25 +595,49 @@ def fmt_price(x: float) -> str:
         return f"{x:.5f}"
     return f"{x:.6f}"
 
-def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
+
+def reset_reject_tracker() -> None:
+    """Call at the start of each scan so stats are per /screen run."""
     global _REJECT_STATS, _REJECT_SAMPLES
+    _REJECT_STATS = Counter()
+    _REJECT_SAMPLES = {}
+
+
+def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
+    """
+    Records reject stats + optional samples for DEBUG_REJECTS.
+
+    - reason: stable key (do not put dynamic numbers in the key)
+    - extra: can include numbers/thresholds (admin-only, stored only if DEBUG_REJECTS)
+    """
+    global _REJECT_STATS, _REJECT_SAMPLES
+    reason = (reason or "unknown").strip()
     _REJECT_STATS[reason] += 1
-    if DEBUG_REJECTS:
-        try:
-            last = fmt_price(float(mv.last or 0.0))
-        except Exception:
-            last = str(mv.last)
-        line = f"{base} | {mv.symbol} | last={last} | {extra}".strip()
-        xs = _REJECT_SAMPLES.get(reason, [])
-        if len(xs) < REJECT_TOP_N:
-            xs.append(line)
-            _REJECT_SAMPLES[reason] = xs
+
+    if not DEBUG_REJECTS:
+        return
+
+    try:
+        last = fmt_price(float(getattr(mv, "last", 0.0) or 0.0))
+    except Exception:
+        last = str(getattr(mv, "last", "-"))
+
+    sym = getattr(mv, "symbol", "") or ""
+    line = f"{base} | {sym} | last={last}"
+    if extra:
+        line = f"{line} | {extra}"
+
+    xs = _REJECT_SAMPLES.get(reason, [])
+    if len(xs) < REJECT_TOP_N:
+        xs.append(line)
+        _REJECT_SAMPLES[reason] = xs
+
 
 def _reject_report(diag_mode: str = "friendly") -> str:
     """
     diag_mode:
-      - "full": technical keys + counts (+ samples if DEBUG_REJECTS)
-      - "friendly": Persian friendly titles + counts (no thresholds/params)
+      - "full": show ALL technical keys + counts (+ samples if DEBUG_REJECTS)
+      - "friendly": friendly titles + counts (no thresholds/params) [top 10 only]
       - "off": ""
     """
     if diag_mode == "off":
@@ -595,24 +649,81 @@ def _reject_report(diag_mode: str = "friendly") -> str:
     parts.append("🧩 Reject Diagnostics")
     parts.append(SEP)
 
-    top = _REJECT_STATS.most_common(10)
+    # ✅ admin/full sees everything (complete per run)
+    if diag_mode == "full":
+        items = _REJECT_STATS.most_common()  # ALL
+    else:
+        items = _REJECT_STATS.most_common(10)  # friendly: top 10
 
-    for reason, cnt in top:
+    for reason, cnt in items:
         if diag_mode == "full":
             parts.append(f"- {reason}: {cnt}")
             if DEBUG_REJECTS and reason in _REJECT_SAMPLES and _REJECT_SAMPLES[reason]:
-                smp = _REJECT_SAMPLES[reason][:3]
-                for s in smp:
+                for s in _REJECT_SAMPLES[reason][:3]:
                     parts.append(f"    • {s}")
         else:
-            # friendly
             title = REJECT_FRIENDLY_EN.get(reason, "❓ Filtered by strategy rules (details hidden)")
             parts.append(f"- {title}  (×{cnt})")
 
     if diag_mode != "full":
         parts.append("")
         parts.append("🔒 Technical details are hidden to protect the strategy.")
+
     return "\n".join(parts).strip()
+
+    """
+    Builds the reject diagnostics block.
+
+    diag_mode:
+      - "full":   shows reason keys + counts (+ samples if DEBUG_REJECTS)
+      - "friendly": shows friendly labels + counts (NO params/thresholds)
+      - "off":    returns ""
+
+    top_n:
+      how many reasons to list (sorted by count desc)
+
+    show_samples_n:
+      samples per reason in FULL mode (only when DEBUG_REJECTS=true)
+    """
+    diag_mode = (diag_mode or "friendly").strip().lower()
+    if diag_mode == "off":
+        return ""
+    if not _REJECT_STATS:
+        return ""
+
+    # sort by count, show top_n
+    most = _REJECT_STATS.most_common(int(max(1, top_n)))
+    total_rejects = sum(_REJECT_STATS.values())
+
+    parts: List[str] = []
+    parts.append("🧩 Reject Diagnostics")
+    parts.append(SEP)
+    parts.append(f"Total rejects tracked: {total_rejects}")
+    parts.append("")
+
+    for reason, cnt in most:
+        if diag_mode == "full":
+            parts.append(f"- {reason}: {cnt}")
+            if DEBUG_REJECTS:
+                smp = (_REJECT_SAMPLES.get(reason) or [])[:max(0, int(show_samples_n))]
+                for s in smp:
+                    parts.append(f"    • {s}")
+        else:
+            title = REJECT_FRIENDLY_EN.get(reason, REJECT_FRIENDLY_EN.get("unknown"))
+            parts.append(f"- {title}  (×{cnt})")
+
+    # If there are more reasons beyond top_n, show remainder count
+    if len(_REJECT_STATS) > len(most):
+        shown = sum(c for _, c in most)
+        parts.append("")
+        parts.append(f"… plus {total_rejects - shown} rejects across other filters.")
+
+    if diag_mode != "full":
+        parts.append("")
+        parts.append("🔒 Technical details are hidden to protect the strategy.")
+
+    return "\n".join(parts).strip()
+
 
 
 
