@@ -3194,8 +3194,15 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# MAIN (Polling or Webhook)
+# MAIN (Background Worker = POLLING)
 # =========================================================
+
+async def _post_init(app: Application):
+    # اگر قبلاً webhook ست شده بوده، پاکش کن تا polling گیر نکنه
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning("delete_webhook failed (ignored): %s", e)
 
 def main():
     if not TOKEN:
@@ -3203,7 +3210,7 @@ def main():
 
     db_init()
 
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(_post_init).build()
 
     # ================= Handlers =================
     app.add_handler(CommandHandler(["help", "start"], cmd_help))
@@ -3252,23 +3259,9 @@ def main():
     else:
         logger.error("JobQueue NOT available – install python-telegram-bot[job-queue]")
 
-    # ================= WEBHOOK ONLY (Render safe) =================
-    port = int(os.environ.get("PORT", "10000"))
-    webhook_url = os.environ.get("WEBHOOK_URL")
+    logger.info("Starting Telegram bot in POLLING mode (Background Worker) ...")
+    app.run_polling(drop_pending_updates=True)
 
-    if not webhook_url or not webhook_url.startswith("https://"):
-        raise RuntimeError("WEBHOOK_URL must be set and start with https://")
-
-    path = f"/telegram/{TOKEN[:16]}"
-    full_webhook = webhook_url.rstrip("/") + path
-
-    logger.info("Starting Telegram webhook at %s", full_webhook)
-
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=path.lstrip("/"),
-        webhook_url=full_webhook,
-        drop_pending_updates=True,
-    )
+if __name__ == "__main__":
+    main()
 
