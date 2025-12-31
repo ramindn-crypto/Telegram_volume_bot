@@ -155,24 +155,6 @@ EMA_SUPPORT_MAX_DIST_PCT_MAX = 1.8
 # Sharp 1H move gating
 SHARP_1H_MOVE_PCT = 20.0
 
-# Melbourne blackout window
-BLACKOUT_TZ = "Australia/Melbourne"
-BLACKOUT_START_HH = 10
-BLACKOUT_END_HH = 12
-
-
-def is_blackout_melbourne_now() -> bool:
-    """
-    Returns True if current Melbourne local time is inside the blackout window.
-    Blackout window is [BLACKOUT_START_HH, BLACKOUT_END_HH).
-    """
-    try:
-        tz = ZoneInfo(BLACKOUT_TZ)
-        now = datetime.now(tz)
-        return BLACKOUT_START_HH <= now.hour < BLACKOUT_END_HH
-    except Exception:
-        # Fail-safe: if timezone fails, do NOT block signals
-        return False
 
 
 
@@ -1690,9 +1672,6 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
 
 
 def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: str = "LON") -> Optional[Setup]:
-    if is_blackout_melbourne_now():
-        _rej("melbourne_blackout_10_12", base, mv, "No signals 10:00–12:00 Melbourne")
-        return None
 
     fut_vol = usd_notional(mv)
     if fut_vol <= 0:
@@ -2997,6 +2976,9 @@ def trend_watch_for_symbol(base, mv, session_name):
 # =========================================================
 
 
+# =========================================================
+# /screen (PRETTY UI)
+# =========================================================
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("⏳ Scanning market…")
@@ -3006,9 +2988,10 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         best_fut = await asyncio.to_thread(fetch_futures_tickers)
         if not best_fut:
-            await update.message.reply_text("Error: could not fetch futures tickers.")
+            await update.message.reply_text("❌ Error: could not fetch futures tickers.")
             return
 
+        # Core tables
         leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
         up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
 
@@ -3016,7 +2999,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Trend Continuation Watch — FAST (concurrent + limited)
         # =========================================================
         trend_watch = []
-
         up_list, dn_list = compute_directional_lists(best_fut)
 
         watch_bases = [b for b, *_ in up_list[:10]] + [b for b, *_ in dn_list[:10]]
@@ -3041,7 +3023,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trend_watch = sorted(trend_watch, key=lambda x: x["confidence"], reverse=True)[:6]
 
         # =========================================================
-        # Main Trade Setups (existing engine)
+        # Main Trade Setups
         # =========================================================
         sn = current_session_utc()
         setups = await asyncio.to_thread(pick_setups, best_fut, SETUPS_N, False, sn)
@@ -3049,89 +3031,127 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db_insert_signal(s)
 
         # =========================================================
-        # Build setups text
+        # Header / Summary
+        # =========================================================
+        now_mel = datetime.now(ZoneInfo("Australia/Melbourne")).strftime("%Y-%m-%d %H:%M")
+        tickers_n = len(best_fut or {})
+        setups_n = len(setups)
+
+        summary = (
+            f"🧠 *Session:* `{sn}`   |   🕒 *Melbourne:* `{now_mel}`\n"
+            f"📦 *Universe:* `{tickers_n}` tickers   |   🔥 *Top setups:* `{setups_n}`"
+        )
+
+        # =========================================================
+        # Build setups block (pretty cards)
         # =========================================================
         if setups:
-            setup_blocks = []
+            cards = []
             for i, s in enumerate(setups, 1):
-                tps = f"TP {fmt_price(s.tp3)}"
-                if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
-                    tps = f"TP1 {fmt_price(s.tp1)} | TP2 {fmt_price(s.tp2)} | TP3 {fmt_price(s.tp3)}"
-
                 rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
-                tp3_mode = "TRAILING (hot coin)" if s.is_trailing_tp3 else "FIXED"
+                side_emoji = "🟢" if s.side == "BUY" else "🔴"
+                engine_tag = "⚡️ Momentum (B)" if s.engine == "B" else "🎯 Pullback (A)"
 
-                setup_blocks.append(
-                    f"🔥 Setup #{i} — {s.side} {s.symbol} — Conf {s.conf}/100\n"
-                    f"ID: {s.setup_id}\n"
-                    f"Engine: {s.engine}\n"
-                    f"Entry {fmt_price(s.entry)} | SL {fmt_price(s.sl)}\n"
-                    f"{tps}\n"
-                    f"RR(TP3): {rr3:.2f}\n"
-                    f"Adaptive EMA({s.ema_support_period}) dist (15m): {s.ema_support_dist_pct:.2f}%\n"
-                    f"TP3 Mode: {tp3_mode}\n"
-                    f"24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}\n"
-                    f"Chart: {tv_chart_url(s.symbol)}"
+                if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
+                    tps = (
+                        f"*TP1:* `{fmt_price(s.tp1)}`  |  "
+                        f"*TP2:* `{fmt_price(s.tp2)}`  |  "
+                        f"*TP3:* `{fmt_price(s.tp3)}`"
+                    )
+                else:
+                    tps = f"*TP:* `{fmt_price(s.tp3)}`"
+
+                tp3_mode = "TRAILING 🧲" if s.is_trailing_tp3 else "FIXED 🎯"
+
+                cards.append(
+                    f"╭━━━━━━━━━━━━━━━╮\n"
+                    f"*#{i}* {side_emoji} *{s.side}*  —  *{s.symbol}*   (*Conf* `{s.conf}/100`)\n"
+                    f"╰━━━━━━━━━━━━━━━╯\n"
+                    f"🆔 *ID:* `{s.setup_id}`\n"
+                    f"{engine_tag}   |   *RR(TP3):* `{rr3:.2f}`   |   *TP3:* {tp3_mode}\n"
+                    f"💰 *Entry:* `{fmt_price(s.entry)}`   |   🛑 *SL:* `{fmt_price(s.sl)}`\n"
+                    f"🎯 {tps}\n"
+                    f"📈 *Moves:* 24H {pct_with_emoji(s.ch24)}  •  4H {pct_with_emoji(s.ch4)}  •  1H {pct_with_emoji(s.ch1)}  •  15m {pct_with_emoji(s.ch15)}\n"
+                    f"🧲 *Adaptive EMA:* `({s.ema_support_period})`  |  *Dist(15m):* `{s.ema_support_dist_pct:.2f}%`\n"
+                    f"💧 *Vol:* `~{fmt_money(s.fut_vol_usd)}`\n"
+                    f"🔗 *Chart:* {tv_chart_url(s.symbol)}"
                 )
-            setups_txt = "\n\n".join(setup_blocks)
+
+            setups_txt = "\n\n".join(cards)
         else:
-            setups_txt = "No high-quality setups right now."
+            setups_txt = "_No high-quality setups right now._"
 
         # =========================================================
-        # ✅ Per-symbol rejection reasons (friendly)
+        # Per-symbol rejection reasons (friendly)
         # =========================================================
         per_symbol_txt = ""
         if _REJECT_BY_SYMBOL:
-            # show most relevant ones: same universe size (max 35), keep short
-            items = list(_REJECT_BY_SYMBOL.items())[:20]
-            lines = ["🚫 Rejected Symbols (latest scan)", SEP]
+            items = list(_REJECT_BY_SYMBOL.items())[:18]
+            lines = ["🚫 *Rejected Symbols (latest scan)*", SEP]
             for base, reason_key in items:
-                friendly = REJECT_FRIENDLY_EN.get(reason_key, REJECT_FRIENDLY_EN.get("unknown", "Filtered by strategy rules."))
-                lines.append(f"- {base}: {friendly}")
+                friendly = REJECT_FRIENDLY_EN.get(
+                    reason_key,
+                    REJECT_FRIENDLY_EN.get("unknown", "Filtered by strategy rules.")
+                )
+                lines.append(f"• *{base}* — {friendly}")
             per_symbol_txt = "\n".join(lines)
 
         # =========================================================
-        # ✅ Reject diagnostics visibility (single append only)
+        # Reject diagnostics (single append)
         # =========================================================
         uid = update.effective_user.id
         mode = "full" if is_admin_user(uid) else user_diag_mode(uid)
         diag_txt = _reject_report(mode)
 
-        # attach diagnostics + per-symbol list
         extra_blocks = []
         if per_symbol_txt:
             extra_blocks.append(per_symbol_txt)
         if diag_txt:
             extra_blocks.append(diag_txt)
 
-        if extra_blocks:
-            setups_txt = setups_txt + "\n\n" + "\n\n".join(extra_blocks)
+        extra_txt = ("\n\n" + "\n\n".join(extra_blocks)) if extra_blocks else ""
 
         # =========================================================
-        # Trend Watch text block (Adaptive EMA title)
+        # Trend Watch block (pretty)
         # =========================================================
         trend_txt = ""
         if trend_watch:
-            trend_lines = ["📊 Trend Continuation Watch (Adaptive EMA)", SEP]
+            trend_lines = [
+                "📊 *Trend Continuation Watch (Adaptive EMA)*",
+                SEP
+            ]
             for t in trend_watch:
+                side_emoji = "🟢" if t["side"] == "BUY" else "🔴"
                 trend_lines.append(
-                    f"- {t['symbol']} | {t['side']} | Conf {t['confidence']}/100 | 24H {pct_with_emoji(t['ch24'])}"
+                    f"• *{t['symbol']}* {side_emoji} `{t['side']}`  |  Conf `{t['confidence']}/100`  |  24H {pct_with_emoji(t['ch24'])}"
                 )
-            trend_txt = "\n".join(trend_lines) + "\n\n"
+            trend_txt = "\n".join(trend_lines)
 
+        # =========================================================
+        # Keyboard buttons (charts)
+        # =========================================================
         kb = []
         for s in setups:
-            kb.append([InlineKeyboardButton(text=f"📈 {s.symbol} ({s.setup_id})", url=tv_chart_url(s.symbol))])
+            kb.append([InlineKeyboardButton(text=f"📈 {s.symbol}  •  {s.setup_id}", url=tv_chart_url(s.symbol))])
 
+        # =========================================================
+        # Final message (beautiful layout)
+        # =========================================================
         msg = (
-            f"✨ PulseFutures — Market Scan\n"
+            f"✨ *PulseFutures — Market Scan*\n"
             f"{HDR}\n"
-            f"— Top Trade Setups\n"
-            f"{setups_txt}\n\n"
-            f"{trend_txt}"
-            f"— Directional Leaders / Losers\n"
+            f"{summary}\n"
+            f"{HDR}\n\n"
+            f"🔥 *Top Trade Setups*\n"
+            f"{SEP}\n"
+            f"{setups_txt}"
+            f"{extra_txt}\n\n"
+            f"{trend_txt}\n\n"
+            f"📌 *Directional Leaders / Losers*\n"
+            f"{SEP}\n"
             f"{up_txt}\n\n{dn_txt}\n\n"
-            f"— Market Leaders\n"
+            f"🏦 *Market Leaders*\n"
+            f"{SEP}\n"
             f"{leaders_txt}"
         )
 
@@ -3253,10 +3273,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             # no users loop; but keep bot quiet
             return
         if not email_config_ok():
-            return
-
-        # ✅ Melbourne blackout window: no emails either
-        if is_blackout_melbourne_now():
             return
 
         users = list_users_notify_on()
@@ -3480,7 +3496,6 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now_s = sess["name"] if sess else "NONE"
 
     # Blackout
-    blackout_now = is_blackout_melbourne_now()
 
     msg = [
         "🩺 PulseFutures • Health",
@@ -3489,7 +3504,6 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Bybit/CCXT: {'OK' if ex_ok else 'FAIL'} | tickers={tickers_n} | {dt_ms}ms" + (f" | {ex_err}" if (not ex_ok and ex_err) else ""),
         f"Email: enabled={email_on} | configured={email_cfg}",
         f"Cache: items={cache_items} | tickersTTL={TICKERS_TTL_SEC}s | ohlcvTTL={OHLCV_TTL_SEC}s",
-        f"Blackout(MEL 10–12): {'ON' if blackout_now else 'OFF'}",
         HDR,
         f"Your TZ: {user['tz']}",
         f"Sessions enabled: {', '.join(enabled)} | Now: {now_s}",
