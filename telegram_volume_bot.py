@@ -314,6 +314,41 @@ SESSION_TRIGGER_ATR_MULT = {
 }
 
 # =========================================================
+# BLACKOUT (Melbourne) — helper
+# =========================================================
+def is_blackout_melbourne_now(now: Optional[datetime] = None) -> bool:
+    """
+    Returns True if current time in Melbourne is within blackout window.
+    BLACKOUT window is [BLACKOUT_START_HH, BLACKOUT_END_HH) in Australia/Melbourne.
+    Example: start=10, end=12 -> blocks 10:00:00 up to 11:59:59
+    """
+    try:
+        tz = ZoneInfo(BLACKOUT_TZ)
+    except Exception:
+        tz = ZoneInfo("Australia/Melbourne")
+
+    if now is None:
+        now = datetime.now(tz)
+    else:
+        # ensure timezone-aware in Melbourne TZ
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=tz)
+        else:
+            now = now.astimezone(tz)
+
+    start_h = int(BLACKOUT_START_HH)
+    end_h = int(BLACKOUT_END_HH)
+
+    # Standard case (e.g., 10 -> 12)
+    if end_h > start_h:
+        return start_h <= now.hour < end_h
+
+    # If blackout crosses midnight (e.g., 22 -> 2)
+    return (now.hour >= start_h) or (now.hour < end_h)
+
+
+
+# =========================================================
 # DATA STRUCTURES
 # =========================================================
 @dataclass
