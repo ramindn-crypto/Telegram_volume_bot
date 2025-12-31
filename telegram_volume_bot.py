@@ -2410,6 +2410,32 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
         up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
 
+        # =========================================================
+        # Trend Continuation Watch (EMA7)
+        # =========================================================
+        trend_watch = []
+
+        up_list, dn_list = compute_directional_lists(best_fut)
+
+        for base, *_ in up_list[:15]:
+            mv = best_fut.get(base)
+            if mv:
+                tw = trend_watch_for_symbol(base, mv, current_session_utc())
+                if tw:
+                    trend_watch.append(tw)
+
+        for base, *_ in dn_list[:15]:
+            mv = best_fut.get(base)
+            if mv:
+                tw = trend_watch_for_symbol(base, mv, current_session_utc())
+                if tw:
+                    trend_watch.append(tw)
+
+        trend_watch = sorted(trend_watch, key=lambda x: x["confidence"], reverse=True)[:6]
+
+        # =========================================================
+        # Main Trade Setups (existing engine)
+        # =========================================================
         setups = await asyncio.to_thread(pick_setups, best_fut, SETUPS_N, False)
         for s in setups:
             db_insert_signal(s)
@@ -2441,6 +2467,18 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if diag_txt:
             setups_txt = setups_txt + "\n\n" + diag_txt
 
+        # =========================================================
+        # Trend Watch text block
+        # =========================================================
+        trend_txt = ""
+        if trend_watch:
+            trend_lines = ["📊 Trend Continuation Watch (EMA7)", SEP]
+            for t in trend_watch:
+                trend_lines.append(
+                    f"- {t['symbol']} | {t['side']} | Conf {t['confidence']}/100 | 24H {pct_with_emoji(t['ch24'])}"
+                )
+            trend_txt = "\n".join(trend_lines) + "\n\n"
+
         kb = []
         for s in setups:
             kb.append([InlineKeyboardButton(text=f"📈 {s.symbol} ({s.setup_id})", url=tv_chart_url(s.symbol))])
@@ -2450,6 +2488,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{HDR}\n"
             f"— Top Trade Setups\n"
             f"{setups_txt}\n\n"
+            f"{trend_txt}"
             f"— Directional Leaders / Losers\n"
             f"{up_txt}\n\n{dn_txt}\n\n"
             f"— Market Leaders\n"
@@ -2637,9 +2676,10 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if s.side == "SELL" and float(s.ch24) > -float(TREND_24H_TOL):
                     continue
 
-                rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
-                if rr3 < MIN_RR_TP3:
+               min_rr = SESSION_MIN_RR_TP3.get(sess["name"], 2.0)
+               if rr3 < min_rr:
                     continue
+
 
                 if symbol_recently_emailed(uid, s.symbol, SYMBOL_COOLDOWN_HOURS):
                     continue
@@ -2682,7 +2722,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # /health (transparent system health)
 # =========================================================
-async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Transparent health check:
     - DB reachable
@@ -2793,6 +2833,8 @@ def main():
     # ✅ Health command
     app.add_handler(CommandHandler("health", health_cmd))
 
+    app.add_handler(CommandHandler("health_sys", health_sys_cmd))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     if getattr(app, "job_queue", None):
@@ -2822,3 +2864,121 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# =========================================================
+# TREND ENGINE (EMA7) — SAFE ADDON (NO CRASH)
+# =========================================================
+
+TREND_EMA_PULLBACK_ATR = 1.2
+TREND_MAX_CONFIDENCE = 90
+
+
+def ema_series(values, period):
+    if not values or len(values) < period:
+        return []
+    k = 2.0 / (period + 1.0)
+    ema_vals = [values[0]]
+    for v in values[1:]:
+        ema_vals.append(v * k + ema_vals[-1] * (1 - k))
+    return ema_vals
+
+
+def ema_slope(series, n=3):
+    if len(series) < n + 1:
+        return 0.0
+    return series[-1] - series[-1 - n]
+
+
+def trend_dynamic_confidence(base_conf, price, ema7_last, atr_15m, ch24_pct, reclaimed):
+    score = base_conf
+
+    if reclaimed:
+        score += 8
+
+    dist_atr = abs(price - ema7_last) / atr_15m
+    if dist_atr < 0.4:
+        score += 8
+    elif dist_atr < 0.8:
+        score += 4
+
+    score += min(10, abs(ch24_pct) / 2)
+
+    return int(min(score, TREND_MAX_CONFIDENCE))
+
+
+def trend_watch_for_symbol(base, mv, session_name):
+    try:
+        c4h = fetch_ohlcv(mv.symbol, "4h", 60)
+        c1h = fetch_ohlcv(mv.symbol, "1h", 60)
+        c15 = fetch_ohlcv(mv.symbol, "15m", 120)
+        if not c4h or not c15:
+            return None
+
+        closes_4h = [x[4] for x in c4h]
+        closes_15 = [x[4] for x in c15]
+
+        ch24 = float(mv.percentage or 0.0)
+        side = "BUY" if ch24 > 0 else "SELL"
+
+        ema12_4h = ema(closes_4h[-40:], 12)
+        ema28_4h = ema(closes_4h[-40:], 28)
+
+        if side == "BUY" and ema12_4h <= ema28_4h:
+            return None
+        if side == "SELL" and ema12_4h >= ema28_4h:
+            return None
+
+        ema7 = ema_series(closes_15[-80:], 7)
+        ema21 = ema_series(closes_15[-80:], 21)
+        ema50 = ema_series(closes_15[-80:], 50)
+        if not ema7 or not ema21 or not ema50:
+            return None
+
+        if side == "BUY":
+            if not (ema7[-1] > ema21[-1] > ema50[-1]):
+                return None
+            if ema_slope(ema7, 3) <= 0:
+                return None
+        else:
+            if not (ema7[-1] < ema21[-1] < ema50[-1]):
+                return None
+            if ema_slope(ema7, 3) >= 0:
+                return None
+
+        atr_15m = compute_atr_from_ohlcv(c15, ATR_PERIOD)
+        if atr_15m <= 0:
+            return None
+
+        price = float(mv.last or closes_15[-1])
+        dist_atr = abs(price - ema7[-1]) / atr_15m
+        if dist_atr > TREND_EMA_PULLBACK_ATR:
+            return None
+
+        reclaimed = False
+        if side == "BUY":
+            reclaimed = closes_15[-2] < ema7[-2] and price > ema7[-1]
+        else:
+            reclaimed = closes_15[-2] > ema7[-2] and price < ema7[-1]
+
+        fut_vol = usd_notional(mv)
+        base_conf = 55 + (15 if fut_vol >= MOVER_VOL_USD_MIN else 0)
+
+        conf = trend_dynamic_confidence(
+            base_conf,
+            price,
+            ema7[-1],
+            atr_15m,
+            ch24,
+            reclaimed
+        )
+
+        return {
+            "symbol": base,
+            "side": side,
+            "confidence": conf,
+            "ch24": ch24
+        }
+
+    except Exception:
+        return None
+
