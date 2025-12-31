@@ -483,9 +483,14 @@ def adaptive_ema_value(closes: List[float], atr_pct: float) -> Tuple[float, int]
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional
 
+
+
 # Track counts + (optional) sample lines per reject reason
 _REJECT_STATS = Counter()
 _REJECT_SAMPLES: Dict[str, List[str]] = {}
+
+# ✅ NEW: per-symbol reject reason (last one) for /screen
+_REJECT_BY_SYMBOL: Dict[str, str] = {}  # base -> reason_key
 
 # ✅ NEW: last email skip reasons (per user) for /health transparency
 _LAST_EMAIL_DECISION: Dict[int, Dict[str, Any]] = {}
@@ -498,6 +503,8 @@ _LAST_SMTP_ERROR: Dict[int, str] = {}  # user_id -> last error text
 # - admin always "full"
 # - non-admin default based on PUBLIC_DIAGNOSTICS_MODE: "friendly" or "off"
 _USER_DIAG_MODE: Dict[int, str] = {}  # user_id -> "full" | "friendly" | "off"
+
+
 
 
 # -------------------------
@@ -573,9 +580,10 @@ def fmt_price(x: float) -> str:
 
 def reset_reject_tracker() -> None:
     """Call at the start of each scan so stats are per /screen run."""
-    global _REJECT_STATS, _REJECT_SAMPLES
+    global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL
     _REJECT_STATS = Counter()
     _REJECT_SAMPLES = {}
+    _REJECT_BY_SYMBOL = {}
 
 
 def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
@@ -585,9 +593,13 @@ def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
     - reason: stable key (do not put dynamic numbers in the key)
     - extra: can include numbers/thresholds (admin-only, stored only if DEBUG_REJECTS)
     """
-    global _REJECT_STATS, _REJECT_SAMPLES
+    global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL
+
     reason = (reason or "unknown").strip()
     _REJECT_STATS[reason] += 1
+
+    # ✅ store LAST reject reason per symbol (we show friendly label later)
+    _REJECT_BY_SYMBOL[str(base)] = reason
 
     if not DEBUG_REJECTS:
         return
@@ -606,6 +618,7 @@ def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
     if len(xs) < REJECT_TOP_N:
         xs.append(line)
         _REJECT_SAMPLES[reason] = xs
+
 
 
 def _reject_report(diag_mode: str = "friendly") -> str:
@@ -1826,9 +1839,10 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: 
 
 
 def pick_setups(best_fut: Dict[str, MarketVol], n: int, strict_15m: bool = True, session_name: str = "LON") -> List[Setup]:
-    global _REJECT_STATS, _REJECT_SAMPLES
+    global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL
     _REJECT_STATS = Counter()
     _REJECT_SAMPLES = {}
+    _REJECT_BY_SYMBOL = {}
 
     universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:35]
     setups: List[Setup] = []
@@ -2982,9 +2996,13 @@ def trend_watch_for_symbol(base, mv, session_name):
 # /screen
 # =========================================================
 
+
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("⏳ Scanning market…")
+
+        # ✅ reset per-run reject tracker so /screen shows THIS run only
+        reset_reject_tracker()
 
         best_fut = await asyncio.to_thread(fetch_futures_tickers)
         if not best_fut:
@@ -2995,17 +3013,16 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
 
         # =========================================================
-        # Trend Continuation Watch (EMA7) — FAST (concurrent + limited)
+        # Trend Continuation Watch — FAST (concurrent + limited)
         # =========================================================
         trend_watch = []
 
         up_list, dn_list = compute_directional_lists(best_fut)
 
-        # pick fewer symbols to watch (reduces load a lot)
         watch_bases = [b for b, *_ in up_list[:10]] + [b for b, *_ in dn_list[:10]]
-        watch_bases = list(dict.fromkeys(watch_bases))[:20]  # unique, cap 20
+        watch_bases = list(dict.fromkeys(watch_bases))[:20]
 
-        sem = asyncio.Semaphore(5)  # limit concurrency (safe for Bybit rate limit)
+        sem = asyncio.Semaphore(5)
 
         async def _one_trend(base: str):
             mv = best_fut.get(base)
@@ -3023,7 +3040,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         trend_watch = sorted(trend_watch, key=lambda x: x["confidence"], reverse=True)[:6]
 
-
         # =========================================================
         # Main Trade Setups (existing engine)
         # =========================================================
@@ -3032,6 +3048,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for s in setups:
             db_insert_signal(s)
 
+        # =========================================================
+        # Build setups text
+        # =========================================================
         if setups:
             setup_blocks = []
             for i, s in enumerate(setups, 1):
@@ -3058,32 +3077,42 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             setups_txt = "No high-quality setups right now."
 
-        # HARD RULE: don't show reject reasons to users
-        uid = update.effective_user.id
-        mode = user_diag_mode(uid)  # off for non-admin
-        diag_txt = _reject_report(mode)
-        if diag_txt:
-            setups_txt = setups_txt + "\n\n" + diag_txt
-
+        # =========================================================
+        # ✅ Per-symbol rejection reasons (friendly)
+        # =========================================================
+        per_symbol_txt = ""
+        if _REJECT_BY_SYMBOL:
+            # show most relevant ones: same universe size (max 35), keep short
+            items = list(_REJECT_BY_SYMBOL.items())[:20]
+            lines = ["🚫 Rejected Symbols (latest scan)", SEP]
+            for base, reason_key in items:
+                friendly = REJECT_FRIENDLY_EN.get(reason_key, REJECT_FRIENDLY_EN.get("unknown", "Filtered by strategy rules."))
+                lines.append(f"- {base}: {friendly}")
+            per_symbol_txt = "\n".join(lines)
 
         # =========================================================
-        # Reject diagnostics visibility (anti-copy)
+        # ✅ Reject diagnostics visibility (single append only)
         # =========================================================
         uid = update.effective_user.id
         mode = "full" if is_admin_user(uid) else user_diag_mode(uid)
         diag_txt = _reject_report(mode)
+
+        # attach diagnostics + per-symbol list
+        extra_blocks = []
+        if per_symbol_txt:
+            extra_blocks.append(per_symbol_txt)
         if diag_txt:
-            setups_txt = setups_txt + "\n\n" + diag_txt
+            extra_blocks.append(diag_txt)
 
+        if extra_blocks:
+            setups_txt = setups_txt + "\n\n" + "\n\n".join(extra_blocks)
 
-
-      
         # =========================================================
-        # Trend Watch text block
+        # Trend Watch text block (Adaptive EMA title)
         # =========================================================
         trend_txt = ""
         if trend_watch:
-            trend_lines = ["📊 Trend Continuation Watch (EMA7)", SEP]
+            trend_lines = ["📊 Trend Continuation Watch (Adaptive EMA)", SEP]
             for t in trend_watch:
                 trend_lines.append(
                     f"- {t['symbol']} | {t['side']} | Conf {t['confidence']}/100 | 24H {pct_with_emoji(t['ch24'])}"
