@@ -7,38 +7,12 @@ import os
 import time
 import logging
 
-def _render_single_instance_guard() -> None:
-    """
-    Render-safe single instance guard for TELEGRAM POLLING.
-    Primary instance runs.
-    Secondary instances sleep forever (no restart loop, no conflict).
-    """
-    instance_id = os.environ.get("RENDER_INSTANCE_ID")
-    if instance_id and instance_id != "0":
-        logging.info("Secondary instance sleeping")
-        while True:
-            time.sleep(3600)
-
-
-
 import asyncio
-
 import os
 import sys
 import logging
 
 logger = logging.getLogger(__name__)
-
-def _render_single_instance_guard() -> None:
-    """
-    Prevent overlapping instances (Render redeploy overlap protection).
-    """
-    instance_id = os.environ.get("RENDER_INSTANCE_ID")
-    if instance_id is not None and instance_id != "0":
-        logging.info("Secondary instance sleeping")
-        import time
-        while True:
-            time.sleep(3600)
 
 import re
 import ssl
@@ -66,6 +40,22 @@ from telegram.ext import (
 )
 import asyncio
 
+def render_primary_only() -> None:
+    """
+    Render-safe single instance guard.
+    Only instance 0 is allowed to run Telegram polling.
+    All others EXIT immediately.
+    """
+    instance_id = os.environ.get("RENDER_INSTANCE_ID")
+
+    # If Render did not set it, assume single instance
+    if instance_id is None:
+        return
+
+    # Only instance "0" may run
+    if instance_id != "0":
+        logging.warning(f"Secondary Render instance ({instance_id}) exiting.")
+        raise SystemExit(0)
 
 
 
@@ -3664,7 +3654,7 @@ async def _post_init(app: Application):
 
 def main():
     # ✅ CRITICAL: prevent 2 instances polling at the same time on Render
-    _render_single_instance_guard()
+    render_primary_only()
 
     if not TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN missing")
