@@ -3445,7 +3445,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             }
             continue
 
-setups_all = setups_by_session.get(sess["name"], [])
+            setups_all = setups_by_session.get(sess["name"], [])
 
             if not setups_all:
                 _LAST_EMAIL_DECISION[uid] = {
