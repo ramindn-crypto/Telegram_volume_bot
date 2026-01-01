@@ -10,19 +10,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-def render_primary_only_or_sleep_forever() -> None:
-    """
-    Render deploys can briefly overlap (old instance + new instance).
-    This prevents 2 pollers. Only instance "0" runs; others sleep forever.
-    """
-    instance_id = os.environ.get("RENDER_INSTANCE_ID")
-    if instance_id and instance_id != "0":
-        logging.basicConfig(level=logging.INFO)
-        logging.info("Secondary Render instance detected (RENDER_INSTANCE_ID=%s). Sleeping forever.", instance_id)
-        while True:
-            time.sleep(3600)
-
-
 import json
 import re
 import ssl
@@ -3687,7 +3674,11 @@ def main():
 
     db_init()
 
+    async def _post_init(app):
+        await app.bot.delete_webhook(drop_pending_updates=True)
+
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
+
     app.add_error_handler(error_handler)
 
     # ================= Handlers =================
@@ -3738,14 +3729,20 @@ def main():
         logger.error("JobQueue NOT available – install python-telegram-bot[job-queue]")
 
     logger.info("Starting Telegram bot in POLLING mode (Background Worker) ...")
-    app.run_polling(drop_pending_updates=True, close_loop=False)
+    try:
+    app.run_polling(
+        drop_pending_updates=True,
+        close_loop=False,
+        allowed_updates=Update.ALL_TYPES,
+    )
+except telegram.error.Conflict:
+    logging.error("Another instance is polling. Sleeping forever.")
+    while True:
+        time.sleep(3600)
 
 
 
 if __name__ == "__main__":
-    render_primary_only_or_sleep_forever()
-
-    # your existing startup continues here...
     main()
 
 
