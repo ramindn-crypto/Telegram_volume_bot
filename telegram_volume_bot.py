@@ -3435,11 +3435,18 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             uid = int(user["user_id"])
             tz = ZoneInfo(user["tz"])
 
-           
             sess = in_session_now(user)
-            
+            # ✅ If user is NOT in an enabled session right now, skip (this is the main reason you saw: not_in_enabled_session)
+            if not sess:
+                _LAST_EMAIL_DECISION[uid] = {
+                "status": "SKIP",
+                "reasons": ["not_in_enabled_session"],
+                "when": datetime.now(tz).isoformat(timespec="seconds"),
+            }
+            continue
 
-            setups_all = setups_by_session.get(sess["name"], [])
+setups_all = setups_by_session.get(sess["name"], [])
+
             if not setups_all:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
