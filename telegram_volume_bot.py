@@ -261,13 +261,16 @@ ALERT_LOCK = asyncio.Lock()
 
 
 
-# Sessions defined in UTC windows
+# Sessions defined in UTC windows (market convention, with overlaps)
+# ASIA: 00:00–09:00 UTC
+# LON : 07:00–16:00 UTC
+# NY  : 13:00–22:00 UTC
+# Priority resolves overlaps: NY > LON > ASIA
 SESSIONS_UTC = {
-    "ASIA": {"start": "20:00", "end": "06:00"},  # crosses midnight
-    "LON":  {"start": "06:00", "end": "13:00"},
-    "NY":   {"start": "13:00", "end": "20:00"},
+    "ASIA": {"start": "00:00", "end": "09:00"},
+    "LON":  {"start": "07:00", "end": "16:00"},
+    "NY":   {"start": "13:00", "end": "22:00"},
 }
-
 
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
@@ -1262,32 +1265,32 @@ def parse_hhmm(s: str) -> Tuple[int, int]:
     return hh, mm
 
 
+
+
 def current_session_utc(now_utc: Optional[datetime] = None) -> str:
     """
-    24H coverage (no gaps) in UTC:
-    - ASIA: 20:00–06:00
-    - LON : 06:00–13:00
-    - NY  : 13:00–20:00
-
-    Can be called with no args safely.
+    Market sessions in UTC (with overlaps handled by priority):
+    - NY  : 13:00–22:00
+    - LON : 07:00–16:00
+    - ASIA: 00:00–09:00
+    Priority: NY > LON > ASIA
     """
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
 
     h = now_utc.hour
 
-    # ASIA crosses midnight
-    if (h >= 20) or (h < 6):
-        return "ASIA"
-    if 6 <= h < 13:
-        return "LON"
-    if 13 <= h < 20:
+    # Priority first (overlaps intentionally resolved)
+    if 13 <= h < 22:
         return "NY"
+    if 7 <= h < 16:
+        return "LON"
+    if 0 <= h < 9:
+        return "ASIA"
 
-    # Should never happen, but safe fallback
-    return "ASIA"
-
-
+    # Outside the three main windows: treat as NY tail/transition
+    # (or return "ASIA"/"OFF" if you prefer)
+    return "NY"
 
 
 
