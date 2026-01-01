@@ -260,10 +260,11 @@ ALERT_LOCK = asyncio.Lock()
 
 # Sessions defined in UTC windows
 SESSIONS_UTC = {
-    "ASIA": {"start": "00:00", "end": "06:00"},
-    "LON":  {"start": "07:00", "end": "12:00"},
+    "ASIA": {"start": "20:00", "end": "06:00"},  # crosses midnight
+    "LON":  {"start": "06:00", "end": "13:00"},
     "NY":   {"start": "13:00", "end": "20:00"},
 }
+
 
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
