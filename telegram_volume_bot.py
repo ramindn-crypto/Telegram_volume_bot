@@ -3110,15 +3110,8 @@ def trend_watch_for_symbol(base, mv, session_name):
 
 
 
-
-
 # =========================================================
-# /screen
-# =========================================================
-
-
-# =========================================================
-# /screen (PRETTY UI)
+# /screen 
 # =========================================================
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
