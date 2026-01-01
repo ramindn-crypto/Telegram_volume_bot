@@ -38,8 +38,15 @@ from collections import Counter, defaultdict
 
 import ccxt
 from tabulate import tabulate
+
 from telegram import Update
-from telegram.ext import ContextTypes
+from telegram.ext import (
+    Application,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 import asyncio
 
 
