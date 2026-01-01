@@ -17,8 +17,10 @@ def _render_single_instance_guard() -> None:
     """
     instance_id = os.environ.get("RENDER_INSTANCE_ID")
     if instance_id is not None and instance_id != "0":
-        logging.info("Secondary instance exit")
-        raise SystemExit(0)
+        logging.info("Secondary instance sleeping")
+        import time
+        while True:
+            time.sleep(3600)
 
 import re
 import ssl
