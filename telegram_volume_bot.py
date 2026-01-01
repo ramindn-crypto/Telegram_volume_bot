@@ -562,8 +562,10 @@ _USER_DIAG_MODE: Dict[int, str] = {}  # user_id -> "full" | "friendly" | "off"
 # Friendly reject titles (NO thresholds / params shown)
 # IMPORTANT: keep this map COMPLETE for all _rej() keys used in make_setup/pick_setups
 # -------------------------
+
+
 REJECT_FRIENDLY_EN = {
-    # global / admin gating
+    # global / admin gating (legacy key kept for compatibility)
     "melbourne_blackout_10_12": "⛔️ Signals are disabled between 10:00–12:00 (Melbourne time).",
 
     # data / market availability
@@ -576,12 +578,12 @@ REJECT_FRIENDLY_EN = {
     "4h_not_aligned_for_long": "↔️ 4H trend is not aligned with LONG direction.",
     "4h_not_aligned_for_short": "↔️ 4H trend is not aligned with SHORT direction.",
 
-    # adaptive EMA / engines
+    # engines / EMA logic
     "price_not_near_ema12_15m": "📍 Price is not close enough to Adaptive EMA (15m) for a quality entry.",
-    "no_engine_passed": "🧩 Setup did not pass Engine A (pullback) or Engine B (momentum) rules.",
+    "no_engine_passed": "🚫 Setup failed both engines (pullback + momentum filters).",
     "sharp_1h_no_ema_reaction": "⚡️ Strong 1H move detected, but no EMA reaction confirmation.",
 
-    "no_engine_passed": "🚫 Setup failed both engines (pullback + momentum filters).",
+    # SL/TP validity
     "bad_sl_tp_or_atr": "⚠️ Could not compute SL/TP reliably (ATR/price issue).",
 
     # direction / bias filters
@@ -591,12 +593,10 @@ REJECT_FRIENDLY_EN = {
     # micro confirmation (email strictness)
     "15m_weak_and_not_early": "🟡 15m confirmation is weak and the setup is not strong enough to qualify as early.",
 
-    # SL/TP validity
-    "bad_sl_tp_or_atr": "⚠️ Could not compute SL/TP reliably (ATR/price issue).",
-
     # fallback / unknown
     "unknown": "❓ Filtered by strategy rules (details hidden).",
 }
+
 
 
 def is_admin_user(user_id: int) -> bool:
@@ -679,89 +679,34 @@ def _reject_report(diag_mode: str = "friendly") -> str:
       - "friendly": friendly titles + counts (no thresholds/params) [top 10 only]
       - "off": ""
     """
-    if diag_mode == "off":
-        return ""
-    if not _REJECT_STATS:
-        return ""
-
-    parts = []
-    parts.append("🧩 Reject Diagnostics")
-    parts.append(SEP)
-
-    # ✅ admin/full sees everything (complete per run)
-    if diag_mode == "full":
-        items = _REJECT_STATS.most_common()  # ALL
-    else:
-        items = _REJECT_STATS.most_common(10)  # friendly: top 10
-
-    for reason, cnt in items:
-        if diag_mode == "full":
-            parts.append(f"- {reason}: {cnt}")
-            if DEBUG_REJECTS and reason in _REJECT_SAMPLES and _REJECT_SAMPLES[reason]:
-                for s in _REJECT_SAMPLES[reason][:3]:
-                    parts.append(f"    • {s}")
-        else:
-            title = REJECT_FRIENDLY_EN.get(reason, "❓ Filtered by strategy rules (details hidden)")
-            parts.append(f"- {title}  (×{cnt})")
-
-    if diag_mode != "full":
-        parts.append("")
-        parts.append("🔒 Technical details are hidden to protect the strategy.")
-
-    return "\n".join(parts).strip()
-
-    """
-    Builds the reject diagnostics block.
-
-    diag_mode:
-      - "full":   shows reason keys + counts (+ samples if DEBUG_REJECTS)
-      - "friendly": shows friendly labels + counts (NO params/thresholds)
-      - "off":    returns ""
-
-    top_n:
-      how many reasons to list (sorted by count desc)
-
-    show_samples_n:
-      samples per reason in FULL mode (only when DEBUG_REJECTS=true)
-    """
     diag_mode = (diag_mode or "friendly").strip().lower()
     if diag_mode == "off":
         return ""
     if not _REJECT_STATS:
         return ""
 
-    # sort by count, show top_n
-    most = _REJECT_STATS.most_common(int(max(1, top_n)))
-    total_rejects = sum(_REJECT_STATS.values())
-
     parts: List[str] = []
     parts.append("🧩 Reject Diagnostics")
     parts.append(SEP)
-    parts.append(f"Total rejects tracked: {total_rejects}")
-    parts.append("")
 
-    for reason, cnt in most:
+    items = _REJECT_STATS.most_common() if diag_mode == "full" else _REJECT_STATS.most_common(10)
+
+    for reason, cnt in items:
         if diag_mode == "full":
             parts.append(f"- {reason}: {cnt}")
-            if DEBUG_REJECTS:
-                smp = (_REJECT_SAMPLES.get(reason) or [])[:max(0, int(show_samples_n))]
-                for s in smp:
+            if DEBUG_REJECTS and (reason in _REJECT_SAMPLES) and _REJECT_SAMPLES[reason]:
+                for s in _REJECT_SAMPLES[reason][:3]:
                     parts.append(f"    • {s}")
         else:
-            title = REJECT_FRIENDLY_EN.get(reason, REJECT_FRIENDLY_EN.get("unknown"))
+            title = REJECT_FRIENDLY_EN.get(reason, REJECT_FRIENDLY_EN.get("unknown", "Filtered by strategy rules."))
             parts.append(f"- {title}  (×{cnt})")
-
-    # If there are more reasons beyond top_n, show remainder count
-    if len(_REJECT_STATS) > len(most):
-        shown = sum(c for _, c in most)
-        parts.append("")
-        parts.append(f"… plus {total_rejects - shown} rejects across other filters.")
 
     if diag_mode != "full":
         parts.append("")
         parts.append("🔒 Technical details are hidden to protect the strategy.")
 
     return "\n".join(parts).strip()
+
 
 
 
@@ -3111,15 +3056,11 @@ def trend_watch_for_symbol(base, mv, session_name):
 
 
 # =========================================================
-# /screen 
-# =========================================================
-
-
-# =========================================================
 # /screen — Premium Telegram UI
 # =========================================================
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        # quick UX response
         await update.message.reply_text("⏳ Scanning market… Please wait")
 
         # Reset per-run trackers
@@ -3148,22 +3089,26 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         # -------------------------------------------------
-        # Main setups
+        # Main setups (screen-loosened rules)
         # -------------------------------------------------
         setups = await asyncio.to_thread(
             pick_setups,
             best_fut,
             SETUPS_N,
-            False,
+            False,                 # strict_15m = False for screen UX
             session,
             SCREEN_UNIVERSE_N,
             SCREEN_TRIGGER_LOOSEN,
             SCREEN_WAITING_NEAR_PCT,
+            True,                  # allow_no_pullback for screen awareness
         )
 
         for s in setups:
             db_insert_signal(s)
 
+        # -------------------------------------------------
+        # Setup cards
+        # -------------------------------------------------
         if setups:
             cards = []
             for i, s in enumerate(setups, 1):
@@ -3193,7 +3138,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"╰──────────────╯\n"
                     f"🆔 `{s.setup_id}`  |  *Conf:* `{s.conf}/100`\n"
                     f"{engine_tag}  |  *RR(TP3):* `{rr3:.2f}`\n"
-                    f"🧲 Pullback: {pullback}\n"
+                    f"🧲 *Pullback:* {pullback}\n"
                     f"💰 *Entry:* `{fmt_price(s.entry)}`   |   🛑 *SL:* `{fmt_price(s.sl)}`\n"
                     f"🎯 {tp_line}\n"
                     f"📈 *Moves:* 24H {pct_with_emoji(s.ch24)}  •  "
@@ -3215,25 +3160,27 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _WAITING_TRIGGER:
             lines = ["⏳ *Waiting for Trigger (near-miss)*", SEP]
             for base, d in list(_WAITING_TRIGGER.items())[:SCREEN_WAITING_N]:
-                side_emoji = "🟢" if d["side"] == "BUY" else "🔴"
+                side_emoji = "🟢" if d.get("side") == "BUY" else "🔴"
                 lines.append(
                     f"• *{base}* {side_emoji} `{d['side']}` | "
-                    f"1H `{d['ch1']:+.2f}%` → need `{d['need']:.2f}%`"
+                    f"1H `{d['ch1']:+.2f}%` → need `{d['need']:.2f}%` (trigger `{d['trig']:.2f}%`)"
                 )
             waiting_txt = "\n".join(lines)
 
         # -------------------------------------------------
-        # Rejection summary (user-friendly)
+        # Rejection summary (per-user visibility)
         # -------------------------------------------------
         diag_mode = "full" if is_admin_user(uid) else user_diag_mode(uid)
         reject_txt = _reject_report(diag_mode)
 
         # -------------------------------------------------
-        # Trend continuation watch
+        # Trend continuation watch (adaptive EMA)
         # -------------------------------------------------
         trend_txt = ""
         trend_watch = []
         up_list, dn_list = compute_directional_lists(best_fut)
+
+        # take a small watchlist from leaders/losers (already filtered for vol+move+4h align)
         watch = [b for b, *_ in up_list[:6]] + [b for b, *_ in dn_list[:6]]
 
         for base in dict.fromkeys(watch):
@@ -3255,7 +3202,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             trend_txt = "\n".join(lines)
 
         # -------------------------------------------------
-        # Market context tables
+        # Market context tables (leaders/losers + top volume)
         # -------------------------------------------------
         leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
         up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
@@ -3263,25 +3210,42 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # -------------------------------------------------
         # Final assembly
         # -------------------------------------------------
-        msg = (
-            f"{header}\n\n"
-            f"🔥 *Top Trade Setups*\n"
-            f"{SEP}\n"
-            f"{setups_txt}\n\n"
-            f"{waiting_txt}\n\n"
-            f"{trend_txt}\n\n"
-            f"{reject_txt}\n\n"
-            f"📌 *Directional Leaders / Losers*\n"
-            f"{SEP}\n"
-            f"{up_txt}\n\n{dn_txt}\n\n"
-            f"🏦 *Market Leaders*\n"
-            f"{SEP}\n"
-            f"{leaders_txt}"
-        )
+        blocks = [
+            header,
+            "",
+            "🔥 *Top Trade Setups*",
+            SEP,
+            setups_txt,
+        ]
 
+        if waiting_txt:
+            blocks.extend(["", waiting_txt])
+
+        if trend_txt:
+            blocks.extend(["", trend_txt])
+
+        if reject_txt:
+            blocks.extend(["", reject_txt])
+
+        blocks.extend([
+            "",
+            "📌 *Directional Leaders / Losers*",
+            SEP,
+            up_txt,
+            "",
+            dn_txt,
+            "",
+            "🏦 *Market Leaders*",
+            SEP,
+            leaders_txt,
+        ])
+
+        msg = "\n".join([b for b in blocks if b is not None]).strip()
+
+        # Inline buttons for quick charts (top setups only)
         keyboard = [
             [InlineKeyboardButton(text=f"📈 {s.symbol} • {s.setup_id}", url=tv_chart_url(s.symbol))]
-            for s in setups
+            for s in (setups or [])
         ]
 
         await send_long_message(
@@ -3295,6 +3259,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("screen_cmd failed")
         await update.message.reply_text(f"⚠️ /screen failed: {e}")
+
 
 
 
