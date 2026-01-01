@@ -6,12 +6,28 @@ PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + 
 import os
 import sys
 import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+def render_primary_only_or_sleep_forever() -> None:
+    """
+    Render deploys can briefly overlap (old instance + new instance).
+    This prevents 2 pollers. Only instance "0" runs; others sleep forever.
+    """
+    instance_id = os.environ.get("RENDER_INSTANCE_ID")
+    if instance_id and instance_id != "0":
+        logging.basicConfig(level=logging.INFO)
+        logging.info("Secondary Render instance detected (RENDER_INSTANCE_ID=%s). Sleeping forever.", instance_id)
+        while True:
+            time.sleep(3600)
+
+
 import json
 import re
 import ssl
 import smtplib
 import sqlite3
-import logging
 import asyncio
 
 from dataclasses import dataclass
@@ -3727,6 +3743,9 @@ def main():
 
 
 if __name__ == "__main__":
+    render_primary_only_or_sleep_forever()
+
+    # your existing startup continues here...
     main()
 
 
