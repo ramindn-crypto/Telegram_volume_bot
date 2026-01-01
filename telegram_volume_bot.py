@@ -102,11 +102,6 @@ PUBLIC_DIAGNOSTICS_MODE = os.environ.get("PUBLIC_DIAGNOSTICS_MODE", "off").strip
 # - "admin"  => only admins can see diagnostics (recommended)
 # Admin always sees full if needed.
 
-# -------------------------
-# Screen output sizes
-# -------------------------
-LEADERS_N = 10
-
 
 # -------------------------
 # Screen output sizes
@@ -3725,7 +3720,8 @@ def main():
         logger.error("JobQueue NOT available – install python-telegram-bot[job-queue]")
 
     logger.info("Starting Telegram bot in POLLING mode (Background Worker) ...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, close_loop=False)
+
 
 
 if __name__ == "__main__":
