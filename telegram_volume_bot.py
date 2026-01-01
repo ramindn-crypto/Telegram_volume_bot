@@ -17,10 +17,7 @@ def _render_single_instance_guard() -> None:
     """
     instance_id = os.environ.get("RENDER_INSTANCE_ID")
     if instance_id is not None and instance_id != "0":
-        logger.warning(
-            "Secondary Render instance detected (RENDER_INSTANCE_ID=%s) — exiting",
-            instance_id,
-        )
+        logging.info("Secondary instance exit")
         raise SystemExit(0)
 
 import re
