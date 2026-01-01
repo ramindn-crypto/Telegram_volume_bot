@@ -3663,10 +3663,6 @@ async def _post_init(app: Application):
         logger.warning("delete_webhook failed (ignored): %s", e)
 
 def main():
-
-    def main():
-    _render_single_instance_guard()
-    
     # ✅ CRITICAL: prevent 2 instances polling at the same time on Render
     _render_single_instance_guard()
 
