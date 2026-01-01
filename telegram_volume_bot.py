@@ -63,8 +63,24 @@ PUBLIC_DIAGNOSTICS_MODE = os.environ.get("PUBLIC_DIAGNOSTICS_MODE", "off").strip
 # Screen output sizes
 # -------------------------
 LEADERS_N = 10
-SETUPS_N = 3
+
+
+# -------------------------
+# Screen output sizes
+# -------------------------
+LEADERS_N = 10
+
+# ✅ More setups on /screen (UX), while email stays strict
+SETUPS_N = 6
 EMAIL_SETUPS_N = 3
+
+# ✅ /screen scan breadth + loosened trigger only for screen (NOT email)
+SCREEN_UNIVERSE_N = 70          # was effectively 35 (inside pick_setups)
+SCREEN_TRIGGER_LOOSEN = 0.85    # 15% easier trigger on /screen only
+SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
+SCREEN_WAITING_N = 10
+
+
 
 # Directional Leaders/Losers thresholds
 MOVER_VOL_USD_MIN = 5_000_000
@@ -471,8 +487,13 @@ from typing import Any, Dict, List, Optional
 _REJECT_STATS = Counter()
 _REJECT_SAMPLES: Dict[str, List[str]] = {}
 
+
 # ✅ NEW: per-symbol reject reason (last one) for /screen
 _REJECT_BY_SYMBOL: Dict[str, str] = {}  # base -> reason_key
+
+# ✅ NEW: "Waiting for Trigger" (near-miss candidates)
+# base -> {"side": "BUY"/"SELL", "ch1": float, "trig": float, "need": float}
+_WAITING_TRIGGER: Dict[str, Dict[str, Any]] = {}
 
 # ✅ NEW: last email skip reasons (per user) for /health transparency
 _LAST_EMAIL_DECISION: Dict[int, Dict[str, Any]] = {}
@@ -485,6 +506,7 @@ _LAST_SMTP_ERROR: Dict[int, str] = {}  # user_id -> last error text
 # - admin always "full"
 # - non-admin default based on PUBLIC_DIAGNOSTICS_MODE: "friendly" or "off"
 _USER_DIAG_MODE: Dict[int, str] = {}  # user_id -> "full" | "friendly" | "off"
+
 
 
 
@@ -1215,13 +1237,18 @@ def parse_hhmm(s: str) -> Tuple[int, int]:
     return hh, mm
 
 
-def current_session_utc(now_utc: datetime) -> str:
+def current_session_utc(now_utc: Optional[datetime] = None) -> str:
     """
     24H coverage (no gaps) in UTC:
     - ASIA: 20:00–06:00
     - LON : 06:00–13:00
     - NY  : 13:00–20:00
+
+    Can be called with no args safely.
     """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
     h = now_utc.hour
 
     # ASIA crosses midnight
@@ -1234,6 +1261,7 @@ def current_session_utc(now_utc: datetime) -> str:
 
     # Should never happen, but safe fallback
     return "ASIA"
+
 
 
 
@@ -1683,15 +1711,37 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: 
         _rej("ohlcv_missing_or_insufficient", base, mv, "metrics/ema missing")
         return None
 
-    # --------- SOFT 1H TRIGGER (loosened) ----------
+
+    # --------- SOFT 1H TRIGGER ----------
+    # ✅ Email remains strict (loosen_mult=1.0)
+    # ✅ /screen can pass loosen_mult=SCREEN_TRIGGER_LOOSEN to generate more setups
     atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
-    trig_min = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
+    trig_min_raw = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
+
+    # local parameter injected by caller (default = strict)
+    loosen_mult = float(locals().get("trigger_loosen_mult", 1.0) or 1.0)
+    trig_min = max(0.4, float(trig_min_raw) * float(loosen_mult))
 
     if abs(ch1) < trig_min:
+        # ✅ "Waiting for Trigger" near-miss capture (screen UX)
+        # Only store if it is close to triggering
+        near_thr = float(locals().get("waiting_near_pct", SCREEN_WAITING_NEAR_PCT))
+        if trig_min > 0 and abs(ch1) >= (near_thr * trig_min):
+            side_guess = "BUY" if ch1 > 0 else "SELL"
+            _WAITING_TRIGGER[str(base)] = {
+                "side": side_guess,
+                "ch1": float(ch1),
+                "trig": float(trig_min),
+                "need": float(trig_min - abs(ch1)),
+            }
+
         _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% < {trig_min:.2f}% (ATR%={atr_pct_now:.2f})")
         return None
 
     side = "BUY" if ch1 > 0 else "SELL"
+
+
+    
 
     # 4H alignment
     if side == "BUY" and ch4 < ALIGN_4H_MIN:
@@ -1810,21 +1860,37 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: 
 
 
 
-def pick_setups(best_fut: Dict[str, MarketVol], n: int, strict_15m: bool = True, session_name: str = "LON") -> List[Setup]:
-    global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL
+def pick_setups(
+    best_fut: Dict[str, MarketVol],
+    n: int,
+    strict_15m: bool = True,
+    session_name: str = "LON",
+    universe_n: int = 35,
+    trigger_loosen_mult: float = 1.0,
+    waiting_near_pct: float = SCREEN_WAITING_NEAR_PCT,
+) -> List[Setup]:
+    global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL, _WAITING_TRIGGER
     _REJECT_STATS = Counter()
     _REJECT_SAMPLES = {}
     _REJECT_BY_SYMBOL = {}
+    _WAITING_TRIGGER = {}
 
-    universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:35]
+    universe_n = int(max(10, universe_n))
+    universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:universe_n]
+
     setups: List[Setup] = []
     for base, mv in universe:
+        # Inject knobs into make_setup via locals() access (simple, low-touch)
+        # (keeps function signature stable everywhere else)
+        trigger_loosen_mult = float(trigger_loosen_mult)
+        waiting_near_pct = float(waiting_near_pct)
         s = make_setup(base, mv, strict_15m=strict_15m, session_name=session_name)
         if s:
             setups.append(s)
 
     setups.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
     return setups[:n]
+
 
 
 # =========================================================
@@ -3018,15 +3084,28 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # =========================================================
         # Main Trade Setups
         # =========================================================
-        sn = current_session_utc()
-        setups = await asyncio.to_thread(pick_setups, best_fut, SETUPS_N, False, sn)
+
+                # ✅ Session label for screen: always a real session (never OFF)
+        uid = update.effective_user.id
+        user = get_user(uid)
+
+        sn = current_session_utc()  # ASIA/LON/NY (24H)
+        now_mel = datetime.now(ZoneInfo("Australia/Melbourne")).strftime("%Y-%m-%d %H:%M")
+
+        # ✅ /screen uses loosened trigger + larger universe to show more candidates
+        setups = await asyncio.to_thread(
+            pick_setups,
+            best_fut,
+            SETUPS_N,
+            False,
+            sn,
+            SCREEN_UNIVERSE_N,
+            SCREEN_TRIGGER_LOOSEN,
+            SCREEN_WAITING_NEAR_PCT,
+        )
         for s in setups:
             db_insert_signal(s)
 
-        # =========================================================
-        # Header / Summary
-        # =========================================================
-        now_mel = datetime.now(ZoneInfo("Australia/Melbourne")).strftime("%Y-%m-%d %H:%M")
         tickers_n = len(best_fut or {})
         setups_n = len(setups)
 
@@ -3034,6 +3113,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🧠 *Session:* `{sn}`   |   🕒 *Melbourne:* `{now_mel}`\n"
             f"📦 *Universe:* `{tickers_n}` tickers   |   🔥 *Top setups:* `{setups_n}`"
         )
+
 
         # =========================================================
         # Build setups block (pretty cards)
@@ -3074,6 +3154,32 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             setups_txt = "_No high-quality setups right now._"
 
+
+        # =========================================================
+        # Waiting for Trigger (near-miss, best UX)
+        # =========================================================
+        waiting_txt = ""
+        if _WAITING_TRIGGER:
+            items = []
+            for base, d in _WAITING_TRIGGER.items():
+                items.append((base, d))
+            # smallest "need" first (closest to triggering)
+            items.sort(key=lambda x: float(x[1].get("need", 999)))
+
+            lines = ["⏳ *Waiting for Trigger (near-miss)*", SEP]
+            for base, d in items[:SCREEN_WAITING_N]:
+                side_emoji = "🟢" if d.get("side") == "BUY" else "🔴"
+                ch1v = float(d.get("ch1", 0.0))
+                trig = float(d.get("trig", 0.0))
+                need = float(d.get("need", 0.0))
+                lines.append(
+                    f"• *{base}* {side_emoji} `{d.get('side','-')}`  |  "
+                    f"1H `{ch1v:+.2f}%`  → need `{need:.2f}%` (trigger `{trig:.2f}%`)"
+                )
+            waiting_txt = "\n".join(lines)
+
+
+        
         # =========================================================
         # Per-symbol rejection reasons (friendly)
         # =========================================================
@@ -3089,6 +3195,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"• *{base}* — {friendly}")
             per_symbol_txt = "\n".join(lines)
 
+
+        
+
         # =========================================================
         # Reject diagnostics (single append)
         # =========================================================
@@ -3097,12 +3206,15 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         diag_txt = _reject_report(mode)
 
         extra_blocks = []
+        if waiting_txt:
+            extra_blocks.append(waiting_txt)
         if per_symbol_txt:
             extra_blocks.append(per_symbol_txt)
         if diag_txt:
             extra_blocks.append(diag_txt)
 
         extra_txt = ("\n\n" + "\n\n".join(extra_blocks)) if extra_blocks else ""
+
 
         # =========================================================
         # Trend Watch block (pretty)
