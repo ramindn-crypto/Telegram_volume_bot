@@ -3646,6 +3646,9 @@ async def _post_init(app: Application):
         logger.warning("delete_webhook failed (ignored): %s", e)
 
 def main():
+    # ✅ CRITICAL: prevent 2 instances polling at the same time on Render
+    _render_single_instance_guard()
+
     if not TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN missing")
 
@@ -3703,6 +3706,8 @@ def main():
     logger.info("Starting Telegram bot in POLLING mode (Background Worker) ...")
     app.run_polling(drop_pending_updates=True)
 
+
 if __name__ == "__main__":
     main()
+
 
