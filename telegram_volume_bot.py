@@ -3663,22 +3663,21 @@ async def _post_init(app: Application):
     except Exception as e:
         logger.warning("delete_webhook failed (ignored): %s", e)
 
+
 def main():
     # Hard guard: Background Worker ONLY
     if os.environ.get("RENDER_SERVICE_TYPE") == "web":
         raise SystemExit("Web service detected — polling disabled.")
+
+    # Single instance guard (Render overlap protection)
     render_primary_only()
-   
+
     if not TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN missing")
 
     db_init()
 
-    async def _post_init(app):
-        await app.bot.delete_webhook(drop_pending_updates=True)
-
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
-
     app.add_error_handler(error_handler)
 
     # ================= Handlers =================
@@ -3717,34 +3716,35 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
-    # ================= JobQueue =================
+    # ================= JobQueue =================app.run_polling(
     if app.job_queue:
         app.job_queue.run_repeating(
             alert_job,
             interval=CHECK_INTERVAL_MIN * 60,
             first=30,
-            name="alert_job"
+            name="alert_job",
         )
     else:
         logger.error("JobQueue NOT available – install python-telegram-bot[job-queue]")
 
-logger.info("Starting Telegram bot in POLLING mode (Background Worker) ...")
+    logger.info("Starting Telegram bot in POLLING mode (Background Worker) ...")
 
-from telegram.error import Conflict
-
-try:
-    app.run_polling(
-        drop_pending_updates=True,
-        close_loop=False,
-        allowed_updates=Update.ALL_TYPES,
-    )
-except Conflict:
-    logger.error("Another instance is polling. Sleeping forever.")
-    while True:
-        time.sleep(3600)
+    # Optional: if any other poller exists, don't crash-restart; just sleep.
+    from telegram.error import Conflict
+    try:
+        app.run_polling(
+            drop_pending_updates=True,
+            close_loop=False,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    except Conflict:
+        logger.error("Another instance is polling. Sleeping forever.")
+        while True:
+            time.sleep(3600)
 
 
 if __name__ == "__main__":
     main()
+
 
 
