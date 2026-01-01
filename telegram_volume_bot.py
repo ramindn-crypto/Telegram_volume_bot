@@ -3114,67 +3114,48 @@ def trend_watch_for_symbol(base, mv, session_name):
 # /screen 
 # =========================================================
 
+
 # =========================================================
-# /screen
+# /screen — Premium Telegram UI
 # =========================================================
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await update.message.reply_text("⏳ Scanning market…")
+        await update.message.reply_text("⏳ Scanning market… Please wait")
 
-        # reset per-run trackers
+        # Reset per-run trackers
         reset_reject_tracker()
 
         best_fut = await asyncio.to_thread(fetch_futures_tickers)
         if not best_fut:
-            await update.message.reply_text("❌ Error: could not fetch futures tickers.")
+            await update.message.reply_text("❌ Failed to fetch futures data.")
             return
 
-        # Core tables
-        leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
-        up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
-
-        # =========================================================
-        # Trend Continuation Watch
-        # =========================================================
-        trend_watch = []
-        up_list, dn_list = compute_directional_lists(best_fut)
-        watch_bases = [b for b, *_ in up_list[:10]] + [b for b, *_ in dn_list[:10]]
-        watch_bases = list(dict.fromkeys(watch_bases))[:20]
-
-        sem = asyncio.Semaphore(5)
-
-        async def _one_trend(base: str):
-            mv = best_fut.get(base)
-            if not mv:
-                return None
-            async with sem:
-                return await asyncio.to_thread(
-                    trend_watch_for_symbol, base, mv, current_session_utc()
-                )
-
-        tasks = [asyncio.create_task(_one_trend(b)) for b in watch_bases]
-        res = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in res:
-            if isinstance(r, dict):
-                trend_watch.append(r)
-
-        trend_watch = sorted(trend_watch, key=lambda x: x["confidence"], reverse=True)[:6]
-
-        # =========================================================
-        # Main Trade Setups
-        # =========================================================
+        # -------------------------------------------------
+        # Header / session
+        # -------------------------------------------------
         uid = update.effective_user.id
         user = get_user(uid)
 
-        sn = current_session_utc()
+        session = current_session_utc()
         now_mel = datetime.now(ZoneInfo("Australia/Melbourne")).strftime("%Y-%m-%d %H:%M")
 
+        header = (
+            f"✨ *PulseFutures — Market Scan*\n"
+            f"{HDR}\n"
+            f"🧠 *Session:* `{session}`   |   🕒 *Melbourne:* `{now_mel}`\n"
+            f"📦 *Universe:* `{len(best_fut)}` tickers\n"
+            f"{HDR}"
+        )
+
+        # -------------------------------------------------
+        # Main setups
+        # -------------------------------------------------
         setups = await asyncio.to_thread(
             pick_setups,
             best_fut,
             SETUPS_N,
             False,
-            sn,
+            session,
             SCREEN_UNIVERSE_N,
             SCREEN_TRIGGER_LOOSEN,
             SCREEN_WAITING_NEAR_PCT,
@@ -3183,60 +3164,43 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for s in setups:
             db_insert_signal(s)
 
-        summary = (
-            f"🧠 *Session:* `{sn}`   |   🕒 *Melbourne:* `{now_mel}`\n"
-            f"📦 *Universe:* `{len(best_fut)}` tickers   |   🔥 *Top setups:* `{len(setups)}`"
-        )
-
-        # =========================================================
-        # Build setups cards
-        # =========================================================
         if setups:
             cards = []
             for i, s in enumerate(setups, 1):
-                rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
                 side_emoji = "🟢" if s.side == "BUY" else "🔴"
-                engine_tag = "⚡️ Momentum (B)" if s.engine == "B" else "🎯 Pullback (A)"
+                engine_tag = "⚡️ Momentum" if s.engine == "B" else "🎯 Pullback"
+                rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
 
-                if s.pullback_ready:
-                    if s.pullback_bypass_hot:
-                        pullback_line = f"🔥 Pullback: BYPASS (Vol ≥ {fmt_money(HOT_VOL_USD)})"
-                    else:
-                        pullback_line = (
-                            f"✅ Pullback: done near EMA{s.pullback_ema_period} "
-                            f"(dist {s.pullback_ema_dist_pct:.2f}%)"
-                        )
-                else:
-                    pullback_line = (
-                        f"⏳ Pullback: NOT YET — wait for EMA{s.pullback_ema_period} "
-                        f"(dist {s.pullback_ema_dist_pct:.2f}%)"
-                    )
+                pullback = (
+                    "🔥 Bypass (Hot)"
+                    if s.pullback_bypass_hot
+                    else f"EMA{s.pullback_ema_period} ({s.pullback_ema_dist_pct:.2f}%)"
+                    if s.pullback_ready
+                    else f"⏳ Waiting EMA{s.pullback_ema_period}"
+                )
 
-                if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
-                    tps = (
-                        f"*TP1:* `{fmt_price(s.tp1)}`  |  "
-                        f"*TP2:* `{fmt_price(s.tp2)}`  |  "
-                        f"*TP3:* `{fmt_price(s.tp3)}`"
-                    )
-                else:
-                    tps = f"*TP:* `{fmt_price(s.tp3)}`"
-
-                tp3_mode = "TRAILING 🧲" if s.is_trailing_tp3 else "FIXED 🎯"
+                tp_line = (
+                    f"*TP1:* `{fmt_price(s.tp1)}`  |  "
+                    f"*TP2:* `{fmt_price(s.tp2)}`  |  "
+                    f"*TP3:* `{fmt_price(s.tp3)}`"
+                    if s.tp1 and s.tp2
+                    else f"*TP:* `{fmt_price(s.tp3)}`"
+                )
 
                 cards.append(
-                    f"╭━━━━━━━━━━━━━━━╮\n"
-                    f"*#{i}* {side_emoji} *{s.side}*  —  *{s.symbol}*   (*Conf* `{s.conf}/100`)\n"
-                    f"╰━━━━━━━━━━━━━━━╯\n"
-                    f"🆔 *ID:* `{s.setup_id}`\n"
-                    f"{engine_tag}   |   *RR(TP3):* `{rr3:.2f}`   |   *TP3:* {tp3_mode}\n"
-                    f"{pullback_line}\n"
+                    f"╭──────────────╮\n"
+                    f"*#{i}* {side_emoji} *{s.side}* — *{s.symbol}*\n"
+                    f"╰──────────────╯\n"
+                    f"🆔 `{s.setup_id}`  |  *Conf:* `{s.conf}/100`\n"
+                    f"{engine_tag}  |  *RR(TP3):* `{rr3:.2f}`\n"
+                    f"🧲 Pullback: {pullback}\n"
                     f"💰 *Entry:* `{fmt_price(s.entry)}`   |   🛑 *SL:* `{fmt_price(s.sl)}`\n"
-                    f"🎯 {tps}\n"
-                    f"📈 *Moves:* 24H {pct_with_emoji(s.ch24)}  •  4H {pct_with_emoji(s.ch4)}  •  "
-                    f"1H {pct_with_emoji(s.ch1)}  •  15m {pct_with_emoji(s.ch15)}\n"
-                    f"🧲 *Adaptive EMA:* `({s.ema_support_period})`  |  "
-                    f"*Dist(15m):* `{s.ema_support_dist_pct:.2f}%`\n"
-                    f"💧 *Vol:* `~{fmt_money(s.fut_vol_usd)}`\n"
+                    f"🎯 {tp_line}\n"
+                    f"📈 *Moves:* 24H {pct_with_emoji(s.ch24)}  •  "
+                    f"4H {pct_with_emoji(s.ch4)}  •  "
+                    f"1H {pct_with_emoji(s.ch1)}  •  "
+                    f"15m {pct_with_emoji(s.ch15)}\n"
+                    f"💧 *Volume:* `~{fmt_money(s.fut_vol_usd)}`\n"
                     f"🔗 *Chart:* {tv_chart_url(s.symbol)}"
                 )
 
@@ -3244,62 +3208,45 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             setups_txt = "_No high-quality setups right now._"
 
-        # =========================================================
-        # Waiting for Trigger
-        # =========================================================
+        # -------------------------------------------------
+        # Waiting for trigger (near-miss)
+        # -------------------------------------------------
         waiting_txt = ""
         if _WAITING_TRIGGER:
-            items = sorted(
-                _WAITING_TRIGGER.items(),
-                key=lambda x: float(x[1].get("need", 999)),
-            )
             lines = ["⏳ *Waiting for Trigger (near-miss)*", SEP]
-            for base, d in items[:SCREEN_WAITING_N]:
-                side_emoji = "🟢" if d.get("side") == "BUY" else "🔴"
+            for base, d in list(_WAITING_TRIGGER.items())[:SCREEN_WAITING_N]:
+                side_emoji = "🟢" if d["side"] == "BUY" else "🔴"
                 lines.append(
-                    f"• *{base}* {side_emoji} `{d.get('side')}`  |  "
-                    f"1H `{d.get('ch1',0):+.2f}%`  → need `{d.get('need',0):.2f}%` "
-                    f"(trigger `{d.get('trig',0):.2f}%`)"
+                    f"• *{base}* {side_emoji} `{d['side']}` | "
+                    f"1H `{d['ch1']:+.2f}%` → need `{d['need']:.2f}%`"
                 )
             waiting_txt = "\n".join(lines)
 
-        # =========================================================
-        # Per-symbol rejection reasons
-        # =========================================================
-        per_symbol_txt = ""
-        if _REJECT_BY_SYMBOL:
-            lines = ["🚫 *Rejected Symbols (latest scan)*", SEP]
-            for base, reason_key in list(_REJECT_BY_SYMBOL.items())[:18]:
-                friendly = REJECT_FRIENDLY_EN.get(
-                    reason_key,
-                    REJECT_FRIENDLY_EN.get("unknown", "Filtered by strategy rules."),
-                )
-                lines.append(f"• *{base}* — {friendly}")
-            per_symbol_txt = "\n".join(lines)
+        # -------------------------------------------------
+        # Rejection summary (user-friendly)
+        # -------------------------------------------------
+        diag_mode = "full" if is_admin_user(uid) else user_diag_mode(uid)
+        reject_txt = _reject_report(diag_mode)
 
-        # =========================================================
-        # Reject diagnostics
-        # =========================================================
-        mode = "full" if is_admin_user(uid) else user_diag_mode(uid)
-        diag_txt = _reject_report(mode)
-
-        extra_blocks = []
-        if waiting_txt:
-            extra_blocks.append(waiting_txt)
-        if per_symbol_txt:
-            extra_blocks.append(per_symbol_txt)
-        if diag_txt:
-            extra_blocks.append(diag_txt)
-
-        extra_txt = ("\n\n" + "\n\n".join(extra_blocks)) if extra_blocks else ""
-
-        # =========================================================
-        # Trend Watch block
-        # =========================================================
+        # -------------------------------------------------
+        # Trend continuation watch
+        # -------------------------------------------------
         trend_txt = ""
+        trend_watch = []
+        up_list, dn_list = compute_directional_lists(best_fut)
+        watch = [b for b, *_ in up_list[:6]] + [b for b, *_ in dn_list[:6]]
+
+        for base in dict.fromkeys(watch):
+            mv = best_fut.get(base)
+            if not mv:
+                continue
+            r = await asyncio.to_thread(trend_watch_for_symbol, base, mv, session)
+            if r:
+                trend_watch.append(r)
+
         if trend_watch:
-            lines = ["📊 *Trend Continuation Watch (Adaptive EMA)*", SEP]
-            for t in trend_watch:
+            lines = ["📊 *Trend Continuation Watch*", SEP]
+            for t in sorted(trend_watch, key=lambda x: x["confidence"], reverse=True)[:6]:
                 side_emoji = "🟢" if t["side"] == "BUY" else "🔴"
                 lines.append(
                     f"• *{t['symbol']}* {side_emoji} `{t['side']}`  |  "
@@ -3307,27 +3254,23 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             trend_txt = "\n".join(lines)
 
-        # =========================================================
-        # Keyboard
-        # =========================================================
-        kb = [
-            [InlineKeyboardButton(text=f"📈 {s.symbol} • {s.setup_id}", url=tv_chart_url(s.symbol))]
-            for s in setups
-        ]
+        # -------------------------------------------------
+        # Market context tables
+        # -------------------------------------------------
+        leaders_txt = await asyncio.to_thread(build_leaders_table, best_fut)
+        up_txt, dn_txt = await asyncio.to_thread(movers_tables, best_fut)
 
-        # =========================================================
-        # Final message
-        # =========================================================
+        # -------------------------------------------------
+        # Final assembly
+        # -------------------------------------------------
         msg = (
-            f"✨ *PulseFutures — Market Scan*\n"
-            f"{HDR}\n"
-            f"{summary}\n"
-            f"{HDR}\n\n"
+            f"{header}\n\n"
             f"🔥 *Top Trade Setups*\n"
             f"{SEP}\n"
-            f"{setups_txt}"
-            f"{extra_txt}\n\n"
+            f"{setups_txt}\n\n"
+            f"{waiting_txt}\n\n"
             f"{trend_txt}\n\n"
+            f"{reject_txt}\n\n"
             f"📌 *Directional Leaders / Losers*\n"
             f"{SEP}\n"
             f"{up_txt}\n\n{dn_txt}\n\n"
@@ -3336,20 +3279,22 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{leaders_txt}"
         )
 
+        keyboard = [
+            [InlineKeyboardButton(text=f"📈 {s.symbol} • {s.setup_id}", url=tv_chart_url(s.symbol))]
+            for s in setups
+        ]
+
         await send_long_message(
             update,
             msg,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
-            reply_markup=InlineKeyboardMarkup(kb) if kb else None,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
         )
 
     except Exception as e:
-        logger.exception("screen_cmd failed: %s", e)
-        try:
-            await update.message.reply_text(f"⚠️ /screen failed: {e}")
-        except Exception:
-            pass
+        logger.exception("screen_cmd failed")
+        await update.message.reply_text(f"⚠️ /screen failed: {e}")
 
 
 
