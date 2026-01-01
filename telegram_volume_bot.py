@@ -559,15 +559,6 @@ def best_pullback_ema_15m(closes_15: List[float], entry: float) -> Tuple[float, 
 
 
 
-
-# =========================================================
-# REJECT TRACKER (in-memory per run) — COMPLETE
-# =========================================================
-from collections import Counter, defaultdict
-from typing import Any, Dict, List, Optional
-
-
-
 # Track counts + (optional) sample lines per reject reason
 _REJECT_STATS = Counter()
 _REJECT_SAMPLES: Dict[str, List[str]] = {}
@@ -3651,6 +3642,12 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(msg))
 
 
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Telegram error", exc_info=context.error)
+
+
+
 # =========================================================
 # MAIN (Background Worker = POLLING)
 # =========================================================
@@ -3663,14 +3660,18 @@ async def _post_init(app: Application):
         logger.warning("delete_webhook failed (ignored): %s", e)
 
 def main():
+    # Hard guard: Background Worker ONLY
+    if os.environ.get("RENDER_SERVICE_TYPE") == "web":
+        raise SystemExit("Web service detected — polling disabled.")
     render_primary_only()
-    
+   
     if not TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN missing")
 
     db_init()
 
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
+    app.add_error_handler(error_handler)
 
     # ================= Handlers =================
     app.add_handler(CommandHandler(["help", "start"], cmd_help))
