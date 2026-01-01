@@ -41,16 +41,7 @@ from tabulate import tabulate
 from telegram import Update
 import asyncio
 
-async def _pre_polling_cleanup(application) -> None:
-    # Remove any leftover webhook to avoid polling conflicts
-    await application.bot.delete_webhook(drop_pending_updates=True)
 
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
 
 # =========================================================
 # CONFIG
