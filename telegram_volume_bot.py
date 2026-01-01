@@ -4,8 +4,25 @@ PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + 
 """
 
 import asyncio
-import logging
+
 import os
+import sys
+import logging
+
+logger = logging.getLogger(__name__)
+
+def _render_single_instance_guard() -> None:
+    """
+    Prevent overlapping instances (Render redeploy overlap protection).
+    """
+    instance_id = os.environ.get("RENDER_INSTANCE_ID")
+    if instance_id is not None and instance_id != "0":
+        logger.warning(
+            "Secondary Render instance detected (RENDER_INSTANCE_ID=%s) — exiting",
+            instance_id,
+        )
+        raise SystemExit(0)
+
 import re
 import ssl
 import smtplib
@@ -21,9 +38,13 @@ from collections import Counter, defaultdict
 
 import ccxt
 from tabulate import tabulate
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
-from telegram.ext import (
+from telegram import Update
+import asyncio
+
+async def _pre_polling_cleanup(application) -> None:
+    # Remove any leftover webhook to avoid polling conflicts
+    await application.bot.delete_webhook(drop_pending_updates=True)
+
     Application,
     CommandHandler,
     ContextTypes,
