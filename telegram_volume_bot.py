@@ -43,19 +43,33 @@ import asyncio
 def render_primary_only() -> None:
     """
     Render-safe single instance guard.
-    Only instance 0 is allowed to run Telegram polling.
-    All others EXIT immediately.
+
+    IMPORTANT:
+    - On Render, RENDER_INSTANCE_ID is often a string like "srv-...".
+      That does NOT mean "secondary".
+    - We only exit if Render provides a *numeric replica index* AND it's not 0.
     """
+    # Some Render setups expose an index/number; only trust numeric ones.
+    candidates = [
+        os.environ.get("RENDER_INSTANCE_NUMBER"),
+        os.environ.get("RENDER_INSTANCE_INDEX"),
+        os.environ.get("RENDER_REPLICA_NUMBER"),
+    ]
+
+    for val in candidates:
+        if val is None:
+            continue
+        # Only treat as authoritative if it's purely numeric
+        if val.isdigit():
+            if val != "0":
+                logging.warning(f"Secondary Render replica ({val}) exiting.")
+                raise SystemExit(0)
+            return  # primary replica
+
+    # Fallback: DO NOT exit just because RENDER_INSTANCE_ID exists (it's usually non-numeric).
     instance_id = os.environ.get("RENDER_INSTANCE_ID")
+    logging.info(f"Render instance id: {instance_id} (no numeric replica index found; continuing)")
 
-    # If Render did not set it, assume single instance
-    if instance_id is None:
-        return
-
-    # Only instance "0" may run
-    if instance_id != "0":
-        logging.warning(f"Secondary Render instance ({instance_id}) exiting.")
-        raise SystemExit(0)
 
 
 
@@ -3653,9 +3667,8 @@ async def _post_init(app: Application):
         logger.warning("delete_webhook failed (ignored): %s", e)
 
 def main():
-    # ✅ CRITICAL: prevent 2 instances polling at the same time on Render
     render_primary_only()
-
+    
     if not TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN missing")
 
