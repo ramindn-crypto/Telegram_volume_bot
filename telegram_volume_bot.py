@@ -3,6 +3,24 @@
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
 """
 
+import os
+import time
+import logging
+
+def _render_single_instance_guard() -> None:
+    """
+    Render-safe single instance guard for TELEGRAM POLLING.
+    Primary instance runs.
+    Secondary instances sleep forever (no restart loop, no conflict).
+    """
+    instance_id = os.environ.get("RENDER_INSTANCE_ID")
+    if instance_id and instance_id != "0":
+        logging.info("Secondary instance sleeping")
+        while True:
+            time.sleep(3600)
+
+
+
 import asyncio
 
 import os
@@ -3645,6 +3663,10 @@ async def _post_init(app: Application):
         logger.warning("delete_webhook failed (ignored): %s", e)
 
 def main():
+
+    def main():
+    _render_single_instance_guard()
+    
     # ✅ CRITICAL: prevent 2 instances polling at the same time on Render
     _render_single_instance_guard()
 
