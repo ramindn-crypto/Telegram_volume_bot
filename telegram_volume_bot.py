@@ -3729,17 +3729,19 @@ def main():
         logger.error("JobQueue NOT available – install python-telegram-bot[job-queue]")
 
     logger.info("Starting Telegram bot in POLLING mode (Background Worker) ...")
-    try:
+
+from telegram.error import Conflict
+
+try:
     app.run_polling(
         drop_pending_updates=True,
         close_loop=False,
         allowed_updates=Update.ALL_TYPES,
     )
-except telegram.error.Conflict:
+except Conflict:
     logging.error("Another instance is polling. Sleeping forever.")
     while True:
         time.sleep(3600)
-
 
 
 if __name__ == "__main__":
