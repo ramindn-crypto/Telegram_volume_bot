@@ -94,21 +94,29 @@ ENGINE_A_PULLBACK_ENABLED = True     # pullback / mean-reversion near adaptive E
 ENGINE_B_MOMENTUM_ENABLED = True     # pump / expansion
 
 # =========================================================
-# ✅ 1H MOMENTUM INTENSITY (LOOSENED)
+# ✅ 1H MOMENTUM INTENSITY (SESSION-DYNAMIC)
 # =========================================================
-# Was too conservative; now it triggers more often
-TRIGGER_1H_ABS_MIN_BASE = 1.2        # was 2.0
-CONFIRM_15M_ABS_MIN = 0.45           # was 0.6 (slightly easier)
-ALIGN_4H_MIN = 0.0                   # keep alignment
+# Base floor (still used), but we now scale it per session:
+TRIGGER_1H_ABS_MIN_BASE = 1.2        # global floor
+CONFIRM_15M_ABS_MIN = 0.45
+ALIGN_4H_MIN = 0.0
 
-# "EARLY" filler (email only) — also loosened slightly
-EARLY_1H_ABS_MIN = 2.8               # was 3.8
+# "EARLY" filler (email only)
+EARLY_1H_ABS_MIN = 2.8
 EARLY_CONF_PENALTY = 6
 EARLY_EMAIL_EXTRA_CONF = 4
 EARLY_EMAIL_MAX_FILL = 1
 
-# Trend-follow Email filter (avoid counter-trend reversals)
 TREND_24H_TOL = 0.5
+
+# ✅ Session-based 1H strictness:
+# ASIA = tightest, LON = medium, NY = loosest
+SESSION_1H_BASE_MULT = {
+    "NY": 0.85,
+    "LON": 1.00,
+    "ASIA": 1.15,
+}
+
 
 # =========================================================
 # ✅ ENGINE B (MOMENTUM / EXPANSION) SETTINGS (for pumps)
@@ -266,17 +274,27 @@ def session_knobs(session_name: str) -> dict:
     }
 
 
+
+
 def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
     """
-    Loosened trigger:
-    - clamp down to 1.0..4.5 (was 2..6)
+    Session-dynamic 1H trigger:
+    - ATR-adaptive (existing)
+    - PLUS per-session strictness multiplier:
+        ASIA tighter > LON > NY looser
     """
     knobs = session_knobs(session_name)
-    mult = knobs["trigger_atr_mult"]
-    dyn = clamp(float(atr_pct) * float(mult), 1.0, 4.5)
-    return max(float(TRIGGER_1H_ABS_MIN_BASE), float(dyn))
+    mult_atr = float(knobs["trigger_atr_mult"])
 
+    # ATR-based dynamic trigger
+    dyn = clamp(float(atr_pct) * float(mult_atr), 1.0, 4.5)
 
+    # Session strictness multiplier applied to BASE floor
+    sess = knobs["name"]
+    base_mult = float(SESSION_1H_BASE_MULT.get(sess, 1.0))
+    base_floor = float(TRIGGER_1H_ABS_MIN_BASE) * base_mult
+
+    return max(float(base_floor), float(dyn))
 
 
 
@@ -316,15 +334,22 @@ class Setup:
     ch1: float
     ch15: float
 
-    # ✅ adaptive EMA support (replaces fixed EMA12)
+    # ✅ adaptive EMA support (15m, volatility-based)
     ema_support_period: int
     ema_support_dist_pct: float
+
+    # ✅ NEW: pullback EMA selection (7/14/21) + status
+    pullback_ema_period: int
+    pullback_ema_dist_pct: float
+    pullback_ready: bool          # True => pullback happened / entry quality
+    pullback_bypass_hot: bool     # True => volume>=50M bypass (no pullback needed)
 
     # ✅ engine label (A pullback / B momentum)
     engine: str
 
     is_trailing_tp3: bool
     created_ts: float
+
 
 
 # =========================================================
@@ -471,6 +496,28 @@ def adaptive_ema_value(closes: List[float], atr_pct: float) -> Tuple[float, int]
     p = adaptive_ema_period(atr_pct)
     lookback = min(len(closes), p + 30)
     return ema(closes[-lookback:], p), p
+
+def best_pullback_ema_15m(closes_15: List[float], entry: float) -> Tuple[float, int, float]:
+    """
+    Pick the best EMA among (7,14,21) based on which is closest to price.
+    Returns: (ema_value, period, dist_pct)
+    """
+    if not closes_15 or entry <= 0:
+        return 0.0, 14, 999.0
+
+    candidates = [7, 14, 21]
+    best = (0.0, 14, 999.0)
+
+    for p in candidates:
+        lookback = min(len(closes_15), p + 60)
+        e = ema(closes_15[-lookback:], p)
+        if e <= 0:
+            continue
+        dist_pct = abs(entry - e) / entry * 100.0
+        if dist_pct < best[2]:
+            best = (float(e), int(p), float(dist_pct))
+
+    return best
 
 
 
@@ -1691,8 +1738,16 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
 
 
 
-
-def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: str = "LON") -> Optional[Setup]:
+def make_setup(
+    base: str,
+    mv: MarketVol,
+    strict_15m: bool = True,
+    session_name: str = "LON",
+    allow_no_pullback: bool = True,     # ✅ /screen True, Email False (except HOT bypass)
+    hot_vol_usd: float = HOT_VOL_USD,   # 50M
+    trigger_loosen_mult: float = 1.0,
+    waiting_near_pct: float = SCREEN_WAITING_NEAR_PCT,
+) -> Optional[Setup]:
 
     fut_vol = usd_notional(mv)
     if fut_vol <= 0:
@@ -1711,22 +1766,15 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: 
         _rej("ohlcv_missing_or_insufficient", base, mv, "metrics/ema missing")
         return None
 
-
-    # --------- SOFT 1H TRIGGER ----------
-    # ✅ Email remains strict (loosen_mult=1.0)
-    # ✅ /screen can pass loosen_mult=SCREEN_TRIGGER_LOOSEN to generate more setups
+    # --------- SESSION-DYNAMIC 1H TRIGGER ----------
     atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
     trig_min_raw = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
 
-    # local parameter injected by caller (default = strict)
-    loosen_mult = float(locals().get("trigger_loosen_mult", 1.0) or 1.0)
-    trig_min = max(0.4, float(trig_min_raw) * float(loosen_mult))
+    trig_min = max(0.4, float(trig_min_raw) * float(trigger_loosen_mult))
 
     if abs(ch1) < trig_min:
-        # ✅ "Waiting for Trigger" near-miss capture (screen UX)
-        # Only store if it is close to triggering
-        near_thr = float(locals().get("waiting_near_pct", SCREEN_WAITING_NEAR_PCT))
-        if trig_min > 0 and abs(ch1) >= (near_thr * trig_min):
+        # "Waiting for Trigger" capture
+        if trig_min > 0 and abs(ch1) >= (float(waiting_near_pct) * trig_min):
             side_guess = "BUY" if ch1 > 0 else "SELL"
             _WAITING_TRIGGER[str(base)] = {
                 "side": side_guess,
@@ -1734,14 +1782,10 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: 
                 "trig": float(trig_min),
                 "need": float(trig_min - abs(ch1)),
             }
-
         _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% < {trig_min:.2f}% (ATR%={atr_pct_now:.2f})")
         return None
 
     side = "BUY" if ch1 > 0 else "SELL"
-
-
-    
 
     # 4H alignment
     if side == "BUY" and ch4 < ALIGN_4H_MIN:
@@ -1752,41 +1796,68 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: 
         return None
 
     # =========================================================
-    # ENGINE A — PULLBACK near Adaptive EMA
+    # ✅ PULLBACK EMA (7/14/21) selection (15m)
     # =========================================================
-    engine_a_ok = False
-    ema_ok, dist_pct, thr_pct, atr_pct = ema_support_proximity_ok(entry, ema_support_15m, atr_1h, session_name)
-    if ENGINE_A_PULLBACK_ENABLED and ema_ok:
-        engine_a_ok = True
+    closes_15 = [float(x[4]) for x in c15]
+    pb_ema_val, pb_ema_p, pb_dist_pct = best_pullback_ema_15m(closes_15, entry)
+
+    # "HOT" bypass: if futures 24h vol >= 50M, no pullback required
+    pullback_bypass_hot = (float(fut_vol) >= float(hot_vol_usd))
+
+    # Proximity threshold uses session knobs + ATR% (same idea as your adaptive EMA gate)
+    pb_ok = False
+    if pb_ema_val > 0:
+        pb_ok, _, _, _ = ema_support_proximity_ok(entry, pb_ema_val, atr_1h, session_name)
+
+    pullback_ready = bool(pb_ok or pullback_bypass_hot)
 
     # =========================================================
-    # ENGINE B — MOMENTUM / EXPANSION (pumps allowed far from EMA)
+    # ENGINE A (Pullback) vs ENGINE B (Momentum)
     # =========================================================
+    # Engine A requires pullback-ready (or hot bypass)
+    engine_a_ok = bool(ENGINE_A_PULLBACK_ENABLED and pullback_ready)
+
+    # Engine B = momentum/expansion (can be far from EMA)
     engine_b_ok = False
     if ENGINE_B_MOMENTUM_ENABLED:
         if abs(ch1) >= MOMENTUM_MIN_CH1 and abs(ch24) >= MOMENTUM_MIN_24H:
             if fut_vol >= (MOVER_VOL_USD_MIN * MOMENTUM_VOL_MULT):
-                # expansion vs ATR%
                 body_pct = abs(ch1)
                 if atr_pct_now > 0 and body_pct >= (MOMENTUM_ATR_BODY_MULT * atr_pct_now):
-                    # allow being far from EMA up to MOMENTUM_MAX_ADAPTIVE_EMA_DIST
+                    # distance vs ADAPTIVE EMA (existing pump tolerance)
+                    ema_ok, dist_pct, _, _ = ema_support_proximity_ok(entry, ema_support_15m, atr_1h, session_name)
                     if dist_pct <= MOMENTUM_MAX_ADAPTIVE_EMA_DIST:
                         engine_b_ok = True
 
+    # ---------------------------------------------------------
+    # ✅ Two-case logic AFTER 1H criteria:
+    # A) Pullback-ready => valid
+    # B) Not pullback-ready => only allowed on /screen (allow_no_pullback=True),
+    #    BUT emails must not use this (except hot bypass already handled above).
+    # ---------------------------------------------------------
     if not engine_a_ok and not engine_b_ok:
-        _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} dist={dist_pct:.2f}")
+        _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}")
         return None
 
-    engine = "B" if engine_b_ok else "A"
+    # If pullback not ready:
+    # - allow only if allow_no_pullback True AND engine_b_ok True (screen awareness)
+    if not pullback_ready:
+        if not (allow_no_pullback and engine_b_ok):
+            _rej("price_not_near_ema12_15m", base, mv, f"pullback_not_ready pb_dist={pb_dist_pct:.2f}")
+            return None
 
-    # Sharp 1H move gating (only for Engine A; Engine B is pump-tolerant)
+    # Prefer Engine A when pullback-ready; otherwise engine B
+    engine = "A" if pullback_ready else "B"
+
+    # Sharp 1H move gating:
+    # - if we are relying on pullback (engine A) then require EMA reaction
     if engine == "A" and abs(float(ch1)) >= float(SHARP_1H_MOVE_PCT):
-        if not ema_support_reaction_ok_15m(c15, ema_support_15m, side, session_name):
+        if not ema_support_reaction_ok_15m(c15, pb_ema_val, side, session_name):
             _rej("sharp_1h_no_ema_reaction", base, mv, f"ch1={ch1:+.2f}% needs EMA reaction")
             return None
 
-    # Soft 24H contradiction gate (dynamic by ATR%)
-    thr = clamp(max(12.0, 2.5 * atr_pct), 12.0, 22.0)
+    # Soft 24H contradiction gate
+    thr = clamp(max(12.0, 2.5 * ((atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0)), 12.0, 22.0)
     if side == "BUY" and ch24 <= -thr:
         _rej("24h_contradiction_for_long", base, mv, f"ch24={ch24:+.1f}% <= -{thr:.1f}%")
         return None
@@ -1805,14 +1876,12 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: 
 
     conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
 
-    # Early penalty only for emails
     if strict_15m and (not is_confirm_15m):
         conf = max(0, int(conf) - int(EARLY_CONF_PENALTY))
 
-    # Dynamic TP cap by coin hotness
     tp_cap_pct = tp_cap_pct_for_coin(fut_vol, ch24)
 
-    # ✅ Engine B gets higher TP expectation
+    # Engine B gets higher TP expectation ONLY when we actually tag engine B
     rr_bonus = ENGINE_B_RR_BONUS if engine == "B" else 0.0
     tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine == "B" else 0.0
 
@@ -1850,11 +1919,18 @@ def make_setup(base: str, mv: MarketVol, strict_15m: bool = True, session_name: 
         ch1=ch1,
         ch15=ch15,
         ema_support_period=int(ema_period),
-        ema_support_dist_pct=float(dist_pct),
-        engine=engine,
+        ema_support_dist_pct=float(abs(entry - float(ema_support_15m)) / entry * 100.0 if entry > 0 else 999.0),
+        pullback_ema_period=int(pb_ema_p),
+        pullback_ema_dist_pct=float(pb_dist_pct),
+        pullback_ready=bool(pullback_ready),
+        pullback_bypass_hot=bool(pullback_bypass_hot),
+        engine=str(engine),
         is_trailing_tp3=bool(hot),
         created_ts=time.time(),
     )
+
+
+
 
 
 
@@ -1868,6 +1944,7 @@ def pick_setups(
     universe_n: int = 35,
     trigger_loosen_mult: float = 1.0,
     waiting_near_pct: float = SCREEN_WAITING_NEAR_PCT,
+    allow_no_pullback: bool = True,   # ✅ screen True, email False (except HOT bypass inside make_setup)
 ) -> List[Setup]:
     global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL, _WAITING_TRIGGER
     _REJECT_STATS = Counter()
@@ -1880,16 +1957,21 @@ def pick_setups(
 
     setups: List[Setup] = []
     for base, mv in universe:
-        # Inject knobs into make_setup via locals() access (simple, low-touch)
-        # (keeps function signature stable everywhere else)
-        trigger_loosen_mult = float(trigger_loosen_mult)
-        waiting_near_pct = float(waiting_near_pct)
-        s = make_setup(base, mv, strict_15m=strict_15m, session_name=session_name)
+        s = make_setup(
+            base,
+            mv,
+            strict_15m=strict_15m,
+            session_name=session_name,
+            allow_no_pullback=allow_no_pullback,
+            trigger_loosen_mult=float(trigger_loosen_mult),
+            waiting_near_pct=float(waiting_near_pct),
+        )
         if s:
             setups.append(s)
 
     setups.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
     return setups[:n]
+
 
 
 
@@ -3123,6 +3205,20 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for i, s in enumerate(setups, 1):
                 rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
                 side_emoji = "🟢" if s.side == "BUY" else "🔴"
+                engine_tag = "🎯 Pullback (A)" if s.pullback_ready else "⚡️ Momentum (B)"
+
+            # ✅ Pullback status line for /screen (your Note2)
+            if s.pullback_ready:
+                if s.pullback_bypass_hot:
+                    pullback_line = f"🔥 Pullback: BYPASS (Vol ≥ {fmt_money(HOT_VOL_USD)})"
+                else:
+                    pullback_line = f"✅ Pullback: done near EMA{s.pullback_ema_period} (dist {s.pullback_ema_dist_pct:.2f}%)"
+            else:
+                pullback_line = f"⏳ Pullback: NOT YET — wait for EMA{s.pullback_ema_period} (dist {s.pullback_ema_dist_pct:.2f}%)"
+
+        tp3_mode = "TRAILING 🧲" if s.is_trailing_tp3 else "FIXED 🎯"
+
+                
                 engine_tag = "⚡️ Momentum (B)" if s.engine == "B" else "🎯 Pullback (A)"
 
                 if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
@@ -3142,6 +3238,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"╰━━━━━━━━━━━━━━━╯\n"
                     f"🆔 *ID:* `{s.setup_id}`\n"
                     f"{engine_tag}   |   *RR(TP3):* `{rr3:.2f}`   |   *TP3:* {tp3_mode}\n"
+                    f"{pullback_line}\n"
                     f"💰 *Entry:* `{fmt_price(s.entry)}`   |   🛑 *SL:* `{fmt_price(s.sl)}`\n"
                     f"🎯 {tps}\n"
                     f"📈 *Moves:* 24H {pct_with_emoji(s.ch24)}  •  4H {pct_with_emoji(s.ch4)}  •  1H {pct_with_emoji(s.ch1)}  •  15m {pct_with_emoji(s.ch15)}\n"
@@ -3396,8 +3493,14 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 best_fut,
                 max(EMAIL_SETUPS_N * 3, 9),
                 True,
-                sess_name
+                sess_name,
+                35,
+                1.0,
+                SCREEN_WAITING_NEAR_PCT,
+                False,   # ✅ allow_no_pullback = False for EMAIL (option A only, HOT bypass handled inside)
             )
+
+          
             setups_by_session[sess_name] = setups
             for s in setups:
                 db_insert_signal(s)
