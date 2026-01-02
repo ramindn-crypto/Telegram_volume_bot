@@ -3392,16 +3392,19 @@ def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, set
     parts.append(HDR)
     return "\n".join(parts).strip()
 
+
+
 # =========================================================
 # EMAIL JOB
 # =========================================================
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+    # Prevent overlapping runs (JobQueue can overlap if a run is slow)
     if ALERT_LOCK.locked():
         return
+
     async with ALERT_LOCK:
-        # Store decisions per user for /health transparency
+        # Keep it quiet if email is off or not configured
         if not EMAIL_ENABLED:
-            # no users loop; but keep bot quiet
             return
         if not email_config_ok():
             return
@@ -3421,33 +3424,34 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 pick_setups,
                 best_fut,
                 max(EMAIL_SETUPS_N * 3, 9),
-                True,
+                True,                 # strict_15m for email
                 sess_name,
-                35,
-                1.0,
+                35,                   # email universe
+                1.0,                  # no trigger loosen for email
                 SCREEN_WAITING_NEAR_PCT,
-                False,   # ✅ allow_no_pullback = False for EMAIL (option A only, HOT bypass handled inside)
+                False,                # ✅ allow_no_pullback = False for EMAIL
             )
 
-          
             setups_by_session[sess_name] = setups
             for s in setups:
                 db_insert_signal(s)
 
+        # Per-user send / skip logic
         for user in users:
             uid = int(user["user_id"])
             tz = ZoneInfo(user["tz"])
 
             sess = in_session_now(user)
-            # ✅ If user is NOT in an enabled session right now, skip (this is the main reason you saw: not_in_enabled_session)
-                if not sess:
-                    _LAST_EMAIL_DECISION[uid] = {
+
+            # ✅ If user is NOT in an enabled session right now, skip
+            if not sess:
+                _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
                     "reasons": ["not_in_enabled_session"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
-            
+
             setups_all = setups_by_session.get(sess["name"], [])
 
             if not setups_all:
@@ -3502,7 +3506,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
             confirmed: List[Setup] = []
             early: List[Setup] = []
-
             skip_reasons_counter = Counter()
 
             for s in setups_all:
@@ -3561,12 +3564,13 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
             now_local = datetime.now(tz)
             body = _email_body_pretty(sess["name"], now_local, user["tz"], filtered, best_fut)
-            subject = f"PulseFutures • {sess['name']} • Premium Setups ({int(st['sent_count'])+1})"
+            subject = f"PulseFutures • {sess['name']} • Premium Setups ({int(st['sent_count']) + 1})"
 
             ok = await asyncio.to_thread(send_email, subject, body, uid)
             if ok:
                 email_state_set(uid, sent_count=int(st["sent_count"]) + 1, last_email_ts=now_ts)
                 _email_daily_inc(uid, day_local, 1)
+
                 for s in filtered:
                     mark_symbol_emailed(uid, s.symbol)
 
@@ -3582,6 +3586,10 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     "reasons": [f"send_email_failed ({err})"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
+
+
+
+
 
 # =========================================================
 # /health (transparent system health)
