@@ -2147,7 +2147,6 @@ def _advice(user: dict, stats: dict) -> List[str]:
     return adv[:6]
 
 
-
 # =========================================================
 # HELP TEXT
 # =========================================================
@@ -2158,23 +2157,25 @@ PulseFutures — Commands (Telegram)
 - /screen
   Shows:
   • Top Trade Setups (best quality)
+  • Waiting for Trigger (near-miss)
+  • Trend Continuation Watch
   • Directional Leaders/Losers (24H ±10% with futures vol >= $5M)
   • Market Leaders by futures volume
-  • Reject Diagnostics (professional explanation)
+  • Diagnostics (based on your visibility mode)
 
 2) Position Sizing (Risk + SL => Qty)
 - /size <SYMBOL> <long|short> sl <STOP> [risk <usd|pct> <VALUE>] [entry <ENTRY>]
 
 Examples:
 - /size BTC long sl 42000
-  → Default risk = 2% of Equity (safer). If your equity is 0, set it first:
+  → Default risk = your configured risk (riskmode). If equity is 0, set it first:
     /equity 1000
 
 - /size BTC long risk usd 40 sl 42000
   → Bot uses current Bybit futures price as Entry and returns Qty for $40 risk.
 
 - /size ETH short risk pct 2.5 sl 2480
-  → Uses Equity. If your equity is 0, set it first:
+  → Uses Equity. If equity is 0, set it first:
     /equity 1000
 
 Manual entry examples:
@@ -2182,35 +2183,50 @@ Manual entry examples:
 - /size BTC long risk usd 50 sl 42000 entry 43000
 
 Notes:
-- If you do NOT specify "risk", the bot uses 2% of your Equity by default.
-- If you specify risk above 2% of Equity, the bot will warn you.
+- If you do NOT specify "risk", the bot uses your default /riskmode settings.
 - pct uses your Equity
 - Qty = RiskUSD / |Entry - SL|
 - This command does NOT open a trade.
 
-3) Trade Journal (Open / Close) + Equity auto-update
+3) Trade Journal (Open / Manage / Close) + Equity auto-update
 Set equity:
 - /equity 1000
+Reset equity:
+- /equity_reset
 
 Open trade:
 - /trade_open <SYMBOL> <long|short> entry <ENTRY> sl <SL> risk <usd|pct> <VALUE> [note "..."] [sig <SETUP_ID>]
+
+Manage open trade (NEW):
+- /trade_sl <TRADE_ID> <NEW_SL>
+  → Updates Stop Loss for an open trade (and updates trade risk). Warns if risk increased.
+
+- /trade_rf <TRADE_ID>
+  → Risk-Free: moves SL to Entry and sets trade risk to 0
+  → Also releases today's used risk by the previous risk amount.
 
 Close trade:
 - /trade_close <TRADE_ID> pnl <PNL>
 
 Equity behavior:
 - Equity updates ONLY when trades are closed
-- Persistent until reset:
-  /equity_reset
+- Trade journal stays persistent in DB
 
 4) Status
 - /status
+Shows:
+• equity, daily limits, used/remaining daily risk
+• sessions enabled + current session
+• email limits
+• open trades list
 
 5) Risk Settings
 - /riskmode pct 2.5
 - /riskmode usd 25
 - /dailycap pct 5
 - /dailycap usd 60
+
+Limits:
 - /limits maxtrades 5
 - /limits emailcap 4        (0 = unlimited)
 - /limits emailgap 60
@@ -2236,9 +2252,13 @@ Commands:
 
 Email rules:
 - Sent only during enabled sessions
-- Session-based quality filters
+- Session-based quality filters (conf + RR floors)
 - No same symbol for 18h
 - Daily email cap supported
+
+Admin-only:
+- /email_test
+  Sends a test email immediately (checks SMTP end-to-end).
 
 8) Performance Reports
 - /report_daily
@@ -2248,12 +2268,23 @@ Email rules:
 - /signals_daily
 - /signals_weekly
 
-10) Health (Transparent)
+10) Health / Diagnostics
 - /health
-Shows engine layer status, current session knobs, and last email decision.
+Shows engine layer status, session knobs, and last email decision.
+
+Diagnostics visibility (NEW):
+- /diag_on [friendly|off]
+- /diag_off
+
+Notes:
+- Admin always sees FULL diagnostics.
+- Non-admin can choose friendly/off based on system settings.
 
 Not financial advice.
 """
+
+
+
 
 # =========================================================
 # TELEGRAM COMMANDS
