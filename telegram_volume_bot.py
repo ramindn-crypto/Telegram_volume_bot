@@ -2923,6 +2923,7 @@ async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     old_risk = float(t["risk_usd"])
     new_risk = abs(entry - new_sl) * float(t["qty"])
 
+    # --- update trade in DB ---
     cur.execute(
         "UPDATE trades SET sl=?, risk_usd=? WHERE id=?",
         (new_sl, new_risk, trade_id),
@@ -2930,17 +2931,32 @@ async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     con.commit()
     con.close()
 
+    # ✅ UPDATE daily used risk based on delta
+    # اگر ریسک کم شد => used کم میشه (release)
+    # اگر ریسک زیاد شد => used زیاد میشه (consume)
+    user = get_user(uid)
+    day_local = _user_day_local(user)
+
+    delta = float(new_risk) - float(old_risk)
+    if abs(delta) > 1e-9:
+        _risk_daily_inc(uid, day_local, delta)
+
+        # prevent negative used risk (safety clamp)
+        used_now = _risk_daily_get(uid, day_local)
+        if used_now < 0:
+            con2 = db_connect()
+            cur2 = con2.cursor()
+            cur2.execute(
+                "UPDATE risk_daily SET used_risk_usd=? WHERE user_id=? AND day_local=?",
+                (0.0, uid, day_local),
+            )
+            con2.commit()
+            con2.close()
+
     warn = ""
-    if new_risk > old_risk:
+    if new_risk > old_risk + 1e-9:
         warn = "⚠️ Risk increased!"
 
-    await update.message.reply_text(
-        f"✅ SL Updated\n"
-        f"- Trade ID: {trade_id}\n"
-        f"- New SL: {fmt_price(new_sl)}\n"
-        f"- New Risk: ${new_risk:.2f}\n"
-        f"{warn}"
-    )
 
 
 async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
