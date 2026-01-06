@@ -751,11 +751,31 @@ def _reject_report(diag_mode: str = "friendly") -> str:
 # DB
 # =========================================================
 def db_connect() -> sqlite3.Connection:
+    # ensure directory exists
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
+
+    # safer sqlite on hosted envs
+    try:
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=NORMAL;")
+        con.execute("PRAGMA busy_timeout=5000;")
+        con.execute("PRAGMA foreign_keys=ON;")
+    except Exception:
+        pass
+
     return con
 
 def db_init():
+    # ensures folder exists before creating DB file
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+        
     con = db_connect()
     cur = con.cursor()
 
@@ -2883,6 +2903,7 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
 async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     tokens = context.args
@@ -2911,37 +2932,39 @@ async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     t = dict(row)
     entry = float(t["entry"])
-    side = t["side"]
+    side = str(t["side"]).upper()
 
+    # validate new SL direction
     if side == "BUY" and new_sl >= entry:
+        con.close()
         await update.message.reply_text("For BUY, SL must be below entry.")
         return
     if side == "SELL" and new_sl <= entry:
+        con.close()
         await update.message.reply_text("For SELL, SL must be above entry.")
         return
 
     old_risk = float(t["risk_usd"])
-    new_risk = abs(entry - new_sl) * float(t["qty"])
+    qty = float(t["qty"])
+    new_risk = abs(entry - new_sl) * qty
 
-    # --- update trade in DB ---
+    # update trade
     cur.execute(
-        "UPDATE trades SET sl=?, risk_usd=? WHERE id=?",
-        (new_sl, new_risk, trade_id),
+        "UPDATE trades SET sl=?, risk_usd=? WHERE id=? AND user_id=?",
+        (float(new_sl), float(new_risk), trade_id, uid),
     )
     con.commit()
     con.close()
 
-    # ✅ UPDATE daily used risk based on delta
-    # اگر ریسک کم شد => used کم میشه (release)
-    # اگر ریسک زیاد شد => used زیاد میشه (consume)
+    # update daily used risk by delta
     user = get_user(uid)
     day_local = _user_day_local(user)
-
     delta = float(new_risk) - float(old_risk)
+
     if abs(delta) > 1e-9:
         _risk_daily_inc(uid, day_local, delta)
 
-        # prevent negative used risk (safety clamp)
+        # clamp to 0 if negative due to edge cases
         used_now = _risk_daily_get(uid, day_local)
         if used_now < 0:
             con2 = db_connect()
@@ -2953,9 +2976,35 @@ async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             con2.commit()
             con2.close()
 
+    cap = daily_cap_usd(user)
+    used_today = _risk_daily_get(uid, day_local)
+    remaining_today = (cap - used_today) if cap > 0 else float("inf")
+
     warn = ""
     if new_risk > old_risk + 1e-9:
         warn = "⚠️ Risk increased!"
+    elif new_risk < old_risk - 1e-9:
+        warn = "✅ Risk reduced (released daily risk)."
+
+    await update.message.reply_text(
+        f"✅ Stop Loss UPDATED\n"
+        f"- Trade ID: {trade_id}\n"
+        f"- Side: {side}\n"
+        f"- Entry: {fmt_price(entry)}\n"
+        f"- New SL: {fmt_price(new_sl)}\n"
+        f"- Old Risk: ${old_risk:.2f}\n"
+        f"- New Risk: ${new_risk:.2f}\n"
+        f"{warn}\n\n"
+        f"📌 Daily Risk\n"
+        f"- Cap: ≈ ${cap:.2f}\n"
+        f"- Used today: ${used_today:.2f}\n"
+        f"- Remaining today: ${max(0.0, remaining_today):.2f}" if cap > 0 else
+        f"📌 Daily Risk\n"
+        f"- Cap: ≈ ${cap:.2f}\n"
+        f"- Used today: ${used_today:.2f}\n"
+        f"- Remaining today: ∞"
+    )
+
 
 
 
@@ -3517,7 +3566,7 @@ def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, set
 
     for i, s in enumerate(setups, 1):
         rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
-        parts.append(f"{i}) {s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}/100")
+        parts.append(f"{i}) {s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
         parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP3): {rr3:.2f}")
 
         if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
