@@ -2857,23 +2857,23 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     t = db_trade_close(uid, trade_id, pnl)
-   
-    # ✅ release unused risk if profitable
-    if pnl > 0:
-    day_local = _user_day_local(user)
-    _risk_daily_inc(uid, day_local, -float(t["risk_usd"]))
-
+    
     if not t:
         await update.message.reply_text("Trade not found or already closed.")
         return
-
+    
+    # ✅ release unused risk if profitable
+    if pnl > 0:
+        day_local = _user_day_local(user)
+        _risk_daily_inc(uid, day_local, -float(t["risk_usd"]))
+    
     new_eq = float(user["equity"]) + float(pnl)
     update_user(uid, equity=new_eq)
     user = get_user(uid)
-
+    
     r_mult = t.get("r_mult")
     r_txt = f"{r_mult:+.2f}R" if r_mult is not None else "-"
-
+    
     await update.message.reply_text(
         f"✅ Trade CLOSED\n"
         f"- ID: {trade_id}\n"
@@ -2881,7 +2881,6 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- R: {r_txt}\n"
         f"- New Equity: ${float(user['equity']):.2f}"
     )
-
 
 
 async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
