@@ -84,7 +84,7 @@ EXCHANGE_ID = "bybit"
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 DEFAULT_TYPE = "swap"  # bybit futures
-DB_PATH = os.environ.get("DB_PATH", "pulsefutures.db")
+DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
 
 CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "5"))
 
@@ -1668,8 +1668,8 @@ def build_leaders_table(best_fut: Dict[str, MarketVol]) -> str:
     leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:LEADERS_N]
     rows = []
     for base, mv in leaders:
-        rows.append([base, fmt_money(usd_notional(mv)), pct_with_emoji(float(mv.percentage or 0.0)), fmt_price(float(mv.last or 0.0))])
-    return "*Market Leaders (Top 10 by Futures Volume)*\n" + table_md(rows, ["SYM", "F Vol", "24H", "Last"])
+        rows.append([base, fmt_money(usd_notional(mv)), pct_with_emoji(float(mv.percentage or 0.0))])
+    return "*Market Leaders (Top 10 by Futures Volume)*\n" + table_md(rows, ["SYM", "F Vol", "24H"])
 
 def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tuple], List[Tuple]]:
     """
@@ -1713,8 +1713,8 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     up, dn = compute_directional_lists(best_fut)
     up_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4), fmt_price(px)] for b, v, c24, c4, px in up[:10]]
     dn_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4), fmt_price(px)] for b, v, c24, c4, px in dn[:10]]
-    up_txt = "*Directional Leaders (24H ≥ +10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(up_rows, ["SYM", "F Vol", "24H", "4H", "Last"]) if up_rows else "_None_")
-    dn_txt = "*Directional Losers (24H ≤ -10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(dn_rows, ["SYM", "F Vol", "24H", "4H", "Last"]) if dn_rows else "_None_")
+    up_txt = "*Directional Leaders (24H ≥ +10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(up_rows, ["SYM", "F Vol", "24H", "4H"]) if up_rows else "_None_")
+    dn_txt = "*Directional Losers (24H ≤ -10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(dn_rows, ["SYM", "F Vol", "24H", "4H"]) if dn_rows else "_None_")
     return up_txt, dn_txt
 
 
@@ -2845,6 +2845,112 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- New Equity: ${float(user['equity']):.2f}"
     )
 
+
+
+async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    tokens = context.args
+    if len(tokens) != 2:
+        await update.message.reply_text("Usage: /trade_sl <TRADE_ID> <NEW_SL>")
+        return
+
+    try:
+        trade_id = int(tokens[0])
+        new_sl = float(tokens[1])
+    except Exception:
+        await update.message.reply_text("Invalid arguments.")
+        return
+
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT * FROM trades WHERE id=? AND user_id=? AND closed_ts IS NULL",
+        (trade_id, uid),
+    )
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        await update.message.reply_text("Open trade not found.")
+        return
+
+    t = dict(row)
+    entry = float(t["entry"])
+    side = t["side"]
+
+    if side == "BUY" and new_sl >= entry:
+        await update.message.reply_text("For BUY, SL must be below entry.")
+        return
+    if side == "SELL" and new_sl <= entry:
+        await update.message.reply_text("For SELL, SL must be above entry.")
+        return
+
+    old_risk = float(t["risk_usd"])
+    new_risk = abs(entry - new_sl) * float(t["qty"])
+
+    cur.execute(
+        "UPDATE trades SET sl=?, risk_usd=? WHERE id=?",
+        (new_sl, new_risk, trade_id),
+    )
+    con.commit()
+    con.close()
+
+    warn = ""
+    if new_risk > old_risk:
+        warn = "⚠️ Risk increased!"
+
+    await update.message.reply_text(
+        f"✅ SL Updated\n"
+        f"- Trade ID: {trade_id}\n"
+        f"- New SL: {fmt_price(new_sl)}\n"
+        f"- New Risk: ${new_risk:.2f}\n"
+        f"{warn}"
+    )
+
+
+async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("Usage: /trade_rf <TRADE_ID>")
+        return
+
+    trade_id = int(context.args[0])
+
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT * FROM trades WHERE id=? AND user_id=? AND closed_ts IS NULL",
+        (trade_id, uid),
+    )
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        await update.message.reply_text("Open trade not found.")
+        return
+
+    t = dict(row)
+    entry = float(t["entry"])
+    old_risk = float(t["risk_usd"])
+
+    cur.execute(
+        "UPDATE trades SET sl=?, risk_usd=? WHERE id=?",
+        (entry, 0.0, trade_id),
+    )
+    con.commit()
+    con.close()
+
+    # ✅ Risk Free of the Day
+    day_local = _user_day_local(get_user(uid))
+    _risk_daily_inc(uid, day_local, -old_risk)
+
+    await update.message.reply_text(
+        f"🟢 Trade Risk-Free\n"
+        f"- Trade ID: {trade_id}\n"
+        f"- SL moved to Entry\n"
+        f"- Released Risk: ${old_risk:.2f}"
+    )
+
+
+
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
@@ -3119,9 +3225,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         header = (
             f"✨ *PulseFutures — Market Scan*\n"
             f"{HDR}\n"
-            f"🧠 *Session:* `{session}`   |   🕒 *Melbourne:* `{now_mel}`\n"
-            f"📦 *Universe:* `{len(best_fut)}` tickers\n"
-            f"{HDR}"
+            f"🧠 *Session:* `{session}`   |   🕒 *Melbourne:* `{now_mel}`\n"          
         )
 
         # -------------------------------------------------
@@ -3172,7 +3276,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"╭──────────────╮\n"
                     f"*#{i}* {side_emoji} *{s.side}* — *{s.symbol}*\n"
                     f"╰──────────────╯\n"
-                    f"🆔 `{s.setup_id}`  |  *Conf:* `{s.conf}/100`\n"
+                    f"🆔 `{s.setup_id}`  |  *Conf:* `{s.conf}`\n"
                     f"{engine_tag}  |  *RR(TP3):* `{rr3:.2f}`\n"
                     f"🧲 *Pullback:* {pullback}\n"
                     f"💰 *Entry:* `{fmt_price(s.entry)}`   |   🛑 *SL:* `{fmt_price(s.sl)}`\n"
@@ -3199,7 +3303,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 side_emoji = "🟢" if d.get("side") == "BUY" else "🔴"
                 lines.append(
                     f"• *{base}* {side_emoji} `{d['side']}` | "
-                    f"1H `{d['ch1']:+.2f}%` → need `{d['need']:.2f}%` (trigger `{d['trig']:.2f}%`)"
+                    f"1H `{d['ch1']:+.2f}%` → trigger `{d['trig']:.2f}%`"
                 )
             waiting_txt = "\n".join(lines)
 
@@ -3260,9 +3364,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if trend_txt:
             blocks.extend(["", trend_txt])
 
-        if reject_txt:
-            blocks.extend(["", reject_txt])
-
+            
         blocks.extend([
             "",
             "📌 *Directional Leaders / Losers*",
@@ -3703,6 +3805,9 @@ def main():
     app.add_handler(CommandHandler("dailycap", dailycap_cmd))
     app.add_handler(CommandHandler("limits", limits_cmd))
 
+    app.add_handler(CommandHandler("trade_sl", trade_sl_cmd))
+    app.add_handler(CommandHandler("trade_rf", trade_rf_cmd))
+    
     app.add_handler(CommandHandler("sessions", sessions_cmd))
     app.add_handler(CommandHandler("sessions_on", sessions_on_cmd))
     app.add_handler(CommandHandler("sessions_off", sessions_off_cmd))
