@@ -1711,8 +1711,8 @@ def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tupl
 
 def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     up, dn = compute_directional_lists(best_fut)
-    up_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4), fmt_price(px)] for b, v, c24, c4, px in up[:10]]
-    dn_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4), fmt_price(px)] for b, v, c24, c4, px in dn[:10]]
+    up_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4)] for b, v, c24, c4, px in up[:10]]
+    dn_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4)] for b, v, c24, c4, px in dn[:10]]
     up_txt = "*Directional Leaders (24H ≥ +10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(up_rows, ["SYM", "F Vol", "24H", "4H"]) if up_rows else "_None_")
     dn_txt = "*Directional Losers (24H ≤ -10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(dn_rows, ["SYM", "F Vol", "24H", "4H"]) if dn_rows else "_None_")
     return up_txt, dn_txt
@@ -2857,6 +2857,12 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     t = db_trade_close(uid, trade_id, pnl)
+   
+    # ✅ release unused risk if profitable
+    if pnl > 0:
+    day_local = _user_day_local(user)
+    _risk_daily_inc(uid, day_local, -float(t["risk_usd"]))
+
     if not t:
         await update.message.reply_text("Trade not found or already closed.")
         return
@@ -3368,7 +3374,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 side_emoji = "🟢" if t["side"] == "BUY" else "🔴"
                 lines.append(
                     f"• *{t['symbol']}* {side_emoji} `{t['side']}`  |  "
-                    f"Conf `{t['confidence']}/100`  |  24H {pct_with_emoji(t['ch24'])}"
+                    f"Conf `{t['confidence']}`  |  24H {pct_with_emoji(t['ch24'])}"
                 )
             trend_txt = "\n".join(lines)
 
