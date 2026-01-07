@@ -1687,9 +1687,28 @@ def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: flo
 def build_leaders_table(best_fut: Dict[str, MarketVol]) -> str:
     leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:LEADERS_N]
     rows = []
+
     for base, mv in leaders:
-        rows.append([base, fmt_money(usd_notional(mv)), pct_with_emoji(float(mv.percentage or 0.0))])
-    return "*Market Leaders (Top 10 by Futures Volume)*\n" + table_md(rows, ["SYM", "F Vol", "24H"])
+        # ✅ 4H change from real 4h candles (light: limit=2)
+        ch4 = 0.0
+        try:
+            c4h = fetch_ohlcv(mv.symbol, "4h", limit=2)
+            if c4h and len(c4h) >= 2:
+                c_last = float(c4h[-1][4])
+                c_prev = float(c4h[-2][4])
+                if c_prev > 0:
+                    ch4 = ((c_last - c_prev) / c_prev) * 100.0
+        except Exception:
+            ch4 = 0.0
+
+        rows.append([
+            base,
+            fmt_money(usd_notional(mv)),
+            pct_with_emoji(float(mv.percentage or 0.0)),  # 24H
+            pct_with_emoji(float(ch4)),                  # 4H
+        ])
+
+    return "*Market Leaders (Top 10 by Futures Volume)*\n" + table_md(rows, ["SYM", "F Vol", "24H", "4H"])
 
 def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tuple], List[Tuple]]:
     """
