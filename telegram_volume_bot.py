@@ -1758,6 +1758,10 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
 
 
 
+# =========================================================
+# ✅ MODIFIED: make_setup (trailing TP3 only when it's a trailing-needed setup)
+# Rule applied: trailing only for HOT coins AND Engine B (Momentum)
+# =========================================================
 def make_setup(
     base: str,
     mv: MarketVol,
@@ -1824,7 +1828,6 @@ def make_setup(
     # "HOT" bypass: if futures 24h vol >= 50M, no pullback required
     pullback_bypass_hot = (float(fut_vol) >= float(hot_vol_usd))
 
-    # Proximity threshold uses session knobs + ATR% (same idea as your adaptive EMA gate)
     pb_ok = False
     if pb_ema_val > 0:
         pb_ok, _, _, _ = ema_support_proximity_ok(entry, pb_ema_val, atr_1h, session_name)
@@ -1832,51 +1835,36 @@ def make_setup(
     pullback_ready = bool(pb_ok or pullback_bypass_hot)
 
     # =========================================================
-    # ENGINE A (Pullback) vs ENGINE B (Momentum)
+    # ENGINE A (Mean-Reversion) vs ENGINE B (Momentum)
     # =========================================================
-    # Engine A requires pullback-ready (or hot bypass)
     engine_a_ok = bool(ENGINE_A_PULLBACK_ENABLED and pullback_ready)
 
-    # Engine B = momentum/expansion (can be far from EMA)
     engine_b_ok = False
     if ENGINE_B_MOMENTUM_ENABLED:
         if abs(ch1) >= MOMENTUM_MIN_CH1 and abs(ch24) >= MOMENTUM_MIN_24H:
             if fut_vol >= (MOVER_VOL_USD_MIN * MOMENTUM_VOL_MULT):
                 body_pct = abs(ch1)
                 if atr_pct_now > 0 and body_pct >= (MOMENTUM_ATR_BODY_MULT * atr_pct_now):
-                    # distance vs ADAPTIVE EMA (existing pump tolerance)
                     ema_ok, dist_pct, _, _ = ema_support_proximity_ok(entry, ema_support_15m, atr_1h, session_name)
                     if dist_pct <= MOMENTUM_MAX_ADAPTIVE_EMA_DIST:
                         engine_b_ok = True
 
-    # ---------------------------------------------------------
-    # ✅ Two-case logic AFTER 1H criteria:
-    # A) Pullback-ready => valid
-    # B) Not pullback-ready => only allowed on /screen (allow_no_pullback=True),
-    #    BUT emails must not use this (except hot bypass already handled above).
-    # ---------------------------------------------------------
     if not engine_a_ok and not engine_b_ok:
         _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}")
         return None
 
-    # If pullback not ready:
-    # - allow only if allow_no_pullback True AND engine_b_ok True (screen awareness)
     if not pullback_ready:
         if not (allow_no_pullback and engine_b_ok):
             _rej("price_not_near_ema12_15m", base, mv, f"pullback_not_ready pb_dist={pb_dist_pct:.2f}")
             return None
 
-    # Prefer Engine A when pullback-ready; otherwise engine B
     engine = "A" if pullback_ready else "B"
 
-    # Sharp 1H move gating:
-    # - if we are relying on pullback (engine A) then require EMA reaction
     if engine == "A" and abs(float(ch1)) >= float(SHARP_1H_MOVE_PCT):
         if not ema_support_reaction_ok_15m(c15, pb_ema_val, side, session_name):
             _rej("sharp_1h_no_ema_reaction", base, mv, f"ch1={ch1:+.2f}% needs EMA reaction")
             return None
 
-    # Soft 24H contradiction gate
     thr = clamp(max(12.0, 2.5 * ((atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0)), 12.0, 22.0)
     if side == "BUY" and ch24 <= -thr:
         _rej("24h_contradiction_for_long", base, mv, f"ch24={ch24:+.1f}% <= -{thr:.1f}%")
@@ -1885,7 +1873,6 @@ def make_setup(
         _rej("24h_contradiction_for_short", base, mv, f"ch24={ch24:+.1f}% >= +{thr:.1f}%")
         return None
 
-    # 15m confirm logic (email strictness only)
     is_confirm_15m = abs(ch15) >= CONFIRM_15M_ABS_MIN
     is_early_allowed = (abs(ch1) >= EARLY_1H_ABS_MIN)
 
@@ -1895,13 +1882,11 @@ def make_setup(
             return None
 
     conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
-
     if strict_15m and (not is_confirm_15m):
         conf = max(0, int(conf) - int(EARLY_CONF_PENALTY))
 
     tp_cap_pct = tp_cap_pct_for_coin(fut_vol, ch24)
 
-    # Engine B gets higher TP expectation ONLY when we actually tag engine B
     rr_bonus = ENGINE_B_RR_BONUS if engine == "B" else 0.0
     tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine == "B" else 0.0
 
@@ -1921,6 +1906,9 @@ def make_setup(
 
     sid = next_setup_id()
     hot = is_hot_coin(fut_vol, ch24)
+
+    # ✅ trailing only for the setups that need it (Momentum + Hot)
+    trailing_tp3 = bool(hot and engine == "B")
 
     return Setup(
         setup_id=sid,
@@ -1945,14 +1933,9 @@ def make_setup(
         pullback_ready=bool(pullback_ready),
         pullback_bypass_hot=bool(pullback_bypass_hot),
         engine=str(engine),
-        is_trailing_tp3=bool(hot),
+        is_trailing_tp3=trailing_tp3,
         created_ts=time.time(),
     )
-
-
-
-
-
 
 
 
@@ -3316,16 +3299,65 @@ def trend_watch_for_symbol(base, mv, session_name):
         return None
 
 
+# =========================================================
+# User location/time helpers (TZ -> City/Country label)
+# =========================================================
+def tz_location_label(tz_name: str) -> str:
+    """
+    Converts IANA TZ like 'Australia/Melbourne' -> 'Melbourne (Australia)'
+    """
+    tz_name = (tz_name or "").strip()
+    if not tz_name or "/" not in tz_name:
+        return tz_name or "Unknown"
+
+    parts = tz_name.split("/")
+    region = (parts[0] or "").replace("_", " ")
+    city = (parts[-1] or "").replace("_", " ")
+    if region and city:
+        return f"{city} ({region})"
+    return city or region or tz_name
+
+def user_location_and_time(user: dict) -> Tuple[str, str]:
+    """
+    Returns: (location_label, time_str) based on user's tz
+    """
+    tz_name = str(user.get("tz") or "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+        tz_name = "UTC"
+
+    now_local = datetime.now(tz)
+    loc = tz_location_label(tz_name)
+    return loc, now_local.strftime("%Y-%m-%d %H:%M")
+
 
 # =========================================================
-# /screen — Premium Telegram UI
+# movers_tables (remove brackets/thresholds from titles)
+# =========================================================
+def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
+    up, dn = compute_directional_lists(best_fut)
+    up_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4)] for b, v, c24, c4, px in up[:10]]
+    dn_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4)] for b, v, c24, c4, px in dn[:10]]
+
+    up_txt = "*Directional Leaders*\n" + (table_md(up_rows, ["SYM", "F Vol", "24H", "4H"]) if up_rows else "_None_")
+    dn_txt = "*Directional Losers*\n" + (table_md(dn_rows, ["SYM", "F Vol", "24H", "4H"]) if dn_rows else "_None_")
+    return up_txt, dn_txt
+
+
+
+# =========================================================
+# ✅ MODIFIED: /screen — Premium Telegram UI
+# Changes:
+# 1) Header shows USER city/location + time (not Melbourne hardcoded)
+# 2) Under each signal: remove "Pullback" word + remove pullback line
+# 3) Directional Leaders/Losers titles handled in movers_tables() above
 # =========================================================
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        # quick UX response
         await update.message.reply_text("⏳ Scanning market… Please wait")
 
-        # Reset per-run trackers
         reset_reject_tracker()
 
         best_fut = await asyncio.to_thread(fetch_futures_tickers)
@@ -3334,18 +3366,18 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # -------------------------------------------------
-        # Header / session
+        # Header / session + user location/time
         # -------------------------------------------------
         uid = update.effective_user.id
         user = get_user(uid)
 
         session = current_session_utc()
-        now_mel = datetime.now(ZoneInfo("Australia/Melbourne")).strftime("%Y-%m-%d %H:%M")
 
+        loc_label, loc_time = user_location_and_time(user)
         header = (
             f"✨ *PulseFutures — Market Scan*\n"
             f"{HDR}\n"
-            f"🧠 *Session:* `{session}`   |   🕒 *Melbourne:* `{now_mel}`\n"          
+            f"🧠 *Session:* `{session}`   |   📍 *{loc_label}:* `{loc_time}`\n"
         )
 
         # -------------------------------------------------
@@ -3373,16 +3405,11 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cards = []
             for i, s in enumerate(setups, 1):
                 side_emoji = "🟢" if s.side == "BUY" else "🔴"
-                engine_tag = "⚡️ Momentum" if s.engine == "B" else "🎯 Pullback"
-                rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
 
-                pullback = (
-                    "🔥 Bypass (Hot)"
-                    if s.pullback_bypass_hot
-                    else f"EMA{s.pullback_ema_period} ({s.pullback_ema_dist_pct:.2f}%)"
-                    if s.pullback_ready
-                    else f"⏳ Waiting EMA{s.pullback_ema_period}"
-                )
+                # ✅ remove "Pullback" word
+                engine_tag = "⚡️ Momentum" if s.engine == "B" else "🎯 Mean-Reversion"
+
+                rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
 
                 tp_line = (
                     f"*TP1:* `{fmt_price(s.tp1)}`  |  "
@@ -3392,13 +3419,13 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else f"*TP:* `{fmt_price(s.tp3)}`"
                 )
 
+                # ✅ remove pullback block entirely
                 cards.append(
                     f"╭──────────────╮\n"
                     f"*#{i}* {side_emoji} *{s.side}* — *{s.symbol}*\n"
                     f"╰──────────────╯\n"
                     f"🆔 `{s.setup_id}`  |  *Conf:* `{s.conf}`\n"
                     f"{engine_tag}  |  *RR(TP3):* `{rr3:.2f}`\n"
-                    f"🧲 *Pullback:* {pullback}\n"
                     f"💰 *Entry:* `{fmt_price(s.entry)}`   |   🛑 *SL:* `{fmt_price(s.sl)}`\n"
                     f"🎯 {tp_line}\n"
                     f"📈 *Moves:* 24H {pct_with_emoji(s.ch24)}  •  "
@@ -3440,7 +3467,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trend_watch = []
         up_list, dn_list = compute_directional_lists(best_fut)
 
-        # take a small watchlist from leaders/losers (already filtered for vol+move+4h align)
         watch = [b for b, *_ in up_list[:6]] + [b for b, *_ in dn_list[:6]]
 
         for base in dict.fromkeys(watch):
@@ -3484,7 +3510,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if trend_txt:
             blocks.extend(["", trend_txt])
 
-            
         blocks.extend([
             "",
             "📌 *Directional Leaders / Losers*",
@@ -3500,7 +3525,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         msg = "\n".join([b for b in blocks if b is not None]).strip()
 
-        # Inline buttons for quick charts (top setups only)
         keyboard = [
             [InlineKeyboardButton(text=f"📈 {s.symbol} • {s.setup_id}", url=tv_chart_url(s.symbol))]
             for s in (setups or [])
@@ -3517,8 +3541,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("screen_cmd failed")
         await update.message.reply_text(f"⚠️ /screen failed: {e}")
-
-
 
 
 
@@ -3555,12 +3577,25 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# EMAIL BODY
+# ✅ MODIFIED: EMAIL BODY
+# Changes:
+# 4) TP3 Mode: Trailing only when setup.is_trailing_tp3 True (now engine B + hot)
+# 5) Header includes user City/Country + time (same as /screen)
+# 6) Setup ID is shown as "ID-<id>"
 # =========================================================
-def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, setups: List[Setup], best_fut: Dict[str, MarketVol]) -> str:
+def _email_body_pretty(
+    session_name: str,
+    now_local: datetime,
+    user_tz: str,
+    setups: List[Setup],
+    best_fut: Dict[str, MarketVol],
+) -> str:
+    loc_label = tz_location_label(user_tz)
+    when_str = now_local.strftime("%Y-%m-%d %H:%M")
+
     parts = []
     parts.append(HDR)
-    parts.append(f"📩 PulseFutures • {session_name} Session • {now_local.strftime('%Y-%m-%d %H:%M')} ({user_tz})")
+    parts.append(f"📩 PulseFutures • {session_name} • {loc_label}: {when_str} ({user_tz})")
     parts.append(HDR)
     parts.append("")
 
@@ -3585,7 +3620,9 @@ def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, set
 
     for i, s in enumerate(setups, 1):
         rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
-        parts.append(f"{i}) {s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
+
+        # ✅ "ID-" prefix
+        parts.append(f"{i}) ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
         parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP3): {rr3:.2f}")
 
         if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
@@ -3597,10 +3634,14 @@ def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, set
         else:
             parts.append(f"   TP: {fmt_price_email(s.tp3)}")
 
+        # ✅ only for trailing-needed setups
         if s.is_trailing_tp3:
-            parts.append("   TP3 Mode: Trailing (hot coin)")
+            parts.append("   TP3 Mode: Trailing")
 
-        parts.append(f"   24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | 1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}")
+        parts.append(
+            f"   24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | "
+            f"1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}"
+        )
         parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
         parts.append("")
 
@@ -3612,6 +3653,7 @@ def _email_body_pretty(session_name: str, now_local: datetime, user_tz: str, set
     parts.append("Not financial advice.")
     parts.append("PulseFutures")
     parts.append(HDR)
+
     return "\n".join(parts).strip()
 
 
