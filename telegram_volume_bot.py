@@ -240,7 +240,7 @@ TICKERS_TTL_SEC = 45
 OHLCV_TTL_SEC = 60
 
 # =========================================================
-# DEBUG / REJECT REASONS (INTERNAL ONLY)
+# help (INTERNAL ONLY)
 # =========================================================
 # Keep internal reject stats for you, but DO NOT show to public
 DEBUG_REJECTS = os.environ.get("DEBUG_REJECTS", "false").lower() == "true"
@@ -255,11 +255,6 @@ HDR = "━━━━━━━━━━━━━━━━━━━━"
 SEP = "────────────────────"
 
 ALERT_LOCK = asyncio.Lock()
-
-
-
-
-
 
 # Sessions defined in UTC windows (market convention, with overlaps)
 # ASIA: 00:00–09:00 UTC
@@ -1796,20 +1791,28 @@ def make_setup(
 
     trig_min = max(0.4, float(trig_min_raw) * float(trigger_loosen_mult))
 
+
+
     if abs(ch1) < trig_min:
-        # "Waiting for Trigger" capture
-        if trig_min > 0 and abs(ch1) >= (float(waiting_near_pct) * trig_min):
-            side_guess = "BUY" if ch1 > 0 else "SELL"
-            _WAITING_TRIGGER[str(base)] = {
-                "side": side_guess,
-                "ch1": float(ch1),
-                "trig": float(trig_min),
-                "need": float(trig_min - abs(ch1)),
-            }
-        _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% < {trig_min:.2f}% (ATR%={atr_pct_now:.2f})")
+        # Waiting for Trigger (near-miss) — store ONLY side + a color dot (no numbers)
+        if trig_min > 0:
+            ratio = abs(ch1) / trig_min  # internal only
+            if ratio >= float(waiting_near_pct):
+                # color indicates "how close" WITHOUT revealing thresholds
+                if ratio >= 0.92:
+                    dot = "🟢"
+                elif ratio >= 0.82:
+                    dot = "🟡"
+                else:
+                    dot = "🔴"
+    
+                side_guess = "BUY" if ch1 > 0 else "SELL"
+                _WAITING_TRIGGER[str(base)] = {"side": side_guess, "dot": dot}
+    
+        _rej("ch1_below_trigger", base, mv)
         return None
 
-    side = "BUY" if ch1 > 0 else "SELL"
+       side = "BUY" if ch1 > 0 else "SELL"
 
     # 4H alignment
     if side == "BUY" and ch4 < ALIGN_4H_MIN:
@@ -2181,9 +2184,8 @@ PulseFutures — Commands (Telegram)
   • Top Trade Setups (best quality)
   • Waiting for Trigger (near-miss)
   • Trend Continuation Watch
-  • Directional Leaders/Losers (24H ±10% with futures vol >= $5M)
+  • Directional Leaders/Losers 
   • Market Leaders by futures volume
-  • Diagnostics (based on your visibility mode)
 
 2) Position Sizing (Risk + SL => Qty)
 - /size <SYMBOL> <long|short> sl <STOP> [risk <usd|pct> <VALUE>] [entry <ENTRY>]
@@ -2290,22 +2292,12 @@ Admin-only:
 - /signals_daily
 - /signals_weekly
 
-10) Health / Diagnostics
+
+10) HEalth 
 - /health
-Shows engine layer status, session knobs, and last email decision.
-
-Diagnostics visibility (NEW):
-- /diag_on [friendly|off]
-- /diag_off
-
-Notes:
-- Admin always sees FULL diagnostics.
-- Non-admin can choose friendly/off based on system settings.
 
 Not financial advice.
 """
-
-
 
 
 # =========================================================
@@ -2318,62 +2310,15 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
-    sess_now = in_session_now(user)
-    sess_name = sess_now["name"] if sess_now else current_session_utc()
-    knobs = session_knobs(sess_name)
-
-    last_dec = _LAST_EMAIL_DECISION.get(uid, {})
-    diag_mode = user_diag_mode(uid)
-
-    last_lines = []
-    if last_dec:
-        last_lines.append(f"Last email decision: {last_dec.get('status','-')}")
-        if last_dec.get("status") == "SKIP":
-            reasons = last_dec.get("reasons", [])
-            if reasons:
-                last_lines.append("Top skip reasons:")
-                for r in reasons[:6]:
-                    last_lines.append(f"- {r}")
-        if last_dec.get("when"):
-            last_lines.append(f"When: {last_dec.get('when')}")
-
-    prox_mode = f"Session-adaptive ({knobs['name']}: mult={knobs['ema_prox_mult']:.2f})"
-    react_mode = f"Session-adaptive ({knobs['name']}: lookback={knobs['ema_reaction_lookback']})"
-    trig_mode = f"ATR-adaptive ({knobs['name']}: mult={knobs['trigger_atr_mult']:.2f})"
-
-    rr_floor = SESSION_MIN_RR_TP3.get(knobs["name"], 2.0)
-    conf_floor = SESSION_MIN_CONF.get(knobs["name"], 78)
-
     smtp_err = _LAST_SMTP_ERROR.get(uid, "")
-
     msg = [
-        "🫀 PulseFutures Health Check",
+        "🫀 PulseFutures Health",
         HDR,
         f"User TZ: {user['tz']}",
-        f"Session (user-enabled): {sess_name}",
-        f"Diagnostics mode: {('FULL' if is_admin_user(uid) else diag_mode)}",
-        "",
-        "Layer / Status",
-        SEP,
-        f"EMA12 Proximity: ✅ {prox_mode}",
-        f"EMA12 Reaction: ✅ {react_mode}",
-        f"1H Trigger: ✅ {trig_mode}",
-        f"Confidence floors: ✅ Session-based (min={conf_floor})",
-        f"RR floors: ✅ Session-based (minRR={rr_floor:.2f})",
-        f"TP scaling: ✅ Confidence-weighted",
-        "",
         f"Email Engine: {'ACTIVE' if EMAIL_ENABLED and email_config_ok() else 'OFF/NOT CONFIGURED'}",
         f"SMTP last error: {smtp_err if smtp_err else '-'}",
-        f"Scanner cache: tickers_ttl={TICKERS_TTL_SEC}s ohlcv_ttl={OHLCV_TTL_SEC}s",
-        f"Reject Diagnostics: {'ON' if diag_mode != 'off' or is_admin_user(uid) else 'OFF'} | Samples: {'ON' if DEBUG_REJECTS else 'OFF'}",
         HDR,
     ]
-    if last_lines:
-        msg.append("Last Email Details")
-        msg.append(SEP)
-        msg.extend(last_lines)
-        msg.append(HDR)
-
     await update.message.reply_text("\n".join(msg).strip())
 
 
@@ -3447,11 +3392,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _WAITING_TRIGGER:
             lines = ["⏳ *Waiting for Trigger (near-miss)*", SEP]
             for base, d in list(_WAITING_TRIGGER.items())[:SCREEN_WAITING_N]:
-                side_emoji = "🟢" if d.get("side") == "BUY" else "🔴"
-                lines.append(
-                    f"• *{base}* {side_emoji} `{d['side']}` | "
-                    f"1H `{d['ch1']:+.2f}%` → trigger `{d['trig']:.2f}%`"
-                )
+                dot = d.get("dot", "🟡")
+                side = d.get("side", "BUY")
+                lines.append(f"• *{base}* {dot} `{side}`")
             waiting_txt = "\n".join(lines)
 
         # -------------------------------------------------
@@ -3989,8 +3932,7 @@ def main():
 
     app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CommandHandler("health_sys", health_sys_cmd))
-    app.add_handler(CommandHandler("diag_on", diag_on_cmd))
-    app.add_handler(CommandHandler("diag_off", diag_off_cmd))
+
     app.add_handler(CommandHandler("email_test", email_test_cmd))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
