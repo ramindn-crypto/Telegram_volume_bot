@@ -188,7 +188,29 @@ DEFAULT_MAX_EMAILS_PER_DAY = 4
 DEFAULT_MAX_RISK_PCT_PER_TRADE = 2.0
 WARN_RISK_PCT_PER_TRADE = 2.0
 
+# =========================================================
+# ✅ COOLDOWNS (email anti-spam)
+# =========================================================
+# Session-aware cooldown hours (recommended)
+SESSION_SYMBOL_COOLDOWN_HOURS = {
+    "NY": 2,     # more active
+    "LON": 3,    # balanced
+    "ASIA": 4,   # more strict
+}
+
+# Fallback if session unknown
 SYMBOL_COOLDOWN_HOURS = 4
+
+def cooldown_hours_for_session(session_name: str) -> int:
+    s = (session_name or "").strip().upper()
+    return int(SESSION_SYMBOL_COOLDOWN_HOURS.get(s, SYMBOL_COOLDOWN_HOURS))
+
+def max_cooldown_hours() -> int:
+    try:
+        return int(max(list(SESSION_SYMBOL_COOLDOWN_HOURS.values()) + [SYMBOL_COOLDOWN_HOURS]))
+    except Exception:
+        return int(SYMBOL_COOLDOWN_HOURS)
+
 
 # Multi-TP
 ATR_PERIOD = 14
@@ -607,25 +629,65 @@ def db_init():
     con = db_connect()
     cur = con.cursor()
 
+        # =========================================================
+    # ✅ Cooldown table (v2): direction-aware + optional session stamp
+    # - old: PRIMARY KEY(user_id, symbol)
+    # - new: PRIMARY KEY(user_id, symbol, side)
+    # =========================================================
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        tz TEXT NOT NULL,
-        equity REAL NOT NULL,
-        risk_mode TEXT NOT NULL,
-        risk_value REAL NOT NULL,
-        daily_cap_mode TEXT NOT NULL,
-        daily_cap_value REAL NOT NULL,
-        max_trades_day INTEGER NOT NULL,
-        notify_on INTEGER NOT NULL,
-        sessions_enabled TEXT NOT NULL,
-        max_emails_per_session INTEGER NOT NULL,
-        email_gap_min INTEGER NOT NULL,
-        max_emails_per_day INTEGER NOT NULL,
-        day_trade_date TEXT NOT NULL,
-        day_trade_count INTEGER NOT NULL
+    CREATE TABLE IF NOT EXISTS emailed_symbols (
+        user_id INTEGER NOT NULL,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        session TEXT NOT NULL DEFAULT '',
+        emailed_ts REAL NOT NULL,
+        PRIMARY KEY (user_id, symbol, side)
     )
     """)
+
+    # --- Migration from old schema (if needed) ---
+    # If table exists but missing "side", then it's old schema.
+    try:
+        cur.execute("PRAGMA table_info(emailed_symbols)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "side" not in cols:
+            # Create new table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS emailed_symbols_v2 (
+                    user_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    session TEXT NOT NULL DEFAULT '',
+                    emailed_ts REAL NOT NULL,
+                    PRIMARY KEY (user_id, symbol, side)
+                )
+            """)
+
+            # Copy old rows -> assume side=ANY (we duplicate into BUY and SELL to be safe)
+            cur.execute("SELECT user_id, symbol, emailed_ts FROM emailed_symbols")
+            old_rows = cur.fetchall() or []
+            for r in old_rows:
+                uid0 = int(r[0])
+                sym0 = str(r[1]).upper()
+                ts0 = float(r[2])
+                # Duplicate into BUY and SELL so cooldown still applies in both directions initially.
+                cur.execute("""
+                    INSERT OR REPLACE INTO emailed_symbols_v2 (user_id, symbol, side, session, emailed_ts)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (uid0, sym0, "BUY", "", ts0))
+                cur.execute("""
+                    INSERT OR REPLACE INTO emailed_symbols_v2 (user_id, symbol, side, session, emailed_ts)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (uid0, sym0, "SELL", "", ts0))
+
+            # Swap tables
+            cur.execute("DROP TABLE emailed_symbols")
+            cur.execute("ALTER TABLE emailed_symbols_v2 RENAME TO emailed_symbols")
+            con.commit()
+    except Exception:
+        # Don't block startup if migration fails; worst case cooldown table resets.
+        pass
+
 
     cur.execute("PRAGMA table_info(users)")
     cols = {r[1] for r in cur.fetchall()}
@@ -829,26 +891,78 @@ def email_state_set(user_id: int, **kwargs):
     con.commit()
     con.close()
 
-def mark_symbol_emailed(user_id: int, symbol: str):
+def mark_symbol_emailed(user_id: int, symbol: str, side: str, session_name: str = ""):
+    """
+    ✅ Direction-aware cooldown: stored per (symbol, side)
+    Optionally stores session name (NY/LON/ASIA) for audit.
+    """
     con = db_connect()
     cur = con.cursor()
     cur.execute("""
-        INSERT INTO emailed_symbols (user_id, symbol, emailed_ts)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id, symbol) DO UPDATE SET emailed_ts=excluded.emailed_ts
-    """, (user_id, symbol.upper(), time.time()))
+        INSERT INTO emailed_symbols (user_id, symbol, side, session, emailed_ts)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, symbol, side) DO UPDATE SET
+            session=excluded.session,
+            emailed_ts=excluded.emailed_ts
+    """, (int(user_id), str(symbol).upper(), str(side).upper(), str(session_name or ""), time.time()))
     con.commit()
     con.close()
 
-def symbol_recently_emailed(user_id: int, symbol: str, cooldown_hours: float) -> bool:
+
+def symbol_recently_emailed(
+    user_id: int,
+    symbol: str,
+    side: str,
+    session_name: str,
+) -> bool:
+    """
+    ✅ Session-aware + direction-aware cooldown check.
+    Cooldown hours depend on CURRENT session (NY/LON/ASIA).
+    """
+    cooldown_hours = float(cooldown_hours_for_session(session_name))
+
     con = db_connect()
     cur = con.cursor()
-    cur.execute("SELECT emailed_ts FROM emailed_symbols WHERE user_id=? AND symbol=?", (user_id, symbol.upper()))
+    cur.execute("""
+        SELECT emailed_ts
+        FROM emailed_symbols
+        WHERE user_id=? AND symbol=? AND side=?
+    """, (int(user_id), str(symbol).upper(), str(side).upper()))
     row = cur.fetchone()
     con.close()
     if not row:
         return False
-    return (time.time() - float(row["emailed_ts"])) < (cooldown_hours * 3600)
+
+    last_ts = float(row["emailed_ts"])
+    return (time.time() - last_ts) < (cooldown_hours * 3600.0)
+
+
+def list_cooldowns(user_id: int) -> List[dict]:
+    """
+    Returns list of cooldown stamps for user:
+    [{symbol, side, session, emailed_ts}, ...]
+    """
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT symbol, side, session, emailed_ts
+        FROM emailed_symbols
+        WHERE user_id=?
+        ORDER BY emailed_ts DESC
+    """, (int(user_id),))
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def _fmt_dur(seconds: float) -> str:
+    s = int(max(0, seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    if h <= 0:
+        return f"{m}m"
+    return f"{h}h {m}m"
+
 
 def _email_daily_get(user_id: int, day_local: str) -> int:
     con = db_connect()
@@ -2016,144 +2130,239 @@ PulseFutures — Commands (Telegram)
 /help
 
 PulseFutures — Commands (Telegram)
+Bybit USDT Futures • Risk-first • Session-aware
+Not financial advice.
 
+────────────────────────────────────
 1) Market Scan
-- /screen
-  Shows:
-  • Top Trade Setups (best quality)
-  • Waiting for Trigger (near-miss candidates)
-  • Trend Continuation Watch (adaptive EMA trend pullback)
-  • Directional Leaders
-  • Directional Losers
-  • Market Leaders (Top 10 by Futures Volume)
+────────────────────────────────────
 
-2) Position Sizing (Risk + SL => Qty)
-- /size <SYMBOL> <long|short> sl <STOP> [risk <usd|pct> <VALUE>] [entry <ENTRY>]
+/screen
+
+Shows a real-time market snapshot:
+• Top Trade Setups (highest quality)
+• Waiting for Trigger (near-miss candidates)
+• Trend Continuation Watch (adaptive EMA logic)
+• Directional Leaders
+• Directional Losers
+• Market Leaders (Top by Futures Volume)
+
+Notes:
+• Header shows: Active Session + Your City/Location + Local Time
+• Each setup includes:
+  - ID (ID-PF-YYYYMMDD-XXXX)
+  - Side (BUY / SELL)
+  - Confidence score
+  - Engine type (Mean-Reversion or Momentum)
+  - Entry / SL / TP(s)
+  - RR(TP3)
+  - Multi-timeframe momentum
+  - Futures volume
+  - TradingView chart link
+• “Pullback” wording is intentionally removed
+• /screen is NOT affected by cooldowns (always live)
+
+────────────────────────────────────
+2) Position Sizing (NO trade opened)
+────────────────────────────────────
+/size <SYMBOL> <long|short> sl <STOP>
+     [risk <usd|pct> <VALUE>]
+     [entry <ENTRY>]
+
+Purpose:
+• Calculates correct position size from Risk + SL
+• Does NOT open a trade
 
 Examples:
-- /size BTC long sl 42000
-  → Uses your default /riskmode. If equity is 0 and you use pct risk:
-    /equity 1000
+• /size BTC long sl 42000
+  → Uses default /riskmode
 
-- /size BTC long risk usd 40 sl 42000
-  → Uses current Bybit futures price as Entry and returns Qty for $40 risk.
+• /size BTC long risk usd 40 sl 42000
+  → Uses current Bybit futures price as Entry
 
-- /size ETH short risk pct 2.5 sl 2480
-  → Uses Equity. If equity is 0:
-    /equity 1000
+• /size ETH short risk pct 2.5 sl 2480
+  → Uses your Equity
 
-Manual entry examples:
-- /size BTC long sl 42000 entry 43000
-- /size BTC long risk usd 50 sl 42000 entry 43000
+• /size BTC long sl 42000 entry 43000
+  → Manual entry price
 
 Notes:
-- If you do NOT specify "risk", bot uses your configured /riskmode
-- pct uses your Equity
-- Qty = RiskUSD / |Entry - SL|
-- This command does NOT open a trade
+• If risk is omitted → /riskmode is used
+• pct risk uses Equity
+• Qty = Risk / |Entry − SL|
 
-3) Trade Journal (Open / Manage / Close) + Daily Risk Tracking
+────────────────────────────────────
+3) Trade Journal & Equity Tracking
+────────────────────────────────────
 Set equity:
-- /equity 1000
+• /equity 1000
 Reset equity:
-- /equity_reset
+• /equity_reset
 
 Open trade:
-- /trade_open <SYMBOL> <long|short> entry <ENTRY> sl <SL> risk <usd|pct> <VALUE> [note ...] [sig <PF-ID>]
+• /trade_open <SYMBOL> <long|short>
+              entry <ENTRY> sl <SL>
+              risk <usd|pct> <VALUE>
+              [note "..."] [sig <SETUP_ID>]
 
 Manage open trade:
-- /trade_sl <TRADE_ID> <NEW_SL>
-  → Updates SL + updates trade risk
-  → Daily used risk is adjusted by the risk delta
-  → Warns if risk increased / confirms if risk reduced
+• /trade_sl <TRADE_ID> <NEW_SL>
+  → Updates SL and recalculates trade risk
+  → Warns if risk increases
+  → Adjusts today’s used risk
 
-- /trade_rf <TRADE_ID>
-  → Risk-Free: moves SL to Entry, sets trade risk to 0
-  → Releases today’s used risk by the previous risk amount
+• /trade_rf <TRADE_ID>
+  → Moves SL to Entry (Risk-Free)
+  → Sets trade risk to 0
+  → Releases today’s used risk immediately
 
 Close trade:
-- /trade_close <TRADE_ID> pnl <PNL>
-  → Equity updates ONLY when trades are closed
-  → If PnL is PROFIT (>0), today’s used risk is released by the trade’s original risk
+• /trade_close <TRADE_ID> pnl <PNL>
 
-Notes:
-- Trade journal stays persistent in DB
+Equity behavior:
+• Equity updates ONLY when trades are closed
+• If trade closes in profit → its risk is released
+• Trade journal is persistent (stored in DB)
 
-4) Status
-- /status
+────────────────────────────────────
+4) Status Dashboard
+────────────────────────────────────
+/status
+
 Shows:
-• equity
-• trades today (count)
-• daily cap + used/remaining daily risk
-• sessions enabled + current session
-• email alert status + email caps (session/day/gap)
-• open trades list
+• Equity
+• Trades today (count)
+• Daily risk cap + used / remaining risk
+• Active sessions + current session
+• Email alert status + email limits
+• Open trades list
+• Active symbol cooldowns (current session)
 
+────────────────────────────────────
 5) Risk Settings
-Default risk per trade:
-- /riskmode pct 2.5
-- /riskmode usd 25
+────────────────────────────────────
+Risk per trade:
+• /riskmode pct 2.5
+• /riskmode usd 25
 
 Daily risk cap:
-- /dailycap pct 5
-- /dailycap usd 60
+• /dailycap pct 5
+• /dailycap usd 60
 
-Limits:
-- /limits maxtrades 5
-- /limits emailcap 4        (0 = unlimited per session)
-- /limits emailgap 60       (minutes)
-- /limits emaildaycap 4     (0 = unlimited per day)
+────────────────────────────────────
+6) Limits (Discipline Controls)
+────────────────────────────────────
+/limits maxtrades 5
+/limits emailcap 4        (0 = unlimited per session)
+/limits emailgap 60       (minutes between emails)
+/limits emaildaycap 4     (0 = unlimited per day)
 
-6) Sessions (Email delivery windows)
-View:
-- /sessions
+Limits protect against:
+• Overtrading
+• Email spam
+• Emotional decision-making
+
+────────────────────────────────────
+7) Sessions (Email Delivery Windows)
+────────────────────────────────────
+View sessions:
+• /sessions
 
 Enable / disable:
-- /sessions_on NY
-- /sessions_off LON
+• /sessions_on NY
+• /sessions_off LON
 
 Defaults by timezone:
-- Americas → NY
-- Europe/Africa → LON
-- Asia/Oceania → ASIA
+• Americas → NY
+• Europe/Africa → LON
+• Asia/Oceania → ASIA
 
-Priority:
+Session priority:
 NY > LON > ASIA
 
-7) Email Alerts
-- /notify_on
-- /notify_off
+Emails are sent ONLY during enabled sessions.
+
+────────────────────────────────────
+8) Email Alerts
+────────────────────────────────────
+
+Enable / disable:
+• /notify_on
+• /notify_off
 
 Email rules:
-- Sent only during your ENABLED sessions
-- Session-based quality floors (min confidence + min RR(TP3))
-- No same symbol for 4h (cooldown)
-- Caps supported:
-  • per-session cap (/limits emailcap)
-  • per-day cap (/limits emaildaycap)
-  • min gap between emails (/limits emailgap)
+• Sent only during enabled sessions
+• Session-based quality filters (confidence + RR floors)
+• No same symbol+direction spam
+• Cooldowns enforced (see below)
+• Per-session & per-day caps supported
 
-8) Performance Reports
-- /report_daily
-- /report_weekly
+────────────────────────────────────
+9) Symbol Cooldowns (Anti-Spam Logic)
+────────────────────────────────────
+Cooldowns are:
+• Per-user
+• Per-symbol
+• Per-direction (BUY vs SELL)
+• Session-aware
 
-9) Signal Reports
-- /signals_daily
-- /signals_weekly
-Summaries of signals generated + your linked trades performance (if you used sig PF-...)
+Cooldown duration by session:
+• NY    → 2 hours
+• LON   → 3 hours
+• ASIA  → 4 hours
 
-10) Health
-- /health_sys
-System-level health:
-• DB OK/FAIL
-• Bybit/CCXT OK/FAIL + ticker count + latency
-• email enabled/configured
-• cache stats + TTLs
-• your sessions enabled + current session
-• email limits (session/day/gap)
+Meaning:
+• If BTC BUY is emailed in NY → blocked for 2h
+• BTC SELL can still be emailed if valid
+• /screen is NOT affected
 
-Not financial advice.
+View cooldowns:
+• /cooldowns
+  → Shows remaining cooldown time for NY / LON / ASIA
+    for each symbol + direction
+
+/status also shows active cooldowns for
+your current session.
+
+────────────────────────────────────
+10) Reports
+────────────────────────────────────
+Performance:
+• /report_daily
+• /report_weekly
+
+Signal summaries:
+• /signals_daily
+• /signals_weekly
+
+Reports include:
+• Trades taken
+• Win rate
+• Net PnL
+• R-multiples
+• Best / worst trades
+• System-generated advice
+
+────────────────────────────────────
+11) System Health
+────────────────────────────────────
+• /health_sys
+  → DB status
+  → Bybit/CCXT connectivity
+  → Cache stats
+  → Session state
+  → Email configuration
+
+────────────────────────────────────
+Final Notes
+────────────────────────────────────
+• PulseFutures does NOT auto-trade
+• PulseFutures does NOT promise profits
+• PulseFutures enforces discipline, risk control, and session awareness
+
+Trade less. Trade better. Risk first.
 PulseFutures
+
 """
 
 # =========================================================
@@ -2872,6 +3081,38 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     lines.append("📌 Status")
     lines.append(HDR)
+    
+    # ✅ Cooldowns (active ones for current session)
+    rows = list_cooldowns(uid)
+    now_ts = time.time()
+    sess_for_cd = now_txt if now_txt != "NONE" else current_session_utc()
+    cd_hours = cooldown_hours_for_session(sess_for_cd)
+    cd_sec = cd_hours * 3600
+
+    active = []
+    seen = set()
+    for r in rows:
+        sym = str(r["symbol"]).upper()
+        side = str(r["side"]).upper()
+        key = (sym, side)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        last_ts = float(r["emailed_ts"])
+        ago = now_ts - last_ts
+        if ago < cd_sec:
+            remain = cd_sec - ago
+            active.append((sym, side, remain))
+
+    active.sort(key=lambda x: x[2])  # soonest to expire first
+    if active:
+        lines.append(f"Cooldowns active (session={sess_for_cd}, {cd_hours}h):")
+        for sym, side, rem in active[:10]:
+            lines.append(f"- {sym} {side} | remaining {_fmt_dur(rem)}")
+    else:
+        lines.append(f"Cooldowns active (session={sess_for_cd}, {cd_hours}h): none")
+
     lines.append(f"Equity: ${float(user['equity']):.2f}")
     lines.append(f"Trades today: {int(user['day_trade_count'])}/{int(user['max_trades_day'])}")
 
@@ -2896,6 +3137,69 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"SL {fmt_price(float(t['sl']))} | Risk ${float(t['risk_usd']):.2f} | Qty {float(t['qty']):.6g}"
         )
     await update.message.reply_text("\n".join(lines))
+
+
+async def cooldowns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    now_sess = in_session_now(user)
+    current_session = (now_sess["name"] if now_sess else current_session_utc())
+    rows = list_cooldowns(uid)
+
+    if not rows:
+        await update.message.reply_text(
+            "⏱ Cooldowns\n"
+            f"{HDR}\n"
+            "No cooldowns recorded yet."
+        )
+        return
+
+    # We show remaining cooldown for ALL sessions (NY/LON/ASIA) per (symbol, side)
+    now_ts = time.time()
+    out = []
+    out.append("⏱ Cooldowns (All Sessions)")
+    out.append(HDR)
+    out.append(f"Current session: {current_session}")
+    out.append(f"Policy: NY={cooldown_hours_for_session('NY')}h | LON={cooldown_hours_for_session('LON')}h | ASIA={cooldown_hours_for_session('ASIA')}h")
+    out.append(SEP)
+
+    # keep only most recent per (symbol, side)
+    seen = set()
+    compact = []
+    for r in rows:
+        key = (str(r["symbol"]).upper(), str(r["side"]).upper())
+        if key in seen:
+            continue
+        seen.add(key)
+        compact.append(r)
+
+    # show top 20 recent
+    compact = compact[:20]
+
+    for r in compact:
+        sym = str(r["symbol"]).upper()
+        side = str(r["side"]).upper()
+        last_ts = float(r["emailed_ts"])
+        ago = now_ts - last_ts
+
+        rem_ny = max(0.0, cooldown_hours_for_session("NY") * 3600 - ago)
+        rem_lon = max(0.0, cooldown_hours_for_session("LON") * 3600 - ago)
+        rem_asia = max(0.0, cooldown_hours_for_session("ASIA") * 3600 - ago)
+
+        def tag(rem):
+            return "✅" if rem <= 0 else "⛔️"
+
+        out.append(
+            f"- {sym} {side} | "
+            f"NY: {tag(rem_ny)} {_fmt_dur(rem_ny)} | "
+            f"LON: {tag(rem_lon)} {_fmt_dur(rem_lon)} | "
+            f"ASIA: {tag(rem_asia)} {_fmt_dur(rem_asia)}"
+        )
+
+    await update.message.reply_text("\n".join(out))
+
+
 
 async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -3590,9 +3894,9 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     skip_reasons_counter["below_session_rr_floor"] += 1
                     continue
 
-                # Symbol cooldown
-                if symbol_recently_emailed(uid, s.symbol, SYMBOL_COOLDOWN_HOURS):
-                    skip_reasons_counter["symbol_cooldown_4h"] += 1
+                # ✅ Symbol cooldown (direction-aware + session-aware)
+                if symbol_recently_emailed(uid, s.symbol, s.side, sess["name"]):
+                    skip_reasons_counter["symbol_cooldown_active"] += 1
                     continue
 
                 is_confirm_15m = abs(float(s.ch15)) >= CONFIRM_15M_ABS_MIN
@@ -3635,7 +3939,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 _email_daily_inc(uid, day_local, 1)
 
                 for s in filtered:
-                    mark_symbol_emailed(uid, s.symbol)
+                    mark_symbol_emailed(uid, s.symbol, s.side, sess["name"])
 
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SENT",
@@ -3768,7 +4072,7 @@ def main():
 
     app.add_handler(CommandHandler("trade_sl", trade_sl_cmd))
     app.add_handler(CommandHandler("trade_rf", trade_rf_cmd))
-    
+   
     app.add_handler(CommandHandler("sessions", sessions_cmd))
     app.add_handler(CommandHandler("sessions_on", sessions_on_cmd))
     app.add_handler(CommandHandler("sessions_off", sessions_off_cmd))
@@ -3780,6 +4084,7 @@ def main():
     app.add_handler(CommandHandler("trade_open", trade_open_cmd))
     app.add_handler(CommandHandler("trade_close", trade_close_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("cooldowns", cooldowns_cmd))
 
     app.add_handler(CommandHandler("report_daily", report_daily_cmd))
     app.add_handler(CommandHandler("report_weekly", report_weekly_cmd))
