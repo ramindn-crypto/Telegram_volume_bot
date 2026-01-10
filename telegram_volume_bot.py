@@ -2304,25 +2304,24 @@ Cooldowns are:
 • Per-user
 • Per-symbol
 • Per-direction (BUY vs SELL)
-• Session-aware
+• Session-aware (duration depends on NY/LON/ASIA policy)
 
 Cooldown duration by session:
 • NY    → 2 hours
 • LON   → 3 hours
 • ASIA  → 4 hours
 
-Meaning:
-• If BTC BUY is emailed in NY → blocked for 2h
-• BTC SELL can still be emailed if valid
-• /screen is NOT affected
-
 View cooldowns:
 • /cooldowns
-  → Shows remaining cooldown time for NY / LON / ASIA
-    for each symbol + direction
+  → Shows remaining cooldown time for NY / LON / ASIA for each symbol + direction
 
-/status also shows active cooldowns for
-your current session.
+Query a single symbol:
+• /cooldown <SYMBOL> <long|short>
+  → Shows remaining cooldown time for NY / LON / ASIA for that exact symbol+direction
+
+Admin-only reset:
+• /cooldown_clear <SYMBOL> <long|short>
+• /cooldown_clear_all
 
 ────────────────────
 10) Reports
@@ -3210,6 +3209,138 @@ async def cooldowns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(out))
 
 
+def clear_cooldown(user_id: int, symbol: str, side: str) -> int:
+    """
+    Deletes ONE cooldown row for (user, symbol, side).
+    Returns deleted row count.
+    """
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        DELETE FROM emailed_symbols
+        WHERE user_id=? AND symbol=? AND side=?
+    """, (int(user_id), str(symbol).upper(), str(side).upper()))
+    n = cur.rowcount
+    con.commit()
+    con.close()
+    return int(n)
+
+
+def clear_all_cooldowns(user_id: int) -> int:
+    """
+    Deletes ALL cooldown rows for this user.
+    Returns deleted row count.
+    """
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        DELETE FROM emailed_symbols
+        WHERE user_id=?
+    """, (int(user_id),))
+    n = cur.rowcount
+    con.commit()
+    con.close()
+    return int(n)
+
+
+async def cooldown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /cooldown <SYMBOL> <long|short>
+    Show remaining cooldown times for NY/LON/ASIA for that symbol+direction.
+    """
+    uid = update.effective_user.id
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /cooldown <SYMBOL> <long|short>\nExample: /cooldown BTC long")
+        return
+
+    sym = re.sub(r"[^A-Za-z0-9]", "", context.args[0]).upper()
+    direction = context.args[1].strip().lower()
+    if direction not in {"long", "short"}:
+        await update.message.reply_text("Second arg must be long or short.\nExample: /cooldown BTC long")
+        return
+
+    side = "BUY" if direction == "long" else "SELL"
+
+    # find latest cooldown row for this (sym, side)
+    rows = list_cooldowns(uid)
+    match = None
+    for r in rows:
+        if str(r["symbol"]).upper() == sym and str(r["side"]).upper() == side:
+            match = r
+            break
+
+    if not match:
+        await update.message.reply_text(
+            "⏱ Cooldown\n"
+            f"{HDR}\n"
+            f"{sym} {side}\n"
+            "No cooldown recorded yet (✅ available)."
+        )
+        return
+
+    now_ts = time.time()
+    last_ts = float(match["emailed_ts"])
+    ago = now_ts - last_ts
+
+    rem_ny = max(0.0, cooldown_hours_for_session("NY") * 3600 - ago)
+    rem_lon = max(0.0, cooldown_hours_for_session("LON") * 3600 - ago)
+    rem_asia = max(0.0, cooldown_hours_for_session("ASIA") * 3600 - ago)
+
+    def tag(rem): return "✅" if rem <= 0 else "⛔️"
+
+    await update.message.reply_text(
+        "⏱ Cooldown (per session policy)\n"
+        f"{HDR}\n"
+        f"{sym} {side}\n"
+        f"NY: {tag(rem_ny)} {_fmt_dur(rem_ny)}\n"
+        f"LON: {tag(rem_lon)} {_fmt_dur(rem_lon)}\n"
+        f"ASIA: {tag(rem_asia)} {_fmt_dur(rem_asia)}"
+    )
+
+
+async def cooldown_clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /cooldown_clear <SYMBOL> <long|short>  (admin only)
+    Clears one cooldown row.
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /cooldown_clear <SYMBOL> <long|short>\nExample: /cooldown_clear BTC long")
+        return
+
+    sym = re.sub(r"[^A-Za-z0-9]", "", context.args[0]).upper()
+    direction = context.args[1].strip().lower()
+    if direction not in {"long", "short"}:
+        await update.message.reply_text("Second arg must be long or short.")
+        return
+
+    side = "BUY" if direction == "long" else "SELL"
+    n = clear_cooldown(uid, sym, side)
+
+    if n > 0:
+        await update.message.reply_text(f"✅ Cooldown cleared: {sym} {side}")
+    else:
+        await update.message.reply_text(f"ℹ️ No cooldown found for: {sym} {side}")
+
+
+async def cooldown_clear_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /cooldown_clear_all  (admin only)
+    Clears all cooldown rows for the admin user.
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    n = clear_all_cooldowns(uid)
+    await update.message.reply_text(f"✅ Cleared {n} cooldown record(s).")
+
+
 
 async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -4094,13 +4225,18 @@ def main():
     app.add_handler(CommandHandler("trade_open", trade_open_cmd))
     app.add_handler(CommandHandler("trade_close", trade_close_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("cooldowns", cooldowns_cmd))
 
+    app.add_handler(CommandHandler("cooldowns", cooldowns_cmd))
+    app.add_handler(CommandHandler("cooldown", cooldown_cmd))
+    app.add_handler(CommandHandler("cooldown_clear", cooldown_clear_cmd))
+    app.add_handler(CommandHandler("cooldown_clear_all", cooldown_clear_all_cmd))
+ 
     app.add_handler(CommandHandler("report_daily", report_daily_cmd))
     app.add_handler(CommandHandler("report_weekly", report_weekly_cmd))
     app.add_handler(CommandHandler("signals_daily", signals_daily_cmd))
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd))
 
+    
     app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CommandHandler("health_sys", health_sys_cmd))
 
