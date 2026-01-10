@@ -1648,6 +1648,7 @@ def make_setup(
     # ✅ IMPORTANT: this must be OUTSIDE the if block (no extra indent)
     side = "BUY" if ch1 > 0 else "SELL"
 
+
     # 4H alignment
     if side == "BUY" and ch4 < ALIGN_4H_MIN:
         _rej("4h_not_aligned_for_long", base, mv, f"side=BUY ch4={ch4:+.2f}%")
