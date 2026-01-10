@@ -557,121 +557,22 @@ def best_pullback_ema_15m(closes_15: List[float], entry: float) -> Tuple[float, 
 
 
 # ✅ NEW: "Waiting for Trigger" (near-miss candidates)
-# base -> {"side": "BUY"/"SELL", "ch1": float, "trig": float, "need": float}
-_WAITING_TRIGGER: Dict[str, Dict[str, Any]] = {}
 
+_WAITING_TRIGGER: Dict[str, Dict[str, Any]] = {}
 
 
 def is_admin_user(user_id: int) -> bool:
     return int(user_id) in ADMIN_USER_IDS if ADMIN_USER_IDS else False
 
 
-def user_diag_mode(user_id: int) -> str:
-    """
-    Returns: "full" | "friendly" | "off"
-    Admin always full.
-    """
-    uid = int(user_id)
-    if is_admin_user(uid):
-        return "full"
-    if uid in _USER_DIAG_MODE:
-        return _USER_DIAG_MODE[uid]
-    if PUBLIC_DIAGNOSTICS_MODE in {"off", "none"}:
-        return "off"
-    return "friendly"
-
-
-def fmt_price(x: float) -> str:
-    ax = abs(float(x))
-    if ax >= 100:
-        return f"{x:.2f}"
-    if ax >= 1:
-        return f"{x:.4f}"
-    if ax >= 0.1:
-        return f"{x:.5f}"
-    return f"{x:.6f}"
-
-
 def reset_reject_tracker() -> None:
-    """Call at the start of each scan so stats are per /screen run."""
-    global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL
-    _REJECT_STATS = Counter()
-    _REJECT_SAMPLES = {}
-    _REJECT_BY_SYMBOL = {}
-
+    return
 
 def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
-    """
-    Records reject stats + optional samples for DEBUG_REJECTS.
+    return
 
-    - reason: stable key (do not put dynamic numbers in the key)
-    - extra: can include numbers/thresholds (admin-only, stored only if DEBUG_REJECTS)
-    """
-    global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL
-
-    reason = (reason or "unknown").strip()
-    _REJECT_STATS[reason] += 1
-
-    # ✅ store LAST reject reason per symbol (we show friendly label later)
-    _REJECT_BY_SYMBOL[str(base)] = reason
-
-    if not DEBUG_REJECTS:
-        return
-
-    try:
-        last = fmt_price(float(getattr(mv, "last", 0.0) or 0.0))
-    except Exception:
-        last = str(getattr(mv, "last", "-"))
-
-    sym = getattr(mv, "symbol", "") or ""
-    line = f"{base} | {sym} | last={last}"
-    if extra:
-        line = f"{line} | {extra}"
-
-    xs = _REJECT_SAMPLES.get(reason, [])
-    if len(xs) < REJECT_TOP_N:
-        xs.append(line)
-        _REJECT_SAMPLES[reason] = xs
-
-
-
-def _reject_report(diag_mode: str = "friendly") -> str:
-    """
-    diag_mode:
-      - "full": show ALL technical keys + counts (+ samples if DEBUG_REJECTS)
-      - "friendly": friendly titles + counts (no thresholds/params) [top 10 only]
-      - "off": ""
-    """
-    diag_mode = (diag_mode or "friendly").strip().lower()
-    if diag_mode == "off":
-        return ""
-    if not _REJECT_STATS:
-        return ""
-
-    parts: List[str] = []
-    parts.append("🧩 Reject Diagnostics")
-    parts.append(SEP)
-
-    items = _REJECT_STATS.most_common() if diag_mode == "full" else _REJECT_STATS.most_common(10)
-
-    for reason, cnt in items:
-        if diag_mode == "full":
-            parts.append(f"- {reason}: {cnt}")
-            if DEBUG_REJECTS and (reason in _REJECT_SAMPLES) and _REJECT_SAMPLES[reason]:
-                for s in _REJECT_SAMPLES[reason][:3]:
-                    parts.append(f"    • {s}")
-        else:
-            title = REJECT_FRIENDLY_EN.get(reason, REJECT_FRIENDLY_EN.get("unknown", "Filtered by strategy rules."))
-            parts.append(f"- {title}  (×{cnt})")
-
-    if diag_mode != "full":
-        parts.append("")
-        parts.append("🔒 Technical details are hidden to protect the strategy.")
-
-    return "\n".join(parts).strip()
-
-
-
+def _reject_report(diag_mode: str = "off") -> str:
+    return ""
 
 
 # =========================================================
