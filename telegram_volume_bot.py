@@ -239,12 +239,8 @@ TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFutures
 TICKERS_TTL_SEC = 45
 OHLCV_TTL_SEC = 60
 
-# =========================================================
-# help (INTERNAL ONLY)
-# =========================================================
-# Keep internal reject stats for you, but DO NOT show to public
-DEBUG_REJECTS = os.environ.get("DEBUG_REJECTS", "false").lower() == "true"
-REJECT_TOP_N = int(os.environ.get("REJECT_TOP_N", "12"))
+
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pulsefutures")
@@ -560,73 +556,9 @@ def best_pullback_ema_15m(closes_15: List[float], entry: float) -> Tuple[float, 
     return best
 
 
-
-# Track counts + (optional) sample lines per reject reason
-_REJECT_STATS = Counter()
-_REJECT_SAMPLES: Dict[str, List[str]] = {}
-
-
-# ✅ NEW: per-symbol reject reason (last one) for /screen
-_REJECT_BY_SYMBOL: Dict[str, str] = {}  # base -> reason_key
-
 # ✅ NEW: "Waiting for Trigger" (near-miss candidates)
 # base -> {"side": "BUY"/"SELL", "ch1": float, "trig": float, "need": float}
 _WAITING_TRIGGER: Dict[str, Dict[str, Any]] = {}
-
-# ✅ NEW: last email skip reasons (per user) for /health transparency
-_LAST_EMAIL_DECISION: Dict[int, Dict[str, Any]] = {}
-_EMAIL_SKIP_COUNTERS: Dict[int, Counter] = defaultdict(Counter)
-
-# ✅ NEW: last SMTP error (per run) to debug "email didn't arrive"
-_LAST_SMTP_ERROR: Dict[int, str] = {}  # user_id -> last error text
-
-# ✅ NEW: per-user diagnostics preference (runtime)
-# - admin always "full"
-# - non-admin default based on PUBLIC_DIAGNOSTICS_MODE: "friendly" or "off"
-_USER_DIAG_MODE: Dict[int, str] = {}  # user_id -> "full" | "friendly" | "off"
-
-
-
-
-
-# -------------------------
-# Friendly reject titles (NO thresholds / params shown)
-# IMPORTANT: keep this map COMPLETE for all _rej() keys used in make_setup/pick_setups
-# -------------------------
-
-
-REJECT_FRIENDLY_EN = {
-    # global / admin gating (legacy key kept for compatibility)
-    "melbourne_blackout_10_12": "⛔️ Signals are disabled between 10:00–12:00 (Melbourne time).",
-
-    # data / market availability
-    "no_fut_vol": "📉 Insufficient futures trading volume.",
-    "bad_entry": "⚠️ Invalid or unreliable entry price data.",
-    "ohlcv_missing_or_insufficient": "⚠️ Not enough candle data available (try again later).",
-
-    # primary gates
-    "ch1_below_trigger": "🧊 1H momentum is not strong enough yet.",
-    "4h_not_aligned_for_long": "↔️ 4H trend is not aligned with LONG direction.",
-    "4h_not_aligned_for_short": "↔️ 4H trend is not aligned with SHORT direction.",
-
-    # engines / EMA logic
-    "price_not_near_ema12_15m": "📍 Price is not close enough to Adaptive EMA (15m) for a quality entry.",
-    "no_engine_passed": "🚫 Setup failed both engines (pullback + momentum filters).",
-    "sharp_1h_no_ema_reaction": "⚡️ Strong 1H move detected, but no EMA reaction confirmation.",
-
-    # SL/TP validity
-    "bad_sl_tp_or_atr": "⚠️ Could not compute SL/TP reliably (ATR/price issue).",
-
-    # direction / bias filters
-    "24h_contradiction_for_long": "🚫 24H trend contradicts LONG bias.",
-    "24h_contradiction_for_short": "🚫 24H trend contradicts SHORT bias.",
-
-    # micro confirmation (email strictness)
-    "15m_weak_and_not_early": "🟡 15m confirmation is weak and the setup is not strong enough to qualify as early.",
-
-    # fallback / unknown
-    "unknown": "❓ Filtered by strategy rules (details hidden).",
-}
 
 
 
