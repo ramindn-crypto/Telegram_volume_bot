@@ -2133,9 +2133,9 @@ PulseFutures — Commands (Telegram)
 Bybit USDT Futures • Risk-first • Session-aware
 Not financial advice.
 
-────────────────────────────────────
+─────────────────────
 1) Market Scan
-────────────────────────────────────
+─────────────────────
 
 /screen
 
@@ -2162,9 +2162,9 @@ Notes:
 • “Pullback” wording is intentionally removed
 • /screen is NOT affected by cooldowns (always live)
 
-────────────────────────────────────
+─────────────────────
 2) Position Sizing (NO trade opened)
-────────────────────────────────────
+─────────────────────
 /size <SYMBOL> <long|short> sl <STOP>
      [risk <usd|pct> <VALUE>]
      [entry <ENTRY>]
@@ -2191,9 +2191,9 @@ Notes:
 • pct risk uses Equity
 • Qty = Risk / |Entry − SL|
 
-────────────────────────────────────
+─────────────────────
 3) Trade Journal & Equity Tracking
-────────────────────────────────────
+─────────────────────
 Set equity:
 • /equity 1000
 Reset equity:
@@ -2224,9 +2224,9 @@ Equity behavior:
 • If trade closes in profit → its risk is released
 • Trade journal is persistent (stored in DB)
 
-────────────────────────────────────
+─────────────────────
 4) Status Dashboard
-────────────────────────────────────
+─────────────────────
 /status
 
 Shows:
@@ -2238,9 +2238,9 @@ Shows:
 • Open trades list
 • Active symbol cooldowns (current session)
 
-────────────────────────────────────
+─────────────────────
 5) Risk Settings
-────────────────────────────────────
+─────────────────────
 Risk per trade:
 • /riskmode pct 2.5
 • /riskmode usd 25
@@ -2249,9 +2249,9 @@ Daily risk cap:
 • /dailycap pct 5
 • /dailycap usd 60
 
-────────────────────────────────────
+─────────────────────
 6) Limits (Discipline Controls)
-────────────────────────────────────
+─────────────────────
 /limits maxtrades 5
 /limits emailcap 4        (0 = unlimited per session)
 /limits emailgap 60       (minutes between emails)
@@ -2262,9 +2262,9 @@ Limits protect against:
 • Email spam
 • Emotional decision-making
 
-────────────────────────────────────
+─────────────────────
 7) Sessions (Email Delivery Windows)
-────────────────────────────────────
+─────────────────────
 View sessions:
 • /sessions
 
@@ -2282,9 +2282,9 @@ NY > LON > ASIA
 
 Emails are sent ONLY during enabled sessions.
 
-────────────────────────────────────
+─────────────────────
 8) Email Alerts
-────────────────────────────────────
+─────────────────────
 
 Enable / disable:
 • /notify_on
@@ -2297,9 +2297,9 @@ Email rules:
 • Cooldowns enforced (see below)
 • Per-session & per-day caps supported
 
-────────────────────────────────────
+─────────────────────
 9) Symbol Cooldowns (Anti-Spam Logic)
-────────────────────────────────────
+─────────────────────
 Cooldowns are:
 • Per-user
 • Per-symbol
@@ -2324,9 +2324,9 @@ View cooldowns:
 /status also shows active cooldowns for
 your current session.
 
-────────────────────────────────────
+─────────────────────
 10) Reports
-────────────────────────────────────
+─────────────────────
 Performance:
 • /report_daily
 • /report_weekly
@@ -2343,9 +2343,9 @@ Reports include:
 • Best / worst trades
 • System-generated advice
 
-────────────────────────────────────
+─────────────────────
 11) System Health
-────────────────────────────────────
+─────────────────────
 • /health_sys
   → DB status
   → Bybit/CCXT connectivity
@@ -2353,9 +2353,9 @@ Reports include:
   → Session state
   → Email configuration
 
-────────────────────────────────────
+─────────────────────
 Final Notes
-────────────────────────────────────
+─────────────────────
 • PulseFutures does NOT auto-trade
 • PulseFutures does NOT promise profits
 • PulseFutures enforces discipline, risk control, and session awareness
