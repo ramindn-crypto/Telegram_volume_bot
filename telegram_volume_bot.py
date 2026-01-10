@@ -188,7 +188,7 @@ DEFAULT_MAX_EMAILS_PER_DAY = 4
 DEFAULT_MAX_RISK_PCT_PER_TRADE = 2.0
 WARN_RISK_PCT_PER_TRADE = 2.0
 
-SYMBOL_COOLDOWN_HOURS = 18
+SYMBOL_COOLDOWN_HOURS = 4
 
 # Multi-TP
 ATR_PERIOD = 14
@@ -2013,28 +2013,33 @@ def _advice(user: dict, stats: dict) -> List[str]:
 HELP_TEXT = """\
 PulseFutures — Commands (Telegram)
 
+/help
+
+PulseFutures — Commands (Telegram)
+
 1) Market Scan
 - /screen
   Shows:
   • Top Trade Setups (best quality)
-  • Waiting for Trigger (near-miss)
-  • Trend Continuation Watch
-  • Directional Leaders/Losers 
-  • Market Leaders by futures volume
+  • Waiting for Trigger (near-miss candidates)
+  • Trend Continuation Watch (adaptive EMA trend pullback)
+  • Directional Leaders
+  • Directional Losers
+  • Market Leaders (Top 10 by Futures Volume)
 
 2) Position Sizing (Risk + SL => Qty)
 - /size <SYMBOL> <long|short> sl <STOP> [risk <usd|pct> <VALUE>] [entry <ENTRY>]
 
 Examples:
 - /size BTC long sl 42000
-  → Default risk = your configured risk (riskmode). If equity is 0, set it first:
+  → Uses your default /riskmode. If equity is 0 and you use pct risk:
     /equity 1000
 
 - /size BTC long risk usd 40 sl 42000
-  → Bot uses current Bybit futures price as Entry and returns Qty for $40 risk.
+  → Uses current Bybit futures price as Entry and returns Qty for $40 risk.
 
 - /size ETH short risk pct 2.5 sl 2480
-  → Uses Equity. If equity is 0, set it first:
+  → Uses Equity. If equity is 0:
     /equity 1000
 
 Manual entry examples:
@@ -2042,82 +2047,91 @@ Manual entry examples:
 - /size BTC long risk usd 50 sl 42000 entry 43000
 
 Notes:
-- If you do NOT specify "risk", the bot uses your default /riskmode settings.
+- If you do NOT specify "risk", bot uses your configured /riskmode
 - pct uses your Equity
 - Qty = RiskUSD / |Entry - SL|
-- This command does NOT open a trade.
+- This command does NOT open a trade
 
-3) Trade Journal (Open / Manage / Close) + Equity auto-update
+3) Trade Journal (Open / Manage / Close) + Daily Risk Tracking
 Set equity:
 - /equity 1000
 Reset equity:
 - /equity_reset
 
 Open trade:
-- /trade_open <SYMBOL> <long|short> entry <ENTRY> sl <SL> risk <usd|pct> <VALUE> [note "..."] [sig <SETUP_ID>]
+- /trade_open <SYMBOL> <long|short> entry <ENTRY> sl <SL> risk <usd|pct> <VALUE> [note ...] [sig <PF-ID>]
 
-Manage open trade (NEW):
+Manage open trade:
 - /trade_sl <TRADE_ID> <NEW_SL>
-  → Updates Stop Loss for an open trade (and updates trade risk). Warns if risk increased.
+  → Updates SL + updates trade risk
+  → Daily used risk is adjusted by the risk delta
+  → Warns if risk increased / confirms if risk reduced
 
 - /trade_rf <TRADE_ID>
-  → Risk-Free: moves SL to Entry and sets trade risk to 0
-  → Also releases today's used risk by the previous risk amount.
+  → Risk-Free: moves SL to Entry, sets trade risk to 0
+  → Releases today’s used risk by the previous risk amount
 
 Close trade:
 - /trade_close <TRADE_ID> pnl <PNL>
+  → Equity updates ONLY when trades are closed
+  → If PnL is PROFIT (>0), today’s used risk is released by the trade’s original risk
 
-Equity behavior:
-- Equity updates ONLY when trades are closed
+Notes:
 - Trade journal stays persistent in DB
 
 4) Status
 - /status
 Shows:
-• equity, daily limits, used/remaining daily risk
+• equity
+• trades today (count)
+• daily cap + used/remaining daily risk
 • sessions enabled + current session
-• email limits
+• email alert status + email caps (session/day/gap)
 • open trades list
 
 5) Risk Settings
+Default risk per trade:
 - /riskmode pct 2.5
 - /riskmode usd 25
+
+Daily risk cap:
 - /dailycap pct 5
 - /dailycap usd 60
 
 Limits:
 - /limits maxtrades 5
-- /limits emailcap 4        (0 = unlimited)
-- /limits emailgap 60
-- /limits emaildaycap 4     (0 = unlimited)
+- /limits emailcap 4        (0 = unlimited per session)
+- /limits emailgap 60       (minutes)
+- /limits emaildaycap 4     (0 = unlimited per day)
 
-6) Sessions (Emails by session)
-Default by timezone:
+6) Sessions (Email delivery windows)
+View:
+- /sessions
+
+Enable / disable:
+- /sessions_on NY
+- /sessions_off LON
+
+Defaults by timezone:
 - Americas → NY
 - Europe/Africa → LON
 - Asia/Oceania → ASIA
 
-Session priority:
+Priority:
 NY > LON > ASIA
-
-Commands:
-- /sessions
-- /sessions_on NY
-- /sessions_off LON
 
 7) Email Alerts
 - /notify_on
 - /notify_off
 
 Email rules:
-- Sent only during enabled sessions
-- Session-based quality filters (conf + RR floors)
-- No same symbol for 18h
-- Daily email cap supported
-
-Admin-only:
-- /email_test
-  Sends a test email immediately (checks SMTP end-to-end).
+- Sent only during your ENABLED sessions
+- Session-based quality floors (min confidence + min RR(TP3))
+- No same symbol for 4h (cooldown)
+- Caps supported:
+  • per-session cap (/limits emailcap)
+  • per-day cap (/limits emaildaycap)
+  • min gap between emails (/limits emailgap)
 
 8) Performance Reports
 - /report_daily
@@ -2126,6 +2140,17 @@ Admin-only:
 9) Signal Reports
 - /signals_daily
 - /signals_weekly
+Summaries of signals generated + your linked trades performance (if you used sig PF-...)
+
+10) Health
+- /health_sys
+System-level health:
+• DB OK/FAIL
+• Bybit/CCXT OK/FAIL + ticker count + latency
+• email enabled/configured
+• cache stats + TTLs
+• your sessions enabled + current session
+• email limits (session/day/gap)
 
 Not financial advice.
 PulseFutures
@@ -3567,7 +3592,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
                 # Symbol cooldown
                 if symbol_recently_emailed(uid, s.symbol, SYMBOL_COOLDOWN_HOURS):
-                    skip_reasons_counter["symbol_cooldown_18h"] += 1
+                    skip_reasons_counter["symbol_cooldown_4h"] += 1
                     continue
 
                 is_confirm_15m = abs(float(s.ch15)) >= CONFIRM_15M_ABS_MIN
