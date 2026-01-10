@@ -1375,8 +1375,18 @@ def table_md(rows: List[List[Any]], headers: List[str]) -> str:
     return "```\n" + tabulate(rows, headers=headers, tablefmt="github") + "\n```"
 
 # Email-specific price formatting (less noisy)
-def fmt_price_email(x: float) -> str:
-    ax = abs(float(x))
+def fmt_price(x: float) -> str:
+    """
+    Telegram-friendly price formatting (less noisy than raw float).
+    """
+    try:
+        x = float(x)
+    except Exception:
+        return "0"
+
+    ax = abs(x)
+    if ax >= 1000:
+        return f"{x:.2f}"
     if ax >= 100:
         return f"{x:.2f}"
     if ax >= 1:
@@ -1386,6 +1396,7 @@ def fmt_price_email(x: float) -> str:
     if ax >= 0.01:
         return f"{x:.5f}"
     return f"{x:.6f}"
+
 
 
 # =========================================================
