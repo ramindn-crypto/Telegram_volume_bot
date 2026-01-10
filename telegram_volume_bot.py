@@ -629,7 +629,7 @@ def db_init():
     con = db_connect()
     cur = con.cursor()
 
-        # =========================================================
+    # =========================================================
     # ✅ Cooldown table (v2): direction-aware + optional session stamp
     # - old: PRIMARY KEY(user_id, symbol)
     # - new: PRIMARY KEY(user_id, symbol, side)
@@ -739,15 +739,6 @@ def db_init():
         session_key TEXT NOT NULL,
         sent_count INTEGER NOT NULL,
         last_email_ts REAL NOT NULL
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS emailed_symbols (
-        user_id INTEGER NOT NULL,
-        symbol TEXT NOT NULL,
-        emailed_ts REAL NOT NULL,
-        PRIMARY KEY (user_id, symbol)
     )
     """)
 
