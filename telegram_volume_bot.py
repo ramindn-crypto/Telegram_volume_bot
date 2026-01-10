@@ -1638,14 +1638,15 @@ def make_setup(
                     dot = "🟡"
                 else:
                     dot = "🔴"
-    
+
                 side_guess = "BUY" if ch1 > 0 else "SELL"
                 _WAITING_TRIGGER[str(base)] = {"side": side_guess, "dot": dot}
-    
+
         _rej("ch1_below_trigger", base, mv)
         return None
 
-       side = "BUY" if ch1 > 0 else "SELL"
+    # ✅ IMPORTANT: this must be OUTSIDE the if block (no extra indent)
+    side = "BUY" if ch1 > 0 else "SELL"
 
     # 4H alignment
     if side == "BUY" and ch4 < ALIGN_4H_MIN:
