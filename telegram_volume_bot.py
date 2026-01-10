@@ -2127,13 +2127,9 @@ Admin-only:
 - /signals_daily
 - /signals_weekly
 
-
-10) HEalth 
-- /health
-
 Not financial advice.
+PulseFutures
 """
-
 
 # =========================================================
 # TELEGRAM COMMANDS
