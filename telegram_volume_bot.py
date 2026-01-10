@@ -2369,7 +2369,17 @@ PulseFutures
 # TELEGRAM COMMANDS
 # =========================================================
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
+    # HELP_TEXT is long -> must be chunked
+    await send_long_message(
+        update,
+        HELP_TEXT,
+        parse_mode=None,  # keep plain text (safe)
+        disable_web_page_preview=True,
+    )
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_help(update, context)
+
 
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
