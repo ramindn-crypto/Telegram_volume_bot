@@ -586,6 +586,40 @@ _WAITING_TRIGGER: Dict[str, Dict[str, Any]] = {}
 def is_admin_user(user_id: int) -> bool:
     return int(user_id) in ADMIN_USER_IDS if ADMIN_USER_IDS else False
 
+# =========================================================
+# GLOBAL STATE (missing in current file)
+# =========================================================
+
+# Stores last SMTP error per user for /health and /email_test
+_LAST_SMTP_ERROR: Dict[int, str] = {}
+
+# Per-user diagnostics preference (non-admin). Admin always full.
+_USER_DIAG_MODE: Dict[int, str] = {}
+
+def user_diag_mode(user_id: int) -> str:
+    """
+    Returns diagnostic visibility mode for this user:
+    - admin => 'full'
+    - non-admin => 'friendly' or 'off'
+    Enforces PUBLIC_DIAGNOSTICS_MODE:
+      - 'off'   => always off for non-admin
+      - 'admin' => allow per-user friendly/off
+    """
+    uid = int(user_id)
+
+    if is_admin_user(uid):
+        return "full"
+
+    # hard lock for public users
+    if PUBLIC_DIAGNOSTICS_MODE == "off":
+        return "off"
+
+    # admin-only diagnostics policy (recommended):
+    # non-admin can choose friendly/off locally
+    mode = (_USER_DIAG_MODE.get(uid) or "off").strip().lower()
+    if mode not in {"friendly", "off"}:
+        mode = "off"
+    return mode
 
 def reset_reject_tracker() -> None:
     return
@@ -4238,7 +4272,6 @@ def main():
     app.add_handler(CommandHandler("signals_daily", signals_daily_cmd))
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd))
 
-    
     app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CommandHandler("health_sys", health_sys_cmd))
 
