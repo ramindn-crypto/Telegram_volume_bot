@@ -89,6 +89,56 @@ DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
 CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "5"))
 
 # -------------------------
+# LOGGING: redact secrets + quiet noisy libs (Render-safe)
+# -------------------------
+class RedactSecretsFilter(logging.Filter):
+    def __init__(self, secrets: List[str]):
+        super().__init__()
+        self.secrets = [s for s in (secrets or []) if s]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+
+        for s in self.secrets:
+            if s and s in msg:
+                msg = msg.replace(s, "[REDACTED]")
+
+        # Replace rendered message safely
+        record.msg = msg
+        record.args = ()
+        return True
+
+
+def setup_logging():
+    # Let Render control via LOG_LEVEL, default INFO
+    lvl = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(level=getattr(logging, lvl, logging.INFO))
+
+    # Quiet the libs that spam request URLs (and may leak token)
+    for noisy in ("httpx", "telegram", "telegram.ext", "apscheduler"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # Redact secrets from ALL logs
+    secrets = [
+        os.environ.get("TELEGRAM_TOKEN", ""),
+        os.environ.get("EMAIL_PASS", ""),
+    ]
+    logging.getLogger().addFilter(RedactSecretsFilter(secrets))
+
+
+# Call once at import time (after TOKEN/envs exist)
+setup_logging()
+
+# Recreate your app logger after setup_logging so it inherits config
+logger = logging.getLogger("pulsefutures")
+
+
+
+
+# -------------------------
 # ✅ Admin / Visibility (anti-copy)
 # -------------------------
 # Put your Telegram user id(s) here, comma-separated (example: "123,456")
@@ -1459,14 +1509,33 @@ async def send_long_message(update: Update, text: str, parse_mode: Optional[str]
                 disable_web_page_preview=disable_web_page_preview,
                 reply_markup=reply_markup if first else None,
             )
-        except Exception as e:
-            logger.exception("send_long_message markdown failed, fallback plain. err=%s", e)
-            await update.message.reply_text(
-                ch,
-                disable_web_page_preview=disable_web_page_preview,
-                reply_markup=reply_markup if first else None,
-            )
-        first = False
+        
+        
+            except smtplib.SMTPAuthenticationError as e:
+                # Gmail/Google commonly returns 534 5.7.9 when browser login / app password needed
+                msg = f"SMTPAuthenticationError: {getattr(e, 'smtp_code', '')} {getattr(e, 'smtp_error', b'').decode(errors='ignore')}"
+                logger.error("send_email auth failed: %s", msg)
+        
+                if user_id_for_debug is not None:
+                    _LAST_SMTP_ERROR[int(user_id_for_debug)] = (
+                        "SMTP auth failed (likely app-password or provider security step required). "
+                        + msg
+                    )
+                return False
+        
+            except (smtplib.SMTPException, OSError, ssl.SSLError) as e:
+                # Network / SMTP transient errors: log one line, no traceback spam
+                logger.error("send_email failed: %s: %s", type(e).__name__, str(e))
+                if user_id_for_debug is not None:
+                    _LAST_SMTP_ERROR[int(user_id_for_debug)] = f"{type(e).__name__}: {str(e)}"
+                return False
+        
+            except Exception as e:
+                # Last-resort: still no traceback spam in Render
+                logger.error("send_email unexpected error: %s: %s", type(e).__name__, str(e))
+                if user_id_for_debug is not None:
+                    _LAST_SMTP_ERROR[int(user_id_for_debug)] = f"{type(e).__name__}: {str(e)}"
+                return False
 
 
 # =========================================================
