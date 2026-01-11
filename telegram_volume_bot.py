@@ -1487,18 +1487,23 @@ def fmt_price_email(x: float) -> str:
 # =========================================================
 # TELEGRAM SAFE SEND (chunking + markdown fallback)
 # =========================================================
+
+from telegram.error import BadRequest, TimedOut, NetworkError, RetryAfter
+
 SAFE_CHUNK = 3500
 
-async def send_long_message(update: Update, text: str, parse_mode: Optional[str] = None,
-                            disable_web_page_preview: bool = True, reply_markup=None):
+async def send_long_message(
+    update: Update,
+    text: str,
+    parse_mode: Optional[str] = None,
+    disable_web_page_preview: bool = True,
+    reply_markup=None,
+):
     if not update or not update.message:
         return
 
-    chunks = []
     s = text or ""
-    while s:
-        chunks.append(s[:SAFE_CHUNK])
-        s = s[SAFE_CHUNK:]
+    chunks = [s[i:i+SAFE_CHUNK] for i in range(0, len(s), SAFE_CHUNK)]
 
     first = True
     for ch in chunks:
@@ -1509,33 +1514,36 @@ async def send_long_message(update: Update, text: str, parse_mode: Optional[str]
                 disable_web_page_preview=disable_web_page_preview,
                 reply_markup=reply_markup if first else None,
             )
-        
-        
-            except smtplib.SMTPAuthenticationError as e:
-                # Gmail/Google commonly returns 534 5.7.9 when browser login / app password needed
-                msg = f"SMTPAuthenticationError: {getattr(e, 'smtp_code', '')} {getattr(e, 'smtp_error', b'').decode(errors='ignore')}"
-                logger.error("send_email auth failed: %s", msg)
-        
-                if user_id_for_debug is not None:
-                    _LAST_SMTP_ERROR[int(user_id_for_debug)] = (
-                        "SMTP auth failed (likely app-password or provider security step required). "
-                        + msg
-                    )
-                return False
-        
-            except (smtplib.SMTPException, OSError, ssl.SSLError) as e:
-                # Network / SMTP transient errors: log one line, no traceback spam
-                logger.error("send_email failed: %s: %s", type(e).__name__, str(e))
-                if user_id_for_debug is not None:
-                    _LAST_SMTP_ERROR[int(user_id_for_debug)] = f"{type(e).__name__}: {str(e)}"
-                return False
-        
-            except Exception as e:
-                # Last-resort: still no traceback spam in Render
-                logger.error("send_email unexpected error: %s: %s", type(e).__name__, str(e))
-                if user_id_for_debug is not None:
-                    _LAST_SMTP_ERROR[int(user_id_for_debug)] = f"{type(e).__name__}: {str(e)}"
-                return False
+
+        except RetryAfter as e:
+            # Telegram rate limit: wait then retry once
+            await asyncio.sleep(int(e.retry_after) + 1)
+            await update.message.reply_text(
+                ch,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+                reply_markup=reply_markup if first else None,
+            )
+
+        except BadRequest:
+            # Usually markdown issue -> fallback to plain text
+            await update.message.reply_text(
+                ch,
+                parse_mode=None,
+                disable_web_page_preview=disable_web_page_preview,
+                reply_markup=reply_markup if first else None,
+            )
+
+        except (TimedOut, NetworkError) as e:
+            logger.warning("Telegram send failed (network): %s", e)
+            # optionally: retry once
+            await asyncio.sleep(2)
+
+        except Exception as e:
+            logger.exception("Telegram send failed: %s", e)
+
+        first = False
+
 
 
 # =========================================================
