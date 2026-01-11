@@ -586,8 +586,10 @@ _WAITING_TRIGGER: Dict[str, Dict[str, Any]] = {}
 def is_admin_user(user_id: int) -> bool:
     return int(user_id) in ADMIN_USER_IDS if ADMIN_USER_IDS else False
 
+
+
 # =========================================================
-# GLOBAL STATE (missing in current file)
+# GLOBAL STATE
 # =========================================================
 
 # Stores last SMTP error per user for /health and /email_test
@@ -595,6 +597,12 @@ _LAST_SMTP_ERROR: Dict[int, str] = {}
 
 # Per-user diagnostics preference (non-admin). Admin always full.
 _USER_DIAG_MODE: Dict[int, str] = {}
+
+# ✅ NEW: Stores last email decision per user (SENT / SKIP + reasons)
+_LAST_EMAIL_DECISION: Dict[int, Dict[str, Any]] = {}
+
+
+
 
 def user_diag_mode(user_id: int) -> str:
     """
@@ -4132,6 +4140,18 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 }
 
 
+async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    d = _LAST_EMAIL_DECISION.get(uid)
+    if not d:
+        await update.message.reply_text("No email decision recorded yet.")
+        return
+    await update.message.reply_text(
+        "📧 Last Email Decision\n"
+        f"Status: {d.get('status')}\n"
+        f"When: {d.get('when')}\n"
+        f"Reasons:\n- " + "\n- ".join(d.get("reasons", []))
+    )
 
 
 
@@ -4276,10 +4296,12 @@ def main():
     app.add_handler(CommandHandler("health_sys", health_sys_cmd))
 
     app.add_handler(CommandHandler("email_test", email_test_cmd))
-
+    app.add_handler(CommandHandler("email_decision", email_decision_cmd))
+    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
-    # ================= JobQueue =================app.run_polling(
+    # ================= JobQueue ================= #
+    app.run_polling(
     if app.job_queue:
         app.job_queue.run_repeating(
             alert_job,
