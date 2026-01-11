@@ -1430,6 +1430,8 @@ def fmt_price(x: float) -> str:
         return f"{x:.5f}"
     return f"{x:.6f}"
 
+def fmt_price_email(x: float) -> str:
+    return fmt_price(x)
 
 
 # =========================================================
@@ -4301,7 +4303,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     # ================= JobQueue ================= #
-    app.run_polling(
     if app.job_queue:
         app.job_queue.run_repeating(
             alert_job,
@@ -4330,6 +4331,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
