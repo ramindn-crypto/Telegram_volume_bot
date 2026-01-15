@@ -324,6 +324,15 @@ SEP = "────────────────────"
 
 ALERT_LOCK = asyncio.Lock()
 
+# =========================================================
+# ✅ DB BACKUP/RESET + EMAIL TRADE WINDOW (per-user)
+# =========================================================
+DB_BACKUP_PATH = os.environ.get("DB_BACKUP_PATH", DB_PATH + ".bak")
+
+DB_FILE_LOCK = asyncio.Lock()
+
+
+
 # Sessions defined in UTC windows (market convention, with overlaps)
 # ASIA: 00:00–09:00 UTC
 # LON : 07:00–16:00 UTC
@@ -712,6 +721,141 @@ def db_connect() -> sqlite3.Connection:
 
     return con
 
+
+def db_backup_file() -> Tuple[bool, str]:
+    """
+    Copies DB_PATH -> DB_BACKUP_PATH
+    """
+    try:
+        # Ensure folder exists
+        os.makedirs(os.path.dirname(DB_BACKUP_PATH) or ".", exist_ok=True)
+
+        if not os.path.exists(DB_PATH):
+            return False, f"DB file not found: {DB_PATH}"
+
+        # Copy bytes
+        with open(DB_PATH, "rb") as src, open(DB_BACKUP_PATH, "wb") as dst:
+            dst.write(src.read())
+
+        return True, f"Backup created: {DB_BACKUP_PATH}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def db_restore_file() -> Tuple[bool, str]:
+    """
+    Copies DB_BACKUP_PATH -> DB_PATH
+    """
+    try:
+        if not os.path.exists(DB_BACKUP_PATH):
+            return False, f"No backup found: {DB_BACKUP_PATH}"
+
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+
+        with open(DB_BACKUP_PATH, "rb") as src, open(DB_PATH, "wb") as dst:
+            dst.write(src.read())
+
+        return True, f"Restored from backup: {DB_BACKUP_PATH}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def db_wipe_all_data_keep_schema() -> None:
+    """
+    Deletes ALL rows from core tables, keeps schema.
+    Also resets in-memory trackers.
+    """
+    con = db_connect()
+    cur = con.cursor()
+
+    # Order matters if FK ever added later. We currently don’t have FK refs, but still safe.
+    tables = [
+        "trades",
+        "signals",
+        "emailed_symbols",
+        "email_state",
+        "email_daily",
+        "risk_daily",
+        "setup_counter",
+        # users is kept (preferences) OR can be wiped too. You requested "clean database":
+        # wiping users means everyone will be re-created on next /start.
+        "users",
+    ]
+
+    for t in tables:
+        try:
+            cur.execute(f"DELETE FROM {t}")
+        except Exception:
+            pass
+
+    con.commit()
+    con.close()
+
+    # Also clear runtime trackers
+    _LAST_SMTP_ERROR.clear()
+    _USER_DIAG_MODE.clear()
+    _LAST_EMAIL_DECISION.clear()
+
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /reset
+    Admin-only:
+    1) Backup DB file
+    2) Wipe tables (clean DB)
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    async with DB_FILE_LOCK:
+        ok, msg = db_backup_file()
+        if not ok:
+            await update.message.reply_text(f"❌ Backup failed.\n{msg}")
+            return
+
+        try:
+            db_wipe_all_data_keep_schema()
+        except Exception as e:
+            await update.message.reply_text(f"❌ Reset failed.\n{type(e).__name__}: {e}")
+            return
+
+    await update.message.reply_text(
+        "✅ Database RESET completed.\n"
+        f"{msg}\n\n"
+        "Use /restore to revert to the backup."
+    )
+
+
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /restore
+    Admin-only:
+    Restores DB from DB_BACKUP_PATH
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    async with DB_FILE_LOCK:
+        ok, msg = db_restore_file()
+        if not ok:
+            await update.message.reply_text(f"❌ Restore failed.\n{msg}")
+            return
+
+        # After restore, ensure schema migrations still applied
+        try:
+            db_init()
+        except Exception:
+            pass
+
+    await update.message.reply_text(f"✅ Database RESTORED.\n{msg}")
+
+
+
+
 def db_init():
     # ensures folder exists before creating DB file
     db_dir = os.path.dirname(DB_PATH)
@@ -783,6 +927,14 @@ def db_init():
 
     cur.execute("PRAGMA table_info(users)")
     cols = {r[1] for r in cur.fetchall()}
+
+    # ✅ Trade window columns (local time HH:MM), empty = disabled
+    if "trade_window_start" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN trade_window_start TEXT NOT NULL DEFAULT ''")
+    if "trade_window_end" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN trade_window_end TEXT NOT NULL DEFAULT ''")
+
+    
     if "max_emails_per_day" not in cols:
         cur.execute(f"ALTER TABLE users ADD COLUMN max_emails_per_day INTEGER NOT NULL DEFAULT {int(DEFAULT_MAX_EMAILS_PER_DAY)}")
 
@@ -1190,6 +1342,65 @@ def db_trades_since(user_id: int, ts_from: float) -> List[dict]:
     rows = cur.fetchall()
     con.close()
     return [dict(r) for r in rows]
+
+
+def db_trades_all(user_id: int) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT * FROM trades
+        WHERE user_id=?
+        ORDER BY opened_ts ASC
+    """, (int(user_id),))
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def _profit_factor(trades: List[dict]) -> Optional[float]:
+    closed = [t for t in trades if t.get("closed_ts") is not None and t.get("pnl") is not None]
+    if not closed:
+        return None
+    gp = sum(float(t["pnl"]) for t in closed if float(t["pnl"]) > 0)
+    gl = abs(sum(float(t["pnl"]) for t in closed if float(t["pnl"]) < 0))
+    if gl <= 0:
+        return None if gp <= 0 else float("inf")
+    return gp / gl
+
+
+def _expectancy_r(trades: List[dict]) -> Optional[float]:
+    closed = [t for t in trades if t.get("closed_ts") is not None and t.get("r_mult") is not None]
+    if not closed:
+        return None
+    rs = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
+    return (sum(rs) / len(rs)) if rs else None
+
+
+async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    trades = db_trades_all(uid)
+    stats = _stats_from_trades(trades)
+
+    pf = _profit_factor(trades)
+    exp_r = _expectancy_r(trades)
+
+    msg = [
+        "📊 Overall Report (ALL TIME)",
+        HDR,
+        f"Closed: {stats['closed_n']} | Wins: {stats['wins']} | Losses: {stats['losses']}",
+        f"Win rate: {stats['win_rate']:.1f}%",
+        f"Net PnL: {stats['net']:+.2f}",
+        f"Avg R: {stats['avg_r']:+.2f}" if stats["avg_r"] is not None else "Avg R: -",
+        f"Expectancy (R): {exp_r:+.2f}" if exp_r is not None else "Expectancy (R): -",
+        f"Profit Factor: {pf:.2f}" if (pf is not None and pf != float('inf')) else ("Profit Factor: ∞" if pf == float('inf') else "Profit Factor: -"),
+        f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
+        HDR,
+        f"Equity (current): ${float(user['equity']):.2f}",
+    ]
+
+    await update.message.reply_text("\n".join(msg))
 
 
 # =========================================================
@@ -2063,6 +2274,15 @@ def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None)
     """
     Sends email and stores last SMTP error per user (for /health).
     """
+
+    if not in_trade_window_now(user, now_local):
+    _LAST_EMAIL_DECISION[int(user["user_id"])] = {
+        "status": "SKIP",
+        "reason": "outside_trade_window",
+        "ts": time.time(),
+    }
+    continue
+   
     if not email_config_ok():
         logger.warning("Email not configured.")
         if user_id_for_debug is not None:
@@ -2127,6 +2347,104 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         err = _LAST_SMTP_ERROR.get(uid, "unknown")
         await update.message.reply_text(f"❌ Test email failed.\nError: {err}")
+
+
+
+def _parse_hhmm_local(s: str) -> Tuple[int, int]:
+    s = (s or "").strip()
+    m = re.match(r"^(\d{2}):(\d{2})$", s)
+    if not m:
+        raise ValueError("bad time")
+    hh = int(m.group(1)); mm = int(m.group(2))
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        raise ValueError("bad time")
+    return hh, mm
+
+
+def in_trade_window_now(user: dict, now_local: Optional[datetime] = None) -> bool:
+    """
+    If user trade_window_start/end are empty -> allowed (no restriction).
+    Otherwise checks local time window (supports overnight windows).
+    """
+    start_s = str(user.get("trade_window_start") or "").strip()
+    end_s = str(user.get("trade_window_end") or "").strip()
+    if not start_s or not end_s:
+        return True  # disabled => allow
+
+    tz = ZoneInfo(user["tz"])
+    if now_local is None:
+        now_local = datetime.now(tz)
+
+    sh, sm = _parse_hhmm_local(start_s)
+    eh, em = _parse_hhmm_local(end_s)
+
+    start_dt = now_local.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end_dt = now_local.replace(hour=eh, minute=em, second=0, microsecond=0)
+
+    # Overnight window support, e.g. 22:00 -> 06:00
+    if end_dt <= start_dt:
+        # window crosses midnight
+        if now_local >= start_dt:
+            return True
+        # else compare with "yesterday start"
+        start_dt = start_dt - timedelta(days=1)
+        end_dt = end_dt + timedelta(days=1)
+
+    return start_dt <= now_local <= end_dt
+
+
+async def trade_window_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /trade_window
+    View: /trade_window
+    Set : /trade_window 09:00 17:30
+    Off : /trade_window off
+    """
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not context.args:
+        cur_s = (user.get("trade_window_start") or "").strip()
+        cur_e = (user.get("trade_window_end") or "").strip()
+        if not cur_s or not cur_e:
+            await update.message.reply_text(
+                "🕒 Trade Window (Email Signals)\n"
+                f"{HDR}\n"
+                "Current: OFF (no time restriction)\n\n"
+                "Set: /trade_window 09:00 17:30\n"
+                "Off: /trade_window off"
+            )
+        else:
+            await update.message.reply_text(
+                "🕒 Trade Window (Email Signals)\n"
+                f"{HDR}\n"
+                f"Current: {cur_s} → {cur_e} (local)\n\n"
+                "Change: /trade_window 09:00 17:30\n"
+                "Off: /trade_window off"
+            )
+        return
+
+    if len(context.args) == 1 and context.args[0].strip().lower() in {"off", "disable", "none"}:
+        update_user(uid, trade_window_start="", trade_window_end="")
+        await update.message.reply_text("✅ Trade window is now OFF (emails allowed anytime).")
+        return
+
+    if len(context.args) != 2:
+        await update.message.reply_text("Usage: /trade_window 09:00 17:30  OR  /trade_window off")
+        return
+
+    start_s = context.args[0].strip()
+    end_s = context.args[1].strip()
+
+    try:
+        _parse_hhmm_local(start_s)
+        _parse_hhmm_local(end_s)
+    except Exception:
+        await update.message.reply_text("Invalid time format. Use HH:MM (24h). Example: /trade_window 09:00 17:30")
+        return
+
+    update_user(uid, trade_window_start=start_s, trade_window_end=end_s)
+    await update.message.reply_text(f"✅ Trade window set: {start_s} → {end_s} (local time).")
 
 
 # =========================================================
@@ -2517,6 +2835,142 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         HDR,
     ]
     await update.message.reply_text("\n".join(msg).strip())
+
+
+def db_backup_file() -> Tuple[bool, str]:
+    """
+    Copies DB_PATH -> DB_BACKUP_PATH
+    """
+    try:
+        # Ensure folder exists
+        os.makedirs(os.path.dirname(DB_BACKUP_PATH) or ".", exist_ok=True)
+
+        if not os.path.exists(DB_PATH):
+            return False, f"DB file not found: {DB_PATH}"
+
+        # Copy bytes
+        with open(DB_PATH, "rb") as src, open(DB_BACKUP_PATH, "wb") as dst:
+            dst.write(src.read())
+
+        return True, f"Backup created: {DB_BACKUP_PATH}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def db_restore_file() -> Tuple[bool, str]:
+    """
+    Copies DB_BACKUP_PATH -> DB_PATH
+    """
+    try:
+        if not os.path.exists(DB_BACKUP_PATH):
+            return False, f"No backup found: {DB_BACKUP_PATH}"
+
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+
+        with open(DB_BACKUP_PATH, "rb") as src, open(DB_PATH, "wb") as dst:
+            dst.write(src.read())
+
+        return True, f"Restored from backup: {DB_BACKUP_PATH}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def db_wipe_all_data_keep_schema() -> None:
+    """
+    Deletes ALL rows from core tables, keeps schema.
+    Also resets in-memory trackers.
+    """
+    con = db_connect()
+    cur = con.cursor()
+
+    # Order matters if FK ever added later. We currently don’t have FK refs, but still safe.
+    tables = [
+        "trades",
+        "signals",
+        "emailed_symbols",
+        "email_state",
+        "email_daily",
+        "risk_daily",
+        "setup_counter",
+        # users is kept (preferences) OR can be wiped too. You requested "clean database":
+        # wiping users means everyone will be re-created on next /start.
+        "users",
+    ]
+
+    for t in tables:
+        try:
+            cur.execute(f"DELETE FROM {t}")
+        except Exception:
+            pass
+
+    con.commit()
+    con.close()
+
+    # Also clear runtime trackers
+    _LAST_SMTP_ERROR.clear()
+    _USER_DIAG_MODE.clear()
+    _LAST_EMAIL_DECISION.clear()
+
+
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /reset
+    Admin-only:
+    1) Backup DB file
+    2) Wipe tables (clean DB)
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    async with DB_FILE_LOCK:
+        ok, msg = db_backup_file()
+        if not ok:
+            await update.message.reply_text(f"❌ Backup failed.\n{msg}")
+            return
+
+        try:
+            db_wipe_all_data_keep_schema()
+        except Exception as e:
+            await update.message.reply_text(f"❌ Reset failed.\n{type(e).__name__}: {e}")
+            return
+
+    await update.message.reply_text(
+        "✅ Database RESET completed.\n"
+        f"{msg}\n\n"
+        "Use /restore to revert to the backup."
+    )
+
+
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /restore
+    Admin-only:
+    Restores DB from DB_BACKUP_PATH
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    async with DB_FILE_LOCK:
+        ok, msg = db_restore_file()
+        if not ok:
+            await update.message.reply_text(f"❌ Restore failed.\n{msg}")
+            return
+
+        # After restore, ensure schema migrations still applied
+        try:
+            db_init()
+        except Exception:
+            pass
+
+    await update.message.reply_text(f"✅ Database RESTORED.\n{msg}")
+
+
+
 
 
 async def diag_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3490,6 +3944,68 @@ async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(msg))
 
+
+def db_trades_all(user_id: int) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT * FROM trades
+        WHERE user_id=?
+        ORDER BY opened_ts ASC
+    """, (int(user_id),))
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def _profit_factor(trades: List[dict]) -> Optional[float]:
+    closed = [t for t in trades if t.get("closed_ts") is not None and t.get("pnl") is not None]
+    if not closed:
+        return None
+    gp = sum(float(t["pnl"]) for t in closed if float(t["pnl"]) > 0)
+    gl = abs(sum(float(t["pnl"]) for t in closed if float(t["pnl"]) < 0))
+    if gl <= 0:
+        return None if gp <= 0 else float("inf")
+    return gp / gl
+
+
+def _expectancy_r(trades: List[dict]) -> Optional[float]:
+    closed = [t for t in trades if t.get("closed_ts") is not None and t.get("r_mult") is not None]
+    if not closed:
+        return None
+    rs = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
+    return (sum(rs) / len(rs)) if rs else None
+
+
+async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    trades = db_trades_all(uid)
+    stats = _stats_from_trades(trades)
+
+    pf = _profit_factor(trades)
+    exp_r = _expectancy_r(trades)
+
+    msg = [
+        "📊 Overall Report (ALL TIME)",
+        HDR,
+        f"Closed: {stats['closed_n']} | Wins: {stats['wins']} | Losses: {stats['losses']}",
+        f"Win rate: {stats['win_rate']:.1f}%",
+        f"Net PnL: {stats['net']:+.2f}",
+        f"Avg R: {stats['avg_r']:+.2f}" if stats["avg_r"] is not None else "Avg R: -",
+        f"Expectancy (R): {exp_r:+.2f}" if exp_r is not None else "Expectancy (R): -",
+        f"Profit Factor: {pf:.2f}" if (pf is not None and pf != float('inf')) else ("Profit Factor: ∞" if pf == float('inf') else "Profit Factor: -"),
+        f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
+        HDR,
+        f"Equity (current): ${float(user['equity']):.2f}",
+    ]
+
+    await update.message.reply_text("\n".join(msg))
+
+
+
+
 async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -4367,14 +4883,20 @@ def main():
     app.add_handler(CommandHandler("cooldown_clear_all", cooldown_clear_all_cmd))
  
     app.add_handler(CommandHandler("report_daily", report_daily_cmd))
+    app.add_handler(CommandHandler("report_overall", report_overall_cmd))  
     app.add_handler(CommandHandler("report_weekly", report_weekly_cmd))
     app.add_handler(CommandHandler("signals_daily", signals_daily_cmd))
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd))
 
     app.add_handler(CommandHandler("health", health_cmd))
+
+    app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("restore", restore_cmd))
+    
     app.add_handler(CommandHandler("health_sys", health_sys_cmd))
 
     app.add_handler(CommandHandler("email_test", email_test_cmd))
+    app.add_handler(CommandHandler("trade_window", trade_window_cmd))
     app.add_handler(CommandHandler("email_decision", email_decision_cmd))
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
