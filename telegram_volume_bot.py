@@ -2300,6 +2300,7 @@ def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None)
     """
     Sends email and stores last SMTP error per user (for /health).
     """
+    user = get_user(uid)
     if not email_config_ok():
         logger.warning("Email not configured.")
         if user_id_for_debug is not None:
