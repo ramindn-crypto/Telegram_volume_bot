@@ -2571,13 +2571,9 @@ PulseFutures — Commands (Telegram)
 /help
 
 PulseFutures — Commands (Telegram)
-Bybit USDT Futures • Risk-first • Session-aware
-Not financial advice.
-
 ────────────────────
 1) Market Scan
 ────────────────────
-
 /screen
 
 Shows a real-time market snapshot:
@@ -2587,21 +2583,6 @@ Shows a real-time market snapshot:
 • Directional Leaders
 • Directional Losers
 • Market Leaders (Top by Futures Volume)
-
-Notes:
-• Header shows: Active Session + Your City/Location + Local Time
-• Each setup includes:
-  - ID (ID-PF-YYYYMMDD-XXXX)
-  - Side (BUY / SELL)
-  - Confidence score
-  - Engine type (Mean-Reversion or Momentum)
-  - Entry / SL / TP(s)
-  - RR(TP3)
-  - Multi-timeframe momentum
-  - Futures volume
-  - TradingView chart link
-• “Pullback” wording is intentionally removed
-• /screen is NOT affected by cooldowns (always live)
 
 ────────────────────
 2) Position Sizing (NO trade opened)
@@ -2726,32 +2707,14 @@ Emails are sent ONLY during enabled sessions.
 ────────────────────
 8) Email Alerts
 ────────────────────
-
 Enable / disable:
 • /notify_on
 • /notify_off
 
-Email rules:
-• Sent only during enabled sessions
-• Session-based quality filters (confidence + RR floors)
-• No same symbol+direction spam
-• Cooldowns enforced (see below)
-• Per-session & per-day caps supported
-
+• Email Sent only during enabled sessions
 ────────────────────
 9) Symbol Cooldowns (Anti-Spam Logic)
 ────────────────────
-Cooldowns are:
-• Per-user
-• Per-symbol
-• Per-direction (BUY vs SELL)
-• Session-aware (duration depends on NY/LON/ASIA policy)
-
-Cooldown duration by session:
-• NY    → 2 hours
-• LON   → 3 hours
-• ASIA  → 4 hours
-
 View cooldowns:
 • /cooldowns
   → Shows remaining cooldown time for NY / LON / ASIA for each symbol + direction
@@ -2763,25 +2726,17 @@ Query a single symbol:
 Admin-only reset:
 • /cooldown_clear <SYMBOL> <long|short>
 • /cooldown_clear_all
-
 ────────────────────
 10) Reports
 ────────────────────
 Performance:
 • /report_daily
 • /report_weekly
+• /report_overall
 
 Signal summaries:
 • /signals_daily
 • /signals_weekly
-
-Reports include:
-• Trades taken
-• Win rate
-• Net PnL
-• R-multiples
-• Best / worst trades
-• System-generated advice
 
 ────────────────────
 11) System Health
