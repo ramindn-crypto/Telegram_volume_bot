@@ -1097,6 +1097,19 @@ def set_user_email(uid: int, email: str) -> None:
         )
         con.commit()
 
+def ensure_email_column():
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN email_to TEXT")
+            con.commit()
+            logger.info("Added email_to column to users table")
+        except sqlite3.OperationalError:
+            # Column already exists
+            pass
+
+
+
 def reset_daily_if_needed(user: dict) -> dict:
     tz = ZoneInfo(user["tz"])
     today = datetime.now(tz).date().isoformat()
@@ -4965,7 +4978,8 @@ def main():
         raise RuntimeError("TELEGRAM_TOKEN missing")
 
     db_init()
-
+    ensure_email_column()
+    
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
     app.add_error_handler(error_handler)
 
