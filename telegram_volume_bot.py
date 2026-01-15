@@ -2648,11 +2648,10 @@ def _advice(user: dict, stats: dict) -> List[str]:
 # HELP TEXT
 # =========================================================
 HELP_TEXT = """\
-PulseFutures — Commands (Telegram)
 
+PulseFutures — Commands (Telegram)
 /help
 
-PulseFutures — Commands (Telegram)
 ────────────────────
 1) Market Scan
 ────────────────────
@@ -2787,13 +2786,27 @@ NY > LON > ASIA
 Emails are sent ONLY during enabled sessions.
 
 ────────────────────
-8) Email Alerts
+8) Email Alerts (On/Off + Time Window)
 ────────────────────
 Enable / disable:
 • /notify_on
 • /notify_off
 
-• Email Sent only during enabled sessions
+Set allowed daily email window (local time):
+• /trade_window <START_HH:MM> <END_HH:MM>
+  Example:
+  • /trade_window 09:00 17:30
+  Notes:
+  • Signals/emails will only be sent inside this window
+  • Uses your /tz local time
+
+Test + diagnostics:
+• /email_test
+  → Sends a test email (confirms SMTP works)
+
+• /email_decision
+  → Shows the last email send/skip decision + reasons
+
 ────────────────────
 9) Symbol Cooldowns (Anti-Spam Logic)
 ────────────────────
@@ -2808,6 +2821,7 @@ Query a single symbol:
 Admin-only reset:
 • /cooldown_clear <SYMBOL> <long|short>
 • /cooldown_clear_all
+
 ────────────────────
 10) Reports
 ────────────────────
@@ -2815,6 +2829,7 @@ Performance:
 • /report_daily
 • /report_weekly
 • /report_overall
+  → All-time performance (win rate, net PnL, avg R, expectancy, profit factor)
 
 Signal summaries:
 • /signals_daily
@@ -2823,12 +2838,24 @@ Signal summaries:
 ────────────────────
 11) System Health
 ────────────────────
+• /health
+  → Quick bot health check
+
 • /health_sys
   → DB status
   → Bybit/CCXT connectivity
   → Cache stats
   → Session state
   → Email configuration
+
+────────────────────
+12) Data Maintenance (Admin)
+────────────────────
+• /reset
+  → Resets data / clean database (admin only)
+
+• /restore
+  → Restores previously removed data (admin only)
 
 ────────────────────
 Final Notes
