@@ -1083,6 +1083,20 @@ def update_user(user_id: int, **kwargs):
     con.commit()
     con.close()
 
+def set_user_email(uid: int, email: str) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        # ensure row exists
+        cur.execute(
+            "INSERT OR IGNORE INTO users(user_id) VALUES(?)",
+            (uid,)
+        )
+        cur.execute(
+            "UPDATE users SET email_to = ? WHERE user_id = ?",
+            (email, uid)
+        )
+        con.commit()
+
 def reset_daily_if_needed(user: dict) -> dict:
     tz = ZoneInfo(user["tz"])
     today = datetime.now(tz).date().isoformat()
@@ -2353,6 +2367,32 @@ def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None)
         }
         logger.error(f"Email send failed for user {user_id}: {err}")
         return False
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    if not context.args:
+        await update.message.reply_text("Usage: /email your@email.com\nExample: /email ramin@gmail.com")
+        return
+
+    email = context.args[0].strip()
+    if not EMAIL_RE.match(email):
+        await update.message.reply_text("❌ Invalid email format.\nExample: /email ramin@gmail.com")
+        return
+
+    try:
+        # Save per-user email (key you already read in email_test_cmd)
+        set_user_email(uid, email)
+
+        await update.message.reply_text(
+            f"✅ Recipient email saved:\n{email}\n\nNow run: /email_test"
+        )
+    except Exception as e:
+        logger.exception("email_cmd failed")
+        await update.message.reply_text(f"❌ Failed to save email: {type(e).__name__}: {e}")
 
 
 
@@ -4973,6 +5013,7 @@ def main():
     
     app.add_handler(CommandHandler("health_sys", health_sys_cmd))
     app.add_handler(CommandHandler("trade_window", trade_window_cmd))
+    app.add_handler(CommandHandler("email", email_cmd))   
     app.add_handler(CommandHandler("email_test", email_test_cmd))  
     app.add_handler(CommandHandler("email_decision", email_decision_cmd))
     
