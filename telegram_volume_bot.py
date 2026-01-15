@@ -46,7 +46,40 @@ from telegram.ext import (
 )
 
 
+# =========================================================
+# SAAS / STRIPE CONFIG
+# =========================================================
+import stripe
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
+FREE_TRIAL_DAYS = 7
+
+VALID_LICENSE_PREFIX = {
+    "PF-STD": "standard",
+    "PF-PRO": "pro",
+}
+
+# Reuse your existing admin system
+ADMIN_IDS = ADMIN_USER_IDS
+
+ALLOWED_WHEN_LOCKED = {
+    "start",
+    "help",
+    "billing",
+    "manage",
+    "myplan",
+    "license",
+    "support",
+    "support_status",
+}
+
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+
+STRIPE_PRICE_TO_PLAN = {
+    os.getenv("STRIPE_PRICE_STANDARD"): "standard",
+    os.getenv("STRIPE_PRICE_PRO"): "pro",
+}
 
 def render_primary_only() -> None:
     """
@@ -497,7 +530,6 @@ def ema(values: List[float], period: int) -> float:
     for v in values[1:]:
         e = (float(v) * k) + (e * (1.0 - k))
     return float(e)
-
 
 def compute_atr_from_ohlcv(ohlcv: List[List[float]], period: int = 14) -> float:
     """
@@ -1037,6 +1069,44 @@ def get_user(user_id: int) -> dict:
 
     con.close()
     return dict(row)
+
+# =========================================================
+# ACCESS CONTROL (FREE TRIAL + PAYWALL)
+# =========================================================
+def trial_expired(user: dict) -> bool:
+    try:
+        created = datetime.fromisoformat(user["created_at"])
+    except Exception:
+        return True
+    return datetime.utcnow() > created + timedelta(days=FREE_TRIAL_DAYS)
+
+
+def has_active_access(user: dict) -> bool:
+    if user.get("plan") in ("standard", "pro"):
+        return True
+    if user.get("plan") == "free" and not trial_expired(user):
+        return True
+    return False
+
+
+def enforce_access_or_block(update: Update, command: str) -> bool:
+    user = get_user(update.effective_user.id)
+
+    if has_active_access(user):
+        return True
+
+    if command in ALLOWED_WHEN_LOCKED:
+        return True
+
+    update.message.reply_text(
+        "⛔ Access locked.\n\n"
+        "Your 7-day free trial has ended.\n\n"
+        "Plans:\n"
+        "• Standard — $50/month\n"
+        "• Pro — $99/month\n\n"
+        "👉 /billing"
+    )
+    return False
 
 def update_user(user_id: int, **kwargs):
     if not kwargs:
@@ -2330,6 +2400,36 @@ def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None)
             }
         return False
 
+# =========================================================
+# STRIPE CHECKOUT / CUSTOMER PORTAL
+# =========================================================
+def create_checkout_session(email: str, plan: str) -> str:
+    price_id = (
+        os.environ.get("STRIPE_PRICE_STANDARD")
+        if plan == "standard"
+        else os.environ.get("STRIPE_PRICE_PRO")
+    )
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        customer_email=email,
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url=TELEGRAM_BOT_URL,
+        cancel_url=TELEGRAM_BOT_URL,
+        metadata={"plan": plan},
+    )
+    return session.url
+
+
+def create_customer_portal(email: str) -> str:
+    customer = stripe.Customer.list(email=email, limit=1).data[0]
+    portal = stripe.billing_portal.Session.create(
+        customer=customer.id,
+        return_url=TELEGRAM_BOT_URL,
+    )
+    return portal.url
+
+
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2858,6 +2958,42 @@ PulseFutures
 """
 
 # =========================================================
+# BILLING COMMANDS
+# =========================================================
+async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not enforce_access_or_block(update, "billing"):
+        return
+    user = get_user(update.effective_user.id)
+    email = user.get("email_to")
+    if not email:
+        await update.message.reply_text("❌ No email on file.")
+        return
+
+    await update.message.reply_text(
+        f"💳 Subscribe:\n\n"
+        f"Standard → {create_checkout_session(email, 'standard')}\n\n"
+        f"Pro → {create_checkout_session(email, 'pro')}"
+    )
+
+
+async def manage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    if user["plan"] not in ("standard", "pro"):
+        await update.message.reply_text("No active subscription.")
+        return
+    await update.message.reply_text(
+        create_customer_portal(user["email_to"])
+    )
+
+
+async def myplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    status = "ACTIVE" if has_active_access(user) else "LOCKED"
+    await update.message.reply_text(
+        f"Plan: {user['plan'].upper()}\nStatus: {status}"
+    )
+
+# =========================================================
 # TELEGRAM COMMANDS
 # =========================================================
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2871,6 +3007,41 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_help(update, context)
+
+# =========================================================
+# SUPPORT SYSTEM
+# =========================================================
+async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n/support <your issue>"
+        )
+        return
+
+    issue = " ".join(context.args)
+    ticket_id = f"TKT-{uid}-{int(time.time())}"
+
+    msg = (
+        f"🆘 Support Ticket {ticket_id}\n\n"
+        f"User: {uid}\n"
+        f"Message:\n{issue}"
+    )
+
+    for admin in ADMIN_IDS:
+        await context.bot.send_message(admin, msg)
+
+    await update.message.reply_text(
+        f"✅ Ticket created: {ticket_id}\n"
+        "Use /support_status to check."
+    )
+
+
+async def support_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📨 Your latest support ticket is being reviewed.\n"
+        "Resolved tickets are auto-closed."
+    )
 
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -4547,6 +4718,48 @@ def _email_body_pretty(
 
     return "\n".join(parts).strip()
 
+
+# =========================================================
+# STRIPE WEBHOOK SERVER
+# =========================================================
+class StripeWebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        payload = self.rfile.read(int(self.headers["Content-Length"]))
+        sig = self.headers.get("Stripe-Signature")
+
+        try:
+            event = stripe.Webhook.construct_event(
+                payload,
+                sig,
+                os.environ.get("STRIPE_WEBHOOK_SECRET"),
+            )
+        except Exception:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        data = event["data"]["object"]
+
+        if event["type"] in ("checkout.session.completed", "invoice.paid"):
+            email = data.get("customer_email")
+            price_id = data["lines"]["data"][0]["price"]["id"]
+            plan = STRIPE_PRICE_TO_PLAN.get(price_id)
+
+            if email and plan:
+                activate_user_by_email(email, plan)
+
+        if event["type"] == "customer.subscription.deleted":
+            email = data.get("customer_email")
+            if email:
+                downgrade_user_by_email(email)
+
+        self.send_response(200)
+        self.end_headers()
+
+
+def start_stripe_webhook():
+    HTTPServer(("0.0.0.0", 4242), StripeWebhookHandler).serve_forever()
+
 # =========================================================
 # EMAIL JOB
 # =========================================================
@@ -4868,6 +5081,11 @@ def main():
 
     # ================= Handlers =================
     app.add_handler(CommandHandler(["help", "start"], cmd_help))
+    application.add_handler(CommandHandler("billing", billing_cmd))
+    app.add_handler(CommandHandler("manage", manage_cmd))
+    app.add_handler(CommandHandler("myplan", myplan_cmd))
+    app.add_handler(CommandHandler("support", support_cmd))
+    app.add_handler(CommandHandler("support_status", support_status_cmd))
     app.add_handler(CommandHandler("tz", tz_cmd))
     app.add_handler(CommandHandler("screen", screen_cmd))
     app.add_handler(CommandHandler("equity", equity_cmd))
@@ -4917,6 +5135,12 @@ def main():
         logger.error("JobQueue NOT available – install python-telegram-bot[job-queue]")
 
     logger.info("Starting Telegram bot in POLLING mode (Background Worker) ...")
+
+    # ================= Stripe Webhook ================= #
+    threading.Thread(
+        target=start_stripe_webhook,
+        daemon=True
+    ).start()
 
     # Optional: if any other poller exists, don't crash-restart; just sleep.
     from telegram.error import Conflict
