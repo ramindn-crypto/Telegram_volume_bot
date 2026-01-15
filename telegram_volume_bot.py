@@ -3,6 +3,10 @@
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
 """
 
+# =========================================================
+# IMPORTS
+# =========================================================
+
 import os
 import sys
 import time
@@ -137,7 +141,6 @@ logger = logging.getLogger("pulsefutures")
 
 
 
-
 # -------------------------
 # ✅ Admin / Visibility (anti-copy)
 # -------------------------
@@ -170,8 +173,6 @@ SCREEN_UNIVERSE_N = 70          # was effectively 35 (inside pick_setups)
 SCREEN_TRIGGER_LOOSEN = 0.85    # 15% easier trigger on /screen only
 SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
 SCREEN_WAITING_N = 10
-
-
 
 # Directional Leaders/Losers thresholds
 MOVER_VOL_USD_MIN = 5_000_000
@@ -207,7 +208,6 @@ SESSION_1H_BASE_MULT = {
     "LON": 1.00,
     "ASIA": 1.15,
 }
-
 
 # =========================================================
 # ✅ ENGINE B (MOMENTUM / EXPANSION) SETTINGS (for pumps)
@@ -261,7 +261,6 @@ def max_cooldown_hours() -> int:
     except Exception:
         return int(SYMBOL_COOLDOWN_HOURS)
 
-
 # Multi-TP
 ATR_PERIOD = 14
 ATR_MIN_PCT = 1.0
@@ -292,9 +291,6 @@ EMA_SUPPORT_MAX_DIST_PCT_MAX = 1.8
 # Sharp 1H move gating
 SHARP_1H_MOVE_PCT = 20.0
 
-
-
-
 # Email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
@@ -310,9 +306,6 @@ TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFutures
 # Caching for speed
 TICKERS_TTL_SEC = 45
 OHLCV_TTL_SEC = 60
-
-
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pulsefutures")
@@ -330,8 +323,6 @@ ALERT_LOCK = asyncio.Lock()
 DB_BACKUP_PATH = os.environ.get("DB_BACKUP_PATH", DB_PATH + ".bak")
 
 DB_FILE_LOCK = asyncio.Lock()
-
-
 
 # Sessions defined in UTC windows (market convention, with overlaps)
 # ASIA: 00:00–09:00 UTC
@@ -390,9 +381,6 @@ def session_knobs(session_name: str) -> dict:
         "min_rr_tp3": float(SESSION_MIN_RR_TP3.get(s, 2.0)),
     }
 
-
-
-
 def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
     """
     Session-dynamic 1H trigger:
@@ -413,10 +401,6 @@ def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
 
     return max(float(base_floor), float(dyn))
 
-
-
-
-
 # =========================================================
 # DATA STRUCTURES
 # =========================================================
@@ -431,7 +415,6 @@ class MarketVol:
     base_vol: float
     quote_vol: float
     vwap: float
-
 
 @dataclass
 class Setup:
@@ -467,8 +450,6 @@ class Setup:
     is_trailing_tp3: bool
     created_ts: float
 
-
-
 # =========================================================
 # SIMPLE TTL CACHE (in-memory)
 # =========================================================
@@ -500,7 +481,6 @@ def clamp(x: float, lo: float, hi: float) -> float:
     except Exception:
         return lo
     return max(lo, min(hi, x))
-
 
 def ema(values: List[float], period: int) -> float:
     """
@@ -561,7 +541,6 @@ def compute_atr_from_ohlcv(ohlcv: List[List[float]], period: int = 14) -> float:
 
     return float(atr)
 
-
 def is_hot_coin(fut_vol_usd: float, ch24: float) -> bool:
     """
     Hot coin definition for TP cap logic.
@@ -571,13 +550,11 @@ def is_hot_coin(fut_vol_usd: float, ch24: float) -> bool:
     except Exception:
         return False
 
-
 def tp_cap_pct_for_coin(fut_vol_usd: float, ch24: float) -> float:
     """
     Dynamic TP3 cap % based on coin hotness.
     """
     return float(TP_MAX_PCT_HOT) if is_hot_coin(fut_vol_usd, ch24) else float(TP_MAX_PCT_NORMAL)
-
 
 # =========================================================
 # ADAPTIVE EMA SUPPORT
@@ -636,7 +613,6 @@ def best_pullback_ema_15m(closes_15: List[float], entry: float) -> Tuple[float, 
 
     return best
 
-
 # ✅ NEW: "Waiting for Trigger" (near-miss candidates)
 
 _WAITING_TRIGGER: Dict[str, Dict[str, Any]] = {}
@@ -645,12 +621,9 @@ _WAITING_TRIGGER: Dict[str, Dict[str, Any]] = {}
 def is_admin_user(user_id: int) -> bool:
     return int(user_id) in ADMIN_USER_IDS if ADMIN_USER_IDS else False
 
-
-
 # =========================================================
 # GLOBAL STATE
 # =========================================================
-
 # Stores last SMTP error per user for /health and /email_test
 _LAST_SMTP_ERROR: Dict[int, str] = {}
 
@@ -695,7 +668,6 @@ def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
 def _reject_report(diag_mode: str = "off") -> str:
     return ""
 
-
 # =========================================================
 # DB
 # =========================================================
@@ -718,7 +690,6 @@ def db_connect() -> sqlite3.Connection:
         pass
 
     return con
-
 
 def db_backup_file() -> Tuple[bool, str]:
     """
@@ -825,7 +796,6 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use /restore to revert to the backup."
     )
 
-
 async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /restore
@@ -850,9 +820,6 @@ async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     await update.message.reply_text(f"✅ Database RESTORED.\n{msg}")
-
-
-
 
 def db_init():
     # ensures folder exists before creating DB file
@@ -921,7 +888,6 @@ def db_init():
     except Exception:
         # Don't block startup if migration fails; worst case cooldown table resets.
         pass
-
 
     cur.execute("PRAGMA table_info(users)")
     cols = {r[1] for r in cur.fetchall()}
@@ -1168,7 +1134,6 @@ def mark_symbol_emailed(user_id: int, symbol: str, side: str, session_name: str 
     con.commit()
     con.close()
 
-
 def symbol_recently_emailed(
     user_id: int,
     symbol: str,
@@ -1196,7 +1161,6 @@ def symbol_recently_emailed(
     last_ts = float(row["emailed_ts"])
     return (time.time() - last_ts) < (cooldown_hours * 3600.0)
 
-
 def list_cooldowns(user_id: int) -> List[dict]:
     """
     Returns list of cooldown stamps for user:
@@ -1222,7 +1186,6 @@ def _fmt_dur(seconds: float) -> str:
     if h <= 0:
         return f"{m}m"
     return f"{h}h {m}m"
-
 
 def _email_daily_get(user_id: int, day_local: str) -> int:
     con = db_connect()
@@ -1368,7 +1331,6 @@ def db_trades_since(user_id: int, ts_from: float) -> List[dict]:
     con.close()
     return [dict(r) for r in rows]
 
-
 def db_trades_all(user_id: int) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
@@ -1381,7 +1343,6 @@ def db_trades_all(user_id: int) -> List[dict]:
     con.close()
     return [dict(r) for r in rows]
 
-
 def _profit_factor(trades: List[dict]) -> Optional[float]:
     closed = [t for t in trades if t.get("closed_ts") is not None and t.get("pnl") is not None]
     if not closed:
@@ -1392,14 +1353,12 @@ def _profit_factor(trades: List[dict]) -> Optional[float]:
         return None if gp <= 0 else float("inf")
     return gp / gl
 
-
 def _expectancy_r(trades: List[dict]) -> Optional[float]:
     closed = [t for t in trades if t.get("closed_ts") is not None and t.get("r_mult") is not None]
     if not closed:
         return None
     rs = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
     return (sum(rs) / len(rs)) if rs else None
-
 
 async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1427,12 +1386,10 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text("\n".join(msg))
 
-
 # =========================================================
 # EXCHANGE HELPERS (FAST: singleton exchange + no repeated load_markets)
 # =========================================================
 import threading
-
 _EX: Optional[ccxt.Exchange] = None
 _EX_LOCK = threading.Lock()
 _EX_MARKETS_LOADED = False
@@ -1531,7 +1488,6 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     cache_set(key, data)
     return data
 
-
 # =========================================================
 # ✅ Session resolution helpers (for /screen + engine)
 # =========================================================
@@ -1544,9 +1500,6 @@ def parse_hhmm(s: str) -> Tuple[int, int]:
     if hh < 0 or hh > 23 or mm < 0 or mm > 59:
         raise ValueError("bad time")
     return hh, mm
-
-
-
 
 def current_session_utc(now_utc: Optional[datetime] = None) -> str:
     """
@@ -1572,9 +1525,6 @@ def current_session_utc(now_utc: Optional[datetime] = None) -> str:
     # Outside the three main windows: treat as NY tail/transition
     # (or return "ASIA"/"OFF" if you prefer)
     return "NY"
-
-
-
 
 def ema_support_proximity_ok(entry: float, ema_val: float, atr_1h: float, session_name: str):
     """
@@ -1624,12 +1574,6 @@ def ema_support_reaction_ok_15m(c15: List[List[float]], ema_val: float, side: st
                 return True
     return False
 
-
-
-
-
-
-
 def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float, float, float, int, List[List[float]]]:
     """
     returns: ch1, ch4, ch15, atr_1h, ema_support_15m, ema_support_period, c15
@@ -1663,8 +1607,6 @@ def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float
     ch15 = ((c15_last - c15_prev) / c15_prev) * 100.0 if c15_prev else 0.0
 
     return ch1, ch4, ch15, atr_1h, ema_support_15m, int(ema_period), c15
-
-
 
 # =========================================================
 # FORMATTING
@@ -1719,11 +1661,9 @@ def fmt_price(x: float) -> str:
 def fmt_price_email(x: float) -> str:
     return fmt_price(x)
 
-
 # =========================================================
 # TELEGRAM SAFE SEND (chunking + markdown fallback)
 # =========================================================
-
 from telegram.error import BadRequest, TimedOut, NetworkError, RetryAfter
 
 SAFE_CHUNK = 3500
@@ -1780,8 +1720,6 @@ async def send_long_message(
 
         first = False
 
-
-
 # =========================================================
 # SIGNAL IDs
 # =========================================================
@@ -1805,7 +1743,6 @@ def next_setup_id() -> str:
     finally:
         con.close()
     return f"PF-{today}-{n:04d}"
-
 
 # =========================================================
 # SL/TP ENGINE (closer + dynamic cap + ✅ confidence-weighted TP scaling)
@@ -1843,8 +1780,6 @@ def tp_r_mults_from_conf(conf: int) -> Tuple[float, float, float]:
     if tp2 >= tp3:
         tp2 = max(1.6, tp3 - 0.3)
     return (tp1, tp2, tp3)
-
-
 
 def compute_sl_tp(
     entry: float,
@@ -1885,9 +1820,6 @@ def compute_sl_tp(
         tp3 = entry - tp_dist
 
     return sl, tp3, R
-
-
-
 
 def _distinctify(a: float, b: float, c: float, entry: float, side: str) -> Tuple[float, float, float]:
     if entry <= 0:
@@ -1935,17 +1867,12 @@ def multi_tp(
 
     return _distinctify(tp1, tp2, tp3, entry, side)
 
-
-
-
-
 def rr_to_tp(entry: float, sl: float, tp: float) -> float:
     d_sl = abs(entry - sl)
     d_tp = abs(tp - entry)
     if d_sl <= 0:
         return 0.0
     return d_tp / d_sl
-
 
 # =========================================================
 # SETUP ENGINE
@@ -2048,7 +1975,6 @@ def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tupl
     dn.sort(key=lambda x: (x[2], x[1]))
     return up, dn
 
-
 def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     up, dn = compute_directional_lists(best_fut)
     up_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4)] for b, v, c24, c4, px in up[:10]]
@@ -2056,8 +1982,6 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     up_txt = "*Directional Leaders (24H ≥ +10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(up_rows, ["SYM", "F Vol", "24H", "4H"]) if up_rows else "_None_")
     dn_txt = "*Directional Losers (24H ≤ -10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(dn_rows, ["SYM", "F Vol", "24H", "4H"]) if dn_rows else "_None_")
     return up_txt, dn_txt
-
-
 
 # =========================================================
 # ✅ MODIFIED: make_setup (trailing TP3 only when it's a trailing-needed setup)
@@ -2097,8 +2021,6 @@ def make_setup(
 
     trig_min = max(0.4, float(trig_min_raw) * float(trigger_loosen_mult))
 
-
-
     if abs(ch1) < trig_min:
         # Waiting for Trigger (near-miss) — store ONLY side + a color dot (no numbers)
         if trig_min > 0:
@@ -2120,7 +2042,6 @@ def make_setup(
 
     # ✅ IMPORTANT: this must be OUTSIDE the if block (no extra indent)
     side = "BUY" if ch1 > 0 else "SELL"
-
 
     # 4H alignment
     if side == "BUY" and ch4 < ALIGN_4H_MIN:
@@ -2248,8 +2169,6 @@ def make_setup(
         created_ts=time.time(),
     )
 
-
-
 def pick_setups(
     best_fut: Dict[str, MarketVol],
     n: int,
@@ -2286,9 +2205,6 @@ def pick_setups(
     setups.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
     return setups[:n]
 
-
-
-
 # =========================================================
 # EMAIL
 # =========================================================
@@ -2298,7 +2214,6 @@ def email_config_ok() -> bool:
     Recipient is per-user (users.email_to) OR fallback EMAIL_TO.
     """
     return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM])
-
 
 def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None) -> bool:
     """
@@ -2415,8 +2330,6 @@ def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None)
             }
         return False
 
-
-
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2441,8 +2354,6 @@ async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("email_cmd failed")
         await update.message.reply_text(f"❌ Failed to save email: {type(e).__name__}: {e}")
-
-
 
 async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -2517,9 +2428,6 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "- EMAIL_FROM not matching account\n"
         )
 
-
-
-
 def _parse_hhmm_local(s: str) -> Tuple[int, int]:
     s = (s or "").strip()
     m = re.match(r"^(\d{2}):(\d{2})$", s)
@@ -2529,7 +2437,6 @@ def _parse_hhmm_local(s: str) -> Tuple[int, int]:
     if hh < 0 or hh > 23 or mm < 0 or mm > 59:
         raise ValueError("bad time")
     return hh, mm
-
 
 def in_trade_window_now(user: dict, now_local: Optional[datetime] = None) -> bool:
     """
@@ -2561,7 +2468,6 @@ def in_trade_window_now(user: dict, now_local: Optional[datetime] = None) -> boo
         end_dt = end_dt + timedelta(days=1)
 
     return start_dt <= now_local <= end_dt
-
 
 async def trade_window_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -2616,7 +2522,6 @@ async def trade_window_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user(uid, trade_window_start=start_s, trade_window_end=end_s)
     await update.message.reply_text(f"✅ Trade window set: {start_s} → {end_s} (local time).")
 
-
 # =========================================================
 # SESSIONS (user)
 # =========================================================
@@ -2661,7 +2566,6 @@ def in_session_now(user: dict) -> Optional[dict]:
 
     return None
 
-
 # =========================================================
 # RISK
 # =========================================================
@@ -2689,7 +2593,6 @@ def daily_cap_usd(user: dict) -> float:
     if eq <= 0:
         return 0.0
     return max(0.0, eq * (val / 100.0))
-
 
 # =========================================================
 # REPORTING / ADVICE
@@ -2731,7 +2634,6 @@ def _advice(user: dict, stats: dict) -> List[str]:
         adv.append("✅ Daily trade limits help prevent overtrading. Focus only on top-quality setups.")
     return adv[:6]
 
-
 # =========================================================
 # HELP TEXT
 # =========================================================
@@ -2743,9 +2645,7 @@ PulseFutures — Commands (Telegram)
 ────────────────────
 1) Market Scan
 ────────────────────
-/screen
-
-Shows a real-time market snapshot:
+/screen : Shows a real-time market snapshot:
 • Top Trade Setups (highest quality)
 • Waiting for Trigger (near-miss candidates)
 • Trend Continuation Watch (adaptive EMA logic)
@@ -2972,7 +2872,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_help(update, context)
 
-
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -2987,7 +2886,6 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         HDR,
     ]
     await update.message.reply_text("\n".join(msg).strip())
-
 
 def db_backup_file() -> Tuple[bool, str]:
     """
@@ -3008,7 +2906,6 @@ def db_backup_file() -> Tuple[bool, str]:
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
-
 def db_restore_file() -> Tuple[bool, str]:
     """
     Copies DB_BACKUP_PATH -> DB_PATH
@@ -3025,7 +2922,6 @@ def db_restore_file() -> Tuple[bool, str]:
         return True, f"Restored from backup: {DB_BACKUP_PATH}"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
-
 
 def db_wipe_all_data_keep_schema() -> None:
     """
@@ -3063,8 +2959,6 @@ def db_wipe_all_data_keep_schema() -> None:
     _USER_DIAG_MODE.clear()
     _LAST_EMAIL_DECISION.clear()
 
-
-
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /reset
@@ -3095,7 +2989,6 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use /restore to revert to the backup."
     )
 
-
 async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /restore
@@ -3120,10 +3013,6 @@ async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     await update.message.reply_text(f"✅ Database RESTORED.\n{msg}")
-
-
-
-
 
 async def diag_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -3652,8 +3541,6 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- New Equity: ${float(user['equity']):.2f}"
     )
 
-
-
 async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     tokens = context.args
@@ -3755,9 +3642,6 @@ async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- Remaining today: ∞"
     )
 
-
-
-
 async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not context.args:
@@ -3799,8 +3683,6 @@ async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- SL moved to Entry\n"
         f"- Released Risk: ${old_risk:.2f}"
     )
-
-
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -3876,7 +3758,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text("\n".join(lines))
 
-
 async def cooldowns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -3937,7 +3818,6 @@ async def cooldowns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(out))
 
-
 def clear_cooldown(user_id: int, symbol: str, side: str) -> int:
     """
     Deletes ONE cooldown row for (user, symbol, side).
@@ -3954,7 +3834,6 @@ def clear_cooldown(user_id: int, symbol: str, side: str) -> int:
     con.close()
     return int(n)
 
-
 def clear_all_cooldowns(user_id: int) -> int:
     """
     Deletes ALL cooldown rows for this user.
@@ -3970,7 +3849,6 @@ def clear_all_cooldowns(user_id: int) -> int:
     con.commit()
     con.close()
     return int(n)
-
 
 async def cooldown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -4026,7 +3904,6 @@ async def cooldown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"ASIA: {tag(rem_asia)} {_fmt_dur(rem_asia)}"
     )
 
-
 async def cooldown_clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /cooldown_clear <SYMBOL> <long|short>  (admin only)
@@ -4055,7 +3932,6 @@ async def cooldown_clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text(f"ℹ️ No cooldown found for: {sym} {side}")
 
-
 async def cooldown_clear_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /cooldown_clear_all  (admin only)
@@ -4068,8 +3944,6 @@ async def cooldown_clear_all_cmd(update: Update, context: ContextTypes.DEFAULT_T
 
     n = clear_all_cooldowns(uid)
     await update.message.reply_text(f"✅ Cleared {n} cooldown record(s).")
-
-
 
 async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -4096,7 +3970,6 @@ async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(msg))
 
-
 def db_trades_all(user_id: int) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
@@ -4109,7 +3982,6 @@ def db_trades_all(user_id: int) -> List[dict]:
     con.close()
     return [dict(r) for r in rows]
 
-
 def _profit_factor(trades: List[dict]) -> Optional[float]:
     closed = [t for t in trades if t.get("closed_ts") is not None and t.get("pnl") is not None]
     if not closed:
@@ -4120,14 +3992,12 @@ def _profit_factor(trades: List[dict]) -> Optional[float]:
         return None if gp <= 0 else float("inf")
     return gp / gl
 
-
 def _expectancy_r(trades: List[dict]) -> Optional[float]:
     closed = [t for t in trades if t.get("closed_ts") is not None and t.get("r_mult") is not None]
     if not closed:
         return None
     rs = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
     return (sum(rs) / len(rs)) if rs else None
-
 
 async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -4154,9 +4024,6 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ]
 
     await update.message.reply_text("\n".join(msg))
-
-
-
 
 async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -4239,8 +4106,6 @@ async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         msg.append("Your linked signal trades closed: 0")
 
     await update.message.reply_text("\n".join(msg))
-
-
 
 # =========================================================
 # TREND ENGINE — ADAPTIVE EMA (NO FIXED EMA7/21/50)
@@ -4335,7 +4200,6 @@ def trend_watch_for_symbol(base, mv, session_name):
     except Exception:
         return None
 
-
 # =========================================================
 # User location/time helpers (TZ -> City/Country label)
 # =========================================================
@@ -4369,7 +4233,6 @@ def user_location_and_time(user: dict) -> Tuple[str, str]:
     loc = tz_location_label(tz_name)
     return loc, now_local.strftime("%Y-%m-%d %H:%M")
 
-
 # =========================================================
 # movers_tables (remove brackets/thresholds from titles)
 # =========================================================
@@ -4381,8 +4244,6 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     up_txt = "*Directional Leaders*\n" + (table_md(up_rows, ["SYM", "F Vol", "24H", "4H"]) if up_rows else "_None_")
     dn_txt = "*Directional Losers*\n" + (table_md(dn_rows, ["SYM", "F Vol", "24H", "4H"]) if dn_rows else "_None_")
     return up_txt, dn_txt
-
-
 
 # =========================================================
 # ✅ MODIFIED: /screen — Premium Telegram UI
@@ -4577,10 +4438,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("screen_cmd failed")
         await update.message.reply_text(f"⚠️ /screen failed: {e}")
 
-
-
-
-
 # =========================================================
 # TEXT ROUTER (Signal ID lookup)
 # =========================================================
@@ -4609,7 +4466,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/trade_open {sig['symbol']} {'long' if sig['side']=='BUY' else 'short'} entry {sig['entry']} sl {sig['sl']} risk usd 40 sig {sig['setup_id']}"
         )
         return
-
 
 # =========================================================
 # ✅ MODIFIED: EMAIL BODY
@@ -4690,8 +4546,6 @@ def _email_body_pretty(
     parts.append(HDR)
 
     return "\n".join(parts).strip()
-
-
 
 # =========================================================
 # EMAIL JOB
@@ -4900,8 +4754,6 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Reasons:\n- " + "\n- ".join(d.get("reasons", []))
     )
 
-
-
 # =========================================================
 # /health (transparent system health)
 # =========================================================
@@ -4968,8 +4820,6 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("\n".join(msg))
 
-
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     # Always log
     logger.exception("Telegram error", exc_info=context.error)
@@ -4986,8 +4836,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         # never let error handler crash
         pass
-
-
 
 # =========================================================
 # MAIN (Background Worker = POLLING)
@@ -5022,50 +4870,39 @@ def main():
     app.add_handler(CommandHandler(["help", "start"], cmd_help))
     app.add_handler(CommandHandler("tz", tz_cmd))
     app.add_handler(CommandHandler("screen", screen_cmd))
-
     app.add_handler(CommandHandler("equity", equity_cmd))
     app.add_handler(CommandHandler("equity_reset", equity_reset_cmd))
     app.add_handler(CommandHandler("riskmode", riskmode_cmd))
     app.add_handler(CommandHandler("dailycap", dailycap_cmd))
     app.add_handler(CommandHandler("limits", limits_cmd))
-
     app.add_handler(CommandHandler("trade_sl", trade_sl_cmd))
     app.add_handler(CommandHandler("trade_rf", trade_rf_cmd))
-   
     app.add_handler(CommandHandler("sessions", sessions_cmd))
     app.add_handler(CommandHandler("sessions_on", sessions_on_cmd))
     app.add_handler(CommandHandler("sessions_off", sessions_off_cmd))
-
     app.add_handler(CommandHandler("notify_on", notify_on))
     app.add_handler(CommandHandler("notify_off", notify_off))
-
     app.add_handler(CommandHandler("size", size_cmd))
     app.add_handler(CommandHandler("trade_open", trade_open_cmd))
     app.add_handler(CommandHandler("trade_close", trade_close_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
-
     app.add_handler(CommandHandler("cooldowns", cooldowns_cmd))
     app.add_handler(CommandHandler("cooldown", cooldown_cmd))
     app.add_handler(CommandHandler("cooldown_clear", cooldown_clear_cmd))
     app.add_handler(CommandHandler("cooldown_clear_all", cooldown_clear_all_cmd))
- 
     app.add_handler(CommandHandler("report_daily", report_daily_cmd))
     app.add_handler(CommandHandler("report_overall", report_overall_cmd))  
     app.add_handler(CommandHandler("report_weekly", report_weekly_cmd))
     app.add_handler(CommandHandler("signals_daily", signals_daily_cmd))
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd))
-
     app.add_handler(CommandHandler("health", health_cmd))
-
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("restore", restore_cmd))
-    
     app.add_handler(CommandHandler("health_sys", health_sys_cmd))
     app.add_handler(CommandHandler("trade_window", trade_window_cmd))
     app.add_handler(CommandHandler("email", email_cmd))   
     app.add_handler(CommandHandler("email_test", email_test_cmd))  
     app.add_handler(CommandHandler("email_decision", email_decision_cmd))
-    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     # ================= JobQueue ================= #
