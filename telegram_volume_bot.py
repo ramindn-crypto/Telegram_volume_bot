@@ -2357,33 +2357,78 @@ def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None)
 
 
 async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /email_test
-    Sends a test email NOW (admin only).
-    """
     uid = update.effective_user.id
-    if not is_admin_user(uid):
-        await update.message.reply_text("⛔️ این دستور فقط برای Admin فعال است.")
-        return
+    user = get_user(uid)
 
+    # Always respond immediately
+    await update.message.reply_text("📧 Running email test…")
+
+    # Show config status clearly
     if not EMAIL_ENABLED:
-        await update.message.reply_text("⚠️ EMAIL_ENABLED=false است. اول فعالش کن.")
+        await update.message.reply_text("❌ Email is disabled (EMAIL_ENABLED=False). Turn it on in your config/env.")
         return
 
     if not email_config_ok():
-        await update.message.reply_text("⚠️ Email ENV ناقص است. EMAIL_HOST/PORT/USER/PASS/FROM/TO را چک کن.")
+        # If you have a helper that checks env vars, mention it
+        await update.message.reply_text(
+            "❌ Email config is NOT OK.\n"
+            "Check env vars like EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM (and anything your code expects).\n"
+            "Tip: run /health_sys and verify Email: enabled/configured."
+        )
         return
 
-    now = datetime.now(ZoneInfo("Australia/Melbourne"))
-    subject = f"PulseFutures • EMAIL TEST • {now.strftime('%Y-%m-%d %H:%M')}"
-    body = "This is a test email from PulseFutures.\n\nIf you received this, SMTP is OK."
+    # Determine recipient
+    # (Your bot earlier used a per-user email field; adjust key name if yours differs)
+    to_email = (user.get("email_to") or user.get("email") or "").strip()
+    if not to_email:
+        await update.message.reply_text(
+            "❌ No recipient email found for your user.\n"
+            "Set it first (whatever your bot uses), e.g. /email your@email.com"
+        )
+        return
 
-    ok = await asyncio.to_thread(send_email, subject, body, uid)
+    # Build a short test message
+    tz_name = str(user.get("tz") or "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+        tz_name = "UTC"
+
+    now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+    subject = "PulseFutures — Email Test ✅"
+    body = (
+        f"{HDR}\n"
+        f"PulseFutures Email Test\n"
+        f"{HDR}\n\n"
+        f"User ID: {uid}\n"
+        f"Recipient: {to_email}\n"
+        f"Time: {now_local} ({tz_name})\n\n"
+        f"If you received this, SMTP is working.\n"
+        f"{HDR}\n"
+    )
+
+    # Send
+    try:
+        ok = await asyncio.to_thread(send_email, subject, body, uid)
+    except Exception as e:
+        logger.exception("email_test_cmd failed")
+        await update.message.reply_text(f"❌ Test email crashed: {type(e).__name__}: {e}")
+        return
+
     if ok:
-        await update.message.reply_text("✅ Test email sent. Inbox/Spam را چک کن.")
+        await update.message.reply_text(f"✅ Test email SENT to: {to_email}")
     else:
-        err = _LAST_SMTP_ERROR.get(uid, "unknown")
-        await update.message.reply_text(f"❌ Test email failed.\nError: {err}")
+        err = _LAST_SMTP_ERROR.get(uid, "unknown_error")
+        await update.message.reply_text(
+            "❌ Test email FAILED.\n"
+            f"Reason: {err}\n\n"
+            "Common causes:\n"
+            "- Gmail: app password / 2FA issues\n"
+            "- Wrong EMAIL_HOST/PORT (465 SSL vs 587 STARTTLS)\n"
+            "- EMAIL_FROM not matching account\n"
+        )
+
 
 
 
@@ -4811,7 +4856,21 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    # Always log
     logger.exception("Telegram error", exc_info=context.error)
+
+    # Also tell the user (otherwise it looks like "nothing happened")
+    try:
+        if update and getattr(update, "effective_message", None):
+            msg = "⚠️ Something crashed while handling your request."
+            # If admin, show the exception text as well
+            uid = getattr(getattr(update, "effective_user", None), "id", None)
+            if uid is not None and is_admin_user(int(uid)):
+                msg += f"\n\nError: {type(context.error).__name__}: {context.error}"
+            await update.effective_message.reply_text(msg)
+    except Exception:
+        # never let error handler crash
+        pass
 
 
 
@@ -4887,7 +4946,7 @@ def main():
     
     app.add_handler(CommandHandler("health_sys", health_sys_cmd))
 
-    app.add_handler(CommandHandler("email_test", email_test_cmd))
+    app.add_handler(CommandHandler(["email_test", "Email_test", "EMAIL_TEST"], email_test_cmd))
     app.add_handler(CommandHandler("trade_window", trade_window_cmd))
     app.add_handler(CommandHandler("email_decision", email_decision_cmd))
     
