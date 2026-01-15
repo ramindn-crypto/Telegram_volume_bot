@@ -2293,94 +2293,128 @@ def pick_setups(
 # EMAIL
 # =========================================================
 def email_config_ok() -> bool:
-    return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO])
+    """
+    Only checks SMTP sender config.
+    Recipient is per-user (users.email_to) OR fallback EMAIL_TO.
+    """
+    return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM])
 
 
 def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None) -> bool:
     """
-    Sends email and stores last SMTP error per user (for /health).
+    Sends an email.
+
+    Recipient resolution:
+    - If user_id_for_debug is provided: uses users.email_to
+    - Otherwise falls back to EMAIL_TO (if set)
+
+    Also enforces per-user trade window (if enabled).
+    Tracks last SMTP error + last email decision for /health and /email_decision.
     """
-    user = get_user(uid)
+    uid = int(user_id_for_debug) if user_id_for_debug is not None else None
+
+    # --- SMTP config check (sender side) ---
     if not email_config_ok():
-        logger.warning("Email not configured.")
-        if user_id_for_debug is not None:
-            _LAST_SMTP_ERROR[int(user_id_for_debug)] = "Email not configured (missing env vars)."
+        logger.warning("Email not configured (missing SMTP env vars).")
+        if uid is not None:
+            _LAST_SMTP_ERROR[uid] = "Email not configured (missing SMTP env vars)."
+            _LAST_EMAIL_DECISION[uid] = {"status": "SKIP", "reason": "smtp_not_configured", "ts": time.time()}
         return False
 
-    # --- Trade window enforcement ---
-    if not in_trade_window_now(user, now_local):
-        _LAST_EMAIL_DECISION[user_id] = {
-            "status": "SKIP",
-            "reason": "outside_trade_window",
-            "ts": time.time(),
-        }
-        return False
-    
+    # --- Resolve recipient ---
+    to_email = ""
+    user = None
+    now_local = None
+
+    if uid is not None:
+        user = get_user(uid)
+        to_email = str(user.get("email_to") or "").strip()
+
+        # If trade window feature exists, enforce it here
+        try:
+            tz = ZoneInfo(str(user.get("tz") or "UTC"))
+        except Exception:
+            tz = timezone.utc
+        now_local = datetime.now(tz)
+
+        # If user has NOT set email, we skip (selling bot: you’ll set it via onboarding)
+        if not to_email:
+            _LAST_EMAIL_DECISION[uid] = {
+                "status": "SKIP",
+                "reason": "no_recipient_email",
+                "ts": time.time(),
+            }
+            return False
+
+        # Trade window enforcement
+        try:
+            if not in_trade_window_now(user, now_local):
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reason": "outside_trade_window",
+                    "ts": time.time(),
+                }
+                return False
+        except Exception:
+            # If trade window parsing ever fails, fail OPEN (send) or fail CLOSED (skip).
+            # I recommend fail CLOSED to avoid spam:
+            _LAST_EMAIL_DECISION[uid] = {
+                "status": "SKIP",
+                "reason": "trade_window_check_failed",
+                "ts": time.time(),
+            }
+            return False
+
+    else:
+        # Legacy fallback (single recipient deployment)
+        to_email = str(EMAIL_TO or "").strip()
+        if not to_email:
+            logger.warning("No recipient email (EMAIL_TO empty and no user_id provided).")
+            return False
+
+    # --- Build message ---
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    # --- Send ---
     try:
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = EMAIL_FROM
-        msg["To"] = EMAIL_TO
-        msg.set_content(body)
-
-        if EMAIL_PORT == 465:
+        if int(EMAIL_PORT) == 465:
             ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT, context=ctx, timeout=30) as s:
+            with smtplib.SMTP_SSL(EMAIL_HOST, int(EMAIL_PORT), context=ctx, timeout=30) as s:
                 s.login(EMAIL_USER, EMAIL_PASS)
                 s.send_message(msg)
         else:
-            with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT, timeout=30) as s:
+            with smtplib.SMTP(EMAIL_HOST, int(EMAIL_PORT), timeout=30) as s:
                 s.ehlo()
-                s.starttls()
+                s.starttls(context=ssl.create_default_context())
                 s.ehlo()
                 s.login(EMAIL_USER, EMAIL_PASS)
                 s.send_message(msg)
 
-        if user_id_for_debug is not None:
-            _LAST_SMTP_ERROR.pop(int(user_id_for_debug), None)
-        return True
-
-    except Exception as e:
-        logger.exception("send_email failed: %s", e)
-        if user_id_for_debug is not None:
-            _LAST_SMTP_ERROR[int(user_id_for_debug)] = f"{type(e).__name__}: {str(e)}"
-        return False
-
-    msg = EmailMessage()
-    msg["From"] = EMAIL_FROM
-    msg["To"] = email_to
-    msg["Subject"] = subject
-
-    if body_html:
-        msg.set_content(body_text)
-        msg.add_alternative(body_html, subtype="html")
-    else:
-        msg.set_content(body_text)
-
-    try:
-        with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT, timeout=30) as server:
-            server.ehlo()
-            server.starttls(context=ssl.create_default_context())
-            server.login(EMAIL_USER, EMAIL_PASS)
-            server.send_message(msg)
-
-        _LAST_EMAIL_DECISION[user_id] = {
-            "status": "SENT",
-            "reason": "ok",
-            "ts": time.time(),
-        }
+        if uid is not None:
+            _LAST_SMTP_ERROR.pop(uid, None)
+            _LAST_EMAIL_DECISION[uid] = {
+                "status": "SENT",
+                "reason": "ok",
+                "ts": time.time(),
+            }
         return True
 
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
-        _LAST_SMTP_ERROR[user_id] = err
-        _LAST_EMAIL_DECISION[user_id] = {
-            "status": "FAIL",
-            "reason": err,
-            "ts": time.time(),
-        }
-        logger.error(f"Email send failed for user {user_id}: {err}")
+        logger.exception("send_email failed: %s", err)
+        if uid is not None:
+            _LAST_SMTP_ERROR[uid] = err
+            _LAST_EMAIL_DECISION[uid] = {
+                "status": "FAIL",
+                "reason": err,
+                "ts": time.time(),
+            }
         return False
+
 
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
