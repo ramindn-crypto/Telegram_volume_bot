@@ -5081,7 +5081,7 @@ def main():
 
     # ================= Handlers =================
     app.add_handler(CommandHandler(["help", "start"], cmd_help))
-    application.add_handler(CommandHandler("billing", billing_cmd))
+    app.add_handler(CommandHandler("billing", billing_cmd))
     app.add_handler(CommandHandler("manage", manage_cmd))
     app.add_handler(CommandHandler("myplan", myplan_cmd))
     app.add_handler(CommandHandler("support", support_cmd))
