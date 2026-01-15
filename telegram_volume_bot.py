@@ -2269,38 +2269,44 @@ def email_config_ok() -> bool:
     return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM, EMAIL_TO])
 
 
-def send_email(user: dict, subject: str, body_text: str, body_html: Optional[str] = None) -> bool:
+def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None) -> bool:
     """
-    Sends an email to the user, respecting:
-    - trade window
-    - SMTP safety
-    - runtime diagnostics
-
-    Returns True if sent, False otherwise.
+    Sends email and stores last SMTP error per user (for /health).
     """
-
-    user_id = int(user["user_id"])
-    email_to = (user.get("email") or "").strip()
-
-    if not email_to:
-        _LAST_EMAIL_DECISION[user_id] = {
-            "status": "SKIP",
-            "reason": "no_email",
-            "ts": time.time(),
-        }
+    if not email_config_ok():
+        logger.warning("Email not configured.")
+        if user_id_for_debug is not None:
+            _LAST_SMTP_ERROR[int(user_id_for_debug)] = "Email not configured (missing env vars)."
         return False
 
-    # --- Local time for trade window ---
-    tz = ZoneInfo(user["tz"])
-    now_local = datetime.now(tz)
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+        msg.set_content(body)
 
-    # --- Trade window enforcement ---
-    if not in_trade_window_now(user, now_local):
-        _LAST_EMAIL_DECISION[user_id] = {
-            "status": "SKIP",
-            "reason": "outside_trade_window",
-            "ts": time.time(),
-        }
+        if EMAIL_PORT == 465:
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT, context=ctx, timeout=30) as s:
+                s.login(EMAIL_USER, EMAIL_PASS)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT, timeout=30) as s:
+                s.ehlo()
+                s.starttls()
+                s.ehlo()
+                s.login(EMAIL_USER, EMAIL_PASS)
+                s.send_message(msg)
+
+        if user_id_for_debug is not None:
+            _LAST_SMTP_ERROR.pop(int(user_id_for_debug), None)
+        return True
+
+    except Exception as e:
+        logger.exception("send_email failed: %s", e)
+        if user_id_for_debug is not None:
+            _LAST_SMTP_ERROR[int(user_id_for_debug)] = f"{type(e).__name__}: {str(e)}"
         return False
 
     msg = EmailMessage()
