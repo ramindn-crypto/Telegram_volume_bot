@@ -4972,9 +4972,8 @@ def main():
     app.add_handler(CommandHandler("restore", restore_cmd))
     
     app.add_handler(CommandHandler("health_sys", health_sys_cmd))
-
-    app.add_handler(CommandHandler(["email_test", "Email_test", "EMAIL_TEST"], email_test_cmd))
     app.add_handler(CommandHandler("trade_window", trade_window_cmd))
+    app.add_handler(CommandHandler("email_test", email_test_cmd))  
     app.add_handler(CommandHandler("email_decision", email_decision_cmd))
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
