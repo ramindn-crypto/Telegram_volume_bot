@@ -2279,6 +2279,15 @@ def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None)
             _LAST_SMTP_ERROR[int(user_id_for_debug)] = "Email not configured (missing env vars)."
         return False
 
+    # --- Trade window enforcement ---
+    if not in_trade_window_now(user, now_local):
+        _LAST_EMAIL_DECISION[user_id] = {
+            "status": "SKIP",
+            "reason": "outside_trade_window",
+            "ts": time.time(),
+        }
+        return False
+    
     try:
         msg = EmailMessage()
         msg["Subject"] = subject
