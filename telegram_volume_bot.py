@@ -37,9 +37,7 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 
-import html
-import textwrap
-from telegram.constants import ParseMode
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -2741,84 +2739,358 @@ def _advice(user: dict, stats: dict) -> List[str]:
 # HELP TEXT (USER)
 # =========================================================
 
-HELP_SECTIONS_USER = [
-    {"name": "Market Scan", "rows": [
-        {"cmd": "/screen", "what": "Scans Bybit futures and shows best trade setups using volume + trend + EMA + session logic.", "ex": ""},
-    ]},
-    {"name": "Position Sizing (no trade opened)", "rows": [
-        {"cmd": "/size", "what": "Calculates position size from risk + stop loss. Does NOT open a trade.", "ex": "/size BTC long sl 42000"},
-        {"cmd": "/size", "what": "Sizing with percent risk.", "ex": "/size ETH short risk pct 2 sl 2500"},
-        {"cmd": "/size", "what": "Sizing using custom entry.", "ex": "/size BTC long sl 42000 entry 43000"},
-    ]},
-    {"name": "Trade Journal & Equity", "rows": [
-        {"cmd": "/equity", "what": "Sets or shows starting equity.", "ex": "/equity 1000"},
-        {"cmd": "/equity_reset", "what": "Resets equity tracking.", "ex": ""},
-        {"cmd": "/trade_open", "what": "Logs a new trade in the journal (manual or signal-based note).", "ex": "/trade_open BTC long entry 43000 sl 42000 risk pct 2"},
-        {"cmd": "/trade_sl", "what": "Updates stop loss for an open journal trade.", "ex": "/trade_sl 12 42500"},
-        {"cmd": "/trade_rf", "what": "Marks a trade as risk-free (tracking only).", "ex": "/trade_rf 12"},
-        {"cmd": "/trade_close", "what": "Closes a trade record and logs realised PnL.", "ex": "/trade_close 12 pnl 180"},
-        {"cmd": "/status", "what": "Shows dashboard: equity, risk usage, sessions, email status, open trades.", "ex": ""},
-    ]},
-    {"name": "Risk & Limits", "rows": [
-        {"cmd": "/riskmode", "what": "Sets risk per trade (usd or pct).", "ex": "/riskmode pct 2"},
-        {"cmd": "/dailycap", "what": "Sets daily max loss cap (stops signals when hit).", "ex": "/dailycap usd 50"},
-        {"cmd": "/limits", "what": "Sets discipline limits (max trades, email caps, gaps).", "ex": "/limits maxtrades 5"},
-    ]},
-    {"name": "Sessions & Alerts", "rows": [
-        {"cmd": "/sessions", "what": "Shows enabled sessions.", "ex": ""},
-        {"cmd": "/sessions_on", "what": "Enables a session.", "ex": "/sessions_on NY"},
-        {"cmd": "/sessions_off", "what": "Disables a session.", "ex": "/sessions_off LON"},
-        {"cmd": "/notify_on", "what": "Turns email alerts ON.", "ex": ""},
-        {"cmd": "/notify_off", "what": "Turns email alerts OFF.", "ex": ""},
-        {"cmd": "/trade_window", "what": "Limits alerts to a daily time window (your timezone).", "ex": "/trade_window 09:00 17:30"},
-    ]},
-    {"name": "Cooldowns & Reports", "rows": [
-        {"cmd": "/cooldowns", "what": "Shows active cooldowns.", "ex": ""},
-        {"cmd": "/cooldown", "what": "Shows cooldown for a symbol & side.", "ex": "/cooldown BTC long"},
-        {"cmd": "/report_daily", "what": "Daily performance report.", "ex": ""},
-        {"cmd": "/report_weekly", "what": "Weekly performance report.", "ex": ""},
-        {"cmd": "/report_overall", "what": "All-time performance report.", "ex": ""},
-        {"cmd": "/signals_daily", "what": "Daily signal stats.", "ex": ""},
-        {"cmd": "/signals_weekly", "what": "Weekly signal stats.", "ex": ""},
-    ]},
-    {"name": "Billing & Support", "rows": [
-        {"cmd": "/myplan", "what": "Shows your plan and access status.", "ex": ""},
-        {"cmd": "/billing", "what": "Opens Stripe subscription checkout.", "ex": ""},
-        {"cmd": "/manage", "what": "Opens Stripe portal to manage/cancel subscription.", "ex": ""},
-        {"cmd": "/support", "what": "Creates a support ticket.", "ex": "/support Email alerts stopped"},
-        {"cmd": "/support_status", "what": "Checks support ticket status.", "ex": "/support_status PF-1023"},
-        {"cmd": "/help_admin", "what": "Admin operations help (admins only).", "ex": ""},
-    ]},
-]
+HELP_TEXT = """\
+PulseFutures — Commands (Telegram)
+
+/help
+
+PulseFutures — Commands (Telegram)
+Bybit USDT Futures • Risk-first • Session-aware
+Not financial advice.
+
+────────────────────
+1) Market Scan
+────────────────────
+
+/screen
+
+Shows a real-time market snapshot:
+• Top Trade Setups (highest quality)
+• Waiting for Trigger (near-miss candidates)
+• Trend Continuation Watch (adaptive EMA logic)
+• Directional Leaders
+• Directional Losers
+• Market Leaders (Top by Futures Volume)
+
+Notes:
+• Header shows: Active Session + Your City/Location + Local Time
+• Each setup includes:
+  - ID (ID-PF-YYYYMMDD-XXXX)
+  - Side (BUY / SELL)
+  - Confidence score
+  - Engine type (Mean-Reversion or Momentum)
+  - Entry / SL / TP(s)
+  - RR(TP3)
+  - Multi-timeframe momentum
+  - Futures volume
+  - TradingView chart link
+• “Pullback” wording is intentionally removed
+• /screen is NOT affected by cooldowns (always live)
+
+────────────────────
+2) Position Sizing (NO trade opened)
+────────────────────
+/size <SYMBOL> <long|short> sl <STOP>
+     [risk <usd|pct> <VALUE>]
+     [entry <ENTRY>]
+
+Purpose:
+• Calculates correct position size from Risk + SL
+• Does NOT open a trade
+
+Examples:
+• /size BTC long sl 42000
+  → Uses default /riskmode
+
+• /size BTC long risk usd 40 sl 42000
+  → Uses current Bybit futures price as Entry
+
+• /size ETH short risk pct 2.5 sl 2480
+  → Uses your Equity
+
+• /size BTC long sl 42000 entry 43000
+  → Manual entry price
+
+Notes:
+• If risk is omitted → /riskmode is used
+• pct risk uses Equity
+• Qty = Risk / |Entry − SL|
+
+────────────────────
+3) Trade Journal & Equity Tracking
+────────────────────
+Set equity:
+• /equity 1000
+Reset equity:
+• /equity_reset
+
+Open trade:
+• /trade_open <SYMBOL> <long|short>
+              entry <ENTRY> sl <SL>
+              risk <usd|pct> <VALUE>
+              [note "..."] [sig <SETUP_ID>]
+
+Manage open trade:
+• /trade_sl <TRADE_ID> <NEW_SL>
+  → Updates SL and recalculates trade risk
+  → Warns if risk increases
+  → Adjusts today’s used risk
+
+• /trade_rf <TRADE_ID>
+  → Moves SL to Entry (Risk-Free)
+  → Sets trade risk to 0
+  → Releases today’s used risk immediately
+
+Close trade:
+• /trade_close <TRADE_ID> pnl <PNL>
+
+Equity behavior:
+• Equity updates ONLY when trades are closed
+• If trade closes in profit → its risk is released
+• Trade journal is persistent (stored in DB)
+
+────────────────────
+4) Status Dashboard
+────────────────────
+/status
+
+Shows:
+• Equity
+• Trades today (count)
+• Daily risk cap + used / remaining risk
+• Active sessions + current session
+• Email alert status + email limits
+• Open trades list
+• Active symbol cooldowns (current session)
+
+────────────────────
+5) Risk Settings
+────────────────────
+Risk per trade:
+• /riskmode pct 2.5
+• /riskmode usd 25
+
+Daily risk cap:
+• /dailycap pct 5
+• /dailycap usd 60
+
+────────────────────
+6) Limits (Discipline Controls)
+────────────────────
+/limits maxtrades 5
+/limits emailcap 4        (0 = unlimited per session)
+/limits emailgap 60       (minutes between emails)
+/limits emaildaycap 4     (0 = unlimited per day)
+
+Limits protect against:
+• Overtrading
+• Email spam
+• Emotional decision-making
+
+────────────────────
+7) Sessions (Email Delivery Windows)
+────────────────────
+View sessions:
+• /sessions
+
+Enable / disable:
+• /sessions_on NY
+• /sessions_off LON
+
+Defaults by timezone:
+• Americas → NY
+• Europe/Africa → LON
+• Asia/Oceania → ASIA
+
+Session priority:
+NY > LON > ASIA
+
+Emails are sent ONLY during enabled sessions.
+
+────────────────────
+8) Email Alerts
+────────────────────
+
+Enable / disable:
+• /notify_on
+• /notify_off
+
+Limit alerts to a daily time window (your timezone):
+• /trade_window <START_HH:MM> <END_HH:MM>
+  Example: /trade_window 09:00 17:30
+
+Email rules:
+• Sent only during enabled sessions
+• Session-based quality filters (confidence + RR floors)
+• No same symbol+direction spam
+• Cooldowns enforced (see below)
+• Per-session & per-day caps supported
+
+Email troubleshooting:
+• /email_test
+  → Sends a test email using your configured email setup
+
+• /email_decision
+  → Shows the last email decision (SENT/SKIP + reasons)
+
+────────────────────
+9) Symbol Cooldowns (Anti-Spam Logic)
+────────────────────
+Cooldowns are:
+• Per-user
+• Per-symbol
+• Per-direction (BUY vs SELL)
+• Session-aware (duration depends on NY/LON/ASIA policy)
+
+Cooldown duration by session:
+• NY    → 2 hours
+• LON   → 3 hours
+• ASIA  → 4 hours
+
+View cooldowns:
+• /cooldowns
+  → Shows remaining cooldown time for NY / LON / ASIA for each symbol + direction
+
+Query a single symbol:
+• /cooldown <SYMBOL> <long|short>
+  → Shows remaining cooldown time for NY / LON / ASIA for that exact symbol+direction
+
+Admin-only reset:
+• /cooldown_clear <SYMBOL> <long|short>
+• /cooldown_clear_all
+
+────────────────────
+10) Reports
+────────────────────
+Performance:
+• /report_daily
+• /report_weekly
+• /report_overall
+
+Signal summaries:
+• /signals_daily
+• /signals_weekly
+
+Reports include:
+• Trades taken
+• Win rate
+• Net PnL
+• R-multiples
+• Best / worst trades
+• System-generated advice
+
+────────────────────
+11) System Health
+────────────────────
+• /health
+  → Quick status
+
+• /health_sys
+  → DB status
+  → Bybit/CCXT connectivity
+  → Cache stats
+  → Session state
+  → Email configuration
+
+────────────────────
+12) Timezone
+────────────────────
+View / set timezone:
+• /tz
+• /tz Australia/Melbourne
+• /tz America/New_York
+
+────────────────────
+13) Support
+────────────────────
+• /support
+  → Contact/support info and troubleshooting steps
+
+────────────────────
+Admin Help
+────────────────────
+• /help_admin
+  → Admin-only commands (owner/operators)
+
+────────────────────
+Final Notes
+────────────────────
+• PulseFutures does NOT auto-trade
+• PulseFutures does NOT promise profits
+• PulseFutures enforces discipline, risk control, and session awareness
+
+Trade less. Trade better. Risk first.
+PulseFutures
+"""
 
 # =========================================================
 # HELP TEXT (ADMIN)
 # =========================================================
 
-HELP_SECTIONS_ADMIN = [
-    {"name": "Support Ops", "rows": [
-        {"cmd": "/reply", "what": "Reply to a support ticket (auto-closes ticket).", "ex": "/reply PF-1023 Fixed ✅"},
-        {"cmd": "/support_status", "what": "Check any ticket status.", "ex": "/support_status PF-1023"},
-    ]},
-    {"name": "Email Debug", "rows": [
-        {"cmd": "/email_test", "what": "Send a test email to current saved recipient.", "ex": ""},
-        {"cmd": "/email_decision", "what": "Explain last email decision (sent/blocked + reason).", "ex": ""},
-        {"cmd": "/trade_window", "what": "Set alert delivery time window.", "ex": "/trade_window 08:00 18:00"},
-    ]},
-    {"name": "Cooldown Overrides", "rows": [
-        {"cmd": "/cooldown_clear", "what": "Clear cooldown for one symbol/side.", "ex": "/cooldown_clear BTC long"},
-        {"cmd": "/cooldown_clear_all", "what": "Clear ALL cooldowns.", "ex": ""},
-    ]},
-    {"name": "Maintenance", "rows": [
-        {"cmd": "/reset", "what": "Reset DB (dangerous).", "ex": ""},
-        {"cmd": "/restore", "what": "Restore DB from backup.", "ex": ""},
-    ]},
-    {"name": "System Health", "rows": [
-        {"cmd": "/health", "what": "Bot health summary.", "ex": ""},
-        {"cmd": "/health_sys", "what": "System diagnostics.", "ex": ""},
-    ]},
-]
+HELP_TEXT_ADMIN = """\
+PulseFutures — Admin Commands (Telegram)
 
+/help_admin
+
+PulseFutures — Admin Commands (Telegram)
+Admin-only • Use carefully
+Not financial advice.
+
+────────────────────
+1) Admin Access
+────────────────────
+• /help_admin
+  → Shows this admin help
+
+────────────────────
+2) Diagnostics
+────────────────────
+/diag_on [friendly|off]
+• Non-admin: friendly/off only
+• Admin: always FULL
+
+/diag_off
+• Non-admin: turns diagnostics OFF
+
+────────────────────
+3) Email Operations
+────────────────────
+/email_test
+• Sends a test email (verifies SMTP + config)
+
+/email_decision
+• Shows last email decision for this user:
+  SENT/SKIP + reasons
+
+────────────────────
+4) Cooldown Controls (Admin)
+────────────────────
+/cooldown_clear <SYMBOL> <long|short>
+• Clears cooldown for that symbol+side (admin)
+
+/cooldown_clear_all
+• Clears ALL cooldowns (admin)
+
+────────────────────
+5) Data / Recovery
+────────────────────
+/reset
+• Resets user data / clean DB (DANGEROUS)
+
+/restore
+• Restores previously removed data (if backup exists)
+
+────────────────────
+6) Support & Billing (Admin tools)
+────────────────────
+/support
+• Support message template / contact instructions
+
+(If enabled in your code)
+/myplan
+/billing
+/manage
+/cancel
+
+────────────────────
+Final Notes
+────────────────────
+• Keep admin commands private (do not show to users)
+• Always verify before /reset
+• Prefer /health_sys when diagnosing production issues
+
+PulseFutures
+"""
 
 
 # =========================================================
