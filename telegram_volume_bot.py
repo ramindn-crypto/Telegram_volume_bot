@@ -61,7 +61,7 @@ VALID_LICENSE_PREFIX = {
 }
 
 # Reuse your existing admin system
-ADMIN_IDS = ADMIN_USER_IDS
+ADMIN_IDS = {74935310}  # <-- PUT YOUR TELEGRAM USER ID HERE
 
 ALLOWED_WHEN_LOCKED = {
     "start",
