@@ -2735,227 +2735,182 @@ def _advice(user: dict, stats: dict) -> List[str]:
     return adv[:6]
 
 # =========================================================
-# HELP TEXT
+# HELP TEXT (USER)
 # =========================================================
+
 HELP_TEXT = """\
+📘 PulseFutures — User Commands
+Use /help_admin for admin operations.
 
-PulseFutures — Commands (Telegram)
-/help
+────────────────────────────────────────
+CATEGORY: Market Scan
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /screen | Scans Bybit futures market and shows best trade setups using volume, trend, EMA, and session logic | /screen |
 
-────────────────────
-1) Market Scan
-────────────────────
-/screen : Shows a real-time market snapshot:
-• Top Trade Setups (highest quality)
-• Waiting for Trigger (near-miss candidates)
-• Trend Continuation Watch (adaptive EMA logic)
-• Directional Leaders
-• Directional Losers
-• Market Leaders (Top by Futures Volume)
+────────────────────────────────────────
+CATEGORY: Position Sizing (NO trade opened)
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /size | Calculates correct position size based on risk and stop loss | /size BTC long sl 42000 |
+| /size | Same as above with % risk | /size ETH short risk pct 2 sl 2500 |
+| /size | Uses custom entry price | /size BTC long sl 42000 entry 43000 |
 
-────────────────────
-2) Position Sizing (NO trade opened)
-────────────────────
-/size <SYMBOL> <long|short> sl <STOP>
-     [risk <usd|pct> <VALUE>]
-     [entry <ENTRY>]
+────────────────────────────────────────
+CATEGORY: Trade Journal
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /trade_open | Opens a journal trade (manual or signal-based) | /trade_open BTC long entry 43000 sl 42000 risk pct 2 |
+| /trade_sl | Updates stop loss of an open trade | /trade_sl 12 42500 |
+| /trade_rf | Marks trade as risk-free | /trade_rf 12 |
+| /trade_close | Closes trade and records PnL | /trade_close 12 pnl 180 |
 
-Purpose:
-• Calculates correct position size from Risk + SL
-• Does NOT open a trade
+────────────────────────────────────────
+CATEGORY: Equity & Performance
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /equity | Sets or shows starting equity | /equity 1000 |
+| /equity_reset | Resets equity tracking | /equity_reset |
+| /status | Shows account dashboard, risk usage, sessions, and open trades | /status |
 
-Examples:
-• /size BTC long sl 42000
-  → Uses default /riskmode
+────────────────────────────────────────
+CATEGORY: Risk Management
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /riskmode | Sets risk per trade | /riskmode pct 2 |
+| /dailycap | Sets daily max loss | /dailycap usd 50 |
+| /limits | Sets discipline limits (trades, emails, gaps) | /limits maxtrades 5 |
 
-• /size BTC long risk usd 40 sl 42000
-  → Uses current Bybit futures price as Entry
+────────────────────────────────────────
+CATEGORY: Sessions & Alerts
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /sessions | Shows active trading sessions | /sessions |
+| /sessions_on | Enables session | /sessions_on NY |
+| /sessions_off | Disables session | /sessions_off LON |
+| /notify_on | Enables email alerts | /notify_on |
+| /notify_off | Disables email alerts | /notify_off |
+| /trade_window | Limits alert delivery time | /trade_window 09:00 17:30 |
 
-• /size ETH short risk pct 2.5 sl 2480
-  → Uses your Equity
+────────────────────────────────────────
+CATEGORY: Cooldowns
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /cooldowns | Shows active symbol cooldowns | /cooldowns |
+| /cooldown | Shows cooldown for a symbol | /cooldown BTC long |
 
-• /size BTC long sl 42000 entry 43000
-  → Manual entry price
+────────────────────────────────────────
+CATEGORY: Reports
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /report_daily | Daily performance report | /report_daily |
+| /report_weekly | Weekly performance report | /report_weekly |
+| /report_overall | All-time performance stats | /report_overall |
+| /signals_daily | Daily signal summary | /signals_daily |
+| /signals_weekly | Weekly signal summary | /signals_weekly |
 
-Notes:
-• If risk is omitted → /riskmode is used
-• pct risk uses Equity
-• Qty = Risk / |Entry − SL|
+────────────────────────────────────────
+CATEGORY: Billing & Access
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /myplan | Shows your plan and access status | /myplan |
+| /billing | Opens Stripe checkout for subscription | /billing |
+| /manage | Opens Stripe billing portal | /manage |
 
-────────────────────
-3) Trade Journal & Equity Tracking
-────────────────────
-Set equity:
-• /equity 1000
-Reset equity:
-• /equity_reset
+────────────────────────────────────────
+CATEGORY: Support
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /support | Sends a support request | /support Email alerts stopped |
+| /support_status | Checks support ticket status | /support_status PF-1023 |
 
-Open trade:
-• /trade_open <SYMBOL> <long|short>
-              entry <ENTRY> sl <SL>
-              risk <usd|pct> <VALUE>
-              [note "..."] [sig <SETUP_ID>]
-
-Manage open trade:
-• /trade_sl <TRADE_ID> <NEW_SL>
-  → Updates SL and recalculates trade risk
-  → Warns if risk increases
-  → Adjusts today’s used risk
-
-• /trade_rf <TRADE_ID>
-  → Moves SL to Entry (Risk-Free)
-  → Sets trade risk to 0
-  → Releases today’s used risk immediately
-
-Close trade:
-• /trade_close <TRADE_ID> pnl <PNL>
-
-Equity behavior:
-• Equity updates ONLY when trades are closed
-• If trade closes in profit → its risk is released
-• Trade journal is persistent (stored in DB)
-
-────────────────────
-4) Status Dashboard
-────────────────────
-/status
-
-Shows:
-• Equity
-• Trades today (count)
-• Daily risk cap + used / remaining risk
-• Active sessions + current session
-• Email alert status + email limits
-• Open trades list
-• Active symbol cooldowns (current session)
-
-────────────────────
-5) Risk Settings
-────────────────────
-Risk per trade:
-• /riskmode pct 2.5
-• /riskmode usd 25
-
-Daily risk cap:
-• /dailycap pct 5
-• /dailycap usd 60
-
-────────────────────
-6) Limits (Discipline Controls)
-────────────────────
-/limits maxtrades 5
-/limits emailcap 4        (0 = unlimited per session)
-/limits emailgap 60       (minutes between emails)
-/limits emaildaycap 4     (0 = unlimited per day)
-
-Limits protect against:
-• Overtrading
-• Email spam
-• Emotional decision-making
-
-────────────────────
-7) Sessions (Email Delivery Windows)
-────────────────────
-View sessions:
-• /sessions
-
-Enable / disable:
-• /sessions_on NY
-• /sessions_off LON
-
-Defaults by timezone:
-• Americas → NY
-• Europe/Africa → LON
-• Asia/Oceania → ASIA
-
-Session priority:
-NY > LON > ASIA
-
-Emails are sent ONLY during enabled sessions.
-
-────────────────────
-8) Email Alerts (On/Off + Time Window)
-────────────────────
-Enable / disable:
-• /notify_on
-• /notify_off
-
-Set allowed daily email window (local time):
-• /trade_window <START_HH:MM> <END_HH:MM>
-  Example:
-  • /trade_window 09:00 17:30
-  Notes:
-  • Signals/emails will only be sent inside this window
-  • Uses your /tz local time
-
-Test + diagnostics:
-• /email_test
-  → Sends a test email (confirms SMTP works)
-
-• /email_decision
-  → Shows the last email send/skip decision + reasons
-
-────────────────────
-9) Symbol Cooldowns (Anti-Spam Logic)
-────────────────────
-View cooldowns:
-• /cooldowns
-  → Shows remaining cooldown time for NY / LON / ASIA for each symbol + direction
-
-Query a single symbol:
-• /cooldown <SYMBOL> <long|short>
-  → Shows remaining cooldown time for NY / LON / ASIA for that exact symbol+direction
-
-Admin-only reset:
-• /cooldown_clear <SYMBOL> <long|short>
-• /cooldown_clear_all
-
-────────────────────
-10) Reports
-────────────────────
-Performance:
-• /report_daily
-• /report_weekly
-• /report_overall
-  → All-time performance (win rate, net PnL, avg R, expectancy, profit factor)
-
-Signal summaries:
-• /signals_daily
-• /signals_weekly
-
-────────────────────
-11) System Health
-────────────────────
-• /health
-  → Quick bot health check
-
-• /health_sys
-  → DB status
-  → Bybit/CCXT connectivity
-  → Cache stats
-  → Session state
-  → Email configuration
-
-────────────────────
-12) Data Maintenance (Admin)
-────────────────────
-• /reset
-  → Resets data / clean database (admin only)
-
-• /restore
-  → Restores previously removed data (admin only)
-
-────────────────────
-Final Notes
-────────────────────
+────────────────────────────────────────
+NOTES
+────────────────────────────────────────
+• 7-day free trial for new users
+• After trial, access is locked until subscription is active
 • PulseFutures does NOT auto-trade
-• PulseFutures does NOT promise profits
-• PulseFutures enforces discipline, risk control, and session awareness
+• Risk management is always your responsibility
 
-Trade less. Trade better. Risk first.
-PulseFutures
-
+PulseFutures — Trade less. Trade better.
 """
+
+# =========================================================
+# HELP TEXT (ADMIN)
+# =========================================================
+HELP_ADMIN_TEXT = """\
+
+🛠 PulseFutures — Admin Commands
+
+────────────────────────────────────────
+CATEGORY: Billing & Access Control
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /billing | Generates Stripe checkout links | /billing |
+| /manage | Opens Stripe customer billing portal | /manage |
+
+────────────────────────────────────────
+CATEGORY: Email & Alerts
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /email_test | Sends a test email | /email_test |
+| /email_decision | Shows why an email was sent or blocked | /email_decision |
+| /trade_window | Sets global alert time window | /trade_window 08:00 18:00 |
+
+────────────────────────────────────────
+CATEGORY: Cooldowns (Admin Override)
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /cooldown_clear | Clears cooldown for a symbol | /cooldown_clear BTC long |
+| /cooldown_clear_all | Clears all cooldowns | /cooldown_clear_all |
+
+────────────────────────────────────────
+CATEGORY: Data & Maintenance
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /reset | Resets DB (dangerous) | /reset |
+| /restore | Restores last DB backup | /restore |
+
+────────────────────────────────────────
+CATEGORY: System & Health
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /health | Bot health summary | /health |
+| /health_sys | System diagnostics | /health_sys |
+
+────────────────────────────────────────
+CATEGORY: Support Operations
+────────────────────────────────────────
+| Command | What it does | Example |
+|--------|---------------|---------|
+| /reply | Replies to a support ticket (auto-closes) | /reply PF-1023 Fixed |
+| /support_status | Checks any ticket status | /support_status PF-1023 |
+
+────────────────────────────────────────
+NOTES
+────────────────────────────────────────
+• Admin commands are hidden from normal users
+• Use /help_admin only for operations & debugging
+• Billing & access are fully automated via Stripe
+
+PulseFutures — Admin Panel
+"""
+
 
 # =========================================================
 # BILLING COMMANDS
@@ -3002,6 +2957,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         HELP_TEXT,
         parse_mode=None,  # keep plain text (safe)
+        disable_web_page_preview=True,
+    )
+
+async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("Admin only.")
+        return
+
+    await send_long_message(
+        update,
+        HELP_ADMIN_TEXT,
+        parse_mode=None,
         disable_web_page_preview=True,
     )
 
@@ -5081,6 +5049,7 @@ def main():
 
     # ================= Handlers =================
     app.add_handler(CommandHandler(["help", "start"], cmd_help))
+    app.add_handler(CommandHandler("help_admin", cmd_help_admin))
     app.add_handler(CommandHandler("billing", billing_cmd))
     app.add_handler(CommandHandler("manage", manage_cmd))
     app.add_handler(CommandHandler("myplan", myplan_cmd))
