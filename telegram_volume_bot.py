@@ -1741,7 +1741,7 @@ def fmt_price_email(x: float) -> str:
 # =========================================================
 from telegram.error import BadRequest, TimedOut, NetworkError, RetryAfter
 
-SAFE_CHUNK = 3500
+SAFE_CHUNK = 3800
 
 async def send_long_message(
     update: Update,
@@ -1750,45 +1750,69 @@ async def send_long_message(
     disable_web_page_preview: bool = True,
     reply_markup=None,
 ):
-    if not update or not update.message:
+    """
+    Sends long messages safely by chunking and retrying.
+
+    Notes:
+    - Telegram max message length is ~4096 chars. We stay below that.
+    - If parse_mode causes BadRequest (HTML/Markdown formatting), we retry as plain text.
+    - Retries on RetryAfter and transient network errors to avoid losing chunks.
+    """
+    if not update or not getattr(update, "message", None):
         return
 
     s = text or ""
-    chunks = [s[i:i+SAFE_CHUNK] for i in range(0, len(s), SAFE_CHUNK)]
+
+    # Be safe if SAFE_CHUNK is missing or too large
+    max_len = 3800
+    try:
+        max_len = int(globals().get("SAFE_CHUNK", 3800))
+    except Exception:
+        max_len = 3800
+    if max_len > 3900:
+        max_len = 3900
+    if max_len < 500:
+        max_len = 2000
+
+    chunks = [s[i : i + max_len] for i in range(0, len(s), max_len)]
 
     first = True
     for ch in chunks:
-        try:
+
+        async def _send(pm: Optional[str]):
             await update.message.reply_text(
                 ch,
-                parse_mode=parse_mode,
+                parse_mode=pm,
                 disable_web_page_preview=disable_web_page_preview,
                 reply_markup=reply_markup if first else None,
             )
+
+        # Try with requested parse_mode first (or None)
+        try:
+            await _send(parse_mode)
 
         except RetryAfter as e:
             # Telegram rate limit: wait then retry once
-            await asyncio.sleep(int(e.retry_after) + 1)
-            await update.message.reply_text(
-                ch,
-                parse_mode=parse_mode,
-                disable_web_page_preview=disable_web_page_preview,
-                reply_markup=reply_markup if first else None,
-            )
-
-        except BadRequest:
-            # Usually markdown issue -> fallback to plain text
-            await update.message.reply_text(
-                ch,
-                parse_mode=None,
-                disable_web_page_preview=disable_web_page_preview,
-                reply_markup=reply_markup if first else None,
-            )
+            wait_s = int(getattr(e, "retry_after", 1)) + 1
+            await asyncio.sleep(wait_s)
+            await _send(parse_mode)
 
         except (TimedOut, NetworkError) as e:
+            # transient network: retry once
             logger.warning("Telegram send failed (network): %s", e)
-            # optionally: retry once
             await asyncio.sleep(2)
+            try:
+                await _send(parse_mode)
+            except Exception as e2:
+                logger.warning("Telegram retry failed (network): %s", e2)
+
+        except BadRequest as e:
+            # Usually formatting issue -> fallback to plain text
+            logger.warning("Telegram BadRequest (parse_mode=%s): %s | Falling back to plain text.", parse_mode, e)
+            try:
+                await _send(None)
+            except Exception as e2:
+                logger.warning("Telegram fallback send failed: %s", e2)
 
         except Exception as e:
             logger.exception("Telegram send failed: %s", e)
@@ -3200,11 +3224,11 @@ def build_help_html(title: str, sections: list) -> str:
 # TELEGRAM COMMANDS
 # =========================================================
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = build_help_html("PulseFutures — User Commands", HELP_SECTIONS_USER)
+    # Plain text help (no tables, no HTML builder)
     await send_long_message(
         update,
-        msg,
-        parse_mode=ParseMode.HTML,
+        HELP_TEXT,
+        parse_mode=None,
         disable_web_page_preview=True,
     )
 
@@ -3214,13 +3238,13 @@ async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Admin only.")
         return
 
-    msg = build_help_html("PulseFutures — Admin Commands", HELP_SECTIONS_ADMIN)
     await send_long_message(
         update,
-        msg,
-        parse_mode=ParseMode.HTML,
+        HELP_TEXT_ADMIN,
+        parse_mode=None,
         disable_web_page_preview=True,
     )
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_help(update, context)
@@ -5297,7 +5321,8 @@ def main():
     app.add_error_handler(error_handler)
 
     # ================= Handlers =================
-    app.add_handler(CommandHandler(["help", "start"], cmd_help))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help_admin", cmd_help_admin))
     app.add_handler(CommandHandler("billing", billing_cmd))
     app.add_handler(CommandHandler("manage", manage_cmd))
