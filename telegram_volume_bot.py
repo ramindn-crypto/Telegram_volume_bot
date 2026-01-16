@@ -31,12 +31,6 @@ from collections import Counter, defaultdict
 import ccxt
 from tabulate import tabulate
 
-import stripe
-stripe.api_key = os.getenv("STRIPE_API_KEY")
-
-if not stripe.api_key:
-    raise RuntimeError("Stripe API key not configured")
-
 import html
 import textwrap
 from telegram.constants import ParseMode
