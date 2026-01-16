@@ -36,6 +36,9 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
+import html
+import textwrap
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -2738,178 +2741,84 @@ def _advice(user: dict, stats: dict) -> List[str]:
 # HELP TEXT (USER)
 # =========================================================
 
-HELP_TEXT = """\
-📘 PulseFutures — User Commands
-Use /help_admin for admin operations.
-
-────────────────────────────────────────
-CATEGORY: Market Scan
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /screen | Scans Bybit futures market and shows best trade setups using volume, trend, EMA, and session logic | /screen |
-
-────────────────────────────────────────
-CATEGORY: Position Sizing (NO trade opened)
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /size | Calculates correct position size based on risk and stop loss | /size BTC long sl 42000 |
-| /size | Same as above with % risk | /size ETH short risk pct 2 sl 2500 |
-| /size | Uses custom entry price | /size BTC long sl 42000 entry 43000 |
-
-────────────────────────────────────────
-CATEGORY: Trade Journal
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /trade_open | Opens a journal trade (manual or signal-based) | /trade_open BTC long entry 43000 sl 42000 risk pct 2 |
-| /trade_sl | Updates stop loss of an open trade | /trade_sl 12 42500 |
-| /trade_rf | Marks trade as risk-free | /trade_rf 12 |
-| /trade_close | Closes trade and records PnL | /trade_close 12 pnl 180 |
-
-────────────────────────────────────────
-CATEGORY: Equity & Performance
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /equity | Sets or shows starting equity | /equity 1000 |
-| /equity_reset | Resets equity tracking | /equity_reset |
-| /status | Shows account dashboard, risk usage, sessions, and open trades | /status |
-
-────────────────────────────────────────
-CATEGORY: Risk Management
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /riskmode | Sets risk per trade | /riskmode pct 2 |
-| /dailycap | Sets daily max loss | /dailycap usd 50 |
-| /limits | Sets discipline limits (trades, emails, gaps) | /limits maxtrades 5 |
-
-────────────────────────────────────────
-CATEGORY: Sessions & Alerts
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /sessions | Shows active trading sessions | /sessions |
-| /sessions_on | Enables session | /sessions_on NY |
-| /sessions_off | Disables session | /sessions_off LON |
-| /notify_on | Enables email alerts | /notify_on |
-| /notify_off | Disables email alerts | /notify_off |
-| /trade_window | Limits alert delivery time | /trade_window 09:00 17:30 |
-
-────────────────────────────────────────
-CATEGORY: Cooldowns
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /cooldowns | Shows active symbol cooldowns | /cooldowns |
-| /cooldown | Shows cooldown for a symbol | /cooldown BTC long |
-
-────────────────────────────────────────
-CATEGORY: Reports
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /report_daily | Daily performance report | /report_daily |
-| /report_weekly | Weekly performance report | /report_weekly |
-| /report_overall | All-time performance stats | /report_overall |
-| /signals_daily | Daily signal summary | /signals_daily |
-| /signals_weekly | Weekly signal summary | /signals_weekly |
-
-────────────────────────────────────────
-CATEGORY: Billing & Access
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /myplan | Shows your plan and access status | /myplan |
-| /billing | Opens Stripe checkout for subscription | /billing |
-| /manage | Opens Stripe billing portal | /manage |
-
-────────────────────────────────────────
-CATEGORY: Support
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /support | Sends a support request | /support Email alerts stopped |
-| /support_status | Checks support ticket status | /support_status PF-1023 |
-
-────────────────────────────────────────
-NOTES
-────────────────────────────────────────
-• 7-day free trial for new users
-• After trial, access is locked until subscription is active
-• PulseFutures does NOT auto-trade
-• Risk management is always your responsibility
-
-PulseFutures — Trade less. Trade better.
-"""
+HELP_SECTIONS_USER = [
+    {"name": "Market Scan", "rows": [
+        {"cmd": "/screen", "what": "Scans Bybit futures and shows best trade setups using volume + trend + EMA + session logic.", "ex": ""},
+    ]},
+    {"name": "Position Sizing (no trade opened)", "rows": [
+        {"cmd": "/size", "what": "Calculates position size from risk + stop loss. Does NOT open a trade.", "ex": "/size BTC long sl 42000"},
+        {"cmd": "/size", "what": "Sizing with percent risk.", "ex": "/size ETH short risk pct 2 sl 2500"},
+        {"cmd": "/size", "what": "Sizing using custom entry.", "ex": "/size BTC long sl 42000 entry 43000"},
+    ]},
+    {"name": "Trade Journal & Equity", "rows": [
+        {"cmd": "/equity", "what": "Sets or shows starting equity.", "ex": "/equity 1000"},
+        {"cmd": "/equity_reset", "what": "Resets equity tracking.", "ex": ""},
+        {"cmd": "/trade_open", "what": "Logs a new trade in the journal (manual or signal-based note).", "ex": "/trade_open BTC long entry 43000 sl 42000 risk pct 2"},
+        {"cmd": "/trade_sl", "what": "Updates stop loss for an open journal trade.", "ex": "/trade_sl 12 42500"},
+        {"cmd": "/trade_rf", "what": "Marks a trade as risk-free (tracking only).", "ex": "/trade_rf 12"},
+        {"cmd": "/trade_close", "what": "Closes a trade record and logs realised PnL.", "ex": "/trade_close 12 pnl 180"},
+        {"cmd": "/status", "what": "Shows dashboard: equity, risk usage, sessions, email status, open trades.", "ex": ""},
+    ]},
+    {"name": "Risk & Limits", "rows": [
+        {"cmd": "/riskmode", "what": "Sets risk per trade (usd or pct).", "ex": "/riskmode pct 2"},
+        {"cmd": "/dailycap", "what": "Sets daily max loss cap (stops signals when hit).", "ex": "/dailycap usd 50"},
+        {"cmd": "/limits", "what": "Sets discipline limits (max trades, email caps, gaps).", "ex": "/limits maxtrades 5"},
+    ]},
+    {"name": "Sessions & Alerts", "rows": [
+        {"cmd": "/sessions", "what": "Shows enabled sessions.", "ex": ""},
+        {"cmd": "/sessions_on", "what": "Enables a session.", "ex": "/sessions_on NY"},
+        {"cmd": "/sessions_off", "what": "Disables a session.", "ex": "/sessions_off LON"},
+        {"cmd": "/notify_on", "what": "Turns email alerts ON.", "ex": ""},
+        {"cmd": "/notify_off", "what": "Turns email alerts OFF.", "ex": ""},
+        {"cmd": "/trade_window", "what": "Limits alerts to a daily time window (your timezone).", "ex": "/trade_window 09:00 17:30"},
+    ]},
+    {"name": "Cooldowns & Reports", "rows": [
+        {"cmd": "/cooldowns", "what": "Shows active cooldowns.", "ex": ""},
+        {"cmd": "/cooldown", "what": "Shows cooldown for a symbol & side.", "ex": "/cooldown BTC long"},
+        {"cmd": "/report_daily", "what": "Daily performance report.", "ex": ""},
+        {"cmd": "/report_weekly", "what": "Weekly performance report.", "ex": ""},
+        {"cmd": "/report_overall", "what": "All-time performance report.", "ex": ""},
+        {"cmd": "/signals_daily", "what": "Daily signal stats.", "ex": ""},
+        {"cmd": "/signals_weekly", "what": "Weekly signal stats.", "ex": ""},
+    ]},
+    {"name": "Billing & Support", "rows": [
+        {"cmd": "/myplan", "what": "Shows your plan and access status.", "ex": ""},
+        {"cmd": "/billing", "what": "Opens Stripe subscription checkout.", "ex": ""},
+        {"cmd": "/manage", "what": "Opens Stripe portal to manage/cancel subscription.", "ex": ""},
+        {"cmd": "/support", "what": "Creates a support ticket.", "ex": "/support Email alerts stopped"},
+        {"cmd": "/support_status", "what": "Checks support ticket status.", "ex": "/support_status PF-1023"},
+        {"cmd": "/help_admin", "what": "Admin operations help (admins only).", "ex": ""},
+    ]},
+]
 
 # =========================================================
 # HELP TEXT (ADMIN)
 # =========================================================
-HELP_ADMIN_TEXT = """\
 
-🛠 PulseFutures — Admin Commands
+HELP_SECTIONS_ADMIN = [
+    {"name": "Support Ops", "rows": [
+        {"cmd": "/reply", "what": "Reply to a support ticket (auto-closes ticket).", "ex": "/reply PF-1023 Fixed ✅"},
+        {"cmd": "/support_status", "what": "Check any ticket status.", "ex": "/support_status PF-1023"},
+    ]},
+    {"name": "Email Debug", "rows": [
+        {"cmd": "/email_test", "what": "Send a test email to current saved recipient.", "ex": ""},
+        {"cmd": "/email_decision", "what": "Explain last email decision (sent/blocked + reason).", "ex": ""},
+        {"cmd": "/trade_window", "what": "Set alert delivery time window.", "ex": "/trade_window 08:00 18:00"},
+    ]},
+    {"name": "Cooldown Overrides", "rows": [
+        {"cmd": "/cooldown_clear", "what": "Clear cooldown for one symbol/side.", "ex": "/cooldown_clear BTC long"},
+        {"cmd": "/cooldown_clear_all", "what": "Clear ALL cooldowns.", "ex": ""},
+    ]},
+    {"name": "Maintenance", "rows": [
+        {"cmd": "/reset", "what": "Reset DB (dangerous).", "ex": ""},
+        {"cmd": "/restore", "what": "Restore DB from backup.", "ex": ""},
+    ]},
+    {"name": "System Health", "rows": [
+        {"cmd": "/health", "what": "Bot health summary.", "ex": ""},
+        {"cmd": "/health_sys", "what": "System diagnostics.", "ex": ""},
+    ]},
+]
 
-────────────────────────────────────────
-CATEGORY: Billing & Access Control
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /billing | Generates Stripe checkout links | /billing |
-| /manage | Opens Stripe customer billing portal | /manage |
-
-────────────────────────────────────────
-CATEGORY: Email & Alerts
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /email_test | Sends a test email | /email_test |
-| /email_decision | Shows why an email was sent or blocked | /email_decision |
-| /trade_window | Sets global alert time window | /trade_window 08:00 18:00 |
-
-────────────────────────────────────────
-CATEGORY: Cooldowns (Admin Override)
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /cooldown_clear | Clears cooldown for a symbol | /cooldown_clear BTC long |
-| /cooldown_clear_all | Clears all cooldowns | /cooldown_clear_all |
-
-────────────────────────────────────────
-CATEGORY: Data & Maintenance
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /reset | Resets DB (dangerous) | /reset |
-| /restore | Restores last DB backup | /restore |
-
-────────────────────────────────────────
-CATEGORY: System & Health
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /health | Bot health summary | /health |
-| /health_sys | System diagnostics | /health_sys |
-
-────────────────────────────────────────
-CATEGORY: Support Operations
-────────────────────────────────────────
-| Command | What it does | Example |
-|--------|---------------|---------|
-| /reply | Replies to a support ticket (auto-closes) | /reply PF-1023 Fixed |
-| /support_status | Checks any ticket status | /support_status PF-1023 |
-
-────────────────────────────────────────
-NOTES
-────────────────────────────────────────
-• Admin commands are hidden from normal users
-• Use /help_admin only for operations & debugging
-• Billing & access are fully automated via Stripe
-
-PulseFutures — Admin Panel
-"""
 
 
 # =========================================================
@@ -2948,28 +2857,92 @@ async def myplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Plan: {user['plan'].upper()}\nStatus: {status}"
     )
 
+def _format_help_table(rows, col_cmd=16, col_what=46, col_ex=28) -> str:
+    """
+    Monospace table with wrapping; optional Example column.
+    rows: [{"cmd": str, "what": str, "ex": str|""}, ...]
+    - If ex == cmd -> omit example.
+    - If no examples in a section -> omit Example column entirely.
+    """
+    clean_rows = []
+    any_ex = False
+
+    for r in rows:
+        cmd = (r.get("cmd") or "").strip()
+        what = (r.get("what") or "").strip()
+        ex = (r.get("ex") or "").strip()
+
+        if ex == cmd:
+            ex = ""
+        if ex:
+            any_ex = True
+
+        clean_rows.append({"cmd": cmd, "what": what, "ex": ex})
+
+    if any_ex:
+        header = f"{'Command':<{col_cmd}}  {'What it does':<{col_what}}  {'Example':<{col_ex}}"
+        sep    = f"{'-'*col_cmd}  {'-'*col_what}  {'-'*col_ex}"
+    else:
+        header = f"{'Command':<{col_cmd}}  {'What it does':<{col_what}}"
+        sep    = f"{'-'*col_cmd}  {'-'*col_what}"
+
+    lines = [header, sep]
+
+    for r in clean_rows:
+        cmd = r["cmd"][:col_cmd]
+        what_lines = textwrap.wrap(r["what"], width=col_what) or [""]
+        if any_ex:
+            ex_lines = textwrap.wrap(r["ex"], width=col_ex) or [""]
+            n = max(len(what_lines), len(ex_lines))
+            for i in range(n):
+                c = cmd if i == 0 else ""
+                w = what_lines[i] if i < len(what_lines) else ""
+                e = ex_lines[i] if i < len(ex_lines) else ""
+                lines.append(f"{c:<{col_cmd}}  {w:<{col_what}}  {e:<{col_ex}}")
+        else:
+            for i, w in enumerate(what_lines):
+                c = cmd if i == 0 else ""
+                lines.append(f"{c:<{col_cmd}}  {w:<{col_what}}")
+
+    return "\n".join(lines)
+
+
+def build_help_html(title: str, sections: list) -> str:
+    """
+    sections: [{"name": str, "rows": [...]}, ...]
+    Produces HTML message with <pre> monospace tables.
+    """
+    parts = [f"📘 <b>{html.escape(title)}</b>"]
+    for sec in sections:
+        parts.append(f"\n<b>• {html.escape(sec['name'])}</b>")
+        table = _format_help_table(sec["rows"])
+        parts.append(f"<pre>{html.escape(table)}</pre>")
+    return "\n".join(parts)
+
+
 # =========================================================
 # TELEGRAM COMMANDS
 # =========================================================
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # HELP_TEXT is long -> must be chunked
+    msg = build_help_html("PulseFutures — User Commands", HELP_SECTIONS_USER)
     await send_long_message(
         update,
-        HELP_TEXT,
-        parse_mode=None,  # keep plain text (safe)
+        msg,
+        parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
 
+
 async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin_user(uid):
+    if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("Admin only.")
         return
 
+    msg = build_help_html("PulseFutures — Admin Commands", HELP_SECTIONS_ADMIN)
     await send_long_message(
         update,
-        HELP_ADMIN_TEXT,
-        parse_mode=None,
+        msg,
+        parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
 
