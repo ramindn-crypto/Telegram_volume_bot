@@ -31,9 +31,18 @@ from collections import Counter, defaultdict
 import ccxt
 from tabulate import tabulate
 
+import stripe
+stripe.api_key = os.getenv("STRIPE_API_KEY")
+
+if not stripe.api_key:
+    raise RuntimeError("Stripe API key not configured")
+
 import html
 import textwrap
 from telegram.constants import ParseMode
+
+import os
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from telegram import (
     Update,
@@ -5001,6 +5010,134 @@ class StripeWebhookHandler(BaseHTTPRequestHandler):
 def start_stripe_webhook():
     HTTPServer(("0.0.0.0", 4242), StripeWebhookHandler).serve_forever()
 
+
+# =========================================================
+# MY PLSN & BILLING
+# =========================================================
+
+async def myplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    user = get_user(user_id)  # however you fetch user data
+
+    plan = user.get("plan") or "free"
+    expires = user.get("plan_expires")
+
+    msg = f"""\
+📦 Your Plan
+
+• Plan: {plan.upper()}
+• Status: {'Active' if plan != 'free' else 'Free user'}
+"""
+
+    if expires:
+        msg += f"• Expires: {expires}\n"
+
+    await update.message.reply_text(msg)
+
+
+def _env(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    return (v or default).strip()
+
+def _mask_addr(addr: str) -> str:
+    a = (addr or "").strip()
+    if len(a) <= 12:
+        return a
+    return f"{a[:6]}…{a[-6:]}"
+
+async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Billing menu: Stripe (Payment Links) + USDT.
+    - Uses env vars only (safe on Render)
+    - Does NOT call Stripe API (no stripe.api_key needed)
+    - Never crashes if not configured
+    """
+    user = update.effective_user
+    uid = user.id if user else None
+
+    # Stripe Payment Links
+    stripe_standard_url = _env("STRIPE_STANDARD_URL")
+    stripe_pro_url = _env("STRIPE_PRO_URL")
+
+    # USDT
+    usdt_network = _env("USDT_NETWORK", "TRC20")
+    usdt_address = _env("USDT_ADDRESS")
+    usdt_note = _env("USDT_NOTE")
+
+    # Support
+    support_handle = _env("BILLING_SUPPORT_HANDLE", "@PulseFuturesSupport")
+
+    # Reference for manual matching (USDT payments, or any support ticket)
+    ref = f"PF-{uid}" if uid else "PF-UNKNOWN"
+
+    lines = []
+    lines.append("💳 PulseFutures — Billing & Upgrade")
+    lines.append("")
+    lines.append("Choose your payment method below.")
+    lines.append(f"Reference (important): {ref}")
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("1) Stripe (Card / Apple Pay / Google Pay)")
+    lines.append("────────────────────")
+    if stripe_standard_url or stripe_pro_url:
+        lines.append("Tap a plan button to pay securely via Stripe.")
+    else:
+        lines.append("Stripe is not configured yet.")
+        lines.append("Admin: set STRIPE_STANDARD_URL / STRIPE_PRO_URL in Render env vars.")
+
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("2) USDT")
+    lines.append("────────────────────")
+    if usdt_address:
+        lines.append(f"Network: {usdt_network}")
+        lines.append(f"Address: {usdt_address}")
+        lines.append(f"(Short: {_mask_addr(usdt_address)})")
+        if usdt_note:
+            lines.append(f"Note: {usdt_note.replace('<REF>', ref)}")
+        else:
+            lines.append(f"Note: After sending, message support with TXID + reference '{ref}'.")
+    else:
+        lines.append("USDT is not configured yet.")
+        lines.append("Admin: set USDT_ADDRESS (+ optional USDT_NETWORK) in Render env vars.")
+
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("After payment")
+    lines.append("────────────────────")
+    lines.append("1) If Stripe: you’ll be activated after confirmation (or contact support if needed).")
+    lines.append("2) If USDT: send TXID + screenshot to support for manual activation.")
+    lines.append(f"Support: {support_handle}")
+    lines.append(f"Reference: {ref}")
+
+    msg = "\n".join(lines)
+
+    # Buttons
+    buttons = []
+    stripe_row = []
+    if stripe_standard_url:
+        stripe_row.append(InlineKeyboardButton("✅ Stripe — Standard", url=stripe_standard_url))
+    if stripe_pro_url:
+        stripe_row.append(InlineKeyboardButton("🚀 Stripe — Pro", url=stripe_pro_url))
+    if stripe_row:
+        buttons.append(stripe_row)
+
+    howto_url = _env("BILLING_HOWTO_URL")
+    if howto_url:
+        buttons.append([InlineKeyboardButton("ℹ️ Payment Instructions", url=howto_url)])
+
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+
+    await send_long_message(
+        update,
+        msg,
+        parse_mode=None,
+        disable_web_page_preview=True,
+        reply_markup=reply_markup,
+    )
+
+
 # =========================================================
 # EMAIL JOB
 # =========================================================
@@ -5360,6 +5497,7 @@ def main():
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("restore", restore_cmd))
     app.add_handler(CommandHandler("health_sys", health_sys_cmd))
+    app.add_handler(CommandHandler("billing", billing_cmd))
     app.add_handler(CommandHandler("trade_window", trade_window_cmd))
     app.add_handler(CommandHandler("email", email_cmd))   
     app.add_handler(CommandHandler("email_test", email_test_cmd))  
