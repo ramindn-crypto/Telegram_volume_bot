@@ -31,6 +31,10 @@ from collections import Counter, defaultdict
 import ccxt
 from tabulate import tabulate
 
+import html
+import textwrap
+from telegram.constants import ParseMode
+
 from telegram import (
     Update,
     InlineKeyboardButton,
