@@ -54,6 +54,34 @@ from telegram.ext import (
 )
 
 
+import re
+import sqlite3
+
+TXID_REGEX = re.compile(r"^[A-Fa-f0-9]{64}$")
+
+def is_valid_txid(txid: str) -> bool:
+    return bool(TXID_REGEX.match(txid))
+
+def usdt_txid_exists(txid: str) -> bool:
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM usdt_payments WHERE txid = ?", (txid,))
+    exists = cur.fetchone() is not None
+    conn.close()
+    return exists
+
+def save_usdt_payment(user_id, username, txid, plan):
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO usdt_payments (telegram_id, username, txid, plan, status)
+        VALUES (?, ?, ?, ?, 'PENDING')
+    """, (user_id, username, txid, plan))
+    conn.commit()
+    conn.close()
+
+
+
 # =========================================================
 # SAAS / STRIPE CONFIG
 # =========================================================
@@ -1151,8 +1179,6 @@ def ensure_email_column():
         except sqlite3.OperationalError:
             # Column already exists
             pass
-
-
 
 def reset_daily_if_needed(user: dict) -> dict:
     tz = ZoneInfo(user["tz"])
@@ -2307,6 +2333,7 @@ def pick_setups(
     setups.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
     return setups[:n]
 
+
 # =========================================================
 # EMAIL
 # =========================================================
@@ -2766,6 +2793,90 @@ def _advice(user: dict, stats: dict) -> List[str]:
         adv.append("✅ Daily trade limits help prevent overtrading. Focus only on top-quality setups.")
     return adv[:6]
 
+
+
+# =========================================================
+# USDT Payment
+# =========================================================
+
+async def usdt_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage:\n/usdt_paid <TXID> <standard|pro>"
+        )
+        return
+
+    txid, plan = context.args
+    plan = plan.lower()
+
+    if plan not in ("standard", "pro"):
+        await update.message.reply_text("Plan must be 'standard' or 'pro'")
+        return
+
+    if not is_valid_txid(txid):
+        await update.message.reply_text("❌ Invalid TXID format.")
+        return
+
+    if usdt_txid_exists(txid):
+        await update.message.reply_text("⚠️ This TXID has already been used.")
+        return
+
+    save_usdt_payment(
+        update.effective_user.id,
+        update.effective_user.username,
+        txid,
+        plan
+    )
+
+    await update.message.reply_text(
+        "✅ Payment submitted.\n"
+        "Status: Pending admin approval."
+    )
+
+    await context.bot.send_message(
+        chat_id=int(os.getenv("USDT_ADMIN_CHAT_ID")),
+        text=(
+            "🧾 New USDT payment request\n\n"
+            f"User: @{update.effective_user.username}\n"
+            f"Plan: {plan.upper()}\n"
+            f"TXID: {txid}\n\n"
+            f"Approve with:\n"
+            f"/usdt_approve {txid}"
+        )
+    )
+
+def approve_usdt(txid: str):
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE usdt_payments
+        SET status = 'APPROVED'
+        WHERE txid = ?
+    """, (txid,))
+    conn.commit()
+    conn.close()
+
+async def usdt_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != int(os.getenv("USDT_ADMIN_CHAT_ID")):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /usdt_approve <TXID>")
+        return
+
+    txid = context.args[0]
+
+    approve_usdt(txid)
+
+    await update.message.reply_text("✅ USDT payment approved.")
+
+    # 🔑 ACCESS GRANT HOOK
+    # TODO:
+    # grant_standard_access(user_id)
+    # grant_pro_access(user_id)
+
+
 # =========================================================
 # HELP TEXT (USER)
 # =========================================================
@@ -3026,6 +3137,34 @@ View / set timezone:
 ────────────────────
 • /support
   → Contact/support info and troubleshooting steps
+• /myplan
+• /billing
+────────────────────
+USDT Payments
+────────────────────
+You can pay using USDT (crypto).
+
+Accepted network:
+• USDT (TRC20 only)
+
+Prices:
+• Standard: 49 USDT
+• Pro: 99 USDT
+
+Steps:
+1) Send USDT to the provided address
+2) Copy the transaction hash (TXID)
+3) Submit payment using:
+
+/usdt_paid <TXID> <standard|pro>
+
+Example:
+/usdt_paid abc123... standard
+
+Notes:
+• USDT payments are final
+• No refunds for crypto payments
+• Access is granted after admin approval
 
 ────────────────────
 Admin Help
@@ -3104,14 +3243,21 @@ Not financial advice.
 ────────────────────
 6) Support & Billing (Admin tools)
 ────────────────────
-/support
 • Support message template / contact instructions
 
-(If enabled in your code)
-/myplan
-/billing
-/manage
-/cancel
+────────────────────
+USDT Admin Commands
+────────────────────
+
+/usdt_approve <TXID>
+
+Approves a pending USDT payment
+and grants user access.
+
+Notes:
+• Always verify TXID on the blockchain
+• USDT payments are irreversible
+• Never approve without verification
 
 ────────────────────
 Final Notes
