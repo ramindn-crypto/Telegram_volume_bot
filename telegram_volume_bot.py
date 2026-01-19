@@ -1043,6 +1043,53 @@ def db_init():
     )
     """)
 
+    # =========================================================
+    # USDT payments + unified access/payments ledger
+    # =========================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS usdt_payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER NOT NULL,
+        username TEXT,
+        txid TEXT UNIQUE NOT NULL,
+        plan TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PENDING',   -- PENDING / APPROVED / REJECTED
+        created_ts REAL NOT NULL,
+        decided_ts REAL,
+        decided_by INTEGER,
+        note TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS payments_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        source TEXT NOT NULL,         -- 'stripe' | 'usdt' | 'manual'
+        ref TEXT NOT NULL,            -- stripe invoice/sub id OR txid OR manual note
+        plan TEXT NOT NULL,           -- free | standard | pro
+        amount REAL NOT NULL DEFAULT 0,
+        currency TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,         -- paid | refunded | void | pending
+        created_ts REAL NOT NULL
+    )
+    """)
+
+    # optional: add columnsapp.add_handler(CommandHandler("email_decision", email_decision_cmd))
+ to users if missing
+    try:
+        cur.execute("PRAGMA table_info(users)")
+        user_cols = {r[1] for r in cur.fetchall()}
+        if "access_source" not in user_cols:
+            cur.execute("ALTER TABLE users ADD COLUMN access_source TEXT NOT NULL DEFAULT ''")
+        if "access_ref" not in user_cols:
+            cur.execute("ALTER TABLE users ADD COLUMN access_ref TEXT NOT NULL DEFAULT ''")
+        if "access_updated_ts" not in user_cols:
+            cur.execute("ALTER TABLE users ADD COLUMN access_updated_ts REAL NOT NULL DEFAULT 0")
+    except Exception:
+        pass
+
+   
     con.commit()
     con.close()
 
@@ -2886,14 +2933,12 @@ PulseFutures — Commands (Telegram)
 
 /help
 
-PulseFutures — Commands (Telegram)
 Bybit USDT Futures • Risk-first • Session-aware
 Not financial advice.
 
 ────────────────────
 1) Market Scan
 ────────────────────
-
 /screen
 
 Shows a real-time market snapshot:
@@ -3042,7 +3087,6 @@ Emails are sent ONLY during enabled sessions.
 ────────────────────
 8) Email Alerts
 ────────────────────
-
 Enable / disable:
 • /notify_on
 • /notify_off
@@ -3087,10 +3131,6 @@ Query a single symbol:
 • /cooldown <SYMBOL> <long|short>
   → Shows remaining cooldown time for NY / LON / ASIA for that exact symbol+direction
 
-Admin-only reset:
-• /cooldown_clear <SYMBOL> <long|short>
-• /cooldown_clear_all
-
 ────────────────────
 10) Reports
 ────────────────────
@@ -3133,16 +3173,25 @@ View / set timezone:
 • /tz America/New_York
 
 ────────────────────
-13) Support
+13) Billing, Plan, Support
 ────────────────────
+• /myplan
+  → Shows your current plan
+
+• /billing
+  → Shows payment options (Stripe + USDT)
+
 • /support
   → Contact/support info and troubleshooting steps
-• /myplan
-• /billing
+
 ────────────────────
-USDT Payments
+14) USDT Payments (Semi-Auto)
 ────────────────────
 You can pay using USDT (crypto).
+
+Start here:
+• /usdt
+  → Shows the current network + address + instructions
 
 Accepted network:
 • USDT (TRC20 only)
@@ -3152,14 +3201,14 @@ Prices:
 • Pro: 99 USDT
 
 Steps:
-1) Send USDT to the provided address
+1) Send USDT to the address shown in /usdt
 2) Copy the transaction hash (TXID)
 3) Submit payment using:
 
 /usdt_paid <TXID> <standard|pro>
 
 Example:
-/usdt_paid abc123... standard
+• /usdt_paid 7f3a...c9 standard
 
 Notes:
 • USDT payments are final
@@ -3183,6 +3232,7 @@ Trade less. Trade better. Risk first.
 PulseFutures
 """
 
+
 # =========================================================
 # HELP TEXT (ADMIN)
 # =========================================================
@@ -3192,38 +3242,11 @@ PulseFutures — Admin Commands (Telegram)
 
 /help_admin
 
-PulseFutures — Admin Commands (Telegram)
 Admin-only • Use carefully
 Not financial advice.
 
 ────────────────────
-1) Admin Access
-────────────────────
-• /help_admin
-  → Shows this admin help
-
-────────────────────
-2) Diagnostics
-────────────────────
-/diag_on [friendly|off]
-• Non-admin: friendly/off only
-• Admin: always FULL
-
-/diag_off
-• Non-admin: turns diagnostics OFF
-
-────────────────────
-3) Email Operations
-────────────────────
-/email_test
-• Sends a test email (verifies SMTP + config)
-
-/email_decision
-• Shows last email decision for this user:
-  SENT/SKIP + reasons
-
-────────────────────
-4) Cooldown Controls (Admin)
+Cooldown Controls (Admin)
 ────────────────────
 /cooldown_clear <SYMBOL> <long|short>
 • Clears cooldown for that symbol+side (admin)
@@ -3232,7 +3255,7 @@ Not financial advice.
 • Clears ALL cooldowns (admin)
 
 ────────────────────
-5) Data / Recovery
+Data / Recovery
 ────────────────────
 /reset
 • Resets user data / clean DB (DANGEROUS)
@@ -3241,30 +3264,38 @@ Not financial advice.
 • Restores previously removed data (if backup exists)
 
 ────────────────────
-6) Support & Billing (Admin tools)
-────────────────────
-• Support message template / contact instructions
-
-────────────────────
 USDT Admin Commands
 ────────────────────
+/usdt_pending
+• Shows pending USDT requests
 
 /usdt_approve <TXID>
+• Approves TXID (grants access + writes ledger)
 
-Approves a pending USDT payment
-and grants user access.
+/usdt_reject <TXID> <reason>
+• Rejects TXID
 
 Notes:
-• Always verify TXID on the blockchain
-• USDT payments are irreversible
-• Never approve without verification
+• Always verify TXID on the chain before approving
+• USDT payments are final/irreversible
 
 ────────────────────
-Final Notes
+Payments & Access Admin
 ────────────────────
-• Keep admin commands private (do not show to users)
-• Always verify before /reset
-• Prefer /health_sys when diagnosing production issues
+/admin_user <telegram_id>
+• Shows plan + access source/ref + last payments
+
+/admin_users [free|standard|pro]
+• Lists users (max 50)
+
+/admin_payments [N]
+• Shows latest payments from Stripe/USDT/manual (max 50)
+
+/admin_grant <telegram_id> <standard|pro|free> [source] [ref]
+• Manually grant/change access and log it
+
+/admin_revoke <telegram_id>
+• Revokes access (sets plan to FREE)
 
 PulseFutures
 """
@@ -5132,16 +5163,32 @@ class StripeWebhookHandler(BaseHTTPRequestHandler):
 
         if event["type"] in ("checkout.session.completed", "invoice.paid"):
             email = data.get("customer_email")
-            price_id = data["lines"]["data"][0]["price"]["id"]
+        
+            # get price + plan
+            line = data["lines"]["data"][0]
+            price_id = line["price"]["id"]
             plan = STRIPE_PRICE_TO_PLAN.get(price_id)
-
+        
+            # reference + amount
+            ref = data.get("id") or event.get("id")
+            amount = (line.get("amount_total") or data.get("amount_paid") or 0) / 100
+            currency = (data.get("currency") or "usd").upper()
+        
             if email and plan:
-                activate_user_by_email(email, plan)
+                activate_user_with_ledger_by_email(
+                    email=email,
+                    plan=plan,
+                    ref=ref,
+                    amount=amount,
+                    currency=currency,
+                )
 
         if event["type"] == "customer.subscription.deleted":
             email = data.get("customer_email")
+            ref = data.get("id") or event.get("id")
             if email:
-                downgrade_user_by_email(email)
+                downgrade_user_with_ledger_by_email(email, ref=ref)
+
 
         self.send_response(200)
         self.end_headers()
@@ -5247,7 +5294,7 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("After payment")
     lines.append("────────────────────")
     lines.append("1) If Stripe: you’ll be activated after confirmation (or contact support if needed).")
-    lines.append("2) If USDT: send TXID + screenshot to support for manual activation.")
+    lines.append("2) If USDT: submit TXID using /usdt_paid <TXID> <standard|pro>.")
     lines.append(f"Support: {support_handle}")
     lines.append(f"Reference: {ref}")
 
@@ -5276,6 +5323,46 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
         reply_markup=reply_markup,
     )
+
+
+
+def activate_user_with_ledger_by_email(email: str, plan: str, ref: str, amount: float = 0, currency: str = "USD"):
+    """
+    Activates user by email AND records payment in ledger.
+    """
+    user = get_user_by_email(email)
+    if not user:
+        return
+
+    user_id = user["user_id"]
+
+    # 1) grant access (existing behavior)
+    activate_user_by_email(email, plan)
+
+    # 2) write unified access state
+    _set_user_access(user_id, plan, "stripe", ref)
+
+    # 3) write payment ledger
+    _ledger_add(
+        user_id=user_id,
+        source="stripe",
+        ref=ref,
+        plan=plan,
+        amount=amount,
+        currency=currency,
+        status="paid",
+    )
+
+
+def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
+    user = get_user_by_email(email)
+    if not user:
+        return
+
+    user_id = user["user_id"]
+
+    downgrade_user_by_email(email)
+    _set_user_access(user_id, "free", "stripe", ref)
 
 
 # =========================================================
@@ -5579,6 +5666,393 @@ async def _post_init(app: Application):
     except Exception as e:
         logger.warning("delete_webhook failed (ignored): %s", e)
 
+        
+
+# =========================================================
+# USDT (SEMI-AUTO) + ADMIN PAYMENTS/ACCESS MANAGEMENT
+# =========================================================
+import re
+import time
+
+TXID_REGEX = re.compile(r"^[A-Fa-f0-9]{64}$")
+
+USDT_NETWORK = os.getenv("USDT_NETWORK", "TRC20").strip().upper()
+USDT_RECEIVE_ADDRESS = os.getenv("USDT_RECEIVE_ADDRESS", "").strip()
+
+USDT_STANDARD_PRICE = float(os.getenv("USDT_STANDARD_PRICE", "45"))
+USDT_PRO_PRICE = float(os.getenv("USDT_PRO_PRICE", "99"))
+
+def _now() -> float:
+    return float(time.time())
+
+def _is_admin(update: Update) -> bool:
+    try:
+        return is_admin_user(update.effective_user.id)
+    except Exception:
+        return False
+
+def _db():
+    return sqlite3.connect(DB_PATH)
+
+def _user_ident_str(uid: int) -> str:
+    return f"uid={uid}"
+
+def _ledger_add(user_id: int, source: str, ref: str, plan: str, amount: float, currency: str, status: str):
+    with _db() as con:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO payments_ledger (user_id, source, ref, plan, amount, currency, status, created_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (int(user_id), source, str(ref), str(plan), float(amount), str(currency), str(status), _now()))
+        con.commit()
+
+def _set_user_access(user_id: int, plan: str, source: str, ref: str):
+    # Use your existing update_user helper
+    update_user(
+        int(user_id),
+        plan=str(plan),
+        access_source=str(source),
+        access_ref=str(ref),
+        access_updated_ts=_now(),
+    )
+
+def _usdt_payment_row_by_txid(txid: str):
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("SELECT * FROM usdt_payments WHERE txid = ?", (txid,))
+        r = cur.fetchone()
+        return dict(r) if r else None
+
+def _usdt_insert_pending(user_id: int, username: str, txid: str, plan: str):
+    with _db() as con:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO usdt_payments (telegram_id, username, txid, plan, status, created_ts)
+            VALUES (?, ?, ?, ?, 'PENDING', ?)
+        """, (int(user_id), (username or ""), txid, plan, _now()))
+        con.commit()
+
+def _usdt_set_status(txid: str, status: str, decided_by: int, note: str = ""):
+    with _db() as con:
+        cur = con.cursor()
+        cur.execute("""
+            UPDATE usdt_payments
+            SET status = ?, decided_ts = ?, decided_by = ?, note = ?
+            WHERE txid = ?
+        """, (status, _now(), int(decided_by), (note or ""), txid))
+        con.commit()
+
+# ---------------- USER COMMANDS ----------------
+
+async def usdt_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    addr = USDT_RECEIVE_ADDRESS or "(not set)"
+    await update.message.reply_text(
+        "USDT Payment (Semi-Auto)\n\n"
+        f"Network: USDT ({USDT_NETWORK})\n"
+        f"Address: {addr}\n\n"
+        f"Standard: {USDT_STANDARD_PRICE:.0f} USDT\n"
+        f"Pro: {USDT_PRO_PRICE:.0f} USDT\n\n"
+        "After payment submit:\n"
+        "/usdt_paid <TXID> <standard|pro>\n\n"
+        "Example:\n"
+        "/usdt_paid 7f3a...c9 standard\n\n"
+        "Note: USDT payments are final. Access after admin approval."
+    )
+
+async def usdt_paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Usage:\n/usdt_paid <TXID> <standard|pro>")
+        return
+
+    txid = context.args[0].strip()
+    plan = context.args[1].strip().lower()
+
+    if plan not in ("standard", "pro"):
+        await update.message.reply_text("❌ Plan must be: standard or pro\nExample: /usdt_paid <TXID> standard")
+        return
+
+    if not TXID_REGEX.match(txid):
+        await update.message.reply_text("❌ TXID looks invalid.\nIt must be a 64-char hex hash.")
+        return
+
+    # prevent duplicates
+    existing = _usdt_payment_row_by_txid(txid)
+    if existing:
+        await update.message.reply_text(f"⚠️ This TXID is already in the system (status: {existing['status']}).")
+        return
+
+    uid = int(update.effective_user.id)
+    uname = update.effective_user.username or ""
+    try:
+        _usdt_insert_pending(uid, uname, txid, plan)
+    except sqlite3.IntegrityError:
+        await update.message.reply_text("⚠️ This TXID is already used.")
+        return
+    except Exception as e:
+        logger.exception("usdt_paid_cmd failed")
+        await update.message.reply_text(f"❌ Failed to save. {type(e).__name__}: {e}")
+        return
+
+    await update.message.reply_text(
+        "✅ USDT payment submitted.\n"
+        "Status: PENDING admin approval.\n\n"
+        "If you made a mistake, contact /support."
+    )
+
+    # Notify admins (send to each admin user id)
+    try:
+        for admin_id in (ADMIN_USER_IDS or set()):
+            await context.bot.send_message(
+                chat_id=int(admin_id),
+                text=(
+                    "🧾 New USDT Payment Request\n\n"
+                    f"User: @{uname or '(no username)'} ({uid})\n"
+                    f"Plan: {plan.upper()}\n"
+                    f"TXID: {txid}\n\n"
+                    f"Approve: /usdt_approve {txid}\n"
+                    f"Reject:  /usdt_reject {txid} <reason>"
+                )
+            )
+    except Exception:
+        # don't block user success if admin notify fails
+        logger.exception("Failed to notify admins about USDT request")
+
+# ---------------- ADMIN COMMANDS ----------------
+
+async def usdt_pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("""
+            SELECT txid, telegram_id, username, plan, created_ts
+            FROM usdt_payments
+            WHERE status='PENDING'
+            ORDER BY created_ts DESC
+            LIMIT 20
+        """)
+        rows = cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text("✅ No pending USDT requests.")
+        return
+
+    lines = ["Pending USDT requests (latest 20):\n"]
+    for r in rows:
+        lines.append(f"- {r['plan'].upper()} | @{r['username'] or 'n/a'} ({r['telegram_id']}) | {r['txid']}")
+    lines.append("\nApprove with: /usdt_approve <TXID>")
+    await update.message.reply_text("\n".join(lines))
+
+async def usdt_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /usdt_approve <TXID>")
+        return
+
+    txid = context.args[0].strip()
+    if not TXID_REGEX.match(txid):
+        await update.message.reply_text("❌ Invalid TXID format (must be 64-char hex).")
+        return
+
+    row = _usdt_payment_row_by_txid(txid)
+    if not row:
+        await update.message.reply_text("❌ TXID not found in DB. Ask user to re-submit with /usdt_paid.")
+        return
+
+    if row["status"] == "APPROVED":
+        await update.message.reply_text("⚠️ Already approved.")
+        return
+    if row["status"] == "REJECTED":
+        await update.message.reply_text("⚠️ This TXID was rejected earlier.")
+        return
+
+    plan = row["plan"].lower()
+    uid = int(row["telegram_id"])
+
+    # Grant access + ledger
+    amount = USDT_STANDARD_PRICE if plan == "standard" else USDT_PRO_PRICE
+    _set_user_access(uid, plan, "usdt", txid)
+    _ledger_add(uid, "usdt", txid, plan, amount, "USDT", "paid")
+    _usdt_set_status(txid, "APPROVED", update.effective_user.id, note="approved")
+
+    await update.message.reply_text(f"✅ Approved. Access granted: {plan.upper()} to user {uid}.")
+    try:
+        await context.bot.send_message(chat_id=uid, text=f"✅ Payment approved. Your plan is now: {plan.upper()}")
+    except Exception:
+        pass
+
+async def usdt_reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /usdt_reject <TXID> <reason(optional)>")
+        return
+
+    txid = context.args[0].strip()
+    reason = " ".join(context.args[1:]).strip() if len(context.args) > 1 else "rejected"
+    if not TXID_REGEX.match(txid):
+        await update.message.reply_text("❌ Invalid TXID format.")
+        return
+
+    row = _usdt_payment_row_by_txid(txid)
+    if not row:
+        await update.message.reply_text("❌ TXID not found.")
+        return
+
+    if row["status"] != "PENDING":
+        await update.message.reply_text(f"⚠️ Cannot reject (current status: {row['status']}).")
+        return
+
+    _usdt_set_status(txid, "REJECTED", update.effective_user.id, note=reason)
+    await update.message.reply_text("✅ Rejected.")
+    try:
+        await context.bot.send_message(chat_id=int(row["telegram_id"]), text=f"❌ USDT payment rejected: {reason}")
+    except Exception:
+        pass
+
+# ---------------- ADMIN: USERS / ACCESS / PAYMENTS ----------------
+
+async def admin_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /admin_user <telegram_id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("❌ telegram_id must be a number.")
+        return
+
+    user = get_user(uid)
+    plan = user.get("plan")
+    src = user.get("access_source", "")
+    ref = user.get("access_ref", "")
+    upd = user.get("access_updated_ts", 0)
+
+    # latest payments
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("""
+            SELECT source, ref, plan, amount, currency, status, created_ts
+            FROM payments_ledger
+            WHERE user_id = ?
+            ORDER BY created_ts DESC
+            LIMIT 5
+        """, (uid,))
+        pays = cur.fetchall()
+
+    lines = [
+        f"User: {uid}",
+        f"Plan: {plan}",
+        f"Access source/ref: {src} / {ref}",
+        f"Access updated: {datetime.utcfromtimestamp(upd).isoformat()+'Z' if upd else 'n/a'}",
+        f"Email: {user.get('email_to','') or ''}",
+        "",
+        "Last payments:"
+    ]
+    if pays:
+        for p in pays:
+            lines.append(f"- {p['source']} | {p['plan']} | {p['amount']} {p['currency']} | {p['status']} | {p['ref']}")
+    else:
+        lines.append("- (none)")
+    await update.message.reply_text("\n".join(lines))
+
+async def admin_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    flt = (context.args[0].lower() if context.args else "").strip()  # optional: standard/pro/free
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        if flt in ("standard", "pro", "free"):
+            cur.execute("SELECT user_id, plan, email_to, access_source FROM users WHERE plan=? ORDER BY user_id LIMIT 50", (flt,))
+        else:
+            cur.execute("SELECT user_id, plan, email_to, access_source FROM users ORDER BY user_id LIMIT 50")
+        rows = cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text("No users found.")
+        return
+
+    lines = ["Users (max 50):"]
+    for r in rows:
+        lines.append(f"- {r['user_id']} | {r['plan']} | {r['access_source'] or ''} | {r['email_to'] or ''}")
+    await update.message.reply_text("\n".join(lines))
+
+async def admin_grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /admin_grant <telegram_id> <standard|pro> [source] [ref]")
+        return
+    uid = int(context.args[0])
+    plan = context.args[1].lower().strip()
+    source = (context.args[2].lower().strip() if len(context.args) >= 3 else "manual")
+    ref = (" ".join(context.args[3:]).strip() if len(context.args) >= 4 else "manual_grant")
+
+    if plan not in ("standard", "pro", "free"):
+        await update.message.reply_text("❌ plan must be: standard | pro | free")
+        return
+
+    _set_user_access(uid, plan, source, ref)
+    _ledger_add(uid, source, ref, plan, 0, "", "paid")
+    await update.message.reply_text(f"✅ Granted {plan.upper()} to {uid} (source={source}).")
+
+async def admin_revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /admin_revoke <telegram_id>")
+        return
+    uid = int(context.args[0])
+    _set_user_access(uid, "free", "manual", "revoked")
+    await update.message.reply_text(f"✅ Access revoked. User {uid} set to FREE.")
+
+async def admin_payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    n = 20
+    if context.args and context.args[0].isdigit():
+        n = max(1, min(50, int(context.args[0])))
+
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("""
+            SELECT user_id, source, plan, amount, currency, status, ref, created_ts
+            FROM payments_ledger
+            ORDER BY created_ts DESC
+            LIMIT ?
+        """, (n,))
+        rows = cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text("No payments in ledger.")
+        return
+
+    lines = [f"Latest payments (max {n}):"]
+    for r in rows:
+        ts = datetime.utcfromtimestamp(r["created_ts"]).isoformat() + "Z"
+        lines.append(f"- {ts} | uid={r['user_id']} | {r['source']} | {r['plan']} | {r['amount']} {r['currency']} | {r['status']} | {r['ref']}")
+    await update.message.reply_text("\n".join(lines))
+
 
 def main():
     # Hard guard: Background Worker ONLY
@@ -5642,6 +6116,21 @@ def main():
     app.add_handler(CommandHandler("email", email_cmd))   
     app.add_handler(CommandHandler("email_test", email_test_cmd))  
     app.add_handler(CommandHandler("email_decision", email_decision_cmd))
+    
+    # ================= USDT (semi-auto) =================
+    app.add_handler(CommandHandler("usdt", usdt_info_cmd))
+    app.add_handler(CommandHandler("usdt_paid", usdt_paid_cmd))
+    app.add_handler(CommandHandler("usdt_pending", usdt_pending_cmd))
+    app.add_handler(CommandHandler("usdt_approve", usdt_approve_cmd))
+    app.add_handler(CommandHandler("usdt_reject", usdt_reject_cmd))
+    
+    # ================= Admin: access & payments =================
+    app.add_handler(CommandHandler("admin_user", admin_user_cmd))
+    app.add_handler(CommandHandler("admin_users", admin_users_cmd))
+    app.add_handler(CommandHandler("admin_grant", admin_grant_cmd))
+    app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd))
+    app.add_handler(CommandHandler("admin_payments", admin_payments_cmd))
+   
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     # ================= JobQueue ================= #
