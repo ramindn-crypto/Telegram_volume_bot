@@ -6400,7 +6400,7 @@ def main():
     app.add_handler(CommandHandler("admin_payments", admin_payments_cmd))
    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-    application.add_handler(CommandHandler(None, unknown_command))
+    app.add_handler(CommandHandler(None, unknown_command))
 
 
     # ================= JobQueue ================= #
