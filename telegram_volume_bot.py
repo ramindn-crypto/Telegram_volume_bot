@@ -2897,7 +2897,33 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if suggestion:
         msg = (
             "❌ *Unknown command*\n\n"
-            f"Did you
+            f"Did you mean: `/{suggestion}` ?\n\n"
+            "Type /help to see all commands."
+        )
+    else:
+        msg = (
+            "❌ *Unknown command*\n\n"
+            "Please check the spelling.\n"
+            "Type /help to see all commands."
+        )
+
+    try:
+        await update.message.reply_text(
+            msg,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        # Plain text fallback (never fails due to Markdown)
+        if suggestion:
+            await update.message.reply_text(
+                f"❌ Unknown command\n\nDid you mean: /{suggestion} ?\n\nType /help to see all commands."
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Unknown command\n\nPlease check the spelling.\nType /help to see all commands."
+            )
+
 
 
 # =========================================================
