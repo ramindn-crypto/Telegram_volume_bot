@@ -2786,14 +2786,12 @@ def in_session_now(user: dict) -> Optional[dict]:
     return None
 
 
+import difflib
 
 # =========================================================
 # UNKNOWN COMMAND + "DID YOU MEAN" SUGGESTION (ALL USERS)
 # =========================================================
 
-# IMPORTANT:
-# - Keep this list aligned with HELP_TEXT + HELP_TEXT_ADMIN
-# - Commands are WITHOUT the leading "/"
 KNOWN_COMMANDS = sorted(set([
     # Help
     "help", "help_admin",
@@ -2856,12 +2854,6 @@ KNOWN_COMMANDS = sorted(set([
 ]))
 
 def _normalize_cmd(text: str) -> str:
-    """
-    Extract command name from Telegram message text:
-    - "/help" -> "help"
-    - "/help@MyBot" -> "help"
-    - "/size BTC long sl 42000" -> "size"
-    """
     s = (text or "").strip()
     if not s.startswith("/"):
         return ""
@@ -2872,27 +2864,18 @@ def _normalize_cmd(text: str) -> str:
         s = s.split("@", 1)[0]
     return s.lower()
 
-def _closest_command(cmd: str) -> str:
-    """
-    Returns best suggestion or "" if none.
-    cutoff:
-      - 0.62 is a good balance (not too spammy, still helpful)
-    """
-    matches = difflib.get_close_matches(cmd, KNOWN_COMMANDS, n=1, cutoff=0.62)
-    return matches[0] if matches else ""
-
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update or not update.message:
         return
 
     raw = update.message.text or ""
     cmd = _normalize_cmd(raw)
-
-    # Only respond to slash commands; ignore normal chat
     if not cmd:
         return
 
-    suggestion = _closest_command(cmd)
+    # Suggest closest command
+    matches = difflib.get_close_matches(cmd, KNOWN_COMMANDS, n=1, cutoff=0.62)
+    suggestion = matches[0] if matches else ""
 
     if suggestion:
         msg = (
@@ -2914,7 +2897,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True,
         )
     except Exception:
-        # Plain text fallback (never fails due to Markdown)
+        # plain text fallback
         if suggestion:
             await update.message.reply_text(
                 f"❌ Unknown command\n\nDid you mean: /{suggestion} ?\n\nType /help to see all commands."
@@ -6398,10 +6381,11 @@ def main():
     app.add_handler(CommandHandler("admin_grant", admin_grant_cmd))
     app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd))
     app.add_handler(CommandHandler("admin_payments", admin_payments_cmd))
-   
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-    app.add_handler(CommandHandler(None, unknown_command))
 
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    
+    # Catch-all for unknown /commands (MUST be after all CommandHandlers)
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
     # ================= JobQueue ================= #
     if app.job_queue:
