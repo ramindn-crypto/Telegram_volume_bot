@@ -1075,20 +1075,31 @@ def db_init():
     )
     """)
 
-    # optional: add columnsapp.add_handler(CommandHandler("email_decision", email_decision_cmd))
- to users if missing
+    # =========================================================
+    # Optional: add access tracking columns to users table
+    # =========================================================
     try:
         cur.execute("PRAGMA table_info(users)")
         user_cols = {r[1] for r in cur.fetchall()}
-        if "access_source" not in user_cols:
-            cur.execute("ALTER TABLE users ADD COLUMN access_source TEXT NOT NULL DEFAULT ''")
-        if "access_ref" not in user_cols:
-            cur.execute("ALTER TABLE users ADD COLUMN access_ref TEXT NOT NULL DEFAULT ''")
-        if "access_updated_ts" not in user_cols:
-            cur.execute("ALTER TABLE users ADD COLUMN access_updated_ts REAL NOT NULL DEFAULT 0")
-    except Exception:
-        pass
 
+        if "access_source" not in user_cols:
+            cur.execute(
+                "ALTER TABLE users ADD COLUMN access_source TEXT NOT NULL DEFAULT ''"
+            )
+
+        if "access_ref" not in user_cols:
+            cur.execute(
+                "ALTER TABLE users ADD COLUMN access_ref TEXT NOT NULL DEFAULT ''"
+            )
+
+        if "access_updated_ts" not in user_cols:
+            cur.execute(
+                "ALTER TABLE users ADD COLUMN access_updated_ts REAL NOT NULL DEFAULT 0"
+            )
+
+    except Exception:
+        # Do not block startup if ALTER TABLE fails
+        pass
    
     con.commit()
     con.close()
