@@ -35,6 +35,8 @@ import html
 import textwrap
 from telegram.constants import ParseMode
 
+import difflib
+
 import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -2782,6 +2784,121 @@ def in_session_now(user: dict) -> Optional[dict]:
             }
 
     return None
+
+
+
+# =========================================================
+# UNKNOWN COMMAND + "DID YOU MEAN" SUGGESTION (ALL USERS)
+# =========================================================
+
+# IMPORTANT:
+# - Keep this list aligned with HELP_TEXT + HELP_TEXT_ADMIN
+# - Commands are WITHOUT the leading "/"
+KNOWN_COMMANDS = sorted(set([
+    # Help
+    "help", "help_admin",
+
+    # Market scan
+    "screen",
+
+    # Position sizing / risk
+    "size", "riskmode", "dailycap",
+
+    # Trade journal & equity
+    "equity", "equity_reset",
+    "trade_open", "trade_sl", "trade_rf", "trade_close",
+
+    # Status
+    "status",
+
+    # Limits
+    "limits",
+
+    # Sessions
+    "sessions", "sessions_on", "sessions_off",
+
+    # Email alerts
+    "notify_on", "notify_off",
+    "trade_window",
+    "email_test", "email_decision",
+
+    # Cooldowns (user)
+    "cooldowns", "cooldown",
+
+    # Reports
+    "report_daily", "report_weekly", "report_overall",
+    "signals_daily", "signals_weekly",
+
+    # System health
+    "health", "health_sys",
+
+    # Timezone
+    "tz",
+
+    # Billing / plan / support
+    "myplan", "billing", "support",
+
+    # USDT user
+    "usdt", "usdt_paid",
+
+    # Admin cooldown controls
+    "cooldown_clear", "cooldown_clear_all",
+
+    # Admin data/recovery
+    "reset", "restore",
+
+    # USDT admin
+    "usdt_pending", "usdt_approve", "usdt_reject",
+
+    # Payments & access admin
+    "admin_user", "admin_users", "admin_payments",
+    "admin_grant", "admin_revoke",
+]))
+
+def _normalize_cmd(text: str) -> str:
+    """
+    Extract command name from Telegram message text:
+    - "/help" -> "help"
+    - "/help@MyBot" -> "help"
+    - "/size BTC long sl 42000" -> "size"
+    """
+    s = (text or "").strip()
+    if not s.startswith("/"):
+        return ""
+    s = s[1:]  # remove "/"
+    if " " in s:
+        s = s.split(" ", 1)[0]
+    if "@" in s:
+        s = s.split("@", 1)[0]
+    return s.lower()
+
+def _closest_command(cmd: str) -> str:
+    """
+    Returns best suggestion or "" if none.
+    cutoff:
+      - 0.62 is a good balance (not too spammy, still helpful)
+    """
+    matches = difflib.get_close_matches(cmd, KNOWN_COMMANDS, n=1, cutoff=0.62)
+    return matches[0] if matches else ""
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update or not update.message:
+        return
+
+    raw = update.message.text or ""
+    cmd = _normalize_cmd(raw)
+
+    # Only respond to slash commands; ignore normal chat
+    if not cmd:
+        return
+
+    suggestion = _closest_command(cmd)
+
+    if suggestion:
+        msg = (
+            "❌ *Unknown command*\n\n"
+            f"Did you
+
 
 # =========================================================
 # RISK
@@ -6257,6 +6374,8 @@ def main():
     app.add_handler(CommandHandler("admin_payments", admin_payments_cmd))
    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    application.add_handler(CommandHandler(None, unknown_command))
+
 
     # ================= JobQueue ================= #
     if app.job_queue:
