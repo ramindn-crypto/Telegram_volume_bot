@@ -3313,40 +3313,154 @@ PulseFutures
 
 
 # =========================================================
-# BILLING COMMANDS
+# BILLING COMMANDS (Stripe Payment Links + USDT)
 # =========================================================
-async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not enforce_access_or_block(update, "billing"):
-        return
-    user = get_user(update.effective_user.id)
-    email = user.get("email_to")
-    if not email:
-        await update.message.reply_text("❌ No email on file.")
-        return
 
-    await update.message.reply_text(
-        f"💳 Subscribe:\n\n"
-        f"Standard → {create_checkout_session(email, 'standard')}\n\n"
-        f"Pro → {create_checkout_session(email, 'pro')}"
+def _env(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    return (v or default).strip()
+
+def _mask_addr(addr: str) -> str:
+    a = (addr or "").strip()
+    if len(a) <= 14:
+        return a
+    return f"{a[:6]}…{a[-6:]}"
+
+async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Billing menu: Stripe Payment Links + USDT.
+    - Safe: uses env vars only for Stripe links (no Stripe API calls required)
+    - USDT address works with either USDT_ADDRESS or USDT_RECEIVE_ADDRESS
+    - Does NOT require email to show billing
+    """
+    user = update.effective_user
+    uid = user.id if user else None
+
+    # Stripe payment links (recommended)
+    stripe_standard_url = _env("STRIPE_STANDARD_URL")
+    stripe_pro_url = _env("STRIPE_PRO_URL")
+
+    # USDT config (support BOTH possible env names)
+    usdt_network = _env("USDT_NETWORK", "TRC20")
+    usdt_address = _env("USDT_ADDRESS") or _env("USDT_RECEIVE_ADDRESS")
+    usdt_note = _env("USDT_NOTE")  # optional
+
+    # Prices (optional – used for display only)
+    usdt_standard_price = _env("USDT_STANDARD_PRICE", "45")
+    usdt_pro_price = _env("USDT_PRO_PRICE", "99")
+
+    # Support (optional)
+    support_handle = _env("BILLING_SUPPORT_HANDLE", "@PulseFuturesSupport")
+
+    # Reference (helps you match tickets/payments)
+    ref = f"PF-{uid}" if uid else "PF-UNKNOWN"
+
+    lines = []
+    lines.append("💳 PulseFutures — Billing & Upgrade")
+    lines.append("")
+    lines.append("Choose your payment method below.")
+    lines.append(f"Reference (important): {ref}")
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("1) Stripe (Card / Apple Pay / Google Pay)")
+    lines.append("────────────────────")
+    if stripe_standard_url or stripe_pro_url:
+        lines.append("Tap a plan button to pay securely via Stripe.")
+    else:
+        lines.append("Stripe is not configured yet.")
+        lines.append("Admin: set STRIPE_STANDARD_URL / STRIPE_PRO_URL in Render env vars.")
+
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("2) USDT")
+    lines.append("────────────────────")
+    if usdt_address:
+        lines.append(f"Network: USDT ({usdt_network})")
+        lines.append(f"Address: {usdt_address}")
+        lines.append(f"(Short: {_mask_addr(usdt_address)})")
+        lines.append(f"Prices: Standard {usdt_standard_price} USDT • Pro {usdt_pro_price} USDT")
+        if usdt_note:
+            lines.append(f"Note: {usdt_note.replace('<REF>', ref)}")
+        else:
+            lines.append(f"Note: Use reference '{ref}' in your message to support if needed.")
+    else:
+        lines.append("USDT is not configured yet.")
+        lines.append("Admin: set USDT_ADDRESS or USDT_RECEIVE_ADDRESS in Render env vars.")
+        lines.append("Optional: set USDT_NETWORK (default TRC20).")
+
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("After payment")
+    lines.append("────────────────────")
+    lines.append("1) If Stripe: you’ll be activated automatically after confirmation.")
+    lines.append("2) If USDT: submit TXID using /usdt_paid <TXID> <standard|pro>.")
+    lines.append(f"Support: {support_handle}")
+    lines.append(f"Reference: {ref}")
+
+    msg = "\n".join(lines)
+
+    # Buttons (Stripe)
+    buttons = []
+    stripe_row = []
+    if stripe_standard_url:
+        stripe_row.append(InlineKeyboardButton("✅ Stripe — Standard", url=stripe_standard_url))
+    if stripe_pro_url:
+        stripe_row.append(InlineKeyboardButton("🚀 Stripe — Pro", url=stripe_pro_url))
+    if stripe_row:
+        buttons.append(stripe_row)
+
+    howto_url = _env("BILLING_HOWTO_URL")
+    if howto_url:
+        buttons.append([InlineKeyboardButton("ℹ️ Payment Instructions", url=howto_url)])
+
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+
+    await send_long_message(
+        update,
+        msg,
+        parse_mode=None,
+        disable_web_page_preview=True,
+        reply_markup=reply_markup,
     )
 
 
 async def manage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Stripe customer portal link (if you have it).
+    If you are using Payment Links only and not portal, keep as-is or disable this command.
+    """
     user = get_user(update.effective_user.id)
-    if user["plan"] not in ("standard", "pro"):
+    if user.get("plan") not in ("standard", "pro"):
         await update.message.reply_text("No active subscription.")
         return
-    await update.message.reply_text(
-        create_customer_portal(user["email_to"])
-    )
+
+    # If you still use Stripe Customer Portal:
+    if user.get("email_to"):
+        await update.message.reply_text(create_customer_portal(user["email_to"]))
+        return
+
+    await update.message.reply_text("❌ No email on file for subscription management.")
 
 
 async def myplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
     status = "ACTIVE" if has_active_access(user) else "LOCKED"
-    await update.message.reply_text(
-        f"Plan: {user['plan'].upper()}\nStatus: {status}"
-    )
+
+    plan = (user.get("plan") or "free").upper()
+    src = (user.get("access_source") or "").strip()
+    if src:
+        src = src.upper()
+
+    msg = f"Plan: {plan}\nStatus: {status}"
+    if src:
+        msg += f"\nSource: {src}"
+
+    await update.message.reply_text(msg)
+
+
+# =========================================================
+# Table Format
+# =========================================================
 
 def _format_help_table(rows, col_cmd=16, col_what=46, col_ex=28) -> str:
     """
