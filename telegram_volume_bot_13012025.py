@@ -251,6 +251,21 @@ SESSION_SYMBOL_COOLDOWN_HOURS = {
 # Fallback if session unknown
 SYMBOL_COOLDOWN_HOURS = 4
 
+# =========================================================
+# WIN-RATE FILTERS (stricter = fewer signals, higher quality)
+# =========================================================
+
+# 1) Flip-Guard: prevents opposite-direction alerts for same symbol for a period
+# Example: SELL then BUY within 2 hours => BUY is blocked (and vice-versa)
+FLIP_GUARD_ENABLED = True
+FLIP_GUARD_MULT = 1.0  # 1.0 = same as session cooldown hours; try 1.5–2.0 to be stricter
+
+# 2) Higher-TF alignment: require 1H + 4H momentum to agree with the signal direction
+TF_ALIGN_ENABLED = True
+TF_ALIGN_1H_MIN_ABS = 0.5   # percent
+TF_ALIGN_4H_MIN_ABS = 0.5   # percent
+
+
 def cooldown_hours_for_session(session_name: str) -> int:
     s = (session_name or "").strip().upper()
     return int(SESSION_SYMBOL_COOLDOWN_HOURS.get(s, SYMBOL_COOLDOWN_HOURS))
@@ -1018,6 +1033,51 @@ def symbol_recently_emailed(
 
     last_ts = float(row["emailed_ts"])
     return (time.time() - last_ts) < (cooldown_hours * 3600.0)
+
+def _safe_float(x, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        s = str(x).strip()
+        if s == "" or s == "-" or s.lower() == "none":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+
+def symbol_flip_guard_active(
+    user_id: int,
+    symbol: str,
+    side: str,
+    session_name: str,
+) -> bool:
+    """
+    Blocks opposite-direction alerts for the same symbol for a period.
+    Uses (session cooldown hours * FLIP_GUARD_MULT).
+    """
+    if not FLIP_GUARD_ENABLED:
+        return False
+
+    cooldown_hours = float(cooldown_hours_for_session(session_name)) * float(FLIP_GUARD_MULT)
+    opposite = "SELL" if str(side).upper() == "BUY" else "BUY"
+
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT emailed_ts
+        FROM emailed_symbols
+        WHERE user_id=? AND symbol=? AND side=?
+    """, (int(user_id), str(symbol).upper(), opposite))
+    row = cur.fetchone()
+    con.close()
+
+    if not row:
+        return False
+
+    last_ts = float(row["emailed_ts"])
+    return (time.time() - last_ts) < (cooldown_hours * 3600.0)
+
 
 
 def list_cooldowns(user_id: int) -> List[dict]:
@@ -4157,11 +4217,31 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if rr3 < min_rr:
                     skip_reasons_counter["below_session_rr_floor"] += 1
                     continue
-
-                # ✅ Symbol cooldown (direction-aware + session-aware)
+        
+                # Higher timeframe alignment (win-rate filter)
+                if TF_ALIGN_ENABLED:
+                    ch1 = _safe_float(getattr(s, "ch1", 0.0), 0.0)
+                    ch4 = _safe_float(getattr(s, "ch4", 0.0), 0.0)
+                
+                    if s.side == "BUY":
+                        if ch1 < TF_ALIGN_1H_MIN_ABS or ch4 < TF_ALIGN_4H_MIN_ABS:
+                            skip_reasons_counter["tf_align_fail_buy_1h4h"] += 1
+                            continue
+                    else:  # SELL
+                        if ch1 > -TF_ALIGN_1H_MIN_ABS or ch4 > -TF_ALIGN_4H_MIN_ABS:
+                            skip_reasons_counter["tf_align_fail_sell_1h4h"] += 1
+                            continue
+                
+                # Flip-Guard: block opposite direction flips within cooldown window
+                if symbol_flip_guard_active(uid, s.symbol, s.side, sess["name"]):
+                    skip_reasons_counter["symbol_flip_guard_active"] += 1
+                    continue
+                
+                # Symbol cooldown (direction-aware + session-aware) — blocks same direction repeats
                 if symbol_recently_emailed(uid, s.symbol, s.side, sess["name"]):
                     skip_reasons_counter["symbol_cooldown_active"] += 1
                     continue
+
 
                 is_confirm_15m = abs(float(s.ch15)) >= CONFIRM_15M_ABS_MIN
 
