@@ -4485,13 +4485,22 @@ async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- Remaining today: ∞"
     )
 
+
 async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+
+    # Ensure daily reset happens before any risk math
+    user = reset_daily_if_needed(get_user(uid))
+
     if not context.args:
         await update.message.reply_text("Usage: /trade_rf <TRADE_ID>")
         return
 
-    trade_id = int(context.args[0])
+    try:
+        trade_id = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Usage: /trade_rf <TRADE_ID>")
+        return
 
     con = db_connect()
     cur = con.cursor()
@@ -4509,23 +4518,72 @@ async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entry = float(t["entry"])
     old_risk = float(t["risk_usd"])
 
+    # If already risk-free, don't release again
+    if old_risk <= 1e-9:
+        con.close()
+        cap = daily_cap_usd(user)
+        day_local = _user_day_local(user)
+        used_today = _risk_daily_get(uid, day_local)
+        remaining_today = (cap - used_today) if cap > 0 else float("inf")
+
+        await update.message.reply_text(
+            f"✅ Trade is already Risk-Free\n"
+            f"- Trade ID: {trade_id}\n"
+            f"- SL is already at Entry\n\n"
+            f"📌 Daily Risk\n"
+            f"- Cap: ≈ ${cap:.2f}\n"
+            f"- Used today: ${used_today:.2f}\n"
+            f"- Remaining today: ${max(0.0, remaining_today):.2f}" if cap > 0 else
+            f"📌 Daily Risk\n"
+            f"- Cap: ≈ ${cap:.2f}\n"
+            f"- Used today: ${used_today:.2f}\n"
+            f"- Remaining today: ∞"
+        )
+        return
+
+    # Move SL to entry and set trade risk to 0
     cur.execute(
-        "UPDATE trades SET sl=?, risk_usd=? WHERE id=?",
-        (entry, 0.0, trade_id),
+        "UPDATE trades SET sl=?, risk_usd=? WHERE id=? AND user_id=?",
+        (entry, 0.0, trade_id, uid),
     )
     con.commit()
     con.close()
 
-    # ✅ Risk Free of the Day
-    day_local = _user_day_local(get_user(uid))
+    # Release today's risk immediately
+    day_local = _user_day_local(user)
     _risk_daily_inc(uid, day_local, -old_risk)
 
+    # Clamp used risk to 0 if it went negative (edge cases)
+    used_now = _risk_daily_get(uid, day_local)
+    if used_now < 0:
+        con2 = db_connect()
+        cur2 = con2.cursor()
+        cur2.execute(
+            "UPDATE risk_daily SET used_risk_usd=? WHERE user_id=? AND day_local=?",
+            (0.0, uid, day_local),
+        )
+        con2.commit()
+        con2.close()
+        used_now = 0.0
+
+    cap = daily_cap_usd(user)
+    remaining_today = (cap - used_now) if cap > 0 else float("inf")
+
     await update.message.reply_text(
-        f"🟢 Trade Risk-Free\n"
+        f"✅ Trade Risk-Free\n"
         f"- Trade ID: {trade_id}\n"
         f"- SL moved to Entry\n"
-        f"- Released Risk: ${old_risk:.2f}"
+        f"- Released Risk: ${old_risk:.2f}\n\n"
+        f"📌 Daily Risk (updated)\n"
+        f"- Cap: ≈ ${cap:.2f}\n"
+        f"- Used today: ${used_now:.2f}\n"
+        f"- Remaining today: ${max(0.0, remaining_today):.2f}" if cap > 0 else
+        f"📌 Daily Risk (updated)\n"
+        f"- Cap: ≈ ${cap:.2f}\n"
+        f"- Used today: ${used_now:.2f}\n"
+        f"- Remaining today: ∞"
     )
+
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
