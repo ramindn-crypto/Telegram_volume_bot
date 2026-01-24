@@ -5103,8 +5103,11 @@ def trend_dynamic_confidence(base_conf, price, ema_fast_last, atr_15m, ch24_pct,
     score += min(10, abs(ch24_pct) / 2)
     return int(min(score, TREND_MAX_CONFIDENCE))
 
+
+# =====================================================================
 def trend_watch_for_symbol(base, mv, session_name):
     try:
+
         c4h = fetch_ohlcv(mv.symbol, "4h", 60)
         c15 = fetch_ohlcv(mv.symbol, "15m", 140)
         if not c4h or not c15 or len(c15) < 40:
@@ -5135,31 +5138,233 @@ def trend_watch_for_symbol(base, mv, session_name):
                 return None
             if ema_slope(ema_fast, 3) <= 0:
                 return None
+
+            # pullback touch or near-touch
+            last = closes_15[-1]
+            near = abs(last - ema_fast[-1]) / last * 100.0
+            if near > 1.2:
+                return None
+
         else:
             if not (ema_fast[-1] < ema_slow[-1]):
                 return None
             if ema_slope(ema_fast, 3) >= 0:
                 return None
 
-        dist_atr = abs(price - ema_fast[-1]) / atr_15m if atr_15m > 0 else 999
-        if dist_atr > TREND_EMA_PULLBACK_ATR:
-            return None
+            last = closes_15[-1]
+            near = abs(last - ema_fast[-1]) / last * 100.0
+            if near > 1.2:
+                return None
 
-        reclaimed = False
-        if side == "BUY":
-            reclaimed = closes_15[-2] < ema_fast[-2] and price > ema_fast[-1]
-        else:
-            reclaimed = closes_15[-2] > ema_fast[-2] and price < ema_fast[-1]
+        conf = 80
+        # session boost (optional)
+        if session_name == "NY":
+            conf += 5
+        elif session_name == "LON":
+            conf += 2
 
-        fut_vol = usd_notional(mv)
-        base_conf = 55 + (15 if fut_vol >= MOVER_VOL_USD_MIN else 0)
-
-        conf = trend_dynamic_confidence(base_conf, price, ema_fast[-1], atr_15m, ch24, reclaimed)
-
-        return {"symbol": base, "side": side, "confidence": conf, "ch24": ch24}
+        return {
+            "symbol": base,
+            "side": side,
+            "conf": int(clamp(conf, 1, 99)),
+            "ch24": float(ch24),
+        }
 
     except Exception:
         return None
+
+
+# =========================================================
+# PRIORITY SIGNAL POOL (USED BY /screen AND EMAIL)
+# Directional Leaders/Losers → Trend Continuation Watch → Waiting for Trigger → Market Leaders
+# =========================================================
+
+def _bases_from_directional(rows, n):
+    out = []
+    for r in (rows or [])[:n]:
+        try:
+            out.append(str(r[0]).upper())
+        except Exception:
+            continue
+    return out
+
+def _subset_best(best_fut: dict, bases: list) -> dict:
+    s = set([str(b).upper() for b in (bases or [])])
+    return {k: v for k, v in (best_fut or {}).items() if str(k).upper() in s}
+
+def _market_leader_bases(best_fut: dict, n: int) -> list:
+    try:
+        items = [(b, mv) for b, mv in (best_fut or {}).items()]
+        items = sorted(items, key=lambda x: float(getattr(x[1], "fut_vol_usd", 0.0) or 0.0), reverse=True)
+        return [str(b).upper() for b, _ in items[:n]]
+    except Exception:
+        return []
+
+async def build_priority_pool(best_fut: dict, session_name: str, mode: str) -> dict:
+    """
+    mode: "screen" or "email"
+    returns: { "setups": [Setup...], "waiting": [(base, info_dict)...], "trend_watch": [dict...] }
+    """
+
+    # knobs
+    if mode == "screen":
+        n_target = int(SETUPS_N)
+        strict_15m = False
+        universe_cap = int(SCREEN_UNIVERSE_N)
+        trigger_loosen = float(SCREEN_TRIGGER_LOOSEN)
+        waiting_near = float(SCREEN_WAITING_NEAR_PCT)
+        allow_no_pullback = True
+        scan_multiplier = 10
+        directional_take = 12
+        market_take = 15
+        trend_take = 12
+    else:  # email
+        n_target = int(max(EMAIL_SETUPS_N * 3, 9))
+        strict_15m = True
+        universe_cap = 35
+        trigger_loosen = 1.0
+        waiting_near = float(SCREEN_WAITING_NEAR_PCT)
+        allow_no_pullback = False
+        scan_multiplier = 10
+        directional_take = 12
+        market_take = 15
+        trend_take = 12
+
+    # 1) Directional leaders / losers (priority #1)
+    up_list, dn_list = compute_directional_lists(best_fut)
+    leaders = _bases_from_directional(up_list, directional_take)
+    losers  = _bases_from_directional(dn_list, directional_take)
+
+    priority_setups = []
+
+    if leaders:
+        sub = _subset_best(best_fut, leaders)
+        try:
+            tmp = await asyncio.to_thread(
+                pick_setups,
+                sub,
+                n_target * scan_multiplier,
+                strict_15m,
+                session_name,
+                min(int(universe_cap), len(sub) if sub else universe_cap),
+                trigger_loosen,
+                waiting_near,
+                allow_no_pullback,
+            )
+        except Exception:
+            tmp = []
+        for s in tmp or []:
+            if s.side == "BUY":
+                priority_setups.append(s)
+
+    if losers:
+        sub = _subset_best(best_fut, losers)
+        try:
+            tmp = await asyncio.to_thread(
+                pick_setups,
+                sub,
+                n_target * scan_multiplier,
+                strict_15m,
+                session_name,
+                min(int(universe_cap), len(sub) if sub else universe_cap),
+                trigger_loosen,
+                waiting_near,
+                allow_no_pullback,
+            )
+        except Exception:
+            tmp = []
+        for s in tmp or []:
+            if s.side == "SELL":
+                priority_setups.append(s)
+
+    # 2) Trend continuation watch (priority #2)
+    # same universe used by /screen: top 6 leaders + top 6 losers
+    watch_bases = []
+    watch_bases.extend([b for b in leaders[:6]])
+    watch_bases.extend([b for b in losers[:6]])
+    watch_bases = list(dict.fromkeys([b.upper() for b in watch_bases]))
+
+    trend_watch = []
+    trend_bases = []
+    for base in watch_bases:
+        mv = (best_fut or {}).get(base)
+        if not mv:
+            continue
+        r = await asyncio.to_thread(trend_watch_for_symbol, base, mv, session_name)
+        if r:
+            trend_watch.append(r)
+            trend_bases.append(base)
+
+    if trend_bases:
+        sub = _subset_best(best_fut, trend_bases[:trend_take])
+        try:
+            tmp = await asyncio.to_thread(
+                pick_setups,
+                sub,
+                n_target * scan_multiplier,
+                strict_15m,
+                session_name,
+                min(int(universe_cap), len(sub) if sub else universe_cap),
+                trigger_loosen,
+                waiting_near,
+                True if mode == "screen" else True,  # allow trend continuation to pass even on email
+            )
+        except Exception:
+            tmp = []
+
+        side_map = {str(t.get("symbol")).upper(): str(t.get("side")) for t in (trend_watch or []) if t.get("symbol")}
+        for s in tmp or []:
+            want = side_map.get(str(s.symbol).upper())
+            if want and s.side == want:
+                priority_setups.append(s)
+
+    # 3) Waiting for Trigger (priority #3) is produced by pick_setups via _WAITING_TRIGGER
+    waiting_items = []
+    try:
+        if _WAITING_TRIGGER:
+            waiting_items = list(_WAITING_TRIGGER.items())[:SCREEN_WAITING_N]
+    except Exception:
+        waiting_items = []
+
+    # 4) Market leaders fallback (priority #4)
+    if len(priority_setups) < (n_target * 2):
+        market_bases = _market_leader_bases(best_fut, market_take)
+        if market_bases:
+            sub = _subset_best(best_fut, market_bases)
+            try:
+                tmp = await asyncio.to_thread(
+                    pick_setups,
+                    sub,
+                    n_target * scan_multiplier,
+                    strict_15m,
+                    session_name,
+                    min(int(universe_cap), len(sub) if sub else universe_cap),
+                    trigger_loosen,
+                    waiting_near,
+                    allow_no_pullback,
+                )
+            except Exception:
+                tmp = []
+            priority_setups.extend(tmp or [])
+
+    # de-dupe by (symbol, side) keeping highest conf, preserving priority order
+    best = {}
+    for s in priority_setups:
+        k = (str(s.symbol).upper(), str(s.side))
+        if k not in best or int(s.conf) > int(best[k].conf):
+            best[k] = s
+
+    ordered = []
+    seen = set()
+    for s in priority_setups:
+        k = (str(s.symbol).upper(), str(s.side))
+        if k in seen:
+            continue
+        if k in best:
+            ordered.append(best[k])
+            seen.add(k)
+
+    return {"setups": ordered, "waiting": waiting_items, "trend_watch": trend_watch}
 
 # =========================================================
 # User location/time helpers (TZ -> City/Country label)
@@ -5207,11 +5412,7 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     return up_txt, dn_txt
 
 # =========================================================
-# ✅ MODIFIED: /screen — Premium Telegram UI
-# Changes:
-# 1) Header shows USER city/location + time (not Melbourne hardcoded)
-# 2) Under each signal: remove "Pullback" word + remove pullback line
-# 3) Directional Leaders/Losers titles handled in movers_tables() above
+# screen 
 # =========================================================
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -5238,21 +5439,12 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{HDR}\n"
             f"🧠 *Session:* `{session}`   |   📍 *{loc_label}:* `{loc_time}`\n"
         )
-
+      
         # -------------------------------------------------
-        # Main setups (screen-loosened rules)
+        # Main setups (PRIORITY: leaders/losers → trend watch → waiting → market leaders)
         # -------------------------------------------------
-        setups = await asyncio.to_thread(
-            pick_setups,
-            best_fut,
-            SETUPS_N,
-            False,                 # strict_15m = False for screen UX
-            session,
-            SCREEN_UNIVERSE_N,
-            SCREEN_TRIGGER_LOOSEN,
-            SCREEN_WAITING_NEAR_PCT,
-            True,                  # allow_no_pullback for screen awareness
-        )
+        pool = await build_priority_pool(best_fut, session, mode="screen")
+        setups = (pool.get("setups") or [])[:SETUPS_N]
 
         for s in setups:
             db_insert_signal(s)
@@ -5429,11 +5621,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # =========================================================
-# ✅ MODIFIED: EMAIL BODY
-# Changes:
-# 4) TP3 Mode: Trailing only when setup.is_trailing_tp3 True (now engine B + hot)
-# 5) Header includes user City/Country + time (same as /screen)
-# 6) Setup ID is shown as "ID-<id>"
+# EMAIL BODY
 # =========================================================
 def _email_body_pretty(
     session_name: str,
@@ -5508,7 +5696,6 @@ def _email_body_pretty(
 
     return "\n".join(parts).strip()
 
-
 # =========================================================
 # STRIPE WEBHOOK SERVER
 # =========================================================
@@ -5558,14 +5745,11 @@ class StripeWebhookHandler(BaseHTTPRequestHandler):
             if email:
                 downgrade_user_with_ledger_by_email(email, ref=ref)
 
-
         self.send_response(200)
         self.end_headers()
 
-
 def start_stripe_webhook():
     HTTPServer(("0.0.0.0", 4242), StripeWebhookHandler).serve_forever()
-
 
 # =========================================================
 # MY PLSN & BILLING
@@ -5693,8 +5877,6 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup,
     )
 
-
-
 def activate_user_with_ledger_by_email(email: str, plan: str, ref: str, amount: float = 0, currency: str = "USD"):
     """
     Activates user by email AND records payment in ledger.
@@ -5722,7 +5904,6 @@ def activate_user_with_ledger_by_email(email: str, plan: str, ref: str, amount: 
         status="paid",
     )
 
-
 def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
     user = get_user_by_email(email)
     if not user:
@@ -5732,7 +5913,6 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 
     downgrade_user_by_email(email)
     _set_user_access(user_id, "free", "stripe", ref)
-
 
 # =========================================================
 # EMAIL JOB
@@ -5757,25 +5937,16 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not best_fut:
             return
 
-        # ✅ Build setups per session (session-aware engine knobs)
+        #   Build setups per session (PRIORITY: leaders/losers → trend watch → waiting → market leaders)
         setups_by_session: Dict[str, List[Setup]] = {}
         for sess_name in ["NY", "LON", "ASIA"]:
-            setups = await asyncio.to_thread(
-                pick_setups,
-                best_fut,
-                max(EMAIL_SETUPS_N * 3, 9),
-                True,                 # strict_15m for email
-                sess_name,
-                35,                   # email universe
-                1.0,                  # no trigger loosen for email
-                SCREEN_WAITING_NEAR_PCT,
-                False,                # ✅ allow_no_pullback = False for EMAIL
-            )
+            pool = await build_priority_pool(best_fut, sess_name, mode="email")
+            setups = pool.get("setups", [])[:max(EMAIL_SETUPS_N * 3, 9)]
 
             setups_by_session[sess_name] = setups
             for s in setups:
                 db_insert_signal(s)
-
+        
         # Per-user send / skip logic
         for user in users:
             uid = int(user["user_id"])
