@@ -5414,10 +5414,10 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
 # =========================================================
 # screen 
 # =========================================================
+
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await update.message.reply_text("⏳ Scanning market… Please wait")
-
+        await update.message.reply_text("🔎 Scanning market… Please wait")
         reset_reject_tracker()
 
         best_fut = await asyncio.to_thread(fetch_futures_tickers)
@@ -5425,71 +5425,66 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Failed to fetch futures data.")
             return
 
-        # -------------------------------------------------
-        # Header / session + user location/time
-        # -------------------------------------------------
         uid = update.effective_user.id
         user = get_user(uid)
-
         session = current_session_utc()
-
         loc_label, loc_time = user_location_and_time(user)
+
         header = (
-            f"✨ *PulseFutures — Market Scan*\n"
+            f"*PulseFutures — Market Scan*\n"
             f"{HDR}\n"
-            f"🧠 *Session:* `{session}`   |   📍 *{loc_label}:* `{loc_time}`\n"
+            f"*Session:* `{session}` | *{loc_label}:* `{loc_time}`\n"
         )
-      
-        # -------------------------------------------------
-        # Main setups (PRIORITY: leaders/losers → trend watch → waiting → market leaders)
-        # -------------------------------------------------
+
         pool = await build_priority_pool(best_fut, session, mode="screen")
         setups = (pool.get("setups") or [])[:SETUPS_N]
 
         for s in setups:
+            if not hasattr(s, "conf") or s.conf is None:
+                s.conf = 0
             db_insert_signal(s)
 
-        # -------------------------------------------------
-        # Setup cards
-        # -------------------------------------------------
-        if setups:
-            cards = []
-            for i, s in enumerate(setups, 1):
-                side_emoji = "🟢" if s.side == "BUY" else "🔴"
+        if not setups:
+            await update.message.reply_text(header + "\n_No valid setups found._", parse_mode="Markdown")
+            return
 
-                # ✅ remove "Pullback" word
-                engine_tag = "⚡️ Momentum" if s.engine == "B" else "🎯 Mean-Reversion"
+        cards = []
+        for i, s in enumerate(setups, 1):
+            side_emoji = "🟢" if s.side == "BUY" else "🔴"
+            engine_tag = "Momentum" if s.engine == "B" else "Mean-Reversion"
+            rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
 
-                rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+            tp_line = (
+                f"*TP1:* `{fmt_price(s.tp1)}` | "
+                f"*TP2:* `{fmt_price(s.tp2)}` | "
+                f"*TP3:* `{fmt_price(s.tp3)}`"
+                if s.tp1 and s.tp2
+                else f"*TP:* `{fmt_price(s.tp3)}`"
+            )
 
-                tp_line = (
-                    f"*TP1:* `{fmt_price(s.tp1)}`  |  "
-                    f"*TP2:* `{fmt_price(s.tp2)}`  |  "
-                    f"*TP3:* `{fmt_price(s.tp3)}`"
-                    if s.tp1 and s.tp2
-                    else f"*TP:* `{fmt_price(s.tp3)}`"
-                )
+            cards.append(
+                f"╭──────────────╮\n"
+                f"*#{i}* {side_emoji} *{s.side}* — *{s.symbol}*\n"
+                f"╰──────────────╯\n"
+                f"`{s.setup_id}` | *Conf:* `{int(s.conf)}`\n"
+                f"{engine_tag} | *RR(TP3):* `{rr3:.2f}`\n"
+                f"*Entry:* `{fmt_price(s.entry)}` | *SL:* `{fmt_price(s.sl)}`\n"
+                f"{tp_line}\n"
+                f"*Moves:* 24H {pct_with_emoji(s.ch24)} • "
+                f"4H {pct_with_emoji(s.ch4)} • "
+                f"1H {pct_with_emoji(s.ch1)} • "
+                f"15m {pct_with_emoji(s.ch15)}\n"
+                f"*Volume:* `~{fmt_money(s.fut_vol_usd)}`\n"
+                f"*Chart:* {tv_chart_url(s.symbol)}"
+            )
 
-                # ✅ remove pullback block entirely
-                cards.append(
-                    f"╭──────────────╮\n"
-                    f"*#{i}* {side_emoji} *{s.side}* — *{s.symbol}*\n"
-                    f"╰──────────────╯\n"
-                    f"🆔 `{s.setup_id}`  |  *Conf:* `{s.conf}`\n"
-                    f"{engine_tag}  |  *RR(TP3):* `{rr3:.2f}`\n"
-                    f"💰 *Entry:* `{fmt_price(s.entry)}`   |   🛑 *SL:* `{fmt_price(s.sl)}`\n"
-                    f"🎯 {tp_line}\n"
-                    f"📈 *Moves:* 24H {pct_with_emoji(s.ch24)}  •  "
-                    f"4H {pct_with_emoji(s.ch4)}  •  "
-                    f"1H {pct_with_emoji(s.ch1)}  •  "
-                    f"15m {pct_with_emoji(s.ch15)}\n"
-                    f"💧 *Volume:* `~{fmt_money(s.fut_vol_usd)}`\n"
-                    f"🔗 *Chart:* {tv_chart_url(s.symbol)}"
-                )
+        text = header + "\n\n" + "\n\n".join(cards)
+        await safe_send(update, text, parse_mode="Markdown")
 
-            setups_txt = "\n\n".join(cards)
-        else:
-            setups_txt = "_No high-quality setups right now._"
+    except Exception as e:
+        logger.exception("screen_cmd failed")
+        await update.message.reply_text(f"⚠️ /screen failed: {e}")
+
 
         # -------------------------------------------------
         # Waiting for trigger (near-miss)
