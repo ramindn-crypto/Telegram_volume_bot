@@ -5479,7 +5479,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         text = header + "\n\n" + "\n\n".join(cards)
-        await safe_send(update, text, parse_mode="Markdown")
+        await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
 
     except Exception as e:
         logger.exception("screen_cmd failed")
@@ -5523,7 +5523,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if trend_watch:
             lines = ["📊 *Trend Continuation Watch*", SEP]
-            for t in sorted(trend_watch, key=lambda x: x["confidence"], reverse=True)[:6]:
+            for t in sorted(trend_watch, key=lambda x: x.get("conf", 0), reverse=True)[:6]:
                 side_emoji = "🟢" if t["side"] == "BUY" else "🔴"
                 lines.append(
                     f"• *{t['symbol']}* {side_emoji} `{t['side']}`  |  "
