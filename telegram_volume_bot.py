@@ -4357,8 +4357,30 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tokens = raw.split()
+    
+    # -------------------------------------------------
+    # REQUIRED POSITIONAL ARGS
+    # -------------------------------------------------
+    if len(tokens) < 4:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/size <SYMBOL> <long|short> entry <PRICE> sl <STOP>\n"
+            "Optional: risk <usd|pct> <VALUE> (default: 1.5%)"
+        )
+        return
+    
+    symbol = re.sub(r"[^A-Za-z0-9]", "", tokens[0]).upper()
+    direction = tokens[1].lower()
+    
+    if direction not in ("long", "short"):
+        await update.message.reply_text("Second argument must be long or short.")
+        return
+    
+    # Strip positional args BEFORE keyword parsing
+    tokens = tokens[2:]
+
     # STRICT: reject unknown tokens (prevents silent fallback to live price on typos like "entrt")
-    allowed = {"sl", "entry", "risk", "usd", "pct", "long", "short"}
+    allowed = {"sl", "entry", "risk", "usd", "pct"}
     unknown = []
     for t in tokens:
         tt = str(t).strip().lower()
@@ -4374,7 +4396,6 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             unknown.append(tt)
 
     if unknown:
-        # common hint for entry typos
         hint = ""
         u0 = unknown[0]
         if u0.startswith("entr") and u0 != "entry":
@@ -4382,67 +4403,71 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Invalid /size syntax.\n\n"
             f"Unknown keyword(s): {', '.join(unknown)}{hint}\n\n"
-            "Use:\n/size <SYMBOL> <long|short> sl <STOP> [entry <ENTRY>] [risk <usd|pct> <VALUE>]\n"
-            "Example:\n/size BTC long sl 42000 entry 43000 risk usd 40"
+            "Use:\n/size <SYMBOL> <long|short> entry <ENTRY> sl <STOP> [risk <usd|pct> <VALUE>]\n"
+            "Example:\n/size BTC long entry 43000 sl 42000 risk usd 40"
         )
         return
 
-    if len(tokens) < 4:
-        await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: risk pct 2 | risk usd 40 | entry 43000)")
-        return
-
-    sym = re.sub(r"[^A-Za-z0-9]", "", tokens[0]).upper()
-    direction = tokens[1].lower()
-    if direction not in {"long", "short"}:
-        await update.message.reply_text("Second arg must be long or short.")
-        return
+    # -------------------------------------------------
+    # KEYWORD PARSING (entry + sl REQUIRED)
+    # -------------------------------------------------
     side = "BUY" if direction == "long" else "SELL"
-
-    if "sl" not in tokens:
-        await update.message.reply_text("Missing SL. Example: /size BTC long sl 42000")
-        return
-    try:
-        sl_i = tokens.index("sl")
-        sl = float(tokens[sl_i + 1])
-    except Exception:
-        await update.message.reply_text("Bad SL format. Example: /size BTC long sl 42000")
-        return
+    sym = symbol  # <- use the original parsed symbol (positional)
 
     entry = None
-    if "entry" in tokens:
-        try:
-            e_i = tokens.index("entry")
-            entry = float(tokens[e_i + 1])
-        except Exception:
-            await update.message.reply_text("Bad entry format. Example: entry 43000")
-            return
+    sl = None
 
-    risk_mode = None
-    risk_val = None
-    if "risk" in tokens:
-        try:
-            r_i = tokens.index("risk")
-            risk_mode = tokens[r_i + 1].upper()
-            risk_val = float(tokens[r_i + 2])
-        except Exception:
-            await update.message.reply_text("Bad risk format. Example: risk pct 2  OR  risk usd 40")
-            return
-        if risk_mode not in {"USD", "PCT"}:
-            await update.message.reply_text("risk mode must be usd or pct")
-            return
-    else:
-        # Use user's configured defaults
-        risk_mode = str(user.get("risk_mode", "PCT")).upper()
-        risk_val = float(user.get("risk_value", DEFAULT_RISK_VALUE))
+    risk_mode = "PCT"
+    risk_val = 1.5  # <- DEFAULT: 1.5% of equity if user does not provide risk
 
-    if entry is None:
-        best = await asyncio.to_thread(fetch_futures_tickers)
-        mv = best.get(sym)
-        if not mv or float(mv.last or 0) <= 0:
-            await update.message.reply_text(f"Could not fetch price for {sym}. Provide entry manually: entry 43000")
-            return
-        entry = float(mv.last)
+    i = 0
+    while i < len(tokens):
+        t = tokens[i].lower()
 
+        if t == "entry" and i + 1 < len(tokens):
+            try:
+                entry = float(tokens[i + 1])
+            except Exception:
+                await update.message.reply_text("Bad entry format. Example: entry 43000")
+                return
+            i += 2
+            continue
+
+        if t == "sl" and i + 1 < len(tokens):
+            try:
+                sl = float(tokens[i + 1])
+            except Exception:
+                await update.message.reply_text("Bad SL format. Example: sl 42000")
+                return
+            i += 2
+            continue
+
+        if t == "risk" and i + 2 < len(tokens):
+            rm = tokens[i + 1].lower()
+            if rm not in ("usd", "pct"):
+                await update.message.reply_text("Bad risk format. Use: risk pct 2  OR  risk usd 40")
+                return
+            try:
+                rv = float(tokens[i + 2])
+            except Exception:
+                await update.message.reply_text("Bad risk format. Use: risk pct 2  OR  risk usd 40")
+                return
+            risk_mode = rm.upper()
+            risk_val = rv
+            i += 3
+            continue
+
+        await update.message.reply_text(f"❌ Invalid keyword: {tokens[i]}")
+        return
+
+    # entry + sl are mandatory (as you requested)
+    if entry is None or sl is None:
+        await update.message.reply_text(
+            "❌ Missing entry or SL.\n"
+            "Use:\n/size <SYMBOL> <long|short> entry <ENTRY> sl <STOP>\n"
+            "Example:\n/size EUL long entry 2.46 sl 2.26"
+        )
+        return
 
     # --- Entry sanity check vs live price (warn only; does not block /size) ---
     try:
