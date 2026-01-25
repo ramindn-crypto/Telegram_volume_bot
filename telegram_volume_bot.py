@@ -6035,6 +6035,41 @@ def _email_body_pretty(
 
     return "\n".join(parts).strip()
 
+def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut) -> bool:
+    """
+    One email containing multiple setups.
+    Requires _email_body_pretty(...) and send_email(...).
+    """
+    if not setups:
+        return False
+
+    uid = int(user["user_id"])
+    user_tz = str(user.get("tz") or "UTC")
+    try:
+        tz = ZoneInfo(user_tz)
+    except Exception:
+        tz = timezone.utc
+        user_tz = "UTC"
+
+    now_local = datetime.now(tz)
+
+    first = setups[0]
+    subject = f"PulseFutures • {sess['name']} • {first.side} {first.symbol}"
+    if len(setups) > 1:
+        subject += f" (+{len(setups)-1} more)"
+
+    body = _email_body_pretty(
+        session_name=str(sess["name"]),
+        now_local=now_local,
+        user_tz=user_tz,
+        setups=setups,
+        best_fut=best_fut,
+    )
+
+    return send_email(subject, body, user_id_for_debug=uid)
+
+
+
 # =========================================================
 # STRIPE WEBHOOK SERVER
 # =========================================================
@@ -6091,7 +6126,7 @@ def start_stripe_webhook():
     HTTPServer(("0.0.0.0", 4242), StripeWebhookHandler).serve_forever()
 
 # =========================================================
-# MY PLSN & BILLING
+# MY PLAN & BILLING
 # =========================================================
 
 async def myplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6449,37 +6484,66 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
-
-            # Enforce cooldown-style duplicate suppression per user
-            chosen = None
+          
+            # Enforce cooldown + flip-guard suppression per user (direction/session-aware)
+            chosen_list: List[Setup] = []
+            cooldown_blocked = 0
+            flip_blocked = 0
+            
             for s in picks:
-                if not email_recently_sent(uid, s.symbol):
-                    chosen = s
+                if len(chosen_list) >= int(EMAIL_SETUPS_N):
                     break
-
-            if not chosen:
+            
+                sym = str(getattr(s, "symbol", "")).upper()
+                side = str(getattr(s, "side", "")).upper()
+                sess_name = str(sess["name"])
+            
+                # Block opposite-direction flips for a while (prevents BUY then SELL spam on same symbol)
+                if symbol_flip_guard_active(uid, sym, side, sess_name):
+                    flip_blocked += 1
+                    continue
+            
+                # Block same-direction repeats within session-dependent cooldown window
+                if symbol_recently_emailed(uid, sym, side, sess_name):
+                    cooldown_blocked += 1
+                    continue
+            
+                chosen_list.append(s)
+            
+            if not chosen_list:
+                reasons = []
+                if cooldown_blocked:
+                    reasons.append(f"cooldown_blocked={cooldown_blocked}")
+                if flip_blocked:
+                    reasons.append(f"flip_guard_blocked={flip_blocked}")
+                reasons.append("all_candidates_blocked")
+            
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
-                    "reasons": ["all_candidates_recently_sent"],
+                    "reasons": reasons,
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
-
-            # Send the email
+            
+            # Send ONE email containing MULTIPLE setups
             try:
-                ok = send_email_alert(user, sess, chosen, best_fut)
-            except Exception as e:
+                ok = send_email_alert_multi(user, sess, chosen_list, best_fut)
+            except Exception:
                 ok = False
-
+            
             if ok:
                 email_state_set(uid, last_email_ts=time.time(), sent_count=int(st["sent_count"]) + 1)
                 _email_daily_inc(uid, day_local)
-
+            
+                # Mark ALL emailed symbols (cooldown/flip-guard tracking)
+                for s in chosen_list:
+                    mark_symbol_emailed(uid, s.symbol, s.side, sess["name"])
+            
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SENT",
-                    "picked": f"{chosen.side} {chosen.symbol} conf={chosen.conf}",
+                    "picked": ", ".join([f"{s.side} {s.symbol} conf={s.conf}" for s in chosen_list]),
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "reasons": ["passed_filters"],
+                    "reasons": ["passed_filters_multi"],
                 }
             else:
                 _LAST_EMAIL_DECISION[uid] = {
@@ -6487,7 +6551,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     "reasons": ["send_email_failed"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
-
 
 async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
