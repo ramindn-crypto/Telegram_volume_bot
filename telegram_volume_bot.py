@@ -3250,295 +3250,274 @@ Not financial advice.
 ────────────────────
 /screen
 
-Shows a real-time market snapshot:
-• Top Trade Setups (highest quality)
-• Waiting for Trigger (near-miss candidates)
-• Trend Continuation Watch (adaptive EMA logic)
-• Directional Leaders
-• Directional Losers
-• Market Leaders (Top by Futures Volume)
-
+    Shows a real-time market snapshot:
+    • Top Trade Setups (highest quality)
+    • Waiting for Trigger (near-miss candidates)
+    • Trend Continuation Watch (adaptive EMA logic)
+    • Directional Leaders
+    • Directional Losers
+    • Market Leaders (Top by Futures Volume)
 
 Market Scan Controls & Alerts ↓
 
-/sessions_on_unlimited
-Enables 24-hour email signaling.
-• Emails are sent even outside ASIA / LONDON / NEW YORK sessions
-• Useful for catching overnight or explosive moves
-
-/sessions_off_unlimited
-Disables 24-hour mode.
-• Reverts back to session-based email signaling only
-
-/bigmove_alert [on <24H%> <4H%> | off]
-
-Sends ALERT emails for strong market moves,
-even if they do NOT qualify as full trade signals.
-
-Default thresholds:
-• 24H ≥ 40%  OR
-• 4H ≥ 15%
-
-Examples:
-• /bigmove_alert
-• /bigmove_alert on 60 25
-• /bigmove_alert off
+    /sessions_on_unlimited
+    Enables 24-hour email signaling.
+    • Emails are sent even outside ASIA / LONDON / NEW YORK sessions
+    • Useful for catching overnight or explosive moves
+    
+    /sessions_off_unlimited
+    Disables 24-hour mode.
+    • Reverts back to session-based email signaling only
+    
+    /bigmove_alert [on <24H%> <4H%> | off]
+    
+    Sends ALERT emails for strong market moves,
+    even if they do NOT qualify as full trade signals.
+    
+    Default thresholds:
+    • 24H ≥ 40%  OR
+    • 4H ≥ 15%
+    
+    Examples:
+    • /bigmove_alert
+    • /bigmove_alert on 60 25
+    • /bigmove_alert off
 ────────────────────
 2) Position Sizing (NO trade opened)
 ────────────────────
-/size <SYMBOL> <long|short> sl <STOP>
-     [risk <usd|pct> <VALUE>]
-     [entry <ENTRY>]
-
-Purpose:
-• Calculates correct position size from Risk + SL
-• Does NOT open a trade
-
-Examples:
-• /size BTC long sl 42000
-  → Uses default /riskmode
-
-• /size BTC long risk usd 40 sl 42000
-  → Uses current Bybit futures price as Entry
-
-• /size ETH short risk pct 2.5 sl 2480
-  → Uses your Equity
-
-• /size BTC long sl 42000 entry 43000
-  → Manual entry price
-
-Notes:
-• If risk is omitted → /riskmode is used
-• pct risk uses Equity
-• Qty = Risk / |Entry − SL|
+    /size <SYMBOL> <long|short> sl <STOP>
+         [risk <usd|pct> <VALUE>]
+         [entry <ENTRY>]
+    
+    Purpose:
+    • Calculates correct position size from Risk + SL
+    • Does NOT open a trade
+    
+    Examples:
+    • /size BTC long sl 42000
+      → Uses default /riskmode
+    
+    • /size BTC long risk usd 40 sl 42000
+      → Uses current Bybit futures price as Entry
+    
+    • /size ETH short risk pct 2.5 sl 2480
+      → Uses your Equity
+    
+    • /size BTC long sl 42000 entry 43000
+      → Manual entry price
+    
+    Notes:
+    • If risk is omitted → /riskmode is used
+    • pct risk uses Equity
+    • Qty = Risk / |Entry − SL|
 
 ────────────────────
 3) Trade Journal & Equity Tracking
 ────────────────────
-Set equity:
-• /equity 1000
-Reset equity:
-• /equity_reset
-
-Open trade:
-• /trade_open <SYMBOL> <long|short>
-              entry <ENTRY> sl <SL>
-              risk <usd|pct> <VALUE>
-              [note "..."] [sig <SETUP_ID>]
-
-Manage open trade:
-• /trade_sl <TRADE_ID> <NEW_SL>
-  → Updates SL and recalculates trade risk
-  → Warns if risk increases
-  → Adjusts today’s used risk
-
-• /trade_rf <TRADE_ID>
-  → Moves SL to Entry (Risk-Free)
-  → Sets trade risk to 0
-  → Releases today’s used risk immediately
-
-Close trade:
-• /trade_close <TRADE_ID> pnl <PNL>
-
-Equity behavior:
-• Equity updates ONLY when trades are closed
-• If trade closes in profit → its risk is released
-• Trade journal is persistent (stored in DB)
+    Set equity:
+    • /equity 1000
+    Reset equity:
+    • /equity_reset
+    
+    Open trade:
+    • /trade_open <SYMBOL> <long|short>
+                  entry <ENTRY> sl <SL>
+                  risk <usd|pct> <VALUE>
+                  [note "..."] [sig <SETUP_ID>]
+    
+    Manage open trade:
+    • /trade_sl <TRADE_ID> <NEW_SL>
+      → Updates SL and recalculates trade risk
+      → Warns if risk increases
+      → Adjusts today’s used risk
+    
+    • /trade_rf <TRADE_ID>
+      → Moves SL to Entry (Risk-Free)
+      → Sets trade risk to 0
+      → Releases today’s used risk immediately
+    
+    Close trade:
+    • /trade_close <TRADE_ID> pnl <PNL>
+    
+    Equity behavior:
+    • Equity updates ONLY when trades are closed
+    • If trade closes in profit → its risk is released
+    • Trade journal is persistent (stored in DB)
 
 ────────────────────
 4) Status Dashboard
 ────────────────────
-/status
-
-Shows:
-• Equity
-• Trades today (count)
-• Daily risk cap + used / remaining risk
-• Active sessions + current session
-• Email alert status + email limits
-• Open trades list
-• Active symbol cooldowns (current session)
+    /status
+    
+    Shows:
+    • Equity
+    • Trades today (count)
+    • Daily risk cap + used / remaining risk
+    • Active sessions + current session
+    • Email alert status + email limits
+    • Open trades list
+    • Active symbol cooldowns (current session)
 
 ────────────────────
 5) Risk Settings
 ────────────────────
-Risk per trade:
-• /riskmode pct 2.5
-• /riskmode usd 25
-
-Daily risk cap:
-• /dailycap pct 5
-• /dailycap usd 60
+    Risk per trade:
+    • /riskmode pct 2.5
+    • /riskmode usd 25
+    
+    Daily risk cap:
+    • /dailycap pct 5
+    • /dailycap usd 60
 
 ────────────────────
 6) Limits (Discipline Controls)
 ────────────────────
-/limits maxtrades 5
-/limits emailcap 4        (0 = unlimited per session)
-/limits emailgap 60       (minutes between emails)
-/limits emaildaycap 4     (0 = unlimited per day)
-
-Limits protect against:
-• Overtrading
-• Email spam
-• Emotional decision-making
+    /limits maxtrades 5
+    /limits emailcap 4        (0 = unlimited per session)
+    /limits emailgap 60       (minutes between emails)
+    /limits emaildaycap 4     (0 = unlimited per day)
+    
+    Limits protect against:
+    • Overtrading
+    • Email spam
+    • Emotional decision-making
 
 ────────────────────
 7) Sessions (Email Delivery Windows)
-────────────────────
-View sessions:
-• /sessions
-
-Enable / disable:
-• /sessions_on NY
-• /sessions_off LON
-
-Defaults by timezone:
-• Americas → NY
-• Europe/Africa → LON
-• Asia/Oceania → ASIA
-
-Session priority:
-NY > LON > ASIA
-
-Emails are sent ONLY during enabled sessions.
+    ────────────────────
+    View sessions:
+    • /sessions
+    
+    Enable / disable:
+    • /sessions_on NY
+    • /sessions_off LON
+    
+    Defaults by timezone:
+    • Americas → NY
+    • Europe/Africa → LON
+    • Asia/Oceania → ASIA
+    
+    Session priority:
+    NY > LON > ASIA
+    
+    Emails are sent ONLY during enabled sessions.
 
 ────────────────────
 8) Email Alerts
 ────────────────────
-Enable / disable:
-• /notify_on
-• /notify_off
-
-Limit alerts to a daily time window (your timezone):
-• /trade_window <START_HH:MM> <END_HH:MM>
-  Example: /trade_window 09:00 17:30
-
-Email rules:
-• Sent only during enabled sessions
-• Session-based quality filters (confidence + RR floors)
-• No same symbol+direction spam
-• Cooldowns enforced (see below)
-• Per-session & per-day caps supported
-
-Email troubleshooting:
-• /email_test
-  → Sends a test email using your configured email setup
-
-• /email_decision
-  → Shows the last email decision (SENT/SKIP + reasons)
+    Enable / disable:
+    • /notify_on
+    • /notify_off
+    
+    Limit alerts to a daily time window (your timezone):
+    • /trade_window <START_HH:MM> <END_HH:MM>
+      Example: /trade_window 09:00 17:30
+    
+    Email rules:
+    • Sent only during enabled sessions
+    • Session-based quality filters (confidence + RR floors)
+    • No same symbol+direction spam
+    • Cooldowns enforced (see below)
+    • Per-session & per-day caps supported
+    
+    Email troubleshooting:
+    • /email_test
+      → Sends a test email using your configured email setup
 
 ────────────────────
 9) Symbol Cooldowns (Anti-Spam Logic)
 ────────────────────
-Cooldowns are:
-• Per-user
-• Per-symbol
-• Per-direction (BUY vs SELL)
-• Session-aware (duration depends on NY/LON/ASIA policy)
-
-Cooldown duration by session:
-• NY    → 2 hours
-• LON   → 3 hours
-• ASIA  → 4 hours
-
-View cooldowns:
-• /cooldowns
-  → Shows remaining cooldown time for NY / LON / ASIA for each symbol + direction
-
-Query a single symbol:
-• /cooldown <SYMBOL> <long|short>
-  → Shows remaining cooldown time for NY / LON / ASIA for that exact symbol+direction
+    Cooldowns are:
+    • Per-user
+    • Per-symbol
+    • Per-direction (BUY vs SELL)
+    • Session-aware (duration depends on NY/LON/ASIA policy)
+    
+    Cooldown duration by session:
+    • NY    → 2 hours
+    • LON   → 3 hours
+    • ASIA  → 4 hours
+    
+    View cooldowns:
+    • /cooldowns
+      → Shows remaining cooldown time for NY / LON / ASIA for each symbol + direction
+    
+    Query a single symbol:
+    • /cooldown <SYMBOL> <long|short>
+      → Shows remaining cooldown time for NY / LON / ASIA for that exact symbol+direction
 
 ────────────────────
 10) Reports
 ────────────────────
-Performance:
-• /report_daily
-• /report_weekly
-• /report_overall
-
-Signal summaries:
-• /signals_daily
-• /signals_weekly
-
-Reports include:
-• Trades taken
-• Win rate
-• Net PnL
-• R-multiples
-• Best / worst trades
-• System-generated advice
+    Performance:
+    • /report_daily
+    • /report_weekly
+    • /report_overall
+    
+    Signal summaries:
+    • /signals_daily
+    • /signals_weekly
 
 ────────────────────
 11) System Health
 ────────────────────
-• /health
-  → Quick status
-
-• /health_sys
-  → DB status
-  → Bybit/CCXT connectivity
-  → Cache stats
-  → Session state
-  → Email configuration
+    • /health_sys
+      → DB status
+      → Bybit/CCXT connectivity
+      → Cache stats
+      → Session state
+      → Email configuration
 
 ────────────────────
 12) Timezone
 ────────────────────
-View / set timezone:
-• /tz
-• /tz Australia/Melbourne
-• /tz America/New_York
+    View / set timezone:
+    • /tz
+    • /tz Australia/Melbourne
+    • /tz America/New_York
 
 ────────────────────
 13) Billing, Plan, Support
 ────────────────────
-• /myplan
-  → Shows your current plan
-
-• /billing
-  → Shows payment options (Stripe + USDT)
-
-• /support
-  → Contact/support info and troubleshooting steps
+    • /myplan
+      → Shows your current plan
+    
+    • /billing
+      → Shows payment options (Stripe + USDT)
+    
+    • /support
+      → Contact/support info and troubleshooting steps
 
 ────────────────────
 14) USDT Payments (Semi-Auto)
 ────────────────────
-You can pay using USDT (crypto).
-
-Start here:
-• /usdt
-  → Shows the current network + address + instructions
-
-Accepted network:
-• USDT (TRC20 only)
-
-Prices:
-• Standard: 49 USDT
-• Pro: 99 USDT
-
-Steps:
-1) Send USDT to the address shown in /usdt
-2) Copy the transaction hash (TXID)
-3) Submit payment using:
-
-/usdt_paid <TXID> <standard|pro>
-
-Example:
-• /usdt_paid 7f3a...c9 standard
-
-Notes:
-• USDT payments are final
-• No refunds for crypto payments
-• Access is granted after admin approval
-
-────────────────────
-Admin Help
-────────────────────
-• /help_admin
-  → Admin-only commands (owner/operators)
+    You can pay using USDT (crypto).
+    
+    Start here:
+    • /usdt
+      → Shows the current network + address + instructions
+    
+    Accepted network:
+    • USDT (TRC20 only)
+    
+    Prices:
+    • Standard: 49 USDT
+    • Pro: 99 USDT
+    
+    Steps:
+    1) Send USDT to the address shown in /usdt
+    2) Copy the transaction hash (TXID)
+    3) Submit payment using:
+    
+    /usdt_paid <TXID> <standard|pro>
+    
+    Example:
+    • /usdt_paid 7f3a...c9 standard
+    
+    Notes:
+    • USDT payments are final
+    • No refunds for crypto payments
+    • Access is granted after admin approval
 
 ────────────────────
 Final Notes
@@ -3546,11 +3525,11 @@ Final Notes
 • PulseFutures does NOT auto-trade
 • PulseFutures does NOT promise profits
 • PulseFutures enforces discipline, risk control, and session awareness
-
+    
 Trade less. Trade better. Risk first.
 PulseFutures
 """
-
+    
 
 # =========================================================
 # HELP TEXT (ADMIN)
