@@ -4245,23 +4245,6 @@ async def sessions_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user(uid, sessions_enabled=json.dumps(enabled))
     await update.message.reply_text(f"✅ Enabled sessions: {', '.join(enabled)}")
 
-async def sessions_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user = get_user(uid)
-    if not context.args:
-        await update.message.reply_text("Usage: /sessions_on NY")
-        return
-    name = context.args[0].strip().upper()
-    if name not in SESSIONS_UTC:
-        await update.message.reply_text("Session must be one of: ASIA, LON, NY")
-        return
-    enabled = user_enabled_sessions(user)
-    if name not in enabled:
-        enabled.append(name)
-    enabled = _order_sessions(enabled) or enabled
-    update_user(uid, sessions_enabled=json.dumps(enabled))
-    await update.message.reply_text(f"✅ Enabled sessions: {', '.join(enabled)}")
-
 async def sessions_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -7034,10 +7017,16 @@ def main():
     app.add_handler(CommandHandler("riskmode", riskmode_cmd))
     app.add_handler(CommandHandler("dailycap", dailycap_cmd))
     app.add_handler(CommandHandler("limits", limits_cmd))
+
     app.add_handler(CommandHandler("trade_sl", trade_sl_cmd))
     app.add_handler(CommandHandler("trade_rf", trade_rf_cmd))
+    
+    app.add_handler(CommandHandler("sessions", sessions_cmd))
+    app.add_handler(CommandHandler("sessions_on", sessions_on_cmd))
+    app.add_handler(CommandHandler("sessions_off", sessions_off_cmd))
     app.add_handler(CommandHandler("sessions_on_unlimited", sessions_on_unlimited_cmd))
     app.add_handler(CommandHandler("sessions_off_unlimited", sessions_off_unlimited_cmd))
+
     app.add_handler(CommandHandler("bigmove_alert", bigmove_alert_cmd))
     app.add_handler(CommandHandler("notify_on", notify_on))
     app.add_handler(CommandHandler("notify_off", notify_off))
