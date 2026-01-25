@@ -4343,6 +4343,48 @@ def _equity_risk_pct_from_usd(user: dict, risk_usd: float) -> Optional[float]:
         return None
     return (float(risk_usd) / eq) * 100.0
 
+
+def _find_unknown_tokens(tokens: list) -> list:
+    """
+    Very strict validation:
+    - allowed keywords: symbol, side, sl, entry, risk, usd, pct
+    - side values: long/short/buy/sell
+    - everything else should be numeric (like prices/values)
+    Any unknown non-numeric token => error.
+    """
+    allowed = {
+        "sl", "stop",
+        "entry", "ent",
+        "risk",
+        "usd", "pct",
+        "long", "short", "buy", "sell",
+    }
+
+    unknown = []
+    for t in tokens:
+        tt = str(t).strip().lower()
+        if not tt:
+            continue
+        if tt in allowed:
+            continue
+        # numeric is OK
+        try:
+            float(tt)
+            continue
+        except Exception:
+            unknown.append(tt)
+    return unknown
+
+def _typo_hint_for_token(tok: str) -> str:
+    t = (tok or "").lower()
+    # common "entry" typos
+    if t.startswith("entr") and t not in ("entry", "ent"):
+        return "Did you mean `entry`?"
+    if t in ("enrty", "etry", "etryy", "enter", "entery", "enrt"):
+        return "Did you mean `entry`?"
+    return ""
+
+
 async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -4353,6 +4395,36 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tokens = raw.split()
+    # STRICT: reject unknown tokens (prevents silent fallback to live price on typos like "entrt")
+    allowed = {"sl", "entry", "risk", "usd", "pct", "long", "short"}
+    unknown = []
+    for t in tokens:
+        tt = str(t).strip().lower()
+        if not tt:
+            continue
+        if tt in allowed:
+            continue
+        # numeric token is OK
+        try:
+            float(tt)
+            continue
+        except Exception:
+            unknown.append(tt)
+
+    if unknown:
+        # common hint for entry typos
+        hint = ""
+        u0 = unknown[0]
+        if u0.startswith("entr") and u0 != "entry":
+            hint = "\nDid you mean `entry`?"
+        await update.message.reply_text(
+            "❌ Invalid /size syntax.\n\n"
+            f"Unknown keyword(s): {', '.join(unknown)}{hint}\n\n"
+            "Use:\n/size <SYMBOL> <long|short> sl <STOP> [entry <ENTRY>] [risk <usd|pct> <VALUE>]\n"
+            "Example:\n/size BTC long sl 42000 entry 43000 risk usd 40"
+        )
+        return
+
     if len(tokens) < 4:
         await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: risk pct 2 | risk usd 40 | entry 43000)")
         return
@@ -6327,7 +6399,8 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if s.conf < min_conf:
                     skip_reasons_counter["below_session_conf_floor"] += 1
                     continue
-                if float(s.rr_tp3) < float(min_rr):
+                rr3 = rr_to_tp(float(s.entry), float(s.sl), float(s.tp3))
+                if float(rr3) < float(min_rr):
                     skip_reasons_counter["below_session_rr_floor"] += 1
                     continue
 
