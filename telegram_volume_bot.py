@@ -976,16 +976,31 @@ def db_init():
 
     cur.execute("PRAGMA table_info(users)")
     cols = {r[1] for r in cur.fetchall()}
-
-    # ✅ Trade window columns (local time HH:MM), empty = disabled
+    
+    # Trade window columns (local time HH:MM), empty = disabled
     if "trade_window_start" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN trade_window_start TEXT NOT NULL DEFAULT ''")
     if "trade_window_end" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN trade_window_end TEXT NOT NULL DEFAULT ''")
-
     
+    # Daily email cap
     if "max_emails_per_day" not in cols:
-        cur.execute(f"ALTER TABLE users ADD COLUMN max_emails_per_day INTEGER NOT NULL DEFAULT {int(DEFAULT_MAX_EMAILS_PER_DAY)}")
+        cur.execute(
+            f"ALTER TABLE users ADD COLUMN max_emails_per_day INTEGER NOT NULL DEFAULT {int(DEFAULT_MAX_EMAILS_PER_DAY)}"
+        )
+    
+    # NEW: Unlimited session emailing (24h)
+    if "sessions_unlimited" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN sessions_unlimited INTEGER NOT NULL DEFAULT 0")
+    
+    # NEW: Big-move alert emails (even if not a valid setup)
+    if "bigmove_alert_on" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_on INTEGER NOT NULL DEFAULT 1")
+        # Aligned defaults (ENSO / SOMI sensitivity)
+    if "bigmove_alert_24h" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_24h REAL NOT NULL DEFAULT 40")  # %
+    if "bigmove_alert_4h" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_4h REAL NOT NULL DEFAULT 15")   # %
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trades (
@@ -2813,10 +2828,43 @@ def user_enabled_sessions(user: dict) -> List[str]:
     except Exception:
         return _default_sessions_for_tz(user["tz"])
 
+def _guess_session_name_utc(now_utc: datetime) -> str:
+    """
+    Returns NY/LON/ASIA if within their UTC windows (priority NY > LON > ASIA).
+    If we're in the 22:00–24:00 UTC gap, default to ASIA (so emails still run).
+    """
+    for name in SESSION_PRIORITY:  # ["NY","LON","ASIA"]
+        w = SESSIONS_UTC[name]
+        sh, sm = parse_hhmm(w["start"])
+        eh, em = parse_hhmm(w["end"])
+        start_utc = now_utc.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_utc = now_utc.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if end_utc <= start_utc:
+            end_utc += timedelta(days=1)
+        if now_utc < start_utc and (start_utc - now_utc) > timedelta(hours=12):
+            start_utc -= timedelta(days=1)
+            end_utc -= timedelta(days=1)
+        if start_utc <= now_utc <= end_utc:
+            return name
+    return "ASIA"
+
+
 def in_session_now(user: dict) -> Optional[dict]:
     tz = ZoneInfo(user["tz"])
     now_local = datetime.now(tz)
     now_utc = now_local.astimezone(timezone.utc)
+
+    # NEW: unlimited mode => always return a session (no more NONE)
+    if int(user.get("sessions_unlimited", 0) or 0) == 1:
+        name = _guess_session_name_utc(now_utc)
+        session_key = f"{now_utc.strftime('%Y-%m-%d')}_{name}_UNL"
+        return {
+            "name": name,
+            "session_key": session_key,
+            "start_utc": now_utc,
+            "end_utc": now_utc,
+            "now_local": now_local,
+        }
 
     enabled = user_enabled_sessions(user)
     for name in enabled:
@@ -2825,14 +2873,11 @@ def in_session_now(user: dict) -> Optional[dict]:
         eh, em = parse_hhmm(w["end"])
         start_utc = now_utc.replace(hour=sh, minute=sm, second=0, microsecond=0)
         end_utc = now_utc.replace(hour=eh, minute=em, second=0, microsecond=0)
-
         if end_utc <= start_utc:
             end_utc += timedelta(days=1)
-
         if now_utc < start_utc and (start_utc - now_utc) > timedelta(hours=12):
             start_utc -= timedelta(days=1)
             end_utc -= timedelta(days=1)
-
         if start_utc <= now_utc <= end_utc:
             session_key = f"{start_utc.strftime('%Y-%m-%d')}_{name}"
             return {
@@ -2842,8 +2887,8 @@ def in_session_now(user: dict) -> Optional[dict]:
                 "end_utc": end_utc,
                 "now_local": now_local,
             }
-
     return None
+
 
 
 import difflib
@@ -2873,12 +2918,13 @@ KNOWN_COMMANDS = sorted(set([
     "limits",
 
     # Sessions
-    "sessions", "sessions_on", "sessions_off",
+    "sessions", "sessions_on", "sessions_off", "sessions_on_unlimited", "sessions_off_unlimited",
 
     # Email alerts
     "notify_on", "notify_off",
     "trade_window",
     "email_test", "email_decision",
+    "bigmove_alert",
 
     # Cooldowns (user)
     "cooldowns", "cooldown",
@@ -2986,6 +3032,58 @@ def calc_qty(entry: float, sl: float, risk_usd: float) -> float:
     if entry <= 0 or d <= 0 or risk_usd <= 0:
         return 0.0
     return risk_usd / d
+
+def entry_sanity_check(entry: float, current: float) -> Tuple[Optional[str], bool]:
+    """
+    Returns (warning_message, severe_flag).
+    - warning_message is None if entry looks normal.
+    - severe_flag True means it's extremely off and should be blocked unless user confirms.
+    """
+    try:
+        e = float(entry)
+        c = float(current)
+    except Exception:
+        return ("⚠️ Entry sanity check: could not compare entry vs current price.", False)
+
+    if c <= 0 or e <= 0:
+        return ("⚠️ Entry sanity check: entry/current must be positive.", True)
+
+    diff_pct = abs(e - c) / c * 100.0
+    ratio = e / c
+
+    # Detect common decimal-shift mistakes (x10 or /10)
+    dec_shift = ""
+    if 8.0 <= ratio <= 12.5:
+        dec_shift = " (looks like ~x10 higher — possible decimal mistake)"
+    elif 0.08 <= ratio <= 0.125:
+        dec_shift = " (looks like ~x10 lower — possible decimal mistake)"
+
+    # Tune thresholds here
+    WARN_PCT = 15.0
+    SEVERE_PCT = 40.0
+
+    if diff_pct < WARN_PCT:
+        return (None, False)
+
+    if diff_pct >= SEVERE_PCT:
+        msg = (
+            f"🚨 ENTRY PRICE LOOKS WRONG\n"
+            f"- Current: {fmt_price(c)}\n"
+            f"- Entered: {fmt_price(e)}\n"
+            f"- Difference: {diff_pct:.1f}%{dec_shift}\n"
+            f"Double-check your entry value."
+        )
+        return (msg, True)
+
+    msg = (
+        f"⚠️ Entry looks unusual vs current price\n"
+        f"- Current: {fmt_price(c)}\n"
+        f"- Entered: {fmt_price(e)}\n"
+        f"- Difference: {diff_pct:.1f}%{dec_shift}\n"
+        f"Please double-check."
+    )
+    return (msg, False)
+
 
 def daily_cap_usd(user: dict) -> float:
     mode = user["daily_cap_mode"].upper()
@@ -3146,21 +3244,31 @@ Shows a real-time market snapshot:
 • Directional Losers
 • Market Leaders (Top by Futures Volume)
 
-Notes:
-• Header shows: Active Session + Your City/Location + Local Time
-• Each setup includes:
-  - ID (ID-PF-YYYYMMDD-XXXX)
-  - Side (BUY / SELL)
-  - Confidence score
-  - Engine type (Mean-Reversion or Momentum)
-  - Entry / SL / TP(s)
-  - RR(TP3)
-  - Multi-timeframe momentum
-  - Futures volume
-  - TradingView chart link
-• “Pullback” wording is intentionally removed
-• /screen is NOT affected by cooldowns (always live)
 
+Market Scan Controls & Alerts ↓
+
+/sessions_on_unlimited
+Enables 24-hour email signaling.
+• Emails are sent even outside ASIA / LONDON / NEW YORK sessions
+• Useful for catching overnight or explosive moves
+
+/sessions_off_unlimited
+Disables 24-hour mode.
+• Reverts back to session-based email signaling only
+
+/bigmove_alert [on <24H%> <4H%> | off]
+
+Sends ALERT emails for strong market moves,
+even if they do NOT qualify as full trade signals.
+
+Default thresholds:
+• 24H ≥ 60%  OR
+• 4H ≥ 25%
+
+Examples:
+• /bigmove_alert
+• /bigmove_alert on 60 25
+• /bigmove_alert off
 ────────────────────
 2) Position Sizing (NO trade opened)
 ────────────────────
@@ -4139,6 +4247,58 @@ async def sessions_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user(uid, sessions_enabled=json.dumps(enabled))
     await update.message.reply_text(f"✅ Enabled sessions: {', '.join(enabled)}")
 
+
+async def sessions_on_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_user(uid, sessions_unlimited=1)
+    await update.message.reply_text("✅ Sessions: UNLIMITED (24h emailing enabled).")
+
+async def sessions_off_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_user(uid, sessions_unlimited=0)
+    await update.message.reply_text("✅ Sessions: back to normal (enabled sessions only).")
+
+async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not context.args:
+        on = int(user.get("bigmove_alert_on", 1) or 0)
+        p24 = float(user.get("bigmove_alert_24h", 60) or 60)
+        p4 = float(user.get("bigmove_alert_4h", 25) or 25)
+        await update.message.reply_text(
+            "📣 Big-Move Alert Emails\n"
+            f"{HDR}\n"
+            f"Status: {'ON' if on else 'OFF'}\n"
+            f"Thresholds: 24H ≥ {p24:.0f}% OR 4H ≥ {p4:.0f}%\n\n"
+            "Set: /bigmove_alert on 60 25\n"
+            "Off: /bigmove_alert off"
+        )
+        return
+
+    mode = context.args[0].strip().lower()
+    if mode in {"off", "0", "disable"}:
+        update_user(uid, bigmove_alert_on=0)
+        await update.message.reply_text("✅ Big-move alert emails: OFF")
+        return
+
+    if mode in {"on", "1", "enable"}:
+        p24 = 60.0
+        p4 = 25.0
+        if len(context.args) >= 3:
+            try:
+                p24 = float(context.args[1])
+                p4 = float(context.args[2])
+            except Exception:
+                await update.message.reply_text("Usage: /bigmove_alert on 60 25  (percent thresholds)")
+                return
+        update_user(uid, bigmove_alert_on=1, bigmove_alert_24h=p24, bigmove_alert_4h=p4)
+        await update.message.reply_text(f"✅ Big-move alert emails: ON (24H≥{p24:.0f}% OR 4H≥{p4:.0f}%)")
+        return
+
+    await update.message.reply_text("Usage: /bigmove_alert on 60 25  OR  /bigmove_alert off")
+
+
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     update_user(uid, notify_on=1)
@@ -4221,6 +4381,23 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         entry = float(mv.last)
 
+
+    # --- Entry sanity check vs live price (warn only; does not block /size) ---
+    try:
+        best_now = await asyncio.to_thread(fetch_futures_tickers)
+        mv_now = best_now.get(sym)
+        cur_px = float(mv_now.last) if mv_now and float(mv_now.last or 0) > 0 else 0.0
+    except Exception:
+        cur_px = 0.0
+    
+    entry_warn = ""
+    if cur_px > 0:
+        w, severe = entry_sanity_check(entry, cur_px)
+        if w:
+            # /size: warn only (no blocking), but make severe warnings very visible
+            entry_warn = ("\n" + w + "\n")
+    # --------------------------------------------------------------
+
     if entry <= 0 or sl <= 0 or entry == sl:
         await update.message.reply_text("Entry/SL invalid. Ensure entry and sl are positive and not equal.")
         return
@@ -4270,10 +4447,13 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- Risk: ${risk_usd:.2f}\n"
         f"- Qty: {qty:.6g}\n"
     )
+
     if warn:
         msg += "\n" + warn + "\n"
-
+    if entry_warn:
+        msg += entry_warn
     msg += f"\nChart: {tv_chart_url(sym)}"
+
     await update.message.reply_text(msg)
 
 async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4328,13 +4508,38 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("risk mode must be usd or pct")
         return
 
+    # =========================================================
+    # ENTRY PRICE SANITY CHECK (BLOCK if severe unless "force")
+    # =========================================================
+    force = ("force" in tokens)  # user can add: force
+    
+    try:
+        best_now = await asyncio.to_thread(fetch_futures_tickers)
+        mv_now = best_now.get(sym)
+        cur_px = float(mv_now.last) if mv_now and float(mv_now.last or 0) > 0 else 0.0
+    except Exception:
+        cur_px = 0.0
+    
+    if cur_px > 0:
+        w, severe = entry_sanity_check(entry, cur_px)
+        if w and severe and not force:
+            await update.message.reply_text(
+                w
+                + "\n\n❌ Trade NOT opened to protect you from a bad entry.\n"
+                  "If you are 100% sure, re-run the command and add: force"
+            )
+            return
+        elif w and not severe:
+            await update.message.reply_text(w)
+    # =========================================================
+    
     if side == "BUY" and sl >= entry:
         await update.message.reply_text("For LONG, SL should be BELOW entry.")
         return
     if side == "SELL" and sl <= entry:
         await update.message.reply_text("For SHORT, SL should be ABOVE entry.")
         return
-
+  
     risk_usd = compute_risk_usd(user, risk_mode, risk_val)
     if risk_usd <= 0:
         await update.message.reply_text("Risk USD computed as 0. If you used pct, set your equity first: /equity 1000")
@@ -6051,10 +6256,22 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if s.side == "SELL" and float(s.ch24) > -float(TREND_24H_TOL):
                     skip_reasons_counter["trend_filter_sell_24h_too_high"] += 1
                     continue
-
+                
                 # RR floor by session (TP3)
                 rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+                
+                # NEW: allow "big move alert" bypass (does not change your strict signal rules)
+                bigmove_on = int(user.get("bigmove_alert_on", 1) or 0) == 1
+                bm24 = float(user.get("bigmove_alert_24h", 60) or 60)
+                bm4 = float(user.get("bigmove_alert_4h", 25) or 25)
+                
+                is_big_mover = (abs(float(s.ch24)) >= bm24) or (abs(float(s.ch4)) >= bm4)
+                
                 if rr3 < min_rr:
+                    if bigmove_on and is_big_mover:
+                        # Put into 'early' bucket so it becomes an "ALERT email"
+                        early.append(s)
+                        continue
                     skip_reasons_counter["below_session_rr_floor"] += 1
                     continue
 
