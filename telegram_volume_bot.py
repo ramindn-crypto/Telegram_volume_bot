@@ -270,6 +270,19 @@ EARLY_CONF_PENALTY = 6
 EARLY_EMAIL_EXTRA_CONF = 4
 EARLY_EMAIL_MAX_FILL = 1
 
+# =========================================================
+# EMAIL QUALITY GATES (STRICT)
+# =========================================================
+# Rule 1) Minimum momentum gate (prevents "15m=0%" emails via EARLY path)
+EMAIL_EARLY_MIN_CH15_ABS = 0.20   # require at least this abs(15m %) for EARLY emails
+
+# Rule 2) Volume relative filter (killer rule)
+EMAIL_ABS_VOL_USD_MIN = 3_000_000     # hard floor
+EMAIL_REL_VOL_MIN_MULT = 1.25         # require vol >= (median_vol * this multiplier)
+
+# Rule 3) Priority override (Directional Leaders/Losers first)
+EMAIL_PRIORITY_OVERRIDE_ON = True
+
 TREND_24H_TOL = 0.5
 
 # ✅ Session-based 1H strictness:
@@ -5412,13 +5425,44 @@ def _subset_best(best_fut: dict, bases: list) -> dict:
     s = set([str(b).upper() for b in (bases or [])])
     return {k: v for k, v in (best_fut or {}).items() if str(k).upper() in s}
 
-def _market_leader_bases(best_fut: dict, n: int) -> list:
+def _market_leader_bases(best_fut: dict, n: int) -> list: 
+    
     try:
         items = [(b, mv) for b, mv in (best_fut or {}).items()]
         items = sorted(items, key=lambda x: float(getattr(x[1], "fut_vol_usd", 0.0) or 0.0), reverse=True)
         return [str(b).upper() for b, _ in items[:n]]
     except Exception:
         return []
+
+def _best_fut_vol_usd(best_fut: dict, base: str) -> float:
+    try:
+        mv = (best_fut or {}).get(str(base).upper())
+        return float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+def _median(values: list) -> float:
+    try:
+        vals = sorted([float(x) for x in values if float(x) > 0])
+        if not vals:
+            return 0.0
+        mid = len(vals) // 2
+        if len(vals) % 2 == 1:
+            return float(vals[mid])
+        return float((vals[mid - 1] + vals[mid]) / 2.0)
+    except Exception:
+        return 0.0
+
+def _email_priority_bases(best_fut: dict, directional_take: int = 12) -> set:
+    # Directional Leaders/Losers = priority symbols (email override)
+    try:
+        up_list, dn_list = compute_directional_lists(best_fut)
+        leaders = _bases_from_directional(up_list, directional_take)
+        losers  = _bases_from_directional(dn_list, directional_take)
+        return set([str(x).upper() for x in (leaders + losers)])
+    except Exception:
+        return set()
+
 
 async def build_priority_pool(best_fut: dict, session_name: str, mode: str) -> dict:
     """
@@ -6157,6 +6201,7 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 # EMAIL JOB
 # =========================================================
+
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     # Prevent overlapping runs (JobQueue can overlap if a run is slow)
     if ALERT_LOCK.locked():
@@ -6177,16 +6222,35 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not best_fut:
             return
 
-        #   Build setups per session (PRIORITY: leaders/losers → trend watch → waiting → market leaders)
+        # -----------------------------------------------------
+        # Rule 2: Volume relative filter base line (killer rule)
+        # -----------------------------------------------------
+        _all_vols = []
+        for _b, _mv in (best_fut or {}).items():
+            try:
+                _all_vols.append(float(getattr(_mv, "fut_vol_usd", 0.0) or 0.0))
+            except Exception:
+                pass
+        MARKET_VOL_MEDIAN_USD = _median(_all_vols)
+
+        # Build setups per session (PRIORITY: leaders/losers → trend watch → waiting → market leaders)
         setups_by_session: Dict[str, List[Setup]] = {}
         for sess_name in ["NY", "LON", "ASIA"]:
             pool = await build_priority_pool(best_fut, sess_name, mode="email")
             setups = pool.get("setups", [])[:max(EMAIL_SETUPS_N * 3, 9)]
 
+            # Rule 3: Priority override (Directional Leaders/Losers first)
+            if EMAIL_PRIORITY_OVERRIDE_ON:
+                pri = _email_priority_bases(best_fut, directional_take=12)
+                setups = sorted(
+                    setups,
+                    key=lambda s: (0 if str(getattr(s, "symbol", "")).upper() in pri else 1)
+                )
+
             setups_by_session[sess_name] = setups
             for s in setups:
                 db_insert_signal(s)
-        
+
         # Per-user send / skip logic
         for user in users:
             uid = int(user["user_id"])
@@ -6194,7 +6258,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
             sess = in_session_now(user)
 
-            # ✅ If user is NOT in an enabled session right now, skip
+            # If user is NOT in an enabled session right now, skip
             if not sess:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
@@ -6263,110 +6327,108 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if s.conf < min_conf:
                     skip_reasons_counter["below_session_conf_floor"] += 1
                     continue
-
-                # Trend-follow filter
-                if s.side == "BUY" and float(s.ch24) < float(TREND_24H_TOL):
-                    skip_reasons_counter["trend_filter_buy_24h_too_low"] += 1
-                    continue
-                if s.side == "SELL" and float(s.ch24) > -float(TREND_24H_TOL):
-                    skip_reasons_counter["trend_filter_sell_24h_too_high"] += 1
-                    continue
-                
-                # RR floor by session (TP3)
-                rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
-                
-                # NEW: allow "big move alert" bypass (does not change your strict signal rules)
-                bigmove_on = int(user.get("bigmove_alert_on", 1) or 0) == 1
-                bm24 = float(user.get("bigmove_alert_24h", 60) or 60)
-                bm4 = float(user.get("bigmove_alert_4h", 25) or 25)
-                
-                is_big_mover = (abs(float(s.ch24)) >= bm24) or (abs(float(s.ch4)) >= bm4)
-                
-                if rr3 < min_rr:
-                    if bigmove_on and is_big_mover:
-                        # Put into 'early' bucket so it becomes an "ALERT email"
-                        early.append(s)
-                        continue
+                if float(s.rr_tp3) < float(min_rr):
                     skip_reasons_counter["below_session_rr_floor"] += 1
                     continue
 
-                # Higher timeframe alignment (win-rate filter)
-                if TF_ALIGN_ENABLED:
-                    ch1 = _safe_float(getattr(s, "ch1", 0.0), 0.0)
-                    ch4 = _safe_float(getattr(s, "ch4", 0.0), 0.0)
-                
-                    if s.side == "BUY":
-                        if ch1 < TF_ALIGN_1H_MIN_ABS or ch4 < TF_ALIGN_4H_MIN_ABS:
-                            skip_reasons_counter["tf_align_fail_buy_1h4h"] += 1
-                            continue
-                    else:  # SELL
-                        if ch1 > -TF_ALIGN_1H_MIN_ABS or ch4 > -TF_ALIGN_4H_MIN_ABS:
-                            skip_reasons_counter["tf_align_fail_sell_1h4h"] += 1
-                            continue
-                
-                # Flip-Guard: block opposite direction flips within cooldown window
-                if symbol_flip_guard_active(uid, s.symbol, s.side, sess["name"]):
-                    skip_reasons_counter["symbol_flip_guard_active"] += 1
+                # =========================================================
+                # Rule 2: Volume relative filter (killer rule)
+                # =========================================================
+                vol_usd = _best_fut_vol_usd(best_fut, s.symbol)
+                if vol_usd < float(EMAIL_ABS_VOL_USD_MIN):
+                    skip_reasons_counter["email_vol_abs_too_low"] += 1
                     continue
-                
-                # Symbol cooldown (direction-aware + session-aware) — blocks same direction repeats
-                if symbol_recently_emailed(uid, s.symbol, s.side, sess["name"]):
-                    skip_reasons_counter["symbol_cooldown_active"] += 1
-                    continue
+                if float(MARKET_VOL_MEDIAN_USD or 0.0) > 0:
+                    rel = vol_usd / float(MARKET_VOL_MEDIAN_USD)
+                    if rel < float(EMAIL_REL_VOL_MIN_MULT):
+                        skip_reasons_counter["email_vol_rel_too_low"] += 1
+                        continue
 
-
-                is_confirm_15m = abs(float(s.ch15)) >= CONFIRM_15M_ABS_MIN
+                # =========================================================
+                # Rule 1: Minimum momentum gate for EMAILS
+                # - Confirmed path uses CONFIRM_15M_ABS_MIN
+                # - EARLY path must ALSO have abs(15m) >= EMAIL_EARLY_MIN_CH15_ABS
+                # =========================================================
+                ch15 = _safe_float(getattr(s, "ch15", 0.0), 0.0)
+                is_confirm_15m = abs(float(ch15)) >= CONFIRM_15M_ABS_MIN
 
                 if is_confirm_15m:
                     confirmed.append(s)
                 else:
+                    # EARLY path (strict)
                     if abs(float(s.ch1)) < EARLY_1H_ABS_MIN:
                         skip_reasons_counter["early_gate_ch1_not_strong"] += 1
+                        continue
+                    if abs(float(ch15)) < float(EMAIL_EARLY_MIN_CH15_ABS):
+                        skip_reasons_counter["early_gate_15m_too_weak"] += 1
                         continue
                     if s.conf < (min_conf + EARLY_EMAIL_EXTRA_CONF):
                         skip_reasons_counter["early_gate_conf_not_high_enough"] += 1
                         continue
                     early.append(s)
 
-                if len(confirmed) >= EMAIL_SETUPS_N:
+            # Choose final candidates (confirmed first, then early filler)
+            confirmed = sorted(confirmed, key=lambda x: x.conf, reverse=True)
+            early = sorted(early, key=lambda x: x.conf, reverse=True)
+
+            picks: List[Setup] = []
+            for s in confirmed:
+                if len(picks) >= int(EMAIL_SETUPS_N):
                     break
+                picks.append(s)
 
-            filtered: List[Setup] = confirmed[:EMAIL_SETUPS_N]
-            if len(filtered) < EMAIL_SETUPS_N and early:
-                need = EMAIL_SETUPS_N - len(filtered)
-                filtered.extend(early[:min(need, EARLY_EMAIL_MAX_FILL)])
+            # Allow limited early fill
+            fill_left = int(EMAIL_SETUPS_N) - len(picks)
+            if fill_left > 0 and int(EARLY_EMAIL_MAX_FILL) > 0:
+                allow_early = min(int(EARLY_EMAIL_MAX_FILL), fill_left)
+                picks.extend(early[:allow_early])
 
-            if not filtered:
-                top_reasons = [f"{k}: {v}" for k, v in skip_reasons_counter.most_common(6)]
+            if not picks:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
-                    "reasons": ["no_setups_after_filters"] + (top_reasons if top_reasons else []),
+                    "reasons": ["no_setups_after_filters"] + (
+                        [f"top_reasons={dict(skip_reasons_counter.most_common(5))}"]
+                        if skip_reasons_counter else []
+                    ),
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
 
-            now_local = datetime.now(tz)
-            body = _email_body_pretty(sess["name"], now_local, user["tz"], filtered, best_fut)
-            subject = f"PulseFutures • {sess['name']} • Premium Setups ({int(st['sent_count']) + 1})"
+            # Enforce cooldown-style duplicate suppression per user
+            chosen = None
+            for s in picks:
+                if not email_recently_sent(uid, s.symbol):
+                    chosen = s
+                    break
 
-            ok = await asyncio.to_thread(send_email, subject, body, uid)
+            if not chosen:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": ["all_candidates_recently_sent"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Send the email
+            try:
+                ok = send_email_alert(user, sess, chosen, best_fut)
+            except Exception as e:
+                ok = False
+
             if ok:
-                email_state_set(uid, sent_count=int(st["sent_count"]) + 1, last_email_ts=now_ts)
-                _email_daily_inc(uid, day_local, 1)
-
-                for s in filtered:
-                    mark_symbol_emailed(uid, s.symbol, s.side, sess["name"])
+                email_state_set(uid, last_email_ts=time.time(), sent_count=int(st["sent_count"]) + 1)
+                _email_daily_inc(uid, day_local)
 
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SENT",
-                    "reasons": [f"sent {len(filtered)} setups"],
+                    "picked": f"{chosen.side} {chosen.symbol} conf={chosen.conf}",
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": ["passed_filters"],
                 }
             else:
-                err = _LAST_SMTP_ERROR.get(uid, "unknown")
                 _LAST_EMAIL_DECISION[uid] = {
-                    "status": "SKIP",
-                    "reasons": [f"send_email_failed ({err})"],
+                    "status": "ERROR",
+                    "reasons": ["send_email_failed"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
 
