@@ -996,12 +996,13 @@ def db_init():
     # NEW: Big-move alert emails (even if not a valid setup)
     if "bigmove_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_on INTEGER NOT NULL DEFAULT 1")
-        # Aligned defaults (ENSO / SOMI sensitivity)
+    
+    # Aligned defaults (per your request): 24H >= 40 OR 4H >= 15
     if "bigmove_alert_24h" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_24h REAL NOT NULL DEFAULT 40")  # %
     if "bigmove_alert_4h" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_4h REAL NOT NULL DEFAULT 15")   # %
-
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_4h REAL NOT NULL DEFAULT 15")  # %
+    
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3262,8 +3263,8 @@ Sends ALERT emails for strong market moves,
 even if they do NOT qualify as full trade signals.
 
 Default thresholds:
-• 24H ≥ 60%  OR
-• 4H ≥ 25%
+• 24H ≥ 40%  OR
+• 4H ≥ 15%
 
 Examples:
 • /bigmove_alert
@@ -4231,6 +4232,23 @@ async def sessions_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user(uid, sessions_enabled=json.dumps(enabled))
     await update.message.reply_text(f"✅ Enabled sessions: {', '.join(enabled)}")
 
+async def sessions_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not context.args:
+        await update.message.reply_text("Usage: /sessions_on NY")
+        return
+    name = context.args[0].strip().upper()
+    if name not in SESSIONS_UTC:
+        await update.message.reply_text("Session must be one of: ASIA, LON, NY")
+        return
+    enabled = user_enabled_sessions(user)
+    if name not in enabled:
+        enabled.append(name)
+    enabled = _order_sessions(enabled) or enabled
+    update_user(uid, sessions_enabled=json.dumps(enabled))
+    await update.message.reply_text(f"✅ Enabled sessions: {', '.join(enabled)}")
+
 async def sessions_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -4238,15 +4256,12 @@ async def sessions_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /sessions_off LON")
         return
     name = context.args[0].strip().upper()
-
     enabled = [s for s in user_enabled_sessions(user) if s != name]
     if not enabled:
         enabled = _default_sessions_for_tz(user["tz"])
-
-    enabled = _order_sessions(enabled) or enabled
+        enabled = _order_sessions(enabled) or enabled
     update_user(uid, sessions_enabled=json.dumps(enabled))
     await update.message.reply_text(f"✅ Enabled sessions: {', '.join(enabled)}")
-
 
 async def sessions_on_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -4264,40 +4279,40 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args:
         on = int(user.get("bigmove_alert_on", 1) or 0)
-        p24 = float(user.get("bigmove_alert_24h", 60) or 60)
-        p4 = float(user.get("bigmove_alert_4h", 25) or 25)
+        p24 = float(user.get("bigmove_alert_24h", 40) or 40)
+        p4 = float(user.get("bigmove_alert_4h", 15) or 15)
         await update.message.reply_text(
             "📣 Big-Move Alert Emails\n"
             f"{HDR}\n"
             f"Status: {'ON' if on else 'OFF'}\n"
             f"Thresholds: 24H ≥ {p24:.0f}% OR 4H ≥ {p4:.0f}%\n\n"
-            "Set: /bigmove_alert on 60 25\n"
+            "Set: /bigmove_alert on 40 15\n"
             "Off: /bigmove_alert off"
         )
         return
 
     mode = context.args[0].strip().lower()
+
     if mode in {"off", "0", "disable"}:
         update_user(uid, bigmove_alert_on=0)
         await update.message.reply_text("✅ Big-move alert emails: OFF")
         return
 
     if mode in {"on", "1", "enable"}:
-        p24 = 60.0
-        p4 = 25.0
+        p24 = 40.0
+        p4 = 15.0
         if len(context.args) >= 3:
             try:
                 p24 = float(context.args[1])
                 p4 = float(context.args[2])
             except Exception:
-                await update.message.reply_text("Usage: /bigmove_alert on 60 25  (percent thresholds)")
+                await update.message.reply_text("Usage: /bigmove_alert on 40 15 (percent thresholds)")
                 return
         update_user(uid, bigmove_alert_on=1, bigmove_alert_24h=p24, bigmove_alert_4h=p4)
         await update.message.reply_text(f"✅ Big-move alert emails: ON (24H≥{p24:.0f}% OR 4H≥{p4:.0f}%)")
         return
 
-    await update.message.reply_text("Usage: /bigmove_alert on 60 25  OR  /bigmove_alert off")
-
+    await update.message.reply_text("Usage: /bigmove_alert on 40 15 OR /bigmove_alert off")
 
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -6886,9 +6901,9 @@ def main():
     app.add_handler(CommandHandler("limits", limits_cmd))
     app.add_handler(CommandHandler("trade_sl", trade_sl_cmd))
     app.add_handler(CommandHandler("trade_rf", trade_rf_cmd))
-    app.add_handler(CommandHandler("sessions", sessions_cmd))
-    app.add_handler(CommandHandler("sessions_on", sessions_on_cmd))
-    app.add_handler(CommandHandler("sessions_off", sessions_off_cmd))
+    app.add_handler(CommandHandler("sessions_on_unlimited", sessions_on_unlimited_cmd))
+    app.add_handler(CommandHandler("sessions_off_unlimited", sessions_off_unlimited_cmd))
+    app.add_handler(CommandHandler("bigmove_alert", bigmove_alert_cmd))
     app.add_handler(CommandHandler("notify_on", notify_on))
     app.add_handler(CommandHandler("notify_off", notify_off))
     app.add_handler(CommandHandler("size", size_cmd))
