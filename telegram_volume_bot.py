@@ -2662,11 +2662,11 @@ def send_email(
     try:
         if int(EMAIL_PORT) == 465:
             ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(EMAIL_HOST, int(EMAIL_PORT), context=ctx, timeout=30) as s:
+            with smtplib.SMTP_SSL(EMAIL_HOST, int(EMAIL_PORT), context=ctx, timeout=EMAIL_SEND_TIMEOUT_SEC) as s:
                 s.login(EMAIL_USER, EMAIL_PASS)
                 s.send_message(msg)
         else:
-            with smtplib.SMTP(EMAIL_HOST, int(EMAIL_PORT), timeout=30) as s:
+            with smtplib.SMTP(EMAIL_HOST, int(EMAIL_PORT), timeout=EMAIL_SEND_TIMEOUT_SEC) as s:
                 s.ehlo()
                 s.starttls(context=ssl.create_default_context())
                 s.ehlo()
@@ -2803,7 +2803,7 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Send
     try:
-        ok = await asyncio.to_thread(send_email, subject, body, uid)
+        ok = await asyncio.to_thread(send_email, subject, body, uid, False)
     except Exception as e:
         logger.exception("email_test_cmd failed")
         await update.message.reply_text(f"❌ Test email crashed: {type(e).__name__}: {e}")
