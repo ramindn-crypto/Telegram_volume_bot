@@ -6296,6 +6296,13 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # EMAIL JOB
 # =========================================================
 
+EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "35"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "25"))
+EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "25"))
+
+async def _to_thread_with_timeout(fn, timeout_sec: int, *args, **kwargs):
+    return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout_sec)
+
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     # Prevent overlapping runs (JobQueue can overlap if a run is slow)
     if ALERT_LOCK.locked():
@@ -6312,7 +6319,14 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not users:
             return
 
-        best_fut = await asyncio.to_thread(fetch_futures_tickers)
+        # TIMEOUT-PROTECTED fetch (prevents lock being held forever)
+        try:
+            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, EMAIL_FETCH_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            return
+        except Exception:
+            return
+
         if not best_fut:
             return
 
@@ -6330,7 +6344,16 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         # Build setups per session (PRIORITY: leaders/losers → trend watch → waiting → market leaders)
         setups_by_session: Dict[str, List[Setup]] = {}
         for sess_name in ["NY", "LON", "ASIA"]:
-            pool = await build_priority_pool(best_fut, sess_name, mode="email")
+            try:
+                pool = await asyncio.wait_for(
+                    build_priority_pool(best_fut, sess_name, mode="email"),
+                    timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                pool = {"setups": []}
+            except Exception:
+                pool = {"setups": []}
+
             setups = pool.get("setups", [])[:max(EMAIL_SETUPS_N * 3, 9)]
 
             # Rule 3: Priority override (Directional Leaders/Losers first)
@@ -6343,7 +6366,10 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
             setups_by_session[sess_name] = setups
             for s in setups:
-                db_insert_signal(s)
+                try:
+                    db_insert_signal(s)
+                except Exception:
+                    pass
 
         # Per-user send / skip logic
         for user in users:
@@ -6441,8 +6467,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
                 # =========================================================
                 # Rule 1: Minimum momentum gate for EMAILS
-                # - Confirmed path uses CONFIRM_15M_ABS_MIN
-                # - EARLY path must ALSO have abs(15m) >= EMAIL_EARLY_MIN_CH15_ABS
                 # =========================================================
                 ch15 = _safe_float(getattr(s, "ch15", 0.0), 0.0)
                 is_confirm_15m = abs(float(ch15)) >= CONFIRM_15M_ABS_MIN
@@ -6450,7 +6474,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if is_confirm_15m:
                     confirmed.append(s)
                 else:
-                    # EARLY path (strict)
                     if abs(float(s.ch1)) < EARLY_1H_ABS_MIN:
                         skip_reasons_counter["early_gate_ch1_not_strong"] += 1
                         continue
@@ -6462,7 +6485,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                         continue
                     early.append(s)
 
-            # Choose final candidates (confirmed first, then early filler)
             confirmed = sorted(confirmed, key=lambda x: x.conf, reverse=True)
             early = sorted(early, key=lambda x: x.conf, reverse=True)
 
@@ -6472,7 +6494,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     break
                 picks.append(s)
 
-            # Allow limited early fill
             fill_left = int(EMAIL_SETUPS_N) - len(picks)
             if fill_left > 0 and int(EARLY_EMAIL_MAX_FILL) > 0:
                 allow_early = min(int(EARLY_EMAIL_MAX_FILL), fill_left)
@@ -6488,32 +6509,29 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
-          
-            # Enforce cooldown + flip-guard suppression per user (direction/session-aware)
+
             chosen_list: List[Setup] = []
             cooldown_blocked = 0
             flip_blocked = 0
-            
+
             for s in picks:
                 if len(chosen_list) >= int(EMAIL_SETUPS_N):
                     break
-            
+
                 sym = str(getattr(s, "symbol", "")).upper()
                 side = str(getattr(s, "side", "")).upper()
                 sess_name = str(sess["name"])
-            
-                # Block opposite-direction flips for a while (prevents BUY then SELL spam on same symbol)
+
                 if symbol_flip_guard_active(uid, sym, side, sess_name):
                     flip_blocked += 1
                     continue
-            
-                # Block same-direction repeats within session-dependent cooldown window
+
                 if symbol_recently_emailed(uid, sym, side, sess_name):
                     cooldown_blocked += 1
                     continue
-            
+
                 chosen_list.append(s)
-            
+
             if not chosen_list:
                 reasons = []
                 if cooldown_blocked:
@@ -6521,28 +6539,32 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if flip_blocked:
                     reasons.append(f"flip_guard_blocked={flip_blocked}")
                 reasons.append("all_candidates_blocked")
-            
+
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
                     "reasons": reasons,
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
-            
-            # Send ONE email containing MULTIPLE setups
+
+            # Send ONE email containing MULTIPLE setups (timeout-protected)
             try:
-                ok = send_email_alert_multi(user, sess, chosen_list, best_fut)
+                ok = await asyncio.wait_for(
+                    asyncio.to_thread(send_email_alert_multi, user, sess, chosen_list, best_fut),
+                    timeout=EMAIL_SEND_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                ok = False
             except Exception:
                 ok = False
-            
+
             if ok:
                 email_state_set(uid, last_email_ts=time.time(), sent_count=int(st["sent_count"]) + 1)
                 _email_daily_inc(uid, day_local)
-            
-                # Mark ALL emailed symbols (cooldown/flip-guard tracking)
+
                 for s in chosen_list:
                     mark_symbol_emailed(uid, s.symbol, s.side, sess["name"])
-            
+
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SENT",
                     "picked": ", ".join([f"{s.side} {s.symbol} conf={s.conf}" for s in chosen_list]),
@@ -6552,9 +6574,10 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             else:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "ERROR",
-                    "reasons": ["send_email_failed"],
+                    "reasons": ["send_email_failed_or_timeout"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
+
 
 async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
