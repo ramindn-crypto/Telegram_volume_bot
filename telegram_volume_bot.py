@@ -1089,6 +1089,17 @@ def db_init():
     )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS emailed_bigmoves (
+            user_id     INTEGER NOT NULL,
+            symbol      TEXT    NOT NULL,
+            direction   TEXT    NOT NULL,   -- "UP" or "DOWN"
+            emailed_ts  REAL    NOT NULL,
+            PRIMARY KEY (user_id, symbol, direction)
+        )
+    """)
+
+    
     # =========================================================
     # USDT payments + unified access/payments ledger
     # =========================================================
@@ -1379,6 +1390,68 @@ def _safe_float(x, default: float = 0.0) -> float:
         return float(s)
     except Exception:
         return default
+
+
+
+BIGMOVE_COOLDOWN_SEC = 60 * 60 * 3  # 3 hours
+
+def bigmove_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT emailed_ts FROM emailed_bigmoves WHERE user_id=? AND symbol=? AND direction=?",
+                (int(uid), str(symbol), str(direction)),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            last_ts = float(row[0] or 0.0)
+            return (time.time() - last_ts) < BIGMOVE_COOLDOWN_SEC
+    except Exception:
+        return False
+
+def mark_bigmove_emailed(uid: int, symbol: str, direction: str) -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO emailed_bigmoves(user_id, symbol, direction, emailed_ts) VALUES(?,?,?,?)",
+                (int(uid), str(symbol), str(direction), time.time()),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def _bigmove_candidates(best_fut: dict, p24: float, p4: float, max_items: int = 12) -> list:
+    """
+    Returns list of dicts: {symbol, ch24, ch4, vol_usd, direction}
+    direction = "UP" if ch4>=0 else "DOWN" (uses ch4 sign)
+    Triggers if abs(ch24)>=p24 OR abs(ch4)>=p4
+    """
+    out = []
+    for sym, mv in (best_fut or {}).items():
+        try:
+            ch24 = float(getattr(mv, "ch24", 0.0) or 0.0)
+            ch4  = float(getattr(mv, "ch4", 0.0) or 0.0)
+            vol  = float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+        except Exception:
+            continue
+
+        if (abs(ch24) >= float(p24)) or (abs(ch4) >= float(p4)):
+            direction = "UP" if ch4 >= 0 else "DOWN"
+            score = max(abs(ch24) / max(p24, 1e-9), abs(ch4) / max(p4, 1e-9))
+            out.append({
+                "symbol": sym,
+                "ch24": ch24,
+                "ch4": ch4,
+                "vol": vol,
+                "direction": direction,
+                "score": score,
+            })
+
+    out.sort(key=lambda x: (x["score"], x["vol"]), reverse=True)
+    return out[: max_items]
 
 
 def symbol_flip_guard_active(
@@ -2486,22 +2559,32 @@ def pick_setups(
 # =========================================================
 # EMAIL
 # =========================================================
+
 def email_config_ok() -> bool:
     """
     Only checks SMTP sender config.
-    Recipient is per-user (users.email_to) OR fallback EMAIL_TO.
+    Recipient is per-user (users.email_to OR users.email) OR fallback EMAIL_TO.
     """
     return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM])
 
-def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None) -> bool:
+
+def send_email(
+    subject: str,
+    body: str,
+    user_id_for_debug: Optional[int] = None,
+    enforce_trade_window: bool = True
+) -> bool:
     """
     Sends an email.
 
     Recipient resolution:
-    - If user_id_for_debug is provided: uses users.email_to
+    - If user_id_for_debug is provided: uses users.email_to OR users.email
     - Otherwise falls back to EMAIL_TO (if set)
 
-    Also enforces per-user trade window (if enabled).
+    Trade window:
+    - Enforced only if enforce_trade_window=True
+      (use False for system alerts like big-move alerts)
+
     Tracks last SMTP error + last email decision for /health and /email_decision.
     """
     uid = int(user_id_for_debug) if user_id_for_debug is not None else None
@@ -2511,7 +2594,11 @@ def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None)
         logger.warning("Email not configured (missing SMTP env vars).")
         if uid is not None:
             _LAST_SMTP_ERROR[uid] = "Email not configured (missing SMTP env vars)."
-            _LAST_EMAIL_DECISION[uid] = {"status": "SKIP", "reason": "smtp_not_configured", "ts": time.time()}
+            _LAST_EMAIL_DECISION[uid] = {
+                "status": "SKIP",
+                "reason": "smtp_not_configured",
+                "ts": time.time()
+            }
         return False
 
     # --- Resolve recipient ---
@@ -2520,17 +2607,10 @@ def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None)
     now_local = None
 
     if uid is not None:
-        user = get_user(uid)
-        to_email = str(user.get("email_to") or "").strip()
+        user = get_user(uid) or {}
+        to_email = str(user.get("email_to") or user.get("email") or "").strip()
 
-        # If trade window feature exists, enforce it here
-        try:
-            tz = ZoneInfo(str(user.get("tz") or "UTC"))
-        except Exception:
-            tz = timezone.utc
-        now_local = datetime.now(tz)
-
-        # If user has NOT set email, we skip (selling bot: you’ll set it via onboarding)
+        # If user has NOT set email, we skip
         if not to_email:
             _LAST_EMAIL_DECISION[uid] = {
                 "status": "SKIP",
@@ -2539,24 +2619,30 @@ def send_email(subject: str, body: str, user_id_for_debug: Optional[int] = None)
             }
             return False
 
-        # Trade window enforcement
-        try:
-            if not in_trade_window_now(user, now_local):
+        # If trade window feature exists, enforce it here (ONLY if enabled)
+        if enforce_trade_window:
+            try:
+                try:
+                    tz = ZoneInfo(str(user.get("tz") or "UTC"))
+                except Exception:
+                    tz = timezone.utc
+                now_local = datetime.now(tz)
+
+                if not in_trade_window_now(user, now_local):
+                    _LAST_EMAIL_DECISION[uid] = {
+                        "status": "SKIP",
+                        "reason": "outside_trade_window",
+                        "ts": time.time(),
+                    }
+                    return False
+            except Exception:
+                # Fail CLOSED to avoid spam:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
-                    "reason": "outside_trade_window",
+                    "reason": "trade_window_check_failed",
                     "ts": time.time(),
                 }
                 return False
-        except Exception:
-            # If trade window parsing ever fails, fail OPEN (send) or fail CLOSED (skip).
-            # I recommend fail CLOSED to avoid spam:
-            _LAST_EMAIL_DECISION[uid] = {
-                "status": "SKIP",
-                "reason": "trade_window_check_failed",
-                "ts": time.time(),
-            }
-            return False
 
     else:
         # Legacy fallback (single recipient deployment)
@@ -5547,7 +5633,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str) -> d
         universe_cap = 35
         trigger_loosen = 1.0
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
-        allow_no_pullback = False
+        allow_no_pullback = True
         scan_multiplier = 10
         directional_take = 12
         market_take = 15
@@ -6296,9 +6382,9 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # EMAIL JOB
 # =========================================================
 
-EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "35"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "25"))
-EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "25"))
+EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "60"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "60"))
+EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "60"))
 
 async def _to_thread_with_timeout(fn, timeout_sec: int, *args, **kwargs):
     return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout_sec)
@@ -6340,6 +6426,71 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         MARKET_VOL_MEDIAN_USD = _median(_all_vols)
+
+                # -----------------------------------------------------
+        # Big-Move Alert Emails (independent of full trade setups)
+        # Trigger: abs(24H) >= user.bigmove_alert_24h  OR  abs(4H) >= user.bigmove_alert_4h
+        # -----------------------------------------------------
+        for u in users:
+            try:
+                uid = int(u.get("id") or u.get("user_id") or 0)
+            except Exception:
+                continue
+            if not uid:
+                continue
+
+            # Must have normal email alerts ON
+            if int(u.get("notify_on", 0) or 0) != 1:
+                continue
+
+            # Must have big-move alerts ON
+            if int(u.get("bigmove_alert_on", 1) or 0) != 1:
+                continue
+
+            try:
+                p24 = float(u.get("bigmove_alert_24h", 40) or 40)
+                p4 = float(u.get("bigmove_alert_4h", 15) or 15)
+            except Exception:
+                p24, p4 = 40.0, 15.0
+
+            candidates = _bigmove_candidates(best_fut, p24=p24, p4=p4, max_items=12)
+            if not candidates:
+                continue
+
+            # Remove ones emailed recently (per symbol + direction)
+            filtered = []
+            for c in candidates:
+                if not bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
+                    filtered.append(c)
+
+            if not filtered:
+                continue
+
+            # Build email body
+            lines = []
+            lines.append("📣 PulseFutures — Big-Move Alerts")
+            lines.append(HDR)
+            lines.append(f"Triggers: |24H| ≥ {p24:.0f}%  OR  |4H| ≥ {p4:.0f}%")
+            lines.append("")
+            for c in filtered[:8]:
+                sym = c["symbol"]
+                ch24 = c["ch24"]
+                ch4 = c["ch4"]
+                vol = c["vol"]
+                arrow = "🟢" if c["direction"] == "UP" else "🔴"
+                lines.append(f"{arrow} {sym}: 24H {ch24:+.0f}% | 4H {ch4:+.0f}% | Vol ~{vol/1e6:.1f}M")
+                lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
+                lines.append("")
+
+            body = "\n".join(lines).strip()
+            subject = "PulseFutures • Big-Move Alert"
+
+            # IMPORTANT: bypass trade-window so you still get alerted
+            ok = send_email(subject, body, user_id_for_debug=uid, enforce_trade_window=False)
+            if ok:
+                for c in filtered[:8]:
+                    mark_bigmove_emailed(uid, c["symbol"], c["direction"])
+
 
         # Build setups per session (PRIORITY: leaders/losers → trend watch → waiting → market leaders)
         setups_by_session: Dict[str, List[Setup]] = {}
