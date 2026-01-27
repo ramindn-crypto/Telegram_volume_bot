@@ -277,8 +277,8 @@ EARLY_EMAIL_MAX_FILL = 1
 EMAIL_EARLY_MIN_CH15_ABS = 0.20   # require at least this abs(15m %) for EARLY emails
 
 # Rule 2) Volume relative filter (killer rule)
-EMAIL_ABS_VOL_USD_MIN = 3_000_000     # hard floor
-EMAIL_REL_VOL_MIN_MULT = 1.25         # require vol >= (median_vol * this multiplier)
+EMAIL_ABS_VOL_USD_MIN = 1_000_000     # hard floor (was too strict)
+EMAIL_REL_VOL_MIN_MULT = 0.6         # require vol >= 0.6x median (was 1.25x median)
 
 # Rule 3) Priority override (Directional Leaders/Losers first)
 EMAIL_PRIORITY_OVERRIDE_ON = True
@@ -5582,12 +5582,45 @@ def _market_leader_bases(best_fut: dict, n: int) -> list:
     except Exception:
         return []
 
-def _best_fut_vol_usd(best_fut: dict, base: str) -> float:
+def _norm_sym(s: str) -> str:
+    s = (s or "").upper().strip()
+    # common variants -> base
+    s = s.replace("USDT.P", "").replace("USDT", "")
+    s = s.replace("-PERP", "").replace("PERP", "")
+    s = s.replace("/", "").replace("-", "").replace("_", "")
+    return s
+
+def _best_fut_vol_usd(best_fut: dict, symbol: str) -> float:
+    """
+    Returns futures volume USD from best_fut dict using robust symbol matching.
+    Handles keys like BTC, BTCUSDT, BTCUSDT.P, BTC/USDT, etc.
+    """
+    if not best_fut:
+        return 0.0
+
+    sym_raw = str(symbol or "").upper().strip()
+    sym_n = _norm_sym(sym_raw)
+
+    # direct hits first
+    mv = (best_fut or {}).get(sym_raw)
+    if mv is None:
+        mv = (best_fut or {}).get(sym_n)
+
+    # brute search by normalized keys
+    if mv is None:
+        for k, v in (best_fut or {}).items():
+            if _norm_sym(str(k)) == sym_n:
+                mv = v
+                break
+
+    if mv is None:
+        return 0.0
+
     try:
-        mv = (best_fut or {}).get(str(base).upper())
         return float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
     except Exception:
         return 0.0
+
 
 def _median(values: list) -> float:
     try:
@@ -6686,15 +6719,35 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 # =========================================================
                 # Rule 2: Volume relative filter (killer rule)
                 # =========================================================
-                vol_usd = _best_fut_vol_usd(best_fut, s.symbol)
-                if vol_usd < float(EMAIL_ABS_VOL_USD_MIN):
+                # Robust volume resolution:
+                # 1) try best_fut lookup
+                # 2) fallback to setup's own fut_vol_usd if present
+                vol_usd = 0.0
+                try:
+                    vol_usd = float(_best_fut_vol_usd(best_fut, getattr(s, "symbol", "")) or 0.0)
+                except Exception:
+                    vol_usd = 0.0
+
+                if vol_usd <= 0.0:
+                    try:
+                        vol_usd = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+                    except Exception:
+                        vol_usd = 0.0
+
+                abs_min = float(EMAIL_ABS_VOL_USD_MIN)
+
+                # If volume is missing/unknown (0), do NOT auto-kill the email.
+                # Treat as "unknown" and let RR/conf/momentum decide.
+                if vol_usd > 0.0 and vol_usd < abs_min:
                     skip_reasons_counter["email_vol_abs_too_low"] += 1
                     continue
-                if float(MARKET_VOL_MEDIAN_USD or 0.0) > 0:
+
+                if vol_usd > 0.0 and float(MARKET_VOL_MEDIAN_USD or 0.0) > 0:
                     rel = vol_usd / float(MARKET_VOL_MEDIAN_USD)
                     if rel < float(EMAIL_REL_VOL_MIN_MULT):
                         skip_reasons_counter["email_vol_rel_too_low"] += 1
                         continue
+
 
                 # =========================================================
                 # Rule 1: Minimum momentum gate for EMAILS
