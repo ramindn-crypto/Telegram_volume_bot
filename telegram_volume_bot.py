@@ -1206,7 +1206,10 @@ def get_user(user_id: int) -> dict:
             DEFAULT_DAILY_CAP_MODE,
             float(DEFAULT_DAILY_CAP_VALUE),
             int(DEFAULT_MAX_TRADES_DAY),
-            1 if EMAIL_ENABLED else 0,
+            
+            # ✅ FIX: default notify_on should NOT depend on EMAIL_ENABLED
+            1,
+            
             json.dumps(sessions),
             int(DEFAULT_MAX_EMAILS_PER_SESSION),
             int(DEFAULT_MIN_EMAIL_GAP_MIN),
@@ -5821,10 +5824,6 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     return up_txt, dn_txt
 
 # =========================================================
-# screen 
-# =========================================================
-
-# =========================================================
 # /screen — Premium Telegram UI (FULL tables like old version)
 # =========================================================
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6382,6 +6381,10 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # EMAIL JOB
 # =========================================================
 
+# =========================================================
+# EMAIL JOB
+# =========================================================
+
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "60"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "60"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "60"))
@@ -6427,72 +6430,77 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 pass
         MARKET_VOL_MEDIAN_USD = _median(_all_vols)
 
-                # -----------------------------------------------------
+        # -----------------------------------------------------
         # Big-Move Alert Emails (independent of full trade setups)
         # Trigger: abs(24H) >= user.bigmove_alert_24h  OR  abs(4H) >= user.bigmove_alert_4h
         # -----------------------------------------------------
-        for u in users:
+        for u in (users or []):
             try:
-                uid = int(u.get("id") or u.get("user_id") or 0)
+                uid = int(u.get("user_id") or u.get("id") or 0)
             except Exception:
-                continue
+                uid = 0
             if not uid:
                 continue
 
-            # Must have normal email alerts ON
-            if int(u.get("notify_on", 0) or 0) != 1:
-                continue
-
-            # Must have big-move alerts ON
-            if int(u.get("bigmove_alert_on", 1) or 0) != 1:
-                continue
-
             try:
-                p24 = float(u.get("bigmove_alert_24h", 40) or 40)
-                p4 = float(u.get("bigmove_alert_4h", 15) or 15)
-            except Exception:
-                p24, p4 = 40.0, 15.0
+                # Must have normal email alerts ON
+                if int(u.get("notify_on", 0) or 0) != 1:
+                    continue
 
-            candidates = _bigmove_candidates(best_fut, p24=p24, p4=p4, max_items=12)
-            if not candidates:
-                continue
+                # Must have big-move alerts ON
+                if int(u.get("bigmove_alert_on", 1) or 0) != 1:
+                    continue
 
-            # Remove ones emailed recently (per symbol + direction)
-            filtered = []
-            for c in candidates:
-                if not bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
-                    filtered.append(c)
+                try:
+                    p24 = float(u.get("bigmove_alert_24h", 40) or 40)
+                    p4 = float(u.get("bigmove_alert_4h", 15) or 15)
+                except Exception:
+                    p24, p4 = 40.0, 15.0
 
-            if not filtered:
-                continue
+                candidates = _bigmove_candidates(best_fut, p24=p24, p4=p4, max_items=12)
+                if not candidates:
+                    continue
 
-            # Build email body
-            lines = []
-            lines.append("📣 PulseFutures — Big-Move Alerts")
-            lines.append(HDR)
-            lines.append(f"Triggers: |24H| ≥ {p24:.0f}%  OR  |4H| ≥ {p4:.0f}%")
-            lines.append("")
-            for c in filtered[:8]:
-                sym = c["symbol"]
-                ch24 = c["ch24"]
-                ch4 = c["ch4"]
-                vol = c["vol"]
-                arrow = "🟢" if c["direction"] == "UP" else "🔴"
-                lines.append(f"{arrow} {sym}: 24H {ch24:+.0f}% | 4H {ch4:+.0f}% | Vol ~{vol/1e6:.1f}M")
-                lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
+                # Remove ones emailed recently (per symbol + direction)
+                filtered = []
+                for c in candidates:
+                    if not bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
+                        filtered.append(c)
+
+                if not filtered:
+                    continue
+
+                # Build email body
+                lines = []
+                lines.append("📣 PulseFutures — Big-Move Alerts")
+                lines.append(HDR)
+                lines.append(f"Triggers: |24H| ≥ {p24:.0f}%  OR  |4H| ≥ {p4:.0f}%")
                 lines.append("")
-
-            body = "\n".join(lines).strip()
-            subject = "PulseFutures • Big-Move Alert"
-
-            # IMPORTANT: bypass trade-window so you still get alerted
-            ok = send_email(subject, body, user_id_for_debug=uid, enforce_trade_window=False)
-            if ok:
                 for c in filtered[:8]:
-                    mark_bigmove_emailed(uid, c["symbol"], c["direction"])
+                    sym = c["symbol"]
+                    ch24 = c["ch24"]
+                    ch4 = c["ch4"]
+                    vol = c["vol"]
+                    arrow = "🟢" if c["direction"] == "UP" else "🔴"
+                    lines.append(f"{arrow} {sym}: 24H {ch24:+.0f}% | 4H {ch4:+.0f}% | Vol ~{vol/1e6:.1f}M")
+                    lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
+                    lines.append("")
 
+                body = "\n".join(lines).strip()
+                subject = "PulseFutures • Big-Move Alert"
 
+                # IMPORTANT: bypass trade-window so you still get alerted
+                ok = send_email(subject, body, user_id_for_debug=uid, enforce_trade_window=False)
+                if ok:
+                    for c in filtered[:8]:
+                        mark_bigmove_emailed(uid, c["symbol"], c["direction"])
+            except Exception:
+                # Never let one user's bigmove logic kill the whole job
+                continue
+
+        # -----------------------------------------------------
         # Build setups per session (PRIORITY: leaders/losers → trend watch → waiting → market leaders)
+        # -----------------------------------------------------
         setups_by_session: Dict[str, List[Setup]] = {}
         for sess_name in ["NY", "LON", "ASIA"]:
             try:
@@ -6505,7 +6513,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pool = {"setups": []}
 
-            setups = pool.get("setups", [])[:max(EMAIL_SETUPS_N * 3, 9)]
+            setups = (pool.get("setups", []) or [])[:max(EMAIL_SETUPS_N * 3, 9)]
 
             # Rule 3: Priority override (Directional Leaders/Losers first)
             if EMAIL_PRIORITY_OVERRIDE_ON:
@@ -6516,18 +6524,43 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 )
 
             setups_by_session[sess_name] = setups
+
             for s in setups:
                 try:
                     db_insert_signal(s)
                 except Exception:
                     pass
 
+        # -----------------------------------------------------
         # Per-user send / skip logic
-        for user in users:
-            uid = int(user["user_id"])
-            tz = ZoneInfo(user["tz"])
+        # -----------------------------------------------------
+        for user in (users or []):
+            # ✅ Robust uid resolution (supports either user_id or id)
+            try:
+                uid = int(user.get("user_id") or user.get("id") or 0)
+            except Exception:
+                uid = 0
+            if not uid:
+                continue
 
-            sess = in_session_now(user)
+            # ✅ Robust tz resolution (never crash job)
+            tz_name = str(user.get("tz") or "UTC")
+            try:
+                tz = ZoneInfo(tz_name)
+            except Exception:
+                tz = timezone.utc
+                tz_name = "UTC"
+
+            # ✅ Ensure session logic never crashes job
+            try:
+                sess = in_session_now(user)
+            except Exception as e:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"in_session_now_failed ({type(e).__name__})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
 
             # If user is NOT in an enabled session right now, skip
             if not sess:
@@ -6538,28 +6571,59 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 }
                 continue
 
-            setups_all = setups_by_session.get(sess["name"], [])
+            setups_all = setups_by_session.get(str(sess.get("name") or ""), []) or []
 
             if not setups_all:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
-                    "reasons": [f"no_setups_generated_for_session ({sess['name']})"],
+                    "reasons": [f"no_setups_generated_for_session ({sess.get('name')})"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
 
-            st = email_state_get(uid)
-            if st["session_key"] != sess["session_key"]:
-                email_state_set(uid, session_key=sess["session_key"], sent_count=0, last_email_ts=0.0)
+            # state init must not crash job
+            try:
                 st = email_state_get(uid)
+            except Exception as e:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "ERROR",
+                    "reasons": [f"email_state_get_failed ({type(e).__name__})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
 
-            max_emails = int(user["max_emails_per_session"])
-            gap_min = int(user["email_gap_min"])
-            gap_sec = gap_min * 60
+            # Reset session state if session_key changed
+            try:
+                if str(st.get("session_key")) != str(sess.get("session_key")):
+                    email_state_set(uid, session_key=str(sess.get("session_key")), sent_count=0, last_email_ts=0.0)
+                    st = email_state_get(uid)
+            except Exception:
+                pass
 
+            # Safe defaults (never KeyError)
+            try:
+                max_emails = int(user.get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION))
+            except Exception:
+                max_emails = int(DEFAULT_MAX_EMAILS_PER_SESSION)
+
+            try:
+                gap_min = int(user.get("email_gap_min", DEFAULT_MIN_EMAIL_GAP_MIN))
+            except Exception:
+                gap_min = int(DEFAULT_MIN_EMAIL_GAP_MIN)
+
+            gap_sec = max(0, gap_min) * 60
+
+            # Daily cap
             day_local = datetime.now(tz).date().isoformat()
-            sent_today = _email_daily_get(uid, day_local)
-            day_cap = int(user.get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY))
+            try:
+                sent_today = _email_daily_get(uid, day_local)
+            except Exception:
+                sent_today = 0
+
+            try:
+                day_cap = int(user.get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY))
+            except Exception:
+                day_cap = int(DEFAULT_MAX_EMAILS_PER_DAY)
 
             if day_cap > 0 and sent_today >= day_cap:
                 _LAST_EMAIL_DECISION[uid] = {
@@ -6569,17 +6633,29 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 }
                 continue
 
-            if max_emails > 0 and int(st["sent_count"]) >= max_emails:
+            # Session cap
+            try:
+                sent_in_session = int(st.get("sent_count", 0) or 0)
+            except Exception:
+                sent_in_session = 0
+
+            if max_emails > 0 and sent_in_session >= max_emails:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
-                    "reasons": [f"session_email_cap_reached ({int(st['sent_count'])}/{max_emails})"],
+                    "reasons": [f"session_email_cap_reached ({sent_in_session}/{max_emails})"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
 
+            # Gap
             now_ts = time.time()
-            if gap_sec > 0 and (now_ts - float(st["last_email_ts"])) < gap_sec:
-                remain = int(gap_sec - (now_ts - float(st["last_email_ts"])))
+            try:
+                last_ts = float(st.get("last_email_ts", 0.0) or 0.0)
+            except Exception:
+                last_ts = 0.0
+
+            if gap_sec > 0 and (now_ts - last_ts) < gap_sec:
+                remain = int(gap_sec - (now_ts - last_ts))
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
                     "reasons": [f"email_gap_active (remain {remain}s)"],
@@ -6587,6 +6663,9 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 }
                 continue
 
+            # ---------------------------
+            # Your existing filter + pick logic
+            # ---------------------------
             min_conf = SESSION_MIN_CONF.get(sess["name"], 78)
             min_rr = SESSION_MIN_RR_TP3.get(sess["name"], 2.0)
 
@@ -6598,6 +6677,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if s.conf < min_conf:
                     skip_reasons_counter["below_session_conf_floor"] += 1
                     continue
+
                 rr3 = rr_to_tp(float(s.entry), float(s.sl), float(s.tp3))
                 if float(rr3) < float(min_rr):
                     skip_reasons_counter["below_session_rr_floor"] += 1
@@ -6710,11 +6790,21 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 ok = False
 
             if ok:
-                email_state_set(uid, last_email_ts=time.time(), sent_count=int(st["sent_count"]) + 1)
-                _email_daily_inc(uid, day_local)
+                try:
+                    email_state_set(uid, last_email_ts=time.time(), sent_count=int(st.get("sent_count", 0) or 0) + 1)
+                except Exception:
+                    pass
+
+                try:
+                    _email_daily_inc(uid, day_local)
+                except Exception:
+                    pass
 
                 for s in chosen_list:
-                    mark_symbol_emailed(uid, s.symbol, s.side, sess["name"])
+                    try:
+                        mark_symbol_emailed(uid, s.symbol, s.side, sess["name"])
+                    except Exception:
+                        pass
 
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SENT",
@@ -6729,19 +6819,20 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
 
-
 async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     d = _LAST_EMAIL_DECISION.get(uid)
     if not d:
         await update.message.reply_text("No email decision recorded yet.")
         return
+
     await update.message.reply_text(
         "📧 Last Email Decision\n"
         f"Status: {d.get('status')}\n"
         f"When: {d.get('when')}\n"
-        f"Reasons:\n- " + "\n- ".join(d.get("reasons", []))
+        "Reasons:\n- " + "\n- ".join(d.get("reasons", []))
     )
+
 
 # =========================================================
 # /health (transparent system health)
