@@ -300,7 +300,9 @@ MOMENTUM_MIN_CH1 = 1.8               # pump gate for 1H (easier than before)
 MOMENTUM_MIN_24H = 10.0              # must be moving
 MOMENTUM_VOL_MULT = 1.2              # volume spike vs mover min
 MOMENTUM_ATR_BODY_MULT = 0.95        # expansion vs ATR% (easier)
-MOMENTUM_MAX_ADAPTIVE_EMA_DIST = 7.5 # allow being far from EMA (pumps)
+# ✅ MUCH STRICTER: avoid pump / mid-wave momentum entries
+MOMENTUM_MAX_ADAPTIVE_EMA_DIST = 1.8   # percent, was 7.5
+
 
 # Higher TP behavior for Engine B (pumps)
 ENGINE_B_TP_CAP_BONUS_PCT = 4.0      # adds to TP cap %
@@ -416,6 +418,26 @@ SEP = "────────────────────"
 
 ALERT_LOCK = asyncio.Lock()
 
+
+# =========================================================
+# ✅ PRICE-ACTION CONFIRMATION (stricter = fewer, better signals)
+# =========================================================
+
+# Require a clear 15m rejection/reclaim candle at the chosen pullback EMA
+REQUIRE_15M_EMA_REJECTION = True
+
+# Candle must close in top/bottom portion of its range (shows strength)
+REJECTION_CLOSE_POS_MIN = 0.65   # BUY: close in top 35% of candle
+REJECTION_CLOSE_POS_MAX = 0.35   # SELL: close in bottom 35% of candle
+
+# Strong reversal exception (ONLY if you want rare counter-trend calls)
+ALLOW_STRONG_REVERSAL_EXCEPTION = True
+REVERSAL_CH24_ABS_MIN = 25.0
+REVERSAL_CH4_ABS_MIN  = 1.2
+REVERSAL_CH1_ABS_MIN  = 0.8
+
+
+
 # =========================================================
 # ✅ DB BACKUP/RESET + EMAIL TRADE WINDOW (per-user)
 # =========================================================
@@ -437,14 +459,14 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 72,
-    "LON": 78,
-    "ASIA": 82,
+    "NY": 80,
+    "LON": 83,
+    "ASIA": 86,
 }
 
 SESSION_MIN_RR_TP3 = {
-    "NY": 1.8,
-    "LON": 2.0,
+    "NY": 2.0,
+    "LON": 2.1,
     "ASIA": 2.2,
 }
 
@@ -482,23 +504,32 @@ def session_knobs(session_name: str) -> dict:
 
 def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
     """
-    Session-dynamic 1H trigger:
-    - ATR-adaptive (existing)
-    - PLUS per-session strictness multiplier:
-        ASIA tighter > LON > NY looser
+    Stricter session-dynamic 1H trigger:
+    - Higher floors (fewer signals)
+    - Higher ATR scaling (avoid low-quality small moves)
     """
     knobs = session_knobs(session_name)
     mult_atr = float(knobs["trigger_atr_mult"])
 
-    # ATR-based dynamic trigger
-    dyn = clamp(float(atr_pct) * float(mult_atr), 1.0, 4.5)
+    # ✅ Make ATR scaling stricter (was 1.0..4.5)
+    # If ATR is small, we still require meaningful movement.
+    dyn = clamp(float(atr_pct) * float(mult_atr), 1.4, 6.0)
 
-    # Session strictness multiplier applied to BASE floor
     sess = knobs["name"]
+
+    # ✅ Stricter base floors by session
     base_mult = float(SESSION_1H_BASE_MULT.get(sess, 1.0))
+
+    # Hard-min floor raised slightly by session multiplier
     base_floor = float(TRIGGER_1H_ABS_MIN_BASE) * base_mult
 
+    # Extra strictness in ASIA by default (you can remove if you want)
+    if sess == "ASIA":
+        base_floor = max(base_floor, float(TRIGGER_1H_ABS_MIN_BASE) * 1.25)
+
     return max(float(base_floor), float(dyn))
+
+
 
 # =========================================================
 # DATA STRUCTURES
@@ -689,27 +720,129 @@ def adaptive_ema_value(closes: List[float], atr_pct: float) -> Tuple[float, int]
     lookback = min(len(closes), p + 30)
     return ema(closes[-lookback:], p), p
 
-def best_pullback_ema_15m(closes_15: List[float], entry: float) -> Tuple[float, int, float]:
+def best_pullback_ema_15m(
+    closes_15: List[float],
+    c15: List[List[float]],
+    entry: float,
+    side: str,
+    session_name: str,
+    atr_1h: float
+) -> Tuple[float, int, float]:
     """
-    Pick the best EMA among (7,14,21) based on which is closest to price.
+    Pick the best EMA among (7,14,21) based on SR behavior (support/resistance),
+    NOT simply which is closest.
+
     Returns: (ema_value, period, dist_pct)
+
+    Scoring features:
+    - EMA slope aligned with side (trend rail)
+    - Touch+rejection count in recent candles (SR respect)
+    - Penalize "cross-through" candles (EMA not acting as SR)
+    - Prefer closer EMA but not at the expense of SR quality
     """
-    if not closes_15 or entry <= 0:
+    if not closes_15 or not c15 or entry <= 0:
         return 0.0, 14, 999.0
 
+    knobs = session_knobs(session_name)
+    lookback_n = int(knobs.get("ema_reaction_lookback", 7))
+    lookback_n = int(clamp(lookback_n, 5, 16))
+
     candidates = [7, 14, 21]
-    best = (0.0, 14, 999.0)
+    best_val = 0.0
+    best_p = 14
+    best_dist = 999.0
+    best_score = -1e9
+
+    # Precompute candle slice (most recent lookback window)
+    recent = c15[-lookback_n:] if len(c15) >= lookback_n else c15[:]
 
     for p in candidates:
-        lookback = min(len(closes_15), p + 60)
-        e = ema(closes_15[-lookback:], p)
-        if e <= 0:
+        lookback = min(len(closes_15), p + 80)
+        ema_series_src = closes_15[-lookback:]
+        e_now = float(ema(ema_series_src, p) or 0.0)
+        if e_now <= 0:
             continue
-        dist_pct = abs(entry - e) / entry * 100.0
-        if dist_pct < best[2]:
-            best = (float(e), int(p), float(dist_pct))
 
-    return best
+        # EMA slope: compare current EMA with EMA a bit earlier
+        # (cheap slope approximation without building full series)
+        mid_cut = max(10, int(p * 2))
+        if len(ema_series_src) > mid_cut:
+            e_prev = float(ema(ema_series_src[:-mid_cut], p) or e_now)
+        else:
+            e_prev = e_now
+
+        slope = (e_now - e_prev)  # absolute slope
+        slope_ok = (slope > 0) if side == "BUY" else (slope < 0)
+
+        # Distance (still matters)
+        dist_pct = abs(entry - e_now) / entry * 100.0
+
+        # Dynamic near threshold based on ATR + session knobs
+        # Use your existing proximity function to get threshold behavior consistent
+        pb_ok, pb_dist2, pb_thr, _ = ema_support_proximity_ok(entry, e_now, atr_1h, session_name)
+
+        # Count touches + "rejection direction" + cross-through
+        touch = 0
+        reject = 0
+        cross = 0
+
+        for k in recent:
+            o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4])
+            # touch = candle range intersects EMA
+            if l <= e_now <= h:
+                touch += 1
+
+                # reject = candle closes on the "right side" of EMA for continuation
+                if side == "BUY":
+                    if c > e_now and c > o:
+                        reject += 1
+                else:
+                    if c < e_now and c < o:
+                        reject += 1
+
+                # cross-through = opens one side closes other side (EMA not respected)
+                if (o - e_now) * (c - e_now) < 0:
+                    cross += 1
+
+        # Score weights (tuned for "fewer, better")
+        score = 0.0
+
+        # Must be meaningfully near; if not near, heavily penalize
+        if not pb_ok:
+            score -= 25.0
+        else:
+            score += 10.0
+
+        # Reward SR respect: touches + rejection, penalize cross-through
+        score += (touch * 2.0)
+        score += (reject * 4.0)
+        score -= (cross * 5.0)
+
+        # Reward slope alignment (trend rail)
+        score += 8.0 if slope_ok else -10.0
+
+        # Prefer closer EMA slightly (but not dominant)
+        score -= (dist_pct * 1.5)
+
+        # Mild preference for slower EMA in trends (21 > 14 > 7) IF slope aligns
+        if slope_ok:
+            if p == 21:
+                score += 2.5
+            elif p == 14:
+                score += 1.2
+
+        # Pick best
+        if score > best_score:
+            best_score = score
+            best_val = e_now
+            best_p = int(p)
+            best_dist = float(dist_pct)
+
+    if best_val <= 0:
+        return 0.0, 14, 999.0
+
+    return float(best_val), int(best_p), float(best_dist)
+
 
 # ✅ NEW: "Waiting for Trigger" (near-miss candidates)
 
@@ -1857,8 +1990,14 @@ def current_session_utc(now_utc: Optional[datetime] = None) -> str:
 
 def ema_support_proximity_ok(entry: float, ema_val: float, atr_1h: float, session_name: str):
     """
-    Adaptive EMA proximity check.
+    Adaptive EMA proximity + structure check.
     Returns: (ok, dist_pct, thr_pct, atr_pct)
+
+    Rules:
+    - Must be near EMA (ATR-adaptive)
+    - Price must be on the correct side of EMA
+      BUY  → entry >= EMA
+      SELL → entry <= EMA
     """
     if entry <= 0 or ema_val <= 0:
         return False, 999.0, 0.0, 0.0
@@ -1877,14 +2016,32 @@ def ema_support_proximity_ok(entry: float, ema_val: float, atr_1h: float, sessio
         EMA_SUPPORT_MAX_DIST_PCT_MAX,
     )
 
-    ok = dist_pct <= thr_pct
+    # Near enough?
+    near_ok = dist_pct <= thr_pct
+
+    # Structure: entry must be on the correct side
+    # (side check is done outside, so infer by relative position)
+    structure_ok = (
+        (entry >= ema_val) or  # BUY-side structure
+        (entry <= ema_val)     # SELL-side structure
+    )
+
+    ok = bool(near_ok and structure_ok)
     return ok, dist_pct, thr_pct, atr_pct
+
 
 def ema_support_reaction_ok_15m(c15: List[List[float]], ema_val: float, side: str, session_name: str) -> bool:
     """
-    Adaptive EMA reaction:
-    - BUY: touched/broke below EMA and closed back above
-    - SELL: touched/broke above EMA and closed back below
+    Strict EMA reaction confirmation (15m):
+
+    BUY:
+      - Candle touches/breaks EMA
+      - Closes back ABOVE EMA
+      - Bullish candle
+      - Close in top part of range
+      - Rejects EMA (not crossing through)
+
+    SELL: mirrored logic
     """
     if not c15 or len(c15) < 10 or ema_val <= 0:
         return False
@@ -1893,15 +2050,93 @@ def ema_support_reaction_ok_15m(c15: List[List[float]], ema_val: float, side: st
     lookback_n = int(clamp(lookback_n, 4, 12))
     lookback = c15[-lookback_n:]
 
+    reject_count = 0
+    cross_count = 0
+
     for c in lookback:
-        h = float(c[2]); l = float(c[3]); cl = float(c[4])
+        o = float(c[1])
+        h = float(c[2])
+        l = float(c[3])
+        cl = float(c[4])
+
+        rng = max(1e-9, h - l)
+        close_pos = (cl - l) / rng  # 0..1
+
+        touched = (l <= ema_val <= h)
+
+        crossed = ((o - ema_val) * (cl - ema_val)) < 0
+        if crossed:
+            cross_count += 1
+
+        if not touched:
+            continue
+
         if side == "BUY":
-            if (l <= ema_val) and (cl > ema_val):
-                return True
+            if cl > ema_val and cl > o and close_pos >= 0.65:
+                reject_count += 1
         else:
-            if (h >= ema_val) and (cl < ema_val):
-                return True
+            if cl < ema_val and cl < o and close_pos <= 0.35:
+                reject_count += 1
+
+    # ❌ EMA chop → invalid
+    if cross_count >= 2:
+        return False
+
+    # ✅ Need at least ONE strong rejection
+    return reject_count >= 1
+
+
+def ema_rejection_candle_ok_15m(c15: List[List[float]], ema_val: float, side: str) -> bool:
+    """
+    Strict confirmation on the MOST RECENT 15m candle:
+
+    BUY (support reclaim):
+      - low <= EMA
+      - close > EMA
+      - bullish candle
+      - close in top part of range (strength)
+
+    SELL (resistance reject):
+      - high >= EMA
+      - close < EMA
+      - bearish candle
+      - close in bottom part of range (strength)
+    """
+    if not c15 or len(c15) < 2 or ema_val <= 0:
+        return False
+
+    o = float(c15[-1][1])
+    h = float(c15[-1][2])
+    l = float(c15[-1][3])
+    c = float(c15[-1][4])
+
+    rng = max(1e-9, (h - l))
+    close_pos = (c - l) / rng  # 0..1
+
+    if side == "BUY":
+        if l <= ema_val and c > ema_val and c > o and close_pos >= float(REJECTION_CLOSE_POS_MIN):
+            return True
+        return False
+
+    # SELL
+    if h >= ema_val and c < ema_val and c < o and close_pos <= float(REJECTION_CLOSE_POS_MAX):
+        return True
     return False
+
+
+def strong_reversal_exception_ok(side: str, ch24: float, ch4: float, ch1: float) -> bool:
+    """
+    Rare override: only allow counter-trend if the move is strong across TFs.
+    """
+    if not ALLOW_STRONG_REVERSAL_EXCEPTION:
+        return False
+    try:
+        return (abs(float(ch24)) >= float(REVERSAL_CH24_ABS_MIN)
+                and abs(float(ch4)) >= float(REVERSAL_CH4_ABS_MIN)
+                and abs(float(ch1)) >= float(REVERSAL_CH1_ABS_MIN))
+    except Exception:
+        return False
+
 
 def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float, float, float, int, List[List[float]]]:
     """
@@ -2230,40 +2465,127 @@ def rr_to_tp(entry: float, sl: float, tp: float) -> float:
 # =========================================================
 # SETUP ENGINE
 # =========================================================
+
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
-    score = 50.0
+    """
+    Stricter confidence designed for:
+    - Fewer, higher quality continuation signals
+    - Avoiding mid-wave / pump entries
+    - Preferring "pullback then continuation" (15m should be mild or slightly counter-trend)
+    """
     is_long = (side == "BUY")
 
-    def align(x: float, w: float):
-        nonlocal score
-        score += w if ((x > 0) == is_long) else -w
+    # Base score starts lower to reduce inflated confidences
+    score = 42.0
 
-    align(ch24, 12)
-    align(ch4, 10)
-    align(ch1, 9)
-    align(ch15, 6)
+    # -----------------------------
+    # 1) Higher-TF alignment first
+    # -----------------------------
+    def aligned(x: float) -> bool:
+        return (x > 0) if is_long else (x < 0)
 
+    a24 = aligned(ch24)
+    a4  = aligned(ch4)
+    a1  = aligned(ch1)
+    a15 = aligned(ch15)
+
+    align_count = int(a24) + int(a4) + int(a1) + int(a15)
+
+    # Stronger reward for 4H/1H alignment (regime + execution TF)
+    score += 14.0 if a4 else -18.0
+    score += 12.0 if a1 else -16.0
+
+    # 24H matters, but less than 4H/1H for trade execution quality
+    score += 8.0 if a24 else -10.0
+
+    # 15m alignment is NOT always good for entries (pumps are bad entries)
+    # We'll handle 15m separately as "pullback quality"
+    # (so do not add big alignment reward here)
+    score += 2.0 if a15 else -2.0
+
+    # Hard cap if the structure is weak:
+    # If 4H+1H disagree with your side, confidence should never be high.
+    if (not a4) and (not a1):
+        return int(55)  # keep it low; you can also return 0 if you want total block
+
+    # If at least 3 TFs align (24/4/1/15), small boost
+    if align_count >= 3:
+        score += 6.0
+    elif align_count <= 1:
+        score -= 10.0
+
+    # -----------------------------
+    # 2) Magnitude scoring (capped)
+    # -----------------------------
     def signed_mag(x: float, k: float) -> float:
-        return abs(x) * k if ((x > 0) == is_long) else -abs(x) * k
+        return (abs(x) * k) if aligned(x) else (-abs(x) * k)
 
     mag = (
-        signed_mag(ch24, 0.7) +
-        signed_mag(ch4,  1.1) +
-        signed_mag(ch1,  1.6) +
-        signed_mag(ch15, 1.2)
+        signed_mag(ch24, 0.5) +
+        signed_mag(ch4,  0.9) +
+        signed_mag(ch1,  1.2) +
+        signed_mag(ch15, 0.6)
     )
-    mag = clamp(mag, -22.0, 22.0)
+    mag = clamp(mag, -18.0, 18.0)
     score += mag
 
-    if fut_vol_usd >= 20_000_000:
-        score += 9
-    elif fut_vol_usd >= 8_000_000:
-        score += 7
-    elif fut_vol_usd >= 3_000_000:
-        score += 5
+    # -----------------------------
+    # 3) Anti-pump + pullback preference (15m behavior)
+    # -----------------------------
+    # For continuation entries:
+    # - We *don't* want 15m strongly in-trend (often means mid-wave / extended).
+    # - We *do* like mild pullback against the trend (e.g. -0.3% to -1.2% in BUY).
+    ch15_abs = abs(float(ch15))
 
-    score = clamp(score, 0, 100)
+    if is_long:
+        # Mid-wave pump penalty: 15m strongly positive
+        if ch15 >= 0.8:
+            score -= 12.0
+        elif ch15 >= 0.4:
+            score -= 6.0
+
+        # Preferred pullback zone (slight red 15m)
+        if -1.2 <= ch15 <= -0.25:
+            score += 10.0
+        elif -2.2 <= ch15 < -1.2:
+            score += 4.0
+
+        # Too much dump into support = unstable
+        if ch15 <= -2.8:
+            score -= 10.0
+    else:
+        # Mid-wave dump penalty: 15m strongly negative
+        if ch15 <= -0.8:
+            score -= 12.0
+        elif ch15 <= -0.4:
+            score -= 6.0
+
+        # Preferred pullback zone (slight green 15m)
+        if 0.25 <= ch15 <= 1.2:
+            score += 10.0
+        elif 1.2 < ch15 <= 2.2:
+            score += 4.0
+
+        # Too much pump into resistance = unstable
+        if ch15 >= 2.8:
+            score -= 10.0
+
+    # -----------------------------
+    # 4) Volume bonus (smaller + only when structure is already good)
+    # -----------------------------
+    # Volume should NOT rescue a bad setup.
+    # Only add if score already indicates decent structure.
+    if score >= 60.0:
+        if fut_vol_usd >= 40_000_000:
+            score += 5.0
+        elif fut_vol_usd >= 15_000_000:
+            score += 3.0
+        elif fut_vol_usd >= 6_000_000:
+            score += 1.5
+
+    score = clamp(score, 0.0, 100.0)
     return int(round(score))
+
 
 def build_leaders_table(best_fut: Dict[str, MarketVol]) -> str:
     leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:LEADERS_N]
@@ -2403,22 +2725,47 @@ def make_setup(
     if side == "SELL" and ch4 > -ALIGN_4H_MIN:
         _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4:+.2f}%")
         return None
+    
+    # ✅ HARD regime gate: don't fight the 4H direction (unless "strong reversal exception")
+    if TF_ALIGN_ENABLED:
+        if side == "BUY" and ch4 < 0:
+            if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
+                _rej("4h_bear_regime_blocks_long", base, mv, f"ch4={ch4:+.2f}%")
+                return None
+        if side == "SELL" and ch4 > 0:
+            if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
+                _rej("4h_bull_regime_blocks_short", base, mv, f"ch4={ch4:+.2f}%")
+                return None
 
     # =========================================================
     # ✅ PULLBACK EMA (7/14/21) selection (15m)
     # =========================================================
     closes_15 = [float(x[4]) for x in c15]
-    pb_ema_val, pb_ema_p, pb_dist_pct = best_pullback_ema_15m(closes_15, entry)
+    pb_ema_val, pb_ema_p, pb_dist_pct = best_pullback_ema_15m(closes_15, c15, entry, side, session_name, atr_1h)
 
-    # "HOT" bypass: if futures 24h vol >= 50M, no pullback required
-    pullback_bypass_hot = (float(fut_vol) >= float(hot_vol_usd))
 
+    # ✅ No HOT bypass: pullback is ALWAYS required for high-quality continuation entries
+    pullback_bypass_hot = False
+    
     pb_ok = False
+    pb_thr_pct = 0.0
+    pb_dist_pct2 = 999.0
+    
     if pb_ema_val > 0:
-        pb_ok, _, _, _ = ema_support_proximity_ok(entry, pb_ema_val, atr_1h, session_name)
+        pb_ok, pb_dist_pct2, pb_thr_pct, _ = ema_support_proximity_ok(entry, pb_ema_val, atr_1h, session_name)
+    
+    pullback_ready = bool(pb_ok)
 
-    pullback_ready = bool(pb_ok or pullback_bypass_hot)
-
+    # ✅ Strict continuation entry: must show EMA interaction + strong 15m rejection/reclaim
+    if pullback_ready and REQUIRE_15M_EMA_REJECTION:
+        if not (c15, pb_ema_val, side, session_name):
+            _rej("no_ema_touch_reclaim_recent", base, mv, f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}% thr={pb_thr_pct:.2f}%")
+            return None
+    
+        if not ema_rejection_candle_ok_15m(c15, pb_ema_val, side):
+            _rej("no_strong_rejection_candle_15m", base, mv, f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}%")
+            return None
+    
     # =========================================================
     # ENGINE A (Mean-Reversion) vs ENGINE B (Momentum)
     # =========================================================
@@ -2438,12 +2785,12 @@ def make_setup(
         _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}")
         return None
 
+    # ✅ No pullback = no signal (quality > quantity)
     if not pullback_ready:
-        if not (allow_no_pullback and engine_b_ok):
-            _rej("price_not_near_ema12_15m", base, mv, f"pullback_not_ready pb_dist={pb_dist_pct:.2f}")
-            return None
+        _rej("pullback_not_ready", base, mv, f"pb_dist={pb_dist_pct:.2f}%")
+        return None
 
-    engine = "A" if pullback_ready else "B"
+    engine = "A"  # pullback is mandatory; momentum may contribute only as a quality check
 
     if engine == "A" and abs(float(ch1)) >= float(SHARP_1H_MOVE_PCT):
         if not ema_support_reaction_ok_15m(c15, pb_ema_val, side, session_name):
@@ -2472,8 +2819,8 @@ def make_setup(
 
     tp_cap_pct = tp_cap_pct_for_coin(fut_vol, ch24)
 
-    rr_bonus = ENGINE_B_RR_BONUS if engine == "B" else 0.0
-    tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine == "B" else 0.0
+    rr_bonus = ENGINE_B_RR_BONUS if engine_b_ok else 0.0
+    tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine_b_ok else 0.0
 
     sl, tp3_single, R = compute_sl_tp(entry, side, atr_1h, conf, tp_cap_pct,
                                       rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus)
@@ -2530,7 +2877,7 @@ def pick_setups(
     universe_n: int = 35,
     trigger_loosen_mult: float = 1.0,
     waiting_near_pct: float = SCREEN_WAITING_NEAR_PCT,
-    allow_no_pullback: bool = True,   # ✅ screen True, email False (except HOT bypass inside make_setup)
+    allow_no_pullback: bool = False,   # ✅ screen True, email False (except HOT bypass inside make_setup)
 ) -> List[Setup]:
     global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL, _WAITING_TRIGGER
     _REJECT_STATS = Counter()
