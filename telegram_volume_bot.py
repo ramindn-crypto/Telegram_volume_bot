@@ -1447,6 +1447,19 @@ def list_users_notify_on() -> List[dict]:
     con.close()
     return [dict(r) for r in rows]
 
+def list_users_with_email() -> List[dict]:
+    """
+    Users eligible for email sends (have a saved recipient email).
+    This is used for Big-Move Alerts so it works even if notify_on=0.
+    """
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM users WHERE email_to IS NOT NULL AND TRIM(email_to) != ''")
+    rows = cur.fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+    
 def email_state_get(user_id: int) -> dict:
     con = db_connect()
     cur = con.cursor()
@@ -6784,8 +6797,12 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not email_config_ok():
             return
 
-        users = list_users_notify_on()
-        if not users:
+        # Trade-signal emails may be notify_on-gated,
+        # but Big-Move Alerts should go to anyone who has an email saved.
+        users_notify = list_users_notify_on()
+        users_bigmove = list_users_with_email()
+        
+        if not users_notify and not users_bigmove:
             return
 
         # TIMEOUT-PROTECTED fetch (prevents lock being held forever)
@@ -6814,7 +6831,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         # Big-Move Alert Emails (independent of full trade setups)
         # Trigger: abs(24H) >= user.bigmove_alert_24h  OR  abs(4H) >= user.bigmove_alert_4h
         # -----------------------------------------------------
-        for u in (users or []):
+        for u in (users_bigmove or []):
             try:
                 uid = int(u.get("user_id") or u.get("id") or 0)
             except Exception:
@@ -6823,14 +6840,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             try:
-                # Must have normal email alerts ON
-                if int(u.get("notify_on", 0) or 0) != 1:
-                    continue
-
-                # Must have big-move alerts ON
-                if int(u.get("bigmove_alert_on", 1) or 0) != 1:
-                    continue
-
                 try:
                     p24 = float(u.get("bigmove_alert_24h", 40) or 40)
                     p4 = float(u.get("bigmove_alert_4h", 15) or 15)
@@ -6914,7 +6923,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         # -----------------------------------------------------
         # Per-user send / skip logic
         # -----------------------------------------------------
-        for user in (users or []):
+        for user in (users_notify or []):
             # ✅ Robust uid resolution (supports either user_id or id)
             try:
                 uid = int(user.get("user_id") or user.get("id") or 0)
