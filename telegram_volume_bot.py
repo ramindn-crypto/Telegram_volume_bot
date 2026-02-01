@@ -1455,11 +1455,29 @@ def list_users_with_email() -> List[dict]:
     This is used for Big-Move Alerts so it works even if notify_on=0.
     """
     con = db_connect()
-    cur = con.cursor()
-    cur.execute("SELECT * FROM users WHERE email_to IS NOT NULL AND TRIM(email_to) != ''")
-    rows = cur.fetchall()
-    con.close()
-    return [dict(r) for r in rows]
+    try:
+        # Ensure rows are dict-convertible
+        try:
+            import sqlite3
+            con.row_factory = sqlite3.Row
+        except Exception:
+            pass
+
+        cur = con.cursor()
+        cur.execute("""
+            SELECT *
+            FROM users
+            WHERE (email_to IS NOT NULL AND TRIM(email_to) != '')
+               OR (email    IS NOT NULL AND TRIM(email)    != '')
+        """)
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
 
     
 def email_state_get(user_id: int) -> dict:
@@ -6882,16 +6900,20 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 continue
         
             try:
+                # Always re-fetch the full user record (list_users_with_email may be partial)
+                uu = get_user(uid) or {}
+                
                 # Respect per-user ON/OFF
-                on = int(u.get("bigmove_alert_on", 1) or 0)
+                on = int(uu.get("bigmove_alert_on", 1) or 0)
                 if not on:
                     continue
-        
+                
                 try:
-                    p4 = float(u.get("bigmove_alert_4h", 20) or 20)
-                    p1 = float(u.get("bigmove_alert_1h", 10) or 10)
+                    p4 = float(uu.get("bigmove_alert_4h", 20) or 20)
+                    p1 = float(uu.get("bigmove_alert_1h", 10) or 10)
                 except Exception:
                     p4, p1 = 20.0, 10.0
+
         
                 candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, max_items=12)
                 if not candidates:
@@ -6943,11 +6965,11 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     for c in filtered[:8]:
                         mark_bigmove_emailed(uid, c["symbol"], c["direction"])
         
-            except Exception:
-                # Never let one user's bigmove logic kill the whole job
+            except Exception as e:
+                logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
                 continue
 
-
+         
         # -----------------------------------------------------
         # Build setups per session (PRIORITY: leaders/losers → trend watch → waiting → market leaders)
         # -----------------------------------------------------
