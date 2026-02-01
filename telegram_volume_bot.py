@@ -1144,10 +1144,12 @@ def db_init():
         cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_on INTEGER NOT NULL DEFAULT 1")
     
     # Aligned defaults (per your request): 24H >= 40 OR 4H >= 15
-    if "bigmove_alert_24h" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_24h REAL NOT NULL DEFAULT 40")  # %
+    # Aligned defaults: 4H >= 20 OR 1H >= 10
     if "bigmove_alert_4h" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_4h REAL NOT NULL DEFAULT 15")  # %
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_4h REAL NOT NULL DEFAULT 20")
+    if "bigmove_alert_1h" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_1h REAL NOT NULL DEFAULT 10")
+
     
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trades (
@@ -1572,35 +1574,68 @@ def mark_bigmove_emailed(uid: int, symbol: str, direction: str) -> None:
     except Exception:
         pass
 
-def _bigmove_candidates(best_fut: dict, p24: float, p4: float, max_items: int = 12) -> list:
+def _bigmove_candidates(best_fut: dict, p4: float, p1: float, max_items: int = 12) -> list:
     """
-    Returns list of dicts: {symbol, ch24, ch4, vol_usd, direction}
-    direction = "UP" if ch4>=0 else "DOWN" (uses ch4 sign)
-    Triggers if abs(ch24)>=p24 OR abs(ch4)>=p4
+    Returns list of dicts: {symbol, ch4, ch1, vol, direction, score}
+
+    direction:
+      - "UP"   → strong positive move
+      - "DOWN" → strong negative move
+
+    Triggers:
+      - UP   if ch4 >= +p4 OR ch1 >= +p1
+      - DOWN if ch4 <= -p4 OR ch1 <= -p1
     """
+
     out = []
+
     for sym, mv in (best_fut or {}).items():
         try:
-            ch24 = float(getattr(mv, "ch24", 0.0) or 0.0)
-            ch4  = float(getattr(mv, "ch4", 0.0) or 0.0)
-            vol  = float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+            ch4 = float(getattr(mv, "ch4", 0.0) or 0.0)
+            ch1 = float(getattr(mv, "ch1", 0.0) or 0.0)
+            vol = float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
         except Exception:
             continue
 
-        if (abs(ch24) >= float(p24)) or (abs(ch4) >= float(p4)):
-            direction = "UP" if ch4 >= 0 else "DOWN"
-            score = max(abs(ch24) / max(p24, 1e-9), abs(ch4) / max(p4, 1e-9))
-            out.append({
-                "symbol": sym,
-                "ch24": ch24,
-                "ch4": ch4,
-                "vol": vol,
-                "direction": direction,
-                "score": score,
-            })
+        # Directional triggers
+        up_hit   = (ch4 >= float(p4)) or (ch1 >= float(p1))
+        down_hit = (ch4 <= -float(p4)) or (ch1 <= -float(p1))
+
+        if not (up_hit or down_hit):
+            continue
+
+        # Resolve direction
+        if down_hit and not up_hit:
+            direction = "DOWN"
+        elif up_hit and not down_hit:
+            direction = "UP"
+        else:
+            # Mixed signals → 1H decides
+            direction = "UP" if ch1 >= 0 else "DOWN"
+
+        # Direction-aware scoring
+        score_up = max(
+            (abs(ch4) / max(p4, 1e-9)) if ch4 > 0 else 0.0,
+            (abs(ch1) / max(p1, 1e-9)) if ch1 > 0 else 0.0,
+        )
+        score_dn = max(
+            (abs(ch4) / max(p4, 1e-9)) if ch4 < 0 else 0.0,
+            (abs(ch1) / max(p1, 1e-9)) if ch1 < 0 else 0.0,
+        )
+
+        score = max(score_up, score_dn)
+
+        out.append({
+            "symbol": sym,
+            "ch4": ch4,
+            "ch1": ch1,
+            "vol": vol,
+            "direction": direction,
+            "score": score,
+        })
 
     out.sort(key=lambda x: (x["score"], x["vol"]), reverse=True)
-    return out[: max_items]
+    return out[:max_items]
 
 
 def symbol_flip_guard_active(
@@ -3718,19 +3753,25 @@ Market Scan Controls & Alerts ↓
     Disables 24-hour mode.
     • Reverts back to session-based email signaling only
     
-    /bigmove_alert [on <24H%> <4H%> | off]
+    /bigmove_alert [on <4H%> <1H%> | off]
     
-    Sends ALERT emails for strong market moves,
+    Sends ALERT emails for strong market moves
+    in either direction (UP or DOWN),
     even if they do NOT qualify as full trade signals.
     
-    Default thresholds:
-    • 24H ≥ 40%  OR
-    • 4H ≥ 15%
+    Triggers on:
+    • +4H ≥ threshold  OR  +1H ≥ threshold
+    • −4H ≥ threshold  OR  −1H ≥ threshold
     
+    Default thresholds:
+    • 4H ≥ +20% OR ≤ −20%
+    • 1H ≥ +10% OR ≤ −10%
+
     Examples:
     • /bigmove_alert
-    • /bigmove_alert on 60 25
+    • /bigmove_alert on 30 12
     • /bigmove_alert off
+
 ────────────────────
 2) Position Sizing (NO trade opened)
 ────────────────────
@@ -4703,14 +4744,14 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args:
         on = int(user.get("bigmove_alert_on", 1) or 0)
-        p24 = float(user.get("bigmove_alert_24h", 40) or 40)
-        p4 = float(user.get("bigmove_alert_4h", 15) or 15)
+        p4 = float(user.get("bigmove_alert_4h", 20) or 20)
+        p1 = float(user.get("bigmove_alert_1h", 10) or 10)
         await update.message.reply_text(
             "📣 Big-Move Alert Emails\n"
             f"{HDR}\n"
             f"Status: {'ON' if on else 'OFF'}\n"
-            f"Thresholds: 24H ≥ {p24:.0f}% OR 4H ≥ {p4:.0f}%\n\n"
-            "Set: /bigmove_alert on 40 15\n"
+            f"Thresholds (absolute, UP or DOWN): 4H ≥ {p4:.0f}% OR 1H ≥ {p1:.0f}%\n\n"
+            "Set: /bigmove_alert on 20 10\n"
             "Off: /bigmove_alert off"
         )
         return
@@ -4723,20 +4764,21 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode in {"on", "1", "enable"}:
-        p24 = 40.0
-        p4 = 15.0
+        p4 = 20.0
+        p1 = 10.0
         if len(context.args) >= 3:
             try:
-                p24 = float(context.args[1])
-                p4 = float(context.args[2])
+                p4 = float(context.args[1])
+                p1 = float(context.args[2])
             except Exception:
-                await update.message.reply_text("Usage: /bigmove_alert on 40 15 (percent thresholds)")
+                await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)")
                 return
-        update_user(uid, bigmove_alert_on=1, bigmove_alert_24h=p24, bigmove_alert_4h=p4)
-        await update.message.reply_text(f"✅ Big-move alert emails: ON (24H≥{p24:.0f}% OR 4H≥{p4:.0f}%)")
+        update_user(uid, bigmove_alert_on=1, bigmove_alert_4h=p4, bigmove_alert_1h=p1)
+        await update.message.reply_text(f"✅ Big-move alert emails: ON (4H≥{p4:.0f}% OR 1H≥{p1:.0f}%)")
         return
 
-    await update.message.reply_text("Usage: /bigmove_alert on 40 15 OR /bigmove_alert off")
+    await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)  OR  /bigmove_alert off")
+
 
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -6841,12 +6883,12 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 try:
-                    p24 = float(u.get("bigmove_alert_24h", 40) or 40)
-                    p4 = float(u.get("bigmove_alert_4h", 15) or 15)
+                    p4 = float(u.get("bigmove_alert_4h", 20) or 20)
+                    p1 = float(u.get("bigmove_alert_1h", 10) or 10)
                 except Exception:
                     p24, p4 = 40.0, 15.0
 
-                candidates = _bigmove_candidates(best_fut, p24=p24, p4=p4, max_items=12)
+                candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, max_items=12)
                 if not candidates:
                     continue
 
@@ -6863,7 +6905,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 lines = []
                 lines.append("📣 PulseFutures — Big-Move Alerts")
                 lines.append(HDR)
-                lines.append(f"Triggers: |24H| ≥ {p24:.0f}%  OR  |4H| ≥ {p4:.0f}%")
+                lines.append(f"Triggers: |4H| ≥ {p4:.0f}%  OR  |1H| ≥ {p1:.0f}%")
                 lines.append("")
                 for c in filtered[:8]:
                     sym = c["symbol"]
@@ -6871,7 +6913,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     ch4 = c["ch4"]
                     vol = c["vol"]
                     arrow = "🟢" if c["direction"] == "UP" else "🔴"
-                    lines.append(f"{arrow} {sym}: 24H {ch24:+.0f}% | 4H {ch4:+.0f}% | Vol ~{vol/1e6:.1f}M")
+                    lines.append(f"{arrow} {sym}: 4H {ch4:+.0f}% | 1H {ch1:+.0f}% | Vol ~{vol/1e6:.1f}M")
                     lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
                     lines.append("")
 
