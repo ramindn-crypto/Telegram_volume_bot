@@ -4750,7 +4750,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📣 Big-Move Alert Emails\n"
             f"{HDR}\n"
             f"Status: {'ON' if on else 'OFF'}\n"
-            f"Thresholds (absolute, UP or DOWN): 4H ≥ {p4:.0f}% OR 1H ≥ {p1:.0f}%\n\n"
+            f"Thresholds: |4H| ≥ {p4:.0f}% OR |1H| ≥ {p1:.0f}% (both directions)\n\n"
             "Set: /bigmove_alert on 20 10\n"
             "Off: /bigmove_alert off"
         )
@@ -6871,7 +6871,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
         # -----------------------------------------------------
         # Big-Move Alert Emails (independent of full trade setups)
-        # Trigger: abs(24H) >= user.bigmove_alert_24h  OR  abs(4H) >= user.bigmove_alert_4h
+        # Trigger: |4H| >= user.bigmove_alert_4h  OR  |1H| >= user.bigmove_alert_1h
         # -----------------------------------------------------
         for u in (users_bigmove or []):
             try:
@@ -6880,54 +6880,73 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 uid = 0
             if not uid:
                 continue
-
+        
             try:
+                # Respect per-user ON/OFF
+                on = int(u.get("bigmove_alert_on", 1) or 0)
+                if not on:
+                    continue
+        
                 try:
                     p4 = float(u.get("bigmove_alert_4h", 20) or 20)
                     p1 = float(u.get("bigmove_alert_1h", 10) or 10)
                 except Exception:
-                    p24, p4 = 40.0, 15.0
-
+                    p4, p1 = 20.0, 10.0
+        
                 candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, max_items=12)
                 if not candidates:
                     continue
-
+        
                 # Remove ones emailed recently (per symbol + direction)
                 filtered = []
                 for c in candidates:
                     if not bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
                         filtered.append(c)
-
+        
                 if not filtered:
                     continue
-
+        
                 # Build email body
                 lines = []
-                lines.append("📣 PulseFutures — Big-Move Alerts")
+                lines.append("⚡ PulseFutures — BIG MOVE ALERT")
                 lines.append(HDR)
                 lines.append(f"Triggers: |4H| ≥ {p4:.0f}%  OR  |1H| ≥ {p1:.0f}%")
                 lines.append("")
+        
+                # Build a clean subject that is NOT “market scan”
+                top = filtered[0]
+                top_sym = top["symbol"]
+                top_dir = "UP" if top["direction"] == "UP" else "DOWN"
+                top_move = top["ch4"] if abs(top["ch4"]) >= abs(top["ch1"]) else top["ch1"]
+                top_tf = "4H" if abs(top["ch4"]) >= abs(top["ch1"]) else "1H"
+        
+                subject = f"⚡ Big Move Alert • {top_sym} {top_dir} • {top_tf} {top_move:+.0f}%"
+                if len(filtered) > 1:
+                    subject += f" (+{len(filtered)-1} more)"
+        
                 for c in filtered[:8]:
                     sym = c["symbol"]
-                    ch24 = c["ch24"]
                     ch4 = c["ch4"]
+                    ch1 = c["ch1"]   # ✅ FIX: this was missing and was breaking the whole email
                     vol = c["vol"]
                     arrow = "🟢" if c["direction"] == "UP" else "🔴"
+        
                     lines.append(f"{arrow} {sym}: 4H {ch4:+.0f}% | 1H {ch1:+.0f}% | Vol ~{vol/1e6:.1f}M")
                     lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
                     lines.append("")
-
+        
                 body = "\n".join(lines).strip()
-                subject = "PulseFutures • Big-Move Alert"
-
+        
                 # IMPORTANT: bypass trade-window so you still get alerted
                 ok = send_email(subject, body, user_id_for_debug=uid, enforce_trade_window=False)
                 if ok:
                     for c in filtered[:8]:
                         mark_bigmove_emailed(uid, c["symbol"], c["direction"])
+        
             except Exception:
                 # Never let one user's bigmove logic kill the whole job
                 continue
+
 
         # -----------------------------------------------------
         # Build setups per session (PRIORITY: leaders/losers → trend watch → waiting → market leaders)
