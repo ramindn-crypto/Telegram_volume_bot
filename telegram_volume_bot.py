@@ -3041,13 +3041,7 @@ def send_email(
             _LAST_EMAIL_DECISION[uid] = {
                 "status": "SENT",
                 "reasons": ["ok"],
-                tz_name = str((get_user(uid) or {}).get("tz") or "UTC")
-                try:
-                    tz_bm = ZoneInfo(tz_name)
-                except Exception:
-                    tz_bm = timezone.utc
-                
-                "when": datetime.now(tz_bm).isoformat(timespec="seconds")
+                "when": datetime.now(timezone.utc).isoformat(timespec="seconds")
             }
         return False
 
@@ -3065,14 +3059,7 @@ def send_email(
             _LAST_EMAIL_DECISION[uid] = {
                 "status": "FAIL",
                 "reasons": [err],
-                tz_name = str((get_user(uid) or {}).get("tz") or "UTC")
-                try:
-                    tz_bm = ZoneInfo(tz_name)
-                except Exception:
-                    tz_bm = timezone.utc
-                
-                "when": datetime.now(tz_bm).isoformat(timespec="seconds")
-
+                "when": datetime.now(timezone.utc).isoformat(timespec="seconds")
             }            
             return False
 
@@ -6954,14 +6941,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if not on:
                     _LAST_BIGMOVE_DECISION[uid] = {
                         "status": "SKIP",
-                        tz_name = str((get_user(uid) or {}).get("tz") or "UTC")
-                try:
-                    tz_bm = ZoneInfo(tz_name)
-                except Exception:
-                    tz_bm = timezone.utc
-                
-                "when": datetime.now(tz_bm).isoformat(timespec="seconds")
-
+                        "when": datetime.now(timezone.utc).isoformat(timespec="seconds")
                         "reasons": ["bigmove_alert_off"],
                     }
                     continue
@@ -6995,14 +6975,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if not candidates:
                     _LAST_BIGMOVE_DECISION[uid] = {
                         "status": "SKIP",
-                        tz_name = str((get_user(uid) or {}).get("tz") or "UTC")
-                        try:
-                            tz_bm = ZoneInfo(tz_name)
-                        except Exception:
-                            tz_bm = timezone.utc
-                        
-                        "when": datetime.now(tz_bm).isoformat(timespec="seconds")
-
+                        "when": datetime.now(timezone.utc).isoformat(timespec="seconds")
                         "reasons": [
                             f"no_candidates (p4={p4}, p1={p1})",
                             f"debug_raw_hits:4h={bm_any_4h},1h={bm_any_1h}",
@@ -7025,12 +6998,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if not filtered:
                     _LAST_BIGMOVE_DECISION[uid] = {
                         "status": "SKIP",
-                        tz_name = str((get_user(uid) or {}).get("tz") or "UTC")
-                    try:
-                        tz_bm = ZoneInfo(tz_name)
-                    except Exception:
-                        tz_bm = timezone.utc                    
-                    "when": datetime.now(tz_bm).isoformat(timespec="seconds")
+                        "when": datetime.now(timezone.utc).isoformat(timespec="seconds")
                         "reasons": ["all_candidates_recently_emailed"],
                     }
                     continue
@@ -7067,14 +7035,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
                 _LAST_BIGMOVE_DECISION[uid] = {
                     "status": "TRY_SEND",
-                    tz_name = str((get_user(uid) or {}).get("tz") or "UTC")
-                    try:
-                        tz_bm = ZoneInfo(tz_name)
-                    except Exception:
-                        tz_bm = timezone.utc
-                    
-                    "when": datetime.now(tz_bm).isoformat(timespec="seconds")
-
+                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds")
                     "reasons": [f"candidates={len(filtered)}", f"p4={p4}", f"p1={p1}"],
                 }
 
@@ -7082,14 +7043,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
                 _LAST_BIGMOVE_DECISION[uid] = {
                     "status": "SENT" if ok else "FAIL",
-                    tz_name = str((get_user(uid) or {}).get("tz") or "UTC")
-                    try:
-                        tz_bm = ZoneInfo(tz_name)
-                    except Exception:
-                        tz_bm = timezone.utc
-                    
-                    "when": datetime.now(tz_bm).isoformat(timespec="seconds")
-
+                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds")
                     "reasons": ["ok"] if ok else [_LAST_SMTP_ERROR.get(uid, "send_email_failed")],
                 }
 
@@ -7104,14 +7058,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
                 _LAST_BIGMOVE_DECISION[uid] = {
                     "status": "ERROR",
-                    tz_name = str((get_user(uid) or {}).get("tz") or "UTC")
-                    try:
-                        tz_bm = ZoneInfo(tz_name)
-                    except Exception:
-                        tz_bm = timezone.utc
-                    
-                    "when": datetime.now(tz_bm).isoformat(timespec="seconds")
-
+                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds")
                     "reasons": [f"{type(e).__name__}: {e}"],
                 }
                 continue
