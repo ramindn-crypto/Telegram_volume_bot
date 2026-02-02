@@ -1453,6 +1453,10 @@ def list_users_with_email() -> List[dict]:
     """
     Users eligible for email sends (have a saved recipient email).
     This is used for Big-Move Alerts so it works even if notify_on=0.
+
+    IMPORTANT:
+    Some DB versions don't have users.email (only users.email_to).
+    This function auto-detects columns and builds a safe query.
     """
     con = db_connect()
     try:
@@ -1464,11 +1468,34 @@ def list_users_with_email() -> List[dict]:
             pass
 
         cur = con.cursor()
-        cur.execute("""
+
+        # Detect available columns in users table
+        try:
+            cur.execute("PRAGMA table_info(users)")
+            cols = {str(r[1]).lower() for r in cur.fetchall()}  # r[1] is column name
+        except Exception:
+            cols = set()
+
+        has_email_to = ("email_to" in cols)
+        has_email = ("email" in cols)
+
+        # Build safe WHERE clause
+        where_parts = []
+        if has_email_to:
+            where_parts.append("(email_to IS NOT NULL AND TRIM(email_to) != '')")
+        if has_email:
+            where_parts.append("(email IS NOT NULL AND TRIM(email) != '')")
+
+        # If neither column exists, no one is eligible
+        if not where_parts:
+            return []
+
+        where_sql = " OR ".join(where_parts)
+
+        cur.execute(f"""
             SELECT *
             FROM users
-            WHERE (email_to IS NOT NULL AND TRIM(email_to) != '')
-               OR (email    IS NOT NULL AND TRIM(email)    != '')
+            WHERE {where_sql}
         """)
         rows = cur.fetchall()
         return [dict(r) for r in rows]
@@ -6834,10 +6861,6 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # EMAIL JOB
 # =========================================================
 
-# =========================================================
-# EMAIL JOB
-# =========================================================
-
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "60"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "60"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "60"))
@@ -6859,8 +6882,18 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
         # Trade-signal emails may be notify_on-gated,
         # but Big-Move Alerts should go to anyone who has an email saved.
-        users_notify = list_users_notify_on()
-        users_bigmove = list_users_with_email()
+
+        try:
+            users_notify = list_users_notify_on()
+        except Exception as e:
+            logger.exception("list_users_notify_on failed: %s", e)
+            users_notify = []
+        
+        try:
+            users_bigmove = list_users_with_email()
+        except Exception as e:
+            logger.exception("list_users_with_email failed: %s", e)
+            users_bigmove = []
         
         if not users_notify and not users_bigmove:
             return
