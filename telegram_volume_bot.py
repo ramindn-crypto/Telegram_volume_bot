@@ -1630,8 +1630,10 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, max_items: int = 1
 
     Triggers:
       - UP   if ch4 >= +p4 OR ch1 >= +p1
-      - DOWN if ch4 <= -p4 OR ch1 <= -p4 OR ch1 <= -p1
+      - DOWN if ch4 <= -p4 OR ch1 <= -p1
     """
+
+    BIGMOVE_MIN_VOL_USD = 5_000_000  # ✅ only alert if 24H USD volume >= $5M
 
     def _pick_pct(mv, keys) -> float:
         for k in keys:
@@ -1651,7 +1653,9 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, max_items: int = 1
             # Try multiple possible field names (fixes "different field names" issue)
             ch4 = _pick_pct(mv, ["ch4", "pct_4h", "change_4h", "chg_4h", "percentage_4h", "p4", "h4"])
             ch1 = _pick_pct(mv, ["ch1", "pct_1h", "change_1h", "chg_1h", "percentage_1h", "p1", "h1"])
-            vol = float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+
+            # ✅ FIX: correct 24H USD volume (MarketVol does NOT have fut_vol_usd)
+            vol = float(usd_notional(mv) or 0.0)
 
             # If still missing, compute from 1h candles (same logic as compute_metrics-style)
             if (abs(ch4) < 1e-9 and abs(ch1) < 1e-9) and getattr(mv, "symbol", None):
@@ -1674,6 +1678,10 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, max_items: int = 1
         down_hit = (ch4 <= -float(p4)) or (ch1 <= -float(p1))
 
         if not (up_hit or down_hit):
+            continue
+
+        # ✅ NEW: volume gate (skip low-volume coins completely)
+        if vol < float(BIGMOVE_MIN_VOL_USD):
             continue
 
         if down_hit and not up_hit:
