@@ -1630,36 +1630,59 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, max_items: int = 1
 
     Triggers:
       - UP   if ch4 >= +p4 OR ch1 >= +p1
-      - DOWN if ch4 <= -p4 OR ch1 <= -p1
+      - DOWN if ch4 <= -p4 OR ch1 <= -p4 OR ch1 <= -p1
     """
+
+    def _pick_pct(mv, keys) -> float:
+        for k in keys:
+            try:
+                v = getattr(mv, k, None)
+                if v is None:
+                    continue
+                return float(v or 0.0)
+            except Exception:
+                continue
+        return 0.0
 
     out = []
 
     for sym, mv in (best_fut or {}).items():
         try:
-            ch4 = float(getattr(mv, "ch4", 0.0) or 0.0)
-            ch1 = float(getattr(mv, "ch1", 0.0) or 0.0)
+            # Try multiple possible field names (fixes "different field names" issue)
+            ch4 = _pick_pct(mv, ["ch4", "pct_4h", "change_4h", "chg_4h", "percentage_4h", "p4", "h4"])
+            ch1 = _pick_pct(mv, ["ch1", "pct_1h", "change_1h", "chg_1h", "percentage_1h", "p1", "h1"])
             vol = float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+
+            # If still missing, compute from 1h candles (same logic as compute_metrics-style)
+            if (abs(ch4) < 1e-9 and abs(ch1) < 1e-9) and getattr(mv, "symbol", None):
+                try:
+                    c1 = fetch_ohlcv(mv.symbol, "1h", 6)
+                    if c1 and len(c1) >= 2:
+                        closes_1h = [float(x[4]) for x in c1]
+                        c_last = closes_1h[-1]
+                        c_prev1 = closes_1h[-2]
+                        c_prev4 = closes_1h[-5] if len(closes_1h) >= 5 else closes_1h[0]
+                        ch1 = ((c_last - c_prev1) / c_prev1) * 100.0 if c_prev1 else 0.0
+                        ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
+                except Exception:
+                    pass
+
         except Exception:
             continue
 
-        # Directional triggers
-        up_hit   = (ch4 >= float(p4)) or (ch1 >= float(p1))
+        up_hit = (ch4 >= float(p4)) or (ch1 >= float(p1))
         down_hit = (ch4 <= -float(p4)) or (ch1 <= -float(p1))
 
         if not (up_hit or down_hit):
             continue
 
-        # Resolve direction
         if down_hit and not up_hit:
             direction = "DOWN"
         elif up_hit and not down_hit:
             direction = "UP"
         else:
-            # Mixed signals → 1H decides
             direction = "UP" if ch1 >= 0 else "DOWN"
 
-        # Direction-aware scoring
         score_up = max(
             (abs(ch4) / max(p4, 1e-9)) if ch4 > 0 else 0.0,
             (abs(ch1) / max(p1, 1e-9)) if ch1 > 0 else 0.0,
@@ -1668,7 +1691,6 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, max_items: int = 1
             (abs(ch4) / max(p4, 1e-9)) if ch4 < 0 else 0.0,
             (abs(ch1) / max(p1, 1e-9)) if ch1 < 0 else 0.0,
         )
-
         score = max(score_up, score_dn)
 
         out.append({
@@ -1682,6 +1704,7 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, max_items: int = 1
 
     out.sort(key=lambda x: (x["score"], x["vol"]), reverse=True)
     return out[:max_items]
+
 
 
 def symbol_flip_guard_active(
@@ -6935,13 +6958,20 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 uu = get_user(uid) or {}
+                # Use per-user timezone for decision timestamps (do NOT default to Melbourne)
+                tz_name = str((uu or {}).get("tz") or "UTC")
+                try:
+                    tz = ZoneInfo(tz_name)
+                except Exception:
+                    tz = timezone.utc
+
 
                 # Respect per-user ON/OFF
                 on = int(uu.get("bigmove_alert_on", 1) or 0)
                 if not on:
                     _LAST_BIGMOVE_DECISION[uid] = {
                         "status": "SKIP",
-                        "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
                         "reasons": ["bigmove_alert_off"],
                     }
                     continue
@@ -6955,27 +6985,39 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
                 candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, max_items=12)
                 
-                # Debug counts from the SAME dataset used for bigmove
+                # Debug counts from the SAME dataset used for bigmove (same field-name logic)
+                def _pick_pct(_mv, _keys) -> float:
+                    for _k in _keys:
+                        try:
+                            _v = getattr(_mv, _k, None)
+                            if _v is None:
+                                continue
+                            return float(_v or 0.0)
+                        except Exception:
+                            continue
+                    return 0.0
+
                 try:
                     bm_any_4h = sum(
                         1 for _sym, _mv in (best_fut or {}).items()
-                        if abs(float(getattr(_mv, "percentage_4h", 0.0) or 0.0)) >= float(p4)
+                        if abs(_pick_pct(_mv, ["ch4", "pct_4h", "change_4h", "chg_4h", "percentage_4h", "p4", "h4"])) >= float(p4)
                     )
                 except Exception:
                     bm_any_4h = -1
-                
+
                 try:
                     bm_any_1h = sum(
                         1 for _sym, _mv in (best_fut or {}).items()
-                        if abs(float(getattr(_mv, "percentage_1h", 0.0) or 0.0)) >= float(p1)
+                        if abs(_pick_pct(_mv, ["ch1", "pct_1h", "change_1h", "chg_1h", "percentage_1h", "p1", "h1"])) >= float(p1)
                     )
                 except Exception:
                     bm_any_1h = -1
+
                 
                 if not candidates:
                     _LAST_BIGMOVE_DECISION[uid] = {
                         "status": "SKIP",
-                        "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
                         "reasons": [
                             f"no_candidates (p4={p4}, p1={p1})",
                             f"debug_raw_hits:4h={bm_any_4h},1h={bm_any_1h}",
@@ -6998,7 +7040,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 if not filtered:
                     _LAST_BIGMOVE_DECISION[uid] = {
                         "status": "SKIP",
-                        "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
                         "reasons": ["all_candidates_recently_emailed"],
                     }
                     continue
@@ -7035,7 +7077,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
                 _LAST_BIGMOVE_DECISION[uid] = {
                     "status": "TRY_SEND",
-                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
                     "reasons": [f"candidates={len(filtered)}", f"p4={p4}", f"p1={p1}"],
                 }
 
@@ -7043,7 +7085,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
                 _LAST_BIGMOVE_DECISION[uid] = {
                     "status": "SENT" if ok else "FAIL",
-                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
                     "reasons": ["ok"] if ok else [_LAST_SMTP_ERROR.get(uid, "send_email_failed")],
                 }
 
@@ -7058,7 +7100,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
                 _LAST_BIGMOVE_DECISION[uid] = {
                     "status": "ERROR",
-                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
                     "reasons": [f"{type(e).__name__}: {e}"],
                 }
                 continue
