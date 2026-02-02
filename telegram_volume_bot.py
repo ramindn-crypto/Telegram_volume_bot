@@ -864,6 +864,7 @@ _USER_DIAG_MODE: Dict[int, str] = {}
 # ✅ NEW: Stores last email decision per user (SENT / SKIP + reasons)
 _LAST_EMAIL_DECISION: Dict[int, Dict[str, Any]] = {}
 
+_LAST_BIGMOVE_DECISION: Dict[int, dict] = {}
 
 def user_diag_mode(user_id: int) -> str:
     """
@@ -3038,9 +3039,9 @@ def send_email(
         if uid is not None:
             _LAST_SMTP_ERROR[uid] = "Email not configured (missing SMTP env vars)."
             _LAST_EMAIL_DECISION[uid] = {
-                "status": "SKIP",
-                "reason": "smtp_not_configured",
-                "ts": time.time()
+                "status": "SENT",
+                "reasons": ["ok"],
+                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
         return False
 
@@ -3056,10 +3057,10 @@ def send_email(
         # If user has NOT set email, we skip
         if not to_email:
             _LAST_EMAIL_DECISION[uid] = {
-                "status": "SKIP",
-                "reason": "no_recipient_email",
-                "ts": time.time(),
-            }
+                "status": "FAIL",
+                "reasons": [err],
+                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }            
             return False
 
         # If trade window feature exists, enforce it here (ONLY if enabled)
@@ -6888,13 +6889,13 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.exception("list_users_notify_on failed: %s", e)
             users_notify = []
-        
+
         try:
             users_bigmove = list_users_with_email()
         except Exception as e:
             logger.exception("list_users_with_email failed: %s", e)
             users_bigmove = []
-        
+
         if not users_notify and not users_bigmove:
             return
 
@@ -6919,7 +6920,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         MARKET_VOL_MEDIAN_USD = _median(_all_vols)
-
+        
         # -----------------------------------------------------
         # Big-Move Alert Emails (independent of full trade setups)
         # Trigger: |4H| >= user.bigmove_alert_4h  OR  |1H| >= user.bigmove_alert_1h
@@ -6931,75 +6932,111 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 uid = 0
             if not uid:
                 continue
-        
+
             try:
-                # Always re-fetch the full user record (list_users_with_email may be partial)
                 uu = get_user(uid) or {}
-                
+
                 # Respect per-user ON/OFF
                 on = int(uu.get("bigmove_alert_on", 1) or 0)
                 if not on:
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "reasons": ["bigmove_alert_off"],
+                    }
                     continue
-                
+
                 try:
                     p4 = float(uu.get("bigmove_alert_4h", 20) or 20)
                     p1 = float(uu.get("bigmove_alert_1h", 10) or 10)
                 except Exception:
                     p4, p1 = 20.0, 10.0
 
-        
                 candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, max_items=12)
                 if not candidates:
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "reasons": [f"no_candidates (p4={p4}, p1={p1})"],
+                    }
                     continue
-        
+
                 # Remove ones emailed recently (per symbol + direction)
                 filtered = []
                 for c in candidates:
-                    if not bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
+                    try:
+                        if not bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
+                            filtered.append(c)
+                    except Exception:
+                        # If state check fails, do NOT kill bigmove; treat as not recently emailed
                         filtered.append(c)
-        
+
                 if not filtered:
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "reasons": ["all_candidates_recently_emailed"],
+                    }
                     continue
-        
+
                 # Build email body
                 lines = []
                 lines.append("⚡ PulseFutures — BIG MOVE ALERT")
                 lines.append(HDR)
                 lines.append(f"Triggers: |4H| ≥ {p4:.0f}%  OR  |1H| ≥ {p1:.0f}%")
                 lines.append("")
-        
-                # Build a clean subject that is NOT “market scan”
+
                 top = filtered[0]
                 top_sym = top["symbol"]
-                top_dir = "UP" if top["direction"] == "UP" else "DOWN"
-                top_move = top["ch4"] if abs(top["ch4"]) >= abs(top["ch1"]) else top["ch1"]
-                top_tf = "4H" if abs(top["ch4"]) >= abs(top["ch1"]) else "1H"
-        
+                top_dir = "UP" if top.get("direction") == "UP" else "DOWN"
+                top_move = top["ch4"] if abs(top.get("ch4", 0.0)) >= abs(top.get("ch1", 0.0)) else top.get("ch1", 0.0)
+                top_tf = "4H" if abs(top.get("ch4", 0.0)) >= abs(top.get("ch1", 0.0)) else "1H"
+
                 subject = f"⚡ Big Move Alert • {top_sym} {top_dir} • {top_tf} {top_move:+.0f}%"
                 if len(filtered) > 1:
                     subject += f" (+{len(filtered)-1} more)"
-        
+
                 for c in filtered[:8]:
                     sym = c["symbol"]
-                    ch4 = c["ch4"]
-                    ch1 = c["ch1"]   # ✅ FIX: this was missing and was breaking the whole email
-                    vol = c["vol"]
-                    arrow = "🟢" if c["direction"] == "UP" else "🔴"
-        
+                    ch4 = float(c.get("ch4", 0.0) or 0.0)
+                    ch1 = float(c.get("ch1", 0.0) or 0.0)
+                    vol = float(c.get("vol", 0.0) or 0.0)
+                    arrow = "🟢" if c.get("direction") == "UP" else "🔴"
+
                     lines.append(f"{arrow} {sym}: 4H {ch4:+.0f}% | 1H {ch1:+.0f}% | Vol ~{vol/1e6:.1f}M")
                     lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
                     lines.append("")
-        
+
                 body = "\n".join(lines).strip()
-        
-                # IMPORTANT: bypass trade-window so you still get alerted
+
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "TRY_SEND",
+                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "reasons": [f"candidates={len(filtered)}", f"p4={p4}", f"p1={p1}"],
+                }
+
                 ok = send_email(subject, body, user_id_for_debug=uid, enforce_trade_window=False)
+
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "SENT" if ok else "FAIL",
+                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "reasons": ["ok"] if ok else [_LAST_SMTP_ERROR.get(uid, "send_email_failed")],
+                }
+
                 if ok:
                     for c in filtered[:8]:
-                        mark_bigmove_emailed(uid, c["symbol"], c["direction"])
-        
+                        try:
+                            mark_bigmove_emailed(uid, c["symbol"], c["direction"])
+                        except Exception:
+                            pass
+
             except Exception as e:
                 logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "ERROR",
+                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "reasons": [f"{type(e).__name__}: {e}"],
+                }
                 continue
 
          
@@ -7346,17 +7383,40 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    d = _LAST_EMAIL_DECISION.get(uid)
-    if not d:
+
+    scan = _LAST_EMAIL_DECISION.get(uid) or {}
+    bigm = _LAST_BIGMOVE_DECISION.get(uid) or {}
+
+    # If nothing recorded
+    if not scan and not bigm:
         await update.message.reply_text("No email decision recorded yet.")
         return
 
-    await update.message.reply_text(
-        "📧 Last Email Decision\n"
-        f"Status: {d.get('status')}\n"
-        f"When: {d.get('when')}\n"
-        "Reasons:\n- " + "\n- ".join(d.get("reasons", []))
-    )
+    lines = []
+    lines.append("📧 Email Decisions")
+
+    if bigm:
+        lines.append("")
+        lines.append("⚡ Big-Move Alert Decision")
+        lines.append(f"Status: {bigm.get('status')}")
+        lines.append(f"When: {bigm.get('when')}")
+        rs = bigm.get("reasons") or []
+        if rs:
+            lines.append("Reasons:\n- " + "\n- ".join(rs))
+
+    if scan:
+        lines.append("")
+        lines.append("🧠 Market Scan Decision")
+        lines.append(f"Status: {scan.get('status')}")
+        lines.append(f"When: {scan.get('when')}")
+        rs = scan.get("reasons") or scan.get("reason")
+        if isinstance(rs, list):
+            lines.append("Reasons:\n- " + "\n- ".join(rs))
+        elif rs:
+            lines.append(f"Reason: {rs}")
+
+    await update.message.reply_text("\n".join(lines).strip())
+
 
 
 # =========================================================
