@@ -1952,13 +1952,13 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = get_user(uid)
 
     if not has_active_access(user, uid):
-    await update.message.reply_text(
-        "⛔️ Access expired.\n\n"
-        "Please subscribe to continue:\n\n"
-        "💳 /billing\n"
-        "💰 /usdt"
-    )
-    return
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return
 
     trades = db_trades_all(uid)
     stats = _stats_from_trades(trades)
