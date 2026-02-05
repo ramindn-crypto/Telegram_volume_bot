@@ -4842,14 +4842,14 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
 
     if not has_active_access(user, uid):
-    await update.message.reply_text(
-        "⛔️ Access expired.\n\n"
-        "Please subscribe to continue:\n\n"
-        "💳 /billing\n"
-        "💰 /usdt"
-    )
-    return
-
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return   
+        
     if not context.args:
         on = int(user.get("bigmove_alert_on", 1) or 0)
         p4 = float(user.get("bigmove_alert_4h", 20) or 20)
@@ -4951,14 +4951,14 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
 
     if not has_active_access(user, uid):
-    await update.message.reply_text(
-        "⛔️ Access expired.\n\n"
-        "Please subscribe to continue:\n\n"
-        "💳 /billing\n"
-        "💰 /usdt"
-    )
-    return
-    
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return   
+        
     raw = " ".join(context.args).strip()
     if not raw:
         await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: risk pct 2 | risk usd 40 | entry 43000)")
@@ -5157,13 +5157,14 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     if not has_active_access(user, uid):
-    await update.message.reply_text(
-        "⛔️ Access expired.\n\n"
-        "Please subscribe to continue:\n\n"
-        "💳 /billing\n"
-        "💰 /usdt"
-    )
-    return
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return   
+        
     raw = " ".join(context.args).strip()
     if not raw:
         await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 risk usd 40 [note ...] [sig PF-...]")
@@ -5310,13 +5311,13 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
 
     if not has_active_access(user, uid):
-    await update.message.reply_text(
-        "⛔️ Access expired.\n\n"
-        "Please subscribe to continue:\n\n"
-        "💳 /billing\n"
-        "💰 /usdt"
-    )
-    return
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return   
     
     raw = " ".join(context.args).strip()
     if not raw:
@@ -5575,7 +5576,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💳 /billing\n"
             "💰 /usdt"
         )
-        return
+        return   
 
     opens = db_open_trades(uid)
 
@@ -5840,13 +5841,13 @@ async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
     
     if not has_active_access(user, uid):
-    await update.message.reply_text(
-        "⛔️ Access expired.\n\n"
-        "Please subscribe to continue:\n\n"
-        "💳 /billing\n"
-        "💰 /usdt"
-    )
-    return
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return   
     
     tz = ZoneInfo(user["tz"])
     start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
@@ -5903,6 +5904,15 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     uid = update.effective_user.id
     user = get_user(uid)
 
+    if not has_active_access(user, uid):
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return    
+
     trades = db_trades_all(uid)
     stats = _stats_from_trades(trades)
 
@@ -5930,13 +5940,13 @@ async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
 
     if not has_active_access(user, uid):
-    await update.message.reply_text(
-        "⛔️ Access expired.\n\n"
-        "Please subscribe to continue:\n\n"
-        "💳 /billing\n"
-        "💰 /usdt"
-    )
-    return
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return   
     
     tz = ZoneInfo(user["tz"])
     now = datetime.now(tz)
@@ -5968,13 +5978,13 @@ async def signals_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
 
     if not has_active_access(user, uid):
-    await update.message.reply_text(
-        "⛔️ Access expired.\n\n"
-        "Please subscribe to continue:\n\n"
-        "💳 /billing\n"
-        "💰 /usdt"
-    )
-    return
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return   
     
     tz = ZoneInfo(user["tz"])
     start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).timestamp()
@@ -6004,13 +6014,13 @@ async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = get_user(uid)
 
     if not has_active_access(user, uid):
-    await update.message.reply_text(
-        "⛔️ Access expired.\n\n"
-        "Please subscribe to continue:\n\n"
-        "💳 /billing\n"
-        "💰 /usdt"
-    )
-    return
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return   
     
     tz = ZoneInfo(user["tz"])
     start_dt = datetime.now(tz) - timedelta(days=7)
