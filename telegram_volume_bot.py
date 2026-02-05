@@ -1951,6 +1951,15 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     uid = update.effective_user.id
     user = get_user(uid)
 
+    if not has_active_access(user, uid):
+    await update.message.reply_text(
+        "⛔️ Access expired.\n\n"
+        "Please subscribe to continue:\n\n"
+        "💳 /billing\n"
+        "💰 /usdt"
+    )
+    return
+
     trades = db_trades_all(uid)
     stats = _stats_from_trades(trades)
 
@@ -4406,6 +4415,19 @@ async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not user:
+        now = time.time()
+        create_user(
+            user_id=uid,
+            plan="trial",
+            trial_until=now + (7 * 24 * 3600),
+            access_source="trial",
+            access_ref="auto_start",
+        )
+
     await cmd_help(update, context)
 
 # =========================================================
@@ -4819,6 +4841,15 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
+    if not has_active_access(user, uid):
+    await update.message.reply_text(
+        "⛔️ Access expired.\n\n"
+        "Please subscribe to continue:\n\n"
+        "💳 /billing\n"
+        "💰 /usdt"
+    )
+    return
+
     if not context.args:
         on = int(user.get("bigmove_alert_on", 1) or 0)
         p4 = float(user.get("bigmove_alert_4h", 20) or 20)
@@ -4919,6 +4950,15 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
+    if not has_active_access(user, uid):
+    await update.message.reply_text(
+        "⛔️ Access expired.\n\n"
+        "Please subscribe to continue:\n\n"
+        "💳 /billing\n"
+        "💰 /usdt"
+    )
+    return
+    
     raw = " ".join(context.args).strip()
     if not raw:
         await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: risk pct 2 | risk usd 40 | entry 43000)")
@@ -5115,6 +5155,15 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
 
+
+    if not has_active_access(user, uid):
+    await update.message.reply_text(
+        "⛔️ Access expired.\n\n"
+        "Please subscribe to continue:\n\n"
+        "💳 /billing\n"
+        "💰 /usdt"
+    )
+    return
     raw = " ".join(context.args).strip()
     if not raw:
         await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 risk usd 40 [note ...] [sig PF-...]")
@@ -5259,6 +5308,16 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
+
+    if not has_active_access(user, uid):
+    await update.message.reply_text(
+        "⛔️ Access expired.\n\n"
+        "Please subscribe to continue:\n\n"
+        "💳 /billing\n"
+        "💰 /usdt"
+    )
+    return
+    
     raw = " ".join(context.args).strip()
     if not raw:
         await update.message.reply_text("Usage: /trade_close <TRADE_ID> pnl <PNL>")
@@ -5505,9 +5564,19 @@ async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):   
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
+    
+    if not has_active_access(user, uid):
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return
+
     opens = db_open_trades(uid)
 
     cap = daily_cap_usd(user)
@@ -5769,6 +5838,16 @@ async def cooldown_clear_all_cmd(update: Update, context: ContextTypes.DEFAULT_T
 async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
+    
+    if not has_active_access(user, uid):
+    await update.message.reply_text(
+        "⛔️ Access expired.\n\n"
+        "Please subscribe to continue:\n\n"
+        "💳 /billing\n"
+        "💰 /usdt"
+    )
+    return
+    
     tz = ZoneInfo(user["tz"])
     start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     trades = db_trades_since(uid, start)
@@ -5849,6 +5928,16 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
+
+    if not has_active_access(user, uid):
+    await update.message.reply_text(
+        "⛔️ Access expired.\n\n"
+        "Please subscribe to continue:\n\n"
+        "💳 /billing\n"
+        "💰 /usdt"
+    )
+    return
+    
     tz = ZoneInfo(user["tz"])
     now = datetime.now(tz)
     start_dt = now - timedelta(days=7)
@@ -5877,6 +5966,16 @@ async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def signals_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
+
+    if not has_active_access(user, uid):
+    await update.message.reply_text(
+        "⛔️ Access expired.\n\n"
+        "Please subscribe to continue:\n\n"
+        "💳 /billing\n"
+        "💰 /usdt"
+    )
+    return
+    
     tz = ZoneInfo(user["tz"])
     start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).timestamp()
     sigs = db_list_signals_since(start)
@@ -5903,6 +6002,16 @@ async def signals_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
+
+    if not has_active_access(user, uid):
+    await update.message.reply_text(
+        "⛔️ Access expired.\n\n"
+        "Please subscribe to continue:\n\n"
+        "💳 /billing\n"
+        "💰 /usdt"
+    )
+    return
+    
     tz = ZoneInfo(user["tz"])
     start_dt = datetime.now(tz) - timedelta(days=7)
     start = start_dt.astimezone(timezone.utc).timestamp()
@@ -6349,6 +6458,19 @@ _SCREEN_LOCK = asyncio.Lock()
 # /screen — Premium Telegram UI (FULL tables like old version)
 # =========================================================
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    uid = update.effective_user.id
+    user = get_user(uid)
+    
+    if not has_active_access(user, uid):
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return
+
     try:
         # Send immediate response (fast perceived UX)
         status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
@@ -7682,6 +7804,24 @@ def _ledger_add(user_id: int, source: str, ref: str, plan: str, amount: float, c
         con.commit()
 
 def _set_user_access(user_id: int, plan: str, source: str, ref: str):
+
+    def has_active_access(user: dict, uid: int) -> bool:
+    if is_admin_user(uid):
+        return True
+
+    if not user:
+        return False
+
+    now = time.time()
+
+    if user.get("plan") == "trial" and now <= float(user.get("trial_until", 0)):
+        return True
+
+    if user.get("plan") in ("standard", "pro"):
+        return True
+
+    return False
+
     # Use your existing update_user helper
     update_user(
         int(user_id),
