@@ -7814,8 +7814,16 @@ def _ledger_add(user_id: int, source: str, ref: str, plan: str, amount: float, c
         con.commit()
 
 def _set_user_access(user_id: int, plan: str, source: str, ref: str):
+    update_user(
+        int(user_id),
+        plan=str(plan),
+        access_source=str(source),
+        access_ref=str(ref),
+        access_updated_ts=_now(),
+    )
 
-    def has_active_access(user: dict, uid: int) -> bool:
+
+def has_active_access(user: dict, uid: int) -> bool:
     if is_admin_user(uid):
         return True
 
@@ -7832,14 +7840,6 @@ def _set_user_access(user_id: int, plan: str, source: str, ref: str):
 
     return False
 
-    # Use your existing update_user helper
-    update_user(
-        int(user_id),
-        plan=str(plan),
-        access_source=str(source),
-        access_ref=str(ref),
-        access_updated_ts=_now(),
-    )
 
 def _usdt_payment_row_by_txid(txid: str):
     with _db() as con:
