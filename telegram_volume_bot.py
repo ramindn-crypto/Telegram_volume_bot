@@ -4443,7 +4443,7 @@ def _mask_addr(addr: str) -> str:
 
 async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Billing menu: Stripe Payment Links + USDT.
+    Billing menu: Stripe Payment Links + USDT (MANUAL activation for Stripe).
     - Safe: uses env vars only for Stripe links (no Stripe API calls required)
     - USDT address works with either USDT_ADDRESS or USDT_RECEIVE_ADDRESS
     - Does NOT require email to show billing
@@ -4451,7 +4451,7 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = user.id if user else None
 
-    # Stripe payment links (recommended)
+    # Stripe payment links
     stripe_standard_url = _env("STRIPE_STANDARD_URL")
     stripe_pro_url = _env("STRIPE_PRO_URL")
 
@@ -4460,11 +4460,11 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usdt_address = _env("USDT_ADDRESS") or _env("USDT_RECEIVE_ADDRESS")
     usdt_note = _env("USDT_NOTE")  # optional
 
-    # Prices (optional – used for display only)
+    # Prices (display only)
     usdt_standard_price = _env("USDT_STANDARD_PRICE", "45")
     usdt_pro_price = _env("USDT_PRO_PRICE", "99")
 
-    # Support (optional)
+    # Support
     support_handle = _env("BILLING_SUPPORT_HANDLE", "@PulseFuturesSupport")
 
     # Reference (helps you match tickets/payments)
@@ -4481,6 +4481,12 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("────────────────────")
     if stripe_standard_url or stripe_pro_url:
         lines.append("Tap a plan button to pay securely via Stripe.")
+        lines.append("✅ Activation is MANUAL for now (fast). After paying, send:")
+        lines.append(f"• Reference: {ref}")
+        lines.append(f"• Telegram ID: {uid if uid else 'unknown'}")
+        lines.append("• Plan: Standard or Pro")
+        lines.append("• Stripe email used")
+        lines.append(f"Support: {support_handle}")
     else:
         lines.append("Stripe is not configured yet.")
         lines.append("Admin: set STRIPE_STANDARD_URL / STRIPE_PRO_URL in Render env vars.")
@@ -4498,6 +4504,8 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"Note: {usdt_note.replace('<REF>', ref)}")
         else:
             lines.append(f"Note: Use reference '{ref}' in your message to support if needed.")
+        lines.append("After paying, submit:")
+        lines.append("/usdt_paid <TXID> <standard|pro>")
     else:
         lines.append("USDT is not configured yet.")
         lines.append("Admin: set USDT_ADDRESS or USDT_RECEIVE_ADDRESS in Render env vars.")
@@ -4505,10 +4513,17 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines.append("")
     lines.append("────────────────────")
-    lines.append("After payment")
+    lines.append("After payment (Activation)")
     lines.append("────────────────────")
-    lines.append("1) If Stripe: you’ll be activated automatically after confirmation.")
-    lines.append("2) If USDT: submit TXID using /usdt_paid <TXID> <standard|pro>.")
+    lines.append("✅ Stripe:")
+    lines.append(f"Send to Support: {support_handle}")
+    lines.append(f"1) Reference: {ref}")
+    lines.append(f"2) Telegram ID: {uid if uid else 'unknown'}")
+    lines.append("3) Plan: Standard or Pro")
+    lines.append("4) Stripe email used")
+    lines.append("")
+    lines.append("✅ USDT:")
+    lines.append("Submit: /usdt_paid <TXID> <standard|pro>")
     lines.append(f"Support: {support_handle}")
     lines.append(f"Reference: {ref}")
 
@@ -4537,41 +4552,6 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
         reply_markup=reply_markup,
     )
-
-
-async def manage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Stripe customer portal link (if you have it).
-    If you are using Payment Links only and not portal, keep as-is or disable this command.
-    """
-    user = get_user(update.effective_user.id)
-    if user.get("plan") not in ("standard", "pro"):
-        await update.message.reply_text("No active subscription.")
-        return
-
-    # If you still use Stripe Customer Portal:
-    if user.get("email_to"):
-        await update.message.reply_text(create_customer_portal(user["email_to"]))
-        return
-
-    await update.message.reply_text("❌ No email on file for subscription management.")
-
-
-async def myplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_user.id)
-    status = "ACTIVE" if has_active_access(user) else "LOCKED"
-
-    plan = (user.get("plan") or "free").upper()
-    src = (user.get("access_source") or "").strip()
-    if src:
-        src = src.upper()
-
-    msg = f"Plan: {plan}\nStatus: {status}"
-    if src:
-        msg += f"\nSource: {src}"
-
-    await update.message.reply_text(msg)
-
 
 # =========================================================
 # Table Format
