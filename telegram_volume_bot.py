@@ -6734,6 +6734,19 @@ def user_location_and_time(user: dict):
 
     return loc, now_local.strftime("%Y-%m-%d %H:%M")
 
+
+# =========================================================
+# /screen fast cache (per-instance)
+# =========================================================
+SCREEN_CACHE_TTL_SEC = 20  # seconds
+_SCREEN_CACHE = {
+    "ts": 0.0,
+    "body": "",
+    "kb": [],
+}
+_SCREEN_LOCK = asyncio.Lock()
+
+
 # =========================================================
 # /screen
 # =========================================================
