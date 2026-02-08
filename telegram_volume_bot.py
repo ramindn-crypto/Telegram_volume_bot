@@ -1843,7 +1843,7 @@ def _spike_reversal_candidates(
 
             # Downtrend: spike UP into resistance -> SELL reversal
             if downtrend and big_range and upper_ratio >= float(wick_ratio_min) and c < o:
-                if not sell_confirm::
+                if not sell_confirm:
                     continue
 
                 entry = float(l)  # break of spike candle low
