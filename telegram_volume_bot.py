@@ -6979,8 +6979,10 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if trend_txt:
                 blocks.extend(["", trend_txt])
 
-            if spike_txt:
-                blocks.extend(["", spike_txt])
+            blocks.extend([
+                "",
+                spike_txt if spike_txt else "*Spike Reversal Alerts (15M+ Vol)*\n" + SEP + "\n_No spike-reversal candidates right now._"
+            ])
 
             blocks.extend([
                 "",
