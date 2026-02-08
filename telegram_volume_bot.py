@@ -1151,7 +1151,22 @@ def db_init():
     if "bigmove_alert_1h" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_1h REAL NOT NULL DEFAULT 10")
 
-    
+    # NEW: Spike Reversal Alerts
+    if "spike_alert_on" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN spike_alert_on INTEGER NOT NULL DEFAULT 1")
+
+    # default volume gate: 15M
+    if "spike_min_vol_usd" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN spike_min_vol_usd REAL NOT NULL DEFAULT 15000000")
+
+    # wick ratio threshold (0.55 means wick is 55%+ of candle range)
+    if "spike_wick_ratio" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN spike_wick_ratio REAL NOT NULL DEFAULT 0.55")
+
+    # spike size must be >= ATR * this multiplier
+    if "spike_atr_mult" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN spike_atr_mult REAL NOT NULL DEFAULT 1.20")
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1234,6 +1249,17 @@ def db_init():
             PRIMARY KEY (user_id, symbol, direction)
         )
     """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS emailed_spikes (
+            user_id     INTEGER NOT NULL,
+            symbol      TEXT    NOT NULL,
+            direction   TEXT    NOT NULL,   -- "UP" or "DOWN"
+            emailed_ts  REAL    NOT NULL,
+            PRIMARY KEY (user_id, symbol, direction)
+        )
+    """)
+
 
     
     # =========================================================
@@ -1620,6 +1646,37 @@ def mark_bigmove_emailed(uid: int, symbol: str, direction: str) -> None:
     except Exception:
         pass
 
+SPIKE_COOLDOWN_SEC = 60 * 60 * 3  # 3 hours
+
+def spike_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT emailed_ts FROM emailed_spikes WHERE user_id=? AND symbol=? AND direction=?",
+                (int(uid), str(symbol), str(direction)),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            last_ts = float(row[0] or 0.0)
+            return (time.time() - last_ts) < SPIKE_COOLDOWN_SEC
+    except Exception:
+        return False
+
+def mark_spike_emailed(uid: int, symbol: str, direction: str) -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO emailed_spikes(user_id, symbol, direction, emailed_ts) VALUES(?,?,?,?)",
+                (int(uid), str(symbol), str(direction), time.time()),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 def _bigmove_candidates(best_fut: dict, p4: float, p1: float, max_items: int = 12) -> list:
     """
     Returns list of dicts: {symbol, ch4, ch1, vol, direction, score}
@@ -1714,6 +1771,147 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, max_items: int = 1
     return out[:max_items]
 
 
+def _spike_reversal_candidates(
+    best_fut: Dict[str, Any],
+    min_vol_usd: float = 15_000_000.0,
+    wick_ratio_min: float = 0.55,
+    atr_mult_min: float = 1.20,
+    max_items: int = 10,
+) -> List[dict]:
+    """
+    Detects wick-spike rejection in the direction opposite to the spike, aligned with the bigger trend.
+    Downtrend: upper-wick spike rejection -> SELL
+    Uptrend: lower-wick spike rejection -> BUY
+    """
+    out: List[dict] = []
+    if not best_fut:
+        return out
+
+    for base, mv in (best_fut or {}).items():
+        try:
+            sym_base = str(base).upper()
+            market_symbol = str(getattr(mv, "symbol", "") or "")
+            vol24 = float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+            if vol24 < float(min_vol_usd):
+                continue
+            if not market_symbol:
+                continue
+
+            # 1H candles for spike detection + ATR + trend
+            c1 = fetch_ohlcv(market_symbol, "1h", limit=max(ATR_PERIOD + 10, 220))
+            if not c1 or len(c1) < (ATR_PERIOD + 50):
+                continue
+
+            atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
+            if atr_1h <= 0:
+                continue
+
+            closes_1h = [float(x[4]) for x in c1]
+            ema50 = float(ema(closes_1h[-200:], 50) or 0.0)
+            ema200 = float(ema(closes_1h[-220:], 200) or 0.0)
+            if ema50 <= 0 or ema200 <= 0:
+                continue
+
+            uptrend = (ema50 > ema200)
+            downtrend = (ema50 < ema200)
+            if not (uptrend or downtrend):
+                continue
+
+            # Spike candle = most recent closed 1H candle
+            o = float(c1[-1][1]); h = float(c1[-1][2]); l = float(c1[-1][3]); c = float(c1[-1][4])
+            rng = max(1e-12, h - l)
+
+            upper_wick = h - max(o, c)
+            lower_wick = min(o, c) - l
+            upper_ratio = upper_wick / rng
+            lower_ratio = lower_wick / rng
+
+            big_range = (rng >= (atr_1h * float(atr_mult_min)))
+
+            
+            # 15m confirmation (stronger): last 15m close must confirm rejection
+            # SELL: close below spike mid (and preferably below spike open)
+            # BUY : close above spike mid (and preferably above spike open)
+            c15 = fetch_ohlcv(market_symbol, "15m", limit=60)
+            if not c15 or len(c15) < 12:
+                continue
+            c15_last_close = float(c15[-1][4])
+
+            spike_mid = (h + l) / 2.0
+            sell_confirm = (c15_last_close < spike_mid) and (c15_last_close < o)
+            buy_confirm  = (c15_last_close > spike_mid) and (c15_last_close > o)
+
+            # Downtrend: spike UP into resistance -> SELL reversal
+            if downtrend and big_range and upper_ratio >= float(wick_ratio_min) and c < o:
+                if not sell_confirm::
+                    continue
+
+                entry = float(l)  # break of spike candle low
+                sl = float(h) + (0.10 * atr_1h)
+                r = max(1e-12, sl - entry)
+
+                tp1 = entry - 1.0 * r
+                tp2 = entry - 1.6 * r
+                tp3 = entry - 2.3 * r
+
+                conf = 86
+                if (c - l) / rng < 0.40:
+                    conf += 4
+
+                out.append({
+                    "symbol": sym_base,
+                    "market_symbol": market_symbol,
+                    "side": "SELL",
+                    "direction": "DOWN",
+                    "conf": int(clamp(conf, 1, 99)),
+                    "entry": float(entry),
+                    "sl": float(sl),
+                    "tp1": float(tp1),
+                    "tp2": float(tp2),
+                    "tp3": float(tp3),
+                    "vol": float(vol24),
+                    "why": f"Downtrend (EMA50<EMA200). 1H upper-wick spike rejection (wick={upper_ratio:.2f}, range={rng/atr_1h:.2f} ATR).",
+                })
+                continue
+
+            # Uptrend: spike DOWN into support -> BUY reversal
+            if uptrend and big_range and lower_ratio >= float(wick_ratio_min) and c > o:
+                if not buy_confirm:
+                    continue
+
+                entry = float(h)  # break of spike candle high
+                sl = float(l) - (0.10 * atr_1h)
+                r = max(1e-12, entry - sl)
+
+                tp1 = entry + 1.0 * r
+                tp2 = entry + 1.6 * r
+                tp3 = entry + 2.3 * r
+
+                conf = 86
+                if (h - c) / rng < 0.40:
+                    conf += 4
+
+                out.append({
+                    "symbol": sym_base,
+                    "market_symbol": market_symbol,
+                    "side": "BUY",
+                    "direction": "UP",
+                    "conf": int(clamp(conf, 1, 99)),
+                    "entry": float(entry),
+                    "sl": float(sl),
+                    "tp1": float(tp1),
+                    "tp2": float(tp2),
+                    "tp3": float(tp3),
+                    "vol": float(vol24),
+                    "why": f"Uptrend (EMA50>EMA200). 1H lower-wick spike rejection (wick={lower_ratio:.2f}, range={rng/atr_1h:.2f} ATR).",
+                })
+                continue
+
+        except Exception:
+            continue
+
+    out = sorted(out, key=lambda x: (int(x.get("conf", 0)), float(x.get("vol", 0.0))), reverse=True)
+    return out[:max_items]
 
 def symbol_flip_guard_active(
     user_id: int,
@@ -6300,7 +6498,12 @@ def _email_priority_bases(best_fut: dict, directional_take: int = 12) -> set:
 async def build_priority_pool(best_fut: dict, session_name: str, mode: str) -> dict:
     """
     mode: "screen" or "email"
-    returns: { "setups": [Setup...], "waiting": [(base, info_dict)...], "trend_watch": [dict...] }
+    returns: {
+        "setups": [Setup...],
+        "waiting": [(base, info_dict)...],
+        "trend_watch": [dict...],
+        "spikes": [dict...],   # NEW
+    }
     """
 
     # knobs
@@ -6461,71 +6664,34 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str) -> d
             ordered.append(best[k])
             seen.add(k)
 
-    return {"setups": ordered, "waiting": waiting_items, "trend_watch": trend_watch}
+    # -----------------------------------------------------
+    # NEW: Spike Reversal candidates (15M+ Vol) — for /screen only
+    # -----------------------------------------------------
+    spike_candidates = []
+    if mode == "screen":
+        try:
+            spike_candidates = await asyncio.to_thread(
+                _spike_reversal_candidates,
+                best_fut,
+                15_000_000.0,  # min_vol_usd
+                0.55,          # wick_ratio_min
+                1.20,          # atr_mult_min
+                6,             # max_items
+            )
+        except Exception:
+            spike_candidates = []
 
-# =========================================================
-# User location/time helpers (TZ -> City/Country label)
-# =========================================================
-def tz_location_label(tz_name: str) -> str:
-    """
-    Converts IANA TZ like 'Australia/Melbourne' -> 'Melbourne (Australia)'
-    """
-    tz_name = (tz_name or "").strip()
-    if not tz_name or "/" not in tz_name:
-        return tz_name or "Unknown"
-
-    parts = tz_name.split("/")
-    region = (parts[0] or "").replace("_", " ")
-    city = (parts[-1] or "").replace("_", " ")
-    if region and city:
-        return f"{city} ({region})"
-    return city or region or tz_name
-
-def user_location_and_time(user: dict) -> Tuple[str, str]:
-    """
-    Returns: (location_label, time_str) based on user's tz
-    """
-    tz_name = str(user.get("tz") or "UTC")
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = timezone.utc
-        tz_name = "UTC"
-
-    now_local = datetime.now(tz)
-    loc = tz_location_label(tz_name)
-    return loc, now_local.strftime("%Y-%m-%d %H:%M")
-
-# =========================================================
-# movers_tables (remove brackets/thresholds from titles)
-# =========================================================
-def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
-    up, dn = compute_directional_lists(best_fut)
-    up_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4)] for b, v, c24, c4, px in up[:10]]
-    dn_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4)] for b, v, c24, c4, px in dn[:10]]
-
-    up_txt = "*Directional Leaders*\n" + (table_md(up_rows, ["SYM", "F Vol", "24H", "4H"]) if up_rows else "_None_")
-    dn_txt = "*Directional Losers*\n" + (table_md(dn_rows, ["SYM", "F Vol", "24H", "4H"]) if dn_rows else "_None_")
-    return up_txt, dn_txt
-
-
-# -------------------------
-# /screen fast cache (per-instance)
-# -------------------------
-SCREEN_CACHE_TTL_SEC = 20  # adjust 15–45 as you like
-_SCREEN_CACHE = {"ts": 0.0, "body": "", "kb": []}
-_SCREEN_LOCK = asyncio.Lock()
-
+    return {"setups": ordered, "waiting": waiting_items, "trend_watch": trend_watch, "spikes": spike_candidates}
 
 
 # =========================================================
-# /screen — Premium Telegram UI (FULL tables like old version)
+# /screen
 # =========================================================
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = update.effective_user.id
     user = get_user(uid)
-    
+
     if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Access expired.\n\n"
@@ -6709,6 +6875,33 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 trend_txt = "\n".join(lines)
 
+            # NEW: Spike Reversal Alerts (15M+ Vol) — includes /size line
+            spike_txt = ""
+            spikes = pool.get("spikes") or []
+            if spikes:
+                lines = ["*Spike Reversal Alerts (15M+ Vol)*", SEP]
+                for c in spikes[:6]:
+                    try:
+                        sym = str(c.get("symbol", "")).upper()
+                        side = str(c.get("side", "SELL")).upper()
+                        conf = int(c.get("conf", 0) or 0)
+                        entry = float(c.get("entry", 0.0) or 0.0)
+                        sl = float(c.get("sl", 0.0) or 0.0)
+                        tp3 = float(c.get("tp3", 0.0) or 0.0)
+                        vol = float(c.get("vol", 0.0) or 0.0)
+
+                        rr_den = abs(entry - sl)
+                        rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
+                        pos_word = "long" if side == "BUY" else "short"
+                        size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
+
+                        side_emoji = "🟢" if side == "BUY" else "🔴"
+                        lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf}` | RR(TP3) `{rr3:.2f}` | Vol~`{vol/1e6:.1f}M`")
+                        lines.append(f"  `{size_cmd}`")
+                    except Exception:
+                        continue
+                spike_txt = "\n".join(lines)
+
             # Assemble body (cache THIS, header stays live)
             blocks = [
                 "",
@@ -6722,6 +6915,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if trend_txt:
                 blocks.extend(["", trend_txt])
+
+            if spike_txt:
+                blocks.extend(["", spike_txt])
 
             blocks.extend([
                 "",
@@ -6769,6 +6965,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ /screen failed: {e}")
         except Exception:
             pass
+
 
 
 # =========================================================
@@ -7371,7 +7568,125 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     "reasons": [f"{type(e).__name__}: {e}"],
                 }
                 continue
+        
+        # -----------------------------------------------------
+        # Spike Reversal Alert Emails (new engine)
+        # Trigger: wick-spike rejection aligned with bigger trend
+        # Volume gate: vol24 >= user.spike_min_vol_usd (default 15M)
+        # -----------------------------------------------------
+        for u in (users_bigmove or []):
+            tz = timezone.utc
+            uid = 0
+            try:
+                try:
+                    uid = int(u.get("user_id") or u.get("id") or 0)
+                except Exception:
+                    uid = 0
+                if not uid:
+                    continue
 
+                uu = get_user(uid) or {}
+
+                tz_name = str((uu or {}).get("tz") or "UTC")
+                try:
+                    tz = ZoneInfo(tz_name)
+                except Exception:
+                    tz = timezone.utc
+
+                on = int(uu.get("spike_alert_on", 1) or 0)
+                if not on:
+                    continue
+
+                try:
+                    min_vol = float(uu.get("spike_min_vol_usd", 15_000_000) or 15_000_000)
+                except Exception:
+                    min_vol = 15_000_000.0
+
+                try:
+                    wick_ratio = float(uu.get("spike_wick_ratio", 0.55) or 0.55)
+                except Exception:
+                    wick_ratio = 0.55
+
+                try:
+                    atr_mult = float(uu.get("spike_atr_mult", 1.20) or 1.20)
+                except Exception:
+                    atr_mult = 1.20
+
+                candidates = _spike_reversal_candidates(
+                    best_fut,
+                    min_vol_usd=min_vol,
+                    wick_ratio_min=wick_ratio,
+                    atr_mult_min=atr_mult,
+                    max_items=10,
+                )
+                if not candidates:
+                    continue
+
+                filtered = []
+                for c in candidates:
+                    try:
+                        if spike_recently_emailed(uid, c["symbol"], c["direction"]):
+                            continue
+                        filtered.append(c)
+                    except Exception:
+                        filtered.append(c)
+
+                if not filtered:
+                    continue
+
+                now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+                subject = f"⚡ Spike Reversal Alert — {filtered[0]['symbol']} ({now_local})"
+
+                lines = []
+                lines.append("⚡ Spike Reversal Alert")
+                lines.append(HDR)
+                lines.append(f"Time: {now_local}  |  Session: {current_session_utc()}  |  TZ: {tz_name}")
+                lines.append("")
+                lines.append("Top Reversal Candidates")
+                lines.append("────────────────────")
+
+                for c in filtered[:6]:
+                    sym = c["symbol"]
+                    side = c["side"]
+                    conf = int(c.get("conf", 0))
+                    entry = float(c["entry"]); sl = float(c["sl"])
+                    tp1 = float(c["tp1"]); tp2 = float(c["tp2"]); tp3 = float(c["tp3"])
+                    vol = float(c.get("vol", 0.0))
+                    why = str(c.get("why", ""))
+
+                    rr_den = abs(entry - sl)
+                    rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
+
+                    pos_word = "long" if side.upper() == "BUY" else "short"
+                    size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
+
+                    lines.append(f"{sym} — {side} — Conf {conf}  |  RR(TP3): {rr3:.2f}")
+                    lines.append(f"Entry: {entry:.6g} | SL: {sl:.6g}")
+                    lines.append(f"TP1: {tp1:.6g} | TP2: {tp2:.6g} | TP3: {tp3:.6g}")
+                    lines.append(f"Size: {size_cmd}")
+                    lines.append(f"24H Vol ~{vol/1e6:.1f}M")
+
+                    if why:
+                        lines.append(f"Why: {why}")
+                    lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
+                    lines.append("")
+
+                body = "\n".join(lines).strip()
+
+                ok = send_email(subject, body, user_id_for_debug=uid, enforce_trade_window=False)
+                if ok:
+                    for c in filtered[:6]:
+                        try:
+                            mark_spike_emailed(uid, c["symbol"], c["direction"])
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                logger.exception("Spike reversal alert failed for uid=%s: %s", uid, e)
+                continue
+
+
+        
         # -----------------------------------------------------
         # Build setups per session (PRIORITY: leaders/losers → trend watch → waiting → market leaders)
         # -----------------------------------------------------
