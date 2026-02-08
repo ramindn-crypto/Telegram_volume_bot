@@ -8609,6 +8609,23 @@ async def admin_payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append(f"- {ts} | uid={r['user_id']} | {r['source']} | {r['plan']} | {r['amount']} {r['currency']} | {r['status']} | {r['ref']}")
     await update.message.reply_text("\n".join(lines))
 
+async def manage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Stripe customer portal link (if you have it).
+    If you are using Payment Links only and not portal, keep as-is or disable this command.
+    """
+    user = get_user(update.effective_user.id)
+    if user.get("plan") not in ("standard", "pro"):
+        await update.message.reply_text("No active subscription.")
+        return
+
+    # If you still use Stripe Customer Portal:
+    if user.get("email_to"):
+        await update.message.reply_text(create_customer_portal(user["email_to"]))
+        return
+
+    await update.message.reply_text("❌ No email on file for subscription management.")
+
 
 def main():
     # Hard guard: Background Worker ONLY
