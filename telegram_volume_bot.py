@@ -4063,50 +4063,18 @@ HELP_TEXT = """\
 PulseFutures — Commands (Telegram)
 
 /help
-
-Bybit USDT Futures • Risk-first • Session-aware
-Not financial advice.
-
 ────────────────────
 1) Market Scan
 ────────────────────
 /screen
 
-    Shows a real-time market snapshot:
-    • Top Trade Setups (highest quality)
-    • Waiting for Trigger (near-miss candidates)
-    • Trend Continuation Watch (adaptive EMA logic)
-    • Directional Leaders
-    • Directional Losers
-    • Market Leaders (Top by Futures Volume)
-
-Market Scan Controls & Alerts ↓
-
-    /sessions_on_unlimited
-    Enables 24-hour email signaling.
-    • Emails are sent even outside ASIA / LONDON / NEW YORK sessions
-    • Useful for catching overnight or explosive moves
-    
-    /sessions_off_unlimited
-    Disables 24-hour mode.
-    • Reverts back to session-based email signaling only
-    
-    /bigmove_alert [on <4H%> <1H%> | off]
-    
-    Sends ALERT emails for strong market moves
-    in either direction (UP or DOWN),
-    even if they do NOT qualify as full trade signals.
-    
-    Triggers on:
-    • +4H ≥ threshold  OR  +1H ≥ threshold
-    • −4H ≥ threshold  OR  −1H ≥ threshold
-    
-    Default thresholds:
-    • 4H ≥ +20% OR ≤ −20%
-    • 1H ≥ +10% OR ≤ −10%
+Market Scan Controls & Alerts 
+    /sessions_on_unlimited → Enables 24-hour email signaling.  
+    /sessions_off_unlimited → Disables 24-hour mode.    
+    /bigmove_alert [on <4H%> <1H%> | off] → Sends ALERT emails for strong market moves
+    in either direction (UP or DOWN), even if they do NOT qualify as full trade signals.
 
     Examples:
-    • /bigmove_alert
     • /bigmove_alert on 30 12
     • /bigmove_alert off
 
@@ -4117,74 +4085,38 @@ Market Scan Controls & Alerts ↓
          [risk <usd|pct> <VALUE>]
          [entry <ENTRY>]
     
-    Purpose:
-    • Calculates correct position size from Risk + SL
-    • Does NOT open a trade
+    Purpose: Calculates correct position size from Risk + SL
     
     Examples:
     • /size BTC long sl 42000
       → Uses default /riskmode
-    
     • /size BTC long risk usd 40 sl 42000
       → Uses current Bybit futures price as Entry
-    
     • /size ETH short risk pct 2.5 sl 2480
       → Uses your Equity
-    
     • /size BTC long sl 42000 entry 43000
       → Manual entry price
     
-    Notes:
-    • If risk is omitted → /riskmode is used
-    • pct risk uses Equity
-    • Qty = Risk / |Entry − SL|
-
 ────────────────────
 3) Trade Journal & Equity Tracking
 ────────────────────
-    Set equity:
-    • /equity 1000
-    Reset equity:
-    • /equity_reset
+    • /equity 1000 → Set equity:
+    • /equity_reset → Reset equity
     
     Open trade:
     • /trade_open <SYMBOL> <long|short>
                   entry <ENTRY> sl <SL>
                   risk <usd|pct> <VALUE>
-                  [note "..."] [sig <SETUP_ID>]
     
     Manage open trade:
-    • /trade_sl <TRADE_ID> <NEW_SL>
-      → Updates SL and recalculates trade risk
-      → Warns if risk increases
-      → Adjusts today’s used risk
+    • /trade_sl <TRADE_ID> <NEW_SL> → Updates SL and recalculates trade risk    
+    • /trade_rf <TRADE_ID> → Moves SL to Entry (Risk-Free) 
+    • /trade_close <TRADE_ID> pnl <PNL> → Close trade
     
-    • /trade_rf <TRADE_ID>
-      → Moves SL to Entry (Risk-Free)
-      → Sets trade risk to 0
-      → Releases today’s used risk immediately
-    
-    Close trade:
-    • /trade_close <TRADE_ID> pnl <PNL>
-    
-    Equity behavior:
-    • Equity updates ONLY when trades are closed
-    • If trade closes in profit → its risk is released
-    • Trade journal is persistent (stored in DB)
-
 ────────────────────
 4) Status Dashboard
 ────────────────────
     /status
-    
-    Shows:
-    • Equity
-    • Trades today (count)
-    • Daily risk cap + used / remaining risk
-    • Active sessions + current session
-    • Email alert status + email limits
-    • Open trades list
-    • Active symbol cooldowns (current session)
 
 ────────────────────
 5) Risk Settings
@@ -4204,15 +4136,10 @@ Market Scan Controls & Alerts ↓
     /limits emailcap 4        (0 = unlimited per session)
     /limits emailgap 60       (minutes between emails)
     /limits emaildaycap 4     (0 = unlimited per day)
-    
-    Limits protect against:
-    • Overtrading
-    • Email spam
-    • Emotional decision-making
 
 ────────────────────
 7) Sessions (Email Delivery Windows)
-    ────────────────────
+────────────────────
     View sessions:
     • /sessions
     
@@ -4220,14 +4147,7 @@ Market Scan Controls & Alerts ↓
     • /sessions_on NY
     • /sessions_off LON
     
-    Defaults by timezone:
-    • Americas → NY
-    • Europe/Africa → LON
-    • Asia/Oceania → ASIA
-    
-    Session priority:
-    NY > LON > ASIA
-    
+    Session priority: NY > LON > ASIA
     Emails are sent ONLY during enabled sessions.
 
 ────────────────────
@@ -4241,16 +4161,8 @@ Market Scan Controls & Alerts ↓
     • /trade_window <START_HH:MM> <END_HH:MM>
       Example: /trade_window 09:00 17:30
     
-    Email rules:
-    • Sent only during enabled sessions
-    • Session-based quality filters (confidence + RR floors)
-    • No same symbol+direction spam
-    • Cooldowns enforced (see below)
-    • Per-session & per-day caps supported
-    
     Email troubleshooting:
-    • /email_test
-      → Sends a test email using your configured email setup
+    • /email_test → Sends a test email using your configured email setup
 
 ────────────────────
 9) Symbol Cooldowns (Anti-Spam Logic)
@@ -4261,17 +4173,10 @@ Market Scan Controls & Alerts ↓
     • Per-direction (BUY vs SELL)
     • Session-aware (duration depends on NY/LON/ASIA policy)
     
-    Cooldown duration by session:
-    • NY    → 2 hours
-    • LON   → 3 hours
-    • ASIA  → 4 hours
-    
-    View cooldowns:
-    • /cooldowns
+    View cooldowns → /cooldowns
       → Shows remaining cooldown time for NY / LON / ASIA for each symbol + direction
     
-    Query a single symbol:
-    • /cooldown <SYMBOL> <long|short>
+    Query a single symbol → /cooldown <SYMBOL> <long|short>
       → Shows remaining cooldown time for NY / LON / ASIA for that exact symbol+direction
 
 ────────────────────
@@ -4281,8 +4186,6 @@ Market Scan Controls & Alerts ↓
     • /report_daily
     • /report_weekly
     • /report_overall
-    
-    Signal summaries:
     • /signals_daily
     • /signals_weekly
 
@@ -4290,31 +4193,19 @@ Market Scan Controls & Alerts ↓
 11) System Health
 ────────────────────
     • /health_sys
-      → DB status
-      → Bybit/CCXT connectivity
-      → Cache stats
-      → Session state
-      → Email configuration
-
+    
 ────────────────────
 12) Timezone
 ────────────────────
     View / set timezone:
     • /tz
-    • /tz Australia/Melbourne
-    • /tz America/New_York
 
 ────────────────────
 13) Billing, Plan, Support
 ────────────────────
-    • /myplan
-      → Shows your current plan
-    
-    • /billing
-      → Shows payment options (Stripe + USDT)
-    
-    • /support
-      → Contact/support info and troubleshooting steps
+    • /myplan → Shows your current plan
+    • /billing → Shows payment options (Stripe + USDT)
+    • /support → Contact/support info and troubleshooting steps
 
 ────────────────────
 14) USDT Payments (Semi-Auto)
@@ -4322,11 +4213,8 @@ Market Scan Controls & Alerts ↓
     You can pay using USDT (crypto).
     
     Start here:
-    • /usdt
-      → Shows the current network + address + instructions
-    
-    Accepted network:
-    • USDT (TRC20 only)
+    • /usdt → Shows the current network + address + instructions
+    Accepted network: USDT (TRC20 only)
     
     Prices:
     • Standard: 49 USDT
