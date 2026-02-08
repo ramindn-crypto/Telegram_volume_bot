@@ -1633,7 +1633,7 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, max_items: int = 1
       - DOWN if ch4 <= -p4 OR ch1 <= -p1
     """
 
-    BIGMOVE_MIN_VOL_USD = 5_000_000  # ✅ only alert if 24H USD volume >= $5M
+    BIGMOVE_MIN_VOL_USD = 10_000_000  # ✅ only alert if 24H USD volume >= $10M
 
     def _pick_pct(mv, keys) -> float:
         for k in keys:
@@ -2220,6 +2220,37 @@ def ema_support_reaction_ok_15m(c15: List[List[float]], ema_val: float, side: st
     return reject_count >= 1
 
 
+# =========================================================
+# Optional pullback policy (do NOT hard-reject signals)
+# =========================================================
+
+PULLBACK_OPTIONAL_DEFAULT = True
+PULLBACK_MISS_PENALTY_CONF = 6.0
+
+def apply_pullback_policy(
+    *,
+    require_pullback: bool,
+    pullback_ok: bool,
+    pullback_price: float | None,
+    confidence: float,
+    notes: list[str],
+):
+    if pullback_ok:
+        return True, confidence
+
+    if require_pullback:
+        return False, confidence
+
+    confidence = max(0.0, confidence - float(PULLBACK_MISS_PENALTY_CONF))
+
+    if pullback_price and pullback_price > 0:
+        notes.append(f"📝 Optional: wait for pullback entry near {pullback_price:.6g}.")
+    else:
+        notes.append("📝 Optional: consider waiting for a pullback before entering.")
+
+    return True, confidence
+
+
 def ema_rejection_candle_ok_15m(c15: List[List[float]], ema_val: float, side: str) -> bool:
     """
     Strict confirmation on the MOST RECENT 15m candle:
@@ -2793,8 +2824,7 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     return up_txt, dn_txt
 
 # =========================================================
-# ✅ MODIFIED: make_setup (trailing TP3 only when it's a trailing-needed setup)
-# Rule applied: trailing only for HOT coins AND Engine B (Momentum)
+# make_setup
 # =========================================================
 def make_setup(
     base: str,
@@ -2859,7 +2889,7 @@ def make_setup(
     if side == "SELL" and ch4 > -ALIGN_4H_MIN:
         _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4:+.2f}%")
         return None
-    
+
     # ✅ HARD regime gate: don't fight the 4H direction (unless "strong reversal exception")
     if TF_ALIGN_ENABLED:
         if side == "BUY" and ch4 < 0:
@@ -2877,29 +2907,29 @@ def make_setup(
     closes_15 = [float(x[4]) for x in c15]
     pb_ema_val, pb_ema_p, pb_dist_pct = best_pullback_ema_15m(closes_15, c15, entry, side, session_name, atr_1h)
 
-
     # ✅ No HOT bypass: pullback is ALWAYS required for high-quality continuation entries
     pullback_bypass_hot = False
-    
+
     pb_ok = False
     pb_thr_pct = 0.0
     pb_dist_pct2 = 999.0
-    
+
     if pb_ema_val > 0:
         pb_ok, pb_dist_pct2, pb_thr_pct, _ = ema_support_proximity_ok(entry, pb_ema_val, atr_1h, session_name)
-    
+
     pullback_ready = bool(pb_ok)
 
     # ✅ Strict continuation entry: must show EMA interaction + strong 15m rejection/reclaim
     if pullback_ready and REQUIRE_15M_EMA_REJECTION:
-        if not (c15, pb_ema_val, side, session_name):
-            _rej("no_ema_touch_reclaim_recent", base, mv, f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}% thr={pb_thr_pct:.2f}%")
+        if (not c15) or (pb_ema_val <= 0):
+            _rej("no_ema_touch_reclaim_recent", base, mv,
+                 f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}% thr={pb_thr_pct:.2f}%")
             return None
-    
+
         if not ema_rejection_candle_ok_15m(c15, pb_ema_val, side):
             _rej("no_strong_rejection_candle_15m", base, mv, f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}%")
             return None
-    
+
     # =========================================================
     # ENGINE A (Mean-Reversion) vs ENGINE B (Momentum)
     # =========================================================
@@ -2911,7 +2941,7 @@ def make_setup(
             if fut_vol >= (MOVER_VOL_USD_MIN * MOMENTUM_VOL_MULT):
                 body_pct = abs(ch1)
                 if atr_pct_now > 0 and body_pct >= (MOMENTUM_ATR_BODY_MULT * atr_pct_now):
-                    ema_ok, dist_pct, _, _ = ema_support_proximity_ok(entry, ema_support_15m, atr_1h, session_name)
+                    _, dist_pct, _, _ = ema_support_proximity_ok(entry, ema_support_15m, atr_1h, session_name)
                     if dist_pct <= MOMENTUM_MAX_ADAPTIVE_EMA_DIST:
                         engine_b_ok = True
 
@@ -2919,12 +2949,31 @@ def make_setup(
         _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}")
         return None
 
-    # ✅ No pullback = no signal (quality > quantity)
-    if not pullback_ready:
-        _rej("pullback_not_ready", base, mv, f"pb_dist={pb_dist_pct:.2f}%")
-        return None
+    # ---------------------------------------------------------
+    # Pullback policy (optional for Engine B)
+    # ---------------------------------------------------------
+    engine = "A" if engine_a_ok else "B"
+    require_pullback = (not bool(allow_no_pullback))
 
-    engine = "A"  # pullback is mandatory; momentum may contribute only as a quality check
+    # Compute confidence BEFORE applying optional pullback penalty
+    conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
+
+    # Engine A already required pullback_ready; Engine B does not require pullback
+    pullback_ok_local = True if engine == "A" else True
+
+    keep, conf2 = apply_pullback_policy(
+        require_pullback=require_pullback,
+        pullback_ok=pullback_ok_local,
+        pullback_price=(pb_ema_val if pb_ema_val > 0 else None),
+        confidence=float(conf),
+        notes=notes,
+    )
+
+    conf = conf2
+
+    if not keep:
+        _rej("pullback_required_not_met", base, mv, "require_pullback=1")
+        return None
 
     if engine == "A" and abs(float(ch1)) >= float(SHARP_1H_MOVE_PCT):
         if not ema_support_reaction_ok_15m(c15, pb_ema_val, side, session_name):
@@ -2947,7 +2996,6 @@ def make_setup(
             _rej("15m_weak_and_not_early", base, mv, f"ch15={ch15:+.2f}% ch1={ch1:+.2f}%")
             return None
 
-    conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
     if strict_15m and (not is_confirm_15m):
         conf = max(0, int(conf) - int(EARLY_CONF_PENALTY))
 
@@ -2956,8 +3004,10 @@ def make_setup(
     rr_bonus = ENGINE_B_RR_BONUS if engine_b_ok else 0.0
     tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine_b_ok else 0.0
 
-    sl, tp3_single, R = compute_sl_tp(entry, side, atr_1h, conf, tp_cap_pct,
-                                      rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus)
+    sl, tp3_single, R = compute_sl_tp(
+        entry, side, atr_1h, conf, tp_cap_pct,
+        rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
+    )
     if sl <= 0 or tp3_single <= 0 or R <= 0:
         _rej("bad_sl_tp_or_atr", base, mv, f"atr={atr_1h:.6g} entry={entry:.6g}")
         return None
@@ -2965,8 +3015,10 @@ def make_setup(
     tp1 = tp2 = None
     tp3 = tp3_single
     if conf >= MULTI_TP_MIN_CONF:
-        _tp1, _tp2, _tp3 = multi_tp(entry, side, R, tp_cap_pct, conf,
-                                    rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus)
+        _tp1, _tp2, _tp3 = multi_tp(
+            entry, side, R, tp_cap_pct, conf,
+            rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
+        )
         if _tp1 and _tp2 and _tp3:
             tp1, tp2, tp3 = _tp1, _tp2, _tp3
 
@@ -2995,13 +3047,14 @@ def make_setup(
         ema_support_period=int(ema_period),
         ema_support_dist_pct=float(abs(entry - float(ema_support_15m)) / entry * 100.0 if entry > 0 else 999.0),
         pullback_ema_period=int(pb_ema_p),
-        pullback_ema_dist_pct=float(pb_dist_pct),
+        pullback_ema_dist_pct=float(pb_dist_pct2),
         pullback_ready=bool(pullback_ready),
         pullback_bypass_hot=bool(pullback_bypass_hot),
         engine=str(engine),
         is_trailing_tp3=trailing_tp3,
         created_ts=time.time(),
     )
+
 
 def pick_setups(
     best_fut: Dict[str, MarketVol],
@@ -3098,9 +3151,9 @@ def send_email(
         if not to_email:
             _LAST_EMAIL_DECISION[uid] = {
                 "status": "FAIL",
-                "reasons": [err],
-                "when": datetime.now(timezone.utc).isoformat(timespec="seconds")
-            }            
+                "reasons": ["no_recipient_email_set"],
+                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
             return False
 
         # If trade window feature exists, enforce it here (ONLY if enabled)
@@ -3177,6 +3230,7 @@ def send_email(
                 "ts": time.time(),
             }
         return False
+
 
 # =========================================================
 # STRIPE CHECKOUT / CUSTOMER PORTAL
@@ -7075,6 +7129,8 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
     downgrade_user_by_email(email)
     _set_user_access(user_id, "free", "stripe", ref)
 
+
+
 # =========================================================
 # EMAIL JOB
 # =========================================================
@@ -7137,28 +7193,31 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         MARKET_VOL_MEDIAN_USD = _median(_all_vols)
-        
+
         # -----------------------------------------------------
         # Big-Move Alert Emails (independent of full trade setups)
         # Trigger: |4H| >= user.bigmove_alert_4h  OR  |1H| >= user.bigmove_alert_1h
+        # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 10M)
+        # Defaults: 1H=7.5%, 4H=15%
         # -----------------------------------------------------
         for u in (users_bigmove or []):
+            tz = timezone.utc
+            uid = 0
             try:
-                uid = int(u.get("user_id") or u.get("id") or 0)
-            except Exception:
-                uid = 0
-            if not uid:
-                continue
+                try:
+                    uid = int(u.get("user_id") or u.get("id") or 0)
+                except Exception:
+                    uid = 0
+                if not uid:
+                    continue
 
-            try:
                 uu = get_user(uid) or {}
-                # Use per-user timezone for decision timestamps (do NOT default to Melbourne)
+
                 tz_name = str((uu or {}).get("tz") or "UTC")
                 try:
                     tz = ZoneInfo(tz_name)
                 except Exception:
                     tz = timezone.utc
-
 
                 # Respect per-user ON/OFF
                 on = int(uu.get("bigmove_alert_on", 1) or 0)
@@ -7171,14 +7230,18 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 try:
-                    p4 = float(uu.get("bigmove_alert_4h", 20) or 20)
-                    p1 = float(uu.get("bigmove_alert_1h", 10) or 10)
+                    p4 = float(uu.get("bigmove_alert_4h", 15.0) or 15.0)
+                    p1 = float(uu.get("bigmove_alert_1h", 7.5) or 7.5)
                 except Exception:
-                    p4, p1 = 20.0, 10.0
+                    p4, p1 = 15.0, 7.5
 
+                try:
+                    min_vol = float(uu.get("bigmove_min_vol_usd", 10_000_000) or 10_000_000)
+                except Exception:
+                    min_vol = 10_000_000.0
 
                 candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, max_items=12)
-                
+
                 # Debug counts from the SAME dataset used for bigmove (same field-name logic)
                 def _pick_pct(_mv, _keys) -> float:
                     for _k in _keys:
@@ -7207,7 +7270,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     bm_any_1h = -1
 
-                
                 if not candidates:
                     _LAST_BIGMOVE_DECISION[uid] = {
                         "status": "SKIP",
@@ -7215,27 +7277,32 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                         "reasons": [
                             f"no_candidates (p4={p4}, p1={p1})",
                             f"debug_raw_hits:4h={bm_any_4h},1h={bm_any_1h}",
-                            "debug_hint: _bigmove_candidates may be reading different field names",
                         ],
                     }
                     continue
 
-
-                # Remove ones emailed recently (per symbol + direction)
+                # Volume gate (default 10M) + remove ones emailed recently (per symbol + direction)
                 filtered = []
                 for c in candidates:
+                    try:
+                        vol = float(c.get("vol", 0.0) or 0.0)
+                    except Exception:
+                        vol = 0.0
+
+                    if vol > 0.0 and vol < float(min_vol):
+                        continue
+
                     try:
                         if not bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
                             filtered.append(c)
                     except Exception:
-                        # If state check fails, do NOT kill bigmove; treat as not recently emailed
                         filtered.append(c)
 
                 if not filtered:
                     _LAST_BIGMOVE_DECISION[uid] = {
                         "status": "SKIP",
                         "when": datetime.now(tz).isoformat(timespec="seconds"),
-                        "reasons": ["all_candidates_recently_emailed"],
+                        "reasons": [f"no_candidates_after_volume_or_cooldown (min_vol={min_vol/1e6:.1f}M)"],
                     }
                     continue
 
@@ -7243,7 +7310,8 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 lines = []
                 lines.append("⚡ PulseFutures — BIG MOVE ALERT")
                 lines.append(HDR)
-                lines.append(f"Triggers: |4H| ≥ {p4:.0f}%  OR  |1H| ≥ {p1:.0f}%")
+                lines.append(f"Triggers: |4H| ≥ {p4:.1f}%  OR  |1H| ≥ {p1:.1f}%")
+                lines.append(f"Min Vol (24H): {min_vol/1e6:.1f}M")
                 lines.append("")
 
                 top = filtered[0]
@@ -7272,7 +7340,12 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 _LAST_BIGMOVE_DECISION[uid] = {
                     "status": "TRY_SEND",
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "reasons": [f"candidates={len(filtered)}", f"p4={p4}", f"p1={p1}"],
+                    "reasons": [
+                        f"candidates={len(filtered)}",
+                        f"p4={p4}",
+                        f"p1={p1}",
+                        f"min_vol={min_vol}",
+                    ],
                 }
 
                 ok = send_email(subject, body, user_id_for_debug=uid, enforce_trade_window=False)
@@ -7299,7 +7372,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 }
                 continue
 
-         
         # -----------------------------------------------------
         # Build setups per session (PRIORITY: leaders/losers → trend watch → waiting → market leaders)
         # -----------------------------------------------------
@@ -7488,9 +7560,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 # =========================================================
                 # Rule 2: Volume relative filter (killer rule)
                 # =========================================================
-                # Robust volume resolution:
-                # 1) try best_fut lookup
-                # 2) fallback to setup's own fut_vol_usd if present
                 vol_usd = 0.0
                 try:
                     vol_usd = float(_best_fut_vol_usd(best_fut, getattr(s, "symbol", "")) or 0.0)
@@ -7505,8 +7574,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
                 abs_min = float(EMAIL_ABS_VOL_USD_MIN)
 
-                # If volume is missing/unknown (0), do NOT auto-kill the email.
-                # Treat as "unknown" and let RR/conf/momentum decide.
                 if vol_usd > 0.0 and vol_usd < abs_min:
                     skip_reasons_counter["email_vol_abs_too_low"] += 1
                     continue
@@ -7516,7 +7583,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     if rel < float(EMAIL_REL_VOL_MIN_MULT):
                         skip_reasons_counter["email_vol_rel_too_low"] += 1
                         continue
-
 
                 # =========================================================
                 # Rule 1: Minimum momentum gate for EMAILS
@@ -7676,6 +7742,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             lines.append(f"Reason: {rs}")
 
     await update.message.reply_text("\n".join(lines).strip())
+
 
 
 
@@ -8094,49 +8161,53 @@ async def admin_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("- (none)")
     await update.message.reply_text("\n".join(lines))
 
+def _table_columns(conn, table_name: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(r[1]) for r in rows}
+
+def _first_existing_col(cols: set[str], candidates: list[str]):
+    for c in candidates:
+        if c in cols:
+            return c
+    return None
+
 async def admin_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        await update.message.reply_text("❌ Admin only.")
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
         return
 
-    flt = (context.args[0].lower() if context.args else "").strip()  # optional: standard/pro/free
-    with _db() as con:
-        con.row_factory = sqlite3.Row
-        cur = con.cursor()
-        if flt in ("standard", "pro", "free"):
-            cur.execute("SELECT user_id, plan, email_to, access_source FROM users WHERE plan=? ORDER BY user_id LIMIT 50", (flt,))
-        else:
-            cur.execute("SELECT user_id, plan, email_to, access_source FROM users ORDER BY user_id LIMIT 50")
-        rows = cur.fetchall()
+    conn = _db()
+    cols = _table_columns(conn, "users")
 
-    if not rows:
-        await update.message.reply_text("No users found.")
-        return
+    id_col = _first_existing_col(cols, ["user_id", "id"]) or "id"
+    plan_col = _first_existing_col(cols, ["plan", "tier", "subscription_plan"])
+    email_col = _first_existing_col(cols, ["email", "user_email"])
+    tz_col = _first_existing_col(cols, ["tz", "timezone"])
 
-    lines = ["Users (max 50):"]
-    for r in rows:
-        lines.append(f"- {r['user_id']} | {r['plan']} | {r['access_source'] or ''} | {r['email_to'] or ''}")
+    sql = f"""
+        SELECT
+            {id_col} AS uid,
+            {plan_col if plan_col else 'NULL'} AS plan,
+            {email_col if email_col else 'NULL'} AS email,
+            {tz_col if tz_col else 'NULL'} AS tz
+        FROM users
+        ORDER BY uid DESC
+        LIMIT 50
+    """
+
+    rows = conn.execute(sql).fetchall()
+
+    lines = ["👤 Admin — Users", HDR]
+    for uid, plan, email, tz in rows:
+        lines.append(
+            f"• {uid}"
+            f" | {plan or ''}"
+            f" | {email or ''}"
+            f" | tz:{tz or ''}"
+        )
+
     await update.message.reply_text("\n".join(lines))
 
-async def admin_grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        await update.message.reply_text("❌ Admin only.")
-        return
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /admin_grant <telegram_id> <standard|pro> [source] [ref]")
-        return
-    uid = int(context.args[0])
-    plan = context.args[1].lower().strip()
-    source = (context.args[2].lower().strip() if len(context.args) >= 3 else "manual")
-    ref = (" ".join(context.args[3:]).strip() if len(context.args) >= 4 else "manual_grant")
-
-    if plan not in ("standard", "pro", "free"):
-        await update.message.reply_text("❌ plan must be: standard | pro | free")
-        return
-
-    _set_user_access(uid, plan, source, ref)
-    _ledger_add(uid, source, ref, plan, 0, "", "paid")
-    await update.message.reply_text(f"✅ Granted {plan.upper()} to {uid} (source={source}).")
 
 async def admin_revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
