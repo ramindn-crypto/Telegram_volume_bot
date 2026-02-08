@@ -4067,174 +4067,133 @@ PulseFutures — Commands (Telegram)
 1) Market Scan
 ────────────────────
 /screen
-
 Market Scan Controls & Alerts 
     /sessions_on_unlimited → Enables 24-hour email signaling.  
     /sessions_off_unlimited → Disables 24-hour mode.    
-    /bigmove_alert [on <4H%> <1H%> | off] → Sends ALERT emails for strong market moves
-    in either direction (UP or DOWN), even if they do NOT qualify as full trade signals.
-
-    Examples:
-    • /bigmove_alert on 30 12
-    • /bigmove_alert off
-
+    /bigmove_alert [on <4H%> <1H%> | off] → Sends ALERT emails for strong market moves in either direction (UP or DOWN), even if they do NOT qualify as full trade signals.
+    Examples: /bigmove_alert on 30 12 ; /bigmove_alert off
 ────────────────────
 2) Position Sizing (NO trade opened)
 ────────────────────
-    /size <SYMBOL> <long|short> sl <STOP>
-         [risk <usd|pct> <VALUE>]
-         [entry <ENTRY>]
+/size <SYMBOL> <long|short> entry <ENTRY> sl <STOP> [risk <usd|pct> <VALUE>]   
+Purpose: Calculates correct position size from Risk + SL
     
-    Purpose: Calculates correct position size from Risk + SL
-    
-    Examples:
-    • /size BTC long sl 42000
-      → Uses default /riskmode
-    • /size BTC long risk usd 40 sl 42000
-      → Uses current Bybit futures price as Entry
-    • /size ETH short risk pct 2.5 sl 2480
-      → Uses your Equity
-    • /size BTC long sl 42000 entry 43000
-      → Manual entry price
-    
+Examples:
+   • /size BTC long sl 42000 → Uses default /riskmode
+   • /size BTC long risk usd 40 sl 42000 → Uses current Bybit futures price as Entry
+   • /size ETH short risk pct 2.5 sl 2480 → Uses your Equity
+   • /size BTC long sl 42000 entry 43000 → Manual entry price
 ────────────────────
 3) Trade Journal & Equity Tracking
 ────────────────────
-    • /equity 1000 → Set equity:
-    • /equity_reset → Reset equity
-    
-    Open trade:
-    • /trade_open <SYMBOL> <long|short>
-                  entry <ENTRY> sl <SL>
-                  risk <usd|pct> <VALUE>
-    
-    Manage open trade:
-    • /trade_sl <TRADE_ID> <NEW_SL> → Updates SL and recalculates trade risk    
-    • /trade_rf <TRADE_ID> → Moves SL to Entry (Risk-Free) 
-    • /trade_close <TRADE_ID> pnl <PNL> → Close trade
-    
+Set equity
+   • /equity <value> → /equity 1000
+   • /equity_reset → Reset equity  
+Open trade:
+   • /trade_open <SYMBOL> <long|short> entry <ENTRY> sl <SL> risk <usd|pct> <VALUE>
+Manage open trade:
+   • /trade_sl <TRADE_ID> <NEW_SL> → Updates SL and recalculates trade risk    
+   • /trade_rf <TRADE_ID> → Moves SL to Entry (Risk-Free) 
+   • /trade_close <TRADE_ID> pnl <PNL> → Close trade
 ────────────────────
 4) Status Dashboard
 ────────────────────
     /status
-
 ────────────────────
 5) Risk Settings
 ────────────────────
-    Risk per trade:
-    • /riskmode pct 2.5
-    • /riskmode usd 25
-    
-    Daily risk cap:
-    • /dailycap pct 5
-    • /dailycap usd 60
-
+Risk per trade:
+   • /riskmode pct 2.5
+   • /riskmode usd 25
+Daily risk cap:
+   • /dailycap pct 5
+   • /dailycap usd 60
 ────────────────────
 6) Limits (Discipline Controls)
 ────────────────────
-    /limits maxtrades 5
-    /limits emailcap 4        (0 = unlimited per session)
-    /limits emailgap 60       (minutes between emails)
-    /limits emaildaycap 4     (0 = unlimited per day)
-
+/limits maxtrades 5
+/limits emailcap 4        (0 = unlimited per session)
+/limits emailgap 60       (minutes between emails)
+/limits emaildaycap 4     (0 = unlimited per day)
 ────────────────────
 7) Sessions (Email Delivery Windows)
 ────────────────────
-    View sessions:
-    • /sessions
-    
-    Enable / disable:
-    • /sessions_on NY
-    • /sessions_off LON
-    
-    Session priority: NY > LON > ASIA
-    Emails are sent ONLY during enabled sessions.
-
+View sessions:
+   • /sessions
+Enable / disable:
+   • /sessions_on NY
+   • /sessions_off LO
+Session priority: NY > LON > ASIA
+Emails are sent ONLY during enabled sessions.
 ────────────────────
 8) Email Alerts
 ────────────────────
-    Enable / disable:
-    • /notify_on
-    • /notify_off
-    
-    Limit alerts to a daily time window (your timezone):
-    • /trade_window <START_HH:MM> <END_HH:MM>
-      Example: /trade_window 09:00 17:30
-    
-    Email troubleshooting:
-    • /email_test → Sends a test email using your configured email setup
-
+Enable / disable:
+   • /notify_on
+   • /notify_off
+Limit alerts to a daily time window (your timezone):
+   • /trade_window <START_HH:MM> <END_HH:MM>
+     Example: /trade_window 09:00 17:30
+Email troubleshooting:
+   • /email_test → Sends a test email using your configured email setup
 ────────────────────
 9) Symbol Cooldowns (Anti-Spam Logic)
 ────────────────────
-    Cooldowns are:
+Cooldowns are:
     • Per-user
     • Per-symbol
     • Per-direction (BUY vs SELL)
     • Session-aware (duration depends on NY/LON/ASIA policy)
-    
-    View cooldowns → /cooldowns
-      → Shows remaining cooldown time for NY / LON / ASIA for each symbol + direction
-    
-    Query a single symbol → /cooldown <SYMBOL> <long|short>
+View cooldowns → /cooldowns
+   → Shows remaining cooldown time for NY / LON / ASIA for each symbol + direction
+Query a single symbol → /cooldown <SYMBOL> <long|short>
       → Shows remaining cooldown time for NY / LON / ASIA for that exact symbol+direction
-
 ────────────────────
 10) Reports
 ────────────────────
-    Performance:
-    • /report_daily
-    • /report_weekly
-    • /report_overall
-    • /signals_daily
-    • /signals_weekly
-
+Performance:
+   • /report_daily
+   • /report_weekly
+   • /report_overall
+   • /signals_daily
+   • /signals_weekly
 ────────────────────
 11) System Health
 ────────────────────
-    • /health_sys
-    
+   • /health_sys
 ────────────────────
 12) Timezone
 ────────────────────
-    View / set timezone:
-    • /tz
-
+View / set timezone:
+   • /tz
 ────────────────────
 13) Billing, Plan, Support
 ────────────────────
-    • /myplan → Shows your current plan
-    • /billing → Shows payment options (Stripe + USDT)
-    • /support → Contact/support info and troubleshooting steps
-
+   • /myplan → Shows your current plan
+   • /billing → Shows payment options (Stripe + USDT)
+   • /support → Contact/support info and troubleshooting steps
 ────────────────────
 14) USDT Payments (Semi-Auto)
 ────────────────────
-    You can pay using USDT (crypto).
+You can pay using USDT (crypto).
+Start here:
+   • /usdt → Shows the current network + address + instructions
+   Accepted network: USDT (TRC20 only)
     
-    Start here:
-    • /usdt → Shows the current network + address + instructions
-    Accepted network: USDT (TRC20 only)
+   Prices:
+   • Standard: 49 USDT
+   • Pro: 99 USDT
     
-    Prices:
-    • Standard: 49 USDT
-    • Pro: 99 USDT
-    
-    Steps:
-    1) Send USDT to the address shown in /usdt
-    2) Copy the transaction hash (TXID)
-    3) Submit payment using:
-    
+   Steps:
+   1) Send USDT to the address shown in /usdt
+   2) Copy the transaction hash (TXID)
+   3) Submit payment using:
     /usdt_paid <TXID> <standard|pro>
-    
-    Example:
-    • /usdt_paid 7f3a...c9 standard
-    
+    Example: /usdt_paid 7f3a...c9 standard
     Notes:
     • USDT payments are final
     • No refunds for crypto payments
     • Access is granted after admin approval
-
 ────────────────────
 Final Notes
 ────────────────────
@@ -4242,10 +4201,9 @@ Final Notes
 • PulseFutures does NOT promise profits
 • PulseFutures enforces discipline, risk control, and session awareness
     
-Trade less. Trade better. Risk first.
+Trade less. Trade better. Stay disciplined
 PulseFutures
 """
-    
 
 # =========================================================
 # HELP TEXT (ADMIN)
