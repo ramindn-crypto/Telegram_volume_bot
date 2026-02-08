@@ -6684,6 +6684,31 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str) -> d
     return {"setups": ordered, "waiting": waiting_items, "trend_watch": trend_watch, "spikes": spike_candidates}
 
 
+def user_location_and_time(user: dict):
+    """
+    Returns: (location_label, time_str) based on user's tz
+    """
+    tz_name = str(user.get("tz") or "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+        tz_name = "UTC"
+
+    now_local = datetime.now(tz)
+
+    # Build location label safely
+    if "/" in tz_name:
+        parts = tz_name.split("/")
+        region = parts[0].replace("_", " ")
+        city = parts[-1].replace("_", " ")
+        loc = f"{city} ({region})"
+    else:
+        loc = tz_name
+
+    return loc, now_local.strftime("%Y-%m-%d %H:%M")
+
+
 # =========================================================
 # /screen
 # =========================================================
