@@ -8327,10 +8327,11 @@ def main():
     app.add_handler(CommandHandler("usdt_reject", usdt_reject_cmd))
     
     # ================= Admin: access & payments =================
+    
     app.add_handler(CommandHandler("admin_user", admin_user_cmd))
     app.add_handler(CommandHandler("admin_users", admin_users_cmd))
-    app.add_handler(CommandHandler("admin_grant", admin_grant_cmd))
-    app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd))
+    # app.add_handler(CommandHandler("admin_grant", admin_grant_cmd)) # 
+    # app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd)) # 
     app.add_handler(CommandHandler("admin_payments", admin_payments_cmd))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
