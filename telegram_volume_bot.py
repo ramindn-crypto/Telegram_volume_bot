@@ -473,7 +473,7 @@ SESSION_MIN_RR_TP3 = {
 SESSION_EMA_PROX_MULT = {
     "NY": 1.20,
     "LON": 1.00,
-    "ASIA": 0.85,
+    "ASIA": 1.00,
 }
 
 SESSION_EMA_REACTION_LOOKBACK = {
@@ -504,31 +504,24 @@ def session_knobs(session_name: str) -> dict:
 
 def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
     """
-    Stricter session-dynamic 1H trigger:
-    - Higher floors (fewer signals)
-    - Higher ATR scaling (avoid low-quality small moves)
+    Session-dynamic 1H trigger:
+    - Still adapts to ATR%
+    - But avoids an extra ASIA hard-floor that can zero-out signals
     """
     knobs = session_knobs(session_name)
     mult_atr = float(knobs["trigger_atr_mult"])
 
-    # ✅ Make ATR scaling stricter (was 1.0..4.5)
-    # If ATR is small, we still require meaningful movement.
-    dyn = clamp(float(atr_pct) * float(mult_atr), 1.4, 6.0)
+    # ATR-scaled trigger (so low ATR still needs some move, high ATR needs more)
+    # Slightly lower min clamp so ASIA isn't dead during quieter hours
+    dyn = clamp(float(atr_pct) * float(mult_atr), 0.9, 6.0)
 
     sess = knobs["name"]
-
-    # ✅ Stricter base floors by session
     base_mult = float(SESSION_1H_BASE_MULT.get(sess, 1.0))
 
-    # Hard-min floor raised slightly by session multiplier
+    # Base floor (session-scaled) — no extra ASIA override
     base_floor = float(TRIGGER_1H_ABS_MIN_BASE) * base_mult
 
-    # Extra strictness in ASIA by default (you can remove if you want)
-    if sess == "ASIA":
-        base_floor = max(base_floor, float(TRIGGER_1H_ABS_MIN_BASE) * 1.25)
-
     return max(float(base_floor), float(dyn))
-
 
 
 # =========================================================
@@ -6571,29 +6564,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str) -> d
     return {"setups": ordered, "waiting": waiting_items, "trend_watch": trend_watch, "spikes": spike_candidates}
 
 
-def user_location_and_time(user: dict):
-    """
-    Returns: (location_label, time_str) based on user's tz
-    """
-    tz_name = str(user.get("tz") or "UTC")
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = timezone.utc
-        tz_name = "UTC"
 
-    now_local = datetime.now(tz)
-
-    # Build location label safely
-    if "/" in tz_name:
-        parts = tz_name.split("/")
-        region = parts[0].replace("_", " ")
-        city = parts[-1].replace("_", " ")
-        loc = f"{city} ({region})"
-    else:
-        loc = tz_name
-
-    return loc, now_local.strftime("%Y-%m-%d %H:%M")
 
 # =========================================================
 # User location/time helpers
