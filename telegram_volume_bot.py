@@ -3391,8 +3391,10 @@ def send_email(
     msg["To"] = to_email
     msg.set_content(body)
 
+
+
       
-    def _close_cached():      
+    def _close_cached():
         global _SMTP_CONN, _SMTP_CONN_IS_SSL, _SMTP_CONN_TS
         try:
             if _SMTP_CONN is not None:
@@ -3409,7 +3411,7 @@ def send_email(
             _SMTP_CONN_TS = 0.0
 
     def _need_new_conn(is_ssl: bool) -> bool:
-        global _SMTP_CONN, _SMTP_CONN_IS_SSL, _SMTP_CONN_TS:
+        global _SMTP_CONN, _SMTP_CONN_IS_SSL, _SMTP_CONN_TS
         if _SMTP_CONN is None:
             return True
         if _SMTP_CONN_IS_SSL is None or _SMTP_CONN_IS_SSL != is_ssl:
@@ -3417,6 +3419,7 @@ def send_email(
         if (time.time() - float(_SMTP_CONN_TS or 0.0)) > float(SMTP_REUSE_TTL_SEC or 0.0):
             return True
         return False
+
 
     def _connect_and_login(is_ssl: bool) -> smtplib.SMTP:
         timeout = float(EMAIL_SEND_TIMEOUT_SEC)
