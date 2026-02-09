@@ -110,6 +110,7 @@ ALLOWED_WHEN_LOCKED = {
     "license",
     "support",
     "support_status",
+    "mode",
 }
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
@@ -3043,10 +3044,11 @@ def make_setup(
     mv: MarketVol,
     strict_15m: bool = True,
     session_name: str = "LON",
-    allow_no_pullback: bool = True,     # ✅ /screen True, Email False (except HOT bypass)
+    allow_no_pullback: bool = True,     # /screen True, Email False (except HOT bypass)
     hot_vol_usd: float = HOT_VOL_USD,   # 50M
     trigger_loosen_mult: float = 1.0,
     waiting_near_pct: float = SCREEN_WAITING_NEAR_PCT,
+    scan_profile: str = DEFAULT_SCAN_PROFILE,
 ) -> Optional[Setup]:
 
     fut_vol = usd_notional(mv)
@@ -3065,6 +3067,12 @@ def make_setup(
     if (ch1 == 0.0 and ch4 == 0.0 and ch15 == 0.0 and atr_1h == 0.0) or (not c15) or (ema_support_15m == 0.0):
         _rej("ohlcv_missing_or_insufficient", base, mv, "metrics/ema missing")
         return None
+
+    # Scan profile tuning
+    prof = str(scan_profile or DEFAULT_SCAN_PROFILE).strip().lower()
+    if prof not in SCAN_PROFILES:
+        prof = DEFAULT_SCAN_PROFILE
+    aggressive_screen = (prof == "aggressive" and (not strict_15m))
 
     # --------- SESSION-DYNAMIC 1H TRIGGER ----------
     atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
@@ -3131,8 +3139,19 @@ def make_setup(
 
     pullback_ready = bool(pb_ok)
 
+    # Aggressive /screen: allow "near-EMA" pullback (slightly looser proximity)
+    if (not pullback_ready) and aggressive_screen and (pb_ema_val > 0) and (pb_thr_pct > 0):
+        try:
+            if float(pb_dist_pct2) <= float(pb_thr_pct) * 1.35:
+                pullback_ready = True
+        except Exception:
+            pass
+
+    # 15m rejection candle requirement (skip in Aggressive /screen)
+    require_rejection = bool(REQUIRE_15M_EMA_REJECTION and (not aggressive_screen))
+
     # ✅ Strict continuation entry: must show EMA interaction + strong 15m rejection/reclaim
-    if pullback_ready and REQUIRE_15M_EMA_REJECTION:
+    if pullback_ready and require_rejection:
         if (not c15) or (pb_ema_val <= 0):
             _rej("no_ema_touch_reclaim_recent", base, mv,
                  f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}% thr={pb_thr_pct:.2f}%")
@@ -3149,12 +3168,18 @@ def make_setup(
 
     engine_b_ok = False
     if ENGINE_B_MOMENTUM_ENABLED:
-        if abs(ch1) >= MOMENTUM_MIN_CH1 and abs(ch24) >= MOMENTUM_MIN_24H:
+        # Aggressive /screen: slightly looser momentum requirements
+        mom_min_ch1 = float(MOMENTUM_MIN_CH1) * (0.75 if aggressive_screen else 1.0)
+        mom_min_24h = float(MOMENTUM_MIN_24H) * (0.75 if aggressive_screen else 1.0)
+        mom_body_mult = float(MOMENTUM_ATR_BODY_MULT) * (0.85 if aggressive_screen else 1.0)
+        mom_max_ema_dist = float(MOMENTUM_MAX_ADAPTIVE_EMA_DIST) * (1.30 if aggressive_screen else 1.0)
+
+        if abs(ch1) >= mom_min_ch1 and abs(ch24) >= mom_min_24h:
             if fut_vol >= (MOVER_VOL_USD_MIN * MOMENTUM_VOL_MULT):
                 body_pct = abs(ch1)
-                if atr_pct_now > 0 and body_pct >= (MOMENTUM_ATR_BODY_MULT * atr_pct_now):
+                if atr_pct_now > 0 and body_pct >= (mom_body_mult * atr_pct_now):
                     _, dist_pct, _, _ = ema_support_proximity_ok(entry, ema_support_15m, atr_1h, session_name)
-                    if dist_pct <= MOMENTUM_MAX_ADAPTIVE_EMA_DIST:
+                    if dist_pct <= mom_max_ema_dist:
                         engine_b_ok = True
 
     if not engine_a_ok and not engine_b_ok:
@@ -3276,7 +3301,8 @@ def pick_setups(
     universe_n: int = 35,
     trigger_loosen_mult: float = 1.0,
     waiting_near_pct: float = SCREEN_WAITING_NEAR_PCT,
-    allow_no_pullback: bool = False,   # ✅ screen True, email False (except HOT bypass inside make_setup)
+    allow_no_pullback: bool = False,   # /screen True, email False (except HOT bypass inside make_setup)
+    scan_profile: str = DEFAULT_SCAN_PROFILE,
 ) -> List[Setup]:
     global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL, _WAITING_TRIGGER
     _REJECT_STATS = Counter()
@@ -3297,6 +3323,7 @@ def pick_setups(
             allow_no_pullback=allow_no_pullback,
             trigger_loosen_mult=float(trigger_loosen_mult),
             waiting_near_pct=float(waiting_near_pct),
+            scan_profile=str(scan_profile or DEFAULT_SCAN_PROFILE),
         )
         if s:
             setups.append(s)
@@ -4294,6 +4321,12 @@ PulseFutures — Admin Commands (Telegram)
 
 Admin-only • Use carefully
 Not financial advice.
+
+────────────────────
+User Scan Profile (All Users)
+────────────────────
+/mode <standard|aggressive>
+• Changes /screen strictness (Aggressive = more setups; higher risk)
 
 ────────────────────
 Cooldown Controls (Admin)
@@ -6485,6 +6518,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                 trigger_loosen,
                 waiting_near,
                 allow_no_pullback,
+            scan_profile=prof,
             )
         except Exception:
             tmp = []
@@ -6505,6 +6539,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                 trigger_loosen,
                 waiting_near,
                 allow_no_pullback,
+            scan_profile=prof,
             )
         except Exception:
             tmp = []
@@ -6577,7 +6612,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                     trigger_loosen,
                     waiting_near,
                     allow_no_pullback,
-                )
+                scan_profile=prof,
+            )
             except Exception:
                 tmp = []
             priority_setups.extend(tmp or [])
