@@ -322,6 +322,15 @@ DEFAULT_MAX_EMAILS_PER_SESSION = 4
 DEFAULT_MAX_EMAILS_PER_DAY = 4
 
 DEFAULT_MAX_RISK_PCT_PER_TRADE = 2.0
+
+# =========================================================
+# SCAN PROFILES
+# =========================================================
+# standard = fewer, higher quality
+# aggressive = more setups on /screen and more candidates for email filters (still risk-gated)
+DEFAULT_SCAN_PROFILE = "standard"
+SCAN_PROFILES = {"standard", "aggressive"}
+
 WARN_RISK_PCT_PER_TRADE = 2.0
 
 # =========================================================
@@ -473,7 +482,7 @@ SESSION_MIN_RR_TP3 = {
 SESSION_EMA_PROX_MULT = {
     "NY": 1.20,
     "LON": 1.00,
-    "ASIA": 1.00,
+    "ASIA": 0.85,
 }
 
 SESSION_EMA_REACTION_LOOKBACK = {
@@ -504,24 +513,31 @@ def session_knobs(session_name: str) -> dict:
 
 def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
     """
-    Session-dynamic 1H trigger:
-    - Still adapts to ATR%
-    - But avoids an extra ASIA hard-floor that can zero-out signals
+    Stricter session-dynamic 1H trigger:
+    - Higher floors (fewer signals)
+    - Higher ATR scaling (avoid low-quality small moves)
     """
     knobs = session_knobs(session_name)
     mult_atr = float(knobs["trigger_atr_mult"])
 
-    # ATR-scaled trigger (so low ATR still needs some move, high ATR needs more)
-    # Slightly lower min clamp so ASIA isn't dead during quieter hours
-    dyn = clamp(float(atr_pct) * float(mult_atr), 0.9, 6.0)
+    # ✅ Make ATR scaling stricter (was 1.0..4.5)
+    # If ATR is small, we still require meaningful movement.
+    dyn = clamp(float(atr_pct) * float(mult_atr), 1.4, 6.0)
 
     sess = knobs["name"]
+
+    # ✅ Stricter base floors by session
     base_mult = float(SESSION_1H_BASE_MULT.get(sess, 1.0))
 
-    # Base floor (session-scaled) — no extra ASIA override
+    # Hard-min floor raised slightly by session multiplier
     base_floor = float(TRIGGER_1H_ABS_MIN_BASE) * base_mult
 
+    # Extra strictness in ASIA by default (you can remove if you want)
+    if sess == "ASIA":
+        base_floor = max(base_floor, float(TRIGGER_1H_ABS_MIN_BASE) * 1.25)
+
     return max(float(base_floor), float(dyn))
+
 
 
 # =========================================================
@@ -1123,7 +1139,11 @@ def db_init():
     if "trade_window_end" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN trade_window_end TEXT NOT NULL DEFAULT ''")
     
-    # Daily email cap
+    
+    # Scan profile (standard/aggressive)
+    if "scan_profile" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN scan_profile TEXT NOT NULL DEFAULT 'standard'")
+# Daily email cap
     if "max_emails_per_day" not in cols:
         cur.execute(
             f"ALTER TABLE users ADD COLUMN max_emails_per_day INTEGER NOT NULL DEFAULT {int(DEFAULT_MAX_EMAILS_PER_DAY)}"
@@ -1344,17 +1364,18 @@ def get_user(user_id: int) -> dict:
         now_local = datetime.now(ZoneInfo(tz_name)).date().isoformat()
         cur.execute("""
             INSERT INTO users (
-                user_id, tz, equity, risk_mode, risk_value,
+                user_id, tz, scan_profile, equity, risk_mode, risk_value,
                 daily_cap_mode, daily_cap_value,
                 max_trades_day, notify_on,
                 sessions_enabled, max_emails_per_session, email_gap_min,
                 max_emails_per_day,
                 day_trade_date, day_trade_count
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             user_id,
             tz_name,
+            str(DEFAULT_SCAN_PROFILE),
             float(DEFAULT_EQUITY),
             DEFAULT_RISK_MODE,
             float(DEFAULT_RISK_VALUE),
@@ -4115,222 +4136,151 @@ async def usdt_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 HELP_TEXT = """\
 PulseFutures — Commands (Telegram)
+
 /help
-
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
 1) Market Scan
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
 /screen
+/mode <standard|aggressive>
+• Changes scan strictness (Aggressive = more setups; higher risk).
 
-Market Scan Controls & Alerts
-• /sessions_on_unlimited
-  → Enables 24-hour email signaling
-
-• /sessions_off_unlimited
-  → Disables 24-hour mode
-
-• /bigmove_alert [on <4H%> <1H%> | off]
-  → Sends ALERT emails for strong market moves in either direction (UP or DOWN),
-    even if they do NOT qualify as full trade signals
-
-Examples:
-• /bigmove_alert on 30 12
-• /bigmove_alert off
-
-━━━━━━━━━━━━━━━━━━━━
+Market Scan Controls & Alerts 
+    /sessions_on_unlimited → Enables 24-hour email signaling.  
+    /sessions_off_unlimited → Disables 24-hour mode.    
+    /bigmove_alert [on <4H%> <1H%> | off] → Sends ALERT emails for strong market moves in either direction (UP or DOWN), even if they do NOT qualify as full trade signals.
+    Examples: /bigmove_alert on 30 12 ; /bigmove_alert off
+────────────────────
 2) Position Sizing (NO trade opened)
-━━━━━━━━━━━━━━━━━━━━
-/size <SYMBOL> <long|short> entry <ENTRY> sl <STOP> [risk <usd|pct> <VALUE>]
-
-Purpose:
-Calculates correct position size from Risk + Stop Loss
-
+────────────────────
+/size <SYMBOL> <long|short> entry <ENTRY> sl <STOP> [risk <usd|pct> <VALUE>]   
+Purpose: Calculates correct position size from Risk + SL
+    
 Examples:
-• /size BTC long sl 42000
-  → Uses default /riskmode
-
-• /size BTC long risk usd 40 sl 42000
-  → Uses current Bybit futures price as Entry
-
-• /size ETH short risk pct 2.5 sl 2480
-  → Uses your Equity
-
-• /size BTC long sl 42000 entry 43000
-  → Manual entry price
-
-━━━━━━━━━━━━━━━━━━━━
+   • /size BTC long sl 42000 → Uses default /riskmode
+   • /size BTC long risk usd 40 sl 42000 → Uses current Bybit futures price as Entry
+   • /size ETH short risk pct 2.5 sl 2480 → Uses your Equity
+   • /size BTC long sl 42000 entry 43000 → Manual entry price
+────────────────────
 3) Trade Journal & Equity Tracking
-━━━━━━━━━━━━━━━━━━━━
-Set equity:
-• /equity <value>
-  → Example: /equity 1000
-
-• /equity_reset
-  → Reset equity
-
+────────────────────
+Set equity
+   • /equity <value> → /equity 1000
+   • /equity_reset → Reset equity  
 Open trade:
-• /trade_open <SYMBOL> <long|short> entry <ENTRY> sl <SL> risk <usd|pct> <VALUE>
-
+   • /trade_open <SYMBOL> <long|short> entry <ENTRY> sl <SL> risk <usd|pct> <VALUE>
 Manage open trade:
-• /trade_sl <TRADE_ID> <NEW_SL>
-  → Updates SL and recalculates trade risk
-
-• /trade_rf <TRADE_ID>
-  → Moves SL to Entry (Risk-Free)
-
-• /trade_close <TRADE_ID> pnl <PNL>
-  → Close trade
-
-━━━━━━━━━━━━━━━━━━━━
+   • /trade_sl <TRADE_ID> <NEW_SL> → Updates SL and recalculates trade risk    
+   • /trade_rf <TRADE_ID> → Moves SL to Entry (Risk-Free) 
+   • /trade_close <TRADE_ID> pnl <PNL> → Close trade
+────────────────────
 4) Status Dashboard
-━━━━━━━━━━━━━━━━━━━━
-• /status
-
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
+    /status
+────────────────────
 5) Risk Settings
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
 Risk per trade:
-• /riskmode pct 2.5
-• /riskmode usd 25
-
+   • /riskmode pct 2.5
+   • /riskmode usd 25
 Daily risk cap:
-• /dailycap pct 5
-• /dailycap usd 60
-
-━━━━━━━━━━━━━━━━━━━━
+   • /dailycap pct 5
+   • /dailycap usd 60
+────────────────────
 6) Limits (Discipline Controls)
-━━━━━━━━━━━━━━━━━━━━
-• /limits maxtrades 5
-• /limits emailcap 4        (0 = unlimited per session)
-• /limits emailgap 60       (minutes between emails)
-• /limits emaildaycap 4     (0 = unlimited per day)
-
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
+/limits maxtrades 5
+/limits emailcap 4        (0 = unlimited per session)
+/limits emailgap 60       (minutes between emails)
+/limits emaildaycap 4     (0 = unlimited per day)
+────────────────────
 7) Sessions (Email Delivery Windows)
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
 View sessions:
-• /sessions
-
+   • /sessions
 Enable / disable:
-• /sessions_on NY
-• /sessions_off LO
-
-Session priority:
-NY > LON > ASIA
-
+   • /sessions_on NY
+   • /sessions_off LO
+Session priority: NY > LON > ASIA
 Emails are sent ONLY during enabled sessions.
-
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
 8) Email Alerts
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
 Enable / disable:
-• /notify_on
-• /notify_off
-
+   • /notify_on
+   • /notify_off
 Limit alerts to a daily time window (your timezone):
-• /trade_window <START_HH:MM> <END_HH:MM>
-  Example: /trade_window 09:00 17:30
-
+   • /trade_window <START_HH:MM> <END_HH:MM>
+     Example: /trade_window 09:00 17:30
 Email troubleshooting:
-• /email_test
-  → Sends a test email using your configured email setup
-
-━━━━━━━━━━━━━━━━━━━━
+   • /email_test → Sends a test email using your configured email setup
+────────────────────
 9) Symbol Cooldowns (Anti-Spam Logic)
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
 Cooldowns are:
-• Per-user
-• Per-symbol
-• Per-direction (BUY vs SELL)
-• Session-aware (NY / LON / ASIA)
-
-View cooldowns:
-• /cooldowns
-  → Shows remaining cooldown time per session
-
-Query a single symbol:
-• /cooldown <SYMBOL> <long|short>
-  → Shows remaining cooldown time for that symbol + direction
-
-━━━━━━━━━━━━━━━━━━━━
+    • Per-user
+    • Per-symbol
+    • Per-direction (BUY vs SELL)
+    • Session-aware (duration depends on NY/LON/ASIA policy)
+View cooldowns → /cooldowns
+   → Shows remaining cooldown time for NY / LON / ASIA for each symbol + direction
+Query a single symbol → /cooldown <SYMBOL> <long|short>
+      → Shows remaining cooldown time for NY / LON / ASIA for that exact symbol+direction
+────────────────────
 10) Reports
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
 Performance:
-• /report_daily
-• /report_weekly
-• /report_overall
-• /signals_daily
-• /signals_weekly
-
-━━━━━━━━━━━━━━━━━━━━
+   • /report_daily
+   • /report_weekly
+   • /report_overall
+   • /signals_daily
+   • /signals_weekly
+────────────────────
 11) System Health
-━━━━━━━━━━━━━━━━━━━━
-• /health_sys
-
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
+   • /health_sys
+────────────────────
 12) Timezone
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
 View / set timezone:
-• /tz
-
-━━━━━━━━━━━━━━━━━━━━
-13) Billing, Plan & Support
-━━━━━━━━━━━━━━━━━━━━
-• /myplan
-  → Shows your current plan
-
-• /billing
-  → Shows payment options (Stripe & USDT)
-
-• /support
-  → Contact details & activation help
-
-━━━━━━━━━━━━━━━━━━━━
-14) Payments & Activation (Manual)
-━━━━━━━━━━━━━━━━━━━━
-PulseFutures uses MANUAL activation for ALL payments.
-
-Stripe (Card / Apple Pay / Google Pay):
-• Pay via /billing
-• After payment, if not activated yet, contact support with:
-  - Reference (PF-<yourTelegramID>)
-  - Telegram ID
-  - Plan (Standard / Pro)
-  - Stripe email used
-  - Payment time (approx)
-
-USDT (Crypto):
-• /usdt
-  → Shows network + address + instructions
-• Accepted network: USDT (TRC20 only)
-
-Prices:
-• Standard: 49 USDT
-• Pro: 99 USDT
-
-Steps:
-1) Send USDT to the address shown in /usdt
-2) Copy the transaction hash (TXID)
-3) Submit payment:
-   /usdt_paid <TXID> <standard|pro>
-   Example:
-   /usdt_paid 7f3a...c9 standard
-
-Notes:
-• Crypto payments are final
-• No refunds for USDT
-• Access is granted after admin approval
-
-━━━━━━━━━━━━━━━━━━━━
+   • /tz
+────────────────────
+13) Billing, Plan, Support
+────────────────────
+   • /myplan → Shows your current plan
+   • /billing → Shows payment options (Stripe + USDT)
+   • /support → Contact/support info and troubleshooting steps
+────────────────────
+14) USDT Payments (Semi-Auto)
+────────────────────
+You can pay using USDT (crypto).
+Start here:
+   • /usdt → Shows the current network + address + instructions
+   Accepted network: USDT (TRC20 only)
+    
+   Prices:
+   • Standard: 49 USDT
+   • Pro: 99 USDT
+    
+   Steps:
+   1) Send USDT to the address shown in /usdt
+   2) Copy the transaction hash (TXID)
+   3) Submit payment using:
+    /usdt_paid <TXID> <standard|pro>
+    Example: /usdt_paid 7f3a...c9 standard
+    Notes:
+    • USDT payments are final
+    • No refunds for crypto payments
+    • Access is granted after admin approval
+────────────────────
 Final Notes
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
 • PulseFutures does NOT auto-trade
 • PulseFutures does NOT promise profits
 • PulseFutures enforces discipline, risk control, and session awareness
-
-Trade less. Trade better. Stay disciplined.
-
-— PulseFutures
+    
+Trade less. Trade better. Stay disciplined
+PulseFutures
 """
 
 # =========================================================
@@ -4339,75 +4289,66 @@ Trade less. Trade better. Stay disciplined.
 
 HELP_TEXT_ADMIN = """\
 PulseFutures — Admin Commands (Telegram)
+
 /help_admin
 
-Admin-only • Use carefully  
+Admin-only • Use carefully
 Not financial advice.
 
-━━━━━━━━━━━━━━━━━━━━
-Cooldown Controls
-━━━━━━━━━━━━━━━━━━━━
-• /cooldown_clear <SYMBOL> <long|short>
-  → Clears cooldown for a specific symbol + direction
+────────────────────
+Cooldown Controls (Admin)
+────────────────────
+/cooldown_clear <SYMBOL> <long|short>
+• Clears cooldown for that symbol+side (admin)
 
-• /cooldown_clear_all
-  → Clears ALL cooldowns (DANGEROUS)
+/cooldown_clear_all
+• Clears ALL cooldowns (admin)
 
-━━━━━━━━━━━━━━━━━━━━
+────────────────────
 Data / Recovery
-━━━━━━━━━━━━━━━━━━━━
-• /reset
-  → Resets user data / cleans database (VERY DANGEROUS)
+────────────────────
+/reset
+• Resets user data / clean DB (DANGEROUS)
 
-• /restore
-  → Restores previously removed data (if backup exists)
+/restore
+• Restores previously removed data (if backup exists)
 
-━━━━━━━━━━━━━━━━━━━━
-USDT Payments — Admin
-━━━━━━━━━━━━━━━━━━━━
-• /usdt_pending
-  → Shows pending USDT payment requests
+────────────────────
+USDT Admin Commands
+────────────────────
+/usdt_pending
+• Shows pending USDT requests
 
-• /usdt_approve <TXID>
-  → Approves TXID, grants access, and writes ledger entry
+/usdt_approve <TXID>
+• Approves TXID (grants access + writes ledger)
 
-• /usdt_reject <TXID> <reason>
-  → Rejects TXID with reason
+/usdt_reject <TXID> <reason>
+• Rejects TXID
 
-Important Notes:
-• ALWAYS verify TXID on-chain before approving
-• USDT payments are final and irreversible
-• Grant access only after confirmation
+Notes:
+• Always verify TXID on the chain before approving
+• USDT payments are final/irreversible
 
-━━━━━━━━━━━━━━━━━━━━
-Payments & Access Control
-━━━━━━━━━━━━━━━━━━━━
-• /admin_user <telegram_id>
-  → Shows plan, access source, reference, and last payment
+────────────────────
+Payments & Access Admin
+────────────────────
+/admin_user <telegram_id>
+• Shows plan + access source/ref + last payments
 
-• /admin_users [free|standard|pro]
-  → Lists users (max 50)
+/admin_users [free|standard|pro]
+• Lists users (max 50)
 
-• /admin_payments [N]
-  → Shows latest payments (Stripe / USDT / Manual)
-    Default max: 50
+/admin_payments [N]
+• Shows latest payments from Stripe/USDT/manual (max 50)
 
-• /admin_grant <telegram_id> <standard|pro|free> [source] [ref]
-  → Manually grant or change access (logged)
+/admin_grant <telegram_id> <standard|pro|free> [source] [ref]
+• Manually grant/change access and log it
 
-• /admin_revoke <telegram_id>
-  → Revokes access (sets plan to FREE)
+/admin_revoke <telegram_id>
+• Revokes access (sets plan to FREE)
 
-━━━━━━━━━━━━━━━━━━━━
-Final Notes
-━━━━━━━━━━━━━━━━━━━━
-• Stripe and USDT activations are MANUAL
-• Always cross-check reference: PF-<telegram_id>
-• When in doubt — do NOT grant access
-
-— PulseFutures Admin
+PulseFutures
 """
-
 
 
 # =========================================================
@@ -4426,7 +4367,7 @@ def _mask_addr(addr: str) -> str:
 
 async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Billing menu: Stripe Payment Links + USDT (MANUAL activation for ALL payments).
+    Billing menu: Stripe Payment Links + USDT (MANUAL activation for Stripe).
     - Safe: uses env vars only for Stripe links (no Stripe API calls required)
     - USDT address works with either USDT_ADDRESS or USDT_RECEIVE_ADDRESS
     - Does NOT require email to show billing
@@ -4459,49 +4400,54 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("Choose your payment method below.")
     lines.append(f"Reference (important): {ref}")
     lines.append("")
-
     lines.append("────────────────────")
     lines.append("1) Stripe (Card / Apple Pay / Google Pay)")
     lines.append("────────────────────")
     if stripe_standard_url or stripe_pro_url:
         lines.append("Tap a plan button to pay securely via Stripe.")
+        lines.append("✅ Activation is MANUAL for now (fast). After paying, send:")
+        lines.append(f"• Reference: {ref}")
+        lines.append(f"• Telegram ID: {uid if uid else 'unknown'}")
+        lines.append("• Plan: Standard or Pro")
+        lines.append("• Stripe email used")
+        lines.append(f"Support: {support_handle}")
     else:
         lines.append("Stripe is not configured yet.")
         lines.append("Admin: set STRIPE_STANDARD_URL / STRIPE_PRO_URL in Render env vars.")
-    lines.append("")
 
+    lines.append("")
     lines.append("────────────────────")
     lines.append("2) USDT")
     lines.append("────────────────────")
     if usdt_address:
-        lines.append(f"Network: {usdt_network}")
+        lines.append(f"Network: USDT ({usdt_network})")
         lines.append(f"Address: {usdt_address}")
         lines.append(f"(Short: {_mask_addr(usdt_address)})")
         lines.append(f"Prices: Standard {usdt_standard_price} USDT • Pro {usdt_pro_price} USDT")
         if usdt_note:
             lines.append(f"Note: {usdt_note.replace('<REF>', ref)}")
         else:
-            lines.append(f"Note: After sending, keep your TXID and include reference '{ref}' in your message to support if needed.")
+            lines.append(f"Note: Use reference '{ref}' in your message to support if needed.")
         lines.append("After paying, submit:")
         lines.append("/usdt_paid <TXID> <standard|pro>")
     else:
         lines.append("USDT is not configured yet.")
         lines.append("Admin: set USDT_ADDRESS or USDT_RECEIVE_ADDRESS in Render env vars.")
         lines.append("Optional: set USDT_NETWORK (default TRC20).")
-    lines.append("")
 
+    lines.append("")
     lines.append("────────────────────")
-    lines.append("Activation (Manual for ALL payments)")
+    lines.append("After payment (Activation)")
     lines.append("────────────────────")
-    lines.append("After you pay (Stripe or USDT), activation is done manually.")
-    lines.append("If you are not activated yet, message support with:")
-    lines.append(f"• Reference: {ref}")
-    lines.append(f"• Telegram ID: {uid if uid else 'unknown'}")
-    lines.append("• Plan: Standard or Pro")
-    lines.append("• Payment method: Stripe or USDT")
-    lines.append("• Payment time (approx)")
-    lines.append("• If Stripe: email used")
-    lines.append("• If USDT: TXID (or use /usdt_paid)")
+    lines.append("✅ Stripe:")
+    lines.append(f"Send to Support: {support_handle}")
+    lines.append(f"1) Reference: {ref}")
+    lines.append(f"2) Telegram ID: {uid if uid else 'unknown'}")
+    lines.append("3) Plan: Standard or Pro")
+    lines.append("4) Stripe email used")
+    lines.append("")
+    lines.append("✅ USDT:")
+    lines.append("Submit: /usdt_paid <TXID> <standard|pro>")
     lines.append(f"Support: {support_handle}")
     lines.append(f"Reference: {ref}")
 
@@ -6453,7 +6399,7 @@ def _email_priority_bases(best_fut: dict, directional_take: int = 12) -> set:
         return set()
 
 
-async def build_priority_pool(best_fut: dict, session_name: str, mode: str) -> dict:
+async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE) -> dict:
     """
     mode: "screen" or "email"
     returns: {
@@ -6487,6 +6433,37 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str) -> d
         directional_take = 12
         market_take = 15
         trend_take = 12
+
+
+    # Aggressive profile overrides
+    prof = str(scan_profile or DEFAULT_SCAN_PROFILE).strip().lower()
+    if prof not in SCAN_PROFILES:
+        prof = DEFAULT_SCAN_PROFILE
+
+    if prof == "aggressive":
+        if mode == "screen":
+            n_target = int(max(SETUPS_N, 8))
+            universe_cap = int(max(SCREEN_UNIVERSE_N, 110))
+            trigger_loosen = float(min(0.80, SCREEN_TRIGGER_LOOSEN))
+            waiting_near = float(min(0.70, SCREEN_WAITING_NEAR_PCT))
+            scan_multiplier = 12
+            directional_take = 16
+            market_take = 18
+            trend_take = 16
+            strict_15m = False
+            allow_no_pullback = True
+        else:
+            # Email pool becomes broader, but final email gates still apply
+            n_target = int(max(EMAIL_SETUPS_N * 4, 12))
+            universe_cap = int(max(60, universe_cap))
+            trigger_loosen = 0.95
+            waiting_near = float(SCREEN_WAITING_NEAR_PCT)
+            strict_15m = True
+            allow_no_pullback = True
+            scan_multiplier = 12
+            directional_take = 14
+            market_take = 16
+            trend_take = 14
 
     # 1) Directional leaders / losers (priority #1)
     up_list, dn_list = compute_directional_lists(best_fut)
@@ -6642,7 +6619,29 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str) -> d
     return {"setups": ordered, "waiting": waiting_items, "trend_watch": trend_watch, "spikes": spike_candidates}
 
 
+def user_location_and_time(user: dict):
+    """
+    Returns: (location_label, time_str) based on user's tz
+    """
+    tz_name = str(user.get("tz") or "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+        tz_name = "UTC"
 
+    now_local = datetime.now(tz)
+
+    # Build location label safely
+    if "/" in tz_name:
+        parts = tz_name.split("/")
+        region = parts[0].replace("_", " ")
+        city = parts[-1].replace("_", " ")
+        loc = f"{city} ({region})"
+    else:
+        loc = tz_name
+
+    return loc, now_local.strftime("%Y-%m-%d %H:%M")
 
 # =========================================================
 # User location/time helpers
@@ -6686,6 +6685,45 @@ _SCREEN_LOCK = asyncio.Lock()
 # =========================================================
 # /screen
 # =========================================================
+
+
+# =========================================================
+# /mode (scan profile)
+# =========================================================
+
+async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    cur_mode = str((user or {}).get("scan_profile") or DEFAULT_SCAN_PROFILE).strip().lower()
+    if cur_mode not in SCAN_PROFILES:
+        cur_mode = DEFAULT_SCAN_PROFILE
+
+    if not context.args:
+        await update.message.reply_text(
+            "🧭 Scan Profile\n"
+            f"{HDR}\n"
+            f"Current: {cur_mode.upper()}\n\n"
+            "Set:\n"
+            "• /mode standard\n"
+            "• /mode aggressive\n\n"
+            "Aggressive = more /screen setups (looser trigger + bigger universe).\n"
+            "Use carefully. Not financial advice."
+        )
+        return
+
+    new_mode = str(context.args[0]).strip().lower()
+    if new_mode not in SCAN_PROFILES:
+        await update.message.reply_text("Usage: /mode <standard|aggressive>")
+        return
+
+    update_user(int(uid), scan_profile=str(new_mode))
+    await update.message.reply_text(
+        "✅ Updated scan profile\n"
+        f"{HDR}\n"
+        f"Now: {new_mode.upper()}\n\n"
+        "Tip: run /screen again."
+    )
+
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = update.effective_user.id
@@ -6782,7 +6820,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # Run heavy work in parallel where possible
-            pool_task = asyncio.create_task(build_priority_pool(best_fut, session, mode="screen"))
+            pool_task = asyncio.create_task(build_priority_pool(best_fut, session, mode="screen", scan_profile=str((get_user(update.effective_user.id) or {}).get('scan_profile') or DEFAULT_SCAN_PROFILE)))
             leaders_task = asyncio.to_thread(build_leaders_table, best_fut)
             movers_task = asyncio.to_thread(movers_tables, best_fut)
 
@@ -7731,7 +7769,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         for sess_name in ["NY", "LON", "ASIA"]:
             try:
                 pool = await asyncio.wait_for(
-                    build_priority_pool(best_fut, sess_name, mode="email"),
+                    build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str((get_user(uid) or {}).get('scan_profile') or DEFAULT_SCAN_PROFILE)),
                     timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
                 )
             except asyncio.TimeoutError:
@@ -7924,7 +7962,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         vol_usd = 0.0
 
-                abs_min = float(EMAIL_ABS_VOL_USD_MIN)
+                abs_min = float(email_abs_vol_min)
 
                 if vol_usd > 0.0 and vol_usd < abs_min:
                     skip_reasons_counter["email_vol_abs_too_low"] += 1
@@ -7932,7 +7970,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
                 if vol_usd > 0.0 and float(MARKET_VOL_MEDIAN_USD or 0.0) > 0:
                     rel = vol_usd / float(MARKET_VOL_MEDIAN_USD)
-                    if rel < float(EMAIL_REL_VOL_MIN_MULT):
+                    if rel < float(email_rel_vol_min_mult):
                         skip_reasons_counter["email_vol_rel_too_low"] += 1
                         continue
 
@@ -7940,12 +7978,12 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 # Rule 1: Minimum momentum gate for EMAILS
                 # =========================================================
                 ch15 = _safe_float(getattr(s, "ch15", 0.0), 0.0)
-                is_confirm_15m = abs(float(ch15)) >= CONFIRM_15M_ABS_MIN
+                is_confirm_15m = abs(float(ch15)) >= float(confirm_15m_abs_min)
 
                 if is_confirm_15m:
                     confirmed.append(s)
                 else:
-                    if abs(float(s.ch1)) < EARLY_1H_ABS_MIN:
+                    if abs(float(s.ch1)) < float(early_1h_abs_min):
                         skip_reasons_counter["early_gate_ch1_not_strong"] += 1
                         continue
                     if abs(float(ch15)) < float(EMAIL_EARLY_MIN_CH15_ABS):
@@ -8645,6 +8683,7 @@ def main():
     app.add_handler(CommandHandler("support", support_cmd))
     app.add_handler(CommandHandler("support_status", support_status_cmd))
     app.add_handler(CommandHandler("tz", tz_cmd))
+    app.add_handler(CommandHandler("mode", mode_cmd))
     app.add_handler(CommandHandler("screen", screen_cmd))
     app.add_handler(CommandHandler("equity", equity_cmd))
     app.add_handler(CommandHandler("equity_reset", equity_reset_cmd))
