@@ -3322,17 +3322,20 @@ def send_email(
 
     Tracks last SMTP error + last email decision for /health and /email_decision.
     """
+    global _SMTP_CONN, _SMTP_CONN_IS_SSL, _SMTP_CONN_TS
+
     uid = int(user_id_for_debug) if user_id_for_debug is not None else None
 
     # --- SMTP config check (sender side) ---
     if not email_config_ok():
-        logger.warning("Email not configured (missing SMTP env vars).")
+        msg = "Email not configured (missing SMTP env vars)."
+        logger.warning(msg)
         if uid is not None:
-            _LAST_SMTP_ERROR[uid] = "Email not configured (missing SMTP env vars)."
+            _LAST_SMTP_ERROR[uid] = msg
             _LAST_EMAIL_DECISION[uid] = {
-                "status": "SENT",
-                "reasons": ["ok"],
-                "when": datetime.now(timezone.utc).isoformat(timespec="seconds")
+                "status": "FAIL",
+                "reason": msg,
+                "ts": time.time(),
             }
         return False
 
@@ -3345,7 +3348,6 @@ def send_email(
         user = get_user(uid) or {}
         to_email = str(user.get("email_to") or user.get("email") or "").strip()
 
-        # If user has NOT set email, we skip
         if not to_email:
             _LAST_EMAIL_DECISION[uid] = {
                 "status": "FAIL",
@@ -3354,7 +3356,6 @@ def send_email(
             }
             return False
 
-        # If trade window feature exists, enforce it here (ONLY if enabled)
         if enforce_trade_window:
             try:
                 try:
@@ -3371,16 +3372,13 @@ def send_email(
                     }
                     return False
             except Exception:
-                # Fail CLOSED to avoid spam:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
                     "reason": "trade_window_check_failed",
                     "ts": time.time(),
                 }
                 return False
-
     else:
-        # Legacy fallback (single recipient deployment)
         to_email = str(EMAIL_TO or "").strip()
         if not to_email:
             logger.warning("No recipient email (EMAIL_TO empty and no user_id provided).")
@@ -3393,20 +3391,70 @@ def send_email(
     msg["To"] = to_email
     msg.set_content(body)
 
-    # --- Send ---
-    try:
-        if int(EMAIL_PORT) == 465:
+    def _close_cached():
+        nonlocal uid
+        try:
+            if _SMTP_CONN is not None:
+                try:
+                    _SMTP_CONN.quit()
+                except Exception:
+                    try:
+                        _SMTP_CONN.close()
+                    except Exception:
+                        pass
+        finally:
+            _SMTP_CONN = None
+            _SMTP_CONN_IS_SSL = None
+            _SMTP_CONN_TS = 0.0
+
+    def _need_new_conn(is_ssl: bool) -> bool:
+        if _SMTP_CONN is None:
+            return True
+        if _SMTP_CONN_IS_SSL is None or _SMTP_CONN_IS_SSL != is_ssl:
+            return True
+        if (time.time() - float(_SMTP_CONN_TS or 0.0)) > float(SMTP_REUSE_TTL_SEC or 0.0):
+            return True
+        return False
+
+    def _connect_and_login(is_ssl: bool) -> smtplib.SMTP:
+        timeout = float(EMAIL_SEND_TIMEOUT_SEC)
+        if is_ssl:
             ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(EMAIL_HOST, int(EMAIL_PORT), context=ctx, timeout=EMAIL_SEND_TIMEOUT_SEC) as s:
-                s.login(EMAIL_USER, EMAIL_PASS)
-                s.send_message(msg)
+            s = smtplib.SMTP_SSL(EMAIL_HOST, int(EMAIL_PORT), context=ctx, timeout=timeout)
         else:
-            with smtplib.SMTP(EMAIL_HOST, int(EMAIL_PORT), timeout=EMAIL_SEND_TIMEOUT_SEC) as s:
-                s.ehlo()
-                s.starttls(context=ssl.create_default_context())
-                s.ehlo()
-                s.login(EMAIL_USER, EMAIL_PASS)
-                s.send_message(msg)
+            s = smtplib.SMTP(EMAIL_HOST, int(EMAIL_PORT), timeout=timeout)
+            s.ehlo()
+            s.starttls(context=ssl.create_default_context())
+            s.ehlo()
+
+        # login can be slow; keep under socket timeout
+        s.login(EMAIL_USER, EMAIL_PASS)
+        return s
+
+    # --- Send (with connection reuse + lock) ---
+    try:
+        is_ssl = (int(EMAIL_PORT) == 465)
+
+        with _SMTP_LOCK:
+            # Refresh connection if needed
+            if _need_new_conn(is_ssl):
+                _close_cached()
+                _SMTP_CONN = _connect_and_login(is_ssl)
+                _SMTP_CONN_IS_SSL = is_ssl
+                _SMTP_CONN_TS = time.time()
+            else:
+                # Light keepalive; if dropped, reconnect
+                try:
+                    _SMTP_CONN.noop()
+                except Exception:
+                    _close_cached()
+                    _SMTP_CONN = _connect_and_login(is_ssl)
+                    _SMTP_CONN_IS_SSL = is_ssl
+                    _SMTP_CONN_TS = time.time()
+
+            # Actual send
+            _SMTP_CONN.send_message(msg)
+            _SMTP_CONN_TS = time.time()
 
         if uid is not None:
             _LAST_SMTP_ERROR.pop(uid, None)
@@ -3420,6 +3468,14 @@ def send_email(
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
         logger.exception("send_email failed: %s", err)
+
+        # On any send failure, drop cached connection (often becomes poisoned)
+        try:
+            with _SMTP_LOCK:
+                _close_cached()
+        except Exception:
+            pass
+
         if uid is not None:
             _LAST_SMTP_ERROR[uid] = err
             _LAST_EMAIL_DECISION[uid] = {
@@ -7227,8 +7283,29 @@ EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "60"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "60"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "60"))
 
+# SMTP connection reuse (Render speed fix)
+SMTP_REUSE_TTL_SEC = int(os.environ.get("SMTP_REUSE_TTL_SEC", "240"))  # 4 minutes
+
+_SMTP_LOCK = threading.RLock()
+_SMTP_CONN = None          # cached SMTP connection
+_SMTP_CONN_IS_SSL = None   # bool
+_SMTP_CONN_TS = 0.0        # last-used timestamp
+
+
 async def _to_thread_with_timeout(fn, timeout_sec: int, *args, **kwargs):
     return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout_sec)
+
+async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
+    """
+    Runs send_email() in a worker thread with a hard timeout so SMTP/network stalls
+    can't block the Telegram event loop (Render lag fix).
+    """
+    try:
+        return bool(await _to_thread_with_timeout(send_email, timeout_sec, *args, **kwargs))
+    except asyncio.TimeoutError:
+        return False
+    except Exception:
+        return False
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     # Prevent overlapping runs (JobQueue can overlap if a run is slow)
@@ -7436,7 +7513,14 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     ],
                 }
 
-                ok = send_email(subject, body, user_id_for_debug=uid, enforce_trade_window=False)
+                ok = await _send_email_async(
+                    EMAIL_SEND_TIMEOUT_SEC,
+                    subject,
+                    body,
+                    user_id_for_debug=uid,
+                    enforce_trade_window=False
+                )
+
 
                 _LAST_BIGMOVE_DECISION[uid] = {
                     "status": "SENT" if ok else "FAIL",
@@ -7565,6 +7649,14 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 body = "\n".join(lines).strip()
 
                 ok = send_email(subject, body, user_id_for_debug=uid, enforce_trade_window=False)
+                ok = await _send_email_async(
+                    EMAIL_SEND_TIMEOUT_SEC,
+                    subject,
+                    body,
+                    user_id_for_debug=uid,
+                    enforce_trade_window=False
+                )
+
                 if ok:
                     for c in filtered[:6]:
                         try:
@@ -8494,7 +8586,6 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help_admin", cmd_help_admin))
-    app.add_handler(CommandHandler("billing", billing_cmd))
     app.add_handler(CommandHandler("manage", manage_cmd))
     app.add_handler(CommandHandler("myplan", myplan_cmd))
     app.add_handler(CommandHandler("support", support_cmd))
@@ -8562,18 +8653,24 @@ def main():
     # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
-    # ================= JobQueue ================= #
     if app.job_queue:
+        interval_sec = int(CHECK_INTERVAL_MIN * 60)
+    
         app.job_queue.run_repeating(
             alert_job,
-            interval=CHECK_INTERVAL_MIN * 60,
-            first=30,
+            interval=interval_sec,
+            first=90,
             name="alert_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 60,
+            },
         )
     else:
         logger.error("JobQueue NOT available – install python-telegram-bot[job-queue]")
 
-    logger.info("Starting Telegram bot in POLLING mode (Background Worker) ...")
+
 
     # ================= Stripe Webhook ================= #
     threading.Thread(
