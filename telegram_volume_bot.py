@@ -4115,148 +4115,222 @@ async def usdt_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 HELP_TEXT = """\
 PulseFutures — Commands (Telegram)
-
 /help
-────────────────────
+
+━━━━━━━━━━━━━━━━━━━━
 1) Market Scan
-────────────────────
+━━━━━━━━━━━━━━━━━━━━
 /screen
-Market Scan Controls & Alerts 
-    /sessions_on_unlimited → Enables 24-hour email signaling.  
-    /sessions_off_unlimited → Disables 24-hour mode.    
-    /bigmove_alert [on <4H%> <1H%> | off] → Sends ALERT emails for strong market moves in either direction (UP or DOWN), even if they do NOT qualify as full trade signals.
-    Examples: /bigmove_alert on 30 12 ; /bigmove_alert off
-────────────────────
-2) Position Sizing (NO trade opened)
-────────────────────
-/size <SYMBOL> <long|short> entry <ENTRY> sl <STOP> [risk <usd|pct> <VALUE>]   
-Purpose: Calculates correct position size from Risk + SL
-    
+
+Market Scan Controls & Alerts
+• /sessions_on_unlimited
+  → Enables 24-hour email signaling
+
+• /sessions_off_unlimited
+  → Disables 24-hour mode
+
+• /bigmove_alert [on <4H%> <1H%> | off]
+  → Sends ALERT emails for strong market moves in either direction (UP or DOWN),
+    even if they do NOT qualify as full trade signals
+
 Examples:
-   • /size BTC long sl 42000 → Uses default /riskmode
-   • /size BTC long risk usd 40 sl 42000 → Uses current Bybit futures price as Entry
-   • /size ETH short risk pct 2.5 sl 2480 → Uses your Equity
-   • /size BTC long sl 42000 entry 43000 → Manual entry price
-────────────────────
+• /bigmove_alert on 30 12
+• /bigmove_alert off
+
+━━━━━━━━━━━━━━━━━━━━
+2) Position Sizing (NO trade opened)
+━━━━━━━━━━━━━━━━━━━━
+/size <SYMBOL> <long|short> entry <ENTRY> sl <STOP> [risk <usd|pct> <VALUE>]
+
+Purpose:
+Calculates correct position size from Risk + Stop Loss
+
+Examples:
+• /size BTC long sl 42000
+  → Uses default /riskmode
+
+• /size BTC long risk usd 40 sl 42000
+  → Uses current Bybit futures price as Entry
+
+• /size ETH short risk pct 2.5 sl 2480
+  → Uses your Equity
+
+• /size BTC long sl 42000 entry 43000
+  → Manual entry price
+
+━━━━━━━━━━━━━━━━━━━━
 3) Trade Journal & Equity Tracking
-────────────────────
-Set equity
-   • /equity <value> → /equity 1000
-   • /equity_reset → Reset equity  
+━━━━━━━━━━━━━━━━━━━━
+Set equity:
+• /equity <value>
+  → Example: /equity 1000
+
+• /equity_reset
+  → Reset equity
+
 Open trade:
-   • /trade_open <SYMBOL> <long|short> entry <ENTRY> sl <SL> risk <usd|pct> <VALUE>
+• /trade_open <SYMBOL> <long|short> entry <ENTRY> sl <SL> risk <usd|pct> <VALUE>
+
 Manage open trade:
-   • /trade_sl <TRADE_ID> <NEW_SL> → Updates SL and recalculates trade risk    
-   • /trade_rf <TRADE_ID> → Moves SL to Entry (Risk-Free) 
-   • /trade_close <TRADE_ID> pnl <PNL> → Close trade
-────────────────────
+• /trade_sl <TRADE_ID> <NEW_SL>
+  → Updates SL and recalculates trade risk
+
+• /trade_rf <TRADE_ID>
+  → Moves SL to Entry (Risk-Free)
+
+• /trade_close <TRADE_ID> pnl <PNL>
+  → Close trade
+
+━━━━━━━━━━━━━━━━━━━━
 4) Status Dashboard
-────────────────────
-    /status
-────────────────────
+━━━━━━━━━━━━━━━━━━━━
+• /status
+
+━━━━━━━━━━━━━━━━━━━━
 5) Risk Settings
-────────────────────
+━━━━━━━━━━━━━━━━━━━━
 Risk per trade:
-   • /riskmode pct 2.5
-   • /riskmode usd 25
+• /riskmode pct 2.5
+• /riskmode usd 25
+
 Daily risk cap:
-   • /dailycap pct 5
-   • /dailycap usd 60
-────────────────────
+• /dailycap pct 5
+• /dailycap usd 60
+
+━━━━━━━━━━━━━━━━━━━━
 6) Limits (Discipline Controls)
-────────────────────
-/limits maxtrades 5
-/limits emailcap 4        (0 = unlimited per session)
-/limits emailgap 60       (minutes between emails)
-/limits emaildaycap 4     (0 = unlimited per day)
-────────────────────
+━━━━━━━━━━━━━━━━━━━━
+• /limits maxtrades 5
+• /limits emailcap 4        (0 = unlimited per session)
+• /limits emailgap 60       (minutes between emails)
+• /limits emaildaycap 4     (0 = unlimited per day)
+
+━━━━━━━━━━━━━━━━━━━━
 7) Sessions (Email Delivery Windows)
-────────────────────
+━━━━━━━━━━━━━━━━━━━━
 View sessions:
-   • /sessions
+• /sessions
+
 Enable / disable:
-   • /sessions_on NY
-   • /sessions_off LO
-Session priority: NY > LON > ASIA
+• /sessions_on NY
+• /sessions_off LO
+
+Session priority:
+NY > LON > ASIA
+
 Emails are sent ONLY during enabled sessions.
-────────────────────
+
+━━━━━━━━━━━━━━━━━━━━
 8) Email Alerts
-────────────────────
+━━━━━━━━━━━━━━━━━━━━
 Enable / disable:
-   • /notify_on
-   • /notify_off
+• /notify_on
+• /notify_off
+
 Limit alerts to a daily time window (your timezone):
-   • /trade_window <START_HH:MM> <END_HH:MM>
-     Example: /trade_window 09:00 17:30
+• /trade_window <START_HH:MM> <END_HH:MM>
+  Example: /trade_window 09:00 17:30
+
 Email troubleshooting:
-   • /email_test → Sends a test email using your configured email setup
-────────────────────
+• /email_test
+  → Sends a test email using your configured email setup
+
+━━━━━━━━━━━━━━━━━━━━
 9) Symbol Cooldowns (Anti-Spam Logic)
-────────────────────
+━━━━━━━━━━━━━━━━━━━━
 Cooldowns are:
-    • Per-user
-    • Per-symbol
-    • Per-direction (BUY vs SELL)
-    • Session-aware (duration depends on NY/LON/ASIA policy)
-View cooldowns → /cooldowns
-   → Shows remaining cooldown time for NY / LON / ASIA for each symbol + direction
-Query a single symbol → /cooldown <SYMBOL> <long|short>
-      → Shows remaining cooldown time for NY / LON / ASIA for that exact symbol+direction
-────────────────────
+• Per-user
+• Per-symbol
+• Per-direction (BUY vs SELL)
+• Session-aware (NY / LON / ASIA)
+
+View cooldowns:
+• /cooldowns
+  → Shows remaining cooldown time per session
+
+Query a single symbol:
+• /cooldown <SYMBOL> <long|short>
+  → Shows remaining cooldown time for that symbol + direction
+
+━━━━━━━━━━━━━━━━━━━━
 10) Reports
-────────────────────
+━━━━━━━━━━━━━━━━━━━━
 Performance:
-   • /report_daily
-   • /report_weekly
-   • /report_overall
-   • /signals_daily
-   • /signals_weekly
-────────────────────
+• /report_daily
+• /report_weekly
+• /report_overall
+• /signals_daily
+• /signals_weekly
+
+━━━━━━━━━━━━━━━━━━━━
 11) System Health
-────────────────────
-   • /health_sys
-────────────────────
+━━━━━━━━━━━━━━━━━━━━
+• /health_sys
+
+━━━━━━━━━━━━━━━━━━━━
 12) Timezone
-────────────────────
+━━━━━━━━━━━━━━━━━━━━
 View / set timezone:
-   • /tz
-────────────────────
-13) Billing, Plan, Support
-────────────────────
-   • /myplan → Shows your current plan
-   • /billing → Shows payment options (Stripe + USDT)
-   • /support → Contact/support info and troubleshooting steps
-────────────────────
-14) USDT Payments (Semi-Auto)
-────────────────────
-You can pay using USDT (crypto).
-Start here:
-   • /usdt → Shows the current network + address + instructions
-   Accepted network: USDT (TRC20 only)
-    
-   Prices:
-   • Standard: 49 USDT
-   • Pro: 99 USDT
-    
-   Steps:
-   1) Send USDT to the address shown in /usdt
-   2) Copy the transaction hash (TXID)
-   3) Submit payment using:
-    /usdt_paid <TXID> <standard|pro>
-    Example: /usdt_paid 7f3a...c9 standard
-    Notes:
-    • USDT payments are final
-    • No refunds for crypto payments
-    • Access is granted after admin approval
-────────────────────
+• /tz
+
+━━━━━━━━━━━━━━━━━━━━
+13) Billing, Plan & Support
+━━━━━━━━━━━━━━━━━━━━
+• /myplan
+  → Shows your current plan
+
+• /billing
+  → Shows payment options (Stripe & USDT)
+
+• /support
+  → Contact details & activation help
+
+━━━━━━━━━━━━━━━━━━━━
+14) Payments & Activation (Manual)
+━━━━━━━━━━━━━━━━━━━━
+PulseFutures uses MANUAL activation for ALL payments.
+
+Stripe (Card / Apple Pay / Google Pay):
+• Pay via /billing
+• After payment, if not activated yet, contact support with:
+  - Reference (PF-<yourTelegramID>)
+  - Telegram ID
+  - Plan (Standard / Pro)
+  - Stripe email used
+  - Payment time (approx)
+
+USDT (Crypto):
+• /usdt
+  → Shows network + address + instructions
+• Accepted network: USDT (TRC20 only)
+
+Prices:
+• Standard: 49 USDT
+• Pro: 99 USDT
+
+Steps:
+1) Send USDT to the address shown in /usdt
+2) Copy the transaction hash (TXID)
+3) Submit payment:
+   /usdt_paid <TXID> <standard|pro>
+   Example:
+   /usdt_paid 7f3a...c9 standard
+
+Notes:
+• Crypto payments are final
+• No refunds for USDT
+• Access is granted after admin approval
+
+━━━━━━━━━━━━━━━━━━━━
 Final Notes
-────────────────────
+━━━━━━━━━━━━━━━━━━━━
 • PulseFutures does NOT auto-trade
 • PulseFutures does NOT promise profits
 • PulseFutures enforces discipline, risk control, and session awareness
-    
-Trade less. Trade better. Stay disciplined
-PulseFutures
+
+Trade less. Trade better. Stay disciplined.
+
+— PulseFutures
 """
 
 # =========================================================
@@ -4265,66 +4339,75 @@ PulseFutures
 
 HELP_TEXT_ADMIN = """\
 PulseFutures — Admin Commands (Telegram)
-
 /help_admin
 
-Admin-only • Use carefully
+Admin-only • Use carefully  
 Not financial advice.
 
-────────────────────
-Cooldown Controls (Admin)
-────────────────────
-/cooldown_clear <SYMBOL> <long|short>
-• Clears cooldown for that symbol+side (admin)
+━━━━━━━━━━━━━━━━━━━━
+Cooldown Controls
+━━━━━━━━━━━━━━━━━━━━
+• /cooldown_clear <SYMBOL> <long|short>
+  → Clears cooldown for a specific symbol + direction
 
-/cooldown_clear_all
-• Clears ALL cooldowns (admin)
+• /cooldown_clear_all
+  → Clears ALL cooldowns (DANGEROUS)
 
-────────────────────
+━━━━━━━━━━━━━━━━━━━━
 Data / Recovery
-────────────────────
-/reset
-• Resets user data / clean DB (DANGEROUS)
+━━━━━━━━━━━━━━━━━━━━
+• /reset
+  → Resets user data / cleans database (VERY DANGEROUS)
 
-/restore
-• Restores previously removed data (if backup exists)
+• /restore
+  → Restores previously removed data (if backup exists)
 
-────────────────────
-USDT Admin Commands
-────────────────────
-/usdt_pending
-• Shows pending USDT requests
+━━━━━━━━━━━━━━━━━━━━
+USDT Payments — Admin
+━━━━━━━━━━━━━━━━━━━━
+• /usdt_pending
+  → Shows pending USDT payment requests
 
-/usdt_approve <TXID>
-• Approves TXID (grants access + writes ledger)
+• /usdt_approve <TXID>
+  → Approves TXID, grants access, and writes ledger entry
 
-/usdt_reject <TXID> <reason>
-• Rejects TXID
+• /usdt_reject <TXID> <reason>
+  → Rejects TXID with reason
 
-Notes:
-• Always verify TXID on the chain before approving
-• USDT payments are final/irreversible
+Important Notes:
+• ALWAYS verify TXID on-chain before approving
+• USDT payments are final and irreversible
+• Grant access only after confirmation
 
-────────────────────
-Payments & Access Admin
-────────────────────
-/admin_user <telegram_id>
-• Shows plan + access source/ref + last payments
+━━━━━━━━━━━━━━━━━━━━
+Payments & Access Control
+━━━━━━━━━━━━━━━━━━━━
+• /admin_user <telegram_id>
+  → Shows plan, access source, reference, and last payment
 
-/admin_users [free|standard|pro]
-• Lists users (max 50)
+• /admin_users [free|standard|pro]
+  → Lists users (max 50)
 
-/admin_payments [N]
-• Shows latest payments from Stripe/USDT/manual (max 50)
+• /admin_payments [N]
+  → Shows latest payments (Stripe / USDT / Manual)
+    Default max: 50
 
-/admin_grant <telegram_id> <standard|pro|free> [source] [ref]
-• Manually grant/change access and log it
+• /admin_grant <telegram_id> <standard|pro|free> [source] [ref]
+  → Manually grant or change access (logged)
 
-/admin_revoke <telegram_id>
-• Revokes access (sets plan to FREE)
+• /admin_revoke <telegram_id>
+  → Revokes access (sets plan to FREE)
 
-PulseFutures
+━━━━━━━━━━━━━━━━━━━━
+Final Notes
+━━━━━━━━━━━━━━━━━━━━
+• Stripe and USDT activations are MANUAL
+• Always cross-check reference: PF-<telegram_id>
+• When in doubt — do NOT grant access
+
+— PulseFutures Admin
 """
+
 
 
 # =========================================================
@@ -4343,7 +4426,7 @@ def _mask_addr(addr: str) -> str:
 
 async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Billing menu: Stripe Payment Links + USDT (MANUAL activation for Stripe).
+    Billing menu: Stripe Payment Links + USDT (MANUAL activation for ALL payments).
     - Safe: uses env vars only for Stripe links (no Stripe API calls required)
     - USDT address works with either USDT_ADDRESS or USDT_RECEIVE_ADDRESS
     - Does NOT require email to show billing
@@ -4376,54 +4459,49 @@ async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("Choose your payment method below.")
     lines.append(f"Reference (important): {ref}")
     lines.append("")
+
     lines.append("────────────────────")
     lines.append("1) Stripe (Card / Apple Pay / Google Pay)")
     lines.append("────────────────────")
     if stripe_standard_url or stripe_pro_url:
         lines.append("Tap a plan button to pay securely via Stripe.")
-        lines.append("✅ Activation is MANUAL for now (fast). After paying, send:")
-        lines.append(f"• Reference: {ref}")
-        lines.append(f"• Telegram ID: {uid if uid else 'unknown'}")
-        lines.append("• Plan: Standard or Pro")
-        lines.append("• Stripe email used")
-        lines.append(f"Support: {support_handle}")
     else:
         lines.append("Stripe is not configured yet.")
         lines.append("Admin: set STRIPE_STANDARD_URL / STRIPE_PRO_URL in Render env vars.")
-
     lines.append("")
+
     lines.append("────────────────────")
     lines.append("2) USDT")
     lines.append("────────────────────")
     if usdt_address:
-        lines.append(f"Network: USDT ({usdt_network})")
+        lines.append(f"Network: {usdt_network}")
         lines.append(f"Address: {usdt_address}")
         lines.append(f"(Short: {_mask_addr(usdt_address)})")
         lines.append(f"Prices: Standard {usdt_standard_price} USDT • Pro {usdt_pro_price} USDT")
         if usdt_note:
             lines.append(f"Note: {usdt_note.replace('<REF>', ref)}")
         else:
-            lines.append(f"Note: Use reference '{ref}' in your message to support if needed.")
+            lines.append(f"Note: After sending, keep your TXID and include reference '{ref}' in your message to support if needed.")
         lines.append("After paying, submit:")
         lines.append("/usdt_paid <TXID> <standard|pro>")
     else:
         lines.append("USDT is not configured yet.")
         lines.append("Admin: set USDT_ADDRESS or USDT_RECEIVE_ADDRESS in Render env vars.")
         lines.append("Optional: set USDT_NETWORK (default TRC20).")
+    lines.append("")
 
-    lines.append("")
     lines.append("────────────────────")
-    lines.append("After payment (Activation)")
+    lines.append("Activation (Manual for ALL payments)")
     lines.append("────────────────────")
-    lines.append("✅ Stripe:")
-    lines.append(f"Send to Support: {support_handle}")
-    lines.append(f"1) Reference: {ref}")
-    lines.append(f"2) Telegram ID: {uid if uid else 'unknown'}")
-    lines.append("3) Plan: Standard or Pro")
-    lines.append("4) Stripe email used")
-    lines.append("")
-    lines.append("✅ USDT:")
-    lines.append("Submit: /usdt_paid <TXID> <standard|pro>")
+    lines.append("After you pay (Stripe or USDT), activation is done manually.")
+    lines.append("If you are not activated yet, message support with:")
+    lines.append(f"• Reference: {ref}")
+    lines.append(f"• Telegram ID: {uid if uid else 'unknown'}")
+    lines.append("• Plan: Standard or Pro")
+    lines.append("• Payment method: Stripe or USDT")
+    lines.append("• Payment time (approx)")
+    lines.append("• If Stripe: email used")
+    lines.append("• If USDT: TXID (or use /usdt_paid)")
     lines.append(f"Support: {support_handle}")
     lines.append(f"Reference: {ref}")
 
