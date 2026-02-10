@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
@@ -4329,75 +4330,81 @@ async def usdt_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # HELP TEXT (USER)
 # =========================================================
 
-HELP_TEXT = """\
-🚀 PulseFutures — Trading System in Telegram
+HELP_TEXT = """🚀 PulseFutures — Trading System in Telegram
 
 PulseFutures is NOT a signal spam bot.
-It’s a full trading assistant that helps you trade with discipline.
+It’s a complete trading assistant built for discipline.
 
 ────────────────────
-🔍 Core Commands
+🔍 Trading
 ────────────────────
 /screen
-• Scan the market for high-quality setups
+• Scan markets for high-quality setups
 
 /size <symbol> <entry> <sl>
-• Position sizing based on your risk rules
-
-/status
-• Your plan, trial status & enabled features
+• Position sizing based on your risk
 
 /mode standard | aggressive
 • Control trade frequency & timing
 
-/commands
-• Full command guide + examples
-
 ────────────────────
-⚠️ Alerts & Context
+⚠️ Alerts
 ────────────────────
 /bigmove_alert on|off
-• Major market moves (📧 Pro/Trial only)
+• Major market moves (📧 Pro)
 
 /early_warning_alert on|off
-• Possible reversal zones (📧 Pro/Trial only)
+• Possible reversal zones (📧 Pro)
 
 ────────────────────
-💎 Plans
+💳 Billing & Plan
 ────────────────────
-🟢 Standard — Telegram only
-🔵 Pro — Telegram + Email alerts
+/status
+• Your plan, trial days & enabled features
+
+/upgrade
+• View pricing & upgrade to Pro
+
+/billing
+• Billing & payment help
+
 🎁 New users get a 7-day Pro trial automatically.
+
+────────────────────
+📘 Learn more:
+/commands
 
 🤖 Bot: @PulseFuturesBot
 📢 Updates: @PulseFutures
 🆘 Support: @PulseFuturesSupport
 """\
 
-COMMANDS_TEXT = """\
-📘 PulseFutures — Command Guide & Examples
+COMMANDS_TEXT = """📘 PulseFutures — Command Guide & Examples
 
 PulseFutures is a full trading system inside Telegram.
-Below are the key commands with simple examples.
+Below are key commands and simple examples.
 
 ────────────────────
-🔍 MARKET SCAN
+🔍 Market Scan
 ────────────────────
 /screen
-• Scans the market for high-quality setups
-• Sections you may see:
-  - Top Trade Setups (ready)
-  - Waiting for Trigger (near-miss)
-  - Trend Continuation Watch
-  - Spike Reversal Alerts
-  - Early Warning zones (if any)
-  - Leaders/Losers + Market Leaders
+• Scans the market for high-quality trade setups and context
 
 Example:
 /screen
 
 ────────────────────
-🎛️ STRATEGY MODE
+⚖️ Risk & Position Sizing
+────────────────────
+/size <symbol> <side> <entry> <sl>
+• Calculates position size based on your risk rules
+
+Examples:
+/size BTCUSDT long 42000 41000
+/size ELSA short 0.091 0.097
+
+────────────────────
+🎛️ Strategy Mode
 ────────────────────
 /mode standard
 • Conservative, higher-quality entries
@@ -4405,69 +4412,61 @@ Example:
 /mode aggressive
 • Earlier entries, higher frequency, higher risk
 
-Example:
-/mode aggressive
-
-────────────────────
-⚖️ RISK & POSITION SIZING
-────────────────────
-/size <symbol> <side> <entry> <sl>
-• Calculates position size based on your risk rules
-
 Examples:
-/size BTC long 42000 41000
-/size ELSA short 0.09087 0.09671
+/mode aggressive
+/mode standard
 
 ────────────────────
-🕒 SESSION CONTROL
+⚠️ Alerts & Context
 ────────────────────
-/sessions
-• View your session settings
-
-/sessions_on <ASIA|LON|NY>
-/sessions_off <ASIA|LON|NY>
-• Enable/disable sessions
-
-/sessions_on_unlimited
-/sessions_off_unlimited
-• 24-hour mode for scans (if enabled in your build)
-
-Example:
-/sessions_on NY
-
-────────────────────
-⚠️ ALERTS & EMAILS
-────────────────────
-/bigmove_alert on|off [4H%] [1H%]
-• Big move alerts in either direction (UP or DOWN)
-• 📧 Email alerts are Pro/Trial only
+/bigmove_alert on|off
+• Big-move alerts (📧 Pro only)
 
 /early_warning_alert on|off
-• Possible reversal zones (context, not an entry)
-• 📧 Email alerts are Pro/Trial only
-
-/email
-• Show email status
-
-/email set you@example.com
-• Save your email for alerts
-
-/email off
-• Disable email
+• Possible reversal zones (📧 Pro only)
 
 Examples:
-/bigmove_alert on 30 12
+/bigmove_alert on
 /early_warning_alert on
-/email set you@example.com
 
 ────────────────────
-📊 PLAN & STATUS
+📧 Email
+────────────────────
+/email
+• View email status
+
+/email set you@example.com
+• Set/update your email address
+
+/email off
+• Disable email alerts
+
+────────────────────
+🕒 Sessions
+────────────────────
+/sessions
+• View session settings
+
+/sessions on ASIA|LON|NY
+/sessions off
+
+Example:
+/sessions on LON
+
+────────────────────
+📊 Plan & Features
 ────────────────────
 /status
-• Shows your plan (Trial/Standard/Pro), trial days remaining, and enabled features
+• Shows plan (Trial/Standard/Pro), trial days remaining, enabled features
+
+/upgrade
+• Shows pricing and how to upgrade
+
+/billing
+• Billing & payment help
 
 ────────────────────
-🆘 HELP & SUPPORT
+🆘 Help
 ────────────────────
 /help
 • Quick overview
@@ -4475,8 +4474,8 @@ Examples:
 /commands
 • Full guide (this)
 
-Support: @PulseFuturesSupport
-Updates: @PulseFutures
+📢 Updates: @PulseFutures
+🆘 Support: @PulseFuturesSupport
 """\
 
 
@@ -4485,63 +4484,49 @@ Updates: @PulseFutures
 # HELP TEXT (ADMIN)
 # =========================================================
 
-HELP_TEXT_ADMIN = """\
-🛠 PulseFutures — Admin Command Guide
+HELP_TEXT_ADMIN = """🛠 PulseFutures — Admin Command Guide
 
-Admin commands are powerful. Use carefully.
+Admin-only. Use carefully.
 Not financial advice.
 
 ────────────────────
-👤 USERS & ACCESS
+👤 User & Access
 ────────────────────
 /admin_user <user_id>
 • View full user record (plan, trial, alerts)
 
-/admin_users
-• List users (overview)
-
 /admin_grant <user_id> <standard|pro>
-• Grant or change user plan
+• Grant/change user plan
 
 /admin_revoke <user_id>
 • Revoke paid access (sets to standard)
 
-/myplan
-• View your own plan status (admins too)
-
 ────────────────────
-💳 PAYMENTS (USDT)
+💸 USDT Payments
 ────────────────────
-/admin_payments
-• View payments ledger
-
 /usdt_pending
 • Show pending USDT requests
 
 /usdt_approve <TXID>
-• Approve payment (grants access + writes ledger)
+• Approve TXID (grant access + ledger)
 
 /usdt_reject <TXID> <reason>
-• Reject payment
+• Reject TXID with reason
 
 ────────────────────
-⏱️ COOLDOWNS
+⏱️ Cooldown Controls
 ────────────────────
-/cooldown
-/cooldowns
-• View cooldowns
-
 /cooldown_clear <SYMBOL> <long|short>
 • Clear cooldown for one symbol + side
 
 /cooldown_clear_all
-• Clear all cooldowns (global)
+• Clear ALL cooldowns
 
 ────────────────────
-⚙️ DATA / RECOVERY
+🧯 Data / Recovery
 ────────────────────
 /reset
-• Reset user data / clean DB (⚠️ DANGEROUS)
+• Reset user data (DANGEROUS)
 
 /restore
 • Restore previously removed data (if backup exists)
@@ -9276,6 +9261,11 @@ async def manage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ No email on file for subscription management.")
 
 
+async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(UPGRADE_TEXT)
+
+
+
 def main():
     # Hard guard: Background Worker ONLY
     if os.environ.get("RENDER_SERVICE_TYPE") == "web":
@@ -9291,6 +9281,7 @@ def main():
     ensure_email_column()
     
     app = Application.builder().token(TOKEN).post_init(_post_init).build()
+    app.add_handler(CommandHandler("upgrade", upgrade_cmd))
     app.add_error_handler(error_handler)
 
     # ================= Handlers =================
@@ -9475,3 +9466,51 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• ⚠️ Early-Warning Emails — Pro only",
         ]
     await update.message.reply_text("\n".join(lines))
+
+
+
+UPGRADE_TEXT = """💎 PulseFutures — Plans & Upgrades
+
+PulseFutures is a professional trading system inside Telegram.
+
+────────────────────
+🟢 STANDARD — $49 / month
+────────────────────
+✅ Market Scan (/screen)
+✅ Risk & position sizing (/size)
+✅ Journal & performance tracking
+✅ Session filters (ASIA / LON / NY)
+✅ Strategy modes (Standard / Aggressive)
+✅ Telegram alerts
+
+❌ No email alerts
+
+────────────────────
+🔵 PRO — $99 / month
+────────────────────
+Includes everything in Standard, plus:
+✅ 📧 Email alerts (trade setups)
+✅ ⚡ Big-Move email alerts
+✅ ⚠️ Early-Warning email alerts
+
+🎁 New users get a 7-day Pro trial automatically.
+
+To upgrade, follow the payment instructions in @PulseFutures
+or contact support: @PulseFuturesSupport
+"""
+
+
+BILLING_TEXT = """💳 Billing & Payments
+
+Plans:
+• Standard — $49/mo
+• Pro — $99/mo
+• 7-day Pro trial for new users (automatic)
+
+Use:
+/status  — see your plan & enabled features
+/upgrade — pricing & upgrade info
+
+If you have payment or access issues, contact:
+@PulseFuturesSupport
+"""
