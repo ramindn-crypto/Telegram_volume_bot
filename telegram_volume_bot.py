@@ -4554,6 +4554,27 @@ Updates: @PulseFutures
 Support: @PulseFuturesSupport
 """\
 
+
+# =========================================================
+# PERFORMANCE HELPERS
+# =========================================================
+
+def _run_coro_in_thread(coro):
+    """Run an async coroutine to completion in a worker thread."""
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        # Fallback for edge cases where a loop is already running in that thread
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
 # =========================================================
 # BILLING COMMANDS (Stripe Payment Links + USDT)
 # =========================================================
@@ -7139,11 +7160,11 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # Run heavy work in parallel where possible
-            pool_task = asyncio.create_task(build_priority_pool(best_fut, session, mode="screen", scan_profile=str((get_user(update.effective_user.id) or {}).get('scan_profile') or DEFAULT_SCAN_PROFILE)))
+            pool = await asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, session, mode="screen", scan_profile=str((get_user(update.effective_user.id) or {}).get('scan_profile') or DEFAULT_SCAN_PROFILE)))
             leaders_task = asyncio.to_thread(build_leaders_table, best_fut)
             movers_task = asyncio.to_thread(movers_tables, best_fut)
 
-            pool = await pool_task
+            # pool built in worker thread (see above)
             leaders_txt = await leaders_task
             up_txt, dn_txt = await movers_task
 
