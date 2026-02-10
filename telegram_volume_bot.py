@@ -7193,8 +7193,22 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     try:
                         if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[1], dict):
                             base, d = item
-                            dot = d.get("dot", "•")
-                            side = d.get("side", "BUY")
+                            # Always derive the color-dot from side to avoid mismatches
+                            raw_side = str(d.get("side", "BUY") or "BUY").strip().upper()
+                            if raw_side in ("LONG",):
+                                side = "BUY"
+                            elif raw_side in ("SHORT",):
+                                side = "SELL"
+                            elif raw_side in ("BUY", "SELL"):
+                                side = raw_side
+                            else:
+                                side = raw_side  # fallback (still show it)
+                            if side == "BUY":
+                                dot = "🟢"
+                            elif side == "SELL":
+                                dot = "🔴"
+                            else:
+                                dot = "🟡"
                             lines.append(f"• *{base}* {dot} `{side}`")
                         else:
                             lines.append(f"• `{str(item)}`")
