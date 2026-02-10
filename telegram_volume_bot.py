@@ -1495,14 +1495,21 @@ def set_user_email(uid: int, email: str) -> None:
 def ensure_email_column():
     with sqlite3.connect(DB_PATH) as con:
         cur = con.cursor()
+        # email address
         try:
             cur.execute("ALTER TABLE users ADD COLUMN email_to TEXT")
             con.commit()
             logger.info("Added email_to column to users table")
         except sqlite3.OperationalError:
-            # Column already exists
             pass
 
+        # per-user master toggle for ALL email alerts (signals/bigmove/early-warning)
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN email_alerts_enabled INTEGER DEFAULT 1")
+            con.commit()
+            logger.info("Added email_alerts_enabled column to users table")
+        except sqlite3.OperationalError:
+            pass
 def reset_daily_if_needed(user: dict) -> dict:
     tz = ZoneInfo(user["tz"])
     today = datetime.now(tz).date().isoformat()
@@ -3505,6 +3512,43 @@ def pick_setups(
 # EMAIL
 # =========================================================
 
+
+def user_email_alerts_enabled(user: dict) -> bool:
+    try:
+        return int((user or {}).get("email_alerts_enabled", 1)) == 1
+    except Exception:
+        return True
+
+def set_user_email_alerts_enabled(uid: int, enabled: bool):
+    update_user(int(uid), email_alerts_enabled=(1 if enabled else 0))
+
+async def email_on_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User command to enable/disable ALL email alerts without removing the saved email address."""
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+
+    arg = (context.args[0].strip().lower() if context.args else "")
+    if arg not in ("on", "off", "enable", "disable"):
+        cur = "ON" if user_email_alerts_enabled(user) else "OFF"
+        await update.message.reply_text(
+            "📧 Email alerts (master switch)\n"
+            "────────────────────\n"
+            f"Current: {cur}\n\n"
+            "Usage:\n"
+            "/email_on_off on\n"
+            "/email_on_off off\n\n"
+            "Note: This does not remove your saved email address."
+        )
+        return
+
+    enabled = arg in ("on", "enable")
+    set_user_email_alerts_enabled(uid, enabled)
+    await update.message.reply_text(
+        "✅ Email alerts updated\n"
+        "────────────────────\n"
+        f"Now: {'ON' if enabled else 'OFF'}"
+    )
+
 def email_config_ok() -> bool:
     """
     Only checks SMTP sender config.
@@ -3533,6 +3577,14 @@ def send_email(
     Tracks last SMTP error + last email decision for /health and /email_decision.
     """
     global _SMTP_CONN, _SMTP_CONN_IS_SSL, _SMTP_CONN_TS
+
+    # Per-user master email alerts switch
+    if user_id_for_debug is not None:
+        u = get_user(int(user_id_for_debug))
+        if u and not user_email_alerts_enabled(u):
+            _EMAIL_LAST_DECISION["reason"] = "user_email_alerts_disabled"
+            _EMAIL_LAST_DECISION["ts"] = _now()
+            return False
 
     uid = int(user_id_for_debug) if user_id_for_debug is not None else None
 
@@ -4433,6 +4485,7 @@ Example:
 ────────────────────────────────────────
 ⚠️ ALERTS & EMAILS
 ────────────────────────────────────────
+
 /bigmove_alert on|off [4H%] [1H%]
 • Big move alerts in either direction (UP or DOWN)
 • 📧 Email alerts are Pro/Trial only
@@ -4447,23 +4500,23 @@ Example:
 /email_test
 • Test the email
 
-/email_off
-• Turn off email alerts
+/email off
+• Disable email
 
 Examples:
 /bigmove_alert on 30 12
 /early_warning_alert on
-/email set you@example.com
+/email you@example.com
 
-────────────────────
+────────────────────────────────────────
 📊 PLAN & STATUS
-────────────────────
+────────────────────────────────────────
 /status
 • Shows your plan (Trial/Standard/Pro), trial days remaining, and enabled features
 
-────────────────────
+────────────────────────────────────────
 🆘 HELP & SUPPORT
-────────────────────
+────────────────────────────────────────
 /help
 • Quick overview
 
@@ -4486,9 +4539,9 @@ HELP_TEXT_ADMIN = """\
 Admin commands are powerful. Use carefully.
 Not financial advice.
 
-────────────────────
+────────────────────────────────────────
 👤 USERS & ACCESS
-────────────────────
+────────────────────────────────────────
 /admin_user <user_id>
 • View full user record (plan, trial, alerts)
 
@@ -4504,9 +4557,9 @@ Not financial advice.
 /myplan
 • View your own plan status (admins too)
 
-────────────────────
+────────────────────────────────────────
 💳 PAYMENTS (USDT)
-────────────────────
+────────────────────────────────────────
 /admin_payments
 • View payments ledger
 
@@ -4519,9 +4572,9 @@ Not financial advice.
 /usdt_reject <TXID> <reason>
 • Reject payment
 
-────────────────────
+────────────────────────────────────────
 ⏱️ COOLDOWNS
-────────────────────
+────────────────────────────────────────
 /cooldown
 /cooldowns
 • View cooldowns
@@ -4532,9 +4585,9 @@ Not financial advice.
 /cooldown_clear_all
 • Clear all cooldowns (global)
 
-────────────────────
+────────────────────────────────────────
 ⚙️ DATA / RECOVERY
-────────────────────
+────────────────────────────────────────
 /reset
 • Reset user data / clean DB (⚠️ DANGEROUS)
 
@@ -9377,6 +9430,7 @@ def main():
     app.add_handler(CommandHandler("restore", restore_cmd))
     app.add_handler(CommandHandler("health_sys", health_sys_cmd))
     app.add_handler(CommandHandler("billing", billing_cmd))
+    app.add_handler(CommandHandler("email_on_off", email_on_off_cmd))
     app.add_handler(CommandHandler("upgrade", upgrade_cmd))
     app.add_handler(CommandHandler("trade_window", trade_window_cmd))
     app.add_handler(CommandHandler("email", email_cmd))   
@@ -9511,3 +9565,4 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• ⚠️ Early-Warning Emails — Pro only",
         ]
     await update.message.reply_text("\n".join(lines))
+
