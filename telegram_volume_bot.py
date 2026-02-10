@@ -9389,3 +9389,136 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ===============================
+# TRIAL + STATUS (ADDED)
+# ===============================
+
+TRIAL_DAYS = 7
+
+def _ensure_trial(user):
+    if not user:
+        return
+    if user.get("plan"):
+        return
+    start = user.get("trial_start_ts")
+    now = time.time()
+    if not start:
+        update_user(user["user_id"], plan="trial", trial_start_ts=now, trial_until=now + TRIAL_DAYS*86400)
+    elif now <= float(user.get("trial_until", 0)):
+        update_user(user["user_id"], plan="trial")
+    else:
+        update_user(user["user_id"], plan="standard")
+
+def user_has_pro(uid):
+    u = get_user(uid)
+    if not u:
+        return False
+    _ensure_trial(u)
+    if u.get("plan") == "pro":
+        return True
+    if u.get("plan") == "trial" and time.time() <= float(u.get("trial_until", 0)):
+        return True
+    return False
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    u = get_user(uid)
+    _ensure_trial(u)
+    plan = (u or {}).get("plan","standard").upper()
+    lines = [
+        "📊 PulseFutures — Status",
+        "────────────────────",
+        f"Plan: {plan}",
+    ]
+    if (u or {}).get("plan") == "trial":
+        rem = int((float(u.get("trial_until",0)) - time.time())/86400)
+        lines.append(f"Trial remaining: {max(rem,0)} days")
+    lines += [
+        "",
+        "Enabled features:",
+        "• Market Scan (/screen)",
+        "• Risk & Position Sizing (/size)",
+        "• Journal & Performance",
+        "• Session Filters",
+        "• Strategy Mode",
+    ]
+    if user_has_pro(uid):
+        lines += [
+            "• 📧 Email Alerts",
+            "• ⚡ Big-Move Emails",
+            "• ⚠️ Early-Warning Emails",
+        ]
+    else:
+        lines += [
+            "• 📧 Email Alerts — Pro only",
+            "• ⚡ Big-Move Emails — Pro only",
+            "• ⚠️ Early-Warning Emails — Pro only",
+        ]
+    await update.message.reply_text("\n".join(lines))
+
+
+
+
+
+# ===============================
+# HELP TEXT (ADMIN)
+# ===============================
+
+HELP_TEXT_ADMIN = """🛠 PulseFutures — Admin Command Guide
+
+Admin commands are powerful. Use carefully.
+Not financial advice.
+
+────────────────────
+👤 USER & ACCESS
+────────────────────
+/admin_user <user_id>
+• View full user record (plan, trial, alerts)
+
+/admin_grant <user_id> <standard|pro>
+• Grant or change user plan
+
+/admin_revoke <user_id>
+• Revoke paid access (sets to standard)
+
+/usdt_pending
+• Show pending USDT payments
+
+/usdt_approve <TXID>
+• Approve USDT payment and grant access
+
+/usdt_reject <TXID> <reason>
+• Reject USDT payment
+
+────────────────────
+⚙️ SYSTEM & DATA
+────────────────────
+/reset
+• Reset user data (⚠️ DANGEROUS)
+
+/restore
+• Restore previously removed data (if backup exists)
+
+────────────────────
+⏱️ COOLDOWN CONTROL
+────────────────────
+/cooldown_clear <SYMBOL> <long|short>
+• Clear cooldown for one symbol + side
+
+/cooldown_clear_all
+• Clear all cooldowns (global)
+
+────────────────────
+📊 MONITORING
+────────────────────
+• All scan logic, modes, alerts are user-controlled
+• Admins do NOT receive special trading signals
+• Pricing & trial logic is automatic
+
+────────────────────
+📢 Channels
+────────────────────
+Updates: @PulseFutures
+Support: @PulseFuturesSupport
+"""
