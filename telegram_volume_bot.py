@@ -4330,234 +4330,228 @@ async def usdt_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 HELP_TEXT = """\
-PulseFutures — Commands (Telegram)
+🚀 PulseFutures — Trading System in Telegram
 
-/help
+PulseFutures is NOT a signal spam bot.
+It’s a full trading assistant that helps you trade with discipline.
+
 ────────────────────
-1) Market Scan
+🔍 Core Commands
 ────────────────────
 /screen
-/mode <standard|aggressive>
-• Changes scan strictness (Aggressive = more setups; higher risk).
+• Scan the market for high-quality setups
 
-Market Scan Controls & Alerts 
-    /sessions_on_unlimited → Enables 24-hour email signaling.  
-    /sessions_off_unlimited → Disables 24-hour mode.    
-    /bigmove_alert [on <4H%> <1H%> | off] → Sends ALERT emails for strong market moves in either direction (UP or DOWN), even if they do NOT qualify as full trade signals.
-    Examples: /bigmove_alert on 30 12 ; /bigmove_alert off
-    /early_warning_alert [on | off] → Emails EARLY warnings (possible reversal zones). Not a trade signal.
-    Example: /early_warning_alert on
+/size <symbol> <entry> <sl>
+• Position sizing based on your risk rules
+
+/status
+• Your plan, trial status & enabled features
+
+/mode standard | aggressive
+• Control trade frequency & timing
+
+/commands
+• Full command guide + examples
+
 ────────────────────
-2) Position Sizing (NO trade opened)
+⚠️ Alerts & Context
 ────────────────────
-/size <SYMBOL> <long|short> entry <ENTRY> sl <STOP> [risk <usd|pct> <VALUE>]   
-Purpose: Calculates correct position size from Risk + SL
-    
+/bigmove_alert on|off
+• Major market moves (📧 Pro/Trial only)
+
+/early_warning_alert on|off
+• Possible reversal zones (📧 Pro/Trial only)
+
+────────────────────
+💎 Plans
+────────────────────
+🟢 Standard — Telegram only
+🔵 Pro — Telegram + Email alerts
+🎁 New users get a 7-day Pro trial automatically.
+
+🤖 Bot: @PulseFuturesBot
+📢 Updates: @PulseFutures
+🆘 Support: @PulseFuturesSupport
+"""\
+
+COMMANDS_TEXT = """\
+📘 PulseFutures — Command Guide & Examples
+
+PulseFutures is a full trading system inside Telegram.
+Below are the key commands with simple examples.
+
+────────────────────
+🔍 MARKET SCAN
+────────────────────
+/screen
+• Scans the market for high-quality setups
+• Sections you may see:
+  - Top Trade Setups (ready)
+  - Waiting for Trigger (near-miss)
+  - Trend Continuation Watch
+  - Spike Reversal Alerts
+  - Early Warning zones (if any)
+  - Leaders/Losers + Market Leaders
+
+Example:
+/screen
+
+────────────────────
+🎛️ STRATEGY MODE
+────────────────────
+/mode standard
+• Conservative, higher-quality entries
+
+/mode aggressive
+• Earlier entries, higher frequency, higher risk
+
+Example:
+/mode aggressive
+
+────────────────────
+⚖️ RISK & POSITION SIZING
+────────────────────
+/size <symbol> <side> <entry> <sl>
+• Calculates position size based on your risk rules
+
 Examples:
-   • /size BTC long sl 42000 → Uses default /riskmode
-   • /size BTC long risk usd 40 sl 42000 → Uses current Bybit futures price as Entry
-   • /size ETH short risk pct 2.5 sl 2480 → Uses your Equity
-   • /size BTC long sl 42000 entry 43000 → Manual entry price
+/size BTC long 42000 41000
+/size ELSA short 0.09087 0.09671
+
 ────────────────────
-3) Trade Journal & Equity Tracking
+🕒 SESSION CONTROL
 ────────────────────
-Set equity
-   • /equity <value> → /equity 1000
-   • /equity_reset → Reset equity  
-Open trade:
-   • /trade_open <SYMBOL> <long|short> entry <ENTRY> sl <SL> risk <usd|pct> <VALUE>
-Manage open trade:
-   • /trade_sl <TRADE_ID> <NEW_SL> → Updates SL and recalculates trade risk    
-   • /trade_rf <TRADE_ID> → Moves SL to Entry (Risk-Free) 
-   • /trade_close <TRADE_ID> pnl <PNL> → Close trade
+/sessions
+• View your session settings
+
+/sessions_on <ASIA|LON|NY>
+/sessions_off <ASIA|LON|NY>
+• Enable/disable sessions
+
+/sessions_on_unlimited
+/sessions_off_unlimited
+• 24-hour mode for scans (if enabled in your build)
+
+Example:
+/sessions_on NY
+
 ────────────────────
-4) Status Dashboard
+⚠️ ALERTS & EMAILS
 ────────────────────
-    /status
+/bigmove_alert on|off [4H%] [1H%]
+• Big move alerts in either direction (UP or DOWN)
+• 📧 Email alerts are Pro/Trial only
+
+/early_warning_alert on|off
+• Possible reversal zones (context, not an entry)
+• 📧 Email alerts are Pro/Trial only
+
+/email
+• Show email status
+
+/email set you@example.com
+• Save your email for alerts
+
+/email off
+• Disable email
+
+Examples:
+/bigmove_alert on 30 12
+/early_warning_alert on
+/email set you@example.com
+
 ────────────────────
-5) Risk Settings
+📊 PLAN & STATUS
 ────────────────────
-Risk per trade:
-   • /riskmode pct 2.5
-   • /riskmode usd 25
-Daily risk cap:
-   • /dailycap pct 5
-   • /dailycap usd 60
+/status
+• Shows your plan (Trial/Standard/Pro), trial days remaining, and enabled features
+
 ────────────────────
-6) Limits (Discipline Controls)
+🆘 HELP & SUPPORT
 ────────────────────
-/limits maxtrades 5
-/limits emailcap 4        (0 = unlimited per session)
-/limits emailgap 60       (minutes between emails)
-/limits emaildaycap 4     (0 = unlimited per day)
-────────────────────
-7) Sessions (Email Delivery Windows)
-────────────────────
-View sessions:
-   • /sessions
-Enable / disable:
-   • /sessions_on NY
-   • /sessions_off LO
-Session priority: NY > LON > ASIA
-Emails are sent ONLY during enabled sessions.
-────────────────────
-8) Email Alerts
-────────────────────
-Enable / disable:
-   • /notify_on
-   • /notify_off
-Limit alerts to a daily time window (your timezone):
-   • /trade_window <START_HH:MM> <END_HH:MM>
-     Example: /trade_window 09:00 17:30
-Email troubleshooting:
-   • /email_test → Sends a test email using your configured email setup
-────────────────────
-9) Symbol Cooldowns (Anti-Spam Logic)
-────────────────────
-Cooldowns are:
-    • Per-user
-    • Per-symbol
-    • Per-direction (BUY vs SELL)
-    • Session-aware (duration depends on NY/LON/ASIA policy)
-View cooldowns → /cooldowns
-   → Shows remaining cooldown time for NY / LON / ASIA for each symbol + direction
-Query a single symbol → /cooldown <SYMBOL> <long|short>
-      → Shows remaining cooldown time for NY / LON / ASIA for that exact symbol+direction
-────────────────────
-10) Reports
-────────────────────
-Performance:
-   • /report_daily
-   • /report_weekly
-   • /report_overall
-   • /signals_daily
-   • /signals_weekly
-────────────────────
-11) System Health
-────────────────────
-   • /health_sys
-────────────────────
-12) Timezone
-────────────────────
-View / set timezone:
-   • /tz
-────────────────────
-13) Billing, Plan, Support
-────────────────────
-   • /myplan → Shows your current plan
-   • /billing → Shows payment options (Stripe + USDT)
-   • /support → Contact/support info and troubleshooting steps
-────────────────────
-14) USDT Payments (Semi-Auto)
-────────────────────
-You can pay using USDT (crypto).
-Start here:
-   • /usdt → Shows the current network + address + instructions
-   Accepted network: USDT (TRC20 only)
-    
-   Prices:
-   • Standard: 49 USDT
-   • Pro: 99 USDT
-    
-   Steps:
-   1) Send USDT to the address shown in /usdt
-   2) Copy the transaction hash (TXID)
-   3) Submit payment using:
-    /usdt_paid <TXID> <standard|pro>
-    Example: /usdt_paid 7f3a...c9 standard
-    Notes:
-    • USDT payments are final
-    • No refunds for crypto payments
-    • Access is granted after admin approval
-────────────────────
-Final Notes
-────────────────────
-• PulseFutures does NOT auto-trade
-• PulseFutures does NOT promise profits
-• PulseFutures enforces discipline, risk control, and session awareness
-    
-Trade less. Trade better. Stay disciplined
-PulseFutures
-"""
+/help
+• Quick overview
+
+/commands
+• Full guide (this)
+
+Support: @PulseFuturesSupport
+Updates: @PulseFutures
+"""\
+
+
 
 # =========================================================
 # HELP TEXT (ADMIN)
 # =========================================================
 
 HELP_TEXT_ADMIN = """\
-PulseFutures — Admin Commands (Telegram)
+🛠 PulseFutures — Admin Command Guide
 
-/help_admin
-
-Admin-only • Use carefully
+Admin commands are powerful. Use carefully.
 Not financial advice.
 
 ────────────────────
-User Scan Profile (All Users)
+👤 USERS & ACCESS
 ────────────────────
-/mode <standard|aggressive>
-• Changes /screen strictness (Aggressive = more setups; higher risk)
+/admin_user <user_id>
+• View full user record (plan, trial, alerts)
 
-Early Warning Emails (All Users)
-────────────────────
-/early_warning_alert [on | off]
-• Emails non-trade early warnings (possible reversal zones).
+/admin_users
+• List users (overview)
 
-────────────────────
-Cooldown Controls (Admin)
-────────────────────
-/cooldown_clear <SYMBOL> <long|short>
-• Clears cooldown for that symbol+side (admin)
+/admin_grant <user_id> <standard|pro>
+• Grant or change user plan
 
-/cooldown_clear_all
-• Clears ALL cooldowns (admin)
+/admin_revoke <user_id>
+• Revoke paid access (sets to standard)
+
+/myplan
+• View your own plan status (admins too)
 
 ────────────────────
-Data / Recovery
+💳 PAYMENTS (USDT)
 ────────────────────
-/reset
-• Resets user data / clean DB (DANGEROUS)
+/admin_payments
+• View payments ledger
 
-/restore
-• Restores previously removed data (if backup exists)
-
-────────────────────
-USDT Admin Commands
-────────────────────
 /usdt_pending
-• Shows pending USDT requests
+• Show pending USDT requests
 
 /usdt_approve <TXID>
-• Approves TXID (grants access + writes ledger)
+• Approve payment (grants access + writes ledger)
 
 /usdt_reject <TXID> <reason>
-• Rejects TXID
-
-Notes:
-• Always verify TXID on the chain before approving
-• USDT payments are final/irreversible
+• Reject payment
 
 ────────────────────
-Payments & Access Admin
+⏱️ COOLDOWNS
 ────────────────────
-/admin_user <telegram_id>
-• Shows plan + access source/ref + last payments
+/cooldown
+/cooldowns
+• View cooldowns
 
-/admin_users [free|standard|pro]
-• Lists users (max 50)
+/cooldown_clear <SYMBOL> <long|short>
+• Clear cooldown for one symbol + side
 
-/admin_payments [N]
-• Shows latest payments from Stripe/USDT/manual (max 50)
+/cooldown_clear_all
+• Clear all cooldowns (global)
 
-/admin_grant <telegram_id> <standard|pro|free> [source] [ref]
-• Manually grant/change access and log it
+────────────────────
+⚙️ DATA / RECOVERY
+────────────────────
+/reset
+• Reset user data / clean DB (⚠️ DANGEROUS)
 
-/admin_revoke <telegram_id>
-• Revokes access (sets plan to FREE)
+/restore
+• Restore previously removed data (if backup exists)
 
-PulseFutures
-"""
-
+────────────────────
+📢 Channels
+────────────────────
+Updates: @PulseFutures
+Support: @PulseFuturesSupport
+"""\
 
 # =========================================================
 # BILLING COMMANDS (Stripe Payment Links + USDT)
@@ -4763,6 +4757,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=None,
         disable_web_page_preview=True,
     )
+
+async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Full command guide with examples
+    await send_long_message(
+        update,
+        COMMANDS_TEXT,
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
+
 
 
 async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9277,6 +9281,7 @@ def main():
 
     # ================= Handlers =================
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("commands", commands_cmd))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help_admin", cmd_help_admin))
     app.add_handler(CommandHandler("manage", manage_cmd))
@@ -9456,69 +9461,3 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• ⚠️ Early-Warning Emails — Pro only",
         ]
     await update.message.reply_text("\n".join(lines))
-
-
-
-
-
-# ===============================
-# HELP TEXT (ADMIN)
-# ===============================
-
-HELP_TEXT_ADMIN = """🛠 PulseFutures — Admin Command Guide
-
-Admin commands are powerful. Use carefully.
-Not financial advice.
-
-────────────────────
-👤 USER & ACCESS
-────────────────────
-/admin_user <user_id>
-• View full user record (plan, trial, alerts)
-
-/admin_grant <user_id> <standard|pro>
-• Grant or change user plan
-
-/admin_revoke <user_id>
-• Revoke paid access (sets to standard)
-
-/usdt_pending
-• Show pending USDT payments
-
-/usdt_approve <TXID>
-• Approve USDT payment and grant access
-
-/usdt_reject <TXID> <reason>
-• Reject USDT payment
-
-────────────────────
-⚙️ SYSTEM & DATA
-────────────────────
-/reset
-• Reset user data (⚠️ DANGEROUS)
-
-/restore
-• Restore previously removed data (if backup exists)
-
-────────────────────
-⏱️ COOLDOWN CONTROL
-────────────────────
-/cooldown_clear <SYMBOL> <long|short>
-• Clear cooldown for one symbol + side
-
-/cooldown_clear_all
-• Clear all cooldowns (global)
-
-────────────────────
-📊 MONITORING
-────────────────────
-• All scan logic, modes, alerts are user-controlled
-• Admins do NOT receive special trading signals
-• Pricing & trial logic is automatic
-
-────────────────────
-📢 Channels
-────────────────────
-Updates: @PulseFutures
-Support: @PulseFuturesSupport
-"""
