@@ -4926,6 +4926,18 @@ Not financial advice.
 • Restore previously removed data (if backup exists)
 
 ────────────────────
+🧪 DIAGNOSTICS
+────────────────────
+/why
+• Last /screen reject summary (why no setups)
+
+/email_decision
+• Last email decision (why email sent/skipped/error)
+
+/health_sys
+• System health (DB, exchange, email)
+
+────────────────────
 📢 Channels
 ────────────────────
 Updates: @PulseFutures
@@ -7650,40 +7662,37 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 setups_txt = "_No high-quality setups right now._"
                 momentum_txt = "_No breakout setups right now._"
-            # Combine pullback + breakout into one Top Trade Setups section (users don't care about engine)
-            combined_lines = []
-            # Pullback setups keep their confidence as-is; breakout setups get a small penalty (balanced)
-            for s in setups:
-                combined_lines.append(s)
-            for s in momentum_setups:
-                try:
-                    s2 = dict(s)
-                    s2["confidence"] = max(70, int(s2.get("confidence", 78)) - 4)
-                    combined_lines.append(s2)
-                except Exception:
-                    combined_lines.append(s)
-            # Sort by confidence desc, then volume if present
-            def _sort_key(x):
-                return (-int(x.get("confidence", 0)), -float(x.get("fvol", 0) or 0))
-            combined_lines = sorted(combined_lines, key=_sort_key)
-            if not combined_lines:
-                combined_setups_txt = "_No high-quality setups right now._"
-            else:
-                lines2 = []
-                for s in combined_lines[:5]:
-                    sym = s.get("symbol")
-                    side = s.get("side")
-                    conf = int(s.get("confidence", 0))
-                    emoji = "🟢" if side == "BUY" else "🔴"
-                    rr = s.get("rr")
-                    if rr is not None:
-                        lines2.append(f"• {sym} {emoji} {side} | Conf {conf} | RR {rr}")
-                    else:
-                        lines2.append(f"• {sym} {emoji} {side} | Conf {conf}")
-                combined_setups_txt = "\n".join(lines2)
+                # Top Trade Setups (clean, user-facing)
+                # NOTE: Users don't care about internal engines; just show entry/SL/TP + a copy-paste /size command.
+                if not setups:
+                    combined_setups_txt = "_No high-quality setups right now._"
+                else:
+                    lines2 = []
+                    for s in setups[:SETUPS_N]:
+                        try:
+                            sym = str(getattr(s, "symbol", "") or "").strip()
+                            side = str(getattr(s, "side", "") or "").strip().upper()
+                            conf = int(getattr(s, "conf", 0) or 0)
+                            entry = float(getattr(s, "entry", 0.0) or 0.0)
+                            sl = float(getattr(s, "sl", 0.0) or 0.0)
+                            tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+                            sid = str(getattr(s, "setup_id", "") or "").strip()
 
+                            emoji = "🟢" if side == "BUY" else "🔴"
+                            longshort = "long" if side == "BUY" else "short"
+                            size_cmd = f"/size {sym} {longshort} entry {fmt_price(entry)} sl {fmt_price(sl)}"
 
-            # Waiting for Trigger (near-miss)
+                            lines2.append(
+                                f"• `{sid}` — *{sym}* {emoji} `{side}` | Conf `{conf}`\\n"
+                                f"  Entry `{fmt_price(entry)}` | SL `{fmt_price(sl)}` | TP `{fmt_price(tp3)}`\\n"
+                                f"  `{size_cmd}`"
+                            )
+                        except Exception:
+                            continue
+                    combined_setups_txt = "\\n".join(lines2) if lines2 else "_No high-quality setups right now._"
+
+                # Waiting for Trigger (near-miss)
+
             waiting_txt = ""
             waiting_items = pool.get("waiting") or []
             if not waiting_items and _WAITING_TRIGGER:
