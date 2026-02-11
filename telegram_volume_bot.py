@@ -3247,6 +3247,20 @@ def make_setup(
     ch24 = float(mv.percentage or 0.0)
 
     ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
+
+    # Use true 4H change from 4H candles (more stable than 1H*4 approximation)
+    ch4_exact = 0.0
+    try:
+        c4h = fetch_ohlcv(mv.symbol, "4h", limit=6)
+        if c4h and len(c4h) >= 2:
+            c_last_4h = float(c4h[-1][4])
+            c_prev_4h = float(c4h[-2][4])
+            ch4_exact = ((c_last_4h - c_prev_4h) / c_prev_4h) * 100.0 if c_prev_4h else 0.0
+    except Exception:
+        ch4_exact = 0.0
+
+    ch4_used = ch4_exact if abs(ch4_exact) > 0.0001 else ch4
+
     if (ch1 == 0.0 and ch4 == 0.0 and ch15 == 0.0 and atr_1h == 0.0) or (not c15) or (ema_support_15m == 0.0):
         _rej("ohlcv_missing_or_insufficient", base, mv, "metrics/ema missing")
         return None
@@ -3405,7 +3419,7 @@ def make_setup(
             vol_mult = 1.05 if aggressive_screen else 1.08
 
             # Use 4H/side gating already computed as the trend regime.
-            uptrend = (ch4 >= 0)
+            uptrend = (ch4_used >= 0)
             downtrend = (ch4 < 0)
 
             if abs(ch24) >= ch24_thr and fut_vol >= max(5_000_000.0, float(MOVER_VOL_USD_MIN) * 0.70) and c1 and len(c1) >= 25:
@@ -3591,8 +3605,8 @@ def make_breakout_setup(
         return None
 
     # Prefer trend regime from 4H
-    trend_up = ch4 > 0
-    trend_dn = ch4 < 0
+    trend_up = ch4_used > 0
+    trend_dn = ch4_used < 0
 
     highs = [float(x[2]) for x in c1 if x and len(x) >= 6][-25:]
     lows  = [float(x[3]) for x in c1 if x and len(x) >= 6][-25:]
@@ -3632,14 +3646,14 @@ def make_breakout_setup(
         # As a fallback, allow if 4H is neutral but 24H is strong
         if is_breakout and vol_ok and ch24 >= max(10.0, ch24_buy_min) and (ch4 >= 0):
             side = "BUY"
-        elif is_breakdown and vol_ok and ch24 <= min(-10.0, ch24_sell_max) and (ch4 <= 0):
+        elif is_breakdown and vol_ok and ch24 <= min(-10.0, ch24_sell_max) and (ch4_used <= 0):
             side = "SELL"
         else:
             # Balanced fallback: strong momentum continuation (not a fresh HH/LL break)
             if vol_ok:
-                if (ch4 >= 6.0 and ch24 >= 15.0):
+                if (ch4_used >= 4.0 and ch24 >= 12.0):
                     side = "BUY"
-                elif (ch4 <= -6.0 and ch24 <= -15.0):
+                elif (ch4_used <= -4.0 and ch24 <= -12.0):
                     side = "SELL"
                 else:
                     _rej("no_breakout_trigger", base, mv)
@@ -3665,7 +3679,7 @@ def make_breakout_setup(
 
     # Confidence scoring (balanced)
     conf = 80
-    if abs(ch4) >= 5:
+    if abs(ch4_used) >= 5:
         conf += 2
     if abs(ch24) >= 20:
         conf += 2
@@ -3687,7 +3701,7 @@ def make_breakout_setup(
         tp3=float(tp3),
         fut_vol_usd=float(fut_vol),
         ch24=float(ch24),
-        ch4=float(ch4),
+        ch4=float(ch4_used),
         ch1=float(ch1),
         ch15=float(ch15),
         ema_support_period=int(ema_period or 0),
