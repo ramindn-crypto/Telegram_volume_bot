@@ -7250,17 +7250,35 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                 tmp = []
             priority_setups.extend(tmp or [])
 
-    # de-dupe by (symbol, side) keeping highest conf, preserving priority order
+    
+    # 4B) Momentum Breakout setups (Engine B) — Balanced
+    # NOTE: keep in same unified list; /screen splits by s.engine == "B"
+    try:
+        mom_n = max(6, int(n_target) * 2)
+        mom = await asyncio.to_thread(
+            pick_breakout_setups,
+            best_fut,
+            mom_n,
+            session_name,
+            int(universe_cap),
+            scan_profile=prof,
+        )
+    except Exception:
+        mom = []
+    if mom:
+        priority_setups.extend(mom)
+
+# de-dupe by (symbol, side) keeping highest conf, preserving priority order
     best = {}
     for s in priority_setups:
-        k = (str(s.symbol).upper(), str(s.side))
+        k = (str(s.symbol).upper(), str(s.side), str(getattr(s, "engine", "")))
         if k not in best or int(s.conf) > int(best[k].conf):
             best[k] = s
 
     ordered = []
     seen = set()
     for s in priority_setups:
-        k = (str(s.symbol).upper(), str(s.side))
+        k = (str(s.symbol).upper(), str(s.side), str(getattr(s, "engine", "")))
         if k in seen:
             continue
         if k in best:
@@ -7546,7 +7564,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
 
                     card = (
-                        f"*#{i}* {side_emoji} *{s.side}* — *{s.symbol}*\n"
+                        f"{side_emoji} *{s.side}* — *{s.symbol}*\n"
                         f"╰──────────────╯\n"
                         f"`{s.setup_id}` | *Conf:* `{int(getattr(s, 'conf', 0))}`\n"
                         f"*Type:* `{engine_tag}` | *RR(TP3):* `{rr3:.2f}`\n"
