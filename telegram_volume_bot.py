@@ -3350,6 +3350,7 @@ def make_setup(
     engine_a_ok = bool(ENGINE_A_PULLBACK_ENABLED and pullback_ready)
 
     engine_b_ok = False
+
     if ENGINE_B_MOMENTUM_ENABLED:
         # Aggressive /screen: slightly looser momentum requirements
         mom_min_ch1 = float(MOMENTUM_MIN_CH1) * (0.75 if aggressive_screen else 1.0)
@@ -3357,6 +3358,9 @@ def make_setup(
         mom_body_mult = float(MOMENTUM_ATR_BODY_MULT) * (0.85 if aggressive_screen else 1.0)
         mom_max_ema_dist = float(MOMENTUM_MAX_ADAPTIVE_EMA_DIST) * (1.30 if aggressive_screen else 1.0)
 
+        # ------------------------------------------------------------------
+        # B1) Momentum continuation (existing)
+        # ------------------------------------------------------------------
         if abs(ch1) >= mom_min_ch1 and abs(ch24) >= mom_min_24h:
             if fut_vol >= (MOVER_VOL_USD_MIN * MOMENTUM_VOL_MULT):
                 body_pct = abs(ch1)
@@ -3365,6 +3369,47 @@ def make_setup(
                     if dist_pct <= mom_max_ema_dist:
                         engine_b_ok = True
 
+        # ------------------------------------------------------------------
+        # B2) Balanced Breakout continuation (NEW)
+        # Purpose: avoid "leaders full, setups empty" during expansion phases.
+        # ------------------------------------------------------------------
+        try:
+            # Only attempt breakout checks for reasonably active markets
+            # (reduces API load + avoids noise)
+            ch24_thr = 6.0 if aggressive_screen else 8.0
+            vol_mult = 1.10 if aggressive_screen else 1.15
+
+            if abs(ch24) >= ch24_thr and fut_vol >= float(MOVER_VOL_USD_MIN):
+                c1h = fetch_ohlcv(mv.symbol, "1h", limit=220)
+                if c1h and len(c1h) >= 210:
+                    closes_1h = [float(x[4]) for x in c1h]
+                    highs_1h  = [float(x[2]) for x in c1h]
+                    lows_1h   = [float(x[3]) for x in c1h]
+                    vols_1h   = [float(x[5]) for x in c1h]
+
+                    ema50  = float(ema(closes_1h[-200:], 50) or 0.0)
+                    ema200 = float(ema(closes_1h[-220:], 200) or 0.0)
+                    if ema50 > 0 and ema200 > 0:
+                        uptrend = (ema50 > ema200)
+                        downtrend = (ema50 < ema200)
+
+                        hh20 = max(highs_1h[-20:])
+                        ll20 = min(lows_1h[-20:])
+                        vavg = (sum(vols_1h[-20:]) / 20.0) if vols_1h[-20:] else 0.0
+                        vnow = float(vols_1h[-1])
+                        last_close = float(closes_1h[-1])
+
+                        # Breakout BUY
+                        if uptrend and ch24 >= ch24_thr and last_close > hh20 and (vavg > 0) and (vnow >= vavg * vol_mult):
+                            engine_b_ok = True
+                            mv._pf_breakout_hint = "BUY"
+
+                        # Breakdown SELL
+                        if downtrend and ch24 <= -ch24_thr and last_close < ll20 and (vavg > 0) and (vnow >= vavg * vol_mult):
+                            engine_b_ok = True
+                            mv._pf_breakout_hint = "SELL"
+        except Exception:
+            pass
     if not engine_a_ok and not engine_b_ok:
         _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}")
         return None
@@ -6795,7 +6840,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         trend_take = 12
     else:  # email
         n_target = int(max(EMAIL_SETUPS_N * 3, 9))
-        strict_15m = (False if mode == "screen" else True)  # loosen screen: more setups
+        strict_15m = True
         universe_cap = 35
         trigger_loosen = 1.0
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
@@ -7236,24 +7281,26 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Setup cards
             if setups:
-                cards = []
+                pull_cards = []
+                mom_cards = []
+
                 for i, s in enumerate(setups, 1):
                     side_emoji = "🟢" if s.side == "BUY" else "🔴"
-                    engine_tag = "Momentum" if getattr(s, "engine", "") == "B" else "Mean-Reversion"
+                    is_mom = (getattr(s, "engine", "") == "B")
+                    engine_tag = "Momentum Breakout" if is_mom else "Pullback"
                     rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
 
                     tp_line = (
                         f"*TP1:* `{fmt_price(s.tp1)}` | *TP2:* `{fmt_price(s.tp2)}` | *TP3:* `{fmt_price(s.tp3)}`"
-                        if (getattr(s, "tp1", None) and getattr(s, "tp2", None))
-                        else f"*TP:* `{fmt_price(s.tp3)}`"
+                        if s.tp1 and s.tp2 else
+                        f"*TP3:* `{fmt_price(s.tp3)}`"
                     )
 
-                    cards.append(
-                        f"╭──────────────╮\n"
+                    card = (
                         f"*#{i}* {side_emoji} *{s.side}* — *{s.symbol}*\n"
                         f"╰──────────────╯\n"
                         f"`{s.setup_id}` | *Conf:* `{int(getattr(s, 'conf', 0))}`\n"
-                        f"{engine_tag} | *RR(TP3):* `{rr3:.2f}`\n"
+                        f"*Type:* `{engine_tag}` | *RR(TP3):* `{rr3:.2f}`\n"
                         f"*Entry:* `{fmt_price(s.entry)}` | *SL:* `{fmt_price(s.sl)}`\n"
                         f"{tp_line}\n"
                         f"*Moves:* 24H {pct_with_emoji(s.ch24)} • 4H {pct_with_emoji(s.ch4)} • "
@@ -7261,9 +7308,17 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"*Volume:* `~{fmt_money(s.fut_vol_usd)}`\n"
                         f"*Chart:* {tv_chart_url(s.symbol)}"
                     )
-                setups_txt = "\n\n".join(cards)
+
+                    if is_mom:
+                        mom_cards.append(card)
+                    else:
+                        pull_cards.append(card)
+
+                setups_txt = "\n\n".join(pull_cards) if pull_cards else "_No pullback setups right now._"
+                momentum_txt = "\n\n".join(mom_cards) if mom_cards else "_No breakout setups right now._"
             else:
                 setups_txt = "_No high-quality setups right now._"
+                momentum_txt = "_No breakout setups right now._"
 
             # Waiting for Trigger (near-miss)
             waiting_txt = ""
@@ -7373,9 +7428,13 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Assemble body (cache THIS, header stays live)
             blocks = [
                 "",
-                "*Top Trade Setups*",
+                "*Top Trade Setups (Pullback)*",
                 SEP,
                 setups_txt,
+                "",
+                "*Momentum Breakout Setups*",
+                SEP,
+                momentum_txt,
             ]
 
             if waiting_txt:
@@ -9585,4 +9644,3 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• ⚠️ Early-Warning Emails — Pro only",
         ]
     await update.message.reply_text("\n".join(lines))
-
