@@ -3375,20 +3375,22 @@ def make_setup(
         # Uses the already-fetched 1H candles (c1) to avoid extra API calls / rate limits.
         # ------------------------------------------------------------------
         try:
-            ch24_thr = 6.0 if aggressive_screen else 8.0
-            vol_mult = 1.08 if aggressive_screen else 1.12
+            ch24_thr = 4.0 if aggressive_screen else 6.0
+            vol_mult = 1.05 if aggressive_screen else 1.08
 
             # Use 4H/side gating already computed as the trend regime.
             uptrend = (side == "BUY")
             downtrend = (side == "SELL")
 
-            if abs(ch24) >= ch24_thr and fut_vol >= float(MOVER_VOL_USD_MIN) and c1 and len(c1) >= 25:
+            if abs(ch24) >= ch24_thr and fut_vol >= max(5_000_000.0, float(MOVER_VOL_USD_MIN) * 0.70) and c1 and len(c1) >= 25:
                 highs_1h = [float(x[2]) for x in c1]
                 lows_1h  = [float(x[3]) for x in c1]
                 closes_1h = [float(x[4]) for x in c1]
                 vols_1h  = [float(x[5]) for x in c1]
 
                 last_close = float(closes_1h[-1])
+                last_high = float(highs_1h[-1])
+                last_low  = float(lows_1h[-1])
                 vnow = float(vols_1h[-1])
                 vavg = (sum(vols_1h[-21:-1]) / 20.0) if vols_1h[-21:-1] else 0.0
 
@@ -3397,12 +3399,12 @@ def make_setup(
                 ll20 = min(lows_1h[-21:-1])
 
                 # Breakout BUY
-                if uptrend and ch24 >= ch24_thr and last_close > hh20 and (vavg > 0) and (vnow >= vavg * vol_mult):
+                if uptrend and ch24 >= ch24_thr and (last_high > hh20 or last_close > hh20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
                     engine_b_ok = True
                     mv._pf_breakout_hint = "BUY"
 
                 # Breakdown SELL
-                if downtrend and ch24 <= -ch24_thr and last_close < ll20 and (vavg > 0) and (vnow >= vavg * vol_mult):
+                if downtrend and ch24 <= -ch24_thr and (last_low < ll20 or last_close < ll20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
                     engine_b_ok = True
                     mv._pf_breakout_hint = "SELL"
         except Exception:
