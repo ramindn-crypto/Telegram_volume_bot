@@ -2699,14 +2699,14 @@ def strong_reversal_exception_ok(side: str, ch24: float, ch4: float, ch1: float)
         return False
 
 
-def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float, float, float, int, List[List[float]]]:
+def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float, float, float, int, List[List[float]], List[List[float]]]:
     """
-    returns: ch1, ch4, ch15, atr_1h, ema_support_15m, ema_support_period, c15
+    returns: ch1, ch4, ch15, atr_1h, ema_support_15m, ema_support_period, c15, c1
     """
     need_1h = max(ATR_PERIOD + 6, 35)
     c1 = fetch_ohlcv(market_symbol, "1h", limit=need_1h)
-    if not c1 or len(c1) < 6:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0, []
+    if not c1 or len(c1) < 25:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0, [], []
 
     closes_1h = [float(x[4]) for x in c1]
     c_last = closes_1h[-1]
@@ -2719,7 +2719,7 @@ def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float
 
     c15 = fetch_ohlcv(market_symbol, "15m", limit=80)
     if not c15 or len(c15) < 20:
-        return ch1, ch4, 0.0, atr_1h, 0.0, 0, []
+        return ch1, ch4, 0.0, atr_1h, 0.0, 0, [], c1
 
     closes_15 = [float(x[4]) for x in c15]
     entry_proxy = float(closes_15[-1]) if closes_15 else 0.0
@@ -2731,7 +2731,8 @@ def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float
     c15_prev = float(c15[-2][4])
     ch15 = ((c15_last - c15_prev) / c15_prev) * 100.0 if c15_prev else 0.0
 
-    return ch1, ch4, ch15, atr_1h, ema_support_15m, int(ema_period), c15
+    return ch1, ch4, ch15, atr_1h, ema_support_15m, int(ema_period), c15, c1
+
 
 # =========================================================
 # FORMATTING
@@ -3236,7 +3237,6 @@ def make_setup(
 
     fut_vol = usd_notional(mv)
     if fut_vol <= 0:
-        _rej("no_fut_vol", base, mv)
         return None
 
     entry = float(mv.last or 0.0)
@@ -3246,7 +3246,7 @@ def make_setup(
 
     ch24 = float(mv.percentage or 0.0)
 
-    ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15 = metrics_from_candles_1h_15m(mv.symbol)
+    ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
     if (ch1 == 0.0 and ch4 == 0.0 and ch15 == 0.0 and atr_1h == 0.0) or (not c15) or (ema_support_15m == 0.0):
         _rej("ohlcv_missing_or_insufficient", base, mv, "metrics/ema missing")
         return None
@@ -3372,44 +3372,58 @@ def make_setup(
         # ------------------------------------------------------------------
         # B2) Balanced Breakout continuation (NEW)
         # Purpose: avoid "leaders full, setups empty" during expansion phases.
+        # Uses the already-fetched 1H candles (c1) to avoid extra API calls / rate limits.
         # ------------------------------------------------------------------
         try:
-            # Only attempt breakout checks for reasonably active markets
-            # (reduces API load + avoids noise)
             ch24_thr = 6.0 if aggressive_screen else 8.0
-            vol_mult = 1.10 if aggressive_screen else 1.15
+            vol_mult = 1.08 if aggressive_screen else 1.12
 
-            if abs(ch24) >= ch24_thr and fut_vol >= float(MOVER_VOL_USD_MIN):
-                c1h = fetch_ohlcv(mv.symbol, "1h", limit=220)
-                if c1h and len(c1h) >= 210:
-                    closes_1h = [float(x[4]) for x in c1h]
-                    highs_1h  = [float(x[2]) for x in c1h]
-                    lows_1h   = [float(x[3]) for x in c1h]
-                    vols_1h   = [float(x[5]) for x in c1h]
+            # Use 4H/side gating already computed as the trend regime.
+            uptrend = (side == "BUY")
+            downtrend = (side == "SELL")
 
-                    ema50  = float(ema(closes_1h[-200:], 50) or 0.0)
-                    ema200 = float(ema(closes_1h[-220:], 200) or 0.0)
-                    if ema50 > 0 and ema200 > 0:
-                        uptrend = (ema50 > ema200)
-                        downtrend = (ema50 < ema200)
+            if abs(ch24) >= ch24_thr and fut_vol >= float(MOVER_VOL_USD_MIN) and c1 and len(c1) >= 25:
+                highs_1h = [float(x[2]) for x in c1]
+                lows_1h  = [float(x[3]) for x in c1]
+                closes_1h = [float(x[4]) for x in c1]
+                vols_1h  = [float(x[5]) for x in c1]
 
-                        hh20 = max(highs_1h[-20:])
-                        ll20 = min(lows_1h[-20:])
-                        vavg = (sum(vols_1h[-20:]) / 20.0) if vols_1h[-20:] else 0.0
-                        vnow = float(vols_1h[-1])
-                        last_close = float(closes_1h[-1])
+                last_close = float(closes_1h[-1])
+                vnow = float(vols_1h[-1])
+                vavg = (sum(vols_1h[-21:-1]) / 20.0) if vols_1h[-21:-1] else 0.0
 
-                        # Breakout BUY
-                        if uptrend and ch24 >= ch24_thr and last_close > hh20 and (vavg > 0) and (vnow >= vavg * vol_mult):
-                            engine_b_ok = True
-                            mv._pf_breakout_hint = "BUY"
+                # Prior 20-candle extremes (exclude the current candle)
+                hh20 = max(highs_1h[-21:-1])
+                ll20 = min(lows_1h[-21:-1])
 
-                        # Breakdown SELL
-                        if downtrend and ch24 <= -ch24_thr and last_close < ll20 and (vavg > 0) and (vnow >= vavg * vol_mult):
-                            engine_b_ok = True
-                            mv._pf_breakout_hint = "SELL"
+                # Breakout BUY
+                if uptrend and ch24 >= ch24_thr and last_close > hh20 and (vavg > 0) and (vnow >= vavg * vol_mult):
+                    engine_b_ok = True
+                    mv._pf_breakout_hint = "BUY"
+
+                # Breakdown SELL
+                if downtrend and ch24 <= -ch24_thr and last_close < ll20 and (vavg > 0) and (vnow >= vavg * vol_mult):
+                    engine_b_ok = True
+                    mv._pf_breakout_hint = "SELL"
         except Exception:
             pass
+    
+    # If breakout engine fired, force side to match the breakout direction (prevents green BUY / red mismatch)
+    try:
+        hint = getattr(mv, "_pf_breakout_hint", None)
+        if engine_b_ok and hint in ("BUY", "SELL"):
+            side = hint
+    except Exception:
+        pass
+
+    # If breakout engine fired, force side to match the breakout direction (prevents green BUY / red mismatch)
+    try:
+        hint = getattr(mv, "_pf_breakout_hint", None)
+        if engine_b_ok and hint in ("BUY", "SELL"):
+            side = hint
+    except Exception:
+        pass
+
     if not engine_a_ok and not engine_b_ok:
         _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}")
         return None
