@@ -3276,14 +3276,40 @@ def make_setup(
                 else:
                     dot = "🔴"
 
-                side_guess = "BUY" if ch1 > 0 else "SELL"
+                side_guess = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.25 else ("BUY" if ch1 > 0 else "SELL")
                 _WAITING_TRIGGER[str(base)] = {"side": side_guess, "dot": dot}
 
-        _rej("ch1_below_trigger", base, mv)
-        return None
+        # Balanced breakout override: even if 1H change is small, allow true breakouts
+        breakout_override = False
+        try:
+            if c1 and len(c1) >= 25 and abs(ch24) >= 6.0:
+                highs_1h = [float(x[2]) for x in c1]
+                lows_1h  = [float(x[3]) for x in c1]
+                closes_1h = [float(x[4]) for x in c1]
+                vols_1h  = [float(x[5]) for x in c1]
+                last_close = float(closes_1h[-1])
+                last_high  = float(highs_1h[-1])
+                last_low   = float(lows_1h[-1])
+                hh20 = max(highs_1h[-21:-1])
+                ll20 = min(lows_1h[-21:-1])
+                vnow = float(vols_1h[-1])
+                vavg = (sum(vols_1h[-21:-1]) / 20.0) if vols_1h[-21:-1] else 0.0
+
+                vol_mult = 1.08  # balanced default
+                if (ch24 >= 6.0) and (last_high > hh20 or last_close > hh20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
+                    breakout_override = True
+                if (ch24 <= -6.0) and (last_low < ll20 or last_close < ll20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
+                    breakout_override = True
+        except Exception:
+            breakout_override = False
+
+        if not breakout_override:
+            _rej("ch1_below_trigger", base, mv)
+            return None
+
 
     # ✅ IMPORTANT: this must be OUTSIDE the if block (no extra indent)
-    side = "BUY" if ch1 > 0 else "SELL"
+    side = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.25 else ("BUY" if ch1 > 0 else "SELL")  # trend-side gating: prefer 4H regime over 1H noise
 
     # 4H alignment
     if side == "BUY" and ch4 < ALIGN_4H_MIN:
@@ -3379,8 +3405,8 @@ def make_setup(
             vol_mult = 1.05 if aggressive_screen else 1.08
 
             # Use 4H/side gating already computed as the trend regime.
-            uptrend = (side == "BUY")
-            downtrend = (side == "SELL")
+            uptrend = (ch4 >= 0)
+            downtrend = (ch4 < 0)
 
             if abs(ch24) >= ch24_thr and fut_vol >= max(5_000_000.0, float(MOVER_VOL_USD_MIN) * 0.70) and c1 and len(c1) >= 25:
                 highs_1h = [float(x[2]) for x in c1]
