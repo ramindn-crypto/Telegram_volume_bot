@@ -20,6 +20,7 @@ import ssl
 import smtplib
 import sqlite3
 import asyncio
+import contextvars
 
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -906,11 +907,33 @@ def user_diag_mode(user_id: int) -> str:
 def reset_reject_tracker() -> None:
     return
 
+
+# =========================================================
+# DIAGNOSTICS (reject reasons)
+# =========================================================
+_REJECT_CTX = contextvars.ContextVar("pf_reject_ctx", default=None)
+_LAST_REJECTS = {}  # uid -> {"ts": float, "counts": { "A:no_trigger": 12, ... }}
+
 def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
+    """Record reject reasons for diagnostics. base is an engine tag (A/B/C/etc)."""
+    ctx = _REJECT_CTX.get()
+    if isinstance(ctx, dict):
+        key = f"{str(base)}:{str(reason)}"
+        ctx[key] = int(ctx.get(key, 0)) + 1
     return
 
-def _reject_report(diag_mode: str = "off") -> str:
-    return ""
+def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
+    rec = _LAST_REJECTS.get(int(uid)) or {}
+    counts = rec.get("counts") or {}
+    if not counts:
+        return "No reject stats recorded yet. Run /screen once."
+    items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:int(top_n)]
+    lines = []
+    lines.append("🧩 Last Scan Reject Reasons (top)")
+    for k, v in items:
+        lines.append(f"• {k} = {v}")
+    return "\n".join(lines)
+
 
 # =========================================================
 # DB
@@ -1188,7 +1211,7 @@ def db_init():
     if "early_warning_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN early_warning_alert_on INTEGER NOT NULL DEFAULT 0")
     if "early_warning_min_vol_usd" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN early_warning_min_vol_usd REAL NOT NULL DEFAULT 15000000")
+        cur.execute("ALTER TABLE users ADD COLUMN early_warning_min_vol_usd REAL NOT NULL DEFAULT 10000000")
     if "early_warning_atr_mult" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN early_warning_atr_mult REAL NOT NULL DEFAULT 1.15")
     if "early_warning_body_ratio" not in cols:
@@ -7065,7 +7088,7 @@ def _email_priority_bases(best_fut: dict, directional_take: int = 12) -> set:
         return set()
 
 
-async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE) -> dict:
+async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
     """
     mode: "screen" or "email"
     returns: {
@@ -7076,6 +7099,11 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         "spike_warnings": [dict...],  # NEW (Early Warning, non-trade)
     }
     """
+
+    # Diagnostics: collect reject reasons for this scan
+    _rej_ctx = {}
+    _rej_token = _REJECT_CTX.set(_rej_ctx)
+
 
     # knobs
     if mode == "screen":
@@ -7346,6 +7374,17 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         except Exception:
             spike_warnings = []
 
+    
+    # Store diagnostics for /why
+    try:
+        if uid is not None:
+            _LAST_REJECTS[int(uid)] = {"ts": time.time(), "counts": dict(_rej_ctx)}
+    finally:
+        try:
+            _REJECT_CTX.reset(_rej_token)
+        except Exception:
+            pass
+
     return {"setups": ordered, "waiting": waiting_items, "trend_watch": trend_watch, "spikes": spike_candidates, "spike_warnings": spike_warnings}
 
 
@@ -7556,7 +7595,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # Run heavy work in parallel where possible
-            pool = await asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, session, mode="screen", scan_profile=str((get_user(update.effective_user.id) or {}).get('scan_profile') or DEFAULT_SCAN_PROFILE)))
+            pool = await asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, session, mode="screen", scan_profile=str((get_user(update.effective_user.id) or {}).get('scan_profile') or DEFAULT_SCAN_PROFILE), uid=update.effective_user.id))
             leaders_task = asyncio.to_thread(build_leaders_table, best_fut)
             movers_task = asyncio.to_thread(movers_tables, best_fut)
 
@@ -7611,6 +7650,38 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 setups_txt = "_No high-quality setups right now._"
                 momentum_txt = "_No breakout setups right now._"
+            # Combine pullback + breakout into one Top Trade Setups section (users don't care about engine)
+            combined_lines = []
+            # Pullback setups keep their confidence as-is; breakout setups get a small penalty (balanced)
+            for s in setups:
+                combined_lines.append(s)
+            for s in momentum_setups:
+                try:
+                    s2 = dict(s)
+                    s2["confidence"] = max(70, int(s2.get("confidence", 78)) - 4)
+                    combined_lines.append(s2)
+                except Exception:
+                    combined_lines.append(s)
+            # Sort by confidence desc, then volume if present
+            def _sort_key(x):
+                return (-int(x.get("confidence", 0)), -float(x.get("fvol", 0) or 0))
+            combined_lines = sorted(combined_lines, key=_sort_key)
+            if not combined_lines:
+                combined_setups_txt = "_No high-quality setups right now._"
+            else:
+                lines2 = []
+                for s in combined_lines[:5]:
+                    sym = s.get("symbol")
+                    side = s.get("side")
+                    conf = int(s.get("confidence", 0))
+                    emoji = "🟢" if side == "BUY" else "🔴"
+                    rr = s.get("rr")
+                    if rr is not None:
+                        lines2.append(f"• {sym} {emoji} {side} | Conf {conf} | RR {rr}")
+                    else:
+                        lines2.append(f"• {sym} {emoji} {side} | Conf {conf}")
+                combined_setups_txt = "\n".join(lines2)
+
 
             # Waiting for Trigger (near-miss)
             waiting_txt = ""
@@ -7694,7 +7765,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             spike_txt = ""
             spikes = pool.get("spikes") or []
             if spikes:
-                lines = ["*Spike Reversal Alerts (15M+ Vol)*", SEP]
+                lines = ["*Spike Reversal Alerts (10M+ Vol)*", SEP]
                 for c in spikes[:6]:
                     try:
                         sym = str(c.get("symbol", "")).upper()
@@ -7720,13 +7791,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Assemble body (cache THIS, header stays live)
             blocks = [
                 "",
-                "*Top Trade Setups (Pullback)*",
+                "*Top Trade Setups*",
                 SEP,
-                setups_txt,
-                "",
-                "*Momentum Breakout Setups*",
-                SEP,
-                momentum_txt,
+                combined_setups_txt,
             ]
 
             if waiting_txt:
@@ -7740,7 +7807,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             blocks.extend([
                 "",
-                spike_txt if spike_txt else "*Spike Reversal Alerts (15M+ Vol)*\n" + SEP + "\n_No spike-reversal candidates right now._"
+                spike_txt if spike_txt else "*Spike Reversal Alerts (10M+ Vol)*\n" + SEP + "\n_No spike-reversal candidates right now._"
             ])
 
             blocks.extend([
@@ -8842,7 +8909,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         for sess_name in ["NY", "LON", "ASIA"]:
             try:
                 pool = await asyncio.wait_for(
-                    build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str((get_user(uid) or {}).get('scan_profile') or DEFAULT_SCAN_PROFILE)),
+                    build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str((get_user(uid) or {}).get('scan_profile') or DEFAULT_SCAN_PROFILE), uid=uid),
                     timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
                 )
             except asyncio.TimeoutError:
@@ -9188,7 +9255,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append("")
         lines.append("⚡ Big-Move Alert Decision")
         lines.append(f"Status: {bigm.get('status')}")
-        lines.append(f"When: {bigm.get('when')}")
+        lines.append(f"When: {bigm.get('when') or _fmt_when(bigm.get('ts'))}")
         rs = bigm.get("reasons") or []
         if rs:
             lines.append("Reasons:\n- " + "\n- ".join(rs))
@@ -9197,7 +9264,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append("")
         lines.append("🧠 Market Scan Decision")
         lines.append(f"Status: {scan.get('status')}")
-        lines.append(f"When: {scan.get('when')}")
+        lines.append(f"When: {scan.get('when') or _fmt_when(scan.get('ts'))}")
         rs = scan.get("reasons") or scan.get("reason")
         if isinstance(rs, list):
             lines.append("Reasons:\n- " + "\n- ".join(rs))
@@ -9206,6 +9273,14 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text("\n".join(lines).strip())
 
+
+# =========================================================
+# /why (debug why no setups)
+# =========================================================
+async def why_no_setups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    txt = _reject_report_for_uid(uid)
+    await update.message.reply_text(txt)
 
 
 
@@ -9807,7 +9882,8 @@ def main():
     app.add_handler(CommandHandler("email", email_cmd))   
     app.add_handler(CommandHandler("email_test", email_test_cmd))  
     app.add_handler(CommandHandler("email_decision", email_decision_cmd))
-    
+
+    app.add_handler(CommandHandler("why", why_no_setups_cmd))    
     # ================= USDT (semi-auto) =================
     app.add_handler(CommandHandler("usdt", usdt_info_cmd))
     app.add_handler(CommandHandler("usdt_paid", usdt_paid_cmd))
