@@ -436,11 +436,11 @@ SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands unde
 # =========================================================
 
 # Require a clear 15m rejection/reclaim candle at the chosen pullback EMA
-REQUIRE_15M_EMA_REJECTION = True
+REQUIRE_15M_EMA_REJECTION = False  # loosened: more setups
 
 # Candle must close in top/bottom portion of its range (shows strength)
-REJECTION_CLOSE_POS_MIN = 0.65   # BUY: close in top 35% of candle
-REJECTION_CLOSE_POS_MAX = 0.35   # SELL: close in bottom 35% of candle
+REJECTION_CLOSE_POS_MIN = 0.60   # BUY: close in top 35% of candle
+REJECTION_CLOSE_POS_MAX = 0.40   # SELL: close in bottom 35% of candle
 
 # Strong reversal exception (ONLY if you want rare counter-trend calls)
 ALLOW_STRONG_REVERSAL_EXCEPTION = True
@@ -471,21 +471,21 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 80,
-    "LON": 83,
-    "ASIA": 86,
+    "NY": 78,
+    "LON": 80,
+    "ASIA": 82,
 }
 
 SESSION_MIN_RR_TP3 = {
-    "NY": 2.0,
-    "LON": 2.1,
-    "ASIA": 2.2,
+    "NY": 1.7,
+    "LON": 1.8,
+    "ASIA": 1.9,
 }
 
 SESSION_EMA_PROX_MULT = {
-    "NY": 1.20,
-    "LON": 1.00,
-    "ASIA": 0.85,
+    "NY": 1.60,
+    "LON": 1.40,
+    "ASIA": 1.20,
 }
 
 SESSION_EMA_REACTION_LOOKBACK = {
@@ -496,9 +496,9 @@ SESSION_EMA_REACTION_LOOKBACK = {
 
 # ✅ 1H trigger loosened per session (overall easier)
 SESSION_TRIGGER_ATR_MULT = {
-    "NY": 0.65,
-    "LON": 0.85,
-    "ASIA": 1.00,
+    "NY": 0.55,
+    "LON": 0.70,
+    "ASIA": 0.85,
 }
 
 def session_knobs(session_name: str) -> dict:
@@ -1173,15 +1173,15 @@ def db_init():
 
     # default volume gate: 15M
     if "spike_min_vol_usd" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN spike_min_vol_usd REAL NOT NULL DEFAULT 15000000")
+        cur.execute("ALTER TABLE users ADD COLUMN spike_min_vol_usd REAL NOT NULL DEFAULT 10000000")
 
     # wick ratio threshold (0.55 means wick is 55%+ of candle range)
     if "spike_wick_ratio" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN spike_wick_ratio REAL NOT NULL DEFAULT 0.55")
+        cur.execute("ALTER TABLE users ADD COLUMN spike_wick_ratio REAL NOT NULL DEFAULT 0.45")
 
     # spike size must be >= ATR * this multiplier
     if "spike_atr_mult" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN spike_atr_mult REAL NOT NULL DEFAULT 1.20")
+        cur.execute("ALTER TABLE users ADD COLUMN spike_atr_mult REAL NOT NULL DEFAULT 1.00")
 
     # NEW: Early Warning (Possible Reversal Zones) email alerts
     # Default OFF to avoid inbox noise; users can enable explicitly.
@@ -1555,6 +1555,7 @@ def list_users_with_email() -> List[dict]:
 
         has_email_to = ("email_to" in cols)
         has_email = ("email" in cols)
+        has_email_enabled = ("email_alerts_enabled" in cols)
 
         # Build safe WHERE clause
         where_parts = []
@@ -1568,6 +1569,8 @@ def list_users_with_email() -> List[dict]:
             return []
 
         where_sql = " OR ".join(where_parts)
+        if has_email_enabled:
+            where_sql = f"({where_sql}) AND (COALESCE(email_alerts_enabled, 1) = 1)"
 
         cur.execute(f"""
             SELECT *
@@ -1918,13 +1921,13 @@ def _spike_reversal_candidates(
             c15_last_close = float(c15[-1][4])
 
             spike_mid = (h + l) / 2.0
-            sell_confirm = (c15_last_close < spike_mid) and (c15_last_close < o)
-            buy_confirm  = (c15_last_close > spike_mid) and (c15_last_close > o)
+            sell_confirm = (c15_last_close < spike_mid)
+            buy_confirm  = (c15_last_close > spike_mid)
 
             # Downtrend: spike UP into resistance -> SELL reversal
             if downtrend and big_range and upper_ratio >= float(wick_ratio_min) and c < o:
-                if not sell_confirm:
-                    continue
+                weak_confirm = (not sell_confirm)
+                # allow weak confirmations with lower confidence
 
                 entry = float(l)  # break of spike candle low
                 sl = float(h) + (0.10 * atr_1h)
@@ -1934,7 +1937,9 @@ def _spike_reversal_candidates(
                 tp2 = entry - 1.6 * r
                 tp3 = entry - 2.3 * r
 
-                conf = 86
+                conf = 82
+                if weak_confirm:
+                    conf -= 6
                 if (c - l) / rng < 0.40:
                     conf += 4
 
@@ -1950,14 +1955,14 @@ def _spike_reversal_candidates(
                     "tp2": float(tp2),
                     "tp3": float(tp3),
                     "vol": float(vol24),
-                    "why": f"Downtrend (EMA50<EMA200). 1H upper-wick spike rejection (wick={upper_ratio:.2f}, range={rng/atr_1h:.2f} ATR).",
+                    "why": f"Downtrend (EMA50<EMA200). 1H upper-wick spike rejection (wick={upper_ratio:.2f}, range={rng/atr_1h:.2f} ATR). " + ("15m confirm: WEAK" if weak_confirm else "15m confirm: OK"),
                 })
                 continue
 
             # Uptrend: spike DOWN into support -> BUY reversal
             if uptrend and big_range and lower_ratio >= float(wick_ratio_min) and c > o:
-                if not buy_confirm:
-                    continue
+                weak_confirm = (not buy_confirm)
+                # allow weak confirmations with lower confidence
 
                 entry = float(h)  # break of spike candle high
                 sl = float(l) - (0.10 * atr_1h)
@@ -1967,7 +1972,9 @@ def _spike_reversal_candidates(
                 tp2 = entry + 1.6 * r
                 tp3 = entry + 2.3 * r
 
-                conf = 86
+                conf = 82
+                if weak_confirm:
+                    conf -= 6
                 if (h - c) / rng < 0.40:
                     conf += 4
 
@@ -1983,7 +1990,7 @@ def _spike_reversal_candidates(
                     "tp2": float(tp2),
                     "tp3": float(tp3),
                     "vol": float(vol24),
-                    "why": f"Uptrend (EMA50>EMA200). 1H lower-wick spike rejection (wick={lower_ratio:.2f}, range={rng/atr_1h:.2f} ATR).",
+                    "why": f"Uptrend (EMA50>EMA200). 1H lower-wick spike rejection (wick={lower_ratio:.2f}, range={rng/atr_1h:.2f} ATR). " + ("15m confirm: WEAK" if weak_confirm else "15m confirm: OK"),
                 })
                 continue
 
@@ -1998,10 +2005,10 @@ def _spike_reversal_candidates(
 def _spike_reversal_warnings(
     best_fut: Dict[str, Any],
     min_vol_usd: float = 15_000_000.0,
-    atr_mult_min: float = 1.15,
-    body_ratio_min: float = 0.60,
+    atr_mult_min: float = 1.05,
+    body_ratio_min: float = 0.50,
     lookback_1h: int = 8,
-    retrace_min: float = 0.30,
+    retrace_min: float = 0.22,
     max_items: int = 8,
 ) -> List[dict]:
     """
@@ -6788,7 +6795,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         trend_take = 12
     else:  # email
         n_target = int(max(EMAIL_SETUPS_N * 3, 9))
-        strict_15m = True
+        strict_15m = (False if mode == "screen" else True)  # loosen screen: more setups
         universe_cap = 35
         trigger_loosen = 1.0
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
@@ -7893,6 +7900,14 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         # Defaults: 1H=7.5%, 4H=15%
         # -----------------------------------------------------
         for u in (users_bigmove or []):
+            # Pro/trial-only email features
+            try:
+                uid = int(u.get("user_id") or u.get("id") or 0)
+            except Exception:
+                uid = 0
+            if uid and (not user_has_pro(uid)):
+                continue
+
             tz = timezone.utc
             uid = 0
             try:
