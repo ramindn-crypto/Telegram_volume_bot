@@ -3563,6 +3563,134 @@ def make_setup(
     )
 
 
+
+def make_breakout_setup(
+    base: str,
+    mv: MarketVol,
+    session_name: str = "LON",
+    scan_profile: str = DEFAULT_SCAN_PROFILE,
+) -> Optional[Setup]:
+    """
+    Engine B: Momentum Breakout/Breakdown setups.
+    Uses already-fetched 1H candles from metrics_from_candles_1h_15m().
+    """
+    fut_vol = usd_notional(mv)
+    if fut_vol <= 0:
+        return None
+
+    entry = float(mv.last or 0.0)
+    if entry <= 0:
+        _rej("bad_entry", base, mv)
+        return None
+
+    ch24 = float(mv.percentage or 0.0)
+
+    ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
+    if not c1 or len(c1) < 30 or atr_1h <= 0:
+        _rej("no_candles_breakout", base, mv)
+        return None
+
+    # Prefer trend regime from 4H
+    trend_up = ch4 > 0
+    trend_dn = ch4 < 0
+
+    highs = [float(x[2]) for x in c1 if x and len(x) >= 6][-25:]
+    lows  = [float(x[3]) for x in c1 if x and len(x) >= 6][-25:]
+    closes= [float(x[4]) for x in c1 if x and len(x) >= 6][-25:]
+    vols  = [float(x[5]) for x in c1 if x and len(x) >= 6][-25:]
+
+    if len(highs) < 22 or len(vols) < 22:
+        _rej("insufficient_1h_window", base, mv)
+        return None
+
+    # prior window excludes the last candle to avoid self-referencing
+    prior_high20 = max(highs[-21:-1])
+    prior_low20  = min(lows[-21:-1])
+
+    last_high = highs[-1]
+    last_low  = lows[-1]
+    last_close = closes[-1]
+
+    vol_avg20 = sum(vols[-21:-1]) / 20.0
+    vol_now = vols[-1]
+    vol_ok = (vol_avg20 > 0 and vol_now >= vol_avg20 * 1.08) or (vol_avg20 <= 0 and vol_now > 0)
+
+    # Balanced thresholds
+    ch24_buy_min = 6.0
+    ch24_sell_max = -6.0
+
+    # Breakout/Breakdown by wick OR close
+    is_breakout = (last_high > prior_high20) or (last_close > prior_high20)
+    is_breakdown = (last_low < prior_low20) or (last_close < prior_low20)
+
+    # If 4H is strongly up/down, allow direction to follow regime
+    if trend_up and is_breakout and vol_ok and ch24 >= ch24_buy_min:
+        side = "BUY"
+    elif trend_dn and is_breakdown and vol_ok and ch24 <= ch24_sell_max:
+        side = "SELL"
+    else:
+        # As a fallback, allow if 4H is neutral but 24H is strong
+        if is_breakout and vol_ok and ch24 >= max(10.0, ch24_buy_min) and (ch4 >= 0):
+            side = "BUY"
+        elif is_breakdown and vol_ok and ch24 <= min(-10.0, ch24_sell_max) and (ch4 <= 0):
+            side = "SELL"
+        else:
+            _rej("no_breakout_trigger", base, mv)
+            return None
+
+    # SL/TP using ATR (simple + robust)
+    sl_atr = 1.35
+    rr_target = 2.0  # TP3 RR target for momentum
+    if side == "BUY":
+        sl = entry - (atr_1h * sl_atr)
+        tp3 = entry + (entry - sl) * rr_target
+    else:
+        sl = entry + (atr_1h * sl_atr)
+        tp3 = entry - (sl - entry) * rr_target
+
+    if sl <= 0 or tp3 <= 0:
+        _rej("bad_sl_tp", base, mv)
+        return None
+
+    # Confidence scoring (balanced)
+    conf = 80
+    if abs(ch4) >= 5:
+        conf += 2
+    if abs(ch24) >= 20:
+        conf += 2
+    if vol_avg20 > 0 and vol_now >= vol_avg20 * 1.25:
+        conf += 2
+    conf = int(min(conf, 90))
+
+    setup_id = make_setup_id(base, side)
+    return Setup(
+        setup_id=setup_id,
+        symbol=base,
+        market_symbol=mv.symbol,
+        side=side,
+        conf=conf,
+        entry=float(entry),
+        sl=float(sl),
+        tp1=None,
+        tp2=None,
+        tp3=float(tp3),
+        fut_vol_usd=float(fut_vol),
+        ch24=float(ch24),
+        ch4=float(ch4),
+        ch1=float(ch1),
+        ch15=float(ch15),
+        ema_support_period=int(ema_period or 0),
+        ema_support_dist_pct=float(0.0),
+        pullback_ema_period=int(0),
+        pullback_ema_dist_pct=float(0.0),
+        pullback_ready=False,
+        pullback_bypass_hot=False,
+        engine="B",
+        is_trailing_tp3=False,
+        created_ts=time.time(),
+    )
+
+
 def pick_setups(
     best_fut: Dict[str, MarketVol],
     n: int,
@@ -3605,6 +3733,37 @@ def pick_setups(
 # =========================================================
 # EMAIL
 # =========================================================
+
+def pick_breakout_setups(
+    best_fut: Dict[str, MarketVol],
+    n: int,
+    session_name: str,
+    universe_cap: int,
+    scan_profile: str = DEFAULT_SCAN_PROFILE,
+) -> List[Setup]:
+    """
+    Engine B selector: iterate symbols and build momentum breakout/breakdown setups.
+    """
+    items = list((best_fut or {}).items())
+    # simple volume-based ordering
+    items.sort(key=lambda kv: usd_notional(kv[1] or MarketVol()), reverse=True)
+    if universe_cap and universe_cap > 0:
+        items = items[:universe_cap]
+
+    out: List[Setup] = []
+    for base, mv in items:
+        try:
+            s = make_breakout_setup(base, mv, session_name=session_name, scan_profile=scan_profile)
+            if s:
+                out.append(s)
+        except Exception:
+            continue
+
+    # order by confidence then volume
+    out.sort(key=lambda s: (s.conf, s.fut_vol_usd), reverse=True)
+    return out[: max(0, int(n)) ]
+
+
 
 
 def user_email_alerts_enabled(user: dict) -> bool:
@@ -6972,7 +7131,30 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             if s.side == "SELL":
                 priority_setups.append(s)
 
-    # 2) Trend continuation watch (priority #2)
+    
+    # ------------------------------------------------
+    # Engine B: Momentum Breakout Setups (Balanced)
+    # ------------------------------------------------
+    breakout_setups = []
+    try:
+        bases_for_breakout = list(dict.fromkeys([b.upper() for b in (leaders + losers)]))
+        if bases_for_breakout:
+            sub = _subset_best(best_fut, bases_for_breakout)
+            breakout_setups = await asyncio.to_thread(
+                pick_breakout_setups,
+                sub,
+                int(max(6, n_target)),   # allow a handful
+                session_name,
+                min(int(universe_cap), len(sub) if sub else universe_cap),
+                scan_profile=prof,
+            )
+    except Exception:
+        breakout_setups = []
+
+    if breakout_setups:
+        priority_setups.extend(breakout_setups)
+
+# 2) Trend continuation watch (priority #2)
     # same universe used by /screen: top 6 leaders + top 6 losers
     watch_bases = []
     watch_bases.extend([b for b in leaders[:6]])
