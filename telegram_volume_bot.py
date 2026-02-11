@@ -3613,7 +3613,7 @@ def make_breakout_setup(
 
     vol_avg20 = sum(vols[-21:-1]) / 20.0
     vol_now = vols[-1]
-    vol_ok = (vol_avg20 > 0 and vol_now >= vol_avg20 * 1.08) or (vol_avg20 <= 0 and vol_now > 0)
+    vol_ok = (vol_now > 0) and ((vol_avg20 <= 0) or (vol_now >= vol_avg20 * 1.00))  # looser
 
     # Balanced thresholds
     ch24_buy_min = 6.0
@@ -3635,8 +3635,19 @@ def make_breakout_setup(
         elif is_breakdown and vol_ok and ch24 <= min(-10.0, ch24_sell_max) and (ch4 <= 0):
             side = "SELL"
         else:
-            _rej("no_breakout_trigger", base, mv)
-            return None
+            # Balanced fallback: strong momentum continuation (not a fresh HH/LL break)
+            if vol_ok:
+                if (ch4 >= 6.0 and ch24 >= 15.0):
+                    side = "BUY"
+                elif (ch4 <= -6.0 and ch24 <= -15.0):
+                    side = "SELL"
+                else:
+                    _rej("no_breakout_trigger", base, mv)
+                    return None
+            else:
+                _rej("no_breakout_trigger", base, mv)
+                return None
+
 
     # SL/TP using ATR (simple + robust)
     sl_atr = 1.35
@@ -9799,8 +9810,6 @@ def main():
             time.sleep(3600)
 
 
-if __name__ == "__main__":
-    main()
 
 # ===============================
 # TRIAL + STATUS (ADDED)
@@ -9868,3 +9877,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• ⚠️ Early-Warning Emails — Pro only",
         ]
     await update.message.reply_text("\n".join(lines))
+
+if __name__ == "__main__":
+    main()
