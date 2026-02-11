@@ -1510,6 +1510,31 @@ def ensure_email_column():
             logger.info("Added email_alerts_enabled column to users table")
         except sqlite3.OperationalError:
             pass
+
+
+def ensure_billing_columns():
+    """Ensure billing / plan / trial columns exist on users table (backward compatible migrations)."""
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+
+        # Plan / trial columns
+        for ddl, label in [
+            ("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'", "plan"),
+            ("ALTER TABLE users ADD COLUMN trial_start_ts REAL DEFAULT 0", "trial_start_ts"),
+            ("ALTER TABLE users ADD COLUMN trial_until REAL DEFAULT 0", "trial_until"),
+            ("ALTER TABLE users ADD COLUMN plan_expires REAL DEFAULT 0", "plan_expires"),
+            ("ALTER TABLE users ADD COLUMN access_source TEXT", "access_source"),
+            ("ALTER TABLE users ADD COLUMN access_ref TEXT", "access_ref"),
+            ("ALTER TABLE users ADD COLUMN access_updated_ts REAL DEFAULT 0", "access_updated_ts"),
+        ]:
+            try:
+                cur.execute(ddl)
+                con.commit()
+                logger.info("Added %s column to users table", label)
+            except sqlite3.OperationalError:
+                # column already exists (or older sqlite limitation)
+                pass
+
 def reset_daily_if_needed(user: dict) -> dict:
     tz = ZoneInfo(user["tz"])
     today = datetime.now(tz).date().isoformat()
