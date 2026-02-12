@@ -942,54 +942,127 @@ _LAST_REJECTS = {}  # uid -> {"ts": float, "counts": { "A:no_trigger": 12, ... }
 def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
     """Record reject reasons for diagnostics.
 
-    NOTE:
-    - We record symbol-scoped reasons as "<BASE>:<REASON>" (BASE is usually the symbol base).
-    - If the current scan sets ctx["__allow__"] (a set of allowed bases),
-      we only record reasons for those bases to keep /why focused.
+    - Aggregate counters: ctx["<BASE>:<REASON>"] += 1
+    - Per-symbol last-known reason: ctx["__per__"][BASE] = {"reason": REASON, "n": count}
+    - If ctx["__allow__"] exists, only record for bases in that set (keeps /why focused).
     """
     ctx = _REJECT_CTX.get()
     if not isinstance(ctx, dict):
         return
 
+    b = str(base or "").upper().strip()
+    if not b:
+        return
+
     allow = ctx.get("__allow__")
     try:
-        if allow is not None and base is not None:
-            b = str(base).upper()
-            # Only keep symbol-scoped rejections for the current scan universe.
-            if b not in set(allow):
-                return
+        if allow is not None and b not in set(allow):
+            return
     except Exception:
         pass
 
-    key = f"{str(base)}:{str(reason)}"
+    r = str(reason or "").strip()
+    if not r:
+        r = "unknown_reject"
+
+    key = f"{b}:{r}"
     ctx[key] = int(ctx.get(key, 0)) + 1
+
+    try:
+        per = ctx.get("__per__")
+        if not isinstance(per, dict):
+            per = {}
+            ctx["__per__"] = per
+        per_item = per.get(b) or {}
+        n = int(per_item.get("n") or 0) + 1
+        per[b] = {"reason": r, "n": n}
+    except Exception:
+        pass
     return
 
 
 def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
+    """Explain why setups were rejected in the *last* scan for this user.
+
+    Output is intentionally compact:
+    - Shows how many symbols were in-scope (leaders/losers + optionally market leaders)
+    - Shows how many had recorded reject reasons
+    - Shows top reject reasons (aggregate)
+    - Shows a per-symbol last-known reason list (limited)
+    """
     rec = _LAST_REJECTS.get(int(uid)) or {}
     counts = rec.get("counts") or {}
-    allow = rec.get("allow") or None
+    allow = rec.get("allow") or []
+    per_sym = rec.get("per_symbol") or {}  # base -> {"reason": str, "n": int}
 
-    if not counts:
+    if not allow and not counts:
         return "No reject stats recorded yet. Run /screen once."
 
-    # Filter to the scan universe (leaders/losers/market leaders) if available.
-    if allow:
-        allow_set = set([str(x).upper() for x in (allow or [])])
-        filtered = {}
-        for k, v in counts.items():
-            # keys are "<BASE>:<REASON>"
-            base = str(k).split(":", 1)[0].upper().strip()
-            if base in allow_set:
-                filtered[k] = v
-        counts = filtered or counts
+    allow_set = [str(x).upper() for x in (allow or []) if str(x).strip()]
+    allow_set_unique = []
+    seen = set()
+    for b in allow_set:
+        if b not in seen:
+            seen.add(b)
+            allow_set_unique.append(b)
 
-    items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:int(top_n)]
+    # Filter counts to allow-set if we have it (keeps /why focused).
+    filtered_counts = {}
+    if allow_set_unique:
+        allow_s = set(allow_set_unique)
+        for k, v in (counts or {}).items():
+            base = str(k).split(":", 1)[0].upper().strip()
+            if base in allow_s:
+                filtered_counts[k] = v
+    else:
+        filtered_counts = dict(counts or {})
+
+    # Aggregate top reject keys
+    items = sorted(filtered_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:int(top_n)]
+
+    # Per-symbol summary (show all if small; otherwise truncate)
+    per_lines = []
+    allow_s = set(allow_set_unique) if allow_set_unique else None
+    if allow_set_unique:
+        bases = allow_set_unique
+    else:
+        # fallback: infer bases from counts
+        bases = sorted(list({str(k).split(":", 1)[0].upper().strip() for k in (filtered_counts or {}).keys()}))
+
+    for b in bases:
+        info = per_sym.get(b) or per_sym.get(b.upper()) or None
+        if info and isinstance(info, dict):
+            r = str(info.get("reason") or "").strip()
+            n = int(info.get("n") or 0)
+            if r:
+                per_lines.append(f"• {b}: {r} ({n})")
+                continue
+        # No recorded reject for this symbol in the last scan
+        per_lines.append(f"• {b}: (no reject recorded)")
+
+    # If the universe is large, keep per-symbol section readable
+    max_per = 20
+    per_tail = ""
+    if len(per_lines) > max_per:
+        per_tail = f"… (+{len(per_lines) - max_per} more)"
+        per_lines = per_lines[:max_per]
+
     lines = []
-    lines.append("🧩 Last Scan Reject Reasons (top)")
-    for k, v in items:
-        lines.append(f"• {k} = {v}")
+    lines.append("🧩 Last Scan Reject Reasons")
+    if allow_set_unique:
+        lines.append(f"Universe (leaders/losers/market leaders): {len(allow_set_unique)} symbols")
+        lines.append("Symbols: " + ", ".join(allow_set_unique[:30]) + ("…" if len(allow_set_unique) > 30 else ""))
+    lines.append(f"Recorded reject keys: {len(filtered_counts)}")
+    if items:
+        lines.append("")
+        lines.append("Top reasons (aggregate):")
+        for k, v in items:
+            lines.append(f"• {k} = {v}")
+    lines.append("")
+    lines.append("Per-symbol (last known):")
+    lines.extend(per_lines)
+    if per_tail:
+        lines.append(per_tail)
     return "\n".join(lines)
 
 
@@ -7660,7 +7733,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Store diagnostics for /why
     try:
         if uid is not None:
-            _LAST_REJECTS[int(uid)] = {"ts": time.time(), "counts": {k:v for k,v in dict(_rej_ctx).items() if k != '__allow__'}, "allow": list(_rej_ctx.get('__allow__') or [])}
+            _LAST_REJECTS[int(uid)] = {"ts": time.time(), "counts": {k:v for k,v in dict(_rej_ctx).items() if not str(k).startswith("__")}, "allow": list(_rej_ctx.get("__allow__") or []), "per_symbol": dict((_rej_ctx.get("__per__") or {}))}
     finally:
         try:
             _REJECT_CTX.reset(_rej_token)
@@ -7887,6 +7960,19 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             setups = (pool.get("setups") or [])[:SETUPS_N]
 
+# Safety: if engine produced no setups, generate fallback ATR-based setups
+# from the same universe shown in the Directional Leaders/Losers tables.
+if not setups:
+    try:
+        up_list, dn_list = compute_directional_lists(best_fut)
+        leaders_bases = [str(t[0]).upper() for t in (up_list or [])[:10]]
+        losers_bases  = [str(t[0]).upper() for t in (dn_list or [])[:10]]
+        market_bases  = _market_leader_bases(best_fut)[:10]
+        setups = _fallback_setups_from_universe(best_fut, leaders_bases, losers_bases, market_bases, session, max_items=max(4, int(SETUPS_N or 4)))[:SETUPS_N]
+    except Exception:
+        pass
+
+
             for s in setups:
                 if not hasattr(s, "conf") or s.conf is None:
                     s.conf = 0
@@ -7929,6 +8015,32 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 setups_txt = "\n\n".join(pull_cards) if pull_cards else "_No pullback setups right now._"
                 momentum_txt = "\n\n".join(mom_cards) if mom_cards else "_No breakout setups right now._"
+
+# Clean Top Trade Setups (always)
+lines2 = []
+for s in setups[:SETUPS_N]:
+    try:
+        sym = str(getattr(s, "symbol", "") or "").strip()
+        side = str(getattr(s, "side", "") or "").strip().upper()
+        conf = int(getattr(s, "conf", 0) or 0)
+        entry = float(getattr(s, "entry", 0.0) or 0.0)
+        sl = float(getattr(s, "sl", 0.0) or 0.0)
+        tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+        sid = str(getattr(s, "setup_id", "") or "").strip()
+
+        emoji = "🟢" if side == "BUY" else "🔴"
+        longshort = "long" if side == "BUY" else "short"
+        size_cmd = f"/size {sym} {longshort} entry {fmt_price(entry)} sl {fmt_price(sl)}"
+
+        lines2.append(
+            f"• `{sid}` — *{sym}* {emoji} `{side}` | Conf `{conf}`\\n"
+            f"  Entry `{fmt_price(entry)}` | SL `{fmt_price(sl)}` | TP `{fmt_price(tp3)}`\\n"
+            f"  `{size_cmd}`"
+        )
+    except Exception:
+        continue
+combined_setups_txt = "\\n".join(lines2) if lines2 else "_No high-quality setups right now._"
+
             else:
                 setups_txt = "_No high-quality setups right now._"
                 momentum_txt = "_No breakout setups right now._"
