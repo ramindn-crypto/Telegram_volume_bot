@@ -263,7 +263,7 @@ ENGINE_B_MOMENTUM_ENABLED = True     # pump / expansion
 # ✅ 1H MOMENTUM INTENSITY (SESSION-DYNAMIC)
 # =========================================================
 # Base floor (still used), but we now scale it per session:
-TRIGGER_1H_ABS_MIN_BASE = 1.2        # global floor
+TRIGGER_1H_ABS_MIN_BASE = 0.35        # global floor
 CONFIRM_15M_ABS_MIN = 0.45
 ALIGN_4H_MIN = 0.0
 
@@ -517,29 +517,25 @@ def session_knobs(session_name: str) -> dict:
 
 def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
     """
-    Stricter session-dynamic 1H trigger:
-    - Higher floors (fewer signals)
-    - Higher ATR scaling (avoid low-quality small moves)
+    Session‑dynamic 1H trigger (loosened so signals actually fire).
+
+    Goal:
+    - Still ATR-adaptive (avoid tiny noise when ATR is high)
+    - But DO NOT impose huge hard floors that suppress all setups
     """
     knobs = session_knobs(session_name)
     mult_atr = float(knobs["trigger_atr_mult"])
 
-    # ✅ Make ATR scaling stricter (was 1.0..4.5)
-    # If ATR is small, we still require meaningful movement.
-    dyn = clamp(float(atr_pct) * float(mult_atr), 1.4, 6.0)
+    # ATR-adaptive component: scaled by session knob, gently clamped
+    dyn = clamp(float(atr_pct) * float(mult_atr), 0.25, 3.5)
 
     sess = knobs["name"]
-
-    # ✅ Stricter base floors by session
     base_mult = float(SESSION_1H_BASE_MULT.get(sess, 1.0))
 
-    # Hard-min floor raised slightly by session multiplier
+    # Global base floor (kept modest)
     base_floor = float(TRIGGER_1H_ABS_MIN_BASE) * base_mult
 
-    # Extra strictness in ASIA by default (you can remove if you want)
-    if sess == "ASIA":
-        base_floor = max(base_floor, float(TRIGGER_1H_ABS_MIN_BASE) * 1.25)
-
+    # Final trigger is the max of base floor and ATR-adaptive requirement
     return max(float(base_floor), float(dyn))
 
 
@@ -1883,7 +1879,7 @@ def mark_earlywarn_emailed(uid: int, symbol: str, side: str) -> None:
     except Exception:
         pass
 
-def _bigmove_candidates(best_fut: dict, p4: float, p1: float, max_items: int = 12) -> list:
+def _bigmove_candidates(best_fut: dict, p4: float, p1: float, min_vol_usd: float = 0.0, max_items: int = 12) -> list:
     """
     Returns list of dicts: {symbol, ch4, ch1, vol, direction, score}
 
@@ -1895,8 +1891,6 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, max_items: int = 1
       - UP   if ch4 >= +p4 OR ch1 >= +p1
       - DOWN if ch4 <= -p4 OR ch1 <= -p1
     """
-
-    BIGMOVE_MIN_VOL_USD = 10_000_000  # ✅ only alert if 24H USD volume >= $10M
 
     def _pick_pct(mv, keys) -> float:
         for k in keys:
@@ -1944,7 +1938,7 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, max_items: int = 1
             continue
 
         # ✅ NEW: volume gate (skip low-volume coins completely)
-        if vol < float(BIGMOVE_MIN_VOL_USD):
+        if float(min_vol_usd or 0.0) > 0.0 and vol < float(min_vol_usd):
             continue
 
         if down_hit and not up_hit:
@@ -3398,7 +3392,7 @@ def make_setup(
     atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
     trig_min_raw = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
 
-    trig_min = max(0.4, float(trig_min_raw) * float(trigger_loosen_mult))
+    trig_min = max(0.25, float(trig_min_raw) * float(trigger_loosen_mult))
 
     if abs(ch1) < trig_min:
         # Waiting for Trigger (near-miss) — store ONLY side + a color dot (no numbers)
@@ -5758,11 +5752,11 @@ async def early_warning_alert_cmd(update: Update, context: ContextTypes.DEFAULT_
 
     if not context.args:
         on = int((user or {}).get("early_warning_alert_on", 0) or 0)
-        min_vol = float((user or {}).get("early_warning_min_vol_usd", 15_000_000) or 15_000_000)
-        atr_mult = float((user or {}).get("early_warning_atr_mult", 1.15) or 1.15)
-        body_ratio = float((user or {}).get("early_warning_body_ratio", 0.60) or 0.60)
+        min_vol = float((user or {}).get("early_warning_min_vol_usd", 10_000_000) or 15_000_000)
+        atr_mult = float((user or {}).get("early_warning_atr_mult", 0.95) or 1.15)
+        body_ratio = float((user or {}).get("early_warning_body_ratio", 0.50) or 0.60)
         lookback = int((user or {}).get("early_warning_lookback_1h", 8) or 8)
-        retrace = float((user or {}).get("early_warning_retrace_min", 0.30) or 0.30)
+        retrace = float((user or {}).get("early_warning_retrace_min", 0.20) or 0.30)
         await update.message.reply_text(
             "⚠️ Early Warning Emails (Possible Reversal Zones)\n"
             f"{HDR}\n"
@@ -6497,10 +6491,10 @@ async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):   
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
-    
+
     if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Access expired.\n\n"
@@ -6508,9 +6502,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💳 /billing\n"
             "💰 /usdt"
         )
-        return   
+        return
 
     opens = db_open_trades(uid)
+
+    plan = str((user or {}).get("plan") or "free").upper()
+    equity = float((user or {}).get("equity") or 0.0)
 
     cap = daily_cap_usd(user)
     day_local = _user_day_local(user)
@@ -6521,51 +6518,28 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now_s = in_session_now(user)
     now_txt = now_s["name"] if now_s else "NONE"
 
+    # Email caps (show infinite as 0=∞ to match UI)
+    cap_sess = int((user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION) or DEFAULT_MAX_EMAILS_PER_SESSION)
+    cap_day = int((user or {}).get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY) or DEFAULT_MAX_EMAILS_PER_DAY)
+    gap_m = int((user or {}).get("email_gap_min", DEFAULT_EMAIL_GAP_MIN) or DEFAULT_EMAIL_GAP_MIN)
+
+    # Big-move status
+    bm_on = int((user or {}).get("bigmove_alert_on", 1) or 0)
+    bm_4h = float((user or {}).get("bigmove_alert_4h", 20) or 20)
+    bm_1h = float((user or {}).get("bigmove_alert_1h", 10) or 10)
+
     lines = []
     lines.append("📌 Status")
-    lines.append(HDR)
-    
-    # ✅ Cooldowns (active ones for current session)
-    rows = list_cooldowns(uid)
-    now_ts = time.time()
-    sess_for_cd = now_txt if now_txt != "NONE" else current_session_utc()
-    cd_hours = cooldown_hours_for_session(sess_for_cd)
-    cd_sec = cd_hours * 3600
-
-    active = []
-    seen = set()
-    for r in rows:
-        sym = str(r["symbol"]).upper()
-        side = str(r["side"]).upper()
-        key = (sym, side)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        last_ts = float(r["emailed_ts"])
-        ago = now_ts - last_ts
-        if ago < cd_sec:
-            remain = cd_sec - ago
-            active.append((sym, side, remain))
-
-    active.sort(key=lambda x: x[2])  # soonest to expire first
-    if active:
-        lines.append(f"Cooldowns active (session={sess_for_cd}, {cd_hours}h):")
-        for sym, side, rem in active[:10]:
-            lines.append(f"- {sym} {side} | remaining {_fmt_dur(rem)}")
-    else:
-        lines.append(f"Cooldowns active (session={sess_for_cd}, {cd_hours}h): none")
-
-    lines.append(f"Equity: ${float(user['equity']):.2f}")
-    lines.append(f"Trades today: {int(user['day_trade_count'])}/{int(user['max_trades_day'])}")
-
-    lines.append(f"Daily cap: {user['daily_cap_mode']} {float(user['daily_cap_value']):.2f} (≈ ${cap:.2f})")
+    lines.append(f"Plan: {plan}")
+    lines.append(f"Equity: ${equity:.2f}")
+    lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
+    lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
     lines.append(f"Daily risk used: ${used_today:.2f}")
     lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
-
-    lines.append(f"Email alerts: {'ON' if int(user['notify_on'])==1 else 'OFF'}")
-    lines.append(f"Sessions enabled: {', '.join(enabled)} | Now: {now_txt}")
-    lines.append(f"Email caps: session={int(user['max_emails_per_session'])} (0=∞), day={int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0=∞), gap={int(user['email_gap_min'])}m")
+    lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
+    lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
+    lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
+    lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
     lines.append(HDR)
 
     if not opens:
@@ -6575,12 +6549,19 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines.append("Open trades:")
     for t in opens:
-        lines.append(
-            f"- ID {t['id']} | {t['symbol']} {t['side']} | Entry {fmt_price(float(t['entry']))} | "
-            f"SL {fmt_price(float(t['sl']))} | Risk ${float(t['risk_usd']):.2f} | Qty {float(t['qty']):.6g}"
-        )
-    await update.message.reply_text("\n".join(lines))
+        try:
+            entry = float(t.get("entry") or 0.0)
+            sl = float(t.get("sl") or 0.0)
+            qty = float(t.get("qty") or 0.0)
+            risk = float(t.get("risk_usd") or 0.0)
+            lines.append(
+                f"- ID {t.get('id')} | {t.get('symbol')} {t.get('side')} | "
+                f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g}"
+            )
+        except Exception:
+            continue
 
+    await update.message.reply_text("\n".join(lines))
 async def cooldowns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -7873,41 +7854,41 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 spike_txt = "\n".join(lines)
 
             # Assemble body (cache THIS, header stays live)
-            blocks = [
-                "",
-                "*Top Trade Setups*",
-                SEP,
-                combined_setups_txt,
-            ]
+            def _is_empty(txt: str) -> bool:
+                t = (txt or '').strip()
+                if not t:
+                    return True
+                return t.startswith('_No ') or t.startswith('No ') or t.endswith('right now._')
 
-            if waiting_txt:
-                blocks.extend(["", waiting_txt])
+            blocks = []
 
-            if trend_txt:
-                blocks.extend(["", trend_txt])
+            # Top setups (always shown)
+            blocks.extend(['', '*Top Trade Setups*', SEP, combined_setups_txt])
 
-            if warning_txt:
-                blocks.extend(["", warning_txt])
+            if waiting_txt and (not _is_empty(waiting_txt)):
+                blocks.extend(['', waiting_txt])
 
-            blocks.extend([
-                "",
-                spike_txt if spike_txt else "*Spike Reversal Alerts (10M+ Vol)*\n" + SEP + "\n_No spike-reversal candidates right now._"
-            ])
+            if trend_txt and (not _is_empty(trend_txt)):
+                blocks.extend(['', trend_txt])
 
-            blocks.extend([
-                "",
-                "*Directional Leaders / Losers*",
-                SEP,
-                up_txt,
-                "",
-                dn_txt,
-                "",
-                "*Market Leaders*",
-                SEP,
-                leaders_txt,
-            ])
+            if warning_txt and (not _is_empty(warning_txt)):
+                blocks.extend(['', warning_txt])
 
-            body = "\n".join([b for b in blocks if b is not None]).strip()
+            # Spike reversal section — only show if we have candidates
+            if spike_txt and (not _is_empty(spike_txt)):
+                blocks.extend(['', spike_txt])
+
+            # Directional / Leaders sections — only show if they contain rows
+            if up_txt and (not _is_empty(up_txt)) and ('|' in up_txt):
+                blocks.extend(['', '*Directional Leaders / Losers*', SEP, up_txt])
+
+            if dn_txt and (not _is_empty(dn_txt)) and ('|' in dn_txt):
+                blocks.extend(['', dn_txt])
+
+            if leaders_txt and (not _is_empty(leaders_txt)) and ('|' in leaders_txt):
+                blocks.extend(['', '*Market Leaders*', SEP, leaders_txt])
+
+            body = '\n'.join([b for b in blocks if b is not None]).strip()
 
             # Cache for fast subsequent /screen calls
             _SCREEN_CACHE["ts"] = time.time()
@@ -8449,7 +8430,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     min_vol = 10_000_000.0
 
-                candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, max_items=12)
+                candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, min_vol_usd=min_vol, max_items=12)
 
                 # Debug counts from the SAME dataset used for bigmove (same field-name logic)
                 def _pick_pct(_mv, _keys) -> float:
@@ -8619,17 +8600,17 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 try:
-                    min_vol = float((uu or {}).get("early_warning_min_vol_usd", 15_000_000) or 15_000_000)
+                    min_vol = float((uu or {}).get("early_warning_min_vol_usd", 10_000_000) or 15_000_000)
                 except Exception:
                     min_vol = 15_000_000.0
 
                 try:
-                    atr_mult = float((uu or {}).get("early_warning_atr_mult", 1.15) or 1.15)
+                    atr_mult = float((uu or {}).get("early_warning_atr_mult", 0.95) or 1.15)
                 except Exception:
                     atr_mult = 1.15
 
                 try:
-                    body_ratio = float((uu or {}).get("early_warning_body_ratio", 0.60) or 0.60)
+                    body_ratio = float((uu or {}).get("early_warning_body_ratio", 0.50) or 0.60)
                 except Exception:
                     body_ratio = 0.60
 
@@ -8639,7 +8620,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     lookback = 8
 
                 try:
-                    retrace = float((uu or {}).get("early_warning_retrace_min", 0.30) or 0.30)
+                    retrace = float((uu or {}).get("early_warning_retrace_min", 0.20) or 0.30)
                 except Exception:
                     retrace = 0.30
 
@@ -8755,17 +8736,17 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 try:
-                    min_vol = float((uu or {}).get("early_warning_min_vol_usd", 15_000_000) or 15_000_000)
+                    min_vol = float((uu or {}).get("early_warning_min_vol_usd", 10_000_000) or 15_000_000)
                 except Exception:
                     min_vol = 15_000_000.0
 
                 try:
-                    atr_mult = float((uu or {}).get("early_warning_atr_mult", 1.15) or 1.15)
+                    atr_mult = float((uu or {}).get("early_warning_atr_mult", 0.95) or 1.15)
                 except Exception:
                     atr_mult = 1.15
 
                 try:
-                    body_ratio = float((uu or {}).get("early_warning_body_ratio", 0.60) or 0.60)
+                    body_ratio = float((uu or {}).get("early_warning_body_ratio", 0.50) or 0.60)
                 except Exception:
                     body_ratio = 0.60
 
@@ -8775,7 +8756,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     lookback = 8
 
                 try:
-                    retrace = float((uu or {}).get("early_warning_retrace_min", 0.30) or 0.30)
+                    retrace = float((uu or {}).get("early_warning_retrace_min", 0.20) or 0.30)
                 except Exception:
                     retrace = 0.30
 
@@ -10061,38 +10042,74 @@ def user_has_pro(uid):
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    u = get_user(uid)
-    _ensure_trial(u)
-    plan = (u or {}).get("plan","standard").upper()
-    lines = [
-        "📊 PulseFutures — Status",
-        "────────────────────",
-        f"Plan: {plan}",
-    ]
-    if (u or {}).get("plan") == "trial":
-        rem = int((float(u.get("trial_until",0)) - time.time())/86400)
-        lines.append(f"Trial remaining: {max(rem,0)} days")
-    lines += [
-        "",
-        "Enabled features:",
-        "• Market Scan (/screen)",
-        "• Risk & Position Sizing (/size)",
-        "• Journal & Performance",
-        "• Session Filters",
-        "• Strategy Mode",
-    ]
-    if user_has_pro(uid):
-        lines += [
-            "• 📧 Email Alerts",
-            "• ⚡ Big-Move Emails",
-            "• ⚠️ Early-Warning Emails",
-        ]
-    else:
-        lines += [
-            "• 📧 Email Alerts — Pro only",
-            "• ⚡ Big-Move Emails — Pro only",
-            "• ⚠️ Early-Warning Emails — Pro only",
-        ]
+    user = reset_daily_if_needed(get_user(uid))
+
+    if not has_active_access(user, uid):
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return
+
+    opens = db_open_trades(uid)
+
+    plan = str((user or {}).get("plan") or "free").upper()
+    equity = float((user or {}).get("equity") or 0.0)
+
+    cap = daily_cap_usd(user)
+    day_local = _user_day_local(user)
+    used_today = _risk_daily_get(uid, day_local)
+    remaining_today = (cap - used_today) if cap > 0 else float("inf")
+
+    enabled = user_enabled_sessions(user)
+    now_s = in_session_now(user)
+    now_txt = now_s["name"] if now_s else "NONE"
+
+    # Email caps (show infinite as 0=∞ to match UI)
+    cap_sess = int((user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION) or DEFAULT_MAX_EMAILS_PER_SESSION)
+    cap_day = int((user or {}).get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY) or DEFAULT_MAX_EMAILS_PER_DAY)
+    gap_m = int((user or {}).get("email_gap_min", DEFAULT_EMAIL_GAP_MIN) or DEFAULT_EMAIL_GAP_MIN)
+
+    # Big-move status
+    bm_on = int((user or {}).get("bigmove_alert_on", 1) or 0)
+    bm_4h = float((user or {}).get("bigmove_alert_4h", 20) or 20)
+    bm_1h = float((user or {}).get("bigmove_alert_1h", 10) or 10)
+
+    lines = []
+    lines.append("📌 Status")
+    lines.append(f"Plan: {plan}")
+    lines.append(f"Equity: ${equity:.2f}")
+    lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
+    lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
+    lines.append(f"Daily risk used: ${used_today:.2f}")
+    lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
+    lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
+    lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
+    lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
+    lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
+    lines.append(HDR)
+
+    if not opens:
+        lines.append("Open trades: None")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    lines.append("Open trades:")
+    for t in opens:
+        try:
+            entry = float(t.get("entry") or 0.0)
+            sl = float(t.get("sl") or 0.0)
+            qty = float(t.get("qty") or 0.0)
+            risk = float(t.get("risk_usd") or 0.0)
+            lines.append(
+                f"- ID {t.get('id')} | {t.get('symbol')} {t.get('side')} | "
+                f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g}"
+            )
+        except Exception:
+            continue
+
     await update.message.reply_text("\n".join(lines))
 
 if __name__ == "__main__":
