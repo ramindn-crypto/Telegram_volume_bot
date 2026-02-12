@@ -3443,7 +3443,8 @@ def make_setup(
     atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
     trig_min_raw = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
 
-    trig_min = max(0.10, float(trig_min_raw) * float(trigger_loosen_mult))
+    floor_min = 0.05 if aggressive_screen else 0.08
+    trig_min = max(float(floor_min), float(trig_min_raw) * float(trigger_loosen_mult))
 
     if abs(ch1) < trig_min:
         # Waiting for Trigger (near-miss) — store ONLY side + a color dot (no numbers)
@@ -3463,6 +3464,12 @@ def make_setup(
 
         # Balanced breakout override: even if 1H change is small, allow true breakouts
         breakout_override = False
+        # Trend override: if 4H regime move is meaningful, allow even if this 1H is quiet.
+        try:
+            if abs(float(ch4_used or 0.0)) >= max(0.90, float(trig_min) * 6.0) and float(fut_vol or 0.0) >= 5_000_000.0:
+                breakout_override = True
+        except Exception:
+            pass
         try:
             if c1 and len(c1) >= 25 and abs(ch24) >= 6.0:
                 highs_1h = [float(x[2]) for x in c1]
@@ -6565,7 +6572,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     opens = db_open_trades(uid)
 
-    plan = str((user or {}).get("plan") or "free").upper()
+    plan = str(effective_plan(user or {}, uid)).upper()
     equity = float((user or {}).get("equity") or 0.0)
 
     cap = daily_cap_usd(user)
@@ -10087,10 +10094,31 @@ def _ensure_trial(user):
     else:
         update_user(user["user_id"], plan="standard")
 
-def user_has_pro(uid):
+def user_has_pro(uid: int) -> bool:
+    # Admin is always Pro/Unlimited
+    try:
+        if is_admin_user(int(uid)):
+            return True
+    except Exception:
+        pass
+
     u = get_user(uid)
     if not u:
         return False
+
+    _ensure_trial(u)
+
+    # Use effective plan (covers legacy DBs + admin override)
+    try:
+        plan = str(effective_plan(u, int(uid))).strip().lower()
+    except Exception:
+        plan = str(u.get("plan") or "free").strip().lower()
+
+    if plan == "pro":
+        return True
+    if plan == "trial" and time.time() <= float(u.get("trial_until", 0) or 0):
+        return True
+    return False
     _ensure_trial(u)
     if u.get("plan") == "pro":
         return True
