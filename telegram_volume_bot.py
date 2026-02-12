@@ -940,24 +940,58 @@ _REJECT_CTX = contextvars.ContextVar("pf_reject_ctx", default=None)
 _LAST_REJECTS = {}  # uid -> {"ts": float, "counts": { "A:no_trigger": 12, ... }}
 
 def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
-    """Record reject reasons for diagnostics. base is an engine tag (A/B/C/etc)."""
+    """Record reject reasons for diagnostics.
+
+    NOTE:
+    - We record symbol-scoped reasons as "<BASE>:<REASON>" (BASE is usually the symbol base).
+    - If the current scan sets ctx["__allow__"] (a set of allowed bases),
+      we only record reasons for those bases to keep /why focused.
+    """
     ctx = _REJECT_CTX.get()
-    if isinstance(ctx, dict):
-        key = f"{str(base)}:{str(reason)}"
-        ctx[key] = int(ctx.get(key, 0)) + 1
+    if not isinstance(ctx, dict):
+        return
+
+    allow = ctx.get("__allow__")
+    try:
+        if allow is not None and base is not None:
+            b = str(base).upper()
+            # Only keep symbol-scoped rejections for the current scan universe.
+            if b not in set(allow):
+                return
+    except Exception:
+        pass
+
+    key = f"{str(base)}:{str(reason)}"
+    ctx[key] = int(ctx.get(key, 0)) + 1
     return
+
 
 def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
     rec = _LAST_REJECTS.get(int(uid)) or {}
     counts = rec.get("counts") or {}
+    allow = rec.get("allow") or None
+
     if not counts:
         return "No reject stats recorded yet. Run /screen once."
+
+    # Filter to the scan universe (leaders/losers/market leaders) if available.
+    if allow:
+        allow_set = set([str(x).upper() for x in (allow or [])])
+        filtered = {}
+        for k, v in counts.items():
+            # keys are "<BASE>:<REASON>"
+            base = str(k).split(":", 1)[0].upper().strip()
+            if base in allow_set:
+                filtered[k] = v
+        counts = filtered or counts
+
     items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:int(top_n)]
     lines = []
     lines.append("🧩 Last Scan Reject Reasons (top)")
     for k, v in items:
         lines.append(f"• {k} = {v}")
     return "\n".join(lines)
+
 
 
 # =========================================================
@@ -7222,6 +7256,91 @@ def _email_priority_bases(best_fut: dict, directional_take: int = 12) -> set:
         return set()
 
 
+
+def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, market_bases: list, session_name: str, max_items: int = 4) -> list:
+    """Last-resort generator to avoid empty Top Trade Setups.
+
+    Creates simple ATR-based setups for the most active symbols in the
+    directional leaders/losers + market leaders universe.
+    """
+    bases = []
+    for b in (leaders or [])[:2]:
+        bases.append((str(b).upper(), "BUY"))
+    for b in (losers or [])[:2]:
+        bases.append((str(b).upper(), "SELL"))
+    for b in (market_bases or [])[:2]:
+        bb = str(b).upper()
+        if all(bb != x[0] for x in bases):
+            # Decide side by 4H sign if available later; default BUY
+            bases.append((bb, "BUY"))
+
+    setups = []
+    for base, side in bases:
+        mv = (best_fut or {}).get(base)
+        if not mv:
+            continue
+        market_symbol = str(getattr(mv, "symbol", base))
+        entry = float(getattr(mv, "last", 0.0) or 0.0)
+        if entry <= 0:
+            continue
+
+        try:
+            c1 = fetch_ohlcv(market_symbol, "1h", limit=max(ATR_PERIOD + 10, 80))
+            atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD) if c1 else 0.0
+        except Exception:
+            atr_1h = 0.0
+
+        if atr_1h <= 0:
+            # small default: 1% of price
+            atr_1h = max(entry * 0.01, 0.0000001)
+
+        sl_dist = 1.4 * atr_1h
+        tp_dist = 2.2 * atr_1h
+
+        if side == "BUY":
+            sl = max(entry - sl_dist, entry * 0.001)
+            tp3 = entry + tp_dist
+            tp1 = entry + tp_dist * 0.6
+            tp2 = entry + tp_dist * 0.85
+        else:
+            sl = entry + sl_dist
+            tp3 = max(entry - tp_dist, entry * 0.001)
+            tp1 = max(entry - tp_dist * 0.6, entry * 0.001)
+            tp2 = max(entry - tp_dist * 0.85, entry * 0.001)
+
+        fut_vol = _fut_vol_usd_from_best(best_fut, base)
+
+        setups.append(Setup(
+            setup_id=_new_setup_id(),
+            symbol=base,
+            market_symbol=market_symbol,
+            side=side,
+            conf=70,
+            entry=entry,
+            sl=sl,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            fut_vol_usd=float(fut_vol or 0.0),
+            ch24=float(getattr(mv, "percentage", 0.0) or 0.0),
+            ch4=0.0,
+            ch1=0.0,
+            ch15=0.0,
+            ema_support_period=0,
+            ema_support_dist_pct=0.0,
+            pullback_ema_period=0,
+            pullback_ema_dist_pct=0.0,
+            pullback_ready=True,
+            pullback_bypass_hot=True,
+            engine="F",
+            is_trailing_tp3=False,
+            created_ts=time.time(),
+        ))
+
+        if len(setups) >= int(max_items):
+            break
+    return setups
+
 async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
     """
     mode: "screen" or "email"
@@ -7306,6 +7425,12 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Directional Leaders + Directional Losers + Market Leaders
     universe_bases = list(dict.fromkeys([b.upper() for b in (leaders + losers + (market_bases or []))]))
     universe_best = _subset_best(best_fut, universe_bases) if universe_bases else best_fut
+
+    # Diagnostics: keep /why focused on this scan universe
+    try:
+        _rej_ctx["__allow__"] = set([str(x).upper() for x in (universe_bases or [])])
+    except Exception:
+        pass
 
     priority_setups = []
 
@@ -7479,6 +7604,13 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             ordered.append(best[k])
             seen.add(k)
 
+
+    # If still empty, create a small fallback set so /screen isn't blank.
+    if not ordered and mode == "screen":
+        try:
+            ordered = _fallback_setups_from_universe(best_fut, leaders, losers, market_bases, session_name, max_items=max(4, n_target))
+        except Exception:
+            pass
     # -----------------------------------------------------
     # NEW: Spike Reversal candidates (15M+ Vol) — for /screen only
     # -----------------------------------------------------
@@ -7519,7 +7651,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Store diagnostics for /why
     try:
         if uid is not None:
-            _LAST_REJECTS[int(uid)] = {"ts": time.time(), "counts": dict(_rej_ctx)}
+            _LAST_REJECTS[int(uid)] = {"ts": time.time(), "counts": {k:v for k,v in dict(_rej_ctx).items() if k != '__allow__'}, "allow": list(_rej_ctx.get('__allow__') or [])}
     finally:
         try:
             _REJECT_CTX.reset(_rej_token)
