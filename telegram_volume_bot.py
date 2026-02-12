@@ -7357,6 +7357,12 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     _rej_ctx = {}
     _rej_token = _REJECT_CTX.set(_rej_ctx)
 
+    # Reset near-miss list for this scan (so /screen doesn't show stale symbols)
+    try:
+        _WAITING_TRIGGER.clear()
+    except Exception:
+        pass
+
 
     # knobs
     if mode == "screen":
@@ -7415,16 +7421,19 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
     # 1) Directional leaders / losers (priority #1)
     up_list, dn_list = compute_directional_lists(best_fut)
-    leaders = _bases_from_directional(up_list, directional_take)
-    losers  = _bases_from_directional(dn_list, directional_take)
+    # IMPORTANT: Setup universe must match the *tables shown* in /screen.
+    # We therefore use the top N rows shown in Directional Leaders/Losers tables (default 10),
+    # not the full filtered universe.
+    directional_table_n = 10
+    leaders = [str(t[0]).upper() for t in (up_list or [])[:directional_table_n]]
+    losers  = [str(t[0]).upper() for t in (dn_list or [])[:directional_table_n]]
 
     # Market Leaders (Top by Futures Volume)
     market_bases = _market_leader_bases(best_fut, market_take)
 
-    # ✅ USER REQUEST: Restrict setup generation universe ONLY to:
-    # Directional Leaders + Directional Losers + Market Leaders
-    universe_bases = list(dict.fromkeys([b.upper() for b in (leaders + losers + (market_bases or []))]))
-    universe_best = _subset_best(best_fut, universe_bases) if universe_bases else best_fut
+    # ✅ USER REQUEST: Setups MUST use ONLY Directional Leaders + Directional Losers (the tables above).
+    universe_bases = list(dict.fromkeys([b.upper() for b in (leaders + losers)]))
+    universe_best = _subset_best(best_fut, universe_bases) if universe_bases else {}
 
     # Diagnostics: keep /why focused on this scan universe
     try:
