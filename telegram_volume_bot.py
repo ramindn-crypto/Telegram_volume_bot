@@ -263,7 +263,7 @@ ENGINE_B_MOMENTUM_ENABLED = True     # pump / expansion
 # ✅ 1H MOMENTUM INTENSITY (SESSION-DYNAMIC)
 # =========================================================
 # Base floor (still used), but we now scale it per session:
-TRIGGER_1H_ABS_MIN_BASE = 0.35        # global floor
+TRIGGER_1H_ABS_MIN_BASE = 0.15        # global floor
 CONFIRM_15M_ABS_MIN = 0.45
 ALIGN_4H_MIN = 0.0
 
@@ -321,6 +321,9 @@ DEFAULT_DAILY_CAP_MODE = "PCT"
 DEFAULT_DAILY_CAP_VALUE = 5.0
 DEFAULT_MAX_TRADES_DAY = 5
 DEFAULT_MIN_EMAIL_GAP_MIN = 60
+
+# Backward-compat alias
+DEFAULT_EMAIL_GAP_MIN = DEFAULT_MIN_EMAIL_GAP_MIN
 DEFAULT_MAX_EMAILS_PER_SESSION = 4
 DEFAULT_MAX_EMAILS_PER_DAY = 4
 
@@ -527,7 +530,7 @@ def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
     mult_atr = float(knobs["trigger_atr_mult"])
 
     # ATR-adaptive component: scaled by session knob, gently clamped
-    dyn = clamp(float(atr_pct) * float(mult_atr), 0.25, 3.5)
+    dyn = clamp(float(atr_pct) * float(mult_atr), 0.10, 3.5)
 
     sess = knobs["name"]
     base_mult = float(SESSION_1H_BASE_MULT.get(sess, 1.0))
@@ -859,7 +862,33 @@ _WAITING_TRIGGER: Dict[str, Dict[str, Any]] = {}
 
 
 def is_admin_user(user_id: int) -> bool:
-    return int(user_id) in ADMIN_USER_IDS if ADMIN_USER_IDS else False
+    """Admin check (supports list + single-id env fallbacks)."""
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+
+    for k in ("ADMIN_TELEGRAM_ID", "OWNER_USER_ID", "ADMIN_ID"):
+        v = os.environ.get(k)
+        if v:
+            try:
+                if uid == int(str(v).strip()):
+                    return True
+            except Exception:
+                pass
+
+    return (uid in ADMIN_USER_IDS) if ADMIN_USER_IDS else False
+
+
+def effective_plan(user_id: int, user: Optional[dict]) -> str:
+    """Effective plan, forcing admin to PRO."""
+    if is_admin_user(user_id):
+        return "pro"
+    return str((user or {}).get("plan") or "free").strip().lower()
+
+
+def is_unlimited_admin(user_id: int) -> bool:
+    return is_admin_user(user_id)
 
 # =========================================================
 # GLOBAL STATE
@@ -1507,9 +1536,13 @@ def has_active_access(user: dict) -> bool:
 
 
 def enforce_access_or_block(update: Update, command: str) -> bool:
-    user = get_user(update.effective_user.id)
+    uid = update.effective_user.id
+    if is_admin_user(uid):
+        return True
 
-    if has_active_access(user):
+    user = get_user(uid)
+
+    if has_active_access(user, uid):
         return True
 
     if command in ALLOWED_WHEN_LOCKED:
@@ -1638,12 +1671,30 @@ def reset_daily_if_needed(user: dict) -> dict:
     return user
 
 def list_users_notify_on() -> List[dict]:
+    """Users who should receive scan emails. Admins are always included."""
     con = db_connect()
     cur = con.cursor()
     cur.execute("SELECT * FROM users WHERE notify_on=1")
-    rows = cur.fetchall()
+    rows = [dict(r) for r in cur.fetchall()]
+
+    # Add admins with an email address saved, even if notify_on=0
+    try:
+        if ADMIN_USER_IDS:
+            placeholders = ",".join(["?"] * len(ADMIN_USER_IDS))
+            cur.execute(
+                f"SELECT * FROM users WHERE user_id IN ({placeholders}) AND ( (email IS NOT NULL AND TRIM(email)!='') OR (email_to IS NOT NULL AND TRIM(email_to)!='') )",
+                [int(x) for x in ADMIN_USER_IDS],
+            )
+            for r in cur.fetchall():
+                d = dict(r)
+                if not any(int(x.get("user_id") or 0) == int(d.get("user_id") or 0) for x in rows):
+                    rows.append(d)
+    except Exception:
+        pass
+
     con.close()
-    return [dict(r) for r in rows]
+    return rows
+
 
 def list_users_with_email() -> List[dict]:
     """
@@ -3392,7 +3443,7 @@ def make_setup(
     atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
     trig_min_raw = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
 
-    trig_min = max(0.25, float(trig_min_raw) * float(trigger_loosen_mult))
+    trig_min = max(0.10, float(trig_min_raw) * float(trigger_loosen_mult))
 
     if abs(ch1) < trig_min:
         # Waiting for Trigger (near-miss) — store ONLY side + a color dot (no numbers)
@@ -3909,10 +3960,18 @@ def pick_breakout_setups(
 
 
 def user_email_alerts_enabled(user: dict) -> bool:
+    # Admin always receives emails
+    try:
+        uid = int((user or {}).get("user_id") or 0)
+        if uid and is_admin_user(uid):
+            return True
+    except Exception:
+        pass
     try:
         return int((user or {}).get("email_alerts_enabled", 1)) == 1
     except Exception:
         return True
+
 
 def set_user_email_alerts_enabled(uid: int, enabled: bool):
     update_user(int(uid), email_alerts_enabled=(1 if enabled else 0))
@@ -8136,14 +8195,14 @@ async def myplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = get_user(user_id)  # however you fetch user data
 
-    plan = user.get("plan") or "free"
-    expires = user.get("plan_expires")
+    plan = effective_plan(user_id, user)
+    expires = (user or {}).get("plan_expires")
 
     msg = f"""\
 📦 Your Plan
 
 • Plan: {plan.upper()}
-• Status: {'Active' if plan != 'free' else 'Free user'}
+• Status: {'Admin (Unlimited)' if is_admin_user(user_id) else ('Active' if plan != 'free' else 'Free user')}
 """
 
     if expires:
@@ -9493,22 +9552,21 @@ def _set_user_access(user_id: int, plan: str, source: str, ref: str):
     )
 
 
-def has_active_access(user: dict, uid: int) -> bool:
-    if is_admin_user(uid):
+def has_active_access(user: dict, uid: Optional[int] = None) -> bool:
+    # Admin is always unlimited
+    if uid is not None and is_admin_user(int(uid)):
         return True
 
     if not user:
-        return False
+        return True  # missing row => FREE
 
     now = time.time()
+    plan = str(user.get("plan") or "free").strip().lower()
 
-    if user.get("plan") == "trial" and now <= float(user.get("trial_until", 0)):
-        return True
+    if plan == "trial":
+        return now <= float(user.get("trial_until", 0) or 0)
 
-    if user.get("plan") in ("standard", "pro"):
-        return True
-
-    return False
+    return plan in ("free", "standard", "pro")
 
 
 def _usdt_payment_row_by_txid(txid: str):
