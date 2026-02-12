@@ -1554,11 +1554,18 @@ def set_user_email(uid: int, email: str) -> None:
         )
         con.commit()
 
-def ensure_email_column()
+def ensure_email_column():
+    """Backward-compatible email + access columns migration.
+
+    Also ensures billing/access columns exist (plan/trial/etc), because many commands
+    (e.g. /status, /screen gating) depend on them.
+    """
+    # Ensure billing/access columns exist first
     ensure_billing_columns()
-:
+
     with sqlite3.connect(DB_PATH) as con:
         cur = con.cursor()
+
         # email address
         try:
             cur.execute("ALTER TABLE users ADD COLUMN email_to TEXT")
@@ -1567,14 +1574,41 @@ def ensure_email_column()
         except sqlite3.OperationalError:
             pass
 
-        # per-user master toggle for ALL email alerts (signals/bigmove/early-warning)
+        # per-user email preferences
         try:
-            cur.execute("ALTER TABLE users ADD COLUMN email_alerts_enabled INTEGER DEFAULT 1")
+            cur.execute("ALTER TABLE users ADD COLUMN email_enabled INTEGER DEFAULT 1")
             con.commit()
-            logger.info("Added email_alerts_enabled column to users table")
+            logger.info("Added email_enabled column to users table")
         except sqlite3.OperationalError:
             pass
 
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN notify_on INTEGER DEFAULT 1")
+            con.commit()
+            logger.info("Added notify_on column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert INTEGER DEFAULT 1")
+            con.commit()
+            logger.info("Added bigmove_alert column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN bigmove_min_usd REAL DEFAULT 5000000")
+            con.commit()
+            logger.info("Added bigmove_min_usd column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN sessions_unlimited INTEGER DEFAULT 0")
+            con.commit()
+            logger.info("Added sessions_unlimited column to users table")
+        except sqlite3.OperationalError:
+            pass
 
 def ensure_billing_columns():
     """Ensure billing / plan / trial columns exist on users table (backward compatible migrations)."""
