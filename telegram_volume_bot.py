@@ -1,3 +1,4 @@
+_LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
 #!/usr/bin/env python3
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
@@ -3564,12 +3565,15 @@ def make_setup(
                 elif ratio >= 0.82:
                     dot = "🟡"
                 else:
-                    dot = "🔴"
+                    dot = "🟠"
 
                 side_guess = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.25 else ("BUY" if ch1 > 0 else "SELL")
                 _WAITING_TRIGGER[str(base)] = {"side": side_guess, "dot": dot}
 
         # Balanced breakout override: even if 1H change is small, allow true breakouts
+        # Additional overrides: allow setups during quiet 1H candles if 4H/24H move is strong and 15m confirms.
+        override_4h = (abs(float(ch4_used or 0.0)) >= max(2.0, float(trig_min) * 2.5)) and (abs(float(ch15 or 0.0)) >= 0.25)
+        override_24h = (abs(float(ch24 or 0.0)) >= 18.0) and (abs(float(ch15 or 0.0)) >= 0.20)
         breakout_override = False
         # Trend override: if 4H regime move is meaningful, allow even if this 1H is quiet.
         try:
@@ -3599,8 +3603,8 @@ def make_setup(
         except Exception:
             breakout_override = False
 
-        if not breakout_override:
-            _rej("ch1_below_trigger", base, mv)
+        if not (breakout_override or override_4h or override_24h):
+            _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% trig={trig_min:.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}% ch15={ch15:+.2f}%")
             return None
 
 
@@ -7504,13 +7508,18 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Market Leaders (Top by Futures Volume)
     market_bases = _market_leader_bases(best_fut, market_take)
 
-    # ✅ USER REQUEST: Setups MUST use ONLY Directional Leaders + Directional Losers (the tables above).
-    universe_bases = list(dict.fromkeys([b.upper() for b in (leaders + losers)]))
+    # ✅ Setup universe: ONLY what /screen shows — Directional Leaders + Directional Losers + Market Leaders.
+    universe_bases = list(dict.fromkeys([b.upper() for b in (leaders + losers + (market_bases or []))]))
     universe_best = _subset_best(best_fut, universe_bases) if universe_bases else {}
 
     # Diagnostics: keep /why focused on this scan universe
     try:
         _rej_ctx["__allow__"] = set([str(x).upper() for x in (universe_bases or [])])
+        try:
+            global _LAST_SCAN_UNIVERSE
+            _LAST_SCAN_UNIVERSE = list(universe_bases or [])
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -7626,7 +7635,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     waiting_items = []
     try:
         if _WAITING_TRIGGER:
-            waiting_items = list(_WAITING_TRIGGER.items())[:SCREEN_WAITING_N]
+            waiting_items = [(b, o) for (b, o) in list(_WAITING_TRIGGER.items()) if (not _LAST_SCAN_UNIVERSE) or (str(b).upper() in set([str(x).upper() for x in (_LAST_SCAN_UNIVERSE or [])]))][:SCREEN_WAITING_N]
     except Exception:
         waiting_items = []
 
@@ -7960,17 +7969,17 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             setups = (pool.get("setups") or [])[:SETUPS_N]
 
-# Safety: if engine produced no setups, generate fallback ATR-based setups
-# from the same universe shown in the Directional Leaders/Losers tables.
-if not setups:
-    try:
-        up_list, dn_list = compute_directional_lists(best_fut)
-        leaders_bases = [str(t[0]).upper() for t in (up_list or [])[:10]]
-        losers_bases  = [str(t[0]).upper() for t in (dn_list or [])[:10]]
-        market_bases  = _market_leader_bases(best_fut)[:10]
-        setups = _fallback_setups_from_universe(best_fut, leaders_bases, losers_bases, market_bases, session, max_items=max(4, int(SETUPS_N or 4)))[:SETUPS_N]
-    except Exception:
-        pass
+            # Safety: if engine produced no setups, generate fallback ATR-based setups
+            # from the same universe shown in the Directional Leaders/Losers tables.
+            if not setups:
+                try:
+                    up_list, dn_list = compute_directional_lists(best_fut)
+                    leaders_bases = [str(t[0]).upper() for t in (up_list or [])[:10]]
+                    losers_bases  = [str(t[0]).upper() for t in (dn_list or [])[:10]]
+                    market_bases  = _market_leader_bases(best_fut)[:10]
+                    setups = _fallback_setups_from_universe(best_fut, leaders_bases, losers_bases, market_bases, session, max_items=max(4, int(SETUPS_N or 4)))[:SETUPS_N]
+                except Exception:
+                    pass
 
 
             for s in setups:
@@ -8015,31 +8024,6 @@ if not setups:
 
                 setups_txt = "\n\n".join(pull_cards) if pull_cards else "_No pullback setups right now._"
                 momentum_txt = "\n\n".join(mom_cards) if mom_cards else "_No breakout setups right now._"
-
-# Clean Top Trade Setups (always)
-lines2 = []
-for s in setups[:SETUPS_N]:
-    try:
-        sym = str(getattr(s, "symbol", "") or "").strip()
-        side = str(getattr(s, "side", "") or "").strip().upper()
-        conf = int(getattr(s, "conf", 0) or 0)
-        entry = float(getattr(s, "entry", 0.0) or 0.0)
-        sl = float(getattr(s, "sl", 0.0) or 0.0)
-        tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
-        sid = str(getattr(s, "setup_id", "") or "").strip()
-
-        emoji = "🟢" if side == "BUY" else "🔴"
-        longshort = "long" if side == "BUY" else "short"
-        size_cmd = f"/size {sym} {longshort} entry {fmt_price(entry)} sl {fmt_price(sl)}"
-
-        lines2.append(
-            f"• `{sid}` — *{sym}* {emoji} `{side}` | Conf `{conf}`\\n"
-            f"  Entry `{fmt_price(entry)}` | SL `{fmt_price(sl)}` | TP `{fmt_price(tp3)}`\\n"
-            f"  `{size_cmd}`"
-        )
-    except Exception:
-        continue
-combined_setups_txt = "\\n".join(lines2) if lines2 else "_No high-quality setups right now._"
 
             else:
                 setups_txt = "_No high-quality setups right now._"
