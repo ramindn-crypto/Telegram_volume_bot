@@ -958,8 +958,11 @@ def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
 
     allow = ctx.get("__allow__")
     try:
-        if allow is not None and b not in set(allow):
-            return
+        # If allow-list is present but empty, treat it as disabled (avoid silencing /why)
+        if allow is not None:
+            _allow_set = set(allow)
+            if len(_allow_set) > 0 and b not in _allow_set:
+                return
     except Exception:
         pass
 
@@ -4041,6 +4044,17 @@ def pick_setups(
         )
         if s:
             setups.append(s)
+        else:
+            # If make_setup returns None without recording a reject, add a generic reject
+            # so /why is never empty and tuning is possible.
+            try:
+                ctx = _REJECT_CTX.get()
+                b = str(base or "").upper().strip()
+                per = (ctx or {}).get("__per__") if isinstance(ctx, dict) else None
+                if b and isinstance(ctx, dict) and (not isinstance(per, dict) or b not in per):
+                    _rej("no_setup_candidate", base, mv, "make_setup_returned_none")
+            except Exception:
+                pass
 
     setups.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
     return setups[:n]
