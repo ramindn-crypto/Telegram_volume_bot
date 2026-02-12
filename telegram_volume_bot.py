@@ -7299,6 +7299,14 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     leaders = _bases_from_directional(up_list, directional_take)
     losers  = _bases_from_directional(dn_list, directional_take)
 
+    # Market Leaders (Top by Futures Volume)
+    market_bases = _market_leader_bases(best_fut, market_take)
+
+    # ✅ USER REQUEST: Restrict setup generation universe ONLY to:
+    # Directional Leaders + Directional Losers + Market Leaders
+    universe_bases = list(dict.fromkeys([b.upper() for b in (leaders + losers + (market_bases or []))]))
+    universe_best = _subset_best(best_fut, universe_bases) if universe_bases else best_fut
+
     priority_setups = []
 
     if leaders:
@@ -7417,7 +7425,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
     # 4) Market leaders fallback (priority #4)
     if len(priority_setups) < (n_target * 2):
-        market_bases = _market_leader_bases(best_fut, market_take)
         if market_bases:
             sub = _subset_best(best_fut, market_bases)
             try:
@@ -7444,7 +7451,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         mom_n = max(6, int(n_target) * 2)
         mom = await asyncio.to_thread(
             pick_breakout_setups,
-            best_fut,
+            universe_best,  # ✅ restricted universe
             mom_n,
             session_name,
             int(universe_cap),
@@ -7480,8 +7487,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         try:
             spike_candidates = await asyncio.to_thread(
                 _spike_reversal_candidates,
-                best_fut,
-                15_000_000.0,  # min_vol_usd
+                universe_best,
+                10_000_000.0,  # min_vol_usd
                 0.55,          # wick_ratio_min
                 1.20,          # atr_mult_min
                 6,             # max_items
@@ -7497,8 +7504,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         try:
             spike_warnings = await asyncio.to_thread(
                 _spike_reversal_warnings,
-                best_fut,
-                15_000_000.0,  # min_vol_usd
+                universe_best,
+                10_000_000.0,  # min_vol_usd
                 1.15,          # atr_mult_min
                 0.60,          # body_ratio_min
                 8,             # lookback_1h
