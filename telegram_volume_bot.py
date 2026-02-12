@@ -265,12 +265,13 @@ ENGINE_B_MOMENTUM_ENABLED = True     # pump / expansion
 # =========================================================
 # Base floor (still used), but we now scale it per session:
 TRIGGER_1H_ABS_MIN_BASE = 0.15        # global floor
-CONFIRM_15M_ABS_MIN = 0.45
+CONFIRM_15M_ABS_MIN = 0.25
 ALIGN_4H_MIN = 0.0
+ALIGN_4H_NEUTRAL_ZONE = 0.35  # if |4H| < this, treat regime as neutral (avoid blocking leaders)
 
 # "EARLY" filler (email only)
-EARLY_1H_ABS_MIN = 2.8
-EARLY_CONF_PENALTY = 6
+EARLY_1H_ABS_MIN = 1.8
+EARLY_CONF_PENALTY = 4
 EARLY_EMAIL_EXTRA_CONF = 4
 EARLY_EMAIL_MAX_FILL = 1
 
@@ -300,12 +301,12 @@ SESSION_1H_BASE_MULT = {
 # =========================================================
 # ✅ ENGINE B (MOMENTUM / EXPANSION) SETTINGS (for pumps)
 # =========================================================
-MOMENTUM_MIN_CH1 = 1.8               # pump gate for 1H (easier than before)
-MOMENTUM_MIN_24H = 10.0              # must be moving
+MOMENTUM_MIN_CH1 = 1.3               # pump gate for 1H (easier than before)
+MOMENTUM_MIN_24H = 8.0              # must be moving
 MOMENTUM_VOL_MULT = 1.2              # volume spike vs mover min
 MOMENTUM_ATR_BODY_MULT = 0.95        # expansion vs ATR% (easier)
 # ✅ MUCH STRICTER: avoid pump / mid-wave momentum entries
-MOMENTUM_MAX_ADAPTIVE_EMA_DIST = 1.8   # percent, was 7.5
+MOMENTUM_MAX_ADAPTIVE_EMA_DIST = 3.5   # percent, was 7.5
 
 
 # Higher TP behavior for Engine B (pumps)
@@ -3609,18 +3610,20 @@ def make_setup(
 
 
     # ✅ IMPORTANT: this must be OUTSIDE the if block (no extra indent)
-    side = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.25 else ("BUY" if ch1 > 0 else "SELL")  # trend-side gating: prefer 4H regime over 1H noise
+    side = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.40 else ("BUY" if ch1 > 0 else "SELL")  # trend-side gating: prefer 4H regime over 1H noise
 
     # 4H alignment
-    if side == "BUY" and ch4 < ALIGN_4H_MIN:
-        _rej("4h_not_aligned_for_long", base, mv, f"side=BUY ch4={ch4:+.2f}%")
-        return None
-    if side == "SELL" and ch4 > -ALIGN_4H_MIN:
-        _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4:+.2f}%")
-        return None
+    # If 4H is basically flat, don't block (leaders often show ch4 ~ 0 while 24H is huge).
+    if abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
+        if side == "BUY" and ch4 < ALIGN_4H_MIN:
+            _rej("4h_not_aligned_for_long", base, mv, f"side=BUY ch4={ch4:+.2f}%")
+            return None
+        if side == "SELL" and ch4 > -ALIGN_4H_MIN:
+            _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4:+.2f}%")
+            return None
 
     # ✅ HARD regime gate: don't fight the 4H direction (unless "strong reversal exception")
-    if TF_ALIGN_ENABLED:
+    if TF_ALIGN_ENABLED and abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
         if side == "BUY" and ch4 < 0:
             if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
                 _rej("4h_bear_regime_blocks_long", base, mv, f"ch4={ch4:+.2f}%")
@@ -3682,7 +3685,7 @@ def make_setup(
         mom_min_ch1 = float(MOMENTUM_MIN_CH1) * (0.75 if aggressive_screen else 1.0)
         mom_min_24h = float(MOMENTUM_MIN_24H) * (0.75 if aggressive_screen else 1.0)
         mom_body_mult = float(MOMENTUM_ATR_BODY_MULT) * (0.85 if aggressive_screen else 1.0)
-        mom_max_ema_dist = float(MOMENTUM_MAX_ADAPTIVE_EMA_DIST) * (1.30 if aggressive_screen else 1.0)
+        mom_max_ema_dist = float(MOMENTUM_MAX_ADAPTIVE_EMA_DIST) * ((1.60 if (not strict_15m) else 1.0)) * (1.30 if aggressive_screen else 1.0)
 
         # ------------------------------------------------------------------
         # B1) Momentum continuation (existing)
@@ -3701,7 +3704,7 @@ def make_setup(
         # Uses the already-fetched 1H candles (c1) to avoid extra API calls / rate limits.
         # ------------------------------------------------------------------
         try:
-            ch24_thr = 4.0 if aggressive_screen else 6.0
+            ch24_thr = 4.0 if aggressive_screen else 5.0
             vol_mult = 1.05 if aggressive_screen else 1.08
 
             # Use 4H/side gating already computed as the trend regime.
@@ -3886,7 +3889,7 @@ def make_breakout_setup(
     ch24 = float(mv.percentage or 0.0)
 
     ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
-    if not c1 or len(c1) < 30 or atr_1h <= 0:
+    if not c1 or len(c1) < 25 or atr_1h <= 0:
         _rej("no_candles_breakout", base, mv)
         return None
 
