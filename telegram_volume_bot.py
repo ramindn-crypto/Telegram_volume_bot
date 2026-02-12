@@ -1098,6 +1098,45 @@ def db_init():
     cur = con.cursor()
 
     # =========================================================
+    # ✅ Users table (core) — created if missing (fresh installs)
+    # =========================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        tz TEXT DEFAULT 'Australia/Melbourne',
+        scan_profile TEXT DEFAULT 'default',
+        equity REAL DEFAULT 1000.0,
+        risk_mode TEXT DEFAULT 'percent',
+        risk_value REAL DEFAULT 1.0,
+        daily_cap_mode TEXT DEFAULT 'percent',
+        daily_cap_value REAL DEFAULT 3.0,
+        max_trades_day INTEGER DEFAULT 3,
+        notify_on INTEGER DEFAULT 0,
+
+        sessions_enabled TEXT DEFAULT '',
+        max_emails_per_session INTEGER DEFAULT 1,
+        email_gap_min INTEGER DEFAULT 30,
+        max_emails_per_day INTEGER DEFAULT 5,
+
+        day_trade_date TEXT DEFAULT '',
+        day_trade_count INTEGER DEFAULT 0,
+
+        -- Email columns
+        email_to TEXT,
+        email_alerts_enabled INTEGER DEFAULT 1,
+
+        -- Billing / access columns (backward compatible)
+        plan TEXT DEFAULT 'free',
+        trial_start_ts REAL DEFAULT 0,
+        trial_until REAL DEFAULT 0,
+        plan_expires REAL DEFAULT 0,
+        access_source TEXT,
+        access_ref TEXT,
+        access_updated_ts REAL DEFAULT 0
+    )
+    """)
+
+    # =========================================================
     # ✅ Cooldown table (v2): direction-aware + optional session stamp
     # - old: PRIMARY KEY(user_id, symbol)
     # - new: PRIMARY KEY(user_id, symbol, side)
@@ -1515,7 +1554,9 @@ def set_user_email(uid: int, email: str) -> None:
         )
         con.commit()
 
-def ensure_email_column():
+def ensure_email_column()
+    ensure_billing_columns()
+:
     with sqlite3.connect(DB_PATH) as con:
         cur = con.cursor()
         # email address
