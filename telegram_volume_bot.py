@@ -3552,7 +3552,7 @@ def make_setup(
     atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
     trig_min_raw = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
 
-    floor_min = 0.05 if aggressive_screen else 0.08
+    floor_min = 0.03 if aggressive_screen else 0.06  # loosened: allow setups in quiet 1H candles
     trig_min = max(float(floor_min), float(trig_min_raw) * float(trigger_loosen_mult))
 
     if abs(ch1) < trig_min:
@@ -3573,12 +3573,14 @@ def make_setup(
 
         # Balanced breakout override: even if 1H change is small, allow true breakouts
         # Additional overrides: allow setups during quiet 1H candles if 4H/24H move is strong and 15m confirms.
-        override_4h = (abs(float(ch4_used or 0.0)) >= max(2.0, float(trig_min) * 2.5)) and (abs(float(ch15 or 0.0)) >= 0.25)
-        override_24h = (abs(float(ch24 or 0.0)) >= 18.0) and (abs(float(ch15 or 0.0)) >= 0.20)
+        override_4h = (abs(float(ch4_used or 0.0)) >= max(1.2, float(trig_min) * 2.0)) and (abs(float(ch15 or 0.0)) >= 0.15)
+        override_24h = (abs(float(ch24 or 0.0)) >= 12.0) and (abs(float(ch15 or 0.0)) >= 0.12)
+        # Extra override: if 24H is very strong AND 4H aligns, don't require 15m confirmation (quiet consolidation after a big move)
+        override_24h_strong = (abs(float(ch24 or 0.0)) >= 22.0) and (abs(float(ch4_used or 0.0)) >= 0.75) and (float(fut_vol or 0.0) >= 8_000_000.0)
         breakout_override = False
         # Trend override: if 4H regime move is meaningful, allow even if this 1H is quiet.
         try:
-            if abs(float(ch4_used or 0.0)) >= max(0.90, float(trig_min) * 6.0) and float(fut_vol or 0.0) >= 5_000_000.0:
+            if abs(float(ch4_used or 0.0)) >= max(0.90, float(trig_min) * 4.0) and float(fut_vol or 0.0) >= 5_000_000.0:
                 breakout_override = True
         except Exception:
             pass
@@ -3604,7 +3606,7 @@ def make_setup(
         except Exception:
             breakout_override = False
 
-        if not (breakout_override or override_4h or override_24h):
+        if not (breakout_override or override_4h or override_24h or override_24h_strong):
             _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% trig={trig_min:.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}% ch15={ch15:+.2f}%")
             return None
 
@@ -4565,7 +4567,7 @@ def user_enabled_sessions(user: dict) -> List[str]:
 def _guess_session_name_utc(now_utc: datetime) -> str:
     """
     Returns NY/LON/ASIA if within their UTC windows (priority NY > LON > ASIA).
-    If we're in the 22:00–24:00 UTC gap, default to ASIA (so emails still run).
+    If we're in the 22:00–24:00 UTC gap, default to NY (keep UI consistent with /screen).
     """
     for name in SESSION_PRIORITY:  # ["NY","LON","ASIA"]
         w = SESSIONS_UTC[name]
@@ -4580,7 +4582,7 @@ def _guess_session_name_utc(now_utc: datetime) -> str:
             end_utc -= timedelta(days=1)
         if start_utc <= now_utc <= end_utc:
             return name
-    return "ASIA"
+    return "NY"
 
 
 def in_session_now(user: dict) -> Optional[dict]:
@@ -5074,11 +5076,11 @@ Example:
 • Possible reversal zones (context, not an entry)
 • 📧 Email alerts are Pro/Trial only
 
-/email
-• Show email status
+/email you@gmail.com
+• Set your email for alerts
 
-/email set you@example.com
-• Save your email for alerts
+/email_test
+• Send a test email to confirm delivery
 
 /email off
 • Disable email
@@ -5086,7 +5088,7 @@ Example:
 Examples:
 /bigmove_alert on 30 12
 /early_warning_alert on
-/email set you@example.com
+/email you@example.com
 
 ────────────────────
 📊 PLAN & STATUS
@@ -6686,7 +6688,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     opens = db_open_trades(uid)
 
-    plan = str(effective_plan(user or {}, uid)).upper()
+    plan = str(effective_plan(uid, user)).upper()
     equity = float((user or {}).get("equity") or 0.0)
 
     cap = daily_cap_usd(user)
