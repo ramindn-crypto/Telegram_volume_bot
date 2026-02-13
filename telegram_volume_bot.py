@@ -8463,6 +8463,30 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # EMAIL BODY
 # =========================================================
+
+def tz_location_label(tz_name: str) -> str:
+    """Return a friendly location label from an IANA tz like 'Australia/Sydney'."""
+    try:
+        tz_name = str(tz_name or '').strip()
+    except Exception:
+        tz_name = ''
+    if not tz_name:
+        return 'Local time'
+    parts = tz_name.split('/')
+    region = parts[0] if parts else tz_name
+    city = parts[-1] if parts else tz_name
+    try:
+        city = city.replace('_', ' ').strip()
+    except Exception:
+        pass
+    region_label = region
+    # Small UX mappings (keep it simple + safe)
+    if region == 'America':
+        region_label = 'USA'
+    elif region == 'Etc':
+        region_label = 'UTC'
+    return f"{city} ({region_label})" if city else str(region_label)
+
 def _email_body_pretty(
     session_name: str,
     now_local: datetime,
@@ -9664,7 +9688,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             try:
                 email_early_min_ch15_abs = float((user.get("email_early_min_ch15_abs") if isinstance(user, dict) else None) or EMAIL_EARLY_MIN_CH15_ABS)
             except Exception:
-                email_early_min_ch15_abs = float(email_early_min_ch15_abs)
+                email_early_min_ch15_abs = float(EMAIL_EARLY_MIN_CH15_ABS)
 
             confirmed: List[Setup] = []
             early: List[Setup] = []
