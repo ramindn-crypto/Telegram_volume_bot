@@ -3623,10 +3623,6 @@ def make_setup(
 
                 side_guess = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.25 else ("BUY" if ch1 > 0 else "SELL")
                 _WAITING_TRIGGER[str(base)] = {"side": side_guess, "dot": dot}
-                try:
-                    _note_status("waiting_trigger", base, mv)
-                except Exception:
-                    pass
 
         # Balanced breakout override: even if 1H change is small, allow true breakouts
         # Additional overrides: allow setups during quiet 1H candles if 4H/24H move is strong and 15m confirms.
@@ -4086,59 +4082,90 @@ def pick_setups(
     allow_no_pullback: bool = False,   # /screen True, email False (except HOT bypass inside make_setup)
     scan_profile: str = DEFAULT_SCAN_PROFILE,
 ) -> List[Setup]:
+    """Generate setups from a best_fut dict.
+
+    IMPORTANT:
+    - Must never abort the entire scan because one symbol throws.
+    - Must keep /why meaningful by marking status for every evaluated symbol.
+    - Must NOT wipe _WAITING_TRIGGER on each call (build_priority_pool may call us multiple times per scan).
+    """
     global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL, _WAITING_TRIGGER
-    _REJECT_STATS = Counter()
-    _REJECT_SAMPLES = {}
-    _REJECT_BY_SYMBOL = {}
-    _WAITING_TRIGGER = {}
+
+    # Keep legacy globals for other debug paths, but don't nuke waiting triggers each call.
+    try:
+        _REJECT_STATS = Counter()
+        _REJECT_SAMPLES = {}
+        _REJECT_BY_SYMBOL = {}
+    except Exception:
+        pass
+    try:
+        if not isinstance(_WAITING_TRIGGER, dict):
+            _WAITING_TRIGGER = {}
+    except Exception:
+        _WAITING_TRIGGER = {}
 
     universe_n = int(max(10, universe_n))
     universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:universe_n]
 
     setups: List[Setup] = []
     for base, mv in universe:
-        s = make_setup(
-            base,
-            mv,
-            strict_15m=strict_15m,
-            session_name=session_name,
-            allow_no_pullback=allow_no_pullback,
-            trigger_loosen_mult=float(trigger_loosen_mult),
-            waiting_near_pct=float(waiting_near_pct),
-            scan_profile=str(scan_profile or DEFAULT_SCAN_PROFILE),
-        )
+        # Mark that we are actively evaluating this symbol (so it never remains not_evaluated)
+        try:
+            _note_status("evaluating", base, mv)
+        except Exception:
+            pass
+
+        try:
+            s = make_setup(
+                base,
+                mv,
+                strict_15m=strict_15m,
+                session_name=session_name,
+                allow_no_pullback=allow_no_pullback,
+                trigger_loosen_mult=float(trigger_loosen_mult),
+                waiting_near_pct=float(waiting_near_pct),
+                scan_profile=str(scan_profile or DEFAULT_SCAN_PROFILE),
+            )
+        except Exception as e:
+            # Never let one bad symbol kill the whole scan.
+            try:
+                _rej("exception_in_make_setup", base, mv, str(e)[:120])
+            except Exception:
+                pass
+            continue
+
         if s:
             try:
                 _note_status("setup_generated", base, mv)
             except Exception:
                 pass
             setups.append(s)
-        else:
-            # If make_setup returns None, ensure /why still shows a meaningful per-symbol decision.
-            # We treat a still-default "not_evaluated" as "no_engine_passed" so tuning is possible.
-            try:
-                ctx = _REJECT_CTX.get()
-                if not isinstance(ctx, dict):
-                    global _GLOBAL_REJECT_CTX
-                    if isinstance(_GLOBAL_REJECT_CTX, dict):
-                        ctx = _GLOBAL_REJECT_CTX
+            continue
 
-                b = str(base or "").upper().strip()
-                per = (ctx or {}).get("__per__") if isinstance(ctx, dict) else None
+        # If make_setup produced a waiting trigger, mark that explicitly
+        try:
+            bU = str(base or "").upper().strip()
+            if bU and isinstance(_WAITING_TRIGGER, dict) and bU in {str(k).upper() for k in _WAITING_TRIGGER.keys()}:
+                _note_status("waiting_trigger", base, mv)
+        except Exception:
+            pass
 
-                if b and isinstance(per, dict):
-                    cur = per.get(b) or {}
-                    cur_reason = str(cur.get("reason") or "").strip()
-                    if cur_reason in ("", "not_evaluated", "not_evaluated (0)"):
-                        _rej("no_engine_passed", base, mv, "make_setup_returned_none")
-                elif b and isinstance(ctx, dict):
-                    # no per dict available: record something anyway
-                    _rej("no_engine_passed", base, mv, "make_setup_returned_none")
-            except Exception:
-                pass
+        # If make_setup returned None without a meaningful reject/status, record a generic reason
+        try:
+            ctx = _REJECT_CTX.get()
+            b = str(base or "").upper().strip()
+            per = (ctx or {}).get("__per__") if isinstance(ctx, dict) else None
+            cur_reason = None
+            if isinstance(per, dict) and b in per:
+                cur_reason = str((per.get(b) or {}).get("reason") or "")
+            if cur_reason in ("", "not_evaluated", "evaluating", "evaluated"):
+                _rej("no_engine_passed", base, mv, "make_setup_returned_none")
+        except Exception:
+            pass
 
     setups.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
     return setups[:n]
+
 
 
 # =========================================================
@@ -7864,25 +7891,36 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         except Exception:
             spike_warnings = []
 
-    # Store diagnostics for /why, then ALWAYS reset context
-    try:
-        if uid is not None:
-            _LAST_REJECTS[int(uid)] = {
-                "ts": time.time(),
-                "allow": list(_rej_ctx.get("__allow__") or []),
-                "per_symbol": dict((_rej_ctx.get("__per__") or {})),
-            }
-    finally:
+# Store diagnostics for /why, then ALWAYS reset context
+try:
+    if uid is not None:
+        counts = {}
         try:
-            _REJECT_CTX.reset(_rej_token)
+            for k, v in dict(_rej_ctx).items():
+                if str(k).startswith("__"):
+                    continue
+                if isinstance(v, (int, float)):
+                    counts[str(k)] = int(v)
         except Exception:
-            pass
-        try:
-            _GLOBAL_REJECT_CTX = None
-        except Exception:
-            pass
+            counts = {}
 
-    return {
+        _LAST_REJECTS[int(uid)] = {
+            "ts": time.time(),
+            "counts": counts,
+            "allow": list(_rej_ctx.get("__allow__") or []),
+            "per_symbol": dict((_rej_ctx.get("__per__") or {})),
+        }
+finally:
+    try:
+        _REJECT_CTX.reset(_rej_token)
+    except Exception:
+        pass
+    try:
+        _GLOBAL_REJECT_CTX = None
+    except Exception:
+        pass
+
+return {
         "setups": ordered,
         "waiting": waiting_items,
         "trend_watch": trend_watch,
