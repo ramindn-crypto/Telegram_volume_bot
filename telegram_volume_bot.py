@@ -7515,7 +7515,13 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     """
 
     # Diagnostics: collect reject reasons for this scan
-    _rej_ctx = {}
+    # Keep a stable structure so /why is always meaningful.
+    _rej_ctx = {
+        "__agg__": {},          # aggregate counters per reason
+        "__per__": {},          # per-symbol last reason/status
+        "__allow__": set(),     # universe allow-list (uppercased bases)
+    }
+
     # Fallback for nested threads that may lose contextvars
     global _GLOBAL_REJECT_CTX
     _GLOBAL_REJECT_CTX = _rej_ctx
@@ -7526,7 +7532,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         _WAITING_TRIGGER.clear()
     except Exception:
         pass
-
 
     # knobs
     if mode == "screen":
@@ -7551,7 +7556,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         directional_take = 12
         market_take = 15
         trend_take = 12
-
 
     # Aggressive profile overrides
     prof = str(scan_profile or DEFAULT_SCAN_PROFILE).strip().lower()
@@ -7585,9 +7589,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
     # 1) Directional leaders / losers (priority #1)
     up_list, dn_list = compute_directional_lists(best_fut)
-    # IMPORTANT: Setup universe must match the *tables shown* in /screen.
-    # We therefore use the top N rows shown in Directional Leaders/Losers tables (default 10),
-    # not the full filtered universe.
+
     directional_table_n = 10
     leaders = [str(t[0]).upper() for t in (up_list or [])[:directional_table_n]]
     losers  = [str(t[0]).upper() for t in (dn_list or [])[:directional_table_n]]
@@ -7601,8 +7603,9 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
     # Diagnostics: keep /why focused on this scan universe
     try:
-        _rej_ctx["__allow__"] = set([str(x).upper() for x in (universe_bases or [])])
-_rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b in (universe_bases or [])}
+        _rej_ctx["__allow__"] = set(str(x).upper() for x in (universe_bases or []) if x)
+        _rej_ctx["__per__"] = {b: {"reason": "not_evaluated", "n": 0} for b in (_rej_ctx["__allow__"] or set())}
+
         try:
             global _LAST_SCAN_UNIVERSE
             _LAST_SCAN_UNIVERSE = list(universe_bases or [])
@@ -7613,6 +7616,7 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
 
     priority_setups = []
 
+    # Leaders pass
     if leaders:
         sub = _subset_best(best_fut, leaders)
         try:
@@ -7625,14 +7629,15 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
                 trigger_loosen,
                 waiting_near,
                 allow_no_pullback,
-            scan_profile=prof,
+                scan_profile=prof,
             )
         except Exception:
             tmp = []
-        for s in tmp or []:
+        for s in (tmp or []):
             if s.side == "BUY":
                 priority_setups.append(s)
 
+    # Losers pass
     if losers:
         sub = _subset_best(best_fut, losers)
         try:
@@ -7645,18 +7650,15 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
                 trigger_loosen,
                 waiting_near,
                 allow_no_pullback,
-            scan_profile=prof,
+                scan_profile=prof,
             )
         except Exception:
             tmp = []
-        for s in tmp or []:
+        for s in (tmp or []):
             if s.side == "SELL":
                 priority_setups.append(s)
 
-    
-    
     # 1b) Full universe pass (leaders + losers + market leaders)
-    # Ensures /why has coverage for all symbols shown and increases setup discovery.
     try:
         if universe_best:
             tmp = pick_setups(
@@ -7674,10 +7676,10 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
             tmp = []
     except Exception:
         tmp = []
-    for s in tmp or []:
+    for s in (tmp or []):
         priority_setups.append(s)
 
-# ------------------------------------------------
+    # ------------------------------------------------
     # Engine B: Momentum Breakout Setups (Balanced)
     # ------------------------------------------------
     breakout_setups = []
@@ -7686,7 +7688,6 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
         if bases_for_breakout:
             sub = _subset_best(best_fut, bases_for_breakout)
             breakout_setups = pick_breakout_setups(
-                
                 sub,
                 int(max(6, n_target)),   # allow a handful
                 session_name,
@@ -7699,8 +7700,7 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
     if breakout_setups:
         priority_setups.extend(breakout_setups)
 
-# 2) Trend continuation watch (priority #2)
-    # same universe used by /screen: top 6 leaders + top 6 losers
+    # 2) Trend continuation watch (priority #2)
     watch_bases = []
     watch_bases.extend([b for b in leaders[:6]])
     watch_bases.extend([b for b in losers[:6]])
@@ -7728,13 +7728,14 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
                 min(int(universe_cap), len(sub) if sub else universe_cap),
                 trigger_loosen,
                 waiting_near,
-                True if mode == "screen" else True,  # allow trend continuation to pass even on email
+                True,  # allow trend continuation to pass even on email
+                scan_profile=prof,
             )
         except Exception:
             tmp = []
 
         side_map = {str(t.get("symbol")).upper(): str(t.get("side")) for t in (trend_watch or []) if t.get("symbol")}
-        for s in tmp or []:
+        for s in (tmp or []):
             want = side_map.get(str(s.symbol).upper())
             if want and s.side == want:
                 priority_setups.append(s)
@@ -7743,7 +7744,12 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
     waiting_items = []
     try:
         if _WAITING_TRIGGER:
-            waiting_items = [(b, o) for (b, o) in list(_WAITING_TRIGGER.items()) if (not _LAST_SCAN_UNIVERSE) or (str(b).upper() in set([str(x).upper() for x in (_LAST_SCAN_UNIVERSE or [])]))][:SCREEN_WAITING_N]
+            allow_set = set(str(x).upper() for x in (_LAST_SCAN_UNIVERSE or []))
+            waiting_items = [
+                (b, o)
+                for (b, o) in list(_WAITING_TRIGGER.items())
+                if (not allow_set) or (str(b).upper() in allow_set)
+            ][:SCREEN_WAITING_N]
     except Exception:
         waiting_items = []
 
@@ -7753,7 +7759,7 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
             sub = _subset_best(best_fut, market_bases)
             try:
                 tmp = pick_setups(
-                sub,
+                    sub,
                     n_target * scan_multiplier,
                     strict_15m,
                     session_name,
@@ -7761,19 +7767,16 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
                     trigger_loosen,
                     waiting_near,
                     allow_no_pullback,
-                scan_profile=prof,
-            )
+                    scan_profile=prof,
+                )
             except Exception:
                 tmp = []
             priority_setups.extend(tmp or [])
 
-    
     # 4B) Momentum Breakout setups (Engine B) — Balanced
-    # NOTE: keep in same unified list; /screen splits by s.engine == "B"
     try:
         mom_n = max(6, int(n_target) * 2)
         mom = pick_breakout_setups(
-                
             universe_best,  # ✅ restricted universe
             mom_n,
             session_name,
@@ -7785,7 +7788,7 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
     if mom:
         priority_setups.extend(mom)
 
-# de-dupe by (symbol, side) keeping highest conf, preserving priority order
+    # de-dupe by (symbol, side, engine) keeping highest conf, preserving priority order
     best = {}
     for s in priority_setups:
         k = (str(s.symbol).upper(), str(s.side), str(getattr(s, "engine", "")))
@@ -7802,13 +7805,13 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
             ordered.append(best[k])
             seen.add(k)
 
-
     # If still empty, create a small fallback set so /screen isn't blank.
     if not ordered and mode == "screen":
         try:
             ordered = _fallback_setups_from_universe(best_fut, leaders, losers, market_bases, session_name, max_items=max(4, n_target))
         except Exception:
             pass
+
     # -----------------------------------------------------
     # NEW: Spike Reversal candidates (15M+ Vol) — for /screen only
     # -----------------------------------------------------
@@ -7845,11 +7848,14 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
         except Exception:
             spike_warnings = []
 
-    
-    # Store diagnostics for /why
+    # Store diagnostics for /why, then ALWAYS reset context
     try:
         if uid is not None:
-            _LAST_REJECTS[int(uid)] = {"ts": time.time(), "counts": {k:v for k,v in dict(_rej_ctx).items() if not str(k).startswith("__")}, "allow": list(_rej_ctx.get("__allow__") or []), "per_symbol": dict((_rej_ctx.get("__per__") or {}))}
+            _LAST_REJECTS[int(uid)] = {
+                "ts": time.time(),
+                "allow": list(_rej_ctx.get("__allow__") or []),
+                "per_symbol": dict((_rej_ctx.get("__per__") or {})),
+            }
     finally:
         try:
             _REJECT_CTX.reset(_rej_token)
@@ -7860,7 +7866,14 @@ _rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b
         except Exception:
             pass
 
-    return {"setups": ordered, "waiting": waiting_items, "trend_watch": trend_watch, "spikes": spike_candidates, "spike_warnings": spike_warnings}
+    return {
+        "setups": ordered,
+        "waiting": waiting_items,
+        "trend_watch": trend_watch,
+        "spikes": spike_candidates,
+        "spike_warnings": spike_warnings,
+    }
+
 
 
 def user_location_and_time(user: dict):
