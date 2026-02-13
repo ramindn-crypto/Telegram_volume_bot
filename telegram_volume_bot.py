@@ -3669,7 +3669,13 @@ def make_setup(
             abs(float(ch4_used or 0.0)) >= 0.60 or abs(float(ch24 or 0.0)) >= 14.0
         )
 
-        if not (breakout_override or override_4h or override_24h or override_24h_strong or soft_override):
+        # Extra override (moderate): big 24H move + decent volume can justify a setup even if 1H is quiet.
+        try:
+            override_24h_moderate = (abs(float(ch24 or 0.0)) >= 10.0) and (float(fut_vol or 0.0) >= 5_000_000.0) and (ratio >= 0.55)
+        except Exception:
+            override_24h_moderate = False
+
+        if not (breakout_override or override_4h or override_24h or override_24h_strong or soft_override or override_24h_moderate):
             _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% trig={trig_min:.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}% ch15={ch15:+.2f}%")
             return None
 
@@ -7848,13 +7854,14 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             ordered.append(best[k])
             seen.add(k)
 
-    # If still empty, create a small fallback set so /screen isn't blank.
-    if not ordered and mode == "screen":
+    # If still empty, create a small fallback set so the bot always produces something.
+    # This is intentionally conservative (ATR-based) and only triggers when all engines produce nothing.
+    if not ordered:
         try:
-            ordered = _fallback_setups_from_universe(best_fut, leaders, losers, market_bases, session_name, max_items=max(4, n_target))
+            _max_items = max(4, int(n_target)) if mode == "screen" else max(3, int(EMAIL_SETUPS_N or 3))
+            ordered = _fallback_setups_from_universe(best_fut, leaders, losers, market_bases, session_name, max_items=_max_items)
         except Exception:
             pass
-
     # -----------------------------------------------------
     # NEW: Spike Reversal candidates (15M+ Vol) — for /screen only
     # -----------------------------------------------------
@@ -7891,36 +7898,39 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         except Exception:
             spike_warnings = []
 
-# Store diagnostics for /why, then ALWAYS reset context
-try:
-    if uid is not None:
-        counts = {}
-        try:
-            for k, v in dict(_rej_ctx).items():
-                if str(k).startswith("__"):
-                    continue
-                if isinstance(v, (int, float)):
-                    counts[str(k)] = int(v)
-        except Exception:
+    # Store diagnostics for /why, then ALWAYS reset context
+    try:
+        if uid is not None:
             counts = {}
+            try:
+                for k, v in dict(_rej_ctx).items():
+                    if str(k).startswith("__"):
+                        continue
+                    if isinstance(v, (int, float)):
+                        counts[str(k)] = int(v)
+            except Exception:
+                pass
 
-        _LAST_REJECTS[int(uid)] = {
-            "ts": time.time(),
-            "counts": counts,
-            "allow": list(_rej_ctx.get("__allow__") or []),
-            "per_symbol": dict((_rej_ctx.get("__per__") or {})),
-        }
-finally:
-    try:
-        _REJECT_CTX.reset(_rej_token)
-    except Exception:
-        pass
-    try:
-        _GLOBAL_REJECT_CTX = None
-    except Exception:
-        pass
+            try:
+                _LAST_REJECTS[int(uid)] = {
+                    "ts": time.time(),
+                    "counts": counts,
+                    "allow": list(_rej_ctx.get("__allow__") or []),
+                    "per_symbol": dict((_rej_ctx.get("__per__") or {})),
+                }
+            except Exception:
+                pass
+    finally:
+        try:
+            _REJECT_CTX.reset(_rej_token)
+        except Exception:
+            pass
+        try:
+            _GLOBAL_REJECT_CTX = None
+        except Exception:
+            pass
 
-return {
+    return {
         "setups": ordered,
         "waiting": waiting_items,
         "trend_watch": trend_watch,
