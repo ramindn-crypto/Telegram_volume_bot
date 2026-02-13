@@ -3030,39 +3030,35 @@ def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float
     """
     returns: ch1, ch4, ch15, atr_1h, ema_support_15m, ema_support_period, c15, c1
     """
-    try:
-        need_1h = max(ATR_PERIOD + 6, 35)
-        c1 = fetch_ohlcv(market_symbol, "1h", limit=need_1h)
-        if not c1 or len(c1) < 25:
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0, [], []
-
-        closes_1h = [float(x[4]) for x in c1]
-        c_last = closes_1h[-1]
-        c_prev1 = closes_1h[-2]
-        c_prev4 = closes_1h[-5] if len(closes_1h) >= 5 else closes_1h[0]
-
-        ch1 = ((c_last - c_prev1) / c_prev1) * 100.0 if c_prev1 else 0.0
-        ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
-        atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
-
-        c15 = fetch_ohlcv(market_symbol, "15m", limit=80)
-        if not c15 or len(c15) < 20:
-            return ch1, ch4, 0.0, atr_1h, 0.0, 0, [], c1
-
-        closes_15 = [float(x[4]) for x in c15]
-        entry_proxy = float(closes_15[-1]) if closes_15 else 0.0
-        atr_pct_proxy = (atr_1h / entry_proxy) * 100.0 if (atr_1h and entry_proxy) else 2.0
-
-        ema_support_15m, ema_period = adaptive_ema_value(closes_15, atr_pct_proxy)
-
-        c15_last = float(c15[-1][4])
-        c15_prev = float(c15[-2][4])
-        ch15 = ((c15_last - c15_prev) / c15_prev) * 100.0 if c15_prev else 0.0
-
-        return ch1, ch4, ch15, atr_1h, ema_support_15m, int(ema_period), c15, c1
-    except Exception:
-        # Never let candle/EMA computation crash the scan
+    need_1h = max(ATR_PERIOD + 6, 35)
+    c1 = fetch_ohlcv(market_symbol, "1h", limit=need_1h)
+    if not c1 or len(c1) < 25:
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0, [], []
+
+    closes_1h = [float(x[4]) for x in c1]
+    c_last = closes_1h[-1]
+    c_prev1 = closes_1h[-2]
+    c_prev4 = closes_1h[-5] if len(closes_1h) >= 5 else closes_1h[0]
+
+    ch1 = ((c_last - c_prev1) / c_prev1) * 100.0 if c_prev1 else 0.0
+    ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
+    atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
+
+    c15 = fetch_ohlcv(market_symbol, "15m", limit=80)
+    if not c15 or len(c15) < 20:
+        return ch1, ch4, 0.0, atr_1h, 0.0, 0, [], c1
+
+    closes_15 = [float(x[4]) for x in c15]
+    entry_proxy = float(closes_15[-1]) if closes_15 else 0.0
+    atr_pct_proxy = (atr_1h / entry_proxy) * 100.0 if (atr_1h and entry_proxy) else 2.0
+
+    ema_support_15m, ema_period = adaptive_ema_value(closes_15, atr_pct_proxy)
+
+    c15_last = float(c15[-1][4])
+    c15_prev = float(c15[-2][4])
+    ch15 = ((c15_last - c15_prev) / c15_prev) * 100.0 if c15_prev else 0.0
+
+    return ch1, ch4, ch15, atr_1h, ema_support_15m, int(ema_period), c15, c1
 
 
 # =========================================================
@@ -3579,433 +3575,367 @@ def make_setup(
     ch24 = float(mv.percentage or 0.0)
 
     _note_status("evaluated", base, mv)
+
     try:
 
         ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
 
-        # Use true 4H change from 4H candles (more stable than 1H*4 approximation)
+    except Exception:
+
+        _rej("ohlcv_missing_or_insufficient", base, mv)
+
+        return None
+    # Use true 4H change from 4H candles (more stable than 1H*4 approximation)
+    ch4_exact = 0.0
+    try:
+        c4h = fetch_ohlcv(mv.symbol, "4h", limit=6)
+        if c4h and len(c4h) >= 2:
+            c_last_4h = float(c4h[-1][4])
+            c_prev_4h = float(c4h[-2][4])
+            ch4_exact = ((c_last_4h - c_prev_4h) / c_prev_4h) * 100.0 if c_prev_4h else 0.0
+    except Exception:
         ch4_exact = 0.0
+
+    ch4_used = ch4_exact if abs(ch4_exact) > 0.0001 else ch4
+
+    if (ch1 == 0.0 and ch4 == 0.0 and ch15 == 0.0 and atr_1h == 0.0) or (not c15) or (ema_support_15m == 0.0):
+        _rej("ohlcv_missing_or_insufficient", base, mv, "metrics/ema missing")
+        return None
+
+    # Scan profile tuning
+    prof = str(scan_profile or DEFAULT_SCAN_PROFILE).strip().lower()
+    if prof not in SCAN_PROFILES:
+        prof = DEFAULT_SCAN_PROFILE
+    aggressive_screen = (prof == "aggressive" and (not strict_15m))
+
+    # --------- SESSION-DYNAMIC 1H TRIGGER ----------
+    atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
+    trig_min_raw = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
+
+    floor_min = 0.025 if aggressive_screen else 0.05  # further loosened: allow setups in quiet 1H candles
+    trig_min = max(float(floor_min), float(trig_min_raw) * float(trigger_loosen_mult))
+
+    if abs(ch1) < trig_min:
+        # Waiting for Trigger (near-miss) — store ONLY side + a color dot (no numbers)
+        if trig_min > 0:
+            ratio = abs(ch1) / trig_min  # internal only
+            if ratio >= float(waiting_near_pct):
+                # color indicates "how close" WITHOUT revealing thresholds
+                if ratio >= 0.92:
+                    dot = "🟢"
+                elif ratio >= 0.82:
+                    dot = "🟡"
+                else:
+                    dot = "🟠"
+
+                side_guess = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.25 else ("BUY" if ch1 > 0 else "SELL")
+                _WAITING_TRIGGER[str(base)] = {"side": side_guess, "dot": dot}
+
+        # Balanced breakout override: even if 1H change is small, allow true breakouts
+        # Additional overrides: allow setups during quiet 1H candles if 4H/24H move is strong and 15m confirms.
+        override_4h = (abs(float(ch4_used or 0.0)) >= max(0.9, float(trig_min) * 1.6)) and (abs(float(ch15 or 0.0)) >= 0.10)
+        override_24h = (abs(float(ch24 or 0.0)) >= 10.0) and (abs(float(ch15 or 0.0)) >= 0.08)
+        # Extra override: if 24H is very strong AND 4H aligns, don't require 15m confirmation (quiet consolidation after a big move)
+        override_24h_strong = (abs(float(ch24 or 0.0)) >= 18.0) and (abs(float(ch4_used or 0.0)) >= 0.60) and (float(fut_vol or 0.0) >= 5_000_000.0)
+        breakout_override = False
+        # Trend override: if 4H regime move is meaningful, allow even if this 1H is quiet.
         try:
-            c4h = fetch_ohlcv(mv.symbol, "4h", limit=6)
-            if c4h and len(c4h) >= 2:
-                c_last_4h = float(c4h[-1][4])
-                c_prev_4h = float(c4h[-2][4])
-                ch4_exact = ((c_last_4h - c_prev_4h) / c_prev_4h) * 100.0 if c_prev_4h else 0.0
+            if abs(float(ch4_used or 0.0)) >= max(0.75, float(trig_min) * 3.0) and float(fut_vol or 0.0) >= 5_000_000.0:
+                breakout_override = True
         except Exception:
-            ch4_exact = 0.0
+            pass
+        try:
+            if c1 and len(c1) >= 25 and abs(ch24) >= 6.0:
+                highs_1h = [float(x[2]) for x in c1]
+                lows_1h  = [float(x[3]) for x in c1]
+                closes_1h = [float(x[4]) for x in c1]
+                vols_1h  = [float(x[5]) for x in c1]
+                last_close = float(closes_1h[-1])
+                last_high  = float(highs_1h[-1])
+                last_low   = float(lows_1h[-1])
+                hh20 = max(highs_1h[-21:-1])
+                ll20 = min(lows_1h[-21:-1])
+                vnow = float(vols_1h[-1])
+                vavg = (sum(vols_1h[-21:-1]) / 20.0) if vols_1h[-21:-1] else 0.0
 
-        ch4_used = ch4_exact if abs(ch4_exact) > 0.0001 else ch4
-
-        if (ch1 == 0.0 and ch4 == 0.0 and ch15 == 0.0 and atr_1h == 0.0) or (not c15) or (ema_support_15m == 0.0):
-            _rej("ohlcv_missing_or_insufficient", base, mv, "metrics/ema missing")
-            return None
-
-        # Scan profile tuning
-        prof = str(scan_profile or DEFAULT_SCAN_PROFILE).strip().lower()
-        if prof not in SCAN_PROFILES:
-            prof = DEFAULT_SCAN_PROFILE
-        aggressive_screen = (prof == "aggressive" and (not strict_15m))
-
-        # --------- SESSION-DYNAMIC 1H TRIGGER ----------
-        atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
-        trig_min_raw = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
-
-        floor_min = 0.025 if aggressive_screen else 0.05  # further loosened: allow setups in quiet 1H candles
-        trig_min = max(float(floor_min), float(trig_min_raw) * float(trigger_loosen_mult))
-
-        override_mult = 0.35 if (not strict_15m) else 0.55
-        soft_ok = (fut_vol >= 5_000_000.0) and (abs(ch24) >= 10.0) and (abs(ch1) >= float(trig_min) * float(override_mult))
-        if abs(ch1) < trig_min and soft_ok:
-            _note_status("ch1_soft_override", base, mv)
-        if abs(ch1) < trig_min and (not soft_ok):
-            # Waiting for Trigger (near-miss) — store ONLY side + a color dot (no numbers)
-            if trig_min > 0:
-                ratio = abs(ch1) / trig_min  # internal only
-                if ratio >= float(waiting_near_pct):
-                    # color indicates "how close" WITHOUT revealing thresholds
-                    if ratio >= 0.92:
-                        dot = "🟢"
-                    elif ratio >= 0.82:
-                        dot = "🟡"
-                    else:
-                        dot = "🟠"
-
-                    side_guess = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.25 else ("BUY" if ch1 > 0 else "SELL")
-                    _WAITING_TRIGGER[str(base)] = {"side": side_guess, "dot": dot}
-
-            # Balanced breakout override: even if 1H change is small, allow true breakouts
-            # Additional overrides: allow setups during quiet 1H candles if 4H/24H move is strong and 15m confirms.
-            override_4h = (abs(float(ch4_used or 0.0)) >= max(0.9, float(trig_min) * 1.6)) and (abs(float(ch15 or 0.0)) >= 0.10)
-            override_24h = (abs(float(ch24 or 0.0)) >= 10.0) and (abs(float(ch15 or 0.0)) >= 0.08)
-            # Extra override: if 24H is very strong AND 4H aligns, don't require 15m confirmation (quiet consolidation after a big move)
-            override_24h_strong = (abs(float(ch24 or 0.0)) >= 18.0) and (abs(float(ch4_used or 0.0)) >= 0.60) and (float(fut_vol or 0.0) >= 5_000_000.0)
-            breakout_override = False
-            # Trend override: if 4H regime move is meaningful, allow even if this 1H is quiet.
-            try:
-                if abs(float(ch4_used or 0.0)) >= max(0.75, float(trig_min) * 3.0) and float(fut_vol or 0.0) >= 5_000_000.0:
+                vol_mult = 1.08  # balanced default
+                if (ch24 >= 6.0) and (last_high > hh20 or last_close > hh20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
                     breakout_override = True
-            except Exception:
-                pass
-            try:
-                if c1 and len(c1) >= 25 and abs(ch24) >= 6.0:
-                    highs_1h = [float(x[2]) for x in c1]
-                    lows_1h  = [float(x[3]) for x in c1]
-                    closes_1h = [float(x[4]) for x in c1]
-                    vols_1h  = [float(x[5]) for x in c1]
-                    last_close = float(closes_1h[-1])
-                    last_high  = float(highs_1h[-1])
-                    last_low   = float(lows_1h[-1])
-                    hh20 = max(highs_1h[-21:-1])
-                    ll20 = min(lows_1h[-21:-1])
-                    vnow = float(vols_1h[-1])
-                    vavg = (sum(vols_1h[-21:-1]) / 20.0) if vols_1h[-21:-1] else 0.0
-
-                    vol_mult = 1.08  # balanced default
-                    if (ch24 >= 6.0) and (last_high > hh20 or last_close > hh20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
-                        breakout_override = True
-                    if (ch24 <= -6.0) and (last_low < ll20 or last_close < ll20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
-                        breakout_override = True
-            except Exception:
-                breakout_override = False
-
-            # Soft override: if we are close to the trigger and the higher timeframe move supports direction,
-            # allow a lower-confidence setup instead of rejecting everything on a quiet 1H candle.
-            try:
-                ratio = (abs(float(ch1)) / float(trig_min)) if float(trig_min) > 0 else 0.0
-            except Exception:
-                ratio = 0.0
-            soft_override = (ratio >= 0.78) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
-                abs(float(ch4_used or 0.0)) >= 0.60 or abs(float(ch24 or 0.0)) >= 14.0
-            )
-
-            # Extra override (moderate): big 24H move + decent volume can justify a setup even if 1H is quiet.
-            try:
-                override_24h_moderate = (abs(float(ch24 or 0.0)) >= 10.0) and (float(fut_vol or 0.0) >= 5_000_000.0) and (ratio >= 0.55)
-            except Exception:
-                override_24h_moderate = False
-
-            if not (breakout_override or override_4h or override_24h or override_24h_strong or soft_override or override_24h_moderate):
-                _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% trig={trig_min:.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}% ch15={ch15:+.2f}%")
-                return None
-
-
-        # ✅ IMPORTANT: this must be OUTSIDE the if block (no extra indent)
-        side = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.40 else ("BUY" if ch1 > 0 else "SELL")  # trend-side gating: prefer 4H regime over 1H noise
-
-        # 4H alignment
-        # If 4H is basically flat, don't block (leaders often show ch4 ~ 0 while 24H is huge).
-        if abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
-            if side == "BUY" and ch4 < ALIGN_4H_MIN:
-                _rej("4h_not_aligned_for_long", base, mv, f"side=BUY ch4={ch4:+.2f}%")
-                return None
-            if side == "SELL" and ch4 > -ALIGN_4H_MIN:
-                _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4:+.2f}%")
-                return None
-
-        # ✅ HARD regime gate: don't fight the 4H direction (unless "strong reversal exception")
-        if TF_ALIGN_ENABLED and abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
-            if side == "BUY" and ch4 < 0:
-                if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
-                    _rej("4h_bear_regime_blocks_long", base, mv, f"ch4={ch4:+.2f}%")
-                    return None
-            if side == "SELL" and ch4 > 0:
-                if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
-                    _rej("4h_bull_regime_blocks_short", base, mv, f"ch4={ch4:+.2f}%")
-                    return None
-
-        # =========================================================
-        # ✅ PULLBACK EMA (7/14/21) selection (15m)
-        # =========================================================
-        closes_15 = [float(x[4]) for x in c15]
-        pb_ema_val, pb_ema_p, pb_dist_pct = best_pullback_ema_15m(closes_15, c15, entry, side, session_name, atr_1h)
-
-        # ✅ No HOT bypass: pullback is ALWAYS required for high-quality continuation entries
-        pullback_bypass_hot = False
-
-        pb_ok = False
-        pb_thr_pct = 0.0
-        pb_dist_pct2 = 999.0
-
-        if pb_ema_val > 0:
-            pb_ok, pb_dist_pct2, pb_thr_pct, _ = ema_support_proximity_ok(entry, pb_ema_val, atr_1h, session_name)
-
-        pullback_ready = bool(pb_ok)
-
-        # Aggressive /screen: allow "near-EMA" pullback (slightly looser proximity)
-        if (not pullback_ready) and aggressive_screen and (pb_ema_val > 0) and (pb_thr_pct > 0):
-            try:
-                if float(pb_dist_pct2) <= float(pb_thr_pct) * 1.35:
-                    pullback_ready = True
-            except Exception:
-                pass
-
-        # 15m rejection candle requirement (skip in Aggressive /screen)
-        require_rejection = bool(REQUIRE_15M_EMA_REJECTION and (not aggressive_screen))
-
-        # ✅ Strict continuation entry: must show EMA interaction + strong 15m rejection/reclaim
-        if pullback_ready and require_rejection:
-            if (not c15) or (pb_ema_val <= 0):
-                _rej("no_ema_touch_reclaim_recent", base, mv,
-                     f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}% thr={pb_thr_pct:.2f}%")
-                return None
-
-            if not ema_rejection_candle_ok_15m(c15, pb_ema_val, side):
-                _rej("no_strong_rejection_candle_15m", base, mv, f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}%")
-                return None
-
-        # =========================================================
-        # ENGINE A (Mean-Reversion) vs ENGINE B (Momentum)
-        # =========================================================
-        engine_a_ok = bool(ENGINE_A_PULLBACK_ENABLED and pullback_ready)
-
-        engine_b_ok = False
-
-        if ENGINE_B_MOMENTUM_ENABLED:
-            # Aggressive /screen: slightly looser momentum requirements
-            mom_min_ch1 = float(MOMENTUM_MIN_CH1) * (0.75 if aggressive_screen else 1.0)
-            mom_min_24h = float(MOMENTUM_MIN_24H) * (0.75 if aggressive_screen else 1.0)
-            mom_body_mult = float(MOMENTUM_ATR_BODY_MULT) * (0.85 if aggressive_screen else 1.0)
-            mom_max_ema_dist = float(MOMENTUM_MAX_ADAPTIVE_EMA_DIST) * ((1.60 if (not strict_15m) else 1.0)) * (1.30 if aggressive_screen else 1.0)
-
-            # ------------------------------------------------------------------
-            # B1) Momentum continuation (existing)
-            # ------------------------------------------------------------------
-            if abs(ch1) >= mom_min_ch1 and abs(ch24) >= mom_min_24h:
-                if fut_vol >= (MOVER_VOL_USD_MIN * MOMENTUM_VOL_MULT):
-                    body_pct = abs(ch1)
-                    if atr_pct_now > 0 and body_pct >= (mom_body_mult * atr_pct_now):
-                        _, dist_pct, _, _ = ema_support_proximity_ok(entry, ema_support_15m, atr_1h, session_name)
-                        if dist_pct <= mom_max_ema_dist:
-                            engine_b_ok = True
-
-            # ------------------------------------------------------------------
-            # B2) Balanced Breakout continuation (NEW)
-            # Purpose: avoid "leaders full, setups empty" during expansion phases.
-            # Uses the already-fetched 1H candles (c1) to avoid extra API calls / rate limits.
-            # ------------------------------------------------------------------
-            try:
-                ch24_thr = 4.0 if aggressive_screen else 5.0
-                vol_mult = 1.05 if aggressive_screen else 1.08
-
-                # Use 4H/side gating already computed as the trend regime.
-                uptrend = (ch4_used >= 0)
-                downtrend = (ch4 < 0)
-
-                if abs(ch24) >= ch24_thr and fut_vol >= max(5_000_000.0, float(MOVER_VOL_USD_MIN) * 0.70) and c1 and len(c1) >= 25:
-                    highs_1h = [float(x[2]) for x in c1]
-                    lows_1h  = [float(x[3]) for x in c1]
-                    closes_1h = [float(x[4]) for x in c1]
-                    vols_1h  = [float(x[5]) for x in c1]
-
-                    last_close = float(closes_1h[-1])
-                    last_high = float(highs_1h[-1])
-                    last_low  = float(lows_1h[-1])
-                    vnow = float(vols_1h[-1])
-                    vavg = (sum(vols_1h[-21:-1]) / 20.0) if vols_1h[-21:-1] else 0.0
-
-                    # Prior 20-candle extremes (exclude the current candle)
-                    hh20 = max(highs_1h[-21:-1])
-                    ll20 = min(lows_1h[-21:-1])
-
-                    # Breakout BUY
-                    if uptrend and ch24 >= ch24_thr and (last_high > hh20 or last_close > hh20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
-                        engine_b_ok = True
-                        mv._pf_breakout_hint = "BUY"
-
-                    # Breakdown SELL
-                    if downtrend and ch24 <= -ch24_thr and (last_low < ll20 or last_close < ll20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
-                        engine_b_ok = True
-                        mv._pf_breakout_hint = "SELL"
-            except Exception:
-                pass
-    
-        # If breakout engine fired, force side to match the breakout direction (prevents green BUY / red mismatch)
-        try:
-            hint = getattr(mv, "_pf_breakout_hint", None)
-            if engine_b_ok and hint in ("BUY", "SELL"):
-                side = hint
+                if (ch24 <= -6.0) and (last_low < ll20 or last_close < ll20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
+                    breakout_override = True
         except Exception:
-            pass
+            breakout_override = False
 
-        # If breakout engine fired, force side to match the breakout direction (prevents green BUY / red mismatch)
+        # Soft override: if we are close to the trigger and the higher timeframe move supports direction,
+        # allow a lower-confidence setup instead of rejecting everything on a quiet 1H candle.
         try:
-            hint = getattr(mv, "_pf_breakout_hint", None)
-            if engine_b_ok and hint in ("BUY", "SELL"):
-                side = hint
+            ratio = (abs(float(ch1)) / float(trig_min)) if float(trig_min) > 0 else 0.0
         except Exception:
-            pass
-
-        if not engine_a_ok and not engine_b_ok:
-            _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}")
-            return None
-
-        # ---------------------------------------------------------
-        # Pullback policy (optional for Engine B)
-        # ---------------------------------------------------------
-        engine = "A" if engine_a_ok else "B"
-        require_pullback = (not bool(allow_no_pullback))
-
-        # Compute confidence BEFORE applying optional pullback penalty
-        conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
-
-        # Engine A already required pullback_ready; Engine B does not require pullback
-        pullback_ok_local = True if engine == "A" else True
-
-        keep, conf2 = apply_pullback_policy(
-            require_pullback=require_pullback,
-            pullback_ok=pullback_ok_local,
-            pullback_price=(pb_ema_val if pb_ema_val > 0 else None),
-            confidence=float(conf),
-            notes=notes,
+            ratio = 0.0
+        soft_override = (ratio >= 0.78) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
+            abs(float(ch4_used or 0.0)) >= 0.60 or abs(float(ch24 or 0.0)) >= 14.0
         )
 
-        conf = conf2
-
-        if not keep:
-            _rej("pullback_required_not_met", base, mv, "require_pullback=1")
+        if not (breakout_override or override_4h or override_24h or override_24h_strong or soft_override):
+            _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% trig={trig_min:.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}% ch15={ch15:+.2f}%")
             return None
 
-        if engine == "A" and abs(float(ch1)) >= float(SHARP_1H_MOVE_PCT):
-            if not ema_support_reaction_ok_15m(c15, pb_ema_val, side, session_name):
-                _rej("sharp_1h_no_ema_reaction", base, mv, f"ch1={ch1:+.2f}% needs EMA reaction")
+
+    # ✅ IMPORTANT: this must be OUTSIDE the if block (no extra indent)
+    side = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.40 else ("BUY" if ch1 > 0 else "SELL")  # trend-side gating: prefer 4H regime over 1H noise
+
+    # 4H alignment
+    # If 4H is basically flat, don't block (leaders often show ch4 ~ 0 while 24H is huge).
+    if abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
+        if side == "BUY" and ch4 < ALIGN_4H_MIN:
+            _rej("4h_not_aligned_for_long", base, mv, f"side=BUY ch4={ch4:+.2f}%")
+            return None
+        if side == "SELL" and ch4 > -ALIGN_4H_MIN:
+            _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4:+.2f}%")
+            return None
+
+    # ✅ HARD regime gate: don't fight the 4H direction (unless "strong reversal exception")
+    if TF_ALIGN_ENABLED and abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
+        if side == "BUY" and ch4 < 0:
+            if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
+                _rej("4h_bear_regime_blocks_long", base, mv, f"ch4={ch4:+.2f}%")
+                return None
+        if side == "SELL" and ch4 > 0:
+            if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
+                _rej("4h_bull_regime_blocks_short", base, mv, f"ch4={ch4:+.2f}%")
                 return None
 
-        thr = clamp(max(12.0, 2.5 * ((atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0)), 12.0, 22.0)
-        if side == "BUY" and ch24 <= -thr:
-            _rej("24h_contradiction_for_long", base, mv, f"ch24={ch24:+.1f}% <= -{thr:.1f}%")
+    # =========================================================
+    # ✅ PULLBACK EMA (7/14/21) selection (15m)
+    # =========================================================
+    closes_15 = [float(x[4]) for x in c15]
+    pb_ema_val, pb_ema_p, pb_dist_pct = best_pullback_ema_15m(closes_15, c15, entry, side, session_name, atr_1h)
+
+    # ✅ No HOT bypass: pullback is ALWAYS required for high-quality continuation entries
+    pullback_bypass_hot = False
+
+    pb_ok = False
+    pb_thr_pct = 0.0
+    pb_dist_pct2 = 999.0
+
+    if pb_ema_val > 0:
+        pb_ok, pb_dist_pct2, pb_thr_pct, _ = ema_support_proximity_ok(entry, pb_ema_val, atr_1h, session_name)
+
+    pullback_ready = bool(pb_ok)
+
+    # Aggressive /screen: allow "near-EMA" pullback (slightly looser proximity)
+    if (not pullback_ready) and aggressive_screen and (pb_ema_val > 0) and (pb_thr_pct > 0):
+        try:
+            if float(pb_dist_pct2) <= float(pb_thr_pct) * 1.35:
+                pullback_ready = True
+        except Exception:
+            pass
+
+    # 15m rejection candle requirement (skip in Aggressive /screen)
+    require_rejection = bool(REQUIRE_15M_EMA_REJECTION and (not aggressive_screen))
+
+    # ✅ Strict continuation entry: must show EMA interaction + strong 15m rejection/reclaim
+    if pullback_ready and require_rejection:
+        if (not c15) or (pb_ema_val <= 0):
+            _rej("no_ema_touch_reclaim_recent", base, mv,
+                 f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}% thr={pb_thr_pct:.2f}%")
             return None
-        if side == "SELL" and ch24 >= +thr:
-            _rej("24h_contradiction_for_short", base, mv, f"ch24={ch24:+.1f}% >= +{thr:.1f}%")
+
+        if not ema_rejection_candle_ok_15m(c15, pb_ema_val, side):
+            _rej("no_strong_rejection_candle_15m", base, mv, f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}%")
             return None
 
-        is_confirm_15m = abs(ch15) >= CONFIRM_15M_ABS_MIN
-        is_early_allowed = (abs(ch1) >= EARLY_1H_ABS_MIN)
+    # =========================================================
+    # ENGINE A (Mean-Reversion) vs ENGINE B (Momentum)
+    # =========================================================
+    engine_a_ok = bool(ENGINE_A_PULLBACK_ENABLED and pullback_ready)
 
-        if strict_15m:
-            if (not is_confirm_15m) and (not is_early_allowed):
-                _rej("15m_weak_and_not_early", base, mv, f"ch15={ch15:+.2f}% ch1={ch1:+.2f}%")
-                return None
+    engine_b_ok = False
 
-        if strict_15m and (not is_confirm_15m):
-            conf = max(0, int(conf) - int(EARLY_CONF_PENALTY))
+    if ENGINE_B_MOMENTUM_ENABLED:
+        # Aggressive /screen: slightly looser momentum requirements
+        mom_min_ch1 = float(MOMENTUM_MIN_CH1) * (0.75 if aggressive_screen else 1.0)
+        mom_min_24h = float(MOMENTUM_MIN_24H) * (0.75 if aggressive_screen else 1.0)
+        mom_body_mult = float(MOMENTUM_ATR_BODY_MULT) * (0.85 if aggressive_screen else 1.0)
+        mom_max_ema_dist = float(MOMENTUM_MAX_ADAPTIVE_EMA_DIST) * ((1.60 if (not strict_15m) else 1.0)) * (1.30 if aggressive_screen else 1.0)
 
-        tp_cap_pct = tp_cap_pct_for_coin(fut_vol, ch24)
+        # ------------------------------------------------------------------
+        # B1) Momentum continuation (existing)
+        # ------------------------------------------------------------------
+        if abs(ch1) >= mom_min_ch1 and abs(ch24) >= mom_min_24h:
+            if fut_vol >= (MOVER_VOL_USD_MIN * MOMENTUM_VOL_MULT):
+                body_pct = abs(ch1)
+                if atr_pct_now > 0 and body_pct >= (mom_body_mult * atr_pct_now):
+                    _, dist_pct, _, _ = ema_support_proximity_ok(entry, ema_support_15m, atr_1h, session_name)
+                    if dist_pct <= mom_max_ema_dist:
+                        engine_b_ok = True
 
-        rr_bonus = ENGINE_B_RR_BONUS if engine_b_ok else 0.0
-        tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine_b_ok else 0.0
+        # ------------------------------------------------------------------
+        # B2) Balanced Breakout continuation (NEW)
+        # Purpose: avoid "leaders full, setups empty" during expansion phases.
+        # Uses the already-fetched 1H candles (c1) to avoid extra API calls / rate limits.
+        # ------------------------------------------------------------------
+        try:
+            ch24_thr = 4.0 if aggressive_screen else 5.0
+            vol_mult = 1.05 if aggressive_screen else 1.08
 
-        sl, tp3_single, R = compute_sl_tp(
-            entry, side, atr_1h, conf, tp_cap_pct,
+            # Use 4H/side gating already computed as the trend regime.
+            uptrend = (ch4_used >= 0)
+            downtrend = (ch4 < 0)
+
+            if abs(ch24) >= ch24_thr and fut_vol >= max(5_000_000.0, float(MOVER_VOL_USD_MIN) * 0.70) and c1 and len(c1) >= 25:
+                highs_1h = [float(x[2]) for x in c1]
+                lows_1h  = [float(x[3]) for x in c1]
+                closes_1h = [float(x[4]) for x in c1]
+                vols_1h  = [float(x[5]) for x in c1]
+
+                last_close = float(closes_1h[-1])
+                last_high = float(highs_1h[-1])
+                last_low  = float(lows_1h[-1])
+                vnow = float(vols_1h[-1])
+                vavg = (sum(vols_1h[-21:-1]) / 20.0) if vols_1h[-21:-1] else 0.0
+
+                # Prior 20-candle extremes (exclude the current candle)
+                hh20 = max(highs_1h[-21:-1])
+                ll20 = min(lows_1h[-21:-1])
+
+                # Breakout BUY
+                if uptrend and ch24 >= ch24_thr and (last_high > hh20 or last_close > hh20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
+                    engine_b_ok = True
+                    mv._pf_breakout_hint = "BUY"
+
+                # Breakdown SELL
+                if downtrend and ch24 <= -ch24_thr and (last_low < ll20 or last_close < ll20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
+                    engine_b_ok = True
+                    mv._pf_breakout_hint = "SELL"
+        except Exception:
+            pass
+    
+    # If breakout engine fired, force side to match the breakout direction (prevents green BUY / red mismatch)
+    try:
+        hint = getattr(mv, "_pf_breakout_hint", None)
+        if engine_b_ok and hint in ("BUY", "SELL"):
+            side = hint
+    except Exception:
+        pass
+
+    # If breakout engine fired, force side to match the breakout direction (prevents green BUY / red mismatch)
+    try:
+        hint = getattr(mv, "_pf_breakout_hint", None)
+        if engine_b_ok and hint in ("BUY", "SELL"):
+            side = hint
+    except Exception:
+        pass
+
+    if not engine_a_ok and not engine_b_ok:
+        _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}")
+        return None
+
+    # ---------------------------------------------------------
+    # Pullback policy (optional for Engine B)
+    # ---------------------------------------------------------
+    engine = "A" if engine_a_ok else "B"
+    require_pullback = (not bool(allow_no_pullback))
+
+    # Compute confidence BEFORE applying optional pullback penalty
+    conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
+
+    # Engine A already required pullback_ready; Engine B does not require pullback
+    pullback_ok_local = True if engine == "A" else True
+
+    keep, conf2 = apply_pullback_policy(
+        require_pullback=require_pullback,
+        pullback_ok=pullback_ok_local,
+        pullback_price=(pb_ema_val if pb_ema_val > 0 else None),
+        confidence=float(conf),
+        notes=notes,
+    )
+
+    conf = conf2
+
+    if not keep:
+        _rej("pullback_required_not_met", base, mv, "require_pullback=1")
+        return None
+
+    if engine == "A" and abs(float(ch1)) >= float(SHARP_1H_MOVE_PCT):
+        if not ema_support_reaction_ok_15m(c15, pb_ema_val, side, session_name):
+            _rej("sharp_1h_no_ema_reaction", base, mv, f"ch1={ch1:+.2f}% needs EMA reaction")
+            return None
+
+    thr = clamp(max(12.0, 2.5 * ((atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0)), 12.0, 22.0)
+    if side == "BUY" and ch24 <= -thr:
+        _rej("24h_contradiction_for_long", base, mv, f"ch24={ch24:+.1f}% <= -{thr:.1f}%")
+        return None
+    if side == "SELL" and ch24 >= +thr:
+        _rej("24h_contradiction_for_short", base, mv, f"ch24={ch24:+.1f}% >= +{thr:.1f}%")
+        return None
+
+    is_confirm_15m = abs(ch15) >= CONFIRM_15M_ABS_MIN
+    is_early_allowed = (abs(ch1) >= EARLY_1H_ABS_MIN)
+
+    if strict_15m:
+        if (not is_confirm_15m) and (not is_early_allowed):
+            _rej("15m_weak_and_not_early", base, mv, f"ch15={ch15:+.2f}% ch1={ch1:+.2f}%")
+            return None
+
+    if strict_15m and (not is_confirm_15m):
+        conf = max(0, int(conf) - int(EARLY_CONF_PENALTY))
+
+    tp_cap_pct = tp_cap_pct_for_coin(fut_vol, ch24)
+
+    rr_bonus = ENGINE_B_RR_BONUS if engine_b_ok else 0.0
+    tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine_b_ok else 0.0
+
+    sl, tp3_single, R = compute_sl_tp(
+        entry, side, atr_1h, conf, tp_cap_pct,
+        rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
+    )
+    if sl <= 0 or tp3_single <= 0 or R <= 0:
+        _rej("bad_sl_tp_or_atr", base, mv, f"atr={atr_1h:.6g} entry={entry:.6g}")
+        return None
+
+    tp1 = tp2 = None
+    tp3 = tp3_single
+    if conf >= MULTI_TP_MIN_CONF:
+        _tp1, _tp2, _tp3 = multi_tp(
+            entry, side, R, tp_cap_pct, conf,
             rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
         )
-        if sl <= 0 or tp3_single <= 0 or R <= 0:
-            _rej("bad_sl_tp_or_atr", base, mv, f"atr={atr_1h:.6g} entry={entry:.6g}")
-            return None
+        if _tp1 and _tp2 and _tp3:
+            tp1, tp2, tp3 = _tp1, _tp2, _tp3
 
-        tp1 = tp2 = None
-        tp3 = tp3_single
-        if conf >= MULTI_TP_MIN_CONF:
-            _tp1, _tp2, _tp3 = multi_tp(
-                entry, side, R, tp_cap_pct, conf,
-                rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
-            )
-            if _tp1 and _tp2 and _tp3:
-                tp1, tp2, tp3 = _tp1, _tp2, _tp3
+    sid = next_setup_id()
+    hot = is_hot_coin(fut_vol, ch24)
 
-        sid = next_setup_id()
-        hot = is_hot_coin(fut_vol, ch24)
+    # ✅ trailing only for the setups that need it (Momentum + Hot)
+    trailing_tp3 = bool(hot and engine == "B")
 
-        # ✅ trailing only for the setups that need it (Momentum + Hot)
-        trailing_tp3 = bool(hot and engine == "B")
-
-        return Setup(
-            setup_id=sid,
-            symbol=base,
-            market_symbol=mv.symbol,
-            side=side,
-            conf=int(conf),
-            entry=entry,
-            sl=sl,
-            tp1=tp1,
-            tp2=tp2,
-            tp3=tp3,
-            fut_vol_usd=fut_vol,
-            ch24=ch24,
-            ch4=ch4,
-            ch1=ch1,
-            ch15=ch15,
-            ema_support_period=int(ema_period),
-            ema_support_dist_pct=float(abs(entry - float(ema_support_15m)) / entry * 100.0 if entry > 0 else 999.0),
-            pullback_ema_period=int(pb_ema_p),
-            pullback_ema_dist_pct=float(pb_dist_pct2),
-            pullback_ready=bool(pullback_ready),
-            pullback_bypass_hot=bool(pullback_bypass_hot),
-            engine=str(engine),
-            is_trailing_tp3=trailing_tp3,
-            created_ts=time.time(),
-        )
-    except Exception as e:
-        # Never let a single symbol crash setup generation — fallback to a conservative ATR-based setup.
-        try:
-            _rej('exception_in_make_setup', base, mv, str(e)[:160])
-        except Exception:
-            pass
-        entry_f = float(getattr(mv, 'last', 0.0) or 0.0)
-        if entry_f <= 0:
-            return None
-        ch24_f = float(getattr(mv, 'percentage', 0.0) or 0.0)
-        side_f = 'BUY' if ch24_f >= 0 else 'SELL'
-        atr_1h_f = 0.0
-        try:
-            c1_f = fetch_ohlcv(getattr(mv, 'symbol', ''), '1h', limit=max(ATR_PERIOD + 10, 80))
-            atr_1h_f = compute_atr_from_ohlcv(c1_f, ATR_PERIOD) if c1_f else 0.0
-        except Exception:
-            atr_1h_f = 0.0
-        if atr_1h_f <= 0:
-            atr_1h_f = max(entry_f * 0.01, 0.0000001)  # 1% default
-        sl_dist = 1.4 * atr_1h_f
-        tp_dist = 2.2 * atr_1h_f
-        if side_f == 'BUY':
-            sl_f = max(entry_f - sl_dist, entry_f * 0.001)
-            tp3_f = entry_f + tp_dist
-            tp1_f = entry_f + tp_dist * 0.6
-            tp2_f = entry_f + tp_dist * 0.85
-        else:
-            sl_f = entry_f + sl_dist
-            tp3_f = max(entry_f - tp_dist, entry_f * 0.001)
-            tp1_f = max(entry_f - tp_dist * 0.6, entry_f * 0.001)
-            tp2_f = max(entry_f - tp_dist * 0.85, entry_f * 0.001)
-        fut_vol_f = 0.0
-        try:
-            fut_vol_f = float(usd_notional(mv) or 0.0)
-        except Exception:
-            fut_vol_f = 0.0
-        return Setup(
-            setup_id=_new_setup_id(),
-            symbol=str(base).upper(),
-            market_symbol=str(getattr(mv, 'symbol', base)),
-            side=side_f,
-            conf=72,
-            entry=entry_f,
-            sl=sl_f,
-            tp1=tp1_f,
-            tp2=tp2_f,
-            tp3=tp3_f,
-            fut_vol_usd=fut_vol_f,
-            ch24=ch24_f,
-            ch4=0.0,
-            ch1=0.0,
-            ch15=0.0,
-            ema_support_period=0,
-            ema_support_dist_pct=0.0,
-            pullback_ema_period=0,
-            pullback_ema_dist_pct=0.0,
-            pullback_ready=True,
-            pullback_bypass_hot=True,
-            engine='F',
-            is_trailing_tp3=False,
-            created_ts=time.time(),
-        )
+    return Setup(
+        setup_id=sid,
+        symbol=base,
+        market_symbol=mv.symbol,
+        side=side,
+        conf=int(conf),
+        entry=entry,
+        sl=sl,
+        tp1=tp1,
+        tp2=tp2,
+        tp3=tp3,
+        fut_vol_usd=fut_vol,
+        ch24=ch24,
+        ch4=ch4,
+        ch1=ch1,
+        ch15=ch15,
+        ema_support_period=int(ema_period),
+        ema_support_dist_pct=float(abs(entry - float(ema_support_15m)) / entry * 100.0 if entry > 0 else 999.0),
+        pullback_ema_period=int(pb_ema_p),
+        pullback_ema_dist_pct=float(pb_dist_pct2),
+        pullback_ready=bool(pullback_ready),
+        pullback_bypass_hot=bool(pullback_bypass_hot),
+        engine=str(engine),
+        is_trailing_tp3=trailing_tp3,
+        created_ts=time.time(),
+    )
 
 
 
@@ -4159,39 +4089,17 @@ def pick_setups(
     allow_no_pullback: bool = False,   # /screen True, email False (except HOT bypass inside make_setup)
     scan_profile: str = DEFAULT_SCAN_PROFILE,
 ) -> List[Setup]:
-    """Generate setups from a best_fut dict.
-
-    IMPORTANT:
-    - Must never abort the entire scan because one symbol throws.
-    - Must keep /why meaningful by marking status for every evaluated symbol.
-    - Must NOT wipe _WAITING_TRIGGER on each call (build_priority_pool may call us multiple times per scan).
-    """
     global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL, _WAITING_TRIGGER
-
-    # Keep legacy globals for other debug paths, but don't nuke waiting triggers each call.
-    try:
-        _REJECT_STATS = Counter()
-        _REJECT_SAMPLES = {}
-        _REJECT_BY_SYMBOL = {}
-    except Exception:
-        pass
-    try:
-        if not isinstance(_WAITING_TRIGGER, dict):
-            _WAITING_TRIGGER = {}
-    except Exception:
-        _WAITING_TRIGGER = {}
+    _REJECT_STATS = Counter()
+    _REJECT_SAMPLES = {}
+    _REJECT_BY_SYMBOL = {}
+    _WAITING_TRIGGER = {}
 
     universe_n = int(max(10, universe_n))
     universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:universe_n]
 
     setups: List[Setup] = []
     for base, mv in universe:
-        # Mark that we are actively evaluating this symbol (so it never remains not_evaluated)
-        try:
-            _note_status("evaluating", base, mv)
-        except Exception:
-            pass
-
         try:
             s = make_setup(
                 base,
@@ -4203,13 +4111,12 @@ def pick_setups(
                 waiting_near_pct=float(waiting_near_pct),
                 scan_profile=str(scan_profile or DEFAULT_SCAN_PROFILE),
             )
-        except Exception as e:
-            # Never let one bad symbol kill the whole scan.
+        except Exception:
             try:
-                _rej("exception_in_make_setup", base, mv, str(e)[:120])
+                _rej("make_setup_exception", base, mv)
             except Exception:
                 pass
-            continue
+            s = None
 
         if s:
             try:
@@ -4217,32 +4124,20 @@ def pick_setups(
             except Exception:
                 pass
             setups.append(s)
-            continue
-
-        # If make_setup produced a waiting trigger, mark that explicitly
-        try:
-            bU = str(base or "").upper().strip()
-            if bU and isinstance(_WAITING_TRIGGER, dict) and bU in {str(k).upper() for k in _WAITING_TRIGGER.keys()}:
-                _note_status("waiting_trigger", base, mv)
-        except Exception:
-            pass
-
-        # If make_setup returned None without a meaningful reject/status, record a generic reason
-        try:
-            ctx = _REJECT_CTX.get()
-            b = str(base or "").upper().strip()
-            per = (ctx or {}).get("__per__") if isinstance(ctx, dict) else None
-            cur_reason = None
-            if isinstance(per, dict) and b in per:
-                cur_reason = str((per.get(b) or {}).get("reason") or "")
-            if cur_reason in ("", "not_evaluated", "evaluating", "evaluated"):
-                _rej("no_engine_passed", base, mv, "make_setup_returned_none")
-        except Exception:
-            pass
+        else:
+            # If make_setup returns None without recording a reject, add a generic reject
+            # so /why is never empty and tuning is possible.
+            try:
+                ctx = _REJECT_CTX.get()
+                b = str(base or "").upper().strip()
+                per = (ctx or {}).get("__per__") if isinstance(ctx, dict) else None
+                if b and isinstance(ctx, dict) and (not isinstance(per, dict) or b not in per):
+                    _rej("no_setup_candidate", base, mv, "make_setup_returned_none")
+            except Exception:
+                pass
 
     setups.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
     return setups[:n]
-
 
 
 # =========================================================
@@ -7596,7 +7491,7 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
             symbol=base,
             market_symbol=market_symbol,
             side=side,
-            conf=80,
+            conf=70,
             entry=entry,
             sl=sl,
             tp1=tp1,
@@ -7925,14 +7820,13 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             ordered.append(best[k])
             seen.add(k)
 
-    # If still empty, create a small fallback set so the bot always produces something.
-    # This is intentionally conservative (ATR-based) and only triggers when all engines produce nothing.
-    if not ordered:
+    # If still empty, create a small fallback set so /screen isn't blank.
+    if not ordered and mode == "screen":
         try:
-            _max_items = max(4, int(n_target)) if mode == "screen" else max(3, int(EMAIL_SETUPS_N or 3))
-            ordered = _fallback_setups_from_universe(best_fut, leaders, losers, market_bases, session_name, max_items=_max_items)
+            ordered = _fallback_setups_from_universe(best_fut, leaders, losers, market_bases, session_name, max_items=max(4, n_target))
         except Exception:
             pass
+
     # -----------------------------------------------------
     # NEW: Spike Reversal candidates (15M+ Vol) — for /screen only
     # -----------------------------------------------------
@@ -7972,25 +7866,11 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Store diagnostics for /why, then ALWAYS reset context
     try:
         if uid is not None:
-            counts = {}
-            try:
-                for k, v in dict(_rej_ctx).items():
-                    if str(k).startswith("__"):
-                        continue
-                    if isinstance(v, (int, float)):
-                        counts[str(k)] = int(v)
-            except Exception:
-                pass
-
-            try:
-                _LAST_REJECTS[int(uid)] = {
-                    "ts": time.time(),
-                    "counts": counts,
-                    "allow": list(_rej_ctx.get("__allow__") or []),
-                    "per_symbol": dict((_rej_ctx.get("__per__") or {})),
-                }
-            except Exception:
-                pass
+            _LAST_REJECTS[int(uid)] = {
+                "ts": time.time(),
+                "allow": list(_rej_ctx.get("__allow__") or []),
+                "per_symbol": dict((_rej_ctx.get("__per__") or {})),
+            }
     finally:
         try:
             _REJECT_CTX.reset(_rej_token)
