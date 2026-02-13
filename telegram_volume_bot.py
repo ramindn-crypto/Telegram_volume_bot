@@ -3576,6 +3576,8 @@ def make_setup(
 
     _note_status("evaluated", base, mv)
 
+
+    notes = []  # collect internal notes for pullback policy / diagnostics
     try:
 
         ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
@@ -3961,7 +3963,15 @@ def make_breakout_setup(
 
     ch24 = float(mv.percentage or 0.0)
 
-    ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
+    try:
+        ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
+    except Exception:
+        _rej("ohlcv_missing_or_insufficient", base, mv)
+        return None
+
+    # Align naming with make_setup()
+    ch4_used = float(ch4 or 0.0)
+
     if not c1 or len(c1) < 25 or atr_1h <= 0:
         _rej("no_candles_breakout", base, mv)
         return None
