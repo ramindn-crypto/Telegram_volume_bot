@@ -8181,6 +8181,16 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 setups_txt = "\n\n".join(pull_cards) if pull_cards else "_No pullback setups right now._"
                 momentum_txt = "\n\n".join(mom_cards) if mom_cards else "_No breakout setups right now._"
+                # Ensure combined_setups_txt is always defined (used later in /screen output)
+                if pull_cards or mom_cards:
+                    if pull_cards and mom_cards:
+                        combined_setups_txt = "\n\n".join(pull_cards + mom_cards)
+                    elif pull_cards:
+                        combined_setups_txt = "\n\n".join(pull_cards)
+                    else:
+                        combined_setups_txt = "\n\n".join(mom_cards)
+                else:
+                    combined_setups_txt = "_No high-quality setups right now._"
 
             else:
                 setups_txt = "_No high-quality setups right now._"
