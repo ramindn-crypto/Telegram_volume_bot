@@ -1,3 +1,4 @@
+@ -0,0 +1,10700 @@
 _LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
 #!/usr/bin/env python3
 """
@@ -9713,7 +9714,16 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         vol_usd = 0.0
 
-                abs_min = float(email_abs_vol_min)
+                # Per-user email volume floors (stricter than /screen, but configurable)
+                try:
+                    abs_min = float(user.get("email_abs_vol_min_usd", user.get("email_abs_vol_min", 5_000_000)) or 5_000_000)
+                except Exception:
+                    abs_min = 5_000_000.0
+
+                try:
+                    rel_mult = float(user.get("email_rel_vol_min_mult", user.get("email_rel_vol_mult", 0.80)) or 0.80)
+                except Exception:
+                    rel_mult = 0.80
 
                 if vol_usd > 0.0 and vol_usd < abs_min:
                     skip_reasons_counter["email_vol_abs_too_low"] += 1
@@ -9721,7 +9731,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
                 if vol_usd > 0.0 and float(MARKET_VOL_MEDIAN_USD or 0.0) > 0:
                     rel = vol_usd / float(MARKET_VOL_MEDIAN_USD)
-                    if rel < float(email_rel_vol_min_mult):
+                    if rel < float(rel_mult):
                         skip_reasons_counter["email_vol_rel_too_low"] += 1
                         continue
 
@@ -9815,8 +9825,17 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 )
             except asyncio.TimeoutError:
                 ok = False
-            except Exception:
+                try:
+                    _LAST_SMTP_ERROR[uid] = f"timeout_after_{int(EMAIL_SEND_TIMEOUT_SEC)}s"
+                except Exception:
+                    pass
+            except Exception as e:
                 ok = False
+                logger.exception("send_email_alert_multi failed for uid=%s: %s", uid, e)
+                try:
+                    _LAST_SMTP_ERROR[uid] = f"{type(e).__name__}: {e}"
+                except Exception:
+                    pass
 
             if ok:
                 try:
@@ -9844,7 +9863,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             else:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "ERROR",
-                    "reasons": ["send_email_failed_or_timeout"],
+                    "reasons": ["send_email_failed_or_timeout", _LAST_SMTP_ERROR.get(uid, "unknown_error")],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
 
