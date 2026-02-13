@@ -3030,35 +3030,39 @@ def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float
     """
     returns: ch1, ch4, ch15, atr_1h, ema_support_15m, ema_support_period, c15, c1
     """
-    need_1h = max(ATR_PERIOD + 6, 35)
-    c1 = fetch_ohlcv(market_symbol, "1h", limit=need_1h)
-    if not c1 or len(c1) < 25:
+    try:
+        need_1h = max(ATR_PERIOD + 6, 35)
+        c1 = fetch_ohlcv(market_symbol, "1h", limit=need_1h)
+        if not c1 or len(c1) < 25:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0, [], []
+
+        closes_1h = [float(x[4]) for x in c1]
+        c_last = closes_1h[-1]
+        c_prev1 = closes_1h[-2]
+        c_prev4 = closes_1h[-5] if len(closes_1h) >= 5 else closes_1h[0]
+
+        ch1 = ((c_last - c_prev1) / c_prev1) * 100.0 if c_prev1 else 0.0
+        ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
+        atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
+
+        c15 = fetch_ohlcv(market_symbol, "15m", limit=80)
+        if not c15 or len(c15) < 20:
+            return ch1, ch4, 0.0, atr_1h, 0.0, 0, [], c1
+
+        closes_15 = [float(x[4]) for x in c15]
+        entry_proxy = float(closes_15[-1]) if closes_15 else 0.0
+        atr_pct_proxy = (atr_1h / entry_proxy) * 100.0 if (atr_1h and entry_proxy) else 2.0
+
+        ema_support_15m, ema_period = adaptive_ema_value(closes_15, atr_pct_proxy)
+
+        c15_last = float(c15[-1][4])
+        c15_prev = float(c15[-2][4])
+        ch15 = ((c15_last - c15_prev) / c15_prev) * 100.0 if c15_prev else 0.0
+
+        return ch1, ch4, ch15, atr_1h, ema_support_15m, int(ema_period), c15, c1
+    except Exception:
+        # Never let candle/EMA computation crash the scan
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0, [], []
-
-    closes_1h = [float(x[4]) for x in c1]
-    c_last = closes_1h[-1]
-    c_prev1 = closes_1h[-2]
-    c_prev4 = closes_1h[-5] if len(closes_1h) >= 5 else closes_1h[0]
-
-    ch1 = ((c_last - c_prev1) / c_prev1) * 100.0 if c_prev1 else 0.0
-    ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
-    atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
-
-    c15 = fetch_ohlcv(market_symbol, "15m", limit=80)
-    if not c15 or len(c15) < 20:
-        return ch1, ch4, 0.0, atr_1h, 0.0, 0, [], c1
-
-    closes_15 = [float(x[4]) for x in c15]
-    entry_proxy = float(closes_15[-1]) if closes_15 else 0.0
-    atr_pct_proxy = (atr_1h / entry_proxy) * 100.0 if (atr_1h and entry_proxy) else 2.0
-
-    ema_support_15m, ema_period = adaptive_ema_value(closes_15, atr_pct_proxy)
-
-    c15_last = float(c15[-1][4])
-    c15_prev = float(c15[-2][4])
-    ch15 = ((c15_last - c15_prev) / c15_prev) * 100.0 if c15_prev else 0.0
-
-    return ch1, ch4, ch15, atr_1h, ema_support_15m, int(ema_period), c15, c1
 
 
 # =========================================================
@@ -7525,7 +7529,7 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
             symbol=base,
             market_symbol=market_symbol,
             side=side,
-            conf=70,
+            conf=80,
             entry=entry,
             sl=sl,
             tp1=tp1,
