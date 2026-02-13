@@ -940,6 +940,7 @@ def reset_reject_tracker() -> None:
 # =========================================================
 _REJECT_CTX = contextvars.ContextVar("pf_reject_ctx", default=None)
 _LAST_REJECTS = {}  # uid -> {"ts": float, "counts": { "A:no_trigger": 12, ... }}
+_GLOBAL_REJECT_CTX = None  # fallback reject ctx when contextvars don't propagate across nested threads
 
 def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
     """Record reject reasons for diagnostics.
@@ -950,7 +951,13 @@ def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
     """
     ctx = _REJECT_CTX.get()
     if not isinstance(ctx, dict):
-        return
+        # Fallback: nested asyncio.to_thread() inside our thread runner can drop contextvars.
+        # Use the global ctx for this scan if available.
+        global _GLOBAL_REJECT_CTX
+        if isinstance(_GLOBAL_REJECT_CTX, dict):
+            ctx = _GLOBAL_REJECT_CTX
+        else:
+            return
 
     b = str(base or "").upper().strip()
     if not b:
@@ -7453,6 +7460,9 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
     # Diagnostics: collect reject reasons for this scan
     _rej_ctx = {}
+    # Fallback for nested threads that may lose contextvars
+    global _GLOBAL_REJECT_CTX
+    _GLOBAL_REJECT_CTX = _rej_ctx
     _rej_token = _REJECT_CTX.set(_rej_ctx)
 
     # Reset near-miss list for this scan (so /screen doesn't show stale symbols)
@@ -7791,6 +7801,10 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     finally:
         try:
             _REJECT_CTX.reset(_rej_token)
+        except Exception:
+            pass
+        try:
+            _GLOBAL_REJECT_CTX = None
         except Exception:
             pass
 
