@@ -998,7 +998,7 @@ def _note_status(status: str, base: str, mv: "MarketVol", extra: str = "") -> No
     """Record non-reject per-symbol status for diagnostics (/why).
 
     This uses the same reject context plumbing as _rej(), but does NOT increment aggregate reject counters.
-    It only sets ctx["__per__"][BASE] so we don't show '(no reject recorded)' for symbols that actually
+    It only sets ctx["__per__"][BASE] so we don't show '(not evaluated / no decision)' for symbols that actually
     passed gates or produced a setup.
     """
     ctx = _REJECT_CTX.get()
@@ -1090,7 +1090,7 @@ def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
                 per_lines.append(f"• {b}: {r} ({n})")
                 continue
         # No recorded reject for this symbol in the last scan
-        per_lines.append(f"• {b}: (no reject recorded)")
+        per_lines.append(f"• {b}: (not evaluated / no decision)")
 
     # If the universe is large, keep per-symbol section readable
     max_per = 20
@@ -7602,6 +7602,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Diagnostics: keep /why focused on this scan universe
     try:
         _rej_ctx["__allow__"] = set([str(x).upper() for x in (universe_bases or [])])
+_rej_ctx["__per__"] = {str(b).upper(): {"reason": "not_evaluated", "n": 0} for b in (universe_bases or [])}
         try:
             global _LAST_SCAN_UNIVERSE
             _LAST_SCAN_UNIVERSE = list(universe_bases or [])
