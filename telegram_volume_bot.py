@@ -3623,6 +3623,10 @@ def make_setup(
 
                 side_guess = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.25 else ("BUY" if ch1 > 0 else "SELL")
                 _WAITING_TRIGGER[str(base)] = {"side": side_guess, "dot": dot}
+                try:
+                    _note_status("waiting_trigger", base, mv)
+                except Exception:
+                    pass
 
         # Balanced breakout override: even if 1H change is small, allow true breakouts
         # Additional overrides: allow setups during quiet 1H candles if 4H/24H move is strong and 15m confirms.
@@ -4110,14 +4114,26 @@ def pick_setups(
                 pass
             setups.append(s)
         else:
-            # If make_setup returns None without recording a reject, add a generic reject
-            # so /why is never empty and tuning is possible.
+            # If make_setup returns None, ensure /why still shows a meaningful per-symbol decision.
+            # We treat a still-default "not_evaluated" as "no_engine_passed" so tuning is possible.
             try:
                 ctx = _REJECT_CTX.get()
+                if not isinstance(ctx, dict):
+                    global _GLOBAL_REJECT_CTX
+                    if isinstance(_GLOBAL_REJECT_CTX, dict):
+                        ctx = _GLOBAL_REJECT_CTX
+
                 b = str(base or "").upper().strip()
                 per = (ctx or {}).get("__per__") if isinstance(ctx, dict) else None
-                if b and isinstance(ctx, dict) and (not isinstance(per, dict) or b not in per):
-                    _rej("no_setup_candidate", base, mv, "make_setup_returned_none")
+
+                if b and isinstance(per, dict):
+                    cur = per.get(b) or {}
+                    cur_reason = str(cur.get("reason") or "").strip()
+                    if cur_reason in ("", "not_evaluated", "not_evaluated (0)"):
+                        _rej("no_engine_passed", base, mv, "make_setup_returned_none")
+                elif b and isinstance(ctx, dict):
+                    # no per dict available: record something anyway
+                    _rej("no_engine_passed", base, mv, "make_setup_returned_none")
             except Exception:
                 pass
 
