@@ -9637,6 +9637,35 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             min_conf = SESSION_MIN_CONF.get(sess["name"], 78)
             min_rr = SESSION_MIN_RR_TP3.get(sess["name"], 2.0)
 
+            # -------------------------------------------------
+            # Per-user EMAIL filter parameters (safe defaults)
+            # -------------------------------------------------
+            try:
+                email_abs_vol_min = float((user.get("email_abs_vol_min_usd") if isinstance(user, dict) else None) or EMAIL_ABS_VOL_USD_MIN)
+            except Exception:
+                email_abs_vol_min = float(EMAIL_ABS_VOL_USD_MIN)
+
+            try:
+                email_rel_vol_min_mult = float((user.get("email_rel_vol_min_mult") if isinstance(user, dict) else None) or EMAIL_REL_VOL_MIN_MULT)
+            except Exception:
+                email_rel_vol_min_mult = float(EMAIL_REL_VOL_MIN_MULT)
+
+            try:
+                confirm_15m_abs_min = float((user.get("confirm_15m_abs_min") if isinstance(user, dict) else None) or CONFIRM_15M_ABS_MIN)
+            except Exception:
+                confirm_15m_abs_min = float(CONFIRM_15M_ABS_MIN)
+
+            try:
+                early_1h_abs_min = float((user.get("early_1h_abs_min") if isinstance(user, dict) else None) or EARLY_1H_ABS_MIN)
+            except Exception:
+                early_1h_abs_min = float(EARLY_1H_ABS_MIN)
+
+            # Extra strictness for EMAIL (but not "never send"): allow user override, else keep conservative defaults.
+            try:
+                email_early_min_ch15_abs = float((user.get("email_early_min_ch15_abs") if isinstance(user, dict) else None) or EMAIL_EARLY_MIN_CH15_ABS)
+            except Exception:
+                email_early_min_ch15_abs = float(email_early_min_ch15_abs)
+
             confirmed: List[Setup] = []
             early: List[Setup] = []
             skip_reasons_counter = Counter()
@@ -9708,7 +9737,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                     if abs(float(s.ch1)) < float(early_1h_abs_min):
                         skip_reasons_counter["early_gate_ch1_not_strong"] += 1
                         continue
-                    if abs(float(ch15)) < float(EMAIL_EARLY_MIN_CH15_ABS):
+                    if abs(float(ch15)) < float(email_early_min_ch15_abs):
                         skip_reasons_counter["early_gate_15m_too_weak"] += 1
                         continue
                     if s.conf < (min_conf + EARLY_EMAIL_EXTRA_CONF):
