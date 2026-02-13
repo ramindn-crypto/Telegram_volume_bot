@@ -3574,6 +3574,8 @@ def make_setup(
 
     ch24 = float(mv.percentage or 0.0)
 
+    _note_status("evaluated", base, mv)
+
     ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
 
     # Use true 4H change from 4H candles (more stable than 1H*4 approximation)
@@ -7603,8 +7605,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     if leaders:
         sub = _subset_best(best_fut, leaders)
         try:
-            tmp = await asyncio.to_thread(
-                pick_setups,
+            tmp = pick_setups(
                 sub,
                 n_target * scan_multiplier,
                 strict_15m,
@@ -7624,8 +7625,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     if losers:
         sub = _subset_best(best_fut, losers)
         try:
-            tmp = await asyncio.to_thread(
-                pick_setups,
+            tmp = pick_setups(
                 sub,
                 n_target * scan_multiplier,
                 strict_15m,
@@ -7648,8 +7648,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Ensures /why has coverage for all symbols shown and increases setup discovery.
     try:
         if universe_best:
-            tmp = await asyncio.to_thread(
-                pick_setups,
+            tmp = pick_setups(
                 universe_best,
                 n_target * scan_multiplier,
                 strict_15m,
@@ -7675,8 +7674,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         bases_for_breakout = list(dict.fromkeys([b.upper() for b in (leaders + losers)]))
         if bases_for_breakout:
             sub = _subset_best(best_fut, bases_for_breakout)
-            breakout_setups = await asyncio.to_thread(
-                pick_breakout_setups,
+            breakout_setups = pick_breakout_setups(
+                
                 sub,
                 int(max(6, n_target)),   # allow a handful
                 session_name,
@@ -7710,8 +7709,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     if trend_bases:
         sub = _subset_best(best_fut, trend_bases[:trend_take])
         try:
-            tmp = await asyncio.to_thread(
-                pick_setups,
+            tmp = pick_setups(
                 sub,
                 n_target * scan_multiplier,
                 strict_15m,
@@ -7743,9 +7741,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         if market_bases:
             sub = _subset_best(best_fut, market_bases)
             try:
-                tmp = await asyncio.to_thread(
-                    pick_setups,
-                    sub,
+                tmp = pick_setups(
+                sub,
                     n_target * scan_multiplier,
                     strict_15m,
                     session_name,
@@ -7764,8 +7761,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # NOTE: keep in same unified list; /screen splits by s.engine == "B"
     try:
         mom_n = max(6, int(n_target) * 2)
-        mom = await asyncio.to_thread(
-            pick_breakout_setups,
+        mom = pick_breakout_setups(
+                
             universe_best,  # ✅ restricted universe
             mom_n,
             session_name,
