@@ -993,6 +993,46 @@ def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
     return
 
 
+
+def _note_status(status: str, base: str, mv: "MarketVol", extra: str = "") -> None:
+    """Record non-reject per-symbol status for diagnostics (/why).
+
+    This uses the same reject context plumbing as _rej(), but does NOT increment aggregate reject counters.
+    It only sets ctx["__per__"][BASE] so we don't show '(no reject recorded)' for symbols that actually
+    passed gates or produced a setup.
+    """
+    ctx = _REJECT_CTX.get()
+    if not isinstance(ctx, dict):
+        global _GLOBAL_REJECT_CTX
+        if isinstance(_GLOBAL_REJECT_CTX, dict):
+            ctx = _GLOBAL_REJECT_CTX
+        else:
+            return
+    b = str(base or "").upper().strip()
+    if not b:
+        return
+    allow = ctx.get("__allow__")
+    try:
+        if allow is not None:
+            _allow_set = set(allow)
+            if len(_allow_set) > 0 and b not in _allow_set:
+                return
+    except Exception:
+        pass
+    st = str(status or "").strip() or "status"
+    try:
+        per = ctx.get("__per__")
+        if not isinstance(per, dict):
+            per = {}
+            ctx["__per__"] = per
+        per_item = per.get(b) or {}
+        n = int(per_item.get("n") or 0) + 1
+        # keep 'reason' key for backward compatibility in /why renderer
+        per[b] = {"reason": st, "n": n}
+    except Exception:
+        pass
+    return
+
 def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
     """Explain why setups were rejected in the *last* scan for this user.
 
@@ -4052,6 +4092,10 @@ def pick_setups(
             scan_profile=str(scan_profile or DEFAULT_SCAN_PROFILE),
         )
         if s:
+            try:
+                _note_status("setup_generated", base, mv)
+            except Exception:
+                pass
             setups.append(s)
         else:
             # If make_setup returns None without recording a reject, add a generic reject
