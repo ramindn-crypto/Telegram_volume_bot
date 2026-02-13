@@ -9512,13 +9512,35 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             skip_reasons_counter = Counter()
 
             for s in setups_all:
-                if s.conf < min_conf:
+                base = str(getattr(s, "symbol", "") or "").upper().strip()
+
+                # For /screen, be slightly more permissive so the bot doesn't feel "dead" in slow hours.
+                # Email stays at the stricter session floors.
+                eff_min_conf = int(min_conf)
+                eff_min_rr = float(min_rr)
+                if str(mode or "").lower() == "screen":
+                    eff_min_conf = max(70, int(min_conf) - 6)
+                    eff_min_rr = max(1.6, float(min_rr) - 0.30)
+
+                if s.conf < eff_min_conf:
                     skip_reasons_counter["below_session_conf_floor"] += 1
+                    try:
+                        mv = (best_fut or {}).get(base)
+                        if mv is not None:
+                            _rej("below_session_conf_floor", base, mv, f"conf={int(s.conf)} min={int(eff_min_conf)}")
+                    except Exception:
+                        pass
                     continue
 
                 rr3 = rr_to_tp(float(s.entry), float(s.sl), float(s.tp3))
-                if float(rr3) < float(min_rr):
+                if float(rr3) < float(eff_min_rr):
                     skip_reasons_counter["below_session_rr_floor"] += 1
+                    try:
+                        mv = (best_fut or {}).get(base)
+                        if mv is not None:
+                            _rej("below_session_rr_floor", base, mv, f"rr3={float(rr3):.2f} min={float(eff_min_rr):.2f}")
+                    except Exception:
+                        pass
                     continue
 
                 # =========================================================
