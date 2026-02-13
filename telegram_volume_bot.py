@@ -3082,6 +3082,28 @@ def pct_with_emoji(p: float) -> str:
         emo = "🟡"
     return f"{val:+d}% {emo}"
 
+def _fmt_when(ts) -> str:
+    """Best-effort timestamp formatter for decision debug commands."""
+    try:
+        if ts is None:
+            return ""
+        # If already an ISO-ish string, return as-is
+        if isinstance(ts, str):
+            s = ts.strip()
+            if s:
+                return s
+            return ""
+        # Unix timestamp (sec)
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(float(ts), tz=_dt.timezone.utc).isoformat(timespec="seconds")
+    except Exception:
+        try:
+            return str(ts)
+        except Exception:
+            return ""
+
+
+
 def tv_chart_url(symbol_base: str) -> str:
     return f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol_base.upper()}USDT.P"
 
@@ -9626,10 +9648,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 # Email stays at the stricter session floors.
                 eff_min_conf = int(min_conf)
                 eff_min_rr = float(min_rr)
-                if str(mode or "").lower() == "screen":
-                    eff_min_conf = max(70, int(min_conf) - 6)
-                    eff_min_rr = max(1.6, float(min_rr) - 0.30)
-
                 if s.conf < eff_min_conf:
                     skip_reasons_counter["below_session_conf_floor"] += 1
                     try:
