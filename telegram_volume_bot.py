@@ -3605,7 +3605,7 @@ def make_setup(
     atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
     trig_min_raw = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
 
-    floor_min = 0.03 if aggressive_screen else 0.06  # loosened: allow setups in quiet 1H candles
+    floor_min = 0.025 if aggressive_screen else 0.05  # further loosened: allow setups in quiet 1H candles
     trig_min = max(float(floor_min), float(trig_min_raw) * float(trigger_loosen_mult))
 
     if abs(ch1) < trig_min:
@@ -3626,14 +3626,14 @@ def make_setup(
 
         # Balanced breakout override: even if 1H change is small, allow true breakouts
         # Additional overrides: allow setups during quiet 1H candles if 4H/24H move is strong and 15m confirms.
-        override_4h = (abs(float(ch4_used or 0.0)) >= max(1.2, float(trig_min) * 2.0)) and (abs(float(ch15 or 0.0)) >= 0.15)
-        override_24h = (abs(float(ch24 or 0.0)) >= 12.0) and (abs(float(ch15 or 0.0)) >= 0.12)
+        override_4h = (abs(float(ch4_used or 0.0)) >= max(0.9, float(trig_min) * 1.6)) and (abs(float(ch15 or 0.0)) >= 0.10)
+        override_24h = (abs(float(ch24 or 0.0)) >= 10.0) and (abs(float(ch15 or 0.0)) >= 0.08)
         # Extra override: if 24H is very strong AND 4H aligns, don't require 15m confirmation (quiet consolidation after a big move)
-        override_24h_strong = (abs(float(ch24 or 0.0)) >= 22.0) and (abs(float(ch4_used or 0.0)) >= 0.75) and (float(fut_vol or 0.0) >= 8_000_000.0)
+        override_24h_strong = (abs(float(ch24 or 0.0)) >= 18.0) and (abs(float(ch4_used or 0.0)) >= 0.60) and (float(fut_vol or 0.0) >= 5_000_000.0)
         breakout_override = False
         # Trend override: if 4H regime move is meaningful, allow even if this 1H is quiet.
         try:
-            if abs(float(ch4_used or 0.0)) >= max(0.90, float(trig_min) * 4.0) and float(fut_vol or 0.0) >= 5_000_000.0:
+            if abs(float(ch4_used or 0.0)) >= max(0.75, float(trig_min) * 3.0) and float(fut_vol or 0.0) >= 5_000_000.0:
                 breakout_override = True
         except Exception:
             pass
@@ -3659,7 +3659,17 @@ def make_setup(
         except Exception:
             breakout_override = False
 
-        if not (breakout_override or override_4h or override_24h or override_24h_strong):
+        # Soft override: if we are close to the trigger and the higher timeframe move supports direction,
+        # allow a lower-confidence setup instead of rejecting everything on a quiet 1H candle.
+        try:
+            ratio = (abs(float(ch1)) / float(trig_min)) if float(trig_min) > 0 else 0.0
+        except Exception:
+            ratio = 0.0
+        soft_override = (ratio >= 0.78) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
+            abs(float(ch4_used or 0.0)) >= 0.60 or abs(float(ch24 or 0.0)) >= 14.0
+        )
+
+        if not (breakout_override or override_4h or override_24h or override_24h_strong or soft_override):
             _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% trig={trig_min:.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}% ch15={ch15:+.2f}%")
             return None
 
