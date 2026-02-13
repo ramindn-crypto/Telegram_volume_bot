@@ -3517,6 +3517,7 @@ def make_setup(
 
     fut_vol = usd_notional(mv)
     if fut_vol <= 0:
+        _rej("no_futures_volume", base, mv)
         return None
 
     entry = float(mv.last or 0.0)
@@ -3884,6 +3885,7 @@ def make_breakout_setup(
     """
     fut_vol = usd_notional(mv)
     if fut_vol <= 0:
+        _rej("no_futures_volume", base, mv)
         return None
 
     entry = float(mv.last or 0.0)
@@ -7587,7 +7589,31 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                 priority_setups.append(s)
 
     
-    # ------------------------------------------------
+    
+    # 1b) Full universe pass (leaders + losers + market leaders)
+    # Ensures /why has coverage for all symbols shown and increases setup discovery.
+    try:
+        if universe_best:
+            tmp = await asyncio.to_thread(
+                pick_setups,
+                universe_best,
+                n_target * scan_multiplier,
+                strict_15m,
+                session_name,
+                min(int(universe_cap), len(universe_best) if universe_best else universe_cap),
+                trigger_loosen,
+                waiting_near,
+                allow_no_pullback,
+                scan_profile=prof,
+            )
+        else:
+            tmp = []
+    except Exception:
+        tmp = []
+    for s in tmp or []:
+        priority_setups.append(s)
+
+# ------------------------------------------------
     # Engine B: Momentum Breakout Setups (Balanced)
     # ------------------------------------------------
     breakout_setups = []
