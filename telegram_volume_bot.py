@@ -1,4 +1,3 @@
-@ -0,0 +1,10700 @@
 _LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
 #!/usr/bin/env python3
 """
