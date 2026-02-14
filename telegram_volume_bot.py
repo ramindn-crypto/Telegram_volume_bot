@@ -8146,7 +8146,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             leaders_txt = await leaders_task
             up_txt, dn_txt = await movers_task
 
-            setups = (pool.get("setups") or [])[:SETUPS_N]
+            # Hard cap: never show more than 3 top setups on /screen
+            setups = (pool.get("setups") or [])[:min(int(SETUPS_N), 3)]
+
 
             # Safety: if engine produced no setups, generate fallback ATR-based setups
             # from the same universe shown in the Directional Leaders/Losers tables.
@@ -9659,7 +9661,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             # Your existing filter + pick logic
             # ---------------------------
             min_conf = SESSION_MIN_CONF.get(sess["name"], 78)
-            min_rr = SESSION_MIN_RR_TP3.get(sess["name"], 2.0)
+            min_rr = SESSION_MIN_RR_TP3.get(sess["name"], 2.2)
 
             # -------------------------------------------------
             # Per-user EMAIL filter parameters (safe defaults)
