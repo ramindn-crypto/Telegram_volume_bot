@@ -112,8 +112,6 @@ ALLOWED_WHEN_LOCKED = {
     "license",
     "support",
     "support_status",
-    "mode",
-    "early_warning_alert",
 }
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
@@ -1431,18 +1429,6 @@ def db_init():
 
     # NEW: Early Warning (Possible Reversal Zones) email alerts
     # Default OFF to avoid inbox noise; users can enable explicitly.
-    if "early_warning_alert_on" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN early_warning_alert_on INTEGER NOT NULL DEFAULT 0")
-    if "early_warning_min_vol_usd" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN early_warning_min_vol_usd REAL NOT NULL DEFAULT 10000000")
-    if "early_warning_atr_mult" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN early_warning_atr_mult REAL NOT NULL DEFAULT 1.15")
-    if "early_warning_body_ratio" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN early_warning_body_ratio REAL NOT NULL DEFAULT 0.60")
-    if "early_warning_lookback_1h" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN early_warning_lookback_1h INTEGER NOT NULL DEFAULT 8")
-    if "early_warning_retrace_min" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN early_warning_retrace_min REAL NOT NULL DEFAULT 0.30")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trades (
@@ -1635,7 +1621,7 @@ def get_user(user_id: int) -> dict:
 
     if not row:
         tz_name = "Australia/Melbourne"
-        sessions = _order_sessions(_default_sessions_for_tz(tz_name)) or _default_sessions_for_tz(tz_name)
+        sessions = ['NY']
         now_local = datetime.now(ZoneInfo(tz_name)).date().isoformat()
         cur.execute("""
             INSERT INTO users (
@@ -4694,9 +4680,9 @@ def user_enabled_sessions(user: dict) -> List[str]:
         xs = json.loads(user["sessions_enabled"])
         if isinstance(xs, list) and xs:
             ordered = _order_sessions(xs)
-            return ordered or _default_sessions_for_tz(user["tz"])
+            return ordered or ['NY']
     except Exception:
-        return _default_sessions_for_tz(user["tz"])
+        return ['NY']
 
 def _guess_session_name_utc(now_utc: datetime) -> str:
     """
@@ -5111,9 +5097,6 @@ It’s a full trading assistant that helps you trade with discipline.
 /status
 • Your plan, trial status & enabled features
 
-/mode standard | aggressive
-• Control trade frequency & timing
-
 /commands
 • Full command guide + examples
 
@@ -5123,7 +5106,6 @@ It’s a full trading assistant that helps you trade with discipline.
 /bigmove_alert on|off
 • Major market moves (📧 Pro/Trial only)
 
-/early_warning_alert on|off
 • Possible reversal zones (📧 Pro/Trial only)
 
 ────────────────────
@@ -5154,23 +5136,10 @@ Below are the key commands with simple examples.
   - Waiting for Trigger (near-miss)
   - Trend Continuation Watch
   - Spike Reversal Alerts
-  - Early Warning zones (if any)
   - Leaders/Losers + Market Leaders
 
 Example:
 /screen
-
-────────────────────
-🎛️ STRATEGY MODE
-────────────────────
-/mode standard
-• Conservative, higher-quality entries
-
-/mode aggressive
-• Earlier entries, higher frequency, higher risk
-
-Example:
-/mode aggressive
 
 ────────────────────
 ⚖️ RISK & POSITION SIZING
@@ -5206,7 +5175,6 @@ Example:
 • Big move alerts in either direction (UP or DOWN)
 • 📧 Email alerts are Pro/Trial only
 
-/early_warning_alert on|off
 • Possible reversal zones (context, not an entry)
 • 📧 Email alerts are Pro/Trial only
 
@@ -5221,7 +5189,6 @@ Example:
 
 Examples:
 /bigmove_alert on 30 12
-/early_warning_alert on
 /email you@example.com
 
 ────────────────────
@@ -5813,7 +5780,7 @@ async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Invalid TZ. Example: /tz Australia/Melbourne  or  /tz America/New_York")
         return
-    sessions = _order_sessions(_default_sessions_for_tz(tz_name)) or _default_sessions_for_tz(tz_name)
+    sessions = ['NY']
     update_user(uid, tz=tz_name, sessions_enabled=json.dumps(sessions))
     await update.message.reply_text(f"✅ TZ set to {tz_name}\nDefault sessions updated. Use /sessions to view.")
 
@@ -6052,83 +6019,6 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)  OR  /bigmove_alert off")
 
-
-async def early_warning_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user = get_user(uid)
-
-    if not has_active_access(user, uid):
-        await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
-        )
-        return
-
-    if not context.args:
-        on = int((user or {}).get("early_warning_alert_on", 0) or 0)
-        min_vol = float((user or {}).get("early_warning_min_vol_usd", 10_000_000) or 15_000_000)
-        atr_mult = float((user or {}).get("early_warning_atr_mult", 0.95) or 1.15)
-        body_ratio = float((user or {}).get("early_warning_body_ratio", 0.50) or 0.60)
-        lookback = int((user or {}).get("early_warning_lookback_1h", 8) or 8)
-        retrace = float((user or {}).get("early_warning_retrace_min", 0.20) or 0.30)
-        await update.message.reply_text(
-            "⚠️ Early Warning Emails (Possible Reversal Zones)\n"
-            f"{HDR}\n"
-            f"Status: {'ON' if on else 'OFF'}\n"
-            f"Min Vol (24H): {min_vol/1e6:.1f}M\n"
-            f"Impulse: 1H range ≥ ATR×{atr_mult:.2f} and body/range ≥ {body_ratio:.2f}\n"
-            f"Lookback: {lookback}h | Retrace ≥ {retrace:.2f}\n\n"
-            "Set: /early_warning_alert on\n"
-            "Off: /early_warning_alert off\n"
-            "Optional: /early_warning_alert on <minVolM> <atrMult> <bodyRatio> <lookbackH> <retrace>"
-        )
-        return
-
-    mode = str(context.args[0]).strip().lower()
-    if mode in {"off", "0", "disable"}:
-        update_user(uid, early_warning_alert_on=0)
-        await update.message.reply_text("✅ Early warning emails: OFF")
-        return
-
-    if mode in {"on", "1", "enable"}:
-        # Defaults
-        min_vol_m = 15.0
-        atr_mult = 1.15
-        body_ratio = 0.60
-        lookback = 8
-        retrace = 0.30
-        if len(context.args) >= 6:
-            try:
-                min_vol_m = float(context.args[1])
-                atr_mult = float(context.args[2])
-                body_ratio = float(context.args[3])
-                lookback = int(float(context.args[4]))
-                retrace = float(context.args[5])
-            except Exception:
-                await update.message.reply_text(
-                    "Usage: /early_warning_alert on <minVolM> <atrMult> <bodyRatio> <lookbackH> <retrace>\n"
-                    "Example: /early_warning_alert on 15 1.15 0.60 8 0.30"
-                )
-                return
-        update_user(
-            uid,
-            early_warning_alert_on=1,
-            early_warning_min_vol_usd=float(min_vol_m) * 1_000_000.0,
-            early_warning_atr_mult=float(atr_mult),
-            early_warning_body_ratio=float(body_ratio),
-            early_warning_lookback_1h=int(lookback),
-            early_warning_retrace_min=float(retrace),
-        )
-        await update.message.reply_text(
-            f"✅ Early warning emails: ON (minVol={min_vol_m:.1f}M, ATR×{atr_mult:.2f}, body≥{body_ratio:.2f}, lookback={lookback}h, retrace≥{retrace:.2f})"
-        )
-        return
-
-    await update.message.reply_text(
-        "Usage: /early_warning_alert on [minVolM atrMult bodyRatio lookbackH retrace]  OR  /early_warning_alert off"
-    )
 
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -7999,42 +7889,6 @@ _SCREEN_LOCK = asyncio.Lock()
 # =========================================================
 
 
-# =========================================================
-# /mode (scan profile)
-# =========================================================
-
-async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user = get_user(uid)
-    cur_mode = str((user or {}).get("scan_profile") or DEFAULT_SCAN_PROFILE).strip().lower()
-    if cur_mode not in SCAN_PROFILES:
-        cur_mode = DEFAULT_SCAN_PROFILE
-
-    if not context.args:
-        await update.message.reply_text(
-            "🧭 Scan Profile\n"
-            f"{HDR}\n"
-            f"Current: {cur_mode.upper()}\n\n"
-            "Set:\n"
-            "• /mode standard\n"
-            "• /mode aggressive\n\n"
-            "Aggressive = more /screen setups (looser trigger + bigger universe).\n"
-            "Use carefully. Not financial advice."
-        )
-        return
-
-    new_mode = str(context.args[0]).strip().lower()
-    if new_mode not in SCAN_PROFILES:
-        await update.message.reply_text("Usage: /mode <standard|aggressive>")
-        return
-
-    update_user(int(uid), scan_profile=str(new_mode))
-    await update.message.reply_text(
-        "✅ Updated scan profile\n"
-        f"{HDR}\n"
-        f"Now: {new_mode.upper()}\n\n"
-        "Tip: run /screen again."
-    )
 
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -8138,7 +7992,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # Run heavy work in parallel where possible
-            pool = await asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, session, mode="screen", scan_profile=str((get_user(update.effective_user.id) or {}).get('scan_profile') or DEFAULT_SCAN_PROFILE), uid=update.effective_user.id))
+            pool = await asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, session, mode="screen", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=update.effective_user.id))
             leaders_task = asyncio.to_thread(build_leaders_table, best_fut)
             movers_task = asyncio.to_thread(movers_tables, best_fut)
 
@@ -9096,412 +8950,10 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         
 
         # -----------------------------------------------------
-        # Early Warning Emails (Possible Reversal Zones)
-        # Non-trade context alerts like Big-Move (independent of notify_on)
-        # Trigger: _spike_reversal_warnings() (1H impulse + retrace + cooling)
-        # Cooldown: 3 hours per (user, symbol, side)
-        # -----------------------------------------------------
-        for u in (users_bigmove or []):
-            tz = timezone.utc
-            uid = 0
-            try:
-                try:
-                    uid = int(u.get("user_id") or u.get("id") or 0)
-                except Exception:
-                    uid = 0
-                if not uid:
-                    continue
-
-                uu = get_user(uid) or {}
-
-                tz_name = str((uu or {}).get("tz") or "UTC")
-                try:
-                    tz = ZoneInfo(tz_name)
-                except Exception:
-                    tz = timezone.utc
-
-                on = int((uu or {}).get("early_warning_alert_on", 0) or 0)
-                if not on:
-                    continue
-
-                try:
-                    min_vol = float((uu or {}).get("early_warning_min_vol_usd", 10_000_000) or 15_000_000)
-                except Exception:
-                    min_vol = 15_000_000.0
-
-                try:
-                    atr_mult = float((uu or {}).get("early_warning_atr_mult", 0.95) or 1.15)
-                except Exception:
-                    atr_mult = 1.15
-
-                try:
-                    body_ratio = float((uu or {}).get("early_warning_body_ratio", 0.50) or 0.60)
-                except Exception:
-                    body_ratio = 0.60
-
-                try:
-                    lookback = int((uu or {}).get("early_warning_lookback_1h", 8) or 8)
-                except Exception:
-                    lookback = 8
-
-                try:
-                    retrace = float((uu or {}).get("early_warning_retrace_min", 0.20) or 0.30)
-                except Exception:
-                    retrace = 0.30
-
-                candidates = _spike_reversal_warnings(
-                    best_fut,
-                    min_vol_usd=min_vol,
-                    atr_mult_min=atr_mult,
-                    body_ratio_min=body_ratio,
-                    lookback_1h=lookback,
-                    retrace_min=retrace,
-                    max_items=10,
-                )
-
-                if not candidates:
-                    continue
-
-                filtered = []
-                for c in candidates:
-                    try:
-                        sym = str(c.get("symbol") or "").upper()
-                        side = str(c.get("side") or "SELL").upper()
-                        if not sym:
-                            continue
-                        if earlywarn_recently_emailed(uid, sym, side):
-                            continue
-                        filtered.append(c)
-                    except Exception:
-                        filtered.append(c)
-
-                if not filtered:
-                    continue
-
-                now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
-                top_sym = str(filtered[0].get("symbol") or "")
-                top_side = str(filtered[0].get("side") or "").upper()
-                subject = f"⚠️ Early Warning • {top_sym} {top_side} • {now_local}"
-                if len(filtered) > 1:
-                    subject += f" (+{len(filtered)-1} more)"
-
-                lines = []
-                lines.append("⚠️ PulseFutures — EARLY WARNING (Context Only)")
-                lines.append(HDR)
-                lines.append(f"Time: {now_local}  |  Session: {current_session_utc()}  |  TZ: {tz_name}")
-                lines.append(f"Min Vol (24H): {min_vol/1e6:.1f}M")
-                lines.append(f"Rules: ATR×≥{atr_mult:.2f}, Body/Rng≥{body_ratio:.2f}, Lookback={lookback}h, Retrace≥{retrace:.2f}")
-                lines.append("")
-                lines.append("Possible Reversal Zones (NOT a trade signal)")
-                lines.append("────────────────────")
-
-                for c in filtered[:8]:
-                    sym = str(c.get("symbol") or "").upper()
-                    side = str(c.get("side") or "SELL").upper()
-                    conf = int(c.get("conf", 0) or 0)
-                    vol = float(c.get("vol", 0.0) or 0.0)
-                    why = str(c.get("why", "") or "")
-
-                    arrow = "🟢" if side == "BUY" else "🔴"
-                    lines.append(f"{arrow} {sym}: {side} | Conf {conf} | Vol ~{vol/1e6:.1f}M")
-                    if why:
-                        lines.append(f"Why: {why}")
-                    lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
-                    lines.append("")
-
-                body = "\n".join(lines).strip()
-
-                ok = await _send_email_async(
-                    EMAIL_SEND_TIMEOUT_SEC,
-                    subject,
-                    body,
-                    user_id_for_debug=uid,
-                    enforce_trade_window=False,
-                )
-
-                if ok:
-                    for c in filtered[:8]:
-                        try:
-                            mark_earlywarn_emailed(uid, str(c.get("symbol") or ""), str(c.get("side") or "SELL"))
-                        except Exception:
-                            pass
-
-            except Exception:
-                continue
-
-
-        # -----------------------------------------------------
-        # Early Warning Alert Emails (Possible Reversal Zones)
-        # Non-trade context alerts (like bigmove: independent of notify_on)
-        # Trigger: recent 1H impulse + retrace + cooling momentum (soft)
-        # Volume gate: vol24 >= user.early_warning_min_vol_usd (default 15M)
-        # Cooldown: 3h per symbol+side
-        # -----------------------------------------------------
-        for u in (users_bigmove or []):
-            tz = timezone.utc
-            uid = 0
-            try:
-                try:
-                    uid = int(u.get("user_id") or u.get("id") or 0)
-                except Exception:
-                    uid = 0
-                if not uid:
-                    continue
-
-                uu = get_user(uid) or {}
-
-                tz_name = str((uu or {}).get("tz") or "UTC")
-                try:
-                    tz = ZoneInfo(tz_name)
-                except Exception:
-                    tz = timezone.utc
-
-                on = int((uu or {}).get("early_warning_alert_on", 0) or 0)
-                if not on:
-                    continue
-
-                try:
-                    min_vol = float((uu or {}).get("early_warning_min_vol_usd", 10_000_000) or 15_000_000)
-                except Exception:
-                    min_vol = 15_000_000.0
-
-                try:
-                    atr_mult = float((uu or {}).get("early_warning_atr_mult", 0.95) or 1.15)
-                except Exception:
-                    atr_mult = 1.15
-
-                try:
-                    body_ratio = float((uu or {}).get("early_warning_body_ratio", 0.50) or 0.60)
-                except Exception:
-                    body_ratio = 0.60
-
-                try:
-                    lookback = int((uu or {}).get("early_warning_lookback_1h", 8) or 8)
-                except Exception:
-                    lookback = 8
-
-                try:
-                    retrace = float((uu or {}).get("early_warning_retrace_min", 0.20) or 0.30)
-                except Exception:
-                    retrace = 0.30
-
-                candidates = _spike_reversal_warnings(
-                    best_fut,
-                    min_vol_usd=min_vol,
-                    atr_mult_min=atr_mult,
-                    body_ratio_min=body_ratio,
-                    lookback_1h=lookback,
-                    retrace_min=retrace,
-                    max_items=10,
-                )
-                if not candidates:
-                    continue
-
-                filtered = []
-                for c in candidates:
-                    try:
-                        sym = str(c.get("symbol", "")).upper()
-                        side = str(c.get("side", "SELL")).upper()
-                        if earlywarn_recently_emailed(uid, sym, side):
-                            continue
-                        filtered.append(c)
-                    except Exception:
-                        filtered.append(c)
-
-                if not filtered:
-                    continue
-
-                now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
-                top = filtered[0]
-                top_sym = str(top.get("symbol", "")).upper()
-                top_side = str(top.get("side", "")).upper()
-
-                subject = f"⚠️ Early Warning • {top_sym} {top_side} • {now_local}"
-                if len(filtered) > 1:
-                    subject += f" (+{len(filtered)-1} more)"
-
-                lines = []
-                lines.append("⚠️ PulseFutures — EARLY WARNING (Context Only)")
-                lines.append(HDR)
-                lines.append(f"Time: {now_local}  |  Session: {current_session_utc()}  |  TZ: {tz_name}")
-                lines.append("")
-                lines.append("These are NOT trade signals. They highlight possible reversal zones after a recent impulse.")
-                lines.append(f"Filters: MinVol={min_vol/1e6:.1f}M, ATR×≥{atr_mult:.2f}, BodyRatio≥{body_ratio:.2f}, Lookback={lookback}h, Retrace≥{retrace:.2f}")
-                lines.append("")
-                lines.append("Top Early Warnings")
-                lines.append("────────────────────")
-
-                for c in filtered[:6]:
-                    sym = str(c.get("symbol", "")).upper()
-                    side = str(c.get("side", "SELL")).upper()
-                    conf = int(c.get("conf", 0) or 0)
-                    vol = float(c.get("vol", 0.0) or 0.0)
-                    why = str(c.get("why", "") or "")
-                    arrow = "🟢" if side == "BUY" else "🔴"
-
-                    lines.append(f"{arrow} {sym}: {side} | Conf {conf} | Vol ~{vol/1e6:.1f}M")
-                    if why:
-                        # keep the line short-ish
-                        lines.append(f"Why: {why[:220]}")
-                    lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
-                    lines.append("")
-
-                body = "\n".join(lines).strip()
-
-                ok = await _send_email_async(
-                    EMAIL_SEND_TIMEOUT_SEC,
-                    subject,
-                    body,
-                    user_id_for_debug=uid,
-                    enforce_trade_window=False,
-                )
-
-                if ok:
-                    for c in filtered[:6]:
-                        try:
-                            mark_earlywarn_emailed(uid, str(c.get("symbol", "")), str(c.get("side", "SELL")))
-                        except Exception:
-                            pass
-
-            except Exception:
-                continue
-
-        # -----------------------------------------------------
-        # Spike Reversal Alert Emails (new engine)
-        # Trigger: wick-spike rejection aligned with bigger trend
-        # Volume gate: vol24 >= user.spike_min_vol_usd (default 15M)
-        # -----------------------------------------------------
-        for u in (users_bigmove or []):
-            tz = timezone.utc
-            uid = 0
-            try:
-                try:
-                    uid = int(u.get("user_id") or u.get("id") or 0)
-                except Exception:
-                    uid = 0
-                if not uid:
-                    continue
-
-                uu = get_user(uid) or {}
-
-                tz_name = str((uu or {}).get("tz") or "UTC")
-                try:
-                    tz = ZoneInfo(tz_name)
-                except Exception:
-                    tz = timezone.utc
-
-                on = int(uu.get("spike_alert_on", 1) or 0)
-                if not on:
-                    continue
-
-                try:
-                    min_vol = float(uu.get("spike_min_vol_usd", 15_000_000) or 15_000_000)
-                except Exception:
-                    min_vol = 15_000_000.0
-
-                try:
-                    wick_ratio = float(uu.get("spike_wick_ratio", 0.55) or 0.55)
-                except Exception:
-                    wick_ratio = 0.55
-
-                try:
-                    atr_mult = float(uu.get("spike_atr_mult", 1.20) or 1.20)
-                except Exception:
-                    atr_mult = 1.20
-
-                candidates = _spike_reversal_candidates(
-                    best_fut,
-                    min_vol_usd=min_vol,
-                    wick_ratio_min=wick_ratio,
-                    atr_mult_min=atr_mult,
-                    max_items=10,
-                )
-                if not candidates:
-                    continue
-
-                filtered = []
-                for c in candidates:
-                    try:
-                        if spike_recently_emailed(uid, c["symbol"], c["direction"]):
-                            continue
-                        filtered.append(c)
-                    except Exception:
-                        filtered.append(c)
-
-                if not filtered:
-                    continue
-
-                now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
-                subject = f"⚡ Spike Reversal Alert — {filtered[0]['symbol']} ({now_local})"
-
-                lines = []
-                lines.append("⚡ Spike Reversal Alert")
-                lines.append(HDR)
-                lines.append(f"Time: {now_local}  |  Session: {current_session_utc()}  |  TZ: {tz_name}")
-                lines.append("")
-                lines.append("Top Reversal Candidates")
-                lines.append("────────────────────")
-
-                for c in filtered[:6]:
-                    sym = c["symbol"]
-                    side = c["side"]
-                    conf = int(c.get("conf", 0))
-                    entry = float(c["entry"]); sl = float(c["sl"])
-                    tp1 = float(c["tp1"]); tp2 = float(c["tp2"]); tp3 = float(c["tp3"])
-                    vol = float(c.get("vol", 0.0))
-                    why = str(c.get("why", ""))
-
-                    rr_den = abs(entry - sl)
-                    rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
-
-                    pos_word = "long" if side.upper() == "BUY" else "short"
-                    size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
-
-                    lines.append(f"{sym} — {side} — Conf {conf}  |  RR(TP3): {rr3:.2f}")
-                    lines.append(f"Entry: {entry:.6g} | SL: {sl:.6g}")
-                    lines.append(f"TP1: {tp1:.6g} | TP2: {tp2:.6g} | TP3: {tp3:.6g}")
-                    lines.append(f"Size: {size_cmd}")
-                    lines.append(f"24H Vol ~{vol/1e6:.1f}M")
-
-                    if why:
-                        lines.append(f"Why: {why}")
-                    lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
-                    lines.append("")
-
-                body = "\n".join(lines).strip()
-
-                ok = send_email(subject, body, user_id_for_debug=uid, enforce_trade_window=False)
-                ok = await _send_email_async(
-                    EMAIL_SEND_TIMEOUT_SEC,
-                    subject,
-                    body,
-                    user_id_for_debug=uid,
-                    enforce_trade_window=False
-                )
-
-                if ok:
-                    for c in filtered[:6]:
-                        try:
-                            mark_spike_emailed(uid, c["symbol"], c["direction"])
-                        except Exception:
-                            pass
-
-            except Exception as e:
-                logger.exception("Spike reversal alert failed for uid=%s: %s", uid, e)
-                continue
-
-
-        
-        # -----------------------------------------------------
-        # Build setups per session (PRIORITY: leaders/losers → trend watch → waiting → market leaders)
-        # -----------------------------------------------------
         setups_by_session: Dict[str, List[Setup]] = {}
         for sess_name in ["NY", "LON", "ASIA"]:
             try:
-                pool = await asyncio.wait_for(
-                    build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str((get_user(uid) or {}).get('scan_profile') or DEFAULT_SCAN_PROFILE), uid=uid),
-                    timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
-                )
+                pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
             except asyncio.TimeoutError:
                 pool = {"setups": []}
             except Exception:
@@ -10478,7 +9930,7 @@ def main():
     db_init()
     ensure_email_column()
     
-    app = Application.builder().token(TOKEN).post_init(_post_init).build()
+    app = Application.builder().token(TOKEN).post_init(_post_init).concurrent_updates(True).build()
     app.add_error_handler(error_handler)
 
     # ================= Handlers =================
@@ -10491,7 +9943,6 @@ def main():
     app.add_handler(CommandHandler("support", support_cmd))
     app.add_handler(CommandHandler("support_status", support_status_cmd))
     app.add_handler(CommandHandler("tz", tz_cmd))
-    app.add_handler(CommandHandler("mode", mode_cmd))
     app.add_handler(CommandHandler("screen", screen_cmd))
     app.add_handler(CommandHandler("equity", equity_cmd))
     app.add_handler(CommandHandler("equity_reset", equity_reset_cmd))
@@ -10509,7 +9960,6 @@ def main():
     app.add_handler(CommandHandler("sessions_off_unlimited", sessions_off_unlimited_cmd))
 
     app.add_handler(CommandHandler("bigmove_alert", bigmove_alert_cmd))
-    app.add_handler(CommandHandler("early_warning_alert", early_warning_alert_cmd))
     app.add_handler(CommandHandler("notify_on", notify_on))
     app.add_handler(CommandHandler("notify_off", notify_off))
     app.add_handler(CommandHandler("size", size_cmd))
