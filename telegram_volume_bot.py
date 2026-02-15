@@ -320,12 +320,12 @@ DEFAULT_RISK_VALUE = 1.5
 DEFAULT_DAILY_CAP_MODE = "PCT"
 DEFAULT_DAILY_CAP_VALUE = 5.0
 DEFAULT_MAX_TRADES_DAY = 5
-DEFAULT_MIN_EMAIL_GAP_MIN = 60
+DEFAULT_MIN_EMAIL_GAP_MIN = 30
 
 # Backward-compat alias
 DEFAULT_EMAIL_GAP_MIN = DEFAULT_MIN_EMAIL_GAP_MIN
-DEFAULT_MAX_EMAILS_PER_SESSION = 4
-DEFAULT_MAX_EMAILS_PER_DAY = 4
+DEFAULT_MAX_EMAILS_PER_SESSION = 5
+DEFAULT_MAX_EMAILS_PER_DAY = 10
 
 DEFAULT_MAX_RISK_PCT_PER_TRADE = 2.0
 
@@ -1296,9 +1296,9 @@ def db_init():
         notify_on INTEGER DEFAULT 0,
 
         sessions_enabled TEXT DEFAULT '',
-        max_emails_per_session INTEGER DEFAULT 1,
+        max_emails_per_session INTEGER DEFAULT 5,
         email_gap_min INTEGER DEFAULT 30,
-        max_emails_per_day INTEGER DEFAULT 5,
+        max_emails_per_day INTEGER DEFAULT 10,
 
         day_trade_date TEXT DEFAULT '',
         day_trade_count INTEGER DEFAULT 0,
