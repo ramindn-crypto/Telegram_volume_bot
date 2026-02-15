@@ -55,7 +55,6 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     filters,
-    ApplicationHandlerStop,
 )
 
 
@@ -1660,12 +1659,7 @@ def get_user(user_id: int) -> dict:
         row = cur.fetchone()
 
     con.close()
-    user = dict(row)
-    try:
-        user = _ensure_trial(user)
-    except Exception:
-        pass
-    return user
+    return dict(row)
 
 # =========================================================
 # ACCESS CONTROL (FREE TRIAL + PAYWALL)
@@ -1800,7 +1794,6 @@ def ensure_billing_columns():
             ("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'", "plan"),
             ("ALTER TABLE users ADD COLUMN trial_start_ts REAL DEFAULT 0", "trial_start_ts"),
             ("ALTER TABLE users ADD COLUMN trial_until REAL DEFAULT 0", "trial_until"),
-            ("ALTER TABLE users ADD COLUMN trial_warned INTEGER DEFAULT 0", "trial_warned"),
             ("ALTER TABLE users ADD COLUMN plan_expires REAL DEFAULT 0", "plan_expires"),
             ("ALTER TABLE users ADD COLUMN access_source TEXT", "access_source"),
             ("ALTER TABLE users ADD COLUMN access_ref TEXT", "access_ref"),
@@ -4491,73 +4484,27 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = get_user(uid)
 
     if not context.args:
-        await update.message.reply_text(
-            """Usage:
-/email you@example.com   (set your recipient + enable alerts)
-/email off               (disable email alerts)
-
-Example: /email ramin@gmail.com"""
-        )
+        await update.message.reply_text("Usage: /email your@email.com\nExample: /email ramin@gmail.com")
         return
 
-    arg0 = (context.args[0] or "").strip()
-    mode = arg0.lower()
-
-    # Support: /email off
-    if mode in {"off", "0", "disable"}:
-        update_user(uid, notify_on=0)
-        await update.message.reply_text(
-            """✅ Email alerts: OFF
-
-To enable again:
-• /email you@example.com"""
-        )
-        return
-
-    # Optional support: /email on
-    if mode in {"on", "1", "enable"}:
-        update_user(uid, notify_on=1)
-        to_email = (user.get("email_to") or user.get("email") or "").strip()
-        if not to_email:
-            await update.message.reply_text(
-                """✅ Email alerts: ON
-
-⚠️ No recipient email saved yet.
-Set it with: /email you@example.com"""
-            )
-        else:
-            await update.message.reply_text(
-                f"✅ Email alerts: ON\nRecipient: {to_email}\n\nTip: /email_test"
-            )
-        return
-
-    # Otherwise, treat arg as an email address
-    email = arg0
+    email = context.args[0].strip()
     if not EMAIL_RE.match(email):
-        await update.message.reply_text(
-            """❌ Invalid email format.
-Examples:
-• /email ramin@gmail.com
-• /email off"""
-        )
+        await update.message.reply_text("❌ Invalid email format.\nExample: /email ramin@gmail.com")
         return
 
     try:
         # Save per-user email (key you already read in email_test_cmd)
         set_user_email(uid, email)
 
-        # Turning email on is the common expectation when user sets an email
-        update_user(uid, notify_on=1)
-
         await update.message.reply_text(
-            f"✅ Recipient email saved:\n{email}\n\nEmail alerts: ON\nNow run: /email_test"
+            f"✅ Recipient email saved:\n{email}\n\nNow run: /email_test"
         )
     except Exception as e:
         logger.exception("email_cmd failed")
         await update.message.reply_text(f"❌ Failed to save email: {type(e).__name__}: {e}")
+
 async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -6001,44 +5948,17 @@ async def sessions_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sessions_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
-
     if not context.args:
-        await update.message.reply_text(
-            """Usage: /sessions_off <ASIA|LON|NY>
-Example: /sessions_off ASIA"""
-        )
+        await update.message.reply_text("Usage: /sessions_off LON")
         return
-
     name = context.args[0].strip().upper()
-    if name not in SESSIONS_UTC:
-        await update.message.reply_text("Session must be one of: ASIA, LON, NY")
-        return
+    enabled = [s for s in user_enabled_sessions(user) if s != name]
+    if not enabled:
+        enabled = _default_sessions_for_tz(user["tz"])
+        enabled = _order_sessions(enabled) or enabled
+    update_user(uid, sessions_enabled=json.dumps(enabled))
+    await update.message.reply_text(f"✅ Enabled sessions: {', '.join(enabled)}")
 
-    before = user_enabled_sessions(user)
-    after = [s for s in before if s != name]
-
-    # Never allow empty list; keep sensible defaults
-    forced_default = False
-    if not after:
-        after = _default_sessions_for_tz(user["tz"])
-        after = _order_sessions(after) or after
-        forced_default = True
-
-    update_user(uid, sessions_enabled=json.dumps(after))
-
-    if name not in before:
-        await update.message.reply_text(f"ℹ️ Session {name} was already disabled.\nEnabled sessions: {', '.join(after)}")
-        return
-
-    if forced_default:
-        await update.message.reply_text(
-            f"✅ Disabled session: {name}\n"
-            f"⚠️ You must keep at least one session enabled.\n"
-            f"Enabled sessions now: {', '.join(after)}"
-        )
-        return
-
-    await update.message.reply_text(f"✅ Disabled session: {name}\nEnabled sessions now: {', '.join(after)}")
 async def sessions_on_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     update_user(uid, sessions_unlimited=1)
@@ -10013,9 +9933,6 @@ def main():
     app = Application.builder().token(TOKEN).post_init(_post_init).concurrent_updates(True).build()
     app.add_error_handler(error_handler)
 
-    # Global access gate (trial/paywall)
-    app.add_handler(MessageHandler(filters.COMMAND, access_gate_cmd), group=-1)
-
     # ================= Handlers =================
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("commands", commands_cmd))
@@ -10132,219 +10049,128 @@ def main():
 
 
 # ===============================
-# TRIAL + STATUS (ACCESS)
+# TRIAL + STATUS (ADDED)
 # ===============================
 
-def _ensure_trial(user: dict) -> dict:
-    """Guarantee that every user gets exactly one 7-day trial, then locks to FREE (no access).
-    Paid plans (standard/pro) are never modified here.
-    NOTE: This function MUST NOT call get_user() (avoid recursion).
-    """
+TRIAL_DAYS = 7
+
+def _ensure_trial(user):
     if not user:
-        return user
-
-    try:
-        uid = int(user.get("user_id") or user.get("id") or 0)
-    except Exception:
-        uid = 0
-
-    # Admin always unlimited
-    try:
-        if uid and is_admin_user(uid):
-            return user
-    except Exception:
-        pass
-
-    now = float(time.time())
-    plan = str(user.get("plan") or "free").strip().lower()
-
-    # Paid plans: no trial logic changes
-    if plan in ("standard", "pro"):
-        return user
-
-    start = float(user.get("trial_start_ts") or 0.0)
-    until = float(user.get("trial_until") or 0.0)
-
-    # Start trial if never started
-    if start <= 0.0 or until <= 0.0:
-        start = now
-        until = now + float(FREE_TRIAL_DAYS) * 86400.0
-        try:
-            if uid:
-                update_user(uid, plan="trial", trial_start_ts=start, trial_until=until, trial_warned=0)
-        except Exception:
-            pass
-        user["plan"] = "trial"
-        user["trial_start_ts"] = start
-        user["trial_until"] = until
-        user["trial_warned"] = 0
-        return user
-
-    # If trial is active, force plan=trial
-    if now <= until:
-        if plan != "trial":
-            try:
-                if uid:
-                    update_user(uid, plan="trial")
-            except Exception:
-                pass
-            user["plan"] = "trial"
-        return user
-
-    # Trial expired -> lock (free, no access)
-    if plan == "trial":
-        try:
-            if uid:
-                update_user(uid, plan="free")
-        except Exception:
-            pass
-        user["plan"] = "free"
-    return user
-
-
-def _trial_seconds_left(user: dict) -> float:
-    try:
-        until = float(user.get("trial_until", 0) or 0)
-    except Exception:
-        return 0.0
-    return max(0.0, until - float(time.time()))
-
-
-def has_active_access(user: dict, uid: Optional[int] = None) -> bool:
-    # Admin is always unlimited
-    if uid is not None:
-        try:
-            if is_admin_user(int(uid)):
-                return True
-        except Exception:
-            pass
-
-    if not user:
-        return False
-
-    user = _ensure_trial(user)
-    plan = str(user.get("plan") or "free").strip().lower()
-
-    if plan in ("standard", "pro"):
-        return True
-
-    if plan == "trial":
-        return _trial_seconds_left(user) > 0
-
-    # free / anything else => locked
-    return False
-
-
-async def _maybe_warn_trial_ending(update: Update, user: dict) -> None:
-    """Warn once when trial has <= 24h remaining."""
-    try:
-        if not update or not getattr(update, "effective_message", None):
-            return
-        uid = int(update.effective_user.id)
-        if is_admin_user(uid):
-            return
-        user = _ensure_trial(user)
-        if str(user.get("plan") or "").lower() != "trial":
-            return
-        left = _trial_seconds_left(user)
-        if left <= 0:
-            return
-        warned = int(user.get("trial_warned", 0) or 0)
-        if warned:
-            return
-        if left <= 24 * 3600:
-            hrs = int(left // 3600)
-            await update.effective_message.reply_text(
-                "⏳ Trial ending soon\n\n"
-                f"Your free trial expires in ~{hrs} hour(s).\n"
-                "To avoid interruption, please subscribe via /billing."
-            )
-            try:
-                update_user(uid, trial_warned=1)
-            except Exception:
-                pass
-    except Exception:
         return
-
-
-async def access_gate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Global gate for ALL commands: blocks everything after trial unless paid.
-    Allowed commands while locked are in ALLOWED_WHEN_LOCKED.
-    """
-    try:
-        if not update or not getattr(update, "effective_message", None):
-            return
-        txt = (update.effective_message.text or "").strip()
-        if not txt.startswith("/"):
-            return
-
-        cmd = txt.split()[0][1:]
-        cmd = cmd.split("@")[0].strip().lower()
-
-        # allow a few commands even when locked
-        if cmd in (ALLOWED_WHEN_LOCKED or set()):
-            return
-
-        uid = int(update.effective_user.id)
-        if is_admin_user(uid):
-            return
-
-        u = get_user(uid)
-        u = _ensure_trial(u)
-
-        if has_active_access(u, uid):
-            await _maybe_warn_trial_ending(update, u)
-            return
-
-        await update.effective_message.reply_text(
-            "⛔ Access locked.\n\n"
-            "Your 7-day free trial has ended.\n\n"
-            "To continue using PulseFutures, please subscribe: /billing\n"
-            "Alternative: USDT payment: /usdt"
-        )
-        raise ApplicationHandlerStop
-    except ApplicationHandlerStop:
-        raise
-    except Exception:
+    if user.get("plan"):
         return
-
+    start = user.get("trial_start_ts")
+    now = time.time()
+    if not start:
+        update_user(user["user_id"], plan="trial", trial_start_ts=now, trial_until=now + TRIAL_DAYS*86400)
+    elif now <= float(user.get("trial_until", 0)):
+        update_user(user["user_id"], plan="trial")
+    else:
+        update_user(user["user_id"], plan="standard")
 
 def user_has_pro(uid: int) -> bool:
+    # Admin is always Pro/Unlimited
     try:
         if is_admin_user(int(uid)):
             return True
     except Exception:
         pass
-    u = get_user(int(uid))
-    u = _ensure_trial(u)
-    return str(u.get("plan") or "").strip().lower() == "pro"
 
+    u = get_user(uid)
+    if not u:
+        return False
+
+    _ensure_trial(u)
+
+    # Use effective plan (covers legacy DBs + admin override)
+    try:
+        plan = str(effective_plan(u, int(uid))).strip().lower()
+    except Exception:
+        plan = str(u.get("plan") or "free").strip().lower()
+
+    if plan == "pro":
+        return True
+    if plan == "trial" and time.time() <= float(u.get("trial_until", 0) or 0):
+        return True
+    return False
+    _ensure_trial(u)
+    if u.get("plan") == "pro":
+        return True
+    if u.get("plan") == "trial" and time.time() <= float(u.get("trial_until", 0)):
+        return True
+    return False
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = int(update.effective_user.id)
-    u = get_user(uid)
-    u = _ensure_trial(u)
+    uid = update.effective_user.id
+    user = reset_daily_if_needed(get_user(uid))
 
-    plan = str(u.get("plan") or "free").strip().lower()
-    lines = ["📌 Your Plan", HDR]
+    if not has_active_access(user, uid):
+        await update.message.reply_text(
+            "⛔️ Access expired.\n\n"
+            "Please subscribe to continue:\n\n"
+            "💳 /billing\n"
+            "💰 /usdt"
+        )
+        return
 
-    if plan == "trial":
-        left = _trial_seconds_left(u)
-        days = int(left // 86400)
-        hrs = int((left % 86400) // 3600)
-        lines.append("Plan: TRIAL ✅")
-        lines.append(f"Trial left: {days} day(s) {hrs} hour(s)")
-        lines.append(HDR)
-        lines.append("Upgrade anytime: /billing")
-        await _maybe_warn_trial_ending(update, u)
-    elif plan in ("standard", "pro"):
-        lines.append(f"Plan: {plan.upper()} ✅")
-        lines.append(HDR)
-        lines.append("Manage: /billing")
-    else:
-        lines.append("Plan: FREE (locked) ⛔")
-        lines.append("Your 7-day trial has ended.")
-        lines.append(HDR)
-        lines.append("To continue, subscribe: /billing")
+    opens = db_open_trades(uid)
+
+    plan = str((user or {}).get("plan") or "free").upper()
+    equity = float((user or {}).get("equity") or 0.0)
+
+    cap = daily_cap_usd(user)
+    day_local = _user_day_local(user)
+    used_today = _risk_daily_get(uid, day_local)
+    remaining_today = (cap - used_today) if cap > 0 else float("inf")
+
+    enabled = user_enabled_sessions(user)
+    now_s = in_session_now(user)
+    now_txt = now_s["name"] if now_s else "NONE"
+
+    # Email caps (show infinite as 0=∞ to match UI)
+    cap_sess = int((user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION) or DEFAULT_MAX_EMAILS_PER_SESSION)
+    cap_day = int((user or {}).get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY) or DEFAULT_MAX_EMAILS_PER_DAY)
+    gap_m = int((user or {}).get("email_gap_min", DEFAULT_EMAIL_GAP_MIN) or DEFAULT_EMAIL_GAP_MIN)
+
+    # Big-move status
+    bm_on = int((user or {}).get("bigmove_alert_on", 1) or 0)
+    bm_4h = float((user or {}).get("bigmove_alert_4h", 20) or 20)
+    bm_1h = float((user or {}).get("bigmove_alert_1h", 10) or 10)
+
+    lines = []
+    lines.append("📌 Status")
+    lines.append(f"Plan: {plan}")
+    lines.append(f"Equity: ${equity:.2f}")
+    lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
+    lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
+    lines.append(f"Daily risk used: ${used_today:.2f}")
+    lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
+    lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
+    lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
+    lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
+    lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
+    lines.append(HDR)
+
+    if not opens:
+        lines.append("Open trades: None")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    lines.append("Open trades:")
+    for t in opens:
+        try:
+            entry = float(t.get("entry") or 0.0)
+            sl = float(t.get("sl") or 0.0)
+            qty = float(t.get("qty") or 0.0)
+            risk = float(t.get("risk_usd") or 0.0)
+            lines.append(
+                f"- ID {t.get('id')} | {t.get('symbol')} {t.get('side')} | "
+                f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g}"
+            )
+        except Exception:
+            continue
 
     await update.message.reply_text("\n".join(lines))
+
+if __name__ == "__main__":
+    main()
