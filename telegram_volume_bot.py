@@ -2662,10 +2662,9 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not has_active_access(user, uid):
         await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
         )
         return
 
@@ -4484,26 +4483,59 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    user = get_user(uid) or {}
 
     if not context.args:
-        await update.message.reply_text("Usage: /email your@email.com\nExample: /email ramin@gmail.com")
+        cur = "ON" if user_email_alerts_enabled(user) else "OFF"
+        saved = (user.get("email_to") or user.get("email") or "").strip()
+        await update.message.reply_text(
+            "📧 Email Settings\n"
+            "────────────────────\n"
+            f"Alerts: {cur}\n"
+            f"Saved: {saved if saved else '(none)'}\n\n"
+            "Set email: /email you@example.com\n"
+            "Turn off: /email off\n"
+            "Turn on: /email on"
+        )
         return
 
+    arg = context.args[0].strip().lower()
+
+    # Support /email off|on
+    if arg in ("off", "0", "disable", "disabled"):
+        set_user_email_alerts_enabled(uid, False)
+        await update.message.reply_text("✅ Email alerts: OFF")
+        return
+
+    if arg in ("on", "1", "enable", "enabled"):
+        set_user_email_alerts_enabled(uid, True)
+        await update.message.reply_text("✅ Email alerts: ON")
+        return
+
+    # Otherwise treat as an email address
     email = context.args[0].strip()
     if not EMAIL_RE.match(email):
-        await update.message.reply_text("❌ Invalid email format.\nExample: /email ramin@gmail.com")
+        await update.message.reply_text(
+            "❌ Invalid email format.\n"
+            "Example: /email you@example.com\n"
+            "Or: /email off"
+        )
         return
 
     try:
-        # Save per-user email (key you already read in email_test_cmd)
         set_user_email(uid, email)
+        set_user_email_alerts_enabled(uid, True)
 
         await update.message.reply_text(
-            f"✅ Recipient email saved:\n{email}\n\nNow run: /email_test"
+            f"✅ Recipient email saved:\n{email}\n\n"
+            "Email alerts are ON.\n"
+            "Test now: /email_test\n"
+            "Turn off any time: /email off"
         )
     except Exception as e:
         logger.exception("email_cmd failed")
         await update.message.reply_text(f"❌ Failed to save email: {type(e).__name__}: {e}")
+
 
 async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -5949,15 +5981,27 @@ async def sessions_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
     if not context.args:
-        await update.message.reply_text("Usage: /sessions_off LON")
+        await update.message.reply_text("Usage: /sessions_off ASIA")
         return
+
     name = context.args[0].strip().upper()
+    if name not in SESSIONS_UTC:
+        await update.message.reply_text("Session must be one of: ASIA, LON, NY")
+        return
+
     enabled = [s for s in user_enabled_sessions(user) if s != name]
+
+    # Never allow "no sessions" — fall back to sensible defaults
     if not enabled:
         enabled = _default_sessions_for_tz(user["tz"])
         enabled = _order_sessions(enabled) or enabled
+
     update_user(uid, sessions_enabled=json.dumps(enabled))
-    await update.message.reply_text(f"✅ Enabled sessions: {', '.join(enabled)}")
+    await update.message.reply_text(
+        f"✅ Disabled: {name}\n"
+        f"Enabled sessions: {', '.join(enabled)}"
+    )
+
 
 async def sessions_on_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -5975,10 +6019,9 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_active_access(user, uid):
         await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
         )
         return   
         
@@ -6084,10 +6127,9 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_active_access(user, uid):
         await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
         )
         return   
         
@@ -6290,10 +6332,9 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_active_access(user, uid):
         await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
         )
         return   
         
@@ -6444,10 +6485,9 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_active_access(user, uid):
         await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
         )
         return   
     
@@ -6703,10 +6743,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_active_access(user, uid):
         await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
         )
         return
 
@@ -6961,10 +7000,9 @@ async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not has_active_access(user, uid):
         await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
         )
         return   
     
@@ -7025,10 +7063,9 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not has_active_access(user, uid):
         await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
         )
         return    
 
@@ -7060,10 +7097,9 @@ async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_active_access(user, uid):
         await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
         )
         return   
     
@@ -7098,10 +7134,9 @@ async def signals_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_active_access(user, uid):
         await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
         )
         return   
     
@@ -7134,10 +7169,9 @@ async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not has_active_access(user, uid):
         await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
         )
         return   
     
@@ -7897,10 +7931,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_active_access(user, uid):
         await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
         )
         return
 
@@ -9535,22 +9568,87 @@ def _set_user_access(user_id: int, plan: str, source: str, ref: str):
     )
 
 
-def has_active_access(user: dict, uid: Optional[int] = None) -> bool:
-    # Admin is always unlimited
-    if uid is not None and is_admin_user(int(uid)):
-        return True
+def _ensure_trial_state(user: dict, uid: Optional[int] = None) -> dict:
+    """Ensure the user has a 7-day trial recorded, and downgrade to free (locked) when expired."""
+    try:
+        if uid is not None and is_admin_user(int(uid)):
+            return user
+    except Exception:
+        pass
 
     if not user:
-        return True  # missing row => FREE
+        return user
+
+    now = time.time()
+    plan = str(user.get("plan") or "free").strip().lower()
+    trial_until = float(user.get("trial_until", 0) or 0.0)
+    trial_start = float(user.get("trial_start_ts", 0) or 0.0)
+
+    # Initialize trial if user has never had one
+    if trial_until <= 0:
+        trial_start = now
+        trial_until = now + (7 * 86400)
+        update_user(int(user.get("user_id") or uid or 0), plan="trial", trial_start_ts=trial_start, trial_until=trial_until)
+        user["plan"] = "trial"
+        user["trial_start_ts"] = trial_start
+        user["trial_until"] = trial_until
+        return user
+
+    # Keep trial active while inside the window
+    if now <= trial_until:
+        if plan != "trial":
+            update_user(int(user.get("user_id") or uid or 0), plan="trial")
+            user["plan"] = "trial"
+        return user
+
+    # Trial expired => lock user (free = locked)
+    if plan != "free":
+        update_user(int(user.get("user_id") or uid or 0), plan="free")
+        user["plan"] = "free"
+    return user
+
+
+def has_active_access(user: dict, uid: Optional[int] = None) -> bool:
+    """Access rules:
+    - Admin: always allowed
+    - Trial: allowed for 7 days from first seen
+    - Paid plans (standard/pro): allowed (optionally with plan_expires if you set it)
+    - Free: LOCKED (after trial)
+    """
+    try:
+        if uid is not None and is_admin_user(int(uid)):
+            return True
+    except Exception:
+        pass
+
+    if not user:
+        return False
+
+    # Ensure trial is initialized / downgraded when needed
+    user = _ensure_trial_state(user, uid=uid)
 
     now = time.time()
     plan = str(user.get("plan") or "free").strip().lower()
 
+    if plan in ("standard", "pro"):
+        # If you use plan_expires, enforce it (0/None => no expiry)
+        try:
+            exp = float(user.get("plan_expires", 0) or 0.0)
+            if exp > 0 and now > exp:
+                update_user(int(user.get("user_id") or uid or 0), plan="free")
+                return False
+        except Exception:
+            pass
+        return True
+
     if plan == "trial":
-        return now <= float(user.get("trial_until", 0) or 0)
+        try:
+            return now <= float(user.get("trial_until", 0) or 0.0)
+        except Exception:
+            return False
 
-    return plan in ("free", "standard", "pro")
-
+    # free = locked
+    return False
 
 def _usdt_payment_row_by_txid(txid: str):
     with _db() as con:
@@ -10106,10 +10204,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_active_access(user, uid):
         await update.message.reply_text(
-            "⛔️ Access expired.\n\n"
-            "Please subscribe to continue:\n\n"
-            "💳 /billing\n"
-            "💰 /usdt"
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
         )
         return
 
