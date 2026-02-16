@@ -632,8 +632,12 @@ DB_FILE_LOCK = asyncio.Lock()
 # NY  : 13:00–22:00 UTC
 # Priority resolves overlaps: NY > LON > ASIA
 SESSIONS_UTC = {
-    "ASIA": {"start": "00:00", "end": "09:00"},
-    "LON":  {"start": "07:00", "end": "16:00"},
+    # Non-overlapping UTC windows (DST-proof for Melbourne display)
+    # ASIA: 00:00–08:00 UTC
+    # LON : 08:00–17:00 UTC
+    # NY  : 13:00–22:00 UTC
+    "ASIA": {"start": "00:00", "end": "08:00"},
+    "LON":  {"start": "08:00", "end": "17:00"},
     "NY":   {"start": "13:00", "end": "22:00"},
 }
 
@@ -2975,10 +2979,16 @@ def parse_hhmm(s: str) -> Tuple[int, int]:
 
 def current_session_utc(now_utc: Optional[datetime] = None) -> str:
     """
-    Market sessions in UTC (with overlaps handled by priority):
-    - NY  : 13:00–22:00
-    - LON : 07:00–16:00
-    - ASIA: 00:00–09:00
+    Market sessions in UTC.
+
+    NOTE:
+    - We use non-overlapping UTC windows to avoid ambiguous session labels around overlaps.
+    - This also fixes Melbourne display so ~6:00 PM Melbourne remains ASIA until 7:00 PM (AEDT).
+
+    Windows:
+    - NY  : 13:00–22:00 UTC
+    - LON : 08:00–17:00 UTC
+    - ASIA: 00:00–08:00 UTC
     Priority: NY > LON > ASIA
     """
     if now_utc is None:
@@ -2986,9 +2996,15 @@ def current_session_utc(now_utc: Optional[datetime] = None) -> str:
 
     h = now_utc.hour
 
-    # Priority first (overlaps intentionally resolved)
     if 13 <= h < 22:
         return "NY"
+    if 8 <= h < 17:
+        return "LON"
+    if 0 <= h < 8:
+        return "ASIA"
+
+    # Outside the three main windows: treat as NY tail/transition
+    return "NY"
     if 7 <= h < 16:
         return "LON"
     if 0 <= h < 9:
@@ -8165,6 +8181,25 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     # Setup cards -> combined text (single "Top Trade Setups" section)
     combined_setups_txt = "_No high-quality setups right now._"
     if setups:
+        def _mv_dot(p: float) -> str:
+            try:
+                p = float(p or 0.0)
+            except Exception:
+                p = 0.0
+            if abs(p) < 2.0:
+                return "🟡"
+            return "🟢" if p >= 0 else "🔴"
+
+        def _engine_label(e: str) -> str:
+            ee = str(e or "").strip().upper()
+            if ee == "A":
+                return "Pullback"
+            if ee == "B":
+                return "Momentum Breakout"
+            if ee == "F":
+                return "Fallback"
+            return "Setup"
+
         lines2 = []
         for s in setups:
             try:
@@ -8172,26 +8207,52 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 sid = str(getattr(s, "setup_id", "") or "")
                 side = str(getattr(s, "side", "") or "").upper()
                 conf = int(getattr(s, "conf", 0) or 0)
+
                 entry = float(getattr(s, "entry", 0.0) or 0.0)
                 sl = float(getattr(s, "sl", 0.0) or 0.0)
+                tp1 = getattr(s, "tp1", None)
+                tp2 = getattr(s, "tp2", None)
                 tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
                 vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
 
+                ch24 = float(getattr(s, "ch24", 0.0) or 0.0)
+                ch4 = float(getattr(s, "ch4", 0.0) or 0.0)
+                ch1 = float(getattr(s, "ch1", 0.0) or 0.0)
+                ch15 = float(getattr(s, "ch15", 0.0) or 0.0)
+
                 rr_den = abs(entry - sl)
+                rr1 = (abs(float(tp1) - entry) / rr_den) if (rr_den > 0 and tp1 not in (None, 0, 0.0)) else 0.0
+                rr2 = (abs(float(tp2) - entry) / rr_den) if (rr_den > 0 and tp2 not in (None, 0, 0.0)) else 0.0
                 rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
 
                 pos_word = "long" if side == "BUY" else "short"
                 size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
 
                 emoji = "🟢" if side == "BUY" else "🔴"
-                lines2.append(
-                    f"• `{sid}` — *{sym}* {emoji} `{side}` | Conf `{conf}`\n"
-                    f"  Entry `{fmt_price(entry)}` | SL `{fmt_price(sl)}` | TP `{fmt_price(tp3)}`\n"
-                    f"  `{size_cmd}`"
+                typ = _engine_label(getattr(s, "engine", ""))
+
+                # Card-style formatting (same as previous detailed preview) + /size command
+                block = []
+                block.append(f"{emoji} *{side} — {sym}*")
+                block.append(f"`{sid}` | Conf: `{conf}`")
+                block.append(f"Type: {typ} | RR(TP1): `{rr1:.2f}` | RR(TP2): `{rr2:.2f}` | RR(TP3): `{rr3:.2f}`")
+                block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
+                if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
+                    block.append(f"TP1: `{fmt_price(float(tp1))}` | TP2: `{fmt_price(float(tp2))}` | TP3: `{fmt_price(tp3)}`")
+                else:
+                    block.append(f"TP: `{fmt_price(tp3)}`")
+                block.append(
+                    f"Moves: 24H {ch24:+.0f}% {_mv_dot(ch24)} • 4H {ch4:+.0f}% {_mv_dot(ch4)} • "
+                    f"1H {ch1:+.0f}% {_mv_dot(ch1)} • 15m {ch15:+.0f}% {_mv_dot(ch15)}"
                 )
+                block.append(f"Volume: ~{vol/1e6:.1f}M")
+                block.append(f"Chart: {tv_chart_url(sym)}")
+                block.append(f"`{size_cmd}`")
+                lines2.append("\n".join(block))
             except Exception:
                 continue
-        combined_setups_txt = "\n".join(lines2) if lines2 else "_No high-quality setups right now._"
+
+        combined_setups_txt = ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
 
     # Waiting for Trigger (near-miss)
     waiting_txt = ""
@@ -8596,6 +8657,11 @@ def _email_body_pretty(
             f"1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}"
         )
         parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
+        try:
+            _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
+            parts.append(f"   /size {str(getattr(s, 'symbol', ''))} {_pos} entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}")
+        except Exception:
+            pass
         parts.append("")
 
     parts.append(HDR)
