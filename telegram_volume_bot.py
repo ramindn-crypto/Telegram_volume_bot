@@ -1454,7 +1454,7 @@ def db_init():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
-        tz TEXT DEFAULT 'Australia/Melbourne',
+        tz TEXT DEFAULT 'UTC',
         scan_profile TEXT DEFAULT 'default',
         equity REAL DEFAULT 1000.0,
         risk_mode TEXT DEFAULT 'percent',
@@ -1789,7 +1789,7 @@ def get_user(user_id: int) -> dict:
     row = cur.fetchone()
 
     if not row:
-        tz_name = "Australia/Melbourne"
+        tz_name = os.environ.get("DEFAULT_USER_TZ", "UTC")
         sessions = ['NY']
         now_local = datetime.now(ZoneInfo(tz_name)).date().isoformat()
         cur.execute("""
@@ -5331,6 +5331,17 @@ It’s a full trading assistant that helps you trade with discipline.
 • Full command guide + examples
 
 ────────────────────
+⏰ Timezone (Email + Headers)
+────────────────────
+/tz <Region/City>
+• Sets your local timezone so emails show your local time
+• Examples:
+  - Australia (Melbourne): /tz Australia/Melbourne
+  - UAE (Dubai): /tz Asia/Dubai
+  - UK (London): /tz Europe/London
+  - USA (New York): /tz America/New_York
+
+────────────────────
 ⚠️ Alerts & Context
 ────────────────────
 /bigmove_alert on|off
@@ -5397,6 +5408,22 @@ Examples:
 
 Example:
 /sessions_on NY
+
+────────────────────
+⏰ TIMEZONE (LOCAL TIME IN EMAILS)
+────────────────────
+/tz
+• Show your current timezone
+
+/tz <Region/City>
+• Set your timezone so headers + emails show your local time
+• Use IANA format: Region/City
+
+Examples:
+/tz Australia/Melbourne
+/tz Asia/Dubai   (UAE)
+/tz Europe/London
+/tz America/New_York
 
 ────────────────────
 ⚠️ ALERTS & EMAILS
@@ -5995,13 +6022,26 @@ async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
     if not context.args:
-        await update.message.reply_text(f"Your TZ: {user['tz']}\nSet: /tz Australia/Melbourne")
+        await update.message.reply_text(
+            f"Your TZ: {user['tz']}\n\n"
+            "Set your timezone (IANA format Region/City):\n"
+            "• /tz Australia/Melbourne\n"
+            "• /tz Asia/Dubai (UAE)\n"
+            "• /tz Europe/London\n"
+            "• /tz America/New_York"
+        )
         return
     tz_name = " ".join(context.args).strip()
     try:
         ZoneInfo(tz_name)
     except Exception:
-        await update.message.reply_text("Invalid TZ. Example: /tz Australia/Melbourne  or  /tz America/New_York")
+        await update.message.reply_text(
+            "Invalid timezone. Use Region/City, for example:\n"
+            "• /tz Australia/Melbourne\n"
+            "• /tz Asia/Dubai (UAE)\n"
+            "• /tz Europe/London\n"
+            "• /tz America/New_York"
+        )
         return
     sessions = ['NY']
     update_user(uid, tz=tz_name, sessions_enabled=json.dumps(sessions))
