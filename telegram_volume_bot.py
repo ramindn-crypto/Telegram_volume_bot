@@ -7452,37 +7452,33 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def guide_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Sends the full PulseFutures User Guide as a document in Telegram.
-    Note: PDF conversion isn't guaranteed on Render, so we ship the guide as a DOCX file.
+    Sends the full PulseFutures User Guide as a PDF document in Telegram.
     """
     try:
-        data = base64.b64decode(GUIDE_FULL_DOCX_B64.encode("utf-8"))
-    except Exception:
-        await update.message.reply_text("❌ Guide file is not available right now.")
-        return
+        # The PDF should be committed to the repo alongside the bot code.
+        pdf_name = "PulseFutures_User_Guide.pdf"
+        pdf_path = pdf_name
+        if not os.path.exists(pdf_path):
+            # Fallback to the directory of this script (Render runs from /opt/render/project/src)
+            try:
+                pdf_path = os.path.join(os.path.dirname(__file__), pdf_name)
+            except Exception:
+                pdf_path = pdf_name
 
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as f:
-            f.write(data)
-            tmp_path = f.name
+        if not os.path.exists(pdf_path):
+            await update.message.reply_text("❌ PDF guide file is not available right now.")
+            return
 
-        caption = "📘 PulseFutures — Full User Guide"
-        with open(tmp_path, "rb") as fh:
+        caption = "📘 PulseFutures — Full User Guide (PDF)"
+        with open(pdf_path, "rb") as fh:
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
                 document=fh,
-                filename=GUIDE_FULL_DOCX_NAME,
+                filename=pdf_name,
                 caption=caption,
             )
     except Exception:
         await update.message.reply_text("❌ Could not send the guide. Please try again.")
-    finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
 
 async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
