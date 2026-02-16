@@ -55,6 +55,7 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     filters,
+    ApplicationHandlerStop,
 )
 
 
@@ -113,6 +114,170 @@ ALLOWED_WHEN_LOCKED = {
     "support",
     "support_status",
 }
+
+
+# =========================================================
+# ACCESS / TRIAL / PRO FEATURE GATING
+# =========================================================
+
+def _now_ts() -> float:
+    return time.time()
+
+def _plan_valid_until_ok(user: dict) -> bool:
+    try:
+        exp = float(user.get("plan_expires") or 0)
+    except Exception:
+        exp = 0.0
+    return (exp <= 0.0) or (_now_ts() <= exp)
+
+def effective_plan(user_id: int, user: Optional[dict]) -> str:
+    """Effective plan with admin override + trial handling."""
+    if is_admin_user(int(user_id)):
+        return "pro"
+
+    u = user or {}
+    plan = str(u.get("plan") or "free").strip().lower()
+
+    if plan in ("pro", "standard") and _plan_valid_until_ok(u):
+        return plan
+
+    try:
+        until = float(u.get("trial_until") or 0.0)
+    except Exception:
+        until = 0.0
+    if plan == "trial" and until > 0 and _now_ts() <= until:
+        return "trial"
+
+    return "free"
+
+def user_has_pro(user_id: int, user: Optional[dict] = None) -> bool:
+    u = user if user is not None else (get_user(user_id) or {})
+    return effective_plan(int(user_id), u) in ("pro", "trial")
+
+def has_active_access(user_id: int, user: Optional[dict] = None) -> bool:
+    u = user if user is not None else (get_user(user_id) or {})
+    return effective_plan(int(user_id), u) in ("standard", "pro", "trial")
+
+def ensure_trial_started(user_id: int, user: Optional[dict], force: bool = False) -> None:
+    """Starts the 7-day FULL Pro trial ONCE when user runs /start."""
+    if is_admin_user(int(user_id)):
+        return
+    u = user or {}
+    plan = str(u.get("plan") or "free").strip().lower()
+    try:
+        ts_start = float(u.get("trial_start_ts") or 0.0)
+    except Exception:
+        ts_start = 0.0
+
+    if plan != "free":
+        return
+    if ts_start > 0:
+        return
+    if not force:
+        return
+
+    now = _now_ts()
+    update_user(
+        int(user_id),
+        plan="trial",
+        trial_start_ts=now,
+        trial_until=now + float(TRIAL_DAYS) * 86400.0,
+        access_source="trial",
+        access_ref="start",
+        access_updated_ts=now,
+    )
+
+PRO_ONLY_COMMANDS = {
+    # Email + notifications
+    "email", "email_on", "email_off", "email_on_off", "email_test", "email_decision", "notify_on", "notify_off",
+    # Unlimited sessions
+    "sessions_on_unlimited", "sessions_off_unlimited", "sessions_unlimited_on", "sessions_unlimited_off",
+    # Big move alerts
+    "bigmove_alert",
+    # Advanced reports
+    "report_daily", "report_weekly", "report_overall",
+}
+
+def enforce_access_or_block(update: Update, command: str) -> bool:
+    uid = update.effective_user.id
+    if is_admin_user(uid):
+        return True
+
+    user = get_user(uid) or {}
+    if has_active_access(uid, user):
+        return True
+
+    if command in ALLOWED_WHEN_LOCKED:
+        return True
+
+    # Non-blocking reply: never stall the event loop for access messages
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(update.message.reply_text(
+            "⛔ Access locked.\n\n"
+            "Your 7-day free trial has ended.\n\n"
+            "To continue, choose a plan:\n"
+            "• Standard — $49/month\n"
+            "• Pro — $99/month\n\n"
+            "👉 /billing"
+        ))
+    except Exception:
+        try:
+            # Fallback (best effort)
+            update.message.reply_text(
+                "⛔ Access locked.\n\n"
+                "Your 7-day free trial has ended.\n\n"
+                "To continue, choose a plan:\n"
+                "• Standard — $49/month\n"
+                "• Pro — $99/month\n\n"
+                "👉 /billing"
+            )
+        except Exception:
+            pass
+    return False
+
+async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Global guard: locks access after trial + gates Pro-only commands."""
+    try:
+        if not getattr(update, "message", None):
+            return
+        txt = (update.message.text or "").strip()
+        if not txt.startswith("/"):
+            return
+        cmd = txt.split()[0][1:].split("@")[0].strip().lower()
+
+        # 1) Trial/access lock
+        if not enforce_access_or_block(update, cmd):
+            raise ApplicationHandlerStop
+
+        # 2) Pro-only commands
+        if cmd in PRO_ONLY_COMMANDS:
+            uid = update.effective_user.id
+            if not user_has_pro(uid):
+                
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(update.message.reply_text(
+                        "🚀 Pro feature.\n\n"
+                        "This command is available in **Pro** (and during your 7-day trial).\n\n"
+                        "👉 /billing",
+                        parse_mode="Markdown"
+                    ))
+                except Exception:
+                    try:
+                        update.message.reply_text(
+                            "🚀 Pro feature.\n\n"
+                            "This command is available in **Pro** (and during your 7-day trial).\n\n"
+                            "👉 /billing",
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
+                raise ApplicationHandlerStop
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        return
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
@@ -1821,6 +1986,9 @@ def list_users_notify_on() -> List[dict]:
     cur = con.cursor()
     cur.execute("SELECT * FROM users WHERE notify_on=1")
     rows = [dict(r) for r in cur.fetchall()]
+
+    # Pro-only: scan emails are available only for Pro users (and active Trial)
+    rows = [r for r in rows if effective_plan(int(r.get("user_id") or 0), r) in ("pro", "trial")]
 
     # Add admins with an email address saved, even if notify_on=0
     try:
@@ -4537,6 +4705,16 @@ async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Failed to save email: {type(e).__name__}: {e}")
 
 
+async def email_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: /email_on
+    context.args = ["on"]
+    await email_cmd(update, context)
+
+async def email_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: /email_off
+    context.args = ["off"]
+    await email_cmd(update, context)
+
 async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -4589,14 +4767,18 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{HDR}\n"
     )
 
-    # Send
+    
+    # Send (run in worker thread so it never blocks other Telegram commands)
+    status_msg = await update.message.reply_text("📤 Sending test email…")
     try:
-        ok = await asyncio.to_thread(send_email, subject, body, uid, False)
+        ok = await _send_email_async(int(EMAIL_SEND_TIMEOUT_SEC), subject, body, uid, False)
     except Exception as e:
         logger.exception("email_test_cmd failed")
-        await update.message.reply_text(f"❌ Test email crashed: {type(e).__name__}: {e}")
+        try:
+            await status_msg.edit_text(f"❌ Test email crashed: {type(e).__name__}: {e}")
+        except Exception:
+            await update.message.reply_text(f"❌ Test email crashed: {type(e).__name__}: {e}")
         return
-
     if ok:
         await update.message.reply_text(f"✅ Test email SENT to: {to_email}")
     else:
@@ -5580,17 +5762,10 @@ async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = get_user(uid)
+    user = get_user(uid) or {}
 
-    if not user:
-        now = time.time()
-        create_user(
-            user_id=uid,
-            plan="trial",
-            trial_until=now + (7 * 24 * 3600),
-            access_source="trial",
-            access_ref="auto_start",
-        )
+    # Start 7-day FULL Pro trial on first /start only
+    ensure_trial_started(uid, user, force=True)
 
     await cmd_help(update, context)
 
@@ -6012,6 +6187,14 @@ async def sessions_off_unlimited_cmd(update: Update, context: ContextTypes.DEFAU
     uid = update.effective_user.id
     update_user(uid, sessions_unlimited=0)
     await update.message.reply_text("✅ Sessions: back to normal (enabled sessions only).")
+
+async def sessions_unlimited_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: /sessions_unlimited_on
+    await sessions_on_unlimited_cmd(update, context)
+
+async def sessions_unlimited_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: /sessions_unlimited_off
+    await sessions_off_unlimited_cmd(update, context)
 
 async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -7924,6 +8107,226 @@ _SCREEN_LOCK = asyncio.Lock()
 
 
 
+def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
+    """Heavy /screen builder (runs in a worker thread).
+
+    Returns:
+        body (str): cached body (header is built in the async handler)
+        kb (list[tuple[str,str]]): [(SYMBOL, SETUP_ID), ...] for TradingView buttons
+    """
+    # Build pool (coroutine) in this worker thread (isolated event loop)
+    pool = _run_coro_in_thread(
+        build_priority_pool(
+            best_fut,
+            session,
+            mode="screen",
+            scan_profile=str(DEFAULT_SCAN_PROFILE),
+            uid=uid,
+        )
+    )
+
+    # Other heavy helpers are sync; run them here too.
+    leaders_txt = build_leaders_table(best_fut)
+    up_txt, dn_txt = movers_tables(best_fut)
+
+    # Hard cap: never show more than 3 top setups on /screen
+    try:
+        setups = (pool.get("setups") or [])[:min(int(SETUPS_N), 3)]
+    except Exception:
+        setups = (pool.get("setups") or [])[:3]
+
+    # Safety: if engine produced no setups, generate fallback ATR-based setups
+    if not setups:
+        try:
+            up_list, dn_list = compute_directional_lists(best_fut)
+            leaders_bases = [str(t[0]).upper() for t in (up_list or [])[:10]]
+            losers_bases  = [str(t[0]).upper() for t in (dn_list or [])[:10]]
+            market_bases  = _market_leader_bases(best_fut)[:10]
+            setups = _fallback_setups_from_universe(
+                best_fut,
+                leaders_bases,
+                losers_bases,
+                market_bases,
+                session,
+                max_items=max(4, int(SETUPS_N or 4)),
+            )[:int(SETUPS_N or 4)]
+        except Exception:
+            setups = []
+
+    # Ensure conf exists + persist signal cards to DB (used by Signal ID lookup)
+    try:
+        for s in (setups or []):
+            if not hasattr(s, "conf") or s.conf is None:
+                s.conf = 0
+            db_insert_signal(s)
+    except Exception:
+        pass
+
+    # Setup cards -> combined text (single "Top Trade Setups" section)
+    combined_setups_txt = "_No high-quality setups right now._"
+    if setups:
+        lines2 = []
+        for s in setups:
+            try:
+                sym = str(getattr(s, "symbol", "")).upper()
+                sid = str(getattr(s, "setup_id", "") or "")
+                side = str(getattr(s, "side", "") or "").upper()
+                conf = int(getattr(s, "conf", 0) or 0)
+                entry = float(getattr(s, "entry", 0.0) or 0.0)
+                sl = float(getattr(s, "sl", 0.0) or 0.0)
+                tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+                vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+
+                rr_den = abs(entry - sl)
+                rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
+
+                pos_word = "long" if side == "BUY" else "short"
+                size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
+
+                emoji = "🟢" if side == "BUY" else "🔴"
+                lines2.append(
+                    f"• `{sid}` — *{sym}* {emoji} `{side}` | Conf `{conf}`\n"
+                    f"  Entry `{fmt_price(entry)}` | SL `{fmt_price(sl)}` | TP `{fmt_price(tp3)}`\n"
+                    f"  `{size_cmd}`"
+                )
+            except Exception:
+                continue
+        combined_setups_txt = "\n".join(lines2) if lines2 else "_No high-quality setups right now._"
+
+    # Waiting for Trigger (near-miss)
+    waiting_txt = ""
+    waiting_items = pool.get("waiting") or []
+    if not waiting_items and _WAITING_TRIGGER:
+        try:
+            waiting_items = list(_WAITING_TRIGGER.items())[:SCREEN_WAITING_N]
+        except Exception:
+            waiting_items = []
+
+    if waiting_items:
+        lines = ["*Waiting for Trigger (near-miss)*", SEP]
+        for item in waiting_items[:SCREEN_WAITING_N]:
+            try:
+                if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[1], dict):
+                    base, d = item
+                    raw_side = str(d.get("side", "BUY") or "BUY").strip().upper()
+                    if raw_side in ("LONG",):
+                        side = "BUY"
+                    elif raw_side in ("SHORT",):
+                        side = "SELL"
+                    elif raw_side in ("BUY", "SELL"):
+                        side = raw_side
+                    else:
+                        side = raw_side
+                    dot = "🟢" if side == "BUY" else ("🔴" if side == "SELL" else "🟡")
+                    lines.append(f"• *{base}* {dot} `{side}`")
+                else:
+                    lines.append(f"• `{str(item)}`")
+            except Exception:
+                continue
+        waiting_txt = "\n".join(lines)
+
+    # Trend continuation watch
+    trend_txt = ""
+    trend_watch = pool.get("trend_watch") or []
+    if trend_watch:
+        lines = ["*Trend Continuation Watch*", SEP]
+        trend_watch_sorted = sorted(
+            trend_watch,
+            key=lambda x: int(x.get("confidence", x.get("conf", 0)) or 0),
+            reverse=True
+        )[:6]
+        for t in trend_watch_sorted:
+            side = str(t.get("side", "BUY"))
+            side_emoji = "🟢" if side == "BUY" else "🔴"
+            conf_val = int(t.get("confidence", t.get("conf", 0)) or 0)
+            sym = str(t.get("symbol", "")).upper()
+            ch24 = float(t.get("ch24", 0.0) or 0.0)
+            lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf_val}` | 24H {pct_with_emoji(ch24)}")
+        trend_txt = "\n".join(lines)
+
+    # Early Warning
+    warning_txt = ""
+    warnings = pool.get("spike_warnings") or []
+    if warnings:
+        lines = ["*Early Warning (Possible Reversal Zones)*", SEP]
+        for w in warnings[:6]:
+            try:
+                sym = str(w.get("symbol", "")).upper()
+                side = str(w.get("side", "SELL")).upper()
+                conf = int(w.get("conf", 0) or 0)
+                vol = float(w.get("vol", 0.0) or 0.0)
+                side_emoji = "🟢" if side == "BUY" else "🔴"
+                lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf}` | Vol~`{vol/1e6:.1f}M`")
+            except Exception:
+                continue
+        warning_txt = "\n".join(lines)
+
+    # Spike Reversal Alerts (10M+ Vol) — includes /size line
+    spike_txt = ""
+    spikes = pool.get("spikes") or []
+    if spikes:
+        lines = ["*Spike Reversal Alerts (10M+ Vol)*", SEP]
+        for c in spikes[:6]:
+            try:
+                sym = str(c.get("symbol", "")).upper()
+                side = str(c.get("side", "SELL")).upper()
+                conf = int(c.get("conf", 0) or 0)
+                entry = float(c.get("entry", 0.0) or 0.0)
+                sl = float(c.get("sl", 0.0) or 0.0)
+                tp3 = float(c.get("tp3", 0.0) or 0.0)
+                vol = float(c.get("vol", 0.0) or 0.0)
+
+                rr_den = abs(entry - sl)
+                rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
+                pos_word = "long" if side == "BUY" else "short"
+                size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
+
+                side_emoji = "🟢" if side == "BUY" else "🔴"
+                lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf}` | RR(TP3) `{rr3:.2f}` | Vol~`{vol/1e6:.1f}M`")
+                lines.append(f"  `{size_cmd}`")
+            except Exception:
+                continue
+        spike_txt = "\n".join(lines)
+
+    # Assemble body (cache THIS, header stays live)
+    def _is_empty(txt: str) -> bool:
+        t = (txt or "").strip()
+        if not t:
+            return True
+        return t.startswith("_No ") or t.startswith("No ") or t.endswith("right now._")
+
+    blocks = []
+    blocks.extend(["", "*Top Trade Setups*", SEP, combined_setups_txt])
+
+    if waiting_txt and (not _is_empty(waiting_txt)):
+        blocks.extend(["", waiting_txt])
+
+    if trend_txt and (not _is_empty(trend_txt)):
+        blocks.extend(["", trend_txt])
+
+    if warning_txt and (not _is_empty(warning_txt)):
+        blocks.extend(["", warning_txt])
+
+    if spike_txt and (not _is_empty(spike_txt)):
+        blocks.extend(["", spike_txt])
+
+    if up_txt and (not _is_empty(up_txt)) and ("|" in up_txt):
+        blocks.extend(["", "*Directional Leaders / Losers*", SEP, up_txt])
+
+    if dn_txt and (not _is_empty(dn_txt)) and ("|" in dn_txt):
+        blocks.extend(["", dn_txt])
+
+    if leaders_txt and (not _is_empty(leaders_txt)) and ("|" in leaders_txt):
+        blocks.extend(["", "*Market Leaders*", SEP, leaders_txt])
+
+    body = "\n".join([b for b in blocks if b is not None]).strip()
+
+    kb = []
+    try:
+        kb = [(s.symbol, s.setup_id) for s in (setups or [])]
+    except Exception:
+        kb = []
+    return body, kb
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = update.effective_user.id
@@ -8024,264 +8427,21 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            # Run heavy work in parallel where possible
-            pool = await asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, session, mode="screen", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=update.effective_user.id))
-            leaders_task = asyncio.to_thread(build_leaders_table, best_fut)
-            movers_task = asyncio.to_thread(movers_tables, best_fut)
 
-            # pool built in worker thread (see above)
-            leaders_txt = await leaders_task
-            up_txt, dn_txt = await movers_task
-
-            # Hard cap: never show more than 3 top setups on /screen
-            setups = (pool.get("setups") or [])[:min(int(SETUPS_N), 3)]
-
-
-            # Safety: if engine produced no setups, generate fallback ATR-based setups
-            # from the same universe shown in the Directional Leaders/Losers tables.
-            if not setups:
-                try:
-                    up_list, dn_list = compute_directional_lists(best_fut)
-                    leaders_bases = [str(t[0]).upper() for t in (up_list or [])[:10]]
-                    losers_bases  = [str(t[0]).upper() for t in (dn_list or [])[:10]]
-                    market_bases  = _market_leader_bases(best_fut)[:10]
-                    setups = _fallback_setups_from_universe(best_fut, leaders_bases, losers_bases, market_bases, session, max_items=max(4, int(SETUPS_N or 4)))[:SETUPS_N]
-                except Exception:
-                    pass
-
-
-            for s in setups:
-                if not hasattr(s, "conf") or s.conf is None:
-                    s.conf = 0
-                db_insert_signal(s)
-
-            # Setup cards
-            if setups:
-                pull_cards = []
-                mom_cards = []
-
-                for i, s in enumerate(setups, 1):
-                    side_emoji = "🟢" if s.side == "BUY" else "🔴"
-                    is_mom = (getattr(s, "engine", "") == "B")
-                    engine_tag = "Momentum Breakout" if is_mom else "Pullback"
-                    rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
-
-                    tp_line = (
-                        f"*TP1:* `{fmt_price(s.tp1)}` | *TP2:* `{fmt_price(s.tp2)}` | *TP3:* `{fmt_price(s.tp3)}`"
-                        if s.tp1 and s.tp2 else
-                        f"*TP3:* `{fmt_price(s.tp3)}`"
-                    )
-
-                    card = (
-                        f"{side_emoji} *{s.side}* — *{s.symbol}*\n"
-                        f"╰──────────────╯\n"
-                        f"`{s.setup_id}` | *Conf:* `{int(getattr(s, 'conf', 0))}`\n"
-                        f"*Type:* `{engine_tag}` | *RR(TP3):* `{rr3:.2f}`\n"
-                        f"*Entry:* `{fmt_price(s.entry)}` | *SL:* `{fmt_price(s.sl)}`\n"
-                        f"{tp_line}\n"
-                        f"*Moves:* 24H {pct_with_emoji(s.ch24)} • 4H {pct_with_emoji(s.ch4)} • "
-                        f"1H {pct_with_emoji(s.ch1)} • 15m {pct_with_emoji(s.ch15)}\n"
-                        f"*Volume:* `~{fmt_money(s.fut_vol_usd)}`\n"
-                        f"*Chart:* {tv_chart_url(s.symbol)}"
-                    )
-
-                    if is_mom:
-                        mom_cards.append(card)
-                    else:
-                        pull_cards.append(card)
-
-                setups_txt = "\n\n".join(pull_cards) if pull_cards else "_No pullback setups right now._"
-                momentum_txt = "\n\n".join(mom_cards) if mom_cards else "_No breakout setups right now._"
-                # Ensure combined_setups_txt is always defined (used later in /screen output)
-                if pull_cards or mom_cards:
-                    if pull_cards and mom_cards:
-                        combined_setups_txt = "\n\n".join(pull_cards + mom_cards)
-                    elif pull_cards:
-                        combined_setups_txt = "\n\n".join(pull_cards)
-                    else:
-                        combined_setups_txt = "\n\n".join(mom_cards)
-                else:
-                    combined_setups_txt = "_No high-quality setups right now._"
-
-            else:
-                setups_txt = "_No high-quality setups right now._"
-                momentum_txt = "_No breakout setups right now._"
-                # Top Trade Setups (clean, user-facing)
-                # NOTE: Users don't care about internal engines; just show entry/SL/TP + a copy-paste /size command.
-                if not setups:
-                    combined_setups_txt = "_No high-quality setups right now._"
-                else:
-                    lines2 = []
-                    for s in setups[:SETUPS_N]:
-                        try:
-                            sym = str(getattr(s, "symbol", "") or "").strip()
-                            side = str(getattr(s, "side", "") or "").strip().upper()
-                            conf = int(getattr(s, "conf", 0) or 0)
-                            entry = float(getattr(s, "entry", 0.0) or 0.0)
-                            sl = float(getattr(s, "sl", 0.0) or 0.0)
-                            tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
-                            sid = str(getattr(s, "setup_id", "") or "").strip()
-
-                            emoji = "🟢" if side == "BUY" else "🔴"
-                            longshort = "long" if side == "BUY" else "short"
-                            size_cmd = f"/size {sym} {longshort} entry {fmt_price(entry)} sl {fmt_price(sl)}"
-
-                            lines2.append(
-                                f"• `{sid}` — *{sym}* {emoji} `{side}` | Conf `{conf}`\\n"
-                                f"  Entry `{fmt_price(entry)}` | SL `{fmt_price(sl)}` | TP `{fmt_price(tp3)}`\\n"
-                                f"  `{size_cmd}`"
-                            )
-                        except Exception:
-                            continue
-                    combined_setups_txt = "\\n".join(lines2) if lines2 else "_No high-quality setups right now._"
-
-                # Waiting for Trigger (near-miss)
-
-            waiting_txt = ""
-            waiting_items = pool.get("waiting") or []
-            if not waiting_items and _WAITING_TRIGGER:
-                try:
-                    waiting_items = list(_WAITING_TRIGGER.items())[:SCREEN_WAITING_N]
-                except Exception:
-                    waiting_items = []
-
-            if waiting_items:
-                lines = ["*Waiting for Trigger (near-miss)*", SEP]
-                for item in waiting_items[:SCREEN_WAITING_N]:
-                    try:
-                        if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[1], dict):
-                            base, d = item
-                            # Always derive the color-dot from side to avoid mismatches
-                            raw_side = str(d.get("side", "BUY") or "BUY").strip().upper()
-                            if raw_side in ("LONG",):
-                                side = "BUY"
-                            elif raw_side in ("SHORT",):
-                                side = "SELL"
-                            elif raw_side in ("BUY", "SELL"):
-                                side = raw_side
-                            else:
-                                side = raw_side  # fallback (still show it)
-                            if side == "BUY":
-                                dot = "🟢"
-                            elif side == "SELL":
-                                dot = "🔴"
-                            else:
-                                dot = "🟡"
-                            lines.append(f"• *{base}* {dot} `{side}`")
-                        else:
-                            lines.append(f"• `{str(item)}`")
-                    except Exception:
-                        continue
-                waiting_txt = "\n".join(lines)
-
-            # Trend continuation watch (adaptive EMA)
-            trend_txt = ""
-            trend_watch = pool.get("trend_watch") or []
-
-            if trend_watch:
-                lines = ["*Trend Continuation Watch*", SEP]
-                trend_watch_sorted = sorted(
-                    trend_watch,
-                    key=lambda x: int(x.get("confidence", x.get("conf", 0)) or 0),
-                    reverse=True
-                )[:6]
-
-                for t in trend_watch_sorted:
-                    side = str(t.get("side", "BUY"))
-                    side_emoji = "🟢" if side == "BUY" else "🔴"
-                    conf_val = int(t.get("confidence", t.get("conf", 0)) or 0)
-                    sym = str(t.get("symbol", "")).upper()
-                    ch24 = float(t.get("ch24", 0.0) or 0.0)
-                    lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf_val}` | 24H {pct_with_emoji(ch24)}")
-
-                trend_txt = "\n".join(lines)
-
-            
-            # NEW: Early Warning — Possible Reversal Zones (non-trade)
-            warning_txt = ""
-            warnings = pool.get("spike_warnings") or []
-            if warnings:
-                lines = ["*Early Warning (Possible Reversal Zones)*", SEP]
-                for w in warnings[:6]:
-                    try:
-                        sym = str(w.get("symbol", "")).upper()
-                        side = str(w.get("side", "SELL")).upper()
-                        conf = int(w.get("conf", 0) or 0)
-                        vol = float(w.get("vol", 0.0) or 0.0)
-                        side_emoji = "🟢" if side == "BUY" else "🔴"
-                        lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf}` | Vol~`{vol/1e6:.1f}M`")
-                    except Exception:
-                        continue
-                warning_txt = "\n".join(lines)
-
-# NEW: Spike Reversal Alerts (15M+ Vol) — includes /size line
-            spike_txt = ""
-            spikes = pool.get("spikes") or []
-            if spikes:
-                lines = ["*Spike Reversal Alerts (10M+ Vol)*", SEP]
-                for c in spikes[:6]:
-                    try:
-                        sym = str(c.get("symbol", "")).upper()
-                        side = str(c.get("side", "SELL")).upper()
-                        conf = int(c.get("conf", 0) or 0)
-                        entry = float(c.get("entry", 0.0) or 0.0)
-                        sl = float(c.get("sl", 0.0) or 0.0)
-                        tp3 = float(c.get("tp3", 0.0) or 0.0)
-                        vol = float(c.get("vol", 0.0) or 0.0)
-
-                        rr_den = abs(entry - sl)
-                        rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
-                        pos_word = "long" if side == "BUY" else "short"
-                        size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
-
-                        side_emoji = "🟢" if side == "BUY" else "🔴"
-                        lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf}` | RR(TP3) `{rr3:.2f}` | Vol~`{vol/1e6:.1f}M`")
-                        lines.append(f"  `{size_cmd}`")
-                    except Exception:
-                        continue
-                spike_txt = "\n".join(lines)
-
-            # Assemble body (cache THIS, header stays live)
-            def _is_empty(txt: str) -> bool:
-                t = (txt or '').strip()
-                if not t:
-                    return True
-                return t.startswith('_No ') or t.startswith('No ') or t.endswith('right now._')
-
-            blocks = []
-
-            # Top setups (always shown)
-            blocks.extend(['', '*Top Trade Setups*', SEP, combined_setups_txt])
-
-            if waiting_txt and (not _is_empty(waiting_txt)):
-                blocks.extend(['', waiting_txt])
-
-            if trend_txt and (not _is_empty(trend_txt)):
-                blocks.extend(['', trend_txt])
-
-            if warning_txt and (not _is_empty(warning_txt)):
-                blocks.extend(['', warning_txt])
-
-            # Spike reversal section — only show if we have candidates
-            if spike_txt and (not _is_empty(spike_txt)):
-                blocks.extend(['', spike_txt])
-
-            # Directional / Leaders sections — only show if they contain rows
-            if up_txt and (not _is_empty(up_txt)) and ('|' in up_txt):
-                blocks.extend(['', '*Directional Leaders / Losers*', SEP, up_txt])
-
-            if dn_txt and (not _is_empty(dn_txt)) and ('|' in dn_txt):
-                blocks.extend(['', dn_txt])
-
-            if leaders_txt and (not _is_empty(leaders_txt)) and ('|' in leaders_txt):
-                blocks.extend(['', '*Market Leaders*', SEP, leaders_txt])
-
-            body = '\n'.join([b for b in blocks if b is not None]).strip()
+            # Heavy build MUST NOT run on the asyncio event loop.
+            # Only /screen is allowed to take longer; everything here runs in a worker thread.
+            body, kb = await asyncio.to_thread(
+                _build_screen_body_and_kb,
+                best_fut,
+                session,
+                int(update.effective_user.id),
+            )
 
             # Cache for fast subsequent /screen calls
             _SCREEN_CACHE["ts"] = time.time()
             _SCREEN_CACHE["body"] = body
-            _SCREEN_CACHE["kb"] = [(s.symbol, s.setup_id) for s in (setups or [])]
+            _SCREEN_CACHE["kb"] = list(kb or [])
+
 
         # Send final
         msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
@@ -10029,6 +10189,9 @@ def main():
     ensure_email_column()
     
     app = Application.builder().token(TOKEN).post_init(_post_init).concurrent_updates(True).build()
+
+    # Global access + Pro gating (runs before any other command handler)
+    app.add_handler(MessageHandler(filters.COMMAND, _command_guard), group=0)
     app.add_error_handler(error_handler)
 
     # ================= Handlers =================
@@ -10055,7 +10218,9 @@ def main():
     app.add_handler(CommandHandler("sessions_on", sessions_on_cmd))
     app.add_handler(CommandHandler("sessions_off", sessions_off_cmd))
     app.add_handler(CommandHandler("sessions_on_unlimited", sessions_on_unlimited_cmd))
+    app.add_handler(CommandHandler("sessions_unlimited_on", sessions_unlimited_on_cmd))
     app.add_handler(CommandHandler("sessions_off_unlimited", sessions_off_unlimited_cmd))
+    app.add_handler(CommandHandler("sessions_unlimited_off", sessions_unlimited_off_cmd))
 
     app.add_handler(CommandHandler("bigmove_alert", bigmove_alert_cmd))
     app.add_handler(CommandHandler("notify_on", notify_on))
@@ -10081,7 +10246,9 @@ def main():
     app.add_handler(CommandHandler("email_on_off", email_on_off_cmd))
     app.add_handler(CommandHandler("upgrade", upgrade_cmd))
     app.add_handler(CommandHandler("trade_window", trade_window_cmd))
-    app.add_handler(CommandHandler("email", email_cmd))   
+    app.add_handler(CommandHandler("email", email_cmd))
+    app.add_handler(CommandHandler("email_on", email_on_cmd))
+    app.add_handler(CommandHandler("email_off", email_off_cmd))   
     app.add_handler(CommandHandler("email_test", email_test_cmd))  
     app.add_handler(CommandHandler("email_decision", email_decision_cmd))
 
