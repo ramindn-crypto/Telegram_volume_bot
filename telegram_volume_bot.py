@@ -10191,7 +10191,7 @@ def main():
     app = Application.builder().token(TOKEN).post_init(_post_init).concurrent_updates(True).build()
 
     # Global access + Pro gating (runs before any other command handler)
-    app.add_handler(MessageHandler(filters.COMMAND, _command_guard), group=0)
+    app.add_handler(MessageHandler(filters.COMMAND, _command_guard), group=-1)
     app.add_error_handler(error_handler)
 
     # ================= Handlers =================
