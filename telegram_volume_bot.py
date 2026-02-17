@@ -345,7 +345,7 @@ async def _reply_subscribe_required(update: Update, context: ContextTypes.DEFAUL
         pass
 
 async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Global guard: locks access after trial + gates Pro-only commands."""
+    """Global guard: channel gate + trial lock + pro-only gate."""
     try:
         if not getattr(update, "message", None):
             return
@@ -355,29 +355,41 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         cmd = txt.split()[0][1:].split("@")[0].strip().lower()
+        uid = int(update.effective_user.id)
 
         # 0) Channel subscription gate (optional)
         if REQUIRED_CHANNEL:
-            ok = await _is_user_subscribed(
-                context.bot, int(update.effective_user.id)
-            )
+            ok = await _is_user_subscribed(context.bot, uid)
             if not ok:
                 if cmd not in {"start", "help", "commands", "billing", "guide_full"}:
                     await _reply_subscribe_required(update, context)
                     raise ApplicationHandlerStop
-
                 if cmd == "start":
                     await _reply_subscribe_required(update, context)
                     raise ApplicationHandlerStop
 
+        # Load user (cached + offloaded)
+        user = await asyncio.to_thread(_get_user_cached, uid)
+
         # 1) Trial/access lock
-        if not enforce_access_or_block(update, cmd):
-            raise ApplicationHandlerStop
+        if not is_admin_user(uid):
+            if not has_active_access(user, uid) and cmd not in ALLOWED_WHEN_LOCKED:
+                try:
+                    await update.message.reply_text(
+                        "⛔ Access locked.\n\n"
+                        "Your 7-day free trial has ended.\n\n"
+                        "Plans:\n"
+                        "• Standard — $50/month\n"
+                        "• Pro — $99/month\n\n"
+                        "👉 /billing"
+                    )
+                except Exception:
+                    pass
+                raise ApplicationHandlerStop
 
         # 2) Pro-only commands
         if cmd in PRO_ONLY_COMMANDS:
-            uid = update.effective_user.id
-            if not user_has_pro(uid):
+            if not user_has_pro(uid, user=user):
                 try:
                     await update.message.reply_text(
                         "🚀 Pro feature.\n\n"
@@ -393,6 +405,7 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raise
     except Exception:
         return
+
 
 def render_primary_only() -> None:
     """
@@ -1890,6 +1903,34 @@ def _order_sessions(xs: List[str]) -> List[str]:
             cleaned.append(x)
     return [s for s in SESSION_PRIORITY if s in cleaned]
 
+# Fast in-memory cache for user rows (avoids sqlite hits on every command -> instant bot response)
+_USER_CACHE = {}  # user_id -> (user_dict, ts)
+USER_CACHE_TTL_SEC = int(os.getenv("USER_CACHE_TTL_SEC", "30"))
+
+def _get_user_cached(user_id: int) -> dict:
+    uid = int(user_id)
+    now_ts = int(time.time())
+    try:
+        cached = _USER_CACHE.get(uid)
+        if cached:
+            u, ts = cached
+            if now_ts - int(ts) <= int(USER_CACHE_TTL_SEC):
+                return dict(u)
+    except Exception:
+        pass
+    u = get_user(uid) or {}
+    try:
+        _USER_CACHE[uid] = (dict(u), now_ts)
+    except Exception:
+        pass
+    return dict(u)
+
+def _set_user_cache(uid: int, user: dict) -> None:
+    try:
+        _USER_CACHE[int(uid)] = (dict(user or {}), int(time.time()))
+    except Exception:
+        pass
+
 def get_user(user_id: int) -> dict:
     con = db_connect()
     cur = con.cursor()
@@ -1936,6 +1977,7 @@ def get_user(user_id: int) -> dict:
         row = cur.fetchone()
 
     con.close()
+    _set_user_cache(int(user_id), dict(row))
     return dict(row)
 
 # =========================================================
@@ -1990,6 +2032,10 @@ def update_user(user_id: int, **kwargs):
     cur.execute(f"UPDATE users SET {sets} WHERE user_id=?", vals)
     con.commit()
     con.close()
+    try:
+        _set_user_cache(int(user_id), get_user(int(user_id)) or {})
+    except Exception:
+        pass
 
 def set_user_email(uid: int, email: str) -> None:
     with sqlite3.connect(DB_PATH) as con:
