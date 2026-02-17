@@ -43,12 +43,14 @@ import base64
 import tempfile
 
 import os
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Bot,
+    BotCommand,
+    MenuButtonCommands,
 )
 
 
@@ -201,7 +203,7 @@ PRO_ONLY_COMMANDS = {
     "report_daily", "report_weekly", "report_overall",
 }
 
-def enforce_access_or_block(update: Update, command: str) -> bool:
+def enforce_access_or_block_legacy(update: Update, command: str) -> bool:
     uid = update.effective_user.id
     if is_admin_user(uid):
         return True
@@ -239,6 +241,42 @@ def enforce_access_or_block(update: Update, command: str) -> bool:
             pass
     return False
 
+
+# =========================================================
+# CHANNEL SUBSCRIPTION GATE (optional)
+# =========================================================
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "").strip()  # e.g. "@PulseFutures" or "-1001234567890"
+REQUIRED_CHANNEL_JOIN_URL = os.getenv("REQUIRED_CHANNEL_JOIN_URL", "").strip()  # e.g. "https://t.me/PulseFutures"
+
+async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
+    """Returns True if user is a member of REQUIRED_CHANNEL (member/admin/creator).
+    NOTE: Bot must be an admin in the channel to reliably check membership.
+    """
+    if not REQUIRED_CHANNEL:
+        return True
+    try:
+        cm = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=int(user_id))
+        status = str(getattr(cm, "status", "") or "").lower()
+        return status in {"member", "administrator", "creator"}
+    except Exception:
+        return False
+
+async def _reply_subscribe_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        join_url = REQUIRED_CHANNEL_JOIN_URL or (f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}" if REQUIRED_CHANNEL.startswith("@") else "")
+        kb = None
+        if join_url:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join Channel", url=join_url)]])
+        await update.message.reply_text(
+            "📢 To use PulseFutures, you must join our channel first.\n\n"
+            f"Channel: {REQUIRED_CHANNEL or '@PulseFutures'}\n\n"
+            "After joining, come back and press /start.",
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+
 async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Global guard: locks access after trial + gates Pro-only commands."""
     try:
@@ -248,6 +286,19 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not txt.startswith("/"):
             return
         cmd = txt.split()[0][1:].split("@")[0].strip().lower()
+
+# 0) Channel subscription gate (optional)
+if REQUIRED_CHANNEL:
+    ok = await _is_user_subscribed(context.bot, int(update.effective_user.id))
+    if not ok:
+        # Allow public commands that help the user join/pay/read docs
+        if cmd not in {"start", "help", "commands", "billing", "guide_full"}:
+            await _reply_subscribe_required(update, context)
+            raise ApplicationHandlerStop
+        # For /start itself, also show the same prompt and stop
+        if cmd == "start":
+            await _reply_subscribe_required(update, context)
+            raise ApplicationHandlerStop
 
         # 1) Trial/access lock
         if not enforce_access_or_block(update, cmd):
@@ -1807,7 +1858,7 @@ def get_user(user_id: int) -> dict:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             user_id,
-            _name,
+            tz_name,
             str(DEFAULT_SCAN_PROFILE),
             float(DEFAULT_EQUITY),
             DEFAULT_RISK_MODE,
@@ -1836,7 +1887,7 @@ def get_user(user_id: int) -> dict:
 # =========================================================
 # ACCESS CONTROL (FREE TRIAL + PAYWALL)
 # =========================================================
-def trial_expired(user: dict) -> bool:
+def trial_expired_legacy(user: dict) -> bool:
     try:
         created = datetime.fromisoformat(user["created_at"])
     except Exception:
@@ -1844,7 +1895,7 @@ def trial_expired(user: dict) -> bool:
     return datetime.utcnow() > created + timedelta(days=FREE_TRIAL_DAYS)
 
 
-def has_active_access(user: dict) -> bool:
+def has_active_access_legacy(user: dict) -> bool:
     if user.get("plan") in ("standard", "pro"):
         return True
     if user.get("plan") == "free" and not trial_expired(user):
@@ -5602,6 +5653,21 @@ Channel: @PulseFutures
 Support: @PulseFuturesSupport
 YouTube: @PulseFutures
 Website: https://pulsefutures.com/
+
+
+────────────────────
+🆘 SUPPORT
+────────────────────
+/support_open
+• List open support tickets (admin)
+
+/support_close <TICKET_ID>
+• Close a support ticket
+
+(Users)
+ /support <issue>
+ /support_status
+
 """\
 
 
@@ -5897,33 +5963,220 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # SUPPORT SYSTEM
 # =========================================================
+
+# Support notifications:
+# - Admin IDs always receive tickets
+# - Optionally forward to a dedicated support group/channel where the bot is admin:
+#     Set SUPPORT_CHAT_ID="-1001234567890"
+SUPPORT_CHAT_ID = os.getenv("SUPPORT_CHAT_ID", "").strip()
+
+def _admin_ids_all() -> List[int]:
+    ids = set()
+    # ADMIN_IDS is used in many places
+    try:
+        for x in (ADMIN_IDS or []):
+            try:
+                ids.add(int(x))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # ADMIN_USER_IDS (legacy)
+    try:
+        for x in (ADMIN_USER_IDS or []):
+            try:
+                ids.add(int(x))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Single env fallbacks
+    for k in ("ADMIN_TELEGRAM_ID", "OWNER_USER_ID", "ADMIN_ID"):
+        v = os.getenv(k, "").strip()
+        if v:
+            try:
+                ids.add(int(v))
+            except Exception:
+                pass
+    return sorted(ids)
+
+def _support_db_init() -> None:
+    con = None
+    try:
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                ticket_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                username TEXT,
+                message TEXT,
+                status TEXT,
+                created_ts REAL,
+                updated_ts REAL
+            )
+        """)
+        con.commit()
+    except Exception:
+        try:
+            if con:
+                con.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            if con:
+                con.close()
+        except Exception:
+            pass
+
+def _support_ticket_create(ticket_id: str, user_id: int, username: str, message: str):
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    ts = time.time()
+    cur.execute("""
+        INSERT OR REPLACE INTO support_tickets (ticket_id, user_id, username, message, status, created_ts, updated_ts)
+        VALUES (?, ?, ?, ?, 'OPEN', ?, ?)
+    """, (str(ticket_id), int(user_id), str(username or ""), str(message or ""), float(ts), float(ts)))
+    con.commit()
+    con.close()
+
+def _support_ticket_latest_for_user(user_id: int) -> Optional[dict]:
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM support_tickets WHERE user_id=? ORDER BY created_ts DESC LIMIT 1", (int(user_id),))
+    r = cur.fetchone()
+    con.close()
+    return dict(r) if r else None
+
+def _support_ticket_list_open(limit: int = 20) -> List[dict]:
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM support_tickets WHERE status='OPEN' ORDER BY created_ts DESC LIMIT ?", (int(limit),))
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(x) for x in rows]
+
+def _support_ticket_set_status(ticket_id: str, status: str):
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    ts = time.time()
+    cur.execute("UPDATE support_tickets SET status=?, updated_ts=? WHERE ticket_id=?", (str(status), float(ts), str(ticket_id)))
+    con.commit()
+    con.close()
+
+
 async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid = int(update.effective_user.id)
     if not context.args:
-        await update.message.reply_text(
-            "Usage:\n/support <your issue>"
-        )
+        await update.message.reply_text("Usage:
+/support <your issue>")
         return
 
-    issue = " ".join(context.args)
+    issue = " ".join(context.args).strip()
+    if not issue:
+        await update.message.reply_text("Usage:
+/support <your issue>")
+        return
+
     ticket_id = f"TKT-{uid}-{int(time.time())}"
+    username = getattr(update.effective_user, "username", "") or ""
+
+    _support_ticket_create(ticket_id, uid, username, issue)
 
     msg = (
-        f"🆘 Support Ticket {ticket_id}\n\n"
-        f"User: {uid}\n"
-        f"Message:\n{issue}"
+        f"🆘 Support Ticket {ticket_id}
+
+"
+        f"User: {uid} @{username}
+"
+        f"Message:
+{issue}"
     )
 
-    for admin in ADMIN_IDS:
-        await context.bot.send_message(admin, msg)
+    # Notify admins
+    for admin in _admin_ids_all():
+        try:
+            await context.bot.send_message(admin, msg)
+        except Exception:
+            pass
+
+    # Optional: forward to a dedicated support group/channel
+    if SUPPORT_CHAT_ID:
+        try:
+            await context.bot.send_message(chat_id=SUPPORT_CHAT_ID, text=msg)
+        except Exception:
+            pass
 
     await update.message.reply_text(
-        f"✅ Ticket created: {ticket_id}\n"
-        "Use /support_status to check."
+        f"✅ Ticket created: {ticket_id}
+"
+        "Use /support_status to check progress."
     )
 
 
 async def support_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    t = _support_ticket_latest_for_user(uid)
+    if not t:
+        await update.message.reply_text("📨 You have no support tickets yet. Use /support <your issue>.")
+        return
+
+    status = str(t.get("status") or "OPEN").upper()
+    tid = str(t.get("ticket_id") or "")
+    await update.message.reply_text(
+        f"📨 Latest ticket: {tid}
+"
+        f"Status: {status}
+
+"
+        "If you need to add more info, create a new ticket with /support <your issue>."
+    )
+
+
+
+async def admin_support_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("Admin only.")
+        return
+
+    rows = _support_ticket_list_open(limit=30)
+    if not rows:
+        await update.message.reply_text("✅ No open support tickets.")
+        return
+
+    lines = ["🧾 Open support tickets", HDR]
+    for r in rows:
+        tid = r.get("ticket_id")
+        u = r.get("user_id")
+        un = r.get("username") or ""
+        msg = (r.get("message") or "").strip().replace("\n", " ")
+        if len(msg) > 80:
+            msg = msg[:77] + "..."
+        lines.append(f"- {tid} | {u} @{un} | {msg}")
+    lines.append(HDR)
+    lines.append("Close: /support_close <TICKET_ID>")
+    await send_long_message(update, "\n".join(lines), parse_mode=None, disable_web_page_preview=True)
+
+async def admin_support_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage:\n/support_close <TICKET_ID>")
+        return
+    tid = str(context.args[0]).strip()
+    _support_ticket_set_status(tid, "CLOSED")
+    await update.message.reply_text(f"✅ Closed: {tid}")
+
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📨 Your latest support ticket is being reviewed.\n"
         "Resolved tickets are auto-closed."
@@ -9860,13 +10113,39 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 async def _post_init(app: Application):
-    # اگر قبلاً webhook ست شده بوده، پاکش کن تا polling گیر نکنه
+    # If webhook was set previously, remove it so polling starts cleanly
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         logger.warning("delete_webhook failed (ignored): %s", e)
 
-        
+    # Bot menu + command list (Telegram "Menu" button)
+    try:
+        cmds = [
+            BotCommand("start", "Start / restart (starts 7-day trial after joining channel)"),
+            BotCommand("screen", "Scan market and show top setups"),
+            BotCommand("status", "Your status (plan, caps, sessions, open trades)"),
+            BotCommand("size", "Position size calculator"),
+            BotCommand("equity", "Set equity / account size"),
+            BotCommand("risk_mode", "Set risk mode (USD / PCT)"),
+            BotCommand("risk", "Set risk per trade"),
+            BotCommand("limits", "Set daily caps / limits"),
+            BotCommand("billing", "Subscription & payment info"),
+            BotCommand("support", "Open support ticket: /support <issue>"),
+            BotCommand("support_status", "Check your latest support ticket"),
+            BotCommand("help", "Help"),
+            BotCommand("commands", "Command list"),
+        ]
+        await app.bot.set_my_commands(cmds)
+        # Ensure menu button is enabled for private chats
+        try:
+            await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("set_my_commands failed (ignored): %s", e)
+
+
 
 # =========================================================
 # USDT (SEMI-AUTO) + ADMIN PAYMENTS/ACCESS MANAGEMENT
@@ -10392,6 +10671,8 @@ def main():
     app.add_handler(CommandHandler("myplan", myplan_cmd))
     app.add_handler(CommandHandler("support", support_cmd))
     app.add_handler(CommandHandler("support_status", support_status_cmd))
+    app.add_handler(CommandHandler("support_open", admin_support_open_cmd))
+    app.add_handler(CommandHandler("support_close", admin_support_close_cmd))
     app.add_handler(CommandHandler("tz", tz_cmd))
     app.add_handler(CommandHandler("screen", screen_cmd))
     app.add_handler(CommandHandler("equity", equity_cmd))
