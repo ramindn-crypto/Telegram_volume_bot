@@ -250,15 +250,15 @@ REQUIRED_CHANNEL_JOIN_URL = os.getenv("REQUIRED_CHANNEL_JOIN_URL", "").strip()  
 
 # Cache channel membership checks to keep commands instant (Telegram API calls can be slow / rate-limited)
 _SUB_CACHE = {}  # user_id -> (ok: bool, ts: int)
-SUB_CACHE_TTL_SEC = int(os.getenv("SUB_CACHE_TTL_SEC", "300"))
+SUB_CACHE_TTL_SEC = int(os.getenv("SUB_CACHE_TTL_SEC", "1800"))
 
 async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
     """Returns True if user is a member of REQUIRED_CHANNEL (member/admin/creator).
 
-    IMPORTANT:
-    - For channels, Telegram only lets bots check membership reliably if the bot is an **admin** in the channel.
-    - If the bot cannot check (missing rights / chat not found / etc.), we **fail open** to avoid blocking everyone,
-      and we notify admins once in a while so you can fix the configuration.
+    Notes:
+    - For channels, Telegram membership checks can be flaky unless the bot is admin.
+    - We cache results to keep commands instant.
+    - If Telegram refuses the check (permissions / private / etc.), we fail-open to avoid blocking everyone.
     """
     if not REQUIRED_CHANNEL:
         return True
@@ -281,52 +281,72 @@ async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
     except Exception:
         pass
 
+    # Resolve channel id once (more reliable than @username for getChatMember on some setups)
+    chat_id_to_check = REQUIRED_CHANNEL
     try:
-        cm = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=int(user_id))
+        global _REQUIRED_CHANNEL_ID
+    except Exception:
+        _REQUIRED_CHANNEL_ID = None
+
+    try:
+        if _REQUIRED_CHANNEL_ID is None:
+            ch = await bot.get_chat(REQUIRED_CHANNEL)
+            _REQUIRED_CHANNEL_ID = int(getattr(ch, "id"))
+        if _REQUIRED_CHANNEL_ID:
+            chat_id_to_check = int(_REQUIRED_CHANNEL_ID)
+    except Exception:
+        chat_id_to_check = REQUIRED_CHANNEL
+
+    # Attempt membership check (first with resolved id, then fallback to username)
+    async def _check(chat_id_val):
+        cm = await bot.get_chat_member(chat_id=chat_id_val, user_id=int(user_id))
         status = str(getattr(cm, "status", "") or "").lower()
-        ok = status in {"member", "administrator", "creator"}
-        try:
-            _SUB_CACHE[int(user_id)] = (bool(ok), int(time.time()))
-        except Exception:
-            pass
-        return ok
-    except Exception as e:
-        # If we can't check membership (very common when the bot is not admin in the channel),
-        # do not lock everyone out. Warn admins occasionally.
-        try:
-            global _CHANNEL_GATE_WARN_TS
-        except Exception:
-            _CHANNEL_GATE_WARN_TS = 0
+        return status in {"member", "administrator", "creator"}
 
+    try:
+        ok = await _check(chat_id_to_check)
+    except Exception:
         try:
-            now_ts = int(time.time())
-            if now_ts - int(_CHANNEL_GATE_WARN_TS or 0) > 900:
-                _CHANNEL_GATE_WARN_TS = now_ts
-                err = f"{type(e).__name__}: {e}"
-                hint = (
-                    "⚠️ Channel gate check failed.\n\n"
-                    f"REQUIRED_CHANNEL={REQUIRED_CHANNEL}\n"
-                    f"Error: {err}\n\n"
-                    "Fix:\n"
-                    "1) Add this bot as ADMIN in the channel.\n"
-                    "2) Prefer setting REQUIRED_CHANNEL to the channel ID like -1001234567890.\n"
-                    "3) Set REQUIRED_CHANNEL_JOIN_URL to your join link.\n\n"
-                    "Until fixed, the bot will not block users on the channel gate."
-                )
-                for admin in _admin_ids_all():
-                    try:
-                        await bot.send_message(chat_id=int(admin), text=hint)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+            ok = await _check(REQUIRED_CHANNEL)
+        except Exception as e:
+            # If we can't check membership (very common when the bot is not admin in the channel),
+            # do not lock everyone out. Warn admins occasionally.
+            try:
+                global _CHANNEL_GATE_WARN_TS
+            except Exception:
+                _CHANNEL_GATE_WARN_TS = 0
 
-        try:
-            _SUB_CACHE[int(user_id)] = (True, int(time.time()))
-        except Exception:
-            pass
-        return True
+            try:
+                now_ts = int(time.time())
+                if now_ts - int(_CHANNEL_GATE_WARN_TS or 0) > 900:
+                    _CHANNEL_GATE_WARN_TS = now_ts
+                    err = f"{type(e).__name__}: {e}"
+                    hint = (
+                        "⚠️ Channel gate check failed. Failing open.
 
+"
+                        f"REQUIRED_CHANNEL={REQUIRED_CHANNEL}
+"
+                        f"Error: {err}
+
+"
+                        "Fix: add the bot as ADMIN in the channel, or set REQUIRED_CHANNEL to the channel ID (-100...)."
+                    )
+                    for admin in _admin_ids_all():
+                        try:
+                            await bot.send_message(chat_id=admin, text=hint)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            ok = True  # fail-open
+
+    try:
+        _SUB_CACHE[int(user_id)] = (bool(ok), int(time.time()))
+    except Exception:
+        pass
+    return bool(ok)
 
 async def _reply_subscribe_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -345,7 +365,7 @@ async def _reply_subscribe_required(update: Update, context: ContextTypes.DEFAUL
         pass
 
 async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Global guard: channel gate + trial lock + pro-only gate."""
+    """Global guard: locks access after trial + gates Pro-only commands."""
     try:
         if not getattr(update, "message", None):
             return
@@ -355,41 +375,29 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         cmd = txt.split()[0][1:].split("@")[0].strip().lower()
-        uid = int(update.effective_user.id)
 
         # 0) Channel subscription gate (optional)
         if REQUIRED_CHANNEL:
-            ok = await _is_user_subscribed(context.bot, uid)
+            ok = await _is_user_subscribed(
+                context.bot, int(update.effective_user.id)
+            )
             if not ok:
                 if cmd not in {"start", "help", "commands", "billing", "guide_full"}:
                     await _reply_subscribe_required(update, context)
                     raise ApplicationHandlerStop
+
                 if cmd == "start":
                     await _reply_subscribe_required(update, context)
                     raise ApplicationHandlerStop
 
-        # Load user (cached + offloaded)
-        user = await asyncio.to_thread(_get_user_cached, uid)
-
         # 1) Trial/access lock
-        if not is_admin_user(uid):
-            if not has_active_access(user, uid) and cmd not in ALLOWED_WHEN_LOCKED:
-                try:
-                    await update.message.reply_text(
-                        "⛔ Access locked.\n\n"
-                        "Your 7-day free trial has ended.\n\n"
-                        "Plans:\n"
-                        "• Standard — $50/month\n"
-                        "• Pro — $99/month\n\n"
-                        "👉 /billing"
-                    )
-                except Exception:
-                    pass
-                raise ApplicationHandlerStop
+        if not enforce_access_or_block(update, cmd):
+            raise ApplicationHandlerStop
 
         # 2) Pro-only commands
         if cmd in PRO_ONLY_COMMANDS:
-            if not user_has_pro(uid, user=user):
+            uid = update.effective_user.id
+            if not user_has_pro(uid):
                 try:
                     await update.message.reply_text(
                         "🚀 Pro feature.\n\n"
@@ -405,7 +413,6 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raise
     except Exception:
         return
-
 
 def render_primary_only() -> None:
     """
@@ -1903,34 +1910,6 @@ def _order_sessions(xs: List[str]) -> List[str]:
             cleaned.append(x)
     return [s for s in SESSION_PRIORITY if s in cleaned]
 
-# Fast in-memory cache for user rows (avoids sqlite hits on every command -> instant bot response)
-_USER_CACHE = {}  # user_id -> (user_dict, ts)
-USER_CACHE_TTL_SEC = int(os.getenv("USER_CACHE_TTL_SEC", "30"))
-
-def _get_user_cached(user_id: int) -> dict:
-    uid = int(user_id)
-    now_ts = int(time.time())
-    try:
-        cached = _USER_CACHE.get(uid)
-        if cached:
-            u, ts = cached
-            if now_ts - int(ts) <= int(USER_CACHE_TTL_SEC):
-                return dict(u)
-    except Exception:
-        pass
-    u = get_user(uid) or {}
-    try:
-        _USER_CACHE[uid] = (dict(u), now_ts)
-    except Exception:
-        pass
-    return dict(u)
-
-def _set_user_cache(uid: int, user: dict) -> None:
-    try:
-        _USER_CACHE[int(uid)] = (dict(user or {}), int(time.time()))
-    except Exception:
-        pass
-
 def get_user(user_id: int) -> dict:
     con = db_connect()
     cur = con.cursor()
@@ -1977,7 +1956,6 @@ def get_user(user_id: int) -> dict:
         row = cur.fetchone()
 
     con.close()
-    _set_user_cache(int(user_id), dict(row))
     return dict(row)
 
 # =========================================================
@@ -2032,10 +2010,6 @@ def update_user(user_id: int, **kwargs):
     cur.execute(f"UPDATE users SET {sets} WHERE user_id=?", vals)
     con.commit()
     con.close()
-    try:
-        _set_user_cache(int(user_id), get_user(int(user_id)) or {})
-    except Exception:
-        pass
 
 def set_user_email(uid: int, email: str) -> None:
     with sqlite3.connect(DB_PATH) as con:
