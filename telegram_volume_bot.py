@@ -5345,10 +5345,6 @@ async def usdt_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 HELP_TEXT = """\
 🚀 PulseFutures — Trading System in Telegram
-
-PulseFutures is NOT a signal spam bot.
-It’s a full trading assistant that helps you trade with discipline.
-
 ────────────────────
 Core Commands
 ────────────────────
@@ -5409,24 +5405,19 @@ Market & Signals
 /size <symbol> <side> <entry> <sl>
 • Calculates position size based on your risk rules
 
-Examples:
-/size BTC long 42000 41000
-/size ELSA short 0.09087 0.09671
-/riskmode pct 2.5
-
 ────────────────────
 Trade Journal
 ────────────────────
 /trade_open
-• Log a new trade
+• Log an opned position
 
 /trade_sl
 • Update Stop Loss
 
 /trade_rf
-• Set the position to Risk-Free
+• Risk-Free a position
 
-/trade_cloe
+/trade_close
 • Log a closed position
 
 ────────────────────
@@ -5445,9 +5436,6 @@ Trade Journal
 
 /trade_window
 • Set allowed trading time window 
-
-Example:
-/sessions_on NY
 
 ────────────────────
 ⚠️ EMAILS & ALERTS
@@ -5476,10 +5464,6 @@ Example:
 
 /bigmove_alert on|off [4H%] [1H%]
 • Big move alerts in either direction (UP or DOWN)
-
-Examples:
-/bigmove_alert on 30 12
-/email you@example.com
 
 ────────────────────
 ⏰ TIMEZONE (LOCAL TIME IN EMAILS)
@@ -5521,8 +5505,17 @@ Reports
 /guide_full
 • Download the full user guide (PDF)
 
+/Support
+• Submit your support request
+
+────────────────────
+📢 Channels
+────────────────────
+Channel: @PulseFutures
 Support: @PulseFuturesSupport
-Updates: @PulseFutures
+YouTube: @PulseFutures
+Website: https://pulsefutures.com/
+
 """\
 
 # =========================================================
