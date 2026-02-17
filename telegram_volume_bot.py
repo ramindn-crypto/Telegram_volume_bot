@@ -6073,14 +6073,18 @@ def _support_ticket_set_status(ticket_id: str, status: str):
 async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(update.effective_user.id)
     if not context.args:
-        await update.message.reply_text("Usage:
-/support <your issue>")
+        await update.message.reply_text(
+        """Usage:
+        /support <your issue>"""
+        )
         return
 
     issue = " ".join(context.args).strip()
     if not issue:
-        await update.message.reply_text("Usage:
-/support <your issue>")
+        await update.message.reply_text(
+        """Usage:
+        /support <your issue>"""
+        )
         return
 
     ticket_id = f"TKT-{uid}-{int(time.time())}"
