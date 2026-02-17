@@ -6113,30 +6113,28 @@ async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     await update.message.reply_text(
-        f"✅ Ticket created: {ticket_id}
-"
+        f"✅ Ticket created: {ticket_id}\n"
         "Use /support_status to check progress."
     )
-
+    
 
 async def support_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(update.effective_user.id)
     t = _support_ticket_latest_for_user(uid)
     if not t:
-        await update.message.reply_text("📨 You have no support tickets yet. Use /support <your issue>.")
+        await update.message.reply_text(
+            "📨 You have no support tickets yet. Use /support <your issue>."
+        )
         return
 
     status = str(t.get("status") or "OPEN").upper()
     tid = str(t.get("ticket_id") or "")
-    await update.message.reply_text(
-        f"📨 Latest ticket: {tid}
-"
-        f"Status: {status}
 
-"
+    await update.message.reply_text(
+        f"📨 Latest ticket: {tid}\n"
+        f"Status: {status}\n\n"
         "If you need to add more info, create a new ticket with /support <your issue>."
     )
-
 
 
 async def admin_support_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
