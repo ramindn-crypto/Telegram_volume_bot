@@ -282,57 +282,50 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not getattr(update, "message", None):
             return
+
         txt = (update.message.text or "").strip()
         if not txt.startswith("/"):
             return
+
         cmd = txt.split()[0][1:].split("@")[0].strip().lower()
 
-# 0) Channel subscription gate (optional)
-try:
-    if REQUIRED_CHANNEL:
-        ok = await _is_user_subscribed(context.bot, int(update.effective_user.id))
-        if not ok:
-            # Allow public commands that help the user join/pay/read docs
-            if cmd not in {"start", "help", "commands", "billing", "guide_full"}:
-                await _reply_subscribe_required(update, context)
-                raise ApplicationHandlerStop
+        # 0) Channel subscription gate (optional)
+        if REQUIRED_CHANNEL:
+            ok = await _is_user_subscribed(
+                context.bot, int(update.effective_user.id)
+            )
+            if not ok:
+                if cmd not in {"start", "help", "commands", "billing", "guide_full"}:
+                    await _reply_subscribe_required(update, context)
+                    raise ApplicationHandlerStop
 
-            # For /start itself, also show the same prompt and stop
-            if cmd == "start":
-                await _reply_subscribe_required(update, context)
-                raise ApplicationHandlerStop
+                if cmd == "start":
+                    await _reply_subscribe_required(update, context)
+                    raise ApplicationHandlerStop
 
-    # 1) Trial/access lock
-    if not enforce_access_or_block(update, cmd):
-        raise ApplicationHandlerStop
-
-    # 2) Pro-only commands
-    if cmd in PRO_ONLY_COMMANDS:
-        uid = update.effective_user.id
-        if not user_has_pro(uid):
-            try:
-                await update.message.reply_text(
-                    "🚀 Pro feature.\n\n"
-                    "This command is available in *Pro* (and during your 7-day trial).\n\n"
-                    "👉 /billing",
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                pass
+        # 1) Trial/access lock
+        if not enforce_access_or_block(update, cmd):
             raise ApplicationHandlerStop
 
-except ApplicationHandlerStop:
-    raise
-except Exception:
-    return
+        # 2) Pro-only commands
+        if cmd in PRO_ONLY_COMMANDS:
+            uid = update.effective_user.id
+            if not user_has_pro(uid):
+                try:
+                    await update.message.reply_text(
+                        "🚀 Pro feature.\n\n"
+                        "This command is available in *Pro* (and during your 7-day trial).\n\n"
+                        "👉 /billing",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+                raise ApplicationHandlerStop
 
-
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-
-STRIPE_PRICE_TO_PLAN = {
-    os.getenv("STRIPE_PRICE_STANDARD"): "standard",
-    os.getenv("STRIPE_PRICE_PRO"): "pro",
-}
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        return
 
 def render_primary_only() -> None:
     """
