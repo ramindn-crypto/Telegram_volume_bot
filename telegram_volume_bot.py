@@ -1807,7 +1807,7 @@ def get_user(user_id: int) -> dict:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             user_id,
-            tz_name,
+            _name,
             str(DEFAULT_SCAN_PROFILE),
             float(DEFAULT_EQUITY),
             DEFAULT_RISK_MODE,
@@ -1980,8 +1980,8 @@ def ensure_billing_columns():
                 pass
 
 def reset_daily_if_needed(user: dict) -> dict:
-    tz = ZoneInfo(user["tz"])
-    today = datetime.now(tz).date().isoformat()
+     = ZoneInfo(user[""])
+    today = datetime.now().date().isoformat()
     if user["day_trade_date"] != today:
         update_user(user["user_id"], day_trade_date=today, day_trade_count=0)
         user = get_user(user["user_id"])
@@ -2707,7 +2707,7 @@ def _risk_daily_inc(user_id: int, day_local: str, inc_usd: float):
     con.close()
 
 def _user_day_local(user: dict) -> str:
-    tz = ZoneInfo(user["tz"])
+     = ZoneInfo(user["tz"])
     return datetime.now(tz).date().isoformat()
 
 def db_insert_signal(s: Setup):
@@ -6968,11 +6968,14 @@ HELP_TEXT = """\
 PulseFutures is NOT a signal spam bot.
 It’s a full trading assistant that helps you trade with discipline.
 
-────────────────────
+───────────────────────────────────────────────
 🔍 Core Commands
-────────────────────
+───────────────────────────────────────────────
 /screen
 • Scan the market for high-quality setups
+
+/equity
+• Set your equity
 
 /size <symbol> <entry> <sl>
 • Position sizing based on your risk rules
@@ -6986,28 +6989,25 @@ It’s a full trading assistant that helps you trade with discipline.
 /guide_full
 • Download the full user guide (DOCX)
 
-────────────────────
-⏰ Timezone (Email + Headers)
-────────────────────
+───────────────────────────────────────────────
+⏰ Timezone (for Emails)
+───────────────────────────────────────────────
 /tz <Region/City>
 • Sets your local timezone so emails show your local time
 • Examples:
-  - Australia (Melbourne): /tz Australia/Melbourne
   - UAE (Dubai): /tz Asia/Dubai
   - UK (London): /tz Europe/London
   - USA (New York): /tz America/New_York
 
-────────────────────
-⚠️ Alerts & Context
-────────────────────
+───────────────────────────────────────────────
+⚠️ Alerts
+───────────────────────────────────────────────
 /bigmove_alert on|off
 • Major market moves (📧 Pro/Trial only)
 
-• Possible reversal zones (📧 Pro/Trial only)
-
-────────────────────
+───────────────────────────────────────────────
 💎 Plans
-────────────────────
+───────────────────────────────────────────────
 🟢 Standard — Telegram only
 🔵 Pro — Telegram + Email alerts
 🎁 New users get a 7-day Pro trial automatically.
@@ -7023,9 +7023,9 @@ COMMANDS_TEXT = """\
 PulseFutures is a full trading system inside Telegram.
 Below are the key commands with simple examples.
 
-────────────────────
-🔍 MARKET SCAN
-────────────────────
+───────────────────────────────────────────────
+Core Commands
+───────────────────────────────────────────────
 /screen
 • Scans the market for high-quality setups
 • Sections you may see:
@@ -7035,22 +7035,44 @@ Below are the key commands with simple examples.
   - Spike Reversal Alerts
   - Leaders/Losers + Market Leaders
 
-Example:
-/screen
+/status
+• Shows your plan (Trial/Standard/Pro) & enabled features
 
-────────────────────
+───────────────────────────────────────────────
 ⚖️ RISK & POSITION SIZING
-────────────────────
+───────────────────────────────────────────────
+/equity
+• Set your equity
+
+/riskmode
+• Set your risk per trade
+
 /size <symbol> <side> <entry> <sl>
 • Calculates position size based on your risk rules
 
 Examples:
 /size BTC long 42000 41000
 /size ELSA short 0.09087 0.09671
+/riskmode pct 2.5
 
-────────────────────
+───────────────────────────────────────────────
+Trade Journal
+───────────────────────────────────────────────
+/trade_open
+• Log a new trade
+
+/trade_sl
+• Update Stop Loss
+
+/trade_rf
+• Set the position to Risk-Free
+
+/trade_cloe
+• Log a closed position
+
+───────────────────────────────────────────────
 🕒 SESSION CONTROL
-────────────────────
+───────────────────────────────────────────────
 /sessions
 • View your session settings
 
@@ -7060,42 +7082,41 @@ Examples:
 
 /sessions_on_unlimited
 /sessions_off_unlimited
-• 24-hour mode for scans (if enabled in your build)
+• 24-hour mode for scans
 
 Example:
 /sessions_on NY
 
-────────────────────
+───────────────────────────────────────────────
 ⏰ TIMEZONE (LOCAL TIME IN EMAILS)
-────────────────────
+───────────────────────────────────────────────
 /tz
 • Show your current timezone
 
 /tz <Region/City>
-• Set your timezone so headers + emails show your local time
+• Set your timezone so emails show your local time
 • Use IANA format: Region/City
 
 Examples:
 /tz Australia/Melbourne
-/tz Asia/Dubai   (UAE)
+/tz Asia/Dubai   
 /tz Europe/London
 /tz America/New_York
 
-────────────────────
+───────────────────────────────────────────────
 ⚠️ ALERTS & EMAILS
-────────────────────
+───────────────────────────────────────────────
 /bigmove_alert on|off [4H%] [1H%]
 • Big move alerts in either direction (UP or DOWN)
-• 📧 Email alerts are Pro/Trial only
-
-• Possible reversal zones (context, not an entry)
-• 📧 Email alerts are Pro/Trial only
 
 /email you@gmail.com
 • Set your email for alerts
 
 /email_test
 • Send a test email to confirm delivery
+
+/email on
+• Enable email
 
 /email off
 • Disable email
@@ -7104,15 +7125,9 @@ Examples:
 /bigmove_alert on 30 12
 /email you@example.com
 
-────────────────────
-📊 PLAN & STATUS
-────────────────────
-/status
-• Shows your plan (Trial/Standard/Pro), trial days remaining, and enabled features
-
-────────────────────
+───────────────────────────────────────────────
 🆘 HELP & SUPPORT
-────────────────────
+───────────────────────────────────────────────
 /help
 • Quick overview
 
@@ -7120,13 +7135,11 @@ Examples:
 • Full guide (this)
 
 /guide_full
-• Download the full user guide (DOCX)
+• Download the full user guide (PDF)
 
 Support: @PulseFuturesSupport
 Updates: @PulseFutures
 """\
-
-
 
 # =========================================================
 # HELP TEXT (ADMIN)
@@ -7138,9 +7151,9 @@ HELP_TEXT_ADMIN = """\
 Admin commands are powerful. Use carefully.
 Not financial advice.
 
-────────────────────
+───────────────────────────────────────────────
 👤 USERS & ACCESS
-────────────────────
+───────────────────────────────────────────────
 /admin_user <user_id>
 • View full user record (plan, trial, alerts)
 
@@ -7156,9 +7169,9 @@ Not financial advice.
 /myplan
 • View your own plan status (admins too)
 
-────────────────────
+───────────────────────────────────────────────
 💳 PAYMENTS (USDT)
-────────────────────
+───────────────────────────────────────────────
 /admin_payments
 • View payments ledger
 
@@ -7171,9 +7184,9 @@ Not financial advice.
 /usdt_reject <TXID> <reason>
 • Reject payment
 
-────────────────────
+───────────────────────────────────────────────
 ⏱️ COOLDOWNS
-────────────────────
+───────────────────────────────────────────────
 /cooldown
 /cooldowns
 • View cooldowns
@@ -7184,18 +7197,18 @@ Not financial advice.
 /cooldown_clear_all
 • Clear all cooldowns (global)
 
-────────────────────
+───────────────────────────────────────────────
 ⚙️ DATA / RECOVERY
-────────────────────
+───────────────────────────────────────────────
 /reset
 • Reset user data / clean DB (⚠️ DANGEROUS)
 
 /restore
 • Restore previously removed data (if backup exists)
 
-────────────────────
+───────────────────────────────────────────────
 🧪 DIAGNOSTICS
-────────────────────
+───────────────────────────────────────────────
 /why
 • Last /screen reject summary (why no setups)
 
@@ -7205,11 +7218,13 @@ Not financial advice.
 /health_sys
 • System health (DB, exchange, email)
 
-────────────────────
+───────────────────────────────────────────────
 📢 Channels
-────────────────────
-Updates: @PulseFutures
+───────────────────────────────────────────────
+Channel: @PulseFutures
 Support: @PulseFuturesSupport
+YouTube: @PulseFutures
+Website: https://pulsefutures.com/
 """\
 
 
