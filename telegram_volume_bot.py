@@ -6093,13 +6093,9 @@ async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _support_ticket_create(ticket_id, uid, username, issue)
 
     msg = (
-        f"🆘 Support Ticket {ticket_id}
-
-"
-        f"User: {uid} @{username}
-"
-        f"Message:
-{issue}"
+        f"🆘 Support Ticket {ticket_id}\n\n"
+        f"User: {uid} @{username}\n"
+        f"Message:\n{issue}"
     )
 
     # Notify admins
