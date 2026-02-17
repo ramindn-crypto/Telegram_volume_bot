@@ -6069,21 +6069,19 @@ def _support_ticket_set_status(ticket_id: str, status: str):
     con.commit()
     con.close()
 
-
 async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(update.effective_user.id)
+
     if not context.args:
         await update.message.reply_text(
-        """Usage:
-        /support <your issue>"""
+            "Usage:\n/support <your issue>"
         )
         return
 
     issue = " ".join(context.args).strip()
     if not issue:
         await update.message.reply_text(
-        """Usage:
-        /support <your issue>"""
+            "Usage:\n/support <your issue>"
         )
         return
 
@@ -6116,11 +6114,12 @@ async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Ticket created: {ticket_id}\n"
         "Use /support_status to check progress."
     )
-    
+
 
 async def support_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(update.effective_user.id)
     t = _support_ticket_latest_for_user(uid)
+
     if not t:
         await update.message.reply_text(
             "📨 You have no support tickets yet. Use /support <your issue>."
@@ -6135,6 +6134,7 @@ async def support_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Status: {status}\n\n"
         "If you need to add more info, create a new ticket with /support <your issue>."
     )
+
 
 
 async def admin_support_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
