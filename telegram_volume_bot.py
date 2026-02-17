@@ -253,24 +253,19 @@ _SUB_CACHE = {}  # user_id -> (ok: bool, ts: int)
 SUB_CACHE_TTL_SEC = int(os.getenv("SUB_CACHE_TTL_SEC", "1800"))
 
 async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
-    """Returns True if user is a member of REQUIRED_CHANNEL (member/admin/creator).
+    """Returns True if user is a member of REQUIRED_CHANNEL (member/admin/creator)."""
 
-    Notes:
-    - For channels, Telegram membership checks can be flaky unless the bot is admin.
-    - We cache results to keep commands instant.
-    - If Telegram refuses the check (permissions / private / etc.), we fail-open to avoid blocking everyone.
-    """
     if not REQUIRED_CHANNEL:
         return True
 
-    # Admins are never blocked by the channel gate
+    # Admins bypass channel gate
     try:
         if is_admin_user(int(user_id)):
             return True
     except Exception:
         pass
 
-    # Cached membership (keeps commands instant)
+    # Cached membership check
     try:
         now_ts = int(time.time())
         cached = _SUB_CACHE.get(int(user_id))
@@ -281,8 +276,8 @@ async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
     except Exception:
         pass
 
-    # Resolve channel id once (more reliable than @username for getChatMember on some setups)
     chat_id_to_check = REQUIRED_CHANNEL
+
     try:
         global _REQUIRED_CHANNEL_ID
     except Exception:
@@ -297,9 +292,11 @@ async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
     except Exception:
         chat_id_to_check = REQUIRED_CHANNEL
 
-    # Attempt membership check (first with resolved id, then fallback to username)
     async def _check(chat_id_val):
-        cm = await bot.get_chat_member(chat_id=chat_id_val, user_id=int(user_id))
+        cm = await bot.get_chat_member(
+            chat_id=chat_id_val,
+            user_id=int(user_id)
+        )
         status = str(getattr(cm, "status", "") or "").lower()
         return status in {"member", "administrator", "creator"}
 
@@ -309,8 +306,6 @@ async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
         try:
             ok = await _check(REQUIRED_CHANNEL)
         except Exception as e:
-            # If we can't check membership (very common when the bot is not admin in the channel),
-            # do not lock everyone out. Warn admins occasionally.
             try:
                 global _CHANNEL_GATE_WARN_TS
             except Exception:
@@ -321,17 +316,15 @@ async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
                 if now_ts - int(_CHANNEL_GATE_WARN_TS or 0) > 900:
                     _CHANNEL_GATE_WARN_TS = now_ts
                     err = f"{type(e).__name__}: {e}"
+
                     hint = (
-                        "⚠️ Channel gate check failed. Failing open.
-
-"
-                        f"REQUIRED_CHANNEL={REQUIRED_CHANNEL}
-"
-                        f"Error: {err}
-
-"
-                        "Fix: add the bot as ADMIN in the channel, or set REQUIRED_CHANNEL to the channel ID (-100...)."
+                        "⚠️ Channel gate check failed. Failing open.\n\n"
+                        f"REQUIRED_CHANNEL={REQUIRED_CHANNEL}\n"
+                        f"Error: {err}\n\n"
+                        "Fix: add the bot as ADMIN in the channel, "
+                        "or set REQUIRED_CHANNEL to the channel ID (-100...)."
                     )
+
                     for admin in _admin_ids_all():
                         try:
                             await bot.send_message(chat_id=admin, text=hint)
@@ -346,6 +339,7 @@ async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
         _SUB_CACHE[int(user_id)] = (bool(ok), int(time.time()))
     except Exception:
         pass
+
     return bool(ok)
 
 async def _reply_subscribe_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
