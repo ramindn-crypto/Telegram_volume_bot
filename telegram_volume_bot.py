@@ -1979,13 +1979,23 @@ def ensure_billing_columns():
                 # column already exists (or older sqlite limitation)
                 pass
 
+from zoneinfo import ZoneInfo
+from datetime import datetime
+
 def reset_daily_if_needed(user: dict) -> dict:
-     = ZoneInfo(user[""])
-    today = datetime.now().date().isoformat()
+    tz = ZoneInfo(user["timezone"])
+    today = datetime.now(tz).date().isoformat()
+
     if user["day_trade_date"] != today:
-        update_user(user["user_id"], day_trade_date=today, day_trade_count=0)
+        update_user(
+            user["user_id"],
+            day_trade_date=today,
+            day_trade_count=0
+        )
         user = get_user(user["user_id"])
+
     return user
+
 
 def list_users_notify_on() -> List[dict]:
     """Users who should receive scan emails. Admins are always included."""
