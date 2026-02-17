@@ -248,6 +248,10 @@ def enforce_access_or_block_legacy(update: Update, command: str) -> bool:
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "").strip()  # e.g. "@PulseFutures" or "-1001234567890"
 REQUIRED_CHANNEL_JOIN_URL = os.getenv("REQUIRED_CHANNEL_JOIN_URL", "").strip()  # e.g. "https://t.me/PulseFutures"
 
+# Cache channel membership checks to keep commands instant (Telegram API calls can be slow / rate-limited)
+_SUB_CACHE = {}  # user_id -> (ok: bool, ts: int)
+SUB_CACHE_TTL_SEC = int(os.getenv("SUB_CACHE_TTL_SEC", "300"))
+
 async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
     """Returns True if user is a member of REQUIRED_CHANNEL (member/admin/creator).
 
@@ -266,10 +270,26 @@ async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
     except Exception:
         pass
 
+    # Cached membership (keeps commands instant)
+    try:
+        now_ts = int(time.time())
+        cached = _SUB_CACHE.get(int(user_id))
+        if cached:
+            ok, ts = cached
+            if now_ts - int(ts) <= int(SUB_CACHE_TTL_SEC):
+                return bool(ok)
+    except Exception:
+        pass
+
     try:
         cm = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=int(user_id))
         status = str(getattr(cm, "status", "") or "").lower()
-        return status in {"member", "administrator", "creator"}
+        ok = status in {"member", "administrator", "creator"}
+        try:
+            _SUB_CACHE[int(user_id)] = (bool(ok), int(time.time()))
+        except Exception:
+            pass
+        return ok
     except Exception as e:
         # If we can't check membership (very common when the bot is not admin in the channel),
         # do not lock everyone out. Warn admins occasionally.
@@ -284,13 +304,13 @@ async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
                 _CHANNEL_GATE_WARN_TS = now_ts
                 err = f"{type(e).__name__}: {e}"
                 hint = (
-                    "⚠️ Channel gate check failed.\\n\\n"
-                    f"REQUIRED_CHANNEL={REQUIRED_CHANNEL}\\n"
-                    f"Error: {err}\\n\\n"
-                    "Fix:\\n"
-                    "1) Add this bot as ADMIN in the channel.\\n"
-                    "2) Prefer setting REQUIRED_CHANNEL to the channel ID like -1001234567890.\\n"
-                    "3) Set REQUIRED_CHANNEL_JOIN_URL to your join link.\\n\\n"
+                    "⚠️ Channel gate check failed.\n\n"
+                    f"REQUIRED_CHANNEL={REQUIRED_CHANNEL}\n"
+                    f"Error: {err}\n\n"
+                    "Fix:\n"
+                    "1) Add this bot as ADMIN in the channel.\n"
+                    "2) Prefer setting REQUIRED_CHANNEL to the channel ID like -1001234567890.\n"
+                    "3) Set REQUIRED_CHANNEL_JOIN_URL to your join link.\n\n"
                     "Until fixed, the bot will not block users on the channel gate."
                 )
                 for admin in _admin_ids_all():
@@ -301,6 +321,10 @@ async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
         except Exception:
             pass
 
+        try:
+            _SUB_CACHE[int(user_id)] = (True, int(time.time()))
+        except Exception:
+            pass
         return True
 
 
@@ -10150,19 +10174,47 @@ async def _post_init(app: Application):
     # Bot menu + command list (Telegram "Menu" button)
     try:
         cmds = [
-            BotCommand("start", "Start / restart (starts 7-day trial after joining channel)"),
-            BotCommand("screen", "Scan market and show top setups"),
-            BotCommand("status", "Your status (plan, caps, sessions, open trades)"),
+            BotCommand("start", "Start"),
+            BotCommand("status", "Shows your plan & enabled features"),
+            BotCommand("health", "Bot & data health check"),
+
+            BotCommand("screen", "Scans the market for high-quality setups"),
+
+            BotCommand("equity", "Set your equity"),
+            BotCommand("riskmode", "Set your risk per trade"),
             BotCommand("size", "Position size calculator"),
-            BotCommand("equity", "Set equity / account size"),
-            BotCommand("risk_mode", "Set risk mode (USD / PCT)"),
-            BotCommand("risk", "Set risk per trade"),
-            BotCommand("limits", "Set daily caps / limits"),
-            BotCommand("billing", "Subscription & payment info"),
-            BotCommand("support", "Open support ticket: /support <issue>"),
+
+            BotCommand("trade_open", "Log an opened position"),
+            BotCommand("trade_sl", "Update Stop Loss"),
+            BotCommand("trade_rf", "Risk-Free a position"),
+            BotCommand("trade_close", "Log a closed position"),
+
+            BotCommand("sessions", "View your session settings"),
+            BotCommand("sessions_on", "Enable a session"),
+            BotCommand("sessions_off", "Disable a session"),
+            BotCommand("sessions_on_unlimited", "24-hour mode ON"),
+            BotCommand("sessions_off_unlimited", "24-hour mode OFF"),
+            BotCommand("trade_window", "Set allowed trading time window"),
+
+            BotCommand("email", "Set email / email on|off"),
+            BotCommand("email_test", "Send a test email"),
+            BotCommand("limits", "Set email caps/gaps"),
+            BotCommand("bigmove_alert", "Big move alerts"),
+
+            BotCommand("tz", "Show/set your timezone"),
+
+            BotCommand("report_daily", "Daily performance report"),
+            BotCommand("report_weekly", "Weekly performance report"),
+            BotCommand("report_overall", "All-time performance report"),
+
+            BotCommand("help", "Quick overview"),
+            BotCommand("commands", "Full command guide"),
+            BotCommand("guide_full", "Download full user guide (PDF)"),
+
+            BotCommand("support", "Submit support request"),
             BotCommand("support_status", "Check your latest support ticket"),
-            BotCommand("help", "Help"),
-            BotCommand("commands", "Command list"),
+
+            BotCommand("billing", "Subscription & payment info"),
         ]
         await app.bot.set_my_commands(cmds)
         # Ensure menu button is enabled for private chats
