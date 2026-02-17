@@ -1979,11 +1979,13 @@ def ensure_billing_columns():
                 # column already exists (or older sqlite limitation)
                 pass
 
-from zoneinfo import ZoneInfo
-from datetime import datetime
 
 def reset_daily_if_needed(user: dict) -> dict:
-    tz = ZoneInfo(user["timezone"])
+    tz_name = str(user.get("tz") or user.get("timezone") or "UTC").strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
     today = datetime.now(tz).date().isoformat()
 
     if user["day_trade_date"] != today:
@@ -2717,7 +2719,11 @@ def _risk_daily_inc(user_id: int, day_local: str, inc_usd: float):
     con.close()
 
 def _user_day_local(user: dict) -> str:
-     = ZoneInfo(user["tz"])
+    tz_name = str(user.get("tz") or user.get("timezone") or "UTC").strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
     return datetime.now(tz).date().isoformat()
 
 def db_insert_signal(s: Setup):
