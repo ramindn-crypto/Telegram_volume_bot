@@ -39,13 +39,18 @@ from telegram.constants import ParseMode
 
 import difflib
 
+import base64
+import tempfile
+
 import os
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Bot,
+    BotCommand,
+    MenuButtonCommands,
 )
 
 
@@ -198,7 +203,7 @@ PRO_ONLY_COMMANDS = {
     "report_daily", "report_weekly", "report_overall",
 }
 
-def enforce_access_or_block(update: Update, command: str) -> bool:
+def enforce_access_or_block_legacy(update: Update, command: str) -> bool:
     uid = update.effective_user.id
     if is_admin_user(uid):
         return True
@@ -236,6 +241,42 @@ def enforce_access_or_block(update: Update, command: str) -> bool:
             pass
     return False
 
+
+# =========================================================
+# CHANNEL SUBSCRIPTION GATE (optional)
+# =========================================================
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "").strip()  # e.g. "@PulseFutures" or "-1001234567890"
+REQUIRED_CHANNEL_JOIN_URL = os.getenv("REQUIRED_CHANNEL_JOIN_URL", "").strip()  # e.g. "https://t.me/PulseFutures"
+
+async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
+    """Returns True if user is a member of REQUIRED_CHANNEL (member/admin/creator).
+    NOTE: Bot must be an admin in the channel to reliably check membership.
+    """
+    if not REQUIRED_CHANNEL:
+        return True
+    try:
+        cm = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=int(user_id))
+        status = str(getattr(cm, "status", "") or "").lower()
+        return status in {"member", "administrator", "creator"}
+    except Exception:
+        return False
+
+async def _reply_subscribe_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        join_url = REQUIRED_CHANNEL_JOIN_URL or (f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}" if REQUIRED_CHANNEL.startswith("@") else "")
+        kb = None
+        if join_url:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join Channel", url=join_url)]])
+        await update.message.reply_text(
+            "📢 To use PulseFutures, you must join our channel first.\n\n"
+            f"Channel: {REQUIRED_CHANNEL or '@PulseFutures'}\n\n"
+            "After joining, come back and press /start.",
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+
 async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Global guard: locks access after trial + gates Pro-only commands."""
     try:
@@ -245,6 +286,19 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not txt.startswith("/"):
             return
         cmd = txt.split()[0][1:].split("@")[0].strip().lower()
+
+# 0) Channel subscription gate (optional)
+if REQUIRED_CHANNEL:
+    ok = await _is_user_subscribed(context.bot, int(update.effective_user.id))
+    if not ok:
+        # Allow public commands that help the user join/pay/read docs
+        if cmd not in {"start", "help", "commands", "billing", "guide_full"}:
+            await _reply_subscribe_required(update, context)
+            raise ApplicationHandlerStop
+        # For /start itself, also show the same prompt and stop
+        if cmd == "start":
+            await _reply_subscribe_required(update, context)
+            raise ApplicationHandlerStop
 
         # 1) Trial/access lock
         if not enforce_access_or_block(update, cmd):
@@ -632,8 +686,12 @@ DB_FILE_LOCK = asyncio.Lock()
 # NY  : 13:00–22:00 UTC
 # Priority resolves overlaps: NY > LON > ASIA
 SESSIONS_UTC = {
-    "ASIA": {"start": "00:00", "end": "09:00"},
-    "LON":  {"start": "07:00", "end": "16:00"},
+    # Non-overlapping UTC windows (DST-proof for Melbourne display)
+    # ASIA: 00:00–08:00 UTC
+    # LON : 08:00–17:00 UTC
+    # NY  : 13:00–22:00 UTC
+    "ASIA": {"start": "00:00", "end": "08:00"},
+    "LON":  {"start": "08:00", "end": "17:00"},
     "NY":   {"start": "13:00", "end": "22:00"},
 }
 
@@ -1450,7 +1508,7 @@ def db_init():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
-        tz TEXT DEFAULT 'Australia/Melbourne',
+        tz TEXT DEFAULT 'UTC',
         scan_profile TEXT DEFAULT 'default',
         equity REAL DEFAULT 1000.0,
         risk_mode TEXT DEFAULT 'percent',
@@ -1785,7 +1843,7 @@ def get_user(user_id: int) -> dict:
     row = cur.fetchone()
 
     if not row:
-        tz_name = "Australia/Melbourne"
+        tz_name = os.environ.get("DEFAULT_USER_TZ", "UTC")
         sessions = ['NY']
         now_local = datetime.now(ZoneInfo(tz_name)).date().isoformat()
         cur.execute("""
@@ -1829,7 +1887,7 @@ def get_user(user_id: int) -> dict:
 # =========================================================
 # ACCESS CONTROL (FREE TRIAL + PAYWALL)
 # =========================================================
-def trial_expired(user: dict) -> bool:
+def trial_expired_legacy(user: dict) -> bool:
     try:
         created = datetime.fromisoformat(user["created_at"])
     except Exception:
@@ -1837,7 +1895,7 @@ def trial_expired(user: dict) -> bool:
     return datetime.utcnow() > created + timedelta(days=FREE_TRIAL_DAYS)
 
 
-def has_active_access(user: dict) -> bool:
+def has_active_access_legacy(user: dict) -> bool:
     if user.get("plan") in ("standard", "pro"):
         return True
     if user.get("plan") == "free" and not trial_expired(user):
@@ -1972,13 +2030,25 @@ def ensure_billing_columns():
                 # column already exists (or older sqlite limitation)
                 pass
 
+
 def reset_daily_if_needed(user: dict) -> dict:
-    tz = ZoneInfo(user["tz"])
+    tz_name = str(user.get("tz") or user.get("timezone") or "UTC").strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
     today = datetime.now(tz).date().isoformat()
+
     if user["day_trade_date"] != today:
-        update_user(user["user_id"], day_trade_date=today, day_trade_count=0)
+        update_user(
+            user["user_id"],
+            day_trade_date=today,
+            day_trade_count=0
+        )
         user = get_user(user["user_id"])
+
     return user
+
 
 def list_users_notify_on() -> List[dict]:
     """Users who should receive scan emails. Admins are always included."""
@@ -2700,7 +2770,11 @@ def _risk_daily_inc(user_id: int, day_local: str, inc_usd: float):
     con.close()
 
 def _user_day_local(user: dict) -> str:
-    tz = ZoneInfo(user["tz"])
+    tz_name = str(user.get("tz") or user.get("timezone") or "UTC").strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
     return datetime.now(tz).date().isoformat()
 
 def db_insert_signal(s: Setup):
@@ -2923,6 +2997,19 @@ def to_mv(t: dict) -> Optional[MarketVol]:
         vwap=float(t.get("vwap") or 0.0),
     )
 
+
+def get_cached_futures_tickers() -> Dict[str, MarketVol]:
+    """Fast, no-network accessor for last known futures tickers.
+
+    Used by instant commands like /size and /status to avoid blocking on CCXT calls.
+    Returns {} if nothing has been cached yet.
+    """
+    try:
+        obj = cache_get("tickers_best_fut")
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
 def fetch_futures_tickers() -> Dict[str, MarketVol]:
     """
     ✅ Uses singleton exchange (no repeated load_markets)
@@ -2975,10 +3062,16 @@ def parse_hhmm(s: str) -> Tuple[int, int]:
 
 def current_session_utc(now_utc: Optional[datetime] = None) -> str:
     """
-    Market sessions in UTC (with overlaps handled by priority):
-    - NY  : 13:00–22:00
-    - LON : 07:00–16:00
-    - ASIA: 00:00–09:00
+    Market sessions in UTC.
+
+    NOTE:
+    - We use non-overlapping UTC windows to avoid ambiguous session labels around overlaps.
+    - This also fixes Melbourne display so ~6:00 PM Melbourne remains ASIA until 7:00 PM (AEDT).
+
+    Windows:
+    - NY  : 13:00–22:00 UTC
+    - LON : 08:00–17:00 UTC
+    - ASIA: 00:00–08:00 UTC
     Priority: NY > LON > ASIA
     """
     if now_utc is None:
@@ -2986,9 +3079,15 @@ def current_session_utc(now_utc: Optional[datetime] = None) -> str:
 
     h = now_utc.hour
 
-    # Priority first (overlaps intentionally resolved)
     if 13 <= h < 22:
         return "NY"
+    if 8 <= h < 17:
+        return "LON"
+    if 0 <= h < 8:
+        return "ASIA"
+
+    # Outside the three main windows: treat as NY tail/transition
+    return "NY"
     if 7 <= h < 16:
         return "LON"
     if 0 <= h < 9:
@@ -4963,6 +5062,9 @@ def in_session_now(user: dict) -> Optional[dict]:
 
 import difflib
 
+import base64
+import tempfile
+
 # =========================================================
 # UNKNOWN COMMAND + "DID YOU MEAN" SUGGESTION (ALL USERS)
 # =========================================================
@@ -5288,25 +5390,17 @@ async def usdt_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # grant_standard_access(user_id)
     # grant_pro_access(user_id)
 
-
 # =========================================================
 # HELP TEXT (USER)
 # =========================================================
 
 HELP_TEXT = """\
 🚀 PulseFutures — Trading System in Telegram
-
-PulseFutures is NOT a signal spam bot.
-It’s a full trading assistant that helps you trade with discipline.
-
 ────────────────────
-🔍 Core Commands
+Core Commands
 ────────────────────
 /screen
 • Scan the market for high-quality setups
-
-/size <symbol> <entry> <sl>
-• Position sizing based on your risk rules
 
 /status
 • Your plan, trial status & enabled features
@@ -5314,13 +5408,8 @@ It’s a full trading assistant that helps you trade with discipline.
 /commands
 • Full command guide + examples
 
-────────────────────
-⚠️ Alerts & Context
-────────────────────
-/bigmove_alert on|off
-• Major market moves (📧 Pro/Trial only)
-
-• Possible reversal zones (📧 Pro/Trial only)
+/guide_full
+• Download the full user guide (PDF)
 
 ────────────────────
 💎 Plans
@@ -5341,29 +5430,46 @@ PulseFutures is a full trading system inside Telegram.
 Below are the key commands with simple examples.
 
 ────────────────────
-🔍 MARKET SCAN
+Core Commands
+────────────────────
+/status
+• Shows your plan (Trial/Standard/Pro) & enabled features
+
+/health
+• Bot & data health check 
+
+────────────────────
+Market & Signals 
 ────────────────────
 /screen
 • Scans the market for high-quality setups
-• Sections you may see:
-  - Top Trade Setups (ready)
-  - Waiting for Trigger (near-miss)
-  - Trend Continuation Watch
-  - Spike Reversal Alerts
-  - Leaders/Losers + Market Leaders
-
-Example:
-/screen
 
 ────────────────────
 ⚖️ RISK & POSITION SIZING
 ────────────────────
+/equity
+• Set your equity
+
+/riskmode
+• Set your risk per trade
+
 /size <symbol> <side> <entry> <sl>
 • Calculates position size based on your risk rules
 
-Examples:
-/size BTC long 42000 41000
-/size ELSA short 0.09087 0.09671
+────────────────────
+Trade Journal
+────────────────────
+/trade_open
+• Log an opned position
+
+/trade_sl
+• Update Stop Loss
+
+/trade_rf
+• Risk-Free a position
+
+/trade_close
+• Log a closed position
 
 ────────────────────
 🕒 SESSION CONTROL
@@ -5377,20 +5483,14 @@ Examples:
 
 /sessions_on_unlimited
 /sessions_off_unlimited
-• 24-hour mode for scans (if enabled in your build)
+• 24-hour mode for scans
 
-Example:
-/sessions_on NY
+/trade_window
+• Set allowed trading time window 
 
 ────────────────────
-⚠️ ALERTS & EMAILS
+⚠️ EMAILS & ALERTS
 ────────────────────
-/bigmove_alert on|off [4H%] [1H%]
-• Big move alerts in either direction (UP or DOWN)
-• 📧 Email alerts are Pro/Trial only
-
-• Possible reversal zones (context, not an entry)
-• 📧 Email alerts are Pro/Trial only
 
 /email you@gmail.com
 • Set your email for alerts
@@ -5398,18 +5498,51 @@ Example:
 /email_test
 • Send a test email to confirm delivery
 
+/email on
+• Enable email
+
 /email off
 • Disable email
 
-Examples:
-/bigmove_alert on 30 12
-/email you@example.com
+/limits emailcap 
+• Set number of emails per session
+
+/limits emailgap
+• Set min gap between emails 
+
+/limits emaildaycap 
+• Set max number of emails per day
+
+/bigmove_alert on|off [4H%] [1H%]
+• Big move alerts in either direction (UP or DOWN)
 
 ────────────────────
-📊 PLAN & STATUS
+⏰ TIMEZONE (LOCAL TIME IN EMAILS)
 ────────────────────
-/status
-• Shows your plan (Trial/Standard/Pro), trial days remaining, and enabled features
+/tz
+• Show your current timezone
+
+/tz <Region/City>
+• Set your timezone so emails show your local time
+• Use IANA format: Region/City
+
+Examples:
+/tz Australia/Melbourne
+/tz Asia/Dubai   
+/tz Europe/London
+/tz America/New_York
+
+────────────────────
+Reports 
+────────────────────
+/report_daily 
+• Daily performance report 
+
+/report_weekly 
+• Weekly performance report 
+
+/report_overall 
+• All-time performance report 
 
 ────────────────────
 🆘 HELP & SUPPORT
@@ -5420,11 +5553,21 @@ Examples:
 /commands
 • Full guide (this)
 
+/guide_full
+• Download the full user guide (PDF)
+
+/Support
+• Submit your support request
+
+────────────────────
+📢 Channels
+────────────────────
+Channel: @PulseFutures
 Support: @PulseFuturesSupport
-Updates: @PulseFutures
+YouTube: @PulseFutures
+Website: https://pulsefutures.com/
+
 """\
-
-
 
 # =========================================================
 # HELP TEXT (ADMIN)
@@ -5506,8 +5649,25 @@ Not financial advice.
 ────────────────────
 📢 Channels
 ────────────────────
-Updates: @PulseFutures
+Channel: @PulseFutures
 Support: @PulseFuturesSupport
+YouTube: @PulseFutures
+Website: https://pulsefutures.com/
+
+
+────────────────────
+🆘 SUPPORT
+────────────────────
+/support_open
+• List open support tickets (admin)
+
+/support_close <TICKET_ID>
+• Close a support ticket
+
+(Users)
+ /support <issue>
+ /support_status
+
 """\
 
 
@@ -5747,6 +5907,37 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+async def guide_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Sends the full PulseFutures User Guide as a PDF document in Telegram.
+    """
+    try:
+        # The PDF should be committed to the repo alongside the bot code.
+        pdf_name = "PulseFutures_User_Guide.pdf"
+        pdf_path = pdf_name
+        if not os.path.exists(pdf_path):
+            # Fallback to the directory of this script (Render runs from /opt/render/project/src)
+            try:
+                pdf_path = os.path.join(os.path.dirname(__file__), pdf_name)
+            except Exception:
+                pdf_path = pdf_name
+
+        if not os.path.exists(pdf_path):
+            await update.message.reply_text("❌ PDF guide file is not available right now.")
+            return
+
+        caption = "📘 PulseFutures — Full User Guide (PDF)"
+        with open(pdf_path, "rb") as fh:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=fh,
+                filename=pdf_name,
+                caption=caption,
+            )
+    except Exception:
+        await update.message.reply_text("❌ Could not send the guide. Please try again.")
+
 async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("Admin only.")
@@ -5772,33 +5963,220 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # SUPPORT SYSTEM
 # =========================================================
+
+# Support notifications:
+# - Admin IDs always receive tickets
+# - Optionally forward to a dedicated support group/channel where the bot is admin:
+#     Set SUPPORT_CHAT_ID="-1001234567890"
+SUPPORT_CHAT_ID = os.getenv("SUPPORT_CHAT_ID", "").strip()
+
+def _admin_ids_all() -> List[int]:
+    ids = set()
+    # ADMIN_IDS is used in many places
+    try:
+        for x in (ADMIN_IDS or []):
+            try:
+                ids.add(int(x))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # ADMIN_USER_IDS (legacy)
+    try:
+        for x in (ADMIN_USER_IDS or []):
+            try:
+                ids.add(int(x))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Single env fallbacks
+    for k in ("ADMIN_TELEGRAM_ID", "OWNER_USER_ID", "ADMIN_ID"):
+        v = os.getenv(k, "").strip()
+        if v:
+            try:
+                ids.add(int(v))
+            except Exception:
+                pass
+    return sorted(ids)
+
+def _support_db_init() -> None:
+    con = None
+    try:
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                ticket_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                username TEXT,
+                message TEXT,
+                status TEXT,
+                created_ts REAL,
+                updated_ts REAL
+            )
+        """)
+        con.commit()
+    except Exception:
+        try:
+            if con:
+                con.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            if con:
+                con.close()
+        except Exception:
+            pass
+
+def _support_ticket_create(ticket_id: str, user_id: int, username: str, message: str):
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    ts = time.time()
+    cur.execute("""
+        INSERT OR REPLACE INTO support_tickets (ticket_id, user_id, username, message, status, created_ts, updated_ts)
+        VALUES (?, ?, ?, ?, 'OPEN', ?, ?)
+    """, (str(ticket_id), int(user_id), str(username or ""), str(message or ""), float(ts), float(ts)))
+    con.commit()
+    con.close()
+
+def _support_ticket_latest_for_user(user_id: int) -> Optional[dict]:
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM support_tickets WHERE user_id=? ORDER BY created_ts DESC LIMIT 1", (int(user_id),))
+    r = cur.fetchone()
+    con.close()
+    return dict(r) if r else None
+
+def _support_ticket_list_open(limit: int = 20) -> List[dict]:
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM support_tickets WHERE status='OPEN' ORDER BY created_ts DESC LIMIT ?", (int(limit),))
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(x) for x in rows]
+
+def _support_ticket_set_status(ticket_id: str, status: str):
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    ts = time.time()
+    cur.execute("UPDATE support_tickets SET status=?, updated_ts=? WHERE ticket_id=?", (str(status), float(ts), str(ticket_id)))
+    con.commit()
+    con.close()
+
+
 async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid = int(update.effective_user.id)
     if not context.args:
-        await update.message.reply_text(
-            "Usage:\n/support <your issue>"
-        )
+        await update.message.reply_text("Usage:
+/support <your issue>")
         return
 
-    issue = " ".join(context.args)
+    issue = " ".join(context.args).strip()
+    if not issue:
+        await update.message.reply_text("Usage:
+/support <your issue>")
+        return
+
     ticket_id = f"TKT-{uid}-{int(time.time())}"
+    username = getattr(update.effective_user, "username", "") or ""
+
+    _support_ticket_create(ticket_id, uid, username, issue)
 
     msg = (
-        f"🆘 Support Ticket {ticket_id}\n\n"
-        f"User: {uid}\n"
-        f"Message:\n{issue}"
+        f"🆘 Support Ticket {ticket_id}
+
+"
+        f"User: {uid} @{username}
+"
+        f"Message:
+{issue}"
     )
 
-    for admin in ADMIN_IDS:
-        await context.bot.send_message(admin, msg)
+    # Notify admins
+    for admin in _admin_ids_all():
+        try:
+            await context.bot.send_message(admin, msg)
+        except Exception:
+            pass
+
+    # Optional: forward to a dedicated support group/channel
+    if SUPPORT_CHAT_ID:
+        try:
+            await context.bot.send_message(chat_id=SUPPORT_CHAT_ID, text=msg)
+        except Exception:
+            pass
 
     await update.message.reply_text(
-        f"✅ Ticket created: {ticket_id}\n"
-        "Use /support_status to check."
+        f"✅ Ticket created: {ticket_id}
+"
+        "Use /support_status to check progress."
     )
 
 
 async def support_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    t = _support_ticket_latest_for_user(uid)
+    if not t:
+        await update.message.reply_text("📨 You have no support tickets yet. Use /support <your issue>.")
+        return
+
+    status = str(t.get("status") or "OPEN").upper()
+    tid = str(t.get("ticket_id") or "")
+    await update.message.reply_text(
+        f"📨 Latest ticket: {tid}
+"
+        f"Status: {status}
+
+"
+        "If you need to add more info, create a new ticket with /support <your issue>."
+    )
+
+
+
+async def admin_support_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("Admin only.")
+        return
+
+    rows = _support_ticket_list_open(limit=30)
+    if not rows:
+        await update.message.reply_text("✅ No open support tickets.")
+        return
+
+    lines = ["🧾 Open support tickets", HDR]
+    for r in rows:
+        tid = r.get("ticket_id")
+        u = r.get("user_id")
+        un = r.get("username") or ""
+        msg = (r.get("message") or "").strip().replace("\n", " ")
+        if len(msg) > 80:
+            msg = msg[:77] + "..."
+        lines.append(f"- {tid} | {u} @{un} | {msg}")
+    lines.append(HDR)
+    lines.append("Close: /support_close <TICKET_ID>")
+    await send_long_message(update, "\n".join(lines), parse_mode=None, disable_web_page_preview=True)
+
+async def admin_support_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage:\n/support_close <TICKET_ID>")
+        return
+    tid = str(context.args[0]).strip()
+    _support_ticket_set_status(tid, "CLOSED")
+    await update.message.reply_text(f"✅ Closed: {tid}")
+
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📨 Your latest support ticket is being reviewed.\n"
         "Resolved tickets are auto-closed."
@@ -5979,13 +6357,26 @@ async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
     if not context.args:
-        await update.message.reply_text(f"Your TZ: {user['tz']}\nSet: /tz Australia/Melbourne")
+        await update.message.reply_text(
+            f"Your TZ: {user['tz']}\n\n"
+            "Set your timezone (IANA format Region/City):\n"
+            "• /tz Australia/Melbourne\n"
+            "• /tz Asia/Dubai (UAE)\n"
+            "• /tz Europe/London\n"
+            "• /tz America/New_York"
+        )
         return
     tz_name = " ".join(context.args).strip()
     try:
         ZoneInfo(tz_name)
     except Exception:
-        await update.message.reply_text("Invalid TZ. Example: /tz Australia/Melbourne  or  /tz America/New_York")
+        await update.message.reply_text(
+            "Invalid timezone. Use Region/City, for example:\n"
+            "• /tz Australia/Melbourne\n"
+            "• /tz Asia/Dubai (UAE)\n"
+            "• /tz Europe/London\n"
+            "• /tz America/New_York"
+        )
         return
     sessions = ['NY']
     update_user(uid, tz=tz_name, sessions_enabled=json.dumps(sessions))
@@ -6434,11 +6825,11 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- Entry sanity check vs live price (warn only; does not block /size) ---
+    # --- Entry sanity check vs last known price (warn only; NEVER blocks /size) ---
     try:
-        best_now = await asyncio.to_thread(fetch_futures_tickers)
-        mv_now = best_now.get(sym)
-        cur_px = float(mv_now.last) if mv_now and float(mv_now.last or 0) > 0 else 0.0
+        best_now = get_cached_futures_tickers()
+        mv_now = best_now.get(sym) if isinstance(best_now, dict) else None
+        cur_px = float(mv_now.last) if mv_now and float(getattr(mv_now, "last", 0) or 0) > 0 else 0.0
     except Exception:
         cur_px = 0.0
     
@@ -6575,7 +6966,7 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     force = ("force" in tokens)  # user can add: force
     
     try:
-        best_now = await asyncio.to_thread(fetch_futures_tickers)
+        best_now = get_cached_futures_tickers()
         mv_now = best_now.get(sym)
         cur_px = float(mv_now.last) if mv_now and float(mv_now.last or 0) > 0 else 0.0
     except Exception:
@@ -8165,6 +8556,25 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     # Setup cards -> combined text (single "Top Trade Setups" section)
     combined_setups_txt = "_No high-quality setups right now._"
     if setups:
+        def _mv_dot(p: float) -> str:
+            try:
+                p = float(p or 0.0)
+            except Exception:
+                p = 0.0
+            if abs(p) < 2.0:
+                return "🟡"
+            return "🟢" if p >= 0 else "🔴"
+
+        def _engine_label(e: str) -> str:
+            ee = str(e or "").strip().upper()
+            if ee == "A":
+                return "Pullback"
+            if ee == "B":
+                return "Momentum Breakout"
+            if ee == "F":
+                return "Fallback"
+            return "Setup"
+
         lines2 = []
         for s in setups:
             try:
@@ -8172,26 +8582,52 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 sid = str(getattr(s, "setup_id", "") or "")
                 side = str(getattr(s, "side", "") or "").upper()
                 conf = int(getattr(s, "conf", 0) or 0)
+
                 entry = float(getattr(s, "entry", 0.0) or 0.0)
                 sl = float(getattr(s, "sl", 0.0) or 0.0)
+                tp1 = getattr(s, "tp1", None)
+                tp2 = getattr(s, "tp2", None)
                 tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
                 vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
 
+                ch24 = float(getattr(s, "ch24", 0.0) or 0.0)
+                ch4 = float(getattr(s, "ch4", 0.0) or 0.0)
+                ch1 = float(getattr(s, "ch1", 0.0) or 0.0)
+                ch15 = float(getattr(s, "ch15", 0.0) or 0.0)
+
                 rr_den = abs(entry - sl)
+                rr1 = (abs(float(tp1) - entry) / rr_den) if (rr_den > 0 and tp1 not in (None, 0, 0.0)) else 0.0
+                rr2 = (abs(float(tp2) - entry) / rr_den) if (rr_den > 0 and tp2 not in (None, 0, 0.0)) else 0.0
                 rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
 
                 pos_word = "long" if side == "BUY" else "short"
                 size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
 
                 emoji = "🟢" if side == "BUY" else "🔴"
-                lines2.append(
-                    f"• `{sid}` — *{sym}* {emoji} `{side}` | Conf `{conf}`\n"
-                    f"  Entry `{fmt_price(entry)}` | SL `{fmt_price(sl)}` | TP `{fmt_price(tp3)}`\n"
-                    f"  `{size_cmd}`"
+                typ = _engine_label(getattr(s, "engine", ""))
+
+                # Card-style formatting (same as previous detailed preview) + /size command
+                block = []
+                block.append(f"{emoji} *{side} — {sym}*")
+                block.append(f"`{sid}` | Conf: `{conf}`")
+                block.append(f"Type: {typ} | RR(TP1): `{rr1:.2f}` | RR(TP2): `{rr2:.2f}` | RR(TP3): `{rr3:.2f}`")
+                block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
+                if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
+                    block.append(f"TP1: `{fmt_price(float(tp1))}` | TP2: `{fmt_price(float(tp2))}` | TP3: `{fmt_price(tp3)}`")
+                else:
+                    block.append(f"TP: `{fmt_price(tp3)}`")
+                block.append(
+                    f"Moves: 24H {ch24:+.0f}% {_mv_dot(ch24)} • 4H {ch4:+.0f}% {_mv_dot(ch4)} • "
+                    f"1H {ch1:+.0f}% {_mv_dot(ch1)} • 15m {ch15:+.0f}% {_mv_dot(ch15)}"
                 )
+                block.append(f"Volume: ~{vol/1e6:.1f}M")
+                block.append(f"Chart: {tv_chart_url(sym)}")
+                block.append(f"`{size_cmd}`")
+                lines2.append("\n".join(block))
             except Exception:
                 continue
-        combined_setups_txt = "\n".join(lines2) if lines2 else "_No high-quality setups right now._"
+
+        combined_setups_txt = ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
 
     # Waiting for Trigger (near-miss)
     waiting_txt = ""
@@ -8596,6 +9032,11 @@ def _email_body_pretty(
             f"1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}"
         )
         parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
+        try:
+            _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
+            parts.append(f"   /size {str(getattr(s, 'symbol', ''))} {_pos} entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}")
+        except Exception:
+            pass
         parts.append("")
 
     parts.append(HDR)
@@ -9672,13 +10113,39 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 async def _post_init(app: Application):
-    # اگر قبلاً webhook ست شده بوده، پاکش کن تا polling گیر نکنه
+    # If webhook was set previously, remove it so polling starts cleanly
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         logger.warning("delete_webhook failed (ignored): %s", e)
 
-        
+    # Bot menu + command list (Telegram "Menu" button)
+    try:
+        cmds = [
+            BotCommand("start", "Start / restart (starts 7-day trial after joining channel)"),
+            BotCommand("screen", "Scan market and show top setups"),
+            BotCommand("status", "Your status (plan, caps, sessions, open trades)"),
+            BotCommand("size", "Position size calculator"),
+            BotCommand("equity", "Set equity / account size"),
+            BotCommand("risk_mode", "Set risk mode (USD / PCT)"),
+            BotCommand("risk", "Set risk per trade"),
+            BotCommand("limits", "Set daily caps / limits"),
+            BotCommand("billing", "Subscription & payment info"),
+            BotCommand("support", "Open support ticket: /support <issue>"),
+            BotCommand("support_status", "Check your latest support ticket"),
+            BotCommand("help", "Help"),
+            BotCommand("commands", "Command list"),
+        ]
+        await app.bot.set_my_commands(cmds)
+        # Ensure menu button is enabled for private chats
+        try:
+            await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("set_my_commands failed (ignored): %s", e)
+
+
 
 # =========================================================
 # USDT (SEMI-AUTO) + ADMIN PAYMENTS/ACCESS MANAGEMENT
@@ -10188,21 +10655,24 @@ def main():
     db_init()
     ensure_email_column()
     
-    app = Application.builder().token(TOKEN).post_init(_post_init).concurrent_updates(True).build()
+    app = Application.builder().token(TOKEN).post_init(_post_init).concurrent_updates(32).build()
 
     # Global access + Pro gating (runs before any other command handler)
-    app.add_handler(MessageHandler(filters.COMMAND, _command_guard), group=0)
+    app.add_handler(MessageHandler(filters.COMMAND, _command_guard), group=-1)
     app.add_error_handler(error_handler)
 
     # ================= Handlers =================
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("commands", commands_cmd))
+    app.add_handler(CommandHandler("guide_full", guide_full_cmd))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help_admin", cmd_help_admin))
     app.add_handler(CommandHandler("manage", manage_cmd))
     app.add_handler(CommandHandler("myplan", myplan_cmd))
     app.add_handler(CommandHandler("support", support_cmd))
     app.add_handler(CommandHandler("support_status", support_status_cmd))
+    app.add_handler(CommandHandler("support_open", admin_support_open_cmd))
+    app.add_handler(CommandHandler("support_close", admin_support_close_cmd))
     app.add_handler(CommandHandler("tz", tz_cmd))
     app.add_handler(CommandHandler("screen", screen_cmd))
     app.add_handler(CommandHandler("equity", equity_cmd))
