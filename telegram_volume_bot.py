@@ -250,16 +250,59 @@ REQUIRED_CHANNEL_JOIN_URL = os.getenv("REQUIRED_CHANNEL_JOIN_URL", "").strip()  
 
 async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
     """Returns True if user is a member of REQUIRED_CHANNEL (member/admin/creator).
-    NOTE: Bot must be an admin in the channel to reliably check membership.
+
+    IMPORTANT:
+    - For channels, Telegram only lets bots check membership reliably if the bot is an **admin** in the channel.
+    - If the bot cannot check (missing rights / chat not found / etc.), we **fail open** to avoid blocking everyone,
+      and we notify admins once in a while so you can fix the configuration.
     """
     if not REQUIRED_CHANNEL:
         return True
+
+    # Admins are never blocked by the channel gate
+    try:
+        if is_admin_user(int(user_id)):
+            return True
+    except Exception:
+        pass
+
     try:
         cm = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=int(user_id))
         status = str(getattr(cm, "status", "") or "").lower()
         return status in {"member", "administrator", "creator"}
-    except Exception:
-        return False
+    except Exception as e:
+        # If we can't check membership (very common when the bot is not admin in the channel),
+        # do not lock everyone out. Warn admins occasionally.
+        try:
+            global _CHANNEL_GATE_WARN_TS
+        except Exception:
+            _CHANNEL_GATE_WARN_TS = 0
+
+        try:
+            now_ts = int(time.time())
+            if now_ts - int(_CHANNEL_GATE_WARN_TS or 0) > 900:
+                _CHANNEL_GATE_WARN_TS = now_ts
+                err = f"{type(e).__name__}: {e}"
+                hint = (
+                    "⚠️ Channel gate check failed.\\n\\n"
+                    f"REQUIRED_CHANNEL={REQUIRED_CHANNEL}\\n"
+                    f"Error: {err}\\n\\n"
+                    "Fix:\\n"
+                    "1) Add this bot as ADMIN in the channel.\\n"
+                    "2) Prefer setting REQUIRED_CHANNEL to the channel ID like -1001234567890.\\n"
+                    "3) Set REQUIRED_CHANNEL_JOIN_URL to your join link.\\n\\n"
+                    "Until fixed, the bot will not block users on the channel gate."
+                )
+                for admin in _admin_ids_all():
+                    try:
+                        await bot.send_message(chat_id=int(admin), text=hint)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return True
+
 
 async def _reply_subscribe_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
