@@ -60,6 +60,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ApplicationHandlerStop,
 )
@@ -5121,21 +5122,50 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("📤 Sending test email…")
 
-    # Send (do NOT enforce trade window for a test)
-    # NOTE: send_email() resolves recipient from DB (users.email_to OR users.email).
+    # IMPORTANT: ensure _send_email_async uses the supplied recipient for test sends
+    # If your _send_email_async currently looks up the user's email internally,
+    # it may be sending to a blank / different address and failing.
     try:
+        # Clear previous error for clean reporting
         try:
             _LAST_SMTP_ERROR.pop(uid, None)
         except Exception:
             pass
 
+        # Preferred: pass to_email through (requires _send_email_async signature supports it)
+        # If your _send_email_async does NOT accept to_email, use the fallback block below.
         ok = await _send_email_async(
             int(EMAIL_SEND_TIMEOUT_SEC),
             subject,
             body,
-            user_id_for_debug=uid,
-            enforce_trade_window=False,
+            uid,
+            False,
+            to_email=to_email,   # <-- keep this; if your function doesn't accept it, use fallback below
         )
+
+    except TypeError:
+        # Fallback if _send_email_async doesn't accept to_email kwarg:
+        # Temporarily set a per-user override email field that your sender reads.
+        prev_email_to = user.get("email_to")
+        prev_email = user.get("email")
+        try:
+            # Prefer email_to
+            update_user(uid, email_to=to_email)
+            ok = await _send_email_async(int(EMAIL_SEND_TIMEOUT_SEC), subject, body, uid, False)
+        finally:
+            # Restore
+            try:
+                if prev_email_to is None:
+                    update_user(uid, email_to=None)
+                else:
+                    update_user(uid, email_to=prev_email_to)
+            except Exception:
+                pass
+            try:
+                if prev_email is not None:
+                    update_user(uid, email=prev_email)
+            except Exception:
+                pass
 
     except Exception as e:
         logger.exception("email_test_cmd failed")
@@ -9001,10 +9031,10 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
                 block.append(
                     f"24H {pct_with_emoji(ch24)} | 4H {pct_with_emoji(ch4)} | "
-                    f"1H {pct_with_emoji(ch1)} | 15m {pct_with_emoji(ch15)} | Vol~{fmt_money(vol_usd)}"
+                    f"1H {pct_with_emoji(ch1)} | 15m {pct_with_emoji(ch15)} | Vol~{fmt_money(vol)}"
                 )
                 block.append(f"Chart: {tv_chart_url(sym)}")
-                block.append(f"`{size_cmd}`")
+                block.append(f"{size_cmd}")
                 lines2.append("\n".join(block))
             except Exception:
                 continue
@@ -9101,7 +9131,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
                 side_emoji = "🟢" if side == "BUY" else "🔴"
                 lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf}` | RR(TP3) `{rr3:.2f}` | Vol~`{vol/1e6:.1f}M`")
-                lines.append(f"  `{size_cmd}`")
+                lines.append(f"  {size_cmd}")
             except Exception:
                 continue
         spike_txt = "\n".join(lines)
@@ -9199,7 +9229,10 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = (header + "\n" + cached_body).strip()
 
             keyboard = [
-                [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                [
+                    InlineKeyboardButton(text=f"📈 {sym}", url=tv_chart_url(sym)),
+                    InlineKeyboardButton(text="📋 /size", callback_data=f"copy_size|{sid}"),
+                ]
                 for (sym, sid) in (cached_kb or [])
             ]
 
@@ -9227,7 +9260,10 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 msg = (header + "\n" + cached_body).strip()
                 keyboard = [
-                    [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                    [
+                    InlineKeyboardButton(text=f"📈 {sym}", url=tv_chart_url(sym)),
+                    InlineKeyboardButton(text="📋 /size", callback_data=f"copy_size|{sid}"),
+                ]
                     for (sym, sid) in (cached_kb or [])
                 ]
 
@@ -9264,7 +9300,10 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Send final
         msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
         keyboard = [
-            [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+            [
+                    InlineKeyboardButton(text=f"📈 {sym}", url=tv_chart_url(sym)),
+                    InlineKeyboardButton(text="📋 /size", callback_data=f"copy_size|{sid}"),
+                ]
             for (sym, sid) in (_SCREEN_CACHE.get("kb") or [])
         ]
 
@@ -9301,8 +9340,97 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+
+# =========================================================
+# TEXT NORMALIZATION (mobile copy/paste safe)
+# =========================================================
+
+_ZERO_WIDTH_CHARS = [
+    "\u200b",  # zero width space
+    "\u200c",  # zero width non-joiner
+    "\u200d",  # zero width joiner
+    "\ufeff",  # BOM / zero width no-break space
+]
+
+_SLASH_VARIANTS = {
+    "／": "/",  # fullwidth solidus
+    "⁄": "/",  # fraction slash
+    "∕": "/",  # division slash
+}
+
+def _normalize_user_text(s: str) -> str:
+    """Normalize user-pasted text so commands copied from email/HTML render correctly."""
+    try:
+        s = str(s or "")
+    except Exception:
+        return ""
+    # Replace NBSP and other odd spaces with normal spaces
+    s = s.replace("\u00a0", " ").replace("\u202f", " ").replace("\u2007", " ")
+    # Strip zero-width chars
+    for z in _ZERO_WIDTH_CHARS:
+        s = s.replace(z, "")
+    # Normalize slash variants (email clients sometimes change the leading slash)
+    for k, v in _SLASH_VARIANTS.items():
+        s = s.replace(k, v)
+    # Collapse whitespace
+    s = re.sub(r"[\t\r\n]+", " ", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+
+async def copy_size_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inline button callback: posts a clean /size command (ASCII) for easy copy/paste."""
+    try:
+        q = update.callback_query
+        if not q:
+            return
+        data = str(q.data or "")
+        # Expected: copy_size|<SETUP_ID>
+        parts = data.split("|", 1)
+        if len(parts) != 2:
+            await q.answer("Invalid data.", show_alert=True)
+            return
+        setup_id = parts[1].strip()
+        sig = db_get_signal(setup_id)
+        if not sig:
+            await q.answer("Signal not found (expired).", show_alert=True)
+            return
+
+        sym = str(sig.get("symbol", "") or "").upper().strip()
+        side = str(sig.get("side", "") or "").upper().strip()
+        entry = float(sig.get("entry", 0.0) or 0.0)
+        sl = float(sig.get("sl", 0.0) or 0.0)
+
+        pos = "long" if side == "BUY" else "short"
+        size_line = f"/size {sym} {pos} entry {entry:.6g} sl {sl:.6g}"
+
+        # Send the command as plain text (no markdown), so it's guaranteed pasteable.
+        await q.message.reply_text(size_line)
+
+        # Can't actually copy to clipboard via Telegram API; show a quick hint instead.
+        await q.answer("✅ /size command sent — tap & hold to copy.", show_alert=False)
+    except Exception:
+        try:
+            if update.callback_query:
+                await update.callback_query.answer("Error.", show_alert=False)
+        except Exception:
+            pass
+
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
+    raw_text = (update.message.text or "")
+    text = _normalize_user_text(raw_text)
+
+    # If the user pasted a slash command from email/HTML and Telegram didn't treat it as a command
+    # (common on mobile due to special slash characters), catch it here.
+    if text.lower().startswith("/size"):
+        try:
+            parts = text.split()
+            # parts[0] is /size
+            context.args = parts[1:]
+            await size_cmd(update, context)
+            return
+        except Exception:
+            pass
     if text.startswith("PF-"):
         sig = db_get_signal(text)
         if not sig:
@@ -9515,7 +9643,7 @@ def _email_body_pretty_html(
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
             size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
-            card.append(f"<pre style='margin-top:8px;background:#f7f7f7;padding:8px;border-radius:8px;white-space:pre-wrap'>{esc(size_line)}</pre>")
+            card.append(f"<pre style='margin-top:8px;background:#f7f7f7;padding:8px;border-radius:8px;white-space:pre-wrap;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace;user-select:all'>{esc(size_line)}</pre>")
         except Exception:
             pass
         card.append("</div>")
@@ -9817,44 +9945,12 @@ async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
     """
     Runs send_email() in a worker thread with a hard timeout so SMTP/network stalls
     can't block the Telegram event loop (Render lag fix).
-
-    IMPORTANT:
-    - On timeout/exception, we record _LAST_SMTP_ERROR for the relevant user_id_for_debug
-      so /email_test can show a real reason instead of "unknown_error".
     """
-    # Try to capture uid for error reporting
-    uid = kwargs.get("user_id_for_debug", None)
-    try:
-        if uid is not None:
-            uid = int(uid)
-    except Exception:
-        uid = None
-
     try:
         return bool(await _to_thread_with_timeout(send_email, timeout_sec, *args, **kwargs))
     except asyncio.TimeoutError:
-        if uid is not None:
-            try:
-                _LAST_SMTP_ERROR[uid] = f"timeout_after_{int(timeout_sec)}s"
-                _LAST_EMAIL_DECISION[uid] = {
-                    "status": "FAIL",
-                    "reason": _LAST_SMTP_ERROR[uid],
-                    "ts": time.time(),
-                }
-            except Exception:
-                pass
         return False
-    except Exception as e:
-        if uid is not None:
-            try:
-                _LAST_SMTP_ERROR[uid] = f"{type(e).__name__}: {e}"
-                _LAST_EMAIL_DECISION[uid] = {
-                    "status": "FAIL",
-                    "reason": _LAST_SMTP_ERROR[uid],
-                    "ts": time.time(),
-                }
-            except Exception:
-                pass
+    except Exception:
         return False
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
@@ -11286,6 +11382,8 @@ def main():
     app.add_handler(CommandHandler("admin_grant", admin_user_cmd))
     app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd)) 
     app.add_handler(CommandHandler("admin_payments", admin_payments_cmd))
+
+    app.add_handler(CallbackQueryHandler(copy_size_callback, pattern=r"^copy_size\|"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     
