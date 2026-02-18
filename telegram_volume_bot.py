@@ -7699,68 +7699,115 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plan = str(effective_plan(uid, user)).upper()
     equity = float((user or {}).get("equity") or 0.0)
 
-    cap = daily_cap_usd(user)
-    # Sync used risk from CURRENT open positions (RF/close frees capacity instantly)
+    # Today
     pnl_today = _pnl_today_closed_trades(uid, user)
-    used_today = _risk_used_total_today(uid, user)
+    trades_today = int((user or {}).get("day_trade_count", 0) or 0)
+    max_trades = int((user or {}).get("max_trades_day", 0) or 0)
     day_local = _user_day_local(user)
+
+    # Risk
+    cap = daily_cap_usd(user)
+    used_today = _risk_used_total_today(uid, user)  # current open risk today
     remaining_today = (cap - used_today) if cap > 0 else float("inf")
 
+    risk_mode = str((user or {}).get("risk_mode", "PCT")).upper()
+    risk_val = float((user or {}).get("risk_value", 0.0) or 0.0)
+    risk_trade_usd = compute_risk_usd(user, risk_mode, risk_val)
+
+    # Sessions + email
     enabled = user_enabled_sessions(user)
     now_s = in_session_now(user)
     now_txt = now_s["name"] if now_s else "NONE"
 
-    # Email caps (show infinite as 0=∞ to match UI)
+    email_on = (int((user or {}).get("notify_on", 1) or 0) == 1)
     cap_sess = int((user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION) or DEFAULT_MAX_EMAILS_PER_SESSION)
     cap_day = int((user or {}).get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY) or DEFAULT_MAX_EMAILS_PER_DAY)
     gap_m = int((user or {}).get("email_gap_min", DEFAULT_EMAIL_GAP_MIN) or DEFAULT_EMAIL_GAP_MIN)
 
-    # Big-move status
     bm_on = int((user or {}).get("bigmove_alert_on", 1) or 0)
     bm_4h = float((user or {}).get("bigmove_alert_4h", 20) or 20)
     bm_1h = float((user or {}).get("bigmove_alert_1h", 10) or 10)
 
+    # Trade window (local time)
+    tw_start = str((user or {}).get("trade_window_start", "") or "").strip()
+    tw_end = str((user or {}).get("trade_window_end", "") or "").strip()
+    tw_enabled = bool(tw_start and tw_end)
+    tw_line = "Trade window: OFF (emails can send anytime)"
+    if tw_enabled:
+        try:
+            try:
+                tz = ZoneInfo(str((user or {}).get("tz") or "UTC"))
+            except Exception:
+                tz = timezone.utc
+            now_local = datetime.now(tz)
+            in_tw = bool(in_trade_window_now(user, now_local))
+            tw_line = f"Trade window: {tw_start}–{tw_end} (local) | Now: {'IN' if in_tw else 'OUT'}"
+        except Exception:
+            tw_line = f"Trade window: {tw_start}–{tw_end} (local) | Now: ?"
+
+    # Last email diag (helps users realize why they didn't receive emails)
+    last_email = _LAST_EMAIL_DECISION.get(uid) if isinstance(_LAST_EMAIL_DECISION, dict) else None
+    last_smtp = _LAST_SMTP_ERROR.get(uid) if isinstance(_LAST_SMTP_ERROR, dict) else None
+    last_email_line = None
+    if last_email:
+        reason = str(last_email.get("reason") or last_email.get("reasons") or last_email.get("status") or "").strip()
+        if reason:
+            last_email_line = f"Last email decision: {reason}"
+    if not last_email_line and last_smtp:
+        last_email_line = f"Last SMTP error: {str(last_smtp)[:180]}"
+
+    sep = "────────────────────────"
+
     lines = []
     lines.append("📌 Status")
+    lines.append(sep)
     lines.append(f"Plan: {plan}")
     lines.append(f"Equity: ${equity:.2f}")
-    lines.append(f"PnL today: ${pnl_today:+.2f}")
-    lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
-    lines.append(f"Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f} (used by /size)")
-    risk_mode = str(user.get('risk_mode', 'PCT')).upper()
-    risk_val = float(user.get('risk_value', 0.0) or 0.0)
-    risk_trade_usd = compute_risk_usd(user, risk_mode, risk_val)
+    lines.append(sep)
 
-    lines.append(f"Risk per trade: {risk_mode} {risk_val:.2f} (≈ ${risk_trade_usd:.2f})")
-    lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
-    lines.append(f"Daily risk used (open risk today): ${used_today:.2f}")
-    lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
-    lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
-    lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
-    lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
-    lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
-    lines.append(HDR)
+    lines.append(f"📅 Today ({day_local})")
+    lines.append(f"• P&L: ${pnl_today:+.2f}")
+    lines.append(f"• Trades: {trades_today}/{max_trades if max_trades else '∞'}")
+    lines.append(sep)
 
+    lines.append("🛡️ Risk")
+    lines.append(f"• Risk per trade: {risk_mode} {risk_val:.2f} (≈ ${risk_trade_usd:.2f})")
+    lines.append(f"• Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0) or 0.0):.2f} (≈ ${cap:.2f})")
+    lines.append(f"• Used today (open risk): ${used_today:.2f}")
+    lines.append(f"• Remaining today: ${max(0.0, remaining_today):.2f}" if cap > 0 else "• Remaining today: ∞")
+    lines.append(sep)
+
+    lines.append("✉️ Email alerts & sessions")
+    lines.append(f"• Email alerts: {'ON' if email_on else 'OFF'}")
+    lines.append(f"• Sessions enabled: {' | '.join(enabled) if enabled else 'NONE'} | Now: {now_txt}")
+    lines.append(f"• Caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
+    lines.append(f"• Big-move alerts: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
+    lines.append(f"• {tw_line}")
+    if last_email_line:
+        lines.append(f"• {last_email_line}")
+    lines.append(sep)
+
+    # Open trades
+    lines.append("📂 Open trades")
     if not opens:
-        lines.append("Open trades: None")
+        lines.append("• None")
         await update.message.reply_text("\n".join(lines))
         return
 
-    lines.append("Open trades:")
     for t in opens:
         try:
+            sym = str(t.get("symbol") or "").upper().strip()
+            side = str(t.get("side") or "").upper().strip()
             entry = float(t.get("entry") or 0.0)
             sl = float(t.get("sl") or 0.0)
             qty = float(t.get("qty") or 0.0)
             risk = float(t.get("risk_usd") or 0.0)
-            lines.append(
-                f"- ID {t.get('id')} | {t.get('symbol')} {t.get('side')} | "
-                f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g}"
-            )
+            lines.append(f"• {sym} {side} | Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g} | ID {t.get('id')}")
         except Exception:
             continue
 
     await update.message.reply_text("\n".join(lines))
+
 async def cooldowns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -8929,11 +8976,37 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     leaders_txt = build_leaders_table(best_fut)
     up_txt, dn_txt = movers_tables(best_fut)
 
+    # Pick /screen setups with HARD floors (no low-confidence items)
+    # This prevents showing weak setups like Conf 27.
+    setups_all = (pool.get("setups") or [])
+
+    # Session floors
+    try:
+        min_conf = int(SESSION_MIN_CONF.get(session, 78))
+    except Exception:
+        min_conf = 78
+    try:
+        min_rr = float(SESSION_MIN_RR_TP3.get(session, 2.2))
+    except Exception:
+        min_rr = 2.2
+
+    filtered = []
+    for s in setups_all:
+        try:
+            if int(getattr(s, "conf", 0) or 0) < min_conf:
+                continue
+            rr3 = rr_to_tp(float(getattr(s, "entry", 0.0) or 0.0), float(getattr(s, "sl", 0.0) or 0.0), float(getattr(s, "tp3", 0.0) or 0.0))
+            if float(rr3) < min_rr:
+                continue
+            filtered.append(s)
+        except Exception:
+            continue
+
     # Hard cap: never show more than 3 top setups on /screen
     try:
-        setups = (pool.get("setups") or [])[:min(int(SETUPS_N), 3)]
+        setups = (filtered or [])[:min(int(SETUPS_N), 3)]
     except Exception:
-        setups = (pool.get("setups") or [])[:3]
+        setups = (filtered or [])[:3]
 
     # Safety: if engine produced no setups, generate fallback ATR-based setups
     if not setups:
