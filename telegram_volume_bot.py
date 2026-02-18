@@ -5121,51 +5121,30 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("📤 Sending test email…")
 
-    # IMPORTANT: ensure _send_email_async uses the supplied recipient for test sends
-    # If your _send_email_async currently looks up the user's email internally,
-    # it may be sending to a blank / different address and failing.
+    # Clear previous error for clean reporting
     try:
-        # Clear previous error for clean reporting
-        try:
-            _LAST_SMTP_ERROR.pop(uid, None)
-        except Exception:
-            pass
+        _LAST_SMTP_ERROR.pop(uid, None)
+    except Exception:
+        pass
 
-        # Preferred: pass to_email through (requires _send_email_async signature supports it)
-        # If your _send_email_async does NOT accept to_email, use the fallback block below.
+    # Email test should NOT be blocked by user's email master switch
+    prev_enabled = None
+    try:
+        prev_enabled = int((user or {}).get("email_alerts_enabled", 1))
+        if prev_enabled == 0:
+            update_user(uid, email_alerts_enabled=1)
+    except Exception:
+        prev_enabled = None
+
+    try:
+        # IMPORTANT: pass correct kwargs (avoid arg mis-binding)
         ok = await _send_email_async(
             int(EMAIL_SEND_TIMEOUT_SEC),
             subject,
             body,
-            uid,
-            False,
-            to_email=to_email,   # <-- keep this; if your function doesn't accept it, use fallback below
+            user_id_for_debug=uid,
+            enforce_trade_window=False,
         )
-
-    except TypeError:
-        # Fallback if _send_email_async doesn't accept to_email kwarg:
-        # Temporarily set a per-user override email field that your sender reads.
-        prev_email_to = user.get("email_to")
-        prev_email = user.get("email")
-        try:
-            # Prefer email_to
-            update_user(uid, email_to=to_email)
-            ok = await _send_email_async(int(EMAIL_SEND_TIMEOUT_SEC), subject, body, uid, False)
-        finally:
-            # Restore
-            try:
-                if prev_email_to is None:
-                    update_user(uid, email_to=None)
-                else:
-                    update_user(uid, email_to=prev_email_to)
-            except Exception:
-                pass
-            try:
-                if prev_email is not None:
-                    update_user(uid, email=prev_email)
-            except Exception:
-                pass
-
     except Exception as e:
         logger.exception("email_test_cmd failed")
         msg = f"❌ Test email crashed: {type(e).__name__}: {e}"
@@ -5174,6 +5153,13 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text(msg)
         return
+    finally:
+        # Restore user's email alerts flag if we temporarily changed it
+        try:
+            if prev_enabled is not None and prev_enabled in (0, 1):
+                update_user(uid, email_alerts_enabled=prev_enabled)
+        except Exception:
+            pass
 
     if ok:
         try:
@@ -5194,46 +5180,6 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def _parse_hhmm_local(s: str) -> Tuple[int, int]:
-    s = (s or "").strip()
-    m = re.match(r"^(\d{2}):(\d{2})$", s)
-    if not m:
-        raise ValueError("bad time")
-    hh = int(m.group(1)); mm = int(m.group(2))
-    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
-        raise ValueError("bad time")
-    return hh, mm
-
-def in_trade_window_now(user: dict, now_local: Optional[datetime] = None) -> bool:
-    """
-    If user trade_window_start/end are empty -> allowed (no restriction).
-    Otherwise checks local time window (supports overnight windows).
-    """
-    start_s = str(user.get("trade_window_start") or "").strip()
-    end_s = str(user.get("trade_window_end") or "").strip()
-    if not start_s or not end_s:
-        return True  # disabled => allow
-
-    tz = ZoneInfo(user["tz"])
-    if now_local is None:
-        now_local = datetime.now(tz)
-
-    sh, sm = _parse_hhmm_local(start_s)
-    eh, em = _parse_hhmm_local(end_s)
-
-    start_dt = now_local.replace(hour=sh, minute=sm, second=0, microsecond=0)
-    end_dt = now_local.replace(hour=eh, minute=em, second=0, microsecond=0)
-
-    # Overnight window support, e.g. 22:00 -> 06:00
-    if end_dt <= start_dt:
-        # window crosses midnight
-        if now_local >= start_dt:
-            return True
-        # else compare with "yesterday start"
-        start_dt = start_dt - timedelta(days=1)
-        end_dt = end_dt + timedelta(days=1)
-
-    return start_dt <= now_local <= end_dt
 
 async def trade_window_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
