@@ -3019,6 +3019,36 @@ def db_trades_since(user_id: int, ts_from: float) -> List[dict]:
     con.close()
     return [dict(r) for r in rows]
 
+
+def db_trades_closed_today(user_id: int, user: dict) -> List[dict]:
+    """Trades CLOSED today (user local day), regardless of when they were opened."""
+    day_local = str(_user_day_local(user))
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT * FROM trades
+        WHERE user_id=? AND closed_ts IS NOT NULL
+        ORDER BY closed_ts ASC
+        """,
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    out = []
+    for r in rows:
+        try:
+            d = dict(r)
+            cts = float(d.get("closed_ts") or 0.0)
+            if cts <= 0:
+                continue
+            if _day_local_for_ts(user, cts) != day_local:
+                continue
+            out.append(d)
+        except Exception:
+            continue
+    return out
+
 def db_trades_all(user_id: int) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
@@ -7836,10 +7866,8 @@ async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return   
     
     tz = ZoneInfo(user["tz"])
-    start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-    trades = db_trades_since(uid, start)
+    trades = db_trades_closed_today(uid, user)
     stats = _stats_from_trades(trades)
-    adv = _advice(user, stats)
 
     msg = [
         "📊 Daily Report",
@@ -7851,9 +7879,6 @@ async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
         HDR,
     ]
-    if adv:
-        msg.append("🧠 Advice:")
-        msg.extend([f"- {x}" for x in adv])
 
     await update.message.reply_text("\n".join(msg))
 
@@ -7951,9 +7976,6 @@ async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
         HDR,
     ]
-    if adv:
-        msg.append("🧠 Advice:")
-        msg.extend([f"- {x}" for x in adv])
 
     await update.message.reply_text("\n".join(msg))
 
