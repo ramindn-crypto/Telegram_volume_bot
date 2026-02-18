@@ -286,10 +286,15 @@ def enforce_access_or_block_legacy(update: Update, command: str) -> bool:
 # =========================================================
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "").strip()  # e.g. "@PulseFutures" or "-1001234567890"
 REQUIRED_CHANNEL_JOIN_URL = os.getenv("REQUIRED_CHANNEL_JOIN_URL", "").strip()  # e.g. "https://t.me/PulseFutures"
+# What we SHOW to users (name/link), even if REQUIRED_CHANNEL is a numeric channel id.
+REQUIRED_CHANNEL_DISPLAY = os.getenv("REQUIRED_CHANNEL_DISPLAY", "@PulseFutures").strip() or "@PulseFutures"
+REQUIRED_CHANNEL_PUBLIC_URL = os.getenv("REQUIRED_CHANNEL_PUBLIC_URL", "https://t.me/PulseFutures").strip() or "https://t.me/PulseFutures"
 
 # Cache channel membership checks to keep commands instant (Telegram API calls can be slow / rate-limited)
 _SUB_CACHE = {}  # user_id -> (ok: bool, ts: int)
 SUB_CACHE_TTL_SEC = int(os.getenv("SUB_CACHE_TTL_SEC", "1800"))
+SUB_CACHE_NEG_TTL_SEC = int(os.getenv("SUB_CACHE_NEG_TTL_SEC", "60"))
+  # e.g. "https://t.me/PulseFutures"
 
 async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
     """Returns True if user is a member of REQUIRED_CHANNEL (member/admin/creator)."""
@@ -310,7 +315,11 @@ async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
         cached = _SUB_CACHE.get(int(user_id))
         if cached:
             ok, ts = cached
-            if now_ts - int(ts) <= int(SUB_CACHE_TTL_SEC):
+            ok = bool(ok)
+            age = now_ts - int(ts)
+            # Cache positives longer; cache negatives briefly so 'I just joined' works immediately.
+            ttl = int(SUB_CACHE_TTL_SEC) if ok else int(SUB_CACHE_NEG_TTL_SEC)
+            if age <= ttl:
                 return bool(ok)
     except Exception:
         pass
@@ -383,13 +392,13 @@ async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
 
 async def _reply_subscribe_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        join_url = REQUIRED_CHANNEL_JOIN_URL or (f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}" if REQUIRED_CHANNEL.startswith("@") else "")
+        join_url = REQUIRED_CHANNEL_JOIN_URL or REQUIRED_CHANNEL_PUBLIC_URL or (f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}" if REQUIRED_CHANNEL.startswith("@") else "")
         kb = None
         if join_url:
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join Channel", url=join_url)]])
         await update.message.reply_text(
             "📢 To use PulseFutures, you must join our channel first.\n\n"
-            f"Channel: {REQUIRED_CHANNEL or '@PulseFutures'}\n\n"
+            f"Channel: {REQUIRED_CHANNEL_DISPLAY}\n{REQUIRED_CHANNEL_PUBLIC_URL}\n\n"
             "After joining, come back and press /start.",
             reply_markup=kb,
             disable_web_page_preview=True,
@@ -9218,12 +9227,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loc_label, loc_time = user_location_and_time(user)
 
         header = (
-            f"*PulseFutures — Market Scan*
-"
-            f"{HDR}
-"
-            f"*Session:* `{session_disp}` | *{loc_label}:* `{loc_time}`
-"
+            f"*PulseFutures — Market Scan*\n"
+            f"{HDR}\n"
+            f"*Session:* `{session_disp}` | *{loc_label}:* `{loc_time}`\n"
         )
 
         now_ts = time.time()
