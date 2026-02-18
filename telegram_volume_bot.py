@@ -5756,7 +5756,8 @@ Market & Signals
 • Set your risk per trade (used by /size)
 
 
-/size <symbol> <side> <entry> <sl>
+/size <symbol> <short/long> entry <value> sl <value> risk USD <value>
+• If you omit risk, it uses your per-trade risk from /riskmode
 • Calculates position size based on your per-trade risk
 • Daily cap is shown in /status and updates when trades go Risk-Free
 
@@ -7047,7 +7048,7 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     raw = " ".join(context.args).strip()
     if not raw:
-        await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: risk pct 2 | risk usd 40 | entry 43000)")
+        await update.message.reply_text("Usage: /size BTC long entry 69000 sl 66000  (optional: risk pct 2 | risk usd 40)")
         return
 
     tokens = raw.split()
@@ -7059,7 +7060,7 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Usage:\n"
             "/size <SYMBOL> <long|short> entry <PRICE> sl <STOP>\n"
-            "Optional: risk <usd|pct> <VALUE> (default: 1.5%)"
+            "Optional: risk <usd|pct> <VALUE> (default: from /riskmode)"
         )
         return
     
@@ -7111,8 +7112,14 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entry = None
     sl = None
 
-    risk_mode = "PCT"
-    risk_val = 1.5  # <- DEFAULT: 1.5% of equity if user does not provide risk
+    risk_mode = str(user.get("risk_mode", DEFAULT_RISK_MODE)).upper()
+    try:
+        risk_val = float(user.get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
+    except Exception:
+        risk_val = float(DEFAULT_RISK_VALUE)
+
+    # If user does not provide an explicit risk in the command, we use /riskmode defaults.
+    # User can still override via: risk usd 40  OR  risk pct 2
 
     i = 0
     while i < len(tokens):
