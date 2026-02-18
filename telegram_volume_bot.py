@@ -5246,10 +5246,10 @@ def user_enabled_sessions(user: dict) -> List[str]:
     except Exception:
         return ['NY']
 
-def _guess_session_name_utc(now_utc: datetime) -> str:
+def _session_label_utc(now_utc: datetime) -> Optional[str]:
     """
     Returns NY/LON/ASIA if within their UTC windows (priority NY > LON > ASIA).
-    If we're in the 22:00–24:00 UTC gap, default to NY (keep UI consistent with /screen).
+    Returns None if we are in the gap (not in any defined session window).
     """
     for name in SESSION_PRIORITY:  # ["NY","LON","ASIA"]
         w = SESSIONS_UTC[name]
@@ -5264,7 +5264,16 @@ def _guess_session_name_utc(now_utc: datetime) -> str:
             end_utc -= timedelta(days=1)
         if start_utc <= now_utc <= end_utc:
             return name
-    return "NY"
+    return None
+
+
+def _guess_session_name_utc(now_utc: datetime) -> str:
+    """
+    Returns NY/LON/ASIA if within their UTC windows (priority NY > LON > ASIA).
+    If we're outside the three main windows (gap), default to NY (keeps /screen logic consistent).
+    """
+    label = _session_label_utc(now_utc)
+    return label or "NY"
 
 
 def in_session_now(user: dict) -> Optional[dict]:
@@ -5274,7 +5283,7 @@ def in_session_now(user: dict) -> Optional[dict]:
 
     # NEW: unlimited mode => always return a session (no more NONE)
     if int(user.get("sessions_unlimited", 0) or 0) == 1:
-        name = _guess_session_name_utc(now_utc)
+        name = (_session_label_utc(now_utc) or "NONE")
         session_key = f"{now_utc.strftime('%Y-%m-%d')}_{name}_UNL"
         return {
             "name": name,
@@ -6998,7 +7007,7 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     raw = " ".join(context.args).strip()
     if not raw:
-        await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: risk pct 2 | risk usd 40 | entry 43000)")
+        await update.message.reply_text("Usage: /size <symbol> <LONG/SHORT> entry <VALUE> sl <VALUE>  (optional: risk pct <value> | risk usd <value>)\nIf risk is not entered, default risk is used (set in /riskmode).")
         return
 
     tokens = raw.split()
@@ -7679,8 +7688,18 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
     lines.append(f"Daily risk used (open risk today): ${used_today:.2f}")
     lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
+    lines.append(HDR)
+    lines.append(HDR)
     lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
     lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
+    cur_s = (user.get("trade_window_start") or "").strip()
+    cur_e = (user.get("trade_window_end") or "").strip()
+    tw_txt = "OFF" if (not cur_s or not cur_e) else f"{cur_s} → {cur_e} (local)"
+    lines.append(f"Trade window: {tw_txt}")
+    cur_s = (user.get("trade_window_start") or "").strip()
+    cur_e = (user.get("trade_window_end") or "").strip()
+    tw_txt = "OFF" if (not cur_s or not cur_e) else f"{cur_s} → {cur_e} (local)"
+    lines.append(f"Trade window: {tw_txt}")
     lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
     lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
     lines.append(HDR)
@@ -8929,11 +8948,15 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
             return "Setup"
 
         lines2 = []
-        for s in setups:
+        rendered_kb = []  # only add TradingView buttons for setups that were actually rendered in the /screen body
+
+        for s in (setups or []):
+            sym = ""
+            sid = ""
             try:
-                sym = str(getattr(s, "symbol", "")).upper()
-                sid = str(getattr(s, "setup_id", "") or "")
-                side = str(getattr(s, "side", "") or "").upper()
+                sym = str(getattr(s, "symbol", "") or "").upper().strip()
+                sid = str(getattr(s, "setup_id", "") or "").strip()
+                side = str(getattr(s, "side", "") or "").upper().strip()
                 conf = int(getattr(s, "conf", 0) or 0)
 
                 entry = float(getattr(s, "entry", 0.0) or 0.0)
@@ -8949,17 +8972,14 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 ch15 = float(getattr(s, "ch15", 0.0) or 0.0)
 
                 rr_den = abs(entry - sl)
-                rr1 = (abs(float(tp1) - entry) / rr_den) if (rr_den > 0 and tp1 not in (None, 0, 0.0)) else 0.0
-                rr2 = (abs(float(tp2) - entry) / rr_den) if (rr_den > 0 and tp2 not in (None, 0, 0.0)) else 0.0
                 rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
 
                 pos_word = "long" if side == "BUY" else "short"
                 size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
 
                 emoji = "🟢" if side == "BUY" else "🔴"
-                typ = _engine_label(getattr(s, "engine", ""))
 
-                                # Card-style formatting (Telegram /screen) — align to email structure
+                # Card-style formatting (Telegram /screen) — align to email structure
                 block = []
                 block.append(f"{emoji} *{side} — {sym} — Conf {conf}*")
                 block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}` | RR(TP3): `{rr3:.2f}`")
@@ -8974,15 +8994,48 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 else:
                     block.append(f"TP3: `{fmt_price(tp3)}`")
 
+                # NOTE: this used to reference 'vol_usd' (undefined) which could silently drop the entire card.
                 block.append(
                     f"24H {pct_with_emoji(ch24)} | 4H {pct_with_emoji(ch4)} | "
-                    f"1H {pct_with_emoji(ch1)} | 15m {pct_with_emoji(ch15)} | Vol~{fmt_money(vol_usd)}"
+                    f"1H {pct_with_emoji(ch1)} | 15m {pct_with_emoji(ch15)} | Vol~{fmt_money(vol)}"
                 )
+
                 block.append(f"Chart: {tv_chart_url(sym)}")
                 block.append(f"`{size_cmd}`")
+
                 lines2.append("\n".join(block))
+                if sym and sid:
+                    rendered_kb.append((sym, sid))
+
             except Exception:
-                continue
+                # Fallback card (keep /screen readable + keep TradingView buttons in sync with shown setups)
+                try:
+                    sym2 = sym or str(getattr(s, "symbol", "") or "").upper().strip()
+                    sid2 = sid or str(getattr(s, "setup_id", "") or "").strip()
+                    side2 = str(getattr(s, "side", "") or "").upper().strip()
+                    conf2 = int(getattr(s, "conf", 0) or 0)
+                    entry2 = float(getattr(s, "entry", 0.0) or 0.0)
+                    sl2 = float(getattr(s, "sl", 0.0) or 0.0)
+                    tp32 = float(getattr(s, "tp3", 0.0) or 0.0)
+
+                    rr_den2 = abs(entry2 - sl2)
+                    rr32 = (abs(tp32 - entry2) / rr_den2) if rr_den2 > 0 else 0.0
+                    emoji2 = "🟢" if side2 == "BUY" else "🔴"
+                    pos_word2 = "long" if side2 == "BUY" else "short"
+                    size_cmd2 = f"/size {sym2} {pos_word2} entry {entry2:.6g} sl {sl2:.6g}"
+
+                    block2 = []
+                    block2.append(f"{emoji2} *{side2} — {sym2} — Conf {conf2}*")
+                    block2.append(f"Entry: `{fmt_price(entry2)}` | SL: `{fmt_price(sl2)}` | RR(TP3): `{rr32:.2f}`")
+                    block2.append(f"TP3: `{fmt_price(tp32)}`")
+                    block2.append(f"Chart: {tv_chart_url(sym2)}")
+                    block2.append(f"`{size_cmd2}`")
+
+                    lines2.append("\n".join(block2))
+                    if sym2 and sid2:
+                        rendered_kb.append((sym2, sid2))
+                except Exception:
+                    continue
 
         combined_setups_txt = ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
 
@@ -9114,9 +9167,16 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
     body = "\n".join([b for b in blocks if b is not None]).strip()
 
+
+
     kb = []
     try:
-        kb = [(s.symbol, s.setup_id) for s in (setups or [])]
+        # Keep TradingView buttons in sync with the setups actually shown in the /screen body.
+        # (rendered_kb is built during setup card rendering above)
+        if "rendered_kb" in locals() and isinstance(rendered_kb, list) and rendered_kb:
+            kb = list(rendered_kb)
+        else:
+            kb = [(s.symbol, s.setup_id) for s in (setups or [])]
     except Exception:
         kb = []
     return body, kb
@@ -11042,15 +11102,18 @@ async def admin_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     id_col = _first_existing_col(cols, ["user_id", "id"]) or "id"
     plan_col = _first_existing_col(cols, ["plan", "tier", "subscription_plan"])
-    email_col = _first_existing_col(cols, ["email", "user_email"])
     tz_col = _first_existing_col(cols, ["tz", "timezone"])
+
+    trial_until_col = _first_existing_col(cols, ["trial_until", "trial_until_ts", "trial_end_ts"])
+    plan_expires_col = _first_existing_col(cols, ["plan_expires", "expires_ts", "plan_until", "plan_until_ts"])
 
     sql = f"""
         SELECT
             {id_col} AS uid,
             {plan_col if plan_col else 'NULL'} AS plan,
-            {email_col if email_col else 'NULL'} AS email,
-            {tz_col if tz_col else 'NULL'} AS tz
+            {tz_col if tz_col else 'NULL'} AS tz,
+            {trial_until_col if trial_until_col else 'NULL'} AS trial_until,
+            {plan_expires_col if plan_expires_col else 'NULL'} AS plan_expires
         FROM users
         ORDER BY uid DESC
         LIMIT 50
@@ -11058,16 +11121,41 @@ async def admin_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rows = conn.execute(sql).fetchall()
 
+    now_ts = time.time()
     lines = ["👤 Admin — Users", HDR]
-    for uid, plan, email, tz in rows:
-        lines.append(
-            f"• {uid}"
-            f" | {plan or ''}"
-            f" | {email or ''}"
-            f" | tz:{tz or ''}"
-        )
+    for uid0, plan0, tz0, trial_until0, plan_expires0 in rows:
+        try:
+            uid_i = int(uid0)
+        except Exception:
+            continue
+
+        p = str(plan0 or "").strip()
+        pl = p.lower()
+        tz_s = str(tz0 or "").strip()
+
+        # Remaining days
+        if is_admin_user(uid_i):
+            rem = "unlimited"
+        else:
+            until = 0.0
+            try:
+                if pl == "trial":
+                    until = float(trial_until0 or 0.0)
+                elif pl in ("standard", "pro"):
+                    until = float(plan_expires0 or 0.0)
+            except Exception:
+                until = 0.0
+
+            if until and until > now_ts:
+                days_left = int((until - now_ts + 86399) // 86400)
+                rem = f"{days_left}d left"
+            else:
+                rem = "0d left" if pl in ("trial", "standard", "pro") else "-"
+
+        lines.append(f"• {uid_i} | {p or 'free'} | tz:{tz_s or 'UTC'} | {rem}")
 
     await update.message.reply_text("\n".join(lines))
+
 
 
 async def admin_revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11383,7 +11471,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = []
     lines.append("📌 Status")
-    lines.append(f"Plan: {plan} ({days_left}d left)")
+    lines.append(HDR)
+    if is_admin_user(uid):
+        lines.append(f"Plan: {plan} (unlimited)")
+    else:
+        lines.append(f"Plan: {plan} ({days_left}d left)")
     lines.append(f"Equity: ${equity:.2f}")
     lines.append(f"PnL today: ${pnl_today:+.2f}")
     lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
@@ -11391,8 +11483,13 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
     lines.append(f"Daily risk used: ${used_today:.2f}")
     lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
+    lines.append(HDR)
     lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
     lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
+    cur_s = (user.get("trade_window_start") or "").strip()
+    cur_e = (user.get("trade_window_end") or "").strip()
+    tw_txt = "OFF" if (not cur_s or not cur_e) else f"{cur_s} → {cur_e} (local)"
+    lines.append(f"Trade window: {tw_txt}")
     lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
     lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
     lines.append(HDR)
