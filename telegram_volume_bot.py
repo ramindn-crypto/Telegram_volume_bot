@@ -5071,44 +5071,42 @@ async def email_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = get_user(uid)
+    user = get_user(uid) or {}
 
     # Always respond immediately
     await update.message.reply_text("📧 Running email test…")
 
-    # Show config status clearly
+    # Config checks
     if not EMAIL_ENABLED:
         await update.message.reply_text("❌ Email is disabled (EMAIL_ENABLED=False). Turn it on in your config/env.")
         return
 
     if not email_config_ok():
-        # If you have a helper that checks env vars, mention it
         await update.message.reply_text(
             "❌ Email config is NOT OK.\n"
-            "Check env vars like EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM (and anything your code expects).\n"
+            "Check env vars: EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM.\n"
             "Tip: run /health_sys and verify Email: enabled/configured."
         )
         return
 
-    # Determine recipient
-    # (Your bot earlier used a per-user email field; adjust key name if yours differs)
+    # Recipient (match your bot’s keys)
     to_email = (user.get("email_to") or user.get("email") or "").strip()
     if not to_email:
         await update.message.reply_text(
             "❌ No recipient email found for your user.\n"
-            "Set it first (whatever your bot uses), e.g. /email your@email.com"
+            "Set it first, e.g. /email your@email.com"
         )
         return
 
-    # Build a short test message
+    # Local time (user TZ)
     tz_name = str(user.get("tz") or "UTC")
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = timezone.utc
         tz_name = "UTC"
-
     now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
     subject = "PulseFutures — Email Test ✅"
     body = (
         f"{HDR}\n"
@@ -5121,30 +5119,80 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{HDR}\n"
     )
 
-    
-    # Send (run in worker thread so it never blocks other Telegram commands)
     status_msg = await update.message.reply_text("📤 Sending test email…")
+
+    # IMPORTANT: ensure _send_email_async uses the supplied recipient for test sends
+    # If your _send_email_async currently looks up the user's email internally,
+    # it may be sending to a blank / different address and failing.
     try:
-        ok = await _send_email_async(int(EMAIL_SEND_TIMEOUT_SEC), subject, body, uid, False)
+        # Clear previous error for clean reporting
+        try:
+            _LAST_SMTP_ERROR.pop(uid, None)
+        except Exception:
+            pass
+
+        # Preferred: pass to_email through (requires _send_email_async signature supports it)
+        # If your _send_email_async does NOT accept to_email, use the fallback block below.
+        ok = await _send_email_async(
+            int(EMAIL_SEND_TIMEOUT_SEC),
+            subject,
+            body,
+            uid,
+            False,
+            to_email=to_email,   # <-- keep this; if your function doesn't accept it, use fallback below
+        )
+
+    except TypeError:
+        # Fallback if _send_email_async doesn't accept to_email kwarg:
+        # Temporarily set a per-user override email field that your sender reads.
+        prev_email_to = user.get("email_to")
+        prev_email = user.get("email")
+        try:
+            # Prefer email_to
+            update_user(uid, email_to=to_email)
+            ok = await _send_email_async(int(EMAIL_SEND_TIMEOUT_SEC), subject, body, uid, False)
+        finally:
+            # Restore
+            try:
+                if prev_email_to is None:
+                    update_user(uid, email_to=None)
+                else:
+                    update_user(uid, email_to=prev_email_to)
+            except Exception:
+                pass
+            try:
+                if prev_email is not None:
+                    update_user(uid, email=prev_email)
+            except Exception:
+                pass
+
     except Exception as e:
         logger.exception("email_test_cmd failed")
+        msg = f"❌ Test email crashed: {type(e).__name__}: {e}"
         try:
-            await status_msg.edit_text(f"❌ Test email crashed: {type(e).__name__}: {e}")
+            await status_msg.edit_text(msg)
         except Exception:
-            await update.message.reply_text(f"❌ Test email crashed: {type(e).__name__}: {e}")
+            await update.message.reply_text(msg)
         return
+
     if ok:
-        await update.message.reply_text(f"✅ Test email SENT to: {to_email}")
-    else:
-        err = _LAST_SMTP_ERROR.get(uid, "unknown_error")
-        await update.message.reply_text(
-            "❌ Test email FAILED.\n"
-            f"Reason: {err}\n\n"
-            "Common causes:\n"
-            "- Gmail: app password / 2FA issues\n"
-            "- Wrong EMAIL_HOST/PORT (465 SSL vs 587 STARTTLS)\n"
-            "- EMAIL_FROM not matching account\n"
-        )
+        try:
+            await status_msg.edit_text(f"✅ Test email SENT to: {to_email}")
+        except Exception:
+            await update.message.reply_text(f"✅ Test email SENT to: {to_email}")
+        return
+
+    # FAILED: show real last smtp error if available
+    err = _LAST_SMTP_ERROR.get(uid) or "unknown_error"
+    await update.message.reply_text(
+        "❌ Test email FAILED.\n"
+        f"Reason: {err}\n\n"
+        "Common causes:\n"
+        "- Gmail: app password / 2FA issues\n"
+        "- Wrong EMAIL_HOST/PORT (465 SSL vs 587 STARTTLS)\n"
+        "- EMAIL_FROM not matching account"
+    )
+
 
 def _parse_hhmm_local(s: str) -> Tuple[int, int]:
     s = (s or "").strip()
