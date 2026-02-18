@@ -4734,6 +4734,7 @@ def email_config_ok() -> bool:
 def send_email(
     subject: str,
     body: str,
+    body_html: Optional[str] = None,
     user_id_for_debug: Optional[int] = None,
     enforce_trade_window: bool = True
 ) -> bool:
@@ -4826,7 +4827,11 @@ def send_email(
     msg["From"] = EMAIL_FROM
     msg["To"] = to_email
     msg.set_content(body)
-
+    if body_html:
+        try:
+            msg.add_alternative(body_html, subtype="html")
+        except Exception:
+            pass
 
 
       
@@ -5486,7 +5491,8 @@ def _stats_from_trades(trades: List[dict]) -> dict:
     wins = [t for t in closed if float(t["pnl"]) > 0]
     losses = [t for t in closed if float(t["pnl"]) < 0]
     net = sum(float(t["pnl"]) for t in closed) if closed else 0.0
-    win_rate = (len(wins) / len(closed) * 100.0) if closed else 0.0
+        denom = (len(wins) + len(losses))
+    win_rate = (len(wins) / denom * 100.0) if denom else 0.0
     avg_r = None
     r_vals = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
     if r_vals:
@@ -8924,8 +8930,8 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 block = []
                 block.append(f"{emoji} *{side} — {sym}*")
                 block.append(f"`{sid}` | Conf: `{conf}`")
-                block.append(f"Type: {typ} | RR(TP1): `{rr1:.2f}` | RR(TP2): `{rr2:.2f}` | RR(TP3): `{rr3:.2f}`")
-                block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
+                block.append(f"Type: {typ}")
+                block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}` | RR(TP3): `{rr3:.2f}`")
                 if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
                     block.append(f"TP1: `{fmt_price(float(tp1))}` | TP2: `{fmt_price(float(tp2))}` | TP3: `{fmt_price(tp3)}`")
                 else:
@@ -9364,6 +9370,92 @@ def _email_body_pretty(
 
     return "\n".join(parts).strip()
 
+
+def _email_body_pretty_html(
+    session_name: str,
+    now_local: datetime,
+    user_tz: str,
+    setups: List[Setup],
+    best_fut: Dict[str, MarketVol],
+) -> str:
+    """HTML version of the email body styled to resemble Telegram /screen cards (bold headings + code blocks)."""
+    loc_label = tz_location_label(user_tz)
+    when_str = now_local.strftime("%Y-%m-%d %H:%M")
+
+    def esc(s: str) -> str:
+        try:
+            import html as _html
+            return _html.escape(str(s))
+        except Exception:
+            return str(s)
+
+    lines = []
+    lines.append(f"<div style='font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.35'>")
+    lines.append(f"<div style='font-size:16px;font-weight:700'>📩 PulseFutures • {esc(session_name)} • {esc(loc_label)}: {esc(when_str)} ({esc(user_tz)})</div>")
+    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:10px 0'>")
+
+    up, dn = compute_directional_lists(best_fut)
+    leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:5]
+
+    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Market Snapshot</div>")
+    if leaders:
+        topv = ", ".join([f"{esc(b)}({esc(pct_with_emoji(float(mv.percentage or 0.0)))})" for b, mv in leaders])
+        lines.append(f"<div>Top Volume: {topv}</div>")
+    if up:
+        lines.append("<div>Leaders: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in up[:3]]) + "</div>")
+    if dn:
+        lines.append("<div>Losers: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in dn[:3]]) + "</div>")
+
+    lines.append("<hr style='border:none;border-top:1px solid #eee;margin:10px 0'>")
+    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Top Setups</div>")
+
+    for i, s in enumerate(setups, 1):
+        rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+        side = esc(s.side)
+        sym = esc(s.symbol)
+        conf = esc(s.conf)
+        setup_id = esc(s.setup_id)
+
+        card = []
+        card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
+        card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
+        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP3): <code>{rr3:.2f}</code></div>")
+
+        if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
+            card.append(
+                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> ({TP_ALLOCS[0]}%) &nbsp;|&nbsp; "
+                f"TP2: <code>{esc(fmt_price_email(s.tp2))}</code> ({TP_ALLOCS[1]}%) &nbsp;|&nbsp; "
+                f"TP3: <code>{esc(fmt_price_email(s.tp3))}</code> ({TP_ALLOCS[2]}%)</div>"
+            )
+        else:
+            card.append(f"<div style='margin-top:4px'>TP: <code>{esc(fmt_price_email(s.tp3))}</code></div>")
+
+        if s.is_trailing_tp3:
+            card.append("<div style='margin-top:4px'>TP3 Mode: <b>Trailing</b></div>")
+
+        card.append(
+            f"<div style='margin-top:6px'>24H {esc(pct_with_emoji(s.ch24))} &nbsp;|&nbsp; 4H {esc(pct_with_emoji(s.ch4))} &nbsp;|&nbsp; "
+            f"1H {esc(pct_with_emoji(s.ch1))} &nbsp;|&nbsp; 15m {esc(pct_with_emoji(s.ch15))} &nbsp;|&nbsp; Vol~{esc(fmt_money(s.fut_vol_usd))}</div>"
+        )
+        card.append(f"<div style='margin-top:6px'>Chart: {esc(tv_chart_url(s.symbol))}</div>")
+        try:
+            _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
+            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
+            card.append(f"<pre style='margin-top:8px;background:#f7f7f7;padding:8px;border-radius:8px;white-space:pre-wrap'>{esc(size_line)}</pre>")
+        except Exception:
+            pass
+        card.append("</div>")
+        lines.extend(card)
+
+    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:12px 0'>")
+    lines.append("<div style='font-weight:700'>🤖 Position Sizing</div>")
+    lines.append("<div>Use the PulseFutures Telegram bot to calculate safe position size based on your Stop Loss.</div>")
+    lines.append(f"<div style='margin-top:4px'>👉 {esc(TELEGRAM_BOT_URL)}</div>")
+    lines.append("<div style='margin-top:10px;color:#666'>Not financial advice. PulseFutures</div>")
+    lines.append("</div>")
+    return "".join(lines).strip()
+
+
 def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut) -> bool:
     """
     One email containing multiple setups.
@@ -9395,7 +9487,15 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
         best_fut=best_fut,
     )
 
-    return send_email(subject, body, user_id_for_debug=uid)
+    body_html = _email_body_pretty_html(
+        session_name=str(sess['name']),
+        now_local=now_local,
+        user_tz=user_tz,
+        setups=setups,
+        best_fut=best_fut,
+    )
+
+    return send_email(subject, body, user_id_for_debug=uid, body_html=body_html)
 
 
 
