@@ -1,3 +1,38 @@
+
+def _ensure_three_tps(entry: float, sl: float, tp3: float, tp1, tp2, side: str):
+    """Ensure TP1/TP2/TP3 exist. If TP1/TP2 missing, derive them proportionally between entry and TP3.
+    Uses 40/40/20 allocation convention for labels only.
+    """
+    try:
+        e = float(entry or 0.0)
+        t3 = float(tp3 or 0.0)
+        _ = float(sl or 0.0)
+    except Exception:
+        return tp1, tp2, tp3
+    if not (e and t3):
+        return tp1, tp2, tp3
+    side_u = str(side or "").upper().strip()
+    # If tp1/tp2 are missing or zero, derive
+    try:
+        t1_ok = tp1 not in (None, 0, 0.0, "")
+        t2_ok = tp2 not in (None, 0, 0.0, "")
+    except Exception:
+        t1_ok = t2_ok = False
+    if t1_ok and t2_ok:
+        return float(tp1), float(tp2), float(tp3)
+    # Derived targets: 40% and 80% of the way from entry to TP3
+    try:
+        if side_u == "SELL":
+            # tp3 should be below entry for sell; but if not, still compute directionally
+            t1 = e + (t3 - e) * 0.4
+            t2 = e + (t3 - e) * 0.8
+        else:
+            t1 = e + (t3 - e) * 0.4
+            t2 = e + (t3 - e) * 0.8
+        return float(t1), float(t2), float(tp3)
+    except Exception:
+        return tp1, tp2, tp3
+
 _LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
 #!/usr/bin/env python3
 """
@@ -5491,7 +5526,7 @@ def _stats_from_trades(trades: List[dict]) -> dict:
     wins = [t for t in closed if float(t["pnl"]) > 0]
     losses = [t for t in closed if float(t["pnl"]) < 0]
     net = sum(float(t["pnl"]) for t in closed) if closed else 0.0
-    denom = (len(wins) + len(losses))
+        denom = (len(wins) + len(losses))
     win_rate = (len(wins) / denom * 100.0) if denom else 0.0
     avg_r = None
     r_vals = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
@@ -8926,21 +8961,25 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 emoji = "🟢" if side == "BUY" else "🔴"
                 typ = _engine_label(getattr(s, "engine", ""))
 
-                # Card-style formatting (same as previous detailed preview) + /size command
+                                # Card-style formatting (Telegram /screen) — align to email structure
                 block = []
-                block.append(f"{emoji} *{side} — {sym}*")
-                block.append(f"`{sid}` | Conf: `{conf}`")
-                block.append(f"Type: {typ}")
+                block.append(f"{emoji} *{side} — {sym} — Conf {conf}*")
                 block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}` | RR(TP3): `{rr3:.2f}`")
-                if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
-                    block.append(f"TP1: `{fmt_price(float(tp1))}` | TP2: `{fmt_price(float(tp2))}` | TP3: `{fmt_price(tp3)}`")
+
+                _tp1, _tp2, _tp3 = _ensure_three_tps(entry, sl, tp3, tp1, tp2, side)
+                if _tp1 not in (None, 0, 0.0) and _tp2 not in (None, 0, 0.0) and _tp3 not in (None, 0, 0.0):
+                    block.append(
+                        f"TP1: `{fmt_price(float(_tp1))}` ({TP_ALLOCS[0]}%) | "
+                        f"TP2: `{fmt_price(float(_tp2))}` ({TP_ALLOCS[1]}%) | "
+                        f"TP3: `{fmt_price(float(_tp3))}` ({TP_ALLOCS[2]}%)"
+                    )
                 else:
-                    block.append(f"TP: `{fmt_price(tp3)}`")
+                    block.append(f"TP3: `{fmt_price(tp3)}`")
+
                 block.append(
-                    f"Moves: 24H {ch24:+.0f}% {_mv_dot(ch24)} • 4H {ch4:+.0f}% {_mv_dot(ch4)} • "
-                    f"1H {ch1:+.0f}% {_mv_dot(ch1)} • 15m {ch15:+.0f}% {_mv_dot(ch15)}"
+                    f"24H {pct_with_emoji(ch24)} | 4H {pct_with_emoji(ch4)} | "
+                    f"1H {pct_with_emoji(ch1)} | 15m {pct_with_emoji(ch15)} | Vol~{fmt_money(vol_usd)}"
                 )
-                block.append(f"Volume: ~{vol/1e6:.1f}M")
                 block.append(f"Chart: {tv_chart_url(sym)}")
                 block.append(f"`{size_cmd}`")
                 lines2.append("\n".join(block))
@@ -9331,22 +9370,21 @@ def _email_body_pretty(
         rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
 
         # ✅ "ID-" prefix
-        parts.append(f"{i}) ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
+        parts.append(f"ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
         parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP3): {rr3:.2f}")
 
-        if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
+        _tp1, _tp2, _tp3 = _ensure_three_tps(s.entry, s.sl, s.tp3, getattr(s, "tp1", None), getattr(s, "tp2", None), getattr(s, "side", ""))
+        if _tp1 not in (None, 0, 0.0) and _tp2 not in (None, 0, 0.0) and _tp3 not in (None, 0, 0.0):
             parts.append(
-                f"   TP1: {fmt_price_email(s.tp1)} ({TP_ALLOCS[0]}%) | "
-                f"TP2: {fmt_price_email(s.tp2)} ({TP_ALLOCS[1]}%) | "
-                f"TP3: {fmt_price_email(s.tp3)} ({TP_ALLOCS[2]}%)"
+                f"   TP1: {fmt_price_email(_tp1)} ({TP_ALLOCS[0]}%) | "
+                f"TP2: {fmt_price_email(_tp2)} ({TP_ALLOCS[1]}%) | "
+                f"TP3: {fmt_price_email(_tp3)} ({TP_ALLOCS[2]}%)"
             )
         else:
-            parts.append(f"   TP: {fmt_price_email(s.tp3)}")
+            parts.append(f"   TP3: {fmt_price_email(s.tp3)}")
 
-        # ✅ only for trailing-needed setups
-        if s.is_trailing_tp3:
-            parts.append("   TP3 Mode: Trailing")
-
+        # ✅ only for t
+railing-needed setups
         parts.append(
             f"   24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | "
             f"1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}"
