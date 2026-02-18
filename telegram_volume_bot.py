@@ -60,7 +60,6 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
     ApplicationHandlerStop,
 )
@@ -5132,21 +5131,28 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # IMPORTANT: send_email() resolves recipient from DB (users.email_to OR users.email).
-        # For /email_test, we temporarily override users.email_to to ensure it goes to the intended address.
+        # Preferred: pass to_email through (requires _send_email_async signature supports it)
+        # If your _send_email_async does NOT accept to_email, use the fallback block below.
+        ok = await _send_email_async(
+            int(EMAIL_SEND_TIMEOUT_SEC),
+            subject,
+            body,
+            uid,
+            False,
+            to_email=to_email,   # <-- keep this; if your function doesn't accept it, use fallback below
+        )
+
+    except TypeError:
+        # Fallback if _send_email_async doesn't accept to_email kwarg:
+        # Temporarily set a per-user override email field that your sender reads.
         prev_email_to = user.get("email_to")
         prev_email = user.get("email")
         try:
+            # Prefer email_to
             update_user(uid, email_to=to_email)
-            ok = await _send_email_async(
-                int(EMAIL_SEND_TIMEOUT_SEC),
-                subject,
-                body,
-                user_id_for_debug=uid,
-                enforce_trade_window=False,
-            )
+            ok = await _send_email_async(int(EMAIL_SEND_TIMEOUT_SEC), subject, body, uid, False)
         finally:
-            # Restore prior values
+            # Restore
             try:
                 if prev_email_to is None:
                     update_user(uid, email_to=None)
@@ -5161,7 +5167,6 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
     except Exception as e:
-
         logger.exception("email_test_cmd failed")
         msg = f"❌ Test email crashed: {type(e).__name__}: {e}"
         try:
@@ -5756,8 +5761,7 @@ Market & Signals
 • Set your risk per trade (used by /size)
 
 
-/size <symbol> <short/long> entry <value> sl <value> risk USD <value>
-• If you omit risk, it uses your per-trade risk from /riskmode
+/size <symbol> <side> <entry> <sl>
 • Calculates position size based on your per-trade risk
 • Daily cap is shown in /status and updates when trades go Risk-Free
 
@@ -7048,7 +7052,7 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     raw = " ".join(context.args).strip()
     if not raw:
-        await update.message.reply_text("Usage: /size BTC long entry 69000 sl 66000  (optional: risk pct 2 | risk usd 40)")
+        await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: risk pct 2 | risk usd 40 | entry 43000)")
         return
 
     tokens = raw.split()
@@ -7060,7 +7064,7 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Usage:\n"
             "/size <SYMBOL> <long|short> entry <PRICE> sl <STOP>\n"
-            "Optional: risk <usd|pct> <VALUE> (default: from /riskmode)"
+            "Optional: risk <usd|pct> <VALUE> (default: 1.5%)"
         )
         return
     
@@ -7112,14 +7116,8 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entry = None
     sl = None
 
-    risk_mode = str(user.get("risk_mode", DEFAULT_RISK_MODE)).upper()
-    try:
-        risk_val = float(user.get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
-    except Exception:
-        risk_val = float(DEFAULT_RISK_VALUE)
-
-    # If user does not provide an explicit risk in the command, we use /riskmode defaults.
-    # User can still override via: risk usd 40  OR  risk pct 2
+    risk_mode = "PCT"
+    risk_val = 1.5  # <- DEFAULT: 1.5% of equity if user does not provide risk
 
     i = 0
     while i < len(tokens):
@@ -7699,115 +7697,68 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plan = str(effective_plan(uid, user)).upper()
     equity = float((user or {}).get("equity") or 0.0)
 
-    # Today
-    pnl_today = _pnl_today_closed_trades(uid, user)
-    trades_today = int((user or {}).get("day_trade_count", 0) or 0)
-    max_trades = int((user or {}).get("max_trades_day", 0) or 0)
-    day_local = _user_day_local(user)
-
-    # Risk
     cap = daily_cap_usd(user)
-    used_today = _risk_used_total_today(uid, user)  # current open risk today
+    # Sync used risk from CURRENT open positions (RF/close frees capacity instantly)
+    pnl_today = _pnl_today_closed_trades(uid, user)
+    used_today = _risk_used_total_today(uid, user)
+    day_local = _user_day_local(user)
     remaining_today = (cap - used_today) if cap > 0 else float("inf")
 
-    risk_mode = str((user or {}).get("risk_mode", "PCT")).upper()
-    risk_val = float((user or {}).get("risk_value", 0.0) or 0.0)
-    risk_trade_usd = compute_risk_usd(user, risk_mode, risk_val)
-
-    # Sessions + email
     enabled = user_enabled_sessions(user)
     now_s = in_session_now(user)
     now_txt = now_s["name"] if now_s else "NONE"
 
-    email_on = (int((user or {}).get("notify_on", 1) or 0) == 1)
+    # Email caps (show infinite as 0=∞ to match UI)
     cap_sess = int((user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION) or DEFAULT_MAX_EMAILS_PER_SESSION)
     cap_day = int((user or {}).get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY) or DEFAULT_MAX_EMAILS_PER_DAY)
     gap_m = int((user or {}).get("email_gap_min", DEFAULT_EMAIL_GAP_MIN) or DEFAULT_EMAIL_GAP_MIN)
 
+    # Big-move status
     bm_on = int((user or {}).get("bigmove_alert_on", 1) or 0)
     bm_4h = float((user or {}).get("bigmove_alert_4h", 20) or 20)
     bm_1h = float((user or {}).get("bigmove_alert_1h", 10) or 10)
 
-    # Trade window (local time)
-    tw_start = str((user or {}).get("trade_window_start", "") or "").strip()
-    tw_end = str((user or {}).get("trade_window_end", "") or "").strip()
-    tw_enabled = bool(tw_start and tw_end)
-    tw_line = "Trade window: OFF (emails can send anytime)"
-    if tw_enabled:
-        try:
-            try:
-                tz = ZoneInfo(str((user or {}).get("tz") or "UTC"))
-            except Exception:
-                tz = timezone.utc
-            now_local = datetime.now(tz)
-            in_tw = bool(in_trade_window_now(user, now_local))
-            tw_line = f"Trade window: {tw_start}–{tw_end} (local) | Now: {'IN' if in_tw else 'OUT'}"
-        except Exception:
-            tw_line = f"Trade window: {tw_start}–{tw_end} (local) | Now: ?"
-
-    # Last email diag (helps users realize why they didn't receive emails)
-    last_email = _LAST_EMAIL_DECISION.get(uid) if isinstance(_LAST_EMAIL_DECISION, dict) else None
-    last_smtp = _LAST_SMTP_ERROR.get(uid) if isinstance(_LAST_SMTP_ERROR, dict) else None
-    last_email_line = None
-    if last_email:
-        reason = str(last_email.get("reason") or last_email.get("reasons") or last_email.get("status") or "").strip()
-        if reason:
-            last_email_line = f"Last email decision: {reason}"
-    if not last_email_line and last_smtp:
-        last_email_line = f"Last SMTP error: {str(last_smtp)[:180]}"
-
-    sep = "────────────────────────"
-
     lines = []
     lines.append("📌 Status")
-    lines.append(sep)
     lines.append(f"Plan: {plan}")
     lines.append(f"Equity: ${equity:.2f}")
-    lines.append(sep)
+    lines.append(f"PnL today: ${pnl_today:+.2f}")
+    lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
+    lines.append(f"Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f} (used by /size)")
+    risk_mode = str(user.get('risk_mode', 'PCT')).upper()
+    risk_val = float(user.get('risk_value', 0.0) or 0.0)
+    risk_trade_usd = compute_risk_usd(user, risk_mode, risk_val)
 
-    lines.append(f"📅 Today ({day_local})")
-    lines.append(f"• P&L: ${pnl_today:+.2f}")
-    lines.append(f"• Trades: {trades_today}/{max_trades if max_trades else '∞'}")
-    lines.append(sep)
+    lines.append(f"Risk per trade: {risk_mode} {risk_val:.2f} (≈ ${risk_trade_usd:.2f})")
+    lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
+    lines.append(f"Daily risk used (open risk today): ${used_today:.2f}")
+    lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
+    lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
+    lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
+    lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
+    lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
+    lines.append(HDR)
 
-    lines.append("🛡️ Risk")
-    lines.append(f"• Risk per trade: {risk_mode} {risk_val:.2f} (≈ ${risk_trade_usd:.2f})")
-    lines.append(f"• Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0) or 0.0):.2f} (≈ ${cap:.2f})")
-    lines.append(f"• Used today (open risk): ${used_today:.2f}")
-    lines.append(f"• Remaining today: ${max(0.0, remaining_today):.2f}" if cap > 0 else "• Remaining today: ∞")
-    lines.append(sep)
-
-    lines.append("✉️ Email alerts & sessions")
-    lines.append(f"• Email alerts: {'ON' if email_on else 'OFF'}")
-    lines.append(f"• Sessions enabled: {' | '.join(enabled) if enabled else 'NONE'} | Now: {now_txt}")
-    lines.append(f"• Caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
-    lines.append(f"• Big-move alerts: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
-    lines.append(f"• {tw_line}")
-    if last_email_line:
-        lines.append(f"• {last_email_line}")
-    lines.append(sep)
-
-    # Open trades
-    lines.append("📂 Open trades")
     if not opens:
-        lines.append("• None")
+        lines.append("Open trades: None")
         await update.message.reply_text("\n".join(lines))
         return
 
+    lines.append("Open trades:")
     for t in opens:
         try:
-            sym = str(t.get("symbol") or "").upper().strip()
-            side = str(t.get("side") or "").upper().strip()
             entry = float(t.get("entry") or 0.0)
             sl = float(t.get("sl") or 0.0)
             qty = float(t.get("qty") or 0.0)
             risk = float(t.get("risk_usd") or 0.0)
-            lines.append(f"• {sym} {side} | Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g} | ID {t.get('id')}")
+            lines.append(
+                f"- ID {t.get('id')} | {t.get('symbol')} {t.get('side')} | "
+                f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g}"
+            )
         except Exception:
             continue
 
     await update.message.reply_text("\n".join(lines))
-
 async def cooldowns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -8976,37 +8927,11 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     leaders_txt = build_leaders_table(best_fut)
     up_txt, dn_txt = movers_tables(best_fut)
 
-    # Pick /screen setups with HARD floors (no low-confidence items)
-    # This prevents showing weak setups like Conf 27.
-    setups_all = (pool.get("setups") or [])
-
-    # Session floors
-    try:
-        min_conf = int(SESSION_MIN_CONF.get(session, 78))
-    except Exception:
-        min_conf = 78
-    try:
-        min_rr = float(SESSION_MIN_RR_TP3.get(session, 2.2))
-    except Exception:
-        min_rr = 2.2
-
-    filtered = []
-    for s in setups_all:
-        try:
-            if int(getattr(s, "conf", 0) or 0) < min_conf:
-                continue
-            rr3 = rr_to_tp(float(getattr(s, "entry", 0.0) or 0.0), float(getattr(s, "sl", 0.0) or 0.0), float(getattr(s, "tp3", 0.0) or 0.0))
-            if float(rr3) < min_rr:
-                continue
-            filtered.append(s)
-        except Exception:
-            continue
-
     # Hard cap: never show more than 3 top setups on /screen
     try:
-        setups = (filtered or [])[:min(int(SETUPS_N), 3)]
+        setups = (pool.get("setups") or [])[:min(int(SETUPS_N), 3)]
     except Exception:
-        setups = (filtered or [])[:3]
+        setups = (pool.get("setups") or [])[:3]
 
     # Safety: if engine produced no setups, generate fallback ATR-based setups
     if not setups:
@@ -9105,10 +9030,10 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
                 block.append(
                     f"24H {pct_with_emoji(ch24)} | 4H {pct_with_emoji(ch4)} | "
-                    f"1H {pct_with_emoji(ch1)} | 15m {pct_with_emoji(ch15)} | Vol~{fmt_money(vol)}"
+                    f"1H {pct_with_emoji(ch1)} | 15m {pct_with_emoji(ch15)} | Vol~{fmt_money(vol_usd)}"
                 )
                 block.append(f"Chart: {tv_chart_url(sym)}")
-                block.append(f"{size_cmd}")
+                block.append(f"`{size_cmd}`")
                 lines2.append("\n".join(block))
             except Exception:
                 continue
@@ -9205,7 +9130,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
                 side_emoji = "🟢" if side == "BUY" else "🔴"
                 lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf}` | RR(TP3) `{rr3:.2f}` | Vol~`{vol/1e6:.1f}M`")
-                lines.append(f"  {size_cmd}")
+                lines.append(f"  `{size_cmd}`")
             except Exception:
                 continue
         spike_txt = "\n".join(lines)
@@ -9245,19 +9170,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
     kb = []
     try:
-        kb = []
-        for s in (setups or []):
-            try:
-                sym = str(getattr(s, "symbol", "") or "").upper().strip()
-                sid = str(getattr(s, "setup_id", "") or "").strip()
-                side = str(getattr(s, "side", "") or "").upper().strip()
-                entry = float(getattr(s, "entry", 0.0) or 0.0)
-                sl = float(getattr(s, "sl", 0.0) or 0.0)
-                pos_word = "long" if side == "BUY" else "short"
-                cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
-                kb.append((sym, sid, cmd))
-            except Exception:
-                continue
+        kb = [(s.symbol, s.setup_id) for s in (setups or [])]
     except Exception:
         kb = []
     return body, kb
@@ -9314,52 +9227,12 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             msg = (header + "\n" + cached_body).strip()
 
-            keyboard = []
+            keyboard = [
+                [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                for (sym, sid) in (cached_kb or [])
+            ]
 
-            for item in (cached_kb or []):
-
-                try:
-
-                    # item can be (sym, setup_id) or (sym, setup_id, size_cmd)
-
-                    sym = ""
-
-                    sid = ""
-
-                    cmd = ""
-
-                    if isinstance(item, (list, tuple)) and len(item) == 3:
-
-                        sym, sid, cmd = item
-
-                    elif isinstance(item, (list, tuple)) and len(item) == 2:
-
-                        sym, sid = item
-
-                        cmd = ""
-
-                    else:
-
-                        continue
-
-                    row = [InlineKeyboardButton(text=f"📈 {sym}", url=tv_chart_url(sym))]
-
-                    if cmd:
-
-                        # Best mobile UX: inserts the command into the input box (requires inline mode enabled in BotFather)
-
-                        row.append(InlineKeyboardButton(text="📝 Paste /size", switch_inline_query_current_chat=str(cmd)))
-
-                    # Fallback: bot posts a clean ASCII /size line for tap-and-hold copy
-
-                    row.append(InlineKeyboardButton(text="📋 Send /size", callback_data=f"copy_size|{sid}"))
-
-                    keyboard.append(row)
-
-                except Exception:
-
-                    continue
-try:
+            try:
                 await status_msg.delete()
             except Exception:
                 pass
@@ -9382,30 +9255,12 @@ try:
                 cached_kb = list(_SCREEN_CACHE.get("kb") or [])
 
                 msg = (header + "\n" + cached_body).strip()
-                keyboard = []
-                for item in (cached_kb or []):
-                    try:
-                        # item can be (sym, setup_id) or (sym, setup_id, size_cmd)
-                        sym = ""
-                        sid = ""
-                        cmd = ""
-                        if isinstance(item, (list, tuple)) and len(item) == 3:
-                            sym, sid, cmd = item
-                        elif isinstance(item, (list, tuple)) and len(item) == 2:
-                            sym, sid = item
-                            cmd = ""
-                        else:
-                            continue
-                        row = [InlineKeyboardButton(text=f"📈 {sym}", url=tv_chart_url(sym))]
-                        if cmd:
-                            # Best mobile UX: inserts the command into the input box (requires inline mode enabled in BotFather)
-                            row.append(InlineKeyboardButton(text="📝 Paste /size", switch_inline_query_current_chat=str(cmd)))
-                        # Fallback: bot posts a clean ASCII /size line for tap-and-hold copy
-                        row.append(InlineKeyboardButton(text="📋 Send /size", callback_data=f"copy_size|{sid}"))
-                        keyboard.append(row)
-                    except Exception:
-                        continue
-try:
+                keyboard = [
+                    [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                    for (sym, sid) in (cached_kb or [])
+                ]
+
+                try:
                     await status_msg.delete()
                 except Exception:
                     pass
@@ -9437,30 +9292,12 @@ try:
 
         # Send final
         msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
-        keyboard = []
-        for item in (_SCREEN_CACHE.get("kb") or []):
-            try:
-                # item can be (sym, setup_id) or (sym, setup_id, size_cmd)
-                sym = ""
-                sid = ""
-                cmd = ""
-                if isinstance(item, (list, tuple)) and len(item) == 3:
-                    sym, sid, cmd = item
-                elif isinstance(item, (list, tuple)) and len(item) == 2:
-                    sym, sid = item
-                    cmd = ""
-                else:
-                    continue
-                row = [InlineKeyboardButton(text=f"📈 {sym}", url=tv_chart_url(sym))]
-                if cmd:
-                    # Best mobile UX: inserts the command into the input box (requires inline mode enabled in BotFather)
-                    row.append(InlineKeyboardButton(text="📝 Paste /size", switch_inline_query_current_chat=str(cmd)))
-                # Fallback: bot posts a clean ASCII /size line for tap-and-hold copy
-                row.append(InlineKeyboardButton(text="📋 Send /size", callback_data=f"copy_size|{sid}"))
-                keyboard.append(row)
-            except Exception:
-                continue
-try:
+        keyboard = [
+            [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+            for (sym, sid) in (_SCREEN_CACHE.get("kb") or [])
+        ]
+
+        try:
             await status_msg.delete()
         except Exception:
             pass
@@ -9493,97 +9330,8 @@ try:
             pass
 
 
-
-# =========================================================
-# TEXT NORMALIZATION (mobile copy/paste safe)
-# =========================================================
-
-_ZERO_WIDTH_CHARS = [
-    "\u200b",  # zero width space
-    "\u200c",  # zero width non-joiner
-    "\u200d",  # zero width joiner
-    "\ufeff",  # BOM / zero width no-break space
-]
-
-_SLASH_VARIANTS = {
-    "／": "/",  # fullwidth solidus
-    "⁄": "/",  # fraction slash
-    "∕": "/",  # division slash
-}
-
-def _normalize_user_text(s: str) -> str:
-    """Normalize user-pasted text so commands copied from email/HTML render correctly."""
-    try:
-        s = str(s or "")
-    except Exception:
-        return ""
-    # Replace NBSP and other odd spaces with normal spaces
-    s = s.replace("\u00a0", " ").replace("\u202f", " ").replace("\u2007", " ")
-    # Strip zero-width chars
-    for z in _ZERO_WIDTH_CHARS:
-        s = s.replace(z, "")
-    # Normalize slash variants (email clients sometimes change the leading slash)
-    for k, v in _SLASH_VARIANTS.items():
-        s = s.replace(k, v)
-    # Collapse whitespace
-    s = re.sub(r"[\t\r\n]+", " ", s)
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
-
-
-async def copy_size_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inline button callback: posts a clean /size command (ASCII) for easy copy/paste."""
-    try:
-        q = update.callback_query
-        if not q:
-            return
-        data = str(q.data or "")
-        # Expected: copy_size|<SETUP_ID>
-        parts = data.split("|", 1)
-        if len(parts) != 2:
-            await q.answer("Invalid data.", show_alert=True)
-            return
-        setup_id = parts[1].strip()
-        sig = db_get_signal(setup_id)
-        if not sig:
-            await q.answer("Signal not found (expired).", show_alert=True)
-            return
-
-        sym = str(sig.get("symbol", "") or "").upper().strip()
-        side = str(sig.get("side", "") or "").upper().strip()
-        entry = float(sig.get("entry", 0.0) or 0.0)
-        sl = float(sig.get("sl", 0.0) or 0.0)
-
-        pos = "long" if side == "BUY" else "short"
-        size_line = f"/size {sym} {pos} entry {entry:.6g} sl {sl:.6g}"
-
-        # Send the command as plain text (no markdown), so it's guaranteed pasteable.
-        await q.message.reply_text(size_line)
-
-        # Can't actually copy to clipboard via Telegram API; show a quick hint instead.
-        await q.answer("✅ /size command sent — tap & hold to copy.", show_alert=False)
-    except Exception:
-        try:
-            if update.callback_query:
-                await update.callback_query.answer("Error.", show_alert=False)
-        except Exception:
-            pass
-
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw_text = (update.message.text or "")
-    text = _normalize_user_text(raw_text)
-
-    # If the user pasted a slash command from email/HTML and Telegram didn't treat it as a command
-    # (common on mobile due to special slash characters), catch it here.
-    if text.lower().startswith("/size"):
-        try:
-            parts = text.split()
-            # parts[0] is /size
-            context.args = parts[1:]
-            await size_cmd(update, context)
-            return
-        except Exception:
-            pass
+    text = (update.message.text or "").strip()
     if text.startswith("PF-"):
         sig = db_get_signal(text)
         if not sig:
@@ -9705,18 +9453,12 @@ def _email_body_pretty(
 
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
-            size_line = (
-                f"/size {str(getattr(s, 'symbol', ''))} {_pos} "
+            parts.append(
+                f"   /size {str(getattr(s, 'symbol', ''))} {_pos} "
                 f"entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} "
                 f"sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}"
             )
-            parts.append(f"   {size_line}")
-            try:
-                import urllib.parse as _up
-                parts.append(f"   Telegram: https://t.me/share/url?url=&text={_up.quote(str(size_line))}")
-            except Exception:
-                pass
-except Exception:
+        except Exception:
             pass
 
         parts.append("")
@@ -9802,13 +9544,7 @@ def _email_body_pretty_html(
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
             size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
-            try:
-                import urllib.parse as _up
-                _share = "https://t.me/share/url?url=&text=" + _up.quote(str(size_line))
-                card.append(f"<div style='margin-top:6px'><a href='{_share}'>📝 Open /size in Telegram</a></div>")
-            except Exception:
-                pass
-            card.append("<pre style='margin-top:8px;background:#f7f7f7;padding:8px;border-radius:8px;white-space:pre-wrap;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace;user-select:all'>" + esc(size_line) + "</pre>")
+            card.append(f"<pre style='margin-top:8px;background:#f7f7f7;padding:8px;border-radius:8px;white-space:pre-wrap'>{esc(size_line)}</pre>")
         except Exception:
             pass
         card.append("</div>")
@@ -10110,36 +9846,12 @@ async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
     """
     Runs send_email() in a worker thread with a hard timeout so SMTP/network stalls
     can't block the Telegram event loop (Render lag fix).
-
-    IMPORTANT:
-    - On timeout/exception, record _LAST_SMTP_ERROR for the relevant user_id_for_debug
-      so /email_test shows a real reason instead of "unknown_error".
     """
-    # Best-effort extract of user id for diagnostics
-    uid = kwargs.get("user_id_for_debug", None)
-    try:
-        if uid is not None:
-            uid = int(uid)
-    except Exception:
-        uid = None
-
     try:
         return bool(await _to_thread_with_timeout(send_email, timeout_sec, *args, **kwargs))
     except asyncio.TimeoutError:
-        if uid is not None:
-            try:
-                _LAST_SMTP_ERROR[uid] = f"timeout_after_{int(timeout_sec)}s"
-                _LAST_EMAIL_DECISION[uid] = {"status": "FAIL", "reason": _LAST_SMTP_ERROR[uid], "ts": time.time()}
-            except Exception:
-                pass
         return False
-    except Exception as e:
-        if uid is not None:
-            try:
-                _LAST_SMTP_ERROR[uid] = f"{type(e).__name__}: {e}"
-                _LAST_EMAIL_DECISION[uid] = {"status": "FAIL", "reason": _LAST_SMTP_ERROR[uid], "ts": time.time()}
-            except Exception:
-                pass
+    except Exception:
         return False
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
@@ -10929,8 +10641,6 @@ async def _post_init(app: Application):
         cmds = [
             BotCommand("start", "Start"),
             BotCommand("status", "Shows your plan & enabled features"),
-            BotCommand("health", "Bot & data health check"),
-
             BotCommand("screen", "Scans the market for high-quality setups"),
 
             BotCommand("equity", "Set your equity"),
@@ -10967,6 +10677,8 @@ async def _post_init(app: Application):
 
             BotCommand("support", "Submit support request"),
             BotCommand("support_status", "Check your latest support ticket"),
+
+            BotCommand("health", "Bot & data health check"),
 
             BotCommand("billing", "Subscription & payment info"),
         ]
@@ -11572,8 +11284,6 @@ def main():
     app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd)) 
     app.add_handler(CommandHandler("admin_payments", admin_payments_cmd))
 
-    app.add_handler(CallbackQueryHandler(copy_size_callback, pattern=r"^copy_size\|"))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     
     # Catch-all for unknown /commands (MUST be after all CommandHandlers)
@@ -11684,8 +11394,25 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     opens = db_open_trades(uid)
-
-    plan = str((user or {}).get("plan") or "free").upper()
+    # Plan + remaining days (trial/standard/pro)
+    plan_eff = str(effective_plan(uid, user) or "free").strip().lower()
+    plan = plan_eff.upper()
+    now_ts = time.time()
+    days_left = 0
+    try:
+        if plan_eff == "trial":
+            until = float((user or {}).get("trial_until") or 0.0)
+        elif plan_eff in ("standard", "pro"):
+            until = float((user or {}).get("plan_expires") or 0.0)
+        else:
+            until = 0.0
+        if until and until > now_ts:
+            # ceiling((until-now)/86400) without math
+            days_left = int((until - now_ts + 86399) // 86400)
+        else:
+            days_left = 0
+    except Exception:
+        days_left = 0
     equity = float((user or {}).get("equity") or 0.0)
 
     cap = daily_cap_usd(user)
@@ -11710,7 +11437,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = []
     lines.append("📌 Status")
-    lines.append(f"Plan: {plan}")
+    lines.append(f"Plan: {plan} ({days_left}d left)")
     lines.append(f"Equity: ${equity:.2f}")
     lines.append(f"PnL today: ${pnl_today:+.2f}")
     lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
