@@ -1,3 +1,5 @@
+_LAST_SCAN_UNIVERSE = []
+
 #!/usr/bin/env python3
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
