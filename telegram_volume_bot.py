@@ -9345,7 +9345,7 @@ def _email_body_pretty(
     loc_label = tz_location_label(user_tz)
     when_str = now_local.strftime("%Y-%m-%d %H:%M")
 
-    parts = []
+    parts: List[str] = []
     parts.append(HDR)
     parts.append(f"📩 PulseFutures • {session_name} • {loc_label}: {when_str} ({user_tz})")
     parts.append(HDR)
@@ -9353,6 +9353,7 @@ def _email_body_pretty(
 
     up, dn = compute_directional_lists(best_fut)
     leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:5]
+
     parts.append("Market Snapshot")
     parts.append(SEP)
 
@@ -9364,8 +9365,8 @@ def _email_body_pretty(
         parts.append("Leaders: " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in up[:3]]))
     if dn:
         parts.append("Losers:  " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in dn[:3]]))
-    parts.append("")
 
+    parts.append("")
     parts.append("Top Setups")
     parts.append(SEP)
     parts.append("")
@@ -9373,12 +9374,21 @@ def _email_body_pretty(
     for i, s in enumerate(setups, 1):
         rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
 
-        # ✅ "ID-" prefix
         parts.append(f"ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
-        parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP3): {rr3:.2f}")
+        parts.append(
+            f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP3): {rr3:.2f}"
+        )
 
-        _tp1, _tp2, _tp3 = _ensure_three_tps(s.entry, s.sl, s.tp3, getattr(s, "tp1", None), getattr(s, "tp2", None), getattr(s, "side", ""))
-        if _tp1 not in (None, 0, 0.0) and _tp2 not in (None, 0, 0.0) and _tp3 not in (None, 0, 0.0):
+        _tp1, _tp2, _tp3 = _ensure_three_tps(
+            s.entry,
+            s.sl,
+            s.tp3,
+            getattr(s, "tp1", None),
+            getattr(s, "tp2", None),
+            getattr(s, "side", ""),
+        )
+
+        if _tp1 not in (None, 0, 0.0, "") and _tp2 not in (None, 0, 0.0, "") and _tp3 not in (None, 0, 0.0, ""):
             parts.append(
                 f"   TP1: {fmt_price_email(_tp1)} ({TP_ALLOCS[0]}%) | "
                 f"TP2: {fmt_price_email(_tp2)} ({TP_ALLOCS[1]}%) | "
@@ -9387,18 +9397,22 @@ def _email_body_pretty(
         else:
             parts.append(f"   TP3: {fmt_price_email(s.tp3)}")
 
-        # ✅ only for t
-railing-needed setups
         parts.append(
             f"   24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | "
             f"1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}"
         )
         parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
+
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
-            parts.append(f"   /size {str(getattr(s, 'symbol', ''))} {_pos} entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}")
+            parts.append(
+                f"   /size {str(getattr(s, 'symbol', ''))} {_pos} "
+                f"entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} "
+                f"sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}"
+            )
         except Exception:
             pass
+
         parts.append("")
 
     parts.append(HDR)
@@ -9411,7 +9425,6 @@ railing-needed setups
     parts.append(HDR)
 
     return "\n".join(parts).strip()
-
 
 def _email_body_pretty_html(
     session_name: str,
