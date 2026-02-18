@@ -2845,6 +2845,50 @@ def _user_day_local(user: dict) -> str:
         tz = ZoneInfo("UTC")
     return datetime.now(tz).date().isoformat()
 
+
+def _day_local_for_ts(user: dict, ts: float) -> str:
+    tz_name = str(user.get("tz") or user.get("timezone") or "UTC").strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    try:
+        return datetime.fromtimestamp(float(ts), tz).date().isoformat()
+    except Exception:
+        return datetime.now(tz).date().isoformat()
+
+def _risk_used_today_from_open_trades(user_id: int, user: dict, day_local: str) -> float:
+    # Use CURRENT open risk (not historical) so RF/close instantly frees capacity.
+    try:
+        opens = db_open_trades(user_id) or []
+    except Exception:
+        opens = []
+    total = 0.0
+    for t in opens:
+        try:
+            if _day_local_for_ts(user, float(t.get("opened_ts") or 0.0)) != str(day_local):
+                continue
+            total += float(t.get("risk_usd") or 0.0)
+        except Exception:
+            continue
+    return float(max(0.0, total))
+
+def _risk_daily_sync(user_id: int, user: dict) -> float:
+    # Make risk_daily consistent even if a trade was logged before risk_daily updates ran.
+    day_local = _user_day_local(user)
+    used = _risk_used_today_from_open_trades(user_id, user, day_local)
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO risk_daily (user_id, day_local, used_risk_usd) VALUES (?, ?, ?) "
+        "ON CONFLICT(user_id, day_local) DO UPDATE SET used_risk_usd=excluded.used_risk_usd",
+        (int(user_id), str(day_local), float(used)),
+    )
+    con.commit()
+    con.close()
+    return float(used)
+
+
 def db_insert_signal(s: Setup):
     con = db_connect()
     cur = con.cursor()
@@ -5518,11 +5562,18 @@ Market & Signals
 /equity
 • Set your equity
 
+/dailycap
+• Set your TOTAL daily risk cap (per day)
+
 /riskmode
-• Set your risk per trade
+• Set your risk per trade (used by /size)
+
+/trade_risk
+• Alias for /riskmode
 
 /size <symbol> <side> <entry> <sl>
-• Calculates position size based on your risk rules
+• Calculates position size based on your per-trade risk
+• Daily cap is shown in /status and updates when trades go Risk-Free
 
 ────────────────────
 Trade Journal
@@ -6468,55 +6519,95 @@ async def equity_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user(uid, equity=0.0)
     await update.message.reply_text("✅ Equity reset to $0.00")
 
+
 async def riskmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
+
+    # This is PER-TRADE risk used by /size (position sizing).
     if len(context.args) != 2:
-        await update.message.reply_text(f"Current: {user['risk_mode']} {float(user['risk_value']):.2f}\nUsage: /riskmode pct 2.5  OR  /riskmode usd 25")
+        mode = str(user.get("risk_mode", DEFAULT_RISK_MODE)).upper()
+        val = float(user.get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
+        per_trade_usd = compute_risk_usd(user, mode, val)
+        await update.message.reply_text(
+            f"Risk per trade (used by /size): {mode} {val:.2f} (≈ ${per_trade_usd:.2f} per trade)\n"
+            f"Daily risk cap is separate: /dailycap\n\n"
+            "Set examples:\n"
+            "• /riskmode pct 2.5\n"
+            "• /riskmode usd 25"
+        )
         return
+
     mode = context.args[0].strip().upper()
     try:
         val = float(context.args[1])
     except Exception:
         await update.message.reply_text("Usage: /riskmode pct 2.5  OR  /riskmode usd 25")
         return
+
     if mode not in {"PCT", "USD"}:
         await update.message.reply_text("Mode must be pct or usd")
         return
-    if mode == "PCT" and not (0.1 <= val <= 10):
-        await update.message.reply_text("pct value should be between 0.1 and 10")
+    if mode == "PCT" and not (0.0 <= val <= 10):
+        await update.message.reply_text("pct per-trade should be between 0 and 10")
         return
-    if mode == "USD" and val <= 0:
-        await update.message.reply_text("usd value must be > 0")
+    if mode == "USD" and val < 0:
+        await update.message.reply_text("usd per-trade must be >= 0")
         return
+
     update_user(uid, risk_mode=mode, risk_value=val)
-    await update.message.reply_text(f"✅ Risk mode updated: {mode} {val:.2f}")
+    user = get_user(uid)
+    per_trade_usd = compute_risk_usd(user, mode, val)
+    await update.message.reply_text(
+        f"✅ Risk per trade updated: {mode} {val:.2f} (≈ ${per_trade_usd:.2f} per trade)\n"
+        f"Daily cap is separate: /dailycap"
+    )
+
+async def trade_risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: /trade_risk -> /riskmode
+    await riskmode_cmd(update, context)
 
 async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
+
+    # This is TOTAL DAILY risk cap (sum of open risks for today's trades).
     if len(context.args) != 2:
         cap = daily_cap_usd(user)
-        await update.message.reply_text(f"Current: {user['daily_cap_mode']} {float(user['daily_cap_value']):.2f} (≈ ${cap:.2f})\nUsage: /dailycap pct 5  OR  /dailycap usd 60")
+        mode = str(user.get("daily_cap_mode", DEFAULT_DAILY_CAP_MODE)).upper()
+        val = float(user.get("daily_cap_value", DEFAULT_DAILY_CAP_VALUE) or DEFAULT_DAILY_CAP_VALUE)
+        await update.message.reply_text(
+            f"Daily risk cap (TOTAL per day): {mode} {val:.2f} (≈ ${cap:.2f} per day)\n"
+            f"Per-trade risk is separate: /riskmode\n\n"
+            "Set examples:\n"
+            "• /dailycap pct 5\n"
+            "• /dailycap usd 60"
+        )
         return
+
     mode = context.args[0].strip().upper()
     try:
         val = float(context.args[1])
     except Exception:
         await update.message.reply_text("Usage: /dailycap pct 5  OR  /dailycap usd 60")
         return
+
     if mode not in {"PCT", "USD"}:
         await update.message.reply_text("Mode must be pct or usd")
         return
-    if mode == "PCT" and not (0.5 <= val <= 30):
-        await update.message.reply_text("pct/day should be between 0.5 and 30")
+    if mode == "PCT" and not (0.0 <= val <= 30):
+        await update.message.reply_text("pct/day should be between 0 and 30")
         return
     if mode == "USD" and val < 0:
         await update.message.reply_text("usd/day must be >= 0")
         return
+
     update_user(uid, daily_cap_mode=mode, daily_cap_value=val)
     user = get_user(uid)
-    await update.message.reply_text(f"✅ Daily cap updated. (≈ ${daily_cap_usd(user):.2f})")
+    await update.message.reply_text(
+        f"✅ Daily risk cap updated: {mode} {float(val):.2f} (≈ ${daily_cap_usd(user):.2f} per day)"
+    )
+
 
 async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -7070,7 +7161,7 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cap = daily_cap_usd(user)
     day_local = _user_day_local(user)
-    used_before = _risk_daily_get(uid, day_local)
+    used_before = _risk_daily_sync(uid, user)
     remaining_before = (cap - used_before) if cap > 0 else float("inf")
 
     warn_daily = ""
@@ -7088,7 +7179,7 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = db_trade_open(uid, sym, side, entry, sl, risk_usd, qty, note=note, signal_id=signal_id)
     _risk_daily_inc(uid, day_local, float(risk_usd))
 
-    used_after = _risk_daily_get(uid, day_local)
+    used_after = _risk_daily_sync(uid, get_user(uid))
     remaining_after = (cap - used_after) if cap > 0 else float("inf")
 
     update_user(uid, day_trade_count=int(user["day_trade_count"]) + 1)
@@ -7156,11 +7247,9 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Trade not found or already closed.")
         return
     
-    # ✅ release unused risk if profitable
-    if pnl > 0:
-        day_local = _user_day_local(user)
-        _risk_daily_inc(uid, day_local, -float(t["risk_usd"]))
-    
+    # Sync daily risk from CURRENT open positions (closing frees capacity instantly)
+    _risk_daily_sync(uid, user)
+
     new_eq = float(user["equity"]) + float(pnl)
     update_user(uid, equity=new_eq)
     user = get_user(uid)
@@ -7237,7 +7326,7 @@ async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _risk_daily_inc(uid, day_local, delta)
 
         # clamp to 0 if negative due to edge cases
-        used_now = _risk_daily_get(uid, day_local)
+        used_now = _risk_daily_sync(uid, user)
         if used_now < 0:
             con2 = db_connect()
             cur2 = con2.cursor()
@@ -7249,7 +7338,7 @@ async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             con2.close()
 
     cap = daily_cap_usd(user)
-    used_today = _risk_daily_get(uid, day_local)
+    used_today = _risk_daily_sync(uid, user)
     remaining_today = (cap - used_today) if cap > 0 else float("inf")
 
     warn = ""
@@ -7315,7 +7404,7 @@ async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         con.close()
         cap = daily_cap_usd(user)
         day_local = _user_day_local(user)
-        used_today = _risk_daily_get(uid, day_local)
+        used_today = _risk_daily_sync(uid, user)
         remaining_today = (cap - used_today) if cap > 0 else float("inf")
 
         await update.message.reply_text(
@@ -7346,7 +7435,7 @@ async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _risk_daily_inc(uid, day_local, -old_risk)
 
     # Clamp used risk to 0 if it went negative (edge cases)
-    used_now = _risk_daily_get(uid, day_local)
+    used_now = _risk_daily_sync(uid, user)
     if used_now < 0:
         con2 = db_connect()
         cur2 = con2.cursor()
@@ -7395,8 +7484,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     equity = float((user or {}).get("equity") or 0.0)
 
     cap = daily_cap_usd(user)
+    # Sync used risk from CURRENT open positions (RF/close frees capacity instantly)
+    used_today = _risk_daily_sync(uid, user)
     day_local = _user_day_local(user)
-    used_today = _risk_daily_get(uid, day_local)
     remaining_today = (cap - used_today) if cap > 0 else float("inf")
 
     enabled = user_enabled_sessions(user)
@@ -7418,8 +7508,13 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Plan: {plan}")
     lines.append(f"Equity: ${equity:.2f}")
     lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
+    risk_mode = str(user.get('risk_mode', 'PCT')).upper()
+    risk_val = float(user.get('risk_value', 0.0) or 0.0)
+    risk_trade_usd = compute_risk_usd(user, risk_mode, risk_val)
+
+    lines.append(f"Risk per trade: {risk_mode} {risk_val:.2f} (≈ ${risk_trade_usd:.2f})")
     lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
-    lines.append(f"Daily risk used: ${used_today:.2f}")
+    lines.append(f"Daily risk used (open risk today): ${used_today:.2f}")
     lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
     lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
     lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
@@ -10195,7 +10290,9 @@ async def _post_init(app: Application):
             BotCommand("screen", "Scans the market for high-quality setups"),
 
             BotCommand("equity", "Set your equity"),
-            BotCommand("riskmode", "Set your risk per trade"),
+            BotCommand("dailycap", "Set your total daily risk cap"),
+            BotCommand("riskmode", "Set your per-trade risk (used by /size)"),
+            BotCommand("trade_risk", "Alias: set your per-trade risk"),
             BotCommand("size", "Position size calculator"),
 
             BotCommand("trade_open", "Log an opened position"),
@@ -10772,6 +10869,7 @@ def main():
     app.add_handler(CommandHandler("equity", equity_cmd))
     app.add_handler(CommandHandler("equity_reset", equity_reset_cmd))
     app.add_handler(CommandHandler("riskmode", riskmode_cmd))
+    app.add_handler(CommandHandler("trade_risk", trade_risk_cmd))
     app.add_handler(CommandHandler("dailycap", dailycap_cmd))
     app.add_handler(CommandHandler("limits", limits_cmd))
 
@@ -10948,7 +11046,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cap = daily_cap_usd(user)
     day_local = _user_day_local(user)
-    used_today = _risk_daily_get(uid, day_local)
+    used_today = _risk_daily_sync(uid, user)
     remaining_today = (cap - used_today) if cap > 0 else float("inf")
 
     enabled = user_enabled_sessions(user)
