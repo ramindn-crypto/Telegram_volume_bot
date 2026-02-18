@@ -9245,7 +9245,19 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
     kb = []
     try:
-        kb = [(s.symbol, s.setup_id) for s in (setups or [])]
+        kb = []
+        for s in (setups or []):
+            try:
+                sym = str(getattr(s, "symbol", "") or "").upper().strip()
+                sid = str(getattr(s, "setup_id", "") or "").strip()
+                side = str(getattr(s, "side", "") or "").upper().strip()
+                entry = float(getattr(s, "entry", 0.0) or 0.0)
+                sl = float(getattr(s, "sl", 0.0) or 0.0)
+                pos_word = "long" if side == "BUY" else "short"
+                cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
+                kb.append((sym, sid, cmd))
+            except Exception:
+                continue
     except Exception:
         kb = []
     return body, kb
@@ -9302,15 +9314,52 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             msg = (header + "\n" + cached_body).strip()
 
-            keyboard = [
-                [
-                    InlineKeyboardButton(text=f"📈 {sym}", url=tv_chart_url(sym)),
-                    InlineKeyboardButton(text="📋 /size", callback_data=f"copy_size|{sid}"),
-                ]
-                for (sym, sid) in (cached_kb or [])
-            ]
+            keyboard = []
 
-            try:
+            for item in (cached_kb or []):
+
+                try:
+
+                    # item can be (sym, setup_id) or (sym, setup_id, size_cmd)
+
+                    sym = ""
+
+                    sid = ""
+
+                    cmd = ""
+
+                    if isinstance(item, (list, tuple)) and len(item) == 3:
+
+                        sym, sid, cmd = item
+
+                    elif isinstance(item, (list, tuple)) and len(item) == 2:
+
+                        sym, sid = item
+
+                        cmd = ""
+
+                    else:
+
+                        continue
+
+                    row = [InlineKeyboardButton(text=f"📈 {sym}", url=tv_chart_url(sym))]
+
+                    if cmd:
+
+                        # Best mobile UX: inserts the command into the input box (requires inline mode enabled in BotFather)
+
+                        row.append(InlineKeyboardButton(text="📝 Paste /size", switch_inline_query_current_chat=str(cmd)))
+
+                    # Fallback: bot posts a clean ASCII /size line for tap-and-hold copy
+
+                    row.append(InlineKeyboardButton(text="📋 Send /size", callback_data=f"copy_size|{sid}"))
+
+                    keyboard.append(row)
+
+                except Exception:
+
+                    continue
+try:
                 await status_msg.delete()
             except Exception:
                 pass
@@ -9333,15 +9382,30 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cached_kb = list(_SCREEN_CACHE.get("kb") or [])
 
                 msg = (header + "\n" + cached_body).strip()
-                keyboard = [
-                    [
-                    InlineKeyboardButton(text=f"📈 {sym}", url=tv_chart_url(sym)),
-                    InlineKeyboardButton(text="📋 /size", callback_data=f"copy_size|{sid}"),
-                ]
-                    for (sym, sid) in (cached_kb or [])
-                ]
-
-                try:
+                keyboard = []
+                for item in (cached_kb or []):
+                    try:
+                        # item can be (sym, setup_id) or (sym, setup_id, size_cmd)
+                        sym = ""
+                        sid = ""
+                        cmd = ""
+                        if isinstance(item, (list, tuple)) and len(item) == 3:
+                            sym, sid, cmd = item
+                        elif isinstance(item, (list, tuple)) and len(item) == 2:
+                            sym, sid = item
+                            cmd = ""
+                        else:
+                            continue
+                        row = [InlineKeyboardButton(text=f"📈 {sym}", url=tv_chart_url(sym))]
+                        if cmd:
+                            # Best mobile UX: inserts the command into the input box (requires inline mode enabled in BotFather)
+                            row.append(InlineKeyboardButton(text="📝 Paste /size", switch_inline_query_current_chat=str(cmd)))
+                        # Fallback: bot posts a clean ASCII /size line for tap-and-hold copy
+                        row.append(InlineKeyboardButton(text="📋 Send /size", callback_data=f"copy_size|{sid}"))
+                        keyboard.append(row)
+                    except Exception:
+                        continue
+try:
                     await status_msg.delete()
                 except Exception:
                     pass
@@ -9373,15 +9437,30 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Send final
         msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
-        keyboard = [
-            [
-                    InlineKeyboardButton(text=f"📈 {sym}", url=tv_chart_url(sym)),
-                    InlineKeyboardButton(text="📋 /size", callback_data=f"copy_size|{sid}"),
-                ]
-            for (sym, sid) in (_SCREEN_CACHE.get("kb") or [])
-        ]
-
-        try:
+        keyboard = []
+        for item in (_SCREEN_CACHE.get("kb") or []):
+            try:
+                # item can be (sym, setup_id) or (sym, setup_id, size_cmd)
+                sym = ""
+                sid = ""
+                cmd = ""
+                if isinstance(item, (list, tuple)) and len(item) == 3:
+                    sym, sid, cmd = item
+                elif isinstance(item, (list, tuple)) and len(item) == 2:
+                    sym, sid = item
+                    cmd = ""
+                else:
+                    continue
+                row = [InlineKeyboardButton(text=f"📈 {sym}", url=tv_chart_url(sym))]
+                if cmd:
+                    # Best mobile UX: inserts the command into the input box (requires inline mode enabled in BotFather)
+                    row.append(InlineKeyboardButton(text="📝 Paste /size", switch_inline_query_current_chat=str(cmd)))
+                # Fallback: bot posts a clean ASCII /size line for tap-and-hold copy
+                row.append(InlineKeyboardButton(text="📋 Send /size", callback_data=f"copy_size|{sid}"))
+                keyboard.append(row)
+            except Exception:
+                continue
+try:
             await status_msg.delete()
         except Exception:
             pass
@@ -9626,12 +9705,18 @@ def _email_body_pretty(
 
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
-            parts.append(
-                f"   /size {str(getattr(s, 'symbol', ''))} {_pos} "
+            size_line = (
+                f"/size {str(getattr(s, 'symbol', ''))} {_pos} "
                 f"entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} "
                 f"sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}"
             )
-        except Exception:
+            parts.append(f"   {size_line}")
+            try:
+                import urllib.parse as _up
+                parts.append(f"   Telegram: https://t.me/share/url?url=&text={_up.quote(str(size_line))}")
+            except Exception:
+                pass
+except Exception:
             pass
 
         parts.append("")
@@ -9717,7 +9802,13 @@ def _email_body_pretty_html(
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
             size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
-            card.append(f"<pre style='margin-top:8px;background:#f7f7f7;padding:8px;border-radius:8px;white-space:pre-wrap;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace;user-select:all'>{esc(size_line)}</pre>")
+            try:
+                import urllib.parse as _up
+                _share = "https://t.me/share/url?url=&text=" + _up.quote(str(size_line))
+                card.append(f"<div style='margin-top:6px'><a href='{_share}'>📝 Open /size in Telegram</a></div>")
+            except Exception:
+                pass
+            card.append("<pre style='margin-top:8px;background:#f7f7f7;padding:8px;border-radius:8px;white-space:pre-wrap;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace;user-select:all'>" + esc(size_line) + "</pre>")
         except Exception:
             pass
         card.append("</div>")
