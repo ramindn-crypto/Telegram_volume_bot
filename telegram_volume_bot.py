@@ -5491,7 +5491,7 @@ def _stats_from_trades(trades: List[dict]) -> dict:
     wins = [t for t in closed if float(t["pnl"]) > 0]
     losses = [t for t in closed if float(t["pnl"]) < 0]
     net = sum(float(t["pnl"]) for t in closed) if closed else 0.0
-        denom = (len(wins) + len(losses))
+    denom = (len(wins) + len(losses))
     win_rate = (len(wins) / denom * 100.0) if denom else 0.0
     avg_r = None
     r_vals = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
