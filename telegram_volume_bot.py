@@ -534,6 +534,9 @@ SCREEN_TRIGGER_LOOSEN = 0.85    # 15% easier trigger on /screen only
 SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
 SCREEN_WAITING_N = 10
 
+# EMA proximity gate: never generate setups if price is far from EMA7 (1H)
+EMA7_1H_MAX_DIST_PCT = 0.35  # % distance from EMA7(1H). Example: 0.35 = within 0.35%
+
 # Directional Leaders/Losers thresholds
 MOVER_VOL_USD_MIN = 5_000_000
 MOVER_UP_24H_MIN = 10.0
@@ -3158,6 +3161,37 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
     cache_set(key, data)
     return data
+
+
+def ema7_1h_distance_pct(market_symbol: str) -> Tuple[float, float, float]:
+    """
+    Returns (dist_pct, last_close, ema7_1h).
+    dist_pct is absolute percent distance between last close and EMA7 on 1H candles.
+    """
+    try:
+        c1 = fetch_ohlcv(market_symbol, "1h", limit=40)
+        if not c1 or len(c1) < 10:
+            return 999.0, 0.0, 0.0
+        closes = [float(x[4]) for x in c1]
+        last_close = float(closes[-1])
+        # lightweight EMA
+        period = 7
+        k = 2.0 / (period + 1.0)
+        ema = float(closes[0])
+        for v in closes[1:]:
+            ema = (float(v) * k) + (ema * (1.0 - k))
+        if ema == 0.0:
+            return 999.0, last_close, ema
+        dist_pct = abs((last_close - ema) / ema) * 100.0
+        return dist_pct, last_close, ema
+    except Exception:
+        return 999.0, 0.0, 0.0
+
+
+def ema7_1h_is_close(market_symbol: str, max_dist_pct: float = EMA7_1H_MAX_DIST_PCT) -> Tuple[bool, float, float, float]:
+    dist_pct, last_close, ema = ema7_1h_distance_pct(market_symbol)
+    return (dist_pct <= float(max_dist_pct)), dist_pct, last_close, ema
+
 
 # =========================================================
 # ✅ Session resolution helpers (for /screen + engine)
@@ -8502,6 +8536,43 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     if mom:
         priority_setups.extend(mom)
 
+
+    # -----------------------------------------------------
+    # CRITICAL GATE: price must be close to EMA7 (1H) to allow ANY setup (screen/email)
+    # -----------------------------------------------------
+    ema7_cache: Dict[str, Tuple[bool, float, float, float]] = {}
+    gated = []
+    for s in (priority_setups or []):
+        try:
+            mk = str(getattr(s, "market_symbol", "") or "")
+            base = str(getattr(s, "symbol", "") or "").upper().strip()
+            if not mk:
+                # if we somehow don't have market_symbol, be safe and drop it
+                mv = (best_fut or {}).get(base)
+                _rej("missing_market_symbol", base, mv, "EMA7 gate")
+                continue
+
+            if mk not in ema7_cache:
+                ema7_cache[mk] = ema7_1h_is_close(mk, EMA7_1H_MAX_DIST_PCT)
+            ok, dist_pct, last_close, ema7 = ema7_cache[mk]
+            if not ok:
+                mv = (best_fut or {}).get(base)
+                _rej("far_from_ema7_1h", base, mv, f"dist={dist_pct:.2f}% max={float(EMA7_1H_MAX_DIST_PCT):.2f}% close={last_close:.6g} ema7={ema7:.6g}")
+                continue
+
+            gated.append(s)
+        except Exception:
+            # fail-closed: if gate check errors, do not emit setup
+            try:
+                base = str(getattr(s, "symbol", "") or "").upper().strip()
+                mv = (best_fut or {}).get(base)
+                _rej("ema7_gate_error", base, mv)
+            except Exception:
+                pass
+            continue
+
+    priority_setups = gated
+
     # de-dupe by (symbol, side, engine) keeping highest conf, preserving priority order
     best = {}
     for s in priority_setups:
@@ -10290,8 +10361,8 @@ async def _post_init(app: Application):
             BotCommand("screen", "Scans the market for high-quality setups"),
 
             BotCommand("equity", "Set your equity"),
-            BotCommand("dailycap", "Set your total daily risk cap"),
             BotCommand("riskmode", "Set your per-trade risk (used by /size)"),
+            BotCommand("dailycap", "Set your total daily risk cap"),
             BotCommand("trade_risk", "Alias: set your per-trade risk"),
             BotCommand("size", "Position size calculator"),
 
