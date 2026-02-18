@@ -9213,13 +9213,17 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Header (always fresh)
         uid = update.effective_user.id
         user = get_user(uid)
-        session = current_session_utc()
+        now_utc = datetime.now(timezone.utc)
+        session_disp = (_session_label_utc(now_utc) or "NONE")
         loc_label, loc_time = user_location_and_time(user)
 
         header = (
-            f"*PulseFutures — Market Scan*\n"
-            f"{HDR}\n"
-            f"*Session:* `{session}` | *{loc_label}:* `{loc_time}`\n"
+            f"*PulseFutures — Market Scan*
+"
+            f"{HDR}
+"
+            f"*Session:* `{session_disp}` | *{loc_label}:* `{loc_time}`
+"
         )
 
         now_ts = time.time()
