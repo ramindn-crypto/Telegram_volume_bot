@@ -1,39 +1,3 @@
-
-def _ensure_three_tps(entry: float, sl: float, tp3: float, tp1, tp2, side: str):
-    """Ensure TP1/TP2/TP3 exist. If TP1/TP2 missing, derive them proportionally between entry and TP3.
-    Uses 40/40/20 allocation convention for labels only.
-    """
-    try:
-        e = float(entry or 0.0)
-        t3 = float(tp3 or 0.0)
-        _ = float(sl or 0.0)
-    except Exception:
-        return tp1, tp2, tp3
-    if not (e and t3):
-        return tp1, tp2, tp3
-    side_u = str(side or "").upper().strip()
-    # If tp1/tp2 are missing or zero, derive
-    try:
-        t1_ok = tp1 not in (None, 0, 0.0, "")
-        t2_ok = tp2 not in (None, 0, 0.0, "")
-    except Exception:
-        t1_ok = t2_ok = False
-    if t1_ok and t2_ok:
-        return float(tp1), float(tp2), float(tp3)
-    # Derived targets: 40% and 80% of the way from entry to TP3
-    try:
-        if side_u == "SELL":
-            # tp3 should be below entry for sell; but if not, still compute directionally
-            t1 = e + (t3 - e) * 0.4
-            t2 = e + (t3 - e) * 0.8
-        else:
-            t1 = e + (t3 - e) * 0.4
-            t2 = e + (t3 - e) * 0.8
-        return float(t1), float(t2), float(tp3)
-    except Exception:
-        return tp1, tp2, tp3
-
-_LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
 #!/usr/bin/env python3
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
@@ -103,6 +67,44 @@ import re
 import sqlite3
 
 TXID_REGEX = re.compile(r"^[A-Fa-f0-9]{64}$")
+
+
+
+def _ensure_three_tps(entry: float, sl: float, tp3: float, tp1, tp2, side: str):
+    """Ensure TP1/TP2/TP3 exist. If TP1/TP2 missing, derive them proportionally between entry and TP3.
+    Uses 40/40/20 allocation convention for labels only.
+    """
+    try:
+        e = float(entry or 0.0)
+        t3 = float(tp3 or 0.0)
+        _ = float(sl or 0.0)
+    except Exception:
+        return tp1, tp2, tp3
+    if not (e and t3):
+        return tp1, tp2, tp3
+    side_u = str(side or "").upper().strip()
+    # If tp1/tp2 are missing or zero, derive
+    try:
+        t1_ok = tp1 not in (None, 0, 0.0, "")
+        t2_ok = tp2 not in (None, 0, 0.0, "")
+    except Exception:
+        t1_ok = t2_ok = False
+    if t1_ok and t2_ok:
+        return float(tp1), float(tp2), float(tp3)
+    # Derived targets: 40% and 80% of the way from entry to TP3
+    try:
+        if side_u == "SELL":
+            # tp3 should be below entry for sell; but if not, still compute directionally
+            t1 = e + (t3 - e) * 0.4
+            t2 = e + (t3 - e) * 0.8
+        else:
+            t1 = e + (t3 - e) * 0.4
+            t2 = e + (t3 - e) * 0.8
+        return float(t1), float(t2), float(tp3)
+    except Exception:
+        return tp1, tp2, tp3
+
+_LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
 
 def is_valid_txid(txid: str) -> bool:
     return bool(TXID_REGEX.match(txid))
@@ -5526,7 +5528,7 @@ def _stats_from_trades(trades: List[dict]) -> dict:
     wins = [t for t in closed if float(t["pnl"]) > 0]
     losses = [t for t in closed if float(t["pnl"]) < 0]
     net = sum(float(t["pnl"]) for t in closed) if closed else 0.0
-        denom = (len(wins) + len(losses))
+    denom = (len(wins) + len(losses))
     win_rate = (len(wins) / denom * 100.0) if denom else 0.0
     avg_r = None
     r_vals = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
