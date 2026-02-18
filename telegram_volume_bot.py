@@ -5638,8 +5638,6 @@ Market & Signals
 • Set your risk per trade (used by /size)
 
 
-• Alias for /riskmode
-
 /size <symbol> <side> <entry> <sl>
 • Calculates position size based on your per-trade risk
 • Daily cap is shown in /status and updates when trades go Risk-Free
@@ -6632,10 +6630,6 @@ async def riskmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Daily cap is separate: /dailycap"
     )
 
-async def _cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Alias:  -> /riskmode
-    await riskmode_cmd(update, context)
-
 async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -7139,14 +7133,14 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return   
         
     raw_full = " ".join(context.args).strip()
-if not raw_full:
-    await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 risk usd 40 [note ...] [sig PF-...]")
-    return
+    if not raw_full:
+        await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 risk usd 40 [note ...] [sig PF-...]")
+        return
 
-bracket_parts = re.findall(r"\[([^\]]+)\]", raw_full)
-raw = re.sub(r"\[[^\]]+\]", "", raw_full).strip()
+    bracket_parts = re.findall(r"\[([^\]]+)\]", raw_full)
+    raw = re.sub(r"\[[^\]]+\]", "", raw_full).strip()
 
-tokens = raw.split()
+    tokens = raw.split()
     if len(tokens) < 9:
         await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 risk usd 40 [note ...] [sig PF-...]")
         return
@@ -7172,41 +7166,38 @@ tokens = raw.split()
         risk_val = float(tokens[r_i+2])
 
         note = ""
-signal_id = ""
+        signal_id = ""
 
-# Token-based (explicit keywords)
-if "note" in tokens:
-    n_i = idx("note")
-    # note runs until "sig" if present
-    if "sig" in tokens[n_i+1:]:
-        s_rel = tokens[n_i+1:].index("sig")
-        note = " ".join(tokens[n_i+1:n_i+1+s_rel]).strip()
-    else:
-        note = " ".join(tokens[n_i+1:]).strip()
+        # Token-based (explicit keywords)
+        if "note" in tokens:
+            n_i = idx("note")
+            # note runs until "sig" if present
+            if "sig" in tokens[n_i+1:]:
+                s_rel = tokens[n_i+1:].index("sig")
+                note = " ".join(tokens[n_i+1:n_i+1+s_rel]).strip()
+            else:
+                note = " ".join(tokens[n_i+1:]).strip()
 
-if "sig" in tokens:
-    s_i = idx("sig")
-    if s_i + 1 < len(tokens):
-        signal_id = tokens[s_i+1].strip()
+        if "sig" in tokens:
+            s_i = idx("sig")
+            if s_i + 1 < len(tokens):
+                signal_id = tokens[s_i+1].strip()
 
-# Bracket-based (legacy/quick typing): [my note] [sig PF-123]
-for bp in bracket_parts or []:
-    seg = str(bp or "").strip()
-    if not seg:
-        continue
-    low = seg.lower().strip()
-    if low.startswith("sig " ) or low.startswith("sig:"):
-        parts = seg.replace("sig:", "sig ").split(None, 1)
-        if len(parts) == 2 and parts[1].strip():
-            signal_id = parts[1].strip()
-        continue
-    if low.startswith("signal " ) or low.startswith("signal:"):
-        parts = seg.replace("signal:", "signal ").split(None, 1)
-        if len(parts) == 2 and parts[1].strip():
-            signal_id = parts[1].strip()
-        continue
-    # otherwise it's a note chunk
-    note = (seg if not note else (note + " | " + seg)).strip()
+        # Bracket-based (legacy/quick typing): [my note] [sig PF-123]
+        for bp in bracket_parts or []:
+            seg = str(bp or "").strip()
+            if not seg:
+                continue
+            low = seg.lower()
+            if low.startswith("sig "):
+                signal_id = seg[4:].strip()
+                continue
+            m2 = re.match(r"^(sig)\s*[:\-]?\s*(.+)$", seg, flags=re.IGNORECASE)
+            if m2:
+                signal_id = m2.group(2).strip()
+                continue
+            note = (seg if not note else (note + " | " + seg)).strip()
+
     except Exception:
         await update.message.reply_text("Bad format. Example: /trade_open BTC long entry 43000 sl 42000 risk usd 40 note breakout sig PF-20251219-0007")
         return
@@ -7504,7 +7495,7 @@ async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cap = daily_cap_usd(user)
         day_local = _user_day_local(user)
         pnl_today = _pnl_today_closed_trades(uid, user)
-    used_today = _risk_used_total_today(uid, user)
+        used_today = _risk_used_total_today(uid, user)
         remaining_today = (cap - used_today) if cap > 0 else float("inf")
 
         await update.message.reply_text(
@@ -10432,7 +10423,6 @@ async def _post_init(app: Application):
             BotCommand("equity", "Set your equity"),
             BotCommand("riskmode", "Set your per-trade risk (used by /size)"),
             BotCommand("dailycap", "Set your total daily risk cap"),
-            BotCommand("", "Alias: set your per-trade risk"),
             BotCommand("size", "Position size calculator"),
 
             BotCommand("trade_open", "Log an opened position"),
@@ -11009,7 +10999,6 @@ def main():
     app.add_handler(CommandHandler("equity", equity_cmd))
     app.add_handler(CommandHandler("equity_reset", equity_reset_cmd))
     app.add_handler(CommandHandler("riskmode", riskmode_cmd))
-    app.add_handler(CommandHandler("", _cmd))
     app.add_handler(CommandHandler("dailycap", dailycap_cmd))
     app.add_handler(CommandHandler("limits", limits_cmd))
 
