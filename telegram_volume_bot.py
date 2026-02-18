@@ -5132,28 +5132,21 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # Preferred: pass to_email through (requires _send_email_async signature supports it)
-        # If your _send_email_async does NOT accept to_email, use the fallback block below.
-        ok = await _send_email_async(
-            int(EMAIL_SEND_TIMEOUT_SEC),
-            subject,
-            body,
-            uid,
-            False,
-            to_email=to_email,   # <-- keep this; if your function doesn't accept it, use fallback below
-        )
-
-    except TypeError:
-        # Fallback if _send_email_async doesn't accept to_email kwarg:
-        # Temporarily set a per-user override email field that your sender reads.
+        # IMPORTANT: send_email() resolves recipient from DB (users.email_to OR users.email).
+        # For /email_test, we temporarily override users.email_to to ensure it goes to the intended address.
         prev_email_to = user.get("email_to")
         prev_email = user.get("email")
         try:
-            # Prefer email_to
             update_user(uid, email_to=to_email)
-            ok = await _send_email_async(int(EMAIL_SEND_TIMEOUT_SEC), subject, body, uid, False)
+            ok = await _send_email_async(
+                int(EMAIL_SEND_TIMEOUT_SEC),
+                subject,
+                body,
+                user_id_for_debug=uid,
+                enforce_trade_window=False,
+            )
         finally:
-            # Restore
+            # Restore prior values
             try:
                 if prev_email_to is None:
                     update_user(uid, email_to=None)
@@ -5168,6 +5161,7 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
     except Exception as e:
+
         logger.exception("email_test_cmd failed")
         msg = f"❌ Test email crashed: {type(e).__name__}: {e}"
         try:
@@ -9945,12 +9939,36 @@ async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
     """
     Runs send_email() in a worker thread with a hard timeout so SMTP/network stalls
     can't block the Telegram event loop (Render lag fix).
+
+    IMPORTANT:
+    - On timeout/exception, record _LAST_SMTP_ERROR for the relevant user_id_for_debug
+      so /email_test shows a real reason instead of "unknown_error".
     """
+    # Best-effort extract of user id for diagnostics
+    uid = kwargs.get("user_id_for_debug", None)
+    try:
+        if uid is not None:
+            uid = int(uid)
+    except Exception:
+        uid = None
+
     try:
         return bool(await _to_thread_with_timeout(send_email, timeout_sec, *args, **kwargs))
     except asyncio.TimeoutError:
+        if uid is not None:
+            try:
+                _LAST_SMTP_ERROR[uid] = f"timeout_after_{int(timeout_sec)}s"
+                _LAST_EMAIL_DECISION[uid] = {"status": "FAIL", "reason": _LAST_SMTP_ERROR[uid], "ts": time.time()}
+            except Exception:
+                pass
         return False
-    except Exception:
+    except Exception as e:
+        if uid is not None:
+            try:
+                _LAST_SMTP_ERROR[uid] = f"{type(e).__name__}: {e}"
+                _LAST_EMAIL_DECISION[uid] = {"status": "FAIL", "reason": _LAST_SMTP_ERROR[uid], "ts": time.time()}
+            except Exception:
+                pass
         return False
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
