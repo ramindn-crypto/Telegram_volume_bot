@@ -9355,6 +9355,9 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/screen — allowed to take longer, but must never hang or go silent."""
+    
+    global _SCREEN_REFRESH_TASK, _SCREEN_REFRESH_TASK_STARTED_AT
+    
     uid = update.effective_user.id
     user = get_user(uid)
 
@@ -9408,8 +9411,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             freshness_line += "\n_No change since your last /screen._"
 
         msg = (header + "\n" + cached_body + freshness_line).strip()
-
-        global _SCREEN_REFRESH_TASK, _SCREEN_REFRESH_TASK_STARTED_AT
 
         # Watchdog for stuck refresh
         try:
