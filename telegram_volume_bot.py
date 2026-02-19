@@ -8901,6 +8901,7 @@ def user_location_and_time(user: dict):
 # /screen fast cache (per-instance)
 # =========================================================
 SCREEN_CACHE_TTL_SEC = 20  # seconds
+SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 _SCREEN_CACHE = {
     "ts": 0.0,
     "body": "",
@@ -9032,6 +9033,10 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 side = str(getattr(s, "side", "") or "").upper().strip()
                 conf = int(getattr(s, "conf", 0) or 0)
 
+                # Filter out low-confidence setups from /screen
+                if conf < int(SCREEN_MIN_CONF):
+                    continue
+
                 entry = float(getattr(s, "entry", 0.0) or 0.0)
                 sl = float(getattr(s, "sl", 0.0) or 0.0)
                 tp1 = getattr(s, "tp1", None)
@@ -9073,7 +9078,6 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                     f"1H {pct_with_emoji(ch1)} | 15m {pct_with_emoji(ch15)} | Vol~{fmt_money(vol)}"
                 )
 
-                block.append(f"Chart: {tv_chart_url(sym)}")
                 block.append(f"`{size_cmd}`")
 
                 lines2.append("\n".join(block))
@@ -9101,7 +9105,6 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                     block2.append(f"{emoji2} *{side2} — {sym2} — Conf {conf2}*")
                     block2.append(f"Entry: `{fmt_price(entry2)}` | SL: `{fmt_price(sl2)}` | RR(TP3): `{rr32:.2f}`")
                     block2.append(f"TP3: `{fmt_price(tp32)}`")
-                    block2.append(f"Chart: {tv_chart_url(sym2)}")
                     block2.append(f"`{size_cmd2}`")
 
                     lines2.append("\n".join(block2))
@@ -9240,18 +9243,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
     body = "\n".join([b for b in blocks if b is not None]).strip()
 
-
-
-    kb = []
-    try:
-        # Keep TradingView buttons in sync with the setups actually shown in the /screen body.
-        # (rendered_kb is built during setup card rendering above)
-        if "rendered_kb" in locals() and isinstance(rendered_kb, list) and rendered_kb:
-            kb = list(rendered_kb)
-        else:
-            kb = [(s.symbol, s.setup_id) for s in (setups or [])]
-    except Exception:
-        kb = []
+    kb = []  # TradingView buttons disabled for /screen
     return body, kb
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -9287,10 +9279,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cached_body:
         msg = (header + "\n" + cached_body).strip()
 
-        keyboard = [
-            [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
-            for (sym, sid) in (cached_kb or [])
-        ]
+        keyboard = []  # TradingView buttons disabled
 
         # If stale, kick off a background refresh and still reply instantly
         if (now_ts - ts) > float(SCREEN_CACHE_TTL_SEC):
@@ -9352,10 +9341,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             msg = (header + "\n" + cached_body).strip()
 
-            keyboard = [
-                [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
-                for (sym, sid) in (cached_kb or [])
-            ]
+            keyboard = []  # TradingView buttons disabled
 
             try:
                 await status_msg.delete()
@@ -9380,10 +9366,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cached_kb = list(_SCREEN_CACHE.get("kb") or [])
 
                 msg = (header + "\n" + cached_body).strip()
-                keyboard = [
-                    [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
-                    for (sym, sid) in (cached_kb or [])
-                ]
+                keyboard = []  # TradingView buttons disabled
 
                 try:
                     await status_msg.delete()
@@ -9417,10 +9400,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Send final
         msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
-        keyboard = [
-            [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
-            for (sym, sid) in (_SCREEN_CACHE.get("kb") or [])
-        ]
+        keyboard = []  # TradingView buttons disabled
 
         try:
             await status_msg.delete()
