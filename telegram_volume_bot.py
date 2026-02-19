@@ -11181,9 +11181,9 @@ async def admin_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         until = 0
 
         if plan == "TRIAL":
-            until = float(r.get("trial_until") or 0)
+            until = float(d.get("trial_until") or 0)
         elif plan in ("STANDARD", "PRO"):
-            until = float(r.get("plan_expires") or 0)
+            until = float(d.get("plan_expires") or 0)
 
         if until and until > now_ts:
             days_left = f"{int((until - now_ts + 86399)//86400)}d"
