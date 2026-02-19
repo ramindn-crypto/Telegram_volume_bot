@@ -9306,7 +9306,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     kb = []  # TradingView buttons disabled for /screen
     return body, kb
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
+    """/screen — allowed to take longer, but must never hang or go silent."""
     uid = update.effective_user.id
     user = get_user(uid)
 
@@ -9318,9 +9318,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-        # Header (always fresh)
+    # Header (always fresh)
     now_utc = datetime.now(timezone.utc)
-    session = _guess_session_name_utc(now_utc)  # engine session (falls back to NY in gap)
     session_disp = (_session_label_utc(now_utc) or "NONE")
     loc_label, loc_time = user_location_and_time(user)
 
@@ -9333,18 +9332,17 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now_ts = time.time()
     ts = float(_SCREEN_CACHE.get("ts", 0.0) or 0.0)
     cached_body = str(_SCREEN_CACHE.get("body") or "").strip()
-    cached_kb = list(_SCREEN_CACHE.get("kb") or [])
 
-    # ------------- INSTANT PATH (serve cache, even if stale) -------------
+    # ----------------------------
+    # 1) INSTANT PATH (serve cache)
+    # ----------------------------
     if cached_body:
         msg = (header + "\n" + cached_body).strip()
-
         keyboard = []  # TradingView buttons disabled
 
-        # If stale, refresh (best effort) but NEVER serve stale forever.
         cache_age = (now_ts - ts)
 
-        # Watchdog: if the background refresh got stuck (e.g., network hang), cancel it so we can refresh again.
+        # Watchdog: if the background refresh got stuck, cancel it so we can refresh again.
         global _SCREEN_REFRESH_TASK, _SCREEN_REFRESH_TASK_STARTED_AT
         try:
             if _SCREEN_REFRESH_TASK is not None and _SCREEN_REFRESH_TASK_STARTED_AT:
@@ -9358,26 +9356,35 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+        # If stale: refresh in background (best effort). If VERY stale: do sync refresh (allowed to take longer).
         if cache_age > float(SCREEN_CACHE_TTL_SEC):
-            # If very stale, do a synchronous refresh (still allowed to take longer).
             if cache_age > float(_SCREEN_FORCE_SYNC_AFTER_SEC):
+                # Sync refresh to avoid hours-old results
                 try:
                     await update.message.reply_text("🔎 Scanning market… Please wait")
-                    best_fut = await to_thread_heavy(fetch_futures_tickers)
+                    reset_reject_tracker()
+
+                    best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
                     if best_fut:
                         now_utc2 = datetime.now(timezone.utc)
                         session2 = _guess_session_name_utc(now_utc2)
-                        body2, kb2 = await to_thread_heavy(_build_screen_body_and_kb, best_fut, session2, int(uid))
+                        body2, kb2 = await _to_thread_with_timeout(
+                            _build_screen_body_and_kb,
+                            SCREEN_BUILD_TIMEOUT_SEC,
+                            best_fut,
+                            session2,
+                            int(uid),
+                        )
                         _SCREEN_CACHE["ts"] = time.time()
                         _SCREEN_CACHE["body"] = body2
                         _SCREEN_CACHE["kb"] = list(kb2 or [])
-                        # Update message immediately with refreshed cache
                         msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
+                    else:
+                        msg = (msg + "\n\n_Still refreshing… try /screen again in ~10–20s._").strip()
                 except Exception:
-                    # fall back to cached msg + background refresh hint
                     msg = (msg + "\n\n_Updating in background… run /screen again in ~10–20s for freshest results._").strip()
             else:
-                # Kick off a background refresh and still reply instantly
+                # Background refresh
                 try:
                     if _SCREEN_REFRESH_TASK is None:
                         _SCREEN_REFRESH_TASK = asyncio.create_task(_refresh_screen_cache_async())
@@ -9394,109 +9401,80 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # No cache yet -> only now we do the heavy scan (one at a time)
+    # ---------------------------------------------------------
+    # 2) NO CACHE YET — DO A REAL SCAN (one-at-a-time, protected)
+    # ---------------------------------------------------------
     if SCAN_LOCK.locked():
         await update.message.reply_text("⏳ Scan is running… please try /screen again in a moment.")
         return
 
     await SCAN_LOCK.acquire()
+    status_msg = None
     try:
         status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
-
         reset_reject_tracker()
 
-        best_fut = await to_thread_heavy(fetch_futures_tickers)
-        if not best_fut:
-            await status_msg.edit_text("❌ Failed to fetch futures data.")
+        # Hard timeouts so /screen cannot hang forever
+        try:
+            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            try:
+                await status_msg.edit_text("⏱️ /screen timed out while fetching market data. Try again.")
+            except Exception:
+                await update.message.reply_text("⏱️ /screen timed out while fetching market data. Try again.")
             return
 
-        # Header (always fresh)
-        uid = update.effective_user.id
+        if not best_fut:
+            try:
+                await status_msg.edit_text("❌ Failed to fetch futures data.")
+            except Exception:
+                await update.message.reply_text("❌ Failed to fetch futures data.")
+            return
+
+        # Fresh header
         user = get_user(uid)
         now_utc = datetime.now(timezone.utc)
-        session = _guess_session_name_utc(now_utc)  # engine session (falls back to NY in gap)
+        session = _guess_session_name_utc(now_utc)
         session_disp = (_session_label_utc(now_utc) or "NONE")
         loc_label, loc_time = user_location_and_time(user)
-
         header = (
             f"*PulseFutures — Market Scan*\n"
             f"{HDR}\n"
             f"*Session:* `{session_disp}` | *{loc_label}:* `{loc_time}`\n"
         )
 
-        now_ts = time.time()
-
-        # ------------- FAST PATH (cache hit) -------------
-        cached_body = ""
-        cached_kb = []
-        if (_SCREEN_CACHE.get("body") and (now_ts - float(_SCREEN_CACHE.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
-            cached_body = str(_SCREEN_CACHE.get("body") or "")
-            cached_kb = list(_SCREEN_CACHE.get("kb") or [])
-
-            msg = (header + "\n" + cached_body).strip()
-
-            keyboard = []  # TradingView buttons disabled
-
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-
-            await send_long_message(
-                update,
-                msg,
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True,
-                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
-            )
-            return
-
-        # ------------- SLOW PATH (build once under lock) -------------
+        # Build under screen lock so we don't spam heavy builds
         async with _SCREEN_LOCK:
-            # Re-check cache after waiting for lock (another request may have filled it)
             now_ts = time.time()
             if (_SCREEN_CACHE.get("body") and (now_ts - float(_SCREEN_CACHE.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
-                cached_body = str(_SCREEN_CACHE.get("body") or "")
-                cached_kb = list(_SCREEN_CACHE.get("kb") or [])
-
-                msg = (header + "\n" + cached_body).strip()
-                keyboard = []  # TradingView buttons disabled
-
+                body = str(_SCREEN_CACHE.get("body") or "")
+                kb = list(_SCREEN_CACHE.get("kb") or [])
+            else:
                 try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
+                    body, kb = await _to_thread_with_timeout(
+                        _build_screen_body_and_kb,
+                        SCREEN_BUILD_TIMEOUT_SEC,
+                        best_fut,
+                        session,
+                        int(uid),
+                    )
+                except asyncio.TimeoutError:
+                    try:
+                        await status_msg.edit_text("⏱️ /screen timed out while building results. Try again.")
+                    except Exception:
+                        await update.message.reply_text("⏱️ /screen timed out while building results. Try again.")
+                    return
 
-                await send_long_message(
-                    update,
-                    msg,
-                    parse_mode=ParseMode.MARKDOWN,
-                    disable_web_page_preview=True,
-                    reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
-                )
-                return
+                _SCREEN_CACHE["ts"] = time.time()
+                _SCREEN_CACHE["body"] = body
+                _SCREEN_CACHE["kb"] = list(kb or [])
 
-
-            # Heavy build MUST NOT run on the asyncio event loop.
-            # Only /screen is allowed to take longer; everything here runs in a worker thread.
-            body, kb = await to_thread_heavy(_build_screen_body_and_kb,
-                best_fut,
-                session,
-                int(update.effective_user.id),
-            )
-
-            # Cache for fast subsequent /screen calls
-            _SCREEN_CACHE["ts"] = time.time()
-            _SCREEN_CACHE["body"] = body
-            _SCREEN_CACHE["kb"] = list(kb or [])
-
-
-        # Send final
         msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
         keyboard = []  # TradingView buttons disabled
 
         try:
-            await status_msg.delete()
+            if status_msg:
+                await status_msg.delete()
         except Exception:
             pass
 
@@ -9511,21 +9489,21 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("screen_cmd failed")
         try:
-            await update.message.reply_text(f"❌ /screen failed: {e}")
+            if status_msg:
+                await status_msg.edit_text(f"❌ /screen failed: {e}")
+            else:
+                await update.message.reply_text(f"❌ /screen failed: {e}")
         except Exception:
             pass
-
-
-
-# =========================================================
-# TEXT ROUTER (Signal ID lookup)
-# =========================================================
     finally:
         try:
             if SCAN_LOCK.locked():
                 SCAN_LOCK.release()
         except Exception:
             pass
+# =========================================================
+# TEXT ROUTER (Signal ID lookup)
+# =========================================================
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10045,12 +10023,31 @@ async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
     """
     Runs send_email() in a worker thread with a hard timeout so SMTP/network stalls
     can't block the Telegram event loop (Render lag fix).
+
+    IMPORTANT: if send_email() raises, capture the real exception into _LAST_SMTP_ERROR
+    so /email_test shows the actual reason (not "unknown_error").
     """
+    uid = None
+    try:
+        uid = kwargs.get("user_id_for_debug", None)
+    except Exception:
+        uid = None
+
     try:
         return bool(await _to_thread_with_timeout(send_email, timeout_sec, *args, **kwargs))
     except asyncio.TimeoutError:
+        if uid is not None:
+            try:
+                _LAST_SMTP_ERROR[int(uid)] = "timeout_sending_email"
+            except Exception:
+                pass
         return False
-    except Exception:
+    except Exception as e:
+        if uid is not None:
+            try:
+                _LAST_SMTP_ERROR[int(uid)] = f"{type(e).__name__}: {e}"
+            except Exception:
+                pass
         return False
 
 async def _alert_job_inner():
