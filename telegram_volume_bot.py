@@ -9311,6 +9311,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
     kb = []  # TradingView buttons disabled for /screen
     return body, kb
+    
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/screen — allowed to take longer, but must never hang or go silent."""
     uid = update.effective_user.id
@@ -9377,6 +9378,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
 
                     best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
+
                     if best_fut:
                         now_utc2 = datetime.now(timezone.utc)
                         session2 = _guess_session_name_utc(now_utc2)
@@ -9426,15 +9428,15 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
         reset_reject_tracker()
 
-        # Hard timeouts so /screen cannot hang forever
-        try:
-                    # /screen must use LIVE tickers (bypass in-memory TTL cache)
+        # /screen must use LIVE tickers (bypass in-memory TTL cache)
         try:
             _CACHE.pop("tickers_best_fut", None)
         except Exception:
             pass
 
-best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
+        # Hard timeouts so /screen cannot hang forever
+        try:
+            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
         except asyncio.TimeoutError:
             try:
                 await status_msg.edit_text("⏱️ /screen timed out while fetching market data. Try again.")
@@ -9464,7 +9466,10 @@ best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIM
         # Build under screen lock so we don't spam heavy builds
         async with _SCREEN_LOCK:
             now_ts = time.time()
-            if (_SCREEN_CACHE.get("body") and (now_ts - float(_SCREEN_CACHE.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
+            if (
+                _SCREEN_CACHE.get("body")
+                and (now_ts - float(_SCREEN_CACHE.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))
+            ):
                 body = str(_SCREEN_CACHE.get("body") or "")
                 kb = list(_SCREEN_CACHE.get("kb") or [])
             else:
@@ -9519,6 +9524,9 @@ best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIM
                 SCAN_LOCK.release()
         except Exception:
             pass
+
+
+    
 # =========================================================
 # TEXT ROUTER (Signal ID lookup)
 # =========================================================
