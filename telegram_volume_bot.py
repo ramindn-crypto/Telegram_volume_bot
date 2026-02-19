@@ -852,6 +852,12 @@ EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
 EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 
+# ---------------- SCREEN CONFIG ----------------
+SCREEN_FETCH_TIMEOUT_SEC = 25
+SCREEN_BUILD_TIMEOUT_SEC = 30
+SCREEN_MAX_CACHE_AGE_SEC = 120
+
+
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
 TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFuturesBot").strip()
 
