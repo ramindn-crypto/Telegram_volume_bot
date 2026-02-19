@@ -102,6 +102,30 @@ from telegram.ext import (
     ApplicationHandlerStop,
 )
 
+# =========================================================
+# PERFORMANCE: Dedicated thread pools (prevents lag spikes)
+# - FAST pool: tiny DB / access checks
+# - HEAVY pool: market scans, signal building, email job work
+# This prevents long scans from starving quick commands like /start, /status, /size.
+# =========================================================
+from concurrent.futures import ThreadPoolExecutor
+import functools as _functools
+
+_FAST_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("FAST_EXECUTOR_WORKERS", "8")))
+_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "2")))
+
+async def _run_in_executor(executor, fn, *args, timeout: int | None = None, **kwargs):
+    loop = asyncio.get_running_loop()
+    call = _functools.partial(fn, *args, **kwargs)
+    fut = loop.run_in_executor(executor, call)
+    return await asyncio.wait_for(fut, timeout=timeout) if timeout else await fut
+
+async def to_thread_fast(fn, *args, timeout: int | None = None, **kwargs):
+    return await _run_in_executor(_FAST_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
+
+async def to_thread_heavy(fn, *args, timeout: int | None = None, **kwargs):
+    return await _run_in_executor(_HEAVY_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
+
 
 import re
 import sqlite3
@@ -499,7 +523,7 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 access_ok = bool(ent.get("access_ok", False))
                 is_pro = bool(ent.get("is_pro", False))
             else:
-                access_ok = await asyncio.to_thread(enforce_access_or_block, update, cmd)
+                access_ok = await to_thread_fast(enforce_access_or_block, update, cmd)
                 # Only compute pro flag if needed later; but cheap enough to cache now
                 try:
                     is_pro = bool(user_has_pro(uid))
@@ -8678,7 +8702,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         mv = (best_fut or {}).get(base)
         if not mv:
             continue
-        r = await asyncio.to_thread(trend_watch_for_symbol, base, mv, session_name)
+        r = await to_thread_heavy(trend_watch_for_symbol, base, mv, session_name)
         if r:
             trend_watch.append(r)
             trend_bases.append(base)
@@ -8821,8 +8845,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     spike_candidates = []
     if mode == "screen":
         try:
-            spike_candidates = await asyncio.to_thread(
-                _spike_reversal_candidates,
+            spike_candidates = await to_thread_heavy(_spike_reversal_candidates,
                 universe_best,
                 10_000_000.0,  # min_vol_usd
                 0.55,          # wick_ratio_min
@@ -8838,8 +8861,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     spike_warnings = []
     if mode == "screen":
         try:
-            spike_warnings = await asyncio.to_thread(
-                _spike_reversal_warnings,
+            spike_warnings = await to_thread_heavy(_spike_reversal_warnings,
                 universe_best,
                 10_000_000.0,  # min_vol_usd
                 1.15,          # atr_mult_min
@@ -8949,13 +8971,12 @@ async def _refresh_screen_cache_async():
     """Refreshes _SCREEN_CACHE in the background (best effort)."""
     global _SCREEN_REFRESH_TASK
     try:
-        best_fut = await asyncio.to_thread(fetch_futures_tickers)
+        best_fut = await to_thread_heavy(fetch_futures_tickers)
         if not best_fut:
             return
         now_utc = datetime.now(timezone.utc)
         session = _guess_session_name_utc(now_utc)
-        body, kb = await asyncio.to_thread(
-            _build_screen_body_and_kb,
+        body, kb = await to_thread_heavy(_build_screen_body_and_kb,
             best_fut,
             session,
             0,
@@ -9344,7 +9365,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         reset_reject_tracker()
 
-        best_fut = await asyncio.to_thread(fetch_futures_tickers)
+        best_fut = await to_thread_heavy(fetch_futures_tickers)
         if not best_fut:
             await status_msg.edit_text("❌ Failed to fetch futures data.")
             return
@@ -9418,8 +9439,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Heavy build MUST NOT run on the asyncio event loop.
             # Only /screen is allowed to take longer; everything here runs in a worker thread.
-            body, kb = await asyncio.to_thread(
-                _build_screen_body_and_kb,
+            body, kb = await to_thread_heavy(_build_screen_body_and_kb,
                 best_fut,
                 session,
                 int(update.effective_user.id),
@@ -9978,7 +9998,8 @@ _SMTP_CONN_TS = 0.0        # last-used timestamp
 
 
 async def _to_thread_with_timeout(fn, timeout_sec: int, *args, **kwargs):
-    return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout_sec)
+    # Use HEAVY pool: prevents starving FAST command checks
+    return await to_thread_heavy(fn, *args, timeout=timeout_sec, **kwargs)
 
 async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
     """
@@ -10242,7 +10263,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         setups_by_session: Dict[str, List[Setup]] = {}
         for sess_name in ["NY", "LON", "ASIA"]:
             try:
-                pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
+                pool = await asyncio.wait_for(to_thread_heavy(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
             except asyncio.TimeoutError:
                 pool = {"setups": []}
             except Exception:
@@ -10586,7 +10607,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             # Send ONE email containing MULTIPLE setups (timeout-protected)
             try:
                 ok = await asyncio.wait_for(
-                    asyncio.to_thread(send_email_alert_multi, user, sess, chosen_list, best_fut),
+                    to_thread_heavy(send_email_alert_multi, user, sess, chosen_list, best_fut),
                     timeout=EMAIL_SEND_TIMEOUT_SEC,
                 )
             except asyncio.TimeoutError:
@@ -10709,7 +10730,7 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tickers_n = 0
     t0 = time.time()
     try:
-        best = await asyncio.to_thread(fetch_futures_tickers)
+        best = await to_thread_heavy(fetch_futures_tickers)
         tickers_n = len(best or {})
     except Exception as e:
         ex_ok = False
