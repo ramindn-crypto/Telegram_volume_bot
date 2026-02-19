@@ -8954,7 +8954,7 @@ def user_location_and_time(user: dict):
 # =========================================================
 # /screen fast cache (per-instance)
 # =========================================================
-SCREEN_CACHE_TTL_SEC = 20  # seconds
+SCREEN_CACHE_TTL_SEC = 60  # seconds (minimum refresh interval target)
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 
 # ✅ FIX: missing timeouts used by /screen
@@ -8966,6 +8966,35 @@ _SCREEN_CACHE = {
     "body": "",
     "kb": [],
 }
+
+# Per-user last /screen signature so we can tell users when results are unchanged.
+_LAST_SCREEN_SIG = {}  # uid -> (sig:str, ts:float)
+
+def _screen_sig(text: str) -> str:
+    try:
+        import hashlib
+        return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12]
+    except Exception:
+        return str(len(text or ""))
+
+async def _screen_countdown(status_msg, total_sec: int = 40, step_sec: int = 5):
+    """Best-effort countdown edits while /screen is running (does not block)."""
+    try:
+        remaining = int(total_sec)
+        while remaining > 0:
+            await asyncio.sleep(step_sec)
+            remaining -= int(step_sec)
+            if remaining < 0:
+                remaining = 0
+            try:
+                await status_msg.edit_text(f"🔎 Scanning market… ~{remaining}s")
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+
 _SCREEN_LOCK = asyncio.Lock()
 
 # Background refresh task for /screen (keeps UX instant)
@@ -9356,10 +9385,29 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) INSTANT PATH (serve cache)
     # ----------------------------
     if cached_body:
-        msg = (header + "\n" + cached_body).strip()
         keyboard = []  # TradingView buttons disabled
 
         cache_age = (now_ts - ts)
+        next_refresh_in = max(0, int(float(SCREEN_CACHE_TTL_SEC) - cache_age))
+        refresh_running = (_SCREEN_REFRESH_TASK is not None)
+
+        # Signature for "unchanged" notice
+        sig = _screen_sig(cached_body)
+        prev_sig, _prev_ts = _LAST_SCREEN_SIG.get(uid, (None, 0.0))
+        unchanged = (prev_sig == sig)
+        _LAST_SCREEN_SIG[uid] = (sig, now_ts)
+
+        freshness_line = f"
+
+`Data age:` {int(cache_age)}s · `Next refresh:` {next_refresh_in}s"
+        if refresh_running:
+            freshness_line += " · `Refreshing:` yes"
+        if unchanged:
+            freshness_line += "
+_No change since your last /screen._"
+
+        msg = (header + "
+" + cached_body + freshness_line).strip()
 
         # Watchdog: if the background refresh got stuck, cancel it so we can refresh again.
         global _SCREEN_REFRESH_TASK, _SCREEN_REFRESH_TASK_STARTED_AT
@@ -9377,7 +9425,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Kick off a background refresh when cache is a bit old (keeps /screen instant)
         try:
-            if (_SCREEN_REFRESH_TASK is None) and (cache_age > 10):
+            if (_SCREEN_REFRESH_TASK is None) and (cache_age >= float(SCREEN_CACHE_TTL_SEC)):
                 _SCREEN_REFRESH_TASK = asyncio.create_task(_refresh_screen_cache_async())
         except Exception:
             pass
@@ -9433,8 +9481,10 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await SCAN_LOCK.acquire()
     status_msg = None
+    countdown_task = None
     try:
-        status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
+        status_msg = await update.message.reply_text("🔎 Scanning market… ~40s")
+        countdown_task = asyncio.create_task(_screen_countdown(status_msg, total_sec=40, step_sec=5))
         reset_reject_tracker()
 
         # /screen must use LIVE tickers (bypass in-memory TTL cache)
@@ -9501,8 +9551,27 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _SCREEN_CACHE["body"] = body
                 _SCREEN_CACHE["kb"] = list(kb or [])
 
-        msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
+        cached_body2 = str(_SCREEN_CACHE.get("body") or "").strip()
+        cache_age2 = max(0.0, time.time() - float(_SCREEN_CACHE.get("ts", 0.0) or 0.0))
+        sig2 = _screen_sig(cached_body2)
+        prev_sig2, _prev_ts2 = _LAST_SCREEN_SIG.get(uid, (None, 0.0))
+        unchanged2 = (prev_sig2 == sig2)
+        _LAST_SCREEN_SIG[uid] = (sig2, time.time())
+        freshness2 = f"
+
+`Data age:` {int(cache_age2)}s · `Next refresh:` {int(float(SCREEN_CACHE_TTL_SEC))}s"
+        if unchanged2:
+            freshness2 += "
+_No change since your last /screen._"
+        msg = (header + "
+" + cached_body2 + freshness2).strip()
         keyboard = []  # TradingView buttons disabled
+
+        try:
+            if countdown_task:
+                countdown_task.cancel()
+        except Exception:
+            pass
 
         try:
             if status_msg:
