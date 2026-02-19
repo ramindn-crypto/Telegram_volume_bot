@@ -9001,7 +9001,7 @@ async def _refresh_screen_cache_async():
         # Heavy build in thread + timeout
         body, kb = await asyncio.wait_for(
             to_thread_heavy(_build_screen_body_and_kb, best_fut, session, 0),
-            timeout=25
+            timeout=SCREEN_BUILD_TIMEOUT_SEC
         )
 
         _SCREEN_CACHE["ts"] = time.time()
@@ -9377,7 +9377,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Kick off a background refresh when cache is a bit old (keeps /screen instant)
         try:
-            if (_SCREEN_REFRESH_TASK is None) and (cache_age > 5):
+            if (_SCREEN_REFRESH_TASK is None) and (cache_age > 10):
                 _SCREEN_REFRESH_TASK = asyncio.create_task(_refresh_screen_cache_async())
         except Exception:
             pass
