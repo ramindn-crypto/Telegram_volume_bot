@@ -2065,7 +2065,7 @@ def enforce_access_or_block(update: Update, command: str) -> bool:
 
     user = get_user(uid)
 
-    if has_active_access(user, uid):
+    if has_active_access(uid, user):
         return True
 
     if command in ALLOWED_WHEN_LOCKED:
@@ -3166,7 +3166,7 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(user, uid):
+    if not has_active_access(uid, user):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -6934,7 +6934,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(user, uid):
+    if not has_active_access(uid, user):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -7042,7 +7042,7 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(user, uid):
+    if not has_active_access(uid, user):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -7247,7 +7247,7 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = reset_daily_if_needed(get_user(uid))
 
 
-    if not has_active_access(user, uid):
+    if not has_active_access(uid, user):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -7426,7 +7426,7 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(user, uid):
+    if not has_active_access(uid, user):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -7684,7 +7684,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
 
-    if not has_active_access(user, uid):
+    if not has_active_access(uid, user):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -7960,7 +7960,7 @@ async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
     
-    if not has_active_access(user, uid):
+    if not has_active_access(uid, user):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -8018,7 +8018,7 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(user, uid):
+    if not has_active_access(uid, user):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -8052,7 +8052,7 @@ async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(user, uid):
+    if not has_active_access(uid, user):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -8086,7 +8086,7 @@ async def signals_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(user, uid):
+    if not has_active_access(uid, user):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -8121,7 +8121,7 @@ async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(user, uid):
+    if not has_active_access(uid, user):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -8908,6 +8908,34 @@ _SCREEN_CACHE = {
 }
 _SCREEN_LOCK = asyncio.Lock()
 
+# Background refresh task for /screen (keeps UX instant)
+_SCREEN_REFRESH_TASK = None  # asyncio.Task
+
+async def _refresh_screen_cache_async():
+    """Refreshes _SCREEN_CACHE in the background (best effort)."""
+    global _SCREEN_REFRESH_TASK
+    try:
+        best_fut = await asyncio.to_thread(fetch_futures_tickers)
+        if not best_fut:
+            return
+        now_utc = datetime.now(timezone.utc)
+        session = _guess_session_name_utc(now_utc)
+        body, kb = await asyncio.to_thread(
+            _build_screen_body_and_kb,
+            best_fut,
+            session,
+            0,
+        )
+        _SCREEN_CACHE["ts"] = time.time()
+        _SCREEN_CACHE["body"] = body
+        _SCREEN_CACHE["kb"] = list(kb or [])
+    except Exception:
+        # never let background refresh crash the bot
+        return
+    finally:
+        _SCREEN_REFRESH_TASK = None
+
+
 
 # =========================================================
 # /screen
@@ -9230,7 +9258,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(user, uid):
+    if not has_active_access(uid, user):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -9238,14 +9266,58 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Avoid long scans blocking other commands on small instances
+        # Header (always fresh)
+    now_utc = datetime.now(timezone.utc)
+    session = _guess_session_name_utc(now_utc)  # engine session (falls back to NY in gap)
+    session_disp = (_session_label_utc(now_utc) or "NONE")
+    loc_label, loc_time = user_location_and_time(user)
+
+    header = (
+        f"*PulseFutures — Market Scan*\n"
+        f"{HDR}\n"
+        f"*Session:* `{session_disp}` | *{loc_label}:* `{loc_time}`\n"
+    )
+
+    now_ts = time.time()
+    ts = float(_SCREEN_CACHE.get("ts", 0.0) or 0.0)
+    cached_body = str(_SCREEN_CACHE.get("body") or "").strip()
+    cached_kb = list(_SCREEN_CACHE.get("kb") or [])
+
+    # ------------- INSTANT PATH (serve cache, even if stale) -------------
+    if cached_body:
+        msg = (header + "\n" + cached_body).strip()
+
+        keyboard = [
+            [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+            for (sym, sid) in (cached_kb or [])
+        ]
+
+        # If stale, kick off a background refresh and still reply instantly
+        if (now_ts - ts) > float(SCREEN_CACHE_TTL_SEC):
+            global _SCREEN_REFRESH_TASK
+            try:
+                if _SCREEN_REFRESH_TASK is None:
+                    _SCREEN_REFRESH_TASK = asyncio.create_task(_refresh_screen_cache_async())
+            except Exception:
+                pass
+            msg = (msg + "\n\n_Updating in background… run /screen again in ~10–20s for freshest results._").strip()
+
+        await send_long_message(
+            update,
+            msg,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+        )
+        return
+
+    # No cache yet -> only now we do the heavy scan (one at a time)
     if SCAN_LOCK.locked():
         await update.message.reply_text("⏳ Scan is running… please try /screen again in a moment.")
         return
 
     await SCAN_LOCK.acquire()
     try:
-        # Send immediate response (fast perceived UX)
         status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
 
         reset_reject_tracker()
@@ -10794,47 +10866,7 @@ def _set_user_access(user_id: int, plan: str, source: str, ref: str):
     )
 
 
-def has_active_access(user: dict, uid: Optional[int] = None) -> bool:
-    """Access rules:
-    - Admin: always allowed
-    - Trial: allowed for 7 days from first seen
-    - Paid plans (standard/pro): allowed (optionally with plan_expires if you set it)
-    - Free: LOCKED (after trial)
-    """
-    try:
-        if uid is not None and is_admin_user(int(uid)):
-            return True
-    except Exception:
-        pass
 
-    if not user:
-        return False
-
-    # Ensure trial is initialized / downgraded when needed
-    user = _ensure_trial_state(user, uid=uid)
-
-    now = time.time()
-    plan = str(user.get("plan") or "free").strip().lower()
-
-    if plan in ("standard", "pro"):
-        # If you use plan_expires, enforce it (0/None => no expiry)
-        try:
-            exp = float(user.get("plan_expires", 0) or 0.0)
-            if exp > 0 and now > exp:
-                update_user(int(user.get("user_id") or uid or 0), plan="free")
-                return False
-        except Exception:
-            pass
-        return True
-
-    if plan == "trial":
-        try:
-            return now <= float(user.get("trial_until", 0) or 0.0)
-        except Exception:
-            return False
-
-    # free = locked
-    return False
 
 def _usdt_payment_row_by_txid(txid: str):
     with _db() as con:
@@ -11119,11 +11151,12 @@ async def admin_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📊 USERS OVERVIEW\n"]
 
     for r in rows:
-        uid = r["user_id"]
-        tz = r.get("tz") or "UTC"
+        d = dict(r)
+        uid = int(d.get("user_id") or 0)
+        tz = str(d.get("tz") or "UTC")
 
         # Use effective plan logic
-        plan = str(effective_plan(uid, dict(r))).upper()
+        plan = str(effective_plan(uid, d)).upper()
 
         # Remaining days
         days_left = "-"
@@ -11424,160 +11457,3 @@ def main():
         logger.error("Another instance is polling. Sleeping forever.")
         while True:
             time.sleep(3600)
-
-
-
-# ===============================
-# TRIAL + STATUS (ADDED)
-# ===============================
-
-TRIAL_DAYS = 7
-
-def _ensure_trial(user):
-    if not user:
-        return
-    if user.get("plan"):
-        return
-    start = user.get("trial_start_ts")
-    now = time.time()
-    if not start:
-        update_user(user["user_id"], plan="trial", trial_start_ts=now, trial_until=now + TRIAL_DAYS*86400)
-    elif now <= float(user.get("trial_until", 0)):
-        update_user(user["user_id"], plan="trial")
-    else:
-        update_user(user["user_id"], plan="standard")
-
-def user_has_pro(uid: int) -> bool:
-    # Admin is always Pro/Unlimited
-    try:
-        if is_admin_user(int(uid)):
-            return True
-    except Exception:
-        pass
-
-    u = get_user(uid)
-    if not u:
-        return False
-
-    _ensure_trial(u)
-
-    # Use effective plan (covers legacy DBs + admin override)
-    try:
-        plan = str(effective_plan(u, int(uid))).strip().lower()
-    except Exception:
-        plan = str(u.get("plan") or "free").strip().lower()
-
-    if plan == "pro":
-        return True
-    if plan == "trial" and time.time() <= float(u.get("trial_until", 0) or 0):
-        return True
-    return False
-    _ensure_trial(u)
-    if u.get("plan") == "pro":
-        return True
-    if u.get("plan") == "trial" and time.time() <= float(u.get("trial_until", 0)):
-        return True
-    return False
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user = reset_daily_if_needed(get_user(uid))
-
-    if not has_active_access(user, uid):
-        await update.message.reply_text(
-            "⛔️ Trial finished.\n\n"
-            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
-            "👉 /billing"
-        )
-        return
-
-    opens = db_open_trades(uid)
-    # Plan + remaining days (trial/standard/pro)
-    plan_eff = str(effective_plan(uid, user) or "free").strip().lower()
-    plan = plan_eff.upper()
-    now_ts = time.time()
-    days_left = 0
-    try:
-        if plan_eff == "trial":
-            until = float((user or {}).get("trial_until") or 0.0)
-        elif plan_eff in ("standard", "pro"):
-            until = float((user or {}).get("plan_expires") or 0.0)
-        else:
-            until = 0.0
-        if until and until > now_ts:
-            # ceiling((until-now)/86400) without math
-            days_left = int((until - now_ts + 86399) // 86400)
-        else:
-            days_left = 0
-    except Exception:
-        days_left = 0
-    equity = float((user or {}).get("equity") or 0.0)
-
-    cap = daily_cap_usd(user)
-    day_local = _user_day_local(user)
-    pnl_today = _pnl_today_closed_trades(uid, user)
-    used_today = _risk_used_total_today(uid, user)
-    remaining_today = (cap - used_today) if cap > 0 else float("inf")
-
-    enabled = user_enabled_sessions(user)
-    now_s = in_session_now(user)
-    now_txt = now_s["name"] if now_s else "NONE"
-
-    # Email caps (show infinite as 0=∞ to match UI)
-    cap_sess = int((user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION) or DEFAULT_MAX_EMAILS_PER_SESSION)
-    cap_day = int((user or {}).get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY) or DEFAULT_MAX_EMAILS_PER_DAY)
-    gap_m = int((user or {}).get("email_gap_min", DEFAULT_EMAIL_GAP_MIN) or DEFAULT_EMAIL_GAP_MIN)
-
-    # Big-move status
-    bm_on = int((user or {}).get("bigmove_alert_on", 1) or 0)
-    bm_4h = float((user or {}).get("bigmove_alert_4h", 20) or 20)
-    bm_1h = float((user or {}).get("bigmove_alert_1h", 10) or 10)
-
-    lines = []
-    lines.append("📌 Status")
-    lines.append(HDR)
-    if is_admin_user(uid):
-        lines.append(f"Plan: {plan} (unlimited)")
-    else:
-        lines.append(f"Plan: {plan} ({days_left}d left)")
-    lines.append(f"Equity: ${equity:.2f}")
-    lines.append(f"PnL today: ${pnl_today:+.2f}")
-    lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
-    lines.append(f"Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f} (used by /size)")
-    lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
-    lines.append(f"Daily risk used: ${used_today:.2f}")
-    lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
-    lines.append(HDR)
-    lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
-    lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
-    cur_s = (user.get("trade_window_start") or "").strip()
-    cur_e = (user.get("trade_window_end") or "").strip()
-    tw_txt = "OFF" if (not cur_s or not cur_e) else f"{cur_s} → {cur_e} (local)"
-    lines.append(f"Trade window: {tw_txt}")
-    lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
-    lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
-    lines.append(HDR)
-
-    if not opens:
-        lines.append("Open trades: None")
-        await update.message.reply_text("\n".join(lines))
-        return
-
-    lines.append("Open trades:")
-    for t in opens:
-        try:
-            entry = float(t.get("entry") or 0.0)
-            sl = float(t.get("sl") or 0.0)
-            qty = float(t.get("qty") or 0.0)
-            risk = float(t.get("risk_usd") or 0.0)
-            lines.append(
-                f"- ID {t.get('id')} | {t.get('symbol')} {t.get('side')} | "
-                f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g}"
-            )
-        except Exception:
-            continue
-
-    await update.message.reply_text("\n".join(lines))
-
-if __name__ == "__main__":
-    main()
