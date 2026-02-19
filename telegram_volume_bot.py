@@ -9013,16 +9013,19 @@ async def _refresh_screen_cache_async():
     try:
         reset_reject_tracker()
 
-        # Force live tickers for refresh
+        # Force live tickers
         try:
             _CACHE.pop("tickers_best_fut", None)
         except Exception:
             pass
 
-        best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
+        best_fut = await _to_thread_with_timeout(
+            fetch_futures_tickers,
+            SCREEN_FETCH_TIMEOUT_SEC
+        )
 
         if not best_fut:
-            return  # keep old cache; just exit gracefully
+            return  # keep old cache, exit cleanly
 
         now_utc = datetime.now(timezone.utc)
         session = _guess_session_name_utc(now_utc)
@@ -9032,20 +9035,23 @@ async def _refresh_screen_cache_async():
             SCREEN_BUILD_TIMEOUT_SEC,
             best_fut,
             session,
-            int(0),  # uid not needed for global cache build; keep int
+            0  # no user-specific logic for cache build
         )
 
-        # Commit cache ONLY if we built successfully
+        # Only update cache if build succeeded
         _SCREEN_CACHE["ts"] = time.time()
         _SCREEN_CACHE["body"] = str(body or "")
         _SCREEN_CACHE["kb"] = list(kb or [])
 
     except asyncio.TimeoutError:
-        # refresh timed out; do not modify cache
-        pass
+        # Timed out refresh — do not modify cache
+        logger.warning("Background /screen refresh timed out")
+
     except Exception:
-        logger.exception("background /screen refresh failed")
+        logger.exception("Background /screen refresh failed")
+
     finally:
+        # ALWAYS clear refresh state
         _SCREEN_CACHE["refreshing"] = False
         _SCREEN_REFRESH_TASK = None
         _SCREEN_REFRESH_TASK_STARTED_AT = 0.0
