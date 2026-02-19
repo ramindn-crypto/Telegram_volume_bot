@@ -8958,8 +8958,8 @@ SCREEN_CACHE_TTL_SEC = 20  # seconds
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 
 # ✅ FIX: missing timeouts used by /screen
-SCREEN_FETCH_TIMEOUT_SEC = 25   # timeout for fetching futures tickers
-SCREEN_BUILD_TIMEOUT_SEC = 25   # timeout for building screen body
+SCREEN_FETCH_TIMEOUT_SEC = 35   # timeout for fetching futures tickers (network can be slow)
+SCREEN_BUILD_TIMEOUT_SEC = 70   # timeout for building screen body (can take longer on Render)
 
 _SCREEN_CACHE = {
     "ts": 0.0,
@@ -8972,7 +8972,7 @@ _SCREEN_LOCK = asyncio.Lock()
 _SCREEN_REFRESH_TASK = None  # asyncio.Task
 _SCREEN_REFRESH_TASK_STARTED_AT = 0.0
 _SCREEN_FORCE_SYNC_AFTER_SEC = 120  # if cache older than this, do a synchronous refresh
-_SCREEN_REFRESH_MAX_RUNTIME_SEC = 35  # watchdog for stuck background refresh
+_SCREEN_REFRESH_MAX_RUNTIME_SEC = 90  # watchdog for stuck background refresh
 
 async def _refresh_screen_cache_async():
     """Refreshes _SCREEN_CACHE in the background (best effort).
@@ -8991,7 +8991,7 @@ async def _refresh_screen_cache_async():
         except Exception:
             pass
 
-        best_fut = await asyncio.wait_for(to_thread_heavy(fetch_futures_tickers), timeout=25)
+        best_fut = await asyncio.wait_for(to_thread_heavy(fetch_futures_tickers), timeout=SCREEN_FETCH_TIMEOUT_SEC)
         if not best_fut:
             return
 
@@ -9394,14 +9394,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
-                # ✅ Force fresh candles too (otherwise /screen can repeat same output)
-                try:
-                    for k in list(_CACHE.keys()):
-                        if str(k).startswith("ohlcv:"):
-                            _CACHE.pop(k, None)
-                except Exception:
-                    pass
-
                 best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
 
                 if best_fut:
@@ -9448,14 +9440,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # /screen must use LIVE tickers (bypass in-memory TTL cache)
         try:
             _CACHE.pop("tickers_best_fut", None)
-        except Exception:
-            pass
-
-        # ✅ Force fresh candles for /screen
-        try:
-            for k in list(_CACHE.keys()):
-                if str(k).startswith("ohlcv:"):
-                    _CACHE.pop(k, None)
         except Exception:
             pass
 
