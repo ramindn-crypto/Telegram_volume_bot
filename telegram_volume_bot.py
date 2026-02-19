@@ -8948,6 +8948,11 @@ def user_location_and_time(user: dict):
 # =========================================================
 SCREEN_CACHE_TTL_SEC = 20  # seconds
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
+
+# ✅ FIX: missing timeouts used by /screen
+SCREEN_FETCH_TIMEOUT_SEC = 25   # timeout for fetching futures tickers
+SCREEN_BUILD_TIMEOUT_SEC = 25   # timeout for building screen body
+
 _SCREEN_CACHE = {
     "ts": 0.0,
     "body": "",
