@@ -5945,19 +5945,14 @@ Not financial advice.
 • View your own plan status (admins too)
 
 ────────────────────
-💳 PAYMENTS (USDT)
+💳 PAYMENTS
 ────────────────────
+/payment_approve <user_id> <payment_id> <standard|pro>
+• Approve a payment received (Stripe or USDT) and grant access
+
 /admin_payments
-• View payments ledger
-
-/usdt_pending
-• Show pending USDT requests
-
-/usdt_approve <TXID>
-• Approve payment (grants access + writes ledger)
-
-/usdt_reject <TXID> <reason>
-• Reject payment
+• Show all users: User ID / Last Payment Approval / Plan
+  (Plan comes from /admin_grant)
 
 ────────────────────
 ⏱️ COOLDOWNS
@@ -11273,6 +11268,64 @@ async def admin_grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+
+async def payment_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only: approve a payment (Stripe or USDT) and grant access.
+    Usage: /payment_approve <user_id> <payment_id> <standard|pro>
+    """
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args or len(context.args) < 3:
+        await update.message.reply_text("Usage: /payment_approve <user_id> <payment_id> <standard|pro>")
+        return
+
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("❌ user_id must be a number.")
+        return
+
+    payment_id = str(context.args[1]).strip()
+    plan = str(context.args[2]).strip().lower()
+
+    if not payment_id:
+        await update.message.reply_text("❌ payment_id cannot be empty.")
+        return
+
+    if plan not in ("standard", "pro"):
+        await update.message.reply_text("❌ Plan must be: standard or pro")
+        return
+
+    # 1) Write payments ledger (single source of truth for approvals)
+    try:
+        _ledger_add(uid, "payment_approve", payment_id, plan, 0.0, "", "paid")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to write payment ledger: {e}")
+        return
+
+    # 2) Grant access (sync plan + access metadata)
+    _set_user_access(uid, plan, "payment_approve", payment_id)
+
+    # 3) Prevent trial logic from overwriting the plan
+    try:
+        update_user(uid, trial_until=0.0, trial_start_ts=0.0)
+    except Exception:
+        pass
+
+    user = get_user(uid) or {"plan": plan}
+
+    await update.message.reply_text(
+        "✅ Payment approved + access granted\n"
+        f"User: {uid}\n"
+        f"Plan: {str(user.get('plan') or plan).strip()}\n"
+        f"Payment ID: {payment_id}\n"
+        "Tip: /admin_user <user_id> to confirm."
+    )
+
+
 async def admin_revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         await update.message.reply_text("❌ Admin only.")
@@ -11288,30 +11341,59 @@ async def admin_payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not _is_admin(update):
         await update.message.reply_text("❌ Admin only.")
         return
-    n = 20
+
+    limit_n = 50
     if context.args and context.args[0].isdigit():
-        n = max(1, min(50, int(context.args[0])))
+        limit_n = max(1, min(200, int(context.args[0])))
 
     with _db() as con:
         con.row_factory = sqlite3.Row
         cur = con.cursor()
-        cur.execute("""
-            SELECT user_id, source, plan, amount, currency, status, ref, created_ts
-            FROM payments_ledger
-            ORDER BY created_ts DESC
+
+        # For each user, pull latest PAID ledger entry (approval) + current plan (from /admin_grant or access engine)
+        cur.execute(f"""
+            SELECT
+                u.user_id AS user_id,
+                COALESCE(NULLIF(TRIM(u.plan),''), 'standard') AS plan,
+                (
+                    SELECT p.created_ts
+                    FROM payments_ledger p
+                    WHERE p.user_id = u.user_id AND p.status = 'paid'
+                    ORDER BY p.created_ts DESC
+                    LIMIT 1
+                ) AS last_paid_ts,
+                (
+                    SELECT p.ref
+                    FROM payments_ledger p
+                    WHERE p.user_id = u.user_id AND p.status = 'paid'
+                    ORDER BY p.created_ts DESC
+                    LIMIT 1
+                ) AS last_payment_id
+            FROM users u
+            ORDER BY COALESCE(last_paid_ts, 0) DESC
             LIMIT ?
-        """, (n,))
+        """, (limit_n,))
         rows = cur.fetchall()
 
     if not rows:
-        await update.message.reply_text("No payments in ledger.")
+        await update.message.reply_text("No users found.")
         return
 
-    lines = [f"Latest payments (max {n}):"]
+    lines = []
+    lines.append(f"💳 Admin Payments (showing up to {limit_n} users)")
+    lines.append("User ID | Last Payment Approval (UTC) | Payment ID | Plan")
+    lines.append("────────────────────────────────────────────────────────")
+
     for r in rows:
-        ts = datetime.utcfromtimestamp(r["created_ts"]).isoformat() + "Z"
-        lines.append(f"- {ts} | uid={r['user_id']} | {r['source']} | {r['plan']} | {r['amount']} {r['currency']} | {r['status']} | {r['ref']}")
+        uid = int(r["user_id"])
+        plan = str(r["plan"] or "standard").strip()
+        ts = float(r["last_paid_ts"] or 0)
+        pay_id = str(r["last_payment_id"] or "").strip() or "-"
+        ts_txt = datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts else "n/a"
+        lines.append(f"{uid} | {ts_txt} | {pay_id} | {plan}")
+
     await update.message.reply_text("\n".join(lines))
+
 
 async def manage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -11422,9 +11504,6 @@ def main():
     # ================= USDT (semi-auto) =================
     app.add_handler(CommandHandler("usdt", usdt_info_cmd))
     app.add_handler(CommandHandler("usdt_paid", usdt_paid_cmd))
-    app.add_handler(CommandHandler("usdt_pending", usdt_pending_cmd))
-    app.add_handler(CommandHandler("usdt_approve", usdt_approve_cmd))
-    app.add_handler(CommandHandler("usdt_reject", usdt_reject_cmd))
     
     # ================= Admin: access & payments =================
     
@@ -11480,3 +11559,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    app.add_handler(CommandHandler("payment_approve", payment_approve_cmd))
