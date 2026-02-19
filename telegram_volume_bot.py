@@ -407,7 +407,9 @@ async def _reply_subscribe_required(update: Update, context: ContextTypes.DEFAUL
         pass
 
 async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Global guard: locks access after trial + gates Pro-only commands."""
+    """Global guard: locks access after trial + gates Pro-only commands.
+    Optimized: cache access/pro checks so ALL commands feel instant (except /screen can still be heavier downstream).
+    """
     try:
         if not getattr(update, "message", None):
             return
@@ -418,13 +420,28 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cmd = txt.split()[0][1:].split("@")[0].strip().lower()
 
+        # --- STATIC (function-local) caches to reduce DB hits / lag ---
+        # Cache entries: { uid: {"ts": float, "access_ok": bool, "is_pro": bool} }
+        if not hasattr(_command_guard, "_cache"):
+            _command_guard._cache = {}
+        _cache = _command_guard._cache
+
+        # Cache TTL (seconds). Keep short so plan changes propagate quickly.
+        CACHE_TTL = 8.0
+
+        # Commands that should always work even if user is locked (no access check)
+        ACCESS_EXEMPT = {"start", "help", "commands", "billing", "guide_full"}
+
+        # Commands that should force a fresh access check (never use cache)
+        # (/screen is the only one you said can be slow; we keep it strict/fresh here)
+        FORCE_FRESH = {"screen"}
+
         # 0) Channel subscription gate (optional)
         if REQUIRED_CHANNEL:
-            ok = await _is_user_subscribed(
-                context.bot, int(update.effective_user.id)
-            )
+            ok = await _is_user_subscribed(context.bot, int(update.effective_user.id))
             if not ok:
-                if cmd not in {"start", "help", "commands", "billing", "guide_full"}:
+                # Keep same behavior as your original code
+                if cmd not in ACCESS_EXEMPT:
                     await _reply_subscribe_required(update, context)
                     raise ApplicationHandlerStop
 
@@ -432,14 +449,32 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await _reply_subscribe_required(update, context)
                     raise ApplicationHandlerStop
 
-        # 1) Trial/access lock
-        if not enforce_access_or_block(update, cmd):
-            raise ApplicationHandlerStop
+        # 1) Trial/access lock (optimized)
+        if cmd not in ACCESS_EXEMPT:
+            uid = int(update.effective_user.id)
 
-        # 2) Pro-only commands
-        if cmd in PRO_ONLY_COMMANDS:
-            uid = update.effective_user.id
-            if not user_has_pro(uid):
+            now = time.time()
+            ent = _cache.get(uid)
+            use_cache = bool(ent) and (now - float(ent.get("ts", 0.0))) < CACHE_TTL and (cmd not in FORCE_FRESH)
+
+            if use_cache:
+                access_ok = bool(ent.get("access_ok", False))
+                is_pro = bool(ent.get("is_pro", False))
+            else:
+                access_ok = bool(enforce_access_or_block(update, cmd))
+                # Only compute pro flag if needed later; but cheap enough to cache now
+                try:
+                    is_pro = bool(user_has_pro(uid))
+                except Exception:
+                    is_pro = False
+
+                _cache[uid] = {"ts": now, "access_ok": access_ok, "is_pro": is_pro}
+
+            if not access_ok:
+                raise ApplicationHandlerStop
+
+            # 2) Pro-only commands (use cached pro flag)
+            if cmd in PRO_ONLY_COMMANDS and not is_pro:
                 try:
                     await update.message.reply_text(
                         "🚀 Pro feature.\n\n"
@@ -455,6 +490,7 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raise
     except Exception:
         return
+
 
 def render_primary_only() -> None:
     """
@@ -10758,46 +10794,6 @@ def _set_user_access(user_id: int, plan: str, source: str, ref: str):
     )
 
 
-def _ensure_trial_state(user: dict, uid: Optional[int] = None) -> dict:
-    """Ensure the user has a 7-day trial recorded, and downgrade to free (locked) when expired."""
-    try:
-        if uid is not None and is_admin_user(int(uid)):
-            return user
-    except Exception:
-        pass
-
-    if not user:
-        return user
-
-    now = time.time()
-    plan = str(user.get("plan") or "free").strip().lower()
-    trial_until = float(user.get("trial_until", 0) or 0.0)
-    trial_start = float(user.get("trial_start_ts", 0) or 0.0)
-
-    # Initialize trial if user has never had one
-    if trial_until <= 0:
-        trial_start = now
-        trial_until = now + (7 * 86400)
-        update_user(int(user.get("user_id") or uid or 0), plan="trial", trial_start_ts=trial_start, trial_until=trial_until)
-        user["plan"] = "trial"
-        user["trial_start_ts"] = trial_start
-        user["trial_until"] = trial_until
-        return user
-
-    # Keep trial active while inside the window
-    if now <= trial_until:
-        if plan != "trial":
-            update_user(int(user.get("user_id") or uid or 0), plan="trial")
-            user["plan"] = "trial"
-        return user
-
-    # Trial expired => lock user (free = locked)
-    if plan != "free":
-        update_user(int(user.get("user_id") or uid or 0), plan="free")
-        user["plan"] = "free"
-    return user
-
-
 def has_active_access(user: dict, uid: Optional[int] = None) -> bool:
     """Access rules:
     - Admin: always allowed
@@ -11104,69 +11100,126 @@ def _first_existing_col(cols: set[str], candidates: list[str]):
     return None
 
 async def admin_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin_user(uid):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
         return
 
-    conn = _db()
-    cols = _table_columns(conn, "users")
-
-    id_col = _first_existing_col(cols, ["user_id", "id"]) or "id"
-    plan_col = _first_existing_col(cols, ["plan", "tier", "subscription_plan"])
-    tz_col = _first_existing_col(cols, ["tz", "timezone"])
-
-    trial_until_col = _first_existing_col(cols, ["trial_until", "trial_until_ts", "trial_end_ts"])
-    plan_expires_col = _first_existing_col(cols, ["plan_expires", "expires_ts", "plan_until", "plan_until_ts"])
-
-    sql = f"""
-        SELECT
-            {id_col} AS uid,
-            {plan_col if plan_col else 'NULL'} AS plan,
-            {tz_col if tz_col else 'NULL'} AS tz,
-            {trial_until_col if trial_until_col else 'NULL'} AS trial_until,
-            {plan_expires_col if plan_expires_col else 'NULL'} AS plan_expires
-        FROM users
-        ORDER BY uid DESC
-        LIMIT 50
-    """
-
-    rows = conn.execute(sql).fetchall()
-
     now_ts = time.time()
-    lines = ["👤 Admin — Users", HDR]
-    for uid0, plan0, tz0, trial_until0, plan_expires0 in rows:
-        try:
-            uid_i = int(uid0)
-        except Exception:
-            continue
 
-        p = str(plan0 or "").strip()
-        pl = p.lower()
-        tz_s = str(tz0 or "").strip()
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("SELECT * FROM users")
+        rows = cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text("No users found.")
+        return
+
+    lines = ["📊 USERS OVERVIEW\n"]
+
+    for r in rows:
+        uid = r["user_id"]
+        tz = r.get("tz") or "UTC"
+
+        # Use effective plan logic
+        plan = str(effective_plan(uid, dict(r))).upper()
 
         # Remaining days
-        if is_admin_user(uid_i):
-            rem = "unlimited"
-        else:
-            until = 0.0
-            try:
-                if pl == "trial":
-                    until = float(trial_until0 or 0.0)
-                elif pl in ("standard", "pro"):
-                    until = float(plan_expires0 or 0.0)
-            except Exception:
-                until = 0.0
+        days_left = "-"
+        until = 0
 
-            if until and until > now_ts:
-                days_left = int((until - now_ts + 86399) // 86400)
-                rem = f"{days_left}d left"
-            else:
-                rem = "0d left" if pl in ("trial", "standard", "pro") else "-"
+        if plan == "TRIAL":
+            until = float(r.get("trial_until") or 0)
+        elif plan in ("STANDARD", "PRO"):
+            until = float(r.get("plan_expires") or 0)
 
-        lines.append(f"• {uid_i} | {p or 'free'} | tz:{tz_s or 'UTC'} | {rem}")
+        if until and until > now_ts:
+            days_left = f"{int((until - now_ts + 86399)//86400)}d"
+        elif plan in ("TRIAL", "STANDARD", "PRO"):
+            days_left = "0d"
+
+        # Payment status
+        with _db() as con:
+            cur = con.cursor()
+            cur.execute("""
+                SELECT status
+                FROM payments_ledger
+                WHERE user_id = ?
+                ORDER BY created_ts DESC
+                LIMIT 1
+            """, (uid,))
+            p = cur.fetchone()
+
+        pay_status = p[0] if p else "None"
+
+        lines.append(f"{uid} | {plan} | {tz} | {days_left} | {pay_status}")
 
     await update.message.reply_text("\n".join(lines))
 
+async def admin_grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Usage: /admin_grant <telegram_id> <standard|pro>")
+        return
+
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("❌ telegram_id must be a number.")
+        return
+
+    plan = str(context.args[1]).strip().lower()
+    if plan not in ("standard", "pro"):
+        await update.message.reply_text("❌ Plan must be: standard or pro")
+        return
+
+    # Grant access (sync plan + access metadata)
+    _set_user_access(uid, plan, "manual_admin", "admin_grant")
+
+    # IMPORTANT: prevent trial logic from overwriting the plan
+    # (Some parts of your code treat trial_until>0 as "still trial")
+    try:
+        update_user(uid, trial_until=0.0, trial_start_ts=0.0)
+    except Exception:
+        pass
+
+    user = get_user(uid) or {}
+
+    # Latest payment (1 row)
+    pay_line = "- (none)"
+    try:
+        with _db() as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            cur.execute("""
+                SELECT source, ref, plan, amount, currency, status, created_ts
+                FROM payments_ledger
+                WHERE user_id = ?
+                ORDER BY created_ts DESC
+                LIMIT 1
+            """, (uid,))
+            p = cur.fetchone()
+        if p:
+            pay_line = f"- {p['source']} | {p['plan']} | {p['amount']} {p['currency']} | {p['status']} | {p['ref']}"
+    except Exception:
+        pass
+
+    # Reply (as you requested)
+    lines = [
+        "✅ Access updated",
+        f"User: {uid}",
+        f"Plan: {str(user.get('plan') or plan).strip()}",
+        f"Access source/ref: {user.get('access_source','')} / {user.get('access_ref','')}",
+        f"Email: {user.get('email_to','') or ''}",
+        "",
+        "Last payments:",
+        pay_line
+    ]
+    await update.message.reply_text("\n".join(lines))
 
 
 async def admin_revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11325,7 +11378,7 @@ def main():
     
     app.add_handler(CommandHandler("admin_user", admin_user_cmd))
     app.add_handler(CommandHandler("admin_users", admin_users_cmd))
-    app.add_handler(CommandHandler("admin_grant", admin_user_cmd))
+    app.add_handler(CommandHandler("admin_grant", admin_grant_cmd))
     app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd)) 
     app.add_handler(CommandHandler("admin_payments", admin_payments_cmd))
 
