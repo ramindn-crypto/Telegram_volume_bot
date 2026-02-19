@@ -856,7 +856,7 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
 TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFuturesBot").strip()
 
 # Caching for speed
-TICKERS_TTL_SEC = 45
+TICKERS_TTL_SEC = 120
 OHLCV_TTL_SEC = 120
 
 logging.basicConfig(level=logging.INFO)
@@ -3278,8 +3278,7 @@ def get_exchange() -> ccxt.Exchange:
             klass = ccxt.__dict__[EXCHANGE_ID]
             _EX = klass({
                 "enableRateLimit": True,
-                # Render can be slow; keep CCXT request timeout generous
-                "timeout": 60000,
+                "timeout": 20000,
                 "options": {"defaultType": DEFAULT_TYPE},
             })
             _EX_MARKETS_LOADED = False
@@ -3339,16 +3338,34 @@ def get_cached_futures_tickers() -> Dict[str, MarketVol]:
 
 def fetch_futures_tickers() -> Dict[str, MarketVol]:
     """
-    ✅ Uses singleton exchange (no repeated load_markets)
+    Futures tickers (best-by-base), cached.
+
+    Reliability-first:
+    - Uses singleton exchange (no repeated load_markets)
+    - If CCXT/network stalls or errors, fall back to the last cached value (even if stale)
+      so /screen and email jobs don't hard-fail.
     """
-    if cache_valid("tickers_best_fut", TICKERS_TTL_SEC):
-        return cache_get("tickers_best_fut")
+    # Fast path: valid cache
+    try:
+        if cache_valid("tickers_best_fut", TICKERS_TTL_SEC):
+            return cache_get("tickers_best_fut")
+    except Exception:
+        pass
+
+    # Stale fallback (may be empty)
+    stale_best: Dict[str, MarketVol] = {}
+    try:
+        stale_best = cache_get("tickers_best_fut") or {}
+    except Exception:
+        stale_best = {}
 
     ex = get_exchange()
+
     # CCXT fetch_tickers can occasionally stall on Render/network.
-    # Use a small retry to avoid false timeouts in /screen and email job.
+    # We keep CCXT's internal request timeout (exchange.timeout) as the primary guard.
     last_err = None
     tickers = None
+
     for _attempt in range(2):
         try:
             tickers = ex.fetch_tickers()
@@ -3359,7 +3376,11 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
                 time.sleep(0.6)
             except Exception:
                 pass
+
+    # If CCXT failed, return stale cache if available (keeps bot usable)
     if tickers is None:
+        if stale_best:
+            return stale_best
         raise last_err or RuntimeError("fetch_tickers_failed")
 
     best: Dict[str, MarketVol] = {}
@@ -3372,7 +3393,10 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
         if mv.base not in best or usd_notional(mv) > usd_notional(best[mv.base]):
             best[mv.base] = mv
 
-    cache_set("tickers_best_fut", best)
+    try:
+        cache_set("tickers_best_fut", best)
+    except Exception:
+        pass
     return best
 
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
@@ -4466,6 +4490,14 @@ def make_setup(
             hint = getattr(mv, "_pf_breakout_hint", None)
             if engine_b_ok and hint in ("BUY", "SELL"):
                 side = hint
+        except Exception:
+            pass
+
+        # Also bypass cached candles so /screen output actually changes
+        try:
+            for k in list(_CACHE.keys()):
+                if str(k).startswith("ohlcv:"):
+                    _CACHE.pop(k, None)
         except Exception:
             pass
 
@@ -8966,7 +8998,7 @@ SCREEN_CACHE_TTL_SEC = 120  # seconds (minimum refresh interval target)
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 
 # ✅ FIX: missing timeouts used by /screen
-SCREEN_FETCH_TIMEOUT_SEC = 60   # timeout for fetching futures tickers (network can be slow)
+SCREEN_FETCH_TIMEOUT_SEC = 60
 SCREEN_BUILD_TIMEOUT_SEC = 70   # timeout for building screen body (can take longer on Render)
 
 _SCREEN_CACHE = {
@@ -9374,44 +9406,36 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     
 
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/screen — simple + reliable. Refresh at most once per 2 minutes (TTL)."""
-
+    """/screen — simple + reliable. Refreshes at most once per SCREEN_CACHE_TTL_SEC (default 120s)."""
     uid = update.effective_user.id
     user = get_user(uid)
 
     if not has_active_access(uid, user):
         await update.message.reply_text(
-            "⛔️ Trial finished.\n\n"
-            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "⛔️ Trial finished.\\n\\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\\n\\n"
             "👉 /billing"
         )
         return
 
-    # Header (always fresh)
+    # Always-fresh header
     now_utc = datetime.now(timezone.utc)
     session_disp = (_session_label_utc(now_utc) or "NONE")
     loc_label, loc_time = user_location_and_time(user)
-
     header = (
-        f"*PulseFutures — Market Scan*\n"
-        f"{HDR}\n"
-        f"*Session:* `{session_disp}` | *{loc_label}:* `{loc_time}`\n"
+        f"*PulseFutures — Market Scan*\\n"
+        f"{HDR}\\n"
+        f"*Session:* `{session_disp}` | *{loc_label}:* `{loc_time}`\\n"
     )
 
     now_ts = time.time()
     ts = float(_SCREEN_CACHE.get("ts", 0.0) or 0.0)
     cached_body = str(_SCREEN_CACHE.get("body") or "").strip()
+    cache_age = max(0.0, now_ts - ts)
 
-    # =========================================================
-    # 1) INSTANT PATH — serve cache if still within TTL
-    # =========================================================
-    try:
-        cache_age = max(0.0, now_ts - ts)
-    except Exception:
-        cache_age = 999999.0
-
+    # Serve cache if still within TTL
     if cached_body and cache_age < float(SCREEN_CACHE_TTL_SEC):
-        msg = (header + "\n" + cached_body).strip()
+        msg = (header + "\\n" + cached_body).strip()
         await send_long_message(
             update,
             msg,
@@ -9421,35 +9445,73 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # =========================================================
-    # 2) TTL expired (or no cache) — do a real scan (sync)
-    # =========================================================
+    # One scan at a time (avoid stampede)
     if SCAN_LOCK.locked():
+        # If we have ANY cache, serve it instead of making the user wait
+        if cached_body:
+            msg = (header + "\\n" + cached_body).strip()
+            await send_long_message(
+                update,
+                msg,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+                reply_markup=None,
+            )
+            return
         await update.message.reply_text("⏳ Scan is running… please try /screen again in a moment.")
         return
 
     await SCAN_LOCK.acquire()
     status_msg = None
-
     try:
         status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
         reset_reject_tracker()
 
-        # NOTE: We do NOT purge candle/ticker caches here.
-        # Purging causes huge CCXT load and timeouts on Render.
-        # Freshness is controlled by TTLs (SCREEN_CACHE_TTL_SEC, TICKERS_TTL_SEC, OHLCV_TTL_SEC).
+        # Prefer live tickers; fetch_futures_tickers() will fall back to stale cache if CCXT errors.
+        try:
+            _CACHE.pop("tickers_best_fut", None)
+        except Exception:
+            pass
 
-        # Fetch futures tickers with hard timeout
         try:
             best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
         except asyncio.TimeoutError:
+            # If network is slow, serve last cached screen (if available)
+            if cached_body:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                msg = (header + "\\n" + cached_body).strip()
+                await send_long_message(
+                    update,
+                    msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                    reply_markup=None,
+                )
+                return
             try:
-                await status_msg.edit_text("⏱️ /screen timed out while fetching market data. Try again.")
+                await status_msg.edit_text("⏱️ Market is slow right now. Try /screen again in ~20s.")
             except Exception:
-                await update.message.reply_text("⏱️ /screen timed out while fetching market data. Try again.")
+                await update.message.reply_text("⏱️ Market is slow right now. Try /screen again in ~20s.")
             return
 
         if not best_fut:
+            if cached_body:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                msg = (header + "\\n" + cached_body).strip()
+                await send_long_message(
+                    update,
+                    msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                    reply_markup=None,
+                )
+                return
             try:
                 await status_msg.edit_text("❌ Failed to fetch futures data.")
             except Exception:
@@ -9458,7 +9520,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         session = _guess_session_name_utc(datetime.now(timezone.utc))
 
-        # Build under lock to avoid concurrent heavy builds
         async with _SCREEN_LOCK:
             try:
                 body, kb = await _to_thread_with_timeout(
@@ -9469,6 +9530,20 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     int(uid),
                 )
             except asyncio.TimeoutError:
+                if cached_body:
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+                    msg = (header + "\\n" + cached_body).strip()
+                    await send_long_message(
+                        update,
+                        msg,
+                        parse_mode=ParseMode.MARKDOWN,
+                        disable_web_page_preview=True,
+                        reply_markup=None,
+                    )
+                    return
                 try:
                     await status_msg.edit_text("⏱️ /screen timed out while building results. Try again.")
                 except Exception:
@@ -9479,25 +9554,24 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _SCREEN_CACHE["body"] = str(body or "")
             _SCREEN_CACHE["kb"] = list(kb or [])
 
-        # Refresh header again (so time/session line is accurate)
-        user = get_user(uid)
-        now_utc2 = datetime.now(timezone.utc)
-        session_disp2 = (_session_label_utc(now_utc2) or "NONE")
-        loc_label2, loc_time2 = user_location_and_time(user)
-        header2 = (
-            f"*PulseFutures — Market Scan*\n"
-            f"{HDR}\n"
-            f"*Session:* `{session_disp2}` | *{loc_label2}:* `{loc_time2}`\n"
-        )
-
-        msg = (header2 + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
-
         try:
             if status_msg:
                 await status_msg.delete()
         except Exception:
             pass
 
+        # Refresh header timestamp/session one more time
+        user = get_user(uid)
+        now_utc2 = datetime.now(timezone.utc)
+        session_disp2 = (_session_label_utc(now_utc2) or "NONE")
+        loc_label2, loc_time2 = user_location_and_time(user)
+        header2 = (
+            f"*PulseFutures — Market Scan*\\n"
+            f"{HDR}\\n"
+            f"*Session:* `{session_disp}` | *{loc_label}:* `{loc_time}`\\n"
+        )
+
+        msg = (header2 + "\\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
         await send_long_message(
             update,
             msg,
@@ -9521,13 +9595,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 SCAN_LOCK.release()
         except Exception:
             pass
-
-
-    
-# =========================================================
-# TEXT ROUTER (Signal ID lookup)
-# =========================================================
-
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
