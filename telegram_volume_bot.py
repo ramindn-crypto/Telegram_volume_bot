@@ -9223,6 +9223,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
         user = get_user(uid)
         now_utc = datetime.now(timezone.utc)
+        session = _guess_session_name_utc(now_utc)  # engine session (falls back to NY in gap)
         session_disp = (_session_label_utc(now_utc) or "NONE")
         loc_label, loc_time = user_location_and_time(user)
 
