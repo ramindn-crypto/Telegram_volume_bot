@@ -8957,21 +8957,34 @@ _SCREEN_LOCK = asyncio.Lock()
 
 # Background refresh task for /screen (keeps UX instant)
 _SCREEN_REFRESH_TASK = None  # asyncio.Task
+_SCREEN_REFRESH_TASK_STARTED_AT = 0.0
+_SCREEN_FORCE_SYNC_AFTER_SEC = 120  # if cache older than this, do a synchronous refresh
+_SCREEN_REFRESH_MAX_RUNTIME_SEC = 35  # watchdog for stuck background refresh
 
 async def _refresh_screen_cache_async():
-    """Refreshes _SCREEN_CACHE in the background (best effort)."""
-    global _SCREEN_REFRESH_TASK
+    """Refreshes _SCREEN_CACHE in the background (best effort).
+
+    IMPORTANT:
+    - Must never block the bot event loop.
+    - Must not get stuck forever (watchdog + timeouts), otherwise /screen will serve stale cache indefinitely.
+    """
+    global _SCREEN_REFRESH_TASK, _SCREEN_REFRESH_TASK_STARTED_AT
+    _SCREEN_REFRESH_TASK_STARTED_AT = time.time()
     try:
-        best_fut = await to_thread_heavy(fetch_futures_tickers)
+        # Hard timeout so a stuck network call doesn't freeze refresh for hours
+        best_fut = await asyncio.wait_for(to_thread_heavy(fetch_futures_tickers), timeout=25)
         if not best_fut:
             return
+
         now_utc = datetime.now(timezone.utc)
         session = _guess_session_name_utc(now_utc)
-        body, kb = await to_thread_heavy(_build_screen_body_and_kb,
-            best_fut,
-            session,
-            0,
+
+        # Heavy build in thread + timeout
+        body, kb = await asyncio.wait_for(
+            to_thread_heavy(_build_screen_body_and_kb, best_fut, session, 0),
+            timeout=25
         )
+
         _SCREEN_CACHE["ts"] = time.time()
         _SCREEN_CACHE["body"] = body
         _SCREEN_CACHE["kb"] = list(kb or [])
@@ -8980,6 +8993,8 @@ async def _refresh_screen_cache_async():
         return
     finally:
         _SCREEN_REFRESH_TASK = None
+        _SCREEN_REFRESH_TASK_STARTED_AT = 0.0
+
 
 
 
@@ -9326,15 +9341,49 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         keyboard = []  # TradingView buttons disabled
 
-        # If stale, kick off a background refresh and still reply instantly
-        if (now_ts - ts) > float(SCREEN_CACHE_TTL_SEC):
-            global _SCREEN_REFRESH_TASK
-            try:
-                if _SCREEN_REFRESH_TASK is None:
-                    _SCREEN_REFRESH_TASK = asyncio.create_task(_refresh_screen_cache_async())
-            except Exception:
-                pass
-            msg = (msg + "\n\n_Updating in background… run /screen again in ~10–20s for freshest results._").strip()
+        # If stale, refresh (best effort) but NEVER serve stale forever.
+        cache_age = (now_ts - ts)
+
+        # Watchdog: if the background refresh got stuck (e.g., network hang), cancel it so we can refresh again.
+        global _SCREEN_REFRESH_TASK, _SCREEN_REFRESH_TASK_STARTED_AT
+        try:
+            if _SCREEN_REFRESH_TASK is not None and _SCREEN_REFRESH_TASK_STARTED_AT:
+                if (now_ts - float(_SCREEN_REFRESH_TASK_STARTED_AT)) > float(_SCREEN_REFRESH_MAX_RUNTIME_SEC):
+                    try:
+                        _SCREEN_REFRESH_TASK.cancel()
+                    except Exception:
+                        pass
+                    _SCREEN_REFRESH_TASK = None
+                    _SCREEN_REFRESH_TASK_STARTED_AT = 0.0
+        except Exception:
+            pass
+
+        if cache_age > float(SCREEN_CACHE_TTL_SEC):
+            # If very stale, do a synchronous refresh (still allowed to take longer).
+            if cache_age > float(_SCREEN_FORCE_SYNC_AFTER_SEC):
+                try:
+                    await update.message.reply_text("🔎 Scanning market… Please wait")
+                    best_fut = await to_thread_heavy(fetch_futures_tickers)
+                    if best_fut:
+                        now_utc2 = datetime.now(timezone.utc)
+                        session2 = _guess_session_name_utc(now_utc2)
+                        body2, kb2 = await to_thread_heavy(_build_screen_body_and_kb, best_fut, session2, int(uid))
+                        _SCREEN_CACHE["ts"] = time.time()
+                        _SCREEN_CACHE["body"] = body2
+                        _SCREEN_CACHE["kb"] = list(kb2 or [])
+                        # Update message immediately with refreshed cache
+                        msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
+                except Exception:
+                    # fall back to cached msg + background refresh hint
+                    msg = (msg + "\n\n_Updating in background… run /screen again in ~10–20s for freshest results._").strip()
+            else:
+                # Kick off a background refresh and still reply instantly
+                try:
+                    if _SCREEN_REFRESH_TASK is None:
+                        _SCREEN_REFRESH_TASK = asyncio.create_task(_refresh_screen_cache_async())
+                except Exception:
+                    pass
+                msg = (msg + "\n\n_Updating in background… run /screen again in ~10–20s for freshest results._").strip()
 
         await send_long_message(
             update,
