@@ -856,8 +856,8 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
 TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFuturesBot").strip()
 
 # Caching for speed
-TICKERS_TTL_SEC = 60
-OHLCV_TTL_SEC = 120
+TICKERS_TTL_SEC = 45
+OHLCV_TTL_SEC = 60
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pulsefutures")
@@ -3278,7 +3278,7 @@ def get_exchange() -> ccxt.Exchange:
             klass = ccxt.__dict__[EXCHANGE_ID]
             _EX = klass({
                 "enableRateLimit": True,
-                "timeout": 60000,
+                "timeout": 20000,
                 "options": {"defaultType": DEFAULT_TYPE},
             })
             _EX_MARKETS_LOADED = False
@@ -8958,8 +8958,8 @@ SCREEN_CACHE_TTL_SEC = 120  # seconds (minimum refresh interval target)
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 
 # ✅ FIX: missing timeouts used by /screen
-SCREEN_FETCH_TIMEOUT_SEC = 60# timeout for fetching futures tickers (network can be slow)
-SCREEN_BUILD_TIMEOUT_SEC = 180# timeout for building screen body (can take longer on Render)
+SCREEN_FETCH_TIMEOUT_SEC = 90   # timeout for fetching futures tickers (network can be slow)
+SCREEN_BUILD_TIMEOUT_SEC = 120   # timeout for building screen body (can take longer on Render)
 
 _SCREEN_CACHE = {
     "ts": 0.0,
@@ -9365,8 +9365,85 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     return body, kb
     
 
+# =========================================================
+# /screen cache refresher (runs in background every 2 minutes)
+# =========================================================
+
+SCREEN_REFRESH_INTERVAL_SEC = 120  # 2 minutes (as requested)
+
+SCREEN_JOB_LOCK = asyncio.Lock()
+_SCREEN_LAST_REFRESH_OK_TS = 0.0
+
+async def _refresh_screen_cache_once():
+    """Builds the /screen cache snapshot. Never raises."""
+    global _SCREEN_LAST_REFRESH_OK_TS
+
+    # Prevent overlap
+    if SCREEN_JOB_LOCK.locked():
+        return
+
+    async with SCREEN_JOB_LOCK:
+        try:
+            reset_reject_tracker()
+
+            # Force LIVE tickers only (do NOT nuke OHLCV cache; that causes timeouts)
+            try:
+                _CACHE.pop("tickers_best_fut", None)
+            except Exception:
+                pass
+
+            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
+            if not best_fut:
+                return
+
+            session = _guess_session_name_utc(datetime.now(timezone.utc))
+
+            # Build body (heavy)
+            body, kb = await _to_thread_with_timeout(
+                _build_screen_body_and_kb,
+                SCREEN_BUILD_TIMEOUT_SEC,
+                best_fut,
+                session,
+                0,  # cache snapshot is global (not per-user)
+            )
+
+            b = str(body or "")
+            # If something stored escaped newlines previously, normalize it
+            if ("\\n" in b) and ("\n" not in b):
+                try:
+                    b = b.replace("\\n", "\n")
+                except Exception:
+                    pass
+
+            _SCREEN_CACHE["ts"] = time.time()
+            _SCREEN_CACHE["body"] = b
+            _SCREEN_CACHE["kb"] = list(kb or [])
+            _SCREEN_LAST_REFRESH_OK_TS = float(_SCREEN_CACHE["ts"])
+
+        except asyncio.TimeoutError:
+            # Keep previous cache; next run will try again
+            return
+        except Exception:
+            logger.exception("screen cache refresh failed")
+            return
+
+
+async def screen_cache_job(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue entrypoint: refresh /screen cache every 2 minutes."""
+    try:
+        await _refresh_screen_cache_once()
+    except Exception:
+        # never crash JobQueue
+        return
+
+
+# =========================================================
+# /screen — ALWAYS instant (serves last snapshot)
+# Refresh happens in background every 2 minutes.
+# =========================================================
+
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/screen — simple + reliable. Refresh at most once per 2 minutes (TTL)."""
+    """/screen — instant snapshot. Background refresh runs every 2 minutes."""
 
     uid = update.effective_user.id
     user = get_user(uid)
@@ -9390,19 +9467,10 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"*Session:* `{session_disp}` | *{loc_label}:* `{loc_time}`\n"
     )
 
-    now_ts = time.time()
-    ts = float(_SCREEN_CACHE.get("ts", 0.0) or 0.0)
     cached_body = str(_SCREEN_CACHE.get("body") or "").strip()
 
-    # =========================================================
-    # 1) INSTANT PATH — serve cache if still within TTL
-    # =========================================================
-    try:
-        cache_age = max(0.0, now_ts - ts)
-    except Exception:
-        cache_age = 999999.0
-
-    if cached_body and cache_age < float(SCREEN_CACHE_TTL_SEC):
+    # If we have a snapshot, always serve it instantly
+    if cached_body:
         msg = (header + "\n" + cached_body).strip()
         await send_long_message(
             update,
@@ -9413,112 +9481,20 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # =========================================================
-    # 2) TTL expired (or no cache) — do a real scan (sync)
-    # =========================================================
-    if SCAN_LOCK.locked():
-        await update.message.reply_text("⏳ Scan is running… please try /screen again in a moment.")
-        return
-
-    await SCAN_LOCK.acquire()
-    status_msg = None
-
+    # No cache yet: kick an immediate refresh and tell user to retry shortly
     try:
-        status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
-        reset_reject_tracker()
+        asyncio.create_task(_refresh_screen_cache_once())
+    except Exception:
+        pass
 
-        # Force LIVE tickers (bypass in-memory cached futures list)
-        try:
-            _CACHE.pop("tickers_best_fut", None)
-        except Exception:
-            pass
-
-        # Fetch futures tickers with hard timeout
-        try:
-            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
-            try:
-                await status_msg.edit_text("⏱️ /screen timed out while fetching market data. Try again.")
-            except Exception:
-                await update.message.reply_text("⏱️ /screen timed out while fetching market data. Try again.")
-            return
-
-        if not best_fut:
-            try:
-                await status_msg.edit_text("❌ Failed to fetch futures data.")
-            except Exception:
-                await update.message.reply_text("❌ Failed to fetch futures data.")
-            return
-
-        session = _guess_session_name_utc(datetime.now(timezone.utc))
-
-        # Build under lock to avoid concurrent heavy builds
-        async with _SCREEN_LOCK:
-            try:
-                body, kb = await _to_thread_with_timeout(
-                    _build_screen_body_and_kb,
-                    SCREEN_BUILD_TIMEOUT_SEC,
-                    best_fut,
-                    session,
-                    int(uid),
-                )
-            except asyncio.TimeoutError:
-                try:
-                    await status_msg.edit_text("⏱️ /screen timed out while building results. Try again.")
-                except Exception:
-                    await update.message.reply_text("⏱️ /screen timed out while building results. Try again.")
-                return
-
-            _SCREEN_CACHE["ts"] = time.time()
-            _SCREEN_CACHE["body"] = str(body or "")
-            _SCREEN_CACHE["kb"] = list(kb or [])
-
-        # Refresh header again (so time/session line is accurate)
-        user = get_user(uid)
-        now_utc2 = datetime.now(timezone.utc)
-        session_disp2 = (_session_label_utc(now_utc2) or "NONE")
-        loc_label2, loc_time2 = user_location_and_time(user)
-        header2 = (
-            f"*PulseFutures — Market Scan*\n"
-            f"{HDR}\n"
-            f"*Session:* `{session_disp2}` | *{loc_label2}:* `{loc_time2}`\n"
-        )
-
-        msg = (header2 + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
-
-        try:
-            if status_msg:
-                await status_msg.delete()
-        except Exception:
-            pass
-
-        await send_long_message(
-            update,
-            msg,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-            reply_markup=None,
-        )
-
-    except Exception as e:
-        logger.exception("screen_cmd failed")
-        try:
-            if status_msg:
-                await status_msg.edit_text(f"❌ /screen failed: {e}")
-            else:
-                await update.message.reply_text(f"❌ /screen failed: {e}")
-        except Exception:
-            pass
-    finally:
-        try:
-            if SCAN_LOCK.locked():
-                SCAN_LOCK.release()
-        except Exception:
-            pass
+    await update.message.reply_text(
+        "🔎 Warming up market scan…\n"
+        "Please try /screen again in ~30–60 seconds."
+    )
 
 
-    
 # =========================================================
+# TEXT ROUTER# =========================================================
 # TEXT ROUTER (Signal ID lookup)
 # =========================================================
 
@@ -11621,6 +11597,19 @@ def main():
             interval=interval_sec,
             first=90,
             name="alert_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 60,
+            },
+        )
+
+        # Keep /screen snapshot fresh in background (every 2 minutes)
+        app.job_queue.run_repeating(
+            screen_cache_job,
+            interval=int(SCREEN_REFRESH_INTERVAL_SEC),
+            first=10,
+            name="screen_cache_job",
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
