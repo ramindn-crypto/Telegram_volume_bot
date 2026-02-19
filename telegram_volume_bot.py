@@ -857,7 +857,7 @@ TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFutures
 
 # Caching for speed
 TICKERS_TTL_SEC = 45
-OHLCV_TTL_SEC = 60
+OHLCV_TTL_SEC = 120
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pulsefutures")
@@ -3278,7 +3278,8 @@ def get_exchange() -> ccxt.Exchange:
             klass = ccxt.__dict__[EXCHANGE_ID]
             _EX = klass({
                 "enableRateLimit": True,
-                "timeout": 20000,
+                # Render can be slow; keep CCXT request timeout generous
+                "timeout": 60000,
                 "options": {"defaultType": DEFAULT_TYPE},
             })
             _EX_MARKETS_LOADED = False
@@ -3344,7 +3345,22 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
         return cache_get("tickers_best_fut")
 
     ex = get_exchange()
-    tickers = ex.fetch_tickers()
+    # CCXT fetch_tickers can occasionally stall on Render/network.
+    # Use a small retry to avoid false timeouts in /screen and email job.
+    last_err = None
+    tickers = None
+    for _attempt in range(2):
+        try:
+            tickers = ex.fetch_tickers()
+            break
+        except Exception as e:
+            last_err = e
+            try:
+                time.sleep(0.6)
+            except Exception:
+                pass
+    if tickers is None:
+        raise last_err or RuntimeError("fetch_tickers_failed")
 
     best: Dict[str, MarketVol] = {}
     for t in tickers.values():
@@ -4450,14 +4466,6 @@ def make_setup(
             hint = getattr(mv, "_pf_breakout_hint", None)
             if engine_b_ok and hint in ("BUY", "SELL"):
                 side = hint
-        except Exception:
-            pass
-
-        # Also bypass cached candles so /screen output actually changes
-        try:
-            for k in list(_CACHE.keys()):
-                if str(k).startswith("ohlcv:"):
-                    _CACHE.pop(k, None)
         except Exception:
             pass
 
@@ -8958,7 +8966,7 @@ SCREEN_CACHE_TTL_SEC = 120  # seconds (minimum refresh interval target)
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 
 # ✅ FIX: missing timeouts used by /screen
-SCREEN_FETCH_TIMEOUT_SEC = 35   # timeout for fetching futures tickers (network can be slow)
+SCREEN_FETCH_TIMEOUT_SEC = 60   # timeout for fetching futures tickers (network can be slow)
 SCREEN_BUILD_TIMEOUT_SEC = 70   # timeout for building screen body (can take longer on Render)
 
 _SCREEN_CACHE = {
@@ -9427,19 +9435,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
         reset_reject_tracker()
 
-        # Force LIVE tickers (bypass in-memory cached futures list)
-        try:
-            _CACHE.pop("tickers_best_fut", None)
-        except Exception:
-            pass
-
-        # Force fresh candles too (prevents repeating same results)
-        try:
-            for k in list(_CACHE.keys()):
-                if str(k).startswith("ohlcv:"):
-                    _CACHE.pop(k, None)
-        except Exception:
-            pass
+        # NOTE: We do NOT purge candle/ticker caches here.
+        # Purging causes huge CCXT load and timeouts on Render.
+        # Freshness is controlled by TTLs (SCREEN_CACHE_TTL_SEC, TICKERS_TTL_SEC, OHLCV_TTL_SEC).
 
         # Fetch futures tickers with hard timeout
         try:
