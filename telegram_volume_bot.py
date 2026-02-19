@@ -9003,46 +9003,52 @@ _SCREEN_REFRESH_TASK_STARTED_AT = 0.0
 _SCREEN_FORCE_SYNC_AFTER_SEC = 120  # if cache older than this, do a synchronous refresh
 _SCREEN_REFRESH_MAX_RUNTIME_SEC = 90  # watchdog for stuck background refresh
 
-async def _refresh_screen_cache_async():
-    """Refreshes _SCREEN_CACHE in the background (best effort).
 
-    IMPORTANT:
-    - Must never block the bot event loop.
-    - Must not get stuck forever (watchdog + timeouts), otherwise /screen will serve stale cache indefinitely.
-    """
+async def _refresh_screen_cache_async():
     global _SCREEN_REFRESH_TASK, _SCREEN_REFRESH_TASK_STARTED_AT
+
     _SCREEN_REFRESH_TASK_STARTED_AT = time.time()
+    _SCREEN_CACHE["refreshing"] = True
+
     try:
-        # Hard timeout so a stuck network call doesn't freeze refresh for hours
-        # /screen must use LIVE tickers (bypass in-memory TTL cache)
+        reset_reject_tracker()
+
+        # Force live tickers for refresh
         try:
             _CACHE.pop("tickers_best_fut", None)
         except Exception:
             pass
 
-        best_fut = await asyncio.wait_for(to_thread_heavy(fetch_futures_tickers), timeout=SCREEN_FETCH_TIMEOUT_SEC)
+        best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
+
         if not best_fut:
-            return
+            return  # keep old cache; just exit gracefully
 
         now_utc = datetime.now(timezone.utc)
         session = _guess_session_name_utc(now_utc)
 
-        # Heavy build in thread + timeout
-        body, kb = await asyncio.wait_for(
-            to_thread_heavy(_build_screen_body_and_kb, best_fut, session, 0),
-            timeout=SCREEN_BUILD_TIMEOUT_SEC
+        body, kb = await _to_thread_with_timeout(
+            _build_screen_body_and_kb,
+            SCREEN_BUILD_TIMEOUT_SEC,
+            best_fut,
+            session,
+            int(0),  # uid not needed for global cache build; keep int
         )
 
+        # Commit cache ONLY if we built successfully
         _SCREEN_CACHE["ts"] = time.time()
-        _SCREEN_CACHE["body"] = body
+        _SCREEN_CACHE["body"] = str(body or "")
         _SCREEN_CACHE["kb"] = list(kb or [])
+
+    except asyncio.TimeoutError:
+        # refresh timed out; do not modify cache
+        pass
     except Exception:
-        # never let background refresh crash the bot
-        return
+        logger.exception("background /screen refresh failed")
     finally:
+        _SCREEN_CACHE["refreshing"] = False
         _SCREEN_REFRESH_TASK = None
         _SCREEN_REFRESH_TASK_STARTED_AT = 0.0
-
 
 
 
@@ -9355,9 +9361,9 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/screen — allowed to take longer, but must never hang or go silent."""
-    
+
     global _SCREEN_REFRESH_TASK, _SCREEN_REFRESH_TASK_STARTED_AT
-    
+
     uid = update.effective_user.id
     user = get_user(uid)
 
@@ -9369,6 +9375,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Header (always fresh)
     now_utc = datetime.now(timezone.utc)
     session_disp = (_session_label_utc(now_utc) or "NONE")
     loc_label, loc_time = user_location_and_time(user)
@@ -9387,24 +9394,26 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) INSTANT PATH — SERVE CACHE
     # =========================================================
     if cached_body:
+        keyboard = []  # TradingView buttons disabled
 
-        keyboard = []
-
-        cache_age = now_ts - ts
+        cache_age = max(0.0, now_ts - ts)
         next_refresh_in = max(0, int(float(SCREEN_CACHE_TTL_SEC) - cache_age))
-        refresh_running = (_SCREEN_REFRESH_TASK is not None)
+        refresh_running = (_SCREEN_REFRESH_TASK is not None) or bool(_SCREEN_CACHE.get("refreshing"))
 
+        # Signature for "unchanged" notice
         sig = _screen_sig(cached_body)
         prev_sig, _ = _LAST_SCREEN_SIG.get(uid, (None, 0.0))
         unchanged = (prev_sig == sig)
         _LAST_SCREEN_SIG[uid] = (sig, now_ts)
 
+        # Footer (truthful)
         freshness_line = (
             f"\n\n`Data age:` {int(cache_age)}s · "
             f"`Next refresh:` {next_refresh_in}s"
         )
-
-        if refresh_running:
+        if refresh_running and next_refresh_in == 0:
+            freshness_line += " · `Refreshing:` yes (overdue)"
+        elif refresh_running:
             freshness_line += " · `Refreshing:` yes"
 
         if unchanged:
@@ -9412,16 +9421,18 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         msg = (header + "\n" + cached_body + freshness_line).strip()
 
-        # Watchdog for stuck refresh
+        # Watchdog: if refresh is stuck too long, kill it and clear state
         try:
-            if _SCREEN_REFRESH_TASK and _SCREEN_REFRESH_TASK_STARTED_AT:
-                if (now_ts - float(_SCREEN_REFRESH_TASK_STARTED_AT)) > float(_SCREEN_REFRESH_MAX_RUNTIME_SEC):
+            if _SCREEN_REFRESH_TASK is not None and _SCREEN_REFRESH_TASK_STARTED_AT:
+                runtime = now_ts - float(_SCREEN_REFRESH_TASK_STARTED_AT)
+                if runtime > float(_SCREEN_REFRESH_MAX_RUNTIME_SEC):
                     try:
                         _SCREEN_REFRESH_TASK.cancel()
                     except Exception:
                         pass
                     _SCREEN_REFRESH_TASK = None
                     _SCREEN_REFRESH_TASK_STARTED_AT = 0.0
+                    _SCREEN_CACHE["refreshing"] = False
         except Exception:
             pass
 
@@ -9437,7 +9448,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
-            reply_markup=None,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
         )
         return
 
@@ -9458,39 +9469,56 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         reset_reject_tracker()
 
+        # /screen must use LIVE tickers (bypass in-memory TTL cache)
         try:
             _CACHE.pop("tickers_best_fut", None)
         except Exception:
             pass
 
+        # Hard timeouts so /screen cannot hang forever
         try:
             best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
         except asyncio.TimeoutError:
-            await status_msg.edit_text("⏱️ /screen timed out while fetching market data. Try again.")
+            try:
+                await status_msg.edit_text("⏱️ /screen timed out while fetching market data. Try again.")
+            except Exception:
+                await update.message.reply_text("⏱️ /screen timed out while fetching market data. Try again.")
             return
 
         if not best_fut:
-            await status_msg.edit_text("❌ Failed to fetch futures data.")
+            try:
+                await status_msg.edit_text("❌ Failed to fetch futures data.")
+            except Exception:
+                await update.message.reply_text("❌ Failed to fetch futures data.")
             return
 
         session = _guess_session_name_utc(datetime.now(timezone.utc))
 
+        # Build under screen lock so we don't spam heavy builds
         async with _SCREEN_LOCK:
-            body, kb = await _to_thread_with_timeout(
-                _build_screen_body_and_kb,
-                SCREEN_BUILD_TIMEOUT_SEC,
-                best_fut,
-                session,
-                int(uid),
-            )
+            try:
+                body, kb = await _to_thread_with_timeout(
+                    _build_screen_body_and_kb,
+                    SCREEN_BUILD_TIMEOUT_SEC,
+                    best_fut,
+                    session,
+                    int(uid),
+                )
+            except asyncio.TimeoutError:
+                try:
+                    await status_msg.edit_text("⏱️ /screen timed out while building results. Try again.")
+                except Exception:
+                    await update.message.reply_text("⏱️ /screen timed out while building results. Try again.")
+                return
 
             _SCREEN_CACHE["ts"] = time.time()
-            _SCREEN_CACHE["body"] = body
+            _SCREEN_CACHE["body"] = str(body or "")
             _SCREEN_CACHE["kb"] = list(kb or [])
 
         cached_body2 = str(_SCREEN_CACHE.get("body") or "").strip()
-        cache_age2 = max(0.0, time.time() - float(_SCREEN_CACHE.get("ts", 0.0)))
+        cache_age2 = max(0.0, time.time() - float(_SCREEN_CACHE.get("ts", 0.0) or 0.0))
 
+        # Signature for "unchanged" notice (per-user)
         sig2 = _screen_sig(cached_body2)
         prev_sig2, _ = _LAST_SCREEN_SIG.get(uid, (None, 0.0))
         unchanged2 = (prev_sig2 == sig2)
@@ -9500,11 +9528,11 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"\n\n`Data age:` {int(cache_age2)}s · "
             f"`Next refresh:` {int(float(SCREEN_CACHE_TTL_SEC))}s"
         )
-
         if unchanged2:
             freshness2 += "\n_No change since your last /screen._"
 
         msg = (header + "\n" + cached_body2 + freshness2).strip()
+        keyboard = []  # TradingView buttons disabled
 
         try:
             if countdown_task:
@@ -9523,7 +9551,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
-            reply_markup=None,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
         )
 
     except Exception as e:
@@ -9541,7 +9569,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 SCAN_LOCK.release()
         except Exception:
             pass
-
 
     
 # =========================================================
