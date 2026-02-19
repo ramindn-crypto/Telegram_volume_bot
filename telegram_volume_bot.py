@@ -9404,13 +9404,54 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cache_age = max(0.0, now_ts - ts)
         next_refresh_in = max(0, int(float(SCREEN_CACHE_TTL_SEC) - cache_age))
-        refresh_running = (_SCREEN_REFRESH_TASK is not None) or bool(_SCREEN_CACHE.get("refreshing"))
+
+        # --- State truth: "refreshing" is the flag, not the task pointer ---
+        refresh_running = bool(_SCREEN_CACHE.get("refreshing"))
 
         # Signature for "unchanged" notice
         sig = _screen_sig(cached_body)
         prev_sig, _ = _LAST_SCREEN_SIG.get(uid, (None, 0.0))
         unchanged = (prev_sig == sig)
         _LAST_SCREEN_SIG[uid] = (sig, now_ts)
+
+        # -----------------------------
+        # Robust refresh watchdog + kick
+        # -----------------------------
+
+        # 0) If flag says refreshing but task is gone, clear the flag (prevents "yes" forever)
+        try:
+            if _SCREEN_CACHE.get("refreshing") and (_SCREEN_REFRESH_TASK is None):
+                _SCREEN_CACHE["refreshing"] = False
+                _SCREEN_REFRESH_TASK_STARTED_AT = 0.0
+        except Exception:
+            pass
+
+        # 1) If refresh task stuck too long, cancel and clear everything
+        try:
+            if _SCREEN_REFRESH_TASK is not None and _SCREEN_REFRESH_TASK_STARTED_AT:
+                runtime = now_ts - float(_SCREEN_REFRESH_TASK_STARTED_AT)
+                if runtime > float(_SCREEN_REFRESH_MAX_RUNTIME_SEC):
+                    try:
+                        _SCREEN_REFRESH_TASK.cancel()
+                    except Exception:
+                        pass
+                    _SCREEN_REFRESH_TASK = None
+                    _SCREEN_REFRESH_TASK_STARTED_AT = 0.0
+                    _SCREEN_CACHE["refreshing"] = False
+        except Exception:
+            pass
+
+        # 2) If TTL expired and no refresh running, start one (set state BEFORE create_task)
+        try:
+            if (_SCREEN_REFRESH_TASK is None) and (cache_age >= float(SCREEN_CACHE_TTL_SEC)):
+                _SCREEN_CACHE["refreshing"] = True
+                _SCREEN_REFRESH_TASK_STARTED_AT = time.time()
+                _SCREEN_REFRESH_TASK = asyncio.create_task(_refresh_screen_cache_async())
+        except Exception:
+            pass
+
+        # Re-read state after watchdog/kick
+        refresh_running = bool(_SCREEN_CACHE.get("refreshing"))
 
         # Footer (truthful)
         freshness_line = (
@@ -9426,28 +9467,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             freshness_line += "\n_No change since your last /screen._"
 
         msg = (header + "\n" + cached_body + freshness_line).strip()
-
-        # Watchdog: if refresh is stuck too long, kill it and clear state
-        try:
-            if _SCREEN_REFRESH_TASK is not None and _SCREEN_REFRESH_TASK_STARTED_AT:
-                runtime = now_ts - float(_SCREEN_REFRESH_TASK_STARTED_AT)
-                if runtime > float(_SCREEN_REFRESH_MAX_RUNTIME_SEC):
-                    try:
-                        _SCREEN_REFRESH_TASK.cancel()
-                    except Exception:
-                        pass
-                    _SCREEN_REFRESH_TASK = None
-                    _SCREEN_REFRESH_TASK_STARTED_AT = 0.0
-                    _SCREEN_CACHE["refreshing"] = False
-        except Exception:
-            pass
-
-        # Start background refresh if TTL expired
-        try:
-            if (_SCREEN_REFRESH_TASK is None) and (cache_age >= float(SCREEN_CACHE_TTL_SEC)):
-                _SCREEN_REFRESH_TASK = asyncio.create_task(_refresh_screen_cache_async())
-        except Exception:
-            pass
 
         await send_long_message(
             update,
@@ -9471,7 +9490,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         status_msg = await update.message.reply_text("🔎 Scanning market… ~40s")
-        countdown_task = asyncio.create_task(_screen_countdown(status_msg, total_sec=40, step_sec=5))
+        countdown_task = asyncio.create_task(
+            _screen_countdown(status_msg, total_sec=40, step_sec=5)
+        )
 
         reset_reject_tracker()
 
@@ -9483,7 +9504,10 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Hard timeouts so /screen cannot hang forever
         try:
-            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
+            best_fut = await _to_thread_with_timeout(
+                fetch_futures_tickers,
+                SCREEN_FETCH_TIMEOUT_SEC
+            )
         except asyncio.TimeoutError:
             try:
                 await status_msg.edit_text("⏱️ /screen timed out while fetching market data. Try again.")
