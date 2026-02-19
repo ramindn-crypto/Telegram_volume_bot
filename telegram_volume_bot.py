@@ -465,7 +465,7 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _cache = _command_guard._cache
 
         # Cache TTL (seconds). Keep short so plan changes propagate quickly.
-        CACHE_TTL = 8.0
+        CACHE_TTL = 60.0
 
         # Commands that should always work even if user is locked (no access check)
         ACCESS_EXEMPT = {"start", "help", "commands", "billing", "guide_full"}
@@ -499,7 +499,7 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 access_ok = bool(ent.get("access_ok", False))
                 is_pro = bool(ent.get("is_pro", False))
             else:
-                access_ok = bool(enforce_access_or_block(update, cmd))
+                access_ok = await asyncio.to_thread(enforce_access_or_block, update, cmd)
                 # Only compute pro flag if needed later; but cheap enough to cache now
                 try:
                     is_pro = bool(user_has_pro(uid))
@@ -10855,7 +10855,16 @@ def _is_admin(update: Update) -> bool:
         return False
 
 def _db():
-    return sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(
+        DB_PATH,
+        timeout=5,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    return con
+
 
 def _user_ident_str(uid: int) -> str:
     return f"uid={uid}"
