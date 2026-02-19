@@ -9331,6 +9331,14 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ---- local, /screen-only timeouts (prevents NameError + avoids long stale cache) ----
+    # If you later define globals, these will still work. If not, /screen stays stable.
+    FETCH_TIMEOUT_SEC = int(os.environ.get("SCREEN_FETCH_TIMEOUT_SEC", "60"))
+    BUILD_TIMEOUT_SEC = int(os.environ.get("SCREEN_BUILD_TIMEOUT_SEC", "60"))
+
+    # Force a synchronous refresh if cache is older than this (fixes "same output after 15 min")
+    FORCE_SYNC_AFTER_SEC = int(os.environ.get("SCREEN_FORCE_SYNC_AFTER_SEC", "60"))
+
     # Header (always fresh)
     now_utc = datetime.now(timezone.utc)
     session_disp = (_session_label_utc(now_utc) or "NONE")
@@ -9355,7 +9363,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cache_age = (now_ts - ts)
 
-        # Watchdog: if the background refresh got stuck, cancel it so we can refresh again.
+        # Watchdog: if background refresh got stuck, cancel it so we can refresh again.
         global _SCREEN_REFRESH_TASK, _SCREEN_REFRESH_TASK_STARTED_AT
         try:
             if _SCREEN_REFRESH_TASK is not None and _SCREEN_REFRESH_TASK_STARTED_AT:
@@ -9369,45 +9377,78 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # ✅ If stale: ALWAYS do a sync refresh so /screen is never stuck on old results
+        # If stale, refresh. If very stale, do synchronous refresh (with retry) so it truly updates.
         if cache_age > float(SCREEN_CACHE_TTL_SEC):
-            try:
-                await update.message.reply_text("🔎 Scanning market… Please wait")
-                reset_reject_tracker()
-
-                # /screen must use LIVE tickers (bypass in-memory TTL cache)
+            if cache_age > float(FORCE_SYNC_AFTER_SEC):
+                # --- sync refresh (allowed to take longer) ---
+                status_msg = None
                 try:
-                    _CACHE.pop("tickers_best_fut", None)
+                    status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
+                    reset_reject_tracker()
+
+                    # /screen must use LIVE tickers (bypass in-memory TTL cache)
+                    try:
+                        _CACHE.pop("tickers_best_fut", None)
+                    except Exception:
+                        pass
+
+                    # Retry once if Bybit is slow
+                    best_fut = None
+                    try:
+                        best_fut = await _to_thread_with_timeout(fetch_futures_tickers, FETCH_TIMEOUT_SEC)
+                    except asyncio.TimeoutError:
+                        # retry with longer timeout
+                        try:
+                            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, max(FETCH_TIMEOUT_SEC, 90))
+                        except Exception:
+                            best_fut = None
+                    except Exception:
+                        best_fut = None
+
+                    if best_fut:
+                        now_utc2 = datetime.now(timezone.utc)
+                        session2 = _guess_session_name_utc(now_utc2)
+
+                        try:
+                            body2, kb2 = await _to_thread_with_timeout(
+                                _build_screen_body_and_kb,
+                                BUILD_TIMEOUT_SEC,
+                                best_fut,
+                                session2,
+                                int(uid),
+                            )
+                        except asyncio.TimeoutError:
+                            # retry build once with longer timeout
+                            body2, kb2 = await _to_thread_with_timeout(
+                                _build_screen_body_and_kb,
+                                max(BUILD_TIMEOUT_SEC, 90),
+                                best_fut,
+                                session2,
+                                int(uid),
+                            )
+
+                        _SCREEN_CACHE["ts"] = time.time()
+                        _SCREEN_CACHE["body"] = body2
+                        _SCREEN_CACHE["kb"] = list(kb2 or [])
+
+                        msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
+                    else:
+                        msg = (msg + "\n\n_⚠️ Market data is slow right now. Try /screen again in ~10–20s._").strip()
+                except Exception:
+                    msg = (msg + "\n\n_⚠️ Updating… try /screen again in ~10–20s._").strip()
+                finally:
+                    try:
+                        if status_msg:
+                            await status_msg.delete()
+                    except Exception:
+                        pass
+            else:
+                # Background refresh (best effort)
+                try:
+                    if _SCREEN_REFRESH_TASK is None:
+                        _SCREEN_REFRESH_TASK = asyncio.create_task(_refresh_screen_cache_async())
                 except Exception:
                     pass
-
-                # ✅ Force fresh candles too (otherwise /screen can repeat same output)
-                try:
-                    for k in list(_CACHE.keys()):
-                        if str(k).startswith("ohlcv:"):
-                            _CACHE.pop(k, None)
-                except Exception:
-                    pass
-
-                best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
-
-                if best_fut:
-                    now_utc2 = datetime.now(timezone.utc)
-                    session2 = _guess_session_name_utc(now_utc2)
-                    body2, kb2 = await _to_thread_with_timeout(
-                        _build_screen_body_and_kb,
-                        SCREEN_BUILD_TIMEOUT_SEC,
-                        best_fut,
-                        session2,
-                        int(uid),
-                    )
-                    _SCREEN_CACHE["ts"] = time.time()
-                    _SCREEN_CACHE["body"] = body2
-                    _SCREEN_CACHE["kb"] = list(kb2 or [])
-                    msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
-                else:
-                    msg = (msg + "\n\n_Still refreshing… try /screen again in ~10–20s._").strip()
-            except Exception:
                 msg = (msg + "\n\n_Updating in background… run /screen again in ~10–20s for freshest results._").strip()
 
         await send_long_message(
@@ -9438,29 +9479,23 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # ✅ Force fresh candles for /screen
+        # Fetch with retry (Bybit can be slow)
+        best_fut = None
         try:
-            for k in list(_CACHE.keys()):
-                if str(k).startswith("ohlcv:"):
-                    _CACHE.pop(k, None)
-        except Exception:
-            pass
-
-        # Hard timeouts so /screen cannot hang forever
-        try:
-            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
+            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, FETCH_TIMEOUT_SEC)
         except asyncio.TimeoutError:
+            try:
+                best_fut = await _to_thread_with_timeout(fetch_futures_tickers, max(FETCH_TIMEOUT_SEC, 90))
+            except Exception:
+                best_fut = None
+        except Exception:
+            best_fut = None
+
+        if not best_fut:
             try:
                 await status_msg.edit_text("⏱️ /screen timed out while fetching market data. Try again.")
             except Exception:
                 await update.message.reply_text("⏱️ /screen timed out while fetching market data. Try again.")
-            return
-
-        if not best_fut:
-            try:
-                await status_msg.edit_text("❌ Failed to fetch futures data.")
-            except Exception:
-                await update.message.reply_text("❌ Failed to fetch futures data.")
             return
 
         # Fresh header
@@ -9477,32 +9512,27 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Build under screen lock so we don't spam heavy builds
         async with _SCREEN_LOCK:
-            now_ts = time.time()
-            if (
-                _SCREEN_CACHE.get("body")
-                and (now_ts - float(_SCREEN_CACHE.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))
-            ):
-                body = str(_SCREEN_CACHE.get("body") or "")
-                kb = list(_SCREEN_CACHE.get("kb") or [])
-            else:
-                try:
-                    body, kb = await _to_thread_with_timeout(
-                        _build_screen_body_and_kb,
-                        SCREEN_BUILD_TIMEOUT_SEC,
-                        best_fut,
-                        session,
-                        int(uid),
-                    )
-                except asyncio.TimeoutError:
-                    try:
-                        await status_msg.edit_text("⏱️ /screen timed out while building results. Try again.")
-                    except Exception:
-                        await update.message.reply_text("⏱️ /screen timed out while building results. Try again.")
-                    return
+            try:
+                body, kb = await _to_thread_with_timeout(
+                    _build_screen_body_and_kb,
+                    BUILD_TIMEOUT_SEC,
+                    best_fut,
+                    session,
+                    int(uid),
+                )
+            except asyncio.TimeoutError:
+                # retry build once with longer timeout
+                body, kb = await _to_thread_with_timeout(
+                    _build_screen_body_and_kb,
+                    max(BUILD_TIMEOUT_SEC, 90),
+                    best_fut,
+                    session,
+                    int(uid),
+                )
 
-                _SCREEN_CACHE["ts"] = time.time()
-                _SCREEN_CACHE["body"] = body
-                _SCREEN_CACHE["kb"] = list(kb or [])
+            _SCREEN_CACHE["ts"] = time.time()
+            _SCREEN_CACHE["body"] = body
+            _SCREEN_CACHE["kb"] = list(kb or [])
 
         msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
         keyboard = []  # TradingView buttons disabled
@@ -9536,6 +9566,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 SCAN_LOCK.release()
         except Exception:
             pass
+
 
 
     
