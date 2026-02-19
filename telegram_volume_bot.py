@@ -9317,6 +9317,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     kb = []  # TradingView buttons disabled for /screen
     return body, kb
     
+
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/screen — allowed to take longer, but must never hang or go silent."""
     uid = update.effective_user.id
@@ -9368,47 +9369,45 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # If stale: refresh in background (best effort). If VERY stale: do sync refresh (allowed to take longer).
+        # ✅ If stale: ALWAYS do a sync refresh so /screen is never stuck on old results
         if cache_age > float(SCREEN_CACHE_TTL_SEC):
-            if cache_age > float(_SCREEN_FORCE_SYNC_AFTER_SEC):
-                # Sync refresh to avoid hours-old results
+            try:
+                await update.message.reply_text("🔎 Scanning market… Please wait")
+                reset_reject_tracker()
+
+                # /screen must use LIVE tickers (bypass in-memory TTL cache)
                 try:
-                    await update.message.reply_text("🔎 Scanning market… Please wait")
-                    reset_reject_tracker()
-
-                    # /screen must use LIVE tickers (bypass in-memory TTL cache)
-                    try:
-                        _CACHE.pop("tickers_best_fut", None)
-                    except Exception:
-                        pass
-
-                    best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
-
-                    if best_fut:
-                        now_utc2 = datetime.now(timezone.utc)
-                        session2 = _guess_session_name_utc(now_utc2)
-                        body2, kb2 = await _to_thread_with_timeout(
-                            _build_screen_body_and_kb,
-                            SCREEN_BUILD_TIMEOUT_SEC,
-                            best_fut,
-                            session2,
-                            int(uid),
-                        )
-                        _SCREEN_CACHE["ts"] = time.time()
-                        _SCREEN_CACHE["body"] = body2
-                        _SCREEN_CACHE["kb"] = list(kb2 or [])
-                        msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
-                    else:
-                        msg = (msg + "\n\n_Still refreshing… try /screen again in ~10–20s._").strip()
-                except Exception:
-                    msg = (msg + "\n\n_Updating in background… run /screen again in ~10–20s for freshest results._").strip()
-            else:
-                # Background refresh
-                try:
-                    if _SCREEN_REFRESH_TASK is None:
-                        _SCREEN_REFRESH_TASK = asyncio.create_task(_refresh_screen_cache_async())
+                    _CACHE.pop("tickers_best_fut", None)
                 except Exception:
                     pass
+
+                # ✅ Force fresh candles too (otherwise /screen can repeat same output)
+                try:
+                    for k in list(_CACHE.keys()):
+                        if str(k).startswith("ohlcv:"):
+                            _CACHE.pop(k, None)
+                except Exception:
+                    pass
+
+                best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
+
+                if best_fut:
+                    now_utc2 = datetime.now(timezone.utc)
+                    session2 = _guess_session_name_utc(now_utc2)
+                    body2, kb2 = await _to_thread_with_timeout(
+                        _build_screen_body_and_kb,
+                        SCREEN_BUILD_TIMEOUT_SEC,
+                        best_fut,
+                        session2,
+                        int(uid),
+                    )
+                    _SCREEN_CACHE["ts"] = time.time()
+                    _SCREEN_CACHE["body"] = body2
+                    _SCREEN_CACHE["kb"] = list(kb2 or [])
+                    msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
+                else:
+                    msg = (msg + "\n\n_Still refreshing… try /screen again in ~10–20s._").strip()
+            except Exception:
                 msg = (msg + "\n\n_Updating in background… run /screen again in ~10–20s for freshest results._").strip()
 
         await send_long_message(
@@ -9436,6 +9435,14 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # /screen must use LIVE tickers (bypass in-memory TTL cache)
         try:
             _CACHE.pop("tickers_best_fut", None)
+        except Exception:
+            pass
+
+        # ✅ Force fresh candles for /screen
+        try:
+            for k in list(_CACHE.keys()):
+                if str(k).startswith("ohlcv:"):
+                    _CACHE.pop(k, None)
         except Exception:
             pass
 
