@@ -9331,13 +9331,25 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---- local, /screen-only timeouts (prevents NameError + avoids long stale cache) ----
-    # If you later define globals, these will still work. If not, /screen stays stable.
+    # /screen-only timeouts (local fallback; avoids NameError)
     FETCH_TIMEOUT_SEC = int(os.environ.get("SCREEN_FETCH_TIMEOUT_SEC", "60"))
     BUILD_TIMEOUT_SEC = int(os.environ.get("SCREEN_BUILD_TIMEOUT_SEC", "60"))
 
-    # Force a synchronous refresh if cache is older than this (fixes "same output after 15 min")
+    # If cache is older than this, force a sync refresh (so it updates)
     FORCE_SYNC_AFTER_SEC = int(os.environ.get("SCREEN_FORCE_SYNC_AFTER_SEC", "60"))
+
+    # If SCAN_LOCK is stuck longer than this, force-release it (prevents endless "scan is running")
+    SCAN_STUCK_SEC = int(os.environ.get("SCREEN_SCAN_STUCK_SEC", "90"))
+
+    # Absolute cap for a whole /screen scan attempt (guarantees lock release)
+    SCREEN_TOTAL_TIMEOUT_SEC = int(os.environ.get("SCREEN_TOTAL_TIMEOUT_SEC", "110"))
+
+    # Track scan start time (used only by /screen watchdog)
+    global _SCREEN_SCAN_STARTED_AT
+    try:
+        _SCREEN_SCAN_STARTED_AT
+    except Exception:
+        _SCREEN_SCAN_STARTED_AT = 0.0
 
     # Header (always fresh)
     now_utc = datetime.now(timezone.utc)
@@ -9355,7 +9367,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cached_body = str(_SCREEN_CACHE.get("body") or "").strip()
 
     # ----------------------------
-    # 1) INSTANT PATH (serve cache)
+    # 1) FAST PATH (serve cache)
     # ----------------------------
     if cached_body:
         msg = (header + "\n" + cached_body).strip()
@@ -9363,93 +9375,51 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cache_age = (now_ts - ts)
 
-        # Watchdog: if background refresh got stuck, cancel it so we can refresh again.
-        global _SCREEN_REFRESH_TASK, _SCREEN_REFRESH_TASK_STARTED_AT
-        try:
-            if _SCREEN_REFRESH_TASK is not None and _SCREEN_REFRESH_TASK_STARTED_AT:
-                if (now_ts - float(_SCREEN_REFRESH_TASK_STARTED_AT)) > float(_SCREEN_REFRESH_MAX_RUNTIME_SEC):
-                    try:
-                        _SCREEN_REFRESH_TASK.cancel()
-                    except Exception:
-                        pass
-                    _SCREEN_REFRESH_TASK = None
-                    _SCREEN_REFRESH_TASK_STARTED_AT = 0.0
-        except Exception:
-            pass
+        # If stale enough, do synchronous refresh to ensure updates
+        if cache_age > float(SCREEN_CACHE_TTL_SEC) and cache_age > float(FORCE_SYNC_AFTER_SEC):
+            status_msg = None
+            try:
+                status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
+                reset_reject_tracker()
 
-        # If stale, refresh. If very stale, do synchronous refresh (with retry) so it truly updates.
-        if cache_age > float(SCREEN_CACHE_TTL_SEC):
-            if cache_age > float(FORCE_SYNC_AFTER_SEC):
-                # --- sync refresh (allowed to take longer) ---
-                status_msg = None
+                # /screen must use LIVE tickers (bypass in-memory TTL cache)
                 try:
-                    status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
-                    reset_reject_tracker()
-
-                    # /screen must use LIVE tickers (bypass in-memory TTL cache)
-                    try:
-                        _CACHE.pop("tickers_best_fut", None)
-                    except Exception:
-                        pass
-
-                    # Retry once if Bybit is slow
-                    best_fut = None
-                    try:
-                        best_fut = await _to_thread_with_timeout(fetch_futures_tickers, FETCH_TIMEOUT_SEC)
-                    except asyncio.TimeoutError:
-                        # retry with longer timeout
-                        try:
-                            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, max(FETCH_TIMEOUT_SEC, 90))
-                        except Exception:
-                            best_fut = None
-                    except Exception:
-                        best_fut = None
-
-                    if best_fut:
-                        now_utc2 = datetime.now(timezone.utc)
-                        session2 = _guess_session_name_utc(now_utc2)
-
-                        try:
-                            body2, kb2 = await _to_thread_with_timeout(
-                                _build_screen_body_and_kb,
-                                BUILD_TIMEOUT_SEC,
-                                best_fut,
-                                session2,
-                                int(uid),
-                            )
-                        except asyncio.TimeoutError:
-                            # retry build once with longer timeout
-                            body2, kb2 = await _to_thread_with_timeout(
-                                _build_screen_body_and_kb,
-                                max(BUILD_TIMEOUT_SEC, 90),
-                                best_fut,
-                                session2,
-                                int(uid),
-                            )
-
-                        _SCREEN_CACHE["ts"] = time.time()
-                        _SCREEN_CACHE["body"] = body2
-                        _SCREEN_CACHE["kb"] = list(kb2 or [])
-
-                        msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
-                    else:
-                        msg = (msg + "\n\n_⚠️ Market data is slow right now. Try /screen again in ~10–20s._").strip()
-                except Exception:
-                    msg = (msg + "\n\n_⚠️ Updating… try /screen again in ~10–20s._").strip()
-                finally:
-                    try:
-                        if status_msg:
-                            await status_msg.delete()
-                    except Exception:
-                        pass
-            else:
-                # Background refresh (best effort)
-                try:
-                    if _SCREEN_REFRESH_TASK is None:
-                        _SCREEN_REFRESH_TASK = asyncio.create_task(_refresh_screen_cache_async())
+                    _CACHE.pop("tickers_best_fut", None)
                 except Exception:
                     pass
-                msg = (msg + "\n\n_Updating in background… run /screen again in ~10–20s for freshest results._").strip()
+
+                # Fetch
+                best_fut = await _to_thread_with_timeout(fetch_futures_tickers, FETCH_TIMEOUT_SEC)
+
+                if best_fut:
+                    now_utc2 = datetime.now(timezone.utc)
+                    session2 = _guess_session_name_utc(now_utc2)
+
+                    body2, kb2 = await _to_thread_with_timeout(
+                        _build_screen_body_and_kb,
+                        BUILD_TIMEOUT_SEC,
+                        best_fut,
+                        session2,
+                        int(uid),
+                    )
+
+                    _SCREEN_CACHE["ts"] = time.time()
+                    _SCREEN_CACHE["body"] = body2
+                    _SCREEN_CACHE["kb"] = list(kb2 or [])
+
+                    msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
+                else:
+                    msg = (msg + "\n\n_⚠️ Market data is slow right now. Try /screen again in ~10–20s._").strip()
+            except asyncio.TimeoutError:
+                msg = (msg + "\n\n_⏱️ Timed out. Try /screen again in ~10–20s._").strip()
+            except Exception:
+                msg = (msg + "\n\n_⚠️ Updating… try /screen again in ~10–20s._").strip()
+            finally:
+                try:
+                    if status_msg:
+                        await status_msg.delete()
+                except Exception:
+                    pass
 
         await send_long_message(
             update,
@@ -9461,41 +9431,53 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ---------------------------------------------------------
-    # 2) NO CACHE YET — DO A REAL SCAN (one-at-a-time, protected)
+    # 2) NO CACHE YET — REAL SCAN (one-at-a-time, with watchdog)
     # ---------------------------------------------------------
-    if SCAN_LOCK.locked():
-        await update.message.reply_text("⏳ Scan is running… please try /screen again in a moment.")
-        return
 
+    # If scan lock is stuck too long, force release it (prevents endless "scan is running")
+    if SCAN_LOCK.locked():
+        try:
+            started = float(_SCREEN_SCAN_STARTED_AT or 0.0)
+        except Exception:
+            started = 0.0
+
+        if started and (time.time() - started) > float(SCAN_STUCK_SEC):
+            try:
+                SCAN_LOCK.release()
+            except Exception:
+                pass
+            _SCREEN_SCAN_STARTED_AT = 0.0
+        else:
+            await update.message.reply_text("⏳ Scan is running… please try /screen again in a moment.")
+            return
+
+    # Acquire lock
     await SCAN_LOCK.acquire()
+    _SCREEN_SCAN_STARTED_AT = time.time()
+
     status_msg = None
     try:
         status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
         reset_reject_tracker()
 
-        # /screen must use LIVE tickers (bypass in-memory TTL cache)
-        try:
-            _CACHE.pop("tickers_best_fut", None)
-        except Exception:
-            pass
-
-        # Fetch with retry (Bybit can be slow)
-        best_fut = None
-        try:
-            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, FETCH_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
+        # hard cap the whole scan so lock cannot remain stuck
+        async def _do_scan_once():
+            # /screen must use LIVE tickers (bypass in-memory TTL cache)
             try:
-                best_fut = await _to_thread_with_timeout(fetch_futures_tickers, max(FETCH_TIMEOUT_SEC, 90))
+                _CACHE.pop("tickers_best_fut", None)
             except Exception:
-                best_fut = None
-        except Exception:
-            best_fut = None
+                pass
+
+            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, FETCH_TIMEOUT_SEC)
+            return best_fut
+
+        best_fut = await asyncio.wait_for(_do_scan_once(), timeout=float(SCREEN_TOTAL_TIMEOUT_SEC))
 
         if not best_fut:
             try:
-                await status_msg.edit_text("⏱️ /screen timed out while fetching market data. Try again.")
+                await status_msg.edit_text("❌ Failed to fetch futures data.")
             except Exception:
-                await update.message.reply_text("⏱️ /screen timed out while fetching market data. Try again.")
+                await update.message.reply_text("❌ Failed to fetch futures data.")
             return
 
         # Fresh header
@@ -9512,24 +9494,13 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Build under screen lock so we don't spam heavy builds
         async with _SCREEN_LOCK:
-            try:
-                body, kb = await _to_thread_with_timeout(
-                    _build_screen_body_and_kb,
-                    BUILD_TIMEOUT_SEC,
-                    best_fut,
-                    session,
-                    int(uid),
-                )
-            except asyncio.TimeoutError:
-                # retry build once with longer timeout
-                body, kb = await _to_thread_with_timeout(
-                    _build_screen_body_and_kb,
-                    max(BUILD_TIMEOUT_SEC, 90),
-                    best_fut,
-                    session,
-                    int(uid),
-                )
-
+            body, kb = await _to_thread_with_timeout(
+                _build_screen_body_and_kb,
+                BUILD_TIMEOUT_SEC,
+                best_fut,
+                session,
+                int(uid),
+            )
             _SCREEN_CACHE["ts"] = time.time()
             _SCREEN_CACHE["body"] = body
             _SCREEN_CACHE["kb"] = list(kb or [])
@@ -9551,6 +9522,16 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
         )
 
+    except asyncio.TimeoutError:
+        # total scan timeout (watchdog)
+        try:
+            if status_msg:
+                await status_msg.edit_text("⏱️ /screen timed out. Please try again in ~10–20s.")
+            else:
+                await update.message.reply_text("⏱️ /screen timed out. Please try again in ~10–20s.")
+        except Exception:
+            pass
+
     except Exception as e:
         logger.exception("screen_cmd failed")
         try:
@@ -9560,14 +9541,14 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"❌ /screen failed: {e}")
         except Exception:
             pass
+
     finally:
+        _SCREEN_SCAN_STARTED_AT = 0.0
         try:
             if SCAN_LOCK.locked():
                 SCAN_LOCK.release()
         except Exception:
             pass
-
-
 
     
 # =========================================================
