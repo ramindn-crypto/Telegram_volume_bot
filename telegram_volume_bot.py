@@ -852,12 +852,6 @@ EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
 EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 
-# ---------------- SCREEN CONFIG ----------------
-SCREEN_FETCH_TIMEOUT_SEC = 25
-SCREEN_BUILD_TIMEOUT_SEC = 30
-SCREEN_MAX_CACHE_AGE_SEC = 120
-
-
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
 TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFuturesBot").strip()
 
@@ -8954,6 +8948,10 @@ def user_location_and_time(user: dict):
 # =========================================================
 SCREEN_CACHE_TTL_SEC = 20  # seconds
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
+# /screen hard timeouts (queue + network + build)
+SCREEN_FETCH_TIMEOUT_SEC = int(os.environ.get('SCREEN_FETCH_TIMEOUT_SEC', '120'))
+SCREEN_BUILD_TIMEOUT_SEC = int(os.environ.get('SCREEN_BUILD_TIMEOUT_SEC', '120'))
+
 _SCREEN_CACHE = {
     "ts": 0.0,
     "body": "",
@@ -8978,7 +8976,7 @@ async def _refresh_screen_cache_async():
     _SCREEN_REFRESH_TASK_STARTED_AT = time.time()
     try:
         # Hard timeout so a stuck network call doesn't freeze refresh for hours
-        best_fut = await asyncio.wait_for(to_thread_heavy(fetch_futures_tickers), timeout=25)
+        best_fut = await asyncio.wait_for(to_thread_heavy(fetch_futures_tickers), timeout=SCREEN_FETCH_TIMEOUT_SEC)
         if not best_fut:
             return
 
@@ -8988,7 +8986,7 @@ async def _refresh_screen_cache_async():
         # Heavy build in thread + timeout
         body, kb = await asyncio.wait_for(
             to_thread_heavy(_build_screen_body_and_kb, best_fut, session, 0),
-            timeout=25
+            timeout=SCREEN_BUILD_TIMEOUT_SEC
         )
 
         _SCREEN_CACHE["ts"] = time.time()
