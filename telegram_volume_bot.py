@@ -1,3 +1,41 @@
+# =========================================================
+# RENDER WEB SERVICE KEEPALIVE (optional)
+# =========================================================
+def start_keepalive_http_server():
+    """
+    Render 'Web Service' expects the process to bind to $PORT.
+    If you deploy this bot as a Web Service (instead of a Background Worker),
+    we start a tiny HTTP server on $PORT so Render keeps it alive, while the bot
+    still runs polling in the same process.
+    """
+    try:
+        port = int(os.environ.get("PORT", "10000"))
+    except Exception:
+        port = 10000
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"ok")
+            except Exception:
+                pass
+
+        def log_message(self, fmt, *args):
+            # quiet
+            return
+
+    try:
+        srv = HTTPServer(("0.0.0.0", port), _Handler)
+    except Exception as e:
+        logger.warning("Keepalive HTTP server failed to bind on PORT=%s: %s", port, e)
+        return
+
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    logger.info("Keepalive HTTP server started on 0.0.0.0:%s", port)
+
 _LAST_SCAN_UNIVERSE = []
 
 #!/usr/bin/env python3
@@ -11299,9 +11337,10 @@ async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    # Hard guard: Background Worker ONLY
+    # Render note: if deployed as a Web Service, bind to $PORT so Render keeps the service alive.
     if os.environ.get("RENDER_SERVICE_TYPE") == "web":
-        raise SystemExit("Web service detected — polling disabled.")
+        start_keepalive_http_server()
+        logger.warning("Running in Render Web Service mode: keepalive HTTP server enabled; polling will still run.")
 
     # Single instance guard (Render overlap protection)
     render_primary_only()
@@ -11437,3 +11476,7 @@ def main():
         logger.error("Another instance is polling. Sleeping forever.")
         while True:
             time.sleep(3600)
+
+
+if __name__ == "__main__":
+    main()
