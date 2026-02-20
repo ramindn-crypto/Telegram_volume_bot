@@ -1,43 +1,4 @@
-# =========================================================
-# RENDER WEB SERVICE KEEPALIVE (optional)
-# =========================================================
-def start_keepalive_http_server():
-    """
-    Render 'Web Service' expects the process to bind to $PORT.
-    If you deploy this bot as a Web Service (instead of a Background Worker),
-    we start a tiny HTTP server on $PORT so Render keeps it alive, while the bot
-    still runs polling in the same process.
-    """
-    try:
-        port = int(os.environ.get("PORT", "10000"))
-    except Exception:
-        port = 10000
-
-    class _Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(b"ok")
-            except Exception:
-                pass
-
-        def log_message(self, fmt, *args):
-            # quiet
-            return
-
-    try:
-        srv = HTTPServer(("0.0.0.0", port), _Handler)
-    except Exception as e:
-        logger.warning("Keepalive HTTP server failed to bind on PORT=%s: %s", port, e)
-        return
-
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    logger.info("Keepalive HTTP server started on 0.0.0.0:%s", port)
-
-_LAST_SCAN_UNIVERSE = []
-
+_LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
 #!/usr/bin/env python3
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
@@ -82,14 +43,12 @@ import base64
 import tempfile
 
 import os
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Bot,
-    BotCommand,
-    MenuButtonCommands,
 )
 
 
@@ -102,73 +61,11 @@ from telegram.ext import (
     ApplicationHandlerStop,
 )
 
-# =========================================================
-# PERFORMANCE: Dedicated thread pools (prevents lag spikes)
-# - FAST pool: tiny DB / access checks
-# - HEAVY pool: market scans, signal building, email job work
-# This prevents long scans from starving quick commands like /start, /status, /size.
-# =========================================================
-from concurrent.futures import ThreadPoolExecutor
-import functools as _functools
-
-_FAST_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("FAST_EXECUTOR_WORKERS", "8")))
-_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "2")))
-
-async def _run_in_executor(executor, fn, *args, timeout: int | None = None, **kwargs):
-    loop = asyncio.get_running_loop()
-    call = _functools.partial(fn, *args, **kwargs)
-    fut = loop.run_in_executor(executor, call)
-    return await asyncio.wait_for(fut, timeout=timeout) if timeout else await fut
-
-async def to_thread_fast(fn, *args, timeout: int | None = None, **kwargs):
-    return await _run_in_executor(_FAST_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
-
-async def to_thread_heavy(fn, *args, timeout: int | None = None, **kwargs):
-    return await _run_in_executor(_HEAVY_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
-
 
 import re
 import sqlite3
 
 TXID_REGEX = re.compile(r"^[A-Fa-f0-9]{64}$")
-
-
-
-def _ensure_three_tps(entry: float, sl: float, tp3: float, tp1, tp2, side: str):
-    """Ensure TP1/TP2/TP3 exist. If TP1/TP2 missing, derive them proportionally between entry and TP3.
-    Uses 40/40/20 allocation convention for labels only.
-    """
-    try:
-        e = float(entry or 0.0)
-        t3 = float(tp3 or 0.0)
-        _ = float(sl or 0.0)
-    except Exception:
-        return tp1, tp2, tp3
-    if not (e and t3):
-        return tp1, tp2, tp3
-    side_u = str(side or "").upper().strip()
-    # If tp1/tp2 are missing or zero, derive
-    try:
-        t1_ok = tp1 not in (None, 0, 0.0, "")
-        t2_ok = tp2 not in (None, 0, 0.0, "")
-    except Exception:
-        t1_ok = t2_ok = False
-    if t1_ok and t2_ok:
-        return float(tp1), float(tp2), float(tp3)
-    # Derived targets: 40% and 80% of the way from entry to TP3
-    try:
-        if side_u == "SELL":
-            # tp3 should be below entry for sell; but if not, still compute directionally
-            t1 = e + (t3 - e) * 0.4
-            t2 = e + (t3 - e) * 0.8
-        else:
-            t1 = e + (t3 - e) * 0.4
-            t2 = e + (t3 - e) * 0.8
-        return float(t1), float(t2), float(tp3)
-    except Exception:
-        return tp1, tp2, tp3
-
-_LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
 
 def is_valid_txid(txid: str) -> bool:
     return bool(TXID_REGEX.match(txid))
@@ -304,7 +201,7 @@ PRO_ONLY_COMMANDS = {
     "report_daily", "report_weekly", "report_overall",
 }
 
-def enforce_access_or_block_legacy(update: Update, command: str) -> bool:
+def enforce_access_or_block(update: Update, command: str) -> bool:
     uid = update.effective_user.id
     if is_admin_user(uid):
         return True
@@ -342,217 +239,55 @@ def enforce_access_or_block_legacy(update: Update, command: str) -> bool:
             pass
     return False
 
-
-# =========================================================
-# CHANNEL SUBSCRIPTION GATE (optional)
-# =========================================================
-REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "").strip()  # e.g. "@PulseFutures" or "-1001234567890"
-REQUIRED_CHANNEL_JOIN_URL = os.getenv("REQUIRED_CHANNEL_JOIN_URL", "").strip()  # e.g. "https://t.me/PulseFutures"
-# What we SHOW to users (name/link), even if REQUIRED_CHANNEL is a numeric channel id.
-REQUIRED_CHANNEL_DISPLAY = os.getenv("REQUIRED_CHANNEL_DISPLAY", "@PulseFutures").strip() or "@PulseFutures"
-REQUIRED_CHANNEL_PUBLIC_URL = os.getenv("REQUIRED_CHANNEL_PUBLIC_URL", "https://t.me/PulseFutures").strip() or "https://t.me/PulseFutures"
-
-# Cache channel membership checks to keep commands instant (Telegram API calls can be slow / rate-limited)
-_SUB_CACHE = {}  # user_id -> (ok: bool, ts: int)
-SUB_CACHE_TTL_SEC = int(os.getenv("SUB_CACHE_TTL_SEC", "1800"))
-SUB_CACHE_NEG_TTL_SEC = int(os.getenv("SUB_CACHE_NEG_TTL_SEC", "60"))
-  # e.g. "https://t.me/PulseFutures"
-
-async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
-    """Returns True if user is a member of REQUIRED_CHANNEL (member/admin/creator)."""
-
-    if not REQUIRED_CHANNEL:
-        return True
-
-    # Admins bypass channel gate
-    try:
-        if is_admin_user(int(user_id)):
-            return True
-    except Exception:
-        pass
-
-    # Cached membership check
-    try:
-        now_ts = int(time.time())
-        cached = _SUB_CACHE.get(int(user_id))
-        if cached:
-            ok, ts = cached
-            ok = bool(ok)
-            age = now_ts - int(ts)
-            # Cache positives longer; cache negatives briefly so 'I just joined' works immediately.
-            ttl = int(SUB_CACHE_TTL_SEC) if ok else int(SUB_CACHE_NEG_TTL_SEC)
-            if age <= ttl:
-                return bool(ok)
-    except Exception:
-        pass
-
-    chat_id_to_check = REQUIRED_CHANNEL
-
-    try:
-        global _REQUIRED_CHANNEL_ID
-    except Exception:
-        _REQUIRED_CHANNEL_ID = None
-
-    try:
-        if _REQUIRED_CHANNEL_ID is None:
-            ch = await bot.get_chat(REQUIRED_CHANNEL)
-            _REQUIRED_CHANNEL_ID = int(getattr(ch, "id"))
-        if _REQUIRED_CHANNEL_ID:
-            chat_id_to_check = int(_REQUIRED_CHANNEL_ID)
-    except Exception:
-        chat_id_to_check = REQUIRED_CHANNEL
-
-    async def _check(chat_id_val):
-        cm = await bot.get_chat_member(
-            chat_id=chat_id_val,
-            user_id=int(user_id)
-        )
-        status = str(getattr(cm, "status", "") or "").lower()
-        return status in {"member", "administrator", "creator"}
-
-    try:
-        ok = await _check(chat_id_to_check)
-    except Exception:
-        try:
-            ok = await _check(REQUIRED_CHANNEL)
-        except Exception as e:
-            try:
-                global _CHANNEL_GATE_WARN_TS
-            except Exception:
-                _CHANNEL_GATE_WARN_TS = 0
-
-            try:
-                now_ts = int(time.time())
-                if now_ts - int(_CHANNEL_GATE_WARN_TS or 0) > 900:
-                    _CHANNEL_GATE_WARN_TS = now_ts
-                    err = f"{type(e).__name__}: {e}"
-
-                    hint = (
-                        "⚠️ Channel gate check failed. Failing open.\n\n"
-                        f"REQUIRED_CHANNEL={REQUIRED_CHANNEL}\n"
-                        f"Error: {err}\n\n"
-                        "Fix: add the bot as ADMIN in the channel, "
-                        "or set REQUIRED_CHANNEL to the channel ID (-100...)."
-                    )
-
-                    for admin in _admin_ids_all():
-                        try:
-                            await bot.send_message(chat_id=admin, text=hint)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-            ok = True  # fail-open
-
-    try:
-        _SUB_CACHE[int(user_id)] = (bool(ok), int(time.time()))
-    except Exception:
-        pass
-
-    return bool(ok)
-
-async def _reply_subscribe_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        join_url = REQUIRED_CHANNEL_JOIN_URL or REQUIRED_CHANNEL_PUBLIC_URL or (f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}" if REQUIRED_CHANNEL.startswith("@") else "")
-        kb = None
-        if join_url:
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join Channel", url=join_url)]])
-        await update.message.reply_text(
-            "📢 To use PulseFutures, you must join our channel first.\n\n"
-            f"Channel: {REQUIRED_CHANNEL_DISPLAY}\n{REQUIRED_CHANNEL_PUBLIC_URL}\n\n"
-            "After joining, come back and press /start.",
-            reply_markup=kb,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        pass
-
 async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Global guard: locks access after trial + gates Pro-only commands.
-    Optimized: cache access/pro checks so ALL commands feel instant (except /screen can still be heavier downstream).
-    """
+    """Global guard: locks access after trial + gates Pro-only commands."""
     try:
         if not getattr(update, "message", None):
             return
-
         txt = (update.message.text or "").strip()
         if not txt.startswith("/"):
             return
-
         cmd = txt.split()[0][1:].split("@")[0].strip().lower()
 
-        # --- STATIC (function-local) caches to reduce DB hits / lag ---
-        # Cache entries: { uid: {"ts": float, "access_ok": bool, "is_pro": bool} }
-        if not hasattr(_command_guard, "_cache"):
-            _command_guard._cache = {}
-        _cache = _command_guard._cache
+        # 1) Trial/access lock
+        if not enforce_access_or_block(update, cmd):
+            raise ApplicationHandlerStop
 
-        # Cache TTL (seconds). Keep short so plan changes propagate quickly.
-        CACHE_TTL = 60.0
-
-        # Commands that should always work even if user is locked (no access check)
-        ACCESS_EXEMPT = {"start", "help", "commands", "billing", "guide_full"}
-
-        # Commands that should force a fresh access check (never use cache)
-        # (/screen is the only one you said can be slow; we keep it strict/fresh here)
-        FORCE_FRESH = {"screen"}
-
-        # 0) Channel subscription gate (optional)
-        if REQUIRED_CHANNEL:
-            ok = await _is_user_subscribed(context.bot, int(update.effective_user.id))
-            if not ok:
-                # Keep same behavior as your original code
-                if cmd not in ACCESS_EXEMPT:
-                    await _reply_subscribe_required(update, context)
-                    raise ApplicationHandlerStop
-
-                if cmd == "start":
-                    await _reply_subscribe_required(update, context)
-                    raise ApplicationHandlerStop
-
-        # 1) Trial/access lock (optimized)
-        if cmd not in ACCESS_EXEMPT:
-            uid = int(update.effective_user.id)
-
-            now = time.time()
-            ent = _cache.get(uid)
-            use_cache = bool(ent) and (now - float(ent.get("ts", 0.0))) < CACHE_TTL and (cmd not in FORCE_FRESH)
-
-            if use_cache:
-                access_ok = bool(ent.get("access_ok", False))
-                is_pro = bool(ent.get("is_pro", False))
-            else:
-                access_ok = await to_thread_fast(enforce_access_or_block, update, cmd)
-                # Only compute pro flag if needed later; but cheap enough to cache now
+        # 2) Pro-only commands
+        if cmd in PRO_ONLY_COMMANDS:
+            uid = update.effective_user.id
+            if not user_has_pro(uid):
+                
                 try:
-                    is_pro = bool(user_has_pro(uid))
-                except Exception:
-                    is_pro = False
-
-                _cache[uid] = {"ts": now, "access_ok": access_ok, "is_pro": is_pro}
-
-            if not access_ok:
-                raise ApplicationHandlerStop
-
-            # 2) Pro-only commands (use cached pro flag)
-            if cmd in PRO_ONLY_COMMANDS and not is_pro:
-                try:
-                    await update.message.reply_text(
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(update.message.reply_text(
                         "🚀 Pro feature.\n\n"
-                        "This command is available in *Pro* (and during your 7-day trial).\n\n"
+                        "This command is available in **Pro** (and during your 7-day trial).\n\n"
                         "👉 /billing",
-                        parse_mode="Markdown",
-                    )
+                        parse_mode="Markdown"
+                    ))
                 except Exception:
-                    pass
+                    try:
+                        update.message.reply_text(
+                            "🚀 Pro feature.\n\n"
+                            "This command is available in **Pro** (and during your 7-day trial).\n\n"
+                            "👉 /billing",
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
                 raise ApplicationHandlerStop
-
     except ApplicationHandlerStop:
         raise
     except Exception:
         return
 
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+
+STRIPE_PRICE_TO_PLAN = {
+    os.getenv("STRIPE_PRICE_STANDARD"): "standard",
+    os.getenv("STRIPE_PRICE_PRO"): "pro",
+}
 
 def render_primary_only() -> None:
     """
@@ -679,9 +414,6 @@ SCREEN_UNIVERSE_N = 70          # was effectively 35 (inside pick_setups)
 SCREEN_TRIGGER_LOOSEN = 0.85    # 15% easier trigger on /screen only
 SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
 SCREEN_WAITING_N = 10
-
-# EMA proximity gate: never generate setups if price is far from EMA7 (1H)
-EMA7_1H_MAX_DIST_PCT = 0.35  # % distance from EMA7(1H). Example: 0.35 = within 0.35%
 
 # Directional Leaders/Losers thresholds
 MOVER_VOL_USD_MIN = 5_000_000
@@ -2075,7 +1807,7 @@ def get_user(user_id: int) -> dict:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             user_id,
-            tz_name,
+            _name,
             str(DEFAULT_SCAN_PROFILE),
             float(DEFAULT_EQUITY),
             DEFAULT_RISK_MODE,
@@ -2104,7 +1836,7 @@ def get_user(user_id: int) -> dict:
 # =========================================================
 # ACCESS CONTROL (FREE TRIAL + PAYWALL)
 # =========================================================
-def trial_expired_legacy(user: dict) -> bool:
+def trial_expired(user: dict) -> bool:
     try:
         created = datetime.fromisoformat(user["created_at"])
     except Exception:
@@ -2112,7 +1844,7 @@ def trial_expired_legacy(user: dict) -> bool:
     return datetime.utcnow() > created + timedelta(days=FREE_TRIAL_DAYS)
 
 
-def has_active_access_legacy(user: dict) -> bool:
+def has_active_access(user: dict) -> bool:
     if user.get("plan") in ("standard", "pro"):
         return True
     if user.get("plan") == "free" and not trial_expired(user):
@@ -2127,7 +1859,7 @@ def enforce_access_or_block(update: Update, command: str) -> bool:
 
     user = get_user(uid)
 
-    if has_active_access(uid, user):
+    if has_active_access(user, uid):
         return True
 
     if command in ALLOWED_WHEN_LOCKED:
@@ -2994,85 +2726,6 @@ def _user_day_local(user: dict) -> str:
         tz = ZoneInfo("UTC")
     return datetime.now(tz).date().isoformat()
 
-
-def _day_local_for_ts(user: dict, ts: float) -> str:
-    tz_name = str(user.get("tz") or user.get("timezone") or "UTC").strip()
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("UTC")
-    try:
-        return datetime.fromtimestamp(float(ts), tz).date().isoformat()
-    except Exception:
-        return datetime.now(tz).date().isoformat()
-
-def _risk_used_today_from_open_trades(user_id: int, user: dict, day_local: str) -> float:
-    # Use CURRENT open risk (not historical) so RF/close instantly frees capacity.
-    try:
-        opens = db_open_trades(user_id) or []
-    except Exception:
-        opens = []
-    total = 0.0
-    for t in opens:
-        try:
-            if _day_local_for_ts(user, float(t.get("opened_ts") or 0.0)) != str(day_local):
-                continue
-            total += float(t.get("risk_usd") or 0.0)
-        except Exception:
-            continue
-    return float(max(0.0, total))
-
-def _risk_daily_sync(user_id: int, user: dict) -> float:
-    # Make risk_daily consistent even if a trade was logged before risk_daily updates ran.
-    day_local = _user_day_local(user)
-    used = _risk_used_today_from_open_trades(user_id, user, day_local)
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO risk_daily (user_id, day_local, used_risk_usd) VALUES (?, ?, ?) "
-        "ON CONFLICT(user_id, day_local) DO UPDATE SET used_risk_usd=excluded.used_risk_usd",
-        (int(user_id), str(day_local), float(used)),
-    )
-    con.commit()
-    con.close()
-    return float(used)
-
-def _pnl_today_closed_trades(user_id: int, user: dict) -> float:
-    """Sum of realized PnL for trades CLOSED today (user local day)."""
-    day_local = _user_day_local(user)
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute(
-        "SELECT pnl, closed_ts FROM trades WHERE user_id=? AND closed_ts IS NOT NULL",
-        (int(user_id),),
-    )
-    rows = cur.fetchall() or []
-    con.close()
-    total = 0.0
-    for r in rows:
-        try:
-            pnl = float(r["pnl"] or 0.0)
-            cts = float(r["closed_ts"] or 0.0)
-            if cts <= 0:
-                continue
-            if _day_local_for_ts(user, cts) != str(day_local):
-                continue
-            total += pnl
-        except Exception:
-            continue
-    return float(total)
-
-def _risk_used_total_today(user_id: int, user: dict) -> float:
-    """Daily used risk = open risk from trades opened today + realized losses today (PnL<0)."""
-    day_local = _user_day_local(user)
-    open_risk = _risk_used_today_from_open_trades(user_id, user, day_local)
-    pnl_today = _pnl_today_closed_trades(user_id, user)
-    loss_today = max(0.0, -float(pnl_today))
-    return float(max(0.0, open_risk + loss_today))
-
-
-
-
 def db_insert_signal(s: Setup):
     con = db_connect()
     cur = con.cursor()
@@ -3165,36 +2818,6 @@ def db_trades_since(user_id: int, ts_from: float) -> List[dict]:
     con.close()
     return [dict(r) for r in rows]
 
-
-def db_trades_closed_today(user_id: int, user: dict) -> List[dict]:
-    """Trades CLOSED today (user local day), regardless of when they were opened."""
-    day_local = str(_user_day_local(user))
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute(
-        """
-        SELECT * FROM trades
-        WHERE user_id=? AND closed_ts IS NOT NULL
-        ORDER BY closed_ts ASC
-        """,
-        (int(user_id),),
-    )
-    rows = cur.fetchall() or []
-    con.close()
-    out = []
-    for r in rows:
-        try:
-            d = dict(r)
-            cts = float(d.get("closed_ts") or 0.0)
-            if cts <= 0:
-                continue
-            if _day_local_for_ts(user, cts) != day_local:
-                continue
-            out.append(d)
-        except Exception:
-            continue
-    return out
-
 def db_trades_all(user_id: int) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
@@ -3228,7 +2851,7 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(uid, user):
+    if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -3372,37 +2995,6 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
     cache_set(key, data)
     return data
-
-
-def ema7_1h_distance_pct(market_symbol: str) -> Tuple[float, float, float]:
-    """
-    Returns (dist_pct, last_close, ema7_1h).
-    dist_pct is absolute percent distance between last close and EMA7 on 1H candles.
-    """
-    try:
-        c1 = fetch_ohlcv(market_symbol, "1h", limit=40)
-        if not c1 or len(c1) < 10:
-            return 999.0, 0.0, 0.0
-        closes = [float(x[4]) for x in c1]
-        last_close = float(closes[-1])
-        # lightweight EMA
-        period = 7
-        k = 2.0 / (period + 1.0)
-        ema = float(closes[0])
-        for v in closes[1:]:
-            ema = (float(v) * k) + (ema * (1.0 - k))
-        if ema == 0.0:
-            return 999.0, last_close, ema
-        dist_pct = abs((last_close - ema) / ema) * 100.0
-        return dist_pct, last_close, ema
-    except Exception:
-        return 999.0, 0.0, 0.0
-
-
-def ema7_1h_is_close(market_symbol: str, max_dist_pct: float = EMA7_1H_MAX_DIST_PCT) -> Tuple[bool, float, float, float]:
-    dist_pct, last_close, ema = ema7_1h_distance_pct(market_symbol)
-    return (dist_pct <= float(max_dist_pct)), dist_pct, last_close, ema
-
 
 # =========================================================
 # ✅ Session resolution helpers (for /screen + engine)
@@ -4453,14 +4045,6 @@ def make_setup(
         except Exception:
             pass
 
-        # Also bypass cached candles so /screen output actually changes
-        try:
-            for k in list(_CACHE.keys()):
-                if str(k).startswith("ohlcv:"):
-                    _CACHE.pop(k, None)
-        except Exception:
-            pass
-
         # If breakout engine fired, force side to match the breakout direction (prevents green BUY / red mismatch)
         try:
             hint = getattr(mv, "_pf_breakout_hint", None)
@@ -4888,7 +4472,6 @@ def email_config_ok() -> bool:
 def send_email(
     subject: str,
     body: str,
-    body_html: Optional[str] = None,
     user_id_for_debug: Optional[int] = None,
     enforce_trade_window: bool = True
 ) -> bool:
@@ -4981,11 +4564,7 @@ def send_email(
     msg["From"] = EMAIL_FROM
     msg["To"] = to_email
     msg.set_content(body)
-    if body_html:
-        try:
-            msg.add_alternative(body_html, subtype="html")
-        except Exception:
-            pass
+
 
 
       
@@ -5186,42 +4765,44 @@ async def email_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = get_user(uid) or {}
+    user = get_user(uid)
 
     # Always respond immediately
     await update.message.reply_text("📧 Running email test…")
 
-    # Config checks
+    # Show config status clearly
     if not EMAIL_ENABLED:
         await update.message.reply_text("❌ Email is disabled (EMAIL_ENABLED=False). Turn it on in your config/env.")
         return
 
     if not email_config_ok():
+        # If you have a helper that checks env vars, mention it
         await update.message.reply_text(
             "❌ Email config is NOT OK.\n"
-            "Check env vars: EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM.\n"
+            "Check env vars like EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM (and anything your code expects).\n"
             "Tip: run /health_sys and verify Email: enabled/configured."
         )
         return
 
-    # Recipient (match your bot’s keys)
+    # Determine recipient
+    # (Your bot earlier used a per-user email field; adjust key name if yours differs)
     to_email = (user.get("email_to") or user.get("email") or "").strip()
     if not to_email:
         await update.message.reply_text(
             "❌ No recipient email found for your user.\n"
-            "Set it first, e.g. /email your@email.com"
+            "Set it first (whatever your bot uses), e.g. /email your@email.com"
         )
         return
 
-    # Local time (user TZ)
+    # Build a short test message
     tz_name = str(user.get("tz") or "UTC")
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = timezone.utc
         tz_name = "UTC"
-    now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
+    now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
     subject = "PulseFutures — Email Test ✅"
     body = (
         f"{HDR}\n"
@@ -5234,67 +4815,71 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{HDR}\n"
     )
 
+    
+    # Send (run in worker thread so it never blocks other Telegram commands)
     status_msg = await update.message.reply_text("📤 Sending test email…")
-
-    # Clear previous error for clean reporting
     try:
-        _LAST_SMTP_ERROR.pop(uid, None)
-    except Exception:
-        pass
-
-    # Email test should NOT be blocked by user's email master switch
-    prev_enabled = None
-    try:
-        prev_enabled = int((user or {}).get("email_alerts_enabled", 1))
-        if prev_enabled == 0:
-            update_user(uid, email_alerts_enabled=1)
-    except Exception:
-        prev_enabled = None
-
-    try:
-        # IMPORTANT: pass correct kwargs (avoid arg mis-binding)
-        ok = await _send_email_async(
-            int(EMAIL_SEND_TIMEOUT_SEC),
-            subject,
-            body,
-            user_id_for_debug=uid,
-            enforce_trade_window=False,
-        )
+        ok = await _send_email_async(int(EMAIL_SEND_TIMEOUT_SEC), subject, body, uid, False)
     except Exception as e:
         logger.exception("email_test_cmd failed")
-        msg = f"❌ Test email crashed: {type(e).__name__}: {e}"
         try:
-            await status_msg.edit_text(msg)
+            await status_msg.edit_text(f"❌ Test email crashed: {type(e).__name__}: {e}")
         except Exception:
-            await update.message.reply_text(msg)
+            await update.message.reply_text(f"❌ Test email crashed: {type(e).__name__}: {e}")
         return
-    finally:
-        # Restore user's email alerts flag if we temporarily changed it
-        try:
-            if prev_enabled is not None and prev_enabled in (0, 1):
-                update_user(uid, email_alerts_enabled=prev_enabled)
-        except Exception:
-            pass
-
     if ok:
-        try:
-            await status_msg.edit_text(f"✅ Test email SENT to: {to_email}")
-        except Exception:
-            await update.message.reply_text(f"✅ Test email SENT to: {to_email}")
-        return
+        await update.message.reply_text(f"✅ Test email SENT to: {to_email}")
+    else:
+        err = _LAST_SMTP_ERROR.get(uid, "unknown_error")
+        await update.message.reply_text(
+            "❌ Test email FAILED.\n"
+            f"Reason: {err}\n\n"
+            "Common causes:\n"
+            "- Gmail: app password / 2FA issues\n"
+            "- Wrong EMAIL_HOST/PORT (465 SSL vs 587 STARTTLS)\n"
+            "- EMAIL_FROM not matching account\n"
+        )
 
-    # FAILED: show real last smtp error if available
-    err = _LAST_SMTP_ERROR.get(uid) or "unknown_error"
-    await update.message.reply_text(
-        "❌ Test email FAILED.\n"
-        f"Reason: {err}\n\n"
-        "Common causes:\n"
-        "- Gmail: app password / 2FA issues\n"
-        "- Wrong EMAIL_HOST/PORT (465 SSL vs 587 STARTTLS)\n"
-        "- EMAIL_FROM not matching account"
-    )
+def _parse_hhmm_local(s: str) -> Tuple[int, int]:
+    s = (s or "").strip()
+    m = re.match(r"^(\d{2}):(\d{2})$", s)
+    if not m:
+        raise ValueError("bad time")
+    hh = int(m.group(1)); mm = int(m.group(2))
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        raise ValueError("bad time")
+    return hh, mm
 
+def in_trade_window_now(user: dict, now_local: Optional[datetime] = None) -> bool:
+    """
+    If user trade_window_start/end are empty -> allowed (no restriction).
+    Otherwise checks local time window (supports overnight windows).
+    """
+    start_s = str(user.get("trade_window_start") or "").strip()
+    end_s = str(user.get("trade_window_end") or "").strip()
+    if not start_s or not end_s:
+        return True  # disabled => allow
 
+    tz = ZoneInfo(user["tz"])
+    if now_local is None:
+        now_local = datetime.now(tz)
+
+    sh, sm = _parse_hhmm_local(start_s)
+    eh, em = _parse_hhmm_local(end_s)
+
+    start_dt = now_local.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end_dt = now_local.replace(hour=eh, minute=em, second=0, microsecond=0)
+
+    # Overnight window support, e.g. 22:00 -> 06:00
+    if end_dt <= start_dt:
+        # window crosses midnight
+        if now_local >= start_dt:
+            return True
+        # else compare with "yesterday start"
+        start_dt = start_dt - timedelta(days=1)
+        end_dt = end_dt + timedelta(days=1)
+
+    return start_dt <= now_local <= end_dt
 
 async def trade_window_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -5361,10 +4946,10 @@ def user_enabled_sessions(user: dict) -> List[str]:
     except Exception:
         return ['NY']
 
-def _session_label_utc(now_utc: datetime) -> Optional[str]:
+def _guess_session_name_utc(now_utc: datetime) -> str:
     """
     Returns NY/LON/ASIA if within their UTC windows (priority NY > LON > ASIA).
-    Returns None if we are in the gap (not in any defined session window).
+    If we're in the 22:00–24:00 UTC gap, default to NY (keep UI consistent with /screen).
     """
     for name in SESSION_PRIORITY:  # ["NY","LON","ASIA"]
         w = SESSIONS_UTC[name]
@@ -5379,16 +4964,7 @@ def _session_label_utc(now_utc: datetime) -> Optional[str]:
             end_utc -= timedelta(days=1)
         if start_utc <= now_utc <= end_utc:
             return name
-    return None
-
-
-def _guess_session_name_utc(now_utc: datetime) -> str:
-    """
-    Returns NY/LON/ASIA if within their UTC windows (priority NY > LON > ASIA).
-    If we're outside the three main windows (gap), default to NY (keeps /screen logic consistent).
-    """
-    label = _session_label_utc(now_utc)
-    return label or "NY"
+    return "NY"
 
 
 def in_session_now(user: dict) -> Optional[dict]:
@@ -5398,7 +4974,7 @@ def in_session_now(user: dict) -> Optional[dict]:
 
     # NEW: unlimited mode => always return a session (no more NONE)
     if int(user.get("sessions_unlimited", 0) or 0) == 1:
-        name = (_session_label_utc(now_utc) or "NONE")
+        name = _guess_session_name_utc(now_utc)
         session_key = f"{now_utc.strftime('%Y-%m-%d')}_{name}_UNL"
         return {
             "name": name,
@@ -5648,8 +5224,7 @@ def _stats_from_trades(trades: List[dict]) -> dict:
     wins = [t for t in closed if float(t["pnl"]) > 0]
     losses = [t for t in closed if float(t["pnl"]) < 0]
     net = sum(float(t["pnl"]) for t in closed) if closed else 0.0
-    denom = (len(wins) + len(losses))
-    win_rate = (len(wins) / denom * 100.0) if denom else 0.0
+    win_rate = (len(wins) / len(closed) * 100.0) if closed else 0.0
     avg_r = None
     r_vals = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
     if r_vals:
@@ -5824,16 +5399,11 @@ Market & Signals
 /equity
 • Set your equity
 
-/dailycap
-• Set your TOTAL daily risk cap (per day)
-
 /riskmode
-• Set your risk per trade (used by /size)
-
+• Set your risk per trade
 
 /size <symbol> <side> <entry> <sl>
-• Calculates position size based on your per-trade risk
-• Daily cap is shown in /status and updates when trades go Risk-Free
+• Calculates position size based on your risk rules
 
 ────────────────────
 Trade Journal
@@ -5977,14 +5547,19 @@ Not financial advice.
 • View your own plan status (admins too)
 
 ────────────────────
-💳 PAYMENTS
+💳 PAYMENTS (USDT)
 ────────────────────
-/payment_approve <user_id> <payment_id> <standard|pro>
-• Approve a payment received (Stripe or USDT) and grant access
-
 /admin_payments
-• Show all users: User ID / Last Payment Approval / Plan
-  (Plan comes from /admin_grant)
+• View payments ledger
+
+/usdt_pending
+• Show pending USDT requests
+
+/usdt_approve <TXID>
+• Approve payment (grants access + writes ledger)
+
+/usdt_reject <TXID> <reason>
+• Reject payment
 
 ────────────────────
 ⏱️ COOLDOWNS
@@ -6027,21 +5602,6 @@ Channel: @PulseFutures
 Support: @PulseFuturesSupport
 YouTube: @PulseFutures
 Website: https://pulsefutures.com/
-
-
-────────────────────
-🆘 SUPPORT
-────────────────────
-/support_open
-• List open support tickets (admin)
-
-/support_close <TICKET_ID>
-• Close a support ticket
-
-(Users)
- /support <issue>
- /support_status
-
 """\
 
 
@@ -6337,218 +5897,33 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # SUPPORT SYSTEM
 # =========================================================
-
-# Support notifications:
-# - Admin IDs always receive tickets
-# - Optionally forward to a dedicated support group/channel where the bot is admin:
-#     Set SUPPORT_CHAT_ID="-1001234567890"
-SUPPORT_CHAT_ID = os.getenv("SUPPORT_CHAT_ID", "").strip()
-
-def _admin_ids_all() -> List[int]:
-    ids = set()
-    # ADMIN_IDS is used in many places
-    try:
-        for x in (ADMIN_IDS or []):
-            try:
-                ids.add(int(x))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # ADMIN_USER_IDS (legacy)
-    try:
-        for x in (ADMIN_USER_IDS or []):
-            try:
-                ids.add(int(x))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # Single env fallbacks
-    for k in ("ADMIN_TELEGRAM_ID", "OWNER_USER_ID", "ADMIN_ID"):
-        v = os.getenv(k, "").strip()
-        if v:
-            try:
-                ids.add(int(v))
-            except Exception:
-                pass
-    return sorted(ids)
-
-def _support_db_init() -> None:
-    con = None
-    try:
-        con = db_connect()
-        cur = con.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS support_tickets (
-                ticket_id TEXT PRIMARY KEY,
-                user_id INTEGER,
-                username TEXT,
-                message TEXT,
-                status TEXT,
-                created_ts REAL,
-                updated_ts REAL
-            )
-        """)
-        con.commit()
-    except Exception:
-        try:
-            if con:
-                con.rollback()
-        except Exception:
-            pass
-    finally:
-        try:
-            if con:
-                con.close()
-        except Exception:
-            pass
-
-def _support_ticket_create(ticket_id: str, user_id: int, username: str, message: str):
-    _support_db_init()
-    con = db_connect()
-    cur = con.cursor()
-    ts = time.time()
-    cur.execute("""
-        INSERT OR REPLACE INTO support_tickets (ticket_id, user_id, username, message, status, created_ts, updated_ts)
-        VALUES (?, ?, ?, ?, 'OPEN', ?, ?)
-    """, (str(ticket_id), int(user_id), str(username or ""), str(message or ""), float(ts), float(ts)))
-    con.commit()
-    con.close()
-
-def _support_ticket_latest_for_user(user_id: int) -> Optional[dict]:
-    _support_db_init()
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute("SELECT * FROM support_tickets WHERE user_id=? ORDER BY created_ts DESC LIMIT 1", (int(user_id),))
-    r = cur.fetchone()
-    con.close()
-    return dict(r) if r else None
-
-def _support_ticket_list_open(limit: int = 20) -> List[dict]:
-    _support_db_init()
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute("SELECT * FROM support_tickets WHERE status='OPEN' ORDER BY created_ts DESC LIMIT ?", (int(limit),))
-    rows = cur.fetchall() or []
-    con.close()
-    return [dict(x) for x in rows]
-
-def _support_ticket_set_status(ticket_id: str, status: str):
-    _support_db_init()
-    con = db_connect()
-    cur = con.cursor()
-    ts = time.time()
-    cur.execute("UPDATE support_tickets SET status=?, updated_ts=? WHERE ticket_id=?", (str(status), float(ts), str(ticket_id)))
-    con.commit()
-    con.close()
-
 async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = int(update.effective_user.id)
-
+    uid = update.effective_user.id
     if not context.args:
         await update.message.reply_text(
             "Usage:\n/support <your issue>"
         )
         return
 
-    issue = " ".join(context.args).strip()
-    if not issue:
-        await update.message.reply_text(
-            "Usage:\n/support <your issue>"
-        )
-        return
-
+    issue = " ".join(context.args)
     ticket_id = f"TKT-{uid}-{int(time.time())}"
-    username = getattr(update.effective_user, "username", "") or ""
-
-    _support_ticket_create(ticket_id, uid, username, issue)
 
     msg = (
         f"🆘 Support Ticket {ticket_id}\n\n"
-        f"User: {uid} @{username}\n"
+        f"User: {uid}\n"
         f"Message:\n{issue}"
     )
 
-    # Notify admins
-    for admin in _admin_ids_all():
-        try:
-            await context.bot.send_message(admin, msg)
-        except Exception:
-            pass
-
-    # Optional: forward to a dedicated support group/channel
-    if SUPPORT_CHAT_ID:
-        try:
-            await context.bot.send_message(chat_id=SUPPORT_CHAT_ID, text=msg)
-        except Exception:
-            pass
+    for admin in ADMIN_IDS:
+        await context.bot.send_message(admin, msg)
 
     await update.message.reply_text(
         f"✅ Ticket created: {ticket_id}\n"
-        "Use /support_status to check progress."
+        "Use /support_status to check."
     )
 
 
 async def support_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = int(update.effective_user.id)
-    t = _support_ticket_latest_for_user(uid)
-
-    if not t:
-        await update.message.reply_text(
-            "📨 You have no support tickets yet. Use /support <your issue>."
-        )
-        return
-
-    status = str(t.get("status") or "OPEN").upper()
-    tid = str(t.get("ticket_id") or "")
-
-    await update.message.reply_text(
-        f"📨 Latest ticket: {tid}\n"
-        f"Status: {status}\n\n"
-        "If you need to add more info, create a new ticket with /support <your issue>."
-    )
-
-
-
-async def admin_support_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = int(update.effective_user.id)
-    if not is_admin_user(uid):
-        await update.message.reply_text("Admin only.")
-        return
-
-    rows = _support_ticket_list_open(limit=30)
-    if not rows:
-        await update.message.reply_text("✅ No open support tickets.")
-        return
-
-    lines = ["🧾 Open support tickets", HDR]
-    for r in rows:
-        tid = r.get("ticket_id")
-        u = r.get("user_id")
-        un = r.get("username") or ""
-        msg = (r.get("message") or "").strip().replace("\n", " ")
-        if len(msg) > 80:
-            msg = msg[:77] + "..."
-        lines.append(f"- {tid} | {u} @{un} | {msg}")
-    lines.append(HDR)
-    lines.append("Close: /support_close <TICKET_ID>")
-    await send_long_message(update, "\n".join(lines), parse_mode=None, disable_web_page_preview=True)
-
-async def admin_support_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = int(update.effective_user.id)
-    if not is_admin_user(uid):
-        await update.message.reply_text("Admin only.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage:\n/support_close <TICKET_ID>")
-        return
-    tid = str(context.args[0]).strip()
-    _support_ticket_set_status(tid, "CLOSED")
-    await update.message.reply_text(f"✅ Closed: {tid}")
-
-
-async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📨 Your latest support ticket is being reviewed.\n"
         "Resolved tickets are auto-closed."
@@ -6774,91 +6149,55 @@ async def equity_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user(uid, equity=0.0)
     await update.message.reply_text("✅ Equity reset to $0.00")
 
-
 async def riskmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
-
-    # This is PER-TRADE risk used by /size (position sizing).
     if len(context.args) != 2:
-        mode = str(user.get("risk_mode", DEFAULT_RISK_MODE)).upper()
-        val = float(user.get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
-        per_trade_usd = compute_risk_usd(user, mode, val)
-        await update.message.reply_text(
-            f"Risk per trade (used by /size): {mode} {val:.2f} (≈ ${per_trade_usd:.2f} per trade)\n"
-            f"Daily risk cap is separate: /dailycap\n\n"
-            "Set examples:\n"
-            "• /riskmode pct 2.5\n"
-            "• /riskmode usd 25"
-        )
+        await update.message.reply_text(f"Current: {user['risk_mode']} {float(user['risk_value']):.2f}\nUsage: /riskmode pct 2.5  OR  /riskmode usd 25")
         return
-
     mode = context.args[0].strip().upper()
     try:
         val = float(context.args[1])
     except Exception:
         await update.message.reply_text("Usage: /riskmode pct 2.5  OR  /riskmode usd 25")
         return
-
     if mode not in {"PCT", "USD"}:
         await update.message.reply_text("Mode must be pct or usd")
         return
-    if mode == "PCT" and not (0.0 <= val <= 10):
-        await update.message.reply_text("pct per-trade should be between 0 and 10")
+    if mode == "PCT" and not (0.1 <= val <= 10):
+        await update.message.reply_text("pct value should be between 0.1 and 10")
         return
-    if mode == "USD" and val < 0:
-        await update.message.reply_text("usd per-trade must be >= 0")
+    if mode == "USD" and val <= 0:
+        await update.message.reply_text("usd value must be > 0")
         return
-
     update_user(uid, risk_mode=mode, risk_value=val)
-    user = get_user(uid)
-    per_trade_usd = compute_risk_usd(user, mode, val)
-    await update.message.reply_text(
-        f"✅ Risk per trade updated: {mode} {val:.2f} (≈ ${per_trade_usd:.2f} per trade)\n"
-        f"Daily cap is separate: /dailycap"
-    )
+    await update.message.reply_text(f"✅ Risk mode updated: {mode} {val:.2f}")
 
 async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
-
-    # This is TOTAL DAILY risk cap (sum of open risks for today's trades).
     if len(context.args) != 2:
         cap = daily_cap_usd(user)
-        mode = str(user.get("daily_cap_mode", DEFAULT_DAILY_CAP_MODE)).upper()
-        val = float(user.get("daily_cap_value", DEFAULT_DAILY_CAP_VALUE) or DEFAULT_DAILY_CAP_VALUE)
-        await update.message.reply_text(
-            f"Daily risk cap (TOTAL per day): {mode} {val:.2f} (≈ ${cap:.2f} per day)\n"
-            f"Per-trade risk is separate: /riskmode\n\n"
-            "Set examples:\n"
-            "• /dailycap pct 5\n"
-            "• /dailycap usd 60"
-        )
+        await update.message.reply_text(f"Current: {user['daily_cap_mode']} {float(user['daily_cap_value']):.2f} (≈ ${cap:.2f})\nUsage: /dailycap pct 5  OR  /dailycap usd 60")
         return
-
     mode = context.args[0].strip().upper()
     try:
         val = float(context.args[1])
     except Exception:
         await update.message.reply_text("Usage: /dailycap pct 5  OR  /dailycap usd 60")
         return
-
     if mode not in {"PCT", "USD"}:
         await update.message.reply_text("Mode must be pct or usd")
         return
-    if mode == "PCT" and not (0.0 <= val <= 30):
-        await update.message.reply_text("pct/day should be between 0 and 30")
+    if mode == "PCT" and not (0.5 <= val <= 30):
+        await update.message.reply_text("pct/day should be between 0.5 and 30")
         return
     if mode == "USD" and val < 0:
         await update.message.reply_text("usd/day must be >= 0")
         return
-
     update_user(uid, daily_cap_mode=mode, daily_cap_value=val)
     user = get_user(uid)
-    await update.message.reply_text(
-        f"✅ Daily risk cap updated: {mode} {float(val):.2f} (≈ ${daily_cap_usd(user):.2f} per day)"
-    )
-
+    await update.message.reply_text(f"✅ Daily cap updated. (≈ ${daily_cap_usd(user):.2f})")
 
 async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -6999,7 +6338,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(uid, user):
+    if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -7107,7 +6446,7 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(uid, user):
+    if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -7117,7 +6456,7 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     raw = " ".join(context.args).strip()
     if not raw:
-        await update.message.reply_text("Usage: /size <symbol> <LONG/SHORT> entry <VALUE> sl <VALUE>  (optional: risk pct <value> | risk usd <value>)\nIf risk is not entered, default risk is used (set in /riskmode).")
+        await update.message.reply_text("Usage: /size BTC long sl 42000  (optional: risk pct 2 | risk usd 40 | entry 43000)")
         return
 
     tokens = raw.split()
@@ -7312,7 +6651,7 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = reset_daily_if_needed(get_user(uid))
 
 
-    if not has_active_access(uid, user):
+    if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -7320,13 +6659,10 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return   
         
-    raw_full = " ".join(context.args).strip()
-    if not raw_full:
+    raw = " ".join(context.args).strip()
+    if not raw:
         await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 risk usd 40 [note ...] [sig PF-...]")
         return
-
-    bracket_parts = re.findall(r"\[([^\]]+)\]", raw_full)
-    raw = re.sub(r"\[[^\]]+\]", "", raw_full).strip()
 
     tokens = raw.split()
     if len(tokens) < 9:
@@ -7355,37 +6691,14 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         note = ""
         signal_id = ""
-
-        # Token-based (explicit keywords)
         if "note" in tokens:
             n_i = idx("note")
-            # note runs until "sig" if present
-            if "sig" in tokens[n_i+1:]:
-                s_rel = tokens[n_i+1:].index("sig")
-                note = " ".join(tokens[n_i+1:n_i+1+s_rel]).strip()
-            else:
-                note = " ".join(tokens[n_i+1:]).strip()
-
+            note = " ".join(tokens[n_i+1:])
         if "sig" in tokens:
             s_i = idx("sig")
-            if s_i + 1 < len(tokens):
-                signal_id = tokens[s_i+1].strip()
-
-        # Bracket-based (legacy/quick typing): [my note] [sig PF-123]
-        for bp in bracket_parts or []:
-            seg = str(bp or "").strip()
-            if not seg:
-                continue
-            low = seg.lower()
-            if low.startswith("sig "):
-                signal_id = seg[4:].strip()
-                continue
-            m2 = re.match(r"^(sig)\s*[:\-]?\s*(.+)$", seg, flags=re.IGNORECASE)
-            if m2:
-                signal_id = m2.group(2).strip()
-                continue
-            note = (seg if not note else (note + " | " + seg)).strip()
-
+            signal_id = tokens[s_i+1].strip()
+            if " sig " in f" {note} ":
+                note = note.split(" sig ")[0].strip()
     except Exception:
         await update.message.reply_text("Bad format. Example: /trade_open BTC long entry 43000 sl 42000 risk usd 40 note breakout sig PF-20251219-0007")
         return
@@ -7438,7 +6751,7 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cap = daily_cap_usd(user)
     day_local = _user_day_local(user)
-    used_before = _risk_used_total_today(uid, user)
+    used_before = _risk_daily_get(uid, day_local)
     remaining_before = (cap - used_before) if cap > 0 else float("inf")
 
     warn_daily = ""
@@ -7456,7 +6769,7 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = db_trade_open(uid, sym, side, entry, sl, risk_usd, qty, note=note, signal_id=signal_id)
     _risk_daily_inc(uid, day_local, float(risk_usd))
 
-    used_after = _risk_used_total_today(uid, get_user(uid))
+    used_after = _risk_daily_get(uid, day_local)
     remaining_after = (cap - used_after) if cap > 0 else float("inf")
 
     update_user(uid, day_trade_count=int(user["day_trade_count"]) + 1)
@@ -7491,7 +6804,7 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(uid, user):
+    if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -7524,9 +6837,11 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Trade not found or already closed.")
         return
     
-    # Sync daily risk from CURRENT open positions (closing frees capacity instantly)
-    _risk_daily_sync(uid, user)
-
+    # ✅ release unused risk if profitable
+    if pnl > 0:
+        day_local = _user_day_local(user)
+        _risk_daily_inc(uid, day_local, -float(t["risk_usd"]))
+    
     new_eq = float(user["equity"]) + float(pnl)
     update_user(uid, equity=new_eq)
     user = get_user(uid)
@@ -7603,7 +6918,7 @@ async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _risk_daily_inc(uid, day_local, delta)
 
         # clamp to 0 if negative due to edge cases
-        used_now = _risk_daily_sync(uid, user)
+        used_now = _risk_daily_get(uid, day_local)
         if used_now < 0:
             con2 = db_connect()
             cur2 = con2.cursor()
@@ -7615,8 +6930,7 @@ async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             con2.close()
 
     cap = daily_cap_usd(user)
-    pnl_today = _pnl_today_closed_trades(uid, user)
-    used_today = _risk_used_total_today(uid, user)
+    used_today = _risk_daily_get(uid, day_local)
     remaining_today = (cap - used_today) if cap > 0 else float("inf")
 
     warn = ""
@@ -7682,8 +6996,7 @@ async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         con.close()
         cap = daily_cap_usd(user)
         day_local = _user_day_local(user)
-        pnl_today = _pnl_today_closed_trades(uid, user)
-        used_today = _risk_used_total_today(uid, user)
+        used_today = _risk_daily_get(uid, day_local)
         remaining_today = (cap - used_today) if cap > 0 else float("inf")
 
         await update.message.reply_text(
@@ -7714,7 +7027,7 @@ async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _risk_daily_inc(uid, day_local, -old_risk)
 
     # Clamp used risk to 0 if it went negative (edge cases)
-    used_now = _risk_daily_sync(uid, user)
+    used_now = _risk_daily_get(uid, day_local)
     if used_now < 0:
         con2 = db_connect()
         cur2 = con2.cursor()
@@ -7749,7 +7062,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
 
-    if not has_active_access(uid, user):
+    if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -7763,10 +7076,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     equity = float((user or {}).get("equity") or 0.0)
 
     cap = daily_cap_usd(user)
-    # Sync used risk from CURRENT open positions (RF/close frees capacity instantly)
-    pnl_today = _pnl_today_closed_trades(uid, user)
-    used_today = _risk_used_total_today(uid, user)
     day_local = _user_day_local(user)
+    used_today = _risk_daily_get(uid, day_local)
     remaining_today = (cap - used_today) if cap > 0 else float("inf")
 
     enabled = user_enabled_sessions(user)
@@ -7785,22 +7096,14 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = []
     lines.append("📌 Status")
-    lines.append(HDR)
     lines.append(f"Plan: {plan}")
     lines.append(f"Equity: ${equity:.2f}")
-    lines.append(f"PnL today: ${pnl_today:+.2f}")
     lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
-    lines.append(f"Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f} (used by /size)")
     lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
-    lines.append(f"Daily risk used (open risk today): ${used_today:.2f}")
+    lines.append(f"Daily risk used: ${used_today:.2f}")
     lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
-    lines.append(HDR)
     lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
     lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
-    cur_s = (user.get("trade_window_start") or "").strip()
-    cur_e = (user.get("trade_window_end") or "").strip()
-    tw_txt = "OFF" if (not cur_s or not cur_e) else f"{cur_s} → {cur_e} (local)"
-    lines.append(f"Trade window: {tw_txt}")
     lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
     lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
     lines.append(HDR)
@@ -8016,7 +7319,7 @@ async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
     
-    if not has_active_access(uid, user):
+    if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -8025,8 +7328,10 @@ async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return   
     
     tz = ZoneInfo(user["tz"])
-    trades = db_trades_closed_today(uid, user)
+    start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    trades = db_trades_since(uid, start)
     stats = _stats_from_trades(trades)
+    adv = _advice(user, stats)
 
     msg = [
         "📊 Daily Report",
@@ -8038,6 +7343,9 @@ async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
         HDR,
     ]
+    if adv:
+        msg.append("🧠 Advice:")
+        msg.extend([f"- {x}" for x in adv])
 
     await update.message.reply_text("\n".join(msg))
 
@@ -8074,7 +7382,7 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(uid, user):
+    if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -8108,7 +7416,7 @@ async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(uid, user):
+    if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -8135,6 +7443,9 @@ async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
         HDR,
     ]
+    if adv:
+        msg.append("🧠 Advice:")
+        msg.extend([f"- {x}" for x in adv])
 
     await update.message.reply_text("\n".join(msg))
 
@@ -8142,7 +7453,7 @@ async def signals_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(uid, user):
+    if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -8177,7 +7488,7 @@ async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(uid, user):
+    if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -8701,7 +8012,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         mv = (best_fut or {}).get(base)
         if not mv:
             continue
-        r = await to_thread_heavy(trend_watch_for_symbol, base, mv, session_name)
+        r = await asyncio.to_thread(trend_watch_for_symbol, base, mv, session_name)
         if r:
             trend_watch.append(r)
             trend_bases.append(base)
@@ -8777,43 +8088,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     if mom:
         priority_setups.extend(mom)
 
-
-    # -----------------------------------------------------
-    # CRITICAL GATE: price must be close to EMA7 (1H) to allow ANY setup (screen/email)
-    # -----------------------------------------------------
-    ema7_cache: Dict[str, Tuple[bool, float, float, float]] = {}
-    gated = []
-    for s in (priority_setups or []):
-        try:
-            mk = str(getattr(s, "market_symbol", "") or "")
-            base = str(getattr(s, "symbol", "") or "").upper().strip()
-            if not mk:
-                # if we somehow don't have market_symbol, be safe and drop it
-                mv = (best_fut or {}).get(base)
-                _rej("missing_market_symbol", base, mv, "EMA7 gate")
-                continue
-
-            if mk not in ema7_cache:
-                ema7_cache[mk] = ema7_1h_is_close(mk, EMA7_1H_MAX_DIST_PCT)
-            ok, dist_pct, last_close, ema7 = ema7_cache[mk]
-            if not ok:
-                mv = (best_fut or {}).get(base)
-                _rej("far_from_ema7_1h", base, mv, f"dist={dist_pct:.2f}% max={float(EMA7_1H_MAX_DIST_PCT):.2f}% close={last_close:.6g} ema7={ema7:.6g}")
-                continue
-
-            gated.append(s)
-        except Exception:
-            # fail-closed: if gate check errors, do not emit setup
-            try:
-                base = str(getattr(s, "symbol", "") or "").upper().strip()
-                mv = (best_fut or {}).get(base)
-                _rej("ema7_gate_error", base, mv)
-            except Exception:
-                pass
-            continue
-
-    priority_setups = gated
-
     # de-dupe by (symbol, side, engine) keeping highest conf, preserving priority order
     best = {}
     for s in priority_setups:
@@ -8844,7 +8118,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     spike_candidates = []
     if mode == "screen":
         try:
-            spike_candidates = await to_thread_heavy(_spike_reversal_candidates,
+            spike_candidates = await asyncio.to_thread(
+                _spike_reversal_candidates,
                 universe_best,
                 10_000_000.0,  # min_vol_usd
                 0.55,          # wick_ratio_min
@@ -8860,7 +8135,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     spike_warnings = []
     if mode == "screen":
         try:
-            spike_warnings = await to_thread_heavy(_spike_reversal_warnings,
+            spike_warnings = await asyncio.to_thread(
+                _spike_reversal_warnings,
                 universe_best,
                 10_000_000.0,  # min_vol_usd
                 1.15,          # atr_mult_min
@@ -8976,21 +8252,6 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         body (str): cached body (header is built in the async handler)
         kb (list[tuple[str,str]]): [(SYMBOL, SETUP_ID), ...] for TradingView buttons
     """
-
-    def _safe_int(v, default: int = 0) -> int:
-        """Coerce possibly-nested values (including dicts) into int safely."""
-        try:
-            if isinstance(v, dict):
-                # common shapes: {"value": 67}, {"conf": 67}
-                v = v.get("value", v.get("conf", v.get("confidence", default)))
-            if isinstance(v, (list, tuple)) and v:
-                v = v[0]
-            if v is None:
-                return default
-            return int(float(v))
-        except Exception:
-            return default
-
     # Build pool (coroutine) in this worker thread (isolated event loop)
     pool = _run_coro_in_thread(
         build_priority_pool(
@@ -9067,7 +8328,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 sym = str(getattr(s, "symbol", "")).upper()
                 sid = str(getattr(s, "setup_id", "") or "")
                 side = str(getattr(s, "side", "") or "").upper()
-                conf = _safe_int(getattr(s, "conf", 0) or 0)
+                conf = int(getattr(s, "conf", 0) or 0)
 
                 entry = float(getattr(s, "entry", 0.0) or 0.0)
                 sl = float(getattr(s, "sl", 0.0) or 0.0)
@@ -9154,13 +8415,13 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         lines = ["*Trend Continuation Watch*", SEP]
         trend_watch_sorted = sorted(
             trend_watch,
-            key=lambda x: _safe_int(x.get("confidence", x.get("conf", 0))),
+            key=lambda x: int(x.get("confidence", x.get("conf", 0)) or 0),
             reverse=True
         )[:6]
         for t in trend_watch_sorted:
             side = str(t.get("side", "BUY"))
             side_emoji = "🟢" if side == "BUY" else "🔴"
-            conf_val = _safe_int(t.get("confidence", t.get("conf", 0)))
+            conf_val = int(t.get("confidence", t.get("conf", 0)) or 0)
             sym = str(t.get("symbol", "")).upper()
             ch24 = float(t.get("ch24", 0.0) or 0.0)
             lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf_val}` | 24H {pct_with_emoji(ch24)}")
@@ -9175,7 +8436,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
             try:
                 sym = str(w.get("symbol", "")).upper()
                 side = str(w.get("side", "SELL")).upper()
-                conf = _safe_int(w.get("conf", 0))
+                conf = int(w.get("conf", 0) or 0)
                 vol = float(w.get("vol", 0.0) or 0.0)
                 side_emoji = "🟢" if side == "BUY" else "🔴"
                 lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf}` | Vol~`{vol/1e6:.1f}M`")
@@ -9192,7 +8453,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
             try:
                 sym = str(c.get("symbol", "")).upper()
                 side = str(c.get("side", "SELL")).upper()
-                conf = _safe_int(c.get("conf", 0))
+                conf = int(c.get("conf", 0) or 0)
                 entry = float(c.get("entry", 0.0) or 0.0)
                 sl = float(c.get("sl", 0.0) or 0.0)
                 tp3 = float(c.get("tp3", 0.0) or 0.0)
@@ -9395,9 +8656,14 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# TEXT ROUTER# =========================================================
 # TEXT ROUTER (Signal ID lookup)
 # =========================================================
+    finally:
+        try:
+            if SCAN_LOCK.locked():
+                SCAN_LOCK.release()
+        except Exception:
+            pass
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9409,7 +8675,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         tps = f"TP {fmt_price(float(sig['tp3']))}"
-        if sig.get("tp1") and sig.get("tp2") and _safe_int(sig.get("conf", 0)) >= MULTI_TP_MIN_CONF:
+        if sig.get("tp1") and sig.get("tp2") and int(sig["conf"]) >= MULTI_TP_MIN_CONF:
             tps = f"TP1 {fmt_price(float(sig['tp1']))} | TP2 {fmt_price(float(sig['tp2']))} | TP3 {fmt_price(float(sig['tp3']))}"
 
         rr3 = rr_to_tp(float(sig["entry"]), float(sig["sl"]), float(sig["tp3"]))
@@ -9463,7 +8729,7 @@ def _email_body_pretty(
     loc_label = tz_location_label(user_tz)
     when_str = now_local.strftime("%Y-%m-%d %H:%M")
 
-    parts: List[str] = []
+    parts = []
     parts.append(HDR)
     parts.append(f"📩 PulseFutures • {session_name} • {loc_label}: {when_str} ({user_tz})")
     parts.append(HDR)
@@ -9471,7 +8737,6 @@ def _email_body_pretty(
 
     up, dn = compute_directional_lists(best_fut)
     leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:5]
-
     parts.append("Market Snapshot")
     parts.append(SEP)
 
@@ -9483,8 +8748,8 @@ def _email_body_pretty(
         parts.append("Leaders: " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in up[:3]]))
     if dn:
         parts.append("Losers:  " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in dn[:3]]))
-
     parts.append("")
+
     parts.append("Top Setups")
     parts.append(SEP)
     parts.append("")
@@ -9492,45 +8757,33 @@ def _email_body_pretty(
     for i, s in enumerate(setups, 1):
         rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
 
-        parts.append(f"ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
-        parts.append(
-            f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP3): {rr3:.2f}"
-        )
+        # ✅ "ID-" prefix
+        parts.append(f"{i}) ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
+        parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP3): {rr3:.2f}")
 
-        _tp1, _tp2, _tp3 = _ensure_three_tps(
-            s.entry,
-            s.sl,
-            s.tp3,
-            getattr(s, "tp1", None),
-            getattr(s, "tp2", None),
-            getattr(s, "side", ""),
-        )
-
-        if _tp1 not in (None, 0, 0.0, "") and _tp2 not in (None, 0, 0.0, "") and _tp3 not in (None, 0, 0.0, ""):
+        if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
             parts.append(
-                f"   TP1: {fmt_price_email(_tp1)} ({TP_ALLOCS[0]}%) | "
-                f"TP2: {fmt_price_email(_tp2)} ({TP_ALLOCS[1]}%) | "
-                f"TP3: {fmt_price_email(_tp3)} ({TP_ALLOCS[2]}%)"
+                f"   TP1: {fmt_price_email(s.tp1)} ({TP_ALLOCS[0]}%) | "
+                f"TP2: {fmt_price_email(s.tp2)} ({TP_ALLOCS[1]}%) | "
+                f"TP3: {fmt_price_email(s.tp3)} ({TP_ALLOCS[2]}%)"
             )
         else:
-            parts.append(f"   TP3: {fmt_price_email(s.tp3)}")
+            parts.append(f"   TP: {fmt_price_email(s.tp3)}")
+
+        # ✅ only for trailing-needed setups
+        if s.is_trailing_tp3:
+            parts.append("   TP3 Mode: Trailing")
 
         parts.append(
             f"   24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | "
             f"1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}"
         )
         parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
-
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
-            parts.append(
-                f"   /size {str(getattr(s, 'symbol', ''))} {_pos} "
-                f"entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} "
-                f"sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}"
-            )
+            parts.append(f"   /size {str(getattr(s, 'symbol', ''))} {_pos} entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}")
         except Exception:
             pass
-
         parts.append("")
 
     parts.append(HDR)
@@ -9543,91 +8796,6 @@ def _email_body_pretty(
     parts.append(HDR)
 
     return "\n".join(parts).strip()
-
-def _email_body_pretty_html(
-    session_name: str,
-    now_local: datetime,
-    user_tz: str,
-    setups: List[Setup],
-    best_fut: Dict[str, MarketVol],
-) -> str:
-    """HTML version of the email body styled to resemble Telegram /screen cards (bold headings + code blocks)."""
-    loc_label = tz_location_label(user_tz)
-    when_str = now_local.strftime("%Y-%m-%d %H:%M")
-
-    def esc(s: str) -> str:
-        try:
-            import html as _html
-            return _html.escape(str(s))
-        except Exception:
-            return str(s)
-
-    lines = []
-    lines.append(f"<div style='font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.35'>")
-    lines.append(f"<div style='font-size:16px;font-weight:700'>📩 PulseFutures • {esc(session_name)} • {esc(loc_label)}: {esc(when_str)} ({esc(user_tz)})</div>")
-    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:10px 0'>")
-
-    up, dn = compute_directional_lists(best_fut)
-    leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:5]
-
-    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Market Snapshot</div>")
-    if leaders:
-        topv = ", ".join([f"{esc(b)}({esc(pct_with_emoji(float(mv.percentage or 0.0)))})" for b, mv in leaders])
-        lines.append(f"<div>Top Volume: {topv}</div>")
-    if up:
-        lines.append("<div>Leaders: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in up[:3]]) + "</div>")
-    if dn:
-        lines.append("<div>Losers: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in dn[:3]]) + "</div>")
-
-    lines.append("<hr style='border:none;border-top:1px solid #eee;margin:10px 0'>")
-    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Top Setups</div>")
-
-    for i, s in enumerate(setups, 1):
-        rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
-        side = esc(s.side)
-        sym = esc(s.symbol)
-        conf = esc(s.conf)
-        setup_id = esc(s.setup_id)
-
-        card = []
-        card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
-        card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
-        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP3): <code>{rr3:.2f}</code></div>")
-
-        if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
-            card.append(
-                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> ({TP_ALLOCS[0]}%) &nbsp;|&nbsp; "
-                f"TP2: <code>{esc(fmt_price_email(s.tp2))}</code> ({TP_ALLOCS[1]}%) &nbsp;|&nbsp; "
-                f"TP3: <code>{esc(fmt_price_email(s.tp3))}</code> ({TP_ALLOCS[2]}%)</div>"
-            )
-        else:
-            card.append(f"<div style='margin-top:4px'>TP: <code>{esc(fmt_price_email(s.tp3))}</code></div>")
-
-        if s.is_trailing_tp3:
-            card.append("<div style='margin-top:4px'>TP3 Mode: <b>Trailing</b></div>")
-
-        card.append(
-            f"<div style='margin-top:6px'>24H {esc(pct_with_emoji(s.ch24))} &nbsp;|&nbsp; 4H {esc(pct_with_emoji(s.ch4))} &nbsp;|&nbsp; "
-            f"1H {esc(pct_with_emoji(s.ch1))} &nbsp;|&nbsp; 15m {esc(pct_with_emoji(s.ch15))} &nbsp;|&nbsp; Vol~{esc(fmt_money(s.fut_vol_usd))}</div>"
-        )
-        card.append(f"<div style='margin-top:6px'>Chart: {esc(tv_chart_url(s.symbol))}</div>")
-        try:
-            _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
-            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
-            card.append(f"<pre style='margin-top:8px;background:#f7f7f7;padding:8px;border-radius:8px;white-space:pre-wrap'>{esc(size_line)}</pre>")
-        except Exception:
-            pass
-        card.append("</div>")
-        lines.extend(card)
-
-    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:12px 0'>")
-    lines.append("<div style='font-weight:700'>🤖 Position Sizing</div>")
-    lines.append("<div>Use the PulseFutures Telegram bot to calculate safe position size based on your Stop Loss.</div>")
-    lines.append(f"<div style='margin-top:4px'>👉 {esc(TELEGRAM_BOT_URL)}</div>")
-    lines.append("<div style='margin-top:10px;color:#666'>Not financial advice. PulseFutures</div>")
-    lines.append("</div>")
-    return "".join(lines).strip()
-
 
 def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut) -> bool:
     """
@@ -9660,15 +8828,7 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
         best_fut=best_fut,
     )
 
-    body_html = _email_body_pretty_html(
-        session_name=str(sess['name']),
-        now_local=now_local,
-        user_tz=user_tz,
-        setups=setups,
-        best_fut=best_fut,
-    )
-
-    return send_email(subject, body, user_id_for_debug=uid, body_html=body_html)
+    return send_email(subject, body, user_id_for_debug=uid)
 
 
 
@@ -10641,7 +9801,7 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tickers_n = 0
     t0 = time.time()
     try:
-        best = await to_thread_heavy(fetch_futures_tickers)
+        best = await asyncio.to_thread(fetch_futures_tickers)
         tickers_n = len(best or {})
     except Exception as e:
         ex_ok = False
@@ -10700,68 +9860,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 async def _post_init(app: Application):
-    # If webhook was set previously, remove it so polling starts cleanly
+    # اگر قبلاً webhook ست شده بوده، پاکش کن تا polling گیر نکنه
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         logger.warning("delete_webhook failed (ignored): %s", e)
 
-    # Bot menu + command list (Telegram "Menu" button)
-    try:
-        cmds = [
-            BotCommand("start", "Start"),
-            BotCommand("status", "Shows your plan & enabled features"),
-            BotCommand("screen", "Scans the market for high-quality setups"),
-
-            BotCommand("equity", "Set your equity"),
-            BotCommand("riskmode", "Set your per-trade risk (used by /size)"),
-            BotCommand("dailycap", "Set your total daily risk cap"),
-            BotCommand("size", "Position size calculator"),
-
-            BotCommand("trade_open", "Log an opened position"),
-            BotCommand("trade_sl", "Update Stop Loss"),
-            BotCommand("trade_rf", "Risk-Free a position"),
-            BotCommand("trade_close", "Log a closed position"),
-
-            BotCommand("sessions", "View your session settings"),
-            BotCommand("sessions_on", "Enable a session"),
-            BotCommand("sessions_off", "Disable a session"),
-            BotCommand("sessions_on_unlimited", "24-hour mode ON"),
-            BotCommand("sessions_off_unlimited", "24-hour mode OFF"),
-            BotCommand("trade_window", "Set allowed trading time window"),
-
-            BotCommand("email", "Set email / email on|off"),
-            BotCommand("email_test", "Send a test email"),
-            BotCommand("limits", "Set email caps/gaps"),
-            BotCommand("bigmove_alert", "Big move alerts"),
-
-            BotCommand("tz", "Show/set your timezone"),
-
-            BotCommand("report_daily", "Daily performance report"),
-            BotCommand("report_weekly", "Weekly performance report"),
-            BotCommand("report_overall", "All-time performance report"),
-
-            BotCommand("help", "Quick overview"),
-            BotCommand("commands", "Full command guide"),
-            BotCommand("guide_full", "Download full user guide (PDF)"),
-
-            BotCommand("support", "Submit support request"),
-            BotCommand("support_status", "Check your latest support ticket"),
-
-            BotCommand("health", "Bot & data health check"),
-
-            BotCommand("billing", "Subscription & payment info"),
-        ]
-        await app.bot.set_my_commands(cmds)
-        # Ensure menu button is enabled for private chats
-        try:
-            await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-        except Exception:
-            pass
-    except Exception as e:
-        logger.warning("set_my_commands failed (ignored): %s", e)
-
-
+        
 
 # =========================================================
 # USDT (SEMI-AUTO) + ADMIN PAYMENTS/ACCESS MANAGEMENT
@@ -10787,16 +9892,7 @@ def _is_admin(update: Update) -> bool:
         return False
 
 def _db():
-    con = sqlite3.connect(
-        DB_PATH,
-        timeout=5,
-        isolation_level=None,
-        check_same_thread=False,
-    )
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=NORMAL;")
-    return con
-
+    return sqlite3.connect(DB_PATH)
 
 def _user_ident_str(uid: int) -> str:
     return f"uid={uid}"
@@ -10820,7 +9916,87 @@ def _set_user_access(user_id: int, plan: str, source: str, ref: str):
     )
 
 
+def _ensure_trial_state(user: dict, uid: Optional[int] = None) -> dict:
+    """Ensure the user has a 7-day trial recorded, and downgrade to free (locked) when expired."""
+    try:
+        if uid is not None and is_admin_user(int(uid)):
+            return user
+    except Exception:
+        pass
 
+    if not user:
+        return user
+
+    now = time.time()
+    plan = str(user.get("plan") or "free").strip().lower()
+    trial_until = float(user.get("trial_until", 0) or 0.0)
+    trial_start = float(user.get("trial_start_ts", 0) or 0.0)
+
+    # Initialize trial if user has never had one
+    if trial_until <= 0:
+        trial_start = now
+        trial_until = now + (7 * 86400)
+        update_user(int(user.get("user_id") or uid or 0), plan="trial", trial_start_ts=trial_start, trial_until=trial_until)
+        user["plan"] = "trial"
+        user["trial_start_ts"] = trial_start
+        user["trial_until"] = trial_until
+        return user
+
+    # Keep trial active while inside the window
+    if now <= trial_until:
+        if plan != "trial":
+            update_user(int(user.get("user_id") or uid or 0), plan="trial")
+            user["plan"] = "trial"
+        return user
+
+    # Trial expired => lock user (free = locked)
+    if plan != "free":
+        update_user(int(user.get("user_id") or uid or 0), plan="free")
+        user["plan"] = "free"
+    return user
+
+
+def has_active_access(user: dict, uid: Optional[int] = None) -> bool:
+    """Access rules:
+    - Admin: always allowed
+    - Trial: allowed for 7 days from first seen
+    - Paid plans (standard/pro): allowed (optionally with plan_expires if you set it)
+    - Free: LOCKED (after trial)
+    """
+    try:
+        if uid is not None and is_admin_user(int(uid)):
+            return True
+    except Exception:
+        pass
+
+    if not user:
+        return False
+
+    # Ensure trial is initialized / downgraded when needed
+    user = _ensure_trial_state(user, uid=uid)
+
+    now = time.time()
+    plan = str(user.get("plan") or "free").strip().lower()
+
+    if plan in ("standard", "pro"):
+        # If you use plan_expires, enforce it (0/None => no expiry)
+        try:
+            exp = float(user.get("plan_expires", 0) or 0.0)
+            if exp > 0 and now > exp:
+                update_user(int(user.get("user_id") or uid or 0), plan="free")
+                return False
+        except Exception:
+            pass
+        return True
+
+    if plan == "trial":
+        try:
+            return now <= float(user.get("trial_until", 0) or 0.0)
+        except Exception:
+            return False
+
+    # free = locked
+    return False
 
 def _usdt_payment_row_by_txid(txid: str):
     with _db() as con:
@@ -11086,185 +10262,41 @@ def _first_existing_col(cols: set[str], candidates: list[str]):
     return None
 
 async def admin_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        await update.message.reply_text("❌ Admin only.")
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
         return
 
-    now_ts = time.time()
+    conn = _db()
+    cols = _table_columns(conn, "users")
 
-    with _db() as con:
-        con.row_factory = sqlite3.Row
-        cur = con.cursor()
-        cur.execute("SELECT * FROM users")
-        rows = cur.fetchall()
+    id_col = _first_existing_col(cols, ["user_id", "id"]) or "id"
+    plan_col = _first_existing_col(cols, ["plan", "tier", "subscription_plan"])
+    email_col = _first_existing_col(cols, ["email", "user_email"])
+    tz_col = _first_existing_col(cols, ["tz", "timezone"])
 
-    if not rows:
-        await update.message.reply_text("No users found.")
-        return
+    sql = f"""
+        SELECT
+            {id_col} AS uid,
+            {plan_col if plan_col else 'NULL'} AS plan,
+            {email_col if email_col else 'NULL'} AS email,
+            {tz_col if tz_col else 'NULL'} AS tz
+        FROM users
+        ORDER BY uid DESC
+        LIMIT 50
+    """
 
-    lines = ["📊 USERS OVERVIEW\n"]
+    rows = conn.execute(sql).fetchall()
 
-    for r in rows:
-        d = dict(r)
-        uid = int(d.get("user_id") or 0)
-        tz = str(d.get("tz") or "UTC")
-
-        # Use effective plan logic
-        plan = str(effective_plan(uid, d)).upper()
-
-        # Remaining days
-        days_left = "-"
-        until = 0
-
-        if plan == "TRIAL":
-            until = float(d.get("trial_until") or 0)
-        elif plan in ("STANDARD", "PRO"):
-            until = float(d.get("plan_expires") or 0)
-
-        if until and until > now_ts:
-            days_left = f"{int((until - now_ts + 86399)//86400)}d"
-        elif plan in ("TRIAL", "STANDARD", "PRO"):
-            days_left = "0d"
-
-        # Payment status
-        with _db() as con:
-            cur = con.cursor()
-            cur.execute("""
-                SELECT status
-                FROM payments_ledger
-                WHERE user_id = ?
-                ORDER BY created_ts DESC
-                LIMIT 1
-            """, (uid,))
-            p = cur.fetchone()
-
-        pay_status = p[0] if p else "None"
-
-        lines.append(f"{uid} | {plan} | {tz} | {days_left} | {pay_status}")
+    lines = ["👤 Admin — Users", HDR]
+    for uid, plan, email, tz in rows:
+        lines.append(
+            f"• {uid}"
+            f" | {plan or ''}"
+            f" | {email or ''}"
+            f" | tz:{tz or ''}"
+        )
 
     await update.message.reply_text("\n".join(lines))
-
-async def admin_grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        await update.message.reply_text("❌ Admin only.")
-        return
-
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Usage: /admin_grant <telegram_id> <standard|pro>")
-        return
-
-    try:
-        uid = int(context.args[0])
-    except Exception:
-        await update.message.reply_text("❌ telegram_id must be a number.")
-        return
-
-    plan = str(context.args[1]).strip().lower()
-    if plan not in ("standard", "pro"):
-        await update.message.reply_text("❌ Plan must be: standard or pro")
-        return
-
-    # Grant access (sync plan + access metadata)
-    _set_user_access(uid, plan, "manual_admin", "admin_grant")
-
-    # IMPORTANT: prevent trial logic from overwriting the plan
-    # (Some parts of your code treat trial_until>0 as "still trial")
-    try:
-        update_user(uid, trial_until=0.0, trial_start_ts=0.0)
-    except Exception:
-        pass
-
-    user = get_user(uid) or {}
-
-    # Latest payment (1 row)
-    pay_line = "- (none)"
-    try:
-        with _db() as con:
-            con.row_factory = sqlite3.Row
-            cur = con.cursor()
-            cur.execute("""
-                SELECT source, ref, plan, amount, currency, status, created_ts
-                FROM payments_ledger
-                WHERE user_id = ?
-                ORDER BY created_ts DESC
-                LIMIT 1
-            """, (uid,))
-            p = cur.fetchone()
-        if p:
-            pay_line = f"- {p['source']} | {p['plan']} | {p['amount']} {p['currency']} | {p['status']} | {p['ref']}"
-    except Exception:
-        pass
-
-    # Reply (as you requested)
-    lines = [
-        "✅ Access updated",
-        f"User: {uid}",
-        f"Plan: {str(user.get('plan') or plan).strip()}",
-        f"Access source/ref: {user.get('access_source','')} / {user.get('access_ref','')}",
-        f"Email: {user.get('email_to','') or ''}",
-        "",
-        "Last payments:",
-        pay_line
-    ]
-    await update.message.reply_text("\n".join(lines))
-
-
-
-async def payment_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Admin-only: approve a payment (Stripe or USDT) and grant access.
-    Usage: /payment_approve <user_id> <payment_id> <standard|pro>
-    """
-    if not _is_admin(update):
-        await update.message.reply_text("❌ Admin only.")
-        return
-
-    if not context.args or len(context.args) < 3:
-        await update.message.reply_text("Usage: /payment_approve <user_id> <payment_id> <standard|pro>")
-        return
-
-    try:
-        uid = int(context.args[0])
-    except Exception:
-        await update.message.reply_text("❌ user_id must be a number.")
-        return
-
-    payment_id = str(context.args[1]).strip()
-    plan = str(context.args[2]).strip().lower()
-
-    if not payment_id:
-        await update.message.reply_text("❌ payment_id cannot be empty.")
-        return
-
-    if plan not in ("standard", "pro"):
-        await update.message.reply_text("❌ Plan must be: standard or pro")
-        return
-
-    # 1) Write payments ledger (single source of truth for approvals)
-    try:
-        _ledger_add(uid, "payment_approve", payment_id, plan, 0.0, "", "paid")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to write payment ledger: {e}")
-        return
-
-    # 2) Grant access (sync plan + access metadata)
-    _set_user_access(uid, plan, "payment_approve", payment_id)
-
-    # 3) Prevent trial logic from overwriting the plan
-    try:
-        update_user(uid, trial_until=0.0, trial_start_ts=0.0)
-    except Exception:
-        pass
-
-    user = get_user(uid) or {"plan": plan}
-
-    await update.message.reply_text(
-        "✅ Payment approved + access granted\n"
-        f"User: {uid}\n"
-        f"Plan: {str(user.get('plan') or plan).strip()}\n"
-        f"Payment ID: {payment_id}\n"
-        "Tip: /admin_user <user_id> to confirm."
-    )
 
 
 async def admin_revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11282,59 +10314,30 @@ async def admin_payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not _is_admin(update):
         await update.message.reply_text("❌ Admin only.")
         return
-
-    limit_n = 50
+    n = 20
     if context.args and context.args[0].isdigit():
-        limit_n = max(1, min(200, int(context.args[0])))
+        n = max(1, min(50, int(context.args[0])))
 
     with _db() as con:
         con.row_factory = sqlite3.Row
         cur = con.cursor()
-
-        # For each user, pull latest PAID ledger entry (approval) + current plan (from /admin_grant or access engine)
-        cur.execute(f"""
-            SELECT
-                u.user_id AS user_id,
-                COALESCE(NULLIF(TRIM(u.plan),''), 'standard') AS plan,
-                (
-                    SELECT p.created_ts
-                    FROM payments_ledger p
-                    WHERE p.user_id = u.user_id AND p.status = 'paid'
-                    ORDER BY p.created_ts DESC
-                    LIMIT 1
-                ) AS last_paid_ts,
-                (
-                    SELECT p.ref
-                    FROM payments_ledger p
-                    WHERE p.user_id = u.user_id AND p.status = 'paid'
-                    ORDER BY p.created_ts DESC
-                    LIMIT 1
-                ) AS last_payment_id
-            FROM users u
-            ORDER BY COALESCE(last_paid_ts, 0) DESC
+        cur.execute("""
+            SELECT user_id, source, plan, amount, currency, status, ref, created_ts
+            FROM payments_ledger
+            ORDER BY created_ts DESC
             LIMIT ?
-        """, (limit_n,))
+        """, (n,))
         rows = cur.fetchall()
 
     if not rows:
-        await update.message.reply_text("No users found.")
+        await update.message.reply_text("No payments in ledger.")
         return
 
-    lines = []
-    lines.append(f"💳 Admin Payments (showing up to {limit_n} users)")
-    lines.append("User ID | Last Payment Approval (UTC) | Payment ID | Plan")
-    lines.append("────────────────────────────────────────────────────────")
-
+    lines = [f"Latest payments (max {n}):"]
     for r in rows:
-        uid = int(r["user_id"])
-        plan = str(r["plan"] or "standard").strip()
-        ts = float(r["last_paid_ts"] or 0)
-        pay_id = str(r["last_payment_id"] or "").strip() or "-"
-        ts_txt = datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts else "n/a"
-        lines.append(f"{uid} | {ts_txt} | {pay_id} | {plan}")
-
+        ts = datetime.utcfromtimestamp(r["created_ts"]).isoformat() + "Z"
+        lines.append(f"- {ts} | uid={r['user_id']} | {r['source']} | {r['plan']} | {r['amount']} {r['currency']} | {r['status']} | {r['ref']}")
     await update.message.reply_text("\n".join(lines))
-
 
 async def manage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -11360,10 +10363,9 @@ async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    # Render note: if deployed as a Web Service, bind to $PORT so Render keeps the service alive.
+    # Hard guard: Background Worker ONLY
     if os.environ.get("RENDER_SERVICE_TYPE") == "web":
-        start_keepalive_http_server()
-        logger.warning("Running in Render Web Service mode: keepalive HTTP server enabled; polling will still run.")
+        raise SystemExit("Web service detected — polling disabled.")
 
     # Single instance guard (Render overlap protection)
     render_primary_only()
@@ -11390,8 +10392,6 @@ def main():
     app.add_handler(CommandHandler("myplan", myplan_cmd))
     app.add_handler(CommandHandler("support", support_cmd))
     app.add_handler(CommandHandler("support_status", support_status_cmd))
-    app.add_handler(CommandHandler("support_open", admin_support_open_cmd))
-    app.add_handler(CommandHandler("support_close", admin_support_close_cmd))
     app.add_handler(CommandHandler("tz", tz_cmd))
     app.add_handler(CommandHandler("screen", screen_cmd))
     app.add_handler(CommandHandler("equity", equity_cmd))
@@ -11445,18 +10445,17 @@ def main():
     # ================= USDT (semi-auto) =================
     app.add_handler(CommandHandler("usdt", usdt_info_cmd))
     app.add_handler(CommandHandler("usdt_paid", usdt_paid_cmd))
+    app.add_handler(CommandHandler("usdt_pending", usdt_pending_cmd))
+    app.add_handler(CommandHandler("usdt_approve", usdt_approve_cmd))
+    app.add_handler(CommandHandler("usdt_reject", usdt_reject_cmd))
     
     # ================= Admin: access & payments =================
     
     app.add_handler(CommandHandler("admin_user", admin_user_cmd))
     app.add_handler(CommandHandler("admin_users", admin_users_cmd))
-    app.add_handler(CommandHandler("admin_grant", admin_grant_cmd))
+    app.add_handler(CommandHandler("admin_grant", admin_user_cmd))
     app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd)) 
     app.add_handler(CommandHandler("admin_payments", admin_payments_cmd))
-
-    # Admin: approve Stripe/USDT payments and grant access
-    app.add_handler(CommandHandler("payment_approve", payment_approve_cmd))
-    app.add_handler(CommandHandler("payment_Approve", payment_approve_cmd))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     
@@ -11501,6 +10500,130 @@ def main():
         while True:
             time.sleep(3600)
 
+
+
+# ===============================
+# TRIAL + STATUS (ADDED)
+# ===============================
+
+TRIAL_DAYS = 7
+
+def _ensure_trial(user):
+    if not user:
+        return
+    if user.get("plan"):
+        return
+    start = user.get("trial_start_ts")
+    now = time.time()
+    if not start:
+        update_user(user["user_id"], plan="trial", trial_start_ts=now, trial_until=now + TRIAL_DAYS*86400)
+    elif now <= float(user.get("trial_until", 0)):
+        update_user(user["user_id"], plan="trial")
+    else:
+        update_user(user["user_id"], plan="standard")
+
+def user_has_pro(uid: int) -> bool:
+    # Admin is always Pro/Unlimited
+    try:
+        if is_admin_user(int(uid)):
+            return True
+    except Exception:
+        pass
+
+    u = get_user(uid)
+    if not u:
+        return False
+
+    _ensure_trial(u)
+
+    # Use effective plan (covers legacy DBs + admin override)
+    try:
+        plan = str(effective_plan(u, int(uid))).strip().lower()
+    except Exception:
+        plan = str(u.get("plan") or "free").strip().lower()
+
+    if plan == "pro":
+        return True
+    if plan == "trial" and time.time() <= float(u.get("trial_until", 0) or 0):
+        return True
+    return False
+    _ensure_trial(u)
+    if u.get("plan") == "pro":
+        return True
+    if u.get("plan") == "trial" and time.time() <= float(u.get("trial_until", 0)):
+        return True
+    return False
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = reset_daily_if_needed(get_user(uid))
+
+    if not has_active_access(user, uid):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return
+
+    opens = db_open_trades(uid)
+
+    plan = str((user or {}).get("plan") or "free").upper()
+    equity = float((user or {}).get("equity") or 0.0)
+
+    cap = daily_cap_usd(user)
+    day_local = _user_day_local(user)
+    used_today = _risk_daily_get(uid, day_local)
+    remaining_today = (cap - used_today) if cap > 0 else float("inf")
+
+    enabled = user_enabled_sessions(user)
+    now_s = in_session_now(user)
+    now_txt = now_s["name"] if now_s else "NONE"
+
+    # Email caps (show infinite as 0=∞ to match UI)
+    cap_sess = int((user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION) or DEFAULT_MAX_EMAILS_PER_SESSION)
+    cap_day = int((user or {}).get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY) or DEFAULT_MAX_EMAILS_PER_DAY)
+    gap_m = int((user or {}).get("email_gap_min", DEFAULT_EMAIL_GAP_MIN) or DEFAULT_EMAIL_GAP_MIN)
+
+    # Big-move status
+    bm_on = int((user or {}).get("bigmove_alert_on", 1) or 0)
+    bm_4h = float((user or {}).get("bigmove_alert_4h", 20) or 20)
+    bm_1h = float((user or {}).get("bigmove_alert_1h", 10) or 10)
+
+    lines = []
+    lines.append("📌 Status")
+    lines.append(f"Plan: {plan}")
+    lines.append(f"Equity: ${equity:.2f}")
+    lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
+    lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
+    lines.append(f"Daily risk used: ${used_today:.2f}")
+    lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
+    lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
+    lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
+    lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
+    lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
+    lines.append(HDR)
+
+    if not opens:
+        lines.append("Open trades: None")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    lines.append("Open trades:")
+    for t in opens:
+        try:
+            entry = float(t.get("entry") or 0.0)
+            sl = float(t.get("sl") or 0.0)
+            qty = float(t.get("qty") or 0.0)
+            risk = float(t.get("risk_usd") or 0.0)
+            lines.append(
+                f"- ID {t.get('id')} | {t.get('symbol')} {t.get('side')} | "
+                f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g}"
+            )
+        except Exception:
+            continue
+
+    await update.message.reply_text("\n".join(lines))
 
 if __name__ == "__main__":
     main()
