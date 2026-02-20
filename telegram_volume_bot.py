@@ -8954,108 +8954,13 @@ def user_location_and_time(user: dict):
 # =========================================================
 # /screen fast cache (per-instance)
 # =========================================================
-SCREEN_CACHE_TTL_SEC = 120  # seconds (minimum refresh interval target)
-SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
-
-# ✅ FIX: missing timeouts used by /screen
-SCREEN_FETCH_TIMEOUT_SEC = 90   # timeout for fetching futures tickers (network can be slow)
-SCREEN_BUILD_TIMEOUT_SEC = 120   # timeout for building screen body (can take longer on Render)
-
+SCREEN_CACHE_TTL_SEC = 20  # seconds
 _SCREEN_CACHE = {
     "ts": 0.0,
     "body": "",
     "kb": [],
 }
-
-# Per-user last /screen signature so we can tell users when results are unchanged.
-_LAST_SCREEN_SIG = {}  # uid -> (sig:str, ts:float)
-
-def _screen_sig(text: str) -> str:
-    try:
-        import hashlib
-        return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12]
-    except Exception:
-        return str(len(text or ""))
-
-async def _screen_countdown(status_msg, total_sec: int = 40, step_sec: int = 5):
-    """Best-effort countdown edits while /screen is running (does not block)."""
-    try:
-        remaining = int(total_sec)
-        while remaining > 0:
-            await asyncio.sleep(step_sec)
-            remaining -= int(step_sec)
-            if remaining < 0:
-                remaining = 0
-            try:
-                await status_msg.edit_text(f"🔎 Scanning market… ~{remaining}s")
-            except Exception:
-                pass
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        return
-
 _SCREEN_LOCK = asyncio.Lock()
-
-# Background refresh task for /screen (keeps UX instant)
-_SCREEN_REFRESH_TASK = None  # asyncio.Task
-_SCREEN_REFRESH_TASK_STARTED_AT = 0.0
-_SCREEN_FORCE_SYNC_AFTER_SEC = 120  # if cache older than this, do a synchronous refresh
-_SCREEN_REFRESH_MAX_RUNTIME_SEC = 90  # watchdog for stuck background refresh
-
-
-async def _refresh_screen_cache_async():
-    global _SCREEN_REFRESH_TASK, _SCREEN_REFRESH_TASK_STARTED_AT
-
-    _SCREEN_REFRESH_TASK_STARTED_AT = time.time()
-    _SCREEN_CACHE["refreshing"] = True
-
-    try:
-        reset_reject_tracker()
-
-        # Force live tickers
-        try:
-            _CACHE.pop("tickers_best_fut", None)
-        except Exception:
-            pass
-
-        best_fut = await _to_thread_with_timeout(
-            fetch_futures_tickers,
-            SCREEN_FETCH_TIMEOUT_SEC
-        )
-
-        if not best_fut:
-            return  # keep old cache, exit cleanly
-
-        now_utc = datetime.now(timezone.utc)
-        session = _guess_session_name_utc(now_utc)
-
-        body, kb = await _to_thread_with_timeout(
-            _build_screen_body_and_kb,
-            SCREEN_BUILD_TIMEOUT_SEC,
-            best_fut,
-            session,
-            0  # no user-specific logic for cache build
-        )
-
-        # Only update cache if build succeeded
-        _SCREEN_CACHE["ts"] = time.time()
-        _SCREEN_CACHE["body"] = str(body or "")
-        _SCREEN_CACHE["kb"] = list(kb or [])
-
-    except asyncio.TimeoutError:
-        logger.warning("screen_cache_job: TIMEOUT after %.1fs", time.time() - t0)
-        return
-    
-    except Exception:
-        logger.exception("Background /screen refresh failed")
-
-    finally:
-        # ALWAYS clear refresh state
-        _SCREEN_CACHE["refreshing"] = False
-        _SCREEN_REFRESH_TASK = None
-        _SCREEN_REFRESH_TASK_STARTED_AT = 0.0
-
 
 
 # =========================================================
@@ -9142,20 +9047,12 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
             return "Setup"
 
         lines2 = []
-        rendered_kb = []  # only add TradingView buttons for setups that were actually rendered in the /screen body
-
-        for s in (setups or []):
-            sym = ""
-            sid = ""
+        for s in setups:
             try:
-                sym = str(getattr(s, "symbol", "") or "").upper().strip()
-                sid = str(getattr(s, "setup_id", "") or "").strip()
-                side = str(getattr(s, "side", "") or "").upper().strip()
+                sym = str(getattr(s, "symbol", "")).upper()
+                sid = str(getattr(s, "setup_id", "") or "")
+                side = str(getattr(s, "side", "") or "").upper()
                 conf = int(getattr(s, "conf", 0) or 0)
-
-                # Filter out low-confidence setups from /screen
-                if conf < int(SCREEN_MIN_CONF):
-                    continue
 
                 entry = float(getattr(s, "entry", 0.0) or 0.0)
                 sl = float(getattr(s, "sl", 0.0) or 0.0)
@@ -9170,68 +9067,36 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 ch15 = float(getattr(s, "ch15", 0.0) or 0.0)
 
                 rr_den = abs(entry - sl)
+                rr1 = (abs(float(tp1) - entry) / rr_den) if (rr_den > 0 and tp1 not in (None, 0, 0.0)) else 0.0
+                rr2 = (abs(float(tp2) - entry) / rr_den) if (rr_den > 0 and tp2 not in (None, 0, 0.0)) else 0.0
                 rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
 
                 pos_word = "long" if side == "BUY" else "short"
                 size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
 
                 emoji = "🟢" if side == "BUY" else "🔴"
+                typ = _engine_label(getattr(s, "engine", ""))
 
-                # Card-style formatting (Telegram /screen) — align to email structure
+                # Card-style formatting (same as previous detailed preview) + /size command
                 block = []
-                block.append(f"{emoji} *{side} — {sym} — Conf {conf}*")
-                block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}` | RR(TP3): `{rr3:.2f}`")
-
-                _tp1, _tp2, _tp3 = _ensure_three_tps(entry, sl, tp3, tp1, tp2, side)
-                if _tp1 not in (None, 0, 0.0) and _tp2 not in (None, 0, 0.0) and _tp3 not in (None, 0, 0.0):
-                    block.append(
-                        f"TP1: `{fmt_price(float(_tp1))}` ({TP_ALLOCS[0]}%) | "
-                        f"TP2: `{fmt_price(float(_tp2))}` ({TP_ALLOCS[1]}%) | "
-                        f"TP3: `{fmt_price(float(_tp3))}` ({TP_ALLOCS[2]}%)"
-                    )
+                block.append(f"{emoji} *{side} — {sym}*")
+                block.append(f"`{sid}` | Conf: `{conf}`")
+                block.append(f"Type: {typ} | RR(TP1): `{rr1:.2f}` | RR(TP2): `{rr2:.2f}` | RR(TP3): `{rr3:.2f}`")
+                block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
+                if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
+                    block.append(f"TP1: `{fmt_price(float(tp1))}` | TP2: `{fmt_price(float(tp2))}` | TP3: `{fmt_price(tp3)}`")
                 else:
-                    block.append(f"TP3: `{fmt_price(tp3)}`")
-
-                # NOTE: this used to reference 'vol_usd' (undefined) which could silently drop the entire card.
+                    block.append(f"TP: `{fmt_price(tp3)}`")
                 block.append(
-                    f"24H {pct_with_emoji(ch24)} | 4H {pct_with_emoji(ch4)} | "
-                    f"1H {pct_with_emoji(ch1)} | 15m {pct_with_emoji(ch15)} | Vol~{fmt_money(vol)}"
+                    f"Moves: 24H {ch24:+.0f}% {_mv_dot(ch24)} • 4H {ch4:+.0f}% {_mv_dot(ch4)} • "
+                    f"1H {ch1:+.0f}% {_mv_dot(ch1)} • 15m {ch15:+.0f}% {_mv_dot(ch15)}"
                 )
-
+                block.append(f"Volume: ~{vol/1e6:.1f}M")
+                block.append(f"Chart: {tv_chart_url(sym)}")
                 block.append(f"`{size_cmd}`")
-
                 lines2.append("\n".join(block))
-                if sym and sid:
-                    rendered_kb.append((sym, sid))
-
             except Exception:
-                # Fallback card (keep /screen readable + keep TradingView buttons in sync with shown setups)
-                try:
-                    sym2 = sym or str(getattr(s, "symbol", "") or "").upper().strip()
-                    sid2 = sid or str(getattr(s, "setup_id", "") or "").strip()
-                    side2 = str(getattr(s, "side", "") or "").upper().strip()
-                    conf2 = int(getattr(s, "conf", 0) or 0)
-                    entry2 = float(getattr(s, "entry", 0.0) or 0.0)
-                    sl2 = float(getattr(s, "sl", 0.0) or 0.0)
-                    tp32 = float(getattr(s, "tp3", 0.0) or 0.0)
-
-                    rr_den2 = abs(entry2 - sl2)
-                    rr32 = (abs(tp32 - entry2) / rr_den2) if rr_den2 > 0 else 0.0
-                    emoji2 = "🟢" if side2 == "BUY" else "🔴"
-                    pos_word2 = "long" if side2 == "BUY" else "short"
-                    size_cmd2 = f"/size {sym2} {pos_word2} entry {entry2:.6g} sl {sl2:.6g}"
-
-                    block2 = []
-                    block2.append(f"{emoji2} *{side2} — {sym2} — Conf {conf2}*")
-                    block2.append(f"Entry: `{fmt_price(entry2)}` | SL: `{fmt_price(sl2)}` | RR(TP3): `{rr32:.2f}`")
-                    block2.append(f"TP3: `{fmt_price(tp32)}`")
-                    block2.append(f"`{size_cmd2}`")
-
-                    lines2.append("\n".join(block2))
-                    if sym2 and sid2:
-                        rendered_kb.append((sym2, sid2))
-                except Exception:
-                    continue
+                continue
 
         combined_setups_txt = ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
 
@@ -9352,106 +9217,29 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     if spike_txt and (not _is_empty(spike_txt)):
         blocks.extend(["", spike_txt])
 
-    # Directional Leaders/Losers (always show both sections; show _None_ when empty)
-    if (up_txt or dn_txt) and (not (_is_empty(up_txt) and _is_empty(dn_txt))):
-        blocks.extend(["", "*Directional Leaders / Losers*", SEP, up_txt or "_None_", dn_txt or "_None_"])
+    if up_txt and (not _is_empty(up_txt)) and ("|" in up_txt):
+        blocks.extend(["", "*Directional Leaders / Losers*", SEP, up_txt])
+
+    if dn_txt and (not _is_empty(dn_txt)) and ("|" in dn_txt):
+        blocks.extend(["", dn_txt])
 
     if leaders_txt and (not _is_empty(leaders_txt)) and ("|" in leaders_txt):
         blocks.extend(["", "*Market Leaders*", SEP, leaders_txt])
 
     body = "\n".join([b for b in blocks if b is not None]).strip()
 
-    kb = []  # TradingView buttons disabled for /screen
-    return body, kb
-    
-
-# =========================================================
-# /screen cache refresher (runs in background every 2 minutes)
-# =========================================================
-
-SCREEN_REFRESH_INTERVAL_SEC = 120  # 2 minutes (as requested)
-
-SCREEN_JOB_LOCK = asyncio.Lock()
-_SCREEN_LAST_REFRESH_OK_TS = 0.0
-
-async def _refresh_screen_cache_once():
-    """Builds the /screen cache snapshot. Never raises."""
-    global _SCREEN_LAST_REFRESH_OK_TS
-
-    # Prevent overlap
-    if SCREEN_JOB_LOCK.locked():
-        return
-
-    async with SCREEN_JOB_LOCK:
-        t0 = time.time()
-        logger.info("screen_cache_job: start")
-        try:
-            reset_reject_tracker()
-
-            # Force LIVE tickers only (do NOT nuke OHLCV cache; that causes timeouts)
-            try:
-                _CACHE.pop("tickers_best_fut", None)
-            except Exception:
-                pass
-
-            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, SCREEN_FETCH_TIMEOUT_SEC)
-            if not best_fut:
-                return
-
-            session = _guess_session_name_utc(datetime.now(timezone.utc))
-
-            # Build body (heavy)
-            body, kb = await _to_thread_with_timeout(
-                _build_screen_body_and_kb,
-                SCREEN_BUILD_TIMEOUT_SEC,
-                best_fut,
-                session,
-                0,  # cache snapshot is global (not per-user)
-            )
-
-            b = str(body or "")
-            # If something stored escaped newlines previously, normalize it
-            if ("\\n" in b) and ("\n" not in b):
-                try:
-                    b = b.replace("\\n", "\n")
-                except Exception:
-                    pass
-
-            _SCREEN_CACHE["ts"] = time.time()
-            logger.info("screen_cache_job: OK in %.1fs (ts=%s)", time.time() - t0, _SCREEN_CACHE["ts"])
-            _SCREEN_CACHE["body"] = b
-            _SCREEN_CACHE["kb"] = list(kb or [])
-            _SCREEN_LAST_REFRESH_OK_TS = float(_SCREEN_CACHE["ts"])
-
-        except asyncio.TimeoutError:
-            # Keep previous cache; next run will try again
-            return
-        except Exception:
-            logger.exception("screen cache refresh failed")
-            return
-
-
-async def screen_cache_job(context: ContextTypes.DEFAULT_TYPE):
-    """JobQueue entrypoint: refresh /screen cache every 2 minutes."""
+    kb = []
     try:
-        await _refresh_screen_cache_once()
+        kb = [(s.symbol, s.setup_id) for s in (setups or [])]
     except Exception:
-        # never crash JobQueue
-        return
-
-
-# =========================================================
-# /screen — ALWAYS instant (serves last snapshot)
-# Refresh happens in background every 2 minutes.
-# =========================================================
-
+        kb = []
+    return body, kb
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/screen — instant snapshot. Background refresh runs every 2 minutes."""
 
     uid = update.effective_user.id
     user = get_user(uid)
 
-    if not has_active_access(uid, user):
+    if not has_active_access(user, uid):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -9459,41 +9247,136 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Header (always fresh)
-    now_utc = datetime.now(timezone.utc)
-    session_disp = (_session_label_utc(now_utc) or "NONE")
-    loc_label, loc_time = user_location_and_time(user)
+    # Avoid long scans blocking other commands on small instances
+    if SCAN_LOCK.locked():
+        await update.message.reply_text("⏳ Scan is running… please try /screen again in a moment.")
+        return
 
-    header = (
-        f"*PulseFutures — Market Scan*\n"
-        f"{HDR}\n"
-        f"*Session:* `{session_disp}` | *{loc_label}:* `{loc_time}`\n"
-    )
+    await SCAN_LOCK.acquire()
+    try:
+        # Send immediate response (fast perceived UX)
+        status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
 
-    cached_body = str(_SCREEN_CACHE.get("body") or "").strip()
+        reset_reject_tracker()
 
-    # If we have a snapshot, always serve it instantly
-    if cached_body:
-        msg = (header + "\n" + cached_body).strip()
+        best_fut = await asyncio.to_thread(fetch_futures_tickers)
+        if not best_fut:
+            await status_msg.edit_text("❌ Failed to fetch futures data.")
+            return
+
+        # Header (always fresh)
+        uid = update.effective_user.id
+        user = get_user(uid)
+        session = current_session_utc()
+        loc_label, loc_time = user_location_and_time(user)
+
+        header = (
+            f"*PulseFutures — Market Scan*\n"
+            f"{HDR}\n"
+            f"*Session:* `{session}` | *{loc_label}:* `{loc_time}`\n"
+        )
+
+        now_ts = time.time()
+
+        # ------------- FAST PATH (cache hit) -------------
+        cached_body = ""
+        cached_kb = []
+        if (_SCREEN_CACHE.get("body") and (now_ts - float(_SCREEN_CACHE.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
+            cached_body = str(_SCREEN_CACHE.get("body") or "")
+            cached_kb = list(_SCREEN_CACHE.get("kb") or [])
+
+            msg = (header + "\n" + cached_body).strip()
+
+            keyboard = [
+                [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                for (sym, sid) in (cached_kb or [])
+            ]
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+            await send_long_message(
+                update,
+                msg,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            )
+            return
+
+        # ------------- SLOW PATH (build once under lock) -------------
+        async with _SCREEN_LOCK:
+            # Re-check cache after waiting for lock (another request may have filled it)
+            now_ts = time.time()
+            if (_SCREEN_CACHE.get("body") and (now_ts - float(_SCREEN_CACHE.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
+                cached_body = str(_SCREEN_CACHE.get("body") or "")
+                cached_kb = list(_SCREEN_CACHE.get("kb") or [])
+
+                msg = (header + "\n" + cached_body).strip()
+                keyboard = [
+                    [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                    for (sym, sid) in (cached_kb or [])
+                ]
+
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+
+                await send_long_message(
+                    update,
+                    msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+                )
+                return
+
+
+            # Heavy build MUST NOT run on the asyncio event loop.
+            # Only /screen is allowed to take longer; everything here runs in a worker thread.
+            body, kb = await asyncio.to_thread(
+                _build_screen_body_and_kb,
+                best_fut,
+                session,
+                int(update.effective_user.id),
+            )
+
+            # Cache for fast subsequent /screen calls
+            _SCREEN_CACHE["ts"] = time.time()
+            _SCREEN_CACHE["body"] = body
+            _SCREEN_CACHE["kb"] = list(kb or [])
+
+
+        # Send final
+        msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
+        keyboard = [
+            [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+            for (sym, sid) in (_SCREEN_CACHE.get("kb") or [])
+        ]
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
         await send_long_message(
             update,
             msg,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
-            reply_markup=None,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
         )
-        return
 
-    # No cache yet: kick an immediate refresh and tell user to retry shortly
-    try:
-        asyncio.create_task(_refresh_screen_cache_once())
-    except Exception:
-        pass
+    except Exception as e:
+        logger.exception("screen_cmd failed")
+        try:
+            await update.message.reply_text(f"❌ /screen failed: {e}")
+        except Exception:
+            pass
 
-    await update.message.reply_text(
-        "🔎 Warming up market scan…\n"
-        "Please try /screen again in ~30–60 seconds."
-    )
 
 
 # =========================================================
@@ -10012,675 +9895,19 @@ _SMTP_CONN_TS = 0.0        # last-used timestamp
 
 
 async def _to_thread_with_timeout(fn, timeout_sec: int, *args, **kwargs):
-    # Use HEAVY pool: prevents starving FAST command checks
-    return await to_thread_heavy(fn, *args, timeout=timeout_sec, **kwargs)
+    return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout_sec)
 
 async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
     """
     Runs send_email() in a worker thread with a hard timeout so SMTP/network stalls
     can't block the Telegram event loop (Render lag fix).
-
-    IMPORTANT: if send_email() raises, capture the real exception into _LAST_SMTP_ERROR
-    so /email_test shows the actual reason (not "unknown_error").
     """
-    uid = None
-    try:
-        uid = kwargs.get("user_id_for_debug", None)
-    except Exception:
-        uid = None
-
     try:
         return bool(await _to_thread_with_timeout(send_email, timeout_sec, *args, **kwargs))
     except asyncio.TimeoutError:
-        if uid is not None:
-            try:
-                _LAST_SMTP_ERROR[int(uid)] = "timeout_sending_email"
-            except Exception:
-                pass
         return False
-    except Exception as e:
-        if uid is not None:
-            try:
-                _LAST_SMTP_ERROR[int(uid)] = f"{type(e).__name__}: {e}"
-            except Exception:
-                pass
-        return False
-
-async def _alert_job_inner():
-    # Keep it quiet if email is off or not configured
-    if not EMAIL_ENABLED:
-        return
-    if not email_config_ok():
-        return
-
-    # Trade-signal emails may be notify_on-gated,
-    # but Big-Move Alerts should go to anyone who has an email saved.
-
-    try:
-        users_notify = list_users_notify_on()
-    except Exception as e:
-        logger.exception("list_users_notify_on failed: %s", e)
-        users_notify = []
-
-    try:
-        users_bigmove = list_users_with_email()
-    except Exception as e:
-        logger.exception("list_users_with_email failed: %s", e)
-        users_bigmove = []
-
-    if not users_notify and not users_bigmove:
-        return
-
-    # TIMEOUT-PROTECTED fetch (prevents lock being held forever)
-    try:
-        best_fut = await _to_thread_with_timeout(fetch_futures_tickers, EMAIL_FETCH_TIMEOUT_SEC)
-    except asyncio.TimeoutError:
-        return
     except Exception:
-        return
-
-    if not best_fut:
-        return
-
-    # -----------------------------------------------------
-    # Rule 2: Volume relative filter base line (killer rule)
-    # -----------------------------------------------------
-    _all_vols = []
-    for _b, _mv in (best_fut or {}).items():
-        try:
-            _all_vols.append(float(getattr(_mv, "fut_vol_usd", 0.0) or 0.0))
-        except Exception:
-            pass
-    MARKET_VOL_MEDIAN_USD = _median(_all_vols)
-
-    # -----------------------------------------------------
-    # Big-Move Alert Emails (independent of full trade setups)
-    # Trigger: |4H| >= user.bigmove_alert_4h  OR  |1H| >= user.bigmove_alert_1h
-    # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 10M)
-    # Defaults: 1H=7.5%, 4H=15%
-    # -----------------------------------------------------
-    for u in (users_bigmove or []):
-        # Pro/trial-only email features
-        try:
-            uid = int(u.get("user_id") or u.get("id") or 0)
-        except Exception:
-            uid = 0
-        if uid and (not user_has_pro(uid)):
-            continue
-
-        tz = timezone.utc
-        uid = 0
-        try:
-            try:
-                uid = int(u.get("user_id") or u.get("id") or 0)
-            except Exception:
-                uid = 0
-            if not uid:
-                continue
-
-            uu = get_user(uid) or {}
-
-            tz_name = str((uu or {}).get("tz") or "UTC")
-            try:
-                tz = ZoneInfo(tz_name)
-            except Exception:
-                tz = timezone.utc
-
-            # Respect per-user ON/OFF
-            on = int(uu.get("bigmove_alert_on", 1) or 0)
-            if not on:
-                _LAST_BIGMOVE_DECISION[uid] = {
-                    "status": "SKIP",
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "reasons": ["bigmove_alert_off"],
-                }
-                continue
-
-            try:
-                p4 = float(uu.get("bigmove_alert_4h", 15.0) or 15.0)
-                p1 = float(uu.get("bigmove_alert_1h", 7.5) or 7.5)
-            except Exception:
-                p4, p1 = 15.0, 7.5
-
-            try:
-                min_vol = float(uu.get("bigmove_min_vol_usd", 10_000_000) or 10_000_000)
-            except Exception:
-                min_vol = 10_000_000.0
-
-            candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, min_vol_usd=min_vol, max_items=12)
-
-            # Debug counts from the SAME dataset used for bigmove (same field-name logic)
-            def _pick_pct(_mv, _keys) -> float:
-                for _k in _keys:
-                    try:
-                        _v = getattr(_mv, _k, None)
-                        if _v is None:
-                            continue
-                        return float(_v or 0.0)
-                    except Exception:
-                        continue
-                return 0.0
-
-            try:
-                bm_any_4h = sum(
-                    1 for _sym, _mv in (best_fut or {}).items()
-                    if abs(_pick_pct(_mv, ["ch4", "pct_4h", "change_4h", "chg_4h", "percentage_4h", "p4", "h4"])) >= float(p4)
-                )
-            except Exception:
-                bm_any_4h = -1
-
-            try:
-                bm_any_1h = sum(
-                    1 for _sym, _mv in (best_fut or {}).items()
-                    if abs(_pick_pct(_mv, ["ch1", "pct_1h", "change_1h", "chg_1h", "percentage_1h", "p1", "h1"])) >= float(p1)
-                )
-            except Exception:
-                bm_any_1h = -1
-
-            if not candidates:
-                _LAST_BIGMOVE_DECISION[uid] = {
-                    "status": "SKIP",
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "reasons": [
-                        f"no_candidates (p4={p4}, p1={p1})",
-                        f"debug_raw_hits:4h={bm_any_4h},1h={bm_any_1h}",
-                    ],
-                }
-                continue
-
-            # Volume gate (default 10M) + remove ones emailed recently (per symbol + direction)
-            filtered = []
-            for c in candidates:
-                try:
-                    vol = float(c.get("vol", 0.0) or 0.0)
-                except Exception:
-                    vol = 0.0
-
-                if vol > 0.0 and vol < float(min_vol):
-                    continue
-
-                try:
-                    if not bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
-                        filtered.append(c)
-                except Exception:
-                    filtered.append(c)
-
-            if not filtered:
-                _LAST_BIGMOVE_DECISION[uid] = {
-                    "status": "SKIP",
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "reasons": [f"no_candidates_after_volume_or_cooldown (min_vol={min_vol/1e6:.1f}M)"],
-                }
-                continue
-
-            # Build email body
-            lines = []
-            lines.append("⚡ PulseFutures — BIG MOVE ALERT")
-            lines.append(HDR)
-            lines.append(f"Triggers: |4H| ≥ {p4:.1f}%  OR  |1H| ≥ {p1:.1f}%")
-            lines.append(f"Min Vol (24H): {min_vol/1e6:.1f}M")
-            lines.append("")
-
-            top = filtered[0]
-            top_sym = top["symbol"]
-            top_dir = "UP" if top.get("direction") == "UP" else "DOWN"
-            top_move = top["ch4"] if abs(top.get("ch4", 0.0)) >= abs(top.get("ch1", 0.0)) else top.get("ch1", 0.0)
-            top_tf = "4H" if abs(top.get("ch4", 0.0)) >= abs(top.get("ch1", 0.0)) else "1H"
-
-            subject = f"⚡ Big Move Alert • {top_sym} {top_dir} • {top_tf} {top_move:+.0f}%"
-            if len(filtered) > 1:
-                subject += f" (+{len(filtered)-1} more)"
-
-            for c in filtered[:8]:
-                sym = c["symbol"]
-                ch4 = float(c.get("ch4", 0.0) or 0.0)
-                ch1 = float(c.get("ch1", 0.0) or 0.0)
-                vol = float(c.get("vol", 0.0) or 0.0)
-                arrow = "🟢" if c.get("direction") == "UP" else "🔴"
-
-                lines.append(f"{arrow} {sym}: 4H {ch4:+.0f}% | 1H {ch1:+.0f}% | Vol ~{vol/1e6:.1f}M")
-                lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
-                lines.append("")
-
-            body = "\n".join(lines).strip()
-
-            _LAST_BIGMOVE_DECISION[uid] = {
-                "status": "TRY_SEND",
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-                "reasons": [
-                    f"candidates={len(filtered)}",
-                    f"p4={p4}",
-                    f"p1={p1}",
-                    f"min_vol={min_vol}",
-                ],
-            }
-
-            ok = await _send_email_async(
-                EMAIL_SEND_TIMEOUT_SEC,
-                subject,
-                body,
-                user_id_for_debug=uid,
-                enforce_trade_window=False
-            )
-
-
-            _LAST_BIGMOVE_DECISION[uid] = {
-                "status": "SENT" if ok else "FAIL",
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-                "reasons": ["ok"] if ok else [_LAST_SMTP_ERROR.get(uid, "send_email_failed")],
-            }
-
-            if ok:
-                for c in filtered[:8]:
-                    try:
-                        mark_bigmove_emailed(uid, c["symbol"], c["direction"])
-                    except Exception:
-                        pass
-
-        except Exception as e:
-            logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
-            _LAST_BIGMOVE_DECISION[uid] = {
-                "status": "ERROR",
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-                "reasons": [f"{type(e).__name__}: {e}"],
-            }
-            continue
-    
-
-    # -----------------------------------------------------
-    setups_by_session: Dict[str, List[Setup]] = {}
-    for sess_name in ["NY", "LON", "ASIA"]:
-        try:
-            pool = await asyncio.wait_for(to_thread_heavy(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
-            pool = {"setups": []}
-        except Exception:
-            pool = {"setups": []}
-
-        setups = (pool.get("setups", []) or [])[:max(EMAIL_SETUPS_N * 3, 9)]
-
-        # Rule 3: Priority override (Directional Leaders/Losers first)
-        if EMAIL_PRIORITY_OVERRIDE_ON:
-            pri = _email_priority_bases(best_fut, directional_take=12)
-            setups = sorted(
-                setups,
-                key=lambda s: (0 if str(getattr(s, "symbol", "")).upper() in pri else 1)
-            )
-
-        setups_by_session[sess_name] = setups
-
-        for s in setups:
-            try:
-                db_insert_signal(s)
-            except Exception:
-                pass
-
-    # -----------------------------------------------------
-    # Per-user send / skip logic
-    # -----------------------------------------------------
-    for user in (users_notify or []):
-        # ✅ Robust uid resolution (supports either user_id or id)
-        try:
-            uid = int(user.get("user_id") or user.get("id") or 0)
-        except Exception:
-            uid = 0
-        if not uid:
-            continue
-
-        # ✅ Robust tz resolution (never crash job)
-        tz_name = str(user.get("tz") or "UTC")
-        try:
-            tz = ZoneInfo(tz_name)
-        except Exception:
-            tz = timezone.utc
-            tz_name = "UTC"
-
-        # ✅ Ensure session logic never crashes job
-        try:
-            sess = in_session_now(user)
-        except Exception as e:
-            _LAST_EMAIL_DECISION[uid] = {
-                "status": "SKIP",
-                "reasons": [f"in_session_now_failed ({type(e).__name__})"],
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-            }
-            continue
-
-        # If user is NOT in an enabled session right now, skip
-        if not sess:
-            _LAST_EMAIL_DECISION[uid] = {
-                "status": "SKIP",
-                "reasons": ["not_in_enabled_session"],
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-            }
-            continue
-
-        setups_all = setups_by_session.get(str(sess.get("name") or ""), []) or []
-
-        if not setups_all:
-            _LAST_EMAIL_DECISION[uid] = {
-                "status": "SKIP",
-                "reasons": [f"no_setups_generated_for_session ({sess.get('name')})"],
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-            }
-            continue
-
-        # state init must not crash job
-        try:
-            st = email_state_get(uid)
-        except Exception as e:
-            _LAST_EMAIL_DECISION[uid] = {
-                "status": "ERROR",
-                "reasons": [f"email_state_get_failed ({type(e).__name__})"],
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-            }
-            continue
-
-        # Reset session state if session_key changed
-        try:
-            if str(st.get("session_key")) != str(sess.get("session_key")):
-                email_state_set(uid, session_key=str(sess.get("session_key")), sent_count=0, last_email_ts=0.0)
-                st = email_state_get(uid)
-        except Exception:
-            pass
-
-        # Safe defaults (never KeyError)
-        try:
-            max_emails = int(user.get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION))
-        except Exception:
-            max_emails = int(DEFAULT_MAX_EMAILS_PER_SESSION)
-
-        try:
-            gap_min = int(user.get("email_gap_min", DEFAULT_MIN_EMAIL_GAP_MIN))
-        except Exception:
-            gap_min = int(DEFAULT_MIN_EMAIL_GAP_MIN)
-
-        gap_sec = max(0, gap_min) * 60
-
-        # Daily cap
-        day_local = datetime.now(tz).date().isoformat()
-        try:
-            sent_today = _email_daily_get(uid, day_local)
-        except Exception:
-            sent_today = 0
-
-        try:
-            day_cap = int(user.get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY))
-        except Exception:
-            day_cap = int(DEFAULT_MAX_EMAILS_PER_DAY)
-
-        if day_cap > 0 and sent_today >= day_cap:
-            _LAST_EMAIL_DECISION[uid] = {
-                "status": "SKIP",
-                "reasons": [f"daily_email_cap_reached ({sent_today}/{day_cap})"],
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-            }
-            continue
-
-        # Session cap
-        try:
-            sent_in_session = int(st.get("sent_count", 0) or 0)
-        except Exception:
-            sent_in_session = 0
-
-        if max_emails > 0 and sent_in_session >= max_emails:
-            _LAST_EMAIL_DECISION[uid] = {
-                "status": "SKIP",
-                "reasons": [f"session_email_cap_reached ({sent_in_session}/{max_emails})"],
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-            }
-            continue
-
-        # Gap
-        now_ts = time.time()
-        try:
-            last_ts = float(st.get("last_email_ts", 0.0) or 0.0)
-        except Exception:
-            last_ts = 0.0
-
-        if gap_sec > 0 and (now_ts - last_ts) < gap_sec:
-            remain = int(gap_sec - (now_ts - last_ts))
-            _LAST_EMAIL_DECISION[uid] = {
-                "status": "SKIP",
-                "reasons": [f"email_gap_active (remain {remain}s)"],
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-            }
-            continue
-
-        # ---------------------------
-        # Your existing filter + pick logic
-        # ---------------------------
-        min_conf = SESSION_MIN_CONF.get(sess["name"], 78)
-        min_rr = SESSION_MIN_RR_TP3.get(sess["name"], 2.2)
-
-        # -------------------------------------------------
-        # Per-user EMAIL filter parameters (safe defaults)
-        # -------------------------------------------------
-        try:
-            email_abs_vol_min = float((user.get("email_abs_vol_min_usd") if isinstance(user, dict) else None) or EMAIL_ABS_VOL_USD_MIN)
-        except Exception:
-            email_abs_vol_min = float(EMAIL_ABS_VOL_USD_MIN)
-
-        try:
-            email_rel_vol_min_mult = float((user.get("email_rel_vol_min_mult") if isinstance(user, dict) else None) or EMAIL_REL_VOL_MIN_MULT)
-        except Exception:
-            email_rel_vol_min_mult = float(EMAIL_REL_VOL_MIN_MULT)
-
-        try:
-            confirm_15m_abs_min = float((user.get("confirm_15m_abs_min") if isinstance(user, dict) else None) or CONFIRM_15M_ABS_MIN)
-        except Exception:
-            confirm_15m_abs_min = float(CONFIRM_15M_ABS_MIN)
-
-        try:
-            early_1h_abs_min = float((user.get("early_1h_abs_min") if isinstance(user, dict) else None) or EARLY_1H_ABS_MIN)
-        except Exception:
-            early_1h_abs_min = float(EARLY_1H_ABS_MIN)
-
-        # Extra strictness for EMAIL (but not "never send"): allow user override, else keep conservative defaults.
-        try:
-            email_early_min_ch15_abs = float((user.get("email_early_min_ch15_abs") if isinstance(user, dict) else None) or EMAIL_EARLY_MIN_CH15_ABS)
-        except Exception:
-            email_early_min_ch15_abs = float(EMAIL_EARLY_MIN_CH15_ABS)
-
-        confirmed: List[Setup] = []
-        early: List[Setup] = []
-        skip_reasons_counter = Counter()
-
-        for s in setups_all:
-            base = str(getattr(s, "symbol", "") or "").upper().strip()
-
-            # For /screen, be slightly more permissive so the bot doesn't feel "dead" in slow hours.
-            # Email stays at the stricter session floors.
-            eff_min_conf = int(min_conf)
-            eff_min_rr = float(min_rr)
-            if s.conf < eff_min_conf:
-                skip_reasons_counter["below_session_conf_floor"] += 1
-                try:
-                    mv = (best_fut or {}).get(base)
-                    if mv is not None:
-                        _rej("below_session_conf_floor", base, mv, f"conf={int(s.conf)} min={int(eff_min_conf)}")
-                except Exception:
-                    pass
-                continue
-
-            rr3 = rr_to_tp(float(s.entry), float(s.sl), float(s.tp3))
-            if float(rr3) < float(eff_min_rr):
-                skip_reasons_counter["below_session_rr_floor"] += 1
-                try:
-                    mv = (best_fut or {}).get(base)
-                    if mv is not None:
-                        _rej("below_session_rr_floor", base, mv, f"rr3={float(rr3):.2f} min={float(eff_min_rr):.2f}")
-                except Exception:
-                    pass
-                continue
-
-            # =========================================================
-            # Rule 2: Volume relative filter (killer rule)
-            # =========================================================
-            vol_usd = 0.0
-            try:
-                vol_usd = float(_best_fut_vol_usd(best_fut, getattr(s, "symbol", "")) or 0.0)
-            except Exception:
-                vol_usd = 0.0
-
-            if vol_usd <= 0.0:
-                try:
-                    vol_usd = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
-                except Exception:
-                    vol_usd = 0.0
-
-            # Per-user email volume floors (stricter than /screen, but configurable)
-            try:
-                abs_min = float(user.get("email_abs_vol_min_usd", user.get("email_abs_vol_min", 5_000_000)) or 5_000_000)
-            except Exception:
-                abs_min = 5_000_000.0
-
-            try:
-                rel_mult = float(user.get("email_rel_vol_min_mult", user.get("email_rel_vol_mult", 0.80)) or 0.80)
-            except Exception:
-                rel_mult = 0.80
-
-            if vol_usd > 0.0 and vol_usd < abs_min:
-                skip_reasons_counter["email_vol_abs_too_low"] += 1
-                continue
-
-            if vol_usd > 0.0 and float(MARKET_VOL_MEDIAN_USD or 0.0) > 0:
-                rel = vol_usd / float(MARKET_VOL_MEDIAN_USD)
-                if rel < float(rel_mult):
-                    skip_reasons_counter["email_vol_rel_too_low"] += 1
-                    continue
-
-            # =========================================================
-            # Rule 1: Minimum momentum gate for EMAILS
-            # =========================================================
-            ch15 = _safe_float(getattr(s, "ch15", 0.0), 0.0)
-            is_confirm_15m = abs(float(ch15)) >= float(confirm_15m_abs_min)
-
-            if is_confirm_15m:
-                confirmed.append(s)
-            else:
-                if abs(float(s.ch1)) < float(early_1h_abs_min):
-                    skip_reasons_counter["early_gate_ch1_not_strong"] += 1
-                    continue
-                if abs(float(ch15)) < float(email_early_min_ch15_abs):
-                    skip_reasons_counter["early_gate_15m_too_weak"] += 1
-                    continue
-                if s.conf < (min_conf + EARLY_EMAIL_EXTRA_CONF):
-                    skip_reasons_counter["early_gate_conf_not_high_enough"] += 1
-                    continue
-                early.append(s)
-
-        confirmed = sorted(confirmed, key=lambda x: x.conf, reverse=True)
-        early = sorted(early, key=lambda x: x.conf, reverse=True)
-
-        picks: List[Setup] = []
-        for s in confirmed:
-            if len(picks) >= int(EMAIL_SETUPS_N):
-                break
-            picks.append(s)
-
-        fill_left = int(EMAIL_SETUPS_N) - len(picks)
-        if fill_left > 0 and int(EARLY_EMAIL_MAX_FILL) > 0:
-            allow_early = min(int(EARLY_EMAIL_MAX_FILL), fill_left)
-            picks.extend(early[:allow_early])
-
-        if not picks:
-            _LAST_EMAIL_DECISION[uid] = {
-                "status": "SKIP",
-                "reasons": ["no_setups_after_filters"] + (
-                    [f"top_reasons={dict(skip_reasons_counter.most_common(5))}"]
-                    if skip_reasons_counter else []
-                ),
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-            }
-            continue
-
-        chosen_list: List[Setup] = []
-        cooldown_blocked = 0
-        flip_blocked = 0
-
-        for s in picks:
-            if len(chosen_list) >= int(EMAIL_SETUPS_N):
-                break
-
-            sym = str(getattr(s, "symbol", "")).upper()
-            side = str(getattr(s, "side", "")).upper()
-            sess_name = str(sess["name"])
-
-            if symbol_flip_guard_active(uid, sym, side, sess_name):
-                flip_blocked += 1
-                continue
-
-            if symbol_recently_emailed(uid, sym, side, sess_name):
-                cooldown_blocked += 1
-                continue
-
-            chosen_list.append(s)
-
-        if not chosen_list:
-            reasons = []
-            if cooldown_blocked:
-                reasons.append(f"cooldown_blocked={cooldown_blocked}")
-            if flip_blocked:
-                reasons.append(f"flip_guard_blocked={flip_blocked}")
-            reasons.append("all_candidates_blocked")
-
-            _LAST_EMAIL_DECISION[uid] = {
-                "status": "SKIP",
-                "reasons": reasons,
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-            }
-            continue
-
-        # Send ONE email containing MULTIPLE setups (timeout-protected)
-        try:
-            ok = await asyncio.wait_for(
-                to_thread_heavy(send_email_alert_multi, user, sess, chosen_list, best_fut),
-                timeout=EMAIL_SEND_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError:
-            ok = False
-            try:
-                _LAST_SMTP_ERROR[uid] = f"timeout_after_{int(EMAIL_SEND_TIMEOUT_SEC)}s"
-            except Exception:
-                pass
-        except Exception as e:
-            ok = False
-            logger.exception("send_email_alert_multi failed for uid=%s: %s", uid, e)
-            try:
-                _LAST_SMTP_ERROR[uid] = f"{type(e).__name__}: {e}"
-            except Exception:
-                pass
-
-        if ok:
-            try:
-                email_state_set(uid, last_email_ts=time.time(), sent_count=int(st.get("sent_count", 0) or 0) + 1)
-            except Exception:
-                pass
-
-            try:
-                _email_daily_inc(uid, day_local)
-            except Exception:
-                pass
-
-            for s in chosen_list:
-                try:
-                    mark_symbol_emailed(uid, s.symbol, s.side, sess["name"])
-                except Exception:
-                    pass
-
-            _LAST_EMAIL_DECISION[uid] = {
-                "status": "SENT",
-                "picked": ", ".join([f"{s.side} {s.symbol} conf={s.conf}" for s in chosen_list]),
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-                "reasons": ["passed_filters_multi"],
-            }
-        else:
-            _LAST_EMAIL_DECISION[uid] = {
-                "status": "ERROR",
-                "reasons": ["send_email_failed_or_timeout", _LAST_SMTP_ERROR.get(uid, "unknown_error")],
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-            }
+        return False
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     # Prevent overlapping runs (JobQueue can overlap if a run is slow)
@@ -10688,11 +9915,640 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with ALERT_LOCK:
-        # Offload the full email job to a worker thread so Telegram commands stay instant
+        # Keep it quiet if email is off or not configured
+        if not EMAIL_ENABLED:
+            return
+        if not email_config_ok():
+            return
+
+        # Trade-signal emails may be notify_on-gated,
+        # but Big-Move Alerts should go to anyone who has an email saved.
+
         try:
-            await to_thread_heavy(_run_coro_in_thread, _alert_job_inner())
+            users_notify = list_users_notify_on()
         except Exception as e:
-            logger.exception("alert_job failed: %s", e)
+            logger.exception("list_users_notify_on failed: %s", e)
+            users_notify = []
+
+        try:
+            users_bigmove = list_users_with_email()
+        except Exception as e:
+            logger.exception("list_users_with_email failed: %s", e)
+            users_bigmove = []
+
+        if not users_notify and not users_bigmove:
+            return
+
+        # TIMEOUT-PROTECTED fetch (prevents lock being held forever)
+        try:
+            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, EMAIL_FETCH_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            return
+        except Exception:
+            return
+
+        if not best_fut:
+            return
+
+        # -----------------------------------------------------
+        # Rule 2: Volume relative filter base line (killer rule)
+        # -----------------------------------------------------
+        _all_vols = []
+        for _b, _mv in (best_fut or {}).items():
+            try:
+                _all_vols.append(float(getattr(_mv, "fut_vol_usd", 0.0) or 0.0))
+            except Exception:
+                pass
+        MARKET_VOL_MEDIAN_USD = _median(_all_vols)
+
+        # -----------------------------------------------------
+        # Big-Move Alert Emails (independent of full trade setups)
+        # Trigger: |4H| >= user.bigmove_alert_4h  OR  |1H| >= user.bigmove_alert_1h
+        # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 10M)
+        # Defaults: 1H=7.5%, 4H=15%
+        # -----------------------------------------------------
+        for u in (users_bigmove or []):
+            # Pro/trial-only email features
+            try:
+                uid = int(u.get("user_id") or u.get("id") or 0)
+            except Exception:
+                uid = 0
+            if uid and (not user_has_pro(uid)):
+                continue
+
+            tz = timezone.utc
+            uid = 0
+            try:
+                try:
+                    uid = int(u.get("user_id") or u.get("id") or 0)
+                except Exception:
+                    uid = 0
+                if not uid:
+                    continue
+
+                uu = get_user(uid) or {}
+
+                tz_name = str((uu or {}).get("tz") or "UTC")
+                try:
+                    tz = ZoneInfo(tz_name)
+                except Exception:
+                    tz = timezone.utc
+
+                # Respect per-user ON/OFF
+                on = int(uu.get("bigmove_alert_on", 1) or 0)
+                if not on:
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": ["bigmove_alert_off"],
+                    }
+                    continue
+
+                try:
+                    p4 = float(uu.get("bigmove_alert_4h", 15.0) or 15.0)
+                    p1 = float(uu.get("bigmove_alert_1h", 7.5) or 7.5)
+                except Exception:
+                    p4, p1 = 15.0, 7.5
+
+                try:
+                    min_vol = float(uu.get("bigmove_min_vol_usd", 10_000_000) or 10_000_000)
+                except Exception:
+                    min_vol = 10_000_000.0
+
+                candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, min_vol_usd=min_vol, max_items=12)
+
+                # Debug counts from the SAME dataset used for bigmove (same field-name logic)
+                def _pick_pct(_mv, _keys) -> float:
+                    for _k in _keys:
+                        try:
+                            _v = getattr(_mv, _k, None)
+                            if _v is None:
+                                continue
+                            return float(_v or 0.0)
+                        except Exception:
+                            continue
+                    return 0.0
+
+                try:
+                    bm_any_4h = sum(
+                        1 for _sym, _mv in (best_fut or {}).items()
+                        if abs(_pick_pct(_mv, ["ch4", "pct_4h", "change_4h", "chg_4h", "percentage_4h", "p4", "h4"])) >= float(p4)
+                    )
+                except Exception:
+                    bm_any_4h = -1
+
+                try:
+                    bm_any_1h = sum(
+                        1 for _sym, _mv in (best_fut or {}).items()
+                        if abs(_pick_pct(_mv, ["ch1", "pct_1h", "change_1h", "chg_1h", "percentage_1h", "p1", "h1"])) >= float(p1)
+                    )
+                except Exception:
+                    bm_any_1h = -1
+
+                if not candidates:
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": [
+                            f"no_candidates (p4={p4}, p1={p1})",
+                            f"debug_raw_hits:4h={bm_any_4h},1h={bm_any_1h}",
+                        ],
+                    }
+                    continue
+
+                # Volume gate (default 10M) + remove ones emailed recently (per symbol + direction)
+                filtered = []
+                for c in candidates:
+                    try:
+                        vol = float(c.get("vol", 0.0) or 0.0)
+                    except Exception:
+                        vol = 0.0
+
+                    if vol > 0.0 and vol < float(min_vol):
+                        continue
+
+                    try:
+                        if not bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
+                            filtered.append(c)
+                    except Exception:
+                        filtered.append(c)
+
+                if not filtered:
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": [f"no_candidates_after_volume_or_cooldown (min_vol={min_vol/1e6:.1f}M)"],
+                    }
+                    continue
+
+                # Build email body
+                lines = []
+                lines.append("⚡ PulseFutures — BIG MOVE ALERT")
+                lines.append(HDR)
+                lines.append(f"Triggers: |4H| ≥ {p4:.1f}%  OR  |1H| ≥ {p1:.1f}%")
+                lines.append(f"Min Vol (24H): {min_vol/1e6:.1f}M")
+                lines.append("")
+
+                top = filtered[0]
+                top_sym = top["symbol"]
+                top_dir = "UP" if top.get("direction") == "UP" else "DOWN"
+                top_move = top["ch4"] if abs(top.get("ch4", 0.0)) >= abs(top.get("ch1", 0.0)) else top.get("ch1", 0.0)
+                top_tf = "4H" if abs(top.get("ch4", 0.0)) >= abs(top.get("ch1", 0.0)) else "1H"
+
+                subject = f"⚡ Big Move Alert • {top_sym} {top_dir} • {top_tf} {top_move:+.0f}%"
+                if len(filtered) > 1:
+                    subject += f" (+{len(filtered)-1} more)"
+
+                for c in filtered[:8]:
+                    sym = c["symbol"]
+                    ch4 = float(c.get("ch4", 0.0) or 0.0)
+                    ch1 = float(c.get("ch1", 0.0) or 0.0)
+                    vol = float(c.get("vol", 0.0) or 0.0)
+                    arrow = "🟢" if c.get("direction") == "UP" else "🔴"
+
+                    lines.append(f"{arrow} {sym}: 4H {ch4:+.0f}% | 1H {ch1:+.0f}% | Vol ~{vol/1e6:.1f}M")
+                    lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
+                    lines.append("")
+
+                body = "\n".join(lines).strip()
+
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "TRY_SEND",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": [
+                        f"candidates={len(filtered)}",
+                        f"p4={p4}",
+                        f"p1={p1}",
+                        f"min_vol={min_vol}",
+                    ],
+                }
+
+                ok = await _send_email_async(
+                    EMAIL_SEND_TIMEOUT_SEC,
+                    subject,
+                    body,
+                    user_id_for_debug=uid,
+                    enforce_trade_window=False
+                )
+
+
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "SENT" if ok else "FAIL",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": ["ok"] if ok else [_LAST_SMTP_ERROR.get(uid, "send_email_failed")],
+                }
+
+                if ok:
+                    for c in filtered[:8]:
+                        try:
+                            mark_bigmove_emailed(uid, c["symbol"], c["direction"])
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "ERROR",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": [f"{type(e).__name__}: {e}"],
+                }
+                continue
+        
+
+        # -----------------------------------------------------
+        setups_by_session: Dict[str, List[Setup]] = {}
+        for sess_name in ["NY", "LON", "ASIA"]:
+            try:
+                pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                pool = {"setups": []}
+            except Exception:
+                pool = {"setups": []}
+
+            setups = (pool.get("setups", []) or [])[:max(EMAIL_SETUPS_N * 3, 9)]
+
+            # Rule 3: Priority override (Directional Leaders/Losers first)
+            if EMAIL_PRIORITY_OVERRIDE_ON:
+                pri = _email_priority_bases(best_fut, directional_take=12)
+                setups = sorted(
+                    setups,
+                    key=lambda s: (0 if str(getattr(s, "symbol", "")).upper() in pri else 1)
+                )
+
+            setups_by_session[sess_name] = setups
+
+            for s in setups:
+                try:
+                    db_insert_signal(s)
+                except Exception:
+                    pass
+
+        # -----------------------------------------------------
+        # Per-user send / skip logic
+        # -----------------------------------------------------
+        for user in (users_notify or []):
+            # ✅ Robust uid resolution (supports either user_id or id)
+            try:
+                uid = int(user.get("user_id") or user.get("id") or 0)
+            except Exception:
+                uid = 0
+            if not uid:
+                continue
+
+            # ✅ Robust tz resolution (never crash job)
+            tz_name = str(user.get("tz") or "UTC")
+            try:
+                tz = ZoneInfo(tz_name)
+            except Exception:
+                tz = timezone.utc
+                tz_name = "UTC"
+
+            # ✅ Ensure session logic never crashes job
+            try:
+                sess = in_session_now(user)
+            except Exception as e:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"in_session_now_failed ({type(e).__name__})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # If user is NOT in an enabled session right now, skip
+            if not sess:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": ["not_in_enabled_session"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            setups_all = setups_by_session.get(str(sess.get("name") or ""), []) or []
+
+            if not setups_all:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"no_setups_generated_for_session ({sess.get('name')})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # state init must not crash job
+            try:
+                st = email_state_get(uid)
+            except Exception as e:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "ERROR",
+                    "reasons": [f"email_state_get_failed ({type(e).__name__})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Reset session state if session_key changed
+            try:
+                if str(st.get("session_key")) != str(sess.get("session_key")):
+                    email_state_set(uid, session_key=str(sess.get("session_key")), sent_count=0, last_email_ts=0.0)
+                    st = email_state_get(uid)
+            except Exception:
+                pass
+
+            # Safe defaults (never KeyError)
+            try:
+                max_emails = int(user.get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION))
+            except Exception:
+                max_emails = int(DEFAULT_MAX_EMAILS_PER_SESSION)
+
+            try:
+                gap_min = int(user.get("email_gap_min", DEFAULT_MIN_EMAIL_GAP_MIN))
+            except Exception:
+                gap_min = int(DEFAULT_MIN_EMAIL_GAP_MIN)
+
+            gap_sec = max(0, gap_min) * 60
+
+            # Daily cap
+            day_local = datetime.now(tz).date().isoformat()
+            try:
+                sent_today = _email_daily_get(uid, day_local)
+            except Exception:
+                sent_today = 0
+
+            try:
+                day_cap = int(user.get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY))
+            except Exception:
+                day_cap = int(DEFAULT_MAX_EMAILS_PER_DAY)
+
+            if day_cap > 0 and sent_today >= day_cap:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"daily_email_cap_reached ({sent_today}/{day_cap})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Session cap
+            try:
+                sent_in_session = int(st.get("sent_count", 0) or 0)
+            except Exception:
+                sent_in_session = 0
+
+            if max_emails > 0 and sent_in_session >= max_emails:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"session_email_cap_reached ({sent_in_session}/{max_emails})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Gap
+            now_ts = time.time()
+            try:
+                last_ts = float(st.get("last_email_ts", 0.0) or 0.0)
+            except Exception:
+                last_ts = 0.0
+
+            if gap_sec > 0 and (now_ts - last_ts) < gap_sec:
+                remain = int(gap_sec - (now_ts - last_ts))
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"email_gap_active (remain {remain}s)"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # ---------------------------
+            # Your existing filter + pick logic
+            # ---------------------------
+            min_conf = SESSION_MIN_CONF.get(sess["name"], 78)
+            min_rr = SESSION_MIN_RR_TP3.get(sess["name"], 2.2)
+
+            # -------------------------------------------------
+            # Per-user EMAIL filter parameters (safe defaults)
+            # -------------------------------------------------
+            try:
+                email_abs_vol_min = float((user.get("email_abs_vol_min_usd") if isinstance(user, dict) else None) or EMAIL_ABS_VOL_USD_MIN)
+            except Exception:
+                email_abs_vol_min = float(EMAIL_ABS_VOL_USD_MIN)
+
+            try:
+                email_rel_vol_min_mult = float((user.get("email_rel_vol_min_mult") if isinstance(user, dict) else None) or EMAIL_REL_VOL_MIN_MULT)
+            except Exception:
+                email_rel_vol_min_mult = float(EMAIL_REL_VOL_MIN_MULT)
+
+            try:
+                confirm_15m_abs_min = float((user.get("confirm_15m_abs_min") if isinstance(user, dict) else None) or CONFIRM_15M_ABS_MIN)
+            except Exception:
+                confirm_15m_abs_min = float(CONFIRM_15M_ABS_MIN)
+
+            try:
+                early_1h_abs_min = float((user.get("early_1h_abs_min") if isinstance(user, dict) else None) or EARLY_1H_ABS_MIN)
+            except Exception:
+                early_1h_abs_min = float(EARLY_1H_ABS_MIN)
+
+            # Extra strictness for EMAIL (but not "never send"): allow user override, else keep conservative defaults.
+            try:
+                email_early_min_ch15_abs = float((user.get("email_early_min_ch15_abs") if isinstance(user, dict) else None) or EMAIL_EARLY_MIN_CH15_ABS)
+            except Exception:
+                email_early_min_ch15_abs = float(EMAIL_EARLY_MIN_CH15_ABS)
+
+            confirmed: List[Setup] = []
+            early: List[Setup] = []
+            skip_reasons_counter = Counter()
+
+            for s in setups_all:
+                base = str(getattr(s, "symbol", "") or "").upper().strip()
+
+                # For /screen, be slightly more permissive so the bot doesn't feel "dead" in slow hours.
+                # Email stays at the stricter session floors.
+                eff_min_conf = int(min_conf)
+                eff_min_rr = float(min_rr)
+                if s.conf < eff_min_conf:
+                    skip_reasons_counter["below_session_conf_floor"] += 1
+                    try:
+                        mv = (best_fut or {}).get(base)
+                        if mv is not None:
+                            _rej("below_session_conf_floor", base, mv, f"conf={int(s.conf)} min={int(eff_min_conf)}")
+                    except Exception:
+                        pass
+                    continue
+
+                rr3 = rr_to_tp(float(s.entry), float(s.sl), float(s.tp3))
+                if float(rr3) < float(eff_min_rr):
+                    skip_reasons_counter["below_session_rr_floor"] += 1
+                    try:
+                        mv = (best_fut or {}).get(base)
+                        if mv is not None:
+                            _rej("below_session_rr_floor", base, mv, f"rr3={float(rr3):.2f} min={float(eff_min_rr):.2f}")
+                    except Exception:
+                        pass
+                    continue
+
+                # =========================================================
+                # Rule 2: Volume relative filter (killer rule)
+                # =========================================================
+                vol_usd = 0.0
+                try:
+                    vol_usd = float(_best_fut_vol_usd(best_fut, getattr(s, "symbol", "")) or 0.0)
+                except Exception:
+                    vol_usd = 0.0
+
+                if vol_usd <= 0.0:
+                    try:
+                        vol_usd = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+                    except Exception:
+                        vol_usd = 0.0
+
+                # Per-user email volume floors (stricter than /screen, but configurable)
+                try:
+                    abs_min = float(user.get("email_abs_vol_min_usd", user.get("email_abs_vol_min", 5_000_000)) or 5_000_000)
+                except Exception:
+                    abs_min = 5_000_000.0
+
+                try:
+                    rel_mult = float(user.get("email_rel_vol_min_mult", user.get("email_rel_vol_mult", 0.80)) or 0.80)
+                except Exception:
+                    rel_mult = 0.80
+
+                if vol_usd > 0.0 and vol_usd < abs_min:
+                    skip_reasons_counter["email_vol_abs_too_low"] += 1
+                    continue
+
+                if vol_usd > 0.0 and float(MARKET_VOL_MEDIAN_USD or 0.0) > 0:
+                    rel = vol_usd / float(MARKET_VOL_MEDIAN_USD)
+                    if rel < float(rel_mult):
+                        skip_reasons_counter["email_vol_rel_too_low"] += 1
+                        continue
+
+                # =========================================================
+                # Rule 1: Minimum momentum gate for EMAILS
+                # =========================================================
+                ch15 = _safe_float(getattr(s, "ch15", 0.0), 0.0)
+                is_confirm_15m = abs(float(ch15)) >= float(confirm_15m_abs_min)
+
+                if is_confirm_15m:
+                    confirmed.append(s)
+                else:
+                    if abs(float(s.ch1)) < float(early_1h_abs_min):
+                        skip_reasons_counter["early_gate_ch1_not_strong"] += 1
+                        continue
+                    if abs(float(ch15)) < float(email_early_min_ch15_abs):
+                        skip_reasons_counter["early_gate_15m_too_weak"] += 1
+                        continue
+                    if s.conf < (min_conf + EARLY_EMAIL_EXTRA_CONF):
+                        skip_reasons_counter["early_gate_conf_not_high_enough"] += 1
+                        continue
+                    early.append(s)
+
+            confirmed = sorted(confirmed, key=lambda x: x.conf, reverse=True)
+            early = sorted(early, key=lambda x: x.conf, reverse=True)
+
+            picks: List[Setup] = []
+            for s in confirmed:
+                if len(picks) >= int(EMAIL_SETUPS_N):
+                    break
+                picks.append(s)
+
+            fill_left = int(EMAIL_SETUPS_N) - len(picks)
+            if fill_left > 0 and int(EARLY_EMAIL_MAX_FILL) > 0:
+                allow_early = min(int(EARLY_EMAIL_MAX_FILL), fill_left)
+                picks.extend(early[:allow_early])
+
+            if not picks:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": ["no_setups_after_filters"] + (
+                        [f"top_reasons={dict(skip_reasons_counter.most_common(5))}"]
+                        if skip_reasons_counter else []
+                    ),
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            chosen_list: List[Setup] = []
+            cooldown_blocked = 0
+            flip_blocked = 0
+
+            for s in picks:
+                if len(chosen_list) >= int(EMAIL_SETUPS_N):
+                    break
+
+                sym = str(getattr(s, "symbol", "")).upper()
+                side = str(getattr(s, "side", "")).upper()
+                sess_name = str(sess["name"])
+
+                if symbol_flip_guard_active(uid, sym, side, sess_name):
+                    flip_blocked += 1
+                    continue
+
+                if symbol_recently_emailed(uid, sym, side, sess_name):
+                    cooldown_blocked += 1
+                    continue
+
+                chosen_list.append(s)
+
+            if not chosen_list:
+                reasons = []
+                if cooldown_blocked:
+                    reasons.append(f"cooldown_blocked={cooldown_blocked}")
+                if flip_blocked:
+                    reasons.append(f"flip_guard_blocked={flip_blocked}")
+                reasons.append("all_candidates_blocked")
+
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": reasons,
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Send ONE email containing MULTIPLE setups (timeout-protected)
+            try:
+                ok = await asyncio.wait_for(
+                    asyncio.to_thread(send_email_alert_multi, user, sess, chosen_list, best_fut),
+                    timeout=EMAIL_SEND_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                ok = False
+                try:
+                    _LAST_SMTP_ERROR[uid] = f"timeout_after_{int(EMAIL_SEND_TIMEOUT_SEC)}s"
+                except Exception:
+                    pass
+            except Exception as e:
+                ok = False
+                logger.exception("send_email_alert_multi failed for uid=%s: %s", uid, e)
+                try:
+                    _LAST_SMTP_ERROR[uid] = f"{type(e).__name__}: {e}"
+                except Exception:
+                    pass
+
+            if ok:
+                try:
+                    email_state_set(uid, last_email_ts=time.time(), sent_count=int(st.get("sent_count", 0) or 0) + 1)
+                except Exception:
+                    pass
+
+                try:
+                    _email_daily_inc(uid, day_local)
+                except Exception:
+                    pass
+
+                for s in chosen_list:
+                    try:
+                        mark_symbol_emailed(uid, s.symbol, s.side, sess["name"])
+                    except Exception:
+                        pass
+
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SENT",
+                    "picked": ", ".join([f"{s.side} {s.symbol} conf={s.conf}" for s in chosen_list]),
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": ["passed_filters_multi"],
+                }
+            else:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "ERROR",
+                    "reasons": ["send_email_failed_or_timeout", _LAST_SMTP_ERROR.get(uid, "unknown_error")],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
 
 async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -11600,19 +11456,6 @@ def main():
             interval=interval_sec,
             first=90,
             name="alert_job",
-            job_kwargs={
-                "max_instances": 1,
-                "coalesce": True,
-                "misfire_grace_time": 60,
-            },
-        )
-
-        # Keep /screen snapshot fresh in background (every 2 minutes)
-        app.job_queue.run_repeating(
-            screen_cache_job,
-            interval=int(SCREEN_REFRESH_INTERVAL_SEC),
-            first=10,
-            name="screen_cache_job",
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
