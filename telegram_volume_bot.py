@@ -9067,7 +9067,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 sym = str(getattr(s, "symbol", "")).upper()
                 sid = str(getattr(s, "setup_id", "") or "")
                 side = str(getattr(s, "side", "") or "").upper()
-                conf = int(getattr(s, "conf", 0) or 0)
+                conf = _safe_int(getattr(s, "conf", 0) or 0)
 
                 entry = float(getattr(s, "entry", 0.0) or 0.0)
                 sl = float(getattr(s, "sl", 0.0) or 0.0)
@@ -9409,7 +9409,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         tps = f"TP {fmt_price(float(sig['tp3']))}"
-        if sig.get("tp1") and sig.get("tp2") and int(sig["conf"]) >= MULTI_TP_MIN_CONF:
+        if sig.get("tp1") and sig.get("tp2") and _safe_int(sig.get("conf", 0)) >= MULTI_TP_MIN_CONF:
             tps = f"TP1 {fmt_price(float(sig['tp1']))} | TP2 {fmt_price(float(sig['tp2']))} | TP3 {fmt_price(float(sig['tp3']))}"
 
         rr3 = rr_to_tp(float(sig["entry"]), float(sig["sl"]), float(sig["tp3"]))
