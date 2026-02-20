@@ -9383,6 +9383,8 @@ async def _refresh_screen_cache_once():
         return
 
     async with SCREEN_JOB_LOCK:
+        t0 = time.time()
+        logger.info("screen_cache_job: start")
         try:
             reset_reject_tracker()
 
@@ -9416,6 +9418,7 @@ async def _refresh_screen_cache_once():
                     pass
 
             _SCREEN_CACHE["ts"] = time.time()
+            logger.info("screen_cache_job: OK in %.1fs (ts=%s)", time.time() - t0, _SCREEN_CACHE["ts"])
             _SCREEN_CACHE["body"] = b
             _SCREEN_CACHE["kb"] = list(kb or [])
             _SCREEN_LAST_REFRESH_OK_TS = float(_SCREEN_CACHE["ts"])
