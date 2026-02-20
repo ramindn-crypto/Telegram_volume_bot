@@ -8976,6 +8976,21 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         body (str): cached body (header is built in the async handler)
         kb (list[tuple[str,str]]): [(SYMBOL, SETUP_ID), ...] for TradingView buttons
     """
+
+    def _safe_int(v, default: int = 0) -> int:
+        """Coerce possibly-nested values (including dicts) into int safely."""
+        try:
+            if isinstance(v, dict):
+                # common shapes: {"value": 67}, {"conf": 67}
+                v = v.get("value", v.get("conf", v.get("confidence", default)))
+            if isinstance(v, (list, tuple)) and v:
+                v = v[0]
+            if v is None:
+                return default
+            return int(float(v))
+        except Exception:
+            return default
+
     # Build pool (coroutine) in this worker thread (isolated event loop)
     pool = _run_coro_in_thread(
         build_priority_pool(
@@ -9139,13 +9154,13 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         lines = ["*Trend Continuation Watch*", SEP]
         trend_watch_sorted = sorted(
             trend_watch,
-            key=lambda x: int(x.get("confidence", x.get("conf", 0)) or 0),
+            key=lambda x: _safe_int(x.get("confidence", x.get("conf", 0))),
             reverse=True
         )[:6]
         for t in trend_watch_sorted:
             side = str(t.get("side", "BUY"))
             side_emoji = "🟢" if side == "BUY" else "🔴"
-            conf_val = int(t.get("confidence", t.get("conf", 0)) or 0)
+            conf_val = _safe_int(t.get("confidence", t.get("conf", 0)))
             sym = str(t.get("symbol", "")).upper()
             ch24 = float(t.get("ch24", 0.0) or 0.0)
             lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf_val}` | 24H {pct_with_emoji(ch24)}")
@@ -9160,7 +9175,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
             try:
                 sym = str(w.get("symbol", "")).upper()
                 side = str(w.get("side", "SELL")).upper()
-                conf = int(w.get("conf", 0) or 0)
+                conf = _safe_int(w.get("conf", 0))
                 vol = float(w.get("vol", 0.0) or 0.0)
                 side_emoji = "🟢" if side == "BUY" else "🔴"
                 lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf}` | Vol~`{vol/1e6:.1f}M`")
@@ -9177,7 +9192,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
             try:
                 sym = str(c.get("symbol", "")).upper()
                 side = str(c.get("side", "SELL")).upper()
-                conf = int(c.get("conf", 0) or 0)
+                conf = _safe_int(c.get("conf", 0))
                 entry = float(c.get("entry", 0.0) or 0.0)
                 sl = float(c.get("sl", 0.0) or 0.0)
                 tp3 = float(c.get("tp3", 0.0) or 0.0)
