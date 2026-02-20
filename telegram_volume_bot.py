@@ -9044,9 +9044,9 @@ async def _refresh_screen_cache_async():
         _SCREEN_CACHE["kb"] = list(kb or [])
 
     except asyncio.TimeoutError:
-        # Timed out refresh — do not modify cache
-        logger.warning("Background /screen refresh timed out")
-
+        logger.warning("screen_cache_job: TIMEOUT after %.1fs", time.time() - t0)
+        return
+    
     except Exception:
         logger.exception("Background /screen refresh failed")
 
