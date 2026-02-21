@@ -9773,13 +9773,21 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
 
     now_local = datetime.now(tz)
 
+    # Display the *market* session (NY/LON/ASIA) in the email header.
+    # 'UNLIMITED' is an access mode, not a market session.
+    try:
+        live_sess = _session_label_utc(datetime.now(timezone.utc)) or str(sess.get('name') or '')
+    except Exception:
+        live_sess = str(sess.get('name') or '')
+    display_session = live_sess if str(sess.get('name') or '') == 'UNLIMITED' else str(sess.get('name') or '')
+
     first = setups[0]
-    subject = f"PulseFutures • {sess['name']} • {first.side} {first.symbol}"
+    subject = f"PulseFutures • {display_session} • {first.side} {first.symbol}"
     if len(setups) > 1:
         subject += f" (+{len(setups)-1} more)"
 
     body = _email_body_pretty(
-        session_name=str(sess["name"]),
+        session_name=str(display_session),
         now_local=now_local,
         user_tz=user_tz,
         setups=setups,
@@ -9787,7 +9795,7 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
     )
 
     body_html = _email_body_pretty_html(
-        session_name=str(sess['name']),
+        session_name=str(display_session),
         now_local=now_local,
         user_tz=user_tz,
         setups=setups,
@@ -10613,6 +10621,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             chosen_list: List[Setup] = []
+            # Deduplicate setups (important in UNLIMITED mode where we merge sessions).
+            # Keyed by symbol/side + rounded prices, so we don't email the same idea 2-3 times.
+            _seen_setup_keys = set()
             cooldown_blocked = 0
             flip_blocked = 0
 
@@ -10622,6 +10633,19 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
                 sym = str(getattr(s, "symbol", "")).upper()
                 side = str(getattr(s, "side", "")).upper()
+                try:
+                    _k = (
+                        sym,
+                        side,
+                        round(float(getattr(s, 'entry', 0.0) or 0.0), 8),
+                        round(float(getattr(s, 'sl', 0.0) or 0.0), 8),
+                        round(float(getattr(s, 'tp3', 0.0) or 0.0), 8),
+                    )
+                except Exception:
+                    _k = (sym, side, str(getattr(s, 'entry', '')), str(getattr(s, 'sl', '')), str(getattr(s, 'tp3', '')))
+                if _k in _seen_setup_keys:
+                    continue
+                _seen_setup_keys.add(_k)
                 sess_name = str(sess["name"])
 
                 if symbol_flip_guard_active(uid, sym, side, sess_name):
