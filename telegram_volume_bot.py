@@ -9025,8 +9025,9 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     )
 
     # Other heavy helpers are sync; run them here too.
-    leaders_txt = build_leaders_table(best_fut)
-    up_txt, dn_txt = movers_tables(best_fut)
+    # Market context inputs (keep /screen informative without becoming a data terminal)
+    leaders_txt = build_leaders_table(best_fut)  # fast (top by futures volume)
+    up_list, dn_list = compute_directional_lists(best_fut)
 
     # Hard cap: never show more than 3 top setups on /screen
     try:
@@ -9137,100 +9138,130 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
         combined_setups_txt = ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
 
-    # Waiting for Trigger (near-miss)
-    waiting_txt = ""
-    waiting_items = pool.get("waiting") or []
-    if not waiting_items and _WAITING_TRIGGER:
-        try:
-            waiting_items = list(_WAITING_TRIGGER.items())[:SCREEN_WAITING_N]
-        except Exception:
-            waiting_items = []
+    # -----------------------------------------------------
+    # UX: Keep /screen clean and action-first.
+    # - Top Trade Setups = ONLY qualified, email-eligible setups.
+    # - Momentum Watch = small "FYI" list (no entry yet).
+    # - Market Context = compressed pulse of the market (tone + a few leaders/losers + BTC/ETH).
+    # -----------------------------------------------------
 
-    if waiting_items:
-        lines = ["*Waiting for Trigger (near-miss)*", SEP]
-        for item in waiting_items[:SCREEN_WAITING_N]:
+    # Momentum Watch (No Entry Yet)
+    momentum_lines = []
+    try:
+        waiting_items = pool.get("waiting") or []
+    except Exception:
+        waiting_items = []
+
+    try:
+        trend_watch = pool.get("trend_watch") or []
+    except Exception:
+        trend_watch = []
+
+    try:
+        seen_syms = set()
+
+        # 1) Waiting-for-trigger items first (near-miss)
+        for item in (waiting_items or [])[:max(2, int(SCREEN_WAITING_N or 2))]:
             try:
-                if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[1], dict):
-                    base, d = item
-                    raw_side = str(d.get("side", "BUY") or "BUY").strip().upper()
-                    if raw_side in ("LONG",):
-                        side = "BUY"
-                    elif raw_side in ("SHORT",):
-                        side = "SELL"
-                    elif raw_side in ("BUY", "SELL"):
-                        side = raw_side
-                    else:
-                        side = raw_side
-                    dot = "🟢" if side == "BUY" else ("🔴" if side == "SELL" else "🟡")
-                    lines.append(f"• *{base}* {dot} `{side}`")
+                if not (isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[1], dict)):
+                    continue
+                base, d = item
+                sym = str(base).upper()
+                raw_side = str(d.get("side", "BUY") or "BUY").strip().upper()
+                if raw_side in ("LONG",):
+                    side = "BUY"
+                elif raw_side in ("SHORT",):
+                    side = "SELL"
+                elif raw_side in ("BUY", "SELL"):
+                    side = raw_side
                 else:
-                    lines.append(f"• `{str(item)}`")
+                    side = raw_side
+                dot = "🟢" if side == "BUY" else ("🔴" if side == "SELL" else "🟡")
+                if sym in seen_syms:
+                    continue
+                seen_syms.add(sym)
+                momentum_lines.append(f"• *{sym}* {dot} `{side}` — waiting for entry trigger")
+                if len(momentum_lines) >= 2:
+                    break
             except Exception:
                 continue
-        waiting_txt = "\n".join(lines)
 
-    # Trend continuation watch
-    trend_txt = ""
-    trend_watch = pool.get("trend_watch") or []
-    if trend_watch:
-        lines = ["*Trend Continuation Watch*", SEP]
-        trend_watch_sorted = sorted(
-            trend_watch,
-            key=lambda x: int(x.get("confidence", x.get("conf", 0)) or 0),
-            reverse=True
-        )[:6]
-        for t in trend_watch_sorted:
-            side = str(t.get("side", "BUY"))
-            side_emoji = "🟢" if side == "BUY" else "🔴"
-            conf_val = int(t.get("confidence", t.get("conf", 0)) or 0)
-            sym = str(t.get("symbol", "")).upper()
-            ch24 = float(t.get("ch24", 0.0) or 0.0)
-            lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf_val}` | 24H {pct_with_emoji(ch24)}")
-        trend_txt = "\n".join(lines)
+        # 2) Trend watch (strong trend but no valid entry) — fill remaining slots
+        if len(momentum_lines) < 2:
+            trend_watch_sorted = sorted(
+                (trend_watch or []),
+                key=lambda x: int(x.get("confidence", x.get("conf", 0)) or 0),
+                reverse=True
+            )
+            for t in trend_watch_sorted:
+                try:
+                    sym = str(t.get("symbol", "")).upper().strip()
+                    if not sym or sym in seen_syms:
+                        continue
+                    side = str(t.get("side", "BUY") or "BUY").strip().upper()
+                    dot = "🟢" if side == "BUY" else ("🔴" if side == "SELL" else "🟡")
+                    seen_syms.add(sym)
+                    momentum_lines.append(f"• *{sym}* {dot} `{side}` — strong trend, no qualified entry yet")
+                    if len(momentum_lines) >= 2:
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        momentum_lines = []
 
-    # Early Warning
-    warning_txt = ""
-    warnings = pool.get("spike_warnings") or []
-    if warnings:
-        lines = ["*Early Warning (Possible Reversal Zones)*", SEP]
-        for w in warnings[:6]:
+    momentum_txt = ""
+    if momentum_lines:
+        momentum_txt = "*Momentum Watch (No Entry Yet)*\n" + SEP + "\n" + "\n".join(momentum_lines)
+
+    # Market Context (compressed)
+    market_txt = ""
+    try:
+        up_top = []
+        for it in (up_list or [])[:3]:
             try:
-                sym = str(w.get("symbol", "")).upper()
-                side = str(w.get("side", "SELL")).upper()
-                conf = int(w.get("conf", 0) or 0)
-                vol = float(w.get("vol", 0.0) or 0.0)
-                side_emoji = "🟢" if side == "BUY" else "🔴"
-                lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf}` | Vol~`{vol/1e6:.1f}M`")
+                b, vol, ch24, ch4, px = it
+                up_top.append(f"{str(b).upper()} {pct_with_emoji(float(ch24) or 0.0)}")
             except Exception:
                 continue
-        warning_txt = "\n".join(lines)
 
-    # Spike Reversal Alerts (10M+ Vol) — includes /size line
-    spike_txt = ""
-    spikes = pool.get("spikes") or []
-    if spikes:
-        lines = ["*Spike Reversal Alerts (10M+ Vol)*", SEP]
-        for c in spikes[:6]:
+        dn_top = []
+        for it in (dn_list or [])[:3]:
             try:
-                sym = str(c.get("symbol", "")).upper()
-                side = str(c.get("side", "SELL")).upper()
-                conf = int(c.get("conf", 0) or 0)
-                entry = float(c.get("entry", 0.0) or 0.0)
-                sl = float(c.get("sl", 0.0) or 0.0)
-                tp3 = float(c.get("tp3", 0.0) or 0.0)
-                vol = float(c.get("vol", 0.0) or 0.0)
-
-                rr_den = abs(entry - sl)
-                rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
-                pos_word = "long" if side == "BUY" else "short"
-                size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
-
-                side_emoji = "🟢" if side == "BUY" else "🔴"
-                lines.append(f"• *{sym}* {side_emoji} `{side}` | Conf `{conf}` | RR(TP3) `{rr3:.2f}` | Vol~`{vol/1e6:.1f}M`")
-                lines.append(f"  `{size_cmd}`")
+                b, vol, ch24, ch4, px = it
+                dn_top.append(f"{str(b).upper()} {pct_with_emoji(float(ch24) or 0.0)}")
             except Exception:
                 continue
-        spike_txt = "\n".join(lines)
+
+        # Tone heuristic
+        upn = len(up_list or [])
+        dnn = len(dn_list or [])
+        if upn >= max(2, int(dnn * 1.5)):
+            tone = "🟢 Bullish"
+        elif dnn >= max(2, int(upn * 1.5)):
+            tone = "🔴 Bearish"
+        else:
+            tone = "🟡 Mixed"
+
+        # BTC/ETH pulse (if available)
+        btc = (best_fut or {}).get("BTC")
+        eth = (best_fut or {}).get("ETH")
+        btc24 = pct_with_emoji(float(getattr(btc, "percentage", 0.0) or 0.0)) if btc else "—"
+        eth24 = pct_with_emoji(float(getattr(eth, "percentage", 0.0) or 0.0)) if eth else "—"
+
+        lines = [
+            f"*Market Context*",
+            SEP,
+            f"Risk Tone: *{tone}*",
+            f"Pulse: BTC {btc24} | ETH {eth24}",
+        ]
+        if up_top:
+            lines.append("Leaders: " + ", ".join(up_top))
+        if dn_top:
+            lines.append("Losers: " + ", ".join(dn_top))
+
+        market_txt = "\n".join(lines).strip()
+    except Exception:
+        market_txt = ""
 
     # Assemble body (cache THIS, header stays live)
     def _is_empty(txt: str) -> bool:
@@ -9242,26 +9273,12 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     blocks = []
     blocks.extend(["", "*Top Trade Setups*", SEP, combined_setups_txt])
 
-    if waiting_txt and (not _is_empty(waiting_txt)):
-        blocks.extend(["", waiting_txt])
+    # Only show momentum section if there are no qualified setups OR to give quick context.
+    if momentum_txt and (not _is_empty(momentum_txt)):
+        blocks.extend(["", momentum_txt])
 
-    if trend_txt and (not _is_empty(trend_txt)):
-        blocks.extend(["", trend_txt])
-
-    if warning_txt and (not _is_empty(warning_txt)):
-        blocks.extend(["", warning_txt])
-
-    if spike_txt and (not _is_empty(spike_txt)):
-        blocks.extend(["", spike_txt])
-
-    if up_txt and (not _is_empty(up_txt)) and ("|" in up_txt):
-        blocks.extend(["", "*Directional Leaders / Losers*", SEP, up_txt])
-
-    if dn_txt and (not _is_empty(dn_txt)) and ("|" in dn_txt):
-        blocks.extend(["", dn_txt])
-
-    if leaders_txt and (not _is_empty(leaders_txt)) and ("|" in leaders_txt):
-        blocks.extend(["", "*Market Leaders*", SEP, leaders_txt])
+    if market_txt and (not _is_empty(market_txt)):
+        blocks.extend(["", market_txt])
 
     body = "\n".join([b for b in blocks if b is not None]).strip()
 
@@ -9271,6 +9288,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     except Exception:
         kb = []
     return body, kb
+
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = update.effective_user.id
