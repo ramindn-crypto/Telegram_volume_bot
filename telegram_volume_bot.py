@@ -3453,6 +3453,56 @@ def parse_hhmm(s: str) -> Tuple[int, int]:
         raise ValueError("bad time")
     return hh, mm
 
+
+def _parse_hhmm_local(s: str) -> Tuple[int, int]:
+    """Parse HH:MM (24h) and return (hour, minute)."""
+    return parse_hhmm(s)
+
+def in_trade_window_now(user: dict, now_local: Optional[datetime] = None) -> bool:
+    """
+    Trade window gate for email alerts.
+
+    - If user has Sessions UNLIMITED enabled -> always allow (24h).
+    - If trade_window_start/end are empty -> allow (no restriction).
+    - Otherwise checks local time window (supports overnight windows like 22:00 -> 06:00).
+    """
+    # Sessions UNLIMITED means 24h emailing (no trade-window restriction)
+    try:
+        if int(user.get("sessions_unlimited") or 0) == 1:
+            return True
+    except Exception:
+        pass
+
+    start_s = str(user.get("trade_window_start") or "").strip()
+    end_s = str(user.get("trade_window_end") or "").strip()
+    if not start_s or not end_s:
+        return True  # disabled => allow
+
+    # User timezone
+    try:
+        tz = ZoneInfo(str(user.get("tz") or "UTC"))
+    except Exception:
+        tz = timezone.utc
+
+    if now_local is None:
+        now_local = datetime.now(tz)
+
+    sh, sm = _parse_hhmm_local(start_s)
+    eh, em = _parse_hhmm_local(end_s)
+
+    start_dt = now_local.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end_dt = now_local.replace(hour=eh, minute=em, second=0, microsecond=0)
+
+    # Overnight window support
+    if end_dt <= start_dt:
+        if now_local >= start_dt:
+            return True
+        start_dt = start_dt - timedelta(days=1)
+        end_dt = end_dt + timedelta(days=1)
+
+    return start_dt <= now_local <= end_dt
+
+
 def current_session_utc(now_utc: Optional[datetime] = None) -> str:
     """
     Market sessions in UTC.
@@ -9500,6 +9550,7 @@ def tz_location_label(tz_name: str) -> str:
         region_label = 'UTC'
     return f"{city} ({region_label})" if city else str(region_label)
 
+
 def _email_body_pretty(
     session_name: str,
     now_local: datetime,
@@ -9510,7 +9561,7 @@ def _email_body_pretty(
     loc_label = tz_location_label(user_tz)
     when_str = now_local.strftime("%Y-%m-%d %H:%M")
 
-    parts: List[str] = []
+    parts = []
     parts.append(HDR)
     parts.append(f"📩 PulseFutures • {session_name} • {loc_label}: {when_str} ({user_tz})")
     parts.append(HDR)
@@ -9518,7 +9569,6 @@ def _email_body_pretty(
 
     up, dn = compute_directional_lists(best_fut)
     leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:5]
-
     parts.append("Market Snapshot")
     parts.append(SEP)
 
@@ -9530,8 +9580,8 @@ def _email_body_pretty(
         parts.append("Leaders: " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in up[:3]]))
     if dn:
         parts.append("Losers:  " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in dn[:3]]))
-
     parts.append("")
+
     parts.append("Top Setups")
     parts.append(SEP)
     parts.append("")
@@ -9539,21 +9589,12 @@ def _email_body_pretty(
     for i, s in enumerate(setups, 1):
         rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
 
+        # ✅ "ID-" prefix
         parts.append(f"ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
-        parts.append(
-            f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP3): {rr3:.2f}"
-        )
+        parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP3): {rr3:.2f}")
 
-        _tp1, _tp2, _tp3 = _ensure_three_tps(
-            s.entry,
-            s.sl,
-            s.tp3,
-            getattr(s, "tp1", None),
-            getattr(s, "tp2", None),
-            getattr(s, "side", ""),
-        )
-
-        if _tp1 not in (None, 0, 0.0, "") and _tp2 not in (None, 0, 0.0, "") and _tp3 not in (None, 0, 0.0, ""):
+        _tp1, _tp2, _tp3 = _ensure_three_tps(s.entry, s.sl, s.tp3, getattr(s, "tp1", None), getattr(s, "tp2", None), getattr(s, "side", ""))
+        if _tp1 not in (None, 0, 0.0) and _tp2 not in (None, 0, 0.0) and _tp3 not in (None, 0, 0.0):
             parts.append(
                 f"   TP1: {fmt_price_email(_tp1)} ({TP_ALLOCS[0]}%) | "
                 f"TP2: {fmt_price_email(_tp2)} ({TP_ALLOCS[1]}%) | "
@@ -9562,22 +9603,20 @@ def _email_body_pretty(
         else:
             parts.append(f"   TP3: {fmt_price_email(s.tp3)}")
 
+        # ✅ only for t# trailing-needed setups
+        if getattr(s, 'is_trailing_tp3', False):
+            parts.append("   TP3 Mode: Trailing")
+
         parts.append(
             f"   24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | "
             f"1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}"
         )
         parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
-
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
-            parts.append(
-                f"   /size {str(getattr(s, 'symbol', ''))} {_pos} "
-                f"entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} "
-                f"sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}"
-            )
+            parts.append(f"   /size {str(getattr(s, 'symbol', ''))} {_pos} entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}")
         except Exception:
             pass
-
         parts.append("")
 
     parts.append(HDR)
@@ -9591,6 +9630,7 @@ def _email_body_pretty(
 
     return "\n".join(parts).strip()
 
+
 def _email_body_pretty_html(
     session_name: str,
     now_local: datetime,
@@ -9601,6 +9641,80 @@ def _email_body_pretty_html(
     """HTML version of the email body styled to resemble Telegram /screen cards (bold headings + code blocks)."""
     loc_label = tz_location_label(user_tz)
     when_str = now_local.strftime("%Y-%m-%d %H:%M")
+
+    def esc(s: str) -> str:
+        try:
+            import html as _html
+            return _html.escape(str(s))
+        except Exception:
+            return str(s)
+
+    lines = []
+    lines.append(f"<div style='font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.35'>")
+    lines.append(f"<div style='font-size:16px;font-weight:700'>📩 PulseFutures • {esc(session_name)} • {esc(loc_label)}: {esc(when_str)} ({esc(user_tz)})</div>")
+    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:10px 0'>")
+
+    up, dn = compute_directional_lists(best_fut)
+    leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:5]
+
+    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Market Snapshot</div>")
+    if leaders:
+        topv = ", ".join([f"{esc(b)}({esc(pct_with_emoji(float(mv.percentage or 0.0)))})" for b, mv in leaders])
+        lines.append(f"<div>Top Volume: {topv}</div>")
+    if up:
+        lines.append("<div>Leaders: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in up[:3]]) + "</div>")
+    if dn:
+        lines.append("<div>Losers: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in dn[:3]]) + "</div>")
+
+    lines.append("<hr style='border:none;border-top:1px solid #eee;margin:10px 0'>")
+    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Top Setups</div>")
+
+    for i, s in enumerate(setups, 1):
+        rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+        side = esc(s.side)
+        sym = esc(s.symbol)
+        conf = esc(s.conf)
+        setup_id = esc(s.setup_id)
+
+        card = []
+        card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
+        card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
+        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP3): <code>{rr3:.2f}</code></div>")
+
+        if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
+            card.append(
+                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> ({TP_ALLOCS[0]}%) &nbsp;|&nbsp; "
+                f"TP2: <code>{esc(fmt_price_email(s.tp2))}</code> ({TP_ALLOCS[1]}%) &nbsp;|&nbsp; "
+                f"TP3: <code>{esc(fmt_price_email(s.tp3))}</code> ({TP_ALLOCS[2]}%)</div>"
+            )
+        else:
+            card.append(f"<div style='margin-top:4px'>TP: <code>{esc(fmt_price_email(s.tp3))}</code></div>")
+
+        if s.is_trailing_tp3:
+            card.append("<div style='margin-top:4px'>TP3 Mode: <b>Trailing</b></div>")
+
+        card.append(
+            f"<div style='margin-top:6px'>24H {esc(pct_with_emoji(s.ch24))} &nbsp;|&nbsp; 4H {esc(pct_with_emoji(s.ch4))} &nbsp;|&nbsp; "
+            f"1H {esc(pct_with_emoji(s.ch1))} &nbsp;|&nbsp; 15m {esc(pct_with_emoji(s.ch15))} &nbsp;|&nbsp; Vol~{esc(fmt_money(s.fut_vol_usd))}</div>"
+        )
+        card.append(f"<div style='margin-top:6px'>Chart: {esc(tv_chart_url(s.symbol))}</div>")
+        try:
+            _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
+            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
+            card.append(f"<pre style='margin-top:8px;background:#f7f7f7;padding:8px;border-radius:8px;white-space:pre-wrap'>{esc(size_line)}</pre>")
+        except Exception:
+            pass
+        card.append("</div>")
+        lines.extend(card)
+
+    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:12px 0'>")
+    lines.append("<div style='font-weight:700'>🤖 Position Sizing</div>")
+    lines.append("<div>Use the PulseFutures Telegram bot to calculate safe position size based on your Stop Loss.</div>")
+    lines.append(f"<div style='margin-top:4px'>👉 {esc(TELEGRAM_BOT_URL)}</div>")
+    lines.append("<div style='margin-top:10px;color:#666'>Not financial advice. PulseFutures</div>")
+    lines.append("</div>")
+    return "".join(lines).strip()
+
 
     def esc(s: str) -> str:
         try:
@@ -9716,6 +9830,7 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
     )
 
     return send_email(subject, body, user_id_for_debug=uid, body_html=body_html)
+
 
 
 
