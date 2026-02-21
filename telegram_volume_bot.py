@@ -9971,7 +9971,7 @@ async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
     except Exception:
         return False
 
-async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
     # Prevent overlapping runs (JobQueue can overlap if a run is slow)
     if ALERT_LOCK.locked():
         return
@@ -11420,6 +11420,18 @@ async def manage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Upgrade opens the billing menu
     return await billing_cmd(update, context)
+
+
+
+async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+    # Fully isolate heavy alert logic into separate thread
+    if ALERT_LOCK.locked():
+        return
+    async with ALERT_LOCK:
+        try:
+            await to_thread_heavy(lambda: asyncio.run(_alert_job_async_internal(context)))
+        except Exception as e:
+            logger.exception("Alert job thread failure: %s", e)
 
 
 def main():
