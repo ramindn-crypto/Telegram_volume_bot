@@ -1320,11 +1320,6 @@ def is_admin_user(user_id: int) -> bool:
     return (uid in ADMIN_USER_IDS) if ADMIN_USER_IDS else False
 
 
-def effective_plan(user_id: int, user: Optional[dict]) -> str:
-    """Effective plan, forcing admin to PRO."""
-    if is_admin_user(user_id):
-        return "pro"
-    return str((user or {}).get("plan") or "free").strip().lower()
 
 
 def is_unlimited_admin(user_id: int) -> bool:
@@ -6701,11 +6696,6 @@ async def admin_support_close_cmd(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text(f"✅ Closed: {tid}")
 
 
-async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📨 Your latest support ticket is being reviewed.\n"
-        "Resolved tickets are auto-closed."
-    )
 
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -6722,132 +6712,7 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("\n".join(msg).strip())
 
-def db_backup_file() -> Tuple[bool, str]:
-    """
-    Copies DB_PATH -> DB_BACKUP_PATH
-    """
-    try:
-        # Ensure folder exists
-        os.makedirs(os.path.dirname(DB_BACKUP_PATH) or ".", exist_ok=True)
 
-        if not os.path.exists(DB_PATH):
-            return False, f"DB file not found: {DB_PATH}"
-
-        # Copy bytes
-        with open(DB_PATH, "rb") as src, open(DB_BACKUP_PATH, "wb") as dst:
-            dst.write(src.read())
-
-        return True, f"Backup created: {DB_BACKUP_PATH}"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-def db_restore_file() -> Tuple[bool, str]:
-    """
-    Copies DB_BACKUP_PATH -> DB_PATH
-    """
-    try:
-        if not os.path.exists(DB_BACKUP_PATH):
-            return False, f"No backup found: {DB_BACKUP_PATH}"
-
-        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-
-        with open(DB_BACKUP_PATH, "rb") as src, open(DB_PATH, "wb") as dst:
-            dst.write(src.read())
-
-        return True, f"Restored from backup: {DB_BACKUP_PATH}"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-def db_wipe_all_data_keep_schema() -> None:
-    """
-    Deletes ALL rows from core tables, keeps schema.
-    Also resets in-memory trackers.
-    """
-    con = db_connect()
-    cur = con.cursor()
-
-    # Order matters if FK ever added later. We currently don’t have FK refs, but still safe.
-    tables = [
-        "trades",
-        "signals",
-        "emailed_symbols",
-        "email_state",
-        "email_daily",
-        "risk_daily",
-        "setup_counter",
-        # users is kept (preferences) OR can be wiped too. You requested "clean database":
-        # wiping users means everyone will be re-created on next /start.
-        "users",
-    ]
-
-    for t in tables:
-        try:
-            cur.execute(f"DELETE FROM {t}")
-        except Exception:
-            pass
-
-    con.commit()
-    con.close()
-
-    # Also clear runtime trackers
-    _LAST_SMTP_ERROR.clear()
-    _USER_DIAG_MODE.clear()
-    _LAST_EMAIL_DECISION.clear()
-
-async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /reset
-    Admin-only:
-    1) Backup DB file
-    2) Wipe tables (clean DB)
-    """
-    uid = update.effective_user.id
-    if not is_admin_user(uid):
-        await update.message.reply_text("⛔️ Admin only.")
-        return
-
-    async with DB_FILE_LOCK:
-        ok, msg = db_backup_file()
-        if not ok:
-            await update.message.reply_text(f"❌ Backup failed.\n{msg}")
-            return
-
-        try:
-            db_wipe_all_data_keep_schema()
-        except Exception as e:
-            await update.message.reply_text(f"❌ Reset failed.\n{type(e).__name__}: {e}")
-            return
-
-    await update.message.reply_text(
-        "✅ Database RESET completed.\n"
-        f"{msg}\n\n"
-        "Use /restore to revert to the backup."
-    )
-
-async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /restore
-    Admin-only:
-    Restores DB from DB_BACKUP_PATH
-    """
-    uid = update.effective_user.id
-    if not is_admin_user(uid):
-        await update.message.reply_text("⛔️ Admin only.")
-        return
-
-    async with DB_FILE_LOCK:
-        ok, msg = db_restore_file()
-        if not ok:
-            await update.message.reply_text(f"❌ Restore failed.\n{msg}")
-            return
-
-        # After restore, ensure schema migrations still applied
-        try:
-            db_init()
-        except Exception:
-            pass
-
-    await update.message.reply_text(f"✅ Database RESTORED.\n{msg}")
 
 async def diag_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -8194,68 +8059,6 @@ async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(msg))
 
-def db_trades_all(user_id: int) -> List[dict]:
-    con = db_connect()
-    cur = con.cursor()
-    cur.execute("""
-        SELECT * FROM trades
-        WHERE user_id=?
-        ORDER BY opened_ts ASC
-    """, (int(user_id),))
-    rows = cur.fetchall() or []
-    con.close()
-    return [dict(r) for r in rows]
-
-def _profit_factor(trades: List[dict]) -> Optional[float]:
-    closed = [t for t in trades if t.get("closed_ts") is not None and t.get("pnl") is not None]
-    if not closed:
-        return None
-    gp = sum(float(t["pnl"]) for t in closed if float(t["pnl"]) > 0)
-    gl = abs(sum(float(t["pnl"]) for t in closed if float(t["pnl"]) < 0))
-    if gl <= 0:
-        return None if gp <= 0 else float("inf")
-    return gp / gl
-
-def _expectancy_r(trades: List[dict]) -> Optional[float]:
-    closed = [t for t in trades if t.get("closed_ts") is not None and t.get("r_mult") is not None]
-    if not closed:
-        return None
-    rs = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
-    return (sum(rs) / len(rs)) if rs else None
-
-async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user = get_user(uid)
-
-    if not has_active_access(uid, user):
-        await update.message.reply_text(
-            "⛔️ Trial finished.\n\n"
-            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
-            "👉 /billing"
-        )
-        return    
-
-    trades = db_trades_all(uid)
-    stats = _stats_from_trades(trades)
-
-    pf = _profit_factor(trades)
-    exp_r = _expectancy_r(trades)
-
-    msg = [
-        "📊 Overall Report (ALL TIME)",
-        HDR,
-        f"Closed: {stats['closed_n']} | Wins: {stats['wins']} | Losses: {stats['losses']}",
-        f"Win rate: {stats['win_rate']:.1f}%",
-        f"Net PnL: {stats['net']:+.2f}",
-        f"Avg R: {stats['avg_r']:+.2f}" if stats["avg_r"] is not None else "Avg R: -",
-        f"Expectancy (R): {exp_r:+.2f}" if exp_r is not None else "Expectancy (R): -",
-        f"Profit Factor: {pf:.2f}" if (pf is not None and pf != float('inf')) else ("Profit Factor: ∞" if pf == float('inf') else "Profit Factor: -"),
-        f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
-        HDR,
-        f"Equity (current): ${float(user['equity']):.2f}",
-    ]
-
-    await update.message.reply_text("\n".join(msg))
 
 async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -9129,29 +8932,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
 
 
-def user_location_and_time(user: dict):
-    """
-    Returns: (location_label, time_str) based on user's tz
-    """
-    tz_name = str(user.get("tz") or "UTC")
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = timezone.utc
-        tz_name = "UTC"
-
-    now_local = datetime.now(tz)
-
-    # Build location label safely
-    if "/" in tz_name:
-        parts = tz_name.split("/")
-        region = parts[0].replace("_", " ")
-        city = parts[-1].replace("_", " ")
-        loc = f"{city} ({region})"
-    else:
-        loc = tz_name
-
-    return loc, now_local.strftime("%Y-%m-%d %H:%M")
 
 # =========================================================
 # User location/time helpers
@@ -10064,15 +9844,6 @@ async def myplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
-def _env(key: str, default: str = "") -> str:
-    v = os.getenv(key)
-    return (v or default).strip()
-
-def _mask_addr(addr: str) -> str:
-    a = (addr or "").strip()
-    if len(a) <= 12:
-        return a
-    return f"{a[:6]}…{a[-6:]}"
 
 async def _billing_cmd_unused(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -11796,7 +11567,6 @@ def main():
 
     # Admin: approve Stripe/USDT payments and grant access
     app.add_handler(CommandHandler("payment_approve", payment_approve_cmd, block=False))
-    app.add_handler(CommandHandler("payment_Approve", payment_approve_cmd, block=False))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     
