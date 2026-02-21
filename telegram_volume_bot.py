@@ -1337,9 +1337,6 @@ _USER_DIAG_MODE: Dict[int, str] = {}
 # ✅ NEW: Stores last email decision per user (SENT / SKIP + reasons)
 _LAST_EMAIL_DECISION: Dict[int, Dict[str, Any]] = {}
 
-
-# ✅ NEW: Stores last email TEST decision per user (/email_test)
-_LAST_EMAIL_TEST_DECISION: Dict[int, Dict[str, Any]] = {}
 _LAST_BIGMOVE_DECISION: Dict[int, dict] = {}
 
 def user_diag_mode(user_id: int) -> str:
@@ -3863,34 +3860,6 @@ def _fmt_when(ts) -> str:
         # Unix timestamp (sec)
         import datetime as _dt
         return _dt.datetime.fromtimestamp(float(ts), tz=_dt.timezone.utc).isoformat(timespec="seconds")
-    except Exception:
-        try:
-            return str(ts)
-        except Exception:
-            return ""
-
-
-
-def _fmt_when_local(ts, tz) -> str:
-    """Format a decision timestamp in a user's local timezone (best-effort)."""
-    try:
-        if ts is None:
-            return ""
-        if isinstance(ts, str):
-            s = ts.strip()
-            if not s:
-                return ""
-            # If ISO with offset -> parse and convert
-            try:
-                dt = datetime.fromisoformat(s)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt.astimezone(tz).isoformat(timespec="seconds")
-            except Exception:
-                # Already human-readable string
-                return s
-        # Unix timestamp
-        return datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone(tz).isoformat(timespec="seconds")
     except Exception:
         try:
             return str(ts)
@@ -10466,20 +10435,6 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             min_conf = SESSION_MIN_CONF.get(sess["name"], 78)
             min_rr = SESSION_MIN_RR_TP3.get(sess["name"], 2.2)
 
-            # Per-user email loosen knobs (helps keep /email closer to /screen)
-            try:
-                min_conf = float(user.get("email_min_conf", min_conf) or min_conf)
-            except Exception:
-                pass
-            try:
-                min_rr = float(user.get("email_min_rr_tp3", min_rr) or min_rr)
-            except Exception:
-                pass
-
-            # Safety: never force overly-strict defaults by accident
-            min_conf = max(0.0, float(min_conf))
-            min_rr = max(0.0, float(min_rr))
-
             # -------------------------------------------------
             # Per-user EMAIL filter parameters (safe defaults)
             # -------------------------------------------------
@@ -10711,44 +10666,23 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
 async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = get_user(uid) or {}
-
-    # Resolve user timezone (never crash)
-    tz_name = str((user or {}).get("tz") or "UTC")
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = timezone.utc
-        tz_name = "UTC"
 
     scan = _LAST_EMAIL_DECISION.get(uid) or {}
-    test = _LAST_EMAIL_TEST_DECISION.get(uid) or {}
     bigm = _LAST_BIGMOVE_DECISION.get(uid) or {}
 
-    if not scan and not test and not bigm:
+    # If nothing recorded
+    if not scan and not bigm:
         await update.message.reply_text("No email decision recorded yet.")
         return
 
     lines = []
     lines.append("📧 Email Decisions")
-    lines.append(f"TZ: {tz_name}")
-
-    if test:
-        lines.append("")
-        lines.append("🧪 Email Test Decision")
-        lines.append(f"Status: {test.get('status')}")
-        lines.append(f"When: {_fmt_when_local(test.get('when') or test.get('ts'), tz)}")
-        rs = test.get("reasons") or test.get("reason")
-        if isinstance(rs, list):
-            lines.append("Reasons:\n- " + "\n- ".join(rs))
-        elif rs:
-            lines.append(f"Reason: {rs}")
 
     if bigm:
         lines.append("")
         lines.append("⚡ Big-Move Alert Decision")
         lines.append(f"Status: {bigm.get('status')}")
-        lines.append(f"When: {_fmt_when_local(bigm.get('when') or bigm.get('ts'), tz)}")
+        lines.append(f"When: {bigm.get('when') or _fmt_when(bigm.get('ts'))}")
         rs = bigm.get("reasons") or []
         if rs:
             lines.append("Reasons:\n- " + "\n- ".join(rs))
@@ -10757,7 +10691,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append("")
         lines.append("🧠 Market Scan Decision")
         lines.append(f"Status: {scan.get('status')}")
-        lines.append(f"When: {_fmt_when_local(scan.get('when') or scan.get('ts'), tz)}")
+        lines.append(f"When: {scan.get('when') or _fmt_when(scan.get('ts'))}")
         rs = scan.get("reasons") or scan.get("reason")
         if isinstance(rs, list):
             lines.append("Reasons:\n- " + "\n- ".join(rs))
@@ -10766,6 +10700,10 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text("\n".join(lines).strip())
 
+
+# =========================================================
+# /why (debug why no setups)
+# =========================================================
 async def why_no_setups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     txt = _reject_report_for_uid(uid)
@@ -11522,14 +11460,20 @@ async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
-    # Fully isolate heavy alert logic into separate thread
-    if ALERT_LOCK.locked():
-        return
-    async with ALERT_LOCK:
-        try:
-            await to_thread_heavy(lambda: asyncio.run(_alert_job_async_internal(context)))
-        except Exception as e:
-            logger.exception("Alert job thread failure: %s", e)
+    """Background email engine (trade setups + big-move alerts).
+
+    IMPORTANT:
+    - Do NOT take ALERT_LOCK here.
+    - _alert_job_async_internal() already owns ALERT_LOCK to prevent overlap.
+
+    The previous version double-locked (wrapper + internal), which caused the
+    internal job to exit immediately every time, so no emails were ever sent
+    (while /email_test still worked).
+    """
+    try:
+        await _alert_job_async_internal(context)
+    except Exception as e:
+        logger.exception("Alert job failure: %s", e)
 
 
 def main():
