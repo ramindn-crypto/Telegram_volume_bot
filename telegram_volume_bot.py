@@ -2268,31 +2268,67 @@ def reset_daily_if_needed(user: dict) -> dict:
 
 
 def list_users_notify_on() -> List[dict]:
-    """Users who should receive scan emails. Admins are always included."""
+    """Users who should receive *scan* emails.
+
+    Key points (matches the behavior of the 14–15 Feb working builds):
+    - Primary rule: notify_on=1 AND has a saved email address.
+    - Admins are ALWAYS included if they have an email saved, even if notify_on=0.
+      (This uses is_admin_user(), not ADMIN_USER_IDS, so it works with env single-admin setups.)
+    """
     con = db_connect()
-    cur = con.cursor()
-    cur.execute("SELECT * FROM users WHERE notify_on=1")
-    rows = [dict(r) for r in cur.fetchall()]
-
-    # Pro-only: scan emails are available only for Pro users (and active Trial)
-    rows = [r for r in rows if effective_plan(int(r.get("user_id") or 0), r) in ("pro", "trial")]
-
-    # Add admins with an email address saved, even if notify_on=0
     try:
-        if ADMIN_USER_IDS:
-            placeholders = ",".join(["?"] * len(ADMIN_USER_IDS))
-            cur.execute(
-                f"SELECT * FROM users WHERE user_id IN ({placeholders}) AND ( (email IS NOT NULL AND TRIM(email)!='') OR (email_to IS NOT NULL AND TRIM(email_to)!='') )",
-                [int(x) for x in ADMIN_USER_IDS],
-            )
-            for r in cur.fetchall():
-                d = dict(r)
-                if not any(int(x.get("user_id") or 0) == int(d.get("user_id") or 0) for x in rows):
+        import sqlite3
+        con.row_factory = sqlite3.Row
+    except Exception:
+        pass
+
+    cur = con.cursor()
+
+    # Detect whether DB uses users.email or only users.email_to (older schemas)
+    cols = set()
+    try:
+        cur.execute("PRAGMA table_info(users)")
+        cols = {str(r[1]) for r in cur.fetchall()}
+    except Exception:
+        cols = set()
+
+    email_fields = []
+    if "email" in cols:
+        email_fields.append("email")
+    if "email_to" in cols:
+        email_fields.append("email_to")
+
+    # If we can't detect, fall back to both names in the WHERE (SQLite will error),
+    # so only use a safe default.
+    if not email_fields:
+        email_fields = ["email_to"]
+
+    email_ok_where = " OR ".join([f"({c} IS NOT NULL AND TRIM({c})!='')" for c in email_fields])
+
+    # 1) notify_on users
+    try:
+        cur.execute(f"SELECT * FROM users WHERE notify_on=1 AND ({email_ok_where})")
+        rows = [dict(r) for r in cur.fetchall()]
+    except Exception:
+        # fallback: just notify_on=1
+        cur.execute("SELECT * FROM users WHERE notify_on=1")
+        rows = [dict(r) for r in cur.fetchall()]
+
+    # 2) admins with an email saved (even if notify_on=0)
+    try:
+        cur.execute(f"SELECT * FROM users WHERE ({email_ok_where})")
+        for r in cur.fetchall():
+            d = dict(r)
+            try:
+                uid = int(d.get("user_id") or 0)
+            except Exception:
+                uid = 0
+            if uid and is_admin_user(uid):
+                if not any(int(x.get("user_id") or 0) == uid for x in rows):
                     rows.append(d)
     except Exception:
         pass
 
-    con.close()
     return rows
 
 
@@ -5388,10 +5424,11 @@ def in_session_now(user: dict) -> Optional[dict]:
     now_local = datetime.now(tz)
     now_utc = now_local.astimezone(timezone.utc)
 
-    # NEW: unlimited mode => always return a session (no more NONE)
+    # NEW: unlimited mode => always return a session key and bypass session gating
+    # In this mode, email setups are allowed 24/7 (subject to caps & gap).
     if int(user.get("sessions_unlimited", 0) or 0) == 1:
-        name = (_session_label_utc(now_utc) or "NONE")
-        session_key = f"{now_utc.strftime('%Y-%m-%d')}_{name}_UNL"
+        name = "UNLIMITED"
+        session_key = f"{now_utc.strftime('%Y-%m-%d')}_{name}"
         return {
             "name": name,
             "session_key": session_key,
@@ -10248,8 +10285,24 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
                 }
                 continue
 
-            setups_all = setups_by_session.get(str(sess.get("name") or ""), []) or []
+            sess_name = str(sess.get("name") or "")
 
+
+            # Unlimited mode => allow setups from ALL sessions (24/7)
+
+            if sess_name == "UNLIMITED":
+
+                setups_all = []
+
+                for _lst in (setups_by_session or {}).values():
+
+                    if _lst:
+
+                        setups_all.extend(list(_lst))
+
+            else:
+
+                setups_all = setups_by_session.get(sess_name, []) or []
             if not setups_all:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
