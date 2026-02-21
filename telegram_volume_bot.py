@@ -3440,6 +3440,80 @@ def ema7_1h_is_close(market_symbol: str, max_dist_pct: float = EMA7_1H_MAX_DIST_
     return (dist_pct <= float(max_dist_pct)), dist_pct, last_close, ema
 
 
+
+# =========================================================
+# EMA ANCHOR PROXIMITY GATE (DYNAMIC)
+# - Instead of hard-gating only EMA7 on 1H, we allow the engine to anchor
+#   around the *closest* EMA among a small set of periods on 1H.
+# - This keeps your original intention (avoid "far from EMA" signals)
+#   but prevents starving signals when EMA7 is not the relevant magnet.
+# =========================================================
+
+# Periods to consider as potential "magnet" EMAs on 1H candles.
+EMA_ANCHOR_1H_PERIODS = [7, 13, 21]
+
+# Base max distance (%) used for EMA7. Longer EMAs get a slightly wider allowance.
+# Example with default EMA7_1H_MAX_DIST_PCT=0.35:
+#   EMA7  -> 0.35%
+#   EMA13 -> ~0.48%
+#   EMA21 -> ~0.61%
+EMA_ANCHOR_BASE_MAX_DIST_PCT = EMA7_1H_MAX_DIST_PCT
+
+def _ema_last(closes: List[float], period: int) -> float:
+    """Lightweight EMA last value (no full series)."""
+    if not closes or len(closes) < max(3, period):
+        return 0.0
+    k = 2.0 / (period + 1.0)
+    ema = float(closes[0])
+    for v in closes[1:]:
+        ema = (float(v) * k) + (ema * (1.0 - k))
+    return float(ema)
+
+def ema_anchor_1h_distance_pct(
+    market_symbol: str,
+    periods: Optional[List[int]] = None,
+) -> Tuple[float, float, float, int]:
+    """Return (best_dist_pct, last_close, best_ema, best_period) for 1H EMA anchors."""
+    try:
+        ps = periods or EMA_ANCHOR_1H_PERIODS
+        c1 = fetch_ohlcv(market_symbol, "1h", limit=60)
+        if not c1 or len(c1) < 20:
+            return 999.0, 0.0, 0.0, 0
+        closes = [float(x[4]) for x in c1]
+        last_close = float(closes[-1])
+
+        best = (999.0, 0.0, 0)  # (dist_pct, ema, period)
+        for p in ps:
+            try:
+                ema = _ema_last(closes, int(p))
+                if not ema:
+                    continue
+                dist_pct = abs((last_close - ema) / ema) * 100.0
+                if dist_pct < best[0]:
+                    best = (dist_pct, ema, int(p))
+            except Exception:
+                continue
+
+        return float(best[0]), float(last_close), float(best[1]), int(best[2])
+    except Exception:
+        return 999.0, 0.0, 0.0, 0
+
+def ema_anchor_1h_is_close(
+    market_symbol: str,
+    base_max_dist_pct: float = EMA_ANCHOR_BASE_MAX_DIST_PCT,
+    periods: Optional[List[int]] = None,
+) -> Tuple[bool, float, float, float, int, float]:
+    """Return (ok, dist_pct, last_close, ema, period, allowed_max_pct)."""
+    dist_pct, last_close, ema, period = ema_anchor_1h_distance_pct(market_symbol, periods=periods)
+    # widen allowance slightly for longer EMAs
+    try:
+        p = int(period or 7)
+        allowed = float(base_max_dist_pct) * ((p / 7.0) ** 0.5)
+    except Exception:
+        allowed = float(base_max_dist_pct)
+    ok = (dist_pct <= allowed)
+    return ok, float(dist_pct), float(last_close), float(ema), int(period or 0), float(allowed)
+
 # =========================================================
 # ✅ Session resolution helpers (for /screen + engine)
 # =========================================================
@@ -8604,7 +8678,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # knobs
     if mode == "screen":
         n_target = int(SETUPS_N)
-        strict_15m = False
+        strict_15m = True
         universe_cap = int(SCREEN_UNIVERSE_N)
         trigger_loosen = float(SCREEN_TRIGGER_LOOSEN)
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
@@ -8640,7 +8714,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             directional_take = 16
             market_take = 18
             trend_take = 16
-            strict_15m = False
+            strict_15m = True
             allow_no_pullback = True
         else:
             # Email pool becomes broader, but final email gates still apply
@@ -8857,41 +8931,117 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         priority_setups.extend(mom)
 
 
+    
     # -----------------------------------------------------
-    # CRITICAL GATE: price must be close to EMA7 (1H) to allow ANY setup (screen/email)
+    # BALANCE MODE: If strict_15m produces too few candidates,
+    # add a relaxed 15m pass to avoid starving /screen and email pools.
+    # This keeps quality-first behavior, but prevents "no signals" sessions.
     # -----------------------------------------------------
-    ema7_cache: Dict[str, Tuple[bool, float, float, float]] = {}
+    if strict_15m and len(priority_setups) < int(max(3, n_target)):
+        try:
+            if universe_best:
+                tmp = pick_setups(
+                    universe_best,
+                    n_target * scan_multiplier,
+                    False,  # relaxed 15m
+                    session_name,
+                    min(int(universe_cap), len(universe_best) if universe_best else universe_cap),
+                    trigger_loosen,
+                    waiting_near,
+                    allow_no_pullback,
+                    scan_profile=prof,
+                )
+                priority_setups.extend(tmp or [])
+        except Exception:
+            pass
+
+        # If still low, try market leaders once with relaxed 15m
+        try:
+            if len(priority_setups) < int(max(3, n_target)) and market_bases:
+                sub = _subset_best(best_fut, market_bases)
+                tmp = pick_setups(
+                    sub,
+                    n_target * scan_multiplier,
+                    False,  # relaxed 15m
+                    session_name,
+                    min(int(universe_cap), len(sub) if sub else universe_cap),
+                    trigger_loosen,
+                    waiting_near,
+                    allow_no_pullback,
+                    scan_profile=prof,
+                )
+                priority_setups.extend(tmp or [])
+        except Exception:
+            pass
+
+        # De-duplicate setups after relaxation
+        try:
+            seen = set()
+            deduped = []
+            for s in (priority_setups or []):
+                k = (
+                    getattr(s, "setup_id", None),
+                    getattr(s, "market_symbol", None),
+                    getattr(s, "side", None),
+                    getattr(s, "entry", None),
+                    getattr(s, "sl", None),
+                )
+                if k in seen:
+                    continue
+                seen.add(k)
+                deduped.append(s)
+            priority_setups = deduped
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------
+    # CRITICAL GATE (DYNAMIC EMA ANCHOR):
+    # Require price to be close to the *nearest* 1H EMA among {EMA_ANCHOR_1H_PERIODS}.
+    # This preserves your original intent (avoid "stretched" entries),
+    # but reduces missed opportunities when EMA7 isn't the active magnet.
+    # -----------------------------------------------------
+    ema_anchor_cache: Dict[str, Tuple[bool, float, float, float, int, float]] = {}
     gated = []
     for s in (priority_setups or []):
         try:
             mk = str(getattr(s, "market_symbol", "") or "")
             base = str(getattr(s, "symbol", "") or "").upper().strip()
             if not mk:
-                # if we somehow don't have market_symbol, be safe and drop it
                 mv = (best_fut or {}).get(base)
-                _rej("missing_market_symbol", base, mv, "EMA7 gate")
+                _rej("missing_market_symbol", base, mv, "EMA-anchor gate")
                 continue
 
-            if mk not in ema7_cache:
-                ema7_cache[mk] = ema7_1h_is_close(mk, EMA7_1H_MAX_DIST_PCT)
-            ok, dist_pct, last_close, ema7 = ema7_cache[mk]
+            if mk not in ema_anchor_cache:
+                ema_anchor_cache[mk] = ema_anchor_1h_is_close(
+                    mk,
+                    base_max_dist_pct=EMA_ANCHOR_BASE_MAX_DIST_PCT,
+                    periods=EMA_ANCHOR_1H_PERIODS,
+                )
+
+            ok, dist_pct, last_close, ema_val, ema_p, allowed = ema_anchor_cache[mk]
             if not ok:
                 mv = (best_fut or {}).get(base)
-                _rej("far_from_ema7_1h", base, mv, f"dist={dist_pct:.2f}% max={float(EMA7_1H_MAX_DIST_PCT):.2f}% close={last_close:.6g} ema7={ema7:.6g}")
+                _rej(
+                    "far_from_ema_anchor_1h",
+                    base,
+                    mv,
+                    f"ema={ema_p} dist={dist_pct:.2f}% max={allowed:.2f}% close={last_close:.6g} emaV={ema_val:.6g}",
+                )
                 continue
 
             gated.append(s)
         except Exception:
-            # fail-closed: if gate check errors, do not emit setup
             try:
                 base = str(getattr(s, "symbol", "") or "").upper().strip()
                 mv = (best_fut or {}).get(base)
-                _rej("ema7_gate_error", base, mv)
+                _rej("ema_anchor_gate_error", base, mv)
             except Exception:
                 pass
             continue
 
     priority_setups = gated
+
 
     # de-dupe by (symbol, side, engine) keeping highest conf, preserving priority order
     best = {}
