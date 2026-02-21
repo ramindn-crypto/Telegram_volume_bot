@@ -674,6 +674,9 @@ LEADERS_N = 10
 SETUPS_N = 6
 EMAIL_SETUPS_N = 3
 
+# ✅ Global setup quality floor (Premium & Selective)
+MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "75"))
+
 # ✅ /screen scan breadth + loosened trigger only for screen (NOT email)
 SCREEN_UNIVERSE_N = 70          # was effectively 35 (inside pick_setups)
 SCREEN_TRIGGER_LOOSEN = 0.85    # 15% easier trigger on /screen only
@@ -4669,6 +4672,17 @@ def make_setup(
 
         if strict_15m and (not is_confirm_15m):
             conf = max(0, int(conf) - int(EARLY_CONF_PENALTY))
+
+
+        # ---------------------------------------------------------
+        # ✅ Global quality gate: do NOT generate setups below MIN_SETUP_CONF
+        # ---------------------------------------------------------
+        try:
+            if int(conf) < int(MIN_SETUP_CONF):
+                _rej("below_min_confidence", base, mv, f"conf={int(conf)} min={int(MIN_SETUP_CONF)}")
+                return None
+        except Exception:
+            pass
 
         tp_cap_pct = tp_cap_pct_for_coin(fut_vol, ch24)
 
@@ -9119,7 +9133,10 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 block = []
                 block.append(f"{emoji} *{side} — {sym}*")
                 block.append(f"`{sid}` | Conf: `{conf}`")
-                block.append(f"Type: {typ} | RR(TP1): `{rr1:.2f}` | RR(TP2): `{rr2:.2f}` | RR(TP3): `{rr3:.2f}`")
+                if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
+                    block.append(f"Type: {typ} | RR(TP1): `{rr1:.2f}` | RR(TP2): `{rr2:.2f}` | RR(TP3): `{rr3:.2f}`")
+                else:
+                    block.append(f"Type: {typ} | RR(TP3): `{rr3:.2f}`")
                 block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
                 if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
                     block.append(f"TP1: `{fmt_price(float(tp1))}` | TP2: `{fmt_price(float(tp2))}` | TP3: `{fmt_price(tp3)}`")
