@@ -10615,42 +10615,13 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 # =========================================================
-                # Rule 2: Volume relative filter (killer rule)
+                # Rule 2: Email volume filter (DISABLED)
                 # =========================================================
-                vol_usd = 0.0
-                try:
-                    vol_usd = float(_best_fut_vol_usd(best_fut, getattr(s, "symbol", "")) or 0.0)
-                except Exception:
-                    vol_usd = 0.0
-
-                if vol_usd <= 0.0:
-                    try:
-                        vol_usd = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
-                    except Exception:
-                        vol_usd = 0.0
-
-                # Per-user email volume floors (stricter than /screen, but configurable)
-                try:
-                    abs_min = float(user.get("email_abs_vol_min_usd", user.get("email_abs_vol_min", 5_000_000)) or 5_000_000)
-                except Exception:
-                    abs_min = 5_000_000.0
-
-                try:
-                    rel_mult = float(user.get("email_rel_vol_min_mult", user.get("email_rel_vol_mult", 0.80)) or 0.80)
-                except Exception:
-                    rel_mult = 0.80
-
-                if vol_usd > 0.0 and vol_usd < abs_min:
-                    skip_reasons_counter["email_vol_abs_too_low"] += 1
-                    continue
-
-                if vol_usd > 0.0 and float(MARKET_VOL_MEDIAN_USD or 0.0) > 0:
-                    rel = vol_usd / float(MARKET_VOL_MEDIAN_USD)
-                    if rel < float(rel_mult):
-                        skip_reasons_counter["email_vol_rel_too_low"] += 1
-                        continue
-
-                # =========================================================
+                # NOTE (PulseFutures premium UX decision):
+                # Emails were becoming too rare due to absolute/relative volume floors.
+                # We now rely on confidence + RR floors + momentum gates + cooldowns.
+                # Volume is still shown for context, but it no longer blocks emailing.
+# =========================================================
                 # Rule 1: Minimum momentum gate for EMAILS
                 # =========================================================
                 ch15 = _safe_float(getattr(s, "ch15", 0.0), 0.0)
