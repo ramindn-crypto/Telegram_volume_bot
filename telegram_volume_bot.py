@@ -674,13 +674,15 @@ LEADERS_N = 10
 SETUPS_N = 6
 EMAIL_SETUPS_N = 3
 
-# ✅ Minimum 24H futures notional volume required to EMAIL a setup (USD)
-# Keeps low-liquidity micro setups (e.g., Vol~150K) out of email.
-# You can override via env: EMAIL_MIN_FUT_VOL_USD=5000000
-EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", "5000000"))
-
 # ✅ Global setup quality floor (Premium & Selective)
 MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "75"))
+
+# ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
+MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "5000000"))
+MIN_RR_TP3 = float(os.environ.get("MIN_RR_TP3", "1.8"))
+
+# Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
+EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
 
 # ✅ /screen scan breadth + loosened trigger only for screen (NOT email)
 SCREEN_UNIVERSE_N = 70          # was effectively 35 (inside pick_setups)
@@ -4156,6 +4158,56 @@ def rr_to_tp(entry: float, sl: float, tp: float) -> float:
     if d_sl <= 0:
         return 0.0
     return d_tp / d_sl
+
+
+def is_top_setup_eligible(s: "Setup") -> tuple[bool, str]:
+    """
+    Shared eligibility gate for:
+      - /screen -> Top Trade Setups
+      - Emails  -> Market Scan alerts
+
+    Defaults (env-overridable):
+      MIN_SETUP_CONF >= 75
+      MIN_FUT_VOL_USD >= 5,000,000
+      MIN_RR_TP3 >= 1.8
+      Valid TP ladder (TP1/TP2/TP3 present and RR1/RR2/RR3 positive)
+    """
+    try:
+        conf = int(getattr(s, "conf", 0) or 0)
+        if conf < int(MIN_SETUP_CONF):
+            return (False, "below_min_conf")
+
+        fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+        if fut_vol < float(MIN_FUT_VOL_USD):
+            return (False, "below_min_fut_vol")
+
+        entry = float(getattr(s, "entry", 0.0) or 0.0)
+        sl = float(getattr(s, "sl", 0.0) or 0.0)
+        tp1 = getattr(s, "tp1", None)
+        tp2 = getattr(s, "tp2", None)
+        tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+
+        # Ladder validity
+        if tp1 is None or tp2 is None:
+            return (False, "invalid_tp_ladder")
+        tp1 = float(tp1 or 0.0)
+        tp2 = float(tp2 or 0.0)
+        if tp1 <= 0 or tp2 <= 0 or tp3 <= 0 or entry <= 0 or sl <= 0:
+            return (False, "invalid_tp_ladder")
+
+        rr1 = rr_to_tp(entry, sl, tp1)
+        rr2 = rr_to_tp(entry, sl, tp2)
+        rr3 = rr_to_tp(entry, sl, tp3)
+
+        if rr1 <= 0 or rr2 <= 0 or rr3 <= 0:
+            return (False, "invalid_rr_ladder")
+
+        if float(rr3) < float(MIN_RR_TP3):
+            return (False, "below_min_rr_tp3")
+
+        return (True, "ok")
+    except Exception:
+        return (False, "eligibility_exception")
 
 # =========================================================
 # SETUP ENGINE
@@ -8910,7 +8962,15 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         except Exception:
             pass
 
+    
     # -----------------------------------------------------
+    # Shared Top Setup gate (applies to BOTH /screen and email)
+    # -----------------------------------------------------
+    try:
+        ordered = [s for s in (ordered or []) if is_top_setup_eligible(s)[0]]
+    except Exception:
+        pass
+# -----------------------------------------------------
     # NEW: Spike Reversal candidates (15M+ Vol) — for /screen only
     # -----------------------------------------------------
     spike_candidates = []
@@ -10380,7 +10440,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         setups_by_session: Dict[str, List[Setup]] = {}
         for sess_name in ["NY", "LON", "ASIA"]:
             try:
-                pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
+                pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="screen", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
             except asyncio.TimeoutError:
                 pool = {"setups": []}
             except Exception:
@@ -10552,135 +10612,42 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 }
                 continue
 
+                        # ---------------------------
+            # Unified /screen + /email Top Setup eligibility
             # ---------------------------
-            # Your existing filter + pick logic
-            # ---------------------------
-            min_conf = SESSION_MIN_CONF.get(sess["name"], 78)
-            min_rr = SESSION_MIN_RR_TP3.get(sess["name"], 2.2)
+            # Email should send the SAME Top Trade Setups that /screen shows.
+            # Only user preferences (sessions/trade window/caps/gap/cooldown) can block sending.
 
-            # -------------------------------------------------
-            # Per-user EMAIL filter parameters (safe defaults)
-            # -------------------------------------------------
-            try:
-                email_abs_vol_min = float((user.get("email_abs_vol_min_usd") if isinstance(user, dict) else None) or EMAIL_ABS_VOL_USD_MIN)
-            except Exception:
-                email_abs_vol_min = float(EMAIL_ABS_VOL_USD_MIN)
-
-            try:
-                email_rel_vol_min_mult = float((user.get("email_rel_vol_min_mult") if isinstance(user, dict) else None) or EMAIL_REL_VOL_MIN_MULT)
-            except Exception:
-                email_rel_vol_min_mult = float(EMAIL_REL_VOL_MIN_MULT)
-
-            try:
-                confirm_15m_abs_min = float((user.get("confirm_15m_abs_min") if isinstance(user, dict) else None) or CONFIRM_15M_ABS_MIN)
-            except Exception:
-                confirm_15m_abs_min = float(CONFIRM_15M_ABS_MIN)
-
-            try:
-                early_1h_abs_min = float((user.get("early_1h_abs_min") if isinstance(user, dict) else None) or EARLY_1H_ABS_MIN)
-            except Exception:
-                early_1h_abs_min = float(EARLY_1H_ABS_MIN)
-
-            # Extra strictness for EMAIL (but not "never send"): allow user override, else keep conservative defaults.
-            try:
-                email_early_min_ch15_abs = float((user.get("email_early_min_ch15_abs") if isinstance(user, dict) else None) or EMAIL_EARLY_MIN_CH15_ABS)
-            except Exception:
-                email_early_min_ch15_abs = float(EMAIL_EARLY_MIN_CH15_ABS)
-
-            confirmed: List[Setup] = []
-            early: List[Setup] = []
             skip_reasons_counter = Counter()
-
-            for s in setups_all:
-                base = str(getattr(s, "symbol", "") or "").upper().strip()
-
-                # For /screen, be slightly more permissive so the bot doesn't feel "dead" in slow hours.
-                # Email stays at the stricter session floors.
-                eff_min_conf = int(min_conf)
-                eff_min_rr = float(min_rr)
-                if s.conf < eff_min_conf:
-                    skip_reasons_counter["below_session_conf_floor"] += 1
-                    try:
-                        mv = (best_fut or {}).get(base)
-                        if mv is not None:
-                            _rej("below_session_conf_floor", base, mv, f"conf={int(s.conf)} min={int(eff_min_conf)}")
-                    except Exception:
-                        pass
-                    continue
-
-                rr3 = rr_to_tp(float(s.entry), float(s.sl), float(s.tp3))
-                if float(rr3) < float(eff_min_rr):
-                    skip_reasons_counter["below_session_rr_floor"] += 1
-                    try:
-                        mv = (best_fut or {}).get(base)
-                        if mv is not None:
-                            _rej("below_session_rr_floor", base, mv, f"rr3={float(rr3):.2f} min={float(eff_min_rr):.2f}")
-                    except Exception:
-                        pass
-                    continue
-
-                # =========================================================
-                # Rule 2: Minimum futures notional volume (EMAIL only)
-                # =========================================================
-                vol24_usd = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
-                if vol24_usd < float(EMAIL_MIN_FUT_VOL_USD):
-                    skip_reasons_counter["email_fut_vol_too_low"] += 1
-                    try:
-                        mv = (best_fut or {}).get(base)
-                        if mv is not None:
-                            _rej("email_fut_vol_too_low", base, mv, f"vol={fmt_money(vol24_usd)} min={fmt_money(float(EMAIL_MIN_FUT_VOL_USD))}")
-                    except Exception:
-                        pass
-                    continue
-
-                # =========================================================
-                # Rule 1: Minimum momentum gate for EMAILS
-                # =========================================================
-                ch15 = _safe_float(getattr(s, "ch15", 0.0), 0.0)
-                is_confirm_15m = abs(float(ch15)) >= float(confirm_15m_abs_min)
-
-                if is_confirm_15m:
-                    confirmed.append(s)
+            eligible: List[Setup] = []
+            for s in (setups_all or []):
+                ok, why = is_top_setup_eligible(s)
+                if ok:
+                    eligible.append(s)
                 else:
-                    if abs(float(s.ch1)) < float(early_1h_abs_min):
-                        skip_reasons_counter["early_gate_ch1_not_strong"] += 1
-                        continue
-                    if abs(float(ch15)) < float(email_early_min_ch15_abs):
-                        skip_reasons_counter["early_gate_15m_too_weak"] += 1
-                        continue
-                    if s.conf < (min_conf + EARLY_EMAIL_EXTRA_CONF):
-                        skip_reasons_counter["early_gate_conf_not_high_enough"] += 1
-                        continue
-                    early.append(s)
+                    skip_reasons_counter[str(why)] += 1
 
-            confirmed = sorted(confirmed, key=lambda x: x.conf, reverse=True)
-            early = sorted(early, key=lambda x: x.conf, reverse=True)
-
-            picks: List[Setup] = []
-            for s in confirmed:
-                if len(picks) >= int(EMAIL_SETUPS_N):
-                    break
-                picks.append(s)
-
-            fill_left = int(EMAIL_SETUPS_N) - len(picks)
-            if fill_left > 0 and int(EARLY_EMAIL_MAX_FILL) > 0:
-                allow_early = min(int(EARLY_EMAIL_MAX_FILL), fill_left)
-                picks.extend(early[:allow_early])
-
-            if not picks:
+            if not eligible:
+                top_reasons = dict(skip_reasons_counter.most_common(3))
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
-                    "reasons": ["no_setups_after_filters"] + (
-                        [f"top_reasons={dict(skip_reasons_counter.most_common(5))}"]
-                        if skip_reasons_counter else []
-                    ),
+                    "reasons": ["no_setups_after_filters", f"top_reasons={top_reasons}"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
 
-            chosen_list: List[Setup] = []
-            # Deduplicate setups (important in UNLIMITED mode where we merge sessions).
-            # Keyed by symbol/side + rounded prices, so we don't email the same idea 2-3 times.
+            # Premium ordering: confidence desc, RR(TP3) desc
+            def _rr3(_s: Setup) -> float:
+                try:
+                    return float(rr_to_tp(float(_s.entry), float(_s.sl), float(_s.tp3)))
+                except Exception:
+                    return 0.0
+
+            eligible = sorted(eligible, key=lambda _s: (int(getattr(_s, "conf", 0) or 0), _rr3(_s)), reverse=True)
+
+            # Candidate picks for cooldown/flip checks below
+            picks: List[Setup] = list(eligible[: max(int(EMAIL_SETUPS_N) * 6, 18)])
+
             _seen_setup_keys = set()
             cooldown_blocked = 0
             flip_blocked = 0
