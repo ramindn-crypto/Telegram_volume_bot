@@ -9133,6 +9133,11 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 block = []
                 block.append(f"{emoji} *{side} — {sym}*")
                 block.append(f"`{sid}` | Conf: `{conf}`")
+                try:
+                    if symbol_recently_emailed(uid, sym, side, session):
+                        block.append("📩 *Email suppressed:* cooldown active")
+                except Exception:
+                    pass
                 if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
                     block.append(f"Type: {typ} | RR(TP1): `{rr1:.2f}` | RR(TP2): `{rr2:.2f}` | RR(TP3): `{rr3:.2f}`")
                 else:
@@ -9234,18 +9239,18 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     market_txt = ""
     try:
         up_top = []
-        for it in (up_list or [])[:3]:
+        for it in (up_list or [])[:5]:
             try:
                 b, vol, ch24, ch4, px = it
-                up_top.append(f"{str(b).upper()} {pct_with_emoji(float(ch24) or 0.0)}")
+                up_top.append(f"{str(b).upper()} {pct_with_emoji(float(ch24) or 0.0)} ({(float(vol) or 0.0)/1e6:.1f}M)")
             except Exception:
                 continue
 
         dn_top = []
-        for it in (dn_list or [])[:3]:
+        for it in (dn_list or [])[:5]:
             try:
                 b, vol, ch24, ch4, px = it
-                dn_top.append(f"{str(b).upper()} {pct_with_emoji(float(ch24) or 0.0)}")
+                dn_top.append(f"{str(b).upper()} {pct_with_emoji(float(ch24) or 0.0)} ({(float(vol) or 0.0)/1e6:.1f}M)")
             except Exception:
                 continue
 
