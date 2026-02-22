@@ -674,6 +674,11 @@ LEADERS_N = 10
 SETUPS_N = 6
 EMAIL_SETUPS_N = 3
 
+# ✅ Minimum 24H futures notional volume required to EMAIL a setup (USD)
+# Keeps low-liquidity micro setups (e.g., Vol~150K) out of email.
+# You can override via env: EMAIL_MIN_FUT_VOL_USD=5000000
+EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", "5000000"))
+
 # ✅ Global setup quality floor (Premium & Selective)
 MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "75"))
 
@@ -10615,13 +10620,20 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 # =========================================================
-                # Rule 2: Email volume filter (DISABLED)
+                # Rule 2: Minimum futures notional volume (EMAIL only)
                 # =========================================================
-                # NOTE (PulseFutures premium UX decision):
-                # Emails were becoming too rare due to absolute/relative volume floors.
-                # We now rely on confidence + RR floors + momentum gates + cooldowns.
-                # Volume is still shown for context, but it no longer blocks emailing.
-# =========================================================
+                vol24_usd = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+                if vol24_usd < float(EMAIL_MIN_FUT_VOL_USD):
+                    skip_reasons_counter["email_fut_vol_too_low"] += 1
+                    try:
+                        mv = (best_fut or {}).get(base)
+                        if mv is not None:
+                            _rej("email_fut_vol_too_low", base, mv, f"vol={fmt_money(vol24_usd)} min={fmt_money(float(EMAIL_MIN_FUT_VOL_USD))}")
+                    except Exception:
+                        pass
+                    continue
+
+                # =========================================================
                 # Rule 1: Minimum momentum gate for EMAILS
                 # =========================================================
                 ch15 = _safe_float(getattr(s, "ch15", 0.0), 0.0)
