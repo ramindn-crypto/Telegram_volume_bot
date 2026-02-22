@@ -6966,7 +6966,11 @@ async def sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
     enabled = user_enabled_sessions(user)
     now_s = in_session_now(user)
-    now_txt = f"Now in session: {now_s['name']}" if now_s else "Now in session: NONE"
+    now_live = _guess_session_name_utc(datetime.now(timezone.utc))
+    if int(user.get("sessions_unlimited", 0) or 0) == 1:
+        now_txt = f"Now in session: {now_live}"
+    else:
+        now_txt = f"Now in session: {now_s['name']}" if now_s else "Now in session: NONE"
     await update.message.reply_text(
         f"Your TZ: {user['tz']}\n"
         f"{now_txt}\n\n"
@@ -7815,7 +7819,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     enabled = user_enabled_sessions(user)
     now_s = in_session_now(user)
-    now_txt = now_s["name"] if now_s else "NONE"
+    # Display the *live market session* (NY/LON/ASIA), not "UNLIMITED" access mode
+    now_live = _guess_session_name_utc(datetime.now(timezone.utc))
+    if int(user.get("sessions_unlimited", 0) or 0) == 1:
+        now_txt = now_live
+    else:
+        now_txt = (now_s["name"] if now_s else "NONE")
 
     # Email caps (show infinite as 0=∞ to match UI)
     cap_sess = int((user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION) or DEFAULT_MAX_EMAILS_PER_SESSION)
@@ -9260,25 +9269,60 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     # Market Context (compressed)
     market_txt = ""
     try:
-        up_top = []
-        for it in (up_list or [])[:5]:
+        # Build Leaders/Losers for Market Context
+        # Goal: show up to 5 items each (when available), preferring "directional" movers,
+        # but backfilling with high-volume movers so the section is informative.
+        vol_min = float(MOVER_VOL_USD_MIN)
+
+        movers = []
+        for sym, mv in (best_fut or {}).items():
             try:
-                b, vol, ch24, ch4, px = it
-                up_top.append(f"*{str(b).upper()}* {pct_with_emoji(float(ch24) or 0.0)} ({(float(vol) or 0.0)/1e6:.1f}M)")
+                v = float(usd_notional(mv) or 0.0)
+                c24 = float(getattr(mv, "percentage", 0.0) or 0.0)
+                movers.append((sym, v, c24))
             except Exception:
                 continue
 
-        dn_top = []
-        for it in (dn_list or [])[:5]:
-            try:
-                b, vol, ch24, ch4, px = it
-                dn_top.append(f"*{str(b).upper()}* {pct_with_emoji(float(ch24) or 0.0)} ({(float(vol) or 0.0)/1e6:.1f}M)")
-            except Exception:
-                continue
+        movers = [t for t in movers if t[1] >= vol_min]
 
-        # Tone heuristic
-        upn = len(up_list or [])
-        dnn = len(dn_list or [])
+        # Backfill thresholds: start strict, relax if we don't have enough.
+        def _pick_top(movers_list, direction: str):
+            out = []
+            used = set()
+            if direction == "up":
+                thresholds = [float(MOVER_UP_24H_MIN), 5.0, 0.0]
+                key = lambda x: x[2]
+                filt = lambda x, th: x[2] >= th
+                sort_rev = True
+            else:
+                thresholds = [abs(float(MOVER_DN_24H_MAX)), 5.0, 0.0]  # compare on absolute move
+                key = lambda x: -x[2]  # more negative first when sorting ascending by c24
+                filt = lambda x, th: (-x[2]) >= th
+                sort_rev = False
+
+            for th in thresholds:
+                if direction == "up":
+                    cand = [x for x in movers_list if x[0] not in used and filt(x, th)]
+                    cand = sorted(cand, key=lambda x: x[2], reverse=True)
+                else:
+                    cand = [x for x in movers_list if x[0] not in used and filt(x, th)]
+                    cand = sorted(cand, key=lambda x: x[2])  # most negative first
+
+                for x in cand:
+                    out.append(x)
+                    used.add(x[0])
+                    if len(out) >= 5:
+                        return out
+            return out
+
+        up_picks = _pick_top(movers, "up")
+        dn_picks = _pick_top(movers, "dn")
+
+        up_top = [f"*{str(sym).upper()}* {pct_with_emoji(c24)} ({v/1e6:.1f}M)" for sym, v, c24 in up_picks]
+        dn_top = [f"*{str(sym).upper()}* {pct_with_emoji(c24)} ({v/1e6:.1f}M)" for sym, v, c24 in dn_picks]
+        # Tone heuristic (based on strict directional thresholds)
+        upn = sum(1 for _sym, _v, _c24 in movers if _c24 >= float(MOVER_UP_24H_MIN))
+        dnn = sum(1 for _sym, _v, _c24 in movers if _c24 <= float(MOVER_DN_24H_MAX))
         if upn >= max(2, int(dnn * 1.5)):
             tone = "🟢 Bullish"
         elif dnn >= max(2, int(upn * 1.5)):
@@ -9573,9 +9617,9 @@ def _email_body_pretty(
         parts.append(f"Top Volume: {topv}")
 
     if up:
-        parts.append("Leaders: " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in up[:3]]))
+        parts.append("Leaders: " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in up[:5]]))
     if dn:
-        parts.append("Losers:  " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in dn[:3]]))
+        parts.append("Losers:  " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in dn[:5]]))
     parts.append("")
 
     parts.append("Top Setups")
@@ -9658,9 +9702,9 @@ def _email_body_pretty_html(
         topv = ", ".join([f"{esc(b)}({esc(pct_with_emoji(float(mv.percentage or 0.0)))})" for b, mv in leaders])
         lines.append(f"<div>Top Volume: {topv}</div>")
     if up:
-        lines.append("<div>Leaders: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in up[:3]]) + "</div>")
+        lines.append("<div>Leaders: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in up[:5]]) + "</div>")
     if dn:
-        lines.append("<div>Losers: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in dn[:3]]) + "</div>")
+        lines.append("<div>Losers: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in dn[:5]]) + "</div>")
 
     lines.append("<hr style='border:none;border-top:1px solid #eee;margin:10px 0'>")
     lines.append("<div style='font-weight:700;margin:8px 0 4px'>Top Setups</div>")
@@ -9732,9 +9776,9 @@ def _email_body_pretty_html(
         topv = ", ".join([f"{esc(b)}({esc(pct_with_emoji(float(mv.percentage or 0.0)))})" for b, mv in leaders])
         lines.append(f"<div>Top Volume: {topv}</div>")
     if up:
-        lines.append("<div>Leaders: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in up[:3]]) + "</div>")
+        lines.append("<div>Leaders: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in up[:5]]) + "</div>")
     if dn:
-        lines.append("<div>Losers: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in dn[:3]]) + "</div>")
+        lines.append("<div>Losers: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in dn[:5]]) + "</div>")
 
     lines.append("<hr style='border:none;border-top:1px solid #eee;margin:10px 0'>")
     lines.append("<div style='font-weight:700;margin:8px 0 4px'>Top Setups</div>")
@@ -10866,7 +10910,8 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
     enabled = user_enabled_sessions(user)
     sess = in_session_now(user)
-    now_s = sess["name"] if sess else "NONE"
+    # Display the *live market session* (NY/LON/ASIA), not "UNLIMITED" access mode
+    now_s = _guess_session_name_utc(datetime.now(timezone.utc)) if int(user.get("sessions_unlimited", 0) or 0) == 1 else (sess["name"] if sess else "NONE")
 
     # Blackout
 
