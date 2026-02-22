@@ -781,15 +781,17 @@ WARN_RISK_PCT_PER_TRADE = 2.0
 # =========================================================
 # ✅ COOLDOWNS (email anti-spam)
 # =========================================================
-# Session-aware cooldown hours (recommended)
+# Lighter cooldowns (emails are rare; don't over-block)
+# NOTE: cooldown only suppresses *emails*, not /screen.
+# You can still keep spam under control via email_gap_min + daily caps.
 SESSION_SYMBOL_COOLDOWN_HOURS = {
-    "NY": 2,     # more active
-    "LON": 3,    # balanced
-    "ASIA": 4,   # more strict
+    "NY": 1,     # more active
+    "LON": 2,    # balanced
+    "ASIA": 3,   # a bit stricter
 }
 
 # Fallback if session unknown
-SYMBOL_COOLDOWN_HOURS = 4
+SYMBOL_COOLDOWN_HOURS = 3
 
 # =========================================================
 # WIN-RATE FILTERS (stricter = fewer signals, higher quality)
@@ -1341,6 +1343,16 @@ _USER_DIAG_MODE: Dict[int, str] = {}
 _LAST_EMAIL_DECISION: Dict[int, Dict[str, Any]] = {}
 
 _LAST_BIGMOVE_DECISION: Dict[int, dict] = {}
+
+# ---------------------------------------------------------
+# Email loop heartbeat (for /email_decision transparency)
+# ---------------------------------------------------------
+_EMAIL_LOOP_HEARTBEAT: Dict[str, Any] = {
+    "alive": False,
+    "last_tick_ts": 0.0,
+    "next_tick_ts": 0.0,
+    "last_error": "",
+}
 
 def user_diag_mode(user_id: int) -> str:
     """
@@ -9049,6 +9061,12 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     except Exception:
         setups = (pool.get("setups") or [])[:3]
 
+    # For UX: do not show the same symbol in Momentum Watch if it's already a Top Setup
+    try:
+        top_setup_syms = set(str(getattr(s, 'symbol', '') or '').upper() for s in (setups or []) if getattr(s, 'symbol', None))
+    except Exception:
+        top_setup_syms = set()
+
     # Safety: if engine produced no setups, generate fallback ATR-based setups
     if not setups:
         try:
@@ -9189,6 +9207,8 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                     continue
                 base, d = item
                 sym = str(base).upper()
+                if sym in (top_setup_syms or set()):
+                    continue
                 raw_side = str(d.get("side", "BUY") or "BUY").strip().upper()
                 if raw_side in ("LONG",):
                     side = "BUY"
@@ -9218,6 +9238,8 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
             for t in trend_watch_sorted:
                 try:
                     sym = str(t.get("symbol", "")).upper().strip()
+                    if sym in (top_setup_syms or set()):
+                        continue
                     if not sym or sym in seen_syms:
                         continue
                     side = str(t.get("side", "BUY") or "BUY").strip().upper()
@@ -9242,7 +9264,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         for it in (up_list or [])[:5]:
             try:
                 b, vol, ch24, ch4, px = it
-                up_top.append(f"{str(b).upper()} {pct_with_emoji(float(ch24) or 0.0)} ({(float(vol) or 0.0)/1e6:.1f}M)")
+                up_top.append(f"*{str(b).upper()}* {pct_with_emoji(float(ch24) or 0.0)} ({(float(vol) or 0.0)/1e6:.1f}M)")
             except Exception:
                 continue
 
@@ -9250,7 +9272,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         for it in (dn_list or [])[:5]:
             try:
                 b, vol, ch24, ch4, px = it
-                dn_top.append(f"{str(b).upper()} {pct_with_emoji(float(ch24) or 0.0)} ({(float(vol) or 0.0)/1e6:.1f}M)")
+                dn_top.append(f"*{str(b).upper()}* {pct_with_emoji(float(ch24) or 0.0)} ({(float(vol) or 0.0)/1e6:.1f}M)")
             except Exception:
                 continue
 
@@ -9273,13 +9295,17 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         lines = [
             f"*Market Context*",
             SEP,
-            f"Risk Tone: *{tone}*",
-            f"Pulse: BTC {btc24} | ETH {eth24}",
+            f"*Risk Tone:* {tone}",
+            "",
+            f"*Pulse:* *BTC* {btc24} | *ETH* {eth24}",
+            "",
         ]
         if up_top:
-            lines.append("Leaders: " + ", ".join(up_top))
+            lines.append(f"*Leaders:* " + ", ".join(up_top))
+            lines.append("")
         if dn_top:
-            lines.append("Losers: " + ", ".join(dn_top))
+            lines.append(f"*Losers:* " + ", ".join(dn_top))
+            lines.append("")
 
         market_txt = "\n".join(lines).strip()
     except Exception:
@@ -10741,6 +10767,23 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     lines = []
     lines.append("📧 Email Decisions")
+    # Heartbeat
+    try:
+        last_tick = float(_EMAIL_LOOP_HEARTBEAT.get("last_tick_ts", 0.0) or 0.0)
+        next_tick = float(_EMAIL_LOOP_HEARTBEAT.get("next_tick_ts", 0.0) or 0.0)
+        alive = bool(_EMAIL_LOOP_HEARTBEAT.get("alive", False))
+        last_err = str(_EMAIL_LOOP_HEARTBEAT.get("last_error", "") or "")
+        lines.append("")
+        lines.append("🫀 Email Loop")
+        lines.append(f"Alive: {'YES' if alive else 'NO'}")
+        if last_tick > 0:
+            lines.append("Last tick: " + _fmt_when(last_tick))
+        if next_tick > 0:
+            lines.append("Next tick: " + _fmt_when(next_tick))
+        if last_err:
+            lines.append("Last error: " + last_err)
+    except Exception:
+        pass
 
     if bigm:
         lines.append("")
@@ -11534,9 +11577,30 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     internal job to exit immediately every time, so no emails were ever sent
     (while /email_test still worked).
     """
+
+    # Heartbeat (so /email_decision can prove the loop is alive)
+    try:
+        _EMAIL_LOOP_HEARTBEAT["alive"] = True
+        now_ts = time.time()
+        _EMAIL_LOOP_HEARTBEAT["last_tick_ts"] = now_ts
+        job = getattr(context, "job", None)
+        interval = float(getattr(job, "interval", 0) or 0)
+        if interval > 0:
+            _EMAIL_LOOP_HEARTBEAT["next_tick_ts"] = now_ts + interval
+    except Exception:
+        pass
+
     try:
         await _alert_job_async_internal(context)
+        try:
+            _EMAIL_LOOP_HEARTBEAT["last_error"] = ""
+        except Exception:
+            pass
     except Exception as e:
+        try:
+            _EMAIL_LOOP_HEARTBEAT["last_error"] = f"{type(e).__name__}: {e}"
+        except Exception:
+            pass
         logger.exception("Alert job failure: %s", e)
 
 
