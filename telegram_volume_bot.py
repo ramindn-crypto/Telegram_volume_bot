@@ -10505,6 +10505,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             sess_name = str(sess.get("name") or "")
+            live_sess = (_session_label_utc(datetime.now(timezone.utc)) or "NONE")
+            display_sess = live_sess if sess_name == "UNLIMITED" else sess_name
 
 
             # Unlimited mode => allow setups from ALL sessions (24/7)
@@ -10525,7 +10527,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             if not setups_all:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
-                    "reasons": [f"no_setups_generated_for_session ({sess.get('name')})"],
+                    "reasons": [f"no_setups_generated_for_session ({display_sess})"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
@@ -10648,6 +10650,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # Candidate picks for cooldown/flip checks below
             picks: List[Setup] = list(eligible[: max(int(EMAIL_SETUPS_N) * 6, 18)])
 
+            chosen_list: List[Setup] = []
             _seen_setup_keys = set()
             cooldown_blocked = 0
             flip_blocked = 0
