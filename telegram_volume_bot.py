@@ -3622,14 +3622,18 @@ def current_session_utc(now_utc: Optional[datetime] = None) -> str:
 
     # Outside the three main windows: treat as NY tail/transition
     return "NY"
-    if 7 <= h < 16:
-        return "LON"
-    if 0 <= h < 9:
-        return "ASIA"
 
-    # Outside the three main windows: treat as NY tail/transition
-    # (or return "ASIA"/"OFF" if you prefer)
-    return "NY"
+
+# Some mobile apps (Gmail/iOS) may copy-paste commands with invisible Unicode markers
+# (LTR/RTL marks, BOM, etc.) before the leading '/'. Telegram then won't treat it as a command.
+# We strip those so users can paste /size directly from email.
+_INVISIBLE_PREFIX_CHARS = "\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\ufeff"
+
+def _strip_invisible_prefix(s: str) -> str:
+    try:
+        return (s or "").lstrip(_INVISIBLE_PREFIX_CHARS + " \t\r\n")
+    except Exception:
+        return s or ""
 
 def ema_support_proximity_ok(entry: float, ema_val: float, atr_1h: float, session_name: str):
     """
@@ -7412,6 +7416,43 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(msg)
 
+
+async def _size_paste_fallback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback for mobile copy/paste where Telegram doesn't parse it as a command.
+
+    Example: Gmail/iOS sometimes prefixes invisible Unicode markers before '/size'.
+    Then CommandHandler("size") won't fire. This router strips those markers and
+    re-dispatches to size_cmd.
+    """
+    try:
+        if not update.message or not update.message.text:
+            return
+        txt = update.message.text
+        # If Telegram already treated it as a command, CommandHandler will handle it.
+        if txt.startswith("/size"):
+            return
+
+        clean = _strip_invisible_prefix(txt)
+        if not clean.lower().startswith("/size"):
+            return
+
+        parts = clean.split()
+        if not parts:
+            return
+
+        cmd = parts[0]
+        if "@" in cmd:
+            cmd = cmd.split("@", 1)[0]
+        if cmd.lower() != "/size":
+            return
+
+        # Emulate CommandHandler args
+        context.args = parts[1:]
+        await size_cmd(update, context)
+    except Exception:
+        # Never crash generic text handling
+        return
+
 async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
@@ -9920,10 +9961,11 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
     # Display the *market* session (NY/LON/ASIA) in the email header.
     # 'UNLIMITED' is an access mode, not a market session.
     try:
-        live_sess = _session_label_utc(datetime.now(timezone.utc)) or str(sess.get('name') or '')
+        live_sess = current_session_utc(datetime.now(timezone.utc))
     except Exception:
-        live_sess = str(sess.get('name') or '')
-    display_session = live_sess if str(sess.get('name') or '') == 'UNLIMITED' else str(sess.get('name') or '')
+        live_sess = "NY"
+    sess_name = str(sess.get("name") or "")
+    display_session = live_sess if sess_name == "UNLIMITED" else sess_name
 
     first = setups[0]
     subject = f"PulseFutures • {display_session} • {first.side} {first.symbol}"
@@ -10509,7 +10551,11 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             sess_name = str(sess.get("name") or "")
-            live_sess = (_session_label_utc(datetime.now(timezone.utc)) or "NONE")
+            # Market session label (NY/LON/ASIA) — never show "UNLIMITED" as the session name in email.
+            try:
+                live_sess = current_session_utc(datetime.now(timezone.utc))
+            except Exception:
+                live_sess = "NY"
             display_sess = live_sess if sess_name == "UNLIMITED" else sess_name
 
 
@@ -11661,6 +11707,8 @@ def main():
     app.add_handler(CommandHandler("bigmove_alert", bigmove_alert_cmd, block=False))
     app.add_handler(CommandHandler("notify_on", notify_on, block=False))
     app.add_handler(CommandHandler("notify_off", notify_off, block=False))
+    # Fallback: pasted "invisible-prefix" /size from mobile email clients
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _size_paste_fallback_router), group=-2)
     app.add_handler(CommandHandler("size", size_cmd, block=False))
     app.add_handler(CommandHandler("trade_open", trade_open_cmd, block=False))
     app.add_handler(CommandHandler("trade_close", trade_close_cmd, block=False))
