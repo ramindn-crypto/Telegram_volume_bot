@@ -7884,9 +7884,13 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         now_txt = (now_s["name"] if now_s else "NONE")
 
     # Email caps (show infinite as 0=∞ to match UI)
-    cap_sess = int((user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION) or DEFAULT_MAX_EMAILS_PER_SESSION)
-    cap_day = int((user or {}).get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY) or DEFAULT_MAX_EMAILS_PER_DAY)
-    gap_m = int((user or {}).get("email_gap_min", DEFAULT_EMAIL_GAP_MIN) or DEFAULT_EMAIL_GAP_MIN)
+        # IMPORTANT: 0 is a valid value (means unlimited) — do not coerce with `or DEFAULT`.
+    cap_sess_raw = (user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION)
+    cap_day_raw  = (user or {}).get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY)
+    gap_raw      = (user or {}).get("email_gap_min", DEFAULT_EMAIL_GAP_MIN)
+    cap_sess = int(DEFAULT_MAX_EMAILS_PER_SESSION if cap_sess_raw is None else cap_sess_raw)
+    cap_day  = int(DEFAULT_MAX_EMAILS_PER_DAY if cap_day_raw is None else cap_day_raw)
+    gap_m    = int(DEFAULT_EMAIL_GAP_MIN if gap_raw is None else gap_raw)
 
     # Big-move status
     bm_on = int((user or {}).get("bigmove_alert_on", 1) or 0)
