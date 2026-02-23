@@ -9719,7 +9719,7 @@ def _email_body_pretty(
         parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
-            parts.append(f"   /size {str(getattr(s, 'symbol', ''))} {_pos} entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}")
+            parts.append(f"/size {str(getattr(s, 'symbol', ''))} {_pos} entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}")
         except Exception:
             pass
         parts.append("")
@@ -9806,7 +9806,7 @@ def _email_body_pretty_html(
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
             size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
-            card.append(f"<pre style='margin-top:8px;background:#f7f7f7;padding:8px;border-radius:8px;white-space:pre-wrap'>{esc(size_line)}</pre>")
+            card.append(f"<div style='margin-top:8px'><code style='background:#f7f7f7;padding:8px;border-radius:8px;display:inline-block;white-space:nowrap;font-family:Menlo,Consolas,monospace'>{esc(size_line)}</code></div>")
         except Exception:
             pass
         card.append("</div>")
@@ -9880,7 +9880,7 @@ def _email_body_pretty_html(
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
             size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
-            card.append(f"<pre style='margin-top:8px;background:#f7f7f7;padding:8px;border-radius:8px;white-space:pre-wrap'>{esc(size_line)}</pre>")
+            card.append(f"<div style='margin-top:8px'><code style='background:#f7f7f7;padding:8px;border-radius:8px;display:inline-block;white-space:nowrap;font-family:Menlo,Consolas,monospace'>{esc(size_line)}</code></div>")
         except Exception:
             pass
         card.append("</div>")
