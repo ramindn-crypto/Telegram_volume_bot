@@ -6811,13 +6811,81 @@ async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user = get_user(uid) or {}
+    """/start — must never crash.
 
-    # Start 7-day FULL Pro trial on first /start only
-    ensure_trial_started(uid, user, force=True)
+    Rules:
+    - Any Telegram user can start the bot (after joining your channel you can optionally check elsewhere).
+    - New users get a 7-day trial automatically on first /start.
+    - If trial expired (and no paid plan), show upgrade message.
+    """
+    uid = update.effective_user.id
+
+    # Ensure DB schema is migrated before touching plan/trial columns
+    try:
+        ensure_email_column()   # includes ensure_billing_columns()
+    except Exception:
+        try:
+            ensure_billing_columns()
+        except Exception:
+            pass
+
+    # Ensure user row exists
+    try:
+        user = get_user(uid) or {}
+    except Exception as e:
+        logger.exception("/start get_user failed for uid=%s: %s", uid, e)
+        try:
+            await update.message.reply_text("❌ Internal error creating your account. Please try again.")
+        except Exception:
+            pass
+        return
+
+    # Start 7-day trial ONCE (only if currently free)
+    try:
+        ensure_trial_started(uid, user, force=True)
+    except Exception as e:
+        # One more attempt after re-migrating (covers older DBs missing columns)
+        logger.exception("/start ensure_trial_started failed for uid=%s: %s", uid, e)
+        try:
+            ensure_email_column()
+        except Exception:
+            try:
+                ensure_billing_columns()
+            except Exception:
+                pass
+        try:
+            user = get_user(uid) or {}
+            ensure_trial_started(uid, user, force=True)
+        except Exception as e2:
+            logger.exception("/start ensure_trial_started retry failed for uid=%s: %s", uid, e2)
+            try:
+                await update.message.reply_text("❌ Internal error starting your trial. Please try again.")
+            except Exception:
+                pass
+            return
+
+    # Refresh and gate access
+    try:
+        user = get_user(uid) or {}
+    except Exception:
+        user = user or {}
+
+    if not has_active_access(uid, user):
+        try:
+            await update.message.reply_text(
+                "⛔️ Access locked.\n\n"
+                "Your 7-day free trial has ended.\n\n"
+                "To continue, choose a plan:\n"
+                "• Standard — $49/month\n"
+                "• Pro — $99/month\n\n"
+                "👉 /billing"
+            )
+        except Exception:
+            pass
+        return
 
     await cmd_help(update, context)
+
 
 # =========================================================
 # SUPPORT SYSTEM
@@ -11698,40 +11766,80 @@ async def admin_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ telegram_id must be a number.")
         return
 
-    user = get_user(uid)
-    plan = user.get("plan")
-    src = user.get("access_source", "")
-    ref = user.get("access_ref", "")
-    upd = user.get("access_updated_ts", 0)
+    # Ensure schema exists so this command never crashes on older DBs
+    try:
+        ensure_email_column()   # includes billing columns
+    except Exception:
+        try:
+            ensure_billing_columns()
+        except Exception:
+            pass
 
-    # latest payments
-    with _db() as con:
-        con.row_factory = sqlite3.Row
-        cur = con.cursor()
-        cur.execute("""
-            SELECT source, ref, plan, amount, currency, status, created_ts
-            FROM payments_ledger
-            WHERE user_id = ?
-            ORDER BY created_ts DESC
-            LIMIT 5
-        """, (uid,))
-        pays = cur.fetchall()
+    user = get_user(uid) or {}
+
+    stored_plan = str(user.get("plan") or "free").strip().lower()
+    eff_plan = str(effective_plan(uid, user)).strip().lower()
+
+    upd = 0.0
+    try:
+        upd = float(user.get("access_updated_ts") or 0.0)
+    except Exception:
+        upd = 0.0
+    upd_txt = datetime.utcfromtimestamp(upd).isoformat() + "Z" if upd else "n/a"
+
+    # Email field (handle old schemas)
+    email_val = ""
+    try:
+        email_val = (user.get("email_to") or user.get("email") or "").strip()
+    except Exception:
+        email_val = ""
+
+    # Latest payment (any) + latest PAID approval
+    last_any = None
+    last_paid = None
+    try:
+        with _db() as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            cur.execute(
+                "SELECT source, ref, plan, amount, currency, status, created_ts "
+                "FROM payments_ledger WHERE user_id=? ORDER BY created_ts DESC LIMIT 1",
+                (uid,)
+            )
+            last_any = cur.fetchone()
+            cur.execute(
+                "SELECT source, ref, plan, amount, currency, status, created_ts "
+                "FROM payments_ledger WHERE user_id=? AND status='paid' ORDER BY created_ts DESC LIMIT 1",
+                (uid,)
+            )
+            last_paid = cur.fetchone()
+    except Exception:
+        last_any = None
+        last_paid = None
+
+    def _fmt_pay(row):
+        if not row:
+            return "(none)"
+        ts = 0.0
+        try:
+            ts = float(row["created_ts"] or 0.0)
+        except Exception:
+            ts = 0.0
+        ts_txt = datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts else "n/a"
+        amt = row["amount"]
+        curcy = row["currency"] or ""
+        return f"{row['source']} | {row['plan']} | {amt} {curcy} | {row['status']} | {row['ref']} | {ts_txt}"
 
     lines = [
-        f"User: {uid}",
-        f"Plan: {plan}",
-        f"Access source/ref: {src} / {ref}",
-        f"Access updated: {datetime.utcfromtimestamp(upd).isoformat()+'Z' if upd else 'n/a'}",
-        f"Email: {user.get('email_to','') or ''}",
-        "",
-        "Last payments:"
+        f"User ID: {uid}",
+        f"Plan: {stored_plan.upper()} (effective: {eff_plan.upper()})",
+        f"Access Updated (UTC): {upd_txt}",
+        f"Email: {email_val or '-'}",
+        f"Last Payment (latest): {_fmt_pay(last_any)}",
+        f"Last Payment Approval (paid): {_fmt_pay(last_paid)}",
     ]
-    if pays:
-        for p in pays:
-            lines.append(f"- {p['source']} | {p['plan']} | {p['amount']} {p['currency']} | {p['status']} | {p['ref']}")
-    else:
-        lines.append("- (none)")
     await update.message.reply_text("\n".join(lines))
+
 
 def _table_columns(conn, table_name: str) -> set[str]:
     rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
@@ -11945,51 +12053,60 @@ async def admin_payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if context.args and context.args[0].isdigit():
         limit_n = max(1, min(200, int(context.args[0])))
 
+    # Ensure schema exists
+    try:
+        ensure_email_column()
+    except Exception:
+        try:
+            ensure_billing_columns()
+        except Exception:
+            pass
+
     with _db() as con:
         con.row_factory = sqlite3.Row
         cur = con.cursor()
+        cur.execute("SELECT * FROM users ORDER BY user_id ASC")
+        users = cur.fetchall() or []
 
-        # For each user, pull latest PAID ledger entry (approval) + current plan (from /admin_grant or access engine)
-        cur.execute(f"""
-            SELECT
-                u.user_id AS user_id,
-                COALESCE(NULLIF(TRIM(u.plan),''), 'standard') AS plan,
-                (
-                    SELECT p.created_ts
-                    FROM payments_ledger p
-                    WHERE p.user_id = u.user_id AND p.status = 'paid'
-                    ORDER BY p.created_ts DESC
-                    LIMIT 1
-                ) AS last_paid_ts,
-                (
-                    SELECT p.ref
-                    FROM payments_ledger p
-                    WHERE p.user_id = u.user_id AND p.status = 'paid'
-                    ORDER BY p.created_ts DESC
-                    LIMIT 1
-                ) AS last_payment_id
-            FROM users u
-            ORDER BY COALESCE(last_paid_ts, 0) DESC
-            LIMIT ?
-        """, (limit_n,))
-        rows = cur.fetchall()
+        # Preload last PAID payment per user (approval)
+        last_paid_map = {}
+        cur.execute("""
+            SELECT p.user_id, p.created_ts, p.ref
+            FROM payments_ledger p
+            JOIN (
+                SELECT user_id, MAX(created_ts) AS mx
+                FROM payments_ledger
+                WHERE status='paid'
+                GROUP BY user_id
+            ) t ON t.user_id = p.user_id AND t.mx = p.created_ts
+        """)
+        for r in cur.fetchall() or []:
+            last_paid_map[int(r["user_id"])] = (float(r["created_ts"] or 0.0), str(r["ref"] or ""))
 
-    if not rows:
+    if not users:
         await update.message.reply_text("No users found.")
         return
 
     lines = []
     lines.append(f"💳 Admin Payments (showing up to {limit_n} users)")
-    lines.append("User ID | Last Payment Approval (UTC) | Payment ID | Plan")
-    lines.append("────────────────────────────────────────────────────────")
+    lines.append("User ID | Last Payment Approval (UTC) | Payment ID | Plan (stored/effective)")
+    lines.append("────────────────────────────────────────────────────────────────────────")
 
-    for r in rows:
-        uid = int(r["user_id"])
-        plan = str(r["plan"] or "standard").strip()
-        ts = float(r["last_paid_ts"] or 0)
-        pay_id = str(r["last_payment_id"] or "").strip() or "-"
+    count = 0
+    for ur in users:
+        if count >= limit_n:
+            break
+        d = dict(ur)
+        uid = int(d.get("user_id") or 0)
+        stored_plan = str(d.get("plan") or "free").strip().lower()
+        eff_plan = str(effective_plan(uid, d)).strip().lower()
+
+        ts, pay_id = last_paid_map.get(uid, (0.0, ""))
         ts_txt = datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts else "n/a"
-        lines.append(f"{uid} | {ts_txt} | {pay_id} | {plan}")
+        pay_id = pay_id.strip() or "-"
+
+        lines.append(f"{uid} | {ts_txt} | {pay_id} | {stored_plan}/{eff_plan}")
+        count += 1
 
     await update.message.reply_text("\n".join(lines))
 
