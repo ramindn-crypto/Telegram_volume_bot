@@ -1960,6 +1960,17 @@ def db_init():
         note TEXT
     )
     """)
+
+    # Add new columns for best TP tracking (backward-compatible)
+    try:
+        cols = [r["name"] for r in cur.execute("PRAGMA table_info(signal_outcomes)").fetchall()]
+        if "best_level" not in cols:
+            cur.execute("ALTER TABLE signal_outcomes ADD COLUMN best_level TEXT")
+        if "best_ts" not in cols:
+            cur.execute("ALTER TABLE signal_outcomes ADD COLUMN best_ts REAL")
+    except Exception:
+        pass
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS email_state (
         user_id INTEGER PRIMARY KEY,
@@ -3244,23 +3255,48 @@ def db_get_outcome(setup_id: str) -> Optional[dict]:
     return dict(row) if row else None
 
 def db_upsert_outcome(setup_id: str, outcome: str, hit_level: str, hit_ts: Optional[float],
-                      horizon_hours: int, note: str = ""):
+                      horizon_hours: int, note: str = "", best_level: str = "", best_ts: Optional[float] = None):
     con = db_connect()
     cur = con.cursor()
-    cur.execute(
-        """INSERT OR REPLACE INTO signal_outcomes
-           (setup_id, outcome, hit_level, hit_ts, evaluated_ts, horizon_hours, note)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (
-            str(setup_id).strip(),
-            str(outcome),
-            str(hit_level or ""),
-            (float(hit_ts) if hit_ts is not None else None),
-            float(time.time()),
-            int(horizon_hours),
-            str(note or ""),
-        ),
-    )
+
+    # Backward compatible: if DB hasn't been migrated yet, insert only legacy columns.
+    try:
+        cols = [r["name"] for r in cur.execute("PRAGMA table_info(signal_outcomes)").fetchall()]
+    except Exception:
+        cols = []
+
+    if "best_level" in cols and "best_ts" in cols:
+        cur.execute(
+            """INSERT OR REPLACE INTO signal_outcomes
+               (setup_id, outcome, hit_level, hit_ts, evaluated_ts, horizon_hours, note, best_level, best_ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(setup_id).strip(),
+                str(outcome),
+                str(hit_level or ""),
+                (float(hit_ts) if hit_ts is not None else None),
+                float(time.time()),
+                int(horizon_hours),
+                str(note or ""),
+                str(best_level or ""),
+                (float(best_ts) if best_ts is not None else None),
+            ),
+        )
+    else:
+        cur.execute(
+            """INSERT OR REPLACE INTO signal_outcomes
+               (setup_id, outcome, hit_level, hit_ts, evaluated_ts, horizon_hours, note)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(setup_id).strip(),
+                str(outcome),
+                str(hit_level or ""),
+                (float(hit_ts) if hit_ts is not None else None),
+                float(time.time()),
+                int(horizon_hours),
+                str(note or ""),
+            ),
+        )
     con.commit()
     con.close()
 
@@ -3320,12 +3356,24 @@ def fetch_ohlcv_paged(symbol: str, timeframe: str, since_ms: int, until_ms: int,
     return out
 
 def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: str = "1m") -> dict:
-    """Evaluate whether TP/SL was touched first using OHLCV data (best effort).
+    """Evaluate TP/SL touches using OHLCV data (best effort).
+
+    IMPORTANT:
+    - We compute BOTH:
+        1) first_decision: earliest decisive touch (LOSS if SL before TP1, else TP1).
+        2) best_reached: highest TP level reached BEFORE SL (if SL happens after TP1, TP1 still counts).
+    - This solves the "always TP1" issue: trades often hit TP1 first, then TP2/TP3 later.
 
     Returns:
-      { outcome, hit_level, hit_ts, note }
+      {
+        outcome: one of WIN_TP1/WIN_TP2/WIN_TP3/LOSS/OPEN/AMBIGUOUS,
+        hit_level: SL/TP1/TP2/TP3/NONE/MIXED,
+        hit_ts: epoch seconds of the FIRST decisive touch,
+        best_level: NONE/TP1/TP2/TP3,
+        best_ts: epoch seconds of BEST TP touch (if any),
+        note: str
+      }
     """
-    setup_id = str(setup.get("setup_id") or "").strip()
     side = str(setup.get("side") or "").upper().strip()
     entry = float(setup.get("entry") or 0.0)
     sl = float(setup.get("sl") or 0.0)
@@ -3337,22 +3385,29 @@ def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: s
     t1, t2, t3 = _ensure_three_tps(entry, sl, tp3, tp1, tp2, side)
 
     created_ts = float(setup.get("created_ts") or 0.0)
-    # Prefer saved market_symbol if present
     market_symbol = str(setup.get("market_symbol") or "").strip() or _market_symbol_from_base(setup.get("symbol"))
     if not market_symbol:
-        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "note": "missing_market_symbol"}
-
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "missing_market_symbol"}
     if created_ts <= 0:
-        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "note": "missing_created_ts"}
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "missing_created_ts"}
 
     since_ms = int(created_ts * 1000)
     until_ms = int(min(time.time(), created_ts + horizon_hours * 3600) * 1000)
 
     candles = fetch_ohlcv_paged(market_symbol, timeframe, since_ms=since_ms, until_ms=until_ms, limit=1000)
     if not candles:
-        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "note": "no_ohlcv"}
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "no_ohlcv"}
 
-    # Traverse candle by candle in chronological order
+    # Find earliest touch times for each level
+    t_sl_ts = None
+    t_tp1_ts = None
+    t_tp2_ts = None
+    t_tp3_ts = None
+
+    # Also detect "mixed" candles where SL and TP are both within the same candle range.
+    # If the FIRST decisive candle is mixed, we return AMBIGUOUS.
+    mixed_first_ts = None
+
     for c in candles:
         try:
             ts_ms, o, h, l, cl, v = c
@@ -3361,42 +3416,101 @@ def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: s
         except Exception:
             continue
 
+        ts_s = ts_ms / 1000.0
+
         if side == "BUY":
             hit_sl = lo <= sl
-            hit_tp3 = hi >= t3
-            hit_tp2 = hi >= t2
-            hit_tp1 = hi >= t1
-
-            # If both SL and any TP in same candle -> ambiguous (can't know order)
-            if hit_sl and (hit_tp1 or hit_tp2 or hit_tp3):
-                return {"outcome": "AMBIGUOUS", "hit_level": "MIXED", "hit_ts": ts_ms / 1000.0, "note": "tp_and_sl_same_candle"}
-            if hit_sl:
-                return {"outcome": "LOSS", "hit_level": "SL", "hit_ts": ts_ms / 1000.0, "note": ""}
-            if hit_tp3:
-                return {"outcome": "WIN_TP3", "hit_level": "TP3", "hit_ts": ts_ms / 1000.0, "note": ""}
-            if hit_tp2:
-                return {"outcome": "WIN_TP2", "hit_level": "TP2", "hit_ts": ts_ms / 1000.0, "note": ""}
-            if hit_tp1:
-                return {"outcome": "WIN_TP1", "hit_level": "TP1", "hit_ts": ts_ms / 1000.0, "note": ""}
-
+            hit1 = hi >= t1
+            hit2 = hi >= t2
+            hit3 = hi >= t3
         else:  # SELL
             hit_sl = hi >= sl
-            hit_tp3 = lo <= t3
-            hit_tp2 = lo <= t2
-            hit_tp1 = lo <= t1
+            hit1 = lo <= t1
+            hit2 = lo <= t2
+            hit3 = lo <= t3
 
-            if hit_sl and (hit_tp1 or hit_tp2 or hit_tp3):
-                return {"outcome": "AMBIGUOUS", "hit_level": "MIXED", "hit_ts": ts_ms / 1000.0, "note": "tp_and_sl_same_candle"}
-            if hit_sl:
-                return {"outcome": "LOSS", "hit_level": "SL", "hit_ts": ts_ms / 1000.0, "note": ""}
-            if hit_tp3:
-                return {"outcome": "WIN_TP3", "hit_level": "TP3", "hit_ts": ts_ms / 1000.0, "note": ""}
-            if hit_tp2:
-                return {"outcome": "WIN_TP2", "hit_level": "TP2", "hit_ts": ts_ms / 1000.0, "note": ""}
-            if hit_tp1:
-                return {"outcome": "WIN_TP1", "hit_level": "TP1", "hit_ts": ts_ms / 1000.0, "note": ""}
+        # earliest SL
+        if hit_sl and t_sl_ts is None:
+            t_sl_ts = ts_s
 
-    return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "note": "horizon_not_hit"}
+        # earliest TPs
+        if hit1 and t_tp1_ts is None:
+            t_tp1_ts = ts_s
+        if hit2 and t_tp2_ts is None:
+            t_tp2_ts = ts_s
+        if hit3 and t_tp3_ts is None:
+            t_tp3_ts = ts_s
+
+        # record first mixed (SL + any TP in same candle)
+        if hit_sl and (hit1 or hit2 or hit3):
+            if mixed_first_ts is None:
+                mixed_first_ts = ts_s
+
+        # small optimization: if we've got all earliest times, stop scanning
+        if (t_sl_ts is not None) and (t_tp1_ts is not None) and (t_tp2_ts is not None) and (t_tp3_ts is not None):
+            break
+
+    # If nothing touched
+    if (t_sl_ts is None) and (t_tp1_ts is None) and (t_tp2_ts is None) and (t_tp3_ts is None):
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "horizon_not_hit"}
+
+    # Determine FIRST decisive touch:
+    # - LOSS if SL happens before TP1 (or TP1 never happens)
+    # - otherwise first decision is TP1 (even if TP2/TP3 also later)
+    # If the earliest decisive candle is "mixed", return AMBIGUOUS.
+    first_ts = None
+    first_level = None
+
+    if t_tp1_ts is None:
+        # no TP1 at all; if SL happened -> loss, else open
+        if t_sl_ts is not None:
+            first_ts, first_level = t_sl_ts, "SL"
+        else:
+            return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "no_tp1_and_no_sl"}
+    else:
+        # TP1 exists
+        if (t_sl_ts is not None) and (t_sl_ts < t_tp1_ts):
+            first_ts, first_level = t_sl_ts, "SL"
+        else:
+            first_ts, first_level = t_tp1_ts, "TP1"
+
+    # Mixed-candle ambiguity only matters if it coincides with the first decisive timestamp
+    if mixed_first_ts is not None and first_ts is not None:
+        # If the first decisive candle is mixed (timestamps equal), can't know which hit first
+        # Candles are 1m; treat within same minute as ambiguous.
+        if abs(mixed_first_ts - first_ts) < 0.9:
+            return {"outcome": "AMBIGUOUS", "hit_level": "MIXED", "hit_ts": first_ts, "best_level": "NONE", "best_ts": None, "note": "tp_and_sl_same_candle"}
+
+    # Determine BEST TP reached BEFORE SL (if SL never happened, use best TP reached within horizon)
+    best_level = "NONE"
+    best_ts = None
+
+    # Only count TPs that occur BEFORE SL (if SL exists). If SL occurs after TP1, TP1 still counts.
+    def _tp_ok(tp_ts):
+        if tp_ts is None:
+            return False
+        if t_sl_ts is None:
+            return True
+        return tp_ts < t_sl_ts  # reached before SL
+
+    if _tp_ok(t_tp3_ts):
+        best_level, best_ts = "TP3", t_tp3_ts
+    elif _tp_ok(t_tp2_ts):
+        best_level, best_ts = "TP2", t_tp2_ts
+    elif _tp_ok(t_tp1_ts):
+        best_level, best_ts = "TP1", t_tp1_ts
+
+    # Final outcome:
+    if first_level == "SL":
+        return {"outcome": "LOSS", "hit_level": "SL", "hit_ts": first_ts, "best_level": best_level, "best_ts": best_ts, "note": ""}
+    if best_level == "TP3":
+        return {"outcome": "WIN_TP3", "hit_level": "TP1", "hit_ts": first_ts, "best_level": "TP3", "best_ts": best_ts, "note": ""}
+    if best_level == "TP2":
+        return {"outcome": "WIN_TP2", "hit_level": "TP1", "hit_ts": first_ts, "best_level": "TP2", "best_ts": best_ts, "note": ""}
+    if best_level == "TP1":
+        return {"outcome": "WIN_TP1", "hit_level": "TP1", "hit_ts": first_ts, "best_level": "TP1", "best_ts": best_ts, "note": ""}
+    # If TP1 happened but SL later and TP1 wasn't before SL (shouldn't happen) -> open/edge
+    return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "edge_case"}
 
 def db_trade_open(user_id: int, symbol: str, side: str, entry: float, sl: float,
                   risk_usd: float, qty: float, note: str = "", signal_id: str = "") -> int:
@@ -8940,12 +9054,12 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sess = str(e.get("session") or "").strip() or "?"
             sig = db_get_signal(setup_id) or {}
             if not sig:
-                outcome = {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "note": "missing_signal_row"}
+                outcome = {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level":"NONE", "best_ts": None, "note": "missing_signal_row"}
             else:
                 # Use cached outcome if same horizon and evaluated recently (<10m)
                 oc = db_get_outcome(setup_id)
                 if oc and int(oc.get("horizon_hours") or 0) == int(lookback_h) and (time.time() - float(oc.get("evaluated_ts") or 0)) < 600:
-                    outcome = {"outcome": oc.get("outcome"), "hit_level": oc.get("hit_level"), "hit_ts": oc.get("hit_ts"), "note": oc.get("note") or ""}
+                    outcome = {"outcome": oc.get("outcome"), "hit_level": oc.get("hit_level"), "hit_ts": oc.get("hit_ts"), "best_level": oc.get("best_level") or "NONE", "best_ts": oc.get("best_ts"), "note": oc.get("note") or ""}
                 else:
                     outcome = evaluate_signal_hit_order(sig, horizon_hours=lookback_h, timeframe="1m")
                     try:
@@ -8956,6 +9070,8 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             hit_ts=outcome.get("hit_ts"),
                             horizon_hours=lookback_h,
                             note=str(outcome.get("note") or ""),
+                            best_level=str(outcome.get("best_level") or ""),
+                            best_ts=outcome.get("best_ts"),
                         )
                     except Exception:
                         pass
@@ -8976,20 +9092,26 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            hit_str = "-"
+            first_str = "-"
             try:
                 ht = outcome.get("hit_ts")
                 if ht:
-                    hit_str = datetime.fromtimestamp(float(ht), tz).strftime("%m-%d %H:%M")
+                    first_str = datetime.fromtimestamp(float(ht), tz).strftime("%m-%d %H:%M")
+            except Exception:
+                pass
+
+            best_str = "-"
+            try:
+                bt = outcome.get("best_ts")
+                if bt:
+                    best_str = datetime.fromtimestamp(float(bt), tz).strftime("%m-%d %H:%M")
             except Exception:
                 pass
 
             sym = str(sig.get("symbol") or "?")
             side = str(sig.get("side") or "?")
             conf = sig.get("conf")
-            entry = sig.get("entry")
-            sl = sig.get("sl")
-            tp3 = sig.get("tp3")
+
             rows.append([
                 setup_id,
                 sess,
@@ -8998,7 +9120,9 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conf if conf is not None else "-",
                 out,
                 str(outcome.get("hit_level") or "-"),
-                hit_str,
+                first_str,
+                str(outcome.get("best_level") or "-"),
+                best_str,
             ])
         return rows, counts, by_session
 
@@ -9021,9 +9145,9 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Table (compact)
     table = tabulate(
         rows,
-        headers=["SetupID", "Sess", "At", "Trade", "Conf", "Outcome", "Hit", "HitAt"],
+        headers=["SetupID","Sess","At","Trade","Conf","Outcome","First","FirstAt","Best","BestAt"],
         tablefmt="plain",
-        colalign=("left","left","left","left","right","left","left","left")
+        colalign=("left","left","left","left","right","left","left","left","left","left")
     )
 
     # Session breakdown
