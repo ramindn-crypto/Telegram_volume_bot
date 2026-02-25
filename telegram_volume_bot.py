@@ -6506,6 +6506,15 @@ Website: https://pulsefutures.com/
 
 
 ────────────────────
+📊 SIGNAL REPORTING
+────────────────────
+/signal_report [hours]
+• Evaluate emailed setups for the requesting user in the last N hours (default 24)
+• Uses Bybit 1m OHLCV to detect which level hit first: TP1/TP2/TP3/SL
+• Outputs a table + win rates by session
+• Outcomes: WIN_TP1, WIN_TP2, WIN_TP3, LOSS, OPEN, AMBIGUOUS
+
+────────────────────
 🆘 SUPPORT
 ────────────────────
 /support_open
