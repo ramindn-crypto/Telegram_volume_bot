@@ -1926,6 +1926,40 @@ def db_init():
     )
     """)
 
+    # =========================================================
+    # ✅ Signal evaluation tables (emailed setups + outcomes)
+    # =========================================================
+
+    # Ensure signals table has market_symbol (migration-safe)
+    try:
+        cur.execute("PRAGMA table_info(signals)")
+        s_cols = {r[1] for r in cur.fetchall()}
+        if "market_symbol" not in s_cols:
+            cur.execute("ALTER TABLE signals ADD COLUMN market_symbol TEXT")
+    except Exception:
+        pass
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS emailed_setups (
+        user_id INTEGER NOT NULL,
+        setup_id TEXT NOT NULL,
+        session TEXT NOT NULL DEFAULT '',
+        emailed_ts REAL NOT NULL,
+        PRIMARY KEY (user_id, setup_id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS signal_outcomes (
+        setup_id TEXT PRIMARY KEY,
+        outcome TEXT NOT NULL,              -- WIN_TP1 | WIN_TP2 | WIN_TP3 | LOSS | OPEN | AMBIGUOUS
+        hit_level TEXT,                     -- TP1 | TP2 | TP3 | SL | NONE
+        hit_ts REAL,                        -- UTC epoch seconds of first touch (best effort)
+        evaluated_ts REAL NOT NULL,          -- UTC epoch seconds
+        horizon_hours INTEGER NOT NULL DEFAULT 24,
+        note TEXT
+    )
+    """)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS email_state (
         user_id INTEGER PRIMARY KEY,
@@ -3127,17 +3161,31 @@ def _risk_used_total_today(user_id: int, user: dict) -> float:
 
 
 def db_insert_signal(s: Setup):
+    """Upsert a setup into DB (signals table). Adds market_symbol when available."""
     con = db_connect()
     cur = con.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO signals (
-            setup_id, created_ts, symbol, side, conf, entry, sl, tp1, tp2, tp3,
-            fut_vol_usd, ch24, ch4, ch1, ch15
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        s.setup_id, s.created_ts, s.symbol, s.side, s.conf, s.entry, s.sl,
-        s.tp1, s.tp2, s.tp3, s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
-    ))
+    try:
+        cur.execute("""
+            INSERT OR REPLACE INTO signals (
+                setup_id, created_ts, symbol, market_symbol, side, conf, entry, sl, tp1, tp2, tp3,
+                fut_vol_usd, ch24, ch4, ch1, ch15
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            s.setup_id, s.created_ts, s.symbol, getattr(s, "market_symbol", None),
+            s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
+            s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+        ))
+    except Exception:
+        # Backward-compatible (older DB without market_symbol column)
+        cur.execute("""
+            INSERT OR REPLACE INTO signals (
+                setup_id, created_ts, symbol, side, conf, entry, sl, tp1, tp2, tp3,
+                fut_vol_usd, ch24, ch4, ch1, ch15
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            s.setup_id, s.created_ts, s.symbol, s.side, s.conf, s.entry, s.sl,
+            s.tp1, s.tp2, s.tp3, s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+        ))
     con.commit()
     con.close()
 
@@ -3156,6 +3204,199 @@ def db_list_signals_since(ts_from: float) -> List[dict]:
     rows = cur.fetchall()
     con.close()
     return [dict(r) for r in rows]
+
+
+# =========================================================
+# SIGNAL EVALUATION (EMAIL -> OUTCOME TABLE)
+# =========================================================
+
+def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts: float):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """INSERT OR REPLACE INTO emailed_setups (user_id, setup_id, session, emailed_ts)
+           VALUES (?, ?, ?, ?)""",
+        (int(user_id), str(setup_id).strip(), str(session or ""), float(emailed_ts)),
+    )
+    con.commit()
+    con.close()
+
+def db_list_emailed_setups(user_id: int, ts_from: float) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """SELECT setup_id, session, emailed_ts
+           FROM emailed_setups
+           WHERE user_id=? AND emailed_ts>=?
+           ORDER BY emailed_ts ASC""",
+        (int(user_id), float(ts_from)),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+def db_get_outcome(setup_id: str) -> Optional[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM signal_outcomes WHERE setup_id=?", (str(setup_id).strip(),))
+    row = cur.fetchone()
+    con.close()
+    return dict(row) if row else None
+
+def db_upsert_outcome(setup_id: str, outcome: str, hit_level: str, hit_ts: Optional[float],
+                      horizon_hours: int, note: str = ""):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """INSERT OR REPLACE INTO signal_outcomes
+           (setup_id, outcome, hit_level, hit_ts, evaluated_ts, horizon_hours, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            str(setup_id).strip(),
+            str(outcome),
+            str(hit_level or ""),
+            (float(hit_ts) if hit_ts is not None else None),
+            float(time.time()),
+            int(horizon_hours),
+            str(note or ""),
+        ),
+    )
+    con.commit()
+    con.close()
+
+def _market_symbol_from_base(base: str) -> Optional[str]:
+    """Best-effort mapping base -> ccxt market symbol used by the bot (swap)."""
+    try:
+        b = str(base or "").upper().strip()
+        if not b:
+            return None
+        ex = get_exchange()
+        # Prefer Bybit linear swap format in ccxt, e.g. BTC/USDT:USDT
+        for cand in (f"{b}/USDT:USDT", f"{b}/USDT"):
+            if cand in getattr(ex, "markets", {}):
+                return cand
+        # Fallback: find any market whose base matches + quote USDT
+        for sym, m in (getattr(ex, "markets", {}) or {}).items():
+            try:
+                if str(m.get("base", "")).upper() == b and str(m.get("quote", "")).upper() == "USDT":
+                    return sym
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+def fetch_ohlcv_paged(symbol: str, timeframe: str, since_ms: int, until_ms: int, limit: int = 1000) -> List[List[float]]:
+    """Fetch OHLCV with pagination (best effort). Returns candles in ascending time."""
+    ex = get_exchange()
+    out: List[List[float]] = []
+    cur_since = int(since_ms)
+    # Safety limits
+    max_loops = 40
+    for _ in range(max_loops):
+        try:
+            chunk = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=cur_since, limit=limit) or []
+        except Exception:
+            break
+        if not chunk:
+            break
+        # ensure ascending
+        chunk = sorted(chunk, key=lambda r: r[0])
+        # stop if stuck
+        if out and chunk[0][0] <= out[-1][0] and len(chunk) == 1:
+            break
+        # append new only
+        for c in chunk:
+            if not out or c[0] > out[-1][0]:
+                out.append(c)
+        last_ts = out[-1][0]
+        if last_ts >= until_ms:
+            break
+        # advance since by 1 ms to avoid duplicates
+        cur_since = int(last_ts + 1)
+        # If chunk is tiny, likely end
+        if len(chunk) < max(10, int(limit * 0.2)):
+            break
+    return out
+
+def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: str = "1m") -> dict:
+    """Evaluate whether TP/SL was touched first using OHLCV data (best effort).
+
+    Returns:
+      { outcome, hit_level, hit_ts, note }
+    """
+    setup_id = str(setup.get("setup_id") or "").strip()
+    side = str(setup.get("side") or "").upper().strip()
+    entry = float(setup.get("entry") or 0.0)
+    sl = float(setup.get("sl") or 0.0)
+    tp1 = setup.get("tp1")
+    tp2 = setup.get("tp2")
+    tp3 = float(setup.get("tp3") or 0.0)
+
+    # Ensure TP1/TP2 exist (derive if missing)
+    t1, t2, t3 = _ensure_three_tps(entry, sl, tp3, tp1, tp2, side)
+
+    created_ts = float(setup.get("created_ts") or 0.0)
+    # Prefer saved market_symbol if present
+    market_symbol = str(setup.get("market_symbol") or "").strip() or _market_symbol_from_base(setup.get("symbol"))
+    if not market_symbol:
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "note": "missing_market_symbol"}
+
+    if created_ts <= 0:
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "note": "missing_created_ts"}
+
+    since_ms = int(created_ts * 1000)
+    until_ms = int(min(time.time(), created_ts + horizon_hours * 3600) * 1000)
+
+    candles = fetch_ohlcv_paged(market_symbol, timeframe, since_ms=since_ms, until_ms=until_ms, limit=1000)
+    if not candles:
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "note": "no_ohlcv"}
+
+    # Traverse candle by candle in chronological order
+    for c in candles:
+        try:
+            ts_ms, o, h, l, cl, v = c
+            hi = float(h)
+            lo = float(l)
+        except Exception:
+            continue
+
+        if side == "BUY":
+            hit_sl = lo <= sl
+            hit_tp3 = hi >= t3
+            hit_tp2 = hi >= t2
+            hit_tp1 = hi >= t1
+
+            # If both SL and any TP in same candle -> ambiguous (can't know order)
+            if hit_sl and (hit_tp1 or hit_tp2 or hit_tp3):
+                return {"outcome": "AMBIGUOUS", "hit_level": "MIXED", "hit_ts": ts_ms / 1000.0, "note": "tp_and_sl_same_candle"}
+            if hit_sl:
+                return {"outcome": "LOSS", "hit_level": "SL", "hit_ts": ts_ms / 1000.0, "note": ""}
+            if hit_tp3:
+                return {"outcome": "WIN_TP3", "hit_level": "TP3", "hit_ts": ts_ms / 1000.0, "note": ""}
+            if hit_tp2:
+                return {"outcome": "WIN_TP2", "hit_level": "TP2", "hit_ts": ts_ms / 1000.0, "note": ""}
+            if hit_tp1:
+                return {"outcome": "WIN_TP1", "hit_level": "TP1", "hit_ts": ts_ms / 1000.0, "note": ""}
+
+        else:  # SELL
+            hit_sl = hi >= sl
+            hit_tp3 = lo <= t3
+            hit_tp2 = lo <= t2
+            hit_tp1 = lo <= t1
+
+            if hit_sl and (hit_tp1 or hit_tp2 or hit_tp3):
+                return {"outcome": "AMBIGUOUS", "hit_level": "MIXED", "hit_ts": ts_ms / 1000.0, "note": "tp_and_sl_same_candle"}
+            if hit_sl:
+                return {"outcome": "LOSS", "hit_level": "SL", "hit_ts": ts_ms / 1000.0, "note": ""}
+            if hit_tp3:
+                return {"outcome": "WIN_TP3", "hit_level": "TP3", "hit_ts": ts_ms / 1000.0, "note": ""}
+            if hit_tp2:
+                return {"outcome": "WIN_TP2", "hit_level": "TP2", "hit_ts": ts_ms / 1000.0, "note": ""}
+            if hit_tp1:
+                return {"outcome": "WIN_TP1", "hit_level": "TP1", "hit_ts": ts_ms / 1000.0, "note": ""}
+
+    return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "note": "horizon_not_hit"}
 
 def db_trade_open(user_id: int, symbol: str, side: str, entry: float, sl: float,
                   risk_usd: float, qty: float, note: str = "", signal_id: str = "") -> int:
@@ -8584,6 +8825,143 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
             break
     return setups
 
+async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/signal_report [hours]
+    Builds a table for emailed setups in the last N hours and evaluates TP/SL hit-order using Bybit OHLCV.
+    Uses whatever the bot already uses for scanning (market_symbol).
+    """
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+
+    # Default lookback: 24h
+    lookback_h = 24
+    try:
+        if context.args and str(context.args[0]).strip():
+            lookback_h = int(float(context.args[0]))
+    except Exception:
+        lookback_h = 24
+    lookback_h = int(clamp(lookback_h, 1, 168))  # 1h..7d
+
+    await update.message.reply_text(f"📊 Signal Report\n{HDR}\nScanning emailed setups for last {lookback_h}h…")
+
+    ts_from = time.time() - lookback_h * 3600.0
+    emailed = db_list_emailed_setups(uid, ts_from)
+
+    if not emailed:
+        await update.message.reply_text(
+            f"No emailed setups found in the last {lookback_h}h."
+        )
+        return
+
+    # Evaluate (heavy)
+    def _eval_all():
+        rows = []
+        counts = Counter()
+        by_session = defaultdict(lambda: Counter())
+        for e in emailed:
+            setup_id = str(e.get("setup_id") or "").strip()
+            sess = str(e.get("session") or "").strip() or "?"
+            sig = db_get_signal(setup_id) or {}
+            if not sig:
+                outcome = {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "note": "missing_signal_row"}
+            else:
+                # Use cached outcome if same horizon and evaluated recently (<10m)
+                oc = db_get_outcome(setup_id)
+                if oc and int(oc.get("horizon_hours") or 0) == int(lookback_h) and (time.time() - float(oc.get("evaluated_ts") or 0)) < 600:
+                    outcome = {"outcome": oc.get("outcome"), "hit_level": oc.get("hit_level"), "hit_ts": oc.get("hit_ts"), "note": oc.get("note") or ""}
+                else:
+                    outcome = evaluate_signal_hit_order(sig, horizon_hours=lookback_h, timeframe="1m")
+                    try:
+                        db_upsert_outcome(
+                            setup_id=setup_id,
+                            outcome=str(outcome.get("outcome")),
+                            hit_level=str(outcome.get("hit_level")),
+                            hit_ts=outcome.get("hit_ts"),
+                            horizon_hours=lookback_h,
+                            note=str(outcome.get("note") or ""),
+                        )
+                    except Exception:
+                        pass
+
+            out = str(outcome.get("outcome") or "OPEN")
+            counts[out] += 1
+            by_session[sess][out] += 1
+
+            created_ts = float(sig.get("created_ts") or 0.0)
+            created_str = "-"
+            try:
+                tz = ZoneInfo(str(user.get("tz") or "UTC"))
+            except Exception:
+                tz = timezone.utc
+            try:
+                if created_ts > 0:
+                    created_str = datetime.fromtimestamp(created_ts, tz).strftime("%m-%d %H:%M")
+            except Exception:
+                pass
+
+            hit_str = "-"
+            try:
+                ht = outcome.get("hit_ts")
+                if ht:
+                    hit_str = datetime.fromtimestamp(float(ht), tz).strftime("%m-%d %H:%M")
+            except Exception:
+                pass
+
+            sym = str(sig.get("symbol") or "?")
+            side = str(sig.get("side") or "?")
+            conf = sig.get("conf")
+            entry = sig.get("entry")
+            sl = sig.get("sl")
+            tp3 = sig.get("tp3")
+            rows.append([
+                setup_id,
+                sess,
+                created_str,
+                f"{side} {sym}",
+                conf if conf is not None else "-",
+                out,
+                str(outcome.get("hit_level") or "-"),
+                hit_str,
+            ])
+        return rows, counts, by_session
+
+    rows, counts, by_session = await to_thread_heavy(_eval_all, timeout=120)
+
+    # Build summary
+    wins = int(counts.get("WIN_TP1", 0) + counts.get("WIN_TP2", 0) + counts.get("WIN_TP3", 0))
+    losses = int(counts.get("LOSS", 0))
+    decided = wins + losses
+    win_rate = (wins / decided * 100.0) if decided > 0 else 0.0
+
+    header = [
+        f"📊 Signal Report (last {lookback_h}h)",
+        HDR,
+        f"Total: {len(rows)} | Decided: {decided} | Wins: {wins} | Losses: {losses} | Win rate: {win_rate:.1f}%",
+        f"TP1: {counts.get('WIN_TP1',0)} | TP2: {counts.get('WIN_TP2',0)} | TP3: {counts.get('WIN_TP3',0)} | Open: {counts.get('OPEN',0)} | Amb: {counts.get('AMBIGUOUS',0)}",
+        HDR,
+    ]
+
+    # Table (compact)
+    table = tabulate(
+        rows,
+        headers=["SetupID", "Sess", "At", "Trade", "Conf", "Outcome", "Hit", "HitAt"],
+        tablefmt="plain",
+        colalign=("left","left","left","left","right","left","left","left")
+    )
+
+    # Session breakdown
+    sess_lines = ["Session breakdown:"]
+    for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
+        sw = int(c.get("WIN_TP1",0)+c.get("WIN_TP2",0)+c.get("WIN_TP3",0))
+        sl = int(c.get("LOSS",0))
+        sd = sw+sl
+        s_wr = (sw/sd*100.0) if sd>0 else 0.0
+        sess_lines.append(f"• {sname}: total {sum(c.values())} | decided {sd} | WR {s_wr:.1f}% | TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)} AMB {c.get('AMBIGUOUS',0)}")
+
+    msg = "\n".join(header) + "```\n" + table + "\n```\n" + "\n".join(sess_lines)
+    await send_long_message(update, msg, parse_mode=ParseMode.MARKDOWN)
+
+
 async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
     """
     mode: "screen" or "email"
@@ -9988,7 +10366,24 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
         best_fut=best_fut,
     )
 
-    return send_email(subject, body, user_id_for_debug=uid, body_html=body_html)
+    sent = send_email(subject, body, user_id_for_debug=uid, body_html=body_html)
+    if sent:
+        try:
+            now_ts = time.time()
+            for s in setups:
+                # Ensure the setup exists in signals table
+                try:
+                    db_insert_signal(s)
+                except Exception:
+                    pass
+                # Record that this setup was emailed to this user
+                try:
+                    db_mark_emailed_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return sent
 
 
 
@@ -11722,6 +12117,7 @@ def main():
     app.add_handler(CommandHandler("report_weekly", report_weekly_cmd, block=False))
     app.add_handler(CommandHandler("signals_daily", signals_daily_cmd, block=False))
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd, block=False))
+    app.add_handler(CommandHandler("signal_report", signal_report_cmd, block=False))
     app.add_handler(CommandHandler("health", health_cmd, block=False))
     app.add_handler(CommandHandler("reset", reset_cmd, block=False))
     app.add_handler(CommandHandler("restore", restore_cmd, block=False))
