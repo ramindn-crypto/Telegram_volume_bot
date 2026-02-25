@@ -3246,6 +3246,39 @@ def db_list_emailed_setups(user_id: int, ts_from: float) -> List[dict]:
     con.close()
     return [dict(r) for r in rows]
 
+
+def db_list_emailed_setups_all(user_id: int) -> List[dict]:
+    """All emailed setups for a user (no time filter)."""
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """SELECT setup_id, session, emailed_ts
+           FROM emailed_setups
+           WHERE user_id=?
+           ORDER BY emailed_ts ASC""",
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+def db_list_outcomes_for_user(user_id: int) -> List[dict]:
+    """Join emailed_setups -> signal_outcomes for a user. Only setups that have an outcome row."""
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """SELECT e.setup_id, e.session, e.emailed_ts,
+                  o.outcome, o.hit_level, o.hit_ts, o.best_level, o.best_ts, o.horizon_hours, o.evaluated_ts, o.note
+           FROM emailed_setups e
+           JOIN signal_outcomes o ON o.setup_id = e.setup_id
+           WHERE e.user_id=?
+           ORDER BY e.emailed_ts ASC""",
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
 def db_get_outcome(setup_id: str) -> Optional[dict]:
     con = db_connect()
     cur = con.cursor()
@@ -6628,6 +6661,13 @@ Website: https://pulsefutures.com/
 • Outputs a table + win rates by session
 • Outcomes: WIN_TP1, WIN_TP2, WIN_TP3, LOSS, OPEN, AMBIGUOUS
 
+/signal_report_overall
+• Overall performance summary across ALL emailed setups (short output: totals + win-rate)
+• Uses stored evaluated outcomes; shows coverage %
+
+/signal_report_all
+• Alias for /signal_report_overall
+
 ────────────────────
 🆘 SUPPORT
 ────────────────────
@@ -9162,6 +9202,76 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "\n".join(header) + "```\n" + table + "\n```\n" + "\n".join(sess_lines)
     await send_long_message(update, msg, parse_mode=ParseMode.MARKDOWN)
 
+
+
+
+async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/signal_report_overall
+    Overall performance summary across ALL emailed setups for this user.
+    Does NOT print per-symbol rows (keeps output short).
+
+    Notes:
+    - Uses stored outcomes in `signal_outcomes` (i.e., setups that have been evaluated at least once via /signal_report).
+    - Shows coverage so stats are honest even if not all historical setups were evaluated yet.
+    """
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+
+    # Load totals
+    all_emailed = db_list_emailed_setups_all(uid)
+    total = len(all_emailed)
+    if total == 0:
+        await update.message.reply_text("No emailed setups found yet for your account.")
+        return
+
+    outcomes = db_list_outcomes_for_user(uid)  # only evaluated ones
+    evaluated = len(outcomes)
+
+    counts = Counter()
+    by_session = defaultdict(lambda: Counter())
+
+    for r in outcomes:
+        out = str(r.get("outcome") or "OPEN")
+        sess = str(r.get("session") or "").strip() or "?"
+        counts[out] += 1
+        by_session[sess][out] += 1
+
+    wins = int(counts.get("WIN_TP1", 0) + counts.get("WIN_TP2", 0) + counts.get("WIN_TP3", 0))
+    losses = int(counts.get("LOSS", 0))
+    decided = wins + losses
+    win_rate = (wins / decided * 100.0) if decided > 0 else 0.0
+
+    coverage = (evaluated / total * 100.0) if total > 0 else 0.0
+
+    lines = [
+        "📈 Signal Report (overall)",
+        HDR,
+        f"Total emailed setups: {total}",
+        f"Evaluated (have outcome): {evaluated} ({coverage:.1f}% coverage)",
+        HDR,
+        f"Decided: {decided} | Wins: {wins} | Losses: {losses} | Win rate: {win_rate:.1f}%",
+        f"TP1: {counts.get('WIN_TP1',0)} | TP2: {counts.get('WIN_TP2',0)} | TP3: {counts.get('WIN_TP3',0)} | Open: {counts.get('OPEN',0)} | Amb: {counts.get('AMBIGUOUS',0)}",
+        HDR,
+        "Session breakdown (evaluated only):"
+    ]
+
+    for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
+        sw = int(c.get("WIN_TP1",0)+c.get("WIN_TP2",0)+c.get("WIN_TP3",0))
+        sl = int(c.get("LOSS",0))
+        sd = sw + sl
+        s_wr = (sw/sd*100.0) if sd > 0 else 0.0
+        lines.append(
+            f"• {sname}: eval {sum(c.values())} | decided {sd} | WR {s_wr:.1f}% | "
+            f"TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} "
+            f"SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)} AMB {c.get('AMBIGUOUS',0)}"
+        )
+
+    # Tip for user if coverage is low
+    if evaluated < total:
+        lines.append("")
+        lines.append("Tip: Run `/signal_report 168` occasionally to evaluate older setups and increase coverage.")
+
+    await send_long_message(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
     """
@@ -12368,6 +12478,8 @@ def main():
     app.add_handler(CommandHandler("signals_daily", signals_daily_cmd, block=False))
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd, block=False))
     app.add_handler(CommandHandler("signal_report", signal_report_cmd, block=False))
+    app.add_handler(CommandHandler("signal_report_overall", signal_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("signal_report_all", signal_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("health", health_cmd, block=False))
     app.add_handler(CommandHandler("reset", reset_cmd, block=False))
     app.add_handler(CommandHandler("restore", restore_cmd, block=False))
