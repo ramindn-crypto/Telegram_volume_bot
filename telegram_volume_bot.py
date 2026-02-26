@@ -202,6 +202,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 FREE_TRIAL_DAYS = 7
 
+TRIAL_DAYS = 7  # used by ensure_trial_started()
 VALID_LICENSE_PREFIX = {
     "PF-STD": "standard",
     "PF-PRO": "pro",
@@ -352,6 +353,10 @@ REQUIRED_CHANNEL_JOIN_URL = os.getenv("REQUIRED_CHANNEL_JOIN_URL", "").strip()  
 REQUIRED_CHANNEL_DISPLAY = os.getenv("REQUIRED_CHANNEL_DISPLAY", "@PulseFutures").strip() or "@PulseFutures"
 REQUIRED_CHANNEL_PUBLIC_URL = os.getenv("REQUIRED_CHANNEL_PUBLIC_URL", "https://t.me/PulseFutures").strip() or "https://t.me/PulseFutures"
 
+# If set (1/true/yes/on), users MUST join the channel to use the bot.
+# Default is OFF: the channel is promotional only and will be suggested in messages, not enforced.
+ENFORCE_REQUIRED_CHANNEL = os.getenv("ENFORCE_REQUIRED_CHANNEL", "0").strip().lower() in ("1", "true", "yes", "on")
+
 # Cache channel membership checks to keep commands instant (Telegram API calls can be slow / rate-limited)
 _SUB_CACHE = {}  # user_id -> (ok: bool, ts: int)
 SUB_CACHE_TTL_SEC = int(os.getenv("SUB_CACHE_TTL_SEC", "1800"))
@@ -499,7 +504,7 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         FORCE_FRESH = {"screen"}
 
         # 0) Channel subscription gate (optional)
-        if REQUIRED_CHANNEL:
+        if ENFORCE_REQUIRED_CHANNEL and REQUIRED_CHANNEL:
             ok = await _is_user_subscribed(context.bot, int(update.effective_user.id))
             if not ok:
                 # Keep same behavior as your original code
@@ -7083,12 +7088,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_active_access(uid, user):
         try:
             await update.message.reply_text(
-                "⛔️ Access locked.\n\n"
-                "Your 7-day free trial has ended.\n\n"
-                "To continue, choose a plan:\n"
-                "• Standard — $49/month\n"
-                "• Pro — $99/month\n\n"
-                "👉 /billing"
+                f"⛔️ Access locked.\n\n"
+                f"Your 7-day free trial has ended.\n\n"
+                f"To continue, choose a plan:\n"
+                f"• Standard — $49/month\n"
+                f"• Pro — $99/month\n\n"
+                f"👉 /billing\n\n"
+                f"📣 Optional updates: {REQUIRED_CHANNEL_PUBLIC_URL}"
             )
         except Exception:
             pass
@@ -12367,6 +12373,17 @@ async def admin_revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = int(context.args[0])
     _set_user_access(uid, "free", "manual", "revoked")
+    # HARDEN: prevent revoked users from restarting a new trial later (even if admin_grant reset trial_start_ts)
+    try:
+        u = get_user(uid) or {}
+        ts_start = float(u.get("trial_start_ts") or 0.0)
+        if ts_start <= 0:
+            update_user(uid, trial_start_ts=_now_ts(), trial_until=0.0)
+        else:
+            update_user(uid, trial_until=0.0)
+    except Exception:
+        pass
+
     await update.message.reply_text(f"✅ Access revoked. User {uid} set to FREE.")
 
 async def admin_payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
