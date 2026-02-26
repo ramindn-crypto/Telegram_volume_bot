@@ -6733,6 +6733,37 @@ def _r_multiple(side: str, entry: float, sl: float, tp: float) -> float | None:
 # BILLING COMMANDS (Stripe Payment Links + USDT)
 # =========================================================
 
+
+def _realized_r_option_b(outcome: str, side: str, entry: float, sl: float, tp1, tp2, tp3):
+    """Option B scale-out 40/40/20 realized R.
+    LOSS = -1R.
+    WIN_TP1: 0.4*R1 (conservative: remaining exits at 0R)
+    WIN_TP2: 0.4*R1 + 0.6*R2 (remaining 20% exits at TP2)
+    WIN_TP3: 0.4*R1 + 0.4*R2 + 0.2*R3
+    """
+    out = (outcome or "").strip().upper()
+    side_u = (side or "").strip().upper()
+    if out == "LOSS":
+        return -1.0
+    if out not in ("WIN_TP1", "WIN_TP2", "WIN_TP3"):
+        return None
+
+    r1 = _r_multiple(side_u, entry, sl, tp1) if tp1 is not None else None
+    r2 = _r_multiple(side_u, entry, sl, tp2) if tp2 is not None else None
+    r3 = _r_multiple(side_u, entry, sl, tp3) if tp3 is not None else None
+
+    if out == "WIN_TP1":
+        return 0.4 * r1 if r1 is not None else None
+    if out == "WIN_TP2":
+        if r1 is None or r2 is None:
+            return None
+        return 0.4 * r1 + 0.6 * r2
+    if out == "WIN_TP3":
+        if r1 is None or r2 is None or r3 is None:
+            return None
+        return 0.4 * r1 + 0.4 * r2 + 0.2 * r3
+    return None
+
 def _env(key: str, default: str = "") -> str:
     v = os.getenv(key)
     return (v or default).strip()
