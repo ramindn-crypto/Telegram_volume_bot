@@ -4349,7 +4349,7 @@ def tv_chart_url(symbol_base: str) -> str:
     return f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol_base.upper()}USDT.P"
 
 def table_md(rows: List[List[Any]], headers: List[str]) -> str:
-    return "```\n" + tabulate(rows, headers=headers, tablefmt="github") + "\n```"
+    return "\n" + tabulate(rows, headers=headers, tablefmt="github") + "\n"
 
 # Email-specific price formatting (less noisy)
 def fmt_price(x: float) -> str:
@@ -9287,7 +9287,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s_wr = (sw/sd*100.0) if sd>0 else 0.0
         sess_lines.append(f"• {sname}: total {sum(c.values())} | decided {sd} | WR {s_wr:.1f}% | TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)} AMB {c.get('AMBIGUOUS',0)}")
 
-    msg = "\n".join(header) + "```\n" + table + "\n```\n" + "\n".join(sess_lines)
+    msg = "\n".join(header) + "\n" + table + "\n\n" + "\n".join(sess_lines)
     await send_long_message(update, msg, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -9391,23 +9391,20 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
     pf_disp = (f"{profit_factor:.2f}" if profit_factor is not None else "INF")
     lines.append(f"Avg R/trade (decided): *{avg_r:.2f}R* | Avg R/win: *{avg_r_win:.2f}R* | Profit Factor: *{pf_disp}*")
     lines.append(HDR)
-    # Compact session table (monospace)
+    
+    # Session breakdown (clean formatted)
     lines.append("*Session breakdown (evaluated only):*")
-    header = f"{'SESS':<6} {'EVAL':>4} {'DEC':>4} {'WR%':>6} {'TP1':>4} {'TP2':>4} {'TP3':>4} {'SL':>3} {'OPN':>4}" + (f" {'AMB':>3}" if any(int(c.get('AMBIGUOUS',0)) for c in by_session.values()) else "")
-    rows = [header]
-    show_amb = any(int(c.get("AMBIGUOUS",0)) for c in by_session.values())
     for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
         sw = int(c.get("WIN_TP1",0)+c.get("WIN_TP2",0)+c.get("WIN_TP3",0))
         slc = int(c.get("LOSS",0))
         sd = sw + slc
         s_wr = (sw/sd*100.0) if sd > 0 else 0.0
-        line = f"{sname:<6} {sum(c.values()):>4} {sd:>4} {s_wr:>5.1f}  {c.get('WIN_TP1',0):>4} {c.get('WIN_TP2',0):>4} {c.get('WIN_TP3',0):>4} {c.get('LOSS',0):>3} {c.get('OPEN',0):>4}"
-        if show_amb:
-            line += f" {int(c.get('AMBIGUOUS',0)):>3}"
-        rows.append(line)
-    lines.append("```\n" + "
-".join(rows) + "
-```")
+        lines.append(
+            f"• {sname}: eval {sum(c.values())} | decided {sd} | WR {s_wr:.1f}% | "
+            f"TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} "
+            f"SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)}"
+        )
+    
 
     if evaluated < total:
         lines.append("Tip: Run `/signal_report 168` occasionally to evaluate older setups and increase coverage.")
