@@ -12762,3 +12762,13 @@ async def admin_reset_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # Register handler
 application.add_handler(CommandHandler("admin_reset_report", admin_reset_report))
+
+
+
+# ===============================
+# Add new command to ADMIN HELP
+# ===============================
+try:
+    ADMIN_HELP += "\n/admin_reset_report - Archive signals and reset performance report"
+except:
+    pass
