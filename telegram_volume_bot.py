@@ -9231,72 +9231,64 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/signal_report_overall
-    Overall performance summary across ALL emailed setups for this user.
-    Keeps output short (no per-symbol rows).
 
-    Metrics (decided trades only):
-    - Win rate
-    - TP1/TP2/TP3/SL/Open/Amb counts
-    - Avg R/trade and Profit Factor (based on TP level outcome and -1R losses)
+async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/signal_report_overall — Overall performance summary (Option B scaling).
+    Uses signals table (setup_id) for entry/SL/TPs to compute:
+      - Avg R/trade (decided)
+      - Avg R/win
+      - Profit Factor
     """
     uid = update.effective_user.id
-    user = get_user(uid) or {}
 
-    # Load totals
     all_emailed = db_list_emailed_setups_all(uid)
     total = len(all_emailed)
     if total == 0:
         await update.message.reply_text("No emailed setups found yet for your account.")
         return
 
-    # Map setup_id -> setup (for R-multiple calc)
-    setup_map = {}
-    for s in all_emailed:
-        sid = str(s.get("setup_id") or s.get("id") or "").strip()
-        if sid:
-            setup_map[sid] = s
-
-    outcomes = db_list_outcomes_for_user(uid)  # only evaluated ones
+    outcomes = db_list_outcomes_for_user(uid)  # evaluated only
     evaluated = len(outcomes)
 
     counts = Counter()
     by_session = defaultdict(lambda: Counter())
 
-    r_wins = []   # positive R
-    r_losses = [] # negative R (should be -1 each by definition)
-    r_all = []    # decided only
+    r_all = []   # decided only
+    r_wins = []  # wins only
 
     for r in outcomes:
-        out = str(r.get("outcome") or "OPEN")
+        out = str(r.get("outcome") or "OPEN").strip().upper()
         sess = str(r.get("session") or "").strip() or "?"
+
         counts[out] += 1
         by_session[sess][out] += 1
 
-        # R-multiple calc for decided trades
         if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
-            sid = str(r.get("setup_id") or r.get("setup") or r.get("id") or "").strip()
-            s = setup_map.get(sid) or {}
-            side = str(s.get("side") or s.get("trade_side") or "").strip().upper()
-            entry = s.get("entry")
-            sl = s.get("sl") or s.get("stop") or s.get("stop_loss")
-            tp1 = s.get("tp1"); tp2 = s.get("tp2"); tp3 = s.get("tp3")
+            setup_id = str(r.get("setup_id") or "").strip()
+            sig = db_get_signal(setup_id)  # contains side/entry/sl/tps
+            if not sig:
+                continue
 
-            r_mult = None
-            if out == "LOSS":
-                r_mult = -1.0
-            else:
-                tp = tp1 if out == "WIN_TP1" else (tp2 if out == "WIN_TP2" else tp3)
-                if tp is not None and entry is not None and sl is not None and side:
-                    r_mult = _r_multiple(side, entry, sl, tp)
+            side = str(sig.get("side") or "").strip().upper()
+            entry = sig.get("entry")
+            sl = sig.get("sl")
+            tp1 = sig.get("tp1")
+            tp2 = sig.get("tp2")
+            tp3 = sig.get("tp3")
 
-            if r_mult is not None:
-                r_all.append(float(r_mult))
-                if r_mult > 0:
-                    r_wins.append(float(r_mult))
-                elif r_mult < 0:
-                    r_losses.append(float(r_mult))
+            if entry is None or sl is None or not side:
+                continue
+
+            rr = _realized_r_option_b(out, side, float(entry), float(sl),
+                                      float(tp1) if tp1 is not None else None,
+                                      float(tp2) if tp2 is not None else None,
+                                      float(tp3) if tp3 is not None else None)
+            if rr is None:
+                continue
+
+            r_all.append(float(rr))
+            if rr > 0:
+                r_wins.append(float(rr))
 
     wins = int(counts.get("WIN_TP1", 0) + counts.get("WIN_TP2", 0) + counts.get("WIN_TP3", 0))
     losses = int(counts.get("LOSS", 0))
@@ -9305,14 +9297,14 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
 
     coverage = (evaluated / total * 100.0) if total > 0 else 0.0
 
-    # Avg R/trade (decided only) and Profit Factor
     avg_r = (sum(r_all) / len(r_all)) if r_all else 0.0
     avg_r_win = (sum(r_wins) / len(r_wins)) if r_wins else 0.0
+
     gross_profit = sum(x for x in r_all if x > 0)
     gross_loss = -sum(x for x in r_all if x < 0)
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
 
-    amb_count = int(counts.get("AMBIGUOUS", 0))
+    amb = int(counts.get("AMBIGUOUS", 0))
 
     lines = [
         "📈 Signal Report (overall)",
@@ -9321,31 +9313,25 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         f"Evaluated (have outcome): {evaluated} ({coverage:.1f}% coverage)",
         HDR,
         f"Decided: {decided} | Wins: {wins} | Losses: {losses} | Win rate: {win_rate:.1f}%",
-        f"TP1: {counts.get('WIN_TP1',0)} | TP2: {counts.get('WIN_TP2',0)} | TP3: {counts.get('WIN_TP3',0)} | Open: {counts.get('OPEN',0)}" + (f" | Amb: {amb_count}" if amb_count else ""),
+        f"TP1: {counts.get('WIN_TP1',0)} | TP2: {counts.get('WIN_TP2',0)} | TP3: {counts.get('WIN_TP3',0)} | Open: {counts.get('OPEN',0)}" + (f" | Amb: {amb}" if amb else ""),
         HDR,
-        f"Avg R/trade (decided): {avg_r:.2f}R | Avg R/win: {avg_r_win:.2f}R | Profit Factor: " + (f"{profit_factor:.2f}" if profit_factor is not None else "∞"),
+        f"Avg R/trade (decided): {avg_r:.2f}R | Avg R/win: {avg_r_win:.2f}R | Profit Factor: " + ("INF" if profit_factor == float("inf") else f"{profit_factor:.2f}"),
         HDR,
-        "Session breakdown (evaluated only):"
+        "Session breakdown (evaluated only):",
     ]
 
     for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
         sw = int(c.get("WIN_TP1",0)+c.get("WIN_TP2",0)+c.get("WIN_TP3",0))
-        slc = int(c.get("LOSS",0))
-        sd = sw + slc
-        s_wr = (sw/sd*100.0) if sd > 0 else 0.0
+        sl = int(c.get("LOSS",0))
+        sd = sw + sl
+        s_wr = (sw/sd*100.0) if sd>0 else 0.0
         s_amb = int(c.get("AMBIGUOUS",0))
         lines.append(
             f"• {sname}: eval {sum(c.values())} | decided {sd} | WR {s_wr:.1f}% | "
-            f"TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} "
-            f"SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)}" + (f" AMB {s_amb}" if s_amb else "")
+            f"TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)}" + (f" AMB {s_amb}" if s_amb else "")
         )
 
-    if evaluated < total:
-        lines.append("")
-        lines.append("Tip: Run `/signal_report 168` occasionally to evaluate older setups and increase coverage.")
-
     await send_long_message(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
 
 async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
     """
