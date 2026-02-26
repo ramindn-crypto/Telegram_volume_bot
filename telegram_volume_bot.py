@@ -9405,8 +9405,7 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         if show_amb:
             line += f" {int(c.get('AMBIGUOUS',0)):>3}"
         rows.append(line)
-    lines.append("```
-" + "
+    lines.append("```\n" + "
 ".join(rows) + "
 ```")
 
