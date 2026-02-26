@@ -1578,18 +1578,6 @@ def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
 # DB
 # =========================================================
 def db_connect() -> sqlite3.Connection:
-
-
-def _db_ensure_column(cur, table: str, column: str, coldef_sql: str):
-    """Add column if missing (SQLite). coldef_sql like 'symbol TEXT'."""
-    try:
-        cur.execute(f"PRAGMA table_info({table})")
-        cols = [r[1] if isinstance(r, tuple) else r.get("name") for r in (cur.fetchall() or [])]
-        if column not in cols:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {coldef_sql}")
-    except Exception:
-        pass
-
     # ensure directory exists
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
@@ -1957,14 +1945,6 @@ def db_init():
         setup_id TEXT NOT NULL,
         session TEXT NOT NULL DEFAULT '',
         emailed_ts REAL NOT NULL,
-        symbol TEXT,
-        side TEXT,
-        entry REAL,
-        sl REAL,
-        tp1 REAL,
-        tp2 REAL,
-        tp3 REAL,
-        conf INTEGER,
         PRIMARY KEY (user_id, setup_id)
     )
     """)
@@ -3241,65 +3221,22 @@ def db_list_signals_since(ts_from: float) -> List[dict]:
 # SIGNAL EVALUATION (EMAIL -> OUTCOME TABLE)
 # =========================================================
 
-def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts: float, setup_obj=None):
-    """Record that a setup was emailed to a user.
-    Stores minimal fields + (if available) setup details for performance metrics.
-    """
-    symbol = side = None
-    entry = sl = tp1 = tp2 = tp3 = None
-    conf = None
-    try:
-        s = setup_obj
-        # Support both object attributes and dict
-        getv = (lambda k, default=None: s.get(k, default)) if isinstance(s, dict) else (lambda k, default=None: getattr(s, k, default))
-        symbol = getv("symbol", None) or getv("sym", None)
-        side = (getv("side", None) or getv("trade_side", None) or "").upper() or None
-        entry = getv("entry", None)
-        sl = getv("sl", None) or getv("stop", None) or getv("stop_loss", None)
-        tp1 = getv("tp1", None)
-        tp2 = getv("tp2", None)
-        tp3 = getv("tp3", None)
-        conf = getv("conf", None) or getv("confidence", None)
-        # sanitize
-        entry = float(entry) if entry is not None else None
-        sl = float(sl) if sl is not None else None
-        tp1 = float(tp1) if tp1 is not None else None
-        tp2 = float(tp2) if tp2 is not None else None
-        tp3 = float(tp3) if tp3 is not None else None
-        conf = int(conf) if conf is not None else None
-    except Exception:
-        pass
-
+def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts: float):
     con = db_connect()
     cur = con.cursor()
     cur.execute(
-        """INSERT OR REPLACE INTO emailed_setups
-           (user_id, setup_id, session, emailed_ts, symbol, side, entry, sl, tp1, tp2, tp3, conf)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            int(user_id),
-            str(setup_id).strip(),
-            str(session or ""),
-            float(emailed_ts),
-            symbol,
-            side,
-            entry,
-            sl,
-            tp1,
-            tp2,
-            tp3,
-            conf,
-        ),
+        """INSERT OR REPLACE INTO emailed_setups (user_id, setup_id, session, emailed_ts)
+           VALUES (?, ?, ?, ?)""",
+        (int(user_id), str(setup_id).strip(), str(session or ""), float(emailed_ts)),
     )
     con.commit()
     con.close()
-
 
 def db_list_emailed_setups(user_id: int, ts_from: float) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
     cur.execute(
-        """SELECT setup_id, session, emailed_ts, symbol, side, entry, sl, tp1, tp2, tp3, conf
+        """SELECT setup_id, session, emailed_ts
            FROM emailed_setups
            WHERE user_id=? AND emailed_ts>=?
            ORDER BY emailed_ts ASC""",
@@ -3315,7 +3252,7 @@ def db_list_emailed_setups_all(user_id: int) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
     cur.execute(
-        """SELECT setup_id, session, emailed_ts, symbol, side, entry, sl, tp1, tp2, tp3, conf
+        """SELECT setup_id, session, emailed_ts
            FROM emailed_setups
            WHERE user_id=?
            ORDER BY emailed_ts ASC""",
@@ -4349,7 +4286,7 @@ def tv_chart_url(symbol_base: str) -> str:
     return f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol_base.upper()}USDT.P"
 
 def table_md(rows: List[List[Any]], headers: List[str]) -> str:
-    return "\n" + tabulate(rows, headers=headers, tablefmt="github") + "\n"
+    return "```\n" + tabulate(rows, headers=headers, tablefmt="github") + "\n```"
 
 # Email-specific price formatting (less noisy)
 def fmt_price(x: float) -> str:
@@ -6729,7 +6666,7 @@ Website: https://pulsefutures.com/
 • Includes win-rate, TP1/TP2/TP3/SL counts, Avg R/trade, Profit Factor
 • Uses stored evaluated outcomes; shows coverage %
 
-
+/signal_report_all
 • Alias for /signal_report_overall
 
 ────────────────────
@@ -9287,8 +9224,8 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s_wr = (sw/sd*100.0) if sd>0 else 0.0
         sess_lines.append(f"• {sname}: total {sum(c.values())} | decided {sd} | WR {s_wr:.1f}% | TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)} AMB {c.get('AMBIGUOUS',0)}")
 
-    msg = "\n".join(header) + "\n" + table + "\n\n" + "\n".join(sess_lines)
-    await send_long_message(update, msg, parse_mode=ParseMode.MARKDOWN)
+    msg = "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>\n" + "\n".join(sess_lines)
+    await send_long_message(update, msg, parse_mode=ParseMode.HTML)
 
 
 
@@ -9377,41 +9314,37 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
 
     amb_count = int(counts.get("AMBIGUOUS", 0))
 
-    lines = []
+    lines = [
+        "📈 Signal Report (overall)",
+        HDR,
+        f"Total emailed setups: {total}",
+        f"Evaluated (have outcome): {evaluated} ({coverage:.1f}% coverage)",
+        HDR,
+        f"Decided: {decided} | Wins: {wins} | Losses: {losses} | Win rate: {win_rate:.1f}%",
+        f"TP1: {counts.get('WIN_TP1',0)} | TP2: {counts.get('WIN_TP2',0)} | TP3: {counts.get('WIN_TP3',0)} | Open: {counts.get('OPEN',0)}" + (f" | Amb: {amb_count}" if amb_count else ""),
+        HDR,
+        f"Avg R/trade (decided): {avg_r:.2f}R | Avg R/win: {avg_r_win:.2f}R | Profit Factor: " + (f"{profit_factor:.2f}" if profit_factor is not None else "∞"),
+        HDR,
+        "Session breakdown (evaluated only):"
+    ]
 
-    # Header
-    lines.append("📈 *Signal Report (overall)*")
-    lines.append(HDR)
-    lines.append(f"Total emailed setups: *{total}*")
-    lines.append(f"Evaluated (have outcome): *{evaluated}* ({coverage:.1f}% coverage)")
-    lines.append(HDR)
-    lines.append(f"Decided: *{decided}* | Wins: *{wins}* | Losses: *{losses}* | Win rate: *{win_rate:.1f}%*")
-    lines.append(f"TP1: *{counts.get('WIN_TP1',0)}* | TP2: *{counts.get('WIN_TP2',0)}* | TP3: *{counts.get('WIN_TP3',0)}* | Open: *{counts.get('OPEN',0)}*" + (f" | Amb: *{amb_count}*" if amb_count else ""))
-    lines.append(HDR)
-    pf_disp = (f"{profit_factor:.2f}" if profit_factor is not None else "INF")
-    lines.append(f"Avg R/trade (decided): *{avg_r:.2f}R* | Avg R/win: *{avg_r_win:.2f}R* | Profit Factor: *{pf_disp}*")
-    lines.append(HDR)
-    
-    # Session breakdown (clean formatted)
-    lines.append("*Session breakdown (evaluated only):*")
     for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
         sw = int(c.get("WIN_TP1",0)+c.get("WIN_TP2",0)+c.get("WIN_TP3",0))
         slc = int(c.get("LOSS",0))
         sd = sw + slc
         s_wr = (sw/sd*100.0) if sd > 0 else 0.0
+        s_amb = int(c.get("AMBIGUOUS",0))
         lines.append(
             f"• {sname}: eval {sum(c.values())} | decided {sd} | WR {s_wr:.1f}% | "
             f"TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} "
-            f"SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)}"
+            f"SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)}" + (f" AMB {s_amb}" if s_amb else "")
         )
-    
 
     if evaluated < total:
+        lines.append("")
         lines.append("Tip: Run `/signal_report 168` occasionally to evaluate older setups and increase coverage.")
 
-    await send_long_message(update, "
-".join(lines), parse_mode=ParseMode.MARKDOWN)
-(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await send_long_message(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
@@ -10830,7 +10763,7 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                     pass
                 # Record that this setup was emailed to this user
                 try:
-                    db_mark_emailed_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts, s)
+                    db_mark_emailed_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
                 except Exception:
                     pass
         except Exception:
