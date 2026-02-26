@@ -958,9 +958,10 @@ SESSION_EMA_REACTION_LOOKBACK = {
 # ✅ 1H trigger loosened per session (overall easier)
 SESSION_TRIGGER_ATR_MULT = {
     "NY": 0.55,
-    "LON": 0.70,
-    "ASIA": 0.85,
+    "LON": 0.75,
+    "ASIA": 0.95,
 }
+
 
 def session_knobs(session_name: str) -> dict:
     s = (session_name or "LON").upper()
@@ -5141,13 +5142,26 @@ def make_setup(
 
 
         # ---------------------------------------------------------
-        # ✅ Global quality gate: do NOT generate setups below MIN_SETUP_CONF
+        # ✅ Global quality gate: session-aware confidence floor
         # ---------------------------------------------------------
         try:
-            if int(conf) < int(MIN_SETUP_CONF):
-                _rej("below_min_confidence", base, mv, f"conf={int(conf)} min={int(MIN_SETUP_CONF)}")
+            sess_min = int(MIN_SETUP_CONF)
+            try:
+                if str(session_name or "").upper() == "ASIA":
+                    sess_min = max(sess_min, int(SESSION_MIN_CONF.get("ASIA", sess_min)))
+                elif str(session_name or "").upper() == "LON":
+                    sess_min = max(sess_min, int(SESSION_MIN_CONF.get("LON", sess_min)))
+                else:
+                    # Keep NY as-is (use global MIN_SETUP_CONF)
+                    sess_min = int(SESSION_MIN_CONF.get("NY", sess_min)) if str(session_name or "").upper() == "NY" else sess_min
+            except Exception:
+                sess_min = int(MIN_SETUP_CONF)
+
+            if int(conf) < int(sess_min):
+                _rej("below_min_confidence", base, mv, f"conf={int(conf)} min={int(sess_min)} sess={session_name}")
                 return None
         except Exception:
+
             pass
 
         tp_cap_pct = tp_cap_pct_for_coin(fut_vol, ch24)
@@ -5172,6 +5186,31 @@ def make_setup(
             )
             if _tp1 and _tp2 and _tp3:
                 tp1, tp2, tp3 = _tp1, _tp2, _tp3
+
+
+        # ---------------------------------------------------------
+        # ✅ Session-aware TP3 RR floor (reduces low-quality signals, especially ASIA)
+        # ---------------------------------------------------------
+        try:
+            rr3 = rr_to_tp(entry, sl, tp3)
+            sess_rr_min = float(MIN_RR_TP3)
+            try:
+                sname = str(session_name or "").upper()
+                if sname == "ASIA":
+                    sess_rr_min = max(sess_rr_min, float(SESSION_MIN_RR_TP3.get("ASIA", sess_rr_min)))
+                elif sname == "LON":
+                    sess_rr_min = max(sess_rr_min, float(SESSION_MIN_RR_TP3.get("LON", sess_rr_min)))
+                else:
+                    # Keep NY as-is (use global MIN_RR_TP3)
+                    sess_rr_min = float(SESSION_MIN_RR_TP3.get("NY", sess_rr_min)) if sname == "NY" else sess_rr_min
+            except Exception:
+                sess_rr_min = float(MIN_RR_TP3)
+
+            if float(rr3) < float(sess_rr_min):
+                _rej("below_min_rr_tp3_session", base, mv, f"rr3={rr3:.2f} min={sess_rr_min:.2f} sess={session_name}")
+                return None
+        except Exception:
+            pass
 
         sid = next_setup_id()
         hot = is_hot_coin(fut_vol, ch24)
