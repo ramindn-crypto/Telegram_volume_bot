@@ -12484,11 +12484,9 @@ async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
 
         msg = "✅ Signals archived and report reset."
         if outcomes_src:
-            msg += f"
-Archived outcomes from `{outcomes_src}`."
+            msg += f"\nArchived outcomes from `{outcomes_src}`."
         else:
-            msg += "
-(No outcomes table found to archive in this DB.)"
+            msg += "\n(No outcomes table found to archive in this DB.)"
         await update.message.reply_text(msg)
 
     except Exception as e:
