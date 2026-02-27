@@ -6638,7 +6638,10 @@ Not financial advice.
 • Grant or change user plan
 
 /admin_revoke <user_id>
-• Revoke paid access (sets to standard)
+• Revoke paid access (sets to FREE)
+
+/admin_reset_report
+• Archive signals/outcomes and reset live performance report
 
 /myplan
 • View your own plan status (admins too)
@@ -12425,6 +12428,52 @@ async def admin_revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"✅ Access revoked. User {uid} set to FREE.")
 
+
+async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/admin_reset_report — archive current signals/outcomes then reset live tables."""
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        return
+
+    try:
+        now_ts = time.time()
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+
+            # Ensure archive tables exist with same schema + archived_at
+            c.execute("""CREATE TABLE IF NOT EXISTS signals_archive AS
+                         SELECT *, 0.0 AS archived_at FROM signals WHERE 0""")
+            c.execute("""CREATE TABLE IF NOT EXISTS outcomes_archive AS
+                         SELECT *, 0.0 AS archived_at FROM outcomes WHERE 0""")
+            # Add archived_at column if older schema
+            try:
+                c.execute("ALTER TABLE signals_archive ADD COLUMN archived_at REAL")
+            except Exception:
+                pass
+            try:
+                c.execute("ALTER TABLE outcomes_archive ADD COLUMN archived_at REAL")
+            except Exception:
+                pass
+
+            # Archive rows
+            c.execute("INSERT INTO signals_archive SELECT *, ? FROM signals", (now_ts,))
+            c.execute("INSERT INTO outcomes_archive SELECT *, ? FROM outcomes", (now_ts,))
+
+            # Clear live
+            c.execute("DELETE FROM signals")
+            c.execute("DELETE FROM outcomes")
+            conn.commit()
+
+        await update.message.reply_text(
+            "✅ Archived current signals + outcomes and reset live report.\n"
+            "Tracking restarts from zero."
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ admin_reset_report failed: {e}")
+
+
+
 async def admin_payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         await update.message.reply_text("❌ Admin only.")
@@ -12652,6 +12701,7 @@ def main():
     app.add_handler(CommandHandler("admin_users", admin_users_cmd, block=False))
     app.add_handler(CommandHandler("admin_grant", admin_grant_cmd, block=False))
     app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd, block=False))
+    app.add_handler(CommandHandler("admin_reset_report", admin_reset_report_cmd, block=False))
     app.add_handler(CommandHandler("admin_payments", admin_payments_cmd, block=False))
 
     # Admin: approve Stripe/USDT payments and grant access
@@ -12706,69 +12756,3 @@ if __name__ == "__main__":
 
 
 
-# ===============================
-# ADMIN: ARCHIVE + RESET REPORT
-# ===============================
-async def admin_reset_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in ADMIN_IDS:
-        return
-
-    try:
-        now_ts = time.time()
-
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-
-            # Create archive tables if not exist
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS signals_archive AS 
-                SELECT *, 0 AS archived_at FROM signals WHERE 0
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS outcomes_archive AS 
-                SELECT *, 0 AS archived_at FROM outcomes WHERE 0
-            """)
-
-            # Add archived_at column if missing
-            try:
-                c.execute("ALTER TABLE signals_archive ADD COLUMN archived_at REAL")
-            except:
-                pass
-
-            try:
-                c.execute("ALTER TABLE outcomes_archive ADD COLUMN archived_at REAL")
-            except:
-                pass
-
-            # Archive current data
-            c.execute("INSERT INTO signals_archive SELECT *, ? FROM signals", (now_ts,))
-            c.execute("INSERT INTO outcomes_archive SELECT *, ? FROM outcomes", (now_ts,))
-
-            # Clear live tables
-            c.execute("DELETE FROM signals")
-            c.execute("DELETE FROM outcomes")
-
-            conn.commit()
-
-        await update.message.reply_text(
-            "✅ Signals archived and report reset successfully.\n"
-            "New performance tracking has started from zero."
-        )
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ Archive/Reset failed: {e}")
-
-
-# Register handler
-application.add_handler(CommandHandler("admin_reset_report", admin_reset_report))
-
-
-
-# ===============================
-# Add new command to ADMIN HELP
-# ===============================
-try:
-    ADMIN_HELP += "\n/admin_reset_report - Archive signals and reset performance report"
-except:
-    pass
