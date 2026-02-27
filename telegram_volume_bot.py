@@ -6702,6 +6702,9 @@ Website: https://pulsefutures.com/
 ────────────────────
 📊 SIGNAL REPORTING
 ────────────────────
+/admin_reset_report
+• (Admin) Archive signals/outcomes and reset live performance report
+
 /signal_report [hours]
 • Evaluate emailed setups for the requesting user in the last N hours (default 24)
 • Uses Bybit 1m OHLCV to detect which level hit first: TP1/TP2/TP3/SL
@@ -12430,7 +12433,13 @@ async def admin_revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/admin_reset_report — archive current signals/outcomes then reset live tables."""
+    """/admin_reset_report — archive current signals + outcomes then reset live tables.
+
+    This is used after engine changes so new performance stats aren't mixed with old logic.
+    Archives into:
+      - signals_archive
+      - outcomes_archive (mirrors `signal_outcomes` if present; otherwise `outcomes` if present)
+    """
     uid = update.effective_user.id
     if uid not in ADMIN_IDS:
         return
@@ -12440,38 +12449,50 @@ async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
 
-            # Ensure archive tables exist with same schema + archived_at
+            # Detect which outcomes table exists in this build
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('signal_outcomes','outcomes')")
+            row = c.fetchone()
+            outcomes_src = row[0] if row else None
+
+            # --- Signals archive ---
             c.execute("""CREATE TABLE IF NOT EXISTS signals_archive AS
                          SELECT *, 0.0 AS archived_at FROM signals WHERE 0""")
-            c.execute("""CREATE TABLE IF NOT EXISTS outcomes_archive AS
-                         SELECT *, 0.0 AS archived_at FROM outcomes WHERE 0""")
-            # Add archived_at column if older schema
             try:
                 c.execute("ALTER TABLE signals_archive ADD COLUMN archived_at REAL")
             except Exception:
                 pass
-            try:
-                c.execute("ALTER TABLE outcomes_archive ADD COLUMN archived_at REAL")
-            except Exception:
-                pass
 
-            # Archive rows
+            # Archive + clear signals
             c.execute("INSERT INTO signals_archive SELECT *, ? FROM signals", (now_ts,))
-            c.execute("INSERT INTO outcomes_archive SELECT *, ? FROM outcomes", (now_ts,))
-
-            # Clear live
             c.execute("DELETE FROM signals")
-            c.execute("DELETE FROM outcomes")
+
+            # --- Outcomes archive (optional) ---
+            if outcomes_src:
+                # Create archive table based on the existing outcomes table schema
+                c.execute(f"""CREATE TABLE IF NOT EXISTS outcomes_archive AS
+                             SELECT *, 0.0 AS archived_at FROM {outcomes_src} WHERE 0""")
+                try:
+                    c.execute("ALTER TABLE outcomes_archive ADD COLUMN archived_at REAL")
+                except Exception:
+                    pass
+
+                # Archive + clear outcomes
+                c.execute(f"INSERT INTO outcomes_archive SELECT *, ? FROM {outcomes_src}", (now_ts,))
+                c.execute(f"DELETE FROM {outcomes_src}")
+
             conn.commit()
 
-        await update.message.reply_text(
-            "✅ Archived current signals + outcomes and reset live report.\n"
-            "Tracking restarts from zero."
-        )
+        msg = "✅ Signals archived and report reset."
+        if outcomes_src:
+            msg += f"
+Archived outcomes from `{outcomes_src}`."
+        else:
+            msg += "
+(No outcomes table found to archive in this DB.)"
+        await update.message.reply_text(msg)
 
     except Exception as e:
         await update.message.reply_text(f"❌ admin_reset_report failed: {e}")
-
 
 
 async def admin_payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
