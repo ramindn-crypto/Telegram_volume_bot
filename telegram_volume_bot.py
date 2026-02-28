@@ -3588,7 +3588,7 @@ def _pnl_today_closed_trades(user_id: int, user: dict) -> float:
     con = db_connect()
     cur = con.cursor()
     cur.execute(
-        "SELECT pnl, closed_ts FROM trades WHERE user_id=? AND closed_ts IS NOT NULL",
+        "SELECT pnl_usdt AS pnl, closed_ts FROM trades WHERE user_id=? AND closed_ts IS NOT NULL",
         (int(user_id),),
     )
     rows = cur.fetchall() or []
@@ -3701,7 +3701,7 @@ def db_list_autotrade_trades(user_id: int, ts_from: float) -> List[dict]:
     con.row_factory = sqlite3.Row
     cur = con.cursor()
     cur.execute(
-        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status, closed_ts, outcome, pnl
+        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status, closed_ts, outcome, pnl_usdt AS pnl
            FROM autotrade_trades
            WHERE uid=? AND opened_ts>=?
            ORDER BY opened_ts ASC""",
@@ -3716,7 +3716,7 @@ def db_list_autotrade_trades_all(user_id: int) -> List[dict]:
     con.row_factory = sqlite3.Row
     cur = con.cursor()
     cur.execute(
-        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status, closed_ts, outcome, pnl
+        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status, closed_ts, outcome, pnl_usdt AS pnl
            FROM autotrade_trades
            WHERE uid=?
            ORDER BY opened_ts ASC""",
