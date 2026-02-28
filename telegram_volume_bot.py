@@ -9830,6 +9830,7 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
 
 
 async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _autotrade_migrate_tables()
     """/autotrade_report [hours]
     Builds a report for bot-opened trades in the last N hours and evaluates TP/SL hit-order using Bybit OHLCV.
     """
@@ -9950,6 +9951,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _autotrade_migrate_tables()
     """/autotrade_report_overall — Overall performance summary for bot-opened trades."""
     uid = update.effective_user.id
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not user_is_admin(uid)):
@@ -13412,6 +13414,17 @@ def main():
 
     # Optional: if any other poller exists, don't crash-restart; just sleep.
     from telegram.error import Conflict
+    # Ensure AutoTrade tables exist at startup (prevents 'no such table: autotrade_trades')
+
+    try:
+
+        _autotrade_migrate_tables()
+
+    except Exception:
+
+        pass
+
+
     try:
         app.run_polling(
             drop_pending_updates=True,
