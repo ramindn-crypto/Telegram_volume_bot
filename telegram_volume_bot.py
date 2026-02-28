@@ -6744,6 +6744,16 @@ Website: https://pulsefutures.com/
 /admin_reset_report
 • (Admin) Archive signals/outcomes and reset live performance report
 
+🤖 AUTOTRADE SESSION CONTROL
+────────────────────
+/autotrade_sessions
+• Show current auto-trade sessions (admin)
+/autotrade_sessions NY
+/autotrade_sessions NY,LON
+/autotrade_sessions NY,LON,ASIA
+• Set allowed sessions for auto-trading (admin)
+
+
 /signal_report [hours]
 • Evaluate emailed setups for the requesting user in the last N hours (default 24)
 • Uses Bybit 1m OHLCV to detect which level hit first: TP1/TP2/TP3/SL
@@ -12661,6 +12671,29 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Alert job failure: %s", e)
 
 
+
+async def autotrade_sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args:
+        current = ",".join(_autotrade_get_sessions())
+        await update.message.reply_text(f"🤖 Current AutoTrade Sessions: {current}")
+        return
+
+    raw = context.args[0].upper()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+
+    valid = {"NY", "LON", "ASIA"}
+    if any(p not in valid for p in parts):
+        await update.message.reply_text("❌ Invalid session. Use NY,LON,ASIA")
+        return
+
+    _autotrade_set_sessions(",".join(parts))
+    await update.message.reply_text(f"✅ AutoTrade sessions updated: {','.join(parts)}")
+
+
 def main():
     # Render note: if deployed as a Web Service, bind to $PORT so Render keeps the service alive.
     if os.environ.get("RENDER_SERVICE_TYPE") == "web":
@@ -12767,6 +12800,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     
+    app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
     # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
@@ -12815,33 +12849,3 @@ if __name__ == "__main__":
 
 
 
-
-async def autotrade_sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        await update.message.reply_text("❌ Admin only.")
-        return
-
-    if not context.args:
-        current = ",".join(_autotrade_get_sessions())
-        await update.message.reply_text(f"🤖 Current AutoTrade Sessions: {current}")
-        return
-
-    raw = context.args[0].upper()
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-
-    valid = {"NY", "LON", "ASIA"}
-    if any(p not in valid for p in parts):
-        await update.message.reply_text("❌ Invalid session. Use NY,LON,ASIA")
-        return
-
-    _autotrade_set_sessions(",".join(parts))
-    await update.message.reply_text(f"✅ AutoTrade sessions updated: {','.join(parts)}")
-
-try:
-    HELP_TEXT_ADMIN += "\n\n🤖 AutoTrade Session Control:\n"
-    HELP_TEXT_ADMIN += "/autotrade_sessions → Show current\n"
-    HELP_TEXT_ADMIN += "/autotrade_sessions NY\n"
-    HELP_TEXT_ADMIN += "/autotrade_sessions NY,LON\n"
-    HELP_TEXT_ADMIN += "/autotrade_sessions NY,LON,ASIA\n"
-except Exception:
-    pass
