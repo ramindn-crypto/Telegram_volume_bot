@@ -3588,7 +3588,7 @@ def _pnl_today_closed_trades(user_id: int, user: dict) -> float:
     con = db_connect()
     cur = con.cursor()
     cur.execute(
-        "SELECT pnl_usdt AS pnl, closed_ts FROM trades WHERE user_id=? AND closed_ts IS NOT NULL",
+        "SELECT pnl AS pnl, closed_ts FROM trades WHERE user_id=? AND closed_ts IS NOT NULL",
         (int(user_id),),
     )
     rows = cur.fetchall() or []
