@@ -899,6 +899,50 @@ EMA_SUPPORT_MAX_DIST_PCT_MAX = 1.8
 # Sharp 1H move gating
 SHARP_1H_MOVE_PCT = 20.0
 
+
+# =========================================================
+# 🤖 AUTOTRADE (Bybit V5) — LIVE/PAPER
+# =========================================================
+# NOTE: AutoTrade is owner-only (AUTOTRADE_OWNER_UID) and is gated by session + risk caps.
+AUTOTRADE_ENABLED = str(os.environ.get("AUTOTRADE_ENABLED", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
+AUTOTRADE_MODE = str(os.environ.get("AUTOTRADE_MODE", "paper")).strip().lower()  # 'paper' | 'live'
+try:
+    AUTOTRADE_OWNER_UID = int(os.environ.get("AUTOTRADE_OWNER_UID", "0") or 0)
+except Exception:
+    AUTOTRADE_OWNER_UID = 0
+
+# Risk controls
+AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "2") or 2)
+AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT", "6") or 6)
+AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "6") or 6)
+AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "3") or 3)
+
+# Margin / leverage
+AUTOTRADE_ISOLATED = str(os.environ.get("AUTOTRADE_ISOLATED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
+AUTOTRADE_LEVERAGE = int(os.environ.get("AUTOTRADE_LEVERAGE", "10") or 10)
+
+# TP split (fractions must sum ~1.0)
+_AUTOTRADE_TP_SPLIT_RAW = str(os.environ.get("AUTOTRADE_TP_SPLIT", "0.4,0.4,0.2") or "0.4,0.4,0.2")
+try:
+    AUTOTRADE_TP_SPLIT = [float(x) for x in _AUTOTRADE_TP_SPLIT_RAW.split(",")]
+except Exception:
+    AUTOTRADE_TP_SPLIT = [0.4, 0.4, 0.2]
+if len(AUTOTRADE_TP_SPLIT) != 3:
+    AUTOTRADE_TP_SPLIT = [0.4, 0.4, 0.2]
+# Normalize if slightly off
+try:
+    _s = sum(AUTOTRADE_TP_SPLIT)
+    if _s > 0:
+        AUTOTRADE_TP_SPLIT = [x/_s for x in AUTOTRADE_TP_SPLIT]
+except Exception:
+    AUTOTRADE_TP_SPLIT = [0.4, 0.4, 0.2]
+
+# Bybit V5 keys (required for live)
+BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
+BYBIT_API_SECRET = str(os.environ.get("BYBIT_API_SECRET", "") or "").strip()
+BYBIT_RECV_WINDOW = str(os.environ.get("BYBIT_RECV_WINDOW", "5000") or "5000").strip()
+BYBIT_TESTNET = str(os.environ.get("BYBIT_TESTNET", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
+
 # Email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
@@ -910,6 +954,281 @@ EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
 TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFuturesBot").strip()
+
+# =========================================================
+# 🤖 AUTOTRADE — Bybit V5 helpers + DB
+# =========================================================
+import hmac
+import hashlib
+import uuid
+
+def _bybit_base_url() -> str:
+    return "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
+
+def _bybit_v5_sign(ts_ms: str, body: str) -> str:
+    """
+    Bybit V5 signature:
+      sign = HMAC_SHA256(secret, timestamp + api_key + recv_window + body)
+    """
+    msg = f"{ts_ms}{BYBIT_API_KEY}{BYBIT_RECV_WINDOW}{body}".encode("utf-8")
+    return hmac.new(BYBIT_API_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> dict:
+    import requests
+    method = method.upper().strip()
+    url = _bybit_base_url() + path
+
+    ts_ms = str(int(time.time() * 1000))
+    body = json.dumps(payload or {}, separators=(",", ":"), ensure_ascii=False) if method != "GET" else ""
+    sign = _bybit_v5_sign(ts_ms, body) if (BYBIT_API_KEY and BYBIT_API_SECRET) else ""
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": ts_ms,
+        "X-BAPI-RECV-WINDOW": BYBIT_RECV_WINDOW,
+        "X-BAPI-SIGN": sign,
+    }
+
+    try:
+        if method == "GET":
+            r = requests.get(url, headers=headers, timeout=15)
+        else:
+            r = requests.post(url, headers=headers, data=body.encode("utf-8"), timeout=15)
+        return r.json()
+    except Exception as e:
+        return {"retCode": -1, "retMsg": f"{type(e).__name__}: {e}", "result": None}
+
+def _autotrade_ready() -> bool:
+    if not AUTOTRADE_ENABLED:
+        return False
+    if AUTOTRADE_OWNER_UID <= 0:
+        return False
+    if AUTOTRADE_MODE not in ("paper", "live"):
+        return False
+    if AUTOTRADE_MODE == "live" and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
+        return False
+    return True
+
+def _bybit_get_equity_usdt() -> float:
+    """Returns account equity (USDT) from Bybit V5 wallet-balance."""
+    res = _bybit_v5_request("GET", "/v5/account/wallet-balance?accountType=UNIFIED&coin=USDT")
+    try:
+        if int(res.get("retCode", -1)) != 0:
+            return 0.0
+        lst = ((res.get("result") or {}).get("list") or [])
+        if not lst:
+            return 0.0
+        coin = (((lst[0] or {}).get("coin") or [])[0] or {})
+        eq = float(coin.get("equity") or coin.get("walletBalance") or coin.get("availableToWithdraw") or 0.0)
+        return max(0.0, eq)
+    except Exception:
+        return 0.0
+
+def _autotrade_db_init():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS autotrade_trades (
+                trade_id TEXT PRIMARY KEY,
+                uid INTEGER,
+                opened_ts INTEGER,
+                session TEXT,
+                symbol TEXT,
+                side TEXT,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                qty REAL,
+                status TEXT DEFAULT 'OPEN',
+                closed_ts INTEGER,
+                outcome TEXT,
+                pnl REAL
+            )
+        ''')
+        c.execute("CREATE INDEX IF NOT EXISTS idx_autotrade_uid_opened ON autotrade_trades(uid, opened_ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_autotrade_status ON autotrade_trades(status)")
+        conn.commit()
+
+def _autotrade_db_open_trades(uid: int) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM autotrade_trades WHERE uid=? AND status='OPEN' ORDER BY opened_ts DESC", (uid,))
+        return [dict(r) for r in c.fetchall()]
+
+def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float) -> str:
+    trade_id = f"AT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """INSERT INTO autotrade_trades (trade_id, uid, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
+            (
+                trade_id,
+                int(uid),
+                int(time.time()),
+                str(session_label),
+                str(getattr(s, 'symbol', '') or '').upper(),
+                str(getattr(s, 'side', '') or '').upper(),
+                float(getattr(s, 'entry', 0.0) or 0.0),
+                float(getattr(s, 'sl', 0.0) or 0.0),
+                float(getattr(s, 'tp1', 0.0) or 0.0),
+                float(getattr(s, 'tp2', 0.0) or 0.0),
+                float(getattr(s, 'tp3', 0.0) or 0.0),
+                float(qty),
+            ),
+        )
+        conn.commit()
+    return trade_id
+
+def _autotrade_estimated_risk_usd(entry: float, sl: float, qty: float) -> float:
+    try:
+        return abs(entry - sl) * abs(qty)
+    except Exception:
+        return 0.0
+
+def _autotrade_open_risk_usd(uid: int, equity_usdt: float) -> float:
+    total = 0.0
+    for t in _autotrade_db_open_trades(uid):
+        total += _autotrade_estimated_risk_usd(float(t.get('entry') or 0.0), float(t.get('sl') or 0.0), float(t.get('qty') or 0.0))
+    return total
+
+def _autotrade_qty_from_risk(entry: float, sl: float, equity_usdt: float) -> float:
+    dist = abs(entry - sl)
+    if dist <= 0:
+        return 0.0
+    risk_usd = (equity_usdt * (AUTOTRADE_RISK_PER_TRADE_PCT / 100.0))
+    qty = risk_usd / dist
+    if qty <= 0 or (not math.isfinite(qty)):
+        return 0.0
+    return float(qty)
+
+def _autotrade_allowed_session(session_label: str) -> bool:
+    allowed = set([s.strip().upper() for s in _autotrade_get_sessions() if s.strip()])
+    if not allowed:
+        allowed = {'NY'}
+    return session_label.upper() in allowed
+
+def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
+    if not _autotrade_ready():
+        return (False, 'autotrade_not_ready_or_disabled')
+
+    if int(uid) != int(AUTOTRADE_OWNER_UID):
+        return (False, 'not_owner')
+
+    if not _autotrade_allowed_session(session_label):
+        return (False, f'autotrade_session_not_allowed ({session_label})')
+
+    if not setups:
+        return (False, 'no_setups')
+
+    if len(_autotrade_db_open_trades(uid)) >= int(AUTOTRADE_MAX_OPEN_TRADES):
+        return (False, f'max_open_trades_reached ({AUTOTRADE_MAX_OPEN_TRADES})')
+
+    s = setups[0]
+    sym = str(getattr(s, 'symbol', '') or '').upper()
+    side = str(getattr(s, 'side', '') or '').upper()
+    entry = float(getattr(s, 'entry', 0.0) or 0.0)
+    sl = float(getattr(s, 'sl', 0.0) or 0.0)
+    tp1 = float(getattr(s, 'tp1', 0.0) or 0.0)
+    tp2 = float(getattr(s, 'tp2', 0.0) or 0.0)
+    tp3 = float(getattr(s, 'tp3', 0.0) or 0.0)
+
+    if side not in {'BUY', 'SELL'}:
+        return (False, f'bad_side ({side})')
+
+    if entry <= 0 or sl <= 0 or tp1 <= 0 or tp2 <= 0 or tp3 <= 0:
+        return (False, 'bad_prices')
+
+    if side == 'BUY' and sl >= entry:
+        return (False, 'sl_not_below_entry_for_buy')
+    if side == 'SELL' and sl <= entry:
+        return (False, 'sl_not_above_entry_for_sell')
+
+    equity = _bybit_get_equity_usdt() if AUTOTRADE_MODE == 'live' else float((get_user(uid) or {}).get('equity') or 0.0)
+    if equity <= 0:
+        return (False, 'equity_unavailable_or_zero')
+
+    open_risk = _autotrade_open_risk_usd(uid, equity)
+    per_trade_risk = equity * (AUTOTRADE_RISK_PER_TRADE_PCT / 100.0)
+
+    if (open_risk + per_trade_risk) > (equity * (AUTOTRADE_OPEN_RISK_CAP_PCT / 100.0)):
+        return (False, 'open_risk_cap_reached')
+    if (open_risk + per_trade_risk) > (equity * (AUTOTRADE_DAILY_RISK_CAP_PCT / 100.0)):
+        return (False, 'daily_risk_cap_reached')
+
+    qty = _autotrade_qty_from_risk(entry, sl, equity)
+    if qty <= 0:
+        return (False, 'qty_calc_failed')
+
+    if AUTOTRADE_MODE == 'paper':
+        trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
+        return (True, f'[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}')
+
+    # LIVE MODE (Bybit V5)
+    if AUTOTRADE_ISOLATED:
+        _bybit_v5_request('POST', '/v5/position/switch-isolated', {
+            'category': 'linear',
+            'symbol': sym,
+            'tradeMode': 1,
+            'buyLeverage': str(AUTOTRADE_LEVERAGE),
+            'sellLeverage': str(AUTOTRADE_LEVERAGE),
+        })
+    _bybit_v5_request('POST', '/v5/position/set-leverage', {
+        'category': 'linear',
+        'symbol': sym,
+        'buyLeverage': str(AUTOTRADE_LEVERAGE),
+        'sellLeverage': str(AUTOTRADE_LEVERAGE),
+    })
+
+    open_res = _bybit_v5_request('POST', '/v5/order/create', {
+        'category': 'linear',
+        'symbol': sym,
+        'side': 'Buy' if side == 'BUY' else 'Sell',
+        'orderType': 'Market',
+        'qty': str(qty),
+        'timeInForce': 'IOC',
+    })
+
+    if int(open_res.get('retCode', -1)) != 0:
+        return (False, f"bybit_open_failed retCode={open_res.get('retCode')} retMsg={open_res.get('retMsg')}")
+
+    _bybit_v5_request('POST', '/v5/position/trading-stop', {
+        'category': 'linear',
+        'symbol': sym,
+        'stopLoss': str(sl),
+        'tpslMode': 'Full',
+    })
+
+    splits = AUTOTRADE_TP_SPLIT
+    tp_qtys = [max(0.0, qty * splits[0]), max(0.0, qty * splits[1]), max(0.0, qty * splits[2])]
+    try:
+        tp_qtys[2] = max(0.0, qty - (tp_qtys[0] + tp_qtys[1]))
+    except Exception:
+        pass
+
+    tps = [tp1, tp2, tp3]
+    for tp_price, tp_qty in zip(tps, tp_qtys):
+        if tp_price <= 0 or tp_qty <= 0:
+            continue
+        _bybit_v5_request('POST', '/v5/order/create', {
+            'category': 'linear',
+            'symbol': sym,
+            'side': 'Sell' if side == 'BUY' else 'Buy',
+            'orderType': 'Limit',
+            'qty': str(tp_qty),
+            'price': str(tp_price),
+            'timeInForce': 'GTC',
+            'reduceOnly': True,
+            'closeOnTrigger': True,
+        })
+
+    trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
+    return (True, f'[LIVE] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}')
+
 
 # Caching for speed
 TICKERS_TTL_SEC = 45
@@ -1710,6 +2029,10 @@ def db_wipe_all_data_keep_schema() -> None:
 
     con.commit()
     con.close()
+    try:
+        _autotrade_db_init()
+    except Exception:
+        pass
 
     # Also clear runtime trackers
     _LAST_SMTP_ERROR.clear()
@@ -3290,6 +3613,40 @@ def db_list_emailed_setups(user_id: int, ts_from: float) -> List[dict]:
     rows = cur.fetchall() or []
     con.close()
     return [dict(r) for r in rows]
+
+
+
+def db_list_autotrade_trades(user_id: int, ts_from: float) -> List[dict]:
+    """Autotrade trades opened by the bot (journal)."""
+    con = db_connect()
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute(
+        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status, closed_ts, outcome, pnl
+           FROM autotrade_trades
+           WHERE uid=? AND opened_ts>=?
+           ORDER BY opened_ts ASC""",
+        (int(user_id), int(ts_from)),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+def db_list_autotrade_trades_all(user_id: int) -> List[dict]:
+    con = db_connect()
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute(
+        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status, closed_ts, outcome, pnl
+           FROM autotrade_trades
+           WHERE uid=?
+           ORDER BY opened_ts ASC""",
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
 
 
 def db_list_emailed_setups_all(user_id: int) -> List[dict]:
@@ -6765,6 +7122,13 @@ Website: https://pulsefutures.com/
 • Includes win-rate, TP1/TP2/TP3/SL counts, Avg R/trade, Profit Factor
 • Uses stored evaluated outcomes; shows coverage %
 
+/autotrade_report [hours]
+• Journal/report for bot-opened positions (default 24h)
+• Evaluates TP/SL hit-order via Bybit 1m OHLCV (same as signal_report)
+
+/autotrade_report_overall
+• Overall performance summary for bot-opened positions (same metrics as signal_report_overall)
+
 /signal_report_all
 • Alias for /signal_report_overall
 
@@ -9464,6 +9828,212 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
 
     await send_long_message(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
+
+async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/autotrade_report [hours]
+    Builds a report for bot-opened trades in the last N hours and evaluates TP/SL hit-order using Bybit OHLCV.
+    """
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not user_is_admin(uid)):
+        await update.message.reply_text("⛔️ Owner/admin only.")
+        return
+
+    lookback_h = 24
+    try:
+        if context.args and str(context.args[0]).strip():
+            lookback_h = int(float(context.args[0]))
+    except Exception:
+        lookback_h = 24
+    lookback_h = int(clamp(lookback_h, 1, 168))
+
+    await update.message.reply_text(f"📒 AutoTrade Journal\n{HDR}\nScanning bot-opened trades for last {lookback_h}h…")
+
+    ts_from = time.time() - lookback_h * 3600.0
+    trades = db_list_autotrade_trades(AUTOTRADE_OWNER_UID, ts_from)
+
+    if not trades:
+        await update.message.reply_text(f"No bot-opened trades found in the last {lookback_h}h.")
+        return
+
+    def _eval_all():
+        counts = Counter()
+        by_session = defaultdict(lambda: Counter())
+        decided = 0
+        wins = 0
+        losses = 0
+        tp1c = tp2c = tp3c = openc = 0
+
+        for t in trades:
+            setup = {
+                "symbol": t.get("symbol"),
+                "side": t.get("side"),
+                "entry": t.get("entry"),
+                "sl": t.get("sl"),
+                "tp1": t.get("tp1"),
+                "tp2": t.get("tp2"),
+                "tp3": t.get("tp3"),
+                "created_ts": float(t.get("opened_ts") or 0.0),
+            }
+            res = evaluate_signal_hit_order(setup, horizon_hours=lookback_h, timeframe="1m")
+            out = str(res.get("outcome") or "OPEN").upper().strip()
+            sess = str(t.get("session") or "?").strip() or "?"
+
+            counts[out] += 1
+            by_session[sess][out] += 1
+
+            if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+                decided += 1
+                if out.startswith("WIN"):
+                    wins += 1
+                else:
+                    losses += 1
+
+            if out == "WIN_TP1":
+                tp1c += 1
+            elif out == "WIN_TP2":
+                tp2c += 1
+            elif out == "WIN_TP3":
+                tp3c += 1
+            elif out == "OPEN":
+                openc += 1
+
+            # Update journal best-effort
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    c = conn.cursor()
+                    if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+                        c.execute("UPDATE autotrade_trades SET outcome=?, status='CLOSED', closed_ts=? WHERE trade_id=?",
+                                  (out, int(time.time()), str(t.get("trade_id"))))
+                    else:
+                        c.execute("UPDATE autotrade_trades SET outcome=? WHERE trade_id=?",
+                                  (out, str(t.get("trade_id"))))
+                    conn.commit()
+            except Exception:
+                pass
+
+        total = len(trades)
+        coverage = (decided / total * 100.0) if total else 0.0
+        wr = (wins / decided * 100.0) if decided else 0.0
+
+        return {
+            "total": total,
+            "decided": decided,
+            "wins": wins,
+            "losses": losses,
+            "wr": wr,
+            "tp1": tp1c,
+            "tp2": tp2c,
+            "tp3": tp3c,
+            "open": openc,
+            "coverage": coverage,
+            "by_session": by_session,
+        }
+
+    rep = await asyncio.to_thread(_eval_all)
+
+    lines = []
+    lines.append("📈 AutoTrade Report (journal)")
+    lines.append(HDR)
+    lines.append(f"Total bot trades: {rep['total']}")
+    lines.append(f"Decided: {rep['decided']} | Wins: {rep['wins']} | Losses: {rep['losses']} | Win rate: {rep['wr']:.1f}%")
+    lines.append(f"TP1: {rep['tp1']} | TP2: {rep['tp2']} | TP3: {rep['tp3']} | Open: {rep['open']}")
+    lines.append("")
+    lines.append("Session breakdown (evaluated only):")
+    for sess, c in rep["by_session"].items():
+        eval_n = c.get("WIN_TP1", 0) + c.get("WIN_TP2", 0) + c.get("WIN_TP3", 0) + c.get("LOSS", 0) + c.get("OPEN", 0)
+        dec_n = c.get("WIN_TP1", 0) + c.get("WIN_TP2", 0) + c.get("WIN_TP3", 0) + c.get("LOSS", 0)
+        w_n = c.get("WIN_TP1", 0) + c.get("WIN_TP2", 0) + c.get("WIN_TP3", 0)
+        wr_s = (w_n / dec_n * 100.0) if dec_n else 0.0
+        lines.append(f"• {sess}: eval {eval_n} | decided {dec_n} | WR {wr_s:.1f}% | TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/autotrade_report_overall — Overall performance summary for bot-opened trades."""
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not user_is_admin(uid)):
+        await update.message.reply_text("⛔️ Owner/admin only.")
+        return
+
+    trades = db_list_autotrade_trades_all(AUTOTRADE_OWNER_UID)
+    total = len(trades)
+    if total == 0:
+        await update.message.reply_text("No bot-opened trades found yet.")
+        return
+
+    counts = Counter()
+    by_session = defaultdict(lambda: Counter())
+    r_all = []
+    r_wins = []
+
+    for t in trades:
+        setup = {
+            "symbol": t.get("symbol"),
+            "side": t.get("side"),
+            "entry": t.get("entry"),
+            "sl": t.get("sl"),
+            "tp1": t.get("tp1"),
+            "tp2": t.get("tp2"),
+            "tp3": t.get("tp3"),
+            "created_ts": float(t.get("opened_ts") or 0.0),
+        }
+        res = evaluate_signal_hit_order(setup, horizon_hours=168, timeframe="1m")
+        out = str(res.get("outcome") or "OPEN").upper().strip()
+        sess = str(t.get("session") or "?").strip() or "?"
+
+        counts[out] += 1
+        by_session[sess][out] += 1
+
+        if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+            side = str(t.get("side") or "").upper().strip()
+            entry = float(t.get("entry") or 0.0)
+            sl = float(t.get("sl") or 0.0)
+            tp1 = t.get("tp1")
+            tp2 = t.get("tp2")
+            tp3 = t.get("tp3")
+
+            rr = _realized_r_option_b(out, side, entry, sl,
+                                      float(tp1) if tp1 is not None else None,
+                                      float(tp2) if tp2 is not None else None,
+                                      float(tp3) if tp3 is not None else None)
+            if rr is None:
+                continue
+            r_all.append(rr)
+            if rr > 0:
+                r_wins.append(rr)
+
+    decided = counts.get("WIN_TP1",0) + counts.get("WIN_TP2",0) + counts.get("WIN_TP3",0) + counts.get("LOSS",0)
+    wins = counts.get("WIN_TP1",0) + counts.get("WIN_TP2",0) + counts.get("WIN_TP3",0)
+    losses = counts.get("LOSS",0)
+    wr = (wins / decided * 100.0) if decided else 0.0
+
+    avg_r = (sum(r_all)/len(r_all)) if r_all else 0.0
+    avg_r_win = (sum(r_wins)/len(r_wins)) if r_wins else 0.0
+
+    gross_profit = sum([x for x in r_all if x > 0])
+    gross_loss = abs(sum([x for x in r_all if x < 0]))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+
+    lines = []
+    lines.append("📈 AutoTrade Report (overall)")
+    lines.append(HDR)
+    lines.append(f"Total bot trades: {total}")
+    lines.append(f"Decided: {decided} | Wins: {wins} | Losses: {losses} | Win rate: {wr:.1f}%")
+    lines.append(f"TP1: {counts.get('WIN_TP1',0)} | TP2: {counts.get('WIN_TP2',0)} | TP3: {counts.get('WIN_TP3',0)} | Open: {counts.get('OPEN',0)}")
+    lines.append(f"Avg R/trade (decided): {avg_r:.2f}R | Avg R/win: {avg_r_win:.2f}R | Profit Factor: {profit_factor:.2f}")
+    lines.append("")
+    lines.append("Session breakdown (evaluated only):")
+    for sess, c in by_session.items():
+        eval_n = c.get("WIN_TP1", 0) + c.get("WIN_TP2", 0) + c.get("WIN_TP3", 0) + c.get("LOSS", 0) + c.get("OPEN", 0)
+        dec_n = c.get("WIN_TP1", 0) + c.get("WIN_TP2", 0) + c.get("WIN_TP3", 0) + c.get("LOSS", 0)
+        w_n = c.get("WIN_TP1", 0) + c.get("WIN_TP2", 0) + c.get("WIN_TP3", 0)
+        wr_s = (w_n / dec_n * 100.0) if dec_n else 0.0
+        lines.append(f"• {sess}: eval {eval_n} | decided {dec_n} | WR {wr_s:.1f}% | TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
     """
     mode: "screen" or "email"
@@ -11685,10 +12255,19 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
 
+                # 🤖 AutoTrade (owner only) — uses the *same* emailed setup(s)
+                autotrade_note = None
+                try:
+                    ok_at, msg_at = _autotrade_place_trade(uid, display_sess, chosen_list)
+                    autotrade_note = ("OK: " + msg_at) if ok_at else ("SKIP: " + msg_at)
+                except Exception as _e:
+                    autotrade_note = f"ERROR: {type(_e).__name__}: {_e}"
+
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SENT",
                     "picked": ", ".join([f"{s.side} {s.symbol} conf={s.conf}" for s in chosen_list]),
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "autotrade": autotrade_note,
                     "reasons": ["passed_filters_multi"],
                 }
             else:
@@ -12801,6 +13380,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     
     app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
     # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
