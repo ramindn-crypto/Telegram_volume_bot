@@ -62,45 +62,82 @@ import sqlite3
 
 
 # ================= AUTOTRADE TABLE MIGRATION =================
+
 def _autotrade_migrate_tables():
-    """Ensure autotrade tables exist (safe to call anytime)."""
+    """Ensure autotrade tables exist and columns are present (safe to call anytime)."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
+
+            # Create if missing (preferred schema used by trading + reports)
             c.execute("""CREATE TABLE IF NOT EXISTS autotrade_trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                day_utc TEXT NOT NULL,
-                created_ts REAL NOT NULL,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                qty REAL NOT NULL,
-                entry REAL NOT NULL,
-                sl REAL NOT NULL,
-                tp1 REAL NOT NULL,
-                tp2 REAL NOT NULL,
-                tp3 REAL NOT NULL,
-                risk_pct REAL NOT NULL,
-                status TEXT NOT NULL,
-                note TEXT DEFAULT '',
-                closed_ts REAL,
+                trade_id TEXT PRIMARY KEY,
+                uid INTEGER,
+                opened_ts INTEGER,
+                session TEXT,
+                symbol TEXT,
+                side TEXT,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                qty REAL,
+                status TEXT,
+                closed_ts INTEGER,
                 pnl_usdt REAL,
-                equity_entry REAL,
-                risk_usdt REAL,
-                outcome TEXT
+                note TEXT
             )""")
-            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_day_risk (
-                day_utc TEXT PRIMARY KEY,
-                used_risk_pct REAL NOT NULL
-            )""")
-            # autotrade_config used by /autotrade_sessions
             c.execute("""CREATE TABLE IF NOT EXISTS autotrade_config (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            )""")
+
+            # If table existed with an older schema, add missing columns.
+            cols = [r[1] for r in c.execute("PRAGMA table_info(autotrade_trades)").fetchall()]
+            def add_col(name, ddl):
+                if name not in cols:
+                    c.execute(f"ALTER TABLE autotrade_trades ADD COLUMN {ddl}")
+                    cols.append(name)
+
+            add_col("trade_id", "trade_id TEXT")
+            add_col("uid", "uid INTEGER")
+            add_col("opened_ts", "opened_ts INTEGER")
+            add_col("session", "session TEXT")
+            add_col("symbol", "symbol TEXT")
+            add_col("side", "side TEXT")
+            add_col("entry", "entry REAL")
+            add_col("sl", "sl REAL")
+            add_col("tp1", "tp1 REAL")
+            add_col("tp2", "tp2 REAL")
+            add_col("tp3", "tp3 REAL")
+            add_col("qty", "qty REAL")
+            add_col("status", "status TEXT")
+            add_col("closed_ts", "closed_ts INTEGER")
+            add_col("pnl_usdt", "pnl_usdt REAL")
+            add_col("note", "note TEXT")
+
+            # Backfill trade_id for legacy rows (uses rowid).
+            try:
+                rows = c.execute("SELECT rowid FROM autotrade_trades WHERE trade_id IS NULL OR trade_id=''").fetchall()
+                for (rowid,) in rows:
+                    c.execute(
+                        "UPDATE autotrade_trades SET trade_id=? WHERE rowid=?",
+                        (f"AT-LEGACY-{int(rowid)}", int(rowid))
+                    )
+            except Exception:
+                pass
+
+            # Daily risk table (kept for compatibility)
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_day_risk (
+                day_utc TEXT PRIMARY KEY,
+                used_risk_pct REAL NOT NULL
             )""")
             conn.commit()
     except Exception:
         pass
 # =============================================================
+
 
 # ================= AUTOTRADE SESSION STORAGE =================
 def _autotrade_get_sessions():
