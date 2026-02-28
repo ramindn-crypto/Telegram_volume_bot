@@ -59,6 +59,45 @@ import re
 import ssl
 import smtplib
 import sqlite3
+
+# ================= AUTOTRADE SESSION STORAGE =================
+def _autotrade_get_sessions():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS autotrade_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.execute("SELECT value FROM autotrade_config WHERE key='sessions'")
+            row = c.fetchone()
+            if row and row[0]:
+                return [s.strip().upper() for s in row[0].split(",") if s.strip()]
+    except Exception:
+        pass
+    return ["NY"]
+
+def _autotrade_set_sessions(val: str):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS autotrade_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.execute(
+                "INSERT OR REPLACE INTO autotrade_config(key,value) VALUES('sessions',?)",
+                (val.upper(),)
+            )
+            conn.commit()
+    except Exception:
+        pass
+# =============================================================
+
 import asyncio
 import contextvars
 
@@ -12775,3 +12814,34 @@ if __name__ == "__main__":
 
 
 
+
+
+async def autotrade_sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args:
+        current = ",".join(_autotrade_get_sessions())
+        await update.message.reply_text(f"🤖 Current AutoTrade Sessions: {current}")
+        return
+
+    raw = context.args[0].upper()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+
+    valid = {"NY", "LON", "ASIA"}
+    if any(p not in valid for p in parts):
+        await update.message.reply_text("❌ Invalid session. Use NY,LON,ASIA")
+        return
+
+    _autotrade_set_sessions(",".join(parts))
+    await update.message.reply_text(f"✅ AutoTrade sessions updated: {','.join(parts)}")
+
+try:
+    HELP_TEXT_ADMIN += "\n\n🤖 AutoTrade Session Control:\n"
+    HELP_TEXT_ADMIN += "/autotrade_sessions → Show current\n"
+    HELP_TEXT_ADMIN += "/autotrade_sessions NY\n"
+    HELP_TEXT_ADMIN += "/autotrade_sessions NY,LON\n"
+    HELP_TEXT_ADMIN += "/autotrade_sessions NY,LON,ASIA\n"
+except Exception:
+    pass
