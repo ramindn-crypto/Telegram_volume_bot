@@ -60,6 +60,48 @@ import ssl
 import smtplib
 import sqlite3
 
+
+# ================= AUTOTRADE TABLE MIGRATION =================
+def _autotrade_migrate_tables():
+    """Ensure autotrade tables exist (safe to call anytime)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day_utc TEXT NOT NULL,
+                created_ts REAL NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty REAL NOT NULL,
+                entry REAL NOT NULL,
+                sl REAL NOT NULL,
+                tp1 REAL NOT NULL,
+                tp2 REAL NOT NULL,
+                tp3 REAL NOT NULL,
+                risk_pct REAL NOT NULL,
+                status TEXT NOT NULL,
+                note TEXT DEFAULT '',
+                closed_ts REAL,
+                pnl_usdt REAL,
+                equity_entry REAL,
+                risk_usdt REAL,
+                outcome TEXT
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_day_risk (
+                day_utc TEXT PRIMARY KEY,
+                used_risk_pct REAL NOT NULL
+            )""")
+            # autotrade_config used by /autotrade_sessions
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_config (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )""")
+            conn.commit()
+    except Exception:
+        pass
+# =============================================================
+
 # ================= AUTOTRADE SESSION STORAGE =================
 def _autotrade_get_sessions():
     try:
