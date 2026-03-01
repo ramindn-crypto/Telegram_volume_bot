@@ -61,6 +61,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# AutoTrade decision cache (owner/admin visibility)
+_LAST_AUTOTRADE_DECISION: dict[int, dict] = {}
+
+
 import json
 import re
 import ssl
@@ -9036,6 +9040,21 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Trade window: {tw_txt}")
     lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
     lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
+
+    # AutoTrade status (owner/admin only)
+    try:
+        show_at = (int(uid) == int(AUTOTRADE_OWNER_UID)) or is_admin(uid)
+    except Exception:
+        show_at = False
+    if show_at:
+        at_on = "ON" if AUTOTRADE_ENABLED else "OFF"
+        at_mode = str(AUTOTRADE_MODE).upper()
+        at_sess = ",".join([s.strip().upper() for s in _autotrade_get_sessions() if s.strip()]) or "NY"
+        dec = _LAST_AUTOTRADE_DECISION.get(int(AUTOTRADE_OWNER_UID or 0), {})
+        dec_txt = ""
+        if dec:
+            dec_txt = f" | Last: {dec.get('status','')} ({dec.get('reason','')}) @ {dec.get('when','')}"
+        lines.append(f"AutoTrade: {at_on} | Mode: {at_mode} | Sessions: {at_sess}{dec_txt}")
     lines.append(HDR)
 
     if not opens:
@@ -13300,6 +13319,89 @@ async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
+    """Background AutoTrade loop. Scans and opens trades for the owner when enabled.
+    Runs independently from email sending (no dependency on 'email setup sent')."""
+    try:
+        if not _autotrade_ready():
+            return
+
+        uid = int(AUTOTRADE_OWNER_UID)
+        # If user record doesn't exist yet, do nothing (avoids writing defaults to DB)
+        user = get_user(uid) or {}
+        if not user:
+            return
+
+        # Session label in UTC (NY/LON/ASIA)
+        now_utc = datetime.now(timezone.utc)
+        sess = _guess_session_name_utc(now_utc)
+
+        if not _autotrade_allowed_session(sess):
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "SKIP",
+                "when": now_utc.isoformat(timespec="seconds"),
+                "reason": f"session_not_allowed ({sess})",
+            }
+            return
+
+        # Optional: respect user's trade window (if configured)
+        try:
+            if not trade_window_allows_now(user):
+                _LAST_AUTOTRADE_DECISION[uid] = {
+                    "status": "SKIP",
+                    "when": now_utc.isoformat(timespec="seconds"),
+                    "reason": "trade_window_block",
+                }
+                return
+        except Exception:
+            pass
+
+        # Fetch market universe
+        best_fut = await asyncio.to_thread(fetch_futures_tickers)
+        if not best_fut:
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "ERROR",
+                "when": now_utc.isoformat(timespec="seconds"),
+                "reason": "fetch_futures_failed",
+            }
+            return
+
+        # Build setups with the same engine used by /screen (fast + high quality)
+        try:
+            pool = await asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess, mode="screen", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid))
+        except Exception as e:
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "ERROR",
+                "when": now_utc.isoformat(timespec="seconds"),
+                "reason": f"build_pool_failed: {type(e).__name__}: {e}",
+            }
+            return
+
+        setups = (pool.get("setups", []) or [])
+        ok, reason = _autotrade_place_trade(uid, sess, setups)
+
+        _LAST_AUTOTRADE_DECISION[uid] = {
+            "status": "OPENED" if ok else "SKIP",
+            "when": now_utc.isoformat(timespec="seconds"),
+            "reason": reason,
+            "session": sess,
+            "mode": AUTOTRADE_MODE,
+        }
+
+    except Exception as e:
+        try:
+            uid = int(AUTOTRADE_OWNER_UID or 0)
+        except Exception:
+            uid = 0
+        if uid:
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "ERROR",
+                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "reason": f"{type(e).__name__}: {e}",
+            }
+        logger.exception("autotrade_job crashed: %s", e)
+
+
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     """Background email engine (trade setups + big-move alerts).
 
@@ -13485,6 +13587,19 @@ def main():
                 "max_instances": 1,
                 "coalesce": True,
                 "misfire_grace_time": 60,
+            },
+        )
+
+        # AutoTrade loop (owner-only)
+        app.job_queue.run_repeating(
+            autotrade_job,
+            interval=60,
+            first=30,
+            name="autotrade_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 30,
             },
         )
     else:
