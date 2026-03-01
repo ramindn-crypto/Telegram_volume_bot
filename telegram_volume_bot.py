@@ -1,6 +1,6 @@
 
 # --- ASIA tightening (hard-coded, no env vars) ---
-ASIA_MIN_CONF_BOOST = 7
+ASIA_MIN_CONF_BOOST = 9
 ASIA_MIN_FUT_VOL_USD = 10_000_000
 ASIA_EXCLUDED_PREFIXES = ("1000",)
 ASIA_SYMBOL_COOLDOWN_HOURS = 6
@@ -893,7 +893,7 @@ TREND_24H_TOL = 0.5
 SESSION_1H_BASE_MULT = {
     "NY": 0.85,
     "LON": 1.00,
-    "ASIA": 1.15,
+    "ASIA": 1.20,
 }
 
 # =========================================================
@@ -967,6 +967,33 @@ FLIP_GUARD_MULT = 1.0  # 1.0 = same as session cooldown hours; try 1.5–2.0 to 
 TF_ALIGN_ENABLED = True
 TF_ALIGN_1H_MIN_ABS = 0.5   # percent
 TF_ALIGN_4H_MIN_ABS = 0.5   # percent
+
+# ✅ Approach A: session-aware TF alignment floors (higher win-rate, esp. ASIA)
+TF_ALIGN_1H_MIN_ABS_BY_SESSION = {
+    "NY": TF_ALIGN_1H_MIN_ABS,
+    "LON": TF_ALIGN_1H_MIN_ABS,
+    "ASIA": 0.8,
+}
+TF_ALIGN_4H_MIN_ABS_BY_SESSION = {
+    "NY": TF_ALIGN_4H_MIN_ABS,
+    "LON": TF_ALIGN_4H_MIN_ABS,
+    "ASIA": 0.8,
+}
+
+def tf_align_mins_for_session(session_name: str) -> tuple[float, float]:
+    s = (session_name or "").strip().upper()
+    return (
+        float(TF_ALIGN_1H_MIN_ABS_BY_SESSION.get(s, TF_ALIGN_1H_MIN_ABS)),
+        float(TF_ALIGN_4H_MIN_ABS_BY_SESSION.get(s, TF_ALIGN_4H_MIN_ABS)),
+    )
+
+# Weekend handling (UTC-based) — slight tightening only (avoid junky liquidity)
+def is_weekend_utc(dt_utc) -> bool:
+    try:
+        return int(dt_utc.weekday()) >= 5
+    except Exception:
+        return False
+
 
 
 def cooldown_hours_for_session(session_name: str) -> int:
@@ -1702,6 +1729,13 @@ def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
 
     sess = knobs["name"]
     base_mult = float(SESSION_1H_BASE_MULT.get(sess, 1.0))
+
+    # ✅ Weekend slight tightening (UTC)
+    try:
+        if is_weekend_utc(datetime.now(timezone.utc)):
+            base_mult *= (1.06 if sess == "ASIA" else 1.03)
+    except Exception:
+        pass
 
     # Global base floor (kept modest)
     base_floor = float(TRIGGER_1H_ABS_MIN_BASE) * base_mult
@@ -5712,6 +5746,23 @@ def make_setup(
                     _rej("4h_bull_regime_blocks_short", base, mv, f"ch4={ch4:+.2f}%")
                     return None
 
+
+        # ✅ Approach A (ASIA): require basic 1H+4H alignment with the signal direction
+        # (NY/LON unchanged to keep flow)
+        try:
+            if str(session_name).upper() == "ASIA":
+                min1, min4 = tf_align_mins_for_session(session_name)
+                if side == "BUY":
+                    if not (ch1 >= min1 and ch4 >= min4):
+                        _rej("asia_tf_align_fail_long", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need>=({min1},{min4})")
+                        return None
+                else:
+                    if not (ch1 <= -min1 and ch4 <= -min4):
+                        _rej("asia_tf_align_fail_short", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need<=(-{min1},-{min4})")
+                        return None
+        except Exception:
+            pass
+
         # =========================================================
         # ✅ PULLBACK EMA (7/14/21) selection (15m)
         # =========================================================
@@ -5916,6 +5967,16 @@ def make_setup(
 
         rr_bonus = ENGINE_B_RR_BONUS if engine_b_ok else 0.0
         tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine_b_ok else 0.0
+
+        # ✅ Approach A: volatility-aware TP cap tightening (higher hit-rate on choppy/high-ATR coins)
+        try:
+            atr_pct = (float(atr_1h) / float(entry)) * 100.0 if float(entry) > 0 else 0.0
+            if atr_pct >= 6.0:
+                tp_cap_pct = min(float(tp_cap_pct), 9.0)
+            elif atr_pct >= 4.5:
+                tp_cap_pct = min(float(tp_cap_pct), 10.5)
+        except Exception:
+            pass
 
         sl, tp3_single, R = compute_sl_tp(
             entry, side, atr_1h, conf, tp_cap_pct,
