@@ -1,3 +1,10 @@
+
+# --- ASIA tightening (hard-coded, no env vars) ---
+ASIA_MIN_CONF_BOOST = 7
+ASIA_MIN_FUT_VOL_USD = 10_000_000
+ASIA_EXCLUDED_PREFIXES = ("1000",)
+ASIA_SYMBOL_COOLDOWN_HOURS = 6
+
 # =========================================================
 # RENDER WEB SERVICE KEEPALIVE (optional)
 # =========================================================
@@ -85,8 +92,6 @@ def _autotrade_migrate_tables():
                 qty REAL,
                 status TEXT,
                 closed_ts INTEGER,
-                outcome TEXT,
-                pnl REAL,
                 pnl_usdt REAL,
                 note TEXT
             )""")
@@ -802,14 +807,6 @@ EMAIL_SETUPS_N = 3
 # ✅ Global setup quality floor (Premium & Selective)
 MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "75"))
 
-# ✅ Session-specific tightening (only ASIA is tightened by default)
-ASIA_MIN_SETUP_CONF = int(os.environ.get("ASIA_MIN_SETUP_CONF", str(MIN_SETUP_CONF + 7)))
-ASIA_MIN_FUT_VOL_USD = float(os.environ.get("ASIA_MIN_FUT_VOL_USD", str(max(MIN_FUT_VOL_USD, 10_000_000))))
-# Comma-separated prefixes to exclude in ASIA (e.g., "1000,PEPE" would exclude any symbol starting with these)
-ASIA_EXCLUDE_PREFIXES = [p.strip().upper() for p in os.environ.get("ASIA_EXCLUDE_PREFIXES", "1000").split(",") if p.strip()]
-# Cooldown override (hours) — reduces repeated ASIA setups
-ASIA_SYMBOL_COOLDOWN_HOURS = int(os.environ.get("ASIA_SYMBOL_COOLDOWN_HOURS", "6"))
-
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
 MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "5000000"))
 MIN_RR_TP3 = float(os.environ.get("MIN_RR_TP3", "1.8"))
@@ -927,7 +924,7 @@ WARN_RISK_PCT_PER_TRADE = 2.0
 SESSION_SYMBOL_COOLDOWN_HOURS = {
     "NY": 1,     # more active
     "LON": 2,    # balanced
-    "ASIA": ASIA_SYMBOL_COOLDOWN_HOURS,   # stricter by default
+    "ASIA": 3,   # a bit stricter
 }
 
 # Fallback if session unknown
@@ -1031,10 +1028,6 @@ BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
 BYBIT_API_SECRET = str(os.environ.get("BYBIT_API_SECRET", "") or "").strip()
 BYBIT_RECV_WINDOW = str(os.environ.get("BYBIT_RECV_WINDOW", "5000") or "5000").strip()
 BYBIT_TESTNET = str(os.environ.get("BYBIT_TESTNET", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
-
-# AutoTrade scan loop
-AUTOTRADE_SCAN_INTERVAL_SEC = int(os.environ.get("AUTOTRADE_SCAN_INTERVAL_SEC", "60") or 60)
-
 
 # Email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
@@ -3810,20 +3803,6 @@ def db_upsert_outcome(setup_id: str, outcome: str, hit_level: str, hit_ts: Optio
                 (float(best_ts) if best_ts is not None else None),
             ),
         )
-
-        # AutoTrade loop (owner-only). Runs independently from email signals.
-        # NOTE: Even in paper mode, it writes to the autotrade journal tables.
-        app.job_queue.run_repeating(
-            autotrade_job,
-            interval=int(max(15, AUTOTRADE_SCAN_INTERVAL_SEC)),
-            first=120,
-            name="autotrade_job",
-            job_kwargs={
-                "max_instances": 1,
-                "coalesce": True,
-                "misfire_grace_time": 60,
-            },
-        )
     else:
         cur.execute(
             """INSERT OR REPLACE INTO signal_outcomes
@@ -5061,7 +5040,7 @@ def rr_to_tp(entry: float, sl: float, tp: float) -> float:
     return d_tp / d_sl
 
 
-def is_top_setup_eligible(s: "Setup", session_name: str | None = None) -> tuple[bool, str]:
+def is_top_setup_eligible(s: "Setup") -> tuple[bool, str]:
     """
     Shared eligibility gate for:
       - /screen -> Top Trade Setups
@@ -5074,29 +5053,13 @@ def is_top_setup_eligible(s: "Setup", session_name: str | None = None) -> tuple[
       Valid TP ladder (TP1/TP2/TP3 present and RR1/RR2/RR3 positive)
     """
     try:
-        # Session-aware tightening (focus: improve ASIA win-rate and reduce noise)
-        sess = (session_name or getattr(s, "session", None) or getattr(s, "sess", None) or "").strip().upper()
-        sym_u = str(getattr(s, "symbol", "") or "").strip().upper()
-
-        min_conf = int(MIN_SETUP_CONF)
-        min_vol = float(MIN_FUT_VOL_USD)
-
-        if sess == "ASIA":
-            min_conf = int(ASIA_MIN_SETUP_CONF)
-            min_vol = float(ASIA_MIN_FUT_VOL_USD)
-            # Exclude noisy micro-meme prefixes during ASIA by default (configurable)
-            for pref in (ASIA_EXCLUDE_PREFIXES or []):
-                if pref and sym_u.startswith(pref):
-                    return (False, "asia_excluded_symbol")
-
         conf = int(getattr(s, "conf", 0) or 0)
-        if conf < int(min_conf):
+        if conf < int(MIN_SETUP_CONF):
             return (False, "below_min_conf")
 
         fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
-        if fut_vol < float(min_vol):
+        if fut_vol < float(MIN_FUT_VOL_USD):
             return (False, "below_min_fut_vol")
-            return (False, "below_min_conf")
 
         entry = float(getattr(s, "entry", 0.0) or 0.0)
         sl = float(getattr(s, "sl", 0.0) or 0.0)
@@ -9066,15 +9029,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
     lines.append(HDR)
     lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
-    # AutoTrade (owner-only)
-    if int(uid) == int(AUTOTRADE_OWNER_UID) or is_admin_user(int(uid)):
-        at_ready = _autotrade_ready()
-        at_mode = str(AUTOTRADE_MODE).upper()
-        at_last = str((_AUTOTRADE_LOOP_HEARTBEAT or {}).get('last_decision','') or '')
-        at_err = str((_AUTOTRADE_LOOP_HEARTBEAT or {}).get('last_error','') or '')
-        if at_err:
-            at_last = (at_last + ' | ' if at_last else '') + ('err: ' + at_err[:120])
-        lines.append(f"AutoTrade: {'ON' if at_ready else 'OFF'} ({at_mode}) | {at_last or _autotrade_ready_reason()}")
     lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
     cur_s = (user.get("trade_window_start") or "").strip()
     cur_e = (user.get("trade_window_end") or "").strip()
@@ -10223,18 +10177,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         market_take = 15
         trend_take = 12
 
-
-    # Session-specific tuning (keep NY/LON as-is; tighten ASIA)
-    if (session_name or "").strip().upper() == "ASIA":
-        # fewer candidates => fewer marginal signals
-        n_target = int(max(2, round(n_target * 0.70)))
-        universe_cap = int(min(universe_cap, 25 if mode != "screen" else max(50, int(universe_cap * 0.75))))
-        trigger_loosen = float(min(trigger_loosen, 0.95))
-        waiting_near = float(min(waiting_near, 0.65))
-        directional_take = int(min(directional_take, 8))
-        market_take = int(min(market_take, 10))
-        trend_take = int(min(trend_take, 8))
-
     # Aggressive profile overrides
     prof = str(scan_profile or DEFAULT_SCAN_PROFILE).strip().lower()
     if prof not in SCAN_PROFILES:
@@ -10285,8 +10227,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         _rej_ctx["__per__"] = {b: {"reason": "not_evaluated", "n": 0} for b in (_rej_ctx["__allow__"] or set())}
 
         try:
-            _LAST_SCAN_UNIVERSE.clear()
-            _LAST_SCAN_UNIVERSE.extend(list(universe_bases or []))
+            global _LAST_SCAN_UNIVERSE
+            _LAST_SCAN_UNIVERSE = list(universe_bases or [])
         except Exception:
             pass
     except Exception:
@@ -10608,7 +10550,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Shared Top Setup gate (applies to BOTH /screen and email)
     # -----------------------------------------------------
     try:
-        ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, session_name)[0]]
+        ordered = [s for s in (ordered or []) if is_top_setup_eligible(s)[0]]
     except Exception:
         pass
 # -----------------------------------------------------
@@ -12286,7 +12228,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             skip_reasons_counter = Counter()
             eligible: List[Setup] = []
             for s in (setups_all or []):
-                ok, why = is_top_setup_eligible(s, session_name)
+                ok, why = is_top_setup_eligible(s)
                 if ok:
                     eligible.append(s)
                 else:
@@ -13396,109 +13338,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Alert job failure: %s", e)
 
 
-# =========================================================
-# AUTOTRADE LOOP (owner-only)
-# =========================================================
-
-AUTOTRADE_LOCK = asyncio.Lock()
-_AUTOTRADE_LOOP_HEARTBEAT = {"alive": False, "last_tick_ts": 0.0, "last_decision": "", "last_error": ""}
-
-def _autotrade_ready_reason() -> str:
-    if not AUTOTRADE_ENABLED:
-        return "AUTOTRADE_ENABLED=0 (disabled)"
-    if AUTOTRADE_OWNER_UID <= 0:
-        return "AUTOTRADE_OWNER_UID missing/0"
-    if AUTOTRADE_MODE not in ("paper", "live"):
-        return f"invalid AUTOTRADE_MODE={AUTOTRADE_MODE}"
-    if AUTOTRADE_MODE == "live" and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
-        return "live mode requires BYBIT_API_KEY/BYBIT_API_SECRET"
-    return "ok"
-
-async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
-    """Background AutoTrade loop: scans and opens trades for AUTOTRADE_OWNER_UID."""
-    try:
-        _AUTOTRADE_LOOP_HEARTBEAT["alive"] = True
-        _AUTOTRADE_LOOP_HEARTBEAT["last_tick_ts"] = time.time()
-    except Exception:
-        pass
-
-    # Never overlap (prevent double-orders / double-journal)
-    if AUTOTRADE_LOCK.locked():
-        return
-
-    async with AUTOTRADE_LOCK:
-        # Hard gate: only if configured
-        rr = _autotrade_ready_reason()
-        if rr != "ok":
-            try:
-                _AUTOTRADE_LOOP_HEARTBEAT["last_decision"] = rr
-            except Exception:
-                pass
-            return
-
-        # Determine session
-        try:
-            session_name = current_session_utc()
-        except Exception:
-            session_name = "NY"
-
-        # Session gate
-        if not _autotrade_allowed_session(session_name):
-            try:
-                _AUTOTRADE_LOOP_HEARTBEAT["last_decision"] = f"session_not_allowed ({session_name})"
-            except Exception:
-                pass
-            return
-
-        # Build candidate setups using the SAME engine as emails (strict, quality-first)
-        try:
-            best_fut = await to_thread_heavy(fetch_futures_tickers, timeout=EMAIL_FETCH_TIMEOUT_SEC)
-        except Exception as e:
-            try:
-                _AUTOTRADE_LOOP_HEARTBEAT["last_error"] = f"fetch_futures_tickers: {type(e).__name__}: {e}"
-            except Exception:
-                pass
-            return
-
-        if not best_fut:
-            try:
-                _AUTOTRADE_LOOP_HEARTBEAT["last_decision"] = "no_market_data"
-            except Exception:
-                pass
-            return
-
-        try:
-            pool = await build_priority_pool(best_fut, session_name, mode="email", scan_profile=DEFAULT_SCAN_PROFILE, uid=int(AUTOTRADE_OWNER_UID))
-            setups = list((pool or {}).get("setups") or [])
-        except Exception as e:
-            try:
-                _AUTOTRADE_LOOP_HEARTBEAT["last_error"] = f"build_priority_pool: {type(e).__name__}: {e}"
-            except Exception:
-                pass
-            return
-
-        if not setups:
-            try:
-                _AUTOTRADE_LOOP_HEARTBEAT["last_decision"] = "no_setups"
-            except Exception:
-                pass
-            return
-
-        # Try to place ONE trade at a time (risk-managed)
-        try:
-            ok, reason = await to_thread_heavy(_autotrade_place_trade, int(AUTOTRADE_OWNER_UID), str(session_name), setups, timeout=EMAIL_SEND_TIMEOUT_SEC)
-        except Exception as e:
-            try:
-                _AUTOTRADE_LOOP_HEARTBEAT["last_error"] = f"_autotrade_place_trade: {type(e).__name__}: {e}"
-            except Exception:
-                pass
-            return
-
-        try:
-            _AUTOTRADE_LOOP_HEARTBEAT["last_decision"] = ("opened_trade" if ok else str(reason))
-        except Exception:
-            pass
-
 
 async def autotrade_sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
@@ -13536,8 +13375,6 @@ def main():
 
     db_init()
     ensure_email_column()
-    _autotrade_migrate_tables()
-    _autotrade_migrate_tables()
     
     app = Application.builder().token(TOKEN).post_init(_post_init).concurrent_updates(32).build()
 
