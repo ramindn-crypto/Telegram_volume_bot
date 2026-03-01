@@ -85,6 +85,8 @@ def _autotrade_migrate_tables():
                 qty REAL,
                 status TEXT,
                 closed_ts INTEGER,
+                outcome TEXT,
+                pnl REAL,
                 pnl_usdt REAL,
                 note TEXT
             )""")
@@ -1021,6 +1023,10 @@ BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
 BYBIT_API_SECRET = str(os.environ.get("BYBIT_API_SECRET", "") or "").strip()
 BYBIT_RECV_WINDOW = str(os.environ.get("BYBIT_RECV_WINDOW", "5000") or "5000").strip()
 BYBIT_TESTNET = str(os.environ.get("BYBIT_TESTNET", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
+
+# AutoTrade scan loop
+AUTOTRADE_SCAN_INTERVAL_SEC = int(os.environ.get("AUTOTRADE_SCAN_INTERVAL_SEC", "60") or 60)
+
 
 # Email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
@@ -3795,6 +3801,20 @@ def db_upsert_outcome(setup_id: str, outcome: str, hit_level: str, hit_ts: Optio
                 str(best_level or ""),
                 (float(best_ts) if best_ts is not None else None),
             ),
+        )
+
+        # AutoTrade loop (owner-only). Runs independently from email signals.
+        # NOTE: Even in paper mode, it writes to the autotrade journal tables.
+        app.job_queue.run_repeating(
+            autotrade_job,
+            interval=int(max(15, AUTOTRADE_SCAN_INTERVAL_SEC)),
+            first=120,
+            name="autotrade_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 60,
+            },
         )
     else:
         cur.execute(
@@ -9022,6 +9042,15 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
     lines.append(HDR)
     lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
+    # AutoTrade (owner-only)
+    if int(uid) == int(AUTOTRADE_OWNER_UID) or is_admin_user(int(uid)):
+        at_ready = _autotrade_ready()
+        at_mode = str(AUTOTRADE_MODE).upper()
+        at_last = str((_AUTOTRADE_LOOP_HEARTBEAT or {}).get('last_decision','') or '')
+        at_err = str((_AUTOTRADE_LOOP_HEARTBEAT or {}).get('last_error','') or '')
+        if at_err:
+            at_last = (at_last + ' | ' if at_last else '') + ('err: ' + at_err[:120])
+        lines.append(f"AutoTrade: {'ON' if at_ready else 'OFF'} ({at_mode}) | {at_last or _autotrade_ready_reason()}")
     lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
     cur_s = (user.get("trade_window_start") or "").strip()
     cur_e = (user.get("trade_window_end") or "").strip()
@@ -13331,6 +13360,109 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Alert job failure: %s", e)
 
 
+# =========================================================
+# AUTOTRADE LOOP (owner-only)
+# =========================================================
+
+AUTOTRADE_LOCK = asyncio.Lock()
+_AUTOTRADE_LOOP_HEARTBEAT = {"alive": False, "last_tick_ts": 0.0, "last_decision": "", "last_error": ""}
+
+def _autotrade_ready_reason() -> str:
+    if not AUTOTRADE_ENABLED:
+        return "AUTOTRADE_ENABLED=0 (disabled)"
+    if AUTOTRADE_OWNER_UID <= 0:
+        return "AUTOTRADE_OWNER_UID missing/0"
+    if AUTOTRADE_MODE not in ("paper", "live"):
+        return f"invalid AUTOTRADE_MODE={AUTOTRADE_MODE}"
+    if AUTOTRADE_MODE == "live" and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
+        return "live mode requires BYBIT_API_KEY/BYBIT_API_SECRET"
+    return "ok"
+
+async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
+    """Background AutoTrade loop: scans and opens trades for AUTOTRADE_OWNER_UID."""
+    try:
+        _AUTOTRADE_LOOP_HEARTBEAT["alive"] = True
+        _AUTOTRADE_LOOP_HEARTBEAT["last_tick_ts"] = time.time()
+    except Exception:
+        pass
+
+    # Never overlap (prevent double-orders / double-journal)
+    if AUTOTRADE_LOCK.locked():
+        return
+
+    async with AUTOTRADE_LOCK:
+        # Hard gate: only if configured
+        rr = _autotrade_ready_reason()
+        if rr != "ok":
+            try:
+                _AUTOTRADE_LOOP_HEARTBEAT["last_decision"] = rr
+            except Exception:
+                pass
+            return
+
+        # Determine session
+        try:
+            session_name = current_session_utc()
+        except Exception:
+            session_name = "NY"
+
+        # Session gate
+        if not _autotrade_allowed_session(session_name):
+            try:
+                _AUTOTRADE_LOOP_HEARTBEAT["last_decision"] = f"session_not_allowed ({session_name})"
+            except Exception:
+                pass
+            return
+
+        # Build candidate setups using the SAME engine as emails (strict, quality-first)
+        try:
+            best_fut = await to_thread_heavy(fetch_futures_tickers, timeout=EMAIL_FETCH_TIMEOUT_SEC)
+        except Exception as e:
+            try:
+                _AUTOTRADE_LOOP_HEARTBEAT["last_error"] = f"fetch_futures_tickers: {type(e).__name__}: {e}"
+            except Exception:
+                pass
+            return
+
+        if not best_fut:
+            try:
+                _AUTOTRADE_LOOP_HEARTBEAT["last_decision"] = "no_market_data"
+            except Exception:
+                pass
+            return
+
+        try:
+            pool = await build_priority_pool(best_fut, session_name, mode="email", scan_profile=DEFAULT_SCAN_PROFILE, uid=int(AUTOTRADE_OWNER_UID))
+            setups = list((pool or {}).get("setups") or [])
+        except Exception as e:
+            try:
+                _AUTOTRADE_LOOP_HEARTBEAT["last_error"] = f"build_priority_pool: {type(e).__name__}: {e}"
+            except Exception:
+                pass
+            return
+
+        if not setups:
+            try:
+                _AUTOTRADE_LOOP_HEARTBEAT["last_decision"] = "no_setups"
+            except Exception:
+                pass
+            return
+
+        # Try to place ONE trade at a time (risk-managed)
+        try:
+            ok, reason = await to_thread_heavy(_autotrade_place_trade, int(AUTOTRADE_OWNER_UID), str(session_name), setups, timeout=EMAIL_SEND_TIMEOUT_SEC)
+        except Exception as e:
+            try:
+                _AUTOTRADE_LOOP_HEARTBEAT["last_error"] = f"_autotrade_place_trade: {type(e).__name__}: {e}"
+            except Exception:
+                pass
+            return
+
+        try:
+            _AUTOTRADE_LOOP_HEARTBEAT["last_decision"] = ("opened_trade" if ok else str(reason))
+        except Exception:
+            pass
+
 
 async def autotrade_sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
@@ -13368,6 +13500,8 @@ def main():
 
     db_init()
     ensure_email_column()
+    _autotrade_migrate_tables()
+    _autotrade_migrate_tables()
     
     app = Application.builder().token(TOKEN).post_init(_post_init).concurrent_updates(32).build()
 
