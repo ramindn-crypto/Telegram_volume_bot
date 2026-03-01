@@ -802,6 +802,14 @@ EMAIL_SETUPS_N = 3
 # ✅ Global setup quality floor (Premium & Selective)
 MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "75"))
 
+# ✅ Session-specific tightening (only ASIA is tightened by default)
+ASIA_MIN_SETUP_CONF = int(os.environ.get("ASIA_MIN_SETUP_CONF", str(MIN_SETUP_CONF + 7)))
+ASIA_MIN_FUT_VOL_USD = float(os.environ.get("ASIA_MIN_FUT_VOL_USD", str(max(MIN_FUT_VOL_USD, 10_000_000))))
+# Comma-separated prefixes to exclude in ASIA (e.g., "1000,PEPE" would exclude any symbol starting with these)
+ASIA_EXCLUDE_PREFIXES = [p.strip().upper() for p in os.environ.get("ASIA_EXCLUDE_PREFIXES", "1000").split(",") if p.strip()]
+# Cooldown override (hours) — reduces repeated ASIA setups
+ASIA_SYMBOL_COOLDOWN_HOURS = int(os.environ.get("ASIA_SYMBOL_COOLDOWN_HOURS", "6"))
+
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
 MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "5000000"))
 MIN_RR_TP3 = float(os.environ.get("MIN_RR_TP3", "1.8"))
@@ -919,7 +927,7 @@ WARN_RISK_PCT_PER_TRADE = 2.0
 SESSION_SYMBOL_COOLDOWN_HOURS = {
     "NY": 1,     # more active
     "LON": 2,    # balanced
-    "ASIA": 3,   # a bit stricter
+    "ASIA": ASIA_SYMBOL_COOLDOWN_HOURS,   # stricter by default
 }
 
 # Fallback if session unknown
@@ -5053,7 +5061,7 @@ def rr_to_tp(entry: float, sl: float, tp: float) -> float:
     return d_tp / d_sl
 
 
-def is_top_setup_eligible(s: "Setup") -> tuple[bool, str]:
+def is_top_setup_eligible(s: "Setup", session_name: str | None = None) -> tuple[bool, str]:
     """
     Shared eligibility gate for:
       - /screen -> Top Trade Setups
@@ -5066,13 +5074,29 @@ def is_top_setup_eligible(s: "Setup") -> tuple[bool, str]:
       Valid TP ladder (TP1/TP2/TP3 present and RR1/RR2/RR3 positive)
     """
     try:
+        # Session-aware tightening (focus: improve ASIA win-rate and reduce noise)
+        sess = (session_name or getattr(s, "session", None) or getattr(s, "sess", None) or "").strip().upper()
+        sym_u = str(getattr(s, "symbol", "") or "").strip().upper()
+
+        min_conf = int(MIN_SETUP_CONF)
+        min_vol = float(MIN_FUT_VOL_USD)
+
+        if sess == "ASIA":
+            min_conf = int(ASIA_MIN_SETUP_CONF)
+            min_vol = float(ASIA_MIN_FUT_VOL_USD)
+            # Exclude noisy micro-meme prefixes during ASIA by default (configurable)
+            for pref in (ASIA_EXCLUDE_PREFIXES or []):
+                if pref and sym_u.startswith(pref):
+                    return (False, "asia_excluded_symbol")
+
         conf = int(getattr(s, "conf", 0) or 0)
-        if conf < int(MIN_SETUP_CONF):
+        if conf < int(min_conf):
             return (False, "below_min_conf")
 
         fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
-        if fut_vol < float(MIN_FUT_VOL_USD):
+        if fut_vol < float(min_vol):
             return (False, "below_min_fut_vol")
+            return (False, "below_min_conf")
 
         entry = float(getattr(s, "entry", 0.0) or 0.0)
         sl = float(getattr(s, "sl", 0.0) or 0.0)
@@ -10199,6 +10223,18 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         market_take = 15
         trend_take = 12
 
+
+    # Session-specific tuning (keep NY/LON as-is; tighten ASIA)
+    if (session_name or "").strip().upper() == "ASIA":
+        # fewer candidates => fewer marginal signals
+        n_target = int(max(2, round(n_target * 0.70)))
+        universe_cap = int(min(universe_cap, 25 if mode != "screen" else max(50, int(universe_cap * 0.75))))
+        trigger_loosen = float(min(trigger_loosen, 0.95))
+        waiting_near = float(min(waiting_near, 0.65))
+        directional_take = int(min(directional_take, 8))
+        market_take = int(min(market_take, 10))
+        trend_take = int(min(trend_take, 8))
+
     # Aggressive profile overrides
     prof = str(scan_profile or DEFAULT_SCAN_PROFILE).strip().lower()
     if prof not in SCAN_PROFILES:
@@ -10249,8 +10285,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         _rej_ctx["__per__"] = {b: {"reason": "not_evaluated", "n": 0} for b in (_rej_ctx["__allow__"] or set())}
 
         try:
-            global _LAST_SCAN_UNIVERSE
-            _LAST_SCAN_UNIVERSE = list(universe_bases or [])
+            _LAST_SCAN_UNIVERSE.clear()
+            _LAST_SCAN_UNIVERSE.extend(list(universe_bases or []))
         except Exception:
             pass
     except Exception:
@@ -10572,7 +10608,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Shared Top Setup gate (applies to BOTH /screen and email)
     # -----------------------------------------------------
     try:
-        ordered = [s for s in (ordered or []) if is_top_setup_eligible(s)[0]]
+        ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, session_name)[0]]
     except Exception:
         pass
 # -----------------------------------------------------
@@ -12250,7 +12286,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             skip_reasons_counter = Counter()
             eligible: List[Setup] = []
             for s in (setups_all or []):
-                ok, why = is_top_setup_eligible(s)
+                ok, why = is_top_setup_eligible(s, session_name)
                 if ok:
                     eligible.append(s)
                 else:
