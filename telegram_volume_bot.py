@@ -1118,7 +1118,7 @@ def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> di
 
 
 def _bybit_get_instr_filters(symbol: str) -> dict:
-    """Return dict with keys: minQty, qtyStep, minNotional (best-effort) for linear USDT perp."""
+    """Return dict with keys: minQty, qtyStep, minNotional as STRINGS (best-effort) for linear USDT perp."""
     sym = _bybit_linear_symbol(symbol)
     if sym in _INSTR_FILTER_CACHE:
         return _INSTR_FILTER_CACHE[sym]
@@ -1130,12 +1130,12 @@ def _bybit_get_instr_filters(symbol: str) -> dict:
             info = items[0] or {}
             lot = info.get("lotSizeFilter") or {}
             if lot.get("minOrderQty") is not None:
-                out["minQty"] = float(lot.get("minOrderQty"))
+                out["minQty"] = str(lot.get("minOrderQty"))
             if lot.get("qtyStep") is not None:
-                out["qtyStep"] = float(lot.get("qtyStep"))
+                out["qtyStep"] = str(lot.get("qtyStep"))
             nf = info.get("notionalFilter") or {}
             if nf.get("minNotional") is not None:
-                out["minNotional"] = float(nf.get("minNotional"))
+                out["minNotional"] = str(nf.get("minNotional"))
     except Exception:
         pass
     _INSTR_FILTER_CACHE[sym] = out
@@ -1143,14 +1143,22 @@ def _bybit_get_instr_filters(symbol: str) -> dict:
 
 
 
-def _fmt_qty(qty: float, step: float | None) -> str:
-    """Format qty as a non-scientific string aligned to qtyStep (Bybit V5 safe)."""
+def _fmt_qty(qty: float, step) -> str:
+    """Format qty as Bybit-safe decimal string aligned to qtyStep (string or float)."""
     try:
         if qty is None:
             return "0"
-        if step is None or step <= 0:
-            # avoid scientific notation
-            return format(Decimal(str(qty)), "f")
+        dqty = Decimal(str(qty))
+        if step is None:
+            return format(dqty, "f")
+        dstep = Decimal(str(step))
+        if dstep <= 0:
+            return format(dqty, "f")
+        mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
+        dq = (mult * dstep).quantize(dstep)
+        return format(dq, "f")
+    except Exception:
+        return format(Decimal(str(qty)), "f")
         dqty = Decimal(str(qty))
         dstep = Decimal(str(step))
         # round up to step multiple
@@ -1163,24 +1171,55 @@ def _fmt_qty(qty: float, step: float | None) -> str:
         return format(Decimal(str(qty)), "f")
 
 def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | None, str | None]:
-    """Round qty UP to qtyStep and minQty/minNotional. Returns (qty, reason_if_failed)."""
-    if qty is None or qty <= 0:
-        return (None, "qty<=0")
-    f = _bybit_get_instr_filters(symbol)
-    step = f.get("qtyStep")
-    min_qty = f.get("minQty")
-    min_not = f.get("minNotional")
+    """Decimal-safe rounding to Bybit qtyStep + minQty (+ minNotional if provided)."""
     try:
-        if step and step > 0:
-            qty = math.ceil(qty / step) * step
-        if min_qty and qty < min_qty:
-            qty = math.ceil(min_qty / step) * step if (step and step > 0) else min_qty
-        if min_not and entry_price > 0 and (qty * entry_price) < min_not:
-            need = min_not / entry_price
-            qty = max(qty, math.ceil(need / step) * step) if (step and step > 0) else max(qty, need)
-        if qty <= 0:
+        if qty is None or float(qty) <= 0:
+            return (None, "qty<=0")
+
+        f = _bybit_get_instr_filters(symbol)
+        step_s = f.get("qtyStep")
+        min_qty_s = f.get("minQty")
+        min_not_s = f.get("minNotional")
+
+        dqty = Decimal(str(qty))
+        dentry = Decimal(str(entry_price)) if entry_price and entry_price > 0 else None
+
+        def _d(x):
+            if x is None:
+                return None
+            try:
+                return Decimal(str(x))
+            except Exception:
+                return None
+
+        dstep = _d(step_s)
+        dmin = _d(min_qty_s)
+        dmin_not = _d(min_not_s)
+
+        if dstep and dstep > 0:
+            mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
+            dqty = (mult * dstep).quantize(dstep)
+
+        if dmin and dqty < dmin:
+            if dstep and dstep > 0:
+                mult = (dmin / dstep).to_integral_value(rounding=ROUND_UP)
+                dqty = (mult * dstep).quantize(dstep)
+            else:
+                dqty = dmin
+
+        if dmin_not and dentry and dentry > 0 and (dqty * dentry) < dmin_not:
+            need = dmin_not / dentry
+            if dstep and dstep > 0:
+                mult = (need / dstep).to_integral_value(rounding=ROUND_UP)
+                dqty = (mult * dstep).quantize(dstep)
+            else:
+                dqty = need
+
+        if dqty <= 0:
             return (None, "qty_rounds_to_0")
-        return (float(qty), None)
+
+        return (float(dqty), None)
+
     except Exception as e:
         return (None, f"qty_round_fail:{type(e).__name__}")
 
