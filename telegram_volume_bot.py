@@ -7481,6 +7481,9 @@ Website: https://pulsefutures.com/
 • Journal/report for bot-opened positions (default 24h)
 • Evaluates TP/SL hit-order via Bybit 1m OHLCV (same as signal_report)
 
+/autotrade_last
+• Shows the last AutoTrade attempt details (symbol sent, qty/step/minNotional, Bybit retCode/retMsg)
+
 /autotrade_report_overall
 • Overall performance summary for bot-opened positions (same metrics as signal_report_overall)
 
@@ -10502,18 +10505,13 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         _WAITING_TRIGGER.clear()
     except Exception:
         pass
-
-    # FORCE_EMAIL_DEFAULTS: keep /screen, /email, and AutoTrade consistent
-    # Email mode is the source-of-truth because it is what users receive in real time.
-    if mode != 'email':
-        mode = 'email'
-
 # knobs
     if mode == "screen":
         n_target = int(SETUPS_N)
         strict_15m = True
-        universe_cap = int(SCREEN_UNIVERSE_N)
-        trigger_loosen = float(SCREEN_TRIGGER_LOOSEN)
+        universe_cap = int(max(SCREEN_UNIVERSE_N, 35))
+        # Ensure /screen is not stricter than email engine
+        trigger_loosen = float(max(SCREEN_TRIGGER_LOOSEN, 1.0))
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
         allow_no_pullback = True
         scan_multiplier = 10
