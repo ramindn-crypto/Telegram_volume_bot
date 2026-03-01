@@ -1069,8 +1069,16 @@ def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> di
     url = _bybit_base_url() + path
 
     ts_ms = str(int(time.time() * 1000))
+    # For V5 signing:
+    # - GET requests must be signed with the query string (not the body).
+    # - POST requests are signed with the JSON body.
     body = json.dumps(payload or {}, separators=(",", ":"), ensure_ascii=False) if method != "GET" else ""
-    sign = _bybit_v5_sign(ts_ms, body) if (BYBIT_API_KEY and BYBIT_API_SECRET) else ""
+    query_str = ""
+    if method == "GET" and "?" in path:
+        query_str = path.split("?", 1)[1]
+    sign_payload = query_str if method == "GET" else body
+    sign = _bybit_v5_sign(ts_ms, sign_payload) if (BYBIT_API_KEY and BYBIT_API_SECRET) else ""
+ else ""
 
     headers = {
         "Content-Type": "application/json",
@@ -1101,19 +1109,38 @@ def _autotrade_ready() -> bool:
     return True
 
 def _bybit_get_equity_usdt() -> float:
-    """Returns account equity (USDT) from Bybit V5 wallet-balance."""
-    res = _bybit_v5_request("GET", "/v5/account/wallet-balance?accountType=UNIFIED&coin=USDT")
-    try:
-        if int(res.get("retCode", -1)) != 0:
+    """Returns account equity (USDT) from Bybit V5 wallet-balance.
+
+    Tries common account types (UNIFIED, CONTRACT) and returns the first positive equity found.
+    """
+    def _extract_equity(res: dict) -> float:
+        try:
+            if int(res.get("retCode", -1)) != 0:
+                return 0.0
+            lst = ((res.get("result") or {}).get("list") or [])
+            if not lst:
+                return 0.0
+            # V5 response: result.list[].coin[] contains entries like {"coin":"USDT","equity":"..."}
+            coins = ((lst[0] or {}).get("coin") or [])
+            usdt = None
+            for c in coins:
+                if str((c or {}).get("coin", "")).upper() == "USDT":
+                    usdt = c or {}
+                    break
+            if not usdt and coins:
+                usdt = coins[0] or {}
+            eq = float(usdt.get("equity") or usdt.get("walletBalance") or usdt.get("availableToWithdraw") or 0.0)
+            return max(0.0, eq)
+        except Exception:
             return 0.0
-        lst = ((res.get("result") or {}).get("list") or [])
-        if not lst:
-            return 0.0
-        coin = (((lst[0] or {}).get("coin") or [])[0] or {})
-        eq = float(coin.get("equity") or coin.get("walletBalance") or coin.get("availableToWithdraw") or 0.0)
-        return max(0.0, eq)
-    except Exception:
-        return 0.0
+
+    for acct in ("UNIFIED", "CONTRACT"):
+        res = _bybit_v5_request("GET", f"/v5/account/wallet-balance?accountType={acct}&coin=USDT")
+        eq = _extract_equity(res)
+        if eq > 0:
+            return eq
+    return 0.0
+
 
 def _live_equity_usdt() -> float | None:
     """LIVE mode equity source. Returns None if unavailable.
