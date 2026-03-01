@@ -1090,6 +1090,21 @@ def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> di
         return {"retCode": -1, "retMsg": f"{type(e).__name__}: {e}", "result": None}
 
 def _autotrade_ready() -> bool:
+
+def _get_live_equity():
+    """Fetch live USDT futures equity from Bybit (safe wrapper)."""
+    try:
+        if not AUTOTRADE_ENABLED or str(AUTOTRADE_MODE).lower() != "live":
+            return None
+        balance = bybit.fetch_balance()
+        # Adjust if using unified or standard account
+        if "USDT" in balance.get("total", {}):
+            return float(balance["total"]["USDT"])
+        if "USDT" in balance.get("free", {}):
+            return float(balance["free"]["USDT"])
+    except Exception as e:
+        logger.warning(f"Live equity fetch failed: {e}")
+    return None
     if not AUTOTRADE_ENABLED:
         return False
     if AUTOTRADE_OWNER_UID <= 0:
@@ -7945,7 +7960,7 @@ async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
     if not context.args:
-        await update.message.reply_text(f"Equity: ${float(user['equity']):.2f}")
+        await update.message.reply_text(f"Equity: ${live_equity if live_equity is not None else equity:.2f}
         return
     try:
         eq = float(context.args[0])
@@ -8710,7 +8725,7 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{warn_daily}{warn_trade_vs_cap}"
         f"{daily_risk_line}\n"
         f"- Trades today: {int(user['day_trade_count'])}/{int(user['max_trades_day'])}\n"
-        f"- Equity: ${float(user['equity']):.2f}\n"
+        f"- Equity: ${live_equity if live_equity is not None else equity:.2f}
         f"- Signal: {signal_id if signal_id else '-'}\n"
         f"- Note: {note if note else '-'}"
     )
@@ -8767,7 +8782,7 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- ID: {trade_id}\n"
         f"- PnL: {float(pnl):+.2f}\n"
         f"- R: {r_txt}\n"
-        f"- New Equity: ${float(user['equity']):.2f}"
+        f"- New Equity: ${live_equity if live_equity is not None else equity:.2f}
     )
 
 async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8975,6 +8990,11 @@ async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+
+    # Live equity override (LIVE mode only)
+    live_equity = _get_live_equity()
+    if live_equity is not None:
+        equity = live_equity
     user = reset_daily_if_needed(get_user(uid))
 
     if not has_active_access(uid, user):
@@ -9024,7 +9044,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("📌 Status")
     lines.append(HDR)
     lines.append(f"Plan: {plan}")
-    lines.append(f"Equity: ${equity:.2f}")
+    lines.append(f"Equity: ${live_equity if live_equity is not None else equity:.2f}
     lines.append(f"PnL today: ${pnl_today:+.2f}")
     lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
     lines.append(f"Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f} (used by /size)")
