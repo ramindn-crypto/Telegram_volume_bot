@@ -60,6 +60,19 @@ import time
 import logging
 import math
 
+
+def _bybit_linear_symbol(sym: str) -> str:
+    """Normalize base symbol like 'FIO' or '1000LUNC' to Bybit linear symbol like 'FIOUSDT'/'1000LUNCUSDT'."""
+    s = (sym or "").replace("/", "").replace(" ", "").upper()
+    if not s:
+        return s
+    if s.endswith("USDT"):
+        return s
+    if "USDT" in s:
+        return s
+    return f"{s}USDT"
+
+
 logger = logging.getLogger(__name__)
 
 # Bybit instrument filters cache (qtyStep/minQty)
@@ -1105,7 +1118,7 @@ def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> di
 
 def _bybit_get_instr_filters(symbol: str) -> dict:
     """Return dict with keys: minQty, qtyStep, minNotional (best-effort) for linear USDT perp."""
-    sym = symbol.replace("/", "")
+    sym = _bybit_linear_symbol(symbol)
     if sym in _INSTR_FILTER_CACHE:
         return _INSTR_FILTER_CACHE[sym]
     out = {"minQty": None, "qtyStep": None, "minNotional": None}
