@@ -59,6 +59,7 @@ import sys
 import time
 import logging
 import math
+from decimal import Decimal, ROUND_UP
 
 
 def _bybit_linear_symbol(sym: str) -> str:
@@ -1141,6 +1142,26 @@ def _bybit_get_instr_filters(symbol: str) -> dict:
     return out
 
 
+
+def _fmt_qty(qty: float, step: float | None) -> str:
+    """Format qty as a non-scientific string aligned to qtyStep (Bybit V5 safe)."""
+    try:
+        if qty is None:
+            return "0"
+        if step is None or step <= 0:
+            # avoid scientific notation
+            return format(Decimal(str(qty)), "f")
+        dqty = Decimal(str(qty))
+        dstep = Decimal(str(step))
+        # round up to step multiple
+        mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
+        dq = mult * dstep
+        # quantize to step's exponent (keeps correct decimals)
+        dq = dq.quantize(dstep)
+        return format(dq, "f")
+    except Exception:
+        return format(Decimal(str(qty)), "f")
+
 def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | None, str | None]:
     """Round qty UP to qtyStep and minQty/minNotional. Returns (qty, reason_if_failed)."""
     if qty is None or qty <= 0:
@@ -1416,12 +1437,28 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (False, f"qty_invalid:{qreason}")
 
 
+    # Format qty as Bybit-safe string (no scientific notation, aligned to qtyStep)
+
+
+
+    _filt = _bybit_get_instr_filters(sym)
+
+
+
+    qty_step = _filt.get('qtyStep')
+
+
+
+    qty_str = _fmt_qty(qty, qty_step)
+
+
+
     open_res = _bybit_v5_request('POST', '/v5/order/create', {
         'category': 'linear',
         'symbol': sym,
         'side': 'Buy' if side == 'BUY' else 'Sell',
         'orderType': 'Market',
-        'qty': str(qty),
+        'qty': qty_str,
         'timeInForce': 'IOC',
     })
 
