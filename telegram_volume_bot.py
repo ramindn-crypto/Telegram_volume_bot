@@ -1267,15 +1267,31 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     side = str(getattr(s, 'side', '') or '').upper()
     entry = float(getattr(s, 'entry', 0.0) or 0.0)
     sl = float(getattr(s, 'sl', 0.0) or 0.0)
-    tp1 = float(getattr(s, 'tp1', 0.0) or 0.0)
-    tp2 = float(getattr(s, 'tp2', 0.0) or 0.0)
-    tp3 = float(getattr(s, 'tp3', 0.0) or 0.0)
+    # TP targets may be partially available depending on the engine/scanner
+    _tp1 = getattr(s, 'tp1', None)
+    _tp2 = getattr(s, 'tp2', None)
+    _tp3 = getattr(s, 'tp3', None)
+
+    def _as_pos_float(x):
+        try:
+            v = float(x)
+            return v if v > 0 else None
+        except Exception:
+            return None
+
+    tp1 = _as_pos_float(_tp1)
+    tp2 = _as_pos_float(_tp2)
+    tp3 = _as_pos_float(_tp3)
 
     if side not in {'BUY', 'SELL'}:
         return (False, f'bad_side ({side})')
 
-    if entry <= 0 or sl <= 0 or tp1 <= 0 or tp2 <= 0 or tp3 <= 0:
+    # Require core prices + at least one TP
+    if entry <= 0 or sl <= 0:
         return (False, 'bad_prices')
+    tps = [v for v in (tp1, tp2, tp3) if v is not None]
+    if not tps:
+        return (False, 'missing_tp')
 
     if side == 'BUY' and sl >= entry:
         return (False, 'sl_not_below_entry_for_buy')
@@ -1300,7 +1316,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
     if AUTOTRADE_MODE == 'paper':
         trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
-        return (True, f'[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}')
+        return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TPs={','.join([f'{x:g}' for x in tps])}")
 
     # LIVE MODE (Bybit V5)
     if AUTOTRADE_ISOLATED:
@@ -1337,14 +1353,24 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         'tpslMode': 'Full',
     })
 
-    splits = AUTOTRADE_TP_SPLIT
-    tp_qtys = [max(0.0, qty * splits[0]), max(0.0, qty * splits[1]), max(0.0, qty * splits[2])]
-    try:
-        tp_qtys[2] = max(0.0, qty - (tp_qtys[0] + tp_qtys[1]))
-    except Exception:
-        pass
+    # Place as many TP orders as we have valid targets
+    tps = [v for v in (tp1, tp2, tp3) if v is not None]
 
-    tps = [tp1, tp2, tp3]
+    if len(tps) == 1:
+        tp_qtys = [qty]
+    elif len(tps) == 2:
+        splits = AUTOTRADE_TP_SPLIT
+        q1 = max(0.0, qty * splits[0])
+        q2 = max(0.0, qty - q1)
+        tp_qtys = [q1, q2]
+    else:
+        splits = AUTOTRADE_TP_SPLIT
+        tp_qtys = [max(0.0, qty * splits[0]), max(0.0, qty * splits[1]), max(0.0, qty * splits[2])]
+        try:
+            tp_qtys[2] = max(0.0, qty - (tp_qtys[0] + tp_qtys[1]))
+        except Exception:
+            pass
+
     for tp_price, tp_qty in zip(tps, tp_qtys):
         if tp_price <= 0 or tp_qty <= 0:
             continue
@@ -1361,7 +1387,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         })
 
     trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
-    return (True, f'[LIVE] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}')
+    return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TPs={','.join([f'{x:g}' for x in tps])}")
 
 
 # Caching for speed
