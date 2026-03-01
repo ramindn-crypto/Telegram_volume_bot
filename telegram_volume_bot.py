@@ -1332,6 +1332,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
     s = setups[0]
     sym = str(getattr(s, 'symbol', '') or '').upper()
+    sym = _bybit_linear_symbol(sym)
+
     side = str(getattr(s, 'side', '') or '').upper()
     entry = float(getattr(s, 'entry', 0.0) or 0.0)
     sl = float(getattr(s, 'sl', 0.0) or 0.0)
