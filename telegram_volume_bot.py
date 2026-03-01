@@ -1078,7 +1078,6 @@ def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> di
         query_str = path.split("?", 1)[1]
     sign_payload = query_str if method == "GET" else body
     sign = _bybit_v5_sign(ts_ms, sign_payload) if (BYBIT_API_KEY and BYBIT_API_SECRET) else ""
- else ""
 
     headers = {
         "Content-Type": "application/json",
