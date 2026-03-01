@@ -13603,7 +13603,29 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
 
         # Build setups with the same engine used by /screen (fast + high quality)
         try:
-            pool = await asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess, mode="screen", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid))
+            pool = await asyncio.to_thread(
+                _run_coro_in_thread,
+                build_priority_pool(
+                    best_fut,
+                    sess,
+                    mode="screen",
+                    scan_profile=str(DEFAULT_SCAN_PROFILE),
+                    uid=uid,
+                ),
+            )
+
+            # If screen-mode returns nothing, fall back to email-mode (matches what you receive in emails).
+            if not (pool.get("setups", []) or []):
+                pool = await asyncio.to_thread(
+                    _run_coro_in_thread,
+                    build_priority_pool(
+                        best_fut,
+                        sess,
+                        mode="email",
+                        scan_profile=str(DEFAULT_SCAN_PROFILE),
+                        uid=uid,
+                    ),
+                )
         except Exception as e:
             _LAST_AUTOTRADE_DECISION[uid] = {
                 "status": "ERROR",
