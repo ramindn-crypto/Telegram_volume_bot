@@ -61,6 +61,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Bybit instrument filters cache (qtyStep/minQty)
+_INSTR_FILTER_CACHE: dict[str, dict] = {}
+
+
 # AutoTrade decision cache (owner/admin visibility)
 _LAST_AUTOTRADE_DECISION: dict[int, dict] = {}
 
@@ -1096,6 +1100,56 @@ def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> di
     except Exception as e:
         return {"retCode": -1, "retMsg": f"{type(e).__name__}: {e}", "result": None}
 
+
+
+def _bybit_get_instr_filters(symbol: str) -> dict:
+    """Return dict with keys: minQty, qtyStep, minNotional (best-effort) for linear USDT perp."""
+    sym = symbol.replace("/", "")
+    if sym in _INSTR_FILTER_CACHE:
+        return _INSTR_FILTER_CACHE[sym]
+    out = {"minQty": None, "qtyStep": None, "minNotional": None}
+    try:
+        res = _bybit_v5_request("GET", "/v5/market/instruments-info", {"category": "linear", "symbol": sym})
+        items = (((res or {}).get("result") or {}).get("list") or [])
+        if items:
+            info = items[0] or {}
+            lot = info.get("lotSizeFilter") or {}
+            if lot.get("minOrderQty") is not None:
+                out["minQty"] = float(lot.get("minOrderQty"))
+            if lot.get("qtyStep") is not None:
+                out["qtyStep"] = float(lot.get("qtyStep"))
+            nf = info.get("notionalFilter") or {}
+            if nf.get("minNotional") is not None:
+                out["minNotional"] = float(nf.get("minNotional"))
+    except Exception:
+        pass
+    _INSTR_FILTER_CACHE[sym] = out
+    return out
+
+
+def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | None, str | None]:
+    """Round qty UP to qtyStep and minQty/minNotional. Returns (qty, reason_if_failed)."""
+    if qty is None or qty <= 0:
+        return (None, "qty<=0")
+    f = _bybit_get_instr_filters(symbol)
+    step = f.get("qtyStep")
+    min_qty = f.get("minQty")
+    min_not = f.get("minNotional")
+    try:
+        if step and step > 0:
+            qty = math.ceil(qty / step) * step
+        if min_qty and qty < min_qty:
+            qty = math.ceil(min_qty / step) * step if (step and step > 0) else min_qty
+        if min_not and entry_price > 0 and (qty * entry_price) < min_not:
+            need = min_not / entry_price
+            qty = max(qty, math.ceil(need / step) * step) if (step and step > 0) else max(qty, need)
+        if qty <= 0:
+            return (None, "qty_rounds_to_0")
+        return (float(qty), None)
+    except Exception as e:
+        return (None, f"qty_round_fail:{type(e).__name__}")
+
+
 def _autotrade_ready() -> bool:
     if not AUTOTRADE_ENABLED:
         return False
@@ -1333,6 +1387,18 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         'buyLeverage': str(AUTOTRADE_LEVERAGE),
         'sellLeverage': str(AUTOTRADE_LEVERAGE),
     })
+
+    # Round qty up to Bybit min/step to prevent rejections on low-price symbols
+
+
+    qty, qreason = _round_qty_up(sym, qty, entry)
+
+
+    if qty is None:
+
+
+        return (False, f"qty_invalid:{qreason}")
+
 
     open_res = _bybit_v5_request('POST', '/v5/order/create', {
         'category': 'linear',
