@@ -82,6 +82,7 @@ _INSTR_FILTER_CACHE: dict[str, dict] = {}
 
 # AutoTrade decision cache (owner/admin visibility)
 _LAST_AUTOTRADE_DECISION: dict[int, dict] = {}
+_LAST_AUTOTRADE_DETAIL: dict[int, dict] = {}
 
 
 import json
@@ -1393,6 +1394,20 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     s = setups[0]
     sym = str(getattr(s, 'symbol', '') or '').upper()
     sym = _bybit_linear_symbol(sym)
+    # keep last autotrade attempt details for /autotrade_last
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)] = {
+            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'session': session_label,
+            'setup_id': str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''),
+            'symbol_raw': str(getattr(s, 'symbol', '') or ''),
+            'symbol_sent': sym,
+            'side': side,
+            'entry': entry,
+            'sl': sl,
+        }
+    except Exception:
+        pass
 
     side = str(getattr(s, 'side', '') or '').upper()
     entry = float(getattr(s, 'entry', 0.0) or 0.0)
@@ -1489,17 +1504,36 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
 
     qty_str = _fmt_qty(qty, qty_step)
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'qty': float(qty) if qty is not None else None,
+            'qty_step': qty_step,
+            'min_qty': _filt.get('minQty'),
+            'min_notional': _filt.get('minNotional'),
+            'qty_str': qty_str,
+        })
+    except Exception:
+        pass
 
 
 
-    open_res = _bybit_v5_request('POST', '/v5/order/create', {
+    order_payload = {
         'category': 'linear',
         'symbol': sym,
         'side': 'Buy' if side == 'BUY' else 'Sell',
         'orderType': 'Market',
         'qty': qty_str,
         'timeInForce': 'IOC',
-    })
+    }
+    open_res = _bybit_v5_request('POST', '/v5/order/create', order_payload)
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'order_payload': {k: (v if k != 'qty' else str(v)) for k, v in (order_payload or {}).items()},
+            'bybit': open_res,
+        })
+    except Exception:
+        pass
+
 
     if int(open_res.get('retCode', -1)) != 0:
         return (False, f"bybit_open_failed retCode={open_res.get('retCode')} retMsg={open_res.get('retMsg')}")
@@ -9288,7 +9322,16 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dec = _LAST_AUTOTRADE_DECISION.get(int(AUTOTRADE_OWNER_UID or 0), {})
         dec_txt = ""
         if dec:
-            dec_txt = f" | Last: {dec.get('status','')} ({dec.get('reason','')}) @ {dec.get('when','')}"
+            _when = str(dec.get('when','') or '')
+            _when_disp = _when
+            try:
+                if _when:
+                    _dt = datetime.fromisoformat(_when.replace('Z','+00:00'))
+                    _dt_m = _dt.astimezone(ZoneInfo('Australia/Melbourne'))
+                    _when_disp = _dt_m.strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                pass
+            dec_txt = f" | Last: {dec.get('status','')} ({dec.get('reason','')}) @ {_when_disp} (Melbourne)"
         lines.append(f"AutoTrade: {at_on} | Mode: {at_mode} | Sessions: {at_sess}{dec_txt}")
     lines.append(HDR)
 
@@ -10290,6 +10333,59 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text("\n".join(lines))
 
 
+async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show last autotrade attempt details (admin only)."""
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not is_admin(uid, user):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    owner = int(AUTOTRADE_OWNER_UID or 0)
+    det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
+    dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
+
+    # Melbourne time for readability
+    when_utc = str(det.get("when") or dec.get("when") or "")
+    when_m = when_utc
+    try:
+        if when_utc:
+            dt = datetime.fromisoformat(when_utc.replace("Z", "+00:00"))
+            when_m = dt.astimezone(ZoneInfo("Australia/Melbourne")).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
+    lines = []
+    lines.append("*AutoTrade — Last Attempt*")
+    lines.append(HDR)
+    if not det and not dec:
+        lines.append("No attempts recorded yet.")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    lines.append(f"*When (Melbourne):* `{when_m}`")
+    if dec:
+        lines.append(f"*Decision:* `{dec.get('status','')}` — `{dec.get('reason','')}`")
+    if det:
+        lines.append(f"*Symbol:* `{det.get('symbol_sent','')}`  (raw: `{det.get('symbol_raw','')}`)")
+        lines.append(f"*Side:* `{det.get('side','')}`")
+        lines.append(f"*Entry:* `{det.get('entry','')}`  *SL:* `{det.get('sl','')}`")
+        if det.get("qty_str") is not None:
+            lines.append(f"*Qty:* `{det.get('qty_str')}` (step {det.get('qty_step')}, min {det.get('min_qty')}, minNot {det.get('min_notional')})")
+        by = det.get("bybit") or {}
+        try:
+            rc = by.get("retCode")
+            rm = by.get("retMsg")
+            if rc is not None or rm:
+                lines.append(f"*Bybit:* retCode={rc} retMsg={rm}")
+        except Exception:
+            pass
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+
 async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _autotrade_migrate_tables()
     """/autotrade_report_overall — Overall performance summary for bot-opened trades."""
@@ -10407,7 +10503,12 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     except Exception:
         pass
 
-    # knobs
+    # FORCE_EMAIL_DEFAULTS: keep /screen, /email, and AutoTrade consistent
+    # Email mode is the source-of-truth because it is what users receive in real time.
+    if mode != 'email':
+        mode = 'email'
+
+# knobs
     if mode == "screen":
         n_target = int(SETUPS_N)
         strict_15m = True
@@ -13603,29 +13704,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
 
         # Build setups with the same engine used by /screen (fast + high quality)
         try:
-            pool = await asyncio.to_thread(
-                _run_coro_in_thread,
-                build_priority_pool(
-                    best_fut,
-                    sess,
-                    mode="screen",
-                    scan_profile=str(DEFAULT_SCAN_PROFILE),
-                    uid=uid,
-                ),
-            )
-
-            # If screen-mode returns nothing, fall back to email-mode (matches what you receive in emails).
-            if not (pool.get("setups", []) or []):
-                pool = await asyncio.to_thread(
-                    _run_coro_in_thread,
-                    build_priority_pool(
-                        best_fut,
-                        sess,
-                        mode="email",
-                        scan_profile=str(DEFAULT_SCAN_PROFILE),
-                        uid=uid,
-                    ),
-                )
+            pool = await asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess, mode="screen", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid))
         except Exception as e:
             _LAST_AUTOTRADE_DECISION[uid] = {
                 "status": "ERROR",
