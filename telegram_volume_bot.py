@@ -1315,40 +1315,6 @@ def _live_equity_usdt() -> float | None:
         return None
 
 
-def _live_equity_usdt_for(uid: int) -> float | None:
-    """Admin-only LIVE equity source.
-
-    Bybit connectivity is reserved for you (admin). For all other users this returns None,
-    forcing the bot to use stored/manual equity.
-    """
-    try:
-        if not is_admin_user(int(uid)):
-            return None
-    except Exception:
-        return None
-    return _live_equity_usdt()
-
-
-def _effective_equity_usdt(user: dict) -> float:
-    """Equity used for sizing/status for a given user.
-
-    - Admin: Bybit live equity when available (AUTOTRADE_MODE=live), else stored equity.
-    - Non-admin: stored/manual equity only.
-    """
-    try:
-        uid = int((user or {}).get("user_id") or 0)
-    except Exception:
-        uid = 0
-
-    live_eq = _live_equity_usdt_for(uid) if uid else None
-    if live_eq is not None:
-        return float(live_eq)
-    try:
-        return float((user or {}).get("equity") or 0.0)
-    except Exception:
-        return 0.0
-
-
 def _autotrade_db_init():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
@@ -2737,6 +2703,23 @@ def db_init():
     )
     """)
 
+    # =========================================================
+    # ✅ Generated setups log (screen vs email correlation)
+    # =========================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS generated_setups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        source TEXT NOT NULL,          -- 'screen' | 'email'
+        created_ts REAL NOT NULL,
+        session TEXT NOT NULL DEFAULT '',
+        setup_id TEXT NOT NULL DEFAULT '',
+        symbol TEXT NOT NULL DEFAULT '',
+        side TEXT NOT NULL DEFAULT '',
+        conf INTEGER DEFAULT 0
+    )
+    """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS signal_outcomes (
         setup_id TEXT PRIMARY KEY,
@@ -2884,141 +2867,8 @@ def db_init():
         # Do not block startup if ALTER TABLE fails
         pass
    
-    
-# =========================================================
-# 📦 Generated setups log (screen vs email correlation)
-# =========================================================
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS generated_setups (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        source TEXT NOT NULL,          -- 'screen' | 'email'
-        created_ts REAL NOT NULL,
-        session TEXT NOT NULL DEFAULT '',
-        setup_id TEXT NOT NULL DEFAULT '',
-        symbol TEXT NOT NULL DEFAULT '',
-        side TEXT NOT NULL DEFAULT '',
-        conf INTEGER DEFAULT 0
-    )
-""")
-con.commit()
-con.close()
-
-
-# =========================================================
-# 📦 GENERATED SETUPS LOG HELPERS (SCREEN vs EMAIL)
-# =========================================================
-
-def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
-    """Log a generated setup for later comparison between /screen and email."""
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            cur = con.cursor()
-            cur.execute(
-                """INSERT INTO generated_setups
-                   (user_id, source, created_ts, session, setup_id, symbol, side, conf)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    int(user_id),
-                    str(source or ""),
-                    float(time.time()),
-                    str(session or ""),
-                    str(getattr(s, "setup_id", "") or ""),
-                    str(getattr(s, "symbol", "") or "").upper(),
-                    str(getattr(s, "side", "") or "").upper(),
-                    int(getattr(s, "conf", 0) or 0),
-                ),
-            )
-            con.commit()
-    except Exception:
-        pass
-
-
-def db_list_generated_setups(user_id: int, since_ts: float, source: str = "", limit: int = 80):
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            cur = con.cursor()
-            if source:
-                cur.execute(
-                    """SELECT source, session, setup_id, symbol, side, conf, created_ts
-                       FROM generated_setups
-                       WHERE user_id=? AND created_ts>=? AND source=?
-                       ORDER BY created_ts DESC
-                       LIMIT ?""",
-                    (int(user_id), float(since_ts), str(source), int(limit)),
-                )
-            else:
-                cur.execute(
-                    """SELECT source, session, setup_id, symbol, side, conf, created_ts
-                       FROM generated_setups
-                       WHERE user_id=? AND created_ts>=?
-                       ORDER BY created_ts DESC
-                       LIMIT ?""",
-                    (int(user_id), float(since_ts), int(limit)),
-                )
-            return cur.fetchall() or []
-    except Exception:
-        return []
-
-
-async def setups_log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-
-    hours = 24
-    src = ""
-    if context.args:
-        try:
-            hours = int(float(context.args[0]))
-        except Exception:
-            hours = 24
-        if len(context.args) >= 2:
-            src = str(context.args[1] or "").strip().lower()
-
-    hours = int(max(1, min(hours, 168)))
-    since_ts = time.time() - hours * 3600.0
-
-    rows = db_list_generated_setups(uid, since_ts, source=src, limit=120)
-    if not rows:
-        await update.message.reply_text("No logged setups in this window yet.")
-        return
-
-    lines = [f"🗂️ Setups Log (last {hours}h){(' • '+src.upper()) if src else ''}", HDR]
-    for (source, session, setup_id, symbol, side, conf, created_ts) in rows[:50]:
-        try:
-            ts_txt = datetime.fromtimestamp(float(created_ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        except Exception:
-            ts_txt = ""
-        lines.append(f"• {ts_txt} | {str(source).upper()} | {symbol} {side} | {setup_id} | conf {conf} | {session}")
-
-    await send_long_message(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-
-async def full_reset_reports_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin_user(uid):
-        await update.message.reply_text("Admin only.")
-        return
-
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            cur = con.cursor()
-            # Wipe anything that affects /signal_report and /signal_report_overall
-            for tbl in ("emailed_setups", "emailed_symbols", "email_daily", "risk_daily", "generated_setups"):
-                try:
-                    cur.execute(f"DELETE FROM {tbl}")
-                except Exception:
-                    pass
-            # Some builds store outcomes under different names
-            for tbl in ("signal_outcomes", "outcomes"):
-                try:
-                    cur.execute(f"DELETE FROM {tbl}")
-                except Exception:
-                    pass
-            con.commit()
-        await update.message.reply_text("✅ Full reset complete. Reports are now zero/blank.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Reset failed: {e}")
-
+    con.commit()
+    con.close()
 
 def _default_sessions_for_tz(tz_name: str) -> List[str]:
     s = tz_name.lower()
@@ -4152,6 +4002,39 @@ def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts:
     )
     con.commit()
     con.close()
+
+
+
+def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
+    """Log a generated setup (from /screen) or a sent setup (email) for correlation."""
+    con = None
+    try:
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute(
+            """INSERT INTO generated_setups
+               (user_id, source, created_ts, session, setup_id, symbol, side, conf)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(user_id),
+                str(source or "").strip().lower(),
+                float(time.time()),
+                str(session or ""),
+                str(getattr(s, "setup_id", "") or ""),
+                str(getattr(s, "symbol", "") or ""),
+                str(getattr(s, "side", "") or ""),
+                int(getattr(s, "conf", 0) or 0),
+            ),
+        )
+        con.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            if con:
+                con.close()
+        except Exception:
+            pass
 
 def db_list_emailed_setups(user_id: int, ts_from: float) -> List[dict]:
     con = db_connect()
@@ -7210,13 +7093,13 @@ def compute_risk_usd(user: dict, mode: str, value: float) -> float:
     mode = mode.upper()
     if mode == "USD":
         return max(0.0, float(value))
-
-    # ✅ Equity is MANUAL for all users, except admin (who can use Bybit live equity).
-    eq = _effective_equity_usdt(user)
+    eq = float(user["equity"])
+    live_eq = _live_equity_usdt()
+    if live_eq is not None:
+        eq = live_eq
     if eq <= 0:
         return 0.0
     return max(0.0, eq * (float(value) / 100.0))
-
 
 def calc_qty(entry: float, sl: float, risk_usd: float) -> float:
     d = abs(entry - sl)
@@ -7620,13 +7503,9 @@ Not financial advice.
 • Revoke paid access (sets to FREE)
 
 /admin_reset_report
+/admin_reset_signal_reports
+/setups_log [n] [screen|email|all]
 • Archive signals/outcomes and reset live performance report
-
-/full_reset_reports
-• FULL reset: clears /signal_report, /signal_report_overall & setup logs (sets everything to 0)
-
-/setups_log [hours] [screen|email]
-• View logged setups (correlate /screen vs email). Default 24h
 
 /myplan
 • View your own plan status (admins too)
@@ -8444,48 +8323,19 @@ async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ TZ set to {tz_name}\nDefault sessions updated. Use /sessions to view.")
 
 async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/equity [amount]
-
-    Product behavior:
-    - All users (non-admin): equity is MANUAL. They set it with /equity <amount> and it is updated by /trade_close pnl.
-    - Admin: /equity display matches /status (Bybit live equity if available in AUTOTRADE_MODE=live). Admin can still set stored equity.
-    """
     uid = update.effective_user.id
-    user = get_user(uid) or {}
-
-    # Admin-only live equity (everyone else -> None)
-    live_eq = _live_equity_usdt_for(uid)
-    stored_eq = float((user or {}).get("equity") or 0.0)
-
-    # No args: just show current effective equity + source
+    user = get_user(uid)
     if not context.args:
-        if live_eq is not None:
-            await update.message.reply_text(f"Equity: ${float(live_eq):.2f}  [Bybit (admin live)]")
-        else:
-            await update.message.reply_text(f"Equity: ${stored_eq:.2f}  [Manual]")
+        await update.message.reply_text(f"Equity: ${float(user['equity']):.2f}")
         return
-
-    # With args: set stored equity (allowed for everyone)
     try:
-        eq = float(str(context.args[0]).strip())
-        if not math.isfinite(eq) or eq < 0:
+        eq = float(context.args[0])
+        if eq < 0:
             raise ValueError()
         update_user(uid, equity=eq)
-
-        # Friendly notes depending on admin/live
-        if live_eq is not None:
-            await update.message.reply_text(
-                f"✅ Stored equity updated: ${eq:.2f}\n"
-                f"ℹ️ Admin note: /status and /equity display uses Bybit live equity while AUTOTRADE_MODE=live."
-            )
-        else:
-            await update.message.reply_text(
-                f"✅ Equity set: ${eq:.2f}\n"
-                f"ℹ️ It will update automatically when you close trades using /trade_close <id> pnl <pnl>."
-            )
+        await update.message.reply_text(f"✅ Equity set: ${eq:.2f}")
     except Exception:
         await update.message.reply_text("Usage: /equity 1000")
-
 
 async def equity_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -9519,9 +9369,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     opens = db_open_trades(uid)
 
     plan = str(effective_plan(uid, user)).upper()
+    equity = float((user or {}).get("equity") or 0.0)
 
-    # ✅ Equity: admin may use Bybit live equity; all other users use stored/manual equity.
-    equity = _effective_equity_usdt(user)
+    live_eq = _live_equity_usdt()
+    if live_eq is not None:
+        equity = live_eq
 
     cap = daily_cap_usd(user)
     # Sync used risk from CURRENT open positions (RF/close frees capacity instantly)
@@ -10246,16 +10098,9 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     emailed = db_list_emailed_setups(uid, ts_from)
 
     if not emailed:
-        # After /admin_reset_report we intentionally clear emailed_setups, so show a clean 0 report.
-        header = [
-            f"📊 Signal Report (last {lookback_h}h)",
-            HDR,
-            "Total: 0 | Decided: 0 | Wins: 0 | Losses: 0 | Win rate: 0.0%",
-            "TP1: 0 | TP2: 0 | TP3: 0 | Open: 0 | Amb: 0",
-            HDR,
-        ]
-        msg = "\n".join(header) + "\n<pre></pre>\nSession breakdown:\n• (none)"
-        await send_long_message(update, msg, parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"No emailed setups found in the last {lookback_h}h."
+        )
         return
 
     # Evaluate (heavy)
@@ -10379,6 +10224,121 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+
+
+
+
+async def setups_log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setups_log [n] [screen|email|all] — view recently generated setups."""
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not has_active_access(uid, user):
+        await update.message.reply_text("⛔️ Trial finished. 👉 /billing")
+        return
+
+    n = 30
+    src = "all"
+    if context.args:
+        if context.args[0].isdigit():
+            n = max(1, min(200, int(context.args[0])))
+            if len(context.args) > 1:
+                src = str(context.args[1]).strip().lower()
+        else:
+            src = str(context.args[0]).strip().lower()
+            if len(context.args) > 1 and context.args[1].isdigit():
+                n = max(1, min(200, int(context.args[1])))
+
+    if src not in ("all", "screen", "email"):
+        src = "all"
+
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            if src == "all":
+                cur.execute(
+                    """SELECT created_ts, source, session, setup_id, symbol, side, conf
+                       FROM generated_setups
+                       WHERE user_id=?
+                       ORDER BY created_ts DESC
+                       LIMIT ?""",
+                    (int(uid), int(n)),
+                )
+            else:
+                cur.execute(
+                    """SELECT created_ts, source, session, setup_id, symbol, side, conf
+                       FROM generated_setups
+                       WHERE user_id=? AND source=?
+                       ORDER BY created_ts DESC
+                       LIMIT ?""",
+                    (int(uid), str(src), int(n)),
+                )
+            rows = cur.fetchall() or []
+    except Exception as e:
+        await update.message.reply_text(f"❌ setups_log error: {e}")
+        return
+
+    if not rows:
+        await update.message.reply_text("📦 Setups Log\n\nNo rows yet.")
+        return
+
+    lines = ["📦 Setups Log", HDR, f"Showing last {len(rows)} ({src})", ""]
+    for r in rows:
+        try:
+            ts = float(r["created_ts"])
+            dt = datetime.fromtimestamp(ts, timezone.utc).strftime("%m-%d %H:%MZ")
+        except Exception:
+            dt = "?"
+        lines.append(
+            f"{dt} | {str(r['source']).upper():5s} | {str(r['session']):8.8s} | {str(r['setup_id'])} | {str(r['side']).upper():4s} {str(r['symbol']).upper():10s} | {int(r['conf'] or 0)}"
+        )
+
+    await send_long_message(update, "\n".join(lines), parse_mode=None, disable_web_page_preview=True)
+
+
+async def admin_reset_signal_reports_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/admin_reset_signal_reports — hard reset all report-related tables to empty/zero."""
+    if not _is_admin(update):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    try:
+        async with DB_FILE_LOCK:
+            with sqlite3.connect(DB_PATH) as con:
+                c = con.cursor()
+
+                # Clear live tables used by /signal_report & /signal_report_overall + correlation log
+                for t in ("signals", "emailed_setups", "generated_setups"):
+                    try:
+                        c.execute(f"DELETE FROM {t}")
+                    except Exception:
+                        pass
+
+                # Outcomes table name can vary across builds
+                try:
+                    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('signal_outcomes','outcomes')")
+                    row = c.fetchone()
+                    if row and row[0]:
+                        try:
+                            c.execute(f"DELETE FROM {row[0]}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Reset daily counters that affect totals
+                for t in ("email_daily", "risk_daily", "setup_counter", "emailed_symbols"):
+                    try:
+                        c.execute(f"DELETE FROM {t}")
+                    except Exception:
+                        pass
+
+                con.commit()
+
+        await update.message.reply_text("✅ Reports reset: all totals are now 0 and tables cleared.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ admin_reset_signal_reports failed: {e}")
 
 
 async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11369,15 +11329,12 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
             if not hasattr(s, "conf") or s.conf is None:
                 s.conf = 0
             db_insert_signal(s)
+            try:
+                db_log_generated_setup(uid, "screen", session, s)
+            except Exception:
+                pass
     except Exception:
         pass
-
-# Log setups for /setups_log correlation (screen source)
-try:
-    for _s in (setups or []):
-        db_log_generated_setup(uid, "screen", str(session or ""), _s)
-except Exception:
-    pass
 
     # Setup cards -> combined text (single "Top Trade Setups" section)
     combined_setups_txt = "_No high-quality setups right now._"
@@ -12169,12 +12126,10 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                     db_mark_emailed_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
                 except Exception:
                     pass
-# Log emailed setup for /setups_log correlation (email source)
-try:
-    db_log_generated_setup(uid, "email", str(display_session or ""), s)
-except Exception:
-    pass
-
+                try:
+                    db_log_generated_setup(uid, "email", str(display_session or ""), s)
+                except Exception:
+                    pass
         except Exception:
             pass
     return sent
@@ -13830,14 +13785,6 @@ async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
                 c.execute(f"INSERT INTO outcomes_archive SELECT *, ? FROM {outcomes_src}", (now_ts,))
                 c.execute(f"DELETE FROM {outcomes_src}")
 
-
-            # --- Emailed setups (used by /signal_report) ---
-            # After reset, /signal_report should start from zero.
-            try:
-                c.execute("DELETE FROM emailed_setups")
-            except Exception:
-                pass
-
             conn.commit()
 
         msg = "✅ Signals archived and report reset."
@@ -14113,10 +14060,6 @@ def main():
     app.add_handler(CommandHandler("guide_full", guide_full_cmd, block=False))
     app.add_handler(CommandHandler("start", cmd_start, block=False))
     app.add_handler(CommandHandler("help_admin", cmd_help_admin, block=False))
-# --- Setup correlation / reporting reset (admin/debug) ---
-app.add_handler(CommandHandler("setups_log", setups_log_cmd, block=False))
-app.add_handler(CommandHandler("full_reset_reports", full_reset_reports_cmd, block=False))
-
     app.add_handler(CommandHandler("manage", manage_cmd, block=False))
     app.add_handler(CommandHandler("myplan", myplan_cmd, block=False))
     app.add_handler(CommandHandler("support", support_cmd, block=False))
@@ -14189,6 +14132,7 @@ app.add_handler(CommandHandler("full_reset_reports", full_reset_reports_cmd, blo
     app.add_handler(CommandHandler("admin_grant", admin_grant_cmd, block=False))
     app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd, block=False))
     app.add_handler(CommandHandler("admin_reset_report", admin_reset_report_cmd, block=False))
+    app.add_handler(CommandHandler("admin_reset_signal_reports", admin_reset_signal_reports_cmd, block=False))
     app.add_handler(CommandHandler("admin_payments", admin_payments_cmd, block=False))
 
     # Admin: approve Stripe/USDT payments and grant access
