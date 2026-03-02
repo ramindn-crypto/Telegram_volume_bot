@@ -10400,9 +10400,9 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show last autotrade attempt details (admin only)."""
     uid = update.effective_user.id
-    user = get_user(uid)
 
-    if not is_admin(uid, user):
+    # Use the bot's canonical admin check (avoid undefined is_admin())
+    if not is_admin_user(uid):
         await update.message.reply_text("⛔️ Admin only.")
         return
 
