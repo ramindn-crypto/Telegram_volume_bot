@@ -14013,6 +14013,8 @@ def main():
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd, block=False))
     app.add_handler(CommandHandler("signal_report", signal_report_cmd, block=False))
     app.add_handler(CommandHandler("signal_report_overall", signal_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("setups_log", setups_log_cmd))
+    app.add_handler(CommandHandler("full_reset_reports", full_reset_reports_cmd))
     app.add_handler(CommandHandler("signal_report_all", signal_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("health", health_cmd, block=False))
     app.add_handler(CommandHandler("reset", reset_cmd, block=False))
