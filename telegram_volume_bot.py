@@ -1315,6 +1315,40 @@ def _live_equity_usdt() -> float | None:
         return None
 
 
+def _live_equity_usdt_for(uid: int) -> float | None:
+    """Admin-only LIVE equity source.
+
+    Bybit connectivity is reserved for you (admin). For all other users this returns None,
+    forcing the bot to use stored/manual equity.
+    """
+    try:
+        if not is_admin_user(int(uid)):
+            return None
+    except Exception:
+        return None
+    return _live_equity_usdt()
+
+
+def _effective_equity_usdt(user: dict) -> float:
+    """Equity used for sizing/status for a given user.
+
+    - Admin: Bybit live equity when available (AUTOTRADE_MODE=live), else stored equity.
+    - Non-admin: stored/manual equity only.
+    """
+    try:
+        uid = int((user or {}).get("user_id") or 0)
+    except Exception:
+        uid = 0
+
+    live_eq = _live_equity_usdt_for(uid) if uid else None
+    if live_eq is not None:
+        return float(live_eq)
+    try:
+        return float((user or {}).get("equity") or 0.0)
+    except Exception:
+        return 0.0
+
+
 def _autotrade_db_init():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
@@ -7043,13 +7077,13 @@ def compute_risk_usd(user: dict, mode: str, value: float) -> float:
     mode = mode.upper()
     if mode == "USD":
         return max(0.0, float(value))
-    eq = float(user["equity"])
-    live_eq = _live_equity_usdt()
-    if live_eq is not None:
-        eq = live_eq
+
+    # ✅ Equity is MANUAL for all users, except admin (who can use Bybit live equity).
+    eq = _effective_equity_usdt(user)
     if eq <= 0:
         return 0.0
     return max(0.0, eq * (float(value) / 100.0))
+
 
 def calc_qty(entry: float, sl: float, risk_usd: float) -> float:
     d = abs(entry - sl)
@@ -8272,36 +8306,44 @@ async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/equity [amount]
-    - Without args: show the same equity number used in /status (Bybit live equity if available).
-    - With args: set stored equity (used for /size in non-live modes / when Bybit equity unavailable).
+
+    Product behavior:
+    - All users (non-admin): equity is MANUAL. They set it with /equity <amount> and it is updated by /trade_close pnl.
+    - Admin: /equity display matches /status (Bybit live equity if available in AUTOTRADE_MODE=live). Admin can still set stored equity.
     """
     uid = update.effective_user.id
     user = get_user(uid) or {}
 
-    # Match /status behavior: prefer live Bybit equity when available (AUTOTRADE live mode)
-    live_eq = _live_equity_usdt()
-    equity_display = float(live_eq) if live_eq is not None else float((user or {}).get("equity") or 0.0)
+    # Admin-only live equity (everyone else -> None)
+    live_eq = _live_equity_usdt_for(uid)
+    stored_eq = float((user or {}).get("equity") or 0.0)
 
+    # No args: just show current effective equity + source
     if not context.args:
-        src = "Bybit (live)" if live_eq is not None else "Stored"
-        await update.message.reply_text(f"Equity: ${equity_display:.2f}  [{src}]")
+        if live_eq is not None:
+            await update.message.reply_text(f"Equity: ${float(live_eq):.2f}  [Bybit (admin live)]")
+        else:
+            await update.message.reply_text(f"Equity: ${stored_eq:.2f}  [Manual]")
         return
 
-    # Set stored equity
+    # With args: set stored equity (allowed for everyone)
     try:
         eq = float(str(context.args[0]).strip())
         if not math.isfinite(eq) or eq < 0:
             raise ValueError()
         update_user(uid, equity=eq)
 
-        # If live equity exists, be explicit that /status will still show live
+        # Friendly notes depending on admin/live
         if live_eq is not None:
             await update.message.reply_text(
                 f"✅ Stored equity updated: ${eq:.2f}\n"
-                f"ℹ️ Note: /status (and /equity display) uses Bybit live equity while AUTOTRADE_MODE=live."
+                f"ℹ️ Admin note: /status and /equity display uses Bybit live equity while AUTOTRADE_MODE=live."
             )
         else:
-            await update.message.reply_text(f"✅ Equity set: ${eq:.2f}")
+            await update.message.reply_text(
+                f"✅ Equity set: ${eq:.2f}\n"
+                f"ℹ️ It will update automatically when you close trades using /trade_close <id> pnl <pnl>."
+            )
     except Exception:
         await update.message.reply_text("Usage: /equity 1000")
 
@@ -9338,11 +9380,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     opens = db_open_trades(uid)
 
     plan = str(effective_plan(uid, user)).upper()
-    equity = float((user or {}).get("equity") or 0.0)
 
-    live_eq = _live_equity_usdt()
-    if live_eq is not None:
-        equity = live_eq
+    # ✅ Equity: admin may use Bybit live equity; all other users use stored/manual equity.
+    equity = _effective_equity_usdt(user)
 
     cap = daily_cap_usd(user)
     # Sync used risk from CURRENT open positions (RF/close frees capacity instantly)
