@@ -2884,8 +2884,141 @@ def db_init():
         # Do not block startup if ALTER TABLE fails
         pass
    
-    con.commit()
+    
+# =========================================================
+# 📦 Generated setups log (screen vs email correlation)
+# =========================================================
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS generated_setups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        source TEXT NOT NULL,          -- 'screen' | 'email'
+        created_ts REAL NOT NULL,
+        session TEXT NOT NULL DEFAULT '',
+        setup_id TEXT NOT NULL DEFAULT '',
+        symbol TEXT NOT NULL DEFAULT '',
+        side TEXT NOT NULL DEFAULT '',
+        conf INTEGER DEFAULT 0
+    )
+""")
+con.commit()
     con.close()
+
+
+# =========================================================
+# 📦 GENERATED SETUPS LOG HELPERS (SCREEN vs EMAIL)
+# =========================================================
+
+def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
+    """Log a generated setup for later comparison between /screen and email."""
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            cur.execute(
+                """INSERT INTO generated_setups
+                   (user_id, source, created_ts, session, setup_id, symbol, side, conf)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    int(user_id),
+                    str(source or ""),
+                    float(time.time()),
+                    str(session or ""),
+                    str(getattr(s, "setup_id", "") or ""),
+                    str(getattr(s, "symbol", "") or "").upper(),
+                    str(getattr(s, "side", "") or "").upper(),
+                    int(getattr(s, "conf", 0) or 0),
+                ),
+            )
+            con.commit()
+    except Exception:
+        pass
+
+
+def db_list_generated_setups(user_id: int, since_ts: float, source: str = "", limit: int = 80):
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            if source:
+                cur.execute(
+                    """SELECT source, session, setup_id, symbol, side, conf, created_ts
+                       FROM generated_setups
+                       WHERE user_id=? AND created_ts>=? AND source=?
+                       ORDER BY created_ts DESC
+                       LIMIT ?""",
+                    (int(user_id), float(since_ts), str(source), int(limit)),
+                )
+            else:
+                cur.execute(
+                    """SELECT source, session, setup_id, symbol, side, conf, created_ts
+                       FROM generated_setups
+                       WHERE user_id=? AND created_ts>=?
+                       ORDER BY created_ts DESC
+                       LIMIT ?""",
+                    (int(user_id), float(since_ts), int(limit)),
+                )
+            return cur.fetchall() or []
+    except Exception:
+        return []
+
+
+async def setups_log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    hours = 24
+    src = ""
+    if context.args:
+        try:
+            hours = int(float(context.args[0]))
+        except Exception:
+            hours = 24
+        if len(context.args) >= 2:
+            src = str(context.args[1] or "").strip().lower()
+
+    hours = int(max(1, min(hours, 168)))
+    since_ts = time.time() - hours * 3600.0
+
+    rows = db_list_generated_setups(uid, since_ts, source=src, limit=120)
+    if not rows:
+        await update.message.reply_text("No logged setups in this window yet.")
+        return
+
+    lines = [f"🗂️ Setups Log (last {hours}h){(' • '+src.upper()) if src else ''}", HDR]
+    for (source, session, setup_id, symbol, side, conf, created_ts) in rows[:50]:
+        try:
+            ts_txt = datetime.fromtimestamp(float(created_ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except Exception:
+            ts_txt = ""
+        lines.append(f"• {ts_txt} | {str(source).upper()} | {symbol} {side} | {setup_id} | conf {conf} | {session}")
+
+    await send_long_message(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def full_reset_reports_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("Admin only.")
+        return
+
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            # Wipe anything that affects /signal_report and /signal_report_overall
+            for tbl in ("emailed_setups", "emailed_symbols", "email_daily", "risk_daily", "generated_setups"):
+                try:
+                    cur.execute(f"DELETE FROM {tbl}")
+                except Exception:
+                    pass
+            # Some builds store outcomes under different names
+            for tbl in ("signal_outcomes", "outcomes"):
+                try:
+                    cur.execute(f"DELETE FROM {tbl}")
+                except Exception:
+                    pass
+            con.commit()
+        await update.message.reply_text("✅ Full reset complete. Reports are now zero/blank.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Reset failed: {e}")
+
 
 def _default_sessions_for_tz(tz_name: str) -> List[str]:
     s = tz_name.lower()
@@ -7489,6 +7622,12 @@ Not financial advice.
 /admin_reset_report
 • Archive signals/outcomes and reset live performance report
 
+/full_reset_reports
+• FULL reset: clears /signal_report, /signal_report_overall & setup logs (sets everything to 0)
+
+/setups_log [hours] [screen|email]
+• View logged setups (correlate /screen vs email). Default 24h
+
 /myplan
 • View your own plan status (admins too)
 
@@ -7571,13 +7710,6 @@ Website: https://pulsefutures.com/
 • Overall performance summary across ALL emailed setups (short output)
 • Includes win-rate, TP1/TP2/TP3/SL counts, Avg R/trade, Profit Factor
 • Uses stored evaluated outcomes; shows coverage %
-
-/setups_log [hours]
-• View logged setups generated by /screen and emails (default 24h)
-• Helps correlate /screen vs /email behavior
-
-/full_reset_reports
-• (Admin) FULL reset of signal reports + logs (sets everything back to 0)
 
 /autotrade_report [hours]
 • Journal/report for bot-opened positions (default 24h)
@@ -11240,6 +11372,13 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     except Exception:
         pass
 
+# Log setups for /setups_log correlation (screen source)
+try:
+    for _s in (setups or []):
+        db_log_generated_setup(uid, "screen", str(session or ""), _s)
+except Exception:
+    pass
+
     # Setup cards -> combined text (single "Top Trade Setups" section)
     combined_setups_txt = "_No high-quality setups right now._"
     if setups:
@@ -12030,6 +12169,12 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                     db_mark_emailed_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
                 except Exception:
                     pass
+# Log emailed setup for /setups_log correlation (email source)
+try:
+    db_log_generated_setup(uid, "email", str(display_session or ""), s)
+except Exception:
+    pass
+
         except Exception:
             pass
     return sent
@@ -13968,6 +14113,10 @@ def main():
     app.add_handler(CommandHandler("guide_full", guide_full_cmd, block=False))
     app.add_handler(CommandHandler("start", cmd_start, block=False))
     app.add_handler(CommandHandler("help_admin", cmd_help_admin, block=False))
+# --- Setup correlation / reporting reset (admin/debug) ---
+app.add_handler(CommandHandler("setups_log", setups_log_cmd, block=False))
+app.add_handler(CommandHandler("full_reset_reports", full_reset_reports_cmd, block=False))
+
     app.add_handler(CommandHandler("manage", manage_cmd, block=False))
     app.add_handler(CommandHandler("myplan", myplan_cmd, block=False))
     app.add_handler(CommandHandler("support", support_cmd, block=False))
@@ -14013,8 +14162,6 @@ def main():
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd, block=False))
     app.add_handler(CommandHandler("signal_report", signal_report_cmd, block=False))
     app.add_handler(CommandHandler("signal_report_overall", signal_report_overall_cmd, block=False))
-    app.add_handler(CommandHandler("setups_log", setups_log_cmd))
-    app.add_handler(CommandHandler("full_reset_reports", full_reset_reports_cmd))
     app.add_handler(CommandHandler("signal_report_all", signal_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("health", health_cmd, block=False))
     app.add_handler(CommandHandler("reset", reset_cmd, block=False))
@@ -14125,120 +14272,3 @@ if __name__ == "__main__":
 
 
 
-
-
-
-# =========================================================
-# 📦 GENERATED SETUPS LOG (SCREEN vs EMAIL ANALYSIS)
-# =========================================================
-
-def ensure_generated_setups_table():
-    with sqlite3.connect(DB_PATH) as con:
-        cur = con.cursor()
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS generated_setups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            setup_id TEXT,
-            symbol TEXT,
-            side TEXT,
-            source TEXT,          -- 'screen' or 'email'
-            session TEXT,
-            conf INTEGER,
-            created_ts REAL NOT NULL
-        )
-        """)
-        con.commit()
-
-ensure_generated_setups_table()
-
-
-def db_log_generated_setup(user_id: int, s, source: str, session: str):
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            cur = con.cursor()
-            cur.execute("""
-                INSERT INTO generated_setups
-                (user_id, setup_id, symbol, side, source, session, conf, created_ts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                user_id,
-                getattr(s, "setup_id", ""),
-                str(getattr(s, "symbol", "")).upper(),
-                str(getattr(s, "side", "")).upper(),
-                source,
-                session or "",
-                int(getattr(s, "conf", 0) or 0),
-                time.time(),
-            ))
-            con.commit()
-    except Exception:
-        pass
-
-
-async def setups_log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    hours = 24
-    if context.args:
-        try:
-            hours = max(1, int(context.args[0]))
-        except Exception:
-            pass
-
-    since_ts = time.time() - hours * 3600
-
-    with sqlite3.connect(DB_PATH) as con:
-        cur = con.cursor()
-        cur.execute("""
-            SELECT symbol, side, source, conf, datetime(created_ts,'unixepoch')
-            FROM generated_setups
-            WHERE user_id=? AND created_ts>=?
-            ORDER BY created_ts DESC
-        """, (uid, since_ts))
-        rows = cur.fetchall()
-
-    if not rows:
-        await update.message.reply_text("No generated setups in selected window.")
-        return
-
-    lines = [f"Last {hours}h Generated Setups:\n"]
-    for r in rows[:50]:
-        lines.append(f"{r[4]} | {r[0]} {r[1]} | {r[2]} | conf {r[3]}")
-
-    await update.message.reply_text("\n".join(lines))
-
-
-async def full_reset_reports_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin_user(uid):
-        await update.message.reply_text("Admin only.")
-        return
-
-    with sqlite3.connect(DB_PATH) as con:
-        cur = con.cursor()
-        cur.execute("DELETE FROM emailed_symbols")
-        cur.execute("DELETE FROM generated_setups")
-        cur.execute("DELETE FROM email_daily")
-        cur.execute("DELETE FROM risk_daily")
-        con.commit()
-
-    await update.message.reply_text("✅ All signal reports and logs fully reset to zero.")
-
-
-# =========================================================
-# 📌 Hook logging into screen/email pipeline
-# =========================================================
-
-_original_db_insert_signal = db_insert_signal
-
-def db_insert_signal(s):
-    _original_db_insert_signal(s)
-    try:
-        # Attempt to infer context: if called inside /screen, source='screen'
-        source = "unknown"
-        session = ""
-        if hasattr(s, "engine"):
-            source = "screen"
-        db_log_generated_setup(0, s, source, session)
-    except Exception:
-        pass
