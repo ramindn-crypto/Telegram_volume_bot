@@ -8953,15 +8953,16 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     raw_full = " ".join(context.args).strip()
     if not raw_full:
-        await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 risk usd 40 [note ...] [sig PF-...]")
+        await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 [risk usd 40|risk pct 2] [note ...] [sig PF-...]\nIf risk is omitted, it uses your /riskmode settings.")
         return
 
     bracket_parts = re.findall(r"\[([^\]]+)\]", raw_full)
     raw = re.sub(r"\[[^\]]+\]", "", raw_full).strip()
 
     tokens = raw.split()
-    if len(tokens) < 9:
-        await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 risk usd 40 [note ...] [sig PF-...]")
+    # Minimum: <sym> <long|short> entry <px> sl <px> (risk is optional)
+    if len(tokens) < 6 or "entry" not in tokens or "sl" not in tokens:
+        await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 [risk usd 40|risk pct 2] [note ...] [sig PF-...]\nIf risk is omitted, it uses your /riskmode settings.")
         return
 
     sym = re.sub(r"[^A-Za-z0-9]", "", tokens[0]).upper()
@@ -8980,9 +8981,16 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry = float(tokens[idx("entry")+1])
         sl = float(tokens[idx("sl")+1])
 
-        r_i = idx("risk")
-        risk_mode = tokens[r_i+1].upper()
-        risk_val = float(tokens[r_i+2])
+        if "risk" in tokens:
+            r_i = idx("risk")
+            if r_i + 2 >= len(tokens):
+                raise ValueError("risk missing args")
+            risk_mode = tokens[r_i+1].upper()
+            risk_val = float(tokens[r_i+2])
+        else:
+            # If omitted, auto-use /riskmode settings for this user.
+            risk_mode = str(user.get("risk_mode", DEFAULT_RISK_MODE)).upper()
+            risk_val = float(user.get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
 
         note = ""
         signal_id = ""
@@ -9018,7 +9026,7 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             note = (seg if not note else (note + " | " + seg)).strip()
 
     except Exception:
-        await update.message.reply_text("Bad format. Example: /trade_open BTC long entry 43000 sl 42000 risk usd 40 note breakout sig PF-20251219-0007")
+        await update.message.reply_text("Bad format. Example: /trade_open BTC long entry 43000 sl 42000 risk usd 40 note breakout sig PF-20251219-0007\nOr omit risk to use /riskmode automatically.")
         return
 
     if risk_mode not in {"USD", "PCT"}:
