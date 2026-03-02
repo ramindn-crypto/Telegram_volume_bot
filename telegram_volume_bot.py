@@ -1172,31 +1172,33 @@ def _bybit_get_instr_filters(symbol: str) -> dict:
 
 
 def _fmt_qty(qty: float, step) -> str:
-    """Format qty as Bybit-safe decimal string aligned to qtyStep (string or float)."""
+    """Format qty as Bybit-safe decimal string aligned to qtyStep.
+
+    - Never returns scientific notation.
+    - Rounds UP to the nearest qtyStep multiple (Bybit-safe).
+    """
     try:
         if qty is None:
             return "0"
         dqty = Decimal(str(qty))
+
         if step is None:
             return format(dqty, "f")
+
         dstep = Decimal(str(step))
         if dstep <= 0:
             return format(dqty, "f")
+
         mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
-        dq = (mult * dstep).quantize(dstep)
+        dq = (mult * dstep).quantize(dstep)  # keeps correct decimals
         return format(dq, "f")
     except Exception:
-        return format(Decimal(str(qty)), "f")
-        dqty = Decimal(str(qty))
-        dstep = Decimal(str(step))
-        # round up to step multiple
-        mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
-        dq = mult * dstep
-        # quantize to step's exponent (keeps correct decimals)
-        dq = dq.quantize(dstep)
-        return format(dq, "f")
-    except Exception:
-        return format(Decimal(str(qty)), "f")
+        # last resort: plain decimal string
+        try:
+            return format(Decimal(str(qty)), "f")
+        except Exception:
+            return str(qty)
+
 
 def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | None, str | None]:
     """Decimal-safe rounding to Bybit qtyStep + minQty (+ minNotional if provided)."""
