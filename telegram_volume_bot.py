@@ -13172,18 +13172,6 @@ async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
             c.execute("INSERT INTO signals_archive SELECT *, ? FROM signals", (now_ts,))
             c.execute("DELETE FROM signals")
 
-            # --- Emailed setups archive (per-user sent setups) ---
-            c.execute("""CREATE TABLE IF NOT EXISTS emailed_setups_archive AS
-                         SELECT *, 0.0 AS archived_at FROM emailed_setups WHERE 0""")
-            try:
-                c.execute("ALTER TABLE emailed_setups_archive ADD COLUMN archived_at REAL")
-            except Exception:
-                pass
-
-            # Archive + clear emailed_setups
-            c.execute("INSERT INTO emailed_setups_archive SELECT *, ? FROM emailed_setups", (now_ts,))
-            c.execute("DELETE FROM emailed_setups")
-
             # --- Outcomes archive (optional) ---
             if outcomes_src:
                 # Create archive table based on the existing outcomes table schema
@@ -13198,9 +13186,35 @@ async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
                 c.execute(f"INSERT INTO outcomes_archive SELECT *, ? FROM {outcomes_src}", (now_ts,))
                 c.execute(f"DELETE FROM {outcomes_src}")
 
+            # --- Emailed setups archive + clear (critical for reports) ---
+            # Signal reports count delivered setups from `emailed_setups`. Reset must clear it too.
+            try:
+                c.execute("""CREATE TABLE IF NOT EXISTS emailed_setups_archive AS
+                             SELECT *, 0.0 AS archived_at FROM emailed_setups WHERE 0""")
+                try:
+                    c.execute("ALTER TABLE emailed_setups_archive ADD COLUMN archived_at REAL")
+                except Exception:
+                    pass
+                # archive rows (best-effort if schema changed)
+                try:
+                    c.execute("INSERT INTO emailed_setups_archive SELECT *, ? FROM emailed_setups", (now_ts,))
+                except Exception:
+                    try:
+                        c.execute(
+                            "INSERT INTO emailed_setups_archive (user_id, setup_id, session, emailed_ts, archived_at) "
+                            "SELECT user_id, setup_id, session, emailed_ts, ? FROM emailed_setups",
+                            (now_ts,),
+                        )
+                    except Exception:
+                        pass
+                c.execute("DELETE FROM emailed_setups")
+            except Exception:
+                # table may not exist in some DBs
+                pass
+
             conn.commit()
 
-        msg = "✅ Signals archived and report reset.\\nArchived emailed setups from `emailed_setups`."
+        msg = "✅ Signals archived and report reset."
         if outcomes_src:
             msg += f"\nArchived outcomes from `{outcomes_src}`."
         else:
