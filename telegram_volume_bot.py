@@ -97,7 +97,36 @@ import sqlite3
 def _autotrade_migrate_tables():
     """Ensure autotrade tables exist and columns are present (safe to call anytime)."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(
+# =========================================================
+# UNIFIED AUTOTRADE SETUP SELECTOR (Patched)
+# =========================================================
+def get_best_open_setup_for_autotrade(user_id):
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+
+        cutoff = time.time() - 4 * 3600  # last 4 hours
+
+        cur.execute("""
+            SELECT id, setup_id, symbol, side, conf
+            FROM generated_setups
+            WHERE user_id = ?
+            AND source = 'email'
+            AND created_ts >= ?
+            AND outcome = 'OPEN'
+            ORDER BY conf DESC
+            LIMIT 1
+        """, (user_id, cutoff))
+
+        row = cur.fetchone()
+        con.close()
+        return row
+    except Exception as e:
+        logger.error(f"Autotrade selector error: {e}")
+        return None
+
+DB_PATH) as conn:
             c = conn.cursor()
 
             # Create if missing (preferred schema used by trading + reports)
@@ -14374,3 +14403,27 @@ if __name__ == "__main__":
 
 
 
+
+
+# =========================================================
+# ADMIN DEBUG: AUTOTRADE
+# =========================================================
+@bot.message_handler(commands=['autotrade_debug'])
+def autotrade_debug_cmd(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    candidate = get_best_open_setup_for_autotrade(ADMIN_ID)
+
+    if not candidate:
+        bot.reply_to(message, "No OPEN setups found for autotrade.")
+        return
+
+    bot.reply_to(message, f"""
+AutoTrade Debug
+---------------
+SetupID: {candidate[1]}
+Symbol: {candidate[2]}
+Side: {candidate[3]}
+Conf: {candidate[4]}
+""")
