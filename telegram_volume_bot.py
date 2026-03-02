@@ -8324,19 +8324,41 @@ async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = get_user(uid)
+    user = get_user(uid) or {}
+
+    # ✅ Admin: /equity is LIVE-synced with Bybit (same as /status)
     if not context.args:
-        await update.message.reply_text(f"Equity: ${float(user['equity']):.2f}")
+        if is_admin_user(int(uid)):
+            live_eq = _live_equity_usdt()
+            if live_eq is not None:
+                eq = float(live_eq)
+                try:
+                    update_user(int(uid), equity=eq)
+                except Exception:
+                    pass
+                await update.message.reply_text(f"Equity (Bybit): ${eq:.2f}")
+                return
+
+        await update.message.reply_text(f"Equity: ${float(user.get('equity') or 0.0):.2f}")
         return
+
+    # ✅ Non-admins: manual equity setting (used for /size and journaling)
+    if is_admin_user(int(uid)):
+        await update.message.reply_text(
+            "Admin equity is LIVE-synced with Bybit.\n"
+            "Manual override is disabled for Admin.\n\n"
+            "Tip: If you want manual equity, switch AutoTrade to paper or disable live sync."
+        )
+        return
+
     try:
         eq = float(context.args[0])
         if eq < 0:
             raise ValueError()
-        update_user(uid, equity=eq)
+        update_user(int(uid), equity=eq)
         await update.message.reply_text(f"✅ Equity set: ${eq:.2f}")
     except Exception:
         await update.message.reply_text("Usage: /equity 1000")
-
 async def equity_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     update_user(uid, equity=0.0)
@@ -9135,11 +9157,27 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Sync daily risk from CURRENT open positions (closing frees capacity instantly)
     _risk_daily_sync(uid, user)
+    # ✅ Equity handling:
+    # - Admin: keep equity synced with Bybit (if live equity is available)
+    # - Others: manual equity updated by /trade_close pnl
+    if is_admin_user(int(uid)):
+        live_eq = _live_equity_usdt()
+        if live_eq is not None:
+            try:
+                update_user(int(uid), equity=float(live_eq))
+            except Exception:
+                pass
+            user = get_user(uid)
+        else:
+            # fallback to manual equity update (only if live equity unavailable)
+            new_eq = float(user["equity"]) + float(pnl)
+            update_user(uid, equity=new_eq)
+            user = get_user(uid)
+    else:
+        new_eq = float(user["equity"]) + float(pnl)
+        update_user(uid, equity=new_eq)
+        user = get_user(uid)
 
-    new_eq = float(user["equity"]) + float(pnl)
-    update_user(uid, equity=new_eq)
-    user = get_user(uid)
-    
     r_mult = t.get("r_mult")
     r_txt = f"{r_mult:+.2f}R" if r_mult is not None else "-"
     
@@ -9371,9 +9409,14 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plan = str(effective_plan(uid, user)).upper()
     equity = float((user or {}).get("equity") or 0.0)
 
-    live_eq = _live_equity_usdt()
+    # ✅ Live equity sync ONLY for Admin (Bybit)
+    live_eq = _live_equity_usdt() if is_admin_user(int(uid)) else None
     if live_eq is not None:
-        equity = live_eq
+        equity = float(live_eq)
+        try:
+            update_user(int(uid), equity=equity)
+        except Exception:
+            pass
 
     cap = daily_cap_usd(user)
     # Sync used risk from CURRENT open positions (RF/close frees capacity instantly)
