@@ -14402,27 +14402,3 @@ if __name__ == "__main__":
 
 
 
-
-
-# =========================================================
-# ADMIN DEBUG: AUTOTRADE
-# =========================================================
-@bot.message_handler(commands=['autotrade_debug'])
-def autotrade_debug_cmd(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    candidate = get_best_open_setup_for_autotrade(ADMIN_ID)
-
-    if not candidate:
-        bot.reply_to(message, "No OPEN setups found for autotrade.")
-        return
-
-    bot.reply_to(message, f"""
-AutoTrade Debug
----------------
-SetupID: {candidate[1]}
-Symbol: {candidate[2]}
-Side: {candidate[3]}
-Conf: {candidate[4]}
-""")
