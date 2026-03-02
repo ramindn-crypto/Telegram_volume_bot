@@ -8271,19 +8271,40 @@ async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ TZ set to {tz_name}\nDefault sessions updated. Use /sessions to view.")
 
 async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/equity [amount]
+    - Without args: show the same equity number used in /status (Bybit live equity if available).
+    - With args: set stored equity (used for /size in non-live modes / when Bybit equity unavailable).
+    """
     uid = update.effective_user.id
-    user = get_user(uid)
+    user = get_user(uid) or {}
+
+    # Match /status behavior: prefer live Bybit equity when available (AUTOTRADE live mode)
+    live_eq = _live_equity_usdt()
+    equity_display = float(live_eq) if live_eq is not None else float((user or {}).get("equity") or 0.0)
+
     if not context.args:
-        await update.message.reply_text(f"Equity: ${float(user['equity']):.2f}")
+        src = "Bybit (live)" if live_eq is not None else "Stored"
+        await update.message.reply_text(f"Equity: ${equity_display:.2f}  [{src}]")
         return
+
+    # Set stored equity
     try:
-        eq = float(context.args[0])
-        if eq < 0:
+        eq = float(str(context.args[0]).strip())
+        if not math.isfinite(eq) or eq < 0:
             raise ValueError()
         update_user(uid, equity=eq)
-        await update.message.reply_text(f"✅ Equity set: ${eq:.2f}")
+
+        # If live equity exists, be explicit that /status will still show live
+        if live_eq is not None:
+            await update.message.reply_text(
+                f"✅ Stored equity updated: ${eq:.2f}\n"
+                f"ℹ️ Note: /status (and /equity display) uses Bybit live equity while AUTOTRADE_MODE=live."
+            )
+        else:
+            await update.message.reply_text(f"✅ Equity set: ${eq:.2f}")
     except Exception:
         await update.message.reply_text("Usage: /equity 1000")
+
 
 async def equity_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -10046,9 +10067,16 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     emailed = db_list_emailed_setups(uid, ts_from)
 
     if not emailed:
-        await update.message.reply_text(
-            f"No emailed setups found in the last {lookback_h}h."
-        )
+        # After /admin_reset_report we intentionally clear emailed_setups, so show a clean 0 report.
+        header = [
+            f"📊 Signal Report (last {lookback_h}h)",
+            HDR,
+            "Total: 0 | Decided: 0 | Wins: 0 | Losses: 0 | Win rate: 0.0%",
+            "TP1: 0 | TP2: 0 | TP3: 0 | Open: 0 | Amb: 0",
+            HDR,
+        ]
+        msg = "\n".join(header) + "\n<pre></pre>\nSession breakdown:\n• (none)"
+        await send_long_message(update, msg, parse_mode=ParseMode.HTML)
         return
 
     # Evaluate (heavy)
@@ -13609,6 +13637,14 @@ async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
                 # Archive + clear outcomes
                 c.execute(f"INSERT INTO outcomes_archive SELECT *, ? FROM {outcomes_src}", (now_ts,))
                 c.execute(f"DELETE FROM {outcomes_src}")
+
+
+            # --- Emailed setups (used by /signal_report) ---
+            # After reset, /signal_report should start from zero.
+            try:
+                c.execute("DELETE FROM emailed_setups")
+            except Exception:
+                pass
 
             conn.commit()
 
