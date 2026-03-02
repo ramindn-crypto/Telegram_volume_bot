@@ -1402,6 +1402,72 @@ def _autotrade_allowed_session(session_label: str) -> bool:
         allowed = {'NY'}
     return session_label.upper() in allowed
 
+
+# =========================================================
+# AUTOTRADE: select best OPEN setup from DB (generated_setups + signals)
+# =========================================================
+def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1) -> list:
+    """Return a list of Setup-like objects with entry/sl/tps for _autotrade_place_trade.
+    Uses generated_setups for recency + session, joins signal_outcomes for OPEN, and pulls prices from signals.
+    """
+    try:
+        from types import SimpleNamespace
+        cutoff = time.time() - float(lookback_hours) * 3600.0
+
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+
+        cur.execute("""
+            SELECT g.setup_id
+            FROM generated_setups g
+            LEFT JOIN signal_outcomes o ON o.setup_id = g.setup_id
+            WHERE g.user_id = ?
+              AND g.created_ts >= ?
+              AND UPPER(COALESCE(g.session,'')) = UPPER(?)
+              AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+            ORDER BY g.conf DESC, g.created_ts DESC
+            LIMIT ?
+        """, (int(uid), float(cutoff), str(session_label or ''), int(limit)))
+
+        setup_ids = [r[0] for r in cur.fetchall() if r and r[0]]
+        if not setup_ids:
+            con.close()
+            return []
+
+        out = []
+        for sid in setup_ids:
+            cur.execute("""
+                SELECT setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3
+                FROM signals
+                WHERE setup_id = ?
+                LIMIT 1
+            """, (sid,))
+            row = cur.fetchone()
+            if not row:
+                continue
+            setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3 = row
+            out.append(SimpleNamespace(
+                setup_id=setup_id,
+                id=setup_id,
+                symbol=symbol,
+                side=side,
+                conf=int(conf or 0),
+                entry=float(entry or 0.0),
+                sl=float(sl or 0.0),
+                tp1=tp1,
+                tp2=tp2,
+                tp3=tp3,
+            ))
+
+        con.close()
+        return out
+    except Exception as e:
+        try:
+            logger.error(f"_autotrade_select_db_setups failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return []
+
 def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
     if not _autotrade_ready():
         return (False, 'autotrade_not_ready_or_disabled')
@@ -1669,9 +1735,9 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 78,
-    "LON": 80,
-    "ASIA": 82,
+    "NY": 76,
+    "LON": 78,
+    "ASIA": 80,
 }
 
 SESSION_MIN_RR_TP3 = {
@@ -14345,35 +14411,6 @@ def main():
 
     # Optional: if any other poller exists, don't crash-restart; just sleep.
     from telegram.error import Conflict
-
-# =========================================================
-# UNIFIED AUTOTRADE SETUP SELECTOR
-# =========================================================
-def get_best_open_setup_for_autotrade(user_id):
-    try:
-        con = sqlite3.connect(DB_PATH)
-        cur = con.cursor()
-
-        cutoff = time.time() - 4 * 3600  # last 4 hours
-
-        cur.execute("""
-            SELECT id, setup_id, symbol, side, conf
-            FROM generated_setups
-            WHERE user_id = ?
-            AND source = 'email'
-            AND created_ts >= ?
-            AND outcome = 'OPEN'
-            ORDER BY conf DESC
-            LIMIT 1
-        """, (user_id, cutoff))
-
-        row = cur.fetchone()
-        con.close()
-        return row
-    except Exception as e:
-        logger.error(f"Autotrade selector error: {e}")
-        return None
-
     # Ensure AutoTrade tables exist at startup (prevents 'no such table: autotrade_trades')
 
     try:
@@ -14399,6 +14436,7 @@ def get_best_open_setup_for_autotrade(user_id):
 
 if __name__ == "__main__":
     main()
+
 
 
 
