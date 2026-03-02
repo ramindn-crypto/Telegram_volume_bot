@@ -2645,6 +2645,7 @@ def db_init():
     CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
+        public_id INTEGER,
         symbol TEXT NOT NULL,
         side TEXT NOT NULL,
         entry REAL NOT NULL,
@@ -2659,6 +2660,47 @@ def db_init():
         signal_id TEXT
     )
     """)
+
+    
+    # ---------------------------------------------------------
+    # Public per-user Trade IDs (start at 1, resettable)
+    # ---------------------------------------------------------
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trade_id_seq (
+        user_id INTEGER PRIMARY KEY,
+        last_id INTEGER NOT NULL
+    )
+    """)
+    # Add public_id column if DB existed already
+    try:
+        cols_trades = [r[1] for r in cur.execute("PRAGMA table_info(trades)").fetchall()]
+        if "public_id" not in cols_trades:
+            cur.execute("ALTER TABLE trades ADD COLUMN public_id INTEGER")
+            cols_trades.append("public_id")
+    except Exception:
+        pass
+
+    # Backfill missing public_id for existing trades (per user, ordered by opened_ts)
+    try:
+        uids = [r[0] for r in cur.execute("SELECT DISTINCT user_id FROM trades").fetchall()]
+        for _uid in uids:
+            rows = cur.execute(
+                "SELECT id FROM trades WHERE user_id=? AND (public_id IS NULL OR public_id='') ORDER BY opened_ts ASC, id ASC",
+                (int(_uid),),
+            ).fetchall()
+            if rows:
+                rmax = cur.execute("SELECT MAX(public_id) FROM trades WHERE user_id=?", (int(_uid),)).fetchone()
+                start = int(rmax[0]) if rmax and rmax[0] is not None else 0
+                n = start
+                for (rid,) in rows:
+                    n += 1
+                    cur.execute("UPDATE trades SET public_id=? WHERE id=? AND user_id=?", (int(n), int(rid), int(_uid)))
+
+            rmax2 = cur.execute("SELECT MAX(public_id) FROM trades WHERE user_id=?", (int(_uid),)).fetchone()
+            last = int(rmax2[0]) if rmax2 and rmax2[0] is not None else 0
+            cur.execute("INSERT OR REPLACE INTO trade_id_seq(user_id,last_id) VALUES(?,?)", (int(_uid), int(last)))
+    except Exception:
+        pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS signals (
@@ -4383,26 +4425,64 @@ def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: s
     # If TP1 happened but SL later and TP1 wasn't before SL (shouldn't happen) -> open/edge
     return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "edge_case"}
 
-def db_trade_open(user_id: int, symbol: str, side: str, entry: float, sl: float,
-                  risk_usd: float, qty: float, note: str = "", signal_id: str = "") -> int:
+
+def _next_public_trade_id(user_id: int) -> int:
+    """Sequential per-user Trade ID shown to the user (starts at 1)."""
     con = db_connect()
     cur = con.cursor()
-    cur.execute("""
-        INSERT INTO trades (user_id, symbol, side, entry, sl, risk_usd, qty, opened_ts, note, signal_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        user_id, symbol.upper(), side.upper(), float(entry), float(sl),
-        float(risk_usd), float(qty), time.time(), note, signal_id
-    ))
-    trade_id = cur.lastrowid
+    cur.execute("CREATE TABLE IF NOT EXISTS trade_id_seq (user_id INTEGER PRIMARY KEY, last_id INTEGER NOT NULL)")
+    cur.execute("SELECT last_id FROM trade_id_seq WHERE user_id=?", (int(user_id),))
+    row = cur.fetchone()
+    if row:
+        next_id = int(row["last_id"]) + 1
+        cur.execute("UPDATE trade_id_seq SET last_id=? WHERE user_id=?", (int(next_id), int(user_id)))
+    else:
+        next_id = 1
+        cur.execute("INSERT INTO trade_id_seq(user_id,last_id) VALUES(?,?)", (int(user_id), 1))
     con.commit()
     con.close()
-    return int(trade_id)
+    return int(next_id)
+
+
+def _reset_public_trade_id(user_id: int):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS trade_id_seq (user_id INTEGER PRIMARY KEY, last_id INTEGER NOT NULL)")
+    cur.execute("INSERT OR REPLACE INTO trade_id_seq(user_id,last_id) VALUES(?,?)", (int(user_id), 0))
+    con.commit()
+    con.close()
+
+def db_trade_open(user_id: int, symbol: str, side: str, entry: float, sl: float,
+                  risk_usd: float, qty: float, note: str = "", signal_id: str = "") -> int:
+    # Public per-user Trade ID (start at 1; resettable)
+    public_id = _next_public_trade_id(user_id)
+
+    con = db_connect()
+    cur = con.cursor()
+
+    # Ensure column exists (for older DBs)
+    try:
+        cols_trades = [r[1] for r in cur.execute("PRAGMA table_info(trades)").fetchall()]
+        if "public_id" not in cols_trades:
+            cur.execute("ALTER TABLE trades ADD COLUMN public_id INTEGER")
+    except Exception:
+        pass
+
+    cur.execute("""
+        INSERT INTO trades (user_id, public_id, symbol, side, entry, sl, risk_usd, qty, opened_ts, note, signal_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id, int(public_id), symbol.upper(), side.upper(), float(entry), float(sl),
+        float(risk_usd), float(qty), time.time(), note, signal_id
+    ))
+    con.commit()
+    con.close()
+    return int(public_id)
 
 def db_trade_close(user_id: int, trade_id: int, pnl: float) -> Optional[dict]:
     con = db_connect()
     cur = con.cursor()
-    cur.execute("SELECT * FROM trades WHERE id=? AND user_id=? AND closed_ts IS NULL", (trade_id, user_id))
+    cur.execute("SELECT * FROM trades WHERE public_id=? AND user_id=? AND closed_ts IS NULL", (trade_id, user_id))
     row = cur.fetchone()
     if not row:
         con.close()
@@ -4415,7 +4495,7 @@ def db_trade_close(user_id: int, trade_id: int, pnl: float) -> Optional[dict]:
     cur.execute("""
         UPDATE trades
         SET closed_ts=?, pnl=?, r_mult=?
-        WHERE id=? AND user_id=?
+        WHERE public_id=? AND user_id=?
     """, (time.time(), float(pnl), r_mult, trade_id, user_id))
     con.commit()
     con.close()
@@ -7379,6 +7459,9 @@ Trade Journal
 /trade_close
 • Log a closed position
 
+/trade_id_reset
+• Reset your Trade ID numbering (next trade starts from 1)
+
 ────────────────────
 🕒 SESSION CONTROL
 ────────────────────
@@ -7509,6 +7592,9 @@ Not financial advice.
 
 /myplan
 • View your own plan status (admins too)
+
+/trade_id_reset
+• Reset your own Trade ID numbering (next trade starts from 1)
 
 ────────────────────
 💳 PAYMENTS
@@ -9197,6 +9283,26 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- New Equity: ${float(user['equity']):.2f}"
     )
 
+async def trade_id_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return
+
+    _reset_public_trade_id(uid)
+
+    await update.message.reply_text(
+        "✅ Trade ID counter reset.\n\n"
+        "Next /trade_open will start from Trade ID 1."
+    )
+
+
 async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     tokens = context.args
@@ -9214,7 +9320,7 @@ async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     con = db_connect()
     cur = con.cursor()
     cur.execute(
-        "SELECT * FROM trades WHERE id=? AND user_id=? AND closed_ts IS NULL",
+        "SELECT * FROM trades WHERE public_id=? AND user_id=? AND closed_ts IS NULL",
         (trade_id, uid),
     )
     row = cur.fetchone()
@@ -9243,7 +9349,7 @@ async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # update trade
     cur.execute(
-        "UPDATE trades SET sl=?, risk_usd=? WHERE id=? AND user_id=?",
+        "UPDATE trades SET sl=?, risk_usd=? WHERE public_id=? AND user_id=?",
         (float(new_sl), float(new_risk), trade_id, uid),
     )
     con.commit()
@@ -9319,7 +9425,7 @@ async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     con = db_connect()
     cur = con.cursor()
     cur.execute(
-        "SELECT * FROM trades WHERE id=? AND user_id=? AND closed_ts IS NULL",
+        "SELECT * FROM trades WHERE public_id=? AND user_id=? AND closed_ts IS NULL",
         (trade_id, uid),
     )
     row = cur.fetchone()
@@ -9358,7 +9464,7 @@ async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Move SL to entry and set trade risk to 0
     cur.execute(
-        "UPDATE trades SET sl=?, risk_usd=? WHERE id=? AND user_id=?",
+        "UPDATE trades SET sl=?, risk_usd=? WHERE public_id=? AND user_id=?",
         (entry, 0.0, trade_id, uid),
     )
     con.commit()
@@ -9515,7 +9621,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             qty = float(t.get("qty") or 0.0)
             risk = float(t.get("risk_usd") or 0.0)
             lines.append(
-                f"- ID {t.get('id')} | {t.get('symbol')} {t.get('side')} | "
+                f"- ID {t.get('public_id')} | {t.get('symbol')} {t.get('side')} | "
                 f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g}"
             )
         except Exception:
@@ -14144,6 +14250,7 @@ def main():
     app.add_handler(CommandHandler("size", size_cmd, block=False))
     app.add_handler(CommandHandler("trade_open", trade_open_cmd, block=False))
     app.add_handler(CommandHandler("trade_close", trade_close_cmd, block=False))
+    app.add_handler(CommandHandler("trade_id_reset", trade_id_reset_cmd, block=False))
     app.add_handler(CommandHandler("status", status_cmd, block=False))
     app.add_handler(CommandHandler("cooldowns", cooldowns_cmd, block=False))
     app.add_handler(CommandHandler("cooldown", cooldown_cmd, block=False))
