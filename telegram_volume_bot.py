@@ -1,3 +1,10 @@
+
+# --- ASIA tightening (hard-coded, no env vars) ---
+ASIA_MIN_CONF_BOOST = 9
+ASIA_MIN_FUT_VOL_USD = 10_000_000
+ASIA_EXCLUDED_PREFIXES = ("1000",)
+ASIA_SYMBOL_COOLDOWN_HOURS = 6
+
 # =========================================================
 # RENDER WEB SERVICE KEEPALIVE (optional)
 # =========================================================
@@ -51,8 +58,32 @@ import os
 import sys
 import time
 import logging
+import math
+from decimal import Decimal, ROUND_UP
+
+
+def _bybit_linear_symbol(sym: str) -> str:
+    """Normalize base symbol like 'FIO' or '1000LUNC' to Bybit linear symbol like 'FIOUSDT'/'1000LUNCUSDT'."""
+    s = (sym or "").replace("/", "").replace(" ", "").upper()
+    if not s:
+        return s
+    if s.endswith("USDT"):
+        return s
+    if "USDT" in s:
+        return s
+    return f"{s}USDT"
+
 
 logger = logging.getLogger(__name__)
+
+# Bybit instrument filters cache (qtyStep/minQty)
+_INSTR_FILTER_CACHE: dict[str, dict] = {}
+
+
+# AutoTrade decision cache (owner/admin visibility)
+_LAST_AUTOTRADE_DECISION: dict[int, dict] = {}
+_LAST_AUTOTRADE_DETAIL: dict[int, dict] = {}
+
 
 import json
 import re
@@ -862,7 +893,7 @@ TREND_24H_TOL = 0.5
 SESSION_1H_BASE_MULT = {
     "NY": 0.85,
     "LON": 1.00,
-    "ASIA": 1.15,
+    "ASIA": 1.20,
 }
 
 # =========================================================
@@ -936,6 +967,33 @@ FLIP_GUARD_MULT = 1.0  # 1.0 = same as session cooldown hours; try 1.5–2.0 to 
 TF_ALIGN_ENABLED = True
 TF_ALIGN_1H_MIN_ABS = 0.5   # percent
 TF_ALIGN_4H_MIN_ABS = 0.5   # percent
+
+# ✅ Approach A: session-aware TF alignment floors (higher win-rate, esp. ASIA)
+TF_ALIGN_1H_MIN_ABS_BY_SESSION = {
+    "NY": TF_ALIGN_1H_MIN_ABS,
+    "LON": TF_ALIGN_1H_MIN_ABS,
+    "ASIA": 0.8,
+}
+TF_ALIGN_4H_MIN_ABS_BY_SESSION = {
+    "NY": TF_ALIGN_4H_MIN_ABS,
+    "LON": TF_ALIGN_4H_MIN_ABS,
+    "ASIA": 0.8,
+}
+
+def tf_align_mins_for_session(session_name: str) -> tuple[float, float]:
+    s = (session_name or "").strip().upper()
+    return (
+        float(TF_ALIGN_1H_MIN_ABS_BY_SESSION.get(s, TF_ALIGN_1H_MIN_ABS)),
+        float(TF_ALIGN_4H_MIN_ABS_BY_SESSION.get(s, TF_ALIGN_4H_MIN_ABS)),
+    )
+
+# Weekend handling (UTC-based) — slight tightening only (avoid junky liquidity)
+def is_weekend_utc(dt_utc) -> bool:
+    try:
+        return int(dt_utc.weekday()) >= 5
+    except Exception:
+        return False
+
 
 
 def cooldown_hours_for_session(session_name: str) -> int:
@@ -1058,8 +1116,15 @@ def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> di
     url = _bybit_base_url() + path
 
     ts_ms = str(int(time.time() * 1000))
+    # For V5 signing:
+    # - GET requests must be signed with the query string (not the body).
+    # - POST requests are signed with the JSON body.
     body = json.dumps(payload or {}, separators=(",", ":"), ensure_ascii=False) if method != "GET" else ""
-    sign = _bybit_v5_sign(ts_ms, body) if (BYBIT_API_KEY and BYBIT_API_SECRET) else ""
+    query_str = ""
+    if method == "GET" and "?" in path:
+        query_str = path.split("?", 1)[1]
+    sign_payload = query_str if method == "GET" else body
+    sign = _bybit_v5_sign(ts_ms, sign_payload) if (BYBIT_API_KEY and BYBIT_API_SECRET) else ""
 
     headers = {
         "Content-Type": "application/json",
@@ -1078,6 +1143,115 @@ def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> di
     except Exception as e:
         return {"retCode": -1, "retMsg": f"{type(e).__name__}: {e}", "result": None}
 
+
+
+def _bybit_get_instr_filters(symbol: str) -> dict:
+    """Return dict with keys: minQty, qtyStep, minNotional as STRINGS (best-effort) for linear USDT perp."""
+    sym = _bybit_linear_symbol(symbol)
+    if sym in _INSTR_FILTER_CACHE:
+        return _INSTR_FILTER_CACHE[sym]
+    out = {"minQty": None, "qtyStep": None, "minNotional": None}
+    try:
+        res = _bybit_v5_request("GET", "/v5/market/instruments-info", {"category": "linear", "symbol": sym})
+        items = (((res or {}).get("result") or {}).get("list") or [])
+        if items:
+            info = items[0] or {}
+            lot = info.get("lotSizeFilter") or {}
+            if lot.get("minOrderQty") is not None:
+                out["minQty"] = str(lot.get("minOrderQty"))
+            if lot.get("qtyStep") is not None:
+                out["qtyStep"] = str(lot.get("qtyStep"))
+            nf = info.get("notionalFilter") or {}
+            if nf.get("minNotional") is not None:
+                out["minNotional"] = str(nf.get("minNotional"))
+    except Exception:
+        pass
+    _INSTR_FILTER_CACHE[sym] = out
+    return out
+
+
+
+def _fmt_qty(qty: float, step) -> str:
+    """Format qty as Bybit-safe decimal string aligned to qtyStep (string or float)."""
+    try:
+        if qty is None:
+            return "0"
+        dqty = Decimal(str(qty))
+        if step is None:
+            return format(dqty, "f")
+        dstep = Decimal(str(step))
+        if dstep <= 0:
+            return format(dqty, "f")
+        mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
+        dq = (mult * dstep).quantize(dstep)
+        return format(dq, "f")
+    except Exception:
+        return format(Decimal(str(qty)), "f")
+        dqty = Decimal(str(qty))
+        dstep = Decimal(str(step))
+        # round up to step multiple
+        mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
+        dq = mult * dstep
+        # quantize to step's exponent (keeps correct decimals)
+        dq = dq.quantize(dstep)
+        return format(dq, "f")
+    except Exception:
+        return format(Decimal(str(qty)), "f")
+
+def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | None, str | None]:
+    """Decimal-safe rounding to Bybit qtyStep + minQty (+ minNotional if provided)."""
+    try:
+        if qty is None or float(qty) <= 0:
+            return (None, "qty<=0")
+
+        f = _bybit_get_instr_filters(symbol)
+        step_s = f.get("qtyStep")
+        min_qty_s = f.get("minQty")
+        min_not_s = f.get("minNotional")
+
+        dqty = Decimal(str(qty))
+        dentry = Decimal(str(entry_price)) if entry_price and entry_price > 0 else None
+
+        def _d(x):
+            if x is None:
+                return None
+            try:
+                return Decimal(str(x))
+            except Exception:
+                return None
+
+        dstep = _d(step_s)
+        dmin = _d(min_qty_s)
+        dmin_not = _d(min_not_s)
+
+        if dstep and dstep > 0:
+            mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
+            dqty = (mult * dstep).quantize(dstep)
+
+        if dmin and dqty < dmin:
+            if dstep and dstep > 0:
+                mult = (dmin / dstep).to_integral_value(rounding=ROUND_UP)
+                dqty = (mult * dstep).quantize(dstep)
+            else:
+                dqty = dmin
+
+        if dmin_not and dentry and dentry > 0 and (dqty * dentry) < dmin_not:
+            need = dmin_not / dentry
+            if dstep and dstep > 0:
+                mult = (need / dstep).to_integral_value(rounding=ROUND_UP)
+                dqty = (mult * dstep).quantize(dstep)
+            else:
+                dqty = need
+
+        if dqty <= 0:
+            return (None, "qty_rounds_to_0")
+
+        return (float(dqty), None)
+
+    except Exception as e:
+        return (None, f"qty_round_fail:{type(e).__name__}")
+
+
 def _autotrade_ready() -> bool:
     if not AUTOTRADE_ENABLED:
         return False
@@ -1090,19 +1264,56 @@ def _autotrade_ready() -> bool:
     return True
 
 def _bybit_get_equity_usdt() -> float:
-    """Returns account equity (USDT) from Bybit V5 wallet-balance."""
-    res = _bybit_v5_request("GET", "/v5/account/wallet-balance?accountType=UNIFIED&coin=USDT")
+    """Returns account equity (USDT) from Bybit V5 wallet-balance.
+
+    Tries common account types (UNIFIED, CONTRACT) and returns the first positive equity found.
+    """
+    def _extract_equity(res: dict) -> float:
+        try:
+            if int(res.get("retCode", -1)) != 0:
+                return 0.0
+            lst = ((res.get("result") or {}).get("list") or [])
+            if not lst:
+                return 0.0
+            # V5 response: result.list[].coin[] contains entries like {"coin":"USDT","equity":"..."}
+            coins = ((lst[0] or {}).get("coin") or [])
+            usdt = None
+            for c in coins:
+                if str((c or {}).get("coin", "")).upper() == "USDT":
+                    usdt = c or {}
+                    break
+            if not usdt and coins:
+                usdt = coins[0] or {}
+            eq = float(usdt.get("equity") or usdt.get("walletBalance") or usdt.get("availableToWithdraw") or 0.0)
+            return max(0.0, eq)
+        except Exception:
+            return 0.0
+
+    for acct in ("UNIFIED", "CONTRACT"):
+        res = _bybit_v5_request("GET", f"/v5/account/wallet-balance?accountType={acct}&coin=USDT")
+        eq = _extract_equity(res)
+        if eq > 0:
+            return eq
+    return 0.0
+
+
+def _live_equity_usdt() -> float | None:
+    """LIVE mode equity source. Returns None if unavailable.
+
+    Uses Bybit V5 wallet-balance (UNIFIED, USDT) and falls back to None on failure.
+    """
     try:
-        if int(res.get("retCode", -1)) != 0:
-            return 0.0
-        lst = ((res.get("result") or {}).get("list") or [])
-        if not lst:
-            return 0.0
-        coin = (((lst[0] or {}).get("coin") or [])[0] or {})
-        eq = float(coin.get("equity") or coin.get("walletBalance") or coin.get("availableToWithdraw") or 0.0)
-        return max(0.0, eq)
+        if not AUTOTRADE_ENABLED:
+            return None
+        if str(AUTOTRADE_MODE).lower() != "live":
+            return None
+        if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+            return None
+        eq = float(_bybit_get_equity_usdt() or 0.0)
+        return eq if eq > 0 else None
     except Exception:
-        return 0.0
+        return None
+
 
 def _autotrade_db_init():
     with sqlite3.connect(DB_PATH) as conn:
@@ -1209,18 +1420,50 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
     s = setups[0]
     sym = str(getattr(s, 'symbol', '') or '').upper()
+    sym = _bybit_linear_symbol(sym)
+    # keep last autotrade attempt details for /autotrade_last
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)] = {
+            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'session': session_label,
+            'setup_id': str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''),
+            'symbol_raw': str(getattr(s, 'symbol', '') or ''),
+            'symbol_sent': sym,
+            'side': side,
+            'entry': entry,
+            'sl': sl,
+        }
+    except Exception:
+        pass
+
     side = str(getattr(s, 'side', '') or '').upper()
     entry = float(getattr(s, 'entry', 0.0) or 0.0)
     sl = float(getattr(s, 'sl', 0.0) or 0.0)
-    tp1 = float(getattr(s, 'tp1', 0.0) or 0.0)
-    tp2 = float(getattr(s, 'tp2', 0.0) or 0.0)
-    tp3 = float(getattr(s, 'tp3', 0.0) or 0.0)
+    # TP targets may be partially available depending on the engine/scanner
+    _tp1 = getattr(s, 'tp1', None)
+    _tp2 = getattr(s, 'tp2', None)
+    _tp3 = getattr(s, 'tp3', None)
+
+    def _as_pos_float(x):
+        try:
+            v = float(x)
+            return v if v > 0 else None
+        except Exception:
+            return None
+
+    tp1 = _as_pos_float(_tp1)
+    tp2 = _as_pos_float(_tp2)
+    tp3 = _as_pos_float(_tp3)
 
     if side not in {'BUY', 'SELL'}:
         return (False, f'bad_side ({side})')
 
-    if entry <= 0 or sl <= 0 or tp1 <= 0 or tp2 <= 0 or tp3 <= 0:
+    # Require core prices + at least one TP
+    if entry <= 0 or sl <= 0:
         return (False, 'bad_prices')
+    tps = [v for v in (tp1, tp2, tp3) if v is not None]
+    if not tps:
+        return (False, 'missing_tp')
 
     if side == 'BUY' and sl >= entry:
         return (False, 'sl_not_below_entry_for_buy')
@@ -1245,7 +1488,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
     if AUTOTRADE_MODE == 'paper':
         trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
-        return (True, f'[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}')
+        return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TPs={','.join([f'{x:g}' for x in tps])}")
 
     # LIVE MODE (Bybit V5)
     if AUTOTRADE_ISOLATED:
@@ -1263,14 +1506,61 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         'sellLeverage': str(AUTOTRADE_LEVERAGE),
     })
 
-    open_res = _bybit_v5_request('POST', '/v5/order/create', {
+    # Round qty up to Bybit min/step to prevent rejections on low-price symbols
+
+
+    qty, qreason = _round_qty_up(sym, qty, entry)
+
+
+    if qty is None:
+
+
+        return (False, f"qty_invalid:{qreason}")
+
+
+    # Format qty as Bybit-safe string (no scientific notation, aligned to qtyStep)
+
+
+
+    _filt = _bybit_get_instr_filters(sym)
+
+
+
+    qty_step = _filt.get('qtyStep')
+
+
+
+    qty_str = _fmt_qty(qty, qty_step)
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'qty': float(qty) if qty is not None else None,
+            'qty_step': qty_step,
+            'min_qty': _filt.get('minQty'),
+            'min_notional': _filt.get('minNotional'),
+            'qty_str': qty_str,
+        })
+    except Exception:
+        pass
+
+
+
+    order_payload = {
         'category': 'linear',
         'symbol': sym,
         'side': 'Buy' if side == 'BUY' else 'Sell',
         'orderType': 'Market',
-        'qty': str(qty),
+        'qty': qty_str,
         'timeInForce': 'IOC',
-    })
+    }
+    open_res = _bybit_v5_request('POST', '/v5/order/create', order_payload)
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'order_payload': {k: (v if k != 'qty' else str(v)) for k, v in (order_payload or {}).items()},
+            'bybit': open_res,
+        })
+    except Exception:
+        pass
+
 
     if int(open_res.get('retCode', -1)) != 0:
         return (False, f"bybit_open_failed retCode={open_res.get('retCode')} retMsg={open_res.get('retMsg')}")
@@ -1282,14 +1572,24 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         'tpslMode': 'Full',
     })
 
-    splits = AUTOTRADE_TP_SPLIT
-    tp_qtys = [max(0.0, qty * splits[0]), max(0.0, qty * splits[1]), max(0.0, qty * splits[2])]
-    try:
-        tp_qtys[2] = max(0.0, qty - (tp_qtys[0] + tp_qtys[1]))
-    except Exception:
-        pass
+    # Place as many TP orders as we have valid targets
+    tps = [v for v in (tp1, tp2, tp3) if v is not None]
 
-    tps = [tp1, tp2, tp3]
+    if len(tps) == 1:
+        tp_qtys = [qty]
+    elif len(tps) == 2:
+        splits = AUTOTRADE_TP_SPLIT
+        q1 = max(0.0, qty * splits[0])
+        q2 = max(0.0, qty - q1)
+        tp_qtys = [q1, q2]
+    else:
+        splits = AUTOTRADE_TP_SPLIT
+        tp_qtys = [max(0.0, qty * splits[0]), max(0.0, qty * splits[1]), max(0.0, qty * splits[2])]
+        try:
+            tp_qtys[2] = max(0.0, qty - (tp_qtys[0] + tp_qtys[1]))
+        except Exception:
+            pass
+
     for tp_price, tp_qty in zip(tps, tp_qtys):
         if tp_price <= 0 or tp_qty <= 0:
             continue
@@ -1306,7 +1606,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         })
 
     trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
-    return (True, f'[LIVE] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}')
+    return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TPs={','.join([f'{x:g}' for x in tps])}")
 
 
 # Caching for speed
@@ -1429,6 +1729,13 @@ def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
 
     sess = knobs["name"]
     base_mult = float(SESSION_1H_BASE_MULT.get(sess, 1.0))
+
+    # ✅ Weekend slight tightening (UTC)
+    try:
+        if is_weekend_utc(datetime.now(timezone.utc)):
+            base_mult *= (1.06 if sess == "ASIA" else 1.03)
+    except Exception:
+        pass
 
     # Global base floor (kept modest)
     base_floor = float(TRIGGER_1H_ABS_MIN_BASE) * base_mult
@@ -5439,6 +5746,23 @@ def make_setup(
                     _rej("4h_bull_regime_blocks_short", base, mv, f"ch4={ch4:+.2f}%")
                     return None
 
+
+        # ✅ Approach A (ASIA): require basic 1H+4H alignment with the signal direction
+        # (NY/LON unchanged to keep flow)
+        try:
+            if str(session_name).upper() == "ASIA":
+                min1, min4 = tf_align_mins_for_session(session_name)
+                if side == "BUY":
+                    if not (ch1 >= min1 and ch4 >= min4):
+                        _rej("asia_tf_align_fail_long", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need>=({min1},{min4})")
+                        return None
+                else:
+                    if not (ch1 <= -min1 and ch4 <= -min4):
+                        _rej("asia_tf_align_fail_short", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need<=(-{min1},-{min4})")
+                        return None
+        except Exception:
+            pass
+
         # =========================================================
         # ✅ PULLBACK EMA (7/14/21) selection (15m)
         # =========================================================
@@ -5643,6 +5967,16 @@ def make_setup(
 
         rr_bonus = ENGINE_B_RR_BONUS if engine_b_ok else 0.0
         tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine_b_ok else 0.0
+
+        # ✅ Approach A: volatility-aware TP cap tightening (higher hit-rate on choppy/high-ATR coins)
+        try:
+            atr_pct = (float(atr_1h) / float(entry)) * 100.0 if float(entry) > 0 else 0.0
+            if atr_pct >= 6.0:
+                tp_cap_pct = min(float(tp_cap_pct), 9.0)
+            elif atr_pct >= 4.5:
+                tp_cap_pct = min(float(tp_cap_pct), 10.5)
+        except Exception:
+            pass
 
         sl, tp3_single, R = compute_sl_tp(
             entry, side, atr_1h, conf, tp_cap_pct,
@@ -6710,6 +7044,9 @@ def compute_risk_usd(user: dict, mode: str, value: float) -> float:
     if mode == "USD":
         return max(0.0, float(value))
     eq = float(user["equity"])
+    live_eq = _live_equity_usdt()
+    if live_eq is not None:
+        eq = live_eq
     if eq <= 0:
         return 0.0
     return max(0.0, eq * (float(value) / 100.0))
@@ -7204,6 +7541,9 @@ Website: https://pulsefutures.com/
 /autotrade_report [hours]
 • Journal/report for bot-opened positions (default 24h)
 • Evaluates TP/SL hit-order via Bybit 1m OHLCV (same as signal_report)
+
+/autotrade_last
+• Shows the last AutoTrade attempt details (symbol sent, qty/step/minNotional, Bybit retCode/retMsg)
 
 /autotrade_report_overall
 • Overall performance summary for bot-opened positions (same metrics as signal_report_overall)
@@ -8979,6 +9319,10 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plan = str(effective_plan(uid, user)).upper()
     equity = float((user or {}).get("equity") or 0.0)
 
+    live_eq = _live_equity_usdt()
+    if live_eq is not None:
+        equity = live_eq
+
     cap = daily_cap_usd(user)
     # Sync used risk from CURRENT open positions (RF/close frees capacity instantly)
     pnl_today = _pnl_today_closed_trades(uid, user)
@@ -9029,6 +9373,30 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Trade window: {tw_txt}")
     lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
     lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
+
+    # AutoTrade status (owner/admin only)
+    try:
+        show_at = (int(uid) == int(AUTOTRADE_OWNER_UID)) or is_admin(uid)
+    except Exception:
+        show_at = False
+    if show_at:
+        at_on = "ON" if AUTOTRADE_ENABLED else "OFF"
+        at_mode = str(AUTOTRADE_MODE).upper()
+        at_sess = ",".join([s.strip().upper() for s in _autotrade_get_sessions() if s.strip()]) or "NY"
+        dec = _LAST_AUTOTRADE_DECISION.get(int(AUTOTRADE_OWNER_UID or 0), {})
+        dec_txt = ""
+        if dec:
+            _when = str(dec.get('when','') or '')
+            _when_disp = _when
+            try:
+                if _when:
+                    _dt = datetime.fromisoformat(_when.replace('Z','+00:00'))
+                    _dt_m = _dt.astimezone(ZoneInfo('Australia/Melbourne'))
+                    _when_disp = _dt_m.strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                pass
+            dec_txt = f" | Last: {dec.get('status','')} ({dec.get('reason','')}) @ {_when_disp} (Melbourne)"
+        lines.append(f"AutoTrade: {at_on} | Mode: {at_mode} | Sessions: {at_sess}{dec_txt}")
     lines.append(HDR)
 
     if not opens:
@@ -9817,6 +10185,9 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
 
     all_emailed = db_list_emailed_setups_all(uid)
     total = len(all_emailed)
+    if total == 0:
+        await update.message.reply_text("No emailed setups found yet for your account.")
+        return
 
     outcomes = db_list_outcomes_for_user(uid)  # evaluated only
     evaluated = len(outcomes)
@@ -10026,6 +10397,59 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text("\n".join(lines))
 
 
+async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show last autotrade attempt details (admin only)."""
+    uid = update.effective_user.id
+
+    # Use the bot's canonical admin check (avoid undefined is_admin())
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    owner = int(AUTOTRADE_OWNER_UID or 0)
+    det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
+    dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
+
+    # Melbourne time for readability
+    when_utc = str(det.get("when") or dec.get("when") or "")
+    when_m = when_utc
+    try:
+        if when_utc:
+            dt = datetime.fromisoformat(when_utc.replace("Z", "+00:00"))
+            when_m = dt.astimezone(ZoneInfo("Australia/Melbourne")).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
+    lines = []
+    lines.append("*AutoTrade — Last Attempt*")
+    lines.append(HDR)
+    if not det and not dec:
+        lines.append("No attempts recorded yet.")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    lines.append(f"*When (Melbourne):* `{when_m}`")
+    if dec:
+        lines.append(f"*Decision:* `{dec.get('status','')}` — `{dec.get('reason','')}`")
+    if det:
+        lines.append(f"*Symbol:* `{det.get('symbol_sent','')}`  (raw: `{det.get('symbol_raw','')}`)")
+        lines.append(f"*Side:* `{det.get('side','')}`")
+        lines.append(f"*Entry:* `{det.get('entry','')}`  *SL:* `{det.get('sl','')}`")
+        if det.get("qty_str") is not None:
+            lines.append(f"*Qty:* `{det.get('qty_str')}` (step {det.get('qty_step')}, min {det.get('min_qty')}, minNot {det.get('min_notional')})")
+        by = det.get("bybit") or {}
+        try:
+            rc = by.get("retCode")
+            rm = by.get("retMsg")
+            if rc is not None or rm:
+                lines.append(f"*Bybit:* retCode={rc} retMsg={rm}")
+        except Exception:
+            pass
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+
 async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _autotrade_migrate_tables()
     """/autotrade_report_overall — Overall performance summary for bot-opened trades."""
@@ -10142,13 +10566,13 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         _WAITING_TRIGGER.clear()
     except Exception:
         pass
-
-    # knobs
+# knobs
     if mode == "screen":
         n_target = int(SETUPS_N)
         strict_15m = True
-        universe_cap = int(SCREEN_UNIVERSE_N)
-        trigger_loosen = float(SCREEN_TRIGGER_LOOSEN)
+        universe_cap = int(max(SCREEN_UNIVERSE_N, 35))
+        # Ensure /screen is not stricter than email engine
+        trigger_loosen = float(max(SCREEN_TRIGGER_LOOSEN, 1.0))
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
         allow_no_pullback = True
         scan_multiplier = 10
@@ -13186,32 +13610,6 @@ async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
                 c.execute(f"INSERT INTO outcomes_archive SELECT *, ? FROM {outcomes_src}", (now_ts,))
                 c.execute(f"DELETE FROM {outcomes_src}")
 
-            # --- Emailed setups archive + clear (critical for reports) ---
-            # Signal reports count delivered setups from `emailed_setups`. Reset must clear it too.
-            try:
-                c.execute("""CREATE TABLE IF NOT EXISTS emailed_setups_archive AS
-                             SELECT *, 0.0 AS archived_at FROM emailed_setups WHERE 0""")
-                try:
-                    c.execute("ALTER TABLE emailed_setups_archive ADD COLUMN archived_at REAL")
-                except Exception:
-                    pass
-                # archive rows (best-effort if schema changed)
-                try:
-                    c.execute("INSERT INTO emailed_setups_archive SELECT *, ? FROM emailed_setups", (now_ts,))
-                except Exception:
-                    try:
-                        c.execute(
-                            "INSERT INTO emailed_setups_archive (user_id, setup_id, session, emailed_ts, archived_at) "
-                            "SELECT user_id, setup_id, session, emailed_ts, ? FROM emailed_setups",
-                            (now_ts,),
-                        )
-                    except Exception:
-                        pass
-                c.execute("DELETE FROM emailed_setups")
-            except Exception:
-                # table may not exist in some DBs
-                pass
-
             conn.commit()
 
         msg = "✅ Signals archived and report reset."
@@ -13314,6 +13712,89 @@ async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Upgrade opens the billing menu
     return await billing_cmd(update, context)
 
+
+
+async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
+    """Background AutoTrade loop. Scans and opens trades for the owner when enabled.
+    Runs independently from email sending (no dependency on 'email setup sent')."""
+    try:
+        if not _autotrade_ready():
+            return
+
+        uid = int(AUTOTRADE_OWNER_UID)
+        # If user record doesn't exist yet, do nothing (avoids writing defaults to DB)
+        user = get_user(uid) or {}
+        if not user:
+            return
+
+        # Session label in UTC (NY/LON/ASIA)
+        now_utc = datetime.now(timezone.utc)
+        sess = _guess_session_name_utc(now_utc)
+
+        if not _autotrade_allowed_session(sess):
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "SKIP",
+                "when": now_utc.isoformat(timespec="seconds"),
+                "reason": f"session_not_allowed ({sess})",
+            }
+            return
+
+        # Optional: respect user's trade window (if configured)
+        try:
+            if not trade_window_allows_now(user):
+                _LAST_AUTOTRADE_DECISION[uid] = {
+                    "status": "SKIP",
+                    "when": now_utc.isoformat(timespec="seconds"),
+                    "reason": "trade_window_block",
+                }
+                return
+        except Exception:
+            pass
+
+        # Fetch market universe
+        best_fut = await asyncio.to_thread(fetch_futures_tickers)
+        if not best_fut:
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "ERROR",
+                "when": now_utc.isoformat(timespec="seconds"),
+                "reason": "fetch_futures_failed",
+            }
+            return
+
+        # Build setups with the same engine used by /screen (fast + high quality)
+        try:
+            pool = await asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess, mode="screen", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid))
+        except Exception as e:
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "ERROR",
+                "when": now_utc.isoformat(timespec="seconds"),
+                "reason": f"build_pool_failed: {type(e).__name__}: {e}",
+            }
+            return
+
+        setups = (pool.get("setups", []) or [])
+        ok, reason = _autotrade_place_trade(uid, sess, setups)
+
+        _LAST_AUTOTRADE_DECISION[uid] = {
+            "status": "OPENED" if ok else "SKIP",
+            "when": now_utc.isoformat(timespec="seconds"),
+            "reason": reason,
+            "session": sess,
+            "mode": AUTOTRADE_MODE,
+        }
+
+    except Exception as e:
+        try:
+            uid = int(AUTOTRADE_OWNER_UID or 0)
+        except Exception:
+            uid = 0
+        if uid:
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "ERROR",
+                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "reason": f"{type(e).__name__}: {e}",
+            }
+        logger.exception("autotrade_job crashed: %s", e)
 
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
@@ -13485,6 +13966,7 @@ def main():
     
     app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
     # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
@@ -13501,6 +13983,19 @@ def main():
                 "max_instances": 1,
                 "coalesce": True,
                 "misfire_grace_time": 60,
+            },
+        )
+
+        # AutoTrade loop (owner-only)
+        app.job_queue.run_repeating(
+            autotrade_job,
+            interval=60,
+            first=30,
+            name="autotrade_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 30,
             },
         )
     else:
