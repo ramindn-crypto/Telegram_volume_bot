@@ -13966,6 +13966,7 @@ def main():
     
     app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
     # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
