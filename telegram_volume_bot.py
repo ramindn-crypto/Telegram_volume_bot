@@ -1565,20 +1565,20 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
 
 # Convert base-unit qty to Bybit contract qty if contractSize != 1
-try:
-    _filt_cs = _bybit_get_instr_filters(sym)
-    _cs = float(_filt_cs.get("contractSize") or 1.0)
-    if _cs and _cs > 0:
-        qty = float(qty) / _cs
     try:
-        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-            'contract_size': _cs,
-            'qty_contracts_pre_round': float(qty),
-        })
+        _filt_cs = _bybit_get_instr_filters(sym)
+        _cs = float(_filt_cs.get("contractSize") or 1.0)
+        if _cs and _cs > 0:
+            qty = float(qty) / _cs
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'contract_size': _cs,
+                'qty_contracts_pre_round': float(qty),
+            })
+        except Exception:
+            pass
     except Exception:
         pass
-except Exception:
-    pass
 
     if AUTOTRADE_MODE == 'paper':
         trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
