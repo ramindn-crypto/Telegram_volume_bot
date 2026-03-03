@@ -7852,6 +7852,9 @@ Website: https://pulsefutures.com/
 /autotrade_last
 • Shows the last AutoTrade attempt details (symbol sent, qty/step/minNotional, Bybit retCode/retMsg)
 
+/autotrade_debug
+• AutoTrade readiness + last decision/caps/session diagnostics (admin only)
+
 /autotrade_report_overall
 • Overall performance summary for bot-opened positions (same metrics as signal_report_overall)
 
@@ -10775,7 +10778,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     Builds a report for bot-opened trades in the last N hours and evaluates TP/SL hit-order using Bybit OHLCV.
     """
     uid = update.effective_user.id
-    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not user_is_admin(uid)):
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text("⛔️ Owner/admin only.")
         return
 
@@ -10943,11 +10946,137 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 
+
+async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """AutoTrade readiness + last decision diagnostics (admin only)."""
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    owner = int(AUTOTRADE_OWNER_UID or 0)
+    user = get_user(owner) or {}
+
+    now_utc = datetime.now(timezone.utc)
+    sess = _guess_session_name_utc(now_utc)
+
+    # readiness reasons (more helpful than just True/False)
+    reasons = []
+    if not AUTOTRADE_ENABLED:
+        reasons.append("AUTOTRADE_ENABLED=0")
+    if owner <= 0:
+        reasons.append("AUTOTRADE_OWNER_UID missing/0")
+    if str(AUTOTRADE_MODE).lower() not in ("paper", "live"):
+        reasons.append(f"bad AUTOTRADE_MODE={AUTOTRADE_MODE}")
+    if str(AUTOTRADE_MODE).lower() == "live" and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
+        reasons.append("missing BYBIT_API_KEY/SECRET")
+
+    ready = _autotrade_ready()
+    sess_allowed = _autotrade_allowed_session(sess)
+
+    # trade-window gate (optional)
+    tw_ok = None
+    try:
+        tw_ok = bool(trade_window_allows_now(user))
+    except Exception:
+        tw_ok = None
+
+    # equity + caps
+    equity_src = "n/a"
+    equity = 0.0
+    try:
+        if str(AUTOTRADE_MODE).lower() == "live":
+            equity = float(_bybit_get_equity_usdt() or 0.0)
+            equity_src = "Bybit (live)"
+        else:
+            equity = float((user or {}).get("equity") or 0.0)
+            equity_src = "User stored (paper)"
+    except Exception:
+        equity = 0.0
+
+    open_trades = []
+    try:
+        open_trades = _autotrade_db_open_trades(owner)
+    except Exception:
+        open_trades = []
+
+    open_risk = 0.0
+    per_trade_risk = 0.0
+    open_cap = 0.0
+    daily_cap = 0.0
+    try:
+        open_risk = float(_autotrade_open_risk_usd(owner, equity) or 0.0) if equity > 0 else 0.0
+        per_trade_risk = float(equity * (AUTOTRADE_RISK_PER_TRADE_PCT / 100.0)) if equity > 0 else 0.0
+        open_cap = float(equity * (AUTOTRADE_OPEN_RISK_CAP_PCT / 100.0)) if equity > 0 else 0.0
+        daily_cap = float(equity * (AUTOTRADE_DAILY_RISK_CAP_PCT / 100.0)) if equity > 0 else 0.0
+    except Exception:
+        pass
+
+    # last decision snapshot (set by autotrade_job)
+    dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
+    det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
+
+    lines = []
+    lines.append("🧪 AutoTrade Debug")
+    lines.append(HDR)
+    lines.append(f"Ready: {'✅' if ready else '❌'}")
+    if reasons and not ready:
+        lines.append("Why not ready:")
+        for r in reasons[:6]:
+            lines.append(f"• {r}")
+
+    lines.append(SEP)
+    lines.append(f"Mode: {str(AUTOTRADE_MODE).lower()} | Enabled: {'yes' if AUTOTRADE_ENABLED else 'no'} | Isolated: {'yes' if AUTOTRADE_ISOLATED else 'no'}")
+    lines.append(f"Owner UID: {owner} | Caller UID: {uid}")
+    lines.append(f"Keys present: {'yes' if (BYBIT_API_KEY and BYBIT_API_SECRET) else 'no'}")
+
+    lines.append(SEP)
+    lines.append(f"UTC now: {now_utc.isoformat(timespec='seconds')}")
+    lines.append(f"Session: {sess} | Allowed: {'✅' if sess_allowed else '❌'}")
+    if tw_ok is not None:
+        lines.append(f"Trade window allows now: {'✅' if tw_ok else '❌'}")
+
+    lines.append(SEP)
+    lines.append(f"Equity: ${equity:.2f} ({equity_src})")
+    lines.append(f"Open trades: {len(open_trades)}/{int(AUTOTRADE_MAX_OPEN_TRADES)}")
+    lines.append(f"Open risk est: ${open_risk:.2f}")
+    lines.append(f"Per-trade risk: ${per_trade_risk:.2f} ({AUTOTRADE_RISK_PER_TRADE_PCT:g}%)")
+    lines.append(f"Open cap: ${open_cap:.2f} ({AUTOTRADE_OPEN_RISK_CAP_PCT:g}%)")
+    lines.append(f"Daily cap: ${daily_cap:.2f} ({AUTOTRADE_DAILY_RISK_CAP_PCT:g}%)")
+
+    # cap checks (same as _autotrade_place_trade)
+    if equity > 0:
+        if (open_risk + per_trade_risk) > open_cap:
+            lines.append("⚠️ Would BLOCK: open_risk_cap_reached")
+        if (open_risk + per_trade_risk) > daily_cap:
+            lines.append("⚠️ Would BLOCK: daily_risk_cap_reached")
+
+    lines.append(SEP)
+    if dec:
+        lines.append(f"Last decision: {dec.get('status','')}")
+        lines.append(f"Reason: {dec.get('reason','')}")
+        lines.append(f"When: {dec.get('when','')}")
+    else:
+        lines.append("Last decision: (none yet)")
+
+    if det:
+        # show key setup details if present
+        sym = det.get("symbol_sent") or det.get("symbol_raw") or ""
+        side = det.get("side") or ""
+        entry = det.get("entry")
+        sl = det.get("sl")
+        lines.append(SEP)
+        lines.append("Last setup attempt:")
+        lines.append(f"• {side} {sym} entry={entry} sl={sl} setup_id={det.get('setup_id','')}".strip())
+
+    await update.message.reply_text("\n".join([x for x in lines if x is not None and x != ""]))
+
+
 async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _autotrade_migrate_tables()
     """/autotrade_report_overall — Overall performance summary for bot-opened trades."""
     uid = update.effective_user.id
-    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not user_is_admin(uid)):
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text("⛔️ Owner/admin only.")
         return
 
@@ -14470,6 +14599,7 @@ def main():
     app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
     # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
