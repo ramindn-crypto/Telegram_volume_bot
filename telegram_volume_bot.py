@@ -1488,9 +1488,15 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (False, f'max_open_trades_reached ({AUTOTRADE_MAX_OPEN_TRADES})')
 
     s = setups[0]
+    
+    side = str(getattr(s, 'side', '') or '').upper()
+    entry = float(getattr(s, 'entry', 0.0) or 0.0)
+    sl = float(getattr(s, 'sl', 0.0) or 0.0)
+    
     sym = str(getattr(s, 'symbol', '') or '').upper()
     sym = _bybit_linear_symbol(sym)
-    # keep last autotrade attempt details for /autotrade_last
+    
+    # store attempt details AFTER values are defined
     try:
         _LAST_AUTOTRADE_DETAIL[int(uid)] = {
             'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
