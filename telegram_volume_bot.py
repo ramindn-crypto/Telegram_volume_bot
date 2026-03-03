@@ -1488,15 +1488,15 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (False, f'max_open_trades_reached ({AUTOTRADE_MAX_OPEN_TRADES})')
 
     s = setups[0]
-    
+
     side = str(getattr(s, 'side', '') or '').upper()
     entry = float(getattr(s, 'entry', 0.0) or 0.0)
     sl = float(getattr(s, 'sl', 0.0) or 0.0)
-    
+
     sym = str(getattr(s, 'symbol', '') or '').upper()
     sym = _bybit_linear_symbol(sym)
-    
-    # store attempt details AFTER values are defined
+
+    # keep last autotrade attempt details for /autotrade_last (store AFTER values defined)
     try:
         _LAST_AUTOTRADE_DETAIL[int(uid)] = {
             'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -1511,9 +1511,6 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
 
-    side = str(getattr(s, 'side', '') or '').upper()
-    entry = float(getattr(s, 'entry', 0.0) or 0.0)
-    sl = float(getattr(s, 'sl', 0.0) or 0.0)
     # TP targets may be partially available depending on the engine/scanner
     _tp1 = getattr(s, 'tp1', None)
     _tp2 = getattr(s, 'tp2', None)
@@ -2173,6 +2170,12 @@ _USER_DIAG_MODE: Dict[int, str] = {}
 
 # ✅ NEW: Stores last email decision per user (SENT / SKIP + reasons)
 _LAST_EMAIL_DECISION: Dict[int, Dict[str, Any]] = {}
+
+# ✅ NEW: last successful SENT email (so /email_decision won't be overwritten by later SKIPs)
+_LAST_EMAIL_SENT: Dict[int, Dict[str, Any]] = {}
+
+# ✅ NEW: last email ERROR (send/connect failure)
+_LAST_EMAIL_ERROR: Dict[int, Dict[str, Any]] = {}
 
 _LAST_BIGMOVE_DECISION: Dict[int, dict] = {}
 
@@ -6838,11 +6841,13 @@ def send_email(
 
         if uid is not None:
             _LAST_SMTP_ERROR.pop(uid, None)
-            _LAST_EMAIL_DECISION[uid] = {
+            _tmp_dec = {
                 "status": "SENT",
                 "reason": "ok",
                 "ts": time.time(),
             }
+            _LAST_EMAIL_DECISION[uid] = _tmp_dec
+            _LAST_EMAIL_SENT[uid] = dict(_tmp_dec)
         return True
 
     except Exception as e:
@@ -13191,11 +13196,13 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             try:
                 st = email_state_get(uid)
             except Exception as e:
-                _LAST_EMAIL_DECISION[uid] = {
+                _tmp_dec = {
                     "status": "ERROR",
                     "reasons": [f"email_state_get_failed ({type(e).__name__})"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
+                _LAST_EMAIL_DECISION[uid] = _tmp_dec
+                _LAST_EMAIL_ERROR[uid] = dict(_tmp_dec)
                 continue
 
             # Reset session state if session_key changed
@@ -13401,22 +13408,65 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 except Exception as _e:
                     autotrade_note = f"ERROR: {type(_e).__name__}: {_e}"
 
-                _LAST_EMAIL_DECISION[uid] = {
+                _tmp_dec = {
                     "status": "SENT",
                     "picked": ", ".join([f"{s.side} {s.symbol} conf={s.conf}" for s in chosen_list]),
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                     "autotrade": autotrade_note,
                     "reasons": ["passed_filters_multi"],
                 }
+                _LAST_EMAIL_DECISION[uid] = _tmp_dec
+                _LAST_EMAIL_SENT[uid] = dict(_tmp_dec)
             else:
-                _LAST_EMAIL_DECISION[uid] = {
+                _tmp_dec = {
                     "status": "ERROR",
                     "reasons": ["send_email_failed_or_timeout", _LAST_SMTP_ERROR.get(uid, "unknown_error")],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
+                _LAST_EMAIL_DECISION[uid] = _tmp_dec
+                _LAST_EMAIL_ERROR[uid] = dict(_tmp_dec)
 
 async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+
+    # User timezone for consistent debug display (show local + UTC)
+    try:
+        from zoneinfo import ZoneInfo
+        user = get_user(uid) or {}
+        tz_name = str(user.get("tz") or "UTC")
+        tz_disp = ZoneInfo(tz_name)
+    except Exception:
+        tz_name = "UTC"
+        tz_disp = timezone.utc
+
+    def _fmt_when_both(v) -> str:
+        try:
+            if v is None:
+                return ""
+            import datetime as _dt
+            dt = None
+            if isinstance(v, (int, float)):
+                dt = _dt.datetime.fromtimestamp(float(v), tz=_dt.timezone.utc)
+            elif isinstance(v, str):
+                s = v.strip()
+                if not s:
+                    return ""
+                try:
+                    dt = _dt.datetime.fromisoformat(s)
+                except Exception:
+                    return s
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_dt.timezone.utc)
+            else:
+                return str(v)
+            utc = dt.astimezone(_dt.timezone.utc).isoformat(timespec="seconds")
+            loc = dt.astimezone(tz_disp).isoformat(timespec="seconds")
+            return f"{loc} | UTC {utc}"
+        except Exception:
+            try:
+                return str(v)
+            except Exception:
+                return ""
 
     scan = _LAST_EMAIL_DECISION.get(uid) or {}
     bigm = _LAST_BIGMOVE_DECISION.get(uid) or {}
@@ -13446,11 +13496,33 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         pass
 
+    # Last successful SENT email (not overwritten by later SKIPs)
+    sent = _LAST_EMAIL_SENT.get(uid) or {}
+    if sent:
+        lines.append("")
+        lines.append("✅ Last SENT Email")
+        lines.append(f"When: {_fmt_when_both(sent.get('when') or sent.get('ts'))}")
+        if sent.get('picked'):
+            lines.append("Picked: " + str(sent.get('picked')))
+        rs = sent.get('reasons') or []
+        if rs:
+            lines.append("Reasons:\n- " + "\n- ".join([str(x) for x in rs]))
+
+    err = _LAST_EMAIL_ERROR.get(uid) or {}
+    if err:
+        lines.append("")
+        lines.append("❌ Last Email ERROR")
+        lines.append(f"When: {_fmt_when_both(err.get('when') or err.get('ts'))}")
+        rs = err.get('reasons') or []
+        if rs:
+            lines.append("Reasons:\n- " + "\n- ".join([str(x) for x in rs]))
+
+
     if bigm:
         lines.append("")
         lines.append("⚡ Big-Move Alert Decision")
         lines.append(f"Status: {bigm.get('status')}")
-        lines.append(f"When: {bigm.get('when') or _fmt_when(bigm.get('ts'))}")
+        lines.append("When: " + _fmt_when_both(bigm.get("when") or bigm.get("ts")))
         rs = bigm.get("reasons") or []
         if rs:
             lines.append("Reasons:\n- " + "\n- ".join(rs))
@@ -13459,7 +13531,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append("")
         lines.append("🧠 Market Scan Decision")
         lines.append(f"Status: {scan.get('status')}")
-        lines.append(f"When: {scan.get('when') or _fmt_when(scan.get('ts'))}")
+        lines.append("When: " + _fmt_when_both(scan.get("when") or scan.get("ts")))
         rs = scan.get("reasons") or scan.get("reason")
         if isinstance(rs, list):
             lines.append("Reasons:\n- " + "\n- ".join(rs))
@@ -14387,34 +14459,24 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # Fetch market universe
-        best_fut = await asyncio.to_thread(fetch_futures_tickers)
-        if not best_fut:
+        # Select best recent OPEN setup from DB (generated_setups + signals)
+        db_setups = _autotrade_select_db_setups(uid, sess, lookback_hours=12, limit=1)
+        if not db_setups:
             _LAST_AUTOTRADE_DECISION[uid] = {
-                "status": "ERROR",
+                "status": "SKIP",
                 "when": now_utc.isoformat(timespec="seconds"),
-                "reason": "fetch_futures_failed",
+                "reason": "no_setups",
+                "session": sess,
+                "mode": AUTOTRADE_MODE,
             }
             return
 
-        # Build setups with the same engine used by /screen (fast + high quality)
-        try:
-            pool = await asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess, mode="screen", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid))
-        except Exception as e:
-            _LAST_AUTOTRADE_DECISION[uid] = {
-                "status": "ERROR",
-                "when": now_utc.isoformat(timespec="seconds"),
-                "reason": f"build_pool_failed: {type(e).__name__}: {e}",
-            }
-            return
-
-        setups = (pool.get("setups", []) or [])
-        ok, reason = _autotrade_place_trade(uid, sess, setups)
+        ok, reason = _autotrade_place_trade(uid, sess, db_setups)
 
         _LAST_AUTOTRADE_DECISION[uid] = {
-            "status": "OPENED" if ok else "SKIP",
+            "status": "PLACED" if ok else "SKIP",
             "when": now_utc.isoformat(timespec="seconds"),
-            "reason": reason,
+            "reason": "" if ok else reason,
             "session": sess,
             "mode": AUTOTRADE_MODE,
         }
