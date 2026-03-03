@@ -1150,7 +1150,7 @@ def _bybit_get_instr_filters(symbol: str) -> dict:
     sym = _bybit_linear_symbol(symbol)
     if sym in _INSTR_FILTER_CACHE:
         return _INSTR_FILTER_CACHE[sym]
-    out = {"minQty": None, "qtyStep": None, "minNotional": None}
+    out = {"minQty": None, "qtyStep": None, "minNotional": None, "contractSize": None}
     try:
         res = _bybit_v5_request("GET", "/v5/market/instruments-info", {"category": "linear", "symbol": sym})
         items = (((res or {}).get("result") or {}).get("list") or [])
@@ -1164,6 +1164,9 @@ def _bybit_get_instr_filters(symbol: str) -> dict:
             nf = info.get("notionalFilter") or {}
             if nf.get("minNotional") is not None:
                 out["minNotional"] = str(nf.get("minNotional"))
+            # contract size (important for 1000* symbols)
+            if info.get('contractSize') is not None:
+                out['contractSize'] = str(info.get('contractSize'))
     except Exception:
         pass
     _INSTR_FILTER_CACHE[sym] = out
@@ -1210,6 +1213,7 @@ def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | 
         step_s = f.get("qtyStep")
         min_qty_s = f.get("minQty")
         min_not_s = f.get("minNotional")
+        cs_s = f.get("contractSize")
 
         dqty = Decimal(str(qty))
         dentry = Decimal(str(entry_price)) if entry_price and entry_price > 0 else None
@@ -1225,6 +1229,7 @@ def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | 
         dstep = _d(step_s)
         dmin = _d(min_qty_s)
         dmin_not = _d(min_not_s)
+        dcs = _d(cs_s) or Decimal('1')
 
         if dstep and dstep > 0:
             mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
@@ -1237,8 +1242,8 @@ def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | 
             else:
                 dqty = dmin
 
-        if dmin_not and dentry and dentry > 0 and (dqty * dentry) < dmin_not:
-            need = dmin_not / dentry
+        if dmin_not and dentry and dentry > 0 and (dqty * dentry * dcs) < dmin_not:
+            need = dmin_not / (dentry * dcs)
             if dstep and dstep > 0:
                 mult = (need / dstep).to_integral_value(rounding=ROUND_UP)
                 dqty = (mult * dstep).quantize(dstep)
@@ -1579,6 +1584,21 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     })
 
     # Round qty up to Bybit min/step to prevent rejections on low-price symbols
+
+    # Convert "base units" qty -> Bybit contract qty when contractSize > 1 (e.g., 1000* symbols)
+    try:
+        _tmp_f = _bybit_get_instr_filters(sym)
+        _cs = float(_tmp_f.get('contractSize') or 1.0)
+        if _cs and _cs > 1.0:
+            qty = float(qty) / _cs
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'contractSize': _cs, 'qty_contracts': qty})
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    
 
 
     qty, qreason = _round_qty_up(sym, qty, entry)
