@@ -1563,6 +1563,23 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     if qty <= 0:
         return (False, 'qty_calc_failed')
 
+
+# Convert base-unit qty to Bybit contract qty if contractSize != 1
+try:
+    _filt_cs = _bybit_get_instr_filters(sym)
+    _cs = float(_filt_cs.get("contractSize") or 1.0)
+    if _cs and _cs > 0:
+        qty = float(qty) / _cs
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'contract_size': _cs,
+            'qty_contracts_pre_round': float(qty),
+        })
+    except Exception:
+        pass
+except Exception:
+    pass
+
     if AUTOTRADE_MODE == 'paper':
         trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
         return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TPs={','.join([f'{x:g}' for x in tps])}")
@@ -1690,7 +1707,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'symbol': sym,
             'side': 'Sell' if side == 'BUY' else 'Buy',
             'orderType': 'Limit',
-            'qty': str(tp_qty),
+            'qty': _fmt_qty(tp_qty, qty_step),
             'price': str(tp_price),
             'timeInForce': 'GTC',
             'reduceOnly': True,
