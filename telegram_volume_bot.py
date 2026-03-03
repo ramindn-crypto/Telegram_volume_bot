@@ -14737,3 +14737,36 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ===============================
+# QTY NORMALIZATION FIX (Bybit)
+# ===============================
+import math
+
+def _normalize_bybit_qty(exchange, symbol, qty):
+    try:
+        market = exchange.market(symbol)
+        info = market.get("info", {})
+        lot = info.get("lotSizeFilter", {})
+        step = float(lot.get("qtyStep", 0)) if lot.get("qtyStep") else None
+        min_qty = float(lot.get("minOrderQty", 0)) if lot.get("minOrderQty") else 0.0
+
+        if step and step > 0:
+            qty = math.floor(qty / step) * step
+
+        precision = market.get("precision", {}).get("amount", 8)
+        qty = float(f"{qty:.{precision}f}")
+
+        if qty < min_qty:
+            return 0.0
+
+        return qty
+    except Exception:
+        return 0.0
+
+
+# NOTE:
+# Before placing any Bybit order, call:
+# qty = _normalize_bybit_qty(exchange, symbol, qty)
+# If qty <= 0: skip trade with reason 'qty_below_min'
