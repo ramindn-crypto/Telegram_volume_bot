@@ -2415,6 +2415,44 @@ def db_connect() -> sqlite3.Connection:
 
     return con
 
+
+
+def get_best_open_setup_for_autotrade(user_id):
+    """
+    Pick the best *still-open* setup for autotrade from generated_setups.
+    NOTE: generated_setups does NOT store outcome. Outcome is tracked in signal_outcomes.
+    We treat missing outcome as OPEN.
+    """
+    try:
+        con = db_connect()
+        cur = con.cursor()
+
+        cutoff = time.time() - 6 * 3600  # last 6 hours (safer across sessions)
+
+        cur.execute("""
+            SELECT gs.id, gs.setup_id, gs.symbol, gs.side, gs.conf,
+                   COALESCE(so.outcome, 'OPEN') AS outcome
+            FROM generated_setups gs
+            LEFT JOIN signal_outcomes so
+                   ON so.setup_id = gs.setup_id
+            WHERE gs.user_id = ?
+              AND gs.created_ts >= ?
+              AND gs.source IN ('email','screen')
+              AND COALESCE(so.outcome, 'OPEN') = 'OPEN'
+            ORDER BY gs.conf DESC, gs.created_ts DESC
+            LIMIT 1
+        """, (int(user_id), float(cutoff)))
+
+        row = cur.fetchone()
+        con.close()
+        return row
+    except Exception as e:
+        try:
+            logger.error(f"Autotrade selector error: {e}")
+        except Exception:
+            pass
+        return None
+
 def db_backup_file() -> Tuple[bool, str]:
     """
     Copies DB_PATH -> DB_BACKUP_PATH
