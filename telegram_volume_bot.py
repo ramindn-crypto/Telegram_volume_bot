@@ -1582,7 +1582,8 @@ except Exception:
 
     if AUTOTRADE_MODE == 'paper':
         trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
-        return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TPs={','.join([f'{x:g}' for x in tps])}")
+        tps_str = ','.join([f"{x:g}" for x in tps])
+        return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TPs={tps_str}")
 
     # LIVE MODE (Bybit V5)
     if AUTOTRADE_ISOLATED:
