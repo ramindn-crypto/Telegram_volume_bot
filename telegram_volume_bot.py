@@ -1410,7 +1410,8 @@ def _autotrade_allowed_session(session_label: str) -> bool:
 # =========================================================
 def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1) -> list:
     """Return a list of Setup-like objects with entry/sl/tps for _autotrade_place_trade.
-    Uses generated_setups for recency + session, joins signal_outcomes for OPEN, and pulls prices from signals.
+    Uses generated_setups for recency, joins signal_outcomes for OPEN, and pulls prices from signals.
+    IMPORTANT: Do NOT filter by session label here (it can drift). Pick best OPEN recent setup.
     """
     try:
         from types import SimpleNamespace
@@ -1425,11 +1426,11 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             LEFT JOIN signal_outcomes o ON o.setup_id = g.setup_id
             WHERE g.user_id = ?
               AND g.created_ts >= ?
-              AND UPPER(COALESCE(g.session,'')) = UPPER(?)
+              AND g.source IN ('email','screen')
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
             ORDER BY g.conf DESC, g.created_ts DESC
             LIMIT ?
-        """, (int(uid), float(cutoff), str(session_label or ''), int(limit)))
+        """, (int(uid), float(cutoff), int(limit)))
 
         setup_ids = [r[0] for r in cur.fetchall() if r and r[0]]
         if not setup_ids:
@@ -4152,6 +4153,38 @@ def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts:
     con.close()
 
 
+
+def db_recent_generated_setups(user_id: int, source: str, lookback_hours: int = 6, limit: int = 5) -> list[dict]:
+    """Fetch recent generated_setups rows for UI correlation (/screen showing email setups too)."""
+    try:
+        cutoff = time.time() - float(lookback_hours) * 3600.0
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute("""
+            SELECT setup_id, session, symbol, side, conf, created_ts
+            FROM generated_setups
+            WHERE user_id = ?
+              AND source = ?
+              AND created_ts >= ?
+            ORDER BY created_ts DESC
+            LIMIT ?
+        """, (int(user_id), str(source).strip().lower(), float(cutoff), int(limit)))
+        rows = cur.fetchall() or []
+        con.close()
+        out = []
+        for r in rows:
+            sid, sess, sym, side, conf, ts = r
+            out.append({
+                "setup_id": sid,
+                "session": sess,
+                "symbol": sym,
+                "side": side,
+                "conf": int(conf or 0),
+                "created_ts": float(ts or 0.0),
+            })
+        return out
+    except Exception:
+        return []
 
 def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
     """Log a generated setup (from /screen) or a sent setup (email) for correlation."""
