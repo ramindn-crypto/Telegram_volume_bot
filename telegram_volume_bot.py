@@ -1150,7 +1150,7 @@ def _bybit_get_instr_filters(symbol: str) -> dict:
     sym = _bybit_linear_symbol(symbol)
     if sym in _INSTR_FILTER_CACHE:
         return _INSTR_FILTER_CACHE[sym]
-    out = {"minQty": None, "qtyStep": None, "minNotional": None}
+    out = {"minQty": None, "qtyStep": None, "minNotional": None, "contractSize": None}
     try:
         res = _bybit_v5_request("GET", "/v5/market/instruments-info", {"category": "linear", "symbol": sym})
         items = (((res or {}).get("result") or {}).get("list") or [])
@@ -1164,6 +1164,9 @@ def _bybit_get_instr_filters(symbol: str) -> dict:
             nf = info.get("notionalFilter") or {}
             if nf.get("minNotional") is not None:
                 out["minNotional"] = str(nf.get("minNotional"))
+            # contract size (important for 1000* symbols)
+            if info.get('contractSize') is not None:
+                out['contractSize'] = str(info.get('contractSize'))
     except Exception:
         pass
     _INSTR_FILTER_CACHE[sym] = out
@@ -1210,6 +1213,7 @@ def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | 
         step_s = f.get("qtyStep")
         min_qty_s = f.get("minQty")
         min_not_s = f.get("minNotional")
+        cs_s = f.get("contractSize")
 
         dqty = Decimal(str(qty))
         dentry = Decimal(str(entry_price)) if entry_price and entry_price > 0 else None
@@ -1225,6 +1229,7 @@ def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | 
         dstep = _d(step_s)
         dmin = _d(min_qty_s)
         dmin_not = _d(min_not_s)
+        dcs = _d(cs_s) or Decimal('1')
 
         if dstep and dstep > 0:
             mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
@@ -1237,8 +1242,8 @@ def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | 
             else:
                 dqty = dmin
 
-        if dmin_not and dentry and dentry > 0 and (dqty * dentry) < dmin_not:
-            need = dmin_not / dentry
+        if dmin_not and dentry and dentry > 0 and (dqty * dentry * dcs) < dmin_not:
+            need = dmin_not / (dentry * dcs)
             if dstep and dstep > 0:
                 mult = (need / dstep).to_integral_value(rounding=ROUND_UP)
                 dqty = (mult * dstep).quantize(dstep)
@@ -1488,9 +1493,15 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (False, f'max_open_trades_reached ({AUTOTRADE_MAX_OPEN_TRADES})')
 
     s = setups[0]
+
+    side = str(getattr(s, 'side', '') or '').upper()
+    entry = float(getattr(s, 'entry', 0.0) or 0.0)
+    sl = float(getattr(s, 'sl', 0.0) or 0.0)
+
     sym = str(getattr(s, 'symbol', '') or '').upper()
     sym = _bybit_linear_symbol(sym)
-    # keep last autotrade attempt details for /autotrade_last
+
+    # keep last autotrade attempt details for /autotrade_last (store AFTER values defined)
     try:
         _LAST_AUTOTRADE_DETAIL[int(uid)] = {
             'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -1505,9 +1516,6 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
 
-    side = str(getattr(s, 'side', '') or '').upper()
-    entry = float(getattr(s, 'entry', 0.0) or 0.0)
-    sl = float(getattr(s, 'sl', 0.0) or 0.0)
     # TP targets may be partially available depending on the engine/scanner
     _tp1 = getattr(s, 'tp1', None)
     _tp2 = getattr(s, 'tp2', None)
@@ -1555,9 +1563,27 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     if qty <= 0:
         return (False, 'qty_calc_failed')
 
+
+# Convert base-unit qty to Bybit contract qty if contractSize != 1
+    try:
+        _filt_cs = _bybit_get_instr_filters(sym)
+        _cs = float(_filt_cs.get("contractSize") or 1.0)
+        if _cs and _cs > 0:
+            qty = float(qty) / _cs
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'contract_size': _cs,
+                'qty_contracts_pre_round': float(qty),
+            })
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     if AUTOTRADE_MODE == 'paper':
         trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
-        return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TPs={','.join([f'{x:g}' for x in tps])}")
+        tps_str = ','.join([f"{x:g}" for x in tps])
+        return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TPs={tps_str}")
 
     # LIVE MODE (Bybit V5)
     if AUTOTRADE_ISOLATED:
@@ -1576,6 +1602,21 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     })
 
     # Round qty up to Bybit min/step to prevent rejections on low-price symbols
+
+    # Convert "base units" qty -> Bybit contract qty when contractSize > 1 (e.g., 1000* symbols)
+    try:
+        _tmp_f = _bybit_get_instr_filters(sym)
+        _cs = float(_tmp_f.get('contractSize') or 1.0)
+        if _cs and _cs > 1.0:
+            qty = float(qty) / _cs
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'contractSize': _cs, 'qty_contracts': qty})
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    
 
 
     qty, qreason = _round_qty_up(sym, qty, entry)
@@ -1667,7 +1708,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'symbol': sym,
             'side': 'Sell' if side == 'BUY' else 'Buy',
             'orderType': 'Limit',
-            'qty': str(tp_qty),
+            'qty': _fmt_qty(tp_qty, qty_step),
             'price': str(tp_price),
             'timeInForce': 'GTC',
             'reduceOnly': True,
@@ -2167,6 +2208,12 @@ _USER_DIAG_MODE: Dict[int, str] = {}
 
 # ✅ NEW: Stores last email decision per user (SENT / SKIP + reasons)
 _LAST_EMAIL_DECISION: Dict[int, Dict[str, Any]] = {}
+
+# ✅ NEW: last successful SENT email (so /email_decision won't be overwritten by later SKIPs)
+_LAST_EMAIL_SENT: Dict[int, Dict[str, Any]] = {}
+
+# ✅ NEW: last email ERROR (send/connect failure)
+_LAST_EMAIL_ERROR: Dict[int, Dict[str, Any]] = {}
 
 _LAST_BIGMOVE_DECISION: Dict[int, dict] = {}
 
@@ -6832,11 +6879,13 @@ def send_email(
 
         if uid is not None:
             _LAST_SMTP_ERROR.pop(uid, None)
-            _LAST_EMAIL_DECISION[uid] = {
+            _tmp_dec = {
                 "status": "SENT",
                 "reason": "ok",
                 "ts": time.time(),
             }
+            _LAST_EMAIL_DECISION[uid] = _tmp_dec
+            _LAST_EMAIL_SENT[uid] = dict(_tmp_dec)
         return True
 
     except Exception as e:
@@ -7851,6 +7900,9 @@ Website: https://pulsefutures.com/
 
 /autotrade_last
 • Shows the last AutoTrade attempt details (symbol sent, qty/step/minNotional, Bybit retCode/retMsg)
+
+/autotrade_debug
+• AutoTrade readiness + last decision/caps/session diagnostics (admin only)
 
 /autotrade_report_overall
 • Overall performance summary for bot-opened positions (same metrics as signal_report_overall)
@@ -10775,7 +10827,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     Builds a report for bot-opened trades in the last N hours and evaluates TP/SL hit-order using Bybit OHLCV.
     """
     uid = update.effective_user.id
-    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not user_is_admin(uid)):
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text("⛔️ Owner/admin only.")
         return
 
@@ -10943,11 +10995,148 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 
+
+async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """AutoTrade readiness + last decision diagnostics (admin only)."""
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    owner = int(AUTOTRADE_OWNER_UID or 0)
+    user = get_user(owner) or {}
+
+    now_utc = datetime.now(timezone.utc)
+    sess = _guess_session_name_utc(now_utc)
+
+    # readiness reasons (more helpful than just True/False)
+    reasons = []
+    if not AUTOTRADE_ENABLED:
+        reasons.append("AUTOTRADE_ENABLED=0")
+    if owner <= 0:
+        reasons.append("AUTOTRADE_OWNER_UID missing/0")
+    if str(AUTOTRADE_MODE).lower() not in ("paper", "live"):
+        reasons.append(f"bad AUTOTRADE_MODE={AUTOTRADE_MODE}")
+    if str(AUTOTRADE_MODE).lower() == "live" and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
+        reasons.append("missing BYBIT_API_KEY/SECRET")
+
+    ready = _autotrade_ready()
+    sess_allowed = _autotrade_allowed_session(sess)
+
+    # trade-window gate (optional)
+    tw_ok = None
+    try:
+        tw_ok = bool(trade_window_allows_now(user))
+    except Exception:
+        tw_ok = None
+
+    # equity + caps
+    equity_src = "n/a"
+    equity = 0.0
+    try:
+        if str(AUTOTRADE_MODE).lower() == "live":
+            equity = float(_bybit_get_equity_usdt() or 0.0)
+            equity_src = "Bybit (live)"
+        else:
+            equity = float((user or {}).get("equity") or 0.0)
+            equity_src = "User stored (paper)"
+    except Exception:
+        equity = 0.0
+
+    open_trades = []
+    try:
+        open_trades = _autotrade_db_open_trades(owner)
+    except Exception:
+        open_trades = []
+
+    open_risk = 0.0
+    per_trade_risk = 0.0
+    open_cap = 0.0
+    daily_cap = 0.0
+    try:
+        open_risk = float(_autotrade_open_risk_usd(owner, equity) or 0.0) if equity > 0 else 0.0
+        per_trade_risk = float(equity * (AUTOTRADE_RISK_PER_TRADE_PCT / 100.0)) if equity > 0 else 0.0
+        open_cap = float(equity * (AUTOTRADE_OPEN_RISK_CAP_PCT / 100.0)) if equity > 0 else 0.0
+        daily_cap = float(equity * (AUTOTRADE_DAILY_RISK_CAP_PCT / 100.0)) if equity > 0 else 0.0
+    except Exception:
+        pass
+
+    # last decision snapshot (set by autotrade_job)
+    dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
+    det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
+
+    lines = []
+    lines.append("🧪 AutoTrade Debug")
+    lines.append(HDR)
+    lines.append(f"Ready: {'✅' if ready else '❌'}")
+    if reasons and not ready:
+        lines.append("Why not ready:")
+        for r in reasons[:6]:
+            lines.append(f"• {r}")
+
+    lines.append(SEP)
+    lines.append(f"Mode: {str(AUTOTRADE_MODE).lower()} | Enabled: {'yes' if AUTOTRADE_ENABLED else 'no'} | Isolated: {'yes' if AUTOTRADE_ISOLATED else 'no'}")
+    lines.append(f"Owner UID: {owner} | Caller UID: {uid}")
+    lines.append(f"Keys present: {'yes' if (BYBIT_API_KEY and BYBIT_API_SECRET) else 'no'}")
+
+    lines.append(SEP)
+    lines.append(f"UTC now: {now_utc.isoformat(timespec='seconds')}")
+    # Show how old the displayed decision is (prevents confusion about "stale" output)
+    try:
+        _w = (dec or {}).get('when')
+        if _w:
+            _dt = datetime.fromisoformat(str(_w).replace('Z', '+00:00'))
+            _age = (now_utc - _dt).total_seconds()
+            if _age >= 0:
+                lines.append(f"Decision age: {int(_age//60)}m {int(_age%60)}s ago")
+    except Exception:
+        pass
+
+    lines.append(f"Session: {sess} | Allowed: {'✅' if sess_allowed else '❌'}")
+    if tw_ok is not None:
+        lines.append(f"Trade window allows now: {'✅' if tw_ok else '❌'}")
+
+    lines.append(SEP)
+    lines.append(f"Equity: ${equity:.2f} ({equity_src})")
+    lines.append(f"Open trades: {len(open_trades)}/{int(AUTOTRADE_MAX_OPEN_TRADES)}")
+    lines.append(f"Open risk est: ${open_risk:.2f}")
+    lines.append(f"Per-trade risk: ${per_trade_risk:.2f} ({AUTOTRADE_RISK_PER_TRADE_PCT:g}%)")
+    lines.append(f"Open cap: ${open_cap:.2f} ({AUTOTRADE_OPEN_RISK_CAP_PCT:g}%)")
+    lines.append(f"Daily cap: ${daily_cap:.2f} ({AUTOTRADE_DAILY_RISK_CAP_PCT:g}%)")
+
+    # cap checks (same as _autotrade_place_trade)
+    if equity > 0:
+        if (open_risk + per_trade_risk) > open_cap:
+            lines.append("⚠️ Would BLOCK: open_risk_cap_reached")
+        if (open_risk + per_trade_risk) > daily_cap:
+            lines.append("⚠️ Would BLOCK: daily_risk_cap_reached")
+
+    lines.append(SEP)
+    if dec:
+        lines.append(f"Last decision: {dec.get('status','')}")
+        lines.append(f"Reason: {dec.get('reason','')}")
+        lines.append(f"When: {dec.get('when','')}")
+    else:
+        lines.append("Last decision: (none yet)")
+
+    if det:
+        # show key setup details if present
+        sym = det.get("symbol_sent") or det.get("symbol_raw") or ""
+        side = det.get("side") or ""
+        entry = det.get("entry")
+        sl = det.get("sl")
+        lines.append(SEP)
+        lines.append("Last setup attempt:")
+        lines.append(f"• {side} {sym} entry={entry} sl={sl} setup_id={det.get('setup_id','')}".strip())
+
+    await update.message.reply_text("\n".join([x for x in lines if x is not None and x != ""]))
+
+
 async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _autotrade_migrate_tables()
     """/autotrade_report_overall — Overall performance summary for bot-opened trades."""
     uid = update.effective_user.id
-    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not user_is_admin(uid)):
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text("⛔️ Owner/admin only.")
         return
 
@@ -13056,11 +13245,13 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             try:
                 st = email_state_get(uid)
             except Exception as e:
-                _LAST_EMAIL_DECISION[uid] = {
+                _tmp_dec = {
                     "status": "ERROR",
                     "reasons": [f"email_state_get_failed ({type(e).__name__})"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
+                _LAST_EMAIL_DECISION[uid] = _tmp_dec
+                _LAST_EMAIL_ERROR[uid] = dict(_tmp_dec)
                 continue
 
             # Reset session state if session_key changed
@@ -13266,22 +13457,65 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 except Exception as _e:
                     autotrade_note = f"ERROR: {type(_e).__name__}: {_e}"
 
-                _LAST_EMAIL_DECISION[uid] = {
+                _tmp_dec = {
                     "status": "SENT",
                     "picked": ", ".join([f"{s.side} {s.symbol} conf={s.conf}" for s in chosen_list]),
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                     "autotrade": autotrade_note,
                     "reasons": ["passed_filters_multi"],
                 }
+                _LAST_EMAIL_DECISION[uid] = _tmp_dec
+                _LAST_EMAIL_SENT[uid] = dict(_tmp_dec)
             else:
-                _LAST_EMAIL_DECISION[uid] = {
+                _tmp_dec = {
                     "status": "ERROR",
                     "reasons": ["send_email_failed_or_timeout", _LAST_SMTP_ERROR.get(uid, "unknown_error")],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
+                _LAST_EMAIL_DECISION[uid] = _tmp_dec
+                _LAST_EMAIL_ERROR[uid] = dict(_tmp_dec)
 
 async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+
+    # User timezone for consistent debug display (show local + UTC)
+    try:
+        from zoneinfo import ZoneInfo
+        user = get_user(uid) or {}
+        tz_name = str(user.get("tz") or "UTC")
+        tz_disp = ZoneInfo(tz_name)
+    except Exception:
+        tz_name = "UTC"
+        tz_disp = timezone.utc
+
+    def _fmt_when_both(v) -> str:
+        try:
+            if v is None:
+                return ""
+            import datetime as _dt
+            dt = None
+            if isinstance(v, (int, float)):
+                dt = _dt.datetime.fromtimestamp(float(v), tz=_dt.timezone.utc)
+            elif isinstance(v, str):
+                s = v.strip()
+                if not s:
+                    return ""
+                try:
+                    dt = _dt.datetime.fromisoformat(s)
+                except Exception:
+                    return s
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_dt.timezone.utc)
+            else:
+                return str(v)
+            utc = dt.astimezone(_dt.timezone.utc).isoformat(timespec="seconds")
+            loc = dt.astimezone(tz_disp).isoformat(timespec="seconds")
+            return f"{loc} | UTC {utc}"
+        except Exception:
+            try:
+                return str(v)
+            except Exception:
+                return ""
 
     scan = _LAST_EMAIL_DECISION.get(uid) or {}
     bigm = _LAST_BIGMOVE_DECISION.get(uid) or {}
@@ -13311,11 +13545,33 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         pass
 
+    # Last successful SENT email (not overwritten by later SKIPs)
+    sent = _LAST_EMAIL_SENT.get(uid) or {}
+    if sent:
+        lines.append("")
+        lines.append("✅ Last SENT Email")
+        lines.append(f"When: {_fmt_when_both(sent.get('when') or sent.get('ts'))}")
+        if sent.get('picked'):
+            lines.append("Picked: " + str(sent.get('picked')))
+        rs = sent.get('reasons') or []
+        if rs:
+            lines.append("Reasons:\n- " + "\n- ".join([str(x) for x in rs]))
+
+    err = _LAST_EMAIL_ERROR.get(uid) or {}
+    if err:
+        lines.append("")
+        lines.append("❌ Last Email ERROR")
+        lines.append(f"When: {_fmt_when_both(err.get('when') or err.get('ts'))}")
+        rs = err.get('reasons') or []
+        if rs:
+            lines.append("Reasons:\n- " + "\n- ".join([str(x) for x in rs]))
+
+
     if bigm:
         lines.append("")
         lines.append("⚡ Big-Move Alert Decision")
         lines.append(f"Status: {bigm.get('status')}")
-        lines.append(f"When: {bigm.get('when') or _fmt_when(bigm.get('ts'))}")
+        lines.append("When: " + _fmt_when_both(bigm.get("when") or bigm.get("ts")))
         rs = bigm.get("reasons") or []
         if rs:
             lines.append("Reasons:\n- " + "\n- ".join(rs))
@@ -13324,7 +13580,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append("")
         lines.append("🧠 Market Scan Decision")
         lines.append(f"Status: {scan.get('status')}")
-        lines.append(f"When: {scan.get('when') or _fmt_when(scan.get('ts'))}")
+        lines.append("When: " + _fmt_when_both(scan.get("when") or scan.get("ts")))
         rs = scan.get("reasons") or scan.get("reason")
         if isinstance(rs, list):
             lines.append("Reasons:\n- " + "\n- ".join(rs))
@@ -13482,6 +13738,12 @@ async def _post_init(app: Application):
             BotCommand("support_status", "Check your latest support ticket"),
 
             BotCommand("health", "Bot & data health check"),
+
+            BotCommand("autotrade_report", "AutoTrade journal (admin)"),
+            BotCommand("autotrade_last", "Last AutoTrade attempt (admin)"),
+            BotCommand("autotrade_debug", "AutoTrade debug (admin)"),
+            BotCommand("autotrade_sessions", "Set AutoTrade sessions (admin)"),
+            BotCommand("autotrade_report_overall", "AutoTrade overall stats (admin)"),
 
             BotCommand("billing", "Subscription & payment info"),
         ]
@@ -14252,34 +14514,24 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # Fetch market universe
-        best_fut = await asyncio.to_thread(fetch_futures_tickers)
-        if not best_fut:
+        # Select best recent OPEN setup from DB (generated_setups + signals)
+        db_setups = _autotrade_select_db_setups(uid, sess, lookback_hours=12, limit=1)
+        if not db_setups:
             _LAST_AUTOTRADE_DECISION[uid] = {
-                "status": "ERROR",
+                "status": "SKIP",
                 "when": now_utc.isoformat(timespec="seconds"),
-                "reason": "fetch_futures_failed",
+                "reason": "no_setups",
+                "session": sess,
+                "mode": AUTOTRADE_MODE,
             }
             return
 
-        # Build setups with the same engine used by /screen (fast + high quality)
-        try:
-            pool = await asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess, mode="screen", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid))
-        except Exception as e:
-            _LAST_AUTOTRADE_DECISION[uid] = {
-                "status": "ERROR",
-                "when": now_utc.isoformat(timespec="seconds"),
-                "reason": f"build_pool_failed: {type(e).__name__}: {e}",
-            }
-            return
-
-        setups = (pool.get("setups", []) or [])
-        ok, reason = _autotrade_place_trade(uid, sess, setups)
+        ok, reason = _autotrade_place_trade(uid, sess, db_setups)
 
         _LAST_AUTOTRADE_DECISION[uid] = {
-            "status": "OPENED" if ok else "SKIP",
+            "status": "PLACED" if ok else "SKIP",
             "when": now_utc.isoformat(timespec="seconds"),
-            "reason": reason,
+            "reason": "" if ok else reason,
             "session": sess,
             "mode": AUTOTRADE_MODE,
         }
@@ -14470,6 +14722,7 @@ def main():
     app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
     # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
@@ -14541,69 +14794,34 @@ if __name__ == "__main__":
     main()
 
 
+# ===============================
+# QTY NORMALIZATION FIX (Bybit)
+# ===============================
+import math
 
-
-
-
-@bot.message_handler(commands=['autotrade_diag'])
-def autotrade_diag_cmd(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    uid = int(AUTOTRADE_OWNER_UID)
+def _normalize_bybit_qty(exchange, symbol, qty):
     try:
-        con = db_connect()
-        cur = con.cursor()
+        market = exchange.market(symbol)
+        info = market.get("info", {})
+        lot = info.get("lotSizeFilter", {})
+        step = float(lot.get("qtyStep", 0)) if lot.get("qtyStep") else None
+        min_qty = float(lot.get("minOrderQty", 0)) if lot.get("minOrderQty") else 0.0
 
-        cutoff_24h = time.time() - 24 * 3600.0
-        cur.execute("SELECT COUNT(*) FROM generated_setups WHERE user_id=? AND created_ts>=?", (uid, cutoff_24h))
-        gen_cnt = int((cur.fetchone() or [0])[0] or 0)
+        if step and step > 0:
+            qty = math.floor(qty / step) * step
 
-        cur.execute("SELECT COUNT(*) FROM generated_setups WHERE user_id=? AND created_ts>=? AND source='email'", (uid, cutoff_24h))
-        gen_email_cnt = int((cur.fetchone() or [0])[0] or 0)
+        precision = market.get("precision", {}).get("amount", 8)
+        qty = float(f"{qty:.{precision}f}")
 
-        cur.execute("SELECT COUNT(*) FROM generated_setups WHERE user_id=? AND created_ts>=? AND source='screen'", (uid, cutoff_24h))
-        gen_screen_cnt = int((cur.fetchone() or [0])[0] or 0)
+        if qty < min_qty:
+            return 0.0
 
-        cur.execute("""
-            SELECT setup_id, source, session, symbol, side, conf, created_ts
-            FROM generated_setups
-            WHERE user_id=?
-            ORDER BY created_ts DESC
-            LIMIT 8
-        """, (uid,))
-        rows = cur.fetchall() or []
+        return qty
+    except Exception:
+        return 0.0
 
-        # selector output
-        try:
-            now_sess = str(get_session_label_now())
-        except Exception:
-            now_sess = ""
-        setups = _autotrade_select_db_setups(uid, session_label=now_sess, lookback_hours=24, limit=3)
-        pick = setups[0] if setups else None
 
-        con.close()
-
-        out = []
-        out.append("🧪 AutoTrade Diagnostics")
-        out.append("━━━━━━━━━━━━━━━━━━━━")
-        out.append(f"Owner UID: {uid}")
-        out.append(f"generated_setups (24h): {gen_cnt} | email={gen_email_cnt} | screen={gen_screen_cnt}")
-        out.append("")
-        out.append("Recent generated_setups (last 8):")
-        if rows:
-            for (sid, source, sess, sym, side, conf, ts) in rows:
-                out.append(f"• {sid} | {str(source).upper()} | {sess} | {str(side).upper()} {str(sym).upper()} | Conf {int(conf or 0)} | {datetime.fromtimestamp(float(ts)).strftime('%m-%d %H:%M')}")
-        else:
-            out.append("• (none)")
-
-        out.append("")
-        if pick:
-            out.append("Selector pick (top):")
-            out.append(f"• {getattr(pick,'setup_id','')} | {getattr(pick,'side','')} {getattr(pick,'symbol','')} | Conf {getattr(pick,'conf',0)}")
-            out.append(f"  entry={getattr(pick,'entry',None)} sl={getattr(pick,'sl',None)}")
-        else:
-            out.append("Selector pick: (none)")
-
-        bot.reply_to(message, "\n".join(out))
-    except Exception as e:
-        bot.reply_to(message, f"autotrade_diag failed: {type(e).__name__}: {e}")
+# NOTE:
+# Before placing any Bybit order, call:
+# qty = _normalize_bybit_qty(exchange, symbol, qty)
+# If qty <= 0: skip trade with reason 'qty_below_min'
