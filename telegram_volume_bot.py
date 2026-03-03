@@ -2418,6 +2418,36 @@ def db_connect() -> sqlite3.Connection:
 
 
 
+
+
+def _migrate_generated_setups():
+    """Ensure generated_setups table exists (used by /screen, email, and autotrade)."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS generated_setups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                source TEXT NOT NULL,          -- 'screen' | 'email'
+                created_ts REAL NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                setup_id TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                conf INTEGER DEFAULT 0
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_generated_setups_uid_ts ON generated_setups(user_id, created_ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_generated_setups_setupid ON generated_setups(setup_id)")
+        con.commit()
+        con.close()
+    except Exception as e:
+        try:
+            logger.error(f"_migrate_generated_setups failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+
 def get_best_open_setup_for_autotrade(user_id):
     """
     Pick the best *still-open* setup for autotrade from generated_setups.
@@ -14513,3 +14543,67 @@ if __name__ == "__main__":
 
 
 
+
+
+@bot.message_handler(commands=['autotrade_diag'])
+def autotrade_diag_cmd(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    uid = int(AUTOTRADE_OWNER_UID)
+    try:
+        con = db_connect()
+        cur = con.cursor()
+
+        cutoff_24h = time.time() - 24 * 3600.0
+        cur.execute("SELECT COUNT(*) FROM generated_setups WHERE user_id=? AND created_ts>=?", (uid, cutoff_24h))
+        gen_cnt = int((cur.fetchone() or [0])[0] or 0)
+
+        cur.execute("SELECT COUNT(*) FROM generated_setups WHERE user_id=? AND created_ts>=? AND source='email'", (uid, cutoff_24h))
+        gen_email_cnt = int((cur.fetchone() or [0])[0] or 0)
+
+        cur.execute("SELECT COUNT(*) FROM generated_setups WHERE user_id=? AND created_ts>=? AND source='screen'", (uid, cutoff_24h))
+        gen_screen_cnt = int((cur.fetchone() or [0])[0] or 0)
+
+        cur.execute("""
+            SELECT setup_id, source, session, symbol, side, conf, created_ts
+            FROM generated_setups
+            WHERE user_id=?
+            ORDER BY created_ts DESC
+            LIMIT 8
+        """, (uid,))
+        rows = cur.fetchall() or []
+
+        # selector output
+        try:
+            now_sess = str(get_session_label_now())
+        except Exception:
+            now_sess = ""
+        setups = _autotrade_select_db_setups(uid, session_label=now_sess, lookback_hours=24, limit=3)
+        pick = setups[0] if setups else None
+
+        con.close()
+
+        out = []
+        out.append("🧪 AutoTrade Diagnostics")
+        out.append("━━━━━━━━━━━━━━━━━━━━")
+        out.append(f"Owner UID: {uid}")
+        out.append(f"generated_setups (24h): {gen_cnt} | email={gen_email_cnt} | screen={gen_screen_cnt}")
+        out.append("")
+        out.append("Recent generated_setups (last 8):")
+        if rows:
+            for (sid, source, sess, sym, side, conf, ts) in rows:
+                out.append(f"• {sid} | {str(source).upper()} | {sess} | {str(side).upper()} {str(sym).upper()} | Conf {int(conf or 0)} | {datetime.fromtimestamp(float(ts)).strftime('%m-%d %H:%M')}")
+        else:
+            out.append("• (none)")
+
+        out.append("")
+        if pick:
+            out.append("Selector pick (top):")
+            out.append(f"• {getattr(pick,'setup_id','')} | {getattr(pick,'side','')} {getattr(pick,'symbol','')} | Conf {getattr(pick,'conf',0)}")
+            out.append(f"  entry={getattr(pick,'entry',None)} sl={getattr(pick,'sl',None)}")
+        else:
+            out.append("Selector pick: (none)")
+
+        bot.reply_to(message, "\n".join(out))
+    except Exception as e:
+        bot.reply_to(message, f"autotrade_diag failed: {type(e).__name__}: {e}")
