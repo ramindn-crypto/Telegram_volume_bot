@@ -11081,32 +11081,19 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     lines.append(SEP)
     lines.append(f"UTC now: {now_utc.isoformat(timespec='seconds')}")
+
+# Show how old the displayed decision is (prevents confusion about "stale" output)
+try:
+    _w = (dec or {}).get('when')
+    if _w:
+        _dt = datetime.fromisoformat(str(_w).replace('Z', '+00:00'))
+        _age = (now_utc - _dt).total_seconds()
+        if _age >= 0:
+            lines.append(f"Decision age: {int(_age//60)}m {int(_age%60)}s ago")
+except Exception:
+    pass
+
     lines.append(f"Session: {sess} | Allowed: {'✅' if sess_allowed else '❌'}")
-
-# Human-friendly age for last decision (helps avoid confusion)
-try:
-    if dec and dec.get("when"):
-        _w = dec.get("when")
-        _dt = datetime.fromisoformat(str(_w).replace("Z", "+00:00"))
-        _age_s = (now_utc - _dt).total_seconds()
-        if _age_s >= 0:
-            lines.append(f"Decision age: {int(_age_s//60)}m {int(_age_s%60)}s ago")
-except Exception:
-    pass
-
-# Show what the DB selector sees RIGHT NOW (does not place trades; for diagnostics only)
-try:
-    _dbg_setups = _autotrade_select_db_setups(owner, sess, lookback_hours=12, limit=3)
-    lines.append(SEP)
-    lines.append(f"DB setups (last 12h): {len(_dbg_setups)}")
-    for _s in _dbg_setups[:3]:
-        _sid = str(getattr(_s, "setup_id", "") or getattr(_s, "id", "") or "")
-        _sym = str(getattr(_s, "symbol", "") or "")
-        _side = str(getattr(_s, "side", "") or "")
-        _conf = int(getattr(_s, "conf", 0) or 0)
-        lines.append(f"• {_sid} {_side} {_sym} conf={_conf}")
-except Exception:
-    pass
     if tw_ok is not None:
         lines.append(f"Trade window allows now: {'✅' if tw_ok else '❌'}")
 
@@ -11143,25 +11130,6 @@ except Exception:
         lines.append("Last setup attempt:")
         lines.append(f"• {side} {sym} entry={entry} sl={sl} setup_id={det.get('setup_id','')}".strip())
 
-
-try:
-    _cs = det.get("contract_size")
-    _qty = det.get("qty_contracts_sent")
-    _step = det.get("qty_step")
-    _minq = det.get("min_qty")
-    extras = []
-    if _qty is not None:
-        extras.append(f"qty={_qty}")
-    if _cs is not None:
-        extras.append(f"cs={_cs}")
-    if _step is not None:
-        extras.append(f"step={_step}")
-    if _minq is not None:
-        extras.append(f"min={_minq}")
-    if extras:
-        lines.append("  " + " | ".join(extras))
-except Exception:
-    pass
     await update.message.reply_text("\n".join([x for x in lines if x is not None and x != ""]))
 
 
@@ -14851,14 +14819,4 @@ def _normalize_bybit_qty(exchange, symbol, qty):
 # NOTE:
 # Before placing any Bybit order, call:
 # qty = _normalize_bybit_qty(exchange, symbol, qty)
-
-# --- qty diagnostics for /autotrade_debug ---
-try:
-    _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-        'qty_contracts_sent': float(qty),
-        'qty_step': float(qty_step) if qty_step is not None else None,
-        'min_qty': float(min_qty) if min_qty is not None else None,
-    })
-except Exception:
-    pass
 # If qty <= 0: skip trade with reason 'qty_below_min'
