@@ -1,17 +1,14609 @@
 
-# ===============================
-# PulseFutures - AutoTrade FINAL FIXED
-# ===============================
+# --- ASIA tightening (hard-coded, no env vars) ---
+ASIA_MIN_CONF_BOOST = 9
+ASIA_MIN_FUT_VOL_USD = 10_000_000
+ASIA_EXCLUDED_PREFIXES = ("1000",)
+ASIA_SYMBOL_COOLDOWN_HOURS = 6
 
-# This file includes:
-# - Fixed autotrade selector
-# - Generated setups migration
-# - /autotrade_diag command
-# - Duplicate prevention logic
-# - Unified email + screen setup storage
+# =========================================================
+# RENDER WEB SERVICE KEEPALIVE (optional)
+# =========================================================
+def start_keepalive_http_server():
+    """
+    Render 'Web Service' expects the process to bind to $PORT.
+    If you deploy this bot as a Web Service (instead of a Background Worker),
+    we start a tiny HTTP server on $PORT so Render keeps it alive, while the bot
+    still runs polling in the same process.
+    """
+    try:
+        port = int(os.environ.get("PORT", "10000"))
+    except Exception:
+        port = 10000
 
-print("PulseFutures AutoTrade FINAL FIXED build loaded.")
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"ok")
+            except Exception:
+                pass
 
-# NOTE:
-# Please replace this placeholder with your latest full bot source.
-# The previous environment was reset and original file is not accessible here.
+        def log_message(self, fmt, *args):
+            # quiet
+            return
+
+    try:
+        srv = HTTPServer(("0.0.0.0", port), _Handler)
+    except Exception as e:
+        logger.warning("Keepalive HTTP server failed to bind on PORT=%s: %s", port, e)
+        return
+
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    logger.info("Keepalive HTTP server started on 0.0.0.0:%s", port)
+
+_LAST_SCAN_UNIVERSE = []
+
+#!/usr/bin/env python3
+"""
+PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
+"""
+
+# =========================================================
+# IMPORTS
+# =========================================================
+
+import os
+import sys
+import time
+import logging
+import math
+from decimal import Decimal, ROUND_UP
+
+
+def _bybit_linear_symbol(sym: str) -> str:
+    """Normalize base symbol like 'FIO' or '1000LUNC' to Bybit linear symbol like 'FIOUSDT'/'1000LUNCUSDT'."""
+    s = (sym or "").replace("/", "").replace(" ", "").upper()
+    if not s:
+        return s
+    if s.endswith("USDT"):
+        return s
+    if "USDT" in s:
+        return s
+    return f"{s}USDT"
+
+
+logger = logging.getLogger(__name__)
+
+# Bybit instrument filters cache (qtyStep/minQty)
+_INSTR_FILTER_CACHE: dict[str, dict] = {}
+
+
+# AutoTrade decision cache (owner/admin visibility)
+_LAST_AUTOTRADE_DECISION: dict[int, dict] = {}
+_LAST_AUTOTRADE_DETAIL: dict[int, dict] = {}
+
+
+import json
+import re
+import ssl
+import smtplib
+import sqlite3
+
+
+# ================= AUTOTRADE TABLE MIGRATION =================
+
+def _autotrade_migrate_tables():
+    """Ensure autotrade tables exist and columns are present (safe to call anytime)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+
+            # Create if missing (preferred schema used by trading + reports)
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_trades (
+                trade_id TEXT PRIMARY KEY,
+                uid INTEGER,
+                opened_ts INTEGER,
+                session TEXT,
+                symbol TEXT,
+                side TEXT,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                qty REAL,
+                status TEXT,
+                closed_ts INTEGER,
+                pnl_usdt REAL,
+                note TEXT
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_config (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )""")
+
+            # If table existed with an older schema, add missing columns.
+            cols = [r[1] for r in c.execute("PRAGMA table_info(autotrade_trades)").fetchall()]
+            def add_col(name, ddl):
+                if name not in cols:
+                    c.execute(f"ALTER TABLE autotrade_trades ADD COLUMN {ddl}")
+                    cols.append(name)
+
+            add_col("trade_id", "trade_id TEXT")
+            add_col("uid", "uid INTEGER")
+            add_col("opened_ts", "opened_ts INTEGER")
+            add_col("session", "session TEXT")
+            add_col("symbol", "symbol TEXT")
+            add_col("side", "side TEXT")
+            add_col("entry", "entry REAL")
+            add_col("sl", "sl REAL")
+            add_col("tp1", "tp1 REAL")
+            add_col("tp2", "tp2 REAL")
+            add_col("tp3", "tp3 REAL")
+            add_col("qty", "qty REAL")
+            add_col("status", "status TEXT")
+            add_col("closed_ts", "closed_ts INTEGER")
+            add_col("pnl_usdt", "pnl_usdt REAL")
+            add_col("note", "note TEXT")
+
+            # Backfill trade_id for legacy rows (uses rowid).
+            try:
+                rows = c.execute("SELECT rowid FROM autotrade_trades WHERE trade_id IS NULL OR trade_id=''").fetchall()
+                for (rowid,) in rows:
+                    c.execute(
+                        "UPDATE autotrade_trades SET trade_id=? WHERE rowid=?",
+                        (f"AT-LEGACY-{int(rowid)}", int(rowid))
+                    )
+            except Exception:
+                pass
+
+            # Daily risk table (kept for compatibility)
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_day_risk (
+                day_utc TEXT PRIMARY KEY,
+                used_risk_pct REAL NOT NULL
+            )""")
+            conn.commit()
+    except Exception:
+        pass
+# =============================================================
+
+
+# ================= AUTOTRADE SESSION STORAGE =================
+def _autotrade_get_sessions():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS autotrade_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.execute("SELECT value FROM autotrade_config WHERE key='sessions'")
+            row = c.fetchone()
+            if row and row[0]:
+                return [s.strip().upper() for s in row[0].split(",") if s.strip()]
+    except Exception:
+        pass
+    return ["NY"]
+
+def _autotrade_set_sessions(val: str):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS autotrade_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.execute(
+                "INSERT OR REPLACE INTO autotrade_config(key,value) VALUES('sessions',?)",
+                (val.upper(),)
+            )
+            conn.commit()
+    except Exception:
+        pass
+# =============================================================
+
+import asyncio
+import contextvars
+
+from dataclasses import dataclass
+from email.message import EmailMessage
+from typing import Dict, List, Optional, Tuple, Any
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from collections import Counter, defaultdict
+
+import ccxt
+from tabulate import tabulate
+
+import html
+import textwrap
+from telegram.constants import ParseMode
+
+import difflib
+
+import base64
+import tempfile
+
+import os
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Bot,
+    BotCommand,
+    MenuButtonCommands,
+)
+
+
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+    ApplicationHandlerStop,
+)
+
+# =========================================================
+# PERFORMANCE: Dedicated thread pools (prevents lag spikes)
+# - FAST pool: tiny DB / access checks
+# - HEAVY pool: market scans, signal building, email job work
+# This prevents long scans from starving quick commands like /start, /status, /size.
+# =========================================================
+from concurrent.futures import ThreadPoolExecutor
+import functools as _functools
+
+_FAST_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("FAST_EXECUTOR_WORKERS", "8")))
+_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "2")))
+
+async def _run_in_executor(executor, fn, *args, timeout: int | None = None, **kwargs):
+    loop = asyncio.get_running_loop()
+    call = _functools.partial(fn, *args, **kwargs)
+    fut = loop.run_in_executor(executor, call)
+    return await asyncio.wait_for(fut, timeout=timeout) if timeout else await fut
+
+async def to_thread_fast(fn, *args, timeout: int | None = None, **kwargs):
+    return await _run_in_executor(_FAST_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
+
+async def to_thread_heavy(fn, *args, timeout: int | None = None, **kwargs):
+    return await _run_in_executor(_HEAVY_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
+
+
+import re
+import sqlite3
+
+TXID_REGEX = re.compile(r"^[A-Fa-f0-9]{64}$")
+
+
+
+def _ensure_three_tps(entry: float, sl: float, tp3: float, tp1, tp2, side: str):
+    """Ensure TP1/TP2/TP3 exist. If TP1/TP2 missing, derive them proportionally between entry and TP3.
+    Uses 40/40/20 allocation convention for labels only.
+    """
+    try:
+        e = float(entry or 0.0)
+        t3 = float(tp3 or 0.0)
+        _ = float(sl or 0.0)
+    except Exception:
+        return tp1, tp2, tp3
+    if not (e and t3):
+        return tp1, tp2, tp3
+    side_u = str(side or "").upper().strip()
+    # If tp1/tp2 are missing or zero, derive
+    try:
+        t1_ok = tp1 not in (None, 0, 0.0, "")
+        t2_ok = tp2 not in (None, 0, 0.0, "")
+    except Exception:
+        t1_ok = t2_ok = False
+    if t1_ok and t2_ok:
+        return float(tp1), float(tp2), float(tp3)
+    # Derived targets: 40% and 80% of the way from entry to TP3
+    try:
+        if side_u == "SELL":
+            # tp3 should be below entry for sell; but if not, still compute directionally
+            t1 = e + (t3 - e) * 0.4
+            t2 = e + (t3 - e) * 0.8
+        else:
+            t1 = e + (t3 - e) * 0.4
+            t2 = e + (t3 - e) * 0.8
+        return float(t1), float(t2), float(tp3)
+    except Exception:
+        return tp1, tp2, tp3
+
+_LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
+
+def is_valid_txid(txid: str) -> bool:
+    return bool(TXID_REGEX.match(txid))
+
+def usdt_txid_exists(txid: str) -> bool:
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM usdt_payments WHERE txid = ?", (txid,))
+    exists = cur.fetchone() is not None
+    conn.close()
+    return exists
+
+def save_usdt_payment(user_id, username, txid, plan):
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO usdt_payments (telegram_id, username, txid, plan, status)
+        VALUES (?, ?, ?, ?, 'PENDING')
+    """, (user_id, username, txid, plan))
+    conn.commit()
+    conn.close()
+
+
+
+# =========================================================
+# SAAS / STRIPE CONFIG
+# =========================================================
+import stripe
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+FREE_TRIAL_DAYS = 7
+
+TRIAL_DAYS = 7  # used by ensure_trial_started()
+VALID_LICENSE_PREFIX = {
+    "PF-STD": "standard",
+    "PF-PRO": "pro",
+}
+
+# Reuse your existing admin system
+ADMIN_IDS = {74935310}  # <-- PUT YOUR TELEGRAM USER ID HERE
+
+ALLOWED_WHEN_LOCKED = {
+    "start",
+    "help",
+    "billing",
+    "manage",
+    "myplan",
+    "license",
+    "support",
+    "support_status",
+}
+
+
+# =========================================================
+# ACCESS / TRIAL / PRO FEATURE GATING
+# =========================================================
+
+def _now_ts() -> float:
+    return time.time()
+
+def _plan_valid_until_ok(user: dict) -> bool:
+    try:
+        exp = float(user.get("plan_expires") or 0)
+    except Exception:
+        exp = 0.0
+    return (exp <= 0.0) or (_now_ts() <= exp)
+
+def effective_plan(user_id: int, user: Optional[dict]) -> str:
+    """Effective plan with admin override + trial handling."""
+    if is_admin_user(int(user_id)):
+        return "pro"
+
+    u = user or {}
+    plan = str(u.get("plan") or "free").strip().lower()
+
+    if plan in ("pro", "standard") and _plan_valid_until_ok(u):
+        return plan
+
+    try:
+        until = float(u.get("trial_until") or 0.0)
+    except Exception:
+        until = 0.0
+    if plan == "trial" and until > 0 and _now_ts() <= until:
+        return "trial"
+
+    return "free"
+
+def user_has_pro(user_id: int, user: Optional[dict] = None) -> bool:
+    u = user if user is not None else (get_user(user_id) or {})
+    return effective_plan(int(user_id), u) in ("pro", "trial")
+
+def has_active_access(user_id: int, user: Optional[dict] = None) -> bool:
+    u = user if user is not None else (get_user(user_id) or {})
+    return effective_plan(int(user_id), u) in ("standard", "pro", "trial")
+
+def ensure_trial_started(user_id: int, user: Optional[dict], force: bool = False) -> None:
+    """Starts the 7-day FULL Pro trial ONCE when user runs /start."""
+    if is_admin_user(int(user_id)):
+        return
+    u = user or {}
+    plan = str(u.get("plan") or "free").strip().lower()
+    try:
+        ts_start = float(u.get("trial_start_ts") or 0.0)
+    except Exception:
+        ts_start = 0.0
+
+    if plan != "free":
+        return
+    if ts_start > 0:
+        return
+    if not force:
+        return
+
+    now = _now_ts()
+    update_user(
+        int(user_id),
+        plan="trial",
+        trial_start_ts=now,
+        trial_until=now + float(TRIAL_DAYS) * 86400.0,
+        access_source="trial",
+        access_ref="start",
+        access_updated_ts=now,
+    )
+
+PRO_ONLY_COMMANDS = {
+    # Email + notifications
+    "email", "email_on", "email_off", "email_on_off", "email_test", "email_decision", "notify_on", "notify_off",
+    # Unlimited sessions
+    "sessions_on_unlimited", "sessions_off_unlimited", "sessions_unlimited_on", "sessions_unlimited_off",
+    # Big move alerts
+    "bigmove_alert",
+    # Advanced reports
+    "report_daily", "report_weekly", "report_overall",
+}
+
+def enforce_access_or_block_legacy(update: Update, command: str) -> bool:
+    uid = update.effective_user.id
+    if is_admin_user(uid):
+        return True
+
+    user = get_user(uid) or {}
+    if has_active_access(uid, user):
+        return True
+
+    if command in ALLOWED_WHEN_LOCKED:
+        return True
+
+    # Non-blocking reply: never stall the event loop for access messages
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(update.message.reply_text(
+            "⛔ Access locked.\n\n"
+            "Your 7-day free trial has ended.\n\n"
+            "To continue, choose a plan:\n"
+            "• Standard — $49/month\n"
+            "• Pro — $99/month\n\n"
+            "👉 /billing"
+        ))
+    except Exception:
+        try:
+            # Fallback (best effort)
+            update.message.reply_text(
+                "⛔ Access locked.\n\n"
+                "Your 7-day free trial has ended.\n\n"
+                "To continue, choose a plan:\n"
+                "• Standard — $49/month\n"
+                "• Pro — $99/month\n\n"
+                "👉 /billing"
+            )
+        except Exception:
+            pass
+    return False
+
+
+# =========================================================
+# CHANNEL SUBSCRIPTION GATE (optional)
+# =========================================================
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "").strip()  # e.g. "@PulseFutures" or "-1001234567890"
+REQUIRED_CHANNEL_JOIN_URL = os.getenv("REQUIRED_CHANNEL_JOIN_URL", "").strip()  # e.g. "https://t.me/PulseFutures"
+# What we SHOW to users (name/link), even if REQUIRED_CHANNEL is a numeric channel id.
+REQUIRED_CHANNEL_DISPLAY = os.getenv("REQUIRED_CHANNEL_DISPLAY", "@PulseFutures").strip() or "@PulseFutures"
+REQUIRED_CHANNEL_PUBLIC_URL = os.getenv("REQUIRED_CHANNEL_PUBLIC_URL", "https://t.me/PulseFutures").strip() or "https://t.me/PulseFutures"
+
+# If set (1/true/yes/on), users MUST join the channel to use the bot.
+# Default is OFF: the channel is promotional only and will be suggested in messages, not enforced.
+ENFORCE_REQUIRED_CHANNEL = os.getenv("ENFORCE_REQUIRED_CHANNEL", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Cache channel membership checks to keep commands instant (Telegram API calls can be slow / rate-limited)
+_SUB_CACHE = {}  # user_id -> (ok: bool, ts: int)
+SUB_CACHE_TTL_SEC = int(os.getenv("SUB_CACHE_TTL_SEC", "1800"))
+SUB_CACHE_NEG_TTL_SEC = int(os.getenv("SUB_CACHE_NEG_TTL_SEC", "60"))
+  # e.g. "https://t.me/PulseFutures"
+
+async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
+    """Returns True if user is a member of REQUIRED_CHANNEL (member/admin/creator)."""
+
+    if not REQUIRED_CHANNEL:
+        return True
+
+    # Admins bypass channel gate
+    try:
+        if is_admin_user(int(user_id)):
+            return True
+    except Exception:
+        pass
+
+    # Cached membership check
+    try:
+        now_ts = int(time.time())
+        cached = _SUB_CACHE.get(int(user_id))
+        if cached:
+            ok, ts = cached
+            ok = bool(ok)
+            age = now_ts - int(ts)
+            # Cache positives longer; cache negatives briefly so 'I just joined' works immediately.
+            ttl = int(SUB_CACHE_TTL_SEC) if ok else int(SUB_CACHE_NEG_TTL_SEC)
+            if age <= ttl:
+                return bool(ok)
+    except Exception:
+        pass
+
+    chat_id_to_check = REQUIRED_CHANNEL
+
+    try:
+        global _REQUIRED_CHANNEL_ID
+    except Exception:
+        _REQUIRED_CHANNEL_ID = None
+
+    try:
+        if _REQUIRED_CHANNEL_ID is None:
+            ch = await bot.get_chat(REQUIRED_CHANNEL)
+            _REQUIRED_CHANNEL_ID = int(getattr(ch, "id"))
+        if _REQUIRED_CHANNEL_ID:
+            chat_id_to_check = int(_REQUIRED_CHANNEL_ID)
+    except Exception:
+        chat_id_to_check = REQUIRED_CHANNEL
+
+    async def _check(chat_id_val):
+        cm = await bot.get_chat_member(
+            chat_id=chat_id_val,
+            user_id=int(user_id)
+        )
+        status = str(getattr(cm, "status", "") or "").lower()
+        return status in {"member", "administrator", "creator"}
+
+    try:
+        ok = await _check(chat_id_to_check)
+    except Exception:
+        try:
+            ok = await _check(REQUIRED_CHANNEL)
+        except Exception as e:
+            try:
+                global _CHANNEL_GATE_WARN_TS
+            except Exception:
+                _CHANNEL_GATE_WARN_TS = 0
+
+            try:
+                now_ts = int(time.time())
+                if now_ts - int(_CHANNEL_GATE_WARN_TS or 0) > 900:
+                    _CHANNEL_GATE_WARN_TS = now_ts
+                    err = f"{type(e).__name__}: {e}"
+
+                    hint = (
+                        "⚠️ Channel gate check failed. Failing open.\n\n"
+                        f"REQUIRED_CHANNEL={REQUIRED_CHANNEL}\n"
+                        f"Error: {err}\n\n"
+                        "Fix: add the bot as ADMIN in the channel, "
+                        "or set REQUIRED_CHANNEL to the channel ID (-100...)."
+                    )
+
+                    for admin in _admin_ids_all():
+                        try:
+                            await bot.send_message(chat_id=admin, text=hint)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            ok = True  # fail-open
+
+    try:
+        _SUB_CACHE[int(user_id)] = (bool(ok), int(time.time()))
+    except Exception:
+        pass
+
+    return bool(ok)
+
+async def _reply_subscribe_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        join_url = REQUIRED_CHANNEL_JOIN_URL or REQUIRED_CHANNEL_PUBLIC_URL or (f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}" if REQUIRED_CHANNEL.startswith("@") else "")
+        kb = None
+        if join_url:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join Channel", url=join_url)]])
+        await update.message.reply_text(
+            "📢 To use PulseFutures, you must join our channel first.\n\n"
+            f"Channel: {REQUIRED_CHANNEL_DISPLAY}\n{REQUIRED_CHANNEL_PUBLIC_URL}\n\n"
+            "After joining, come back and press /start.",
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+
+async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Global guard: locks access after trial + gates Pro-only commands.
+    Optimized: cache access/pro checks so ALL commands feel instant (except /screen can still be heavier downstream).
+    """
+    try:
+        if not getattr(update, "message", None):
+            return
+
+        txt = (update.message.text or "").strip()
+        if not txt.startswith("/"):
+            return
+
+        cmd = txt.split()[0][1:].split("@")[0].strip().lower()
+
+        # --- STATIC (function-local) caches to reduce DB hits / lag ---
+        # Cache entries: { uid: {"ts": float, "access_ok": bool, "is_pro": bool} }
+        if not hasattr(_command_guard, "_cache"):
+            _command_guard._cache = {}
+        _cache = _command_guard._cache
+
+        # Cache TTL (seconds). Keep short so plan changes propagate quickly.
+        CACHE_TTL = 60.0
+
+        # Commands that should always work even if user is locked (no access check)
+        ACCESS_EXEMPT = {"start", "help", "commands", "billing", "guide_full"}
+
+        # Commands that should force a fresh access check (never use cache)
+        # (/screen is the only one you said can be slow; we keep it strict/fresh here)
+        FORCE_FRESH = {"screen"}
+
+        # 0) Channel subscription gate (optional)
+        if ENFORCE_REQUIRED_CHANNEL and REQUIRED_CHANNEL:
+            ok = await _is_user_subscribed(context.bot, int(update.effective_user.id))
+            if not ok:
+                # Keep same behavior as your original code
+                if cmd not in ACCESS_EXEMPT:
+                    await _reply_subscribe_required(update, context)
+                    raise ApplicationHandlerStop
+
+                if cmd == "start":
+                    await _reply_subscribe_required(update, context)
+                    raise ApplicationHandlerStop
+
+        # 1) Trial/access lock (optimized)
+        if cmd not in ACCESS_EXEMPT:
+            uid = int(update.effective_user.id)
+
+            now = time.time()
+            ent = _cache.get(uid)
+            use_cache = bool(ent) and (now - float(ent.get("ts", 0.0))) < CACHE_TTL and (cmd not in FORCE_FRESH)
+
+            if use_cache:
+                access_ok = bool(ent.get("access_ok", False))
+                is_pro = bool(ent.get("is_pro", False))
+            else:
+                access_ok = await to_thread_fast(enforce_access_or_block, update, cmd)
+                # Only compute pro flag if needed later; but cheap enough to cache now
+                try:
+                    is_pro = bool(user_has_pro(uid))
+                except Exception:
+                    is_pro = False
+
+                _cache[uid] = {"ts": now, "access_ok": access_ok, "is_pro": is_pro}
+
+            if not access_ok:
+                raise ApplicationHandlerStop
+
+            # 2) Pro-only commands (use cached pro flag)
+            if cmd in PRO_ONLY_COMMANDS and not is_pro:
+                try:
+                    await update.message.reply_text(
+                        "🚀 Pro feature.\n\n"
+                        "This command is available in *Pro* (and during your 7-day trial).\n\n"
+                        "👉 /billing",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+                raise ApplicationHandlerStop
+
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        return
+
+
+def render_primary_only() -> None:
+    """
+    Render-safe single instance guard.
+
+    IMPORTANT:
+    - On Render, RENDER_INSTANCE_ID is often a string like "srv-...".
+      That does NOT mean "secondary".
+    - We only exit if Render provides a *numeric replica index* AND it's not 0.
+    """
+    # Some Render setups expose an index/number; only trust numeric ones.
+    candidates = [
+        os.environ.get("RENDER_INSTANCE_NUMBER"),
+        os.environ.get("RENDER_INSTANCE_INDEX"),
+        os.environ.get("RENDER_REPLICA_NUMBER"),
+    ]
+
+    for val in candidates:
+        if val is None:
+            continue
+        # Only treat as authoritative if it's purely numeric
+        if val.isdigit():
+            if val != "0":
+                logging.warning(f"Secondary Render replica ({val}) exiting.")
+                raise SystemExit(0)
+            return  # primary replica
+
+    # Fallback: DO NOT exit just because RENDER_INSTANCE_ID exists (it's usually non-numeric).
+    instance_id = os.environ.get("RENDER_INSTANCE_ID")
+    logging.info(f"Render instance id: {instance_id} (no numeric replica index found; continuing)")
+
+
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+EXCHANGE_ID = "bybit"
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+
+DEFAULT_TYPE = "swap"  # bybit futures
+DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
+
+CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "5"))
+
+# -------------------------
+# LOGGING: redact secrets + quiet noisy libs (Render-safe)
+# -------------------------
+class RedactSecretsFilter(logging.Filter):
+    def __init__(self, secrets: List[str]):
+        super().__init__()
+        self.secrets = [s for s in (secrets or []) if s]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+
+        for s in self.secrets:
+            if s and s in msg:
+                msg = msg.replace(s, "[REDACTED]")
+
+        # Replace rendered message safely
+        record.msg = msg
+        record.args = ()
+        return True
+
+
+def setup_logging():
+    # Let Render control via LOG_LEVEL, default INFO
+    lvl = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(level=getattr(logging, lvl, logging.INFO))
+
+    # Quiet the libs that spam request URLs (and may leak token)
+    for noisy in ("httpx", "telegram", "telegram.ext", "apscheduler"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # Redact secrets from ALL logs
+    secrets = [
+        os.environ.get("TELEGRAM_TOKEN", ""),
+        os.environ.get("EMAIL_PASS", ""),
+    ]
+    logging.getLogger().addFilter(RedactSecretsFilter(secrets))
+
+
+# Call once at import time (after TOKEN/envs exist)
+setup_logging()
+
+# Recreate your app logger after setup_logging so it inherits config
+logger = logging.getLogger("pulsefutures")
+
+
+
+# -------------------------
+# ✅ Admin / Visibility (anti-copy)
+# -------------------------
+# Put your Telegram user id(s) here, comma-separated (example: "123,456")
+ADMIN_USER_IDS = set(
+    int(x.strip()) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
+)
+
+# IMPORTANT CHANGE:
+# System sends signals only. It does NOT show reject reasons to public users.
+# Admin can still see internals if you set PUBLIC_DIAGNOSTICS_MODE=admin
+PUBLIC_DIAGNOSTICS_MODE = os.environ.get("PUBLIC_DIAGNOSTICS_MODE", "off").strip().lower()
+# values:
+# - "off"    => hide reject diagnostics completely for non-admin
+# - "admin"  => only admins can see diagnostics (recommended)
+# Admin always sees full if needed.
+
+
+# -------------------------
+# Screen output sizes
+# -------------------------
+LEADERS_N = 10
+
+# ✅ More setups on /screen (UX), while email stays strict
+SETUPS_N = 6
+EMAIL_SETUPS_N = 3
+
+# ✅ Global setup quality floor (Premium & Selective)
+MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "75"))
+
+# ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
+MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "5000000"))
+MIN_RR_TP3 = float(os.environ.get("MIN_RR_TP3", "1.8"))
+
+# Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
+EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
+
+# ✅ /screen scan breadth + loosened trigger only for screen (NOT email)
+SCREEN_UNIVERSE_N = 70          # was effectively 35 (inside pick_setups)
+SCREEN_TRIGGER_LOOSEN = 0.85    # 15% easier trigger on /screen only
+SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
+SCREEN_WAITING_N = 10
+
+# EMA proximity gate: never generate setups if price is far from EMA7 (1H)
+EMA7_1H_MAX_DIST_PCT = 0.35  # % distance from EMA7(1H). Example: 0.35 = within 0.35%
+
+# Directional Leaders/Losers thresholds
+MOVER_VOL_USD_MIN = 5_000_000
+MOVER_UP_24H_MIN = 10.0
+MOVER_DN_24H_MAX = -10.0
+
+# =========================================================
+# ✅ ENGINES
+# =========================================================
+ENGINE_A_PULLBACK_ENABLED = True     # pullback / mean-reversion near adaptive EMA
+ENGINE_B_MOMENTUM_ENABLED = True     # pump / expansion
+
+# =========================================================
+# ✅ 1H MOMENTUM INTENSITY (SESSION-DYNAMIC)
+# =========================================================
+# Base floor (still used), but we now scale it per session:
+TRIGGER_1H_ABS_MIN_BASE = 0.15        # global floor
+CONFIRM_15M_ABS_MIN = 0.25
+ALIGN_4H_MIN = 0.0
+ALIGN_4H_NEUTRAL_ZONE = 0.35  # if |4H| < this, treat regime as neutral (avoid blocking leaders)
+
+# "EARLY" filler (email only)
+EARLY_1H_ABS_MIN = 1.8
+EARLY_CONF_PENALTY = 4
+EARLY_EMAIL_EXTRA_CONF = 4
+EARLY_EMAIL_MAX_FILL = 1
+
+# =========================================================
+# EMAIL QUALITY GATES (STRICT)
+# =========================================================
+# Rule 1) Minimum momentum gate (prevents "15m=0%" emails via EARLY path)
+EMAIL_EARLY_MIN_CH15_ABS = 0.20   # require at least this abs(15m %) for EARLY emails
+
+# Rule 2) Volume relative filter (killer rule)
+EMAIL_ABS_VOL_USD_MIN = 1_000_000     # hard floor (was too strict)
+EMAIL_REL_VOL_MIN_MULT = 0.6         # require vol >= 0.6x median (was 1.25x median)
+
+# Rule 3) Priority override (Directional Leaders/Losers first)
+EMAIL_PRIORITY_OVERRIDE_ON = True
+
+TREND_24H_TOL = 0.5
+
+# ✅ Session-based 1H strictness:
+# ASIA = tightest, LON = medium, NY = loosest
+SESSION_1H_BASE_MULT = {
+    "NY": 0.85,
+    "LON": 1.00,
+    "ASIA": 1.20,
+}
+
+# =========================================================
+# ✅ ENGINE B (MOMENTUM / EXPANSION) SETTINGS (for pumps)
+# =========================================================
+MOMENTUM_MIN_CH1 = 1.3               # pump gate for 1H (easier than before)
+MOMENTUM_MIN_24H = 8.0              # must be moving
+MOMENTUM_VOL_MULT = 1.2              # volume spike vs mover min
+MOMENTUM_ATR_BODY_MULT = 0.95        # expansion vs ATR% (easier)
+# ✅ MUCH STRICTER: avoid pump / mid-wave momentum entries
+MOMENTUM_MAX_ADAPTIVE_EMA_DIST = 3.5   # percent, was 7.5
+
+
+# Higher TP behavior for Engine B (pumps)
+ENGINE_B_TP_CAP_BONUS_PCT = 4.0      # adds to TP cap %
+ENGINE_B_RR_BONUS = 0.35             # adds to RR target (TP3)
+
+# =========================================================
+# RISK DEFAULTS
+# =========================================================
+DEFAULT_EQUITY = 0.0
+DEFAULT_RISK_MODE = "PCT"
+DEFAULT_RISK_VALUE = 1.5
+DEFAULT_DAILY_CAP_MODE = "PCT"
+DEFAULT_DAILY_CAP_VALUE = 5.0
+DEFAULT_MAX_TRADES_DAY = 5
+DEFAULT_MIN_EMAIL_GAP_MIN = 30
+
+# Backward-compat alias
+DEFAULT_EMAIL_GAP_MIN = DEFAULT_MIN_EMAIL_GAP_MIN
+DEFAULT_MAX_EMAILS_PER_SESSION = 5
+DEFAULT_MAX_EMAILS_PER_DAY = 10
+
+DEFAULT_MAX_RISK_PCT_PER_TRADE = 2.0
+
+# =========================================================
+# SCAN PROFILES
+# =========================================================
+# standard = fewer, higher quality
+# aggressive = more setups on /screen and more candidates for email filters (still risk-gated)
+DEFAULT_SCAN_PROFILE = "standard"
+SCAN_PROFILES = {"standard", "aggressive"}
+
+WARN_RISK_PCT_PER_TRADE = 2.0
+
+# =========================================================
+# ✅ COOLDOWNS (email anti-spam)
+# =========================================================
+# Lighter cooldowns (emails are rare; don't over-block)
+# NOTE: cooldown only suppresses *emails*, not /screen.
+# You can still keep spam under control via email_gap_min + daily caps.
+SESSION_SYMBOL_COOLDOWN_HOURS = {
+    "NY": 1,     # more active
+    "LON": 2,    # balanced
+    "ASIA": 3,   # a bit stricter
+}
+
+# Fallback if session unknown
+SYMBOL_COOLDOWN_HOURS = 3
+
+# =========================================================
+# WIN-RATE FILTERS (stricter = fewer signals, higher quality)
+# =========================================================
+
+# 1) Flip-Guard: prevents opposite-direction alerts for same symbol for a period
+# Example: SELL then BUY within 2 hours => BUY is blocked (and vice-versa)
+FLIP_GUARD_ENABLED = True
+FLIP_GUARD_MULT = 1.0  # 1.0 = same as session cooldown hours; try 1.5–2.0 to be stricter
+
+# 2) Higher-TF alignment: require 1H + 4H momentum to agree with the signal direction
+TF_ALIGN_ENABLED = True
+TF_ALIGN_1H_MIN_ABS = 0.5   # percent
+TF_ALIGN_4H_MIN_ABS = 0.5   # percent
+
+# ✅ Approach A: session-aware TF alignment floors (higher win-rate, esp. ASIA)
+TF_ALIGN_1H_MIN_ABS_BY_SESSION = {
+    "NY": TF_ALIGN_1H_MIN_ABS,
+    "LON": TF_ALIGN_1H_MIN_ABS,
+    "ASIA": 0.8,
+}
+TF_ALIGN_4H_MIN_ABS_BY_SESSION = {
+    "NY": TF_ALIGN_4H_MIN_ABS,
+    "LON": TF_ALIGN_4H_MIN_ABS,
+    "ASIA": 0.8,
+}
+
+def tf_align_mins_for_session(session_name: str) -> tuple[float, float]:
+    s = (session_name or "").strip().upper()
+    return (
+        float(TF_ALIGN_1H_MIN_ABS_BY_SESSION.get(s, TF_ALIGN_1H_MIN_ABS)),
+        float(TF_ALIGN_4H_MIN_ABS_BY_SESSION.get(s, TF_ALIGN_4H_MIN_ABS)),
+    )
+
+# Weekend handling (UTC-based) — slight tightening only (avoid junky liquidity)
+def is_weekend_utc(dt_utc) -> bool:
+    try:
+        return int(dt_utc.weekday()) >= 5
+    except Exception:
+        return False
+
+
+
+def cooldown_hours_for_session(session_name: str) -> int:
+    s = (session_name or "").strip().upper()
+    return int(SESSION_SYMBOL_COOLDOWN_HOURS.get(s, SYMBOL_COOLDOWN_HOURS))
+
+def max_cooldown_hours() -> int:
+    try:
+        return int(max(list(SESSION_SYMBOL_COOLDOWN_HOURS.values()) + [SYMBOL_COOLDOWN_HOURS]))
+    except Exception:
+        return int(SYMBOL_COOLDOWN_HOURS)
+
+# Multi-TP
+ATR_PERIOD = 14
+ATR_MIN_PCT = 1.0
+ATR_MAX_PCT = 8.0
+MULTI_TP_MIN_CONF = 78
+TP_ALLOCS = (40, 40, 20)
+
+TP_R_MULTS_DEFAULT = (1.0, 1.7, 2.4)
+
+# Dynamic TP cap: normal vs hot coins
+TP_MAX_PCT_NORMAL = 12.0
+TP_MAX_PCT_HOT = 15.0
+HOT_VOL_USD = 50_000_000
+HOT_CH24_ABS = 15.0
+
+# =========================================================
+# ✅ ADAPTIVE EMA SUPPORT (global)
+# =========================================================
+# Minimum/maximum adaptive EMA period bounds
+ADAPTIVE_EMA_MIN = 8
+ADAPTIVE_EMA_MAX = 21
+
+# Proximity threshold (derived from ATR%), clamped
+EMA_SUPPORT_MAX_DIST_ATR_MULT = 0.7
+EMA_SUPPORT_MAX_DIST_PCT_MIN = 0.25
+EMA_SUPPORT_MAX_DIST_PCT_MAX = 1.8
+
+# Sharp 1H move gating
+SHARP_1H_MOVE_PCT = 20.0
+
+
+# =========================================================
+# 🤖 AUTOTRADE (Bybit V5) — LIVE/PAPER
+# =========================================================
+# NOTE: AutoTrade is owner-only (AUTOTRADE_OWNER_UID) and is gated by session + risk caps.
+AUTOTRADE_ENABLED = str(os.environ.get("AUTOTRADE_ENABLED", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
+AUTOTRADE_MODE = str(os.environ.get("AUTOTRADE_MODE", "paper")).strip().lower()  # 'paper' | 'live'
+try:
+    AUTOTRADE_OWNER_UID = int(os.environ.get("AUTOTRADE_OWNER_UID", "0") or 0)
+except Exception:
+    AUTOTRADE_OWNER_UID = 0
+
+# Risk controls
+AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "2") or 2)
+AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT", "6") or 6)
+AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "6") or 6)
+AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "3") or 3)
+
+# Margin / leverage
+AUTOTRADE_ISOLATED = str(os.environ.get("AUTOTRADE_ISOLATED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
+AUTOTRADE_LEVERAGE = int(os.environ.get("AUTOTRADE_LEVERAGE", "10") or 10)
+
+# TP split (fractions must sum ~1.0)
+_AUTOTRADE_TP_SPLIT_RAW = str(os.environ.get("AUTOTRADE_TP_SPLIT", "0.4,0.4,0.2") or "0.4,0.4,0.2")
+try:
+    AUTOTRADE_TP_SPLIT = [float(x) for x in _AUTOTRADE_TP_SPLIT_RAW.split(",")]
+except Exception:
+    AUTOTRADE_TP_SPLIT = [0.4, 0.4, 0.2]
+if len(AUTOTRADE_TP_SPLIT) != 3:
+    AUTOTRADE_TP_SPLIT = [0.4, 0.4, 0.2]
+# Normalize if slightly off
+try:
+    _s = sum(AUTOTRADE_TP_SPLIT)
+    if _s > 0:
+        AUTOTRADE_TP_SPLIT = [x/_s for x in AUTOTRADE_TP_SPLIT]
+except Exception:
+    AUTOTRADE_TP_SPLIT = [0.4, 0.4, 0.2]
+
+# Bybit V5 keys (required for live)
+BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
+BYBIT_API_SECRET = str(os.environ.get("BYBIT_API_SECRET", "") or "").strip()
+BYBIT_RECV_WINDOW = str(os.environ.get("BYBIT_RECV_WINDOW", "5000") or "5000").strip()
+BYBIT_TESTNET = str(os.environ.get("BYBIT_TESTNET", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
+
+# Email
+EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465"))
+EMAIL_USER = os.environ.get("EMAIL_USER", "")
+EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
+EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
+
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
+TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFuturesBot").strip()
+
+# =========================================================
+# 🤖 AUTOTRADE — Bybit V5 helpers + DB
+# =========================================================
+import hmac
+import hashlib
+import uuid
+
+def _bybit_base_url() -> str:
+    return "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
+
+def _bybit_v5_sign(ts_ms: str, body: str) -> str:
+    """
+    Bybit V5 signature:
+      sign = HMAC_SHA256(secret, timestamp + api_key + recv_window + body)
+    """
+    msg = f"{ts_ms}{BYBIT_API_KEY}{BYBIT_RECV_WINDOW}{body}".encode("utf-8")
+    return hmac.new(BYBIT_API_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> dict:
+    import requests
+    method = method.upper().strip()
+    url = _bybit_base_url() + path
+
+    ts_ms = str(int(time.time() * 1000))
+    # For V5 signing:
+    # - GET requests must be signed with the query string (not the body).
+    # - POST requests are signed with the JSON body.
+    body = json.dumps(payload or {}, separators=(",", ":"), ensure_ascii=False) if method != "GET" else ""
+    query_str = ""
+    if method == "GET" and "?" in path:
+        query_str = path.split("?", 1)[1]
+    sign_payload = query_str if method == "GET" else body
+    sign = _bybit_v5_sign(ts_ms, sign_payload) if (BYBIT_API_KEY and BYBIT_API_SECRET) else ""
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": ts_ms,
+        "X-BAPI-RECV-WINDOW": BYBIT_RECV_WINDOW,
+        "X-BAPI-SIGN": sign,
+    }
+
+    try:
+        if method == "GET":
+            r = requests.get(url, headers=headers, timeout=15)
+        else:
+            r = requests.post(url, headers=headers, data=body.encode("utf-8"), timeout=15)
+        return r.json()
+    except Exception as e:
+        return {"retCode": -1, "retMsg": f"{type(e).__name__}: {e}", "result": None}
+
+
+
+def _bybit_get_instr_filters(symbol: str) -> dict:
+    """Return dict with keys: minQty, qtyStep, minNotional as STRINGS (best-effort) for linear USDT perp."""
+    sym = _bybit_linear_symbol(symbol)
+    if sym in _INSTR_FILTER_CACHE:
+        return _INSTR_FILTER_CACHE[sym]
+    out = {"minQty": None, "qtyStep": None, "minNotional": None}
+    try:
+        res = _bybit_v5_request("GET", "/v5/market/instruments-info", {"category": "linear", "symbol": sym})
+        items = (((res or {}).get("result") or {}).get("list") or [])
+        if items:
+            info = items[0] or {}
+            lot = info.get("lotSizeFilter") or {}
+            if lot.get("minOrderQty") is not None:
+                out["minQty"] = str(lot.get("minOrderQty"))
+            if lot.get("qtyStep") is not None:
+                out["qtyStep"] = str(lot.get("qtyStep"))
+            nf = info.get("notionalFilter") or {}
+            if nf.get("minNotional") is not None:
+                out["minNotional"] = str(nf.get("minNotional"))
+    except Exception:
+        pass
+    _INSTR_FILTER_CACHE[sym] = out
+    return out
+
+
+
+def _fmt_qty(qty: float, step) -> str:
+    """Format qty as Bybit-safe decimal string aligned to qtyStep.
+
+    - Never returns scientific notation.
+    - Rounds UP to the nearest qtyStep multiple (Bybit-safe).
+    """
+    try:
+        if qty is None:
+            return "0"
+        dqty = Decimal(str(qty))
+
+        if step is None:
+            return format(dqty, "f")
+
+        dstep = Decimal(str(step))
+        if dstep <= 0:
+            return format(dqty, "f")
+
+        mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
+        dq = (mult * dstep).quantize(dstep)  # keeps correct decimals
+        return format(dq, "f")
+    except Exception:
+        # last resort: plain decimal string
+        try:
+            return format(Decimal(str(qty)), "f")
+        except Exception:
+            return str(qty)
+
+
+def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | None, str | None]:
+    """Decimal-safe rounding to Bybit qtyStep + minQty (+ minNotional if provided)."""
+    try:
+        if qty is None or float(qty) <= 0:
+            return (None, "qty<=0")
+
+        f = _bybit_get_instr_filters(symbol)
+        step_s = f.get("qtyStep")
+        min_qty_s = f.get("minQty")
+        min_not_s = f.get("minNotional")
+
+        dqty = Decimal(str(qty))
+        dentry = Decimal(str(entry_price)) if entry_price and entry_price > 0 else None
+
+        def _d(x):
+            if x is None:
+                return None
+            try:
+                return Decimal(str(x))
+            except Exception:
+                return None
+
+        dstep = _d(step_s)
+        dmin = _d(min_qty_s)
+        dmin_not = _d(min_not_s)
+
+        if dstep and dstep > 0:
+            mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
+            dqty = (mult * dstep).quantize(dstep)
+
+        if dmin and dqty < dmin:
+            if dstep and dstep > 0:
+                mult = (dmin / dstep).to_integral_value(rounding=ROUND_UP)
+                dqty = (mult * dstep).quantize(dstep)
+            else:
+                dqty = dmin
+
+        if dmin_not and dentry and dentry > 0 and (dqty * dentry) < dmin_not:
+            need = dmin_not / dentry
+            if dstep and dstep > 0:
+                mult = (need / dstep).to_integral_value(rounding=ROUND_UP)
+                dqty = (mult * dstep).quantize(dstep)
+            else:
+                dqty = need
+
+        if dqty <= 0:
+            return (None, "qty_rounds_to_0")
+
+        return (float(dqty), None)
+
+    except Exception as e:
+        return (None, f"qty_round_fail:{type(e).__name__}")
+
+
+def _autotrade_ready() -> bool:
+    if not AUTOTRADE_ENABLED:
+        return False
+    if AUTOTRADE_OWNER_UID <= 0:
+        return False
+    if AUTOTRADE_MODE not in ("paper", "live"):
+        return False
+    if AUTOTRADE_MODE == "live" and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
+        return False
+    return True
+
+def _bybit_get_equity_usdt() -> float:
+    """Returns account equity (USDT) from Bybit V5 wallet-balance.
+
+    Tries common account types (UNIFIED, CONTRACT) and returns the first positive equity found.
+    """
+    def _extract_equity(res: dict) -> float:
+        try:
+            if int(res.get("retCode", -1)) != 0:
+                return 0.0
+            lst = ((res.get("result") or {}).get("list") or [])
+            if not lst:
+                return 0.0
+            # V5 response: result.list[].coin[] contains entries like {"coin":"USDT","equity":"..."}
+            coins = ((lst[0] or {}).get("coin") or [])
+            usdt = None
+            for c in coins:
+                if str((c or {}).get("coin", "")).upper() == "USDT":
+                    usdt = c or {}
+                    break
+            if not usdt and coins:
+                usdt = coins[0] or {}
+            eq = float(usdt.get("equity") or usdt.get("walletBalance") or usdt.get("availableToWithdraw") or 0.0)
+            return max(0.0, eq)
+        except Exception:
+            return 0.0
+
+    for acct in ("UNIFIED", "CONTRACT"):
+        res = _bybit_v5_request("GET", f"/v5/account/wallet-balance?accountType={acct}&coin=USDT")
+        eq = _extract_equity(res)
+        if eq > 0:
+            return eq
+    return 0.0
+
+
+def _live_equity_usdt() -> float | None:
+    """LIVE mode equity source. Returns None if unavailable.
+
+    Uses Bybit V5 wallet-balance (UNIFIED, USDT) and falls back to None on failure.
+    """
+    try:
+        if not AUTOTRADE_ENABLED:
+            return None
+        if str(AUTOTRADE_MODE).lower() != "live":
+            return None
+        if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+            return None
+        eq = float(_bybit_get_equity_usdt() or 0.0)
+        return eq if eq > 0 else None
+    except Exception:
+        return None
+
+
+def _autotrade_db_init():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS autotrade_trades (
+                trade_id TEXT PRIMARY KEY,
+                uid INTEGER,
+                opened_ts INTEGER,
+                session TEXT,
+                symbol TEXT,
+                side TEXT,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                qty REAL,
+                status TEXT DEFAULT 'OPEN',
+                closed_ts INTEGER,
+                outcome TEXT,
+                pnl REAL
+            )
+        ''')
+        c.execute("CREATE INDEX IF NOT EXISTS idx_autotrade_uid_opened ON autotrade_trades(uid, opened_ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_autotrade_status ON autotrade_trades(status)")
+        conn.commit()
+
+def _autotrade_db_open_trades(uid: int) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM autotrade_trades WHERE uid=? AND status='OPEN' ORDER BY opened_ts DESC", (uid,))
+        return [dict(r) for r in c.fetchall()]
+
+def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float) -> str:
+    trade_id = f"AT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """INSERT INTO autotrade_trades (trade_id, uid, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
+            (
+                trade_id,
+                int(uid),
+                int(time.time()),
+                str(session_label),
+                str(getattr(s, 'symbol', '') or '').upper(),
+                str(getattr(s, 'side', '') or '').upper(),
+                float(getattr(s, 'entry', 0.0) or 0.0),
+                float(getattr(s, 'sl', 0.0) or 0.0),
+                float(getattr(s, 'tp1', 0.0) or 0.0),
+                float(getattr(s, 'tp2', 0.0) or 0.0),
+                float(getattr(s, 'tp3', 0.0) or 0.0),
+                float(qty),
+            ),
+        )
+        conn.commit()
+    return trade_id
+
+def _autotrade_estimated_risk_usd(entry: float, sl: float, qty: float) -> float:
+    try:
+        return abs(entry - sl) * abs(qty)
+    except Exception:
+        return 0.0
+
+def _autotrade_open_risk_usd(uid: int, equity_usdt: float) -> float:
+    total = 0.0
+    for t in _autotrade_db_open_trades(uid):
+        total += _autotrade_estimated_risk_usd(float(t.get('entry') or 0.0), float(t.get('sl') or 0.0), float(t.get('qty') or 0.0))
+    return total
+
+def _autotrade_qty_from_risk(entry: float, sl: float, equity_usdt: float) -> float:
+    dist = abs(entry - sl)
+    if dist <= 0:
+        return 0.0
+    risk_usd = (equity_usdt * (AUTOTRADE_RISK_PER_TRADE_PCT / 100.0))
+    qty = risk_usd / dist
+    if qty <= 0 or (not math.isfinite(qty)):
+        return 0.0
+    return float(qty)
+
+def _autotrade_allowed_session(session_label: str) -> bool:
+    allowed = set([s.strip().upper() for s in _autotrade_get_sessions() if s.strip()])
+    if not allowed:
+        allowed = {'NY'}
+    return session_label.upper() in allowed
+
+
+# =========================================================
+# AUTOTRADE: select best OPEN setup from DB (generated_setups + signals)
+# =========================================================
+def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1) -> list:
+    """Return a list of Setup-like objects with entry/sl/tps for _autotrade_place_trade.
+    Uses generated_setups for recency, joins signal_outcomes for OPEN, and pulls prices from signals.
+    IMPORTANT: Do NOT filter by session label here (it can drift). Pick best OPEN recent setup.
+    """
+    try:
+        from types import SimpleNamespace
+        cutoff = time.time() - float(lookback_hours) * 3600.0
+
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+
+        cur.execute("""
+            SELECT g.setup_id
+            FROM generated_setups g
+            LEFT JOIN signal_outcomes o ON o.setup_id = g.setup_id
+            WHERE g.user_id = ?
+              AND g.created_ts >= ?
+              AND g.source IN ('email','screen')
+              AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+            ORDER BY g.conf DESC, g.created_ts DESC
+            LIMIT ?
+        """, (int(uid), float(cutoff), int(limit)))
+
+        setup_ids = [r[0] for r in cur.fetchall() if r and r[0]]
+        if not setup_ids:
+            con.close()
+            return []
+
+        out = []
+        for sid in setup_ids:
+            cur.execute("""
+                SELECT setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3
+                FROM signals
+                WHERE setup_id = ?
+                LIMIT 1
+            """, (sid,))
+            row = cur.fetchone()
+            if not row:
+                continue
+            setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3 = row
+            out.append(SimpleNamespace(
+                setup_id=setup_id,
+                id=setup_id,
+                symbol=symbol,
+                side=side,
+                conf=int(conf or 0),
+                entry=float(entry or 0.0),
+                sl=float(sl or 0.0),
+                tp1=tp1,
+                tp2=tp2,
+                tp3=tp3,
+            ))
+
+        con.close()
+        return out
+    except Exception as e:
+        try:
+            logger.error(f"_autotrade_select_db_setups failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return []
+
+def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
+    if not _autotrade_ready():
+        return (False, 'autotrade_not_ready_or_disabled')
+
+    if int(uid) != int(AUTOTRADE_OWNER_UID):
+        return (False, 'not_owner')
+
+    if not _autotrade_allowed_session(session_label):
+        return (False, f'autotrade_session_not_allowed ({session_label})')
+
+    if not setups:
+        return (False, 'no_setups')
+
+    if len(_autotrade_db_open_trades(uid)) >= int(AUTOTRADE_MAX_OPEN_TRADES):
+        return (False, f'max_open_trades_reached ({AUTOTRADE_MAX_OPEN_TRADES})')
+
+    s = setups[0]
+    sym = str(getattr(s, 'symbol', '') or '').upper()
+    sym = _bybit_linear_symbol(sym)
+    # keep last autotrade attempt details for /autotrade_last
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)] = {
+            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'session': session_label,
+            'setup_id': str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''),
+            'symbol_raw': str(getattr(s, 'symbol', '') or ''),
+            'symbol_sent': sym,
+            'side': side,
+            'entry': entry,
+            'sl': sl,
+        }
+    except Exception:
+        pass
+
+    side = str(getattr(s, 'side', '') or '').upper()
+    entry = float(getattr(s, 'entry', 0.0) or 0.0)
+    sl = float(getattr(s, 'sl', 0.0) or 0.0)
+    # TP targets may be partially available depending on the engine/scanner
+    _tp1 = getattr(s, 'tp1', None)
+    _tp2 = getattr(s, 'tp2', None)
+    _tp3 = getattr(s, 'tp3', None)
+
+    def _as_pos_float(x):
+        try:
+            v = float(x)
+            return v if v > 0 else None
+        except Exception:
+            return None
+
+    tp1 = _as_pos_float(_tp1)
+    tp2 = _as_pos_float(_tp2)
+    tp3 = _as_pos_float(_tp3)
+
+    if side not in {'BUY', 'SELL'}:
+        return (False, f'bad_side ({side})')
+
+    # Require core prices + at least one TP
+    if entry <= 0 or sl <= 0:
+        return (False, 'bad_prices')
+    tps = [v for v in (tp1, tp2, tp3) if v is not None]
+    if not tps:
+        return (False, 'missing_tp')
+
+    if side == 'BUY' and sl >= entry:
+        return (False, 'sl_not_below_entry_for_buy')
+    if side == 'SELL' and sl <= entry:
+        return (False, 'sl_not_above_entry_for_sell')
+
+    equity = _bybit_get_equity_usdt() if AUTOTRADE_MODE == 'live' else float((get_user(uid) or {}).get('equity') or 0.0)
+    if equity <= 0:
+        return (False, 'equity_unavailable_or_zero')
+
+    open_risk = _autotrade_open_risk_usd(uid, equity)
+    per_trade_risk = equity * (AUTOTRADE_RISK_PER_TRADE_PCT / 100.0)
+
+    if (open_risk + per_trade_risk) > (equity * (AUTOTRADE_OPEN_RISK_CAP_PCT / 100.0)):
+        return (False, 'open_risk_cap_reached')
+    if (open_risk + per_trade_risk) > (equity * (AUTOTRADE_DAILY_RISK_CAP_PCT / 100.0)):
+        return (False, 'daily_risk_cap_reached')
+
+    qty = _autotrade_qty_from_risk(entry, sl, equity)
+    if qty <= 0:
+        return (False, 'qty_calc_failed')
+
+    if AUTOTRADE_MODE == 'paper':
+        trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
+        return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TPs={','.join([f'{x:g}' for x in tps])}")
+
+    # LIVE MODE (Bybit V5)
+    if AUTOTRADE_ISOLATED:
+        _bybit_v5_request('POST', '/v5/position/switch-isolated', {
+            'category': 'linear',
+            'symbol': sym,
+            'tradeMode': 1,
+            'buyLeverage': str(AUTOTRADE_LEVERAGE),
+            'sellLeverage': str(AUTOTRADE_LEVERAGE),
+        })
+    _bybit_v5_request('POST', '/v5/position/set-leverage', {
+        'category': 'linear',
+        'symbol': sym,
+        'buyLeverage': str(AUTOTRADE_LEVERAGE),
+        'sellLeverage': str(AUTOTRADE_LEVERAGE),
+    })
+
+    # Round qty up to Bybit min/step to prevent rejections on low-price symbols
+
+
+    qty, qreason = _round_qty_up(sym, qty, entry)
+
+
+    if qty is None:
+
+
+        return (False, f"qty_invalid:{qreason}")
+
+
+    # Format qty as Bybit-safe string (no scientific notation, aligned to qtyStep)
+
+
+
+    _filt = _bybit_get_instr_filters(sym)
+
+
+
+    qty_step = _filt.get('qtyStep')
+
+
+
+    qty_str = _fmt_qty(qty, qty_step)
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'qty': float(qty) if qty is not None else None,
+            'qty_step': qty_step,
+            'min_qty': _filt.get('minQty'),
+            'min_notional': _filt.get('minNotional'),
+            'qty_str': qty_str,
+        })
+    except Exception:
+        pass
+
+
+
+    order_payload = {
+        'category': 'linear',
+        'symbol': sym,
+        'side': 'Buy' if side == 'BUY' else 'Sell',
+        'orderType': 'Market',
+        'qty': qty_str,
+        'timeInForce': 'IOC',
+    }
+    open_res = _bybit_v5_request('POST', '/v5/order/create', order_payload)
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'order_payload': {k: (v if k != 'qty' else str(v)) for k, v in (order_payload or {}).items()},
+            'bybit': open_res,
+        })
+    except Exception:
+        pass
+
+
+    if int(open_res.get('retCode', -1)) != 0:
+        return (False, f"bybit_open_failed retCode={open_res.get('retCode')} retMsg={open_res.get('retMsg')}")
+
+    _bybit_v5_request('POST', '/v5/position/trading-stop', {
+        'category': 'linear',
+        'symbol': sym,
+        'stopLoss': str(sl),
+        'tpslMode': 'Full',
+    })
+
+    # Place as many TP orders as we have valid targets
+    tps = [v for v in (tp1, tp2, tp3) if v is not None]
+
+    if len(tps) == 1:
+        tp_qtys = [qty]
+    elif len(tps) == 2:
+        splits = AUTOTRADE_TP_SPLIT
+        q1 = max(0.0, qty * splits[0])
+        q2 = max(0.0, qty - q1)
+        tp_qtys = [q1, q2]
+    else:
+        splits = AUTOTRADE_TP_SPLIT
+        tp_qtys = [max(0.0, qty * splits[0]), max(0.0, qty * splits[1]), max(0.0, qty * splits[2])]
+        try:
+            tp_qtys[2] = max(0.0, qty - (tp_qtys[0] + tp_qtys[1]))
+        except Exception:
+            pass
+
+    for tp_price, tp_qty in zip(tps, tp_qtys):
+        if tp_price <= 0 or tp_qty <= 0:
+            continue
+        _bybit_v5_request('POST', '/v5/order/create', {
+            'category': 'linear',
+            'symbol': sym,
+            'side': 'Sell' if side == 'BUY' else 'Buy',
+            'orderType': 'Limit',
+            'qty': str(tp_qty),
+            'price': str(tp_price),
+            'timeInForce': 'GTC',
+            'reduceOnly': True,
+            'closeOnTrigger': True,
+        })
+
+    trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
+    return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TPs={','.join([f'{x:g}' for x in tps])}")
+
+
+# Caching for speed
+TICKERS_TTL_SEC = 45
+OHLCV_TTL_SEC = 60
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("pulsefutures")
+
+STABLES = {"USDT", "USDC", "USD", "TUSD", "FDUSD", "DAI", "PYUSD"}
+
+HDR = "━━━━━━━━━━━━━━━━━━━━"
+SEP = "────────────────────"
+
+ALERT_LOCK = asyncio.Lock()
+SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
+
+
+# =========================================================
+# ✅ PRICE-ACTION CONFIRMATION (stricter = fewer, better signals)
+# =========================================================
+
+# Require a clear 15m rejection/reclaim candle at the chosen pullback EMA
+REQUIRE_15M_EMA_REJECTION = False  # loosened: more setups
+
+# Candle must close in top/bottom portion of its range (shows strength)
+REJECTION_CLOSE_POS_MIN = 0.60   # BUY: close in top 35% of candle
+REJECTION_CLOSE_POS_MAX = 0.40   # SELL: close in bottom 35% of candle
+
+# Strong reversal exception (ONLY if you want rare counter-trend calls)
+ALLOW_STRONG_REVERSAL_EXCEPTION = True
+REVERSAL_CH24_ABS_MIN = 25.0
+REVERSAL_CH4_ABS_MIN  = 1.2
+REVERSAL_CH1_ABS_MIN  = 0.8
+
+
+
+# =========================================================
+# ✅ DB BACKUP/RESET + EMAIL TRADE WINDOW (per-user)
+# =========================================================
+DB_BACKUP_PATH = os.environ.get("DB_BACKUP_PATH", DB_PATH + ".bak")
+
+DB_FILE_LOCK = asyncio.Lock()
+
+# Sessions defined in UTC windows (market convention, with overlaps)
+# ASIA: 00:00–09:00 UTC
+# LON : 07:00–16:00 UTC
+# NY  : 13:00–22:00 UTC
+# Priority resolves overlaps: NY > LON > ASIA
+SESSIONS_UTC = {
+    # Non-overlapping UTC windows (DST-proof for Melbourne display)
+    # ASIA: 00:00–08:00 UTC
+    # LON : 08:00–17:00 UTC
+    # NY  : 13:00–22:00 UTC
+    "ASIA": {"start": "00:00", "end": "08:00"},
+    "LON":  {"start": "08:00", "end": "17:00"},
+    "NY":   {"start": "13:00", "end": "22:00"},
+}
+
+SESSION_PRIORITY = ["NY", "LON", "ASIA"]
+
+SESSION_MIN_CONF = {
+    "NY": 76,
+    "LON": 78,
+    "ASIA": 80,
+}
+
+SESSION_MIN_RR_TP3 = {
+    "NY": 1.7,
+    "LON": 1.8,
+    "ASIA": 1.9,
+}
+
+SESSION_EMA_PROX_MULT = {
+    "NY": 1.60,
+    "LON": 1.40,
+    "ASIA": 1.20,
+}
+
+SESSION_EMA_REACTION_LOOKBACK = {
+    "NY": 9,
+    "LON": 7,
+    "ASIA": 6,
+}
+
+# ✅ 1H trigger loosened per session (overall easier)
+SESSION_TRIGGER_ATR_MULT = {
+    "NY": 0.55,
+    "LON": 0.75,
+    "ASIA": 0.95,
+}
+
+
+def session_knobs(session_name: str) -> dict:
+    s = (session_name or "LON").upper()
+    if s not in SESSIONS_UTC:
+        s = "LON"
+    return {
+        "name": s,
+        "ema_prox_mult": float(SESSION_EMA_PROX_MULT.get(s, 1.0)),
+        "ema_reaction_lookback": int(SESSION_EMA_REACTION_LOOKBACK.get(s, 7)),
+        "trigger_atr_mult": float(SESSION_TRIGGER_ATR_MULT.get(s, 0.85)),
+        "min_conf": int(SESSION_MIN_CONF.get(s, 78)),
+        "min_rr_tp3": float(SESSION_MIN_RR_TP3.get(s, 2.0)),
+    }
+
+def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
+    """
+    Session‑dynamic 1H trigger (loosened so signals actually fire).
+
+    Goal:
+    - Still ATR-adaptive (avoid tiny noise when ATR is high)
+    - But DO NOT impose huge hard floors that suppress all setups
+    """
+    knobs = session_knobs(session_name)
+    mult_atr = float(knobs["trigger_atr_mult"])
+
+    # ATR-adaptive component: scaled by session knob, gently clamped
+    dyn = clamp(float(atr_pct) * float(mult_atr), 0.10, 3.5)
+
+    sess = knobs["name"]
+    base_mult = float(SESSION_1H_BASE_MULT.get(sess, 1.0))
+
+    # ✅ Weekend slight tightening (UTC)
+    try:
+        if is_weekend_utc(datetime.now(timezone.utc)):
+            base_mult *= (1.06 if sess == "ASIA" else 1.03)
+    except Exception:
+        pass
+
+    # Global base floor (kept modest)
+    base_floor = float(TRIGGER_1H_ABS_MIN_BASE) * base_mult
+
+    # Final trigger is the max of base floor and ATR-adaptive requirement
+    return max(float(base_floor), float(dyn))
+
+
+
+# =========================================================
+# DATA STRUCTURES
+# =========================================================
+@dataclass
+class MarketVol:
+    symbol: str
+    base: str
+    quote: str
+    last: float
+    open: float
+    percentage: float
+    base_vol: float
+    quote_vol: float
+    vwap: float
+
+@dataclass
+class Setup:
+    setup_id: str
+    symbol: str
+    market_symbol: str
+    side: str
+    conf: int
+    entry: float
+    sl: float
+    tp1: Optional[float]
+    tp2: Optional[float]
+    tp3: float
+    fut_vol_usd: float
+    ch24: float
+    ch4: float
+    ch1: float
+    ch15: float
+
+    # ✅ adaptive EMA support (15m, volatility-based)
+    ema_support_period: int
+    ema_support_dist_pct: float
+
+    # ✅ NEW: pullback EMA selection (7/14/21) + status
+    pullback_ema_period: int
+    pullback_ema_dist_pct: float
+    pullback_ready: bool          # True => pullback happened / entry quality
+    pullback_bypass_hot: bool     # True => volume>=50M bypass (no pullback needed)
+
+    # ✅ engine label (A pullback / B momentum)
+    engine: str
+
+    is_trailing_tp3: bool
+    created_ts: float
+
+# =========================================================
+# SIMPLE TTL CACHE (in-memory)
+# =========================================================
+_CACHE: Dict[str, Tuple[float, Any]] = {}
+
+def cache_get(key: str) -> Optional[Any]:
+    v = _CACHE.get(key)
+    if not v:
+        return None
+    ts, obj = v
+    return obj
+
+def cache_set(key: str, obj: Any):
+    _CACHE[key] = (time.time(), obj)
+
+def cache_valid(key: str, ttl: int) -> bool:
+    v = _CACHE.get(key)
+    if not v:
+        return False
+    ts, _ = v
+    return (time.time() - ts) <= ttl
+
+# =========================================================
+# MATH / INDICATORS HELPERS (MISSING FIX)
+# =========================================================
+def clamp(x: float, lo: float, hi: float) -> float:
+    try:
+        x = float(x)
+    except Exception:
+        return lo
+    return max(lo, min(hi, x))
+
+def ema(values: List[float], period: int) -> float:
+    """
+    Returns the LAST EMA value (not full series).
+    Safe for short lists.
+    """
+    if not values or period <= 0:
+        return 0.0
+    if len(values) < 2:
+        return float(values[-1])
+
+    k = 2.0 / (period + 1.0)
+    e = float(values[0])
+    for v in values[1:]:
+        e = (float(v) * k) + (e * (1.0 - k))
+    return float(e)
+
+def compute_atr_from_ohlcv(ohlcv: List[List[float]], period: int = 14) -> float:
+    """
+    ATR (Wilder's smoothing) from OHLCV.
+    ohlcv rows: [ts, open, high, low, close, vol]
+    Returns last ATR value.
+    """
+    if not ohlcv or period <= 0:
+        return 0.0
+
+    # need at least period+1 candles for a stable ATR
+    if len(ohlcv) < period + 1:
+        return 0.0
+
+    highs = []
+    lows = []
+    closes = []
+    for c in ohlcv:
+        try:
+            highs.append(float(c[2]))
+            lows.append(float(c[3]))
+            closes.append(float(c[4]))
+        except Exception:
+            return 0.0
+
+    trs: List[float] = []
+    for i in range(1, len(ohlcv)):
+        h = highs[i]
+        l = lows[i]
+        pc = closes[i - 1]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(float(tr))
+
+    if len(trs) < period:
+        return 0.0
+
+    # Wilder: first ATR = SMA(TR, period), then recursive smoothing
+    atr = sum(trs[:period]) / float(period)
+    for tr in trs[period:]:
+        atr = ((atr * (period - 1)) + tr) / float(period)
+
+    return float(atr)
+
+def is_hot_coin(fut_vol_usd: float, ch24: float) -> bool:
+    """
+    Hot coin definition for TP cap logic.
+    """
+    try:
+        return (float(fut_vol_usd) >= float(HOT_VOL_USD)) or (abs(float(ch24)) >= float(HOT_CH24_ABS))
+    except Exception:
+        return False
+
+def tp_cap_pct_for_coin(fut_vol_usd: float, ch24: float) -> float:
+    """
+    Dynamic TP3 cap % based on coin hotness.
+    """
+    return float(TP_MAX_PCT_HOT) if is_hot_coin(fut_vol_usd, ch24) else float(TP_MAX_PCT_NORMAL)
+
+# =========================================================
+# ADAPTIVE EMA SUPPORT
+# =========================================================
+def adaptive_ema_period(atr_pct: float) -> int:
+    """
+    Volatility-aware EMA period:
+    Higher ATR% => faster EMA (smaller period)
+    Lower ATR%  => slower EMA (larger period)
+    """
+    try:
+        a = float(atr_pct)
+    except Exception:
+        a = 2.0
+
+    if a >= 6.0:
+        p = 8
+    elif a >= 4.0:
+        p = 10
+    elif a >= 2.0:
+        p = 12
+    else:
+        p = 16
+
+    return int(clamp(p, ADAPTIVE_EMA_MIN, ADAPTIVE_EMA_MAX))
+
+def adaptive_ema_value(closes: List[float], atr_pct: float) -> Tuple[float, int]:
+    """
+    Returns: (ema_value, period_used)
+    """
+    if not closes:
+        return 0.0, adaptive_ema_period(atr_pct)
+    p = adaptive_ema_period(atr_pct)
+    lookback = min(len(closes), p + 30)
+    return ema(closes[-lookback:], p), p
+
+def best_pullback_ema_15m(
+    closes_15: List[float],
+    c15: List[List[float]],
+    entry: float,
+    side: str,
+    session_name: str,
+    atr_1h: float
+) -> Tuple[float, int, float]:
+    """
+    Pick the best EMA among (7,14,21) based on SR behavior (support/resistance),
+    NOT simply which is closest.
+
+    Returns: (ema_value, period, dist_pct)
+
+    Scoring features:
+    - EMA slope aligned with side (trend rail)
+    - Touch+rejection count in recent candles (SR respect)
+    - Penalize "cross-through" candles (EMA not acting as SR)
+    - Prefer closer EMA but not at the expense of SR quality
+    """
+    if not closes_15 or not c15 or entry <= 0:
+        return 0.0, 14, 999.0
+
+    knobs = session_knobs(session_name)
+    lookback_n = int(knobs.get("ema_reaction_lookback", 7))
+    lookback_n = int(clamp(lookback_n, 5, 16))
+
+    candidates = [7, 14, 21]
+    best_val = 0.0
+    best_p = 14
+    best_dist = 999.0
+    best_score = -1e9
+
+    # Precompute candle slice (most recent lookback window)
+    recent = c15[-lookback_n:] if len(c15) >= lookback_n else c15[:]
+
+    for p in candidates:
+        lookback = min(len(closes_15), p + 80)
+        ema_series_src = closes_15[-lookback:]
+        e_now = float(ema(ema_series_src, p) or 0.0)
+        if e_now <= 0:
+            continue
+
+        # EMA slope: compare current EMA with EMA a bit earlier
+        # (cheap slope approximation without building full series)
+        mid_cut = max(10, int(p * 2))
+        if len(ema_series_src) > mid_cut:
+            e_prev = float(ema(ema_series_src[:-mid_cut], p) or e_now)
+        else:
+            e_prev = e_now
+
+        slope = (e_now - e_prev)  # absolute slope
+        slope_ok = (slope > 0) if side == "BUY" else (slope < 0)
+
+        # Distance (still matters)
+        dist_pct = abs(entry - e_now) / entry * 100.0
+
+        # Dynamic near threshold based on ATR + session knobs
+        # Use your existing proximity function to get threshold behavior consistent
+        pb_ok, pb_dist2, pb_thr, _ = ema_support_proximity_ok(entry, e_now, atr_1h, session_name)
+
+        # Count touches + "rejection direction" + cross-through
+        touch = 0
+        reject = 0
+        cross = 0
+
+        for k in recent:
+            o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4])
+            # touch = candle range intersects EMA
+            if l <= e_now <= h:
+                touch += 1
+
+                # reject = candle closes on the "right side" of EMA for continuation
+                if side == "BUY":
+                    if c > e_now and c > o:
+                        reject += 1
+                else:
+                    if c < e_now and c < o:
+                        reject += 1
+
+                # cross-through = opens one side closes other side (EMA not respected)
+                if (o - e_now) * (c - e_now) < 0:
+                    cross += 1
+
+        # Score weights (tuned for "fewer, better")
+        score = 0.0
+
+        # Must be meaningfully near; if not near, heavily penalize
+        if not pb_ok:
+            score -= 25.0
+        else:
+            score += 10.0
+
+        # Reward SR respect: touches + rejection, penalize cross-through
+        score += (touch * 2.0)
+        score += (reject * 4.0)
+        score -= (cross * 5.0)
+
+        # Reward slope alignment (trend rail)
+        score += 8.0 if slope_ok else -10.0
+
+        # Prefer closer EMA slightly (but not dominant)
+        score -= (dist_pct * 1.5)
+
+        # Mild preference for slower EMA in trends (21 > 14 > 7) IF slope aligns
+        if slope_ok:
+            if p == 21:
+                score += 2.5
+            elif p == 14:
+                score += 1.2
+
+        # Pick best
+        if score > best_score:
+            best_score = score
+            best_val = e_now
+            best_p = int(p)
+            best_dist = float(dist_pct)
+
+    if best_val <= 0:
+        return 0.0, 14, 999.0
+
+    return float(best_val), int(best_p), float(best_dist)
+
+
+# ✅ NEW: "Waiting for Trigger" (near-miss candidates)
+
+_WAITING_TRIGGER: Dict[str, Dict[str, Any]] = {}
+
+
+def is_admin_user(user_id: int) -> bool:
+    """Admin check (supports list + single-id env fallbacks)."""
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+
+    for k in ("ADMIN_TELEGRAM_ID", "OWNER_USER_ID", "ADMIN_ID"):
+        v = os.environ.get(k)
+        if v:
+            try:
+                if uid == int(str(v).strip()):
+                    return True
+            except Exception:
+                pass
+
+    return (uid in ADMIN_USER_IDS) if ADMIN_USER_IDS else False
+
+
+
+
+def is_unlimited_admin(user_id: int) -> bool:
+    return is_admin_user(user_id)
+
+# =========================================================
+# GLOBAL STATE
+# =========================================================
+# Stores last SMTP error per user for /health and /email_test
+_LAST_SMTP_ERROR: Dict[int, str] = {}
+
+# Per-user diagnostics preference (non-admin). Admin always full.
+_USER_DIAG_MODE: Dict[int, str] = {}
+
+# ✅ NEW: Stores last email decision per user (SENT / SKIP + reasons)
+_LAST_EMAIL_DECISION: Dict[int, Dict[str, Any]] = {}
+
+_LAST_BIGMOVE_DECISION: Dict[int, dict] = {}
+
+# ---------------------------------------------------------
+# Email loop heartbeat (for /email_decision transparency)
+# ---------------------------------------------------------
+_EMAIL_LOOP_HEARTBEAT: Dict[str, Any] = {
+    "alive": False,
+    "last_tick_ts": 0.0,
+    "next_tick_ts": 0.0,
+    "last_error": "",
+}
+
+def user_diag_mode(user_id: int) -> str:
+    """
+    Returns diagnostic visibility mode for this user:
+    - admin => 'full'
+    - non-admin => 'friendly' or 'off'
+    Enforces PUBLIC_DIAGNOSTICS_MODE:
+      - 'off'   => always off for non-admin
+      - 'admin' => allow per-user friendly/off
+    """
+    uid = int(user_id)
+
+    if is_admin_user(uid):
+        return "full"
+
+    # hard lock for public users
+    if PUBLIC_DIAGNOSTICS_MODE == "off":
+        return "off"
+
+    # admin-only diagnostics policy (recommended):
+    # non-admin can choose friendly/off locally
+    mode = (_USER_DIAG_MODE.get(uid) or "off").strip().lower()
+    if mode not in {"friendly", "off"}:
+        mode = "off"
+    return mode
+
+def reset_reject_tracker() -> None:
+    return
+
+
+# =========================================================
+# DIAGNOSTICS (reject reasons)
+# =========================================================
+_REJECT_CTX = contextvars.ContextVar("pf_reject_ctx", default=None)
+_LAST_REJECTS = {}  # uid -> {"ts": float, "counts": { "A:no_trigger": 12, ... }}
+_GLOBAL_REJECT_CTX = None  # fallback reject ctx when contextvars don't propagate across nested threads
+
+def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
+    """Record reject reasons for diagnostics.
+
+    - Aggregate counters: ctx["<BASE>:<REASON>"] += 1
+    - Per-symbol last-known reason: ctx["__per__"][BASE] = {"reason": REASON, "n": count}
+    - If ctx["__allow__"] exists, only record for bases in that set (keeps /why focused).
+    """
+    ctx = _REJECT_CTX.get()
+    if not isinstance(ctx, dict):
+        # Fallback: nested asyncio.to_thread() inside our thread runner can drop contextvars.
+        # Use the global ctx for this scan if available.
+        global _GLOBAL_REJECT_CTX
+        if isinstance(_GLOBAL_REJECT_CTX, dict):
+            ctx = _GLOBAL_REJECT_CTX
+        else:
+            return
+
+    b = str(base or "").upper().strip()
+    if not b:
+        return
+
+    allow = ctx.get("__allow__")
+    try:
+        # If allow-list is present but empty, treat it as disabled (avoid silencing /why)
+        if allow is not None:
+            _allow_set = set(allow)
+            if len(_allow_set) > 0 and b not in _allow_set:
+                return
+    except Exception:
+        pass
+
+    r = str(reason or "").strip()
+    if not r:
+        r = "unknown_reject"
+
+    key = f"{b}:{r}"
+    ctx[key] = int(ctx.get(key, 0)) + 1
+
+    try:
+        per = ctx.get("__per__")
+        if not isinstance(per, dict):
+            per = {}
+            ctx["__per__"] = per
+        per_item = per.get(b) or {}
+        n = int(per_item.get("n") or 0) + 1
+        per[b] = {"reason": r, "n": n}
+    except Exception:
+        pass
+    return
+
+
+
+def _note_status(status: str, base: str, mv: "MarketVol", extra: str = "") -> None:
+    """Record non-reject per-symbol status for diagnostics (/why).
+
+    This uses the same reject context plumbing as _rej(), but does NOT increment aggregate reject counters.
+    It only sets ctx["__per__"][BASE] so we don't show '(not evaluated / no decision)' for symbols that actually
+    passed gates or produced a setup.
+    """
+    ctx = _REJECT_CTX.get()
+    if not isinstance(ctx, dict):
+        global _GLOBAL_REJECT_CTX
+        if isinstance(_GLOBAL_REJECT_CTX, dict):
+            ctx = _GLOBAL_REJECT_CTX
+        else:
+            return
+    b = str(base or "").upper().strip()
+    if not b:
+        return
+    allow = ctx.get("__allow__")
+    try:
+        if allow is not None:
+            _allow_set = set(allow)
+            if len(_allow_set) > 0 and b not in _allow_set:
+                return
+    except Exception:
+        pass
+    st = str(status or "").strip() or "status"
+    try:
+        per = ctx.get("__per__")
+        if not isinstance(per, dict):
+            per = {}
+            ctx["__per__"] = per
+        per_item = per.get(b) or {}
+        n = int(per_item.get("n") or 0) + 1
+        # keep 'reason' key for backward compatibility in /why renderer
+        per[b] = {"reason": st, "n": n}
+    except Exception:
+        pass
+    return
+
+def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
+    """Explain why setups were rejected in the *last* scan for this user.
+
+    Output is intentionally compact:
+    - Shows how many symbols were in-scope (leaders/losers + optionally market leaders)
+    - Shows how many had recorded reject reasons
+    - Shows top reject reasons (aggregate)
+    - Shows a per-symbol last-known reason list (limited)
+    """
+    rec = _LAST_REJECTS.get(int(uid)) or {}
+    counts = rec.get("counts") or {}
+    allow = rec.get("allow") or []
+    per_sym = rec.get("per_symbol") or {}  # base -> {"reason": str, "n": int}
+
+    if not allow and not counts:
+        return "No reject stats recorded yet. Run /screen once."
+
+    allow_set = [str(x).upper() for x in (allow or []) if str(x).strip()]
+    allow_set_unique = []
+    seen = set()
+    for b in allow_set:
+        if b not in seen:
+            seen.add(b)
+            allow_set_unique.append(b)
+
+    # Filter counts to allow-set if we have it (keeps /why focused).
+    filtered_counts = {}
+    if allow_set_unique:
+        allow_s = set(allow_set_unique)
+        for k, v in (counts or {}).items():
+            base = str(k).split(":", 1)[0].upper().strip()
+            if base in allow_s:
+                filtered_counts[k] = v
+    else:
+        filtered_counts = dict(counts or {})
+
+    # Aggregate top reject keys
+    items = sorted(filtered_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:int(top_n)]
+
+    # Per-symbol summary (show all if small; otherwise truncate)
+    per_lines = []
+    allow_s = set(allow_set_unique) if allow_set_unique else None
+    if allow_set_unique:
+        bases = allow_set_unique
+    else:
+        # fallback: infer bases from counts
+        bases = sorted(list({str(k).split(":", 1)[0].upper().strip() for k in (filtered_counts or {}).keys()}))
+
+    for b in bases:
+        info = per_sym.get(b) or per_sym.get(b.upper()) or None
+        if info and isinstance(info, dict):
+            r = str(info.get("reason") or "").strip()
+            n = int(info.get("n") or 0)
+            if r:
+                per_lines.append(f"• {b}: {r} ({n})")
+                continue
+        # No recorded reject for this symbol in the last scan
+        per_lines.append(f"• {b}: (not evaluated / no decision)")
+
+    # If the universe is large, keep per-symbol section readable
+    max_per = 20
+    per_tail = ""
+    if len(per_lines) > max_per:
+        per_tail = f"… (+{len(per_lines) - max_per} more)"
+        per_lines = per_lines[:max_per]
+
+    lines = []
+    lines.append("🧩 Last Scan Reject Reasons")
+    if allow_set_unique:
+        lines.append(f"Universe (leaders/losers/market leaders): {len(allow_set_unique)} symbols")
+        lines.append("Symbols: " + ", ".join(allow_set_unique[:30]) + ("…" if len(allow_set_unique) > 30 else ""))
+    lines.append(f"Recorded reject keys: {len(filtered_counts)}")
+    if items:
+        lines.append("")
+        lines.append("Top reasons (aggregate):")
+        for k, v in items:
+            lines.append(f"• {k} = {v}")
+    lines.append("")
+    lines.append("Per-symbol (last known):")
+    lines.extend(per_lines)
+    if per_tail:
+        lines.append(per_tail)
+    return "\n".join(lines)
+
+
+
+# =========================================================
+# DB
+# =========================================================
+def db_connect() -> sqlite3.Connection:
+    # ensure directory exists
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+
+    # safer sqlite on hosted envs
+    try:
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=NORMAL;")
+        con.execute("PRAGMA busy_timeout=5000;")
+        con.execute("PRAGMA foreign_keys=ON;")
+    except Exception:
+        pass
+
+    return con
+
+
+
+
+
+def _migrate_generated_setups():
+    """Ensure generated_setups table exists (used by /screen, email, and autotrade)."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS generated_setups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                source TEXT NOT NULL,          -- 'screen' | 'email'
+                created_ts REAL NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                setup_id TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                conf INTEGER DEFAULT 0
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_generated_setups_uid_ts ON generated_setups(user_id, created_ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_generated_setups_setupid ON generated_setups(setup_id)")
+        con.commit()
+        con.close()
+    except Exception as e:
+        try:
+            logger.error(f"_migrate_generated_setups failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+
+def get_best_open_setup_for_autotrade(user_id):
+    """
+    Pick the best *still-open* setup for autotrade from generated_setups.
+    NOTE: generated_setups does NOT store outcome. Outcome is tracked in signal_outcomes.
+    We treat missing outcome as OPEN.
+    """
+    try:
+        con = db_connect()
+        cur = con.cursor()
+
+        cutoff = time.time() - 6 * 3600  # last 6 hours (safer across sessions)
+
+        cur.execute("""
+            SELECT gs.id, gs.setup_id, gs.symbol, gs.side, gs.conf,
+                   COALESCE(so.outcome, 'OPEN') AS outcome
+            FROM generated_setups gs
+            LEFT JOIN signal_outcomes so
+                   ON so.setup_id = gs.setup_id
+            WHERE gs.user_id = ?
+              AND gs.created_ts >= ?
+              AND gs.source IN ('email','screen')
+              AND COALESCE(so.outcome, 'OPEN') = 'OPEN'
+            ORDER BY gs.conf DESC, gs.created_ts DESC
+            LIMIT 1
+        """, (int(user_id), float(cutoff)))
+
+        row = cur.fetchone()
+        con.close()
+        return row
+    except Exception as e:
+        try:
+            logger.error(f"Autotrade selector error: {e}")
+        except Exception:
+            pass
+        return None
+
+def db_backup_file() -> Tuple[bool, str]:
+    """
+    Copies DB_PATH -> DB_BACKUP_PATH
+    """
+    try:
+        # Ensure folder exists
+        os.makedirs(os.path.dirname(DB_BACKUP_PATH) or ".", exist_ok=True)
+
+        if not os.path.exists(DB_PATH):
+            return False, f"DB file not found: {DB_PATH}"
+
+        # Copy bytes
+        with open(DB_PATH, "rb") as src, open(DB_BACKUP_PATH, "wb") as dst:
+            dst.write(src.read())
+
+        return True, f"Backup created: {DB_BACKUP_PATH}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def db_restore_file() -> Tuple[bool, str]:
+    """
+    Copies DB_BACKUP_PATH -> DB_PATH
+    """
+    try:
+        if not os.path.exists(DB_BACKUP_PATH):
+            return False, f"No backup found: {DB_BACKUP_PATH}"
+
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+
+        with open(DB_BACKUP_PATH, "rb") as src, open(DB_PATH, "wb") as dst:
+            dst.write(src.read())
+
+        return True, f"Restored from backup: {DB_BACKUP_PATH}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def db_wipe_all_data_keep_schema() -> None:
+    """
+    Deletes ALL rows from core tables, keeps schema.
+    Also resets in-memory trackers.
+    """
+    con = db_connect()
+    cur = con.cursor()
+
+    # Order matters if FK ever added later. We currently don’t have FK refs, but still safe.
+    tables = [
+        "trades",
+        "signals",
+        "emailed_symbols",
+        "email_state",
+        "email_daily",
+        "risk_daily",
+        "setup_counter",
+        # users is kept (preferences) OR can be wiped too. You requested "clean database":
+        # wiping users means everyone will be re-created on next /start.
+        "users",
+    ]
+
+    for t in tables:
+        try:
+            cur.execute(f"DELETE FROM {t}")
+        except Exception:
+            pass
+
+    con.commit()
+    con.close()
+    try:
+        _autotrade_db_init()
+    except Exception:
+        pass
+
+    # Also clear runtime trackers
+    _LAST_SMTP_ERROR.clear()
+    _USER_DIAG_MODE.clear()
+    _LAST_EMAIL_DECISION.clear()
+
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /reset
+    Admin-only:
+    1) Backup DB file
+    2) Wipe tables (clean DB)
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    async with DB_FILE_LOCK:
+        ok, msg = db_backup_file()
+        if not ok:
+            await update.message.reply_text(f"❌ Backup failed.\n{msg}")
+            return
+
+        try:
+            db_wipe_all_data_keep_schema()
+        except Exception as e:
+            await update.message.reply_text(f"❌ Reset failed.\n{type(e).__name__}: {e}")
+            return
+
+    await update.message.reply_text(
+        "✅ Database RESET completed.\n"
+        f"{msg}\n\n"
+        "Use /restore to revert to the backup."
+    )
+
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /restore
+    Admin-only:
+    Restores DB from DB_BACKUP_PATH
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    async with DB_FILE_LOCK:
+        ok, msg = db_restore_file()
+        if not ok:
+            await update.message.reply_text(f"❌ Restore failed.\n{msg}")
+            return
+
+        # After restore, ensure schema migrations still applied
+        try:
+            db_init()
+        except Exception:
+            pass
+
+    await update.message.reply_text(f"✅ Database RESTORED.\n{msg}")
+
+def db_init():
+    # ensures folder exists before creating DB file
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+        
+    con = db_connect()
+    cur = con.cursor()
+
+    # =========================================================
+    # ✅ Users table (core) — created if missing (fresh installs)
+    # =========================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        tz TEXT DEFAULT 'UTC',
+        scan_profile TEXT DEFAULT 'default',
+        equity REAL DEFAULT 1000.0,
+        risk_mode TEXT DEFAULT 'percent',
+        risk_value REAL DEFAULT 1.0,
+        daily_cap_mode TEXT DEFAULT 'percent',
+        daily_cap_value REAL DEFAULT 3.0,
+        max_trades_day INTEGER DEFAULT 3,
+        notify_on INTEGER DEFAULT 0,
+
+        sessions_enabled TEXT DEFAULT '',
+        max_emails_per_session INTEGER DEFAULT 5,
+        email_gap_min INTEGER DEFAULT 30,
+        max_emails_per_day INTEGER DEFAULT 10,
+
+        day_trade_date TEXT DEFAULT '',
+        day_trade_count INTEGER DEFAULT 0,
+
+        -- Email columns
+        email_to TEXT,
+        email_alerts_enabled INTEGER DEFAULT 1,
+
+        -- Billing / access columns (backward compatible)
+        plan TEXT DEFAULT 'free',
+        trial_start_ts REAL DEFAULT 0,
+        trial_until REAL DEFAULT 0,
+        plan_expires REAL DEFAULT 0,
+        access_source TEXT,
+        access_ref TEXT,
+        access_updated_ts REAL DEFAULT 0
+    )
+    """)
+
+    # =========================================================
+    # ✅ Cooldown table (v2): direction-aware + optional session stamp
+    # - old: PRIMARY KEY(user_id, symbol)
+    # - new: PRIMARY KEY(user_id, symbol, side)
+    # =========================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS emailed_symbols (
+        user_id INTEGER NOT NULL,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        session TEXT NOT NULL DEFAULT '',
+        emailed_ts REAL NOT NULL,
+        PRIMARY KEY (user_id, symbol, side)
+    )
+    """)
+
+    # --- Migration from old schema (if needed) ---
+    # If table exists but missing "side", then it's old schema.
+    try:
+        cur.execute("PRAGMA table_info(emailed_symbols)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "side" not in cols:
+            # Create new table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS emailed_symbols_v2 (
+                    user_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    session TEXT NOT NULL DEFAULT '',
+                    emailed_ts REAL NOT NULL,
+                    PRIMARY KEY (user_id, symbol, side)
+                )
+            """)
+
+            # Copy old rows -> assume side=ANY (we duplicate into BUY and SELL to be safe)
+            cur.execute("SELECT user_id, symbol, emailed_ts FROM emailed_symbols")
+            old_rows = cur.fetchall() or []
+            for r in old_rows:
+                uid0 = int(r[0])
+                sym0 = str(r[1]).upper()
+                ts0 = float(r[2])
+                # Duplicate into BUY and SELL so cooldown still applies in both directions initially.
+                cur.execute("""
+                    INSERT OR REPLACE INTO emailed_symbols_v2 (user_id, symbol, side, session, emailed_ts)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (uid0, sym0, "BUY", "", ts0))
+                cur.execute("""
+                    INSERT OR REPLACE INTO emailed_symbols_v2 (user_id, symbol, side, session, emailed_ts)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (uid0, sym0, "SELL", "", ts0))
+
+            # Swap tables
+            cur.execute("DROP TABLE emailed_symbols")
+            cur.execute("ALTER TABLE emailed_symbols_v2 RENAME TO emailed_symbols")
+            con.commit()
+    except Exception:
+        # Don't block startup if migration fails; worst case cooldown table resets.
+        pass
+
+    cur.execute("PRAGMA table_info(users)")
+    cols = {r[1] for r in cur.fetchall()}
+    
+    # Trade window columns (local time HH:MM), empty = disabled
+    if "trade_window_start" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN trade_window_start TEXT NOT NULL DEFAULT ''")
+    if "trade_window_end" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN trade_window_end TEXT NOT NULL DEFAULT ''")
+    
+    
+    # Scan profile (standard/aggressive)
+    if "scan_profile" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN scan_profile TEXT NOT NULL DEFAULT 'standard'")
+# Daily email cap
+    if "max_emails_per_day" not in cols:
+        cur.execute(
+            f"ALTER TABLE users ADD COLUMN max_emails_per_day INTEGER NOT NULL DEFAULT {int(DEFAULT_MAX_EMAILS_PER_DAY)}"
+        )
+    
+    # NEW: Unlimited session emailing (24h)
+    if "sessions_unlimited" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN sessions_unlimited INTEGER NOT NULL DEFAULT 0")
+    
+    # NEW: Big-move alert emails (even if not a valid setup)
+    if "bigmove_alert_on" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_on INTEGER NOT NULL DEFAULT 1")
+    
+    # Aligned defaults (per your request): 24H >= 40 OR 4H >= 15
+    # Aligned defaults: 4H >= 20 OR 1H >= 10
+    if "bigmove_alert_4h" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_4h REAL NOT NULL DEFAULT 20")
+    if "bigmove_alert_1h" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_1h REAL NOT NULL DEFAULT 10")
+
+    # NEW: Spike Reversal Alerts
+    if "spike_alert_on" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN spike_alert_on INTEGER NOT NULL DEFAULT 1")
+
+    # default volume gate: 15M
+    if "spike_min_vol_usd" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN spike_min_vol_usd REAL NOT NULL DEFAULT 10000000")
+
+    # wick ratio threshold (0.55 means wick is 55%+ of candle range)
+    if "spike_wick_ratio" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN spike_wick_ratio REAL NOT NULL DEFAULT 0.45")
+
+    # spike size must be >= ATR * this multiplier
+    if "spike_atr_mult" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN spike_atr_mult REAL NOT NULL DEFAULT 1.00")
+
+    # NEW: Early Warning (Possible Reversal Zones) email alerts
+    # Default OFF to avoid inbox noise; users can enable explicitly.
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        public_id INTEGER,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        entry REAL NOT NULL,
+        sl REAL NOT NULL,
+        risk_usd REAL NOT NULL,
+        qty REAL NOT NULL,
+        opened_ts REAL NOT NULL,
+        closed_ts REAL,
+        pnl REAL,
+        r_mult REAL,
+        note TEXT,
+        signal_id TEXT
+    )
+    """)
+
+    
+    # ---------------------------------------------------------
+    # Public per-user Trade IDs (start at 1, resettable)
+    # ---------------------------------------------------------
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trade_id_seq (
+        user_id INTEGER PRIMARY KEY,
+        last_id INTEGER NOT NULL
+    )
+    """)
+    # Add public_id column if DB existed already
+    try:
+        cols_trades = [r[1] for r in cur.execute("PRAGMA table_info(trades)").fetchall()]
+        if "public_id" not in cols_trades:
+            cur.execute("ALTER TABLE trades ADD COLUMN public_id INTEGER")
+            cols_trades.append("public_id")
+    except Exception:
+        pass
+
+    # Backfill missing public_id for existing trades (per user, ordered by opened_ts)
+    try:
+        uids = [r[0] for r in cur.execute("SELECT DISTINCT user_id FROM trades").fetchall()]
+        for _uid in uids:
+            rows = cur.execute(
+                "SELECT id FROM trades WHERE user_id=? AND (public_id IS NULL OR public_id='') ORDER BY opened_ts ASC, id ASC",
+                (int(_uid),),
+            ).fetchall()
+            if rows:
+                rmax = cur.execute("SELECT MAX(public_id) FROM trades WHERE user_id=?", (int(_uid),)).fetchone()
+                start = int(rmax[0]) if rmax and rmax[0] is not None else 0
+                n = start
+                for (rid,) in rows:
+                    n += 1
+                    cur.execute("UPDATE trades SET public_id=? WHERE id=? AND user_id=?", (int(n), int(rid), int(_uid)))
+
+            rmax2 = cur.execute("SELECT MAX(public_id) FROM trades WHERE user_id=?", (int(_uid),)).fetchone()
+            last = int(rmax2[0]) if rmax2 and rmax2[0] is not None else 0
+            cur.execute("INSERT OR REPLACE INTO trade_id_seq(user_id,last_id) VALUES(?,?)", (int(_uid), int(last)))
+    except Exception:
+        pass
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS signals (
+        setup_id TEXT PRIMARY KEY,
+        created_ts REAL NOT NULL,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        conf INTEGER NOT NULL,
+        entry REAL NOT NULL,
+        sl REAL NOT NULL,
+        tp1 REAL,
+        tp2 REAL,
+        tp3 REAL NOT NULL,
+        fut_vol_usd REAL NOT NULL,
+        ch24 REAL NOT NULL,
+        ch4 REAL NOT NULL,
+        ch1 REAL NOT NULL,
+        ch15 REAL NOT NULL
+    )
+    """)
+
+    # =========================================================
+    # ✅ Signal evaluation tables (emailed setups + outcomes)
+    # =========================================================
+
+    # Ensure signals table has market_symbol (migration-safe)
+    try:
+        cur.execute("PRAGMA table_info(signals)")
+        s_cols = {r[1] for r in cur.fetchall()}
+        if "market_symbol" not in s_cols:
+            cur.execute("ALTER TABLE signals ADD COLUMN market_symbol TEXT")
+    except Exception:
+        pass
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS emailed_setups (
+        user_id INTEGER NOT NULL,
+        setup_id TEXT NOT NULL,
+        session TEXT NOT NULL DEFAULT '',
+        emailed_ts REAL NOT NULL,
+        PRIMARY KEY (user_id, setup_id)
+    )
+    """)
+
+    # =========================================================
+    # ✅ Generated setups log (screen vs email correlation)
+    # =========================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS generated_setups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        source TEXT NOT NULL,          -- 'screen' | 'email'
+        created_ts REAL NOT NULL,
+        session TEXT NOT NULL DEFAULT '',
+        setup_id TEXT NOT NULL DEFAULT '',
+        symbol TEXT NOT NULL DEFAULT '',
+        side TEXT NOT NULL DEFAULT '',
+        conf INTEGER DEFAULT 0
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS signal_outcomes (
+        setup_id TEXT PRIMARY KEY,
+        outcome TEXT NOT NULL,              -- WIN_TP1 | WIN_TP2 | WIN_TP3 | LOSS | OPEN | AMBIGUOUS
+        hit_level TEXT,                     -- TP1 | TP2 | TP3 | SL | NONE
+        hit_ts REAL,                        -- UTC epoch seconds of first touch (best effort)
+        evaluated_ts REAL NOT NULL,          -- UTC epoch seconds
+        horizon_hours INTEGER NOT NULL DEFAULT 24,
+        note TEXT
+    )
+    """)
+
+    # Add new columns for best TP tracking (backward-compatible)
+    try:
+        cols = [r["name"] for r in cur.execute("PRAGMA table_info(signal_outcomes)").fetchall()]
+        if "best_level" not in cols:
+            cur.execute("ALTER TABLE signal_outcomes ADD COLUMN best_level TEXT")
+        if "best_ts" not in cols:
+            cur.execute("ALTER TABLE signal_outcomes ADD COLUMN best_ts REAL")
+    except Exception:
+        pass
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS email_state (
+        user_id INTEGER PRIMARY KEY,
+        session_key TEXT NOT NULL,
+        sent_count INTEGER NOT NULL,
+        last_email_ts REAL NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS email_daily (
+        user_id INTEGER NOT NULL,
+        day_local TEXT NOT NULL,
+        sent_count INTEGER NOT NULL,
+        PRIMARY KEY (user_id, day_local)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS risk_daily (
+        user_id INTEGER NOT NULL,
+        day_local TEXT NOT NULL,
+        used_risk_usd REAL NOT NULL,
+        PRIMARY KEY (user_id, day_local)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS setup_counter (
+        day_yyyymmdd TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL
+    )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS emailed_bigmoves (
+            user_id     INTEGER NOT NULL,
+            symbol      TEXT    NOT NULL,
+            direction   TEXT    NOT NULL,   -- "UP" or "DOWN"
+            emailed_ts  REAL    NOT NULL,
+            PRIMARY KEY (user_id, symbol, direction)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS emailed_spikes (
+            user_id     INTEGER NOT NULL,
+            symbol      TEXT    NOT NULL,
+            direction   TEXT    NOT NULL,   -- "UP" or "DOWN"
+            emailed_ts  REAL    NOT NULL,
+            PRIMARY KEY (user_id, symbol, direction)
+        )
+    """)
+
+
+    
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS emailed_earlywarnings (
+            user_id     INTEGER NOT NULL,
+            symbol      TEXT    NOT NULL,
+            side        TEXT    NOT NULL,   -- "BUY" or "SELL"
+            emailed_ts  REAL    NOT NULL,
+            PRIMARY KEY (user_id, symbol, side)
+        )
+    """
+    )
+
+    # =========================================================
+    # USDT payments + unified access/payments ledger
+    # =========================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS usdt_payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER NOT NULL,
+        username TEXT,
+        txid TEXT UNIQUE NOT NULL,
+        plan TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PENDING',   -- PENDING / APPROVED / REJECTED
+        created_ts REAL NOT NULL,
+        decided_ts REAL,
+        decided_by INTEGER,
+        note TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS payments_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        source TEXT NOT NULL,         -- 'stripe' | 'usdt' | 'manual'
+        ref TEXT NOT NULL,            -- stripe invoice/sub id OR txid OR manual note
+        plan TEXT NOT NULL,           -- free | standard | pro
+        amount REAL NOT NULL DEFAULT 0,
+        currency TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,         -- paid | refunded | void | pending
+        created_ts REAL NOT NULL
+    )
+    """)
+
+    # =========================================================
+    # Optional: add access tracking columns to users table
+    # =========================================================
+    try:
+        cur.execute("PRAGMA table_info(users)")
+        user_cols = {r[1] for r in cur.fetchall()}
+
+        if "access_source" not in user_cols:
+            cur.execute(
+                "ALTER TABLE users ADD COLUMN access_source TEXT NOT NULL DEFAULT ''"
+            )
+
+        if "access_ref" not in user_cols:
+            cur.execute(
+                "ALTER TABLE users ADD COLUMN access_ref TEXT NOT NULL DEFAULT ''"
+            )
+
+        if "access_updated_ts" not in user_cols:
+            cur.execute(
+                "ALTER TABLE users ADD COLUMN access_updated_ts REAL NOT NULL DEFAULT 0"
+            )
+
+    except Exception:
+        # Do not block startup if ALTER TABLE fails
+        pass
+   
+    con.commit()
+    con.close()
+
+def _default_sessions_for_tz(tz_name: str) -> List[str]:
+    s = tz_name.lower()
+    if "america" in s or s.startswith("us/") or "new_york" in s:
+        return ["NY"]
+    if "europe" in s or "london" in s or "africa" in s:
+        return ["LON"]
+    return ["ASIA"]
+
+def _order_sessions(xs: List[str]) -> List[str]:
+    cleaned = []
+    for x in xs:
+        x = str(x).strip().upper()
+        if x in SESSIONS_UTC and x not in cleaned:
+            cleaned.append(x)
+    return [s for s in SESSION_PRIORITY if s in cleaned]
+
+def get_user(user_id: int) -> dict:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+
+    if not row:
+        tz_name = os.environ.get("DEFAULT_USER_TZ", "UTC")
+        sessions = ['NY']
+        now_local = datetime.now(ZoneInfo(tz_name)).date().isoformat()
+        cur.execute("""
+            INSERT INTO users (
+                user_id, tz, scan_profile, equity, risk_mode, risk_value,
+                daily_cap_mode, daily_cap_value,
+                max_trades_day, notify_on,
+                sessions_enabled, max_emails_per_session, email_gap_min,
+                max_emails_per_day,
+                day_trade_date, day_trade_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            tz_name,
+            str(DEFAULT_SCAN_PROFILE),
+            float(DEFAULT_EQUITY),
+            DEFAULT_RISK_MODE,
+            float(DEFAULT_RISK_VALUE),
+            DEFAULT_DAILY_CAP_MODE,
+            float(DEFAULT_DAILY_CAP_VALUE),
+            int(DEFAULT_MAX_TRADES_DAY),
+            
+            # ✅ FIX: default notify_on should NOT depend on EMAIL_ENABLED
+            1,
+            
+            json.dumps(sessions),
+            int(DEFAULT_MAX_EMAILS_PER_SESSION),
+            int(DEFAULT_MIN_EMAIL_GAP_MIN),
+            int(DEFAULT_MAX_EMAILS_PER_DAY),
+            now_local,
+            0
+        ))
+        con.commit()
+        cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+
+    con.close()
+    return dict(row)
+
+# =========================================================
+# ACCESS CONTROL (FREE TRIAL + PAYWALL)
+# =========================================================
+def trial_expired_legacy(user: dict) -> bool:
+    try:
+        created = datetime.fromisoformat(user["created_at"])
+    except Exception:
+        return True
+    return datetime.utcnow() > created + timedelta(days=FREE_TRIAL_DAYS)
+
+
+def has_active_access_legacy(user: dict) -> bool:
+    if user.get("plan") in ("standard", "pro"):
+        return True
+    if user.get("plan") == "free" and not trial_expired(user):
+        return True
+    return False
+
+
+def enforce_access_or_block(update: Update, command: str) -> bool:
+    uid = update.effective_user.id
+    if is_admin_user(uid):
+        return True
+
+    user = get_user(uid)
+
+    if has_active_access(uid, user):
+        return True
+
+    if command in ALLOWED_WHEN_LOCKED:
+        return True
+
+    update.message.reply_text(
+        "⛔ Access locked.\n\n"
+        "Your 7-day free trial has ended.\n\n"
+        "Plans:\n"
+        "• Standard — $50/month\n"
+        "• Pro — $99/month\n\n"
+        "👉 /billing"
+    )
+    return False
+
+def update_user(user_id: int, **kwargs):
+    if not kwargs:
+        return
+    con = db_connect()
+    cur = con.cursor()
+    sets = ", ".join([f"{k}=?" for k in kwargs.keys()])
+    vals = list(kwargs.values()) + [user_id]
+    cur.execute(f"UPDATE users SET {sets} WHERE user_id=?", vals)
+    con.commit()
+    con.close()
+
+def set_user_email(uid: int, email: str) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        # ensure row exists
+        cur.execute(
+            "INSERT OR IGNORE INTO users(user_id) VALUES(?)",
+            (uid,)
+        )
+        cur.execute(
+            "UPDATE users SET email_to = ? WHERE user_id = ?",
+            (email, uid)
+        )
+        con.commit()
+
+def ensure_email_column():
+    """Backward-compatible email + access columns migration.
+
+    Also ensures billing/access columns exist (plan/trial/etc), because many commands
+    (e.g. /status, /screen gating) depend on them.
+    """
+    # Ensure billing/access columns exist first
+    ensure_billing_columns()
+
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+
+        # email address
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN email_to TEXT")
+            con.commit()
+            logger.info("Added email_to column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        # per-user email preferences
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN email_enabled INTEGER DEFAULT 1")
+            con.commit()
+            logger.info("Added email_enabled column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN notify_on INTEGER DEFAULT 1")
+            con.commit()
+            logger.info("Added notify_on column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert INTEGER DEFAULT 1")
+            con.commit()
+            logger.info("Added bigmove_alert column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN bigmove_min_usd REAL DEFAULT 5000000")
+            con.commit()
+            logger.info("Added bigmove_min_usd column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN sessions_unlimited INTEGER DEFAULT 0")
+            con.commit()
+            logger.info("Added sessions_unlimited column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+def ensure_billing_columns():
+    """Ensure billing / plan / trial columns exist on users table (backward compatible migrations)."""
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+
+        # Plan / trial columns
+        for ddl, label in [
+            ("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'", "plan"),
+            ("ALTER TABLE users ADD COLUMN trial_start_ts REAL DEFAULT 0", "trial_start_ts"),
+            ("ALTER TABLE users ADD COLUMN trial_until REAL DEFAULT 0", "trial_until"),
+            ("ALTER TABLE users ADD COLUMN plan_expires REAL DEFAULT 0", "plan_expires"),
+            ("ALTER TABLE users ADD COLUMN access_source TEXT", "access_source"),
+            ("ALTER TABLE users ADD COLUMN access_ref TEXT", "access_ref"),
+            ("ALTER TABLE users ADD COLUMN access_updated_ts REAL DEFAULT 0", "access_updated_ts"),
+        ]:
+            try:
+                cur.execute(ddl)
+                con.commit()
+                logger.info("Added %s column to users table", label)
+            except sqlite3.OperationalError:
+                # column already exists (or older sqlite limitation)
+                pass
+
+
+def reset_daily_if_needed(user: dict) -> dict:
+    tz_name = str(user.get("tz") or user.get("timezone") or "UTC").strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    today = datetime.now(tz).date().isoformat()
+
+    if user["day_trade_date"] != today:
+        update_user(
+            user["user_id"],
+            day_trade_date=today,
+            day_trade_count=0
+        )
+        user = get_user(user["user_id"])
+
+    return user
+
+
+def list_users_notify_on() -> List[dict]:
+    """Users who should receive *scan* emails.
+
+    Key points (matches the behavior of the 14–15 Feb working builds):
+    - Primary rule: notify_on=1 AND has a saved email address.
+    - Admins are ALWAYS included if they have an email saved, even if notify_on=0.
+      (This uses is_admin_user(), not ADMIN_USER_IDS, so it works with env single-admin setups.)
+    """
+    con = db_connect()
+    try:
+        import sqlite3
+        con.row_factory = sqlite3.Row
+    except Exception:
+        pass
+
+    cur = con.cursor()
+
+    # Detect whether DB uses users.email or only users.email_to (older schemas)
+    cols = set()
+    try:
+        cur.execute("PRAGMA table_info(users)")
+        cols = {str(r[1]) for r in cur.fetchall()}
+    except Exception:
+        cols = set()
+
+    email_fields = []
+    if "email" in cols:
+        email_fields.append("email")
+    if "email_to" in cols:
+        email_fields.append("email_to")
+
+    # If we can't detect, fall back to both names in the WHERE (SQLite will error),
+    # so only use a safe default.
+    if not email_fields:
+        email_fields = ["email_to"]
+
+    email_ok_where = " OR ".join([f"({c} IS NOT NULL AND TRIM({c})!='')" for c in email_fields])
+
+    # 1) notify_on users
+    try:
+        cur.execute(f"SELECT * FROM users WHERE notify_on=1 AND ({email_ok_where})")
+        rows = [dict(r) for r in cur.fetchall()]
+    except Exception:
+        # fallback: just notify_on=1
+        cur.execute("SELECT * FROM users WHERE notify_on=1")
+        rows = [dict(r) for r in cur.fetchall()]
+
+    # 2) admins with an email saved (even if notify_on=0)
+    try:
+        cur.execute(f"SELECT * FROM users WHERE ({email_ok_where})")
+        for r in cur.fetchall():
+            d = dict(r)
+            try:
+                uid = int(d.get("user_id") or 0)
+            except Exception:
+                uid = 0
+            if uid and is_admin_user(uid):
+                if not any(int(x.get("user_id") or 0) == uid for x in rows):
+                    rows.append(d)
+    except Exception:
+        pass
+
+    return rows
+
+
+def list_users_with_email() -> List[dict]:
+    """
+    Users eligible for email sends (have a saved recipient email).
+    This is used for Big-Move Alerts so it works even if notify_on=0.
+
+    IMPORTANT:
+    Some DB versions don't have users.email (only users.email_to).
+    This function auto-detects columns and builds a safe query.
+    """
+    con = db_connect()
+    try:
+        # Ensure rows are dict-convertible
+        try:
+            import sqlite3
+            con.row_factory = sqlite3.Row
+        except Exception:
+            pass
+
+        cur = con.cursor()
+
+        # Detect available columns in users table
+        try:
+            cur.execute("PRAGMA table_info(users)")
+            cols = {str(r[1]).lower() for r in cur.fetchall()}  # r[1] is column name
+        except Exception:
+            cols = set()
+
+        has_email_to = ("email_to" in cols)
+        has_email = ("email" in cols)
+        has_email_enabled = ("email_alerts_enabled" in cols)
+
+        # Build safe WHERE clause
+        where_parts = []
+        if has_email_to:
+            where_parts.append("(email_to IS NOT NULL AND TRIM(email_to) != '')")
+        if has_email:
+            where_parts.append("(email IS NOT NULL AND TRIM(email) != '')")
+
+        # If neither column exists, no one is eligible
+        if not where_parts:
+            return []
+
+        where_sql = " OR ".join(where_parts)
+        if has_email_enabled:
+            where_sql = f"({where_sql}) AND (COALESCE(email_alerts_enabled, 1) = 1)"
+
+        cur.execute(f"""
+            SELECT *
+            FROM users
+            WHERE {where_sql}
+        """)
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+    
+def email_state_get(user_id: int) -> dict:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM email_state WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO email_state (user_id, session_key, sent_count, last_email_ts) VALUES (?, ?, ?, ?)",
+                    (user_id, "NONE", 0, 0.0))
+        con.commit()
+        cur.execute("SELECT * FROM email_state WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+    con.close()
+    return dict(row)
+
+def email_state_set(user_id: int, **kwargs):
+    if not kwargs:
+        return
+    con = db_connect()
+    cur = con.cursor()
+    sets = ", ".join([f"{k}=?" for k in kwargs.keys()])
+    vals = list(kwargs.values()) + [user_id]
+    cur.execute(f"UPDATE email_state SET {sets} WHERE user_id=?", vals)
+    con.commit()
+    con.close()
+
+def mark_symbol_emailed(user_id: int, symbol: str, side: str, session_name: str = ""):
+    """
+    ✅ Direction-aware cooldown: stored per (symbol, side)
+    Optionally stores session name (NY/LON/ASIA) for audit.
+    """
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO emailed_symbols (user_id, symbol, side, session, emailed_ts)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, symbol, side) DO UPDATE SET
+            session=excluded.session,
+            emailed_ts=excluded.emailed_ts
+    """, (int(user_id), str(symbol).upper(), str(side).upper(), str(session_name or ""), time.time()))
+    con.commit()
+    con.close()
+
+def symbol_recently_emailed(
+    user_id: int,
+    symbol: str,
+    side: str,
+    session_name: str,
+) -> bool:
+    """
+    ✅ Session-aware + direction-aware cooldown check.
+    Cooldown hours depend on CURRENT session (NY/LON/ASIA).
+    """
+    cooldown_hours = float(cooldown_hours_for_session(session_name))
+
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT emailed_ts
+        FROM emailed_symbols
+        WHERE user_id=? AND symbol=? AND side=?
+    """, (int(user_id), str(symbol).upper(), str(side).upper()))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return False
+
+    last_ts = float(row["emailed_ts"])
+    return (time.time() - last_ts) < (cooldown_hours * 3600.0)
+
+def _safe_float(x, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        s = str(x).strip()
+        if s == "" or s == "-" or s.lower() == "none":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+
+
+BIGMOVE_COOLDOWN_SEC = 60 * 60 * 3  # 3 hours
+
+def bigmove_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT emailed_ts FROM emailed_bigmoves WHERE user_id=? AND symbol=? AND direction=?",
+                (int(uid), str(symbol), str(direction)),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            last_ts = float(row[0] or 0.0)
+            return (time.time() - last_ts) < BIGMOVE_COOLDOWN_SEC
+    except Exception:
+        return False
+
+def mark_bigmove_emailed(uid: int, symbol: str, direction: str) -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO emailed_bigmoves(user_id, symbol, direction, emailed_ts) VALUES(?,?,?,?)",
+                (int(uid), str(symbol), str(direction), time.time()),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+SPIKE_COOLDOWN_SEC = 60 * 60 * 3  # 3 hours
+
+def spike_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT emailed_ts FROM emailed_spikes WHERE user_id=? AND symbol=? AND direction=?",
+                (int(uid), str(symbol), str(direction)),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            last_ts = float(row[0] or 0.0)
+            return (time.time() - last_ts) < SPIKE_COOLDOWN_SEC
+    except Exception:
+        return False
+
+def mark_spike_emailed(uid: int, symbol: str, direction: str) -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO emailed_spikes(user_id, symbol, direction, emailed_ts) VALUES(?,?,?,?)",
+                (int(uid), str(symbol), str(direction), time.time()),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+EARLYWARN_COOLDOWN_SEC = 60 * 60 * 3  # 3 hours
+
+def earlywarn_recently_emailed(uid: int, symbol: str, side: str) -> bool:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT emailed_ts FROM emailed_earlywarnings WHERE user_id=? AND symbol=? AND side=?",
+                (int(uid), str(symbol), str(side).upper()),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            last_ts = float(row[0] or 0.0)
+            return (time.time() - last_ts) < EARLYWARN_COOLDOWN_SEC
+    except Exception:
+        return False
+
+def mark_earlywarn_emailed(uid: int, symbol: str, side: str) -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO emailed_earlywarnings(user_id, symbol, side, emailed_ts) VALUES(?,?,?,?)",
+                (int(uid), str(symbol), str(side).upper(), time.time()),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def _bigmove_candidates(best_fut: dict, p4: float, p1: float, min_vol_usd: float = 0.0, max_items: int = 12) -> list:
+    """
+    Returns list of dicts: {symbol, ch4, ch1, vol, direction, score}
+
+    direction:
+      - "UP"   → strong positive move
+      - "DOWN" → strong negative move
+
+    Triggers:
+      - UP   if ch4 >= +p4 OR ch1 >= +p1
+      - DOWN if ch4 <= -p4 OR ch1 <= -p1
+    """
+
+    def _pick_pct(mv, keys) -> float:
+        for k in keys:
+            try:
+                v = getattr(mv, k, None)
+                if v is None:
+                    continue
+                return float(v or 0.0)
+            except Exception:
+                continue
+        return 0.0
+
+    out = []
+
+    for sym, mv in (best_fut or {}).items():
+        try:
+            # Try multiple possible field names (fixes "different field names" issue)
+            ch4 = _pick_pct(mv, ["ch4", "pct_4h", "change_4h", "chg_4h", "percentage_4h", "p4", "h4"])
+            ch1 = _pick_pct(mv, ["ch1", "pct_1h", "change_1h", "chg_1h", "percentage_1h", "p1", "h1"])
+
+            # ✅ FIX: correct 24H USD volume (MarketVol does NOT have fut_vol_usd)
+            vol = float(usd_notional(mv) or 0.0)
+
+            # If still missing, compute from 1h candles (same logic as compute_metrics-style)
+            if (abs(ch4) < 1e-9 and abs(ch1) < 1e-9) and getattr(mv, "symbol", None):
+                try:
+                    c1 = fetch_ohlcv(mv.symbol, "1h", 6)
+                    if c1 and len(c1) >= 2:
+                        closes_1h = [float(x[4]) for x in c1]
+                        c_last = closes_1h[-1]
+                        c_prev1 = closes_1h[-2]
+                        c_prev4 = closes_1h[-5] if len(closes_1h) >= 5 else closes_1h[0]
+                        ch1 = ((c_last - c_prev1) / c_prev1) * 100.0 if c_prev1 else 0.0
+                        ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
+                except Exception:
+                    pass
+
+        except Exception:
+            continue
+
+        up_hit = (ch4 >= float(p4)) or (ch1 >= float(p1))
+        down_hit = (ch4 <= -float(p4)) or (ch1 <= -float(p1))
+
+        if not (up_hit or down_hit):
+            continue
+
+        # ✅ NEW: volume gate (skip low-volume coins completely)
+        if float(min_vol_usd or 0.0) > 0.0 and vol < float(min_vol_usd):
+            continue
+
+        if down_hit and not up_hit:
+            direction = "DOWN"
+        elif up_hit and not down_hit:
+            direction = "UP"
+        else:
+            direction = "UP" if ch1 >= 0 else "DOWN"
+
+        score_up = max(
+            (abs(ch4) / max(p4, 1e-9)) if ch4 > 0 else 0.0,
+            (abs(ch1) / max(p1, 1e-9)) if ch1 > 0 else 0.0,
+        )
+        score_dn = max(
+            (abs(ch4) / max(p4, 1e-9)) if ch4 < 0 else 0.0,
+            (abs(ch1) / max(p1, 1e-9)) if ch1 < 0 else 0.0,
+        )
+        score = max(score_up, score_dn)
+
+        out.append({
+            "symbol": sym,
+            "ch4": ch4,
+            "ch1": ch1,
+            "vol": vol,
+            "direction": direction,
+            "score": score,
+        })
+
+    out.sort(key=lambda x: (x["score"], x["vol"]), reverse=True)
+    return out[:max_items]
+
+
+def _spike_reversal_candidates(
+    best_fut: Dict[str, Any],
+    min_vol_usd: float = 15_000_000.0,
+    wick_ratio_min: float = 0.55,
+    atr_mult_min: float = 1.20,
+    max_items: int = 10,
+) -> List[dict]:
+    """
+    Detects wick-spike rejection in the direction opposite to the spike, aligned with the bigger trend.
+    Downtrend: upper-wick spike rejection -> SELL
+    Uptrend: lower-wick spike rejection -> BUY
+    """
+    out: List[dict] = []
+    if not best_fut:
+        return out
+
+    for base, mv in (best_fut or {}).items():
+        try:
+            sym_base = str(base).upper()
+            market_symbol = str(getattr(mv, "symbol", "") or "")
+            vol24 = float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+            if vol24 < float(min_vol_usd):
+                continue
+            if not market_symbol:
+                continue
+
+            # 1H candles for spike detection + ATR + trend
+            c1 = fetch_ohlcv(market_symbol, "1h", limit=max(ATR_PERIOD + 10, 220))
+            if not c1 or len(c1) < (ATR_PERIOD + 50):
+                continue
+
+            atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
+            if atr_1h <= 0:
+                continue
+
+            closes_1h = [float(x[4]) for x in c1]
+            ema50 = float(ema(closes_1h[-200:], 50) or 0.0)
+            ema200 = float(ema(closes_1h[-220:], 200) or 0.0)
+            if ema50 <= 0 or ema200 <= 0:
+                continue
+
+            uptrend = (ema50 > ema200)
+            downtrend = (ema50 < ema200)
+            if not (uptrend or downtrend):
+                continue
+
+            # Spike candle = most recent closed 1H candle
+            o = float(c1[-1][1]); h = float(c1[-1][2]); l = float(c1[-1][3]); c = float(c1[-1][4])
+            rng = max(1e-12, h - l)
+
+            upper_wick = h - max(o, c)
+            lower_wick = min(o, c) - l
+            upper_ratio = upper_wick / rng
+            lower_ratio = lower_wick / rng
+
+            big_range = (rng >= (atr_1h * float(atr_mult_min)))
+
+            
+            # 15m confirmation (stronger): last 15m close must confirm rejection
+            # SELL: close below spike mid (and preferably below spike open)
+            # BUY : close above spike mid (and preferably above spike open)
+            c15 = fetch_ohlcv(market_symbol, "15m", limit=60)
+            if not c15 or len(c15) < 12:
+                continue
+            c15_last_close = float(c15[-1][4])
+
+            spike_mid = (h + l) / 2.0
+            sell_confirm = (c15_last_close < spike_mid)
+            buy_confirm  = (c15_last_close > spike_mid)
+
+            # Downtrend: spike UP into resistance -> SELL reversal
+            if downtrend and big_range and upper_ratio >= float(wick_ratio_min) and c < o:
+                weak_confirm = (not sell_confirm)
+                # allow weak confirmations with lower confidence
+
+                entry = float(l)  # break of spike candle low
+                sl = float(h) + (0.10 * atr_1h)
+                r = max(1e-12, sl - entry)
+
+                tp1 = entry - 1.0 * r
+                tp2 = entry - 1.6 * r
+                tp3 = entry - 2.3 * r
+
+                conf = 82
+                if weak_confirm:
+                    conf -= 6
+                if (c - l) / rng < 0.40:
+                    conf += 4
+
+                out.append({
+                    "symbol": sym_base,
+                    "market_symbol": market_symbol,
+                    "side": "SELL",
+                    "direction": "DOWN",
+                    "conf": int(clamp(conf, 1, 99)),
+                    "entry": float(entry),
+                    "sl": float(sl),
+                    "tp1": float(tp1),
+                    "tp2": float(tp2),
+                    "tp3": float(tp3),
+                    "vol": float(vol24),
+                    "why": f"Downtrend (EMA50<EMA200). 1H upper-wick spike rejection (wick={upper_ratio:.2f}, range={rng/atr_1h:.2f} ATR). " + ("15m confirm: WEAK" if weak_confirm else "15m confirm: OK"),
+                })
+                continue
+
+            # Uptrend: spike DOWN into support -> BUY reversal
+            if uptrend and big_range and lower_ratio >= float(wick_ratio_min) and c > o:
+                weak_confirm = (not buy_confirm)
+                # allow weak confirmations with lower confidence
+
+                entry = float(h)  # break of spike candle high
+                sl = float(l) - (0.10 * atr_1h)
+                r = max(1e-12, entry - sl)
+
+                tp1 = entry + 1.0 * r
+                tp2 = entry + 1.6 * r
+                tp3 = entry + 2.3 * r
+
+                conf = 82
+                if weak_confirm:
+                    conf -= 6
+                if (h - c) / rng < 0.40:
+                    conf += 4
+
+                out.append({
+                    "symbol": sym_base,
+                    "market_symbol": market_symbol,
+                    "side": "BUY",
+                    "direction": "UP",
+                    "conf": int(clamp(conf, 1, 99)),
+                    "entry": float(entry),
+                    "sl": float(sl),
+                    "tp1": float(tp1),
+                    "tp2": float(tp2),
+                    "tp3": float(tp3),
+                    "vol": float(vol24),
+                    "why": f"Uptrend (EMA50>EMA200). 1H lower-wick spike rejection (wick={lower_ratio:.2f}, range={rng/atr_1h:.2f} ATR). " + ("15m confirm: WEAK" if weak_confirm else "15m confirm: OK"),
+                })
+                continue
+
+        except Exception:
+            continue
+
+    out = sorted(out, key=lambda x: (int(x.get("conf", 0)), float(x.get("vol", 0.0))), reverse=True)
+    return out[:max_items]
+
+
+
+def _spike_reversal_warnings(
+    best_fut: Dict[str, Any],
+    min_vol_usd: float = 15_000_000.0,
+    atr_mult_min: float = 1.05,
+    body_ratio_min: float = 0.50,
+    lookback_1h: int = 8,
+    retrace_min: float = 0.22,
+    max_items: int = 8,
+) -> List[dict]:
+    """
+    EARLY WARNING (non-trade):
+    Flags possible reversal zones after a recent 1H impulse (spike) when price starts
+    retracing and momentum cools, but BEFORE strict wick-rejection + 15m-confirm rules.
+
+    Output dict: {symbol, side, conf, vol, why}
+    """
+    out: List[dict] = []
+    if not best_fut:
+        return out
+
+    for base, mv in (best_fut or {}).items():
+        try:
+            sym_base = str(base).upper()
+            market_symbol = str(getattr(mv, "symbol", "") or "")
+            vol24 = float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+            if vol24 < float(min_vol_usd):
+                continue
+            if not market_symbol:
+                continue
+
+            c1 = fetch_ohlcv(market_symbol, "1h", limit=max(ATR_PERIOD + 10, 240))
+            if not c1 or len(c1) < (ATR_PERIOD + 60):
+                continue
+
+            atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
+            if atr_1h <= 0:
+                continue
+
+            closes_1h = [float(x[4]) for x in c1]
+            ema50 = float(ema(closes_1h[-200:], 50) or 0.0)
+            ema200 = float(ema(closes_1h[-220:], 200) or 0.0)
+            if ema50 <= 0 or ema200 <= 0:
+                continue
+
+            uptrend = (ema50 > ema200)
+            downtrend = (ema50 < ema200)
+
+            # find most recent impulse candle in lookback window
+            imp = None
+            for i in range(1, int(lookback_1h) + 1):
+                o = float(c1[-i][1]); h = float(c1[-i][2]); l = float(c1[-i][3]); c = float(c1[-i][4])
+                rng = max(1e-12, h - l)
+                body = abs(c - o)
+                if rng >= (atr_1h * float(atr_mult_min)) and (body / rng) >= float(body_ratio_min):
+                    imp = (i, o, h, l, c, rng, body)
+                    break
+            if not imp:
+                continue
+
+            i, oI, hI, lI, cI, rngI, bodyI = imp
+            impulse_up = (cI > oI)
+            impulse_dn = (cI < oI)
+            if not (impulse_up or impulse_dn):
+                continue
+
+            c0 = float(c1[-1][4])
+
+            # momentum cooling on 1H closes (soft)
+            cooling_dn = (float(c1[-1][4]) <= float(c1[-2][4]) <= float(c1[-3][4])) if len(c1) >= 3 else True
+            cooling_up = (float(c1[-1][4]) >= float(c1[-2][4]) >= float(c1[-3][4])) if len(c1) >= 3 else True
+
+            if impulse_up:
+                retrace = (hI - c0) / max(1e-12, rngI)
+                if retrace < float(retrace_min) or not cooling_dn:
+                    continue
+                trend_note = "Downtrend context. " if downtrend else ("Uptrend context. " if uptrend else "")
+                conf = 72 + int(clamp(retrace * 20.0, 0, 15))
+                out.append({
+                    "symbol": sym_base,
+                    "market_symbol": market_symbol,
+                    "side": "SELL",
+                    "conf": int(clamp(conf, 1, 99)),
+                    "vol": float(vol24),
+                    "why": f"{trend_note}Recent 1H impulse UP (range={rngI/atr_1h:.2f} ATR, body={bodyI/rngI:.2f}). Retrace={retrace:.2f}; cooling closes.",
+                })
+                continue
+
+            if impulse_dn:
+                retrace = (c0 - lI) / max(1e-12, rngI)
+                if retrace < float(retrace_min) or not cooling_up:
+                    continue
+                trend_note = "Uptrend context. " if uptrend else ("Downtrend context. " if downtrend else "")
+                conf = 72 + int(clamp(retrace * 20.0, 0, 15))
+                out.append({
+                    "symbol": sym_base,
+                    "market_symbol": market_symbol,
+                    "side": "BUY",
+                    "conf": int(clamp(conf, 1, 99)),
+                    "vol": float(vol24),
+                    "why": f"{trend_note}Recent 1H impulse DOWN (range={rngI/atr_1h:.2f} ATR, body={bodyI/rngI:.2f}). Retrace={retrace:.2f}; cooling closes.",
+                })
+                continue
+
+        except Exception:
+            continue
+
+    out = sorted(out, key=lambda x: (int(x.get("conf", 0)), float(x.get("vol", 0.0))), reverse=True)
+    return out[:max_items]
+
+def symbol_flip_guard_active(
+    user_id: int,
+    symbol: str,
+    side: str,
+    session_name: str,
+) -> bool:
+    """
+    Blocks opposite-direction alerts for the same symbol for a period.
+    Uses (session cooldown hours * FLIP_GUARD_MULT).
+    """
+    if not FLIP_GUARD_ENABLED:
+        return False
+
+    cooldown_hours = float(cooldown_hours_for_session(session_name)) * float(FLIP_GUARD_MULT)
+    opposite = "SELL" if str(side).upper() == "BUY" else "BUY"
+
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT emailed_ts
+        FROM emailed_symbols
+        WHERE user_id=? AND symbol=? AND side=?
+    """, (int(user_id), str(symbol).upper(), opposite))
+    row = cur.fetchone()
+    con.close()
+
+    if not row:
+        return False
+
+    last_ts = float(row["emailed_ts"])
+    return (time.time() - last_ts) < (cooldown_hours * 3600.0)
+
+
+def list_cooldowns(user_id: int) -> List[dict]:
+    """
+    Returns list of cooldown stamps for user:
+    [{symbol, side, session, emailed_ts}, ...]
+    """
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT symbol, side, session, emailed_ts
+        FROM emailed_symbols
+        WHERE user_id=?
+        ORDER BY emailed_ts DESC
+    """, (int(user_id),))
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def _fmt_dur(seconds: float) -> str:
+    s = int(max(0, seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    if h <= 0:
+        return f"{m}m"
+    return f"{h}h {m}m"
+
+def _email_daily_get(user_id: int, day_local: str) -> int:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT sent_count FROM email_daily WHERE user_id=? AND day_local=?", (user_id, day_local))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO email_daily (user_id, day_local, sent_count) VALUES (?, ?, ?)", (user_id, day_local, 0))
+        con.commit()
+        con.close()
+        return 0
+    con.close()
+    return int(row["sent_count"])
+
+def _email_daily_inc(user_id: int, day_local: str, inc: int = 1):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO email_daily (user_id, day_local, sent_count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, day_local) DO UPDATE SET sent_count = sent_count + excluded.sent_count
+    """, (user_id, day_local, int(inc)))
+    con.commit()
+    con.close()
+
+def _risk_daily_get(user_id: int, day_local: str) -> float:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT used_risk_usd FROM risk_daily WHERE user_id=? AND day_local=?", (user_id, day_local))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO risk_daily (user_id, day_local, used_risk_usd) VALUES (?, ?, ?)", (user_id, day_local, 0.0))
+        con.commit()
+        con.close()
+        return 0.0
+    con.close()
+    return float(row["used_risk_usd"])
+
+def _risk_daily_inc(user_id: int, day_local: str, inc_usd: float):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO risk_daily (user_id, day_local, used_risk_usd)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, day_local) DO UPDATE SET used_risk_usd = used_risk_usd + excluded.used_risk_usd
+    """, (user_id, day_local, float(inc_usd)))
+    con.commit()
+    con.close()
+
+def _user_day_local(user: dict) -> str:
+    tz_name = str(user.get("tz") or user.get("timezone") or "UTC").strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    return datetime.now(tz).date().isoformat()
+
+
+def _day_local_for_ts(user: dict, ts: float) -> str:
+    tz_name = str(user.get("tz") or user.get("timezone") or "UTC").strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    try:
+        return datetime.fromtimestamp(float(ts), tz).date().isoformat()
+    except Exception:
+        return datetime.now(tz).date().isoformat()
+
+def _risk_used_today_from_open_trades(user_id: int, user: dict, day_local: str) -> float:
+    # Use CURRENT open risk (not historical) so RF/close instantly frees capacity.
+    try:
+        opens = db_open_trades(user_id) or []
+    except Exception:
+        opens = []
+    total = 0.0
+    for t in opens:
+        try:
+            if _day_local_for_ts(user, float(t.get("opened_ts") or 0.0)) != str(day_local):
+                continue
+            total += float(t.get("risk_usd") or 0.0)
+        except Exception:
+            continue
+    return float(max(0.0, total))
+
+def _risk_daily_sync(user_id: int, user: dict) -> float:
+    # Make risk_daily consistent even if a trade was logged before risk_daily updates ran.
+    day_local = _user_day_local(user)
+    used = _risk_used_today_from_open_trades(user_id, user, day_local)
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO risk_daily (user_id, day_local, used_risk_usd) VALUES (?, ?, ?) "
+        "ON CONFLICT(user_id, day_local) DO UPDATE SET used_risk_usd=excluded.used_risk_usd",
+        (int(user_id), str(day_local), float(used)),
+    )
+    con.commit()
+    con.close()
+    return float(used)
+
+def _pnl_today_closed_trades(user_id: int, user: dict) -> float:
+    """Sum of realized PnL for trades CLOSED today (user local day)."""
+    day_local = _user_day_local(user)
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT pnl AS pnl, closed_ts FROM trades WHERE user_id=? AND closed_ts IS NOT NULL",
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    total = 0.0
+    for r in rows:
+        try:
+            pnl = float(r["pnl"] or 0.0)
+            cts = float(r["closed_ts"] or 0.0)
+            if cts <= 0:
+                continue
+            if _day_local_for_ts(user, cts) != str(day_local):
+                continue
+            total += pnl
+        except Exception:
+            continue
+    return float(total)
+
+def _risk_used_total_today(user_id: int, user: dict) -> float:
+    """Daily used risk = open risk from trades opened today + realized losses today (PnL<0)."""
+    day_local = _user_day_local(user)
+    open_risk = _risk_used_today_from_open_trades(user_id, user, day_local)
+    pnl_today = _pnl_today_closed_trades(user_id, user)
+    loss_today = max(0.0, -float(pnl_today))
+    return float(max(0.0, open_risk + loss_today))
+
+
+
+
+def db_insert_signal(s: Setup):
+    """Upsert a setup into DB (signals table). Adds market_symbol when available."""
+    con = db_connect()
+    cur = con.cursor()
+    try:
+        cur.execute("""
+            INSERT OR REPLACE INTO signals (
+                setup_id, created_ts, symbol, market_symbol, side, conf, entry, sl, tp1, tp2, tp3,
+                fut_vol_usd, ch24, ch4, ch1, ch15
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            s.setup_id, s.created_ts, s.symbol, getattr(s, "market_symbol", None),
+            s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
+            s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+        ))
+    except Exception:
+        # Backward-compatible (older DB without market_symbol column)
+        cur.execute("""
+            INSERT OR REPLACE INTO signals (
+                setup_id, created_ts, symbol, side, conf, entry, sl, tp1, tp2, tp3,
+                fut_vol_usd, ch24, ch4, ch1, ch15
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            s.setup_id, s.created_ts, s.symbol, s.side, s.conf, s.entry, s.sl,
+            s.tp1, s.tp2, s.tp3, s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+        ))
+    con.commit()
+    con.close()
+
+def db_get_signal(setup_id: str) -> Optional[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM signals WHERE setup_id=?", (setup_id.strip(),))
+    row = cur.fetchone()
+    con.close()
+    return dict(row) if row else None
+
+def db_list_signals_since(ts_from: float) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM signals WHERE created_ts>=? ORDER BY created_ts ASC", (ts_from,))
+    rows = cur.fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+# =========================================================
+# SIGNAL EVALUATION (EMAIL -> OUTCOME TABLE)
+# =========================================================
+
+def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts: float):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """INSERT OR REPLACE INTO emailed_setups (user_id, setup_id, session, emailed_ts)
+           VALUES (?, ?, ?, ?)""",
+        (int(user_id), str(setup_id).strip(), str(session or ""), float(emailed_ts)),
+    )
+    con.commit()
+    con.close()
+
+
+
+def db_recent_generated_setups(user_id: int, source: str, lookback_hours: int = 6, limit: int = 5) -> list[dict]:
+    """Fetch recent generated_setups rows for UI correlation (/screen showing email setups too)."""
+    try:
+        cutoff = time.time() - float(lookback_hours) * 3600.0
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute("""
+            SELECT setup_id, session, symbol, side, conf, created_ts
+            FROM generated_setups
+            WHERE user_id = ?
+              AND source = ?
+              AND created_ts >= ?
+            ORDER BY created_ts DESC
+            LIMIT ?
+        """, (int(user_id), str(source).strip().lower(), float(cutoff), int(limit)))
+        rows = cur.fetchall() or []
+        con.close()
+        out = []
+        for r in rows:
+            sid, sess, sym, side, conf, ts = r
+            out.append({
+                "setup_id": sid,
+                "session": sess,
+                "symbol": sym,
+                "side": side,
+                "conf": int(conf or 0),
+                "created_ts": float(ts or 0.0),
+            })
+        return out
+    except Exception:
+        return []
+
+def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
+    """Log a generated setup (from /screen) or a sent setup (email) for correlation."""
+    con = None
+    try:
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute(
+            """INSERT INTO generated_setups
+               (user_id, source, created_ts, session, setup_id, symbol, side, conf)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(user_id),
+                str(source or "").strip().lower(),
+                float(time.time()),
+                str(session or ""),
+                str(getattr(s, "setup_id", "") or ""),
+                str(getattr(s, "symbol", "") or ""),
+                str(getattr(s, "side", "") or ""),
+                int(getattr(s, "conf", 0) or 0),
+            ),
+        )
+        con.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            if con:
+                con.close()
+        except Exception:
+            pass
+
+def db_list_emailed_setups(user_id: int, ts_from: float) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """SELECT setup_id, session, emailed_ts
+           FROM emailed_setups
+           WHERE user_id=? AND emailed_ts>=?
+           ORDER BY emailed_ts ASC""",
+        (int(user_id), float(ts_from)),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+
+
+def db_list_autotrade_trades(user_id: int, ts_from: float) -> List[dict]:
+    """Autotrade trades opened by the bot (journal)."""
+    con = db_connect()
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute(
+        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status, closed_ts, outcome, pnl_usdt AS pnl
+           FROM autotrade_trades
+           WHERE uid=? AND opened_ts>=?
+           ORDER BY opened_ts ASC""",
+        (int(user_id), int(ts_from)),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+def db_list_autotrade_trades_all(user_id: int) -> List[dict]:
+    con = db_connect()
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute(
+        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status, closed_ts, outcome, pnl_usdt AS pnl
+           FROM autotrade_trades
+           WHERE uid=?
+           ORDER BY opened_ts ASC""",
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+
+
+def db_list_emailed_setups_all(user_id: int) -> List[dict]:
+    """All emailed setups for a user (no time filter)."""
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """SELECT setup_id, session, emailed_ts
+           FROM emailed_setups
+           WHERE user_id=?
+           ORDER BY emailed_ts ASC""",
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+def db_list_outcomes_for_user(user_id: int) -> List[dict]:
+    """Join emailed_setups -> signal_outcomes for a user. Only setups that have an outcome row."""
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """SELECT e.setup_id, e.session, e.emailed_ts,
+                  o.outcome, o.hit_level, o.hit_ts, o.best_level, o.best_ts, o.horizon_hours, o.evaluated_ts, o.note
+           FROM emailed_setups e
+           JOIN signal_outcomes o ON o.setup_id = e.setup_id
+           WHERE e.user_id=?
+           ORDER BY e.emailed_ts ASC""",
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+def db_get_outcome(setup_id: str) -> Optional[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM signal_outcomes WHERE setup_id=?", (str(setup_id).strip(),))
+    row = cur.fetchone()
+    con.close()
+    return dict(row) if row else None
+
+def db_upsert_outcome(setup_id: str, outcome: str, hit_level: str, hit_ts: Optional[float],
+                      horizon_hours: int, note: str = "", best_level: str = "", best_ts: Optional[float] = None):
+    con = db_connect()
+    cur = con.cursor()
+
+    # Backward compatible: if DB hasn't been migrated yet, insert only legacy columns.
+    try:
+        cols = [r["name"] for r in cur.execute("PRAGMA table_info(signal_outcomes)").fetchall()]
+    except Exception:
+        cols = []
+
+    if "best_level" in cols and "best_ts" in cols:
+        cur.execute(
+            """INSERT OR REPLACE INTO signal_outcomes
+               (setup_id, outcome, hit_level, hit_ts, evaluated_ts, horizon_hours, note, best_level, best_ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(setup_id).strip(),
+                str(outcome),
+                str(hit_level or ""),
+                (float(hit_ts) if hit_ts is not None else None),
+                float(time.time()),
+                int(horizon_hours),
+                str(note or ""),
+                str(best_level or ""),
+                (float(best_ts) if best_ts is not None else None),
+            ),
+        )
+    else:
+        cur.execute(
+            """INSERT OR REPLACE INTO signal_outcomes
+               (setup_id, outcome, hit_level, hit_ts, evaluated_ts, horizon_hours, note)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(setup_id).strip(),
+                str(outcome),
+                str(hit_level or ""),
+                (float(hit_ts) if hit_ts is not None else None),
+                float(time.time()),
+                int(horizon_hours),
+                str(note or ""),
+            ),
+        )
+    con.commit()
+    con.close()
+
+def _market_symbol_from_base(base: str) -> Optional[str]:
+    """Best-effort mapping base -> ccxt market symbol used by the bot (swap)."""
+    try:
+        b = str(base or "").upper().strip()
+        if not b:
+            return None
+        ex = get_exchange()
+        # Prefer Bybit linear swap format in ccxt, e.g. BTC/USDT:USDT
+        for cand in (f"{b}/USDT:USDT", f"{b}/USDT"):
+            if cand in getattr(ex, "markets", {}):
+                return cand
+        # Fallback: find any market whose base matches + quote USDT
+        for sym, m in (getattr(ex, "markets", {}) or {}).items():
+            try:
+                if str(m.get("base", "")).upper() == b and str(m.get("quote", "")).upper() == "USDT":
+                    return sym
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+def fetch_ohlcv_paged(symbol: str, timeframe: str, since_ms: int, until_ms: int, limit: int = 1000) -> List[List[float]]:
+    """Fetch OHLCV with pagination (best effort). Returns candles in ascending time."""
+    ex = get_exchange()
+    out: List[List[float]] = []
+    cur_since = int(since_ms)
+    # Safety limits
+    max_loops = 40
+    for _ in range(max_loops):
+        try:
+            chunk = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=cur_since, limit=limit) or []
+        except Exception:
+            break
+        if not chunk:
+            break
+        # ensure ascending
+        chunk = sorted(chunk, key=lambda r: r[0])
+        # stop if stuck
+        if out and chunk[0][0] <= out[-1][0] and len(chunk) == 1:
+            break
+        # append new only
+        for c in chunk:
+            if not out or c[0] > out[-1][0]:
+                out.append(c)
+        last_ts = out[-1][0]
+        if last_ts >= until_ms:
+            break
+        # advance since by 1 ms to avoid duplicates
+        cur_since = int(last_ts + 1)
+        # If chunk is tiny, likely end
+        if len(chunk) < max(10, int(limit * 0.2)):
+            break
+    return out
+
+def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: str = "1m") -> dict:
+    """Evaluate TP/SL touches using OHLCV data (best effort).
+
+    IMPORTANT:
+    - We compute BOTH:
+        1) first_decision: earliest decisive touch (LOSS if SL before TP1, else TP1).
+        2) best_reached: highest TP level reached BEFORE SL (if SL happens after TP1, TP1 still counts).
+    - This solves the "always TP1" issue: trades often hit TP1 first, then TP2/TP3 later.
+
+    Returns:
+      {
+        outcome: one of WIN_TP1/WIN_TP2/WIN_TP3/LOSS/OPEN/AMBIGUOUS,
+        hit_level: SL/TP1/TP2/TP3/NONE/MIXED,
+        hit_ts: epoch seconds of the FIRST decisive touch,
+        best_level: NONE/TP1/TP2/TP3,
+        best_ts: epoch seconds of BEST TP touch (if any),
+        note: str
+      }
+    """
+    side = str(setup.get("side") or "").upper().strip()
+    entry = float(setup.get("entry") or 0.0)
+    sl = float(setup.get("sl") or 0.0)
+    tp1 = setup.get("tp1")
+    tp2 = setup.get("tp2")
+    tp3 = float(setup.get("tp3") or 0.0)
+
+    # Ensure TP1/TP2 exist (derive if missing)
+    t1, t2, t3 = _ensure_three_tps(entry, sl, tp3, tp1, tp2, side)
+
+    created_ts = float(setup.get("created_ts") or 0.0)
+    market_symbol = str(setup.get("market_symbol") or "").strip() or _market_symbol_from_base(setup.get("symbol"))
+    if not market_symbol:
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "missing_market_symbol"}
+    if created_ts <= 0:
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "missing_created_ts"}
+
+    since_ms = int(created_ts * 1000)
+    until_ms = int(min(time.time(), created_ts + horizon_hours * 3600) * 1000)
+
+    candles = fetch_ohlcv_paged(market_symbol, timeframe, since_ms=since_ms, until_ms=until_ms, limit=1000)
+    if not candles:
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "no_ohlcv"}
+
+    # Find earliest touch times for each level
+    t_sl_ts = None
+    t_tp1_ts = None
+    t_tp2_ts = None
+    t_tp3_ts = None
+
+    # Also detect "mixed" candles where SL and TP are both within the same candle range.
+    # If the FIRST decisive candle is mixed, we return AMBIGUOUS.
+    mixed_first_ts = None
+
+    for c in candles:
+        try:
+            ts_ms, o, h, l, cl, v = c
+            hi = float(h)
+            lo = float(l)
+        except Exception:
+            continue
+
+        ts_s = ts_ms / 1000.0
+
+        if side == "BUY":
+            hit_sl = lo <= sl
+            hit1 = hi >= t1
+            hit2 = hi >= t2
+            hit3 = hi >= t3
+        else:  # SELL
+            hit_sl = hi >= sl
+            hit1 = lo <= t1
+            hit2 = lo <= t2
+            hit3 = lo <= t3
+
+        # earliest SL
+        if hit_sl and t_sl_ts is None:
+            t_sl_ts = ts_s
+
+        # earliest TPs
+        if hit1 and t_tp1_ts is None:
+            t_tp1_ts = ts_s
+        if hit2 and t_tp2_ts is None:
+            t_tp2_ts = ts_s
+        if hit3 and t_tp3_ts is None:
+            t_tp3_ts = ts_s
+
+        # record first mixed (SL + any TP in same candle)
+        if hit_sl and (hit1 or hit2 or hit3):
+            if mixed_first_ts is None:
+                mixed_first_ts = ts_s
+
+        # small optimization: if we've got all earliest times, stop scanning
+        if (t_sl_ts is not None) and (t_tp1_ts is not None) and (t_tp2_ts is not None) and (t_tp3_ts is not None):
+            break
+
+    # If nothing touched
+    if (t_sl_ts is None) and (t_tp1_ts is None) and (t_tp2_ts is None) and (t_tp3_ts is None):
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "horizon_not_hit"}
+
+    # Determine FIRST decisive touch:
+    # - LOSS if SL happens before TP1 (or TP1 never happens)
+    # - otherwise first decision is TP1 (even if TP2/TP3 also later)
+    # If the earliest decisive candle is "mixed", return AMBIGUOUS.
+    first_ts = None
+    first_level = None
+
+    if t_tp1_ts is None:
+        # no TP1 at all; if SL happened -> loss, else open
+        if t_sl_ts is not None:
+            first_ts, first_level = t_sl_ts, "SL"
+        else:
+            return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "no_tp1_and_no_sl"}
+    else:
+        # TP1 exists
+        if (t_sl_ts is not None) and (t_sl_ts < t_tp1_ts):
+            first_ts, first_level = t_sl_ts, "SL"
+        else:
+            first_ts, first_level = t_tp1_ts, "TP1"
+
+    # Mixed-candle ambiguity only matters if it coincides with the first decisive timestamp
+    if mixed_first_ts is not None and first_ts is not None:
+        # If the first decisive candle is mixed (timestamps equal), can't know which hit first
+        # Candles are 1m; treat within same minute as ambiguous.
+        if abs(mixed_first_ts - first_ts) < 0.9:
+            return {"outcome": "AMBIGUOUS", "hit_level": "MIXED", "hit_ts": first_ts, "best_level": "NONE", "best_ts": None, "note": "tp_and_sl_same_candle"}
+
+    # Determine BEST TP reached BEFORE SL (if SL never happened, use best TP reached within horizon)
+    best_level = "NONE"
+    best_ts = None
+
+    # Only count TPs that occur BEFORE SL (if SL exists). If SL occurs after TP1, TP1 still counts.
+    def _tp_ok(tp_ts):
+        if tp_ts is None:
+            return False
+        if t_sl_ts is None:
+            return True
+        return tp_ts < t_sl_ts  # reached before SL
+
+    if _tp_ok(t_tp3_ts):
+        best_level, best_ts = "TP3", t_tp3_ts
+    elif _tp_ok(t_tp2_ts):
+        best_level, best_ts = "TP2", t_tp2_ts
+    elif _tp_ok(t_tp1_ts):
+        best_level, best_ts = "TP1", t_tp1_ts
+
+    # Final outcome:
+    if first_level == "SL":
+        return {"outcome": "LOSS", "hit_level": "SL", "hit_ts": first_ts, "best_level": best_level, "best_ts": best_ts, "note": ""}
+    if best_level == "TP3":
+        return {"outcome": "WIN_TP3", "hit_level": "TP1", "hit_ts": first_ts, "best_level": "TP3", "best_ts": best_ts, "note": ""}
+    if best_level == "TP2":
+        return {"outcome": "WIN_TP2", "hit_level": "TP1", "hit_ts": first_ts, "best_level": "TP2", "best_ts": best_ts, "note": ""}
+    if best_level == "TP1":
+        return {"outcome": "WIN_TP1", "hit_level": "TP1", "hit_ts": first_ts, "best_level": "TP1", "best_ts": best_ts, "note": ""}
+    # If TP1 happened but SL later and TP1 wasn't before SL (shouldn't happen) -> open/edge
+    return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "edge_case"}
+
+
+def _next_public_trade_id(user_id: int) -> int:
+    """Sequential per-user Trade ID shown to the user (starts at 1)."""
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS trade_id_seq (user_id INTEGER PRIMARY KEY, last_id INTEGER NOT NULL)")
+    cur.execute("SELECT last_id FROM trade_id_seq WHERE user_id=?", (int(user_id),))
+    row = cur.fetchone()
+    if row:
+        next_id = int(row["last_id"]) + 1
+        cur.execute("UPDATE trade_id_seq SET last_id=? WHERE user_id=?", (int(next_id), int(user_id)))
+    else:
+        next_id = 1
+        cur.execute("INSERT INTO trade_id_seq(user_id,last_id) VALUES(?,?)", (int(user_id), 1))
+    con.commit()
+    con.close()
+    return int(next_id)
+
+
+def _reset_public_trade_id(user_id: int):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS trade_id_seq (user_id INTEGER PRIMARY KEY, last_id INTEGER NOT NULL)")
+    cur.execute("INSERT OR REPLACE INTO trade_id_seq(user_id,last_id) VALUES(?,?)", (int(user_id), 0))
+    con.commit()
+    con.close()
+
+def db_trade_open(user_id: int, symbol: str, side: str, entry: float, sl: float,
+                  risk_usd: float, qty: float, note: str = "", signal_id: str = "") -> int:
+    # Public per-user Trade ID (start at 1; resettable)
+    public_id = _next_public_trade_id(user_id)
+
+    con = db_connect()
+    cur = con.cursor()
+
+    # Ensure column exists (for older DBs)
+    try:
+        cols_trades = [r[1] for r in cur.execute("PRAGMA table_info(trades)").fetchall()]
+        if "public_id" not in cols_trades:
+            cur.execute("ALTER TABLE trades ADD COLUMN public_id INTEGER")
+    except Exception:
+        pass
+
+    cur.execute("""
+        INSERT INTO trades (user_id, public_id, symbol, side, entry, sl, risk_usd, qty, opened_ts, note, signal_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id, int(public_id), symbol.upper(), side.upper(), float(entry), float(sl),
+        float(risk_usd), float(qty), time.time(), note, signal_id
+    ))
+    con.commit()
+    con.close()
+    return int(public_id)
+
+def db_trade_close(user_id: int, trade_id: int, pnl: float) -> Optional[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM trades WHERE public_id=? AND user_id=? AND closed_ts IS NULL", (trade_id, user_id))
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        return None
+    t = dict(row)
+
+    risk = float(t["risk_usd"]) if float(t["risk_usd"]) != 0 else 0.0
+    r_mult = (float(pnl) / risk) if risk > 0 else None
+
+    cur.execute("""
+        UPDATE trades
+        SET closed_ts=?, pnl=?, r_mult=?
+        WHERE public_id=? AND user_id=?
+    """, (time.time(), float(pnl), r_mult, trade_id, user_id))
+    con.commit()
+    con.close()
+
+    t["pnl"] = float(pnl)
+    t["r_mult"] = r_mult
+    return t
+
+def db_open_trades(user_id: int) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM trades WHERE user_id=? AND closed_ts IS NULL ORDER BY opened_ts ASC", (user_id,))
+    rows = cur.fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+def db_trades_since(user_id: int, ts_from: float) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT * FROM trades
+        WHERE user_id=? AND opened_ts>=?
+        ORDER BY opened_ts ASC
+    """, (user_id, ts_from))
+    rows = cur.fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def db_trades_closed_today(user_id: int, user: dict) -> List[dict]:
+    """Trades CLOSED today (user local day), regardless of when they were opened."""
+    day_local = str(_user_day_local(user))
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT * FROM trades
+        WHERE user_id=? AND closed_ts IS NOT NULL
+        ORDER BY closed_ts ASC
+        """,
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    out = []
+    for r in rows:
+        try:
+            d = dict(r)
+            cts = float(d.get("closed_ts") or 0.0)
+            if cts <= 0:
+                continue
+            if _day_local_for_ts(user, cts) != day_local:
+                continue
+            out.append(d)
+        except Exception:
+            continue
+    return out
+
+def db_trades_all(user_id: int) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT * FROM trades
+        WHERE user_id=?
+        ORDER BY opened_ts ASC
+    """, (int(user_id),))
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+def _profit_factor(trades: List[dict]) -> Optional[float]:
+    closed = [t for t in trades if t.get("closed_ts") is not None and t.get("pnl") is not None]
+    if not closed:
+        return None
+    gp = sum(float(t["pnl"]) for t in closed if float(t["pnl"]) > 0)
+    gl = abs(sum(float(t["pnl"]) for t in closed if float(t["pnl"]) < 0))
+    if gl <= 0:
+        return None if gp <= 0 else float("inf")
+    return gp / gl
+
+def _expectancy_r(trades: List[dict]) -> Optional[float]:
+    closed = [t for t in trades if t.get("closed_ts") is not None and t.get("r_mult") is not None]
+    if not closed:
+        return None
+    rs = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
+    return (sum(rs) / len(rs)) if rs else None
+
+async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return
+
+    trades = db_trades_all(uid)
+    stats = _stats_from_trades(trades)
+
+    pf = _profit_factor(trades)
+    exp_r = _expectancy_r(trades)
+
+    msg = [
+        "📊 Overall Report (ALL TIME)",
+        HDR,
+        f"Closed: {stats['closed_n']} | Wins: {stats['wins']} | Losses: {stats['losses']}",
+        f"Win rate: {stats['win_rate']:.1f}%",
+        f"Net PnL: {stats['net']:+.2f}",
+        f"Avg R: {stats['avg_r']:+.2f}" if stats["avg_r"] is not None else "Avg R: -",
+        f"Expectancy (R): {exp_r:+.2f}" if exp_r is not None else "Expectancy (R): -",
+        f"Profit Factor: {pf:.2f}" if (pf is not None and pf != float('inf')) else ("Profit Factor: ∞" if pf == float('inf') else "Profit Factor: -"),
+        f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
+        HDR,
+        f"Equity (current): ${float(user['equity']):.2f}",
+    ]
+
+    await update.message.reply_text("\n".join(msg))
+
+# =========================================================
+# EXCHANGE HELPERS (FAST: singleton exchange + no repeated load_markets)
+# =========================================================
+import threading
+_EX: Optional[ccxt.Exchange] = None
+_EX_LOCK = threading.Lock()
+_EX_MARKETS_LOADED = False
+
+def get_exchange() -> ccxt.Exchange:
+    """
+    ✅ SINGLETON exchange instance
+    - Avoids building a new exchange per request
+    - Avoids calling load_markets() repeatedly
+    """
+    global _EX, _EX_MARKETS_LOADED
+    with _EX_LOCK:
+        if _EX is None:
+            klass = ccxt.__dict__[EXCHANGE_ID]
+            _EX = klass({
+                "enableRateLimit": True,
+                "timeout": 20000,
+                "options": {"defaultType": DEFAULT_TYPE},
+            })
+            _EX_MARKETS_LOADED = False
+
+        if not _EX_MARKETS_LOADED:
+            _EX.load_markets()
+            _EX_MARKETS_LOADED = True
+
+        return _EX
+
+def safe_split_symbol(sym: Optional[str]) -> Optional[Tuple[str, str]]:
+    if not sym:
+        return None
+    pair = sym.split(":")[0]
+    if "/" not in pair:
+        return None
+    return tuple(pair.split("/", 1))
+
+def usd_notional(mv: MarketVol) -> float:
+    if mv.quote in STABLES and mv.quote_vol:
+        return float(mv.quote_vol)
+    price = mv.vwap if mv.vwap else mv.last
+    if not price or not mv.base_vol:
+        return 0.0
+    return float(mv.base_vol) * float(price)
+
+def to_mv(t: dict) -> Optional[MarketVol]:
+    sym = t.get("symbol")
+    sp = safe_split_symbol(sym)
+    if not sp:
+        return None
+    base, quote = sp
+    return MarketVol(
+        symbol=sym,
+        base=base,
+        quote=quote,
+        last=float(t.get("last") or 0.0),
+        open=float(t.get("open") or 0.0),
+        percentage=float(t.get("percentage") or 0.0),
+        base_vol=float(t.get("baseVolume") or 0.0),
+        quote_vol=float(t.get("quoteVolume") or 0.0),
+        vwap=float(t.get("vwap") or 0.0),
+    )
+
+
+def get_cached_futures_tickers() -> Dict[str, MarketVol]:
+    """Fast, no-network accessor for last known futures tickers.
+
+    Used by instant commands like /size and /status to avoid blocking on CCXT calls.
+    Returns {} if nothing has been cached yet.
+    """
+    try:
+        obj = cache_get("tickers_best_fut")
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+def fetch_futures_tickers() -> Dict[str, MarketVol]:
+    """
+    ✅ Uses singleton exchange (no repeated load_markets)
+    """
+    if cache_valid("tickers_best_fut", TICKERS_TTL_SEC):
+        return cache_get("tickers_best_fut")
+
+    ex = get_exchange()
+    tickers = ex.fetch_tickers()
+
+    best: Dict[str, MarketVol] = {}
+    for t in tickers.values():
+        mv = to_mv(t)
+        if not mv:
+            continue
+        if mv.quote not in STABLES:
+            continue
+        if mv.base not in best or usd_notional(mv) > usd_notional(best[mv.base]):
+            best[mv.base] = mv
+
+    cache_set("tickers_best_fut", best)
+    return best
+
+def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
+    """
+    ✅ Uses singleton exchange (no repeated build + load_markets)
+    ✅ TTL cache already exists
+    """
+    key = f"ohlcv:{symbol}:{timeframe}:{limit}"
+    if cache_valid(key, OHLCV_TTL_SEC):
+        return cache_get(key)
+
+    ex = get_exchange()
+    data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
+    cache_set(key, data)
+    return data
+
+
+def ema7_1h_distance_pct(market_symbol: str) -> Tuple[float, float, float]:
+    """
+    Returns (dist_pct, last_close, ema7_1h).
+    dist_pct is absolute percent distance between last close and EMA7 on 1H candles.
+    """
+    try:
+        c1 = fetch_ohlcv(market_symbol, "1h", limit=40)
+        if not c1 or len(c1) < 10:
+            return 999.0, 0.0, 0.0
+        closes = [float(x[4]) for x in c1]
+        last_close = float(closes[-1])
+        # lightweight EMA
+        period = 7
+        k = 2.0 / (period + 1.0)
+        ema = float(closes[0])
+        for v in closes[1:]:
+            ema = (float(v) * k) + (ema * (1.0 - k))
+        if ema == 0.0:
+            return 999.0, last_close, ema
+        dist_pct = abs((last_close - ema) / ema) * 100.0
+        return dist_pct, last_close, ema
+    except Exception:
+        return 999.0, 0.0, 0.0
+
+
+def ema7_1h_is_close(market_symbol: str, max_dist_pct: float = EMA7_1H_MAX_DIST_PCT) -> Tuple[bool, float, float, float]:
+    dist_pct, last_close, ema = ema7_1h_distance_pct(market_symbol)
+    return (dist_pct <= float(max_dist_pct)), dist_pct, last_close, ema
+
+
+
+# =========================================================
+# EMA ANCHOR PROXIMITY GATE (DYNAMIC)
+# - Instead of hard-gating only EMA7 on 1H, we allow the engine to anchor
+#   around the *closest* EMA among a small set of periods on 1H.
+# - This keeps your original intention (avoid "far from EMA" signals)
+#   but prevents starving signals when EMA7 is not the relevant magnet.
+# =========================================================
+
+# Periods to consider as potential "magnet" EMAs on 1H candles.
+EMA_ANCHOR_1H_PERIODS = [7, 13, 21]
+
+# Base max distance (%) used for EMA7. Longer EMAs get a slightly wider allowance.
+# Example with default EMA7_1H_MAX_DIST_PCT=0.35:
+#   EMA7  -> 0.35%
+#   EMA13 -> ~0.48%
+#   EMA21 -> ~0.61%
+EMA_ANCHOR_BASE_MAX_DIST_PCT = EMA7_1H_MAX_DIST_PCT
+
+def _ema_last(closes: List[float], period: int) -> float:
+    """Lightweight EMA last value (no full series)."""
+    if not closes or len(closes) < max(3, period):
+        return 0.0
+    k = 2.0 / (period + 1.0)
+    ema = float(closes[0])
+    for v in closes[1:]:
+        ema = (float(v) * k) + (ema * (1.0 - k))
+    return float(ema)
+
+def ema_anchor_1h_distance_pct(
+    market_symbol: str,
+    periods: Optional[List[int]] = None,
+) -> Tuple[float, float, float, int]:
+    """Return (best_dist_pct, last_close, best_ema, best_period) for 1H EMA anchors."""
+    try:
+        ps = periods or EMA_ANCHOR_1H_PERIODS
+        c1 = fetch_ohlcv(market_symbol, "1h", limit=60)
+        if not c1 or len(c1) < 20:
+            return 999.0, 0.0, 0.0, 0
+        closes = [float(x[4]) for x in c1]
+        last_close = float(closes[-1])
+
+        best = (999.0, 0.0, 0)  # (dist_pct, ema, period)
+        for p in ps:
+            try:
+                ema = _ema_last(closes, int(p))
+                if not ema:
+                    continue
+                dist_pct = abs((last_close - ema) / ema) * 100.0
+                if dist_pct < best[0]:
+                    best = (dist_pct, ema, int(p))
+            except Exception:
+                continue
+
+        return float(best[0]), float(last_close), float(best[1]), int(best[2])
+    except Exception:
+        return 999.0, 0.0, 0.0, 0
+
+def ema_anchor_1h_is_close(
+    market_symbol: str,
+    base_max_dist_pct: float = EMA_ANCHOR_BASE_MAX_DIST_PCT,
+    periods: Optional[List[int]] = None,
+) -> Tuple[bool, float, float, float, int, float]:
+    """Return (ok, dist_pct, last_close, ema, period, allowed_max_pct)."""
+    dist_pct, last_close, ema, period = ema_anchor_1h_distance_pct(market_symbol, periods=periods)
+    # widen allowance slightly for longer EMAs
+    try:
+        p = int(period or 7)
+        allowed = float(base_max_dist_pct) * ((p / 7.0) ** 0.5)
+    except Exception:
+        allowed = float(base_max_dist_pct)
+    ok = (dist_pct <= allowed)
+    return ok, float(dist_pct), float(last_close), float(ema), int(period or 0), float(allowed)
+
+# =========================================================
+# ✅ Session resolution helpers (for /screen + engine)
+# =========================================================
+def parse_hhmm(s: str) -> Tuple[int, int]:
+    m = re.match(r"^(\d{2}):(\d{2})$", s.strip())
+    if not m:
+        raise ValueError("bad time")
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        raise ValueError("bad time")
+    return hh, mm
+
+
+def _parse_hhmm_local(s: str) -> Tuple[int, int]:
+    """Parse HH:MM (24h) and return (hour, minute)."""
+    return parse_hhmm(s)
+
+def in_trade_window_now(user: dict, now_local: Optional[datetime] = None) -> bool:
+    """
+    Trade window gate for email alerts.
+
+    - If user has Sessions UNLIMITED enabled -> always allow (24h).
+    - If trade_window_start/end are empty -> allow (no restriction).
+    - Otherwise checks local time window (supports overnight windows like 22:00 -> 06:00).
+    """
+    # Sessions UNLIMITED means 24h emailing (no trade-window restriction)
+    try:
+        if int(user.get("sessions_unlimited") or 0) == 1:
+            return True
+    except Exception:
+        pass
+
+    start_s = str(user.get("trade_window_start") or "").strip()
+    end_s = str(user.get("trade_window_end") or "").strip()
+    if not start_s or not end_s:
+        return True  # disabled => allow
+
+    # User timezone
+    try:
+        tz = ZoneInfo(str(user.get("tz") or "UTC"))
+    except Exception:
+        tz = timezone.utc
+
+    if now_local is None:
+        now_local = datetime.now(tz)
+
+    sh, sm = _parse_hhmm_local(start_s)
+    eh, em = _parse_hhmm_local(end_s)
+
+    start_dt = now_local.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end_dt = now_local.replace(hour=eh, minute=em, second=0, microsecond=0)
+
+    # Overnight window support
+    if end_dt <= start_dt:
+        if now_local >= start_dt:
+            return True
+        start_dt = start_dt - timedelta(days=1)
+        end_dt = end_dt + timedelta(days=1)
+
+    return start_dt <= now_local <= end_dt
+
+
+def current_session_utc(now_utc: Optional[datetime] = None) -> str:
+    """
+    Market sessions in UTC.
+
+    NOTE:
+    - We use non-overlapping UTC windows to avoid ambiguous session labels around overlaps.
+    - This also fixes Melbourne display so ~6:00 PM Melbourne remains ASIA until 7:00 PM (AEDT).
+
+    Windows:
+    - NY  : 13:00–22:00 UTC
+    - LON : 08:00–17:00 UTC
+    - ASIA: 00:00–08:00 UTC
+    Priority: NY > LON > ASIA
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    h = now_utc.hour
+
+    if 13 <= h < 22:
+        return "NY"
+    if 8 <= h < 17:
+        return "LON"
+    if 0 <= h < 8:
+        return "ASIA"
+
+    # Outside the three main windows: treat as NY tail/transition
+    return "NY"
+
+
+# Some mobile apps (Gmail/iOS) may copy-paste commands with invisible Unicode markers
+# (LTR/RTL marks, BOM, etc.) before the leading '/'. Telegram then won't treat it as a command.
+# We strip those so users can paste /size directly from email.
+_INVISIBLE_PREFIX_CHARS = "\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\ufeff"
+
+def _strip_invisible_prefix(s: str) -> str:
+    try:
+        return (s or "").lstrip(_INVISIBLE_PREFIX_CHARS + " \t\r\n")
+    except Exception:
+        return s or ""
+
+def ema_support_proximity_ok(entry: float, ema_val: float, atr_1h: float, session_name: str):
+    """
+    Adaptive EMA proximity + structure check.
+    Returns: (ok, dist_pct, thr_pct, atr_pct)
+
+    Rules:
+    - Must be near EMA (ATR-adaptive)
+    - Price must be on the correct side of EMA
+      BUY  → entry >= EMA
+      SELL → entry <= EMA
+    """
+    if entry <= 0 or ema_val <= 0:
+        return False, 999.0, 0.0, 0.0
+
+    dist = abs(entry - ema_val)
+    dist_pct = (dist / entry) * 100.0
+
+    atr_pct = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
+
+    knobs = session_knobs(session_name)
+    prox_mult = knobs["ema_prox_mult"]
+
+    thr_pct = clamp(
+        (EMA_SUPPORT_MAX_DIST_ATR_MULT * prox_mult) * atr_pct,
+        EMA_SUPPORT_MAX_DIST_PCT_MIN,
+        EMA_SUPPORT_MAX_DIST_PCT_MAX,
+    )
+
+    # Near enough?
+    near_ok = dist_pct <= thr_pct
+
+    # Structure: entry must be on the correct side
+    # (side check is done outside, so infer by relative position)
+    structure_ok = (
+        (entry >= ema_val) or  # BUY-side structure
+        (entry <= ema_val)     # SELL-side structure
+    )
+
+    ok = bool(near_ok and structure_ok)
+    return ok, dist_pct, thr_pct, atr_pct
+
+
+def ema_support_reaction_ok_15m(c15: List[List[float]], ema_val: float, side: str, session_name: str) -> bool:
+    """
+    Strict EMA reaction confirmation (15m):
+
+    BUY:
+      - Candle touches/breaks EMA
+      - Closes back ABOVE EMA
+      - Bullish candle
+      - Close in top part of range
+      - Rejects EMA (not crossing through)
+
+    SELL: mirrored logic
+    """
+    if not c15 or len(c15) < 10 or ema_val <= 0:
+        return False
+
+    lookback_n = int(session_knobs(session_name)["ema_reaction_lookback"])
+    lookback_n = int(clamp(lookback_n, 4, 12))
+    lookback = c15[-lookback_n:]
+
+    reject_count = 0
+    cross_count = 0
+
+    for c in lookback:
+        o = float(c[1])
+        h = float(c[2])
+        l = float(c[3])
+        cl = float(c[4])
+
+        rng = max(1e-9, h - l)
+        close_pos = (cl - l) / rng  # 0..1
+
+        touched = (l <= ema_val <= h)
+
+        crossed = ((o - ema_val) * (cl - ema_val)) < 0
+        if crossed:
+            cross_count += 1
+
+        if not touched:
+            continue
+
+        if side == "BUY":
+            if cl > ema_val and cl > o and close_pos >= 0.65:
+                reject_count += 1
+        else:
+            if cl < ema_val and cl < o and close_pos <= 0.35:
+                reject_count += 1
+
+    # ❌ EMA chop → invalid
+    if cross_count >= 2:
+        return False
+
+    # ✅ Need at least ONE strong rejection
+    return reject_count >= 1
+
+
+# =========================================================
+# Optional pullback policy (do NOT hard-reject signals)
+# =========================================================
+
+PULLBACK_OPTIONAL_DEFAULT = True
+PULLBACK_MISS_PENALTY_CONF = 6.0
+
+def apply_pullback_policy(
+    *,
+    require_pullback: bool,
+    pullback_ok: bool,
+    pullback_price: float | None,
+    confidence: float,
+    notes: list[str],
+):
+    if pullback_ok:
+        return True, confidence
+
+    if require_pullback:
+        return False, confidence
+
+    confidence = max(0.0, confidence - float(PULLBACK_MISS_PENALTY_CONF))
+
+    if pullback_price and pullback_price > 0:
+        notes.append(f"📝 Optional: wait for pullback entry near {pullback_price:.6g}.")
+    else:
+        notes.append("📝 Optional: consider waiting for a pullback before entering.")
+
+    return True, confidence
+
+
+def ema_rejection_candle_ok_15m(c15: List[List[float]], ema_val: float, side: str) -> bool:
+    """
+    Strict confirmation on the MOST RECENT 15m candle:
+
+    BUY (support reclaim):
+      - low <= EMA
+      - close > EMA
+      - bullish candle
+      - close in top part of range (strength)
+
+    SELL (resistance reject):
+      - high >= EMA
+      - close < EMA
+      - bearish candle
+      - close in bottom part of range (strength)
+    """
+    if not c15 or len(c15) < 2 or ema_val <= 0:
+        return False
+
+    o = float(c15[-1][1])
+    h = float(c15[-1][2])
+    l = float(c15[-1][3])
+    c = float(c15[-1][4])
+
+    rng = max(1e-9, (h - l))
+    close_pos = (c - l) / rng  # 0..1
+
+    if side == "BUY":
+        if l <= ema_val and c > ema_val and c > o and close_pos >= float(REJECTION_CLOSE_POS_MIN):
+            return True
+        return False
+
+    # SELL
+    if h >= ema_val and c < ema_val and c < o and close_pos <= float(REJECTION_CLOSE_POS_MAX):
+        return True
+    return False
+
+
+def strong_reversal_exception_ok(side: str, ch24: float, ch4: float, ch1: float) -> bool:
+    """
+    Rare override: only allow counter-trend if the move is strong across TFs.
+    """
+    if not ALLOW_STRONG_REVERSAL_EXCEPTION:
+        return False
+    try:
+        return (abs(float(ch24)) >= float(REVERSAL_CH24_ABS_MIN)
+                and abs(float(ch4)) >= float(REVERSAL_CH4_ABS_MIN)
+                and abs(float(ch1)) >= float(REVERSAL_CH1_ABS_MIN))
+    except Exception:
+        return False
+
+
+def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float, float, float, int, List[List[float]], List[List[float]]]:
+    """
+    returns: ch1, ch4, ch15, atr_1h, ema_support_15m, ema_support_period, c15, c1
+    """
+    need_1h = max(ATR_PERIOD + 6, 35)
+    c1 = fetch_ohlcv(market_symbol, "1h", limit=need_1h)
+    if not c1 or len(c1) < 25:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0, [], []
+
+    closes_1h = [float(x[4]) for x in c1]
+    c_last = closes_1h[-1]
+    c_prev1 = closes_1h[-2]
+    c_prev4 = closes_1h[-5] if len(closes_1h) >= 5 else closes_1h[0]
+
+    ch1 = ((c_last - c_prev1) / c_prev1) * 100.0 if c_prev1 else 0.0
+    ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
+    atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
+
+    c15 = fetch_ohlcv(market_symbol, "15m", limit=80)
+    if not c15 or len(c15) < 20:
+        return ch1, ch4, 0.0, atr_1h, 0.0, 0, [], c1
+
+    closes_15 = [float(x[4]) for x in c15]
+    entry_proxy = float(closes_15[-1]) if closes_15 else 0.0
+    atr_pct_proxy = (atr_1h / entry_proxy) * 100.0 if (atr_1h and entry_proxy) else 2.0
+
+    ema_support_15m, ema_period = adaptive_ema_value(closes_15, atr_pct_proxy)
+
+    c15_last = float(c15[-1][4])
+    c15_prev = float(c15[-2][4])
+    ch15 = ((c15_last - c15_prev) / c15_prev) * 100.0 if c15_prev else 0.0
+
+    return ch1, ch4, ch15, atr_1h, ema_support_15m, int(ema_period), c15, c1
+
+
+# =========================================================
+# FORMATTING
+# =========================================================
+def fmt_money(x: float) -> str:
+    ax = abs(x)
+    if ax >= 1_000_000:
+        return f"{x/1_000_000:.1f}M"
+    if ax >= 1_000:
+        return f"{x/1_000:.1f}K"
+    return f"{x:.0f}"
+
+def pct_with_emoji(p: float) -> str:
+    val = int(round(p))
+    if val >= 3:
+        emo = "🟢"
+    elif val <= -3:
+        emo = "🔴"
+    else:
+        emo = "🟡"
+    return f"{val:+d}% {emo}"
+
+def _fmt_when(ts) -> str:
+    """Best-effort timestamp formatter for decision debug commands."""
+    try:
+        if ts is None:
+            return ""
+        # If already an ISO-ish string, return as-is
+        if isinstance(ts, str):
+            s = ts.strip()
+            if s:
+                return s
+            return ""
+        # Unix timestamp (sec)
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(float(ts), tz=_dt.timezone.utc).isoformat(timespec="seconds")
+    except Exception:
+        try:
+            return str(ts)
+        except Exception:
+            return ""
+
+
+
+def tv_chart_url(symbol_base: str) -> str:
+    return f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol_base.upper()}USDT.P"
+
+def table_md(rows: List[List[Any]], headers: List[str]) -> str:
+    return "```\n" + tabulate(rows, headers=headers, tablefmt="github") + "\n```"
+
+# Email-specific price formatting (less noisy)
+def fmt_price(x: float) -> str:
+    """
+    Telegram-friendly price formatting (less noisy than raw float).
+    """
+    try:
+        x = float(x)
+    except Exception:
+        return "0"
+
+    ax = abs(x)
+    if ax >= 1000:
+        return f"{x:.2f}"
+    if ax >= 100:
+        return f"{x:.2f}"
+    if ax >= 1:
+        return f"{x:.3f}"
+    if ax >= 0.1:
+        return f"{x:.4f}"
+    if ax >= 0.01:
+        return f"{x:.5f}"
+    return f"{x:.6f}"
+
+def fmt_price_email(x: float) -> str:
+    return fmt_price(x)
+
+# =========================================================
+# TELEGRAM SAFE SEND (chunking + markdown fallback)
+# =========================================================
+from telegram.error import BadRequest, TimedOut, NetworkError, RetryAfter
+
+SAFE_CHUNK = 3800
+
+async def send_long_message(
+    update: Update,
+    text: str,
+    parse_mode: Optional[str] = None,
+    disable_web_page_preview: bool = True,
+    reply_markup=None,
+):
+    """
+    Sends long messages safely by chunking and retrying.
+
+    Notes:
+    - Telegram max message length is ~4096 chars. We stay below that.
+    - If parse_mode causes BadRequest (HTML/Markdown formatting), we retry as plain text.
+    - Retries on RetryAfter and transient network errors to avoid losing chunks.
+    """
+    if not update or not getattr(update, "message", None):
+        return
+
+    s = text or ""
+
+    # Be safe if SAFE_CHUNK is missing or too large
+    max_len = 3800
+    try:
+        max_len = int(globals().get("SAFE_CHUNK", 3800))
+    except Exception:
+        max_len = 3800
+    if max_len > 3900:
+        max_len = 3900
+    if max_len < 500:
+        max_len = 2000
+
+    chunks = [s[i : i + max_len] for i in range(0, len(s), max_len)]
+
+    first = True
+    for ch in chunks:
+
+        async def _send(pm: Optional[str]):
+            await update.message.reply_text(
+                ch,
+                parse_mode=pm,
+                disable_web_page_preview=disable_web_page_preview,
+                reply_markup=reply_markup if first else None,
+            )
+
+        # Try with requested parse_mode first (or None)
+        try:
+            await _send(parse_mode)
+
+        except RetryAfter as e:
+            # Telegram rate limit: wait then retry once
+            wait_s = int(getattr(e, "retry_after", 1)) + 1
+            await asyncio.sleep(wait_s)
+            await _send(parse_mode)
+
+        except (TimedOut, NetworkError) as e:
+            # transient network: retry once
+            logger.warning("Telegram send failed (network): %s", e)
+            await asyncio.sleep(2)
+            try:
+                await _send(parse_mode)
+            except Exception as e2:
+                logger.warning("Telegram retry failed (network): %s", e2)
+
+        except BadRequest as e:
+            # Usually formatting issue -> fallback to plain text
+            logger.warning("Telegram BadRequest (parse_mode=%s): %s | Falling back to plain text.", parse_mode, e)
+            try:
+                await _send(None)
+            except Exception as e2:
+                logger.warning("Telegram fallback send failed: %s", e2)
+
+        except Exception as e:
+            logger.exception("Telegram send failed: %s", e)
+
+        first = False
+
+# =========================================================
+# SIGNAL IDs
+# =========================================================
+def next_setup_id() -> str:
+    today = datetime.utcnow().strftime("%Y%m%d")
+    con = db_connect()
+    cur = con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("""
+            INSERT INTO setup_counter (day_yyyymmdd, seq)
+            VALUES (?, 1)
+            ON CONFLICT(day_yyyymmdd) DO UPDATE SET seq = seq + 1
+        """, (today,))
+        cur.execute("SELECT seq FROM setup_counter WHERE day_yyyymmdd=?", (today,))
+        n = int(cur.fetchone()["seq"])
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return f"PF-{today}-{n:04d}"
+
+# =========================================================
+# SL/TP ENGINE (closer + dynamic cap + ✅ confidence-weighted TP scaling)
+# =========================================================
+def sl_mult_from_conf(conf: int) -> float:
+    # slightly tighter than old premium; tuned for higher win-rate with closer TPs
+    if conf >= 88:
+        return 2.2
+    if conf >= 80:
+        return 1.95
+    if conf >= 70:
+        return 1.70
+    return 1.55
+
+def tp3_rr_target_from_conf(conf: int) -> float:
+    """
+    ✅ TP scaling: confidence-weighted RR target for TP3.
+    """
+    if conf >= 88:
+        return 2.6
+    if conf >= 80:
+        return 2.4
+    if conf >= 72:
+        return 2.2
+    # below 72 we still may keep for /screen (awareness), but email floors will filter
+    return 2.0
+
+def tp_r_mults_from_conf(conf: int) -> Tuple[float, float, float]:
+    """
+    Returns (tp1_rr, tp2_rr, tp3_rr) with tp3 driven by confidence.
+    """
+    tp3 = tp3_rr_target_from_conf(conf)
+    tp1 = 1.0
+    tp2 = max(1.5, min(1.9, tp3 * 0.70))
+    if tp2 >= tp3:
+        tp2 = max(1.6, tp3 - 0.3)
+    return (tp1, tp2, tp3)
+
+def compute_sl_tp(
+    entry: float,
+    side: str,
+    atr: float,
+    conf: int,
+    tp_cap_pct: float,
+    rr_bonus: float = 0.0,
+    tp_cap_bonus_pct: float = 0.0,
+) -> Tuple[float, float, float]:
+    """
+    Returns (sl, tp3, R)
+    """
+    if entry <= 0 or atr <= 0:
+        return 0.0, 0.0, 0.0
+
+    sl_dist = sl_mult_from_conf(conf) * atr
+
+    min_dist = (ATR_MIN_PCT / 100.0) * entry
+    max_dist = (ATR_MAX_PCT / 100.0) * entry
+    sl_dist = clamp(sl_dist, min_dist, max_dist)
+
+    R = sl_dist
+
+    # ✅ confidence-weighted RR + engine bonus
+    rr_target = tp3_rr_target_from_conf(conf) + rr_bonus
+    tp_dist = rr_target * R
+
+    # ✅ TP cap with engine bonus
+    tp_cap = ((tp_cap_pct + tp_cap_bonus_pct) / 100.0) * entry
+    tp_dist = min(tp_dist, tp_cap)
+
+    if side == "BUY":
+        sl = entry - sl_dist
+        tp3 = entry + tp_dist
+    else:
+        sl = entry + sl_dist
+        tp3 = entry - tp_dist
+
+    return sl, tp3, R
+
+def _distinctify(a: float, b: float, c: float, entry: float, side: str) -> Tuple[float, float, float]:
+    if entry <= 0:
+        return a, b, c
+    eps = max(entry * 1e-6, 1e-8)
+    if side == "BUY":
+        if a >= b: a = b - eps
+        if b >= c: b = c - eps
+        if a >= b: a = b - eps
+    else:
+        if a <= b: a = b + eps
+        if b <= c: b = c + eps
+        if a <= b: a = b + eps
+    if abs(a - b) < eps: a = a - eps if side == "BUY" else a + eps
+    if abs(b - c) < eps: b = b - eps if side == "BUY" else b + eps
+    if abs(a - c) < eps: a = a - 2*eps if side == "BUY" else a + 2*eps
+    return a, b, c
+
+
+def multi_tp(
+    entry: float,
+    side: str,
+    R: float,
+    tp_cap_pct: float,
+    conf: int,
+    rr_bonus: float = 0.0,
+    tp_cap_bonus_pct: float = 0.0,
+) -> Tuple[float, float, float]:
+    if entry <= 0 or R <= 0:
+        return 0.0, 0.0, 0.0
+
+    r1, r2, r3 = tp_r_mults_from_conf(conf)
+    r3 += rr_bonus  # ✅ Engine B bonus
+
+    maxd = ((tp_cap_pct + tp_cap_bonus_pct) / 100.0) * entry
+
+    d3 = min(r3 * R, maxd)
+    d2 = min(r2 * R, d3 * (r2 / r3 if r3 > 0 else 0.7))
+    d1 = min(r1 * R, d3 * (r1 / r3 if r3 > 0 else 0.4))
+
+    if side == "BUY":
+        tp1, tp2, tp3 = (entry + d1, entry + d2, entry + d3)
+    else:
+        tp1, tp2, tp3 = (entry - d1, entry - d2, entry - d3)
+
+    return _distinctify(tp1, tp2, tp3, entry, side)
+
+def rr_to_tp(entry: float, sl: float, tp: float) -> float:
+    d_sl = abs(entry - sl)
+    d_tp = abs(tp - entry)
+    if d_sl <= 0:
+        return 0.0
+    return d_tp / d_sl
+
+
+def is_top_setup_eligible(s: "Setup") -> tuple[bool, str]:
+    """
+    Shared eligibility gate for:
+      - /screen -> Top Trade Setups
+      - Emails  -> Market Scan alerts
+
+    Defaults (env-overridable):
+      MIN_SETUP_CONF >= 75
+      MIN_FUT_VOL_USD >= 5,000,000
+      MIN_RR_TP3 >= 1.8
+      Valid TP ladder (TP1/TP2/TP3 present and RR1/RR2/RR3 positive)
+    """
+    try:
+        conf = int(getattr(s, "conf", 0) or 0)
+        if conf < int(MIN_SETUP_CONF):
+            return (False, "below_min_conf")
+
+        fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+        if fut_vol < float(MIN_FUT_VOL_USD):
+            return (False, "below_min_fut_vol")
+
+        entry = float(getattr(s, "entry", 0.0) or 0.0)
+        sl = float(getattr(s, "sl", 0.0) or 0.0)
+        tp1 = getattr(s, "tp1", None)
+        tp2 = getattr(s, "tp2", None)
+        tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+
+        # Ladder validity
+        if tp1 is None or tp2 is None:
+            return (False, "invalid_tp_ladder")
+        tp1 = float(tp1 or 0.0)
+        tp2 = float(tp2 or 0.0)
+        if tp1 <= 0 or tp2 <= 0 or tp3 <= 0 or entry <= 0 or sl <= 0:
+            return (False, "invalid_tp_ladder")
+
+        rr1 = rr_to_tp(entry, sl, tp1)
+        rr2 = rr_to_tp(entry, sl, tp2)
+        rr3 = rr_to_tp(entry, sl, tp3)
+
+        if rr1 <= 0 or rr2 <= 0 or rr3 <= 0:
+            return (False, "invalid_rr_ladder")
+
+        if float(rr3) < float(MIN_RR_TP3):
+            return (False, "below_min_rr_tp3")
+
+        return (True, "ok")
+    except Exception:
+        return (False, "eligibility_exception")
+
+# =========================================================
+# SETUP ENGINE
+# =========================================================
+
+def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
+    """
+    Stricter confidence designed for:
+    - Fewer, higher quality continuation signals
+    - Avoiding mid-wave / pump entries
+    - Preferring "pullback then continuation" (15m should be mild or slightly counter-trend)
+    """
+    is_long = (side == "BUY")
+
+    # Base score starts lower to reduce inflated confidences
+    score = 42.0
+
+    # -----------------------------
+    # 1) Higher-TF alignment first
+    # -----------------------------
+    def aligned(x: float) -> bool:
+        return (x > 0) if is_long else (x < 0)
+
+    a24 = aligned(ch24)
+    a4  = aligned(ch4)
+    a1  = aligned(ch1)
+    a15 = aligned(ch15)
+
+    align_count = int(a24) + int(a4) + int(a1) + int(a15)
+
+    # Stronger reward for 4H/1H alignment (regime + execution TF)
+    score += 14.0 if a4 else -18.0
+    score += 12.0 if a1 else -16.0
+
+    # 24H matters, but less than 4H/1H for trade execution quality
+    score += 8.0 if a24 else -10.0
+
+    # 15m alignment is NOT always good for entries (pumps are bad entries)
+    # We'll handle 15m separately as "pullback quality"
+    # (so do not add big alignment reward here)
+    score += 2.0 if a15 else -2.0
+
+    # Hard cap if the structure is weak:
+    # If 4H+1H disagree with your side, confidence should never be high.
+    if (not a4) and (not a1):
+        return int(55)  # keep it low; you can also return 0 if you want total block
+
+    # If at least 3 TFs align (24/4/1/15), small boost
+    if align_count >= 3:
+        score += 6.0
+    elif align_count <= 1:
+        score -= 10.0
+
+    # -----------------------------
+    # 2) Magnitude scoring (capped)
+    # -----------------------------
+    def signed_mag(x: float, k: float) -> float:
+        return (abs(x) * k) if aligned(x) else (-abs(x) * k)
+
+    mag = (
+        signed_mag(ch24, 0.5) +
+        signed_mag(ch4,  0.9) +
+        signed_mag(ch1,  1.2) +
+        signed_mag(ch15, 0.6)
+    )
+    mag = clamp(mag, -18.0, 18.0)
+    score += mag
+
+    # -----------------------------
+    # 3) Anti-pump + pullback preference (15m behavior)
+    # -----------------------------
+    # For continuation entries:
+    # - We *don't* want 15m strongly in-trend (often means mid-wave / extended).
+    # - We *do* like mild pullback against the trend (e.g. -0.3% to -1.2% in BUY).
+    ch15_abs = abs(float(ch15))
+
+    if is_long:
+        # Mid-wave pump penalty: 15m strongly positive
+        if ch15 >= 0.8:
+            score -= 12.0
+        elif ch15 >= 0.4:
+            score -= 6.0
+
+        # Preferred pullback zone (slight red 15m)
+        if -1.2 <= ch15 <= -0.25:
+            score += 10.0
+        elif -2.2 <= ch15 < -1.2:
+            score += 4.0
+
+        # Too much dump into support = unstable
+        if ch15 <= -2.8:
+            score -= 10.0
+    else:
+        # Mid-wave dump penalty: 15m strongly negative
+        if ch15 <= -0.8:
+            score -= 12.0
+        elif ch15 <= -0.4:
+            score -= 6.0
+
+        # Preferred pullback zone (slight green 15m)
+        if 0.25 <= ch15 <= 1.2:
+            score += 10.0
+        elif 1.2 < ch15 <= 2.2:
+            score += 4.0
+
+        # Too much pump into resistance = unstable
+        if ch15 >= 2.8:
+            score -= 10.0
+
+    # -----------------------------
+    # 4) Volume bonus (smaller + only when structure is already good)
+    # -----------------------------
+    # Volume should NOT rescue a bad setup.
+    # Only add if score already indicates decent structure.
+    if score >= 60.0:
+        if fut_vol_usd >= 40_000_000:
+            score += 5.0
+        elif fut_vol_usd >= 15_000_000:
+            score += 3.0
+        elif fut_vol_usd >= 6_000_000:
+            score += 1.5
+
+    score = clamp(score, 0.0, 100.0)
+    return int(round(score))
+
+
+def build_leaders_table(best_fut: Dict[str, MarketVol]) -> str:
+    leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:LEADERS_N]
+    rows = []
+
+    for base, mv in leaders:
+        # ✅ 4H change from real 4h candles (light: limit=2)
+        ch4 = 0.0
+        try:
+            c4h = fetch_ohlcv(mv.symbol, "4h", limit=2)
+            if c4h and len(c4h) >= 2:
+                c_last = float(c4h[-1][4])
+                c_prev = float(c4h[-2][4])
+                if c_prev > 0:
+                    ch4 = ((c_last - c_prev) / c_prev) * 100.0
+        except Exception:
+            ch4 = 0.0
+
+        rows.append([
+            base,
+            fmt_money(usd_notional(mv)),
+            pct_with_emoji(float(mv.percentage or 0.0)),  # 24H
+            pct_with_emoji(float(ch4)),                  # 4H
+        ])
+
+    return "*Market Leaders (Top 10 by Futures Volume)*\n" + table_md(rows, ["SYM", "F Vol", "24H", "4H"])
+
+def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tuple], List[Tuple]]:
+    """
+    ✅ FAST version:
+    - For leaders/losers we only need: volume, 24H move, and 4H alignment
+    - So we fetch ONLY 4H candles (limit=2) instead of full 1H+15m metrics
+    """
+    up, dn = [], []
+
+    for base, mv in best_fut.items():
+        vol = usd_notional(mv)
+        if vol < MOVER_VOL_USD_MIN:
+            continue
+
+        ch24 = float(mv.percentage or 0.0)
+        if ch24 < MOVER_UP_24H_MIN and ch24 > MOVER_DN_24H_MAX:
+            continue
+
+        # ✅ 4H alignment using real 4H candles (very light)
+        c4h = fetch_ohlcv(mv.symbol, "4h", limit=2)
+        if not c4h or len(c4h) < 2:
+            continue
+
+        c_last = float(c4h[-1][4])
+        c_prev = float(c4h[-2][4])
+        if c_prev <= 0:
+            continue
+        ch4 = ((c_last - c_prev) / c_prev) * 100.0
+
+        if ch24 >= MOVER_UP_24H_MIN and ch4 > 0:
+            up.append((base, vol, ch24, ch4, float(mv.last or 0.0)))
+        if ch24 <= MOVER_DN_24H_MAX and ch4 < 0:
+            dn.append((base, vol, ch24, ch4, float(mv.last or 0.0)))
+
+    up.sort(key=lambda x: (x[2], x[1]), reverse=True)
+    dn.sort(key=lambda x: (x[2], x[1]))
+    return up, dn
+
+def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
+    up, dn = compute_directional_lists(best_fut)
+    up_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4)] for b, v, c24, c4, px in up[:10]]
+    dn_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4)] for b, v, c24, c4, px in dn[:10]]
+    up_txt = "*Directional Leaders (24H ≥ +10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(up_rows, ["SYM", "F Vol", "24H", "4H"]) if up_rows else "_None_")
+    dn_txt = "*Directional Losers (24H ≤ -10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(dn_rows, ["SYM", "F Vol", "24H", "4H"]) if dn_rows else "_None_")
+    return up_txt, dn_txt
+
+# =========================================================
+# make_setup
+# =========================================================
+def make_setup(
+    base: str,
+    mv: MarketVol,
+    strict_15m: bool = True,
+    session_name: str = "LON",
+    allow_no_pullback: bool = True,     # /screen True, Email False (except HOT bypass)
+    hot_vol_usd: float = HOT_VOL_USD,   # 50M
+    trigger_loosen_mult: float = 1.0,
+    waiting_near_pct: float = SCREEN_WAITING_NEAR_PCT,
+    scan_profile: str = DEFAULT_SCAN_PROFILE,
+) -> Optional[Setup]:
+
+    fut_vol = usd_notional(mv)
+    if fut_vol <= 0:
+        _rej("no_futures_volume", base, mv)
+        return None
+
+    entry = float(mv.last or 0.0)
+    if entry <= 0:
+        _rej("bad_entry", base, mv)
+        return None
+
+    ch24 = float(mv.percentage or 0.0)
+
+    _note_status("evaluated", base, mv)
+
+
+    notes = []  # collect internal notes for pullback policy / diagnostics
+    try:
+
+        ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
+
+    except Exception:
+
+        _rej("ohlcv_missing_or_insufficient", base, mv)
+
+        return None
+    # Use true 4H change from 4H candles (more stable than 1H*4 approximation)
+    try:
+        ch4_exact = 0.0
+        try:
+            c4h = fetch_ohlcv(mv.symbol, "4h", limit=6)
+            if c4h and len(c4h) >= 2:
+                c_last_4h = float(c4h[-1][4])
+                c_prev_4h = float(c4h[-2][4])
+                ch4_exact = ((c_last_4h - c_prev_4h) / c_prev_4h) * 100.0 if c_prev_4h else 0.0
+        except Exception:
+            ch4_exact = 0.0
+
+        ch4_used = ch4_exact if abs(ch4_exact) > 0.0001 else ch4
+
+        if (ch1 == 0.0 and ch4 == 0.0 and ch15 == 0.0 and atr_1h == 0.0) or (not c15) or (ema_support_15m == 0.0):
+            _rej("ohlcv_missing_or_insufficient", base, mv, "metrics/ema missing")
+            return None
+
+        # Scan profile tuning
+        prof = str(scan_profile or DEFAULT_SCAN_PROFILE).strip().lower()
+        if prof not in SCAN_PROFILES:
+            prof = DEFAULT_SCAN_PROFILE
+        aggressive_screen = (prof == "aggressive" and (not strict_15m))
+
+        # --------- SESSION-DYNAMIC 1H TRIGGER ----------
+        atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
+        trig_min_raw = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
+
+        floor_min = 0.025 if aggressive_screen else 0.05  # further loosened: allow setups in quiet 1H candles
+        trig_min = max(float(floor_min), float(trig_min_raw) * float(trigger_loosen_mult))
+
+        if abs(ch1) < trig_min:
+            # Waiting for Trigger (near-miss) — store ONLY side + a color dot (no numbers)
+            if trig_min > 0:
+                ratio = abs(ch1) / trig_min  # internal only
+                if ratio >= float(waiting_near_pct):
+                    # color indicates "how close" WITHOUT revealing thresholds
+                    if ratio >= 0.92:
+                        dot = "🟢"
+                    elif ratio >= 0.82:
+                        dot = "🟡"
+                    else:
+                        dot = "🟠"
+
+                    side_guess = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.25 else ("BUY" if ch1 > 0 else "SELL")
+                    _WAITING_TRIGGER[str(base)] = {"side": side_guess, "dot": dot}
+
+            # Balanced breakout override: even if 1H change is small, allow true breakouts
+            # Additional overrides: allow setups during quiet 1H candles if 4H/24H move is strong and 15m confirms.
+            override_4h = (abs(float(ch4_used or 0.0)) >= max(0.9, float(trig_min) * 1.6)) and (abs(float(ch15 or 0.0)) >= 0.10)
+            override_24h = (abs(float(ch24 or 0.0)) >= 10.0) and (abs(float(ch15 or 0.0)) >= 0.08)
+            # Extra override: if 24H is very strong AND 4H aligns, don't require 15m confirmation (quiet consolidation after a big move)
+            override_24h_strong = (abs(float(ch24 or 0.0)) >= 18.0) and (abs(float(ch4_used or 0.0)) >= 0.60) and (float(fut_vol or 0.0) >= 5_000_000.0)
+            breakout_override = False
+            # Trend override: if 4H regime move is meaningful, allow even if this 1H is quiet.
+            try:
+                if abs(float(ch4_used or 0.0)) >= max(0.75, float(trig_min) * 3.0) and float(fut_vol or 0.0) >= 5_000_000.0:
+                    breakout_override = True
+            except Exception:
+                pass
+            try:
+                if c1 and len(c1) >= 25 and abs(ch24) >= 6.0:
+                    highs_1h = [float(x[2]) for x in c1]
+                    lows_1h  = [float(x[3]) for x in c1]
+                    closes_1h = [float(x[4]) for x in c1]
+                    vols_1h  = [float(x[5]) for x in c1]
+                    last_close = float(closes_1h[-1])
+                    last_high  = float(highs_1h[-1])
+                    last_low   = float(lows_1h[-1])
+                    hh20 = max(highs_1h[-21:-1])
+                    ll20 = min(lows_1h[-21:-1])
+                    vnow = float(vols_1h[-1])
+                    vavg = (sum(vols_1h[-21:-1]) / 20.0) if vols_1h[-21:-1] else 0.0
+
+                    vol_mult = 1.08  # balanced default
+                    if (ch24 >= 6.0) and (last_high > hh20 or last_close > hh20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
+                        breakout_override = True
+                    if (ch24 <= -6.0) and (last_low < ll20 or last_close < ll20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
+                        breakout_override = True
+            except Exception:
+                breakout_override = False
+
+            # Soft override: if we are close to the trigger and the higher timeframe move supports direction,
+            # allow a lower-confidence setup instead of rejecting everything on a quiet 1H candle.
+            try:
+                ratio = (abs(float(ch1)) / float(trig_min)) if float(trig_min) > 0 else 0.0
+            except Exception:
+                ratio = 0.0
+            soft_override = (ratio >= 0.78) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
+                abs(float(ch4_used or 0.0)) >= 0.60 or abs(float(ch24 or 0.0)) >= 14.0
+            )
+
+            if not (breakout_override or override_4h or override_24h or override_24h_strong or soft_override):
+                _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% trig={trig_min:.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}% ch15={ch15:+.2f}%")
+                return None
+
+
+        # ✅ IMPORTANT: this must be OUTSIDE the if block (no extra indent)
+        side = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.40 else ("BUY" if ch1 > 0 else "SELL")  # trend-side gating: prefer 4H regime over 1H noise
+
+        # 4H alignment
+        # If 4H is basically flat, don't block (leaders often show ch4 ~ 0 while 24H is huge).
+        if abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
+            if side == "BUY" and ch4 < ALIGN_4H_MIN:
+                _rej("4h_not_aligned_for_long", base, mv, f"side=BUY ch4={ch4:+.2f}%")
+                return None
+            if side == "SELL" and ch4 > -ALIGN_4H_MIN:
+                _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4:+.2f}%")
+                return None
+
+        # ✅ HARD regime gate: don't fight the 4H direction (unless "strong reversal exception")
+        if TF_ALIGN_ENABLED and abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
+            if side == "BUY" and ch4 < 0:
+                if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
+                    _rej("4h_bear_regime_blocks_long", base, mv, f"ch4={ch4:+.2f}%")
+                    return None
+            if side == "SELL" and ch4 > 0:
+                if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
+                    _rej("4h_bull_regime_blocks_short", base, mv, f"ch4={ch4:+.2f}%")
+                    return None
+
+
+        # ✅ Approach A (ASIA): require basic 1H+4H alignment with the signal direction
+        # (NY/LON unchanged to keep flow)
+        try:
+            if str(session_name).upper() == "ASIA":
+                min1, min4 = tf_align_mins_for_session(session_name)
+                if side == "BUY":
+                    if not (ch1 >= min1 and ch4 >= min4):
+                        _rej("asia_tf_align_fail_long", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need>=({min1},{min4})")
+                        return None
+                else:
+                    if not (ch1 <= -min1 and ch4 <= -min4):
+                        _rej("asia_tf_align_fail_short", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need<=(-{min1},-{min4})")
+                        return None
+        except Exception:
+            pass
+
+        # =========================================================
+        # ✅ PULLBACK EMA (7/14/21) selection (15m)
+        # =========================================================
+        closes_15 = [float(x[4]) for x in c15]
+        pb_ema_val, pb_ema_p, pb_dist_pct = best_pullback_ema_15m(closes_15, c15, entry, side, session_name, atr_1h)
+
+        # ✅ No HOT bypass: pullback is ALWAYS required for high-quality continuation entries
+        pullback_bypass_hot = False
+
+        pb_ok = False
+        pb_thr_pct = 0.0
+        pb_dist_pct2 = 999.0
+
+        if pb_ema_val > 0:
+            pb_ok, pb_dist_pct2, pb_thr_pct, _ = ema_support_proximity_ok(entry, pb_ema_val, atr_1h, session_name)
+
+        pullback_ready = bool(pb_ok)
+
+        # Aggressive /screen: allow "near-EMA" pullback (slightly looser proximity)
+        if (not pullback_ready) and aggressive_screen and (pb_ema_val > 0) and (pb_thr_pct > 0):
+            try:
+                if float(pb_dist_pct2) <= float(pb_thr_pct) * 1.35:
+                    pullback_ready = True
+            except Exception:
+                pass
+
+        # 15m rejection candle requirement (skip in Aggressive /screen)
+        require_rejection = bool(REQUIRE_15M_EMA_REJECTION and (not aggressive_screen))
+
+        # ✅ Strict continuation entry: must show EMA interaction + strong 15m rejection/reclaim
+        if pullback_ready and require_rejection:
+            if (not c15) or (pb_ema_val <= 0):
+                _rej("no_ema_touch_reclaim_recent", base, mv,
+                     f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}% thr={pb_thr_pct:.2f}%")
+                return None
+
+            if not ema_rejection_candle_ok_15m(c15, pb_ema_val, side):
+                _rej("no_strong_rejection_candle_15m", base, mv, f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}%")
+                return None
+
+        # =========================================================
+        # ENGINE A (Mean-Reversion) vs ENGINE B (Momentum)
+        # =========================================================
+        engine_a_ok = bool(ENGINE_A_PULLBACK_ENABLED and pullback_ready)
+
+        engine_b_ok = False
+
+        if ENGINE_B_MOMENTUM_ENABLED:
+            # Aggressive /screen: slightly looser momentum requirements
+            mom_min_ch1 = float(MOMENTUM_MIN_CH1) * (0.75 if aggressive_screen else 1.0)
+            mom_min_24h = float(MOMENTUM_MIN_24H) * (0.75 if aggressive_screen else 1.0)
+            mom_body_mult = float(MOMENTUM_ATR_BODY_MULT) * (0.85 if aggressive_screen else 1.0)
+            mom_max_ema_dist = float(MOMENTUM_MAX_ADAPTIVE_EMA_DIST) * ((1.60 if (not strict_15m) else 1.0)) * (1.30 if aggressive_screen else 1.0)
+
+            # ------------------------------------------------------------------
+            # B1) Momentum continuation (existing)
+            # ------------------------------------------------------------------
+            if abs(ch1) >= mom_min_ch1 and abs(ch24) >= mom_min_24h:
+                if fut_vol >= (MOVER_VOL_USD_MIN * MOMENTUM_VOL_MULT):
+                    body_pct = abs(ch1)
+                    if atr_pct_now > 0 and body_pct >= (mom_body_mult * atr_pct_now):
+                        _, dist_pct, _, _ = ema_support_proximity_ok(entry, ema_support_15m, atr_1h, session_name)
+                        if dist_pct <= mom_max_ema_dist:
+                            engine_b_ok = True
+
+            # ------------------------------------------------------------------
+            # B2) Balanced Breakout continuation (NEW)
+            # Purpose: avoid "leaders full, setups empty" during expansion phases.
+            # Uses the already-fetched 1H candles (c1) to avoid extra API calls / rate limits.
+            # ------------------------------------------------------------------
+            try:
+                ch24_thr = 4.0 if aggressive_screen else 5.0
+                vol_mult = 1.05 if aggressive_screen else 1.08
+
+                # Use 4H/side gating already computed as the trend regime.
+                uptrend = (ch4_used >= 0)
+                downtrend = (ch4 < 0)
+
+                if abs(ch24) >= ch24_thr and fut_vol >= max(5_000_000.0, float(MOVER_VOL_USD_MIN) * 0.70) and c1 and len(c1) >= 25:
+                    highs_1h = [float(x[2]) for x in c1]
+                    lows_1h  = [float(x[3]) for x in c1]
+                    closes_1h = [float(x[4]) for x in c1]
+                    vols_1h  = [float(x[5]) for x in c1]
+
+                    last_close = float(closes_1h[-1])
+                    last_high = float(highs_1h[-1])
+                    last_low  = float(lows_1h[-1])
+                    vnow = float(vols_1h[-1])
+                    vavg = (sum(vols_1h[-21:-1]) / 20.0) if vols_1h[-21:-1] else 0.0
+
+                    # Prior 20-candle extremes (exclude the current candle)
+                    hh20 = max(highs_1h[-21:-1])
+                    ll20 = min(lows_1h[-21:-1])
+
+                    # Breakout BUY
+                    if uptrend and ch24 >= ch24_thr and (last_high > hh20 or last_close > hh20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
+                        engine_b_ok = True
+                        mv._pf_breakout_hint = "BUY"
+
+                    # Breakdown SELL
+                    if downtrend and ch24 <= -ch24_thr and (last_low < ll20 or last_close < ll20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
+                        engine_b_ok = True
+                        mv._pf_breakout_hint = "SELL"
+            except Exception:
+                pass
+    
+        # If breakout engine fired, force side to match the breakout direction (prevents green BUY / red mismatch)
+        try:
+            hint = getattr(mv, "_pf_breakout_hint", None)
+            if engine_b_ok and hint in ("BUY", "SELL"):
+                side = hint
+        except Exception:
+            pass
+
+        # If breakout engine fired, force side to match the breakout direction (prevents green BUY / red mismatch)
+        try:
+            hint = getattr(mv, "_pf_breakout_hint", None)
+            if engine_b_ok and hint in ("BUY", "SELL"):
+                side = hint
+        except Exception:
+            pass
+
+        if not engine_a_ok and not engine_b_ok:
+            _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}")
+            return None
+
+        # ---------------------------------------------------------
+        # Pullback policy (optional for Engine B)
+        # ---------------------------------------------------------
+        engine = "A" if engine_a_ok else "B"
+        require_pullback = (not bool(allow_no_pullback))
+
+        # Compute confidence BEFORE applying optional pullback penalty
+        conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
+
+        # Engine A already required pullback_ready; Engine B does not require pullback
+        pullback_ok_local = True if engine == "A" else True
+
+        keep, conf2 = apply_pullback_policy(
+            require_pullback=require_pullback,
+            pullback_ok=pullback_ok_local,
+            pullback_price=(pb_ema_val if pb_ema_val > 0 else None),
+            confidence=float(conf),
+            notes=notes,
+        )
+
+        conf = conf2
+
+        if not keep:
+            _rej("pullback_required_not_met", base, mv, "require_pullback=1")
+            return None
+
+        if engine == "A" and abs(float(ch1)) >= float(SHARP_1H_MOVE_PCT):
+            if not ema_support_reaction_ok_15m(c15, pb_ema_val, side, session_name):
+                _rej("sharp_1h_no_ema_reaction", base, mv, f"ch1={ch1:+.2f}% needs EMA reaction")
+                return None
+
+        thr = clamp(max(12.0, 2.5 * ((atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0)), 12.0, 22.0)
+        if side == "BUY" and ch24 <= -thr:
+            _rej("24h_contradiction_for_long", base, mv, f"ch24={ch24:+.1f}% <= -{thr:.1f}%")
+            return None
+        if side == "SELL" and ch24 >= +thr:
+            _rej("24h_contradiction_for_short", base, mv, f"ch24={ch24:+.1f}% >= +{thr:.1f}%")
+            return None
+
+        is_confirm_15m = abs(ch15) >= CONFIRM_15M_ABS_MIN
+        is_early_allowed = (abs(ch1) >= EARLY_1H_ABS_MIN)
+
+        if strict_15m:
+            if (not is_confirm_15m) and (not is_early_allowed):
+                _rej("15m_weak_and_not_early", base, mv, f"ch15={ch15:+.2f}% ch1={ch1:+.2f}%")
+                return None
+
+        if strict_15m and (not is_confirm_15m):
+            conf = max(0, int(conf) - int(EARLY_CONF_PENALTY))
+
+
+        # ---------------------------------------------------------
+        # ✅ Global quality gate: session-aware confidence floor
+        # ---------------------------------------------------------
+        try:
+            sess_min = int(MIN_SETUP_CONF)
+            try:
+                if str(session_name or "").upper() == "ASIA":
+                    sess_min = max(sess_min, int(SESSION_MIN_CONF.get("ASIA", sess_min)))
+                elif str(session_name or "").upper() == "LON":
+                    sess_min = max(sess_min, int(SESSION_MIN_CONF.get("LON", sess_min)))
+                else:
+                    # Keep NY as-is (use global MIN_SETUP_CONF)
+                    sess_min = int(SESSION_MIN_CONF.get("NY", sess_min)) if str(session_name or "").upper() == "NY" else sess_min
+            except Exception:
+                sess_min = int(MIN_SETUP_CONF)
+
+            if int(conf) < int(sess_min):
+                _rej("below_min_confidence", base, mv, f"conf={int(conf)} min={int(sess_min)} sess={session_name}")
+                return None
+        except Exception:
+
+            pass
+
+        tp_cap_pct = tp_cap_pct_for_coin(fut_vol, ch24)
+
+        rr_bonus = ENGINE_B_RR_BONUS if engine_b_ok else 0.0
+        tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine_b_ok else 0.0
+
+        # ✅ Approach A: volatility-aware TP cap tightening (higher hit-rate on choppy/high-ATR coins)
+        try:
+            atr_pct = (float(atr_1h) / float(entry)) * 100.0 if float(entry) > 0 else 0.0
+            if atr_pct >= 6.0:
+                tp_cap_pct = min(float(tp_cap_pct), 9.0)
+            elif atr_pct >= 4.5:
+                tp_cap_pct = min(float(tp_cap_pct), 10.5)
+        except Exception:
+            pass
+
+        sl, tp3_single, R = compute_sl_tp(
+            entry, side, atr_1h, conf, tp_cap_pct,
+            rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
+        )
+        if sl <= 0 or tp3_single <= 0 or R <= 0:
+            _rej("bad_sl_tp_or_atr", base, mv, f"atr={atr_1h:.6g} entry={entry:.6g}")
+            return None
+
+        tp1 = tp2 = None
+        tp3 = tp3_single
+        if conf >= MULTI_TP_MIN_CONF:
+            _tp1, _tp2, _tp3 = multi_tp(
+                entry, side, R, tp_cap_pct, conf,
+                rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
+            )
+            if _tp1 and _tp2 and _tp3:
+                tp1, tp2, tp3 = _tp1, _tp2, _tp3
+
+
+        # ---------------------------------------------------------
+        # ✅ Session-aware TP3 RR floor (reduces low-quality signals, especially ASIA)
+        # ---------------------------------------------------------
+        try:
+            rr3 = rr_to_tp(entry, sl, tp3)
+            sess_rr_min = float(MIN_RR_TP3)
+            try:
+                sname = str(session_name or "").upper()
+                if sname == "ASIA":
+                    sess_rr_min = max(sess_rr_min, float(SESSION_MIN_RR_TP3.get("ASIA", sess_rr_min)))
+                elif sname == "LON":
+                    sess_rr_min = max(sess_rr_min, float(SESSION_MIN_RR_TP3.get("LON", sess_rr_min)))
+                else:
+                    # Keep NY as-is (use global MIN_RR_TP3)
+                    sess_rr_min = float(SESSION_MIN_RR_TP3.get("NY", sess_rr_min)) if sname == "NY" else sess_rr_min
+            except Exception:
+                sess_rr_min = float(MIN_RR_TP3)
+
+            if float(rr3) < float(sess_rr_min):
+                _rej("below_min_rr_tp3_session", base, mv, f"rr3={rr3:.2f} min={sess_rr_min:.2f} sess={session_name}")
+                return None
+        except Exception:
+            pass
+
+        sid = next_setup_id()
+        hot = is_hot_coin(fut_vol, ch24)
+
+        # ✅ trailing only for the setups that need it (Momentum + Hot)
+        trailing_tp3 = bool(hot and engine == "B")
+
+        return Setup(
+            setup_id=sid,
+            symbol=base,
+            market_symbol=mv.symbol,
+            side=side,
+            conf=int(conf),
+            entry=entry,
+            sl=sl,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            fut_vol_usd=fut_vol,
+            ch24=ch24,
+            ch4=ch4,
+            ch1=ch1,
+            ch15=ch15,
+            ema_support_period=int(ema_period),
+            ema_support_dist_pct=float(abs(entry - float(ema_support_15m)) / entry * 100.0 if entry > 0 else 999.0),
+            pullback_ema_period=int(pb_ema_p),
+            pullback_ema_dist_pct=float(pb_dist_pct2),
+            pullback_ready=bool(pullback_ready),
+            pullback_bypass_hot=bool(pullback_bypass_hot),
+            engine=str(engine),
+            is_trailing_tp3=trailing_tp3,
+            created_ts=time.time(),
+        )
+    except Exception as e:
+        try:
+            _rej("exception_in_make_setup", base, mv, f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return None
+
+
+
+
+def make_breakout_setup(
+    base: str,
+    mv: MarketVol,
+    session_name: str = "LON",
+    scan_profile: str = DEFAULT_SCAN_PROFILE,
+) -> Optional[Setup]:
+    """
+    Engine B: Momentum Breakout/Breakdown setups.
+    Uses already-fetched 1H candles from metrics_from_candles_1h_15m().
+    """
+    fut_vol = usd_notional(mv)
+    if fut_vol <= 0:
+        _rej("no_futures_volume", base, mv)
+        return None
+
+    entry = float(mv.last or 0.0)
+    if entry <= 0:
+        _rej("bad_entry", base, mv)
+        return None
+
+    ch24 = float(mv.percentage or 0.0)
+
+    try:
+        ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
+    except Exception:
+        _rej("ohlcv_missing_or_insufficient", base, mv)
+        return None
+
+    # Align naming with make_setup()
+    ch4_used = float(ch4 or 0.0)
+
+    if not c1 or len(c1) < 25 or atr_1h <= 0:
+        _rej("no_candles_breakout", base, mv)
+        return None
+
+    # Prefer trend regime from 4H
+    trend_up = ch4_used > 0
+    trend_dn = ch4_used < 0
+
+    highs = [float(x[2]) for x in c1 if x and len(x) >= 6][-25:]
+    lows  = [float(x[3]) for x in c1 if x and len(x) >= 6][-25:]
+    closes= [float(x[4]) for x in c1 if x and len(x) >= 6][-25:]
+    vols  = [float(x[5]) for x in c1 if x and len(x) >= 6][-25:]
+
+    if len(highs) < 22 or len(vols) < 22:
+        _rej("insufficient_1h_window", base, mv)
+        return None
+
+    # prior window excludes the last candle to avoid self-referencing
+    prior_high20 = max(highs[-21:-1])
+    prior_low20  = min(lows[-21:-1])
+
+    last_high = highs[-1]
+    last_low  = lows[-1]
+    last_close = closes[-1]
+
+    vol_avg20 = sum(vols[-21:-1]) / 20.0
+    vol_now = vols[-1]
+    vol_ok = (vol_now > 0) and ((vol_avg20 <= 0) or (vol_now >= vol_avg20 * 1.00))  # looser
+
+    # Balanced thresholds
+    ch24_buy_min = 6.0
+    ch24_sell_max = -6.0
+
+    # Breakout/Breakdown by wick OR close
+    is_breakout = (last_high > prior_high20) or (last_close > prior_high20)
+    is_breakdown = (last_low < prior_low20) or (last_close < prior_low20)
+
+    # If 4H is strongly up/down, allow direction to follow regime
+    if trend_up and is_breakout and vol_ok and ch24 >= ch24_buy_min:
+        side = "BUY"
+    elif trend_dn and is_breakdown and vol_ok and ch24 <= ch24_sell_max:
+        side = "SELL"
+    else:
+        # As a fallback, allow if 4H is neutral but 24H is strong
+        if is_breakout and vol_ok and ch24 >= max(10.0, ch24_buy_min) and (ch4 >= 0):
+            side = "BUY"
+        elif is_breakdown and vol_ok and ch24 <= min(-10.0, ch24_sell_max) and (ch4_used <= 0):
+            side = "SELL"
+        else:
+            # Balanced fallback: strong momentum continuation (not a fresh HH/LL break)
+            if vol_ok:
+                if (ch4_used >= 4.0 and ch24 >= 12.0):
+                    side = "BUY"
+                elif (ch4_used <= -4.0 and ch24 <= -12.0):
+                    side = "SELL"
+                else:
+                    _rej("no_breakout_trigger", base, mv)
+                    return None
+            else:
+                _rej("no_breakout_trigger", base, mv)
+                return None
+
+
+    # SL/TP using ATR (simple + robust)
+    sl_atr = 1.35
+    rr_target = 2.0  # TP3 RR target for momentum
+    if side == "BUY":
+        sl = entry - (atr_1h * sl_atr)
+        tp3 = entry + (entry - sl) * rr_target
+    else:
+        sl = entry + (atr_1h * sl_atr)
+        tp3 = entry - (sl - entry) * rr_target
+
+    if sl <= 0 or tp3 <= 0:
+        _rej("bad_sl_tp", base, mv)
+        return None
+
+    # Confidence scoring (balanced)
+    conf = 80
+    if abs(ch4_used) >= 5:
+        conf += 2
+    if abs(ch24) >= 20:
+        conf += 2
+    if vol_avg20 > 0 and vol_now >= vol_avg20 * 1.25:
+        conf += 2
+    conf = int(min(conf, 90))
+
+    setup_id = make_setup_id(base, side)
+    return Setup(
+        setup_id=setup_id,
+        symbol=base,
+        market_symbol=mv.symbol,
+        side=side,
+        conf=conf,
+        entry=float(entry),
+        sl=float(sl),
+        tp1=None,
+        tp2=None,
+        tp3=float(tp3),
+        fut_vol_usd=float(fut_vol),
+        ch24=float(ch24),
+        ch4=float(ch4_used),
+        ch1=float(ch1),
+        ch15=float(ch15),
+        ema_support_period=int(ema_period or 0),
+        ema_support_dist_pct=float(0.0),
+        pullback_ema_period=int(0),
+        pullback_ema_dist_pct=float(0.0),
+        pullback_ready=False,
+        pullback_bypass_hot=False,
+        engine="B",
+        is_trailing_tp3=False,
+        created_ts=time.time(),
+    )
+
+
+def pick_setups(
+    best_fut: Dict[str, MarketVol],
+    n: int,
+    strict_15m: bool = True,
+    session_name: str = "LON",
+    universe_n: int = 35,
+    trigger_loosen_mult: float = 1.0,
+    waiting_near_pct: float = SCREEN_WAITING_NEAR_PCT,
+    allow_no_pullback: bool = False,   # /screen True, email False (except HOT bypass inside make_setup)
+    scan_profile: str = DEFAULT_SCAN_PROFILE,
+) -> List[Setup]:
+    global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL, _WAITING_TRIGGER
+    _REJECT_STATS = Counter()
+    _REJECT_SAMPLES = {}
+    _REJECT_BY_SYMBOL = {}
+    _WAITING_TRIGGER = {}
+
+    universe_n = int(max(10, universe_n))
+    universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:universe_n]
+
+    setups: List[Setup] = []
+    for base, mv in universe:
+        try:
+            s = make_setup(
+                base,
+                mv,
+                strict_15m=strict_15m,
+                session_name=session_name,
+                allow_no_pullback=allow_no_pullback,
+                trigger_loosen_mult=float(trigger_loosen_mult),
+                waiting_near_pct=float(waiting_near_pct),
+                scan_profile=str(scan_profile or DEFAULT_SCAN_PROFILE),
+            )
+        except Exception:
+            try:
+                _rej("make_setup_exception", base, mv)
+            except Exception:
+                pass
+            s = None
+
+        if s:
+            try:
+                _note_status("setup_generated", base, mv)
+            except Exception:
+                pass
+            setups.append(s)
+        else:
+            # If make_setup returns None without recording a reject, add a generic reject
+            # so /why is never empty and tuning is possible.
+            try:
+                ctx = _REJECT_CTX.get()
+                b = str(base or "").upper().strip()
+                per = (ctx or {}).get("__per__") if isinstance(ctx, dict) else None
+                if b and isinstance(ctx, dict) and (not isinstance(per, dict) or b not in per):
+                    _rej("no_setup_candidate", base, mv, "make_setup_returned_none")
+            except Exception:
+                pass
+
+    setups.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
+    return setups[:n]
+
+
+# =========================================================
+# EMAIL
+# =========================================================
+
+def pick_breakout_setups(
+    best_fut: Dict[str, MarketVol],
+    n: int,
+    session_name: str,
+    universe_cap: int,
+    scan_profile: str = DEFAULT_SCAN_PROFILE,
+) -> List[Setup]:
+    """
+    Engine B selector: iterate symbols and build momentum breakout/breakdown setups.
+    """
+    items = list((best_fut or {}).items())
+    # simple volume-based ordering
+    items.sort(key=lambda kv: usd_notional(kv[1] or MarketVol()), reverse=True)
+    if universe_cap and universe_cap > 0:
+        items = items[:universe_cap]
+
+    out: List[Setup] = []
+    for base, mv in items:
+        try:
+            s = make_breakout_setup(base, mv, session_name=session_name, scan_profile=scan_profile)
+            if s:
+                out.append(s)
+        except Exception:
+            continue
+
+    # order by confidence then volume
+    out.sort(key=lambda s: (s.conf, s.fut_vol_usd), reverse=True)
+    return out[: max(0, int(n)) ]
+
+
+
+
+def user_email_alerts_enabled(user: dict) -> bool:
+    # Admin always receives emails
+    try:
+        uid = int((user or {}).get("user_id") or 0)
+        if uid and is_admin_user(uid):
+            return True
+    except Exception:
+        pass
+    try:
+        return int((user or {}).get("email_alerts_enabled", 1)) == 1
+    except Exception:
+        return True
+
+
+def set_user_email_alerts_enabled(uid: int, enabled: bool):
+    update_user(int(uid), email_alerts_enabled=(1 if enabled else 0))
+
+async def email_on_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User command to enable/disable ALL email alerts without removing the saved email address."""
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+
+    arg = (context.args[0].strip().lower() if context.args else "")
+    if arg not in ("on", "off", "enable", "disable"):
+        cur = "ON" if user_email_alerts_enabled(user) else "OFF"
+        await update.message.reply_text(
+            "📧 Email alerts (master switch)\n"
+            "────────────────────\n"
+            f"Current: {cur}\n\n"
+            "Usage:\n"
+            "/email_on_off on\n"
+            "/email_on_off off\n\n"
+            "Note: This does not remove your saved email address."
+        )
+        return
+
+    enabled = arg in ("on", "enable")
+    set_user_email_alerts_enabled(uid, enabled)
+    await update.message.reply_text(
+        "✅ Email alerts updated\n"
+        "────────────────────\n"
+        f"Now: {'ON' if enabled else 'OFF'}"
+    )
+
+def email_config_ok() -> bool:
+    """
+    Only checks SMTP sender config.
+    Recipient is per-user (users.email_to OR users.email) OR fallback EMAIL_TO.
+    """
+    return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM])
+
+
+def send_email(
+    subject: str,
+    body: str,
+    body_html: Optional[str] = None,
+    user_id_for_debug: Optional[int] = None,
+    enforce_trade_window: bool = True
+) -> bool:
+    """
+    Sends an email.
+
+    Recipient resolution:
+    - If user_id_for_debug is provided: uses users.email_to OR users.email
+    - Otherwise falls back to EMAIL_TO (if set)
+
+    Trade window:
+    - Enforced only if enforce_trade_window=True
+      (use False for system alerts like big-move alerts)
+
+    Tracks last SMTP error + last email decision for /health and /email_decision.
+    """
+    global _SMTP_CONN, _SMTP_CONN_IS_SSL, _SMTP_CONN_TS
+
+    # Per-user master email alerts switch
+    if user_id_for_debug is not None:
+        u = get_user(int(user_id_for_debug))
+        if u and not user_email_alerts_enabled(u):
+            _EMAIL_LAST_DECISION["reason"] = "user_email_alerts_disabled"
+            _EMAIL_LAST_DECISION["ts"] = _now()
+            return False
+
+    uid = int(user_id_for_debug) if user_id_for_debug is not None else None
+
+    # --- SMTP config check (sender side) ---
+    if not email_config_ok():
+        msg = "Email not configured (missing SMTP env vars)."
+        logger.warning(msg)
+        if uid is not None:
+            _LAST_SMTP_ERROR[uid] = msg
+            _LAST_EMAIL_DECISION[uid] = {
+                "status": "FAIL",
+                "reason": msg,
+                "ts": time.time(),
+            }
+        return False
+
+    # --- Resolve recipient ---
+    to_email = ""
+    user = None
+    now_local = None
+
+    if uid is not None:
+        user = get_user(uid) or {}
+        to_email = str(user.get("email_to") or user.get("email") or "").strip()
+
+        if not to_email:
+            _LAST_EMAIL_DECISION[uid] = {
+                "status": "FAIL",
+                "reasons": ["no_recipient_email_set"],
+                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            return False
+
+        if enforce_trade_window:
+            try:
+                try:
+                    tz = ZoneInfo(str(user.get("tz") or "UTC"))
+                except Exception:
+                    tz = timezone.utc
+                now_local = datetime.now(tz)
+
+                if not in_trade_window_now(user, now_local):
+                    _LAST_EMAIL_DECISION[uid] = {
+                        "status": "SKIP",
+                        "reason": "outside_trade_window",
+                        "ts": time.time(),
+                    }
+                    return False
+            except Exception:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reason": "trade_window_check_failed",
+                    "ts": time.time(),
+                }
+                return False
+    else:
+        to_email = str(EMAIL_TO or "").strip()
+        if not to_email:
+            logger.warning("No recipient email (EMAIL_TO empty and no user_id provided).")
+            return False
+
+    # --- Build message ---
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = to_email
+    msg.set_content(body)
+    if body_html:
+        try:
+            msg.add_alternative(body_html, subtype="html")
+        except Exception:
+            pass
+
+
+      
+    def _close_cached():
+        global _SMTP_CONN, _SMTP_CONN_IS_SSL, _SMTP_CONN_TS
+        try:
+            if _SMTP_CONN is not None:
+                try:
+                    _SMTP_CONN.quit()
+                except Exception:
+                    try:
+                        _SMTP_CONN.close()
+                    except Exception:
+                        pass
+        finally:
+            _SMTP_CONN = None
+            _SMTP_CONN_IS_SSL = None
+            _SMTP_CONN_TS = 0.0
+
+    def _need_new_conn(is_ssl: bool) -> bool:
+        global _SMTP_CONN, _SMTP_CONN_IS_SSL, _SMTP_CONN_TS
+        if _SMTP_CONN is None:
+            return True
+        if _SMTP_CONN_IS_SSL is None or _SMTP_CONN_IS_SSL != is_ssl:
+            return True
+        if (time.time() - float(_SMTP_CONN_TS or 0.0)) > float(SMTP_REUSE_TTL_SEC or 0.0):
+            return True
+        return False
+
+
+    def _connect_and_login(is_ssl: bool) -> smtplib.SMTP:
+        timeout = float(EMAIL_SEND_TIMEOUT_SEC)
+        if is_ssl:
+            ctx = ssl.create_default_context()
+            s = smtplib.SMTP_SSL(EMAIL_HOST, int(EMAIL_PORT), context=ctx, timeout=timeout)
+        else:
+            s = smtplib.SMTP(EMAIL_HOST, int(EMAIL_PORT), timeout=timeout)
+            s.ehlo()
+            s.starttls(context=ssl.create_default_context())
+            s.ehlo()
+
+        # login can be slow; keep under socket timeout
+        s.login(EMAIL_USER, EMAIL_PASS)
+        return s
+
+    # --- Send (with connection reuse + lock) ---
+    try:
+        is_ssl = (int(EMAIL_PORT) == 465)
+
+        with _SMTP_LOCK:
+            # Refresh connection if needed
+            if _need_new_conn(is_ssl):
+                _close_cached()
+                _SMTP_CONN = _connect_and_login(is_ssl)
+                _SMTP_CONN_IS_SSL = is_ssl
+                _SMTP_CONN_TS = time.time()
+            else:
+                # Light keepalive; if dropped, reconnect
+                try:
+                    _SMTP_CONN.noop()
+                except Exception:
+                    _close_cached()
+                    _SMTP_CONN = _connect_and_login(is_ssl)
+                    _SMTP_CONN_IS_SSL = is_ssl
+                    _SMTP_CONN_TS = time.time()
+
+            # Actual send
+            _SMTP_CONN.send_message(msg)
+            _SMTP_CONN_TS = time.time()
+
+        if uid is not None:
+            _LAST_SMTP_ERROR.pop(uid, None)
+            _LAST_EMAIL_DECISION[uid] = {
+                "status": "SENT",
+                "reason": "ok",
+                "ts": time.time(),
+            }
+        return True
+
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        logger.exception("send_email failed: %s", err)
+
+        # On any send failure, drop cached connection (often becomes poisoned)
+        try:
+            with _SMTP_LOCK:
+                _close_cached()
+        except Exception:
+            pass
+
+        if uid is not None:
+            _LAST_SMTP_ERROR[uid] = err
+            _LAST_EMAIL_DECISION[uid] = {
+                "status": "FAIL",
+                "reason": err,
+                "ts": time.time(),
+            }
+        return False
+
+
+# =========================================================
+# STRIPE CHECKOUT / CUSTOMER PORTAL
+# =========================================================
+def create_checkout_session(email: str, plan: str) -> str:
+    price_id = (
+        os.environ.get("STRIPE_PRICE_STANDARD")
+        if plan == "standard"
+        else os.environ.get("STRIPE_PRICE_PRO")
+    )
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        customer_email=email,
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url=TELEGRAM_BOT_URL,
+        cancel_url=TELEGRAM_BOT_URL,
+        metadata={"plan": plan},
+    )
+    return session.url
+
+
+def create_customer_portal(email: str) -> str:
+    customer = stripe.Customer.list(email=email, limit=1).data[0]
+    portal = stripe.billing_portal.Session.create(
+        customer=customer.id,
+        return_url=TELEGRAM_BOT_URL,
+    )
+    return portal.url
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+
+    if not context.args:
+        cur = "ON" if user_email_alerts_enabled(user) else "OFF"
+        saved = (user.get("email_to") or user.get("email") or "").strip()
+        await update.message.reply_text(
+            "📧 Email Settings\n"
+            "────────────────────\n"
+            f"Alerts: {cur}\n"
+            f"Saved: {saved if saved else '(none)'}\n\n"
+            "Set email: /email you@example.com\n"
+            "Turn off: /email off\n"
+            "Turn on: /email on"
+        )
+        return
+
+    arg = context.args[0].strip().lower()
+
+    # Support /email off|on
+    if arg in ("off", "0", "disable", "disabled"):
+        set_user_email_alerts_enabled(uid, False)
+        await update.message.reply_text("✅ Email alerts: OFF")
+        return
+
+    if arg in ("on", "1", "enable", "enabled"):
+        set_user_email_alerts_enabled(uid, True)
+        await update.message.reply_text("✅ Email alerts: ON")
+        return
+
+    # Otherwise treat as an email address
+    email = context.args[0].strip()
+    if not EMAIL_RE.match(email):
+        await update.message.reply_text(
+            "❌ Invalid email format.\n"
+            "Example: /email you@example.com\n"
+            "Or: /email off"
+        )
+        return
+
+    try:
+        set_user_email(uid, email)
+        set_user_email_alerts_enabled(uid, True)
+
+        await update.message.reply_text(
+            f"✅ Recipient email saved:\n{email}\n\n"
+            "Email alerts are ON.\n"
+            "Test now: /email_test\n"
+            "Turn off any time: /email off"
+        )
+    except Exception as e:
+        logger.exception("email_cmd failed")
+        await update.message.reply_text(f"❌ Failed to save email: {type(e).__name__}: {e}")
+
+
+async def email_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: /email_on
+    context.args = ["on"]
+    await email_cmd(update, context)
+
+async def email_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: /email_off
+    context.args = ["off"]
+    await email_cmd(update, context)
+
+async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+
+    # Always respond immediately
+    await update.message.reply_text("📧 Running email test…")
+
+    # Config checks
+    if not EMAIL_ENABLED:
+        await update.message.reply_text("❌ Email is disabled (EMAIL_ENABLED=False). Turn it on in your config/env.")
+        return
+
+    if not email_config_ok():
+        await update.message.reply_text(
+            "❌ Email config is NOT OK.\n"
+            "Check env vars: EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM.\n"
+            "Tip: run /health_sys and verify Email: enabled/configured."
+        )
+        return
+
+    # Recipient (match your bot’s keys)
+    to_email = (user.get("email_to") or user.get("email") or "").strip()
+    if not to_email:
+        await update.message.reply_text(
+            "❌ No recipient email found for your user.\n"
+            "Set it first, e.g. /email your@email.com"
+        )
+        return
+
+    # Local time (user TZ)
+    tz_name = str(user.get("tz") or "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+        tz_name = "UTC"
+    now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+    subject = "PulseFutures — Email Test ✅"
+    body = (
+        f"{HDR}\n"
+        f"PulseFutures Email Test\n"
+        f"{HDR}\n\n"
+        f"User ID: {uid}\n"
+        f"Recipient: {to_email}\n"
+        f"Time: {now_local} ({tz_name})\n\n"
+        f"If you received this, SMTP is working.\n"
+        f"{HDR}\n"
+    )
+
+    status_msg = await update.message.reply_text("📤 Sending test email…")
+
+    # Clear previous error for clean reporting
+    try:
+        _LAST_SMTP_ERROR.pop(uid, None)
+    except Exception:
+        pass
+
+    # Email test should NOT be blocked by user's email master switch
+    prev_enabled = None
+    try:
+        prev_enabled = int((user or {}).get("email_alerts_enabled", 1))
+        if prev_enabled == 0:
+            update_user(uid, email_alerts_enabled=1)
+    except Exception:
+        prev_enabled = None
+
+    try:
+        # IMPORTANT: pass correct kwargs (avoid arg mis-binding)
+        ok = await _send_email_async(
+            int(EMAIL_SEND_TIMEOUT_SEC),
+            subject,
+            body,
+            user_id_for_debug=uid,
+            enforce_trade_window=False,
+        )
+    except Exception as e:
+        logger.exception("email_test_cmd failed")
+        msg = f"❌ Test email crashed: {type(e).__name__}: {e}"
+        try:
+            await status_msg.edit_text(msg)
+        except Exception:
+            await update.message.reply_text(msg)
+        return
+    finally:
+        # Restore user's email alerts flag if we temporarily changed it
+        try:
+            if prev_enabled is not None and prev_enabled in (0, 1):
+                update_user(uid, email_alerts_enabled=prev_enabled)
+        except Exception:
+            pass
+
+    if ok:
+        try:
+            await status_msg.edit_text(f"✅ Test email SENT to: {to_email}")
+        except Exception:
+            await update.message.reply_text(f"✅ Test email SENT to: {to_email}")
+        return
+
+    # FAILED: show real last smtp error if available
+    err = _LAST_SMTP_ERROR.get(uid) or "unknown_error"
+    await update.message.reply_text(
+        "❌ Test email FAILED.\n"
+        f"Reason: {err}\n\n"
+        "Common causes:\n"
+        "- Gmail: app password / 2FA issues\n"
+        "- Wrong EMAIL_HOST/PORT (465 SSL vs 587 STARTTLS)\n"
+        "- EMAIL_FROM not matching account"
+    )
+
+
+
+async def trade_window_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /trade_window
+    View: /trade_window
+    Set : /trade_window 09:00 17:30
+    Off : /trade_window off
+    """
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not context.args:
+        cur_s = (user.get("trade_window_start") or "").strip()
+        cur_e = (user.get("trade_window_end") or "").strip()
+        if not cur_s or not cur_e:
+            await update.message.reply_text(
+                "🕒 Trade Window (Email Signals)\n"
+                f"{HDR}\n"
+                "Current: OFF (no time restriction)\n\n"
+                "Set: /trade_window 09:00 17:30\n"
+                "Off: /trade_window off"
+            )
+        else:
+            await update.message.reply_text(
+                "🕒 Trade Window (Email Signals)\n"
+                f"{HDR}\n"
+                f"Current: {cur_s} → {cur_e} (local)\n\n"
+                "Change: /trade_window 09:00 17:30\n"
+                "Off: /trade_window off"
+            )
+        return
+
+    if len(context.args) == 1 and context.args[0].strip().lower() in {"off", "disable", "none"}:
+        update_user(uid, trade_window_start="", trade_window_end="")
+        await update.message.reply_text("✅ Trade window is now OFF (emails allowed anytime).")
+        return
+
+    if len(context.args) != 2:
+        await update.message.reply_text("Usage: /trade_window 09:00 17:30  OR  /trade_window off")
+        return
+
+    start_s = context.args[0].strip()
+    end_s = context.args[1].strip()
+
+    try:
+        _parse_hhmm_local(start_s)
+        _parse_hhmm_local(end_s)
+    except Exception:
+        await update.message.reply_text("Invalid time format. Use HH:MM (24h). Example: /trade_window 09:00 17:30")
+        return
+
+    update_user(uid, trade_window_start=start_s, trade_window_end=end_s)
+    await update.message.reply_text(f"✅ Trade window set: {start_s} → {end_s} (local time).")
+
+# =========================================================
+# SESSIONS (user)
+# =========================================================
+def user_enabled_sessions(user: dict) -> List[str]:
+    try:
+        xs = json.loads(user["sessions_enabled"])
+        if isinstance(xs, list) and xs:
+            ordered = _order_sessions(xs)
+            return ordered or ['NY']
+    except Exception:
+        return ['NY']
+
+def _session_label_utc(now_utc: datetime) -> Optional[str]:
+    """
+    Returns NY/LON/ASIA if within their UTC windows (priority NY > LON > ASIA).
+    Returns None if we are in the gap (not in any defined session window).
+    """
+    for name in SESSION_PRIORITY:  # ["NY","LON","ASIA"]
+        w = SESSIONS_UTC[name]
+        sh, sm = parse_hhmm(w["start"])
+        eh, em = parse_hhmm(w["end"])
+        start_utc = now_utc.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_utc = now_utc.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if end_utc <= start_utc:
+            end_utc += timedelta(days=1)
+        if now_utc < start_utc and (start_utc - now_utc) > timedelta(hours=12):
+            start_utc -= timedelta(days=1)
+            end_utc -= timedelta(days=1)
+        if start_utc <= now_utc <= end_utc:
+            return name
+    return None
+
+
+def _guess_session_name_utc(now_utc: datetime) -> str:
+    """
+    Returns NY/LON/ASIA if within their UTC windows (priority NY > LON > ASIA).
+    If we're outside the three main windows (gap), default to NY (keeps /screen logic consistent).
+    """
+    label = _session_label_utc(now_utc)
+    return label or "NY"
+
+
+def in_session_now(user: dict) -> Optional[dict]:
+    tz = ZoneInfo(user["tz"])
+    now_local = datetime.now(tz)
+    now_utc = now_local.astimezone(timezone.utc)
+
+    # NEW: unlimited mode => always return a session key and bypass session gating
+    # In this mode, email setups are allowed 24/7 (subject to caps & gap).
+    if int(user.get("sessions_unlimited", 0) or 0) == 1:
+        name = "UNLIMITED"
+        session_key = f"{now_utc.strftime('%Y-%m-%d')}_{name}"
+        return {
+            "name": name,
+            "session_key": session_key,
+            "start_utc": now_utc,
+            "end_utc": now_utc,
+            "now_local": now_local,
+        }
+
+    enabled = user_enabled_sessions(user)
+    for name in enabled:
+        w = SESSIONS_UTC[name]
+        sh, sm = parse_hhmm(w["start"])
+        eh, em = parse_hhmm(w["end"])
+        start_utc = now_utc.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_utc = now_utc.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if end_utc <= start_utc:
+            end_utc += timedelta(days=1)
+        if now_utc < start_utc and (start_utc - now_utc) > timedelta(hours=12):
+            start_utc -= timedelta(days=1)
+            end_utc -= timedelta(days=1)
+        if start_utc <= now_utc <= end_utc:
+            session_key = f"{start_utc.strftime('%Y-%m-%d')}_{name}"
+            return {
+                "name": name,
+                "session_key": session_key,
+                "start_utc": start_utc,
+                "end_utc": end_utc,
+                "now_local": now_local,
+            }
+    return None
+
+
+
+import difflib
+
+import base64
+import tempfile
+
+# =========================================================
+# UNKNOWN COMMAND + "DID YOU MEAN" SUGGESTION (ALL USERS)
+# =========================================================
+
+KNOWN_COMMANDS = sorted(set([
+    # Help
+    "help", "help_admin",
+
+    # Market scan
+    "screen",
+
+    # Position sizing / risk
+    "size", "riskmode", "dailycap",
+
+    # Trade journal & equity
+    "equity", "equity_reset",
+    "trade_open", "trade_sl", "trade_rf", "trade_close",
+
+    # Status
+    "status",
+
+    # Limits
+    "limits",
+
+    # Sessions
+    "sessions", "sessions_on", "sessions_off", "sessions_on_unlimited", "sessions_off_unlimited",
+
+    # Email alerts
+    "notify_on", "notify_off",
+    "trade_window",
+    "email_test", "email_decision",
+    "bigmove_alert",
+
+    # Cooldowns (user)
+    "cooldowns", "cooldown",
+
+    # Reports
+    "report_daily", "report_weekly", "report_overall",
+    "signals_daily", "signals_weekly",
+
+    # System health
+    "health", "health_sys",
+
+    # Timezone
+    "tz",
+
+    # Billing / plan / support
+    "myplan", "billing", "support",
+
+    # USDT user
+    "usdt", "usdt_paid",
+
+    # Admin cooldown controls
+    "cooldown_clear", "cooldown_clear_all",
+
+    # Admin data/recovery
+    "reset", "restore",
+
+    # USDT admin
+    "usdt_pending", "usdt_approve", "usdt_reject",
+
+    # Payments & access admin
+    "admin_user", "admin_users", "admin_payments",
+    "admin_grant", "admin_revoke",
+]))
+
+def _normalize_cmd(text: str) -> str:
+    s = (text or "").strip()
+    if not s.startswith("/"):
+        return ""
+    s = s[1:]  # remove "/"
+    if " " in s:
+        s = s.split(" ", 1)[0]
+    if "@" in s:
+        s = s.split("@", 1)[0]
+    return s.lower()
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update or not update.message:
+        return
+
+    raw = update.message.text or ""
+    cmd = _normalize_cmd(raw)
+    if not cmd:
+        return
+
+    # Suggest closest command
+    matches = difflib.get_close_matches(cmd, KNOWN_COMMANDS, n=1, cutoff=0.62)
+    suggestion = matches[0] if matches else ""
+
+    if suggestion:
+        msg = (
+            "❌ *Unknown command*\n\n"
+            f"Did you mean: `/{suggestion}` ?\n\n"
+            "Type /help to see all commands."
+        )
+    else:
+        msg = (
+            "❌ *Unknown command*\n\n"
+            "Please check the spelling.\n"
+            "Type /help to see all commands."
+        )
+
+    try:
+        await update.message.reply_text(
+            msg,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        # plain text fallback
+        if suggestion:
+            await update.message.reply_text(
+                f"❌ Unknown command\n\nDid you mean: /{suggestion} ?\n\nType /help to see all commands."
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Unknown command\n\nPlease check the spelling.\nType /help to see all commands."
+            )
+
+
+
+# =========================================================
+# RISK
+# =========================================================
+def compute_risk_usd(user: dict, mode: str, value: float) -> float:
+    mode = mode.upper()
+    if mode == "USD":
+        return max(0.0, float(value))
+    eq = float(user["equity"])
+    live_eq = _live_equity_usdt()
+    if live_eq is not None:
+        eq = live_eq
+    if eq <= 0:
+        return 0.0
+    return max(0.0, eq * (float(value) / 100.0))
+
+def calc_qty(entry: float, sl: float, risk_usd: float) -> float:
+    d = abs(entry - sl)
+    if entry <= 0 or d <= 0 or risk_usd <= 0:
+        return 0.0
+    return risk_usd / d
+
+def entry_sanity_check(entry: float, current: float) -> Tuple[Optional[str], bool]:
+    """
+    Returns (warning_message, severe_flag).
+    - warning_message is None if entry looks normal.
+    - severe_flag True means it's extremely off and should be blocked unless user confirms.
+    """
+    try:
+        e = float(entry)
+        c = float(current)
+    except Exception:
+        return ("⚠️ Entry sanity check: could not compare entry vs current price.", False)
+
+    if c <= 0 or e <= 0:
+        return ("⚠️ Entry sanity check: entry/current must be positive.", True)
+
+    diff_pct = abs(e - c) / c * 100.0
+    ratio = e / c
+
+    # Detect common decimal-shift mistakes (x10 or /10)
+    dec_shift = ""
+    if 8.0 <= ratio <= 12.5:
+        dec_shift = " (looks like ~x10 higher — possible decimal mistake)"
+    elif 0.08 <= ratio <= 0.125:
+        dec_shift = " (looks like ~x10 lower — possible decimal mistake)"
+
+    # Tune thresholds here
+    WARN_PCT = 15.0
+    SEVERE_PCT = 40.0
+
+    if diff_pct < WARN_PCT:
+        return (None, False)
+
+    if diff_pct >= SEVERE_PCT:
+        msg = (
+            f"🚨 ENTRY PRICE LOOKS WRONG\n"
+            f"- Current: {fmt_price(c)}\n"
+            f"- Entered: {fmt_price(e)}\n"
+            f"- Difference: {diff_pct:.1f}%{dec_shift}\n"
+            f"Double-check your entry value."
+        )
+        return (msg, True)
+
+    msg = (
+        f"⚠️ Entry looks unusual vs current price\n"
+        f"- Current: {fmt_price(c)}\n"
+        f"- Entered: {fmt_price(e)}\n"
+        f"- Difference: {diff_pct:.1f}%{dec_shift}\n"
+        f"Please double-check."
+    )
+    return (msg, False)
+
+
+def daily_cap_usd(user: dict) -> float:
+    mode = user["daily_cap_mode"].upper()
+    val = float(user["daily_cap_value"])
+    if mode == "USD":
+        return max(0.0, val)
+    eq = float(user["equity"])
+    if eq <= 0:
+        return 0.0
+    return max(0.0, eq * (val / 100.0))
+
+# =========================================================
+# REPORTING / ADVICE
+# =========================================================
+def _stats_from_trades(trades: List[dict]) -> dict:
+    closed = [t for t in trades if t.get("closed_ts") is not None and t.get("pnl") is not None]
+    wins = [t for t in closed if float(t["pnl"]) > 0]
+    losses = [t for t in closed if float(t["pnl"]) < 0]
+    net = sum(float(t["pnl"]) for t in closed) if closed else 0.0
+    denom = (len(wins) + len(losses))
+    win_rate = (len(wins) / denom * 100.0) if denom else 0.0
+    avg_r = None
+    r_vals = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
+    if r_vals:
+        avg_r = sum(r_vals) / len(r_vals)
+    biggest_loss = min((float(t["pnl"]) for t in closed), default=0.0)
+    biggest_win = max((float(t["pnl"]) for t in closed), default=0.0)
+    return {
+        "closed_n": len(closed),
+        "wins": len(wins),
+        "losses": len(losses),
+        "net": net,
+        "win_rate": win_rate,
+        "avg_r": avg_r,
+        "biggest_loss": biggest_loss,
+        "biggest_win": biggest_win,
+    }
+
+def _advice(user: dict, stats: dict) -> List[str]:
+    adv = []
+    if stats["closed_n"] < 5:
+        adv.append("📌 Not enough data yet: close at least 5–10 trades for meaningful statistics.")
+    if stats["win_rate"] < 45 and stats["closed_n"] >= 5:
+        adv.append("⚠️ Low win rate detected: reduce trade frequency and only take high-confidence setups.")
+    if stats["avg_r"] is not None and stats["avg_r"] < 0.2 and stats["closed_n"] >= 5:
+        adv.append("⚠️ Low R-multiple: stop-loss may be too tight or profits are taken too early.")
+    if stats["biggest_loss"] < -0.9 * max(1.0, float(user["equity"]) * 0.01):
+        adv.append("🛑 A large loss detected: review stop-loss execution and slippage/re-entry discipline.")
+    if int(user["max_trades_day"]) <= 5:
+        adv.append("✅ Daily trade limits help prevent overtrading. Focus only on top-quality setups.")
+    return adv[:6]
+
+
+
+# =========================================================
+# USDT Payment
+# =========================================================
+
+async def usdt_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage:\n/usdt_paid <TXID> <standard|pro>"
+        )
+        return
+
+    txid, plan = context.args
+    plan = plan.lower()
+
+    if plan not in ("standard", "pro"):
+        await update.message.reply_text("Plan must be 'standard' or 'pro'")
+        return
+
+    if not is_valid_txid(txid):
+        await update.message.reply_text("❌ Invalid TXID format.")
+        return
+
+    if usdt_txid_exists(txid):
+        await update.message.reply_text("⚠️ This TXID has already been used.")
+        return
+
+    save_usdt_payment(
+        update.effective_user.id,
+        update.effective_user.username,
+        txid,
+        plan
+    )
+
+    await update.message.reply_text(
+        "✅ Payment submitted.\n"
+        "Status: Pending admin approval."
+    )
+
+    await context.bot.send_message(
+        chat_id=int(os.getenv("USDT_ADMIN_CHAT_ID")),
+        text=(
+            "🧾 New USDT payment request\n\n"
+            f"User: @{update.effective_user.username}\n"
+            f"Plan: {plan.upper()}\n"
+            f"TXID: {txid}\n\n"
+            f"Approve with:\n"
+            f"/usdt_approve {txid}"
+        )
+    )
+
+def approve_usdt(txid: str):
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE usdt_payments
+        SET status = 'APPROVED'
+        WHERE txid = ?
+    """, (txid,))
+    conn.commit()
+    conn.close()
+
+async def usdt_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != int(os.getenv("USDT_ADMIN_CHAT_ID")):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /usdt_approve <TXID>")
+        return
+
+    txid = context.args[0]
+
+    approve_usdt(txid)
+
+    await update.message.reply_text("✅ USDT payment approved.")
+
+    # 🔑 ACCESS GRANT HOOK
+    # TODO:
+    # grant_standard_access(user_id)
+    # grant_pro_access(user_id)
+
+# =========================================================
+# HELP TEXT (USER)
+# =========================================================
+
+HELP_TEXT = """\
+🚀 PulseFutures — Trading System in Telegram
+────────────────────
+Core Commands
+────────────────────
+/screen
+• Scan the market for high-quality setups
+
+/status
+• Your plan, trial status & enabled features
+
+/commands
+• Full command guide + examples
+
+/guide_full
+• Download the full user guide (PDF)
+
+────────────────────
+💎 Plans
+────────────────────
+🟢 Standard — Telegram only
+🔵 Pro — Telegram + Email alerts
+🎁 New users get a 7-day Pro trial automatically.
+
+🤖 Bot: @PulseFuturesBot
+📢 Updates: @PulseFutures
+🆘 Support: @PulseFuturesSupport
+"""\
+
+COMMANDS_TEXT = """\
+📘 PulseFutures — Command Guide & Examples
+
+PulseFutures is a full trading system inside Telegram.
+Below are the key commands with simple examples.
+
+────────────────────
+Core Commands
+────────────────────
+/status
+• Shows your plan (Trial/Standard/Pro) & enabled features
+
+/health
+• Bot & data health check 
+
+────────────────────
+Market & Signals 
+────────────────────
+/screen
+• Scans the market for high-quality setups
+
+────────────────────
+⚖️ RISK & POSITION SIZING
+────────────────────
+/equity
+• Set your equity
+
+/dailycap
+• Set your TOTAL daily risk cap (per day)
+
+/riskmode
+• Set your risk per trade (used by /size)
+
+
+/size <symbol> <side> <entry> <sl>
+• Calculates position size based on your per-trade risk
+• Daily cap is shown in /status and updates when trades go Risk-Free
+
+────────────────────
+Trade Journal
+────────────────────
+/trade_open
+• Log an opned position
+
+/trade_sl
+• Update Stop Loss
+
+/trade_rf
+• Risk-Free a position
+
+/trade_close
+• Log a closed position
+
+/trade_id_reset
+• Reset your Trade ID numbering (next trade starts from 1)
+
+────────────────────
+🕒 SESSION CONTROL
+────────────────────
+/sessions
+• View your session settings
+
+/sessions_on <ASIA|LON|NY>
+/sessions_off <ASIA|LON|NY>
+• Enable/disable sessions
+
+/sessions_on_unlimited
+/sessions_off_unlimited
+• 24-hour mode for scans
+
+/trade_window
+• Set allowed trading time window 
+
+────────────────────
+⚠️ EMAILS & ALERTS
+────────────────────
+
+/email you@gmail.com
+• Set your email for alerts
+
+/email_test
+• Send a test email to confirm delivery
+
+/email on
+• Enable email
+
+/email off
+• Disable email
+
+/limits emailcap 
+• Set number of emails per session
+
+/limits emailgap
+• Set min gap between emails 
+
+/limits emaildaycap 
+• Set max number of emails per day
+
+/bigmove_alert on|off [4H%] [1H%]
+• Big move alerts in either direction (UP or DOWN)
+
+────────────────────
+⏰ TIMEZONE (LOCAL TIME IN EMAILS)
+────────────────────
+/tz
+• Show your current timezone
+
+/tz <Region/City>
+• Set your timezone so emails show your local time
+• Use IANA format: Region/City
+
+Examples:
+/tz Australia/Melbourne
+/tz Asia/Dubai   
+/tz Europe/London
+/tz America/New_York
+
+────────────────────
+Reports 
+────────────────────
+/report_daily 
+• Daily performance report 
+
+/report_weekly 
+• Weekly performance report 
+
+/report_overall 
+• All-time performance report 
+
+────────────────────
+🆘 HELP & SUPPORT
+────────────────────
+/help
+• Quick overview
+
+/commands
+• Full guide (this)
+
+/guide_full
+• Download the full user guide (PDF)
+
+/Support
+• Submit your support request
+
+────────────────────
+📢 Channels
+────────────────────
+Channel: @PulseFutures
+Support: @PulseFuturesSupport
+YouTube: @PulseFutures
+Website: https://pulsefutures.com/
+
+"""\
+
+# =========================================================
+# HELP TEXT (ADMIN)
+# =========================================================
+
+HELP_TEXT_ADMIN = """\
+🛠 PulseFutures — Admin Command Guide
+
+Admin commands are powerful. Use carefully.
+Not financial advice.
+
+────────────────────
+👤 USERS & ACCESS
+────────────────────
+/admin_user <user_id>
+• View full user record (plan, trial, alerts)
+
+/admin_users
+• List users (overview)
+
+/admin_grant <user_id> <standard|pro>
+• Grant or change user plan
+
+/admin_revoke <user_id>
+• Revoke paid access (sets to FREE)
+
+/admin_reset_report
+/admin_reset_signal_reports
+/setups_log [n] [screen|email|all]
+• Archive signals/outcomes and reset live performance report
+
+/myplan
+• View your own plan status (admins too)
+
+/trade_id_reset
+• Reset your own Trade ID numbering (next trade starts from 1)
+
+────────────────────
+💳 PAYMENTS
+────────────────────
+/payment_approve <user_id> <payment_id> <standard|pro>
+• Approve a payment received (Stripe or USDT) and grant access
+
+/admin_payments
+• Show all users: User ID / Last Payment Approval / Plan
+  (Plan comes from /admin_grant)
+
+────────────────────
+⏱️ COOLDOWNS
+────────────────────
+/cooldown
+/cooldowns
+• View cooldowns
+
+/cooldown_clear <SYMBOL> <long|short>
+• Clear cooldown for one symbol + side
+
+/cooldown_clear_all
+• Clear all cooldowns (global)
+
+────────────────────
+⚙️ DATA / RECOVERY
+────────────────────
+/reset
+• Reset user data / clean DB (⚠️ DANGEROUS)
+
+/restore
+• Restore previously removed data (if backup exists)
+
+────────────────────
+🧪 DIAGNOSTICS
+────────────────────
+/why
+• Last /screen reject summary (why no setups)
+
+/email_decision
+• Last email decision (why email sent/skipped/error)
+
+/health_sys
+• System health (DB, exchange, email)
+
+────────────────────
+📢 Channels
+────────────────────
+Channel: @PulseFutures
+Support: @PulseFuturesSupport
+YouTube: @PulseFutures
+Website: https://pulsefutures.com/
+
+
+────────────────────
+📊 SIGNAL REPORTING
+────────────────────
+/admin_reset_report
+• (Admin) Archive signals/outcomes and reset live performance report
+
+🤖 AUTOTRADE SESSION CONTROL
+────────────────────
+/autotrade_sessions
+• Show current auto-trade sessions (admin)
+/autotrade_sessions NY
+/autotrade_sessions NY,LON
+/autotrade_sessions NY,LON,ASIA
+• Set allowed sessions for auto-trading (admin)
+
+
+/signal_report [hours]
+• Evaluate emailed setups for the requesting user in the last N hours (default 24)
+• Uses Bybit 1m OHLCV to detect which level hit first: TP1/TP2/TP3/SL
+• Outputs a table + win rates by session
+• Outcomes: WIN_TP1, WIN_TP2, WIN_TP3, LOSS, OPEN, AMBIGUOUS
+
+/signal_report_overall
+• Overall performance summary across ALL emailed setups (short output)
+• Includes win-rate, TP1/TP2/TP3/SL counts, Avg R/trade, Profit Factor
+• Uses stored evaluated outcomes; shows coverage %
+
+/autotrade_report [hours]
+• Journal/report for bot-opened positions (default 24h)
+• Evaluates TP/SL hit-order via Bybit 1m OHLCV (same as signal_report)
+
+/autotrade_last
+• Shows the last AutoTrade attempt details (symbol sent, qty/step/minNotional, Bybit retCode/retMsg)
+
+/autotrade_report_overall
+• Overall performance summary for bot-opened positions (same metrics as signal_report_overall)
+
+/signal_report_all
+• Alias for /signal_report_overall
+
+────────────────────
+🆘 SUPPORT
+────────────────────
+/support_open
+• List open support tickets (admin)
+
+/support_close <TICKET_ID>
+• Close a support ticket
+
+(Users)
+ /support <issue>
+ /support_status
+
+"""\
+
+
+# =========================================================
+# PERFORMANCE HELPERS
+# =========================================================
+
+def _run_coro_in_thread(coro):
+    """Run an async coroutine to completion in a worker thread."""
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        # Fallback for edge cases where a loop is already running in that thread
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+
+# =========================================================
+# SIGNAL PERFORMANCE METRICS
+# =========================================================
+
+def _r_multiple(side: str, entry: float, sl: float, tp: float) -> float | None:
+    """Return R-multiple for reaching `tp` with risk defined by (entry-sl).
+    BUY: reward = tp-entry
+    SELL: reward = entry-tp
+    """
+    try:
+        side_u = (side or "").strip().upper()
+        entry = float(entry); sl = float(sl); tp = float(tp)
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return None
+        if side_u == "BUY":
+            reward = tp - entry
+        else:
+            reward = entry - tp
+        return reward / risk
+    except Exception:
+        return None
+
+# =========================================================
+# BILLING COMMANDS (Stripe Payment Links + USDT)
+# =========================================================
+
+
+def _realized_r_option_b(outcome: str, side: str, entry: float, sl: float, tp1, tp2, tp3):
+    """Option B scale-out 40/40/20 realized R.
+    LOSS = -1R.
+    WIN_TP1: 0.4*R1 (conservative: remaining exits at 0R)
+    WIN_TP2: 0.4*R1 + 0.6*R2 (remaining 20% exits at TP2)
+    WIN_TP3: 0.4*R1 + 0.4*R2 + 0.2*R3
+    """
+    out = (outcome or "").strip().upper()
+    side_u = (side or "").strip().upper()
+    if out == "LOSS":
+        return -1.0
+    if out not in ("WIN_TP1", "WIN_TP2", "WIN_TP3"):
+        return None
+
+    r1 = _r_multiple(side_u, entry, sl, tp1) if tp1 is not None else None
+    r2 = _r_multiple(side_u, entry, sl, tp2) if tp2 is not None else None
+    r3 = _r_multiple(side_u, entry, sl, tp3) if tp3 is not None else None
+
+    if out == "WIN_TP1":
+        return 0.4 * r1 if r1 is not None else None
+    if out == "WIN_TP2":
+        if r1 is None or r2 is None:
+            return None
+        return 0.4 * r1 + 0.6 * r2
+    if out == "WIN_TP3":
+        if r1 is None or r2 is None or r3 is None:
+            return None
+        return 0.4 * r1 + 0.4 * r2 + 0.2 * r3
+    return None
+
+def _env(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    return (v or default).strip()
+
+def _mask_addr(addr: str) -> str:
+    a = (addr or "").strip()
+    if len(a) <= 14:
+        return a
+    return f"{a[:6]}…{a[-6:]}"
+
+async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Billing menu: Stripe Payment Links + USDT (MANUAL activation for Stripe).
+    - Safe: uses env vars only for Stripe links (no Stripe API calls required)
+    - USDT address works with either USDT_ADDRESS or USDT_RECEIVE_ADDRESS
+    - Does NOT require email to show billing
+    """
+    user = update.effective_user
+    uid = user.id if user else None
+
+    # Stripe payment links
+    stripe_standard_url = _env("STRIPE_STANDARD_URL")
+    stripe_pro_url = _env("STRIPE_PRO_URL")
+
+    # USDT config (support BOTH possible env names)
+    usdt_network = _env("USDT_NETWORK", "TRC20")
+    usdt_address = _env("USDT_ADDRESS") or _env("USDT_RECEIVE_ADDRESS")
+    usdt_note = _env("USDT_NOTE")  # optional
+
+    # Prices (display only)
+    usdt_standard_price = _env("USDT_STANDARD_PRICE", "45")
+    usdt_pro_price = _env("USDT_PRO_PRICE", "99")
+
+    # Support
+    support_handle = _env("BILLING_SUPPORT_HANDLE", "@PulseFuturesSupport")
+
+    # Reference (helps you match tickets/payments)
+    ref = f"PF-{uid}" if uid else "PF-UNKNOWN"
+
+    lines = []
+    lines.append("💳 PulseFutures — Billing & Upgrade")
+    lines.append("")
+    lines.append("Choose your payment method below.")
+    lines.append(f"Reference (important): {ref}")
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("1) Stripe (Card / Apple Pay / Google Pay)")
+    lines.append("────────────────────")
+    if stripe_standard_url or stripe_pro_url:
+        lines.append("Tap a plan button to pay securely via Stripe.")
+        lines.append("✅ Activation is MANUAL for now (fast). After paying, send:")
+        lines.append(f"• Reference: {ref}")
+        lines.append(f"• Telegram ID: {uid if uid else 'unknown'}")
+        lines.append("• Plan: Standard or Pro")
+        lines.append("• Stripe email used")
+        lines.append(f"Support: {support_handle}")
+    else:
+        lines.append("Stripe is not configured yet.")
+        lines.append("Admin: set STRIPE_STANDARD_URL / STRIPE_PRO_URL in Render env vars.")
+
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("2) USDT")
+    lines.append("────────────────────")
+    if usdt_address:
+        lines.append(f"Network: USDT ({usdt_network})")
+        lines.append(f"Address: {usdt_address}")
+        lines.append(f"(Short: {_mask_addr(usdt_address)})")
+        lines.append(f"Prices: Standard {usdt_standard_price} USDT • Pro {usdt_pro_price} USDT")
+        if usdt_note:
+            lines.append(f"Note: {usdt_note.replace('<REF>', ref)}")
+        else:
+            lines.append(f"Note: Use reference '{ref}' in your message to support if needed.")
+        lines.append("After paying, submit:")
+        lines.append("/usdt_paid <TXID> <standard|pro>")
+    else:
+        lines.append("USDT is not configured yet.")
+        lines.append("Admin: set USDT_ADDRESS or USDT_RECEIVE_ADDRESS in Render env vars.")
+        lines.append("Optional: set USDT_NETWORK (default TRC20).")
+
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("After payment (Activation)")
+    lines.append("────────────────────")
+    lines.append("✅ Stripe:")
+    lines.append(f"Send to Support: {support_handle}")
+    lines.append(f"1) Reference: {ref}")
+    lines.append(f"2) Telegram ID: {uid if uid else 'unknown'}")
+    lines.append("3) Plan: Standard or Pro")
+    lines.append("4) Stripe email used")
+    lines.append("")
+    lines.append("✅ USDT:")
+    lines.append("Submit: /usdt_paid <TXID> <standard|pro>")
+    lines.append(f"Support: {support_handle}")
+    lines.append(f"Reference: {ref}")
+
+    msg = "\n".join(lines)
+
+    # Buttons (Stripe)
+    buttons = []
+    stripe_row = []
+    if stripe_standard_url:
+        stripe_row.append(InlineKeyboardButton("✅ Stripe — Standard", url=stripe_standard_url))
+    if stripe_pro_url:
+        stripe_row.append(InlineKeyboardButton("🚀 Stripe — Pro", url=stripe_pro_url))
+    if stripe_row:
+        buttons.append(stripe_row)
+
+    howto_url = _env("BILLING_HOWTO_URL")
+    if howto_url:
+        buttons.append([InlineKeyboardButton("ℹ️ Payment Instructions", url=howto_url)])
+
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+
+    await send_long_message(
+        update,
+        msg,
+        parse_mode=None,
+        disable_web_page_preview=True,
+        reply_markup=reply_markup,
+    )
+
+# =========================================================
+# Table Format
+# =========================================================
+
+def _format_help_table(rows, col_cmd=16, col_what=46, col_ex=28) -> str:
+    """
+    Monospace table with wrapping; optional Example column.
+    rows: [{"cmd": str, "what": str, "ex": str|""}, ...]
+    - If ex == cmd -> omit example.
+    - If no examples in a section -> omit Example column entirely.
+    """
+    clean_rows = []
+    any_ex = False
+
+    for r in rows:
+        cmd = (r.get("cmd") or "").strip()
+        what = (r.get("what") or "").strip()
+        ex = (r.get("ex") or "").strip()
+
+        if ex == cmd:
+            ex = ""
+        if ex:
+            any_ex = True
+
+        clean_rows.append({"cmd": cmd, "what": what, "ex": ex})
+
+    if any_ex:
+        header = f"{'Command':<{col_cmd}}  {'What it does':<{col_what}}  {'Example':<{col_ex}}"
+        sep    = f"{'-'*col_cmd}  {'-'*col_what}  {'-'*col_ex}"
+    else:
+        header = f"{'Command':<{col_cmd}}  {'What it does':<{col_what}}"
+        sep    = f"{'-'*col_cmd}  {'-'*col_what}"
+
+    lines = [header, sep]
+
+    for r in clean_rows:
+        cmd = r["cmd"][:col_cmd]
+        what_lines = textwrap.wrap(r["what"], width=col_what) or [""]
+        if any_ex:
+            ex_lines = textwrap.wrap(r["ex"], width=col_ex) or [""]
+            n = max(len(what_lines), len(ex_lines))
+            for i in range(n):
+                c = cmd if i == 0 else ""
+                w = what_lines[i] if i < len(what_lines) else ""
+                e = ex_lines[i] if i < len(ex_lines) else ""
+                lines.append(f"{c:<{col_cmd}}  {w:<{col_what}}  {e:<{col_ex}}")
+        else:
+            for i, w in enumerate(what_lines):
+                c = cmd if i == 0 else ""
+                lines.append(f"{c:<{col_cmd}}  {w:<{col_what}}")
+
+    return "\n".join(lines)
+
+
+def build_help_html(title: str, sections: list) -> str:
+    """
+    sections: [{"name": str, "rows": [...]}, ...]
+    Produces HTML message with <pre> monospace tables.
+    """
+    parts = [f"📘 <b>{html.escape(title)}</b>"]
+    for sec in sections:
+        parts.append(f"\n<b>• {html.escape(sec['name'])}</b>")
+        table = _format_help_table(sec["rows"])
+        parts.append(f"<pre>{html.escape(table)}</pre>")
+    return "\n".join(parts)
+
+
+# =========================================================
+# TELEGRAM COMMANDS
+# =========================================================
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Plain text help (no tables, no HTML builder)
+    await send_long_message(
+        update,
+        HELP_TEXT,
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
+
+async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Full command guide with examples
+    await send_long_message(
+        update,
+        COMMANDS_TEXT,
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
+
+
+
+
+async def guide_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Sends the full PulseFutures User Guide as a PDF document in Telegram.
+    """
+    try:
+        # The PDF should be committed to the repo alongside the bot code.
+        pdf_name = "PulseFutures_User_Guide.pdf"
+        pdf_path = pdf_name
+        if not os.path.exists(pdf_path):
+            # Fallback to the directory of this script (Render runs from /opt/render/project/src)
+            try:
+                pdf_path = os.path.join(os.path.dirname(__file__), pdf_name)
+            except Exception:
+                pdf_path = pdf_name
+
+        if not os.path.exists(pdf_path):
+            await update.message.reply_text("❌ PDF guide file is not available right now.")
+            return
+
+        caption = "📘 PulseFutures — Full User Guide (PDF)"
+        with open(pdf_path, "rb") as fh:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=fh,
+                filename=pdf_name,
+                caption=caption,
+            )
+    except Exception:
+        await update.message.reply_text("❌ Could not send the guide. Please try again.")
+
+async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Admin only.")
+        return
+
+    await send_long_message(
+        update,
+        HELP_TEXT_ADMIN,
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start — must never crash.
+
+    Rules:
+    - Any Telegram user can start the bot (after joining your channel you can optionally check elsewhere).
+    - New users get a 7-day trial automatically on first /start.
+    - If trial expired (and no paid plan), show upgrade message.
+    """
+    uid = update.effective_user.id
+
+    # Ensure DB schema is migrated before touching plan/trial columns
+    try:
+        ensure_email_column()   # includes ensure_billing_columns()
+    except Exception:
+        try:
+            ensure_billing_columns()
+        except Exception:
+            pass
+
+    # Ensure user row exists
+    try:
+        user = get_user(uid) or {}
+    except Exception as e:
+        logger.exception("/start get_user failed for uid=%s: %s", uid, e)
+        try:
+            await update.message.reply_text("❌ Internal error creating your account. Please try again.")
+        except Exception:
+            pass
+        return
+
+    # Start 7-day trial ONCE (only if currently free)
+    try:
+        ensure_trial_started(uid, user, force=True)
+    except Exception as e:
+        # One more attempt after re-migrating (covers older DBs missing columns)
+        logger.exception("/start ensure_trial_started failed for uid=%s: %s", uid, e)
+        try:
+            ensure_email_column()
+        except Exception:
+            try:
+                ensure_billing_columns()
+            except Exception:
+                pass
+        try:
+            user = get_user(uid) or {}
+            ensure_trial_started(uid, user, force=True)
+        except Exception as e2:
+            logger.exception("/start ensure_trial_started retry failed for uid=%s: %s", uid, e2)
+            try:
+                await update.message.reply_text("❌ Internal error starting your trial. Please try again.")
+            except Exception:
+                pass
+            return
+
+    # Refresh and gate access
+    try:
+        user = get_user(uid) or {}
+    except Exception:
+        user = user or {}
+
+    if not has_active_access(uid, user):
+        try:
+            await update.message.reply_text(
+                f"⛔️ Access locked.\n\n"
+                f"Your 7-day free trial has ended.\n\n"
+                f"To continue, choose a plan:\n"
+                f"• Standard — $49/month\n"
+                f"• Pro — $99/month\n\n"
+                f"👉 /billing\n\n"
+                f"📣 Optional updates: {REQUIRED_CHANNEL_PUBLIC_URL}"
+            )
+        except Exception:
+            pass
+        return
+
+    await cmd_help(update, context)
+
+
+# =========================================================
+# SUPPORT SYSTEM
+# =========================================================
+
+# Support notifications:
+# - Admin IDs always receive tickets
+# - Optionally forward to a dedicated support group/channel where the bot is admin:
+#     Set SUPPORT_CHAT_ID="-1001234567890"
+SUPPORT_CHAT_ID = os.getenv("SUPPORT_CHAT_ID", "").strip()
+
+def _admin_ids_all() -> List[int]:
+    ids = set()
+    # ADMIN_IDS is used in many places
+    try:
+        for x in (ADMIN_IDS or []):
+            try:
+                ids.add(int(x))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # ADMIN_USER_IDS (legacy)
+    try:
+        for x in (ADMIN_USER_IDS or []):
+            try:
+                ids.add(int(x))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Single env fallbacks
+    for k in ("ADMIN_TELEGRAM_ID", "OWNER_USER_ID", "ADMIN_ID"):
+        v = os.getenv(k, "").strip()
+        if v:
+            try:
+                ids.add(int(v))
+            except Exception:
+                pass
+    return sorted(ids)
+
+def _support_db_init() -> None:
+    con = None
+    try:
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                ticket_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                username TEXT,
+                message TEXT,
+                status TEXT,
+                created_ts REAL,
+                updated_ts REAL
+            )
+        """)
+        con.commit()
+    except Exception:
+        try:
+            if con:
+                con.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            if con:
+                con.close()
+        except Exception:
+            pass
+
+def _support_ticket_create(ticket_id: str, user_id: int, username: str, message: str):
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    ts = time.time()
+    cur.execute("""
+        INSERT OR REPLACE INTO support_tickets (ticket_id, user_id, username, message, status, created_ts, updated_ts)
+        VALUES (?, ?, ?, ?, 'OPEN', ?, ?)
+    """, (str(ticket_id), int(user_id), str(username or ""), str(message or ""), float(ts), float(ts)))
+    con.commit()
+    con.close()
+
+def _support_ticket_latest_for_user(user_id: int) -> Optional[dict]:
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM support_tickets WHERE user_id=? ORDER BY created_ts DESC LIMIT 1", (int(user_id),))
+    r = cur.fetchone()
+    con.close()
+    return dict(r) if r else None
+
+def _support_ticket_list_open(limit: int = 20) -> List[dict]:
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM support_tickets WHERE status='OPEN' ORDER BY created_ts DESC LIMIT ?", (int(limit),))
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(x) for x in rows]
+
+def _support_ticket_set_status(ticket_id: str, status: str):
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    ts = time.time()
+    cur.execute("UPDATE support_tickets SET status=?, updated_ts=? WHERE ticket_id=?", (str(status), float(ts), str(ticket_id)))
+    con.commit()
+    con.close()
+
+async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n/support <your issue>"
+        )
+        return
+
+    issue = " ".join(context.args).strip()
+    if not issue:
+        await update.message.reply_text(
+            "Usage:\n/support <your issue>"
+        )
+        return
+
+    ticket_id = f"TKT-{uid}-{int(time.time())}"
+    username = getattr(update.effective_user, "username", "") or ""
+
+    _support_ticket_create(ticket_id, uid, username, issue)
+
+    msg = (
+        f"🆘 Support Ticket {ticket_id}\n\n"
+        f"User: {uid} @{username}\n"
+        f"Message:\n{issue}"
+    )
+
+    # Notify admins
+    for admin in _admin_ids_all():
+        try:
+            await context.bot.send_message(admin, msg)
+        except Exception:
+            pass
+
+    # Optional: forward to a dedicated support group/channel
+    if SUPPORT_CHAT_ID:
+        try:
+            await context.bot.send_message(chat_id=SUPPORT_CHAT_ID, text=msg)
+        except Exception:
+            pass
+
+    await update.message.reply_text(
+        f"✅ Ticket created: {ticket_id}\n"
+        "Use /support_status to check progress."
+    )
+
+
+async def support_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    t = _support_ticket_latest_for_user(uid)
+
+    if not t:
+        await update.message.reply_text(
+            "📨 You have no support tickets yet. Use /support <your issue>."
+        )
+        return
+
+    status = str(t.get("status") or "OPEN").upper()
+    tid = str(t.get("ticket_id") or "")
+
+    await update.message.reply_text(
+        f"📨 Latest ticket: {tid}\n"
+        f"Status: {status}\n\n"
+        "If you need to add more info, create a new ticket with /support <your issue>."
+    )
+
+
+
+async def admin_support_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("Admin only.")
+        return
+
+    rows = _support_ticket_list_open(limit=30)
+    if not rows:
+        await update.message.reply_text("✅ No open support tickets.")
+        return
+
+    lines = ["🧾 Open support tickets", HDR]
+    for r in rows:
+        tid = r.get("ticket_id")
+        u = r.get("user_id")
+        un = r.get("username") or ""
+        msg = (r.get("message") or "").strip().replace("\n", " ")
+        if len(msg) > 80:
+            msg = msg[:77] + "..."
+        lines.append(f"- {tid} | {u} @{un} | {msg}")
+    lines.append(HDR)
+    lines.append("Close: /support_close <TICKET_ID>")
+    await send_long_message(update, "\n".join(lines), parse_mode=None, disable_web_page_preview=True)
+
+async def admin_support_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage:\n/support_close <TICKET_ID>")
+        return
+    tid = str(context.args[0]).strip()
+    _support_ticket_set_status(tid, "CLOSED")
+    await update.message.reply_text(f"✅ Closed: {tid}")
+
+
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    smtp_err = _LAST_SMTP_ERROR.get(uid, "")
+    msg = [
+        "🫀 PulseFutures Health",
+        HDR,
+        f"User TZ: {user['tz']}",
+        f"Email Engine: {'ACTIVE' if EMAIL_ENABLED and email_config_ok() else 'OFF/NOT CONFIGURED'}",
+        f"SMTP last error: {smtp_err if smtp_err else '-'}",
+        HDR,
+    ]
+    await update.message.reply_text("\n".join(msg).strip())
+
+
+
+async def diag_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /diag_on [friendly|off]
+    Non-admin can only choose friendly/off. Admin always full.
+    """
+    uid = update.effective_user.id
+    if is_admin_user(uid):
+        _USER_DIAG_MODE[uid] = "full"
+        await update.message.reply_text("✅ Diagnostics: FULL (admin).")
+        return
+
+    mode = (context.args[0].strip().lower() if context.args else "friendly")
+    if mode not in {"friendly", "off"}:
+        await update.message.reply_text("Usage: /diag_on friendly  OR  /diag_on off")
+        return
+    _USER_DIAG_MODE[uid] = mode
+    await update.message.reply_text(f"✅ Diagnostics set to: {mode}")
+
+async def diag_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /diag_off  -> hides diagnostics for this user (non-admin).
+    """
+    uid = update.effective_user.id
+    if is_admin_user(uid):
+        await update.message.reply_text("✅ Admin diagnostics همیشه FULL است.")
+        return
+    _USER_DIAG_MODE[uid] = "off"
+    await update.message.reply_text("✅ Diagnostics: OFF")
+
+async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not context.args:
+        await update.message.reply_text(
+            f"Your TZ: {user['tz']}\n\n"
+            "Set your timezone (IANA format Region/City):\n"
+            "• /tz Australia/Melbourne\n"
+            "• /tz Asia/Dubai (UAE)\n"
+            "• /tz Europe/London\n"
+            "• /tz America/New_York"
+        )
+        return
+    tz_name = " ".join(context.args).strip()
+    try:
+        ZoneInfo(tz_name)
+    except Exception:
+        await update.message.reply_text(
+            "Invalid timezone. Use Region/City, for example:\n"
+            "• /tz Australia/Melbourne\n"
+            "• /tz Asia/Dubai (UAE)\n"
+            "• /tz Europe/London\n"
+            "• /tz America/New_York"
+        )
+        return
+    sessions = ['NY']
+    update_user(uid, tz=tz_name, sessions_enabled=json.dumps(sessions))
+    await update.message.reply_text(f"✅ TZ set to {tz_name}\nDefault sessions updated. Use /sessions to view.")
+
+async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+
+    # ✅ Admin: /equity is LIVE-synced with Bybit (same as /status)
+    if not context.args:
+        if is_admin_user(int(uid)):
+            live_eq = _live_equity_usdt()
+            if live_eq is not None:
+                eq = float(live_eq)
+                try:
+                    update_user(int(uid), equity=eq)
+                except Exception:
+                    pass
+                await update.message.reply_text(f"Equity (Bybit): ${eq:.2f}")
+                return
+
+        await update.message.reply_text(f"Equity: ${float(user.get('equity') or 0.0):.2f}")
+        return
+
+    # ✅ Non-admins: manual equity setting (used for /size and journaling)
+    if is_admin_user(int(uid)):
+        await update.message.reply_text(
+            "Admin equity is LIVE-synced with Bybit.\n"
+            "Manual override is disabled for Admin.\n\n"
+            "Tip: If you want manual equity, switch AutoTrade to paper or disable live sync."
+        )
+        return
+
+    try:
+        eq = float(context.args[0])
+        if eq < 0:
+            raise ValueError()
+        update_user(int(uid), equity=eq)
+        await update.message.reply_text(f"✅ Equity set: ${eq:.2f}")
+    except Exception:
+        await update.message.reply_text("Usage: /equity 1000")
+async def equity_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_user(uid, equity=0.0)
+    await update.message.reply_text("✅ Equity reset to $0.00")
+
+
+async def riskmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    # This is PER-TRADE risk used by /size (position sizing).
+    if len(context.args) != 2:
+        mode = str(user.get("risk_mode", DEFAULT_RISK_MODE)).upper()
+        val = float(user.get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
+        per_trade_usd = compute_risk_usd(user, mode, val)
+        await update.message.reply_text(
+            f"Risk per trade (used by /size): {mode} {val:.2f} (≈ ${per_trade_usd:.2f} per trade)\n"
+            f"Daily risk cap is separate: /dailycap\n\n"
+            "Set examples:\n"
+            "• /riskmode pct 2.5\n"
+            "• /riskmode usd 25"
+        )
+        return
+
+    mode = context.args[0].strip().upper()
+    try:
+        val = float(context.args[1])
+    except Exception:
+        await update.message.reply_text("Usage: /riskmode pct 2.5  OR  /riskmode usd 25")
+        return
+
+    if mode not in {"PCT", "USD"}:
+        await update.message.reply_text("Mode must be pct or usd")
+        return
+    if mode == "PCT" and not (0.0 <= val <= 10):
+        await update.message.reply_text("pct per-trade should be between 0 and 10")
+        return
+    if mode == "USD" and val < 0:
+        await update.message.reply_text("usd per-trade must be >= 0")
+        return
+
+    update_user(uid, risk_mode=mode, risk_value=val)
+    user = get_user(uid)
+    per_trade_usd = compute_risk_usd(user, mode, val)
+    await update.message.reply_text(
+        f"✅ Risk per trade updated: {mode} {val:.2f} (≈ ${per_trade_usd:.2f} per trade)\n"
+        f"Daily cap is separate: /dailycap"
+    )
+
+async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    # This is TOTAL DAILY risk cap (sum of open risks for today's trades).
+    if len(context.args) != 2:
+        cap = daily_cap_usd(user)
+        mode = str(user.get("daily_cap_mode", DEFAULT_DAILY_CAP_MODE)).upper()
+        val = float(user.get("daily_cap_value", DEFAULT_DAILY_CAP_VALUE) or DEFAULT_DAILY_CAP_VALUE)
+        await update.message.reply_text(
+            f"Daily risk cap (TOTAL per day): {mode} {val:.2f} (≈ ${cap:.2f} per day)\n"
+            f"Per-trade risk is separate: /riskmode\n\n"
+            "Set examples:\n"
+            "• /dailycap pct 5\n"
+            "• /dailycap usd 60"
+        )
+        return
+
+    mode = context.args[0].strip().upper()
+    try:
+        val = float(context.args[1])
+    except Exception:
+        await update.message.reply_text("Usage: /dailycap pct 5  OR  /dailycap usd 60")
+        return
+
+    if mode not in {"PCT", "USD"}:
+        await update.message.reply_text("Mode must be pct or usd")
+        return
+    if mode == "PCT" and not (0.0 <= val <= 30):
+        await update.message.reply_text("pct/day should be between 0 and 30")
+        return
+    if mode == "USD" and val < 0:
+        await update.message.reply_text("usd/day must be >= 0")
+        return
+
+    update_user(uid, daily_cap_mode=mode, daily_cap_value=val)
+    user = get_user(uid)
+    await update.message.reply_text(
+        f"✅ Daily risk cap updated: {mode} {float(val):.2f} (≈ ${daily_cap_usd(user):.2f} per day)"
+    )
+
+
+async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            f"Limits:\n"
+            f"- maxtrades: {int(user['max_trades_day'])}\n"
+            f"- emailcap: {int(user['max_emails_per_session'])} (0 = unlimited)\n"
+            f"- emailgap: {int(user['email_gap_min'])} min\n"
+            f"- emaildaycap: {int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0 = unlimited)\n\n"
+            f"Set examples:\n"
+            f"/limits maxtrades 5\n"
+            f"/limits emailcap 0\n"
+            f"/limits emailgap 60\n"
+            f"/limits emaildaycap 0\n"
+        )
+        return
+
+    key = context.args[0].strip().lower()
+    try:
+        val = int(float(context.args[1]))
+    except Exception:
+        await update.message.reply_text("Value must be a number.")
+        return
+
+    if key == "maxtrades":
+        if not (1 <= val <= 50):
+            await update.message.reply_text("maxtrades must be 1..50")
+            return
+        update_user(uid, max_trades_day=val)
+        await update.message.reply_text(f"✅ maxtrades/day set to {val}")
+
+    elif key == "emailcap":
+        if not (0 <= val <= 50):
+            await update.message.reply_text("emailcap must be 0..50 (0 = unlimited)")
+            return
+        update_user(uid, max_emails_per_session=val)
+        await update.message.reply_text(f"✅ emailcap/session set to {val} (0 = unlimited)")
+
+    elif key == "emailgap":
+        if not (0 <= val <= 360):
+            await update.message.reply_text("emailgap must be 0..360 minutes")
+            return
+        update_user(uid, email_gap_min=val)
+        await update.message.reply_text(f"✅ emailgap set to {val} minutes")
+
+    elif key in {"emaildaycap", "dailyemailcap", "emailcapday"}:
+        if not (0 <= val <= 50):
+            await update.message.reply_text("emaildaycap must be 0..50 (0 = unlimited)")
+            return
+        update_user(uid, max_emails_per_day=val)
+        await update.message.reply_text(f"✅ daily email cap set to {val} (0 = unlimited)")
+
+    else:
+        await update.message.reply_text("Unknown key. Use: maxtrades | emailcap | emailgap | emaildaycap")
+
+async def sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    enabled = user_enabled_sessions(user)
+    now_s = in_session_now(user)
+    now_live = _guess_session_name_utc(datetime.now(timezone.utc))
+    if int(user.get("sessions_unlimited", 0) or 0) == 1:
+        now_txt = f"Now in session: {now_live}"
+    else:
+        now_txt = f"Now in session: {now_s['name']}" if now_s else "Now in session: NONE"
+    await update.message.reply_text(
+        f"Your TZ: {user['tz']}\n"
+        f"{now_txt}\n\n"
+        f"Enabled sessions (priority): {', '.join(enabled)}\n"
+        f"Available: ASIA, LON, NY\n\n"
+        f"Enable: /sessions_on NY\n"
+        f"Disable: /sessions_off LON"
+    )
+
+async def sessions_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not context.args:
+        await update.message.reply_text("Usage: /sessions_on NY")
+        return
+    name = context.args[0].strip().upper()
+    if name not in SESSIONS_UTC:
+        await update.message.reply_text("Session must be one of: ASIA, LON, NY")
+        return
+
+    enabled = user_enabled_sessions(user)
+    if name not in enabled:
+        enabled.append(name)
+
+    enabled = _order_sessions(enabled) or enabled
+    update_user(uid, sessions_enabled=json.dumps(enabled))
+    await update.message.reply_text(f"✅ Enabled sessions: {', '.join(enabled)}")
+
+async def sessions_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not context.args:
+        await update.message.reply_text("Usage: /sessions_off ASIA")
+        return
+
+    name = context.args[0].strip().upper()
+    if name not in SESSIONS_UTC:
+        await update.message.reply_text("Session must be one of: ASIA, LON, NY")
+        return
+
+    enabled = [s for s in user_enabled_sessions(user) if s != name]
+
+    # Never allow "no sessions" — fall back to sensible defaults
+    if not enabled:
+        enabled = _default_sessions_for_tz(user["tz"])
+        enabled = _order_sessions(enabled) or enabled
+
+    update_user(uid, sessions_enabled=json.dumps(enabled))
+    await update.message.reply_text(
+        f"✅ Disabled: {name}\n"
+        f"Enabled sessions: {', '.join(enabled)}"
+    )
+
+
+async def sessions_on_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_user(uid, sessions_unlimited=1)
+    await update.message.reply_text("✅ Sessions: UNLIMITED (24h emailing enabled).")
+
+async def sessions_off_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_user(uid, sessions_unlimited=0)
+    await update.message.reply_text("✅ Sessions: back to normal (enabled sessions only).")
+
+async def sessions_unlimited_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: /sessions_unlimited_on
+    await sessions_on_unlimited_cmd(update, context)
+
+async def sessions_unlimited_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: /sessions_unlimited_off
+    await sessions_off_unlimited_cmd(update, context)
+
+async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+        
+    if not context.args:
+        on = int(user.get("bigmove_alert_on", 1) or 0)
+        p4 = float(user.get("bigmove_alert_4h", 20) or 20)
+        p1 = float(user.get("bigmove_alert_1h", 10) or 10)
+        await update.message.reply_text(
+            "📣 Big-Move Alert Emails\n"
+            f"{HDR}\n"
+            f"Status: {'ON' if on else 'OFF'}\n"
+            f"Thresholds: |4H| ≥ {p4:.0f}% OR |1H| ≥ {p1:.0f}% (both directions)\n\n"
+            "Set: /bigmove_alert on 20 10\n"
+            "Off: /bigmove_alert off"
+        )
+        return
+
+    mode = context.args[0].strip().lower()
+
+    if mode in {"off", "0", "disable"}:
+        update_user(uid, bigmove_alert_on=0)
+        await update.message.reply_text("✅ Big-move alert emails: OFF")
+        return
+
+    if mode in {"on", "1", "enable"}:
+        p4 = 20.0
+        p1 = 10.0
+        if len(context.args) >= 3:
+            try:
+                p4 = float(context.args[1])
+                p1 = float(context.args[2])
+            except Exception:
+                await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)")
+                return
+        update_user(uid, bigmove_alert_on=1, bigmove_alert_4h=p4, bigmove_alert_1h=p1)
+        await update.message.reply_text(f"✅ Big-move alert emails: ON (4H≥{p4:.0f}% OR 1H≥{p1:.0f}%)")
+        return
+
+    await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)  OR  /bigmove_alert off")
+
+
+async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_user(uid, notify_on=1)
+    await update.message.reply_text("✅ Email alerts: ON")
+
+async def notify_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_user(uid, notify_on=0)
+    await update.message.reply_text("✅ Email alerts: OFF")
+
+def _equity_risk_pct_from_usd(user: dict, risk_usd: float) -> Optional[float]:
+    eq = float(user.get("equity", 0.0) or 0.0)
+    if eq <= 0:
+        return None
+    return (float(risk_usd) / eq) * 100.0
+
+
+def _find_unknown_tokens(tokens: list) -> list:
+    """
+    Very strict validation:
+    - allowed keywords: symbol, side, sl, entry, risk, usd, pct
+    - side values: long/short/buy/sell
+    - everything else should be numeric (like prices/values)
+    Any unknown non-numeric token => error.
+    """
+    allowed = {
+        "sl", "stop",
+        "entry", "ent",
+        "risk",
+        "usd", "pct",
+        "long", "short", "buy", "sell",
+    }
+
+    unknown = []
+    for t in tokens:
+        tt = str(t).strip().lower()
+        if not tt:
+            continue
+        if tt in allowed:
+            continue
+        # numeric is OK
+        try:
+            float(tt)
+            continue
+        except Exception:
+            unknown.append(tt)
+    return unknown
+
+def _typo_hint_for_token(tok: str) -> str:
+    t = (tok or "").lower()
+    # common "entry" typos
+    if t.startswith("entr") and t not in ("entry", "ent"):
+        return "Did you mean `entry`?"
+    if t in ("enrty", "etry", "etryy", "enter", "entery", "enrt"):
+        return "Did you mean `entry`?"
+    return ""
+
+
+async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+        
+    raw = " ".join(context.args).strip()
+    if not raw:
+        await update.message.reply_text("Usage: /size <symbol> <LONG/SHORT> entry <VALUE> sl <VALUE>  (optional: risk pct <value> | risk usd <value>)\nIf risk is not entered, default risk is used (set in /riskmode).")
+        return
+
+    tokens = raw.split()
+    
+    # -------------------------------------------------
+    # REQUIRED POSITIONAL ARGS
+    # -------------------------------------------------
+    if len(tokens) < 4:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/size <SYMBOL> <long|short> entry <PRICE> sl <STOP>\n"
+            "Optional: risk <usd|pct> <VALUE> (default: 1.5%)"
+        )
+        return
+    
+    symbol = re.sub(r"[^A-Za-z0-9]", "", tokens[0]).upper()
+    direction = tokens[1].lower()
+    
+    if direction not in ("long", "short"):
+        await update.message.reply_text("Second argument must be long or short.")
+        return
+    
+    # Strip positional args BEFORE keyword parsing
+    tokens = tokens[2:]
+
+    # STRICT: reject unknown tokens (prevents silent fallback to live price on typos like "entrt")
+    allowed = {"sl", "entry", "risk", "usd", "pct"}
+    unknown = []
+    for t in tokens:
+        tt = str(t).strip().lower()
+        if not tt:
+            continue
+        if tt in allowed:
+            continue
+        # numeric token is OK
+        try:
+            float(tt)
+            continue
+        except Exception:
+            unknown.append(tt)
+
+    if unknown:
+        hint = ""
+        u0 = unknown[0]
+        if u0.startswith("entr") and u0 != "entry":
+            hint = "\nDid you mean `entry`?"
+        await update.message.reply_text(
+            "❌ Invalid /size syntax.\n\n"
+            f"Unknown keyword(s): {', '.join(unknown)}{hint}\n\n"
+            "Use:\n/size <SYMBOL> <long|short> entry <ENTRY> sl <STOP> [risk <usd|pct> <VALUE>]\n"
+            "Example:\n/size BTC long entry 43000 sl 42000 risk usd 40"
+        )
+        return
+
+    # -------------------------------------------------
+    # KEYWORD PARSING (entry + sl REQUIRED)
+    # -------------------------------------------------
+    side = "BUY" if direction == "long" else "SELL"
+    sym = symbol  # <- use the original parsed symbol (positional)
+
+    entry = None
+    sl = None
+
+    risk_mode = "PCT"
+    risk_val = 1.5  # <- DEFAULT: 1.5% of equity if user does not provide risk
+
+    i = 0
+    while i < len(tokens):
+        t = tokens[i].lower()
+
+        if t == "entry" and i + 1 < len(tokens):
+            try:
+                entry = float(tokens[i + 1])
+            except Exception:
+                await update.message.reply_text("Bad entry format. Example: entry 43000")
+                return
+            i += 2
+            continue
+
+        if t == "sl" and i + 1 < len(tokens):
+            try:
+                sl = float(tokens[i + 1])
+            except Exception:
+                await update.message.reply_text("Bad SL format. Example: sl 42000")
+                return
+            i += 2
+            continue
+
+        if t == "risk" and i + 2 < len(tokens):
+            rm = tokens[i + 1].lower()
+            if rm not in ("usd", "pct"):
+                await update.message.reply_text("Bad risk format. Use: risk pct 2  OR  risk usd 40")
+                return
+            try:
+                rv = float(tokens[i + 2])
+            except Exception:
+                await update.message.reply_text("Bad risk format. Use: risk pct 2  OR  risk usd 40")
+                return
+            risk_mode = rm.upper()
+            risk_val = rv
+            i += 3
+            continue
+
+        await update.message.reply_text(f"❌ Invalid keyword: {tokens[i]}")
+        return
+
+    # entry + sl are mandatory (as you requested)
+    if entry is None or sl is None:
+        await update.message.reply_text(
+            "❌ Missing entry or SL.\n"
+            "Use:\n/size <SYMBOL> <long|short> entry <ENTRY> sl <STOP>\n"
+            "Example:\n/size EUL long entry 2.46 sl 2.26"
+        )
+        return
+
+    # --- Entry sanity check vs last known price (warn only; NEVER blocks /size) ---
+    try:
+        best_now = get_cached_futures_tickers()
+        mv_now = best_now.get(sym) if isinstance(best_now, dict) else None
+        cur_px = float(mv_now.last) if mv_now and float(getattr(mv_now, "last", 0) or 0) > 0 else 0.0
+    except Exception:
+        cur_px = 0.0
+    
+    entry_warn = ""
+    if cur_px > 0:
+        w, severe = entry_sanity_check(entry, cur_px)
+        if w:
+            # /size: warn only (no blocking), but make severe warnings very visible
+            entry_warn = ("\n" + w + "\n")
+    # --------------------------------------------------------------
+
+    if entry <= 0 or sl <= 0 or entry == sl:
+        await update.message.reply_text("Entry/SL invalid. Ensure entry and sl are positive and not equal.")
+        return
+
+    if side == "BUY" and sl >= entry:
+        await update.message.reply_text("For LONG, SL should be BELOW entry.")
+        return
+    if side == "SELL" and sl <= entry:
+        await update.message.reply_text("For SHORT, SL should be ABOVE entry.")
+        return
+
+    risk_usd = compute_risk_usd(user, risk_mode, risk_val)
+
+    if risk_usd <= 0:
+        if risk_mode == "PCT":
+            await update.message.reply_text("Risk computed as $0. Set your equity first: /equity 1000")
+            return
+        await update.message.reply_text("Risk USD computed as 0. Check your risk value.")
+        return
+
+    qty = calc_qty(entry, sl, risk_usd)
+    if qty <= 0:
+        await update.message.reply_text("Could not compute qty. Check entry/sl/risk.")
+        return
+
+    warn = ""
+    if risk_mode == "PCT":
+        if float(risk_val) > float(WARN_RISK_PCT_PER_TRADE):
+            warn = (
+                f"⚠️ Warning: You are risking {float(risk_val):.2f}% of equity.\n"
+                f"Recommended max risk per trade is {WARN_RISK_PCT_PER_TRADE:.2f}%."
+            )
+    else:
+        pct_equiv = _equity_risk_pct_from_usd(user, risk_usd)
+        if pct_equiv is not None and pct_equiv > float(WARN_RISK_PCT_PER_TRADE):
+            warn = (
+                f"⚠️ Warning: This equals ~{pct_equiv:.2f}% of equity.\n"
+                f"Recommended max risk per trade is {WARN_RISK_PCT_PER_TRADE:.2f}%."
+            )
+
+    msg = (
+        f"✅ Position Size\n"
+        f"- Symbol: {sym}\n"
+        f"- Side: {side}\n"
+        f"- Entry: {fmt_price(entry)}\n"
+        f"- SL: {fmt_price(sl)}\n"
+        f"- Risk: ${risk_usd:.2f}\n"
+        f"- Qty: {qty:.6g}\n"
+    )
+
+    if warn:
+        msg += "\n" + warn + "\n"
+    if entry_warn:
+        msg += entry_warn
+    msg += f"\nChart: {tv_chart_url(sym)}"
+
+    await update.message.reply_text(msg)
+
+
+async def _size_paste_fallback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback for mobile copy/paste where Telegram doesn't parse it as a command.
+
+    Example: Gmail/iOS sometimes prefixes invisible Unicode markers before '/size'.
+    Then CommandHandler("size") won't fire. This router strips those markers and
+    re-dispatches to size_cmd.
+    """
+    try:
+        if not update.message or not update.message.text:
+            return
+        txt = update.message.text
+        # If Telegram already treated it as a command, CommandHandler will handle it.
+        if txt.startswith("/size"):
+            return
+
+        clean = _strip_invisible_prefix(txt)
+        if not clean.lower().startswith("/size"):
+            return
+
+        parts = clean.split()
+        if not parts:
+            return
+
+        cmd = parts[0]
+        if "@" in cmd:
+            cmd = cmd.split("@", 1)[0]
+        if cmd.lower() != "/size":
+            return
+
+        # Emulate CommandHandler args
+        context.args = parts[1:]
+        await size_cmd(update, context)
+    except Exception:
+        # Never crash generic text handling
+        return
+
+async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = reset_daily_if_needed(get_user(uid))
+
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+        
+    raw_full = " ".join(context.args).strip()
+    if not raw_full:
+        await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 [risk usd 40|risk pct 2] [note ...] [sig PF-...]\nIf risk is omitted, it uses your /riskmode settings.")
+        return
+
+    bracket_parts = re.findall(r"\[([^\]]+)\]", raw_full)
+    raw = re.sub(r"\[[^\]]+\]", "", raw_full).strip()
+
+    tokens = raw.split()
+    # Minimum: <sym> <long|short> entry <px> sl <px> (risk is optional)
+    if len(tokens) < 6 or "entry" not in tokens or "sl" not in tokens:
+        await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 [risk usd 40|risk pct 2] [note ...] [sig PF-...]\nIf risk is omitted, it uses your /riskmode settings.")
+        return
+
+    sym = re.sub(r"[^A-Za-z0-9]", "", tokens[0]).upper()
+    direction = tokens[1].lower()
+    if direction not in {"long", "short"}:
+        await update.message.reply_text("Second arg must be long or short.")
+        return
+    side = "BUY" if direction == "long" else "SELL"
+
+    if int(user["day_trade_count"]) >= int(user["max_trades_day"]):
+        await update.message.reply_text(f"⚠️ Max trades/day reached ({user['max_trades_day']}). If you continue, you are overtrading.")
+        return
+
+    try:
+        def idx(x): return tokens.index(x)
+        entry = float(tokens[idx("entry")+1])
+        sl = float(tokens[idx("sl")+1])
+
+        if "risk" in tokens:
+            r_i = idx("risk")
+            if r_i + 2 >= len(tokens):
+                raise ValueError("risk missing args")
+            risk_mode = tokens[r_i+1].upper()
+            risk_val = float(tokens[r_i+2])
+        else:
+            # If omitted, auto-use /riskmode settings for this user.
+            risk_mode = str(user.get("risk_mode", DEFAULT_RISK_MODE)).upper()
+            risk_val = float(user.get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
+
+        note = ""
+        signal_id = ""
+
+        # Token-based (explicit keywords)
+        if "note" in tokens:
+            n_i = idx("note")
+            # note runs until "sig" if present
+            if "sig" in tokens[n_i+1:]:
+                s_rel = tokens[n_i+1:].index("sig")
+                note = " ".join(tokens[n_i+1:n_i+1+s_rel]).strip()
+            else:
+                note = " ".join(tokens[n_i+1:]).strip()
+
+        if "sig" in tokens:
+            s_i = idx("sig")
+            if s_i + 1 < len(tokens):
+                signal_id = tokens[s_i+1].strip()
+
+        # Bracket-based (legacy/quick typing): [my note] [sig PF-123]
+        for bp in bracket_parts or []:
+            seg = str(bp or "").strip()
+            if not seg:
+                continue
+            low = seg.lower()
+            if low.startswith("sig "):
+                signal_id = seg[4:].strip()
+                continue
+            m2 = re.match(r"^(sig)\s*[:\-]?\s*(.+)$", seg, flags=re.IGNORECASE)
+            if m2:
+                signal_id = m2.group(2).strip()
+                continue
+            note = (seg if not note else (note + " | " + seg)).strip()
+
+    except Exception:
+        await update.message.reply_text("Bad format. Example: /trade_open BTC long entry 43000 sl 42000 risk usd 40 note breakout sig PF-20251219-0007\nOr omit risk to use /riskmode automatically.")
+        return
+
+    if risk_mode not in {"USD", "PCT"}:
+        await update.message.reply_text("risk mode must be usd or pct")
+        return
+
+    # =========================================================
+    # ENTRY PRICE SANITY CHECK (BLOCK if severe unless "force")
+    # =========================================================
+    force = ("force" in tokens)  # user can add: force
+    
+    try:
+        best_now = get_cached_futures_tickers()
+        mv_now = best_now.get(sym)
+        cur_px = float(mv_now.last) if mv_now and float(mv_now.last or 0) > 0 else 0.0
+    except Exception:
+        cur_px = 0.0
+    
+    if cur_px > 0:
+        w, severe = entry_sanity_check(entry, cur_px)
+        if w and severe and not force:
+            await update.message.reply_text(
+                w
+                + "\n\n❌ Trade NOT opened to protect you from a bad entry.\n"
+                  "If you are 100% sure, re-run the command and add: force"
+            )
+            return
+        elif w and not severe:
+            await update.message.reply_text(w)
+    # =========================================================
+    
+    if side == "BUY" and sl >= entry:
+        await update.message.reply_text("For LONG, SL should be BELOW entry.")
+        return
+    if side == "SELL" and sl <= entry:
+        await update.message.reply_text("For SHORT, SL should be ABOVE entry.")
+        return
+  
+    risk_usd = compute_risk_usd(user, risk_mode, risk_val)
+    if risk_usd <= 0:
+        await update.message.reply_text("Risk USD computed as 0. If you used pct, set your equity first: /equity 1000")
+        return
+
+    qty = calc_qty(entry, sl, risk_usd)
+    if qty <= 0:
+        await update.message.reply_text("Could not compute qty. Check entry/sl/risk.")
+        return
+
+    cap = daily_cap_usd(user)
+    day_local = _user_day_local(user)
+    used_before = _risk_used_total_today(uid, user)
+    remaining_before = (cap - used_before) if cap > 0 else float("inf")
+
+    warn_daily = ""
+    if cap > 0 and float(risk_usd) > max(0.0, remaining_before) + 1e-9:
+        warn_daily = (
+            f"⚠️ Daily Risk Warning: "
+            f"This position (${risk_usd:.2f}) exceeds today's remaining risk "
+            f"(${max(0.0, remaining_before):.2f}).\n"
+        )
+
+    warn_trade_vs_cap = ""
+    if cap > 0 and float(risk_usd) > float(cap) + 1e-9:
+        warn_trade_vs_cap = f"⚠️ Note: This trade risk (${risk_usd:.2f}) exceeds the total Daily Risk Cap (${cap:.2f}).\n"
+
+    tid = db_trade_open(uid, sym, side, entry, sl, risk_usd, qty, note=note, signal_id=signal_id)
+    _risk_daily_inc(uid, day_local, float(risk_usd))
+
+    used_after = _risk_used_total_today(uid, get_user(uid))
+    remaining_after = (cap - used_after) if cap > 0 else float("inf")
+
+    update_user(uid, day_trade_count=int(user["day_trade_count"]) + 1)
+    user = get_user(uid)
+
+    daily_risk_line = (
+        f"- Daily risk limit: {user['daily_cap_mode']} {float(user['daily_cap_value']):.2f} (≈ ${cap:.2f})\n"
+        f"- Used today: ${used_after:.2f}\n"
+        f"- Remaining today: ${max(0.0, remaining_after):.2f}" if cap > 0 else
+        f"- Daily risk limit: {user['daily_cap_mode']} {float(user['daily_cap_value']):.2f} (≈ ${cap:.2f})\n"
+        f"- Used today: ${used_after:.2f}\n"
+        f"- Remaining today: ∞"
+    )
+
+    await update.message.reply_text(
+        f"✅ Trade OPENED (Journal)\n"
+        f"- ID: {tid}\n"
+        f"- {sym} {side}\n"
+        f"- Entry: {fmt_price(entry)}\n"
+        f"- SL: {fmt_price(sl)}\n"
+        f"- Risk: ${risk_usd:.2f}\n"
+        f"- Qty: {qty:.6g}\n"
+        f"{warn_daily}{warn_trade_vs_cap}"
+        f"{daily_risk_line}\n"
+        f"- Trades today: {int(user['day_trade_count'])}/{int(user['max_trades_day'])}\n"
+        f"- Equity: ${float(user['equity']):.2f}\n"
+        f"- Signal: {signal_id if signal_id else '-'}\n"
+        f"- Note: {note if note else '-'}"
+    )
+
+async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+    
+    raw = " ".join(context.args).strip()
+    if not raw:
+        await update.message.reply_text("Usage: /trade_close <TRADE_ID> pnl <PNL>")
+        return
+
+    tokens = raw.split()
+    if len(tokens) < 3:
+        await update.message.reply_text("Usage: /trade_close <TRADE_ID> pnl <PNL>")
+        return
+
+    try:
+        trade_id = int(tokens[0])
+        if tokens[1].lower() != "pnl":
+            raise ValueError()
+        pnl = float(tokens[2])
+    except Exception:
+        await update.message.reply_text("Usage: /trade_close <TRADE_ID> pnl <PNL>  (example: /trade_close 12 pnl +85.5)")
+        return
+
+    t = db_trade_close(uid, trade_id, pnl)
+    
+    if not t:
+        await update.message.reply_text("Trade not found or already closed.")
+        return
+    
+    # Sync daily risk from CURRENT open positions (closing frees capacity instantly)
+    _risk_daily_sync(uid, user)
+    # ✅ Equity handling:
+    # - Admin: keep equity synced with Bybit (if live equity is available)
+    # - Others: manual equity updated by /trade_close pnl
+    if is_admin_user(int(uid)):
+        live_eq = _live_equity_usdt()
+        if live_eq is not None:
+            try:
+                update_user(int(uid), equity=float(live_eq))
+            except Exception:
+                pass
+            user = get_user(uid)
+        else:
+            # fallback to manual equity update (only if live equity unavailable)
+            new_eq = float(user["equity"]) + float(pnl)
+            update_user(uid, equity=new_eq)
+            user = get_user(uid)
+    else:
+        new_eq = float(user["equity"]) + float(pnl)
+        update_user(uid, equity=new_eq)
+        user = get_user(uid)
+
+    r_mult = t.get("r_mult")
+    r_txt = f"{r_mult:+.2f}R" if r_mult is not None else "-"
+    
+    await update.message.reply_text(
+        f"✅ Trade CLOSED\n"
+        f"- ID: {trade_id}\n"
+        f"- PnL: {float(pnl):+.2f}\n"
+        f"- R: {r_txt}\n"
+        f"- New Equity: ${float(user['equity']):.2f}"
+    )
+
+async def trade_id_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return
+
+    _reset_public_trade_id(uid)
+
+    await update.message.reply_text(
+        "✅ Trade ID counter reset.\n\n"
+        "Next /trade_open will start from Trade ID 1."
+    )
+
+
+async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    tokens = context.args
+    if len(tokens) != 2:
+        await update.message.reply_text("Usage: /trade_sl <TRADE_ID> <NEW_SL>")
+        return
+
+    try:
+        trade_id = int(tokens[0])
+        new_sl = float(tokens[1])
+    except Exception:
+        await update.message.reply_text("Invalid arguments.")
+        return
+
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT * FROM trades WHERE public_id=? AND user_id=? AND closed_ts IS NULL",
+        (trade_id, uid),
+    )
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        await update.message.reply_text("Open trade not found.")
+        return
+
+    t = dict(row)
+    entry = float(t["entry"])
+    side = str(t["side"]).upper()
+
+    # validate new SL direction
+    if side == "BUY" and new_sl >= entry:
+        con.close()
+        await update.message.reply_text("For BUY, SL must be below entry.")
+        return
+    if side == "SELL" and new_sl <= entry:
+        con.close()
+        await update.message.reply_text("For SELL, SL must be above entry.")
+        return
+
+    old_risk = float(t["risk_usd"])
+    qty = float(t["qty"])
+    new_risk = abs(entry - new_sl) * qty
+
+    # update trade
+    cur.execute(
+        "UPDATE trades SET sl=?, risk_usd=? WHERE public_id=? AND user_id=?",
+        (float(new_sl), float(new_risk), trade_id, uid),
+    )
+    con.commit()
+    con.close()
+
+    # update daily used risk by delta
+    user = get_user(uid)
+    day_local = _user_day_local(user)
+    delta = float(new_risk) - float(old_risk)
+
+    if abs(delta) > 1e-9:
+        _risk_daily_inc(uid, day_local, delta)
+
+        # clamp to 0 if negative due to edge cases
+        used_now = _risk_daily_sync(uid, user)
+        if used_now < 0:
+            con2 = db_connect()
+            cur2 = con2.cursor()
+            cur2.execute(
+                "UPDATE risk_daily SET used_risk_usd=? WHERE user_id=? AND day_local=?",
+                (0.0, uid, day_local),
+            )
+            con2.commit()
+            con2.close()
+
+    cap = daily_cap_usd(user)
+    pnl_today = _pnl_today_closed_trades(uid, user)
+    used_today = _risk_used_total_today(uid, user)
+    remaining_today = (cap - used_today) if cap > 0 else float("inf")
+
+    warn = ""
+    if new_risk > old_risk + 1e-9:
+        warn = "⚠️ Risk increased!"
+    elif new_risk < old_risk - 1e-9:
+        warn = "✅ Risk reduced (released daily risk)."
+
+    await update.message.reply_text(
+        f"✅ Stop Loss UPDATED\n"
+        f"- Trade ID: {trade_id}\n"
+        f"- Side: {side}\n"
+        f"- Entry: {fmt_price(entry)}\n"
+        f"- New SL: {fmt_price(new_sl)}\n"
+        f"- Old Risk: ${old_risk:.2f}\n"
+        f"- New Risk: ${new_risk:.2f}\n"
+        f"{warn}\n\n"
+        f"📌 Daily Risk\n"
+        f"- Cap: ≈ ${cap:.2f}\n"
+        f"- Used today: ${used_today:.2f}\n"
+        f"- Remaining today: ${max(0.0, remaining_today):.2f}" if cap > 0 else
+        f"📌 Daily Risk\n"
+        f"- Cap: ≈ ${cap:.2f}\n"
+        f"- Used today: ${used_today:.2f}\n"
+        f"- Remaining today: ∞"
+    )
+
+
+async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    # Ensure daily reset happens before any risk math
+    user = reset_daily_if_needed(get_user(uid))
+
+    if not context.args:
+        await update.message.reply_text("Usage: /trade_rf <TRADE_ID>")
+        return
+
+    try:
+        trade_id = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Usage: /trade_rf <TRADE_ID>")
+        return
+
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT * FROM trades WHERE public_id=? AND user_id=? AND closed_ts IS NULL",
+        (trade_id, uid),
+    )
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        await update.message.reply_text("Open trade not found.")
+        return
+
+    t = dict(row)
+    entry = float(t["entry"])
+    old_risk = float(t["risk_usd"])
+
+    # If already risk-free, don't release again
+    if old_risk <= 1e-9:
+        con.close()
+        cap = daily_cap_usd(user)
+        day_local = _user_day_local(user)
+        pnl_today = _pnl_today_closed_trades(uid, user)
+        used_today = _risk_used_total_today(uid, user)
+        remaining_today = (cap - used_today) if cap > 0 else float("inf")
+
+        await update.message.reply_text(
+            f"✅ Trade is already Risk-Free\n"
+            f"- Trade ID: {trade_id}\n"
+            f"- SL is already at Entry\n\n"
+            f"📌 Daily Risk\n"
+            f"- Cap: ≈ ${cap:.2f}\n"
+            f"- Used today: ${used_today:.2f}\n"
+            f"- Remaining today: ${max(0.0, remaining_today):.2f}" if cap > 0 else
+            f"📌 Daily Risk\n"
+            f"- Cap: ≈ ${cap:.2f}\n"
+            f"- Used today: ${used_today:.2f}\n"
+            f"- Remaining today: ∞"
+        )
+        return
+
+    # Move SL to entry and set trade risk to 0
+    cur.execute(
+        "UPDATE trades SET sl=?, risk_usd=? WHERE public_id=? AND user_id=?",
+        (entry, 0.0, trade_id, uid),
+    )
+    con.commit()
+    con.close()
+
+    # Release today's risk immediately
+    day_local = _user_day_local(user)
+    _risk_daily_inc(uid, day_local, -old_risk)
+
+    # Clamp used risk to 0 if it went negative (edge cases)
+    used_now = _risk_daily_sync(uid, user)
+    if used_now < 0:
+        con2 = db_connect()
+        cur2 = con2.cursor()
+        cur2.execute(
+            "UPDATE risk_daily SET used_risk_usd=? WHERE user_id=? AND day_local=?",
+            (0.0, uid, day_local),
+        )
+        con2.commit()
+        con2.close()
+        used_now = 0.0
+
+    cap = daily_cap_usd(user)
+    remaining_today = (cap - used_now) if cap > 0 else float("inf")
+
+    await update.message.reply_text(
+        f"✅ Trade Risk-Free\n"
+        f"- Trade ID: {trade_id}\n"
+        f"- SL moved to Entry\n"
+        f"- Released Risk: ${old_risk:.2f}\n\n"
+        f"📌 Daily Risk (updated)\n"
+        f"- Cap: ≈ ${cap:.2f}\n"
+        f"- Used today: ${used_now:.2f}\n"
+        f"- Remaining today: ${max(0.0, remaining_today):.2f}" if cap > 0 else
+        f"📌 Daily Risk (updated)\n"
+        f"- Cap: ≈ ${cap:.2f}\n"
+        f"- Used today: ${used_now:.2f}\n"
+        f"- Remaining today: ∞"
+    )
+
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = reset_daily_if_needed(get_user(uid))
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return
+
+    opens = db_open_trades(uid)
+
+    plan = str(effective_plan(uid, user)).upper()
+    equity = float((user or {}).get("equity") or 0.0)
+
+    # ✅ Live equity sync ONLY for Admin (Bybit)
+    live_eq = _live_equity_usdt() if is_admin_user(int(uid)) else None
+    if live_eq is not None:
+        equity = float(live_eq)
+        try:
+            update_user(int(uid), equity=equity)
+        except Exception:
+            pass
+
+    cap = daily_cap_usd(user)
+    # Sync used risk from CURRENT open positions (RF/close frees capacity instantly)
+    pnl_today = _pnl_today_closed_trades(uid, user)
+    used_today = _risk_used_total_today(uid, user)
+    day_local = _user_day_local(user)
+    remaining_today = (cap - used_today) if cap > 0 else float("inf")
+
+    enabled = user_enabled_sessions(user)
+    now_s = in_session_now(user)
+    # Display the *live market session* (NY/LON/ASIA), not "UNLIMITED" access mode
+    now_live = _guess_session_name_utc(datetime.now(timezone.utc))
+    if int(user.get("sessions_unlimited", 0) or 0) == 1:
+        now_txt = now_live
+    else:
+        now_txt = (now_s["name"] if now_s else "NONE")
+
+    # Email caps (show infinite as 0=∞ to match UI)
+        # IMPORTANT: 0 is a valid value (means unlimited) — do not coerce with `or DEFAULT`.
+    cap_sess_raw = (user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION)
+    cap_day_raw  = (user or {}).get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY)
+    gap_raw      = (user or {}).get("email_gap_min", DEFAULT_EMAIL_GAP_MIN)
+    cap_sess = int(DEFAULT_MAX_EMAILS_PER_SESSION if cap_sess_raw is None else cap_sess_raw)
+    cap_day  = int(DEFAULT_MAX_EMAILS_PER_DAY if cap_day_raw is None else cap_day_raw)
+    gap_m    = int(DEFAULT_EMAIL_GAP_MIN if gap_raw is None else gap_raw)
+
+    # Big-move status
+    bm_on = int((user or {}).get("bigmove_alert_on", 1) or 0)
+    bm_4h = float((user or {}).get("bigmove_alert_4h", 20) or 20)
+    bm_1h = float((user or {}).get("bigmove_alert_1h", 10) or 10)
+
+    lines = []
+    lines.append("📌 Status")
+    lines.append(HDR)
+    lines.append(f"Plan: {plan}")
+    lines.append(f"Equity: ${equity:.2f}")
+    lines.append(f"PnL today: ${pnl_today:+.2f}")
+    lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
+    lines.append(f"Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f} (used by /size)")
+    lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
+    lines.append(f"Daily risk used (open risk today): ${used_today:.2f}")
+    lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
+    lines.append(HDR)
+    lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
+    lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
+    cur_s = (user.get("trade_window_start") or "").strip()
+    cur_e = (user.get("trade_window_end") or "").strip()
+    tw_txt = "OFF" if (not cur_s or not cur_e) else f"{cur_s} → {cur_e} (local)"
+    lines.append(f"Trade window: {tw_txt}")
+    lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
+    lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
+
+    # AutoTrade status (owner/admin only)
+    try:
+        show_at = (int(uid) == int(AUTOTRADE_OWNER_UID)) or is_admin(uid)
+    except Exception:
+        show_at = False
+    if show_at:
+        at_on = "ON" if AUTOTRADE_ENABLED else "OFF"
+        at_mode = str(AUTOTRADE_MODE).upper()
+        at_sess = ",".join([s.strip().upper() for s in _autotrade_get_sessions() if s.strip()]) or "NY"
+        dec = _LAST_AUTOTRADE_DECISION.get(int(AUTOTRADE_OWNER_UID or 0), {})
+        dec_txt = ""
+        if dec:
+            _when = str(dec.get('when','') or '')
+            _when_disp = _when
+            try:
+                if _when:
+                    _dt = datetime.fromisoformat(_when.replace('Z','+00:00'))
+                    _dt_m = _dt.astimezone(ZoneInfo('Australia/Melbourne'))
+                    _when_disp = _dt_m.strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                pass
+            dec_txt = f" | Last: {dec.get('status','')} ({dec.get('reason','')}) @ {_when_disp} (Melbourne)"
+        lines.append(f"AutoTrade: {at_on} | Mode: {at_mode} | Sessions: {at_sess}{dec_txt}")
+    lines.append(HDR)
+
+    if not opens:
+        lines.append("Open trades: None")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    lines.append("Open trades:")
+    for t in opens:
+        try:
+            entry = float(t.get("entry") or 0.0)
+            sl = float(t.get("sl") or 0.0)
+            qty = float(t.get("qty") or 0.0)
+            risk = float(t.get("risk_usd") or 0.0)
+            lines.append(
+                f"- ID {t.get('public_id')} | {t.get('symbol')} {t.get('side')} | "
+                f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g}"
+            )
+        except Exception:
+            continue
+
+    await update.message.reply_text("\n".join(lines))
+async def cooldowns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    now_sess = in_session_now(user)
+    current_session = (now_sess["name"] if now_sess else current_session_utc())
+    rows = list_cooldowns(uid)
+
+    if not rows:
+        await update.message.reply_text(
+            "⏱ Cooldowns\n"
+            f"{HDR}\n"
+            "No cooldowns recorded yet."
+        )
+        return
+
+    # We show remaining cooldown for ALL sessions (NY/LON/ASIA) per (symbol, side)
+    now_ts = time.time()
+    out = []
+    out.append("⏱ Cooldowns (All Sessions)")
+    out.append(HDR)
+    out.append(f"Current session: {current_session}")
+    out.append(f"Policy: NY={cooldown_hours_for_session('NY')}h | LON={cooldown_hours_for_session('LON')}h | ASIA={cooldown_hours_for_session('ASIA')}h")
+    out.append(SEP)
+
+    # keep only most recent per (symbol, side)
+    seen = set()
+    compact = []
+    for r in rows:
+        key = (str(r["symbol"]).upper(), str(r["side"]).upper())
+        if key in seen:
+            continue
+        seen.add(key)
+        compact.append(r)
+
+    # show top 20 recent
+    compact = compact[:20]
+
+    for r in compact:
+        sym = str(r["symbol"]).upper()
+        side = str(r["side"]).upper()
+        last_ts = float(r["emailed_ts"])
+        ago = now_ts - last_ts
+
+        rem_ny = max(0.0, cooldown_hours_for_session("NY") * 3600 - ago)
+        rem_lon = max(0.0, cooldown_hours_for_session("LON") * 3600 - ago)
+        rem_asia = max(0.0, cooldown_hours_for_session("ASIA") * 3600 - ago)
+
+        def tag(rem):
+            return "✅" if rem <= 0 else "⛔️"
+
+        out.append(
+            f"- {sym} {side} | "
+            f"NY: {tag(rem_ny)} {_fmt_dur(rem_ny)} | "
+            f"LON: {tag(rem_lon)} {_fmt_dur(rem_lon)} | "
+            f"ASIA: {tag(rem_asia)} {_fmt_dur(rem_asia)}"
+        )
+
+    await update.message.reply_text("\n".join(out))
+
+def clear_cooldown(user_id: int, symbol: str, side: str) -> int:
+    """
+    Deletes ONE cooldown row for (user, symbol, side).
+    Returns deleted row count.
+    """
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        DELETE FROM emailed_symbols
+        WHERE user_id=? AND symbol=? AND side=?
+    """, (int(user_id), str(symbol).upper(), str(side).upper()))
+    n = cur.rowcount
+    con.commit()
+    con.close()
+    return int(n)
+
+def clear_all_cooldowns(user_id: int) -> int:
+    """
+    Deletes ALL cooldown rows for this user.
+    Returns deleted row count.
+    """
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        DELETE FROM emailed_symbols
+        WHERE user_id=?
+    """, (int(user_id),))
+    n = cur.rowcount
+    con.commit()
+    con.close()
+    return int(n)
+
+async def cooldown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /cooldown <SYMBOL> <long|short>
+    Show remaining cooldown times for NY/LON/ASIA for that symbol+direction.
+    """
+    uid = update.effective_user.id
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /cooldown <SYMBOL> <long|short>\nExample: /cooldown BTC long")
+        return
+
+    sym = re.sub(r"[^A-Za-z0-9]", "", context.args[0]).upper()
+    direction = context.args[1].strip().lower()
+    if direction not in {"long", "short"}:
+        await update.message.reply_text("Second arg must be long or short.\nExample: /cooldown BTC long")
+        return
+
+    side = "BUY" if direction == "long" else "SELL"
+
+    # find latest cooldown row for this (sym, side)
+    rows = list_cooldowns(uid)
+    match = None
+    for r in rows:
+        if str(r["symbol"]).upper() == sym and str(r["side"]).upper() == side:
+            match = r
+            break
+
+    if not match:
+        await update.message.reply_text(
+            "⏱ Cooldown\n"
+            f"{HDR}\n"
+            f"{sym} {side}\n"
+            "No cooldown recorded yet (✅ available)."
+        )
+        return
+
+    now_ts = time.time()
+    last_ts = float(match["emailed_ts"])
+    ago = now_ts - last_ts
+
+    rem_ny = max(0.0, cooldown_hours_for_session("NY") * 3600 - ago)
+    rem_lon = max(0.0, cooldown_hours_for_session("LON") * 3600 - ago)
+    rem_asia = max(0.0, cooldown_hours_for_session("ASIA") * 3600 - ago)
+
+    def tag(rem): return "✅" if rem <= 0 else "⛔️"
+
+    await update.message.reply_text(
+        "⏱ Cooldown (per session policy)\n"
+        f"{HDR}\n"
+        f"{sym} {side}\n"
+        f"NY: {tag(rem_ny)} {_fmt_dur(rem_ny)}\n"
+        f"LON: {tag(rem_lon)} {_fmt_dur(rem_lon)}\n"
+        f"ASIA: {tag(rem_asia)} {_fmt_dur(rem_asia)}"
+    )
+
+async def cooldown_clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /cooldown_clear <SYMBOL> <long|short>  (admin only)
+    Clears one cooldown row.
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /cooldown_clear <SYMBOL> <long|short>\nExample: /cooldown_clear BTC long")
+        return
+
+    sym = re.sub(r"[^A-Za-z0-9]", "", context.args[0]).upper()
+    direction = context.args[1].strip().lower()
+    if direction not in {"long", "short"}:
+        await update.message.reply_text("Second arg must be long or short.")
+        return
+
+    side = "BUY" if direction == "long" else "SELL"
+    n = clear_cooldown(uid, sym, side)
+
+    if n > 0:
+        await update.message.reply_text(f"✅ Cooldown cleared: {sym} {side}")
+    else:
+        await update.message.reply_text(f"ℹ️ No cooldown found for: {sym} {side}")
+
+async def cooldown_clear_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /cooldown_clear_all  (admin only)
+    Clears all cooldown rows for the admin user.
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    n = clear_all_cooldowns(uid)
+    await update.message.reply_text(f"✅ Cleared {n} cooldown record(s).")
+
+async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+    
+    tz = ZoneInfo(user["tz"])
+    trades = db_trades_closed_today(uid, user)
+    stats = _stats_from_trades(trades)
+
+    msg = [
+        "📊 Daily Report",
+        HDR,
+        f"Closed: {stats['closed_n']} | Wins: {stats['wins']} | Losses: {stats['losses']}",
+        f"Win rate: {stats['win_rate']:.1f}%",
+        f"Net PnL: {stats['net']:+.2f}",
+        f"Avg R: {stats['avg_r']:+.2f}" if stats["avg_r"] is not None else "Avg R: -",
+        f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
+        HDR,
+    ]
+
+    await update.message.reply_text("\n".join(msg))
+
+
+async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+    
+    tz = ZoneInfo(user["tz"])
+    now = datetime.now(tz)
+    start_dt = now - timedelta(days=7)
+    ts_from = start_dt.timestamp()
+
+    trades = db_trades_since(uid, ts_from)
+    stats = _stats_from_trades(trades)
+    adv = _advice(user, stats)
+
+    msg = [
+        "📊 Weekly Report (last 7 days)",
+        HDR,
+        f"Closed: {stats['closed_n']} | Wins: {stats['wins']} | Losses: {stats['losses']}",
+        f"Win rate: {stats['win_rate']:.1f}%",
+        f"Net PnL: {stats['net']:+.2f}",
+        f"Avg R: {stats['avg_r']:+.2f}" if stats["avg_r"] is not None else "Avg R: -",
+        f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
+        HDR,
+    ]
+
+    await update.message.reply_text("\n".join(msg))
+
+async def signals_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+    
+    tz = ZoneInfo(user["tz"])
+    start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).timestamp()
+    sigs = db_list_signals_since(start)
+
+    msg = ["📮 Signals Daily Summary (generated)"]
+    msg.append(HDR)
+    msg.append(f"Total setups generated today: {len(sigs)}")
+    msg.append(HDR)
+
+    trades = db_trades_since(uid, start)
+    linked = [t for t in trades if t.get("signal_id")]
+    closed_linked = [t for t in linked if t.get("closed_ts") and t.get("pnl") is not None]
+
+    if closed_linked:
+        win = len([t for t in closed_linked if float(t["pnl"]) > 0])
+        loss = len([t for t in closed_linked if float(t["pnl"]) < 0])
+        net = sum(float(t["pnl"]) for t in closed_linked)
+        msg.append(f"Your linked signal trades closed today: {len(closed_linked)} | W {win} / L {loss} | Net {net:+.2f}")
+    else:
+        msg.append("Your linked signal trades closed today: 0")
+
+    await update.message.reply_text("\n".join(msg))
+
+async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+    
+    tz = ZoneInfo(user["tz"])
+    start_dt = datetime.now(tz) - timedelta(days=7)
+    start = start_dt.astimezone(timezone.utc).timestamp()
+
+    sigs = db_list_signals_since(start)
+    msg = ["📮 Signals Weekly Summary (last 7 days)"]
+    msg.append(HDR)
+    msg.append(f"Total setups generated: {len(sigs)}")
+    msg.append(HDR)
+
+    trades = db_trades_since(uid, start)
+    linked = [t for t in trades if t.get("signal_id")]
+    closed_linked = [t for t in linked if t.get("closed_ts") and t.get("pnl") is not None]
+
+    if closed_linked:
+        win = len([t for t in closed_linked if float(t["pnl"]) > 0])
+        loss = len([t for t in closed_linked if float(t["pnl"]) < 0])
+        net = sum(float(t["pnl"]) for t in closed_linked)
+        wr = (win / len(closed_linked) * 100.0) if closed_linked else 0.0
+        msg.append(f"Your linked signal trades closed: {len(closed_linked)} | WinRate {wr:.1f}% | Net {net:+.2f}")
+    else:
+        msg.append("Your linked signal trades closed: 0")
+
+    await update.message.reply_text("\n".join(msg))
+
+# =========================================================
+# TREND ENGINE — ADAPTIVE EMA (NO FIXED EMA7/21/50)
+# =========================================================
+
+TREND_EMA_PULLBACK_ATR = 1.2
+TREND_MAX_CONFIDENCE = 90
+
+def ema_series(values, period):
+    if not values or len(values) < period:
+        return []
+    k = 2.0 / (period + 1.0)
+    ema_vals = [values[0]]
+    for v in values[1:]:
+        ema_vals.append(v * k + ema_vals[-1] * (1 - k))
+    return ema_vals
+
+def ema_slope(series, n=3):
+    if len(series) < n + 1:
+        return 0.0
+    return series[-1] - series[-1 - n]
+
+def trend_dynamic_confidence(base_conf, price, ema_fast_last, atr_15m, ch24_pct, reclaimed):
+    score = base_conf
+    if reclaimed:
+        score += 8
+
+    dist_atr = abs(price - ema_fast_last) / atr_15m
+    if dist_atr < 0.4:
+        score += 8
+    elif dist_atr < 0.8:
+        score += 4
+
+    score += min(10, abs(ch24_pct) / 2)
+    return int(min(score, TREND_MAX_CONFIDENCE))
+
+
+# =====================================================================
+def trend_watch_for_symbol(base, mv, session_name):
+    try:
+
+        c4h = fetch_ohlcv(mv.symbol, "4h", 60)
+        c15 = fetch_ohlcv(mv.symbol, "15m", 140)
+        if not c4h or not c15 or len(c15) < 40:
+            return None
+
+        closes_4h = [float(x[4]) for x in c4h]
+        closes_15 = [float(x[4]) for x in c15]
+
+        ch24 = float(mv.percentage or 0.0)
+        side = "BUY" if ch24 > 0 else "SELL"
+
+        # volatility proxy for adaptive EMA
+        atr_15m = compute_atr_from_ohlcv(c15, ATR_PERIOD)
+        price = float(mv.last or closes_15[-1])
+        atr_pct = (atr_15m / price) * 100.0 if (atr_15m and price) else 2.0
+
+        # adaptive EMA periods
+        p_fast = adaptive_ema_period(atr_pct)          # 8..21
+        p_slow = int(clamp(p_fast * 2, 16, 55))        # adaptive slow
+
+        ema_fast = ema_series(closes_15[-120:], p_fast)
+        ema_slow = ema_series(closes_15[-120:], p_slow)
+        if not ema_fast or not ema_slow:
+            return None
+
+        if side == "BUY":
+            if not (ema_fast[-1] > ema_slow[-1]):
+                return None
+            if ema_slope(ema_fast, 3) <= 0:
+                return None
+
+            # pullback touch or near-touch
+            last = closes_15[-1]
+            near = abs(last - ema_fast[-1]) / last * 100.0
+            if near > 1.2:
+                return None
+
+        else:
+            if not (ema_fast[-1] < ema_slow[-1]):
+                return None
+            if ema_slope(ema_fast, 3) >= 0:
+                return None
+
+            last = closes_15[-1]
+            near = abs(last - ema_fast[-1]) / last * 100.0
+            if near > 1.2:
+                return None
+
+        conf = 80
+        # session boost (optional)
+        if session_name == "NY":
+            conf += 5
+        elif session_name == "LON":
+            conf += 2
+
+        return {
+            "symbol": base,
+            "side": side,
+            "conf": int(clamp(conf, 1, 99)),
+            "ch24": float(ch24),
+        }
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# PRIORITY SIGNAL POOL (USED BY /screen AND EMAIL)
+# Directional Leaders/Losers → Trend Continuation Watch → Waiting for Trigger → Market Leaders
+# =========================================================
+
+def _bases_from_directional(rows, n):
+    out = []
+    for r in (rows or [])[:n]:
+        try:
+            out.append(str(r[0]).upper())
+        except Exception:
+            continue
+    return out
+
+def _subset_best(best_fut: dict, bases: list) -> dict:
+    s = set([str(b).upper() for b in (bases or [])])
+    return {k: v for k, v in (best_fut or {}).items() if str(k).upper() in s}
+
+def _market_leader_bases(best_fut: dict, n: int) -> list: 
+    
+    try:
+        items = [(b, mv) for b, mv in (best_fut or {}).items()]
+        items = sorted(items, key=lambda x: float(getattr(x[1], "fut_vol_usd", 0.0) or 0.0), reverse=True)
+        return [str(b).upper() for b, _ in items[:n]]
+    except Exception:
+        return []
+
+def _norm_sym(s: str) -> str:
+    s = (s or "").upper().strip()
+    # common variants -> base
+    s = s.replace("USDT.P", "").replace("USDT", "")
+    s = s.replace("-PERP", "").replace("PERP", "")
+    s = s.replace("/", "").replace("-", "").replace("_", "")
+    return s
+
+def _best_fut_vol_usd(best_fut: dict, symbol: str) -> float:
+    """
+    Returns futures volume USD from best_fut dict using robust symbol matching.
+    Handles keys like BTC, BTCUSDT, BTCUSDT.P, BTC/USDT, etc.
+    """
+    if not best_fut:
+        return 0.0
+
+    sym_raw = str(symbol or "").upper().strip()
+    sym_n = _norm_sym(sym_raw)
+
+    # direct hits first
+    mv = (best_fut or {}).get(sym_raw)
+    if mv is None:
+        mv = (best_fut or {}).get(sym_n)
+
+    # brute search by normalized keys
+    if mv is None:
+        for k, v in (best_fut or {}).items():
+            if _norm_sym(str(k)) == sym_n:
+                mv = v
+                break
+
+    if mv is None:
+        return 0.0
+
+    try:
+        return float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _median(values: list) -> float:
+    try:
+        vals = sorted([float(x) for x in values if float(x) > 0])
+        if not vals:
+            return 0.0
+        mid = len(vals) // 2
+        if len(vals) % 2 == 1:
+            return float(vals[mid])
+        return float((vals[mid - 1] + vals[mid]) / 2.0)
+    except Exception:
+        return 0.0
+
+def _email_priority_bases(best_fut: dict, directional_take: int = 12) -> set:
+    # Directional Leaders/Losers = priority symbols (email override)
+    try:
+        up_list, dn_list = compute_directional_lists(best_fut)
+        leaders = _bases_from_directional(up_list, directional_take)
+        losers  = _bases_from_directional(dn_list, directional_take)
+        return set([str(x).upper() for x in (leaders + losers)])
+    except Exception:
+        return set()
+
+
+
+def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, market_bases: list, session_name: str, max_items: int = 4) -> list:
+    """Last-resort generator to avoid empty Top Trade Setups.
+
+    Creates simple ATR-based setups for the most active symbols in the
+    directional leaders/losers + market leaders universe.
+    """
+    bases = []
+    for b in (leaders or [])[:2]:
+        bases.append((str(b).upper(), "BUY"))
+    for b in (losers or [])[:2]:
+        bases.append((str(b).upper(), "SELL"))
+    for b in (market_bases or [])[:2]:
+        bb = str(b).upper()
+        if all(bb != x[0] for x in bases):
+            # Decide side by 4H sign if available later; default BUY
+            bases.append((bb, "BUY"))
+
+    setups = []
+    for base, side in bases:
+        mv = (best_fut or {}).get(base)
+        if not mv:
+            continue
+        market_symbol = str(getattr(mv, "symbol", base))
+        entry = float(getattr(mv, "last", 0.0) or 0.0)
+        if entry <= 0:
+            continue
+
+        try:
+            c1 = fetch_ohlcv(market_symbol, "1h", limit=max(ATR_PERIOD + 10, 80))
+            atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD) if c1 else 0.0
+        except Exception:
+            atr_1h = 0.0
+
+        if atr_1h <= 0:
+            # small default: 1% of price
+            atr_1h = max(entry * 0.01, 0.0000001)
+
+        sl_dist = 1.4 * atr_1h
+        tp_dist = 2.2 * atr_1h
+
+        if side == "BUY":
+            sl = max(entry - sl_dist, entry * 0.001)
+            tp3 = entry + tp_dist
+            tp1 = entry + tp_dist * 0.6
+            tp2 = entry + tp_dist * 0.85
+        else:
+            sl = entry + sl_dist
+            tp3 = max(entry - tp_dist, entry * 0.001)
+            tp1 = max(entry - tp_dist * 0.6, entry * 0.001)
+            tp2 = max(entry - tp_dist * 0.85, entry * 0.001)
+
+        fut_vol = _fut_vol_usd_from_best(best_fut, base)
+
+        setups.append(Setup(
+            setup_id=_new_setup_id(),
+            symbol=base,
+            market_symbol=market_symbol,
+            side=side,
+            conf=70,
+            entry=entry,
+            sl=sl,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            fut_vol_usd=float(fut_vol or 0.0),
+            ch24=float(getattr(mv, "percentage", 0.0) or 0.0),
+            ch4=0.0,
+            ch1=0.0,
+            ch15=0.0,
+            ema_support_period=0,
+            ema_support_dist_pct=0.0,
+            pullback_ema_period=0,
+            pullback_ema_dist_pct=0.0,
+            pullback_ready=True,
+            pullback_bypass_hot=True,
+            engine="F",
+            is_trailing_tp3=False,
+            created_ts=time.time(),
+        ))
+
+        if len(setups) >= int(max_items):
+            break
+    return setups
+
+async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/signal_report [hours]
+    Builds a table for emailed setups in the last N hours and evaluates TP/SL hit-order using Bybit OHLCV.
+    Uses whatever the bot already uses for scanning (market_symbol).
+    """
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+
+    # Default lookback: 24h
+    lookback_h = 24
+    try:
+        if context.args and str(context.args[0]).strip():
+            lookback_h = int(float(context.args[0]))
+    except Exception:
+        lookback_h = 24
+    lookback_h = int(clamp(lookback_h, 1, 168))  # 1h..7d
+
+    await update.message.reply_text(f"📊 Signal Report\n{HDR}\nScanning emailed setups for last {lookback_h}h…")
+
+    ts_from = time.time() - lookback_h * 3600.0
+    emailed = db_list_emailed_setups(uid, ts_from)
+
+    if not emailed:
+        await update.message.reply_text(
+            f"No emailed setups found in the last {lookback_h}h."
+        )
+        return
+
+    # Evaluate (heavy)
+    def _eval_all():
+        rows = []
+        counts = Counter()
+        by_session = defaultdict(lambda: Counter())
+        for e in emailed:
+            setup_id = str(e.get("setup_id") or "").strip()
+            sess = str(e.get("session") or "").strip() or "?"
+            sig = db_get_signal(setup_id) or {}
+            if not sig:
+                outcome = {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level":"NONE", "best_ts": None, "note": "missing_signal_row"}
+            else:
+                # Use cached outcome if same horizon and evaluated recently (<10m)
+                oc = db_get_outcome(setup_id)
+                if oc and int(oc.get("horizon_hours") or 0) == int(lookback_h) and (time.time() - float(oc.get("evaluated_ts") or 0)) < 600:
+                    outcome = {"outcome": oc.get("outcome"), "hit_level": oc.get("hit_level"), "hit_ts": oc.get("hit_ts"), "best_level": oc.get("best_level") or "NONE", "best_ts": oc.get("best_ts"), "note": oc.get("note") or ""}
+                else:
+                    outcome = evaluate_signal_hit_order(sig, horizon_hours=lookback_h, timeframe="1m")
+                    try:
+                        db_upsert_outcome(
+                            setup_id=setup_id,
+                            outcome=str(outcome.get("outcome")),
+                            hit_level=str(outcome.get("hit_level")),
+                            hit_ts=outcome.get("hit_ts"),
+                            horizon_hours=lookback_h,
+                            note=str(outcome.get("note") or ""),
+                            best_level=str(outcome.get("best_level") or ""),
+                            best_ts=outcome.get("best_ts"),
+                        )
+                    except Exception:
+                        pass
+
+            out = str(outcome.get("outcome") or "OPEN")
+            counts[out] += 1
+            by_session[sess][out] += 1
+
+            created_ts = float(sig.get("created_ts") or 0.0)
+            created_str = "-"
+            try:
+                tz = ZoneInfo(str(user.get("tz") or "UTC"))
+            except Exception:
+                tz = timezone.utc
+            try:
+                if created_ts > 0:
+                    created_str = datetime.fromtimestamp(created_ts, tz).strftime("%m-%d %H:%M")
+            except Exception:
+                pass
+
+            first_str = "-"
+            try:
+                ht = outcome.get("hit_ts")
+                if ht:
+                    first_str = datetime.fromtimestamp(float(ht), tz).strftime("%m-%d %H:%M")
+            except Exception:
+                pass
+
+            best_str = "-"
+            try:
+                bt = outcome.get("best_ts")
+                if bt:
+                    best_str = datetime.fromtimestamp(float(bt), tz).strftime("%m-%d %H:%M")
+            except Exception:
+                pass
+
+            sym = str(sig.get("symbol") or "?")
+            side = str(sig.get("side") or "?")
+            conf = sig.get("conf")
+
+            rows.append([
+                setup_id,
+                sess,
+                created_str,
+                f"{side} {sym}",
+                conf if conf is not None else "-",
+                out,
+                str(outcome.get("hit_level") or "-"),
+                first_str,
+                str(outcome.get("best_level") or "-"),
+                best_str,
+            ])
+        return rows, counts, by_session
+
+    rows, counts, by_session = await to_thread_heavy(_eval_all, timeout=120)
+
+    # Build summary
+    wins = int(counts.get("WIN_TP1", 0) + counts.get("WIN_TP2", 0) + counts.get("WIN_TP3", 0))
+    losses = int(counts.get("LOSS", 0))
+    decided = wins + losses
+    win_rate = (wins / decided * 100.0) if decided > 0 else 0.0
+
+    header = [
+        f"📊 Signal Report (last {lookback_h}h)",
+        HDR,
+        f"Total: {len(rows)} | Decided: {decided} | Wins: {wins} | Losses: {losses} | Win rate: {win_rate:.1f}%",
+        f"TP1: {counts.get('WIN_TP1',0)} | TP2: {counts.get('WIN_TP2',0)} | TP3: {counts.get('WIN_TP3',0)} | Open: {counts.get('OPEN',0)} | Amb: {counts.get('AMBIGUOUS',0)}",
+        HDR,
+    ]
+
+    # Table (compact)
+    table = tabulate(
+        rows,
+        headers=["SetupID","Sess","At","Trade","Conf","Outcome","First","FirstAt","Best","BestAt"],
+        tablefmt="plain",
+        colalign=("left","left","left","left","right","left","left","left","left","left")
+    )
+
+    # Session breakdown
+    sess_lines = ["Session breakdown:"]
+    for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
+        sw = int(c.get("WIN_TP1",0)+c.get("WIN_TP2",0)+c.get("WIN_TP3",0))
+        sl = int(c.get("LOSS",0))
+        sd = sw+sl
+        s_wr = (sw/sd*100.0) if sd>0 else 0.0
+        sess_lines.append(f"• {sname}: total {sum(c.values())} | decided {sd} | WR {s_wr:.1f}% | TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)} AMB {c.get('AMBIGUOUS',0)}")
+
+    msg = "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>\n" + "\n".join(sess_lines)
+    await send_long_message(update, msg, parse_mode=ParseMode.HTML)
+
+
+
+
+
+
+
+
+
+async def setups_log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setups_log [n] [screen|email|all] — view recently generated setups."""
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not has_active_access(uid, user):
+        await update.message.reply_text("⛔️ Trial finished. 👉 /billing")
+        return
+
+    n = 30
+    src = "all"
+    if context.args:
+        if context.args[0].isdigit():
+            n = max(1, min(200, int(context.args[0])))
+            if len(context.args) > 1:
+                src = str(context.args[1]).strip().lower()
+        else:
+            src = str(context.args[0]).strip().lower()
+            if len(context.args) > 1 and context.args[1].isdigit():
+                n = max(1, min(200, int(context.args[1])))
+
+    if src not in ("all", "screen", "email"):
+        src = "all"
+
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            if src == "all":
+                cur.execute(
+                    """SELECT created_ts, source, session, setup_id, symbol, side, conf
+                       FROM generated_setups
+                       WHERE user_id=?
+                       ORDER BY created_ts DESC
+                       LIMIT ?""",
+                    (int(uid), int(n)),
+                )
+            else:
+                cur.execute(
+                    """SELECT created_ts, source, session, setup_id, symbol, side, conf
+                       FROM generated_setups
+                       WHERE user_id=? AND source=?
+                       ORDER BY created_ts DESC
+                       LIMIT ?""",
+                    (int(uid), str(src), int(n)),
+                )
+            rows = cur.fetchall() or []
+    except Exception as e:
+        await update.message.reply_text(f"❌ setups_log error: {e}")
+        return
+
+    if not rows:
+        await update.message.reply_text("📦 Setups Log\n\nNo rows yet.")
+        return
+
+    lines = ["📦 Setups Log", HDR, f"Showing last {len(rows)} ({src})", ""]
+    for r in rows:
+        try:
+            ts = float(r["created_ts"])
+            dt = datetime.fromtimestamp(ts, timezone.utc).strftime("%m-%d %H:%MZ")
+        except Exception:
+            dt = "?"
+        lines.append(
+            f"{dt} | {str(r['source']).upper():5s} | {str(r['session']):8.8s} | {str(r['setup_id'])} | {str(r['side']).upper():4s} {str(r['symbol']).upper():10s} | {int(r['conf'] or 0)}"
+        )
+
+    await send_long_message(update, "\n".join(lines), parse_mode=None, disable_web_page_preview=True)
+
+
+async def admin_reset_signal_reports_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/admin_reset_signal_reports — hard reset all report-related tables to empty/zero."""
+    if not _is_admin(update):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    try:
+        async with DB_FILE_LOCK:
+            with sqlite3.connect(DB_PATH) as con:
+                c = con.cursor()
+
+                # Clear live tables used by /signal_report & /signal_report_overall + correlation log
+                for t in ("signals", "emailed_setups", "generated_setups"):
+                    try:
+                        c.execute(f"DELETE FROM {t}")
+                    except Exception:
+                        pass
+
+                # Outcomes table name can vary across builds
+                try:
+                    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('signal_outcomes','outcomes')")
+                    row = c.fetchone()
+                    if row and row[0]:
+                        try:
+                            c.execute(f"DELETE FROM {row[0]}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Reset daily counters that affect totals
+                for t in ("email_daily", "risk_daily", "setup_counter", "emailed_symbols"):
+                    try:
+                        c.execute(f"DELETE FROM {t}")
+                    except Exception:
+                        pass
+
+                con.commit()
+
+        await update.message.reply_text("✅ Reports reset: all totals are now 0 and tables cleared.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ admin_reset_signal_reports failed: {e}")
+
+
+async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/signal_report_overall — Overall performance summary (Option B scaling).
+    Uses signals table (setup_id) for entry/SL/TPs to compute:
+      - Avg R/trade (decided)
+      - Avg R/win
+      - Profit Factor
+    """
+    uid = update.effective_user.id
+
+    all_emailed = db_list_emailed_setups_all(uid)
+    total = len(all_emailed)
+    if total == 0:
+        await update.message.reply_text("No emailed setups found yet for your account.")
+        return
+
+    outcomes = db_list_outcomes_for_user(uid)  # evaluated only
+    evaluated = len(outcomes)
+
+    counts = Counter()
+    by_session = defaultdict(lambda: Counter())
+
+    r_all = []   # decided only
+    r_wins = []  # wins only
+
+    for r in outcomes:
+        out = str(r.get("outcome") or "OPEN").strip().upper()
+        sess = str(r.get("session") or "").strip() or "?"
+
+        counts[out] += 1
+        by_session[sess][out] += 1
+
+        if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+            setup_id = str(r.get("setup_id") or "").strip()
+            sig = db_get_signal(setup_id)  # contains side/entry/sl/tps
+            if not sig:
+                continue
+
+            side = str(sig.get("side") or "").strip().upper()
+            entry = sig.get("entry")
+            sl = sig.get("sl")
+            tp1 = sig.get("tp1")
+            tp2 = sig.get("tp2")
+            tp3 = sig.get("tp3")
+
+            if entry is None or sl is None or not side:
+                continue
+
+            rr = _realized_r_option_b(out, side, float(entry), float(sl),
+                                      float(tp1) if tp1 is not None else None,
+                                      float(tp2) if tp2 is not None else None,
+                                      float(tp3) if tp3 is not None else None)
+            if rr is None:
+                continue
+
+            r_all.append(float(rr))
+            if rr > 0:
+                r_wins.append(float(rr))
+
+    wins = int(counts.get("WIN_TP1", 0) + counts.get("WIN_TP2", 0) + counts.get("WIN_TP3", 0))
+    losses = int(counts.get("LOSS", 0))
+    decided = wins + losses
+    win_rate = (wins / decided * 100.0) if decided > 0 else 0.0
+
+    coverage = (evaluated / total * 100.0) if total > 0 else 0.0
+
+    avg_r = (sum(r_all) / len(r_all)) if r_all else 0.0
+    avg_r_win = (sum(r_wins) / len(r_wins)) if r_wins else 0.0
+
+    gross_profit = sum(x for x in r_all if x > 0)
+    gross_loss = -sum(x for x in r_all if x < 0)
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+
+    amb = int(counts.get("AMBIGUOUS", 0))
+
+    lines = [
+        "📈 Signal Report (overall)",
+        HDR,
+        f"Total emailed setups: {total}",
+        f"Evaluated (have outcome): {evaluated} ({coverage:.1f}% coverage)",
+        HDR,
+        f"Decided: {decided} | Wins: {wins} | Losses: {losses} | Win rate: {win_rate:.1f}%",
+        f"TP1: {counts.get('WIN_TP1',0)} | TP2: {counts.get('WIN_TP2',0)} | TP3: {counts.get('WIN_TP3',0)} | Open: {counts.get('OPEN',0)}" + (f" | Amb: {amb}" if amb else ""),
+        HDR,
+        f"Avg R/trade (decided): {avg_r:.2f}R | Avg R/win: {avg_r_win:.2f}R | Profit Factor: " + ("INF" if profit_factor == float("inf") else f"{profit_factor:.2f}"),
+        HDR,
+        "Session breakdown (evaluated only):",
+    ]
+
+    for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
+        sw = int(c.get("WIN_TP1",0)+c.get("WIN_TP2",0)+c.get("WIN_TP3",0))
+        sl = int(c.get("LOSS",0))
+        sd = sw + sl
+        s_wr = (sw/sd*100.0) if sd>0 else 0.0
+        s_amb = int(c.get("AMBIGUOUS",0))
+        lines.append(
+            f"• {sname}: eval {sum(c.values())} | decided {sd} | WR {s_wr:.1f}% | "
+            f"TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)}" + (f" AMB {s_amb}" if s_amb else "")
+        )
+
+    await send_long_message(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _autotrade_migrate_tables()
+    """/autotrade_report [hours]
+    Builds a report for bot-opened trades in the last N hours and evaluates TP/SL hit-order using Bybit OHLCV.
+    """
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not user_is_admin(uid)):
+        await update.message.reply_text("⛔️ Owner/admin only.")
+        return
+
+    lookback_h = 24
+    try:
+        if context.args and str(context.args[0]).strip():
+            lookback_h = int(float(context.args[0]))
+    except Exception:
+        lookback_h = 24
+    lookback_h = int(clamp(lookback_h, 1, 168))
+
+    await update.message.reply_text(f"📒 AutoTrade Journal\n{HDR}\nScanning bot-opened trades for last {lookback_h}h…")
+
+    ts_from = time.time() - lookback_h * 3600.0
+    trades = db_list_autotrade_trades(AUTOTRADE_OWNER_UID, ts_from)
+
+    if not trades:
+        await update.message.reply_text(f"No bot-opened trades found in the last {lookback_h}h.")
+        return
+
+    def _eval_all():
+        counts = Counter()
+        by_session = defaultdict(lambda: Counter())
+        decided = 0
+        wins = 0
+        losses = 0
+        tp1c = tp2c = tp3c = openc = 0
+
+        for t in trades:
+            setup = {
+                "symbol": t.get("symbol"),
+                "side": t.get("side"),
+                "entry": t.get("entry"),
+                "sl": t.get("sl"),
+                "tp1": t.get("tp1"),
+                "tp2": t.get("tp2"),
+                "tp3": t.get("tp3"),
+                "created_ts": float(t.get("opened_ts") or 0.0),
+            }
+            res = evaluate_signal_hit_order(setup, horizon_hours=lookback_h, timeframe="1m")
+            out = str(res.get("outcome") or "OPEN").upper().strip()
+            sess = str(t.get("session") or "?").strip() or "?"
+
+            counts[out] += 1
+            by_session[sess][out] += 1
+
+            if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+                decided += 1
+                if out.startswith("WIN"):
+                    wins += 1
+                else:
+                    losses += 1
+
+            if out == "WIN_TP1":
+                tp1c += 1
+            elif out == "WIN_TP2":
+                tp2c += 1
+            elif out == "WIN_TP3":
+                tp3c += 1
+            elif out == "OPEN":
+                openc += 1
+
+            # Update journal best-effort
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    c = conn.cursor()
+                    if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+                        c.execute("UPDATE autotrade_trades SET outcome=?, status='CLOSED', closed_ts=? WHERE trade_id=?",
+                                  (out, int(time.time()), str(t.get("trade_id"))))
+                    else:
+                        c.execute("UPDATE autotrade_trades SET outcome=? WHERE trade_id=?",
+                                  (out, str(t.get("trade_id"))))
+                    conn.commit()
+            except Exception:
+                pass
+
+        total = len(trades)
+        coverage = (decided / total * 100.0) if total else 0.0
+        wr = (wins / decided * 100.0) if decided else 0.0
+
+        return {
+            "total": total,
+            "decided": decided,
+            "wins": wins,
+            "losses": losses,
+            "wr": wr,
+            "tp1": tp1c,
+            "tp2": tp2c,
+            "tp3": tp3c,
+            "open": openc,
+            "coverage": coverage,
+            "by_session": by_session,
+        }
+
+    rep = await asyncio.to_thread(_eval_all)
+
+    lines = []
+    lines.append("📈 AutoTrade Report (journal)")
+    lines.append(HDR)
+    lines.append(f"Total bot trades: {rep['total']}")
+    lines.append(f"Decided: {rep['decided']} | Wins: {rep['wins']} | Losses: {rep['losses']} | Win rate: {rep['wr']:.1f}%")
+    lines.append(f"TP1: {rep['tp1']} | TP2: {rep['tp2']} | TP3: {rep['tp3']} | Open: {rep['open']}")
+    lines.append("")
+    lines.append("Session breakdown (evaluated only):")
+    for sess, c in rep["by_session"].items():
+        eval_n = c.get("WIN_TP1", 0) + c.get("WIN_TP2", 0) + c.get("WIN_TP3", 0) + c.get("LOSS", 0) + c.get("OPEN", 0)
+        dec_n = c.get("WIN_TP1", 0) + c.get("WIN_TP2", 0) + c.get("WIN_TP3", 0) + c.get("LOSS", 0)
+        w_n = c.get("WIN_TP1", 0) + c.get("WIN_TP2", 0) + c.get("WIN_TP3", 0)
+        wr_s = (w_n / dec_n * 100.0) if dec_n else 0.0
+        lines.append(f"• {sess}: eval {eval_n} | decided {dec_n} | WR {wr_s:.1f}% | TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show last autotrade attempt details (admin only)."""
+    uid = update.effective_user.id
+
+    # Use the bot's canonical admin check (avoid undefined is_admin())
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    owner = int(AUTOTRADE_OWNER_UID or 0)
+    det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
+    dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
+
+    # Melbourne time for readability
+    when_utc = str(det.get("when") or dec.get("when") or "")
+    when_m = when_utc
+    try:
+        if when_utc:
+            dt = datetime.fromisoformat(when_utc.replace("Z", "+00:00"))
+            when_m = dt.astimezone(ZoneInfo("Australia/Melbourne")).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
+    lines = []
+    lines.append("*AutoTrade — Last Attempt*")
+    lines.append(HDR)
+    if not det and not dec:
+        lines.append("No attempts recorded yet.")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    lines.append(f"*When (Melbourne):* `{when_m}`")
+    if dec:
+        lines.append(f"*Decision:* `{dec.get('status','')}` — `{dec.get('reason','')}`")
+    if det:
+        lines.append(f"*Symbol:* `{det.get('symbol_sent','')}`  (raw: `{det.get('symbol_raw','')}`)")
+        lines.append(f"*Side:* `{det.get('side','')}`")
+        lines.append(f"*Entry:* `{det.get('entry','')}`  *SL:* `{det.get('sl','')}`")
+        if det.get("qty_str") is not None:
+            lines.append(f"*Qty:* `{det.get('qty_str')}` (step {det.get('qty_step')}, min {det.get('min_qty')}, minNot {det.get('min_notional')})")
+        by = det.get("bybit") or {}
+        try:
+            rc = by.get("retCode")
+            rm = by.get("retMsg")
+            if rc is not None or rm:
+                lines.append(f"*Bybit:* retCode={rc} retMsg={rm}")
+        except Exception:
+            pass
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+
+async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _autotrade_migrate_tables()
+    """/autotrade_report_overall — Overall performance summary for bot-opened trades."""
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not user_is_admin(uid)):
+        await update.message.reply_text("⛔️ Owner/admin only.")
+        return
+
+    trades = db_list_autotrade_trades_all(AUTOTRADE_OWNER_UID)
+    total = len(trades)
+    if total == 0:
+        await update.message.reply_text("No bot-opened trades found yet.")
+        return
+
+    counts = Counter()
+    by_session = defaultdict(lambda: Counter())
+    r_all = []
+    r_wins = []
+
+    for t in trades:
+        setup = {
+            "symbol": t.get("symbol"),
+            "side": t.get("side"),
+            "entry": t.get("entry"),
+            "sl": t.get("sl"),
+            "tp1": t.get("tp1"),
+            "tp2": t.get("tp2"),
+            "tp3": t.get("tp3"),
+            "created_ts": float(t.get("opened_ts") or 0.0),
+        }
+        res = evaluate_signal_hit_order(setup, horizon_hours=168, timeframe="1m")
+        out = str(res.get("outcome") or "OPEN").upper().strip()
+        sess = str(t.get("session") or "?").strip() or "?"
+
+        counts[out] += 1
+        by_session[sess][out] += 1
+
+        if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+            side = str(t.get("side") or "").upper().strip()
+            entry = float(t.get("entry") or 0.0)
+            sl = float(t.get("sl") or 0.0)
+            tp1 = t.get("tp1")
+            tp2 = t.get("tp2")
+            tp3 = t.get("tp3")
+
+            rr = _realized_r_option_b(out, side, entry, sl,
+                                      float(tp1) if tp1 is not None else None,
+                                      float(tp2) if tp2 is not None else None,
+                                      float(tp3) if tp3 is not None else None)
+            if rr is None:
+                continue
+            r_all.append(rr)
+            if rr > 0:
+                r_wins.append(rr)
+
+    decided = counts.get("WIN_TP1",0) + counts.get("WIN_TP2",0) + counts.get("WIN_TP3",0) + counts.get("LOSS",0)
+    wins = counts.get("WIN_TP1",0) + counts.get("WIN_TP2",0) + counts.get("WIN_TP3",0)
+    losses = counts.get("LOSS",0)
+    wr = (wins / decided * 100.0) if decided else 0.0
+
+    avg_r = (sum(r_all)/len(r_all)) if r_all else 0.0
+    avg_r_win = (sum(r_wins)/len(r_wins)) if r_wins else 0.0
+
+    gross_profit = sum([x for x in r_all if x > 0])
+    gross_loss = abs(sum([x for x in r_all if x < 0]))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+
+    lines = []
+    lines.append("📈 AutoTrade Report (overall)")
+    lines.append(HDR)
+    lines.append(f"Total bot trades: {total}")
+    lines.append(f"Decided: {decided} | Wins: {wins} | Losses: {losses} | Win rate: {wr:.1f}%")
+    lines.append(f"TP1: {counts.get('WIN_TP1',0)} | TP2: {counts.get('WIN_TP2',0)} | TP3: {counts.get('WIN_TP3',0)} | Open: {counts.get('OPEN',0)}")
+    lines.append(f"Avg R/trade (decided): {avg_r:.2f}R | Avg R/win: {avg_r_win:.2f}R | Profit Factor: {profit_factor:.2f}")
+    lines.append("")
+    lines.append("Session breakdown (evaluated only):")
+    for sess, c in by_session.items():
+        eval_n = c.get("WIN_TP1", 0) + c.get("WIN_TP2", 0) + c.get("WIN_TP3", 0) + c.get("LOSS", 0) + c.get("OPEN", 0)
+        dec_n = c.get("WIN_TP1", 0) + c.get("WIN_TP2", 0) + c.get("WIN_TP3", 0) + c.get("LOSS", 0)
+        w_n = c.get("WIN_TP1", 0) + c.get("WIN_TP2", 0) + c.get("WIN_TP3", 0)
+        wr_s = (w_n / dec_n * 100.0) if dec_n else 0.0
+        lines.append(f"• {sess}: eval {eval_n} | decided {dec_n} | WR {wr_s:.1f}% | TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
+    """
+    mode: "screen" or "email"
+    returns: {
+        "setups": [Setup...],
+        "waiting": [(base, info_dict)...],
+        "trend_watch": [dict...],
+        "spikes": [dict...],   # NEW
+        "spike_warnings": [dict...],  # NEW (Early Warning, non-trade)
+    }
+    """
+
+    # Diagnostics: collect reject reasons for this scan
+    # Keep a stable structure so /why is always meaningful.
+    _rej_ctx = {
+        "__agg__": {},          # aggregate counters per reason
+        "__per__": {},          # per-symbol last reason/status
+        "__allow__": set(),     # universe allow-list (uppercased bases)
+    }
+
+    # Fallback for nested threads that may lose contextvars
+    global _GLOBAL_REJECT_CTX
+    _GLOBAL_REJECT_CTX = _rej_ctx
+    _rej_token = _REJECT_CTX.set(_rej_ctx)
+
+    # Reset near-miss list for this scan (so /screen doesn't show stale symbols)
+    try:
+        _WAITING_TRIGGER.clear()
+    except Exception:
+        pass
+# knobs
+    if mode == "screen":
+        n_target = int(SETUPS_N)
+        strict_15m = True
+        universe_cap = int(max(SCREEN_UNIVERSE_N, 35))
+        # Ensure /screen is not stricter than email engine
+        trigger_loosen = float(max(SCREEN_TRIGGER_LOOSEN, 1.0))
+        waiting_near = float(SCREEN_WAITING_NEAR_PCT)
+        allow_no_pullback = True
+        scan_multiplier = 10
+        directional_take = 12
+        market_take = 15
+        trend_take = 12
+    else:  # email
+        n_target = int(max(EMAIL_SETUPS_N * 3, 9))
+        strict_15m = True
+        universe_cap = 35
+        trigger_loosen = 1.0
+        waiting_near = float(SCREEN_WAITING_NEAR_PCT)
+        allow_no_pullback = True
+        scan_multiplier = 10
+        directional_take = 12
+        market_take = 15
+        trend_take = 12
+
+    # Aggressive profile overrides
+    prof = str(scan_profile or DEFAULT_SCAN_PROFILE).strip().lower()
+    if prof not in SCAN_PROFILES:
+        prof = DEFAULT_SCAN_PROFILE
+
+    if prof == "aggressive":
+        if mode == "screen":
+            n_target = int(max(SETUPS_N, 8))
+            universe_cap = int(max(SCREEN_UNIVERSE_N, 110))
+            trigger_loosen = float(min(0.80, SCREEN_TRIGGER_LOOSEN))
+            waiting_near = float(min(0.70, SCREEN_WAITING_NEAR_PCT))
+            scan_multiplier = 12
+            directional_take = 16
+            market_take = 18
+            trend_take = 16
+            strict_15m = True
+            allow_no_pullback = True
+        else:
+            # Email pool becomes broader, but final email gates still apply
+            n_target = int(max(EMAIL_SETUPS_N * 4, 12))
+            universe_cap = int(max(60, universe_cap))
+            trigger_loosen = 0.95
+            waiting_near = float(SCREEN_WAITING_NEAR_PCT)
+            strict_15m = True
+            allow_no_pullback = True
+            scan_multiplier = 12
+            directional_take = 14
+            market_take = 16
+            trend_take = 14
+
+    # 1) Directional leaders / losers (priority #1)
+    up_list, dn_list = compute_directional_lists(best_fut)
+
+    directional_table_n = 10
+    leaders = [str(t[0]).upper() for t in (up_list or [])[:directional_table_n]]
+    losers  = [str(t[0]).upper() for t in (dn_list or [])[:directional_table_n]]
+
+    # Market Leaders (Top by Futures Volume)
+    market_bases = _market_leader_bases(best_fut, market_take)
+
+    # ✅ Setup universe: ONLY what /screen shows — Directional Leaders + Directional Losers + Market Leaders.
+    universe_bases = list(dict.fromkeys([b.upper() for b in (leaders + losers + (market_bases or []))]))
+    universe_best = _subset_best(best_fut, universe_bases) if universe_bases else {}
+
+    # Diagnostics: keep /why focused on this scan universe
+    try:
+        _rej_ctx["__allow__"] = set(str(x).upper() for x in (universe_bases or []) if x)
+        _rej_ctx["__per__"] = {b: {"reason": "not_evaluated", "n": 0} for b in (_rej_ctx["__allow__"] or set())}
+
+        try:
+            global _LAST_SCAN_UNIVERSE
+            _LAST_SCAN_UNIVERSE = list(universe_bases or [])
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    priority_setups = []
+
+    # Leaders pass
+    if leaders:
+        sub = _subset_best(best_fut, leaders)
+        try:
+            tmp = pick_setups(
+                sub,
+                n_target * scan_multiplier,
+                strict_15m,
+                session_name,
+                min(int(universe_cap), len(sub) if sub else universe_cap),
+                trigger_loosen,
+                waiting_near,
+                allow_no_pullback,
+                scan_profile=prof,
+            )
+        except Exception:
+            tmp = []
+        for s in (tmp or []):
+            if s.side == "BUY":
+                priority_setups.append(s)
+
+    # Losers pass
+    if losers:
+        sub = _subset_best(best_fut, losers)
+        try:
+            tmp = pick_setups(
+                sub,
+                n_target * scan_multiplier,
+                strict_15m,
+                session_name,
+                min(int(universe_cap), len(sub) if sub else universe_cap),
+                trigger_loosen,
+                waiting_near,
+                allow_no_pullback,
+                scan_profile=prof,
+            )
+        except Exception:
+            tmp = []
+        for s in (tmp or []):
+            if s.side == "SELL":
+                priority_setups.append(s)
+
+    # 1b) Full universe pass (leaders + losers + market leaders)
+    try:
+        if universe_best:
+            tmp = pick_setups(
+                universe_best,
+                n_target * scan_multiplier,
+                strict_15m,
+                session_name,
+                min(int(universe_cap), len(universe_best) if universe_best else universe_cap),
+                trigger_loosen,
+                waiting_near,
+                allow_no_pullback,
+                scan_profile=prof,
+            )
+        else:
+            tmp = []
+    except Exception:
+        tmp = []
+    for s in (tmp or []):
+        priority_setups.append(s)
+
+    # ------------------------------------------------
+    # Engine B: Momentum Breakout Setups (Balanced)
+    # ------------------------------------------------
+    breakout_setups = []
+    try:
+        bases_for_breakout = list(dict.fromkeys([b.upper() for b in (leaders + losers)]))
+        if bases_for_breakout:
+            sub = _subset_best(best_fut, bases_for_breakout)
+            breakout_setups = pick_breakout_setups(
+                sub,
+                int(max(6, n_target)),   # allow a handful
+                session_name,
+                min(int(universe_cap), len(sub) if sub else universe_cap),
+                scan_profile=prof,
+            )
+    except Exception:
+        breakout_setups = []
+
+    if breakout_setups:
+        priority_setups.extend(breakout_setups)
+
+    # 2) Trend continuation watch (priority #2)
+    watch_bases = []
+    watch_bases.extend([b for b in leaders[:6]])
+    watch_bases.extend([b for b in losers[:6]])
+    watch_bases = list(dict.fromkeys([b.upper() for b in watch_bases]))
+
+    trend_watch = []
+    trend_bases = []
+    for base in watch_bases:
+        mv = (best_fut or {}).get(base)
+        if not mv:
+            continue
+        r = await to_thread_heavy(trend_watch_for_symbol, base, mv, session_name)
+        if r:
+            trend_watch.append(r)
+            trend_bases.append(base)
+
+    if trend_bases:
+        sub = _subset_best(best_fut, trend_bases[:trend_take])
+        try:
+            tmp = pick_setups(
+                sub,
+                n_target * scan_multiplier,
+                strict_15m,
+                session_name,
+                min(int(universe_cap), len(sub) if sub else universe_cap),
+                trigger_loosen,
+                waiting_near,
+                True,  # allow trend continuation to pass even on email
+                scan_profile=prof,
+            )
+        except Exception:
+            tmp = []
+
+        side_map = {str(t.get("symbol")).upper(): str(t.get("side")) for t in (trend_watch or []) if t.get("symbol")}
+        for s in (tmp or []):
+            want = side_map.get(str(s.symbol).upper())
+            if want and s.side == want:
+                priority_setups.append(s)
+
+    # 3) Waiting for Trigger (priority #3) is produced by pick_setups via _WAITING_TRIGGER
+    waiting_items = []
+    try:
+        if _WAITING_TRIGGER:
+            allow_set = set(str(x).upper() for x in (_LAST_SCAN_UNIVERSE or []))
+            waiting_items = [
+                (b, o)
+                for (b, o) in list(_WAITING_TRIGGER.items())
+                if (not allow_set) or (str(b).upper() in allow_set)
+            ][:SCREEN_WAITING_N]
+    except Exception:
+        waiting_items = []
+
+    # 4) Market leaders fallback (priority #4)
+    if len(priority_setups) < (n_target * 2):
+        if market_bases:
+            sub = _subset_best(best_fut, market_bases)
+            try:
+                tmp = pick_setups(
+                    sub,
+                    n_target * scan_multiplier,
+                    strict_15m,
+                    session_name,
+                    min(int(universe_cap), len(sub) if sub else universe_cap),
+                    trigger_loosen,
+                    waiting_near,
+                    allow_no_pullback,
+                    scan_profile=prof,
+                )
+            except Exception:
+                tmp = []
+            priority_setups.extend(tmp or [])
+
+    # 4B) Momentum Breakout setups (Engine B) — Balanced
+    try:
+        mom_n = max(6, int(n_target) * 2)
+        mom = pick_breakout_setups(
+            universe_best,  # ✅ restricted universe
+            mom_n,
+            session_name,
+            int(universe_cap),
+            scan_profile=prof,
+        )
+    except Exception:
+        mom = []
+    if mom:
+        priority_setups.extend(mom)
+
+
+    
+    # -----------------------------------------------------
+    # BALANCE MODE: If strict_15m produces too few candidates,
+    # add a relaxed 15m pass to avoid starving /screen and email pools.
+    # This keeps quality-first behavior, but prevents "no signals" sessions.
+    # -----------------------------------------------------
+    if strict_15m and len(priority_setups) < int(max(3, n_target)):
+        try:
+            if universe_best:
+                tmp = pick_setups(
+                    universe_best,
+                    n_target * scan_multiplier,
+                    False,  # relaxed 15m
+                    session_name,
+                    min(int(universe_cap), len(universe_best) if universe_best else universe_cap),
+                    trigger_loosen,
+                    waiting_near,
+                    allow_no_pullback,
+                    scan_profile=prof,
+                )
+                priority_setups.extend(tmp or [])
+        except Exception:
+            pass
+
+        # If still low, try market leaders once with relaxed 15m
+        try:
+            if len(priority_setups) < int(max(3, n_target)) and market_bases:
+                sub = _subset_best(best_fut, market_bases)
+                tmp = pick_setups(
+                    sub,
+                    n_target * scan_multiplier,
+                    False,  # relaxed 15m
+                    session_name,
+                    min(int(universe_cap), len(sub) if sub else universe_cap),
+                    trigger_loosen,
+                    waiting_near,
+                    allow_no_pullback,
+                    scan_profile=prof,
+                )
+                priority_setups.extend(tmp or [])
+        except Exception:
+            pass
+
+        # De-duplicate setups after relaxation
+        try:
+            seen = set()
+            deduped = []
+            for s in (priority_setups or []):
+                k = (
+                    getattr(s, "setup_id", None),
+                    getattr(s, "market_symbol", None),
+                    getattr(s, "side", None),
+                    getattr(s, "entry", None),
+                    getattr(s, "sl", None),
+                )
+                if k in seen:
+                    continue
+                seen.add(k)
+                deduped.append(s)
+            priority_setups = deduped
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------
+    # CRITICAL GATE (DYNAMIC EMA ANCHOR):
+    # Require price to be close to the *nearest* 1H EMA among {EMA_ANCHOR_1H_PERIODS}.
+    # This preserves your original intent (avoid "stretched" entries),
+    # but reduces missed opportunities when EMA7 isn't the active magnet.
+    # -----------------------------------------------------
+    ema_anchor_cache: Dict[str, Tuple[bool, float, float, float, int, float]] = {}
+    gated = []
+    for s in (priority_setups or []):
+        try:
+            mk = str(getattr(s, "market_symbol", "") or "")
+            base = str(getattr(s, "symbol", "") or "").upper().strip()
+            if not mk:
+                mv = (best_fut or {}).get(base)
+                _rej("missing_market_symbol", base, mv, "EMA-anchor gate")
+                continue
+
+            if mk not in ema_anchor_cache:
+                ema_anchor_cache[mk] = ema_anchor_1h_is_close(
+                    mk,
+                    base_max_dist_pct=EMA_ANCHOR_BASE_MAX_DIST_PCT,
+                    periods=EMA_ANCHOR_1H_PERIODS,
+                )
+
+            ok, dist_pct, last_close, ema_val, ema_p, allowed = ema_anchor_cache[mk]
+            if not ok:
+                mv = (best_fut or {}).get(base)
+                _rej(
+                    "far_from_ema_anchor_1h",
+                    base,
+                    mv,
+                    f"ema={ema_p} dist={dist_pct:.2f}% max={allowed:.2f}% close={last_close:.6g} emaV={ema_val:.6g}",
+                )
+                continue
+
+            gated.append(s)
+        except Exception:
+            try:
+                base = str(getattr(s, "symbol", "") or "").upper().strip()
+                mv = (best_fut or {}).get(base)
+                _rej("ema_anchor_gate_error", base, mv)
+            except Exception:
+                pass
+            continue
+
+    priority_setups = gated
+
+
+    # de-dupe by (symbol, side, engine) keeping highest conf, preserving priority order
+    best = {}
+    for s in priority_setups:
+        k = (str(s.symbol).upper(), str(s.side), str(getattr(s, "engine", "")))
+        if k not in best or int(s.conf) > int(best[k].conf):
+            best[k] = s
+
+    ordered = []
+    seen = set()
+    for s in priority_setups:
+        k = (str(s.symbol).upper(), str(s.side), str(getattr(s, "engine", "")))
+        if k in seen:
+            continue
+        if k in best:
+            ordered.append(best[k])
+            seen.add(k)
+
+    # If still empty, create a small fallback set so /screen isn't blank.
+    if not ordered and mode == "screen":
+        try:
+            ordered = _fallback_setups_from_universe(best_fut, leaders, losers, market_bases, session_name, max_items=max(4, n_target))
+        except Exception:
+            pass
+
+    
+    # -----------------------------------------------------
+    # Shared Top Setup gate (applies to BOTH /screen and email)
+    # -----------------------------------------------------
+    try:
+        ordered = [s for s in (ordered or []) if is_top_setup_eligible(s)[0]]
+    except Exception:
+        pass
+# -----------------------------------------------------
+    # NEW: Spike Reversal candidates (15M+ Vol) — for /screen only
+    # -----------------------------------------------------
+    spike_candidates = []
+    if mode == "screen":
+        try:
+            spike_candidates = await to_thread_heavy(_spike_reversal_candidates,
+                universe_best,
+                10_000_000.0,  # min_vol_usd
+                0.55,          # wick_ratio_min
+                1.20,          # atr_mult_min
+                6,             # max_items
+            )
+        except Exception:
+            spike_candidates = []
+
+    # -----------------------------------------------------
+    # NEW: Early Warning — Possible Reversal Zones (non-trade)
+    # -----------------------------------------------------
+    spike_warnings = []
+    if mode == "screen":
+        try:
+            spike_warnings = await to_thread_heavy(_spike_reversal_warnings,
+                universe_best,
+                10_000_000.0,  # min_vol_usd
+                1.15,          # atr_mult_min
+                0.60,          # body_ratio_min
+                8,             # lookback_1h
+                0.30,          # retrace_min
+                6,             # max_items
+            )
+        except Exception:
+            spike_warnings = []
+
+    # Store diagnostics for /why, then ALWAYS reset context
+    try:
+        if uid is not None:
+            _LAST_REJECTS[int(uid)] = {
+                "ts": time.time(),
+                "allow": list(_rej_ctx.get("__allow__") or []),
+                "per_symbol": dict((_rej_ctx.get("__per__") or {})),
+            }
+    finally:
+        try:
+            _REJECT_CTX.reset(_rej_token)
+        except Exception:
+            pass
+        try:
+            _GLOBAL_REJECT_CTX = None
+        except Exception:
+            pass
+
+    return {
+        "setups": ordered,
+        "waiting": waiting_items,
+        "trend_watch": trend_watch,
+        "spikes": spike_candidates,
+        "spike_warnings": spike_warnings,
+    }
+
+
+
+
+# =========================================================
+# User location/time helpers
+# =========================================================
+def user_location_and_time(user: dict):
+    """
+    Returns: (location_label, time_str) based on user's tz
+    """
+    tz_name = str((user or {}).get("tz") or "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+        tz_name = "UTC"
+
+    now_local = datetime.now(tz)
+
+    if "/" in tz_name:
+        parts = tz_name.split("/")
+        region = parts[0].replace("_", " ")
+        city = parts[-1].replace("_", " ")
+        loc = f"{city} ({region})"
+    else:
+        loc = tz_name
+
+    return loc, now_local.strftime("%Y-%m-%d %H:%M")
+
+
+# =========================================================
+# /screen fast cache (per-instance)
+# =========================================================
+SCREEN_CACHE_TTL_SEC = 20  # seconds
+SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
+_SCREEN_CACHE = {
+    "ts": 0.0,
+    "body": "",
+    "kb": [],
+}
+_SCREEN_LOCK = asyncio.Lock()
+
+# Background refresh task for /screen (keeps UX instant)
+_SCREEN_REFRESH_TASK = None  # asyncio.Task
+
+async def _refresh_screen_cache_async():
+    """Refreshes _SCREEN_CACHE in the background (best effort)."""
+    global _SCREEN_REFRESH_TASK
+    try:
+        best_fut = await to_thread_heavy(fetch_futures_tickers)
+        if not best_fut:
+            return
+        now_utc = datetime.now(timezone.utc)
+        session = _guess_session_name_utc(now_utc)
+        body, kb = await to_thread_heavy(_build_screen_body_and_kb,
+            best_fut,
+            session,
+            0,
+        )
+        _SCREEN_CACHE["ts"] = time.time()
+        _SCREEN_CACHE["body"] = body
+        _SCREEN_CACHE["kb"] = list(kb or [])
+    except Exception:
+        # never let background refresh crash the bot
+        return
+    finally:
+        _SCREEN_REFRESH_TASK = None
+
+
+
+# =========================================================
+# /screen
+# =========================================================
+
+
+
+def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
+    """Heavy /screen builder (runs in a worker thread).
+
+    Returns:
+        body (str): cached body (header is built in the async handler)
+        kb (list[tuple[str,str]]): [(SYMBOL, SETUP_ID), ...] for TradingView buttons
+    """
+    # Build pool (coroutine) in this worker thread (isolated event loop)
+    pool = _run_coro_in_thread(
+        build_priority_pool(
+            best_fut,
+            session,
+            mode="screen",
+            scan_profile=str(DEFAULT_SCAN_PROFILE),
+            uid=uid,
+        )
+    )
+
+    # Other heavy helpers are sync; run them here too.
+    # Market context inputs (keep /screen informative without becoming a data terminal)
+    leaders_txt = build_leaders_table(best_fut)  # fast (top by futures volume)
+    up_list, dn_list = compute_directional_lists(best_fut)
+
+    # Hard cap: never show more than 3 top setups on /screen
+    try:
+        setups = (pool.get("setups") or [])[:min(int(SETUPS_N), 3)]
+    except Exception:
+        setups = (pool.get("setups") or [])[:3]
+
+    # For UX: do not show the same symbol in Momentum Watch if it's already a Top Setup
+    try:
+        top_setup_syms = set(str(getattr(s, 'symbol', '') or '').upper() for s in (setups or []) if getattr(s, 'symbol', None))
+    except Exception:
+        top_setup_syms = set()
+
+    # Safety: if engine produced no setups, generate fallback ATR-based setups
+    if not setups:
+        try:
+            up_list, dn_list = compute_directional_lists(best_fut)
+            leaders_bases = [str(t[0]).upper() for t in (up_list or [])[:10]]
+            losers_bases  = [str(t[0]).upper() for t in (dn_list or [])[:10]]
+            market_bases  = _market_leader_bases(best_fut)[:10]
+            setups = _fallback_setups_from_universe(
+                best_fut,
+                leaders_bases,
+                losers_bases,
+                market_bases,
+                session,
+                max_items=max(4, int(SETUPS_N or 4)),
+            )[:int(SETUPS_N or 4)]
+        except Exception:
+            setups = []
+
+    # Ensure conf exists + persist signal cards to DB (used by Signal ID lookup)
+    try:
+        for s in (setups or []):
+            if not hasattr(s, "conf") or s.conf is None:
+                s.conf = 0
+            db_insert_signal(s)
+            try:
+                db_log_generated_setup(uid, "screen", session, s)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Setup cards -> combined text (single "Top Trade Setups" section)
+    combined_setups_txt = "_No high-quality setups right now._"
+    if setups:
+        def _mv_dot(p: float) -> str:
+            try:
+                p = float(p or 0.0)
+            except Exception:
+                p = 0.0
+            if abs(p) < 2.0:
+                return "🟡"
+            return "🟢" if p >= 0 else "🔴"
+
+        def _engine_label(e: str) -> str:
+            ee = str(e or "").strip().upper()
+            if ee == "A":
+                return "Pullback"
+            if ee == "B":
+                return "Momentum Breakout"
+            if ee == "F":
+                return "Fallback"
+            return "Setup"
+
+        lines2 = []
+        for s in setups:
+            try:
+                sym = str(getattr(s, "symbol", "")).upper()
+                sid = str(getattr(s, "setup_id", "") or "")
+                side = str(getattr(s, "side", "") or "").upper()
+                conf = int(getattr(s, "conf", 0) or 0)
+
+                entry = float(getattr(s, "entry", 0.0) or 0.0)
+                sl = float(getattr(s, "sl", 0.0) or 0.0)
+                tp1 = getattr(s, "tp1", None)
+                tp2 = getattr(s, "tp2", None)
+                tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+                vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+
+                ch24 = float(getattr(s, "ch24", 0.0) or 0.0)
+                ch4 = float(getattr(s, "ch4", 0.0) or 0.0)
+                ch1 = float(getattr(s, "ch1", 0.0) or 0.0)
+                ch15 = float(getattr(s, "ch15", 0.0) or 0.0)
+
+                rr_den = abs(entry - sl)
+                rr1 = (abs(float(tp1) - entry) / rr_den) if (rr_den > 0 and tp1 not in (None, 0, 0.0)) else 0.0
+                rr2 = (abs(float(tp2) - entry) / rr_den) if (rr_den > 0 and tp2 not in (None, 0, 0.0)) else 0.0
+                rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
+
+                pos_word = "long" if side == "BUY" else "short"
+                size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
+
+                emoji = "🟢" if side == "BUY" else "🔴"
+                typ = _engine_label(getattr(s, "engine", ""))
+
+                # Card-style formatting (same as previous detailed preview) + /size command
+                block = []
+                block.append(f"{emoji} *{side} — {sym}*")
+                block.append(f"`{sid}` | Conf: `{conf}`")
+                try:
+                    if symbol_recently_emailed(uid, sym, side, session):
+                        block.append("📩 *Email suppressed:* cooldown active")
+                except Exception:
+                    pass
+                if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
+                    block.append(f"Type: {typ} | RR(TP1): `{rr1:.2f}` | RR(TP2): `{rr2:.2f}` | RR(TP3): `{rr3:.2f}`")
+                else:
+                    block.append(f"Type: {typ} | RR(TP3): `{rr3:.2f}`")
+                block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
+                if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
+                    block.append(f"TP1: `{fmt_price(float(tp1))}` | TP2: `{fmt_price(float(tp2))}` | TP3: `{fmt_price(tp3)}`")
+                else:
+                    block.append(f"TP: `{fmt_price(tp3)}`")
+                block.append(
+                    f"Moves: 24H {ch24:+.0f}% {_mv_dot(ch24)} • 4H {ch4:+.0f}% {_mv_dot(ch4)} • "
+                    f"1H {ch1:+.0f}% {_mv_dot(ch1)} • 15m {ch15:+.0f}% {_mv_dot(ch15)}"
+                )
+                block.append(f"Volume: ~{vol/1e6:.1f}M")
+                block.append(f"Chart: {tv_chart_url(sym)}")
+                block.append(f"`{size_cmd}`")
+                lines2.append("\n".join(block))
+            except Exception:
+                continue
+
+        combined_setups_txt = ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
+
+    # -----------------------------------------------------
+    # UX: Keep /screen clean and action-first.
+    # - Top Trade Setups = ONLY qualified, email-eligible setups.
+    # - Momentum Watch = small "FYI" list (no entry yet).
+    # - Market Context = compressed pulse of the market (tone + a few leaders/losers + BTC/ETH).
+    # -----------------------------------------------------
+
+    # Momentum Watch (No Entry Yet)
+    momentum_lines = []
+    try:
+        waiting_items = pool.get("waiting") or []
+    except Exception:
+        waiting_items = []
+
+    try:
+        trend_watch = pool.get("trend_watch") or []
+    except Exception:
+        trend_watch = []
+
+    try:
+        seen_syms = set()
+
+        # 1) Waiting-for-trigger items first (near-miss)
+        for item in (waiting_items or [])[:max(2, int(SCREEN_WAITING_N or 2))]:
+            try:
+                if not (isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[1], dict)):
+                    continue
+                base, d = item
+                sym = str(base).upper()
+                if sym in (top_setup_syms or set()):
+                    continue
+                raw_side = str(d.get("side", "BUY") or "BUY").strip().upper()
+                if raw_side in ("LONG",):
+                    side = "BUY"
+                elif raw_side in ("SHORT",):
+                    side = "SELL"
+                elif raw_side in ("BUY", "SELL"):
+                    side = raw_side
+                else:
+                    side = raw_side
+                dot = "🟢" if side == "BUY" else ("🔴" if side == "SELL" else "🟡")
+                if sym in seen_syms:
+                    continue
+                seen_syms.add(sym)
+                momentum_lines.append(f"• *{sym}* {dot} `{side}` — waiting for entry trigger")
+                if len(momentum_lines) >= 2:
+                    break
+            except Exception:
+                continue
+
+        # 2) Trend watch (strong trend but no valid entry) — fill remaining slots
+        if len(momentum_lines) < 2:
+            trend_watch_sorted = sorted(
+                (trend_watch or []),
+                key=lambda x: int(x.get("confidence", x.get("conf", 0)) or 0),
+                reverse=True
+            )
+            for t in trend_watch_sorted:
+                try:
+                    sym = str(t.get("symbol", "")).upper().strip()
+                    if sym in (top_setup_syms or set()):
+                        continue
+                    if not sym or sym in seen_syms:
+                        continue
+                    side = str(t.get("side", "BUY") or "BUY").strip().upper()
+                    dot = "🟢" if side == "BUY" else ("🔴" if side == "SELL" else "🟡")
+                    seen_syms.add(sym)
+                    momentum_lines.append(f"• *{sym}* {dot} `{side}` — strong trend, no qualified entry yet")
+                    if len(momentum_lines) >= 2:
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        momentum_lines = []
+
+    momentum_txt = ""
+    if momentum_lines:
+        momentum_txt = "*Momentum Watch (No Entry Yet)*\n" + SEP + "\n" + "\n".join(momentum_lines)
+
+    # Market Context (compressed)
+    market_txt = ""
+    try:
+        # Build Leaders/Losers for Market Context
+        # Goal: show up to 5 items each (when available), preferring "directional" movers,
+        # but backfilling with high-volume movers so the section is informative.
+        vol_min = float(MOVER_VOL_USD_MIN)
+
+        movers = []
+        for sym, mv in (best_fut or {}).items():
+            try:
+                v = float(usd_notional(mv) or 0.0)
+                c24 = float(getattr(mv, "percentage", 0.0) or 0.0)
+                movers.append((sym, v, c24))
+            except Exception:
+                continue
+
+        movers = [t for t in movers if t[1] >= vol_min]
+
+        # Backfill thresholds: start strict, relax if we don't have enough.
+        def _pick_top(movers_list, direction: str):
+            out = []
+            used = set()
+            if direction == "up":
+                thresholds = [float(MOVER_UP_24H_MIN), 5.0, 0.0]
+                key = lambda x: x[2]
+                filt = lambda x, th: x[2] >= th
+                sort_rev = True
+            else:
+                thresholds = [abs(float(MOVER_DN_24H_MAX)), 5.0, 0.0]  # compare on absolute move
+                key = lambda x: -x[2]  # more negative first when sorting ascending by c24
+                filt = lambda x, th: (-x[2]) >= th
+                sort_rev = False
+
+            for th in thresholds:
+                if direction == "up":
+                    cand = [x for x in movers_list if x[0] not in used and filt(x, th)]
+                    cand = sorted(cand, key=lambda x: x[2], reverse=True)
+                else:
+                    cand = [x for x in movers_list if x[0] not in used and filt(x, th)]
+                    cand = sorted(cand, key=lambda x: x[2])  # most negative first
+
+                for x in cand:
+                    out.append(x)
+                    used.add(x[0])
+                    if len(out) >= 5:
+                        return out
+            return out
+
+        up_picks = _pick_top(movers, "up")
+        dn_picks = _pick_top(movers, "dn")
+
+        up_top = [f"*{str(sym).upper()}* {pct_with_emoji(c24)} ({v/1e6:.1f}M)" for sym, v, c24 in up_picks]
+        dn_top = [f"*{str(sym).upper()}* {pct_with_emoji(c24)} ({v/1e6:.1f}M)" for sym, v, c24 in dn_picks]
+        # Tone heuristic (based on strict directional thresholds)
+        upn = sum(1 for _sym, _v, _c24 in movers if _c24 >= float(MOVER_UP_24H_MIN))
+        dnn = sum(1 for _sym, _v, _c24 in movers if _c24 <= float(MOVER_DN_24H_MAX))
+        if upn >= max(2, int(dnn * 1.5)):
+            tone = "🟢 Bullish"
+        elif dnn >= max(2, int(upn * 1.5)):
+            tone = "🔴 Bearish"
+        else:
+            tone = "🟡 Mixed"
+
+        # BTC/ETH pulse (if available)
+        btc = (best_fut or {}).get("BTC")
+        eth = (best_fut or {}).get("ETH")
+        btc24 = pct_with_emoji(float(getattr(btc, "percentage", 0.0) or 0.0)) if btc else "—"
+        eth24 = pct_with_emoji(float(getattr(eth, "percentage", 0.0) or 0.0)) if eth else "—"
+
+        lines = [
+            f"*Market Context*",
+            SEP,
+            f"*Risk Tone:* {tone}",
+            "",
+            f"*Pulse:* *BTC* {btc24} | *ETH* {eth24}",
+            "",
+        ]
+        if up_top:
+            lines.append(f"*Leaders:* " + ", ".join(up_top))
+            lines.append("")
+        if dn_top:
+            lines.append(f"*Losers:* " + ", ".join(dn_top))
+            lines.append("")
+
+        market_txt = "\n".join(lines).strip()
+    except Exception:
+        market_txt = ""
+
+    # Assemble body (cache THIS, header stays live)
+    def _is_empty(txt: str) -> bool:
+        t = (txt or "").strip()
+        if not t:
+            return True
+        return t.startswith("_No ") or t.startswith("No ") or t.endswith("right now._")
+
+    blocks = []
+    blocks.extend(["", "*Top Trade Setups*", SEP, combined_setups_txt])
+
+    # Only show momentum section if there are no qualified setups OR to give quick context.
+    if momentum_txt and (not _is_empty(momentum_txt)):
+        blocks.extend(["", momentum_txt])
+
+    if market_txt and (not _is_empty(market_txt)):
+        blocks.extend(["", market_txt])
+
+    body = "\n".join([b for b in blocks if b is not None]).strip()
+
+    kb = []
+    try:
+        kb = [(s.symbol, s.setup_id) for s in (setups or [])]
+    except Exception:
+        kb = []
+    return body, kb
+
+async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return
+
+    # Avoid long scans blocking other commands on small instances
+    if SCAN_LOCK.locked():
+        await update.message.reply_text("⏳ Scan is running… please try /screen again in a moment.")
+        return
+
+    await SCAN_LOCK.acquire()
+    try:
+        # Send immediate response (fast perceived UX)
+        status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
+
+        reset_reject_tracker()
+
+        best_fut = await asyncio.to_thread(fetch_futures_tickers)
+        if not best_fut:
+            await status_msg.edit_text("❌ Failed to fetch futures data.")
+            return
+
+        # Header (always fresh)
+        uid = update.effective_user.id
+        user = get_user(uid)
+        session = current_session_utc()
+        loc_label, loc_time = user_location_and_time(user)
+
+        header = (
+            f"*PulseFutures — Market Scan*\n"
+            f"{HDR}\n"
+            f"*Session:* `{session}` | *{loc_label}:* `{loc_time}`\n"
+        )
+
+        now_ts = time.time()
+
+        # ------------- FAST PATH (cache hit) -------------
+        cached_body = ""
+        cached_kb = []
+        if (_SCREEN_CACHE.get("body") and (now_ts - float(_SCREEN_CACHE.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
+            cached_body = str(_SCREEN_CACHE.get("body") or "")
+            cached_kb = list(_SCREEN_CACHE.get("kb") or [])
+
+            msg = (header + "\n" + cached_body).strip()
+
+            keyboard = [
+                [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                for (sym, sid) in (cached_kb or [])
+            ]
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+            await send_long_message(
+                update,
+                msg,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            )
+            return
+
+        # ------------- SLOW PATH (build once under lock) -------------
+        async with _SCREEN_LOCK:
+            # Re-check cache after waiting for lock (another request may have filled it)
+            now_ts = time.time()
+            if (_SCREEN_CACHE.get("body") and (now_ts - float(_SCREEN_CACHE.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
+                cached_body = str(_SCREEN_CACHE.get("body") or "")
+                cached_kb = list(_SCREEN_CACHE.get("kb") or [])
+
+                msg = (header + "\n" + cached_body).strip()
+                keyboard = [
+                    [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                    for (sym, sid) in (cached_kb or [])
+                ]
+
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+
+                await send_long_message(
+                    update,
+                    msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+                )
+                return
+
+
+            # Heavy build MUST NOT run on the asyncio event loop.
+            # Only /screen is allowed to take longer; everything here runs in a worker thread.
+            body, kb = await asyncio.to_thread(
+                _build_screen_body_and_kb,
+                best_fut,
+                session,
+                int(update.effective_user.id),
+            )
+
+            # Cache for fast subsequent /screen calls
+            _SCREEN_CACHE["ts"] = time.time()
+            _SCREEN_CACHE["body"] = body
+            _SCREEN_CACHE["kb"] = list(kb or [])
+
+
+        # Send final
+        msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
+        keyboard = [
+            [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+            for (sym, sid) in (_SCREEN_CACHE.get("kb") or [])
+        ]
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        await send_long_message(
+            update,
+            msg,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+        )
+
+    except Exception as e:
+        logger.exception("screen_cmd failed")
+        try:
+            await update.message.reply_text(f"❌ /screen failed: {e}")
+        except Exception:
+            pass
+
+
+
+# =========================================================
+# TEXT ROUTER (Signal ID lookup)
+# =========================================================
+    finally:
+        try:
+            if SCAN_LOCK.locked():
+                SCAN_LOCK.release()
+        except Exception:
+            pass
+
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text.startswith("PF-"):
+        sig = db_get_signal(text)
+        if not sig:
+            await update.message.reply_text("Signal ID not found.")
+            return
+
+        tps = f"TP {fmt_price(float(sig['tp3']))}"
+        if sig.get("tp1") and sig.get("tp2") and int(sig["conf"]) >= MULTI_TP_MIN_CONF:
+            tps = f"TP1 {fmt_price(float(sig['tp1']))} | TP2 {fmt_price(float(sig['tp2']))} | TP3 {fmt_price(float(sig['tp3']))}"
+
+        rr3 = rr_to_tp(float(sig["entry"]), float(sig["sl"]), float(sig["tp3"]))
+
+        await update.message.reply_text(
+            f"🔎 Signal {sig['setup_id']}\n"
+            f"{sig['side']} {sig['symbol']} — Conf {sig['conf']}/100\n"
+            f"Entry {fmt_price(float(sig['entry']))} | SL {fmt_price(float(sig['sl']))}\n"
+            f"{tps}\n"
+            f"RR(TP3): {rr3:.2f}\n"
+            f"Chart: {tv_chart_url(sig['symbol'])}\n\n"
+            f"To journal it:\n"
+            f"/trade_open {sig['symbol']} {'long' if sig['side']=='BUY' else 'short'} entry {sig['entry']} sl {sig['sl']} risk usd 40 sig {sig['setup_id']}"
+        )
+        return
+
+# =========================================================
+# EMAIL BODY
+# =========================================================
+
+def tz_location_label(tz_name: str) -> str:
+    """Return a friendly location label from an IANA tz like 'Australia/Sydney'."""
+    try:
+        tz_name = str(tz_name or '').strip()
+    except Exception:
+        tz_name = ''
+    if not tz_name:
+        return 'Local time'
+    parts = tz_name.split('/')
+    region = parts[0] if parts else tz_name
+    city = parts[-1] if parts else tz_name
+    try:
+        city = city.replace('_', ' ').strip()
+    except Exception:
+        pass
+    region_label = region
+    # Small UX mappings (keep it simple + safe)
+    if region == 'America':
+        region_label = 'USA'
+    elif region == 'Etc':
+        region_label = 'UTC'
+    return f"{city} ({region_label})" if city else str(region_label)
+
+
+def _email_body_pretty(
+    session_name: str,
+    now_local: datetime,
+    user_tz: str,
+    setups: List[Setup],
+    best_fut: Dict[str, MarketVol],
+) -> str:
+    loc_label = tz_location_label(user_tz)
+    when_str = now_local.strftime("%Y-%m-%d %H:%M")
+
+    parts = []
+    parts.append(HDR)
+    parts.append(f"📩 PulseFutures • {session_name} • {loc_label}: {when_str} ({user_tz})")
+    parts.append(HDR)
+    parts.append("")
+
+    up, dn = compute_directional_lists(best_fut)
+    leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:5]
+    parts.append("Market Snapshot")
+    parts.append(SEP)
+
+    if leaders:
+        topv = ", ".join([f"{b}({pct_with_emoji(float(mv.percentage or 0.0))})" for b, mv in leaders])
+        parts.append(f"Top Volume: {topv}")
+
+    if up:
+        parts.append("Leaders: " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in up[:5]]))
+    if dn:
+        parts.append("Losers:  " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in dn[:5]]))
+    parts.append("")
+
+    parts.append("Top Setups")
+    parts.append(SEP)
+    parts.append("")
+
+    for i, s in enumerate(setups, 1):
+        rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+
+        # ✅ "ID-" prefix
+        parts.append(f"ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
+        parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP3): {rr3:.2f}")
+
+        _tp1, _tp2, _tp3 = _ensure_three_tps(s.entry, s.sl, s.tp3, getattr(s, "tp1", None), getattr(s, "tp2", None), getattr(s, "side", ""))
+        if _tp1 not in (None, 0, 0.0) and _tp2 not in (None, 0, 0.0) and _tp3 not in (None, 0, 0.0):
+            parts.append(
+                f"   TP1: {fmt_price_email(_tp1)} ({TP_ALLOCS[0]}%) | "
+                f"TP2: {fmt_price_email(_tp2)} ({TP_ALLOCS[1]}%) | "
+                f"TP3: {fmt_price_email(_tp3)} ({TP_ALLOCS[2]}%)"
+            )
+        else:
+            parts.append(f"   TP3: {fmt_price_email(s.tp3)}")
+
+        # ✅ only for t# trailing-needed setups
+        if getattr(s, 'is_trailing_tp3', False):
+            parts.append("   TP3 Mode: Trailing")
+
+        parts.append(
+            f"   24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | "
+            f"1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}"
+        )
+        parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
+        try:
+            _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
+            parts.append(f"/size {str(getattr(s, 'symbol', ''))} {_pos} entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}")
+        except Exception:
+            pass
+        parts.append("")
+
+    parts.append(HDR)
+    parts.append("🤖 Position Sizing")
+    parts.append("Use the PulseFutures Telegram bot to calculate safe position size based on your Stop Loss.")
+    parts.append(f"👉 {TELEGRAM_BOT_URL}")
+    parts.append(HDR)
+    parts.append("Not financial advice.")
+    parts.append("PulseFutures")
+    parts.append(HDR)
+
+    return "\n".join(parts).strip()
+
+
+def _email_body_pretty_html(
+    session_name: str,
+    now_local: datetime,
+    user_tz: str,
+    setups: List[Setup],
+    best_fut: Dict[str, MarketVol],
+) -> str:
+    """HTML version of the email body styled to resemble Telegram /screen cards (bold headings + code blocks)."""
+    loc_label = tz_location_label(user_tz)
+    when_str = now_local.strftime("%Y-%m-%d %H:%M")
+
+    def esc(s: str) -> str:
+        try:
+            import html as _html
+            return _html.escape(str(s))
+        except Exception:
+            return str(s)
+
+    lines = []
+    lines.append(f"<div style='font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.35'>")
+    lines.append(f"<div style='font-size:16px;font-weight:700'>📩 PulseFutures • {esc(session_name)} • {esc(loc_label)}: {esc(when_str)} ({esc(user_tz)})</div>")
+    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:10px 0'>")
+
+    up, dn = compute_directional_lists(best_fut)
+    leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:5]
+
+    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Market Snapshot</div>")
+    if leaders:
+        topv = ", ".join([f"{esc(b)}({esc(pct_with_emoji(float(mv.percentage or 0.0)))})" for b, mv in leaders])
+        lines.append(f"<div>Top Volume: {topv}</div>")
+    if up:
+        lines.append("<div>Leaders: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in up[:5]]) + "</div>")
+    if dn:
+        lines.append("<div>Losers: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in dn[:5]]) + "</div>")
+
+    lines.append("<hr style='border:none;border-top:1px solid #eee;margin:10px 0'>")
+    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Top Setups</div>")
+
+    for i, s in enumerate(setups, 1):
+        rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+        side = esc(s.side)
+        sym = esc(s.symbol)
+        conf = esc(s.conf)
+        setup_id = esc(s.setup_id)
+
+        card = []
+        card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
+        card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
+        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP3): <code>{rr3:.2f}</code></div>")
+
+        if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
+            card.append(
+                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> ({TP_ALLOCS[0]}%) &nbsp;|&nbsp; "
+                f"TP2: <code>{esc(fmt_price_email(s.tp2))}</code> ({TP_ALLOCS[1]}%) &nbsp;|&nbsp; "
+                f"TP3: <code>{esc(fmt_price_email(s.tp3))}</code> ({TP_ALLOCS[2]}%)</div>"
+            )
+        else:
+            card.append(f"<div style='margin-top:4px'>TP: <code>{esc(fmt_price_email(s.tp3))}</code></div>")
+
+        if s.is_trailing_tp3:
+            card.append("<div style='margin-top:4px'>TP3 Mode: <b>Trailing</b></div>")
+
+        card.append(
+            f"<div style='margin-top:6px'>24H {esc(pct_with_emoji(s.ch24))} &nbsp;|&nbsp; 4H {esc(pct_with_emoji(s.ch4))} &nbsp;|&nbsp; "
+            f"1H {esc(pct_with_emoji(s.ch1))} &nbsp;|&nbsp; 15m {esc(pct_with_emoji(s.ch15))} &nbsp;|&nbsp; Vol~{esc(fmt_money(s.fut_vol_usd))}</div>"
+        )
+        card.append(f"<div style='margin-top:6px'>Chart: {esc(tv_chart_url(s.symbol))}</div>")
+        try:
+            _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
+            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
+            card.append(f"<div style='margin-top:8px'><code style='background:#f7f7f7;padding:8px;border-radius:8px;display:inline-block;white-space:nowrap;font-family:Menlo,Consolas,monospace'>{esc(size_line)}</code></div>")
+        except Exception:
+            pass
+        card.append("</div>")
+        lines.extend(card)
+
+    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:12px 0'>")
+    lines.append("<div style='font-weight:700'>🤖 Position Sizing</div>")
+    lines.append("<div>Use the PulseFutures Telegram bot to calculate safe position size based on your Stop Loss.</div>")
+    lines.append(f"<div style='margin-top:4px'>👉 {esc(TELEGRAM_BOT_URL)}</div>")
+    lines.append("<div style='margin-top:10px;color:#666'>Not financial advice. PulseFutures</div>")
+    lines.append("</div>")
+    return "".join(lines).strip()
+
+
+    def esc(s: str) -> str:
+        try:
+            import html as _html
+            return _html.escape(str(s))
+        except Exception:
+            return str(s)
+
+    lines = []
+    lines.append(f"<div style='font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.35'>")
+    lines.append(f"<div style='font-size:16px;font-weight:700'>📩 PulseFutures • {esc(session_name)} • {esc(loc_label)}: {esc(when_str)} ({esc(user_tz)})</div>")
+    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:10px 0'>")
+
+    up, dn = compute_directional_lists(best_fut)
+    leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:5]
+
+    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Market Snapshot</div>")
+    if leaders:
+        topv = ", ".join([f"{esc(b)}({esc(pct_with_emoji(float(mv.percentage or 0.0)))})" for b, mv in leaders])
+        lines.append(f"<div>Top Volume: {topv}</div>")
+    if up:
+        lines.append("<div>Leaders: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in up[:5]]) + "</div>")
+    if dn:
+        lines.append("<div>Losers: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in dn[:5]]) + "</div>")
+
+    lines.append("<hr style='border:none;border-top:1px solid #eee;margin:10px 0'>")
+    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Top Setups</div>")
+
+    for i, s in enumerate(setups, 1):
+        rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+        side = esc(s.side)
+        sym = esc(s.symbol)
+        conf = esc(s.conf)
+        setup_id = esc(s.setup_id)
+
+        card = []
+        card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
+        card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
+        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP3): <code>{rr3:.2f}</code></div>")
+
+        if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
+            card.append(
+                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> ({TP_ALLOCS[0]}%) &nbsp;|&nbsp; "
+                f"TP2: <code>{esc(fmt_price_email(s.tp2))}</code> ({TP_ALLOCS[1]}%) &nbsp;|&nbsp; "
+                f"TP3: <code>{esc(fmt_price_email(s.tp3))}</code> ({TP_ALLOCS[2]}%)</div>"
+            )
+        else:
+            card.append(f"<div style='margin-top:4px'>TP: <code>{esc(fmt_price_email(s.tp3))}</code></div>")
+
+        if s.is_trailing_tp3:
+            card.append("<div style='margin-top:4px'>TP3 Mode: <b>Trailing</b></div>")
+
+        card.append(
+            f"<div style='margin-top:6px'>24H {esc(pct_with_emoji(s.ch24))} &nbsp;|&nbsp; 4H {esc(pct_with_emoji(s.ch4))} &nbsp;|&nbsp; "
+            f"1H {esc(pct_with_emoji(s.ch1))} &nbsp;|&nbsp; 15m {esc(pct_with_emoji(s.ch15))} &nbsp;|&nbsp; Vol~{esc(fmt_money(s.fut_vol_usd))}</div>"
+        )
+        card.append(f"<div style='margin-top:6px'>Chart: {esc(tv_chart_url(s.symbol))}</div>")
+        try:
+            _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
+            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
+            card.append(f"<div style='margin-top:8px'><code style='background:#f7f7f7;padding:8px;border-radius:8px;display:inline-block;white-space:nowrap;font-family:Menlo,Consolas,monospace'>{esc(size_line)}</code></div>")
+        except Exception:
+            pass
+        card.append("</div>")
+        lines.extend(card)
+
+    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:12px 0'>")
+    lines.append("<div style='font-weight:700'>🤖 Position Sizing</div>")
+    lines.append("<div>Use the PulseFutures Telegram bot to calculate safe position size based on your Stop Loss.</div>")
+    lines.append(f"<div style='margin-top:4px'>👉 {esc(TELEGRAM_BOT_URL)}</div>")
+    lines.append("<div style='margin-top:10px;color:#666'>Not financial advice. PulseFutures</div>")
+    lines.append("</div>")
+    return "".join(lines).strip()
+
+
+def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut) -> bool:
+    """
+    One email containing multiple setups.
+    Requires _email_body_pretty(...) and send_email(...).
+    """
+    if not setups:
+        return False
+
+    uid = int(user["user_id"])
+    user_tz = str(user.get("tz") or "UTC")
+    try:
+        tz = ZoneInfo(user_tz)
+    except Exception:
+        tz = timezone.utc
+        user_tz = "UTC"
+
+    now_local = datetime.now(tz)
+
+    # Display the *market* session (NY/LON/ASIA) in the email header.
+    # 'UNLIMITED' is an access mode, not a market session.
+    try:
+        live_sess = current_session_utc(datetime.now(timezone.utc))
+    except Exception:
+        live_sess = "NY"
+    sess_name = str(sess.get("name") or "")
+    display_session = live_sess if sess_name == "UNLIMITED" else sess_name
+
+    first = setups[0]
+    subject = f"PulseFutures • {display_session} • {first.side} {first.symbol}"
+    if len(setups) > 1:
+        subject += f" (+{len(setups)-1} more)"
+
+    body = _email_body_pretty(
+        session_name=str(display_session),
+        now_local=now_local,
+        user_tz=user_tz,
+        setups=setups,
+        best_fut=best_fut,
+    )
+
+    body_html = _email_body_pretty_html(
+        session_name=str(display_session),
+        now_local=now_local,
+        user_tz=user_tz,
+        setups=setups,
+        best_fut=best_fut,
+    )
+
+    sent = send_email(subject, body, user_id_for_debug=uid, body_html=body_html)
+    if sent:
+        try:
+            now_ts = time.time()
+            for s in setups:
+                # Ensure the setup exists in signals table
+                try:
+                    db_insert_signal(s)
+                except Exception:
+                    pass
+                # Record that this setup was emailed to this user
+                try:
+                    db_mark_emailed_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
+                except Exception:
+                    pass
+                try:
+                    db_log_generated_setup(uid, "email", str(display_session or ""), s)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return sent
+
+
+
+
+# =========================================================
+# STRIPE WEBHOOK SERVER
+# =========================================================
+class StripeWebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        payload = self.rfile.read(int(self.headers["Content-Length"]))
+        sig = self.headers.get("Stripe-Signature")
+
+        try:
+            event = stripe.Webhook.construct_event(
+                payload,
+                sig,
+                os.environ.get("STRIPE_WEBHOOK_SECRET"),
+            )
+        except Exception:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        data = event["data"]["object"]
+
+        if event["type"] in ("checkout.session.completed", "invoice.paid"):
+            email = data.get("customer_email")
+        
+            # get price + plan
+            line = data["lines"]["data"][0]
+            price_id = line["price"]["id"]
+            plan = STRIPE_PRICE_TO_PLAN.get(price_id)
+        
+            # reference + amount
+            ref = data.get("id") or event.get("id")
+            amount = (line.get("amount_total") or data.get("amount_paid") or 0) / 100
+            currency = (data.get("currency") or "usd").upper()
+        
+            if email and plan:
+                activate_user_with_ledger_by_email(
+                    email=email,
+                    plan=plan,
+                    ref=ref,
+                    amount=amount,
+                    currency=currency,
+                )
+
+        if event["type"] == "customer.subscription.deleted":
+            email = data.get("customer_email")
+            ref = data.get("id") or event.get("id")
+            if email:
+                downgrade_user_with_ledger_by_email(email, ref=ref)
+
+        self.send_response(200)
+        self.end_headers()
+
+def start_stripe_webhook():
+    HTTPServer(("0.0.0.0", 4242), StripeWebhookHandler).serve_forever()
+
+# =========================================================
+# MY PLAN & BILLING
+# =========================================================
+
+async def myplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    user = get_user(user_id)  # however you fetch user data
+
+    plan = effective_plan(user_id, user)
+    expires = (user or {}).get("plan_expires")
+
+    msg = f"""\
+📦 Your Plan
+
+• Plan: {plan.upper()}
+• Status: {'Admin (Unlimited)' if is_admin_user(user_id) else ('Active' if plan != 'free' else 'Free user')}
+"""
+
+    if expires:
+        msg += f"• Expires: {expires}\n"
+
+    await update.message.reply_text(msg)
+
+
+
+async def _billing_cmd_unused(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Billing menu: Stripe (Payment Links) + USDT.
+    - Uses env vars only (safe on Render)
+    - Does NOT call Stripe API (no stripe.api_key needed)
+    - Never crashes if not configured
+    """
+    user = update.effective_user
+    uid = user.id if user else None
+
+    # Stripe Payment Links
+    stripe_standard_url = _env("STRIPE_STANDARD_URL")
+    stripe_pro_url = _env("STRIPE_PRO_URL")
+
+    # USDT
+    usdt_network = _env("USDT_NETWORK", "TRC20")
+    usdt_address = _env("USDT_ADDRESS")
+    usdt_note = _env("USDT_NOTE")
+
+    # Support
+    support_handle = _env("BILLING_SUPPORT_HANDLE", "@PulseFuturesSupport")
+
+    # Reference for manual matching (USDT payments, or any support ticket)
+    ref = f"PF-{uid}" if uid else "PF-UNKNOWN"
+
+    lines = []
+    lines.append("💳 PulseFutures — Billing & Upgrade")
+    lines.append("")
+    lines.append("Choose your payment method below.")
+    lines.append(f"Reference (important): {ref}")
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("1) Stripe (Card / Apple Pay / Google Pay)")
+    lines.append("────────────────────")
+    if stripe_standard_url or stripe_pro_url:
+        lines.append("Tap a plan button to pay securely via Stripe.")
+    else:
+        lines.append("Stripe is not configured yet.")
+        lines.append("Admin: set STRIPE_STANDARD_URL / STRIPE_PRO_URL in Render env vars.")
+
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("2) USDT")
+    lines.append("────────────────────")
+    if usdt_address:
+        lines.append(f"Network: {usdt_network}")
+        lines.append(f"Address: {usdt_address}")
+        lines.append(f"(Short: {_mask_addr(usdt_address)})")
+        if usdt_note:
+            lines.append(f"Note: {usdt_note.replace('<REF>', ref)}")
+        else:
+            lines.append(f"Note: After sending, message support with TXID + reference '{ref}'.")
+    else:
+        lines.append("USDT is not configured yet.")
+        lines.append("Admin: set USDT_ADDRESS (+ optional USDT_NETWORK) in Render env vars.")
+
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("After payment")
+    lines.append("────────────────────")
+    lines.append("1) If Stripe: you’ll be activated after confirmation (or contact support if needed).")
+    lines.append("2) If USDT: submit TXID using /usdt_paid <TXID> <standard|pro>.")
+    lines.append(f"Support: {support_handle}")
+    lines.append(f"Reference: {ref}")
+
+    msg = "\n".join(lines)
+
+    # Buttons
+    buttons = []
+    stripe_row = []
+    if stripe_standard_url:
+        stripe_row.append(InlineKeyboardButton("✅ Stripe — Standard", url=stripe_standard_url))
+    if stripe_pro_url:
+        stripe_row.append(InlineKeyboardButton("🚀 Stripe — Pro", url=stripe_pro_url))
+    if stripe_row:
+        buttons.append(stripe_row)
+
+    howto_url = _env("BILLING_HOWTO_URL")
+    if howto_url:
+        buttons.append([InlineKeyboardButton("ℹ️ Payment Instructions", url=howto_url)])
+
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+
+    await send_long_message(
+        update,
+        msg,
+        parse_mode=None,
+        disable_web_page_preview=True,
+        reply_markup=reply_markup,
+    )
+
+def activate_user_with_ledger_by_email(email: str, plan: str, ref: str, amount: float = 0, currency: str = "USD"):
+    """
+    Activates user by email AND records payment in ledger.
+    """
+    user = get_user_by_email(email)
+    if not user:
+        return
+
+    user_id = user["user_id"]
+
+    # 1) grant access (existing behavior)
+    activate_user_by_email(email, plan)
+
+    # 2) write unified access state
+    _set_user_access(user_id, plan, "stripe", ref)
+
+    # 3) write payment ledger
+    _ledger_add(
+        user_id=user_id,
+        source="stripe",
+        ref=ref,
+        plan=plan,
+        amount=amount,
+        currency=currency,
+        status="paid",
+    )
+
+def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
+    user = get_user_by_email(email)
+    if not user:
+        return
+
+    user_id = user["user_id"]
+
+    downgrade_user_by_email(email)
+    _set_user_access(user_id, "free", "stripe", ref)
+
+
+
+# =========================================================
+# EMAIL JOB
+# =========================================================
+
+EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "60"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "60"))
+EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "60"))
+
+# SMTP connection reuse (Render speed fix)
+SMTP_REUSE_TTL_SEC = int(os.environ.get("SMTP_REUSE_TTL_SEC", "240"))  # 4 minutes
+
+_SMTP_LOCK = threading.RLock()
+_SMTP_CONN = None          # cached SMTP connection
+_SMTP_CONN_IS_SSL = None   # bool
+_SMTP_CONN_TS = 0.0        # last-used timestamp
+
+
+async def _to_thread_with_timeout(fn, timeout_sec: int, *args, **kwargs):
+    return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout_sec)
+
+async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
+    """
+    Runs send_email() in a worker thread with a hard timeout so SMTP/network stalls
+    can't block the Telegram event loop (Render lag fix).
+    """
+    try:
+        return bool(await _to_thread_with_timeout(send_email, timeout_sec, *args, **kwargs))
+    except asyncio.TimeoutError:
+        return False
+    except Exception:
+        return False
+
+async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
+    # Prevent overlapping runs (JobQueue can overlap if a run is slow)
+    if ALERT_LOCK.locked():
+        return
+
+    async with ALERT_LOCK:
+        # Keep it quiet if email is off or not configured
+        if not EMAIL_ENABLED:
+            return
+        if not email_config_ok():
+            return
+
+        # Trade-signal emails may be notify_on-gated,
+        # but Big-Move Alerts should go to anyone who has an email saved.
+
+        try:
+            users_notify = list_users_notify_on()
+        except Exception as e:
+            logger.exception("list_users_notify_on failed: %s", e)
+            users_notify = []
+
+        try:
+            users_bigmove = list_users_with_email()
+        except Exception as e:
+            logger.exception("list_users_with_email failed: %s", e)
+            users_bigmove = []
+
+        if not users_notify and not users_bigmove:
+            return
+
+        # TIMEOUT-PROTECTED fetch (prevents lock being held forever)
+        try:
+            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, EMAIL_FETCH_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            return
+        except Exception:
+            return
+
+        if not best_fut:
+            return
+
+        # -----------------------------------------------------
+        # Rule 2: Volume relative filter base line (killer rule)
+        # -----------------------------------------------------
+        _all_vols = []
+        for _b, _mv in (best_fut or {}).items():
+            try:
+                _all_vols.append(float(getattr(_mv, "fut_vol_usd", 0.0) or 0.0))
+            except Exception:
+                pass
+        MARKET_VOL_MEDIAN_USD = _median(_all_vols)
+
+        # -----------------------------------------------------
+        # Big-Move Alert Emails (independent of full trade setups)
+        # Trigger: |4H| >= user.bigmove_alert_4h  OR  |1H| >= user.bigmove_alert_1h
+        # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 10M)
+        # Defaults: 1H=7.5%, 4H=15%
+        # -----------------------------------------------------
+        for u in (users_bigmove or []):
+            # Pro/trial-only email features
+            try:
+                uid = int(u.get("user_id") or u.get("id") or 0)
+            except Exception:
+                uid = 0
+            if uid and (not user_has_pro(uid)):
+                continue
+
+            tz = timezone.utc
+            uid = 0
+            try:
+                try:
+                    uid = int(u.get("user_id") or u.get("id") or 0)
+                except Exception:
+                    uid = 0
+                if not uid:
+                    continue
+
+                uu = get_user(uid) or {}
+
+                tz_name = str((uu or {}).get("tz") or "UTC")
+                try:
+                    tz = ZoneInfo(tz_name)
+                except Exception:
+                    tz = timezone.utc
+
+                # Respect per-user ON/OFF
+                on = int(uu.get("bigmove_alert_on", 1) or 0)
+                if not on:
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": ["bigmove_alert_off"],
+                    }
+                    continue
+
+                try:
+                    p4 = float(uu.get("bigmove_alert_4h", 15.0) or 15.0)
+                    p1 = float(uu.get("bigmove_alert_1h", 7.5) or 7.5)
+                except Exception:
+                    p4, p1 = 15.0, 7.5
+
+                try:
+                    min_vol = float(uu.get("bigmove_min_vol_usd", 10_000_000) or 10_000_000)
+                except Exception:
+                    min_vol = 10_000_000.0
+
+                candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, min_vol_usd=min_vol, max_items=12)
+
+                # Debug counts from the SAME dataset used for bigmove (same field-name logic)
+                def _pick_pct(_mv, _keys) -> float:
+                    for _k in _keys:
+                        try:
+                            _v = getattr(_mv, _k, None)
+                            if _v is None:
+                                continue
+                            return float(_v or 0.0)
+                        except Exception:
+                            continue
+                    return 0.0
+
+                try:
+                    bm_any_4h = sum(
+                        1 for _sym, _mv in (best_fut or {}).items()
+                        if abs(_pick_pct(_mv, ["ch4", "pct_4h", "change_4h", "chg_4h", "percentage_4h", "p4", "h4"])) >= float(p4)
+                    )
+                except Exception:
+                    bm_any_4h = -1
+
+                try:
+                    bm_any_1h = sum(
+                        1 for _sym, _mv in (best_fut or {}).items()
+                        if abs(_pick_pct(_mv, ["ch1", "pct_1h", "change_1h", "chg_1h", "percentage_1h", "p1", "h1"])) >= float(p1)
+                    )
+                except Exception:
+                    bm_any_1h = -1
+
+                if not candidates:
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": [
+                            f"no_candidates (p4={p4}, p1={p1})",
+                            f"debug_raw_hits:4h={bm_any_4h},1h={bm_any_1h}",
+                        ],
+                    }
+                    continue
+
+                # Volume gate (default 10M) + remove ones emailed recently (per symbol + direction)
+                filtered = []
+                for c in candidates:
+                    try:
+                        vol = float(c.get("vol", 0.0) or 0.0)
+                    except Exception:
+                        vol = 0.0
+
+                    if vol > 0.0 and vol < float(min_vol):
+                        continue
+
+                    try:
+                        if not bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
+                            filtered.append(c)
+                    except Exception:
+                        filtered.append(c)
+
+                if not filtered:
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": [f"no_candidates_after_volume_or_cooldown (min_vol={min_vol/1e6:.1f}M)"],
+                    }
+                    continue
+
+                # Build email body
+                lines = []
+                lines.append("⚡ PulseFutures — BIG MOVE ALERT")
+                lines.append(HDR)
+                lines.append(f"Triggers: |4H| ≥ {p4:.1f}%  OR  |1H| ≥ {p1:.1f}%")
+                lines.append(f"Min Vol (24H): {min_vol/1e6:.1f}M")
+                lines.append("")
+
+                top = filtered[0]
+                top_sym = top["symbol"]
+                top_dir = "UP" if top.get("direction") == "UP" else "DOWN"
+                top_move = top["ch4"] if abs(top.get("ch4", 0.0)) >= abs(top.get("ch1", 0.0)) else top.get("ch1", 0.0)
+                top_tf = "4H" if abs(top.get("ch4", 0.0)) >= abs(top.get("ch1", 0.0)) else "1H"
+
+                subject = f"⚡ Big Move Alert • {top_sym} {top_dir} • {top_tf} {top_move:+.0f}%"
+                if len(filtered) > 1:
+                    subject += f" (+{len(filtered)-1} more)"
+
+                for c in filtered[:8]:
+                    sym = c["symbol"]
+                    ch4 = float(c.get("ch4", 0.0) or 0.0)
+                    ch1 = float(c.get("ch1", 0.0) or 0.0)
+                    vol = float(c.get("vol", 0.0) or 0.0)
+                    arrow = "🟢" if c.get("direction") == "UP" else "🔴"
+
+                    lines.append(f"{arrow} {sym}: 4H {ch4:+.0f}% | 1H {ch1:+.0f}% | Vol ~{vol/1e6:.1f}M")
+                    lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
+                    lines.append("")
+
+                body = "\n".join(lines).strip()
+
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "TRY_SEND",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": [
+                        f"candidates={len(filtered)}",
+                        f"p4={p4}",
+                        f"p1={p1}",
+                        f"min_vol={min_vol}",
+                    ],
+                }
+
+                ok = await _send_email_async(
+                    EMAIL_SEND_TIMEOUT_SEC,
+                    subject,
+                    body,
+                    user_id_for_debug=uid,
+                    enforce_trade_window=False
+                )
+
+
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "SENT" if ok else "FAIL",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": ["ok"] if ok else [_LAST_SMTP_ERROR.get(uid, "send_email_failed")],
+                }
+
+                if ok:
+                    for c in filtered[:8]:
+                        try:
+                            mark_bigmove_emailed(uid, c["symbol"], c["direction"])
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "ERROR",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": [f"{type(e).__name__}: {e}"],
+                }
+                continue
+        
+
+        # -----------------------------------------------------
+        setups_by_session: Dict[str, List[Setup]] = {}
+        for sess_name in ["NY", "LON", "ASIA"]:
+            try:
+                pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                pool = {"setups": []}
+            except Exception:
+                pool = {"setups": []}
+
+            setups = (pool.get("setups", []) or [])[:max(EMAIL_SETUPS_N * 3, 9)]
+
+            # Rule 3: Priority override (Directional Leaders/Losers first)
+            if EMAIL_PRIORITY_OVERRIDE_ON:
+                pri = _email_priority_bases(best_fut, directional_take=12)
+                setups = sorted(
+                    setups,
+                    key=lambda s: (0 if str(getattr(s, "symbol", "")).upper() in pri else 1)
+                )
+
+            setups_by_session[sess_name] = setups
+
+            for s in setups:
+                try:
+                    db_insert_signal(s)
+                except Exception:
+                    pass
+
+        # -----------------------------------------------------
+        # Per-user send / skip logic
+        # -----------------------------------------------------
+        for user in (users_notify or []):
+            # ✅ Robust uid resolution (supports either user_id or id)
+            try:
+                uid = int(user.get("user_id") or user.get("id") or 0)
+            except Exception:
+                uid = 0
+            if not uid:
+                continue
+
+            # ✅ Robust tz resolution (never crash job)
+            tz_name = str(user.get("tz") or "UTC")
+            try:
+                tz = ZoneInfo(tz_name)
+            except Exception:
+                tz = timezone.utc
+                tz_name = "UTC"
+
+            # ✅ Ensure session logic never crashes job
+            try:
+                sess = in_session_now(user)
+            except Exception as e:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"in_session_now_failed ({type(e).__name__})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # If user is NOT in an enabled session right now, skip
+            if not sess:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": ["not_in_enabled_session"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            sess_name = str(sess.get("name") or "")
+            # Market session label (NY/LON/ASIA) — never show "UNLIMITED" as the session name in email.
+            try:
+                live_sess = current_session_utc(datetime.now(timezone.utc))
+            except Exception:
+                live_sess = "NY"
+            display_sess = live_sess if sess_name == "UNLIMITED" else sess_name
+
+
+            # Unlimited mode => allow setups from ALL sessions (24/7)
+
+            if sess_name == "UNLIMITED":
+
+                setups_all = []
+
+                for _lst in (setups_by_session or {}).values():
+
+                    if _lst:
+
+                        setups_all.extend(list(_lst))
+
+            else:
+
+                setups_all = setups_by_session.get(sess_name, []) or []
+            if not setups_all:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"no_setups_generated_for_session ({display_sess})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # state init must not crash job
+            try:
+                st = email_state_get(uid)
+            except Exception as e:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "ERROR",
+                    "reasons": [f"email_state_get_failed ({type(e).__name__})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Reset session state if session_key changed
+            try:
+                if str(st.get("session_key")) != str(sess.get("session_key")):
+                    email_state_set(uid, session_key=str(sess.get("session_key")), sent_count=0, last_email_ts=0.0)
+                    st = email_state_get(uid)
+            except Exception:
+                pass
+
+            # Safe defaults (never KeyError)
+            try:
+                max_emails = int(user.get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION))
+            except Exception:
+                max_emails = int(DEFAULT_MAX_EMAILS_PER_SESSION)
+
+            try:
+                gap_min = int(user.get("email_gap_min", DEFAULT_MIN_EMAIL_GAP_MIN))
+            except Exception:
+                gap_min = int(DEFAULT_MIN_EMAIL_GAP_MIN)
+
+            gap_sec = max(0, gap_min) * 60
+
+            # Daily cap
+            day_local = datetime.now(tz).date().isoformat()
+            try:
+                sent_today = _email_daily_get(uid, day_local)
+            except Exception:
+                sent_today = 0
+
+            try:
+                day_cap = int(user.get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY))
+            except Exception:
+                day_cap = int(DEFAULT_MAX_EMAILS_PER_DAY)
+
+            if day_cap > 0 and sent_today >= day_cap:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"daily_email_cap_reached ({sent_today}/{day_cap})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Session cap
+            try:
+                sent_in_session = int(st.get("sent_count", 0) or 0)
+            except Exception:
+                sent_in_session = 0
+
+            if max_emails > 0 and sent_in_session >= max_emails:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"session_email_cap_reached ({sent_in_session}/{max_emails})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Gap
+            now_ts = time.time()
+            try:
+                last_ts = float(st.get("last_email_ts", 0.0) or 0.0)
+            except Exception:
+                last_ts = 0.0
+
+            if gap_sec > 0 and (now_ts - last_ts) < gap_sec:
+                remain = int(gap_sec - (now_ts - last_ts))
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"email_gap_active (remain {remain}s)"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+                        # ---------------------------
+            # Unified /screen + /email Top Setup eligibility
+            # ---------------------------
+            # Email should send the SAME Top Trade Setups that /screen shows.
+            # Only user preferences (sessions/trade window/caps/gap/cooldown) can block sending.
+
+            skip_reasons_counter = Counter()
+            eligible: List[Setup] = []
+            for s in (setups_all or []):
+                ok, why = is_top_setup_eligible(s)
+                if ok:
+                    eligible.append(s)
+                else:
+                    skip_reasons_counter[str(why)] += 1
+
+            if not eligible:
+                top_reasons = dict(skip_reasons_counter.most_common(3))
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": ["no_setups_after_filters", f"top_reasons={top_reasons}"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Premium ordering: confidence desc, RR(TP3) desc
+            def _rr3(_s: Setup) -> float:
+                try:
+                    return float(rr_to_tp(float(_s.entry), float(_s.sl), float(_s.tp3)))
+                except Exception:
+                    return 0.0
+
+            eligible = sorted(eligible, key=lambda _s: (int(getattr(_s, "conf", 0) or 0), _rr3(_s)), reverse=True)
+
+            # Candidate picks for cooldown/flip checks below
+            picks: List[Setup] = list(eligible[: max(int(EMAIL_SETUPS_N) * 6, 18)])
+
+            chosen_list: List[Setup] = []
+            _seen_setup_keys = set()
+            cooldown_blocked = 0
+            flip_blocked = 0
+
+            for s in picks:
+                if len(chosen_list) >= int(EMAIL_SETUPS_N):
+                    break
+
+                sym = str(getattr(s, "symbol", "")).upper()
+                side = str(getattr(s, "side", "")).upper()
+                try:
+                    _k = (
+                        sym,
+                        side,
+                        round(float(getattr(s, 'entry', 0.0) or 0.0), 8),
+                        round(float(getattr(s, 'sl', 0.0) or 0.0), 8),
+                        round(float(getattr(s, 'tp3', 0.0) or 0.0), 8),
+                    )
+                except Exception:
+                    _k = (sym, side, str(getattr(s, 'entry', '')), str(getattr(s, 'sl', '')), str(getattr(s, 'tp3', '')))
+                if _k in _seen_setup_keys:
+                    continue
+                _seen_setup_keys.add(_k)
+                sess_name = str(sess["name"])
+
+                if symbol_flip_guard_active(uid, sym, side, sess_name):
+                    flip_blocked += 1
+                    continue
+
+                if symbol_recently_emailed(uid, sym, side, sess_name):
+                    cooldown_blocked += 1
+                    continue
+
+                chosen_list.append(s)
+
+            if not chosen_list:
+                reasons = []
+                if cooldown_blocked:
+                    reasons.append(f"cooldown_blocked={cooldown_blocked}")
+                if flip_blocked:
+                    reasons.append(f"flip_guard_blocked={flip_blocked}")
+                reasons.append("all_candidates_blocked")
+
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": reasons,
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Send ONE email containing MULTIPLE setups (timeout-protected)
+            try:
+                ok = await asyncio.wait_for(
+                    asyncio.to_thread(send_email_alert_multi, user, sess, chosen_list, best_fut),
+                    timeout=EMAIL_SEND_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                ok = False
+                try:
+                    _LAST_SMTP_ERROR[uid] = f"timeout_after_{int(EMAIL_SEND_TIMEOUT_SEC)}s"
+                except Exception:
+                    pass
+            except Exception as e:
+                ok = False
+                logger.exception("send_email_alert_multi failed for uid=%s: %s", uid, e)
+                try:
+                    _LAST_SMTP_ERROR[uid] = f"{type(e).__name__}: {e}"
+                except Exception:
+                    pass
+
+            if ok:
+                try:
+                    email_state_set(uid, last_email_ts=time.time(), sent_count=int(st.get("sent_count", 0) or 0) + 1)
+                except Exception:
+                    pass
+
+                try:
+                    _email_daily_inc(uid, day_local)
+                except Exception:
+                    pass
+
+                for s in chosen_list:
+                    try:
+                        mark_symbol_emailed(uid, s.symbol, s.side, sess["name"])
+                    except Exception:
+                        pass
+
+                # 🤖 AutoTrade (owner only) — uses the *same* emailed setup(s)
+                autotrade_note = None
+                try:
+                    ok_at, msg_at = _autotrade_place_trade(uid, display_sess, chosen_list)
+                    autotrade_note = ("OK: " + msg_at) if ok_at else ("SKIP: " + msg_at)
+                except Exception as _e:
+                    autotrade_note = f"ERROR: {type(_e).__name__}: {_e}"
+
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SENT",
+                    "picked": ", ".join([f"{s.side} {s.symbol} conf={s.conf}" for s in chosen_list]),
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "autotrade": autotrade_note,
+                    "reasons": ["passed_filters_multi"],
+                }
+            else:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "ERROR",
+                    "reasons": ["send_email_failed_or_timeout", _LAST_SMTP_ERROR.get(uid, "unknown_error")],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+
+async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    scan = _LAST_EMAIL_DECISION.get(uid) or {}
+    bigm = _LAST_BIGMOVE_DECISION.get(uid) or {}
+
+    # If nothing recorded
+    if not scan and not bigm:
+        await update.message.reply_text("No email decision recorded yet.")
+        return
+
+    lines = []
+    lines.append("📧 Email Decisions")
+    # Heartbeat
+    try:
+        last_tick = float(_EMAIL_LOOP_HEARTBEAT.get("last_tick_ts", 0.0) or 0.0)
+        next_tick = float(_EMAIL_LOOP_HEARTBEAT.get("next_tick_ts", 0.0) or 0.0)
+        alive = bool(_EMAIL_LOOP_HEARTBEAT.get("alive", False))
+        last_err = str(_EMAIL_LOOP_HEARTBEAT.get("last_error", "") or "")
+        lines.append("")
+        lines.append("🫀 Email Loop")
+        lines.append(f"Alive: {'YES' if alive else 'NO'}")
+        if last_tick > 0:
+            lines.append("Last tick: " + _fmt_when(last_tick))
+        if next_tick > 0:
+            lines.append("Next tick: " + _fmt_when(next_tick))
+        if last_err:
+            lines.append("Last error: " + last_err)
+    except Exception:
+        pass
+
+    if bigm:
+        lines.append("")
+        lines.append("⚡ Big-Move Alert Decision")
+        lines.append(f"Status: {bigm.get('status')}")
+        lines.append(f"When: {bigm.get('when') or _fmt_when(bigm.get('ts'))}")
+        rs = bigm.get("reasons") or []
+        if rs:
+            lines.append("Reasons:\n- " + "\n- ".join(rs))
+
+    if scan:
+        lines.append("")
+        lines.append("🧠 Market Scan Decision")
+        lines.append(f"Status: {scan.get('status')}")
+        lines.append(f"When: {scan.get('when') or _fmt_when(scan.get('ts'))}")
+        rs = scan.get("reasons") or scan.get("reason")
+        if isinstance(rs, list):
+            lines.append("Reasons:\n- " + "\n- ".join(rs))
+        elif rs:
+            lines.append(f"Reason: {rs}")
+
+    await update.message.reply_text("\n".join(lines).strip())
+
+
+# =========================================================
+# /why (debug why no setups)
+# =========================================================
+async def why_no_setups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    txt = _reject_report_for_uid(uid)
+    await update.message.reply_text(txt)
+
+
+
+# =========================================================
+# /health (transparent system health)
+# =========================================================
+async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Transparent health check:
+    - DB reachable
+    - Exchange tickers reachable
+    - Email configured/enabled status
+    - Cache stats
+    - Blackout status
+    """
+    # DB check
+    db_ok = True
+    db_err = ""
+    try:
+        con = db_connect()
+        con.execute("SELECT 1")
+        con.close()
+    except Exception as e:
+        db_ok = False
+        db_err = str(e)
+
+    # Exchange check (quick)
+    ex_ok = True
+    ex_err = ""
+    tickers_n = 0
+    t0 = time.time()
+    try:
+        best = await to_thread_heavy(fetch_futures_tickers)
+        tickers_n = len(best or {})
+    except Exception as e:
+        ex_ok = False
+        ex_err = str(e)
+    dt_ms = int((time.time() - t0) * 1000)
+
+    # Cache stats
+    cache_items = len(_CACHE)
+
+    # Email status
+    email_cfg = email_config_ok()
+    email_on = EMAIL_ENABLED
+
+    # Sessions
+    uid = update.effective_user.id
+    user = get_user(uid)
+    enabled = user_enabled_sessions(user)
+    sess = in_session_now(user)
+    # Display the *live market session* (NY/LON/ASIA), not "UNLIMITED" access mode
+    now_s = _guess_session_name_utc(datetime.now(timezone.utc)) if int(user.get("sessions_unlimited", 0) or 0) == 1 else (sess["name"] if sess else "NONE")
+
+    # Blackout
+
+    msg = [
+        "🩺 PulseFutures • Health",
+        HDR,
+        f"DB: {'OK' if db_ok else 'FAIL'}" + (f" | {db_err}" if (not db_ok and db_err) else ""),
+        f"Bybit/CCXT: {'OK' if ex_ok else 'FAIL'} | tickers={tickers_n} | {dt_ms}ms" + (f" | {ex_err}" if (not ex_ok and ex_err) else ""),
+        f"Email: enabled={email_on} | configured={email_cfg}",
+        f"Cache: items={cache_items} | tickersTTL={TICKERS_TTL_SEC}s | ohlcvTTL={OHLCV_TTL_SEC}s",
+        HDR,
+        f"Your TZ: {user['tz']}",
+        f"Sessions enabled: {', '.join(enabled)} | Now: {now_s}",
+        f"Limits: emailcap/session={int(user['max_emails_per_session'])} (0=∞), emaildaycap={int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0=∞), gap={int(user['email_gap_min'])}m",
+    ]
+    await update.message.reply_text("\n".join(msg))
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    # Always log
+    logger.exception("Telegram error", exc_info=context.error)
+
+    # Also tell the user (otherwise it looks like "nothing happened")
+    try:
+        if update and getattr(update, "effective_message", None):
+            msg = "⚠️ Something crashed while handling your request."
+            # If admin, show the exception text as well
+            uid = getattr(getattr(update, "effective_user", None), "id", None)
+            if uid is not None and is_admin_user(int(uid)):
+                msg += f"\n\nError: {type(context.error).__name__}: {context.error}"
+            await update.effective_message.reply_text(msg)
+    except Exception:
+        # never let error handler crash
+        pass
+
+# =========================================================
+# MAIN (Background Worker = POLLING)
+# =========================================================
+
+async def _post_init(app: Application):
+    # If webhook was set previously, remove it so polling starts cleanly
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning("delete_webhook failed (ignored): %s", e)
+
+    # Bot menu + command list (Telegram "Menu" button)
+    try:
+        cmds = [
+            BotCommand("start", "Start"),
+            BotCommand("status", "Shows your plan & enabled features"),
+            BotCommand("screen", "Scans the market for high-quality setups"),
+
+            BotCommand("equity", "Set your equity"),
+            BotCommand("riskmode", "Set your per-trade risk (used by /size)"),
+            BotCommand("dailycap", "Set your total daily risk cap"),
+            BotCommand("size", "Position size calculator"),
+
+            BotCommand("trade_open", "Log an opened position"),
+            BotCommand("trade_sl", "Update Stop Loss"),
+            BotCommand("trade_rf", "Risk-Free a position"),
+            BotCommand("trade_close", "Log a closed position"),
+
+            BotCommand("sessions", "View your session settings"),
+            BotCommand("sessions_on", "Enable a session"),
+            BotCommand("sessions_off", "Disable a session"),
+            BotCommand("sessions_on_unlimited", "24-hour mode ON"),
+            BotCommand("sessions_off_unlimited", "24-hour mode OFF"),
+            BotCommand("trade_window", "Set allowed trading time window"),
+
+            BotCommand("email", "Set email / email on|off"),
+            BotCommand("email_test", "Send a test email"),
+            BotCommand("limits", "Set email caps/gaps"),
+            BotCommand("bigmove_alert", "Big move alerts"),
+
+            BotCommand("tz", "Show/set your timezone"),
+
+            BotCommand("report_daily", "Daily performance report"),
+            BotCommand("report_weekly", "Weekly performance report"),
+            BotCommand("report_overall", "All-time performance report"),
+
+            BotCommand("help", "Quick overview"),
+            BotCommand("commands", "Full command guide"),
+            BotCommand("guide_full", "Download full user guide (PDF)"),
+
+            BotCommand("support", "Submit support request"),
+            BotCommand("support_status", "Check your latest support ticket"),
+
+            BotCommand("health", "Bot & data health check"),
+
+            BotCommand("billing", "Subscription & payment info"),
+        ]
+        await app.bot.set_my_commands(cmds)
+        # Ensure menu button is enabled for private chats
+        try:
+            await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("set_my_commands failed (ignored): %s", e)
+
+
+
+# =========================================================
+# USDT (SEMI-AUTO) + ADMIN PAYMENTS/ACCESS MANAGEMENT
+# =========================================================
+import re
+import time
+
+TXID_REGEX = re.compile(r"^[A-Fa-f0-9]{64}$")
+
+USDT_NETWORK = os.getenv("USDT_NETWORK", "TRC20").strip().upper()
+USDT_RECEIVE_ADDRESS = os.getenv("USDT_RECEIVE_ADDRESS", "").strip()
+
+USDT_STANDARD_PRICE = float(os.getenv("USDT_STANDARD_PRICE", "45"))
+USDT_PRO_PRICE = float(os.getenv("USDT_PRO_PRICE", "99"))
+
+def _now() -> float:
+    return float(time.time())
+
+def _is_admin(update: Update) -> bool:
+    try:
+        return is_admin_user(update.effective_user.id)
+    except Exception:
+        return False
+
+def _db():
+    con = sqlite3.connect(
+        DB_PATH,
+        timeout=5,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    return con
+
+
+def _user_ident_str(uid: int) -> str:
+    return f"uid={uid}"
+
+def _ledger_add(user_id: int, source: str, ref: str, plan: str, amount: float, currency: str, status: str):
+    with _db() as con:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO payments_ledger (user_id, source, ref, plan, amount, currency, status, created_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (int(user_id), source, str(ref), str(plan), float(amount), str(currency), str(status), _now()))
+        con.commit()
+
+def _set_user_access(user_id: int, plan: str, source: str, ref: str):
+    update_user(
+        int(user_id),
+        plan=str(plan),
+        access_source=str(source),
+        access_ref=str(ref),
+        access_updated_ts=_now(),
+    )
+
+
+
+
+def _usdt_payment_row_by_txid(txid: str):
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("SELECT * FROM usdt_payments WHERE txid = ?", (txid,))
+        r = cur.fetchone()
+        return dict(r) if r else None
+
+def _usdt_insert_pending(user_id: int, username: str, txid: str, plan: str):
+    with _db() as con:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO usdt_payments (telegram_id, username, txid, plan, status, created_ts)
+            VALUES (?, ?, ?, ?, 'PENDING', ?)
+        """, (int(user_id), (username or ""), txid, plan, _now()))
+        con.commit()
+
+def _usdt_set_status(txid: str, status: str, decided_by: int, note: str = ""):
+    with _db() as con:
+        cur = con.cursor()
+        cur.execute("""
+            UPDATE usdt_payments
+            SET status = ?, decided_ts = ?, decided_by = ?, note = ?
+            WHERE txid = ?
+        """, (status, _now(), int(decided_by), (note or ""), txid))
+        con.commit()
+
+# ---------------- USER COMMANDS ----------------
+
+async def usdt_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    addr = USDT_RECEIVE_ADDRESS or "(not set)"
+    await update.message.reply_text(
+        "USDT Payment (Semi-Auto)\n\n"
+        f"Network: USDT ({USDT_NETWORK})\n"
+        f"Address: {addr}\n\n"
+        f"Standard: {USDT_STANDARD_PRICE:.0f} USDT\n"
+        f"Pro: {USDT_PRO_PRICE:.0f} USDT\n\n"
+        "After payment submit:\n"
+        "/usdt_paid <TXID> <standard|pro>\n\n"
+        "Example:\n"
+        "/usdt_paid 7f3a...c9 standard\n\n"
+        "Note: USDT payments are final. Access after admin approval."
+    )
+
+async def usdt_paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Usage:\n/usdt_paid <TXID> <standard|pro>")
+        return
+
+    txid = context.args[0].strip()
+    plan = context.args[1].strip().lower()
+
+    if plan not in ("standard", "pro"):
+        await update.message.reply_text("❌ Plan must be: standard or pro\nExample: /usdt_paid <TXID> standard")
+        return
+
+    if not TXID_REGEX.match(txid):
+        await update.message.reply_text("❌ TXID looks invalid.\nIt must be a 64-char hex hash.")
+        return
+
+    # prevent duplicates
+    existing = _usdt_payment_row_by_txid(txid)
+    if existing:
+        await update.message.reply_text(f"⚠️ This TXID is already in the system (status: {existing['status']}).")
+        return
+
+    uid = int(update.effective_user.id)
+    uname = update.effective_user.username or ""
+    try:
+        _usdt_insert_pending(uid, uname, txid, plan)
+    except sqlite3.IntegrityError:
+        await update.message.reply_text("⚠️ This TXID is already used.")
+        return
+    except Exception as e:
+        logger.exception("usdt_paid_cmd failed")
+        await update.message.reply_text(f"❌ Failed to save. {type(e).__name__}: {e}")
+        return
+
+    await update.message.reply_text(
+        "✅ USDT payment submitted.\n"
+        "Status: PENDING admin approval.\n\n"
+        "If you made a mistake, contact /support."
+    )
+
+    # Notify admins (send to each admin user id)
+    try:
+        for admin_id in (ADMIN_USER_IDS or set()):
+            await context.bot.send_message(
+                chat_id=int(admin_id),
+                text=(
+                    "🧾 New USDT Payment Request\n\n"
+                    f"User: @{uname or '(no username)'} ({uid})\n"
+                    f"Plan: {plan.upper()}\n"
+                    f"TXID: {txid}\n\n"
+                    f"Approve: /usdt_approve {txid}\n"
+                    f"Reject:  /usdt_reject {txid} <reason>"
+                )
+            )
+    except Exception:
+        # don't block user success if admin notify fails
+        logger.exception("Failed to notify admins about USDT request")
+
+# ---------------- ADMIN COMMANDS ----------------
+
+async def usdt_pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("""
+            SELECT txid, telegram_id, username, plan, created_ts
+            FROM usdt_payments
+            WHERE status='PENDING'
+            ORDER BY created_ts DESC
+            LIMIT 20
+        """)
+        rows = cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text("✅ No pending USDT requests.")
+        return
+
+    lines = ["Pending USDT requests (latest 20):\n"]
+    for r in rows:
+        lines.append(f"- {r['plan'].upper()} | @{r['username'] or 'n/a'} ({r['telegram_id']}) | {r['txid']}")
+    lines.append("\nApprove with: /usdt_approve <TXID>")
+    await update.message.reply_text("\n".join(lines))
+
+async def usdt_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /usdt_approve <TXID>")
+        return
+
+    txid = context.args[0].strip()
+    if not TXID_REGEX.match(txid):
+        await update.message.reply_text("❌ Invalid TXID format (must be 64-char hex).")
+        return
+
+    row = _usdt_payment_row_by_txid(txid)
+    if not row:
+        await update.message.reply_text("❌ TXID not found in DB. Ask user to re-submit with /usdt_paid.")
+        return
+
+    if row["status"] == "APPROVED":
+        await update.message.reply_text("⚠️ Already approved.")
+        return
+    if row["status"] == "REJECTED":
+        await update.message.reply_text("⚠️ This TXID was rejected earlier.")
+        return
+
+    plan = row["plan"].lower()
+    uid = int(row["telegram_id"])
+
+    # Grant access + ledger
+    amount = USDT_STANDARD_PRICE if plan == "standard" else USDT_PRO_PRICE
+    _set_user_access(uid, plan, "usdt", txid)
+    _ledger_add(uid, "usdt", txid, plan, amount, "USDT", "paid")
+    _usdt_set_status(txid, "APPROVED", update.effective_user.id, note="approved")
+
+    await update.message.reply_text(f"✅ Approved. Access granted: {plan.upper()} to user {uid}.")
+    try:
+        await context.bot.send_message(chat_id=uid, text=f"✅ Payment approved. Your plan is now: {plan.upper()}")
+    except Exception:
+        pass
+
+async def usdt_reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /usdt_reject <TXID> <reason(optional)>")
+        return
+
+    txid = context.args[0].strip()
+    reason = " ".join(context.args[1:]).strip() if len(context.args) > 1 else "rejected"
+    if not TXID_REGEX.match(txid):
+        await update.message.reply_text("❌ Invalid TXID format.")
+        return
+
+    row = _usdt_payment_row_by_txid(txid)
+    if not row:
+        await update.message.reply_text("❌ TXID not found.")
+        return
+
+    if row["status"] != "PENDING":
+        await update.message.reply_text(f"⚠️ Cannot reject (current status: {row['status']}).")
+        return
+
+    _usdt_set_status(txid, "REJECTED", update.effective_user.id, note=reason)
+    await update.message.reply_text("✅ Rejected.")
+    try:
+        await context.bot.send_message(chat_id=int(row["telegram_id"]), text=f"❌ USDT payment rejected: {reason}")
+    except Exception:
+        pass
+
+# ---------------- ADMIN: USERS / ACCESS / PAYMENTS ----------------
+
+async def admin_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /admin_user <telegram_id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("❌ telegram_id must be a number.")
+        return
+
+    # Ensure schema exists so this command never crashes on older DBs
+    try:
+        ensure_email_column()   # includes billing columns
+    except Exception:
+        try:
+            ensure_billing_columns()
+        except Exception:
+            pass
+
+    user = get_user(uid) or {}
+
+    stored_plan = str(user.get("plan") or "free").strip().lower()
+    eff_plan = str(effective_plan(uid, user)).strip().lower()
+
+    upd = 0.0
+    try:
+        upd = float(user.get("access_updated_ts") or 0.0)
+    except Exception:
+        upd = 0.0
+    upd_txt = datetime.utcfromtimestamp(upd).isoformat() + "Z" if upd else "n/a"
+
+    # Email field (handle old schemas)
+    email_val = ""
+    try:
+        email_val = (user.get("email_to") or user.get("email") or "").strip()
+    except Exception:
+        email_val = ""
+
+    # Latest payment (any) + latest PAID approval
+    last_any = None
+    last_paid = None
+    try:
+        with _db() as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            cur.execute(
+                "SELECT source, ref, plan, amount, currency, status, created_ts "
+                "FROM payments_ledger WHERE user_id=? ORDER BY created_ts DESC LIMIT 1",
+                (uid,)
+            )
+            last_any = cur.fetchone()
+            cur.execute(
+                "SELECT source, ref, plan, amount, currency, status, created_ts "
+                "FROM payments_ledger WHERE user_id=? AND status='paid' ORDER BY created_ts DESC LIMIT 1",
+                (uid,)
+            )
+            last_paid = cur.fetchone()
+    except Exception:
+        last_any = None
+        last_paid = None
+
+    def _fmt_pay(row):
+        if not row:
+            return "(none)"
+        ts = 0.0
+        try:
+            ts = float(row["created_ts"] or 0.0)
+        except Exception:
+            ts = 0.0
+        ts_txt = datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts else "n/a"
+        amt = row["amount"]
+        curcy = row["currency"] or ""
+        return f"{row['source']} | {row['plan']} | {amt} {curcy} | {row['status']} | {row['ref']} | {ts_txt}"
+
+    lines = [
+        f"User ID: {uid}",
+        f"Plan: {stored_plan.upper()} (effective: {eff_plan.upper()})",
+        f"Access Updated (UTC): {upd_txt}",
+        f"Email: {email_val or '-'}",
+        f"Last Payment (latest): {_fmt_pay(last_any)}",
+        f"Last Payment Approval (paid): {_fmt_pay(last_paid)}",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
+def _table_columns(conn, table_name: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(r[1]) for r in rows}
+
+def _first_existing_col(cols: set[str], candidates: list[str]):
+    for c in candidates:
+        if c in cols:
+            return c
+    return None
+
+async def admin_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    now_ts = time.time()
+
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("SELECT * FROM users")
+        rows = cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text("No users found.")
+        return
+
+    lines = ["📊 USERS OVERVIEW\n"]
+
+    for r in rows:
+        d = dict(r)
+        uid = int(d.get("user_id") or 0)
+        tz = str(d.get("tz") or "UTC")
+
+        # Use effective plan logic
+        plan = str(effective_plan(uid, d)).upper()
+
+        # Remaining days
+        days_left = "-"
+        until = 0
+
+        if plan == "TRIAL":
+            until = float(d.get("trial_until") or 0)
+        elif plan in ("STANDARD", "PRO"):
+            until = float(d.get("plan_expires") or 0)
+
+        if until and until > now_ts:
+            days_left = f"{int((until - now_ts + 86399)//86400)}d"
+        elif plan in ("TRIAL", "STANDARD", "PRO"):
+            days_left = "0d"
+
+        # Payment status
+        with _db() as con:
+            cur = con.cursor()
+            cur.execute("""
+                SELECT status
+                FROM payments_ledger
+                WHERE user_id = ?
+                ORDER BY created_ts DESC
+                LIMIT 1
+            """, (uid,))
+            p = cur.fetchone()
+
+        pay_status = p[0] if p else "None"
+
+        lines.append(f"{uid} | {plan} | {tz} | {days_left} | {pay_status}")
+
+    await update.message.reply_text("\n".join(lines))
+
+async def admin_grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Usage: /admin_grant <telegram_id> <standard|pro>")
+        return
+
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("❌ telegram_id must be a number.")
+        return
+
+    plan = str(context.args[1]).strip().lower()
+    if plan not in ("standard", "pro"):
+        await update.message.reply_text("❌ Plan must be: standard or pro")
+        return
+
+    # Grant access (sync plan + access metadata)
+    _set_user_access(uid, plan, "manual_admin", "admin_grant")
+
+    # IMPORTANT: prevent trial logic from overwriting the plan
+    # (Some parts of your code treat trial_until>0 as "still trial")
+    try:
+        update_user(uid, trial_until=0.0, trial_start_ts=0.0)
+    except Exception:
+        pass
+
+    user = get_user(uid) or {}
+
+    # Latest payment (1 row)
+    pay_line = "- (none)"
+    try:
+        with _db() as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            cur.execute("""
+                SELECT source, ref, plan, amount, currency, status, created_ts
+                FROM payments_ledger
+                WHERE user_id = ?
+                ORDER BY created_ts DESC
+                LIMIT 1
+            """, (uid,))
+            p = cur.fetchone()
+        if p:
+            pay_line = f"- {p['source']} | {p['plan']} | {p['amount']} {p['currency']} | {p['status']} | {p['ref']}"
+    except Exception:
+        pass
+
+    # Reply (as you requested)
+    lines = [
+        "✅ Access updated",
+        f"User: {uid}",
+        f"Plan: {str(user.get('plan') or plan).strip()}",
+        f"Access source/ref: {user.get('access_source','')} / {user.get('access_ref','')}",
+        f"Email: {user.get('email_to','') or ''}",
+        "",
+        "Last payments:",
+        pay_line
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
+
+async def payment_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only: approve a payment (Stripe or USDT) and grant access.
+    Usage: /payment_approve <user_id> <payment_id> <standard|pro>
+    """
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args or len(context.args) < 3:
+        await update.message.reply_text("Usage: /payment_approve <user_id> <payment_id> <standard|pro>")
+        return
+
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("❌ user_id must be a number.")
+        return
+
+    payment_id = str(context.args[1]).strip()
+    plan = str(context.args[2]).strip().lower()
+
+    if not payment_id:
+        await update.message.reply_text("❌ payment_id cannot be empty.")
+        return
+
+    if plan not in ("standard", "pro"):
+        await update.message.reply_text("❌ Plan must be: standard or pro")
+        return
+
+    # 1) Write payments ledger (single source of truth for approvals)
+    try:
+        _ledger_add(uid, "payment_approve", payment_id, plan, 0.0, "", "paid")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to write payment ledger: {e}")
+        return
+
+    # 2) Grant access (sync plan + access metadata)
+    _set_user_access(uid, plan, "payment_approve", payment_id)
+
+    # 3) Prevent trial logic from overwriting the plan
+    try:
+        update_user(uid, trial_until=0.0, trial_start_ts=0.0)
+    except Exception:
+        pass
+
+    user = get_user(uid) or {"plan": plan}
+
+    await update.message.reply_text(
+        "✅ Payment approved + access granted\n"
+        f"User: {uid}\n"
+        f"Plan: {str(user.get('plan') or plan).strip()}\n"
+        f"Payment ID: {payment_id}\n"
+        "Tip: /admin_user <user_id> to confirm."
+    )
+
+
+async def admin_revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /admin_revoke <telegram_id>")
+        return
+    uid = int(context.args[0])
+    _set_user_access(uid, "free", "manual", "revoked")
+    # HARDEN: prevent revoked users from restarting a new trial later (even if admin_grant reset trial_start_ts)
+    try:
+        u = get_user(uid) or {}
+        ts_start = float(u.get("trial_start_ts") or 0.0)
+        if ts_start <= 0:
+            update_user(uid, trial_start_ts=_now_ts(), trial_until=0.0)
+        else:
+            update_user(uid, trial_until=0.0)
+    except Exception:
+        pass
+
+    await update.message.reply_text(f"✅ Access revoked. User {uid} set to FREE.")
+
+
+async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/admin_reset_report — archive current signals + outcomes then reset live tables.
+
+    This is used after engine changes so new performance stats aren't mixed with old logic.
+    Archives into:
+      - signals_archive
+      - outcomes_archive (mirrors `signal_outcomes` if present; otherwise `outcomes` if present)
+    """
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        return
+
+    try:
+        now_ts = time.time()
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+
+            # Detect which outcomes table exists in this build
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('signal_outcomes','outcomes')")
+            row = c.fetchone()
+            outcomes_src = row[0] if row else None
+
+            # --- Signals archive ---
+            c.execute("""CREATE TABLE IF NOT EXISTS signals_archive AS
+                         SELECT *, 0.0 AS archived_at FROM signals WHERE 0""")
+            try:
+                c.execute("ALTER TABLE signals_archive ADD COLUMN archived_at REAL")
+            except Exception:
+                pass
+
+            # Archive + clear signals
+            c.execute("INSERT INTO signals_archive SELECT *, ? FROM signals", (now_ts,))
+            c.execute("DELETE FROM signals")
+
+            # --- Outcomes archive (optional) ---
+            if outcomes_src:
+                # Create archive table based on the existing outcomes table schema
+                c.execute(f"""CREATE TABLE IF NOT EXISTS outcomes_archive AS
+                             SELECT *, 0.0 AS archived_at FROM {outcomes_src} WHERE 0""")
+                try:
+                    c.execute("ALTER TABLE outcomes_archive ADD COLUMN archived_at REAL")
+                except Exception:
+                    pass
+
+                # Archive + clear outcomes
+                c.execute(f"INSERT INTO outcomes_archive SELECT *, ? FROM {outcomes_src}", (now_ts,))
+                c.execute(f"DELETE FROM {outcomes_src}")
+
+            conn.commit()
+
+        msg = "✅ Signals archived and report reset."
+        if outcomes_src:
+            msg += f"\nArchived outcomes from `{outcomes_src}`."
+        else:
+            msg += "\n(No outcomes table found to archive in this DB.)"
+        await update.message.reply_text(msg)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ admin_reset_report failed: {e}")
+
+
+async def admin_payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    limit_n = 50
+    if context.args and context.args[0].isdigit():
+        limit_n = max(1, min(200, int(context.args[0])))
+
+    # Ensure schema exists
+    try:
+        ensure_email_column()
+    except Exception:
+        try:
+            ensure_billing_columns()
+        except Exception:
+            pass
+
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("SELECT * FROM users ORDER BY user_id ASC")
+        users = cur.fetchall() or []
+
+        # Preload last PAID payment per user (approval)
+        last_paid_map = {}
+        cur.execute("""
+            SELECT p.user_id, p.created_ts, p.ref
+            FROM payments_ledger p
+            JOIN (
+                SELECT user_id, MAX(created_ts) AS mx
+                FROM payments_ledger
+                WHERE status='paid'
+                GROUP BY user_id
+            ) t ON t.user_id = p.user_id AND t.mx = p.created_ts
+        """)
+        for r in cur.fetchall() or []:
+            last_paid_map[int(r["user_id"])] = (float(r["created_ts"] or 0.0), str(r["ref"] or ""))
+
+    if not users:
+        await update.message.reply_text("No users found.")
+        return
+
+    lines = []
+    lines.append(f"💳 Admin Payments (showing up to {limit_n} users)")
+    lines.append("User ID | Last Payment Approval (UTC) | Payment ID | Plan (stored/effective)")
+    lines.append("────────────────────────────────────────────────────────────────────────")
+
+    count = 0
+    for ur in users:
+        if count >= limit_n:
+            break
+        d = dict(ur)
+        uid = int(d.get("user_id") or 0)
+        stored_plan = str(d.get("plan") or "free").strip().lower()
+        eff_plan = str(effective_plan(uid, d)).strip().lower()
+
+        ts, pay_id = last_paid_map.get(uid, (0.0, ""))
+        ts_txt = datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts else "n/a"
+        pay_id = pay_id.strip() or "-"
+
+        lines.append(f"{uid} | {ts_txt} | {pay_id} | {stored_plan}/{eff_plan}")
+        count += 1
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def manage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Stripe customer portal link (if you have it).
+    If you are using Payment Links only and not portal, keep as-is or disable this command.
+    """
+    user = get_user(update.effective_user.id)
+    if user.get("plan") not in ("standard", "pro"):
+        await update.message.reply_text("No active subscription.")
+        return
+
+    # If you still use Stripe Customer Portal:
+    if user.get("email_to"):
+        await update.message.reply_text(create_customer_portal(user["email_to"]))
+        return
+
+    await update.message.reply_text("❌ No email on file for subscription management.")
+
+
+async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Upgrade opens the billing menu
+    return await billing_cmd(update, context)
+
+
+
+async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
+    """Background AutoTrade loop. Scans and opens trades for the owner when enabled.
+    Runs independently from email sending (no dependency on 'email setup sent')."""
+    try:
+        if not _autotrade_ready():
+            return
+
+        uid = int(AUTOTRADE_OWNER_UID)
+        # If user record doesn't exist yet, do nothing (avoids writing defaults to DB)
+        user = get_user(uid) or {}
+        if not user:
+            return
+
+        # Session label in UTC (NY/LON/ASIA)
+        now_utc = datetime.now(timezone.utc)
+        sess = _guess_session_name_utc(now_utc)
+
+        if not _autotrade_allowed_session(sess):
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "SKIP",
+                "when": now_utc.isoformat(timespec="seconds"),
+                "reason": f"session_not_allowed ({sess})",
+            }
+            return
+
+        # Optional: respect user's trade window (if configured)
+        try:
+            if not trade_window_allows_now(user):
+                _LAST_AUTOTRADE_DECISION[uid] = {
+                    "status": "SKIP",
+                    "when": now_utc.isoformat(timespec="seconds"),
+                    "reason": "trade_window_block",
+                }
+                return
+        except Exception:
+            pass
+
+        # Fetch market universe
+        best_fut = await asyncio.to_thread(fetch_futures_tickers)
+        if not best_fut:
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "ERROR",
+                "when": now_utc.isoformat(timespec="seconds"),
+                "reason": "fetch_futures_failed",
+            }
+            return
+
+        # Build setups with the same engine used by /screen (fast + high quality)
+        try:
+            pool = await asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess, mode="screen", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid))
+        except Exception as e:
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "ERROR",
+                "when": now_utc.isoformat(timespec="seconds"),
+                "reason": f"build_pool_failed: {type(e).__name__}: {e}",
+            }
+            return
+
+        setups = (pool.get("setups", []) or [])
+        ok, reason = _autotrade_place_trade(uid, sess, setups)
+
+        _LAST_AUTOTRADE_DECISION[uid] = {
+            "status": "OPENED" if ok else "SKIP",
+            "when": now_utc.isoformat(timespec="seconds"),
+            "reason": reason,
+            "session": sess,
+            "mode": AUTOTRADE_MODE,
+        }
+
+    except Exception as e:
+        try:
+            uid = int(AUTOTRADE_OWNER_UID or 0)
+        except Exception:
+            uid = 0
+        if uid:
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "ERROR",
+                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "reason": f"{type(e).__name__}: {e}",
+            }
+        logger.exception("autotrade_job crashed: %s", e)
+
+
+async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+    """Background email engine (trade setups + big-move alerts).
+
+    IMPORTANT:
+    - Do NOT take ALERT_LOCK here.
+    - _alert_job_async_internal() already owns ALERT_LOCK to prevent overlap.
+
+    The previous version double-locked (wrapper + internal), which caused the
+    internal job to exit immediately every time, so no emails were ever sent
+    (while /email_test still worked).
+    """
+
+    # Heartbeat (so /email_decision can prove the loop is alive)
+    try:
+        _EMAIL_LOOP_HEARTBEAT["alive"] = True
+        now_ts = time.time()
+        _EMAIL_LOOP_HEARTBEAT["last_tick_ts"] = now_ts
+        job = getattr(context, "job", None)
+        interval = float(getattr(job, "interval", 0) or 0)
+        if interval > 0:
+            _EMAIL_LOOP_HEARTBEAT["next_tick_ts"] = now_ts + interval
+    except Exception:
+        pass
+
+    try:
+        await _alert_job_async_internal(context)
+        try:
+            _EMAIL_LOOP_HEARTBEAT["last_error"] = ""
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            _EMAIL_LOOP_HEARTBEAT["last_error"] = f"{type(e).__name__}: {e}"
+        except Exception:
+            pass
+        logger.exception("Alert job failure: %s", e)
+
+
+
+async def autotrade_sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args:
+        current = ",".join(_autotrade_get_sessions())
+        await update.message.reply_text(f"🤖 Current AutoTrade Sessions: {current}")
+        return
+
+    raw = context.args[0].upper()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+
+    valid = {"NY", "LON", "ASIA"}
+    if any(p not in valid for p in parts):
+        await update.message.reply_text("❌ Invalid session. Use NY,LON,ASIA")
+        return
+
+    _autotrade_set_sessions(",".join(parts))
+    await update.message.reply_text(f"✅ AutoTrade sessions updated: {','.join(parts)}")
+
+
+def main():
+    # Render note: if deployed as a Web Service, bind to $PORT so Render keeps the service alive.
+    if os.environ.get("RENDER_SERVICE_TYPE") == "web":
+        start_keepalive_http_server()
+        logger.warning("Running in Render Web Service mode: keepalive HTTP server enabled; polling will still run.")
+
+    # Single instance guard (Render overlap protection)
+    render_primary_only()
+
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN missing")
+
+    db_init()
+    ensure_email_column()
+    
+    app = Application.builder().token(TOKEN).post_init(_post_init).concurrent_updates(32).build()
+
+    # Global access + Pro gating (runs before any other command handler)
+    app.add_handler(MessageHandler(filters.COMMAND, _command_guard), group=-1)
+    app.add_error_handler(error_handler)
+
+    # ================= Handlers =================
+    app.add_handler(CommandHandler("help", cmd_help, block=False))
+    app.add_handler(CommandHandler("commands", commands_cmd, block=False))
+    app.add_handler(CommandHandler("guide_full", guide_full_cmd, block=False))
+    app.add_handler(CommandHandler("start", cmd_start, block=False))
+    app.add_handler(CommandHandler("help_admin", cmd_help_admin, block=False))
+    app.add_handler(CommandHandler("manage", manage_cmd, block=False))
+    app.add_handler(CommandHandler("myplan", myplan_cmd, block=False))
+    app.add_handler(CommandHandler("support", support_cmd, block=False))
+    app.add_handler(CommandHandler("support_status", support_status_cmd, block=False))
+    app.add_handler(CommandHandler("support_open", admin_support_open_cmd, block=False))
+    app.add_handler(CommandHandler("support_close", admin_support_close_cmd, block=False))
+    app.add_handler(CommandHandler("tz", tz_cmd, block=False))
+    app.add_handler(CommandHandler("screen", screen_cmd))
+    app.add_handler(CommandHandler("equity", equity_cmd, block=False))
+    app.add_handler(CommandHandler("equity_reset", equity_reset_cmd, block=False))
+    app.add_handler(CommandHandler("riskmode", riskmode_cmd, block=False))
+    app.add_handler(CommandHandler("dailycap", dailycap_cmd, block=False))
+    app.add_handler(CommandHandler("limits", limits_cmd, block=False))
+
+    app.add_handler(CommandHandler("trade_sl", trade_sl_cmd, block=False))
+    app.add_handler(CommandHandler("trade_rf", trade_rf_cmd, block=False))
+    
+    app.add_handler(CommandHandler("sessions", sessions_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_on", sessions_on_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_off", sessions_off_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_on_unlimited", sessions_on_unlimited_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_unlimited_on", sessions_unlimited_on_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_off_unlimited", sessions_off_unlimited_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_unlimited_off", sessions_unlimited_off_cmd, block=False))
+
+    app.add_handler(CommandHandler("bigmove_alert", bigmove_alert_cmd, block=False))
+    app.add_handler(CommandHandler("notify_on", notify_on, block=False))
+    app.add_handler(CommandHandler("notify_off", notify_off, block=False))
+    # Fallback: pasted "invisible-prefix" /size from mobile email clients
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _size_paste_fallback_router), group=-2)
+    app.add_handler(CommandHandler("size", size_cmd, block=False))
+    app.add_handler(CommandHandler("trade_open", trade_open_cmd, block=False))
+    app.add_handler(CommandHandler("trade_close", trade_close_cmd, block=False))
+    app.add_handler(CommandHandler("trade_id_reset", trade_id_reset_cmd, block=False))
+    app.add_handler(CommandHandler("status", status_cmd, block=False))
+    app.add_handler(CommandHandler("cooldowns", cooldowns_cmd, block=False))
+    app.add_handler(CommandHandler("cooldown", cooldown_cmd, block=False))
+    app.add_handler(CommandHandler("cooldown_clear", cooldown_clear_cmd, block=False))
+    app.add_handler(CommandHandler("cooldown_clear_all", cooldown_clear_all_cmd, block=False))
+    app.add_handler(CommandHandler("report_daily", report_daily_cmd, block=False))
+    app.add_handler(CommandHandler("report_overall", report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("report_weekly", report_weekly_cmd, block=False))
+    app.add_handler(CommandHandler("signals_daily", signals_daily_cmd, block=False))
+    app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd, block=False))
+    app.add_handler(CommandHandler("signal_report", signal_report_cmd, block=False))
+    app.add_handler(CommandHandler("signal_report_overall", signal_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("signal_report_all", signal_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("health", health_cmd, block=False))
+    app.add_handler(CommandHandler("reset", reset_cmd, block=False))
+    app.add_handler(CommandHandler("restore", restore_cmd, block=False))
+    app.add_handler(CommandHandler("health_sys", health_sys_cmd, block=False))
+    app.add_handler(CommandHandler("billing", billing_cmd, block=False))
+    app.add_handler(CommandHandler("email_on_off", email_on_off_cmd, block=False))
+    app.add_handler(CommandHandler("upgrade", upgrade_cmd, block=False))
+    app.add_handler(CommandHandler("trade_window", trade_window_cmd, block=False))
+    app.add_handler(CommandHandler("email", email_cmd, block=False))
+    app.add_handler(CommandHandler("email_on", email_on_cmd, block=False))
+    app.add_handler(CommandHandler("email_off", email_off_cmd, block=False))
+    app.add_handler(CommandHandler("email_test", email_test_cmd, block=False))
+    app.add_handler(CommandHandler("email_decision", email_decision_cmd, block=False))
+
+    app.add_handler(CommandHandler("why", why_no_setups_cmd, block=False))
+    # ================= USDT (semi-auto) =================
+    app.add_handler(CommandHandler("usdt", usdt_info_cmd, block=False))
+    app.add_handler(CommandHandler("usdt_paid", usdt_paid_cmd, block=False))
+    
+    # ================= Admin: access & payments =================
+    
+    app.add_handler(CommandHandler("admin_user", admin_user_cmd, block=False))
+    app.add_handler(CommandHandler("admin_users", admin_users_cmd, block=False))
+    app.add_handler(CommandHandler("admin_grant", admin_grant_cmd, block=False))
+    app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd, block=False))
+    app.add_handler(CommandHandler("admin_reset_report", admin_reset_report_cmd, block=False))
+    app.add_handler(CommandHandler("admin_reset_signal_reports", admin_reset_signal_reports_cmd, block=False))
+    app.add_handler(CommandHandler("admin_payments", admin_payments_cmd, block=False))
+
+    # Admin: approve Stripe/USDT payments and grant access
+    app.add_handler(CommandHandler("payment_approve", payment_approve_cmd, block=False))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    
+    app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
+    # Catch-all for unknown /commands (MUST be after all CommandHandlers)
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+
+    if app.job_queue:
+        interval_sec = int(CHECK_INTERVAL_MIN * 60)
+    
+        app.job_queue.run_repeating(
+            alert_job,
+            interval=interval_sec,
+            first=90,
+            name="alert_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 60,
+            },
+        )
+
+        # AutoTrade loop (owner-only)
+        app.job_queue.run_repeating(
+            autotrade_job,
+            interval=60,
+            first=30,
+            name="autotrade_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 30,
+            },
+        )
+    else:
+        logger.error("JobQueue NOT available – install python-telegram-bot[job-queue]")
+
+
+
+    # ================= Stripe Webhook ================= #
+    threading.Thread(
+        target=start_stripe_webhook,
+        daemon=True
+    ).start()
+
+    # Optional: if any other poller exists, don't crash-restart; just sleep.
+    from telegram.error import Conflict
+    # Ensure AutoTrade tables exist at startup (prevents 'no such table: autotrade_trades')
+
+    try:
+
+        _autotrade_migrate_tables()
+
+    except Exception:
+
+        pass
+
+
+    try:
+        app.run_polling(
+            drop_pending_updates=True,
+            close_loop=False,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    except Conflict:
+        logger.error("Another instance is polling. Sleeping forever.")
+        while True:
+            time.sleep(3600)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+@bot.message_handler(commands=['autotrade_diag'])
+def autotrade_diag_cmd(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    uid = int(AUTOTRADE_OWNER_UID)
+    try:
+        con = db_connect()
+        cur = con.cursor()
+
+        cutoff_24h = time.time() - 24 * 3600.0
+        cur.execute("SELECT COUNT(*) FROM generated_setups WHERE user_id=? AND created_ts>=?", (uid, cutoff_24h))
+        gen_cnt = int((cur.fetchone() or [0])[0] or 0)
+
+        cur.execute("SELECT COUNT(*) FROM generated_setups WHERE user_id=? AND created_ts>=? AND source='email'", (uid, cutoff_24h))
+        gen_email_cnt = int((cur.fetchone() or [0])[0] or 0)
+
+        cur.execute("SELECT COUNT(*) FROM generated_setups WHERE user_id=? AND created_ts>=? AND source='screen'", (uid, cutoff_24h))
+        gen_screen_cnt = int((cur.fetchone() or [0])[0] or 0)
+
+        cur.execute("""
+            SELECT setup_id, source, session, symbol, side, conf, created_ts
+            FROM generated_setups
+            WHERE user_id=?
+            ORDER BY created_ts DESC
+            LIMIT 8
+        """, (uid,))
+        rows = cur.fetchall() or []
+
+        # selector output
+        try:
+            now_sess = str(get_session_label_now())
+        except Exception:
+            now_sess = ""
+        setups = _autotrade_select_db_setups(uid, session_label=now_sess, lookback_hours=24, limit=3)
+        pick = setups[0] if setups else None
+
+        con.close()
+
+        out = []
+        out.append("🧪 AutoTrade Diagnostics")
+        out.append("━━━━━━━━━━━━━━━━━━━━")
+        out.append(f"Owner UID: {uid}")
+        out.append(f"generated_setups (24h): {gen_cnt} | email={gen_email_cnt} | screen={gen_screen_cnt}")
+        out.append("")
+        out.append("Recent generated_setups (last 8):")
+        if rows:
+            for (sid, source, sess, sym, side, conf, ts) in rows:
+                out.append(f"• {sid} | {str(source).upper()} | {sess} | {str(side).upper()} {str(sym).upper()} | Conf {int(conf or 0)} | {datetime.fromtimestamp(float(ts)).strftime('%m-%d %H:%M')}")
+        else:
+            out.append("• (none)")
+
+        out.append("")
+        if pick:
+            out.append("Selector pick (top):")
+            out.append(f"• {getattr(pick,'setup_id','')} | {getattr(pick,'side','')} {getattr(pick,'symbol','')} | Conf {getattr(pick,'conf',0)}")
+            out.append(f"  entry={getattr(pick,'entry',None)} sl={getattr(pick,'sl',None)}")
+        else:
+            out.append("Selector pick: (none)")
+
+        bot.reply_to(message, "\n".join(out))
+    except Exception as e:
+        bot.reply_to(message, f"autotrade_diag failed: {type(e).__name__}: {e}")
