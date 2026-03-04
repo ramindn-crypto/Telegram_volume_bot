@@ -11119,8 +11119,7 @@ except Exception:
         lines.append("Last setup attempt:")
         lines.append(f"• {side} {sym} entry={entry} sl={sl} setup_id={det.get('setup_id','')}".strip())
 
-    await update.message.reply_text("\n".join([x for x in lines if x is not None and x != ""]))
-
+    return "\n".join([x for x in lines if x is not None and x != ""])
 
 async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _autotrade_migrate_tables()
