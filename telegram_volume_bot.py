@@ -1112,18 +1112,42 @@ def _bybit_v5_sign(ts_ms: str, body: str) -> str:
 
 def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> dict:
     import requests
-    method = method.upper().strip()
-    url = _bybit_base_url() + path
+    from urllib.parse import urlencode
+
+    method = (method or "GET").upper().strip()
+    payload = payload or {}
+
+    base = _bybit_base_url()
+    url = base + path
 
     ts_ms = str(int(time.time() * 1000))
+
     # For V5 signing:
-    # - GET requests must be signed with the query string (not the body).
+    # - GET requests must be signed with the *query string* (not the body),
+    #   and the query must actually be sent to Bybit.
     # - POST requests are signed with the JSON body.
-    body = json.dumps(payload or {}, separators=(",", ":"), ensure_ascii=False) if method != "GET" else ""
+    body = ""
     query_str = ""
-    if method == "GET" and "?" in path:
-        query_str = path.split("?", 1)[1]
-    sign_payload = query_str if method == "GET" else body
+
+    if method == "GET":
+        # Support callers that pass params in payload (recommended).
+        # If path already has '?', keep it and append any payload params.
+        if "?" in url:
+            url_base, url_q = url.split("?", 1)
+            url = url_base
+            query_str = url_q
+        if payload:
+            extra = urlencode(payload, doseq=True)
+            query_str = f"{query_str}&{extra}" if (query_str and extra) else (query_str or extra)
+
+        if query_str:
+            url = f"{url}?{query_str}"
+
+        sign_payload = query_str
+    else:
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        sign_payload = body
+
     sign = _bybit_v5_sign(ts_ms, sign_payload) if (BYBIT_API_KEY and BYBIT_API_SECRET) else ""
 
     headers = {
@@ -1142,9 +1166,6 @@ def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> di
         return r.json()
     except Exception as e:
         return {"retCode": -1, "retMsg": f"{type(e).__name__}: {e}", "result": None}
-
-
-
 def _bybit_get_instr_filters(symbol: str) -> dict:
     """Return dict with keys: minQty, qtyStep, minNotional as STRINGS (best-effort) for linear USDT perp."""
     sym = _bybit_linear_symbol(symbol)
