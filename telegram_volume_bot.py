@@ -1469,6 +1469,61 @@ def _estimate_position_risk_usd(p: dict) -> float:
     except Exception:
         return 0.0
 
+def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
+    """Compute AutoTrade day risk metrics.
+
+    Definition (as requested):
+    - used_risk = TOTAL estimated risk of currently OPEN positions (entry vs SL).
+    - remaining = daily_cap - used_risk + open_pnl_adjust
+      where open_pnl_adjust is the current unrealised PnL on open positions (live only).
+      This means:
+        * positive PnL increases remaining risk capacity
+        * negative PnL reduces remaining risk capacity
+
+    Notes:
+    - In LIVE mode we read Bybit open positions (includes manual trades).
+    - In PAPER mode we use bot journal open risk (no unrealised PnL adjustment).
+    """
+    cap = 0.0
+    used_risk = 0.0
+    open_pnl = 0.0
+    mode = str(AUTOTRADE_MODE).lower()
+
+    try:
+        cap = float(_autotrade_daily_cap_usd(int(uid), float(equity)) or 0.0) if equity and equity > 0 else 0.0
+    except Exception:
+        cap = 0.0
+
+    if mode == "live":
+        try:
+            positions = _bybit_get_open_positions_linear()
+            used_risk = float(sum(_estimate_position_risk_usd(p) for p in positions) or 0.0)
+            open_pnl = float(sum(_pos_unreal_pnl(p) for p in positions) or 0.0)
+        except Exception:
+            used_risk = 0.0
+            open_pnl = 0.0
+    else:
+        # Paper: only bot-opened trades (no mark/pnl adjustment)
+        try:
+            used_risk = float(_autotrade_open_risk_usd(int(uid), float(equity)) or 0.0) if equity and equity > 0 else 0.0
+        except Exception:
+            used_risk = 0.0
+        open_pnl = 0.0
+
+    remaining = float("inf") if cap <= 0 else (cap - used_risk + open_pnl)
+    over_by = 0.0
+    if cap > 0 and remaining < 0:
+        over_by = abs(remaining)
+
+    return {
+        "cap": float(cap),
+        "used_risk": float(used_risk),
+        "open_pnl": float(open_pnl),
+        "remaining": float(remaining),
+        "over_by": float(over_by),
+    }
+
+
 def _autotrade_user_settings(uid: int) -> dict:
     """Return user dict after daily reset (so caps are current)."""
     try:
@@ -7605,6 +7660,9 @@ KNOWN_COMMANDS = sorted(set([
     # System health
     "health", "health_sys",
 
+    # AutoTrade (admin)
+    "open_trades", "autotrade_debug", "autotrade_report",
+
     # Timezone
     "tz",
 
@@ -8158,6 +8216,15 @@ Not financial advice.
 
 /health_sys
 • System health (DB, exchange, email)
+
+/open_trades
+• Show live open Bybit positions (admin)
+
+/autotrade_debug
+• AutoTrade readiness + last decision (admin)
+
+/autotrade_report [hours]
+• AutoTrade journal (admin)
 
 ────────────────────
 📢 Channels
@@ -10057,11 +10124,29 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     cap = daily_cap_usd(user)
-    # Sync used risk from CURRENT open positions (RF/close frees capacity instantly)
+    # Day risk capacity logic
     pnl_today = _pnl_today_closed_trades(uid, user)
-    used_today = _risk_used_total_today(uid, user)
+
+    # For admin (AutoTrade owner), sync with LIVE Bybit positions so /status matches /autotrade_debug.
+    # For non-admin users, we use the bot journal open risk.
+    open_pnl_adj = 0.0
+    if is_admin_user(int(uid)):
+        m = _autotrade_day_risk_metrics(int(uid), float(equity))
+        # Use cap computed from /dailycap with live equity
+        if float(m.get("cap") or 0.0) > 0:
+            cap = float(m["cap"])
+        used_today = float(m.get("used_risk") or 0.0)
+        open_pnl_adj = float(m.get("open_pnl") or 0.0)
+        remaining_today = float(m.get("remaining"))
+        # Include realized PnL today too (more capacity if positive)
+        if cap > 0 and remaining_today != float("inf"):
+            remaining_today = remaining_today + float(pnl_today or 0.0)
+    else:
+        used_today = _risk_used_total_today(uid, user)
+        remaining_today = (cap - used_today + float(pnl_today or 0.0)) if cap > 0 else float("inf")
+
     day_local = _user_day_local(user)
-    remaining_today = (cap - used_today) if cap > 0 else float("inf")
+
 
     enabled = user_enabled_sessions(user)
     now_s = in_session_now(user)
@@ -10092,11 +10177,18 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Plan: {plan}")
     lines.append(f"Equity: ${equity:.2f}")
     lines.append(f"PnL today: ${pnl_today:+.2f}")
+    if is_admin_user(int(uid)):
+        lines.append(f"Open PnL (adds to remaining): ${open_pnl_adj:+.2f}")
     lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
     lines.append(f"Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f} (used by /size)")
     lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
     lines.append(f"Daily risk used (open risk today): ${used_today:.2f}")
-    lines.append(f"Daily risk remaining: ${max(0.0, remaining_today):.2f}" if cap > 0 else "Daily risk remaining: ∞")
+    if cap > 0:
+        lines.append(f"Daily risk remaining: ${remaining_today:.2f}")
+        if remaining_today < 0:
+            lines.append(f"⚠️ Over daily cap by ${abs(remaining_today):.2f} (reduce risk / add SL / close positions)")
+    else:
+        lines.append("Daily risk remaining: ∞")
     lines.append(HDR)
     lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
     lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
@@ -10107,8 +10199,24 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
     lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
 
-    # AutoTrade status (owner/admin only)
-    lines.append(HDR)
+
+    # AutoTrade status: admin only (hidden for public users)
+    if is_admin_user(int(uid)):
+        lines.append(HDR)
+        try:
+            at_on = "ON" if AUTOTRADE_ENABLED else "OFF"
+            at_mode = str(AUTOTRADE_MODE).upper()
+            at_sess = ",".join(_autotrade_get_sessions())
+            last = _LAST_AUTOTRADE_DECISION.get(int(AUTOTRADE_OWNER_UID or 0)) or _LAST_AUTOTRADE_DECISION.get(int(uid)) or {}
+            last_txt = str(last.get("decision") or "—").upper()
+            last_reason = str(last.get("reason") or "—")
+            last_when = _fmt_iso_to_local(str(last.get("when") or "")) if last.get("when") else ""
+            if last_when:
+                lines.append(f"AutoTrade: {at_on} | Mode: {at_mode} | Sessions: {at_sess} | Last: {last_txt} ({last_reason}) @ {last_when}")
+            else:
+                lines.append(f"AutoTrade: {at_on} | Mode: {at_mode} | Sessions: {at_sess} | Last: {last_txt} ({last_reason})")
+        except Exception:
+            pass
 
     if not opens:
         lines.append("Open trades: None")
@@ -11136,7 +11244,8 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lines.append("OPEN POSITIONS (live):")
         total_u = 0.0
         total_r = 0.0
-        for p in open_positions:
+
+        for i, p in enumerate(open_positions, 1):
             sym = _pos_symbol(p)
             side = _pos_side_text(p)
             size = _pos_size(p)
@@ -11145,13 +11254,22 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             pnl = _pos_unreal_pnl(p)
             sl = _pos_stop(p)
             risk = _estimate_position_risk_usd(p)
+
             total_u += pnl
             total_r += risk
-            lines.append(f"• {side} {sym} size={size:g} entry={fmt_price(entry)} mark={fmt_price(mark)} pnl={pnl:+.2f} USDT")
-            if sl:
-                lines.append(f"  SL={fmt_price(sl)} | risk est={risk:.2f} USDT")
+
+            lines.append(f"{i}) {side} {sym}")
+            lines.append(f"   • Size: {size:g}")
+            lines.append(f"   • Entry: {fmt_price(entry)}   | Mark: {fmt_price(mark)}")
+            lines.append(f"   • PnL: {pnl:+.2f} USDT")
+            if sl and sl > 0:
+                lines.append(f"   • SL: {fmt_price(sl)}   | Risk est: {risk:.2f} USDT")
             else:
-                lines.append("  SL=— (risk est unavailable)")
+                lines.append("   • SL: —   | Risk est: — (needs SL)")
+            if i != len(open_positions):
+                lines.append(SEP)
+
+        lines.append(HDR)
         lines.append(f"Total unrealised PnL: {total_u:+.2f} USDT")
         lines.append(f"Total risk est (needs SL): {total_r:.2f} USDT")
     else:
@@ -11345,9 +11463,14 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             open_risk = 0.0
 
     per_trade_risk = float(_autotrade_per_trade_risk_usd(owner, equity) or 0.0) if equity > 0 else 0.0
-    daily_cap = float(_autotrade_daily_cap_usd(owner, equity) or 0.0) if equity > 0 else 0.0
-    used_today = float(_risk_used_total_today(owner, user) or 0.0)
-    remaining_today = (daily_cap - used_today) if daily_cap > 0 else float("inf")
+
+    # Daily cap and used/remaining risk (sync definition with /status)
+    mday = _autotrade_day_risk_metrics(int(owner), float(equity))
+    daily_cap = float(mday.get("cap") or 0.0)
+    used_today = float(mday.get("used_risk") or 0.0)   # TOTAL risk of open positions
+    open_pnl_adj = float(mday.get("open_pnl") or 0.0)  # unrealised PnL adjusts remaining capacity (live)
+    pnl_today_closed = float(_pnl_today_closed_trades(owner, user) or 0.0)
+    remaining_today = float("inf") if daily_cap <= 0 else (daily_cap - used_today + open_pnl_adj + pnl_today_closed)
 
     dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
     det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
@@ -11390,17 +11513,29 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines.append(f"Open trades: {int(open_trades_n)}/{int(AUTOTRADE_MAX_OPEN_TRADES)}")
     lines.append(f"Open risk est: ${open_risk:.2f}")
     lines.append(f"Per-trade risk (from /riskmode): ${per_trade_risk:.2f}")
+    lines.append(SEP)
     lines.append(f"Daily cap (from /dailycap): ${daily_cap:.2f}")
-    lines.append(f"Daily risk used (synced w /status): ${used_today:.2f}")
-    if math.isfinite(remaining_today):
-        lines.append(f"Daily risk remaining (synced w /status): ${remaining_today:.2f}")
-    else:
-        lines.append("Daily risk remaining (synced w /status): ∞")
 
+    # Capacity breakdown (kept in-sync with /status)
+    lines.append(f"Daily risk used = open risk: ${used_today:.2f}")
+    lines.append(f"Unrealised PnL adj (open): ${open_pnl_adj:+.2f}")
+    lines.append(f"Realised PnL today (closed): ${pnl_today_closed:+.2f}")
+
+    if math.isfinite(remaining_today):
+        lines.append(f"Daily risk remaining: ${remaining_today:.2f}")
+        if remaining_today < 0:
+            lines.append(f"⚠️ Over daily cap by ${abs(remaining_today):.2f}")
+    else:
+        lines.append("Daily risk remaining: ∞")
+
+    # Block logic
     if equity > 0 and daily_cap > 0:
-        if per_trade_risk > remaining_today:
+        if remaining_today <= 0:
             lines.append("⚠️ Would BLOCK: daily_risk_cap_reached")
-        elif (open_risk + per_trade_risk) > daily_cap:
+        elif per_trade_risk > remaining_today:
+            lines.append("⚠️ Would BLOCK: per_trade_risk_gt_remaining")
+        elif (open_risk + per_trade_risk) > daily_cap and (open_pnl_adj + pnl_today_closed) <= 0:
+            # conservative check if PnL doesn't offset risk
             lines.append("⚠️ Would BLOCK: daily_risk_cap_reached")
 
     lines.append(SEP)
@@ -11456,17 +11591,23 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ Admin only.")
         return
 
-    positions = _bybit_get_open_positions_linear() if str(AUTOTRADE_MODE).lower() == "live" else []
-    if not positions:
-        await update.message.reply_text("No open positions found.")
+    if str(AUTOTRADE_MODE).lower() != "live":
+        await update.message.reply_text("AutoTrade is not in LIVE mode. No live positions to display.")
         return
 
-    lines = []
+    positions = _bybit_get_open_positions_linear()
+    if not positions:
+        await update.message.reply_text("✅ No open positions found.")
+        return
+
+    lines: list[str] = []
     lines.append("📌 Open Positions (Bybit)")
     lines.append(HDR)
+
     total_pnl = 0.0
     total_risk = 0.0
-    for p in positions:
+
+    for i, p in enumerate(positions, 1):
         sym = _pos_symbol(p)
         side = _pos_side_text(p)
         size = _pos_size(p)
@@ -11475,22 +11616,34 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pnl = _pos_unreal_pnl(p)
         sl = _pos_stop(p)
         risk = _estimate_position_risk_usd(p)
+
         total_pnl += pnl
         total_risk += risk
 
-        lines.append(f"{side} {sym} | size={size:g} | entry={fmt_price(entry)} | mark={fmt_price(mark)}")
-        lines.append(f"  PnL: {pnl:+.2f} USDT | SL: {fmt_price(sl) if sl else '—'} | Risk est: {risk:.2f} USDT")
-        # time (best-effort)
+        lines.append(f"{i}) {side} {sym}")
+        lines.append(f"   • Size: {size:g}")
+        lines.append(f"   • Entry: {fmt_price(entry)}   | Mark: {fmt_price(mark)}")
+        lines.append(f"   • PnL: {pnl:+.2f} USDT")
+
+        if sl and sl > 0:
+            lines.append(f"   • SL: {fmt_price(sl)}   | Risk est: {risk:.2f} USDT")
+        else:
+            lines.append("   • SL: —   | Risk est: — (needs SL)")
+
         ct = p.get("createdTime") or p.get("created_time") or ""
         ut = p.get("updatedTime") or p.get("updated_time") or ""
         if ct:
-            lines.append(f"  Opened: {_ms_to_local_str(ct)}")
+            lines.append(f"   • Opened: {_ms_to_local_str(ct)}")
         if ut:
-            lines.append(f"  Updated: {_ms_to_local_str(ut)}")
-        lines.append(SEP)
+            lines.append(f"   • Updated: {_ms_to_local_str(ut)}")
 
+        if i != len(positions):
+            lines.append(SEP)
+
+    lines.append(HDR)
     lines.append(f"TOTAL unrealised PnL: {total_pnl:+.2f} USDT")
     lines.append(f"TOTAL risk est (needs SL): {total_risk:.2f} USDT")
+
     await send_long_message(update, "\n".join(lines))
 
 async def autotrade_debug_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
