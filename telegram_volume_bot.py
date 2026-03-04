@@ -1564,21 +1564,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (False, 'qty_calc_failed')
 
 
-# Convert base-unit qty to Bybit contract qty if contractSize != 1
-    try:
-        _filt_cs = _bybit_get_instr_filters(sym)
-        _cs = float(_filt_cs.get("contractSize") or 1.0)
-        if _cs and _cs > 0:
-            qty = float(qty) / _cs
-        try:
-            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                'contract_size': _cs,
-                'qty_contracts_pre_round': float(qty),
-            })
-        except Exception:
-            pass
-    except Exception:
-        pass
+    # NOTE: qty is kept in base units here. Contract-size conversion (e.g., 1000* symbols)
+    # happens once in LIVE mode right before rounding + order placement.
 
     if AUTOTRADE_MODE == 'paper':
         trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
@@ -6262,9 +6249,11 @@ def make_setup(
             return None
 
         if engine == "A" and abs(float(ch1)) >= float(SHARP_1H_MOVE_PCT):
+            # EMA touch/reaction on 15m is OPTIONAL: do not hard-reject if it's missing.
+            # (Ramin requested: no hard requirement to touch 15m EMA.)
             if not ema_support_reaction_ok_15m(c15, pb_ema_val, side, session_name):
-                _rej("sharp_1h_no_ema_reaction", base, mv, f"ch1={ch1:+.2f}% needs EMA reaction")
-                return None
+                notes.append("🟡 No strong 15m EMA reaction detected (optional check).")
+                conf = max(0.0, float(conf) - 4.0)
 
         thr = clamp(max(12.0, 2.5 * ((atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0)), 12.0, 22.0)
         if side == "BUY" and ch24 <= -thr:
@@ -11081,16 +11070,17 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     lines.append(SEP)
     lines.append(f"UTC now: {now_utc.isoformat(timespec='seconds')}")
-    # Show how old the displayed decision is (prevents confusion about "stale" output)
-    try:
-        _w = (dec or {}).get('when')
-        if _w:
-            _dt = datetime.fromisoformat(str(_w).replace('Z', '+00:00'))
-            _age = (now_utc - _dt).total_seconds()
-            if _age >= 0:
-                lines.append(f"Decision age: {int(_age//60)}m {int(_age%60)}s ago")
-    except Exception:
-        pass
+
+# Show how old the displayed decision is (prevents confusion about "stale" output)
+try:
+    _w = (dec or {}).get('when')
+    if _w:
+        _dt = datetime.fromisoformat(str(_w).replace('Z', '+00:00'))
+        _age = (now_utc - _dt).total_seconds()
+        if _age >= 0:
+            lines.append(f"Decision age: {int(_age//60)}m {int(_age%60)}s ago")
+except Exception:
+    pass
 
     lines.append(f"Session: {sess} | Allowed: {'✅' if sess_allowed else '❌'}")
     if tw_ok is not None:
@@ -13738,12 +13728,6 @@ async def _post_init(app: Application):
             BotCommand("support_status", "Check your latest support ticket"),
 
             BotCommand("health", "Bot & data health check"),
-
-            BotCommand("autotrade_report", "AutoTrade journal (admin)"),
-            BotCommand("autotrade_last", "Last AutoTrade attempt (admin)"),
-            BotCommand("autotrade_debug", "AutoTrade debug (admin)"),
-            BotCommand("autotrade_sessions", "Set AutoTrade sessions (admin)"),
-            BotCommand("autotrade_report_overall", "AutoTrade overall stats (admin)"),
 
             BotCommand("billing", "Subscription & payment info"),
         ]
