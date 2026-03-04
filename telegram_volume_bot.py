@@ -105,6 +105,7 @@ def _autotrade_migrate_tables():
                 trade_id TEXT PRIMARY KEY,
                 uid INTEGER,
                 opened_ts INTEGER,
+                day_utc TEXT NOT NULL DEFAULT \'\',
                 session TEXT,
                 symbol TEXT,
                 side TEXT,
@@ -1351,6 +1352,7 @@ def _autotrade_db_init():
                 trade_id TEXT PRIMARY KEY,
                 uid INTEGER,
                 opened_ts INTEGER,
+                day_utc TEXT NOT NULL DEFAULT \'\',
                 session TEXT,
                 symbol TEXT,
                 side TEXT,
@@ -1378,29 +1380,71 @@ def _autotrade_db_open_trades(uid: int) -> list[dict]:
         return [dict(r) for r in c.fetchall()]
 
 def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float) -> str:
+    """Persist a bot-opened trade into SQLite.
+
+    NOTE: Some deployed DBs have a NOT NULL `day_utc` column on autotrade_trades.
+    We detect it and always populate it to avoid IntegrityError.
+    """
     trade_id = f"AT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+    day_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute(
-            """INSERT INTO autotrade_trades (trade_id, uid, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
-            (
-                trade_id,
-                int(uid),
-                int(time.time()),
-                str(session_label),
-                str(getattr(s, 'symbol', '') or '').upper(),
-                str(getattr(s, 'side', '') or '').upper(),
-                float(getattr(s, 'entry', 0.0) or 0.0),
-                float(getattr(s, 'sl', 0.0) or 0.0),
-                float(getattr(s, 'tp1', 0.0) or 0.0),
-                float(getattr(s, 'tp2', 0.0) or 0.0),
-                float(getattr(s, 'tp3', 0.0) or 0.0),
-                float(qty),
-            ),
-        )
+
+        # Detect schema (older/newer deployments)
+        try:
+            cols = [r[1] for r in c.execute("PRAGMA table_info(autotrade_trades)").fetchall()]
+        except Exception:
+            cols = []
+
+        has_day = 'day_utc' in cols
+
+        if has_day:
+            c.execute(
+                """INSERT INTO autotrade_trades
+                       (trade_id, uid, opened_ts, day_utc, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
+                (
+                    trade_id,
+                    int(uid),
+                    int(time.time()),
+                    str(day_utc),
+                    str(session_label),
+                    str(getattr(s, 'symbol', '') or '').upper(),
+                    str(getattr(s, 'side', '') or '').upper(),
+                    float(getattr(s, 'entry', 0.0) or 0.0),
+                    float(getattr(s, 'sl', 0.0) or 0.0),
+                    float(getattr(s, 'tp1', 0.0) or 0.0),
+                    float(getattr(s, 'tp2', 0.0) or 0.0),
+                    float(getattr(s, 'tp3', 0.0) or 0.0),
+                    float(qty),
+                ),
+            )
+        else:
+            c.execute(
+                """INSERT INTO autotrade_trades
+                       (trade_id, uid, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
+                (
+                    trade_id,
+                    int(uid),
+                    int(time.time()),
+                    str(session_label),
+                    str(getattr(s, 'symbol', '') or '').upper(),
+                    str(getattr(s, 'side', '') or '').upper(),
+                    float(getattr(s, 'entry', 0.0) or 0.0),
+                    float(getattr(s, 'sl', 0.0) or 0.0),
+                    float(getattr(s, 'tp1', 0.0) or 0.0),
+                    float(getattr(s, 'tp2', 0.0) or 0.0),
+                    float(getattr(s, 'tp3', 0.0) or 0.0),
+                    float(qty),
+                ),
+            )
+
         conn.commit()
+
     return trade_id
+
 
 def _autotrade_estimated_risk_usd(entry: float, sl: float, qty: float) -> float:
     try:
@@ -11205,7 +11249,7 @@ async def autotrade_debug_reset_cmd(update: Update, context: ContextTypes.DEFAUL
     uid = update.effective_user.id
 
     # admin-only
-    if int(uid) != int(OWNER_UID):
+    if int(uid) not in set(ADMIN_IDS):
         await update.message.reply_text("⛔ Admin only.")
         return
 
