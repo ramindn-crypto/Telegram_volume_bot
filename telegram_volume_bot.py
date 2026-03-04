@@ -1562,7 +1562,15 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     qty = _autotrade_qty_from_risk(entry, sl, equity)
     if qty <= 0:
         return (False, 'qty_calc_failed')
-
+    
+    # store qty calculated from risk (for /autotrade_debug)
+    try:
+        _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'qty_from_risk': float(qty)
+        })
+    except Exception:
+        pass
 
     # NOTE: qty is kept in base units here. Contract-size conversion (e.g., 1000* symbols)
     # happens once in LIVE mode right before rounding + order placement.
@@ -1603,30 +1611,23 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
 
-    
-
-
     qty, qreason = _round_qty_up(sym, qty, entry)
-
-
     if qty is None:
-
-
         return (False, f"qty_invalid:{qreason}")
-
-
+    
+    # store final qty after rounding (for /autotrade_debug)
+    try:
+        _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'qty_attempted': float(qty),
+            'qty_round_reason': qreason
+        })
+    except Exception:
+        pass
+    
     # Format qty as Bybit-safe string (no scientific notation, aligned to qtyStep)
-
-
-
     _filt = _bybit_get_instr_filters(sym)
-
-
-
     qty_step = _filt.get('qtyStep')
-
-
-
     qty_str = _fmt_qty(qty, qty_step)
     try:
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
@@ -1638,8 +1639,6 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         })
     except Exception:
         pass
-
-
 
     order_payload = {
         'category': 'linear',
@@ -10983,8 +10982,6 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-
-
 async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """AutoTrade readiness + last decision diagnostics (admin only)."""
     uid = update.effective_user.id
@@ -10998,7 +10995,6 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     now_utc = datetime.now(timezone.utc)
     sess = _guess_session_name_utc(now_utc)
 
-    # readiness reasons (more helpful than just True/False)
     reasons = []
     if not AUTOTRADE_ENABLED:
         reasons.append("AUTOTRADE_ENABLED=0")
@@ -11012,14 +11008,12 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     ready = _autotrade_ready()
     sess_allowed = _autotrade_allowed_session(sess)
 
-    # trade-window gate (optional)
     tw_ok = None
     try:
         tw_ok = bool(trade_window_allows_now(user))
     except Exception:
         tw_ok = None
 
-    # equity + caps
     equity_src = "n/a"
     equity = 0.0
     try:
@@ -11049,7 +11043,6 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
 
-    # last decision snapshot (set by autotrade_job)
     dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
     det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
 
@@ -11057,26 +11050,24 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines.append("🧪 AutoTrade Debug")
     lines.append(HDR)
     lines.append(f"Ready: {'✅' if ready else '❌'}")
+
     if reasons and not ready:
         lines.append("Why not ready:")
         for r in reasons[:6]:
             lines.append(f"• {r}")
 
     lines.append(SEP)
-    lines.append(
-        f"Mode: {str(AUTOTRADE_MODE).lower()} | Enabled: {'yes' if AUTOTRADE_ENABLED else 'no'} | Isolated: {'yes' if AUTOTRADE_ISOLATED else 'no'}"
-    )
+    lines.append(f"Mode: {str(AUTOTRADE_MODE).lower()} | Enabled: {'yes' if AUTOTRADE_ENABLED else 'no'} | Isolated: {'yes' if AUTOTRADE_ISOLATED else 'no'}")
     lines.append(f"Owner UID: {owner} | Caller UID: {uid}")
     lines.append(f"Keys present: {'yes' if (BYBIT_API_KEY and BYBIT_API_SECRET) else 'no'}")
 
     lines.append(SEP)
     lines.append(f"UTC now: {now_utc.isoformat(timespec='seconds')}")
 
-    # Show how old the displayed decision is (prevents confusion about "stale" output)
     try:
         _w = (dec or {}).get("when")
         if _w:
-            _dt = datetime.fromisoformat(str(_w).replace("Z", "+00:00"))
+            _dt = datetime.fromisoformat(str(_w).replace("Z","+00:00"))
             _age = (now_utc - _dt).total_seconds()
             if _age >= 0:
                 lines.append(f"Decision age: {int(_age//60)}m {int(_age%60)}s ago")
@@ -11084,6 +11075,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass
 
     lines.append(f"Session: {sess} | Allowed: {'✅' if sess_allowed else '❌'}")
+
     if tw_ok is not None:
         lines.append(f"Trade window allows now: {'✅' if tw_ok else '❌'}")
 
@@ -11095,7 +11087,6 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines.append(f"Open cap: ${open_cap:.2f} ({AUTOTRADE_OPEN_RISK_CAP_PCT:g}%)")
     lines.append(f"Daily cap: ${daily_cap:.2f} ({AUTOTRADE_DAILY_RISK_CAP_PCT:g}%)")
 
-    # cap checks (same as _autotrade_place_trade)
     if equity > 0:
         if (open_risk + per_trade_risk) > open_cap:
             lines.append("⚠️ Would BLOCK: open_risk_cap_reached")
@@ -11103,6 +11094,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             lines.append("⚠️ Would BLOCK: daily_risk_cap_reached")
 
     lines.append(SEP)
+
     if dec:
         lines.append(f"Last decision: {dec.get('status','')}")
         lines.append(f"Reason: {dec.get('reason','')}")
@@ -11115,12 +11107,37 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         side = det.get("side") or ""
         entry = det.get("entry")
         sl = det.get("sl")
+
         lines.append(SEP)
         lines.append("Last setup attempt:")
         lines.append(f"• {side} {sym} entry={entry} sl={sl} setup_id={det.get('setup_id','')}".strip())
 
+        setup_time = det.get("setup_time")
+        deadline = det.get("entry_deadline")
+        qty_attempted = det.get("qty_attempted")
+
+        if setup_time:
+            lines.append(f"Setup time: {setup_time}")
+
+        if deadline:
+            lines.append(f"Entry deadline: {deadline}")
+            try:
+                dl = datetime.fromisoformat(str(deadline).replace("Z","+00:00"))
+                remaining = (dl - now_utc).total_seconds()
+                if remaining > 0:
+                    lines.append(f"Time left: {int(remaining//60)}m {int(remaining%60)}s")
+                else:
+                    lines.append("Time left: EXPIRED")
+            except Exception:
+                pass
+
+        if qty_attempted:
+            lines.append(f"Order qty attempted: {qty_attempted}")
+
     msg = "\n".join([x for x in lines if x is not None and x != ""])
     await update.message.reply_text(msg)
+
+
 
 async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _autotrade_migrate_tables()
