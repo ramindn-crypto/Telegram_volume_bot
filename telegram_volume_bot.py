@@ -1814,9 +1814,9 @@ SESSION_EMA_REACTION_LOOKBACK = {
 
 # ✅ 1H trigger loosened per session (overall easier)
 SESSION_TRIGGER_ATR_MULT = {
-    "NY": 0.55,
-    "LON": 0.75,
-    "ASIA": 0.95,
+    "NY": 0.50,
+    "LON": 0.7,
+    "ASIA": 0.9,
 }
 
 
