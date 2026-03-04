@@ -1497,6 +1497,11 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     side = str(getattr(s, 'side', '') or '').upper()
     entry = float(getattr(s, 'entry', 0.0) or 0.0)
     sl = float(getattr(s, 'sl', 0.0) or 0.0)
+    sl = float(getattr(s, 'sl', 0.0) or 0.0)
+
+    # clean debug precision
+    entry = round(entry, 6) if entry else entry
+    sl = round(sl, 6) if sl else sl
 
     sym = str(getattr(s, 'symbol', '') or '').upper()
     sym = _bybit_linear_symbol(sym)
@@ -1513,6 +1518,13 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'entry': entry,
             'sl': sl,
         }
+    # track setup generation timing
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'setup_time': datetime.now(timezone.utc).isoformat(),
+            'entry_deadline': (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+            'attempt_count': 0
+        })
     except Exception:
         pass
 
@@ -1619,7 +1631,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     try:
         _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-            'qty_attempted': float(qty),
+            'qty_attempted': int(qty),
             'qty_round_reason': qreason
         })
     except Exception:
@@ -1648,6 +1660,14 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         'qty': qty_str,
         'timeInForce': 'IOC',
     }
+    # track order attempts
+    try:
+        d = _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+        d['attempt_count'] = int(d.get('attempt_count', 0)) + 1
+        d['last_attempt'] = datetime.now(timezone.utc).isoformat()
+    except Exception:
+        pass
+        
     open_res = _bybit_v5_request('POST', '/v5/order/create', order_payload)
     try:
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
@@ -1659,7 +1679,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
 
     if int(open_res.get('retCode', -1)) != 0:
-        return (False, f"bybit_open_failed retCode={open_res.get('retCode')} retMsg={open_res.get('retMsg')}")
+        err = f"{open_res.get('retCode')} {open_res.get('retMsg')}"
+        return (False, f"bybit_open_failed ({err})")
 
     _bybit_v5_request('POST', '/v5/position/trading-stop', {
         'category': 'linear',
