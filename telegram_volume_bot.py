@@ -1518,6 +1518,9 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'entry': entry,
             'sl': sl,
         }
+    except Exception:
+        pass
+        
     # track setup generation timing
     try:
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
