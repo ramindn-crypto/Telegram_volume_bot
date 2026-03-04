@@ -11032,7 +11032,6 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         equity = 0.0
 
-    open_trades = []
     try:
         open_trades = _autotrade_db_open_trades(owner)
     except Exception:
@@ -11064,23 +11063,25 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             lines.append(f"• {r}")
 
     lines.append(SEP)
-    lines.append(f"Mode: {str(AUTOTRADE_MODE).lower()} | Enabled: {'yes' if AUTOTRADE_ENABLED else 'no'} | Isolated: {'yes' if AUTOTRADE_ISOLATED else 'no'}")
+    lines.append(
+        f"Mode: {str(AUTOTRADE_MODE).lower()} | Enabled: {'yes' if AUTOTRADE_ENABLED else 'no'} | Isolated: {'yes' if AUTOTRADE_ISOLATED else 'no'}"
+    )
     lines.append(f"Owner UID: {owner} | Caller UID: {uid}")
     lines.append(f"Keys present: {'yes' if (BYBIT_API_KEY and BYBIT_API_SECRET) else 'no'}")
 
     lines.append(SEP)
     lines.append(f"UTC now: {now_utc.isoformat(timespec='seconds')}")
 
-# Show how old the displayed decision is (prevents confusion about "stale" output)
-try:
-    _w = (dec or {}).get('when')
-    if _w:
-        _dt = datetime.fromisoformat(str(_w).replace('Z', '+00:00'))
-        _age = (now_utc - _dt).total_seconds()
-        if _age >= 0:
-            lines.append(f"Decision age: {int(_age//60)}m {int(_age%60)}s ago")
-except Exception:
-    pass
+    # Show how old the displayed decision is (prevents confusion about "stale" output)
+    try:
+        _w = (dec or {}).get("when")
+        if _w:
+            _dt = datetime.fromisoformat(str(_w).replace("Z", "+00:00"))
+            _age = (now_utc - _dt).total_seconds()
+            if _age >= 0:
+                lines.append(f"Decision age: {int(_age//60)}m {int(_age%60)}s ago")
+    except Exception:
+        pass
 
     lines.append(f"Session: {sess} | Allowed: {'✅' if sess_allowed else '❌'}")
     if tw_ok is not None:
@@ -11110,7 +11111,6 @@ except Exception:
         lines.append("Last decision: (none yet)")
 
     if det:
-        # show key setup details if present
         sym = det.get("symbol_sent") or det.get("symbol_raw") or ""
         side = det.get("side") or ""
         entry = det.get("entry")
@@ -11119,7 +11119,8 @@ except Exception:
         lines.append("Last setup attempt:")
         lines.append(f"• {side} {sym} entry={entry} sl={sl} setup_id={det.get('setup_id','')}".strip())
 
-    return "\n".join([x for x in lines if x is not None and x != ""])
+    msg = "\n".join([x for x in lines if x is not None and x != ""])
+    await update.message.reply_text(msg)
 
 async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _autotrade_migrate_tables()
