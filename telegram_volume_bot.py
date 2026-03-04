@@ -10141,9 +10141,22 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Include realized PnL today too (more capacity if positive)
         if cap > 0 and remaining_today != float("inf"):
             remaining_today = remaining_today + float(pnl_today or 0.0)
+        # Display rule (sync with /autotrade_debug):
+        # If Daily risk used (open risk) is ABOVE Daily cap, show remaining as 0 (but keep the over-cap alert).
+        over_by = 0.0
+        if cap > 0 and used_today > cap:
+            over_by = used_today - cap
+            remaining_today = 0.0
     else:
         used_today = _risk_used_total_today(uid, user)
         remaining_today = (cap - used_today + float(pnl_today or 0.0)) if cap > 0 else float("inf")
+
+        # Display rule (sync with /autotrade_debug):
+        # If Daily risk used (open risk) is ABOVE Daily cap, show remaining as 0 (but keep the over-cap alert).
+        over_by = 0.0
+        if cap > 0 and used_today > cap:
+            over_by = used_today - cap
+            remaining_today = 0.0
 
     day_local = _user_day_local(user)
 
@@ -10185,7 +10198,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Daily risk used (open risk today): ${used_today:.2f}")
     if cap > 0:
         lines.append(f"Daily risk remaining: ${remaining_today:.2f}")
-        if remaining_today < 0:
+        if over_by > 0:
+            lines.append(f"⚠️ Over daily cap by ${over_by:.2f} (reduce risk / add SL / close positions)")
+        elif remaining_today < 0:
             lines.append(f"⚠️ Over daily cap by ${abs(remaining_today):.2f} (reduce risk / add SL / close positions)")
     else:
         lines.append("Daily risk remaining: ∞")
@@ -11470,7 +11485,16 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     used_today = float(mday.get("used_risk") or 0.0)   # TOTAL risk of open positions
     open_pnl_adj = float(mday.get("open_pnl") or 0.0)  # unrealised PnL adjusts remaining capacity (live)
     pnl_today_closed = float(_pnl_today_closed_trades(owner, user) or 0.0)
-    remaining_today = float("inf") if daily_cap <= 0 else (daily_cap - used_today + open_pnl_adj + pnl_today_closed)
+
+    # Raw remaining capacity (can go negative). Display rule:
+    # If Daily risk used (open risk) is ABOVE Daily cap, show remaining as 0 (but keep the over-cap alert).
+    remaining_raw = float("inf") if daily_cap <= 0 else (daily_cap - used_today + open_pnl_adj + pnl_today_closed)
+    over_by = 0.0
+    if daily_cap > 0 and used_today > daily_cap:
+        over_by = used_today - daily_cap
+        remaining_today = 0.0
+    else:
+        remaining_today = remaining_raw
 
     dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
     det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
@@ -11523,7 +11547,9 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if math.isfinite(remaining_today):
         lines.append(f"Daily risk remaining: ${remaining_today:.2f}")
-        if remaining_today < 0:
+        if over_by > 0:
+            lines.append(f"⚠️ Over daily cap by ${over_by:.2f}")
+        elif remaining_today < 0:
             lines.append(f"⚠️ Over daily cap by ${abs(remaining_today):.2f}")
     else:
         lines.append("Daily risk remaining: ∞")
