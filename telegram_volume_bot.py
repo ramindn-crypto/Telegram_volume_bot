@@ -1709,8 +1709,12 @@ def _autotrade_allowed_session(session_label: str) -> bool:
 # =========================================================
 def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1) -> list:
     """Return a list of Setup-like objects with entry/sl/tps for _autotrade_place_trade.
+
     Uses generated_setups for recency, joins signal_outcomes for OPEN, and pulls prices from signals.
     IMPORTANT: Do NOT filter by session label here (it can drift). Pick best OPEN recent setup.
+
+    Adds:
+      - created_ts: the generated_setups.created_ts (epoch seconds) so autotrade can enforce entry deadlines.
     """
     try:
         from types import SimpleNamespace
@@ -1719,8 +1723,9 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         con = sqlite3.connect(DB_PATH)
         cur = con.cursor()
 
+        # Pull recency + created_ts from generated_setups (canonical "setup generated time")
         cur.execute("""
-            SELECT g.setup_id
+            SELECT g.setup_id, g.created_ts
             FROM generated_setups g
             LEFT JOIN signal_outcomes o ON o.setup_id = g.setup_id
             WHERE g.user_id = ?
@@ -1731,13 +1736,24 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             LIMIT ?
         """, (int(uid), float(cutoff), int(limit)))
 
-        setup_ids = [r[0] for r in cur.fetchall() if r and r[0]]
-        if not setup_ids:
+        rows = cur.fetchall() or []
+        if not rows:
             con.close()
             return []
 
+        # Keep the newest created_ts per setup_id just in case
+        sid_to_created = {}
+        for r in rows:
+            try:
+                sid = r[0]
+                cts = float(r[1] or 0.0)
+                if sid:
+                    sid_to_created[str(sid)] = max(float(sid_to_created.get(str(sid), 0.0) or 0.0), cts)
+            except Exception:
+                pass
+
         out = []
-        for sid in setup_ids:
+        for sid in list(sid_to_created.keys()):
             cur.execute("""
                 SELECT setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3
                 FROM signals
@@ -1759,6 +1775,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                 tp1=tp1,
                 tp2=tp2,
                 tp3=tp3,
+                created_ts=float(sid_to_created.get(str(setup_id), 0.0) or 0.0),
             ))
 
         con.close()
@@ -1769,8 +1786,6 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         except Exception:
             pass
         return []
-
-
 def _autotrade_clear_debug_state(uid: int | None = None) -> None:
     """Clear in-memory autotrade debug state. If uid is None, clears all."""
     global _LAST_AUTOTRADE_DECISION, _LAST_AUTOTRADE_DETAIL
@@ -1814,7 +1829,6 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     side = str(getattr(s, 'side', '') or '').upper()
     entry = float(getattr(s, 'entry', 0.0) or 0.0)
     sl = float(getattr(s, 'sl', 0.0) or 0.0)
-    sl = float(getattr(s, 'sl', 0.0) or 0.0)
 
     # clean debug precision
     entry = round(entry, 6) if entry else entry
@@ -1838,15 +1852,36 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
         
-    # track setup generation timing
+    # track setup generation timing (setup generated time + 10m entry deadline)
     try:
+        # Prefer the DB-generated timestamp if present; fall back to "now".
+        _cts = float(getattr(s, 'created_ts', 0.0) or 0.0)
+        if _cts > 0:
+            _setup_dt = datetime.fromtimestamp(_cts, tz=timezone.utc)
+        else:
+            _setup_dt = datetime.now(timezone.utc)
+
+        _deadline_dt = _setup_dt + timedelta(minutes=10)
+
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-            'setup_time': datetime.now(timezone.utc).isoformat(),
-            'entry_deadline': (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
-            'attempt_count': 0
+            'setup_time': _setup_dt.isoformat(timespec='seconds'),
+            'entry_deadline': _deadline_dt.isoformat(timespec='seconds'),
+            'attempt_count': int(_LAST_AUTOTRADE_DETAIL.get(int(uid), {}).get('attempt_count', 0) or 0),
         })
     except Exception:
         pass
+
+    # Enforce: setup is valid for 10 minutes only (after that it's expired)
+    try:
+        _st = _LAST_AUTOTRADE_DETAIL.get(int(uid), {}).get('setup_time')
+        _dl = _LAST_AUTOTRADE_DETAIL.get(int(uid), {}).get('entry_deadline')
+        if _st and _dl:
+            _dl_dt = datetime.fromisoformat(str(_dl).replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) > _dl_dt:
+                return (False, 'setup_expired')
+    except Exception:
+        pass
+
 
     # TP targets may be partially available depending on the engine/scanner
     _tp1 = getattr(s, 'tp1', None)
@@ -11566,12 +11601,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     lines.append(SEP)
 
-    if dec:
-        lines.append(f"Last decision: {dec.get('status','')}")
-        lines.append(f"Reason: {dec.get('reason','')}")
-        lines.append(f"When (Melbourne): {_fmt_iso_to_local(dec.get('when',''))}")
-    else:
-        lines.append("Last decision: (none yet)")
+    # (Last decision section removed — keep output focused on readiness + last setup attempt)
 
     if det:
         sym = det.get("symbol_sent") or det.get("symbol_raw") or ""
