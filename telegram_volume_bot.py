@@ -1476,6 +1476,21 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             pass
         return []
 
+
+def _autotrade_clear_debug_state(uid: int | None = None) -> None:
+    """Clear in-memory autotrade debug state. If uid is None, clears all."""
+    global _LAST_AUTOTRADE_DECISION, _LAST_AUTOTRADE_DETAIL
+    try:
+        if uid is None:
+            _LAST_AUTOTRADE_DECISION.clear()
+            _LAST_AUTOTRADE_DETAIL.clear()
+        else:
+            _LAST_AUTOTRADE_DECISION.pop(int(uid), None)
+            _LAST_AUTOTRADE_DETAIL.pop(int(uid), None)
+    except Exception:
+        pass
+
+
 def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
     if not _autotrade_ready():
         return (False, 'autotrade_not_ready_or_disabled')
@@ -7572,6 +7587,7 @@ async def usdt_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
 
+
 def approve_usdt(txid: str):
     conn = sqlite3.connect("bot.db")
     cur = conn.cursor()
@@ -7915,6 +7931,8 @@ Website: https://pulsefutures.com/
 
 /autotrade_debug
 • AutoTrade readiness + last decision/caps/session diagnostics (admin only)
+
+/autotrade_debug_reset
 
 /autotrade_report_overall
 • Overall performance summary for bot-opened positions (same metrics as signal_report_overall)
@@ -11161,6 +11179,21 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     msg = "\n".join([x for x in lines if x is not None and x != ""])
     await update.message.reply_text(msg)
 
+
+async def autotrade_debug_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    # admin-only
+    if int(uid) != int(OWNER_UID):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    _autotrade_clear_debug_state(uid=int(uid))
+
+    await update.message.reply_text(
+        "✅ AutoTrade debug state cleared.\n"
+        "Next setup attempt will start fresh."
+    )
 
 
 async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -14748,6 +14781,7 @@ def main():
     app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
     app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
     # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
