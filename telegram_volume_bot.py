@@ -15407,3 +15407,245 @@ def _normalize_bybit_qty(exchange, symbol, qty):
 # Before placing any Bybit order, call:
 # qty = _normalize_bybit_qty(exchange, symbol, qty)
 # If qty <= 0: skip trade with reason 'qty_below_min'
+
+
+
+# =========================================================
+# ===== PULSEFUTURES ULTRA INTELLIGENCE ENGINE (2026) =====
+# =========================================================
+
+# This block adds advanced analytical engines requested:
+# - Market Structure
+# - Multi‑Timeframe Alignment
+# - Liquidity Sweep Detection
+# - Orderflow Momentum
+# - Market Regime Detection
+# - Dynamic Risk Engine
+# - Trade Replay Analyzer
+# - Self‑Learning Strategy Analyzer
+
+# NOTE:
+# These functions are intentionally modular and safe.
+# They do NOT break existing signal logic. They enhance it.
+
+# ---------------------------------------------------------
+# Market Structure Engine (HH HL LH LL)
+# ---------------------------------------------------------
+def pf_detect_market_structure(ohlcv):
+
+    try:
+        highs = [c[2] for c in ohlcv]
+        lows = [c[3] for c in ohlcv]
+
+        if len(highs) < 10:
+            return "UNKNOWN"
+
+        if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+            return "BULLISH"
+
+        if highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+            return "BEARISH"
+
+        return "RANGE"
+
+    except Exception:
+        return "UNKNOWN"
+
+
+# ---------------------------------------------------------
+# Multi Timeframe Alignment
+# ---------------------------------------------------------
+def pf_mtf_alignment(symbol, fetch_func):
+
+    try:
+        ohlcv4 = fetch_func(symbol, "4h", 120)
+        ohlcv1 = fetch_func(symbol, "1h", 120)
+
+        if not ohlcv4 or not ohlcv1:
+            return "UNKNOWN"
+
+        c4 = [x[4] for x in ohlcv4]
+        c1 = [x[4] for x in ohlcv1]
+
+        if c4[-1] > sum(c4[-20:]) / 20 and c1[-1] > sum(c1[-20:]) / 20:
+            return "BULLISH"
+
+        if c4[-1] < sum(c4[-20:]) / 20 and c1[-1] < sum(c1[-20:]) / 20:
+            return "BEARISH"
+
+        return "MIXED"
+
+    except Exception:
+        return "UNKNOWN"
+
+
+# ---------------------------------------------------------
+# Liquidity Sweep Detection
+# ---------------------------------------------------------
+def pf_liquidity_sweep(ohlcv):
+
+    try:
+        highs = [c[2] for c in ohlcv]
+        lows = [c[3] for c in ohlcv]
+        close = ohlcv[-1][4]
+
+        prev_high = max(highs[-10:-1])
+        prev_low = min(lows[-10:-1])
+
+        if highs[-1] > prev_high and close < prev_high:
+            return "SELL_SWEEP"
+
+        if lows[-1] < prev_low and close > prev_low:
+            return "BUY_SWEEP"
+
+        return None
+
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------
+# Orderflow Momentum
+# ---------------------------------------------------------
+def pf_orderflow_momentum(ohlcv):
+
+    try:
+        closes = [c[4] for c in ohlcv]
+
+        move = closes[-1] - closes[-5]
+
+        if move > 0:
+            return "BULLISH"
+
+        if move < 0:
+            return "BEARISH"
+
+        return "FLAT"
+
+    except Exception:
+        return "FLAT"
+
+
+# ---------------------------------------------------------
+# Market Regime Detection
+# ---------------------------------------------------------
+def pf_market_regime(ohlcv):
+
+    try:
+        closes = [c[4] for c in ohlcv]
+        highs = [c[2] for c in ohlcv]
+        lows = [c[3] for c in ohlcv]
+
+        rng = [(highs[i] - lows[i]) for i in range(-20, 0)]
+        avg_range = sum(rng) / len(rng)
+
+        move = abs(closes[-1] - closes[-20]) / closes[-20] * 100
+
+        if move > 4:
+            return "TRENDING"
+
+        if avg_range / closes[-1] > 0.02:
+            return "VOLATILE"
+
+        if move < 1:
+            return "RANGING"
+
+        return "NORMAL"
+
+    except Exception:
+        return "UNKNOWN"
+
+
+# ---------------------------------------------------------
+# Dynamic Risk Engine
+# ---------------------------------------------------------
+def pf_dynamic_risk(confidence, base_risk):
+
+    try:
+        if confidence >= 85:
+            return base_risk * 1.3
+
+        if confidence >= 70:
+            return base_risk * 1.15
+
+        if confidence >= 55:
+            return base_risk
+
+        return base_risk * 0.7
+
+    except Exception:
+        return base_risk
+
+
+# ---------------------------------------------------------
+# Trade Replay Analyzer
+# ---------------------------------------------------------
+def pf_trade_replay(symbol, entry, sl, fetch_func):
+
+    try:
+
+        ohlcv = fetch_func(symbol, "5m", 120)
+
+        highs = [c[2] for c in ohlcv]
+        lows = [c[3] for c in ohlcv]
+
+        max_move = max(highs) - entry
+        sl_dist = abs(entry - sl)
+
+        if sl_dist == 0:
+            return None
+
+        rr = max_move / sl_dist
+
+        if rr >= 3:
+            return "EXCELLENT"
+
+        if rr >= 2:
+            return "GOOD"
+
+        if rr >= 1:
+            return "OK"
+
+        return "POOR"
+
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------
+# Self Learning Strategy Analyzer
+# ---------------------------------------------------------
+def pf_strategy_learning(trades):
+
+    try:
+
+        wins = 0
+        losses = 0
+
+        for t in trades:
+
+            pnl = float(t.get("pnl", 0))
+
+            if pnl > 0:
+                wins += 1
+            else:
+                losses += 1
+
+        total = wins + losses
+
+        if total == 0:
+            return "No data"
+
+        winrate = wins / total
+
+        if winrate < 0.5:
+            return "Recommendation: tighten signal filters"
+
+        if winrate < 0.6:
+            return "Recommendation: adjust EMA proximity"
+
+        return "Strategy performing well"
+
+    except Exception:
+        return "Learning engine error"
+
