@@ -74,7 +74,7 @@ import sys
 import time
 import logging
 import math
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal, ROUND_UP, ROUND_DOWN
 
 
 def _bybit_linear_symbol(sym: str) -> str:
@@ -1509,8 +1509,9 @@ def _bybit_get_instr_filters(symbol: str) -> dict:
 def _fmt_qty(qty: float, step) -> str:
     """Format qty as Bybit-safe decimal string aligned to qtyStep.
 
-    - Never returns scientific notation.
-    - Rounds UP to the nearest qtyStep multiple (Bybit-safe).
+    Safety rule (critical): never round UP quantities, because that can increase
+    the true $ risk beyond the intended risk-per-trade. We therefore round DOWN
+    to the nearest qtyStep multiple.
     """
     try:
         if qty is None:
@@ -1524,19 +1525,26 @@ def _fmt_qty(qty: float, step) -> str:
         if dstep <= 0:
             return format(dqty, "f")
 
-        mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
+        mult = (dqty / dstep).to_integral_value(rounding=ROUND_DOWN)
         dq = (mult * dstep).quantize(dstep)  # keeps correct decimals
+        if dq <= 0:
+            return "0"
         return format(dq, "f")
     except Exception:
-        # last resort: plain decimal string
         try:
             return format(Decimal(str(qty)), "f")
         except Exception:
             return str(qty)
 
 
-def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | None, str | None]:
-    """Decimal-safe rounding to Bybit qtyStep + minQty (+ minNotional if provided)."""
+def _round_qty_down(symbol: str, qty: float, entry_price: float) -> tuple[float | None, str | None]:
+    """Decimal-safe rounding DOWN to Bybit qtyStep and safety-checking minQty/minNotional.
+
+    CRITICAL SAFETY:
+    - We never round UP qty to satisfy minNotional/minQty because that can increase
+      the true $ risk beyond the user's /riskmode.
+    - If, after rounding DOWN, qty does not meet exchange minimums, we SKIP the trade.
+    """
     try:
         if qty is None or float(qty) <= 0:
             return (None, "qty<=0")
@@ -1563,32 +1571,30 @@ def _round_qty_up(symbol: str, qty: float, entry_price: float) -> tuple[float | 
         dmin_not = _d(min_not_s)
         dcs = _d(cs_s) or Decimal('1')
 
+        # Round DOWN to step
         if dstep and dstep > 0:
-            mult = (dqty / dstep).to_integral_value(rounding=ROUND_UP)
+            mult = (dqty / dstep).to_integral_value(rounding=ROUND_DOWN)
             dqty = (mult * dstep).quantize(dstep)
-
-        if dmin and dqty < dmin:
-            if dstep and dstep > 0:
-                mult = (dmin / dstep).to_integral_value(rounding=ROUND_UP)
-                dqty = (mult * dstep).quantize(dstep)
-            else:
-                dqty = dmin
-
-        if dmin_not and dentry and dentry > 0 and (dqty * dentry * dcs) < dmin_not:
-            need = dmin_not / (dentry * dcs)
-            if dstep and dstep > 0:
-                mult = (need / dstep).to_integral_value(rounding=ROUND_UP)
-                dqty = (mult * dstep).quantize(dstep)
-            else:
-                dqty = need
 
         if dqty <= 0:
             return (None, "qty_rounds_to_0")
+
+        # Enforce minQty without rounding up
+        if dmin and dqty < dmin:
+            return (None, "below_minQty_after_round_down")
+
+        # Enforce minNotional without rounding up
+        if dmin_not and dentry and dentry > 0:
+            notional = dqty * dentry * dcs
+            if notional < dmin_not:
+                return (None, "below_minNotional_after_round_down")
 
         return (float(dqty), None)
 
     except Exception as e:
         return (None, f"qty_round_fail:{type(e).__name__}")
+
+
 
 
 def _autotrade_ready() -> bool:
@@ -2133,7 +2139,10 @@ def _autotrade_effective_risk_usd(uid: int, setup, equity: float, base_risk_usd:
             regime = 'UNKNOWN'
 
         mult = float(pf_dynamic_risk_multiplier(conf, regime=regime, engine=engine) or 1.0)
-        target_risk = max(0.0, float(base_risk_usd) * mult)
+        # SAFETY: never scale risk ABOVE the user's /riskmode base.
+        mult = min(float(mult), 1.0)
+        target_risk = max(0.0, float(base_risk_usd) * float(mult))
+        target_risk = min(target_risk, float(base_risk_usd))
 
         if daily_cap_usd > 0:
             cap_left = max(0.0, float(daily_cap_usd) - max(0.0, float(open_risk_usd)))
@@ -2374,9 +2383,51 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
 
-    qty, qreason = _round_qty_up(sym, qty, entry)
+    qty, qreason = _round_qty_down(sym, qty, entry)
     if qty is None:
         return (False, f"qty_invalid:{qreason}")
+
+    # Final safety check: ensure TRUE $ risk after rounding never exceeds:
+    # - per-trade risk from /riskmode (base_per_trade_risk)
+    # - remaining daily risk capacity
+    # NOTE: rounding DOWN should already make this safe, but contractSize/minimums can still cause drift.
+    try:
+        _f = _bybit_get_instr_filters(sym)
+        _cs2 = float(_f.get('contractSize') or 1.0)
+        _actual_risk = abs(float(entry) - float(sl)) * float(qty) * _cs2
+        _cap = max(0.0, min(float(base_per_trade_risk), float(remaining_risk), max(0.0, float(daily_cap) - float(open_risk))))
+        # small tolerance for float noise
+        if _cap > 0 and _actual_risk > (_cap * 1.0005):
+            # scale down qty to meet cap and re-round down
+            _scale = _cap / _actual_risk
+            qty2 = float(qty) * float(_scale)
+            qty2, qreason2 = _round_qty_down(sym, qty2, entry)
+            if qty2 is None:
+                return (False, f"qty_capped_but_invalid:{qreason2}")
+            qty = qty2
+            _actual_risk2 = abs(float(entry) - float(sl)) * float(qty) * _cs2
+            if _actual_risk2 > (_cap * 1.0005):
+                return (False, "risk_cap_enforcement_failed")
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                    'risk_cap_usd': float(_cap),
+                    'risk_actual_usd': float(_actual_risk2),
+                    'qty_capped': True,
+                })
+            except Exception:
+                pass
+        else:
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                    'risk_cap_usd': float(_cap),
+                    'risk_actual_usd': float(_actual_risk),
+                    'qty_capped': False,
+                })
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     
     # store final qty after rounding (for /autotrade_debug)
     try:
@@ -3179,6 +3230,20 @@ def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
         per_lines = per_lines[:max_per]
 
     lines = []
+
+    def _fmt_num(val, fmt_spec=".2f", default="—"):
+        """Safe numeric formatter for reports (handles None/NaN/inf)."""
+        try:
+            if val is None:
+                return default
+            f = float(val)
+            if math.isnan(f):
+                return default
+            if math.isinf(f):
+                return "∞" if f > 0 else "-∞"
+            return format(f, fmt_spec)
+        except Exception:
+            return default
     lines.append("🧩 Last Scan Reject Reasons")
     if allow_set_unique:
         lines.append(f"Universe (leaders/losers/market leaders): {len(allow_set_unique)} symbols")
@@ -7057,20 +7122,11 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"Setups/day: {setups_day:.2f}")
     except Exception:
         pass
-    lines.append(f"Win rate: {rep.get('win_rate'):.1f}%")
-    lines.append(f"Avg R: {rep.get('avg_R'):.3f}")
-    pf = rep.get('profit_factor')
-    if pf == float('inf'):
-        pf_s = "∞"
-    else:
-        try:
-            pf_s = f"{float(pf):.2f}"
-        except Exception:
-            pf_s = str(pf)
-    lines.append(f"Profit factor: {pf_s}")
-    lines.append(f"Max DD (R): {rep.get('max_drawdown_R'):.2f}")
-    lines.append(f"Net (R): {rep.get('equity_R'):.2f}")
-
+    lines.append(f"Win rate: {_fmt_num(rep.get('win_rate'), '.1f')}%")
+    lines.append(f"Avg R: {_fmt_num(rep.get('avg_R'), '.3f')}")
+    lines.append(f"Profit factor: {_fmt_num(rep.get('profit_factor'), '.2f')}")
+    lines.append(f"Max DD (R): {_fmt_num(rep.get('max_drawdown_R'), '.2f')}")
+    lines.append(f"Net (R): {_fmt_num(rep.get('equity_R'), '.2f')}")
     try:
         lines.append(f"Avg hold: {float(rep.get('avg_hold_minutes',0.0) or 0.0):.1f} min")
     except Exception:
