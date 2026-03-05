@@ -1485,7 +1485,6 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     - In LIVE mode we read Bybit open positions (includes manual trades).
     - In PAPER mode we use bot journal open risk.
     """
-
     cap = 0.0
     used_risk = 0.0
     open_pnl = 0.0
@@ -10121,14 +10120,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # For admin (AutoTrade owner), sync with LIVE Bybit positions so /status matches /autotrade_debug.
     # For non-admin users, we use the bot journal open risk.
-    open_pnl_adj = 0.0
     if is_admin_user(int(uid)):
         m = _autotrade_day_risk_metrics(int(uid), float(equity))
         # Use cap computed from /dailycap with live equity
         if float(m.get("cap") or 0.0) > 0:
             cap = float(m["cap"])
         used_today = float(m.get("used_risk") or 0.0)
-        open_pnl_adj = float(m.get("open_pnl") or 0.0)
         remaining_today = float(m.get("remaining"))
         # Include realized PnL today too (more capacity if positive)
         if cap > 0 and remaining_today != float("inf"):
@@ -10182,8 +10179,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Plan: {plan}")
     lines.append(f"Equity: ${equity:.2f}")
     lines.append(f"PnL today: ${pnl_today:+.2f}")
-    if is_admin_user(int(uid)):
-        lines.append(f"Open PnL (adds to remaining): ${open_pnl_adj:+.2f}")
     lines.append(f"Trades today: {int(user.get('day_trade_count',0))}/{int(user.get('max_trades_day',0))}")
     lines.append(f"Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f} (used by /size)")
     lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
@@ -11475,7 +11470,6 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     mday = _autotrade_day_risk_metrics(int(owner), float(equity))
     daily_cap = float(mday.get("cap") or 0.0)
     used_today = float(mday.get("used_risk") or 0.0)   # TOTAL risk of open positions
-    open_pnl_adj = float(mday.get("open_pnl") or 0.0)  # unrealised PnL adjusts remaining capacity (live)
     pnl_today_closed = float(_pnl_today_closed_trades(owner, user) or 0.0)
 
     # Raw remaining capacity (can go negative). Display rule:
@@ -11534,7 +11528,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Capacity breakdown (kept in-sync with /status)
     lines.append(f"Daily risk used = open risk: ${used_today:.2f}")
-    lines.append(f"Unrealised PnL adj (open): ${open_pnl_adj:+.2f}")
+    lines.append(f"Unrealised PnL (open, ignored for risk): ${float(mday.get('open_pnl') or 0.0):+.2f}")
     lines.append(f"Realised PnL today (closed): ${pnl_today_closed:+.2f}")
 
     if math.isfinite(remaining_today):
@@ -11552,10 +11546,6 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             lines.append("⚠️ Would BLOCK: daily_risk_cap_reached")
         elif per_trade_risk > remaining_today:
             lines.append("⚠️ Would BLOCK: per_trade_risk_gt_remaining")
-        elif (open_risk + per_trade_risk) > daily_cap and (open_pnl_adj + pnl_today_closed) <= 0:
-            # conservative check if PnL doesn't offset risk
-            lines.append("⚠️ Would BLOCK: daily_risk_cap_reached")
-
     lines.append(SEP)
 
     # (Last decision section removed — keep output focused on readiness + last setup attempt)
