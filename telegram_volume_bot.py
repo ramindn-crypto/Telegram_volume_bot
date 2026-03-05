@@ -48,6 +48,21 @@ _LAST_SCAN_UNIVERSE = []
 #!/usr/bin/env python3
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
+
+CHANGELOG (2026-03-06)
+- Added StrategyConfig (parameterized strategy module) persisted to SQLite (strategy_config table):
+  - /params_show, /params_set (admin), /params_reset (admin)
+  - apply_strategy_config() updates all tunable globals from one config source
+- Upgraded setup quality scoring to use StrategyConfig-driven weights (no hard-coded weights).
+- Upgraded /backtest engine:
+  - session gating (ASIA/LON/NY via UTC inference)
+  - rejects breakdown (reason codes) + avg hold time + setups/day
+  - report now displays reject breakdown for faster tuning
+- Added /optimize (admin-only) and /optimize_report:
+  - bounded deterministic grid search across TF matrix and top-volume universe (≥$10M 24h volume)
+  - walk-forward (train/test split) and OOS-first objective with frequency targeting (3–5 setups/day)
+  - persists chosen TF + params into StrategyConfig and saves an optimization report
+
 """
 
 # =========================================================
@@ -852,6 +867,300 @@ EMA7_1H_MAX_DIST_PCT = 0.35  # % distance from EMA7(1H). Example: 0.35 = within 
 MOVER_VOL_USD_MIN = 5_000_000
 MOVER_UP_24H_MIN = 10.0
 MOVER_DN_24H_MAX = -10.0
+
+
+# =========================================================
+# STRATEGY CONFIG (PARAMETERIZED) — single source of truth
+# - All tunable thresholds/weights live here.
+# - Persisted to SQLite (strategy_config table).
+# - Used by live scanning, /backtest, and /optimize.
+# =========================================================
+
+STRATEGY_CONFIG_KEY_ACTIVE = "active"
+STRATEGY_CONFIG_KEY_OPT_REPORT = "opt_report"
+
+def _strategy_config_migrate():
+    """Ensure strategy_config table exists."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS strategy_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_ts REAL
+            )""")
+            conn.commit()
+    except Exception:
+        pass
+
+def _strategy_config_defaults() -> dict:
+    """Defaults are chosen to target ~3–5 setups/day across universe with robust quality."""
+    return {
+        # Universe / liquidity
+        "min_fut_vol_usd": float(MIN_FUT_VOL_USD),
+        "universe_top_n": int(120),
+
+        # Execution timeframes (matrix is used by /optimize; live uses exec_tf_default unless overridden)
+        "exec_tf_default": "15m",
+        "exec_tf_candidates": ["5m", "15m"],
+        "context_tf_1": "1h",
+        "context_tf_2": "4h",
+
+        # Quality floors (0..100)
+        "quality_score_min_screen": float(QUALITY_SCORE_MIN_SCREEN),
+        "quality_score_min_email": float(QUALITY_SCORE_MIN_EMAIL),
+
+        # Regime thresholds (used by backtest generator + some live scoring)
+        "regime_slope_trend_min_pct": 0.06,
+        "regime_atr_pct_min": 0.7,
+        "regime_atr_pct_max": 9.0,
+        "regime_unstable_atr_hi": 10.5,
+        "regime_unstable_atr_lo": 0.3,
+
+        # ATR / volatility floor (applies in make_setup too)
+        "atr_min_pct": float(ATR_MIN_PCT),
+        "atr_max_pct": float(ATR_MAX_PCT),
+
+        # Alignment floors (session-aware multipliers already exist)
+        "tf_align_enabled": bool(TF_ALIGN_ENABLED),
+        "tf_align_1h_min_abs": float(TF_ALIGN_1H_MIN_ABS),
+        "tf_align_4h_min_abs": float(TF_ALIGN_4H_MIN_ABS),
+
+        # RR floor
+        "min_rr_tp3": float(MIN_RR_TP3),
+
+        # Score weights (must sum ~1.0; scaled to 100 in compute_setup_quality_score)
+        "score_w_conf": 0.45,
+        "score_w_regime": 0.12,
+        "score_w_align": 0.10,
+        "score_w_rr": 0.10,
+        "score_w_vol": 0.08,
+        "score_w_atr": 0.06,
+        "score_w_ema_clean": 0.04,
+        "score_w_stop_sane": 0.04,
+        "score_w_sweep": 0.03,
+        "score_w_smf": 0.01,
+
+        # Frequency targeting (used in /optimize objective)
+        "target_setups_per_day_lo": 3.0,
+        "target_setups_per_day_hi": 5.0,
+
+        # Optimization bounds (safe ranges)
+        "opt_bounds": {
+            "quality_score_min_screen": [52.0, 70.0],
+            "regime_slope_trend_min_pct": [0.04, 0.10],
+            "tf_align_1h_min_abs": [0.3, 1.2],
+            "tf_align_4h_min_abs": [0.3, 1.2],
+            "atr_min_pct": [0.4, 1.5],
+            "min_rr_tp3": [1.3, 2.4],
+        },
+    }
+
+_STRATEGY_CFG_CACHE = {"ts": 0.0, "cfg": None}
+_STRATEGY_CFG_TTL = 15.0
+
+def load_strategy_config(force: bool = False) -> dict:
+    """Load StrategyConfig from SQLite; create defaults if missing."""
+    _strategy_config_migrate()
+    now = time.time()
+    if (not force) and _STRATEGY_CFG_CACHE.get("cfg") is not None and (now - float(_STRATEGY_CFG_CACHE.get("ts") or 0.0)) < _STRATEGY_CFG_TTL:
+        return dict(_STRATEGY_CFG_CACHE["cfg"])
+    cfg = None
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute("SELECT value FROM strategy_config WHERE key=?", (STRATEGY_CONFIG_KEY_ACTIVE,)).fetchone()
+            if row and row[0]:
+                cfg = json.loads(row[0])
+    except Exception:
+        cfg = None
+    if not isinstance(cfg, dict):
+        cfg = _strategy_config_defaults()
+        save_strategy_config(cfg)
+    _STRATEGY_CFG_CACHE["ts"] = now
+    _STRATEGY_CFG_CACHE["cfg"] = dict(cfg)
+    return dict(cfg)
+
+def save_strategy_config(cfg: dict) -> None:
+    """Persist StrategyConfig to SQLite."""
+    _strategy_config_migrate()
+    try:
+        payload = json.dumps(cfg, ensure_ascii=False, sort_keys=True)
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO strategy_config(key,value,updated_ts) VALUES(?,?,?)",
+                (STRATEGY_CONFIG_KEY_ACTIVE, payload, float(time.time()))
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def save_opt_report(report: dict) -> None:
+    _strategy_config_migrate()
+    try:
+        payload = json.dumps(report, ensure_ascii=False, sort_keys=True)
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO strategy_config(key,value,updated_ts) VALUES(?,?,?)",
+                (STRATEGY_CONFIG_KEY_OPT_REPORT, payload, float(time.time()))
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def load_opt_report() -> dict:
+    _strategy_config_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute("SELECT value FROM strategy_config WHERE key=?", (STRATEGY_CONFIG_KEY_OPT_REPORT,)).fetchone()
+            if row and row[0]:
+                obj = json.loads(row[0])
+                return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    try:
+        return max(float(lo), min(float(hi), float(v)))
+    except Exception:
+        return float(lo)
+
+def apply_strategy_config(cfg: dict) -> None:
+    """Apply StrategyConfig into global tunables used throughout the bot."""
+    global MIN_FUT_VOL_USD, EMAIL_MIN_FUT_VOL_USD, MIN_RR_TP3
+    global QUALITY_SCORE_MIN_SCREEN, QUALITY_SCORE_MIN_EMAIL
+    global TF_ALIGN_ENABLED, TF_ALIGN_1H_MIN_ABS, TF_ALIGN_4H_MIN_ABS
+    global ATR_MIN_PCT, ATR_MAX_PCT
+    global _QUALITY_W
+
+    if not isinstance(cfg, dict):
+        return
+
+    # Liquidity + RR
+    try:
+        MIN_FUT_VOL_USD = float(cfg.get("min_fut_vol_usd", MIN_FUT_VOL_USD))
+        EMAIL_MIN_FUT_VOL_USD = float(MIN_FUT_VOL_USD)
+    except Exception:
+        pass
+    try:
+        MIN_RR_TP3 = float(cfg.get("min_rr_tp3", MIN_RR_TP3))
+    except Exception:
+        pass
+
+    # Score floors
+    try:
+        QUALITY_SCORE_MIN_SCREEN = float(cfg.get("quality_score_min_screen", QUALITY_SCORE_MIN_SCREEN))
+    except Exception:
+        pass
+    try:
+        QUALITY_SCORE_MIN_EMAIL = float(cfg.get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL))
+    except Exception:
+        pass
+
+    # Alignment / ATR
+    try:
+        TF_ALIGN_ENABLED = bool(cfg.get("tf_align_enabled", TF_ALIGN_ENABLED))
+    except Exception:
+        pass
+    try:
+        TF_ALIGN_1H_MIN_ABS = float(cfg.get("tf_align_1h_min_abs", TF_ALIGN_1H_MIN_ABS))
+        TF_ALIGN_4H_MIN_ABS = float(cfg.get("tf_align_4h_min_abs", TF_ALIGN_4H_MIN_ABS))
+    except Exception:
+        pass
+    try:
+        ATR_MIN_PCT = float(cfg.get("atr_min_pct", ATR_MIN_PCT))
+        ATR_MAX_PCT = float(cfg.get("atr_max_pct", ATR_MAX_PCT))
+    except Exception:
+        pass
+
+    # Scoring weights (kept in one dict for compute_setup_quality_score)
+    _QUALITY_W = {
+        "conf": float(cfg.get("score_w_conf", 0.45)),
+        "regime": float(cfg.get("score_w_regime", 0.12)),
+        "align": float(cfg.get("score_w_align", 0.10)),
+        "rr": float(cfg.get("score_w_rr", 0.10)),
+        "vol": float(cfg.get("score_w_vol", 0.08)),
+        "atr": float(cfg.get("score_w_atr", 0.06)),
+        "ema_clean": float(cfg.get("score_w_ema_clean", 0.04)),
+        "stop_sane": float(cfg.get("score_w_stop_sane", 0.04)),
+        "sweep": float(cfg.get("score_w_sweep", 0.03)),
+        "smf": float(cfg.get("score_w_smf", 0.01)),
+    }
+
+# Initialize config on boot
+try:
+    apply_strategy_config(load_strategy_config(force=True))
+except Exception:
+    pass
+
+def _parse_param_value(s: str):
+    """Parse param values for /params_set. Supports bool/int/float/json/raw string."""
+    v = (s or "").strip()
+    if v.lower() in ("true","yes","on","1"): return True
+    if v.lower() in ("false","no","off","0"): return False
+    # Try numeric
+    try:
+        if re.fullmatch(r"[-+]?\d+", v):
+            return int(v)
+        if re.fullmatch(r"[-+]?\d*\.\d+", v):
+            return float(v)
+    except Exception:
+        pass
+    # Try JSON
+    try:
+        if (v.startswith("{") and v.endswith("}")) or (v.startswith("[") and v.endswith("]")):
+            return json.loads(v)
+    except Exception:
+        pass
+    return v
+
+async def cmd_params_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = load_strategy_config(force=True)
+    pretty = json.dumps(cfg, indent=2, ensure_ascii=False, sort_keys=True)
+    await send_long_message(update, f"⚙️ Strategy Params (active)\n{HDR}\n```\n{pretty}\n```", parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_params_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    cfg = _strategy_config_defaults()
+    save_strategy_config(cfg)
+    apply_strategy_config(cfg)
+    await update.message.reply_text("✅ Strategy params reset to defaults.")
+
+async def cmd_params_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /params_set <key> <value>\nExample: /params_set quality_score_min_screen 58")
+        return
+    key = str(args[0]).strip()
+    val_raw = " ".join(args[1:]).strip()
+    val = _parse_param_value(val_raw)
+    cfg = load_strategy_config(force=True)
+
+    # Support dot paths into nested dict (e.g. opt_bounds.quality_score_min_screen)
+    if "." in key:
+        parts = key.split(".")
+        cur = cfg
+        for p in parts[:-1]:
+            if p not in cur or not isinstance(cur[p], dict):
+                cur[p] = {}
+            cur = cur[p]
+        cur[parts[-1]] = val
+    else:
+        cfg[key] = val
+
+    save_strategy_config(cfg)
+    apply_strategy_config(cfg)
+    await update.message.reply_text(f"✅ Updated: {key} = {val_raw}")
+
 
 # =========================================================
 # ✅ ENGINES
@@ -6279,17 +6588,28 @@ def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[
         "rr3": rr3,
     }
 
+    # Weighted score (0..100) — weights come from StrategyConfig (see _QUALITY_W)
+    try:
+        w = dict(globals().get("_QUALITY_W") or {})
+    except Exception:
+        w = {}
+    def _w(name: str, default: float) -> float:
+        try:
+            return float(w.get(name, default))
+        except Exception:
+            return float(default)
+
     score = (
-        0.45 * _clamp01(conf / 100.0) * 100.0 +
-        0.12 * regime_score * 100.0 +
-        0.10 * align * 100.0 +
-        0.10 * rr_score * 100.0 +
-        0.08 * vol_score * 100.0 +
-        0.06 * atr_score * 100.0 +
-        0.04 * ema_clean * 100.0 +
-        0.04 * stop_sane * 100.0 +
-        0.03 * sweep_score * 100.0 +
-        0.01 * (smf_bonus * 100.0)
+        _w("conf", 0.45) * _clamp01(conf / 100.0) * 100.0 +
+        _w("regime", 0.12) * regime_score * 100.0 +
+        _w("align", 0.10) * align * 100.0 +
+        _w("rr", 0.10) * rr_score * 100.0 +
+        _w("vol", 0.08) * vol_score * 100.0 +
+        _w("atr", 0.06) * atr_score * 100.0 +
+        _w("ema_clean", 0.04) * ema_clean * 100.0 +
+        _w("stop_sane", 0.04) * stop_sane * 100.0 +
+        _w("sweep", 0.03) * sweep_score * 100.0 +
+        _w("smf", 0.01) * (smf_bonus * 100.0)
     )
 
     # If TP is invalid, cap the score hard (still allows diagnostics/backtest)
@@ -6369,6 +6689,30 @@ def _candle_strength(o: float, h: float, l: float, c: float, side: str) -> float
     except Exception:
         return 0.5
 
+
+def _session_label_from_ts(ts_sec: float) -> str:
+    """Infer session from UTC hour. Ranges are approximate and intentionally simple."""
+    try:
+        dt = datetime.fromtimestamp(float(ts_sec), tz=timezone.utc)
+        h = int(dt.hour)
+    except Exception:
+        return "NY"
+    # ASIA ~ 00:00-08:00 UTC, LON ~ 08:00-16:00, NY ~ 16:00-24:00
+    if 0 <= h < 8:
+        return "ASIA"
+    if 8 <= h < 16:
+        return "LON"
+    return "NY"
+
+def _ts_in_session(ts_sec: float, session_name: str) -> bool:
+    s = (session_name or "").strip().upper()
+    if s not in {"ASIA","LON","NY"}:
+        return True
+    return _session_label_from_ts(ts_sec) == s
+
+from collections import Counter as _CounterBT
+_BT_LAST_REJECTS = _CounterBT()
+
 def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: str = "NY") -> list:
     """Generate setups from historical bars using the same *architecture* (A-E).
     Returns list of Setup-like dicts.
@@ -6386,11 +6730,36 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
     ema21 = _ema_series(closes, 21)
     atr   = _atr_series(ohlcv, 14)
 
+    global _BT_LAST_REJECTS
+    _BT_LAST_REJECTS = Counter()
+
     setups = []
     warm = 80
 
+    # Pull regime thresholds from StrategyConfig (single source of truth)
+    cfg = load_strategy_config(force=False)
+    slope_thr = float(cfg.get("regime_slope_trend_min_pct", 0.06))
+    atr_lo = float(cfg.get("regime_atr_pct_min", 0.7))
+    atr_hi = float(cfg.get("regime_atr_pct_max", 9.0))
+    unstable_hi = float(cfg.get("regime_unstable_atr_hi", 10.5))
+    unstable_lo = float(cfg.get("regime_unstable_atr_lo", 0.3))
+
+
     for i in range(warm, len(ohlcv) - 2):
         px = closes[i]
+
+        # Session gating (optional)
+        try:
+            ts_raw = float(ohlcv[i][0] or 0.0)
+            ts_sec = (ts_raw / 1000.0) if ts_raw > 1e12 else ts_raw
+        except Exception:
+            ts_sec = 0.0
+        if session_name and (not _ts_in_session(ts_sec, session_name)):
+            try:
+                _BT_LAST_REJECTS["out_of_session"] += 1
+            except Exception:
+                pass
+            continue
         if px <= 0:
             continue
 
@@ -6399,12 +6768,16 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
         atr_pct = (atr[i] / px * 100.0) if atr and atr[i] else 0.0
 
         regime = "RANGING"
-        if abs(slope) >= 0.06 and 0.7 <= atr_pct <= 9.0:
+        if abs(slope) >= slope_thr and atr_lo <= atr_pct <= atr_hi:
             regime = "TRENDING"
-        if atr_pct >= 10.5 or atr_pct <= 0.3:
+        if atr_pct >= unstable_hi or atr_pct <= unstable_lo:
             regime = "UNSTABLE"
 
         if regime == "UNSTABLE":
+            try:
+                _BT_LAST_REJECTS["regime_unstable"] += 1
+            except Exception:
+                pass
             continue  # hard gate
 
         # --- B) Trend/Bias ---
@@ -6506,6 +6879,10 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
         )
         setattr(s, "atr_pct", float(atr_pct))
         setattr(s, "regime", regime)
+        try:
+            setattr(s, "session", _session_label_from_ts(getattr(s, "created_ts", 0.0)))
+        except Exception:
+            pass
         setattr(s, "trend", "BULLISH" if side == "BUY" else "BEARISH")
         setattr(s, "structure", getattr(s, "trend"))
         score, _ = compute_setup_quality_score(s, session_name=session_name)
@@ -6514,6 +6891,11 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
         # E) Score threshold
         if float(score) >= float(QUALITY_SCORE_MIN_SCREEN):
             setups.append(s)
+        else:
+            try:
+                _BT_LAST_REJECTS["score_below_min"] += 1
+            except Exception:
+                pass
 
     return setups
 
@@ -6615,11 +6997,16 @@ def run_backtest(symbol: str, days: int = 30, tf: str = "1h", session_name: str 
         "tf": tf,
         "days": d,
         "setups": total,
+        "trades": total,
+        "conversion_rate": (total / total) if total else 0.0,
         "win_rate": win_rate,
         "avg_R": avg_r,
         "profit_factor": pf,
         "max_drawdown_R": float(max_dd),
         "equity_R": float(eq),
+        "avg_hold_bars": float(sum(float(r.get("bars",0) or 0) for r in results)/total) if total else 0.0,
+        "avg_hold_minutes": float(sum(float(r.get("bars",0) or 0) for r in results)/total) * float(tf_min) if total else 0.0,
+        "reject_breakdown": dict(_BT_LAST_REJECTS) if isinstance(globals().get("_BT_LAST_REJECTS"), Counter) else {},
         "sample": results[:12],
     }
 
@@ -6664,6 +7051,12 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"TF: {rep.get('tf')} | Days: {rep.get('days')} | Session: {session_name}")
     lines.append(SEP)
     lines.append(f"Setups: {rep.get('setups')}")
+    try:
+        lines.append(f"Trades (simulated): {rep.get('trades', rep.get('setups'))}")
+        setups_day = (float(rep.get('setups',0) or 0) / float(rep.get('days',1) or 1))
+        lines.append(f"Setups/day: {setups_day:.2f}")
+    except Exception:
+        pass
     lines.append(f"Win rate: {rep.get('win_rate'):.1f}%")
     lines.append(f"Avg R: {rep.get('avg_R'):.3f}")
     pf = rep.get('profit_factor')
@@ -6678,6 +7071,22 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Max DD (R): {rep.get('max_drawdown_R'):.2f}")
     lines.append(f"Net (R): {rep.get('equity_R'):.2f}")
 
+    try:
+        lines.append(f"Avg hold: {float(rep.get('avg_hold_minutes',0.0) or 0.0):.1f} min")
+    except Exception:
+        pass
+
+    try:
+        rb = rep.get("reject_breakdown") or {}
+        if isinstance(rb, dict) and rb:
+            lines.append(SEP)
+            lines.append("Reject breakdown (top):")
+            items = sorted(rb.items(), key=lambda kv: int(kv[1]), reverse=True)[:12]
+            for k,v in items:
+                lines.append(f"• {k}: {v}")
+    except Exception:
+        pass
+
     # Sample outcomes
     try:
         samp = rep.get("sample") or []
@@ -6690,6 +7099,324 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+
+# =========================================================
+# OPTIMIZATION (ADMIN) — bounded, deterministic, walk-forward
+# =========================================================
+
+def _build_universe_for_opt(cfg: dict) -> list[str]:
+    """Return list of market symbols (ccxt) for Bybit USDT perps meeting min volume."""
+    try:
+        best = fetch_futures_tickers()
+    except Exception:
+        best = {}
+    min_vol = float(cfg.get("min_fut_vol_usd", MIN_FUT_VOL_USD))
+    top_n = int(cfg.get("universe_top_n", 120))
+    # Filter + sort by notional
+    items = []
+    for base, mv in (best or {}).items():
+        try:
+            if usd_notional(mv) < min_vol:
+                continue
+            # Exclude obvious illiquid/new listings by missing VWAP/price
+            if float(mv.last or 0.0) <= 0:
+                continue
+            items.append((base, mv))
+        except Exception:
+            continue
+    items.sort(key=lambda kv: usd_notional(kv[1]), reverse=True)
+    items = items[:max(50, min(150, top_n))]
+    out = []
+    for base, mv in items:
+        out.append(str(mv.symbol))
+    return out
+
+def _walk_forward_split(ohlcv: list, train_frac: float = 0.7) -> tuple[list, list]:
+    if not ohlcv:
+        return [], []
+    n = len(ohlcv)
+    cut = max(100, int(n * float(train_frac)))
+    cut = min(n-50, cut) if n > 200 else cut
+    return ohlcv[:cut], ohlcv[cut:]
+
+def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session_name: str) -> dict:
+    """Same as run_backtest but uses already-fetched ohlcv."""
+    tf_min = _tf_to_minutes(tf)
+    if not ohlcv or len(ohlcv) < 300:
+        return {"ok": False, "error": "insufficient_ohlcv", "symbol": symbol, "tf": tf, "days": days}
+    setups = _backtest_generate_setups(symbol, ohlcv, tf, session_name=session_name)
+    if not setups:
+        return {"ok": True, "symbol": symbol, "tf": tf, "days": days, "setups": 0, "trades": 0, "avg_R": 0.0, "profit_factor": 0.0, "max_drawdown_R": 0.0, "equity_R": 0.0, "reject_breakdown": dict(_BT_LAST_REJECTS)}
+    results = []
+    eq = 0.0; peak = 0.0; max_dd = 0.0
+    for s in setups:
+        try:
+            sid = str(getattr(s, "setup_id", "BT-0"))
+            i = int(sid.split("-")[-1])
+        except Exception:
+            i = 0
+        res = _simulate_one_setup(ohlcv, i + 1, s)
+        res["R"] = float(res.get("R", 0.0) or 0.0)
+        results.append(res)
+        eq += res["R"]
+        peak = max(peak, eq)
+        max_dd = max(max_dd, peak - eq)
+
+    total = len(results)
+    wins = [r for r in results if str(r.get("outcome")) == "TP3"]
+    win_rate = (len(wins)/total*100.0) if total else 0.0
+    avg_r = (sum(r["R"] for r in results)/total) if total else 0.0
+    gross_win = sum(max(0.0, r["R"]) for r in results)
+    gross_loss = sum(min(0.0, r["R"]) for r in results)
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float("inf") if gross_win > 0 else 0.0)
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "tf": tf,
+        "days": days,
+        "setups": total,
+        "trades": total,
+        "win_rate": win_rate,
+        "avg_R": float(avg_r),
+        "profit_factor": pf,
+        "max_drawdown_R": float(max_dd),
+        "equity_R": float(eq),
+        "reject_breakdown": dict(_BT_LAST_REJECTS),
+    }
+
+def _objective(oos: list[dict], days: int, cfg: dict) -> float:
+    """Robust objective: expectancy + PF, penalize drawdown and off-target frequency."""
+    if not oos:
+        return -1e9
+    # Aggregate
+    total_setups = sum(int(r.get("setups", 0) or 0) for r in oos)
+    total_days = max(1.0, float(days))
+    setups_day = total_setups / total_days
+
+    avg_r = 0.0
+    pf = 0.0
+    dd = 0.0
+    n = 0
+    for r in oos:
+        if not r.get("ok"):
+            continue
+        n += 1
+        avg_r += float(r.get("avg_R", 0.0) or 0.0)
+        pf_i = r.get("profit_factor")
+        pf += (10.0 if pf_i == float("inf") else float(pf_i or 0.0))
+        dd += float(r.get("max_drawdown_R", 0.0) or 0.0)
+    if n <= 0:
+        return -1e9
+    avg_r /= n
+    pf /= n
+    dd /= n
+
+    lo = float(cfg.get("target_setups_per_day_lo", 3.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 5.0))
+    freq_pen = 0.0
+    if setups_day < lo:
+        freq_pen = (lo - setups_day) * 2.0
+    elif setups_day > hi:
+        freq_pen = (setups_day - hi) * 2.0
+
+    # Overconcentration penalty: discourage all performance from a single symbol
+    sym_counts = sorted([int(r.get("setups",0) or 0) for r in oos], reverse=True)
+    conc_pen = 0.0
+    if sym_counts and total_setups > 0:
+        top_share = sym_counts[0] / total_setups
+        if top_share > 0.25:
+            conc_pen = (top_share - 0.25) * 10.0
+
+    # Score
+    score = (avg_r * 8.0) + (pf * 1.2) - (dd * 0.8) - freq_pen - conc_pen
+    return float(score)
+
+def _generate_candidates(cfg: dict) -> list[dict]:
+    bounds = cfg.get("opt_bounds") or {}
+    def _rng(key, default_lo, default_hi):
+        try:
+            lo, hi = bounds.get(key, [default_lo, default_hi])
+            return float(lo), float(hi)
+        except Exception:
+            return float(default_lo), float(default_hi)
+
+    # Deterministic small grid (safe runtime)
+    qlo, qhi = _rng("quality_score_min_screen", 52, 70)
+    slo, shi = _rng("regime_slope_trend_min_pct", 0.04, 0.10)
+    a1lo, a1hi = _rng("tf_align_1h_min_abs", 0.3, 1.2)
+    a4lo, a4hi = _rng("tf_align_4h_min_abs", 0.3, 1.2)
+    atrlo, atrhi = _rng("atr_min_pct", 0.4, 1.5)
+    rrlo, rrhi = _rng("min_rr_tp3", 1.3, 2.4)
+
+    q_grid = [qlo, (qlo+qhi)/2.0, qhi]
+    s_grid = [slo, (slo+shi)/2.0, shi]
+    a_grid = [a1lo, (a1lo+a1hi)/2.0, a1hi]
+    atr_grid = [atrlo, (atrlo+atrhi)/2.0, atrhi]
+    rr_grid = [rrlo, (rrlo+rrhi)/2.0, rrhi]
+
+    cands = []
+    for q in q_grid:
+        for s in s_grid:
+            for a in a_grid:
+                for atrm in atr_grid:
+                    for rr in rr_grid:
+                        c = {
+                            "quality_score_min_screen": float(_clamp(q, qlo, qhi)),
+                            "quality_score_min_email": float(_clamp(q+6.0, qlo+2.0, qhi+10.0)),
+                            "regime_slope_trend_min_pct": float(_clamp(s, slo, shi)),
+                            "tf_align_1h_min_abs": float(_clamp(a, a1lo, a1hi)),
+                            "tf_align_4h_min_abs": float(_clamp(a, a4lo, a4hi)),
+                            "atr_min_pct": float(_clamp(atrm, atrlo, atrhi)),
+                            "min_rr_tp3": float(_clamp(rr, rrlo, rrhi)),
+                        }
+                        cands.append(c)
+    # Keep bounded
+    return cands[:180]
+
+async def cmd_optimize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    args = context.args or []
+    days = 60
+    session_name = "NY"
+    try:
+        if len(args) >= 1:
+            days = _parse_days(str(args[0]))
+        if len(args) >= 2:
+            session_name = str(args[1]).upper()
+    except Exception:
+        days = 60
+        session_name = "NY"
+
+    base_cfg = load_strategy_config(force=True)
+    tf_matrix = [
+        ("5m", ["1h", "4h"]),
+        ("15m", ["1h", "4h"]),
+    ]
+    # Optional 30m matrix (runtime-dependent)
+    tf_matrix.append(("30m", ["4h"]))
+
+    await update.message.reply_text("🧪 /optimize started (admin). This is CPU-heavy and runs bounded search…")
+
+    def _do_optimize():
+        best_score = -1e18
+        best = None
+        best_report = {}
+        # Universe
+        universe = _build_universe_for_opt(base_cfg)
+        # Sample for runtime (still deterministic): top 60 by volume
+        universe = universe[:60]
+        cands = _generate_candidates(base_cfg)
+
+        for exec_tf, _ctx in tf_matrix:
+            # Fetch ohlcv once per symbol + tf
+            ohlcv_map = {}
+            for sym in universe:
+                try:
+                    tf_min = _tf_to_minutes(exec_tf)
+                    bars = int((days * 1440) / max(1, tf_min)) + 300
+                    bars = int(min(12000, max(800, bars)))
+                    ohlcv_map[sym] = fetch_ohlcv(sym, exec_tf, limit=bars)
+                except Exception:
+                    ohlcv_map[sym] = []
+
+            for cand in cands:
+                cfg = dict(base_cfg)
+                cfg.update(cand)
+                # Apply candidate into globals (so generator/scoring uses it)
+                apply_strategy_config(cfg)
+
+                # Walk-forward evaluate OOS on last 30% of candles per symbol
+                oos_results = []
+                for sym in universe:
+                    ohl = ohlcv_map.get(sym) or []
+                    train, test = _walk_forward_split(ohl, 0.7)
+                    # Use test only for objective (OOS primary)
+                    rep = _run_backtest_on_ohlcv(sym, test, days=max(7, int(days*0.3)), tf=exec_tf, session_name=session_name)
+                    oos_results.append(rep)
+
+                sc = _objective(oos_results, days=max(7, int(days*0.3)), cfg=cfg)
+                if sc > best_score:
+                    best_score = sc
+                    best = {"exec_tf_default": exec_tf, **cand}
+                    # Summaries
+                    total_setups = sum(int(r.get("setups",0) or 0) for r in oos_results if r.get("ok"))
+                    setups_day = total_setups / max(1.0, float(max(7, int(days*0.3))))
+                    avg_r = sum(float(r.get("avg_R",0.0) or 0.0) for r in oos_results if r.get("ok")) / max(1, sum(1 for r in oos_results if r.get("ok")))
+                    pf = sum((10.0 if r.get("profit_factor")==float("inf") else float(r.get("profit_factor") or 0.0)) for r in oos_results if r.get("ok")) / max(1, sum(1 for r in oos_results if r.get("ok")))
+                    dd = sum(float(r.get("max_drawdown_R",0.0) or 0.0) for r in oos_results if r.get("ok")) / max(1, sum(1 for r in oos_results if r.get("ok")))
+
+                    best_report = {
+                        "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "session": session_name,
+                        "days_requested": int(days),
+                        "universe_used": len(universe),
+                        "best_objective": float(best_score),
+                        "chosen_exec_tf": exec_tf,
+                        "params": dict(best),
+                        "oos_summary": {
+                            "setups": int(total_setups),
+                            "setups_per_day": float(setups_day),
+                            "avg_R": float(avg_r),
+                            "profit_factor": float(pf),
+                            "max_drawdown_R": float(dd),
+                        },
+                        "notes": "Objective uses OOS split (last 30% candles), penalizes off-target frequency & overconcentration.",
+                    }
+
+        # Restore and persist best config
+        if best:
+            final_cfg = dict(base_cfg)
+            final_cfg.update(best)
+            save_strategy_config(final_cfg)
+            apply_strategy_config(final_cfg)
+            save_opt_report(best_report)
+
+        return best_report
+
+    report = await to_thread_heavy(_do_optimize)
+    if not report:
+        await update.message.reply_text("❌ Optimize failed (no report).")
+        return
+
+    # Human report
+    p = report.get("params") or {}
+    oos = report.get("oos_summary") or {}
+    lines = [
+        "✅ Optimize complete",
+        HDR,
+        f"Chosen exec TF: {report.get('chosen_exec_tf')}",
+        f"Session: {report.get('session')} | Universe: {report.get('universe_used')} symbols",
+        SEP,
+        f"OOS setups/day: {float(oos.get('setups_per_day',0.0)):.2f} (target {base_cfg.get('target_setups_per_day_lo',3)}–{base_cfg.get('target_setups_per_day_hi',5)})",
+        f"OOS Avg R: {float(oos.get('avg_R',0.0)):.3f} | PF: {float(oos.get('profit_factor',0.0)):.2f} | MaxDD(R): {float(oos.get('max_drawdown_R',0.0)):.2f}",
+        SEP,
+        "Chosen params (key subset):",
+        f"quality_score_min_screen={p.get('quality_score_min_screen')} | min_rr_tp3={p.get('min_rr_tp3')}",
+        f"tf_align_1h_min_abs={p.get('tf_align_1h_min_abs')} | tf_align_4h_min_abs={p.get('tf_align_4h_min_abs')}",
+        f"regime_slope_trend_min_pct={p.get('regime_slope_trend_min_pct')} | atr_min_pct={p.get('atr_min_pct')}",
+        SEP,
+        "Saved to StrategyConfig. Use /optimize_report and /params_show.",
+    ]
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+async def cmd_optimize_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    rep = load_opt_report()
+    if not rep:
+        await update.message.reply_text("No optimize report saved yet. Run /optimize first.")
+        return
+    pretty = json.dumps(rep, indent=2, ensure_ascii=False, sort_keys=True)
+    await send_long_message(update, f"🧪 Optimize Report (last)\n{HDR}\n```\n{pretty}\n```", parse_mode=ParseMode.MARKDOWN)
+
+
+
 
 
 
@@ -9070,6 +9797,31 @@ Optional SESSION: NY | LON | ASIA (default NY)
 Notes:
 - Uses the same institutional scoring model as live selection.
 - Simulation is TP3 vs SL (conservative if both hit same candle).
+
+
+
+📌 STRATEGY PARAMS (Admin)
+────────────
+/params_show
+• Show active StrategyConfig (single source of truth).
+
+/params_set <key> <value>
+• Update one parameter (admin-only).
+  Example: /params_set quality_score_min_screen 58
+
+/params_reset
+• Reset StrategyConfig to defaults (admin-only).
+
+🧪 OPTIMIZATION (Admin)
+────────────
+/optimize [DAYS] [SESSION]
+• Runs bounded walk-forward backtest search across:
+  - Universe: Bybit USDT perps filtered by 24h quote volume ≥ $10M
+  - TF matrix: 5m+1H/4H, 15m+1H/4H, optional 30m+4H
+• Saves best params + chosen TF into StrategyConfig.
+
+/optimize_report
+• Show last optimization decision + OOS metrics.
 
 """\
 
@@ -16204,7 +16956,15 @@ def main():
     app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report_overal", autotrade_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("ai_strategy_report", ai_strategy_report_cmd, block=False))
-    # Catch-all for unknown /commands (MUST be after all CommandHandlers)
+    
+    # Strategy parameterization + optimization (admin)
+    app.add_handler(CommandHandler("params_show", cmd_params_show, block=False))
+    app.add_handler(CommandHandler("params_set", cmd_params_set, block=False))
+    app.add_handler(CommandHandler("params_reset", cmd_params_reset, block=False))
+    app.add_handler(CommandHandler("optimize", cmd_optimize, block=False))
+    app.add_handler(CommandHandler("optimize_report", cmd_optimize_report, block=False))
+
+# Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
     if app.job_queue:
