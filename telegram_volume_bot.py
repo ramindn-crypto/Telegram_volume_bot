@@ -6135,58 +6135,620 @@ def rr_to_tp(entry: float, sl: float, tp: float) -> float:
     return d_tp / d_sl
 
 
-def is_top_setup_eligible(s: "Setup") -> tuple[bool, str]:
-    """
-    Shared eligibility gate for:
-      - /screen -> Top Trade Setups
-      - Emails  -> Market Scan alerts
 
-    Defaults (env-overridable):
-      MIN_SETUP_CONF >= 75
-      MIN_FUT_VOL_USD >= 10,000,000
-      MIN_RR_TP3 >= 1.8
-      Valid TP ladder (TP1/TP2/TP3 present and RR1/RR2/RR3 positive)
+# =========================================================
+# INSTITUTIONAL-STYLE SETUP QUALITY (SCORING + LIGHT GATES)
+# - Replaces "many stacked hard filters" with: few mandatory gates + quality score.
+# - Used by both /screen and email selection, and by backtests.
+# =========================================================
+
+QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "58"))
+QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "64"))
+
+# Soft throttling: how many candidates we score before slicing (keeps compute bounded)
+QUALITY_SCORE_CAND_MULT_SCREEN = int(os.environ.get("QUALITY_SCORE_CAND_MULT_SCREEN", "8"))
+QUALITY_SCORE_CAND_MULT_EMAIL  = int(os.environ.get("QUALITY_SCORE_CAND_MULT_EMAIL",  "10"))
+
+def _clamp01(x: float) -> float:
+    try:
+        return max(0.0, min(1.0, float(x)))
+    except Exception:
+        return 0.0
+
+def _log_norm(x: float, lo: float, hi: float) -> float:
+    """Log-normalize x into [0,1] between lo..hi (robust for volume)."""
+    try:
+        x = float(x or 0.0)
+        lo = float(lo); hi = float(hi)
+        if x <= lo:
+            return 0.0
+        if x >= hi:
+            return 1.0
+        return _clamp01((math.log(x) - math.log(lo)) / (math.log(hi) - math.log(lo)))
+    except Exception:
+        return 0.0
+
+def _mid_pref(x: float, lo: float, hi: float, mid: float | None = None) -> float:
+    """Prefer a mid-range (e.g. ATR% not too low/high). Returns [0,1]."""
+    try:
+        x = float(x or 0.0)
+        lo = float(lo); hi = float(hi)
+        if mid is None:
+            mid = (lo + hi) / 2.0
+        mid = float(mid)
+        if x <= lo or x >= hi:
+            return 0.0
+        # triangular preference peaking at mid
+        if x <= mid:
+            return _clamp01((x - lo) / (mid - lo)) if mid > lo else 0.0
+        return _clamp01((hi - x) / (hi - mid)) if hi > mid else 0.0
+    except Exception:
+        return 0.0
+
+def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[float, dict]:
+    """Return (score, components). Score is 0..100.
+
+    NOTE: This is intentionally lightweight and deterministic.
+    """
+    # Base fields
+    conf = float(getattr(s, "conf", 0) or 0)
+    fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+    entry = float(getattr(s, "entry", 0.0) or 0.0)
+    sl = float(getattr(s, "sl", 0.0) or 0.0)
+    tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+
+    rr3 = 0.0
+    try:
+        rr3 = float(rr_to_tp(entry, sl, tp3))
+    except Exception:
+        rr3 = 0.0
+
+    # --- Component A: Market regime (lightweight, mandatory-ish) ---
+    regime = str(getattr(s, "regime", "") or "").upper()
+    # Trending regimes score higher; unstable is penalized; ranging is allowed but lower score.
+    regime_score = 0.55
+    if "TREND" in regime:
+        regime_score = 1.0
+    elif "RANG" in regime:
+        regime_score = 0.55
+    elif "VOL" in regime or "UNST" in regime:
+        regime_score = 0.20
+
+    # --- Component B: Trend/structure bias (simple alignment) ---
+    trend = str(getattr(s, "trend", "") or "").upper()
+    structure = str(getattr(s, "structure", "") or "").upper()
+    side = str(getattr(s, "side", "") or "").upper()
+    align = 0.5
+    want = "BULLISH" if side == "BUY" else "BEARISH" if side == "SELL" else ""
+    if want:
+        if want in trend:
+            align += 0.25
+        if want in structure:
+            align += 0.25
+    align = _clamp01(align)
+
+    # --- Component C: Entry trigger cleanliness (proxy: EMA distance + stop distance sanity) ---
+    ema_dist = float(getattr(s, "pullback_ema_dist_pct", 0.0) or 0.0)
+    # Prefer pullbacks not too far from EMA (but don't hard-gate)
+    ema_clean = 1.0 - _clamp01(ema_dist / 2.0)  # 0%..2% maps to 1..0
+
+    # Stop distance should not be absurdly tight or huge vs ATR (if atr_pct available)
+    atr_pct = float(getattr(s, "atr_pct", 0.0) or 0.0)
+    stop_pct = 0.0
+    try:
+        stop_pct = abs(entry - sl) / entry * 100.0 if entry > 0 else 0.0
+    except Exception:
+        stop_pct = 0.0
+    # Prefer stop roughly within [0.3%..3.5%] (crypto perps, 15m/1h)
+    stop_sane = _mid_pref(stop_pct, 0.25, 4.5, mid=1.4)
+
+    # --- Component D: Risk & trade construction (RR + TP validity) ---
+    rr_score = _clamp01(rr3 / 2.2)  # RR 2.2 ~ full
+    tp_valid = 1.0 if (entry > 0 and sl > 0 and tp3 > 0 and rr3 > 0.2) else 0.0
+
+    # --- Component E: Quality scoring inputs ---
+    vol_score = _log_norm(fut_vol, lo=float(MIN_FUT_VOL_USD or 10_000_000), hi=120_000_000.0)
+    atr_score = _mid_pref(atr_pct if atr_pct > 0 else stop_pct, 0.7, 9.0, mid=2.5)
+
+    sweep = str(getattr(s, "sweep", "") or "").upper()
+    sweep_score = 0.0 if sweep in ("", "NONE") else 0.7
+
+    smf_event = str(getattr(s, "smf_event", "") or "").upper()
+    smf_score_i = int(getattr(s, "smf_score", 0) or 0)
+    smf_bonus = 0.0
+    if side == "BUY" and smf_event in ("BUY_IGNITION", "LIQUIDATION_BUY"):
+        smf_bonus = 0.6 + 0.1 * min(3, max(0, smf_score_i))
+    if side == "SELL" and smf_event in ("SELL_IGNITION", "LIQUIDATION_SELL"):
+        smf_bonus = 0.6 + 0.1 * min(3, max(0, smf_score_i))
+    if (side == "BUY" and smf_event in ("SELL_IGNITION", "LIQUIDATION_SELL")) or (side == "SELL" and smf_event in ("BUY_IGNITION", "LIQUIDATION_BUY")):
+        smf_bonus -= 0.5  # soft penalty only (never a hard block)
+
+    # Weighting (total ~100)
+    components = {
+        "conf": conf,  # already 0..100-ish
+        "regime": regime_score,
+        "align": align,
+        "rr": rr_score,
+        "vol": vol_score,
+        "atr": atr_score,
+        "ema_clean": ema_clean,
+        "stop_sane": stop_sane,
+        "tp_valid": tp_valid,
+        "sweep": sweep_score,
+        "smf": smf_bonus,
+        "rr3": rr3,
+    }
+
+    score = (
+        0.45 * _clamp01(conf / 100.0) * 100.0 +
+        0.12 * regime_score * 100.0 +
+        0.10 * align * 100.0 +
+        0.10 * rr_score * 100.0 +
+        0.08 * vol_score * 100.0 +
+        0.06 * atr_score * 100.0 +
+        0.04 * ema_clean * 100.0 +
+        0.04 * stop_sane * 100.0 +
+        0.03 * sweep_score * 100.0 +
+        0.01 * (smf_bonus * 100.0)
+    )
+
+    # If TP is invalid, cap the score hard (still allows diagnostics/backtest)
+    if tp_valid <= 0:
+        score = min(score, 35.0)
+
+    # Session slight tuning (NY a bit looser)
+    sname = str(session_name or "").upper()
+    if sname == "NY":
+        score += 2.0
+    elif sname == "ASIA":
+        score -= 1.0
+
+    return float(clamp(score, 0.0, 100.0)), components
+
+# =========================================================
+# BACKTESTING (ADMIN) — lightweight, deterministic, no ML
+# =========================================================
+
+def _parse_days(s: str) -> int:
+    try:
+        s = str(s).strip().lower().replace("d", "")
+        return max(1, min(365, int(float(s))))
+    except Exception:
+        return 30
+
+def _tf_to_minutes(tf: str) -> int:
+    t = str(tf or "").strip().lower()
+    if t.endswith("m"):
+        return int(float(t[:-1] or 0))
+    if t.endswith("h"):
+        return int(float(t[:-1] or 0)) * 60
+    if t.endswith("d"):
+        return int(float(t[:-1] or 0)) * 1440
+    # common aliases
+    if t in ("15", "15min"):
+        return 15
+    if t in ("60", "1hour", "1hr"):
+        return 60
+    return 60
+
+def _ema_series(closes: list[float], period: int) -> list[float]:
+    if not closes:
+        return []
+    k = 2.0 / (period + 1.0)
+    ema = float(closes[0])
+    out = [ema]
+    for v in closes[1:]:
+        ema = (float(v) * k) + (ema * (1.0 - k))
+        out.append(float(ema))
+    return out
+
+def _atr_series(ohlcv: list, period: int = 14) -> list[float]:
+    # ohlcv: [ts, o, h, l, c, v]
+    if not ohlcv or len(ohlcv) < period + 2:
+        return []
+    trs = []
+    prev_close = float(ohlcv[0][4])
+    for i in range(1, len(ohlcv)):
+        h = float(ohlcv[i][2]); l = float(ohlcv[i][3]); c = float(ohlcv[i][4])
+        tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        trs.append(tr)
+        prev_close = c
+    # simple rolling ATR (Wilder-ish smoothing would be better; this is fast & ok)
+    out = [0.0] * len(ohlcv)
+    for i in range(period, len(trs)):
+        out[i+1] = float(sum(trs[i-period+1:i+1]) / period)
+    return out
+
+def _candle_strength(o: float, h: float, l: float, c: float, side: str) -> float:
+    # 0..1 where 1 = strong close in direction
+    try:
+        rng = max(1e-12, float(h) - float(l))
+        if str(side).upper() == "BUY":
+            return _clamp01((float(c) - float(l)) / rng)
+        return _clamp01((float(h) - float(c)) / rng)
+    except Exception:
+        return 0.5
+
+def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: str = "NY") -> list:
+    """Generate setups from historical bars using the same *architecture* (A-E).
+    Returns list of Setup-like dicts.
+    """
+    if not ohlcv or len(ohlcv) < 250:
+        return []
+
+    closes = [float(x[4]) for x in ohlcv]
+    highs  = [float(x[2]) for x in ohlcv]
+    lows   = [float(x[3]) for x in ohlcv]
+    opens  = [float(x[1]) for x in ohlcv]
+    vols   = [float(x[5] or 0.0) for x in ohlcv]
+
+    ema13 = _ema_series(closes, 13)
+    ema21 = _ema_series(closes, 21)
+    atr   = _atr_series(ohlcv, 14)
+
+    setups = []
+    warm = 80
+
+    for i in range(warm, len(ohlcv) - 2):
+        px = closes[i]
+        if px <= 0:
+            continue
+
+        # --- A) Regime (light gate) ---
+        slope = (ema21[i] - ema21[i-3]) / px * 100.0 if i >= 3 else 0.0
+        atr_pct = (atr[i] / px * 100.0) if atr and atr[i] else 0.0
+
+        regime = "RANGING"
+        if abs(slope) >= 0.06 and 0.7 <= atr_pct <= 9.0:
+            regime = "TRENDING"
+        if atr_pct >= 10.5 or atr_pct <= 0.3:
+            regime = "UNSTABLE"
+
+        if regime == "UNSTABLE":
+            continue  # hard gate
+
+        # --- B) Trend/Bias ---
+        bias = "NONE"
+        if ema13[i] > ema21[i] and slope > 0:
+            bias = "BUY"
+        elif ema13[i] < ema21[i] and slope < 0:
+            bias = "SELL"
+        else:
+            bias = "NONE"
+
+        if bias == "NONE":
+            continue
+
+        # --- C) Triggers (pullback OR breakout) ---
+        trigger = None
+        side = bias
+        # pullback: price dipped through EMA13 then reclaimed with a strong candle
+        if side == "BUY":
+            dipped = min(lows[i-3:i+1]) < ema13[i] * (1.0 - 0.0015)
+            reclaimed = closes[i] > ema13[i] and closes[i-1] < ema13[i-1]
+            strength = _candle_strength(opens[i], highs[i], lows[i], closes[i], side)
+            if dipped and reclaimed and strength >= 0.60:
+                trigger = "PULLBACK"
+        else:
+            spiked = max(highs[i-3:i+1]) > ema13[i] * (1.0 + 0.0015)
+            reclaimed = closes[i] < ema13[i] and closes[i-1] > ema13[i-1]
+            strength = _candle_strength(opens[i], highs[i], lows[i], closes[i], side)
+            if spiked and reclaimed and strength >= 0.60:
+                trigger = "PULLBACK"
+
+        # breakout: 20-bar range break with volume
+        if trigger is None and regime == "TRENDING":
+            hh20 = max(highs[i-20:i]) if i >= 20 else highs[i]
+            ll20 = min(lows[i-20:i]) if i >= 20 else lows[i]
+            vavg = (sum(vols[i-20:i]) / 20.0) if i >= 20 else vols[i]
+            vnow = vols[i]
+            if side == "BUY" and closes[i] > hh20 and vnow >= max(1.0, vavg) * 1.10:
+                trigger = "BREAKOUT"
+            if side == "SELL" and closes[i] < ll20 and vnow >= max(1.0, vavg) * 1.10:
+                trigger = "BREAKOUT"
+
+        if trigger is None:
+            continue
+
+        # --- D) Risk construction (ATR/structure stop + R targets) ---
+        entry = opens[i+1]  # next bar open (deterministic)
+        if entry <= 0:
+            continue
+
+        if side == "BUY":
+            sl = min(lows[i-5:i+1]) if i >= 5 else lows[i]
+            sl = min(sl, entry - (atr[i] * 1.2 if atr and atr[i] else entry * 0.01))
+            if sl >= entry:
+                continue
+        else:
+            sl = max(highs[i-5:i+1]) if i >= 5 else highs[i]
+            sl = max(sl, entry + (atr[i] * 1.2 if atr and atr[i] else entry * 0.01))
+            if sl <= entry:
+                continue
+
+        R = abs(entry - sl)
+        tp3 = entry + 2.2 * R if side == "BUY" else entry - 2.2 * R
+
+        t1, t2, t3 = _ensure_three_tps(entry, sl, tp3, None, None, side)
+
+        # synthetic "conf" from components (kept consistent with live scoring)
+        conf = 60
+        conf += 6 if trigger == "PULLBACK" else 4
+        conf += 6 if regime == "TRENDING" else 1
+        conf += int(min(10, max(0.0, abs(slope) * 40)))
+        conf = int(clamp(conf, 0, 95))
+
+        s = Setup(
+            setup_id=f"BT-{i}",
+            symbol=str(symbol).upper().replace("USDT",""),
+            market_symbol=str(symbol).upper(),
+            side=side,
+            conf=int(conf),
+            entry=float(entry),
+            sl=float(sl),
+            tp1=float(t1),
+            tp2=float(t2),
+            tp3=float(t3),
+            fut_vol_usd=float(0.0),
+            ch24=float(0.0),
+            ch4=float(0.0),
+            ch1=float(0.0),
+            ch15=float(0.0),
+            ema_support_period=13,
+            ema_support_dist_pct=0.0,
+            pullback_ema_period=13,
+            pullback_ema_dist_pct=0.0,
+            pullback_ready=True,
+            pullback_bypass_hot=False,
+            engine="A" if trigger == "PULLBACK" else "B",
+            is_trailing_tp3=False,
+            created_ts=float(ohlcv[i][0]) / 1000.0 if float(ohlcv[i][0] or 0) > 1e12 else float(ohlcv[i][0] or 0.0),
+        )
+        setattr(s, "atr_pct", float(atr_pct))
+        setattr(s, "regime", regime)
+        setattr(s, "trend", "BULLISH" if side == "BUY" else "BEARISH")
+        setattr(s, "structure", getattr(s, "trend"))
+        score, _ = compute_setup_quality_score(s, session_name=session_name)
+        setattr(s, "quality_score", float(score))
+
+        # E) Score threshold
+        if float(score) >= float(QUALITY_SCORE_MIN_SCREEN):
+            setups.append(s)
+
+    return setups
+
+def _simulate_one_setup(ohlcv: list, start_i: int, setup: "Setup", max_bars: int = 96) -> dict:
+    """Simulate TP3 vs SL only (fast). Returns dict outcome + R multiple."""
+    entry = float(getattr(setup, "entry", 0.0) or 0.0)
+    sl = float(getattr(setup, "sl", 0.0) or 0.0)
+    tp = float(getattr(setup, "tp3", 0.0) or 0.0)
+    side = str(getattr(setup, "side", "") or "").upper()
+
+    R = abs(entry - sl)
+    if entry <= 0 or sl <= 0 or tp <= 0 or R <= 0:
+        return {"outcome": "INVALID", "R": 0.0, "bars": 0}
+
+    end = min(len(ohlcv), start_i + max_bars)
+    for j in range(start_i, end):
+        h = float(ohlcv[j][2]); l = float(ohlcv[j][3])
+        if side == "BUY":
+            hit_sl = l <= sl
+            hit_tp = h >= tp
+        else:
+            hit_sl = h >= sl
+            hit_tp = l <= tp
+
+        # If both hit in same bar, assume worst-case (conservative)
+        if hit_sl and hit_tp:
+            return {"outcome": "SL_FIRST", "R": -1.0, "bars": j - start_i + 1}
+        if hit_sl:
+            return {"outcome": "SL", "R": -1.0, "bars": j - start_i + 1}
+        if hit_tp:
+            rr = rr_to_tp(entry, sl, tp)
+            return {"outcome": "TP3", "R": float(rr), "bars": j - start_i + 1}
+
+    # timed out: mark-to-market at last close
+    c = float(ohlcv[end-1][4])
+    if side == "BUY":
+        r = (c - entry) / R
+    else:
+        r = (entry - c) / R
+    return {"outcome": "TIMEOUT", "R": float(r), "bars": end - start_i}
+
+def run_backtest(symbol: str, days: int = 30, tf: str = "1h", session_name: str = "NY") -> dict:
+    """Admin backtest runner (fast, no external deps)."""
+    sym = _bybit_linear_symbol(symbol)
+    d = _parse_days(str(days))
+    tf = str(tf or "1h").strip().lower()
+
+    # Bybit/ccxt uses limits not date ranges; approximate bars needed
+    tf_min = _tf_to_minutes(tf)
+    bars = int((d * 1440) / max(1, tf_min)) + 300  # warmup
+    bars = int(min(20000, max(600, bars)))
+
+    ohlcv = fetch_ohlcv(sym, tf, limit=bars)
+    if not ohlcv or len(ohlcv) < 300:
+        return {"ok": False, "error": "insufficient_ohlcv", "symbol": sym, "tf": tf, "days": d}
+
+    setups = _backtest_generate_setups(sym, ohlcv, tf, session_name=session_name)
+    if not setups:
+        return {"ok": True, "symbol": sym, "tf": tf, "days": d, "setups": 0, "report": {"note": "no_setups"}}
+
+    # Simulate
+    results = []
+    equity_curve = []
+    eq = 0.0
+    max_dd = 0.0
+    peak = 0.0
+
+    # map setup_id "BT-i" -> index i
+    for s in setups:
+        try:
+            sid = str(getattr(s, "setup_id", "BT-0"))
+            i = int(sid.split("-")[-1])
+        except Exception:
+            i = 0
+        res = _simulate_one_setup(ohlcv, i + 1, s)
+        res["setup_id"] = getattr(s, "setup_id", "")
+        res["score"] = float(getattr(s, "quality_score", 0.0) or 0.0)
+        results.append(res)
+
+        eq += float(res.get("R", 0.0) or 0.0)
+        peak = max(peak, eq)
+        dd = peak - eq
+        max_dd = max(max_dd, dd)
+        equity_curve.append(eq)
+
+    wins = [r for r in results if str(r.get("outcome")) == "TP3"]
+    losses = [r for r in results if str(r.get("outcome")) in ("SL", "SL_FIRST")]
+    total = len(results)
+
+    win_rate = (len(wins) / total) * 100.0 if total else 0.0
+    avg_r = float(sum(float(r.get("R", 0.0) or 0.0) for r in results) / total) if total else 0.0
+    gross_win = float(sum(max(0.0, float(r.get("R", 0.0) or 0.0)) for r in results))
+    gross_loss = float(sum(min(0.0, float(r.get("R", 0.0) or 0.0)) for r in results))
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float("inf") if gross_win > 0 else 0.0)
+
+    return {
+        "ok": True,
+        "symbol": sym,
+        "tf": tf,
+        "days": d,
+        "setups": total,
+        "win_rate": win_rate,
+        "avg_R": avg_r,
+        "profit_factor": pf,
+        "max_drawdown_R": float(max_dd),
+        "equity_R": float(eq),
+        "sample": results[:12],
+    }
+
+async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Admin only.")
+        return
+    args = (context.args or [])
+    if len(args) < 3:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/backtest BTCUSDT 30d 1h\n"
+            "/backtest ETHUSDT 7d 15m\n"
+        )
+        return
+    symbol = args[0]
+    days = args[1]
+    tf = args[2]
+    session_name = "NY"
+    try:
+        if len(args) >= 4:
+            session_name = str(args[3]).upper()
+    except Exception:
+        session_name = "NY"
+
+    await update.message.reply_text("⏳ Running backtest… (this can take a bit)")
+    try:
+        rep = await to_thread_heavy(run_backtest, symbol, days, tf, session_name=session_name)
+    except Exception as e:
+        await update.message.reply_text(f"Backtest failed: {type(e).__name__}: {e}")
+        return
+
+    if not rep.get("ok"):
+        await update.message.reply_text(f"Backtest error: {rep.get('error')}")
+        return
+
+    # Pretty report
+    lines = []
+    lines.append("📊 Backtest Report")
+    lines.append(HDR)
+    lines.append(f"Symbol: {rep.get('symbol')}")
+    lines.append(f"TF: {rep.get('tf')} | Days: {rep.get('days')} | Session: {session_name}")
+    lines.append(SEP)
+    lines.append(f"Setups: {rep.get('setups')}")
+    lines.append(f"Win rate: {rep.get('win_rate'):.1f}%")
+    lines.append(f"Avg R: {rep.get('avg_R'):.3f}")
+    pf = rep.get('profit_factor')
+    if pf == float('inf'):
+        pf_s = "∞"
+    else:
+        try:
+            pf_s = f"{float(pf):.2f}"
+        except Exception:
+            pf_s = str(pf)
+    lines.append(f"Profit factor: {pf_s}")
+    lines.append(f"Max DD (R): {rep.get('max_drawdown_R'):.2f}")
+    lines.append(f"Net (R): {rep.get('equity_R'):.2f}")
+
+    # Sample outcomes
+    try:
+        samp = rep.get("sample") or []
+        if samp:
+            lines.append(SEP)
+            lines.append("Sample outcomes:")
+            for r in samp[:10]:
+                lines.append(f"• {r.get('setup_id')} — {r.get('outcome')} — R={float(r.get('R',0.0)):.2f} — score={float(r.get('score',0.0)):.1f}")
+    except Exception:
+        pass
+
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+
+
+
+def is_top_setup_eligible(
+    s: "Setup",
+    source: str = "screen",
+    session_name: str = "LON",
+) -> tuple[bool, str]:
+    """Unified eligibility using scoring + a few safety checks.
+
+    - source='screen' => slightly looser (more flow)
+    - source='email'  => slightly stricter (quality + anti-spam handled elsewhere)
     """
     try:
-        conf = int(getattr(s, "conf", 0) or 0)
-        if conf < int(MIN_SETUP_CONF):
-            return (False, "below_min_conf")
+        # Basic safety sanity (never create impossible orders)
+        entry = float(getattr(s, "entry", 0.0) or 0.0)
+        sl = float(getattr(s, "sl", 0.0) or 0.0)
+        tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+        side = str(getattr(s, "side", "") or "").upper()
 
+        if entry <= 0 or sl <= 0 or tp3 <= 0 or side not in ("BUY", "SELL"):
+            return (False, "bad_prices_or_side")
+
+        if side == "BUY" and not (sl < entry < tp3):
+            return (False, "bad_price_order_buy")
+        if side == "SELL" and not (tp3 < entry < sl):
+            return (False, "bad_price_order_sell")
+
+        # Always ensure TP ladder exists (derive if missing)
+        try:
+            t1, t2, t3 = _ensure_three_tps(entry, sl, tp3, getattr(s, "tp1", None), getattr(s, "tp2", None), side)
+            setattr(s, "tp1", t1)
+            setattr(s, "tp2", t2)
+            setattr(s, "tp3", t3)
+        except Exception:
+            pass
+
+        score, comps = compute_setup_quality_score(s, session_name=session_name)
+        setattr(s, "quality_score", float(score))
+        try:
+            setattr(s, "quality_components", comps)
+        except Exception:
+            pass
+
+        src = str(source or "screen").strip().lower()
+        min_score = float(QUALITY_SCORE_MIN_EMAIL if src == "email" else QUALITY_SCORE_MIN_SCREEN)
+
+        if float(score) < float(min_score):
+            return (False, f"below_score_{int(min_score)}")
+
+        # Liquidity floor remains a HARD safety gate (prevents junk illiquid coins)
         fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
         if fut_vol < float(MIN_FUT_VOL_USD):
             return (False, "below_min_fut_vol")
 
-        entry = float(getattr(s, "entry", 0.0) or 0.0)
-        sl = float(getattr(s, "sl", 0.0) or 0.0)
-        tp1 = getattr(s, "tp1", None)
-        tp2 = getattr(s, "tp2", None)
-        tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
-
-        # Ladder validity
-        if tp1 is None or tp2 is None:
-            return (False, "invalid_tp_ladder")
-        tp1 = float(tp1 or 0.0)
-        tp2 = float(tp2 or 0.0)
-        if tp1 <= 0 or tp2 <= 0 or tp3 <= 0 or entry <= 0 or sl <= 0:
-            return (False, "invalid_tp_ladder")
-
-        rr1 = rr_to_tp(entry, sl, tp1)
-        rr2 = rr_to_tp(entry, sl, tp2)
-        rr3 = rr_to_tp(entry, sl, tp3)
-
-        if rr1 <= 0 or rr2 <= 0 or rr3 <= 0:
-            return (False, "invalid_rr_ladder")
-
-        if float(rr3) < float(MIN_RR_TP3):
-            return (False, "below_min_rr_tp3")
-
         return (True, "ok")
     except Exception:
         return (False, "eligibility_exception")
-
-# =========================================================
-# SETUP ENGINE
-# =========================================================
 
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
     """
@@ -6745,8 +7307,9 @@ def make_setup(
 
             # Momentum engine works best in trend regimes, not ranging.
             if engine == "B" and strict_15m and regime == "RANGING" and (not sweep_ok):
-                _rej("pro_ranging_regime_blocks_momentum", base, mv, f"side={side} regime={regime}")
-                return None
+                _rej("pro_ranging_regime_blocks_momentum_soft", base, mv, f"side={side} regime={regime}")
+                conf -= 3
+                notes.append("ranging_penalty")
 
             # Confidence nudges: reward alignment, penalize conflict.
             if structure == want_trend:
@@ -6781,8 +7344,9 @@ def make_setup(
                 conf += 2 + min(2, max(0, smf_score - 2))
             elif (side == "BUY" and smf_sell) or (side == "SELL" and smf_buy):
                 # Strong opposite smart-money signature: avoid
-                _rej("smart_money_opposes_side", base, mv, f"side={side} smf={smf_event} score={smf_score} structure={structure} trend={trend}")
-                return None
+                _rej("smart_money_opposes_side_soft", base, mv, f"side={side} smf={smf_event} score={smf_score} structure={structure} trend={trend}")
+                conf -= 6
+                notes.append("smf_opposes_soft")
             # Require at least 2 of 3 core confirmations for aggressive momentum setups.
             if engine == "B":
                 core_hits = 0
@@ -6793,8 +7357,9 @@ def make_setup(
                 if sweep_ok or momentum_ok:
                     core_hits += 1
                 if core_hits < 2:
-                    _rej("pro_quality_gate_failed", base, mv, f"side={side} hits={core_hits} trend={trend} structure={structure} sweep={sweep} momentum={momentum}")
-                    return None
+                    _rej("pro_quality_gate_failed_soft", base, mv, f"side={side} hits={core_hits} trend={trend} structure={structure} sweep={sweep} momentum={momentum}")
+                    conf -= 5
+                    notes.append(f"pro_hits={core_hits}")
 
             conf = int(clamp(float(conf), 0.0, 100.0))
         except Exception:
@@ -6931,7 +7496,7 @@ def make_setup(
         # ✅ trailing only for the setups that need it (Momentum + Hot)
         trailing_tp3 = bool(hot and engine == "B")
 
-        return Setup(
+        s = Setup(
             setup_id=sid,
             symbol=base,
             market_symbol=mv.symbol,
@@ -6957,6 +7522,29 @@ def make_setup(
             is_trailing_tp3=trailing_tp3,
             created_ts=time.time(),
         )
+        try:
+            # Attach lightweight diagnostics for scoring/backtests (safe even if unused elsewhere)
+            setattr(s, 'atr_pct', float(atr_pct_now or 0.0))
+            setattr(s, 'regime', str(regime or 'UNKNOWN'))
+            setattr(s, 'trend', str(trend or 'UNKNOWN'))
+            setattr(s, 'structure', str(structure or 'UNKNOWN'))
+            setattr(s, 'bos', str(bos or 'NONE'))
+            setattr(s, 'choch', str(choch or 'NONE'))
+            setattr(s, 'sweep', str(sweep or 'NONE'))
+            setattr(s, 'smf_event', str(smf_event or 'NONE'))
+            setattr(s, 'smf_score', int(smf_score or 0))
+            setattr(s, 'engine', str(engine or ''))
+            # Ensure TP ladder is always present (derive TP1/TP2 if needed)
+            try:
+                t1, t2, t3 = _ensure_three_tps(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp3',0.0) or 0.0), getattr(s,'tp1',None), getattr(s,'tp2',None), str(getattr(s,'side','') or ''))
+                setattr(s, 'tp1', t1)
+                setattr(s, 'tp2', t2)
+                setattr(s, 'tp3', t3)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return s
     except Exception as e:
         try:
             _rej("exception_in_make_setup", base, mv, f"{type(e).__name__}: {e}")
@@ -8470,6 +9058,19 @@ Advanced setup quality is now enforced inside the live engine:
 
 /health_sys
 • System health (DB, exchange, email)
+────────────────────
+📈 BACKTESTING (Admin)
+─────────────
+/backtest <SYMBOL> <DAYS>d <TF> [SESSION]
+Examples:
+• /backtest BTCUSDT 30d 1h
+• /backtest ETHUSDT 7d 15m
+Optional SESSION: NY | LON | ASIA (default NY)
+
+Notes:
+- Uses the same institutional scoring model as live selection.
+- Simulation is TP3 vs SL (conservative if both hit same candle).
+
 """\
 
 
@@ -14213,7 +14814,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             skip_reasons_counter = Counter()
             eligible: List[Setup] = []
             for s in (setups_all or []):
-                ok, why = is_top_setup_eligible(s)
+                ok, why = is_top_setup_eligible(s, source='email', session_name=sess_name)
                 if ok:
                     eligible.append(s)
                 else:
@@ -15511,6 +16112,7 @@ def main():
     app.add_handler(CommandHandler("guide_full", guide_full_cmd, block=False))
     app.add_handler(CommandHandler("start", cmd_start, block=False))
     app.add_handler(CommandHandler("help_admin", cmd_help_admin, block=False))
+    app.add_handler(CommandHandler("backtest", cmd_backtest, block=False))
     app.add_handler(CommandHandler("manage", manage_cmd, block=False))
     app.add_handler(CommandHandler("myplan", myplan_cmd, block=False))
     app.add_handler(CommandHandler("support", support_cmd, block=False))
