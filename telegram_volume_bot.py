@@ -8190,7 +8190,7 @@ Not financial advice.
 👤 USERS & ACCESS
 ────────────────────
 /admin_user <user_id>
-• View full user record (plan, trial, alerts)
+• View full user record (plan, trial, alerts, settings)
 
 /admin_users
 • List users (overview)
@@ -8200,11 +8200,6 @@ Not financial advice.
 
 /admin_revoke <user_id>
 • Revoke paid access (sets to FREE)
-
-/admin_reset_report
-/admin_reset_signal_reports
-/setups_log [n] [screen|email|all]
-• Archive signals/outcomes and reset live performance report
 
 /myplan
 • View your own plan status (admins too)
@@ -8216,19 +8211,50 @@ Not financial advice.
 💳 PAYMENTS
 ────────────────────
 /payment_approve <user_id> <payment_id> <standard|pro>
-• Approve a payment received (Stripe or USDT) and grant access
+• Approve a payment (Stripe or USDT) and grant access
 
-/admin_payments
-• Show all users: User ID / Last Payment Approval / Plan
-  (Plan comes from /admin_grant)
+/admin_payments [n]
+• Show recent payment approvals and current plans
+
+────────────────────
+🧰 SUPPORT / OPS
+────────────────────
+/support_open <user_id> [note]
+• Open a support ticket (admin)
+
+/support_close <ticket_id> [note]
+• Close a support ticket (admin)
+
+────────────────────
+🤖 AUTOTRADE (OWNER / ADMIN)
+────────────────────
+/autotrade_debug
+• AutoTrade readiness + last decision diagnostics
+
+/autotrade_debug_reset
+• Clear AutoTrade debug state (fresh next attempt)
+
+/autotrade_last
+• Show last autotrade attempt details
+
+/autotrade_report [hours]
+• AutoTrade journal (recent)
+
+/autotrade_report_overall
+• AutoTrade overall performance summary
+
+/autotrade_sessions
+/autotrade_sessions NY
+/autotrade_sessions NY,LON
+/autotrade_sessions NY,LON,ASIA
+• Show / set allowed sessions for auto-trading
+
+/open_trades
+• Show live open Bybit positions (admin)
 
 ────────────────────
 ⏱️ COOLDOWNS
 ────────────────────
-/cooldown
-/cooldowns
-• View cooldowns
-
 /cooldown_clear <SYMBOL> <long|short>
 • Clear cooldown for one symbol + side
 
@@ -8238,8 +8264,14 @@ Not financial advice.
 ────────────────────
 ⚙️ DATA / RECOVERY
 ────────────────────
+/admin_reset_report
+• Archive signals/outcomes and reset live performance report
+
+/admin_reset_signal_reports
+• Hard reset report-related tables (signals / emailed_setups / generated_setups)
+
 /reset
-• Reset user data / clean DB (⚠️ DANGEROUS)
+• Reset bot data / clean DB (⚠️ DANGEROUS)
 
 /restore
 • Restore previously removed data (if backup exists)
@@ -8255,83 +8287,6 @@ Not financial advice.
 
 /health_sys
 • System health (DB, exchange, email)
-
-/open_trades
-• Show live open Bybit positions (admin)
-
-/autotrade_debug
-• AutoTrade readiness + last decision (admin)
-
-/autotrade_report [hours]
-• AutoTrade journal (admin)
-
-────────────────────
-📢 Channels
-────────────────────
-Channel: @PulseFutures
-Support: @PulseFuturesSupport
-YouTube: @PulseFutures
-Website: https://pulsefutures.com/
-
-
-────────────────────
-📊 SIGNAL REPORTING
-────────────────────
-/admin_reset_report
-• (Admin) Archive signals/outcomes and reset live performance report
-
-🤖 AUTOTRADE SESSION CONTROL
-────────────────────
-/autotrade_sessions
-• Show current auto-trade sessions (admin)
-/autotrade_sessions NY
-/autotrade_sessions NY,LON
-/autotrade_sessions NY,LON,ASIA
-• Set allowed sessions for auto-trading (admin)
-
-
-/signal_report [hours]
-• Evaluate emailed setups for the requesting user in the last N hours (default 24)
-• Uses Bybit 1m OHLCV to detect which level hit first: TP1/TP2/TP3/SL
-• Outputs a table + win rates by session
-• Outcomes: WIN_TP1, WIN_TP2, WIN_TP3, LOSS, OPEN, AMBIGUOUS
-
-/signal_report_overall
-• Overall performance summary across ALL emailed setups (short output)
-• Includes win-rate, TP1/TP2/TP3/SL counts, Avg R/trade, Profit Factor
-• Uses stored evaluated outcomes; shows coverage %
-
-/autotrade_report [hours]
-• Journal/report for bot-opened positions (default 24h)
-• Evaluates TP/SL hit-order via Bybit 1m OHLCV (same as signal_report)
-
-/autotrade_last
-• Shows the last AutoTrade attempt details (symbol sent, qty/step/minNotional, Bybit retCode/retMsg)
-
-/autotrade_debug
-• AutoTrade readiness + last decision/caps/session diagnostics (admin only)
-
-/autotrade_debug_reset
-
-/autotrade_report_overall
-• Overall performance summary for bot-opened positions (same metrics as signal_report_overall)
-
-/signal_report_all
-• Alias for /signal_report_overall
-
-────────────────────
-🆘 SUPPORT
-────────────────────
-/support_open
-• List open support tickets (admin)
-
-/support_close <TICKET_ID>
-• Close a support ticket
-
-(Users)
- /support <issue>
- /support_status
-
 """\
 
 
