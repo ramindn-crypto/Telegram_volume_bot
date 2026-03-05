@@ -833,7 +833,7 @@ EMAIL_SETUPS_N = 3
 MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "75"))
 
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
-MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "5000000"))
+MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
 MIN_RR_TP3 = float(os.environ.get("MIN_RR_TP3", "1.8"))
 
 # Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
@@ -6143,7 +6143,7 @@ def is_top_setup_eligible(s: "Setup") -> tuple[bool, str]:
 
     Defaults (env-overridable):
       MIN_SETUP_CONF >= 75
-      MIN_FUT_VOL_USD >= 5,000,000
+      MIN_FUT_VOL_USD >= 10,000,000
       MIN_RR_TP3 >= 1.8
       Valid TP ladder (TP1/TP2/TP3 present and RR1/RR2/RR3 positive)
     """
