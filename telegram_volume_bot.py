@@ -1470,23 +1470,20 @@ def _estimate_position_risk_usd(p: dict) -> float:
         return 0.0
 
 def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
-    \"\"\"Compute AutoTrade day risk metrics.
+    """Compute AutoTrade day risk metrics.
 
-    Definition (as requested):
+    Definition:
     - used_risk = TOTAL estimated risk of currently OPEN positions (entry vs SL).
     - remaining = daily_cap - used_risk
 
-      IMPORTANT: Unrealised (open) PnL must NOT adjust remaining risk.
-      Only realised PnL from CLOSED trades (today) is allowed to adjust remaining risk
-      in /status and /autotrade_debug.
+    IMPORTANT:
+    Unrealised (open) PnL must NOT adjust remaining risk.
+    Only realised PnL from CLOSED trades today may adjust remaining risk
+    in /status and /autotrade_debug.
 
     Notes:
     - In LIVE mode we read Bybit open positions (includes manual trades).
     - In PAPER mode we use bot journal open risk.
-    \"\"\"
-    Notes:
-    - In LIVE mode we read Bybit open positions (includes manual trades).
-    - In PAPER mode we use bot journal open risk (no unrealised PnL adjustment).
     """
     cap = 0.0
     used_risk = 0.0
@@ -15664,4 +15661,3 @@ def pf_evaluate_signal(symbol, trend, ema_pullback, liquidity_event):
 # ==========================================================
 # END SIGNAL QUALITY GATE ENGINE
 # ==========================================================
-
