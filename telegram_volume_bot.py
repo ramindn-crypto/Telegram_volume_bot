@@ -1053,7 +1053,8 @@ except Exception:
 AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "2") or 2)
 AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT", "6") or 6)
 AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "6") or 6)
-AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "3") or 3)
+# Open-trade count is intentionally unlimited. Daily risk cap controls exposure.
+AUTOTRADE_MAX_OPEN_TRADES = 0
 
 # Margin / leverage
 AUTOTRADE_ISOLATED = str(os.environ.get("AUTOTRADE_ISOLATED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
@@ -1857,9 +1858,6 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             _open_n = len(_autotrade_db_open_trades(uid))
     except Exception:
         _open_n = 0
-
-    if _open_n >= int(AUTOTRADE_MAX_OPEN_TRADES):
-        return (False, f'max_open_trades_reached ({AUTOTRADE_MAX_OPEN_TRADES})')
 
     s = setups[0]
 
@@ -8381,11 +8379,17 @@ Advanced setup quality is now enforced inside the live engine:
 • dynamic risk sizing scales AutoTrade size by quality/regime
 • confidence boost/penalty from advanced confirmations
 
-/trade_replay [trade_id|last]
-• Replay a recent trade on 5m path after execution
-
 /ai_strategy_report
 • Review recent bot trade performance and recommendations
+
+/signal_report [hours]
+• Signal report for recent emailed setups
+
+/signal_report_overall
+• Overall signal performance summary
+
+/signal_report_all
+• Alias of /signal_report_overall
 
 ────────────────────
 ⏱️ COOLDOWNS
@@ -10340,24 +10344,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
 
 
-    # AutoTrade status: admin only (hidden for public users)
-    if is_admin_user(int(uid)):
-        lines.append(HDR)
-        try:
-            at_on = "ON" if AUTOTRADE_ENABLED else "OFF"
-            at_mode = str(AUTOTRADE_MODE).upper()
-            at_sess = ",".join(_autotrade_get_sessions())
-            last = _LAST_AUTOTRADE_DECISION.get(int(AUTOTRADE_OWNER_UID or 0)) or _LAST_AUTOTRADE_DECISION.get(int(uid)) or {}
-            last_txt = str(last.get("decision") or "—").upper()
-            last_reason = str(last.get("reason") or "—")
-            last_when = _fmt_iso_to_local(str(last.get("when") or "")) if last.get("when") else ""
-            if last_when:
-                lines.append(f"AutoTrade: {at_on} | Mode: {at_mode} | Sessions: {at_sess} | Last: {last_txt} ({last_reason}) @ {last_when}")
-            else:
-                lines.append(f"AutoTrade: {at_on} | Mode: {at_mode} | Sessions: {at_sess} | Last: {last_txt} ({last_reason})")
-        except Exception:
-            pass
-
     if not opens:
         lines.append("Open trades: None")
         await update.message.reply_text("\n".join(lines))
@@ -11677,7 +11663,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     lines.append(SEP)
     lines.append(f"Equity: ${equity:.2f} ({equity_src})")
-    lines.append(f"Open trades: {int(open_trades_n)}/{int(AUTOTRADE_MAX_OPEN_TRADES)}")
+    lines.append(f"Open trades: {int(open_trades_n)}")
     lines.append(f"Open risk est: ${open_risk:.2f}")
     lines.append(f"Per-trade base risk (from /riskmode): ${per_trade_risk:.2f}")
     try:
@@ -11866,6 +11852,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     for t in trades:
         setup = {
             "symbol": t.get("symbol"),
+            "market_symbol": _market_symbol_from_base(t.get("symbol")),
             "side": t.get("side"),
             "entry": t.get("entry"),
             "sl": t.get("sl"),
@@ -11926,6 +11913,121 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
         w_n = c.get("WIN_TP1", 0) + c.get("WIN_TP2", 0) + c.get("WIN_TP3", 0)
         wr_s = (w_n / dec_n * 100.0) if dec_n else 0.0
         lines.append(f"• {sess}: eval {eval_n} | decided {dec_n} | WR {wr_s:.1f}% | TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+
+async def ai_strategy_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ai_strategy_report — summarize recent bot/autotrade performance and recommendations."""
+    _autotrade_migrate_tables()
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
+        await update.message.reply_text("⛔️ Owner/admin only.")
+        return
+
+    trades = db_list_autotrade_trades_all(AUTOTRADE_OWNER_UID)
+    if not trades:
+        await update.message.reply_text("🤖 AI Strategy Report\n" + HDR + "\nNo bot-opened trades found yet.")
+        return
+
+    decided = []
+    counts = Counter()
+    by_session = defaultdict(lambda: Counter())
+    by_symbol = defaultdict(lambda: {"n": 0, "wins": 0, "losses": 0, "r": []})
+    for t in trades:
+        setup = {
+            "symbol": t.get("symbol"),
+            "market_symbol": _market_symbol_from_base(t.get("symbol")),
+            "side": t.get("side"),
+            "entry": t.get("entry"),
+            "sl": t.get("sl"),
+            "tp1": t.get("tp1"),
+            "tp2": t.get("tp2"),
+            "tp3": t.get("tp3"),
+            "created_ts": float(t.get("opened_ts") or 0.0),
+        }
+        res = evaluate_signal_hit_order(setup, horizon_hours=168, timeframe="1m")
+        out = str(res.get("outcome") or "OPEN").upper().strip()
+        sess = str(t.get("session") or "?").strip() or "?"
+        counts[out] += 1
+        by_session[sess][out] += 1
+        if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+            rr = _realized_r_option_b(
+                out,
+                str(t.get("side") or "").upper().strip(),
+                float(t.get("entry") or 0.0),
+                float(t.get("sl") or 0.0),
+                float(t.get("tp1")) if t.get("tp1") is not None else None,
+                float(t.get("tp2")) if t.get("tp2") is not None else None,
+                float(t.get("tp3")) if t.get("tp3") is not None else None,
+            )
+            sym = str(t.get("symbol") or "?").upper()
+            by_symbol[sym]["n"] += 1
+            by_symbol[sym]["r"].append(float(rr or 0.0))
+            if out == "LOSS":
+                by_symbol[sym]["losses"] += 1
+            else:
+                by_symbol[sym]["wins"] += 1
+            decided.append(float(rr or 0.0))
+
+    total = len(trades)
+    wins = counts.get("WIN_TP1",0) + counts.get("WIN_TP2",0) + counts.get("WIN_TP3",0)
+    losses = counts.get("LOSS",0)
+    decided_n = wins + losses
+    wr = (wins / decided_n * 100.0) if decided_n else 0.0
+    avg_r = (sum(decided) / len(decided)) if decided else 0.0
+
+    recommendation = pf_strategy_learning([{"pnl": 1 if r > 0 else -1 if r < 0 else 0} for r in decided])
+
+    weakest_session = None
+    weakest_wr = None
+    for sess, c in by_session.items():
+        s_w = c.get("WIN_TP1",0) + c.get("WIN_TP2",0) + c.get("WIN_TP3",0)
+        s_l = c.get("LOSS",0)
+        s_d = s_w + s_l
+        if s_d <= 0:
+            continue
+        s_wr = s_w / s_d * 100.0
+        if weakest_wr is None or s_wr < weakest_wr:
+            weakest_wr = s_wr
+            weakest_session = sess
+
+    weakest_symbol = None
+    weakest_symbol_r = None
+    for sym, info in by_symbol.items():
+        if info["n"] <= 0:
+            continue
+        sym_avg = sum(info["r"]) / len(info["r"]) if info["r"] else 0.0
+        if weakest_symbol_r is None or sym_avg < weakest_symbol_r:
+            weakest_symbol_r = sym_avg
+            weakest_symbol = sym
+
+    lines = []
+    lines.append("🤖 AI Strategy Report")
+    lines.append(HDR)
+    lines.append(f"Bot trades reviewed: {total}")
+    lines.append(f"Decided: {decided_n} | Wins: {wins} | Losses: {losses} | Win rate: {wr:.1f}%")
+    lines.append(f"Average realized R: {avg_r:.2f}R")
+    lines.append(f"Open / still developing: {counts.get('OPEN',0)}")
+    lines.append(SEP)
+    lines.append(f"AI recommendation: {recommendation}")
+    if weakest_session is not None:
+        lines.append(f"Weakest session: {weakest_session} ({weakest_wr:.1f}% WR)")
+    if weakest_symbol is not None:
+        lines.append(f"Weakest symbol: {weakest_symbol} ({weakest_symbol_r:.2f}R avg)")
+    lines.append(SEP)
+    lines.append("Suggested actions:")
+    if wr < 50:
+        lines.append("• Tighten filters and reduce risk multiplier on weaker sessions.")
+    elif wr < 60:
+        lines.append("• Keep filters selective; review weaker symbols before allowing auto-trade.")
+    else:
+        lines.append("• Current engine is healthy; keep risk steady and monitor drift.")
+    if weakest_session is not None:
+        lines.append(f"• Consider reducing exposure during {weakest_session} until performance improves.")
+    if weakest_symbol is not None:
+        lines.append(f"• Review {weakest_symbol} setups for repeated false triggers or thin liquidity.")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -15390,6 +15492,7 @@ def main():
     app.add_handler(CommandHandler("signals_daily", signals_daily_cmd, block=False))
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd, block=False))
     app.add_handler(CommandHandler("signal_report", signal_report_cmd, block=False))
+    app.add_handler(CommandHandler("signbal_report", signal_report_cmd, block=False))
     app.add_handler(CommandHandler("signal_report_overall", signal_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("signal_report_all", signal_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("health", health_cmd, block=False))
@@ -15432,6 +15535,8 @@ def main():
     app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
     app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_report_overal", autotrade_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("ai_strategy_report", ai_strategy_report_cmd, block=False))
     # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
