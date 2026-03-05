@@ -6699,40 +6699,13 @@ def make_setup(
         # without rewriting the whole live signal pipeline.
         # ---------------------------------------------------------
         try:
-            # SMC structure (HH/HL/LH/LL + BOS/CHOCH) — higher-quality trend filter
-            smc = pf_market_structure_smc(c1[-220:] if c1 else c1, fractal=2, lookback=220)
-            structure = str(smc.get("bias", "UNKNOWN")).upper()
-            bos = str(smc.get("bos", "NONE")).upper()
-            choch = str(smc.get("choch", "NONE")).upper()
-
-            trend = pf_mtf_alignment(mv.symbol, fetch_ohlcv)  # 4H + 1H only (5m too noisy for hard gating)
-            regime = pf_market_regime(c1[-60:] if c1 else c1)
-
-            sweep_info = pf_liquidity_sweep_v2(c15[-90:] if c15 else c15, lookback_swings=90, fractal=2)
-            sweep = str(sweep_info.get("event", "NONE")).upper()
-
-            momentum = pf_orderflow_momentum(c15[-20:] if c15 else c15)
-
-            smf = pf_smart_money_flow(c15[-90:] if c15 else c15, vol_lookback=30)
-            smf_event = str(smf.get("event", "NONE")).upper()
-            smf_score = int(smf.get("score", 0) or 0)
-
+            structure = pf_detect_market_structure(c1[-20:] if c1 else c1)
+            trend = pf_mtf_alignment(mv.symbol, fetch_ohlcv)  # 4H + 1H only by design; 5m is too noisy for hard gating
+            regime = pf_market_regime(c1[-30:] if c1 else c1)
+            sweep = pf_liquidity_sweep(c15[-20:] if c15 else c15)
+            momentum = pf_orderflow_momentum(c15[-12:] if c15 else c15)
 
             want_trend = "BULLISH" if side == "BUY" else "BEARISH"
-            # Enforce key SMC rule:
-            #   LONG -> only if bullish structure
-            #   SHORT -> only if bearish structure
-            if structure != want_trend:
-                _rej("smc_structure_mismatch", base, mv, f"side={side} structure={structure} bos={bos} choch={choch} trend={trend} regime={regime} smf={smf_event}")
-                return None
-
-            # CHOCH indicates potential reversal against the prevailing bias — avoid entries against it.
-            if side == "BUY" and choch == "CHOCH_DOWN":
-                _rej("smc_choch_against_long", base, mv, f"choch={choch} bos={bos} structure={structure} smf={smf_event}")
-                return None
-            if side == "SELL" and choch == "CHOCH_UP":
-                _rej("smc_choch_against_short", base, mv, f"choch={choch} bos={bos} structure={structure} smf={smf_event}")
-                return None
             opposite_trend = "BEARISH" if side == "BUY" else "BULLISH"
             sweep_ok = (side == "BUY" and sweep == "BUY_SWEEP") or (side == "SELL" and sweep == "SELL_SWEEP")
             momentum_ok = (side == "BUY" and momentum == "BULLISH") or (side == "SELL" and momentum == "BEARISH")
@@ -6766,23 +6739,6 @@ def make_setup(
             if momentum_bad:
                 conf -= 4
 
-            # BOS adds confidence for continuation entries
-            if side == "BUY" and bos == "BOS_UP":
-                conf += 2
-            if side == "SELL" and bos == "BOS_DOWN":
-                conf += 2
-
-            # Smart Money Flow detection (institutional activity / liquidation / ignition)
-            smf_buy = smf_event in ("BUY_IGNITION", "LIQUIDATION_BUY")
-            smf_sell = smf_event in ("SELL_IGNITION", "LIQUIDATION_SELL")
-            if side == "BUY" and smf_buy:
-                conf += 2 + min(2, max(0, smf_score - 2))
-            elif side == "SELL" and smf_sell:
-                conf += 2 + min(2, max(0, smf_score - 2))
-            elif (side == "BUY" and smf_sell) or (side == "SELL" and smf_buy):
-                # Strong opposite smart-money signature: avoid
-                _rej("smart_money_opposes_side", base, mv, f"side={side} smf={smf_event} score={smf_score} structure={structure} trend={trend}")
-                return None
             # Require at least 2 of 3 core confirmations for aggressive momentum setups.
             if engine == "B":
                 core_hits = 0
@@ -15727,257 +15683,34 @@ def _normalize_bybit_qty(exchange, symbol, qty):
 # ---------------------------------------------------------
 # Market Structure Engine (HH HL LH LL)
 # ---------------------------------------------------------
-# ---------------------------------------------------------
-# Smart Money Concepts (SMC) — Market Structure Engine
-# Detects: HH/HL/LH/LL, BOS, CHOCH, and returns a structure bias.
-# Safe: does not alter existing core logic unless you choose to gate with it.
-# ---------------------------------------------------------
-def _pf_swings_from_ohlcv(ohlcv, fractal: int = 2):
-    """Return swing highs/lows indices using a simple fractal window.
-    fractal=2 means current high > highs of 2 candles left and 2 right (same for lows).
-    """
-    highs = [float(c[2]) for c in ohlcv]
-    lows = [float(c[3]) for c in ohlcv]
-    n = len(ohlcv)
-    if n < (fractal * 2 + 5):
-        return [], []
-
-    swing_highs = []
-    swing_lows = []
-    for i in range(fractal, n - fractal):
-        h = highs[i]
-        l = lows[i]
-        if all(h > highs[j] for j in range(i - fractal, i)) and all(h >= highs[j] for j in range(i + 1, i + fractal + 1)):
-            swing_highs.append(i)
-        if all(l < lows[j] for j in range(i - fractal, i)) and all(l <= lows[j] for j in range(i + 1, i + fractal + 1)):
-            swing_lows.append(i)
-
-    return swing_highs, swing_lows
-
-
-def pf_market_structure_smc(ohlcv, fractal: int = 2, lookback: int = 160):
-    """Smart Money Concepts market-structure inference.
-
-    Returns dict:
-      bias: 'BULLISH' | 'BEARISH' | 'RANGE' | 'UNKNOWN'
-      hh_hl_lh_ll: last classified structure point ('HH','HL','LH','LL','NA')
-      bos: 'BOS_UP' | 'BOS_DOWN' | 'NONE'
-      choch: 'CHOCH_UP' | 'CHOCH_DOWN' | 'NONE'
-      last_swing_high: float|None
-      last_swing_low: float|None
-      debug: short text
-    """
-    try:
-        if not ohlcv:
-            return {"bias": "UNKNOWN", "hh_hl_lh_ll": "NA", "bos": "NONE", "choch": "NONE",
-                    "last_swing_high": None, "last_swing_low": None, "debug": "no_ohlcv"}
-
-        # work on a tail window for speed and stability
-        data = ohlcv[-max(lookback, 60):]
-        highs = [float(c[2]) for c in data]
-        lows = [float(c[3]) for c in data]
-        closes = [float(c[4]) for c in data]
-        last_close = closes[-1]
-
-        sh, sl = _pf_swings_from_ohlcv(data, fractal=fractal)
-
-        # Need at least 2 swing highs and 2 swing lows to classify structure
-        if len(sh) < 2 or len(sl) < 2:
-            return {"bias": "UNKNOWN", "hh_hl_lh_ll": "NA", "bos": "NONE", "choch": "NONE",
-                    "last_swing_high": highs[-2] if len(highs) >= 2 else None,
-                    "last_swing_low": lows[-2] if len(lows) >= 2 else None,
-                    "debug": f"insufficient_swings sh={len(sh)} sl={len(sl)}"}
-
-        # last two swing highs/lows
-        sh1, sh2 = sh[-2], sh[-1]
-        sl1, sl2 = sl[-2], sl[-1]
-
-        h1, h2 = highs[sh1], highs[sh2]
-        l1, l2 = lows[sl1], lows[sl2]
-
-        # Determine bias from HH/HL vs LH/LL logic
-        bias = "RANGE"
-        last_tag = "NA"
-        if h2 > h1 and l2 > l1:
-            bias = "BULLISH"
-            last_tag = "HH/HL"
-        elif h2 < h1 and l2 < l1:
-            bias = "BEARISH"
-            last_tag = "LH/LL"
-        else:
-            bias = "RANGE"
-            last_tag = "MIXED"
-
-        last_swing_high = h2
-        last_swing_low = l2
-
-        # BOS/CHOCH detection via break of most recent swing levels
-        bos = "NONE"
-        choch = "NONE"
-
-        broke_up = last_close > last_swing_high
-        broke_down = last_close < last_swing_low
-
-        if bias == "BULLISH":
-            if broke_up:
-                bos = "BOS_UP"
-            if broke_down:
-                choch = "CHOCH_DOWN"
-        elif bias == "BEARISH":
-            if broke_down:
-                bos = "BOS_DOWN"
-            if broke_up:
-                choch = "CHOCH_UP"
-        else:
-            # In range, treat breaks as potential CHOCH signals
-            if broke_up:
-                choch = "CHOCH_UP"
-            if broke_down:
-                choch = "CHOCH_DOWN"
-
-        return {"bias": bias, "hh_hl_lh_ll": last_tag, "bos": bos, "choch": choch,
-                "last_swing_high": float(last_swing_high), "last_swing_low": float(last_swing_low),
-                "debug": f"h1={h1:.6g} h2={h2:.6g} l1={l1:.6g} l2={l2:.6g} close={last_close:.6g}"}
-
-    except Exception as e:
-        return {"bias": "UNKNOWN", "hh_hl_lh_ll": "NA", "bos": "NONE", "choch": "NONE",
-                "last_swing_high": None, "last_swing_low": None, "debug": f"err:{e}"}
-
-
-# ---------------------------------------------------------
-# Liquidity Sweep Detection (Stop-Hunt Detection) — v2
-# Detects wick sweep beyond last swing, then close back inside.
-# ---------------------------------------------------------
-def pf_liquidity_sweep_v2(ohlcv, lookback_swings: int = 50, fractal: int = 2, wick_ratio: float = 0.35):
-    """Return dict with {event, level, debug}.
-
-    event:
-      - BUY_SWEEP  (sweep lows -> reversal up)
-      - SELL_SWEEP (sweep highs -> reversal down)
-      - NONE
-    """
-    try:
-        if not ohlcv or len(ohlcv) < 20:
-            return {"event": "NONE", "level": None, "debug": "insufficient_bars"}
-
-        data = ohlcv[-max(lookback_swings, 30):]
-        highs = [float(c[2]) for c in data]
-        lows = [float(c[3]) for c in data]
-        opens = [float(c[1]) for c in data]
-        closes = [float(c[4]) for c in data]
-
-        sh, sl = _pf_swings_from_ohlcv(data, fractal=fractal)
-
-        if len(sh) < 1 or len(sl) < 1:
-            # fallback to simple last-10 range
-            prev_high = max(highs[-10:-1])
-            prev_low = min(lows[-10:-1])
-            h = highs[-1]; l = lows[-1]; c = closes[-1]
-            if h > prev_high and c < prev_high:
-                return {"event": "SELL_SWEEP", "level": float(prev_high), "debug": "fallback_prev_high"}
-            if l < prev_low and c > prev_low:
-                return {"event": "BUY_SWEEP", "level": float(prev_low), "debug": "fallback_prev_low"}
-            return {"event": "NONE", "level": None, "debug": "no_swings_fallback_none"}
-
-        last_sh = highs[sh[-1]]
-        last_sl = lows[sl[-1]]
-
-        o = opens[-1]; h = highs[-1]; l = lows[-1]; c = closes[-1]
-        rng = max(1e-12, (h - l))
-        upper_wick = max(0.0, h - max(o, c))
-        lower_wick = max(0.0, min(o, c) - l)
-
-        # SELL sweep: wick above swing high, but close back below the swing level
-        if h > last_sh and c < last_sh and (upper_wick / rng) >= wick_ratio:
-            return {"event": "SELL_SWEEP", "level": float(last_sh), "debug": f"wick_up={upper_wick/rng:.2f}"}
-
-        # BUY sweep: wick below swing low, but close back above the swing level
-        if l < last_sl and c > last_sl and (lower_wick / rng) >= wick_ratio:
-            return {"event": "BUY_SWEEP", "level": float(last_sl), "debug": f"wick_dn={lower_wick/rng:.2f}"}
-
-        return {"event": "NONE", "level": None, "debug": "no_sweep"}
-
-    except Exception as e:
-        return {"event": "NONE", "level": None, "debug": f"err:{e}"}
-
-
-# ---------------------------------------------------------
-# Smart Money Flow Detection
-# Detects: institutional activity proxy, liquidation moves, momentum ignition.
-# Uses only OHLCV (safe, no external dependencies).
-# ---------------------------------------------------------
-def pf_smart_money_flow(ohlcv, vol_lookback: int = 30, spike_mult: float = 2.0, body_ratio: float = 0.55):
-    """Return dict with {event, score, debug}.
-
-    event values:
-      - BUY_IGNITION / SELL_IGNITION   (volume spike + expansion + directional close)
-      - LIQUIDATION_BUY / LIQUIDATION_SELL (long-wick sweep + volume spike)
-      - NONE
-    """
-    try:
-        if not ohlcv or len(ohlcv) < (vol_lookback + 5):
-            return {"event": "NONE", "score": 0, "debug": "insufficient_bars"}
-
-        data = ohlcv[-max(vol_lookback + 5, 40):]
-        vols = [float(c[5]) for c in data]
-        opens = [float(c[1]) for c in data]
-        highs = [float(c[2]) for c in data]
-        lows = [float(c[3]) for c in data]
-        closes = [float(c[4]) for c in data]
-
-        v_now = vols[-1]
-        v_avg = sum(vols[-vol_lookback-1:-1]) / max(1, len(vols[-vol_lookback-1:-1]))
-        v_spike = (v_now >= spike_mult * max(1e-12, v_avg))
-
-        o = opens[-1]; h = highs[-1]; l = lows[-1]; c = closes[-1]
-        rng = max(1e-12, (h - l))
-        body = abs(c - o)
-        body_ok = (body / rng) >= body_ratio
-
-        upper_wick = max(0.0, h - max(o, c)) / rng
-        lower_wick = max(0.0, min(o, c) - l) / rng
-
-        # Expansion proxy: last range vs average recent range
-        ranges = [(highs[i] - lows[i]) for i in range(-min(20, len(highs)), 0)]
-        avg_rng = sum(ranges[:-1]) / max(1, (len(ranges) - 1))
-        expansion = (ranges[-1] >= 1.5 * max(1e-12, avg_rng))
-
-        score = 0
-        if v_spike:
-            score += 2
-        if expansion:
-            score += 1
-        if body_ok:
-            score += 1
-
-        # Liquidation / stop-run style candles
-        if v_spike and lower_wick >= 0.55 and c > o:
-            return {"event": "LIQUIDATION_BUY", "score": score + 2, "debug": f"v_spike={v_spike} lw={lower_wick:.2f} exp={expansion}"}
-        if v_spike and upper_wick >= 0.55 and c < o:
-            return {"event": "LIQUIDATION_SELL", "score": score + 2, "debug": f"v_spike={v_spike} uw={upper_wick:.2f} exp={expansion}"}
-
-        # Momentum ignition
-        if v_spike and expansion and body_ok:
-            if c > o:
-                return {"event": "BUY_IGNITION", "score": score, "debug": f"v_spike={v_spike} exp={expansion} body={body/rng:.2f}"}
-            if c < o:
-                return {"event": "SELL_IGNITION", "score": score, "debug": f"v_spike={v_spike} exp={expansion} body={body/rng:.2f}"}
-
-        return {"event": "NONE", "score": score if score else 0, "debug": f"v_spike={v_spike} exp={expansion} body={body/rng:.2f}"}
-
-    except Exception as e:
-        return {"event": "NONE", "score": 0, "debug": f"err:{e}"}
-
 def pf_detect_market_structure(ohlcv):
-    """Backward-compatible wrapper.
-    Returns: 'BULLISH' | 'BEARISH' | 'RANGE' | 'UNKNOWN'
-    """
+
     try:
-        info = pf_market_structure_smc(ohlcv)
-        return (info.get("bias") or "UNKNOWN")
+        highs = [c[2] for c in ohlcv]
+        lows = [c[3] for c in ohlcv]
+
+        if len(highs) < 10:
+            return "UNKNOWN"
+
+        if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+            return "BULLISH"
+
+        if highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+            return "BEARISH"
+
+        return "RANGE"
+
     except Exception:
         return "UNKNOWN"
 
+
+# ---------------------------------------------------------
+# Multi Timeframe Alignment
+# Best-practice choice: use 4H + 1H for structure/trend.
+# Do NOT hard-gate on 5m alignment here because 5m is too noisy
+# and can block otherwise high-quality trades. 15m already handles
+# entry timing elsewhere in the setup engine.
+# ---------------------------------------------------------
 def pf_mtf_alignment(symbol, fetch_func):
 
     try:
@@ -16020,21 +15753,31 @@ def pf_mtf_alignment(symbol, fetch_func):
 # ---------------------------------------------------------
 # Liquidity Sweep Detection
 # ---------------------------------------------------------
-def pf_liquidity_sweep(ohlcv, lookback_swings: int = 40, fractal: int = 2):
-    """Detect stop-hunts (liquidity sweeps) above/below recent swing highs/lows.
+def pf_liquidity_sweep(ohlcv):
 
-    Returns one of:
-      - 'BUY_SWEEP'  : sweep below recent swing low then close back above that level
-      - 'SELL_SWEEP' : sweep above recent swing high then close back below that level
-      - 'NONE'
-      - 'UNKNOWN'
-    """
     try:
-        info = pf_liquidity_sweep_v2(ohlcv, lookback_swings=lookback_swings, fractal=fractal)
-        return info.get("event", "NONE")
-    except Exception:
-        return "UNKNOWN"
+        highs = [c[2] for c in ohlcv]
+        lows = [c[3] for c in ohlcv]
+        close = ohlcv[-1][4]
 
+        prev_high = max(highs[-10:-1])
+        prev_low = min(lows[-10:-1])
+
+        if highs[-1] > prev_high and close < prev_high:
+            return "SELL_SWEEP"
+
+        if lows[-1] < prev_low and close > prev_low:
+            return "BUY_SWEEP"
+
+        return None
+
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------
+# Orderflow Momentum
+# ---------------------------------------------------------
 def pf_orderflow_momentum(ohlcv):
 
     try:
