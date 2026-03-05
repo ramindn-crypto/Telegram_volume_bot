@@ -10233,6 +10233,7 @@ async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
+    is_admin = is_admin_user(int(uid))
 
     if not has_active_access(uid, user):
         await update.message.reply_text(
@@ -10242,38 +10243,38 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    opens = db_open_trades(uid)
+    # Open-trades source must match the relevant command:
+    # - admin  -> live Bybit positions (same source as /open_trades)
+    # - others -> manual journal trades (same source as /trade_open + /trade_close)
+    live_positions = _bybit_get_open_positions_linear() if is_admin else []
+    opens = [] if is_admin else db_open_trades(uid)
 
     plan = str(effective_plan(uid, user)).upper()
     equity = float((user or {}).get("equity") or 0.0)
 
     # ✅ Live equity sync ONLY for Admin (Bybit)
-    live_eq = _live_equity_usdt() if is_admin_user(int(uid)) else None
+    live_eq = _live_equity_usdt() if is_admin else None
     if live_eq is not None:
         equity = float(live_eq)
         try:
             update_user(int(uid), equity=equity)
+            user = get_user(uid)
         except Exception:
             pass
 
     cap = daily_cap_usd(user)
-    # Day risk capacity logic
     pnl_today = _pnl_today_closed_trades(uid, user)
 
-    # For admin (AutoTrade owner), sync with LIVE Bybit positions so /status matches /autotrade_debug.
-    # For non-admin users, we use the bot journal open risk.
-    if is_admin_user(int(uid)):
+    # For admin (AutoTrade owner), sync with LIVE Bybit positions so /status matches /autotrade_debug and /open_trades.
+    # For non-admin users, use the manual trade journal opened/closed via /trade_open and /trade_close.
+    if is_admin:
         m = _autotrade_day_risk_metrics(int(uid), float(equity))
-        # Use cap computed from /dailycap with live equity
         if float(m.get("cap") or 0.0) > 0:
             cap = float(m["cap"])
         used_today = float(m.get("used_risk") or 0.0)
         remaining_today = float(m.get("remaining"))
-        # Include realized PnL today too (more capacity if positive)
         if cap > 0 and remaining_today != float("inf"):
             remaining_today = remaining_today + float(pnl_today or 0.0)
-        # Display rule (sync with /autotrade_debug):
-        # If Daily risk used (open risk) is ABOVE Daily cap, show remaining as 0 (but keep the over-cap alert).
         over_by = 0.0
         if cap > 0 and used_today > cap:
             over_by = used_today - cap
@@ -10281,28 +10282,19 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         used_today = _risk_used_total_today(uid, user)
         remaining_today = (cap - used_today + float(pnl_today or 0.0)) if cap > 0 else float("inf")
-
-        # Display rule (sync with /autotrade_debug):
-        # If Daily risk used (open risk) is ABOVE Daily cap, show remaining as 0 (but keep the over-cap alert).
         over_by = 0.0
         if cap > 0 and used_today > cap:
             over_by = used_today - cap
             remaining_today = 0.0
 
-    day_local = _user_day_local(user)
-
-
     enabled = user_enabled_sessions(user)
     now_s = in_session_now(user)
-    # Display the *live market session* (NY/LON/ASIA), not "UNLIMITED" access mode
     now_live = _guess_session_name_utc(datetime.now(timezone.utc))
     if int(user.get("sessions_unlimited", 0) or 0) == 1:
         now_txt = now_live
     else:
         now_txt = (now_s["name"] if now_s else "NONE")
 
-    # Email caps (show infinite as 0=∞ to match UI)
-        # IMPORTANT: 0 is a valid value (means unlimited) — do not coerce with `or DEFAULT`.
     cap_sess_raw = (user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION)
     cap_day_raw  = (user or {}).get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY)
     gap_raw      = (user or {}).get("email_gap_min", DEFAULT_EMAIL_GAP_MIN)
@@ -10310,7 +10302,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cap_day  = int(DEFAULT_MAX_EMAILS_PER_DAY if cap_day_raw is None else cap_day_raw)
     gap_m    = int(DEFAULT_EMAIL_GAP_MIN if gap_raw is None else gap_raw)
 
-    # Big-move status
     bm_on = int((user or {}).get("bigmove_alert_on", 1) or 0)
     bm_4h = float((user or {}).get("bigmove_alert_4h", 20) or 20)
     bm_1h = float((user or {}).get("bigmove_alert_1h", 10) or 10)
@@ -10343,27 +10334,57 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
     lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
 
+    if is_admin:
+        if not live_positions:
+            lines.append("Open trades: None")
+            await update.message.reply_text("\n".join(lines))
+            return
 
-    if not opens:
-        lines.append("Open trades: None")
-        await update.message.reply_text("\n".join(lines))
-        return
+        lines.append(f"Open trades: {len(live_positions)}")
+        for p in live_positions:
+            try:
+                sym = _pos_symbol(p)
+                side = _pos_side_text(p)
+                size = _pos_size(p)
+                entry = _pos_entry(p)
+                mark = _pos_mark(p)
+                pnl = _pos_unreal_pnl(p)
+                sl = _pos_stop(p)
+                risk = _estimate_position_risk_usd(p)
+                if sl and sl > 0:
+                    lines.append(
+                        f"- {side} {sym} | Size {size:g} | Entry {fmt_price(entry)} | Mark {fmt_price(mark)} | "
+                        f"PnL {pnl:+.2f} USDT | SL {fmt_price(sl)} | Risk ${risk:.2f}"
+                    )
+                else:
+                    lines.append(
+                        f"- {side} {sym} | Size {size:g} | Entry {fmt_price(entry)} | Mark {fmt_price(mark)} | "
+                        f"PnL {pnl:+.2f} USDT | SL — | Risk —"
+                    )
+            except Exception:
+                continue
+    else:
+        if not opens:
+            lines.append("Open trades: None")
+            await update.message.reply_text("\n".join(lines))
+            return
 
-    lines.append("Open trades:")
-    for t in opens:
-        try:
-            entry = float(t.get("entry") or 0.0)
-            sl = float(t.get("sl") or 0.0)
-            qty = float(t.get("qty") or 0.0)
-            risk = float(t.get("risk_usd") or 0.0)
-            lines.append(
-                f"- ID {t.get('public_id')} | {t.get('symbol')} {t.get('side')} | "
-                f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g}"
-            )
-        except Exception:
-            continue
+        lines.append(f"Open trades: {len(opens)}")
+        for t in opens:
+            try:
+                entry = float(t.get("entry") or 0.0)
+                sl = float(t.get("sl") or 0.0)
+                qty = float(t.get("qty") or 0.0)
+                risk = float(t.get("risk_usd") or 0.0)
+                lines.append(
+                    f"- ID {t.get('public_id')} | {t.get('symbol')} {t.get('side')} | "
+                    f"Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g}"
+                )
+            except Exception:
+                continue
 
     await update.message.reply_text("\n".join(lines))
+
 async def cooldowns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
