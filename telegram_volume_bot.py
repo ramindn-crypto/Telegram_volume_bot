@@ -1470,16 +1470,20 @@ def _estimate_position_risk_usd(p: dict) -> float:
         return 0.0
 
 def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
-    """Compute AutoTrade day risk metrics.
+    \"\"\"Compute AutoTrade day risk metrics.
 
     Definition (as requested):
     - used_risk = TOTAL estimated risk of currently OPEN positions (entry vs SL).
-    - remaining = daily_cap - used_risk + open_pnl_adjust
-      where open_pnl_adjust is the current unrealised PnL on open positions (live only).
-      This means:
-        * positive PnL increases remaining risk capacity
-        * negative PnL reduces remaining risk capacity
+    - remaining = daily_cap - used_risk
 
+      IMPORTANT: Unrealised (open) PnL must NOT adjust remaining risk.
+      Only realised PnL from CLOSED trades (today) is allowed to adjust remaining risk
+      in /status and /autotrade_debug.
+
+    Notes:
+    - In LIVE mode we read Bybit open positions (includes manual trades).
+    - In PAPER mode we use bot journal open risk.
+    \"\"\"
     Notes:
     - In LIVE mode we read Bybit open positions (includes manual trades).
     - In PAPER mode we use bot journal open risk (no unrealised PnL adjustment).
@@ -1510,7 +1514,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
             used_risk = 0.0
         open_pnl = 0.0
 
-    remaining = float("inf") if cap <= 0 else (cap - used_risk + open_pnl)
+    remaining = float("inf") if cap <= 0 else (cap - used_risk)
     over_by = 0.0
     if cap > 0 and remaining < 0:
         over_by = abs(remaining)
@@ -11523,7 +11527,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Raw remaining capacity (can go negative). Display rule:
     # If Daily risk used (open risk) is ABOVE Daily cap, show remaining as 0 (but keep the over-cap alert).
-    remaining_raw = float("inf") if daily_cap <= 0 else (daily_cap - used_today + open_pnl_adj + pnl_today_closed)
+    remaining_raw = float("inf") if daily_cap <= 0 else (daily_cap - used_today + pnl_today_closed)
     over_by = 0.0
     if daily_cap > 0 and used_today > daily_cap:
         over_by = used_today - daily_cap
