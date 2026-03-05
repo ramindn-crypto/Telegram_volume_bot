@@ -15654,138 +15654,55 @@ def pf_strategy_learning(trades):
 
 
 # ==========================================================
-# PULSEFUTURES SAFE INTELLIGENCE UPGRADE (NON-BREAKING)
-# Added for Ramin – advanced analysis modules
-# These do NOT modify existing logic to avoid breaking the bot.
-# They can be gradually integrated later.
+# PULSEFUTURES SIGNAL QUALITY GATE ENGINE
+# Added safely for Ramin – does NOT modify existing logic
 # ==========================================================
 
-def pf_market_structure(ohlcv):
+def pf_signal_quality_gate(trend=None, ema_pullback=None, liquidity_event=None):
+    """
+    Determines if a signal should be allowed based on three confirmations:
+    1. Trend confirmation
+    2. EMA pullback confirmation
+    3. Liquidity event confirmation (sweep or order block)
+    """
+
     try:
-        highs=[c[2] for c in ohlcv]
-        lows=[c[3] for c in ohlcv]
-        if highs[-1]>highs[-2] and lows[-1]>lows[-2]:
-            return "BULLISH"
-        if highs[-1]<highs[-2] and lows[-1]<lows[-2]:
-            return "BEARISH"
-        return "RANGE"
+
+        score = 0
+
+        if trend in ("BULLISH", "BEARISH"):
+            score += 1
+
+        if ema_pullback is True:
+            score += 1
+
+        if liquidity_event in ("BUY_SWEEP", "SELL_SWEEP", "ORDER_BLOCK"):
+            score += 1
+
+        if score >= 3:
+            return True
+
+        return False
+
     except Exception:
-        return "UNKNOWN"
+        return False
 
 
-def pf_market_regime(ohlcv):
-    try:
-        closes=[c[4] for c in ohlcv]
-        highs=[c[2] for c in ohlcv]
-        lows=[c[3] for c in ohlcv]
+# ----------------------------------------------------------
+# Example helper to evaluate signal quality for a symbol
+# ----------------------------------------------------------
+def pf_evaluate_signal(symbol, trend, ema_pullback, liquidity_event):
+    """Returns signal approval and explanation"""
 
-        rng=[(highs[i]-lows[i]) for i in range(-20,0)]
-        avg_range=sum(rng)/len(rng)
+    approved = pf_signal_quality_gate(trend, ema_pullback, liquidity_event)
 
-        move=abs(closes[-1]-closes[-20])/closes[-20]*100
-
-        if move>4:
-            return "TRENDING"
-        if avg_range/closes[-1]>0.02:
-            return "VOLATILE"
-        if move<1:
-            return "RANGING"
-        return "NORMAL"
-    except Exception:
-        return "UNKNOWN"
+    if approved:
+        return True, f"Signal approved for {symbol}: Trend + EMA pullback + Liquidity confirmation"
+    else:
+        return False, f"Signal rejected for {symbol}: insufficient confirmations"
 
 
-def pf_liquidity_sweep(ohlcv):
-    try:
-        highs=[c[2] for c in ohlcv]
-        lows=[c[3] for c in ohlcv]
-        close=ohlcv[-1][4]
+# ==========================================================
+# END SIGNAL QUALITY GATE ENGINE
+# ==========================================================
 
-        prev_high=max(highs[-10:-1])
-        prev_low=min(lows[-10:-1])
-
-        if highs[-1]>prev_high and close<prev_high:
-            return "SELL_SWEEP"
-        if lows[-1]<prev_low and close>prev_low:
-            return "BUY_SWEEP"
-
-        return None
-    except Exception:
-        return None
-
-
-def pf_orderflow_momentum(ohlcv):
-    try:
-        closes=[c[4] for c in ohlcv]
-        move=closes[-1]-closes[-5]
-
-        if move>0:
-            return "BULLISH"
-        if move<0:
-            return "BEARISH"
-        return "FLAT"
-    except Exception:
-        return "FLAT"
-
-
-def pf_dynamic_risk(confidence, base_risk):
-    try:
-        if confidence>=85:
-            return base_risk*1.3
-        if confidence>=70:
-            return base_risk*1.15
-        if confidence>=55:
-            return base_risk
-        return base_risk*0.7
-    except Exception:
-        return base_risk
-
-
-def pf_trade_replay(symbol, entry, sl, fetch_func):
-    try:
-        ohlcv=fetch_func(symbol,"5m",120)
-        highs=[c[2] for c in ohlcv]
-        sl_dist=abs(entry-sl)
-
-        if sl_dist==0:
-            return None
-
-        max_move=max(highs)-entry
-        rr=max_move/sl_dist
-
-        if rr>=3: return "EXCELLENT"
-        if rr>=2: return "GOOD"
-        if rr>=1: return "OK"
-        return "POOR"
-    except Exception:
-        return None
-
-
-def pf_strategy_learning(trades):
-    try:
-        wins=0
-        losses=0
-
-        for t in trades:
-            pnl=float(t.get("pnl",0))
-            if pnl>0:
-                wins+=1
-            else:
-                losses+=1
-
-        total=wins+losses
-        if total==0:
-            return "No data"
-
-        winrate=wins/total
-
-        if winrate<0.5:
-            return "Recommendation: tighten filters"
-        if winrate<0.6:
-            return "Recommendation: adjust EMA distance"
-
-        return "Strategy performing well"
-    except Exception:
-        return "Learning error"
-
-# ================= END SAFE UPGRADE ======================
