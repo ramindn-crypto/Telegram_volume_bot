@@ -6644,6 +6644,11 @@ def make_setup(
             regime = pf_market_regime(c1[-30:] if c1 else c1)
             sweep = pf_liquidity_sweep(c15[-20:] if c15 else c15)
             momentum = pf_orderflow_momentum(c15[-12:] if c15 else c15)
+            c5 = fetch_ohlcv(mv.symbol, "5m", 80)
+            mtf_v2 = pf_mtf_alignment_v2(mv.symbol, fetch_ohlcv)
+            bos_state = pf_bos_choch(c15[-20:] if c15 else c15)
+            smart_money = pf_smart_money_detection(c1[-25:] if c1 else c1)
+            flow_score = pf_orderflow_momentum_score(c5[-20:] if c5 else c5)
 
             want_trend = "BULLISH" if side == "BUY" else "BEARISH"
             opposite_trend = "BEARISH" if side == "BUY" else "BULLISH"
@@ -6691,6 +6696,39 @@ def make_setup(
                 if core_hits < 2:
                     _rej("pro_quality_gate_failed", base, mv, f"side={side} hits={core_hits} trend={trend} structure={structure} sweep={sweep} momentum={momentum}")
                     return None
+
+            try:
+                sm_sig = str((smart_money or {}).get("signal") or "NONE")
+                if str((mtf_v2 or {}).get("bias") or "UNKNOWN") == want_trend:
+                    conf += 4
+                elif strict_15m and not bool((mtf_v2 or {}).get("gate_ok")):
+                    _rej("advanced_mtf_gate_failed", base, mv, str((mtf_v2 or {}).get("detail") or "mtf_fail"))
+                    return None
+
+                if side == "BUY" and bos_state in ("BOS_UP", "CHOCH_UP"):
+                    conf += 4
+                elif side == "SELL" and bos_state in ("BOS_DOWN", "CHOCH_DOWN"):
+                    conf += 4
+                elif strict_15m and bos_state not in ("NONE", ""):
+                    conf -= 2
+
+                if side == "BUY" and sm_sig == "BULLISH_EXPANSION":
+                    conf += 3
+                elif side == "SELL" and sm_sig == "BEARISH_EXPANSION":
+                    conf += 3
+
+                if side == "BUY" and int(flow_score) >= 20:
+                    conf += 2
+                elif side == "SELL" and int(flow_score) <= -20:
+                    conf += 2
+                elif abs(int(flow_score)) <= 8:
+                    conf -= 1
+
+                risk_mult_hint = pf_dynamic_risk_tier(conf, regime=regime, orderflow_score=flow_score, smart_signal=sm_sig)
+                if engine == "B" and regime in ("VOLATILE", "RANGING") and risk_mult_hint < 0.95:
+                    conf -= 3
+            except Exception:
+                pass
 
             conf = int(clamp(float(conf), 0.0, 100.0))
         except Exception:
@@ -7720,6 +7758,190 @@ import tempfile
 # UNKNOWN COMMAND + "DID YOU MEAN" SUGGESTION (ALL USERS)
 # =========================================================
 
+# =========================================================
+# PULSEFUTURES ADVANCED EXECUTION HELPERS
+# =========================================================
+def pf_smart_money_detection(ohlcv):
+    """Volume spike + range expansion detector."""
+    try:
+        if not ohlcv or len(ohlcv) < 25:
+            return {"signal": "NONE", "vol_mult": 0.0, "range_mult": 0.0}
+        last = ohlcv[-1]
+        vols = [float(c[5] or 0.0) for c in ohlcv[-21:-1]]
+        ranges = [abs(float(c[2]) - float(c[3])) for c in ohlcv[-21:-1]]
+        v_avg = (sum(vols) / len(vols)) if vols else 0.0
+        r_avg = (sum(ranges) / len(ranges)) if ranges else 0.0
+        v_now = float(last[5] or 0.0)
+        r_now = abs(float(last[2]) - float(last[3]))
+        vol_mult = (v_now / v_avg) if v_avg > 0 else 0.0
+        range_mult = (r_now / r_avg) if r_avg > 0 else 0.0
+        close_ = float(last[4]); open_ = float(last[1])
+        if vol_mult >= 1.8 and range_mult >= 1.35:
+            return {"signal": "BULLISH_EXPANSION" if close_ >= open_ else "BEARISH_EXPANSION", "vol_mult": float(vol_mult), "range_mult": float(range_mult)}
+        return {"signal": "NONE", "vol_mult": float(vol_mult), "range_mult": float(range_mult)}
+    except Exception:
+        return {"signal": "NONE", "vol_mult": 0.0, "range_mult": 0.0}
+
+def pf_bos_choch(ohlcv):
+    try:
+        if not ohlcv or len(ohlcv) < 12:
+            return "NONE"
+        highs = [float(c[2]) for c in ohlcv]
+        lows = [float(c[3]) for c in ohlcv]
+        closes = [float(c[4]) for c in ohlcv]
+        prev_h = max(highs[-7:-2]); prev_l = min(lows[-7:-2]); last_c = closes[-1]
+        prior_up = highs[-4] > highs[-8] and lows[-4] > lows[-8]
+        prior_dn = highs[-4] < highs[-8] and lows[-4] < lows[-8]
+        if last_c > prev_h:
+            return "CHOCH_UP" if prior_dn else "BOS_UP"
+        if last_c < prev_l:
+            return "CHOCH_DOWN" if prior_up else "BOS_DOWN"
+        return "NONE"
+    except Exception:
+        return "NONE"
+
+def pf_orderflow_momentum_score(ohlcv):
+    try:
+        if not ohlcv or len(ohlcv) < 8:
+            return 0
+        closes = [float(c[4]) for c in ohlcv]
+        vols = [float(c[5] or 0.0) for c in ohlcv]
+        ranges = [max(1e-12, float(c[2]) - float(c[3])) for c in ohlcv]
+        delta_pct = ((closes[-1] - closes[-5]) / closes[-5] * 100.0) if closes[-5] else 0.0
+        vol_mult = (vols[-1] / (sum(vols[-6:-1]) / max(1, len(vols[-6:-1])))) if len(vols) >= 6 and sum(vols[-6:-1]) > 0 else 1.0
+        range_mult = (ranges[-1] / (sum(ranges[-6:-1]) / max(1, len(ranges[-6:-1])))) if len(ranges) >= 6 and sum(ranges[-6:-1]) > 0 else 1.0
+        raw = (delta_pct * 18.0) + ((vol_mult - 1.0) * 25.0) + ((range_mult - 1.0) * 18.0)
+        return int(clamp(raw, -100.0, 100.0))
+    except Exception:
+        return 0
+
+def pf_mtf_alignment_v2(symbol, fetch_func):
+    try:
+        o4 = fetch_func(symbol, "4h", 80); o1 = fetch_func(symbol, "1h", 80); o5 = fetch_func(symbol, "5m", 80)
+        if not o4 or not o1 or not o5:
+            return {"bias": "UNKNOWN", "gate_ok": False, "detail": "missing_tf"}
+        c4 = [float(x[4]) for x in o4]; c1 = [float(x[4]) for x in o1]; c5 = [float(x[4]) for x in o5]
+        ema4 = sum(c4[-20:]) / 20.0; ema1 = sum(c1[-20:]) / 20.0; ema5 = sum(c5[-20:]) / 20.0
+        up4, up1, up5 = c4[-1] >= ema4, c1[-1] >= ema1, c5[-1] >= ema5
+        dn4, dn1, dn5 = c4[-1] <= ema4, c1[-1] <= ema1, c5[-1] <= ema5
+        if up4 and up1 and up5:
+            return {"bias": "BULLISH", "gate_ok": True, "detail": "4h+1h+5m aligned up"}
+        if dn4 and dn1 and dn5:
+            return {"bias": "BEARISH", "gate_ok": True, "detail": "4h+1h+5m aligned down"}
+        if up4 and up1 and not up5:
+            return {"bias": "BULLISH", "gate_ok": False, "detail": "5m not aligned with bullish higher TFs"}
+        if dn4 and dn1 and not dn5:
+            return {"bias": "BEARISH", "gate_ok": False, "detail": "5m not aligned with bearish higher TFs"}
+        return {"bias": "MIXED", "gate_ok": False, "detail": "mixed timeframe structure"}
+    except Exception:
+        return {"bias": "UNKNOWN", "gate_ok": False, "detail": "mtf_error"}
+
+def pf_dynamic_risk_tier(confidence, regime=None, orderflow_score=0, smart_signal="NONE"):
+    try:
+        mult = 1.0; c = float(confidence or 0.0)
+        if c >= 88: mult *= 1.30
+        elif c >= 80: mult *= 1.15
+        elif c < 65: mult *= 0.85
+        reg = str(regime or "").upper()
+        if reg == "TRENDING": mult *= 1.10
+        elif reg in ("VOLATILE", "RANGING"): mult *= 0.85
+        ofs = int(orderflow_score or 0)
+        if abs(ofs) >= 55: mult *= 1.08
+        elif abs(ofs) <= 15: mult *= 0.92
+        if smart_signal in ("BULLISH_EXPANSION", "BEARISH_EXPANSION"): mult *= 1.06
+        return float(clamp(mult, 0.60, 1.50))
+    except Exception:
+        return 1.0
+
+def pf_trade_replay_full(symbol, side, entry, sl, tp1, tp2, tp3, fetch_func):
+    try:
+        ohlcv = fetch_func(symbol, "5m", 180)
+        if not ohlcv: return None
+        side_u = str(side or "").upper(); entry = float(entry or 0.0); sl = float(sl or 0.0)
+        tps = [float(x) for x in [tp1, tp2, tp3] if x not in (None, "", 0, 0.0)]
+        if entry <= 0 or sl <= 0: return None
+        risk = abs(entry - sl)
+        highs = [float(c[2]) for c in ohlcv]; lows = [float(c[3]) for c in ohlcv]
+        if side_u == "BUY":
+            best_move = (max(highs) - entry) / risk; adverse = (entry - min(lows)) / risk
+        else:
+            best_move = (entry - min(lows)) / risk; adverse = (max(highs) - entry) / risk
+        quality = "POOR"
+        if best_move >= 3.0: quality = "EXCELLENT"
+        elif best_move >= 2.0: quality = "GOOD"
+        elif best_move >= 1.0: quality = "OK"
+        tp_hit = "NONE"
+        for idx, tp in enumerate(tps, start=1):
+            hit = (max(highs) >= tp) if side_u == "BUY" else (min(lows) <= tp)
+            if hit: tp_hit = f"TP{idx}"
+        return {"quality": quality, "best_r": round(float(best_move),2), "adverse_r": round(float(adverse),2), "tp_hit": tp_hit, "candles": len(ohlcv)}
+    except Exception:
+        return None
+
+def pf_strategy_learning_report(trades):
+    try:
+        closed = [t for t in (trades or []) if t.get("closed_ts") is not None and t.get("pnl") is not None]
+        if not closed:
+            return {"summary": "No closed trades yet.", "recommendations": ["Collect at least 10 closed trades before changing rules."]}
+        wins = [t for t in closed if float(t.get("pnl") or 0.0) > 0]
+        losses = [t for t in closed if float(t.get("pnl") or 0.0) <= 0]
+        total = len(closed); winrate = (len(wins) / total) * 100.0 if total else 0.0
+        avg_win = (sum(float(t.get("pnl") or 0.0) for t in wins) / len(wins)) if wins else 0.0
+        avg_loss = (sum(float(t.get("pnl") or 0.0) for t in losses) / len(losses)) if losses else 0.0
+        recs = []
+        if winrate < 45: recs.append("Tighten entry filters and require stronger MTF alignment before taking setups.")
+        if winrate < 55: recs.append("Prefer BOS/CHOCH + liquidity sweep confirmation instead of pure momentum entries.")
+        if avg_loss and abs(avg_loss) > max(avg_win, 1e-9): recs.append("Cut losers faster or reduce dynamic risk multiplier in volatile/ranging regimes.")
+        if not recs: recs.append("Current edge looks stable. Keep rules steady and review only after more sample size.")
+        return {"summary": f"Closed trades: {total} | Win rate: {winrate:.1f}% | Avg win: {avg_win:+.2f} | Avg loss: {avg_loss:+.2f}", "recommendations": recs[:4]}
+    except Exception:
+        return {"summary": "Learning engine error.", "recommendations": ["Unable to analyze trade history."]}
+
+async def trade_replay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+    if not has_active_access(uid, user):
+        await update.message.reply_text("⛔️ Trial finished. Use /billing")
+        return
+    arg = (" ".join(context.args).strip() if context.args else "")
+    pick = None
+    if arg.lower() == "last" or arg == "":
+        closed = [t for t in db_trades_all(uid) if t.get("closed_ts") is not None]
+        if closed:
+            pick = sorted(closed, key=lambda x: float(x.get("closed_ts") or 0.0), reverse=True)[0]
+        else:
+            opens = db_open_trades(uid)
+            if opens:
+                pick = sorted(opens, key=lambda x: float(x.get("opened_ts") or 0.0), reverse=True)[0]
+    elif arg.isdigit():
+        tid = int(arg)
+        for t in db_trades_all(uid):
+            if int(t.get("public_id") or 0) == tid:
+                pick = t; break
+    if not pick:
+        await update.message.reply_text("Usage: /trade_replay [trade_id|last]\nNo matching trade found.")
+        return
+    sym = _market_symbol_from_base(str(pick.get("symbol") or "")) or str(pick.get("symbol") or "")
+    rep = pf_trade_replay_full(sym, pick.get("side"), pick.get("entry"), pick.get("sl"), None, None, None, fetch_ohlcv)
+    if not rep:
+        await update.message.reply_text("❌ Could not build trade replay for this trade.")
+        return
+    msg = ["🎬 Trade Replay", HDR, f"Trade ID: {int(pick.get('public_id') or 0)}", f"Symbol: {pick.get('symbol')} | Side: {pick.get('side')}", f"Entry: {fmt_price(float(pick.get('entry') or 0.0))} | SL: {fmt_price(float(pick.get('sl') or 0.0))}", f"Replay quality: {rep.get('quality')}", f"Best excursion: {float(rep.get('best_r') or 0.0):+.2f}R", f"Adverse excursion: {float(rep.get('adverse_r') or 0.0):+.2f}R", f"TP reached: {rep.get('tp_hit')}", f"Candles analyzed: {int(rep.get('candles') or 0)}"]
+    await update.message.reply_text("\n".join(msg))
+
+async def ai_strategy_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+    if not has_active_access(uid, user):
+        await update.message.reply_text("⛔️ Trial finished. Use /billing")
+        return
+    rep = pf_strategy_learning_report(db_trades_all(uid))
+    lines = ["🧠 AI Strategy Report", HDR, str(rep.get("summary") or "No data"), SEP, "Recommendations:"]
+    for r in (rep.get("recommendations") or []):
+        lines.append(f"• {r}")
+    await update.message.reply_text("\n".join(lines))
+
+
 KNOWN_COMMANDS = sorted(set([
     # Help
     "help", "help_admin",
@@ -7760,7 +7982,7 @@ KNOWN_COMMANDS = sorted(set([
     "health", "health_sys",
 
     # AutoTrade (admin)
-    "open_trades", "autotrade_debug", "autotrade_report",
+    "open_trades", "autotrade_debug", "autotrade_report", "trade_replay", "ai_strategy_report",
 
     # Timezone
     "tz",
@@ -8352,6 +8574,12 @@ Advanced setup quality is now enforced inside the live engine:
 
 /health_sys
 • System health (DB, exchange, email)
+
+/trade_replay [trade_id|last]
+• Replay a recent trade on 5m structure
+
+/ai_strategy_report
+• Self-learning strategy summary + recommendations
 """\
 
 
@@ -15321,6 +15549,8 @@ def main():
     app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
     app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("trade_replay", trade_replay_cmd, block=False))
+    app.add_handler(CommandHandler("ai_strategy_report", ai_strategy_report_cmd, block=False))
     # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
