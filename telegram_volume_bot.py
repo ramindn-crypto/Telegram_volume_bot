@@ -6633,6 +6633,69 @@ def make_setup(
         # Compute confidence BEFORE applying optional pullback penalty
         conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
 
+        # ---------------------------------------------------------
+        # ✅ PulseFutures PRO quality overlay (safe integration)
+        # Uses the appended advanced engines as a confirmation layer
+        # without rewriting the whole live signal pipeline.
+        # ---------------------------------------------------------
+        try:
+            structure = pf_detect_market_structure(c1[-20:] if c1 else c1)
+            trend = pf_mtf_alignment(mv.symbol, fetch_ohlcv)
+            regime = pf_market_regime(c1[-30:] if c1 else c1)
+            sweep = pf_liquidity_sweep(c15[-20:] if c15 else c15)
+            momentum = pf_orderflow_momentum(c15[-12:] if c15 else c15)
+
+            want_trend = "BULLISH" if side == "BUY" else "BEARISH"
+            opposite_trend = "BEARISH" if side == "BUY" else "BULLISH"
+            sweep_ok = (side == "BUY" and sweep == "BUY_SWEEP") or (side == "SELL" and sweep == "SELL_SWEEP")
+            momentum_ok = (side == "BUY" and momentum == "BULLISH") or (side == "SELL" and momentum == "BEARISH")
+            momentum_bad = (side == "BUY" and momentum == "BEARISH") or (side == "SELL" and momentum == "BULLISH")
+
+            # Hard block only when the advanced engines strongly disagree.
+            if structure == opposite_trend and trend == opposite_trend:
+                _rej("pro_structure_trend_conflict", base, mv, f"side={side} structure={structure} trend={trend}")
+                return None
+
+            # Momentum engine works best in trend regimes, not ranging.
+            if engine == "B" and strict_15m and regime == "RANGING" and (not sweep_ok):
+                _rej("pro_ranging_regime_blocks_momentum", base, mv, f"side={side} regime={regime}")
+                return None
+
+            # Confidence nudges: reward alignment, penalize conflict.
+            if structure == want_trend:
+                conf += 3
+            elif structure == "RANGE":
+                conf -= 1
+
+            if trend == want_trend:
+                conf += 3
+            elif trend == "MIXED":
+                conf -= 1
+
+            if sweep_ok:
+                conf += 4
+            if momentum_ok:
+                conf += 3
+            if momentum_bad:
+                conf -= 4
+
+            # Require at least 2 of 3 core confirmations for aggressive momentum setups.
+            if engine == "B":
+                core_hits = 0
+                if trend == want_trend:
+                    core_hits += 1
+                if structure == want_trend:
+                    core_hits += 1
+                if sweep_ok or momentum_ok:
+                    core_hits += 1
+                if core_hits < 2:
+                    _rej("pro_quality_gate_failed", base, mv, f"side={side} hits={core_hits} trend={trend} structure={structure} sweep={sweep} momentum={momentum}")
+                    return None
+
+            conf = int(clamp(float(conf), 0.0, 100.0))
+        except Exception:
+            pass
+
         # Engine A already required pullback_ready; Engine B does not require pullback
         pullback_ok_local = True if engine == "A" else True
 
@@ -8248,6 +8311,11 @@ Not financial advice.
 
 /open_trades
 • Show live open Bybit positions (admin)
+
+Advanced setup quality is now enforced inside the live engine:
+• market structure + MTF alignment + sweep/momentum confirmation
+• ranging-regime block for weak momentum setups
+• confidence boost/penalty from advanced confirmations
 
 ────────────────────
 ⏱️ COOLDOWNS
