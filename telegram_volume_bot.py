@@ -1485,6 +1485,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     - In LIVE mode we read Bybit open positions (includes manual trades).
     - In PAPER mode we use bot journal open risk.
     """
+
     cap = 0.0
     used_risk = 0.0
     open_pnl = 0.0
