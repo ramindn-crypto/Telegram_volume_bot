@@ -8299,15 +8299,8 @@ def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Ev
     return {"ok": True, "run_id": run_id, "promoted": promoted, "chosen_exec_tf": best_tf, "best_score": float(best_score), "best_params": dict(best_params), "metrics": dict(best_metrics), "reject_stats": dict(best_rejects or {}), "universe_snap_id": universe_snap_id, "universe_size": universe_size, "session_mode": str(session_mode), "days_requested": int(days)}
 
 async def _notify_admins_autonomous_opt(bot, text_msg: str):
-    """Best-effort admin notification for background autonomous optimization events."""
-    try:
-        for admin_id in _admin_ids_all():
-            try:
-                await bot.send_message(chat_id=int(admin_id), text=str(text_msg))
-            except Exception:
-                pass
-    except Exception:
-        pass
+    """No-op: autonomous optimization is fully zero-touch; no Telegram notifications."""
+    return
 
 
 def _autonomous_opt_recent_enough(hours: float) -> bool:
