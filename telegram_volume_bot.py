@@ -945,6 +945,25 @@ def _strategy_config_defaults() -> dict:
         "target_setups_per_day_lo": 3.0,
         "target_setups_per_day_hi": 5.0,
 
+        # Self-optimization governance
+        "session_weights": {"NY": 1.0, "LON": 0.6, "ASIA": 0.3},  # optimizer weighting
+        "concentration_cap": 0.25,          # no single symbol >25% of setups (OOS)
+        "oos_min_setups": 30,               # minimum OOS sample size across universe before promotion
+        "min_win_rate": 70.0,               # enforced only when sample is adequate
+        "min_win_rate_samples": 50,         # require at least this many OOS setups to enforce min_win_rate
+        "max_drawdown_R_cap": 8.0,          # OOS max drawdown cap in R (penalize heavily above)
+
+        # Setup-count governor (live engine + optimizer)
+        "governor_enabled": True,
+        "governor_window_hours": 24,
+        "governor_target_lo": 3.0,
+        "governor_target_hi": 5.0,
+        "governor_step_score": 1.0,         # +/- points applied to quality_score_min_email when adjusting
+        "governor_score_min": 52.0,         # absolute lower bound for quality_score_min_email
+        "governor_score_max": 82.0,         # absolute upper bound for quality_score_min_email
+        "governor_apply_to": "email",       # 'email' (safe) or 'email+screen'
+        "governor_last_adjust_ts": 0.0,
+
         # Optimization bounds (safe ranges)
         "opt_bounds": {
             "quality_score_min_screen": [52.0, 70.0],
@@ -7197,27 +7216,126 @@ def _walk_forward_split(ohlcv: list, train_frac: float = 0.7) -> tuple[list, lis
     return ohlcv[:cut], ohlcv[cut:]
 
 def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session_name: str) -> dict:
-    """Same as run_backtest but uses already-fetched ohlcv."""
-    tf_min = _tf_to_minutes(tf)
+    """Same as run_backtest but uses already-fetched ohlcv.
+
+    WIN DEFINITION (enforced everywhere in backtests/optimizer):
+    - WIN = TP1 is hit before SL within the evaluation window.
+      (If TP2/TP3 hit first, TP1 necessarily hit earlier, so TP2/TP3 are also wins.)
+    """
     if not ohlcv or len(ohlcv) < 300:
         return {"ok": False, "error": "insufficient_ohlcv", "symbol": symbol, "tf": tf, "days": days}
+
     setups = _backtest_generate_setups(symbol, ohlcv, tf, session_name=session_name)
     if not setups:
-        return {"ok": True, "symbol": symbol, "tf": tf, "days": days, "setups": 0, "trades": 0, "avg_R": 0.0, "profit_factor": 0.0, "max_drawdown_R": 0.0, "equity_R": 0.0, "reject_breakdown": dict(_BT_LAST_REJECTS)}
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "tf": tf,
+            "days": days,
+            "setups": 0,
+            "trades": 0,
+            "win_rate": 0.0,
+            "avg_R": 0.0,
+            "profit_factor": 0.0,
+            "max_drawdown_R": 0.0,
+            "equity_R": 0.0,
+            "reject_breakdown": dict(_BT_LAST_REJECTS),
+            "by_session": {},
+        }
+
     results = []
-    eq = 0.0; peak = 0.0; max_dd = 0.0
+    eq = 0.0
+    peak = 0.0
+    max_dd = 0.0
+
+    by_session = defaultdict(lambda: {"setups": 0, "wins": 0, "losses": 0, "r": []})
+
     for s in setups:
         try:
             sid = str(getattr(s, "setup_id", "BT-0"))
             i = int(sid.split("-")[-1])
         except Exception:
             i = 0
+
+        # Infer the setup timestamp (UTC) from candle index
+        ts_sec = 0.0
+        try:
+            ts_raw = float((ohlcv[i][0] if i < len(ohlcv) else ohlcv[-1][0]) or 0.0)
+            ts_sec = (ts_raw / 1000.0) if ts_raw > 1e12 else ts_raw
+        except Exception:
+            ts_sec = 0.0
+
+        sess = "?"
+        try:
+            sess = str(_session_label_from_ts(ts_sec) or "?")
+        except Exception:
+            sess = "?"
+
         res = _simulate_one_setup(ohlcv, i + 1, s)
         res["R"] = float(res.get("R", 0.0) or 0.0)
+        res["session"] = sess
         results.append(res)
+
         eq += res["R"]
         peak = max(peak, eq)
         max_dd = max(max_dd, peak - eq)
+
+        out = str(res.get("outcome") or "").upper().strip()
+        by_session[sess]["setups"] += 1
+        by_session[sess]["r"].append(float(res["R"]))
+
+        # WIN definition: TP1 hit before SL => TP1/TP2/TP3 are all wins
+        if out in ("TP1", "TP2", "TP3"):
+            by_session[sess]["wins"] += 1
+        elif out in ("SL", "LOSS"):
+            by_session[sess]["losses"] += 1
+
+    total = len(results)
+
+    # WIN definition: TP1 hit before SL (TP1/TP2/TP3 outcomes are wins)
+    wins = sum(1 for r in results if str(r.get("outcome") or "").upper().strip() in ("TP1", "TP2", "TP3"))
+    win_rate = (wins / total * 100.0) if total else 0.0
+
+    avg_r = (sum(float(r.get("R", 0.0) or 0.0) for r in results) / total) if total else 0.0
+    gross_win = sum(max(0.0, float(r.get("R", 0.0) or 0.0)) for r in results)
+    gross_loss = sum(min(0.0, float(r.get("R", 0.0) or 0.0)) for r in results)
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float("inf") if gross_win > 0 else 0.0)
+
+    # Session summaries (win_rate + avg_R per session)
+    by_sess_out = {}
+    for sess, d in dict(by_session).items():
+        s_n = int(d.get("setups", 0) or 0)
+        s_w = int(d.get("wins", 0) or 0)
+        s_l = int(d.get("losses", 0) or 0)
+        s_dec = s_w + s_l
+        s_wr = (s_w / s_dec * 100.0) if s_dec else 0.0
+        rr = d.get("r") or []
+        s_avg_r = (sum(float(x) for x in rr) / len(rr)) if rr else 0.0
+        by_sess_out[str(sess)] = {
+            "setups": s_n,
+            "wins": s_w,
+            "losses": s_l,
+            "decided": s_dec,
+            "win_rate": float(s_wr),
+            "avg_R": float(s_avg_r),
+        }
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "tf": tf,
+        "days": days,
+        "setups": total,
+        "trades": total,
+        "win_rate": float(win_rate),
+        "avg_R": float(avg_r),
+        "profit_factor": pf,
+        "max_drawdown_R": float(max_dd),
+        "equity_R": float(eq),
+        "reject_breakdown": dict(_BT_LAST_REJECTS),
+        "by_session": by_sess_out,
+    }
+
 
     total = len(results)
     wins = [r for r in results if str(r.get("outcome")) == "TP3"]
@@ -7243,13 +7361,147 @@ def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session
     }
 
 def _objective(oos: list[dict], days: int, cfg: dict) -> float:
-    """Robust objective: expectancy + PF, penalize drawdown and off-target frequency."""
+    """OOS-first objective with anti-overfitting safeguards.
+
+    - Primary: OOS expectancy (Avg R) + Profit Factor (PF)
+    - Enforces frequency target (3–5 setups/day) via penalty
+    - Penalizes: drawdown, low sample size, symbol concentration, session imbalance/instability
+    - WIN definition used in win_rate: TP1 hit before SL (TP1/TP2/TP3 outcomes are wins)
+    """
     if not oos:
-        return -1e9
-    # Aggregate
-    total_setups = sum(int(r.get("setups", 0) or 0) for r in oos)
+        return -1e12
+
     total_days = max(1.0, float(days))
+    ok_rows = [r for r in oos if r and r.get("ok")]
+
+    if not ok_rows:
+        return -1e12
+
+    total_setups = sum(int(r.get("setups", 0) or 0) for r in ok_rows)
     setups_day = total_setups / total_days
+
+    # Hard minimum sample size to avoid fake win-rate / tiny samples
+    min_oos_setups = int(cfg.get("oos_min_setups", 30) or 30)
+    if total_setups < min_oos_setups:
+        # Still allow ranking (but heavily penalize) so optimizer can find something workable.
+        sample_pen = (min_oos_setups - total_setups) * 8.0
+    else:
+        sample_pen = 0.0
+
+    # Aggregate per-symbol metrics (weighted by setups)
+    w_sum = max(1.0, float(total_setups))
+    avg_r = sum(float(r.get("avg_R", 0.0) or 0.0) * float(r.get("setups", 0) or 0) for r in ok_rows) / w_sum
+    pf_vals = []
+    dd_vals = []
+    wr_num = 0.0
+    for r in ok_rows:
+        st = float(r.get("setups", 0) or 0)
+        pf_i = r.get("profit_factor")
+        pf_i = 10.0 if pf_i == float("inf") else float(pf_i or 0.0)
+        pf_vals.append(pf_i * st)
+        dd_vals.append(float(r.get("max_drawdown_R", 0.0) or 0.0) * st)
+        wr_num += float(r.get("win_rate", 0.0) or 0.0) * st
+    pf = (sum(pf_vals) / w_sum) if pf_vals else 0.0
+    dd = (sum(dd_vals) / w_sum) if dd_vals else 0.0
+    win_rate = (wr_num / w_sum) if w_sum else 0.0
+
+    # Frequency penalty (target band)
+    lo = float(cfg.get("target_setups_per_day_lo", 3.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 5.0))
+    freq_pen = 0.0
+    if setups_day < lo:
+        freq_pen = (lo - setups_day) * 4.0
+    elif setups_day > hi:
+        freq_pen = (setups_day - hi) * 4.0
+
+    # Concentration penalty: discourage all setups from one symbol
+    sym_counts = sorted([int(r.get("setups", 0) or 0) for r in ok_rows], reverse=True)
+    conc_cap = float(cfg.get("concentration_cap", 0.25) or 0.25)
+    conc_pen = 0.0
+    if sym_counts and total_setups > 0:
+        top_share = float(sym_counts[0]) / float(total_setups)
+        if top_share > conc_cap:
+            conc_pen = (top_share - conc_cap) * 20.0
+
+    # Stability penalty across symbols: high variance of Avg R is a red flag
+    try:
+        sym_avg_rs = [float(r.get("avg_R", 0.0) or 0.0) for r in ok_rows if int(r.get("setups", 0) or 0) >= 3]
+        if len(sym_avg_rs) >= 8:
+            mu = sum(sym_avg_rs) / len(sym_avg_rs)
+            var = sum((x - mu) ** 2 for x in sym_avg_rs) / max(1, (len(sym_avg_rs) - 1))
+            stab_pen = (var ** 0.5) * 10.0
+        else:
+            stab_pen = 0.0
+    except Exception:
+        stab_pen = 0.0
+
+    # Session-weighted performance (NY > LON > ASIA) if by_session is present
+    session_weights = cfg.get("session_weights") or {"NY": 1.0, "LON": 0.6, "ASIA": 0.3}
+    try:
+        wny = float(session_weights.get("NY", 1.0))
+        wlon = float(session_weights.get("LON", 0.6))
+        wasia = float(session_weights.get("ASIA", 0.3))
+    except Exception:
+        wny, wlon, wasia = 1.0, 0.6, 0.3
+
+    sess_acc = {"NY": {"n": 0, "wr": 0.0, "r": 0.0}, "LON": {"n": 0, "wr": 0.0, "r": 0.0}, "ASIA": {"n": 0, "wr": 0.0, "r": 0.0}}
+    for r in ok_rows:
+        bs = r.get("by_session") or {}
+        if not isinstance(bs, dict):
+            continue
+        for sname in ("NY", "LON", "ASIA"):
+            d = bs.get(sname) or {}
+            try:
+                n = float(d.get("setups", 0) or 0)
+                if n <= 0:
+                    continue
+                sess_acc[sname]["n"] += n
+                sess_acc[sname]["wr"] += float(d.get("win_rate", 0.0) or 0.0) * n
+                sess_acc[sname]["r"] += float(d.get("avg_R", 0.0) or 0.0) * n
+            except Exception:
+                continue
+
+    # Weighted avg_R / win_rate across sessions (only for those with data)
+    sw = 0.0
+    s_wr = 0.0
+    s_r = 0.0
+    for sname, w in (("NY", wny), ("LON", wlon), ("ASIA", wasia)):
+        n = float(sess_acc[sname]["n"] or 0.0)
+        if n <= 0:
+            continue
+        wr_i = float(sess_acc[sname]["wr"] / n) if n else 0.0
+        r_i = float(sess_acc[sname]["r"] / n) if n else 0.0
+        sw += float(w) * n
+        s_wr += float(w) * wr_i * n
+        s_r += float(w) * r_i * n
+
+    if sw > 0:
+        wr_weighted = s_wr / sw
+        r_weighted = s_r / sw
+    else:
+        wr_weighted = float(win_rate)
+        r_weighted = float(avg_r)
+
+    # Win-rate gating (only if sample is adequate)
+    min_wr = float(cfg.get("min_win_rate", 70.0) or 70.0)
+    min_wr_samples = int(cfg.get("min_win_rate_samples", 50) or 50)
+    wr_pen = 0.0
+    if total_setups >= min_wr_samples and wr_weighted < min_wr:
+        wr_pen = (min_wr - wr_weighted) * 2.5
+
+    # Drawdown penalty (harder once above cap)
+    dd_cap = float(cfg.get("max_drawdown_R_cap", 8.0) or 8.0)
+    dd_pen = 0.0
+    if dd > dd_cap:
+        dd_pen = (dd - dd_cap) * 6.0
+    else:
+        dd_pen = dd * 0.9
+
+    # Final score (maximize)
+    # Expectancy dominates, then PF; penalties enforce safety + frequency.
+    score = (r_weighted * 12.0) + (pf * 1.4) - dd_pen - freq_pen - conc_pen - stab_pen - sample_pen - wr_pen
+    return float(score)
+
 
     avg_r = 0.0
     pf = 0.0
@@ -7475,6 +7727,794 @@ async def cmd_optimize_report(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 
+
+
+
+# =========================================================
+# SELF-OPTIMIZATION v2 (ADMIN) — end-to-end, resumable, kill-switch
+# - Builds daily TOP100 universe (>= $10M 24h quote volume) and snapshots it in SQLite
+# - Runs bounded deterministic search across TF candidates and param grid
+# - Uses walk-forward split (70/30) and OOS-first objective with session weights (NY > LON > ASIA)
+# - Promotes config ONLY if stability gates pass
+# =========================================================
+
+SELF_OPT_DEFAULT_SESSION_MODE = "24H_WEIGHTED"  # NY weighted highest, then LON, then ASIA
+
+# Global job state (single-run at a time; Render-friendly)
+_SELF_OPT_STATE = {
+    "task": None,              # asyncio.Task
+    "stop_event": None,        # threading.Event (checked inside heavy loop)
+    "run_id": None,            # str
+    "started_ts": 0.0,
+}
+
+def _opt_migrate_tables():
+    """Create/extend self-optimization tables (backward compatible)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+
+            c.execute("""CREATE TABLE IF NOT EXISTS universe_snapshots (
+                snap_id TEXT PRIMARY KEY,
+                day_utc TEXT NOT NULL,
+                created_ts REAL NOT NULL,
+                top_n INTEGER NOT NULL,
+                min_vol_usd REAL NOT NULL,
+                symbols_json TEXT NOT NULL,
+                meta_json TEXT NOT NULL DEFAULT ''
+            )""")
+
+            c.execute("""CREATE TABLE IF NOT EXISTS optimization_runs (
+                run_id TEXT PRIMARY KEY,
+                started_ts REAL NOT NULL,
+                finished_ts REAL,
+                status TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                session_mode TEXT NOT NULL,
+                tf_candidates_json TEXT NOT NULL,
+                universe_snap_id TEXT,
+                universe_size INTEGER DEFAULT 0,
+                progress_json TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT ''
+            )""")
+
+            c.execute("""CREATE TABLE IF NOT EXISTS optimization_results (
+                run_id TEXT PRIMARY KEY,
+                promoted INTEGER NOT NULL DEFAULT 0,
+                chosen_exec_tf TEXT,
+                best_score REAL,
+                best_params_json TEXT,
+                metrics_json TEXT,
+                reject_stats_json TEXT,
+                created_ts REAL NOT NULL
+            )""")
+
+            c.execute("""CREATE TABLE IF NOT EXISTS promotion_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                run_id TEXT NOT NULL,
+                from_cfg_json TEXT,
+                to_cfg_json TEXT,
+                decision TEXT NOT NULL,
+                reasons_json TEXT NOT NULL DEFAULT ''
+            )""")
+
+            try:
+                c.execute("CREATE INDEX IF NOT EXISTS idx_universe_day ON universe_snapshots(day_utc)")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_opt_runs_status ON optimization_runs(status)")
+            except Exception:
+                pass
+
+            conn.commit()
+    except Exception:
+        pass
+
+def _utc_day_str(ts: float | None = None) -> str:
+    try:
+        dt = datetime.fromtimestamp(float(ts or time.time()), tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _json_dumps_safe(obj) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        try:
+            return json.dumps(str(obj), ensure_ascii=False)
+        except Exception:
+            return ""
+
+def _db_insert_universe_snapshot(day_utc: str, top_n: int, min_vol_usd: float, symbols: list[dict], meta: dict) -> str:
+    _opt_migrate_tables()
+    snap_id = f"UNIV-{day_utc}-{int(time.time())}"
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO universe_snapshots(snap_id, day_utc, created_ts, top_n, min_vol_usd, symbols_json, meta_json) VALUES(?,?,?,?,?,?,?)",
+                (snap_id, str(day_utc), float(time.time()), int(top_n), float(min_vol_usd), _json_dumps_safe(symbols), _json_dumps_safe(meta)),
+            )
+            conn.commit()
+    except Exception:
+        pass
+    return snap_id
+
+def _db_get_universe_snapshot(day_utc: str) -> Optional[dict]:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute(
+                "SELECT snap_id, created_ts, top_n, min_vol_usd, symbols_json, meta_json FROM universe_snapshots WHERE day_utc=? ORDER BY created_ts DESC LIMIT 1",
+                (str(day_utc),),
+            ).fetchone()
+            if not row:
+                return None
+            snap_id, created_ts, top_n, min_vol_usd, symbols_json, meta_json = row
+            return {
+                "snap_id": snap_id,
+                "day_utc": str(day_utc),
+                "created_ts": float(created_ts or 0.0),
+                "top_n": int(top_n or 0),
+                "min_vol_usd": float(min_vol_usd or 0.0),
+                "symbols": json.loads(symbols_json) if symbols_json else [],
+                "meta": json.loads(meta_json) if meta_json else {},
+            }
+    except Exception:
+        return None
+
+def _build_universe_snapshot_top_volume(top_n: int = 100, min_vol_usd: float = 10_000_000.0) -> dict:
+    """Build TOP-N USDT linear perpetual universe by 24-hour quote volume, store snapshot for reproducibility."""
+    _opt_migrate_tables()
+    day_utc = _utc_day_str()
+
+    ex = get_exchange()
+    markets = getattr(ex, "markets", {}) or {}
+
+    try:
+        best = fetch_futures_tickers()  # base -> MarketVol
+    except Exception:
+        best = {}
+
+    rows = []
+    for base, mv in (best or {}).items():
+        try:
+            sym = str(getattr(mv, "symbol", "") or "")
+            if not sym:
+                continue
+            m = markets.get(sym) or {}
+            if not bool(m.get("swap")):
+                continue
+            if str(m.get("quote", "")).upper() != "USDT":
+                continue
+            qv = float(getattr(mv, "quote_vol", 0.0) or 0.0)
+            if qv < float(min_vol_usd):
+                continue
+            last = float(getattr(mv, "last", 0.0) or 0.0)
+            if last <= 0:
+                continue
+            rows.append({"symbol": sym, "base": str(getattr(mv, "base", base) or base), "quote_vol_usd": float(qv), "last": float(last)})
+        except Exception:
+            continue
+
+    rows.sort(key=lambda r: float(r.get("quote_vol_usd", 0.0) or 0.0), reverse=True)
+    rows = rows[: max(1, int(top_n))]
+
+    meta = {"source": "ccxt.fetch_tickers (filtered swap USDT)", "count": int(len(rows)), "min_vol_usd": float(min_vol_usd)}
+    snap_id = _db_insert_universe_snapshot(day_utc=day_utc, top_n=int(top_n), min_vol_usd=float(min_vol_usd), symbols=rows, meta=meta)
+
+    return {"day_utc": day_utc, "snap_id": snap_id, "symbols": rows, "market_symbols": [str(r["symbol"]) for r in rows], "meta": meta}
+
+def _db_create_opt_run(run_id: str, days: int, session_mode: str, tf_candidates: list[str], universe_snap_id: str, universe_size: int) -> None:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO optimization_runs(run_id, started_ts, status, days, session_mode, tf_candidates_json, universe_snap_id, universe_size, progress_json, notes) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (str(run_id), float(time.time()), "RUNNING", int(days), str(session_mode), _json_dumps_safe(tf_candidates), str(universe_snap_id), int(universe_size), _json_dumps_safe({}), ""),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def _db_update_opt_run(run_id: str, status: Optional[str] = None, progress: Optional[dict] = None, notes: Optional[str] = None, finished: bool = False) -> None:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            fields = []
+            vals = []
+            if status is not None:
+                fields.append("status=?"); vals.append(str(status))
+            if progress is not None:
+                fields.append("progress_json=?"); vals.append(_json_dumps_safe(progress))
+            if notes is not None:
+                fields.append("notes=?"); vals.append(str(notes))
+            if finished:
+                fields.append("finished_ts=?"); vals.append(float(time.time()))
+            if not fields:
+                return
+            vals.append(str(run_id))
+            c.execute(f"UPDATE optimization_runs SET {', '.join(fields)} WHERE run_id=?", vals)
+            conn.commit()
+    except Exception:
+        pass
+
+def _db_save_opt_result(run_id: str, promoted: bool, chosen_exec_tf: str, best_score: float, best_params: dict, metrics: dict, reject_stats: dict) -> None:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO optimization_results(run_id, promoted, chosen_exec_tf, best_score, best_params_json, metrics_json, reject_stats_json, created_ts) VALUES(?,?,?,?,?,?,?,?)",
+                (str(run_id), 1 if promoted else 0, str(chosen_exec_tf or ""), float(best_score), _json_dumps_safe(best_params), _json_dumps_safe(metrics), _json_dumps_safe(reject_stats), float(time.time())),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def _db_get_last_opt_run() -> Optional[dict]:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute(
+                "SELECT run_id, started_ts, finished_ts, status, days, session_mode, tf_candidates_json, universe_snap_id, universe_size, progress_json, notes FROM optimization_runs ORDER BY started_ts DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            run_id, started_ts, finished_ts, status, days, session_mode, tf_json, universe_snap_id, universe_size, progress_json, notes = row
+            return {
+                "run_id": str(run_id),
+                "started_ts": float(started_ts or 0.0),
+                "finished_ts": float(finished_ts or 0.0) if finished_ts is not None else None,
+                "status": str(status),
+                "days": int(days or 0),
+                "session_mode": str(session_mode),
+                "tf_candidates": json.loads(tf_json) if tf_json else [],
+                "universe_snap_id": str(universe_snap_id or ""),
+                "universe_size": int(universe_size or 0),
+                "progress": json.loads(progress_json) if progress_json else {},
+                "notes": str(notes or ""),
+            }
+    except Exception:
+        return None
+
+def _db_get_opt_result(run_id: str) -> Optional[dict]:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute(
+                "SELECT promoted, chosen_exec_tf, best_score, best_params_json, metrics_json, reject_stats_json, created_ts FROM optimization_results WHERE run_id=?",
+                (str(run_id),),
+            ).fetchone()
+            if not row:
+                return None
+            promoted, chosen_exec_tf, best_score, best_params_json, metrics_json, reject_stats_json, created_ts = row
+            return {
+                "run_id": str(run_id),
+                "promoted": bool(int(promoted or 0)),
+                "chosen_exec_tf": str(chosen_exec_tf or ""),
+                "best_score": float(best_score or 0.0),
+                "best_params": json.loads(best_params_json) if best_params_json else {},
+                "metrics": json.loads(metrics_json) if metrics_json else {},
+                "reject_stats": json.loads(reject_stats_json) if reject_stats_json else {},
+                "created_ts": float(created_ts or 0.0),
+            }
+    except Exception:
+        return None
+
+def _db_log_promotion(run_id: str, from_cfg: dict, to_cfg: dict, decision: str, reasons: list[str]) -> None:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO promotion_log(ts, run_id, from_cfg_json, to_cfg_json, decision, reasons_json) VALUES(?,?,?,?,?,?)",
+                (float(time.time()), str(run_id), _json_dumps_safe(from_cfg), _json_dumps_safe(to_cfg), str(decision), _json_dumps_safe(reasons or [])),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def _governor_adjust_quality_floor(session_name: str = "NY") -> Optional[dict]:
+    """Setup governor to keep *email* setup frequency ~3–5/day without spamming."""
+    cfg = load_strategy_config(force=True)
+    if not bool(cfg.get("governor_enabled", True)):
+        return None
+
+    try:
+        window_h = float(cfg.get("governor_window_hours", 24) or 24)
+        target_lo = float(cfg.get("governor_target_lo", cfg.get("target_setups_per_day_lo", 3.0)) or 3.0)
+        target_hi = float(cfg.get("governor_target_hi", cfg.get("target_setups_per_day_hi", 5.0)) or 5.0)
+        step = float(cfg.get("governor_step_score", 1.0) or 1.0)
+        smin = float(cfg.get("governor_score_min", 52.0) or 52.0)
+        smax = float(cfg.get("governor_score_max", 82.0) or 82.0)
+        last_adj = float(cfg.get("governor_last_adjust_ts", 0.0) or 0.0)
+    except Exception:
+        return None
+
+    # Avoid oscillation
+    if time.time() - last_adj < 3600.0:
+        return None
+
+    since_ts = time.time() - window_h * 3600.0
+    sess = str(session_name or "").upper().strip() or "NY"
+
+    n = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            try:
+                n = int(c.execute(
+                    "SELECT COUNT(1) AS n FROM generated_setups WHERE source='email' AND created_ts>=? AND (session='' OR session IS NULL OR session=?)",
+                    (float(since_ts), sess),
+                ).fetchone()["n"])
+            except Exception:
+                n = int(c.execute(
+                    "SELECT COUNT(1) AS n FROM generated_setups WHERE source='email' AND created_ts>=?",
+                    (float(since_ts),),
+                ).fetchone()["n"])
+    except Exception:
+        n = 0
+
+    setups_per_day = float(n) / max(1e-9, (window_h / 24.0))
+
+    cur_q = float(cfg.get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
+    new_q = cur_q
+    action = "hold"
+
+    if setups_per_day > target_hi:
+        new_q = min(smax, cur_q + step); action = "tighten"
+    elif setups_per_day < target_lo:
+        new_q = max(smin, cur_q - step); action = "loosen"
+
+    if abs(new_q - cur_q) < 1e-9:
+        return None
+
+    cfg["quality_score_min_email"] = float(new_q)
+    cfg["governor_last_adjust_ts"] = float(time.time())
+    save_strategy_config(cfg)
+    apply_strategy_config(cfg)
+
+    return {"session": sess, "window_h": window_h, "setups_per_day": setups_per_day, "action": action, "from": cur_q, "to": new_q, "target_lo": target_lo, "target_hi": target_hi}
+
+def _self_opt_stability_gates(metrics: dict, cfg: dict) -> tuple[bool, list[str]]:
+    """Promotion gates (OOS). Returns (ok, reasons_if_not_ok)."""
+    reasons = []
+    try:
+        oos = metrics.get("oos") or {}
+        total_setups = int(oos.get("setups", 0) or 0)
+        setups_day = float(oos.get("setups_per_day", 0.0) or 0.0)
+        wr = float(oos.get("win_rate", 0.0) or 0.0)
+        avg_r = float(oos.get("avg_R", 0.0) or 0.0)
+        pf = float(oos.get("profit_factor", 0.0) or 0.0)
+        dd = float(oos.get("max_drawdown_R", 0.0) or 0.0)
+        conc = float(oos.get("top_symbol_share", 0.0) or 0.0)
+    except Exception:
+        return (False, ["metrics_parse_error"])
+
+    min_setups = int(cfg.get("oos_min_setups", 30) or 30)
+    if total_setups < min_setups:
+        reasons.append(f"oos_sample_too_small ({total_setups} < {min_setups})")
+
+    lo = float(cfg.get("target_setups_per_day_lo", 3.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 5.0))
+    if setups_day < lo:
+        reasons.append(f"frequency_too_low ({setups_day:.2f} < {lo:.2f})")
+    if setups_day > hi * 1.25:
+        reasons.append(f"frequency_too_high ({setups_day:.2f} > {hi*1.25:.2f})")
+
+    if pf < 1.15:
+        reasons.append(f"pf_too_low ({pf:.2f} < 1.15)")
+    if avg_r < 0.10:
+        reasons.append(f"avg_R_too_low ({avg_r:.3f} < 0.10)")
+
+    dd_cap = float(cfg.get("max_drawdown_R_cap", 8.0) or 8.0)
+    if dd > dd_cap:
+        reasons.append(f"drawdown_too_high ({dd:.2f}R > {dd_cap:.2f}R)")
+
+    conc_cap = float(cfg.get("concentration_cap", 0.25) or 0.25)
+    if conc > conc_cap:
+        reasons.append(f"overconcentrated (top_symbol_share={conc:.2%} > {conc_cap:.2%})")
+
+    min_wr = float(cfg.get("min_win_rate", 70.0) or 70.0)
+    min_wr_samples = int(cfg.get("min_win_rate_samples", 50) or 50)
+    if total_setups >= min_wr_samples and wr < min_wr:
+        reasons.append(f"win_rate_below_target ({wr:.1f}% < {min_wr:.1f}%)")
+
+    return (len(reasons) == 0), reasons
+
+def _self_opt_format_report(res: dict) -> str:
+    run_id = res.get("run_id") or "?"
+    promoted = bool(res.get("promoted"))
+    chosen_tf = res.get("chosen_exec_tf") or "?"
+    score = float(res.get("best_score", 0.0) or 0.0)
+    p = res.get("best_params") or {}
+    m = res.get("metrics") or {}
+    oos = m.get("oos") or {}
+    sess = m.get("by_session") or {}
+
+    def _sess_line(name: str):
+        d = sess.get(name) or {}
+        return f"{name}: setups={int(d.get('setups',0) or 0)} | WR={float(d.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(d.get('avg_R',0.0) or 0.0):.3f}"
+
+    lines = [
+        "🧠 Self-Optimize Report (last)",
+        HDR,
+        f"Run: {run_id}",
+        f"Decision: {'✅ PROMOTED' if promoted else '❌ NOT PROMOTED'}",
+        f"Chosen exec TF: {chosen_tf} | Objective: {score:.3f}",
+        SEP,
+        f"OOS setups/day: {float(oos.get('setups_per_day',0.0) or 0.0):.2f} (target {float(p.get('target_setups_per_day_lo',3.0) or 3.0):.0f}–{float(p.get('target_setups_per_day_hi',5.0) or 5.0):.0f})",
+        f"OOS setups: {int(oos.get('setups',0) or 0)} | Win rate: {float(oos.get('win_rate',0.0) or 0.0):.1f}%",
+        f"OOS Avg R: {float(oos.get('avg_R',0.0) or 0.0):.3f} | PF: {float(oos.get('profit_factor',0.0) or 0.0):.2f} | MaxDD(R): {float(oos.get('max_drawdown_R',0.0) or 0.0):.2f}",
+        f"Concentration: top_symbol_share={float(oos.get('top_symbol_share',0.0) or 0.0):.1%}",
+        SEP,
+        "Session breakdown (OOS):",
+        f"• {_sess_line('NY')}",
+        f"• {_sess_line('LON')}",
+        f"• {_sess_line('ASIA')}",
+        SEP,
+        "Best params (subset):",
+        f"quality_score_min_screen={p.get('quality_score_min_screen')} | quality_score_min_email={p.get('quality_score_min_email')}",
+        f"min_rr_tp3={p.get('min_rr_tp3')} | atr_min_pct={p.get('atr_min_pct')}",
+        f"tf_align_1h_min_abs={p.get('tf_align_1h_min_abs')} | tf_align_4h_min_abs={p.get('tf_align_4h_min_abs')}",
+    ]
+
+    try:
+        rejects = res.get("reject_stats") or {}
+        if isinstance(rejects, dict) and rejects:
+            lines.append(SEP)
+            lines.append("Top reject reasons (OOS generator):")
+            items = sorted(rejects.items(), key=lambda kv: int(kv[1]), reverse=True)[:10]
+            for k, v in items:
+                lines.append(f"• {k}: {int(v)}")
+    except Exception:
+        pass
+
+    try:
+        reasons = (m.get("promotion_reasons") or [])
+        if isinstance(reasons, list) and reasons:
+            lines.append(SEP)
+            lines.append("Promotion gate notes:")
+            for r in reasons[:12]:
+                lines.append(f"• {str(r)}")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+def _compute_oos_summary(oos_rows: list[dict], days: float, conc_cap: float) -> dict:
+    ok_rows = [r for r in (oos_rows or []) if r and r.get("ok")]
+    total_setups = sum(int(r.get("setups",0) or 0) for r in ok_rows)
+    total_days = max(1.0, float(days))
+    setups_day = float(total_setups) / total_days
+
+    if total_setups <= 0:
+        return {"setups": 0, "setups_per_day": float(setups_day), "win_rate": 0.0, "avg_R": 0.0, "profit_factor": 0.0, "max_drawdown_R": 0.0, "top_symbol_share": 0.0}
+
+    w_sum = float(total_setups)
+    avg_r = sum(float(r.get("avg_R",0.0) or 0.0) * float(r.get("setups",0) or 0) for r in ok_rows) / w_sum
+    wr = sum(float(r.get("win_rate",0.0) or 0.0) * float(r.get("setups",0) or 0) for r in ok_rows) / w_sum
+    pf = sum((10.0 if r.get("profit_factor")==float("inf") else float(r.get("profit_factor") or 0.0)) * float(r.get("setups",0) or 0) for r in ok_rows) / w_sum
+    dd = sum(float(r.get("max_drawdown_R",0.0) or 0.0) * float(r.get("setups",0) or 0) for r in ok_rows) / w_sum
+
+    sym_counts = sorted([int(r.get("setups",0) or 0) for r in ok_rows], reverse=True)
+    top_share = (float(sym_counts[0]) / float(total_setups)) if sym_counts and total_setups > 0 else 0.0
+
+    return {"setups": int(total_setups), "setups_per_day": float(setups_day), "win_rate": float(wr), "avg_R": float(avg_r), "profit_factor": float(pf), "max_drawdown_R": float(dd), "top_symbol_share": float(top_share), "concentration_cap": float(conc_cap)}
+
+def _aggregate_by_session(oos_rows: list[dict]) -> dict:
+    out = {"NY": {"n": 0, "wr": 0.0, "r": 0.0}, "LON": {"n": 0, "wr": 0.0, "r": 0.0}, "ASIA": {"n": 0, "wr": 0.0, "r": 0.0}}
+    for r in (oos_rows or []):
+        if not r or not r.get("ok"):
+            continue
+        bs = r.get("by_session") or {}
+        if not isinstance(bs, dict):
+            continue
+        for sname in ("NY","LON","ASIA"):
+            d = bs.get(sname) or {}
+            try:
+                n = float(d.get("setups",0) or 0.0)
+                if n <= 0:
+                    continue
+                out[sname]["n"] += n
+                out[sname]["wr"] += float(d.get("win_rate",0.0) or 0.0) * n
+                out[sname]["r"] += float(d.get("avg_R",0.0) or 0.0) * n
+            except Exception:
+                continue
+    pretty = {}
+    for sname, d in out.items():
+        n = float(d["n"] or 0.0)
+        pretty[sname] = {"setups": int(n), "win_rate": float((d["wr"]/n) if n else 0.0), "avg_R": float((d["r"]/n) if n else 0.0)}
+    return pretty
+
+def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Event, progress_cb=None) -> dict:
+    """Runs full self-optimization pipeline in a worker thread."""
+    _opt_migrate_tables()
+    base_cfg = load_strategy_config(force=True)
+
+    # TF candidates start: 5m,15m only (expand only if frequency target not met)
+    tf_candidates = ["5m", "15m"]
+
+    # Universe snapshot (TOP100, >=$10M)
+    univ = _build_universe_snapshot_top_volume(top_n=100, min_vol_usd=10_000_000.0)
+    universe_snap_id = str(univ.get("snap_id") or "")
+    universe = list(univ.get("market_symbols") or [])[:100]
+    universe_size = len(universe)
+
+    run_id = f"OPT-{_utc_day_str()}-{int(time.time())}"
+    _db_create_opt_run(run_id, days=int(days), session_mode=str(session_mode), tf_candidates=tf_candidates, universe_snap_id=universe_snap_id, universe_size=universe_size)
+
+    cands = _generate_candidates(base_cfg)
+    days_test = max(7, int(days * 0.3))
+    conc_cap = float(base_cfg.get("concentration_cap", 0.25) or 0.25)
+
+    best_score = -1e18
+    best_params = None
+    best_metrics = None
+    best_tf = None
+    best_rejects = None
+
+    for exec_tf in tf_candidates:
+        if stop_event.is_set():
+            _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
+            return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
+
+        if progress_cb:
+            progress_cb(f"Fetching OHLCV for TF={exec_tf} (universe={len(universe)})…", {"stage": "fetch_ohlcv", "tf": exec_tf})
+
+        ohlcv_map = {}
+        for si, sym in enumerate(universe):
+            if stop_event.is_set():
+                _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
+                return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
+            try:
+                tf_min = _tf_to_minutes(exec_tf)
+                bars = int((days * 1440) / max(1, tf_min)) + 300
+                bars = int(min(12000, max(900, bars)))
+                ohlcv_map[sym] = fetch_ohlcv(sym, exec_tf, limit=bars)
+            except Exception:
+                ohlcv_map[sym] = []
+            if si % 15 == 0:
+                _db_update_opt_run(run_id, progress={"stage": "fetch_ohlcv", "tf": exec_tf, "symbol_idx": si, "universe": len(universe)})
+
+        for ci, cand in enumerate(cands):
+            if stop_event.is_set():
+                _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
+                return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
+
+            cfg = dict(base_cfg)
+            cfg.update(cand)
+            cfg["exec_tf_default"] = str(exec_tf)
+
+            apply_strategy_config(cfg)
+
+            oos_rows = []
+            reject_acc = Counter()
+
+            for sym in universe:
+                ohl = ohlcv_map.get(sym) or []
+                _train, test = _walk_forward_split(ohl, 0.7)
+                rep = _run_backtest_on_ohlcv(sym, test, days=days_test, tf=exec_tf, session_name=session_mode)
+                oos_rows.append(rep)
+                try:
+                    rb = rep.get("reject_breakdown") or {}
+                    if isinstance(rb, dict):
+                        reject_acc.update(rb)
+                except Exception:
+                    pass
+
+            sc = _objective(oos_rows, days=float(days_test), cfg=cfg)
+
+            if sc > best_score:
+                best_score = float(sc)
+                best_params = dict(cfg)
+                best_tf = str(exec_tf)
+                best_rejects = dict(reject_acc)
+
+                oos_sum = _compute_oos_summary(oos_rows, days=float(days_test), conc_cap=conc_cap)
+                by_sess = _aggregate_by_session(oos_rows)
+                best_metrics = {"oos": oos_sum, "by_session": by_sess}
+
+                _db_update_opt_run(run_id, progress={"stage": "search", "tf": exec_tf, "cand_idx": ci, "cands": len(cands), "best_score": best_score})
+
+                if progress_cb:
+                    progress_cb(f"New best ✅ TF={best_tf} | score={best_score:.3f} | OOS {oos_sum.get('setups_per_day',0.0):.2f}/day | WR {oos_sum.get('win_rate',0.0):.1f}%", {"stage": "new_best"})
+
+            if ci % 5 == 0:
+                _db_update_opt_run(run_id, progress={"stage": "search", "tf": exec_tf, "cand_idx": ci, "cands": len(cands), "best_score": best_score})
+
+    if not best_params or not best_tf or not best_metrics:
+        _db_update_opt_run(run_id, status="FAILED", finished=True, notes="No viable candidate found")
+        _db_save_opt_result(run_id, promoted=False, chosen_exec_tf="", best_score=float(best_score), best_params={}, metrics={}, reject_stats={})
+        return {"ok": False, "run_id": run_id, "status": "FAILED"}
+
+    # Controlled TF expansion: include 3m only if frequency is below target
+    try:
+        oos_day = float(best_metrics.get("oos", {}).get("setups_per_day", 0.0) or 0.0)
+        lo = float(best_params.get("target_setups_per_day_lo", 3.0) or 3.0)
+    except Exception:
+        oos_day = 0.0; lo = 3.0
+
+    if oos_day < lo and not stop_event.is_set():
+        if progress_cb:
+            progress_cb("Frequency below target; expanding TF candidates to include 3m (controlled)…", {"stage": "tf_expand"})
+        exec_tf = "3m"
+        ohlcv_map = {}
+        for sym in universe:
+            try:
+                tf_min = _tf_to_minutes(exec_tf)
+                bars = int((days * 1440) / max(1, tf_min)) + 300
+                bars = int(min(12000, max(1200, bars)))
+                ohlcv_map[sym] = fetch_ohlcv(sym, exec_tf, limit=bars)
+            except Exception:
+                ohlcv_map[sym] = []
+        for cand in cands:
+            if stop_event.is_set():
+                break
+            cfg = dict(base_cfg); cfg.update(cand); cfg["exec_tf_default"] = exec_tf
+            apply_strategy_config(cfg)
+            oos_rows = []
+            reject_acc = Counter()
+            for sym in universe:
+                ohl = ohlcv_map.get(sym) or []
+                _train, test = _walk_forward_split(ohl, 0.7)
+                rep = _run_backtest_on_ohlcv(sym, test, days=days_test, tf=exec_tf, session_name=session_mode)
+                oos_rows.append(rep)
+                try:
+                    rb = rep.get("reject_breakdown") or {}
+                    if isinstance(rb, dict):
+                        reject_acc.update(rb)
+                except Exception:
+                    pass
+            sc = _objective(oos_rows, days=float(days_test), cfg=cfg)
+            if sc > best_score:
+                best_score = float(sc)
+                best_params = dict(cfg)
+                best_tf = str(exec_tf)
+                best_rejects = dict(reject_acc)
+                oos_sum = _compute_oos_summary(oos_rows, days=float(days_test), conc_cap=conc_cap)
+                by_sess = _aggregate_by_session(oos_rows)
+                best_metrics = {"oos": oos_sum, "by_session": by_sess}
+                if progress_cb:
+                    progress_cb(f"New best ✅ TF={best_tf} | score={best_score:.3f} | OOS {oos_sum.get('setups_per_day',0.0):.2f}/day | WR {oos_sum.get('win_rate',0.0):.1f}%", {"stage": "new_best"})
+
+    # Promotion decision
+    gate_ok, gate_reasons = _self_opt_stability_gates(metrics={"oos": best_metrics.get("oos") or {}, "by_session": best_metrics.get("by_session") or {}}, cfg=best_params)
+    best_metrics["promotion_reasons"] = ([] if gate_ok else gate_reasons)
+
+    _db_save_opt_result(run_id, promoted=bool(gate_ok), chosen_exec_tf=str(best_tf), best_score=float(best_score), best_params=dict(best_params), metrics=dict(best_metrics), reject_stats=dict(best_rejects or {}))
+
+    from_cfg = load_strategy_config(force=True)
+    promoted = False
+    if gate_ok:
+        save_strategy_config(best_params)
+        apply_strategy_config(best_params)
+        _db_log_promotion(run_id, from_cfg=from_cfg, to_cfg=best_params, decision="PROMOTED", reasons=[])
+        promoted = True
+        _db_update_opt_run(run_id, status="PROMOTED", finished=True, notes="PROMOTED")
+    else:
+        _db_log_promotion(run_id, from_cfg=from_cfg, to_cfg=best_params, decision="NOT_PROMOTED", reasons=gate_reasons)
+        _db_update_opt_run(run_id, status="NOT_PROMOTED", finished=True, notes="NOT_PROMOTED")
+
+    return {"ok": True, "run_id": run_id, "promoted": promoted, "chosen_exec_tf": best_tf, "best_score": float(best_score), "best_params": dict(best_params), "metrics": dict(best_metrics), "reject_stats": dict(best_rejects or {}), "universe_snap_id": universe_snap_id, "universe_size": universe_size, "session_mode": str(session_mode), "days_requested": int(days)}
+
+async def cmd_self_optimize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    args = context.args or []
+    days = 60
+    session_mode = SELF_OPT_DEFAULT_SESSION_MODE
+    try:
+        if len(args) >= 1:
+            days = _parse_days(str(args[0]))
+        if len(args) >= 2:
+            session_mode = str(args[1]).strip().upper()
+    except Exception:
+        days = 60
+        session_mode = SELF_OPT_DEFAULT_SESSION_MODE
+
+    try:
+        cur_task = _SELF_OPT_STATE.get("task")
+        if cur_task and not cur_task.done():
+            await update.message.reply_text("⚠️ Self-optimization is already running. Use /self_optimize_stop.")
+            return
+    except Exception:
+        pass
+
+    await update.message.reply_text("🧠 /self_optimize started (admin)\nPipeline: universe → walk-forward OOS → stability gates → optional promotion.\n\nCancel anytime: /self_optimize_stop")
+
+    stop_event = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    async def _progress_sender(msg: str):
+        try:
+            await update.message.reply_text(str(msg))
+        except Exception:
+            pass
+
+    def _progress_cb_thread(msg: str, payload: dict):
+        try:
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(_progress_sender(msg)))
+        except Exception:
+            pass
+
+    async def _runner():
+        _SELF_OPT_STATE["stop_event"] = stop_event
+        _SELF_OPT_STATE["started_ts"] = float(time.time())
+        try:
+            res = await to_thread_heavy(_self_optimize_engine, int(days), str(session_mode), stop_event, _progress_cb_thread)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            try:
+                await update.message.reply_text(f"❌ Self-optimize failed: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return
+
+        if not res or not res.get("ok"):
+            st = res.get("status") if isinstance(res, dict) else "FAILED"
+            await update.message.reply_text(f"❌ Self-optimize ended: {st}")
+            return
+
+        _SELF_OPT_STATE["run_id"] = str(res.get("run_id") or "")
+
+        try:
+            save_opt_report(res)  # back-compat store
+        except Exception:
+            pass
+
+        await send_long_message(update, _self_opt_format_report(res), parse_mode=None)
+
+    task = asyncio.create_task(_runner())
+    _SELF_OPT_STATE["task"] = task
+
+async def cmd_self_optimize_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    try:
+        ev = _SELF_OPT_STATE.get("stop_event")
+        if ev:
+            ev.set()
+    except Exception:
+        pass
+
+    try:
+        task = _SELF_OPT_STATE.get("task")
+        if task and not task.done():
+            task.cancel()
+    except Exception:
+        pass
+
+    await update.message.reply_text("🛑 Stop requested. Optimizer will cancel safely at the next checkpoint.")
+
+async def cmd_self_optimize_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    last = _db_get_last_opt_run()
+    if not last:
+        await update.message.reply_text("No self-optimization runs yet. Use /self_optimize.")
+        return
+
+    res = _db_get_opt_result(str(last.get("run_id") or ""))
+    if not res:
+        await update.message.reply_text("No results saved for last run yet (still running or failed).")
+        return
+
+    await send_long_message(update, _self_opt_format_report(res), parse_mode=None)
 
 
 def is_top_setup_eligible(
@@ -9852,9 +10892,23 @@ Optional SESSION: NY | LON | ASIA (default NY)
 
 Notes:
 - Uses the same institutional scoring model as live selection.
-- Simulation is TP3 vs SL (conservative if both hit same candle).
+- WIN definition: TP1 hit before SL within horizon.
+- Simulation uses first-touch (conservative if TP and SL hit same candle).
 
 
+
+
+🧠 SELF-OPTIMIZATION (Admin)
+───────────────
+/self_optimize [DAYS] [SESSION_MODE]
+• Run full end-to-end self-optimization (universe → walk-forward OOS → stability gates → optional promotion)
+• Defaults: DAYS=60, SESSION_MODE=24H_WEIGHTED
+
+/self_optimize_report
+• Show last self-optimization report (decision-grade)
+
+/self_optimize_stop
+• Cancel a running self-optimization job safely
 
 📌 STRATEGY PARAMS (Admin)
 ────────────
@@ -13518,6 +14572,14 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     }
     """
 
+    # Setup-count governor (email path): keep 3–5/day without spamming (safe bounds)
+    try:
+        if str(mode or '').lower().strip() == 'email':
+            _governor_adjust_quality_floor(session_name=session_name)
+    except Exception:
+        pass
+
+
     # Diagnostics: collect reject reasons for this scan
     # Keep a stable structure so /why is always meaningful.
     _rej_ctx = {
@@ -17019,6 +18081,9 @@ def main():
     app.add_handler(CommandHandler("params_reset", cmd_params_reset, block=False))
     app.add_handler(CommandHandler("optimize", cmd_optimize, block=False))
     app.add_handler(CommandHandler("optimize_report", cmd_optimize_report, block=False))
+    app.add_handler(CommandHandler("self_optimize", cmd_self_optimize, block=False))
+    app.add_handler(CommandHandler("self_optimize_report", cmd_self_optimize_report, block=False))
+    app.add_handler(CommandHandler("self_optimize_stop", cmd_self_optimize_stop, block=False))
 
 # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
