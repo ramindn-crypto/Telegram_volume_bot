@@ -8219,6 +8219,1134 @@ def _opt_migrate_tables():
     except Exception:
         pass
 
+
+
+# =========================================================
+# EVOLUTION / LEARNING / LESSONS-LEARNED ENGINE
+# - Production-safe extension built on existing signals, signal_outcomes,
+#   autotrade_trades, strategy_config, and optimization_results.
+# - Uses bounded heuristics + persisted diagnostics, not fake AI reporting.
+# =========================================================
+EVOLUTION_ENABLED = str(os.environ.get("EVOLUTION_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+EVOLUTION_HOURLY_INTERVAL_MIN = int(os.environ.get("EVOLUTION_HOURLY_INTERVAL_MIN", "60") or 60)
+EVOLUTION_DAILY_INTERVAL_HOURS = int(os.environ.get("EVOLUTION_DAILY_INTERVAL_HOURS", "24") or 24)
+EVOLUTION_AUTO_APPLY_COOLDOWN_HOURS = float(os.environ.get("EVOLUTION_AUTO_APPLY_COOLDOWN_HOURS", "24") or 24)
+EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS = int(os.environ.get("EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS", "8") or 8)
+EVOLUTION_LOOKBACK_DAYS = int(os.environ.get("EVOLUTION_LOOKBACK_DAYS", "60") or 60)
+
+_EVOLUTION_STATE = {
+    "hourly_task": None,
+    "daily_task": None,
+}
+
+
+def _evolution_migrate_tables():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS evolution_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_ts REAL NOT NULL
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS evolution_runs (
+                run_id TEXT PRIMARY KEY,
+                cycle_type TEXT NOT NULL,
+                started_ts REAL NOT NULL,
+                finished_ts REAL,
+                status TEXT NOT NULL,
+                analyzed_setups INTEGER NOT NULL DEFAULT 0,
+                analyzed_trades INTEGER NOT NULL DEFAULT 0,
+                findings_json TEXT NOT NULL DEFAULT '',
+                metrics_json TEXT NOT NULL DEFAULT '',
+                actions_json TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS evolution_diagnostics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                processed_key TEXT NOT NULL UNIQUE,
+                source_type TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                created_ts REAL NOT NULL DEFAULT 0,
+                decided_ts REAL NOT NULL DEFAULT 0,
+                outcome TEXT NOT NULL DEFAULT '',
+                win_flag INTEGER NOT NULL DEFAULT 0,
+                tags_json TEXT NOT NULL DEFAULT '',
+                detail_json TEXT NOT NULL DEFAULT '',
+                recommendation TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0,
+                inserted_ts REAL NOT NULL DEFAULT 0
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS evolution_recommendations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_ts REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                scope TEXT NOT NULL DEFAULT '',
+                recommendation TEXT NOT NULL,
+                evidence_json TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0,
+                auto_applied INTEGER NOT NULL DEFAULT 0,
+                action_json TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_evolution_runs_cycle ON evolution_runs(cycle_type, started_ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_evolution_diag_source ON evolution_diagnostics(source_type, source_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_evolution_diag_session ON evolution_diagnostics(session, decided_ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_evolution_rec_status ON evolution_recommendations(status, created_ts)")
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _evolution_state_get(key: str, default=None):
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute("SELECT value FROM evolution_state WHERE key=?", (str(key),)).fetchone()
+            if not row:
+                return default
+            raw = row[0]
+            try:
+                return json.loads(raw)
+            except Exception:
+                return raw
+    except Exception:
+        return default
+
+
+def _evolution_state_set(key: str, value) -> None:
+    _evolution_migrate_tables()
+    try:
+        payload = _json_dumps_safe(value)
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO evolution_state(key,value,updated_ts) VALUES(?,?,?)",
+                (str(key), str(payload), float(time.time())),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _evolution_new_run(cycle_type: str) -> str:
+    _evolution_migrate_tables()
+    run_id = f"EVO-{str(cycle_type).upper()}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO evolution_runs(run_id, cycle_type, started_ts, status) VALUES(?,?,?,?)",
+                (run_id, str(cycle_type).lower(), float(time.time()), "RUNNING"),
+            )
+            conn.commit()
+    except Exception:
+        pass
+    return run_id
+
+
+def _evolution_finish_run(run_id: str, status: str, analyzed_setups: int, analyzed_trades: int, findings: dict, metrics: dict, actions: list, notes: str = "") -> None:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                """UPDATE evolution_runs
+                   SET finished_ts=?, status=?, analyzed_setups=?, analyzed_trades=?, findings_json=?, metrics_json=?, actions_json=?, notes=?
+                   WHERE run_id=?""",
+                (
+                    float(time.time()),
+                    str(status),
+                    int(analyzed_setups),
+                    int(analyzed_trades),
+                    _json_dumps_safe(findings or {}),
+                    _json_dumps_safe(metrics or {}),
+                    _json_dumps_safe(actions or []),
+                    str(notes or ""),
+                    str(run_id),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _evolution_get_last_run(cycle_type: str | None = None) -> dict:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            if cycle_type:
+                row = c.execute(
+                    "SELECT * FROM evolution_runs WHERE cycle_type=? ORDER BY started_ts DESC LIMIT 1",
+                    (str(cycle_type).lower(),),
+                ).fetchone()
+            else:
+                row = c.execute("SELECT * FROM evolution_runs ORDER BY started_ts DESC LIMIT 1").fetchone()
+            return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+def _evolution_insert_recommendation(scope: str, recommendation: str, evidence: dict, confidence: float, auto_applied: bool = False, action: dict | None = None, status: str = "OPEN") -> None:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                """INSERT INTO evolution_recommendations(created_ts, status, scope, recommendation, evidence_json, confidence, auto_applied, action_json)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    float(time.time()),
+                    str(status),
+                    str(scope or ""),
+                    str(recommendation or ""),
+                    _json_dumps_safe(evidence or {}),
+                    float(confidence or 0.0),
+                    1 if auto_applied else 0,
+                    _json_dumps_safe(action or {}),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _evolution_list_open_recommendations(limit: int = 8) -> list[dict]:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                "SELECT * FROM evolution_recommendations WHERE status='OPEN' ORDER BY created_ts DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _evolution_store_diagnostic(processed_key: str, source_type: str, source_id: str, session: str, symbol: str, side: str,
+                                created_ts: float, decided_ts: float, outcome: str, win_flag: bool,
+                                tags: list[str], detail: dict, recommendation: str, confidence: float) -> bool:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                """INSERT OR IGNORE INTO evolution_diagnostics
+                   (processed_key, source_type, source_id, session, symbol, side, created_ts, decided_ts, outcome, win_flag, tags_json, detail_json, recommendation, confidence, inserted_ts)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(processed_key),
+                    str(source_type),
+                    str(source_id),
+                    str(session or ""),
+                    str(symbol or ""),
+                    str(side or ""),
+                    float(created_ts or 0.0),
+                    float(decided_ts or 0.0),
+                    str(outcome or ""),
+                    1 if bool(win_flag) else 0,
+                    _json_dumps_safe(tags or []),
+                    _json_dumps_safe(detail or {}),
+                    str(recommendation or ""),
+                    float(confidence or 0.0),
+                    float(time.time()),
+                ),
+            )
+            conn.commit()
+            return int(c.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+def _evolution_recent_diagnostics(limit: int = 10, losses_only: bool = False, days: int = 30) -> list[dict]:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = "SELECT * FROM evolution_diagnostics WHERE decided_ts>=?"
+            params = [float(time.time() - max(1, int(days)) * 86400.0)]
+            if losses_only:
+                q += " AND win_flag=0"
+            q += " ORDER BY decided_ts DESC LIMIT ?"
+            params.append(int(limit))
+            rows = c.execute(q, tuple(params)).fetchall() or []
+            out = []
+            for r in rows:
+                d = dict(r)
+                try:
+                    d["tags"] = json.loads(d.get("tags_json") or "[]")
+                except Exception:
+                    d["tags"] = []
+                try:
+                    d["detail"] = json.loads(d.get("detail_json") or "{}")
+                except Exception:
+                    d["detail"] = {}
+                out.append(d)
+            return out
+    except Exception:
+        return []
+
+
+def _evolution_tag_counter(days: int = 30, session: str | None = None, losses_only: bool = True) -> Counter:
+    ctr = Counter()
+    try:
+        rows = _evolution_recent_diagnostics(limit=5000, losses_only=losses_only, days=days)
+        for r in rows:
+            if session and str(r.get("session") or "").upper().strip() != str(session).upper().strip():
+                continue
+            for tag in (r.get("tags") or []):
+                ctr[str(tag)] += 1
+    except Exception:
+        pass
+    return ctr
+
+
+def _evolution_outcome_winloss(outcome: str) -> tuple[int, int]:
+    out = str(outcome or "").upper().strip()
+    if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3"):
+        return (1, 0)
+    if out == "LOSS":
+        return (0, 1)
+    return (0, 0)
+
+
+def _evolution_sig_rr(sig: dict) -> float:
+    try:
+        entry = float(sig.get("entry") or 0.0)
+        sl = float(sig.get("sl") or 0.0)
+        tp3 = float(sig.get("tp3") or 0.0)
+        risk = abs(entry - sl)
+        reward = abs(tp3 - entry)
+        if risk <= 0:
+            return 0.0
+        return float(reward / risk)
+    except Exception:
+        return 0.0
+
+
+def _evolution_entry_context(symbol: str, market_symbol: str, created_ts: float, entry: float, side: str) -> dict:
+    """Best-effort entry-context analysis around the setup creation time.
+
+    We purposely keep this lightweight and bounded:
+    - 15m candles: entry extension vs EMA7/EMA21 and local range position
+    - 1h candles : entry distance vs EMA7 and ATR-based extension
+    If market data is unavailable, downstream logic falls back to stored setup metrics.
+    """
+    out = {
+        "ema7_15m_dist_pct": None,
+        "ema21_15m_dist_pct": None,
+        "ema7_1h_dist_pct": None,
+        "atr_pct_1h": None,
+        "bar_range_pos_15m": None,
+        "retracement_pct_15m": None,
+    }
+    try:
+        sym = str(market_symbol or _market_symbol_from_base(symbol) or "").strip()
+        if not sym or float(created_ts or 0.0) <= 0 or float(entry or 0.0) <= 0:
+            return out
+        end_ms = int((float(created_ts) + 3600.0) * 1000)
+        start_15 = int((float(created_ts) - 12 * 3600.0) * 1000)
+        c15 = fetch_ohlcv_paged(sym, "15m", start_15, end_ms, limit=500)
+        if c15 and len(c15) >= 30:
+            closes15 = [float(x[4]) for x in c15]
+            ema7_15 = float(ema(closes15[-40:], 7) or 0.0)
+            ema21_15 = float(ema(closes15[-80:], 21) or 0.0)
+            if ema7_15 > 0:
+                out["ema7_15m_dist_pct"] = abs(float(entry) - ema7_15) / float(entry) * 100.0
+            if ema21_15 > 0:
+                out["ema21_15m_dist_pct"] = abs(float(entry) - ema21_15) / float(entry) * 100.0
+            try:
+                near = min(c15, key=lambda row: abs((float(row[0]) / 1000.0) - float(created_ts)))
+                hi = float(near[2]); lo = float(near[3])
+                rng = max(1e-12, hi - lo)
+                out["bar_range_pos_15m"] = (float(entry) - lo) / rng
+                prior = c15[-8:-1] if len(c15) >= 8 else c15[:-1]
+                if prior:
+                    swing_hi = max(float(x[2]) for x in prior)
+                    swing_lo = min(float(x[3]) for x in prior)
+                    if str(side).upper() == "BUY":
+                        denom = max(1e-12, swing_hi - swing_lo)
+                        out["retracement_pct_15m"] = (swing_hi - float(entry)) / denom
+                    else:
+                        denom = max(1e-12, swing_hi - swing_lo)
+                        out["retracement_pct_15m"] = (float(entry) - swing_lo) / denom
+            except Exception:
+                pass
+        start_1h = int((float(created_ts) - 72 * 3600.0) * 1000)
+        c1 = fetch_ohlcv_paged(sym, "1h", start_1h, end_ms, limit=500)
+        if c1 and len(c1) >= 30:
+            closes1 = [float(x[4]) for x in c1]
+            ema7_1 = float(ema(closes1[-40:], 7) or 0.0)
+            atr_1 = float(compute_atr_from_ohlcv(c1[-80:], ATR_PERIOD) or 0.0)
+            if ema7_1 > 0:
+                out["ema7_1h_dist_pct"] = abs(float(entry) - ema7_1) / float(entry) * 100.0
+            if atr_1 > 0:
+                out["atr_pct_1h"] = float(atr_1 / float(entry) * 100.0)
+    except Exception:
+        return out
+    return out
+
+
+def _evolution_build_signal_diagnostic(sig: dict, session: str, outcome: str, decided_ts: float, source_type: str = "signal") -> tuple[list[str], dict, str, float]:
+    tags = []
+    detail = {}
+    try:
+        side = str(sig.get("side") or "").upper().strip()
+        entry = float(sig.get("entry") or 0.0)
+        ch24 = float(sig.get("ch24") or 0.0)
+        ch4 = float(sig.get("ch4") or 0.0)
+        ch1 = float(sig.get("ch1") or 0.0)
+        ch15 = float(sig.get("ch15") or 0.0)
+        fut_vol = float(sig.get("fut_vol_usd") or 0.0)
+        rr = float(_evolution_sig_rr(sig) or 0.0)
+        ctx = _evolution_entry_context(sig.get("symbol"), sig.get("market_symbol"), float(sig.get("created_ts") or 0.0), entry, side)
+        detail.update({
+            "rr_tp3": rr,
+            "ch24": ch24,
+            "ch4": ch4,
+            "ch1": ch1,
+            "ch15": ch15,
+            "fut_vol_usd": fut_vol,
+        })
+        detail.update(ctx)
+
+        ema15 = ctx.get("ema21_15m_dist_pct")
+        ema1h = ctx.get("ema7_1h_dist_pct")
+        retr = ctx.get("retracement_pct_15m")
+        atr_pct = ctx.get("atr_pct_1h")
+
+        if abs(ch15) >= 1.6 or abs(ch1) >= 3.5 or (ema15 is not None and float(ema15) > 1.2):
+            tags.append("entry_too_extended")
+        if abs(ch15) >= 1.2 and abs(ch1) >= 2.2:
+            tags.append("entry_too_late_after_breakout")
+        if retr is not None:
+            if float(retr) < 0.12:
+                tags.append("pullback_too_shallow")
+            elif float(retr) > 0.85:
+                tags.append("pullback_too_deep")
+        if ema1h is not None and float(ema1h) > float(EMA7_1H_MAX_DIST_PCT):
+            tags.append("entry_far_from_ema")
+        if abs(ch24) >= 20 and abs(ch1) <= 0.35:
+            tags.append("momentum_exhausted")
+        if fut_vol < max(float(MIN_FUT_VOL_USD), 10000000.0) * 1.2:
+            tags.append("thin_liquidity_context")
+        if rr >= 2.3:
+            tags.append("rr_too_ambitious")
+        if str(session).upper() == "ASIA":
+            tags.append("asia_session")
+        if str(session).upper() == "NY" and abs(ch1) >= 2.5 and abs(ch15) >= 1.0:
+            tags.append("ny_breakout_chase_risk")
+        if atr_pct is not None and (float(atr_pct) < 0.45 or float(atr_pct) > 9.0):
+            tags.append("poor_volatility_regime")
+
+        out_u = str(outcome or "").upper().strip()
+        if out_u.startswith("WIN_"):
+            if not tags:
+                tags.append("entry_quality_good")
+        elif out_u == "LOSS":
+            if "entry_too_extended" in tags or "entry_too_late_after_breakout" in tags:
+                tags.append("extended_entry_stopout_pattern")
+            if "rr_too_ambitious" in tags:
+                tags.append("tp_structure_too_ambitious")
+            if not tags:
+                tags.append("loss_without_clear_pattern")
+
+        tags = list(dict.fromkeys(tags))
+        primary = tags[0] if tags else "no_clear_pattern"
+        rec_map = {
+            "entry_too_extended": "Tighten entry quality when price is stretched away from the 15m/1h EMA rail.",
+            "entry_too_late_after_breakout": "Delay breakout entries unless structure resets with a cleaner pullback.",
+            "pullback_too_shallow": "Require a deeper pullback before continuation entries.",
+            "pullback_too_deep": "Reject pullbacks that lose too much structure before trigger.",
+            "entry_far_from_ema": "Tighten EMA-distance tolerance to avoid late continuation entries.",
+            "momentum_exhausted": "Demand stronger fresh momentum expansion before triggering continuation trades.",
+            "rr_too_ambitious": "Reduce TP ambition or require stronger trend context before using high RR targets.",
+            "poor_volatility_regime": "Avoid this volatility regime or apply stricter confirmation.",
+            "asia_session": "ASIA should remain more restrictive unless recent evidence improves.",
+            "ny_breakout_chase_risk": "In New York, tighten volume/confirmation on fast breakout-chase entries.",
+            "thin_liquidity_context": "Prefer thicker futures-volume names for production entries.",
+        }
+        recommendation = rec_map.get(primary, "Monitor recurring failures and tighten the weakest confirmation layer only if the pattern persists.")
+        confidence = 0.45 + min(0.4, 0.06 * len(tags))
+        if ctx.get("ema7_1h_dist_pct") is not None or ctx.get("retracement_pct_15m") is not None:
+            confidence += 0.08
+        return (tags, detail, recommendation, float(clamp(confidence, 0.25, 0.95)))
+    except Exception:
+        return (["diagnostic_error"], detail, "Review diagnostic engine error before making changes.", 0.25)
+
+
+def _evolution_pending_signal_rows(limit: int = 250) -> list[dict]:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                """SELECT e.setup_id, e.session, e.emailed_ts, o.outcome, o.hit_ts, o.evaluated_ts,
+                          s.symbol, s.market_symbol, s.side, s.created_ts, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
+                          s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id=e.setup_id
+                   JOIN signals s ON s.setup_id=e.setup_id
+                   LEFT JOIN evolution_diagnostics d ON d.processed_key=('signal:' || e.setup_id)
+                   WHERE d.id IS NULL
+                     AND UPPER(COALESCE(o.outcome,'')) IN ('WIN_TP1','WIN_TP2','WIN_TP3','LOSS')
+                   ORDER BY COALESCE(o.evaluated_ts, e.emailed_ts) ASC
+                   LIMIT ?""",
+                (int(limit),),
+            ).fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _evolution_pending_autotrade_rows(limit: int = 120) -> list[dict]:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                """SELECT t.trade_id, t.session, t.symbol, t.side, t.opened_ts, t.closed_ts, t.entry, t.sl, t.tp1, t.tp2, t.tp3,
+                          t.qty, t.status, t.note, t.pnl_usdt
+                   FROM autotrade_trades t
+                   LEFT JOIN evolution_diagnostics d ON d.processed_key=('autotrade:' || t.trade_id)
+                   WHERE d.id IS NULL
+                     AND t.opened_ts>0
+                     AND (COALESCE(t.closed_ts,0)>0 OR UPPER(COALESCE(t.status,'')) IN ('CLOSED','LOSE','LOSS','WIN'))
+                   ORDER BY COALESCE(t.closed_ts, t.opened_ts) ASC
+                   LIMIT ?""",
+                (int(limit),),
+            ).fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _evolution_resolve_autotrade_outcome(row: dict) -> tuple[str, float]:
+    try:
+        trade = {
+            "symbol": row.get("symbol"),
+            "market_symbol": _market_symbol_from_base(row.get("symbol")),
+            "side": row.get("side"),
+            "entry": row.get("entry"),
+            "sl": row.get("sl"),
+            "tp1": row.get("tp1"),
+            "tp2": row.get("tp2"),
+            "tp3": row.get("tp3"),
+            "created_ts": float(row.get("opened_ts") or 0.0),
+        }
+        res = evaluate_signal_hit_order(trade, horizon_hours=168, timeframe="1m")
+        outcome = str(res.get("outcome") or "OPEN").upper().strip()
+        decided_ts = float(res.get("hit_ts") or row.get("closed_ts") or 0.0)
+        if outcome in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+            return outcome, decided_ts
+    except Exception:
+        pass
+    try:
+        pnl = float(row.get("pnl_usdt") or 0.0)
+        if pnl > 0:
+            return "WIN_TP1", float(row.get("closed_ts") or 0.0)
+        if pnl < 0:
+            return "LOSS", float(row.get("closed_ts") or 0.0)
+    except Exception:
+        pass
+    return "OPEN", float(row.get("closed_ts") or 0.0)
+
+
+def _evolution_process_new_diagnostics() -> dict:
+    analyzed_setups = 0
+    analyzed_trades = 0
+    new_tags = Counter()
+
+    for row in _evolution_pending_signal_rows(limit=400):
+        outcome = str(row.get("outcome") or "").upper().strip()
+        decided_ts = float(row.get("hit_ts") or row.get("evaluated_ts") or time.time())
+        tags, detail, recommendation, confidence = _evolution_build_signal_diagnostic(row, row.get("session"), outcome, decided_ts, source_type="signal")
+        w, l = _evolution_outcome_winloss(outcome)
+        stored = _evolution_store_diagnostic(
+            processed_key=f"signal:{row.get('setup_id')}",
+            source_type="signal",
+            source_id=str(row.get("setup_id") or ""),
+            session=str(row.get("session") or ""),
+            symbol=str(row.get("symbol") or ""),
+            side=str(row.get("side") or ""),
+            created_ts=float(row.get("created_ts") or row.get("emailed_ts") or 0.0),
+            decided_ts=decided_ts,
+            outcome=outcome,
+            win_flag=bool(w and not l),
+            tags=tags,
+            detail=detail,
+            recommendation=recommendation,
+            confidence=confidence,
+        )
+        if stored:
+            analyzed_setups += 1
+            for tag in tags:
+                new_tags[str(tag)] += 1
+
+    for row in _evolution_pending_autotrade_rows(limit=150):
+        outcome, decided_ts = _evolution_resolve_autotrade_outcome(row)
+        if outcome not in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+            continue
+        diag_sig = {
+            "symbol": row.get("symbol"),
+            "market_symbol": _market_symbol_from_base(row.get("symbol")),
+            "side": row.get("side"),
+            "entry": row.get("entry"),
+            "sl": row.get("sl"),
+            "tp1": row.get("tp1"),
+            "tp2": row.get("tp2"),
+            "tp3": row.get("tp3"),
+            "created_ts": float(row.get("opened_ts") or 0.0),
+            "ch24": 0.0,
+            "ch4": 0.0,
+            "ch1": 0.0,
+            "ch15": 0.0,
+            "fut_vol_usd": 0.0,
+        }
+        tags, detail, recommendation, confidence = _evolution_build_signal_diagnostic(diag_sig, row.get("session"), outcome, decided_ts, source_type="autotrade")
+        detail["pnl_usdt"] = float(row.get("pnl_usdt") or 0.0)
+        w, l = _evolution_outcome_winloss(outcome)
+        stored = _evolution_store_diagnostic(
+            processed_key=f"autotrade:{row.get('trade_id')}",
+            source_type="autotrade",
+            source_id=str(row.get("trade_id") or ""),
+            session=str(row.get("session") or ""),
+            symbol=str(row.get("symbol") or ""),
+            side=str(row.get("side") or ""),
+            created_ts=float(row.get("opened_ts") or 0.0),
+            decided_ts=float(decided_ts or row.get("closed_ts") or time.time()),
+            outcome=outcome,
+            win_flag=bool(w and not l),
+            tags=tags,
+            detail=detail,
+            recommendation=recommendation,
+            confidence=confidence,
+        )
+        if stored:
+            analyzed_trades += 1
+            for tag in tags:
+                new_tags[str(tag)] += 1
+
+    return {
+        "analyzed_setups": analyzed_setups,
+        "analyzed_trades": analyzed_trades,
+        "new_tags": dict(new_tags),
+    }
+
+
+def _evolution_weighted_wr_from_signal_outcomes(days: int = 60, session: str | None = None) -> dict:
+    wins = 0
+    losses = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = """SELECT e.session, o.outcome
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id=e.setup_id
+                   WHERE e.emailed_ts>=?"""
+            params = [float(time.time() - max(1, int(days)) * 86400.0)]
+            if session:
+                q += " AND UPPER(COALESCE(e.session,''))=?"
+                params.append(str(session).upper())
+            rows = c.execute(q, tuple(params)).fetchall() or []
+            for r in rows:
+                w, l = _evolution_outcome_winloss(r["outcome"])
+                wins += int(w)
+                losses += int(l)
+    except Exception:
+        pass
+    n = wins + losses
+    return {"wins": wins, "losses": losses, "sample": n, "wr": (wins / n * 100.0) if n > 0 else 0.0}
+
+
+def _evolution_weighted_wr_from_diagnostics(days: int = 60, session: str | None = None, source_type: str | None = None) -> dict:
+    wins = 0
+    losses = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = "SELECT session, source_type, win_flag, outcome FROM evolution_diagnostics WHERE decided_ts>=?"
+            params = [float(time.time() - max(1, int(days)) * 86400.0)]
+            if session:
+                q += " AND UPPER(COALESCE(session,''))=?"
+                params.append(str(session).upper())
+            if source_type:
+                q += " AND source_type=?"
+                params.append(str(source_type))
+            rows = c.execute(q, tuple(params)).fetchall() or []
+            for r in rows:
+                out = str(r["outcome"] or "").upper().strip()
+                if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3"):
+                    wins += 1
+                elif out == "LOSS":
+                    losses += 1
+    except Exception:
+        pass
+    n = wins + losses
+    return {"wins": wins, "losses": losses, "sample": n, "wr": (wins / n * 100.0) if n > 0 else 0.0}
+
+
+def _evolution_optimizer_wr(session: str | None = None) -> dict:
+    report = load_opt_report() or {}
+    metrics = report.get("metrics") or {}
+    oos = metrics.get("oos") or {}
+    if session:
+        oos = (metrics.get("by_session") or {}).get(str(session).upper(), {}) or {}
+    sample = int(oos.get("setups", 0) or 0)
+    wr = float(oos.get("win_rate", 0.0) or 0.0)
+    return {"wins": int(round(sample * wr / 100.0)), "losses": max(0, sample - int(round(sample * wr / 100.0))), "sample": sample, "wr": wr}
+
+
+def _evolution_estimated_win_rate(session: str | None = None) -> dict:
+    """Current best-estimate win rate.
+
+    Methodology (kept intentionally explicit for live-account trustworthiness):
+    1) Use recent *live* evidence first (autotrade diagnostics + signal outcomes).
+    2) Use optimization OOS results only as a light stabilizer, never as the dominant source.
+    3) Convert all sources into wins/losses, then combine them through a Beta posterior.
+       This prevents tiny recent samples from producing misleading win-rate swings.
+    4) OOS/backtest evidence is sample-capped so live production evidence dominates when available.
+    """
+    sig = _evolution_weighted_wr_from_signal_outcomes(days=EVOLUTION_LOOKBACK_DAYS, session=session)
+    live_auto = _evolution_weighted_wr_from_diagnostics(days=EVOLUTION_LOOKBACK_DAYS, session=session, source_type="autotrade")
+    opt = _evolution_optimizer_wr(session=session)
+
+    # Base prior uses optimizer OOS if available; otherwise a conservative neutral prior.
+    prior_wr = float(opt.get("wr", 55.0) or 55.0) / 100.0 if int(opt.get("sample", 0) or 0) >= 20 else 0.55
+    prior_strength = 20.0
+    alpha = 1.0 + prior_wr * prior_strength
+    beta = 1.0 + (1.0 - prior_wr) * prior_strength
+
+    # Live evidence dominates.
+    alpha += float(sig.get("wins", 0) or 0)
+    beta += float(sig.get("losses", 0) or 0)
+    alpha += float(live_auto.get("wins", 0) or 0) * 1.2
+    beta += float(live_auto.get("losses", 0) or 0) * 1.2
+
+    # OOS evidence is capped so backtests cannot overwhelm live production reality.
+    oos_cap = min(25.0, float(opt.get("sample", 0) or 0) * 0.25)
+    if oos_cap > 0:
+        oos_wr = float(opt.get("wr", 0.0) or 0.0) / 100.0
+        alpha += oos_cap * oos_wr
+        beta += oos_cap * (1.0 - oos_wr)
+
+    est = float(alpha / max(1e-9, (alpha + beta)) * 100.0)
+    live_sample = int(sig.get("sample", 0) or 0) + int(live_auto.get("sample", 0) or 0)
+    confidence = "low"
+    if live_sample >= 40:
+        confidence = "high"
+    elif live_sample >= 15:
+        confidence = "medium"
+    return {
+        "estimated_wr": est,
+        "confidence": confidence,
+        "live_sample": live_sample,
+        "signal_sample": int(sig.get("sample", 0) or 0),
+        "autotrade_sample": int(live_auto.get("sample", 0) or 0),
+        "optimizer_sample": int(opt.get("sample", 0) or 0),
+        "components": {
+            "signals": sig,
+            "autotrade": live_auto,
+            "optimizer_oos": opt,
+        },
+    }
+
+
+def _evolution_period_wr(days: int, offset_days: int = 0, session: str | None = None) -> float:
+    try:
+        ts_to = float(time.time() - max(0, int(offset_days)) * 86400.0)
+        ts_from = float(ts_to - max(1, int(days)) * 86400.0)
+        wins = 0
+        losses = 0
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = """SELECT e.session, o.outcome
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id=e.setup_id
+                   WHERE e.emailed_ts>=? AND e.emailed_ts<?"""
+            params = [ts_from, ts_to]
+            if session:
+                q += " AND UPPER(COALESCE(e.session,''))=?"
+                params.append(str(session).upper())
+            rows = c.execute(q, tuple(params)).fetchall() or []
+            for r in rows:
+                w, l = _evolution_outcome_winloss(r["outcome"])
+                wins += w
+                losses += l
+        total = wins + losses
+        return (wins / total * 100.0) if total > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _evolution_trend_label(current_wr: float, previous_wr: float) -> str:
+    delta = float(current_wr) - float(previous_wr)
+    if delta >= 3.0:
+        return "improving"
+    if delta <= -3.0:
+        return "degrading"
+    return "stable"
+
+
+def _evolution_build_snapshot() -> dict:
+    overall = _evolution_estimated_win_rate(session=None)
+    ny = _evolution_estimated_win_rate(session="NY")
+    curr14 = _evolution_period_wr(14, offset_days=0)
+    prev14 = _evolution_period_wr(14, offset_days=14)
+    curr14_ny = _evolution_period_wr(14, offset_days=0, session="NY")
+    prev14_ny = _evolution_period_wr(14, offset_days=14, session="NY")
+    tag_ctr = _evolution_tag_counter(days=30, losses_only=True)
+    ny_tag_ctr = _evolution_tag_counter(days=30, session="NY", losses_only=True)
+    recs = _evolution_list_open_recommendations(limit=5)
+    cfg = load_strategy_config(force=True)
+    last_hourly = _evolution_get_last_run("hourly")
+    last_daily = _evolution_get_last_run("daily")
+
+    auto_applied_last = _evolution_state_get("last_auto_adjustment", {}) or {}
+    status = "stable"
+    if float(ny.get("estimated_wr", 0.0) or 0.0) < 58.0 or _evolution_trend_label(curr14_ny, prev14_ny) == "degrading":
+        status = "needs_intervention"
+    elif float(overall.get("estimated_wr", 0.0) or 0.0) >= 65.0 and _evolution_trend_label(curr14, prev14) != "degrading":
+        status = "healthy"
+
+    entry_issue_present = any(tag_ctr.get(k, 0) >= 4 for k in (
+        "entry_too_extended", "entry_too_late_after_breakout", "entry_far_from_ema", "pullback_too_shallow"
+    ))
+
+    snapshot = {
+        "updated_ts": float(time.time()),
+        "overall": overall,
+        "ny": ny,
+        "trend": {
+            "overall": _evolution_trend_label(curr14, prev14),
+            "ny": _evolution_trend_label(curr14_ny, prev14_ny),
+            "current14_wr": curr14,
+            "previous14_wr": prev14,
+            "current14_ny_wr": curr14_ny,
+            "previous14_ny_wr": prev14_ny,
+        },
+        "top_failure_tags": tag_ctr.most_common(6),
+        "top_failure_tags_ny": ny_tag_ctr.most_common(6),
+        "open_recommendations": recs,
+        "auto_applied_last": auto_applied_last,
+        "status": status,
+        "entry_issue_present": bool(entry_issue_present),
+        "last_hourly": last_hourly,
+        "last_daily": last_daily,
+        "quality_floor_email": float(cfg.get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
+        "min_rr_tp3": float(cfg.get("min_rr_tp3", MIN_RR_TP3) or MIN_RR_TP3),
+    }
+    _evolution_state_set("snapshot", snapshot)
+    return snapshot
+
+
+def _evolution_safe_apply_adjustments(snapshot: dict) -> list[dict]:
+    actions = []
+    tag_ctr = Counter(dict(snapshot.get("top_failure_tags") or []))
+    cfg = load_strategy_config(force=True)
+    bounds = cfg.get("opt_bounds") or {}
+    now = float(time.time())
+    last_adj = float((cfg.get("governor_last_adjust_ts", 0.0) or 0.0))
+    last_auto = _evolution_state_get("last_auto_adjustment", {}) or {}
+    last_auto_ts = float(last_auto.get("ts", 0.0) or 0.0)
+    if (now - max(last_adj, last_auto_ts)) < (EVOLUTION_AUTO_APPLY_COOLDOWN_HOURS * 3600.0):
+        return actions
+
+    def _bounded_set(key: str, delta: float, reason_tag: str, recommendation_text: str, confidence: float):
+        nonlocal cfg, actions
+        lo, hi = (bounds.get(key) or [None, None])
+        if lo is None or hi is None:
+            return
+        old = float(cfg.get(key, 0.0) or 0.0)
+        new = _clamp(old + float(delta), float(lo), float(hi))
+        if abs(new - old) < 1e-9:
+            return
+        cfg[key] = float(new)
+        action = {
+            "param": key,
+            "from": old,
+            "to": new,
+            "reason_tag": reason_tag,
+            "confidence": float(confidence),
+        }
+        actions.append(action)
+        _evolution_insert_recommendation(
+            scope="strategy_config",
+            recommendation=recommendation_text,
+            evidence={"tag": reason_tag, "count": int(tag_ctr.get(reason_tag, 0)), "snapshot_status": snapshot.get("status")},
+            confidence=float(confidence),
+            auto_applied=True,
+            action=action,
+            status="APPLIED",
+        )
+
+    # Tighten entry quality if repeated stretched-entry losses persist.
+    if int(tag_ctr.get("entry_too_extended", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
+        _bounded_set(
+            "quality_score_min_email",
+            +1.0,
+            "entry_too_extended",
+            "Auto-adjustment: raised email quality floor after repeated stretched-entry stop-outs.",
+            0.74,
+        )
+    if int(tag_ctr.get("entry_far_from_ema", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
+        _bounded_set(
+            "tf_align_1h_min_abs",
+            +0.05,
+            "entry_far_from_ema",
+            "Auto-adjustment: tightened 1H alignment floor after repeated entries too far from the EMA rail.",
+            0.71,
+        )
+    if int(tag_ctr.get("rr_too_ambitious", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
+        _bounded_set(
+            "min_rr_tp3",
+            -0.10,
+            "rr_too_ambitious",
+            "Auto-adjustment: reduced minimum TP3 RR slightly after repeated evidence that targets were too ambitious for current conditions.",
+            0.69,
+        )
+    if int(tag_ctr.get("pullback_too_shallow", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
+        _bounded_set(
+            "quality_score_min_screen",
+            +1.0,
+            "pullback_too_shallow",
+            "Auto-adjustment: tightened screen quality floor after repeated shallow-pullback failures.",
+            0.67,
+        )
+
+    if actions:
+        save_strategy_config(cfg)
+        apply_strategy_config(cfg)
+        _evolution_state_set("last_auto_adjustment", {"ts": now, "actions": actions})
+    return actions
+
+
+def _evolution_generate_recommendations(snapshot: dict) -> list[str]:
+    tag_ctr = Counter(dict(snapshot.get("top_failure_tags") or []))
+    recs = []
+    if int(tag_ctr.get("asia_session", 0)) >= 6 and float(snapshot.get("ny", {}).get("estimated_wr", 0.0) or 0.0) > float(snapshot.get("overall", {}).get("estimated_wr", 0.0) or 0.0):
+        txt = "Recommendation: restrict ASIA more aggressively until its loss patterns improve relative to New York."
+        recs.append(txt)
+        _evolution_insert_recommendation("session", txt, {"tag": "asia_session", "count": int(tag_ctr.get("asia_session", 0))}, 0.72)
+    if int(tag_ctr.get("ny_breakout_chase_risk", 0)) >= 5:
+        txt = "Recommendation: in New York, require stronger volume expansion / confirmation before allowing fast breakout-chase entries."
+        recs.append(txt)
+        _evolution_insert_recommendation("ny", txt, {"tag": "ny_breakout_chase_risk", "count": int(tag_ctr.get("ny_breakout_chase_risk", 0))}, 0.70)
+    if int(tag_ctr.get("thin_liquidity_context", 0)) >= 5:
+        txt = "Recommendation: deprioritize thinner names when multiple liquid alternatives exist."
+        recs.append(txt)
+        _evolution_insert_recommendation("universe", txt, {"tag": "thin_liquidity_context", "count": int(tag_ctr.get("thin_liquidity_context", 0))}, 0.65)
+    return recs
+
+
+def _run_evolution_cycle(cycle_type: str) -> dict:
+    _evolution_migrate_tables()
+    run_id = _evolution_new_run(cycle_type)
+    notes = ""
+    try:
+        processed = _evolution_process_new_diagnostics()
+        snapshot = _evolution_build_snapshot()
+        actions = []
+        recs = []
+        if str(cycle_type).lower() == "daily":
+            actions = _evolution_safe_apply_adjustments(snapshot)
+            recs = _evolution_generate_recommendations(snapshot)
+        findings = {
+            "new_tags": processed.get("new_tags") or {},
+            "top_failure_tags": snapshot.get("top_failure_tags") or [],
+            "top_failure_tags_ny": snapshot.get("top_failure_tags_ny") or [],
+            "recommendations_created": recs,
+        }
+        metrics = {
+            "overall": snapshot.get("overall") or {},
+            "ny": snapshot.get("ny") or {},
+            "trend": snapshot.get("trend") or {},
+            "status": snapshot.get("status") or "unknown",
+        }
+        _evolution_finish_run(
+            run_id,
+            "DONE",
+            int(processed.get("analyzed_setups", 0) or 0),
+            int(processed.get("analyzed_trades", 0) or 0),
+            findings,
+            metrics,
+            actions,
+            notes,
+        )
+        _evolution_state_set(f"last_{str(cycle_type).lower()}_cycle", {"run_id": run_id, "ts": time.time()})
+        return {
+            "run_id": run_id,
+            "processed": processed,
+            "snapshot": snapshot,
+            "actions": actions,
+            "recommendations": recs,
+            "ok": True,
+        }
+    except Exception as e:
+        notes = f"{type(e).__name__}: {e}"
+        _evolution_finish_run(run_id, "FAILED", 0, 0, {}, {}, [], notes)
+        return {"run_id": run_id, "ok": False, "error": notes}
+
+
+async def evolution_hourly_job(context: ContextTypes.DEFAULT_TYPE):
+    if not EVOLUTION_ENABLED:
+        return
+    try:
+        res = await to_thread_heavy(_run_evolution_cycle, "hourly")
+        if isinstance(res, dict) and res.get("ok"):
+            _evolution_state_set("last_hourly_snapshot", res.get("snapshot") or {})
+    except Exception:
+        pass
+
+
+async def evolution_daily_job(context: ContextTypes.DEFAULT_TYPE):
+    if not EVOLUTION_ENABLED:
+        return
+    try:
+        res = await to_thread_heavy(_run_evolution_cycle, "daily")
+        if isinstance(res, dict) and res.get("ok"):
+            snap = res.get("snapshot") or {}
+            if getattr(context, "bot", None):
+                msg = (
+                    "🧠 Evolution daily cycle complete\n"
+                    f"Overall WR est: {float((snap.get('overall') or {}).get('estimated_wr', 0.0) or 0.0):.1f}%\n"
+                    f"NY WR est: {float((snap.get('ny') or {}).get('estimated_wr', 0.0) or 0.0):.1f}%\n"
+                    f"Trend: overall {((snap.get('trend') or {}).get('overall') or 'n/a')} | NY {((snap.get('trend') or {}).get('ny') or 'n/a')}\n"
+                    f"Auto-adjustments: {len(res.get('actions') or [])}"
+                )
+                try:
+                    await _notify_admins_autonomous_opt(context.bot, msg)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _evolution_snapshot_cached() -> dict:
+    snap = _evolution_state_get("snapshot", {}) or {}
+    if not snap:
+        try:
+            snap = _run_evolution_cycle("hourly").get("snapshot") or {}
+        except Exception:
+            snap = {}
+    return snap
+
+
+def _fmt_wr_block(title: str, item: dict) -> str:
+    return (
+        f"{title}: {float(item.get('estimated_wr', 0.0) or 0.0):.1f}%"
+        f" (confidence: {str(item.get('confidence') or 'low')}, live sample: {int(item.get('live_sample', 0) or 0)})"
+    )
+
+
+async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    snap = await to_thread_fast(_evolution_snapshot_cached)
+    if not snap:
+        await update.message.reply_text("No evolution snapshot yet.")
+        return
+    hourly = snap.get("last_hourly") or {}
+    daily = snap.get("last_daily") or {}
+    last_opt = _db_get_last_opt_run() or {}
+    recs = snap.get("open_recommendations") or []
+    auto_last = snap.get("auto_applied_last") or {}
+    auto_actions = auto_last.get("actions") or []
+    top_tags = snap.get("top_failure_tags") or []
+    ny_tags = snap.get("top_failure_tags_ny") or []
+    lines = [
+        "🧠 Edge Status",
+        HDR,
+        f"Continuous optimization: {'ACTIVE' if AUTONOMOUS_OPT_ENABLED else 'OFF'} | Learning: {'ACTIVE' if EVOLUTION_ENABLED else 'OFF'}",
+        f"Last optimization cycle: {_fmt_dt_local(datetime.fromtimestamp(float((last_opt or {}).get('started_ts') or 0.0), tz=timezone.utc)) if (last_opt or {}).get('started_ts') else '—'}",
+        f"Last hourly learning cycle: {_fmt_dt_local(datetime.fromtimestamp(float((hourly or {}).get('finished_ts') or 0.0), tz=timezone.utc)) if (hourly or {}).get('finished_ts') else '—'}",
+        f"Last daily review cycle: {_fmt_dt_local(datetime.fromtimestamp(float((daily or {}).get('finished_ts') or 0.0), tz=timezone.utc)) if (daily or {}).get('finished_ts') else '—'}",
+        f"Analyzed in latest cycles: hourly setups={int((hourly or {}).get('analyzed_setups',0) or 0)} trades={int((hourly or {}).get('analyzed_trades',0) or 0)} | daily setups={int((daily or {}).get('analyzed_setups',0) or 0)} trades={int((daily or {}).get('analyzed_trades',0) or 0)}",
+        _fmt_wr_block("Overall WR estimate", snap.get("overall") or {}),
+        _fmt_wr_block("New York WR estimate", snap.get("ny") or {}),
+        f"Performance trend: overall {((snap.get('trend') or {}).get('overall') or 'n/a')} | NY {((snap.get('trend') or {}).get('ny') or 'n/a')}",
+        f"Entry-quality issues present: {'YES' if snap.get('entry_issue_present') else 'NO'}",
+        f"Rule stability: {str(snap.get('status') or 'unknown').replace('_',' ').upper()}",
+        f"Open recommendations: {len(recs)} | Auto-adjustments in last cycle: {len(auto_actions)}",
+    ]
+    if top_tags:
+        lines.append(SEP)
+        lines.append("Top loss patterns:")
+        for tag, n in top_tags[:4]:
+            lines.append(f"• {tag}: {int(n)}")
+    if ny_tags:
+        lines.append("NY-specific patterns:")
+        for tag, n in ny_tags[:3]:
+            lines.append(f"• {tag}: {int(n)}")
+    if recs:
+        lines.append(SEP)
+        lines.append("Latest recommendation:")
+        lines.append(f"• {str(recs[0].get('recommendation') or '')}")
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+
+async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    snap = await to_thread_fast(_evolution_snapshot_cached)
+    item = (snap or {}).get("overall") or {}
+    msg = (
+        "📊 Bot Win Rate Estimate\n"
+        f"{float(item.get('estimated_wr', 0.0) or 0.0):.1f}%\n"
+        f"Confidence: {str(item.get('confidence') or 'low')}\n"
+        f"Live sample: {int(item.get('live_sample', 0) or 0)} | Optimizer OOS sample: {int(item.get('optimizer_sample', 0) or 0)}"
+    )
+    await update.message.reply_text(msg)
+
+
+async def ny_winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    snap = await to_thread_fast(_evolution_snapshot_cached)
+    item = (snap or {}).get("ny") or {}
+    msg = (
+        "🗽 New York Win Rate Estimate\n"
+        f"{float(item.get('estimated_wr', 0.0) or 0.0):.1f}%\n"
+        f"Confidence: {str(item.get('confidence') or 'low')}\n"
+        f"Live sample: {int(item.get('live_sample', 0) or 0)} | Optimizer OOS sample: {int(item.get('optimizer_sample', 0) or 0)}"
+    )
+    await update.message.reply_text(msg)
+
+
+async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    rows = await to_thread_fast(_evolution_recent_diagnostics, 8, True, 30)
+    if not rows:
+        await update.message.reply_text("No lessons learned diagnostics recorded yet.")
+        return
+    lines = ["📚 Lessons Learned", HDR]
+    for r in rows[:8]:
+        tags = r.get("tags") or []
+        when = _fmt_dt_local(datetime.fromtimestamp(float(r.get("decided_ts") or time.time()), tz=timezone.utc))
+        lines.append(f"• {str(r.get('symbol') or '')} {str(r.get('side') or '')} | {str(r.get('session') or '')} | {when}")
+        lines.append(f"  Outcome: {str(r.get('outcome') or '')} | Tags: {', '.join(tags[:4]) if tags else '—'}")
+        rec = str(r.get("recommendation") or "").strip()
+        if rec:
+            lines.append(f"  Insight: {rec}")
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
 def _utc_day_str(ts: float | None = None) -> str:
     try:
         dt = datetime.fromtimestamp(float(ts or time.time()), tz=timezone.utc)
@@ -18473,6 +19601,7 @@ def main():
 
     db_init()
     ensure_email_column()
+    _evolution_migrate_tables()
     
     app = Application.builder().token(TOKEN).post_init(_post_init).concurrent_updates(32).build()
 
@@ -18577,6 +19706,12 @@ def main():
     app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report_overal", autotrade_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("ai_strategy_report", ai_strategy_report_cmd, block=False))
+    app.add_handler(CommandHandler("edge_status", edge_status_cmd, block=False))
+    app.add_handler(CommandHandler("optimizer_status", edge_status_cmd, block=False))
+    app.add_handler(CommandHandler("learning_status", edge_status_cmd, block=False))
+    app.add_handler(CommandHandler("winrate", winrate_cmd, block=False))
+    app.add_handler(CommandHandler("ny_winrate", ny_winrate_cmd, block=False))
+    app.add_handler(CommandHandler("lessons_learned", lessons_learned_cmd, block=False))
     
     # Strategy parameterization + optimization (admin)
 
@@ -18622,6 +19757,30 @@ def main():
                     "max_instances": 1,
                     "coalesce": True,
                     "misfire_grace_time": 300,
+                },
+            )
+
+        if EVOLUTION_ENABLED:
+            app.job_queue.run_repeating(
+                evolution_hourly_job,
+                interval=max(900, int(EVOLUTION_HOURLY_INTERVAL_MIN * 60)),
+                first=120,
+                name="evolution_hourly_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 120,
+                },
+            )
+            app.job_queue.run_repeating(
+                evolution_daily_job,
+                interval=max(21600, int(EVOLUTION_DAILY_INTERVAL_HOURS * 3600)),
+                first=300,
+                name="evolution_daily_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 600,
                 },
             )
     else:
