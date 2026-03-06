@@ -12485,13 +12485,30 @@ Advanced setup quality is now enforced inside the live engine:
 /health_sys
 • System health (DB, exchange, email)
 
+/edge_status
+• Main evolution dashboard: learning active, cycle times, performance trend, recommendations
+
+/optimizer_status
+/learning_status
+• Aliases for the evolution/learning status view
+
+/winrate
+• Current overall weighted bot win-rate estimate
+
+/ny_winrate
+• Current weighted New York session win-rate estimate
+
+/lessons_learned
+• Recent dominant failure patterns, entry-quality findings, and recommendations
+
 ────────────────────
 🤖 AUTONOMOUS ENGINE (Zero-Touch)
 ────────────────────
-• Backtesting, optimization, validation, promotion, and rejection run automatically in the background.
+• Backtesting, optimization, validation, promotion, rejection, and learning run automatically in the background.
 • Manual optimization/backtest/parameter override commands are intentionally disabled.
 • New parameters go live only after internal walk-forward and OOS validation pass.
 • Bad candidate parameter sets are rejected or reverted automatically.
+• Use /edge_status as the main admin health/evolution command.
 
 """\
 
