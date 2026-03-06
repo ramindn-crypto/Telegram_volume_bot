@@ -2130,19 +2130,66 @@ def _autotrade_db_open_trades(uid: int) -> list[dict]:
         c.execute("SELECT * FROM autotrade_trades WHERE uid=? AND status='OPEN' ORDER BY opened_ts DESC", (uid,))
         return [dict(r) for r in c.fetchall()]
 
-def _autotrade_exec_cleanup(stale_pending_sec: int = 1800, stale_failed_sec: int = 86400) -> None:
+AUTOTRADE_SYMBOL_GUARD_TTL_SEC = int(os.environ.get("AUTOTRADE_SYMBOL_GUARD_TTL_SEC", "1800") or 1800)
+AUTOTRADE_RECENT_SYMBOL_SYNC_SEC = int(os.environ.get("AUTOTRADE_RECENT_SYMBOL_SYNC_SEC", "180") or 180)
+AUTOTRADE_PLACED_GUARD_CLEANUP_SEC = int(os.environ.get("AUTOTRADE_PLACED_GUARD_CLEANUP_SEC", "172800") or 172800)
+
+_AUTOTRADE_RUNTIME_SYMBOL_LOCKS: dict[str, float] = {}
+_AUTOTRADE_RUNTIME_SYMBOL_LOCKS_GUARD = threading.Lock()
+
+def _autotrade_symbol_lock_key(uid: int, symbol: str) -> str:
+    return f"{int(uid)}:{_bybit_linear_symbol(symbol)}"
+
+def _autotrade_runtime_symbol_lock_acquire(uid: int, symbol: str, ttl_sec: int | None = None) -> bool:
+    ttl = int(ttl_sec or AUTOTRADE_SYMBOL_GUARD_TTL_SEC)
+    key = _autotrade_symbol_lock_key(uid, symbol)
+    now = float(time.time())
+    with _AUTOTRADE_RUNTIME_SYMBOL_LOCKS_GUARD:
+        ts = float(_AUTOTRADE_RUNTIME_SYMBOL_LOCKS.get(key) or 0.0)
+        if ts and (now - ts) <= ttl:
+            return False
+        _AUTOTRADE_RUNTIME_SYMBOL_LOCKS[key] = now
+        stale_before = now - max(float(ttl), 60.0)
+        for k, v in list(_AUTOTRADE_RUNTIME_SYMBOL_LOCKS.items()):
+            try:
+                if float(v or 0.0) < stale_before:
+                    _AUTOTRADE_RUNTIME_SYMBOL_LOCKS.pop(k, None)
+            except Exception:
+                _AUTOTRADE_RUNTIME_SYMBOL_LOCKS.pop(k, None)
+    return True
+
+def _autotrade_runtime_symbol_lock_release(uid: int, symbol: str) -> None:
+    key = _autotrade_symbol_lock_key(uid, symbol)
+    with _AUTOTRADE_RUNTIME_SYMBOL_LOCKS_GUARD:
+        _AUTOTRADE_RUNTIME_SYMBOL_LOCKS.pop(key, None)
+
+def _autotrade_runtime_symbol_lock_active(uid: int, symbol: str, ttl_sec: int | None = None) -> bool:
+    ttl = int(ttl_sec or AUTOTRADE_SYMBOL_GUARD_TTL_SEC)
+    key = _autotrade_symbol_lock_key(uid, symbol)
+    now = float(time.time())
+    with _AUTOTRADE_RUNTIME_SYMBOL_LOCKS_GUARD:
+        ts = float(_AUTOTRADE_RUNTIME_SYMBOL_LOCKS.get(key) or 0.0)
+        if not ts:
+            return False
+        if (now - ts) > ttl:
+            _AUTOTRADE_RUNTIME_SYMBOL_LOCKS.pop(key, None)
+            return False
+        return True
+
+def _autotrade_exec_cleanup(stale_pending_sec: int = 1800, stale_failed_sec: int = 86400, stale_placed_sec: int = AUTOTRADE_PLACED_GUARD_CLEANUP_SEC) -> None:
     try:
         now = float(time.time())
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
             c.execute("DELETE FROM autotrade_exec_guard WHERE status='PENDING' AND updated_ts<?", (now - float(stale_pending_sec),))
             c.execute("DELETE FROM autotrade_exec_guard WHERE status='FAILED' AND updated_ts<?", (now - float(stale_failed_sec),))
+            c.execute("DELETE FROM autotrade_exec_guard WHERE status='PLACED' AND updated_ts<?", (now - float(stale_placed_sec),))
             conn.commit()
     except Exception:
         pass
 
 
-def _autotrade_exec_reserve(uid: int, setup_id: str, symbol: str, side: str, setup_ttl_sec: int = 86400, symdir_ttl_sec: int = 900) -> tuple[bool, list[str], str]:
+def _autotrade_exec_reserve(uid: int, setup_id: str, symbol: str, side: str, setup_ttl_sec: int = 86400, symbol_ttl_sec: int = AUTOTRADE_SYMBOL_GUARD_TTL_SEC, symdir_ttl_sec: int = AUTOTRADE_SYMBOL_GUARD_TTL_SEC) -> tuple[bool, list[str], str]:
     """Atomically reserve execution keys to prevent duplicate orders."""
     now = float(time.time())
     sid = str(setup_id or '').strip()
@@ -2152,10 +2199,12 @@ def _autotrade_exec_reserve(uid: int, setup_id: str, symbol: str, side: str, set
         return (False, [], 'bad_guard_identity')
 
     setup_key = f"setup:{int(uid)}:{sid}" if sid else ''
+    symbol_key = f"symbol:{int(uid)}:{sym}"
     symdir_key = f"symdir:{int(uid)}:{sym}:{sd}"
     checks = []
     if setup_key:
         checks.append((setup_key, 'SETUP', float(setup_ttl_sec)))
+    checks.append((symbol_key, 'SYMBOL', float(symbol_ttl_sec)))
     checks.append((symdir_key, 'SYMDIR', float(symdir_ttl_sec)))
 
     try:
@@ -2194,6 +2243,158 @@ def _autotrade_exec_mark(keys: list[str], status: str, note: str = '') -> None:
             conn.commit()
     except Exception:
         pass
+
+
+def _autotrade_get_local_symbol_activity(uid: int, symbol: str) -> dict:
+    sym = _bybit_linear_symbol(symbol)
+    out = {"open_trades": [], "latest_open_ts": 0.0, "latest_close_ts": 0.0, "latest_trade_ts": 0.0}
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT * FROM autotrade_trades WHERE uid=? AND UPPER(symbol)=? ORDER BY opened_ts DESC", (int(uid), str(sym).upper()))
+            rows = [dict(r) for r in c.fetchall()]
+        opens = []
+        for r in rows:
+            status = str(r.get('status') or '').upper()
+            try:
+                open_ts = float(r.get('opened_ts') or 0.0)
+            except Exception:
+                open_ts = 0.0
+            try:
+                close_ts = float(r.get('closed_ts') or 0.0)
+            except Exception:
+                close_ts = 0.0
+            out['latest_open_ts'] = max(float(out['latest_open_ts'] or 0.0), open_ts)
+            out['latest_close_ts'] = max(float(out['latest_close_ts'] or 0.0), close_ts)
+            out['latest_trade_ts'] = max(float(out['latest_trade_ts'] or 0.0), open_ts, close_ts)
+            if status == 'OPEN':
+                opens.append(r)
+        out['open_trades'] = opens
+    except Exception:
+        pass
+    return out
+
+
+def _autotrade_get_pending_symbol_guards(uid: int, symbol: str) -> list[dict]:
+    sym = _bybit_linear_symbol(symbol)
+    out = []
+    try:
+        now = float(time.time())
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT * FROM autotrade_exec_guard WHERE uid=? AND UPPER(symbol)=? ORDER BY updated_ts DESC", (int(uid), str(sym).upper()))
+            rows = [dict(r) for r in c.fetchall()]
+        for r in rows:
+            status = str(r.get('status') or '').upper()
+            age = now - float(r.get('updated_ts') or 0.0)
+            if status == 'PENDING' and age <= float(AUTOTRADE_SYMBOL_GUARD_TTL_SEC):
+                out.append(r)
+            elif status == 'PLACED' and age <= float(AUTOTRADE_RECENT_SYMBOL_SYNC_SEC):
+                out.append(r)
+        return out
+    except Exception:
+        return []
+
+
+def _autotrade_symbol_cooldown_remaining(uid: int, symbol: str, session_label: str) -> float:
+    act = _autotrade_get_local_symbol_activity(uid, symbol)
+    last_ts = float(act.get('latest_trade_ts') or 0.0)
+    if last_ts <= 0:
+        return 0.0
+    cooldown_sec = max(float(cooldown_hours_for_session(session_label)) * 3600.0, float(AUTOTRADE_RECENT_SYMBOL_SYNC_SEC))
+    return max(0.0, (last_ts + cooldown_sec) - float(time.time()))
+
+
+def _autotrade_log_symbol_block(uid: int, symbol: str, side: str, reason: str, extra: str = '') -> None:
+    try:
+        msg = f"{reason} uid={int(uid)} symbol={_bybit_linear_symbol(symbol)} side={str(side or '').upper()}"
+        if extra:
+            msg += f" | {extra}"
+        logger.warning(msg)
+    except Exception:
+        pass
+
+
+def _autotrade_can_open_symbol(uid: int, symbol: str, side: str, session_label: str) -> tuple[bool, str, dict]:
+    """Single hardened gatekeeper for symbol tradability."""
+    sym = _bybit_linear_symbol(symbol)
+    sd = str(side or '').upper().strip()
+    detail = {
+        'symbol': sym,
+        'side': sd,
+        'session': str(session_label or '').upper(),
+        'live_open_position': False,
+        'local_open_trade': False,
+        'live_open_order': False,
+        'pending_guard': False,
+        'runtime_lock': False,
+        'cooldown_remaining_sec': 0.0,
+        'recent_trade_remaining_sec': 0.0,
+        'local_open_count': 0,
+        'pending_guard_count': 0,
+    }
+    if not sym or sd not in {'BUY', 'SELL'}:
+        return (False, 'blocked_bad_symbol_identity', detail)
+
+    _autotrade_exec_cleanup()
+
+    if _autotrade_runtime_symbol_lock_active(uid, sym):
+        detail['runtime_lock'] = True
+        _autotrade_log_symbol_block(uid, sym, sd, 'blocked_duplicate_inflight_lock', 'runtime_lock_active')
+        return (False, 'blocked_duplicate_inflight_lock', detail)
+
+    if str(AUTOTRADE_MODE).lower() == 'live':
+        try:
+            for p in _bybit_get_open_positions_linear():
+                if _pos_symbol(p) == sym and abs(float(_pos_size(p) or 0.0)) > 0:
+                    detail['live_open_position'] = True
+                    _autotrade_log_symbol_block(uid, sym, sd, 'blocked_duplicate_open_position', 'live_position_present')
+                    return (False, 'blocked_duplicate_open_position', detail)
+        except Exception:
+            pass
+
+    local_activity = _autotrade_get_local_symbol_activity(uid, sym)
+    local_opens = local_activity.get('open_trades') or []
+    if local_opens:
+        detail['local_open_trade'] = True
+        detail['local_open_count'] = len(local_opens)
+        _autotrade_log_symbol_block(uid, sym, sd, 'blocked_by_existing_local_trade_state', f"open_trades={len(local_opens)}")
+        return (False, 'blocked_by_existing_local_trade_state', detail)
+
+    pending_guards = _autotrade_get_pending_symbol_guards(uid, sym)
+    if pending_guards:
+        detail['pending_guard'] = True
+        detail['pending_guard_count'] = len(pending_guards)
+        statuses = ','.join(sorted({str(x.get('status') or '').upper() for x in pending_guards}))
+        _autotrade_log_symbol_block(uid, sym, sd, 'blocked_duplicate_pending_order', f"guards={len(pending_guards)} statuses={statuses}")
+        return (False, 'blocked_duplicate_pending_order', detail)
+
+    if str(AUTOTRADE_MODE).lower() == 'live':
+        try:
+            if _autotrade_has_live_open_order(sym, side=None):
+                detail['live_open_order'] = True
+                _autotrade_log_symbol_block(uid, sym, sd, 'blocked_duplicate_pending_order', 'live_open_order_present')
+                return (False, 'blocked_duplicate_pending_order', detail)
+        except Exception:
+            pass
+
+    latest_open_ts = float(local_activity.get('latest_open_ts') or 0.0)
+    if latest_open_ts > 0:
+        recent_remaining = max(0.0, (latest_open_ts + float(AUTOTRADE_RECENT_SYMBOL_SYNC_SEC)) - float(time.time()))
+        detail['recent_trade_remaining_sec'] = recent_remaining
+        if recent_remaining > 0:
+            _autotrade_log_symbol_block(uid, sym, sd, 'blocked_by_recent_symbol_trade', f"remaining_sec={int(recent_remaining)}")
+            return (False, 'blocked_by_recent_symbol_trade', detail)
+
+    cooldown_remaining = _autotrade_symbol_cooldown_remaining(uid, sym, session_label)
+    detail['cooldown_remaining_sec'] = cooldown_remaining
+    if cooldown_remaining > 0:
+        _autotrade_log_symbol_block(uid, sym, sd, 'blocked_by_cooldown', f"remaining_sec={int(cooldown_remaining)}")
+        return (False, 'blocked_by_cooldown', detail)
+
+    return (True, '', detail)
 
 
 def _bybit_get_open_orders_linear(symbol: str | None = None) -> list[dict]:
@@ -2661,28 +2862,62 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
 
-    _autotrade_exec_cleanup()
-    ok_guard, reserved_keys, guard_reason = _autotrade_exec_reserve(uid, setup_id, sym, side)
-    if not ok_guard:
+    gate_ok, gate_reason, gate_detail = _autotrade_can_open_symbol(uid, sym, side, session_label)
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'symbol_gate_allowed': bool(gate_ok),
+            'symbol_gate_reason': gate_reason,
+            'symbol_gate_detail': gate_detail,
+        })
+    except Exception:
+        pass
+    if not gate_ok:
         try:
-            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': guard_reason})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': gate_reason})
         except Exception:
             pass
-        return (False, guard_reason)
+        return (False, gate_reason)
 
+    reserved_keys = []
+    runtime_lock_acquired = False
     try:
-        if str(AUTOTRADE_MODE).lower() == 'live':
-            live_pos = _autotrade_find_live_position(sym, side=side)
-            if live_pos and abs(float(_pos_size(live_pos) or 0.0)) > 0:
-                _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_position_already_open')
-                return (False, 'symbol_position_already_open_live')
-            if _autotrade_has_live_open_order(sym, side=side):
-                _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_open_order_exists')
-                return (False, 'symbol_open_order_already_exists_live')
-        else:
-            if any(str(t.get('symbol') or '').upper() == sym and str(t.get('side') or '').upper() == side and str(t.get('status') or '').upper() == 'OPEN' for t in _autotrade_db_open_trades(uid)):
-                _autotrade_exec_mark(reserved_keys, 'FAILED', 'paper_position_already_open')
-                return (False, 'symbol_position_already_open_paper')
+        runtime_lock_acquired = _autotrade_runtime_symbol_lock_acquire(uid, sym)
+        if not runtime_lock_acquired:
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'blocked_duplicate_inflight_lock'})
+            except Exception:
+                pass
+            _autotrade_log_symbol_block(uid, sym, side, 'blocked_duplicate_inflight_lock', 'runtime_lock_acquire_failed')
+            return (False, 'blocked_duplicate_inflight_lock')
+
+        _autotrade_exec_cleanup()
+        ok_guard, reserved_keys, guard_reason = _autotrade_exec_reserve(uid, setup_id, sym, side)
+        if not ok_guard:
+            mapped_reason = {
+                'duplicate_guard_block:symbol': 'blocked_duplicate_inflight_lock',
+                'duplicate_guard_block:symdir': 'blocked_duplicate_inflight_lock',
+                'duplicate_guard_block:setup': 'blocked_duplicate_pending_order',
+            }.get(guard_reason, guard_reason)
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': mapped_reason})
+            except Exception:
+                pass
+            _autotrade_log_symbol_block(uid, sym, side, mapped_reason, guard_reason)
+            return (False, mapped_reason)
+
+        gate_ok_after, gate_reason_after, gate_detail_after = _autotrade_can_open_symbol(uid, sym, side, session_label)
+        if not gate_ok_after and gate_reason_after not in {'blocked_duplicate_inflight_lock', 'blocked_duplicate_pending_order'}:
+            _autotrade_exec_mark(reserved_keys, 'FAILED', gate_reason_after)
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                    'symbol_gate_allowed': False,
+                    'symbol_gate_reason': gate_reason_after,
+                    'symbol_gate_detail': gate_detail_after,
+                    'reject_reason': gate_reason_after,
+                })
+            except Exception:
+                pass
+            return (False, gate_reason_after)
 
         if str(AUTOTRADE_MODE).lower() == 'paper':
             trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
@@ -2823,6 +3058,9 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception as e:
         _autotrade_exec_mark(reserved_keys, 'FAILED', f'{type(e).__name__}: {e}')
         return (False, f'autotrade_execution_error:{type(e).__name__}')
+    finally:
+        if runtime_lock_acquired:
+            _autotrade_runtime_symbol_lock_release(uid, sym)
 
 # Caching for speed
 TICKERS_TTL_SEC = 45
@@ -14456,6 +14694,29 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.append(SEP)
         lines.append("Last setup attempt:")
         lines.append(f"• {side} {sym} entry={entry} sl={sl} setup_id={det.get('setup_id','')}".strip())
+        try:
+            sg = det.get('symbol_gate_detail') or {}
+            if sym:
+                lines.append(
+                    "Symbol state: "
+                    f"gate={'OPEN' if bool(det.get('symbol_gate_allowed', False)) else 'BLOCKED'}"
+                    + (f" | reason={det.get('symbol_gate_reason')}" if det.get('symbol_gate_reason') else "")
+                )
+                lines.append(
+                    f"   • live_pos={'yes' if sg.get('live_open_position') else 'no'}"
+                    f" | local_open={'yes' if sg.get('local_open_trade') else 'no'}"
+                    f" | live_open_order={'yes' if sg.get('live_open_order') else 'no'}"
+                    f" | pending_guard={'yes' if sg.get('pending_guard') else 'no'}"
+                    f" | inflight_lock={'yes' if sg.get('runtime_lock') else 'no'}"
+                )
+                cd = float(sg.get('cooldown_remaining_sec') or 0.0)
+                rc = float(sg.get('recent_trade_remaining_sec') or 0.0)
+                if cd > 0 or rc > 0:
+                    lines.append(
+                        f"   • cooldown_remaining={int(cd)}s | recent_sync_remaining={int(rc)}s"
+                    )
+        except Exception:
+            pass
 
         setup_time = det.get("setup_time")
         deadline = det.get("entry_deadline")
@@ -18063,47 +18324,65 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
         now_utc = datetime.now(timezone.utc)
         sess = _guess_session_name_utc(now_utc)
 
-        if not _autotrade_allowed_session(sess):
-            _LAST_AUTOTRADE_DECISION[uid] = {
-                "status": "SKIP",
-                "when": now_utc.isoformat(timespec="seconds"),
-                "reason": f"session_not_allowed ({sess})",
-            }
-            return
-
-        # Optional: respect user's trade window (if configured)
-        try:
-            if not trade_window_allows_now(user):
+        async with AUTOTRADE_EXEC_LOCK:
+            if not _autotrade_allowed_session(sess):
                 _LAST_AUTOTRADE_DECISION[uid] = {
                     "status": "SKIP",
                     "when": now_utc.isoformat(timespec="seconds"),
-                    "reason": "trade_window_block",
+                    "reason": f"session_not_allowed ({sess})",
                 }
                 return
-        except Exception:
-            pass
 
-        # Select best recent OPEN setup from DB (generated_setups + signals)
-        db_setups = _autotrade_select_db_setups(uid, sess, lookback_hours=12, limit=1)
-        if not db_setups:
+            # Optional: respect user's trade window (if configured)
+            try:
+                if not trade_window_allows_now(user):
+                    _LAST_AUTOTRADE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": now_utc.isoformat(timespec="seconds"),
+                        "reason": "trade_window_block",
+                    }
+                    return
+            except Exception:
+                pass
+
+            # Select multiple recent OPEN setups and let the hardened gatekeeper choose the first tradable one.
+            db_setups = _autotrade_select_db_setups(uid, sess, lookback_hours=12, limit=5)
+            if not db_setups:
+                _LAST_AUTOTRADE_DECISION[uid] = {
+                    "status": "SKIP",
+                    "when": now_utc.isoformat(timespec="seconds"),
+                    "reason": "no_setups",
+                    "session": sess,
+                    "mode": AUTOTRADE_MODE,
+                }
+                return
+
+            ok = False
+            reason = 'no_tradable_setup'
+            attempted = 0
+            for cand in db_setups:
+                attempted += 1
+                ok, reason = _autotrade_place_trade(uid, sess, [cand])
+                if ok:
+                    break
+                if reason not in {
+                    'blocked_duplicate_open_position',
+                    'blocked_duplicate_pending_order',
+                    'blocked_duplicate_inflight_lock',
+                    'blocked_by_cooldown',
+                    'blocked_by_recent_symbol_trade',
+                    'blocked_by_existing_local_trade_state',
+                }:
+                    break
+
             _LAST_AUTOTRADE_DECISION[uid] = {
-                "status": "SKIP",
+                "status": "PLACED" if ok else "SKIP",
                 "when": now_utc.isoformat(timespec="seconds"),
-                "reason": "no_setups",
+                "reason": "" if ok else reason,
+                "attempted": attempted,
                 "session": sess,
                 "mode": AUTOTRADE_MODE,
             }
-            return
-
-        ok, reason = _autotrade_place_trade(uid, sess, db_setups)
-
-        _LAST_AUTOTRADE_DECISION[uid] = {
-            "status": "PLACED" if ok else "SKIP",
-            "when": now_utc.isoformat(timespec="seconds"),
-            "reason": "" if ok else reason,
-            "session": sess,
-            "mode": AUTOTRADE_MODE,
-        }
 
     except Exception as e:
         try:
