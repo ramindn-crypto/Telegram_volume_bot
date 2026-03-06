@@ -1496,27 +1496,42 @@ def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> di
     except Exception as e:
         return {"retCode": -1, "retMsg": f"{type(e).__name__}: {e}", "result": None}
 def _bybit_get_instr_filters(symbol: str) -> dict:
-    """Return dict with keys: minQty, qtyStep, minNotional as STRINGS (best-effort) for linear USDT perp."""
+    """Return best-effort Bybit linear instrument filters.
+
+    Keys returned as strings when available:
+    - minQty
+    - qtyStep
+    - minNotional
+    - contractSize
+    - tickSize
+    """
     sym = _bybit_linear_symbol(symbol)
     if sym in _INSTR_FILTER_CACHE:
         return _INSTR_FILTER_CACHE[sym]
-    out = {"minQty": None, "qtyStep": None, "minNotional": None, "contractSize": None}
+    out = {"minQty": None, "qtyStep": None, "minNotional": None, "contractSize": None, "tickSize": None}
     try:
         res = _bybit_v5_request("GET", "/v5/market/instruments-info", {"category": "linear", "symbol": sym})
         items = (((res or {}).get("result") or {}).get("list") or [])
         if items:
             info = items[0] or {}
             lot = info.get("lotSizeFilter") or {}
+            price_filter = info.get("priceFilter") or {}
+
             if lot.get("minOrderQty") is not None:
                 out["minQty"] = str(lot.get("minOrderQty"))
             if lot.get("qtyStep") is not None:
                 out["qtyStep"] = str(lot.get("qtyStep"))
-            nf = info.get("notionalFilter") or {}
-            if nf.get("minNotional") is not None:
-                out["minNotional"] = str(nf.get("minNotional"))
-            # contract size (important for 1000* symbols)
+            # Current Bybit V5 field for linear min notional is lotSizeFilter.minNotionalValue
+            min_notional = lot.get("minNotionalValue")
+            if min_notional is None:
+                nf = info.get("notionalFilter") or {}
+                min_notional = nf.get("minNotional")
+            if min_notional is not None:
+                out["minNotional"] = str(min_notional)
             if info.get('contractSize') is not None:
                 out['contractSize'] = str(info.get('contractSize'))
+            if price_filter.get('tickSize') is not None:
+                out['tickSize'] = str(price_filter.get('tickSize'))
     except Exception:
         pass
     _INSTR_FILTER_CACHE[sym] = out
@@ -1615,6 +1630,129 @@ def _round_qty_down(symbol: str, qty: float, entry_price: float) -> tuple[float 
 
 
 
+def _round_price_to_tick(symbol: str, price: float, rounding=ROUND_DOWN) -> float:
+    """Round a price to Bybit tick size. Best-effort only."""
+    try:
+        if price is None:
+            return 0.0
+        f = _bybit_get_instr_filters(symbol)
+        tick_s = f.get("tickSize")
+        if not tick_s:
+            return float(price)
+        dprice = Decimal(str(price))
+        dtick = Decimal(str(tick_s))
+        if dtick <= 0:
+            return float(price)
+        mult = (dprice / dtick).to_integral_value(rounding=rounding)
+        out = (mult * dtick).quantize(dtick)
+        return float(out)
+    except Exception:
+        try:
+            return float(price)
+        except Exception:
+            return 0.0
+
+
+def _effective_equity_for_risk(user: dict | None = None, prefer_live: bool = True) -> float:
+    """Single source of truth for risk-based equity.
+
+    LIVE mode prefers Bybit-reported equity; otherwise falls back to user-stored equity.
+    """
+    eq = 0.0
+    try:
+        if isinstance(user, dict):
+            eq = float(user.get("equity", 0.0) or 0.0)
+    except Exception:
+        eq = 0.0
+    if prefer_live:
+        try:
+            live_eq = _live_equity_usdt()
+            if live_eq is not None and float(live_eq) > 0:
+                return float(live_eq)
+        except Exception:
+            pass
+    return max(0.0, float(eq or 0.0))
+
+
+def _risk_amount_from_pct(equity: float, risk_pct: float) -> float:
+    try:
+        if float(equity) <= 0:
+            return 0.0
+        return max(0.0, float(equity) * (float(risk_pct) / 100.0))
+    except Exception:
+        return 0.0
+
+
+def _risk_pct_from_amount(equity: float, risk_usd: float) -> float:
+    try:
+        if float(equity) <= 0:
+            return 0.0
+        return max(0.0, (float(risk_usd) / float(equity)) * 100.0)
+    except Exception:
+        return 0.0
+
+
+def _autotrade_live_reference_price(symbol: str, fallback_entry: float = 0.0) -> float:
+    """Best-effort executable reference price for live sizing.
+
+    We use a current market reference instead of a potentially stale setup entry so market-order
+    sizing stays aligned with real stop distance.
+    """
+    sym = _bybit_linear_symbol(symbol)
+    try:
+        res = _bybit_v5_request("GET", "/v5/market/tickers", {"category": "linear", "symbol": sym})
+        items = (((res or {}).get("result") or {}).get("list") or [])
+        if items:
+            t = items[0] or {}
+            for k in ("markPrice", "lastPrice", "indexPrice"):
+                try:
+                    px = float(t.get(k) or 0.0)
+                    if px > 0:
+                        return px
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        best = get_cached_futures_tickers() or {}
+        base = sym[:-4] if sym.endswith("USDT") else sym
+        mv = best.get(base)
+        if mv:
+            px = float(getattr(mv, "last", 0.0) or 0.0)
+            if px > 0:
+                return px
+    except Exception:
+        pass
+    try:
+        return float(fallback_entry or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _autotrade_true_risk_usd(entry_price: float, stop_price: float, qty_contracts: float, contract_size: float = 1.0) -> float:
+    try:
+        return abs(float(entry_price) - float(stop_price)) * abs(float(qty_contracts)) * abs(float(contract_size or 1.0))
+    except Exception:
+        return 0.0
+
+
+def _autotrade_find_live_position(symbol: str, side: str | None = None) -> dict | None:
+    sym = _bybit_linear_symbol(symbol)
+    side_u = str(side or "").upper().strip()
+    try:
+        for p in _bybit_get_open_positions_linear():
+            psym = _pos_symbol(p)
+            if psym != sym:
+                continue
+            if side_u:
+                pside = _pos_side_text(p)
+                if pside != side_u:
+                    continue
+            return p
+    except Exception:
+        return None
+    return None
 def _autotrade_ready() -> bool:
     if not AUTOTRADE_ENABLED:
         return False
@@ -2020,14 +2158,15 @@ def _autotrade_open_risk_usd(uid: int, equity_usdt: float) -> float:
         total += _autotrade_estimated_risk_usd(float(t.get('entry') or 0.0), float(t.get('sl') or 0.0), float(t.get('qty') or 0.0))
     return total
 
-def _autotrade_qty_from_risk(entry: float, sl: float, equity_usdt: float, risk_usd: float | None = None) -> float:
-    dist = abs(entry - sl)
-    if dist <= 0:
+def _autotrade_qty_from_risk(entry: float, sl: float, equity_usdt: float, risk_usd: float | None = None, contract_size: float = 1.0) -> float:
+    dist = abs(float(entry) - float(sl))
+    cs = abs(float(contract_size or 1.0))
+    if dist <= 0 or cs <= 0:
         return 0.0
     if risk_usd is None:
-        # Backward-compat fallback (env-based)
-        risk_usd = (equity_usdt * (AUTOTRADE_RISK_PER_TRADE_PCT / 100.0))
-    qty = float(risk_usd) / dist
+        # Backward-compat fallback only. Live sizing should pass explicit /riskmode-derived risk_usd.
+        risk_usd = (float(equity_usdt) * (AUTOTRADE_RISK_PER_TRADE_PCT / 100.0))
+    qty = float(risk_usd) / (dist * cs)
     if qty <= 0 or (not math.isfinite(qty)):
         return 0.0
     return float(qty)
@@ -2187,28 +2326,16 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     if not setups:
         return (False, 'no_setups')
 
-    try:
-        if str(AUTOTRADE_MODE).lower() == 'live':
-            _open_n = len(_bybit_get_open_positions_linear())
-        else:
-            _open_n = len(_autotrade_db_open_trades(uid))
-    except Exception:
-        _open_n = 0
-
     s = setups[0]
 
     side = str(getattr(s, 'side', '') or '').upper()
-    entry = float(getattr(s, 'entry', 0.0) or 0.0)
-    sl = float(getattr(s, 'sl', 0.0) or 0.0)
-
-    # clean debug precision
-    entry = round(entry, 6) if entry else entry
-    sl = round(sl, 6) if sl else sl
+    intended_entry = float(getattr(s, 'entry', 0.0) or 0.0)
+    intended_sl = float(getattr(s, 'sl', 0.0) or 0.0)
 
     sym = str(getattr(s, 'symbol', '') or '').upper()
     sym = _bybit_linear_symbol(sym)
 
-    # keep last autotrade attempt details for /autotrade_last (store AFTER values defined)
+    # Keep last autotrade attempt details for diagnostics
     try:
         _LAST_AUTOTRADE_DETAIL[int(uid)] = {
             'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -2217,15 +2344,14 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'symbol_raw': str(getattr(s, 'symbol', '') or ''),
             'symbol_sent': sym,
             'side': side,
-            'entry': entry,
-            'sl': sl,
+            'setup_entry': intended_entry,
+            'setup_sl_raw': intended_sl,
         }
     except Exception:
         pass
-        
+
     # track setup generation timing (setup generated time + 10m entry deadline)
     try:
-        # Prefer the DB-generated timestamp if present; fall back to "now".
         _cts = float(getattr(s, 'created_ts', 0.0) or 0.0)
         if _cts > 0:
             _setup_dt = datetime.fromtimestamp(_cts, tz=timezone.utc)
@@ -2253,7 +2379,6 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
 
-
     # TP targets may be partially available depending on the engine/scanner
     _tp1 = getattr(s, 'tp1', None)
     _tp2 = getattr(s, 'tp2', None)
@@ -2273,104 +2398,185 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     if side not in {'BUY', 'SELL'}:
         return (False, f'bad_side ({side})')
 
-    # Require core prices + at least one TP
-    if entry <= 0 or sl <= 0:
+    if intended_entry <= 0 or intended_sl <= 0:
         return (False, 'bad_prices')
     tps = [v for v in (tp1, tp2, tp3) if v is not None]
     if not tps:
         return (False, 'missing_tp')
 
-    if side == 'BUY' and sl >= entry:
+    if side == 'BUY' and intended_sl >= intended_entry:
         return (False, 'sl_not_below_entry_for_buy')
-    if side == 'SELL' and sl <= entry:
+    if side == 'SELL' and intended_sl <= intended_entry:
         return (False, 'sl_not_above_entry_for_sell')
 
-    # Equity source
+    # Live sizing should use a current executable price reference, not a potentially stale setup entry.
+    price_ref = intended_entry
     if str(AUTOTRADE_MODE).lower() == 'live':
-        equity = float(_bybit_get_equity_usdt() or 0.0)
-        # keep user equity in sync for pct-based caps (/dailycap, /riskmode)
-        try:
-            if equity > 0:
-                update_user(int(uid), equity=float(equity))
-        except Exception:
-            pass
-    else:
-        equity = float((get_user(uid) or {}).get('equity') or 0.0)
+        live_ref = _autotrade_live_reference_price(sym, fallback_entry=intended_entry)
+        if live_ref > 0:
+            price_ref = live_ref
 
+    filt = _bybit_get_instr_filters(sym)
+    contract_size = float(filt.get('contractSize') or 1.0)
+    stop_rounding = ROUND_UP if side == 'BUY' else ROUND_DOWN
+    sl_for_order = _round_price_to_tick(sym, intended_sl, rounding=stop_rounding)
+    if sl_for_order <= 0:
+        sl_for_order = intended_sl
+
+    if side == 'BUY' and sl_for_order >= price_ref:
+        return (False, 'stop_invalid_after_tick_rounding_for_buy')
+    if side == 'SELL' and sl_for_order <= price_ref:
+        return (False, 'stop_invalid_after_tick_rounding_for_sell')
+
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'entry': float(price_ref),
+            'sl': float(sl_for_order),
+            'setup_entry_vs_live_delta_pct': (((float(price_ref) - float(intended_entry)) / float(intended_entry)) * 100.0) if float(intended_entry) > 0 else 0.0,
+            'contractSize': float(contract_size),
+            'tick_size': filt.get('tickSize'),
+        })
+    except Exception:
+        pass
+
+    # Equity source
+    equity = _effective_equity_for_risk(get_user(uid) or {}, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
     if equity <= 0:
         return (False, 'equity_unavailable_or_zero')
 
-    # Risk parameters are sourced from user commands:
-    # - per-trade risk uses /riskmode as the BASE risk
-    # - dynamic multiplier adjusts actual size by setup quality/regime
-    # - daily cap uses /dailycap
+    try:
+        if str(AUTOTRADE_MODE).lower() == 'live' and equity > 0:
+            update_user(int(uid), equity=float(equity))
+    except Exception:
+        pass
+
     base_per_trade_risk = float(_autotrade_per_trade_risk_usd(uid, equity) or 0.0)
     daily_cap = float(_autotrade_daily_cap_usd(uid, equity) or 0.0)
-    remaining_risk = float(_autotrade_remaining_risk_usd(uid, equity) or 0.0)
 
     # Open risk (live) from Bybit open positions, else from bot journal
     if str(AUTOTRADE_MODE).lower() == 'live':
         try:
-            open_risk = sum(_estimate_position_risk_usd(p) for p in _bybit_get_open_positions_linear())
+            open_positions = _bybit_get_open_positions_linear()
+            open_risk = sum(_estimate_position_risk_usd(p) for p in open_positions)
+            if any(_pos_symbol(p) == sym and abs(_pos_size(p)) > 0 for p in open_positions):
+                return (False, 'symbol_position_already_open_live')
         except Exception:
             open_risk = 0.0
     else:
         open_risk = float(_autotrade_open_risk_usd(uid, equity) or 0.0)
+        try:
+            if any(str(t.get('symbol') or '').upper() == sym and str(t.get('status') or '').upper() == 'OPEN' for t in _autotrade_db_open_trades(uid)):
+                return (False, 'symbol_position_already_open_paper')
+        except Exception:
+            pass
 
-    # Dynamic risk engine for autotrade sizing.
-    # Best approach: 4H+1H define structure, 15m handles entry timing,
-    # and risk is scaled conservatively by confidence + market regime.
+    remaining_risk = float('inf')
+    if daily_cap > 0:
+        remaining_risk = max(0.0, float(daily_cap) - max(0.0, float(open_risk)))
+
     effective_risk, risk_mult, risk_regime = _autotrade_effective_risk_usd(
         uid=uid,
         setup=s,
         equity=float(equity),
         base_risk_usd=float(base_per_trade_risk),
-        remaining_risk_usd=float(remaining_risk),
+        remaining_risk_usd=float(remaining_risk) if math.isfinite(remaining_risk) else float(base_per_trade_risk),
         open_risk_usd=float(open_risk),
         daily_cap_usd=float(daily_cap),
     )
 
-    # Store risk sizing details early so /autotrade_last and /autotrade_debug
-    # can show multiplier/regime even when the trade is skipped before order placement.
+    stop_distance = abs(float(price_ref) - float(sl_for_order))
+    allowed_risk_usd = min(float(base_per_trade_risk), float(effective_risk))
+    if math.isfinite(remaining_risk):
+        allowed_risk_usd = min(float(allowed_risk_usd), float(remaining_risk))
+    allowed_risk_usd = max(0.0, float(allowed_risk_usd))
+
+    configured_risk_pct = _risk_pct_from_amount(float(equity), float(base_per_trade_risk))
+    allowed_risk_pct = _risk_pct_from_amount(float(equity), float(allowed_risk_usd))
+
     try:
         _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'equity_used': float(equity),
+            'risk_mode': str((get_user(uid) or {}).get('risk_mode', DEFAULT_RISK_MODE)).upper(),
+            'risk_value': float((get_user(uid) or {}).get('risk_value', DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE),
             'risk_base_usd': float(base_per_trade_risk),
             'risk_effective_usd': float(effective_risk),
             'risk_multiplier': float(risk_mult),
             'risk_regime': str(risk_regime),
+            'configured_risk_pct': float(configured_risk_pct),
+            'allowed_risk_usd': float(allowed_risk_usd),
+            'allowed_risk_pct': float(allowed_risk_pct),
+            'daily_cap_usd': float(daily_cap),
+            'open_risk_usd_before': float(open_risk),
+            'remaining_risk_usd': float(remaining_risk) if math.isfinite(remaining_risk) else float('inf'),
+            'stop_distance': float(stop_distance),
         })
     except Exception:
         pass
 
-    # If remaining daily capacity clips risk too aggressively, skip the trade.
-    if effective_risk <= 0:
+    if allowed_risk_usd <= 0:
         return (False, 'daily_risk_cap_reached')
-    min_effective = max(1.0, float(base_per_trade_risk) * 0.35)
-    if effective_risk < min_effective:
-        return (False, 'effective_risk_too_small_after_caps')
+    if stop_distance <= 0:
+        return (False, 'stop_distance_zero_or_invalid')
 
-    qty = _autotrade_qty_from_risk(entry, sl, equity, risk_usd=effective_risk)
-    if qty <= 0:
+    raw_qty = _autotrade_qty_from_risk(price_ref, sl_for_order, equity, risk_usd=allowed_risk_usd, contract_size=contract_size)
+    if raw_qty <= 0:
         return (False, 'qty_calc_failed')
 
     try:
-        _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-            'qty_from_risk': float(qty)
+            'raw_qty': float(raw_qty),
+            'qty_from_risk': float(raw_qty),
         })
     except Exception:
         pass
 
-    # NOTE: qty is kept in base units here. Contract-size conversion (e.g., 1000* symbols)
-    # happens once in LIVE mode right before rounding + order placement.
+    qty, qreason = _round_qty_down(sym, raw_qty, price_ref)
+    if qty is None:
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': f'qty_invalid:{qreason}'})
+        except Exception:
+            pass
+        return (False, f'qty_invalid:{qreason}')
 
-    if AUTOTRADE_MODE == 'paper':
+    actual_risk = _autotrade_true_risk_usd(price_ref, sl_for_order, qty, contract_size)
+    if actual_risk > (allowed_risk_usd * 1.0005):
+        qty2 = _autotrade_qty_from_risk(price_ref, sl_for_order, equity, risk_usd=allowed_risk_usd, contract_size=contract_size)
+        qty2, qreason2 = _round_qty_down(sym, qty2, price_ref)
+        if qty2 is None:
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': f'qty_capped_but_invalid:{qreason2}'})
+            except Exception:
+                pass
+            return (False, f'qty_capped_but_invalid:{qreason2}')
+        qty = qty2
+        actual_risk = _autotrade_true_risk_usd(price_ref, sl_for_order, qty, contract_size)
+        if actual_risk > (allowed_risk_usd * 1.0005):
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'risk_cap_enforcement_failed'})
+            except Exception:
+                pass
+            return (False, 'risk_cap_enforcement_failed')
+
+    actual_risk_pct = _risk_pct_from_amount(float(equity), float(actual_risk))
+
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'rounded_qty': float(qty),
+            'qty': float(qty),
+            'qty_attempted': float(qty),
+            'qty_round_reason': qreason,
+            'risk_actual_usd': float(actual_risk),
+            'risk_actual_pct': float(actual_risk_pct),
+        })
+    except Exception:
+        pass
+
+    if str(AUTOTRADE_MODE).lower() == 'paper':
         trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
         tps_str = ','.join([f"{x:g}" for x in tps])
-        return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TPs={tps_str}")
+        return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.8g} SL={sl_for_order} TPs={tps_str}")
 
-    # LIVE MODE (Bybit V5)
     if AUTOTRADE_ISOLATED:
         _bybit_v5_request('POST', '/v5/position/switch-isolated', {
             'category': 'linear',
@@ -2386,84 +2592,11 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         'sellLeverage': str(AUTOTRADE_LEVERAGE),
     })
 
-    # Round qty up to Bybit min/step to prevent rejections on low-price symbols
-
-    # Convert "base units" qty -> Bybit contract qty when contractSize > 1 (e.g., 1000* symbols)
-    try:
-        _tmp_f = _bybit_get_instr_filters(sym)
-        _cs = float(_tmp_f.get('contractSize') or 1.0)
-        if _cs and _cs > 1.0:
-            qty = float(qty) / _cs
-            try:
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'contractSize': _cs, 'qty_contracts': qty})
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    qty, qreason = _round_qty_down(sym, qty, entry)
-    if qty is None:
-        return (False, f"qty_invalid:{qreason}")
-
-    # Final safety check: ensure TRUE $ risk after rounding never exceeds:
-    # - per-trade risk from /riskmode (base_per_trade_risk)
-    # - remaining daily risk capacity
-    # NOTE: rounding DOWN should already make this safe, but contractSize/minimums can still cause drift.
-    try:
-        _f = _bybit_get_instr_filters(sym)
-        _cs2 = float(_f.get('contractSize') or 1.0)
-        _actual_risk = abs(float(entry) - float(sl)) * float(qty) * _cs2
-        _cap = max(0.0, min(float(base_per_trade_risk), float(remaining_risk), max(0.0, float(daily_cap) - float(open_risk))))
-        # small tolerance for float noise
-        if _cap > 0 and _actual_risk > (_cap * 1.0005):
-            # scale down qty to meet cap and re-round down
-            _scale = _cap / _actual_risk
-            qty2 = float(qty) * float(_scale)
-            qty2, qreason2 = _round_qty_down(sym, qty2, entry)
-            if qty2 is None:
-                return (False, f"qty_capped_but_invalid:{qreason2}")
-            qty = qty2
-            _actual_risk2 = abs(float(entry) - float(sl)) * float(qty) * _cs2
-            if _actual_risk2 > (_cap * 1.0005):
-                return (False, "risk_cap_enforcement_failed")
-            try:
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                    'risk_cap_usd': float(_cap),
-                    'risk_actual_usd': float(_actual_risk2),
-                    'qty_capped': True,
-                })
-            except Exception:
-                pass
-        else:
-            try:
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                    'risk_cap_usd': float(_cap),
-                    'risk_actual_usd': float(_actual_risk),
-                    'qty_capped': False,
-                })
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    
-    # store final qty after rounding (for /autotrade_debug)
-    try:
-        _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
-        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-            'qty_attempted': int(qty),
-            'qty_round_reason': qreason
-        })
-    except Exception:
-        pass
-    
-    # Format qty as Bybit-safe string (no scientific notation, aligned to qtyStep)
     _filt = _bybit_get_instr_filters(sym)
     qty_step = _filt.get('qtyStep')
     qty_str = _fmt_qty(qty, qty_step)
     try:
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-            'qty': float(qty) if qty is not None else None,
             'qty_step': qty_step,
             'min_qty': _filt.get('minQty'),
             'min_notional': _filt.get('minNotional'),
@@ -2480,14 +2613,13 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         'qty': qty_str,
         'timeInForce': 'IOC',
     }
-    # track order attempts
     try:
         d = _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
         d['attempt_count'] = int(d.get('attempt_count', 0)) + 1
         d['last_attempt'] = datetime.now(timezone.utc).isoformat()
     except Exception:
         pass
-        
+
     open_res = _bybit_v5_request('POST', '/v5/order/create', order_payload)
     try:
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
@@ -2497,7 +2629,6 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
 
-
     if int(open_res.get('retCode', -1)) != 0:
         err = f"{open_res.get('retCode')} {open_res.get('retMsg')}"
         return (False, f"bybit_open_failed ({err})")
@@ -2505,25 +2636,76 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     _bybit_v5_request('POST', '/v5/position/trading-stop', {
         'category': 'linear',
         'symbol': sym,
-        'stopLoss': str(sl),
+        'stopLoss': str(sl_for_order),
         'tpslMode': 'Full',
     })
 
+    # Post-fill hard guard: correct for slippage / stale entry by reducing oversize immediately.
+    corrected = False
+    try:
+        live_pos = _autotrade_find_live_position(sym, side=side)
+        if live_pos:
+            filled_qty = abs(float(_pos_size(live_pos) or 0.0))
+            filled_entry = float(_pos_entry(live_pos) or price_ref)
+            filled_risk = _autotrade_true_risk_usd(filled_entry, sl_for_order, filled_qty, contract_size)
+            filled_risk_pct = _risk_pct_from_amount(float(equity), float(filled_risk))
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'filled_qty': float(filled_qty),
+                'filled_entry': float(filled_entry),
+                'filled_risk_usd': float(filled_risk),
+                'filled_risk_pct': float(filled_risk_pct),
+            })
+
+            if filled_risk > (allowed_risk_usd * 1.0005):
+                allowed_qty = _autotrade_qty_from_risk(filled_entry, sl_for_order, equity, risk_usd=allowed_risk_usd, contract_size=contract_size)
+                allowed_qty, reduce_reason = _round_qty_down(sym, allowed_qty, filled_entry)
+                if allowed_qty is None or allowed_qty <= 0:
+                    return (False, f'post_fill_risk_breach_no_valid_reduction:{reduce_reason}')
+
+                reduce_qty = max(0.0, filled_qty - float(allowed_qty))
+                reduce_qty, reduce_reason = _round_qty_down(sym, reduce_qty, filled_entry)
+                if reduce_qty is None or reduce_qty <= 0:
+                    return (False, f'post_fill_risk_breach_reduce_qty_invalid:{reduce_reason}')
+
+                reduce_payload = {
+                    'category': 'linear',
+                    'symbol': sym,
+                    'side': 'Sell' if side == 'BUY' else 'Buy',
+                    'orderType': 'Market',
+                    'qty': _fmt_qty(reduce_qty, qty_step),
+                    'timeInForce': 'IOC',
+                    'reduceOnly': True,
+                    'closeOnTrigger': True,
+                }
+                reduce_res = _bybit_v5_request('POST', '/v5/order/create', reduce_payload)
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                    'reduce_payload': reduce_payload,
+                    'reduce_res': reduce_res,
+                })
+                if int(reduce_res.get('retCode', -1)) != 0:
+                    err = f"{reduce_res.get('retCode')} {reduce_res.get('retMsg')}"
+                    return (False, f'post_fill_risk_breach_reduce_failed ({err})')
+                corrected = True
+    except Exception as e:
+        return (False, f'post_fill_risk_guard_error:{type(e).__name__}')
+
     # Place as many TP orders as we have valid targets
     tps = [v for v in (tp1, tp2, tp3) if v is not None]
+    final_pos = _autotrade_find_live_position(sym, side=side)
+    tp_base_qty = abs(float(_pos_size(final_pos) or qty)) if final_pos else float(qty)
 
     if len(tps) == 1:
-        tp_qtys = [qty]
+        tp_qtys = [tp_base_qty]
     elif len(tps) == 2:
         splits = AUTOTRADE_TP_SPLIT
-        q1 = max(0.0, qty * splits[0])
-        q2 = max(0.0, qty - q1)
+        q1 = max(0.0, tp_base_qty * splits[0])
+        q2 = max(0.0, tp_base_qty - q1)
         tp_qtys = [q1, q2]
     else:
         splits = AUTOTRADE_TP_SPLIT
-        tp_qtys = [max(0.0, qty * splits[0]), max(0.0, qty * splits[1]), max(0.0, qty * splits[2])]
+        tp_qtys = [max(0.0, tp_base_qty * splits[0]), max(0.0, tp_base_qty * splits[1]), max(0.0, tp_base_qty * splits[2])]
         try:
-            tp_qtys[2] = max(0.0, qty - (tp_qtys[0] + tp_qtys[1]))
+            tp_qtys[2] = max(0.0, tp_base_qty - (tp_qtys[0] + tp_qtys[1]))
         except Exception:
             pass
 
@@ -2542,8 +2724,10 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'closeOnTrigger': True,
         })
 
-    trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
-    return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty:.4g} SL={sl} TPs={','.join([f'{x:g}' for x in tps])}")
+    qty_for_db = tp_base_qty if tp_base_qty > 0 else qty
+    trade_id = _autotrade_db_add_trade(uid, session_label, s, qty_for_db)
+    suffix = ' corrected_for_post_fill_risk' if corrected else ''
+    return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty_for_db:.8g} SL={sl_for_order} TPs={','.join([f'{x:g}' for x in tps])}{suffix}")
 
 
 # Caching for speed
@@ -10321,16 +10505,13 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # RISK
 # =========================================================
 def compute_risk_usd(user: dict, mode: str, value: float) -> float:
-    mode = mode.upper()
+    mode = str(mode or "").upper()
     if mode == "USD":
         return max(0.0, float(value))
-    eq = float(user["equity"])
-    live_eq = _live_equity_usdt()
-    if live_eq is not None:
-        eq = live_eq
+    eq = _effective_equity_for_risk(user, prefer_live=True)
     if eq <= 0:
         return 0.0
-    return max(0.0, eq * (float(value) / 100.0))
+    return _risk_amount_from_pct(eq, float(value))
 
 def calc_qty(entry: float, sl: float, risk_usd: float) -> float:
     d = abs(entry - sl)
@@ -10391,14 +10572,14 @@ def entry_sanity_check(entry: float, current: float) -> Tuple[Optional[str], boo
 
 
 def daily_cap_usd(user: dict) -> float:
-    mode = user["daily_cap_mode"].upper()
-    val = float(user["daily_cap_value"])
+    mode = str(user.get("daily_cap_mode", DEFAULT_DAILY_CAP_MODE) or DEFAULT_DAILY_CAP_MODE).upper()
+    val = float(user.get("daily_cap_value", DEFAULT_DAILY_CAP_VALUE) or DEFAULT_DAILY_CAP_VALUE)
     if mode == "USD":
         return max(0.0, val)
-    eq = float(user["equity"])
+    eq = _effective_equity_for_risk(user, prefer_live=True)
     if eq <= 0:
         return 0.0
-    return max(0.0, eq * (val / 100.0))
+    return _risk_amount_from_pct(eq, val)
 
 # =========================================================
 # REPORTING / ADVICE
@@ -11885,10 +12066,10 @@ async def notify_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Email alerts: OFF")
 
 def _equity_risk_pct_from_usd(user: dict, risk_usd: float) -> Optional[float]:
-    eq = float(user.get("equity", 0.0) or 0.0)
+    eq = _effective_equity_for_risk(user, prefer_live=True)
     if eq <= 0:
         return None
-    return (float(risk_usd) / eq) * 100.0
+    return _risk_pct_from_amount(eq, risk_usd)
 
 
 def _find_unknown_tokens(tokens: list) -> list:
@@ -13950,7 +14131,9 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if det:
         lines.append(f"*Symbol:* `{det.get('symbol_sent','')}`  (raw: `{det.get('symbol_raw','')}`)")
         lines.append(f"*Side:* `{det.get('side','')}`")
-        lines.append(f"*Entry:* `{det.get('entry','')}`  *SL:* `{det.get('sl','')}`")
+        lines.append(f"*Entry used for sizing:* `{det.get('entry','')}`  *SL used:* `{det.get('sl','')}`")
+        if det.get('setup_entry') is not None:
+            lines.append(f"*Setup entry:* `{det.get('setup_entry')}`  *Raw setup SL:* `{det.get('setup_sl_raw')}`")
         risk_base = det.get("risk_base_usd")
         risk_eff = det.get("risk_effective_usd")
         risk_mult = det.get("risk_multiplier")
@@ -13958,20 +14141,34 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         qty_from_risk = det.get("qty_from_risk")
 
         try:
+            if det.get('equity_used') is not None:
+                lines.append(f"*Equity used:* `${float(det.get('equity_used')):.2f}`")
             if risk_base is not None:
-                lines.append(f"*Base risk:* `${float(risk_base):.2f}`")
+                lines.append(f"*Configured risk:* `${float(risk_base):.2f}` ({float(det.get('configured_risk_pct') or 0.0):.2f}%)")
+            if det.get('allowed_risk_usd') is not None:
+                lines.append(f"*Allowed risk after caps:* `${float(det.get('allowed_risk_usd')):.2f}` ({float(det.get('allowed_risk_pct') or 0.0):.2f}%)")
             if risk_mult is not None and risk_eff is not None:
                 extra = f" | Regime: {risk_regime}" if risk_regime else ""
-                lines.append(f"*Dynamic risk:* `x{float(risk_mult):.2f} → ${float(risk_eff):.2f}`{extra}")
+                lines.append(f"*Dynamic risk engine:* `x{float(risk_mult):.2f} → ${float(risk_eff):.2f}`{extra}")
             elif risk_regime:
                 lines.append(f"*Regime:* `{risk_regime}`")
+            if det.get('stop_distance') is not None:
+                lines.append(f"*Stop distance:* `{float(det.get('stop_distance')):.10g}`")
             if qty_from_risk is not None:
-                lines.append(f"*Qty from risk:* `{float(qty_from_risk):.8g}`")
+                lines.append(f"*Raw qty:* `{float(qty_from_risk):.8g}`")
+            if det.get('rounded_qty') is not None:
+                lines.append(f"*Rounded qty:* `{float(det.get('rounded_qty')):.8g}`")
+            if det.get('risk_actual_usd') is not None:
+                lines.append(f"*Actual pre-fill risk:* `${float(det.get('risk_actual_usd')):.2f}` ({float(det.get('risk_actual_pct') or 0.0):.2f}%)")
+            if det.get('filled_risk_usd') is not None:
+                lines.append(f"*Actual post-fill risk:* `${float(det.get('filled_risk_usd')):.2f}` ({float(det.get('filled_risk_pct') or 0.0):.2f}%)")
         except Exception:
             pass
 
         if det.get("qty_str") is not None:
-            lines.append(f"*Qty:* `{det.get('qty_str')}` (step {det.get('qty_step')}, min {det.get('min_qty')}, minNot {det.get('min_notional')})")
+            lines.append(f"*Qty sent:* `{det.get('qty_str')}` (step {det.get('qty_step')}, min {det.get('min_qty')}, minNot {det.get('min_notional')})")
+        if det.get('reject_reason'):
+            lines.append(f"*Reject reason:* `{det.get('reject_reason')}`")
         by = det.get("bybit") or {}
         try:
             rc = by.get("retCode")
@@ -14160,7 +14357,6 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         setup_time = det.get("setup_time")
         deadline = det.get("entry_deadline")
-        qty_attempted = det.get("qty_attempted")
         risk_base = det.get("risk_base_usd")
         risk_eff = det.get("risk_effective_usd")
         risk_mult = det.get("risk_multiplier")
@@ -14182,16 +14378,29 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
                 pass
 
         try:
+            if det.get('equity_used') is not None:
+                lines.append(f"Equity used for sizing: ${float(det.get('equity_used')):.2f}")
             if risk_base is not None:
-                lines.append(f"Base risk: ${float(risk_base):.2f}")
+                lines.append(f"Configured risk: ${float(risk_base):.2f} ({float(det.get('configured_risk_pct') or 0.0):.2f}%)")
+            if det.get('allowed_risk_usd') is not None:
+                lines.append(f"Allowed risk after caps: ${float(det.get('allowed_risk_usd')):.2f} ({float(det.get('allowed_risk_pct') or 0.0):.2f}%)")
             if risk_mult is not None and risk_eff is not None:
                 extra = f" | Regime: {risk_regime}" if risk_regime else ""
                 lines.append(f"Dynamic risk: x{float(risk_mult):.2f} -> ${float(risk_eff):.2f}" + extra)
+            if det.get('stop_distance') is not None:
+                lines.append(f"Stop distance used: {float(det.get('stop_distance')):.10g}")
+            if det.get('raw_qty') is not None:
+                lines.append(f"Raw qty: {float(det.get('raw_qty')):.8g}")
+            if det.get('rounded_qty') is not None:
+                lines.append(f"Rounded qty: {float(det.get('rounded_qty')):.8g}")
+            if det.get('risk_actual_usd') is not None:
+                lines.append(f"Actual pre-fill risk: ${float(det.get('risk_actual_usd')):.2f} ({float(det.get('risk_actual_pct') or 0.0):.2f}%)")
+            if det.get('filled_risk_usd') is not None:
+                lines.append(f"Actual post-fill risk: ${float(det.get('filled_risk_usd')):.2f} ({float(det.get('filled_risk_pct') or 0.0):.2f}%)")
+            if det.get('reject_reason'):
+                lines.append(f"Reject reason: {det.get('reject_reason')}")
         except Exception:
             pass
-
-        if qty_attempted:
-            lines.append(f"Order qty attempted: {qty_attempted}")
 
     msg = "\n".join([x for x in lines if x is not None and x != ""])
     await update.message.reply_text(msg)
