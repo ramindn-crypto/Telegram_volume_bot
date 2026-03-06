@@ -58,7 +58,7 @@ CHANGELOG (2026-03-06)
   - session gating (ASIA/LON/NY via UTC inference)
   - rejects breakdown (reason codes) + avg hold time + setups/day
   - report now displays reject breakdown for faster tuning
-- Added /optimize (admin-only) and /optimize_report:
+- Added autonomous optimization governance with retained internal reporting:
   - bounded deterministic grid search across TF matrix and top-volume universe (≥$10M 24h volume)
   - walk-forward (train/test split) and OOS-first objective with frequency targeting (3–5 setups/day)
   - persists chosen TF + params into StrategyConfig and saves an optimization report
@@ -7588,129 +7588,12 @@ async def cmd_optimize(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
 
-    args = context.args or []
-    days = 60
-    session_name = "NY"
-    try:
-        if len(args) >= 1:
-            days = _parse_days(str(args[0]))
-        if len(args) >= 2:
-            session_name = str(args[1]).upper()
-    except Exception:
-        days = 60
-        session_name = "NY"
-
-    base_cfg = load_strategy_config(force=True)
-    tf_matrix = [
-        ("5m", ["1h", "4h"]),
-        ("15m", ["1h", "4h"]),
-    ]
-    # Optional 30m matrix (runtime-dependent)
-    tf_matrix.append(("30m", ["4h"]))
-
-    await update.message.reply_text("🧪 /optimize started (admin). This is CPU-heavy and runs bounded search…")
-
-    def _do_optimize():
-        best_score = -1e18
-        best = None
-        best_report = {}
-        # Universe
-        universe = _build_universe_for_opt(base_cfg)
-        # Sample for runtime (still deterministic): top 60 by volume
-        universe = universe[:60]
-        cands = _generate_candidates(base_cfg)
-
-        for exec_tf, _ctx in tf_matrix:
-            # Fetch ohlcv once per symbol + tf
-            ohlcv_map = {}
-            for sym in universe:
-                try:
-                    tf_min = _tf_to_minutes(exec_tf)
-                    bars = int((days * 1440) / max(1, tf_min)) + 300
-                    bars = int(min(12000, max(800, bars)))
-                    ohlcv_map[sym] = fetch_ohlcv(sym, exec_tf, limit=bars)
-                except Exception:
-                    ohlcv_map[sym] = []
-
-            for cand in cands:
-                cfg = dict(base_cfg)
-                cfg.update(cand)
-                # Apply candidate into globals (so generator/scoring uses it)
-                apply_strategy_config(cfg)
-
-                # Walk-forward evaluate OOS on last 30% of candles per symbol
-                oos_results = []
-                for sym in universe:
-                    ohl = ohlcv_map.get(sym) or []
-                    train, test = _walk_forward_split(ohl, 0.7)
-                    # Use test only for objective (OOS primary)
-                    rep = _run_backtest_on_ohlcv(sym, test, days=max(7, int(days*0.3)), tf=exec_tf, session_name=session_name)
-                    oos_results.append(rep)
-
-                sc = _objective(oos_results, days=max(7, int(days*0.3)), cfg=cfg)
-                if sc > best_score:
-                    best_score = sc
-                    best = {"exec_tf_default": exec_tf, **cand}
-                    # Summaries
-                    total_setups = sum(int(r.get("setups",0) or 0) for r in oos_results if r.get("ok"))
-                    setups_day = total_setups / max(1.0, float(max(7, int(days*0.3))))
-                    avg_r = sum(float(r.get("avg_R",0.0) or 0.0) for r in oos_results if r.get("ok")) / max(1, sum(1 for r in oos_results if r.get("ok")))
-                    pf = sum((10.0 if r.get("profit_factor")==float("inf") else float(r.get("profit_factor") or 0.0)) for r in oos_results if r.get("ok")) / max(1, sum(1 for r in oos_results if r.get("ok")))
-                    dd = sum(float(r.get("max_drawdown_R",0.0) or 0.0) for r in oos_results if r.get("ok")) / max(1, sum(1 for r in oos_results if r.get("ok")))
-
-                    best_report = {
-                        "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                        "session": session_name,
-                        "days_requested": int(days),
-                        "universe_used": len(universe),
-                        "best_objective": float(best_score),
-                        "chosen_exec_tf": exec_tf,
-                        "params": dict(best),
-                        "oos_summary": {
-                            "setups": int(total_setups),
-                            "setups_per_day": float(setups_day),
-                            "avg_R": float(avg_r),
-                            "profit_factor": float(pf),
-                            "max_drawdown_R": float(dd),
-                        },
-                        "notes": "Objective uses OOS split (last 30% candles), penalizes off-target frequency & overconcentration.",
-                    }
-
-        # Restore and persist best config
-        if best:
-            final_cfg = dict(base_cfg)
-            final_cfg.update(best)
-            save_strategy_config(final_cfg)
-            apply_strategy_config(final_cfg)
-            save_opt_report(best_report)
-
-        return best_report
-
-    report = await to_thread_heavy(_do_optimize)
-    if not report:
-        await update.message.reply_text("❌ Optimize failed (no report).")
-        return
-
-    # Human report
-    p = report.get("params") or {}
-    oos = report.get("oos_summary") or {}
-    lines = [
-        "✅ Optimize complete",
-        HDR,
-        f"Chosen exec TF: {report.get('chosen_exec_tf')}",
-        f"Session: {report.get('session')} | Universe: {report.get('universe_used')} symbols",
-        SEP,
-        f"OOS setups/day: {float(oos.get('setups_per_day',0.0)):.2f} (target {base_cfg.get('target_setups_per_day_lo',3)}–{base_cfg.get('target_setups_per_day_hi',5)})",
-        f"OOS Avg R: {float(oos.get('avg_R',0.0)):.3f} | PF: {float(oos.get('profit_factor',0.0)):.2f} | MaxDD(R): {float(oos.get('max_drawdown_R',0.0)):.2f}",
-        SEP,
-        "Chosen params (key subset):",
-        f"quality_score_min_screen={p.get('quality_score_min_screen')} | min_rr_tp3={p.get('min_rr_tp3')}",
-        f"tf_align_1h_min_abs={p.get('tf_align_1h_min_abs')} | tf_align_4h_min_abs={p.get('tf_align_4h_min_abs')}",
-        f"regime_slope_trend_min_pct={p.get('regime_slope_trend_min_pct')} | atr_min_pct={p.get('atr_min_pct')}",
-        SEP,
-        "Saved to StrategyConfig. Use /optimize_report and /params_show.",
-    ]
-    await send_long_message(update, "\n".join(lines), parse_mode=None)
+    await update.message.reply_text(
+        "🤖 Manual /optimize is disabled.\n\n"
+        "The bot optimizes itself automatically in the background and only promotes validated parameter sets.\n"
+        "Use /optimize_report if you need the latest internal report."
+    )
+    return
 
 async def cmd_optimize_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -7747,6 +7630,17 @@ _SELF_OPT_STATE = {
     "run_id": None,            # str
     "started_ts": 0.0,
 }
+
+
+# Zero-touch autonomous optimization governance
+AUTONOMOUS_OPT_ENABLED = str(os.environ.get("AUTONOMOUS_OPT_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+AUTONOMOUS_OPT_INTERVAL_HOURS = float(os.environ.get("AUTONOMOUS_OPT_INTERVAL_HOURS", "6") or 6)
+AUTONOMOUS_OPT_MIN_INTERVAL_HOURS = float(os.environ.get("AUTONOMOUS_OPT_MIN_INTERVAL_HOURS", "6") or 6)
+AUTONOMOUS_OPT_DAYS = int(os.environ.get("AUTONOMOUS_OPT_DAYS", "60") or 60)
+AUTONOMOUS_OPT_SESSION_MODE = str(os.environ.get("AUTONOMOUS_OPT_SESSION_MODE", SELF_OPT_DEFAULT_SESSION_MODE) or SELF_OPT_DEFAULT_SESSION_MODE).strip().upper()
+AUTONOMOUS_OPT_LOOKBACK_HOURS = float(os.environ.get("AUTONOMOUS_OPT_LOOKBACK_HOURS", "72") or 72)
+AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS = int(os.environ.get("AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS", "18") or 18)
+AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW = float(os.environ.get("AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW", "70") or 70)
 
 def _opt_migrate_tables():
     """Create/extend self-optimization tables (backward compatible)."""
@@ -8405,99 +8299,173 @@ def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Ev
 
     return {"ok": True, "run_id": run_id, "promoted": promoted, "chosen_exec_tf": best_tf, "best_score": float(best_score), "best_params": dict(best_params), "metrics": dict(best_metrics), "reject_stats": dict(best_rejects or {}), "universe_snap_id": universe_snap_id, "universe_size": universe_size, "session_mode": str(session_mode), "days_requested": int(days)}
 
+async def _notify_admins_autonomous_opt(bot, text_msg: str):
+    """Best-effort admin notification for background autonomous optimization events."""
+    try:
+        for admin_id in _admin_ids_all():
+            try:
+                await bot.send_message(chat_id=int(admin_id), text=str(text_msg))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _autonomous_opt_recent_enough(hours: float) -> bool:
+    """True when the last optimization run finished recently enough."""
+    try:
+        last = _db_get_last_opt_run()
+        if not last:
+            return False
+        finished_ts = float(last.get("finished_ts") or 0.0)
+        started_ts = float(last.get("started_ts") or 0.0)
+        ref_ts = finished_ts if finished_ts > 0 else started_ts
+        if ref_ts <= 0:
+            return False
+        return (time.time() - ref_ts) < (float(hours) * 3600.0)
+    except Exception:
+        return False
+
+
+def _autonomous_opt_performance_snapshot(window_hours: float = 72.0) -> dict:
+    """Read recent signal outcomes to decide whether optimization is warranted."""
+    out = {
+        "emailed": 0,
+        "closed": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0.0,
+    }
+    try:
+        ts_from = float(time.time()) - float(window_hours) * 3600.0
+        con = db_connect()
+        cur = con.cursor()
+        out["emailed"] = int(cur.execute(
+            "SELECT COUNT(1) AS n FROM emailed_setups WHERE emailed_ts>=?",
+            (float(ts_from),),
+        ).fetchone()[0] or 0)
+        rows = cur.execute(
+            """SELECT o.outcome
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id=e.setup_id
+                   WHERE e.emailed_ts>=?""",
+            (float(ts_from),),
+        ).fetchall() or []
+        con.close()
+        closed = 0
+        wins = 0
+        losses = 0
+        for r in rows:
+            outcome = str((r[0] if not isinstance(r, dict) else r.get("outcome")) or "").upper().strip()
+            if outcome in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+                closed += 1
+                if outcome.startswith("WIN_"):
+                    wins += 1
+                elif outcome == "LOSS":
+                    losses += 1
+        out["closed"] = int(closed)
+        out["wins"] = int(wins)
+        out["losses"] = int(losses)
+        out["win_rate"] = float((wins / closed) * 100.0) if closed > 0 else 0.0
+        return out
+    except Exception:
+        return out
+
+
+def _autonomous_opt_should_run() -> tuple[bool, str]:
+    """Decision gate for the zero-touch optimizer."""
+    try:
+        if not bool(AUTONOMOUS_OPT_ENABLED):
+            return (False, "disabled")
+        cur_task = _SELF_OPT_STATE.get("task")
+        if cur_task and not cur_task.done():
+            return (False, "already_running")
+        if _autonomous_opt_recent_enough(float(AUTONOMOUS_OPT_MIN_INTERVAL_HOURS)):
+            snap = _autonomous_opt_performance_snapshot(window_hours=float(AUTONOMOUS_OPT_LOOKBACK_HOURS))
+            min_closed = int(AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS)
+            wr_floor = float(AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW)
+            if int(snap.get("closed", 0) or 0) >= min_closed and float(snap.get("win_rate", 0.0) or 0.0) >= wr_floor:
+                return (False, "recent_run_and_performance_ok")
+        return (True, "run")
+    except Exception:
+        return (False, "gate_error")
+
+
+async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
+    """Internal autonomous optimizer. No manual trigger required."""
+    should_run, reason = _autonomous_opt_should_run()
+    if not should_run:
+        return
+
+    bot = getattr(context, "bot", None)
+    stop_event = threading.Event()
+    _SELF_OPT_STATE["stop_event"] = stop_event
+    _SELF_OPT_STATE["started_ts"] = float(time.time())
+
+    try:
+        res = await to_thread_heavy(
+            _self_optimize_engine,
+            int(AUTONOMOUS_OPT_DAYS),
+            str(AUTONOMOUS_OPT_SESSION_MODE),
+            stop_event,
+            None,
+        )
+    except Exception as e:
+        try:
+            if bot:
+                await _notify_admins_autonomous_opt(bot, f"⚠️ Autonomous optimization failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return
+    finally:
+        _SELF_OPT_STATE["stop_event"] = None
+
+    if not isinstance(res, dict):
+        return
+
+    try:
+        _SELF_OPT_STATE["run_id"] = str(res.get("run_id") or "")
+        save_opt_report(res)
+    except Exception:
+        pass
+
+    try:
+        if bot and bool(res.get("ok")):
+            promoted = bool(res.get("promoted"))
+            summ = res.get("metrics") or {}
+            oos = summ.get("oos") or {}
+            msg = (
+                "🤖 Autonomous optimization completed\n"
+                f"Run: {res.get('run_id','')}\n"
+                f"Promoted: {'YES' if promoted else 'NO'}\n"
+                f"Exec TF: {res.get('chosen_exec_tf','')}\n"
+                f"OOS setups/day: {float(oos.get('setups_per_day',0.0)):.2f}\n"
+                f"OOS win rate: {float(oos.get('win_rate',0.0)):.1f}%\n"
+                f"OOS avg R: {float(oos.get('avg_R',0.0)):.3f}"
+            )
+            await _notify_admins_autonomous_opt(bot, msg)
+    except Exception:
+        pass
+
+
 async def cmd_self_optimize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
         return
-
-    args = context.args or []
-    days = 60
-    session_mode = SELF_OPT_DEFAULT_SESSION_MODE
-    try:
-        if len(args) >= 1:
-            days = _parse_days(str(args[0]))
-        if len(args) >= 2:
-            session_mode = str(args[1]).strip().upper()
-    except Exception:
-        days = 60
-        session_mode = SELF_OPT_DEFAULT_SESSION_MODE
-
-    try:
-        cur_task = _SELF_OPT_STATE.get("task")
-        if cur_task and not cur_task.done():
-            await update.message.reply_text("⚠️ Self-optimization is already running. Use /self_optimize_stop.")
-            return
-    except Exception:
-        pass
-
-    await update.message.reply_text("🧠 /self_optimize started (admin)\nPipeline: universe → walk-forward OOS → stability gates → optional promotion.\n\nCancel anytime: /self_optimize_stop")
-
-    stop_event = threading.Event()
-    loop = asyncio.get_running_loop()
-
-    async def _progress_sender(msg: str):
-        try:
-            await update.message.reply_text(str(msg))
-        except Exception:
-            pass
-
-    def _progress_cb_thread(msg: str, payload: dict):
-        try:
-            loop.call_soon_threadsafe(lambda: asyncio.create_task(_progress_sender(msg)))
-        except Exception:
-            pass
-
-    async def _runner():
-        _SELF_OPT_STATE["stop_event"] = stop_event
-        _SELF_OPT_STATE["started_ts"] = float(time.time())
-        try:
-            res = await to_thread_heavy(_self_optimize_engine, int(days), str(session_mode), stop_event, _progress_cb_thread)
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            try:
-                await update.message.reply_text(f"❌ Self-optimize failed: {type(e).__name__}: {e}")
-            except Exception:
-                pass
-            return
-
-        if not res or not res.get("ok"):
-            st = res.get("status") if isinstance(res, dict) else "FAILED"
-            await update.message.reply_text(f"❌ Self-optimize ended: {st}")
-            return
-
-        _SELF_OPT_STATE["run_id"] = str(res.get("run_id") or "")
-
-        try:
-            save_opt_report(res)  # back-compat store
-        except Exception:
-            pass
-
-        await send_long_message(update, _self_opt_format_report(res), parse_mode=None)
-
-    task = asyncio.create_task(_runner())
-    _SELF_OPT_STATE["task"] = task
+    await update.message.reply_text(
+        "🤖 Autonomous optimization is enabled internally.\n\n"
+        "Manual optimization triggers are disabled by design.\n"
+        "Use /optimize_report only if you need the latest internal decision snapshot."
+    )
 
 async def cmd_self_optimize_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
         return
-
-    try:
-        ev = _SELF_OPT_STATE.get("stop_event")
-        if ev:
-            ev.set()
-    except Exception:
-        pass
-
-    try:
-        task = _SELF_OPT_STATE.get("task")
-        if task and not task.done():
-            task.cancel()
-    except Exception:
-        pass
-
-    await update.message.reply_text("🛑 Stop requested. Optimizer will cancel safely at the next checkpoint.")
+    await update.message.reply_text(
+        "🤖 Manual stop is disabled.\n\n"
+        "The optimizer is autonomous and production-governed. It only promotes validated improvements automatically."
+    )
 
 async def cmd_self_optimize_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -8506,18 +8474,19 @@ async def cmd_self_optimize_report(update: Update, context: ContextTypes.DEFAULT
 
     last = _db_get_last_opt_run()
     if not last:
-        await update.message.reply_text("No self-optimization runs yet. Use /self_optimize.")
+        await update.message.reply_text("No autonomous optimization runs recorded yet.")
         return
 
     res = _db_get_opt_result(str(last.get("run_id") or ""))
     if not res:
-        await update.message.reply_text("No results saved for last run yet (still running or failed).")
+        await update.message.reply_text("No optimization result saved for the latest run yet.")
         return
 
     await send_long_message(update, _self_opt_format_report(res), parse_mode=None)
 
 
 def is_top_setup_eligible(
+
     s: "Setup",
     source: str = "screen",
     session_name: str = "LON",
@@ -10898,17 +10867,14 @@ Notes:
 
 
 
-🧠 SELF-OPTIMIZATION (Admin)
-───────────────
-/self_optimize [DAYS] [SESSION_MODE]
-• Run full end-to-end self-optimization (universe → walk-forward OOS → stability gates → optional promotion)
-• Defaults: DAYS=60, SESSION_MODE=24H_WEIGHTED
+🤖 AUTONOMOUS OPTIMIZATION (Internal)
+────────────
+• Optimization runs automatically in the background.
+• Manual optimization triggers are disabled.
+• New parameters are promoted only after walk-forward and OOS validation pass.
 
-/self_optimize_report
-• Show last self-optimization report (decision-grade)
-
-/self_optimize_stop
-• Cancel a running self-optimization job safely
+/optimize_report
+• Admin diagnostic snapshot of the latest autonomous optimization decision.
 
 📌 STRATEGY PARAMS (Admin)
 ────────────
@@ -10921,17 +10887,6 @@ Notes:
 
 /params_reset
 • Reset StrategyConfig to defaults (admin-only).
-
-🧪 OPTIMIZATION (Admin)
-────────────
-/optimize [DAYS] [SESSION]
-• Runs bounded walk-forward backtest search across:
-  - Universe: Bybit USDT perps filtered by 24h quote volume ≥ $10M
-  - TF matrix: 5m+1H/4H, 15m+1H/4H, optional 30m+4H
-• Saves best params + chosen TF into StrategyConfig.
-
-/optimize_report
-• Show last optimization decision + OOS metrics.
 
 """\
 
@@ -18079,11 +18034,7 @@ def main():
     app.add_handler(CommandHandler("params_show", cmd_params_show, block=False))
     app.add_handler(CommandHandler("params_set", cmd_params_set, block=False))
     app.add_handler(CommandHandler("params_reset", cmd_params_reset, block=False))
-    app.add_handler(CommandHandler("optimize", cmd_optimize, block=False))
     app.add_handler(CommandHandler("optimize_report", cmd_optimize_report, block=False))
-    app.add_handler(CommandHandler("self_optimize", cmd_self_optimize, block=False))
-    app.add_handler(CommandHandler("self_optimize_report", cmd_self_optimize_report, block=False))
-    app.add_handler(CommandHandler("self_optimize_stop", cmd_self_optimize_stop, block=False))
 
 # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
@@ -18115,6 +18066,20 @@ def main():
                 "misfire_grace_time": 30,
             },
         )
+
+        # Autonomous optimizer loop (zero-touch governance)
+        if AUTONOMOUS_OPT_ENABLED:
+            app.job_queue.run_repeating(
+                autonomous_optimize_job,
+                interval=max(3600, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 3600)),
+                first=180,
+                name="autonomous_optimize_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 300,
+                },
+            )
     else:
         logger.error("JobQueue NOT available – install python-telegram-bot[job-queue]")
 
