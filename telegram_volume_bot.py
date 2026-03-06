@@ -51,7 +51,6 @@ PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + 
 
 CHANGELOG (2026-03-06)
 - Added StrategyConfig (parameterized strategy module) persisted to SQLite (strategy_config table):
-  - /params_show, /params_set (admin), /params_reset (admin)
   - apply_strategy_config() updates all tunable globals from one config source
 - Upgraded setup quality scoring to use StrategyConfig-driven weights (no hard-coded weights).
 - Upgraded /backtest engine:
@@ -10850,43 +10849,14 @@ Advanced setup quality is now enforced inside the live engine:
 
 /health_sys
 • System health (DB, exchange, email)
+
 ────────────────────
-📈 BACKTESTING (Admin)
-─────────────
-/backtest <SYMBOL> <DAYS>d <TF> [SESSION]
-Examples:
-• /backtest BTCUSDT 30d 1h
-• /backtest ETHUSDT 7d 15m
-Optional SESSION: NY | LON | ASIA (default NY)
-
-Notes:
-- Uses the same institutional scoring model as live selection.
-- WIN definition: TP1 hit before SL within horizon.
-- Simulation uses first-touch (conservative if TP and SL hit same candle).
-
-
-
-
-🤖 AUTONOMOUS OPTIMIZATION (Internal)
-────────────
-• Optimization runs automatically in the background.
-• Manual optimization triggers are disabled.
-• New parameters are promoted only after walk-forward and OOS validation pass.
-
-/optimize_report
-• Admin diagnostic snapshot of the latest autonomous optimization decision.
-
-📌 STRATEGY PARAMS (Admin)
-────────────
-/params_show
-• Show active StrategyConfig (single source of truth).
-
-/params_set <key> <value>
-• Update one parameter (admin-only).
-  Example: /params_set quality_score_min_screen 58
-
-/params_reset
-• Reset StrategyConfig to defaults (admin-only).
+🤖 AUTONOMOUS ENGINE (Zero-Touch)
+────────────────────
+• Backtesting, optimization, validation, promotion, and rejection run automatically in the background.
+• Manual optimization/backtest/parameter override commands are intentionally disabled.
+• New parameters go live only after internal walk-forward and OOS validation pass.
+• Bad candidate parameter sets are rejected or reverted automatically.
 
 """\
 
@@ -17937,7 +17907,6 @@ def main():
     app.add_handler(CommandHandler("guide_full", guide_full_cmd, block=False))
     app.add_handler(CommandHandler("start", cmd_start, block=False))
     app.add_handler(CommandHandler("help_admin", cmd_help_admin, block=False))
-    app.add_handler(CommandHandler("backtest", cmd_backtest, block=False))
     app.add_handler(CommandHandler("manage", manage_cmd, block=False))
     app.add_handler(CommandHandler("myplan", myplan_cmd, block=False))
     app.add_handler(CommandHandler("support", support_cmd, block=False))
@@ -18031,10 +18000,6 @@ def main():
     app.add_handler(CommandHandler("ai_strategy_report", ai_strategy_report_cmd, block=False))
     
     # Strategy parameterization + optimization (admin)
-    app.add_handler(CommandHandler("params_show", cmd_params_show, block=False))
-    app.add_handler(CommandHandler("params_set", cmd_params_set, block=False))
-    app.add_handler(CommandHandler("params_reset", cmd_params_reset, block=False))
-    app.add_handler(CommandHandler("optimize_report", cmd_optimize_report, block=False))
 
 # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
