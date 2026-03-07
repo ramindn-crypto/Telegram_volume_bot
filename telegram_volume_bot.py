@@ -2555,13 +2555,20 @@ def _autotrade_allowed_session(session_label: str) -> bool:
 # AUTOTRADE: select best OPEN setup from DB (generated_setups + signals)
 # =========================================================
 def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1) -> list:
-    """Return a list of Setup-like objects with entry/sl/tps for _autotrade_place_trade.
+    """Return recent OPEN setup candidates for autotrade.
 
-    Uses generated_setups for recency, joins signal_outcomes for OPEN, and pulls prices from signals.
-    IMPORTANT: Do NOT filter by session label here (it can drift). Pick best OPEN recent setup.
+    Sync model:
+    - PRIMARY source of truth = emailed_setups (what the user actually received)
+    - FALLBACK source = generated_setups(source='email') for backward compatibility
 
-    Adds:
-      - created_ts: the generated_setups.created_ts (epoch seconds) so autotrade can enforce entry deadlines.
+    Ordering is newest-first, not confidence-first. That keeps autotrade aligned with the
+    most recently emailed candidate instead of repeatedly re-checking an older higher-conf row.
+
+    Each returned object carries:
+      - created_ts: canonical timestamp used for entry deadline enforcement
+      - email_logged_ts / generated_logged_ts: debug timestamps for /autotrade_last
+      - source_kind: 'emailed_setups' or 'generated_setups'
+      - source_session: session recorded when the row was logged
     """
     try:
         from types import SimpleNamespace
@@ -2570,61 +2577,106 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         con = sqlite3.connect(DB_PATH)
         cur = con.cursor()
 
-        # Pull recency + created_ts from generated_setups (canonical "setup generated time")
-        cur.execute("""
-            SELECT g.setup_id, g.created_ts
+        def _load_signals(rows, source_kind: str):
+            out = []
+            for sid, chosen_ts, aux_ts, src_session in (rows or []):
+                if not sid:
+                    continue
+                cur.execute(
+                    """
+                    SELECT s.setup_id, s.symbol, s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3, s.created_ts
+                    FROM signals s
+                    WHERE s.setup_id = ?
+                    LIMIT 1
+                    """,
+                    (sid,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    continue
+                setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3, signal_created_ts = row
+                try:
+                    signal_created_ts = float(signal_created_ts or 0.0)
+                except Exception:
+                    signal_created_ts = 0.0
+                try:
+                    chosen_ts_f = float(chosen_ts or 0.0)
+                except Exception:
+                    chosen_ts_f = 0.0
+                try:
+                    aux_ts_f = float(aux_ts or 0.0)
+                except Exception:
+                    aux_ts_f = 0.0
+                canonical_ts = max(chosen_ts_f, signal_created_ts, aux_ts_f)
+                out.append(SimpleNamespace(
+                    setup_id=setup_id,
+                    id=setup_id,
+                    symbol=symbol,
+                    side=side,
+                    conf=int(conf or 0),
+                    entry=float(entry or 0.0),
+                    sl=float(sl or 0.0),
+                    tp1=tp1,
+                    tp2=tp2,
+                    tp3=tp3,
+                    created_ts=float(canonical_ts or 0.0),
+                    signal_created_ts=float(signal_created_ts or 0.0),
+                    email_logged_ts=float(chosen_ts_f or 0.0) if source_kind == 'emailed_setups' else 0.0,
+                    generated_logged_ts=float(aux_ts_f or 0.0) if source_kind == 'emailed_setups' else float(chosen_ts_f or 0.0),
+                    source_kind=str(source_kind),
+                    source_session=str(src_session or ''),
+                ))
+            return out
+
+        # 1) Primary: exact emailed rows, newest first.
+        cur.execute(
+            """
+            SELECT e.setup_id,
+                   MAX(e.emailed_ts) AS emailed_ts,
+                   MAX(g.created_ts) AS generated_ts,
+                   MAX(COALESCE(e.session, g.session, '')) AS src_session
+            FROM emailed_setups e
+            LEFT JOIN signal_outcomes o ON o.setup_id = e.setup_id
+            LEFT JOIN generated_setups g
+                   ON g.user_id = e.user_id
+                  AND g.setup_id = e.setup_id
+                  AND g.source = 'email'
+            WHERE e.user_id = ?
+              AND e.emailed_ts >= ?
+              AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+            GROUP BY e.setup_id
+            ORDER BY emailed_ts DESC, generated_ts DESC, e.setup_id DESC
+            LIMIT ?
+            """,
+            (int(uid), float(cutoff), int(limit)),
+        )
+        rows = cur.fetchall() or []
+        out = _load_signals(rows, 'emailed_setups')
+        if out:
+            con.close()
+            return out
+
+        # 2) Fallback: legacy generated email rows, newest first.
+        cur.execute(
+            """
+            SELECT g.setup_id,
+                   MAX(g.created_ts) AS generated_ts,
+                   0.0 AS aux_ts,
+                   MAX(COALESCE(g.session, '')) AS src_session
             FROM generated_setups g
             LEFT JOIN signal_outcomes o ON o.setup_id = g.setup_id
             WHERE g.user_id = ?
               AND g.created_ts >= ?
-              AND g.source='email'
+              AND g.source = 'email'
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-            ORDER BY g.conf DESC, g.created_ts DESC
+            GROUP BY g.setup_id
+            ORDER BY generated_ts DESC, MAX(g.conf) DESC, g.setup_id DESC
             LIMIT ?
-        """, (int(uid), float(cutoff), int(limit)))
-
+            """,
+            (int(uid), float(cutoff), int(limit)),
+        )
         rows = cur.fetchall() or []
-        if not rows:
-            con.close()
-            return []
-
-        # Keep the newest created_ts per setup_id just in case
-        sid_to_created = {}
-        for r in rows:
-            try:
-                sid = r[0]
-                cts = float(r[1] or 0.0)
-                if sid:
-                    sid_to_created[str(sid)] = max(float(sid_to_created.get(str(sid), 0.0) or 0.0), cts)
-            except Exception:
-                pass
-
-        out = []
-        for sid in list(sid_to_created.keys()):
-            cur.execute("""
-                SELECT setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3
-                FROM signals
-                WHERE setup_id = ?
-                LIMIT 1
-            """, (sid,))
-            row = cur.fetchone()
-            if not row:
-                continue
-            setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3 = row
-            out.append(SimpleNamespace(
-                setup_id=setup_id,
-                id=setup_id,
-                symbol=symbol,
-                side=side,
-                conf=int(conf or 0),
-                entry=float(entry or 0.0),
-                sl=float(sl or 0.0),
-                tp1=tp1,
-                tp2=tp2,
-                tp3=tp3,
-                created_ts=float(sid_to_created.get(str(setup_id), 0.0) or 0.0),
-            ))
-
+        out = _load_signals(rows, 'generated_setups')
         con.close()
         return out
     except Exception as e:
@@ -2633,6 +2685,8 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         except Exception:
             pass
         return []
+
+
 def _autotrade_clear_debug_state(uid: int | None = None) -> None:
     """Clear in-memory autotrade debug state. If uid is None, clears all."""
     global _LAST_AUTOTRADE_DECISION, _LAST_AUTOTRADE_DETAIL
@@ -2718,12 +2772,21 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         pass
 
     try:
+        _signal_ts = float(getattr(s, 'signal_created_ts', 0.0) or 0.0)
+        _email_ts = float(getattr(s, 'email_logged_ts', 0.0) or 0.0)
+        _generated_ts = float(getattr(s, 'generated_logged_ts', 0.0) or 0.0)
         _cts = float(getattr(s, 'created_ts', 0.0) or 0.0)
-        _setup_dt = datetime.fromtimestamp(_cts, tz=timezone.utc) if _cts > 0 else datetime.now(timezone.utc)
+        _canonical_ts = max(_cts, _email_ts, _generated_ts, _signal_ts)
+        _setup_dt = datetime.fromtimestamp(_canonical_ts, tz=timezone.utc) if _canonical_ts > 0 else datetime.now(timezone.utc)
         _deadline_dt = _setup_dt + timedelta(minutes=10)
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
             'setup_time': _setup_dt.isoformat(timespec='seconds'),
             'entry_deadline': _deadline_dt.isoformat(timespec='seconds'),
+            'signal_created_time': datetime.fromtimestamp(_signal_ts, tz=timezone.utc).isoformat(timespec='seconds') if _signal_ts > 0 else '',
+            'email_logged_time': datetime.fromtimestamp(_email_ts, tz=timezone.utc).isoformat(timespec='seconds') if _email_ts > 0 else '',
+            'generated_logged_time': datetime.fromtimestamp(_generated_ts, tz=timezone.utc).isoformat(timespec='seconds') if _generated_ts > 0 else '',
+            'source_kind': str(getattr(s, 'source_kind', '') or ''),
+            'source_session': str(getattr(s, 'source_session', '') or ''),
         })
         if datetime.now(timezone.utc) > _deadline_dt:
             return (False, 'setup_expired')
@@ -16183,6 +16246,18 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append(f"*Entry used for sizing:* `{det.get('entry','')}`  *SL used:* `{det.get('sl','')}`")
         if det.get('setup_entry') is not None:
             lines.append(f"*Setup entry:* `{det.get('setup_entry')}`  *Raw setup SL:* `{det.get('setup_sl_raw')}`")
+        if det.get('setup_id'):
+            lines.append(f"*Setup ID:* `{det.get('setup_id')}`")
+        if det.get('source_kind') or det.get('source_session'):
+            lines.append(f"*Source:* `{det.get('source_kind','')}`  *Logged session:* `{det.get('source_session','')}`")
+        if det.get('signal_created_time'):
+            lines.append(f"*Signal created (UTC):* `{det.get('signal_created_time')}`")
+        if det.get('email_logged_time'):
+            lines.append(f"*Email logged (UTC):* `{det.get('email_logged_time')}`")
+        elif det.get('generated_logged_time'):
+            lines.append(f"*Generated logged (UTC):* `{det.get('generated_logged_time')}`")
+        if det.get('entry_deadline'):
+            lines.append(f"*Entry deadline (UTC):* `{det.get('entry_deadline')}`")
         risk_base = det.get("risk_base_usd")
         risk_eff = det.get("risk_effective_usd")
         risk_mult = det.get("risk_multiplier")
@@ -20021,6 +20096,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     'blocked_by_cooldown',
                     'blocked_by_recent_symbol_trade',
                     'blocked_by_existing_local_trade_state',
+                    'setup_expired',
                 }:
                     break
 
