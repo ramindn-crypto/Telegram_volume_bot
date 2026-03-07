@@ -2765,6 +2765,10 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'symbol_raw': str(getattr(s, 'symbol', '') or ''),
             'symbol_sent': sym,
             'side': side,
+            'entry': float(intended_entry or 0.0),
+            'sl': float(intended_sl or 0.0),
+            'entry_source': 'setup',
+            'sl_source': 'setup',
             'setup_entry': intended_entry,
             'setup_sl_raw': intended_sl,
         }
@@ -2874,6 +2878,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
             'entry': float(price_ref),
             'sl': float(sl_for_order),
+            'entry_source': 'live_ref' if str(AUTOTRADE_MODE).lower() == 'live' else 'setup',
+            'sl_source': 'tick_rounded',
             'setup_entry_vs_live_delta_pct': (((float(price_ref) - float(intended_entry)) / float(intended_entry)) * 100.0) if float(intended_entry) > 0 else 0.0,
             'contractSize': float(contract_size),
             'tick_size': filt.get('tickSize'),
@@ -3651,6 +3657,108 @@ _EMAIL_LOOP_HEARTBEAT: Dict[str, Any] = {
     "next_tick_ts": 0.0,
     "last_error": "",
 }
+
+_ENGINE_HEARTBEAT: Dict[str, Dict[str, Any]] = {
+    "screen": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+    "autotrade": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+    "email": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+    "optimizer": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+    "learning_hourly": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+    "learning_daily": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+    "db": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+}
+
+def _hb_touch(name: str, ok: bool = True, details: str = "", error: str = "") -> None:
+    try:
+        hb = _ENGINE_HEARTBEAT.setdefault(str(name), {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""})
+        now_ts = float(time.time())
+        hb["alive"] = True
+        hb["last_ts"] = now_ts
+        if ok:
+            hb["last_ok_ts"] = now_ts
+            if error == "":
+                hb["last_error"] = ""
+        if details:
+            hb["details"] = str(details)[:240]
+        if error:
+            hb["last_error"] = str(error)[:240]
+    except Exception:
+        pass
+
+def _hb_status_line(name: str, stale_after_sec: int, label: str | None = None) -> tuple[str, str]:
+    hb = _ENGINE_HEARTBEAT.get(str(name)) or {}
+    now_ts = float(time.time())
+    last_ok = float(hb.get("last_ok_ts") or 0.0)
+    last_ts = float(hb.get("last_ts") or 0.0)
+    err = str(hb.get("last_error") or "")
+    shown_ts = last_ok or last_ts
+    if shown_ts <= 0:
+        status = "INACTIVE"
+    elif (now_ts - shown_ts) > float(stale_after_sec):
+        status = "STALE"
+    elif err:
+        status = "ERROR"
+    else:
+        status = "ACTIVE"
+    when = _fmt_dt_local(datetime.fromtimestamp(shown_ts, tz=timezone.utc)) if shown_ts > 0 else "—"
+    detail = str(hb.get("details") or "")
+    prefix = str(label or name).strip()
+    line = f"{prefix}: {status} | Last ok: {when}"
+    if detail:
+        line += f" | {detail}"
+    if err and status in {"STALE", "ERROR"}:
+        line += f" | Error: {err}"
+    return status, line
+
+def _admin_assurance_verdict() -> tuple[str, list[str]]:
+    blockers = []
+    for name, ttl in (("autotrade", 180), ("email", max(180, int(CHECK_INTERVAL_MIN * 120))), ("learning_hourly", max(1800, int(EVOLUTION_HOURLY_INTERVAL_MIN * 180))), ("optimizer", max(7200, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 7200)))):
+        st, _ = _hb_status_line(name, ttl)
+        if name == "optimizer" and not AUTONOMOUS_OPT_ENABLED:
+            continue
+        if name in {"learning_hourly"} and not EVOLUTION_ENABLED:
+            continue
+        if st in {"ERROR", "STALE", "INACTIVE"}:
+            blockers.append(f"{name}={st}")
+    if blockers:
+        return ("CHECK REQUIRED", blockers)
+    return ("HEALTHY", [])
+
+def _fmt_iso_local_label(iso_s: str, fallback: str = "") -> str:
+    if not iso_s:
+        return fallback
+    try:
+        return _fmt_iso_to_local(str(iso_s))
+    except Exception:
+        return str(iso_s)
+
+def _fmt_float_or_blank(v, decimals: int = 10) -> str:
+    try:
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return ""
+        return f"{f:.{decimals}g}"
+    except Exception:
+        return ""
+
+def _latest_emailed_setup_summary(uid: int, lookback_hours: int = 24) -> dict:
+    try:
+        items = _autotrade_select_db_setups(int(uid), "", lookback_hours=max(1, int(lookback_hours)), limit=1)
+        if not items:
+            return {}
+        s = items[0]
+        return {
+            "setup_id": str(getattr(s, "setup_id", "") or getattr(s, "id", "") or ""),
+            "symbol": str(getattr(s, "symbol", "") or ""),
+            "side": str(getattr(s, "side", "") or ""),
+            "created_ts": float(getattr(s, "created_ts", 0.0) or 0.0),
+            "signal_created_ts": float(getattr(s, "signal_created_ts", 0.0) or 0.0),
+            "email_logged_ts": float(getattr(s, "email_logged_ts", 0.0) or 0.0),
+            "source_kind": str(getattr(s, "source_kind", "") or ""),
+            "source_session": str(getattr(s, "source_session", "") or ""),
+        }
+    except Exception:
+        return {}
 
 def user_diag_mode(user_id: int) -> str:
     """
@@ -9237,6 +9345,10 @@ def _evolution_build_snapshot() -> dict:
     prev14 = _evolution_period_wr(14, offset_days=14)
     curr14_ny = _evolution_period_wr(14, offset_days=0, session="NY")
     prev14_ny = _evolution_period_wr(14, offset_days=14, session="NY")
+    curr7 = _evolution_period_wr(7, offset_days=0)
+    prev7 = _evolution_period_wr(7, offset_days=7)
+    curr7_ny = _evolution_period_wr(7, offset_days=0, session="NY")
+    prev7_ny = _evolution_period_wr(7, offset_days=7, session="NY")
     tag_ctr = _evolution_tag_counter(days=30, losses_only=True)
     ny_tag_ctr = _evolution_tag_counter(days=30, session="NY", losses_only=True)
     recs = _evolution_list_open_recommendations(limit=5)
@@ -9262,10 +9374,16 @@ def _evolution_build_snapshot() -> dict:
         "trend": {
             "overall": _evolution_trend_label(curr14, prev14),
             "ny": _evolution_trend_label(curr14_ny, prev14_ny),
+            "overall_7d": _evolution_trend_label(curr7, prev7),
+            "ny_7d": _evolution_trend_label(curr7_ny, prev7_ny),
             "current14_wr": curr14,
             "previous14_wr": prev14,
             "current14_ny_wr": curr14_ny,
             "previous14_ny_wr": prev14_ny,
+            "current7_wr": curr7,
+            "previous7_wr": prev7,
+            "current7_ny_wr": curr7_ny,
+            "previous7_ny_wr": prev7_ny,
         },
         "top_failure_tags": tag_ctr.most_common(6),
         "top_failure_tags_ny": ny_tag_ctr.most_common(6),
@@ -9434,10 +9552,13 @@ async def evolution_hourly_job(context: ContextTypes.DEFAULT_TYPE):
     if not EVOLUTION_ENABLED:
         return
     try:
+        _hb_touch('learning_hourly', ok=True, details='cycle_start')
         res = await to_thread_heavy(_run_evolution_cycle, "hourly")
         if isinstance(res, dict) and res.get("ok"):
             _evolution_state_set("last_hourly_snapshot", res.get("snapshot") or {})
-    except Exception:
+            _hb_touch('learning_hourly', ok=True, details='cycle_ok')
+    except Exception as e:
+        _hb_touch('learning_hourly', ok=False, error=f"{type(e).__name__}: {e}", details='cycle_error')
         pass
 
 
@@ -9445,6 +9566,7 @@ async def evolution_daily_job(context: ContextTypes.DEFAULT_TYPE):
     if not EVOLUTION_ENABLED:
         return
     try:
+        _hb_touch('learning_daily', ok=True, details='cycle_start')
         res = await to_thread_heavy(_run_evolution_cycle, "daily")
         if isinstance(res, dict) and res.get("ok"):
             snap = res.get("snapshot") or {}
@@ -9460,7 +9582,9 @@ async def evolution_daily_job(context: ContextTypes.DEFAULT_TYPE):
                     await _notify_admins_autonomous_opt(context.bot, msg)
                 except Exception:
                     pass
-    except Exception:
+            _hb_touch('learning_daily', ok=True, details='cycle_ok')
+    except Exception as e:
+        _hb_touch('learning_daily', ok=False, error=f"{type(e).__name__}: {e}", details='cycle_error')
         pass
 
 
@@ -9489,54 +9613,46 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not snap:
         await update.message.reply_text("No evolution snapshot yet.")
         return
+
+    overall = snap.get("overall") or {}
+    ny = snap.get("ny") or {}
+    trend = snap.get("trend") or {}
     hourly = snap.get("last_hourly") or {}
     daily = snap.get("last_daily") or {}
     last_opt = _db_get_last_opt_run() or {}
-    recs = snap.get("open_recommendations") or []
-    auto_last = snap.get("auto_applied_last") or {}
-    auto_actions = auto_last.get("actions") or []
-    top_tags = snap.get("top_failure_tags") or []
-    ny_tags = snap.get("top_failure_tags_ny") or []
-    scan_intel = await to_thread_fast(_scan_intel_summary_cached) if SCAN_INTELLIGENCE_ENABLED else {}
-    scan_summary = (scan_intel or {}).get("summary") or {}
-    scan_counts = scan_summary.get("counts") or {}
-    scan_actions = (scan_intel or {}).get("actions") or []
+    verdict, blockers = _admin_assurance_verdict()
+
+    raw_status = str(snap.get('status') or 'stable').strip().lower()
+    live_sample = int(overall.get('live_sample', 0) or 0)
+    if raw_status == 'needs_intervention' and live_sample < 5:
+        intervention = 'WATCH'
+    elif raw_status == 'needs_intervention':
+        intervention = 'YES'
+    else:
+        intervention = 'NO'
+
     lines = [
         "🧠 Edge Status",
         HDR,
-        f"Continuous optimization: {'ACTIVE' if AUTONOMOUS_OPT_ENABLED else 'OFF'} | Learning: {'ACTIVE' if EVOLUTION_ENABLED else 'OFF'}",
+        f"Engine: {verdict}",
+        f"Learning: {'ACTIVE' if EVOLUTION_ENABLED else 'OFF'}",
+        f"Optimization: {'ACTIVE' if AUTONOMOUS_OPT_ENABLED else 'OFF'}",
+        f"Auto-trading: {'ACTIVE' if _autotrade_ready() else 'INACTIVE'}",
+        f"Email pipeline: {'ACTIVE' if EMAIL_ENABLED and email_config_ok() else 'INACTIVE'}",
+        f"Data freshness: {'OK' if _hb_status_line('email', max(180, int(CHECK_INTERVAL_MIN * 120)))[0] not in {'STALE','ERROR','INACTIVE'} else 'STALE'}",
+        SEP,
+        f"Overall win rate estimate: {float(overall.get('estimated_wr', 0.0) or 0.0):.1f}%",
+        f"New York win rate estimate: {float(ny.get('estimated_wr', 0.0) or 0.0):.1f}%",
+        f"Overall trend vs prior 7d: {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}",
+        f"New York trend vs prior 7d: {str(trend.get('ny_7d') or trend.get('ny') or 'n/a')}",
+        f"Overall WR now / 7d ago: {float(trend.get('current7_wr', 0.0) or 0.0):.1f}% / {float(trend.get('previous7_wr', 0.0) or 0.0):.1f}%",
+        f"NY WR now / 7d ago: {float(trend.get('current7_ny_wr', 0.0) or 0.0):.1f}% / {float(trend.get('previous7_ny_wr', 0.0) or 0.0):.1f}%",
+        SEP,
+        f"Intervention required: {intervention}" + (f" | {'; '.join(blockers[:3])}" if blockers else ""),
+        f"Last learning cycle: {_fmt_dt_local(datetime.fromtimestamp(float((hourly or {}).get('finished_ts') or 0.0), tz=timezone.utc)) if (hourly or {}).get('finished_ts') else '—'}",
+        f"Last daily review: {_fmt_dt_local(datetime.fromtimestamp(float((daily or {}).get('finished_ts') or 0.0), tz=timezone.utc)) if (daily or {}).get('finished_ts') else '—'}",
         f"Last optimization cycle: {_fmt_dt_local(datetime.fromtimestamp(float((last_opt or {}).get('started_ts') or 0.0), tz=timezone.utc)) if (last_opt or {}).get('started_ts') else '—'}",
-        f"Last hourly learning cycle: {_fmt_dt_local(datetime.fromtimestamp(float((hourly or {}).get('finished_ts') or 0.0), tz=timezone.utc)) if (hourly or {}).get('finished_ts') else '—'}",
-        f"Last daily review cycle: {_fmt_dt_local(datetime.fromtimestamp(float((daily or {}).get('finished_ts') or 0.0), tz=timezone.utc)) if (daily or {}).get('finished_ts') else '—'}",
-        f"Analyzed in latest cycles: hourly setups={int((hourly or {}).get('analyzed_setups',0) or 0)} trades={int((hourly or {}).get('analyzed_trades',0) or 0)} | daily setups={int((daily or {}).get('analyzed_setups',0) or 0)} trades={int((daily or {}).get('analyzed_trades',0) or 0)}",
-        _fmt_wr_block("Overall WR estimate", snap.get("overall") or {}),
-        _fmt_wr_block("New York WR estimate", snap.get("ny") or {}),
-        f"Performance trend: overall {((snap.get('trend') or {}).get('overall') or 'n/a')} | NY {((snap.get('trend') or {}).get('ny') or 'n/a')}",
-        f"Entry-quality issues present: {'YES' if snap.get('entry_issue_present') else 'NO'}",
-        f"Rule stability: {str(snap.get('status') or 'unknown').replace('_',' ').upper()}",
-        f"Open recommendations: {len(recs)} | Auto-adjustments in last cycle: {len(auto_actions)}",
-        f"Snapshot intelligence: {'ACTIVE' if SCAN_INTELLIGENCE_ENABLED else 'OFF'} | Recently evaluated: {int((scan_intel or {}).get('evaluated', 0) or 0)}",
-        f"Missed-good patterns: {int(scan_counts.get('missed_but_good', 0) or 0)} | Over-filter misses: {int(scan_counts.get('missed_due_to_over_filtering', 0) or 0)} | Watch-never-converted: {int(scan_counts.get('watch_state_never_converted', 0) or 0)}",
-        f"Snapshot auto-adjustments pending/applied: {len(scan_actions)}",
     ]
-    if top_tags:
-        lines.append(SEP)
-        lines.append("Top loss patterns:")
-        for tag, n in top_tags[:4]:
-            lines.append(f"• {tag}: {int(n)}")
-    if ny_tags:
-        lines.append("NY-specific patterns:")
-        for tag, n in ny_tags[:3]:
-            lines.append(f"• {tag}: {int(n)}")
-    if (scan_summary.get("top_missed_reasons") or []):
-        lines.append(SEP)
-        lines.append("Top missed-opportunity patterns:")
-        for reason, n in (scan_summary.get("top_missed_reasons") or [])[:3]:
-            lines.append(f"• {reason}: {int(n)}")
-    if recs:
-        lines.append(SEP)
-        lines.append("Latest recommendation:")
-        lines.append(f"• {str(recs[0].get('recommendation') or '')}")
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 
@@ -9546,11 +9662,12 @@ async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     snap = await to_thread_fast(_evolution_snapshot_cached)
     item = (snap or {}).get("overall") or {}
+    trend = (snap or {}).get("trend") or {}
     msg = (
         "📊 Bot Win Rate Estimate\n"
         f"{float(item.get('estimated_wr', 0.0) or 0.0):.1f}%\n"
-        f"Confidence: {str(item.get('confidence') or 'low')}\n"
-        f"Live sample: {int(item.get('live_sample', 0) or 0)} | Optimizer OOS sample: {int(item.get('optimizer_sample', 0) or 0)}"
+        f"Trend vs prior 7d: {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}\n"
+        f"Current 7d / previous 7d: {float(trend.get('current7_wr', 0.0) or 0.0):.1f}% / {float(trend.get('previous7_wr', 0.0) or 0.0):.1f}%"
     )
     await update.message.reply_text(msg)
 
@@ -9561,11 +9678,12 @@ async def ny_winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     snap = await to_thread_fast(_evolution_snapshot_cached)
     item = (snap or {}).get("ny") or {}
+    trend = (snap or {}).get("trend") or {}
     msg = (
         "🗽 New York Win Rate Estimate\n"
         f"{float(item.get('estimated_wr', 0.0) or 0.0):.1f}%\n"
-        f"Confidence: {str(item.get('confidence') or 'low')}\n"
-        f"Live sample: {int(item.get('live_sample', 0) or 0)} | Optimizer OOS sample: {int(item.get('optimizer_sample', 0) or 0)}"
+        f"Trend vs prior 7d: {str(trend.get('ny_7d') or trend.get('ny') or 'n/a')}\n"
+        f"Current 7d / previous 7d: {float(trend.get('current7_ny_wr', 0.0) or 0.0):.1f}% / {float(trend.get('previous7_ny_wr', 0.0) or 0.0):.1f}%"
     )
     await update.message.reply_text(msg)
 
@@ -13124,7 +13242,10 @@ Advanced setup quality is now enforced inside the live engine:
 • Last email decision (why email sent/skipped/error)
 
 /health_sys
-• System health (DB, exchange, email)
+• Engine health + pipeline heartbeat (DB, market data, email, autotrade, learning, optimization)
+
+/engine_health
+• Alias of /health_sys
 
 /edge_status
 • Main evolution dashboard: learning active, cycle times, performance trend, missed-opportunity patterns, snapshot intelligence
@@ -16559,7 +16680,7 @@ async def autotrade_debug_reset_cmd(update: Update, context: ContextTypes.DEFAUL
     uid = update.effective_user.id
 
     # admin-only
-    if int(uid) not in set(ADMIN_IDS):
+    if not is_admin_user(uid):
         await update.message.reply_text("⛔ Admin only.")
         return
 
@@ -17693,6 +17814,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     return body, kb
 
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _hb_touch('screen', ok=True, details='screen_cmd_invoked')
 
     uid = update.effective_user.id
     user = get_user(uid)
@@ -19162,6 +19284,10 @@ async def why_no_setups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # /health (transparent system health)
 # =========================================================
+async def engine_health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await health_sys_cmd(update, context)
+
+
 async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Transparent health check:
@@ -19298,6 +19424,7 @@ async def _post_init(app: Application):
             BotCommand("support_status", "Check your latest support ticket"),
 
             BotCommand("health", "Bot & data health check"),
+            BotCommand("engine_health", "Admin engine health"),
 
             BotCommand("billing", "Subscription & payment info"),
         ]
@@ -20035,6 +20162,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
     """Background AutoTrade loop. Scans and opens trades for the owner when enabled.
     Runs independently from email sending (no dependency on 'email setup sent')."""
     try:
+        _hb_touch('autotrade', ok=True, details='job_tick')
         if not _autotrade_ready():
             return
 
@@ -20071,6 +20199,14 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
 
             # Select multiple recent OPEN setups and let the hardened gatekeeper choose the first tradable one.
             db_setups = _autotrade_select_db_setups(uid, sess, lookback_hours=12, limit=5)
+            attempt_summaries = [{
+                'setup_id': str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or ''),
+                'symbol': str(getattr(x, 'symbol', '') or ''),
+                'side': str(getattr(x, 'side', '') or ''),
+                'created_ts': float(getattr(x, 'created_ts', 0.0) or 0.0),
+                'source_kind': str(getattr(x, 'source_kind', '') or ''),
+                'source_session': str(getattr(x, 'source_session', '') or ''),
+            } for x in (db_setups or [])]
             if not db_setups:
                 _LAST_AUTOTRADE_DECISION[uid] = {
                     "status": "SKIP",
@@ -20078,7 +20214,9 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     "reason": "no_setups",
                     "session": sess,
                     "mode": AUTOTRADE_MODE,
+                    "attempted_candidates": attempt_summaries,
                 }
+                _hb_touch('autotrade', ok=True, details=f'no_setups sess={sess}')
                 return
 
             ok = False
@@ -20107,7 +20245,10 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 "attempted": attempted,
                 "session": sess,
                 "mode": AUTOTRADE_MODE,
+                "attempted_candidates": attempt_summaries,
+                "latest_candidate": attempt_summaries[0] if attempt_summaries else {},
             }
+            _hb_touch('autotrade', ok=True, details=f"status={'PLACED' if ok else 'SKIP'} reason={'' if ok else reason}")
 
     except Exception as e:
         try:
@@ -20120,6 +20261,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "reason": f"{type(e).__name__}: {e}",
             }
+        _hb_touch('autotrade', ok=False, error=f"{type(e).__name__}: {e}", details='job_error')
         logger.exception("autotrade_job crashed: %s", e)
 
 
@@ -20149,6 +20291,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await _alert_job_async_internal(context)
+        _hb_touch('email', ok=True, details='alert_job_ok')
         try:
             _EMAIL_LOOP_HEARTBEAT["last_error"] = ""
         except Exception:
@@ -20158,6 +20301,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             _EMAIL_LOOP_HEARTBEAT["last_error"] = f"{type(e).__name__}: {e}"
         except Exception:
             pass
+        _hb_touch('email', ok=False, error=f"{type(e).__name__}: {e}", details='alert_job_error')
         logger.exception("Alert job failure: %s", e)
 
 
@@ -20266,6 +20410,7 @@ def main():
     app.add_handler(CommandHandler("reset", reset_cmd, block=False))
     app.add_handler(CommandHandler("restore", restore_cmd, block=False))
     app.add_handler(CommandHandler("health_sys", health_sys_cmd, block=False))
+    app.add_handler(CommandHandler("engine_health", engine_health_cmd, block=False))
     app.add_handler(CommandHandler("billing", billing_cmd, block=False))
     app.add_handler(CommandHandler("email_on_off", email_on_off_cmd, block=False))
     app.add_handler(CommandHandler("upgrade", upgrade_cmd, block=False))
