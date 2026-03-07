@@ -1423,6 +1423,7 @@ BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
 BYBIT_API_SECRET = str(os.environ.get("BYBIT_API_SECRET", "") or "").strip()
 BYBIT_RECV_WINDOW = str(os.environ.get("BYBIT_RECV_WINDOW", "5000") or "5000").strip()
 BYBIT_TESTNET = str(os.environ.get("BYBIT_TESTNET", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
+AUTOTRADE_ENTRY_WINDOW_MIN = int(os.environ.get("AUTOTRADE_ENTRY_WINDOW_MIN", "15") or 15)
 
 # Email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
@@ -2798,7 +2799,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         _cts = float(getattr(s, 'created_ts', 0.0) or 0.0)
         _canonical_ts = max(_cts, _email_ts, _generated_ts, _signal_ts)
         _setup_dt = datetime.fromtimestamp(_canonical_ts, tz=timezone.utc) if _canonical_ts > 0 else datetime.now(timezone.utc)
-        _deadline_dt = _setup_dt + timedelta(minutes=10)
+        _deadline_dt = _setup_dt + timedelta(minutes=AUTOTRADE_ENTRY_WINDOW_MIN)
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
             'setup_time': _setup_dt.isoformat(timespec='seconds'),
             'entry_deadline': _deadline_dt.isoformat(timespec='seconds'),
@@ -3739,6 +3740,136 @@ def _admin_assurance_verdict() -> tuple[str, list[str]]:
     if blockers:
         return ("CHECK REQUIRED", blockers)
     return ("HEALTHY", [])
+
+
+def _component_runtime_state(name: str, stale_after_sec: int, enabled: bool = True, no_data: bool = False, waiting_text: str = "waiting_for_first_cycle") -> tuple[str, str]:
+    if not enabled:
+        return ("DISABLED", "disabled_in_config")
+    hb = _ENGINE_HEARTBEAT.get(str(name)) or {}
+    now_ts = float(time.time())
+    last_ok = float(hb.get("last_ok_ts") or 0.0)
+    last_ts = float(hb.get("last_ts") or 0.0)
+    err = str(hb.get("last_error") or "").strip()
+    if err and last_ts > 0 and (now_ts - last_ts) <= float(stale_after_sec):
+        return ("ERROR", err)
+    if last_ok > 0:
+        if (now_ts - last_ok) <= float(stale_after_sec):
+            return ("ACTIVE", "running")
+        return ("STALE", "scheduler_not_running_or_job_not_completing")
+    if last_ts > 0:
+        if err:
+            return ("ERROR", err)
+        return ("WAITING", waiting_text)
+    if no_data:
+        return ("WAITING_FOR_DATA", "no_eligible_data_yet")
+    return ("WAITING", waiting_text)
+
+
+def _status_label(status: str) -> str:
+    m = {
+        "ACTIVE": "ACTIVE",
+        "DISABLED": "DISABLED",
+        "WAITING": "WAITING",
+        "WAITING_FOR_DATA": "WAITING FOR DATA",
+        "STALE": "CHECK SCHEDULER",
+        "ERROR": "ERROR",
+    }
+    return m.get(str(status).upper(), str(status).upper())
+
+
+def _format_last_run_line(title: str, run: dict) -> str:
+    if not run:
+        return f"{title}: —"
+    ts = run.get("finished_ts") or run.get("started_ts")
+    when = _fmt_dt_local(datetime.fromtimestamp(float(ts), tz=timezone.utc)) if ts else "—"
+    status = str(run.get("status") or "").upper() or "UNKNOWN"
+    analyzed_setups = int(run.get("analyzed_setups", 0) or 0)
+    analyzed_trades = int(run.get("analyzed_trades", 0) or 0)
+    return f"{title}: {when} | status={status} | setups={analyzed_setups} | trades={analyzed_trades}"
+
+
+def _learning_status_text() -> str:
+    snap = _evolution_snapshot_cached() or {}
+    overall = snap.get("overall") or {}
+    ny = snap.get("ny") or {}
+    trend = snap.get("trend") or {}
+    hourly = snap.get("last_hourly") or _evolution_get_last_run("hourly") or {}
+    daily = snap.get("last_daily") or _evolution_get_last_run("daily") or {}
+    last_opt = _db_get_last_opt_run() or {}
+    opt_res = _db_get_opt_result(str(last_opt.get("run_id") or "")) if last_opt else {}
+    cfg = load_strategy_config(force=True)
+    auto_last = snap.get("auto_applied_last") or _evolution_state_get("last_auto_adjustment", {}) or {}
+    open_recs = snap.get("open_recommendations") or []
+
+    hourly_no_data = int(hourly.get("analyzed_setups", 0) or 0) == 0 and int(hourly.get("analyzed_trades", 0) or 0) == 0
+    daily_no_data = int(daily.get("analyzed_setups", 0) or 0) == 0 and int(daily.get("analyzed_trades", 0) or 0) == 0
+    opt_sample = int(((opt_res or {}).get("metrics") or {}).get("oos", {}).get("setups", 0) or 0)
+    opt_no_data = bool(last_opt) and opt_sample == 0
+
+    hourly_state, hourly_reason = _component_runtime_state("learning_hourly", max(1800, int(EVOLUTION_HOURLY_INTERVAL_MIN * 180)), enabled=bool(EVOLUTION_ENABLED), no_data=hourly_no_data, waiting_text="waiting_for_hourly_cycle")
+    daily_state, daily_reason = _component_runtime_state("learning_daily", max(21600, int(EVOLUTION_DAILY_INTERVAL_HOURS * 5400)), enabled=bool(EVOLUTION_ENABLED), no_data=daily_no_data, waiting_text="waiting_for_daily_cycle")
+    opt_state, opt_reason = _component_runtime_state("optimizer", max(7200, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 7200)), enabled=bool(AUTONOMOUS_OPT_ENABLED), no_data=opt_no_data, waiting_text="waiting_for_optimizer_window")
+    email_state, _ = _component_runtime_state("email", max(180, int(CHECK_INTERVAL_MIN * 120)), enabled=bool(EMAIL_ENABLED and email_config_ok()), no_data=False, waiting_text="waiting_for_email_loop")
+
+    optimizer_live_changes = []
+    if auto_last and isinstance(auto_last.get("actions"), list):
+        for a in auto_last.get("actions") or []:
+            try:
+                optimizer_live_changes.append(f"{a.get('param')} {a.get('from')}→{a.get('to')}")
+            except Exception:
+                pass
+
+    opt_promoted = bool((opt_res or {}).get("promoted"))
+    lines = [
+        "🧠 Learning / Optimization Status",
+        HDR,
+        f"Hourly learning: {_status_label(hourly_state)}" + (f" | {hourly_reason}" if hourly_reason and hourly_state != "ACTIVE" else ""),
+        f"Daily review: {_status_label(daily_state)}" + (f" | {daily_reason}" if daily_reason and daily_state != "ACTIVE" else ""),
+        f"Optimizer: {_status_label(opt_state)}" + (f" | {opt_reason}" if opt_reason and opt_state != "ACTIVE" else ""),
+        f"Email loop: {_status_label(email_state)}",
+        SEP,
+        _format_last_run_line("Last hourly cycle", hourly),
+        _format_last_run_line("Last daily review", daily),
+        f"Last optimizer run: {(_fmt_dt_local(datetime.fromtimestamp(float((last_opt or {}).get('started_ts') or 0.0), tz=timezone.utc)) if (last_opt or {}).get('started_ts') else '—')}" + (f" | status={str((last_opt or {}).get('status') or 'UNKNOWN').upper()}" if last_opt else ""),
+    ]
+
+    if last_opt:
+        oos = ((opt_res or {}).get("metrics") or {}).get("oos") or {}
+        lines.append(f"Optimizer effect on live strategy: {'LIVE PARAMS UPDATED' if opt_promoted else 'ADVISORY ONLY'}")
+        if oos:
+            lines.append(f"Latest optimizer OOS: setups/day={float(oos.get('setups_per_day', 0.0) or 0.0):.2f} | WR={float(oos.get('win_rate', 0.0) or 0.0):.1f}% | avgR={float(oos.get('avg_R', 0.0) or 0.0):.3f}")
+    else:
+        lines.append("Optimizer effect on live strategy: waiting for first optimizer run")
+
+    lines.append(SEP)
+    lines.append("What is truly automatic")
+    lines.append(f"• Runtime parameter changes: {'YES' if optimizer_live_changes or opt_promoted else 'YES, but no change has been promoted yet'}")
+    lines.append("• Live parameters are persisted in strategy_config and applied without editing the Python file.")
+    lines.append("• The bot does NOT rewrite its own source code or GitHub file.")
+    lines.append("• Broader strategy redesign still requires manual code update + redeploy.")
+
+    if optimizer_live_changes:
+        lines.append("• Last live parameter changes: " + "; ".join(optimizer_live_changes[:3]))
+    else:
+        lines.append("• Last live parameter changes: none recorded yet.")
+
+    lines.append(SEP)
+    lines.append(f"Current live floors: email_quality={float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL):.1f} | screen_quality={float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN):.1f} | min_rr_tp3={float(cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3):.2f}")
+    lines.append(f"Win-rate estimate: overall {float(overall.get('estimated_wr', 0.0) or 0.0):.1f}% | NY {float(ny.get('estimated_wr', 0.0) or 0.0):.1f}% | trend overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}")
+    if open_recs:
+        rec = open_recs[0] or {}
+        lines.append(f"Top open recommendation: {str(rec.get('recommendation') or '').strip() or '—'}")
+    else:
+        lines.append("Top open recommendation: none")
+
+    if not EVOLUTION_ENABLED and not AUTONOMOUS_OPT_ENABLED:
+        lines.append(SEP)
+        lines.append("Manual action: enable EVOLUTION_ENABLED and/or AUTONOMOUS_OPT_ENABLED in the environment, then redeploy.")
+    else:
+        lines.append(SEP)
+        lines.append("Manual action: none for normal operation. Only redeploy if you want code-level strategy changes beyond bounded runtime parameters.")
+    return "\n".join(lines)
+
 
 def _fmt_iso_local_label(iso_s: str, fallback: str = "") -> str:
     if not iso_s:
@@ -9649,43 +9780,34 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     overall = snap.get("overall") or {}
     ny = snap.get("ny") or {}
     trend = snap.get("trend") or {}
-    hourly = snap.get("last_hourly") or {}
-    daily = snap.get("last_daily") or {}
     last_opt = _db_get_last_opt_run() or {}
+    opt_res = _db_get_opt_result(str(last_opt.get("run_id") or "")) if last_opt else {}
     verdict, blockers = _admin_assurance_verdict()
-
-    raw_status = str(snap.get('status') or 'stable').strip().lower()
-    live_sample = int(overall.get('live_sample', 0) or 0)
-    if raw_status == 'needs_intervention' and live_sample < 5:
-        intervention = 'WATCH'
-    elif raw_status == 'needs_intervention':
-        intervention = 'YES'
-    else:
-        intervention = 'NO'
+    opt_live = bool((opt_res or {}).get("promoted"))
 
     lines = [
         "🧠 Edge Status",
         HDR,
-        f"Engine: {verdict}",
-        f"Learning: {'ACTIVE' if EVOLUTION_ENABLED else 'OFF'}",
-        f"Optimization: {'ACTIVE' if AUTONOMOUS_OPT_ENABLED else 'OFF'}",
-        f"Auto-trading: {'ACTIVE' if _autotrade_ready() else 'INACTIVE'}",
-        f"Email pipeline: {'ACTIVE' if EMAIL_ENABLED and email_config_ok() else 'INACTIVE'}",
-        f"Data freshness: {'OK' if _hb_status_line('email', max(180, int(CHECK_INTERVAL_MIN * 120)))[0] not in {'STALE','ERROR','INACTIVE'} else 'STALE'}",
+        f"Engine verdict: {'HEALTHY' if verdict == 'HEALTHY' else 'ATTENTION NEEDED'}" + (f" | {'; '.join(blockers[:3])}" if blockers else ""),
+        f"Learning engine: {'ON' if EVOLUTION_ENABLED else 'OFF'}",
+        f"Optimizer engine: {'ON' if AUTONOMOUS_OPT_ENABLED else 'OFF'}",
+        f"Auto-trading engine: {'ON' if _autotrade_ready() else 'OFF'}",
+        f"Email pipeline: {'ON' if EMAIL_ENABLED and email_config_ok() else 'OFF'}",
         SEP,
-        f"Overall win rate estimate: {float(overall.get('estimated_wr', 0.0) or 0.0):.1f}%",
-        f"New York win rate estimate: {float(ny.get('estimated_wr', 0.0) or 0.0):.1f}%",
-        f"Overall trend vs prior 7d: {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}",
-        f"New York trend vs prior 7d: {str(trend.get('ny_7d') or trend.get('ny') or 'n/a')}",
-        f"Overall WR now / 7d ago: {float(trend.get('current7_wr', 0.0) or 0.0):.1f}% / {float(trend.get('previous7_wr', 0.0) or 0.0):.1f}%",
-        f"NY WR now / 7d ago: {float(trend.get('current7_ny_wr', 0.0) or 0.0):.1f}% / {float(trend.get('previous7_ny_wr', 0.0) or 0.0):.1f}%",
-        SEP,
-        f"Intervention required: {intervention}" + (f" | {'; '.join(blockers[:3])}" if blockers else ""),
-        f"Last learning cycle: {_fmt_dt_local(datetime.fromtimestamp(float((hourly or {}).get('finished_ts') or 0.0), tz=timezone.utc)) if (hourly or {}).get('finished_ts') else '—'}",
-        f"Last daily review: {_fmt_dt_local(datetime.fromtimestamp(float((daily or {}).get('finished_ts') or 0.0), tz=timezone.utc)) if (daily or {}).get('finished_ts') else '—'}",
-        f"Last optimization cycle: {_fmt_dt_local(datetime.fromtimestamp(float((last_opt or {}).get('started_ts') or 0.0), tz=timezone.utc)) if (last_opt or {}).get('started_ts') else '—'}",
+        f"Overall WR estimate: {float(overall.get('estimated_wr', 0.0) or 0.0):.1f}%",
+        f"New York WR estimate: {float(ny.get('estimated_wr', 0.0) or 0.0):.1f}%",
+        f"Trend vs prior 7d: overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')} | NY {str(trend.get('ny_7d') or trend.get('ny') or 'n/a')}",
+        f"Latest optimizer result: {'PROMOTED TO LIVE PARAMS' if opt_live else 'NO NEW LIVE PARAMS PROMOTED'}",
+        f"Detailed learning view: /learning_status",
     ]
     await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+
+async def learning_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    await send_long_message(update, _learning_status_text(), parse_mode=None)
 
 
 async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -13213,16 +13335,10 @@ Admin day boundary is fixed to the Asia-session start (00:00 UTC) for all autotr
 • AutoTrade overall performance summary
 
 /autotrade_sessions
-/autotrade_sessions NY
-/autotrade_sessions NY,LON
-/autotrade_sessions NY,LON,ASIA
-• Show / set allowed sessions for auto-trading
+• Auto-trade allowed sessions (show or set)
 
 /open_trades
 • Show live open Bybit positions (admin, same live source as /status)
-
-/ai_strategy_report
-• Review recent bot trade performance and recommendations
 
 /signal_report [hours]
 • Signal report for recent emailed setups
@@ -13269,9 +13385,11 @@ Admin day boundary is fixed to the Asia-session start (00:00 UTC) for all autotr
 /edge_status
 • Main evolution dashboard: learning active, cycle times, performance trend, missed-opportunity patterns, snapshot intelligence
 
-/optimizer_status
 /learning_status
-• Aliases for the evolution/learning status view
+• Full learning / optimizer reality check and runtime status
+
+/optimizer_status
+• Alias of /learning_status
 
 /winrate
 • Current overall weighted bot win-rate estimate
@@ -13285,9 +13403,9 @@ Admin day boundary is fixed to the Asia-session start (00:00 UTC) for all autotr
 ────────────────────
 🤖 AUTONOMOUS ENGINE (Zero-Touch)
 ────────────────────
-• Backtesting, optimization, validation, promotion, rejection, and learning run automatically in the background.
-• Manual optimization/backtest/parameter override commands are intentionally disabled.
-• New parameters go live only after internal walk-forward and OOS validation pass.
+• Bounded runtime parameter changes can be applied automatically through strategy_config.
+• The bot does not rewrite its own Python source file. Code-level strategy changes still require a manual update + redeploy.
+• New live parameter values go live only after internal validation / promotion logic passes.
 • Bad candidate parameter sets are rejected or reverted automatically.
 • Use /edge_status as the main admin health/evolution command.
 • Snapshot intelligence now captures repeated scan states automatically and evaluates missed movers after the horizon window.
@@ -16806,120 +16924,6 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
 
     await update.message.reply_text("\n".join(lines))
 
-
-
-async def ai_strategy_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/ai_strategy_report — summarize recent bot/autotrade performance and recommendations."""
-    _autotrade_migrate_tables()
-    uid = update.effective_user.id
-    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
-        await update.message.reply_text("⛔️ Owner/admin only.")
-        return
-
-    trades = db_list_autotrade_trades_all(AUTOTRADE_OWNER_UID)
-    if not trades:
-        await update.message.reply_text("🤖 AI Strategy Report\n" + HDR + "\nNo bot-opened trades found yet.")
-        return
-
-    decided = []
-    counts = Counter()
-    by_session = defaultdict(lambda: Counter())
-    by_symbol = defaultdict(lambda: {"n": 0, "wins": 0, "losses": 0, "r": []})
-    for t in trades:
-        setup = {
-            "symbol": t.get("symbol"),
-            "market_symbol": _market_symbol_from_base(t.get("symbol")),
-            "side": t.get("side"),
-            "entry": t.get("entry"),
-            "sl": t.get("sl"),
-            "tp1": t.get("tp1"),
-            "tp2": t.get("tp2"),
-            "tp3": t.get("tp3"),
-            "created_ts": float(t.get("opened_ts") or 0.0),
-        }
-        res = evaluate_signal_hit_order(setup, horizon_hours=168, timeframe="1m")
-        out = str(res.get("outcome") or "OPEN").upper().strip()
-        sess = str(t.get("session") or "?").strip() or "?"
-        counts[out] += 1
-        by_session[sess][out] += 1
-        if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
-            rr = _realized_r_option_b(
-                out,
-                str(t.get("side") or "").upper().strip(),
-                float(t.get("entry") or 0.0),
-                float(t.get("sl") or 0.0),
-                float(t.get("tp1")) if t.get("tp1") is not None else None,
-                float(t.get("tp2")) if t.get("tp2") is not None else None,
-                float(t.get("tp3")) if t.get("tp3") is not None else None,
-            )
-            sym = str(t.get("symbol") or "?").upper()
-            by_symbol[sym]["n"] += 1
-            by_symbol[sym]["r"].append(float(rr or 0.0))
-            if out == "LOSS":
-                by_symbol[sym]["losses"] += 1
-            else:
-                by_symbol[sym]["wins"] += 1
-            decided.append(float(rr or 0.0))
-
-    total = len(trades)
-    wins = counts.get("WIN_TP1",0) + counts.get("WIN_TP2",0) + counts.get("WIN_TP3",0)
-    losses = counts.get("LOSS",0)
-    decided_n = wins + losses
-    wr = (wins / decided_n * 100.0) if decided_n else 0.0
-    avg_r = (sum(decided) / len(decided)) if decided else 0.0
-
-    recommendation = pf_strategy_learning([{"pnl": 1 if r > 0 else -1 if r < 0 else 0} for r in decided])
-
-    weakest_session = None
-    weakest_wr = None
-    for sess, c in by_session.items():
-        s_w = c.get("WIN_TP1",0) + c.get("WIN_TP2",0) + c.get("WIN_TP3",0)
-        s_l = c.get("LOSS",0)
-        s_d = s_w + s_l
-        if s_d <= 0:
-            continue
-        s_wr = s_w / s_d * 100.0
-        if weakest_wr is None or s_wr < weakest_wr:
-            weakest_wr = s_wr
-            weakest_session = sess
-
-    weakest_symbol = None
-    weakest_symbol_r = None
-    for sym, info in by_symbol.items():
-        if info["n"] <= 0:
-            continue
-        sym_avg = sum(info["r"]) / len(info["r"]) if info["r"] else 0.0
-        if weakest_symbol_r is None or sym_avg < weakest_symbol_r:
-            weakest_symbol_r = sym_avg
-            weakest_symbol = sym
-
-    lines = []
-    lines.append("🤖 AI Strategy Report")
-    lines.append(HDR)
-    lines.append(f"Bot trades reviewed: {total}")
-    lines.append(f"Decided: {decided_n} | Wins: {wins} | Losses: {losses} | Win rate: {wr:.1f}%")
-    lines.append(f"Average realized R: {avg_r:.2f}R")
-    lines.append(f"Open / still developing: {counts.get('OPEN',0)}")
-    lines.append(SEP)
-    lines.append(f"AI recommendation: {recommendation}")
-    if weakest_session is not None:
-        lines.append(f"Weakest session: {weakest_session} ({weakest_wr:.1f}% WR)")
-    if weakest_symbol is not None:
-        lines.append(f"Weakest symbol: {weakest_symbol} ({weakest_symbol_r:.2f}R avg)")
-    lines.append(SEP)
-    lines.append("Suggested actions:")
-    if wr < 50:
-        lines.append("• Tighten filters and reduce risk multiplier on weaker sessions.")
-    elif wr < 60:
-        lines.append("• Keep filters selective; review weaker symbols before allowing auto-trade.")
-    else:
-        lines.append("• Current engine is healthy; keep risk steady and monitor drift.")
-    if weakest_session is not None:
-        lines.append(f"• Consider reducing exposure during {weakest_session} until performance improves.")
-    if weakest_symbol is not None:
-        lines.append(f"• Review {weakest_symbol} setups for repeated false triggers or thin liquidity.")
-
-    await update.message.reply_text("\n".join(lines))
 
 
 async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
@@ -20470,10 +20474,9 @@ def main():
     app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
     app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report_overal", autotrade_report_overall_cmd, block=False))
-    app.add_handler(CommandHandler("ai_strategy_report", ai_strategy_report_cmd, block=False))
     app.add_handler(CommandHandler("edge_status", edge_status_cmd, block=False))
-    app.add_handler(CommandHandler("optimizer_status", edge_status_cmd, block=False))
-    app.add_handler(CommandHandler("learning_status", edge_status_cmd, block=False))
+    app.add_handler(CommandHandler("optimizer_status", learning_status_cmd, block=False))
+    app.add_handler(CommandHandler("learning_status", learning_status_cmd, block=False))
     app.add_handler(CommandHandler("winrate", winrate_cmd, block=False))
     app.add_handler(CommandHandler("ny_winrate", ny_winrate_cmd, block=False))
     app.add_handler(CommandHandler("lessons_learned", lessons_learned_cmd, block=False))
