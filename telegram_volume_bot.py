@@ -1157,7 +1157,7 @@ async def cmd_params_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_long_message(update, f"⚙️ Strategy Params (active)\n{HDR}\n```\n{pretty}\n```", parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_params_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin_user(update.effective_user.id):
         await update.message.reply_text("⛔ Admin only.")
         return
     cfg = _strategy_config_defaults()
@@ -1956,6 +1956,24 @@ def _estimate_position_risk_usd(p: dict) -> float:
     except Exception:
         return 0.0
 
+def _autotrade_realized_pnl_today(uid: int, now_utc: Optional[datetime] = None) -> float:
+    """Realized PnL for autotrade journal rows closed inside the active admin day window."""
+    try:
+        start_utc, end_utc = _admin_today_window_utc(now_utc)
+        start_ts = int(start_utc.timestamp())
+        end_ts = int(end_utc.timestamp())
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COALESCE(SUM(pnl_usdt), 0) FROM autotrade_trades WHERE uid=? AND closed_ts IS NOT NULL AND closed_ts>=? AND closed_ts<?",
+                (int(uid), start_ts, end_ts),
+            )
+            row = cur.fetchone()
+            return float((row[0] if row else 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
 def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     """Compute authoritative AutoTrade day risk metrics.
 
@@ -1993,7 +2011,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         cap = 0.0
 
     try:
-        realized_pnl_today = float(_pnl_today_closed_trades(int(uid), user) or 0.0)
+        realized_pnl_today = float(_autotrade_realized_pnl_today(int(uid)) or 0.0)
         realized_loss_today = max(0.0, -float(realized_pnl_today))
     except Exception:
         realized_pnl_today = 0.0
@@ -4138,8 +4156,9 @@ def db_init():
         cur.execute("ALTER TABLE users ADD COLUMN trade_window_start TEXT NOT NULL DEFAULT ''")
     if "trade_window_end" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN trade_window_end TEXT NOT NULL DEFAULT ''")
-    
-    
+    if "day_reset_hhmm" not in cols:
+        cur.execute(f"ALTER TABLE users ADD COLUMN day_reset_hhmm TEXT NOT NULL DEFAULT '{DEFAULT_USER_DAY_RESET_HHMM}'")
+
     # Scan profile (standard/aggressive)
     if "scan_profile" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN scan_profile TEXT NOT NULL DEFAULT 'standard'")
@@ -4486,10 +4505,10 @@ def get_user(user_id: int) -> dict:
                 daily_cap_mode, daily_cap_value,
                 max_trades_day, notify_on,
                 sessions_enabled, max_emails_per_session, email_gap_min,
-                max_emails_per_day,
+                max_emails_per_day, day_reset_hhmm,
                 day_trade_date, day_trade_count
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             user_id,
             tz_name,
@@ -4508,6 +4527,7 @@ def get_user(user_id: int) -> dict:
             int(DEFAULT_MAX_EMAILS_PER_SESSION),
             int(DEFAULT_MIN_EMAIL_GAP_MIN),
             int(DEFAULT_MAX_EMAILS_PER_DAY),
+            str(DEFAULT_USER_DAY_RESET_HHMM),
             now_local,
             0
         ))
@@ -4666,20 +4686,17 @@ def ensure_billing_columns():
 
 
 def reset_daily_if_needed(user: dict) -> dict:
-    tz_name = str(user.get("tz") or user.get("timezone") or "UTC").strip()
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("UTC")
-    today = datetime.now(tz).date().isoformat()
+    user = dict(user or {})
+    uid = int(user.get("user_id") or 0)
+    if uid <= 0:
+        return user
 
-    if user["day_trade_date"] != today:
-        update_user(
-            user["user_id"],
-            day_trade_date=today,
-            day_trade_count=0
-        )
-        user = get_user(user["user_id"])
+    start_local, _, _ = _user_today_window(user)
+    today_key = start_local.date().isoformat()
+
+    if str(user.get("day_trade_date") or "") != today_key:
+        update_user(uid, day_trade_date=today_key, day_trade_count=0)
+        user = get_user(uid)
 
     return user
 
@@ -5440,24 +5457,17 @@ def _risk_daily_inc(user_id: int, day_local: str, inc_usd: float):
     con.close()
 
 def _user_day_local(user: dict) -> str:
-    tz_name = str(user.get("tz") or user.get("timezone") or "UTC").strip()
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("UTC")
-    return datetime.now(tz).date().isoformat()
+    start_local, _, _ = _user_today_window(user)
+    return start_local.date().isoformat()
 
 
 def _day_local_for_ts(user: dict, ts: float) -> str:
-    tz_name = str(user.get("tz") or user.get("timezone") or "UTC").strip()
     try:
-        tz = ZoneInfo(tz_name)
+        dt_ref = datetime.fromtimestamp(float(ts), _user_tzinfo(user))
     except Exception:
-        tz = ZoneInfo("UTC")
-    try:
-        return datetime.fromtimestamp(float(ts), tz).date().isoformat()
-    except Exception:
-        return datetime.now(tz).date().isoformat()
+        dt_ref = datetime.now(_user_tzinfo(user))
+    start_local, _ = _anchored_day_window(dt_ref, _user_day_reset_hhmm(user))
+    return start_local.date().isoformat()
 
 def _risk_used_today_from_open_trades(user_id: int, user: dict, day_local: str) -> float:
     """Current open manual-trade risk consuming capacity *now*.
@@ -5528,11 +5538,10 @@ def _risk_used_total_today(user_id: int, user: dict) -> float:
 
 
 def _admin_today_window_utc(now_utc: Optional[datetime] = None) -> tuple[datetime, datetime]:
-    """Admin 'today' = Asia-session trading day = [00:00 UTC, next 00:00 UTC)."""
+    """Admin 'today' = Asia-session trading day anchored to the Asia-session start."""
     now_utc = now_utc.astimezone(timezone.utc) if isinstance(now_utc, datetime) else datetime.now(timezone.utc)
-    start_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_utc = start_utc + timedelta(days=1)
-    return start_utc, end_utc
+    start_utc, end_utc = _anchored_day_window(now_utc, ADMIN_ASIA_DAY_START_HHMM)
+    return start_utc.astimezone(timezone.utc), end_utc.astimezone(timezone.utc)
 
 
 def _admin_today_key_utc(now_utc: Optional[datetime] = None) -> str:
@@ -5541,15 +5550,46 @@ def _admin_today_key_utc(now_utc: Optional[datetime] = None) -> str:
 
 
 def _user_today_window(user: dict, now_ts: Optional[float] = None) -> tuple[datetime, datetime, str]:
-    tz_name = str(user.get("tz") or user.get("timezone") or "UTC").strip()
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("UTC")
+    tz = _user_tzinfo(user)
     now_local = datetime.fromtimestamp(float(now_ts), tz) if now_ts is not None else datetime.now(tz)
-    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_local = start_local + timedelta(days=1)
-    return start_local, end_local, tz.key if hasattr(tz, 'key') else tz_name
+    start_local, end_local = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
+    return start_local, end_local, tz.key if hasattr(tz, 'key') else str(user.get("tz") or "UTC")
+
+
+ADMIN_ASIA_DAY_START_HHMM = "00:00"
+DEFAULT_USER_DAY_RESET_HHMM = "00:00"
+
+
+def _parse_anchor_hhmm(anchor_hhmm: str) -> tuple[int, int]:
+    raw = str(anchor_hhmm or DEFAULT_USER_DAY_RESET_HHMM).strip() or DEFAULT_USER_DAY_RESET_HHMM
+    try:
+        h, m = parse_hhmm(raw)
+        return int(clamp(h, 0, 23)), int(clamp(m, 0, 59))
+    except Exception:
+        return 0, 0
+
+
+def _user_tzinfo(user: dict):
+    tz_name = str((user or {}).get("tz") or (user or {}).get("timezone") or "UTC").strip()
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def _user_day_reset_hhmm(user: dict) -> str:
+    raw = str((user or {}).get("day_reset_hhmm") or DEFAULT_USER_DAY_RESET_HHMM).strip()
+    h, m = _parse_anchor_hhmm(raw)
+    return f"{h:02d}:{m:02d}"
+
+
+def _anchored_day_window(dt_ref: datetime, anchor_hhmm: str) -> tuple[datetime, datetime]:
+    hh, mm = _parse_anchor_hhmm(anchor_hhmm)
+    start = dt_ref.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if dt_ref < start:
+        start -= timedelta(days=1)
+    end = start + timedelta(days=1)
+    return start, end
 
 
 def _manual_trades_today_count(user_id: int, user: dict) -> int:
@@ -5616,7 +5656,7 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
                 pass
         start_utc, end_utc = _admin_today_window_utc()
         snap["today_key"] = start_utc.strftime("%Y-%m-%d")
-        snap["today_basis"] = "Asia-session day (UTC)"
+        snap["today_basis"] = f"Asia-session day anchored at {ADMIN_ASIA_DAY_START_HHMM} UTC"
         snap["today_window_label"] = f"{start_utc.strftime('%Y-%m-%d %H:%M')} → {end_utc.strftime('%Y-%m-%d %H:%M')} UTC"
         m = _autotrade_day_risk_metrics(int(uid), float(snap["equity"]))
         snap["cap"] = float(m.get("cap") or 0.0)
@@ -5644,7 +5684,7 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
             "over_by": max(0.0, -remaining_raw) if cap > 0 else 0.0,
             "pnl_today": pnl_today,
             "trades_today": _manual_trades_today_count(uid, user),
-            "today_basis": f"Local calendar day ({tz_name})",
+            "today_basis": f"Local anchored day ({tz_name}, starts {_user_day_reset_hhmm(user)})",
             "today_key": start_local.date().isoformat(),
             "today_window_label": f"{start_local.strftime('%Y-%m-%d %H:%M')} → {end_local.strftime('%Y-%m-%d %H:%M')} {tz_name}",
         })
@@ -12484,11 +12524,21 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # RISK
 # =========================================================
+def _prefer_live_equity_for_user(user: dict | None = None) -> bool:
+    try:
+        uid = int((user or {}).get("user_id") or 0)
+    except Exception:
+        uid = 0
+    if uid <= 0 or not is_admin_user(uid):
+        return False
+    return bool(AUTOTRADE_ENABLED) and str(AUTOTRADE_MODE).lower() == "live"
+
+
 def compute_risk_usd(user: dict, mode: str, value: float) -> float:
     mode = str(mode or "").upper()
     if mode == "USD":
         return max(0.0, float(value))
-    eq = _effective_equity_for_risk(user, prefer_live=True)
+    eq = _effective_equity_for_risk(user, prefer_live=_prefer_live_equity_for_user(user))
     if eq <= 0:
         return 0.0
     return _risk_amount_from_pct(eq, float(value))
@@ -12556,7 +12606,7 @@ def daily_cap_usd(user: dict) -> float:
     val = float(user.get("daily_cap_value", DEFAULT_DAILY_CAP_VALUE) or DEFAULT_DAILY_CAP_VALUE)
     if mode == "USD":
         return max(0.0, val)
-    eq = _effective_equity_for_risk(user, prefer_live=True)
+    eq = _effective_equity_for_risk(user, prefer_live=_prefer_live_equity_for_user(user))
     if eq <= 0:
         return 0.0
     return _risk_amount_from_pct(eq, val)
@@ -12827,14 +12877,21 @@ Trade Journal
 • Show your current timezone
 
 /tz <Region/City>
-• Set your timezone so emails show your local time
+• Set your timezone so emails and day-based stats use your local zone
 • Use IANA format: Region/City
+
+/dayreset
+• Show your active daily reset anchor
+
+/dayreset <HH:MM>
+• Set when your local trading day starts for risk/P&L/trade counters
 
 Examples:
 /tz Australia/Melbourne
 /tz Asia/Dubai   
 /tz Europe/London
 /tz America/New_York
+/dayreset 07:00
 
 ────────────────────
 Reports 
@@ -12883,6 +12940,8 @@ HELP_TEXT_ADMIN = """\
 Admin commands are powerful. Use carefully.
 Not financial advice.
 
+Admin day boundary is fixed to the Asia-session start (00:00 UTC) for all autotrade daily metrics.
+
 ────────────────────
 👤 USERS & ACCESS
 ────────────────────
@@ -12926,7 +12985,7 @@ Not financial advice.
 🤖 AUTOTRADE (OWNER / ADMIN)
 ────────────────────
 /autotrade_debug
-• AutoTrade readiness + synchronized live risk/cap diagnostics
+• AutoTrade readiness + synchronized live risk/cap diagnostics (Asia-session day boundary)
 
 /autotrade_debug_reset
 • Clear AutoTrade debug state (fresh next attempt)
@@ -13736,6 +13795,36 @@ async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user(uid, tz=tz_name, sessions_enabled=json.dumps(sessions))
     await update.message.reply_text(f"✅ TZ set to {tz_name}\nDefault sessions updated. Use /sessions to view.")
 
+async def dayreset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+    current = _user_day_reset_hhmm(user)
+    if not context.args:
+        await update.message.reply_text(
+            f"Your daily reset anchor: {current} ({user.get('tz','UTC')})\n\n"
+            "Set with: /dayreset HH:MM\n"
+            "Examples:\n"
+            "• /dayreset 00:00\n"
+            "• /dayreset 07:00\n"
+            "• /dayreset 21:30"
+        )
+        return
+
+    raw = str(context.args[0]).strip()
+    if not re.fullmatch(r"\d{1,2}:\d{2}", raw):
+        await update.message.reply_text("Invalid time. Use HH:MM in 24h format, for example /dayreset 07:00")
+        return
+    h, m = _parse_anchor_hhmm(raw)
+    anchor = f"{h:02d}:{m:02d}"
+    update_user(uid, day_reset_hhmm=anchor)
+    user = reset_daily_if_needed(get_user(uid) or {})
+    start_local, end_local, tz_name = _user_today_window(user)
+    await update.message.reply_text(
+        f"✅ Daily reset anchor set to {anchor} ({tz_name}).\n"
+        f"Active trading day: {start_local.strftime('%Y-%m-%d %H:%M')} → {end_local.strftime('%Y-%m-%d %H:%M')} {tz_name}"
+    )
+
+
 async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid) or {}
@@ -14386,8 +14475,11 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     side = "BUY" if direction == "long" else "SELL"
 
-    if int(user["day_trade_count"]) >= int(user["max_trades_day"]):
-        await update.message.reply_text(f"⚠️ Max trades/day reached ({user['max_trades_day']}). If you continue, you are overtrading.")
+    trades_today_now = int(_manual_trades_today_count(uid, user) or 0)
+    update_user(uid, day_trade_count=trades_today_now)
+    user = get_user(uid)
+    if trades_today_now >= int(user["max_trades_day"]):
+        await update.message.reply_text(f"⛔ Max trades for the active day reached ({user['max_trades_day']}).")
         return
 
     try:
@@ -14512,7 +14604,7 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     used_after = _risk_used_total_today(uid, get_user(uid))
     remaining_after = (cap - used_after) if cap > 0 else float("inf")
 
-    update_user(uid, day_trade_count=int(user["day_trade_count"]) + 1)
+    update_user(uid, day_trade_count=int(trades_today_now) + 1)
     user = get_user(uid)
 
     daily_risk_line = (
@@ -14532,7 +14624,7 @@ async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- SL: {fmt_price(sl)}\n"
         f"- Risk: ${risk_usd:.2f}\n"
         f"- Qty: {qty:.6g}\n"
-        f"{warn_daily}{warn_trade_vs_cap}"
+        f""
         f"{daily_risk_line}\n"
         f"- Trades today: {int(user['day_trade_count'])}/{int(user['max_trades_day'])}\n"
         f"- Equity: ${float(user['equity']):.2f}\n"
@@ -14901,6 +14993,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
     lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
     lines.append(f"Today basis: {snap.get('today_basis')}")
+    lines.append(f"Today window: {snap.get('today_window_label')}")
 
     if is_admin:
         if not live_positions:
@@ -19116,6 +19209,7 @@ async def _post_init(app: Application):
             BotCommand("bigmove_alert", "Big move alerts"),
 
             BotCommand("tz", "Show/set your timezone"),
+            BotCommand("dayreset", "Set your daily reset anchor"),
 
             BotCommand("report_daily", "Daily performance report"),
             BotCommand("report_weekly", "Weekly performance report"),
@@ -20049,6 +20143,7 @@ def main():
     app.add_handler(CommandHandler("support_open", admin_support_open_cmd, block=False))
     app.add_handler(CommandHandler("support_close", admin_support_close_cmd, block=False))
     app.add_handler(CommandHandler("tz", tz_cmd, block=False))
+    app.add_handler(CommandHandler("dayreset", dayreset_cmd, block=False))
     app.add_handler(CommandHandler("screen", screen_cmd))
     app.add_handler(CommandHandler("equity", equity_cmd, block=False))
     app.add_handler(CommandHandler("equity_reset", equity_reset_cmd, block=False))
