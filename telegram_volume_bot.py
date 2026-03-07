@@ -9394,6 +9394,10 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     auto_actions = auto_last.get("actions") or []
     top_tags = snap.get("top_failure_tags") or []
     ny_tags = snap.get("top_failure_tags_ny") or []
+    scan_intel = await to_thread_fast(_scan_intel_summary_cached) if SCAN_INTELLIGENCE_ENABLED else {}
+    scan_summary = (scan_intel or {}).get("summary") or {}
+    scan_counts = scan_summary.get("counts") or {}
+    scan_actions = (scan_intel or {}).get("actions") or []
     lines = [
         "🧠 Edge Status",
         HDR,
@@ -9408,6 +9412,9 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Entry-quality issues present: {'YES' if snap.get('entry_issue_present') else 'NO'}",
         f"Rule stability: {str(snap.get('status') or 'unknown').replace('_',' ').upper()}",
         f"Open recommendations: {len(recs)} | Auto-adjustments in last cycle: {len(auto_actions)}",
+        f"Snapshot intelligence: {'ACTIVE' if SCAN_INTELLIGENCE_ENABLED else 'OFF'} | Recently evaluated: {int((scan_intel or {}).get('evaluated', 0) or 0)}",
+        f"Missed-good patterns: {int(scan_counts.get('missed_but_good', 0) or 0)} | Over-filter misses: {int(scan_counts.get('missed_due_to_over_filtering', 0) or 0)} | Watch-never-converted: {int(scan_counts.get('watch_state_never_converted', 0) or 0)}",
+        f"Snapshot auto-adjustments pending/applied: {len(scan_actions)}",
     ]
     if top_tags:
         lines.append(SEP)
@@ -9418,6 +9425,11 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("NY-specific patterns:")
         for tag, n in ny_tags[:3]:
             lines.append(f"• {tag}: {int(n)}")
+    if (scan_summary.get("top_missed_reasons") or []):
+        lines.append(SEP)
+        lines.append("Top missed-opportunity patterns:")
+        for reason, n in (scan_summary.get("top_missed_reasons") or [])[:3]:
+            lines.append(f"• {reason}: {int(n)}")
     if recs:
         lines.append(SEP)
         lines.append("Latest recommendation:")
@@ -9473,6 +9485,385 @@ async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         if rec:
             lines.append(f"  Insight: {rec}")
     await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+
+# =========================================================
+# MARKET-SCAN SNAPSHOT INTELLIGENCE (zero-touch, low-maintenance)
+# - Captures repeated scan states several times per day
+# - Evaluates whether symbols later moved enough to count as missed opportunities
+# - Applies only bounded, evidence-based screen-side adjustments
+# =========================================================
+SCAN_INTELLIGENCE_ENABLED = str(os.environ.get("SCAN_INTELLIGENCE_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+SCAN_INTELLIGENCE_INTERVAL_MIN = int(os.environ.get("SCAN_INTELLIGENCE_INTERVAL_MIN", "180") or 180)
+SCAN_INTELLIGENCE_HORIZON_HOURS = float(os.environ.get("SCAN_INTELLIGENCE_HORIZON_HOURS", "6") or 6)
+SCAN_INTELLIGENCE_MAX_SYMBOLS = int(os.environ.get("SCAN_INTELLIGENCE_MAX_SYMBOLS", "24") or 24)
+SCAN_INTELLIGENCE_MIN_MFE_PCT = float(os.environ.get("SCAN_INTELLIGENCE_MIN_MFE_PCT", "1.4") or 1.4)
+SCAN_INTELLIGENCE_MAX_MAE_PCT = float(os.environ.get("SCAN_INTELLIGENCE_MAX_MAE_PCT", "1.2") or 1.2)
+SCAN_INTELLIGENCE_AUTO_APPLY_COOLDOWN_HOURS = float(os.environ.get("SCAN_INTELLIGENCE_AUTO_APPLY_COOLDOWN_HOURS", "18") or 18)
+SCAN_INTELLIGENCE_MIN_MISSED_GOOD = int(os.environ.get("SCAN_INTELLIGENCE_MIN_MISSED_GOOD", "6") or 6)
+
+def _scan_intel_migrate_tables():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS market_scan_snapshots (
+                snap_id TEXT PRIMARY KEY,
+                created_ts REAL NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT 'screen',
+                leaders_json TEXT NOT NULL DEFAULT '[]',
+                losers_json TEXT NOT NULL DEFAULT '[]',
+                market_leaders_json TEXT NOT NULL DEFAULT '[]',
+                waiting_json TEXT NOT NULL DEFAULT '[]',
+                trend_watch_json TEXT NOT NULL DEFAULT '[]',
+                top_setups_json TEXT NOT NULL DEFAULT '[]',
+                market_pulse_json TEXT NOT NULL DEFAULT '{}',
+                reject_summary_json TEXT NOT NULL DEFAULT '{}',
+                outcome_summary_json TEXT NOT NULL DEFAULT '{}'
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS market_scan_symbols (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snap_id TEXT NOT NULL,
+                created_ts REAL NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL,
+                bucket TEXT NOT NULL,
+                side TEXT NOT NULL DEFAULT '',
+                entry REAL NOT NULL DEFAULT 0,
+                ch24 REAL NOT NULL DEFAULT 0,
+                volume_usd REAL NOT NULL DEFAULT 0,
+                reject_reason TEXT NOT NULL DEFAULT '',
+                evaluated INTEGER NOT NULL DEFAULT 0,
+                evaluated_ts REAL,
+                mfe_pct REAL,
+                mae_pct REAL,
+                outcome TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                UNIQUE(snap_id, symbol, bucket)
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_market_scan_symbols_eval ON market_scan_symbols(evaluated, created_ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_market_scan_snapshots_ts ON market_scan_snapshots(created_ts)")
+            conn.commit()
+    except Exception:
+        pass
+
+def _scan_intel_compact_setup(s) -> dict:
+    try:
+        return {
+            "symbol": str(getattr(s, "symbol", "") or "").upper(),
+            "side": str(getattr(s, "side", "") or "").upper(),
+            "conf": int(getattr(s, "conf", 0) or 0),
+            "engine": str(getattr(s, "engine", "") or ""),
+            "entry": float(getattr(s, "entry", 0.0) or 0.0),
+            "sl": float(getattr(s, "sl", 0.0) or 0.0),
+            "tp3": float(getattr(s, "tp3", 0.0) or 0.0),
+            "ch24": float(getattr(s, "ch24", 0.0) or 0.0),
+            "fut_vol_usd": float(getattr(s, "fut_vol_usd", 0.0) or 0.0),
+        }
+    except Exception:
+        return {}
+
+def _scan_intel_market_pulse(best_fut: dict, leaders: list[str], losers: list[str], session_name: str) -> dict:
+    try:
+        adv = []
+        dec = []
+        vols = []
+        for _, mv in (best_fut or {}).items():
+            try:
+                ch24 = float(getattr(mv, "percentage", 0.0) or 0.0)
+                vol = float(usd_notional(mv) or 0.0)
+                vols.append(vol)
+                if ch24 > 0:
+                    adv.append(ch24)
+                elif ch24 < 0:
+                    dec.append(ch24)
+            except Exception:
+                continue
+        risk_tone = "balanced"
+        if len(leaders) >= max(3, len(losers) + 2):
+            risk_tone = "risk_on"
+        elif len(losers) >= max(3, len(leaders) + 2):
+            risk_tone = "risk_off"
+        return {
+            "session": str(session_name or "").upper(),
+            "leaders_n": int(len(leaders or [])),
+            "losers_n": int(len(losers or [])),
+            "breadth_adv": int(len(adv)),
+            "breadth_dec": int(len(dec)),
+            "avg_adv_24h": float(sum(adv) / len(adv)) if adv else 0.0,
+            "avg_dec_24h": float(sum(dec) / len(dec)) if dec else 0.0,
+            "median_vol_usd": float(sorted(vols)[len(vols)//2]) if vols else 0.0,
+            "risk_tone": risk_tone,
+        }
+    except Exception:
+        return {"session": str(session_name or "").upper(), "risk_tone": "unknown"}
+
+def _scan_intel_capture_snapshot(best_fut: dict, session_name: str, pool: dict, reject_ctx: dict | None = None, mode: str = "screen") -> str:
+    _scan_intel_migrate_tables()
+    created_ts = float(time.time())
+    snap_id = f"SCAN-{int(created_ts)}-{str(session_name or '').upper()}"
+    up_list, dn_list = compute_directional_lists(best_fut)
+    leaders = [str(t[0]).upper() for t in (up_list or [])[:10]]
+    losers = [str(t[0]).upper() for t in (dn_list or [])[:10]]
+    market_leaders = _market_leader_bases(best_fut, 10)
+    waiting = list(pool.get("waiting") or [])[:SCREEN_WAITING_N]
+    trend_watch = list(pool.get("trend_watch") or [])[:10]
+    top_setups = [ _scan_intel_compact_setup(s) for s in list(pool.get("setups") or [])[:6] ]
+    pulse = _scan_intel_market_pulse(best_fut, leaders, losers, session_name)
+    reject_summary = {}
+    per = {}
+    try:
+        per = dict((reject_ctx or {}).get("__per__") or {})
+        reason_ctr = Counter()
+        for sym, info in per.items():
+            try:
+                rr = str((info or {}).get("reason") or "").strip()
+                if rr and rr not in ("evaluated", "setup_generated", "not_evaluated"):
+                    reason_ctr[rr] += 1
+            except Exception:
+                continue
+        reject_summary = {"top_rejects": reason_ctr.most_common(8)}
+    except Exception:
+        reject_summary = {}
+
+    tracked = []
+    def _add_symbol(sym: str, bucket: str, side: str = ""):
+        s = str(sym or "").upper().strip()
+        if not s:
+            return
+        mv = (best_fut or {}).get(s)
+        if not mv:
+            return
+        info = per.get(s) or {}
+        tracked.append((
+            snap_id, created_ts, str(session_name or "").upper(), s, str(bucket), str(side or "").upper(),
+            float(getattr(mv, "last", 0.0) or 0.0), float(getattr(mv, "percentage", 0.0) or 0.0), float(usd_notional(mv) or 0.0),
+            str(info.get("reason") or "")
+        ))
+
+    for s in leaders[:8]:
+        _add_symbol(s, "leaders", "BUY")
+    for s in losers[:8]:
+        _add_symbol(s, "losers", "SELL")
+    for s in market_leaders[:8]:
+        _add_symbol(s, "market_leaders", "")
+    for s, info in waiting[:8]:
+        _add_symbol(s, "momentum_watch", str((info or {}).get("side") or ""))
+    for t in trend_watch[:8]:
+        _add_symbol(str((t or {}).get("symbol") or ""), "trend_watch", str((t or {}).get("side") or ""))
+    for s in list(pool.get("setups") or [])[:6]:
+        _add_symbol(str(getattr(s, "symbol", "") or ""), "top_setups", str(getattr(s, "side", "") or ""))
+
+    # Deduplicate by (symbol,bucket) while keeping first occurrence
+    dedup = []
+    seen = set()
+    for row in tracked[: max(8, int(SCAN_INTELLIGENCE_MAX_SYMBOLS))]:
+        k = (row[3], row[4])
+        if k in seen:
+            continue
+        seen.add(k)
+        dedup.append(row)
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO market_scan_snapshots(snap_id, created_ts, session, mode, leaders_json, losers_json, market_leaders_json, waiting_json, trend_watch_json, top_setups_json, market_pulse_json, reject_summary_json, outcome_summary_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (snap_id, created_ts, str(session_name or "").upper(), str(mode or "screen"), _json_dumps_safe(leaders), _json_dumps_safe(losers), _json_dumps_safe(market_leaders), _json_dumps_safe(waiting), _json_dumps_safe(trend_watch), _json_dumps_safe(top_setups), _json_dumps_safe(pulse), _json_dumps_safe(reject_summary), _json_dumps_safe({}))
+            )
+            if dedup:
+                c.executemany(
+                    "INSERT OR REPLACE INTO market_scan_symbols(snap_id, created_ts, session, symbol, bucket, side, entry, ch24, volume_usd, reject_reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    dedup,
+                )
+            conn.commit()
+    except Exception:
+        pass
+    return snap_id
+
+def _scan_intel_eval_one(symbol: str, side: str, entry: float, created_ts: float) -> tuple[float, float, str, str]:
+    try:
+        market_symbol = _bybit_linear_symbol(symbol)
+        candles = fetch_ohlcv(market_symbol, "15m", limit=240)
+        if not candles:
+            return (0.0, 0.0, "insufficient_data", "no_15m_data")
+        start_ms = int(float(created_ts) * 1000.0)
+        rows = [c for c in candles if int(c[0]) >= start_ms]
+        if len(rows) < 3:
+            rows = candles[-min(len(candles), 32):]
+        highs = [float(x[2]) for x in rows]
+        lows = [float(x[3]) for x in rows]
+        if not highs or not lows or float(entry or 0.0) <= 0:
+            return (0.0, 0.0, "insufficient_data", "bad_eval_window")
+        side_u = str(side or "").upper().strip()
+        if side_u == "SELL":
+            mfe = max(0.0, ((float(entry) - min(lows)) / float(entry)) * 100.0)
+            mae = max(0.0, ((max(highs) - float(entry)) / float(entry)) * 100.0)
+        else:
+            mfe = max(0.0, ((max(highs) - float(entry)) / float(entry)) * 100.0)
+            mae = max(0.0, ((float(entry) - min(lows)) / float(entry)) * 100.0)
+        return (float(mfe), float(mae), "ok", "")
+    except Exception as e:
+        return (0.0, 0.0, "eval_error", f"{type(e).__name__}: {e}")
+
+def _scan_intel_classify(bucket: str, mfe_pct: float, mae_pct: float, reject_reason: str) -> str:
+    rr = str(reject_reason or "").strip().lower()
+    if str(bucket or "") == "top_setups":
+        return "setup_worked" if float(mfe_pct) >= float(SCAN_INTELLIGENCE_MIN_MFE_PCT) else "setup_failed"
+    if float(mfe_pct) >= float(SCAN_INTELLIGENCE_MIN_MFE_PCT) and float(mae_pct) <= float(SCAN_INTELLIGENCE_MAX_MAE_PCT):
+        if rr in {"ch1_below_trigger", "no_breakout_trigger", "below_min_confidence", "no_engine_passed", "smc_structure_mismatch"}:
+            return "missed_due_to_over_filtering"
+        return "missed_but_good"
+    if float(mfe_pct) >= float(SCAN_INTELLIGENCE_MIN_MFE_PCT) * 0.70:
+        return "watch_state_never_converted"
+    return "correctly_skipped"
+
+def _scan_intel_summarize_recent(days: int = 14) -> dict:
+    _scan_intel_migrate_tables()
+    since_ts = float(time.time()) - (float(days) * 86400.0)
+    out_ctr = Counter()
+    reason_ctr = Counter()
+    session_ctr = Counter()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                "SELECT session, bucket, outcome, reject_reason FROM market_scan_symbols WHERE evaluated=1 AND created_ts>=?",
+                (since_ts,),
+            ).fetchall() or []
+        for r in rows:
+            outcome = str(r["outcome"] or "")
+            rr = str(r["reject_reason"] or "")
+            sess = str(r["session"] or "")
+            if outcome:
+                out_ctr[outcome] += 1
+            if outcome.startswith("missed") and rr:
+                reason_ctr[rr] += 1
+            if outcome.startswith("missed") and sess:
+                session_ctr[sess] += 1
+    except Exception:
+        pass
+    return {
+        "counts": dict(out_ctr),
+        "top_missed_reasons": reason_ctr.most_common(6),
+        "top_missed_sessions": session_ctr.most_common(3),
+    }
+
+def _scan_intel_safe_adjust(summary: dict) -> list[dict]:
+    actions = []
+    if not summary:
+        return actions
+    missed_total = int(summary.get("counts", {}).get("missed_but_good", 0) or 0) + int(summary.get("counts", {}).get("missed_due_to_over_filtering", 0) or 0)
+    if missed_total < int(SCAN_INTELLIGENCE_MIN_MISSED_GOOD):
+        return actions
+
+    cfg = load_strategy_config(force=True)
+    bounds = cfg.get("opt_bounds") or {}
+    now = float(time.time())
+    last_ts = float((_evolution_state_get("scan_intel_last_adjustment", {}) or {}).get("ts", 0.0) or 0.0)
+    if (now - last_ts) < float(SCAN_INTELLIGENCE_AUTO_APPLY_COOLDOWN_HOURS) * 3600.0:
+        return actions
+
+    top_reason = str((summary.get("top_missed_reasons") or [["", 0]])[0][0] or "")
+    if top_reason in {"ch1_below_trigger", "no_breakout_trigger", "below_min_confidence"}:
+        lo, hi = (bounds.get("quality_score_min_screen") or [52.0, 70.0])
+        old = float(cfg.get("quality_score_min_screen", QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
+        new = _clamp(old - 1.0, float(lo), float(hi))
+        if new < old:
+            cfg["quality_score_min_screen"] = float(new)
+            actions.append({"param": "quality_score_min_screen", "from": old, "to": new, "reason": top_reason})
+
+    if actions:
+        save_strategy_config(cfg)
+        apply_strategy_config(cfg)
+        _evolution_state_set("scan_intel_last_adjustment", {"ts": now, "actions": actions, "summary": summary})
+        try:
+            _evolution_insert_recommendation(
+                "scan_intelligence",
+                "Auto-adjustment: slightly loosened screen quality after repeated snapshot-based evidence of missed but tradeable movers.",
+                {"summary": summary, "actions": actions},
+                0.66,
+                auto_applied=True,
+                action=actions[0],
+                status="APPLIED",
+            )
+        except Exception:
+            pass
+    return actions
+
+def _scan_intel_evaluate_pending() -> dict:
+    _scan_intel_migrate_tables()
+    cutoff_ts = float(time.time()) - (float(SCAN_INTELLIGENCE_HORIZON_HOURS) * 3600.0)
+    evaluated = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                "SELECT id, snap_id, session, symbol, bucket, side, entry, created_ts, reject_reason FROM market_scan_symbols WHERE evaluated=0 AND created_ts<=? ORDER BY created_ts ASC LIMIT 120",
+                (cutoff_ts,),
+            ).fetchall() or []
+        for r in rows:
+            mfe, mae, status, note = _scan_intel_eval_one(str(r["symbol"] or ""), str(r["side"] or "BUY"), float(r["entry"] or 0.0), float(r["created_ts"] or 0.0))
+            outcome = _scan_intel_classify(str(r["bucket"] or ""), mfe, mae, str(r["reject_reason"] or "")) if status == "ok" else status
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    c = conn.cursor()
+                    c.execute(
+                        "UPDATE market_scan_symbols SET evaluated=1, evaluated_ts=?, mfe_pct=?, mae_pct=?, outcome=?, note=? WHERE id=?",
+                        (float(time.time()), float(mfe), float(mae), str(outcome), str(note or ""), int(r["id"])),
+                    )
+                    conn.commit()
+                evaluated += 1
+            except Exception:
+                pass
+        # refresh snapshot-level summaries
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                snap_ids = [str(r["snap_id"]) for r in rows]
+                for snap_id in sorted(set(snap_ids)):
+                    sr = c.execute("SELECT outcome, COUNT(1) AS n FROM market_scan_symbols WHERE snap_id=? AND evaluated=1 GROUP BY outcome", (snap_id,)).fetchall() or []
+                    outcome_summary = {str(x[0] or ""): int(x[1] or 0) for x in sr}
+                    c.execute("UPDATE market_scan_snapshots SET outcome_summary_json=? WHERE snap_id=?", (_json_dumps_safe(outcome_summary), snap_id))
+                conn.commit()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    summary = _scan_intel_summarize_recent(days=14)
+    actions = _scan_intel_safe_adjust(summary)
+    _evolution_state_set("scan_intel_summary", {"ts": time.time(), "summary": summary, "actions": actions, "evaluated": evaluated})
+    return {"evaluated": evaluated, "summary": summary, "actions": actions}
+
+def _scan_intel_summary_cached() -> dict:
+    snap = _evolution_state_get("scan_intel_summary", {}) or {}
+    if snap:
+        return snap
+    summary = _scan_intel_summarize_recent(days=14)
+    snap = {"ts": time.time(), "summary": summary, "actions": [], "evaluated": 0}
+    _evolution_state_set("scan_intel_summary", snap)
+    return snap
+
+async def scan_intelligence_job(context: ContextTypes.DEFAULT_TYPE):
+    if not SCAN_INTELLIGENCE_ENABLED:
+        return
+    try:
+        best_fut = await to_thread_heavy(fetch_futures_tickers)
+        if not best_fut:
+            return
+        session = _guess_session_name_utc(datetime.now(timezone.utc))
+        pool = await build_priority_pool(best_fut, session, mode="screen", scan_profile=DEFAULT_SCAN_PROFILE, uid=None)
+        try:
+            rej_ctx = _REJECT_CTX.get() if isinstance(_REJECT_CTX.get(), dict) else None
+        except Exception:
+            rej_ctx = None
+        await to_thread_fast(_scan_intel_capture_snapshot, best_fut, session, pool, rej_ctx, "screen")
+        await to_thread_fast(_scan_intel_evaluate_pending)
+    except Exception:
+        pass
 
 def _utc_day_str(ts: float | None = None) -> str:
     try:
@@ -11273,7 +11664,8 @@ def pick_setups(
     _REJECT_STATS = Counter()
     _REJECT_SAMPLES = {}
     _REJECT_BY_SYMBOL = {}
-    _WAITING_TRIGGER = {}
+    # _WAITING_TRIGGER is cleared once per scan inside build_priority_pool().
+    # Do not reset it here, otherwise later passes erase earlier near-miss symbols.
 
     universe_n = int(max(10, universe_n))
     universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:universe_n]
@@ -12613,7 +13005,7 @@ Advanced setup quality is now enforced inside the live engine:
 • System health (DB, exchange, email)
 
 /edge_status
-• Main evolution dashboard: learning active, cycle times, performance trend, recommendations
+• Main evolution dashboard: learning active, cycle times, performance trend, missed-opportunity patterns, snapshot intelligence
 
 /optimizer_status
 /learning_status
@@ -12636,6 +13028,7 @@ Advanced setup quality is now enforced inside the live engine:
 • New parameters go live only after internal walk-forward and OOS validation pass.
 • Bad candidate parameter sets are rejected or reverted automatically.
 • Use /edge_status as the main admin health/evolution command.
+• Snapshot intelligence now captures repeated scan states automatically and evaluates missed movers after the horizon window.
 
 """\
 
@@ -14996,11 +15389,16 @@ def _subset_best(best_fut: dict, bases: list) -> dict:
     s = set([str(b).upper() for b in (bases or [])])
     return {k: v for k, v in (best_fut or {}).items() if str(k).upper() in s}
 
-def _market_leader_bases(best_fut: dict, n: int) -> list: 
-    
+def _market_leader_bases(best_fut: dict, n: int) -> list:
+    """Top market leaders by true futures USD notional.
+
+    IMPORTANT:
+    MarketVol does not expose `fut_vol_usd`, so using getattr(..., "fut_vol_usd")
+    silently returns 0 and breaks the fallback market-leader universe.
+    """
     try:
         items = [(b, mv) for b, mv in (best_fut or {}).items()]
-        items = sorted(items, key=lambda x: float(getattr(x[1], "fut_vol_usd", 0.0) or 0.0), reverse=True)
+        items = sorted(items, key=lambda x: float(usd_notional(x[1]) or 0.0), reverse=True)
         return [str(b).upper() for b, _ in items[:n]]
     except Exception:
         return []
@@ -16251,7 +16649,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         strict_15m = True
         universe_cap = int(max(SCREEN_UNIVERSE_N, 35))
         # Ensure /screen is not stricter than email engine
-        trigger_loosen = float(max(SCREEN_TRIGGER_LOOSEN, 1.0))
+        trigger_loosen = float(min(SCREEN_TRIGGER_LOOSEN, 1.0))
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
         allow_no_pullback = True
         scan_multiplier = 10
@@ -19810,6 +20208,19 @@ def main():
                     "max_instances": 1,
                     "coalesce": True,
                     "misfire_grace_time": 600,
+                },
+            )
+
+        if SCAN_INTELLIGENCE_ENABLED:
+            app.job_queue.run_repeating(
+                scan_intelligence_job,
+                interval=max(3600, int(SCAN_INTELLIGENCE_INTERVAL_MIN * 60)),
+                first=150,
+                name="scan_intelligence_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 300,
                 },
             )
     else:
