@@ -1838,11 +1838,27 @@ def _tz_melbourne():
     except Exception:
         return timezone.utc
 
+def _parse_iso_utcish(iso_s: str) -> Optional[datetime]:
+    """Parse ISO text and treat naive timestamps as UTC."""
+    if not iso_s:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso_s).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
 def _dt_local(dt: datetime) -> datetime:
     try:
+        if getattr(dt, "tzinfo", None) is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(_tz_melbourne())
     except Exception:
         return dt
+
 
 def _fmt_dt_local(dt: datetime, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
     try:
@@ -1853,15 +1869,15 @@ def _fmt_dt_local(dt: datetime, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
         except Exception:
             return str(dt)
 
+
 def _fmt_iso_to_local(iso_s: str) -> str:
     """Convert ISO string (UTC or with tz) to Melbourne local display."""
     if not iso_s:
         return ""
-    try:
-        dt = datetime.fromisoformat(str(iso_s).replace("Z", "+00:00"))
-        return _fmt_dt_local(dt)
-    except Exception:
+    dt = _parse_iso_utcish(str(iso_s))
+    if dt is None:
         return str(iso_s)
+    return _fmt_dt_local(dt)
 
 def _ms_to_local_str(ms: int | str | None) -> str:
     try:
@@ -3740,6 +3756,22 @@ def _fmt_float_or_blank(v, decimals: int = 10) -> str:
         return f"{f:.{decimals}g}"
     except Exception:
         return ""
+
+
+def _autotrade_price_str(v) -> str:
+    try:
+        return fmt_price(float(v))
+    except Exception:
+        s = _fmt_float_or_blank(v, decimals=10)
+        return s or "—"
+
+
+def _autotrade_same_price(a, b, rel_tol: float = 1e-9, abs_tol: float = 1e-9) -> bool:
+    try:
+        return math.isclose(float(a), float(b), rel_tol=float(rel_tol), abs_tol=float(abs_tol))
+    except Exception:
+        return False
+
 
 def _latest_emailed_setup_summary(uid: int, lookback_hours: int = 24) -> dict:
     try:
@@ -13189,13 +13221,6 @@ Admin day boundary is fixed to the Asia-session start (00:00 UTC) for all autotr
 /open_trades
 • Show live open Bybit positions (admin, same live source as /status)
 
-Advanced setup quality is now enforced inside the live engine:
-• market structure + 4H/1H alignment + sweep/momentum confirmation
-• 5m alignment is intentionally NOT used as a hard gate (too noisy)
-• ranging-regime block for weak momentum setups
-• dynamic risk sizing scales AutoTrade size by quality/regime
-• confidence boost/penalty from advanced confirmations
-
 /ai_strategy_report
 • Review recent bot trade performance and recommendations
 
@@ -13204,9 +13229,6 @@ Advanced setup quality is now enforced inside the live engine:
 
 /signal_report_overall
 • Overall signal performance summary
-
-/signal_report_all
-• Alias of /signal_report_overall
 
 ────────────────────
 ⏱️ COOLDOWNS
@@ -13243,9 +13265,6 @@ Advanced setup quality is now enforced inside the live engine:
 
 /health_sys
 • Engine health + pipeline heartbeat (DB, market data, email, autotrade, learning, optimization)
-
-/engine_health
-• Alias of /health_sys
 
 /edge_status
 • Main evolution dashboard: learning active, cycle times, performance trend, missed-opportunity patterns, snapshot intelligence
@@ -16331,7 +16350,6 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Show last autotrade attempt details (admin only)."""
     uid = update.effective_user.id
 
-    # Use the bot's canonical admin check (avoid undefined is_admin())
     if not is_admin_user(uid):
         await update.message.reply_text("⛔️ Admin only.")
         return
@@ -16340,19 +16358,10 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
     dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
 
-    # Melbourne time for readability
-    when_utc = str(det.get("when") or dec.get("when") or "")
-    when_m = when_utc
-    try:
-        if when_utc:
-            dt = datetime.fromisoformat(when_utc.replace("Z", "+00:00"))
-            when_m = dt.astimezone(ZoneInfo("Australia/Melbourne")).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        pass
+    when_raw = str(det.get("when") or dec.get("when") or "")
+    when_m = _fmt_iso_to_local(when_raw) if when_raw else "—"
 
-    lines = []
-    lines.append("*AutoTrade — Last Attempt*")
-    lines.append(HDR)
+    lines = ["*AutoTrade — Last Attempt*", HDR]
     if not det and not dec:
         lines.append("No attempts recorded yet.")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -16361,24 +16370,43 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines.append(f"*When (Melbourne):* `{when_m}`")
     if dec:
         lines.append(f"*Decision:* `{dec.get('status','')}` — `{dec.get('reason','')}`")
+
     if det:
-        lines.append(f"*Symbol:* `{det.get('symbol_sent','')}`  (raw: `{det.get('symbol_raw','')}`)")
-        lines.append(f"*Side:* `{det.get('side','')}`")
-        lines.append(f"*Entry used for sizing:* `{det.get('entry','')}`  *SL used:* `{det.get('sl','')}`")
-        if det.get('setup_entry') is not None:
-            lines.append(f"*Setup entry:* `{det.get('setup_entry')}`  *Raw setup SL:* `{det.get('setup_sl_raw')}`")
+        symbol_sent = str(det.get('symbol_sent','') or '')
+        symbol_raw = str(det.get('symbol_raw','') or '')
+        if symbol_sent and symbol_raw and symbol_sent != symbol_raw:
+            lines.append(f"*Symbol:* `{symbol_sent}`  (raw: `{symbol_raw}`)")
+        elif symbol_sent:
+            lines.append(f"*Symbol:* `{symbol_sent}`")
+        elif symbol_raw:
+            lines.append(f"*Symbol:* `{symbol_raw}`")
+
+        if det.get('side'):
+            lines.append(f"*Side:* `{det.get('side','')}`")
+
+        used_entry = det.get('entry')
+        used_sl = det.get('sl')
+        lines.append(f"*Entry / SL used:* `{_autotrade_price_str(used_entry)}` / `{_autotrade_price_str(used_sl)}`")
+
+        setup_entry = det.get('setup_entry')
+        setup_sl = det.get('setup_sl_raw')
+        if (setup_entry is not None and not _autotrade_same_price(setup_entry, used_entry)) or (setup_sl is not None and not _autotrade_same_price(setup_sl, used_sl)):
+            lines.append(f"*Original setup Entry / SL:* `{_autotrade_price_str(setup_entry)}` / `{_autotrade_price_str(setup_sl)}`")
+
         if det.get('setup_id'):
             lines.append(f"*Setup ID:* `{det.get('setup_id')}`")
         if det.get('source_kind') or det.get('source_session'):
             lines.append(f"*Source:* `{det.get('source_kind','')}`  *Logged session:* `{det.get('source_session','')}`")
+
         if det.get('signal_created_time'):
-            lines.append(f"*Signal created (UTC):* `{det.get('signal_created_time')}`")
+            lines.append(f"*Signal created (Melbourne):* `{_fmt_iso_to_local(det.get('signal_created_time'))}`")
         if det.get('email_logged_time'):
-            lines.append(f"*Email logged (UTC):* `{det.get('email_logged_time')}`")
+            lines.append(f"*Email logged (Melbourne):* `{_fmt_iso_to_local(det.get('email_logged_time'))}`")
         elif det.get('generated_logged_time'):
-            lines.append(f"*Generated logged (UTC):* `{det.get('generated_logged_time')}`")
+            lines.append(f"*Generated logged (Melbourne):* `{_fmt_iso_to_local(det.get('generated_logged_time'))}`")
         if det.get('entry_deadline'):
-            lines.append(f"*Entry deadline (UTC):* `{det.get('entry_deadline')}`")
+            lines.append(f"*Entry deadline (Melbourne):* `{_fmt_iso_to_local(det.get('entry_deadline'))}`")
+
         risk_base = det.get("risk_base_usd")
         risk_eff = det.get("risk_effective_usd")
         risk_mult = det.get("risk_multiplier")
@@ -16398,7 +16426,7 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             elif risk_regime:
                 lines.append(f"*Regime:* `{risk_regime}`")
             if det.get('stop_distance') is not None:
-                lines.append(f"*Stop distance:* `{float(det.get('stop_distance')):.10g}`")
+                lines.append(f"*Stop distance:* `{_autotrade_price_str(det.get('stop_distance'))}`")
             if qty_from_risk is not None:
                 lines.append(f"*Raw qty:* `{float(qty_from_risk):.8g}`")
             if det.get('rounded_qty') is not None:
@@ -19284,10 +19312,6 @@ async def why_no_setups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # /health (transparent system health)
 # =========================================================
-async def engine_health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await health_sys_cmd(update, context)
-
-
 async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Transparent health check:
@@ -19424,7 +19448,7 @@ async def _post_init(app: Application):
             BotCommand("support_status", "Check your latest support ticket"),
 
             BotCommand("health", "Bot & data health check"),
-            BotCommand("engine_health", "Admin engine health"),
+            BotCommand("health_sys", "Admin engine health"),
 
             BotCommand("billing", "Subscription & payment info"),
         ]
@@ -20405,12 +20429,10 @@ def main():
     app.add_handler(CommandHandler("signal_report", signal_report_cmd, block=False))
     app.add_handler(CommandHandler("signbal_report", signal_report_cmd, block=False))
     app.add_handler(CommandHandler("signal_report_overall", signal_report_overall_cmd, block=False))
-    app.add_handler(CommandHandler("signal_report_all", signal_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("health", health_cmd, block=False))
     app.add_handler(CommandHandler("reset", reset_cmd, block=False))
     app.add_handler(CommandHandler("restore", restore_cmd, block=False))
     app.add_handler(CommandHandler("health_sys", health_sys_cmd, block=False))
-    app.add_handler(CommandHandler("engine_health", engine_health_cmd, block=False))
     app.add_handler(CommandHandler("billing", billing_cmd, block=False))
     app.add_handler(CommandHandler("email_on_off", email_on_off_cmd, block=False))
     app.add_handler(CommandHandler("upgrade", upgrade_cmd, block=False))
