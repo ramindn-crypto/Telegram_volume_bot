@@ -1873,13 +1873,55 @@ def _fmt_dt_local(dt: datetime, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
 
 
 def _fmt_iso_to_local(iso_s: str) -> str:
-    """Convert ISO string (UTC or with tz) to Melbourne local display."""
+    """Convert ISO string (UTC or with tz) to Melbourne local display.
+
+    Safety rules:
+    - timezone-aware values are converted exactly once
+    - naive ISO strings are treated as UTC legacy values
+    - epoch-looking strings are interpreted as UTC epoch seconds/ms
+    """
     if not iso_s:
         return ""
-    dt = _parse_iso_utcish(str(iso_s))
+    try:
+        raw = str(iso_s).strip()
+    except Exception:
+        raw = ""
+    if not raw:
+        return ""
+    try:
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", raw):
+            num = float(raw)
+            if abs(num) >= 1_000_000_000_000:
+                dt = datetime.fromtimestamp(num / 1000.0, tz=timezone.utc)
+            else:
+                dt = datetime.fromtimestamp(num, tz=timezone.utc)
+            return _fmt_dt_local(dt)
+    except Exception:
+        pass
+    dt = _parse_iso_utcish(raw)
     if dt is None:
-        return str(iso_s)
+        return raw
     return _fmt_dt_local(dt)
+
+def _epoch_to_iso_utc(ts: float | int | None) -> str:
+    try:
+        val = float(ts or 0.0)
+        if val <= 0:
+            return ""
+        return datetime.fromtimestamp(val, tz=timezone.utc).isoformat(timespec="seconds")
+    except Exception:
+        return ""
+
+def _canonical_setup_ts(signal_created_ts: float | int | None = None, email_logged_ts: float | int | None = None, generated_logged_ts: float | int | None = None) -> tuple[float, str]:
+    """Choose one canonical timestamp for autotrade expiry."""
+    for name, val in (("signal_created_ts", signal_created_ts), ("email_logged_ts", email_logged_ts), ("generated_logged_ts", generated_logged_ts)):
+        try:
+            f = float(val or 0.0)
+        except Exception:
+            f = 0.0
+        if f > 0:
+            return f, name
+    return 0.0, ""
 
 def _ms_to_local_str(ms: int | str | None) -> str:
     try:
@@ -2692,7 +2734,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     aux_ts_f = float(aux_ts or 0.0)
                 except Exception:
                     aux_ts_f = 0.0
-                canonical_ts = max(chosen_ts_f, signal_created_ts, aux_ts_f)
+                canonical_ts, canonical_ts_source = _canonical_setup_ts(signal_created_ts=signal_created_ts, email_logged_ts=(chosen_ts_f if source_kind == 'emailed_setups' else 0.0), generated_logged_ts=(aux_ts_f if source_kind == 'emailed_setups' else chosen_ts_f))
                 out.append(SimpleNamespace(
                     setup_id=setup_id,
                     id=setup_id,
@@ -2705,6 +2747,8 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     tp2=tp2,
                     tp3=tp3,
                     created_ts=float(canonical_ts or 0.0),
+                    canonical_setup_ts=float(canonical_ts or 0.0),
+                    canonical_ts_source=str(canonical_ts_source or ''),
                     signal_created_ts=float(signal_created_ts or 0.0),
                     email_logged_ts=float(chosen_ts_f or 0.0) if source_kind == 'emailed_setups' else 0.0,
                     generated_logged_ts=float(aux_ts_f or 0.0) if source_kind == 'emailed_setups' else float(chosen_ts_f or 0.0),
@@ -2856,6 +2900,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'sl_source': 'setup',
             'setup_entry': intended_entry,
             'setup_sl_raw': intended_sl,
+            'attempted_for_execution': True,
+            'emailed_to_user': bool(float(getattr(s, 'email_logged_ts', 0.0) or 0.0) > 0),
         }
     except Exception:
         pass
@@ -2864,20 +2910,30 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         _signal_ts = float(getattr(s, 'signal_created_ts', 0.0) or 0.0)
         _email_ts = float(getattr(s, 'email_logged_ts', 0.0) or 0.0)
         _generated_ts = float(getattr(s, 'generated_logged_ts', 0.0) or 0.0)
-        _cts = float(getattr(s, 'created_ts', 0.0) or 0.0)
-        _canonical_ts = max(_cts, _email_ts, _generated_ts, _signal_ts)
+        _canonical_ts = float(getattr(s, 'canonical_setup_ts', 0.0) or 0.0)
+        _canonical_source = str(getattr(s, 'canonical_ts_source', '') or '')
+        if _canonical_ts <= 0:
+            _canonical_ts, _canonical_source = _canonical_setup_ts(_signal_ts, _email_ts, _generated_ts)
         _setup_dt = datetime.fromtimestamp(_canonical_ts, tz=timezone.utc) if _canonical_ts > 0 else datetime.now(timezone.utc)
         _deadline_dt = _setup_dt + timedelta(minutes=AUTOTRADE_ENTRY_WINDOW_MIN)
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
             'setup_time': _setup_dt.isoformat(timespec='seconds'),
+            'canonical_setup_time': _setup_dt.isoformat(timespec='seconds'),
+            'canonical_setup_ts_num': float(_canonical_ts or 0.0),
+            'canonical_ts_source': _canonical_source,
             'entry_deadline': _deadline_dt.isoformat(timespec='seconds'),
-            'signal_created_time': datetime.fromtimestamp(_signal_ts, tz=timezone.utc).isoformat(timespec='seconds') if _signal_ts > 0 else '',
-            'email_logged_time': datetime.fromtimestamp(_email_ts, tz=timezone.utc).isoformat(timespec='seconds') if _email_ts > 0 else '',
-            'generated_logged_time': datetime.fromtimestamp(_generated_ts, tz=timezone.utc).isoformat(timespec='seconds') if _generated_ts > 0 else '',
+            'entry_deadline_ts_num': float(_deadline_dt.timestamp()),
+            'signal_created_ts_num': float(_signal_ts or 0.0),
+            'email_logged_ts_num': float(_email_ts or 0.0),
+            'generated_logged_ts_num': float(_generated_ts or 0.0),
+            'signal_created_time': _epoch_to_iso_utc(_signal_ts),
+            'email_logged_time': _epoch_to_iso_utc(_email_ts),
+            'generated_logged_time': _epoch_to_iso_utc(_generated_ts),
             'source_kind': str(getattr(s, 'source_kind', '') or ''),
             'source_session': str(getattr(s, 'source_session', '') or ''),
         })
         if datetime.now(timezone.utc) > _deadline_dt:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'setup_expired'})
             return (False, 'setup_expired')
     except Exception:
         pass
@@ -3988,6 +4044,69 @@ def _latest_emailed_setup_summary(uid: int, lookback_hours: int = 24) -> dict:
             "source_kind": str(getattr(s, "source_kind", "") or ""),
             "source_session": str(getattr(s, "source_session", "") or ""),
         }
+    except Exception:
+        return {}
+
+def _autotrade_attempts_migrate_table() -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid INTEGER NOT NULL,
+                attempt_ts REAL NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                setup_id TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                source_kind TEXT NOT NULL DEFAULT '',
+                source_session TEXT NOT NULL DEFAULT '',
+                signal_created_ts REAL NOT NULL DEFAULT 0,
+                email_logged_ts REAL NOT NULL DEFAULT 0,
+                generated_logged_ts REAL NOT NULL DEFAULT 0,
+                canonical_setup_ts REAL NOT NULL DEFAULT 0,
+                canonical_ts_source TEXT NOT NULL DEFAULT '',
+                entry_deadline_ts REAL NOT NULL DEFAULT 0,
+                detail_json TEXT NOT NULL DEFAULT '',
+                attempted_candidates_json TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_autotrade_attempts_uid_ts ON autotrade_attempts(uid, attempt_ts DESC)")
+            conn.commit()
+    except Exception:
+        pass
+
+def _autotrade_attempt_log_insert(uid: int, session_label: str, status: str, reason: str, detail: dict | None = None, attempted_candidates: list | None = None) -> None:
+    _autotrade_attempts_migrate_table()
+    det = dict(detail or {})
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""INSERT INTO autotrade_attempts (uid, attempt_ts, session, status, reason, setup_id, symbol, side, source_kind, source_session, signal_created_ts, email_logged_ts, generated_logged_ts, canonical_setup_ts, canonical_ts_source, entry_deadline_ts, detail_json, attempted_candidates_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (int(uid), float(time.time()), str(session_label or ''), str(status or ''), str(reason or ''), str(det.get('setup_id', '') or ''), str(det.get('symbol_sent') or det.get('symbol_raw') or ''), str(det.get('side', '') or ''), str(det.get('source_kind', '') or ''), str(det.get('source_session', '') or ''), float(det.get('signal_created_ts_num', 0.0) or 0.0), float(det.get('email_logged_ts_num', 0.0) or 0.0), float(det.get('generated_logged_ts_num', 0.0) or 0.0), float(det.get('canonical_setup_ts_num', 0.0) or 0.0), str(det.get('canonical_ts_source', '') or ''), float(det.get('entry_deadline_ts_num', 0.0) or 0.0), json.dumps(det, ensure_ascii=False, sort_keys=True), json.dumps(list(attempted_candidates or []), ensure_ascii=False, sort_keys=True)))
+            conn.commit()
+    except Exception:
+        pass
+
+def _autotrade_attempt_log_latest(uid: int) -> dict:
+    _autotrade_attempts_migrate_table()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            row = c.execute("SELECT * FROM autotrade_attempts WHERE uid=? ORDER BY attempt_ts DESC, id DESC LIMIT 1", (int(uid),)).fetchone()
+            if not row:
+                return {}
+            out = dict(row)
+            try:
+                out['detail'] = json.loads(out.get('detail_json') or '{}')
+            except Exception:
+                out['detail'] = {}
+            try:
+                out['attempted_candidates'] = json.loads(out.get('attempted_candidates_json') or '[]')
+            except Exception:
+                out['attempted_candidates'] = []
+            return out
     except Exception:
         return {}
 
@@ -16402,21 +16521,25 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     owner = int(AUTOTRADE_OWNER_UID or 0)
-    det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
-    dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
+    db_attempt = _autotrade_attempt_log_latest(owner) or {}
+    det = dict((db_attempt.get('detail') or {}) or (_LAST_AUTOTRADE_DETAIL.get(owner) or {}))
+    dec = dict(_LAST_AUTOTRADE_DECISION.get(owner) or {})
+    latest_sig = _latest_emailed_setup_summary(owner, lookback_hours=24)
 
-    when_raw = str(det.get("when") or dec.get("when") or "")
+    when_raw = str(det.get("when") or dec.get("when") or _epoch_to_iso_utc(db_attempt.get('attempt_ts')) or "")
     when_m = _fmt_iso_to_local(when_raw) if when_raw else "—"
 
     lines = ["*AutoTrade — Last Attempt*", HDR]
-    if not det and not dec:
+    if not det and not dec and not latest_sig:
         lines.append("No attempts recorded yet.")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
 
     lines.append(f"*When (Melbourne):* `{when_m}`")
-    if dec:
-        lines.append(f"*Decision:* `{dec.get('status','')}` — `{dec.get('reason','')}`")
+    status = str((db_attempt.get('status') or dec.get('status') or '')).strip()
+    reason = str((db_attempt.get('reason') or dec.get('reason') or det.get('reject_reason') or '')).strip()
+    if status or reason:
+        lines.append(f"*Decision:* `{status or '—'}` — `{reason or '—'}`")
 
     if det:
         symbol_sent = str(det.get('symbol_sent','') or '')
@@ -16427,24 +16550,29 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             lines.append(f"*Symbol:* `{symbol_sent}`")
         elif symbol_raw:
             lines.append(f"*Symbol:* `{symbol_raw}`")
-
         if det.get('side'):
             lines.append(f"*Side:* `{det.get('side','')}`")
-
+        if det.get('setup_id'):
+            lines.append(f"*Setup ID:* `{det.get('setup_id')}`")
+        if det.get('source_kind') or det.get('source_session'):
+            src_line = f"*Source:* `{det.get('source_kind','') or '—'}`"
+            if det.get('source_session'):
+                src_line += f"  *Logged session:* `{det.get('source_session','')}`"
+            lines.append(src_line)
+        lines.append(f"*Emailed to user:* `{'yes' if det.get('emailed_to_user') or det.get('email_logged_ts_num') else 'no'}`")
+        lines.append(f"*Execution attempted:* `{'yes' if det.get('attempted_for_execution', True) else 'no'}`")
         used_entry = det.get('entry')
         used_sl = det.get('sl')
-        lines.append(f"*Entry / SL used:* `{_autotrade_price_str(used_entry)}` / `{_autotrade_price_str(used_sl)}`")
-
+        if used_entry is not None or used_sl is not None:
+            lines.append(f"*Entry / SL used:* `{_autotrade_price_str(used_entry)}` / `{_autotrade_price_str(used_sl)}`")
         setup_entry = det.get('setup_entry')
         setup_sl = det.get('setup_sl_raw')
         if (setup_entry is not None and not _autotrade_same_price(setup_entry, used_entry)) or (setup_sl is not None and not _autotrade_same_price(setup_sl, used_sl)):
             lines.append(f"*Original setup Entry / SL:* `{_autotrade_price_str(setup_entry)}` / `{_autotrade_price_str(setup_sl)}`")
-
-        if det.get('setup_id'):
-            lines.append(f"*Setup ID:* `{det.get('setup_id')}`")
-        if det.get('source_kind') or det.get('source_session'):
-            lines.append(f"*Source:* `{det.get('source_kind','')}`  *Logged session:* `{det.get('source_session','')}`")
-
+        canonical_time = det.get('canonical_setup_time') or det.get('setup_time') or _epoch_to_iso_utc(det.get('canonical_setup_ts_num'))
+        canonical_source = str(det.get('canonical_ts_source','') or '')
+        if canonical_time:
+            lines.append(f"*Canonical setup time (Melbourne):* `{_fmt_iso_to_local(canonical_time)}`" + (f"  *Source:* `{canonical_source}`" if canonical_source else ""))
         if det.get('signal_created_time'):
             lines.append(f"*Signal created (Melbourne):* `{_fmt_iso_to_local(det.get('signal_created_time'))}`")
         if det.get('email_logged_time'):
@@ -16453,50 +16581,21 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             lines.append(f"*Generated logged (Melbourne):* `{_fmt_iso_to_local(det.get('generated_logged_time'))}`")
         if det.get('entry_deadline'):
             lines.append(f"*Entry deadline (Melbourne):* `{_fmt_iso_to_local(det.get('entry_deadline'))}`")
-
-        risk_base = det.get("risk_base_usd")
-        risk_eff = det.get("risk_effective_usd")
-        risk_mult = det.get("risk_multiplier")
-        risk_regime = det.get("risk_regime")
-        qty_from_risk = det.get("qty_from_risk")
-
-        try:
-            if det.get('equity_used') is not None:
-                lines.append(f"*Equity used:* `${float(det.get('equity_used')):.2f}`")
-            if risk_base is not None:
-                lines.append(f"*Configured risk:* `${float(risk_base):.2f}` ({float(det.get('configured_risk_pct') or 0.0):.2f}%)")
-            if det.get('allowed_risk_usd') is not None:
-                lines.append(f"*Allowed risk after caps:* `${float(det.get('allowed_risk_usd')):.2f}` ({float(det.get('allowed_risk_pct') or 0.0):.2f}%)")
-            if risk_mult is not None and risk_eff is not None:
-                extra = f" | Regime: {risk_regime}" if risk_regime else ""
-                lines.append(f"*Dynamic risk engine:* `x{float(risk_mult):.2f} → ${float(risk_eff):.2f}`{extra}")
-            elif risk_regime:
-                lines.append(f"*Regime:* `{risk_regime}`")
-            if det.get('stop_distance') is not None:
-                lines.append(f"*Stop distance:* `{_autotrade_price_str(det.get('stop_distance'))}`")
-            if qty_from_risk is not None:
-                lines.append(f"*Raw qty:* `{float(qty_from_risk):.8g}`")
-            if det.get('rounded_qty') is not None:
-                lines.append(f"*Rounded qty:* `{float(det.get('rounded_qty')):.8g}`")
-            if det.get('risk_actual_usd') is not None:
-                lines.append(f"*Actual pre-fill risk:* `${float(det.get('risk_actual_usd')):.2f}` ({float(det.get('risk_actual_pct') or 0.0):.2f}%)")
-            if det.get('filled_risk_usd') is not None:
-                lines.append(f"*Actual post-fill risk:* `${float(det.get('filled_risk_usd')):.2f}` ({float(det.get('filled_risk_pct') or 0.0):.2f}%)")
-        except Exception:
-            pass
-
-        if det.get("qty_str") is not None:
-            lines.append(f"*Qty sent:* `{det.get('qty_str')}` (step {det.get('qty_step')}, min {det.get('min_qty')}, minNot {det.get('min_notional')})")
         if det.get('reject_reason'):
             lines.append(f"*Reject reason:* `{det.get('reject_reason')}`")
-        by = det.get("bybit") or {}
-        try:
-            rc = by.get("retCode")
-            rm = by.get("retMsg")
-            if rc is not None or rm:
-                lines.append(f"*Bybit:* retCode={rc} retMsg={rm}")
-        except Exception:
-            pass
+
+    if latest_sig:
+        latest_setup_id = str(latest_sig.get('setup_id') or '')
+        shown_setup_id = str(det.get('setup_id') or '')
+        if latest_setup_id and latest_setup_id != shown_setup_id:
+            lines.append(SEP)
+            lines.append("*Latest emailed setup in DB:*")
+            lines.append(f"`{latest_setup_id}` — `{latest_sig.get('side','')}` `{latest_sig.get('symbol','')}`")
+            if latest_sig.get('signal_created_ts'):
+                lines.append(f"*Latest signal created (Melbourne):* `{_fmt_iso_to_local(_epoch_to_iso_utc(latest_sig.get('signal_created_ts')) )}`")
+            if latest_sig.get('email_logged_ts'):
+                lines.append(f"*Latest email logged (Melbourne):* `{_fmt_iso_to_local(_epoch_to_iso_utc(latest_sig.get('email_logged_ts')) )}`")
+            lines.append("*Sync note:* `last attempted setup differs from latest emailed setup`")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -20213,6 +20312,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     "mode": AUTOTRADE_MODE,
                     "attempted_candidates": attempt_summaries,
                 }
+                _autotrade_attempt_log_insert(uid, sess, 'SKIP', 'no_setups', detail={}, attempted_candidates=attempt_summaries)
                 _hb_touch('autotrade', ok=True, details=f'no_setups sess={sess}')
                 return
 
@@ -20245,6 +20345,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 "attempted_candidates": attempt_summaries,
                 "latest_candidate": attempt_summaries[0] if attempt_summaries else {},
             }
+            _autotrade_attempt_log_insert(uid, sess, 'PLACED' if ok else 'SKIP', '' if ok else reason, detail=dict(_LAST_AUTOTRADE_DETAIL.get(uid) or {}), attempted_candidates=attempt_summaries)
             _hb_touch('autotrade', ok=True, details=f"status={'PLACED' if ok else 'SKIP'} reason={'' if ok else reason}")
 
     except Exception as e:
