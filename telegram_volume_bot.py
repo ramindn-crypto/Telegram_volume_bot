@@ -17471,12 +17471,35 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         except Exception:
             spike_warnings = []
 
-    # Store diagnostics for /why, then ALWAYS reset context
+    # Store diagnostics for /why and refresh scan heartbeat, then ALWAYS reset context
     try:
+        _rej_counts = {}
+        try:
+            _rej_counts = {
+                str(k): int(v)
+                for k, v in (_rej_ctx or {}).items()
+                if not str(k).startswith("__")
+            }
+        except Exception:
+            _rej_counts = {}
+
+        _hb_touch(
+            "screen",
+            ok=True,
+            details=(
+                f"scan_cycle_ok mode={str(mode or '').lower()} "
+                f"sess={str(session_name or '').upper()} "
+                f"universe={len(universe_bases or [])} "
+                f"setups={len(ordered or [])} "
+                f"rejects={len(_rej_counts)}"
+            ),
+        )
+
         if uid is not None:
             _LAST_REJECTS[int(uid)] = {
                 "ts": time.time(),
                 "allow": list(_rej_ctx.get("__allow__") or []),
+                "counts": dict(_rej_counts),
                 "per_symbol": dict((_rej_ctx.get("__per__") or {})),
             }
     finally:
