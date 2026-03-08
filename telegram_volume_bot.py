@@ -18505,6 +18505,31 @@ _SMTP_CONN_TS = 0.0        # last-used timestamp
 async def _to_thread_with_timeout(fn, timeout_sec: int, *args, **kwargs):
     return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout_sec)
 
+def _run_coro_in_thread(coro):
+    """Run an awaitable inside a dedicated event loop in a worker thread.
+
+    Used when synchronous thread offloading needs the *result* of an async
+    function (for example build_priority_pool inside /screen or the email loop).
+    Keeps the main Telegram event loop non-blocking and avoids relying on any
+    ambient loop existing inside the worker thread.
+    """
+    if not inspect.isawaitable(coro):
+        return coro
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            asyncio.set_event_loop(None)
+            loop.close()
+
 async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
     """
     Runs send_email() in a worker thread with a hard timeout so SMTP/network stalls
