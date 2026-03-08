@@ -1992,23 +1992,19 @@ def _autotrade_realized_pnl_today(uid: int, now_utc: Optional[datetime] = None) 
 
 
 def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
-    """Compute authoritative AutoTrade day risk metrics.
+    """Compute authoritative AutoTrade day metrics using the admin Asia-session day.
 
-    Definition:
-    - open_risk: current estimated risk of OPEN positions (entry vs SL).
-    - realized_loss_today: absolute value of same-day realized losses from CLOSED journal trades.
-    - used_total: open_risk + realized_loss_today.
-    - remaining: daily_cap - used_total.
+    New accounting model:
+    - current_total_open_risk: risk on all currently open positions now
+    - current_day_open_risk: risk on positions opened inside the current admin day window
+    - carried_open_risk: risk inherited from positions opened before the current admin day
+    - daily_used_total: current_day_open_risk + realized_loss_today
+    - daily_remaining: daily_cap - daily_used_total
 
-    Notes:
-    - Unrealised/open PnL is never used to increase risk capacity.
-    - Realised profits do not increase daily headroom.
-    - In LIVE mode we read Bybit open positions and supplement missing-SL cases from the
-      bot journal conservatively.
-    - In PAPER mode we use the bot journal only.
+    Prior-day carried risk is shown explicitly but does NOT consume the *new* day cap again.
+    This keeps rollover behavior understandable while preserving visibility of true live exposure.
     """
     cap = 0.0
-    open_risk = 0.0
     open_pnl = 0.0
     realized_pnl_today = 0.0
     realized_loss_today = 0.0
@@ -2034,53 +2030,124 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         realized_pnl_today = 0.0
         realized_loss_today = 0.0
 
+    start_utc, end_utc = _admin_today_window_utc()
+    start_ts = float(start_utc.timestamp())
+    end_ts = float(end_utc.timestamp())
+
+    current_total_open_risk = 0.0
+    current_day_open_risk = 0.0
+    carried_open_risk = 0.0
+    open_positions_now = 0
+    inherited_open_positions = 0
+    opened_today_count = 0
+    closed_today_count = 0
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM autotrade_trades WHERE uid=? AND opened_ts>=? AND opened_ts<?",
+                (int(uid), int(start_ts), int(end_ts)),
+            )
+            row = cur.fetchone()
+            opened_today_count = int((row[0] if row else 0) or 0)
+            cur.execute(
+                "SELECT COUNT(*) FROM autotrade_trades WHERE uid=? AND closed_ts IS NOT NULL AND closed_ts>=? AND closed_ts<?",
+                (int(uid), int(start_ts), int(end_ts)),
+            )
+            row = cur.fetchone()
+            closed_today_count = int((row[0] if row else 0) or 0)
+    except Exception:
+        opened_today_count = 0
+        closed_today_count = 0
+
+    journal_open = []
+    try:
+        journal_open = _autotrade_db_open_trades(int(uid)) or []
+    except Exception:
+        journal_open = []
+
+    def _opened_ts_from_trade(t: dict) -> float:
+        try:
+            return float(t.get('opened_ts') or 0.0)
+        except Exception:
+            return 0.0
+
     if mode == "live":
         try:
             positions = _bybit_get_open_positions_linear()
-            open_pnl = float(sum(_pos_unreal_pnl(p) for p in positions) or 0.0)
-            open_risk = 0.0
-            for p in positions:
-                est = float(_estimate_position_risk_usd(p) or 0.0)
-                if est > 0:
-                    open_risk += est
-                    continue
-                try:
-                    psym = _pos_symbol(p)
-                    pside = _pos_side_text(p)
-                    matches = [t for t in _autotrade_db_open_trades(int(uid))
-                               if str(t.get('symbol') or '').upper() == str(psym).upper()
-                               and str(t.get('side') or '').upper() == str(pside).upper()]
-                    if matches:
-                        est = max(float(_autotrade_estimated_risk_usd(float(t.get('entry') or 0.0), float(t.get('sl') or 0.0), float(t.get('qty') or 0.0)) or 0.0) for t in matches)
-                        open_risk += max(0.0, est)
-                except Exception:
-                    pass
         except Exception:
-            open_risk = 0.0
-            open_pnl = 0.0
+            positions = []
+        open_positions_now = len(positions)
+        open_pnl = float(sum(_pos_unreal_pnl(p) for p in positions) or 0.0) if positions else 0.0
+
+        for p in positions:
+            est = float(_estimate_position_risk_usd(p) or 0.0)
+            opened_ts = 0.0
+            try:
+                psym = _pos_symbol(p)
+                pside = _pos_side_text(p)
+                matches = [t for t in journal_open
+                           if str(t.get('symbol') or '').upper() == str(psym).upper()
+                           and str(t.get('side') or '').upper() == str(pside).upper()]
+                if matches:
+                    best = max(matches, key=lambda t: _opened_ts_from_trade(t))
+                    opened_ts = _opened_ts_from_trade(best)
+                    if est <= 0:
+                        est = max(
+                            float(_autotrade_estimated_risk_usd(float(t.get('entry') or 0.0), float(t.get('sl') or 0.0), float(t.get('qty') or 0.0)) or 0.0)
+                            for t in matches
+                        )
+                if opened_ts <= 0:
+                    raw_ct = p.get('createdTime') or p.get('created_time') or 0
+                    if raw_ct:
+                        opened_ts = float(raw_ct) / 1000.0
+            except Exception:
+                pass
+            est = max(0.0, float(est or 0.0))
+            current_total_open_risk += est
+            if opened_ts and opened_ts < start_ts:
+                carried_open_risk += est
+                inherited_open_positions += 1
+            else:
+                current_day_open_risk += est
+        inherited_open_positions = min(int(inherited_open_positions), int(open_positions_now))
     else:
-        try:
-            open_risk = float(_autotrade_open_risk_usd(int(uid), float(equity)) or 0.0) if equity and equity > 0 else 0.0
-        except Exception:
-            open_risk = 0.0
+        open_positions_now = len(journal_open)
+        for t in journal_open:
+            est = max(0.0, float(_autotrade_estimated_risk_usd(float(t.get('entry') or 0.0), float(t.get('sl') or 0.0), float(t.get('qty') or 0.0)) or 0.0))
+            opened_ts = _opened_ts_from_trade(t)
+            current_total_open_risk += est
+            if opened_ts and opened_ts < start_ts:
+                carried_open_risk += est
+                inherited_open_positions += 1
+            else:
+                current_day_open_risk += est
         open_pnl = 0.0
 
-    used_total = max(0.0, float(open_risk) + float(realized_loss_today))
-    remaining_raw = float("inf") if cap <= 0 else (float(cap) - float(used_total))
-    over_by = 0.0
-    if cap > 0 and remaining_raw < 0:
-        over_by = abs(float(remaining_raw))
+    daily_used_total = max(0.0, float(current_day_open_risk) + float(realized_loss_today))
+    remaining_raw = float("inf") if cap <= 0 else (float(cap) - float(daily_used_total))
+    over_by = abs(float(remaining_raw)) if cap > 0 and remaining_raw < 0 else 0.0
 
     return {
         "cap": float(cap),
-        "open_risk": float(open_risk),
-        "used_risk": float(open_risk),  # backward-compatible alias for reports
-        "used_total": float(used_total),
+        "open_risk": float(current_total_open_risk),
+        "used_risk": float(current_day_open_risk),
+        "used_total": float(daily_used_total),
         "open_pnl": float(open_pnl),
         "realized_pnl_today": float(realized_pnl_today),
         "realized_loss_today": float(realized_loss_today),
         "remaining": float(remaining_raw),
         "over_by": float(over_by),
+        "current_total_open_risk": float(current_total_open_risk),
+        "current_day_open_risk": float(current_day_open_risk),
+        "carried_open_risk": float(carried_open_risk),
+        "open_positions_now": int(open_positions_now),
+        "inherited_open_positions": int(inherited_open_positions),
+        "opened_today_count": int(opened_today_count),
+        "closed_today_count": int(closed_today_count),
+        "day_start_ts": float(start_ts),
+        "day_end_ts": float(end_ts),
     }
 
 def _autotrade_user_settings(uid: int) -> dict:
@@ -5804,11 +5871,10 @@ def _day_local_for_ts(user: dict, ts: float) -> str:
     return start_local.date().isoformat()
 
 def _risk_used_today_from_open_trades(user_id: int, user: dict, day_local: str) -> float:
-    """Current open manual-trade risk consuming capacity *now*.
+    """Current-day open risk for manual trades.
 
-    Intentionally sums ALL currently open journal trades, regardless of when they were opened.
-    This keeps /status, /trade_rf, /trade_close, and daily-cap enforcement intuitive:
-    if risk is still open right now, it still consumes today's remaining capacity.
+    Only risk from positions opened inside the user's active day window is charged to the
+    current day cap. Older open positions are shown separately as carried exposure.
     """
     try:
         opens = db_open_trades(user_id) or []
@@ -5817,6 +5883,9 @@ def _risk_used_today_from_open_trades(user_id: int, user: dict, day_local: str) 
     total = 0.0
     for t in opens:
         try:
+            opened_ts = float(t.get("opened_ts") or 0.0)
+            if opened_ts > 0 and _day_local_for_ts(user, opened_ts) != str(day_local):
+                continue
             total += float(t.get("risk_usd") or 0.0)
         except Exception:
             continue
@@ -5944,6 +6013,58 @@ def _manual_trades_today_count(user_id: int, user: dict) -> int:
         return int(user.get("day_trade_count") or 0)
 
 
+def _manual_trades_closed_today_count(user_id: int, user: dict) -> int:
+    try:
+        start_local, end_local, _ = _user_today_window(user)
+        start_ts = float(start_local.timestamp())
+        end_ts = float(end_local.timestamp())
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM trades WHERE user_id=? AND closed_ts IS NOT NULL AND closed_ts>=? AND closed_ts<?",
+            (int(user_id), start_ts, end_ts),
+        )
+        row = cur.fetchone()
+        con.close()
+        return int((row[0] if row else 0) or 0)
+    except Exception:
+        return 0
+
+
+def _manual_position_metrics(user_id: int, user: dict) -> dict:
+    day_local = _user_day_local(user)
+    try:
+        opens = db_open_trades(user_id) or []
+    except Exception:
+        opens = []
+    total_open_risk = 0.0
+    current_day_open_risk = 0.0
+    carried_open_risk = 0.0
+    open_positions_now = len(opens)
+    inherited_open_positions = 0
+    for t in opens:
+        try:
+            risk = float(t.get('risk_usd') or 0.0)
+            total_open_risk += risk
+            opened_ts = float(t.get('opened_ts') or 0.0)
+            if opened_ts > 0 and _day_local_for_ts(user, opened_ts) != str(day_local):
+                carried_open_risk += risk
+                inherited_open_positions += 1
+            else:
+                current_day_open_risk += risk
+        except Exception:
+            continue
+    return {
+        'current_total_open_risk': float(max(0.0, total_open_risk)),
+        'current_day_open_risk': float(max(0.0, current_day_open_risk)),
+        'carried_open_risk': float(max(0.0, carried_open_risk)),
+        'open_positions_now': int(open_positions_now),
+        'inherited_open_positions': int(inherited_open_positions),
+        'opened_today_count': int(_manual_trades_today_count(user_id, user)),
+        'closed_today_count': int(_manual_trades_closed_today_count(user_id, user)),
+    }
+
+
 def _autotrade_trades_today_count(uid: int, now_utc: Optional[datetime] = None) -> int:
     try:
         start_utc, end_utc = _admin_today_window_utc(now_utc)
@@ -5972,6 +6093,14 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         "trades_today_limit": int(user.get("max_trades_day") or 0),
         "cap": 0.0,
         "open_risk_today": 0.0,
+        "current_day_open_risk": 0.0,
+        "carried_open_risk": 0.0,
+        "current_total_open_risk": 0.0,
+        "open_positions_now": 0,
+        "positions_opened_today": 0,
+        "positions_closed_today": 0,
+        "inherited_open_positions": 0,
+        "remaining_new_positions_today": 0,
         "realized_loss_today": 0.0,
         "used_today": 0.0,
         "remaining_today": float("inf"),
@@ -5994,30 +6123,55 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["today_window_label"] = f"{start_utc.strftime('%Y-%m-%d %H:%M')} → {end_utc.strftime('%Y-%m-%d %H:%M')} UTC"
         m = _autotrade_day_risk_metrics(int(uid), float(snap["equity"]))
         snap["cap"] = float(m.get("cap") or 0.0)
-        snap["open_risk_today"] = float(m.get("open_risk") or 0.0)
+        snap["current_total_open_risk"] = float(m.get("current_total_open_risk") or 0.0)
+        snap["open_risk_today"] = float(m.get("current_day_open_risk") or 0.0)
+        snap["current_day_open_risk"] = float(m.get("current_day_open_risk") or 0.0)
+        snap["carried_open_risk"] = float(m.get("carried_open_risk") or 0.0)
+        snap["open_positions_now"] = int(m.get("open_positions_now") or 0)
+        snap["positions_opened_today"] = int(m.get("opened_today_count") or 0)
+        snap["positions_closed_today"] = int(m.get("closed_today_count") or 0)
+        snap["inherited_open_positions"] = int(m.get("inherited_open_positions") or 0)
         snap["realized_loss_today"] = float(m.get("realized_loss_today") or 0.0)
         snap["used_today"] = float(m.get("used_total") or 0.0)
         rem = float(m.get("remaining")) if snap["cap"] > 0 else float("inf")
         snap["remaining_today"] = max(0.0, rem) if math.isfinite(rem) and snap["cap"] > 0 else rem
         snap["over_by"] = max(0.0, -rem) if math.isfinite(rem) and snap["cap"] > 0 else 0.0
         snap["pnl_today"] = float(m.get("realized_pnl_today") or 0.0)
-        snap["trades_today"] = _autotrade_trades_today_count(int(uid))
+        snap["trades_today"] = int(m.get("opened_today_count") or 0)
+        snap["trades_today_limit"] = 0
+        snap["remaining_new_positions_today"] = 0
     else:
         cap = float(daily_cap_usd(user) or 0.0)
         pnl_today = float(_pnl_today_closed_trades(uid, user) or 0.0)
-        open_risk_today = float(_risk_used_today_from_open_trades(uid, user, _user_day_local(user)) or 0.0)
-        used_today = float(max(0.0, open_risk_today + max(0.0, -pnl_today)))
+        pm = _manual_position_metrics(uid, user)
+        current_day_open_risk = float(pm.get('current_day_open_risk') or 0.0)
+        current_total_open_risk = float(pm.get('current_total_open_risk') or 0.0)
+        carried_open_risk = float(pm.get('carried_open_risk') or 0.0)
+        used_today = float(max(0.0, current_day_open_risk + max(0.0, -pnl_today)))
         remaining_raw = float("inf") if cap <= 0 else (cap - used_today)
         start_local, end_local, tz_name = _user_today_window(user)
+        opened_today = int(pm.get('opened_today_count') or 0)
+        closed_today = int(pm.get('closed_today_count') or 0)
+        open_now = int(pm.get('open_positions_now') or 0)
+        inherited_now = int(pm.get('inherited_open_positions') or 0)
+        trade_limit = int(user.get('max_trades_day') or 0)
         snap.update({
             "cap": cap,
-            "open_risk_today": open_risk_today,
+            "open_risk_today": current_day_open_risk,
+            "current_day_open_risk": current_day_open_risk,
+            "current_total_open_risk": current_total_open_risk,
+            "carried_open_risk": carried_open_risk,
+            "open_positions_now": open_now,
+            "positions_opened_today": opened_today,
+            "positions_closed_today": closed_today,
+            "inherited_open_positions": inherited_now,
+            "remaining_new_positions_today": max(0, trade_limit - opened_today) if trade_limit > 0 else 0,
             "realized_loss_today": max(0.0, -pnl_today),
             "used_today": used_today,
             "remaining_today": max(0.0, remaining_raw) if cap > 0 else float("inf"),
             "over_by": max(0.0, -remaining_raw) if cap > 0 else 0.0,
             "pnl_today": pnl_today,
-            "trades_today": _manual_trades_today_count(uid, user),
+            "trades_today": opened_today,
             "today_basis": f"Local anchored day ({tz_name}, starts {_user_day_reset_hhmm(user)})",
             "today_key": start_local.date().isoformat(),
             "today_window_label": f"{start_local.strftime('%Y-%m-%d %H:%M')} → {end_local.strftime('%Y-%m-%d %H:%M')} {tz_name}",
@@ -13075,8 +13229,8 @@ async def usdt_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # HELP TEXT (USER)
 # =========================================================
 
-HELP_TEXT = """\
-🚀 PulseFutures — Trading System in Telegram
+def build_help_text() -> str:
+    return f"""🚀 PulseFutures — Trading System in Telegram
 ────────────────────
 Core Commands
 ────────────────────
@@ -13084,13 +13238,23 @@ Core Commands
 • Scan the market for high-quality setups
 
 /status
-• Your plan, trial status & enabled features
+• Unified status: plan, day window, risk, position counts, carried risk, and open positions
 
 /commands
 • Full command guide + examples
 
 /guide_full
 • Download the full user guide (PDF)
+
+────────────────────
+Today / Risk model
+────────────────────
+• Your day uses your timezone + /dayreset anchor
+• Opened today = positions opened inside your active day window
+• Closed today = positions closed inside your active day window
+• Carried from prior day = positions still open now but opened before today
+• Daily risk used today = current-day open risk + realised losses booked today
+• Carried open risk is shown separately and does not get charged again to today's cap
 
 ────────────────────
 💎 Plans
@@ -13102,10 +13266,11 @@ Core Commands
 🤖 Bot: @PulseFuturesBot
 📢 Updates: @PulseFutures
 🆘 Support: @PulseFuturesSupport
-"""\
+"""
 
-COMMANDS_TEXT = """\
-📘 PulseFutures — Command Guide & Examples
+
+def build_commands_text() -> str:
+    return f"""📘 PulseFutures — Command Guide & Examples
 
 PulseFutures is a full trading system inside Telegram.
 Below are the key commands with simple examples.
@@ -13114,7 +13279,7 @@ Below are the key commands with simple examples.
 Core Commands
 ────────────────────
 /status
-• Unified status: risk, daily cap, today stats, sessions, and open trades
+• Unified status: day window, opened/closed today, open positions now, carried exposure, risk, and daily cap
 
 /health
 • Bot & data health check 
@@ -13132,21 +13297,20 @@ Market & Signals
 • Set your equity
 
 /dailycap
-• Set your TOTAL daily risk cap (per day)
+• Set your TOTAL daily risk cap for your anchored trading day
 
 /riskmode
 • Set your risk per trade (used by /size)
 
-
 /size <symbol> <side> <entry> <sl>
 • Calculates position size based on your per-trade risk
-• Daily cap is shown in /status and updates when trades go Risk-Free
+• /status shows current-day open risk, carried risk, and remaining daily risk for new trades
 
 ────────────────────
 Trade Journal
 ────────────────────
 /trade_open
-• Log an opned position
+• Log an opened position
 
 /trade_sl
 • Update Stop Loss
@@ -13180,7 +13344,6 @@ Trade Journal
 ────────────────────
 ⚠️ EMAILS & ALERTS
 ────────────────────
-
 /email you@gmail.com
 • Set your email for alerts
 
@@ -13263,19 +13426,25 @@ Support: @PulseFuturesSupport
 YouTube: @PulseFutures
 Website: https://pulsefutures.com/
 
-"""\
+"""
 
-# =========================================================
-# HELP TEXT (ADMIN)
-# =========================================================
 
-HELP_TEXT_ADMIN = """\
-🛠 PulseFutures — Admin Command Guide
+def build_help_text_admin() -> str:
+    return f"""🛠 PulseFutures — Admin Command Guide
 
 Admin commands are powerful. Use carefully.
 Not financial advice.
 
-Admin day boundary is fixed to the Asia-session start (00:00 UTC) for all autotrade daily metrics.
+Admin day boundary is fixed to the Asia-session start ({ADMIN_ASIA_DAY_START_HHMM} UTC) for all autotrade daily metrics.
+
+Admin status/debug fields now mean:
+• Opened today = bot positions opened inside the current Asia-session day
+• Closed today = bot positions closed inside the current Asia-session day
+• Carried from prior day = still-open positions opened before today
+• Current-day open risk = only risk from positions opened today
+• Carried open risk = inherited exposure still open now
+• Daily risk used today = current-day open risk + realised losses booked today
+• Daily risk remaining for new trades = daily cap minus daily risk used today
 
 ────────────────────
 👤 USERS & ACCESS
@@ -13320,7 +13489,7 @@ Admin day boundary is fixed to the Asia-session start (00:00 UTC) for all autotr
 🤖 AUTOTRADE (OWNER / ADMIN)
 ────────────────────
 /autotrade_debug
-• AutoTrade readiness + synchronized live risk/cap diagnostics (Asia-session day boundary)
+• AutoTrade readiness + synchronized live day/risk/carry diagnostics
 
 /autotrade_debug_reset
 • Clear AutoTrade debug state (fresh next attempt)
@@ -13368,305 +13537,19 @@ Admin day boundary is fixed to the Asia-session start (00:00 UTC) for all autotr
 • Reset bot data / clean DB (⚠️ DANGEROUS)
 
 /restore
-• Restore previously removed data (if backup exists)
+• Restore from latest DB backup
+"""
 
-────────────────────
-🧪 DIAGNOSTICS
-────────────────────
-/why
-• Last /screen reject summary (why no setups)
 
-/email_decision
-• Last email decision (why email sent/skipped/error)
+HELP_TEXT = build_help_text()
 
-/health_sys
-• Engine health + pipeline heartbeat (DB, market data, email, autotrade, learning, optimization)
-
-/edge_status
-• Main evolution dashboard: learning active, cycle times, performance trend, missed-opportunity patterns, snapshot intelligence
-
-/learning_status
-• Full learning / optimizer reality check and runtime status
-
-/optimizer_status
-• Alias of /learning_status
-
-/winrate
-• Current overall weighted bot win-rate estimate
-
-/ny_winrate
-• Current weighted New York session win-rate estimate
-
-/lessons_learned
-• Recent dominant failure patterns, entry-quality findings, and recommendations
-
-────────────────────
-🤖 AUTONOMOUS ENGINE (Zero-Touch)
-────────────────────
-• Bounded runtime parameter changes can be applied automatically through strategy_config.
-• The bot does not rewrite its own Python source file. Code-level strategy changes still require a manual update + redeploy.
-• New live parameter values go live only after internal validation / promotion logic passes.
-• Bad candidate parameter sets are rejected or reverted automatically.
-• Use /edge_status as the main admin health/evolution command.
-• Snapshot intelligence now captures repeated scan states automatically and evaluates missed movers after the horizon window.
-
-"""\
-
+COMMANDS_TEXT = build_commands_text()
 
 # =========================================================
-# PERFORMANCE HELPERS
+# HELP TEXT (ADMIN)
 # =========================================================
 
-def _run_coro_in_thread(coro):
-    """Run an async coroutine to completion in a worker thread."""
-    try:
-        return asyncio.run(coro)
-    except RuntimeError:
-        # Fallback for edge cases where a loop is already running in that thread
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(coro)
-        finally:
-            try:
-                loop.close()
-            except Exception:
-                pass
-
-
-# =========================================================
-# SIGNAL PERFORMANCE METRICS
-# =========================================================
-
-def _r_multiple(side: str, entry: float, sl: float, tp: float) -> float | None:
-    """Return R-multiple for reaching `tp` with risk defined by (entry-sl).
-    BUY: reward = tp-entry
-    SELL: reward = entry-tp
-    """
-    try:
-        side_u = (side or "").strip().upper()
-        entry = float(entry); sl = float(sl); tp = float(tp)
-        risk = abs(entry - sl)
-        if risk <= 0:
-            return None
-        if side_u == "BUY":
-            reward = tp - entry
-        else:
-            reward = entry - tp
-        return reward / risk
-    except Exception:
-        return None
-
-# =========================================================
-# BILLING COMMANDS (Stripe Payment Links + USDT)
-# =========================================================
-
-
-def _realized_r_option_b(outcome: str, side: str, entry: float, sl: float, tp1, tp2, tp3):
-    """Option B scale-out 40/40/20 realized R.
-    LOSS = -1R.
-    WIN_TP1: 0.4*R1 (conservative: remaining exits at 0R)
-    WIN_TP2: 0.4*R1 + 0.6*R2 (remaining 20% exits at TP2)
-    WIN_TP3: 0.4*R1 + 0.4*R2 + 0.2*R3
-    """
-    out = (outcome or "").strip().upper()
-    side_u = (side or "").strip().upper()
-    if out == "LOSS":
-        return -1.0
-    if out not in ("WIN_TP1", "WIN_TP2", "WIN_TP3"):
-        return None
-
-    r1 = _r_multiple(side_u, entry, sl, tp1) if tp1 is not None else None
-    r2 = _r_multiple(side_u, entry, sl, tp2) if tp2 is not None else None
-    r3 = _r_multiple(side_u, entry, sl, tp3) if tp3 is not None else None
-
-    if out == "WIN_TP1":
-        return 0.4 * r1 if r1 is not None else None
-    if out == "WIN_TP2":
-        if r1 is None or r2 is None:
-            return None
-        return 0.4 * r1 + 0.6 * r2
-    if out == "WIN_TP3":
-        if r1 is None or r2 is None or r3 is None:
-            return None
-        return 0.4 * r1 + 0.4 * r2 + 0.2 * r3
-    return None
-
-def _env(key: str, default: str = "") -> str:
-    v = os.getenv(key)
-    return (v or default).strip()
-
-def _mask_addr(addr: str) -> str:
-    a = (addr or "").strip()
-    if len(a) <= 14:
-        return a
-    return f"{a[:6]}…{a[-6:]}"
-
-async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Billing menu: Stripe Payment Links + USDT (MANUAL activation for Stripe).
-    - Safe: uses env vars only for Stripe links (no Stripe API calls required)
-    - USDT address works with either USDT_ADDRESS or USDT_RECEIVE_ADDRESS
-    - Does NOT require email to show billing
-    """
-    user = update.effective_user
-    uid = user.id if user else None
-
-    # Stripe payment links
-    stripe_standard_url = _env("STRIPE_STANDARD_URL")
-    stripe_pro_url = _env("STRIPE_PRO_URL")
-
-    # USDT config (support BOTH possible env names)
-    usdt_network = _env("USDT_NETWORK", "TRC20")
-    usdt_address = _env("USDT_ADDRESS") or _env("USDT_RECEIVE_ADDRESS")
-    usdt_note = _env("USDT_NOTE")  # optional
-
-    # Prices (display only)
-    usdt_standard_price = _env("USDT_STANDARD_PRICE", "45")
-    usdt_pro_price = _env("USDT_PRO_PRICE", "99")
-
-    # Support
-    support_handle = _env("BILLING_SUPPORT_HANDLE", "@PulseFuturesSupport")
-
-    # Reference (helps you match tickets/payments)
-    ref = f"PF-{uid}" if uid else "PF-UNKNOWN"
-
-    lines = []
-    lines.append("💳 PulseFutures — Billing & Upgrade")
-    lines.append("")
-    lines.append("Choose your payment method below.")
-    lines.append(f"Reference (important): {ref}")
-    lines.append("")
-    lines.append("────────────────────")
-    lines.append("1) Stripe (Card / Apple Pay / Google Pay)")
-    lines.append("────────────────────")
-    if stripe_standard_url or stripe_pro_url:
-        lines.append("Tap a plan button to pay securely via Stripe.")
-        lines.append("✅ Activation is MANUAL for now (fast). After paying, send:")
-        lines.append(f"• Reference: {ref}")
-        lines.append(f"• Telegram ID: {uid if uid else 'unknown'}")
-        lines.append("• Plan: Standard or Pro")
-        lines.append("• Stripe email used")
-        lines.append(f"Support: {support_handle}")
-    else:
-        lines.append("Stripe is not configured yet.")
-        lines.append("Admin: set STRIPE_STANDARD_URL / STRIPE_PRO_URL in Render env vars.")
-
-    lines.append("")
-    lines.append("────────────────────")
-    lines.append("2) USDT")
-    lines.append("────────────────────")
-    if usdt_address:
-        lines.append(f"Network: USDT ({usdt_network})")
-        lines.append(f"Address: {usdt_address}")
-        lines.append(f"(Short: {_mask_addr(usdt_address)})")
-        lines.append(f"Prices: Standard {usdt_standard_price} USDT • Pro {usdt_pro_price} USDT")
-        if usdt_note:
-            lines.append(f"Note: {usdt_note.replace('<REF>', ref)}")
-        else:
-            lines.append(f"Note: Use reference '{ref}' in your message to support if needed.")
-        lines.append("After paying, submit:")
-        lines.append("/usdt_paid <TXID> <standard|pro>")
-    else:
-        lines.append("USDT is not configured yet.")
-        lines.append("Admin: set USDT_ADDRESS or USDT_RECEIVE_ADDRESS in Render env vars.")
-        lines.append("Optional: set USDT_NETWORK (default TRC20).")
-
-    lines.append("")
-    lines.append("────────────────────")
-    lines.append("After payment (Activation)")
-    lines.append("────────────────────")
-    lines.append("✅ Stripe:")
-    lines.append(f"Send to Support: {support_handle}")
-    lines.append(f"1) Reference: {ref}")
-    lines.append(f"2) Telegram ID: {uid if uid else 'unknown'}")
-    lines.append("3) Plan: Standard or Pro")
-    lines.append("4) Stripe email used")
-    lines.append("")
-    lines.append("✅ USDT:")
-    lines.append("Submit: /usdt_paid <TXID> <standard|pro>")
-    lines.append(f"Support: {support_handle}")
-    lines.append(f"Reference: {ref}")
-
-    msg = "\n".join(lines)
-
-    # Buttons (Stripe)
-    buttons = []
-    stripe_row = []
-    if stripe_standard_url:
-        stripe_row.append(InlineKeyboardButton("✅ Stripe — Standard", url=stripe_standard_url))
-    if stripe_pro_url:
-        stripe_row.append(InlineKeyboardButton("🚀 Stripe — Pro", url=stripe_pro_url))
-    if stripe_row:
-        buttons.append(stripe_row)
-
-    howto_url = _env("BILLING_HOWTO_URL")
-    if howto_url:
-        buttons.append([InlineKeyboardButton("ℹ️ Payment Instructions", url=howto_url)])
-
-    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
-
-    await send_long_message(
-        update,
-        msg,
-        parse_mode=None,
-        disable_web_page_preview=True,
-        reply_markup=reply_markup,
-    )
-
-# =========================================================
-# Table Format
-# =========================================================
-
-def _format_help_table(rows, col_cmd=16, col_what=46, col_ex=28) -> str:
-    """
-    Monospace table with wrapping; optional Example column.
-    rows: [{"cmd": str, "what": str, "ex": str|""}, ...]
-    - If ex == cmd -> omit example.
-    - If no examples in a section -> omit Example column entirely.
-    """
-    clean_rows = []
-    any_ex = False
-
-    for r in rows:
-        cmd = (r.get("cmd") or "").strip()
-        what = (r.get("what") or "").strip()
-        ex = (r.get("ex") or "").strip()
-
-        if ex == cmd:
-            ex = ""
-        if ex:
-            any_ex = True
-
-        clean_rows.append({"cmd": cmd, "what": what, "ex": ex})
-
-    if any_ex:
-        header = f"{'Command':<{col_cmd}}  {'What it does':<{col_what}}  {'Example':<{col_ex}}"
-        sep    = f"{'-'*col_cmd}  {'-'*col_what}  {'-'*col_ex}"
-    else:
-        header = f"{'Command':<{col_cmd}}  {'What it does':<{col_what}}"
-        sep    = f"{'-'*col_cmd}  {'-'*col_what}"
-
-    lines = [header, sep]
-
-    for r in clean_rows:
-        cmd = r["cmd"][:col_cmd]
-        what_lines = textwrap.wrap(r["what"], width=col_what) or [""]
-        if any_ex:
-            ex_lines = textwrap.wrap(r["ex"], width=col_ex) or [""]
-            n = max(len(what_lines), len(ex_lines))
-            for i in range(n):
-                c = cmd if i == 0 else ""
-                w = what_lines[i] if i < len(what_lines) else ""
-                e = ex_lines[i] if i < len(ex_lines) else ""
-                lines.append(f"{c:<{col_cmd}}  {w:<{col_what}}  {e:<{col_ex}}")
-        else:
-            for i, w in enumerate(what_lines):
-                c = cmd if i == 0 else ""
-                lines.append(f"{c:<{col_cmd}}  {w:<{col_what}}")
-
-    return "\n".join(lines)
-
+HELP_TEXT_ADMIN = build_help_text_admin()
 
 def build_help_html(title: str, sections: list) -> str:
     """
@@ -13688,7 +13571,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Plain text help (no tables, no HTML builder)
     await send_long_message(
         update,
-        HELP_TEXT,
+        build_help_text(),
         parse_mode=None,
         disable_web_page_preview=True,
     )
@@ -13697,7 +13580,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Full command guide with examples
     await send_long_message(
         update,
-        COMMANDS_TEXT,
+        build_commands_text(),
         parse_mode=None,
         disable_web_page_preview=True,
     )
@@ -13742,7 +13625,7 @@ async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_long_message(
         update,
-        HELP_TEXT_ADMIN,
+        build_help_text_admin(),
         parse_mode=None,
         disable_web_page_preview=True,
     )
@@ -15294,14 +15177,21 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(HDR)
     lines.append(f"Plan: {snap.get('plan')}")
     lines.append(f"Equity: ${equity:.2f}")
-    lines.append(f"PnL today: ${pnl_today:+.2f}")
-    lines.append(f"Trades today: {int(snap.get('trades_today', 0))}/{int(snap.get('trades_today_limit', 0))}")
+    lines.append(f"PnL today (closed): ${pnl_today:+.2f}")
+    _opened_today = int(snap.get('positions_opened_today', 0))
+    _trade_limit = int(snap.get('trades_today_limit', 0))
+    lines.append(f"Opened today: {_opened_today}" + (f"/{_trade_limit}" if _trade_limit > 0 else " (no count cap)"))
+    lines.append(f"Closed today: {int(snap.get('positions_closed_today', 0))}")
+    lines.append(f"Open positions now: {int(snap.get('open_positions_now', 0))}")
+    lines.append(f"Carried from prior day: {int(snap.get('inherited_open_positions', 0))}")
     lines.append(f"Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f} (used by /size)")
     lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
-    lines.append(f"Open risk today: ${open_risk_today:.2f}")
+    lines.append(f"Current-day open risk: ${float(snap.get('current_day_open_risk', 0.0)):.2f}")
+    lines.append(f"Carried open risk: ${float(snap.get('carried_open_risk', 0.0)):.2f}")
+    lines.append(f"Total open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}")
     lines.append(f"Realised loss today used for cap: ${realized_loss_today:.2f}")
-    lines.append(f"Daily risk used total: ${used_today:.2f}")
-    lines.append(f"Daily risk remaining: {'∞' if not math.isfinite(float(remaining_today)) else f'${float(remaining_today):.2f}'}")
+    lines.append(f"Daily risk used today: ${used_today:.2f}")
+    lines.append(f"Daily risk remaining for new trades: {'∞' if not math.isfinite(float(remaining_today)) else f'${float(remaining_today):.2f}'}")
     if over_by > 0:
         lines.append(f"⚠️ Over daily cap by ${over_by:.2f} (reduce risk / add SL / close positions)")
     lines.append(HDR)
@@ -15321,7 +15211,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("Open trades: None")
             await update.message.reply_text("\n".join(lines))
             return
-        lines.append(f"Open trades: {len(live_positions)}")
+        lines.append(f"Open positions list: {len(live_positions)}")
         for p in live_positions:
             try:
                 sym = _pos_symbol(p)
@@ -15343,7 +15233,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("Open trades: None")
             await update.message.reply_text("\n".join(lines))
             return
-        lines.append(f"Open trades: {len(opens)}")
+        lines.append(f"Open positions list: {len(opens)}")
         for t in opens:
             try:
                 entry = float(t.get("entry") or 0.0)
@@ -16678,18 +16568,25 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass
     lines.append(SEP)
     lines.append(f"Daily cap (from /dailycap): ${daily_cap:.2f}")
-    lines.append(f"Trades today: {int(snap.get('trades_today', 0))}/{int(snap.get('trades_today_limit', 0))}")
-    lines.append(f"Open risk today: ${open_risk_today:.2f}")
+    _opened_today = int(snap.get('positions_opened_today', 0))
+    _trade_limit = int(snap.get('trades_today_limit', 0))
+    lines.append(f"Opened today: {_opened_today}" + (f"/{_trade_limit}" if _trade_limit > 0 else " (no count cap)"))
+    lines.append(f"Closed today: {int(snap.get('positions_closed_today', 0))}")
+    lines.append(f"Open positions now: {int(snap.get('open_positions_now', 0))}")
+    lines.append(f"Carried from prior day: {int(snap.get('inherited_open_positions', 0))}")
+    lines.append(f"Current-day open risk: ${float(snap.get('current_day_open_risk', 0.0)):.2f}")
+    lines.append(f"Carried open risk: ${float(snap.get('carried_open_risk', 0.0)):.2f}")
+    lines.append(f"Total open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}")
     lines.append(f"Realised loss today used for cap: ${realized_loss_today:.2f}")
-    lines.append(f"Daily risk used total: ${used_today:.2f}")
+    lines.append(f"Daily risk used today: ${used_today:.2f}")
     lines.append(f"Unrealised PnL (open, ignored for risk): ${float(mday.get('open_pnl') or 0.0):+.2f}")
     lines.append(f"Realised PnL today (closed): ${pnl_today_closed:+.2f}")
     if math.isfinite(float(remaining_today)):
-        lines.append(f"Daily risk remaining: ${float(remaining_today):.2f}")
+        lines.append(f"Daily risk remaining for new trades: ${float(remaining_today):.2f}")
         if over_by > 0:
             lines.append(f"⚠️ Over daily cap by ${over_by:.2f}")
     else:
-        lines.append("Daily risk remaining: ∞")
+        lines.append("Daily risk remaining for new trades: ∞")
     if equity > 0 and daily_cap > 0:
         if float(remaining_today) <= 0:
             lines.append("⚠️ Would BLOCK: daily_risk_cap_reached")
@@ -16722,6 +16619,14 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         risk_eff = det.get("risk_effective_usd")
         risk_mult = det.get("risk_multiplier")
         risk_regime = det.get("risk_regime")
+        if det.get('source_kind'):
+            lines.append(f"Setup source: {det.get('source_kind')}" + (f" | session={det.get('source_session')}" if det.get('source_session') else ""))
+        if det.get('signal_created_time'):
+            lines.append(f"Signal created (Melbourne): {_fmt_iso_to_local(det.get('signal_created_time'))}")
+        if det.get('email_logged_time'):
+            lines.append(f"Email logged (Melbourne): {_fmt_iso_to_local(det.get('email_logged_time'))}")
+        if det.get('generated_logged_time'):
+            lines.append(f"Generated/logged (Melbourne): {_fmt_iso_to_local(det.get('generated_logged_time'))}")
         if setup_time:
             lines.append(f"Setup time (Melbourne): {_fmt_iso_to_local(setup_time)}")
         if deadline:
