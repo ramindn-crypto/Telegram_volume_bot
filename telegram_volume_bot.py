@@ -18355,7 +18355,7 @@ async def myplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-async def _billing_cmd_unused(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Billing menu: Stripe (Payment Links) + USDT.
     - Uses env vars only (safe on Render)
