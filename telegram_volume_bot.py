@@ -1974,6 +1974,238 @@ def _estimate_position_risk_usd(p: dict) -> float:
     except Exception:
         return 0.0
 
+def _ts_seconds_from_any(value) -> float:
+    try:
+        if value in (None, "", 0, "0"):
+            return 0.0
+        v = float(value)
+        if v <= 0:
+            return 0.0
+        return (v / 1000.0) if v > 10_000_000_000 else v
+    except Exception:
+        return 0.0
+
+
+def _bybit_order_reduce_only(order: dict) -> bool:
+    try:
+        for key in ('reduceOnly', 'reduce_only', 'closeOnTrigger', 'close_on_trigger'):
+            val = order.get(key)
+            if isinstance(val, bool) and val:
+                return True
+            sval = str(val or '').strip().lower()
+            if sval in {'true', '1', 'yes', 'y'}:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _bybit_order_filled_time_ts(order: dict) -> float:
+    try:
+        for key in ('updatedTime', 'updated_time', 'createdTime', 'created_time', 'orderTime', 'execTime', 'transactTime'):
+            ts = _ts_seconds_from_any(order.get(key))
+            if ts > 0:
+                return ts
+    except Exception:
+        pass
+    return 0.0
+
+
+def _bybit_order_avg_price(order: dict) -> float:
+    try:
+        for key in ('avgPrice', 'avg_price', 'price', 'triggerPrice', 'trigger_price'):
+            v = float(order.get(key) or 0.0)
+            if v > 0:
+                return v
+    except Exception:
+        pass
+    return 0.0
+
+
+def _bybit_order_filled_qty(order: dict) -> float:
+    try:
+        for key in ('cumExecQty', 'cum_exec_qty', 'cumFilledQty', 'filledQty', 'qty'):
+            v = float(order.get(key) or 0.0)
+            if v > 0:
+                return abs(v)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _bybit_get_recent_filled_orders_linear(symbol: str, lookback_hours: int = 168, limit: int = 200) -> list[dict]:
+    """Recent filled order history for one linear symbol.
+
+    We use this for live-position attribution only. The result is cached briefly because
+    /status and /autotrade_debug may be called back-to-back.
+    """
+    sym = _bybit_linear_symbol(symbol)
+    cache_key = f"bybit_order_history:{sym}:{int(lookback_hours)}:{int(limit)}"
+    try:
+        if cache_valid(cache_key, 30):
+            return list(cache_get(cache_key) or [])
+    except Exception:
+        pass
+
+    end_ms = int(time.time() * 1000)
+    start_ms = int((time.time() - max(1, int(lookback_hours)) * 3600.0) * 1000)
+    payload = {
+        'category': 'linear',
+        'symbol': sym,
+        'startTime': start_ms,
+        'endTime': end_ms,
+        'limit': int(max(20, min(int(limit), 200))),
+    }
+    out = []
+    try:
+        res = _bybit_v5_request('GET', '/v5/order/history', payload)
+        if int((res or {}).get('retCode', -1)) == 0:
+            out = (((res or {}).get('result') or {}).get('list') or [])
+    except Exception:
+        out = []
+
+    try:
+        cache_set(cache_key, list(out or []))
+    except Exception:
+        pass
+    return list(out or [])
+
+
+def _autotrade_resolve_live_position_open_info(uid: int, p: dict, journal_open: Optional[list[dict]] = None) -> dict:
+    """Resolve the authoritative open timestamp for one live Bybit position.
+
+    Evidence priority:
+    1) Bybit filled order history for the same symbol/side and same-position characteristics.
+    2) Matching autotrade journal OPEN row (only if it matches the live position, not merely symbol+side).
+    3) Bybit live position createdTime.
+
+    This prevents stale internal rows from overriding clear exchange evidence.
+    """
+    sym = _pos_symbol(p)
+    side = _pos_side_text(p)
+    entry = float(_pos_entry(p) or 0.0)
+    size = abs(float(_pos_size(p) or 0.0))
+    position_created_ts = _ts_seconds_from_any(p.get('createdTime') or p.get('created_time'))
+    position_updated_ts = _ts_seconds_from_any(p.get('updatedTime') or p.get('updated_time'))
+
+    info = {
+        'symbol': sym,
+        'side': side,
+        'opened_ts': 0.0,
+        'source': 'unknown',
+        'position_created_ts': float(position_created_ts or 0.0),
+        'position_updated_ts': float(position_updated_ts or 0.0),
+        'journal_ts': 0.0,
+        'journal_trade_id': '',
+        'exchange_order_ts': 0.0,
+        'exchange_order_id': '',
+        'exchange_order_price': 0.0,
+        'exchange_order_qty': 0.0,
+        'notes': '',
+    }
+
+    def _entry_rel_diff(a: float, b: float) -> float:
+        try:
+            a = float(a or 0.0)
+            b = float(b or 0.0)
+            if a <= 0 or b <= 0:
+                return 999.0
+            return abs(a - b) / max(abs(a), abs(b), 1e-9)
+        except Exception:
+            return 999.0
+
+    def _qty_rel_diff(a: float, b: float) -> float:
+        try:
+            a = abs(float(a or 0.0))
+            b = abs(float(b or 0.0))
+            if a <= 0 or b <= 0:
+                return 999.0
+            return abs(a - b) / max(a, b, 1e-9)
+        except Exception:
+            return 999.0
+
+    journal_matches = []
+    for t in (journal_open or []):
+        try:
+            if str(t.get('symbol') or '').upper() != str(sym).upper():
+                continue
+            if str(t.get('side') or '').upper() != str(side).upper():
+                continue
+            j_entry = float(t.get('entry') or 0.0)
+            j_qty = abs(float(t.get('qty') or 0.0))
+            entry_rel = _entry_rel_diff(j_entry, entry)
+            qty_rel = _qty_rel_diff(j_qty, size)
+            if entry_rel <= 0.0075 or qty_rel <= 0.35:
+                journal_matches.append((entry_rel, qty_rel, -float(t.get('opened_ts') or 0.0), t))
+        except Exception:
+            continue
+    if journal_matches:
+        best_journal = sorted(journal_matches, key=lambda x: (x[0], x[1], x[2]))[0][3]
+        try:
+            info['journal_ts'] = float(best_journal.get('opened_ts') or 0.0)
+            info['journal_trade_id'] = str(best_journal.get('trade_id') or '')
+        except Exception:
+            pass
+
+    order_candidates = []
+    try:
+        for o in _bybit_get_recent_filled_orders_linear(sym, lookback_hours=168, limit=200):
+            try:
+                if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
+                    continue
+                o_side = str(o.get('side') or '').upper().strip()
+                if o_side != side:
+                    continue
+                if _bybit_order_reduce_only(o):
+                    continue
+                o_status = str(o.get('orderStatus') or '').upper().strip()
+                o_qty = _bybit_order_filled_qty(o)
+                if o_status not in {'FILLED', 'PARTIALLYFILLED', 'PARTIALLY_FILLED', ''} and o_qty <= 0:
+                    continue
+                ts = _bybit_order_filled_time_ts(o)
+                if ts <= 0:
+                    continue
+                o_price = _bybit_order_avg_price(o)
+                entry_rel = _entry_rel_diff(o_price, entry)
+                qty_rel = _qty_rel_diff(o_qty, size)
+                if entry_rel <= 0.0075 or qty_rel <= 0.35:
+                    order_candidates.append((entry_rel, qty_rel, ts, o))
+            except Exception:
+                continue
+    except Exception:
+        order_candidates = []
+
+    if order_candidates:
+        best_entry_rel = min(x[0] for x in order_candidates)
+        shortlist = [x for x in order_candidates if x[0] <= max(best_entry_rel + 0.0015, 0.0080)]
+        best_order = sorted(shortlist, key=lambda x: (x[2], x[0], x[1]))[0][3]
+        info['exchange_order_ts'] = _bybit_order_filled_time_ts(best_order)
+        info['exchange_order_id'] = str(best_order.get('orderId') or best_order.get('orderLinkId') or '')
+        info['exchange_order_price'] = float(_bybit_order_avg_price(best_order) or 0.0)
+        info['exchange_order_qty'] = float(_bybit_order_filled_qty(best_order) or 0.0)
+
+    exchange_ts = float(info.get('exchange_order_ts') or 0.0)
+    journal_ts = float(info.get('journal_ts') or 0.0)
+    created_ts = float(info.get('position_created_ts') or 0.0)
+
+    if exchange_ts > 0:
+        info['opened_ts'] = exchange_ts
+        info['source'] = 'bybit_order_history'
+        if journal_ts > 0 and abs(exchange_ts - journal_ts) > 3600.0:
+            info['notes'] = 'journal_mismatch_ignored'
+    elif journal_ts > 0:
+        info['opened_ts'] = journal_ts
+        info['source'] = 'autotrade_journal'
+    elif created_ts > 0:
+        info['opened_ts'] = created_ts
+        info['source'] = 'bybit_position_created'
+    else:
+        info['opened_ts'] = 0.0
+        info['source'] = 'unknown'
+
+    return info
+
+
 def _autotrade_realized_pnl_today(uid: int, now_utc: Optional[datetime] = None) -> float:
     """Realized PnL for autotrade journal rows closed inside the active trading-day window."""
     try:
@@ -1996,15 +2228,9 @@ def _autotrade_realized_pnl_today(uid: int, now_utc: Optional[datetime] = None) 
 def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     """Compute authoritative AutoTrade day metrics using the configured trading-day window.
 
-    New accounting model:
-    - current_total_open_risk: risk on all currently open positions now
-    - current_day_open_risk: risk on positions opened inside the current admin day window
-    - carried_open_risk: risk inherited from positions opened before the current admin day
-    - daily_used_total: current_day_open_risk + realized_loss_today
-    - daily_remaining: daily_cap - daily_used_total
-
-    Prior-day carried risk is shown explicitly but does NOT consume the *new* day cap again.
-    This keeps rollover behavior understandable while preserving visibility of true live exposure.
+    Live-position day bucketing uses one authoritative open timestamp per current Bybit position.
+    That timestamp is resolved from exchange evidence first, then matching journal state, then
+    position.createdTime as a final fallback.
     """
     cap = 0.0
     open_pnl = 0.0
@@ -2043,6 +2269,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     inherited_open_positions = 0
     opened_today_count = 0
     closed_today_count = 0
+    position_classifications = []
 
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -2085,34 +2312,47 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
 
         for p in positions:
             est = float(_estimate_position_risk_usd(p) or 0.0)
-            opened_ts = 0.0
-            try:
-                psym = _pos_symbol(p)
-                pside = _pos_side_text(p)
-                matches = [t for t in journal_open
-                           if str(t.get('symbol') or '').upper() == str(psym).upper()
-                           and str(t.get('side') or '').upper() == str(pside).upper()]
-                if matches:
-                    best = max(matches, key=lambda t: _opened_ts_from_trade(t))
-                    opened_ts = _opened_ts_from_trade(best)
-                    if est <= 0:
+            info = _autotrade_resolve_live_position_open_info(int(uid), p, journal_open=journal_open)
+            opened_ts = float(info.get('opened_ts') or 0.0)
+            psym = _pos_symbol(p)
+            pside = _pos_side_text(p)
+            if est <= 0:
+                try:
+                    matches = [t for t in journal_open
+                               if str(t.get('symbol') or '').upper() == str(psym).upper()
+                               and str(t.get('side') or '').upper() == str(pside).upper()]
+                    if matches:
+                        matched_journal = [t for t in matches if abs(float(t.get('opened_ts') or 0.0) - float(info.get('journal_ts') or 0.0)) <= 1.0]
+                        risk_pool = matched_journal or matches
                         est = max(
                             float(_autotrade_estimated_risk_usd(float(t.get('entry') or 0.0), float(t.get('sl') or 0.0), float(t.get('qty') or 0.0)) or 0.0)
-                            for t in matches
+                            for t in risk_pool
                         )
-                if opened_ts <= 0:
-                    raw_ct = p.get('createdTime') or p.get('created_time') or 0
-                    if raw_ct:
-                        opened_ts = float(raw_ct) / 1000.0
-            except Exception:
-                pass
+                except Exception:
+                    pass
             est = max(0.0, float(est or 0.0))
             current_total_open_risk += est
-            if opened_ts and opened_ts < start_ts:
+
+            if opened_ts > 0 and opened_ts < start_ts:
+                bucket = 'carried'
                 carried_open_risk += est
                 inherited_open_positions += 1
             else:
+                bucket = 'current_day'
                 current_day_open_risk += est
+
+            position_classifications.append({
+                'symbol': psym,
+                'side': pside,
+                'risk': float(est),
+                'opened_ts': float(opened_ts or 0.0),
+                'bucket': bucket,
+                'source': str(info.get('source') or 'unknown'),
+                'journal_ts': float(info.get('journal_ts') or 0.0),
+                'position_created_ts': float(info.get('position_created_ts') or 0.0),
+                'exchange_order_ts': float(info.get('exchange_order_ts') or 0.0),
+                'notes': str(info.get('notes') or ''),
+            })
         inherited_open_positions = min(int(inherited_open_positions), int(open_positions_now))
     else:
         open_positions_now = len(journal_open)
@@ -2121,10 +2361,24 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
             opened_ts = _opened_ts_from_trade(t)
             current_total_open_risk += est
             if opened_ts and opened_ts < start_ts:
+                bucket = 'carried'
                 carried_open_risk += est
                 inherited_open_positions += 1
             else:
+                bucket = 'current_day'
                 current_day_open_risk += est
+            position_classifications.append({
+                'symbol': str(t.get('symbol') or '').upper(),
+                'side': str(t.get('side') or '').upper(),
+                'risk': float(est),
+                'opened_ts': float(opened_ts or 0.0),
+                'bucket': bucket,
+                'source': 'autotrade_journal',
+                'journal_ts': float(opened_ts or 0.0),
+                'position_created_ts': 0.0,
+                'exchange_order_ts': 0.0,
+                'notes': '',
+            })
         open_pnl = 0.0
 
     daily_used_total = max(0.0, float(current_day_open_risk) + float(realized_loss_today))
@@ -2150,6 +2404,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         "closed_today_count": int(closed_today_count),
         "day_start_ts": float(start_ts),
         "day_end_ts": float(end_ts),
+        "position_classifications": position_classifications,
     }
 
 def _autotrade_user_settings(uid: int) -> dict:
@@ -16776,6 +17031,21 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             lines.append("⚠️ Would BLOCK: daily_risk_cap_reached")
         elif per_trade_risk > float(remaining_today):
             lines.append("⚠️ Would BLOCK: per_trade_risk_gt_remaining")
+    class_rows = mday.get('position_classifications') or []
+    if class_rows:
+        lines.append(SEP)
+        lines.append("Position day buckets:")
+        for row in class_rows[:12]:
+            ts = float(row.get('opened_ts') or 0.0)
+            ts_txt = _fmt_dt_local(datetime.fromtimestamp(ts, tz=timezone.utc)) if ts > 0 else '—'
+            extra = ''
+            note = str(row.get('notes') or '').strip()
+            if note:
+                extra = f" | {note}"
+            lines.append(
+                f"{row.get('symbol')} {row.get('side')} | risk ${float(row.get('risk') or 0.0):.2f} | "
+                f"opened {ts_txt} | bucket={row.get('bucket')} | source={row.get('source')}{extra}"
+            )
     lines.append(SEP)
 
 
