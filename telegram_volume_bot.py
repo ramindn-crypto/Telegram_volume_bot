@@ -3816,6 +3816,99 @@ def _admin_assurance_verdict() -> tuple[str, list[str]]:
     return ("HEALTHY", [])
 
 
+def _db_recent_runtime_evidence(uid: int, hours: int = 24) -> dict:
+    """Best-effort runtime evidence from persisted tables.
+
+    Used by admin health views to distinguish:
+    - engine healthy but no setups passed
+    - pipeline stale / not writing
+    """
+    cutoff = float(time.time()) - float(hours) * 3600.0
+    out = {
+        "signals_count": 0,
+        "signals_last_ts": 0.0,
+        "generated_screen_count": 0,
+        "generated_screen_last_ts": 0.0,
+        "generated_email_count": 0,
+        "generated_email_last_ts": 0.0,
+        "emailed_count": 0,
+        "emailed_last_ts": 0.0,
+        "autotrade_opened_count": 0,
+        "autotrade_last_open_ts": 0.0,
+    }
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+
+            def _count_and_last(sql: str, params: tuple) -> tuple[int, float]:
+                try:
+                    row = cur.execute(sql, params).fetchone()
+                    if not row:
+                        return (0, 0.0)
+                    return (int(row[0] or 0), float(row[1] or 0.0))
+                except Exception:
+                    return (0, 0.0)
+
+            out["signals_count"], out["signals_last_ts"] = _count_and_last(
+                "SELECT COUNT(1), MAX(created_ts) FROM signals WHERE created_ts>=?",
+                (float(cutoff),),
+            )
+            out["generated_screen_count"], out["generated_screen_last_ts"] = _count_and_last(
+                "SELECT COUNT(1), MAX(created_ts) FROM generated_setups WHERE user_id=? AND source='screen' AND created_ts>=?",
+                (int(uid), float(cutoff)),
+            )
+            out["generated_email_count"], out["generated_email_last_ts"] = _count_and_last(
+                "SELECT COUNT(1), MAX(created_ts) FROM generated_setups WHERE user_id=? AND source='email' AND created_ts>=?",
+                (int(uid), float(cutoff)),
+            )
+            out["emailed_count"], out["emailed_last_ts"] = _count_and_last(
+                "SELECT COUNT(1), MAX(emailed_ts) FROM emailed_setups WHERE user_id=? AND emailed_ts>=?",
+                (int(uid), float(cutoff)),
+            )
+            out["autotrade_opened_count"], out["autotrade_last_open_ts"] = _count_and_last(
+                "SELECT COUNT(1), MAX(opened_ts) FROM autotrade_trades WHERE uid=? AND opened_ts>=?",
+                (int(uid), float(cutoff)),
+            )
+    except Exception:
+        pass
+    return out
+
+
+def _fmt_runtime_ts(ts: float) -> str:
+    try:
+        ts = float(ts or 0.0)
+        if ts <= 0:
+            return "—"
+        return _fmt_dt_local(datetime.fromtimestamp(ts, tz=timezone.utc))
+    except Exception:
+        return "—"
+
+
+def _admin_engine_verdict_text(uid: int, evidence: dict | None = None) -> tuple[str, list[str]]:
+    """High-level admin verdict based on actual runtime state + persisted evidence."""
+    evidence = evidence or _db_recent_runtime_evidence(int(uid), hours=24)
+    verdict, blockers = _admin_assurance_verdict()
+
+    if verdict != "HEALTHY":
+        return (verdict, blockers)
+
+    recent_pipeline = (
+        int(evidence.get("signals_count", 0) or 0) > 0
+        or int(evidence.get("generated_screen_count", 0) or 0) > 0
+        or int(evidence.get("generated_email_count", 0) or 0) > 0
+        or int(evidence.get("emailed_count", 0) or 0) > 0
+    )
+    if recent_pipeline:
+        return ("HEALTHY", ["pipeline_writing_recently"])
+
+    rec = _LAST_REJECTS.get(int(uid)) or {}
+    reject_n = len((rec.get("counts") or {}))
+    if reject_n > 0:
+        return ("HEALTHY_NO_VALID_SETUPS", [f"recent_reject_keys={reject_n}"])
+
+    return ("HEALTHY_BUT_NO_RECENT_ACTIVITY", ["no_recent_pipeline_writes"])
+
+
 def _component_runtime_state(name: str, stale_after_sec: int, enabled: bool = True, no_data: bool = False, waiting_text: str = "waiting_for_first_cycle") -> tuple[str, str]:
     if not enabled:
         return ("DISABLED", "disabled_in_config")
@@ -11124,7 +11217,9 @@ async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
     """Internal autonomous optimizer. No manual trigger required."""
     should_run, reason = _autonomous_opt_should_run()
     if not should_run:
+        _hb_touch('optimizer', ok=True, details=f'skip:{reason}')
         return
+    _hb_touch('optimizer', ok=True, details='job_start')
 
     bot = getattr(context, "bot", None)
     stop_event = threading.Event()
@@ -11140,6 +11235,7 @@ async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
             None,
         )
     except Exception as e:
+        _hb_touch('optimizer', ok=False, error=f"{type(e).__name__}: {e}", details='job_error')
         try:
             if bot:
                 await _notify_admins_autonomous_opt(bot, f"⚠️ Autonomous optimization failed: {type(e).__name__}: {e}")
@@ -11150,11 +11246,13 @@ async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
         _SELF_OPT_STATE["stop_event"] = None
 
     if not isinstance(res, dict):
+        _hb_touch('optimizer', ok=False, error='non_dict_result', details='job_error')
         return
 
     try:
         _SELF_OPT_STATE["run_id"] = str(res.get("run_id") or "")
         save_opt_report(res)
+        _hb_touch('optimizer', ok=bool(res.get("ok")), details=f"run_complete promoted={bool(res.get('promoted'))} run_id={str(res.get('run_id') or '')[:24]}")
     except Exception:
         pass
 
@@ -13480,16 +13578,124 @@ def build_help_text_admin() -> str:
 Admin commands are powerful. Use carefully.
 Not financial advice.
 
-Admin day boundary is fixed to the Asia-session start ({ADMIN_ASIA_DAY_START_HHMM} UTC) for all autotrade daily metrics.
+Admin day boundary is fixed to the Asia-session start ({ADMIN_ASIA_DAY_START_HHMM} UTC) for all AutoTrade daily metrics.
+Admin-facing timestamps in diagnostics are shown in Melbourne time where applicable.
 
-Admin status/debug fields now mean:
-• Opened today = bot positions opened inside the current Asia-session day
-• Closed today = bot positions closed inside the current Asia-session day
-• Carried from prior day = still-open positions opened before today
-• Current-day open risk = only risk from positions opened today
-• Carried open risk = inherited exposure still open now
-• Daily risk used today = current-day open risk + realised losses booked today
-• Daily risk remaining for new trades = daily cap minus daily risk used today
+────────────────────
+🔎 DIAGNOSTICS & ENGINE HEALTH
+────────────────────
+/why
+• Last /screen reject summary (why no setups passed)
+
+/email_decision
+• Last email decision + email loop heartbeat + send/skip/error reasons
+
+/health_sys
+• Full admin engine-health view: DB, exchange, scheduler/loop heartbeats, recent pipeline writes, verdict
+
+/edge_status
+• High-level evolution dashboard: engine verdict, WR estimate, optimizer promotion state
+
+/optimizer_status
+/learning_status
+• Detailed learning/optimizer runtime status and latest promoted/advisory changes
+
+/winrate
+• Current overall weighted bot win-rate estimate
+
+/ny_winrate
+• Current weighted New York session win-rate estimate
+
+/lessons_learned
+• Dominant failure patterns, entry-quality findings, and recommended improvements
+
+────────────────────
+🤖 AUTOTRADE (OWNER / ADMIN)
+────────────────────
+/autotrade_debug
+• AutoTrade readiness + synchronized live risk/cap/carry diagnostics
+
+/autotrade_debug_reset
+• Clear AutoTrade debug state (fresh next attempt)
+
+/autotrade_last
+• Show last autotrade attempt details
+
+/autotrade_report [hours]
+• AutoTrade journal (recent)
+
+/autotrade_report_overall
+/autotrade_report_overal
+• AutoTrade overall performance summary
+
+/autotrade_sessions
+/autotrade_sessions NY
+/autotrade_sessions NY,LON
+/autotrade_sessions NY,LON,ASIA
+• Show / set allowed sessions for AutoTrade
+
+/open_trades
+• Live open Bybit positions (same live source as /status)
+
+────────────────────
+📊 SIGNALS & REPORTING
+────────────────────
+/signal_report [hours]
+• Signal report for recent emailed setups
+
+/signal_report_overall
+/signal_report_all
+• Overall signal performance summary
+
+/signals_daily
+• Recent emailed-signal daily breakdown
+
+/signals_weekly
+• Recent emailed-signal weekly breakdown
+
+/report_daily
+/report_weekly
+/report_overall
+• Journal/performance reports
+
+────────────────────
+⚠️ RISK / ACCOUNT / LIVE VIEW
+────────────────────
+/status
+• Unified live admin status: equity, day basis, carry/open risk, open positions
+
+/equity
+• Admin equity is live-synced from Bybit in live mode
+
+/riskmode
+• Per-trade risk basis used by /size and AutoTrade sizing
+
+/dailycap
+• Daily risk cap used by admin accounting snapshot
+
+/size <symbol> <side> <entry> <sl>
+• Position-size calculator using current risk settings
+
+────────────────────
+⏱️ COOLDOWNS & SESSION CONTROLS
+────────────────────
+/cooldown <SYMBOL>
+/cooldowns
+• Inspect cooldown state
+
+/cooldown_clear <SYMBOL> <long|short>
+• Clear one symbol + side cooldown
+
+/cooldown_clear_all
+• Clear all cooldowns
+
+/sessions
+/sessions_on <ASIA|LON|NY>
+/sessions_off <ASIA|LON|NY>
+/sessions_on_unlimited
+/sessions_off_unlimited
+/trade_window
+• User/session scheduling controls
 
 ────────────────────
 👤 USERS & ACCESS
@@ -13510,10 +13716,10 @@ Admin status/debug fields now mean:
 • View your own plan status (admins too)
 
 /trade_id_reset
-• Reset your own Trade ID numbering (next trade starts from 1)
+• Reset your own Trade ID numbering
 
 ────────────────────
-💳 PAYMENTS
+💳 PAYMENTS & BILLING OPS
 ────────────────────
 /payment_approve <user_id> <payment_id> <standard|pro>
 • Approve a payment (Stripe or USDT) and grant access
@@ -13521,8 +13727,13 @@ Admin status/debug fields now mean:
 /admin_payments [n]
 • Show recent payment approvals and current plans
 
+/billing
+/usdt
+/usdt_paid
+• Billing / USDT payment flow views
+
 ────────────────────
-🧰 SUPPORT / OPS
+🧰 SUPPORT / DATA / RECOVERY
 ────────────────────
 /support_open <user_id> [note]
 • Open a support ticket (admin)
@@ -13530,48 +13741,6 @@ Admin status/debug fields now mean:
 /support_close <ticket_id> [note]
 • Close a support ticket (admin)
 
-────────────────────
-🤖 AUTOTRADE (OWNER / ADMIN)
-────────────────────
-/autotrade_debug
-• AutoTrade readiness + synchronized live day/risk/carry diagnostics
-
-/autotrade_debug_reset
-• Clear AutoTrade debug state (fresh next attempt)
-
-/autotrade_last
-• Show last autotrade attempt details
-
-/autotrade_report [hours]
-• AutoTrade journal (recent)
-
-/autotrade_report_overall
-• AutoTrade overall performance summary
-
-/autotrade_sessions
-• Auto-trade allowed sessions (show or set)
-
-/open_trades
-• Show live open Bybit positions (admin, same live source as /status)
-
-/signal_report [hours]
-• Signal report for recent emailed setups
-
-/signal_report_overall
-• Overall signal performance summary
-
-────────────────────
-⏱️ COOLDOWNS
-────────────────────
-/cooldown_clear <SYMBOL> <long|short>
-• Clear cooldown for one symbol + side
-
-/cooldown_clear_all
-• Clear all cooldowns (global)
-
-────────────────────
-⚙️ DATA / RECOVERY
-────────────────────
 /admin_reset_report
 • Archive signals/outcomes and reset live performance report
 
@@ -13579,12 +13748,14 @@ Admin status/debug fields now mean:
 • Hard reset report-related tables (signals / emailed_setups / generated_setups)
 
 /reset
-• Reset bot data / clean DB (⚠️ DANGEROUS)
+• Reset bot data / clean DB (⚠️ dangerous)
 
 /restore
-• Restore from latest DB backup
-"""
+• Restore latest DB backup
 
+/help_admin
+• Show this admin guide
+"""
 
 HELP_TEXT = build_help_text()
 
@@ -13664,7 +13835,7 @@ async def guide_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Could not send the guide. Please try again.")
 
 async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin_user(update.effective_user.id):
         await update.message.reply_text("Admin only.")
         return
 
@@ -19244,67 +19415,124 @@ async def why_no_setups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Transparent health check:
-    - DB reachable
-    - Exchange tickers reachable
-    - Email configured/enabled status
-    - Cache stats
-    - Blackout status
+    Admin-facing transparent engine health check.
+
+    Distinguishes:
+    - engine healthy but no valid setups
+    - stale/broken scheduler or partial pipeline issues
     """
-    # DB check
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    owner = int(AUTOTRADE_OWNER_UID or uid or 0)
+
     db_ok = True
     db_err = ""
+    db_latency_ms = 0
+    t0 = time.time()
     try:
         con = db_connect()
         con.execute("SELECT 1")
         con.close()
+        db_latency_ms = int((time.time() - t0) * 1000)
+        _hb_touch("db", ok=True, details=f"sqlite_ok {db_latency_ms}ms")
     except Exception as e:
         db_ok = False
-        db_err = str(e)
+        db_err = f"{type(e).__name__}: {e}"
+        db_latency_ms = int((time.time() - t0) * 1000)
+        _hb_touch("db", ok=False, error=db_err, details="sqlite_error")
 
-    # Exchange check (quick)
     ex_ok = True
     ex_err = ""
     tickers_n = 0
+    ex_ms = 0
     t0 = time.time()
     try:
         best = await to_thread_heavy(fetch_futures_tickers)
         tickers_n = len(best or {})
+        ex_ms = int((time.time() - t0) * 1000)
     except Exception as e:
         ex_ok = False
-        ex_err = str(e)
-    dt_ms = int((time.time() - t0) * 1000)
+        ex_err = f"{type(e).__name__}: {e}"
+        ex_ms = int((time.time() - t0) * 1000)
 
-    # Cache stats
-    cache_items = len(_CACHE)
+    evidence = _db_recent_runtime_evidence(int(owner), hours=24)
+    verdict, notes = _admin_engine_verdict_text(int(owner), evidence=evidence)
 
-    # Email status
-    email_cfg = email_config_ok()
-    email_on = EMAIL_ENABLED
+    db_state, db_line = _hb_status_line("db", 900, label="DB")
+    screen_state, screen_line = _hb_status_line("screen", max(600, int(CHECK_INTERVAL_MIN * 240)), label="Scan path")
+    email_state, email_line = _hb_status_line("email", max(180, int(CHECK_INTERVAL_MIN * 120)), label="Email loop")
+    autotrade_state, autotrade_line = _hb_status_line("autotrade", 180, label="AutoTrade loop")
+    learning_h_state, learning_h_line = _hb_status_line("learning_hourly", max(1800, int(EVOLUTION_HOURLY_INTERVAL_MIN * 180)), label="Learning hourly")
+    learning_d_state, learning_d_line = _hb_status_line("learning_daily", max(21600, int(EVOLUTION_DAILY_INTERVAL_HOURS * 5400)), label="Learning daily")
+    opt_state, opt_line = _hb_status_line("optimizer", max(7200, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 7200)), label="Optimizer")
 
-    # Sessions
-    uid = update.effective_user.id
+    latest_email = _latest_emailed_setup_summary(int(owner), lookback_hours=24)
     user = get_user(uid)
     enabled = user_enabled_sessions(user)
     sess = in_session_now(user)
-    # Display the *live market session* (NY/LON/ASIA), not "UNLIMITED" access mode
     now_s = _guess_session_name_utc(datetime.now(timezone.utc)) if int(user.get("sessions_unlimited", 0) or 0) == 1 else (sess["name"] if sess else "NONE")
 
-    # Blackout
-
-    msg = [
-        "🩺 PulseFutures • Health",
+    lines = [
+        "🩺 PulseFutures • Admin Health",
         HDR,
-        f"DB: {'OK' if db_ok else 'FAIL'}" + (f" | {db_err}" if (not db_ok and db_err) else ""),
-        f"Bybit/CCXT: {'OK' if ex_ok else 'FAIL'} | tickers={tickers_n} | {dt_ms}ms" + (f" | {ex_err}" if (not ex_ok and ex_err) else ""),
-        f"Email: enabled={email_on} | configured={email_cfg}",
-        f"Cache: items={cache_items} | tickersTTL={TICKERS_TTL_SEC}s | ohlcvTTL={OHLCV_TTL_SEC}s",
-        HDR,
-        f"Your TZ: {user['tz']}",
-        f"Sessions enabled: {', '.join(enabled)} | Now: {now_s}",
-        f"Limits: emailcap/session={int(user['max_emails_per_session'])} (0=∞), emaildaycap={int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0=∞), gap={int(user['email_gap_min'])}m",
+        f"Verdict: {verdict.replace('_', ' ')}" + (f" | {'; '.join(notes[:3])}" if notes else ""),
+        f"DB: {'OK' if db_ok else 'FAIL'} | {db_latency_ms}ms" + (f" | {db_err}" if (not db_ok and db_err) else ""),
+        f"Bybit/CCXT: {'OK' if ex_ok else 'FAIL'} | tickers={tickers_n} | {ex_ms}ms" + (f" | {ex_err}" if (not ex_ok and ex_err) else ""),
+        f"Email config: enabled={EMAIL_ENABLED} | configured={email_config_ok()}",
+        f"Your TZ: {user['tz']} | Sessions enabled: {', '.join(enabled)} | Now: {now_s}",
+        SEP,
+        "Runtime heartbeats",
+        f"• {db_line}",
+        f"• {screen_line}",
+        f"• {email_line}",
+        f"• {autotrade_line}",
+        f"• {learning_h_line}",
+        f"• {learning_d_line}",
+        f"• {opt_line}",
+        SEP,
+        "Persisted pipeline evidence (last 24h)",
+        f"• signals rows: {int(evidence.get('signals_count', 0) or 0)} | last: {_fmt_runtime_ts(evidence.get('signals_last_ts', 0.0))}",
+        f"• generated screen setups: {int(evidence.get('generated_screen_count', 0) or 0)} | last: {_fmt_runtime_ts(evidence.get('generated_screen_last_ts', 0.0))}",
+        f"• generated email setups: {int(evidence.get('generated_email_count', 0) or 0)} | last: {_fmt_runtime_ts(evidence.get('generated_email_last_ts', 0.0))}",
+        f"• emailed setups: {int(evidence.get('emailed_count', 0) or 0)} | last: {_fmt_runtime_ts(evidence.get('emailed_last_ts', 0.0))}",
+        f"• autotrade journal opens: {int(evidence.get('autotrade_opened_count', 0) or 0)} | last: {_fmt_runtime_ts(evidence.get('autotrade_last_open_ts', 0.0))}",
     ]
-    await update.message.reply_text("\n".join(msg))
+
+    try:
+        rec = _LAST_REJECTS.get(int(uid)) or {}
+        reject_keys = len((rec.get("counts") or {}))
+        allowed_symbols = len((rec.get("allow") or []))
+        lines.append(f"• last reject snapshot: keys={reject_keys} | universe={allowed_symbols}")
+    except Exception:
+        pass
+
+    if latest_email:
+        lines.append(SEP)
+        lines.append("Latest emailed setup in DB")
+        lines.append(f"• {latest_email.get('side','')} {latest_email.get('symbol','')} | setup={latest_email.get('setup_id','')}")
+        lines.append(f"• created/logged: {_fmt_runtime_ts(latest_email.get('created_ts', 0.0))}")
+        if latest_email.get("email_logged_ts"):
+            lines.append(f"• email logged: {_fmt_runtime_ts(latest_email.get('email_logged_ts', 0.0))}")
+        if latest_email.get("source_kind") or latest_email.get("source_session"):
+            lines.append(f"• source: {latest_email.get('source_kind','')} | session={latest_email.get('source_session','')}")
+    else:
+        lines.append(SEP)
+        lines.append("Latest emailed setup in DB: none in last 24h")
+
+    if verdict == "HEALTHY_NO_VALID_SETUPS":
+        lines.append("Interpretation: engine appears alive and writing diagnostics, but recent candidates failed the rules.")
+    elif verdict == "HEALTHY_BUT_NO_RECENT_ACTIVITY":
+        lines.append("Interpretation: loops look alive, but there were no recent pipeline writes. Check /why and compare heartbeat freshness above.")
+    elif verdict != "HEALTHY":
+        lines.append("Interpretation: at least one critical loop looks stale/error/inactive. Investigate the heartbeat section first.")
+    else:
+        lines.append("Interpretation: engine appears healthy and synchronized based on runtime heartbeats + persisted writes.")
+
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     # Always log
@@ -20359,6 +20587,7 @@ def main():
     app.add_handler(CommandHandler("signal_report", signal_report_cmd, block=False))
     app.add_handler(CommandHandler("signbal_report", signal_report_cmd, block=False))
     app.add_handler(CommandHandler("signal_report_overall", signal_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("signal_report_all", signal_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("health", health_cmd, block=False))
     app.add_handler(CommandHandler("reset", reset_cmd, block=False))
     app.add_handler(CommandHandler("restore", restore_cmd, block=False))
