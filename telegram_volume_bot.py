@@ -73,6 +73,7 @@ import sys
 import time
 import logging
 import math
+import inspect
 from decimal import Decimal, ROUND_UP, ROUND_DOWN
 
 
@@ -7690,6 +7691,44 @@ def multi_tp(
         tp1, tp2, tp3 = (entry - d1, entry - d2, entry - d3)
 
     return _distinctify(tp1, tp2, tp3, entry, side)
+
+
+
+def _realized_r_option_b(outcome: str, side: str, entry: float, sl: float, tp1=None, tp2=None, tp3=None):
+    """Return realized R for outcome labels used by reports.
+
+    LOSS => -1R. TP wins => R multiple implied by the hit TP level relative to entry/SL.
+    Falls back to conventional 1R/2R/3R if TP prices are missing or invalid.
+    """
+    try:
+        outcome = str(outcome or '').strip().upper()
+        side = str(side or '').strip().upper()
+        entry = float(entry)
+        sl = float(sl)
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return None
+
+        if outcome == 'LOSS':
+            return -1.0
+
+        if outcome not in ('WIN_TP1', 'WIN_TP2', 'WIN_TP3'):
+            return None
+
+        idx = {'WIN_TP1': 1, 'WIN_TP2': 2, 'WIN_TP3': 3}[outcome]
+        tps = {1: tp1, 2: tp2, 3: tp3}
+        tp = tps.get(idx)
+        if tp is not None:
+            try:
+                tp = float(tp)
+                rr = abs(tp - entry) / risk
+                if math.isfinite(rr) and rr > 0:
+                    return float(rr)
+            except Exception:
+                pass
+        return float(idx)
+    except Exception:
+        return None
 
 def rr_to_tp(entry: float, sl: float, tp: float) -> float:
     d_sl = abs(entry - sl)
