@@ -10071,6 +10071,7 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
+    uid = int(update.effective_user.id)
     snap = await to_thread_fast(_evolution_snapshot_cached)
     if not snap:
         await update.message.reply_text("No evolution snapshot yet.")
@@ -10081,7 +10082,7 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trend = snap.get("trend") or {}
     last_opt = _db_get_last_opt_run() or {}
     opt_res = _db_get_opt_result(str(last_opt.get("run_id") or "")) if last_opt else {}
-    verdict, blockers = _admin_assurance_verdict(int(uid))
+    verdict, blockers = _admin_assurance_verdict(uid)
     opt_live = bool((opt_res or {}).get("promoted"))
 
     lines = [
@@ -13074,7 +13075,12 @@ KNOWN_COMMANDS = sorted(set([
     "health", "health_sys",
 
     # AutoTrade (admin)
-    "open_trades", "autotrade_debug", "autotrade_report",
+    "open_trades", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_debug_reset", "autotrade_report_overall", "autotrade_sessions",
+
+    # Admin diagnostics / optimization
+    "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
+    "signal_report", "signal_report_overall", "email_decision",
+    "params_show", "params_set", "params_reset", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report",
 
     # Timezone
     "tz",
@@ -13574,116 +13580,106 @@ Website: https://pulsefutures.com/
 """
 
 
+ADMIN_HELP_DESCRIPTIONS = {
+    "admin_user": "View full user record (plan, trial, alerts, settings)",
+    "admin_users": "List users (overview)",
+    "admin_grant": "Grant or change user plan",
+    "admin_revoke": "Revoke paid access (sets to FREE)",
+    "admin_payments": "Show recent payment approvals and current plans",
+    "payment_approve": "Approve a payment (Stripe or USDT) and grant access",
+    "myplan": "View your own plan status (admins too)",
+    "billing": "Subscription and payment surface",
+    "support_open": "Open a support ticket as admin",
+    "support_close": "Close a support ticket as admin",
+    "health_sys": "Admin engine health summary",
+    "health": "General bot and data health",
+    "why": "Last scan reject reasons",
+    "edge_status": "Learning / optimizer / execution assurance view",
+    "learning_status": "Detailed learning and optimizer status",
+    "optimizer_status": "Alias of /learning_status",
+    "winrate": "Overall estimated win-rate view",
+    "ny_winrate": "New York estimated win-rate view",
+    "lessons_learned": "Latest learning takeaways",
+    "email_decision": "Last email pipeline decision",
+    "signal_report": "Recent emailed setup outcomes",
+    "signal_report_overall": "Overall signal performance summary",
+    "autotrade_debug": "AutoTrade readiness + synchronized live day/risk/carry diagnostics",
+    "autotrade_debug_reset": "Clear AutoTrade debug state",
+    "autotrade_last": "Show last autotrade attempt details",
+    "autotrade_report": "AutoTrade journal (recent)",
+    "autotrade_report_overall": "AutoTrade overall performance summary",
+    "autotrade_sessions": "Show or set allowed auto-trade sessions",
+    "open_trades": "Show live open Bybit positions",
+    "cooldown_clear": "Clear cooldown for one symbol + side",
+    "cooldown_clear_all": "Clear all cooldowns",
+    "admin_reset_report": "Archive signals/outcomes and reset live performance report",
+    "admin_reset_signal_reports": "Hard reset report-related tables",
+    "reset": "Reset bot data / clean DB (dangerous)",
+    "restore": "Restore from latest DB backup",
+    "params_show": "Show active strategy parameters",
+    "params_set": "Update one strategy parameter",
+    "params_reset": "Reset strategy parameters to defaults",
+    "optimize": "Manual optimizer entrypoint (intentionally informational)",
+    "optimize_report": "Show last saved optimization report",
+    "self_optimize": "Explain autonomous optimizer mode",
+    "self_optimize_stop": "Explain why manual stop is disabled",
+    "self_optimize_report": "Show latest autonomous optimization result",
+    "trade_id_reset": "Reset your own Trade ID numbering",
+}
+
+ADMIN_HELP_GROUPS = [
+    ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
+    ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
+    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned", "email_decision"]),
+    ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
+    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "autotrade_sessions", "open_trades"]),
+    ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
+    ("🧠 OPTIMIZATION / STRATEGY", ["params_show", "params_set", "params_reset", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report"]),
+    ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
+]
+
+
+def _registered_command_names_from_source() -> set[str]:
+    try:
+        src = inspect.getsource(main)
+        found = re.findall(r'CommandHandler\("([^\"]+)"', src)
+        return {str(x).strip() for x in found if str(x).strip()}
+    except Exception:
+        return set()
+
+
 def build_help_text_admin() -> str:
-    return f"""🛠 PulseFutures — Admin Command Guide
+    registered = _registered_command_names_from_source()
+    lines = [
+        "🛠 PulseFutures — Admin Command Guide",
+        "",
+        "Admin commands are powerful. Use carefully.",
+        "Not financial advice.",
+        "",
+        f"Admin day boundary is fixed to the Asia-session start ({ADMIN_ASIA_DAY_START_HHMM} UTC) for all autotrade daily metrics.",
+        "",
+        "Admin status/debug fields now mean:",
+        "• Opened today = bot positions opened inside the current Asia-session day",
+        "• Closed today = bot positions closed inside the current Asia-session day",
+        "• Carried from prior day = still-open positions opened before today",
+        "• Current-day open risk = only risk from positions opened today",
+        "• Carried open risk = inherited exposure still open now",
+        "• Daily risk used today = current-day open risk + realised losses booked today",
+        "• Daily risk remaining for new trades = daily cap minus daily risk used today",
+    ]
 
-Admin commands are powerful. Use carefully.
-Not financial advice.
+    for title, commands in ADMIN_HELP_GROUPS:
+        visible = [c for c in commands if (not registered or c in registered)]
+        if not visible:
+            continue
+        lines.extend(["", "────────────────────", title, "────────────────────"])
+        for cmd in visible:
+            desc = ADMIN_HELP_DESCRIPTIONS.get(cmd, "Registered admin command")
+            lines.append(f"/{cmd}")
+            lines.append(f"• {desc}")
+            lines.append("")
 
-Admin day boundary is fixed to the Asia-session start ({ADMIN_ASIA_DAY_START_HHMM} UTC) for all autotrade daily metrics.
-
-Admin status/debug fields now mean:
-• Opened today = bot positions opened inside the current Asia-session day
-• Closed today = bot positions closed inside the current Asia-session day
-• Carried from prior day = still-open positions opened before today
-• Current-day open risk = only risk from positions opened today
-• Carried open risk = inherited exposure still open now
-• Daily risk used today = current-day open risk + realised losses booked today
-• Daily risk remaining for new trades = daily cap minus daily risk used today
-
-────────────────────
-👤 USERS & ACCESS
-────────────────────
-/admin_user <user_id>
-• View full user record (plan, trial, alerts, settings)
-
-/admin_users
-• List users (overview)
-
-/admin_grant <user_id> <standard|pro>
-• Grant or change user plan
-
-/admin_revoke <user_id>
-• Revoke paid access (sets to FREE)
-
-/myplan
-• View your own plan status (admins too)
-
-/trade_id_reset
-• Reset your own Trade ID numbering (next trade starts from 1)
-
-────────────────────
-💳 PAYMENTS
-────────────────────
-/payment_approve <user_id> <payment_id> <standard|pro>
-• Approve a payment (Stripe or USDT) and grant access
-
-/admin_payments [n]
-• Show recent payment approvals and current plans
-
-────────────────────
-🧰 SUPPORT / OPS
-────────────────────
-/support_open <user_id> [note]
-• Open a support ticket (admin)
-
-/support_close <ticket_id> [note]
-• Close a support ticket (admin)
-
-────────────────────
-🤖 AUTOTRADE (OWNER / ADMIN)
-────────────────────
-/autotrade_debug
-• AutoTrade readiness + synchronized live day/risk/carry diagnostics
-
-/autotrade_debug_reset
-• Clear AutoTrade debug state (fresh next attempt)
-
-/autotrade_last
-• Show last autotrade attempt details
-
-/autotrade_report [hours]
-• AutoTrade journal (recent)
-
-/autotrade_report_overall
-• AutoTrade overall performance summary
-
-/autotrade_sessions
-• Auto-trade allowed sessions (show or set)
-
-/open_trades
-• Show live open Bybit positions (admin, same live source as /status)
-
-/signal_report [hours]
-• Signal report for recent emailed setups
-
-/signal_report_overall
-• Overall signal performance summary
-
-────────────────────
-⏱️ COOLDOWNS
-────────────────────
-/cooldown_clear <SYMBOL> <long|short>
-• Clear cooldown for one symbol + side
-
-/cooldown_clear_all
-• Clear all cooldowns (global)
-
-────────────────────
-⚙️ DATA / RECOVERY
-────────────────────
-/admin_reset_report
-• Archive signals/outcomes and reset live performance report
-
-/admin_reset_signal_reports
-• Hard reset report-related tables (signals / emailed_setups / generated_setups)
-
-/reset
-• Reset bot data / clean DB (⚠️ DANGEROUS)
-
-/restore
-• Restore from latest DB backup
-"""
+    return "\n".join(lines).rstrip()
 
 
 HELP_TEXT = build_help_text()
@@ -13764,7 +13760,7 @@ async def guide_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Could not send the guide. Please try again.")
 
 async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not _is_admin(update):
         await update.message.reply_text("Admin only.")
         return
 
@@ -20508,6 +20504,14 @@ def main():
     app.add_handler(CommandHandler("lessons_learned", lessons_learned_cmd, block=False))
     
     # Strategy parameterization + optimization (admin)
+    app.add_handler(CommandHandler("params_show", cmd_params_show, block=False))
+    app.add_handler(CommandHandler("params_set", cmd_params_set, block=False))
+    app.add_handler(CommandHandler("params_reset", cmd_params_reset, block=False))
+    app.add_handler(CommandHandler("optimize", cmd_optimize, block=False))
+    app.add_handler(CommandHandler("optimize_report", cmd_optimize_report, block=False))
+    app.add_handler(CommandHandler("self_optimize", cmd_self_optimize, block=False))
+    app.add_handler(CommandHandler("self_optimize_stop", cmd_self_optimize_stop, block=False))
+    app.add_handler(CommandHandler("self_optimize_report", cmd_self_optimize_report, block=False))
 
 # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
