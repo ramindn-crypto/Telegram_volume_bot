@@ -1975,9 +1975,10 @@ def _estimate_position_risk_usd(p: dict) -> float:
         return 0.0
 
 def _autotrade_realized_pnl_today(uid: int, now_utc: Optional[datetime] = None) -> float:
-    """Realized PnL for autotrade journal rows closed inside the active admin day window."""
+    """Realized PnL for autotrade journal rows closed inside the active trading-day window."""
     try:
-        start_utc, end_utc = _admin_today_window_utc(now_utc)
+        user = _autotrade_user_settings(int(uid))
+        start_utc, end_utc = _admin_today_window_utc(now_utc, uid=int(uid), user=user)
         start_ts = int(start_utc.timestamp())
         end_ts = int(end_utc.timestamp())
         with sqlite3.connect(DB_PATH) as conn:
@@ -1993,7 +1994,7 @@ def _autotrade_realized_pnl_today(uid: int, now_utc: Optional[datetime] = None) 
 
 
 def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
-    """Compute authoritative AutoTrade day metrics using the admin Asia-session day.
+    """Compute authoritative AutoTrade day metrics using the configured trading-day window.
 
     New accounting model:
     - current_total_open_risk: risk on all currently open positions now
@@ -2031,7 +2032,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         realized_pnl_today = 0.0
         realized_loss_today = 0.0
 
-    start_utc, end_utc = _admin_today_window_utc()
+    start_utc, end_utc = _admin_today_window_utc(uid=int(uid), user=user)
     start_ts = float(start_utc.timestamp())
     end_ts = float(end_utc.timestamp())
 
@@ -5977,6 +5978,39 @@ def _day_local_for_ts(user: dict, ts: float) -> str:
     start_local, _ = _anchored_day_window(dt_ref, _user_day_reset_hhmm(user))
     return start_local.date().isoformat()
 
+
+def _trading_day_context(user: dict, now_ts: Optional[float] = None) -> dict:
+    """Single source of truth for the active trading-day window.
+
+    Returns local + UTC boundaries using the user's timezone and configured /dayreset anchor.
+    Handles DST safely by building local wall-clock anchors for today/tomorrow.
+    """
+    tz = _user_tzinfo(user)
+    tz_name = tz.key if hasattr(tz, 'key') else str((user or {}).get('tz') or 'UTC')
+    anchor = _user_day_reset_hhmm(user)
+    hh, mm = _parse_anchor_hhmm(anchor)
+    now_local = datetime.fromtimestamp(float(now_ts), tz) if now_ts is not None else datetime.now(tz)
+
+    today_anchor = datetime(now_local.year, now_local.month, now_local.day, hh, mm, 0, 0, tzinfo=tz)
+    if now_local < today_anchor:
+        prev_day = (today_anchor - timedelta(days=1)).astimezone(tz)
+        start_local = datetime(prev_day.year, prev_day.month, prev_day.day, hh, mm, 0, 0, tzinfo=tz)
+        end_local = today_anchor
+    else:
+        next_day = (today_anchor + timedelta(days=1)).astimezone(tz)
+        start_local = today_anchor
+        end_local = datetime(next_day.year, next_day.month, next_day.day, hh, mm, 0, 0, tzinfo=tz)
+
+    return {
+        'tz': tz,
+        'tz_name': tz_name,
+        'anchor_hhmm': anchor,
+        'start_local': start_local,
+        'end_local': end_local,
+        'start_utc': start_local.astimezone(timezone.utc),
+        'end_utc': end_local.astimezone(timezone.utc),
+    }
+
 def _risk_used_today_from_open_trades(user_id: int, user: dict, day_local: str) -> float:
     """Current-day open risk for manual trades.
 
@@ -6047,23 +6081,36 @@ def _risk_used_total_today(user_id: int, user: dict) -> float:
     return float(max(0.0, open_risk + loss_today))
 
 
-def _admin_today_window_utc(now_utc: Optional[datetime] = None) -> tuple[datetime, datetime]:
-    """Admin 'today' = Asia-session trading day anchored to the Asia-session start."""
-    now_utc = now_utc.astimezone(timezone.utc) if isinstance(now_utc, datetime) else datetime.now(timezone.utc)
-    start_utc, end_utc = _anchored_day_window(now_utc, ADMIN_ASIA_DAY_START_HHMM)
-    return start_utc.astimezone(timezone.utc), end_utc.astimezone(timezone.utc)
+def _admin_today_window_utc(now_utc: Optional[datetime] = None, uid: Optional[int] = None, user: Optional[dict] = None) -> tuple[datetime, datetime]:
+    """Admin active trading day in UTC, derived from the admin user's timezone + /dayreset."""
+    owner_uid = int(uid or AUTOTRADE_OWNER_UID or 0)
+    base_user = dict(user or {}) if isinstance(user, dict) else {}
+    if not base_user and owner_uid > 0:
+        try:
+            base_user = get_user(owner_uid) or {}
+        except Exception:
+            base_user = {}
+    if not base_user:
+        base_user = {'tz': 'UTC', 'day_reset_hhmm': DEFAULT_USER_DAY_RESET_HHMM}
+
+    now_ts = None
+    if isinstance(now_utc, datetime):
+        try:
+            now_ts = float(now_utc.astimezone(timezone.utc).timestamp())
+        except Exception:
+            now_ts = None
+    ctx = _trading_day_context(base_user, now_ts=now_ts)
+    return ctx['start_utc'], ctx['end_utc']
 
 
-def _admin_today_key_utc(now_utc: Optional[datetime] = None) -> str:
-    start_utc, _ = _admin_today_window_utc(now_utc)
+def _admin_today_key_utc(now_utc: Optional[datetime] = None, uid: Optional[int] = None, user: Optional[dict] = None) -> str:
+    start_utc, _ = _admin_today_window_utc(now_utc, uid=uid, user=user)
     return start_utc.strftime("%Y-%m-%d")
 
 
 def _user_today_window(user: dict, now_ts: Optional[float] = None) -> tuple[datetime, datetime, str]:
-    tz = _user_tzinfo(user)
-    now_local = datetime.fromtimestamp(float(now_ts), tz) if now_ts is not None else datetime.now(tz)
-    start_local, end_local = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
-    return start_local, end_local, tz.key if hasattr(tz, 'key') else str(user.get("tz") or "UTC")
+    ctx = _trading_day_context(user, now_ts=now_ts)
+    return ctx['start_local'], ctx['end_local'], ctx['tz_name']
 
 
 ADMIN_ASIA_DAY_START_HHMM = "00:00"
@@ -6174,7 +6221,8 @@ def _manual_position_metrics(user_id: int, user: dict) -> dict:
 
 def _autotrade_trades_today_count(uid: int, now_utc: Optional[datetime] = None) -> int:
     try:
-        start_utc, end_utc = _admin_today_window_utc(now_utc)
+        user = _autotrade_user_settings(int(uid))
+        start_utc, end_utc = _admin_today_window_utc(now_utc, uid=int(uid), user=user)
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
             cur.execute(
@@ -6191,6 +6239,7 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
     """Single source of truth for status/debug/accounting fields."""
     is_admin = is_admin_user(int(uid)) if is_admin is None else bool(is_admin)
     user = dict(user or {})
+    ctx = _trading_day_context(user)
     snap = {
         "is_admin": is_admin,
         "plan": str(effective_plan(uid, user)).upper(),
@@ -6212,9 +6261,9 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         "used_today": 0.0,
         "remaining_today": float("inf"),
         "over_by": 0.0,
-        "today_basis": "",
-        "today_key": "",
-        "today_window_label": "",
+        "today_basis": f"Anchored trading day ({ctx['tz_name']}, starts {ctx['anchor_hhmm']})",
+        "today_key": ctx['start_local'].date().isoformat(),
+        "today_window_label": f"{ctx['start_local'].strftime('%Y-%m-%d %H:%M')} → {ctx['end_local'].strftime('%Y-%m-%d %H:%M')} {ctx['tz_name']}",
     }
     if is_admin:
         live_eq = _live_equity_usdt()
@@ -6224,10 +6273,6 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
                 update_user(int(uid), equity=float(live_eq))
             except Exception:
                 pass
-        start_utc, end_utc = _admin_today_window_utc()
-        snap["today_key"] = start_utc.strftime("%Y-%m-%d")
-        snap["today_basis"] = f"Asia-session day anchored at {ADMIN_ASIA_DAY_START_HHMM} UTC"
-        snap["today_window_label"] = f"{start_utc.strftime('%Y-%m-%d %H:%M')} → {end_utc.strftime('%Y-%m-%d %H:%M')} UTC"
         m = _autotrade_day_risk_metrics(int(uid), float(snap["equity"]))
         snap["cap"] = float(m.get("cap") or 0.0)
         snap["current_total_open_risk"] = float(m.get("current_total_open_risk") or 0.0)
@@ -6256,7 +6301,6 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         carried_open_risk = float(pm.get('carried_open_risk') or 0.0)
         used_today = float(max(0.0, current_day_open_risk + max(0.0, -pnl_today)))
         remaining_raw = float("inf") if cap <= 0 else (cap - used_today)
-        start_local, end_local, tz_name = _user_today_window(user)
         opened_today = int(pm.get('opened_today_count') or 0)
         closed_today = int(pm.get('closed_today_count') or 0)
         open_now = int(pm.get('open_positions_now') or 0)
@@ -6279,9 +6323,6 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
             "over_by": max(0.0, -remaining_raw) if cap > 0 else 0.0,
             "pnl_today": pnl_today,
             "trades_today": opened_today,
-            "today_basis": f"Local anchored day ({tz_name}, starts {_user_day_reset_hhmm(user)})",
-            "today_key": start_local.date().isoformat(),
-            "today_window_label": f"{start_local.strftime('%Y-%m-%d %H:%M')} → {end_local.strftime('%Y-%m-%d %H:%M')} {tz_name}",
         })
     return snap
 
@@ -15317,6 +15358,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("📌 Status")
     lines.append(HDR)
     lines.append(f"Plan: {snap.get('plan')}")
+    lines.append(f"Trading day: {snap.get('today_window_label')}")
     lines.append(f"Equity: ${equity:.2f}")
     lines.append(f"PnL today (closed): ${pnl_today:+.2f}")
     _opened_today = int(snap.get('positions_opened_today', 0))
@@ -16680,7 +16722,8 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines.append(f"Keys present: {'yes' if (BYBIT_API_KEY and BYBIT_API_SECRET) else 'no'}")
     lines.append(SEP)
     lines.append(f"Local now (Melbourne): {_fmt_dt_local(now_utc)}")
-    lines.append(f"Admin today basis: {snap.get('today_basis')}")
+    lines.append(f"Trading day: {snap.get('today_window_label')}")
+    lines.append(f"Today basis: {snap.get('today_basis')}")
     try:
         _w = (dec or {}).get("when")
         if _w:
@@ -16735,24 +16778,6 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             lines.append("⚠️ Would BLOCK: per_trade_risk_gt_remaining")
     lines.append(SEP)
 
-    if det:
-        sym = det.get("symbol_sent") or det.get("symbol_raw") or ""
-        side = det.get("side") or ""
-        lines.append(SEP)
-        lines.append("Last setup attempt:")
-        lines.append(f"• {side} {sym}".strip())
-        if det.get('source_kind'):
-            lines.append(f"Setup source: {det.get('source_kind')}" + (f" | session={det.get('source_session')}" if det.get('source_session') else ""))
-        if det.get('signal_created_time'):
-            lines.append(f"Signal created (Melbourne): {_fmt_iso_to_local(det.get('signal_created_time'))}")
-        if det.get('email_logged_time'):
-            lines.append(f"Email logged (Melbourne): {_fmt_iso_to_local(det.get('email_logged_time'))}")
-        pos_opened = det.get('position_opened_time')
-        lines.append(
-            f"Position/Trade (opened in Bybit) (Melbourne): {_fmt_iso_to_local(pos_opened)}"
-            if pos_opened else
-            "Position/Trade (opened in Bybit) (Melbourne): —"
-        )
 
     msg = "\n".join([x for x in lines if x is not None and x != ""])
     await update.message.reply_text(msg)
