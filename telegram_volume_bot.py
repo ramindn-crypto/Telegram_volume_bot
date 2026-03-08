@@ -10068,7 +10068,6 @@ def _fmt_wr_block(title: str, item: dict) -> str:
 
 
 async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
@@ -11227,7 +11226,6 @@ async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
     if not should_run:
         return
 
-    _hb_touch('optimizer', ok=True, details='cycle_start')
     bot = getattr(context, "bot", None)
     stop_event = threading.Event()
     _SELF_OPT_STATE["stop_event"] = stop_event
@@ -11242,7 +11240,6 @@ async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
             None,
         )
     except Exception as e:
-        _hb_touch('optimizer', ok=False, error=f"{type(e).__name__}: {e}", details='cycle_error')
         try:
             if bot:
                 await _notify_admins_autonomous_opt(bot, f"⚠️ Autonomous optimization failed: {type(e).__name__}: {e}")
@@ -11253,7 +11250,6 @@ async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
         _SELF_OPT_STATE["stop_event"] = None
 
     if not isinstance(res, dict):
-        _hb_touch('optimizer', ok=False, error='non_dict_result', details='cycle_error')
         return
 
     try:
@@ -11263,7 +11259,6 @@ async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
         pass
 
     try:
-        _hb_touch('optimizer', ok=bool(res.get('ok')), details=f"status={str(res.get('status') or ('PROMOTED' if res.get('promoted') else 'NOT_PROMOTED'))}")
         if bot and bool(res.get("ok")):
             promoted = bool(res.get("promoted"))
             summ = res.get("metrics") or {}
@@ -19348,26 +19343,26 @@ async def why_no_setups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /health (transparent system health)
 # =========================================================
 async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Trusted admin health view for live production assurance."""
-    uid = update.effective_user.id
-    if not is_admin_user(uid):
-        await update.message.reply_text("⛔️ Admin only.")
-        return
-
-    owner = int(AUTOTRADE_OWNER_UID or uid or 0)
-
+    """
+    Transparent health check:
+    - DB reachable
+    - Exchange tickers reachable
+    - Email configured/enabled status
+    - Cache stats
+    - Blackout status
+    """
+    # DB check
     db_ok = True
     db_err = ""
     try:
         con = db_connect()
         con.execute("SELECT 1")
         con.close()
-        _hb_touch('db', ok=True, details='db_ok')
     except Exception as e:
         db_ok = False
-        db_err = f"{type(e).__name__}: {e}"
-        _hb_touch('db', ok=False, error=db_err, details='db_fail')
+        db_err = str(e)
 
+    # Exchange check (quick)
     ex_ok = True
     ex_err = ""
     tickers_n = 0
@@ -19377,59 +19372,29 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tickers_n = len(best or {})
     except Exception as e:
         ex_ok = False
-        ex_err = f"{type(e).__name__}: {e}"
+        ex_err = str(e)
     dt_ms = int((time.time() - t0) * 1000)
 
-    email_cfg = email_config_ok()
-    email_on = EMAIL_ENABLED
+    # Cache stats
     cache_items = len(_CACHE)
 
+    # Email status
+    email_cfg = email_config_ok()
+    email_on = EMAIL_ENABLED
+
+    # Sessions
+    uid = update.effective_user.id
     user = get_user(uid)
     enabled = user_enabled_sessions(user)
     sess = in_session_now(user)
-    now_utc = datetime.now(timezone.utc)
-    now_s = _guess_session_name_utc(now_utc) if int(user.get("sessions_unlimited", 0) or 0) == 1 else (sess["name"] if sess else "NONE")
+    # Display the *live market session* (NY/LON/ASIA), not "UNLIMITED" access mode
+    now_s = _guess_session_name_utc(datetime.now(timezone.utc)) if int(user.get("sessions_unlimited", 0) or 0) == 1 else (sess["name"] if sess else "NONE")
 
-    live_eq = _live_equity_usdt() if str(AUTOTRADE_MODE).lower() == 'live' else None
-    equity = float(live_eq if live_eq is not None else (get_user(owner) or {}).get('equity', 0.0) or 0.0)
-    mday = _autotrade_day_risk_metrics(int(owner), float(equity)) if owner > 0 else {}
-    autodec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
-    autodet = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
-    email_dec = _LAST_EMAIL_DECISION.get(owner) or {}
-    last_hourly = _evolution_get_last_run('hourly') or {}
-    last_daily = _evolution_get_last_run('daily') or {}
-    last_opt = _db_get_last_opt_run() or {}
-    last_opt_res = _db_get_opt_result(str(last_opt.get('run_id') or '')) if last_opt else {}
-    runtime_ev = _db_recent_runtime_evidence(int(owner), hours=24) if owner > 0 else {}
-    verdict, blockers = _admin_assurance_verdict(int(owner or uid))
+    # Blackout
 
-    comp_lines = []
-    for name, ttl, label in (
-        ('db', 600, 'DB'),
-        ('screen', max(600, int(CHECK_INTERVAL_MIN * 180)), 'Screen / scan loop'),
-        ('email', max(180, int(CHECK_INTERVAL_MIN * 120)), 'Email loop'),
-        ('autotrade', max(180, int(CHECK_INTERVAL_MIN * 180)), 'AutoTrade loop'),
-        ('learning_hourly', max(1800, int(EVOLUTION_HOURLY_INTERVAL_MIN * 180)), 'Learning hourly'),
-        ('learning_daily', max(21600, int(EVOLUTION_DAILY_INTERVAL_HOURS * 5400)), 'Learning daily'),
-        ('optimizer', max(7200, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 7200)), 'Optimizer'),
-    ):
-        _st, _line = _effective_hb_status_line(name, ttl, label=label, uid=int(owner or uid))
-        comp_lines.append(_line)
-
-    latest_markers = []
-    if runtime_ev.get('generated_screen_last_ts'):
-        latest_markers.append(f"Last /screen write: {_fmt_dt_local(datetime.fromtimestamp(float(runtime_ev.get('generated_screen_last_ts')), tz=timezone.utc))}")
-    if runtime_ev.get('emailed_last_ts'):
-        latest_markers.append(f"Last emailed setup logged: {_fmt_dt_local(datetime.fromtimestamp(float(runtime_ev.get('emailed_last_ts')), tz=timezone.utc))}")
-    if runtime_ev.get('autotrade_open_last_ts'):
-        latest_markers.append(f"Last bot trade open: {_fmt_dt_local(datetime.fromtimestamp(float(runtime_ev.get('autotrade_open_last_ts')), tz=timezone.utc))}")
-    if runtime_ev.get('autotrade_close_last_ts'):
-        latest_markers.append(f"Last bot trade close: {_fmt_dt_local(datetime.fromtimestamp(float(runtime_ev.get('autotrade_close_last_ts')), tz=timezone.utc))}")
-
-    lines = [
+    msg = [
         "🩺 PulseFutures • Health",
         HDR,
-        f"Master verdict: {'HEALTHY' if verdict == 'HEALTHY' else 'CHECK REQUIRED'}" + (f" | {'; '.join(blockers[:4])}" if blockers else ""),
         f"DB: {'OK' if db_ok else 'FAIL'}" + (f" | {db_err}" if (not db_ok and db_err) else ""),
         f"Bybit/CCXT: {'OK' if ex_ok else 'FAIL'} | tickers={tickers_n} | {dt_ms}ms" + (f" | {ex_err}" if (not ex_ok and ex_err) else ""),
         f"Email: enabled={email_on} | configured={email_cfg}",
@@ -19438,34 +19403,8 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Your TZ: {user['tz']}",
         f"Sessions enabled: {', '.join(enabled)} | Now: {now_s}",
         f"Limits: emailcap/session={int(user['max_emails_per_session'])} (0=∞), emaildaycap={int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0=∞), gap={int(user['email_gap_min'])}m",
-        HDR,
-        "Engine health:",
-        *comp_lines,
-        HDR,
-        f"AutoTrade ready: {'YES' if _autotrade_ready() else 'NO'} | mode={str(AUTOTRADE_MODE).lower()} | owner_uid={owner}",
-        f"AutoTrade sessions: {','.join(_autotrade_get_sessions())}",
-        f"Admin day basis: {str((_accounting_snapshot(owner, get_user(owner) or {}, is_admin=True) if owner > 0 else {}).get('today_basis') or '—')}",
-        f"Daily cap remaining: {('∞' if not math.isfinite(float(mday.get('remaining', float('inf')))) else f'${float(mday.get('remaining') or 0.0):.2f}')}",
-        f"Open positions now: {int(mday.get('open_positions_now', 0) or 0)} | Current total open risk: ${float(mday.get('current_total_open_risk', 0.0) or 0.0):.2f}",
-        HDR,
-        f"Last AutoTrade decision: {str(autodec.get('status') or '—')} | {str(autodec.get('reason') or '')}".rstrip(' |'),
-        f"Last AutoTrade attempt: {str(autodet.get('side') or '')} {str(autodet.get('symbol_sent') or autodet.get('symbol_raw') or '')}".strip(),
-        f"Last AutoTrade attempt time: {_fmt_iso_local_label(str(autodet.get('when') or autodec.get('when') or ''), fallback='—')}",
-        f"Last email decision: {str(email_dec.get('decision') or email_dec.get('status') or '—')} | {str(email_dec.get('reason') or '')}".rstrip(' |'),
-        f"Last email decision time: {_fmt_iso_local_label(str(email_dec.get('when') or ''), fallback='—')}",
-        HDR,
-        _format_last_run_line('Last hourly cycle', last_hourly),
-        _format_last_run_line('Last daily review', last_daily),
-        f"Last optimizer run: {(_fmt_dt_local(datetime.fromtimestamp(float((last_opt or {}).get('finished_ts') or (last_opt or {}).get('started_ts') or 0.0), tz=timezone.utc)) if ((last_opt or {}).get('finished_ts') or (last_opt or {}).get('started_ts')) else '—')} | status={str((last_opt or {}).get('status') or 'UNKNOWN').upper()}",
-        f"Optimizer live effect: {'LIVE PARAMS UPDATED' if bool((last_opt_res or {}).get('promoted')) else 'ADVISORY ONLY'}",
     ]
-
-    if latest_markers:
-        lines.append(HDR)
-        lines.append("Latest activity markers:")
-        lines.extend(latest_markers[:6])
-
-    await send_long_message(update, "\n".join([x for x in lines if x is not None and x != ""]), parse_mode=None)
+    await update.message.reply_text("\n".join(msg))
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     # Always log
@@ -20520,7 +20459,6 @@ def main():
     app.add_handler(CommandHandler("signal_report", signal_report_cmd, block=False))
     app.add_handler(CommandHandler("signbal_report", signal_report_cmd, block=False))
     app.add_handler(CommandHandler("signal_report_overall", signal_report_overall_cmd, block=False))
-    app.add_handler(CommandHandler("signal_report_all", signal_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("health", health_cmd, block=False))
     app.add_handler(CommandHandler("reset", reset_cmd, block=False))
     app.add_handler(CommandHandler("restore", restore_cmd, block=False))
