@@ -162,6 +162,7 @@ def _autotrade_migrate_tables():
             add_col("status", "status TEXT")
             add_col("closed_ts", "closed_ts INTEGER")
             add_col("pnl_usdt", "pnl_usdt REAL")
+            add_col("outcome", "outcome TEXT")
             add_col("note", "note TEXT")
 
             # Backfill trade_id for legacy rows (uses rowid).
@@ -2225,6 +2226,313 @@ def _autotrade_realized_pnl_today(uid: int, now_utc: Optional[datetime] = None) 
         return 0.0
 
 
+
+
+def _bybit_closed_pnl_event_ts(row: dict) -> float:
+    try:
+        for key in ('updatedTime', 'updated_time', 'createdTime', 'created_time', 'execTime', 'fillTime'):
+            ts = _ts_seconds_from_any((row or {}).get(key))
+            if ts > 0:
+                return ts
+    except Exception:
+        pass
+    return 0.0
+
+
+def _bybit_closed_pnl_event_qty(row: dict) -> float:
+    try:
+        for key in ('closedSize', 'closed_size', 'qty', 'size', 'closedQty', 'execQty'):
+            v = float((row or {}).get(key) or 0.0)
+            if v > 0:
+                return abs(v)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _bybit_get_closed_pnl_linear(start_ts: float, end_ts: float, symbol: str | None = None, limit: int = 200) -> list[dict]:
+    """Fetch Bybit closed-PnL rows for the requested window.
+
+    Best-effort pagination is used because the exchange may return a cursor.
+    """
+    if str(AUTOTRADE_MODE).lower() != 'live' or not BYBIT_API_KEY or not BYBIT_API_SECRET:
+        return []
+    start_ms = int(max(0.0, float(start_ts or 0.0)) * 1000)
+    end_ms = int(max(float(end_ts or 0.0), float(start_ts or 0.0)) * 1000)
+    sym = _bybit_linear_symbol(symbol) if symbol else None
+    out = []
+    cursor = None
+    seen = set()
+    for _ in range(8):
+        payload = {
+            'category': 'linear',
+            'startTime': start_ms,
+            'endTime': end_ms,
+            'limit': int(max(20, min(int(limit or 200), 200))),
+        }
+        if sym:
+            payload['symbol'] = sym
+        if cursor:
+            payload['cursor'] = cursor
+        try:
+            res = _bybit_v5_request('GET', '/v5/position/closed-pnl', payload)
+            if int((res or {}).get('retCode', -1)) != 0:
+                break
+            result = (res or {}).get('result') or {}
+            rows = result.get('list') or []
+            if not rows:
+                break
+            added = 0
+            for r in rows:
+                try:
+                    key = (
+                        _bybit_linear_symbol(str((r or {}).get('symbol') or '')),
+                        str((r or {}).get('side') or '').upper().strip(),
+                        int(_bybit_closed_pnl_event_ts(r) or 0),
+                        str((r or {}).get('orderId') or (r or {}).get('execId') or ''),
+                        float((r or {}).get('closedPnl') or 0.0),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(r)
+                    added += 1
+                except Exception:
+                    continue
+            cursor = str(result.get('nextPageCursor') or result.get('nextPageToken') or '').strip()
+            if not cursor or added <= 0:
+                break
+        except Exception:
+            break
+    return list(out)
+
+
+def _autotrade_db_close_trade(trade_id: str, closed_ts: float, pnl_usdt: float, outcome: str, note_append: str = '') -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            row = cur.execute("SELECT note FROM autotrade_trades WHERE trade_id=?", (str(trade_id),)).fetchone()
+            old_note = str((row[0] if row else '') or '')
+            note_parts = [old_note.strip()] if old_note and old_note.strip() else []
+            extra = str(note_append or '').strip()
+            if extra and extra not in note_parts:
+                note_parts.append(extra)
+            merged_note = ' | '.join([x for x in note_parts if x])
+            cur.execute(
+                """UPDATE autotrade_trades
+                   SET status='CLOSED', closed_ts=?, pnl_usdt=?, outcome=?, note=?
+                   WHERE trade_id=?""",
+                (int(float(closed_ts or 0.0)), float(pnl_usdt or 0.0), str(outcome or '').upper().strip(), merged_note, str(trade_id)),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _autotrade_sync_closed_trades_from_exchange(uid: int, now_utc: Optional[datetime] = None, lookback_days: int = 14) -> dict:
+    """Reconcile OPEN journal rows against live Bybit state and closed-PnL history.
+
+    This is the missing link between live exchange closures and the bot's day accounting.
+    Without this sync, /status and /autotrade_debug can only see still-open positions plus
+    whatever was manually written into autotrade_trades.
+    """
+    summary = {'checked': 0, 'closed': 0, 'matched_events': 0}
+    if str(AUTOTRADE_MODE).lower() != 'live':
+        return summary
+    try:
+        open_rows = _autotrade_db_open_trades(int(uid)) or []
+    except Exception:
+        open_rows = []
+    if not open_rows:
+        return summary
+
+    try:
+        live_positions = _bybit_get_open_positions_linear() or []
+    except Exception:
+        live_positions = []
+    live_keys = {
+        (str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper())
+        for p in (live_positions or [])
+    }
+
+    now_ts = float((now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc).timestamp())
+    min_open_ts = min(float(t.get('opened_ts') or now_ts) for t in open_rows) if open_rows else now_ts
+    start_ts = max(0.0, min(min_open_ts, now_ts) - 86400.0 * max(1, int(lookback_days)))
+    closed_rows = _bybit_get_closed_pnl_linear(start_ts, now_ts, limit=200)
+
+    event_pool: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for r in (closed_rows or []):
+        try:
+            sym = str(_bybit_linear_symbol((r or {}).get('symbol') or '')).upper()
+            side = str((r or {}).get('side') or '').upper().strip()
+            if not sym or not side:
+                continue
+            ts = float(_bybit_closed_pnl_event_ts(r) or 0.0)
+            if ts <= 0:
+                continue
+            pnl = float((r or {}).get('closedPnl') or 0.0)
+            qty = float(_bybit_closed_pnl_event_qty(r) or 0.0)
+            event_pool[(sym, side)].append({
+                'ts': ts,
+                'pnl': pnl,
+                'qty': qty,
+                'raw': r,
+                'used': False,
+            })
+        except Exception:
+            continue
+    for key in list(event_pool.keys()):
+        event_pool[key].sort(key=lambda x: (float(x.get('ts') or 0.0), float(x.get('qty') or 0.0)))
+
+    rows_by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for t in open_rows:
+        try:
+            key = (str(t.get('symbol') or '').upper(), str(t.get('side') or '').upper())
+            rows_by_key[key].append(t)
+        except Exception:
+            continue
+    for key in list(rows_by_key.keys()):
+        rows_by_key[key].sort(key=lambda x: float(x.get('opened_ts') or 0.0))
+
+    for key, trades in rows_by_key.items():
+        events = event_pool.get(key) or []
+        for idx, trade in enumerate(trades):
+            summary['checked'] += 1
+            sym, side = key
+            if key in live_keys:
+                continue
+            trade_id = str(trade.get('trade_id') or '')
+            opened_ts = float(trade.get('opened_ts') or 0.0)
+            trade_qty = abs(float(trade.get('qty') or 0.0))
+            next_open_ts = None
+            for later in trades[idx + 1:]:
+                later_ts = float(later.get('opened_ts') or 0.0)
+                if later_ts > opened_ts:
+                    next_open_ts = later_ts
+                    break
+
+            candidates = []
+            for ev in events:
+                if ev.get('used'):
+                    continue
+                ev_ts = float(ev.get('ts') or 0.0)
+                if ev_ts <= 0 or ev_ts + 300.0 < opened_ts:
+                    continue
+                if next_open_ts and ev_ts >= next_open_ts:
+                    continue
+                candidates.append(ev)
+            if not candidates:
+                continue
+
+            matched = []
+            matched_qty = 0.0
+            matched_pnl = 0.0
+            for ev in candidates:
+                matched.append(ev)
+                matched_pnl += float(ev.get('pnl') or 0.0)
+                matched_qty += abs(float(ev.get('qty') or 0.0))
+                if trade_qty > 0 and matched_qty > 0 and matched_qty >= trade_qty * 0.80:
+                    break
+                if trade_qty <= 0:
+                    break
+            if not matched:
+                continue
+
+            close_ts = max(float(ev.get('ts') or 0.0) for ev in matched)
+            for ev in matched:
+                ev['used'] = True
+            outcome = 'BREAKEVEN'
+            if matched_pnl > 0:
+                outcome = 'WIN'
+            elif matched_pnl < 0:
+                outcome = 'LOSS'
+            note_bits = ['exchange_close_sync']
+            if len(matched) > 1:
+                note_bits.append(f'partial_close_events={len(matched)}')
+            _autotrade_db_close_trade(trade_id, close_ts, matched_pnl, outcome, ' | '.join(note_bits))
+            summary['closed'] += 1
+            summary['matched_events'] += len(matched)
+    return summary
+
+
+def _autotrade_trade_day_label(ts: float, user: dict) -> str:
+    try:
+        dt_local = datetime.fromtimestamp(float(ts), _user_tzinfo(user))
+        start_local, _ = _anchored_day_window(dt_local, _user_day_reset_hhmm(user))
+        return start_local.strftime('%Y-%m-%d')
+    except Exception:
+        return ''
+
+
+def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
+    days = int(max(2, min(int(days or 7), 60)))
+    user = _autotrade_user_settings(int(uid))
+    _autotrade_sync_closed_trades_from_exchange(int(uid), lookback_days=max(14, days + 5))
+    try:
+        trades = db_list_autotrade_trades_all(int(uid)) or []
+    except Exception:
+        trades = []
+
+    tz = _user_tzinfo(user)
+    start_local, end_local = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(user))
+    day_starts = [start_local - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    rows = []
+    for ds in day_starts:
+        de = ds + timedelta(days=1)
+        ds_ts = float(ds.astimezone(timezone.utc).timestamp())
+        de_ts = float(de.astimezone(timezone.utc).timestamp())
+        opened = [t for t in trades if ds_ts <= float(t.get('opened_ts') or 0.0) < de_ts]
+        closed = [t for t in trades if ds_ts <= float(t.get('closed_ts') or 0.0) < de_ts]
+        pnls = [float(t.get('pnl') or 0.0) for t in closed if t.get('pnl') is not None]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
+        rows.append({
+            'day': ds.strftime('%Y-%m-%d'),
+            'opened': len(opened),
+            'closed': len(closed),
+            'wins': len(wins),
+            'losses': len(losses),
+            'net_pnl': sum(pnls) if pnls else 0.0,
+            'avg_win': (sum(wins) / len(wins)) if wins else 0.0,
+            'avg_loss': (sum(losses) / len(losses)) if losses else 0.0,
+            'gross_profit': sum(wins) if wins else 0.0,
+            'gross_loss': abs(sum(losses)) if losses else 0.0,
+        })
+    return rows
+
+
+def _autotrade_performance_summary(rows: list[dict]) -> dict:
+    closed = sum(int(r.get('closed') or 0) for r in rows)
+    wins = sum(int(r.get('wins') or 0) for r in rows)
+    losses = sum(int(r.get('losses') or 0) for r in rows)
+    net = sum(float(r.get('net_pnl') or 0.0) for r in rows)
+    gross_profit = sum(float(r.get('gross_profit') or 0.0) for r in rows)
+    gross_loss = sum(float(r.get('gross_loss') or 0.0) for r in rows)
+    avg_win_vals = [float(r.get('avg_win') or 0.0) for r in rows if float(r.get('avg_win') or 0.0) > 0]
+    avg_loss_vals = [float(r.get('avg_loss') or 0.0) for r in rows if float(r.get('avg_loss') or 0.0) < 0]
+    best_day = max(rows, key=lambda r: float(r.get('net_pnl') or 0.0)) if rows else None
+    worst_day = min(rows, key=lambda r: float(r.get('net_pnl') or 0.0)) if rows else None
+    win_rate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float('inf') if gross_profit > 0 else 0.0)
+    avg_win = (sum(avg_win_vals) / len(avg_win_vals)) if avg_win_vals else 0.0
+    avg_loss = (sum(avg_loss_vals) / len(avg_loss_vals)) if avg_loss_vals else 0.0
+    expectancy = 0.0
+    if (wins + losses) > 0:
+        expectancy = ((wins / (wins + losses)) * avg_win) + ((losses / (wins + losses)) * avg_loss)
+    return {
+        'closed': closed,
+        'wins': wins,
+        'losses': losses,
+        'net': net,
+        'win_rate': win_rate,
+        'profit_factor': profit_factor,
+        'avg_win': avg_win,
+        'avg_loss': avg_loss,
+        'best_day': best_day,
+        'worst_day': worst_day,
+        'expectancy': expectancy,
+    }
+
 def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     """Compute authoritative AutoTrade day metrics using the configured trading-day window.
 
@@ -2250,6 +2558,12 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         cap = float(daily_cap_usd(user) or 0.0) if equity and equity > 0 else 0.0
     except Exception:
         cap = 0.0
+
+    try:
+        if mode == "live":
+            _autotrade_sync_closed_trades_from_exchange(int(uid), lookback_days=14)
+    except Exception:
+        pass
 
     try:
         realized_pnl_today = float(_autotrade_realized_pnl_today(int(uid)) or 0.0)
@@ -13850,6 +14164,9 @@ Reports
 /report_overall 
 • All-time performance report 
 
+/performance_report
+• Actual autotrade performance trend (exchange/journal based)
+
 ────────────────────
 🆘 HELP & SUPPORT
 ────────────────────
@@ -13904,6 +14221,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_last": "Show last autotrade attempt details",
     "autotrade_report": "AutoTrade journal (recent)",
     "autotrade_report_overall": "AutoTrade overall performance summary",
+    "performance_report": "Actual autotrade performance trend (exchange/journal based)",
     "autotrade_sessions": "Show or set allowed auto-trade sessions",
     "open_trades": "Show live open Bybit positions",
     "cooldown_clear": "Clear cooldown for one symbol + side",
@@ -13928,7 +14246,7 @@ ADMIN_HELP_GROUPS = [
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned", "email_decision"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
-    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "autotrade_sessions", "open_trades"]),
+    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "autotrade_sessions", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("🧠 OPTIMIZATION / STRATEGY", ["params_show", "params_set", "params_reset", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
@@ -16310,7 +16628,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))  # 1h..7d
 
-    await update.message.reply_text(f"📊 Signal Report\n{HDR}\nScanning emailed setups for last {lookback_h}h…")
+    await update.message.reply_text(f"📊 Signal Report\n{HDR}\nModel-based emailed-setup outcome report (not actual exchange PnL).\nScanning emailed setups for last {lookback_h}h…")
 
     ts_from = time.time() - lookback_h * 3600.0
     emailed = db_list_emailed_setups(uid, ts_from)
@@ -16790,6 +17108,64 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
                 continue
 
     await send_long_message(update, "\n".join(lines))
+
+
+async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin actual exchange/journal performance trend over recent anchored trading days."""
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
+        await update.message.reply_text("⛔️ Owner/admin only.")
+        return
+
+    days = 7
+    try:
+        if context.args and str(context.args[0]).strip():
+            days = int(float(context.args[0]))
+    except Exception:
+        days = 7
+    days = int(clamp(days, 3, 30))
+
+    rows = _autotrade_performance_rows(int(AUTOTRADE_OWNER_UID), days=days)
+    summary = _autotrade_performance_summary(rows)
+
+    lines = []
+    lines.append("📈 Performance Report")
+    lines.append(HDR)
+    lines.append(f"Window: last {days} anchored trading day(s) (Melbourne / configured day reset)")
+    lines.append("Source: actual autotrade journal + live Bybit close sync")
+    lines.append(HDR)
+    lines.append(
+        f"Closed: {int(summary.get('closed') or 0)} | Wins: {int(summary.get('wins') or 0)} | "
+        f"Losses: {int(summary.get('losses') or 0)} | Win rate: {float(summary.get('win_rate') or 0.0):.1f}%"
+    )
+    pf = summary.get('profit_factor')
+    pf_txt = 'INF' if pf == float('inf') else f"{float(pf or 0.0):.2f}"
+    lines.append(
+        f"Net PnL: ${float(summary.get('net') or 0.0):+.2f} | Avg win: ${float(summary.get('avg_win') or 0.0):+.2f} | "
+        f"Avg loss: ${float(summary.get('avg_loss') or 0.0):+.2f}"
+    )
+    lines.append(f"Profit factor: {pf_txt} | Expectancy/closed trade: ${float(summary.get('expectancy') or 0.0):+.2f}")
+    bd = summary.get('best_day') or {}
+    wd = summary.get('worst_day') or {}
+    if bd:
+        lines.append(f"Best day: {bd.get('day')} (${float(bd.get('net_pnl') or 0.0):+.2f})")
+    if wd:
+        lines.append(f"Worst day: {wd.get('day')} (${float(wd.get('net_pnl') or 0.0):+.2f})")
+    lines.append(SEP)
+    lines.append("Daily trend:")
+    for r in rows:
+        gp = float(r.get('gross_profit') or 0.0)
+        gl = float(r.get('gross_loss') or 0.0)
+        pf_day = (gp / gl) if gl > 0 else (float('inf') if gp > 0 else 0.0)
+        pf_day_txt = 'INF' if pf_day == float('inf') else f"{pf_day:.2f}"
+        wr = (float(r.get('wins') or 0) / max(1, int(r.get('wins') or 0) + int(r.get('losses') or 0)) * 100.0) if (int(r.get('wins') or 0) + int(r.get('losses') or 0)) > 0 else 0.0
+        lines.append(
+            f"• {r.get('day')}: pnl ${float(r.get('net_pnl') or 0.0):+.2f} | open {int(r.get('opened') or 0)} | "
+            f"closed {int(r.get('closed') or 0)} | W {int(r.get('wins') or 0)} / L {int(r.get('losses') or 0)} | "
+            f"WR {wr:.1f}% | PF {pf_day_txt}"
+        )
+
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 
 async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -20786,6 +21162,7 @@ def main():
     
     app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
+    app.add_handler(CommandHandler("performance_report", performance_report_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
