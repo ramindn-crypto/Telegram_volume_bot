@@ -392,7 +392,9 @@ VALID_LICENSE_PREFIX = {
 # Reuse your existing admin system
 # Unified admin identity source.
 # Fall back to the owner id used in this deployment; merged with ADMIN_USER_IDS later.
-_ADMIN_FALLBACK_IDS = {74935310}
+# Production-safe default: do not hard-code admin Telegram IDs in the codebase.
+# Admins should come from environment / runtime configuration only.
+_ADMIN_FALLBACK_IDS = set()
 ADMIN_IDS = set(_ADMIN_FALLBACK_IDS)
 
 ALLOWED_WHEN_LOCKED = {
@@ -3116,11 +3118,14 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
                 'notes': str(info.get('notes') or ''),
             })
         inherited_open_positions = min(int(inherited_open_positions), int(open_positions_now))
+        current_day_open_positions = max(0, int(open_positions_now) - int(inherited_open_positions))
         # Live admin accounting is driven by exchange-truth open exposure.
         # Charge all currently open risk to today's live risk view so /status and
         # /autotrade_debug stay aligned with the actual Bybit exposure the user sees.
         live_open_risk_charged_today = float(current_total_open_risk)
-        opened_today_count = max(int(open_positions_now), int(opened_today_count))
+        # Do NOT inflate opened_today_count to all currently open positions.
+        # Keep the day-open count anchored to confirmed current-day opens.
+        opened_today_count = max(int(opened_today_count), int(current_day_open_positions))
     else:
         open_positions_now = len(journal_open)
         for t in journal_open:
@@ -9146,6 +9151,16 @@ def next_setup_id() -> str:
     finally:
         con.close()
     return f"PF-{today}-{n:04d}"
+
+
+def make_setup_id(base: str = '', side: str = '') -> str:
+    """Backward-compatible setup ID helper.
+
+    Some setup builders still call make_setup_id(base, side). The setup identity
+    is intentionally sequence-based and globally unique for the day, so base/side
+    are accepted for compatibility but not embedded in the ID.
+    """
+    return next_setup_id()
 
 # =========================================================
 # SL/TP ENGINE (closer + dynamic cap + ✅ confidence-weighted TP scaling)
