@@ -2515,7 +2515,7 @@ def _autotrade_trade_day_label(ts: float, user: dict) -> str:
 def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[dict]:
     """Conservative admin-history fallback for older deployments.
 
-    Uses *emailed setup identity* + exchange closed-PnL events when older journal rows are
+    Uses historical setup identity + exchange closed-PnL events when older journal rows are
     missing. This is only used to avoid a useless all-zero performance report after upgrades.
     It never overrides journal-confirmed bot trades.
     """
@@ -2548,6 +2548,7 @@ def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[d
             cts = float(t.get('closed_ts') or 0.0)
             pnl = round(float(t.get('pnl') or 0.0), 8)
             journal_event_keys.add((sym, side, int(cts // 60), pnl))
+            journal_event_keys.add((sym, _opposite_side_text(side), int(cts // 60), pnl))
         except Exception:
             continue
 
@@ -2557,23 +2558,46 @@ def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[d
             cur = con.cursor()
             rows = cur.execute(
                 """
-                SELECT e.setup_id,
-                       e.emailed_ts,
-                       COALESCE(l.executed_ts, 0) AS executed_ts,
-                       COALESCE(l.closed_ts, 0) AS lifecycle_closed_ts,
-                       COALESCE(NULLIF(l.trade_id,''), '') AS trade_id,
-                       COALESCE(NULLIF(l.symbol,''), NULLIF(s.symbol,''), NULLIF(g.symbol,''), '') AS symbol,
-                       COALESCE(NULLIF(l.side,''), NULLIF(s.side,''), NULLIF(g.side,''), '') AS side,
-                       COALESCE(NULLIF(l.state,''), '') AS state
-                FROM emailed_setups e
-                LEFT JOIN admin_setup_lifecycle l ON l.setup_id = e.setup_id
-                LEFT JOIN signals s ON s.setup_id = e.setup_id
-                LEFT JOIN generated_setups g ON g.setup_id = e.setup_id AND g.user_id = e.user_id AND g.source='email'
-                WHERE e.user_id=?
-                  AND e.emailed_ts >= ?
-                ORDER BY e.emailed_ts ASC, e.setup_id ASC
+                WITH candidates AS (
+                    SELECT e.setup_id AS setup_id,
+                           e.user_id AS user_id,
+                           e.emailed_ts AS emailed_ts,
+                           0.0 AS generated_ts,
+                           'emailed_setups' AS source_kind
+                    FROM emailed_setups e
+                    WHERE e.user_id = ?
+                      AND e.emailed_ts >= ?
+                    UNION ALL
+                    SELECT g.setup_id AS setup_id,
+                           g.user_id AS user_id,
+                           0.0 AS emailed_ts,
+                           MAX(g.created_ts) AS generated_ts,
+                           'generated_setups' AS source_kind
+                    FROM generated_setups g
+                    WHERE g.user_id = ?
+                      AND g.created_ts >= ?
+                      AND COALESCE(NULLIF(g.setup_id,''),'') <> ''
+                    GROUP BY g.user_id, g.setup_id
+                )
+                SELECT c.setup_id,
+                       MAX(c.emailed_ts) AS emailed_ts,
+                       MAX(c.generated_ts) AS generated_ts,
+                       MIN(c.source_kind) AS source_kind,
+                       COALESCE(MAX(l.executed_ts), 0) AS executed_ts,
+                       COALESCE(MAX(l.closed_ts), 0) AS lifecycle_closed_ts,
+                       COALESCE(MAX(NULLIF(l.trade_id,'')), '') AS trade_id,
+                       COALESCE(MAX(NULLIF(l.symbol,'')), MAX(NULLIF(s.symbol,'')), MAX(NULLIF(g.symbol,'')), '') AS symbol,
+                       COALESCE(MAX(NULLIF(l.side,'')), MAX(NULLIF(s.side,'')), MAX(NULLIF(g.side,'')), '') AS side,
+                       COALESCE(MAX(NULLIF(l.state,'')), '') AS state,
+                       COALESCE(MAX(s.created_ts), 0) AS signal_created_ts
+                FROM candidates c
+                LEFT JOIN admin_setup_lifecycle l ON l.setup_id = c.setup_id
+                LEFT JOIN signals s ON s.setup_id = c.setup_id
+                LEFT JOIN generated_setups g ON g.setup_id = c.setup_id AND g.user_id = c.user_id
+                GROUP BY c.setup_id
+                ORDER BY MAX(c.emailed_ts) ASC, MAX(c.generated_ts) ASC, COALESCE(MAX(s.created_ts),0) ASC, c.setup_id ASC
                 """,
-                (int(uid), float(start_ts - 86400.0 * 3.0)),
+                (int(uid), float(start_ts - 86400.0 * 3.0), int(uid), float(start_ts - 86400.0 * 3.0)),
             ).fetchall() or []
             setup_rows = [dict(r) for r in rows]
     except Exception:
@@ -2582,17 +2606,20 @@ def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[d
     if not setup_rows:
         return []
 
-    grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    grouped: dict[str, list[dict]] = defaultdict(list)
     for r in setup_rows:
         sym = str(r.get('symbol') or '').upper()
-        side = str(r.get('side') or '').upper()
-        if not sym or not side:
+        if not sym:
             continue
-        grouped[(sym, side)].append(r)
+        base_ts = float(r.get('executed_ts') or 0.0) or float(r.get('emailed_ts') or 0.0) or float(r.get('generated_ts') or 0.0) or float(r.get('signal_created_ts') or 0.0)
+        if base_ts <= 0:
+            continue
+        r['_base_ts'] = base_ts
+        grouped[sym].append(r)
     for key in list(grouped.keys()):
-        grouped[key].sort(key=lambda x: (float(x.get('executed_ts') or 0.0) or float(x.get('emailed_ts') or 0.0), str(x.get('setup_id') or '')))
+        grouped[key].sort(key=lambda x: (float(x.get('_base_ts') or 0.0), str(x.get('setup_id') or '')))
 
-    event_pool: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    event_pool: dict[str, list[dict]] = defaultdict(list)
     for r in closed_rows:
         try:
             sym = str(_bybit_linear_symbol((r or {}).get('symbol') or '')).upper()
@@ -2601,19 +2628,26 @@ def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[d
             if not sym or ts <= 0:
                 continue
             qty = float(_bybit_closed_pnl_event_qty(r) or 0.0)
-            ev = {'ts': ts, 'pnl': pnl, 'qty': qty, 'raw': r, 'used': False}
-            for side in _bybit_closed_pnl_event_side_candidates(r):
-                if (sym, side, int(ts // 60), pnl) in journal_event_keys:
-                    continue
-                event_pool[(sym, side)].append(ev)
+            sides = sorted(_bybit_closed_pnl_event_side_candidates(r))
+            if any((sym, side, int(ts // 60), pnl) in journal_event_keys for side in sides):
+                continue
+            ev = {
+                'ts': ts,
+                'pnl': pnl,
+                'qty': qty,
+                'raw': r,
+                'used': False,
+                'sides': set(sides),
+            }
+            event_pool[sym].append(ev)
         except Exception:
             continue
     for key in list(event_pool.keys()):
         event_pool[key].sort(key=lambda x: (float(x.get('ts') or 0.0), abs(float(x.get('qty') or 0.0))))
 
     provisional = []
-    for key, setups in grouped.items():
-        events = event_pool.get(key) or []
+    for sym, setups in grouped.items():
+        events = event_pool.get(sym) or []
         if not events:
             continue
         for i, srow in enumerate(setups):
@@ -2622,16 +2656,18 @@ def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[d
                     continue
                 if float(srow.get('lifecycle_closed_ts') or 0.0) > 0:
                     continue
-                base_ts = float(srow.get('executed_ts') or 0.0) or float(srow.get('emailed_ts') or 0.0)
+                base_ts = float(srow.get('_base_ts') or 0.0)
                 if base_ts <= 0:
                     continue
                 next_ts = None
                 for later in setups[i+1:]:
-                    later_ts = float(later.get('executed_ts') or 0.0) or float(later.get('emailed_ts') or 0.0)
+                    later_ts = float(later.get('_base_ts') or 0.0)
                     if later_ts > base_ts:
                         next_ts = later_ts
                         break
+                setup_side = str(srow.get('side') or '').upper().strip()
                 best = None
+                fallback = None
                 for ev in events:
                     if ev.get('used'):
                         continue
@@ -2640,26 +2676,31 @@ def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[d
                         continue
                     if next_ts and ev_ts >= next_ts:
                         continue
-                    best = ev
-                    break
+                    if fallback is None:
+                        fallback = ev
+                    if not setup_side or setup_side in (ev.get('sides') or set()):
+                        best = ev
+                        break
+                best = best or fallback
                 if not best:
                     continue
                 best['used'] = True
                 pnl = float(best.get('pnl') or 0.0)
                 provisional.append({
                     'setup_id': str(srow.get('setup_id') or ''),
-                    'symbol': str(srow.get('symbol') or '').upper(),
-                    'side': str(srow.get('side') or '').upper(),
+                    'symbol': sym,
+                    'side': setup_side,
                     'opened_ts': base_ts,
                     'closed_ts': float(best.get('ts') or 0.0),
                     'pnl': pnl,
                     'outcome': 'WIN' if pnl > 0 else ('LOSS' if pnl < 0 else 'BREAKEVEN'),
                     'provisional': True,
-                    'note': 'provisional_exchange_match_from_emailed_setup',
+                    'note': 'provisional_exchange_match_from_setup_history',
                 })
             except Exception:
                 continue
     return provisional
+
 
 def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
     """Journal-first bot lifecycle performance rows.
