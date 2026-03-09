@@ -2735,12 +2735,92 @@ def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[d
     return provisional
 
 
+def _autotrade_exchange_close_fallback_rows(uid: int, days: int = 7) -> list[dict]:
+    """Last-resort exchange-close fallback for performance reporting.
+
+    Used only when the bot journal has no usable closed trades for the requested window.
+    It aggregates raw Bybit closed-PnL events inside the anchored trading-day window and
+    excludes any events already represented by journal-confirmed or provisional matches.
+    """
+    if str(AUTOTRADE_MODE).lower() != 'live':
+        return []
+    days = int(max(2, min(int(days or 7), 60)))
+    user = _autotrade_user_settings(int(uid))
+    tz = _user_tzinfo(user)
+    start_local, end_local = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(user))
+    start_local = start_local - timedelta(days=days - 1)
+    start_ts = float(start_local.astimezone(timezone.utc).timestamp())
+    end_ts = float(end_local.astimezone(timezone.utc).timestamp())
+
+    excluded = set()
+    try:
+        for t in (db_list_autotrade_trades_all(int(uid)) or []):
+            try:
+                cts = float(t.get('closed_ts') or 0.0)
+                if cts < start_ts or cts >= end_ts:
+                    continue
+                sym = str(t.get('symbol') or '').upper()
+                side = str(t.get('side') or '').upper()
+                pnl = round(float(t.get('pnl') or 0.0), 8)
+                excluded.add((sym, side, int(cts), pnl))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        for t in (_autotrade_reconstruct_provisional_closes(int(uid), days=days) or []):
+            try:
+                cts = float(t.get('closed_ts') or 0.0)
+                sym = str(t.get('symbol') or '').upper()
+                side = str(t.get('side') or '').upper()
+                pnl = round(float(t.get('pnl') or 0.0), 8)
+                excluded.add((sym, side, int(cts), pnl))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    fallback = []
+    for ev in (_bybit_get_closed_pnl_linear(start_ts, end_ts, limit=max(200, days * 80)) or []):
+        try:
+            sym = str(_bybit_linear_symbol((ev or {}).get('symbol') or '')).upper()
+            ts = float(_bybit_closed_pnl_event_ts(ev) or 0.0)
+            pnl = round(float((ev or {}).get('closedPnl') or 0.0), 8)
+            if not sym or ts <= 0:
+                continue
+            sides = _bybit_closed_pnl_event_side_candidates(ev) or {''}
+            if any((sym, str(side or '').upper(), int(ts), pnl) in excluded for side in sides):
+                continue
+            matched_side = ''
+            for side in sides:
+                key = (sym, str(side or '').upper(), int(ts), pnl)
+                if key in excluded:
+                    matched_side = str(side or '').upper()
+                    break
+            if not matched_side:
+                matched_side = str(sorted(sides)[0] if sides else '').upper()
+            fallback.append({
+                'symbol': sym,
+                'side': matched_side,
+                'opened_ts': 0.0,
+                'closed_ts': ts,
+                'pnl': float(pnl),
+                'outcome': 'WIN' if pnl > 0 else ('LOSS' if pnl < 0 else 'BREAKEVEN'),
+                'exchange_only': True,
+                'note': 'exchange_only_fallback_close',
+            })
+        except Exception:
+            continue
+    return fallback
+
+
 def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
     """Journal-first bot lifecycle performance rows.
 
     Primary source stays the bot journal. If older deployments are missing journal rows,
-    a conservative *emailed-setup-linked* provisional fallback is added so the report is
-    not reduced to meaningless zeros after upgrading.
+    a conservative *emailed-setup-linked* provisional fallback is added first, followed by
+    a raw exchange-close fallback so the report does not collapse to meaningless zeros.
     """
     days = int(max(2, min(int(days or 7), 60)))
     user = _autotrade_user_settings(int(uid))
@@ -2769,6 +2849,7 @@ def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
             'journal_confirmed_closes': 0,
             'exchange_reconciled_closes': 0,
             'provisional_emailed_setup_closes': 0,
+            'exchange_only_fallback_closes': 0,
         }
 
     def _label(ts: float) -> str:
@@ -2817,6 +2898,28 @@ def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
                 open_lab = _label(float(t.get('opened_ts') or 0.0))
                 if open_lab in by_day:
                     by_day[open_lab]['opened'] += 1
+                pnl = float(t.get('pnl') or 0.0)
+                row['net_pnl'] += pnl
+                if pnl > 0:
+                    row['wins'] += 1
+                    row['gross_profit'] += pnl
+                elif pnl < 0:
+                    row['losses'] += 1
+                    row['gross_loss'] += abs(pnl)
+            except Exception:
+                continue
+
+    total_closed = sum(int(r.get('closed') or 0) for r in by_day.values())
+    if total_closed <= 0:
+        for t in _autotrade_exchange_close_fallback_rows(int(uid), days=days):
+            try:
+                lab = _label(float(t.get('closed_ts') or 0.0))
+                if lab not in by_day:
+                    continue
+                row = by_day[lab]
+                row['closed'] += 1
+                row['exchange_reconciled_closes'] += 1
+                row['exchange_only_fallback_closes'] += 1
                 pnl = float(t.get('pnl') or 0.0)
                 row['net_pnl'] += pnl
                 if pnl > 0:
@@ -17809,6 +17912,20 @@ def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
             note = str(r['note'] or '')
             if 'exchange_close_sync' in note:
                 exchange_reconciled += 1
+    provisional_emailed = 0
+    provisional_keys = set()
+    try:
+        for t in (_autotrade_reconstruct_provisional_closes(int(uid), days=days) or []):
+            sym = str(t.get('symbol') or '').upper()
+            side = str(t.get('side') or '').upper()
+            ts = int(float(t.get('closed_ts') or 0.0))
+            pnl = round(float(t.get('pnl') or 0.0), 8)
+            provisional_keys.add((sym, side, ts, pnl))
+        provisional_emailed = len(provisional_keys)
+    except Exception:
+        provisional_emailed = 0
+        provisional_keys = set()
+
     unmatched = 0
     try:
         seen = set()
@@ -17821,15 +17938,16 @@ def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
                 (int(uid), int(start_ts), int(end_ts))
             ).fetchall() or []
             for r in rows:
-                key = (str(r['symbol'] or '').upper(), str(r['side'] or '').upper(), int(float(r['closed_ts'] or 0.0)), round(float(r['pnl_usdt'] or 0.0), 8), 'exchange_close_sync' in str(r['note'] or ''))
+                key = (str(r['symbol'] or '').upper(), str(r['side'] or '').upper(), int(float(r['closed_ts'] or 0.0)), round(float(r['pnl_usdt'] or 0.0), 8))
                 seen.add(key)
-        for ev in (_bybit_get_closed_pnl_linear(start_ts, end_ts, limit=200) or []):
+        seen |= provisional_keys
+        for ev in (_bybit_get_closed_pnl_linear(start_ts, end_ts, limit=max(200, days * 80)) or []):
             sym = str(_bybit_linear_symbol((ev or {}).get('symbol') or '')).upper()
             ts = int(float(_bybit_closed_pnl_event_ts(ev) or 0.0))
             pnl = round(float((ev or {}).get('closedPnl') or 0.0), 8)
             matched = False
             for side in _bybit_closed_pnl_event_side_candidates(ev):
-                if (sym, side, ts, pnl, True) in seen or (sym, side, ts, pnl, False) in seen:
+                if (sym, side, ts, pnl) in seen:
                     matched = True
                     break
             if not matched:
@@ -17839,6 +17957,7 @@ def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
     return {
         'journal_confirmed_closes': int(journal_closed),
         'exchange_reconciled_closes': int(exchange_reconciled),
+        'provisional_emailed_setup_closes': int(provisional_emailed),
         'unmatched_exchange_closes': int(unmatched),
     }
 
@@ -17866,7 +17985,7 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
     lines.append("📈 Performance Report")
     lines.append(HDR)
     lines.append(f"Window: last {days} anchored trading day(s) (Melbourne / configured day reset)")
-    lines.append("Source: bot autotrade lifecycle journal only; exchange data used only to sync missing journal closes")
+    lines.append("Source: journal first; emailed-setup reconciliation and exchange-close fallback used when journal history is missing")
     lines.append(HDR)
     lines.append(
         f"Closed: {int(summary.get('closed') or 0)} | Wins: {int(summary.get('wins') or 0)} | "
@@ -17909,6 +18028,8 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
             rec_bits.append(f"xr {int(r.get('exchange_reconciled_closes') or 0)}")
         if int(r.get('provisional_emailed_setup_closes') or 0) > 0:
             rec_bits.append(f"pe {int(r.get('provisional_emailed_setup_closes') or 0)}")
+        if int(r.get('exchange_only_fallback_closes') or 0) > 0:
+            rec_bits.append(f"xf {int(r.get('exchange_only_fallback_closes') or 0)}")
         rec_txt = f" | {' '.join(rec_bits)}" if rec_bits else ""
         lines.append(
             f"• {r.get('day')}: pnl ${float(r.get('net_pnl') or 0.0):+.2f} | open {int(r.get('opened') or 0)} | "
