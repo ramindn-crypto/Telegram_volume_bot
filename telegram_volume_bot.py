@@ -2338,8 +2338,10 @@ def _autotrade_db_close_trade(trade_id: str, closed_ts: float, pnl_usdt: float, 
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
-            row = cur.execute("SELECT note FROM autotrade_trades WHERE trade_id=?", (str(trade_id),)).fetchone()
+            row = cur.execute("SELECT note, symbol, side FROM autotrade_trades WHERE trade_id=?", (str(trade_id),)).fetchone()
             old_note = str((row[0] if row else '') or '')
+            old_symbol = str((row[1] if row else '') or '')
+            old_side = str((row[2] if row else '') or '')
             note_parts = [old_note.strip()] if old_note and old_note.strip() else []
             extra = str(note_append or '').strip()
             if extra and extra not in note_parts:
@@ -2352,6 +2354,22 @@ def _autotrade_db_close_trade(trade_id: str, closed_ts: float, pnl_usdt: float, 
                 (int(float(closed_ts or 0.0)), float(pnl_usdt or 0.0), str(outcome or '').upper().strip(), merged_note, str(trade_id)),
             )
             conn.commit()
+            try:
+                life = cur.execute("SELECT setup_id FROM admin_setup_lifecycle WHERE trade_id=? LIMIT 1", (str(trade_id),)).fetchone()
+                sid = str((life[0] if life else '') or '')
+            except Exception:
+                sid = ''
+        if sid:
+            _admin_setup_lifecycle_merge(
+                int(AUTOTRADE_OWNER_UID or 0), sid,
+                symbol=old_symbol,
+                side=old_side,
+                closed_ts=float(closed_ts or 0.0),
+                state='closed',
+                outcome=str(outcome or '').upper().strip(),
+                pnl_usdt=float(pnl_usdt or 0.0),
+                last_reason=str(note_append or ''),
+            )
     except Exception:
         pass
 
@@ -2493,6 +2511,11 @@ def _autotrade_trade_day_label(ts: float, user: dict) -> str:
 
 
 def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
+    """Journal-first bot lifecycle performance rows.
+
+    Exchange data is allowed only to sync missing journal closes before rows are built.
+    No raw exchange-only rows are injected into day counts.
+    """
     days = int(max(2, min(int(days or 7), 60)))
     user = _autotrade_user_settings(int(uid))
     _autotrade_sync_closed_trades_from_exchange(int(uid), lookback_days=max(14, days + 5))
@@ -2504,14 +2527,6 @@ def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
     tz = _user_tzinfo(user)
     start_local, _ = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(user))
     day_starts = [start_local - timedelta(days=i) for i in range(days - 1, -1, -1)]
-    start_ts = float(day_starts[0].astimezone(timezone.utc).timestamp()) if day_starts else float(time.time())
-    end_ts = float((day_starts[-1] + timedelta(days=1)).astimezone(timezone.utc).timestamp()) if day_starts else float(time.time())
-
-    try:
-        exchange_closed = _bybit_get_closed_pnl_linear(start_ts, end_ts, limit=200) or []
-    except Exception:
-        exchange_closed = []
-
     by_day: dict[str, dict] = {}
     for ds in day_starts:
         by_day[ds.strftime('%Y-%m-%d')] = {
@@ -2525,65 +2540,49 @@ def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
             'avg_loss': 0.0,
             'gross_profit': 0.0,
             'gross_loss': 0.0,
-            'source_closed': 'journal',
+            'journal_confirmed_closes': 0,
+            'exchange_reconciled_closes': 0,
         }
+
+    def _label(ts: float) -> str:
+        return _autotrade_trade_day_label(ts, user)
 
     for t in trades:
         try:
             ots = float(t.get('opened_ts') or 0.0)
             if ots > 0:
-                lab = _autotrade_trade_day_label(ots, user)
+                lab = _label(ots)
                 if lab in by_day:
                     by_day[lab]['opened'] += 1
-        except Exception:
-            continue
-
-    journal_closed_by_day: dict[str, list[float]] = defaultdict(list)
-    for t in trades:
-        try:
             cts = float(t.get('closed_ts') or 0.0)
             if cts <= 0:
                 continue
-            lab = _autotrade_trade_day_label(cts, user)
+            lab = _label(cts)
             if lab not in by_day:
                 continue
-            journal_closed_by_day[lab].append(float(t.get('pnl') or 0.0))
+            pnl = float(t.get('pnl') or 0.0)
+            row = by_day[lab]
+            row['closed'] += 1
+            row['journal_confirmed_closes'] += 1
+            if 'exchange_close_sync' in str(t.get('note') or ''):
+                row['exchange_reconciled_closes'] += 1
+            row['net_pnl'] += pnl
+            if pnl > 0:
+                row['wins'] += 1
+                row['gross_profit'] += pnl
+            elif pnl < 0:
+                row['losses'] += 1
+                row['gross_loss'] += abs(pnl)
         except Exception:
             continue
 
-    exchange_closed_by_day: dict[str, list[float]] = defaultdict(list)
-    for r in exchange_closed:
-        try:
-            cts = float(_bybit_closed_pnl_event_ts(r) or 0.0)
-            if cts <= 0:
-                continue
-            lab = _autotrade_trade_day_label(cts, user)
-            if lab not in by_day:
-                continue
-            exchange_closed_by_day[lab].append(float((r or {}).get('closedPnl') or 0.0))
-        except Exception:
-            continue
-
-    for day, row in by_day.items():
-        pnls = journal_closed_by_day.get(day) or []
-        source_closed = 'journal'
-        if not pnls and exchange_closed_by_day.get(day):
-            pnls = list(exchange_closed_by_day.get(day) or [])
-            source_closed = 'exchange_fallback'
-        wins = [p for p in pnls if p > 0]
-        losses = [p for p in pnls if p < 0]
-        row.update({
-            'closed': len(pnls),
-            'wins': len(wins),
-            'losses': len(losses),
-            'net_pnl': sum(pnls) if pnls else 0.0,
-            'avg_win': (sum(wins) / len(wins)) if wins else 0.0,
-            'avg_loss': (sum(losses) / len(losses)) if losses else 0.0,
-            'gross_profit': sum(wins) if wins else 0.0,
-            'gross_loss': abs(sum(losses)) if losses else 0.0,
-            'source_closed': source_closed,
-        })
-
+    for row in by_day.values():
+        win_n = int(row.get('wins') or 0)
+        loss_n = int(row.get('losses') or 0)
+        gp = float(row.get('gross_profit') or 0.0)
+        gl = float(row.get('gross_loss') or 0.0)
+        row['avg_win'] = (gp / win_n) if win_n > 0 else 0.0
+        row['avg_loss'] = (-(gl / loss_n)) if loss_n > 0 else 0.0
     return [by_day[ds.strftime('%Y-%m-%d')] for ds in day_starts]
 
 
@@ -2594,17 +2593,13 @@ def _autotrade_performance_summary(rows: list[dict]) -> dict:
     net = sum(float(r.get('net_pnl') or 0.0) for r in rows)
     gross_profit = sum(float(r.get('gross_profit') or 0.0) for r in rows)
     gross_loss = sum(float(r.get('gross_loss') or 0.0) for r in rows)
-    avg_win_vals = [float(r.get('avg_win') or 0.0) for r in rows if float(r.get('avg_win') or 0.0) > 0]
-    avg_loss_vals = [float(r.get('avg_loss') or 0.0) for r in rows if float(r.get('avg_loss') or 0.0) < 0]
     best_day = max(rows, key=lambda r: float(r.get('net_pnl') or 0.0)) if rows else None
     worst_day = min(rows, key=lambda r: float(r.get('net_pnl') or 0.0)) if rows else None
     win_rate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float('inf') if gross_profit > 0 else 0.0)
-    avg_win = (sum(avg_win_vals) / len(avg_win_vals)) if avg_win_vals else 0.0
-    avg_loss = (sum(avg_loss_vals) / len(avg_loss_vals)) if avg_loss_vals else 0.0
-    expectancy = 0.0
-    if (wins + losses) > 0:
-        expectancy = ((wins / (wins + losses)) * avg_win) + ((losses / (wins + losses)) * avg_loss)
+    avg_win = (gross_profit / wins) if wins > 0 else 0.0
+    avg_loss = (-(gross_loss / losses)) if losses > 0 else 0.0
+    expectancy = (net / closed) if closed > 0 else 0.0
     return {
         'closed': closed,
         'wins': wins,
@@ -3193,7 +3188,7 @@ def _autotrade_has_live_open_order(symbol: str, side: str | None = None) -> bool
     return False
 
 
-def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float) -> str:
+def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float, lifecycle_state: str = 'executed_open', lifecycle_reason: str = '') -> str:
     """Persist a bot-opened trade into SQLite.
 
     NOTE: Some deployed DBs have a NOT NULL `day_utc` column on autotrade_trades.
@@ -3257,6 +3252,20 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
 
         conn.commit()
 
+    try:
+        _admin_setup_lifecycle_merge(
+            int(uid),
+            str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''),
+            session=str(session_label or ''),
+            symbol=str(getattr(s, 'symbol', '') or ''),
+            side=str(getattr(s, 'side', '') or ''),
+            executed_ts=float(time.time()),
+            trade_id=str(trade_id),
+            state=str(lifecycle_state or 'executed_open'),
+            last_reason=str(lifecycle_reason or ''),
+        )
+    except Exception:
+        pass
     return trade_id
 
 
@@ -3394,6 +3403,23 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         rows = cur.fetchall() or []
         out = _load_signals(rows, 'emailed_setups')
         if out:
+            try:
+                for item in out:
+                    _admin_setup_lifecycle_merge(
+                        int(uid),
+                        str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or ''),
+                        session=str(getattr(item, 'source_session', '') or session_label or ''),
+                        symbol=str(getattr(item, 'symbol', '') or ''),
+                        side=str(getattr(item, 'side', '') or ''),
+                        executable_ts=float(time.time()),
+                        state='executable_pending',
+                        source_kind=str(getattr(item, 'source_kind', '') or 'emailed_setups'),
+                        signal_created_ts=float(getattr(item, 'signal_created_ts', 0.0) or 0.0),
+                        emailed_ts=float(getattr(item, 'email_logged_ts', 0.0) or 0.0),
+                        generated_logged_ts=float(getattr(item, 'generated_logged_ts', 0.0) or 0.0),
+                    )
+            except Exception:
+                pass
             con.close()
             return out
 
@@ -3418,6 +3444,22 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         )
         rows = cur.fetchall() or []
         out = _load_signals(rows, 'generated_setups')
+        try:
+            for item in out:
+                _admin_setup_lifecycle_merge(
+                    int(uid),
+                    str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or ''),
+                    session=str(getattr(item, 'source_session', '') or session_label or ''),
+                    symbol=str(getattr(item, 'symbol', '') or ''),
+                    side=str(getattr(item, 'side', '') or ''),
+                    executable_ts=float(time.time()),
+                    state='executable_pending',
+                    source_kind=str(getattr(item, 'source_kind', '') or 'generated_setups'),
+                    signal_created_ts=float(getattr(item, 'signal_created_ts', 0.0) or 0.0),
+                    generated_logged_ts=float(getattr(item, 'generated_logged_ts', 0.0) or 0.0),
+                )
+        except Exception:
+            pass
         con.close()
         return out
     except Exception as e:
@@ -3499,6 +3541,23 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     setup_id = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
 
     try:
+        _admin_setup_lifecycle_merge(
+            int(uid),
+            setup_id,
+            session=str(session_label or ''),
+            symbol=str(getattr(s, 'symbol', '') or ''),
+            side=str(side or ''),
+            attempted_ts=float(time.time()),
+            state='execution_attempted',
+            source_kind=str(getattr(s, 'source_kind', '') or ''),
+            signal_created_ts=float(getattr(s, 'signal_created_ts', 0.0) or 0.0),
+            emailed_ts=float(getattr(s, 'email_logged_ts', 0.0) or 0.0),
+            generated_logged_ts=float(getattr(s, 'generated_logged_ts', 0.0) or 0.0),
+        )
+    except Exception:
+        pass
+
+    try:
         _LAST_AUTOTRADE_DETAIL[int(uid)] = {
             'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
             'session': session_label,
@@ -3534,6 +3593,10 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'source_session': str(getattr(s, 'source_session', '') or ''),
         })
         if datetime.now(timezone.utc) > _deadline_dt:
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('stale_deadline'), last_reason='stale_deadline')
+            except Exception:
+                pass
             return (False, 'setup_expired')
     except Exception:
         pass
@@ -3647,8 +3710,16 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     if stop_distance <= 0:
         return (False, 'stop_distance_zero_or_invalid')
     if allowed_risk_usd <= 0:
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason='daily_risk_cap_reached')
+        except Exception:
+            pass
         return (False, 'daily_risk_cap_reached')
     if daily_cap > 0 and used_total_before >= daily_cap:
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason='daily_risk_cap_already_exceeded')
+        except Exception:
+            pass
         return (False, 'daily_risk_cap_already_exceeded')
 
     raw_qty = _autotrade_qty_from_risk(price_ref, sl_for_order, equity, risk_usd=allowed_risk_usd, contract_size=contract_size)
@@ -3674,6 +3745,10 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             return (False, 'risk_cap_enforcement_failed')
     actual_risk_pct = _risk_pct_from_amount(float(equity), float(actual_risk))
     if math.isfinite(remaining_risk) and (used_total_before + actual_risk) > (daily_cap * 1.0005):
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason='daily_cap_would_be_exceeded_by_new_trade')
+        except Exception:
+            pass
         return (False, 'daily_cap_would_be_exceeded_by_new_trade')
 
     try:
@@ -3704,6 +3779,10 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': gate_reason})
         except Exception:
             pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(gate_reason), last_reason=gate_reason)
+        except Exception:
+            pass
         return (False, gate_reason)
 
     reserved_keys = []
@@ -3731,6 +3810,10 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             except Exception:
                 pass
             _autotrade_log_symbol_block(uid, sym, side, mapped_reason, guard_reason)
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(mapped_reason), last_reason=mapped_reason)
+            except Exception:
+                pass
             return (False, mapped_reason)
 
         gate_ok_after, gate_reason_after, gate_detail_after = _autotrade_can_open_symbol(uid, sym, side, session_label)
@@ -3745,11 +3828,19 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 })
             except Exception:
                 pass
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(gate_reason_after), last_reason=gate_reason_after)
+            except Exception:
+                pass
             return (False, gate_reason_after)
 
         if str(AUTOTRADE_MODE).lower() == 'paper':
-            trade_id = _autotrade_db_add_trade(uid, session_label, s, qty)
+            trade_id = _autotrade_db_add_trade(uid, session_label, s, qty, lifecycle_state='executed_open', lifecycle_reason='paper_opened')
             _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), state='executed_open', last_reason='paper_opened')
+            except Exception:
+                pass
             return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.8g} SL={sl_for_order} TPs={','.join([f'{x:g}' for x in tps])}")
 
         if AUTOTRADE_ISOLATED:
@@ -3795,7 +3886,23 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         if int(open_res.get('retCode', -1)) != 0:
             err = f"{open_res.get('retCode')} {open_res.get('retMsg')}"
             _autotrade_exec_mark(reserved_keys, 'FAILED', err)
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('exchange_reject'), last_reason=f'bybit_open_failed ({err})')
+            except Exception:
+                pass
             return (False, f'bybit_open_failed ({err})')
+
+        try:
+            _admin_setup_lifecycle_merge(
+                int(uid), setup_id,
+                state='bybit_order_accepted',
+                last_reason='order_accepted',
+                bybit_order_id=str(((open_res or {}).get('result') or {}).get('orderId') or ''),
+                bybit_order_link_id=str(((open_res or {}).get('result') or {}).get('orderLinkId') or ''),
+                bybit_position_symbol=str(sym or ''),
+            )
+        except Exception:
+            pass
 
         _bybit_v5_request('POST', '/v5/position/trading-stop', {
             'category': 'linear',
@@ -3884,8 +3991,12 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             })
 
         qty_for_db = tp_base_qty if tp_base_qty > 0 else qty
-        trade_id = _autotrade_db_add_trade(uid, session_label, s, qty_for_db)
+        trade_id = _autotrade_db_add_trade(uid, session_label, s, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened')
         _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='executed_open', last_reason='live_opened')
+        except Exception:
+            pass
         suffix = ' corrected_for_post_fill_risk' if corrected else ''
         return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty_for_db:.8g} SL={sl_for_order} TPs={','.join([f'{x:g}' for x in tps])}{suffix}")
 
@@ -6984,6 +7095,172 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
 
 
 
+
+
+def _admin_setup_lifecycle_migrate() -> None:
+    """Admin-only authoritative setup lifecycle table.
+
+    This keeps one stable setup identity across:
+    screen -> email -> executable pool -> execution attempt -> Bybit open -> close sync.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS admin_setup_lifecycle (
+                    setup_id TEXT PRIMARY KEY,
+                    uid INTEGER NOT NULL DEFAULT 0,
+                    symbol TEXT NOT NULL DEFAULT '',
+                    side TEXT NOT NULL DEFAULT '',
+                    session TEXT NOT NULL DEFAULT '',
+                    screened_ts REAL NOT NULL DEFAULT 0,
+                    emailed_ts REAL NOT NULL DEFAULT 0,
+                    executable_ts REAL NOT NULL DEFAULT 0,
+                    attempted_ts REAL NOT NULL DEFAULT 0,
+                    executed_ts REAL NOT NULL DEFAULT 0,
+                    closed_ts REAL NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL DEFAULT '',
+                    last_reason TEXT NOT NULL DEFAULT '',
+                    source_kind TEXT NOT NULL DEFAULT '',
+                    signal_created_ts REAL NOT NULL DEFAULT 0,
+                    generated_logged_ts REAL NOT NULL DEFAULT 0,
+                    bybit_order_id TEXT NOT NULL DEFAULT '',
+                    bybit_order_link_id TEXT NOT NULL DEFAULT '',
+                    bybit_position_symbol TEXT NOT NULL DEFAULT '',
+                    trade_id TEXT NOT NULL DEFAULT '',
+                    outcome TEXT NOT NULL DEFAULT '',
+                    pnl_usdt REAL NOT NULL DEFAULT 0,
+                    details_json TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_setup_lifecycle_uid_state ON admin_setup_lifecycle(uid, state, attempted_ts)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_setup_lifecycle_uid_emailed ON admin_setup_lifecycle(uid, emailed_ts)")
+            con.commit()
+    except Exception:
+        pass
+
+
+def _admin_setup_lifecycle_merge(uid: int, setup_id: str, **fields) -> None:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return
+    _admin_setup_lifecycle_migrate()
+    now_ts = float(time.time())
+    safe = {
+        'uid': int(uid or 0),
+        'symbol': str(fields.get('symbol') or ''),
+        'side': str(fields.get('side') or ''),
+        'session': str(fields.get('session') or ''),
+        'screened_ts': float(fields.get('screened_ts') or 0.0),
+        'emailed_ts': float(fields.get('emailed_ts') or 0.0),
+        'executable_ts': float(fields.get('executable_ts') or 0.0),
+        'attempted_ts': float(fields.get('attempted_ts') or 0.0),
+        'executed_ts': float(fields.get('executed_ts') or 0.0),
+        'closed_ts': float(fields.get('closed_ts') or 0.0),
+        'state': str(fields.get('state') or ''),
+        'last_reason': str(fields.get('last_reason') or ''),
+        'source_kind': str(fields.get('source_kind') or ''),
+        'signal_created_ts': float(fields.get('signal_created_ts') or 0.0),
+        'generated_logged_ts': float(fields.get('generated_logged_ts') or 0.0),
+        'bybit_order_id': str(fields.get('bybit_order_id') or ''),
+        'bybit_order_link_id': str(fields.get('bybit_order_link_id') or ''),
+        'bybit_position_symbol': str(fields.get('bybit_position_symbol') or ''),
+        'trade_id': str(fields.get('trade_id') or ''),
+        'outcome': str(fields.get('outcome') or ''),
+        'pnl_usdt': float(fields.get('pnl_usdt') or 0.0),
+        'details_json': str(fields.get('details_json') or ''),
+    }
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            row = cur.execute("SELECT * FROM admin_setup_lifecycle WHERE setup_id=?", (sid,)).fetchone()
+            current = dict(row) if row else {}
+            merged = dict(current)
+            merged.setdefault('setup_id', sid)
+            merged['uid'] = int(safe.get('uid') or current.get('uid') or 0)
+            for key, val in safe.items():
+                if key == 'uid':
+                    continue
+                old = current.get(key)
+                if key.endswith('_ts'):
+                    if float(val or 0.0) > 0:
+                        merged[key] = float(val)
+                    else:
+                        merged[key] = float(old or 0.0)
+                elif key == 'pnl_usdt':
+                    if ('pnl_usdt' in fields) or (float(val or 0.0) != 0.0):
+                        merged[key] = float(val or 0.0)
+                    else:
+                        merged[key] = float(old or 0.0)
+                else:
+                    merged[key] = val if str(val) != '' else str(old or '')
+            cur.execute(
+                """INSERT OR REPLACE INTO admin_setup_lifecycle (
+                    setup_id, uid, symbol, side, session, screened_ts, emailed_ts, executable_ts,
+                    attempted_ts, executed_ts, closed_ts, state, last_reason, source_kind,
+                    signal_created_ts, generated_logged_ts, bybit_order_id, bybit_order_link_id,
+                    bybit_position_symbol, trade_id, outcome, pnl_usdt, details_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    sid, int(merged.get('uid') or 0),
+                    str(merged.get('symbol') or ''), str(merged.get('side') or ''), str(merged.get('session') or ''),
+                    float(merged.get('screened_ts') or 0.0), float(merged.get('emailed_ts') or 0.0), float(merged.get('executable_ts') or 0.0),
+                    float(merged.get('attempted_ts') or 0.0), float(merged.get('executed_ts') or 0.0), float(merged.get('closed_ts') or 0.0),
+                    str(merged.get('state') or ''), str(merged.get('last_reason') or ''), str(merged.get('source_kind') or ''),
+                    float(merged.get('signal_created_ts') or 0.0), float(merged.get('generated_logged_ts') or 0.0),
+                    str(merged.get('bybit_order_id') or ''), str(merged.get('bybit_order_link_id') or ''),
+                    str(merged.get('bybit_position_symbol') or ''), str(merged.get('trade_id') or ''),
+                    str(merged.get('outcome') or ''), float(merged.get('pnl_usdt') or 0.0), str(merged.get('details_json') or ''),
+                )
+            )
+            con.commit()
+    except Exception:
+        pass
+
+
+def _admin_setup_lifecycle_get(setup_id: str) -> dict:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return {}
+    _admin_setup_lifecycle_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            row = cur.execute("SELECT * FROM admin_setup_lifecycle WHERE setup_id=?", (sid,)).fetchone()
+            return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+def _admin_setup_lifecycle_recent(uid: int, limit: int = 10) -> list[dict]:
+    _admin_setup_lifecycle_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            rows = cur.execute(
+                """SELECT * FROM admin_setup_lifecycle
+                   WHERE uid=?
+                   ORDER BY COALESCE(attempted_ts,0) DESC, COALESCE(emailed_ts,0) DESC, COALESCE(screened_ts,0) DESC
+                   LIMIT ?""",
+                (int(uid), int(limit))
+            ).fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _admin_setup_state_from_reason(reason: str) -> str:
+    r = str(reason or '').strip().lower()
+    if not r:
+        return 'rejected'
+    r = re.sub(r'[^a-z0-9_]+', '_', r)
+    if not r.startswith('emailed_not_executed_'):
+        r = f'emailed_not_executed_{r}'
+    return r[:80]
+
 def db_insert_signal(s: Setup):
     """Upsert a setup into DB (signals table). Adds market_symbol when available."""
     con = db_connect()
@@ -7012,6 +7289,17 @@ def db_insert_signal(s: Setup):
         ))
     con.commit()
     con.close()
+    try:
+        _admin_setup_lifecycle_merge(
+            int(AUTOTRADE_OWNER_UID or 0),
+            str(getattr(s, 'setup_id', '') or ''),
+            symbol=str(getattr(s, 'symbol', '') or ''),
+            side=str(getattr(s, 'side', '') or ''),
+            signal_created_ts=float(getattr(s, 'created_ts', 0.0) or 0.0),
+            state='screened',
+        )
+    except Exception:
+        pass
 
 def db_get_signal(setup_id: str) -> Optional[dict]:
     con = db_connect()
@@ -7044,6 +7332,17 @@ def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts:
     )
     con.commit()
     con.close()
+    try:
+        _admin_setup_lifecycle_merge(
+            int(user_id),
+            str(setup_id).strip(),
+            session=str(session or ''),
+            emailed_ts=float(emailed_ts or 0.0),
+            state='emailed',
+            source_kind='emailed_setups',
+        )
+    except Exception:
+        pass
 
 
 
@@ -7082,6 +7381,7 @@ def db_recent_generated_setups(user_id: int, source: str, lookback_hours: int = 
 def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
     """Log a generated setup (from /screen) or a sent setup (email) for correlation."""
     con = None
+    ts_now = float(time.time())
     try:
         con = db_connect()
         cur = con.cursor()
@@ -7092,7 +7392,7 @@ def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
             (
                 int(user_id),
                 str(source or "").strip().lower(),
-                float(time.time()),
+                ts_now,
                 str(session or ""),
                 str(getattr(s, "setup_id", "") or ""),
                 str(getattr(s, "symbol", "") or ""),
@@ -7109,6 +7409,25 @@ def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
                 con.close()
         except Exception:
             pass
+    try:
+        sid = str(getattr(s, 'setup_id', '') or '')
+        state = 'screened' if str(source or '').strip().lower() == 'screen' else 'emailed'
+        payload = {
+            'session': str(session or ''),
+            'symbol': str(getattr(s, 'symbol', '') or ''),
+            'side': str(getattr(s, 'side', '') or ''),
+            'state': state,
+        }
+        if state == 'screened':
+            payload['screened_ts'] = ts_now
+            payload['source_kind'] = 'generated_setups'
+        else:
+            payload['emailed_ts'] = ts_now
+            payload['generated_logged_ts'] = ts_now
+            payload['source_kind'] = 'generated_setups'
+        _admin_setup_lifecycle_merge(int(user_id), sid, **payload)
+    except Exception:
+        pass
 
 def db_list_emailed_setups(user_id: int, ts_from: float) -> List[dict]:
     con = db_connect()
@@ -17196,8 +17515,67 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await send_long_message(update, "\n".join(lines))
 
 
+
+
+def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
+    """Journal-first reconciliation stats for performance reporting."""
+    days = int(max(2, min(int(days or 7), 60)))
+    user = _autotrade_user_settings(int(uid))
+    tz = _user_tzinfo(user)
+    start_local, _ = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(user))
+    start_local = start_local - timedelta(days=days - 1)
+    start_ts = float(start_local.astimezone(timezone.utc).timestamp())
+    end_ts = float((start_local + timedelta(days=days)).astimezone(timezone.utc).timestamp())
+    journal_closed = 0
+    exchange_reconciled = 0
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        rows = cur.execute(
+            """SELECT trade_id, note, closed_ts FROM autotrade_trades
+               WHERE uid=? AND closed_ts IS NOT NULL AND closed_ts>=? AND closed_ts<?""",
+            (int(uid), int(start_ts), int(end_ts))
+        ).fetchall() or []
+        for r in rows:
+            journal_closed += 1
+            note = str(r['note'] or '')
+            if 'exchange_close_sync' in note:
+                exchange_reconciled += 1
+    unmatched = 0
+    try:
+        seen = set()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            rows = cur.execute(
+                """SELECT symbol, side, closed_ts, pnl_usdt, note FROM autotrade_trades
+                   WHERE uid=? AND closed_ts IS NOT NULL AND closed_ts>=? AND closed_ts<?""",
+                (int(uid), int(start_ts), int(end_ts))
+            ).fetchall() or []
+            for r in rows:
+                key = (str(r['symbol'] or '').upper(), str(r['side'] or '').upper(), int(float(r['closed_ts'] or 0.0)), round(float(r['pnl_usdt'] or 0.0), 8), 'exchange_close_sync' in str(r['note'] or ''))
+                seen.add(key)
+        for ev in (_bybit_get_closed_pnl_linear(start_ts, end_ts, limit=200) or []):
+            sym = str(_bybit_linear_symbol((ev or {}).get('symbol') or '')).upper()
+            ts = int(float(_bybit_closed_pnl_event_ts(ev) or 0.0))
+            pnl = round(float((ev or {}).get('closedPnl') or 0.0), 8)
+            matched = False
+            for side in _bybit_closed_pnl_event_side_candidates(ev):
+                if (sym, side, ts, pnl, True) in seen or (sym, side, ts, pnl, False) in seen:
+                    matched = True
+                    break
+            if not matched:
+                unmatched += 1
+    except Exception:
+        pass
+    return {
+        'journal_confirmed_closes': int(journal_closed),
+        'exchange_reconciled_closes': int(exchange_reconciled),
+        'unmatched_exchange_closes': int(unmatched),
+    }
+
 async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin actual exchange/journal performance trend over recent anchored trading days."""
+    """Admin bot-lifecycle performance report over recent anchored trading days."""
     uid = update.effective_user.id
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text("⛔️ Owner/admin only.")
@@ -17211,14 +17589,16 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
         days = 7
     days = int(clamp(days, 3, 30))
 
-    rows = _autotrade_performance_rows(int(AUTOTRADE_OWNER_UID), days=days)
+    owner = int(AUTOTRADE_OWNER_UID)
+    rows = _autotrade_performance_rows(owner, days=days)
     summary = _autotrade_performance_summary(rows)
+    rec = _autotrade_reconciliation_snapshot(owner, days=days)
 
     lines = []
     lines.append("📈 Performance Report")
     lines.append(HDR)
     lines.append(f"Window: last {days} anchored trading day(s) (Melbourne / configured day reset)")
-    lines.append("Source: autotrade journal, with direct Bybit closed-PnL fallback when journal close sync is missing")
+    lines.append("Source: bot autotrade lifecycle journal only; exchange data used only to sync missing journal closes")
     lines.append(HDR)
     lines.append(
         f"Closed: {int(summary.get('closed') or 0)} | Wins: {int(summary.get('wins') or 0)} | "
@@ -17238,6 +17618,14 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
     if wd:
         lines.append(f"Worst day: {wd.get('day')} (${float(wd.get('net_pnl') or 0.0):+.2f})")
     lines.append(SEP)
+    lines.append(
+        f"Reconciliation: journal-confirmed closes {int(rec.get('journal_confirmed_closes') or 0)} | "
+        f"exchange-reconciled closes {int(rec.get('exchange_reconciled_closes') or 0)} | "
+        f"unmatched exchange closes {int(rec.get('unmatched_exchange_closes') or 0)}"
+    )
+    if int(rec.get('unmatched_exchange_closes') or 0) > 0:
+        lines.append("⚠️ Warning: unmatched exchange closes were detected and are excluded from bot performance totals.")
+    lines.append(SEP)
     lines.append("Daily trend:")
     for r in rows:
         gp = float(r.get('gross_profit') or 0.0)
@@ -17245,13 +17633,16 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
         pf_day = (gp / gl) if gl > 0 else (float('inf') if gp > 0 else 0.0)
         pf_day_txt = 'INF' if pf_day == float('inf') else f"{pf_day:.2f}"
         wr = (float(r.get('wins') or 0) / max(1, int(r.get('wins') or 0) + int(r.get('losses') or 0)) * 100.0) if (int(r.get('wins') or 0) + int(r.get('losses') or 0)) > 0 else 0.0
-        src_flag = ''
-        if str(r.get('source_closed') or '') == 'exchange_fallback' and int(r.get('closed') or 0) > 0:
-            src_flag = ' | src=exchange'
+        rec_bits = []
+        if int(r.get('journal_confirmed_closes') or 0) > 0:
+            rec_bits.append(f"jc {int(r.get('journal_confirmed_closes') or 0)}")
+        if int(r.get('exchange_reconciled_closes') or 0) > 0:
+            rec_bits.append(f"xr {int(r.get('exchange_reconciled_closes') or 0)}")
+        rec_txt = f" | {' '.join(rec_bits)}" if rec_bits else ""
         lines.append(
             f"• {r.get('day')}: pnl ${float(r.get('net_pnl') or 0.0):+.2f} | open {int(r.get('opened') or 0)} | "
             f"closed {int(r.get('closed') or 0)} | W {int(r.get('wins') or 0)} / L {int(r.get('losses') or 0)} | "
-            f"WR {wr:.1f}% | PF {pf_day_txt}{src_flag}"
+            f"WR {wr:.1f}% | PF {pf_day_txt}{rec_txt}"
         )
 
     await send_long_message(update, "\n".join(lines), parse_mode=None)
@@ -17268,6 +17659,7 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     owner = int(AUTOTRADE_OWNER_UID or 0)
     det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
     dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
+    life = _admin_setup_lifecycle_get(str(det.get('setup_id') or (dec.get('latest_candidate') or {}).get('setup_id') or ''))
 
     when_raw = str(det.get("when") or dec.get("when") or "")
     when_m = _fmt_iso_to_local(when_raw) if when_raw else "—"
@@ -17306,6 +17698,16 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if det.get('setup_id'):
             lines.append(f"*Setup ID:* `{det.get('setup_id')}`")
+        if life:
+            lines.append(f"*Lifecycle state:* `{str(life.get('state') or '')}`")
+            if life.get('trade_id'):
+                lines.append(f"*Trade ID:* `{life.get('trade_id')}`")
+            if life.get('bybit_order_id'):
+                lines.append(f"*Bybit order ID:* `{life.get('bybit_order_id')}`")
+            if float(life.get('executed_ts') or 0.0) > 0:
+                lines.append(f"*Position/Trade opened in Bybit (Melbourne):* `{_fmt_dt_local(datetime.fromtimestamp(float(life.get('executed_ts') or 0.0), tz=timezone.utc))}`")
+            if float(life.get('closed_ts') or 0.0) > 0:
+                lines.append(f"*Closed (Melbourne):* `{_fmt_dt_local(datetime.fromtimestamp(float(life.get('closed_ts') or 0.0), tz=timezone.utc))}`")
         if det.get('source_kind') or det.get('source_session'):
             lines.append(f"*Source:* `{det.get('source_kind','')}`  *Logged session:* `{det.get('source_session','')}`")
 
@@ -21373,6 +21775,7 @@ def main():
     try:
 
         _autotrade_migrate_tables()
+        _admin_setup_lifecycle_migrate()
 
     except Exception:
 
