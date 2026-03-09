@@ -883,7 +883,7 @@ SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
 SCREEN_WAITING_N = 10
 
 # EMA proximity gate: never generate setups if price is far from EMA7 (1H)
-EMA7_1H_MAX_DIST_PCT = 0.35  # % distance from EMA7(1H). Example: 0.35 = within 0.35%
+EMA7_1H_MAX_DIST_PCT = float(os.environ.get("EMA7_1H_MAX_DIST_PCT", "0.80") or 0.80)  # adaptive base anchor distance (%)
 
 # Directional Leaders/Losers thresholds
 MOVER_VOL_USD_MIN = 5_000_000
@@ -1431,7 +1431,7 @@ BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
 BYBIT_API_SECRET = str(os.environ.get("BYBIT_API_SECRET", "") or "").strip()
 BYBIT_RECV_WINDOW = str(os.environ.get("BYBIT_RECV_WINDOW", "5000") or "5000").strip()
 BYBIT_TESTNET = str(os.environ.get("BYBIT_TESTNET", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
-AUTOTRADE_ENTRY_WINDOW_MIN = int(os.environ.get("AUTOTRADE_ENTRY_WINDOW_MIN", "15") or 15)
+AUTOTRADE_ENTRY_WINDOW_MIN = int(os.environ.get("AUTOTRADE_ENTRY_WINDOW_MIN", "45") or 45)
 
 # Email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
@@ -3739,6 +3739,24 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                 except Exception:
                     aux_ts_f = 0.0
                 canonical_ts = max(chosen_ts_f, signal_created_ts, aux_ts_f)
+                now_ts = float(time.time())
+                expiry_grace_sec = float(max(300, int(AUTOTRADE_ENTRY_WINDOW_MIN) * 60 + 300))
+                src_session_u = str(src_session or '').upper().strip()
+                req_session_u = str(session_label or '').upper().strip()
+                if canonical_ts <= 0 or (now_ts - canonical_ts) > expiry_grace_sec:
+                    try:
+                        if setup_id:
+                            _admin_setup_lifecycle_merge(int(uid), str(setup_id), session=src_session_u or req_session_u, symbol=str(symbol or ''), side=str(side or ''), state=_admin_setup_state_from_reason('stale_deadline'), last_reason='stale_deadline')
+                    except Exception:
+                        pass
+                    continue
+                if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
+                    try:
+                        if setup_id:
+                            _admin_setup_lifecycle_merge(int(uid), str(setup_id), session=src_session_u, symbol=str(symbol or ''), side=str(side or ''), state=_admin_setup_state_from_reason('session_mismatch'), last_reason=f'session_mismatch ({src_session_u}->{req_session_u})')
+                    except Exception:
+                        pass
+                    continue
                 out.append(SimpleNamespace(
                     setup_id=setup_id,
                     id=setup_id,
@@ -3785,7 +3803,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             (int(uid), float(cutoff), int(limit)),
         )
         rows = cur.fetchall() or []
-        out = _load_signals(rows, 'executable_setups')
+        out = sorted(_load_signals(rows, 'executable_setups'), key=lambda x: float(getattr(x, 'created_ts', 0.0) or 0.0), reverse=True)
         if out:
             try:
                 for item in out:
@@ -3830,7 +3848,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             (int(uid), float(cutoff), int(limit)),
         )
         rows = cur.fetchall() or []
-        out = _load_signals(rows, 'emailed_setups')
+        out = sorted(_load_signals(rows, 'emailed_setups'), key=lambda x: float(getattr(x, 'created_ts', 0.0) or 0.0), reverse=True)
         if out:
             try:
                 for item in out:
@@ -3872,7 +3890,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             (int(uid), float(cutoff), int(limit)),
         )
         rows = cur.fetchall() or []
-        out = _load_signals(rows, 'generated_setups')
+        out = sorted(_load_signals(rows, 'generated_setups'), key=lambda x: float(getattr(x, 'created_ts', 0.0) or 0.0), reverse=True)
         try:
             for item in out:
                 _admin_setup_lifecycle_merge(
@@ -4496,15 +4514,15 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 76,
-    "LON": 78,
-    "ASIA": 80,
+    "NY": 74,
+    "LON": 75,
+    "ASIA": 77,
 }
 
 SESSION_MIN_RR_TP3 = {
-    "NY": 1.7,
-    "LON": 1.8,
-    "ASIA": 1.9,
+    "NY": 1.55,
+    "LON": 1.65,
+    "ASIA": 1.80,
 }
 
 SESSION_EMA_PROX_MULT = {
@@ -12874,7 +12892,7 @@ def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: flo
     is_long = (side == "BUY")
 
     # Base score starts lower to reduce inflated confidences
-    score = 42.0
+    score = 36.0
 
     # -----------------------------
     # 1) Higher-TF alignment first
@@ -12981,7 +12999,8 @@ def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: flo
         elif fut_vol_usd >= 6_000_000:
             score += 1.5
 
-    score = clamp(score, 0.0, 100.0)
+    # Public confidence should remain conservative; quality_score is the main gate.
+    score = clamp(score, 0.0, 92.0)
     return int(round(score))
 
 
@@ -13648,12 +13667,20 @@ def make_setup(
             setattr(s, 'smf_event', str(smf_event or 'NONE'))
             setattr(s, 'smf_score', int(smf_score or 0))
             setattr(s, 'engine', str(engine or ''))
+            setattr(s, 'raw_conf', int(conf or 0))
             # Ensure TP ladder is always present (derive TP1/TP2 if needed)
             try:
                 t1, t2, t3 = _ensure_three_tps(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp3',0.0) or 0.0), getattr(s,'tp1',None), getattr(s,'tp2',None), str(getattr(s,'side','') or ''))
                 setattr(s, 'tp1', t1)
                 setattr(s, 'tp2', t2)
                 setattr(s, 'tp3', t3)
+            except Exception:
+                pass
+            try:
+                public_conf, quality_score, quality_components = _recalibrate_public_confidence(s, session_name=session_name)
+                setattr(s, 'quality_score', float(quality_score or 0.0))
+                setattr(s, 'quality_components', quality_components or {})
+                setattr(s, 'conf', int(public_conf or 0))
             except Exception:
                 pass
         except Exception:
@@ -18585,6 +18612,53 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
 
 
 
+
+
+def _adaptive_ema_anchor_limit_pct(setup: "Setup", session_name: str, fallback_allowed: float) -> float:
+    """Adaptive 1H EMA-anchor limit.
+
+    The older static 0.35% anchor was starving valid continuation setups, especially
+    on higher-ATR names and momentum breakouts. This keeps the anchor discipline but
+    scales the allowance by engine, session, and ATR regime.
+    """
+    try:
+        engine = str(getattr(setup, "engine", "") or "").upper()
+        atr_pct = float(getattr(setup, "atr_pct", 0.0) or 0.0)
+        sess = str(session_name or "").upper().strip() or "NY"
+        base = float(fallback_allowed or EMA_ANCHOR_BASE_MAX_DIST_PCT or 0.80)
+
+        if engine == "B":
+            limit = max(base, 0.70 + min(1.10, atr_pct * 0.22))
+        elif engine == "A":
+            limit = max(base, 0.55 + min(0.75, atr_pct * 0.18))
+        else:
+            limit = max(base, 0.60 + min(0.85, atr_pct * 0.20))
+
+        if sess == "ASIA":
+            limit *= 0.92
+        elif sess == "NY":
+            limit *= 1.08
+
+        return float(clamp(limit, 0.55, 1.85))
+    except Exception:
+        return float(fallback_allowed or EMA_ANCHOR_BASE_MAX_DIST_PCT or 0.80)
+
+
+def _recalibrate_public_confidence(setup: "Setup", session_name: str) -> tuple[int, float, dict]:
+    """Blend legacy confidence with quality score so displayed confidence matches real quality better."""
+    try:
+        score, comps = compute_setup_quality_score(setup, session_name=session_name)
+        raw_conf = float(getattr(setup, "conf", 0) or 0.0)
+        blended = (0.35 * raw_conf) + (0.65 * float(score))
+        if str(getattr(setup, "engine", "") or "").upper() == "B" and abs(float(getattr(setup, "ch15", 0.0) or 0.0)) >= 1.0:
+            blended -= 3.0
+        blended = float(clamp(blended, 0.0, 99.0))
+        return int(round(blended)), float(score), comps
+    except Exception:
+        raw = int(float(getattr(setup, "conf", 0) or 0.0))
+        return raw, float(raw), {}
+
+
 async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
     """
     mode: "screen" or "email"
@@ -18969,15 +19043,25 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                 )
 
             ok, dist_pct, last_close, ema_val, ema_p, allowed = ema_anchor_cache[mk]
-            if not ok:
+            adaptive_allowed = _adaptive_ema_anchor_limit_pct(s, session_name=session_name, fallback_allowed=allowed)
+            if float(dist_pct) > float(adaptive_allowed):
                 mv = (best_fut or {}).get(base)
                 _rej(
                     "far_from_ema_anchor_1h",
                     base,
                     mv,
-                    f"ema={ema_p} dist={dist_pct:.2f}% max={allowed:.2f}% close={last_close:.6g} emaV={ema_val:.6g}",
+                    f"ema={ema_p} dist={dist_pct:.2f}% max={adaptive_allowed:.2f}% base={allowed:.2f}% close={last_close:.6g} emaV={ema_val:.6g}",
                 )
                 continue
+
+            try:
+                setattr(s, "ema_anchor_period", int(ema_p or 0))
+                setattr(s, "ema_anchor_dist_pct", float(dist_pct or 0.0))
+                setattr(s, "ema_anchor_limit_pct", float(adaptive_allowed or 0.0))
+                if float(dist_pct) > float(allowed or adaptive_allowed):
+                    s.conf = int(max(0, int(getattr(s, "conf", 0) or 0) - 4))
+            except Exception:
+                pass
 
             gated.append(s)
         except Exception:
@@ -19021,7 +19105,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Shared Top Setup gate (applies to BOTH /screen and email)
     # -----------------------------------------------------
     try:
-        ordered = [s for s in (ordered or []) if is_top_setup_eligible(s)[0]]
+        ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, source=mode, session_name=session_name)[0]]
     except Exception:
         pass
 # -----------------------------------------------------
@@ -20786,7 +20870,16 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     return 0.0
 
-            eligible = sorted(eligible, key=lambda _s: (int(getattr(_s, "conf", 0) or 0), _rr3(_s)), reverse=True)
+            eligible = sorted(
+                eligible,
+                key=lambda _s: (
+                    float(getattr(_s, "quality_score", 0.0) or 0.0),
+                    int(getattr(_s, "conf", 0) or 0),
+                    _rr3(_s),
+                    float(getattr(_s, "fut_vol_usd", 0.0) or 0.0),
+                ),
+                reverse=True,
+            )
 
             # Candidate picks for cooldown/flip checks below
             picks: List[Setup] = list(eligible[: max(int(EMAIL_SETUPS_N) * 6, 18)])
