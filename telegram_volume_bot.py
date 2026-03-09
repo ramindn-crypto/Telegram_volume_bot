@@ -390,7 +390,10 @@ VALID_LICENSE_PREFIX = {
 }
 
 # Reuse your existing admin system
-ADMIN_IDS = {74935310}  # <-- PUT YOUR TELEGRAM USER ID HERE
+# Unified admin identity source.
+# Fall back to the owner id used in this deployment; merged with ADMIN_USER_IDS later.
+_ADMIN_FALLBACK_IDS = {74935310}
+ADMIN_IDS = set(_ADMIN_FALLBACK_IDS)
 
 ALLOWED_WHEN_LOCKED = {
     "start",
@@ -840,6 +843,7 @@ logger = logging.getLogger("pulsefutures")
 ADMIN_USER_IDS = set(
     int(x.strip()) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
 )
+ADMIN_IDS = set(ADMIN_IDS) | set(ADMIN_USER_IDS)
 
 # IMPORTANT CHANGE:
 # System sends signals only. It does NOT show reject reasons to public users.
@@ -2820,7 +2824,8 @@ def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
 
     Primary source stays the bot journal. If older deployments are missing journal rows,
     a conservative *emailed-setup-linked* provisional fallback is added first, followed by
-    a raw exchange-close fallback so the report does not collapse to meaningless zeros.
+    a raw exchange-close fallback. Unlike older versions, fallback reconciliation is applied
+    even when journal history is only partial.
     """
     days = int(max(2, min(int(days or 7), 60)))
     user = _autotrade_user_settings(int(uid))
@@ -2884,52 +2889,48 @@ def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
         except Exception:
             continue
 
-    total_closed = sum(int(r.get('closed') or 0) for r in by_day.values())
-    if total_closed <= 0:
-        for t in _autotrade_reconstruct_provisional_closes(int(uid), days=days):
-            try:
-                lab = _label(float(t.get('closed_ts') or 0.0))
-                if lab not in by_day:
-                    continue
-                row = by_day[lab]
-                row['closed'] += 1
-                row['exchange_reconciled_closes'] += 1
-                row['provisional_emailed_setup_closes'] += 1
-                open_lab = _label(float(t.get('opened_ts') or 0.0))
-                if open_lab in by_day:
-                    by_day[open_lab]['opened'] += 1
-                pnl = float(t.get('pnl') or 0.0)
-                row['net_pnl'] += pnl
-                if pnl > 0:
-                    row['wins'] += 1
-                    row['gross_profit'] += pnl
-                elif pnl < 0:
-                    row['losses'] += 1
-                    row['gross_loss'] += abs(pnl)
-            except Exception:
+    for t in _autotrade_reconstruct_provisional_closes(int(uid), days=days):
+        try:
+            lab = _label(float(t.get('closed_ts') or 0.0))
+            if lab not in by_day:
                 continue
+            row = by_day[lab]
+            row['closed'] += 1
+            row['exchange_reconciled_closes'] += 1
+            row['provisional_emailed_setup_closes'] += 1
+            open_lab = _label(float(t.get('opened_ts') or 0.0))
+            if open_lab in by_day:
+                by_day[open_lab]['opened'] += 1
+            pnl = float(t.get('pnl') or 0.0)
+            row['net_pnl'] += pnl
+            if pnl > 0:
+                row['wins'] += 1
+                row['gross_profit'] += pnl
+            elif pnl < 0:
+                row['losses'] += 1
+                row['gross_loss'] += abs(pnl)
+        except Exception:
+            continue
 
-    total_closed = sum(int(r.get('closed') or 0) for r in by_day.values())
-    if total_closed <= 0:
-        for t in _autotrade_exchange_close_fallback_rows(int(uid), days=days):
-            try:
-                lab = _label(float(t.get('closed_ts') or 0.0))
-                if lab not in by_day:
-                    continue
-                row = by_day[lab]
-                row['closed'] += 1
-                row['exchange_reconciled_closes'] += 1
-                row['exchange_only_fallback_closes'] += 1
-                pnl = float(t.get('pnl') or 0.0)
-                row['net_pnl'] += pnl
-                if pnl > 0:
-                    row['wins'] += 1
-                    row['gross_profit'] += pnl
-                elif pnl < 0:
-                    row['losses'] += 1
-                    row['gross_loss'] += abs(pnl)
-            except Exception:
+    for t in _autotrade_exchange_close_fallback_rows(int(uid), days=days):
+        try:
+            lab = _label(float(t.get('closed_ts') or 0.0))
+            if lab not in by_day:
                 continue
+            row = by_day[lab]
+            row['closed'] += 1
+            row['exchange_reconciled_closes'] += 1
+            row['exchange_only_fallback_closes'] += 1
+            pnl = float(t.get('pnl') or 0.0)
+            row['net_pnl'] += pnl
+            if pnl > 0:
+                row['wins'] += 1
+                row['gross_profit'] += pnl
+            elif pnl < 0:
+                row['losses'] += 1
+                row['gross_loss'] += abs(pnl)
+        except Exception:
+            continue
 
     for row in by_day.values():
         win_n = int(row.get('wins') or 0)
@@ -2939,7 +2940,6 @@ def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
         row['avg_win'] = (gp / win_n) if win_n > 0 else 0.0
         row['avg_loss'] = (-(gl / loss_n)) if loss_n > 0 else 0.0
     return [by_day[ds.strftime('%Y-%m-%d')] for ds in day_starts]
-
 
 def _autotrade_performance_summary(rows: list[dict]) -> dict:
     closed = sum(int(r.get('closed') or 0) for r in rows)
@@ -3020,6 +3020,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
 
     current_total_open_risk = 0.0
     current_day_open_risk = 0.0
+    live_open_risk_charged_today = 0.0
     carried_open_risk = 0.0
     open_positions_now = 0
     inherited_open_positions = 0
@@ -3118,7 +3119,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         # Live admin accounting is driven by exchange-truth open exposure.
         # Charge all currently open risk to today's live risk view so /status and
         # /autotrade_debug stay aligned with the actual Bybit exposure the user sees.
-        current_day_open_risk = float(current_total_open_risk)
+        live_open_risk_charged_today = float(current_total_open_risk)
         opened_today_count = max(int(open_positions_now), int(opened_today_count))
     else:
         open_positions_now = len(journal_open)
@@ -3147,7 +3148,9 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
             })
         open_pnl = 0.0
 
-    daily_used_total = max(0.0, float(current_day_open_risk) + float(realized_loss_today))
+    if float(live_open_risk_charged_today or 0.0) <= 0.0:
+        live_open_risk_charged_today = float(current_day_open_risk)
+    daily_used_total = max(0.0, float(live_open_risk_charged_today) + float(realized_loss_today))
     remaining_raw = float("inf") if cap <= 0 else (float(cap) - float(daily_used_total))
     over_by = abs(float(remaining_raw)) if cap > 0 and remaining_raw < 0 else 0.0
 
@@ -3163,6 +3166,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         "over_by": float(over_by),
         "current_total_open_risk": float(current_total_open_risk),
         "current_day_open_risk": float(current_day_open_risk),
+        "live_open_risk_charged_today": float(live_open_risk_charged_today),
         "carried_open_risk": float(carried_open_risk),
         "open_positions_now": int(open_positions_now),
         "inherited_open_positions": int(inherited_open_positions),
@@ -3679,16 +3683,17 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
     """Return recent OPEN setup candidates for autotrade.
 
     Sync model:
-    - PRIMARY source of truth = emailed_setups (what the user actually received)
+    - PRIMARY source of truth = executable_setups (admin executable pool)
+    - SECONDARY source = emailed_setups (what the user actually received)
     - FALLBACK source = generated_setups(source='email') for backward compatibility
 
     Ordering is newest-first, not confidence-first. That keeps autotrade aligned with the
-    most recently emailed candidate instead of repeatedly re-checking an older higher-conf row.
+    newest executable candidate instead of repeatedly re-checking an older higher-conf row.
 
     Each returned object carries:
       - created_ts: canonical timestamp used for entry deadline enforcement
       - email_logged_ts / generated_logged_ts: debug timestamps for /autotrade_last
-      - source_kind: 'emailed_setups' or 'generated_setups'
+      - source_kind: 'executable_setups' | 'emailed_setups' | 'generated_setups'
       - source_session: session recorded when the row was logged
     """
     try:
@@ -3742,14 +3747,62 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     tp3=tp3,
                     created_ts=float(canonical_ts or 0.0),
                     signal_created_ts=float(signal_created_ts or 0.0),
-                    email_logged_ts=float(chosen_ts_f or 0.0) if source_kind == 'emailed_setups' else 0.0,
-                    generated_logged_ts=float(aux_ts_f or 0.0) if source_kind == 'emailed_setups' else float(chosen_ts_f or 0.0),
+                    email_logged_ts=float(aux_ts_f or 0.0) if source_kind == 'executable_setups' else (float(chosen_ts_f or 0.0) if source_kind == 'emailed_setups' else 0.0),
+                    generated_logged_ts=float(aux_ts_f or 0.0) if source_kind == 'emailed_setups' else (float(aux_ts_f or 0.0) if source_kind == 'executable_setups' else float(chosen_ts_f or 0.0)),
                     source_kind=str(source_kind),
                     source_session=str(src_session or ''),
                 ))
             return out
 
-        # 1) Primary: exact emailed rows, newest first.
+        # 1) Primary: executable pool, newest first.
+        cur.execute(
+            """
+            SELECT x.setup_id,
+                   MAX(x.executable_ts) AS executable_ts,
+                   MAX(COALESCE(e.emailed_ts, 0.0)) AS emailed_ts,
+                   MAX(COALESCE(x.session, e.session, g.session, '')) AS src_session
+            FROM executable_setups x
+            LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
+            LEFT JOIN emailed_setups e
+                   ON e.user_id = x.user_id
+                  AND e.setup_id = x.setup_id
+            LEFT JOIN generated_setups g
+                   ON g.user_id = x.user_id
+                  AND g.setup_id = x.setup_id
+                  AND g.source = 'email'
+            WHERE x.user_id = ?
+              AND x.executable_ts >= ?
+              AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+            GROUP BY x.setup_id
+            ORDER BY executable_ts DESC, emailed_ts DESC, x.setup_id DESC
+            LIMIT ?
+            """,
+            (int(uid), float(cutoff), int(limit)),
+        )
+        rows = cur.fetchall() or []
+        out = _load_signals(rows, 'executable_setups')
+        if out:
+            try:
+                for item in out:
+                    _admin_setup_lifecycle_merge(
+                        int(uid),
+                        str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or ''),
+                        session=str(getattr(item, 'source_session', '') or session_label or ''),
+                        symbol=str(getattr(item, 'symbol', '') or ''),
+                        side=str(getattr(item, 'side', '') or ''),
+                        executable_ts=float(getattr(item, 'created_ts', 0.0) or time.time()),
+                        state='executable_pending',
+                        source_kind=str(getattr(item, 'source_kind', '') or 'executable_setups'),
+                        signal_created_ts=float(getattr(item, 'signal_created_ts', 0.0) or 0.0),
+                        emailed_ts=float(getattr(item, 'email_logged_ts', 0.0) or 0.0),
+                        generated_logged_ts=float(getattr(item, 'generated_logged_ts', 0.0) or 0.0),
+                    )
+            except Exception:
+                pass
+            con.close()
+            return out
+
+        # 2) Secondary: exact emailed rows, newest first.
         cur.execute(
             """
             SELECT e.setup_id,
@@ -3794,7 +3847,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             con.close()
             return out
 
-        # 2) Fallback: legacy generated email rows, newest first.
+        # 3) Fallback: legacy generated email rows, newest first.
         cur.execute(
             """
             SELECT g.setup_id,
@@ -3839,7 +3892,6 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         except Exception:
             pass
         return []
-
 
 def _autotrade_clear_debug_state(uid: int | None = None) -> None:
     """Clear in-memory autotrade debug state. If uid is None, clears all."""
@@ -5952,6 +6004,16 @@ def db_init():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS executable_setups (
+        user_id INTEGER NOT NULL,
+        setup_id TEXT NOT NULL,
+        session TEXT NOT NULL DEFAULT '',
+        executable_ts REAL NOT NULL,
+        PRIMARY KEY (user_id, setup_id)
+    )
+    """)
+
     # =========================================================
     # ✅ Generated setups log (screen vs email correlation)
     # =========================================================
@@ -7715,6 +7777,30 @@ def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts:
     except Exception:
         pass
 
+
+
+
+def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executable_ts: float):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """INSERT OR REPLACE INTO executable_setups (user_id, setup_id, session, executable_ts)
+           VALUES (?, ?, ?, ?)""",
+        (int(user_id), str(setup_id).strip(), str(session or ""), float(executable_ts)),
+    )
+    con.commit()
+    con.close()
+    try:
+        _admin_setup_lifecycle_merge(
+            int(user_id),
+            str(setup_id).strip(),
+            session=str(session or ''),
+            executable_ts=float(executable_ts or 0.0),
+            state='executable_pending',
+            source_kind='executable_setups',
+        )
+    except Exception:
+        pass
 
 
 def db_recent_generated_setups(user_id: int, source: str, lookback_hours: int = 6, limit: int = 5) -> list[dict]:
@@ -14790,8 +14876,8 @@ Today / Risk model
 • Opened today = positions opened inside your active day window
 • Closed today = positions closed inside your active day window
 • Carried from prior day = positions still open now but opened before today
-• Daily risk used today = current-day open risk + realised losses booked today
-• Carried open risk is shown separately and does not get charged again to today's cap
+• Live open risk charged today = open risk currently counted against today's cap
+• Daily risk used today = live open risk charged today + realised losses booked today
 
 ────────────────────
 💎 Plans
@@ -14841,7 +14927,7 @@ Market & Signals
 
 /size <symbol> <side> <entry> <sl>
 • Calculates position size based on your per-trade risk
-• /status shows current-day open risk, carried risk, and remaining daily risk for new trades
+• /status shows current-day risk, live cap-charged risk, carried risk, and remaining daily risk for new trades
 
 ────────────────────
 Trade Journal
@@ -16718,7 +16804,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Carried from prior day: {int(snap.get('inherited_open_positions', 0))}")
     lines.append(f"Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f} (used by /size)")
     lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
-    lines.append(f"Current-day open risk: ${float(snap.get('current_day_open_risk', 0.0)):.2f}")
+    lines.append(f"Current-day open risk (opened today only): ${float(snap.get('current_day_open_risk', 0.0)):.2f}")
+    lines.append(f"Live open risk charged today: ${float(snap.get('live_open_risk_charged_today', snap.get('current_day_open_risk', 0.0))):.2f}")
     lines.append(f"Carried open risk: ${float(snap.get('carried_open_risk', 0.0)):.2f}")
     lines.append(f"Total open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}")
     lines.append(f"Realised loss today used for cap: ${realized_loss_today:.2f}")
@@ -18272,7 +18359,8 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines.append(f"Closed today: {int(snap.get('positions_closed_today', 0))}")
     lines.append(f"Open positions now: {int(snap.get('open_positions_now', 0))}")
     lines.append(f"Carried from prior day: {int(snap.get('inherited_open_positions', 0))}")
-    lines.append(f"Current-day open risk: ${float(snap.get('current_day_open_risk', 0.0)):.2f}")
+    lines.append(f"Current-day open risk (opened today only): ${float(snap.get('current_day_open_risk', 0.0)):.2f}")
+    lines.append(f"Live open risk charged today: ${float(snap.get('live_open_risk_charged_today', snap.get('current_day_open_risk', 0.0))):.2f}")
     lines.append(f"Carried open risk: ${float(snap.get('carried_open_risk', 0.0)):.2f}")
     lines.append(f"Total open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}")
     lines.append(f"Realised loss today used for cap: ${realized_loss_today:.2f}")
@@ -19894,17 +19982,25 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
         best_fut=best_fut,
     )
 
+    pre_log_ts = time.time()
+    try:
+        for s in setups:
+            try:
+                db_insert_signal(s)
+            except Exception:
+                pass
+            try:
+                db_mark_executable_setup(uid, getattr(s, "setup_id", ""), str(display_session), pre_log_ts)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     sent = send_email(subject, body, user_id_for_debug=uid, body_html=body_html)
     if sent:
         try:
             now_ts = time.time()
             for s in setups:
-                # Ensure the setup exists in signals table
-                try:
-                    db_insert_signal(s)
-                except Exception:
-                    pass
-                # Record that this setup was emailed to this user
                 try:
                     db_mark_emailed_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
                 except Exception:
@@ -21764,7 +21860,7 @@ async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
     """Background AutoTrade loop. Scans and opens trades for the owner when enabled.
-    Runs independently from email sending (no dependency on 'email setup sent')."""
+    Runs from the admin executable pool and is not dependent on SMTP success."""
     try:
         _hb_touch('autotrade', ok=True, details='job_tick')
         if not _autotrade_ready():
