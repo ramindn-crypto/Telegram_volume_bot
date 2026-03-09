@@ -2334,6 +2334,39 @@ def _bybit_get_closed_pnl_linear(start_ts: float, end_ts: float, symbol: str | N
     return list(out)
 
 
+def _bybit_closed_pnl_summary(start_ts: float, end_ts: float, symbol: str | None = None) -> dict:
+    """Summarize Bybit closed-PnL rows inside a UTC window.
+
+    Returns exchange-truth totals for the anchored trading day so /status and
+    /autotrade_debug can reflect live realized results even before journal
+    reconciliation finishes.
+    """
+    rows = _bybit_get_closed_pnl_linear(start_ts, end_ts, symbol=symbol, limit=200) or []
+    net_pnl = 0.0
+    realized_loss = 0.0
+    count = 0
+    normalized_rows = []
+    for r in rows:
+        try:
+            ts = float(_bybit_closed_pnl_event_ts(r) or 0.0)
+            if ts <= 0 or ts < float(start_ts) or ts >= float(end_ts):
+                continue
+            pnl = float((r or {}).get('closedPnl') or (r or {}).get('closed_pnl') or 0.0)
+            net_pnl += pnl
+            if pnl < 0:
+                realized_loss += abs(pnl)
+            count += 1
+            normalized_rows.append(r)
+        except Exception:
+            continue
+    return {
+        'rows': normalized_rows,
+        'count': int(count),
+        'net_pnl': float(net_pnl),
+        'realized_loss': float(realized_loss),
+    }
+
+
 def _autotrade_db_close_trade(trade_id: str, closed_ts: float, pnl_usdt: float, outcome: str, note_append: str = '') -> None:
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -2865,14 +2898,20 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     except Exception:
         pass
 
+    start_utc, end_utc = _admin_today_window_utc(uid=int(uid), user=user)
     try:
-        realized_pnl_today = float(_autotrade_realized_pnl_today(int(uid)) or 0.0)
-        realized_loss_today = max(0.0, -float(realized_pnl_today))
+        if mode == "live":
+            closed_summary = _bybit_closed_pnl_summary(float(start_utc.timestamp()), float(end_utc.timestamp()))
+            realized_pnl_today = float(closed_summary.get('net_pnl') or 0.0)
+            realized_loss_today = float(closed_summary.get('realized_loss') or 0.0)
+        else:
+            realized_pnl_today = float(_autotrade_realized_pnl_today(int(uid)) or 0.0)
+            realized_loss_today = max(0.0, -float(realized_pnl_today))
     except Exception:
         realized_pnl_today = 0.0
         realized_loss_today = 0.0
+        closed_summary = {'count': 0}
 
-    start_utc, end_utc = _admin_today_window_utc(uid=int(uid), user=user)
     start_ts = float(start_utc.timestamp())
     end_ts = float(end_utc.timestamp())
 
@@ -2903,6 +2942,11 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     except Exception:
         opened_today_count = 0
         closed_today_count = 0
+    if mode == "live":
+        try:
+            closed_today_count = int((closed_summary or {}).get('count') or 0)
+        except Exception:
+            closed_today_count = 0
 
     journal_open = []
     try:
@@ -2968,6 +3012,11 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
                 'notes': str(info.get('notes') or ''),
             })
         inherited_open_positions = min(int(inherited_open_positions), int(open_positions_now))
+        # Live admin accounting is driven by exchange-truth open exposure.
+        # Charge all currently open risk to today's live risk view so /status and
+        # /autotrade_debug stay aligned with the actual Bybit exposure the user sees.
+        current_day_open_risk = float(current_total_open_risk)
+        opened_today_count = max(int(open_positions_now), int(opened_today_count))
     else:
         open_positions_now = len(journal_open)
         for t in journal_open:
@@ -8288,59 +8337,17 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
     cache_set("tickers_best_fut", best)
     return best
 
-def _timeframe_to_seconds(timeframe: str) -> int:
-    try:
-        tf = str(timeframe or '').strip().lower()
-        if not tf:
-            return 0
-        m = re.fullmatch(r"(\d+)([mhdw])", tf)
-        if not m:
-            return 0
-        n = int(m.group(1))
-        unit = m.group(2)
-        mult = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}.get(unit, 0)
-        return int(n * mult)
-    except Exception:
-        return 0
-
-
-def _drop_incomplete_last_candle(data: List[List[float]], timeframe: str) -> List[List[float]]:
-    """Return OHLCV without the still-forming last candle.
-
-    This stabilizes /screen, email generation, and autotrade by preventing the engine
-    from qualifying/de-qualifying setups on an unfinished 15m/1h/4h candle.
-    """
-    try:
-        if not data or len(data) < 2:
-            return data or []
-        tf_sec = _timeframe_to_seconds(timeframe)
-        if tf_sec <= 0:
-            return data
-        last_open_ms = int(float((data[-1] or [0])[0] or 0))
-        if last_open_ms <= 0:
-            return data
-        now_ms = int(time.time() * 1000)
-        close_ms = last_open_ms + (tf_sec * 1000)
-        if now_ms < close_ms:
-            return data[:-1]
-        return data
-    except Exception:
-        return data or []
-
-
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     """
     ✅ Uses singleton exchange (no repeated build + load_markets)
     ✅ TTL cache already exists
-    ✅ Drops the still-forming last candle for stable signal generation
     """
-    key = f"ohlcv:{symbol}:{timeframe}:{limit}:closed_only"
+    key = f"ohlcv:{symbol}:{timeframe}:{limit}"
     if cache_valid(key, OHLCV_TTL_SEC):
         return cache_get(key)
 
     ex = get_exchange()
     data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
-    data = _drop_incomplete_last_candle(data, timeframe)
     cache_set(key, data)
     return data
 
@@ -17789,7 +17796,6 @@ def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
     end_ts = float((start_local + timedelta(days=days)).astimezone(timezone.utc).timestamp())
     journal_closed = 0
     exchange_reconciled = 0
-    provisional_emailed_setup_closes = 0
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -17803,13 +17809,6 @@ def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
             note = str(r['note'] or '')
             if 'exchange_close_sync' in note:
                 exchange_reconciled += 1
-
-    try:
-        perf_rows = _autotrade_performance_rows(int(uid), days=days) or []
-        provisional_emailed_setup_closes = int(sum(int(r.get('provisional_emailed_setup_closes') or 0) for r in perf_rows))
-    except Exception:
-        provisional_emailed_setup_closes = 0
-
     unmatched = 0
     try:
         seen = set()
@@ -17840,7 +17839,6 @@ def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
     return {
         'journal_confirmed_closes': int(journal_closed),
         'exchange_reconciled_closes': int(exchange_reconciled),
-        'provisional_emailed_setup_closes': int(provisional_emailed_setup_closes),
         'unmatched_exchange_closes': int(unmatched),
     }
 
@@ -18890,7 +18888,7 @@ def user_location_and_time(user: dict):
 # =========================================================
 # /screen fast cache (per-instance)
 # =========================================================
-SCREEN_CACHE_TTL_SEC = 45  # seconds
+SCREEN_CACHE_TTL_SEC = 20  # seconds
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 _SCREEN_CACHE = {
     "ts": 0.0,
