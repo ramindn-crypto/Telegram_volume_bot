@@ -3775,12 +3775,9 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                    ON g.user_id = x.user_id
                   AND g.setup_id = x.setup_id
                   AND g.source = 'email'
-            LEFT JOIN admin_setup_lifecycle l
-                   ON l.setup_id = x.setup_id
             WHERE x.user_id = ?
               AND x.executable_ts >= ?
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-              AND COALESCE(l.state, '') NOT IN ('executed_open', 'closed')
             GROUP BY x.setup_id
             ORDER BY executable_ts DESC, emailed_ts DESC, x.setup_id DESC
             LIMIT ?
@@ -3823,12 +3820,9 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                    ON g.user_id = e.user_id
                   AND g.setup_id = e.setup_id
                   AND g.source = 'email'
-            LEFT JOIN admin_setup_lifecycle l
-                   ON l.setup_id = e.setup_id
             WHERE e.user_id = ?
               AND e.emailed_ts >= ?
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-              AND COALESCE(l.state, '') NOT IN ('executed_open', 'closed')
             GROUP BY e.setup_id
             ORDER BY emailed_ts DESC, generated_ts DESC, e.setup_id DESC
             LIMIT ?
@@ -3867,13 +3861,10 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                    MAX(COALESCE(g.session, '')) AS src_session
             FROM generated_setups g
             LEFT JOIN signal_outcomes o ON o.setup_id = g.setup_id
-            LEFT JOIN admin_setup_lifecycle l
-                   ON l.setup_id = g.setup_id
             WHERE g.user_id = ?
               AND g.created_ts >= ?
               AND g.source = 'email'
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-              AND COALESCE(l.state, '') NOT IN ('executed_open', 'closed')
             GROUP BY g.setup_id
             ORDER BY generated_ts DESC, MAX(g.conf) DESC, g.setup_id DESC
             LIMIT ?
@@ -7587,36 +7578,12 @@ def _admin_setup_lifecycle_migrate() -> None:
         pass
 
 
-def _admin_setup_lifecycle_state_rank(state: str) -> int:
-    s = str(state or '').strip().lower()
-    if not s:
-        return 0
-    if s == 'closed':
-        return 100
-    if s == 'executed_open':
-        return 90
-    if s == 'bybit_order_accepted':
-        return 80
-    if s == 'execution_attempted':
-        return 60
-    if s == 'executable_pending':
-        return 50
-    if s == 'emailed':
-        return 40
-    if s == 'screened':
-        return 30
-    if s.startswith('emailed_not_executed_'):
-        return 20
-    if s == 'email_failed_not_executable':
-        return 10
-    return 25
-
-
 def _admin_setup_lifecycle_merge(uid: int, setup_id: str, **fields) -> None:
     sid = str(setup_id or '').strip()
     if not sid:
         return
     _admin_setup_lifecycle_migrate()
+    now_ts = float(time.time())
     safe = {
         'uid': int(uid or 0),
         'symbol': str(fields.get('symbol') or ''),
@@ -7666,27 +7633,6 @@ def _admin_setup_lifecycle_merge(uid: int, setup_id: str, **fields) -> None:
                         merged[key] = float(old or 0.0)
                 else:
                     merged[key] = val if str(val) != '' else str(old or '')
-
-            current_state = str(current.get('state') or '')
-            incoming_state = str(safe.get('state') or '')
-            if incoming_state:
-                cur_rank = _admin_setup_lifecycle_state_rank(current_state)
-                new_rank = _admin_setup_lifecycle_state_rank(incoming_state)
-                preserve_success = (
-                    cur_rank >= 80
-                    and new_rank < cur_rank
-                    and incoming_state != 'closed'
-                )
-                if preserve_success:
-                    merged['state'] = current_state
-                    if not str(fields.get('last_reason') or '').strip():
-                        merged['last_reason'] = str(current.get('last_reason') or '')
-                    for sticky in ('executed_ts', 'trade_id', 'bybit_order_id', 'bybit_order_link_id', 'bybit_position_symbol'):
-                        merged[sticky] = current.get(sticky) if current.get(sticky) not in (None, '', 0, 0.0) else merged.get(sticky)
-                else:
-                    merged['state'] = incoming_state
-            else:
-                merged['state'] = current_state or str(merged.get('state') or '')
             cur.execute(
                 """INSERT OR REPLACE INTO admin_setup_lifecycle (
                     setup_id, uid, symbol, side, session, screened_ts, emailed_ts, executable_ts,
@@ -18252,22 +18198,11 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if det.get('setup_id'):
             lines.append(f"*Setup ID:* `{det.get('setup_id')}`")
         if life:
-            live_sym = _bybit_linear_symbol(str(life.get('bybit_position_symbol') or symbol_sent or symbol_raw or ''))
-            live_side = str(life.get('side') or det.get('side') or '').upper().strip()
-            live_pos = _autotrade_find_live_position(live_sym, side=live_side) if live_sym else None
-            lifecycle_state = str(life.get('state') or '')
-            if live_pos and lifecycle_state.startswith('emailed_not_executed_'):
-                lifecycle_state = f"{lifecycle_state} (live_position_detected)"
-            lines.append(f"*Lifecycle state:* `{lifecycle_state}`")
+            lines.append(f"*Lifecycle state:* `{str(life.get('state') or '')}`")
             if life.get('trade_id'):
                 lines.append(f"*Trade ID:* `{life.get('trade_id')}`")
             if life.get('bybit_order_id'):
                 lines.append(f"*Bybit order ID:* `{life.get('bybit_order_id')}`")
-            if live_pos:
-                try:
-                    lines.append(f"*Live position now:* `{live_sym}` qty `{abs(float(_pos_size(live_pos) or 0.0)):.8g}` @ `{_autotrade_price_str(_pos_entry(live_pos))}`")
-                except Exception:
-                    lines.append(f"*Live position now:* `{live_sym}`")
             if float(life.get('executed_ts') or 0.0) > 0:
                 lines.append(f"*Position/Trade opened in Bybit (Melbourne):* `{_fmt_dt_local(datetime.fromtimestamp(float(life.get('executed_ts') or 0.0), tz=timezone.utc))}`")
             if float(life.get('closed_ts') or 0.0) > 0:
