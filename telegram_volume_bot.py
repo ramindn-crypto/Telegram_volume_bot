@@ -355,7 +355,7 @@ def is_valid_txid(txid: str) -> bool:
     return bool(TXID_REGEX.match(txid))
 
 def usdt_txid_exists(txid: str) -> bool:
-    conn = sqlite3.connect("bot.db")
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM usdt_payments WHERE txid = ?", (txid,))
     exists = cur.fetchone() is not None
@@ -363,7 +363,7 @@ def usdt_txid_exists(txid: str) -> bool:
     return exists
 
 def save_usdt_payment(user_id, username, txid, plan):
-    conn = sqlite3.connect("bot.db")
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO usdt_payments (telegram_id, username, txid, plan, status)
@@ -1174,7 +1174,7 @@ async def cmd_params_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Strategy params reset to defaults.")
 
 async def cmd_params_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin_user(update.effective_user.id):
         await update.message.reply_text("⛔ Admin only.")
         return
     args = context.args or []
@@ -7699,8 +7699,12 @@ def _admin_setup_state_from_reason(reason: str) -> str:
         r = f'emailed_not_executed_{r}'
     return r[:80]
 
-def db_insert_signal(s: Setup):
-    """Upsert a setup into DB (signals table). Adds market_symbol when available."""
+def db_insert_signal(s: Setup, user_id: int | None = None):
+    """Upsert a setup into DB (signals table). Adds market_symbol when available.
+
+    Important: lifecycle updates must stay user-scoped. Do not default to the owner admin,
+    otherwise signals generated for other users can contaminate admin lifecycle tracking.
+    """
     con = db_connect()
     cur = con.cursor()
     try:
@@ -7728,14 +7732,15 @@ def db_insert_signal(s: Setup):
     con.commit()
     con.close()
     try:
-        _admin_setup_lifecycle_merge(
-            int(AUTOTRADE_OWNER_UID or 0),
-            str(getattr(s, 'setup_id', '') or ''),
-            symbol=str(getattr(s, 'symbol', '') or ''),
-            side=str(getattr(s, 'side', '') or ''),
-            signal_created_ts=float(getattr(s, 'created_ts', 0.0) or 0.0),
-            state='screened',
-        )
+        if user_id is not None:
+            _admin_setup_lifecycle_merge(
+                int(user_id),
+                str(getattr(s, 'setup_id', '') or ''),
+                symbol=str(getattr(s, 'symbol', '') or ''),
+                side=str(getattr(s, 'side', '') or ''),
+                signal_created_ts=float(getattr(s, 'created_ts', 0.0) or 0.0),
+                state='screened',
+            )
     except Exception:
         pass
 
@@ -9898,7 +9903,7 @@ def run_backtest(symbol: str, days: int = 30, tf: str = "1h", session_name: str 
     }
 
 async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin_user(update.effective_user.id):
         await update.message.reply_text("Admin only.")
         return
     args = (context.args or [])
@@ -10387,7 +10392,7 @@ def _generate_candidates(cfg: dict) -> list[dict]:
     return cands[:180]
 
 async def cmd_optimize(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin_user(update.effective_user.id):
         await update.message.reply_text("⛔ Admin only.")
         return
 
@@ -10399,7 +10404,7 @@ async def cmd_optimize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
 async def cmd_optimize_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin_user(update.effective_user.id):
         await update.message.reply_text("⛔ Admin only.")
         return
     rep = load_opt_report()
@@ -12766,7 +12771,7 @@ async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_self_optimize(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin_user(update.effective_user.id):
         await update.message.reply_text("⛔ Admin only.")
         return
     await update.message.reply_text(
@@ -12776,7 +12781,7 @@ async def cmd_self_optimize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_self_optimize_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin_user(update.effective_user.id):
         await update.message.reply_text("⛔ Admin only.")
         return
     await update.message.reply_text(
@@ -12785,7 +12790,7 @@ async def cmd_self_optimize_stop(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 async def cmd_self_optimize_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin_user(update.effective_user.id):
         await update.message.reply_text("⛔ Admin only.")
         return
 
@@ -14833,7 +14838,7 @@ async def usdt_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def approve_usdt(txid: str):
-    conn = sqlite3.connect("bot.db")
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
         UPDATE usdt_payments
@@ -19114,11 +19119,7 @@ def user_location_and_time(user: dict):
 # =========================================================
 SCREEN_CACHE_TTL_SEC = 20  # seconds
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
-_SCREEN_CACHE = {
-    "ts": 0.0,
-    "body": "",
-    "kb": [],
-}
+_SCREEN_CACHE: dict[str, dict] = {}
 _SCREEN_LOCK = asyncio.Lock()
 
 # Background refresh task for /screen (keeps UX instant)
@@ -19138,9 +19139,12 @@ async def _refresh_screen_cache_async():
             session,
             0,
         )
-        _SCREEN_CACHE["ts"] = time.time()
-        _SCREEN_CACHE["body"] = body
-        _SCREEN_CACHE["kb"] = list(kb or [])
+        cache_key = f"global::{str(session or '').upper()}"
+        _SCREEN_CACHE[cache_key] = {
+            "ts": time.time(),
+            "body": body,
+            "kb": list(kb or []),
+        }
     except Exception:
         # never let background refresh crash the bot
         return
@@ -19213,7 +19217,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         for s in (setups or []):
             if not hasattr(s, "conf") or s.conf is None:
                 s.conf = 0
-            db_insert_signal(s)
+            db_insert_signal(s, user_id=uid)
             try:
                 db_log_generated_setup(uid, "screen", session, s)
             except Exception:
@@ -19543,13 +19547,15 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         now_ts = time.time()
+        cache_key = f"uid:{int(uid)}::{str(session or '').upper()}"
+        cache_entry = _SCREEN_CACHE.get(cache_key) or {}
 
         # ------------- FAST PATH (cache hit) -------------
         cached_body = ""
         cached_kb = []
-        if (_SCREEN_CACHE.get("body") and (now_ts - float(_SCREEN_CACHE.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
-            cached_body = str(_SCREEN_CACHE.get("body") or "")
-            cached_kb = list(_SCREEN_CACHE.get("kb") or [])
+        if (cache_entry.get("body") and (now_ts - float(cache_entry.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
+            cached_body = str(cache_entry.get("body") or "")
+            cached_kb = list(cache_entry.get("kb") or [])
 
             msg = (header + "\n" + cached_body).strip()
 
@@ -19576,9 +19582,10 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with _SCREEN_LOCK:
             # Re-check cache after waiting for lock (another request may have filled it)
             now_ts = time.time()
-            if (_SCREEN_CACHE.get("body") and (now_ts - float(_SCREEN_CACHE.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
-                cached_body = str(_SCREEN_CACHE.get("body") or "")
-                cached_kb = list(_SCREEN_CACHE.get("kb") or [])
+            cache_entry = _SCREEN_CACHE.get(cache_key) or {}
+            if (cache_entry.get("body") and (now_ts - float(cache_entry.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
+                cached_body = str(cache_entry.get("body") or "")
+                cached_kb = list(cache_entry.get("kb") or [])
 
                 msg = (header + "\n" + cached_body).strip()
                 keyboard = [
@@ -19610,17 +19617,20 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 int(update.effective_user.id),
             )
 
-            # Cache for fast subsequent /screen calls
-            _SCREEN_CACHE["ts"] = time.time()
-            _SCREEN_CACHE["body"] = body
-            _SCREEN_CACHE["kb"] = list(kb or [])
+            # Cache for fast subsequent /screen calls (user + session scoped)
+            _SCREEN_CACHE[cache_key] = {
+                "ts": time.time(),
+                "body": body,
+                "kb": list(kb or []),
+            }
 
 
         # Send final
-        msg = (header + "\n" + str(_SCREEN_CACHE.get("body") or "")).strip()
+        cache_entry = _SCREEN_CACHE.get(cache_key) or {}
+        msg = (header + "\n" + str(cache_entry.get("body") or "")).strip()
         keyboard = [
             [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
-            for (sym, sid) in (_SCREEN_CACHE.get("kb") or [])
+            for (sym, sid) in (cache_entry.get("kb") or [])
         ]
 
         try:
@@ -19997,15 +20007,10 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
         best_fut=best_fut,
     )
 
-    pre_log_ts = time.time()
     try:
         for s in setups:
             try:
-                db_insert_signal(s)
-            except Exception:
-                pass
-            try:
-                db_mark_executable_setup(uid, getattr(s, "setup_id", ""), str(display_session), pre_log_ts)
+                db_insert_signal(s, user_id=uid)
             except Exception:
                 pass
     except Exception:
@@ -20021,7 +20026,28 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                 except Exception:
                     pass
                 try:
+                    db_mark_executable_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
+                except Exception:
+                    pass
+                try:
                     db_log_generated_setup(uid, "email", str(display_session or ""), s)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    else:
+        try:
+            for s in setups:
+                try:
+                    _admin_setup_lifecycle_merge(
+                        int(uid),
+                        str(getattr(s, 'setup_id', '') or ''),
+                        session=str(display_session or ''),
+                        symbol=str(getattr(s, 'symbol', '') or ''),
+                        side=str(getattr(s, 'side', '') or ''),
+                        state='email_failed_not_executable',
+                        last_reason='smtp_send_failed',
+                    )
                 except Exception:
                     pass
         except Exception:
@@ -21730,7 +21756,7 @@ async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
       - outcomes_archive (mirrors `signal_outcomes` if present; otherwise `outcomes` if present)
     """
     uid = update.effective_user.id
-    if uid not in ADMIN_IDS:
+    if not is_admin_user(uid):
         return
 
     try:
@@ -21875,7 +21901,7 @@ async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
     """Background AutoTrade loop. Scans and opens trades for the owner when enabled.
-    Runs from the admin executable pool and is not dependent on SMTP success."""
+    Runs from the admin confirmed-email executable pool and only executes setups that were successfully emailed."""
     try:
         _hb_touch('autotrade', ok=True, details='job_tick')
         if not _autotrade_ready():
