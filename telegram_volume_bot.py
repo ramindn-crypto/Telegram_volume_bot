@@ -2250,6 +2250,33 @@ def _bybit_closed_pnl_event_qty(row: dict) -> float:
     return 0.0
 
 
+def _opposite_side_text(side: str) -> str:
+    s = str(side or '').upper().strip()
+    if s == 'BUY':
+        return 'SELL'
+    if s == 'SELL':
+        return 'BUY'
+    return s
+
+
+def _bybit_closed_pnl_event_side_candidates(row: dict) -> set[str]:
+    """Return possible open-side labels that may correspond to a closed-pnl row.
+
+    Bybit payloads are inconsistent across endpoints / environments: some rows expose the
+    original position side, while others can look like the closing execution side. We accept
+    both the raw side and its opposite when reconciling journal rows so close-sync and
+    performance reporting remain robust.
+    """
+    raw = str((row or {}).get('side') or '').upper().strip()
+    out = set()
+    if raw:
+        out.add(raw)
+        opp = _opposite_side_text(raw)
+        if opp:
+            out.add(opp)
+    return out or {'BUY', 'SELL'}
+
+
 def _bybit_get_closed_pnl_linear(start_ts: float, end_ts: float, symbol: str | None = None, limit: int = 200) -> list[dict]:
     """Fetch Bybit closed-PnL rows for the requested window.
 
@@ -2364,21 +2391,22 @@ def _autotrade_sync_closed_trades_from_exchange(uid: int, now_utc: Optional[date
     for r in (closed_rows or []):
         try:
             sym = str(_bybit_linear_symbol((r or {}).get('symbol') or '')).upper()
-            side = str((r or {}).get('side') or '').upper().strip()
-            if not sym or not side:
+            if not sym:
                 continue
             ts = float(_bybit_closed_pnl_event_ts(r) or 0.0)
             if ts <= 0:
                 continue
             pnl = float((r or {}).get('closedPnl') or 0.0)
             qty = float(_bybit_closed_pnl_event_qty(r) or 0.0)
-            event_pool[(sym, side)].append({
+            event = {
                 'ts': ts,
                 'pnl': pnl,
                 'qty': qty,
                 'raw': r,
                 'used': False,
-            })
+            }
+            for side in _bybit_closed_pnl_event_side_candidates(r):
+                event_pool[(sym, side)].append(event)
         except Exception:
             continue
     for key in list(event_pool.keys()):
@@ -2474,22 +2502,78 @@ def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
         trades = []
 
     tz = _user_tzinfo(user)
-    start_local, end_local = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(user))
+    start_local, _ = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(user))
     day_starts = [start_local - timedelta(days=i) for i in range(days - 1, -1, -1)]
-    rows = []
+    start_ts = float(day_starts[0].astimezone(timezone.utc).timestamp()) if day_starts else float(time.time())
+    end_ts = float((day_starts[-1] + timedelta(days=1)).astimezone(timezone.utc).timestamp()) if day_starts else float(time.time())
+
+    try:
+        exchange_closed = _bybit_get_closed_pnl_linear(start_ts, end_ts, limit=200) or []
+    except Exception:
+        exchange_closed = []
+
+    by_day: dict[str, dict] = {}
     for ds in day_starts:
-        de = ds + timedelta(days=1)
-        ds_ts = float(ds.astimezone(timezone.utc).timestamp())
-        de_ts = float(de.astimezone(timezone.utc).timestamp())
-        opened = [t for t in trades if ds_ts <= float(t.get('opened_ts') or 0.0) < de_ts]
-        closed = [t for t in trades if ds_ts <= float(t.get('closed_ts') or 0.0) < de_ts]
-        pnls = [float(t.get('pnl') or 0.0) for t in closed if t.get('pnl') is not None]
+        by_day[ds.strftime('%Y-%m-%d')] = {
+            'day': ds.strftime('%Y-%m-%d'),
+            'opened': 0,
+            'closed': 0,
+            'wins': 0,
+            'losses': 0,
+            'net_pnl': 0.0,
+            'avg_win': 0.0,
+            'avg_loss': 0.0,
+            'gross_profit': 0.0,
+            'gross_loss': 0.0,
+            'source_closed': 'journal',
+        }
+
+    for t in trades:
+        try:
+            ots = float(t.get('opened_ts') or 0.0)
+            if ots > 0:
+                lab = _autotrade_trade_day_label(ots, user)
+                if lab in by_day:
+                    by_day[lab]['opened'] += 1
+        except Exception:
+            continue
+
+    journal_closed_by_day: dict[str, list[float]] = defaultdict(list)
+    for t in trades:
+        try:
+            cts = float(t.get('closed_ts') or 0.0)
+            if cts <= 0:
+                continue
+            lab = _autotrade_trade_day_label(cts, user)
+            if lab not in by_day:
+                continue
+            journal_closed_by_day[lab].append(float(t.get('pnl') or 0.0))
+        except Exception:
+            continue
+
+    exchange_closed_by_day: dict[str, list[float]] = defaultdict(list)
+    for r in exchange_closed:
+        try:
+            cts = float(_bybit_closed_pnl_event_ts(r) or 0.0)
+            if cts <= 0:
+                continue
+            lab = _autotrade_trade_day_label(cts, user)
+            if lab not in by_day:
+                continue
+            exchange_closed_by_day[lab].append(float((r or {}).get('closedPnl') or 0.0))
+        except Exception:
+            continue
+
+    for day, row in by_day.items():
+        pnls = journal_closed_by_day.get(day) or []
+        source_closed = 'journal'
+        if not pnls and exchange_closed_by_day.get(day):
+            pnls = list(exchange_closed_by_day.get(day) or [])
+            source_closed = 'exchange_fallback'
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p < 0]
-        rows.append({
-            'day': ds.strftime('%Y-%m-%d'),
-            'opened': len(opened),
-            'closed': len(closed),
+        row.update({
+            'closed': len(pnls),
             'wins': len(wins),
             'losses': len(losses),
             'net_pnl': sum(pnls) if pnls else 0.0,
@@ -2497,8 +2581,10 @@ def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
             'avg_loss': (sum(losses) / len(losses)) if losses else 0.0,
             'gross_profit': sum(wins) if wins else 0.0,
             'gross_loss': abs(sum(losses)) if losses else 0.0,
+            'source_closed': source_closed,
         })
-    return rows
+
+    return [by_day[ds.strftime('%Y-%m-%d')] for ds in day_starts]
 
 
 def _autotrade_performance_summary(rows: list[dict]) -> dict:
@@ -17132,7 +17218,7 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
     lines.append("📈 Performance Report")
     lines.append(HDR)
     lines.append(f"Window: last {days} anchored trading day(s) (Melbourne / configured day reset)")
-    lines.append("Source: actual autotrade journal + live Bybit close sync")
+    lines.append("Source: autotrade journal, with direct Bybit closed-PnL fallback when journal close sync is missing")
     lines.append(HDR)
     lines.append(
         f"Closed: {int(summary.get('closed') or 0)} | Wins: {int(summary.get('wins') or 0)} | "
@@ -17159,10 +17245,13 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
         pf_day = (gp / gl) if gl > 0 else (float('inf') if gp > 0 else 0.0)
         pf_day_txt = 'INF' if pf_day == float('inf') else f"{pf_day:.2f}"
         wr = (float(r.get('wins') or 0) / max(1, int(r.get('wins') or 0) + int(r.get('losses') or 0)) * 100.0) if (int(r.get('wins') or 0) + int(r.get('losses') or 0)) > 0 else 0.0
+        src_flag = ''
+        if str(r.get('source_closed') or '') == 'exchange_fallback' and int(r.get('closed') or 0) > 0:
+            src_flag = ' | src=exchange'
         lines.append(
             f"• {r.get('day')}: pnl ${float(r.get('net_pnl') or 0.0):+.2f} | open {int(r.get('opened') or 0)} | "
             f"closed {int(r.get('closed') or 0)} | W {int(r.get('wins') or 0)} / L {int(r.get('losses') or 0)} | "
-            f"WR {wr:.1f}% | PF {pf_day_txt}"
+            f"WR {wr:.1f}% | PF {pf_day_txt}{src_flag}"
         )
 
     await send_long_message(update, "\n".join(lines), parse_mode=None)
