@@ -8288,17 +8288,59 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
     cache_set("tickers_best_fut", best)
     return best
 
+def _timeframe_to_seconds(timeframe: str) -> int:
+    try:
+        tf = str(timeframe or '').strip().lower()
+        if not tf:
+            return 0
+        m = re.fullmatch(r"(\d+)([mhdw])", tf)
+        if not m:
+            return 0
+        n = int(m.group(1))
+        unit = m.group(2)
+        mult = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}.get(unit, 0)
+        return int(n * mult)
+    except Exception:
+        return 0
+
+
+def _drop_incomplete_last_candle(data: List[List[float]], timeframe: str) -> List[List[float]]:
+    """Return OHLCV without the still-forming last candle.
+
+    This stabilizes /screen, email generation, and autotrade by preventing the engine
+    from qualifying/de-qualifying setups on an unfinished 15m/1h/4h candle.
+    """
+    try:
+        if not data or len(data) < 2:
+            return data or []
+        tf_sec = _timeframe_to_seconds(timeframe)
+        if tf_sec <= 0:
+            return data
+        last_open_ms = int(float((data[-1] or [0])[0] or 0))
+        if last_open_ms <= 0:
+            return data
+        now_ms = int(time.time() * 1000)
+        close_ms = last_open_ms + (tf_sec * 1000)
+        if now_ms < close_ms:
+            return data[:-1]
+        return data
+    except Exception:
+        return data or []
+
+
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     """
     ✅ Uses singleton exchange (no repeated build + load_markets)
     ✅ TTL cache already exists
+    ✅ Drops the still-forming last candle for stable signal generation
     """
-    key = f"ohlcv:{symbol}:{timeframe}:{limit}"
+    key = f"ohlcv:{symbol}:{timeframe}:{limit}:closed_only"
     if cache_valid(key, OHLCV_TTL_SEC):
         return cache_get(key)
 
     ex = get_exchange()
     data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
+    data = _drop_incomplete_last_candle(data, timeframe)
     cache_set(key, data)
     return data
 
@@ -17747,6 +17789,7 @@ def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
     end_ts = float((start_local + timedelta(days=days)).astimezone(timezone.utc).timestamp())
     journal_closed = 0
     exchange_reconciled = 0
+    provisional_emailed_setup_closes = 0
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -17760,6 +17803,13 @@ def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
             note = str(r['note'] or '')
             if 'exchange_close_sync' in note:
                 exchange_reconciled += 1
+
+    try:
+        perf_rows = _autotrade_performance_rows(int(uid), days=days) or []
+        provisional_emailed_setup_closes = int(sum(int(r.get('provisional_emailed_setup_closes') or 0) for r in perf_rows))
+    except Exception:
+        provisional_emailed_setup_closes = 0
+
     unmatched = 0
     try:
         seen = set()
@@ -17790,6 +17840,7 @@ def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
     return {
         'journal_confirmed_closes': int(journal_closed),
         'exchange_reconciled_closes': int(exchange_reconciled),
+        'provisional_emailed_setup_closes': int(provisional_emailed_setup_closes),
         'unmatched_exchange_closes': int(unmatched),
     }
 
@@ -18839,7 +18890,7 @@ def user_location_and_time(user: dict):
 # =========================================================
 # /screen fast cache (per-instance)
 # =========================================================
-SCREEN_CACHE_TTL_SEC = 20  # seconds
+SCREEN_CACHE_TTL_SEC = 45  # seconds
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 _SCREEN_CACHE = {
     "ts": 0.0,
