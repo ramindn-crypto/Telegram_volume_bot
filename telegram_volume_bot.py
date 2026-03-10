@@ -18361,7 +18361,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
         f"Daily cap: ${float(snap.get('cap') or 0.0):.2f}",
         f"Daily risk used: ${float(snap.get('used_today') or 0.0):.2f}",
-        f"Daily risk remaining: {'∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f'${float(snap.get('remaining_today')):.2f}'}",
+        ('Daily risk remaining: ∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f"Daily risk remaining: ${float(snap.get('remaining_today')):.2f}"),
         f"Unrealised PnL: ${float(mday.get('open_pnl') or 0.0):+.2f} | Realised PnL today: ${float(snap.get('pnl_today') or 0.0):+.2f}",
     ]
     if reasons and not ready:
