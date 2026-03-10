@@ -883,7 +883,7 @@ SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
 SCREEN_WAITING_N = 10
 
 # EMA proximity gate: never generate setups if price is far from EMA7 (1H)
-EMA7_1H_MAX_DIST_PCT = 0.35  # % distance from EMA7(1H). Example: 0.35 = within 0.35%
+EMA7_1H_MAX_DIST_PCT = float(os.environ.get("EMA7_1H_MAX_DIST_PCT", "0.80") or 0.80)  # adaptive base anchor distance (%)
 
 # Directional Leaders/Losers thresholds
 MOVER_VOL_USD_MIN = 5_000_000
@@ -1431,7 +1431,7 @@ BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
 BYBIT_API_SECRET = str(os.environ.get("BYBIT_API_SECRET", "") or "").strip()
 BYBIT_RECV_WINDOW = str(os.environ.get("BYBIT_RECV_WINDOW", "5000") or "5000").strip()
 BYBIT_TESTNET = str(os.environ.get("BYBIT_TESTNET", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
-AUTOTRADE_ENTRY_WINDOW_MIN = int(os.environ.get("AUTOTRADE_ENTRY_WINDOW_MIN", "15") or 15)
+AUTOTRADE_ENTRY_WINDOW_MIN = int(os.environ.get("AUTOTRADE_ENTRY_WINDOW_MIN", "45") or 45)
 
 # Email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
@@ -3739,6 +3739,24 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                 except Exception:
                     aux_ts_f = 0.0
                 canonical_ts = max(chosen_ts_f, signal_created_ts, aux_ts_f)
+                now_ts = float(time.time())
+                expiry_grace_sec = float(max(300, int(AUTOTRADE_ENTRY_WINDOW_MIN) * 60 + 300))
+                src_session_u = str(src_session or '').upper().strip()
+                req_session_u = str(session_label or '').upper().strip()
+                if canonical_ts <= 0 or (now_ts - canonical_ts) > expiry_grace_sec:
+                    try:
+                        if setup_id:
+                            _admin_setup_lifecycle_merge(int(uid), str(setup_id), session=src_session_u or req_session_u, symbol=str(symbol or ''), side=str(side or ''), state=_admin_setup_state_from_reason('stale_deadline'), last_reason='stale_deadline')
+                    except Exception:
+                        pass
+                    continue
+                if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
+                    try:
+                        if setup_id:
+                            _admin_setup_lifecycle_merge(int(uid), str(setup_id), session=src_session_u, symbol=str(symbol or ''), side=str(side or ''), state=_admin_setup_state_from_reason('session_mismatch'), last_reason=f'session_mismatch ({src_session_u}->{req_session_u})')
+                    except Exception:
+                        pass
+                    continue
                 out.append(SimpleNamespace(
                     setup_id=setup_id,
                     id=setup_id,
@@ -3775,12 +3793,9 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                    ON g.user_id = x.user_id
                   AND g.setup_id = x.setup_id
                   AND g.source = 'email'
-            LEFT JOIN admin_setup_lifecycle l
-                   ON l.setup_id = x.setup_id
             WHERE x.user_id = ?
               AND x.executable_ts >= ?
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-              AND COALESCE(l.state, '') NOT IN ('executed_open', 'closed')
             GROUP BY x.setup_id
             ORDER BY executable_ts DESC, emailed_ts DESC, x.setup_id DESC
             LIMIT ?
@@ -3788,7 +3803,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             (int(uid), float(cutoff), int(limit)),
         )
         rows = cur.fetchall() or []
-        out = _load_signals(rows, 'executable_setups')
+        out = sorted(_load_signals(rows, 'executable_setups'), key=lambda x: float(getattr(x, 'created_ts', 0.0) or 0.0), reverse=True)
         if out:
             try:
                 for item in out:
@@ -3823,12 +3838,9 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                    ON g.user_id = e.user_id
                   AND g.setup_id = e.setup_id
                   AND g.source = 'email'
-            LEFT JOIN admin_setup_lifecycle l
-                   ON l.setup_id = e.setup_id
             WHERE e.user_id = ?
               AND e.emailed_ts >= ?
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-              AND COALESCE(l.state, '') NOT IN ('executed_open', 'closed')
             GROUP BY e.setup_id
             ORDER BY emailed_ts DESC, generated_ts DESC, e.setup_id DESC
             LIMIT ?
@@ -3836,7 +3848,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             (int(uid), float(cutoff), int(limit)),
         )
         rows = cur.fetchall() or []
-        out = _load_signals(rows, 'emailed_setups')
+        out = sorted(_load_signals(rows, 'emailed_setups'), key=lambda x: float(getattr(x, 'created_ts', 0.0) or 0.0), reverse=True)
         if out:
             try:
                 for item in out:
@@ -3867,13 +3879,10 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                    MAX(COALESCE(g.session, '')) AS src_session
             FROM generated_setups g
             LEFT JOIN signal_outcomes o ON o.setup_id = g.setup_id
-            LEFT JOIN admin_setup_lifecycle l
-                   ON l.setup_id = g.setup_id
             WHERE g.user_id = ?
               AND g.created_ts >= ?
               AND g.source = 'email'
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-              AND COALESCE(l.state, '') NOT IN ('executed_open', 'closed')
             GROUP BY g.setup_id
             ORDER BY generated_ts DESC, MAX(g.conf) DESC, g.setup_id DESC
             LIMIT ?
@@ -3881,7 +3890,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             (int(uid), float(cutoff), int(limit)),
         )
         rows = cur.fetchall() or []
-        out = _load_signals(rows, 'generated_setups')
+        out = sorted(_load_signals(rows, 'generated_setups'), key=lambda x: float(getattr(x, 'created_ts', 0.0) or 0.0), reverse=True)
         try:
             for item in out:
                 _admin_setup_lifecycle_merge(
@@ -4412,10 +4421,13 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 tp_qtys[2] = max(0.0, tp_base_qty - (tp_qtys[0] + tp_qtys[1]))
             except Exception:
                 pass
-        for tp_price, tp_qty in zip(tps, tp_qtys):
+        tp_order_results = []
+        tp_success_count = 0
+        fallback_tp_price = float(tps[0]) if tps else 0.0
+        for idx, (tp_price, tp_qty) in enumerate(zip(tps, tp_qtys), start=1):
             if tp_price <= 0 or tp_qty <= 0:
                 continue
-            _bybit_v5_request('POST', '/v5/order/create', {
+            tp_payload = {
                 'category': 'linear',
                 'symbol': sym,
                 'side': 'Sell' if side == 'BUY' else 'Buy',
@@ -4424,8 +4436,46 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 'price': str(tp_price),
                 'timeInForce': 'GTC',
                 'reduceOnly': True,
-                'closeOnTrigger': True,
+                # Bybit may reject TP reduce-only limit orders when closeOnTrigger is sent here.
+                # Keep them as normal reduce-only closing orders.
+            }
+            tp_res = _bybit_v5_request('POST', '/v5/order/create', tp_payload)
+            ok = int((tp_res or {}).get('retCode', -1)) == 0
+            if ok:
+                tp_success_count += 1
+            tp_order_results.append({
+                'idx': idx,
+                'price': float(tp_price),
+                'qty': float(tp_qty),
+                'ok': bool(ok),
+                'retCode': (tp_res or {}).get('retCode'),
+                'retMsg': (tp_res or {}).get('retMsg'),
+                'orderId': (((tp_res or {}).get('result') or {}).get('orderId') or ''),
             })
+
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'tp_orders': tp_order_results,
+                'tp_success_count': int(tp_success_count),
+            })
+        except Exception:
+            pass
+
+        if tp_success_count == 0 and fallback_tp_price > 0:
+            tp_fallback_res = _bybit_v5_request('POST', '/v5/position/trading-stop', {
+                'category': 'linear',
+                'symbol': sym,
+                'stopLoss': str(sl_for_order),
+                'takeProfit': str(fallback_tp_price),
+                'tpslMode': 'Full',
+            })
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                    'tp_fallback_price': float(fallback_tp_price),
+                    'tp_fallback_res': tp_fallback_res,
+                })
+            except Exception:
+                pass
 
         qty_for_db = tp_base_qty if tp_base_qty > 0 else qty
         trade_id = _autotrade_db_add_trade(uid, session_label, s, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened')
@@ -4499,21 +4549,21 @@ SESSIONS_UTC = {
     # NY  : 13:00–22:00 UTC
     "ASIA": {"start": "00:00", "end": "08:00"},
     "LON":  {"start": "08:00", "end": "17:00"},
-    "NY":   {"start": "13:00", "end": "22:00"},
+    "NY":   {"start": "13:00", "end": "23:00"},
 }
 
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 76,
-    "LON": 78,
-    "ASIA": 80,
+    "NY": 74,
+    "LON": 75,
+    "ASIA": 77,
 }
 
 SESSION_MIN_RR_TP3 = {
-    "NY": 1.7,
-    "LON": 1.8,
-    "ASIA": 1.9,
+    "NY": 1.55,
+    "LON": 1.65,
+    "ASIA": 1.80,
 }
 
 SESSION_EMA_PROX_MULT = {
@@ -7587,36 +7637,12 @@ def _admin_setup_lifecycle_migrate() -> None:
         pass
 
 
-def _admin_setup_lifecycle_state_rank(state: str) -> int:
-    s = str(state or '').strip().lower()
-    if not s:
-        return 0
-    if s == 'closed':
-        return 100
-    if s == 'executed_open':
-        return 90
-    if s == 'bybit_order_accepted':
-        return 80
-    if s == 'execution_attempted':
-        return 60
-    if s == 'executable_pending':
-        return 50
-    if s == 'emailed':
-        return 40
-    if s == 'screened':
-        return 30
-    if s.startswith('emailed_not_executed_'):
-        return 20
-    if s == 'email_failed_not_executable':
-        return 10
-    return 25
-
-
 def _admin_setup_lifecycle_merge(uid: int, setup_id: str, **fields) -> None:
     sid = str(setup_id or '').strip()
     if not sid:
         return
     _admin_setup_lifecycle_migrate()
+    now_ts = float(time.time())
     safe = {
         'uid': int(uid or 0),
         'symbol': str(fields.get('symbol') or ''),
@@ -7666,27 +7692,6 @@ def _admin_setup_lifecycle_merge(uid: int, setup_id: str, **fields) -> None:
                         merged[key] = float(old or 0.0)
                 else:
                     merged[key] = val if str(val) != '' else str(old or '')
-
-            current_state = str(current.get('state') or '')
-            incoming_state = str(safe.get('state') or '')
-            if incoming_state:
-                cur_rank = _admin_setup_lifecycle_state_rank(current_state)
-                new_rank = _admin_setup_lifecycle_state_rank(incoming_state)
-                preserve_success = (
-                    cur_rank >= 80
-                    and new_rank < cur_rank
-                    and incoming_state != 'closed'
-                )
-                if preserve_success:
-                    merged['state'] = current_state
-                    if not str(fields.get('last_reason') or '').strip():
-                        merged['last_reason'] = str(current.get('last_reason') or '')
-                    for sticky in ('executed_ts', 'trade_id', 'bybit_order_id', 'bybit_order_link_id', 'bybit_position_symbol'):
-                        merged[sticky] = current.get(sticky) if current.get(sticky) not in (None, '', 0, 0.0) else merged.get(sticky)
-                else:
-                    merged['state'] = incoming_state
-            else:
-                merged['state'] = current_state or str(merged.get('state') or '')
             cur.execute(
                 """INSERT OR REPLACE INTO admin_setup_lifecycle (
                     setup_id, uid, symbol, side, session, screened_ts, emailed_ts, executable_ts,
@@ -8774,32 +8779,29 @@ def in_trade_window_now(user: dict, now_local: Optional[datetime] = None) -> boo
 
 def current_session_utc(now_utc: Optional[datetime] = None) -> str:
     """
-    Market sessions in UTC.
-
-    NOTE:
-    - We use non-overlapping UTC windows to avoid ambiguous session labels around overlaps.
-    - This also fixes Melbourne display so ~6:00 PM Melbourne remains ASIA until 7:00 PM (AEDT).
+    Returns the live market session label in UTC, or ``"NONE"`` when we are
+    outside all configured session windows.
 
     Windows:
-    - NY  : 13:00–22:00 UTC
+    - NY  : 13:00–23:00 UTC
     - LON : 08:00–17:00 UTC
     - ASIA: 00:00–08:00 UTC
     Priority: NY > LON > ASIA
     """
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
+    return _session_label_utc(now_utc) or "NONE"
 
-    h = now_utc.hour
 
-    if 13 <= h < 22:
-        return "NY"
-    if 8 <= h < 17:
-        return "LON"
-    if 0 <= h < 8:
-        return "ASIA"
-
-    # Outside the three main windows: treat as NY tail/transition
-    return "NY"
+def scan_session_name_utc(now_utc: Optional[datetime] = None) -> str:
+    """
+    Session name used for informational/manual scans when we are in the
+    1-hour gap between NY close and ASIA open. The display/session truth should
+    still be ``NONE`` during that gap; this fallback is only for scan heuristics.
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    return _session_label_utc(now_utc) or "NY"
 
 
 # Some mobile apps (Gmail/iOS) may copy-paste commands with invisible Unicode markers
@@ -11660,32 +11662,32 @@ async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
-    snap = await to_thread_fast(_evolution_snapshot_cached)
-    item = (snap or {}).get("overall") or {}
-    trend = (snap or {}).get("trend") or {}
-    msg = (
-        "📊 Bot Win Rate Estimate\n"
-        f"{float(item.get('estimated_wr', 0.0) or 0.0):.1f}%\n"
-        f"Trend vs prior 7d: {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}\n"
-        f"Current 7d / previous 7d: {float(trend.get('current7_wr', 0.0) or 0.0):.1f}% / {float(trend.get('previous7_wr', 0.0) or 0.0):.1f}%"
-    )
-    await update.message.reply_text(msg)
+    target_uid = _signal_reporting_target_uid(update.effective_user.id)
+    overall = _signal_winrate_stats(target_uid)
+    last7 = _signal_winrate_stats(target_uid, days=7)
+    lines = [
+        "📊 Win Rate",
+        HDR,
+        _format_wr_line("Overall Win Rate", overall),
+        _format_wr_line("Last 7 Days Win Rate", last7),
+    ]
+    await update.message.reply_text("\n".join(lines))
 
 
 async def ny_winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
-    snap = await to_thread_fast(_evolution_snapshot_cached)
-    item = (snap or {}).get("ny") or {}
-    trend = (snap or {}).get("trend") or {}
-    msg = (
-        "🗽 New York Win Rate Estimate\n"
-        f"{float(item.get('estimated_wr', 0.0) or 0.0):.1f}%\n"
-        f"Trend vs prior 7d: {str(trend.get('ny_7d') or trend.get('ny') or 'n/a')}\n"
-        f"Current 7d / previous 7d: {float(trend.get('current7_ny_wr', 0.0) or 0.0):.1f}% / {float(trend.get('previous7_ny_wr', 0.0) or 0.0):.1f}%"
-    )
-    await update.message.reply_text(msg)
+    target_uid = _signal_reporting_target_uid(update.effective_user.id)
+    overall = _signal_winrate_stats(target_uid, session='NY')
+    last7 = _signal_winrate_stats(target_uid, session='NY', days=7)
+    lines = [
+        "🗽 New York Win Rate",
+        HDR,
+        _format_wr_line("Overall NY Win Rate", overall),
+        _format_wr_line("Last 7 Days NY Win Rate", last7),
+    ]
+    await update.message.reply_text("\n".join(lines))
 
 
 async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -12075,7 +12077,7 @@ async def scan_intelligence_job(context: ContextTypes.DEFAULT_TYPE):
         best_fut = await to_thread_heavy(fetch_futures_tickers)
         if not best_fut:
             return
-        session = _guess_session_name_utc(datetime.now(timezone.utc))
+        session = scan_session_name_utc(datetime.now(timezone.utc))
         pool = await build_priority_pool(best_fut, session, mode="screen", scan_profile=DEFAULT_SCAN_PROFILE, uid=None)
         try:
             rej_ctx = _REJECT_CTX.get() if isinstance(_REJECT_CTX.get(), dict) else None
@@ -12928,7 +12930,7 @@ def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: flo
     is_long = (side == "BUY")
 
     # Base score starts lower to reduce inflated confidences
-    score = 42.0
+    score = 36.0
 
     # -----------------------------
     # 1) Higher-TF alignment first
@@ -13035,7 +13037,8 @@ def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: flo
         elif fut_vol_usd >= 6_000_000:
             score += 1.5
 
-    score = clamp(score, 0.0, 100.0)
+    # Public confidence should remain conservative; quality_score is the main gate.
+    score = clamp(score, 0.0, 92.0)
     return int(round(score))
 
 
@@ -13702,12 +13705,20 @@ def make_setup(
             setattr(s, 'smf_event', str(smf_event or 'NONE'))
             setattr(s, 'smf_score', int(smf_score or 0))
             setattr(s, 'engine', str(engine or ''))
+            setattr(s, 'raw_conf', int(conf or 0))
             # Ensure TP ladder is always present (derive TP1/TP2 if needed)
             try:
                 t1, t2, t3 = _ensure_three_tps(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp3',0.0) or 0.0), getattr(s,'tp1',None), getattr(s,'tp2',None), str(getattr(s,'side','') or ''))
                 setattr(s, 'tp1', t1)
                 setattr(s, 'tp2', t2)
                 setattr(s, 'tp3', t3)
+            except Exception:
+                pass
+            try:
+                public_conf, quality_score, quality_components = _recalibrate_public_confidence(s, session_name=session_name)
+                setattr(s, 'quality_score', float(quality_score or 0.0))
+                setattr(s, 'quality_components', quality_components or {})
+                setattr(s, 'conf', int(public_conf or 0))
             except Exception:
                 pass
         except Exception:
@@ -14515,18 +14526,14 @@ def _session_label_utc(now_utc: datetime) -> Optional[str]:
         if now_utc < start_utc and (start_utc - now_utc) > timedelta(hours=12):
             start_utc -= timedelta(days=1)
             end_utc -= timedelta(days=1)
-        if start_utc <= now_utc <= end_utc:
+        if start_utc <= now_utc < end_utc:
             return name
     return None
 
 
 def _guess_session_name_utc(now_utc: datetime) -> str:
-    """
-    Returns NY/LON/ASIA if within their UTC windows (priority NY > LON > ASIA).
-    If we're outside the three main windows (gap), default to NY (keeps /screen logic consistent).
-    """
-    label = _session_label_utc(now_utc)
-    return label or "NY"
+    """Backward-compatible alias for scan-session fallback logic."""
+    return scan_session_name_utc(now_utc)
 
 
 def in_session_now(user: dict) -> Optional[dict]:
@@ -14559,7 +14566,7 @@ def in_session_now(user: dict) -> Optional[dict]:
         if now_utc < start_utc and (start_utc - now_utc) > timedelta(hours=12):
             start_utc -= timedelta(days=1)
             end_utc -= timedelta(days=1)
-        if start_utc <= now_utc <= end_utc:
+        if start_utc <= now_utc < end_utc:
             session_key = f"{start_utc.strftime('%Y-%m-%d')}_{name}"
             return {
                 "name": name,
@@ -15146,18 +15153,18 @@ ADMIN_HELP_DESCRIPTIONS = {
     "edge_status": "Learning / optimizer / execution assurance view",
     "learning_status": "Detailed learning and optimizer status",
     "optimizer_status": "Alias of /learning_status",
-    "winrate": "Overall estimated win-rate view",
-    "ny_winrate": "New York estimated win-rate view",
+    "winrate": "Signal win rate: overall vs last 7 days",
+    "ny_winrate": "NY-session signal win rate: overall vs last 7 days",
     "lessons_learned": "Latest learning takeaways",
     "email_decision": "Last email pipeline decision",
     "signal_report": "Recent emailed setup outcomes",
-    "signal_report_overall": "Overall signal performance summary",
+    "signal_report_overall": "Overall emailed-signal outcome summary (coverage, WR, R, session split)",
     "autotrade_debug": "AutoTrade readiness + synchronized live day/risk/carry diagnostics",
     "autotrade_debug_reset": "Clear AutoTrade debug state",
     "autotrade_last": "Show last autotrade attempt details",
-    "autotrade_report": "AutoTrade journal (recent)",
+    "autotrade_report": "Compact recent AutoTrade open/closed PnL journal",
     "autotrade_report_overall": "AutoTrade overall performance summary",
-    "performance_report": "Actual autotrade performance trend (exchange/journal based)",
+    "performance_report": "Recent + overall autotrade performance with equity/PnL charts",
     "autotrade_sessions": "Show or set allowed auto-trade sessions",
     "open_trades": "Show live open Bybit positions",
     "cooldown_clear": "Clear cooldown for one symbol + side",
@@ -15910,7 +15917,7 @@ async def sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
     enabled = user_enabled_sessions(user)
     now_s = in_session_now(user)
-    now_live = _guess_session_name_utc(datetime.now(timezone.utc))
+    now_live = current_session_utc(datetime.now(timezone.utc))
     if int(user.get("sessions_unlimited", 0) or 0) == 1:
         now_txt = f"Now in session: {now_live}"
     else:
@@ -16849,7 +16856,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     enabled = user_enabled_sessions(user)
     now_s = in_session_now(user)
-    now_live = _guess_session_name_utc(datetime.now(timezone.utc))
+    now_live = current_session_utc(datetime.now(timezone.utc))
     now_txt = now_live if int(user.get("sessions_unlimited", 0) or 0) == 1 else (now_s["name"] if now_s else "NONE")
 
     cap_sess_raw = (user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION)
@@ -17814,6 +17821,270 @@ async def admin_reset_signal_reports_cmd(update: Update, context: ContextTypes.D
         await update.message.reply_text(f"❌ admin_reset_signal_reports failed: {e}")
 
 
+def _signal_reporting_target_uid(caller_uid: int) -> int:
+    """Use owner history for admin-wide signal reports when available."""
+    try:
+        if is_admin_user(int(caller_uid)) and int(AUTOTRADE_OWNER_UID or 0) > 0:
+            return int(AUTOTRADE_OWNER_UID)
+    except Exception:
+        pass
+    return int(caller_uid)
+
+
+def _signal_outcome_rows_for_reporting(user_id: int, session: str | None = None) -> list[dict]:
+    """Return user signal outcomes joined to emailed setups, with completed-event timestamps."""
+    try:
+        con = db_connect()
+        cur = con.cursor()
+        sql = """SELECT e.setup_id, e.session, e.emailed_ts,
+                          o.outcome, o.hit_level, o.hit_ts, o.best_level, o.best_ts, o.horizon_hours, o.evaluated_ts, o.note
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id = e.setup_id
+                   WHERE e.user_id=?"""
+        params = [int(user_id)]
+        if session:
+            sql += " AND UPPER(COALESCE(e.session,''))=?"
+            params.append(str(session).upper().strip())
+        sql += " ORDER BY COALESCE(o.hit_ts, o.evaluated_ts, e.emailed_ts) ASC, e.emailed_ts ASC"
+        cur.execute(sql, tuple(params))
+        rows = [dict(r) for r in (cur.fetchall() or [])]
+        con.close()
+    except Exception:
+        return []
+    for r in rows:
+        try:
+            r['_event_ts'] = float(r.get('hit_ts') or r.get('evaluated_ts') or r.get('emailed_ts') or 0.0)
+        except Exception:
+            r['_event_ts'] = 0.0
+    return rows
+
+
+def _signal_winrate_stats(user_id: int, session: str | None = None, days: int | None = None) -> dict:
+    rows = _signal_outcome_rows_for_reporting(int(user_id), session=session)
+    if days is not None:
+        cutoff = float(time.time()) - (float(days) * 86400.0)
+        rows = [r for r in rows if float(r.get('_event_ts') or 0.0) >= cutoff]
+    wins = 0
+    losses = 0
+    for r in rows:
+        out = str(r.get('outcome') or '').upper().strip()
+        if out in {'WIN_TP1', 'WIN_TP2', 'WIN_TP3'}:
+            wins += 1
+        elif out == 'LOSS':
+            losses += 1
+    decided = wins + losses
+    wr = (wins / decided * 100.0) if decided > 0 else 0.0
+    return {
+        'wins': int(wins),
+        'losses': int(losses),
+        'decided': int(decided),
+        'win_rate': float(wr),
+    }
+
+
+def _autotrade_history_rows(owner_uid: int) -> list[dict]:
+    """Full-history closed-trade rows for performance reporting. Journal-first, fallback-aware."""
+    owner_uid = int(owner_uid)
+    user = _autotrade_user_settings(owner_uid)
+    try:
+        _autotrade_sync_closed_trades_from_exchange(owner_uid, lookback_days=365)
+    except Exception:
+        pass
+
+    records = []
+    earliest_ts = None
+    try:
+        for t in (db_list_autotrade_trades_all(owner_uid) or []):
+            ots = float(t.get('opened_ts') or 0.0)
+            cts = float(t.get('closed_ts') or 0.0)
+            if ots > 0:
+                earliest_ts = ots if earliest_ts is None else min(earliest_ts, ots)
+            if cts > 0:
+                earliest_ts = cts if earliest_ts is None else min(earliest_ts, cts)
+            if cts <= 0:
+                continue
+            pnl = float(t.get('pnl') or 0.0)
+            records.append({
+                'opened_ts': ots,
+                'closed_ts': cts,
+                'pnl': pnl,
+                'outcome': 'WIN' if pnl > 0 else ('LOSS' if pnl < 0 else 'BREAKEVEN'),
+                'source': 'journal',
+            })
+    except Exception:
+        pass
+
+    approx_days = 7
+    if earliest_ts:
+        approx_days = int(max(7, min(365, math.ceil((time.time() - float(earliest_ts)) / 86400.0) + 7)))
+
+    for t in (_autotrade_reconstruct_provisional_closes(owner_uid, days=approx_days) or []):
+        try:
+            ots = float(t.get('opened_ts') or 0.0)
+            cts = float(t.get('closed_ts') or 0.0)
+            if cts <= 0:
+                continue
+            earliest_ts = cts if earliest_ts is None else min(earliest_ts, cts)
+            records.append({
+                'opened_ts': ots,
+                'closed_ts': cts,
+                'pnl': float(t.get('pnl') or 0.0),
+                'outcome': str(t.get('outcome') or '').upper().strip(),
+                'source': 'provisional',
+            })
+        except Exception:
+            continue
+
+    for t in (_autotrade_exchange_close_fallback_rows(owner_uid, days=approx_days) or []):
+        try:
+            cts = float(t.get('closed_ts') or 0.0)
+            if cts <= 0:
+                continue
+            earliest_ts = cts if earliest_ts is None else min(earliest_ts, cts)
+            records.append({
+                'opened_ts': float(t.get('opened_ts') or 0.0),
+                'closed_ts': cts,
+                'pnl': float(t.get('pnl') or 0.0),
+                'outcome': str(t.get('outcome') or '').upper().strip(),
+                'source': 'exchange_only',
+            })
+        except Exception:
+            continue
+
+    return sorted(records, key=lambda x: (float(x.get('closed_ts') or 0.0), float(x.get('opened_ts') or 0.0)))
+
+
+def _autotrade_performance_history(owner_uid: int, recent_days: int = 7) -> dict:
+    owner_uid = int(owner_uid)
+    user = _autotrade_user_settings(owner_uid)
+    tz = _user_tzinfo(user)
+    history = _autotrade_history_rows(owner_uid)
+    if not history:
+        return {'recent_rows': [], 'recent_summary': _autotrade_performance_summary([]), 'overall_rows': [], 'overall_summary': _autotrade_performance_summary([])}
+
+    earliest_closed = min(float(r.get('closed_ts') or 0.0) for r in history if float(r.get('closed_ts') or 0.0) > 0)
+    now_local = datetime.now(tz)
+    current_start_local, _ = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
+    start_local = _anchored_day_window(datetime.fromtimestamp(float(earliest_closed), tz=timezone.utc).astimezone(tz), _user_day_reset_hhmm(user))[0]
+
+    overall_by_day = {}
+    cur = start_local
+    while cur <= current_start_local:
+        overall_by_day[cur.strftime('%Y-%m-%d')] = {
+            'day': cur.strftime('%Y-%m-%d'),
+            'opened': 0, 'closed': 0, 'wins': 0, 'losses': 0,
+            'net_pnl': 0.0, 'avg_win': 0.0, 'avg_loss': 0.0,
+            'gross_profit': 0.0, 'gross_loss': 0.0,
+        }
+        cur += timedelta(days=1)
+
+    for rec in history:
+        try:
+            cts = float(rec.get('closed_ts') or 0.0)
+            if cts <= 0:
+                continue
+            lab = _autotrade_trade_day_label(cts, user)
+            row = overall_by_day.get(lab)
+            if not row:
+                continue
+            pnl = float(rec.get('pnl') or 0.0)
+            row['closed'] += 1
+            row['net_pnl'] += pnl
+            if pnl > 0:
+                row['wins'] += 1
+                row['gross_profit'] += pnl
+            elif pnl < 0:
+                row['losses'] += 1
+                row['gross_loss'] += abs(pnl)
+        except Exception:
+            continue
+
+    for row in overall_by_day.values():
+        win_n = int(row.get('wins') or 0)
+        loss_n = int(row.get('losses') or 0)
+        gp = float(row.get('gross_profit') or 0.0)
+        gl = float(row.get('gross_loss') or 0.0)
+        row['avg_win'] = (gp / win_n) if win_n > 0 else 0.0
+        row['avg_loss'] = (-(gl / loss_n)) if loss_n > 0 else 0.0
+
+    overall_rows = list(overall_by_day.values())
+    recent_rows = overall_rows[-int(max(1, recent_days)):]
+    return {
+        'recent_rows': recent_rows,
+        'recent_summary': _autotrade_performance_summary(recent_rows),
+        'overall_rows': overall_rows,
+        'overall_summary': _autotrade_performance_summary(overall_rows),
+    }
+
+
+def _build_performance_chart(path_png: str, overall_rows: list[dict]) -> bool:
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except Exception:
+        return False
+    rows = [r for r in (overall_rows or []) if r.get('day')]
+    if not rows:
+        return False
+    labels = [str(r.get('day')) for r in rows]
+    pnl = [float(r.get('net_pnl') or 0.0) for r in rows]
+    equity_curve = []
+    running = 0.0
+    for x in pnl:
+        running += float(x)
+        equity_curve.append(running)
+    try:
+        fig = plt.figure(figsize=(11, 7))
+        ax1 = fig.add_subplot(2, 1, 1)
+        ax1.plot(labels, equity_curve)
+        ax1.set_title('Equity Curve')
+        ax1.set_ylabel('Equity')
+        ax1.grid(True, alpha=0.3)
+
+        ax2 = fig.add_subplot(2, 1, 2)
+        ax2.plot(labels, pnl)
+        ax2.set_title('PnL Trend')
+        ax2.set_ylabel('PnL')
+        ax2.set_xlabel('Trading Day')
+        ax2.grid(True, alpha=0.3)
+
+        max_ticks = 10
+        if len(labels) > max_ticks:
+            step = max(1, len(labels) // max_ticks)
+            tick_idx = list(range(0, len(labels), step))
+            if tick_idx[-1] != len(labels) - 1:
+                tick_idx.append(len(labels) - 1)
+            tick_labels = [labels[i] for i in tick_idx]
+            ax1.set_xticks(tick_idx, tick_labels)
+            ax2.set_xticks(tick_idx, tick_labels)
+        for ax in (ax1, ax2):
+            for label in ax.get_xticklabels():
+                label.set_rotation(45)
+                label.set_ha('right')
+        fig.tight_layout()
+        fig.savefig(path_png, dpi=160, bbox_inches='tight')
+        plt.close(fig)
+        return True
+    except Exception:
+        try:
+            plt.close('all')
+        except Exception:
+            pass
+        return False
+
+
+def _format_money(v: float) -> str:
+    try:
+        return f"${float(v):+.2f}"
+    except Exception:
+        return "$0.00"
+
+
+def _format_wr_line(label: str, stats: dict) -> str:
+    return f"{label}: {float(stats.get('win_rate') or 0.0):.1f}% ({int(stats.get('wins') or 0)}W / {int(stats.get('losses') or 0)}L)"
+
+
 async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/signal_report_overall — Overall performance summary (Option B scaling).
     Uses signals table (setup_id) for entry/SL/TPs to compute:
@@ -18252,22 +18523,11 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if det.get('setup_id'):
             lines.append(f"*Setup ID:* `{det.get('setup_id')}`")
         if life:
-            live_sym = _bybit_linear_symbol(str(life.get('bybit_position_symbol') or symbol_sent or symbol_raw or ''))
-            live_side = str(life.get('side') or det.get('side') or '').upper().strip()
-            live_pos = _autotrade_find_live_position(live_sym, side=live_side) if live_sym else None
-            lifecycle_state = str(life.get('state') or '')
-            if live_pos and lifecycle_state.startswith('emailed_not_executed_'):
-                lifecycle_state = f"{lifecycle_state} (live_position_detected)"
-            lines.append(f"*Lifecycle state:* `{lifecycle_state}`")
+            lines.append(f"*Lifecycle state:* `{str(life.get('state') or '')}`")
             if life.get('trade_id'):
                 lines.append(f"*Trade ID:* `{life.get('trade_id')}`")
             if life.get('bybit_order_id'):
                 lines.append(f"*Bybit order ID:* `{life.get('bybit_order_id')}`")
-            if live_pos:
-                try:
-                    lines.append(f"*Live position now:* `{live_sym}` qty `{abs(float(_pos_size(live_pos) or 0.0)):.8g}` @ `{_autotrade_price_str(_pos_entry(live_pos))}`")
-                except Exception:
-                    lines.append(f"*Live position now:* `{live_sym}`")
             if float(life.get('executed_ts') or 0.0) > 0:
                 lines.append(f"*Position/Trade opened in Bybit (Melbourne):* `{_fmt_dt_local(datetime.fromtimestamp(float(life.get('executed_ts') or 0.0), tz=timezone.utc))}`")
             if float(life.get('closed_ts') or 0.0) > 0:
@@ -18341,7 +18601,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     owner = int(AUTOTRADE_OWNER_UID or 0)
     user = get_user(owner) or {}
     now_utc = datetime.now(timezone.utc)
-    sess = _guess_session_name_utc(now_utc)
+    sess = current_session_utc(now_utc)
 
     reasons = []
     if not AUTOTRADE_ENABLED:
@@ -18354,7 +18614,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         reasons.append("missing BYBIT_API_KEY/SECRET")
 
     ready = _autotrade_ready()
-    sess_allowed = _autotrade_allowed_session(sess)
+    sess_allowed = (sess != "NONE") and _autotrade_allowed_session(sess)
     try:
         tw_ok = bool(trade_window_allows_now(user))
     except Exception:
@@ -18648,6 +18908,53 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
 
     await update.message.reply_text("\n".join(lines))
 
+
+
+
+
+def _adaptive_ema_anchor_limit_pct(setup: "Setup", session_name: str, fallback_allowed: float) -> float:
+    """Adaptive 1H EMA-anchor limit.
+
+    The older static 0.35% anchor was starving valid continuation setups, especially
+    on higher-ATR names and momentum breakouts. This keeps the anchor discipline but
+    scales the allowance by engine, session, and ATR regime.
+    """
+    try:
+        engine = str(getattr(setup, "engine", "") or "").upper()
+        atr_pct = float(getattr(setup, "atr_pct", 0.0) or 0.0)
+        sess = str(session_name or "").upper().strip() or "NY"
+        base = float(fallback_allowed or EMA_ANCHOR_BASE_MAX_DIST_PCT or 0.80)
+
+        if engine == "B":
+            limit = max(base, 0.70 + min(1.10, atr_pct * 0.22))
+        elif engine == "A":
+            limit = max(base, 0.55 + min(0.75, atr_pct * 0.18))
+        else:
+            limit = max(base, 0.60 + min(0.85, atr_pct * 0.20))
+
+        if sess == "ASIA":
+            limit *= 0.92
+        elif sess == "NY":
+            limit *= 1.08
+
+        return float(clamp(limit, 0.55, 1.85))
+    except Exception:
+        return float(fallback_allowed or EMA_ANCHOR_BASE_MAX_DIST_PCT or 0.80)
+
+
+def _recalibrate_public_confidence(setup: "Setup", session_name: str) -> tuple[int, float, dict]:
+    """Blend legacy confidence with quality score so displayed confidence matches real quality better."""
+    try:
+        score, comps = compute_setup_quality_score(setup, session_name=session_name)
+        raw_conf = float(getattr(setup, "conf", 0) or 0.0)
+        blended = (0.35 * raw_conf) + (0.65 * float(score))
+        if str(getattr(setup, "engine", "") or "").upper() == "B" and abs(float(getattr(setup, "ch15", 0.0) or 0.0)) >= 1.0:
+            blended -= 3.0
+        blended = float(clamp(blended, 0.0, 99.0))
+        return int(round(blended)), float(score), comps
+    except Exception:
+        raw = int(float(getattr(setup, "conf", 0) or 0.0))
+        return raw, float(raw), {}
 
 
 async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
@@ -19034,15 +19341,25 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                 )
 
             ok, dist_pct, last_close, ema_val, ema_p, allowed = ema_anchor_cache[mk]
-            if not ok:
+            adaptive_allowed = _adaptive_ema_anchor_limit_pct(s, session_name=session_name, fallback_allowed=allowed)
+            if float(dist_pct) > float(adaptive_allowed):
                 mv = (best_fut or {}).get(base)
                 _rej(
                     "far_from_ema_anchor_1h",
                     base,
                     mv,
-                    f"ema={ema_p} dist={dist_pct:.2f}% max={allowed:.2f}% close={last_close:.6g} emaV={ema_val:.6g}",
+                    f"ema={ema_p} dist={dist_pct:.2f}% max={adaptive_allowed:.2f}% base={allowed:.2f}% close={last_close:.6g} emaV={ema_val:.6g}",
                 )
                 continue
+
+            try:
+                setattr(s, "ema_anchor_period", int(ema_p or 0))
+                setattr(s, "ema_anchor_dist_pct", float(dist_pct or 0.0))
+                setattr(s, "ema_anchor_limit_pct", float(adaptive_allowed or 0.0))
+                if float(dist_pct) > float(allowed or adaptive_allowed):
+                    s.conf = int(max(0, int(getattr(s, "conf", 0) or 0) - 4))
+            except Exception:
+                pass
 
             gated.append(s)
         except Exception:
@@ -19086,7 +19403,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Shared Top Setup gate (applies to BOTH /screen and email)
     # -----------------------------------------------------
     try:
-        ordered = [s for s in (ordered or []) if is_top_setup_eligible(s)[0]]
+        ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, source=mode, session_name=session_name)[0]]
     except Exception:
         pass
 # -----------------------------------------------------
@@ -19198,7 +19515,7 @@ async def _refresh_screen_cache_async():
         if not best_fut:
             return
         now_utc = datetime.now(timezone.utc)
-        session = _guess_session_name_utc(now_utc)
+        session = scan_session_name_utc(now_utc)
         body, kb = await to_thread_heavy(_build_screen_body_and_kb,
             best_fut,
             session,
@@ -19602,17 +19919,20 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Header (always fresh)
         uid = update.effective_user.id
         user = get_user(uid)
-        session = current_session_utc()
+        live_session = current_session_utc()
+        scan_session = scan_session_name_utc()
         loc_label, loc_time = user_location_and_time(user)
 
         header = (
             f"*PulseFutures — Market Scan*\n"
             f"{HDR}\n"
-            f"*Session:* `{session}` | *{loc_label}:* `{loc_time}`\n"
+            f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
         )
+        if live_session == "NONE":
+            header += "_Outside live session window. Manual scan shown for reference only._\n"
 
         now_ts = time.time()
-        cache_key = f"uid:{int(uid)}::{str(session or '').upper()}"
+        cache_key = f"uid:{int(uid)}::{str(scan_session or '').upper()}"
         cache_entry = _SCREEN_CACHE.get(cache_key) or {}
 
         # ------------- FAST PATH (cache hit) -------------
@@ -19678,7 +19998,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             body, kb = await asyncio.to_thread(
                 _build_screen_body_and_kb,
                 best_fut,
-                session,
+                scan_session,
                 int(update.effective_user.id),
             )
 
@@ -20047,9 +20367,9 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
     try:
         live_sess = current_session_utc(datetime.now(timezone.utc))
     except Exception:
-        live_sess = "NY"
+        live_sess = "NONE"
     sess_name = str(sess.get("name") or "")
-    display_session = live_sess if sess_name == "UNLIMITED" else sess_name
+    display_session = (live_sess if live_sess != "NONE" else "NY") if sess_name == "UNLIMITED" else sess_name
 
     first = setups[0]
     subject = f"PulseFutures • {display_session} • {first.side} {first.symbol}"
@@ -20699,7 +21019,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             if not sess:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
-                    "reasons": ["not_in_enabled_session"],
+                    "reasons": ["not_in_enabled_session (outside live session window / gap)"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
@@ -20709,8 +21029,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             try:
                 live_sess = current_session_utc(datetime.now(timezone.utc))
             except Exception:
-                live_sess = "NY"
-            display_sess = live_sess if sess_name == "UNLIMITED" else sess_name
+                live_sess = "NONE"
+            display_sess = (live_sess if live_sess != "NONE" else "NY") if sess_name == "UNLIMITED" else sess_name
 
 
             # Unlimited mode => allow setups from ALL sessions (24/7)
@@ -20851,7 +21171,16 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     return 0.0
 
-            eligible = sorted(eligible, key=lambda _s: (int(getattr(_s, "conf", 0) or 0), _rr3(_s)), reverse=True)
+            eligible = sorted(
+                eligible,
+                key=lambda _s: (
+                    float(getattr(_s, "quality_score", 0.0) or 0.0),
+                    int(getattr(_s, "conf", 0) or 0),
+                    _rr3(_s),
+                    float(getattr(_s, "fut_vol_usd", 0.0) or 0.0),
+                ),
+                reverse=True,
+            )
 
             # Candidate picks for cooldown/flip checks below
             picks: List[Setup] = list(eligible[: max(int(EMAIL_SETUPS_N) * 6, 18)])
@@ -21140,7 +21469,7 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     enabled = user_enabled_sessions(user)
     sess = in_session_now(user)
     # Display the *live market session* (NY/LON/ASIA), not "UNLIMITED" access mode
-    now_s = _guess_session_name_utc(datetime.now(timezone.utc)) if int(user.get("sessions_unlimited", 0) or 0) == 1 else (sess["name"] if sess else "NONE")
+    now_s = current_session_utc(datetime.now(timezone.utc)) if int(user.get("sessions_unlimited", 0) or 0) == 1 else (sess["name"] if sess else "NONE")
 
     # Blackout
 
@@ -21980,9 +22309,19 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
 
         # Session label in UTC (NY/LON/ASIA)
         now_utc = datetime.now(timezone.utc)
-        sess = _guess_session_name_utc(now_utc)
+        live_sess = _session_label_utc(now_utc)
+        sess = current_session_utc(now_utc)
 
         async with AUTOTRADE_EXEC_LOCK:
+            if not live_sess:
+                _LAST_AUTOTRADE_DECISION[uid] = {
+                    "status": "SKIP",
+                    "when": now_utc.isoformat(timespec="seconds"),
+                    "reason": "outside_live_session_window",
+                    "session": "NONE",
+                    "mode": AUTOTRADE_MODE,
+                }
+                return
             if not _autotrade_allowed_session(sess):
                 _LAST_AUTOTRADE_DECISION[uid] = {
                     "status": "SKIP",
