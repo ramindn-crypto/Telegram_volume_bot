@@ -12040,7 +12040,121 @@ def _autotrade_weighted_wr_daily_series(uid: int, days: int) -> list[tuple[str, 
     return series
 
 
+def _simple_line_chart_png(series_map: list[tuple[str, list[tuple[str, float]]]], title: str, ylabel: str, out_prefix: str) -> str | None:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        width, height = 1200, 700
+        margin_left, margin_right, margin_top, margin_bottom = 90, 40, 70, 95
+        img = Image.new('RGB', (width, height), 'white')
+        draw = ImageDraw.Draw(img)
+        font = ImageFont.load_default()
+        plot_left = margin_left
+        plot_top = margin_top
+        plot_right = width - margin_right
+        plot_bottom = height - margin_bottom
+        draw.rectangle([plot_left, plot_top, plot_right, plot_bottom], outline=(40, 40, 40), width=2)
+
+        labels = []
+        for _, pts in (series_map or []):
+            if pts:
+                labels = [str(x) for x, _ in pts]
+                break
+        if not labels:
+            labels = ['N/A']
+            series_map = [('Series', [('N/A', 0.0)])]
+
+        vals = []
+        for _, pts in (series_map or []):
+            vals.extend([float(y or 0.0) for _, y in pts])
+        if not vals:
+            vals = [0.0]
+        vmin = min(vals)
+        vmax = max(vals)
+        if abs(vmax - vmin) < 1e-9:
+            if vmax == 0:
+                vmin, vmax = -1.0, 1.0
+            else:
+                pad = abs(vmax) * 0.15 or 1.0
+                vmin, vmax = vmin - pad, vmax + pad
+        else:
+            pad = (vmax - vmin) * 0.12
+            vmin -= pad
+            vmax += pad
+
+        draw.text((margin_left, 22), str(title), fill=(15, 15, 15), font=font)
+        draw.text((16, 46), str(ylabel), fill=(70, 70, 70), font=font)
+
+        grid_steps = 5
+        for i in range(grid_steps + 1):
+            y = plot_top + (plot_bottom - plot_top) * i / grid_steps
+            draw.line([(plot_left, y), (plot_right, y)], fill=(225, 225, 225), width=1)
+            val = vmax - (vmax - vmin) * i / grid_steps
+            draw.text((8, y - 7), f'{val:.1f}', fill=(80, 80, 80), font=font)
+
+        n = max(1, len(labels))
+        x_positions = []
+        for idx in range(n):
+            x = plot_left if n == 1 else plot_left + (plot_right - plot_left) * idx / (n - 1)
+            x_positions.append(x)
+        for x in x_positions:
+            draw.line([(x, plot_top), (x, plot_bottom)], fill=(238, 238, 238), width=1)
+
+        palette = [(31, 119, 180), (255, 127, 14), (44, 160, 44), (214, 39, 40)]
+        for sidx, (name, pts) in enumerate(series_map or []):
+            col = palette[sidx % len(palette)]
+            prev = None
+            for idx, (_, yv) in enumerate(pts or []):
+                yv = float(yv or 0.0)
+                yy = plot_bottom - (yv - vmin) / (vmax - vmin) * (plot_bottom - plot_top)
+                xx = x_positions[idx] if idx < len(x_positions) else plot_left
+                r = 3
+                draw.ellipse((xx-r, yy-r, xx+r, yy+r), fill=col, outline=col)
+                if prev is not None:
+                    draw.line([prev, (xx, yy)], fill=col, width=3)
+                prev = (xx, yy)
+            lx = plot_left + 12 + (sidx * 180)
+            ly = height - 34
+            draw.line([(lx, ly+6), (lx+22, ly+6)], fill=col, width=3)
+            draw.text((lx+30, ly), str(name), fill=(30, 30, 30), font=font)
+
+        step = max(1, int(round(len(labels) / 8.0)))
+        for idx, lab in enumerate(labels):
+            if idx % step != 0 and idx != len(labels) - 1:
+                continue
+            xx = x_positions[idx]
+            short = str(lab)[5:] if len(str(lab)) >= 10 else str(lab)
+            draw.text((xx - 18, plot_bottom + 10), short, fill=(80, 80, 80), font=font)
+
+        out = f'/mnt/data/{out_prefix}_{int(time.time())}.png'
+        img.save(out, format='PNG')
+        return out
+    except Exception as e:
+        try:
+            logger.exception('simple chart build failed: %s', e)
+        except Exception:
+            pass
+        return None
+
+
 def _build_winrate_chart_png(uid: int, days: int, title: str = 'Weighted Signal Win-Rate Trend', session: str | None = None) -> str | None:
+    try:
+        series = _signal_weighted_wr_daily_series(int(uid), int(days), session=session)
+        if not series:
+            labels = _last_n_anchored_day_labels(int(uid), int(days))
+            series = [(lab, 0.0) for lab in labels]
+        chart = _simple_line_chart_png(
+            [('Weighted signal WR %', [(x, float(y)) for x, y in series])],
+            str(title),
+            'Weighted signal win rate %',
+            'winrate_chart',
+        )
+        if chart:
+            return chart
+    except Exception as e:
+        try:
+            logger.exception('winrate chart build failed: %s', e)
+        except Exception:
+            pass
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -12134,6 +12248,30 @@ def _autotrade_chart_series(rows: list[dict], starting_equity: float = 0.0) -> d
 
 
 def _build_performance_chart_png(rows: list[dict], equity: float = 0.0) -> str | None:
+    try:
+        rows = rows or []
+        if not rows:
+            rows = [{'day': 'N/A', 'net_pnl': 0.0}]
+        series = _autotrade_chart_series(rows, starting_equity=float(equity or 0.0))
+        days = [d for d, _ in series['pnl']] or ['N/A']
+        pnl_vals = [float(v) for _, v in series['pnl']] or [0.0]
+        eq_vals = [float(v) for _, v in series['equity']] or [float(equity or 0.0)]
+        chart = _simple_line_chart_png(
+            [
+                ('Equity', list(zip(days, eq_vals))),
+                ('Daily PnL', list(zip(days, pnl_vals))),
+            ],
+            'Equity & PnL Trend',
+            'USDT',
+            'performance_chart',
+        )
+        if chart:
+            return chart
+    except Exception as e:
+        try:
+            logger.exception('performance chart build failed: %s', e)
+        except Exception:
+            pass
     try:
         import matplotlib
         matplotlib.use('Agg')
