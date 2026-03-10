@@ -2560,7 +2560,7 @@ def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[d
     """
     if str(AUTOTRADE_MODE).lower() != 'live':
         return []
-    days = int(max(2, min(int(days or 7), 60)))
+    days = int(max(2, min(int(days or 7), 3650)))
     user = _autotrade_user_settings(int(uid))
     tz = _user_tzinfo(user)
     start_local, end_local = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(user))
@@ -2750,7 +2750,7 @@ def _autotrade_exchange_close_fallback_rows(uid: int, days: int = 7) -> list[dic
     """
     if str(AUTOTRADE_MODE).lower() != 'live':
         return []
-    days = int(max(2, min(int(days or 7), 60)))
+    days = int(max(2, min(int(days or 7), 3650)))
     user = _autotrade_user_settings(int(uid))
     tz = _user_tzinfo(user)
     start_local, end_local = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(user))
@@ -2829,7 +2829,7 @@ def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
     a raw exchange-close fallback. Unlike older versions, fallback reconciliation is applied
     even when journal history is only partial.
     """
-    days = int(max(2, min(int(days or 7), 60)))
+    days = int(max(2, min(int(days or 7), 3650)))
     user = _autotrade_user_settings(int(uid))
     _autotrade_sync_closed_trades_from_exchange(int(uid), lookback_days=max(14, days + 5))
     try:
@@ -11658,36 +11658,168 @@ async def learning_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     await send_long_message(update, _learning_status_text(), parse_mode=None)
 
 
+def _signal_outcome_summary(user_id: int, session: str | None = None, days: int | None = None) -> dict:
+    """Completed signal/setup outcome summary from emailed_setups + signal_outcomes.
+    OPEN / ambiguous / unresolved rows do not affect win rate.
+    """
+    wins = losses = 0
+    counts = Counter()
+    rows = []
+    ts_from = None
+    if days is not None:
+        try:
+            ts_from = float(time.time() - max(1, int(days)) * 86400.0)
+        except Exception:
+            ts_from = None
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = """SELECT e.setup_id, e.session, e.emailed_ts,
+                          o.outcome, o.hit_level, o.hit_ts, o.best_level, o.best_ts,
+                          o.horizon_hours, o.evaluated_ts, o.note
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id = e.setup_id
+                   WHERE e.user_id=?"""
+            params = [int(user_id)]
+            if ts_from is not None:
+                q += " AND e.emailed_ts>=?"
+                params.append(float(ts_from))
+            if session:
+                q += " AND UPPER(COALESCE(e.session,''))=?"
+                params.append(str(session).upper())
+            q += " ORDER BY e.emailed_ts ASC"
+            rows = [dict(r) for r in (c.execute(q, tuple(params)).fetchall() or [])]
+    except Exception:
+        rows = []
+
+    by_session = defaultdict(lambda: Counter())
+    for r in rows:
+        out = str(r.get('outcome') or 'OPEN').strip().upper()
+        sess = str(r.get('session') or '').strip().upper() or '?'
+        counts[out] += 1
+        by_session[sess][out] += 1
+        if out in ('WIN_TP1', 'WIN_TP2', 'WIN_TP3'):
+            wins += 1
+        elif out == 'LOSS':
+            losses += 1
+    decided = wins + losses
+    win_rate = (wins / decided * 100.0) if decided > 0 else 0.0
+    return {
+        'rows': rows,
+        'counts': counts,
+        'by_session': by_session,
+        'wins': int(wins),
+        'losses': int(losses),
+        'decided': int(decided),
+        'win_rate': float(win_rate),
+    }
+
+
+def _autotrade_history_days_available(uid: int) -> int:
+    try:
+        user = _autotrade_user_settings(int(uid))
+        now_local = datetime.now(_user_tzinfo(user))
+        start_local, _ = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
+        earliest = None
+        trades = db_list_autotrade_trades_all(int(uid)) or []
+        for t in trades:
+            for key in ('opened_ts', 'closed_ts'):
+                try:
+                    ts = float(t.get(key) or 0.0)
+                except Exception:
+                    ts = 0.0
+                if ts > 0:
+                    earliest = ts if earliest is None else min(earliest, ts)
+        if earliest is None:
+            return 7
+        earliest_local = datetime.fromtimestamp(float(earliest), tz=timezone.utc).astimezone(_user_tzinfo(user))
+        earliest_day_local, _ = _anchored_day_window(earliest_local, _user_day_reset_hhmm(user))
+        days = int((start_local - earliest_day_local).days) + 1
+        return max(7, min(days, 3650))
+    except Exception:
+        return 7
+
+
+def _autotrade_chart_series(rows: list[dict], starting_equity: float = 0.0) -> dict:
+    pnl_points = []
+    equity_points = []
+    running = float(starting_equity or 0.0)
+    for r in rows or []:
+        day = str(r.get('day') or '')
+        pnl = float(r.get('net_pnl') or 0.0)
+        running += pnl
+        pnl_points.append((day, pnl))
+        equity_points.append((day, running))
+    return {'pnl': pnl_points, 'equity': equity_points}
+
+
+def _build_performance_chart_png(rows: list[dict], equity: float = 0.0) -> str | None:
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        if not rows:
+            return None
+        series = _autotrade_chart_series(rows, starting_equity=float(equity or 0.0))
+        days = [d for d, _ in series['pnl']]
+        pnl_vals = [float(v) for _, v in series['pnl']]
+        eq_vals = [float(v) for _, v in series['equity']]
+        fig, ax = plt.subplots(figsize=(10, 5.5))
+        ax.plot(days, eq_vals, linewidth=2, label='Equity')
+        ax.plot(days, pnl_vals, linewidth=2, label='PnL')
+        ax.set_title('Equity & PnL Trend')
+        ax.set_xlabel('Trading day')
+        ax.set_ylabel('USDT')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        if len(days) > 10:
+            for label in ax.get_xticklabels():
+                label.set_rotation(45)
+                label.set_horizontalalignment('right')
+        fig.tight_layout()
+        out = f"/mnt/data/performance_chart_{int(time.time())}.png"
+        fig.savefig(out, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        return out
+    except Exception:
+        return None
+
+
+def _fmt_wr_line(label: str, summary: dict) -> str:
+    return f"{label}: {int(summary.get('wins') or 0)}W / {int(summary.get('losses') or 0)}L | {float(summary.get('win_rate') or 0.0):.1f}%"
+
+
 async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
-    target_uid = _signal_reporting_target_uid(update.effective_user.id)
-    overall = _signal_winrate_stats(target_uid)
-    last7 = _signal_winrate_stats(target_uid, days=7)
-    lines = [
-        "📊 Win Rate",
-        HDR,
-        _format_wr_line("Overall Win Rate", overall),
-        _format_wr_line("Last 7 Days Win Rate", last7),
-    ]
-    await update.message.reply_text("\n".join(lines))
+    owner = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
+    overall = _signal_outcome_summary(owner)
+    recent = _signal_outcome_summary(owner, days=7)
+    msg = (
+        "📊 Win Rate\n"
+        f"{HDR}\n"
+        f"{_fmt_wr_line('Overall Win Rate', overall)}\n"
+        f"{_fmt_wr_line('Last 7 Days Win Rate', recent)}"
+    )
+    await update.message.reply_text(msg)
 
 
 async def ny_winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
-    target_uid = _signal_reporting_target_uid(update.effective_user.id)
-    overall = _signal_winrate_stats(target_uid, session='NY')
-    last7 = _signal_winrate_stats(target_uid, session='NY', days=7)
-    lines = [
-        "🗽 New York Win Rate",
-        HDR,
-        _format_wr_line("Overall NY Win Rate", overall),
-        _format_wr_line("Last 7 Days NY Win Rate", last7),
-    ]
-    await update.message.reply_text("\n".join(lines))
+    owner = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
+    overall = _signal_outcome_summary(owner, session='NY')
+    recent = _signal_outcome_summary(owner, session='NY', days=7)
+    msg = (
+        "🗽 NY Win Rate\n"
+        f"{HDR}\n"
+        f"{_fmt_wr_line('Overall NY Win Rate', overall)}\n"
+        f"{_fmt_wr_line('Last 7 Days NY Win Rate', recent)}"
+    )
+    await update.message.reply_text(msg)
 
 
 async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -15153,18 +15285,18 @@ ADMIN_HELP_DESCRIPTIONS = {
     "edge_status": "Learning / optimizer / execution assurance view",
     "learning_status": "Detailed learning and optimizer status",
     "optimizer_status": "Alias of /learning_status",
-    "winrate": "Signal win rate: overall vs last 7 days",
-    "ny_winrate": "NY-session signal win rate: overall vs last 7 days",
+    "winrate": "Overall and last-7-days completed signal win rate",
+    "ny_winrate": "Overall and last-7-days NY completed signal win rate",
     "lessons_learned": "Latest learning takeaways",
     "email_decision": "Last email pipeline decision",
     "signal_report": "Recent emailed setup outcomes",
-    "signal_report_overall": "Overall emailed-signal outcome summary (coverage, WR, R, session split)",
-    "autotrade_debug": "AutoTrade readiness + synchronized live day/risk/carry diagnostics",
+    "signal_report_overall": "Overall emailed-signal outcome summary (WR, R, session split)",
+    "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
     "autotrade_debug_reset": "Clear AutoTrade debug state",
     "autotrade_last": "Show last autotrade attempt details",
-    "autotrade_report": "Compact recent AutoTrade open/closed PnL journal",
+    "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows)",
     "autotrade_report_overall": "AutoTrade overall performance summary",
-    "performance_report": "Recent + overall autotrade performance with equity/PnL charts",
+    "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
     "autotrade_sessions": "Show or set allowed auto-trade sessions",
     "open_trades": "Show live open Bybit positions",
     "cooldown_clear": "Clear cooldown for one symbol + side",
@@ -16842,109 +16974,74 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     snap = _accounting_snapshot(uid, user, is_admin=is_admin)
-    equity = float(snap.get("equity") or 0.0)
-    cap = float(snap.get("cap") or 0.0)
-    pnl_today = float(snap.get("pnl_today") or 0.0)
-    open_risk_today = float(snap.get("open_risk_today") or 0.0)
-    realized_loss_today = float(snap.get("realized_loss_today") or 0.0)
-    used_today = float(snap.get("used_today") or 0.0)
-    remaining_today = snap.get("remaining_today", float("inf"))
-    over_by = float(snap.get("over_by") or 0.0)
-
-    live_positions = _bybit_get_open_positions_linear() if is_admin else []
-    opens = [] if is_admin else db_open_trades(uid)
-
+    equity = float(snap.get('equity') or 0.0)
+    cap = float(snap.get('cap') or 0.0)
+    pnl_today = float(snap.get('pnl_today') or 0.0)
+    realized_loss_today = float(snap.get('realized_loss_today') or 0.0)
+    used_today = float(snap.get('used_today') or 0.0)
+    remaining_today = snap.get('remaining_today', float('inf'))
+    over_by = float(snap.get('over_by') or 0.0)
     enabled = user_enabled_sessions(user)
     now_s = in_session_now(user)
     now_live = current_session_utc(datetime.now(timezone.utc))
-    now_txt = now_live if int(user.get("sessions_unlimited", 0) or 0) == 1 else (now_s["name"] if now_s else "NONE")
+    now_txt = now_live if int(user.get('sessions_unlimited', 0) or 0) == 1 else (now_s['name'] if now_s else 'NONE')
+    cur_s = (user.get('trade_window_start') or '').strip()
+    cur_e = (user.get('trade_window_end') or '').strip()
+    tw_txt = 'OFF' if (not cur_s or not cur_e) else f"{cur_s} → {cur_e} (local)"
 
-    cap_sess_raw = (user or {}).get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION)
-    cap_day_raw  = (user or {}).get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY)
-    gap_raw      = (user or {}).get("email_gap_min", DEFAULT_EMAIL_GAP_MIN)
-    cap_sess = int(DEFAULT_MAX_EMAILS_PER_SESSION if cap_sess_raw is None else cap_sess_raw)
-    cap_day  = int(DEFAULT_MAX_EMAILS_PER_DAY if cap_day_raw is None else cap_day_raw)
-    gap_m    = int(DEFAULT_EMAIL_GAP_MIN if gap_raw is None else gap_raw)
-
-    bm_on = int((user or {}).get("bigmove_alert_on", 1) or 0)
-    bm_4h = float((user or {}).get("bigmove_alert_4h", 20) or 20)
-    bm_1h = float((user or {}).get("bigmove_alert_1h", 10) or 10)
-
-    lines = []
-    lines.append("📌 Status")
-    lines.append(HDR)
-    lines.append(f"Plan: {snap.get('plan')}")
-    lines.append(f"Trading day: {snap.get('today_window_label')}")
-    lines.append(f"Equity: ${equity:.2f}")
-    lines.append(f"PnL today (closed): ${pnl_today:+.2f}")
-    _opened_today = int(snap.get('positions_opened_today', 0))
-    _trade_limit = int(snap.get('trades_today_limit', 0))
-    lines.append(f"Opened today: {_opened_today}" + (f"/{_trade_limit}" if _trade_limit > 0 else " (no count cap)"))
-    lines.append(f"Closed today: {int(snap.get('positions_closed_today', 0))}")
-    lines.append(f"Open positions now: {int(snap.get('open_positions_now', 0))}")
-    lines.append(f"Carried from prior day: {int(snap.get('inherited_open_positions', 0))}")
-    lines.append(f"Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f} (used by /size)")
-    lines.append(f"Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})")
-    lines.append(f"Current-day open risk (opened today only): ${float(snap.get('current_day_open_risk', 0.0)):.2f}")
-    lines.append(f"Live open risk charged today: ${float(snap.get('live_open_risk_charged_today', snap.get('current_day_open_risk', 0.0))):.2f}")
-    lines.append(f"Carried open risk: ${float(snap.get('carried_open_risk', 0.0)):.2f}")
-    lines.append(f"Total open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}")
-    lines.append(f"Realised loss today used for cap: ${realized_loss_today:.2f}")
-    lines.append(f"Daily risk used today: ${used_today:.2f}")
-    lines.append(f"Daily risk remaining for new trades: {'∞' if not math.isfinite(float(remaining_today)) else f'${float(remaining_today):.2f}'}")
+    lines = [
+        '📌 Status',
+        HDR,
+        'Account',
+        f"• Plan: {snap.get('plan')}",
+        f"• Trading day: {snap.get('today_window_label')}",
+        f"• Equity: ${equity:.2f}",
+        f"• PnL today (closed): ${pnl_today:+.2f}",
+        SEP,
+        'Risk',
+        f"• Opened today: {int(snap.get('positions_opened_today', 0))}" + (f"/{int(snap.get('trades_today_limit', 0))}" if int(snap.get('trades_today_limit', 0)) > 0 else ' (no count cap)'),
+        f"• Closed today: {int(snap.get('positions_closed_today', 0))}",
+        f"• Open positions now: {int(snap.get('open_positions_now', 0))}",
+        f"• Carried from prior day: {int(snap.get('inherited_open_positions', 0))}",
+        f"• Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f}",
+        f"• Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})",
+        f"• Current-day open risk: ${float(snap.get('current_day_open_risk', 0.0)):.2f}",
+        f"• Live open risk charged today: ${float(snap.get('live_open_risk_charged_today', snap.get('current_day_open_risk', 0.0))):.2f}",
+        f"• Carried open risk: ${float(snap.get('carried_open_risk', 0.0)):.2f}",
+        f"• Total open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
+        f"• Realised loss used for cap: ${realized_loss_today:.2f}",
+        f"• Daily risk used: ${used_today:.2f}",
+        f"• Daily risk remaining: {'∞' if not math.isfinite(float(remaining_today)) else f'${float(remaining_today):.2f}'}",
+        SEP,
+        'Alerts & sessions',
+        f"• Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}",
+        f"• Sessions enabled: {' | '.join(enabled)}",
+        f"• Now: {now_txt}",
+        f"• Trade window: {tw_txt}",
+        f"• Today basis: {snap.get('today_basis')}",
+    ]
     if over_by > 0:
-        lines.append(f"⚠️ Over daily cap by ${over_by:.2f} (reduce risk / add SL / close positions)")
-    lines.append(HDR)
-    lines.append(f"Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}")
-    lines.append(f"Sessions enabled: {' | '.join(enabled)} | Now: {now_txt}")
-    cur_s = (user.get("trade_window_start") or "").strip()
-    cur_e = (user.get("trade_window_end") or "").strip()
-    tw_txt = "OFF" if (not cur_s or not cur_e) else f"{cur_s} → {cur_e} (local)"
-    lines.append(f"Trade window: {tw_txt}")
-    lines.append(f"Email caps: session={cap_sess} (0=∞), day={cap_day} (0=∞), gap={gap_m}m")
-    lines.append(f"Big-move alert emails: {'ON' if bm_on else 'OFF'} (4H≥{bm_4h:.0f}% OR 1H≥{bm_1h:.0f}%)")
-    lines.append(f"Today basis: {snap.get('today_basis')}")
-    lines.append(f"Today window: {snap.get('today_window_label')}")
+        lines.append(f"⚠️ Over daily cap by ${over_by:.2f}")
 
     if is_admin:
+        live_positions = _bybit_get_open_positions_linear()
+        lines.extend([SEP, f"Open positions list: {len(live_positions)}"])
         if not live_positions:
-            lines.append("Open trades: None")
-            await update.message.reply_text("\n".join(lines))
-            return
-        lines.append(f"Open positions list: {len(live_positions)}")
-        for p in live_positions:
-            try:
-                sym = _pos_symbol(p)
-                side = _pos_side_text(p)
-                size = _pos_size(p)
-                entry = _pos_entry(p)
-                mark = _pos_mark(p)
-                pnl = _pos_unreal_pnl(p)
-                sl = _pos_stop(p)
-                risk = _estimate_position_risk_usd(p)
-                if sl and sl > 0:
-                    lines.append(f"- {side} {sym} | Size {size:g} | Entry {fmt_price(entry)} | Mark {fmt_price(mark)} | PnL {pnl:+.2f} USDT | SL {fmt_price(sl)} | Risk ${risk:.2f}")
-                else:
-                    lines.append(f"- {side} {sym} | Size {size:g} | Entry {fmt_price(entry)} | Mark {fmt_price(mark)} | PnL {pnl:+.2f} USDT | SL — | Risk —")
-            except Exception:
-                continue
+            lines.append('• None')
+        else:
+            for p in live_positions[:12]:
+                lines.append(f"• {_pos_side_text(p)} {_pos_symbol(p)} | PnL {_pos_unreal_pnl(p):+.2f} USDT")
     else:
+        opens = db_open_trades(uid)
+        lines.extend([SEP, f"Open trades list: {len(opens)}"])
         if not opens:
-            lines.append("Open trades: None")
-            await update.message.reply_text("\n".join(lines))
-            return
-        lines.append(f"Open positions list: {len(opens)}")
-        for t in opens:
-            try:
-                entry = float(t.get("entry") or 0.0)
-                sl = float(t.get("sl") or 0.0)
-                qty = float(t.get("qty") or 0.0)
-                risk = float(t.get("risk_usd") or 0.0)
-                lines.append(f"- ID {t.get('public_id')} | {t.get('symbol')} {t.get('side')} | Entry {fmt_price(entry)} | SL {fmt_price(sl)} | Risk ${risk:.2f} | Qty {qty:.6g}")
-            except Exception:
-                continue
+            lines.append('• None')
+        else:
+            for t in opens[:12]:
+                lines.append(f"• {t.get('symbol')} {t.get('side')} | Risk ${float(t.get('risk_usd') or 0.0):.2f}")
 
-    await update.message.reply_text("\n".join(lines))
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
 
 async def cooldowns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -17821,377 +17918,87 @@ async def admin_reset_signal_reports_cmd(update: Update, context: ContextTypes.D
         await update.message.reply_text(f"❌ admin_reset_signal_reports failed: {e}")
 
 
-def _signal_reporting_target_uid(caller_uid: int) -> int:
-    """Use owner history for admin-wide signal reports when available."""
-    try:
-        if is_admin_user(int(caller_uid)) and int(AUTOTRADE_OWNER_UID or 0) > 0:
-            return int(AUTOTRADE_OWNER_UID)
-    except Exception:
-        pass
-    return int(caller_uid)
-
-
-def _signal_outcome_rows_for_reporting(user_id: int, session: str | None = None) -> list[dict]:
-    """Return user signal outcomes joined to emailed setups, with completed-event timestamps."""
-    try:
-        con = db_connect()
-        cur = con.cursor()
-        sql = """SELECT e.setup_id, e.session, e.emailed_ts,
-                          o.outcome, o.hit_level, o.hit_ts, o.best_level, o.best_ts, o.horizon_hours, o.evaluated_ts, o.note
-                   FROM emailed_setups e
-                   JOIN signal_outcomes o ON o.setup_id = e.setup_id
-                   WHERE e.user_id=?"""
-        params = [int(user_id)]
-        if session:
-            sql += " AND UPPER(COALESCE(e.session,''))=?"
-            params.append(str(session).upper().strip())
-        sql += " ORDER BY COALESCE(o.hit_ts, o.evaluated_ts, e.emailed_ts) ASC, e.emailed_ts ASC"
-        cur.execute(sql, tuple(params))
-        rows = [dict(r) for r in (cur.fetchall() or [])]
-        con.close()
-    except Exception:
-        return []
-    for r in rows:
-        try:
-            r['_event_ts'] = float(r.get('hit_ts') or r.get('evaluated_ts') or r.get('emailed_ts') or 0.0)
-        except Exception:
-            r['_event_ts'] = 0.0
-    return rows
-
-
-def _signal_winrate_stats(user_id: int, session: str | None = None, days: int | None = None) -> dict:
-    rows = _signal_outcome_rows_for_reporting(int(user_id), session=session)
-    if days is not None:
-        cutoff = float(time.time()) - (float(days) * 86400.0)
-        rows = [r for r in rows if float(r.get('_event_ts') or 0.0) >= cutoff]
-    wins = 0
-    losses = 0
-    for r in rows:
-        out = str(r.get('outcome') or '').upper().strip()
-        if out in {'WIN_TP1', 'WIN_TP2', 'WIN_TP3'}:
-            wins += 1
-        elif out == 'LOSS':
-            losses += 1
-    decided = wins + losses
-    wr = (wins / decided * 100.0) if decided > 0 else 0.0
-    return {
-        'wins': int(wins),
-        'losses': int(losses),
-        'decided': int(decided),
-        'win_rate': float(wr),
-    }
-
-
-def _autotrade_history_rows(owner_uid: int) -> list[dict]:
-    """Full-history closed-trade rows for performance reporting. Journal-first, fallback-aware."""
-    owner_uid = int(owner_uid)
-    user = _autotrade_user_settings(owner_uid)
-    try:
-        _autotrade_sync_closed_trades_from_exchange(owner_uid, lookback_days=365)
-    except Exception:
-        pass
-
-    records = []
-    earliest_ts = None
-    try:
-        for t in (db_list_autotrade_trades_all(owner_uid) or []):
-            ots = float(t.get('opened_ts') or 0.0)
-            cts = float(t.get('closed_ts') or 0.0)
-            if ots > 0:
-                earliest_ts = ots if earliest_ts is None else min(earliest_ts, ots)
-            if cts > 0:
-                earliest_ts = cts if earliest_ts is None else min(earliest_ts, cts)
-            if cts <= 0:
-                continue
-            pnl = float(t.get('pnl') or 0.0)
-            records.append({
-                'opened_ts': ots,
-                'closed_ts': cts,
-                'pnl': pnl,
-                'outcome': 'WIN' if pnl > 0 else ('LOSS' if pnl < 0 else 'BREAKEVEN'),
-                'source': 'journal',
-            })
-    except Exception:
-        pass
-
-    approx_days = 7
-    if earliest_ts:
-        approx_days = int(max(7, min(365, math.ceil((time.time() - float(earliest_ts)) / 86400.0) + 7)))
-
-    for t in (_autotrade_reconstruct_provisional_closes(owner_uid, days=approx_days) or []):
-        try:
-            ots = float(t.get('opened_ts') or 0.0)
-            cts = float(t.get('closed_ts') or 0.0)
-            if cts <= 0:
-                continue
-            earliest_ts = cts if earliest_ts is None else min(earliest_ts, cts)
-            records.append({
-                'opened_ts': ots,
-                'closed_ts': cts,
-                'pnl': float(t.get('pnl') or 0.0),
-                'outcome': str(t.get('outcome') or '').upper().strip(),
-                'source': 'provisional',
-            })
-        except Exception:
-            continue
-
-    for t in (_autotrade_exchange_close_fallback_rows(owner_uid, days=approx_days) or []):
-        try:
-            cts = float(t.get('closed_ts') or 0.0)
-            if cts <= 0:
-                continue
-            earliest_ts = cts if earliest_ts is None else min(earliest_ts, cts)
-            records.append({
-                'opened_ts': float(t.get('opened_ts') or 0.0),
-                'closed_ts': cts,
-                'pnl': float(t.get('pnl') or 0.0),
-                'outcome': str(t.get('outcome') or '').upper().strip(),
-                'source': 'exchange_only',
-            })
-        except Exception:
-            continue
-
-    return sorted(records, key=lambda x: (float(x.get('closed_ts') or 0.0), float(x.get('opened_ts') or 0.0)))
-
-
-def _autotrade_performance_history(owner_uid: int, recent_days: int = 7) -> dict:
-    owner_uid = int(owner_uid)
-    user = _autotrade_user_settings(owner_uid)
-    tz = _user_tzinfo(user)
-    history = _autotrade_history_rows(owner_uid)
-    if not history:
-        return {'recent_rows': [], 'recent_summary': _autotrade_performance_summary([]), 'overall_rows': [], 'overall_summary': _autotrade_performance_summary([])}
-
-    earliest_closed = min(float(r.get('closed_ts') or 0.0) for r in history if float(r.get('closed_ts') or 0.0) > 0)
-    now_local = datetime.now(tz)
-    current_start_local, _ = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
-    start_local = _anchored_day_window(datetime.fromtimestamp(float(earliest_closed), tz=timezone.utc).astimezone(tz), _user_day_reset_hhmm(user))[0]
-
-    overall_by_day = {}
-    cur = start_local
-    while cur <= current_start_local:
-        overall_by_day[cur.strftime('%Y-%m-%d')] = {
-            'day': cur.strftime('%Y-%m-%d'),
-            'opened': 0, 'closed': 0, 'wins': 0, 'losses': 0,
-            'net_pnl': 0.0, 'avg_win': 0.0, 'avg_loss': 0.0,
-            'gross_profit': 0.0, 'gross_loss': 0.0,
-        }
-        cur += timedelta(days=1)
-
-    for rec in history:
-        try:
-            cts = float(rec.get('closed_ts') or 0.0)
-            if cts <= 0:
-                continue
-            lab = _autotrade_trade_day_label(cts, user)
-            row = overall_by_day.get(lab)
-            if not row:
-                continue
-            pnl = float(rec.get('pnl') or 0.0)
-            row['closed'] += 1
-            row['net_pnl'] += pnl
-            if pnl > 0:
-                row['wins'] += 1
-                row['gross_profit'] += pnl
-            elif pnl < 0:
-                row['losses'] += 1
-                row['gross_loss'] += abs(pnl)
-        except Exception:
-            continue
-
-    for row in overall_by_day.values():
-        win_n = int(row.get('wins') or 0)
-        loss_n = int(row.get('losses') or 0)
-        gp = float(row.get('gross_profit') or 0.0)
-        gl = float(row.get('gross_loss') or 0.0)
-        row['avg_win'] = (gp / win_n) if win_n > 0 else 0.0
-        row['avg_loss'] = (-(gl / loss_n)) if loss_n > 0 else 0.0
-
-    overall_rows = list(overall_by_day.values())
-    recent_rows = overall_rows[-int(max(1, recent_days)):]
-    return {
-        'recent_rows': recent_rows,
-        'recent_summary': _autotrade_performance_summary(recent_rows),
-        'overall_rows': overall_rows,
-        'overall_summary': _autotrade_performance_summary(overall_rows),
-    }
-
-
-def _build_performance_chart(path_png: str, overall_rows: list[dict]) -> bool:
-    try:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-    except Exception:
-        return False
-    rows = [r for r in (overall_rows or []) if r.get('day')]
-    if not rows:
-        return False
-    labels = [str(r.get('day')) for r in rows]
-    pnl = [float(r.get('net_pnl') or 0.0) for r in rows]
-    equity_curve = []
-    running = 0.0
-    for x in pnl:
-        running += float(x)
-        equity_curve.append(running)
-    try:
-        fig = plt.figure(figsize=(11, 7))
-        ax1 = fig.add_subplot(2, 1, 1)
-        ax1.plot(labels, equity_curve)
-        ax1.set_title('Equity Curve')
-        ax1.set_ylabel('Equity')
-        ax1.grid(True, alpha=0.3)
-
-        ax2 = fig.add_subplot(2, 1, 2)
-        ax2.plot(labels, pnl)
-        ax2.set_title('PnL Trend')
-        ax2.set_ylabel('PnL')
-        ax2.set_xlabel('Trading Day')
-        ax2.grid(True, alpha=0.3)
-
-        max_ticks = 10
-        if len(labels) > max_ticks:
-            step = max(1, len(labels) // max_ticks)
-            tick_idx = list(range(0, len(labels), step))
-            if tick_idx[-1] != len(labels) - 1:
-                tick_idx.append(len(labels) - 1)
-            tick_labels = [labels[i] for i in tick_idx]
-            ax1.set_xticks(tick_idx, tick_labels)
-            ax2.set_xticks(tick_idx, tick_labels)
-        for ax in (ax1, ax2):
-            for label in ax.get_xticklabels():
-                label.set_rotation(45)
-                label.set_ha('right')
-        fig.tight_layout()
-        fig.savefig(path_png, dpi=160, bbox_inches='tight')
-        plt.close(fig)
-        return True
-    except Exception:
-        try:
-            plt.close('all')
-        except Exception:
-            pass
-        return False
-
-
-def _format_money(v: float) -> str:
-    try:
-        return f"${float(v):+.2f}"
-    except Exception:
-        return "$0.00"
-
-
-def _format_wr_line(label: str, stats: dict) -> str:
-    return f"{label}: {float(stats.get('win_rate') or 0.0):.1f}% ({int(stats.get('wins') or 0)}W / {int(stats.get('losses') or 0)}L)"
-
-
 async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/signal_report_overall — Overall performance summary (Option B scaling).
-    Uses signals table (setup_id) for entry/SL/TPs to compute:
-      - Avg R/trade (decided)
-      - Avg R/win
-      - Profit Factor
-    """
+    """/signal_report_overall — overall emailed signal outcome summary."""
     uid = update.effective_user.id
+    target_uid = int(AUTOTRADE_OWNER_UID or uid) if is_admin_user(uid) else int(uid)
 
-    all_emailed = db_list_emailed_setups_all(uid)
+    all_emailed = db_list_emailed_setups_all(target_uid)
     total = len(all_emailed)
     if total == 0:
-        await update.message.reply_text("No emailed setups found yet for your account.")
+        await update.message.reply_text("No emailed setups found yet for this account.")
         return
 
-    outcomes = db_list_outcomes_for_user(uid)  # evaluated only
+    summary = _signal_outcome_summary(target_uid)
+    outcomes = summary.get('rows') or []
+    counts = summary.get('counts') or Counter()
+    by_session = summary.get('by_session') or defaultdict(lambda: Counter())
+    wins = int(summary.get('wins') or 0)
+    losses = int(summary.get('losses') or 0)
+    decided = int(summary.get('decided') or 0)
+    win_rate = float(summary.get('win_rate') or 0.0)
     evaluated = len(outcomes)
-
-    counts = Counter()
-    by_session = defaultdict(lambda: Counter())
-
-    r_all = []   # decided only
-    r_wins = []  # wins only
-
-    for r in outcomes:
-        out = str(r.get("outcome") or "OPEN").strip().upper()
-        sess = str(r.get("session") or "").strip() or "?"
-
-        counts[out] += 1
-        by_session[sess][out] += 1
-
-        if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
-            setup_id = str(r.get("setup_id") or "").strip()
-            sig = db_get_signal(setup_id)  # contains side/entry/sl/tps
-            if not sig:
-                continue
-
-            side = str(sig.get("side") or "").strip().upper()
-            entry = sig.get("entry")
-            sl = sig.get("sl")
-            tp1 = sig.get("tp1")
-            tp2 = sig.get("tp2")
-            tp3 = sig.get("tp3")
-
-            if entry is None or sl is None or not side:
-                continue
-
-            rr = _realized_r_option_b(out, side, float(entry), float(sl),
-                                      float(tp1) if tp1 is not None else None,
-                                      float(tp2) if tp2 is not None else None,
-                                      float(tp3) if tp3 is not None else None)
-            if rr is None:
-                continue
-
-            r_all.append(float(rr))
-            if rr > 0:
-                r_wins.append(float(rr))
-
-    wins = int(counts.get("WIN_TP1", 0) + counts.get("WIN_TP2", 0) + counts.get("WIN_TP3", 0))
-    losses = int(counts.get("LOSS", 0))
-    decided = wins + losses
-    win_rate = (wins / decided * 100.0) if decided > 0 else 0.0
-
     coverage = (evaluated / total * 100.0) if total > 0 else 0.0
 
-    avg_r = (sum(r_all) / len(r_all)) if r_all else 0.0
-    avg_r_win = (sum(r_wins) / len(r_wins)) if r_wins else 0.0
+    r_all = []
+    r_wins = []
+    for r in outcomes:
+        out = str(r.get('outcome') or 'OPEN').strip().upper()
+        if out not in ('WIN_TP1', 'WIN_TP2', 'WIN_TP3', 'LOSS'):
+            continue
+        sig = db_get_signal(str(r.get('setup_id') or '').strip())
+        if not sig:
+            continue
+        side = str(sig.get('side') or '').strip().upper()
+        entry = sig.get('entry')
+        sl = sig.get('sl')
+        tp1 = sig.get('tp1')
+        tp2 = sig.get('tp2')
+        tp3 = sig.get('tp3')
+        if entry is None or sl is None or not side:
+            continue
+        rr = _realized_r_option_b(out, side, float(entry), float(sl),
+                                  float(tp1) if tp1 is not None else None,
+                                  float(tp2) if tp2 is not None else None,
+                                  float(tp3) if tp3 is not None else None)
+        if rr is None:
+            continue
+        r_all.append(float(rr))
+        if rr > 0:
+            r_wins.append(float(rr))
 
     gross_profit = sum(x for x in r_all if x > 0)
     gross_loss = -sum(x for x in r_all if x < 0)
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
-
-    amb = int(counts.get("AMBIGUOUS", 0))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float('inf') if gross_profit > 0 else 0.0)
+    pf_txt = 'INF' if profit_factor == float('inf') else f"{profit_factor:.2f}"
+    avg_r = (sum(r_all) / len(r_all)) if r_all else 0.0
+    avg_r_win = (sum(r_wins) / len(r_wins)) if r_wins else 0.0
 
     lines = [
-        "📈 Signal Report (overall)",
+        "📈 Signal Report — Overall",
         HDR,
         f"Total emailed setups: {total}",
-        f"Evaluated (have outcome): {evaluated} ({coverage:.1f}% coverage)",
-        HDR,
-        f"Decided: {decided} | Wins: {wins} | Losses: {losses} | Win rate: {win_rate:.1f}%",
-        f"TP1: {counts.get('WIN_TP1',0)} | TP2: {counts.get('WIN_TP2',0)} | TP3: {counts.get('WIN_TP3',0)} | Open: {counts.get('OPEN',0)}" + (f" | Amb: {amb}" if amb else ""),
-        HDR,
-        f"Avg R/trade (decided): {avg_r:.2f}R | Avg R/win: {avg_r_win:.2f}R | Profit Factor: " + ("INF" if profit_factor == float("inf") else f"{profit_factor:.2f}"),
-        HDR,
-        "Session breakdown (evaluated only):",
+        f"Evaluated: {evaluated} ({coverage:.1f}% coverage)",
+        SEP,
+        f"Completed outcomes: {decided}",
+        f"Wins: {wins} | Losses: {losses} | Win Rate: {win_rate:.1f}%",
+        f"TP1: {counts.get('WIN_TP1',0)} | TP2: {counts.get('WIN_TP2',0)} | TP3: {counts.get('WIN_TP3',0)} | Open: {counts.get('OPEN',0)}" + (f" | Ambiguous: {int(counts.get('AMBIGUOUS',0))}" if int(counts.get('AMBIGUOUS',0)) else ""),
+        f"Avg R / completed: {avg_r:.2f}R | Avg R / win: {avg_r_win:.2f}R | Profit Factor: {pf_txt}",
     ]
+    if by_session:
+        lines.extend([SEP, "By session"])
+        for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
+            sw = int(c.get('WIN_TP1',0)+c.get('WIN_TP2',0)+c.get('WIN_TP3',0))
+            sl = int(c.get('LOSS',0))
+            sd = sw + sl
+            s_wr = (sw / sd * 100.0) if sd > 0 else 0.0
+            lines.append(f"• {sname}: {sw}W / {sl}L | {s_wr:.1f}% | completed {sd}")
 
-    for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
-        sw = int(c.get("WIN_TP1",0)+c.get("WIN_TP2",0)+c.get("WIN_TP3",0))
-        sl = int(c.get("LOSS",0))
-        sd = sw + sl
-        s_wr = (sw/sd*100.0) if sd>0 else 0.0
-        s_amb = int(c.get("AMBIGUOUS",0))
-        lines.append(
-            f"• {sname}: eval {sum(c.values())} | decided {sd} | WR {s_wr:.1f}% | "
-            f"TP1 {c.get('WIN_TP1',0)} TP2 {c.get('WIN_TP2',0)} TP3 {c.get('WIN_TP3',0)} SL {c.get('LOSS',0)} OPEN {c.get('OPEN',0)}" + (f" AMB {s_amb}" if s_amb else "")
-        )
-
-    await send_long_message(update, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 
 async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/autotrade_report [hours]
-    LIVE: shows Bybit closed PnL (realized) and current open positions for last N hours.
-    Also includes any entries found in autotrade_trades table (journal).
-    """
+    """/autotrade_report [hours] — compact live journal view."""
     _autotrade_migrate_tables()
     uid = update.effective_user.id
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
@@ -18206,118 +18013,48 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
 
-    lines = []
-    lines.append("📒 AutoTrade Journal")
-    lines.append(HDR)
-    lines.append(f"Window: last {lookback_h}h (Melbourne time)")
-
-    # 1) Open positions (live)
-    open_positions = []
-    if str(AUTOTRADE_MODE).lower() == "live":
-        open_positions = _bybit_get_open_positions_linear()
-
-    if open_positions:
-        lines.append(SEP)
-        lines.append("OPEN POSITIONS (live):")
-        total_u = 0.0
-        total_r = 0.0
-
-        for i, p in enumerate(open_positions, 1):
-            sym = _pos_symbol(p)
-            side = _pos_side_text(p)
-            size = _pos_size(p)
-            entry = _pos_entry(p)
-            mark = _pos_mark(p)
-            pnl = _pos_unreal_pnl(p)
-            sl = _pos_stop(p)
-            risk = _estimate_position_risk_usd(p)
-
-            total_u += pnl
-            total_r += risk
-
-            lines.append(f"{i}) {side} {sym}")
-            lines.append(f"   • Size: {size:g}")
-            lines.append(f"   • Entry: {fmt_price(entry)}   | Mark: {fmt_price(mark)}")
-            lines.append(f"   • PnL: {pnl:+.2f} USDT")
-            if sl and sl > 0:
-                lines.append(f"   • SL: {fmt_price(sl)}   | Risk est: {risk:.2f} USDT")
-            else:
-                lines.append("   • SL: —   | Risk est: — (needs SL)")
-            if i != len(open_positions):
-                lines.append(SEP)
-
-        lines.append(HDR)
-        lines.append(f"Total unrealised PnL: {total_u:+.2f} USDT")
-        lines.append(f"Total risk est (needs SL): {total_r:.2f} USDT")
+    lines = ["📒 AutoTrade Journal", HDR, f"Window: last {lookback_h}h (Melbourne)"]
+    open_positions = _bybit_get_open_positions_linear() if str(AUTOTRADE_MODE).lower() == 'live' else []
+    lines.extend([SEP, 'Open positions'])
+    if not open_positions:
+        lines.append('• None')
     else:
-        lines.append(SEP)
-        lines.append("OPEN POSITIONS (live): none")
+        total_u = 0.0
+        for p in open_positions:
+            pnl = _pos_unreal_pnl(p)
+            total_u += pnl
+            lines.append(f"• {_pos_side_text(p)} {_pos_symbol(p)} | PnL {pnl:+.2f} USDT")
+        lines.append(f"Total open PnL: {total_u:+.2f} USDT")
 
-    # 2) Closed PnL (Bybit) for last lookback window
-    if str(AUTOTRADE_MODE).lower() == "live":
+    lines.extend([SEP, 'Closed positions'])
+    closed_any = False
+    if str(AUTOTRADE_MODE).lower() == 'live':
         try:
             end_ms = int(time.time() * 1000)
             start_ms = int((time.time() - lookback_h * 3600.0) * 1000)
-            res = _bybit_v5_request("GET", "/v5/position/closed-pnl", {
-                "category": "linear",
-                "startTime": start_ms,
-                "endTime": end_ms,
-                "limit": 50,
+            res = _bybit_v5_request('GET', '/v5/position/closed-pnl', {
+                'category': 'linear', 'startTime': start_ms, 'endTime': end_ms, 'limit': 50,
             })
-            closed = []
-            if int(res.get("retCode", -1)) == 0:
-                closed = ((res.get("result") or {}).get("list") or [])
-            if closed:
-                lines.append(SEP)
-                lines.append("CLOSED PnL (realized):")
-                tot = 0.0
-                for r in closed[:30]:
-                    try:
-                        sym = _bybit_linear_symbol(str(r.get("symbol") or ""))
-                        side = str(r.get("side") or "").upper()
-                        pnl = float(r.get("closedPnl") or 0.0)
-                        tot += pnl
-                        ct = r.get("createdTime") or r.get("updatedTime") or ""
-                        lines.append(f"• {side} {sym} pnl={pnl:+.2f} USDT @ {_ms_to_local_str(ct)}")
-                    except Exception:
-                        continue
-                lines.append(f"Total realized PnL: {tot:+.2f} USDT")
-            else:
-                lines.append(SEP)
-                lines.append("CLOSED PnL (realized): none in this window")
+            closed = (((res or {}).get('result') or {}).get('list') or []) if int((res or {}).get('retCode', -1)) == 0 else []
+            total_closed = 0.0
+            for r in closed[:30]:
+                try:
+                    sym = _bybit_linear_symbol(str(r.get('symbol') or ''))
+                    side = str(r.get('side') or '').upper()
+                    pnl = float(r.get('closedPnl') or 0.0)
+                    total_closed += pnl
+                    lines.append(f"• {side} {sym} | PnL {pnl:+.2f} USDT")
+                    closed_any = True
+                except Exception:
+                    continue
+            if closed_any:
+                lines.append(f"Total closed PnL: {total_closed:+.2f} USDT")
         except Exception:
-            lines.append(SEP)
-            lines.append("CLOSED PnL (realized): unavailable (API error)")
+            pass
+    if not closed_any:
+        lines.append('• None in this window')
 
-    # 3) Bot journal table (autotrade_trades)
-    try:
-        ts_from = time.time() - lookback_h * 3600.0
-        trades = db_list_autotrade_trades(AUTOTRADE_OWNER_UID, ts_from)
-    except Exception:
-        trades = []
-
-    lines.append(SEP)
-    lines.append("BOT JOURNAL (autotrade_trades table):")
-    if not trades:
-        lines.append("No bot-journal rows in this window.")
-    else:
-        for t in trades[:50]:
-            try:
-                sym = str(t.get("symbol") or "")
-                side = str(t.get("side") or "")
-                entry = float(t.get("entry") or 0.0)
-                sl = float(t.get("sl") or 0.0)
-                opened_ts = float(t.get("opened_ts") or 0.0)
-                when = _fmt_dt_local(datetime.fromtimestamp(opened_ts, tz=timezone.utc)) if opened_ts else ""
-                status = str(t.get("status") or "")
-                outcome = str(t.get("outcome") or "")
-                lines.append(f"• {status} {side} {sym} entry={fmt_price(entry)} sl={fmt_price(sl)} @ {when} {outcome}".strip())
-            except Exception:
-                continue
-
-    await send_long_message(update, "\n".join(lines))
-
-
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 
 def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
@@ -18394,7 +18131,7 @@ def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
     }
 
 async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin bot-lifecycle performance report over recent anchored trading days."""
+    """Admin bot-lifecycle performance report over recent and overall anchored trading days."""
     uid = update.effective_user.id
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text("⛔️ Owner/admin only.")
@@ -18409,67 +18146,60 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
     days = int(clamp(days, 3, 30))
 
     owner = int(AUTOTRADE_OWNER_UID)
-    rows = _autotrade_performance_rows(owner, days=days)
-    summary = _autotrade_performance_summary(rows)
-    rec = _autotrade_reconciliation_snapshot(owner, days=days)
+    recent_rows = _autotrade_performance_rows(owner, days=days)
+    recent_summary = _autotrade_performance_summary(recent_rows)
+    overall_days = _autotrade_history_days_available(owner)
+    overall_rows = _autotrade_performance_rows(owner, days=overall_days)
+    overall_summary = _autotrade_performance_summary(overall_rows)
+    owner_user = _autotrade_user_settings(owner)
+    equity_now = _effective_equity_for_risk(owner_user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
 
-    lines = []
-    lines.append("📈 Performance Report")
-    lines.append(HDR)
-    lines.append(f"Window: last {days} anchored trading day(s) (Melbourne / configured day reset)")
-    lines.append("Source: journal first; emailed-setup reconciliation and exchange-close fallback used when journal history is missing")
-    lines.append(HDR)
-    lines.append(
-        f"Closed: {int(summary.get('closed') or 0)} | Wins: {int(summary.get('wins') or 0)} | "
-        f"Losses: {int(summary.get('losses') or 0)} | Win rate: {float(summary.get('win_rate') or 0.0):.1f}%"
-    )
-    pf = summary.get('profit_factor')
-    pf_txt = 'INF' if pf == float('inf') else f"{float(pf or 0.0):.2f}"
-    lines.append(
-        f"Net PnL: ${float(summary.get('net') or 0.0):+.2f} | Avg win: ${float(summary.get('avg_win') or 0.0):+.2f} | "
-        f"Avg loss: ${float(summary.get('avg_loss') or 0.0):+.2f}"
-    )
-    lines.append(f"Profit factor: {pf_txt} | Expectancy/closed trade: ${float(summary.get('expectancy') or 0.0):+.2f}")
-    bd = summary.get('best_day') or {}
-    wd = summary.get('worst_day') or {}
+    def _pf_txt(v):
+        return 'INF' if v == float('inf') else f"{float(v or 0.0):.2f}"
+
+    lines = [
+        '📈 Performance Report',
+        HDR,
+        f'Recent window: last {days} anchored trading day(s)',
+        f'Overall history: {len(overall_rows)} anchored trading day(s)',
+        SEP,
+        'OVERALL',
+        f"Total closed trades: {int(overall_summary.get('closed') or 0)}",
+        f"Total wins: {int(overall_summary.get('wins') or 0)} | Total losses: {int(overall_summary.get('losses') or 0)}",
+        f"Overall win rate: {float(overall_summary.get('win_rate') or 0.0):.1f}%",
+        f"Net PnL: ${float(overall_summary.get('net') or 0.0):+.2f}",
+        f"Average win: ${float(overall_summary.get('avg_win') or 0.0):+.2f} | Average loss: ${float(overall_summary.get('avg_loss') or 0.0):+.2f}",
+        f"Profit factor: {_pf_txt(overall_summary.get('profit_factor'))}",
+        f"Expectancy per closed trade: ${float(overall_summary.get('expectancy') or 0.0):+.2f}",
+    ]
+    bd = overall_summary.get('best_day') or {}
+    wd = overall_summary.get('worst_day') or {}
     if bd:
-        lines.append(f"Best day: {bd.get('day')} (${float(bd.get('net_pnl') or 0.0):+.2f})")
+        lines.append(f"Best day: {bd.get('day')} | ${float(bd.get('net_pnl') or 0.0):+.2f}")
     if wd:
-        lines.append(f"Worst day: {wd.get('day')} (${float(wd.get('net_pnl') or 0.0):+.2f})")
-    lines.append(SEP)
-    lines.append(
-        f"Reconciliation: journal-confirmed closes {int(rec.get('journal_confirmed_closes') or 0)} | "
-        f"exchange-reconciled closes {int(rec.get('exchange_reconciled_closes') or 0)} | "
-        f"provisional emailed-setup closes {int(rec.get('provisional_emailed_setup_closes') or 0)} | "
-        f"unmatched exchange closes {int(rec.get('unmatched_exchange_closes') or 0)}"
-    )
-    if int(rec.get('unmatched_exchange_closes') or 0) > 0:
-        lines.append("⚠️ Warning: unmatched exchange closes were detected and are excluded from bot performance totals.")
-    lines.append(SEP)
-    lines.append("Daily trend:")
-    for r in rows:
-        gp = float(r.get('gross_profit') or 0.0)
-        gl = float(r.get('gross_loss') or 0.0)
-        pf_day = (gp / gl) if gl > 0 else (float('inf') if gp > 0 else 0.0)
-        pf_day_txt = 'INF' if pf_day == float('inf') else f"{pf_day:.2f}"
-        wr = (float(r.get('wins') or 0) / max(1, int(r.get('wins') or 0) + int(r.get('losses') or 0)) * 100.0) if (int(r.get('wins') or 0) + int(r.get('losses') or 0)) > 0 else 0.0
-        rec_bits = []
-        if int(r.get('journal_confirmed_closes') or 0) > 0:
-            rec_bits.append(f"jc {int(r.get('journal_confirmed_closes') or 0)}")
-        if int(r.get('exchange_reconciled_closes') or 0) > 0:
-            rec_bits.append(f"xr {int(r.get('exchange_reconciled_closes') or 0)}")
-        if int(r.get('provisional_emailed_setup_closes') or 0) > 0:
-            rec_bits.append(f"pe {int(r.get('provisional_emailed_setup_closes') or 0)}")
-        if int(r.get('exchange_only_fallback_closes') or 0) > 0:
-            rec_bits.append(f"xf {int(r.get('exchange_only_fallback_closes') or 0)}")
-        rec_txt = f" | {' '.join(rec_bits)}" if rec_bits else ""
-        lines.append(
-            f"• {r.get('day')}: pnl ${float(r.get('net_pnl') or 0.0):+.2f} | open {int(r.get('opened') or 0)} | "
-            f"closed {int(r.get('closed') or 0)} | W {int(r.get('wins') or 0)} / L {int(r.get('losses') or 0)} | "
-            f"WR {wr:.1f}% | PF {pf_day_txt}{rec_txt}"
-        )
+        lines.append(f"Worst day: {wd.get('day')} | ${float(wd.get('net_pnl') or 0.0):+.2f}")
+
+    lines.extend([
+        SEP,
+        f'RECENT ({days} day window)',
+        f"Closed: {int(recent_summary.get('closed') or 0)} | Wins: {int(recent_summary.get('wins') or 0)} | Losses: {int(recent_summary.get('losses') or 0)} | Win rate: {float(recent_summary.get('win_rate') or 0.0):.1f}%",
+        f"Net PnL: ${float(recent_summary.get('net') or 0.0):+.2f} | Profit factor: {_pf_txt(recent_summary.get('profit_factor'))} | Expectancy: ${float(recent_summary.get('expectancy') or 0.0):+.2f}",
+        SEP,
+        'Daily trend',
+    ])
+    for r in recent_rows:
+        wl_total = int(r.get('wins') or 0) + int(r.get('losses') or 0)
+        wr = (float(r.get('wins') or 0) / wl_total * 100.0) if wl_total > 0 else 0.0
+        lines.append(f"• {r.get('day')} | PnL ${float(r.get('net_pnl') or 0.0):+.2f} | Win Rate {wr:.1f}%")
 
     await send_long_message(update, "\n".join(lines), parse_mode=None)
+    chart_path = _build_performance_chart_png(overall_rows or recent_rows, equity=float(equity_now or 0.0))
+    if chart_path:
+        try:
+            with open(chart_path, 'rb') as f:
+                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=f, caption='📉 Equity & PnL trend')
+        except Exception:
+            pass
 
 
 async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -18602,147 +18332,52 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = get_user(owner) or {}
     now_utc = datetime.now(timezone.utc)
     sess = current_session_utc(now_utc)
+    ready = _autotrade_ready()
+    sess_allowed = (sess != 'NONE') and _autotrade_allowed_session(sess)
+    snap = _accounting_snapshot(owner, user, is_admin=True)
+    equity = float(snap.get('equity') or 0.0)
+    mday = _autotrade_day_risk_metrics(int(owner), float(equity))
+    dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
 
     reasons = []
     if not AUTOTRADE_ENABLED:
-        reasons.append("AUTOTRADE_ENABLED=0")
+        reasons.append('AUTOTRADE_ENABLED=0')
     if owner <= 0:
-        reasons.append("AUTOTRADE_OWNER_UID missing/0")
-    if str(AUTOTRADE_MODE).lower() not in ("paper", "live"):
-        reasons.append(f"bad AUTOTRADE_MODE={AUTOTRADE_MODE}")
-    if str(AUTOTRADE_MODE).lower() == "live" and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
-        reasons.append("missing BYBIT_API_KEY/SECRET")
+        reasons.append('AUTOTRADE_OWNER_UID missing/0')
+    if str(AUTOTRADE_MODE).lower() == 'live' and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
+        reasons.append('missing BYBIT_API_KEY/SECRET')
 
-    ready = _autotrade_ready()
-    sess_allowed = (sess != "NONE") and _autotrade_allowed_session(sess)
-    try:
-        tw_ok = bool(trade_window_allows_now(user))
-    except Exception:
-        tw_ok = None
-
-    snap = _accounting_snapshot(owner, user, is_admin=True)
-    equity = float(snap.get("equity") or 0.0)
-    equity_src = "Bybit (live)" if str(AUTOTRADE_MODE).lower() == "live" else "User stored (paper)"
-
-    if str(AUTOTRADE_MODE).lower() == "live":
-        open_positions = _bybit_get_open_positions_linear()
-        open_trades_n = len(open_positions)
-        try:
-            open_risk = float(sum(_estimate_position_risk_usd(p) for p in open_positions) or 0.0)
-        except Exception:
-            open_risk = 0.0
-    else:
-        try:
-            open_positions = []
-            open_trades_n = len(_autotrade_db_open_trades(owner))
-            open_risk = float(_autotrade_open_risk_usd(owner, equity) or 0.0) if equity > 0 else 0.0
-        except Exception:
-            open_positions = []
-            open_trades_n = 0
-            open_risk = 0.0
-
-    per_trade_risk = float(_autotrade_per_trade_risk_usd(owner, equity) or 0.0) if equity > 0 else 0.0
-    mday = _autotrade_day_risk_metrics(int(owner), float(equity))
-    daily_cap = float(snap.get("cap") or 0.0)
-    open_risk_today = float(snap.get("open_risk_today") or 0.0)
-    used_today = float(snap.get("used_today") or 0.0)
-    pnl_today_closed = float(snap.get("pnl_today") or 0.0)
-    realized_loss_today = float(snap.get("realized_loss_today") or 0.0)
-    remaining_today = snap.get("remaining_today", float("inf"))
-    over_by = float(snap.get("over_by") or 0.0)
-
-    dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
-    det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
-
-    lines = []
-    lines.append("🧪 AutoTrade Debug")
-    lines.append(HDR)
-    lines.append(f"Ready: {'✅' if ready else '❌'}")
+    lines = [
+        '🧪 AutoTrade Debug',
+        HDR,
+        f"Ready: {'✅' if ready else '❌'}",
+        f"Mode: {str(AUTOTRADE_MODE).lower()} | Enabled: {'yes' if AUTOTRADE_ENABLED else 'no'} | Isolated: {'yes' if AUTOTRADE_ISOLATED else 'no'}",
+        f"Session now: {sess} | Allowed: {'✅' if sess_allowed else '❌'}",
+        f"Local now (Melbourne): {_fmt_dt_local(now_utc)}",
+        f"Trading day: {snap.get('today_window_label')}",
+        SEP,
+        f"Equity: ${equity:.2f}",
+        f"Open positions: {int(snap.get('open_positions_now', 0))} | Carried: {int(snap.get('inherited_open_positions', 0))}",
+        f"Open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
+        f"Daily cap: ${float(snap.get('cap') or 0.0):.2f}",
+        f"Daily risk used: ${float(snap.get('used_today') or 0.0):.2f}",
+        f"Daily risk remaining: {'∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f'${float(snap.get('remaining_today')):.2f}'}",
+        f"Unrealised PnL: ${float(mday.get('open_pnl') or 0.0):+.2f} | Realised PnL today: ${float(snap.get('pnl_today') or 0.0):+.2f}",
+    ]
     if reasons and not ready:
-        lines.append("Why not ready:")
+        lines.extend([SEP, 'Blocking reasons'])
         for r in reasons[:6]:
             lines.append(f"• {r}")
-    lines.append(SEP)
-    lines.append(f"Mode: {str(AUTOTRADE_MODE).lower()} | Enabled: {'yes' if AUTOTRADE_ENABLED else 'no'} | Isolated: {'yes' if AUTOTRADE_ISOLATED else 'no'}")
-    lines.append(f"Owner UID: {owner} | Caller UID: {uid}")
-    lines.append(f"Keys present: {'yes' if (BYBIT_API_KEY and BYBIT_API_SECRET) else 'no'}")
-    lines.append(SEP)
-    lines.append(f"Local now (Melbourne): {_fmt_dt_local(now_utc)}")
-    lines.append(f"Trading day: {snap.get('today_window_label')}")
-    lines.append(f"Today basis: {snap.get('today_basis')}")
-    try:
-        _w = (dec or {}).get("when")
-        if _w:
-            _dt = datetime.fromisoformat(str(_w).replace("Z","+00:00"))
-            _age = (now_utc - _dt).total_seconds()
-            if _age >= 0:
-                lines.append(f"Decision age: {int(_age//60)}m {int(_age%60)}s ago")
-    except Exception:
-        pass
-    lines.append(f"Session: {sess} | Allowed: {'✅' if sess_allowed else '❌'}")
-    if tw_ok is not None:
-        lines.append(f"Trade window allows now: {'✅' if tw_ok else '❌'}")
-    lines.append(SEP)
-    lines.append(f"Equity: ${equity:.2f} ({equity_src})")
-    lines.append(f"Open trades: {int(open_trades_n)}")
-    lines.append(f"Open risk est: ${open_risk:.2f}")
-    lines.append(f"Per-trade base risk (from /riskmode): ${per_trade_risk:.2f}")
-    try:
-        _det_dbg = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
-        _rm = float(_det_dbg.get("risk_multiplier") or 0.0)
-        _re = float(_det_dbg.get("risk_effective_usd") or 0.0)
-        _rr = str(_det_dbg.get("risk_regime") or "")
-        if _rm > 0 and _re > 0:
-            lines.append(f"Dynamic risk: x{_rm:.2f} | Effective risk: ${_re:.2f}" + (f" | Regime: {_rr}" if _rr else ""))
-    except Exception:
-        pass
-    lines.append(SEP)
-    lines.append(f"Daily cap (from /dailycap): ${daily_cap:.2f}")
-    _opened_today = int(snap.get('positions_opened_today', 0))
-    _trade_limit = int(snap.get('trades_today_limit', 0))
-    lines.append(f"Opened today: {_opened_today}" + (f"/{_trade_limit}" if _trade_limit > 0 else " (no count cap)"))
-    lines.append(f"Closed today: {int(snap.get('positions_closed_today', 0))}")
-    lines.append(f"Open positions now: {int(snap.get('open_positions_now', 0))}")
-    lines.append(f"Carried from prior day: {int(snap.get('inherited_open_positions', 0))}")
-    lines.append(f"Current-day open risk (opened today only): ${float(snap.get('current_day_open_risk', 0.0)):.2f}")
-    lines.append(f"Live open risk charged today: ${float(snap.get('live_open_risk_charged_today', snap.get('current_day_open_risk', 0.0))):.2f}")
-    lines.append(f"Carried open risk: ${float(snap.get('carried_open_risk', 0.0)):.2f}")
-    lines.append(f"Total open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}")
-    lines.append(f"Realised loss today used for cap: ${realized_loss_today:.2f}")
-    lines.append(f"Daily risk used today: ${used_today:.2f}")
-    lines.append(f"Unrealised PnL (open, ignored for risk): ${float(mday.get('open_pnl') or 0.0):+.2f}")
-    lines.append(f"Realised PnL today (closed): ${pnl_today_closed:+.2f}")
-    if math.isfinite(float(remaining_today)):
-        lines.append(f"Daily risk remaining for new trades: ${float(remaining_today):.2f}")
-        if over_by > 0:
-            lines.append(f"⚠️ Over daily cap by ${over_by:.2f}")
-    else:
-        lines.append("Daily risk remaining for new trades: ∞")
-    if equity > 0 and daily_cap > 0:
-        if float(remaining_today) <= 0:
-            lines.append("⚠️ Would BLOCK: daily_risk_cap_reached")
-        elif per_trade_risk > float(remaining_today):
-            lines.append("⚠️ Would BLOCK: per_trade_risk_gt_remaining")
+    if dec:
+        lines.extend([SEP, 'Last decision'])
+        lines.append(f"• Status: {dec.get('status','')} | Reason: {dec.get('reason','')}")
     class_rows = mday.get('position_classifications') or []
     if class_rows:
-        lines.append(SEP)
-        lines.append("Position day buckets:")
-        for row in class_rows[:12]:
-            ts = float(row.get('opened_ts') or 0.0)
-            ts_txt = _fmt_dt_local(datetime.fromtimestamp(ts, tz=timezone.utc)) if ts > 0 else '—'
-            extra = ''
-            note = str(row.get('notes') or '').strip()
-            if note:
-                extra = f" | {note}"
-            lines.append(
-                f"{row.get('symbol')} {row.get('side')} | risk ${float(row.get('risk') or 0.0):.2f} | "
-                f"opened {ts_txt} | bucket={row.get('bucket')} | source={row.get('source')}{extra}"
-            )
-    lines.append(SEP)
+        lines.extend([SEP, 'Position day buckets'])
+        for row in class_rows[:10]:
+            lines.append(f"• {row.get('symbol')} {row.get('side')} | ${float(row.get('risk') or 0.0):.2f} | {row.get('bucket')} | {row.get('source')}")
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
 
-
-    msg = "\n".join([x for x in lines if x is not None and x != ""])
-    await update.message.reply_text(msg)
 
 async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show all open Bybit positions (admin only) with live PnL and estimated risk."""
