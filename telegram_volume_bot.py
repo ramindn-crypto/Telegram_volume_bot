@@ -5302,7 +5302,7 @@ def _learning_status_text() -> str:
     lines.extend([
         SEP,
         f"Current live floors: email_quality={float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL):.1f} | screen_quality={float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN):.1f} | min_rr_tp3={float(cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3):.2f}",
-        f"Win-rate estimate: overall {float(overall.get('estimated_wr', 0.0) or 0.0):.1f}% | NY {float(ny.get('estimated_wr', 0.0) or 0.0):.1f}% | trend overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}",
+        f"Signal win rate (completed outcomes): overall {_signal_wr_display_metrics(owner).get('binary_win_rate', 0.0):.1f}% | NY {_signal_wr_display_metrics(owner, session='NY').get('binary_win_rate', 0.0):.1f}% | trend overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}",
         SEP,
     ])
 
@@ -11655,6 +11655,9 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     opt_res = _db_get_opt_result(str(last_opt.get("run_id") or "")) if last_opt else {}
     verdict, blockers = _admin_assurance_verdict(uid)
     opt_live = bool((opt_res or {}).get("promoted"))
+    owner = int(AUTOTRADE_OWNER_UID or uid)
+    overall_sig = _signal_wr_display_metrics(owner)
+    ny_sig = _signal_wr_display_metrics(owner, session='NY')
 
     lines = [
         "🧠 Edge Status",
@@ -11665,10 +11668,12 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Auto-trading engine: {'ON' if _autotrade_ready() else 'OFF'}",
         f"Email pipeline: {'ON' if EMAIL_ENABLED and email_config_ok() else 'OFF'}",
         SEP,
-        f"Overall WR estimate: {float(overall.get('estimated_wr', 0.0) or 0.0):.1f}%",
-        f"New York WR estimate: {float(ny.get('estimated_wr', 0.0) or 0.0):.1f}%",
+        f"Overall signal WR: {float(overall_sig.get('binary_win_rate') or 0.0):.1f}% ({int(overall_sig.get('wins') or 0)}W / {int(overall_sig.get('losses') or 0)}L)",
+        f"New York signal WR: {float(ny_sig.get('binary_win_rate') or 0.0):.1f}% ({int(ny_sig.get('wins') or 0)}W / {int(ny_sig.get('losses') or 0)}L)",
+        f"Weighted TP-stage WR: {float(overall_sig.get('weighted_win_rate') or 0.0):.1f}%",
         f"Trend vs prior 7d: overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')} | NY {str(trend.get('ny_7d') or trend.get('ny') or 'n/a')}",
         f"Latest optimizer result: {'PROMOTED TO LIVE PARAMS' if opt_live else 'NO NEW LIVE PARAMS PROMOTED'}",
+        f"Estimator snapshot: overall {float(overall.get('estimated_wr', 0.0) or 0.0):.1f}% | NY {float(ny.get('estimated_wr', 0.0) or 0.0):.1f}%",
         f"Detailed learning view: /learning_status",
     ]
     await send_long_message(update, "\n".join(lines), parse_mode=None)
@@ -11738,6 +11743,102 @@ def _signal_outcome_summary(user_id: int, session: str | None = None, days: int 
         'win_rate': float(win_rate),
     }
 
+
+
+
+def _signal_outcome_weighted_summary(user_id: int, session: str | None = None, days: int | None = None) -> dict:
+    """Signal-outcome rollup with both binary and weighted TP-stage metrics.
+
+    Binary signal win rate = any TP-stage win divided by decided outcomes.
+    Weighted signal win rate = TP-stage credit (TP1=0.40, TP2=0.80, TP3=1.00, LOSS=0.00)
+    divided by decided outcomes. This is shown only where weighted methodology is explicit.
+    """
+    summary = _signal_outcome_summary(int(user_id), session=session, days=days)
+    outcomes = []
+    for r in summary.get('rows') or []:
+        outcomes.append((str(r.get('session') or '?'), str(r.get('outcome') or 'OPEN')))
+    roll = _weighted_rollup_from_outcomes(outcomes)
+    roll['rows'] = summary.get('rows') or []
+    roll['counts'] = summary.get('counts') or Counter()
+    return roll
+
+
+def _signal_wr_display_metrics(user_id: int, session: str | None = None, days: int | None = None) -> dict:
+    """Single source of truth for signal win-rate displays across admin reports."""
+    roll = _signal_outcome_weighted_summary(int(user_id), session=session, days=days)
+    return {
+        'wins': int(roll.get('tp1_only') or 0) + int(roll.get('tp2_plus') or 0),
+        'losses': int(roll.get('losses') or 0),
+        'decided': int(roll.get('decided') or 0),
+        'binary_win_rate': float(roll.get('binary_win_rate') or 0.0),
+        'weighted_win_rate': float(roll.get('weighted_win_rate') or 0.0),
+        'avg_weighted_credit': float(roll.get('avg_weighted_credit') or 0.0),
+        'tp1_only': int(roll.get('tp1_only') or 0),
+        'tp2_plus': int(roll.get('tp2_plus') or 0),
+        'tp3': int(roll.get('tp3') or 0),
+        'open': int(roll.get('open') or 0),
+        'counts': roll.get('counts') or Counter(),
+        'rows': roll.get('rows') or [],
+        'by_session': roll.get('by_session') or {},
+    }
+
+
+def _signal_weighted_wr_daily_series(uid: int, days: int, session: str | None = None) -> list[tuple[str, float]]:
+    uid = int(uid)
+    days = int(max(1, days))
+    user = _autotrade_user_settings(uid)
+    now_local = datetime.now(_user_tzinfo(user))
+    start_local, _ = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
+    day_starts = [start_local - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    buckets = {ds.strftime('%Y-%m-%d'): [] for ds in day_starts}
+    ts_from = float((day_starts[0]).astimezone(timezone.utc).timestamp()) if day_starts else None
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = """SELECT e.setup_id, e.session, e.emailed_ts, o.outcome
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id = e.setup_id
+                   WHERE e.user_id=?"""
+            params = [uid]
+            if ts_from is not None:
+                q += " AND e.emailed_ts>=?"
+                params.append(float(ts_from))
+            if session:
+                q += " AND UPPER(COALESCE(e.session,''))=?"
+                params.append(str(session).upper())
+            q += " ORDER BY e.emailed_ts ASC"
+            rows = [dict(r) for r in (c.execute(q, tuple(params)).fetchall() or [])]
+    except Exception:
+        rows = []
+    for r in rows:
+        try:
+            emailed_ts = float(r.get('emailed_ts') or 0.0)
+            if emailed_ts <= 0:
+                continue
+            lab = _autotrade_trade_day_label(emailed_ts, user)
+            if lab in buckets:
+                buckets[lab].append(str(r.get('outcome') or 'OPEN'))
+        except Exception:
+            continue
+    series = []
+    for ds in day_starts:
+        lab = ds.strftime('%Y-%m-%d')
+        outs = buckets.get(lab) or []
+        decided = sum(1 for o in outs if str(o or '').upper().strip() in {'WIN_TP1', 'WIN_TP2', 'WIN_TP3', 'LOSS'})
+        wsum = sum(_stage_credit_from_outcome(o) for o in outs if str(o or '').upper().strip() in {'WIN_TP1', 'WIN_TP2', 'WIN_TP3', 'LOSS'})
+        wr = (wsum / decided * 100.0) if decided > 0 else 0.0
+        series.append((lab, float(wr)))
+    return series
+
+
+def _last_n_anchored_day_labels(uid: int, days: int) -> list[str]:
+    uid = int(uid)
+    days = int(max(1, days))
+    user = _autotrade_user_settings(uid)
+    now_local = datetime.now(_user_tzinfo(user))
+    start_local, _ = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
+    return [(start_local - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(days - 1, -1, -1)]
 
 def _autotrade_history_days_available(uid: int) -> int:
     try:
@@ -11939,21 +12040,22 @@ def _autotrade_weighted_wr_daily_series(uid: int, days: int) -> list[tuple[str, 
     return series
 
 
-def _build_winrate_chart_png(uid: int, days: int, title: str = 'Weighted Win-Rate Trend') -> str | None:
+def _build_winrate_chart_png(uid: int, days: int, title: str = 'Weighted Signal Win-Rate Trend', session: str | None = None) -> str | None:
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        series = _autotrade_weighted_wr_daily_series(int(uid), int(days))
+        series = _signal_weighted_wr_daily_series(int(uid), int(days), session=session)
         if not series:
-            return None
+            labels = _last_n_anchored_day_labels(int(uid), int(days))
+            series = [(lab, 0.0) for lab in labels]
         xs = [x for x, _ in series]
         ys = [float(y) for _, y in series]
         fig, ax = plt.subplots(figsize=(10, 5.5))
         ax.plot(xs, ys, linewidth=2)
         ax.set_title(title)
         ax.set_xlabel('Trading day')
-        ax.set_ylabel('Weighted win rate %')
+        ax.set_ylabel('Weighted signal win rate %')
         ax.set_ylim(0, 100)
         ax.grid(True, alpha=0.3)
         if len(xs) > 10:
@@ -11965,7 +12067,11 @@ def _build_winrate_chart_png(uid: int, days: int, title: str = 'Weighted Win-Rat
         fig.savefig(out, dpi=150, bbox_inches='tight')
         plt.close(fig)
         return out
-    except Exception:
+    except Exception as e:
+        try:
+            logger.exception('winrate chart build failed: %s', e)
+        except Exception:
+            pass
         return None
 
 
@@ -11985,9 +12091,11 @@ async def performance_chart_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         day_arg = None
     days = int(clamp(day_arg if day_arg else overall_days, 7, max(7, overall_days)))
     rows = _autotrade_performance_rows(uid, days=days)
+    if not rows:
+        rows = [{'day': lab, 'net_pnl': 0.0} for lab in _last_n_anchored_day_labels(uid, days)]
     chart = _build_performance_chart_png(rows, equity=float(equity_now or 0.0))
     if not chart:
-        await update.message.reply_text('No performance chart data yet.')
+        await update.message.reply_text('Could not build the performance chart right now.')
         return
     with open(chart, 'rb') as f:
         await context.bot.send_photo(chat_id=update.effective_chat.id, photo=f, caption=f'📉 Equity + daily PnL chart ({days} day view)')
@@ -12006,12 +12114,12 @@ async def winrate_chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         day_arg = None
     days = int(clamp(day_arg if day_arg else overall_days, 7, max(7, overall_days)))
-    chart = _build_winrate_chart_png(uid, days=days, title='Weighted Win-Rate Trend')
+    chart = _build_winrate_chart_png(uid, days=days, title='Weighted Signal Win-Rate Trend')
     if not chart:
-        await update.message.reply_text('No weighted win-rate chart data yet.')
+        await update.message.reply_text('Could not build the weighted signal win-rate chart right now.')
         return
     with open(chart, 'rb') as f:
-        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=f, caption=f'📊 Weighted win-rate trend ({days} day view)')
+        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=f, caption=f'📊 Weighted signal win-rate trend ({days} day view)')
 def _autotrade_chart_series(rows: list[dict], starting_equity: float = 0.0) -> dict:
     pnl_points = []
     equity_points = []
@@ -12053,12 +12161,16 @@ def _build_performance_chart_png(rows: list[dict], equity: float = 0.0) -> str |
         fig.savefig(out, dpi=150, bbox_inches='tight')
         plt.close(fig)
         return out
-    except Exception:
+    except Exception as e:
+        try:
+            logger.exception('performance chart build failed: %s', e)
+        except Exception:
+            pass
         return None
 
 
 def _fmt_wr_line(label: str, summary: dict) -> str:
-    return f"{label}: {int(summary.get('wins') or 0)}W / {int(summary.get('losses') or 0)}L | {float(summary.get('win_rate') or 0.0):.1f}%"
+    return f"{label}: {int(summary.get('wins') or 0)}W / {int(summary.get('losses') or 0)}L | {float(summary.get('binary_win_rate') or summary.get('win_rate') or 0.0):.1f}%"
 
 
 async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -12066,13 +12178,13 @@ async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
     owner = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
-    overall = _signal_outcome_summary(owner)
-    recent = _signal_outcome_summary(owner, days=7)
+    overall = _signal_wr_display_metrics(owner)
+    recent = _signal_wr_display_metrics(owner, days=7)
     msg = (
         "📊 Win Rate\n"
         f"{HDR}\n"
-        f"{_fmt_wr_line('Overall Win Rate', overall)}\n"
-        f"{_fmt_wr_line('Last 7 Days Win Rate', recent)}"
+        f"{_fmt_wr_line('Overall signal WR', overall)}\n"
+        f"{_fmt_wr_line('Last 7 days signal WR', recent)}"
     )
     await update.message.reply_text(msg)
 
@@ -12082,13 +12194,13 @@ async def ny_winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
     owner = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
-    overall = _signal_outcome_summary(owner, session='NY')
-    recent = _signal_outcome_summary(owner, session='NY', days=7)
+    overall = _signal_wr_display_metrics(owner, session='NY')
+    recent = _signal_wr_display_metrics(owner, session='NY', days=7)
     msg = (
         "🗽 NY Win Rate\n"
         f"{HDR}\n"
-        f"{_fmt_wr_line('Overall NY Win Rate', overall)}\n"
-        f"{_fmt_wr_line('Last 7 Days NY Win Rate', recent)}"
+        f"{_fmt_wr_line('Overall NY signal WR', overall)}\n"
+        f"{_fmt_wr_line('Last 7 days NY signal WR', recent)}"
     )
     await update.message.reply_text(msg)
 
@@ -15553,11 +15665,11 @@ ADMIN_HELP_DESCRIPTIONS = {
     "health_sys": "Admin engine health summary",
     "health": "General bot and data health",
     "why": "Last scan reject reasons",
-    "edge_status": "Learning / optimizer / execution assurance view",
-    "learning_status": "Detailed learning and optimizer status",
+    "edge_status": "Learning / optimizer / execution assurance view with synced signal WR",
+    "learning_status": "Detailed learning and optimizer status with synced signal WR",
     "optimizer_status": "Alias of /learning_status",
-    "winrate": "Overall and last-7-days completed signal win rate",
-    "ny_winrate": "Overall and last-7-days NY completed signal win rate",
+    "winrate": "Overall and last-7-days completed signal WR",
+    "ny_winrate": "Overall and last-7-days NY completed signal WR",
     "lessons_learned": "Latest learning takeaways",
     "email_decision": "Last email pipeline decision",
     "signal_report": "Recent emailed setup outcomes",
@@ -15569,7 +15681,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_report_overall": "AutoTrade overall performance summary",
     "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
     "performance_chart": "Send equity + daily PnL chart (overall / 30d / 7d)",
-    "winrate_chart": "Send weighted win-rate trend chart (overall / 30d / 7d)",
+    "winrate_chart": "Send weighted signal win-rate trend chart (overall / 30d / 7d)",
     "autotrade_sessions": "Show or set allowed auto-trade sessions",
     "open_trades": "Show live open Bybit positions",
     "cooldown_clear": "Clear cooldown for one symbol + side",
@@ -15596,7 +15708,6 @@ ADMIN_HELP_GROUPS = [
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall", "performance_chart", "winrate_chart"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "autotrade_sessions", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
-    ("🧠 OPTIMIZATION / STRATEGY", ["params_show", "params_set", "params_reset", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
 ]
 
@@ -18202,14 +18313,14 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("No emailed setups found yet for this account.")
         return
 
-    summary = _signal_outcome_summary(target_uid)
+    summary = _signal_wr_display_metrics(target_uid)
     outcomes = summary.get('rows') or []
     counts = summary.get('counts') or Counter()
     by_session = summary.get('by_session') or defaultdict(lambda: Counter())
     wins = int(summary.get('wins') or 0)
     losses = int(summary.get('losses') or 0)
     decided = int(summary.get('decided') or 0)
-    win_rate = float(summary.get('win_rate') or 0.0)
+    win_rate = float(summary.get('binary_win_rate') or 0.0)
     evaluated = len(outcomes)
     coverage = (evaluated / total * 100.0) if total > 0 else 0.0
 
@@ -18254,17 +18365,17 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         f"Evaluated: {evaluated} ({coverage:.1f}% coverage)",
         SEP,
         f"Completed outcomes: {decided}",
-        f"Wins: {wins} | Losses: {losses} | Win Rate: {win_rate:.1f}%",
+        f"Wins: {wins} | Losses: {losses} | Signal WR: {win_rate:.1f}%",
         f"TP1: {counts.get('WIN_TP1',0)} | TP2: {counts.get('WIN_TP2',0)} | TP3: {counts.get('WIN_TP3',0)} | Open: {counts.get('OPEN',0)}" + (f" | Ambiguous: {int(counts.get('AMBIGUOUS',0))}" if int(counts.get('AMBIGUOUS',0)) else ""),
         f"Avg R / completed: {avg_r:.2f}R | Avg R / win: {avg_r_win:.2f}R | Profit Factor: {pf_txt}",
     ]
     if by_session:
         lines.extend([SEP, "By session"])
         for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
-            sw = int(c.get('WIN_TP1',0)+c.get('WIN_TP2',0)+c.get('WIN_TP3',0))
-            sl = int(c.get('LOSS',0))
-            sd = sw + sl
-            s_wr = (sw / sd * 100.0) if sd > 0 else 0.0
+            sw = int(c.get('tp1_only', 0) or 0) + int(c.get('tp2_plus', 0) or 0)
+            sl = int(c.get('losses', 0) or 0)
+            sd = int(c.get('decided', 0) or 0)
+            s_wr = float(c.get('binary_win_rate', 0.0) or 0.0)
             lines.append(f"• {sname}: {sw}W / {sl}L | {s_wr:.1f}% | completed {sd}")
 
     await send_long_message(update, "\n".join(lines), parse_mode=None)
@@ -18650,27 +18761,45 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
         return
 
     owner = int(AUTOTRADE_OWNER_UID or uid)
-    weighted = _autotrade_weighted_outcome_summary(owner, days=_autotrade_history_days_available(owner))
-    total = int(weighted.get('total') or 0)
-    if total == 0:
-        await update.message.reply_text("No bot-opened trades found yet.")
+    days = _autotrade_history_days_available(owner)
+    weighted = _autotrade_weighted_outcome_summary(owner, days=days)
+    perf_rows = _autotrade_performance_rows(owner, days=days)
+    perf = _autotrade_performance_summary(perf_rows)
+    live_open_positions = _bybit_get_open_positions_linear() if str(AUTOTRADE_MODE).lower() == 'live' else []
+    live_open_count = len(live_open_positions or [])
+    weighted_total = int(weighted.get('total') or 0)
+    closed_total = int(perf.get('closed') or 0)
+    total_visible = max(weighted_total, closed_total) + int(live_open_count if weighted_total <= 0 else 0)
+    if total_visible <= 0 and weighted_total <= 0 and closed_total <= 0:
+        await update.message.reply_text("No autotrade lifecycle data found yet.")
         return
 
     by_session = weighted.get('by_session') or {}
     lines = [
         "📈 AutoTrade Report (overall)",
         HDR,
-        f"Total bot trades: {total}",
-        f"Decided: {int(weighted.get('decided') or 0)} | Weighted WR: {float(weighted.get('weighted_win_rate') or 0.0):.1f}% | Binary WR: {float(weighted.get('binary_win_rate') or 0.0):.1f}%",
-        f"TP1-only: {int(weighted.get('tp1_only') or 0)} | TP2+: {int(weighted.get('tp2_plus') or 0)} | TP3: {int(weighted.get('tp3') or 0)} | SL: {int(weighted.get('losses') or 0)} | Open: {int(weighted.get('open') or 0)}",
-        f"Avg staged credit/trade: {float(weighted.get('avg_weighted_credit') or 0.0):.2f}",
-        "",
-        "Session breakdown:",
+        f"Tracked autotrade rows: {max(weighted_total, closed_total)}",
+        f"Closed autotrades: {closed_total} | Current live open positions: {live_open_count}",
     ]
-    for sess, item in sorted(by_session.items()):
-        lines.append(
-            f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | weighted WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP1-only {int(item.get('tp1_only') or 0)} TP2+ {int(item.get('tp2_plus') or 0)} TP3 {int(item.get('tp3') or 0)} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
-        )
+
+    if weighted_total > 0:
+        lines.extend([
+            f"Decided: {int(weighted.get('decided') or 0)} | Weighted WR: {float(weighted.get('weighted_win_rate') or 0.0):.1f}% | Binary WR: {float(weighted.get('binary_win_rate') or 0.0):.1f}%",
+            f"TP1-only: {int(weighted.get('tp1_only') or 0)} | TP2+: {int(weighted.get('tp2_plus') or 0)} | TP3: {int(weighted.get('tp3') or 0)} | SL: {int(weighted.get('losses') or 0)} | Open: {int(weighted.get('open') or 0)}",
+            f"Avg staged credit/trade: {float(weighted.get('avg_weighted_credit') or 0.0):.2f}",
+        ])
+    else:
+        lines.extend([
+            "Weighted lifecycle WR: pending journal/outcome data",
+            f"Closed autotrade PnL summary: {int(perf.get('wins') or 0)}W / {int(perf.get('losses') or 0)}L | {float(perf.get('win_rate') or 0.0):.1f}% | Net {float(perf.get('net') or 0.0):+.2f} USDT",
+        ])
+
+    if by_session:
+        lines.extend(["", "Session breakdown:"])
+        for sess, item in sorted(by_session.items()):
+            lines.append(
+                f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | weighted WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP1-only {int(item.get('tp1_only') or 0)} TP2+ {int(item.get('tp2_plus') or 0)} TP3 {int(item.get('tp3') or 0)} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
+            )
 
     await update.message.reply_text("\n".join(lines))
 
@@ -22351,6 +22480,7 @@ def main():
     app.add_handler(CommandHandler("performance_report", performance_report_cmd, block=False))
     app.add_handler(CommandHandler("performance_chart", performance_chart_cmd, block=False))
     app.add_handler(CommandHandler("winrate_chart", winrate_chart_cmd, block=False))
+    app.add_handler(CommandHandler("winrate_chrt", winrate_chart_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
@@ -22361,6 +22491,7 @@ def main():
     app.add_handler(CommandHandler("learning_status", learning_status_cmd, block=False))
     app.add_handler(CommandHandler("winrate", winrate_cmd, block=False))
     app.add_handler(CommandHandler("ny_winrate", ny_winrate_cmd, block=False))
+    app.add_handler(CommandHandler("nywinrate", ny_winrate_cmd, block=False))
     app.add_handler(CommandHandler("lessons_learned", lessons_learned_cmd, block=False))
     
     # Strategy parameterization + optimization (admin)
