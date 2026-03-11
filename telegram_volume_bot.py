@@ -21926,6 +21926,11 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("\n".join(lines).strip())
 
 
+
+async def email_pipeline_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await email_decision_cmd(update, context)
+
+
 # =========================================================
 # /why (debug why no setups)
 # =========================================================
