@@ -12136,85 +12136,70 @@ def _autotrade_history_days_available(uid: int) -> int:
 
 
 
+
 def _stage_credit_from_outcome(outcome: str) -> float:
-    o = str(outcome or '').upper().strip()
-    if o == 'WIN_TP1':
-        return 0.40
-    if o == 'WIN_TP2':
-        return 0.80
-    if o == 'WIN_TP3':
+    """Canonical staged credit for the production 2-TP model.
+
+    TP1 = partial success, TP2 = full success, SL = loss, OPEN = unresolved.
+    """
+    canon = _canon_signal_outcome_label(outcome)
+    if canon == 'TP1':
+        return 0.50
+    if canon == 'TP2':
         return 1.00
     return 0.0
 
 
 def _autotrade_trade_signal_outcome(trade: dict) -> str:
+    """Use the journal / live-sync canonical outcome instead of re-simulating old 3-TP paths."""
     try:
-        tp1, tp2, tp3 = _ensure_three_tps(float(trade.get('entry') or 0.0), float(trade.get('sl') or 0.0), float(trade.get('tp3') or 0.0), trade.get('tp1'), trade.get('tp2'), str(trade.get('side') or ''))
-        setup = {
-            'symbol': trade.get('symbol'),
-            'market_symbol': _market_symbol_from_base(trade.get('symbol')),
-            'side': trade.get('side'),
-            'entry': trade.get('entry'),
-            'sl': trade.get('sl'),
-            'tp1': tp1,
-            'tp2': tp2,
-            'tp3': tp3,
-            'created_ts': float(trade.get('opened_ts') or 0.0),
-        }
-        res = evaluate_signal_hit_order(setup, horizon_hours=168, timeframe='1m')
-        return str((res or {}).get('outcome') or 'OPEN').upper().strip()
+        return _canon_outcome_from_autotrade_trade(trade)
     except Exception:
         return 'OPEN'
 
 
 def _weighted_rollup_from_outcomes(outcomes: list[tuple[str, str]]) -> dict:
-    counts = Counter()
-    by_session = defaultdict(lambda: Counter())
-    weighted_sum = 0.0
-    binary_wins = 0
-    decided = 0
-    total = 0
-    for sess, outcome in outcomes or []:
-        s = str(sess or '?').upper().strip() or '?'
-        o = str(outcome or 'OPEN').upper().strip() or 'OPEN'
-        counts[o] += 1
-        by_session[s][o] += 1
-        total += 1
-        if o in {'WIN_TP1', 'WIN_TP2', 'WIN_TP3', 'LOSS'}:
-            decided += 1
-            weighted_sum += _stage_credit_from_outcome(o)
-            if o in {'WIN_TP1', 'WIN_TP2', 'WIN_TP3'}:
-                binary_wins += 1
-    out = {
-        'total': int(total),
-        'decided': int(decided),
-        'counts': counts,
-        'tp1_only': int(counts.get('WIN_TP1', 0)),
-        'tp2_plus': int(counts.get('WIN_TP2', 0) + counts.get('WIN_TP3', 0)),
-        'tp3': int(counts.get('WIN_TP3', 0)),
-        'losses': int(counts.get('LOSS', 0)),
-        'open': int(counts.get('OPEN', 0)),
-        'weighted_win_rate': float((weighted_sum / decided) * 100.0) if decided > 0 else 0.0,
-        'binary_win_rate': float((binary_wins / decided) * 100.0) if decided > 0 else 0.0,
-        'avg_weighted_credit': float(weighted_sum / decided) if decided > 0 else 0.0,
-        'by_session': {},
-    }
-    for sess, ctr in by_session.items():
-        dec = int(ctr.get('WIN_TP1', 0) + ctr.get('WIN_TP2', 0) + ctr.get('WIN_TP3', 0) + ctr.get('LOSS', 0))
-        wsum = float(ctr.get('WIN_TP1', 0)) * 0.40 + float(ctr.get('WIN_TP2', 0)) * 0.80 + float(ctr.get('WIN_TP3', 0)) * 1.00
-        bwin = int(ctr.get('WIN_TP1', 0) + ctr.get('WIN_TP2', 0) + ctr.get('WIN_TP3', 0))
-        out['by_session'][sess] = {
-            'total': int(sum(ctr.values())),
-            'decided': dec,
-            'tp1_only': int(ctr.get('WIN_TP1', 0)),
-            'tp2_plus': int(ctr.get('WIN_TP2', 0) + ctr.get('WIN_TP3', 0)),
-            'tp3': int(ctr.get('WIN_TP3', 0)),
-            'losses': int(ctr.get('LOSS', 0)),
-            'open': int(ctr.get('OPEN', 0)),
-            'weighted_win_rate': float((wsum / dec) * 100.0) if dec > 0 else 0.0,
-            'binary_win_rate': float((bwin / dec) * 100.0) if dec > 0 else 0.0,
+    rows = [{'session': sess, 'outcome': _canon_signal_outcome_label(outcome)} for sess, outcome in (outcomes or [])]
+    stats = _canonical_wr_stats(rows)
+    counts = stats.get('counts') or Counter()
+    decided = int(stats.get('decided') or 0)
+    tp1 = int(counts.get('TP1', 0))
+    tp2 = int(counts.get('TP2', 0))
+    weighted_credit = (tp1 * 0.50) + (tp2 * 1.00)
+    weighted_wr = float((weighted_credit / decided) * 100.0) if decided > 0 else 0.0
+
+    by_session_out = {}
+    for sess, item in (stats.get('by_session') or {}).items():
+        s_dec = int(item.get('decided') or 0)
+        s_tp1 = int(item.get('tp1') or 0)
+        s_tp2 = int(item.get('tp2') or 0)
+        s_weighted_credit = (s_tp1 * 0.50) + (s_tp2 * 1.00)
+        by_session_out[sess] = {
+            'total': int(item.get('total') or 0),
+            'decided': s_dec,
+            'tp1_only': s_tp1,
+            'tp2_plus': s_tp2,
+            'tp3': 0,
+            'losses': int(item.get('sl') or 0),
+            'open': int(item.get('open') or 0),
+            'weighted_win_rate': float((s_weighted_credit / s_dec) * 100.0) if s_dec > 0 else 0.0,
+            'binary_win_rate': float(item.get('win_rate') or 0.0),
         }
-    return out
+
+    return {
+        'total': int(len(rows)),
+        'decided': decided,
+        'counts': counts,
+        'tp1_only': tp1,
+        'tp2_plus': tp2,
+        'tp3': 0,
+        'losses': int(counts.get('SL', 0)),
+        'open': int(counts.get('OPEN', 0)),
+        'weighted_win_rate': weighted_wr,
+        'binary_win_rate': float(stats.get('win_rate') or 0.0),
+        'avg_weighted_credit': float(weighted_credit / decided) if decided > 0 else 0.0,
+        'by_session': by_session_out,
+    }
 
 
 def _autotrade_weighted_outcome_summary(uid: int, days: int | None = None) -> dict:
@@ -12301,9 +12286,9 @@ def _autotrade_weighted_wr_daily_series(uid: int, days: int) -> list[tuple[str, 
     series = []
     for ds in day_starts:
         lab = ds.strftime('%Y-%m-%d')
-        outs = buckets.get(lab) or []
-        decided = sum(1 for o in outs if o in {'WIN_TP1', 'WIN_TP2', 'WIN_TP3', 'LOSS'})
-        wsum = sum(_stage_credit_from_outcome(o) for o in outs if o in {'WIN_TP1', 'WIN_TP2', 'WIN_TP3', 'LOSS'})
+        outs = [_canon_signal_outcome_label(o) for o in (buckets.get(lab) or [])]
+        decided = sum(1 for o in outs if o in {'TP1', 'TP2', 'SL'})
+        wsum = sum(_stage_credit_from_outcome(o) for o in outs if o in {'TP1', 'TP2', 'SL'})
         wr = (wsum / decided * 100.0) if decided > 0 else 0.0
         series.append((lab, float(wr)))
     return series
