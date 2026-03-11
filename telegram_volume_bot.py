@@ -1442,7 +1442,7 @@ AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PC
 AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT", "3") or 3)
 AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "3") or 3)
 # Open-trade count cap for commercial/live safety.
-AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "3") or 3)
+AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "0") or 0)
 EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
 EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
 
@@ -4009,7 +4009,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             (int(uid), float(cutoff), int(limit)),
         )
         rows = cur.fetchall() or []
-        out = sorted(_load_signals(rows, 'executable_setups'), key=lambda x: float(getattr(x, 'created_ts', 0.0) or 0.0), reverse=True)
+        out = sorted(_load_signals(rows, 'executable_setups'), key=lambda x: (int(getattr(x, 'conf', 0) or 0), float(getattr(x, 'created_ts', 0.0) or 0.0)), reverse=True)
         if out:
             try:
                 for item in out:
@@ -11944,8 +11944,10 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _canon_signal_outcome_label(outcome: str, pnl: float | None = None) -> str:
-    """Canonical user-facing outcome model: TP1, TP2, SL, OPEN."""
+    """Canonical user-facing outcome model: TP1, TP2, SL, OPEN, UNTRACKED."""
     o = str(outcome or '').upper().strip()
+    if o in {'UNTRACKED', 'UNTRACKED_OPEN', 'SKIPPED', 'NOT_TRADED'}:
+        return 'UNTRACKED'
     try:
         pnl_f = None if pnl is None else float(pnl)
     except Exception:
@@ -12078,6 +12080,7 @@ def _canonical_wr_stats(rows: list[dict]) -> dict:
             'tp2': int(ctr.get('TP2', 0)),
             'sl': int(ctr.get('SL', 0)),
             'open': int(ctr.get('OPEN', 0)),
+            'untracked': int(ctr.get('UNTRACKED', 0)),
             'win_rate': float((s_win / s_dec) * 100.0) if s_dec > 0 else 0.0,
         }
     return {
@@ -18801,7 +18804,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             canon, meta = _canonical_signal_outcome_for_setup(int(uid), setup_id)
             if _signal_report_live_backed_only(int(uid), meta, canon) is False and str(canon).upper().strip() == 'OPEN' and int(uid) == int(AUTOTRADE_OWNER_UID or 0) and str(AUTOTRADE_MODE).lower() == 'live':
                 hidden_untracked_open += 1
-                continue
+                canon = 'UNTRACKED'
             created_ts = float(sig.get('created_ts') or e.get('emailed_ts') or 0.0)
             try:
                 tz = ZoneInfo(str(user.get('tz') or 'UTC'))
@@ -18827,14 +18830,14 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Signal Report (last {lookback_h}h)",
         HDR,
         f"Total: {len(rows)} | Decided: {int(stats.get('decided') or 0)} | Wins (TP2): {int(stats.get('wins') or 0)} | Losses: {int(stats.get('losses') or 0)} | Win rate: {float(stats.get('win_rate') or 0.0):.1f}%",
-        f"TP1: {counts.get('TP1',0)} | TP2: {counts.get('TP2',0)} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)}",
+        f"TP1: {counts.get('TP1',0)} | TP2: {counts.get('TP2',0)} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)} | Untracked: {counts.get('UNTRACKED',0)}",
         HDR,
     ]
     table_rows = [[r['session'], r['time'], r['trade'], r['confidence'], r['outcome']] for r in rows]
     table = tabulate(table_rows, headers=['Session','Time','Trade','Confidence','Outcome'], tablefmt='plain', colalign=('left','left','left','right','left'))
     sess_lines = ['Session breakdown:']
     for sname, c in sorted((stats.get('by_session') or {}).items(), key=lambda kv: kv[0]):
-        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)}")
+        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} UNTRACKED {int(c.get('untracked') or 0)}")
     if int(hidden_untracked_open or 0) > 0:
         sess_lines.append(f"• Hidden untracked OPEN rows: {int(hidden_untracked_open)} (not backed by live Bybit/autotrade state)")
     msg = "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>\n" + "\n".join(sess_lines)
@@ -18989,7 +18992,7 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
     if by_session:
         lines.extend([SEP, 'By session'])
         for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
-            lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)}")
+            lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} UNTRACKED {int(c.get('untracked') or 0)}")
     hidden_untracked_open = int(summary.get('hidden_untracked_open') or 0)
     if hidden_untracked_open > 0:
         lines.extend([SEP, f'Hidden untracked OPEN rows: {hidden_untracked_open} (not backed by live Bybit/autotrade state)'])
@@ -19230,6 +19233,10 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     email_time = det.get('email_logged_time') or det.get('generated_logged_time') or ''
     lines.append(f"*Signal created:* `{_fmt_iso_to_local(sig_time) if sig_time else '—'}`")
     lines.append(f"*Email logged:* `{_fmt_iso_to_local(email_time) if email_time else '—'}`")
+    dec_status = str(dec.get('status') or '').strip()
+    dec_reason = str(dec.get('reason') or '').strip()
+    if dec_status or dec_reason:
+        lines.append(f"*Result:* `{dec_status or '—'}`{(' | ' + dec_reason) if dec_reason else ''}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -19928,11 +19935,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, source=mode, session_name=session_name)[0]]
     except Exception:
         pass
-    try:
-        if str(mode or "").lower().strip() == "email":
-            ordered = [s for s in (ordered or []) if str(session_name or "").upper().strip() == "NY" and str(getattr(s, "engine", "") or "").upper().strip() == "A"]
-    except Exception:
-        pass
 # -----------------------------------------------------
     # NEW: Spike Reversal candidates (15M+ Vol) — for /screen only
     # -----------------------------------------------------
@@ -20087,6 +20089,10 @@ async def _refresh_screen_cache_async():
 def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     """Heavy /screen builder (runs in a worker thread).
 
+    Top setups intentionally reuse the SAME email-grade pool for the active session.
+    That keeps /screen, emailed setups, and autotrade aligned; only delivery/execution
+    rules like gap/caps/risk may suppress sending or trading.
+
     Returns:
         body (str): cached body (header is built in the async handler)
         kb (list[tuple[str,str]]): [(SYMBOL, SETUP_ID), ...] for TradingView buttons
@@ -20096,7 +20102,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         build_priority_pool(
             best_fut,
             session,
-            mode="screen",
+            mode="email",
             scan_profile=str(DEFAULT_SCAN_PROFILE),
             uid=uid,
         )
@@ -20118,25 +20124,6 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         top_setup_syms = set(str(getattr(s, 'symbol', '') or '').upper() for s in (setups or []) if getattr(s, 'symbol', None))
     except Exception:
         top_setup_syms = set()
-
-    # Safety: if engine produced no setups, generate fallback ATR-based setups
-    if not setups:
-        try:
-            up_list, dn_list = compute_directional_lists(best_fut)
-            leaders_bases = [str(t[0]).upper() for t in (up_list or [])[:10]]
-            losers_bases  = [str(t[0]).upper() for t in (dn_list or [])[:10]]
-            market_bases  = _market_leader_bases(best_fut)[:10]
-            setups = _fallback_setups_from_universe(
-                best_fut,
-                leaders_bases,
-                losers_bases,
-                market_bases,
-                session,
-                max_items=max(4, int(SETUPS_N or 4)),
-            )[:int(SETUPS_N or 4)]
-        except Exception:
-            setups = []
-
     # Ensure conf exists + persist signal cards to DB (used by Signal ID lookup)
     try:
         for s in (setups or []):
