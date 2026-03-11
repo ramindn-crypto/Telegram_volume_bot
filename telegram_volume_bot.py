@@ -12280,6 +12280,8 @@ def _autotrade_weighted_wr_daily_series(uid: int, days: int) -> list[tuple[str, 
 
 def _simple_line_chart_png(series_map: list[tuple[str, list[tuple[str, float]]]], title: str, ylabel: str, out_prefix: str) -> str | None:
     try:
+        import os
+        import tempfile
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
@@ -12300,12 +12302,14 @@ def _simple_line_chart_png(series_map: list[tuple[str, list[tuple[str, float]]]]
                 cleaned_series.append((str(name), clean_pts))
                 if not all_labels:
                     all_labels = [x for x, _ in clean_pts]
+
         if not cleaned_series:
             cleaned_series = [('Series', [('N/A', 0.0)])]
             all_labels = ['N/A']
 
         fig, ax = plt.subplots(figsize=(11, 5.5))
         x_index = {lab: idx for idx, lab in enumerate(all_labels)}
+
         for name, pts in cleaned_series:
             xs = [x_index.get(x, i) for i, (x, _y) in enumerate(pts)]
             ys = [float(y) for _x, y in pts]
@@ -12319,24 +12323,31 @@ def _simple_line_chart_png(series_map: list[tuple[str, list[tuple[str, float]]]]
         ax.grid(True, alpha=0.3)
         ax.set_xticks(list(range(len(all_labels))))
         ax.set_xticklabels(all_labels)
+
         if len(all_labels) > 8:
             for label in ax.get_xticklabels():
                 label.set_rotation(45)
                 label.set_horizontalalignment('right')
+
         if len(cleaned_series) > 1:
             ax.legend()
+
         fig.tight_layout()
-        out = f'/mnt/data/{out_prefix}_{int(time.time())}.png'
+
+        out_dir = os.environ.get("CHART_OUTPUT_DIR") or tempfile.gettempdir()
+        os.makedirs(out_dir, exist_ok=True)
+        out = os.path.join(out_dir, f"{out_prefix}_{int(time.time())}.png")
+
         fig.savefig(out, dpi=150, bbox_inches='tight')
         plt.close(fig)
         return out
+
     except Exception as e:
         try:
             logger.exception('simple chart build failed: %s', e)
         except Exception:
             pass
         return None
-
 
 def _build_winrate_chart_png(uid: int, days: int, title: str = 'Overall Win-Rate Trend', session: str | None = None) -> str | None:
     series = _signal_weighted_wr_daily_series(int(uid), int(days), session=session)
