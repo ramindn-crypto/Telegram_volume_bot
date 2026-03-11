@@ -11825,6 +11825,23 @@ def _canonical_signal_outcome_for_setup(user_id: int, setup_id: str) -> tuple[st
     return 'OPEN', {'source': 'none', 'lifecycle': life}
 
 
+def _signal_report_live_backed_only(user_id: int, meta: dict | None, canon: str) -> bool:
+    # Admin live-report gate: OPEN rows must be backed by current Bybit/autotrade evidence.
+    # This prevents emailed-but-never-executed setups from being counted as live OPEN positions
+    # in /signal_report and /signal_report_overall for the owner/admin account.
+    try:
+        if str(AUTOTRADE_MODE).lower() != 'live':
+            return False
+        if int(user_id) != int(AUTOTRADE_OWNER_UID or 0):
+            return False
+        if str(canon or '').upper().strip() != 'OPEN':
+            return False
+        src = str(((meta or {}).get('source') or '')).strip().lower()
+        return src in {'live_position', 'autotrade_open_trade'}
+    except Exception:
+        return False
+
+
 def _canonical_wr_stats(rows: list[dict]) -> dict:
     counts = Counter()
     by_session = defaultdict(lambda: Counter())
@@ -11908,9 +11925,13 @@ def _signal_outcome_summary(user_id: int, session: str | None = None, days: int 
         emailed = []
 
     rows = []
+    hidden_untracked_open = 0
     for e in emailed:
         sid = str(e.get('setup_id') or '').strip()
         canon, meta = _canonical_signal_outcome_for_setup(user_id, sid)
+        if _signal_report_live_backed_only(int(user_id), meta, canon) is False and str(canon).upper().strip() == 'OPEN' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0) and str(AUTOTRADE_MODE).lower() == 'live':
+            hidden_untracked_open += 1
+            continue
         stored = (meta or {}).get('stored') or {}
         life = (meta or {}).get('lifecycle') or {}
         trade = (meta or {}).get('trade') or {}
@@ -11932,6 +11953,7 @@ def _signal_outcome_summary(user_id: int, session: str | None = None, days: int 
         'losses': int(stats.get('losses') or 0),
         'decided': int(stats.get('decided') or 0),
         'win_rate': float(stats.get('win_rate') or 0.0),
+        'hidden_untracked_open': int(hidden_untracked_open or 0),
     }
 
 
@@ -18248,11 +18270,15 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def _eval_all():
         rows = []
+        hidden_untracked_open = 0
         for e in emailed:
             setup_id = str(e.get('setup_id') or '').strip()
             sess = str(e.get('session') or '').strip().upper() or '?'
             sig = db_get_signal(setup_id) or {}
-            canon, _meta = _canonical_signal_outcome_for_setup(int(uid), setup_id)
+            canon, meta = _canonical_signal_outcome_for_setup(int(uid), setup_id)
+            if _signal_report_live_backed_only(int(uid), meta, canon) is False and str(canon).upper().strip() == 'OPEN' and int(uid) == int(AUTOTRADE_OWNER_UID or 0) and str(AUTOTRADE_MODE).lower() == 'live':
+                hidden_untracked_open += 1
+                continue
             created_ts = float(sig.get('created_ts') or e.get('emailed_ts') or 0.0)
             try:
                 tz = ZoneInfo(str(user.get('tz') or 'UTC'))
@@ -18269,9 +18295,9 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'confidence': conf,
                 'outcome': canon,
             })
-        return rows
+        return rows, hidden_untracked_open
 
-    rows = await to_thread_heavy(_eval_all, timeout=120)
+    rows, hidden_untracked_open = await to_thread_heavy(_eval_all, timeout=120)
     stats = _canonical_wr_stats(rows)
     counts = stats.get('counts') or Counter()
     header = [
@@ -18286,6 +18312,8 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sess_lines = ['Session breakdown:']
     for sname, c in sorted((stats.get('by_session') or {}).items(), key=lambda kv: kv[0]):
         sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)}")
+    if int(hidden_untracked_open or 0) > 0:
+        sess_lines.append(f"• Hidden untracked OPEN rows: {int(hidden_untracked_open)} (not backed by live Bybit/autotrade state)")
     msg = "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>\n" + "\n".join(sess_lines)
     await send_long_message(update, msg, parse_mode=ParseMode.HTML)
 
@@ -18439,6 +18467,9 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         lines.extend([SEP, 'By session'])
         for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
             lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)}")
+    hidden_untracked_open = int(summary.get('hidden_untracked_open') or 0)
+    if hidden_untracked_open > 0:
+        lines.extend([SEP, f'Hidden untracked OPEN rows: {hidden_untracked_open} (not backed by live Bybit/autotrade state)'])
     await send_long_message(update, '\n'.join(lines), parse_mode=None)
 
 async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -19011,8 +19042,25 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Market Leaders (Top by Futures Volume)
     market_bases = _market_leader_bases(best_fut, market_take)
 
-    # ✅ Setup universe: ONLY what /screen shows — Directional Leaders + Directional Losers + Market Leaders.
-    universe_bases = list(dict.fromkeys([b.upper() for b in (leaders + losers + (market_bases or []))]))
+    # Active scan universe:
+    # keep the displayed leaders/losers/market leaders first, then widen with extra top-volume names
+    # so liquid symbols that are not in the visible top buckets can still be evaluated and explained in /why.
+    display_universe_bases = list(dict.fromkeys([b.upper() for b in (leaders + losers + (market_bases or []))]))
+    extra_top_volume_bases = []
+    try:
+        ranked_all = sorted((best_fut or {}).items(), key=lambda kv: usd_notional(kv[1]), reverse=True)
+        seen_display = set(display_universe_bases)
+        for base, _mv in ranked_all:
+            b = str(base or '').upper().strip()
+            if not b or b in seen_display:
+                continue
+            extra_top_volume_bases.append(b)
+            if len(display_universe_bases) + len(extra_top_volume_bases) >= int(max(universe_cap, len(display_universe_bases))):
+                break
+    except Exception:
+        extra_top_volume_bases = []
+
+    universe_bases = list(dict.fromkeys(display_universe_bases + extra_top_volume_bases))
     universe_best = _subset_best(best_fut, universe_bases) if universe_bases else {}
 
     # Diagnostics: keep /why focused on this scan universe
