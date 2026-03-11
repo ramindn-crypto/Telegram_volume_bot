@@ -5629,20 +5629,22 @@ def _note_status(status: str, base: str, mv: "MarketVol", extra: str = "") -> No
     return
 
 def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
-    """Explain why setups were rejected in the *last* scan for this user.
+    """Explain why setups were rejected in the last meaningful scan for this user.
 
-    Output is intentionally compact:
-    - Shows how many symbols were in-scope (leaders/losers + optionally market leaders)
-    - Shows how many had recorded reject reasons
-    - Shows top reject reasons (aggregate)
-    - Shows a per-symbol last-known reason list (limited)
+    Preference order:
+    - last manual /screen scan (what the user most likely wants from /why)
+    - otherwise the latest recorded scan (for example email/background)
     """
-    rec = _LAST_REJECTS.get(int(uid)) or {}
+    raw = _LAST_REJECTS.get(int(uid)) or {}
+    rec = raw
+    if isinstance(raw, dict) and any(k in raw for k in ("screen", "email", "latest")):
+        rec = raw.get("screen") or raw.get("latest") or raw.get("email") or {}
+
     counts = rec.get("counts") or {}
     allow = rec.get("allow") or []
     per_sym = rec.get("per_symbol") or {}  # base -> {"reason": str, "n": int}
 
-    if not allow and not counts:
+    if not allow and not counts and not per_sym:
         return "No reject stats recorded yet. Run /screen once."
 
     allow_set = [str(x).upper() for x in (allow or []) if str(x).strip()]
@@ -11826,9 +11828,9 @@ def _canonical_signal_outcome_for_setup(user_id: int, setup_id: str) -> tuple[st
 
 
 def _signal_report_live_backed_only(user_id: int, meta: dict | None, canon: str) -> bool:
-    # Admin live-report gate: OPEN rows must be backed by current Bybit/autotrade evidence.
-    # This prevents emailed-but-never-executed setups from being counted as live OPEN positions
-    # in /signal_report and /signal_report_overall for the owner/admin account.
+    # Admin live-report gate: OPEN rows must be backed by a CURRENT live Bybit position.
+    # Local journal rows that still say OPEN are not enough, otherwise /signal_report can show
+    # stale OPEN items after the exchange position was already closed outside the bot.
     try:
         if str(AUTOTRADE_MODE).lower() != 'live':
             return False
@@ -11837,7 +11839,7 @@ def _signal_report_live_backed_only(user_id: int, meta: dict | None, canon: str)
         if str(canon or '').upper().strip() != 'OPEN':
             return False
         src = str(((meta or {}).get('source') or '')).strip().lower()
-        return src in {'live_position', 'autotrade_open_trade'}
+        return src in {'live_position'}
     except Exception:
         return False
 
@@ -19442,11 +19444,27 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Store diagnostics for /why, then ALWAYS reset context
     try:
         if uid is not None:
-            _LAST_REJECTS[int(uid)] = {
+            counts = {
+                str(k): int(v)
+                for k, v in dict(_rej_ctx or {}).items()
+                if not str(k).startswith("__")
+            }
+            payload = {
                 "ts": time.time(),
+                "mode": str(mode or ''),
                 "allow": list(_rej_ctx.get("__allow__") or []),
+                "counts": counts,
                 "per_symbol": dict((_rej_ctx.get("__per__") or {})),
             }
+            bucket = _LAST_REJECTS.get(int(uid)) or {}
+            if isinstance(bucket, dict) and any(k in bucket for k in ("screen", "email", "latest")):
+                bucket = dict(bucket)
+            else:
+                bucket = {}
+            if str(mode or '').strip():
+                bucket[str(mode).strip().lower()] = payload
+            bucket["latest"] = payload
+            _LAST_REJECTS[int(uid)] = bucket
     finally:
         try:
             _REJECT_CTX.reset(_rej_token)
