@@ -1460,6 +1460,10 @@ AUTOTRADE_BE_AFTER_TP1_ENABLED = str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ENAB
 AUTOTRADE_BE_AFTER_TP1_MIN_CONF = int(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MIN_CONF", "84") or 84)
 AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT", "4.5") or 4.5)
 AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY,LON") or "NY,LON").upper().replace(' ', '').split(','))
+# Live market-order entries must still stay close to the setup entry. Otherwise the bot can
+# execute a stale emailed setup at a materially worse price just because it is still inside
+# the time window. This guard keeps the email/setup engine and live execution aligned.
+AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "0.80") or 0.80)
 
 # Bybit V5 keys (required for live)
 BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
@@ -4054,45 +4058,13 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             con.close()
             return out
 
-        # 3) Fallback: legacy generated email rows, newest first.
-        cur.execute(
-            """
-            SELECT g.setup_id,
-                   MAX(g.created_ts) AS generated_ts,
-                   0.0 AS aux_ts,
-                   MAX(COALESCE(g.session, '')) AS src_session
-            FROM generated_setups g
-            LEFT JOIN signal_outcomes o ON o.setup_id = g.setup_id
-            WHERE g.user_id = ?
-              AND g.created_ts >= ?
-              AND g.source = 'email'
-              AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-            GROUP BY g.setup_id
-            ORDER BY generated_ts DESC, MAX(g.conf) DESC, g.setup_id DESC
-            LIMIT ?
-            """,
-            (int(uid), float(cutoff), int(limit)),
-        )
-        rows = cur.fetchall() or []
-        out = sorted(_load_signals(rows, 'generated_setups'), key=lambda x: float(getattr(x, 'created_ts', 0.0) or 0.0), reverse=True)
-        try:
-            for item in out:
-                _admin_setup_lifecycle_merge(
-                    int(uid),
-                    str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or ''),
-                    session=str(getattr(item, 'source_session', '') or session_label or ''),
-                    symbol=str(getattr(item, 'symbol', '') or ''),
-                    side=str(getattr(item, 'side', '') or ''),
-                    executable_ts=float(time.time()),
-                    state='executable_pending',
-                    source_kind=str(getattr(item, 'source_kind', '') or 'generated_setups'),
-                    signal_created_ts=float(getattr(item, 'signal_created_ts', 0.0) or 0.0),
-                    generated_logged_ts=float(getattr(item, 'generated_logged_ts', 0.0) or 0.0),
-                )
-        except Exception:
-            pass
+        # 3) No legacy generated_setups fallback here.
+        # AutoTrade must only consume setups that were confirmed as emailed successfully
+        # (executable_setups primary, emailed_setups secondary). Using generated_setups
+        # alone can resurrect unsent / partially logged setups and create execution drift
+        # versus the actual email pipeline.
         con.close()
-        return out
+        return []
     except Exception as e:
         try:
             logger.error(f"_autotrade_select_db_setups failed: {type(e).__name__}: {e}")
@@ -4258,6 +4230,30 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         live_ref = _autotrade_live_reference_price(sym, fallback_entry=intended_entry)
         if live_ref > 0:
             price_ref = live_ref
+
+    entry_drift_pct = 0.0
+    try:
+        if float(intended_entry) > 0 and float(price_ref) > 0:
+            entry_drift_pct = abs((float(price_ref) - float(intended_entry)) / float(intended_entry)) * 100.0
+    except Exception:
+        entry_drift_pct = 0.0
+    if str(AUTOTRADE_MODE).lower() == 'live' and float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT) > 0 and entry_drift_pct > float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT):
+        try:
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'entry': float(price_ref),
+                'entry_source': 'live_ref',
+                'setup_entry': float(intended_entry),
+                'entry_drift_pct': float(entry_drift_pct),
+                'reject_reason': 'entry_drift_too_wide',
+            })
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('stale_deadline'), last_reason=f'entry_drift_too_wide ({entry_drift_pct:.2f}%>{float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT):.2f}%)')
+        except Exception:
+            pass
+        return (False, 'entry_drift_too_wide')
 
     filt = _bybit_get_instr_filters(sym)
     contract_size = float(filt.get('contractSize') or 1.0)
