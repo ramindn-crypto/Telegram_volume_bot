@@ -16251,6 +16251,16 @@ Market & Signals
 /screen
 • Scans the market for high-quality setups
 
+/setups_log <n> <screen|email|all>
+• Shows recently generated setups saved by the bot
+• Example: /setups_log 20 all
+
+/why
+• Shows why the last scan rejected symbols
+
+/email_decision
+• Shows the latest email-pipeline decision and loop health
+
 ────────────────────
 ⚖️ RISK & POSITION SIZING
 ────────────────────
@@ -16414,6 +16424,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "ny_winrate": "Overall NY completed signal WR",
     "lessons_learned": "Latest learning takeaways",
     "email_decision": "Last email pipeline decision",
+    "email_pipeline_status": "Alias of /email_decision for email pipeline visibility",
     "signal_report": "Recent emailed setup outcomes",
     "signal_report_overall": "Overall emailed-signal outcome summary (WR, R, session split)",
     "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
@@ -16446,7 +16457,7 @@ ADMIN_HELP_DESCRIPTIONS = {
 ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
-    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "winrate", "ny_winrate", "lessons_learned", "email_decision"]),
+    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "autotrade_sessions", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
@@ -23091,6 +23102,8 @@ def main():
     app.add_handler(CommandHandler("email_off", email_off_cmd, block=False))
     app.add_handler(CommandHandler("email_test", email_test_cmd, block=False))
     app.add_handler(CommandHandler("email_decision", email_decision_cmd, block=False))
+    app.add_handler(CommandHandler("email_pipeline_status", email_pipeline_status_cmd, block=False))
+    app.add_handler(CommandHandler("setups_log", setups_log_cmd, block=False))
 
     app.add_handler(CommandHandler("why", why_no_setups_cmd, block=False))
     # ================= USDT (semi-auto) =================
