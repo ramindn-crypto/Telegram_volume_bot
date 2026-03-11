@@ -892,7 +892,7 @@ SETUPS_N = 6
 EMAIL_SETUPS_N = 3
 
 # ✅ Global setup quality floor (Premium & Selective)
-MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "75"))
+MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "78"))
 
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
 MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
@@ -993,7 +993,7 @@ def _strategy_config_defaults() -> dict:
         "target_setups_per_day_hi": 5.0,
 
         # Self-optimization governance
-        "session_weights": {"NY": 1.0, "LON": 0.6, "ASIA": 0.3},  # optimizer weighting
+        "session_weights": {"NY": 1.0, "LON": 0.0, "ASIA": 0.0},  # optimizer weighting (production bias: NY-only)
         "concentration_cap": 0.25,          # no single symbol >25% of setups (OOS)
         "oos_min_setups": 30,               # minimum OOS sample size across universe before promotion
         "min_win_rate": 70.0,               # enforced only when sample is adequate
@@ -1425,18 +1425,18 @@ except Exception:
     AUTOTRADE_OWNER_UID = 0
 
 # Risk controls
-AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "2") or 2)
-AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT", "6") or 6)
-AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "6") or 6)
-# Open-trade count is intentionally unlimited. Daily risk cap controls exposure.
-AUTOTRADE_MAX_OPEN_TRADES = 0
+AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "1") or 1)
+AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT", "3") or 3)
+AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "3") or 3)
+# Open-trade count cap for commercial/live safety.
+AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "3") or 3)
 
 # Margin / leverage
 AUTOTRADE_ISOLATED = str(os.environ.get("AUTOTRADE_ISOLATED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
 AUTOTRADE_LEVERAGE = int(os.environ.get("AUTOTRADE_LEVERAGE", "10") or 10)
 
 # TP split (fractions must sum ~1.0)
-_AUTOTRADE_TP_SPLIT_RAW = str(os.environ.get("AUTOTRADE_TP_SPLIT", "0.4,0.4,0.2") or "0.4,0.4,0.2")
+_AUTOTRADE_TP_SPLIT_RAW = str(os.environ.get("AUTOTRADE_TP_SPLIT", "0.65,0.35,0.0") or "0.65,0.35,0.0")
 try:
     AUTOTRADE_TP_SPLIT = [float(x) for x in _AUTOTRADE_TP_SPLIT_RAW.split(",")]
 except Exception:
@@ -1459,11 +1459,11 @@ AUTOTRADE_LIVE_TP1_FRACTION = max(0.25, min(0.85, AUTOTRADE_LIVE_TP1_FRACTION))
 AUTOTRADE_BE_AFTER_TP1_ENABLED = str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ENABLED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
 AUTOTRADE_BE_AFTER_TP1_MIN_CONF = int(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MIN_CONF", "84") or 84)
 AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT", "4.5") or 4.5)
-AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY,LON") or "NY,LON").upper().replace(' ', '').split(','))
+AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY") or "NY").upper().replace(' ', '').split(','))
 # Live market-order entries must still stay close to the setup entry. Otherwise the bot can
 # execute a stale emailed setup at a materially worse price just because it is still inside
 # the time window. This guard keeps the email/setup engine and live execution aligned.
-AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "0.80") or 0.80)
+AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "0.50") or 0.50)
 
 # Bybit V5 keys (required for live)
 BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
@@ -4235,6 +4235,20 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (False, 'per_trade_risk_zero')
 
     mday = _autotrade_day_risk_metrics(int(uid), float(equity))
+    try:
+        live_open_count = int(mday.get('open_positions_now') or 0)
+    except Exception:
+        live_open_count = 0
+    if int(AUTOTRADE_MAX_OPEN_TRADES or 0) > 0 and live_open_count >= int(AUTOTRADE_MAX_OPEN_TRADES):
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_open_trades_reached', 'open_positions_now': int(live_open_count)})
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'max_open_trades_reached ({live_open_count}/{int(AUTOTRADE_MAX_OPEN_TRADES)})')
+        except Exception:
+            pass
+        return (False, 'max_open_trades_reached')
     daily_cap = float(mday.get('cap') or 0.0)
     open_risk = float(mday.get('open_risk') or 0.0)
     used_total_before = float(mday.get('used_total') or 0.0)
@@ -9484,8 +9498,8 @@ def rr_to_tp(entry: float, sl: float, tp: float) -> float:
 # - Used by both /screen and email selection, and by backtests.
 # =========================================================
 
-QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "58"))
-QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "64"))
+QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "62"))
+QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "70"))
 
 # Soft throttling: how many candidates we score before slicing (keeps compute bounded)
 QUALITY_SCORE_CAND_MULT_SCREEN = int(os.environ.get("QUALITY_SCORE_CAND_MULT_SCREEN", "8"))
@@ -13674,6 +13688,57 @@ def is_top_setup_eligible(
         return (True, "ok")
     except Exception:
         return (False, "eligibility_exception")
+
+def is_executable_setup_eligible(
+    s: "Setup",
+    session_name: str = "NY",
+    min_quality: float = 70.0,
+    min_conf: int = 78,
+    min_rr_final: float = 2.0,
+) -> tuple[bool, str]:
+    """Production-grade gate for email/executable/autotrade path.
+
+    Keeps the sellable/live path intentionally narrower than /screen:
+    - NY only
+    - Engine A only (pullback / reclaim / rejection style)
+    - stronger quality + confidence floors
+    - final RR floor
+    """
+    try:
+        sess = str(session_name or "").upper().strip()
+        if sess != "NY":
+            return (False, "session_not_ny")
+
+        ok, why = is_top_setup_eligible(s, source='email', session_name=sess)
+        if not ok:
+            return (False, f"base_gate_{why}")
+
+        engine = str(getattr(s, "engine", "") or "").upper().strip()
+        if engine != "A":
+            return (False, "engine_not_a")
+
+        score = float(getattr(s, "quality_score", 0.0) or 0.0)
+        if score < float(max(min_quality, QUALITY_SCORE_MIN_EMAIL)):
+            return (False, "below_exec_quality")
+
+        conf = int(getattr(s, "conf", 0) or 0)
+        if conf < int(max(min_conf, MIN_SETUP_CONF)):
+            return (False, "below_exec_conf")
+
+        entry = float(getattr(s, "entry", 0.0) or 0.0)
+        sl = float(getattr(s, "sl", 0.0) or 0.0)
+        final_tp = float(getattr(s, "tp2", 0.0) or getattr(s, "tp3", 0.0) or 0.0)
+        rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
+        if rr_final < float(min_rr_final):
+            return (False, "below_exec_rr")
+
+        if not bool(getattr(s, "pullback_ready", False)):
+            return (False, "pullback_not_ready")
+
+        return (True, "ok")
+    except Exception:
+        return (False, "exec_eligibility_exception")
+
 
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
     """
@@ -19004,7 +19069,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         market_take = 15
         trend_take = 12
     else:  # email
-        n_target = int(max(EMAIL_SETUPS_N * 3, 9))
+        n_target = int(max(EMAIL_SETUPS_N * 2, 6))
         strict_15m = True
         universe_cap = 35
         trigger_loosen = 1.0
@@ -19034,7 +19099,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             allow_no_pullback = True
         else:
             # Email pool becomes broader, but final email gates still apply
-            n_target = int(max(EMAIL_SETUPS_N * 4, 12))
+            n_target = int(max(EMAIL_SETUPS_N * 3, 9))
             universe_cap = int(max(60, universe_cap))
             trigger_loosen = 0.95
             waiting_near = float(SCREEN_WAITING_NEAR_PCT)
@@ -19159,6 +19224,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # ------------------------------------------------
     breakout_setups = []
     try:
+        if str(mode or "").lower().strip() == "email":
+            raise RuntimeError("engine_b_disabled_for_email")
         bases_for_breakout = list(dict.fromkeys([b.upper() for b in (leaders + losers)]))
         if bases_for_breakout:
             sub = _subset_best(best_fut, bases_for_breakout)
@@ -19250,6 +19317,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
     # 4B) Momentum Breakout setups (Engine B) — Balanced
     try:
+        if str(mode or "").lower().strip() == "email":
+            raise RuntimeError("engine_b_disabled_for_email")
         mom_n = max(6, int(n_target) * 2)
         mom = pick_breakout_setups(
             universe_best,  # ✅ restricted universe
@@ -19270,7 +19339,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # add a relaxed 15m pass to avoid starving /screen and email pools.
     # This keeps quality-first behavior, but prevents "no signals" sessions.
     # -----------------------------------------------------
-    if strict_15m and len(priority_setups) < int(max(3, n_target)):
+    if strict_15m and str(mode or "").lower().strip() != "email" and len(priority_setups) < int(max(3, n_target)):
         try:
             if universe_best:
                 tmp = pick_setups(
@@ -19416,6 +19485,11 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # -----------------------------------------------------
     try:
         ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, source=mode, session_name=session_name)[0]]
+    except Exception:
+        pass
+    try:
+        if str(mode or "").lower().strip() == "email":
+            ordered = [s for s in (ordered or []) if str(session_name or "").upper().strip() == "NY" and str(getattr(s, "engine", "") or "").upper().strip() == "A"]
     except Exception:
         pass
 # -----------------------------------------------------
@@ -20980,7 +21054,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
         # -----------------------------------------------------
         setups_by_session: Dict[str, List[Setup]] = {}
-        for sess_name in ["NY", "LON", "ASIA"]:
+        for sess_name in ["NY"]:
             try:
                 pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
             except asyncio.TimeoutError:
@@ -21047,29 +21121,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             sess_name = str(sess.get("name") or "")
-            # Market session label (NY/LON/ASIA) — never show "UNLIMITED" as the session name in email.
-            try:
-                live_sess = current_session_utc(datetime.now(timezone.utc))
-            except Exception:
-                live_sess = "NONE"
-            display_sess = (live_sess if live_sess != "NONE" else "NY") if sess_name == "UNLIMITED" else sess_name
-
-
-            # Unlimited mode => allow setups from ALL sessions (24/7)
-
-            if sess_name == "UNLIMITED":
-
-                setups_all = []
-
-                for _lst in (setups_by_session or {}).values():
-
-                    if _lst:
-
-                        setups_all.extend(list(_lst))
-
-            else:
-
-                setups_all = setups_by_session.get(sess_name, []) or []
+            # Production path intentionally uses NY-only setups for higher-quality execution consistency.
+            display_sess = "NY"
+            setups_all = setups_by_session.get("NY", []) or []
             if not setups_all:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
@@ -21171,7 +21225,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             skip_reasons_counter = Counter()
             eligible: List[Setup] = []
             for s in (setups_all or []):
-                ok, why = is_top_setup_eligible(s, source='email', session_name=sess_name)
+                ok, why = is_executable_setup_eligible(s, session_name="NY")
                 if ok:
                     eligible.append(s)
                 else:
