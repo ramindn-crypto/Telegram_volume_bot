@@ -3875,10 +3875,10 @@ def _autotrade_allowed_session(session_label: str) -> bool:
 def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1) -> list:
     """Return recent OPEN setup candidates for autotrade.
 
-    Sync model:
-    - PRIMARY source of truth = executable_setups (admin executable pool)
-    - SECONDARY source = emailed_setups (what the user actually received)
-    - FALLBACK source = generated_setups(source='email') for backward compatibility
+    Production sync model:
+    - qualification source = emailed_setups (the setup really passed the email pipeline)
+    - live execution source = executable_setups (the explicit queue autotrade may consume)
+    - generated_setups(source='email') = audit/debug correlation only, never a direct trade source
 
     Ordering is newest-first, not confidence-first. That keeps autotrade aligned with the
     newest executable candidate instead of repeatedly re-checking an older higher-conf row.
@@ -3886,7 +3886,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
     Each returned object carries:
       - created_ts: canonical timestamp used for entry deadline enforcement
       - email_logged_ts / generated_logged_ts: debug timestamps for /autotrade_last
-      - source_kind: 'executable_setups' | 'emailed_setups' | 'generated_setups'
+      - source_kind: 'executable_setups'
       - source_session: session recorded when the row was logged
     """
     try:
@@ -3965,24 +3965,26 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                 ))
             return out
 
-        # 1) Primary: executable pool, newest first.
+        # 1) Live execution source: executable rows that also have a successful emailed row.
+        #    This keeps autotrade aligned with the real delivered setup pipeline.
         cur.execute(
             """
             SELECT x.setup_id,
                    MAX(x.executable_ts) AS executable_ts,
-                   MAX(COALESCE(e.emailed_ts, 0.0)) AS emailed_ts,
+                   MAX(e.emailed_ts) AS emailed_ts,
                    MAX(COALESCE(x.session, e.session, g.session, '')) AS src_session
             FROM executable_setups x
+            INNER JOIN emailed_setups e
+                    ON e.user_id = x.user_id
+                   AND e.setup_id = x.setup_id
             LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
-            LEFT JOIN emailed_setups e
-                   ON e.user_id = x.user_id
-                  AND e.setup_id = x.setup_id
             LEFT JOIN generated_setups g
                    ON g.user_id = x.user_id
                   AND g.setup_id = x.setup_id
                   AND g.source = 'email'
             WHERE x.user_id = ?
               AND x.executable_ts >= ?
+              AND e.emailed_ts > 0
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
             GROUP BY x.setup_id
             ORDER BY executable_ts DESC, emailed_ts DESC, x.setup_id DESC
@@ -4013,56 +4015,9 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             con.close()
             return out
 
-        # 2) Secondary: exact emailed rows, newest first.
-        cur.execute(
-            """
-            SELECT e.setup_id,
-                   MAX(e.emailed_ts) AS emailed_ts,
-                   MAX(g.created_ts) AS generated_ts,
-                   MAX(COALESCE(e.session, g.session, '')) AS src_session
-            FROM emailed_setups e
-            LEFT JOIN signal_outcomes o ON o.setup_id = e.setup_id
-            LEFT JOIN generated_setups g
-                   ON g.user_id = e.user_id
-                  AND g.setup_id = e.setup_id
-                  AND g.source = 'email'
-            WHERE e.user_id = ?
-              AND e.emailed_ts >= ?
-              AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-            GROUP BY e.setup_id
-            ORDER BY emailed_ts DESC, generated_ts DESC, e.setup_id DESC
-            LIMIT ?
-            """,
-            (int(uid), float(cutoff), int(limit)),
-        )
-        rows = cur.fetchall() or []
-        out = sorted(_load_signals(rows, 'emailed_setups'), key=lambda x: float(getattr(x, 'created_ts', 0.0) or 0.0), reverse=True)
-        if out:
-            try:
-                for item in out:
-                    _admin_setup_lifecycle_merge(
-                        int(uid),
-                        str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or ''),
-                        session=str(getattr(item, 'source_session', '') or session_label or ''),
-                        symbol=str(getattr(item, 'symbol', '') or ''),
-                        side=str(getattr(item, 'side', '') or ''),
-                        executable_ts=float(time.time()),
-                        state='executable_pending',
-                        source_kind=str(getattr(item, 'source_kind', '') or 'emailed_setups'),
-                        signal_created_ts=float(getattr(item, 'signal_created_ts', 0.0) or 0.0),
-                        emailed_ts=float(getattr(item, 'email_logged_ts', 0.0) or 0.0),
-                        generated_logged_ts=float(getattr(item, 'generated_logged_ts', 0.0) or 0.0),
-                    )
-            except Exception:
-                pass
-            con.close()
-            return out
-
-        # 3) No legacy generated_setups fallback here.
-        # AutoTrade must only consume setups that were confirmed as emailed successfully
-        # (executable_setups primary, emailed_setups secondary). Using generated_setups
-        # alone can resurrect unsent / partially logged setups and create execution drift
-        # versus the actual email pipeline.
+        # 2) No fallback to emailed_setups or generated_setups here.
+        # Live autotrade must consume only the explicit executable queue, and each row
+        # in that queue must also have a successful emailed_setups record.
         con.close()
         return []
     except Exception as e:
@@ -4335,6 +4290,16 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
     if stop_distance <= 0:
         return (False, 'stop_distance_zero_or_invalid')
+    if math.isfinite(remaining_risk) and remaining_risk <= 0:
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'daily_remaining_risk_zero'})
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason='daily_remaining_risk_zero')
+        except Exception:
+            pass
+        return (False, 'daily_remaining_risk_zero')
     if allowed_risk_usd <= 0:
         try:
             _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason='daily_risk_cap_reached')
