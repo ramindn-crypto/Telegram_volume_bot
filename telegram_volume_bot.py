@@ -11772,7 +11772,6 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Weighted TP-stage WR: {float(overall_sig.get('weighted_win_rate') or 0.0):.1f}%",
         f"Trend vs prior 7d: overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')} | NY {str(trend.get('ny_7d') or trend.get('ny') or 'n/a')}",
         f"Latest optimizer result: {'PROMOTED TO LIVE PARAMS' if opt_live else 'NO NEW LIVE PARAMS PROMOTED'}",
-        f"Estimator snapshot: overall {float(overall.get('estimated_wr', 0.0) or 0.0):.1f}% | NY {float(ny.get('estimated_wr', 0.0) or 0.0):.1f}%",
         f"Detailed learning view: /learning_status",
     ]
     await send_long_message(update, "\n".join(lines), parse_mode=None)
@@ -15930,8 +15929,6 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows)",
     "autotrade_report_overall": "AutoTrade overall performance summary",
     "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
-    "performance_chart": "Send overall equity + daily PnL chart",
-    "winrate_chart": "Send overall win-rate trend chart",
     "autotrade_sessions": "Show or set allowed auto-trade sessions",
     "open_trades": "Show live open Bybit positions",
     "cooldown_clear": "Clear cooldown for one symbol + side",
@@ -15955,7 +15952,7 @@ ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned", "email_decision"]),
-    ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall", "performance_chart", "winrate_chart"]),
+    ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "autotrade_sessions", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
@@ -15975,20 +15972,6 @@ def build_help_text_admin() -> str:
     registered = _registered_command_names_from_source()
     lines = [
         "🛠 PulseFutures — Admin Command Guide",
-        "",
-        "Admin commands are powerful. Use carefully.",
-        "Not financial advice.",
-        "",
-        f"Admin day boundary is fixed to the Asia-session start ({ADMIN_ASIA_DAY_START_HHMM} UTC) for all autotrade daily metrics.",
-        "",
-        "Admin status/debug fields now mean:",
-        "• Opened today = bot positions opened inside the current Asia-session day",
-        "• Closed today = bot positions closed inside the current Asia-session day",
-        "• Carried from prior day = still-open positions opened before today",
-        "• Current-day open risk = only risk from positions opened today",
-        "• Carried open risk = inherited exposure still open now",
-        "• Daily risk used today = live open risk charged today minus realised net PnL booked today",
-        "• Daily risk remaining for new trades = daily cap minus daily risk used today (profits restore capacity, losses reduce it)",
     ]
 
     for title, commands in ADMIN_HELP_GROUPS:
@@ -16003,7 +15986,6 @@ def build_help_text_admin() -> str:
             lines.append("")
 
     return "\n".join(lines).rstrip()
-
 
 HELP_TEXT = build_help_text()
 
@@ -18482,24 +18464,6 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
     evaluated = len(rows)
     coverage = (evaluated / total * 100.0) if total > 0 else 0.0
 
-    table_rows = []
-    try:
-        owner_user = get_user(target_uid) or {}
-        tz = ZoneInfo(str(owner_user.get('tz') or 'UTC'))
-    except Exception:
-        tz = timezone.utc
-    for r in rows[-40:]:
-        ts = float(r.get('emailed_ts') or 0.0)
-        tstr = datetime.fromtimestamp(ts, tz).strftime('%m-%d %H:%M') if ts > 0 else '-'
-        sig = db_get_signal(str(r.get('setup_id') or '').strip()) or {}
-        table_rows.append([
-            str(r.get('session') or '?'),
-            tstr,
-            f"{str(sig.get('side') or '?').upper()} {str(sig.get('symbol') or '?')}",
-            int(sig.get('conf') or 0) if sig.get('conf') is not None else '-',
-            _canon_signal_outcome_label(r.get('outcome')),
-        ])
-
     lines = [
         '📈 Signal Report — Overall',
         HDR,
@@ -18510,15 +18474,11 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         f'Wins (TP2): {int(stats.get("wins") or 0)} | Losses: {int(stats.get("losses") or 0)} | Signal WR: {float(stats.get("win_rate") or 0.0):.1f}%',
         f'TP1: {counts.get("TP1",0)} | TP2: {counts.get("TP2",0)} | SL: {counts.get("SL",0)} | Open: {counts.get("OPEN",0)}',
     ]
-    if table_rows:
-        table = tabulate(table_rows, headers=['Session','Time','Trade','Confidence','Outcome'], tablefmt='plain', colalign=('left','left','left','right','left'))
-        lines.extend([SEP, '<pre>' + html.escape(table) + '</pre>'])
     if by_session:
         lines.extend([SEP, 'By session'])
         for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
             lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)}")
-    await send_long_message(update, '\n'.join(lines), parse_mode=ParseMode.HTML)
-
+    await send_long_message(update, '\n'.join(lines), parse_mode=None)
 
 async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/autotrade_report [hours] — compact live journal view."""
@@ -22634,9 +22594,6 @@ def main():
     app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
     app.add_handler(CommandHandler("performance_report", performance_report_cmd, block=False))
-    app.add_handler(CommandHandler("performance_chart", performance_chart_cmd, block=False))
-    app.add_handler(CommandHandler("winrate_chart", winrate_chart_cmd, block=False))
-    app.add_handler(CommandHandler("winrate_chrt", winrate_chart_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
