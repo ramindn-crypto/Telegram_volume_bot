@@ -4255,6 +4255,25 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         live_open_count = int(mday.get('open_positions_now') or 0)
     except Exception:
         live_open_count = 0
+    try:
+        opened_today_count = int(mday.get('opened_today_count') or 0)
+    except Exception:
+        opened_today_count = 0
+    try:
+        admin_user = get_user(int(uid)) or {}
+        max_trades_day_limit = int(admin_user.get('max_trades_day') or 0)
+    except Exception:
+        max_trades_day_limit = 0
+    if max_trades_day_limit > 0 and opened_today_count >= max_trades_day_limit:
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_trades_day_reached', 'opened_today_count': int(opened_today_count), 'max_trades_day': int(max_trades_day_limit)})
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'max_trades_day_reached ({opened_today_count}/{max_trades_day_limit})')
+        except Exception:
+            pass
+        return (False, 'max_trades_day_reached')
     if int(AUTOTRADE_MAX_OPEN_TRADES or 0) > 0 and live_open_count >= int(AUTOTRADE_MAX_OPEN_TRADES):
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_open_trades_reached', 'open_positions_now': int(live_open_count)})
@@ -7742,8 +7761,9 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["over_by"] = max(0.0, -rem) if math.isfinite(rem) and snap["cap"] > 0 else 0.0
         snap["pnl_today"] = float(m.get("realized_pnl_today") or 0.0)
         snap["trades_today"] = int(m.get("opened_today_count") or 0)
-        snap["trades_today_limit"] = 0
-        snap["remaining_new_positions_today"] = 0
+        admin_trade_limit = int(user.get("max_trades_day") or 0)
+        snap["trades_today_limit"] = admin_trade_limit
+        snap["remaining_new_positions_today"] = max(0, admin_trade_limit - int(snap["trades_today"])) if admin_trade_limit > 0 else 0
     else:
         cap = float(daily_cap_usd(user) or 0.0)
         pnl_today = float(_pnl_today_closed_trades(uid, user) or 0.0)
