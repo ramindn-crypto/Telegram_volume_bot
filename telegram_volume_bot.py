@@ -1430,6 +1430,9 @@ AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT"
 AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "3") or 3)
 # Open-trade count cap for commercial/live safety.
 AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "3") or 3)
+EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
+
 
 # Margin / leverage
 AUTOTRADE_ISOLATED = str(os.environ.get("AUTOTRADE_ISOLATED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
@@ -13689,6 +13692,23 @@ def is_top_setup_eligible(
     except Exception:
         return (False, "eligibility_exception")
 
+def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]:
+    """Session-aware production thresholds.
+
+    NY remains the preferred execution window, but London and Asia are still allowed
+    with slightly stricter requirements so the bot can surface high-quality global crypto
+    opportunities without turning the email/autotrade lane noisy.
+    """
+    sess = str(session_name or "").upper().strip()
+    if sess == "NY":
+        return (70.0, 78, 2.00)
+    if sess == "LON":
+        return (72.0, 80, 2.10)
+    if sess == "ASIA":
+        return (74.0, 82, 2.20)
+    return (72.0, 80, 2.10)
+
+
 def is_executable_setup_eligible(
     s: "Setup",
     session_name: str = "NY",
@@ -13698,44 +13718,67 @@ def is_executable_setup_eligible(
 ) -> tuple[bool, str]:
     """Production-grade gate for email/executable/autotrade path.
 
-    Keeps the sellable/live path intentionally narrower than /screen:
-    - NY only
-    - Engine A only (pullback / reclaim / rejection style)
-    - stronger quality + confidence floors
-    - final RR floor
+    Best-practice approach:
+    - allow the configured live session (ASIA/LON/NY), not NY-only
+    - keep Engine A as the default/highest-trust source
+    - allow Engine B breakouts only with *stricter* score/conf/RR/liquidity rules
+    - keep the sellable/live path tighter than /screen
     """
     try:
         sess = str(session_name or "").upper().strip()
-        if sess != "NY":
-            return (False, "session_not_ny")
+        if sess not in {"ASIA", "LON", "NY"}:
+            return (False, "session_not_supported")
 
         ok, why = is_top_setup_eligible(s, source='email', session_name=sess)
         if not ok:
             return (False, f"base_gate_{why}")
 
-        engine = str(getattr(s, "engine", "") or "").upper().strip()
-        if engine != "A":
-            return (False, "engine_not_a")
+        sess_quality, sess_conf, sess_rr = _execution_session_thresholds(sess)
+        score_floor = float(max(min_quality, QUALITY_SCORE_MIN_EMAIL, sess_quality))
+        conf_floor = int(max(min_conf, MIN_SETUP_CONF, sess_conf))
+        rr_floor = float(max(min_rr_final, sess_rr))
 
         score = float(getattr(s, "quality_score", 0.0) or 0.0)
-        if score < float(max(min_quality, QUALITY_SCORE_MIN_EMAIL)):
+        if score < score_floor:
             return (False, "below_exec_quality")
 
         conf = int(getattr(s, "conf", 0) or 0)
-        if conf < int(max(min_conf, MIN_SETUP_CONF)):
+        if conf < conf_floor:
             return (False, "below_exec_conf")
 
         entry = float(getattr(s, "entry", 0.0) or 0.0)
         sl = float(getattr(s, "sl", 0.0) or 0.0)
         final_tp = float(getattr(s, "tp2", 0.0) or getattr(s, "tp3", 0.0) or 0.0)
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
-        if rr_final < float(min_rr_final):
+        if rr_final < rr_floor:
             return (False, "below_exec_rr")
 
-        if not bool(getattr(s, "pullback_ready", False)):
-            return (False, "pullback_not_ready")
+        engine = str(getattr(s, "engine", "") or "").upper().strip()
+        fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
 
-        return (True, "ok")
+        if engine == "A":
+            if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
+                return (False, "pullback_not_ready")
+            return (True, "ok")
+
+        if engine == "B":
+            if not bool(EXECUTION_ENGINE_B_EMAIL_ENABLED):
+                return (False, "engine_b_disabled")
+            if score < (score_floor + 3.0):
+                return (False, "engine_b_below_quality")
+            if conf < (conf_floor + 2):
+                return (False, "engine_b_below_conf")
+            if rr_final < (rr_floor + 0.15):
+                return (False, "engine_b_below_rr")
+            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.5, 12_000_000.0)):
+                return (False, "engine_b_below_liquidity")
+            ch1 = abs(float(getattr(s, "ch1", 0.0) or 0.0))
+            ch4 = abs(float(getattr(s, "ch4", 0.0) or 0.0))
+            if ch1 < 0.8 or ch4 < 1.5:
+                return (False, "engine_b_trend_not_strong_enough")
+            return (True, "ok")
+
+        return (False, "engine_not_supported")
     except Exception:
         return (False, "exec_eligibility_exception")
 
@@ -19224,8 +19267,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # ------------------------------------------------
     breakout_setups = []
     try:
-        if str(mode or "").lower().strip() == "email":
-            raise RuntimeError("engine_b_disabled_for_email")
         bases_for_breakout = list(dict.fromkeys([b.upper() for b in (leaders + losers)]))
         if bases_for_breakout:
             sub = _subset_best(best_fut, bases_for_breakout)
@@ -19317,8 +19358,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
     # 4B) Momentum Breakout setups (Engine B) — Balanced
     try:
-        if str(mode or "").lower().strip() == "email":
-            raise RuntimeError("engine_b_disabled_for_email")
         mom_n = max(6, int(n_target) * 2)
         mom = pick_breakout_setups(
             universe_best,  # ✅ restricted universe
@@ -21054,7 +21093,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
         # -----------------------------------------------------
         setups_by_session: Dict[str, List[Setup]] = {}
-        for sess_name in ["NY"]:
+        for sess_name in (EMAIL_BUILD_SESSIONS or ["ASIA", "LON", "NY"]):
             try:
                 pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
             except asyncio.TimeoutError:
@@ -21120,10 +21159,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 }
                 continue
 
-            sess_name = str(sess.get("name") or "")
-            # Production path intentionally uses NY-only setups for higher-quality execution consistency.
-            display_sess = "NY"
-            setups_all = setups_by_session.get("NY", []) or []
+            sess_name = str(sess.get("name") or "").upper()
+            display_sess = sess_name
+            setups_all = setups_by_session.get(sess_name, []) or []
             if not setups_all:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
@@ -21225,7 +21263,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             skip_reasons_counter = Counter()
             eligible: List[Setup] = []
             for s in (setups_all or []):
-                ok, why = is_executable_setup_eligible(s, session_name="NY")
+                ok, why = is_executable_setup_eligible(s, session_name=sess_name)
                 if ok:
                     eligible.append(s)
                 else:
