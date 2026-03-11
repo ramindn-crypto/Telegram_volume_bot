@@ -1,7 +1,7 @@
 # CHANGE SUMMARY
 # - Simplified /learning_status, /autotrade_debug, and /autotrade_last outputs.
 # - Daily risk remaining now restores capacity from positive realized PnL and reduces it from losses.
-# - /performance_report and /autotrade_report_overall now include staged weighted win-rate logic.
+# - /performance_report and /autotrade_report_overall now use the canonical 2-TP outcome model for reporting.
 # - Added /performance_chart and /winrate_chart plus admin help entries.
 
 
@@ -2150,6 +2150,11 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         atr_pct = float(trade_row.get('atr_pct') or 0.0)
         sess = str(trade_row.get('session') or '').upper().strip()
         if AUTOTRADE_BE_AFTER_TP1_ENABLED and entry > 0 and final_tp > 0 and initial_qty > 0 and live_qty > 0:
+            # Production-safe TP1 -> risk-free handling:
+            # - TP1 is executed as a separate reduce-only limit order for a partial close.
+            # - After that partial fill is visible via reduced live position size, the remaining
+            #   position stop is moved to entry (breakeven) only when the configured filters allow it.
+            # - This is an active live-management rule, not just a learning note.
             tp1_hit = live_qty <= max(initial_qty * 0.45, initial_qty * (1.0 - float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION) + 0.08))
             sl_at_be = _price_close_enough(current_sl, entry)
             be_allowed = conf >= int(AUTOTRADE_BE_AFTER_TP1_MIN_CONF) and (atr_pct <= float(AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT) if atr_pct > 0 else True) and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS or sess in AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS)
@@ -11823,15 +11828,20 @@ def _canonical_signal_outcome_for_setup(user_id: int, setup_id: str) -> tuple[st
     life = _admin_setup_lifecycle_get(sid) if sid else {}
     trade = None
     trade_id = str((life or {}).get('trade_id') or '').strip()
-    if trade_id:
+
+    def _load_trade(_trade_id: str):
+        if not _trade_id:
+            return None
         try:
             with sqlite3.connect(DB_PATH) as conn:
                 conn.row_factory = sqlite3.Row
                 cur = conn.cursor()
-                row = cur.execute("SELECT * FROM autotrade_trades WHERE trade_id=? LIMIT 1", (trade_id,)).fetchone()
-                trade = dict(row) if row else None
+                row = cur.execute("SELECT * FROM autotrade_trades WHERE trade_id=? LIMIT 1", (_trade_id,)).fetchone()
+                return dict(row) if row else None
         except Exception:
-            trade = None
+            return None
+
+    trade = _load_trade(trade_id)
     if trade:
         status = str(trade.get('status') or '').upper().strip()
         if status == 'OPEN':
@@ -11839,6 +11849,13 @@ def _canonical_signal_outcome_for_setup(user_id: int, setup_id: str) -> tuple[st
                 pos = _autotrade_find_live_position(str(trade.get('symbol') or ''), side=str(trade.get('side') or ''))
                 if pos:
                     return 'OPEN', {'source': 'live_position', 'trade': trade, 'lifecycle': life}
+                try:
+                    _autotrade_sync_closed_trades_from_exchange(int(user_id), lookback_days=30)
+                    refreshed = _load_trade(trade_id)
+                    if refreshed and (str(refreshed.get('status') or '').upper().strip() == 'CLOSED' or float(refreshed.get('closed_ts') or 0.0) > 0):
+                        return _canon_outcome_from_autotrade_trade(refreshed), {'source': 'autotrade_trade_sync', 'trade': refreshed, 'lifecycle': life}
+                except Exception:
+                    pass
             return 'OPEN', {'source': 'autotrade_open_trade', 'trade': trade, 'lifecycle': life}
         if status == 'CLOSED' or float(trade.get('closed_ts') or 0.0) > 0:
             return _canon_outcome_from_autotrade_trade(trade), {'source': 'autotrade_trade', 'trade': trade, 'lifecycle': life}
@@ -12297,33 +12314,47 @@ def _simple_line_chart_png(series_map: list[tuple[str, list[tuple[str, float]]]]
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
+
+        cleaned_series = []
         all_labels = []
-        for _name, pts in (series_map or []):
-            if pts:
-                all_labels = [str(x) for x, _ in pts]
-                break
-        if not all_labels:
-            all_labels = ['N/A']
-            series_map = [('Series', [('N/A', 0.0)])]
-        fig, ax = plt.subplots(figsize=(11, 5.5))
         for name, pts in (series_map or []):
-            xs = [str(x) for x, _ in (pts or [])] or all_labels
-            ys = [float(y or 0.0) for _, y in (pts or [])] or [0.0 for _ in all_labels]
-            if len(xs) != len(ys):
-                n = min(len(xs), len(ys))
-                xs, ys = xs[:n], ys[:n]
+            clean_pts = []
+            for x, y in (pts or []):
+                try:
+                    yv = float(y or 0.0)
+                    if not math.isfinite(yv):
+                        yv = 0.0
+                    clean_pts.append((str(x), yv))
+                except Exception:
+                    continue
+            if clean_pts:
+                cleaned_series.append((str(name), clean_pts))
+                if not all_labels:
+                    all_labels = [x for x, _ in clean_pts]
+        if not cleaned_series:
+            cleaned_series = [('Series', [('N/A', 0.0)])]
+            all_labels = ['N/A']
+
+        fig, ax = plt.subplots(figsize=(11, 5.5))
+        x_index = {lab: idx for idx, lab in enumerate(all_labels)}
+        for name, pts in cleaned_series:
+            xs = [x_index.get(x, i) for i, (x, _y) in enumerate(pts)]
+            ys = [float(y) for _x, y in pts]
             if not xs:
-                xs, ys = ['N/A'], [0.0]
+                xs, ys = [0], [0.0]
             ax.plot(xs, ys, linewidth=2, marker='o', markersize=3, label=str(name))
+
         ax.set_title(str(title))
         ax.set_xlabel('Trading day')
         ax.set_ylabel(str(ylabel))
         ax.grid(True, alpha=0.3)
-        if len(all_labels) > 10:
+        ax.set_xticks(list(range(len(all_labels))))
+        ax.set_xticklabels(all_labels)
+        if len(all_labels) > 8:
             for label in ax.get_xticklabels():
                 label.set_rotation(45)
                 label.set_horizontalalignment('right')
-        if len(series_map or []) > 1:
+        if len(cleaned_series) > 1:
             ax.legend()
         fig.tight_layout()
         out = f'/mnt/data/{out_prefix}_{int(time.time())}.png'
@@ -12354,7 +12385,7 @@ async def performance_chart_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     owner_user = _autotrade_user_settings(uid)
     equity_now = _effective_equity_for_risk(owner_user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
     days = _autotrade_history_days_available(uid)
-    rows = _autotrade_performance_rows(uid, days=days)
+    rows = _autotrade_performance_rows(uid, days=max(7, days))
     if not rows:
         rows = [{'day': lab, 'net_pnl': 0.0} for lab in _last_n_anchored_day_labels(uid, max(7, days))]
     chart = _build_performance_chart_png(rows, equity=float(equity_now or 0.0))
@@ -15903,7 +15934,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "learning_status": "Detailed learning and optimizer status with synced signal WR",
     "optimizer_status": "Alias of /learning_status",
     "winrate": "Overall and last-7-days completed signal WR",
-    "ny_winrate": "Overall and last-7-days NY completed signal WR",
+    "ny_winrate": "Overall NY completed signal WR",
     "lessons_learned": "Latest learning takeaways",
     "email_decision": "Last email pipeline decision",
     "signal_report": "Recent emailed setup outcomes",
@@ -15914,8 +15945,8 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows)",
     "autotrade_report_overall": "AutoTrade overall performance summary",
     "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
-    "performance_chart": "Send equity + daily PnL chart (overall / 30d / 7d)",
-    "winrate_chart": "Send weighted signal win-rate trend chart (overall / 30d / 7d)",
+    "performance_chart": "Send overall equity + daily PnL chart",
+    "winrate_chart": "Send overall win-rate trend chart",
     "autotrade_sessions": "Show or set allowed auto-trade sessions",
     "open_trades": "Show live open Bybit positions",
     "cooldown_clear": "Clear cooldown for one symbol + side",
@@ -18318,7 +18349,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     header = [
         f"📊 Signal Report (last {lookback_h}h)",
         HDR,
-        f"Total: {len(rows)} | Decided: {int(stats.get('decided') or 0)} | Wins: {int(stats.get('wins') or 0)} | Losses: {int(stats.get('losses') or 0)} | Win rate: {float(stats.get('win_rate') or 0.0):.1f}%",
+        f"Total: {len(rows)} | Decided: {int(stats.get('decided') or 0)} | Wins (TP2): {int(stats.get('wins') or 0)} | Losses: {int(stats.get('losses') or 0)} | Win rate: {float(stats.get('win_rate') or 0.0):.1f}%",
         f"TP1: {counts.get('TP1',0)} | TP2: {counts.get('TP2',0)} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)}",
         HDR,
     ]
@@ -18491,7 +18522,7 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         f'Evaluated: {evaluated} ({coverage:.1f}% coverage)',
         SEP,
         f'Completed outcomes: {int(stats.get("decided") or 0)}',
-        f'Wins: {int(stats.get("wins") or 0)} | Losses: {int(stats.get("losses") or 0)} | Signal WR: {float(stats.get("win_rate") or 0.0):.1f}%',
+        f'Wins (TP2): {int(stats.get("wins") or 0)} | Losses: {int(stats.get("losses") or 0)} | Signal WR: {float(stats.get("win_rate") or 0.0):.1f}%',
         f'TP1: {counts.get("TP1",0)} | TP2: {counts.get("TP2",0)} | SL: {counts.get("SL",0)} | Open: {counts.get("OPEN",0)}',
     ]
     if table_rows:
@@ -18676,7 +18707,7 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
         f"Closed trades: {int(overall_summary.get('closed') or 0)} | Wins: {int(overall_summary.get('wins') or 0)} | Losses: {int(overall_summary.get('losses') or 0)}",
         f"Net PnL: ${float(overall_summary.get('net') or 0.0):+.2f} | Profit factor: {_pf_txt(overall_summary.get('profit_factor'))} | Expectancy: ${float(overall_summary.get('expectancy') or 0.0):+.2f}",
         f"Realized WR: {float(overall_summary.get('win_rate') or 0.0):.1f}% | Weighted TP WR: {float(weighted_overall.get('weighted_win_rate') or 0.0):.1f}%",
-        f"TP mix: TP1-only {int(weighted_overall.get('tp1_only') or 0)} | TP2+ {int(weighted_overall.get('tp2_plus') or 0)} | TP3 {int(weighted_overall.get('tp3') or 0)} | SL {int(weighted_overall.get('losses') or 0)}",
+        f"TP mix: TP1 {int(weighted_overall.get('tp1_only') or 0)} | TP2 {int(weighted_overall.get('tp2_plus') or 0)} | SL {int(weighted_overall.get('losses') or 0)} | OPEN {int(weighted_overall.get('open') or 0)}",
     ]
     bd = overall_summary.get('best_day') or {}
     wd = overall_summary.get('worst_day') or {}
@@ -18689,7 +18720,7 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
         SEP,
         f'RECENT ({days} day window)',
         f"Closed: {int(recent_summary.get('closed') or 0)} | Net PnL: ${float(recent_summary.get('net') or 0.0):+.2f} | Realized WR: {float(recent_summary.get('win_rate') or 0.0):.1f}%",
-        f"Weighted TP WR: {float(weighted_recent.get('weighted_win_rate') or 0.0):.1f}% | TP1-only {int(weighted_recent.get('tp1_only') or 0)} | TP2+ {int(weighted_recent.get('tp2_plus') or 0)} | TP3 {int(weighted_recent.get('tp3') or 0)} | SL {int(weighted_recent.get('losses') or 0)}",
+        f"Weighted TP WR: {float(weighted_recent.get('weighted_win_rate') or 0.0):.1f}% | TP1 {int(weighted_recent.get('tp1_only') or 0)} | TP2 {int(weighted_recent.get('tp2_plus') or 0)} | SL {int(weighted_recent.get('losses') or 0)} | OPEN {int(weighted_recent.get('open') or 0)}",
         SEP,
         'Daily trend',
     ])
@@ -18921,7 +18952,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
         lines.extend(["", "Session breakdown:"])
         for sess, item in sorted(by_session.items()):
             lines.append(
-                f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | weighted WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP1-only {int(item.get('tp1_only') or 0)} TP2+ {int(item.get('tp2_plus') or 0)} TP3 {int(item.get('tp3') or 0)} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
+                f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP1 {int(item.get('tp1_only') or 0)} TP2 {int(item.get('tp2_plus') or 0)} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
             )
 
     await update.message.reply_text("\n".join(lines))
