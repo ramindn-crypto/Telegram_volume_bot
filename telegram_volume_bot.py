@@ -1020,6 +1020,19 @@ def _strategy_config_defaults() -> dict:
             "atr_min_pct": [0.4, 1.5],
             "min_rr_tp3": [1.3, 2.4],
         },
+
+        # Zero-touch autopilot optimizer windows
+        "autotune_windows": [
+            {"days": 7, "end_days_ago": 0},
+            {"days": 14, "end_days_ago": 0},
+            {"days": 21, "end_days_ago": 0},
+            {"days": 30, "end_days_ago": 0},
+        ],
+        "autotune_shortlist": 10,
+        "autotune_min_positive_windows": 3,
+        "autotune_min_window_wr": 52.0,
+        "autotune_consistency_penalty": 2.0,
+        "autotune_learning_guard_enabled": True,
     }
 
 _STRATEGY_CFG_CACHE = {"ts": 0.0, "cfg": None}
@@ -5441,6 +5454,7 @@ def _learning_status_text() -> str:
         f"• Runtime parameter changes: {'YES' if optimizer_live_changes or opt_promoted else 'YES, but no change has been promoted yet'}",
         "• Closed-trade PnL is already used automatically for day-risk accounting and admin reports.",
         "• TP-stage learning is automatic through stored signal outcomes and now feeds the live conditional break-even-after-TP1 rule.",
+        "• Zero-touch autopilot now re-tests shortlisted parameter sets across 7d / 14d / 21d / 30d windows before any live promotion.",
         "• The bot does NOT rewrite its own source code or GitHub file.",
     ])
 
@@ -9949,237 +9963,409 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
 
     return setups
 
-def _simulate_one_setup(ohlcv: list, start_i: int, setup: "Setup", max_bars: int = 96) -> dict:
-    """Simulate TP3 vs SL only (fast). Returns dict outcome + R multiple."""
-    entry = float(getattr(setup, "entry", 0.0) or 0.0)
-    sl = float(getattr(setup, "sl", 0.0) or 0.0)
-    tp = float(getattr(setup, "tp3", 0.0) or 0.0)
-    side = str(getattr(setup, "side", "") or "").upper()
+def _tp_split_two_target() -> tuple[float, float]:
+    """Collapse any configured TP split into canonical 2-target weights."""
+    try:
+        raw = list(AUTOTRADE_TP_SPLIT or [0.5, 0.5, 0.0])
+    except Exception:
+        raw = [0.5, 0.5, 0.0]
+    while len(raw) < 3:
+        raw.append(0.0)
+    w1 = float(raw[0] or 0.0)
+    w2 = float(raw[1] or 0.0) + float(raw[2] or 0.0)
+    s = w1 + w2
+    if s <= 0:
+        return 0.5, 0.5
+    return float(w1 / s), float(w2 / s)
+
+
+def _parse_days_ago(s: str | int | float | None) -> int:
+    try:
+        x = str(s or '0').strip().lower().replace('ago', '').replace('d', '')
+        return max(0, min(365, int(float(x))))
+    except Exception:
+        return 0
+
+
+def _backtest_window_bounds(days: int, end_days_ago: int = 0, warmup_bars: int = 300, tf: str = '1h') -> tuple[int, int, int, int]:
+    """Return (since_ms, until_ms, eval_since_ms, eval_until_ms)."""
+    now_ms = int(time.time() * 1000)
+    d = max(1, int(days or 1))
+    ago = max(0, int(end_days_ago or 0))
+    tf_min = max(1, _tf_to_minutes(tf))
+    eval_until_ms = now_ms - (ago * 86400 * 1000)
+    eval_since_ms = eval_until_ms - (d * 86400 * 1000)
+    warmup_ms = int(max(50, warmup_bars) * tf_min * 60 * 1000)
+    since_ms = max(0, eval_since_ms - warmup_ms)
+    until_ms = eval_until_ms
+    return int(since_ms), int(until_ms), int(eval_since_ms), int(eval_until_ms)
+
+
+def _simulate_one_setup(
+    ohlcv: list,
+    start_i: int,
+    setup: "Setup",
+    max_bars: int = 96,
+    move_sl_to_be_after_tp1: bool = True,
+) -> dict:
+    """Simulate canonical 2-TP behavior (TP1, TP2, SL, OPEN/TIMEOUT).
+
+    R multiple is weighted using the live TP split collapsed into two targets.
+    If TP1 is hit and BE-after-TP1 is enabled, the remaining size is assumed to be
+    protected at entry for the rest of the trade.
+    """
+    entry = float(getattr(setup, 'entry', 0.0) or 0.0)
+    sl = float(getattr(setup, 'sl', 0.0) or 0.0)
+    side = str(getattr(setup, 'side', '') or '').upper()
+    tp1 = float(getattr(setup, 'tp1', 0.0) or 0.0)
+    tp2 = float(getattr(setup, 'tp2', 0.0) or getattr(setup, 'tp3', 0.0) or 0.0)
+    tp1, tp2, _ = _ensure_three_tps(entry, sl, float(tp2 or 0.0), tp1, tp2, side)
 
     R = abs(entry - sl)
-    if entry <= 0 or sl <= 0 or tp <= 0 or R <= 0:
-        return {"outcome": "INVALID", "R": 0.0, "bars": 0}
+    if entry <= 0 or sl <= 0 or tp1 <= 0 or tp2 <= 0 or R <= 0:
+        return {'outcome': 'INVALID', 'R': 0.0, 'bars': 0, 'hit_tp1': False, 'hit_tp2': False}
 
+    w1, w2 = _tp_split_two_target()
+    rr1 = float(rr_to_tp(entry, sl, tp1) or 0.0)
+    rr2 = float(rr_to_tp(entry, sl, tp2) or 0.0)
     end = min(len(ohlcv), start_i + max_bars)
+
+    tp1_hit = False
+    remaining_sl = sl
+    realized_r = 0.0
+
     for j in range(start_i, end):
         h = float(ohlcv[j][2]); l = float(ohlcv[j][3])
-        if side == "BUY":
-            hit_sl = l <= sl
-            hit_tp = h >= tp
+        if side == 'BUY':
+            hit_sl = l <= remaining_sl
+            hit1 = h >= tp1
+            hit2 = h >= tp2
         else:
-            hit_sl = h >= sl
-            hit_tp = l <= tp
+            hit_sl = h >= remaining_sl
+            hit1 = l <= tp1
+            hit2 = l <= tp2
 
-        # If both hit in same bar, assume worst-case (conservative)
-        if hit_sl and hit_tp:
-            return {"outcome": "SL_FIRST", "R": -1.0, "bars": j - start_i + 1}
-        if hit_sl:
-            return {"outcome": "SL", "R": -1.0, "bars": j - start_i + 1}
-        if hit_tp:
-            rr = rr_to_tp(entry, sl, tp)
-            return {"outcome": "TP3", "R": float(rr), "bars": j - start_i + 1}
+        if not tp1_hit:
+            if hit_sl and (hit1 or hit2):
+                return {'outcome': 'SL_FIRST', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_tp2': False}
+            if hit_sl:
+                return {'outcome': 'SL', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_tp2': False}
+            if hit2:
+                return {'outcome': 'TP2', 'R': float((w1 * rr1) + (w2 * rr2)), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': True}
+            if hit1:
+                tp1_hit = True
+                realized_r += float(w1 * rr1)
+                if move_sl_to_be_after_tp1:
+                    remaining_sl = entry
+                continue
+        else:
+            if hit2:
+                return {'outcome': 'TP2', 'R': float(realized_r + (w2 * rr2)), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': True}
+            if hit_sl:
+                if move_sl_to_be_after_tp1:
+                    return {'outcome': 'TP1_BE', 'R': float(realized_r), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': False}
+                return {'outcome': 'TP1_SL', 'R': float(realized_r - w2), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': False}
 
-    # timed out: mark-to-market at last close
-    c = float(ohlcv[end-1][4])
-    if side == "BUY":
-        r = (c - entry) / R
-    else:
-        r = (entry - c) / R
-    return {"outcome": "TIMEOUT", "R": float(r), "bars": end - start_i}
+    c = float(ohlcv[end - 1][4])
+    rem_r = ((c - entry) / R) if side == 'BUY' else ((entry - c) / R)
+    if tp1_hit:
+        return {'outcome': 'TP1_TIMEOUT', 'R': float(realized_r + (w2 * rem_r)), 'bars': end - start_i, 'hit_tp1': True, 'hit_tp2': False}
+    return {'outcome': 'TIMEOUT', 'R': float(rem_r), 'bars': end - start_i, 'hit_tp1': False, 'hit_tp2': False}
 
-def run_backtest(symbol: str, days: int = 30, tf: str = "1h", session_name: str = "NY") -> dict:
-    """Admin backtest runner (fast, no external deps)."""
+
+def run_backtest(
+    symbol: str,
+    days: int = 30,
+    tf: str = '1h',
+    session_name: str = 'NY',
+    end_days_ago: int = 0,
+    initial_equity: float = 1000.0,
+    risk_pct: float = 1.0,
+    compounding: bool = True,
+    move_sl_to_be_after_tp1: bool = True,
+) -> dict:
+    """Admin backtest runner with anchored historical windows and equity-based results."""
     sym = _bybit_linear_symbol(symbol)
     d = _parse_days(str(days))
-    tf = str(tf or "1h").strip().lower()
+    tf = str(tf or '1h').strip().lower()
+    end_days_ago = _parse_days_ago(end_days_ago)
+    sess = str(session_name or 'NY').strip().upper()
+    if sess in ('ALL', 'ANY', '*'):
+        sess = ''
 
-    # Bybit/ccxt uses limits not date ranges; approximate bars needed
     tf_min = _tf_to_minutes(tf)
-    bars = int((d * 1440) / max(1, tf_min)) + 300  # warmup
-    bars = int(min(20000, max(600, bars)))
-
-    ohlcv = fetch_ohlcv(sym, tf, limit=bars)
+    warmup_bars = 300
+    since_ms, until_ms, eval_since_ms, eval_until_ms = _backtest_window_bounds(d, end_days_ago=end_days_ago, warmup_bars=warmup_bars, tf=tf)
+    limit = 1000 if tf_min <= 60 else 500
+    ohlcv = fetch_ohlcv_paged(sym, tf, since_ms=since_ms, until_ms=until_ms, limit=limit)
     if not ohlcv or len(ohlcv) < 300:
-        return {"ok": False, "error": "insufficient_ohlcv", "symbol": sym, "tf": tf, "days": d}
+        return {'ok': False, 'error': 'insufficient_ohlcv', 'symbol': sym, 'tf': tf, 'days': d, 'end_days_ago': end_days_ago}
 
-    setups = _backtest_generate_setups(sym, ohlcv, tf, session_name=session_name)
+    ohlcv = [c for c in sorted(ohlcv, key=lambda r: r[0]) if int(c[0]) <= int(eval_until_ms)]
+    if not ohlcv:
+        return {'ok': False, 'error': 'empty_window', 'symbol': sym, 'tf': tf, 'days': d, 'end_days_ago': end_days_ago}
+
+    setups = _backtest_generate_setups(sym, ohlcv, tf, session_name=sess)
+    if eval_since_ms > 0:
+        filtered = []
+        for s in setups:
+            try:
+                cts = float(getattr(s, 'created_ts', 0.0) or 0.0)
+                ts_ms = int(cts * 1000)
+                if ts_ms < int(eval_since_ms) or ts_ms > int(eval_until_ms):
+                    continue
+                filtered.append(s)
+            except Exception:
+                continue
+        setups = filtered
+
     if not setups:
-        return {"ok": True, "symbol": sym, "tf": tf, "days": d, "setups": 0, "report": {"note": "no_setups"}}
+        return {
+            'ok': True, 'symbol': sym, 'tf': tf, 'days': d, 'end_days_ago': end_days_ago,
+            'window_start_ts': eval_since_ms / 1000.0, 'window_end_ts': eval_until_ms / 1000.0,
+            'setups': 0, 'trades': 0, 'win_rate': 0.0, 'tp1_rate': 0.0, 'tp2_rate': 0.0,
+            'avg_R': 0.0, 'profit_factor': 0.0, 'max_drawdown_R': 0.0, 'equity_R': 0.0,
+            'initial_equity': float(initial_equity), 'ending_equity': float(initial_equity), 'net_pnl_usd': 0.0,
+            'max_drawdown_usd': 0.0, 'reject_breakdown': dict(_BT_LAST_REJECTS), 'by_session': {},
+        }
 
-    # Simulate
     results = []
-    equity_curve = []
-    eq = 0.0
-    max_dd = 0.0
-    peak = 0.0
+    eq_r = 0.0
+    peak_r = 0.0
+    max_dd_r = 0.0
+    eq_usd = float(max(1.0, initial_equity or 1000.0))
+    peak_usd = eq_usd
+    max_dd_usd = 0.0
+    fixed_risk_usd = float(eq_usd * (max(0.01, float(risk_pct or 1.0)) / 100.0))
+    by_session = defaultdict(lambda: {'setups': 0, 'wins': 0, 'losses': 0, 'tp1_hits': 0, 'tp2_hits': 0, 'r': []})
+    hold_bars = []
 
-    # map setup_id "BT-i" -> index i
     for s in setups:
         try:
-            sid = str(getattr(s, "setup_id", "BT-0"))
-            i = int(sid.split("-")[-1])
+            sid = str(getattr(s, 'setup_id', 'BT-0'))
+            i = int(sid.split('-')[-1])
         except Exception:
             i = 0
-        res = _simulate_one_setup(ohlcv, i + 1, s)
-        res["setup_id"] = getattr(s, "setup_id", "")
-        res["score"] = float(getattr(s, "quality_score", 0.0) or 0.0)
+
+        ts_sec = 0.0
+        try:
+            ts_raw = float((ohlcv[i][0] if i < len(ohlcv) else ohlcv[-1][0]) or 0.0)
+            ts_sec = (ts_raw / 1000.0) if ts_raw > 1e12 else ts_raw
+        except Exception:
+            ts_sec = 0.0
+        try:
+            sess_name = str(_session_label_from_ts(ts_sec) or '?')
+        except Exception:
+            sess_name = '?'
+
+        res = _simulate_one_setup(ohlcv, i + 1, s, move_sl_to_be_after_tp1=bool(move_sl_to_be_after_tp1))
+        r_mult = float(res.get('R', 0.0) or 0.0)
+        risk_usd = float(eq_usd * (max(0.01, float(risk_pct or 1.0)) / 100.0)) if compounding else fixed_risk_usd
+        pnl_usd = float(r_mult * risk_usd)
+        eq_usd += pnl_usd
+        peak_usd = max(peak_usd, eq_usd)
+        max_dd_usd = max(max_dd_usd, peak_usd - eq_usd)
+
+        eq_r += r_mult
+        peak_r = max(peak_r, eq_r)
+        max_dd_r = max(max_dd_r, peak_r - eq_r)
+
+        out = str(res.get('outcome') or '').upper().strip()
+        by_session[sess_name]['setups'] += 1
+        by_session[sess_name]['r'].append(r_mult)
+        if bool(res.get('hit_tp1')):
+            by_session[sess_name]['tp1_hits'] += 1
+        if bool(res.get('hit_tp2')):
+            by_session[sess_name]['tp2_hits'] += 1
+        if out in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2'):
+            by_session[sess_name]['wins'] += 1
+        elif out in ('SL', 'SL_FIRST', 'TP1_SL'):
+            by_session[sess_name]['losses'] += 1
+        try:
+            hold_bars.append(int(res.get('bars', 0) or 0))
+        except Exception:
+            pass
+
+        res['setup_id'] = getattr(s, 'setup_id', '')
+        res['score'] = float(getattr(s, 'quality_score', 0.0) or 0.0)
+        res['session'] = sess_name
+        res['pnl_usd'] = float(pnl_usd)
+        res['equity_after_usd'] = float(eq_usd)
         results.append(res)
 
-        eq += float(res.get("R", 0.0) or 0.0)
-        peak = max(peak, eq)
-        dd = peak - eq
-        max_dd = max(max_dd, dd)
-        equity_curve.append(eq)
-
-    wins = [r for r in results if str(r.get("outcome")) == "TP3"]
-    losses = [r for r in results if str(r.get("outcome")) in ("SL", "SL_FIRST")]
     total = len(results)
+    wins = sum(1 for r in results if str(r.get('outcome') or '').upper().strip() in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2'))
+    tp1_hits = sum(1 for r in results if bool(r.get('hit_tp1')))
+    tp2_hits = sum(1 for r in results if bool(r.get('hit_tp2')))
+    win_rate = (wins / total * 100.0) if total else 0.0
+    tp1_rate = (tp1_hits / total * 100.0) if total else 0.0
+    tp2_rate = (tp2_hits / total * 100.0) if total else 0.0
+    avg_r = (sum(float(r.get('R', 0.0) or 0.0) for r in results) / total) if total else 0.0
+    gross_win = sum(max(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
+    gross_loss = sum(min(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float('inf') if gross_win > 0 else 0.0)
 
-    win_rate = (len(wins) / total) * 100.0 if total else 0.0
-    avg_r = float(sum(float(r.get("R", 0.0) or 0.0) for r in results) / total) if total else 0.0
-    gross_win = float(sum(max(0.0, float(r.get("R", 0.0) or 0.0)) for r in results))
-    gross_loss = float(sum(min(0.0, float(r.get("R", 0.0) or 0.0)) for r in results))
-    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float("inf") if gross_win > 0 else 0.0)
+    by_sess_out = {}
+    for sess_name, dct in dict(by_session).items():
+        s_n = int(dct.get('setups', 0) or 0)
+        s_w = int(dct.get('wins', 0) or 0)
+        rr = dct.get('r') or []
+        by_sess_out[str(sess_name)] = {
+            'setups': s_n,
+            'wins': s_w,
+            'losses': int(dct.get('losses', 0) or 0),
+            'win_rate': float((s_w / s_n * 100.0) if s_n else 0.0),
+            'tp1_rate': float((int(dct.get('tp1_hits', 0) or 0) / s_n * 100.0) if s_n else 0.0),
+            'tp2_rate': float((int(dct.get('tp2_hits', 0) or 0) / s_n * 100.0) if s_n else 0.0),
+            'avg_R': float((sum(float(x) for x in rr) / len(rr)) if rr else 0.0),
+        }
 
+    avg_hold_minutes = (sum(hold_bars) / len(hold_bars) * tf_min) if hold_bars else 0.0
     return {
-        "ok": True,
-        "symbol": sym,
-        "tf": tf,
-        "days": d,
-        "setups": total,
-        "trades": total,
-        "conversion_rate": (total / total) if total else 0.0,
-        "win_rate": win_rate,
-        "avg_R": avg_r,
-        "profit_factor": pf,
-        "max_drawdown_R": float(max_dd),
-        "equity_R": float(eq),
-        "avg_hold_bars": float(sum(float(r.get("bars",0) or 0) for r in results)/total) if total else 0.0,
-        "avg_hold_minutes": float(sum(float(r.get("bars",0) or 0) for r in results)/total) * float(tf_min) if total else 0.0,
-        "reject_breakdown": dict(_BT_LAST_REJECTS) if isinstance(globals().get("_BT_LAST_REJECTS"), Counter) else {},
-        "sample": results[:12],
+        'ok': True,
+        'symbol': sym,
+        'tf': tf,
+        'days': d,
+        'end_days_ago': end_days_ago,
+        'window_start_ts': eval_since_ms / 1000.0,
+        'window_end_ts': eval_until_ms / 1000.0,
+        'setups': total,
+        'trades': total,
+        'win_rate': float(win_rate),
+        'tp1_rate': float(tp1_rate),
+        'tp2_rate': float(tp2_rate),
+        'avg_R': float(avg_r),
+        'profit_factor': pf,
+        'max_drawdown_R': float(max_dd_r),
+        'equity_R': float(eq_r),
+        'initial_equity': float(initial_equity),
+        'ending_equity': float(eq_usd),
+        'net_pnl_usd': float(eq_usd - float(initial_equity)),
+        'max_drawdown_usd': float(max_dd_usd),
+        'risk_pct': float(risk_pct),
+        'compounding': bool(compounding),
+        'avg_hold_minutes': float(avg_hold_minutes),
+        'reject_breakdown': dict(_BT_LAST_REJECTS),
+        'by_session': by_sess_out,
+        'sample': results[:12],
     }
+
 
 async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_user(update.effective_user.id):
-        await update.message.reply_text("Admin only.")
+        await update.message.reply_text('Admin only.')
         return
     args = (context.args or [])
     if len(args) < 3:
         await update.message.reply_text(
             "Usage:\n"
             "/backtest BTCUSDT 30d 1h\n"
-            "/backtest ETHUSDT 7d 15m\n"
+            "/backtest ETHUSDT 7d 15m NY 0ago 1000\n"
+            "/backtest BTCUSDT 14d 1h ALL 7ago 1000 1.0 on\n\n"
+            "Args: symbol days tf [session=NY|LON|ASIA|ALL] [end_days_ago=0ago] [equity=1000] [risk%=1.0] [compound=on|off]"
         )
         return
     symbol = args[0]
     days = args[1]
     tf = args[2]
-    session_name = "NY"
+    session_name = str(args[3]).upper().strip() if len(args) >= 4 else 'NY'
+    end_days_ago = _parse_days_ago(args[4]) if len(args) >= 5 else 0
     try:
-        if len(args) >= 4:
-            session_name = str(args[3]).upper()
+        initial_equity = float(args[5]) if len(args) >= 6 else 1000.0
     except Exception:
-        session_name = "NY"
-
-    await update.message.reply_text("⏳ Running backtest… (this can take a bit)")
+        initial_equity = 1000.0
     try:
-        rep = await to_thread_heavy(run_backtest, symbol, days, tf, session_name=session_name)
+        risk_pct = float(args[6]) if len(args) >= 7 else 1.0
+    except Exception:
+        risk_pct = 1.0
+    compound = True
+    if len(args) >= 8:
+        compound = str(args[7]).strip().lower() not in ('off', 'false', '0', 'no')
+
+    await update.message.reply_text('⏳ Running backtest…')
+    try:
+        rep = await to_thread_heavy(
+            run_backtest,
+            symbol,
+            days,
+            tf,
+            session_name=session_name,
+            end_days_ago=end_days_ago,
+            initial_equity=initial_equity,
+            risk_pct=risk_pct,
+            compounding=compound,
+            move_sl_to_be_after_tp1=True,
+        )
     except Exception as e:
-        await update.message.reply_text(f"Backtest failed: {type(e).__name__}: {e}")
+        await update.message.reply_text(f'Backtest failed: {type(e).__name__}: {e}')
         return
 
-    if not rep.get("ok"):
+    if not rep.get('ok'):
         await update.message.reply_text(f"Backtest error: {rep.get('error')}")
         return
 
-    # Pretty report
     lines = []
-    lines.append("📊 Backtest Report")
+    lines.append('📊 Backtest Report')
     lines.append(HDR)
     lines.append(f"Symbol: {rep.get('symbol')}")
     lines.append(f"TF: {rep.get('tf')} | Days: {rep.get('days')} | Session: {session_name}")
+    try:
+        ws = datetime.fromtimestamp(float(rep.get('window_start_ts') or 0.0), tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        we = datetime.fromtimestamp(float(rep.get('window_end_ts') or 0.0), tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        lines.append(f"Window: {ws} → {we} | End offset: {int(rep.get('end_days_ago', 0) or 0)}d ago")
+    except Exception:
+        pass
     lines.append(SEP)
     lines.append(f"Setups: {rep.get('setups')}")
     try:
-        lines.append(f"Trades (simulated): {rep.get('trades', rep.get('setups'))}")
-        setups_day = (float(rep.get('setups',0) or 0) / float(rep.get('days',1) or 1))
+        setups_day = (float(rep.get('setups', 0) or 0) / float(rep.get('days', 1) or 1))
         lines.append(f"Setups/day: {setups_day:.2f}")
     except Exception:
         pass
     lines.append(f"Win rate: {_fmt_num(rep.get('win_rate'), '.1f')}%")
+    lines.append(f"TP1 hit rate: {_fmt_num(rep.get('tp1_rate'), '.1f')}%")
+    lines.append(f"TP2 hit rate: {_fmt_num(rep.get('tp2_rate'), '.1f')}%")
     lines.append(f"Avg R: {_fmt_num(rep.get('avg_R'), '.3f')}")
     lines.append(f"Profit factor: {_fmt_num(rep.get('profit_factor'), '.2f')}")
     lines.append(f"Max DD (R): {_fmt_num(rep.get('max_drawdown_R'), '.2f')}")
     lines.append(f"Net (R): {_fmt_num(rep.get('equity_R'), '.2f')}")
+    lines.append(f"Start equity: ${float(rep.get('initial_equity', 0.0) or 0.0):,.2f}")
+    lines.append(f"End equity: ${float(rep.get('ending_equity', 0.0) or 0.0):,.2f}")
+    lines.append(f"Net PnL: ${float(rep.get('net_pnl_usd', 0.0) or 0.0):,.2f}")
+    lines.append(f"Max DD ($): ${float(rep.get('max_drawdown_usd', 0.0) or 0.0):,.2f}")
     try:
-        lines.append(f"Avg hold: {float(rep.get('avg_hold_minutes',0.0) or 0.0):.1f} min")
+        lines.append(f"Avg hold: {float(rep.get('avg_hold_minutes', 0.0) or 0.0):.1f} min")
     except Exception:
         pass
 
     try:
-        rb = rep.get("reject_breakdown") or {}
+        bs = rep.get('by_session') or {}
+        if isinstance(bs, dict) and bs:
+            lines.append(SEP)
+            lines.append('By session:')
+            for sname in ('NY', 'LON', 'ASIA'):
+                d = bs.get(sname) or {}
+                if not d:
+                    continue
+                lines.append(
+                    f"• {sname}: setups={int(d.get('setups', 0) or 0)} | WR={float(d.get('win_rate', 0.0) or 0.0):.1f}% | TP1={float(d.get('tp1_rate', 0.0) or 0.0):.1f}% | TP2={float(d.get('tp2_rate', 0.0) or 0.0):.1f}% | AvgR={float(d.get('avg_R', 0.0) or 0.0):.2f}"
+                )
+    except Exception:
+        pass
+
+    try:
+        rb = rep.get('reject_breakdown') or {}
         if isinstance(rb, dict) and rb:
             lines.append(SEP)
-            lines.append("Reject breakdown (top):")
-            items = sorted(rb.items(), key=lambda kv: int(kv[1]), reverse=True)[:12]
-            for k,v in items:
-                lines.append(f"• {k}: {v}")
+            lines.append('Reject breakdown (top):')
+            items = sorted(rb.items(), key=lambda kv: int(kv[1]), reverse=True)[:10]
+            for k, v in items:
+                lines.append(f'• {k}: {v}')
     except Exception:
         pass
 
-    # Sample outcomes
-    try:
-        samp = rep.get("sample") or []
-        if samp:
-            lines.append(SEP)
-            lines.append("Sample outcomes:")
-            for r in samp[:10]:
-                lines.append(f"• {r.get('setup_id')} — {r.get('outcome')} — R={float(r.get('R',0.0)):.2f} — score={float(r.get('score',0.0)):.1f}")
-    except Exception:
-        pass
+    await update.message.reply_text('\\n'.join(lines))
 
-    await send_long_message(update, "\n".join(lines), parse_mode=None)
-
-
-# =========================================================
-# OPTIMIZATION (ADMIN) — bounded, deterministic, walk-forward
-# =========================================================
-
-def _build_universe_for_opt(cfg: dict) -> list[str]:
-    """Return list of market symbols (ccxt) for Bybit USDT perps meeting min volume."""
-    try:
-        best = fetch_futures_tickers()
-    except Exception:
-        best = {}
-    min_vol = float(cfg.get("min_fut_vol_usd", MIN_FUT_VOL_USD))
-    top_n = int(cfg.get("universe_top_n", 120))
-    # Filter + sort by notional
-    items = []
-    for base, mv in (best or {}).items():
-        try:
-            if usd_notional(mv) < min_vol:
-                continue
-            # Exclude obvious illiquid/new listings by missing VWAP/price
-            if float(mv.last or 0.0) <= 0:
-                continue
-            items.append((base, mv))
-        except Exception:
-            continue
-    items.sort(key=lambda kv: usd_notional(kv[1]), reverse=True)
-    items = items[:max(50, min(150, top_n))]
-    out = []
-    for base, mv in items:
-        out.append(str(mv.symbol))
-    return out
-
-def _walk_forward_split(ohlcv: list, train_frac: float = 0.7) -> tuple[list, list]:
-    if not ohlcv:
-        return [], []
-    n = len(ohlcv)
-    cut = max(100, int(n * float(train_frac)))
-    cut = min(n-50, cut) if n > 200 else cut
-    return ohlcv[:cut], ohlcv[cut:]
 
 def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session_name: str) -> dict:
     """Same as run_backtest but uses already-fetched ohlcv.
@@ -10251,7 +10437,7 @@ def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session
         by_session[sess]["r"].append(float(res["R"]))
 
         # WIN definition: TP1 hit before SL => TP1/TP2/TP3 are all wins
-        if out in ("TP1", "TP2", "TP3"):
+        if out in ("TP1", "TP1_BE", "TP1_TIMEOUT", "TP2", "TP3"):
             by_session[sess]["wins"] += 1
         elif out in ("SL", "LOSS"):
             by_session[sess]["losses"] += 1
@@ -10259,7 +10445,7 @@ def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session
     total = len(results)
 
     # WIN definition: TP1 hit before SL (TP1/TP2/TP3 outcomes are wins)
-    wins = sum(1 for r in results if str(r.get("outcome") or "").upper().strip() in ("TP1", "TP2", "TP3"))
+    wins = sum(1 for r in results if str(r.get("outcome") or "").upper().strip() in ("TP1", "TP1_BE", "TP1_TIMEOUT", "TP2", "TP3"))
     win_rate = (wins / total * 100.0) if total else 0.0
 
     avg_r = (sum(float(r.get("R", 0.0) or 0.0) for r in results) / total) if total else 0.0
@@ -13238,6 +13424,29 @@ def _self_opt_format_report(res: dict) -> str:
     except Exception:
         pass
 
+    try:
+        win_blocks = m.get("autotune_windows") or []
+        if isinstance(win_blocks, list) and win_blocks:
+            lines.append(SEP)
+            lines.append("Autotune windows:")
+            for w in win_blocks[:8]:
+                ws = (w or {}).get("summary") or {}
+                lines.append(
+                    f"• {w.get('label')}: setups/day={float(ws.get('setups_per_day',0.0) or 0.0):.2f} | WR={float(ws.get('win_rate',0.0) or 0.0):.1f}% | avgR={float(ws.get('avg_R',0.0) or 0.0):.3f}"
+                )
+    except Exception:
+        pass
+
+    try:
+        lg = m.get("learning_guard") or {}
+        if isinstance(lg, dict) and lg:
+            lines.append(SEP)
+            lines.append(
+                f"Learning guard: estWR={float(lg.get('estimated_wr',0.0) or 0.0):.1f}% | conf={str(lg.get('confidence') or 'low')} | live_sample={int(lg.get('live_sample',0) or 0)} | recent_closed={int(lg.get('recent_closed',0) or 0)}"
+            )
+    except Exception:
+        pass
+
     return "\n".join(lines)
 
 def _compute_oos_summary(oos_rows: list[dict], days: float, conc_cap: float) -> dict:
@@ -13285,32 +13494,166 @@ def _aggregate_by_session(oos_rows: list[dict]) -> dict:
         pretty[sname] = {"setups": int(n), "win_rate": float((d["wr"]/n) if n else 0.0), "avg_R": float((d["r"]/n) if n else 0.0)}
     return pretty
 
+def _normalize_autotune_windows(cfg: dict) -> list[dict]:
+    """Safe normalized historical windows for zero-touch optimizer."""
+    raw = (cfg or {}).get("autotune_windows") or []
+    out = []
+    try:
+        for w in raw:
+            if not isinstance(w, dict):
+                continue
+            days = max(3, int(w.get("days", 7) or 7))
+            end_days_ago = max(0, int(w.get("end_days_ago", 0) or 0))
+            out.append({"days": days, "end_days_ago": end_days_ago, "label": f"{days}d_{end_days_ago}ago"})
+    except Exception:
+        out = []
+    if not out:
+        out = [
+            {"days": 7, "end_days_ago": 0, "label": "7d_0ago"},
+            {"days": 14, "end_days_ago": 0, "label": "14d_0ago"},
+            {"days": 21, "end_days_ago": 0, "label": "21d_0ago"},
+            {"days": 30, "end_days_ago": 0, "label": "30d_0ago"},
+        ]
+    return out
+
+
+def _slice_ohlcv_for_window(ohlcv: list, days: int, end_days_ago: int, tf: str, warmup_bars: int = 300) -> list:
+    if not ohlcv:
+        return []
+    try:
+        _since_ms, _until_ms, eval_since_ms, eval_until_ms = _backtest_window_bounds(days, end_days_ago=end_days_ago, warmup_bars=warmup_bars, tf=tf)
+        kept = []
+        for row in (ohlcv or []):
+            try:
+                ts = int(row[0])
+                if ts <= int(eval_until_ms):
+                    kept.append(row)
+            except Exception:
+                continue
+        if not kept:
+            return []
+        start_idx = 0
+        for i, row in enumerate(kept):
+            try:
+                if int(row[0]) >= int(eval_since_ms):
+                    start_idx = max(0, i - int(warmup_bars))
+                    break
+            except Exception:
+                continue
+        return kept[start_idx:]
+    except Exception:
+        return list(ohlcv or [])
+
+
+def _run_backtest_on_ohlcv_window(symbol: str, ohlcv: list, days: int, tf: str, session_name: str, end_days_ago: int = 0) -> dict:
+    sliced = _slice_ohlcv_for_window(ohlcv, days=days, end_days_ago=end_days_ago, tf=tf, warmup_bars=300)
+    rep = _run_backtest_on_ohlcv(symbol, sliced, days=days, tf=tf, session_name=session_name)
+    try:
+        rep["end_days_ago"] = int(end_days_ago)
+        rep["window_label"] = f"{int(days)}d_{int(end_days_ago)}ago"
+    except Exception:
+        pass
+    return rep
+
+
+def _window_bundle_summary(bundle_rows: dict, cfg: dict) -> dict:
+    windows = []
+    flat_rows = []
+    positive = 0
+    pass_wr = 0
+    scores = []
+    total_days = 0.0
+    min_wr_floor = float((cfg or {}).get("autotune_min_window_wr", 52.0) or 52.0)
+    for label, info in (bundle_rows or {}).items():
+        rows = list((info or {}).get("rows") or [])
+        days = int((info or {}).get("days", 0) or 0)
+        total_days += float(max(1, days))
+        summ = _compute_oos_summary(rows, days=float(max(1, days)), conc_cap=float((cfg or {}).get("concentration_cap", 0.25) or 0.25))
+        obj = _objective(rows, days=max(1, days), cfg=cfg) if rows else -1e12
+        windows.append({
+            "label": str(label),
+            "days": days,
+            "end_days_ago": int((info or {}).get("end_days_ago", 0) or 0),
+            "summary": summ,
+            "score": float(obj),
+        })
+        scores.append(float(obj))
+        flat_rows.extend(rows)
+        if float(summ.get("avg_R", 0.0) or 0.0) > 0:
+            positive += 1
+        if float(summ.get("win_rate", 0.0) or 0.0) >= min_wr_floor:
+            pass_wr += 1
+    agg = (_compute_oos_summary(
+        flat_rows,
+        days=float(max(1.0, total_days)),
+        conc_cap=float((cfg or {}).get("concentration_cap", 0.25) or 0.25),
+    ) if flat_rows else {})
+    std_pen = 0.0
+    if len(scores) >= 2:
+        try:
+            std_pen = float(statistics.pstdev(scores))
+        except Exception:
+            std_pen = 0.0
+    return {
+        "windows": windows,
+        "aggregate": agg,
+        "positive_windows": int(positive),
+        "passing_wr_windows": int(pass_wr),
+        "window_scores": [float(x) for x in scores],
+        "score_std": float(std_pen),
+    }
+
+
+def _autotune_learning_guard(session_mode: str = "ALL") -> dict:
+    try:
+        sess = None if str(session_mode).upper() == "ALL" else str(session_mode).upper()
+        live = _evolution_estimated_win_rate(session=sess)
+        recent = _autonomous_opt_performance_snapshot(window_hours=float(AUTONOMOUS_OPT_LOOKBACK_HOURS))
+        return {
+            "estimated_wr": float(live.get("estimated_wr", 0.0) or 0.0),
+            "confidence": str(live.get("confidence") or "low"),
+            "live_sample": int(live.get("live_sample", 0) or 0),
+            "recent_closed": int(recent.get("closed", 0) or 0),
+            "recent_win_rate": float(recent.get("win_rate", 0.0) or 0.0),
+        }
+    except Exception:
+        return {"estimated_wr": 0.0, "confidence": "low", "live_sample": 0, "recent_closed": 0, "recent_win_rate": 0.0}
+
+
 def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Event, progress_cb=None) -> dict:
-    """Runs full self-optimization pipeline in a worker thread."""
+    """Runs full self-optimization pipeline in a worker thread.
+
+    Zero-touch design:
+    1) Search a bounded candidate grid on a primary window.
+    2) Re-test shortlisted candidates across multiple historical windows (7/14/21/30d by default).
+    3) Merge live-learning evidence as a promotion guard so weak real-world performance
+       can tighten promotion even if backtests look good.
+    """
     _opt_migrate_tables()
     base_cfg = load_strategy_config(force=True)
+    robust_windows = _normalize_autotune_windows(base_cfg)
+    primary_days = max(3, int(days or 7))
 
-    # TF candidates start: 5m,15m only (expand only if frequency target not met)
-    tf_candidates = ["5m", "15m"]
+    tf_candidates = list(base_cfg.get("exec_tf_candidates") or ["5m", "15m"])[:3]
+    if not tf_candidates:
+        tf_candidates = ["5m", "15m"]
 
-    # Universe snapshot (TOP100, >=$10M)
     univ = _build_universe_snapshot_top_volume(top_n=100, min_vol_usd=10_000_000.0)
     universe_snap_id = str(univ.get("snap_id") or "")
     universe = list(univ.get("market_symbols") or [])[:100]
     universe_size = len(universe)
 
     run_id = f"OPT-{_utc_day_str()}-{int(time.time())}"
-    _db_create_opt_run(run_id, days=int(days), session_mode=str(session_mode), tf_candidates=tf_candidates, universe_snap_id=universe_snap_id, universe_size=universe_size)
+    _db_create_opt_run(run_id, days=int(primary_days), session_mode=str(session_mode), tf_candidates=tf_candidates, universe_snap_id=universe_snap_id, universe_size=universe_size)
 
     cands = _generate_candidates(base_cfg)
-    days_test = max(7, int(days * 0.3))
+    days_test = max(7, int(primary_days * 0.3))
     conc_cap = float(base_cfg.get("concentration_cap", 0.25) or 0.25)
+    robust_max_days = max([int(w.get("days", 0) or 0) for w in robust_windows] + [primary_days])
+    shortlist_n = max(4, int(base_cfg.get("autotune_shortlist", 10) or 10))
 
-    best_score = -1e18
-    best_params = None
-    best_metrics = None
-    best_tf = None
-    best_rejects = None
+    candidate_pool = []
+    ohlcv_cache_by_tf = {}
 
     for exec_tf in tf_candidates:
         if stop_event.is_set():
@@ -13321,19 +13664,20 @@ def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Ev
             progress_cb(f"Fetching OHLCV for TF={exec_tf} (universe={len(universe)})…", {"stage": "fetch_ohlcv", "tf": exec_tf})
 
         ohlcv_map = {}
+        tf_min = _tf_to_minutes(exec_tf)
+        bars = int((robust_max_days * 1440) / max(1, tf_min)) + 400
+        bars = int(min(12000, max(1200, bars)))
         for si, sym in enumerate(universe):
             if stop_event.is_set():
                 _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
                 return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
             try:
-                tf_min = _tf_to_minutes(exec_tf)
-                bars = int((days * 1440) / max(1, tf_min)) + 300
-                bars = int(min(12000, max(900, bars)))
                 ohlcv_map[sym] = fetch_ohlcv(sym, exec_tf, limit=bars)
             except Exception:
                 ohlcv_map[sym] = []
             if si % 15 == 0:
                 _db_update_opt_run(run_id, progress={"stage": "fetch_ohlcv", "tf": exec_tf, "symbol_idx": si, "universe": len(universe)})
+        ohlcv_cache_by_tf[exec_tf] = ohlcv_map
 
         for ci, cand in enumerate(cands):
             if stop_event.is_set():
@@ -13343,16 +13687,13 @@ def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Ev
             cfg = dict(base_cfg)
             cfg.update(cand)
             cfg["exec_tf_default"] = str(exec_tf)
-
             apply_strategy_config(cfg)
 
             oos_rows = []
             reject_acc = Counter()
-
             for sym in universe:
                 ohl = ohlcv_map.get(sym) or []
-                _train, test = _walk_forward_split(ohl, 0.7)
-                rep = _run_backtest_on_ohlcv(sym, test, days=days_test, tf=exec_tf, session_name=session_mode)
+                rep = _run_backtest_on_ohlcv_window(sym, ohl, days=days_test, tf=exec_tf, session_name=session_mode, end_days_ago=0)
                 oos_rows.append(rep)
                 try:
                     rb = rep.get("reject_breakdown") or {}
@@ -13362,85 +13703,119 @@ def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Ev
                     pass
 
             sc = _objective(oos_rows, days=float(days_test), cfg=cfg)
-
-            if sc > best_score:
-                best_score = float(sc)
-                best_params = dict(cfg)
-                best_tf = str(exec_tf)
-                best_rejects = dict(reject_acc)
-
-                oos_sum = _compute_oos_summary(oos_rows, days=float(days_test), conc_cap=conc_cap)
-                by_sess = _aggregate_by_session(oos_rows)
-                best_metrics = {"oos": oos_sum, "by_session": by_sess}
-
-                _db_update_opt_run(run_id, progress={"stage": "search", "tf": exec_tf, "cand_idx": ci, "cands": len(cands), "best_score": best_score})
-
-                if progress_cb:
-                    progress_cb(f"New best ✅ TF={best_tf} | score={best_score:.3f} | OOS {oos_sum.get('setups_per_day',0.0):.2f}/day | WR {oos_sum.get('win_rate',0.0):.1f}%", {"stage": "new_best"})
+            oos_sum = _compute_oos_summary(oos_rows, days=float(days_test), conc_cap=conc_cap)
+            candidate_pool.append({
+                "score": float(sc),
+                "cfg": dict(cfg),
+                "tf": str(exec_tf),
+                "oos": dict(oos_sum),
+                "rejects": dict(reject_acc),
+            })
 
             if ci % 5 == 0:
-                _db_update_opt_run(run_id, progress={"stage": "search", "tf": exec_tf, "cand_idx": ci, "cands": len(cands), "best_score": best_score})
+                best_now = max([float(x.get("score", -1e18)) for x in candidate_pool] or [-1e18])
+                _db_update_opt_run(run_id, progress={"stage": "search", "tf": exec_tf, "cand_idx": ci, "cands": len(cands), "best_score": best_now})
 
-    if not best_params or not best_tf or not best_metrics:
+    if not candidate_pool:
         _db_update_opt_run(run_id, status="FAILED", finished=True, notes="No viable candidate found")
-        _db_save_opt_result(run_id, promoted=False, chosen_exec_tf="", best_score=float(best_score), best_params={}, metrics={}, reject_stats={})
+        _db_save_opt_result(run_id, promoted=False, chosen_exec_tf="", best_score=float(-1e18), best_params={}, metrics={}, reject_stats={})
         return {"ok": False, "run_id": run_id, "status": "FAILED"}
 
-    # Controlled TF expansion: include 3m only if frequency is below target
-    try:
-        oos_day = float(best_metrics.get("oos", {}).get("setups_per_day", 0.0) or 0.0)
-        lo = float(best_params.get("target_setups_per_day_lo", 3.0) or 3.0)
-    except Exception:
-        oos_day = 0.0; lo = 3.0
+    shortlist = sorted(candidate_pool, key=lambda x: float(x.get("score", -1e18)), reverse=True)[:shortlist_n]
+    learning_guard = _autotune_learning_guard(session_mode=session_mode)
 
-    if oos_day < lo and not stop_event.is_set():
-        if progress_cb:
-            progress_cb("Frequency below target; expanding TF candidates to include 3m (controlled)…", {"stage": "tf_expand"})
-        exec_tf = "3m"
-        ohlcv_map = {}
-        for sym in universe:
-            try:
-                tf_min = _tf_to_minutes(exec_tf)
-                bars = int((days * 1440) / max(1, tf_min)) + 300
-                bars = int(min(12000, max(1200, bars)))
-                ohlcv_map[sym] = fetch_ohlcv(sym, exec_tf, limit=bars)
-            except Exception:
-                ohlcv_map[sym] = []
-        for cand in cands:
-            if stop_event.is_set():
-                break
-            cfg = dict(base_cfg); cfg.update(cand); cfg["exec_tf_default"] = exec_tf
-            apply_strategy_config(cfg)
-            oos_rows = []
-            reject_acc = Counter()
+    best_choice = None
+    best_robust_score = -1e18
+
+    for idx_c, item in enumerate(shortlist):
+        if stop_event.is_set():
+            _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
+            return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
+
+        cfg = dict(item.get("cfg") or {})
+        exec_tf = str(item.get("tf") or cfg.get("exec_tf_default") or "15m")
+        apply_strategy_config(cfg)
+        ohlcv_map = ohlcv_cache_by_tf.get(exec_tf) or {}
+
+        bundle = {}
+        reject_acc = Counter(item.get("rejects") or {})
+        for w in robust_windows:
+            label = str(w.get("label") or f"{int(w.get('days',7))}d_{int(w.get('end_days_ago',0))}ago")
+            rows = []
             for sym in universe:
                 ohl = ohlcv_map.get(sym) or []
-                _train, test = _walk_forward_split(ohl, 0.7)
-                rep = _run_backtest_on_ohlcv(sym, test, days=days_test, tf=exec_tf, session_name=session_mode)
-                oos_rows.append(rep)
+                rep = _run_backtest_on_ohlcv_window(sym, ohl, days=int(w.get("days", 7) or 7), tf=exec_tf, session_name=session_mode, end_days_ago=int(w.get("end_days_ago", 0) or 0))
+                rows.append(rep)
                 try:
                     rb = rep.get("reject_breakdown") or {}
                     if isinstance(rb, dict):
                         reject_acc.update(rb)
                 except Exception:
                     pass
-            sc = _objective(oos_rows, days=float(days_test), cfg=cfg)
-            if sc > best_score:
-                best_score = float(sc)
-                best_params = dict(cfg)
-                best_tf = str(exec_tf)
-                best_rejects = dict(reject_acc)
-                oos_sum = _compute_oos_summary(oos_rows, days=float(days_test), conc_cap=conc_cap)
-                by_sess = _aggregate_by_session(oos_rows)
-                best_metrics = {"oos": oos_sum, "by_session": by_sess}
-                if progress_cb:
-                    progress_cb(f"New best ✅ TF={best_tf} | score={best_score:.3f} | OOS {oos_sum.get('setups_per_day',0.0):.2f}/day | WR {oos_sum.get('win_rate',0.0):.1f}%", {"stage": "new_best"})
+            bundle[label] = {"rows": rows, "days": int(w.get("days", 7) or 7), "end_days_ago": int(w.get("end_days_ago", 0) or 0)}
 
-    # Promotion decision
+        bundle_sum = _window_bundle_summary(bundle, cfg)
+        agg = bundle_sum.get("aggregate") or {}
+        pos_windows = int(bundle_sum.get("positive_windows", 0) or 0)
+        pass_wr_windows = int(bundle_sum.get("passing_wr_windows", 0) or 0)
+        score_std = float(bundle_sum.get("score_std", 0.0) or 0.0)
+        cons_pen = float(base_cfg.get("autotune_consistency_penalty", 2.0) or 2.0) * score_std
+        robust_score = float(agg.get("avg_R", 0.0) or 0.0) * 14.0 + float(agg.get("profit_factor", 0.0) or 0.0) * 1.6 - float(agg.get("max_drawdown_R", 0.0) or 0.0) * 0.9
+        robust_score += (pos_windows * 1.5) + (pass_wr_windows * 0.75) - cons_pen
+
+        if bool(base_cfg.get("autotune_learning_guard_enabled", True)):
+            est_wr = float(learning_guard.get("estimated_wr", 0.0) or 0.0)
+            conf = str(learning_guard.get("confidence") or "low").lower()
+            if conf in {"medium", "high"} and est_wr < 52.0:
+                robust_score -= (52.0 - est_wr) * 0.35
+
+        if robust_score > best_robust_score:
+            best_robust_score = float(robust_score)
+            best_choice = {
+                "cfg": dict(cfg),
+                "tf": exec_tf,
+                "metrics": {
+                    "oos": dict(agg),
+                    "by_session": _aggregate_by_session([r for v in bundle.values() for r in (v.get("rows") or [])]),
+                    "autotune_windows": list(bundle_sum.get("windows") or []),
+                    "positive_windows": pos_windows,
+                    "passing_wr_windows": pass_wr_windows,
+                    "score_std": score_std,
+                    "learning_guard": dict(learning_guard),
+                },
+                "rejects": dict(reject_acc),
+                "robust_score": float(robust_score),
+            }
+
+        _db_update_opt_run(run_id, progress={"stage": "robustness", "candidate_idx": idx_c, "shortlist": len(shortlist), "best_score": float(best_robust_score)})
+
+    if not best_choice:
+        _db_update_opt_run(run_id, status="FAILED", finished=True, notes="No robust candidate found")
+        _db_save_opt_result(run_id, promoted=False, chosen_exec_tf="", best_score=float(best_robust_score), best_params={}, metrics={}, reject_stats={})
+        return {"ok": False, "run_id": run_id, "status": "FAILED"}
+
+    best_params = dict(best_choice.get("cfg") or {})
+    best_tf = str(best_choice.get("tf") or best_params.get("exec_tf_default") or "15m")
+    best_metrics = dict(best_choice.get("metrics") or {})
+    best_rejects = dict(best_choice.get("rejects") or {})
+
     gate_ok, gate_reasons = _self_opt_stability_gates(metrics={"oos": best_metrics.get("oos") or {}, "by_session": best_metrics.get("by_session") or {}}, cfg=best_params)
-    best_metrics["promotion_reasons"] = ([] if gate_ok else gate_reasons)
+    min_positive = int(base_cfg.get("autotune_min_positive_windows", 3) or 3)
+    if int(best_metrics.get("positive_windows", 0) or 0) < min_positive:
+        gate_ok = False
+        gate_reasons = list(gate_reasons or []) + [f"positive_windows<{min_positive}"]
+    if int(best_metrics.get("passing_wr_windows", 0) or 0) < min_positive:
+        gate_ok = False
+        gate_reasons = list(gate_reasons or []) + [f"passing_wr_windows<{min_positive}"]
+    lg = best_metrics.get("learning_guard") or {}
+    if bool(base_cfg.get("autotune_learning_guard_enabled", True)) and str(lg.get("confidence") or "low").lower() == "high" and float(lg.get("estimated_wr", 0.0) or 0.0) < 50.0:
+        gate_ok = False
+        gate_reasons = list(gate_reasons or []) + ["learning_guard_live_wr_below_50"]
 
-    _db_save_opt_result(run_id, promoted=bool(gate_ok), chosen_exec_tf=str(best_tf), best_score=float(best_score), best_params=dict(best_params), metrics=dict(best_metrics), reject_stats=dict(best_rejects or {}))
+    best_metrics["promotion_reasons"] = ([] if gate_ok else gate_reasons)
+    best_metrics["autotune_mode"] = "zero_touch_multi_window"
+
+    _db_save_opt_result(run_id, promoted=bool(gate_ok), chosen_exec_tf=str(best_tf), best_score=float(best_robust_score), best_params=dict(best_params), metrics=dict(best_metrics), reject_stats=dict(best_rejects or {}))
 
     from_cfg = load_strategy_config(force=True)
     promoted = False
@@ -13454,7 +13829,21 @@ def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Ev
         _db_log_promotion(run_id, from_cfg=from_cfg, to_cfg=best_params, decision="NOT_PROMOTED", reasons=gate_reasons)
         _db_update_opt_run(run_id, status="NOT_PROMOTED", finished=True, notes="NOT_PROMOTED")
 
-    return {"ok": True, "run_id": run_id, "promoted": promoted, "chosen_exec_tf": best_tf, "best_score": float(best_score), "best_params": dict(best_params), "metrics": dict(best_metrics), "reject_stats": dict(best_rejects or {}), "universe_snap_id": universe_snap_id, "universe_size": universe_size, "session_mode": str(session_mode), "days_requested": int(days)}
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "promoted": promoted,
+        "chosen_exec_tf": best_tf,
+        "best_score": float(best_robust_score),
+        "best_params": dict(best_params),
+        "metrics": dict(best_metrics),
+        "reject_stats": dict(best_rejects or {}),
+        "universe_snap_id": universe_snap_id,
+        "universe_size": universe_size,
+        "session_mode": str(session_mode),
+        "days_requested": int(primary_days),
+        "autotune_windows": robust_windows,
+    }
 
 async def _notify_admins_autonomous_opt(bot, text_msg: str):
     """No-op: autonomous optimization is fully zero-touch; no Telegram notifications."""
@@ -16049,13 +16438,15 @@ ADMIN_HELP_DESCRIPTIONS = {
     "self_optimize": "Explain autonomous optimizer mode",
     "self_optimize_stop": "Explain why manual stop is disabled",
     "self_optimize_report": "Show latest autonomous optimization result",
+    "autopilot_report": "Alias of /self_optimize_report with multi-window autopilot details",
+    "autopilot_status": "Alias of /learning_status",
     "trade_id_reset": "Reset your own Trade ID numbering",
 }
 
 ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
-    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned", "email_decision"]),
+    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "winrate", "ny_winrate", "lessons_learned", "email_decision"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "autotrade_sessions", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
@@ -22746,6 +23137,8 @@ def main():
     app.add_handler(CommandHandler("self_optimize", cmd_self_optimize, block=False))
     app.add_handler(CommandHandler("self_optimize_stop", cmd_self_optimize_stop, block=False))
     app.add_handler(CommandHandler("self_optimize_report", cmd_self_optimize_report, block=False))
+    app.add_handler(CommandHandler("autopilot_report", cmd_self_optimize_report, block=False))
+    app.add_handler(CommandHandler("autopilot_status", learning_status_cmd, block=False))
 
 # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
