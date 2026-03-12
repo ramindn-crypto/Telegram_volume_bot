@@ -892,7 +892,7 @@ SETUPS_N = 6
 EMAIL_SETUPS_N = 3
 
 # ✅ Global setup quality floor (Premium & Selective)
-MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "75"))
+MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "78"))
 
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
 MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
@@ -993,7 +993,7 @@ def _strategy_config_defaults() -> dict:
         "target_setups_per_day_hi": 5.0,
 
         # Self-optimization governance
-        "session_weights": {"NY": 1.0, "LON": 0.6, "ASIA": 0.3},  # optimizer weighting
+        "session_weights": {"NY": 1.0, "LON": 0.0, "ASIA": 0.0},  # optimizer weighting (production bias: NY-only)
         "concentration_cap": 0.25,          # no single symbol >25% of setups (OOS)
         "oos_min_setups": 30,               # minimum OOS sample size across universe before promotion
         "min_win_rate": 70.0,               # enforced only when sample is adequate
@@ -1020,6 +1020,19 @@ def _strategy_config_defaults() -> dict:
             "atr_min_pct": [0.4, 1.5],
             "min_rr_tp3": [1.3, 2.4],
         },
+
+        # Zero-touch autopilot optimizer windows
+        "autotune_windows": [
+            {"days": 7, "end_days_ago": 0},
+            {"days": 14, "end_days_ago": 0},
+            {"days": 21, "end_days_ago": 0},
+            {"days": 30, "end_days_ago": 0},
+        ],
+        "autotune_shortlist": 10,
+        "autotune_min_positive_windows": 3,
+        "autotune_min_window_wr": 52.0,
+        "autotune_consistency_penalty": 2.0,
+        "autotune_learning_guard_enabled": True,
     }
 
 _STRATEGY_CFG_CACHE = {"ts": 0.0, "cfg": None}
@@ -1288,23 +1301,6 @@ ENGINE_B_TP_CAP_BONUS_PCT = 4.0      # adds to TP cap %
 ENGINE_B_RR_BONUS = 0.35             # adds to RR target (TP3)
 
 # =========================================================
-# ENGINE C (LEADER RANGE BREAKOUT) SETTINGS
-# Purpose: capture ACX/PIXEL-style continuation after an initial pump
-# without chasing the first vertical candle.
-# =========================================================
-ENGINE_C_LEADER_RANGE_ENABLED = True
-LEADER_RANGE_MIN_CH24 = 14.0
-LEADER_RANGE_MIN_FUT_VOL_USD = 8_000_000.0
-LEADER_RANGE_MIN_CH4 = 0.35
-LEADER_RANGE_BOX_LOOKBACK = 8          # prior completed 15m candles used to define the box
-LEADER_RANGE_BOX_MAX_WIDTH_PCT = 12.0 # allows controlled post-pump ranges, not only ultra-tight boxes
-LEADER_RANGE_BREAKOUT_BUFFER_BPS = 5  # 0.05% breakout buffer
-LEADER_RANGE_STOP_PAD_PCT = 0.35      # extra pad beyond local box low/high
-LEADER_RANGE_NEAR_BREAKOUT_PCT = 0.35 # allow breakout if current close is very near the box edge
-LEADER_RANGE_RR_BONUS = 0.15          # slightly better target for clean continuation boxes
-
-
-# =========================================================
 # RISK DEFAULTS
 # =========================================================
 DEFAULT_EQUITY = 0.0
@@ -1442,18 +1438,21 @@ except Exception:
     AUTOTRADE_OWNER_UID = 0
 
 # Risk controls
-AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "2") or 2)
-AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT", "6") or 6)
-AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "6") or 6)
-# Open-trade count is intentionally unlimited. Daily risk cap controls exposure.
-AUTOTRADE_MAX_OPEN_TRADES = 0
+AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "1") or 1)
+AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT", "3") or 3)
+AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "3") or 3)
+# Open-trade count cap for commercial/live safety.
+AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "0") or 0)
+EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
+
 
 # Margin / leverage
 AUTOTRADE_ISOLATED = str(os.environ.get("AUTOTRADE_ISOLATED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
 AUTOTRADE_LEVERAGE = int(os.environ.get("AUTOTRADE_LEVERAGE", "10") or 10)
 
 # TP split (fractions must sum ~1.0)
-_AUTOTRADE_TP_SPLIT_RAW = str(os.environ.get("AUTOTRADE_TP_SPLIT", "0.4,0.4,0.2") or "0.4,0.4,0.2")
+_AUTOTRADE_TP_SPLIT_RAW = str(os.environ.get("AUTOTRADE_TP_SPLIT", "0.65,0.35,0.0") or "0.65,0.35,0.0")
 try:
     AUTOTRADE_TP_SPLIT = [float(x) for x in _AUTOTRADE_TP_SPLIT_RAW.split(",")]
 except Exception:
@@ -1476,11 +1475,11 @@ AUTOTRADE_LIVE_TP1_FRACTION = max(0.25, min(0.85, AUTOTRADE_LIVE_TP1_FRACTION))
 AUTOTRADE_BE_AFTER_TP1_ENABLED = str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ENABLED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
 AUTOTRADE_BE_AFTER_TP1_MIN_CONF = int(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MIN_CONF", "84") or 84)
 AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT", "4.5") or 4.5)
-AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY,LON") or "NY,LON").upper().replace(' ', '').split(','))
+AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY") or "NY").upper().replace(' ', '').split(','))
 # Live market-order entries must still stay close to the setup entry. Otherwise the bot can
 # execute a stale emailed setup at a materially worse price just because it is still inside
 # the time window. This guard keeps the email/setup engine and live execution aligned.
-AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "0.80") or 0.80)
+AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "0.50") or 0.50)
 
 # Bybit V5 keys (required for live)
 BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
@@ -4010,7 +4009,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             (int(uid), float(cutoff), int(limit)),
         )
         rows = cur.fetchall() or []
-        out = sorted(_load_signals(rows, 'executable_setups'), key=lambda x: float(getattr(x, 'created_ts', 0.0) or 0.0), reverse=True)
+        out = sorted(_load_signals(rows, 'executable_setups'), key=lambda x: (int(getattr(x, 'conf', 0) or 0), float(getattr(x, 'created_ts', 0.0) or 0.0)), reverse=True)
         if out:
             try:
                 for item in out:
@@ -4252,6 +4251,39 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (False, 'per_trade_risk_zero')
 
     mday = _autotrade_day_risk_metrics(int(uid), float(equity))
+    try:
+        live_open_count = int(mday.get('open_positions_now') or 0)
+    except Exception:
+        live_open_count = 0
+    try:
+        opened_today_count = int(mday.get('opened_today_count') or 0)
+    except Exception:
+        opened_today_count = 0
+    try:
+        admin_user = get_user(int(uid)) or {}
+        max_trades_day_limit = int(admin_user.get('max_trades_day') or 0)
+    except Exception:
+        max_trades_day_limit = 0
+    if max_trades_day_limit > 0 and opened_today_count >= max_trades_day_limit:
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_trades_day_reached', 'opened_today_count': int(opened_today_count), 'max_trades_day': int(max_trades_day_limit)})
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'max_trades_day_reached ({opened_today_count}/{max_trades_day_limit})')
+        except Exception:
+            pass
+        return (False, 'max_trades_day_reached')
+    if int(AUTOTRADE_MAX_OPEN_TRADES or 0) > 0 and live_open_count >= int(AUTOTRADE_MAX_OPEN_TRADES):
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_open_trades_reached', 'open_positions_now': int(live_open_count)})
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'max_open_trades_reached ({live_open_count}/{int(AUTOTRADE_MAX_OPEN_TRADES)})')
+        except Exception:
+            pass
+        return (False, 'max_open_trades_reached')
     daily_cap = float(mday.get('cap') or 0.0)
     open_risk = float(mday.get('open_risk') or 0.0)
     used_total_before = float(mday.get('used_total') or 0.0)
@@ -5441,6 +5473,7 @@ def _learning_status_text() -> str:
         f"• Runtime parameter changes: {'YES' if optimizer_live_changes or opt_promoted else 'YES, but no change has been promoted yet'}",
         "• Closed-trade PnL is already used automatically for day-risk accounting and admin reports.",
         "• TP-stage learning is automatic through stored signal outcomes and now feeds the live conditional break-even-after-TP1 rule.",
+        "• Zero-touch autopilot now re-tests shortlisted parameter sets across 7d / 14d / 21d / 30d windows before any live promotion.",
         "• The bot does NOT rewrite its own source code or GitHub file.",
     ])
 
@@ -7728,8 +7761,9 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["over_by"] = max(0.0, -rem) if math.isfinite(rem) and snap["cap"] > 0 else 0.0
         snap["pnl_today"] = float(m.get("realized_pnl_today") or 0.0)
         snap["trades_today"] = int(m.get("opened_today_count") or 0)
-        snap["trades_today_limit"] = 0
-        snap["remaining_new_positions_today"] = 0
+        admin_trade_limit = int(user.get("max_trades_day") or 0)
+        snap["trades_today_limit"] = admin_trade_limit
+        snap["remaining_new_positions_today"] = max(0, admin_trade_limit - int(snap["trades_today"])) if admin_trade_limit > 0 else 0
     else:
         cap = float(daily_cap_usd(user) or 0.0)
         pnl_today = float(_pnl_today_closed_trades(uid, user) or 0.0)
@@ -9501,8 +9535,8 @@ def rr_to_tp(entry: float, sl: float, tp: float) -> float:
 # - Used by both /screen and email selection, and by backtests.
 # =========================================================
 
-QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "58"))
-QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "64"))
+QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "62"))
+QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "70"))
 
 # Soft throttling: how many candidates we score before slicing (keeps compute bounded)
 QUALITY_SCORE_CAND_MULT_SCREEN = int(os.environ.get("QUALITY_SCORE_CAND_MULT_SCREEN", "8"))
@@ -9949,237 +9983,409 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
 
     return setups
 
-def _simulate_one_setup(ohlcv: list, start_i: int, setup: "Setup", max_bars: int = 96) -> dict:
-    """Simulate TP3 vs SL only (fast). Returns dict outcome + R multiple."""
-    entry = float(getattr(setup, "entry", 0.0) or 0.0)
-    sl = float(getattr(setup, "sl", 0.0) or 0.0)
-    tp = float(getattr(setup, "tp3", 0.0) or 0.0)
-    side = str(getattr(setup, "side", "") or "").upper()
+def _tp_split_two_target() -> tuple[float, float]:
+    """Collapse any configured TP split into canonical 2-target weights."""
+    try:
+        raw = list(AUTOTRADE_TP_SPLIT or [0.5, 0.5, 0.0])
+    except Exception:
+        raw = [0.5, 0.5, 0.0]
+    while len(raw) < 3:
+        raw.append(0.0)
+    w1 = float(raw[0] or 0.0)
+    w2 = float(raw[1] or 0.0) + float(raw[2] or 0.0)
+    s = w1 + w2
+    if s <= 0:
+        return 0.5, 0.5
+    return float(w1 / s), float(w2 / s)
+
+
+def _parse_days_ago(s: str | int | float | None) -> int:
+    try:
+        x = str(s or '0').strip().lower().replace('ago', '').replace('d', '')
+        return max(0, min(365, int(float(x))))
+    except Exception:
+        return 0
+
+
+def _backtest_window_bounds(days: int, end_days_ago: int = 0, warmup_bars: int = 300, tf: str = '1h') -> tuple[int, int, int, int]:
+    """Return (since_ms, until_ms, eval_since_ms, eval_until_ms)."""
+    now_ms = int(time.time() * 1000)
+    d = max(1, int(days or 1))
+    ago = max(0, int(end_days_ago or 0))
+    tf_min = max(1, _tf_to_minutes(tf))
+    eval_until_ms = now_ms - (ago * 86400 * 1000)
+    eval_since_ms = eval_until_ms - (d * 86400 * 1000)
+    warmup_ms = int(max(50, warmup_bars) * tf_min * 60 * 1000)
+    since_ms = max(0, eval_since_ms - warmup_ms)
+    until_ms = eval_until_ms
+    return int(since_ms), int(until_ms), int(eval_since_ms), int(eval_until_ms)
+
+
+def _simulate_one_setup(
+    ohlcv: list,
+    start_i: int,
+    setup: "Setup",
+    max_bars: int = 96,
+    move_sl_to_be_after_tp1: bool = True,
+) -> dict:
+    """Simulate canonical 2-TP behavior (TP1, TP2, SL, OPEN/TIMEOUT).
+
+    R multiple is weighted using the live TP split collapsed into two targets.
+    If TP1 is hit and BE-after-TP1 is enabled, the remaining size is assumed to be
+    protected at entry for the rest of the trade.
+    """
+    entry = float(getattr(setup, 'entry', 0.0) or 0.0)
+    sl = float(getattr(setup, 'sl', 0.0) or 0.0)
+    side = str(getattr(setup, 'side', '') or '').upper()
+    tp1 = float(getattr(setup, 'tp1', 0.0) or 0.0)
+    tp2 = float(getattr(setup, 'tp2', 0.0) or getattr(setup, 'tp3', 0.0) or 0.0)
+    tp1, tp2, _ = _ensure_three_tps(entry, sl, float(tp2 or 0.0), tp1, tp2, side)
 
     R = abs(entry - sl)
-    if entry <= 0 or sl <= 0 or tp <= 0 or R <= 0:
-        return {"outcome": "INVALID", "R": 0.0, "bars": 0}
+    if entry <= 0 or sl <= 0 or tp1 <= 0 or tp2 <= 0 or R <= 0:
+        return {'outcome': 'INVALID', 'R': 0.0, 'bars': 0, 'hit_tp1': False, 'hit_tp2': False}
 
+    w1, w2 = _tp_split_two_target()
+    rr1 = float(rr_to_tp(entry, sl, tp1) or 0.0)
+    rr2 = float(rr_to_tp(entry, sl, tp2) or 0.0)
     end = min(len(ohlcv), start_i + max_bars)
+
+    tp1_hit = False
+    remaining_sl = sl
+    realized_r = 0.0
+
     for j in range(start_i, end):
         h = float(ohlcv[j][2]); l = float(ohlcv[j][3])
-        if side == "BUY":
-            hit_sl = l <= sl
-            hit_tp = h >= tp
+        if side == 'BUY':
+            hit_sl = l <= remaining_sl
+            hit1 = h >= tp1
+            hit2 = h >= tp2
         else:
-            hit_sl = h >= sl
-            hit_tp = l <= tp
+            hit_sl = h >= remaining_sl
+            hit1 = l <= tp1
+            hit2 = l <= tp2
 
-        # If both hit in same bar, assume worst-case (conservative)
-        if hit_sl and hit_tp:
-            return {"outcome": "SL_FIRST", "R": -1.0, "bars": j - start_i + 1}
-        if hit_sl:
-            return {"outcome": "SL", "R": -1.0, "bars": j - start_i + 1}
-        if hit_tp:
-            rr = rr_to_tp(entry, sl, tp)
-            return {"outcome": "TP3", "R": float(rr), "bars": j - start_i + 1}
+        if not tp1_hit:
+            if hit_sl and (hit1 or hit2):
+                return {'outcome': 'SL_FIRST', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_tp2': False}
+            if hit_sl:
+                return {'outcome': 'SL', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_tp2': False}
+            if hit2:
+                return {'outcome': 'TP2', 'R': float((w1 * rr1) + (w2 * rr2)), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': True}
+            if hit1:
+                tp1_hit = True
+                realized_r += float(w1 * rr1)
+                if move_sl_to_be_after_tp1:
+                    remaining_sl = entry
+                continue
+        else:
+            if hit2:
+                return {'outcome': 'TP2', 'R': float(realized_r + (w2 * rr2)), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': True}
+            if hit_sl:
+                if move_sl_to_be_after_tp1:
+                    return {'outcome': 'TP1_BE', 'R': float(realized_r), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': False}
+                return {'outcome': 'TP1_SL', 'R': float(realized_r - w2), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': False}
 
-    # timed out: mark-to-market at last close
-    c = float(ohlcv[end-1][4])
-    if side == "BUY":
-        r = (c - entry) / R
-    else:
-        r = (entry - c) / R
-    return {"outcome": "TIMEOUT", "R": float(r), "bars": end - start_i}
+    c = float(ohlcv[end - 1][4])
+    rem_r = ((c - entry) / R) if side == 'BUY' else ((entry - c) / R)
+    if tp1_hit:
+        return {'outcome': 'TP1_TIMEOUT', 'R': float(realized_r + (w2 * rem_r)), 'bars': end - start_i, 'hit_tp1': True, 'hit_tp2': False}
+    return {'outcome': 'TIMEOUT', 'R': float(rem_r), 'bars': end - start_i, 'hit_tp1': False, 'hit_tp2': False}
 
-def run_backtest(symbol: str, days: int = 30, tf: str = "1h", session_name: str = "NY") -> dict:
-    """Admin backtest runner (fast, no external deps)."""
+
+def run_backtest(
+    symbol: str,
+    days: int = 30,
+    tf: str = '1h',
+    session_name: str = 'NY',
+    end_days_ago: int = 0,
+    initial_equity: float = 1000.0,
+    risk_pct: float = 1.0,
+    compounding: bool = True,
+    move_sl_to_be_after_tp1: bool = True,
+) -> dict:
+    """Admin backtest runner with anchored historical windows and equity-based results."""
     sym = _bybit_linear_symbol(symbol)
     d = _parse_days(str(days))
-    tf = str(tf or "1h").strip().lower()
+    tf = str(tf or '1h').strip().lower()
+    end_days_ago = _parse_days_ago(end_days_ago)
+    sess = str(session_name or 'NY').strip().upper()
+    if sess in ('ALL', 'ANY', '*'):
+        sess = ''
 
-    # Bybit/ccxt uses limits not date ranges; approximate bars needed
     tf_min = _tf_to_minutes(tf)
-    bars = int((d * 1440) / max(1, tf_min)) + 300  # warmup
-    bars = int(min(20000, max(600, bars)))
-
-    ohlcv = fetch_ohlcv(sym, tf, limit=bars)
+    warmup_bars = 300
+    since_ms, until_ms, eval_since_ms, eval_until_ms = _backtest_window_bounds(d, end_days_ago=end_days_ago, warmup_bars=warmup_bars, tf=tf)
+    limit = 1000 if tf_min <= 60 else 500
+    ohlcv = fetch_ohlcv_paged(sym, tf, since_ms=since_ms, until_ms=until_ms, limit=limit)
     if not ohlcv or len(ohlcv) < 300:
-        return {"ok": False, "error": "insufficient_ohlcv", "symbol": sym, "tf": tf, "days": d}
+        return {'ok': False, 'error': 'insufficient_ohlcv', 'symbol': sym, 'tf': tf, 'days': d, 'end_days_ago': end_days_ago}
 
-    setups = _backtest_generate_setups(sym, ohlcv, tf, session_name=session_name)
+    ohlcv = [c for c in sorted(ohlcv, key=lambda r: r[0]) if int(c[0]) <= int(eval_until_ms)]
+    if not ohlcv:
+        return {'ok': False, 'error': 'empty_window', 'symbol': sym, 'tf': tf, 'days': d, 'end_days_ago': end_days_ago}
+
+    setups = _backtest_generate_setups(sym, ohlcv, tf, session_name=sess)
+    if eval_since_ms > 0:
+        filtered = []
+        for s in setups:
+            try:
+                cts = float(getattr(s, 'created_ts', 0.0) or 0.0)
+                ts_ms = int(cts * 1000)
+                if ts_ms < int(eval_since_ms) or ts_ms > int(eval_until_ms):
+                    continue
+                filtered.append(s)
+            except Exception:
+                continue
+        setups = filtered
+
     if not setups:
-        return {"ok": True, "symbol": sym, "tf": tf, "days": d, "setups": 0, "report": {"note": "no_setups"}}
+        return {
+            'ok': True, 'symbol': sym, 'tf': tf, 'days': d, 'end_days_ago': end_days_ago,
+            'window_start_ts': eval_since_ms / 1000.0, 'window_end_ts': eval_until_ms / 1000.0,
+            'setups': 0, 'trades': 0, 'win_rate': 0.0, 'tp1_rate': 0.0, 'tp2_rate': 0.0,
+            'avg_R': 0.0, 'profit_factor': 0.0, 'max_drawdown_R': 0.0, 'equity_R': 0.0,
+            'initial_equity': float(initial_equity), 'ending_equity': float(initial_equity), 'net_pnl_usd': 0.0,
+            'max_drawdown_usd': 0.0, 'reject_breakdown': dict(_BT_LAST_REJECTS), 'by_session': {},
+        }
 
-    # Simulate
     results = []
-    equity_curve = []
-    eq = 0.0
-    max_dd = 0.0
-    peak = 0.0
+    eq_r = 0.0
+    peak_r = 0.0
+    max_dd_r = 0.0
+    eq_usd = float(max(1.0, initial_equity or 1000.0))
+    peak_usd = eq_usd
+    max_dd_usd = 0.0
+    fixed_risk_usd = float(eq_usd * (max(0.01, float(risk_pct or 1.0)) / 100.0))
+    by_session = defaultdict(lambda: {'setups': 0, 'wins': 0, 'losses': 0, 'tp1_hits': 0, 'tp2_hits': 0, 'r': []})
+    hold_bars = []
 
-    # map setup_id "BT-i" -> index i
     for s in setups:
         try:
-            sid = str(getattr(s, "setup_id", "BT-0"))
-            i = int(sid.split("-")[-1])
+            sid = str(getattr(s, 'setup_id', 'BT-0'))
+            i = int(sid.split('-')[-1])
         except Exception:
             i = 0
-        res = _simulate_one_setup(ohlcv, i + 1, s)
-        res["setup_id"] = getattr(s, "setup_id", "")
-        res["score"] = float(getattr(s, "quality_score", 0.0) or 0.0)
+
+        ts_sec = 0.0
+        try:
+            ts_raw = float((ohlcv[i][0] if i < len(ohlcv) else ohlcv[-1][0]) or 0.0)
+            ts_sec = (ts_raw / 1000.0) if ts_raw > 1e12 else ts_raw
+        except Exception:
+            ts_sec = 0.0
+        try:
+            sess_name = str(_session_label_from_ts(ts_sec) or '?')
+        except Exception:
+            sess_name = '?'
+
+        res = _simulate_one_setup(ohlcv, i + 1, s, move_sl_to_be_after_tp1=bool(move_sl_to_be_after_tp1))
+        r_mult = float(res.get('R', 0.0) or 0.0)
+        risk_usd = float(eq_usd * (max(0.01, float(risk_pct or 1.0)) / 100.0)) if compounding else fixed_risk_usd
+        pnl_usd = float(r_mult * risk_usd)
+        eq_usd += pnl_usd
+        peak_usd = max(peak_usd, eq_usd)
+        max_dd_usd = max(max_dd_usd, peak_usd - eq_usd)
+
+        eq_r += r_mult
+        peak_r = max(peak_r, eq_r)
+        max_dd_r = max(max_dd_r, peak_r - eq_r)
+
+        out = str(res.get('outcome') or '').upper().strip()
+        by_session[sess_name]['setups'] += 1
+        by_session[sess_name]['r'].append(r_mult)
+        if bool(res.get('hit_tp1')):
+            by_session[sess_name]['tp1_hits'] += 1
+        if bool(res.get('hit_tp2')):
+            by_session[sess_name]['tp2_hits'] += 1
+        if out in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2'):
+            by_session[sess_name]['wins'] += 1
+        elif out in ('SL', 'SL_FIRST', 'TP1_SL'):
+            by_session[sess_name]['losses'] += 1
+        try:
+            hold_bars.append(int(res.get('bars', 0) or 0))
+        except Exception:
+            pass
+
+        res['setup_id'] = getattr(s, 'setup_id', '')
+        res['score'] = float(getattr(s, 'quality_score', 0.0) or 0.0)
+        res['session'] = sess_name
+        res['pnl_usd'] = float(pnl_usd)
+        res['equity_after_usd'] = float(eq_usd)
         results.append(res)
 
-        eq += float(res.get("R", 0.0) or 0.0)
-        peak = max(peak, eq)
-        dd = peak - eq
-        max_dd = max(max_dd, dd)
-        equity_curve.append(eq)
-
-    wins = [r for r in results if str(r.get("outcome")) == "TP3"]
-    losses = [r for r in results if str(r.get("outcome")) in ("SL", "SL_FIRST")]
     total = len(results)
+    wins = sum(1 for r in results if str(r.get('outcome') or '').upper().strip() in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2'))
+    tp1_hits = sum(1 for r in results if bool(r.get('hit_tp1')))
+    tp2_hits = sum(1 for r in results if bool(r.get('hit_tp2')))
+    win_rate = (wins / total * 100.0) if total else 0.0
+    tp1_rate = (tp1_hits / total * 100.0) if total else 0.0
+    tp2_rate = (tp2_hits / total * 100.0) if total else 0.0
+    avg_r = (sum(float(r.get('R', 0.0) or 0.0) for r in results) / total) if total else 0.0
+    gross_win = sum(max(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
+    gross_loss = sum(min(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float('inf') if gross_win > 0 else 0.0)
 
-    win_rate = (len(wins) / total) * 100.0 if total else 0.0
-    avg_r = float(sum(float(r.get("R", 0.0) or 0.0) for r in results) / total) if total else 0.0
-    gross_win = float(sum(max(0.0, float(r.get("R", 0.0) or 0.0)) for r in results))
-    gross_loss = float(sum(min(0.0, float(r.get("R", 0.0) or 0.0)) for r in results))
-    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float("inf") if gross_win > 0 else 0.0)
+    by_sess_out = {}
+    for sess_name, dct in dict(by_session).items():
+        s_n = int(dct.get('setups', 0) or 0)
+        s_w = int(dct.get('wins', 0) or 0)
+        rr = dct.get('r') or []
+        by_sess_out[str(sess_name)] = {
+            'setups': s_n,
+            'wins': s_w,
+            'losses': int(dct.get('losses', 0) or 0),
+            'win_rate': float((s_w / s_n * 100.0) if s_n else 0.0),
+            'tp1_rate': float((int(dct.get('tp1_hits', 0) or 0) / s_n * 100.0) if s_n else 0.0),
+            'tp2_rate': float((int(dct.get('tp2_hits', 0) or 0) / s_n * 100.0) if s_n else 0.0),
+            'avg_R': float((sum(float(x) for x in rr) / len(rr)) if rr else 0.0),
+        }
 
+    avg_hold_minutes = (sum(hold_bars) / len(hold_bars) * tf_min) if hold_bars else 0.0
     return {
-        "ok": True,
-        "symbol": sym,
-        "tf": tf,
-        "days": d,
-        "setups": total,
-        "trades": total,
-        "conversion_rate": (total / total) if total else 0.0,
-        "win_rate": win_rate,
-        "avg_R": avg_r,
-        "profit_factor": pf,
-        "max_drawdown_R": float(max_dd),
-        "equity_R": float(eq),
-        "avg_hold_bars": float(sum(float(r.get("bars",0) or 0) for r in results)/total) if total else 0.0,
-        "avg_hold_minutes": float(sum(float(r.get("bars",0) or 0) for r in results)/total) * float(tf_min) if total else 0.0,
-        "reject_breakdown": dict(_BT_LAST_REJECTS) if isinstance(globals().get("_BT_LAST_REJECTS"), Counter) else {},
-        "sample": results[:12],
+        'ok': True,
+        'symbol': sym,
+        'tf': tf,
+        'days': d,
+        'end_days_ago': end_days_ago,
+        'window_start_ts': eval_since_ms / 1000.0,
+        'window_end_ts': eval_until_ms / 1000.0,
+        'setups': total,
+        'trades': total,
+        'win_rate': float(win_rate),
+        'tp1_rate': float(tp1_rate),
+        'tp2_rate': float(tp2_rate),
+        'avg_R': float(avg_r),
+        'profit_factor': pf,
+        'max_drawdown_R': float(max_dd_r),
+        'equity_R': float(eq_r),
+        'initial_equity': float(initial_equity),
+        'ending_equity': float(eq_usd),
+        'net_pnl_usd': float(eq_usd - float(initial_equity)),
+        'max_drawdown_usd': float(max_dd_usd),
+        'risk_pct': float(risk_pct),
+        'compounding': bool(compounding),
+        'avg_hold_minutes': float(avg_hold_minutes),
+        'reject_breakdown': dict(_BT_LAST_REJECTS),
+        'by_session': by_sess_out,
+        'sample': results[:12],
     }
+
 
 async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_user(update.effective_user.id):
-        await update.message.reply_text("Admin only.")
+        await update.message.reply_text('Admin only.')
         return
     args = (context.args or [])
     if len(args) < 3:
         await update.message.reply_text(
             "Usage:\n"
             "/backtest BTCUSDT 30d 1h\n"
-            "/backtest ETHUSDT 7d 15m\n"
+            "/backtest ETHUSDT 7d 15m NY 0ago 1000\n"
+            "/backtest BTCUSDT 14d 1h ALL 7ago 1000 1.0 on\n\n"
+            "Args: symbol days tf [session=NY|LON|ASIA|ALL] [end_days_ago=0ago] [equity=1000] [risk%=1.0] [compound=on|off]"
         )
         return
     symbol = args[0]
     days = args[1]
     tf = args[2]
-    session_name = "NY"
+    session_name = str(args[3]).upper().strip() if len(args) >= 4 else 'NY'
+    end_days_ago = _parse_days_ago(args[4]) if len(args) >= 5 else 0
     try:
-        if len(args) >= 4:
-            session_name = str(args[3]).upper()
+        initial_equity = float(args[5]) if len(args) >= 6 else 1000.0
     except Exception:
-        session_name = "NY"
-
-    await update.message.reply_text("⏳ Running backtest… (this can take a bit)")
+        initial_equity = 1000.0
     try:
-        rep = await to_thread_heavy(run_backtest, symbol, days, tf, session_name=session_name)
+        risk_pct = float(args[6]) if len(args) >= 7 else 1.0
+    except Exception:
+        risk_pct = 1.0
+    compound = True
+    if len(args) >= 8:
+        compound = str(args[7]).strip().lower() not in ('off', 'false', '0', 'no')
+
+    await update.message.reply_text('⏳ Running backtest…')
+    try:
+        rep = await to_thread_heavy(
+            run_backtest,
+            symbol,
+            days,
+            tf,
+            session_name=session_name,
+            end_days_ago=end_days_ago,
+            initial_equity=initial_equity,
+            risk_pct=risk_pct,
+            compounding=compound,
+            move_sl_to_be_after_tp1=True,
+        )
     except Exception as e:
-        await update.message.reply_text(f"Backtest failed: {type(e).__name__}: {e}")
+        await update.message.reply_text(f'Backtest failed: {type(e).__name__}: {e}')
         return
 
-    if not rep.get("ok"):
+    if not rep.get('ok'):
         await update.message.reply_text(f"Backtest error: {rep.get('error')}")
         return
 
-    # Pretty report
     lines = []
-    lines.append("📊 Backtest Report")
+    lines.append('📊 Backtest Report')
     lines.append(HDR)
     lines.append(f"Symbol: {rep.get('symbol')}")
     lines.append(f"TF: {rep.get('tf')} | Days: {rep.get('days')} | Session: {session_name}")
+    try:
+        ws = datetime.fromtimestamp(float(rep.get('window_start_ts') or 0.0), tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        we = datetime.fromtimestamp(float(rep.get('window_end_ts') or 0.0), tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        lines.append(f"Window: {ws} → {we} | End offset: {int(rep.get('end_days_ago', 0) or 0)}d ago")
+    except Exception:
+        pass
     lines.append(SEP)
     lines.append(f"Setups: {rep.get('setups')}")
     try:
-        lines.append(f"Trades (simulated): {rep.get('trades', rep.get('setups'))}")
-        setups_day = (float(rep.get('setups',0) or 0) / float(rep.get('days',1) or 1))
+        setups_day = (float(rep.get('setups', 0) or 0) / float(rep.get('days', 1) or 1))
         lines.append(f"Setups/day: {setups_day:.2f}")
     except Exception:
         pass
     lines.append(f"Win rate: {_fmt_num(rep.get('win_rate'), '.1f')}%")
+    lines.append(f"TP1 hit rate: {_fmt_num(rep.get('tp1_rate'), '.1f')}%")
+    lines.append(f"TP2 hit rate: {_fmt_num(rep.get('tp2_rate'), '.1f')}%")
     lines.append(f"Avg R: {_fmt_num(rep.get('avg_R'), '.3f')}")
     lines.append(f"Profit factor: {_fmt_num(rep.get('profit_factor'), '.2f')}")
     lines.append(f"Max DD (R): {_fmt_num(rep.get('max_drawdown_R'), '.2f')}")
     lines.append(f"Net (R): {_fmt_num(rep.get('equity_R'), '.2f')}")
+    lines.append(f"Start equity: ${float(rep.get('initial_equity', 0.0) or 0.0):,.2f}")
+    lines.append(f"End equity: ${float(rep.get('ending_equity', 0.0) or 0.0):,.2f}")
+    lines.append(f"Net PnL: ${float(rep.get('net_pnl_usd', 0.0) or 0.0):,.2f}")
+    lines.append(f"Max DD ($): ${float(rep.get('max_drawdown_usd', 0.0) or 0.0):,.2f}")
     try:
-        lines.append(f"Avg hold: {float(rep.get('avg_hold_minutes',0.0) or 0.0):.1f} min")
+        lines.append(f"Avg hold: {float(rep.get('avg_hold_minutes', 0.0) or 0.0):.1f} min")
     except Exception:
         pass
 
     try:
-        rb = rep.get("reject_breakdown") or {}
+        bs = rep.get('by_session') or {}
+        if isinstance(bs, dict) and bs:
+            lines.append(SEP)
+            lines.append('By session:')
+            for sname in ('NY', 'LON', 'ASIA'):
+                d = bs.get(sname) or {}
+                if not d:
+                    continue
+                lines.append(
+                    f"• {sname}: setups={int(d.get('setups', 0) or 0)} | WR={float(d.get('win_rate', 0.0) or 0.0):.1f}% | TP1={float(d.get('tp1_rate', 0.0) or 0.0):.1f}% | TP2={float(d.get('tp2_rate', 0.0) or 0.0):.1f}% | AvgR={float(d.get('avg_R', 0.0) or 0.0):.2f}"
+                )
+    except Exception:
+        pass
+
+    try:
+        rb = rep.get('reject_breakdown') or {}
         if isinstance(rb, dict) and rb:
             lines.append(SEP)
-            lines.append("Reject breakdown (top):")
-            items = sorted(rb.items(), key=lambda kv: int(kv[1]), reverse=True)[:12]
-            for k,v in items:
-                lines.append(f"• {k}: {v}")
+            lines.append('Reject breakdown (top):')
+            items = sorted(rb.items(), key=lambda kv: int(kv[1]), reverse=True)[:10]
+            for k, v in items:
+                lines.append(f'• {k}: {v}')
     except Exception:
         pass
 
-    # Sample outcomes
-    try:
-        samp = rep.get("sample") or []
-        if samp:
-            lines.append(SEP)
-            lines.append("Sample outcomes:")
-            for r in samp[:10]:
-                lines.append(f"• {r.get('setup_id')} — {r.get('outcome')} — R={float(r.get('R',0.0)):.2f} — score={float(r.get('score',0.0)):.1f}")
-    except Exception:
-        pass
+    await update.message.reply_text('\\n'.join(lines))
 
-    await send_long_message(update, "\n".join(lines), parse_mode=None)
-
-
-# =========================================================
-# OPTIMIZATION (ADMIN) — bounded, deterministic, walk-forward
-# =========================================================
-
-def _build_universe_for_opt(cfg: dict) -> list[str]:
-    """Return list of market symbols (ccxt) for Bybit USDT perps meeting min volume."""
-    try:
-        best = fetch_futures_tickers()
-    except Exception:
-        best = {}
-    min_vol = float(cfg.get("min_fut_vol_usd", MIN_FUT_VOL_USD))
-    top_n = int(cfg.get("universe_top_n", 120))
-    # Filter + sort by notional
-    items = []
-    for base, mv in (best or {}).items():
-        try:
-            if usd_notional(mv) < min_vol:
-                continue
-            # Exclude obvious illiquid/new listings by missing VWAP/price
-            if float(mv.last or 0.0) <= 0:
-                continue
-            items.append((base, mv))
-        except Exception:
-            continue
-    items.sort(key=lambda kv: usd_notional(kv[1]), reverse=True)
-    items = items[:max(50, min(150, top_n))]
-    out = []
-    for base, mv in items:
-        out.append(str(mv.symbol))
-    return out
-
-def _walk_forward_split(ohlcv: list, train_frac: float = 0.7) -> tuple[list, list]:
-    if not ohlcv:
-        return [], []
-    n = len(ohlcv)
-    cut = max(100, int(n * float(train_frac)))
-    cut = min(n-50, cut) if n > 200 else cut
-    return ohlcv[:cut], ohlcv[cut:]
 
 def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session_name: str) -> dict:
     """Same as run_backtest but uses already-fetched ohlcv.
@@ -10251,7 +10457,7 @@ def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session
         by_session[sess]["r"].append(float(res["R"]))
 
         # WIN definition: TP1 hit before SL => TP1/TP2/TP3 are all wins
-        if out in ("TP1", "TP2", "TP3"):
+        if out in ("TP1", "TP1_BE", "TP1_TIMEOUT", "TP2", "TP3"):
             by_session[sess]["wins"] += 1
         elif out in ("SL", "LOSS"):
             by_session[sess]["losses"] += 1
@@ -10259,7 +10465,7 @@ def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session
     total = len(results)
 
     # WIN definition: TP1 hit before SL (TP1/TP2/TP3 outcomes are wins)
-    wins = sum(1 for r in results if str(r.get("outcome") or "").upper().strip() in ("TP1", "TP2", "TP3"))
+    wins = sum(1 for r in results if str(r.get("outcome") or "").upper().strip() in ("TP1", "TP1_BE", "TP1_TIMEOUT", "TP2", "TP3"))
     win_rate = (wins / total * 100.0) if total else 0.0
 
     avg_r = (sum(float(r.get("R", 0.0) or 0.0) for r in results) / total) if total else 0.0
@@ -11758,8 +11964,10 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _canon_signal_outcome_label(outcome: str, pnl: float | None = None) -> str:
-    """Canonical user-facing outcome model: TP1, TP2, SL, OPEN."""
+    """Canonical user-facing outcome model: TP1, TP2, SL, OPEN, UNTRACKED."""
     o = str(outcome or '').upper().strip()
+    if o in {'UNTRACKED', 'UNTRACKED_OPEN', 'SKIPPED', 'NOT_TRADED'}:
+        return 'UNTRACKED'
     try:
         pnl_f = None if pnl is None else float(pnl)
     except Exception:
@@ -11892,6 +12100,7 @@ def _canonical_wr_stats(rows: list[dict]) -> dict:
             'tp2': int(ctr.get('TP2', 0)),
             'sl': int(ctr.get('SL', 0)),
             'open': int(ctr.get('OPEN', 0)),
+            'untracked': int(ctr.get('UNTRACKED', 0)),
             'win_rate': float((s_win / s_dec) * 100.0) if s_dec > 0 else 0.0,
         }
     return {
@@ -13238,6 +13447,29 @@ def _self_opt_format_report(res: dict) -> str:
     except Exception:
         pass
 
+    try:
+        win_blocks = m.get("autotune_windows") or []
+        if isinstance(win_blocks, list) and win_blocks:
+            lines.append(SEP)
+            lines.append("Autotune windows:")
+            for w in win_blocks[:8]:
+                ws = (w or {}).get("summary") or {}
+                lines.append(
+                    f"• {w.get('label')}: setups/day={float(ws.get('setups_per_day',0.0) or 0.0):.2f} | WR={float(ws.get('win_rate',0.0) or 0.0):.1f}% | avgR={float(ws.get('avg_R',0.0) or 0.0):.3f}"
+                )
+    except Exception:
+        pass
+
+    try:
+        lg = m.get("learning_guard") or {}
+        if isinstance(lg, dict) and lg:
+            lines.append(SEP)
+            lines.append(
+                f"Learning guard: estWR={float(lg.get('estimated_wr',0.0) or 0.0):.1f}% | conf={str(lg.get('confidence') or 'low')} | live_sample={int(lg.get('live_sample',0) or 0)} | recent_closed={int(lg.get('recent_closed',0) or 0)}"
+            )
+    except Exception:
+        pass
+
     return "\n".join(lines)
 
 def _compute_oos_summary(oos_rows: list[dict], days: float, conc_cap: float) -> dict:
@@ -13285,32 +13517,166 @@ def _aggregate_by_session(oos_rows: list[dict]) -> dict:
         pretty[sname] = {"setups": int(n), "win_rate": float((d["wr"]/n) if n else 0.0), "avg_R": float((d["r"]/n) if n else 0.0)}
     return pretty
 
+def _normalize_autotune_windows(cfg: dict) -> list[dict]:
+    """Safe normalized historical windows for zero-touch optimizer."""
+    raw = (cfg or {}).get("autotune_windows") or []
+    out = []
+    try:
+        for w in raw:
+            if not isinstance(w, dict):
+                continue
+            days = max(3, int(w.get("days", 7) or 7))
+            end_days_ago = max(0, int(w.get("end_days_ago", 0) or 0))
+            out.append({"days": days, "end_days_ago": end_days_ago, "label": f"{days}d_{end_days_ago}ago"})
+    except Exception:
+        out = []
+    if not out:
+        out = [
+            {"days": 7, "end_days_ago": 0, "label": "7d_0ago"},
+            {"days": 14, "end_days_ago": 0, "label": "14d_0ago"},
+            {"days": 21, "end_days_ago": 0, "label": "21d_0ago"},
+            {"days": 30, "end_days_ago": 0, "label": "30d_0ago"},
+        ]
+    return out
+
+
+def _slice_ohlcv_for_window(ohlcv: list, days: int, end_days_ago: int, tf: str, warmup_bars: int = 300) -> list:
+    if not ohlcv:
+        return []
+    try:
+        _since_ms, _until_ms, eval_since_ms, eval_until_ms = _backtest_window_bounds(days, end_days_ago=end_days_ago, warmup_bars=warmup_bars, tf=tf)
+        kept = []
+        for row in (ohlcv or []):
+            try:
+                ts = int(row[0])
+                if ts <= int(eval_until_ms):
+                    kept.append(row)
+            except Exception:
+                continue
+        if not kept:
+            return []
+        start_idx = 0
+        for i, row in enumerate(kept):
+            try:
+                if int(row[0]) >= int(eval_since_ms):
+                    start_idx = max(0, i - int(warmup_bars))
+                    break
+            except Exception:
+                continue
+        return kept[start_idx:]
+    except Exception:
+        return list(ohlcv or [])
+
+
+def _run_backtest_on_ohlcv_window(symbol: str, ohlcv: list, days: int, tf: str, session_name: str, end_days_ago: int = 0) -> dict:
+    sliced = _slice_ohlcv_for_window(ohlcv, days=days, end_days_ago=end_days_ago, tf=tf, warmup_bars=300)
+    rep = _run_backtest_on_ohlcv(symbol, sliced, days=days, tf=tf, session_name=session_name)
+    try:
+        rep["end_days_ago"] = int(end_days_ago)
+        rep["window_label"] = f"{int(days)}d_{int(end_days_ago)}ago"
+    except Exception:
+        pass
+    return rep
+
+
+def _window_bundle_summary(bundle_rows: dict, cfg: dict) -> dict:
+    windows = []
+    flat_rows = []
+    positive = 0
+    pass_wr = 0
+    scores = []
+    total_days = 0.0
+    min_wr_floor = float((cfg or {}).get("autotune_min_window_wr", 52.0) or 52.0)
+    for label, info in (bundle_rows or {}).items():
+        rows = list((info or {}).get("rows") or [])
+        days = int((info or {}).get("days", 0) or 0)
+        total_days += float(max(1, days))
+        summ = _compute_oos_summary(rows, days=float(max(1, days)), conc_cap=float((cfg or {}).get("concentration_cap", 0.25) or 0.25))
+        obj = _objective(rows, days=max(1, days), cfg=cfg) if rows else -1e12
+        windows.append({
+            "label": str(label),
+            "days": days,
+            "end_days_ago": int((info or {}).get("end_days_ago", 0) or 0),
+            "summary": summ,
+            "score": float(obj),
+        })
+        scores.append(float(obj))
+        flat_rows.extend(rows)
+        if float(summ.get("avg_R", 0.0) or 0.0) > 0:
+            positive += 1
+        if float(summ.get("win_rate", 0.0) or 0.0) >= min_wr_floor:
+            pass_wr += 1
+    agg = (_compute_oos_summary(
+        flat_rows,
+        days=float(max(1.0, total_days)),
+        conc_cap=float((cfg or {}).get("concentration_cap", 0.25) or 0.25),
+    ) if flat_rows else {})
+    std_pen = 0.0
+    if len(scores) >= 2:
+        try:
+            std_pen = float(statistics.pstdev(scores))
+        except Exception:
+            std_pen = 0.0
+    return {
+        "windows": windows,
+        "aggregate": agg,
+        "positive_windows": int(positive),
+        "passing_wr_windows": int(pass_wr),
+        "window_scores": [float(x) for x in scores],
+        "score_std": float(std_pen),
+    }
+
+
+def _autotune_learning_guard(session_mode: str = "ALL") -> dict:
+    try:
+        sess = None if str(session_mode).upper() == "ALL" else str(session_mode).upper()
+        live = _evolution_estimated_win_rate(session=sess)
+        recent = _autonomous_opt_performance_snapshot(window_hours=float(AUTONOMOUS_OPT_LOOKBACK_HOURS))
+        return {
+            "estimated_wr": float(live.get("estimated_wr", 0.0) or 0.0),
+            "confidence": str(live.get("confidence") or "low"),
+            "live_sample": int(live.get("live_sample", 0) or 0),
+            "recent_closed": int(recent.get("closed", 0) or 0),
+            "recent_win_rate": float(recent.get("win_rate", 0.0) or 0.0),
+        }
+    except Exception:
+        return {"estimated_wr": 0.0, "confidence": "low", "live_sample": 0, "recent_closed": 0, "recent_win_rate": 0.0}
+
+
 def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Event, progress_cb=None) -> dict:
-    """Runs full self-optimization pipeline in a worker thread."""
+    """Runs full self-optimization pipeline in a worker thread.
+
+    Zero-touch design:
+    1) Search a bounded candidate grid on a primary window.
+    2) Re-test shortlisted candidates across multiple historical windows (7/14/21/30d by default).
+    3) Merge live-learning evidence as a promotion guard so weak real-world performance
+       can tighten promotion even if backtests look good.
+    """
     _opt_migrate_tables()
     base_cfg = load_strategy_config(force=True)
+    robust_windows = _normalize_autotune_windows(base_cfg)
+    primary_days = max(3, int(days or 7))
 
-    # TF candidates start: 5m,15m only (expand only if frequency target not met)
-    tf_candidates = ["5m", "15m"]
+    tf_candidates = list(base_cfg.get("exec_tf_candidates") or ["5m", "15m"])[:3]
+    if not tf_candidates:
+        tf_candidates = ["5m", "15m"]
 
-    # Universe snapshot (TOP100, >=$10M)
     univ = _build_universe_snapshot_top_volume(top_n=100, min_vol_usd=10_000_000.0)
     universe_snap_id = str(univ.get("snap_id") or "")
     universe = list(univ.get("market_symbols") or [])[:100]
     universe_size = len(universe)
 
     run_id = f"OPT-{_utc_day_str()}-{int(time.time())}"
-    _db_create_opt_run(run_id, days=int(days), session_mode=str(session_mode), tf_candidates=tf_candidates, universe_snap_id=universe_snap_id, universe_size=universe_size)
+    _db_create_opt_run(run_id, days=int(primary_days), session_mode=str(session_mode), tf_candidates=tf_candidates, universe_snap_id=universe_snap_id, universe_size=universe_size)
 
     cands = _generate_candidates(base_cfg)
-    days_test = max(7, int(days * 0.3))
+    days_test = max(7, int(primary_days * 0.3))
     conc_cap = float(base_cfg.get("concentration_cap", 0.25) or 0.25)
+    robust_max_days = max([int(w.get("days", 0) or 0) for w in robust_windows] + [primary_days])
+    shortlist_n = max(4, int(base_cfg.get("autotune_shortlist", 10) or 10))
 
-    best_score = -1e18
-    best_params = None
-    best_metrics = None
-    best_tf = None
-    best_rejects = None
+    candidate_pool = []
+    ohlcv_cache_by_tf = {}
 
     for exec_tf in tf_candidates:
         if stop_event.is_set():
@@ -13321,19 +13687,20 @@ def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Ev
             progress_cb(f"Fetching OHLCV for TF={exec_tf} (universe={len(universe)})…", {"stage": "fetch_ohlcv", "tf": exec_tf})
 
         ohlcv_map = {}
+        tf_min = _tf_to_minutes(exec_tf)
+        bars = int((robust_max_days * 1440) / max(1, tf_min)) + 400
+        bars = int(min(12000, max(1200, bars)))
         for si, sym in enumerate(universe):
             if stop_event.is_set():
                 _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
                 return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
             try:
-                tf_min = _tf_to_minutes(exec_tf)
-                bars = int((days * 1440) / max(1, tf_min)) + 300
-                bars = int(min(12000, max(900, bars)))
                 ohlcv_map[sym] = fetch_ohlcv(sym, exec_tf, limit=bars)
             except Exception:
                 ohlcv_map[sym] = []
             if si % 15 == 0:
                 _db_update_opt_run(run_id, progress={"stage": "fetch_ohlcv", "tf": exec_tf, "symbol_idx": si, "universe": len(universe)})
+        ohlcv_cache_by_tf[exec_tf] = ohlcv_map
 
         for ci, cand in enumerate(cands):
             if stop_event.is_set():
@@ -13343,16 +13710,13 @@ def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Ev
             cfg = dict(base_cfg)
             cfg.update(cand)
             cfg["exec_tf_default"] = str(exec_tf)
-
             apply_strategy_config(cfg)
 
             oos_rows = []
             reject_acc = Counter()
-
             for sym in universe:
                 ohl = ohlcv_map.get(sym) or []
-                _train, test = _walk_forward_split(ohl, 0.7)
-                rep = _run_backtest_on_ohlcv(sym, test, days=days_test, tf=exec_tf, session_name=session_mode)
+                rep = _run_backtest_on_ohlcv_window(sym, ohl, days=days_test, tf=exec_tf, session_name=session_mode, end_days_ago=0)
                 oos_rows.append(rep)
                 try:
                     rb = rep.get("reject_breakdown") or {}
@@ -13362,85 +13726,119 @@ def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Ev
                     pass
 
             sc = _objective(oos_rows, days=float(days_test), cfg=cfg)
-
-            if sc > best_score:
-                best_score = float(sc)
-                best_params = dict(cfg)
-                best_tf = str(exec_tf)
-                best_rejects = dict(reject_acc)
-
-                oos_sum = _compute_oos_summary(oos_rows, days=float(days_test), conc_cap=conc_cap)
-                by_sess = _aggregate_by_session(oos_rows)
-                best_metrics = {"oos": oos_sum, "by_session": by_sess}
-
-                _db_update_opt_run(run_id, progress={"stage": "search", "tf": exec_tf, "cand_idx": ci, "cands": len(cands), "best_score": best_score})
-
-                if progress_cb:
-                    progress_cb(f"New best ✅ TF={best_tf} | score={best_score:.3f} | OOS {oos_sum.get('setups_per_day',0.0):.2f}/day | WR {oos_sum.get('win_rate',0.0):.1f}%", {"stage": "new_best"})
+            oos_sum = _compute_oos_summary(oos_rows, days=float(days_test), conc_cap=conc_cap)
+            candidate_pool.append({
+                "score": float(sc),
+                "cfg": dict(cfg),
+                "tf": str(exec_tf),
+                "oos": dict(oos_sum),
+                "rejects": dict(reject_acc),
+            })
 
             if ci % 5 == 0:
-                _db_update_opt_run(run_id, progress={"stage": "search", "tf": exec_tf, "cand_idx": ci, "cands": len(cands), "best_score": best_score})
+                best_now = max([float(x.get("score", -1e18)) for x in candidate_pool] or [-1e18])
+                _db_update_opt_run(run_id, progress={"stage": "search", "tf": exec_tf, "cand_idx": ci, "cands": len(cands), "best_score": best_now})
 
-    if not best_params or not best_tf or not best_metrics:
+    if not candidate_pool:
         _db_update_opt_run(run_id, status="FAILED", finished=True, notes="No viable candidate found")
-        _db_save_opt_result(run_id, promoted=False, chosen_exec_tf="", best_score=float(best_score), best_params={}, metrics={}, reject_stats={})
+        _db_save_opt_result(run_id, promoted=False, chosen_exec_tf="", best_score=float(-1e18), best_params={}, metrics={}, reject_stats={})
         return {"ok": False, "run_id": run_id, "status": "FAILED"}
 
-    # Controlled TF expansion: include 3m only if frequency is below target
-    try:
-        oos_day = float(best_metrics.get("oos", {}).get("setups_per_day", 0.0) or 0.0)
-        lo = float(best_params.get("target_setups_per_day_lo", 3.0) or 3.0)
-    except Exception:
-        oos_day = 0.0; lo = 3.0
+    shortlist = sorted(candidate_pool, key=lambda x: float(x.get("score", -1e18)), reverse=True)[:shortlist_n]
+    learning_guard = _autotune_learning_guard(session_mode=session_mode)
 
-    if oos_day < lo and not stop_event.is_set():
-        if progress_cb:
-            progress_cb("Frequency below target; expanding TF candidates to include 3m (controlled)…", {"stage": "tf_expand"})
-        exec_tf = "3m"
-        ohlcv_map = {}
-        for sym in universe:
-            try:
-                tf_min = _tf_to_minutes(exec_tf)
-                bars = int((days * 1440) / max(1, tf_min)) + 300
-                bars = int(min(12000, max(1200, bars)))
-                ohlcv_map[sym] = fetch_ohlcv(sym, exec_tf, limit=bars)
-            except Exception:
-                ohlcv_map[sym] = []
-        for cand in cands:
-            if stop_event.is_set():
-                break
-            cfg = dict(base_cfg); cfg.update(cand); cfg["exec_tf_default"] = exec_tf
-            apply_strategy_config(cfg)
-            oos_rows = []
-            reject_acc = Counter()
+    best_choice = None
+    best_robust_score = -1e18
+
+    for idx_c, item in enumerate(shortlist):
+        if stop_event.is_set():
+            _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
+            return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
+
+        cfg = dict(item.get("cfg") or {})
+        exec_tf = str(item.get("tf") or cfg.get("exec_tf_default") or "15m")
+        apply_strategy_config(cfg)
+        ohlcv_map = ohlcv_cache_by_tf.get(exec_tf) or {}
+
+        bundle = {}
+        reject_acc = Counter(item.get("rejects") or {})
+        for w in robust_windows:
+            label = str(w.get("label") or f"{int(w.get('days',7))}d_{int(w.get('end_days_ago',0))}ago")
+            rows = []
             for sym in universe:
                 ohl = ohlcv_map.get(sym) or []
-                _train, test = _walk_forward_split(ohl, 0.7)
-                rep = _run_backtest_on_ohlcv(sym, test, days=days_test, tf=exec_tf, session_name=session_mode)
-                oos_rows.append(rep)
+                rep = _run_backtest_on_ohlcv_window(sym, ohl, days=int(w.get("days", 7) or 7), tf=exec_tf, session_name=session_mode, end_days_ago=int(w.get("end_days_ago", 0) or 0))
+                rows.append(rep)
                 try:
                     rb = rep.get("reject_breakdown") or {}
                     if isinstance(rb, dict):
                         reject_acc.update(rb)
                 except Exception:
                     pass
-            sc = _objective(oos_rows, days=float(days_test), cfg=cfg)
-            if sc > best_score:
-                best_score = float(sc)
-                best_params = dict(cfg)
-                best_tf = str(exec_tf)
-                best_rejects = dict(reject_acc)
-                oos_sum = _compute_oos_summary(oos_rows, days=float(days_test), conc_cap=conc_cap)
-                by_sess = _aggregate_by_session(oos_rows)
-                best_metrics = {"oos": oos_sum, "by_session": by_sess}
-                if progress_cb:
-                    progress_cb(f"New best ✅ TF={best_tf} | score={best_score:.3f} | OOS {oos_sum.get('setups_per_day',0.0):.2f}/day | WR {oos_sum.get('win_rate',0.0):.1f}%", {"stage": "new_best"})
+            bundle[label] = {"rows": rows, "days": int(w.get("days", 7) or 7), "end_days_ago": int(w.get("end_days_ago", 0) or 0)}
 
-    # Promotion decision
+        bundle_sum = _window_bundle_summary(bundle, cfg)
+        agg = bundle_sum.get("aggregate") or {}
+        pos_windows = int(bundle_sum.get("positive_windows", 0) or 0)
+        pass_wr_windows = int(bundle_sum.get("passing_wr_windows", 0) or 0)
+        score_std = float(bundle_sum.get("score_std", 0.0) or 0.0)
+        cons_pen = float(base_cfg.get("autotune_consistency_penalty", 2.0) or 2.0) * score_std
+        robust_score = float(agg.get("avg_R", 0.0) or 0.0) * 14.0 + float(agg.get("profit_factor", 0.0) or 0.0) * 1.6 - float(agg.get("max_drawdown_R", 0.0) or 0.0) * 0.9
+        robust_score += (pos_windows * 1.5) + (pass_wr_windows * 0.75) - cons_pen
+
+        if bool(base_cfg.get("autotune_learning_guard_enabled", True)):
+            est_wr = float(learning_guard.get("estimated_wr", 0.0) or 0.0)
+            conf = str(learning_guard.get("confidence") or "low").lower()
+            if conf in {"medium", "high"} and est_wr < 52.0:
+                robust_score -= (52.0 - est_wr) * 0.35
+
+        if robust_score > best_robust_score:
+            best_robust_score = float(robust_score)
+            best_choice = {
+                "cfg": dict(cfg),
+                "tf": exec_tf,
+                "metrics": {
+                    "oos": dict(agg),
+                    "by_session": _aggregate_by_session([r for v in bundle.values() for r in (v.get("rows") or [])]),
+                    "autotune_windows": list(bundle_sum.get("windows") or []),
+                    "positive_windows": pos_windows,
+                    "passing_wr_windows": pass_wr_windows,
+                    "score_std": score_std,
+                    "learning_guard": dict(learning_guard),
+                },
+                "rejects": dict(reject_acc),
+                "robust_score": float(robust_score),
+            }
+
+        _db_update_opt_run(run_id, progress={"stage": "robustness", "candidate_idx": idx_c, "shortlist": len(shortlist), "best_score": float(best_robust_score)})
+
+    if not best_choice:
+        _db_update_opt_run(run_id, status="FAILED", finished=True, notes="No robust candidate found")
+        _db_save_opt_result(run_id, promoted=False, chosen_exec_tf="", best_score=float(best_robust_score), best_params={}, metrics={}, reject_stats={})
+        return {"ok": False, "run_id": run_id, "status": "FAILED"}
+
+    best_params = dict(best_choice.get("cfg") or {})
+    best_tf = str(best_choice.get("tf") or best_params.get("exec_tf_default") or "15m")
+    best_metrics = dict(best_choice.get("metrics") or {})
+    best_rejects = dict(best_choice.get("rejects") or {})
+
     gate_ok, gate_reasons = _self_opt_stability_gates(metrics={"oos": best_metrics.get("oos") or {}, "by_session": best_metrics.get("by_session") or {}}, cfg=best_params)
-    best_metrics["promotion_reasons"] = ([] if gate_ok else gate_reasons)
+    min_positive = int(base_cfg.get("autotune_min_positive_windows", 3) or 3)
+    if int(best_metrics.get("positive_windows", 0) or 0) < min_positive:
+        gate_ok = False
+        gate_reasons = list(gate_reasons or []) + [f"positive_windows<{min_positive}"]
+    if int(best_metrics.get("passing_wr_windows", 0) or 0) < min_positive:
+        gate_ok = False
+        gate_reasons = list(gate_reasons or []) + [f"passing_wr_windows<{min_positive}"]
+    lg = best_metrics.get("learning_guard") or {}
+    if bool(base_cfg.get("autotune_learning_guard_enabled", True)) and str(lg.get("confidence") or "low").lower() == "high" and float(lg.get("estimated_wr", 0.0) or 0.0) < 50.0:
+        gate_ok = False
+        gate_reasons = list(gate_reasons or []) + ["learning_guard_live_wr_below_50"]
 
-    _db_save_opt_result(run_id, promoted=bool(gate_ok), chosen_exec_tf=str(best_tf), best_score=float(best_score), best_params=dict(best_params), metrics=dict(best_metrics), reject_stats=dict(best_rejects or {}))
+    best_metrics["promotion_reasons"] = ([] if gate_ok else gate_reasons)
+    best_metrics["autotune_mode"] = "zero_touch_multi_window"
+
+    _db_save_opt_result(run_id, promoted=bool(gate_ok), chosen_exec_tf=str(best_tf), best_score=float(best_robust_score), best_params=dict(best_params), metrics=dict(best_metrics), reject_stats=dict(best_rejects or {}))
 
     from_cfg = load_strategy_config(force=True)
     promoted = False
@@ -13454,7 +13852,21 @@ def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Ev
         _db_log_promotion(run_id, from_cfg=from_cfg, to_cfg=best_params, decision="NOT_PROMOTED", reasons=gate_reasons)
         _db_update_opt_run(run_id, status="NOT_PROMOTED", finished=True, notes="NOT_PROMOTED")
 
-    return {"ok": True, "run_id": run_id, "promoted": promoted, "chosen_exec_tf": best_tf, "best_score": float(best_score), "best_params": dict(best_params), "metrics": dict(best_metrics), "reject_stats": dict(best_rejects or {}), "universe_snap_id": universe_snap_id, "universe_size": universe_size, "session_mode": str(session_mode), "days_requested": int(days)}
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "promoted": promoted,
+        "chosen_exec_tf": best_tf,
+        "best_score": float(best_robust_score),
+        "best_params": dict(best_params),
+        "metrics": dict(best_metrics),
+        "reject_stats": dict(best_rejects or {}),
+        "universe_snap_id": universe_snap_id,
+        "universe_size": universe_size,
+        "session_mode": str(session_mode),
+        "days_requested": int(primary_days),
+        "autotune_windows": robust_windows,
+    }
 
 async def _notify_admins_autonomous_opt(bot, text_msg: str):
     """No-op: autonomous optimization is fully zero-touch; no Telegram notifications."""
@@ -13691,6 +14103,97 @@ def is_top_setup_eligible(
         return (True, "ok")
     except Exception:
         return (False, "eligibility_exception")
+
+def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]:
+    """Session-aware production thresholds.
+
+    NY remains the preferred execution window, but London and Asia are still allowed
+    with slightly stricter requirements so the bot can surface high-quality global crypto
+    opportunities without turning the email/autotrade lane noisy.
+    """
+    sess = str(session_name or "").upper().strip()
+    if sess == "NY":
+        return (70.0, 78, 2.00)
+    if sess == "LON":
+        return (72.0, 80, 2.10)
+    if sess == "ASIA":
+        return (74.0, 82, 2.20)
+    return (72.0, 80, 2.10)
+
+
+def is_executable_setup_eligible(
+    s: "Setup",
+    session_name: str = "NY",
+    min_quality: float = 70.0,
+    min_conf: int = 78,
+    min_rr_final: float = 2.0,
+) -> tuple[bool, str]:
+    """Production-grade gate for email/executable/autotrade path.
+
+    Best-practice approach:
+    - allow the configured live session (ASIA/LON/NY), not NY-only
+    - keep Engine A as the default/highest-trust source
+    - allow Engine B breakouts only with *stricter* score/conf/RR/liquidity rules
+    - keep the sellable/live path tighter than /screen
+    """
+    try:
+        sess = str(session_name or "").upper().strip()
+        if sess not in {"ASIA", "LON", "NY"}:
+            return (False, "session_not_supported")
+
+        ok, why = is_top_setup_eligible(s, source='email', session_name=sess)
+        if not ok:
+            return (False, f"base_gate_{why}")
+
+        sess_quality, sess_conf, sess_rr = _execution_session_thresholds(sess)
+        score_floor = float(max(min_quality, QUALITY_SCORE_MIN_EMAIL, sess_quality))
+        conf_floor = int(max(min_conf, MIN_SETUP_CONF, sess_conf))
+        rr_floor = float(max(min_rr_final, sess_rr))
+
+        score = float(getattr(s, "quality_score", 0.0) or 0.0)
+        if score < score_floor:
+            return (False, "below_exec_quality")
+
+        conf = int(getattr(s, "conf", 0) or 0)
+        if conf < conf_floor:
+            return (False, "below_exec_conf")
+
+        entry = float(getattr(s, "entry", 0.0) or 0.0)
+        sl = float(getattr(s, "sl", 0.0) or 0.0)
+        final_tp = float(getattr(s, "tp2", 0.0) or getattr(s, "tp3", 0.0) or 0.0)
+        rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
+        if rr_final < rr_floor:
+            return (False, "below_exec_rr")
+
+        engine = str(getattr(s, "engine", "") or "").upper().strip()
+        fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+
+        if engine == "A":
+            if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
+                return (False, "pullback_not_ready")
+            return (True, "ok")
+
+        if engine == "B":
+            if not bool(EXECUTION_ENGINE_B_EMAIL_ENABLED):
+                return (False, "engine_b_disabled")
+            if score < (score_floor + 3.0):
+                return (False, "engine_b_below_quality")
+            if conf < (conf_floor + 2):
+                return (False, "engine_b_below_conf")
+            if rr_final < (rr_floor + 0.15):
+                return (False, "engine_b_below_rr")
+            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.5, 12_000_000.0)):
+                return (False, "engine_b_below_liquidity")
+            ch1 = abs(float(getattr(s, "ch1", 0.0) or 0.0))
+            ch4 = abs(float(getattr(s, "ch4", 0.0) or 0.0))
+            if ch1 < 0.8 or ch4 < 1.5:
+                return (False, "engine_b_trend_not_strong_enough")
+            return (True, "ok")
+
+        return (False, "engine_not_supported")
+    except Exception:
+        return (False, "exec_eligibility_exception")
+
 
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
     """
@@ -14109,10 +14612,6 @@ def make_setup(
         engine_a_ok = bool(ENGINE_A_PULLBACK_ENABLED and pullback_ready)
 
         engine_b_ok = False
-        engine_c_ok = False
-        leader_box_high = None
-        leader_box_low = None
-        leader_box_width_pct = None
 
         if ENGINE_B_MOMENTUM_ENABLED:
             # Aggressive /screen: slightly looser momentum requirements
@@ -14172,53 +14671,7 @@ def make_setup(
                         mv._pf_breakout_hint = "SELL"
             except Exception:
                 pass
-
-        # ------------------------------------------------------------------
-        # C) Leader range breakout continuation (ACX / PIXEL style)
-        # Trend expansion -> 15m box / range -> breakout in trend direction.
-        # This avoids chasing the first pump candle and prefers the first
-        # controlled continuation out of the local base.
-        # ------------------------------------------------------------------
-        try:
-            if ENGINE_C_LEADER_RANGE_ENABLED and c15 and len(c15) >= (int(LEADER_RANGE_BOX_LOOKBACK) + 4):
-                lb = max(5, int(LEADER_RANGE_BOX_LOOKBACK) - (1 if aggressive_screen else 0))
-                box = c15[-(lb + 1):-1]  # completed candles only
-                bh = max(float(x[2]) for x in box)
-                bl = min(float(x[3]) for x in box)
-                bw_pct = ((bh - bl) / entry) * 100.0 if entry > 0 else 999.0
-                leader_box_high, leader_box_low, leader_box_width_pct = bh, bl, bw_pct
-
-                ema12_15 = ema(closes_15, 12) if closes_15 else 0.0
-                ema36_15 = ema(closes_15, 36) if closes_15 and len(closes_15) >= 8 else 0.0
-                near_breakout_pct = float(LEADER_RANGE_NEAR_BREAKOUT_PCT) * (1.15 if aggressive_screen else 1.0)
-                max_box_width_pct = float(LEADER_RANGE_BOX_MAX_WIDTH_PCT) * (1.20 if aggressive_screen else 1.0)
-                buf = entry * (float(LEADER_RANGE_BREAKOUT_BUFFER_BPS) / 10000.0)
-
-                o = float(c15[-1][1]); h = float(c15[-1][2]); l = float(c15[-1][3]); c = float(c15[-1][4])
-                recent_closes = [float(x[4]) for x in c15[-3:]]
-
-                leader_long = (side == 'BUY' and float(ch24) >= float(LEADER_RANGE_MIN_CH24) and float(ch4_used) >= float(LEADER_RANGE_MIN_CH4) and float(fut_vol) >= float(LEADER_RANGE_MIN_FUT_VOL_USD))
-                leader_short = (side == 'SELL' and float(ch24) <= -float(LEADER_RANGE_MIN_CH24) and float(ch4_used) <= -float(LEADER_RANGE_MIN_CH4) and float(fut_vol) >= float(LEADER_RANGE_MIN_FUT_VOL_USD))
-                box_ok = bw_pct <= max_box_width_pct
-
-                if leader_long and box_ok:
-                    hold_ok = (ema12_15 > 0 and c >= ema12_15 * 0.992 and min(recent_closes) >= ema12_15 * 0.982)
-                    if ema36_15 > 0:
-                        hold_ok = hold_ok and (bl >= ema36_15 * 0.94)
-                    broke = (c >= (bh - (entry * near_breakout_pct / 100.0))) and (h >= bh + buf or c >= bh - (entry * near_breakout_pct / 100.0))
-                    if hold_ok and broke:
-                        engine_c_ok = True
-
-                if leader_short and box_ok:
-                    hold_ok = (ema12_15 > 0 and c <= ema12_15 * 1.008 and max(recent_closes) <= ema12_15 * 1.018)
-                    if ema36_15 > 0:
-                        hold_ok = hold_ok and (bh <= ema36_15 * 1.06)
-                    broke = (c <= (bl + (entry * near_breakout_pct / 100.0))) and (l <= bl - buf or c <= bl + (entry * near_breakout_pct / 100.0))
-                    if hold_ok and broke:
-                        engine_c_ok = True
-        except Exception:
-            pass
-
+    
         # If breakout engine fired, force side to match the breakout direction (prevents green BUY / red mismatch)
         try:
             hint = getattr(mv, "_pf_breakout_hint", None)
@@ -14235,20 +14688,14 @@ def make_setup(
         except Exception:
             pass
 
-        if not engine_a_ok and not engine_b_ok and not engine_c_ok:
-            extra = ''
-            try:
-                if leader_box_width_pct is not None:
-                    extra = f" box={leader_box_width_pct:.2f}%"
-            except Exception:
-                extra = ''
-            _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}{extra}")
+        if not engine_a_ok and not engine_b_ok:
+            _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}")
             return None
 
         # ---------------------------------------------------------
-        # Pullback policy (optional for Engine B / Engine C)
+        # Pullback policy (optional for Engine B)
         # ---------------------------------------------------------
-        engine = "A" if engine_a_ok else ("C" if engine_c_ok else "B")
+        engine = "A" if engine_a_ok else "B"
         require_pullback = (not bool(allow_no_pullback))
 
         # Compute confidence BEFORE applying optional pullback penalty
@@ -14305,7 +14752,7 @@ def make_setup(
                 return None
 
             # Momentum engine works best in trend regimes, not ranging.
-            if engine in ("B", "C") and strict_15m and regime == "RANGING" and (not sweep_ok):
+            if engine == "B" and strict_15m and regime == "RANGING" and (not sweep_ok):
                 _rej("pro_ranging_regime_blocks_momentum_soft", base, mv, f"side={side} regime={regime}")
                 conf -= 3
                 notes.append("ranging_penalty")
@@ -14347,7 +14794,7 @@ def make_setup(
                 conf -= 6
                 notes.append("smf_opposes_soft")
             # Require at least 2 of 3 core confirmations for aggressive momentum setups.
-            if engine in ("B", "C"):
+            if engine == "B":
                 core_hits = 0
                 if trend == want_trend:
                     core_hits += 1
@@ -14366,7 +14813,7 @@ def make_setup(
 
         # Email/autotrade quality path can require a real 15m pullback for both engines.
         # This was previously bypassed for Engine B, which let too many NY momentum setups through.
-        pullback_ok_local = bool(pullback_ready or engine == "C") if require_pullback else True
+        pullback_ok_local = bool(pullback_ready) if require_pullback else True
 
         keep, conf2 = apply_pullback_policy(
             require_pullback=require_pullback,
@@ -14436,7 +14883,7 @@ def make_setup(
 
         tp_cap_pct = tp_cap_pct_for_coin(fut_vol, ch24)
 
-        rr_bonus = ENGINE_B_RR_BONUS if engine_b_ok else (LEADER_RANGE_RR_BONUS if engine_c_ok else 0.0)
+        rr_bonus = ENGINE_B_RR_BONUS if engine_b_ok else 0.0
         tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine_b_ok else 0.0
 
         # ✅ Approach A: volatility-aware TP cap tightening (higher hit-rate on choppy/high-ATR coins)
@@ -14453,28 +14900,6 @@ def make_setup(
             entry, side, atr_1h, conf, tp_cap_pct,
             rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
         )
-        # Engine C uses the local 15m continuation box for a more realistic stop
-        # after a pump/base sequence. This avoids oversized ATR stops that kill RR.
-        try:
-            if engine == "C" and leader_box_high is not None and leader_box_low is not None:
-                pad = entry * (float(LEADER_RANGE_STOP_PAD_PCT) / 100.0)
-                if side == 'BUY':
-                    sl_local = float(leader_box_low) - pad
-                    R_local = float(entry) - float(sl_local)
-                else:
-                    sl_local = float(leader_box_high) + pad
-                    R_local = float(sl_local) - float(entry)
-                min_dist = (ATR_MIN_PCT / 100.0) * entry
-                max_dist = (ATR_MAX_PCT / 100.0) * entry
-                if min_dist <= R_local <= max_dist:
-                    sl = float(sl_local)
-                    R = float(R_local)
-                    rr_target = tp3_rr_target_from_conf(conf) + float(rr_bonus)
-                    tp_cap = ((tp_cap_pct + tp_cap_bonus) / 100.0) * entry
-                    tp_dist = min(rr_target * R, tp_cap)
-                    tp3_single = (entry + tp_dist) if side == 'BUY' else (entry - tp_dist)
-        except Exception:
-            pass
         if sl <= 0 or tp3_single <= 0 or R <= 0:
             _rej("bad_sl_tp_or_atr", base, mv, f"atr={atr_1h:.6g} entry={entry:.6g}")
             return None
@@ -14561,10 +14986,6 @@ def make_setup(
             setattr(s, 'smf_score', int(smf_score or 0))
             setattr(s, 'engine', str(engine or ''))
             setattr(s, 'raw_conf', int(conf or 0))
-            try:
-                setattr(s, 'leader_box_width_pct', float(leader_box_width_pct) if leader_box_width_pct is not None else None)
-            except Exception:
-                pass
             # Ensure TP ladder is always present (derive TP1/TP2 if needed)
             try:
                 t1, t2, t3 = _ensure_three_tps(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp3',0.0) or 0.0), getattr(s,'tp1',None), getattr(s,'tp2',None), str(getattr(s,'side','') or ''))
@@ -15853,6 +16274,16 @@ Market & Signals
 /screen
 • Scans the market for high-quality setups
 
+/setups_log <n> <screen|email|all>
+• Shows recently generated setups saved by the bot
+• Example: /setups_log 20 all
+
+/why
+• Shows why the last scan rejected symbols
+
+/email_decision
+• Shows the latest email-pipeline decision and loop health
+
 ────────────────────
 ⚖️ RISK & POSITION SIZING
 ────────────────────
@@ -16016,6 +16447,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "ny_winrate": "Overall NY completed signal WR",
     "lessons_learned": "Latest learning takeaways",
     "email_decision": "Last email pipeline decision",
+    "email_pipeline_status": "Alias of /email_decision for email pipeline visibility",
     "signal_report": "Recent emailed setup outcomes",
     "signal_report_overall": "Overall emailed-signal outcome summary (WR, R, session split)",
     "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
@@ -16040,13 +16472,15 @@ ADMIN_HELP_DESCRIPTIONS = {
     "self_optimize": "Explain autonomous optimizer mode",
     "self_optimize_stop": "Explain why manual stop is disabled",
     "self_optimize_report": "Show latest autonomous optimization result",
+    "autopilot_report": "Alias of /self_optimize_report with multi-window autopilot details",
+    "autopilot_status": "Alias of /learning_status",
     "trade_id_reset": "Reset your own Trade ID numbering",
 }
 
 ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
-    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned", "email_decision"]),
+    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "autotrade_sessions", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
@@ -18390,7 +18824,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             canon, meta = _canonical_signal_outcome_for_setup(int(uid), setup_id)
             if _signal_report_live_backed_only(int(uid), meta, canon) is False and str(canon).upper().strip() == 'OPEN' and int(uid) == int(AUTOTRADE_OWNER_UID or 0) and str(AUTOTRADE_MODE).lower() == 'live':
                 hidden_untracked_open += 1
-                continue
+                canon = 'UNTRACKED'
             created_ts = float(sig.get('created_ts') or e.get('emailed_ts') or 0.0)
             try:
                 tz = ZoneInfo(str(user.get('tz') or 'UTC'))
@@ -18416,14 +18850,14 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Signal Report (last {lookback_h}h)",
         HDR,
         f"Total: {len(rows)} | Decided: {int(stats.get('decided') or 0)} | Wins (TP2): {int(stats.get('wins') or 0)} | Losses: {int(stats.get('losses') or 0)} | Win rate: {float(stats.get('win_rate') or 0.0):.1f}%",
-        f"TP1: {counts.get('TP1',0)} | TP2: {counts.get('TP2',0)} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)}",
+        f"TP1: {counts.get('TP1',0)} | TP2: {counts.get('TP2',0)} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)} | Untracked: {counts.get('UNTRACKED',0)}",
         HDR,
     ]
     table_rows = [[r['session'], r['time'], r['trade'], r['confidence'], r['outcome']] for r in rows]
     table = tabulate(table_rows, headers=['Session','Time','Trade','Confidence','Outcome'], tablefmt='plain', colalign=('left','left','left','right','left'))
     sess_lines = ['Session breakdown:']
     for sname, c in sorted((stats.get('by_session') or {}).items(), key=lambda kv: kv[0]):
-        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)}")
+        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} UNTRACKED {int(c.get('untracked') or 0)}")
     if int(hidden_untracked_open or 0) > 0:
         sess_lines.append(f"• Hidden untracked OPEN rows: {int(hidden_untracked_open)} (not backed by live Bybit/autotrade state)")
     msg = "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>\n" + "\n".join(sess_lines)
@@ -18578,7 +19012,7 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
     if by_session:
         lines.extend([SEP, 'By session'])
         for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
-            lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)}")
+            lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} UNTRACKED {int(c.get('untracked') or 0)}")
     hidden_untracked_open = int(summary.get('hidden_untracked_open') or 0)
     if hidden_untracked_open > 0:
         lines.extend([SEP, f'Hidden untracked OPEN rows: {hidden_untracked_open} (not backed by live Bybit/autotrade state)'])
@@ -18819,6 +19253,10 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     email_time = det.get('email_logged_time') or det.get('generated_logged_time') or ''
     lines.append(f"*Signal created:* `{_fmt_iso_to_local(sig_time) if sig_time else '—'}`")
     lines.append(f"*Email logged:* `{_fmt_iso_to_local(email_time) if email_time else '—'}`")
+    dec_status = str(dec.get('status') or '').strip()
+    dec_reason = str(dec.get('reason') or '').strip()
+    if dec_status or dec_reason:
+        lines.append(f"*Result:* `{dec_status or '—'}`{(' | ' + dec_reason) if dec_reason else ''}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -19103,7 +19541,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         market_take = 15
         trend_take = 12
     else:  # email
-        n_target = int(max(EMAIL_SETUPS_N * 3, 9))
+        n_target = int(max(EMAIL_SETUPS_N * 2, 6))
         strict_15m = True
         universe_cap = 35
         trigger_loosen = 1.0
@@ -19133,7 +19571,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             allow_no_pullback = True
         else:
             # Email pool becomes broader, but final email gates still apply
-            n_target = int(max(EMAIL_SETUPS_N * 4, 12))
+            n_target = int(max(EMAIL_SETUPS_N * 3, 9))
             universe_cap = int(max(60, universe_cap))
             trigger_loosen = 0.95
             waiting_near = float(SCREEN_WAITING_NEAR_PCT)
@@ -19369,7 +19807,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # add a relaxed 15m pass to avoid starving /screen and email pools.
     # This keeps quality-first behavior, but prevents "no signals" sessions.
     # -----------------------------------------------------
-    if strict_15m and len(priority_setups) < int(max(3, n_target)):
+    if strict_15m and str(mode or "").lower().strip() != "email" and len(priority_setups) < int(max(3, n_target)):
         try:
             if universe_best:
                 tmp = pick_setups(
@@ -19671,6 +20109,10 @@ async def _refresh_screen_cache_async():
 def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     """Heavy /screen builder (runs in a worker thread).
 
+    Top setups intentionally reuse the SAME email-grade pool for the active session.
+    That keeps /screen, emailed setups, and autotrade aligned; only delivery/execution
+    rules like gap/caps/risk may suppress sending or trading.
+
     Returns:
         body (str): cached body (header is built in the async handler)
         kb (list[tuple[str,str]]): [(SYMBOL, SETUP_ID), ...] for TradingView buttons
@@ -19680,7 +20122,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         build_priority_pool(
             best_fut,
             session,
-            mode="screen",
+            mode="email",
             scan_profile=str(DEFAULT_SCAN_PROFILE),
             uid=uid,
         )
@@ -19702,25 +20144,6 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         top_setup_syms = set(str(getattr(s, 'symbol', '') or '').upper() for s in (setups or []) if getattr(s, 'symbol', None))
     except Exception:
         top_setup_syms = set()
-
-    # Safety: if engine produced no setups, generate fallback ATR-based setups
-    if not setups:
-        try:
-            up_list, dn_list = compute_directional_lists(best_fut)
-            leaders_bases = [str(t[0]).upper() for t in (up_list or [])[:10]]
-            losers_bases  = [str(t[0]).upper() for t in (dn_list or [])[:10]]
-            market_bases  = _market_leader_bases(best_fut)[:10]
-            setups = _fallback_setups_from_universe(
-                best_fut,
-                leaders_bases,
-                losers_bases,
-                market_bases,
-                session,
-                max_items=max(4, int(SETUPS_N or 4)),
-            )[:int(SETUPS_N or 4)]
-        except Exception:
-            setups = []
-
     # Ensure conf exists + persist signal cards to DB (used by Signal ID lookup)
     try:
         for s in (setups or []):
@@ -21079,7 +21502,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
         # -----------------------------------------------------
         setups_by_session: Dict[str, List[Setup]] = {}
-        for sess_name in ["NY", "LON", "ASIA"]:
+        for sess_name in (EMAIL_BUILD_SESSIONS or ["ASIA", "LON", "NY"]):
             try:
                 pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
             except asyncio.TimeoutError:
@@ -21145,30 +21568,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 }
                 continue
 
-            sess_name = str(sess.get("name") or "")
-            # Market session label (NY/LON/ASIA) — never show "UNLIMITED" as the session name in email.
-            try:
-                live_sess = current_session_utc(datetime.now(timezone.utc))
-            except Exception:
-                live_sess = "NONE"
-            display_sess = (live_sess if live_sess != "NONE" else "NY") if sess_name == "UNLIMITED" else sess_name
-
-
-            # Unlimited mode => allow setups from ALL sessions (24/7)
-
-            if sess_name == "UNLIMITED":
-
-                setups_all = []
-
-                for _lst in (setups_by_session or {}).values():
-
-                    if _lst:
-
-                        setups_all.extend(list(_lst))
-
-            else:
-
-                setups_all = setups_by_session.get(sess_name, []) or []
+            sess_name = str(sess.get("name") or "").upper()
+            display_sess = sess_name
+            setups_all = setups_by_session.get(sess_name, []) or []
             if not setups_all:
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
@@ -21270,7 +21672,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             skip_reasons_counter = Counter()
             eligible: List[Setup] = []
             for s in (setups_all or []):
-                ok, why = is_top_setup_eligible(s, source='email', session_name=sess_name)
+                ok, why = is_executable_setup_eligible(s, session_name=sess_name)
                 if ok:
                     eligible.append(s)
                 else:
@@ -21529,6 +21931,11 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             lines.append(f"Reason: {rs}")
 
     await update.message.reply_text("\n".join(lines).strip())
+
+
+
+async def email_pipeline_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await email_decision_cmd(update, context)
 
 
 # =========================================================
@@ -22707,6 +23114,8 @@ def main():
     app.add_handler(CommandHandler("email_off", email_off_cmd, block=False))
     app.add_handler(CommandHandler("email_test", email_test_cmd, block=False))
     app.add_handler(CommandHandler("email_decision", email_decision_cmd, block=False))
+    app.add_handler(CommandHandler("email_pipeline_status", email_pipeline_status_cmd, block=False))
+    app.add_handler(CommandHandler("setups_log", setups_log_cmd, block=False))
 
     app.add_handler(CommandHandler("why", why_no_setups_cmd, block=False))
     # ================= USDT (semi-auto) =================
@@ -22753,6 +23162,8 @@ def main():
     app.add_handler(CommandHandler("self_optimize", cmd_self_optimize, block=False))
     app.add_handler(CommandHandler("self_optimize_stop", cmd_self_optimize_stop, block=False))
     app.add_handler(CommandHandler("self_optimize_report", cmd_self_optimize_report, block=False))
+    app.add_handler(CommandHandler("autopilot_report", cmd_self_optimize_report, block=False))
+    app.add_handler(CommandHandler("autopilot_status", learning_status_cmd, block=False))
 
 # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
