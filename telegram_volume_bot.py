@@ -4787,6 +4787,19 @@ LEADER_BASE_SL_CAP_PCT_NY = env_float("LEADER_BASE_SL_CAP_PCT_NY", 3.6)
 LEADER_BASE_SL_CAP_PCT_LON = env_float("LEADER_BASE_SL_CAP_PCT_LON", 3.3)
 LEADER_BASE_SL_CAP_PCT_ASIA = env_float("LEADER_BASE_SL_CAP_PCT_ASIA", 3.0)
 
+# Leader-range continuation breakout (for explosive leaders like ACX after a clean 15m box/base)
+LEADER_RANGE_BREAKOUT_ENABLED = env_bool("LEADER_RANGE_BREAKOUT_ENABLED", True)
+LEADER_RANGE_MIN_CH24 = env_float("LEADER_RANGE_MIN_CH24", 20.0)
+LEADER_RANGE_MIN_FUT_VOL_USD = env_float("LEADER_RANGE_MIN_FUT_VOL_USD", 8_000_000.0)
+LEADER_RANGE_MIN_CH4 = env_float("LEADER_RANGE_MIN_CH4", 1.0)
+LEADER_RANGE_BOX_LOOKBACK = env_int("LEADER_RANGE_BOX_LOOKBACK", 8)
+LEADER_RANGE_MAX_BOX_PCT = env_float("LEADER_RANGE_MAX_BOX_PCT", 4.5)
+LEADER_RANGE_BREAK_PCT = env_float("LEADER_RANGE_BREAK_PCT", 0.12)
+LEADER_RANGE_SL_PAD_PCT = env_float("LEADER_RANGE_SL_PAD_PCT", 0.35)
+LEADER_RANGE_NEAR_BREAK_PCT = env_float("LEADER_RANGE_NEAR_BREAK_PCT", 0.30)
+LEADER_RANGE_SL_CAP_PCT_NY = env_float("LEADER_RANGE_SL_CAP_PCT_NY", 2.6)
+LEADER_RANGE_SL_CAP_PCT_LON = env_float("LEADER_RANGE_SL_CAP_PCT_LON", 2.4)
+LEADER_RANGE_SL_CAP_PCT_ASIA = env_float("LEADER_RANGE_SL_CAP_PCT_ASIA", 2.2)
 
 # ✅ 1H trigger loosened per session (overall easier)
 SESSION_TRIGGER_ATR_MULT = {
@@ -4883,9 +4896,11 @@ class Setup:
     pullback_ema_dist_pct: float
     pullback_ready: bool          # True => pullback happened / entry quality
     pullback_bypass_hot: bool     # True => volume>=50M bypass (no pullback needed)
+    leader_base_override: bool = False
+    leader_range_breakout: bool = False
 
-    # ✅ engine label (A pullback / B momentum)
-    engine: str
+    # ✅ engine label (A pullback / B momentum / C leader-range breakout)
+    engine: str = "A"
 
     is_trailing_tp3: bool
     created_ts: float
@@ -14606,6 +14621,8 @@ def make_setup(
         pullback_ready = bool(pb_ok)
 
         leader_base_override = _leader_base_override_ok(side, ch24, ch4_used, ch15, fut_vol, pullback_ready, pb_dist_pct2, session_name)
+        leader_range_sig = _leader_range_breakout_signal(side, ch24, ch4_used, fut_vol, c15, session_name)
+        leader_range_override = bool((leader_range_sig or {}).get("active"))
 
         # Aggressive /screen: allow "near-EMA" pullback (slightly looser proximity)
         if (not pullback_ready) and aggressive_screen and (pb_ema_val > 0) and (pb_thr_pct > 0):
@@ -14635,6 +14652,7 @@ def make_setup(
         engine_a_ok = bool(ENGINE_A_PULLBACK_ENABLED and pullback_ready)
 
         engine_b_ok = False
+        engine_c_ok = bool(leader_range_override)
 
         if ENGINE_B_MOMENTUM_ENABLED:
             # Aggressive /screen: slightly looser momentum requirements
@@ -14711,18 +14729,25 @@ def make_setup(
         except Exception:
             pass
 
-        if not engine_a_ok and not engine_b_ok:
+        if not engine_a_ok and not engine_b_ok and not engine_c_ok:
             _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}")
             return None
 
         # ---------------------------------------------------------
-        # Pullback policy (optional for Engine B)
+        # Pullback policy (optional for Engine B / leader range continuation)
         # ---------------------------------------------------------
-        engine = "A" if engine_a_ok else "B"
+        engine = "A" if engine_a_ok else ("C" if engine_c_ok else "B")
+        if engine_c_ok:
+            try:
+                entry = float((leader_range_sig or {}).get("entry") or entry)
+            except Exception:
+                pass
         require_pullback = (not bool(allow_no_pullback))
 
         # Compute confidence BEFORE applying optional pullback penalty
         conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
+        if engine_c_ok:
+            conf += 4
 
         # ---------------------------------------------------------
         # ✅ PulseFutures PRO quality overlay (safe integration)
@@ -14926,11 +14951,42 @@ def make_setup(
                 notes.append("leader_base_override")
             except Exception:
                 atr_for_sl = float(atr_1h)
+        if leader_range_override:
+            try:
+                local_sl_ref = float((leader_range_sig or {}).get("sl_ref") or 0.0)
+                local_risk = abs(float(entry) - local_sl_ref) if local_sl_ref > 0 else 0.0
+                local_cap = float(entry) * (float(_leader_range_sl_cap_pct(session_name)) / 100.0)
+                if local_risk > 0:
+                    atr_for_sl = min(float(atr_for_sl), max(local_risk / max(sl_mult_from_conf(int(conf)), 1e-9), float(entry) * 0.0035), local_cap)
+                else:
+                    atr_for_sl = min(float(atr_for_sl), local_cap)
+                notes.append("leader_range_breakout")
+            except Exception:
+                pass
 
         sl, tp3_single, R = compute_sl_tp(
             entry, side, atr_for_sl, conf, tp_cap_pct,
             rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
         )
+        if engine_c_ok:
+            try:
+                local_sl_ref = float((leader_range_sig or {}).get("sl_ref") or 0.0)
+                if local_sl_ref > 0:
+                    if side == "BUY":
+                        sl = max(float(sl), float(local_sl_ref))
+                    else:
+                        sl = min(float(sl), float(local_sl_ref))
+                    R = abs(float(entry) - float(sl))
+                    if R <= 0:
+                        _rej("bad_leader_range_risk", base, mv)
+                        return None
+                    rr_target = tp3_rr_target_from_conf(int(conf)) + (ENGINE_B_RR_BONUS if engine_b_ok else 0.0)
+                    tp_cap = ((tp_cap_pct + (ENGINE_B_TP_CAP_BONUS_PCT if engine_b_ok else 0.0)) / 100.0) * float(entry)
+                    tp_dist = min(rr_target * R, tp_cap)
+                    tp3_single = float(entry) + tp_dist if side == "BUY" else float(entry) - tp_dist
+            except Exception:
+                pass
+
         if sl <= 0 or tp3_single <= 0 or R <= 0:
             _rej("bad_sl_tp_or_atr", base, mv, f"atr={atr_1h:.6g} entry={entry:.6g}")
             return None
@@ -15001,6 +15057,7 @@ def make_setup(
             pullback_ready=bool(pullback_ready),
             pullback_bypass_hot=bool(pullback_bypass_hot),
             leader_base_override=bool(leader_base_override),
+            leader_range_breakout=bool(engine_c_ok),
             engine=str(engine),
             is_trailing_tp3=trailing_tp3,
             created_ts=time.time(),
@@ -15018,6 +15075,10 @@ def make_setup(
             setattr(s, 'smf_score', int(smf_score or 0))
             setattr(s, 'engine', str(engine or ''))
             setattr(s, 'raw_conf', int(conf or 0))
+            try:
+                setattr(s, 'leader_range_box_pct', float((leader_range_sig or {}).get('box_pct') or 0.0))
+            except Exception:
+                pass
             # Ensure TP ladder is always present (derive TP1/TP2 if needed)
             try:
                 t1, t2, t3 = _ensure_three_tps(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp3',0.0) or 0.0), getattr(s,'tp1',None), getattr(s,'tp2',None), str(getattr(s,'side','') or ''))
@@ -19520,6 +19581,103 @@ def _leader_base_sl_cap_pct(session_name: str) -> float:
         return 3.3
 
 
+def _leader_range_sl_cap_pct(session_name: str) -> float:
+    try:
+        sess = str(session_name or "").upper().strip() or "NY"
+        if sess == "ASIA":
+            return float(LEADER_RANGE_SL_CAP_PCT_ASIA)
+        if sess == "LON":
+            return float(LEADER_RANGE_SL_CAP_PCT_LON)
+        return float(LEADER_RANGE_SL_CAP_PCT_NY)
+    except Exception:
+        return 2.4
+
+
+def _leader_range_breakout_signal(side: str, ch24: float, ch4: float, fut_vol_usd: float, c15: list, session_name: str) -> dict:
+    """Detect a tight 15m box breakout after a large expansion move.
+
+    This is meant for symbols like ACX where the first impulse already happened, but price then
+    forms a controlled range/base above the fast EMA and breaks the box high/low for continuation.
+    Returns a dict with {active, entry, sl_ref, box_high, box_low, near_break}.
+    """
+    try:
+        if not LEADER_RANGE_BREAKOUT_ENABLED:
+            return {"active": False}
+        side = str(side or "").upper().strip()
+        if side not in {"BUY", "SELL"}:
+            return {"active": False}
+        if abs(float(ch24 or 0.0)) < float(LEADER_RANGE_MIN_CH24):
+            return {"active": False}
+        if float(fut_vol_usd or 0.0) < float(LEADER_RANGE_MIN_FUT_VOL_USD):
+            return {"active": False}
+        if not c15 or len(c15) < int(max(10, LEADER_RANGE_BOX_LOOKBACK + 3)):
+            return {"active": False}
+        if side == "BUY" and float(ch4 or 0.0) < float(LEADER_RANGE_MIN_CH4):
+            return {"active": False}
+        if side == "SELL" and float(ch4 or 0.0) > -float(LEADER_RANGE_MIN_CH4):
+            return {"active": False}
+
+        lb = int(max(6, LEADER_RANGE_BOX_LOOKBACK))
+        highs = [float(x[2]) for x in c15]
+        lows = [float(x[3]) for x in c15]
+        closes = [float(x[4]) for x in c15]
+        if len(highs) < lb + 2 or len(lows) < lb + 2 or len(closes) < lb + 2:
+            return {"active": False}
+
+        # Use the last *completed* candles to define the box, then require the current bar to break it.
+        box_high = max(highs[-(lb + 1):-1])
+        box_low = min(lows[-(lb + 1):-1])
+        last_close = float(closes[-1])
+        last_high = float(highs[-1])
+        last_low = float(lows[-1])
+        if last_close <= 0 or box_high <= 0 or box_low <= 0 or box_high <= box_low:
+            return {"active": False}
+
+        box_pct = ((box_high - box_low) / last_close) * 100.0
+        if float(box_pct) > float(LEADER_RANGE_MAX_BOX_PCT):
+            return {"active": False}
+
+        # Require the base to sit above/below the box midpoint in the trend direction to avoid noisy ranges.
+        midpoint = (box_high + box_low) / 2.0
+        recent_closes = closes[-min(lb, 4):]
+        if side == "BUY" and sum(1 for c in recent_closes if c >= midpoint) < max(2, len(recent_closes) - 1):
+            return {"active": False}
+        if side == "SELL" and sum(1 for c in recent_closes if c <= midpoint) < max(2, len(recent_closes) - 1):
+            return {"active": False}
+
+        break_pct = float(LEADER_RANGE_BREAK_PCT) / 100.0
+        near_pct = float(LEADER_RANGE_NEAR_BREAK_PCT) / 100.0
+        if side == "BUY":
+            trigger = box_high * (1.0 + break_pct)
+            near_break = last_close >= box_high * (1.0 - near_pct)
+            active = (last_high >= trigger) or (last_close >= trigger)
+            sl_ref = box_low * (1.0 - float(LEADER_RANGE_SL_PAD_PCT) / 100.0)
+        else:
+            trigger = box_low * (1.0 - break_pct)
+            near_break = last_close <= box_low * (1.0 + near_pct)
+            active = (last_low <= trigger) or (last_close <= trigger)
+            sl_ref = box_high * (1.0 + float(LEADER_RANGE_SL_PAD_PCT) / 100.0)
+
+        return {
+            "active": bool(active),
+            "near_break": bool(near_break),
+            "entry": float(trigger),
+            "sl_ref": float(sl_ref),
+            "box_high": float(box_high),
+            "box_low": float(box_low),
+            "box_pct": float(box_pct),
+        }
+    except Exception:
+        return {"active": False}
+
+
+def _setup_leader_range_breakout_ok(setup: "Setup", session_name: str) -> bool:
+    try:
+        return bool(getattr(setup, "leader_range_breakout", False))
+    except Exception:
+        return False
+
+
 def _setup_leader_base_override_ok(setup: "Setup", session_name: str) -> bool:
     try:
         return _leader_base_override_ok(
@@ -19984,7 +20142,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             ok, dist_pct, last_close, ema_val, ema_p, allowed = ema_anchor_cache[mk]
             adaptive_allowed = _adaptive_ema_anchor_limit_pct(s, session_name=session_name, fallback_allowed=allowed)
             leader_base_ok = _setup_leader_base_override_ok(s, session_name=session_name)
-            if float(dist_pct) > float(adaptive_allowed) and not leader_base_ok:
+            leader_range_ok = _setup_leader_range_breakout_ok(s, session_name=session_name)
+            if float(dist_pct) > float(adaptive_allowed) and not leader_base_ok and not leader_range_ok:
                 mv = (best_fut or {}).get(base)
                 _rej(
                     "far_from_ema_anchor_1h",
@@ -19999,7 +20158,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                 setattr(s, "ema_anchor_dist_pct", float(dist_pct or 0.0))
                 setattr(s, "ema_anchor_limit_pct", float(adaptive_allowed or 0.0))
                 if float(dist_pct) > float(allowed or adaptive_allowed):
-                    if leader_base_ok:
+                    if leader_base_ok or leader_range_ok:
                         setattr(s, "leader_base_anchor_override", True)
                     else:
                         s.conf = int(max(0, int(getattr(s, "conf", 0) or 0) - 4))
