@@ -15019,12 +15019,15 @@ def make_setup(
 
 
             want_trend = "BULLISH" if side == "BUY" else "BEARISH"
-            # Enforce key SMC rule:
-            #   LONG -> only if bullish structure
-            #   SHORT -> only if bearish structure
-            if structure != want_trend:
-                _rej("smc_structure_mismatch", base, mv, f"side={side} structure={structure} bos={bos} choch={choch} trend={trend} regime={regime} smf={smf_event}")
-                return None
+            # Do NOT hard-block merely because SMC structure is not the exact wanted bias.
+            # In live markets many valid continuation or base-break setups print as RANGE/UNKNOWN
+            # for stretches, and the stricter hard reject was starving setup generation.
+            # We only hard-block when structure is explicitly opposite *and* the broader trend
+            # also disagrees a few lines below. Otherwise keep the setup and let confidence /
+            # quality scoring decide.
+            if structure not in (want_trend, "RANGE", "UNKNOWN", "NEUTRAL", "NONE", ""):
+                notes.append(f"smc_structure_soft_mismatch={structure}")
+                conf = max(0.0, float(conf) - 5.0)
 
             # CHOCH indicates potential reversal against the prevailing bias — avoid entries against it.
             if side == "BUY" and choch == "CHOCH_DOWN":
@@ -20520,6 +20523,9 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         kb (list[tuple[str,str]]): [(SYMBOL, SETUP_ID), ...] for TradingView buttons
     """
     # Build pool (coroutine) in this worker thread (isolated event loop)
+    # Prefer the executable/email-aligned lane first, but if that is empty fall back
+    # to the screen lane so /screen never goes blank just because the email lane is
+    # temporarily stricter than the broader scan engine.
     pool = _run_coro_in_thread(
         build_priority_pool(
             best_fut,
@@ -20529,6 +20535,19 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
             uid=uid,
         )
     )
+    try:
+        if not (pool or {}).get("setups"):
+            pool = _run_coro_in_thread(
+                build_priority_pool(
+                    best_fut,
+                    session,
+                    mode="screen",
+                    scan_profile=str(DEFAULT_SCAN_PROFILE),
+                    uid=uid,
+                )
+            )
+    except Exception:
+        pass
 
     # Other heavy helpers are sync; run them here too.
     # Market context inputs (keep /screen informative without becoming a data terminal)
@@ -21906,7 +21925,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         setups_by_session: Dict[str, List[Setup]] = {}
         for sess_name in (EMAIL_BUILD_SESSIONS or ["ASIA", "LON", "NY"]):
             try:
-                pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
+                # Session pools are shared across users, so do not bind them to a stale uid
+                # leaked from an earlier loop iteration.
+                pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=None)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
             except asyncio.TimeoutError:
                 pool = {"setups": []}
             except Exception:
