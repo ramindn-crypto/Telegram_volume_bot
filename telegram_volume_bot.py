@@ -14882,6 +14882,7 @@ def make_setup(
         engine_a_ok = bool(ENGINE_A_PULLBACK_ENABLED and pullback_ready)
 
         engine_b_ok = False
+        engine_b_waterfall_ok = False
         engine_c_ok = False
         engine_c_info = {"ok": False, "reason": "disabled"}
 
@@ -14941,6 +14942,73 @@ def make_setup(
                     if downtrend and ch24 <= -ch24_thr and (last_low < ll20 or last_close < ll20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
                         engine_b_ok = True
                         mv._pf_breakout_hint = "SELL"
+
+                    # B3) Waterfall / blow-off continuation after extreme impulse + tight base.
+                    # This captures names like LYN / PIXEL when they are already trending hard
+                    # and then pause in a narrow consolidation instead of pulling back to EMA.
+                    try:
+                        recent_n = min(12, max(8, len(closes_1h) // 3))
+                        base_closes = closes_1h[-recent_n:]
+                        base_highs = highs_1h[-recent_n:]
+                        base_lows = lows_1h[-recent_n:]
+                        prev_closes = closes_1h[-25:-recent_n] if len(closes_1h) >= 25 else closes_1h[:-recent_n]
+                        prev_highs = highs_1h[-25:-recent_n] if len(highs_1h) >= 25 else highs_1h[:-recent_n]
+                        prev_lows = lows_1h[-25:-recent_n] if len(lows_1h) >= 25 else lows_1h[:-recent_n]
+                        if base_closes and prev_closes and prev_highs and prev_lows:
+                            base_high = max(base_highs)
+                            base_low = min(base_lows)
+                            base_mid = (base_high + base_low) / 2.0 if (base_high > 0 and base_low > 0) else last_close
+                            base_width_pct = ((base_high - base_low) / base_mid) * 100.0 if base_mid > 0 else 999.0
+                            vol_base = (sum(vols_1h[-recent_n:]) / recent_n) if recent_n > 0 else 0.0
+                            vol_prev = (sum(vols_1h[-25:-recent_n]) / max(1, len(vols_1h[-25:-recent_n]))) if len(vols_1h) >= 25 else vavg
+                            impulse_high = max(prev_highs)
+                            impulse_low = min(prev_lows)
+                            last_close = float(closes_1h[-1])
+                            ema_bias_ok = (side == "SELL" and last_close < ema_support_15m) or (side == "BUY" and last_close > ema_support_15m)
+                            near_extreme_sell = ((last_close - base_low) / max(base_high - base_low, 1e-12)) <= 0.45
+                            near_extreme_buy = ((base_high - last_close) / max(base_high - base_low, 1e-12)) <= 0.45
+                            slope_fast = ema_slope(ema_series(closes_1h[-24:], 8), 3) if len(closes_1h) >= 12 else 0.0
+                            slope_slow = ema_slope(ema_series(closes_1h[-36:], 21), 3) if len(closes_1h) >= 24 else 0.0
+
+                            sell_waterfall = (
+                                ch24 <= -10.0
+                                and ch4_used <= -0.90
+                                and impulse_high > 0
+                                and (((impulse_high - base_low) / impulse_high) * 100.0) >= 8.0
+                                and base_width_pct <= (4.5 if aggressive_screen else 3.6)
+                                and near_extreme_sell
+                                and ema_bias_ok
+                                and slope_fast < 0
+                                and slope_slow <= 0
+                                and (vol_base >= vol_prev * 0.70 if vol_prev > 0 else True)
+                            )
+                            buy_blowoff = (
+                                ch24 >= 10.0
+                                and ch4_used >= 0.90
+                                and impulse_low > 0
+                                and (((base_high - impulse_low) / impulse_low) * 100.0) >= 8.0
+                                and base_width_pct <= (4.5 if aggressive_screen else 3.6)
+                                and near_extreme_buy
+                                and ema_bias_ok
+                                and slope_fast > 0
+                                and slope_slow >= 0
+                                and (vol_base >= vol_prev * 0.70 if vol_prev > 0 else True)
+                            )
+
+                            if sell_waterfall:
+                                engine_b_ok = True
+                                engine_b_waterfall_ok = True
+                                side = "SELL"
+                                mv._pf_breakout_hint = "SELL"
+                                notes.append(f"waterfall_base_sell width={base_width_pct:.2f}%")
+                            elif buy_blowoff:
+                                engine_b_ok = True
+                                engine_b_waterfall_ok = True
+                                side = "BUY"
+                                mv._pf_breakout_hint = "BUY"
+                                notes.append(f"waterfall_base_buy width={base_width_pct:.2f}%")
+                    except Exception:
+                        pass
             except Exception:
                 pass
     
@@ -15122,7 +15190,7 @@ def make_setup(
 
         # Email/autotrade quality path can require a real 15m pullback for both engines.
         # This was previously bypassed for Engine B, which let too many NY momentum setups through.
-        pullback_ok_local = bool(pullback_ready) if require_pullback else True
+        pullback_ok_local = (bool(pullback_ready) or bool(engine_b_waterfall_ok)) if require_pullback else True
 
         keep, conf2 = apply_pullback_policy(
             require_pullback=require_pullback,
@@ -18915,7 +18983,13 @@ def trend_watch_for_symbol(base, mv, session_name):
             last = closes_15[-1]
             near = abs(last - ema_fast[-1]) / last * 100.0
             if near > 1.2:
-                return None
+                # Waterfall follow-through allowance: very strong trend + tight base can stay on watch
+                recent = closes_15[-16:] if len(closes_15) >= 16 else closes_15
+                if not recent:
+                    return None
+                width = ((max(recent) - min(recent)) / max((max(recent) + min(recent)) / 2.0, 1e-12)) * 100.0
+                if not (ch24 >= 10.0 and width <= 3.2 and near <= 3.8 and ema_slope(ema_slow, 3) > 0):
+                    return None
 
         else:
             if not (ema_fast[-1] < ema_slow[-1]):
@@ -18926,7 +19000,12 @@ def trend_watch_for_symbol(base, mv, session_name):
             last = closes_15[-1]
             near = abs(last - ema_fast[-1]) / last * 100.0
             if near > 1.2:
-                return None
+                recent = closes_15[-16:] if len(closes_15) >= 16 else closes_15
+                if not recent:
+                    return None
+                width = ((max(recent) - min(recent)) / max((max(recent) + min(recent)) / 2.0, 1e-12)) * 100.0
+                if not (ch24 <= -10.0 and width <= 3.2 and near <= 3.8 and ema_slope(ema_slow, 3) < 0):
+                    return None
 
         conf = 80
         # session boost (optional)
