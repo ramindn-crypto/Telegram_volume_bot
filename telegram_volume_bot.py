@@ -104,6 +104,28 @@ def env_int(name: str, default=0):
         return int(float(v))
     except Exception:
         return int(default)
+
+
+def _env(name: str, default: str | None = None) -> str | None:
+    """Safe env getter used by billing / payment commands."""
+    try:
+        v = os.getenv(name, None)
+        if v is None:
+            return default
+        s = str(v).strip()
+        return s if s != "" else default
+    except Exception:
+        return default
+
+
+def _mask_addr(value: str | None, head: int = 6, tail: int = 4) -> str:
+    """Mask wallet / payment addresses for safer chat display."""
+    s = str(value or "").strip()
+    if not s:
+        return "-"
+    if len(s) <= head + tail + 3:
+        return s
+    return f"{s[:head]}...{s[-tail:]}"
 import sys
 import time
 import logging
