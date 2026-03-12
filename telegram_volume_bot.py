@@ -4255,25 +4255,6 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         live_open_count = int(mday.get('open_positions_now') or 0)
     except Exception:
         live_open_count = 0
-    try:
-        opened_today_count = int(mday.get('opened_today_count') or 0)
-    except Exception:
-        opened_today_count = 0
-    try:
-        admin_user = get_user(int(uid)) or {}
-        max_trades_day_limit = int(admin_user.get('max_trades_day') or 0)
-    except Exception:
-        max_trades_day_limit = 0
-    if max_trades_day_limit > 0 and opened_today_count >= max_trades_day_limit:
-        try:
-            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_trades_day_reached', 'opened_today_count': int(opened_today_count), 'max_trades_day': int(max_trades_day_limit)})
-        except Exception:
-            pass
-        try:
-            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'max_trades_day_reached ({opened_today_count}/{max_trades_day_limit})')
-        except Exception:
-            pass
-        return (False, 'max_trades_day_reached')
     if int(AUTOTRADE_MAX_OPEN_TRADES or 0) > 0 and live_open_count >= int(AUTOTRADE_MAX_OPEN_TRADES):
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_open_trades_reached', 'open_positions_now': int(live_open_count)})
@@ -4765,6 +4746,18 @@ SESSION_EMA_REACTION_LOOKBACK = {
     "LON": 7,
     "ASIA": 6,
 }
+
+# Leader-base continuation override (for explosive trend names like PIXEL after the first impulse)
+LEADER_BASE_OVERRIDE_ENABLED = env_bool("LEADER_BASE_OVERRIDE_ENABLED", True)
+LEADER_BASE_MIN_CH24 = env_float("LEADER_BASE_MIN_CH24", 25.0)
+LEADER_BASE_MIN_FUT_VOL_USD = env_float("LEADER_BASE_MIN_FUT_VOL_USD", 10_000_000.0)
+LEADER_BASE_MIN_CH4 = env_float("LEADER_BASE_MIN_CH4", 1.0)
+LEADER_BASE_MAX_CH15_ABS = env_float("LEADER_BASE_MAX_CH15_ABS", 1.25)
+LEADER_BASE_MAX_PB_DIST_PCT = env_float("LEADER_BASE_MAX_PB_DIST_PCT", 1.10)
+LEADER_BASE_SL_CAP_PCT_NY = env_float("LEADER_BASE_SL_CAP_PCT_NY", 3.6)
+LEADER_BASE_SL_CAP_PCT_LON = env_float("LEADER_BASE_SL_CAP_PCT_LON", 3.3)
+LEADER_BASE_SL_CAP_PCT_ASIA = env_float("LEADER_BASE_SL_CAP_PCT_ASIA", 3.0)
+
 
 # ✅ 1H trigger loosened per session (overall easier)
 SESSION_TRIGGER_ATR_MULT = {
@@ -7761,9 +7754,8 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["over_by"] = max(0.0, -rem) if math.isfinite(rem) and snap["cap"] > 0 else 0.0
         snap["pnl_today"] = float(m.get("realized_pnl_today") or 0.0)
         snap["trades_today"] = int(m.get("opened_today_count") or 0)
-        admin_trade_limit = int(user.get("max_trades_day") or 0)
-        snap["trades_today_limit"] = admin_trade_limit
-        snap["remaining_new_positions_today"] = max(0, admin_trade_limit - int(snap["trades_today"])) if admin_trade_limit > 0 else 0
+        snap["trades_today_limit"] = 0
+        snap["remaining_new_positions_today"] = 0
     else:
         cap = float(daily_cap_usd(user) or 0.0)
         pnl_today = float(_pnl_today_closed_trades(uid, user) or 0.0)
@@ -14584,6 +14576,8 @@ def make_setup(
 
         pullback_ready = bool(pb_ok)
 
+        leader_base_override = _leader_base_override_ok(side, ch24, ch4_used, ch15, fut_vol, pullback_ready, pb_dist_pct2, session_name)
+
         # Aggressive /screen: allow "near-EMA" pullback (slightly looser proximity)
         if (not pullback_ready) and aggressive_screen and (pb_ema_val > 0) and (pb_thr_pct > 0):
             try:
@@ -14896,8 +14890,16 @@ def make_setup(
         except Exception:
             pass
 
+        atr_for_sl = float(atr_1h)
+        if leader_base_override:
+            try:
+                atr_for_sl = min(float(atr_for_sl), float(entry) * (float(_leader_base_sl_cap_pct(session_name)) / 100.0))
+                notes.append("leader_base_override")
+            except Exception:
+                atr_for_sl = float(atr_1h)
+
         sl, tp3_single, R = compute_sl_tp(
-            entry, side, atr_1h, conf, tp_cap_pct,
+            entry, side, atr_for_sl, conf, tp_cap_pct,
             rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
         )
         if sl <= 0 or tp3_single <= 0 or R <= 0:
@@ -14969,6 +14971,7 @@ def make_setup(
             pullback_ema_dist_pct=float(pb_dist_pct2),
             pullback_ready=bool(pullback_ready),
             pullback_bypass_hot=bool(pullback_bypass_hot),
+            leader_base_override=bool(leader_base_override),
             engine=str(engine),
             is_trailing_tp3=trailing_tp3,
             created_ts=time.time(),
@@ -19444,6 +19447,66 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
 
     await update.message.reply_text("\n".join(lines))
 
+def _leader_base_override_ok(side: str, ch24: float, ch4: float, ch15: float, fut_vol_usd: float, pullback_ready: bool, pb_dist_pct: float, session_name: str) -> bool:
+    """Allow post-expansion continuation entries after a clean 15m base/reclaim.
+
+    This is specifically meant to avoid missing explosive leaders that are already far from the
+    1H EMA anchor, but have cooled down and rebuilt around the 15m pullback EMA.
+    """
+    try:
+        if not LEADER_BASE_OVERRIDE_ENABLED:
+            return False
+        side = str(side or "").upper().strip()
+        sess = str(session_name or "").upper().strip() or "NY"
+        if abs(float(ch24 or 0.0)) < float(LEADER_BASE_MIN_CH24):
+            return False
+        if float(fut_vol_usd or 0.0) < float(LEADER_BASE_MIN_FUT_VOL_USD):
+            return False
+        if not bool(pullback_ready):
+            return False
+        if float(pb_dist_pct or 999.0) > float(LEADER_BASE_MAX_PB_DIST_PCT):
+            return False
+        if abs(float(ch15 or 0.0)) > float(LEADER_BASE_MAX_CH15_ABS):
+            return False
+        if side == "BUY" and float(ch4 or 0.0) < float(LEADER_BASE_MIN_CH4):
+            return False
+        if side == "SELL" and float(ch4 or 0.0) > -float(LEADER_BASE_MIN_CH4):
+            return False
+        if sess == "ASIA" and abs(float(ch24 or 0.0)) < float(LEADER_BASE_MIN_CH24) + 5.0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _leader_base_sl_cap_pct(session_name: str) -> float:
+    try:
+        sess = str(session_name or "").upper().strip() or "NY"
+        if sess == "ASIA":
+            return float(LEADER_BASE_SL_CAP_PCT_ASIA)
+        if sess == "LON":
+            return float(LEADER_BASE_SL_CAP_PCT_LON)
+        return float(LEADER_BASE_SL_CAP_PCT_NY)
+    except Exception:
+        return 3.3
+
+
+def _setup_leader_base_override_ok(setup: "Setup", session_name: str) -> bool:
+    try:
+        return _leader_base_override_ok(
+            side=str(getattr(setup, "side", "") or ""),
+            ch24=float(getattr(setup, "ch24", 0.0) or 0.0),
+            ch4=float(getattr(setup, "ch4", 0.0) or 0.0),
+            ch15=float(getattr(setup, "ch15", 0.0) or 0.0),
+            fut_vol_usd=float(getattr(setup, "fut_vol_usd", 0.0) or 0.0),
+            pullback_ready=bool(getattr(setup, "pullback_ready", False)),
+            pb_dist_pct=float(getattr(setup, "pullback_ema_dist_pct", 999.0) or 999.0),
+            session_name=session_name,
+        )
+    except Exception:
+        return False
+
+
 def _adaptive_ema_anchor_limit_pct(setup: "Setup", session_name: str, fallback_allowed: float) -> float:
     """Adaptive 1H EMA-anchor limit.
 
@@ -19891,7 +19954,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
             ok, dist_pct, last_close, ema_val, ema_p, allowed = ema_anchor_cache[mk]
             adaptive_allowed = _adaptive_ema_anchor_limit_pct(s, session_name=session_name, fallback_allowed=allowed)
-            if float(dist_pct) > float(adaptive_allowed):
+            leader_base_ok = _setup_leader_base_override_ok(s, session_name=session_name)
+            if float(dist_pct) > float(adaptive_allowed) and not leader_base_ok:
                 mv = (best_fut or {}).get(base)
                 _rej(
                     "far_from_ema_anchor_1h",
@@ -19906,7 +19970,10 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                 setattr(s, "ema_anchor_dist_pct", float(dist_pct or 0.0))
                 setattr(s, "ema_anchor_limit_pct", float(adaptive_allowed or 0.0))
                 if float(dist_pct) > float(allowed or adaptive_allowed):
-                    s.conf = int(max(0, int(getattr(s, "conf", 0) or 0) - 4))
+                    if leader_base_ok:
+                        setattr(s, "leader_base_anchor_override", True)
+                    else:
+                        s.conf = int(max(0, int(getattr(s, "conf", 0) or 0) - 4))
             except Exception:
                 pass
 
