@@ -19563,30 +19563,32 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     when_raw = str(det.get("when") or dec.get("when") or "")
     when_m = _fmt_iso_to_local(when_raw) if when_raw else "—"
 
-    lines = ["🤖 AutoTrade — Last Attempt", HDR]
+    lines = ["AutoTrade — Last Attempt", HDR]
     if not det and not dec:
         lines.append("No attempts recorded yet.")
         await send_long_message(update, "\n".join(lines), parse_mode=None)
         return
 
-    symbol_sent = str(det.get('symbol_sent', '') or '')
-    symbol_raw = str(det.get('symbol_raw', '') or '')
-    symbol = symbol_sent or symbol_raw or '—'
-    setup_id = str(det.get('setup_id') or (dec.get('latest_candidate') or {}).get('setup_id') or '—')
-    sig_time = det.get('signal_created_time') or ''
-    email_time = det.get('email_logged_time') or det.get('generated_logged_time') or ''
-    dec_status = str(dec.get('status') or '').strip() or '—'
-    dec_reason = str(dec.get('reason') or '').strip()
-
     lines.append(f"When: {when_m}")
+    symbol_sent = str(det.get('symbol_sent','') or '')
+    symbol_raw = str(det.get('symbol_raw','') or '')
+    symbol = symbol_sent or symbol_raw or '—'
     lines.append(f"Symbol: {symbol}")
     lines.append(f"Side: {str(det.get('side') or '—')}")
     lines.append(f"Entry: {_autotrade_price_str(det.get('entry'))}")
     lines.append(f"Stop loss: {_autotrade_price_str(det.get('sl'))}")
-    lines.append(f"Setup ID: {setup_id}")
+    lines.append(f"Setup ID: {str(det.get('setup_id') or (dec.get('latest_candidate') or {}).get('setup_id') or '—')}")
+    sig_time = det.get('signal_created_time') or ''
+    email_time = det.get('email_logged_time') or det.get('generated_logged_time') or ''
     lines.append(f"Signal created: {_fmt_iso_to_local(sig_time) if sig_time else '—'}")
     lines.append(f"Email logged: {_fmt_iso_to_local(email_time) if email_time else '—'}")
-    lines.append(f"Result: {dec_status}{(' | ' + dec_reason) if dec_reason else ''}")
+    dec_status = str(dec.get('status') or '').strip()
+    dec_reason = str(dec.get('reason') or '').strip()
+    if dec_status or dec_reason:
+        result = dec_status or '—'
+        if dec_reason:
+            result += f" | {dec_reason}"
+        lines.append(f"Result: {result}")
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -20199,7 +20201,11 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # add a relaxed 15m pass to avoid starving /screen and email pools.
     # This keeps quality-first behavior, but prevents "no signals" sessions.
     # -----------------------------------------------------
-    if strict_15m and str(mode or "").lower().strip() != "email" and len(priority_setups) < int(max(3, n_target)):
+    # Allow one controlled relaxed-15m recovery pass for BOTH screen and email
+    # when the strict pass produced too few candidates. Final shared eligibility
+    # gates still decide what can actually be shown/sent, so this improves fill
+    # rate without bypassing quality / RR / liquidity controls.
+    if strict_15m and len(priority_setups) < int(max(3, n_target)):
         try:
             if universe_best:
                 tmp = pick_setups(
