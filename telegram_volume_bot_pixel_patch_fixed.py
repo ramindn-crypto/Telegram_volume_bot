@@ -1,0 +1,23980 @@
+# CHANGE SUMMARY
+# - Simplified /learning_status, /autotrade_debug, and /autotrade_last outputs.
+# - Daily risk remaining now restores capacity from positive realized PnL and reduces it from losses.
+# - /performance_report and /autotrade_report_overall now use the canonical 2-TP outcome model for reporting.
+# - Added /performance_chart and /winrate_chart plus admin help entries.
+
+
+# --- ASIA tightening (hard-coded, no env vars) ---
+ASIA_MIN_CONF_BOOST = 9
+ASIA_MIN_FUT_VOL_USD = 10_000_000
+ASIA_EXCLUDED_PREFIXES = ("1000",)
+ASIA_SYMBOL_COOLDOWN_HOURS = 6
+
+# =========================================================
+# RENDER WEB SERVICE KEEPALIVE (optional)
+# =========================================================
+def start_keepalive_http_server():
+    """
+    Render 'Web Service' expects the process to bind to $PORT.
+    If you deploy this bot as a Web Service (instead of a Background Worker),
+    we start a tiny HTTP server on $PORT so Render keeps it alive, while the bot
+    still runs polling in the same process.
+    """
+    try:
+        port = int(os.environ.get("PORT", "10000"))
+    except Exception:
+        port = 10000
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"ok")
+            except Exception:
+                pass
+
+        def log_message(self, fmt, *args):
+            # quiet
+            return
+
+    try:
+        srv = HTTPServer(("0.0.0.0", port), _Handler)
+    except Exception as e:
+        logger.warning("Keepalive HTTP server failed to bind on PORT=%s: %s", port, e)
+        return
+
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    logger.info("Keepalive HTTP server started on 0.0.0.0:%s", port)
+
+_LAST_SCAN_UNIVERSE = []
+
+#!/usr/bin/env python3
+"""
+PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
+
+CHANGELOG (2026-03-06)
+- Added StrategyConfig (parameterized strategy module) persisted to SQLite (strategy_config table):
+  - apply_strategy_config() updates all tunable globals from one config source
+- Upgraded setup quality scoring to use StrategyConfig-driven weights (no hard-coded weights).
+- Upgraded /backtest engine:
+  - session gating (ASIA/LON/NY via UTC inference)
+  - rejects breakdown (reason codes) + avg hold time + setups/day
+  - report now displays reject breakdown for faster tuning
+- Added autonomous optimization governance with retained internal reporting:
+  - bounded deterministic grid search across TF matrix and top-volume universe (≥$10M 24h volume)
+  - walk-forward (train/test split) and OOS-first objective with frequency targeting (3–5 setups/day)
+  - persists chosen TF + params into StrategyConfig and saves an optimization report
+
+"""
+
+# =========================================================
+# IMPORTS
+# =========================================================
+
+import os
+
+
+# --- generic env helpers (added for leader-base patch safety) ---
+def env_bool(name: str, default=False):
+    try:
+        v = os.getenv(name, None)
+        if v is None:
+            return bool(default)
+        return str(v).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+    except Exception:
+        return bool(default)
+
+def env_float(name: str, default=0.0):
+    try:
+        v = os.getenv(name, None)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+def env_int(name: str, default=0):
+    try:
+        v = os.getenv(name, None)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+import sys
+import time
+import logging
+import math
+import inspect
+from decimal import Decimal, ROUND_UP, ROUND_DOWN
+
+
+def _bybit_linear_symbol(sym: str) -> str:
+    """Normalize base symbol like 'FIO' or '1000LUNC' to Bybit linear symbol like 'FIOUSDT'/'1000LUNCUSDT'."""
+    s = (sym or "").replace("/", "").replace(" ", "").upper()
+    if not s:
+        return s
+    if s.endswith("USDT"):
+        return s
+    if "USDT" in s:
+        return s
+    return f"{s}USDT"
+
+
+logger = logging.getLogger(__name__)
+
+# Bybit instrument filters cache (qtyStep/minQty)
+_INSTR_FILTER_CACHE: dict[str, dict] = {}
+
+
+# AutoTrade decision cache (owner/admin visibility)
+_LAST_AUTOTRADE_DECISION: dict[int, dict] = {}
+_LAST_AUTOTRADE_DETAIL: dict[int, dict] = {}
+
+
+import json
+import re
+import ssl
+import smtplib
+import sqlite3
+
+
+# ================= AUTOTRADE TABLE MIGRATION =================
+
+def _autotrade_migrate_tables():
+    """Ensure autotrade tables exist and columns are present (safe to call anytime)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+
+            # Create if missing (preferred schema used by trading + reports)
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_trades (
+                trade_id TEXT PRIMARY KEY,
+                uid INTEGER,
+                opened_ts INTEGER,
+                day_utc TEXT NOT NULL DEFAULT \'\',
+                session TEXT,
+                symbol TEXT,
+                side TEXT,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                qty REAL,
+                status TEXT,
+                closed_ts INTEGER,
+                pnl_usdt REAL,
+                note TEXT
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_config (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )""")
+
+            # If table existed with an older schema, add missing columns.
+            cols = [r[1] for r in c.execute("PRAGMA table_info(autotrade_trades)").fetchall()]
+            def add_col(name, ddl):
+                if name not in cols:
+                    c.execute(f"ALTER TABLE autotrade_trades ADD COLUMN {ddl}")
+                    cols.append(name)
+
+            add_col("trade_id", "trade_id TEXT")
+            add_col("uid", "uid INTEGER")
+            add_col("opened_ts", "opened_ts INTEGER")
+            add_col("session", "session TEXT")
+            add_col("symbol", "symbol TEXT")
+            add_col("side", "side TEXT")
+            add_col("entry", "entry REAL")
+            add_col("sl", "sl REAL")
+            add_col("tp1", "tp1 REAL")
+            add_col("tp2", "tp2 REAL")
+            add_col("tp3", "tp3 REAL")
+            add_col("qty", "qty REAL")
+            add_col("status", "status TEXT")
+            add_col("closed_ts", "closed_ts INTEGER")
+            add_col("pnl_usdt", "pnl_usdt REAL")
+            add_col("outcome", "outcome TEXT")
+            add_col("note", "note TEXT")
+
+            # Backfill trade_id for legacy rows (uses rowid).
+            try:
+                rows = c.execute("SELECT rowid FROM autotrade_trades WHERE trade_id IS NULL OR trade_id=''").fetchall()
+                for (rowid,) in rows:
+                    c.execute(
+                        "UPDATE autotrade_trades SET trade_id=? WHERE rowid=?",
+                        (f"AT-LEGACY-{int(rowid)}", int(rowid))
+                    )
+            except Exception:
+                pass
+
+            # Daily risk table (kept for compatibility)
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_day_risk (
+                day_utc TEXT PRIMARY KEY,
+                used_risk_pct REAL NOT NULL
+            )""")
+
+            # Execution/duplicate guard table
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_exec_guard (
+                guard_key TEXT PRIMARY KEY,
+                uid INTEGER NOT NULL DEFAULT 0,
+                setup_id TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                guard_type TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                created_ts REAL NOT NULL DEFAULT 0,
+                updated_ts REAL NOT NULL DEFAULT 0,
+                note TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_autotrade_exec_guard_lookup ON autotrade_exec_guard(uid, symbol, side, guard_type, status, updated_ts)")
+            conn.commit()
+    except Exception:
+        pass
+# =============================================================
+
+
+# ================= AUTOTRADE SESSION STORAGE =================
+def _autotrade_get_sessions():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS autotrade_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.execute("SELECT value FROM autotrade_config WHERE key='sessions'")
+            row = c.fetchone()
+            if row and row[0]:
+                return [s.strip().upper() for s in row[0].split(",") if s.strip()]
+    except Exception:
+        pass
+    return ["NY"]
+
+def _autotrade_set_sessions(val: str):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS autotrade_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.execute(
+                "INSERT OR REPLACE INTO autotrade_config(key,value) VALUES('sessions',?)",
+                (val.upper(),)
+            )
+            conn.commit()
+    except Exception:
+        pass
+# =============================================================
+
+import asyncio
+import contextvars
+
+from dataclasses import dataclass, replace
+from email.message import EmailMessage
+from typing import Dict, List, Optional, Tuple, Any
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from collections import Counter, defaultdict
+
+import ccxt
+from tabulate import tabulate
+
+import html
+import textwrap
+from telegram.constants import ParseMode
+
+import difflib
+
+import base64
+import tempfile
+
+import os
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Bot,
+    BotCommand,
+    MenuButtonCommands,
+)
+
+
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+    ApplicationHandlerStop,
+)
+
+# =========================================================
+# PERFORMANCE: Dedicated thread pools (prevents lag spikes)
+# - FAST pool: tiny DB / access checks
+# - HEAVY pool: market scans, signal building, email job work
+# This prevents long scans from starving quick commands like /start, /status, /size.
+# =========================================================
+from concurrent.futures import ThreadPoolExecutor
+import functools as _functools
+
+_FAST_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("FAST_EXECUTOR_WORKERS", "8")))
+_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "2")))
+
+async def _run_in_executor(executor, fn, *args, timeout: int | None = None, **kwargs):
+    loop = asyncio.get_running_loop()
+    call = _functools.partial(fn, *args, **kwargs)
+    fut = loop.run_in_executor(executor, call)
+    return await asyncio.wait_for(fut, timeout=timeout) if timeout else await fut
+
+async def to_thread_fast(fn, *args, timeout: int | None = None, **kwargs):
+    return await _run_in_executor(_FAST_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
+
+async def to_thread_heavy(fn, *args, timeout: int | None = None, **kwargs):
+    return await _run_in_executor(_HEAVY_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
+
+
+import re
+import sqlite3
+
+TXID_REGEX = re.compile(r"^[A-Fa-f0-9]{64}$")
+
+
+
+def _ensure_three_tps(entry: float, sl: float, tp3: float, tp1, tp2, side: str):
+    """Legacy compatibility helper for the bot's 2-TP model.
+
+    Returns a normalized ladder ``(tp1, tp2, tp3_legacy)`` where the third value is
+    always mirrored to TP2 so any older callers that still read ``tp3`` cannot create
+    a distinct third target.
+    """
+    try:
+        e = float(entry or 0.0)
+        s = float(sl or 0.0)
+        raw_tp2 = float(tp2 or tp3 or 0.0)
+    except Exception:
+        return tp1, tp2, tp2 if tp2 not in (None, '', 0, 0.0) else tp3
+    if e <= 0 or s <= 0 or raw_tp2 <= 0:
+        return tp1, tp2, tp2 if tp2 not in (None, '', 0, 0.0) else tp3
+
+    try:
+        t1_ok = tp1 not in (None, '', 0, 0.0)
+        t2_ok = tp2 not in (None, '', 0, 0.0)
+    except Exception:
+        t1_ok = t2_ok = False
+
+    if t2_ok:
+        t2 = float(tp2)
+    else:
+        t2 = float(raw_tp2)
+
+    if t1_ok:
+        t1 = float(tp1)
+    else:
+        # Derive TP1 as a conservative partial target between entry and TP2.
+        t1 = e + (t2 - e) * 0.45
+
+    side_u = str(side or '').upper().strip()
+    eps = max(abs(e) * 1e-6, 1e-8)
+    if side_u == 'SELL':
+        if not (t2 < e):
+            t2 = e - abs(e - raw_tp2 or abs(e - s))
+        if not (t1 < e):
+            t1 = e - abs(e - t2) * 0.45
+        if t1 <= t2:
+            t1 = t2 + eps
+    else:
+        if not (t2 > e):
+            t2 = e + abs(raw_tp2 - e or abs(e - s))
+        if not (t1 > e):
+            t1 = e + abs(t2 - e) * 0.45
+        if t1 >= t2:
+            t1 = t2 - eps
+
+    return float(t1), float(t2), float(t2)
+
+_LAST_SCAN_UNIVERSE = []
+_LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
+
+def is_valid_txid(txid: str) -> bool:
+    return bool(TXID_REGEX.match(txid))
+
+def usdt_txid_exists(txid: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM usdt_payments WHERE txid = ?", (txid,))
+    exists = cur.fetchone() is not None
+    conn.close()
+    return exists
+
+def save_usdt_payment(user_id, username, txid, plan):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO usdt_payments (telegram_id, username, txid, plan, status)
+        VALUES (?, ?, ?, ?, 'PENDING')
+    """, (user_id, username, txid, plan))
+    conn.commit()
+    conn.close()
+
+
+
+# =========================================================
+# SAAS / STRIPE CONFIG
+# =========================================================
+import stripe
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+FREE_TRIAL_DAYS = 7
+
+TRIAL_DAYS = 7  # used by ensure_trial_started()
+VALID_LICENSE_PREFIX = {
+    "PF-STD": "standard",
+    "PF-PRO": "pro",
+}
+
+# Reuse your existing admin system
+# Unified admin identity source.
+# Fall back to the owner id used in this deployment; merged with ADMIN_USER_IDS later.
+# Production-safe default: do not hard-code admin Telegram IDs in the codebase.
+# Admins should come from environment / runtime configuration only.
+_ADMIN_FALLBACK_IDS = set()
+ADMIN_IDS = set(_ADMIN_FALLBACK_IDS)
+
+ALLOWED_WHEN_LOCKED = {
+    "start",
+    "help",
+    "billing",
+    "manage",
+    "myplan",
+    "license",
+    "support",
+    "support_status",
+}
+
+
+# =========================================================
+# ACCESS / TRIAL / PRO FEATURE GATING
+# =========================================================
+
+def _now_ts() -> float:
+    return time.time()
+
+def _plan_valid_until_ok(user: dict) -> bool:
+    try:
+        exp = float(user.get("plan_expires") or 0)
+    except Exception:
+        exp = 0.0
+    return (exp <= 0.0) or (_now_ts() <= exp)
+
+def effective_plan(user_id: int, user: Optional[dict]) -> str:
+    """Effective plan with admin override + trial handling."""
+    if is_admin_user(int(user_id)):
+        return "pro"
+
+    u = user or {}
+    plan = str(u.get("plan") or "free").strip().lower()
+
+    if plan in ("pro", "standard") and _plan_valid_until_ok(u):
+        return plan
+
+    try:
+        until = float(u.get("trial_until") or 0.0)
+    except Exception:
+        until = 0.0
+    if plan == "trial" and until > 0 and _now_ts() <= until:
+        return "trial"
+
+    return "free"
+
+def user_has_pro(user_id: int, user: Optional[dict] = None) -> bool:
+    u = user if user is not None else (get_user(user_id) or {})
+    return effective_plan(int(user_id), u) in ("pro", "trial")
+
+def has_active_access(user_id: int, user: Optional[dict] = None) -> bool:
+    u = user if user is not None else (get_user(user_id) or {})
+    return effective_plan(int(user_id), u) in ("standard", "pro", "trial")
+
+def ensure_trial_started(user_id: int, user: Optional[dict], force: bool = False) -> None:
+    """Starts the 7-day FULL Pro trial ONCE when user runs /start."""
+    if is_admin_user(int(user_id)):
+        return
+    u = user or {}
+    plan = str(u.get("plan") or "free").strip().lower()
+    try:
+        ts_start = float(u.get("trial_start_ts") or 0.0)
+    except Exception:
+        ts_start = 0.0
+
+    if plan != "free":
+        return
+    if ts_start > 0:
+        return
+    if not force:
+        return
+
+    now = _now_ts()
+    update_user(
+        int(user_id),
+        plan="trial",
+        trial_start_ts=now,
+        trial_until=now + float(TRIAL_DAYS) * 86400.0,
+        access_source="trial",
+        access_ref="start",
+        access_updated_ts=now,
+    )
+
+PRO_ONLY_COMMANDS = {
+    # Email + notifications
+    "email", "email_on", "email_off", "email_on_off", "email_test", "email_decision", "notify_on", "notify_off",
+    # Unlimited sessions
+    "sessions_on_unlimited", "sessions_off_unlimited", "sessions_unlimited_on", "sessions_unlimited_off",
+    # Big move alerts
+    "bigmove_alert",
+    # Advanced reports
+    "report_daily", "report_weekly", "report_overall",
+}
+
+def enforce_access_or_block_legacy(update: Update, command: str) -> bool:
+    uid = update.effective_user.id
+    if is_admin_user(uid):
+        return True
+
+    user = get_user(uid) or {}
+    if has_active_access(uid, user):
+        return True
+
+    if command in ALLOWED_WHEN_LOCKED:
+        return True
+
+    # Non-blocking reply: never stall the event loop for access messages
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(update.message.reply_text(
+            "⛔ Access locked.\n\n"
+            "Your 7-day free trial has ended.\n\n"
+            "To continue, choose a plan:\n"
+            "• Standard — $49/month\n"
+            "• Pro — $99/month\n\n"
+            "👉 /billing"
+        ))
+    except Exception:
+        try:
+            # Fallback (best effort)
+            update.message.reply_text(
+                "⛔ Access locked.\n\n"
+                "Your 7-day free trial has ended.\n\n"
+                "To continue, choose a plan:\n"
+                "• Standard — $49/month\n"
+                "• Pro — $99/month\n\n"
+                "👉 /billing"
+            )
+        except Exception:
+            pass
+    return False
+
+
+# =========================================================
+# CHANNEL SUBSCRIPTION GATE (optional)
+# =========================================================
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "").strip()  # e.g. "@PulseFutures" or "-1001234567890"
+REQUIRED_CHANNEL_JOIN_URL = os.getenv("REQUIRED_CHANNEL_JOIN_URL", "").strip()  # e.g. "https://t.me/PulseFutures"
+# What we SHOW to users (name/link), even if REQUIRED_CHANNEL is a numeric channel id.
+REQUIRED_CHANNEL_DISPLAY = os.getenv("REQUIRED_CHANNEL_DISPLAY", "@PulseFutures").strip() or "@PulseFutures"
+REQUIRED_CHANNEL_PUBLIC_URL = os.getenv("REQUIRED_CHANNEL_PUBLIC_URL", "https://t.me/PulseFutures").strip() or "https://t.me/PulseFutures"
+
+# If set (1/true/yes/on), users MUST join the channel to use the bot.
+# Default is OFF: the channel is promotional only and will be suggested in messages, not enforced.
+ENFORCE_REQUIRED_CHANNEL = os.getenv("ENFORCE_REQUIRED_CHANNEL", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Cache channel membership checks to keep commands instant (Telegram API calls can be slow / rate-limited)
+_SUB_CACHE = {}  # user_id -> (ok: bool, ts: int)
+SUB_CACHE_TTL_SEC = int(os.getenv("SUB_CACHE_TTL_SEC", "1800"))
+SUB_CACHE_NEG_TTL_SEC = int(os.getenv("SUB_CACHE_NEG_TTL_SEC", "60"))
+  # e.g. "https://t.me/PulseFutures"
+
+async def _is_user_subscribed(bot: Bot, user_id: int) -> bool:
+    """Returns True if user is a member of REQUIRED_CHANNEL (member/admin/creator)."""
+
+    if not REQUIRED_CHANNEL:
+        return True
+
+    # Admins bypass channel gate
+    try:
+        if is_admin_user(int(user_id)):
+            return True
+    except Exception:
+        pass
+
+    # Cached membership check
+    try:
+        now_ts = int(time.time())
+        cached = _SUB_CACHE.get(int(user_id))
+        if cached:
+            ok, ts = cached
+            ok = bool(ok)
+            age = now_ts - int(ts)
+            # Cache positives longer; cache negatives briefly so 'I just joined' works immediately.
+            ttl = int(SUB_CACHE_TTL_SEC) if ok else int(SUB_CACHE_NEG_TTL_SEC)
+            if age <= ttl:
+                return bool(ok)
+    except Exception:
+        pass
+
+    chat_id_to_check = REQUIRED_CHANNEL
+
+    try:
+        global _REQUIRED_CHANNEL_ID
+    except Exception:
+        _REQUIRED_CHANNEL_ID = None
+
+    try:
+        if _REQUIRED_CHANNEL_ID is None:
+            ch = await bot.get_chat(REQUIRED_CHANNEL)
+            _REQUIRED_CHANNEL_ID = int(getattr(ch, "id"))
+        if _REQUIRED_CHANNEL_ID:
+            chat_id_to_check = int(_REQUIRED_CHANNEL_ID)
+    except Exception:
+        chat_id_to_check = REQUIRED_CHANNEL
+
+    async def _check(chat_id_val):
+        cm = await bot.get_chat_member(
+            chat_id=chat_id_val,
+            user_id=int(user_id)
+        )
+        status = str(getattr(cm, "status", "") or "").lower()
+        return status in {"member", "administrator", "creator"}
+
+    try:
+        ok = await _check(chat_id_to_check)
+    except Exception:
+        try:
+            ok = await _check(REQUIRED_CHANNEL)
+        except Exception as e:
+            try:
+                global _CHANNEL_GATE_WARN_TS
+            except Exception:
+                _CHANNEL_GATE_WARN_TS = 0
+
+            try:
+                now_ts = int(time.time())
+                if now_ts - int(_CHANNEL_GATE_WARN_TS or 0) > 900:
+                    _CHANNEL_GATE_WARN_TS = now_ts
+                    err = f"{type(e).__name__}: {e}"
+
+                    hint = (
+                        "⚠️ Channel gate check failed. Failing open.\n\n"
+                        f"REQUIRED_CHANNEL={REQUIRED_CHANNEL}\n"
+                        f"Error: {err}\n\n"
+                        "Fix: add the bot as ADMIN in the channel, "
+                        "or set REQUIRED_CHANNEL to the channel ID (-100...)."
+                    )
+
+                    for admin in _admin_ids_all():
+                        try:
+                            await bot.send_message(chat_id=admin, text=hint)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            ok = True  # fail-open
+
+    try:
+        _SUB_CACHE[int(user_id)] = (bool(ok), int(time.time()))
+    except Exception:
+        pass
+
+    return bool(ok)
+
+async def _reply_subscribe_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        join_url = REQUIRED_CHANNEL_JOIN_URL or REQUIRED_CHANNEL_PUBLIC_URL or (f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}" if REQUIRED_CHANNEL.startswith("@") else "")
+        kb = None
+        if join_url:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join Channel", url=join_url)]])
+        await update.message.reply_text(
+            "📢 To use PulseFutures, you must join our channel first.\n\n"
+            f"Channel: {REQUIRED_CHANNEL_DISPLAY}\n{REQUIRED_CHANNEL_PUBLIC_URL}\n\n"
+            "After joining, come back and press /start.",
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+
+async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Global guard: locks access after trial + gates Pro-only commands.
+    Optimized: cache access/pro checks so ALL commands feel instant (except /screen can still be heavier downstream).
+    """
+    try:
+        if not getattr(update, "message", None):
+            return
+
+        txt = (update.message.text or "").strip()
+        if not txt.startswith("/"):
+            return
+
+        cmd = txt.split()[0][1:].split("@")[0].strip().lower()
+
+        # --- STATIC (function-local) caches to reduce DB hits / lag ---
+        # Cache entries: { uid: {"ts": float, "access_ok": bool, "is_pro": bool} }
+        if not hasattr(_command_guard, "_cache"):
+            _command_guard._cache = {}
+        _cache = _command_guard._cache
+
+        # Cache TTL (seconds). Keep short so plan changes propagate quickly.
+        CACHE_TTL = 60.0
+
+        # Commands that should always work even if user is locked (no access check)
+        ACCESS_EXEMPT = {"start", "help", "commands", "billing", "guide_full"}
+
+        # Commands that should force a fresh access check (never use cache)
+        # (/screen is the only one you said can be slow; we keep it strict/fresh here)
+        FORCE_FRESH = {"screen"}
+
+        # 0) Channel subscription gate (optional)
+        if ENFORCE_REQUIRED_CHANNEL and REQUIRED_CHANNEL:
+            ok = await _is_user_subscribed(context.bot, int(update.effective_user.id))
+            if not ok:
+                # Keep same behavior as your original code
+                if cmd not in ACCESS_EXEMPT:
+                    await _reply_subscribe_required(update, context)
+                    raise ApplicationHandlerStop
+
+                if cmd == "start":
+                    await _reply_subscribe_required(update, context)
+                    raise ApplicationHandlerStop
+
+        # 1) Trial/access lock (optimized)
+        if cmd not in ACCESS_EXEMPT:
+            uid = int(update.effective_user.id)
+
+            now = time.time()
+            ent = _cache.get(uid)
+            use_cache = bool(ent) and (now - float(ent.get("ts", 0.0))) < CACHE_TTL and (cmd not in FORCE_FRESH)
+
+            if use_cache:
+                access_ok = bool(ent.get("access_ok", False))
+                is_pro = bool(ent.get("is_pro", False))
+            else:
+                access_ok = await to_thread_fast(enforce_access_or_block, update, cmd)
+                # Only compute pro flag if needed later; but cheap enough to cache now
+                try:
+                    is_pro = bool(user_has_pro(uid))
+                except Exception:
+                    is_pro = False
+
+                _cache[uid] = {"ts": now, "access_ok": access_ok, "is_pro": is_pro}
+
+            if not access_ok:
+                raise ApplicationHandlerStop
+
+            # 2) Pro-only commands (use cached pro flag)
+            if cmd in PRO_ONLY_COMMANDS and not is_pro:
+                try:
+                    await update.message.reply_text(
+                        "🚀 Pro feature.\n\n"
+                        "This command is available in *Pro* (and during your 7-day trial).\n\n"
+                        "👉 /billing",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+                raise ApplicationHandlerStop
+
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        return
+
+
+def render_primary_only() -> None:
+    """
+    Render-safe single instance guard.
+
+    IMPORTANT:
+    - On Render, RENDER_INSTANCE_ID is often a string like "srv-...".
+      That does NOT mean "secondary".
+    - We only exit if Render provides a *numeric replica index* AND it's not 0.
+    """
+    # Some Render setups expose an index/number; only trust numeric ones.
+    candidates = [
+        os.environ.get("RENDER_INSTANCE_NUMBER"),
+        os.environ.get("RENDER_INSTANCE_INDEX"),
+        os.environ.get("RENDER_REPLICA_NUMBER"),
+    ]
+
+    for val in candidates:
+        if val is None:
+            continue
+        # Only treat as authoritative if it's purely numeric
+        if val.isdigit():
+            if val != "0":
+                logging.warning(f"Secondary Render replica ({val}) exiting.")
+                raise SystemExit(0)
+            return  # primary replica
+
+    # Fallback: DO NOT exit just because RENDER_INSTANCE_ID exists (it's usually non-numeric).
+    instance_id = os.environ.get("RENDER_INSTANCE_ID")
+    logging.info(f"Render instance id: {instance_id} (no numeric replica index found; continuing)")
+
+
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+EXCHANGE_ID = "bybit"
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+
+DEFAULT_TYPE = "swap"  # bybit futures
+DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
+
+CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "5"))
+
+# -------------------------
+# LOGGING: redact secrets + quiet noisy libs (Render-safe)
+# -------------------------
+class RedactSecretsFilter(logging.Filter):
+    def __init__(self, secrets: List[str]):
+        super().__init__()
+        self.secrets = [s for s in (secrets or []) if s]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+
+        for s in self.secrets:
+            if s and s in msg:
+                msg = msg.replace(s, "[REDACTED]")
+
+        # Replace rendered message safely
+        record.msg = msg
+        record.args = ()
+        return True
+
+
+def setup_logging():
+    # Let Render control via LOG_LEVEL, default INFO
+    lvl = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(level=getattr(logging, lvl, logging.INFO))
+
+    # Quiet the libs that spam request URLs (and may leak token)
+    for noisy in ("httpx", "telegram", "telegram.ext", "apscheduler"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # Redact secrets from ALL logs
+    secrets = [
+        os.environ.get("TELEGRAM_TOKEN", ""),
+        os.environ.get("EMAIL_PASS", ""),
+    ]
+    logging.getLogger().addFilter(RedactSecretsFilter(secrets))
+
+
+# Call once at import time (after TOKEN/envs exist)
+setup_logging()
+
+# Recreate your app logger after setup_logging so it inherits config
+logger = logging.getLogger("pulsefutures")
+
+
+
+# -------------------------
+# ✅ Admin / Visibility (anti-copy)
+# -------------------------
+# Put your Telegram user id(s) here, comma-separated (example: "123,456")
+ADMIN_USER_IDS = set(
+    int(x.strip()) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
+)
+ADMIN_IDS = set(ADMIN_IDS) | set(ADMIN_USER_IDS)
+
+# IMPORTANT CHANGE:
+# System sends signals only. It does NOT show reject reasons to public users.
+# Admin can still see internals if you set PUBLIC_DIAGNOSTICS_MODE=admin
+PUBLIC_DIAGNOSTICS_MODE = os.environ.get("PUBLIC_DIAGNOSTICS_MODE", "off").strip().lower()
+# values:
+# - "off"    => hide reject diagnostics completely for non-admin
+# - "admin"  => only admins can see diagnostics (recommended)
+# Admin always sees full if needed.
+
+
+# -------------------------
+# Screen output sizes
+# -------------------------
+LEADERS_N = 10
+
+# ✅ More setups on /screen (UX), while email stays strict
+SETUPS_N = 6
+EMAIL_SETUPS_N = 3
+
+# ✅ Global setup quality floor (Premium & Selective)
+MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "78"))
+
+# ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
+MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
+MIN_RR_TP3 = float(os.environ.get("MIN_RR_TP3", "1.8"))
+
+# Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
+EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
+
+# ✅ /screen scan breadth + loosened trigger only for screen (NOT email)
+SCREEN_UNIVERSE_N = 70          # was effectively 35 (inside pick_setups)
+SCREEN_TRIGGER_LOOSEN = 0.85    # 15% easier trigger on /screen only
+SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
+SCREEN_WAITING_N = 10
+
+# EMA proximity gate: never generate setups if price is far from EMA7 (1H)
+EMA7_1H_MAX_DIST_PCT = float(os.environ.get("EMA7_1H_MAX_DIST_PCT", "0.80") or 0.80)  # adaptive base anchor distance (%)
+
+# Directional Leaders/Losers thresholds
+MOVER_VOL_USD_MIN = 5_000_000
+MOVER_UP_24H_MIN = 10.0
+MOVER_DN_24H_MAX = -10.0
+
+
+# =========================================================
+# STRATEGY CONFIG (PARAMETERIZED) — single source of truth
+# - All tunable thresholds/weights live here.
+# - Persisted to SQLite (strategy_config table).
+# - Used by live scanning, /backtest, and /optimize.
+# =========================================================
+
+STRATEGY_CONFIG_KEY_ACTIVE = "active"
+STRATEGY_CONFIG_KEY_OPT_REPORT = "opt_report"
+
+def _strategy_config_migrate():
+    """Ensure strategy_config table exists."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS strategy_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_ts REAL
+            )""")
+            conn.commit()
+    except Exception:
+        pass
+
+def _strategy_config_defaults() -> dict:
+    """Defaults are chosen to target ~3–5 setups/day across universe with robust quality."""
+    return {
+        # Universe / liquidity
+        "min_fut_vol_usd": float(MIN_FUT_VOL_USD),
+        "universe_top_n": int(120),
+
+        # Execution timeframes (matrix is used by /optimize; live uses exec_tf_default unless overridden)
+        "exec_tf_default": "15m",
+        "exec_tf_candidates": ["5m", "15m"],
+        "context_tf_1": "1h",
+        "context_tf_2": "4h",
+
+        # Quality floors (0..100)
+        "quality_score_min_screen": float(QUALITY_SCORE_MIN_SCREEN),
+        "quality_score_min_email": float(QUALITY_SCORE_MIN_EMAIL),
+
+        # Regime thresholds (used by backtest generator + some live scoring)
+        "regime_slope_trend_min_pct": 0.06,
+        "regime_atr_pct_min": 0.7,
+        "regime_atr_pct_max": 9.0,
+        "regime_unstable_atr_hi": 10.5,
+        "regime_unstable_atr_lo": 0.3,
+
+        # ATR / volatility floor (applies in make_setup too)
+        "atr_min_pct": float(ATR_MIN_PCT),
+        "atr_max_pct": float(ATR_MAX_PCT),
+
+        # Alignment floors (session-aware multipliers already exist)
+        "tf_align_enabled": bool(TF_ALIGN_ENABLED),
+        "tf_align_1h_min_abs": float(TF_ALIGN_1H_MIN_ABS),
+        "tf_align_4h_min_abs": float(TF_ALIGN_4H_MIN_ABS),
+
+        # RR floor
+        "min_rr_tp3": float(MIN_RR_TP3),
+
+        # Score weights (must sum ~1.0; scaled to 100 in compute_setup_quality_score)
+        "score_w_conf": 0.45,
+        "score_w_regime": 0.12,
+        "score_w_align": 0.10,
+        "score_w_rr": 0.10,
+        "score_w_vol": 0.08,
+        "score_w_atr": 0.06,
+        "score_w_ema_clean": 0.04,
+        "score_w_stop_sane": 0.04,
+        "score_w_sweep": 0.03,
+        "score_w_smf": 0.01,
+
+        # Frequency targeting (used in /optimize objective)
+        "target_setups_per_day_lo": 3.0,
+        "target_setups_per_day_hi": 5.0,
+
+        # Self-optimization governance
+        "session_weights": {"NY": 1.0, "LON": 0.0, "ASIA": 0.0},  # optimizer weighting (production bias: NY-only)
+        "concentration_cap": 0.25,          # no single symbol >25% of setups (OOS)
+        "oos_min_setups": 30,               # minimum OOS sample size across universe before promotion
+        "min_win_rate": 70.0,               # enforced only when sample is adequate
+        "min_win_rate_samples": 50,         # require at least this many OOS setups to enforce min_win_rate
+        "max_drawdown_R_cap": 8.0,          # OOS max drawdown cap in R (penalize heavily above)
+
+        # Setup-count governor (live engine + optimizer)
+        "governor_enabled": True,
+        "governor_window_hours": 24,
+        "governor_target_lo": 3.0,
+        "governor_target_hi": 5.0,
+        "governor_step_score": 1.0,         # +/- points applied to quality_score_min_email when adjusting
+        "governor_score_min": 52.0,         # absolute lower bound for quality_score_min_email
+        "governor_score_max": 82.0,         # absolute upper bound for quality_score_min_email
+        "governor_apply_to": "email",       # 'email' (safe) or 'email+screen'
+        "governor_last_adjust_ts": 0.0,
+
+        # Optimization bounds (safe ranges)
+        "opt_bounds": {
+            "quality_score_min_screen": [52.0, 70.0],
+            "regime_slope_trend_min_pct": [0.04, 0.10],
+            "tf_align_1h_min_abs": [0.3, 1.2],
+            "tf_align_4h_min_abs": [0.3, 1.2],
+            "atr_min_pct": [0.4, 1.5],
+            "min_rr_tp3": [1.3, 2.4],
+        },
+
+        # Zero-touch autopilot optimizer windows
+        "autotune_windows": [
+            {"days": 7, "end_days_ago": 0},
+            {"days": 14, "end_days_ago": 0},
+            {"days": 21, "end_days_ago": 0},
+            {"days": 30, "end_days_ago": 0},
+        ],
+        "autotune_shortlist": 10,
+        "autotune_min_positive_windows": 3,
+        "autotune_min_window_wr": 52.0,
+        "autotune_consistency_penalty": 2.0,
+        "autotune_learning_guard_enabled": True,
+    }
+
+_STRATEGY_CFG_CACHE = {"ts": 0.0, "cfg": None}
+_STRATEGY_CFG_TTL = 15.0
+
+def load_strategy_config(force: bool = False) -> dict:
+    """Load StrategyConfig from SQLite; create defaults if missing."""
+    _strategy_config_migrate()
+    now = time.time()
+    if (not force) and _STRATEGY_CFG_CACHE.get("cfg") is not None and (now - float(_STRATEGY_CFG_CACHE.get("ts") or 0.0)) < _STRATEGY_CFG_TTL:
+        return dict(_STRATEGY_CFG_CACHE["cfg"])
+    cfg = None
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute("SELECT value FROM strategy_config WHERE key=?", (STRATEGY_CONFIG_KEY_ACTIVE,)).fetchone()
+            if row and row[0]:
+                cfg = json.loads(row[0])
+    except Exception:
+        cfg = None
+    if not isinstance(cfg, dict):
+        cfg = _strategy_config_defaults()
+        save_strategy_config(cfg)
+    _STRATEGY_CFG_CACHE["ts"] = now
+    _STRATEGY_CFG_CACHE["cfg"] = dict(cfg)
+    return dict(cfg)
+
+def save_strategy_config(cfg: dict) -> None:
+    """Persist StrategyConfig to SQLite."""
+    _strategy_config_migrate()
+    try:
+        payload = json.dumps(cfg, ensure_ascii=False, sort_keys=True)
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO strategy_config(key,value,updated_ts) VALUES(?,?,?)",
+                (STRATEGY_CONFIG_KEY_ACTIVE, payload, float(time.time()))
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def save_opt_report(report: dict) -> None:
+    _strategy_config_migrate()
+    try:
+        payload = json.dumps(report, ensure_ascii=False, sort_keys=True)
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO strategy_config(key,value,updated_ts) VALUES(?,?,?)",
+                (STRATEGY_CONFIG_KEY_OPT_REPORT, payload, float(time.time()))
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def load_opt_report() -> dict:
+    _strategy_config_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute("SELECT value FROM strategy_config WHERE key=?", (STRATEGY_CONFIG_KEY_OPT_REPORT,)).fetchone()
+            if row and row[0]:
+                obj = json.loads(row[0])
+                return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    try:
+        return max(float(lo), min(float(hi), float(v)))
+    except Exception:
+        return float(lo)
+
+def apply_strategy_config(cfg: dict) -> None:
+    """Apply StrategyConfig into global tunables used throughout the bot."""
+    global MIN_FUT_VOL_USD, EMAIL_MIN_FUT_VOL_USD, MIN_RR_TP3
+    global QUALITY_SCORE_MIN_SCREEN, QUALITY_SCORE_MIN_EMAIL
+    global TF_ALIGN_ENABLED, TF_ALIGN_1H_MIN_ABS, TF_ALIGN_4H_MIN_ABS
+    global ATR_MIN_PCT, ATR_MAX_PCT
+    global _QUALITY_W
+
+    if not isinstance(cfg, dict):
+        return
+
+    # Liquidity + RR
+    try:
+        MIN_FUT_VOL_USD = float(cfg.get("min_fut_vol_usd", MIN_FUT_VOL_USD))
+        EMAIL_MIN_FUT_VOL_USD = float(MIN_FUT_VOL_USD)
+    except Exception:
+        pass
+    try:
+        MIN_RR_TP3 = float(cfg.get("min_rr_tp3", MIN_RR_TP3))
+    except Exception:
+        pass
+
+    # Score floors
+    try:
+        QUALITY_SCORE_MIN_SCREEN = float(cfg.get("quality_score_min_screen", QUALITY_SCORE_MIN_SCREEN))
+    except Exception:
+        pass
+    try:
+        QUALITY_SCORE_MIN_EMAIL = float(cfg.get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL))
+    except Exception:
+        pass
+
+    # Alignment / ATR
+    try:
+        TF_ALIGN_ENABLED = bool(cfg.get("tf_align_enabled", TF_ALIGN_ENABLED))
+    except Exception:
+        pass
+    try:
+        TF_ALIGN_1H_MIN_ABS = float(cfg.get("tf_align_1h_min_abs", TF_ALIGN_1H_MIN_ABS))
+        TF_ALIGN_4H_MIN_ABS = float(cfg.get("tf_align_4h_min_abs", TF_ALIGN_4H_MIN_ABS))
+    except Exception:
+        pass
+    try:
+        ATR_MIN_PCT = float(cfg.get("atr_min_pct", ATR_MIN_PCT))
+        ATR_MAX_PCT = float(cfg.get("atr_max_pct", ATR_MAX_PCT))
+    except Exception:
+        pass
+
+    # Scoring weights (kept in one dict for compute_setup_quality_score)
+    _QUALITY_W = {
+        "conf": float(cfg.get("score_w_conf", 0.45)),
+        "regime": float(cfg.get("score_w_regime", 0.12)),
+        "align": float(cfg.get("score_w_align", 0.10)),
+        "rr": float(cfg.get("score_w_rr", 0.10)),
+        "vol": float(cfg.get("score_w_vol", 0.08)),
+        "atr": float(cfg.get("score_w_atr", 0.06)),
+        "ema_clean": float(cfg.get("score_w_ema_clean", 0.04)),
+        "stop_sane": float(cfg.get("score_w_stop_sane", 0.04)),
+        "sweep": float(cfg.get("score_w_sweep", 0.03)),
+        "smf": float(cfg.get("score_w_smf", 0.01)),
+    }
+
+# Initialize config on boot
+try:
+    apply_strategy_config(load_strategy_config(force=True))
+except Exception:
+    pass
+
+def _parse_param_value(s: str):
+    """Parse param values for /params_set. Supports bool/int/float/json/raw string."""
+    v = (s or "").strip()
+    if v.lower() in ("true","yes","on","1"): return True
+    if v.lower() in ("false","no","off","0"): return False
+    # Try numeric
+    try:
+        if re.fullmatch(r"[-+]?\d+", v):
+            return int(v)
+        if re.fullmatch(r"[-+]?\d*\.\d+", v):
+            return float(v)
+    except Exception:
+        pass
+    # Try JSON
+    try:
+        if (v.startswith("{") and v.endswith("}")) or (v.startswith("[") and v.endswith("]")):
+            return json.loads(v)
+    except Exception:
+        pass
+    return v
+
+async def cmd_params_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = load_strategy_config(force=True)
+    pretty = json.dumps(cfg, indent=2, ensure_ascii=False, sort_keys=True)
+    await send_long_message(update, f"⚙️ Strategy Params (active)\n{HDR}\n```\n{pretty}\n```", parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_params_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    cfg = _strategy_config_defaults()
+    save_strategy_config(cfg)
+    apply_strategy_config(cfg)
+    await update.message.reply_text("✅ Strategy params reset to defaults.")
+
+async def cmd_params_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /params_set <key> <value>\nExample: /params_set quality_score_min_screen 58")
+        return
+    key = str(args[0]).strip()
+    val_raw = " ".join(args[1:]).strip()
+    val = _parse_param_value(val_raw)
+    cfg = load_strategy_config(force=True)
+
+    # Support dot paths into nested dict (e.g. opt_bounds.quality_score_min_screen)
+    if "." in key:
+        parts = key.split(".")
+        cur = cfg
+        for p in parts[:-1]:
+            if p not in cur or not isinstance(cur[p], dict):
+                cur[p] = {}
+            cur = cur[p]
+        cur[parts[-1]] = val
+    else:
+        cfg[key] = val
+
+    save_strategy_config(cfg)
+    apply_strategy_config(cfg)
+    await update.message.reply_text(f"✅ Updated: {key} = {val_raw}")
+
+
+# =========================================================
+# ✅ ENGINES
+# =========================================================
+ENGINE_A_PULLBACK_ENABLED = True     # pullback / mean-reversion near adaptive EMA
+ENGINE_B_MOMENTUM_ENABLED = True     # pump / expansion
+
+# =========================================================
+# ✅ 1H MOMENTUM INTENSITY (SESSION-DYNAMIC)
+# =========================================================
+# Base floor (still used), but we now scale it per session:
+TRIGGER_1H_ABS_MIN_BASE = 0.15        # global floor
+CONFIRM_15M_ABS_MIN = 0.25
+ALIGN_4H_MIN = 0.0
+ALIGN_4H_NEUTRAL_ZONE = 0.35  # if |4H| < this, treat regime as neutral (avoid blocking leaders)
+
+# "EARLY" filler (email only)
+EARLY_1H_ABS_MIN = 1.8
+EARLY_CONF_PENALTY = 4
+EARLY_EMAIL_EXTRA_CONF = 4
+EARLY_EMAIL_MAX_FILL = 1
+
+# =========================================================
+# EMAIL QUALITY GATES (STRICT)
+# =========================================================
+# Rule 1) Minimum momentum gate (prevents "15m=0%" emails via EARLY path)
+EMAIL_EARLY_MIN_CH15_ABS = 0.20   # require at least this abs(15m %) for EARLY emails
+
+# Rule 2) Volume relative filter (killer rule)
+EMAIL_ABS_VOL_USD_MIN = 1_000_000     # hard floor (was too strict)
+EMAIL_REL_VOL_MIN_MULT = 0.6         # require vol >= 0.6x median (was 1.25x median)
+
+# Rule 3) Priority override (Directional Leaders/Losers first)
+EMAIL_PRIORITY_OVERRIDE_ON = True
+
+TREND_24H_TOL = 0.5
+
+# ✅ Session-based 1H strictness:
+# ASIA = tightest, LON = medium, NY = loosest
+SESSION_1H_BASE_MULT = {
+    "NY": 0.85,
+    "LON": 1.00,
+    "ASIA": 1.20,
+}
+
+# =========================================================
+# ✅ ENGINE B (MOMENTUM / EXPANSION) SETTINGS (for pumps)
+# =========================================================
+MOMENTUM_MIN_CH1 = 1.3               # pump gate for 1H (easier than before)
+MOMENTUM_MIN_24H = 8.0              # must be moving
+MOMENTUM_VOL_MULT = 1.2              # volume spike vs mover min
+MOMENTUM_ATR_BODY_MULT = 0.95        # expansion vs ATR% (easier)
+# ✅ MUCH STRICTER: avoid pump / mid-wave momentum entries
+MOMENTUM_MAX_ADAPTIVE_EMA_DIST = 3.5   # percent, was 7.5
+
+
+# Higher TP behavior for Engine B (pumps)
+ENGINE_B_TP_CAP_BONUS_PCT = 4.0      # adds to TP cap %
+ENGINE_B_RR_BONUS = 0.35             # adds to RR target (TP3)
+
+# =========================================================
+# RISK DEFAULTS
+# =========================================================
+DEFAULT_EQUITY = 0.0
+DEFAULT_RISK_MODE = "PCT"
+DEFAULT_RISK_VALUE = 1.5
+DEFAULT_DAILY_CAP_MODE = "PCT"
+DEFAULT_DAILY_CAP_VALUE = 5.0
+DEFAULT_MAX_TRADES_DAY = 5
+DEFAULT_MIN_EMAIL_GAP_MIN = 30
+
+# Backward-compat alias
+DEFAULT_EMAIL_GAP_MIN = DEFAULT_MIN_EMAIL_GAP_MIN
+DEFAULT_MAX_EMAILS_PER_SESSION = 5
+DEFAULT_MAX_EMAILS_PER_DAY = 10
+
+DEFAULT_MAX_RISK_PCT_PER_TRADE = 2.0
+
+# =========================================================
+# SCAN PROFILES
+# =========================================================
+# standard = fewer, higher quality
+# aggressive = more setups on /screen and more candidates for email filters (still risk-gated)
+DEFAULT_SCAN_PROFILE = "standard"
+SCAN_PROFILES = {"standard", "aggressive"}
+
+WARN_RISK_PCT_PER_TRADE = 2.0
+
+# =========================================================
+# ✅ COOLDOWNS (email anti-spam)
+# =========================================================
+# Lighter cooldowns (emails are rare; don't over-block)
+# NOTE: cooldown only suppresses *emails*, not /screen.
+# You can still keep spam under control via email_gap_min + daily caps.
+SESSION_SYMBOL_COOLDOWN_HOURS = {
+    "NY": 1,     # more active
+    "LON": 2,    # balanced
+    "ASIA": 3,   # a bit stricter
+}
+
+# Fallback if session unknown
+SYMBOL_COOLDOWN_HOURS = 3
+
+# =========================================================
+# WIN-RATE FILTERS (stricter = fewer signals, higher quality)
+# =========================================================
+
+# 1) Flip-Guard: prevents opposite-direction alerts for same symbol for a period
+# Example: SELL then BUY within 2 hours => BUY is blocked (and vice-versa)
+FLIP_GUARD_ENABLED = True
+FLIP_GUARD_MULT = 1.0  # 1.0 = same as session cooldown hours; try 1.5–2.0 to be stricter
+
+# 2) Higher-TF alignment: require 1H + 4H momentum to agree with the signal direction
+TF_ALIGN_ENABLED = True
+TF_ALIGN_1H_MIN_ABS = 0.5   # percent
+TF_ALIGN_4H_MIN_ABS = 0.5   # percent
+
+# ✅ Approach A: session-aware TF alignment floors (higher win-rate, esp. ASIA)
+TF_ALIGN_1H_MIN_ABS_BY_SESSION = {
+    "NY": TF_ALIGN_1H_MIN_ABS,
+    "LON": TF_ALIGN_1H_MIN_ABS,
+    "ASIA": 0.8,
+}
+TF_ALIGN_4H_MIN_ABS_BY_SESSION = {
+    "NY": TF_ALIGN_4H_MIN_ABS,
+    "LON": TF_ALIGN_4H_MIN_ABS,
+    "ASIA": 0.8,
+}
+
+def tf_align_mins_for_session(session_name: str) -> tuple[float, float]:
+    s = (session_name or "").strip().upper()
+    return (
+        float(TF_ALIGN_1H_MIN_ABS_BY_SESSION.get(s, TF_ALIGN_1H_MIN_ABS)),
+        float(TF_ALIGN_4H_MIN_ABS_BY_SESSION.get(s, TF_ALIGN_4H_MIN_ABS)),
+    )
+
+# Weekend handling (UTC-based) — slight tightening only (avoid junky liquidity)
+def is_weekend_utc(dt_utc) -> bool:
+    try:
+        return int(dt_utc.weekday()) >= 5
+    except Exception:
+        return False
+
+
+
+def cooldown_hours_for_session(session_name: str) -> int:
+    s = (session_name or "").strip().upper()
+    return int(SESSION_SYMBOL_COOLDOWN_HOURS.get(s, SYMBOL_COOLDOWN_HOURS))
+
+def max_cooldown_hours() -> int:
+    try:
+        return int(max(list(SESSION_SYMBOL_COOLDOWN_HOURS.values()) + [SYMBOL_COOLDOWN_HOURS]))
+    except Exception:
+        return int(SYMBOL_COOLDOWN_HOURS)
+
+# Multi-TP
+ATR_PERIOD = 14
+ATR_MIN_PCT = 1.0
+ATR_MAX_PCT = 8.0
+MULTI_TP_MIN_CONF = 78
+TP_ALLOCS = (40, 40, 20)
+
+TP_R_MULTS_DEFAULT = (1.0, 1.7, 2.4)
+
+# Dynamic TP cap: normal vs hot coins
+TP_MAX_PCT_NORMAL = 12.0
+TP_MAX_PCT_HOT = 15.0
+HOT_VOL_USD = 50_000_000
+HOT_CH24_ABS = 15.0
+
+# =========================================================
+# ✅ ADAPTIVE EMA SUPPORT (global)
+# =========================================================
+# Minimum/maximum adaptive EMA period bounds
+ADAPTIVE_EMA_MIN = 8
+ADAPTIVE_EMA_MAX = 21
+
+# Proximity threshold (derived from ATR%), clamped
+EMA_SUPPORT_MAX_DIST_ATR_MULT = 0.7
+EMA_SUPPORT_MAX_DIST_PCT_MIN = 0.25
+EMA_SUPPORT_MAX_DIST_PCT_MAX = 1.8
+
+# Sharp 1H move gating
+SHARP_1H_MOVE_PCT = 20.0
+
+
+# =========================================================
+# 🤖 AUTOTRADE (Bybit V5) — LIVE/PAPER
+# =========================================================
+# NOTE: AutoTrade is owner-only (AUTOTRADE_OWNER_UID) and is gated by session + risk caps.
+AUTOTRADE_ENABLED = str(os.environ.get("AUTOTRADE_ENABLED", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
+AUTOTRADE_MODE = str(os.environ.get("AUTOTRADE_MODE", "paper")).strip().lower()  # 'paper' | 'live'
+try:
+    AUTOTRADE_OWNER_UID = int(os.environ.get("AUTOTRADE_OWNER_UID", "0") or 0)
+except Exception:
+    AUTOTRADE_OWNER_UID = 0
+
+# Risk controls
+AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "1") or 1)
+AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT", "3") or 3)
+AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "3") or 3)
+# Open-trade count cap for commercial/live safety.
+AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "0") or 0)
+EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
+
+
+# Margin / leverage
+AUTOTRADE_ISOLATED = str(os.environ.get("AUTOTRADE_ISOLATED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
+AUTOTRADE_LEVERAGE = int(os.environ.get("AUTOTRADE_LEVERAGE", "10") or 10)
+
+# TP split (fractions must sum ~1.0)
+_AUTOTRADE_TP_SPLIT_RAW = str(os.environ.get("AUTOTRADE_TP_SPLIT", "0.65,0.35,0.0") or "0.65,0.35,0.0")
+try:
+    AUTOTRADE_TP_SPLIT = [float(x) for x in _AUTOTRADE_TP_SPLIT_RAW.split(",")]
+except Exception:
+    AUTOTRADE_TP_SPLIT = [0.4, 0.4, 0.2]
+if len(AUTOTRADE_TP_SPLIT) != 3:
+    AUTOTRADE_TP_SPLIT = [0.4, 0.4, 0.2]
+# Normalize if slightly off
+try:
+    _s = sum(AUTOTRADE_TP_SPLIT)
+    if _s > 0:
+        AUTOTRADE_TP_SPLIT = [x/_s for x in AUTOTRADE_TP_SPLIT]
+except Exception:
+    AUTOTRADE_TP_SPLIT = [0.4, 0.4, 0.2]
+
+# Live exit architecture: keep one partial reduce-only TP on the order book and keep
+# the final TP + SL on Bybit's position-level trading-stop so the chart/position UI is
+# always consistent. This also shortens average resolution time versus waiting for TP3.
+AUTOTRADE_LIVE_TP1_FRACTION = float(os.environ.get("AUTOTRADE_LIVE_TP1_FRACTION", "0.65") or 0.65)
+AUTOTRADE_LIVE_TP1_FRACTION = max(0.25, min(0.85, AUTOTRADE_LIVE_TP1_FRACTION))
+AUTOTRADE_BE_AFTER_TP1_ENABLED = str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ENABLED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
+AUTOTRADE_BE_AFTER_TP1_MIN_CONF = int(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MIN_CONF", "84") or 84)
+AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT", "4.5") or 4.5)
+AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY") or "NY").upper().replace(' ', '').split(','))
+# Live market-order entries must still stay close to the setup entry. Otherwise the bot can
+# execute a stale emailed setup at a materially worse price just because it is still inside
+# the time window. This guard keeps the email/setup engine and live execution aligned.
+AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "0.50") or 0.50)
+
+# Bybit V5 keys (required for live)
+BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
+BYBIT_API_SECRET = str(os.environ.get("BYBIT_API_SECRET", "") or "").strip()
+BYBIT_RECV_WINDOW = str(os.environ.get("BYBIT_RECV_WINDOW", "5000") or "5000").strip()
+BYBIT_TESTNET = str(os.environ.get("BYBIT_TESTNET", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
+AUTOTRADE_ENTRY_WINDOW_MIN = int(os.environ.get("AUTOTRADE_ENTRY_WINDOW_MIN", "45") or 45)
+
+# Email
+EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465"))
+EMAIL_USER = os.environ.get("EMAIL_USER", "")
+EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER)
+EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
+
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
+TELEGRAM_BOT_URL = os.environ.get("TELEGRAM_BOT_URL", "https://t.me/PulseFuturesBot").strip()
+
+# =========================================================
+# 🤖 AUTOTRADE — Bybit V5 helpers + DB
+# =========================================================
+import hmac
+import hashlib
+import uuid
+
+def _bybit_base_url() -> str:
+    return "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
+
+def _bybit_v5_sign(ts_ms: str, body: str) -> str:
+    """
+    Bybit V5 signature:
+      sign = HMAC_SHA256(secret, timestamp + api_key + recv_window + body)
+    """
+    msg = f"{ts_ms}{BYBIT_API_KEY}{BYBIT_RECV_WINDOW}{body}".encode("utf-8")
+    return hmac.new(BYBIT_API_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> dict:
+    import requests
+    from urllib.parse import urlencode
+
+    method = (method or "GET").upper().strip()
+    payload = payload or {}
+
+    base = _bybit_base_url()
+    url = base + path
+
+    ts_ms = str(int(time.time() * 1000))
+
+    # For V5 signing:
+    # - GET requests must be signed with the *query string* (not the body),
+    #   and the query must actually be sent to Bybit.
+    # - POST requests are signed with the JSON body.
+    body = ""
+    query_str = ""
+
+    if method == "GET":
+        # Support callers that pass params in payload (recommended).
+        # If path already has '?', keep it and append any payload params.
+        if "?" in url:
+            url_base, url_q = url.split("?", 1)
+            url = url_base
+            query_str = url_q
+        if payload:
+            extra = urlencode(payload, doseq=True)
+            query_str = f"{query_str}&{extra}" if (query_str and extra) else (query_str or extra)
+
+        if query_str:
+            url = f"{url}?{query_str}"
+
+        sign_payload = query_str
+    else:
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        sign_payload = body
+
+    sign = _bybit_v5_sign(ts_ms, sign_payload) if (BYBIT_API_KEY and BYBIT_API_SECRET) else ""
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": ts_ms,
+        "X-BAPI-RECV-WINDOW": BYBIT_RECV_WINDOW,
+        "X-BAPI-SIGN": sign,
+    }
+
+    try:
+        if method == "GET":
+            r = requests.get(url, headers=headers, timeout=15)
+        else:
+            r = requests.post(url, headers=headers, data=body.encode("utf-8"), timeout=15)
+        return r.json()
+    except Exception as e:
+        return {"retCode": -1, "retMsg": f"{type(e).__name__}: {e}", "result": None}
+def _bybit_get_instr_filters(symbol: str) -> dict:
+    """Return best-effort Bybit linear instrument filters.
+
+    Keys returned as strings when available:
+    - minQty
+    - qtyStep
+    - minNotional
+    - contractSize
+    - tickSize
+    """
+    sym = _bybit_linear_symbol(symbol)
+    if sym in _INSTR_FILTER_CACHE:
+        return _INSTR_FILTER_CACHE[sym]
+    out = {"minQty": None, "qtyStep": None, "minNotional": None, "contractSize": None, "tickSize": None}
+    try:
+        res = _bybit_v5_request("GET", "/v5/market/instruments-info", {"category": "linear", "symbol": sym})
+        items = (((res or {}).get("result") or {}).get("list") or [])
+        if items:
+            info = items[0] or {}
+            lot = info.get("lotSizeFilter") or {}
+            price_filter = info.get("priceFilter") or {}
+
+            if lot.get("minOrderQty") is not None:
+                out["minQty"] = str(lot.get("minOrderQty"))
+            if lot.get("qtyStep") is not None:
+                out["qtyStep"] = str(lot.get("qtyStep"))
+            # Current Bybit V5 field for linear min notional is lotSizeFilter.minNotionalValue
+            min_notional = lot.get("minNotionalValue")
+            if min_notional is None:
+                nf = info.get("notionalFilter") or {}
+                min_notional = nf.get("minNotional")
+            if min_notional is not None:
+                out["minNotional"] = str(min_notional)
+            if info.get('contractSize') is not None:
+                out['contractSize'] = str(info.get('contractSize'))
+            if price_filter.get('tickSize') is not None:
+                out['tickSize'] = str(price_filter.get('tickSize'))
+    except Exception:
+        pass
+    _INSTR_FILTER_CACHE[sym] = out
+    return out
+
+
+
+def _fmt_qty(qty: float, step) -> str:
+    """Format qty as Bybit-safe decimal string aligned to qtyStep.
+
+    Safety rule (critical): never round UP quantities, because that can increase
+    the true $ risk beyond the intended risk-per-trade. We therefore round DOWN
+    to the nearest qtyStep multiple.
+    """
+    try:
+        if qty is None:
+            return "0"
+        dqty = Decimal(str(qty))
+
+        if step is None:
+            return format(dqty, "f")
+
+        dstep = Decimal(str(step))
+        if dstep <= 0:
+            return format(dqty, "f")
+
+        mult = (dqty / dstep).to_integral_value(rounding=ROUND_DOWN)
+        dq = (mult * dstep).quantize(dstep)  # keeps correct decimals
+        if dq <= 0:
+            return "0"
+        return format(dq, "f")
+    except Exception:
+        try:
+            return format(Decimal(str(qty)), "f")
+        except Exception:
+            return str(qty)
+
+
+def _round_qty_down(symbol: str, qty: float, entry_price: float) -> tuple[float | None, str | None]:
+    """Decimal-safe rounding DOWN to Bybit qtyStep and safety-checking minQty/minNotional.
+
+    CRITICAL SAFETY:
+    - We never round UP qty to satisfy minNotional/minQty because that can increase
+      the true $ risk beyond the user's /riskmode.
+    - If, after rounding DOWN, qty does not meet exchange minimums, we SKIP the trade.
+    """
+    try:
+        if qty is None or float(qty) <= 0:
+            return (None, "qty<=0")
+
+        f = _bybit_get_instr_filters(symbol)
+        step_s = f.get("qtyStep")
+        min_qty_s = f.get("minQty")
+        min_not_s = f.get("minNotional")
+        cs_s = f.get("contractSize")
+
+        dqty = Decimal(str(qty))
+        dentry = Decimal(str(entry_price)) if entry_price and entry_price > 0 else None
+
+        def _d(x):
+            if x is None:
+                return None
+            try:
+                return Decimal(str(x))
+            except Exception:
+                return None
+
+        dstep = _d(step_s)
+        dmin = _d(min_qty_s)
+        dmin_not = _d(min_not_s)
+        dcs = _d(cs_s) or Decimal('1')
+
+        # Round DOWN to step
+        if dstep and dstep > 0:
+            mult = (dqty / dstep).to_integral_value(rounding=ROUND_DOWN)
+            dqty = (mult * dstep).quantize(dstep)
+
+        if dqty <= 0:
+            return (None, "qty_rounds_to_0")
+
+        # Enforce minQty without rounding up
+        if dmin and dqty < dmin:
+            return (None, "below_minQty_after_round_down")
+
+        # Enforce minNotional without rounding up
+        if dmin_not and dentry and dentry > 0:
+            notional = dqty * dentry * dcs
+            if notional < dmin_not:
+                return (None, "below_minNotional_after_round_down")
+
+        return (float(dqty), None)
+
+    except Exception as e:
+        return (None, f"qty_round_fail:{type(e).__name__}")
+
+
+
+
+def _round_price_to_tick(symbol: str, price: float, rounding=ROUND_DOWN) -> float:
+    """Round a price to Bybit tick size. Best-effort only."""
+    try:
+        if price is None:
+            return 0.0
+        f = _bybit_get_instr_filters(symbol)
+        tick_s = f.get("tickSize")
+        if not tick_s:
+            return float(price)
+        dprice = Decimal(str(price))
+        dtick = Decimal(str(tick_s))
+        if dtick <= 0:
+            return float(price)
+        mult = (dprice / dtick).to_integral_value(rounding=rounding)
+        out = (mult * dtick).quantize(dtick)
+        return float(out)
+    except Exception:
+        try:
+            return float(price)
+        except Exception:
+            return 0.0
+
+
+def _effective_equity_for_risk(user: dict | None = None, prefer_live: bool = True) -> float:
+    """Single source of truth for risk-based equity.
+
+    LIVE mode prefers Bybit-reported equity; otherwise falls back to user-stored equity.
+    """
+    eq = 0.0
+    try:
+        if isinstance(user, dict):
+            eq = float(user.get("equity", 0.0) or 0.0)
+    except Exception:
+        eq = 0.0
+    if prefer_live:
+        try:
+            live_eq = _live_equity_usdt()
+            if live_eq is not None and float(live_eq) > 0:
+                return float(live_eq)
+        except Exception:
+            pass
+    return max(0.0, float(eq or 0.0))
+
+
+def _risk_amount_from_pct(equity: float, risk_pct: float) -> float:
+    try:
+        if float(equity) <= 0:
+            return 0.0
+        return max(0.0, float(equity) * (float(risk_pct) / 100.0))
+    except Exception:
+        return 0.0
+
+
+def _risk_pct_from_amount(equity: float, risk_usd: float) -> float:
+    try:
+        if float(equity) <= 0:
+            return 0.0
+        return max(0.0, (float(risk_usd) / float(equity)) * 100.0)
+    except Exception:
+        return 0.0
+
+
+def _autotrade_live_reference_price(symbol: str, fallback_entry: float = 0.0) -> float:
+    """Best-effort executable reference price for live sizing.
+
+    We use a current market reference instead of a potentially stale setup entry so market-order
+    sizing stays aligned with real stop distance.
+    """
+    sym = _bybit_linear_symbol(symbol)
+    try:
+        res = _bybit_v5_request("GET", "/v5/market/tickers", {"category": "linear", "symbol": sym})
+        items = (((res or {}).get("result") or {}).get("list") or [])
+        if items:
+            t = items[0] or {}
+            for k in ("markPrice", "lastPrice", "indexPrice"):
+                try:
+                    px = float(t.get(k) or 0.0)
+                    if px > 0:
+                        return px
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        best = get_cached_futures_tickers() or {}
+        base = sym[:-4] if sym.endswith("USDT") else sym
+        mv = best.get(base)
+        if mv:
+            px = float(getattr(mv, "last", 0.0) or 0.0)
+            if px > 0:
+                return px
+    except Exception:
+        pass
+    try:
+        return float(fallback_entry or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _autotrade_true_risk_usd(entry_price: float, stop_price: float, qty_contracts: float, contract_size: float = 1.0) -> float:
+    try:
+        return abs(float(entry_price) - float(stop_price)) * abs(float(qty_contracts)) * abs(float(contract_size or 1.0))
+    except Exception:
+        return 0.0
+
+
+def _autotrade_find_live_position(symbol: str, side: str | None = None) -> dict | None:
+    sym = _bybit_linear_symbol(symbol)
+    side_u = str(side or "").upper().strip()
+    try:
+        for p in _bybit_get_open_positions_linear():
+            psym = _pos_symbol(p)
+            if psym != sym:
+                continue
+            if side_u:
+                pside = _pos_side_text(p)
+                if pside != side_u:
+                    continue
+            return p
+    except Exception:
+        return None
+    return None
+def _autotrade_ready() -> bool:
+    if not AUTOTRADE_ENABLED:
+        return False
+    if AUTOTRADE_OWNER_UID <= 0:
+        return False
+    if AUTOTRADE_MODE not in ("paper", "live"):
+        return False
+    if AUTOTRADE_MODE == "live" and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
+        return False
+    return True
+
+def _bybit_get_equity_usdt() -> float:
+    """Returns account equity (USDT) from Bybit V5 wallet-balance.
+
+    Tries common account types (UNIFIED, CONTRACT) and returns the first positive equity found.
+    """
+    def _extract_equity(res: dict) -> float:
+        try:
+            if int(res.get("retCode", -1)) != 0:
+                return 0.0
+            lst = ((res.get("result") or {}).get("list") or [])
+            if not lst:
+                return 0.0
+            # V5 response: result.list[].coin[] contains entries like {"coin":"USDT","equity":"..."}
+            coins = ((lst[0] or {}).get("coin") or [])
+            usdt = None
+            for c in coins:
+                if str((c or {}).get("coin", "")).upper() == "USDT":
+                    usdt = c or {}
+                    break
+            if not usdt and coins:
+                usdt = coins[0] or {}
+            eq = float(usdt.get("equity") or usdt.get("walletBalance") or usdt.get("availableToWithdraw") or 0.0)
+            return max(0.0, eq)
+        except Exception:
+            return 0.0
+
+    for acct in ("UNIFIED", "CONTRACT"):
+        res = _bybit_v5_request("GET", f"/v5/account/wallet-balance?accountType={acct}&coin=USDT")
+        eq = _extract_equity(res)
+        if eq > 0:
+            return eq
+    return 0.0
+
+
+def _live_equity_usdt() -> float | None:
+    """LIVE mode equity source. Returns None if unavailable.
+
+    Uses Bybit V5 wallet-balance (UNIFIED, USDT) and falls back to None on failure.
+    """
+    try:
+        if not AUTOTRADE_ENABLED:
+            return None
+        if str(AUTOTRADE_MODE).lower() != "live":
+            return None
+        if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+            return None
+        eq = float(_bybit_get_equity_usdt() or 0.0)
+        return eq if eq > 0 else None
+    except Exception:
+        return None
+
+
+
+def _tz_melbourne():
+    try:
+        return ZoneInfo("Australia/Melbourne")
+    except Exception:
+        return timezone.utc
+
+def _parse_iso_utcish(iso_s: str) -> Optional[datetime]:
+    """Parse ISO text and treat naive timestamps as UTC."""
+    if not iso_s:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso_s).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _dt_local(dt: datetime) -> datetime:
+    try:
+        if getattr(dt, "tzinfo", None) is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_tz_melbourne())
+    except Exception:
+        return dt
+
+
+def _fmt_dt_local(dt: datetime, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    try:
+        return _dt_local(dt).strftime(fmt)
+    except Exception:
+        try:
+            return dt.isoformat(timespec="seconds")
+        except Exception:
+            return str(dt)
+
+
+def _fmt_iso_to_local(iso_s: str) -> str:
+    """Convert ISO string (UTC or with tz) to Melbourne local display."""
+    if not iso_s:
+        return ""
+    dt = _parse_iso_utcish(str(iso_s))
+    if dt is None:
+        return str(iso_s)
+    return _fmt_dt_local(dt)
+
+def _ms_to_local_str(ms: int | str | None) -> str:
+    try:
+        if ms is None:
+            return ""
+        ms_i = int(float(ms))
+        dt = datetime.fromtimestamp(ms_i/1000.0, tz=timezone.utc)
+        return _fmt_dt_local(dt)
+    except Exception:
+        return ""
+
+def _bybit_get_open_positions_linear() -> list[dict]:
+    """Return a list of open linear USDT positions (Bybit V5).
+    Each item: {symbol, side, size, avgPrice, markPrice, unrealisedPnl, stopLoss, createdTime, updatedTime, positionValue, leverage}
+    """
+    try:
+        if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+            return []
+        res = _bybit_v5_request("GET", "/v5/position/list", {
+            "category": "linear",
+            "settleCoin": "USDT",
+            "limit": 200,
+        })
+        if int(res.get("retCode", -1)) != 0:
+            return []
+        lst = ((res.get("result") or {}).get("list") or [])
+        out = []
+        for p in lst:
+            try:
+                size = float(p.get("size") or 0.0)
+            except Exception:
+                size = 0.0
+            if size == 0:
+                continue
+            out.append(p)
+        return out
+    except Exception:
+        return []
+
+def _pos_side_text(p: dict) -> str:
+    try:
+        s = str(p.get("side") or "").upper()
+        return "BUY" if s == "BUY" else "SELL" if s == "SELL" else s
+    except Exception:
+        return ""
+
+def _pos_symbol(p: dict) -> str:
+    try:
+        return _bybit_linear_symbol(str(p.get("symbol") or ""))
+    except Exception:
+        return str(p.get("symbol") or "")
+
+def _pos_unreal_pnl(p: dict) -> float:
+    try:
+        return float(p.get("unrealisedPnl") or p.get("unrealizedPnl") or 0.0)
+    except Exception:
+        return 0.0
+
+def _pos_mark(p: dict) -> float:
+    try:
+        return float(p.get("markPrice") or 0.0)
+    except Exception:
+        return 0.0
+
+def _pos_entry(p: dict) -> float:
+    try:
+        return float(p.get("avgPrice") or p.get("entryPrice") or 0.0)
+    except Exception:
+        return 0.0
+
+def _pos_stop(p: dict) -> float:
+    try:
+        return float(p.get("stopLoss") or 0.0)
+    except Exception:
+        return 0.0
+
+def _pos_size(p: dict) -> float:
+    try:
+        return float(p.get("size") or 0.0)
+    except Exception:
+        return 0.0
+
+def _estimate_position_risk_usd(p: dict) -> float:
+    """Estimate risk using entry vs stopLoss if available; otherwise 0."""
+    try:
+        entry = _pos_entry(p)
+        sl = _pos_stop(p)
+        size = abs(_pos_size(p))
+        if entry <= 0 or sl <= 0 or size <= 0:
+            return 0.0
+        return abs(entry - sl) * size
+    except Exception:
+        return 0.0
+
+def _pos_take_profit(p: dict) -> float:
+    try:
+        return float(p.get("takeProfit") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _price_close_enough(a: float, b: float, rel_tol: float = 0.002, abs_tol: float = 1e-8) -> bool:
+    try:
+        a = float(a or 0.0)
+        b = float(b or 0.0)
+        if a <= 0 or b <= 0:
+            return False
+        return abs(a - b) <= max(abs_tol, max(abs(a), abs(b)) * float(rel_tol))
+    except Exception:
+        return False
+
+
+def _autotrade_live_exit_plan_from_targets(entry: float, sl: float, tp1, tp2, tp3, side: str) -> dict:
+    t1, t2, t3 = _ensure_three_tps(float(entry or 0.0), float(sl or 0.0), float(tp3 or 0.0), tp1, tp2, str(side or ''))
+    final_tp = float(t2 or t3 or t1 or 0.0)
+    partial_tp = float(t1 or 0.0)
+    return {
+        'partial_tp': float(partial_tp),
+        'final_tp': float(final_tp),
+        'partial_fraction': float(AUTOTRADE_LIVE_TP1_FRACTION),
+        'effective_tp1': float(t1 or 0.0),
+        'effective_tp2': float(t2 or 0.0),
+        'effective_tp3': float(t3 or 0.0),
+    }
+
+
+def _autotrade_live_exit_plan_for_trade(trade_or_setup) -> dict:
+    return _autotrade_live_exit_plan_from_targets(
+        float(getattr(trade_or_setup, 'entry', 0.0) if hasattr(trade_or_setup, 'entry') else (trade_or_setup.get('entry') if isinstance(trade_or_setup, dict) else 0.0) or 0.0),
+        float(getattr(trade_or_setup, 'sl', 0.0) if hasattr(trade_or_setup, 'sl') else (trade_or_setup.get('sl') if isinstance(trade_or_setup, dict) else 0.0) or 0.0),
+        getattr(trade_or_setup, 'tp1', None) if hasattr(trade_or_setup, 'tp1') else (trade_or_setup.get('tp1') if isinstance(trade_or_setup, dict) else None),
+        getattr(trade_or_setup, 'tp2', None) if hasattr(trade_or_setup, 'tp2') else (trade_or_setup.get('tp2') if isinstance(trade_or_setup, dict) else None),
+        getattr(trade_or_setup, 'tp3', None) if hasattr(trade_or_setup, 'tp3') else (trade_or_setup.get('tp3') if isinstance(trade_or_setup, dict) else None),
+        getattr(trade_or_setup, 'side', '') if hasattr(trade_or_setup, 'side') else (trade_or_setup.get('side') if isinstance(trade_or_setup, dict) else ''),
+    )
+
+
+def _bybit_has_matching_reduce_only_limit_tp(symbol: str, close_side: str, tp_price: float) -> bool:
+    sym = _bybit_linear_symbol(symbol)
+    want_side = str(close_side or '').upper().strip()
+    for o in _bybit_get_open_orders_linear(sym):
+        try:
+            if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
+                continue
+            if str(o.get('side') or '').upper().strip() != want_side:
+                continue
+            if not _bybit_order_reduce_only(o):
+                continue
+            if str(o.get('orderType') or '').upper().strip() != 'LIMIT':
+                continue
+            status = str(o.get('orderStatus') or '').upper().strip()
+            if status in {'FILLED', 'CANCELLED', 'REJECTED', 'DEACTIVATED'}:
+                continue
+            px = float(o.get('price') or o.get('triggerPrice') or 0.0)
+            if _price_close_enough(px, tp_price):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _autotrade_apply_position_tp_sl(symbol: str, stop_loss: float, take_profit: float) -> dict:
+    payload = {
+        'category': 'linear',
+        'symbol': _bybit_linear_symbol(symbol),
+        'stopLoss': str(float(stop_loss or 0.0)),
+        'tpslMode': 'Full',
+    }
+    if float(take_profit or 0.0) > 0:
+        payload['takeProfit'] = str(float(take_profit))
+    return _bybit_v5_request('POST', '/v5/position/trading-stop', payload)
+
+
+def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: dict | None = None) -> dict:
+    result = {'checked': False, 'sl_fixed': False, 'tp_fixed': False, 'tp1_order_fixed': False, 'be_applied': False, 'symbol': '', 'side': ''}
+    try:
+        if str(AUTOTRADE_MODE).lower() != 'live':
+            return result
+        if not trade_row:
+            return result
+        sym = _bybit_linear_symbol(str(trade_row.get('symbol') or ''))
+        side = str(trade_row.get('side') or '').upper().strip()
+        result['symbol'] = sym
+        result['side'] = side
+        if side not in {'BUY', 'SELL'} or not sym:
+            return result
+        pos = live_pos or _autotrade_find_live_position(sym, side=side)
+        if not pos:
+            return result
+        result['checked'] = True
+        plan = _autotrade_live_exit_plan_for_trade(trade_row)
+        partial_tp = float(plan.get('partial_tp') or 0.0)
+        final_tp = float(plan.get('final_tp') or 0.0)
+        entry = float(_pos_entry(pos) or trade_row.get('entry') or 0.0)
+        current_sl = float(_pos_stop(pos) or 0.0)
+        current_tp = float(_pos_take_profit(pos) or 0.0)
+        target_sl = float(trade_row.get('sl') or 0.0)
+        if target_sl > 0 and final_tp > 0 and (current_sl <= 0 or not _price_close_enough(current_sl, target_sl) or current_tp <= 0 or not _price_close_enough(current_tp, final_tp)):
+            _autotrade_apply_position_tp_sl(sym, target_sl, final_tp)
+            result['sl_fixed'] = (current_sl <= 0 or not _price_close_enough(current_sl, target_sl))
+            result['tp_fixed'] = (current_tp <= 0 or not _price_close_enough(current_tp, final_tp))
+        initial_qty = abs(float(trade_row.get('qty') or 0.0))
+        live_qty = abs(float(_pos_size(pos) or 0.0))
+        close_side = 'Sell' if side == 'BUY' else 'Buy'
+        if partial_tp > 0 and initial_qty > 0 and live_qty > max(initial_qty * (1.0 - float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION)) + 1e-9, initial_qty * 0.45):
+            if not _bybit_has_matching_reduce_only_limit_tp(sym, close_side, partial_tp):
+                filt = _bybit_get_instr_filters(sym)
+                qty_step = filt.get('qtyStep')
+                tp1_qty = max(0.0, min(live_qty, initial_qty * float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION)))
+                tp1_qty, qreason = _round_qty_down(sym, tp1_qty, entry)
+                if tp1_qty and tp1_qty > 0:
+                    payload = {
+                        'category': 'linear',
+                        'symbol': sym,
+                        'side': close_side,
+                        'orderType': 'Limit',
+                        'qty': _fmt_qty(tp1_qty, qty_step),
+                        'price': str(partial_tp),
+                        'timeInForce': 'GTC',
+                        'reduceOnly': True,
+                    }
+                    res = _bybit_v5_request('POST', '/v5/order/create', payload)
+                    if int((res or {}).get('retCode', -1)) == 0:
+                        result['tp1_order_fixed'] = True
+        conf = int(float(trade_row.get('conf') or 0) or 0)
+        atr_pct = float(trade_row.get('atr_pct') or 0.0)
+        sess = str(trade_row.get('session') or '').upper().strip()
+        if AUTOTRADE_BE_AFTER_TP1_ENABLED and entry > 0 and final_tp > 0 and initial_qty > 0 and live_qty > 0:
+            # Production-safe TP1 -> risk-free handling:
+            # - TP1 is executed as a separate reduce-only limit order for a partial close.
+            # - After that partial fill is visible via reduced live position size, the remaining
+            #   position stop is moved to entry (breakeven) only when the configured filters allow it.
+            # - This is an active live-management rule, not just a learning note.
+            tp1_hit = live_qty <= max(initial_qty * 0.45, initial_qty * (1.0 - float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION) + 0.08))
+            sl_at_be = _price_close_enough(current_sl, entry)
+            be_allowed = conf >= int(AUTOTRADE_BE_AFTER_TP1_MIN_CONF) and (atr_pct <= float(AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT) if atr_pct > 0 else True) and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS or sess in AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS)
+            if tp1_hit and (not sl_at_be) and be_allowed:
+                _autotrade_apply_position_tp_sl(sym, entry, final_tp)
+                result['be_applied'] = True
+        return result
+    except Exception:
+        return result
+
+def _ts_seconds_from_any(value) -> float:
+    try:
+        if value in (None, "", 0, "0"):
+            return 0.0
+        v = float(value)
+        if v <= 0:
+            return 0.0
+        return (v / 1000.0) if v > 10_000_000_000 else v
+    except Exception:
+        return 0.0
+
+
+def _bybit_order_reduce_only(order: dict) -> bool:
+    try:
+        for key in ('reduceOnly', 'reduce_only', 'closeOnTrigger', 'close_on_trigger'):
+            val = order.get(key)
+            if isinstance(val, bool) and val:
+                return True
+            sval = str(val or '').strip().lower()
+            if sval in {'true', '1', 'yes', 'y'}:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _bybit_order_filled_time_ts(order: dict) -> float:
+    try:
+        for key in ('updatedTime', 'updated_time', 'createdTime', 'created_time', 'orderTime', 'execTime', 'transactTime'):
+            ts = _ts_seconds_from_any(order.get(key))
+            if ts > 0:
+                return ts
+    except Exception:
+        pass
+    return 0.0
+
+
+def _bybit_order_avg_price(order: dict) -> float:
+    try:
+        for key in ('avgPrice', 'avg_price', 'price', 'triggerPrice', 'trigger_price'):
+            v = float(order.get(key) or 0.0)
+            if v > 0:
+                return v
+    except Exception:
+        pass
+    return 0.0
+
+
+def _bybit_order_filled_qty(order: dict) -> float:
+    try:
+        for key in ('cumExecQty', 'cum_exec_qty', 'cumFilledQty', 'filledQty', 'qty'):
+            v = float(order.get(key) or 0.0)
+            if v > 0:
+                return abs(v)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _bybit_get_recent_filled_orders_linear(symbol: str, lookback_hours: int = 168, limit: int = 200) -> list[dict]:
+    """Recent filled order history for one linear symbol.
+
+    We use this for live-position attribution only. The result is cached briefly because
+    /status and /autotrade_debug may be called back-to-back.
+    """
+    sym = _bybit_linear_symbol(symbol)
+    cache_key = f"bybit_order_history:{sym}:{int(lookback_hours)}:{int(limit)}"
+    try:
+        if cache_valid(cache_key, 30):
+            return list(cache_get(cache_key) or [])
+    except Exception:
+        pass
+
+    end_ms = int(time.time() * 1000)
+    start_ms = int((time.time() - max(1, int(lookback_hours)) * 3600.0) * 1000)
+    payload = {
+        'category': 'linear',
+        'symbol': sym,
+        'startTime': start_ms,
+        'endTime': end_ms,
+        'limit': int(max(20, min(int(limit), 200))),
+    }
+    out = []
+    try:
+        res = _bybit_v5_request('GET', '/v5/order/history', payload)
+        if int((res or {}).get('retCode', -1)) == 0:
+            out = (((res or {}).get('result') or {}).get('list') or [])
+    except Exception:
+        out = []
+
+    try:
+        cache_set(cache_key, list(out or []))
+    except Exception:
+        pass
+    return list(out or [])
+
+
+def _autotrade_resolve_live_position_open_info(uid: int, p: dict, journal_open: Optional[list[dict]] = None) -> dict:
+    """Resolve the authoritative open timestamp for one live Bybit position.
+
+    Evidence priority:
+    1) Bybit filled order history for the same symbol/side and same-position characteristics.
+    2) Matching autotrade journal OPEN row (only if it matches the live position, not merely symbol+side).
+    3) Bybit live position createdTime.
+
+    This prevents stale internal rows from overriding clear exchange evidence.
+    """
+    sym = _pos_symbol(p)
+    side = _pos_side_text(p)
+    entry = float(_pos_entry(p) or 0.0)
+    size = abs(float(_pos_size(p) or 0.0))
+    position_created_ts = _ts_seconds_from_any(p.get('createdTime') or p.get('created_time'))
+    position_updated_ts = _ts_seconds_from_any(p.get('updatedTime') or p.get('updated_time'))
+
+    info = {
+        'symbol': sym,
+        'side': side,
+        'opened_ts': 0.0,
+        'source': 'unknown',
+        'position_created_ts': float(position_created_ts or 0.0),
+        'position_updated_ts': float(position_updated_ts or 0.0),
+        'journal_ts': 0.0,
+        'journal_trade_id': '',
+        'exchange_order_ts': 0.0,
+        'exchange_order_id': '',
+        'exchange_order_price': 0.0,
+        'exchange_order_qty': 0.0,
+        'notes': '',
+    }
+
+    def _entry_rel_diff(a: float, b: float) -> float:
+        try:
+            a = float(a or 0.0)
+            b = float(b or 0.0)
+            if a <= 0 or b <= 0:
+                return 999.0
+            return abs(a - b) / max(abs(a), abs(b), 1e-9)
+        except Exception:
+            return 999.0
+
+    def _qty_rel_diff(a: float, b: float) -> float:
+        try:
+            a = abs(float(a or 0.0))
+            b = abs(float(b or 0.0))
+            if a <= 0 or b <= 0:
+                return 999.0
+            return abs(a - b) / max(a, b, 1e-9)
+        except Exception:
+            return 999.0
+
+    journal_matches = []
+    for t in (journal_open or []):
+        try:
+            if str(t.get('symbol') or '').upper() != str(sym).upper():
+                continue
+            if str(t.get('side') or '').upper() != str(side).upper():
+                continue
+            j_entry = float(t.get('entry') or 0.0)
+            j_qty = abs(float(t.get('qty') or 0.0))
+            entry_rel = _entry_rel_diff(j_entry, entry)
+            qty_rel = _qty_rel_diff(j_qty, size)
+            if entry_rel <= 0.0075 or qty_rel <= 0.35:
+                journal_matches.append((entry_rel, qty_rel, -float(t.get('opened_ts') or 0.0), t))
+        except Exception:
+            continue
+    if journal_matches:
+        best_journal = sorted(journal_matches, key=lambda x: (x[0], x[1], x[2]))[0][3]
+        try:
+            info['journal_ts'] = float(best_journal.get('opened_ts') or 0.0)
+            info['journal_trade_id'] = str(best_journal.get('trade_id') or '')
+        except Exception:
+            pass
+
+    order_candidates = []
+    try:
+        for o in _bybit_get_recent_filled_orders_linear(sym, lookback_hours=168, limit=200):
+            try:
+                if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
+                    continue
+                o_side = str(o.get('side') or '').upper().strip()
+                if o_side != side:
+                    continue
+                if _bybit_order_reduce_only(o):
+                    continue
+                o_status = str(o.get('orderStatus') or '').upper().strip()
+                o_qty = _bybit_order_filled_qty(o)
+                if o_status not in {'FILLED', 'PARTIALLYFILLED', 'PARTIALLY_FILLED', ''} and o_qty <= 0:
+                    continue
+                ts = _bybit_order_filled_time_ts(o)
+                if ts <= 0:
+                    continue
+                o_price = _bybit_order_avg_price(o)
+                entry_rel = _entry_rel_diff(o_price, entry)
+                qty_rel = _qty_rel_diff(o_qty, size)
+                if entry_rel <= 0.0075 or qty_rel <= 0.35:
+                    order_candidates.append((entry_rel, qty_rel, ts, o))
+            except Exception:
+                continue
+    except Exception:
+        order_candidates = []
+
+    if order_candidates:
+        best_entry_rel = min(x[0] for x in order_candidates)
+        shortlist = [x for x in order_candidates if x[0] <= max(best_entry_rel + 0.0015, 0.0080)]
+        best_order = sorted(shortlist, key=lambda x: (x[2], x[0], x[1]))[0][3]
+        info['exchange_order_ts'] = _bybit_order_filled_time_ts(best_order)
+        info['exchange_order_id'] = str(best_order.get('orderId') or best_order.get('orderLinkId') or '')
+        info['exchange_order_price'] = float(_bybit_order_avg_price(best_order) or 0.0)
+        info['exchange_order_qty'] = float(_bybit_order_filled_qty(best_order) or 0.0)
+
+    exchange_ts = float(info.get('exchange_order_ts') or 0.0)
+    journal_ts = float(info.get('journal_ts') or 0.0)
+    created_ts = float(info.get('position_created_ts') or 0.0)
+
+    if exchange_ts > 0:
+        info['opened_ts'] = exchange_ts
+        info['source'] = 'bybit_order_history'
+        if journal_ts > 0 and abs(exchange_ts - journal_ts) > 3600.0:
+            info['notes'] = 'journal_mismatch_ignored'
+    elif journal_ts > 0:
+        info['opened_ts'] = journal_ts
+        info['source'] = 'autotrade_journal'
+    elif created_ts > 0:
+        info['opened_ts'] = created_ts
+        info['source'] = 'bybit_position_created'
+    else:
+        info['opened_ts'] = 0.0
+        info['source'] = 'unknown'
+
+    return info
+
+
+def _autotrade_realized_pnl_today(uid: int, now_utc: Optional[datetime] = None) -> float:
+    """Realized PnL for autotrade journal rows closed inside the active trading-day window."""
+    try:
+        user = _autotrade_user_settings(int(uid))
+        start_utc, end_utc = _admin_today_window_utc(now_utc, uid=int(uid), user=user)
+        start_ts = int(start_utc.timestamp())
+        end_ts = int(end_utc.timestamp())
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COALESCE(SUM(pnl_usdt), 0) FROM autotrade_trades WHERE uid=? AND closed_ts IS NOT NULL AND closed_ts>=? AND closed_ts<?",
+                (int(uid), start_ts, end_ts),
+            )
+            row = cur.fetchone()
+            return float((row[0] if row else 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+
+
+def _bybit_closed_pnl_event_ts(row: dict) -> float:
+    try:
+        for key in ('updatedTime', 'updated_time', 'createdTime', 'created_time', 'execTime', 'fillTime'):
+            ts = _ts_seconds_from_any((row or {}).get(key))
+            if ts > 0:
+                return ts
+    except Exception:
+        pass
+    return 0.0
+
+
+def _bybit_closed_pnl_event_qty(row: dict) -> float:
+    try:
+        for key in ('closedSize', 'closed_size', 'qty', 'size', 'closedQty', 'execQty'):
+            v = float((row or {}).get(key) or 0.0)
+            if v > 0:
+                return abs(v)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _opposite_side_text(side: str) -> str:
+    s = str(side or '').upper().strip()
+    if s == 'BUY':
+        return 'SELL'
+    if s == 'SELL':
+        return 'BUY'
+    return s
+
+
+def _bybit_closed_pnl_event_side_candidates(row: dict) -> set[str]:
+    """Return possible open-side labels that may correspond to a closed-pnl row.
+
+    Bybit payloads are inconsistent across endpoints / environments: some rows expose the
+    original position side, while others can look like the closing execution side. We accept
+    both the raw side and its opposite when reconciling journal rows so close-sync and
+    performance reporting remain robust.
+    """
+    raw = str((row or {}).get('side') or '').upper().strip()
+    out = set()
+    if raw:
+        out.add(raw)
+        opp = _opposite_side_text(raw)
+        if opp:
+            out.add(opp)
+    return out or {'BUY', 'SELL'}
+
+
+def _bybit_get_closed_pnl_linear(start_ts: float, end_ts: float, symbol: str | None = None, limit: int = 200) -> list[dict]:
+    """Fetch Bybit closed-PnL rows for the requested window.
+
+    Best-effort pagination is used because the exchange may return a cursor.
+    """
+    if str(AUTOTRADE_MODE).lower() != 'live' or not BYBIT_API_KEY or not BYBIT_API_SECRET:
+        return []
+    start_ms = int(max(0.0, float(start_ts or 0.0)) * 1000)
+    end_ms = int(max(float(end_ts or 0.0), float(start_ts or 0.0)) * 1000)
+    sym = _bybit_linear_symbol(symbol) if symbol else None
+    out = []
+    cursor = None
+    seen = set()
+    for _ in range(8):
+        payload = {
+            'category': 'linear',
+            'startTime': start_ms,
+            'endTime': end_ms,
+            'limit': int(max(20, min(int(limit or 200), 200))),
+        }
+        if sym:
+            payload['symbol'] = sym
+        if cursor:
+            payload['cursor'] = cursor
+        try:
+            res = _bybit_v5_request('GET', '/v5/position/closed-pnl', payload)
+            if int((res or {}).get('retCode', -1)) != 0:
+                break
+            result = (res or {}).get('result') or {}
+            rows = result.get('list') or []
+            if not rows:
+                break
+            added = 0
+            for r in rows:
+                try:
+                    key = (
+                        _bybit_linear_symbol(str((r or {}).get('symbol') or '')),
+                        str((r or {}).get('side') or '').upper().strip(),
+                        int(_bybit_closed_pnl_event_ts(r) or 0),
+                        str((r or {}).get('orderId') or (r or {}).get('execId') or ''),
+                        float((r or {}).get('closedPnl') or 0.0),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(r)
+                    added += 1
+                except Exception:
+                    continue
+            cursor = str(result.get('nextPageCursor') or result.get('nextPageToken') or '').strip()
+            if not cursor or added <= 0:
+                break
+        except Exception:
+            break
+    return list(out)
+
+
+def _bybit_closed_pnl_summary(start_ts: float, end_ts: float, symbol: str | None = None) -> dict:
+    """Summarize Bybit closed-PnL rows inside a UTC window.
+
+    Returns exchange-truth totals for the anchored trading day so /status and
+    /autotrade_debug can reflect live realized results even before journal
+    reconciliation finishes.
+    """
+    rows = _bybit_get_closed_pnl_linear(start_ts, end_ts, symbol=symbol, limit=200) or []
+    net_pnl = 0.0
+    realized_loss = 0.0
+    count = 0
+    normalized_rows = []
+    for r in rows:
+        try:
+            ts = float(_bybit_closed_pnl_event_ts(r) or 0.0)
+            if ts <= 0 or ts < float(start_ts) or ts >= float(end_ts):
+                continue
+            pnl = float((r or {}).get('closedPnl') or (r or {}).get('closed_pnl') or 0.0)
+            net_pnl += pnl
+            if pnl < 0:
+                realized_loss += abs(pnl)
+            count += 1
+            normalized_rows.append(r)
+        except Exception:
+            continue
+    return {
+        'rows': normalized_rows,
+        'count': int(count),
+        'net_pnl': float(net_pnl),
+        'realized_loss': float(realized_loss),
+    }
+
+
+def _autotrade_db_close_trade(trade_id: str, closed_ts: float, pnl_usdt: float, outcome: str, note_append: str = '') -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            row = cur.execute("SELECT note, symbol, side FROM autotrade_trades WHERE trade_id=?", (str(trade_id),)).fetchone()
+            old_note = str((row[0] if row else '') or '')
+            old_symbol = str((row[1] if row else '') or '')
+            old_side = str((row[2] if row else '') or '')
+            note_parts = [old_note.strip()] if old_note and old_note.strip() else []
+            extra = str(note_append or '').strip()
+            if extra and extra not in note_parts:
+                note_parts.append(extra)
+            merged_note = ' | '.join([x for x in note_parts if x])
+            cur.execute(
+                """UPDATE autotrade_trades
+                   SET status='CLOSED', closed_ts=?, pnl_usdt=?, outcome=?, note=?
+                   WHERE trade_id=?""",
+                (int(float(closed_ts or 0.0)), float(pnl_usdt or 0.0), str(outcome or '').upper().strip(), merged_note, str(trade_id)),
+            )
+            conn.commit()
+            try:
+                life = cur.execute("SELECT setup_id FROM admin_setup_lifecycle WHERE trade_id=? LIMIT 1", (str(trade_id),)).fetchone()
+                sid = str((life[0] if life else '') or '')
+            except Exception:
+                sid = ''
+        if sid:
+            _admin_setup_lifecycle_merge(
+                int(AUTOTRADE_OWNER_UID or 0), sid,
+                symbol=old_symbol,
+                side=old_side,
+                closed_ts=float(closed_ts or 0.0),
+                state='closed',
+                outcome=str(outcome or '').upper().strip(),
+                pnl_usdt=float(pnl_usdt or 0.0),
+                last_reason=str(note_append or ''),
+            )
+    except Exception:
+        pass
+
+
+def _autotrade_sync_closed_trades_from_exchange(uid: int, now_utc: Optional[datetime] = None, lookback_days: int = 14) -> dict:
+    """Reconcile OPEN journal rows against live Bybit state and closed-PnL history.
+
+    This is the missing link between live exchange closures and the bot's day accounting.
+    Without this sync, /status and /autotrade_debug can only see still-open positions plus
+    whatever was manually written into autotrade_trades.
+    """
+    summary = {'checked': 0, 'closed': 0, 'matched_events': 0}
+    if str(AUTOTRADE_MODE).lower() != 'live':
+        return summary
+    try:
+        open_rows = _autotrade_db_open_trades(int(uid)) or []
+    except Exception:
+        open_rows = []
+    if not open_rows:
+        return summary
+
+    try:
+        live_positions = _bybit_get_open_positions_linear() or []
+    except Exception:
+        live_positions = []
+    live_keys = {
+        (str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper())
+        for p in (live_positions or [])
+    }
+
+    now_ts = float((now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc).timestamp())
+    min_open_ts = min(float(t.get('opened_ts') or now_ts) for t in open_rows) if open_rows else now_ts
+    start_ts = max(0.0, min(min_open_ts, now_ts) - 86400.0 * max(1, int(lookback_days)))
+    closed_rows = _bybit_get_closed_pnl_linear(start_ts, now_ts, limit=200)
+
+    event_pool: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for r in (closed_rows or []):
+        try:
+            sym = str(_bybit_linear_symbol((r or {}).get('symbol') or '')).upper()
+            if not sym:
+                continue
+            ts = float(_bybit_closed_pnl_event_ts(r) or 0.0)
+            if ts <= 0:
+                continue
+            pnl = float((r or {}).get('closedPnl') or 0.0)
+            qty = float(_bybit_closed_pnl_event_qty(r) or 0.0)
+            event = {
+                'ts': ts,
+                'pnl': pnl,
+                'qty': qty,
+                'raw': r,
+                'used': False,
+            }
+            for side in _bybit_closed_pnl_event_side_candidates(r):
+                event_pool[(sym, side)].append(event)
+        except Exception:
+            continue
+    for key in list(event_pool.keys()):
+        event_pool[key].sort(key=lambda x: (float(x.get('ts') or 0.0), float(x.get('qty') or 0.0)))
+
+    rows_by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for t in open_rows:
+        try:
+            key = (str(t.get('symbol') or '').upper(), str(t.get('side') or '').upper())
+            rows_by_key[key].append(t)
+        except Exception:
+            continue
+    for key in list(rows_by_key.keys()):
+        rows_by_key[key].sort(key=lambda x: float(x.get('opened_ts') or 0.0))
+
+    for key, trades in rows_by_key.items():
+        events = event_pool.get(key) or []
+        for idx, trade in enumerate(trades):
+            summary['checked'] += 1
+            sym, side = key
+            if key in live_keys:
+                continue
+            trade_id = str(trade.get('trade_id') or '')
+            opened_ts = float(trade.get('opened_ts') or 0.0)
+            trade_qty = abs(float(trade.get('qty') or 0.0))
+            next_open_ts = None
+            for later in trades[idx + 1:]:
+                later_ts = float(later.get('opened_ts') or 0.0)
+                if later_ts > opened_ts:
+                    next_open_ts = later_ts
+                    break
+
+            candidates = []
+            for ev in events:
+                if ev.get('used'):
+                    continue
+                ev_ts = float(ev.get('ts') or 0.0)
+                if ev_ts <= 0 or ev_ts + 300.0 < opened_ts:
+                    continue
+                if next_open_ts and ev_ts >= next_open_ts:
+                    continue
+                candidates.append(ev)
+            if not candidates:
+                continue
+
+            matched = []
+            matched_qty = 0.0
+            matched_pnl = 0.0
+            for ev in candidates:
+                matched.append(ev)
+                matched_pnl += float(ev.get('pnl') or 0.0)
+                matched_qty += abs(float(ev.get('qty') or 0.0))
+                if trade_qty > 0 and matched_qty > 0 and matched_qty >= trade_qty * 0.80:
+                    break
+                if trade_qty <= 0:
+                    break
+            if not matched:
+                continue
+
+            close_ts = max(float(ev.get('ts') or 0.0) for ev in matched)
+            for ev in matched:
+                ev['used'] = True
+            outcome = 'BREAKEVEN'
+            if matched_pnl > 0:
+                outcome = 'WIN'
+            elif matched_pnl < 0:
+                outcome = 'LOSS'
+            note_bits = ['exchange_close_sync']
+            if len(matched) > 1:
+                note_bits.append(f'partial_close_events={len(matched)}')
+            _autotrade_db_close_trade(trade_id, close_ts, matched_pnl, outcome, ' | '.join(note_bits))
+            summary['closed'] += 1
+            summary['matched_events'] += len(matched)
+    return summary
+
+
+def _autotrade_trade_day_label(ts: float, user: dict) -> str:
+    try:
+        dt_local = datetime.fromtimestamp(float(ts), _user_tzinfo(user))
+        start_local, _ = _anchored_day_window(dt_local, _user_day_reset_hhmm(user))
+        return start_local.strftime('%Y-%m-%d')
+    except Exception:
+        return ''
+
+
+
+
+def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[dict]:
+    """Conservative admin-history fallback for older deployments.
+
+    Uses historical setup identity + exchange closed-PnL events when older journal rows are
+    missing. This is only used to avoid a useless all-zero performance report after upgrades.
+    It never overrides journal-confirmed bot trades.
+    """
+    if str(AUTOTRADE_MODE).lower() != 'live':
+        return []
+    days = int(max(2, min(int(days or 7), 3650)))
+    user = _autotrade_user_settings(int(uid))
+    tz = _user_tzinfo(user)
+    start_local, end_local = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(user))
+    start_local = start_local - timedelta(days=days - 1)
+    start_ts = float(start_local.astimezone(timezone.utc).timestamp())
+    end_ts = float(end_local.astimezone(timezone.utc).timestamp())
+
+    try:
+        journal_trades = db_list_autotrade_trades_all(int(uid)) or []
+    except Exception:
+        journal_trades = []
+
+    closed_rows = _bybit_get_closed_pnl_linear(max(0.0, start_ts - 86400.0 * 5.0), end_ts, limit=300) or []
+    if not closed_rows:
+        return []
+
+    journal_event_keys = set()
+    for t in journal_trades:
+        try:
+            if float(t.get('closed_ts') or 0.0) <= 0:
+                continue
+            sym = str(t.get('symbol') or '').upper()
+            side = str(t.get('side') or '').upper()
+            cts = float(t.get('closed_ts') or 0.0)
+            pnl = round(float(t.get('pnl') or 0.0), 8)
+            journal_event_keys.add((sym, side, int(cts // 60), pnl))
+            journal_event_keys.add((sym, _opposite_side_text(side), int(cts // 60), pnl))
+        except Exception:
+            continue
+
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            rows = cur.execute(
+                """
+                WITH candidates AS (
+                    SELECT e.setup_id AS setup_id,
+                           e.user_id AS user_id,
+                           e.emailed_ts AS emailed_ts,
+                           0.0 AS generated_ts,
+                           'emailed_setups' AS source_kind
+                    FROM emailed_setups e
+                    WHERE e.user_id = ?
+                      AND e.emailed_ts >= ?
+                    UNION ALL
+                    SELECT g.setup_id AS setup_id,
+                           g.user_id AS user_id,
+                           0.0 AS emailed_ts,
+                           MAX(g.created_ts) AS generated_ts,
+                           'generated_setups' AS source_kind
+                    FROM generated_setups g
+                    WHERE g.user_id = ?
+                      AND g.created_ts >= ?
+                      AND COALESCE(NULLIF(g.setup_id,''),'') <> ''
+                    GROUP BY g.user_id, g.setup_id
+                )
+                SELECT c.setup_id,
+                       MAX(c.emailed_ts) AS emailed_ts,
+                       MAX(c.generated_ts) AS generated_ts,
+                       MIN(c.source_kind) AS source_kind,
+                       COALESCE(MAX(l.executed_ts), 0) AS executed_ts,
+                       COALESCE(MAX(l.closed_ts), 0) AS lifecycle_closed_ts,
+                       COALESCE(MAX(NULLIF(l.trade_id,'')), '') AS trade_id,
+                       COALESCE(MAX(NULLIF(l.symbol,'')), MAX(NULLIF(s.symbol,'')), MAX(NULLIF(g.symbol,'')), '') AS symbol,
+                       COALESCE(MAX(NULLIF(l.side,'')), MAX(NULLIF(s.side,'')), MAX(NULLIF(g.side,'')), '') AS side,
+                       COALESCE(MAX(NULLIF(l.state,'')), '') AS state,
+                       COALESCE(MAX(s.created_ts), 0) AS signal_created_ts
+                FROM candidates c
+                LEFT JOIN admin_setup_lifecycle l ON l.setup_id = c.setup_id
+                LEFT JOIN signals s ON s.setup_id = c.setup_id
+                LEFT JOIN generated_setups g ON g.setup_id = c.setup_id AND g.user_id = c.user_id
+                GROUP BY c.setup_id
+                ORDER BY MAX(c.emailed_ts) ASC, MAX(c.generated_ts) ASC, COALESCE(MAX(s.created_ts),0) ASC, c.setup_id ASC
+                """,
+                (int(uid), float(start_ts - 86400.0 * 3.0), int(uid), float(start_ts - 86400.0 * 3.0)),
+            ).fetchall() or []
+            setup_rows = [dict(r) for r in rows]
+    except Exception:
+        setup_rows = []
+
+    if not setup_rows:
+        return []
+
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for r in setup_rows:
+        sym = str(r.get('symbol') or '').upper()
+        if not sym:
+            continue
+        base_ts = float(r.get('executed_ts') or 0.0) or float(r.get('emailed_ts') or 0.0) or float(r.get('generated_ts') or 0.0) or float(r.get('signal_created_ts') or 0.0)
+        if base_ts <= 0:
+            continue
+        r['_base_ts'] = base_ts
+        grouped[sym].append(r)
+    for key in list(grouped.keys()):
+        grouped[key].sort(key=lambda x: (float(x.get('_base_ts') or 0.0), str(x.get('setup_id') or '')))
+
+    event_pool: dict[str, list[dict]] = defaultdict(list)
+    for r in closed_rows:
+        try:
+            sym = str(_bybit_linear_symbol((r or {}).get('symbol') or '')).upper()
+            ts = float(_bybit_closed_pnl_event_ts(r) or 0.0)
+            pnl = round(float((r or {}).get('closedPnl') or 0.0), 8)
+            if not sym or ts <= 0:
+                continue
+            qty = float(_bybit_closed_pnl_event_qty(r) or 0.0)
+            sides = sorted(_bybit_closed_pnl_event_side_candidates(r))
+            if any((sym, side, int(ts // 60), pnl) in journal_event_keys for side in sides):
+                continue
+            ev = {
+                'ts': ts,
+                'pnl': pnl,
+                'qty': qty,
+                'raw': r,
+                'used': False,
+                'sides': set(sides),
+            }
+            event_pool[sym].append(ev)
+        except Exception:
+            continue
+    for key in list(event_pool.keys()):
+        event_pool[key].sort(key=lambda x: (float(x.get('ts') or 0.0), abs(float(x.get('qty') or 0.0))))
+
+    provisional = []
+    for sym, setups in grouped.items():
+        events = event_pool.get(sym) or []
+        if not events:
+            continue
+        for i, srow in enumerate(setups):
+            try:
+                if str(srow.get('trade_id') or '').strip():
+                    continue
+                if float(srow.get('lifecycle_closed_ts') or 0.0) > 0:
+                    continue
+                base_ts = float(srow.get('_base_ts') or 0.0)
+                if base_ts <= 0:
+                    continue
+                next_ts = None
+                for later in setups[i+1:]:
+                    later_ts = float(later.get('_base_ts') or 0.0)
+                    if later_ts > base_ts:
+                        next_ts = later_ts
+                        break
+                setup_side = str(srow.get('side') or '').upper().strip()
+                best = None
+                fallback = None
+                for ev in events:
+                    if ev.get('used'):
+                        continue
+                    ev_ts = float(ev.get('ts') or 0.0)
+                    if ev_ts + 300.0 < base_ts:
+                        continue
+                    if next_ts and ev_ts >= next_ts:
+                        continue
+                    if fallback is None:
+                        fallback = ev
+                    if not setup_side or setup_side in (ev.get('sides') or set()):
+                        best = ev
+                        break
+                best = best or fallback
+                if not best:
+                    continue
+                best['used'] = True
+                pnl = float(best.get('pnl') or 0.0)
+                provisional.append({
+                    'setup_id': str(srow.get('setup_id') or ''),
+                    'symbol': sym,
+                    'side': setup_side,
+                    'opened_ts': base_ts,
+                    'closed_ts': float(best.get('ts') or 0.0),
+                    'pnl': pnl,
+                    'outcome': 'WIN' if pnl > 0 else ('LOSS' if pnl < 0 else 'BREAKEVEN'),
+                    'provisional': True,
+                    'note': 'provisional_exchange_match_from_setup_history',
+                })
+            except Exception:
+                continue
+    return provisional
+
+
+def _autotrade_exchange_close_fallback_rows(uid: int, days: int = 7) -> list[dict]:
+    """Last-resort exchange-close fallback for performance reporting.
+
+    Used only when the bot journal has no usable closed trades for the requested window.
+    It aggregates raw Bybit closed-PnL events inside the anchored trading-day window and
+    excludes any events already represented by journal-confirmed or provisional matches.
+    """
+    if str(AUTOTRADE_MODE).lower() != 'live':
+        return []
+    days = int(max(2, min(int(days or 7), 3650)))
+    user = _autotrade_user_settings(int(uid))
+    tz = _user_tzinfo(user)
+    start_local, end_local = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(user))
+    start_local = start_local - timedelta(days=days - 1)
+    start_ts = float(start_local.astimezone(timezone.utc).timestamp())
+    end_ts = float(end_local.astimezone(timezone.utc).timestamp())
+
+    excluded = set()
+    try:
+        for t in (db_list_autotrade_trades_all(int(uid)) or []):
+            try:
+                cts = float(t.get('closed_ts') or 0.0)
+                if cts < start_ts or cts >= end_ts:
+                    continue
+                sym = str(t.get('symbol') or '').upper()
+                side = str(t.get('side') or '').upper()
+                pnl = round(float(t.get('pnl') or 0.0), 8)
+                excluded.add((sym, side, int(cts), pnl))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        for t in (_autotrade_reconstruct_provisional_closes(int(uid), days=days) or []):
+            try:
+                cts = float(t.get('closed_ts') or 0.0)
+                sym = str(t.get('symbol') or '').upper()
+                side = str(t.get('side') or '').upper()
+                pnl = round(float(t.get('pnl') or 0.0), 8)
+                excluded.add((sym, side, int(cts), pnl))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    fallback = []
+    for ev in (_bybit_get_closed_pnl_linear(start_ts, end_ts, limit=max(200, days * 80)) or []):
+        try:
+            sym = str(_bybit_linear_symbol((ev or {}).get('symbol') or '')).upper()
+            ts = float(_bybit_closed_pnl_event_ts(ev) or 0.0)
+            pnl = round(float((ev or {}).get('closedPnl') or 0.0), 8)
+            if not sym or ts <= 0:
+                continue
+            sides = _bybit_closed_pnl_event_side_candidates(ev) or {''}
+            if any((sym, str(side or '').upper(), int(ts), pnl) in excluded for side in sides):
+                continue
+            matched_side = ''
+            for side in sides:
+                key = (sym, str(side or '').upper(), int(ts), pnl)
+                if key in excluded:
+                    matched_side = str(side or '').upper()
+                    break
+            if not matched_side:
+                matched_side = str(sorted(sides)[0] if sides else '').upper()
+            fallback.append({
+                'symbol': sym,
+                'side': matched_side,
+                'opened_ts': 0.0,
+                'closed_ts': ts,
+                'pnl': float(pnl),
+                'outcome': 'WIN' if pnl > 0 else ('LOSS' if pnl < 0 else 'BREAKEVEN'),
+                'exchange_only': True,
+                'note': 'exchange_only_fallback_close',
+            })
+        except Exception:
+            continue
+    return fallback
+
+
+def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
+    """Journal-first bot lifecycle performance rows.
+
+    Primary source stays the bot journal. If older deployments are missing journal rows,
+    a conservative *emailed-setup-linked* provisional fallback is added first, followed by
+    a raw exchange-close fallback. Unlike older versions, fallback reconciliation is applied
+    even when journal history is only partial.
+    """
+    days = int(max(2, min(int(days or 7), 3650)))
+    user = _autotrade_user_settings(int(uid))
+    _autotrade_sync_closed_trades_from_exchange(int(uid), lookback_days=max(14, days + 5))
+    try:
+        trades = db_list_autotrade_trades_all(int(uid)) or []
+    except Exception:
+        trades = []
+
+    tz = _user_tzinfo(user)
+    start_local, _ = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(user))
+    day_starts = [start_local - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    by_day: dict[str, dict] = {}
+    for ds in day_starts:
+        by_day[ds.strftime('%Y-%m-%d')] = {
+            'day': ds.strftime('%Y-%m-%d'),
+            'opened': 0,
+            'closed': 0,
+            'wins': 0,
+            'losses': 0,
+            'net_pnl': 0.0,
+            'avg_win': 0.0,
+            'avg_loss': 0.0,
+            'gross_profit': 0.0,
+            'gross_loss': 0.0,
+            'journal_confirmed_closes': 0,
+            'exchange_reconciled_closes': 0,
+            'provisional_emailed_setup_closes': 0,
+            'exchange_only_fallback_closes': 0,
+        }
+
+    def _label(ts: float) -> str:
+        return _autotrade_trade_day_label(ts, user)
+
+    for t in trades:
+        try:
+            ots = float(t.get('opened_ts') or 0.0)
+            if ots > 0:
+                lab = _label(ots)
+                if lab in by_day:
+                    by_day[lab]['opened'] += 1
+            cts = float(t.get('closed_ts') or 0.0)
+            if cts <= 0:
+                continue
+            lab = _label(cts)
+            if lab not in by_day:
+                continue
+            pnl = float(t.get('pnl') or 0.0)
+            row = by_day[lab]
+            row['closed'] += 1
+            row['journal_confirmed_closes'] += 1
+            if 'exchange_close_sync' in str(t.get('note') or ''):
+                row['exchange_reconciled_closes'] += 1
+            row['net_pnl'] += pnl
+            if pnl > 0:
+                row['wins'] += 1
+                row['gross_profit'] += pnl
+            elif pnl < 0:
+                row['losses'] += 1
+                row['gross_loss'] += abs(pnl)
+        except Exception:
+            continue
+
+    for t in _autotrade_reconstruct_provisional_closes(int(uid), days=days):
+        try:
+            lab = _label(float(t.get('closed_ts') or 0.0))
+            if lab not in by_day:
+                continue
+            row = by_day[lab]
+            row['closed'] += 1
+            row['exchange_reconciled_closes'] += 1
+            row['provisional_emailed_setup_closes'] += 1
+            open_lab = _label(float(t.get('opened_ts') or 0.0))
+            if open_lab in by_day:
+                by_day[open_lab]['opened'] += 1
+            pnl = float(t.get('pnl') or 0.0)
+            row['net_pnl'] += pnl
+            if pnl > 0:
+                row['wins'] += 1
+                row['gross_profit'] += pnl
+            elif pnl < 0:
+                row['losses'] += 1
+                row['gross_loss'] += abs(pnl)
+        except Exception:
+            continue
+
+    for t in _autotrade_exchange_close_fallback_rows(int(uid), days=days):
+        try:
+            lab = _label(float(t.get('closed_ts') or 0.0))
+            if lab not in by_day:
+                continue
+            row = by_day[lab]
+            row['closed'] += 1
+            row['exchange_reconciled_closes'] += 1
+            row['exchange_only_fallback_closes'] += 1
+            pnl = float(t.get('pnl') or 0.0)
+            row['net_pnl'] += pnl
+            if pnl > 0:
+                row['wins'] += 1
+                row['gross_profit'] += pnl
+            elif pnl < 0:
+                row['losses'] += 1
+                row['gross_loss'] += abs(pnl)
+        except Exception:
+            continue
+
+    for row in by_day.values():
+        win_n = int(row.get('wins') or 0)
+        loss_n = int(row.get('losses') or 0)
+        gp = float(row.get('gross_profit') or 0.0)
+        gl = float(row.get('gross_loss') or 0.0)
+        row['avg_win'] = (gp / win_n) if win_n > 0 else 0.0
+        row['avg_loss'] = (-(gl / loss_n)) if loss_n > 0 else 0.0
+    return [by_day[ds.strftime('%Y-%m-%d')] for ds in day_starts]
+
+def _autotrade_performance_summary(rows: list[dict]) -> dict:
+    closed = sum(int(r.get('closed') or 0) for r in rows)
+    wins = sum(int(r.get('wins') or 0) for r in rows)
+    losses = sum(int(r.get('losses') or 0) for r in rows)
+    net = sum(float(r.get('net_pnl') or 0.0) for r in rows)
+    gross_profit = sum(float(r.get('gross_profit') or 0.0) for r in rows)
+    gross_loss = sum(float(r.get('gross_loss') or 0.0) for r in rows)
+    best_day = max(rows, key=lambda r: float(r.get('net_pnl') or 0.0)) if rows else None
+    worst_day = min(rows, key=lambda r: float(r.get('net_pnl') or 0.0)) if rows else None
+    win_rate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float('inf') if gross_profit > 0 else 0.0)
+    avg_win = (gross_profit / wins) if wins > 0 else 0.0
+    avg_loss = (-(gross_loss / losses)) if losses > 0 else 0.0
+    expectancy = (net / closed) if closed > 0 else 0.0
+    return {
+        'closed': closed,
+        'wins': wins,
+        'losses': losses,
+        'net': net,
+        'win_rate': win_rate,
+        'profit_factor': profit_factor,
+        'avg_win': avg_win,
+        'avg_loss': avg_loss,
+        'best_day': best_day,
+        'worst_day': worst_day,
+        'expectancy': expectancy,
+    }
+
+def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
+    """Compute authoritative AutoTrade day metrics using the configured trading-day window.
+
+    Live-position day bucketing uses one authoritative open timestamp per current Bybit position.
+    That timestamp is resolved from exchange evidence first, then matching journal state, then
+    position.createdTime as a final fallback.
+    """
+    cap = 0.0
+    open_pnl = 0.0
+    realized_pnl_today = 0.0
+    realized_loss_today = 0.0
+    mode = str(AUTOTRADE_MODE).lower()
+    user = _autotrade_user_settings(uid)
+
+    try:
+        if equity and equity > 0:
+            user = dict(user)
+            user["equity"] = float(equity)
+    except Exception:
+        pass
+
+    try:
+        cap = float(daily_cap_usd(user) or 0.0) if equity and equity > 0 else 0.0
+    except Exception:
+        cap = 0.0
+
+    try:
+        if mode == "live":
+            _autotrade_sync_closed_trades_from_exchange(int(uid), lookback_days=14)
+    except Exception:
+        pass
+
+    start_utc, end_utc = _admin_today_window_utc(uid=int(uid), user=user)
+    try:
+        if mode == "live":
+            closed_summary = _bybit_closed_pnl_summary(float(start_utc.timestamp()), float(end_utc.timestamp()))
+            realized_pnl_today = float(closed_summary.get('net_pnl') or 0.0)
+            realized_loss_today = float(closed_summary.get('realized_loss') or 0.0)
+        else:
+            realized_pnl_today = float(_autotrade_realized_pnl_today(int(uid)) or 0.0)
+            realized_loss_today = max(0.0, -float(realized_pnl_today))
+    except Exception:
+        realized_pnl_today = 0.0
+        realized_loss_today = 0.0
+        closed_summary = {'count': 0}
+
+    start_ts = float(start_utc.timestamp())
+    end_ts = float(end_utc.timestamp())
+
+    current_total_open_risk = 0.0
+    current_day_open_risk = 0.0
+    live_open_risk_charged_today = 0.0
+    carried_open_risk = 0.0
+    open_positions_now = 0
+    inherited_open_positions = 0
+    opened_today_count = 0
+    closed_today_count = 0
+    position_classifications = []
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM autotrade_trades WHERE uid=? AND opened_ts>=? AND opened_ts<?",
+                (int(uid), int(start_ts), int(end_ts)),
+            )
+            row = cur.fetchone()
+            opened_today_count = int((row[0] if row else 0) or 0)
+            cur.execute(
+                "SELECT COUNT(*) FROM autotrade_trades WHERE uid=? AND closed_ts IS NOT NULL AND closed_ts>=? AND closed_ts<?",
+                (int(uid), int(start_ts), int(end_ts)),
+            )
+            row = cur.fetchone()
+            closed_today_count = int((row[0] if row else 0) or 0)
+    except Exception:
+        opened_today_count = 0
+        closed_today_count = 0
+    if mode == "live":
+        try:
+            closed_today_count = int((closed_summary or {}).get('count') or 0)
+        except Exception:
+            closed_today_count = 0
+
+    journal_open = []
+    try:
+        journal_open = _autotrade_db_open_trades(int(uid)) or []
+    except Exception:
+        journal_open = []
+
+    def _opened_ts_from_trade(t: dict) -> float:
+        try:
+            return float(t.get('opened_ts') or 0.0)
+        except Exception:
+            return 0.0
+
+    if mode == "live":
+        try:
+            positions = _bybit_get_open_positions_linear()
+        except Exception:
+            positions = []
+        open_positions_now = len(positions)
+        open_pnl = float(sum(_pos_unreal_pnl(p) for p in positions) or 0.0) if positions else 0.0
+
+        for p in positions:
+            est = float(_estimate_position_risk_usd(p) or 0.0)
+            info = _autotrade_resolve_live_position_open_info(int(uid), p, journal_open=journal_open)
+            opened_ts = float(info.get('opened_ts') or 0.0)
+            psym = _pos_symbol(p)
+            pside = _pos_side_text(p)
+            if est <= 0:
+                try:
+                    matches = [t for t in journal_open
+                               if str(t.get('symbol') or '').upper() == str(psym).upper()
+                               and str(t.get('side') or '').upper() == str(pside).upper()]
+                    if matches:
+                        matched_journal = [t for t in matches if abs(float(t.get('opened_ts') or 0.0) - float(info.get('journal_ts') or 0.0)) <= 1.0]
+                        risk_pool = matched_journal or matches
+                        est = max(
+                            float(_autotrade_estimated_risk_usd(float(t.get('entry') or 0.0), float(t.get('sl') or 0.0), float(t.get('qty') or 0.0)) or 0.0)
+                            for t in risk_pool
+                        )
+                except Exception:
+                    pass
+            est = max(0.0, float(est or 0.0))
+            current_total_open_risk += est
+
+            if opened_ts > 0 and opened_ts < start_ts:
+                bucket = 'carried'
+                carried_open_risk += est
+                inherited_open_positions += 1
+            else:
+                bucket = 'current_day'
+                current_day_open_risk += est
+
+            position_classifications.append({
+                'symbol': psym,
+                'side': pside,
+                'risk': float(est),
+                'opened_ts': float(opened_ts or 0.0),
+                'bucket': bucket,
+                'source': str(info.get('source') or 'unknown'),
+                'journal_ts': float(info.get('journal_ts') or 0.0),
+                'position_created_ts': float(info.get('position_created_ts') or 0.0),
+                'exchange_order_ts': float(info.get('exchange_order_ts') or 0.0),
+                'notes': str(info.get('notes') or ''),
+            })
+        inherited_open_positions = min(int(inherited_open_positions), int(open_positions_now))
+        current_day_open_positions = max(0, int(open_positions_now) - int(inherited_open_positions))
+        # Live day-cap accounting should charge only positions opened inside the current
+        # anchored trading day. Carried exposure is shown separately but must not consume
+        # today's new-trade budget again.
+        live_open_risk_charged_today = float(current_day_open_risk)
+        # Do NOT inflate opened_today_count to all currently open positions.
+        # Keep the day-open count anchored to confirmed current-day opens.
+        opened_today_count = max(int(opened_today_count), int(current_day_open_positions))
+    else:
+        open_positions_now = len(journal_open)
+        for t in journal_open:
+            est = max(0.0, float(_autotrade_estimated_risk_usd(float(t.get('entry') or 0.0), float(t.get('sl') or 0.0), float(t.get('qty') or 0.0)) or 0.0))
+            opened_ts = _opened_ts_from_trade(t)
+            current_total_open_risk += est
+            if opened_ts and opened_ts < start_ts:
+                bucket = 'carried'
+                carried_open_risk += est
+                inherited_open_positions += 1
+            else:
+                bucket = 'current_day'
+                current_day_open_risk += est
+            position_classifications.append({
+                'symbol': str(t.get('symbol') or '').upper(),
+                'side': str(t.get('side') or '').upper(),
+                'risk': float(est),
+                'opened_ts': float(opened_ts or 0.0),
+                'bucket': bucket,
+                'source': 'autotrade_journal',
+                'journal_ts': float(opened_ts or 0.0),
+                'position_created_ts': 0.0,
+                'exchange_order_ts': 0.0,
+                'notes': '',
+            })
+        open_pnl = 0.0
+
+    if float(live_open_risk_charged_today or 0.0) <= 0.0:
+        live_open_risk_charged_today = float(current_day_open_risk)
+    daily_used_total = max(0.0, float(live_open_risk_charged_today) - float(realized_pnl_today))
+    remaining_raw = float("inf") if cap <= 0 else (float(cap) - float(daily_used_total))
+    over_by = abs(float(remaining_raw)) if cap > 0 and remaining_raw < 0 else 0.0
+
+    return {
+        "cap": float(cap),
+        "open_risk": float(current_total_open_risk),
+        "used_risk": float(current_day_open_risk),
+        "used_total": float(daily_used_total),
+        "open_pnl": float(open_pnl),
+        "realized_pnl_today": float(realized_pnl_today),
+        "realized_loss_today": float(realized_loss_today),
+        "remaining": float(remaining_raw),
+        "over_by": float(over_by),
+        "current_total_open_risk": float(current_total_open_risk),
+        "current_day_open_risk": float(current_day_open_risk),
+        "live_open_risk_charged_today": float(live_open_risk_charged_today),
+        "carried_open_risk": float(carried_open_risk),
+        "open_positions_now": int(open_positions_now),
+        "inherited_open_positions": int(inherited_open_positions),
+        "opened_today_count": int(opened_today_count),
+        "closed_today_count": int(closed_today_count),
+        "day_start_ts": float(start_ts),
+        "day_end_ts": float(end_ts),
+        "position_classifications": position_classifications,
+    }
+
+def _autotrade_user_settings(uid: int) -> dict:
+    """Return user dict after daily reset (so caps are current)."""
+    try:
+        return reset_daily_if_needed(get_user(int(uid)) or {})
+    except Exception:
+        return get_user(int(uid)) or {}
+
+def _autotrade_per_trade_risk_usd(uid: int, equity: float) -> float:
+    user = _autotrade_user_settings(uid)
+    mode = str(user.get("risk_mode", DEFAULT_RISK_MODE)).upper()
+    val = float(user.get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
+    # compute_risk_usd uses live equity when available, but we pass user updated equity anyway
+    try:
+        if equity and equity > 0:
+            user = dict(user)
+            user["equity"] = float(equity)
+    except Exception:
+        pass
+    return float(compute_risk_usd(user, mode, val) or 0.0)
+
+def _autotrade_daily_cap_usd(uid: int, equity: float) -> float:
+    user = _autotrade_user_settings(uid)
+    try:
+        if equity and equity > 0:
+            user = dict(user)
+            user["equity"] = float(equity)
+    except Exception:
+        pass
+    return float(daily_cap_usd(user) or 0.0)
+
+def _autotrade_remaining_risk_usd(uid: int, equity: float) -> float:
+    user = _autotrade_user_settings(uid)
+    # keep equity aligned for pct caps
+    try:
+        if equity and equity > 0:
+            user2 = dict(user)
+            user2["equity"] = float(equity)
+        else:
+            user2 = user
+    except Exception:
+        user2 = user
+    cap = float(daily_cap_usd(user2) or 0.0)
+    used = float(_risk_used_total_today(int(uid), user2) or 0.0)
+    if cap <= 0:
+        return float("inf")
+    return max(0.0, cap - used)
+
+def _autotrade_db_init():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS autotrade_trades (
+                trade_id TEXT PRIMARY KEY,
+                uid INTEGER,
+                opened_ts INTEGER,
+                day_utc TEXT NOT NULL DEFAULT \'\',
+                session TEXT,
+                symbol TEXT,
+                side TEXT,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                qty REAL,
+                status TEXT DEFAULT 'OPEN',
+                closed_ts INTEGER,
+                outcome TEXT,
+                pnl REAL
+            )
+        ''')
+        c.execute("CREATE INDEX IF NOT EXISTS idx_autotrade_uid_opened ON autotrade_trades(uid, opened_ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_autotrade_status ON autotrade_trades(status)")
+        conn.commit()
+
+def _autotrade_db_open_trades(uid: int) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM autotrade_trades WHERE uid=? AND status='OPEN' ORDER BY opened_ts DESC", (uid,))
+        return [dict(r) for r in c.fetchall()]
+
+AUTOTRADE_SYMBOL_GUARD_TTL_SEC = int(os.environ.get("AUTOTRADE_SYMBOL_GUARD_TTL_SEC", "1800") or 1800)
+AUTOTRADE_RECENT_SYMBOL_SYNC_SEC = int(os.environ.get("AUTOTRADE_RECENT_SYMBOL_SYNC_SEC", "180") or 180)
+AUTOTRADE_PLACED_GUARD_CLEANUP_SEC = int(os.environ.get("AUTOTRADE_PLACED_GUARD_CLEANUP_SEC", "172800") or 172800)
+
+_AUTOTRADE_RUNTIME_SYMBOL_LOCKS: dict[str, float] = {}
+_AUTOTRADE_RUNTIME_SYMBOL_LOCKS_GUARD = threading.Lock()
+
+def _autotrade_symbol_lock_key(uid: int, symbol: str) -> str:
+    return f"{int(uid)}:{_bybit_linear_symbol(symbol)}"
+
+def _autotrade_runtime_symbol_lock_acquire(uid: int, symbol: str, ttl_sec: int | None = None) -> bool:
+    ttl = int(ttl_sec or AUTOTRADE_SYMBOL_GUARD_TTL_SEC)
+    key = _autotrade_symbol_lock_key(uid, symbol)
+    now = float(time.time())
+    with _AUTOTRADE_RUNTIME_SYMBOL_LOCKS_GUARD:
+        ts = float(_AUTOTRADE_RUNTIME_SYMBOL_LOCKS.get(key) or 0.0)
+        if ts and (now - ts) <= ttl:
+            return False
+        _AUTOTRADE_RUNTIME_SYMBOL_LOCKS[key] = now
+        stale_before = now - max(float(ttl), 60.0)
+        for k, v in list(_AUTOTRADE_RUNTIME_SYMBOL_LOCKS.items()):
+            try:
+                if float(v or 0.0) < stale_before:
+                    _AUTOTRADE_RUNTIME_SYMBOL_LOCKS.pop(k, None)
+            except Exception:
+                _AUTOTRADE_RUNTIME_SYMBOL_LOCKS.pop(k, None)
+    return True
+
+def _autotrade_runtime_symbol_lock_release(uid: int, symbol: str) -> None:
+    key = _autotrade_symbol_lock_key(uid, symbol)
+    with _AUTOTRADE_RUNTIME_SYMBOL_LOCKS_GUARD:
+        _AUTOTRADE_RUNTIME_SYMBOL_LOCKS.pop(key, None)
+
+def _autotrade_runtime_symbol_lock_active(uid: int, symbol: str, ttl_sec: int | None = None) -> bool:
+    ttl = int(ttl_sec or AUTOTRADE_SYMBOL_GUARD_TTL_SEC)
+    key = _autotrade_symbol_lock_key(uid, symbol)
+    now = float(time.time())
+    with _AUTOTRADE_RUNTIME_SYMBOL_LOCKS_GUARD:
+        ts = float(_AUTOTRADE_RUNTIME_SYMBOL_LOCKS.get(key) or 0.0)
+        if not ts:
+            return False
+        if (now - ts) > ttl:
+            _AUTOTRADE_RUNTIME_SYMBOL_LOCKS.pop(key, None)
+            return False
+        return True
+
+def _autotrade_exec_cleanup(stale_pending_sec: int = 1800, stale_failed_sec: int = 86400, stale_placed_sec: int = AUTOTRADE_PLACED_GUARD_CLEANUP_SEC) -> None:
+    try:
+        now = float(time.time())
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM autotrade_exec_guard WHERE status='PENDING' AND updated_ts<?", (now - float(stale_pending_sec),))
+            c.execute("DELETE FROM autotrade_exec_guard WHERE status='FAILED' AND updated_ts<?", (now - float(stale_failed_sec),))
+            c.execute("DELETE FROM autotrade_exec_guard WHERE status='PLACED' AND updated_ts<?", (now - float(stale_placed_sec),))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _autotrade_exec_reserve(uid: int, setup_id: str, symbol: str, side: str, setup_ttl_sec: int = 86400, symbol_ttl_sec: int = AUTOTRADE_SYMBOL_GUARD_TTL_SEC, symdir_ttl_sec: int = AUTOTRADE_SYMBOL_GUARD_TTL_SEC) -> tuple[bool, list[str], str]:
+    """Atomically reserve execution keys to prevent duplicate orders."""
+    now = float(time.time())
+    sid = str(setup_id or '').strip()
+    sym = _bybit_linear_symbol(symbol)
+    sd = str(side or '').upper().strip()
+    if not sym or sd not in {'BUY','SELL'}:
+        return (False, [], 'bad_guard_identity')
+
+    setup_key = f"setup:{int(uid)}:{sid}" if sid else ''
+    symbol_key = f"symbol:{int(uid)}:{sym}"
+    symdir_key = f"symdir:{int(uid)}:{sym}:{sd}"
+    checks = []
+    if setup_key:
+        checks.append((setup_key, 'SETUP', float(setup_ttl_sec)))
+    checks.append((symbol_key, 'SYMBOL', float(symbol_ttl_sec)))
+    checks.append((symdir_key, 'SYMDIR', float(symdir_ttl_sec)))
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute('BEGIN IMMEDIATE')
+            reserved = []
+            for guard_key, gtype, ttl in checks:
+                row = c.execute("SELECT status, updated_ts, note FROM autotrade_exec_guard WHERE guard_key=?", (guard_key,)).fetchone()
+                if row:
+                    status = str(row[0] or '').upper()
+                    updated_ts = float(row[1] or 0.0)
+                    age = now - updated_ts
+                    if status in {'PENDING', 'PLACED'} and age <= ttl:
+                        conn.rollback()
+                        return (False, reserved, f'duplicate_guard_block:{gtype.lower()}')
+                c.execute("INSERT OR REPLACE INTO autotrade_exec_guard(guard_key, uid, setup_id, symbol, side, guard_type, status, created_ts, updated_ts, note) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                          (guard_key, int(uid), sid, sym, sd, gtype, 'PENDING', now, now, ''))
+                reserved.append(guard_key)
+            conn.commit()
+            return (True, reserved, '')
+    except Exception as e:
+        return (False, [], f'guard_reserve_error:{type(e).__name__}')
+
+
+def _autotrade_exec_mark(keys: list[str], status: str, note: str = '') -> None:
+    try:
+        if not keys:
+            return
+        now = float(time.time())
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            for k in keys:
+                c.execute("UPDATE autotrade_exec_guard SET status=?, updated_ts=?, note=? WHERE guard_key=?",
+                          (str(status or '').upper(), now, str(note or '')[:500], str(k)))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _autotrade_get_local_symbol_activity(uid: int, symbol: str) -> dict:
+    sym = _bybit_linear_symbol(symbol)
+    out = {"open_trades": [], "latest_open_ts": 0.0, "latest_close_ts": 0.0, "latest_trade_ts": 0.0}
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT * FROM autotrade_trades WHERE uid=? AND UPPER(symbol)=? ORDER BY opened_ts DESC", (int(uid), str(sym).upper()))
+            rows = [dict(r) for r in c.fetchall()]
+        opens = []
+        for r in rows:
+            status = str(r.get('status') or '').upper()
+            try:
+                open_ts = float(r.get('opened_ts') or 0.0)
+            except Exception:
+                open_ts = 0.0
+            try:
+                close_ts = float(r.get('closed_ts') or 0.0)
+            except Exception:
+                close_ts = 0.0
+            out['latest_open_ts'] = max(float(out['latest_open_ts'] or 0.0), open_ts)
+            out['latest_close_ts'] = max(float(out['latest_close_ts'] or 0.0), close_ts)
+            out['latest_trade_ts'] = max(float(out['latest_trade_ts'] or 0.0), open_ts, close_ts)
+            if status == 'OPEN':
+                opens.append(r)
+        out['open_trades'] = opens
+    except Exception:
+        pass
+    return out
+
+
+def _autotrade_get_pending_symbol_guards(uid: int, symbol: str) -> list[dict]:
+    sym = _bybit_linear_symbol(symbol)
+    out = []
+    try:
+        now = float(time.time())
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT * FROM autotrade_exec_guard WHERE uid=? AND UPPER(symbol)=? ORDER BY updated_ts DESC", (int(uid), str(sym).upper()))
+            rows = [dict(r) for r in c.fetchall()]
+        for r in rows:
+            status = str(r.get('status') or '').upper()
+            age = now - float(r.get('updated_ts') or 0.0)
+            if status == 'PENDING' and age <= float(AUTOTRADE_SYMBOL_GUARD_TTL_SEC):
+                out.append(r)
+            elif status == 'PLACED' and age <= float(AUTOTRADE_RECENT_SYMBOL_SYNC_SEC):
+                out.append(r)
+        return out
+    except Exception:
+        return []
+
+
+def _autotrade_symbol_cooldown_remaining(uid: int, symbol: str, session_label: str) -> float:
+    act = _autotrade_get_local_symbol_activity(uid, symbol)
+    last_ts = float(act.get('latest_trade_ts') or 0.0)
+    if last_ts <= 0:
+        return 0.0
+    cooldown_sec = max(float(cooldown_hours_for_session(session_label)) * 3600.0, float(AUTOTRADE_RECENT_SYMBOL_SYNC_SEC))
+    return max(0.0, (last_ts + cooldown_sec) - float(time.time()))
+
+
+def _autotrade_log_symbol_block(uid: int, symbol: str, side: str, reason: str, extra: str = '') -> None:
+    try:
+        msg = f"{reason} uid={int(uid)} symbol={_bybit_linear_symbol(symbol)} side={str(side or '').upper()}"
+        if extra:
+            msg += f" | {extra}"
+        logger.warning(msg)
+    except Exception:
+        pass
+
+
+def _autotrade_can_open_symbol(uid: int, symbol: str, side: str, session_label: str) -> tuple[bool, str, dict]:
+    """Single hardened gatekeeper for symbol tradability."""
+    sym = _bybit_linear_symbol(symbol)
+    sd = str(side or '').upper().strip()
+    detail = {
+        'symbol': sym,
+        'side': sd,
+        'session': str(session_label or '').upper(),
+        'live_open_position': False,
+        'local_open_trade': False,
+        'live_open_order': False,
+        'pending_guard': False,
+        'runtime_lock': False,
+        'cooldown_remaining_sec': 0.0,
+        'recent_trade_remaining_sec': 0.0,
+        'local_open_count': 0,
+        'pending_guard_count': 0,
+    }
+    if not sym or sd not in {'BUY', 'SELL'}:
+        return (False, 'blocked_bad_symbol_identity', detail)
+
+    _autotrade_exec_cleanup()
+
+    if _autotrade_runtime_symbol_lock_active(uid, sym):
+        detail['runtime_lock'] = True
+        _autotrade_log_symbol_block(uid, sym, sd, 'blocked_duplicate_inflight_lock', 'runtime_lock_active')
+        return (False, 'blocked_duplicate_inflight_lock', detail)
+
+    if str(AUTOTRADE_MODE).lower() == 'live':
+        try:
+            for p in _bybit_get_open_positions_linear():
+                if _pos_symbol(p) == sym and abs(float(_pos_size(p) or 0.0)) > 0:
+                    detail['live_open_position'] = True
+                    _autotrade_log_symbol_block(uid, sym, sd, 'blocked_duplicate_open_position', 'live_position_present')
+                    return (False, 'blocked_duplicate_open_position', detail)
+        except Exception:
+            pass
+
+    local_activity = _autotrade_get_local_symbol_activity(uid, sym)
+    local_opens = local_activity.get('open_trades') or []
+    if local_opens:
+        detail['local_open_trade'] = True
+        detail['local_open_count'] = len(local_opens)
+        _autotrade_log_symbol_block(uid, sym, sd, 'blocked_by_existing_local_trade_state', f"open_trades={len(local_opens)}")
+        return (False, 'blocked_by_existing_local_trade_state', detail)
+
+    pending_guards = _autotrade_get_pending_symbol_guards(uid, sym)
+    if pending_guards:
+        detail['pending_guard'] = True
+        detail['pending_guard_count'] = len(pending_guards)
+        statuses = ','.join(sorted({str(x.get('status') or '').upper() for x in pending_guards}))
+        _autotrade_log_symbol_block(uid, sym, sd, 'blocked_duplicate_pending_order', f"guards={len(pending_guards)} statuses={statuses}")
+        return (False, 'blocked_duplicate_pending_order', detail)
+
+    if str(AUTOTRADE_MODE).lower() == 'live':
+        try:
+            if _autotrade_has_live_open_order(sym, side=None):
+                detail['live_open_order'] = True
+                _autotrade_log_symbol_block(uid, sym, sd, 'blocked_duplicate_pending_order', 'live_open_order_present')
+                return (False, 'blocked_duplicate_pending_order', detail)
+        except Exception:
+            pass
+
+    latest_open_ts = float(local_activity.get('latest_open_ts') or 0.0)
+    if latest_open_ts > 0:
+        recent_remaining = max(0.0, (latest_open_ts + float(AUTOTRADE_RECENT_SYMBOL_SYNC_SEC)) - float(time.time()))
+        detail['recent_trade_remaining_sec'] = recent_remaining
+        if recent_remaining > 0:
+            _autotrade_log_symbol_block(uid, sym, sd, 'blocked_by_recent_symbol_trade', f"remaining_sec={int(recent_remaining)}")
+            return (False, 'blocked_by_recent_symbol_trade', detail)
+
+    cooldown_remaining = _autotrade_symbol_cooldown_remaining(uid, sym, session_label)
+    detail['cooldown_remaining_sec'] = cooldown_remaining
+    if cooldown_remaining > 0:
+        _autotrade_log_symbol_block(uid, sym, sd, 'blocked_by_cooldown', f"remaining_sec={int(cooldown_remaining)}")
+        return (False, 'blocked_by_cooldown', detail)
+
+    return (True, '', detail)
+
+
+def _bybit_get_open_orders_linear(symbol: str | None = None) -> list[dict]:
+    try:
+        if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+            return []
+        payload = {'category': 'linear', 'openOnly': 0, 'limit': 200}
+        if symbol:
+            payload['symbol'] = _bybit_linear_symbol(symbol)
+        res = _bybit_v5_request('GET', '/v5/order/realtime', payload)
+        if int((res or {}).get('retCode', -1)) != 0:
+            return []
+        return (((res or {}).get('result') or {}).get('list') or [])
+    except Exception:
+        return []
+
+
+def _autotrade_has_live_open_order(symbol: str, side: str | None = None) -> bool:
+    sym = _bybit_linear_symbol(symbol)
+    side_u = str(side or '').upper().strip()
+    try:
+        for o in _bybit_get_open_orders_linear(sym):
+            try:
+                if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
+                    continue
+                if side_u:
+                    o_side = str(o.get('side') or '').upper().strip()
+                    if (o_side == 'BUY' and side_u != 'BUY') or (o_side == 'SELL' and side_u != 'SELL'):
+                        continue
+                status = str(o.get('orderStatus') or '').upper()
+                if status not in {'CANCELLED', 'FILLED', 'REJECTED', 'DEACTIVATED'}:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float, lifecycle_state: str = 'executed_open', lifecycle_reason: str = '') -> str:
+    """Persist a bot-opened trade into SQLite.
+
+    NOTE: Some deployed DBs have a NOT NULL `day_utc` column on autotrade_trades.
+    We detect it and always populate it to avoid IntegrityError.
+    """
+    trade_id = f"AT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+    day_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+
+        # Detect schema (older/newer deployments)
+        try:
+            cols = [r[1] for r in c.execute("PRAGMA table_info(autotrade_trades)").fetchall()]
+        except Exception:
+            cols = []
+
+        has_day = 'day_utc' in cols
+
+        if has_day:
+            c.execute(
+                """INSERT INTO autotrade_trades
+                       (trade_id, uid, opened_ts, day_utc, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
+                (
+                    trade_id,
+                    int(uid),
+                    int(time.time()),
+                    str(day_utc),
+                    str(session_label),
+                    str(getattr(s, 'symbol', '') or '').upper(),
+                    str(getattr(s, 'side', '') or '').upper(),
+                    float(getattr(s, 'entry', 0.0) or 0.0),
+                    float(getattr(s, 'sl', 0.0) or 0.0),
+                    float(getattr(s, 'tp1', 0.0) or 0.0),
+                    float(getattr(s, 'tp2', 0.0) or 0.0),
+                    float(getattr(s, 'tp3', 0.0) or 0.0),
+                    float(qty),
+                ),
+            )
+        else:
+            c.execute(
+                """INSERT INTO autotrade_trades
+                       (trade_id, uid, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
+                (
+                    trade_id,
+                    int(uid),
+                    int(time.time()),
+                    str(session_label),
+                    str(getattr(s, 'symbol', '') or '').upper(),
+                    str(getattr(s, 'side', '') or '').upper(),
+                    float(getattr(s, 'entry', 0.0) or 0.0),
+                    float(getattr(s, 'sl', 0.0) or 0.0),
+                    float(getattr(s, 'tp1', 0.0) or 0.0),
+                    float(getattr(s, 'tp2', 0.0) or 0.0),
+                    float(getattr(s, 'tp3', 0.0) or 0.0),
+                    float(qty),
+                ),
+            )
+
+        conn.commit()
+
+    try:
+        _admin_setup_lifecycle_merge(
+            int(uid),
+            str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''),
+            session=str(session_label or ''),
+            symbol=str(getattr(s, 'symbol', '') or ''),
+            side=str(getattr(s, 'side', '') or ''),
+            executed_ts=float(time.time()),
+            trade_id=str(trade_id),
+            state=str(lifecycle_state or 'executed_open'),
+            last_reason=str(lifecycle_reason or ''),
+        )
+    except Exception:
+        pass
+    return trade_id
+
+
+def _autotrade_estimated_risk_usd(entry: float, sl: float, qty: float) -> float:
+    try:
+        return abs(entry - sl) * abs(qty)
+    except Exception:
+        return 0.0
+
+def _autotrade_open_risk_usd(uid: int, equity_usdt: float) -> float:
+    total = 0.0
+    for t in _autotrade_db_open_trades(uid):
+        total += _autotrade_estimated_risk_usd(float(t.get('entry') or 0.0), float(t.get('sl') or 0.0), float(t.get('qty') or 0.0))
+    return total
+
+def _autotrade_qty_from_risk(entry: float, sl: float, equity_usdt: float, risk_usd: float | None = None, contract_size: float = 1.0) -> float:
+    dist = abs(float(entry) - float(sl))
+    cs = abs(float(contract_size or 1.0))
+    if dist <= 0 or cs <= 0:
+        return 0.0
+    if risk_usd is None:
+        # Backward-compat fallback only. Live sizing should pass explicit /riskmode-derived risk_usd.
+        risk_usd = (float(equity_usdt) * (AUTOTRADE_RISK_PER_TRADE_PCT / 100.0))
+    qty = float(risk_usd) / (dist * cs)
+    if qty <= 0 or (not math.isfinite(qty)):
+        return 0.0
+    return float(qty)
+
+def _autotrade_allowed_session(session_label: str) -> bool:
+    allowed = set([s.strip().upper() for s in _autotrade_get_sessions() if s.strip()])
+    if not allowed:
+        allowed = {'NY'}
+    return session_label.upper() in allowed
+
+
+# =========================================================
+# AUTOTRADE: select best OPEN setup from DB (generated_setups + signals)
+# =========================================================
+def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1) -> list:
+    """Return recent OPEN setup candidates for autotrade.
+
+    Production sync model:
+    - qualification source = emailed_setups (the setup really passed the email pipeline)
+    - live execution source = executable_setups (the explicit queue autotrade may consume)
+    - generated_setups(source='email') = audit/debug correlation only, never a direct trade source
+
+    Ordering is newest-first, not confidence-first. That keeps autotrade aligned with the
+    newest executable candidate instead of repeatedly re-checking an older higher-conf row.
+
+    Each returned object carries:
+      - created_ts: canonical timestamp used for entry deadline enforcement
+      - email_logged_ts / generated_logged_ts: debug timestamps for /autotrade_last
+      - source_kind: 'executable_setups'
+      - source_session: session recorded when the row was logged
+    """
+    try:
+        from types import SimpleNamespace
+        cutoff = time.time() - float(lookback_hours) * 3600.0
+
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+
+        def _load_signals(rows, source_kind: str):
+            out = []
+            for sid, chosen_ts, aux_ts, src_session in (rows or []):
+                if not sid:
+                    continue
+                cur.execute(
+                    """
+                    SELECT s.setup_id, s.symbol, s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3, s.created_ts
+                    FROM signals s
+                    WHERE s.setup_id = ?
+                    LIMIT 1
+                    """,
+                    (sid,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    continue
+                setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3, signal_created_ts = row
+                try:
+                    signal_created_ts = float(signal_created_ts or 0.0)
+                except Exception:
+                    signal_created_ts = 0.0
+                try:
+                    chosen_ts_f = float(chosen_ts or 0.0)
+                except Exception:
+                    chosen_ts_f = 0.0
+                try:
+                    aux_ts_f = float(aux_ts or 0.0)
+                except Exception:
+                    aux_ts_f = 0.0
+                canonical_ts = max(chosen_ts_f, signal_created_ts, aux_ts_f)
+                now_ts = float(time.time())
+                expiry_grace_sec = float(max(300, int(AUTOTRADE_ENTRY_WINDOW_MIN) * 60 + 300))
+                src_session_u = str(src_session or '').upper().strip()
+                req_session_u = str(session_label or '').upper().strip()
+                if canonical_ts <= 0 or (now_ts - canonical_ts) > expiry_grace_sec:
+                    try:
+                        if setup_id:
+                            _admin_setup_lifecycle_merge(int(uid), str(setup_id), session=src_session_u or req_session_u, symbol=str(symbol or ''), side=str(side or ''), state=_admin_setup_state_from_reason('stale_deadline'), last_reason='stale_deadline')
+                    except Exception:
+                        pass
+                    continue
+                if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
+                    try:
+                        if setup_id:
+                            _admin_setup_lifecycle_merge(int(uid), str(setup_id), session=src_session_u, symbol=str(symbol or ''), side=str(side or ''), state=_admin_setup_state_from_reason('session_mismatch'), last_reason=f'session_mismatch ({src_session_u}->{req_session_u})')
+                    except Exception:
+                        pass
+                    continue
+                out.append(SimpleNamespace(
+                    setup_id=setup_id,
+                    id=setup_id,
+                    symbol=symbol,
+                    side=side,
+                    conf=int(conf or 0),
+                    entry=float(entry or 0.0),
+                    sl=float(sl or 0.0),
+                    tp1=tp1,
+                    tp2=tp2,
+                    tp3=tp3,
+                    created_ts=float(canonical_ts or 0.0),
+                    signal_created_ts=float(signal_created_ts or 0.0),
+                    email_logged_ts=float(aux_ts_f or 0.0) if source_kind == 'executable_setups' else (float(chosen_ts_f or 0.0) if source_kind == 'emailed_setups' else 0.0),
+                    generated_logged_ts=float(aux_ts_f or 0.0) if source_kind == 'emailed_setups' else (float(aux_ts_f or 0.0) if source_kind == 'executable_setups' else float(chosen_ts_f or 0.0)),
+                    source_kind=str(source_kind),
+                    source_session=str(src_session or ''),
+                ))
+            return out
+
+        # 1) Live execution source: executable rows that also have a successful emailed row.
+        #    This keeps autotrade aligned with the real delivered setup pipeline.
+        cur.execute(
+            """
+            SELECT x.setup_id,
+                   MAX(x.executable_ts) AS executable_ts,
+                   MAX(e.emailed_ts) AS emailed_ts,
+                   MAX(COALESCE(x.session, e.session, g.session, '')) AS src_session
+            FROM executable_setups x
+            INNER JOIN emailed_setups e
+                    ON e.user_id = x.user_id
+                   AND e.setup_id = x.setup_id
+            LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
+            LEFT JOIN generated_setups g
+                   ON g.user_id = x.user_id
+                  AND g.setup_id = x.setup_id
+                  AND g.source = 'email'
+            WHERE x.user_id = ?
+              AND x.executable_ts >= ?
+              AND e.emailed_ts > 0
+              AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+            GROUP BY x.setup_id
+            ORDER BY executable_ts DESC, emailed_ts DESC, x.setup_id DESC
+            LIMIT ?
+            """,
+            (int(uid), float(cutoff), int(limit)),
+        )
+        rows = cur.fetchall() or []
+        out = sorted(_load_signals(rows, 'executable_setups'), key=lambda x: (int(getattr(x, 'conf', 0) or 0), float(getattr(x, 'created_ts', 0.0) or 0.0)), reverse=True)
+        if out:
+            try:
+                for item in out:
+                    _admin_setup_lifecycle_merge(
+                        int(uid),
+                        str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or ''),
+                        session=str(getattr(item, 'source_session', '') or session_label or ''),
+                        symbol=str(getattr(item, 'symbol', '') or ''),
+                        side=str(getattr(item, 'side', '') or ''),
+                        executable_ts=float(getattr(item, 'created_ts', 0.0) or time.time()),
+                        state='executable_pending',
+                        source_kind=str(getattr(item, 'source_kind', '') or 'executable_setups'),
+                        signal_created_ts=float(getattr(item, 'signal_created_ts', 0.0) or 0.0),
+                        emailed_ts=float(getattr(item, 'email_logged_ts', 0.0) or 0.0),
+                        generated_logged_ts=float(getattr(item, 'generated_logged_ts', 0.0) or 0.0),
+                    )
+            except Exception:
+                pass
+            con.close()
+            return out
+
+        # 2) No fallback to emailed_setups or generated_setups here.
+        # Live autotrade must consume only the explicit executable queue, and each row
+        # in that queue must also have a successful emailed_setups record.
+        con.close()
+        return []
+    except Exception as e:
+        try:
+            logger.error(f"_autotrade_select_db_setups failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return []
+
+def _autotrade_clear_debug_state(uid: int | None = None) -> None:
+    """Clear in-memory autotrade debug state. If uid is None, clears all."""
+    global _LAST_AUTOTRADE_DECISION, _LAST_AUTOTRADE_DETAIL
+    try:
+        if uid is None:
+            _LAST_AUTOTRADE_DECISION.clear()
+            _LAST_AUTOTRADE_DETAIL.clear()
+        else:
+            _LAST_AUTOTRADE_DECISION.pop(int(uid), None)
+            _LAST_AUTOTRADE_DETAIL.pop(int(uid), None)
+    except Exception:
+        pass
+
+
+def _autotrade_effective_risk_usd(uid: int, setup, equity: float, base_risk_usd: float, remaining_risk_usd: float, open_risk_usd: float, daily_cap_usd: float) -> tuple[float, float, str]:
+    """Return (effective_risk_usd, multiplier, regime).
+
+    Best approach used here:
+    - /riskmode remains the user-selected base risk
+    - dynamic multiplier scales size up/down based on setup quality
+    - never exceed remaining daily capacity
+    - if the clipped risk becomes too small, block the trade upstream
+    """
+    try:
+        conf = int(getattr(setup, 'conf', 0) or 0)
+        engine = str(getattr(setup, 'engine', '') or '').upper()
+        market_symbol = str(getattr(setup, 'market_symbol', '') or getattr(setup, 'symbol', '') or '')
+
+        regime = 'UNKNOWN'
+        try:
+            c1 = fetch_ohlcv(market_symbol, "1h", 60)
+            regime = pf_market_regime(c1[-30:] if c1 else c1)
+        except Exception:
+            regime = 'UNKNOWN'
+
+        mult = float(pf_dynamic_risk_multiplier(conf, regime=regime, engine=engine) or 1.0)
+        # SAFETY: never scale risk ABOVE the user's /riskmode base.
+        mult = min(float(mult), 1.0)
+        target_risk = max(0.0, float(base_risk_usd) * float(mult))
+        target_risk = min(target_risk, float(base_risk_usd))
+
+        if daily_cap_usd > 0:
+            cap_left = max(0.0, float(daily_cap_usd) - max(0.0, float(open_risk_usd)))
+            target_risk = min(target_risk, cap_left)
+
+        if remaining_risk_usd >= 0:
+            target_risk = min(target_risk, float(remaining_risk_usd))
+
+        return (max(0.0, float(target_risk)), mult, str(regime or 'UNKNOWN').upper())
+    except Exception:
+        return (max(0.0, float(base_risk_usd or 0.0)), 1.0, 'UNKNOWN')
+
+
+def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
+    if not _autotrade_ready():
+        return (False, 'autotrade_not_ready_or_disabled')
+    if int(uid) != int(AUTOTRADE_OWNER_UID):
+        return (False, 'not_owner')
+    if not _autotrade_allowed_session(session_label):
+        return (False, f'autotrade_session_not_allowed ({session_label})')
+    if not setups:
+        return (False, 'no_setups')
+
+    s = setups[0]
+    side = str(getattr(s, 'side', '') or '').upper()
+    intended_entry = float(getattr(s, 'entry', 0.0) or 0.0)
+    intended_sl = float(getattr(s, 'sl', 0.0) or 0.0)
+    sym = _bybit_linear_symbol(str(getattr(s, 'symbol', '') or '').upper())
+    setup_id = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
+
+    try:
+        _admin_setup_lifecycle_merge(
+            int(uid),
+            setup_id,
+            session=str(session_label or ''),
+            symbol=str(getattr(s, 'symbol', '') or ''),
+            side=str(side or ''),
+            attempted_ts=float(time.time()),
+            state='execution_attempted',
+            source_kind=str(getattr(s, 'source_kind', '') or ''),
+            signal_created_ts=float(getattr(s, 'signal_created_ts', 0.0) or 0.0),
+            emailed_ts=float(getattr(s, 'email_logged_ts', 0.0) or 0.0),
+            generated_logged_ts=float(getattr(s, 'generated_logged_ts', 0.0) or 0.0),
+        )
+    except Exception:
+        pass
+
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)] = {
+            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'session': session_label,
+            'setup_id': setup_id,
+            'symbol_raw': str(getattr(s, 'symbol', '') or ''),
+            'symbol_sent': sym,
+            'side': side,
+            'entry': float(intended_entry or 0.0),
+            'sl': float(intended_sl or 0.0),
+            'entry_source': 'setup',
+            'sl_source': 'setup',
+            'setup_entry': intended_entry,
+            'setup_sl_raw': intended_sl,
+        }
+    except Exception:
+        pass
+
+    try:
+        _signal_ts = float(getattr(s, 'signal_created_ts', 0.0) or 0.0)
+        _email_ts = float(getattr(s, 'email_logged_ts', 0.0) or 0.0)
+        _generated_ts = float(getattr(s, 'generated_logged_ts', 0.0) or 0.0)
+        _cts = float(getattr(s, 'created_ts', 0.0) or 0.0)
+        _canonical_ts = max(_cts, _email_ts, _generated_ts, _signal_ts)
+        _setup_dt = datetime.fromtimestamp(_canonical_ts, tz=timezone.utc) if _canonical_ts > 0 else datetime.now(timezone.utc)
+        _deadline_dt = _setup_dt + timedelta(minutes=AUTOTRADE_ENTRY_WINDOW_MIN)
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'setup_time': _setup_dt.isoformat(timespec='seconds'),
+            'entry_deadline': _deadline_dt.isoformat(timespec='seconds'),
+            'signal_created_time': datetime.fromtimestamp(_signal_ts, tz=timezone.utc).isoformat(timespec='seconds') if _signal_ts > 0 else '',
+            'email_logged_time': datetime.fromtimestamp(_email_ts, tz=timezone.utc).isoformat(timespec='seconds') if _email_ts > 0 else '',
+            'generated_logged_time': datetime.fromtimestamp(_generated_ts, tz=timezone.utc).isoformat(timespec='seconds') if _generated_ts > 0 else '',
+            'source_kind': str(getattr(s, 'source_kind', '') or ''),
+            'source_session': str(getattr(s, 'source_session', '') or ''),
+        })
+        if datetime.now(timezone.utc) > _deadline_dt:
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('stale_deadline'), last_reason='stale_deadline')
+            except Exception:
+                pass
+            return (False, 'setup_expired')
+    except Exception:
+        pass
+
+    def _as_pos_float(x):
+        try:
+            v = float(x)
+            return v if v > 0 else None
+        except Exception:
+            return None
+    tp1 = _as_pos_float(getattr(s, 'tp1', None))
+    tp2 = _as_pos_float(getattr(s, 'tp2', None))
+    tp3 = _as_pos_float(getattr(s, 'tp3', None))
+    tps = [v for v in (tp1, tp2, tp3) if v is not None]
+
+    if side not in {'BUY', 'SELL'}:
+        return (False, f'bad_side ({side})')
+    if intended_entry <= 0 or intended_sl <= 0:
+        return (False, 'bad_prices')
+    if not tps:
+        return (False, 'missing_tp')
+    if side == 'BUY' and intended_sl >= intended_entry:
+        return (False, 'sl_not_below_entry_for_buy')
+    if side == 'SELL' and intended_sl <= intended_entry:
+        return (False, 'sl_not_above_entry_for_sell')
+
+    price_ref = intended_entry
+    if str(AUTOTRADE_MODE).lower() == 'live':
+        live_ref = _autotrade_live_reference_price(sym, fallback_entry=intended_entry)
+        if live_ref > 0:
+            price_ref = live_ref
+
+    entry_drift_pct = 0.0
+    try:
+        if float(intended_entry) > 0 and float(price_ref) > 0:
+            entry_drift_pct = abs((float(price_ref) - float(intended_entry)) / float(intended_entry)) * 100.0
+    except Exception:
+        entry_drift_pct = 0.0
+    if str(AUTOTRADE_MODE).lower() == 'live' and float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT) > 0 and entry_drift_pct > float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT):
+        try:
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'entry': float(price_ref),
+                'entry_source': 'live_ref',
+                'setup_entry': float(intended_entry),
+                'entry_drift_pct': float(entry_drift_pct),
+                'reject_reason': 'entry_drift_too_wide',
+            })
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('stale_deadline'), last_reason=f'entry_drift_too_wide ({entry_drift_pct:.2f}%>{float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT):.2f}%)')
+        except Exception:
+            pass
+        return (False, 'entry_drift_too_wide')
+
+    filt = _bybit_get_instr_filters(sym)
+    contract_size = float(filt.get('contractSize') or 1.0)
+    stop_rounding = ROUND_UP if side == 'BUY' else ROUND_DOWN
+    sl_for_order = _round_price_to_tick(sym, intended_sl, rounding=stop_rounding)
+    if sl_for_order <= 0:
+        sl_for_order = intended_sl
+    if side == 'BUY' and sl_for_order >= price_ref:
+        return (False, 'stop_invalid_after_tick_rounding_for_buy')
+    if side == 'SELL' and sl_for_order <= price_ref:
+        return (False, 'stop_invalid_after_tick_rounding_for_sell')
+
+    equity = _effective_equity_for_risk(get_user(uid) or {}, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
+    if equity <= 0:
+        return (False, 'equity_unavailable_or_zero')
+    try:
+        if str(AUTOTRADE_MODE).lower() == 'live' and equity > 0:
+            update_user(int(uid), equity=float(equity))
+    except Exception:
+        pass
+
+    base_per_trade_risk = float(_autotrade_per_trade_risk_usd(uid, equity) or 0.0)
+    if base_per_trade_risk <= 0:
+        return (False, 'per_trade_risk_zero')
+
+    mday = _autotrade_day_risk_metrics(int(uid), float(equity))
+    try:
+        live_open_count = int(mday.get('open_positions_now') or 0)
+    except Exception:
+        live_open_count = 0
+    if int(AUTOTRADE_MAX_OPEN_TRADES or 0) > 0 and live_open_count >= int(AUTOTRADE_MAX_OPEN_TRADES):
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_open_trades_reached', 'open_positions_now': int(live_open_count)})
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'max_open_trades_reached ({live_open_count}/{int(AUTOTRADE_MAX_OPEN_TRADES)})')
+        except Exception:
+            pass
+        return (False, 'max_open_trades_reached')
+    daily_cap = float(mday.get('cap') or 0.0)
+    open_risk = float(mday.get('open_risk') or 0.0)
+    used_total_before = float(mday.get('used_total') or 0.0)
+    remaining_risk = float(mday.get('remaining')) if daily_cap > 0 else float('inf')
+
+    effective_risk, risk_mult, risk_regime = _autotrade_effective_risk_usd(
+        uid=uid,
+        setup=s,
+        equity=float(equity),
+        base_risk_usd=float(base_per_trade_risk),
+        remaining_risk_usd=float(remaining_risk) if math.isfinite(remaining_risk) else float(base_per_trade_risk),
+        open_risk_usd=float(open_risk),
+        daily_cap_usd=float(daily_cap),
+    )
+
+    stop_distance = abs(float(price_ref) - float(sl_for_order))
+    allowed_risk_usd = min(float(base_per_trade_risk), float(effective_risk))
+    if math.isfinite(remaining_risk):
+        allowed_risk_usd = min(float(allowed_risk_usd), float(remaining_risk))
+    allowed_risk_usd = max(0.0, float(allowed_risk_usd))
+
+    configured_risk_pct = _risk_pct_from_amount(float(equity), float(base_per_trade_risk))
+    allowed_risk_pct = _risk_pct_from_amount(float(equity), float(allowed_risk_usd))
+    try:
+        _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'entry': float(price_ref),
+            'sl': float(sl_for_order),
+            'entry_source': 'live_ref' if str(AUTOTRADE_MODE).lower() == 'live' else 'setup',
+            'sl_source': 'tick_rounded',
+            'setup_entry_vs_live_delta_pct': (((float(price_ref) - float(intended_entry)) / float(intended_entry)) * 100.0) if float(intended_entry) > 0 else 0.0,
+            'contractSize': float(contract_size),
+            'tick_size': filt.get('tickSize'),
+            'equity_used': float(equity),
+            'risk_mode': str((get_user(uid) or {}).get('risk_mode', DEFAULT_RISK_MODE)).upper(),
+            'risk_value': float((get_user(uid) or {}).get('risk_value', DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE),
+            'risk_base_usd': float(base_per_trade_risk),
+            'risk_effective_usd': float(effective_risk),
+            'risk_multiplier': float(risk_mult),
+            'risk_regime': str(risk_regime),
+            'configured_risk_pct': float(configured_risk_pct),
+            'allowed_risk_usd': float(allowed_risk_usd),
+            'allowed_risk_pct': float(allowed_risk_pct),
+            'daily_cap_usd': float(daily_cap),
+            'open_risk_usd_before': float(open_risk),
+            'daily_used_total_before': float(used_total_before),
+            'realized_loss_today': float(mday.get('realized_loss_today') or 0.0),
+            'remaining_risk_usd': float(remaining_risk) if math.isfinite(remaining_risk) else float('inf'),
+            'stop_distance': float(stop_distance),
+        })
+    except Exception:
+        pass
+
+    if stop_distance <= 0:
+        return (False, 'stop_distance_zero_or_invalid')
+    if math.isfinite(remaining_risk) and remaining_risk <= 0:
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'daily_remaining_risk_zero'})
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason='daily_remaining_risk_zero')
+        except Exception:
+            pass
+        return (False, 'daily_remaining_risk_zero')
+    if allowed_risk_usd <= 0:
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason='daily_risk_cap_reached')
+        except Exception:
+            pass
+        return (False, 'daily_risk_cap_reached')
+    if daily_cap > 0 and used_total_before >= daily_cap:
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason='daily_risk_cap_already_exceeded')
+        except Exception:
+            pass
+        return (False, 'daily_risk_cap_already_exceeded')
+
+    raw_qty = _autotrade_qty_from_risk(price_ref, sl_for_order, equity, risk_usd=allowed_risk_usd, contract_size=contract_size)
+    if raw_qty <= 0:
+        return (False, 'qty_calc_failed')
+    qty, qreason = _round_qty_down(sym, raw_qty, price_ref)
+    if qty is None:
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': f'qty_invalid:{qreason}'})
+        except Exception:
+            pass
+        return (False, f'qty_invalid:{qreason}')
+
+    actual_risk = _autotrade_true_risk_usd(price_ref, sl_for_order, qty, contract_size)
+    if actual_risk > (allowed_risk_usd * 1.0005):
+        qty2 = _autotrade_qty_from_risk(price_ref, sl_for_order, equity, risk_usd=allowed_risk_usd, contract_size=contract_size)
+        qty2, qreason2 = _round_qty_down(sym, qty2, price_ref)
+        if qty2 is None:
+            return (False, f'qty_capped_but_invalid:{qreason2}')
+        qty = qty2
+        actual_risk = _autotrade_true_risk_usd(price_ref, sl_for_order, qty, contract_size)
+        if actual_risk > (allowed_risk_usd * 1.0005):
+            return (False, 'risk_cap_enforcement_failed')
+    actual_risk_pct = _risk_pct_from_amount(float(equity), float(actual_risk))
+    if math.isfinite(remaining_risk) and (used_total_before + actual_risk) > (daily_cap * 1.0005):
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason='daily_cap_would_be_exceeded_by_new_trade')
+        except Exception:
+            pass
+        return (False, 'daily_cap_would_be_exceeded_by_new_trade')
+
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'raw_qty': float(raw_qty),
+            'rounded_qty': float(qty),
+            'qty': float(qty),
+            'qty_attempted': float(qty),
+            'qty_round_reason': qreason,
+            'risk_actual_usd': float(actual_risk),
+            'risk_actual_pct': float(actual_risk_pct),
+            'daily_used_total_after_est': float(used_total_before + actual_risk),
+        })
+    except Exception:
+        pass
+
+    gate_ok, gate_reason, gate_detail = _autotrade_can_open_symbol(uid, sym, side, session_label)
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'symbol_gate_allowed': bool(gate_ok),
+            'symbol_gate_reason': gate_reason,
+            'symbol_gate_detail': gate_detail,
+        })
+    except Exception:
+        pass
+    if not gate_ok:
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': gate_reason})
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(gate_reason), last_reason=gate_reason)
+        except Exception:
+            pass
+        return (False, gate_reason)
+
+    reserved_keys = []
+    runtime_lock_acquired = False
+    try:
+        runtime_lock_acquired = _autotrade_runtime_symbol_lock_acquire(uid, sym)
+        if not runtime_lock_acquired:
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'blocked_duplicate_inflight_lock'})
+            except Exception:
+                pass
+            _autotrade_log_symbol_block(uid, sym, side, 'blocked_duplicate_inflight_lock', 'runtime_lock_acquire_failed')
+            return (False, 'blocked_duplicate_inflight_lock')
+
+        _autotrade_exec_cleanup()
+        ok_guard, reserved_keys, guard_reason = _autotrade_exec_reserve(uid, setup_id, sym, side)
+        if not ok_guard:
+            mapped_reason = {
+                'duplicate_guard_block:symbol': 'blocked_duplicate_inflight_lock',
+                'duplicate_guard_block:symdir': 'blocked_duplicate_inflight_lock',
+                'duplicate_guard_block:setup': 'blocked_duplicate_pending_order',
+            }.get(guard_reason, guard_reason)
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': mapped_reason})
+            except Exception:
+                pass
+            _autotrade_log_symbol_block(uid, sym, side, mapped_reason, guard_reason)
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(mapped_reason), last_reason=mapped_reason)
+            except Exception:
+                pass
+            return (False, mapped_reason)
+
+        gate_ok_after, gate_reason_after, gate_detail_after = _autotrade_can_open_symbol(uid, sym, side, session_label)
+        if not gate_ok_after and gate_reason_after not in {'blocked_duplicate_inflight_lock', 'blocked_duplicate_pending_order'}:
+            _autotrade_exec_mark(reserved_keys, 'FAILED', gate_reason_after)
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                    'symbol_gate_allowed': False,
+                    'symbol_gate_reason': gate_reason_after,
+                    'symbol_gate_detail': gate_detail_after,
+                    'reject_reason': gate_reason_after,
+                })
+            except Exception:
+                pass
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(gate_reason_after), last_reason=gate_reason_after)
+            except Exception:
+                pass
+            return (False, gate_reason_after)
+
+        if str(AUTOTRADE_MODE).lower() == 'paper':
+            trade_id = _autotrade_db_add_trade(uid, session_label, s, qty, lifecycle_state='executed_open', lifecycle_reason='paper_opened')
+            _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), state='executed_open', last_reason='paper_opened')
+            except Exception:
+                pass
+            return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.8g} SL={sl_for_order} TPs={','.join([f'{x:g}' for x in tps])}")
+
+        if AUTOTRADE_ISOLATED:
+            _bybit_v5_request('POST', '/v5/position/switch-isolated', {
+                'category': 'linear',
+                'symbol': sym,
+                'tradeMode': 1,
+                'buyLeverage': str(AUTOTRADE_LEVERAGE),
+                'sellLeverage': str(AUTOTRADE_LEVERAGE),
+            })
+        _bybit_v5_request('POST', '/v5/position/set-leverage', {
+            'category': 'linear',
+            'symbol': sym,
+            'buyLeverage': str(AUTOTRADE_LEVERAGE),
+            'sellLeverage': str(AUTOTRADE_LEVERAGE),
+        })
+
+        qty_step = filt.get('qtyStep')
+        qty_str = _fmt_qty(qty, qty_step)
+        order_payload = {
+            'category': 'linear',
+            'symbol': sym,
+            'side': 'Buy' if side == 'BUY' else 'Sell',
+            'orderType': 'Market',
+            'qty': qty_str,
+            'timeInForce': 'IOC',
+        }
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'qty_step': qty_step,
+                'min_qty': filt.get('minQty'),
+                'min_notional': filt.get('minNotional'),
+                'qty_str': qty_str,
+                'order_payload': {k: (v if k != 'qty' else str(v)) for k, v in (order_payload or {}).items()},
+            })
+        except Exception:
+            pass
+        open_res = _bybit_v5_request('POST', '/v5/order/create', order_payload)
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'bybit': open_res})
+        except Exception:
+            pass
+        if int(open_res.get('retCode', -1)) != 0:
+            err = f"{open_res.get('retCode')} {open_res.get('retMsg')}"
+            _autotrade_exec_mark(reserved_keys, 'FAILED', err)
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('exchange_reject'), last_reason=f'bybit_open_failed ({err})')
+            except Exception:
+                pass
+            return (False, f'bybit_open_failed ({err})')
+
+        try:
+            _admin_setup_lifecycle_merge(
+                int(uid), setup_id,
+                state='bybit_order_accepted',
+                last_reason='order_accepted',
+                bybit_order_id=str(((open_res or {}).get('result') or {}).get('orderId') or ''),
+                bybit_order_link_id=str(((open_res or {}).get('result') or {}).get('orderLinkId') or ''),
+                bybit_position_symbol=str(sym or ''),
+            )
+        except Exception:
+            pass
+
+        exit_plan = _autotrade_live_exit_plan_for_trade(s)
+        live_partial_tp = float(exit_plan.get('partial_tp') or 0.0)
+        live_final_tp = float(exit_plan.get('final_tp') or 0.0)
+        _autotrade_apply_position_tp_sl(sym, sl_for_order, live_final_tp)
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'position_opened_time': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                'live_exit_partial_tp': float(live_partial_tp),
+                'live_exit_final_tp': float(live_final_tp),
+                'live_exit_partial_fraction': float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION),
+                'live_tp_design': 'partial_tp1_limit + final_tp_position',
+            })
+        except Exception:
+            pass
+
+        corrected = False
+        live_pos = _autotrade_find_live_position(sym, side=side)
+        if live_pos:
+            filled_qty = abs(float(_pos_size(live_pos) or 0.0))
+            filled_entry = float(_pos_entry(live_pos) or price_ref)
+            filled_risk = _autotrade_true_risk_usd(filled_entry, sl_for_order, filled_qty, contract_size)
+            filled_risk_pct = _risk_pct_from_amount(float(equity), float(filled_risk))
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'filled_qty': float(filled_qty),
+                'filled_entry': float(filled_entry),
+                'filled_risk_usd': float(filled_risk),
+                'filled_risk_pct': float(filled_risk_pct),
+            })
+            if filled_risk > (allowed_risk_usd * 1.0005):
+                allowed_qty = _autotrade_qty_from_risk(filled_entry, sl_for_order, equity, risk_usd=allowed_risk_usd, contract_size=contract_size)
+                allowed_qty, reduce_reason = _round_qty_down(sym, allowed_qty, filled_entry)
+                if allowed_qty is None or allowed_qty <= 0:
+                    _autotrade_exec_mark(reserved_keys, 'FAILED', f'post_fill_risk_breach_no_valid_reduction:{reduce_reason}')
+                    return (False, f'post_fill_risk_breach_no_valid_reduction:{reduce_reason}')
+                reduce_qty = max(0.0, filled_qty - float(allowed_qty))
+                reduce_qty, reduce_reason = _round_qty_down(sym, reduce_qty, filled_entry)
+                if reduce_qty is None or reduce_qty <= 0:
+                    _autotrade_exec_mark(reserved_keys, 'FAILED', f'post_fill_risk_breach_reduce_qty_invalid:{reduce_reason}')
+                    return (False, f'post_fill_risk_breach_reduce_qty_invalid:{reduce_reason}')
+                reduce_payload = {
+                    'category': 'linear',
+                    'symbol': sym,
+                    'side': 'Sell' if side == 'BUY' else 'Buy',
+                    'orderType': 'Market',
+                    'qty': _fmt_qty(reduce_qty, qty_step),
+                    'timeInForce': 'IOC',
+                    'reduceOnly': True,
+                    'closeOnTrigger': True,
+                }
+                reduce_res = _bybit_v5_request('POST', '/v5/order/create', reduce_payload)
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reduce_payload': reduce_payload, 'reduce_res': reduce_res})
+                if int(reduce_res.get('retCode', -1)) != 0:
+                    err = f"{reduce_res.get('retCode')} {reduce_res.get('retMsg')}"
+                    _autotrade_exec_mark(reserved_keys, 'FAILED', f'post_fill_risk_breach_reduce_failed:{err}')
+                    return (False, f'post_fill_risk_breach_reduce_failed ({err})')
+                corrected = True
+
+        final_pos = _autotrade_find_live_position(sym, side=side)
+        tp_base_qty = abs(float(_pos_size(final_pos) or qty)) if final_pos else float(qty)
+        tp_order_results = []
+        tp_success_count = 0
+        close_side = 'Sell' if side == 'BUY' else 'Buy'
+        if live_partial_tp > 0 and tp_base_qty > 0:
+            tp1_qty = max(0.0, tp_base_qty * float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
+            tp1_qty, tp1_qreason = _round_qty_down(sym, tp1_qty, price_ref)
+            if tp1_qty and tp1_qty > 0:
+                tp_payload = {
+                    'category': 'linear',
+                    'symbol': sym,
+                    'side': close_side,
+                    'orderType': 'Limit',
+                    'qty': _fmt_qty(tp1_qty, qty_step),
+                    'price': str(live_partial_tp),
+                    'timeInForce': 'GTC',
+                    'reduceOnly': True,
+                }
+                tp_res = _bybit_v5_request('POST', '/v5/order/create', tp_payload)
+                ok = int((tp_res or {}).get('retCode', -1)) == 0
+                if ok:
+                    tp_success_count += 1
+                tp_order_results.append({
+                    'idx': 1,
+                    'label': 'partial_tp1_limit',
+                    'price': float(live_partial_tp),
+                    'qty': float(tp1_qty),
+                    'ok': bool(ok),
+                    'retCode': (tp_res or {}).get('retCode'),
+                    'retMsg': (tp_res or {}).get('retMsg'),
+                    'orderId': (((tp_res or {}).get('result') or {}).get('orderId') or ''),
+                })
+            else:
+                tp_order_results.append({'idx': 1, 'label': 'partial_tp1_limit', 'price': float(live_partial_tp), 'qty': 0.0, 'ok': False, 'retCode': 'qty_invalid', 'retMsg': str(tp1_qreason or '')})
+
+        repair_res = _autotrade_repair_live_exit_protection(uid, {
+            'symbol': sym,
+            'side': side,
+            'entry': float(_pos_entry(final_pos) or price_ref) if final_pos else float(price_ref),
+            'sl': float(sl_for_order),
+            'tp1': float(exit_plan.get('effective_tp1') or live_partial_tp),
+            'tp2': float(exit_plan.get('final_tp') or 0.0),
+            'tp3': float(exit_plan.get('final_tp') or 0.0),
+            'qty': float(tp_base_qty if tp_base_qty > 0 else qty),
+            'conf': int(getattr(s, 'conf', 0) or 0),
+            'atr_pct': float(getattr(s, 'atr_pct', 0.0) or 0.0),
+            'session': str(session_label or ''),
+        }, live_pos=final_pos)
+
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'tp_orders': tp_order_results,
+                'tp_success_count': int(tp_success_count),
+                'protection_repair': repair_res,
+            })
+        except Exception:
+            pass
+
+        qty_for_db = tp_base_qty if tp_base_qty > 0 else qty
+        s_live = replace(s,
+            tp1=float(exit_plan.get('effective_tp1') or live_partial_tp or getattr(s, 'tp1', 0.0) or 0.0),
+            tp2=float(exit_plan.get('final_tp') or getattr(s, 'tp2', 0.0) or getattr(s, 'tp3', 0.0) or 0.0),
+            tp3=float(exit_plan.get('final_tp') or getattr(s, 'tp3', 0.0) or 0.0),
+        )
+        trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened')
+        _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='executed_open', last_reason='live_opened')
+        except Exception:
+            pass
+        suffix = ' corrected_for_post_fill_risk' if corrected else ''
+        return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty_for_db:.8g} SL={sl_for_order} TP1={live_partial_tp:g} finalTP={live_final_tp:g}{suffix}")
+
+    except Exception as e:
+        _autotrade_exec_mark(reserved_keys, 'FAILED', f'{type(e).__name__}: {e}')
+        return (False, f'autotrade_execution_error:{type(e).__name__}')
+    finally:
+        if runtime_lock_acquired:
+            _autotrade_runtime_symbol_lock_release(uid, sym)
+
+# Caching for speed
+TICKERS_TTL_SEC = 45
+OHLCV_TTL_SEC = 60
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("pulsefutures")
+
+STABLES = {"USDT", "USDC", "USD", "TUSD", "FDUSD", "DAI", "PYUSD"}
+
+HDR = "━━━━━━━━━━━━━━━━━━━━"
+SEP = "────────────────────"
+
+ALERT_LOCK = asyncio.Lock()
+SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
+AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
+
+
+# =========================================================
+# ✅ PRICE-ACTION CONFIRMATION (stricter = fewer, better signals)
+# =========================================================
+
+# Require a clear 15m rejection/reclaim candle at the chosen pullback EMA
+REQUIRE_15M_EMA_REJECTION = False  # loosened: more setups
+
+# Candle must close in top/bottom portion of its range (shows strength)
+REJECTION_CLOSE_POS_MIN = 0.60   # BUY: close in top 35% of candle
+REJECTION_CLOSE_POS_MAX = 0.40   # SELL: close in bottom 35% of candle
+
+# Strong reversal exception (ONLY if you want rare counter-trend calls)
+ALLOW_STRONG_REVERSAL_EXCEPTION = True
+REVERSAL_CH24_ABS_MIN = 25.0
+REVERSAL_CH4_ABS_MIN  = 1.2
+REVERSAL_CH1_ABS_MIN  = 0.8
+
+
+
+# =========================================================
+# ✅ DB BACKUP/RESET + EMAIL TRADE WINDOW (per-user)
+# =========================================================
+DB_BACKUP_PATH = os.environ.get("DB_BACKUP_PATH", DB_PATH + ".bak")
+
+DB_FILE_LOCK = asyncio.Lock()
+
+# Sessions defined in UTC windows (market convention, with overlaps)
+# ASIA: 00:00–09:00 UTC
+# LON : 07:00–16:00 UTC
+# NY  : 13:00–22:00 UTC
+# Priority resolves overlaps: NY > LON > ASIA
+SESSIONS_UTC = {
+    # Non-overlapping UTC windows (DST-proof for Melbourne display)
+    # ASIA: 00:00–08:00 UTC
+    # LON : 08:00–17:00 UTC
+    # NY  : 13:00–22:00 UTC
+    "ASIA": {"start": "00:00", "end": "08:00"},
+    "LON":  {"start": "08:00", "end": "17:00"},
+    "NY":   {"start": "13:00", "end": "23:00"},
+}
+
+SESSION_PRIORITY = ["NY", "LON", "ASIA"]
+
+SESSION_MIN_CONF = {
+    "NY": 74,
+    "LON": 75,
+    "ASIA": 77,
+}
+
+SESSION_MIN_RR_TP3 = {
+    "NY": 1.55,
+    "LON": 1.65,
+    "ASIA": 1.80,
+}
+
+SESSION_EMA_PROX_MULT = {
+    "NY": 1.60,
+    "LON": 1.40,
+    "ASIA": 1.20,
+}
+
+SESSION_EMA_REACTION_LOOKBACK = {
+    "NY": 9,
+    "LON": 7,
+    "ASIA": 6,
+}
+
+# Leader-base continuation override (for explosive trend names like PIXEL after the first impulse)
+LEADER_BASE_OVERRIDE_ENABLED = env_bool("LEADER_BASE_OVERRIDE_ENABLED", True)
+LEADER_BASE_MIN_CH24 = env_float("LEADER_BASE_MIN_CH24", 25.0)
+LEADER_BASE_MIN_FUT_VOL_USD = env_float("LEADER_BASE_MIN_FUT_VOL_USD", 10_000_000.0)
+LEADER_BASE_MIN_CH4 = env_float("LEADER_BASE_MIN_CH4", 1.0)
+LEADER_BASE_MAX_CH15_ABS = env_float("LEADER_BASE_MAX_CH15_ABS", 1.25)
+LEADER_BASE_MAX_PB_DIST_PCT = env_float("LEADER_BASE_MAX_PB_DIST_PCT", 1.10)
+LEADER_BASE_SL_CAP_PCT_NY = env_float("LEADER_BASE_SL_CAP_PCT_NY", 3.6)
+LEADER_BASE_SL_CAP_PCT_LON = env_float("LEADER_BASE_SL_CAP_PCT_LON", 3.3)
+LEADER_BASE_SL_CAP_PCT_ASIA = env_float("LEADER_BASE_SL_CAP_PCT_ASIA", 3.0)
+
+
+# ✅ 1H trigger loosened per session (overall easier)
+SESSION_TRIGGER_ATR_MULT = {
+    "NY": 0.50,
+    "LON": 0.7,
+    "ASIA": 0.9,
+}
+
+
+def session_knobs(session_name: str) -> dict:
+    s = (session_name or "LON").upper()
+    if s not in SESSIONS_UTC:
+        s = "LON"
+    return {
+        "name": s,
+        "ema_prox_mult": float(SESSION_EMA_PROX_MULT.get(s, 1.0)),
+        "ema_reaction_lookback": int(SESSION_EMA_REACTION_LOOKBACK.get(s, 7)),
+        "trigger_atr_mult": float(SESSION_TRIGGER_ATR_MULT.get(s, 0.85)),
+        "min_conf": int(SESSION_MIN_CONF.get(s, 78)),
+        "min_rr_tp3": float(SESSION_MIN_RR_TP3.get(s, 2.0)),
+    }
+
+def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
+    """
+    Session‑dynamic 1H trigger (loosened so signals actually fire).
+
+    Goal:
+    - Still ATR-adaptive (avoid tiny noise when ATR is high)
+    - But DO NOT impose huge hard floors that suppress all setups
+    """
+    knobs = session_knobs(session_name)
+    mult_atr = float(knobs["trigger_atr_mult"])
+
+    # ATR-adaptive component: scaled by session knob, gently clamped
+    dyn = clamp(float(atr_pct) * float(mult_atr), 0.10, 3.5)
+
+    sess = knobs["name"]
+    base_mult = float(SESSION_1H_BASE_MULT.get(sess, 1.0))
+
+    # ✅ Weekend slight tightening (UTC)
+    try:
+        if is_weekend_utc(datetime.now(timezone.utc)):
+            base_mult *= (1.06 if sess == "ASIA" else 1.03)
+    except Exception:
+        pass
+
+    # Global base floor (kept modest)
+    base_floor = float(TRIGGER_1H_ABS_MIN_BASE) * base_mult
+
+    # Final trigger is the max of base floor and ATR-adaptive requirement
+    return max(float(base_floor), float(dyn))
+
+
+
+# =========================================================
+# DATA STRUCTURES
+# =========================================================
+@dataclass
+class MarketVol:
+    symbol: str
+    base: str
+    quote: str
+    last: float
+    open: float
+    percentage: float
+    base_vol: float
+    quote_vol: float
+    vwap: float
+
+@dataclass
+class Setup:
+    setup_id: str
+    symbol: str
+    market_symbol: str
+    side: str
+    conf: int
+    entry: float
+    sl: float
+    tp1: Optional[float]
+    tp2: Optional[float]
+    tp3: float
+    fut_vol_usd: float
+    ch24: float
+    ch4: float
+    ch1: float
+    ch15: float
+
+    # ✅ adaptive EMA support (15m, volatility-based)
+    ema_support_period: int
+    ema_support_dist_pct: float
+
+    # ✅ NEW: pullback EMA selection (7/14/21) + status
+    pullback_ema_period: int
+    pullback_ema_dist_pct: float
+    pullback_ready: bool          # True => pullback happened / entry quality
+    pullback_bypass_hot: bool     # True => volume>=50M bypass (no pullback needed)
+
+    # ✅ engine label (A pullback / B momentum)
+    engine: str
+
+    is_trailing_tp3: bool
+    created_ts: float
+
+# =========================================================
+# SIMPLE TTL CACHE (in-memory)
+# =========================================================
+_CACHE: Dict[str, Tuple[float, Any]] = {}
+
+def cache_get(key: str) -> Optional[Any]:
+    v = _CACHE.get(key)
+    if not v:
+        return None
+    ts, obj = v
+    return obj
+
+def cache_set(key: str, obj: Any):
+    _CACHE[key] = (time.time(), obj)
+
+def cache_valid(key: str, ttl: int) -> bool:
+    v = _CACHE.get(key)
+    if not v:
+        return False
+    ts, _ = v
+    return (time.time() - ts) <= ttl
+
+# =========================================================
+# MATH / INDICATORS HELPERS (MISSING FIX)
+# =========================================================
+def clamp(x: float, lo: float, hi: float) -> float:
+    try:
+        x = float(x)
+    except Exception:
+        return lo
+    return max(lo, min(hi, x))
+
+def ema(values: List[float], period: int) -> float:
+    """
+    Returns the LAST EMA value (not full series).
+    Safe for short lists.
+    """
+    if not values or period <= 0:
+        return 0.0
+    if len(values) < 2:
+        return float(values[-1])
+
+    k = 2.0 / (period + 1.0)
+    e = float(values[0])
+    for v in values[1:]:
+        e = (float(v) * k) + (e * (1.0 - k))
+    return float(e)
+
+def compute_atr_from_ohlcv(ohlcv: List[List[float]], period: int = 14) -> float:
+    """
+    ATR (Wilder's smoothing) from OHLCV.
+    ohlcv rows: [ts, open, high, low, close, vol]
+    Returns last ATR value.
+    """
+    if not ohlcv or period <= 0:
+        return 0.0
+
+    # need at least period+1 candles for a stable ATR
+    if len(ohlcv) < period + 1:
+        return 0.0
+
+    highs = []
+    lows = []
+    closes = []
+    for c in ohlcv:
+        try:
+            highs.append(float(c[2]))
+            lows.append(float(c[3]))
+            closes.append(float(c[4]))
+        except Exception:
+            return 0.0
+
+    trs: List[float] = []
+    for i in range(1, len(ohlcv)):
+        h = highs[i]
+        l = lows[i]
+        pc = closes[i - 1]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(float(tr))
+
+    if len(trs) < period:
+        return 0.0
+
+    # Wilder: first ATR = SMA(TR, period), then recursive smoothing
+    atr = sum(trs[:period]) / float(period)
+    for tr in trs[period:]:
+        atr = ((atr * (period - 1)) + tr) / float(period)
+
+    return float(atr)
+
+def is_hot_coin(fut_vol_usd: float, ch24: float) -> bool:
+    """
+    Hot coin definition for TP cap logic.
+    """
+    try:
+        return (float(fut_vol_usd) >= float(HOT_VOL_USD)) or (abs(float(ch24)) >= float(HOT_CH24_ABS))
+    except Exception:
+        return False
+
+def tp_cap_pct_for_coin(fut_vol_usd: float, ch24: float) -> float:
+    """
+    Dynamic TP3 cap % based on coin hotness.
+    """
+    return float(TP_MAX_PCT_HOT) if is_hot_coin(fut_vol_usd, ch24) else float(TP_MAX_PCT_NORMAL)
+
+# =========================================================
+# ADAPTIVE EMA SUPPORT
+# =========================================================
+def adaptive_ema_period(atr_pct: float) -> int:
+    """
+    Volatility-aware EMA period:
+    Higher ATR% => faster EMA (smaller period)
+    Lower ATR%  => slower EMA (larger period)
+    """
+    try:
+        a = float(atr_pct)
+    except Exception:
+        a = 2.0
+
+    if a >= 6.0:
+        p = 8
+    elif a >= 4.0:
+        p = 10
+    elif a >= 2.0:
+        p = 12
+    else:
+        p = 16
+
+    return int(clamp(p, ADAPTIVE_EMA_MIN, ADAPTIVE_EMA_MAX))
+
+def adaptive_ema_value(closes: List[float], atr_pct: float) -> Tuple[float, int]:
+    """
+    Returns: (ema_value, period_used)
+    """
+    if not closes:
+        return 0.0, adaptive_ema_period(atr_pct)
+    p = adaptive_ema_period(atr_pct)
+    lookback = min(len(closes), p + 30)
+    return ema(closes[-lookback:], p), p
+
+def best_pullback_ema_15m(
+    closes_15: List[float],
+    c15: List[List[float]],
+    entry: float,
+    side: str,
+    session_name: str,
+    atr_1h: float
+) -> Tuple[float, int, float]:
+    """
+    Pick the best EMA among (7,14,21) based on SR behavior (support/resistance),
+    NOT simply which is closest.
+
+    Returns: (ema_value, period, dist_pct)
+
+    Scoring features:
+    - EMA slope aligned with side (trend rail)
+    - Touch+rejection count in recent candles (SR respect)
+    - Penalize "cross-through" candles (EMA not acting as SR)
+    - Prefer closer EMA but not at the expense of SR quality
+    """
+    if not closes_15 or not c15 or entry <= 0:
+        return 0.0, 14, 999.0
+
+    knobs = session_knobs(session_name)
+    lookback_n = int(knobs.get("ema_reaction_lookback", 7))
+    lookback_n = int(clamp(lookback_n, 5, 16))
+
+    candidates = [7, 14, 21]
+    best_val = 0.0
+    best_p = 14
+    best_dist = 999.0
+    best_score = -1e9
+
+    # Precompute candle slice (most recent lookback window)
+    recent = c15[-lookback_n:] if len(c15) >= lookback_n else c15[:]
+
+    for p in candidates:
+        lookback = min(len(closes_15), p + 80)
+        ema_series_src = closes_15[-lookback:]
+        e_now = float(ema(ema_series_src, p) or 0.0)
+        if e_now <= 0:
+            continue
+
+        # EMA slope: compare current EMA with EMA a bit earlier
+        # (cheap slope approximation without building full series)
+        mid_cut = max(10, int(p * 2))
+        if len(ema_series_src) > mid_cut:
+            e_prev = float(ema(ema_series_src[:-mid_cut], p) or e_now)
+        else:
+            e_prev = e_now
+
+        slope = (e_now - e_prev)  # absolute slope
+        slope_ok = (slope > 0) if side == "BUY" else (slope < 0)
+
+        # Distance (still matters)
+        dist_pct = abs(entry - e_now) / entry * 100.0
+
+        # Dynamic near threshold based on ATR + session knobs
+        # Use your existing proximity function to get threshold behavior consistent
+        pb_ok, pb_dist2, pb_thr, _ = ema_support_proximity_ok(entry, e_now, atr_1h, session_name)
+
+        # Count touches + "rejection direction" + cross-through
+        touch = 0
+        reject = 0
+        cross = 0
+
+        for k in recent:
+            o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4])
+            # touch = candle range intersects EMA
+            if l <= e_now <= h:
+                touch += 1
+
+                # reject = candle closes on the "right side" of EMA for continuation
+                if side == "BUY":
+                    if c > e_now and c > o:
+                        reject += 1
+                else:
+                    if c < e_now and c < o:
+                        reject += 1
+
+                # cross-through = opens one side closes other side (EMA not respected)
+                if (o - e_now) * (c - e_now) < 0:
+                    cross += 1
+
+        # Score weights (tuned for "fewer, better")
+        score = 0.0
+
+        # Must be meaningfully near; if not near, heavily penalize
+        if not pb_ok:
+            score -= 25.0
+        else:
+            score += 10.0
+
+        # Reward SR respect: touches + rejection, penalize cross-through
+        score += (touch * 2.0)
+        score += (reject * 4.0)
+        score -= (cross * 5.0)
+
+        # Reward slope alignment (trend rail)
+        score += 8.0 if slope_ok else -10.0
+
+        # Prefer closer EMA slightly (but not dominant)
+        score -= (dist_pct * 1.5)
+
+        # Mild preference for slower EMA in trends (21 > 14 > 7) IF slope aligns
+        if slope_ok:
+            if p == 21:
+                score += 2.5
+            elif p == 14:
+                score += 1.2
+
+        # Pick best
+        if score > best_score:
+            best_score = score
+            best_val = e_now
+            best_p = int(p)
+            best_dist = float(dist_pct)
+
+    if best_val <= 0:
+        return 0.0, 14, 999.0
+
+    return float(best_val), int(best_p), float(best_dist)
+
+
+# ✅ NEW: "Waiting for Trigger" (near-miss candidates)
+
+_WAITING_TRIGGER: Dict[str, Dict[str, Any]] = {}
+
+
+def is_admin_user(user_id: int) -> bool:
+    """Admin check (supports list + single-id env fallbacks)."""
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+
+    for k in ("ADMIN_TELEGRAM_ID", "OWNER_USER_ID", "ADMIN_ID"):
+        v = os.environ.get(k)
+        if v:
+            try:
+                if uid == int(str(v).strip()):
+                    return True
+            except Exception:
+                pass
+
+    return (uid in ADMIN_USER_IDS) if ADMIN_USER_IDS else False
+
+
+
+
+def is_unlimited_admin(user_id: int) -> bool:
+    return is_admin_user(user_id)
+
+# =========================================================
+# GLOBAL STATE
+# =========================================================
+# Stores last SMTP error per user for /health and /email_test
+_LAST_SMTP_ERROR: Dict[int, str] = {}
+
+# Per-user diagnostics preference (non-admin). Admin always full.
+_USER_DIAG_MODE: Dict[int, str] = {}
+
+# ✅ NEW: Stores last email decision per user (SENT / SKIP + reasons)
+_LAST_EMAIL_DECISION: Dict[int, Dict[str, Any]] = {}
+
+# ✅ NEW: last successful SENT email (so /email_decision won't be overwritten by later SKIPs)
+_LAST_EMAIL_SENT: Dict[int, Dict[str, Any]] = {}
+
+# ✅ NEW: last email ERROR (send/connect failure)
+_LAST_EMAIL_ERROR: Dict[int, Dict[str, Any]] = {}
+
+_LAST_BIGMOVE_DECISION: Dict[int, dict] = {}
+
+# ---------------------------------------------------------
+# Email loop heartbeat (for /email_decision transparency)
+# ---------------------------------------------------------
+_EMAIL_LOOP_HEARTBEAT: Dict[str, Any] = {
+    "alive": False,
+    "last_tick_ts": 0.0,
+    "next_tick_ts": 0.0,
+    "last_error": "",
+}
+
+_ENGINE_HEARTBEAT: Dict[str, Dict[str, Any]] = {
+    "screen": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+    "autotrade": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+    "email": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+    "optimizer": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+    "learning_hourly": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+    "learning_daily": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+    "db": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
+}
+
+def _hb_touch(name: str, ok: bool = True, details: str = "", error: str = "") -> None:
+    try:
+        hb = _ENGINE_HEARTBEAT.setdefault(str(name), {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""})
+        now_ts = float(time.time())
+        hb["alive"] = True
+        hb["last_ts"] = now_ts
+        if ok:
+            hb["last_ok_ts"] = now_ts
+            if error == "":
+                hb["last_error"] = ""
+        if details:
+            hb["details"] = str(details)[:240]
+        if error:
+            hb["last_error"] = str(error)[:240]
+    except Exception:
+        pass
+
+def _hb_status_line(name: str, stale_after_sec: int, label: str | None = None) -> tuple[str, str]:
+    hb = _ENGINE_HEARTBEAT.get(str(name)) or {}
+    now_ts = float(time.time())
+    last_ok = float(hb.get("last_ok_ts") or 0.0)
+    last_ts = float(hb.get("last_ts") or 0.0)
+    err = str(hb.get("last_error") or "")
+    shown_ts = last_ok or last_ts
+    if shown_ts <= 0:
+        status = "INACTIVE"
+    elif (now_ts - shown_ts) > float(stale_after_sec):
+        status = "STALE"
+    elif err:
+        status = "ERROR"
+    else:
+        status = "ACTIVE"
+    when = _fmt_dt_local(datetime.fromtimestamp(shown_ts, tz=timezone.utc)) if shown_ts > 0 else "—"
+    detail = str(hb.get("details") or "")
+    prefix = str(label or name).strip()
+    line = f"{prefix}: {status} | Last ok: {when}"
+    if detail:
+        line += f" | {detail}"
+    if err and status in {"STALE", "ERROR"}:
+        line += f" | Error: {err}"
+    return status, line
+
+
+def _fallback_component_signal(name: str, uid: int | None = None) -> tuple[float, str]:
+    """Best-effort persisted/runtime fallback for health reporting.
+
+    This prevents false INACTIVE states after restart when a loop is clearly alive
+    but the in-memory heartbeat key has not been touched yet.
+    Returns: (timestamp_utc_epoch_seconds, details)
+    """
+    now_ts = float(time.time())
+    owner = int(uid or AUTOTRADE_OWNER_UID or 0)
+    try:
+        if str(name) == 'screen':
+            rec = _LAST_REJECTS.get(int(owner)) or {}
+            ts = float(rec.get('ts') or 0.0)
+            if ts > 0:
+                allow_n = len((rec.get('allow') or []))
+                reject_n = len((rec.get('counts') or {}))
+                return ts, f"scan_evidence universe={allow_n} rejects={reject_n}"
+            ev = _db_recent_runtime_evidence(int(owner), hours=24)
+            ts = float(ev.get('generated_screen_last_ts') or 0.0) or float(ev.get('signals_last_ts') or 0.0)
+            if ts > 0:
+                return ts, "scan_evidence persisted_write"
+        elif str(name) == 'email':
+            ts = float(_EMAIL_LOOP_HEARTBEAT.get('last_tick_ts', 0.0) or 0.0)
+            if ts > 0:
+                return ts, str(_EMAIL_LOOP_HEARTBEAT.get('last_error') or '') or 'email_loop_tick'
+            dec = _LAST_EMAIL_DECISION.get(int(owner)) or {}
+            for key in ('when_ts', 'ts', 'created_ts'):
+                try:
+                    ts = float(dec.get(key) or 0.0)
+                except Exception:
+                    ts = 0.0
+                if ts > 0:
+                    return ts, f"email_decision {str(dec.get('decision') or dec.get('status') or '').strip()}"
+            when = str(dec.get('when') or '')
+            if when:
+                try:
+                    dt = datetime.fromisoformat(when.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return float(dt.timestamp()), f"email_decision {str(dec.get('decision') or dec.get('status') or '').strip()}"
+                except Exception:
+                    pass
+        elif str(name) == 'autotrade':
+            dec = _LAST_AUTOTRADE_DECISION.get(int(owner)) or {}
+            when = str(dec.get('when') or '')
+            if when:
+                try:
+                    dt = datetime.fromisoformat(when.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return float(dt.timestamp()), str(dec.get('decision') or dec.get('reason') or 'autotrade_decision')
+                except Exception:
+                    pass
+        elif str(name) == 'learning_hourly':
+            run = _evolution_get_last_run('hourly') or {}
+            ts = float(run.get('finished_ts') or run.get('started_ts') or 0.0)
+            if ts > 0:
+                return ts, f"db_run {str(run.get('status') or '').upper() or 'UNKNOWN'}"
+        elif str(name) == 'learning_daily':
+            run = _evolution_get_last_run('daily') or {}
+            ts = float(run.get('finished_ts') or run.get('started_ts') or 0.0)
+            if ts > 0:
+                return ts, f"db_run {str(run.get('status') or '').upper() or 'UNKNOWN'}"
+        elif str(name) == 'optimizer':
+            run = _db_get_last_opt_run() or {}
+            ts = float(run.get('finished_ts') or run.get('started_ts') or 0.0)
+            if ts > 0:
+                return ts, f"db_run {str(run.get('status') or '').upper() or 'UNKNOWN'}"
+    except Exception:
+        return 0.0, ''
+    return 0.0, ''
+
+
+def _effective_hb_status_line(name: str, stale_after_sec: int, label: str | None = None, uid: int | None = None) -> tuple[str, str]:
+    """Health line that prefers in-memory heartbeat but reconciles with real runtime/db evidence."""
+    status, line = _hb_status_line(name, stale_after_sec, label=label)
+    if status not in {'INACTIVE', 'STALE'}:
+        return status, line
+
+    fb_ts, fb_detail = _fallback_component_signal(name, uid=uid)
+    if fb_ts <= 0:
+        return status, line
+
+    now_ts = float(time.time())
+    age = now_ts - float(fb_ts)
+    if age <= float(stale_after_sec):
+        fb_status = 'ACTIVE'
+    else:
+        fb_status = 'STALE'
+
+    when = _fmt_dt_local(datetime.fromtimestamp(fb_ts, tz=timezone.utc)) if fb_ts > 0 else '—'
+    prefix = str(label or name).strip()
+    reconciled = f"{prefix}: {fb_status} | Last ok: {when}"
+    if fb_detail:
+        reconciled += f" | {str(fb_detail)[:240]}"
+    if status in {'INACTIVE', 'STALE'}:
+        reconciled += " | source=fallback"
+    return fb_status, reconciled
+
+
+def _admin_assurance_verdict(uid: int | None = None) -> tuple[str, list[str]]:
+    blockers = []
+    owner = int(uid or AUTOTRADE_OWNER_UID or 0)
+    for name, ttl in (("autotrade", 180), ("email", max(180, int(CHECK_INTERVAL_MIN * 120))), ("learning_hourly", max(1800, int(EVOLUTION_HOURLY_INTERVAL_MIN * 180))), ("optimizer", max(7200, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 7200)))):
+        st, _ = _effective_hb_status_line(name, ttl, uid=owner)
+        if name == "optimizer" and not AUTONOMOUS_OPT_ENABLED:
+            continue
+        if name in {"learning_hourly"} and not EVOLUTION_ENABLED:
+            continue
+        if st in {"ERROR", "STALE", "INACTIVE"}:
+            blockers.append(f"{name}={st}")
+    return ("CHECK REQUIRED", blockers) if blockers else ("HEALTHY", [])
+
+
+def _component_runtime_state(name: str, stale_after_sec: int, enabled: bool = True, no_data: bool = False, waiting_text: str = "waiting_for_first_cycle") -> tuple[str, str]:
+    if not enabled:
+        return ("DISABLED", "disabled_in_config")
+    hb = _ENGINE_HEARTBEAT.get(str(name)) or {}
+    now_ts = float(time.time())
+    last_ok = float(hb.get("last_ok_ts") or 0.0)
+    last_ts = float(hb.get("last_ts") or 0.0)
+    err = str(hb.get("last_error") or "").strip()
+    if err and last_ts > 0 and (now_ts - last_ts) <= float(stale_after_sec):
+        return ("ERROR", err)
+    if last_ok > 0:
+        if (now_ts - last_ok) <= float(stale_after_sec):
+            return ("ACTIVE", "running")
+        return ("STALE", "scheduler_not_running_or_job_not_completing")
+    if last_ts > 0:
+        if err:
+            return ("ERROR", err)
+        return ("WAITING", waiting_text)
+    if no_data:
+        return ("WAITING_FOR_DATA", "no_eligible_data_yet")
+    return ("WAITING", waiting_text)
+
+
+def _status_label(status: str) -> str:
+    m = {
+        "ACTIVE": "ACTIVE",
+        "DISABLED": "DISABLED",
+        "WAITING": "WAITING",
+        "WAITING_FOR_DATA": "WAITING FOR DATA",
+        "STALE": "CHECK SCHEDULER",
+        "ERROR": "ERROR",
+    }
+    return m.get(str(status).upper(), str(status).upper())
+
+
+def _format_last_run_line(title: str, run: dict) -> str:
+    if not run:
+        return f"{title}: —"
+    ts = run.get("finished_ts") or run.get("started_ts")
+    when = _fmt_dt_local(datetime.fromtimestamp(float(ts), tz=timezone.utc)) if ts else "—"
+    status = str(run.get("status") or "").upper() or "UNKNOWN"
+    analyzed_setups = int(run.get("analyzed_setups", 0) or 0)
+    analyzed_trades = int(run.get("analyzed_trades", 0) or 0)
+    return f"{title}: {when} | status={status} | setups={analyzed_setups} | trades={analyzed_trades}"
+
+
+def _learning_status_text() -> str:
+    snap = _evolution_snapshot_cached() or {}
+    overall = snap.get("overall") or {}
+    ny = snap.get("ny") or {}
+    trend = snap.get("trend") or {}
+    hourly = snap.get("last_hourly") or _evolution_get_last_run("hourly") or {}
+    daily = snap.get("last_daily") or _evolution_get_last_run("daily") or {}
+    last_opt = _db_get_last_opt_run() or {}
+    opt_res = _db_get_opt_result(str(last_opt.get("run_id") or "")) if last_opt else {}
+    cfg = load_strategy_config(force=True)
+    auto_last = snap.get("auto_applied_last") or _evolution_state_get("last_auto_adjustment", {}) or {}
+
+    owner = int(AUTOTRADE_OWNER_UID or 0)
+    stage = _learning_stage_outcome_summary(owner, days=60)
+    be = _learning_breakeven_after_tp1_analysis(owner, days=60)
+    live = _learning_live_trade_summary(owner, days=60)
+
+    hourly_no_data = int(hourly.get("analyzed_setups", 0) or 0) == 0 and int(hourly.get("analyzed_trades", 0) or 0) == 0
+    daily_no_data = int(daily.get("analyzed_setups", 0) or 0) == 0 and int(daily.get("analyzed_trades", 0) or 0) == 0
+    opt_sample = int(((opt_res or {}).get("metrics") or {}).get("oos", {}).get("setups", 0) or 0)
+    opt_no_data = bool(last_opt) and opt_sample == 0
+
+    hourly_state, hourly_reason = _component_runtime_state("learning_hourly", max(1800, int(EVOLUTION_HOURLY_INTERVAL_MIN * 180)), enabled=bool(EVOLUTION_ENABLED), no_data=hourly_no_data, waiting_text="waiting_for_hourly_cycle")
+    daily_state, daily_reason = _component_runtime_state("learning_daily", max(21600, int(EVOLUTION_DAILY_INTERVAL_HOURS * 5400)), enabled=bool(EVOLUTION_ENABLED), no_data=daily_no_data, waiting_text="waiting_for_daily_cycle")
+    opt_state, opt_reason = _component_runtime_state("optimizer", max(7200, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 7200)), enabled=bool(AUTONOMOUS_OPT_ENABLED), no_data=opt_no_data, waiting_text="waiting_for_optimizer_window")
+    email_state, _ = _component_runtime_state("email", max(180, int(CHECK_INTERVAL_MIN * 120)), enabled=bool(EMAIL_ENABLED and email_config_ok()), no_data=False, waiting_text="waiting_for_email_loop")
+
+    optimizer_live_changes = []
+    if auto_last and isinstance(auto_last.get("actions"), list):
+        for a in auto_last.get("actions") or []:
+            try:
+                optimizer_live_changes.append(f"{a.get('param')} {a.get('from')}→{a.get('to')}")
+            except Exception:
+                pass
+
+    opt_promoted = bool((opt_res or {}).get("promoted"))
+    lines = [
+        "🧠 Learning / Optimization Status",
+        HDR,
+        f"Hourly learning: {_status_label(hourly_state)}" + (f" | {hourly_reason}" if hourly_reason and hourly_state != "ACTIVE" else ""),
+        f"Daily review: {_status_label(daily_state)}" + (f" | {daily_reason}" if daily_reason and daily_state != "ACTIVE" else ""),
+        f"Optimizer: {_status_label(opt_state)}" + (f" | {opt_reason}" if opt_reason and opt_state != "ACTIVE" else ""),
+        f"Email loop: {_status_label(email_state)}",
+        SEP,
+        _format_last_run_line("Last hourly cycle", hourly),
+        _format_last_run_line("Last daily review", daily),
+        f"Last optimizer run: {(_fmt_dt_local(datetime.fromtimestamp(float((last_opt or {}).get('started_ts') or 0.0), tz=timezone.utc)) if (last_opt or {}).get('started_ts') else '—')}" + (f" | status={str((last_opt or {}).get('status') or 'UNKNOWN').upper()}" if last_opt else ""),
+    ]
+
+    if last_opt:
+        oos = ((opt_res or {}).get("metrics") or {}).get("oos") or {}
+        lines.append(f"Optimizer effect on live strategy: {'LIVE PARAMS UPDATED' if opt_promoted else 'ADVISORY ONLY'}")
+        if oos:
+            lines.append(f"Latest optimizer OOS: setups/day={float(oos.get('setups_per_day', 0.0) or 0.0):.2f} | WR={float(oos.get('win_rate', 0.0) or 0.0):.1f}% | avgR={float(oos.get('avg_R', 0.0) or 0.0):.3f}")
+
+    lines.extend([
+        SEP,
+        "Outcome learning (last 60d)",
+        f"Stage-learning source: emailed setup outcomes with TP-stage resolution | sample {int(stage.get('decided') or 0)} decided",
+        f"TP1: {int(stage.get('tp1_only') or 0)} | TP2: {int(stage.get('tp2_plus') or 0)} | SL: {int(stage.get('losses') or 0)} | OPEN: {int(stage.get('open') or 0)}",
+        f"Weighted TP accuracy: {float(stage.get('weighted_win_rate') or 0.0):.1f}% | Avg staged credit/trade: {float(stage.get('avg_weighted_credit') or 0.0):.2f}",
+        f"Live autotrade closes available: {int(live.get('closed') or 0)} | Net PnL: ${float(live.get('net_pnl') or 0.0):+.2f} | Win rate: {float(live.get('win_rate') or 0.0):.1f}%",
+        f"Breakeven after TP1: {str(be.get('recommendation') or 'NEUTRAL')} | TP1+ sample: {int(be.get('sample_tp1_plus') or 0)} | TP1-only share: {float(be.get('tp1_only_share') or 0.0):.1f}%",
+        f"Why: {str(be.get('explanation') or 'Not enough TP1-path data yet.')}",
+        SEP,
+        "What is automatic now",
+        f"• Runtime parameter changes: {'YES' if optimizer_live_changes or opt_promoted else 'YES, but no change has been promoted yet'}",
+        "• Closed-trade PnL is already used automatically for day-risk accounting and admin reports.",
+        "• TP-stage learning is automatic through stored signal outcomes and now feeds the live conditional break-even-after-TP1 rule.",
+        "• Zero-touch autopilot now re-tests shortlisted parameter sets across 7d / 14d / 21d / 30d windows before any live promotion.",
+        "• The bot does NOT rewrite its own source code or GitHub file.",
+    ])
+
+    if optimizer_live_changes:
+        lines.append("• Last live parameter changes: " + "; ".join(optimizer_live_changes[:3]))
+    else:
+        lines.append("• Last live parameter changes: none recorded yet.")
+
+    lines.extend([
+        SEP,
+        f"Current live floors: email_quality={float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL):.1f} | screen_quality={float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN):.1f} | min_rr_tp3={float(cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3):.2f}",
+        f"Signal win rate (completed outcomes): overall {_signal_wr_display_metrics(owner).get('binary_win_rate', 0.0):.1f}% | NY {_signal_wr_display_metrics(owner, session='NY').get('binary_win_rate', 0.0):.1f}% | trend overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}",
+        SEP,
+    ])
+
+    manual_action = "none for normal operation"
+    if int(stage.get('decided') or 0) < 20:
+        manual_action = "no code change needed yet; more closed outcome data is needed before TP/SL recommendations become reliable"
+    elif str(be.get('recommendation') or '').upper() == 'CONDITIONAL':
+        manual_action = "optional code redesign if you want conditional break-even-after-TP1 rules by setup quality / session / volatility"
+    elif not EVOLUTION_ENABLED and not AUTONOMOUS_OPT_ENABLED:
+        manual_action = "enable EVOLUTION_ENABLED and/or AUTONOMOUS_OPT_ENABLED in the environment, then redeploy"
+    lines.append(f"Manual action: {manual_action}.")
+    return "\n".join(lines)
+
+def _fmt_iso_local_label(iso_s: str, fallback: str = "") -> str:
+    if not iso_s:
+        return fallback
+    try:
+        return _fmt_iso_to_local(str(iso_s))
+    except Exception:
+        return str(iso_s)
+
+def _fmt_float_or_blank(v, decimals: int = 10) -> str:
+    try:
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return ""
+        return f"{f:.{decimals}g}"
+    except Exception:
+        return ""
+
+
+def _autotrade_price_str(v) -> str:
+    try:
+        return fmt_price(float(v))
+    except Exception:
+        s = _fmt_float_or_blank(v, decimals=10)
+        return s or "—"
+
+
+def _autotrade_same_price(a, b, rel_tol: float = 1e-9, abs_tol: float = 1e-9) -> bool:
+    try:
+        return math.isclose(float(a), float(b), rel_tol=float(rel_tol), abs_tol=float(abs_tol))
+    except Exception:
+        return False
+
+
+def _latest_emailed_setup_summary(uid: int, lookback_hours: int = 24) -> dict:
+    try:
+        items = _autotrade_select_db_setups(int(uid), "", lookback_hours=max(1, int(lookback_hours)), limit=1)
+        if not items:
+            return {}
+        s = items[0]
+        return {
+            "setup_id": str(getattr(s, "setup_id", "") or getattr(s, "id", "") or ""),
+            "symbol": str(getattr(s, "symbol", "") or ""),
+            "side": str(getattr(s, "side", "") or ""),
+            "created_ts": float(getattr(s, "created_ts", 0.0) or 0.0),
+            "signal_created_ts": float(getattr(s, "signal_created_ts", 0.0) or 0.0),
+            "email_logged_ts": float(getattr(s, "email_logged_ts", 0.0) or 0.0),
+            "source_kind": str(getattr(s, "source_kind", "") or ""),
+            "source_session": str(getattr(s, "source_session", "") or ""),
+        }
+    except Exception:
+        return {}
+
+def user_diag_mode(user_id: int) -> str:
+    """
+    Returns diagnostic visibility mode for this user:
+    - admin => 'full'
+    - non-admin => 'friendly' or 'off'
+    Enforces PUBLIC_DIAGNOSTICS_MODE:
+      - 'off'   => always off for non-admin
+      - 'admin' => allow per-user friendly/off
+    """
+    uid = int(user_id)
+
+    if is_admin_user(uid):
+        return "full"
+
+    # hard lock for public users
+    if PUBLIC_DIAGNOSTICS_MODE == "off":
+        return "off"
+
+    # admin-only diagnostics policy (recommended):
+    # non-admin can choose friendly/off locally
+    mode = (_USER_DIAG_MODE.get(uid) or "off").strip().lower()
+    if mode not in {"friendly", "off"}:
+        mode = "off"
+    return mode
+
+def reset_reject_tracker() -> None:
+    return
+
+
+# =========================================================
+# DIAGNOSTICS (reject reasons)
+# =========================================================
+_REJECT_CTX = contextvars.ContextVar("pf_reject_ctx", default=None)
+_LAST_REJECTS = {}  # uid -> {"ts": float, "counts": { "A:no_trigger": 12, ... }}
+_GLOBAL_REJECT_CTX = None  # fallback reject ctx when contextvars don't propagate across nested threads
+
+def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
+    """Record reject reasons for diagnostics.
+
+    - Aggregate counters: ctx["<BASE>:<REASON>"] += 1
+    - Per-symbol last-known reason: ctx["__per__"][BASE] = {"reason": REASON, "n": count}
+    - If ctx["__allow__"] exists, only record for bases in that set (keeps /why focused).
+    """
+    ctx = _REJECT_CTX.get()
+    if not isinstance(ctx, dict):
+        # Fallback: nested asyncio.to_thread() inside our thread runner can drop contextvars.
+        # Use the global ctx for this scan if available.
+        global _GLOBAL_REJECT_CTX
+        if isinstance(_GLOBAL_REJECT_CTX, dict):
+            ctx = _GLOBAL_REJECT_CTX
+        else:
+            return
+
+    b = str(base or "").upper().strip()
+    if not b:
+        return
+
+    allow = ctx.get("__allow__")
+    try:
+        # If allow-list is present but empty, treat it as disabled (avoid silencing /why)
+        if allow is not None:
+            _allow_set = set(allow)
+            if len(_allow_set) > 0 and b not in _allow_set:
+                return
+    except Exception:
+        pass
+
+    r = str(reason or "").strip()
+    if not r:
+        r = "unknown_reject"
+
+    key = f"{b}:{r}"
+    ctx[key] = int(ctx.get(key, 0)) + 1
+
+    try:
+        per = ctx.get("__per__")
+        if not isinstance(per, dict):
+            per = {}
+            ctx["__per__"] = per
+        per_item = per.get(b) or {}
+        n = int(per_item.get("n") or 0) + 1
+        per[b] = {"reason": r, "n": n}
+    except Exception:
+        pass
+    return
+
+
+
+def _note_status(status: str, base: str, mv: "MarketVol", extra: str = "") -> None:
+    """Record non-reject per-symbol status for diagnostics (/why).
+
+    This uses the same reject context plumbing as _rej(), but does NOT increment aggregate reject counters.
+    It only sets ctx["__per__"][BASE] so we don't show '(not evaluated / no decision)' for symbols that actually
+    passed gates or produced a setup.
+    """
+    ctx = _REJECT_CTX.get()
+    if not isinstance(ctx, dict):
+        global _GLOBAL_REJECT_CTX
+        if isinstance(_GLOBAL_REJECT_CTX, dict):
+            ctx = _GLOBAL_REJECT_CTX
+        else:
+            return
+    b = str(base or "").upper().strip()
+    if not b:
+        return
+    allow = ctx.get("__allow__")
+    try:
+        if allow is not None:
+            _allow_set = set(allow)
+            if len(_allow_set) > 0 and b not in _allow_set:
+                return
+    except Exception:
+        pass
+    st = str(status or "").strip() or "status"
+    try:
+        per = ctx.get("__per__")
+        if not isinstance(per, dict):
+            per = {}
+            ctx["__per__"] = per
+        per_item = per.get(b) or {}
+        n = int(per_item.get("n") or 0) + 1
+        # keep 'reason' key for backward compatibility in /why renderer
+        per[b] = {"reason": st, "n": n}
+    except Exception:
+        pass
+    return
+
+def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
+    """Explain why setups were rejected in the last meaningful scan for this user.
+
+    Preference order:
+    - last manual /screen scan (what the user most likely wants from /why)
+    - otherwise the latest recorded scan (for example email/background)
+    """
+    raw = _LAST_REJECTS.get(int(uid)) or {}
+    rec = raw
+    if isinstance(raw, dict) and any(k in raw for k in ("screen", "email", "latest")):
+        rec = raw.get("screen") or raw.get("latest") or raw.get("email") or {}
+
+    counts = rec.get("counts") or {}
+    allow = rec.get("allow") or []
+    per_sym = rec.get("per_symbol") or {}  # base -> {"reason": str, "n": int}
+
+    if not allow and not counts and not per_sym:
+        return "No reject stats recorded yet. Run /screen once."
+
+    allow_set = [str(x).upper() for x in (allow or []) if str(x).strip()]
+    allow_set_unique = []
+    seen = set()
+    for b in allow_set:
+        if b not in seen:
+            seen.add(b)
+            allow_set_unique.append(b)
+
+    # Filter counts to allow-set if we have it (keeps /why focused).
+    filtered_counts = {}
+    if allow_set_unique:
+        allow_s = set(allow_set_unique)
+        for k, v in (counts or {}).items():
+            base = str(k).split(":", 1)[0].upper().strip()
+            if base in allow_s:
+                filtered_counts[k] = v
+    else:
+        filtered_counts = dict(counts or {})
+
+    # Aggregate top reject keys
+    items = sorted(filtered_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:int(top_n)]
+
+    # Per-symbol summary (show all if small; otherwise truncate)
+    per_lines = []
+    allow_s = set(allow_set_unique) if allow_set_unique else None
+    if allow_set_unique:
+        bases = allow_set_unique
+    else:
+        # fallback: infer bases from counts
+        bases = sorted(list({str(k).split(":", 1)[0].upper().strip() for k in (filtered_counts or {}).keys()}))
+
+    for b in bases:
+        info = per_sym.get(b) or per_sym.get(b.upper()) or None
+        if info and isinstance(info, dict):
+            r = str(info.get("reason") or "").strip()
+            n = int(info.get("n") or 0)
+            if r:
+                per_lines.append(f"• {b}: {r} ({n})")
+                continue
+        # No recorded reject for this symbol in the last scan
+        per_lines.append(f"• {b}: (not evaluated / no decision)")
+
+    # If the universe is large, keep per-symbol section readable
+    max_per = 20
+    per_tail = ""
+    if len(per_lines) > max_per:
+        per_tail = f"… (+{len(per_lines) - max_per} more)"
+        per_lines = per_lines[:max_per]
+
+    lines = []
+
+    def _fmt_num(val, fmt_spec=".2f", default="—"):
+        """Safe numeric formatter for reports (handles None/NaN/inf)."""
+        try:
+            if val is None:
+                return default
+            f = float(val)
+            if math.isnan(f):
+                return default
+            if math.isinf(f):
+                return "∞" if f > 0 else "-∞"
+            return format(f, fmt_spec)
+        except Exception:
+            return default
+    lines.append("🧩 Last Scan Reject Reasons")
+    if allow_set_unique:
+        lines.append(f"Universe (leaders/losers/market leaders): {len(allow_set_unique)} symbols")
+        lines.append("Symbols: " + ", ".join(allow_set_unique[:30]) + ("…" if len(allow_set_unique) > 30 else ""))
+    lines.append(f"Recorded reject keys: {len(filtered_counts)}")
+    if items:
+        lines.append("")
+        lines.append("Top reasons (aggregate):")
+        for k, v in items:
+            lines.append(f"• {k} = {v}")
+    lines.append("")
+    lines.append("Per-symbol (last known):")
+    lines.extend(per_lines)
+    if per_tail:
+        lines.append(per_tail)
+    return "\n".join(lines)
+
+
+
+# =========================================================
+# DB
+# =========================================================
+def db_connect() -> sqlite3.Connection:
+    # ensure directory exists
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+
+    # safer sqlite on hosted envs
+    try:
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=NORMAL;")
+        con.execute("PRAGMA busy_timeout=5000;")
+        con.execute("PRAGMA foreign_keys=ON;")
+    except Exception:
+        pass
+
+    return con
+
+
+
+
+
+def _migrate_generated_setups():
+    """Ensure generated_setups table exists (used by /screen, email, and autotrade)."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS generated_setups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                source TEXT NOT NULL,          -- 'screen' | 'email'
+                created_ts REAL NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                setup_id TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                conf INTEGER DEFAULT 0
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_generated_setups_uid_ts ON generated_setups(user_id, created_ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_generated_setups_setupid ON generated_setups(setup_id)")
+        con.commit()
+        con.close()
+    except Exception as e:
+        try:
+            logger.error(f"_migrate_generated_setups failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+
+def get_best_open_setup_for_autotrade(user_id):
+    """
+    Pick the best *still-open* setup for autotrade from generated_setups.
+    NOTE: generated_setups does NOT store outcome. Outcome is tracked in signal_outcomes.
+    We treat missing outcome as OPEN.
+    """
+    try:
+        con = db_connect()
+        cur = con.cursor()
+
+        cutoff = time.time() - 6 * 3600  # last 6 hours (safer across sessions)
+
+        cur.execute("""
+            SELECT gs.id, gs.setup_id, gs.symbol, gs.side, gs.conf,
+                   COALESCE(so.outcome, 'OPEN') AS outcome
+            FROM generated_setups gs
+            LEFT JOIN signal_outcomes so
+                   ON so.setup_id = gs.setup_id
+            WHERE gs.user_id = ?
+              AND gs.created_ts >= ?
+              AND gs.source IN ('email','screen')
+              AND COALESCE(so.outcome, 'OPEN') = 'OPEN'
+            ORDER BY gs.conf DESC, gs.created_ts DESC
+            LIMIT 1
+        """, (int(user_id), float(cutoff)))
+
+        row = cur.fetchone()
+        con.close()
+        return row
+    except Exception as e:
+        try:
+            logger.error(f"Autotrade selector error: {e}")
+        except Exception:
+            pass
+        return None
+
+def db_backup_file() -> Tuple[bool, str]:
+    """
+    Copies DB_PATH -> DB_BACKUP_PATH
+    """
+    try:
+        # Ensure folder exists
+        os.makedirs(os.path.dirname(DB_BACKUP_PATH) or ".", exist_ok=True)
+
+        if not os.path.exists(DB_PATH):
+            return False, f"DB file not found: {DB_PATH}"
+
+        # Copy bytes
+        with open(DB_PATH, "rb") as src, open(DB_BACKUP_PATH, "wb") as dst:
+            dst.write(src.read())
+
+        return True, f"Backup created: {DB_BACKUP_PATH}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def db_restore_file() -> Tuple[bool, str]:
+    """
+    Copies DB_BACKUP_PATH -> DB_PATH
+    """
+    try:
+        if not os.path.exists(DB_BACKUP_PATH):
+            return False, f"No backup found: {DB_BACKUP_PATH}"
+
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+
+        with open(DB_BACKUP_PATH, "rb") as src, open(DB_PATH, "wb") as dst:
+            dst.write(src.read())
+
+        return True, f"Restored from backup: {DB_BACKUP_PATH}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def db_wipe_all_data_keep_schema() -> None:
+    """
+    Deletes ALL rows from core tables, keeps schema.
+    Also resets in-memory trackers.
+    """
+    con = db_connect()
+    cur = con.cursor()
+
+    # Order matters if FK ever added later. We currently don’t have FK refs, but still safe.
+    tables = [
+        "trades",
+        "signals",
+        "emailed_symbols",
+        "email_state",
+        "email_daily",
+        "risk_daily",
+        "setup_counter",
+        # users is kept (preferences) OR can be wiped too. You requested "clean database":
+        # wiping users means everyone will be re-created on next /start.
+        "users",
+    ]
+
+    for t in tables:
+        try:
+            cur.execute(f"DELETE FROM {t}")
+        except Exception:
+            pass
+
+    con.commit()
+    con.close()
+    try:
+        _autotrade_db_init()
+    except Exception:
+        pass
+
+    # Also clear runtime trackers
+    _LAST_SMTP_ERROR.clear()
+    _USER_DIAG_MODE.clear()
+    _LAST_EMAIL_DECISION.clear()
+
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /reset
+    Admin-only:
+    1) Backup DB file
+    2) Wipe tables (clean DB)
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    async with DB_FILE_LOCK:
+        ok, msg = db_backup_file()
+        if not ok:
+            await update.message.reply_text(f"❌ Backup failed.\n{msg}")
+            return
+
+        try:
+            db_wipe_all_data_keep_schema()
+        except Exception as e:
+            await update.message.reply_text(f"❌ Reset failed.\n{type(e).__name__}: {e}")
+            return
+
+    await update.message.reply_text(
+        "✅ Database RESET completed.\n"
+        f"{msg}\n\n"
+        "Use /restore to revert to the backup."
+    )
+
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /restore
+    Admin-only:
+    Restores DB from DB_BACKUP_PATH
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    async with DB_FILE_LOCK:
+        ok, msg = db_restore_file()
+        if not ok:
+            await update.message.reply_text(f"❌ Restore failed.\n{msg}")
+            return
+
+        # After restore, ensure schema migrations still applied
+        try:
+            db_init()
+        except Exception:
+            pass
+
+    await update.message.reply_text(f"✅ Database RESTORED.\n{msg}")
+
+def db_init():
+    # ensures folder exists before creating DB file
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+        
+    con = db_connect()
+    cur = con.cursor()
+
+    # =========================================================
+    # ✅ Users table (core) — created if missing (fresh installs)
+    # =========================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        tz TEXT DEFAULT 'UTC',
+        scan_profile TEXT DEFAULT 'default',
+        equity REAL DEFAULT 1000.0,
+        risk_mode TEXT DEFAULT 'percent',
+        risk_value REAL DEFAULT 1.0,
+        daily_cap_mode TEXT DEFAULT 'percent',
+        daily_cap_value REAL DEFAULT 3.0,
+        max_trades_day INTEGER DEFAULT 3,
+        notify_on INTEGER DEFAULT 0,
+
+        sessions_enabled TEXT DEFAULT '',
+        max_emails_per_session INTEGER DEFAULT 5,
+        email_gap_min INTEGER DEFAULT 30,
+        max_emails_per_day INTEGER DEFAULT 10,
+
+        day_trade_date TEXT DEFAULT '',
+        day_trade_count INTEGER DEFAULT 0,
+
+        -- Email columns
+        email_to TEXT,
+        email_alerts_enabled INTEGER DEFAULT 1,
+
+        -- Billing / access columns (backward compatible)
+        plan TEXT DEFAULT 'free',
+        trial_start_ts REAL DEFAULT 0,
+        trial_until REAL DEFAULT 0,
+        plan_expires REAL DEFAULT 0,
+        access_source TEXT,
+        access_ref TEXT,
+        access_updated_ts REAL DEFAULT 0
+    )
+    """)
+
+    # =========================================================
+    # ✅ Cooldown table (v2): direction-aware + optional session stamp
+    # - old: PRIMARY KEY(user_id, symbol)
+    # - new: PRIMARY KEY(user_id, symbol, side)
+    # =========================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS emailed_symbols (
+        user_id INTEGER NOT NULL,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        session TEXT NOT NULL DEFAULT '',
+        emailed_ts REAL NOT NULL,
+        PRIMARY KEY (user_id, symbol, side)
+    )
+    """)
+
+    # --- Migration from old schema (if needed) ---
+    # If table exists but missing "side", then it's old schema.
+    try:
+        cur.execute("PRAGMA table_info(emailed_symbols)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "side" not in cols:
+            # Create new table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS emailed_symbols_v2 (
+                    user_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    session TEXT NOT NULL DEFAULT '',
+                    emailed_ts REAL NOT NULL,
+                    PRIMARY KEY (user_id, symbol, side)
+                )
+            """)
+
+            # Copy old rows -> assume side=ANY (we duplicate into BUY and SELL to be safe)
+            cur.execute("SELECT user_id, symbol, emailed_ts FROM emailed_symbols")
+            old_rows = cur.fetchall() or []
+            for r in old_rows:
+                uid0 = int(r[0])
+                sym0 = str(r[1]).upper()
+                ts0 = float(r[2])
+                # Duplicate into BUY and SELL so cooldown still applies in both directions initially.
+                cur.execute("""
+                    INSERT OR REPLACE INTO emailed_symbols_v2 (user_id, symbol, side, session, emailed_ts)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (uid0, sym0, "BUY", "", ts0))
+                cur.execute("""
+                    INSERT OR REPLACE INTO emailed_symbols_v2 (user_id, symbol, side, session, emailed_ts)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (uid0, sym0, "SELL", "", ts0))
+
+            # Swap tables
+            cur.execute("DROP TABLE emailed_symbols")
+            cur.execute("ALTER TABLE emailed_symbols_v2 RENAME TO emailed_symbols")
+            con.commit()
+    except Exception:
+        # Don't block startup if migration fails; worst case cooldown table resets.
+        pass
+
+    cur.execute("PRAGMA table_info(users)")
+    cols = {r[1] for r in cur.fetchall()}
+    
+    # Trade window columns (local time HH:MM), empty = disabled
+    if "trade_window_start" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN trade_window_start TEXT NOT NULL DEFAULT ''")
+    if "trade_window_end" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN trade_window_end TEXT NOT NULL DEFAULT ''")
+    if "day_reset_hhmm" not in cols:
+        cur.execute(f"ALTER TABLE users ADD COLUMN day_reset_hhmm TEXT NOT NULL DEFAULT '{DEFAULT_USER_DAY_RESET_HHMM}'")
+
+    # Scan profile (standard/aggressive)
+    if "scan_profile" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN scan_profile TEXT NOT NULL DEFAULT 'standard'")
+# Daily email cap
+    if "max_emails_per_day" not in cols:
+        cur.execute(
+            f"ALTER TABLE users ADD COLUMN max_emails_per_day INTEGER NOT NULL DEFAULT {int(DEFAULT_MAX_EMAILS_PER_DAY)}"
+        )
+    
+    # NEW: Unlimited session emailing (24h)
+    if "sessions_unlimited" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN sessions_unlimited INTEGER NOT NULL DEFAULT 0")
+    
+    # NEW: Big-move alert emails (even if not a valid setup)
+    if "bigmove_alert_on" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_on INTEGER NOT NULL DEFAULT 1")
+    
+    # Aligned defaults (per your request): 24H >= 40 OR 4H >= 15
+    # Aligned defaults: 4H >= 20 OR 1H >= 10
+    if "bigmove_alert_4h" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_4h REAL NOT NULL DEFAULT 20")
+    if "bigmove_alert_1h" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_1h REAL NOT NULL DEFAULT 10")
+
+    # NEW: Spike Reversal Alerts
+    if "spike_alert_on" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN spike_alert_on INTEGER NOT NULL DEFAULT 1")
+
+    # default volume gate: 15M
+    if "spike_min_vol_usd" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN spike_min_vol_usd REAL NOT NULL DEFAULT 10000000")
+
+    # wick ratio threshold (0.55 means wick is 55%+ of candle range)
+    if "spike_wick_ratio" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN spike_wick_ratio REAL NOT NULL DEFAULT 0.45")
+
+    # spike size must be >= ATR * this multiplier
+    if "spike_atr_mult" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN spike_atr_mult REAL NOT NULL DEFAULT 1.00")
+
+    # NEW: Early Warning (Possible Reversal Zones) email alerts
+    # Default OFF to avoid inbox noise; users can enable explicitly.
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        public_id INTEGER,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        entry REAL NOT NULL,
+        sl REAL NOT NULL,
+        risk_usd REAL NOT NULL,
+        qty REAL NOT NULL,
+        opened_ts REAL NOT NULL,
+        closed_ts REAL,
+        pnl REAL,
+        r_mult REAL,
+        note TEXT,
+        signal_id TEXT
+    )
+    """)
+
+    
+    # ---------------------------------------------------------
+    # Public per-user Trade IDs (start at 1, resettable)
+    # ---------------------------------------------------------
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trade_id_seq (
+        user_id INTEGER PRIMARY KEY,
+        last_id INTEGER NOT NULL
+    )
+    """)
+    # Add public_id column if DB existed already
+    try:
+        cols_trades = [r[1] for r in cur.execute("PRAGMA table_info(trades)").fetchall()]
+        if "public_id" not in cols_trades:
+            cur.execute("ALTER TABLE trades ADD COLUMN public_id INTEGER")
+            cols_trades.append("public_id")
+    except Exception:
+        pass
+
+    # Backfill missing public_id for existing trades (per user, ordered by opened_ts)
+    try:
+        uids = [r[0] for r in cur.execute("SELECT DISTINCT user_id FROM trades").fetchall()]
+        for _uid in uids:
+            rows = cur.execute(
+                "SELECT id FROM trades WHERE user_id=? AND (public_id IS NULL OR public_id='') ORDER BY opened_ts ASC, id ASC",
+                (int(_uid),),
+            ).fetchall()
+            if rows:
+                rmax = cur.execute("SELECT MAX(public_id) FROM trades WHERE user_id=?", (int(_uid),)).fetchone()
+                start = int(rmax[0]) if rmax and rmax[0] is not None else 0
+                n = start
+                for (rid,) in rows:
+                    n += 1
+                    cur.execute("UPDATE trades SET public_id=? WHERE id=? AND user_id=?", (int(n), int(rid), int(_uid)))
+
+            rmax2 = cur.execute("SELECT MAX(public_id) FROM trades WHERE user_id=?", (int(_uid),)).fetchone()
+            last = int(rmax2[0]) if rmax2 and rmax2[0] is not None else 0
+            cur.execute("INSERT OR REPLACE INTO trade_id_seq(user_id,last_id) VALUES(?,?)", (int(_uid), int(last)))
+    except Exception:
+        pass
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS signals (
+        setup_id TEXT PRIMARY KEY,
+        created_ts REAL NOT NULL,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        conf INTEGER NOT NULL,
+        entry REAL NOT NULL,
+        sl REAL NOT NULL,
+        tp1 REAL,
+        tp2 REAL,
+        tp3 REAL NOT NULL,
+        fut_vol_usd REAL NOT NULL,
+        ch24 REAL NOT NULL,
+        ch4 REAL NOT NULL,
+        ch1 REAL NOT NULL,
+        ch15 REAL NOT NULL
+    )
+    """)
+
+    # =========================================================
+    # ✅ Signal evaluation tables (emailed setups + outcomes)
+    # =========================================================
+
+    # Ensure signals table has market_symbol (migration-safe)
+    try:
+        cur.execute("PRAGMA table_info(signals)")
+        s_cols = {r[1] for r in cur.fetchall()}
+        if "market_symbol" not in s_cols:
+            cur.execute("ALTER TABLE signals ADD COLUMN market_symbol TEXT")
+    except Exception:
+        pass
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS emailed_setups (
+        user_id INTEGER NOT NULL,
+        setup_id TEXT NOT NULL,
+        session TEXT NOT NULL DEFAULT '',
+        emailed_ts REAL NOT NULL,
+        PRIMARY KEY (user_id, setup_id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS executable_setups (
+        user_id INTEGER NOT NULL,
+        setup_id TEXT NOT NULL,
+        session TEXT NOT NULL DEFAULT '',
+        executable_ts REAL NOT NULL,
+        PRIMARY KEY (user_id, setup_id)
+    )
+    """)
+
+    # =========================================================
+    # ✅ Generated setups log (screen vs email correlation)
+    # =========================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS generated_setups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        source TEXT NOT NULL,          -- 'screen' | 'email'
+        created_ts REAL NOT NULL,
+        session TEXT NOT NULL DEFAULT '',
+        setup_id TEXT NOT NULL DEFAULT '',
+        symbol TEXT NOT NULL DEFAULT '',
+        side TEXT NOT NULL DEFAULT '',
+        conf INTEGER DEFAULT 0
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS signal_outcomes (
+        setup_id TEXT PRIMARY KEY,
+        outcome TEXT NOT NULL,              -- WIN_TP1 | WIN_TP2 | WIN_TP3 | LOSS | OPEN | AMBIGUOUS
+        hit_level TEXT,                     -- TP1 | TP2 | TP3 | SL | NONE
+        hit_ts REAL,                        -- UTC epoch seconds of first touch (best effort)
+        evaluated_ts REAL NOT NULL,          -- UTC epoch seconds
+        horizon_hours INTEGER NOT NULL DEFAULT 24,
+        note TEXT
+    )
+    """)
+
+    # Add new columns for best TP tracking (backward-compatible)
+    try:
+        cols = [r["name"] for r in cur.execute("PRAGMA table_info(signal_outcomes)").fetchall()]
+        if "best_level" not in cols:
+            cur.execute("ALTER TABLE signal_outcomes ADD COLUMN best_level TEXT")
+        if "best_ts" not in cols:
+            cur.execute("ALTER TABLE signal_outcomes ADD COLUMN best_ts REAL")
+    except Exception:
+        pass
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS email_state (
+        user_id INTEGER PRIMARY KEY,
+        session_key TEXT NOT NULL,
+        sent_count INTEGER NOT NULL,
+        last_email_ts REAL NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS email_daily (
+        user_id INTEGER NOT NULL,
+        day_local TEXT NOT NULL,
+        sent_count INTEGER NOT NULL,
+        PRIMARY KEY (user_id, day_local)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS risk_daily (
+        user_id INTEGER NOT NULL,
+        day_local TEXT NOT NULL,
+        used_risk_usd REAL NOT NULL,
+        PRIMARY KEY (user_id, day_local)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS setup_counter (
+        day_yyyymmdd TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL
+    )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS emailed_bigmoves (
+            user_id     INTEGER NOT NULL,
+            symbol      TEXT    NOT NULL,
+            direction   TEXT    NOT NULL,   -- "UP" or "DOWN"
+            emailed_ts  REAL    NOT NULL,
+            PRIMARY KEY (user_id, symbol, direction)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS emailed_spikes (
+            user_id     INTEGER NOT NULL,
+            symbol      TEXT    NOT NULL,
+            direction   TEXT    NOT NULL,   -- "UP" or "DOWN"
+            emailed_ts  REAL    NOT NULL,
+            PRIMARY KEY (user_id, symbol, direction)
+        )
+    """)
+
+
+    
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS emailed_earlywarnings (
+            user_id     INTEGER NOT NULL,
+            symbol      TEXT    NOT NULL,
+            side        TEXT    NOT NULL,   -- "BUY" or "SELL"
+            emailed_ts  REAL    NOT NULL,
+            PRIMARY KEY (user_id, symbol, side)
+        )
+    """
+    )
+
+    # =========================================================
+    # USDT payments + unified access/payments ledger
+    # =========================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS usdt_payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER NOT NULL,
+        username TEXT,
+        txid TEXT UNIQUE NOT NULL,
+        plan TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PENDING',   -- PENDING / APPROVED / REJECTED
+        created_ts REAL NOT NULL,
+        decided_ts REAL,
+        decided_by INTEGER,
+        note TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS payments_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        source TEXT NOT NULL,         -- 'stripe' | 'usdt' | 'manual'
+        ref TEXT NOT NULL,            -- stripe invoice/sub id OR txid OR manual note
+        plan TEXT NOT NULL,           -- free | standard | pro
+        amount REAL NOT NULL DEFAULT 0,
+        currency TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,         -- paid | refunded | void | pending
+        created_ts REAL NOT NULL
+    )
+    """)
+
+    # =========================================================
+    # Optional: add access tracking columns to users table
+    # =========================================================
+    try:
+        cur.execute("PRAGMA table_info(users)")
+        user_cols = {r[1] for r in cur.fetchall()}
+
+        if "access_source" not in user_cols:
+            cur.execute(
+                "ALTER TABLE users ADD COLUMN access_source TEXT NOT NULL DEFAULT ''"
+            )
+
+        if "access_ref" not in user_cols:
+            cur.execute(
+                "ALTER TABLE users ADD COLUMN access_ref TEXT NOT NULL DEFAULT ''"
+            )
+
+        if "access_updated_ts" not in user_cols:
+            cur.execute(
+                "ALTER TABLE users ADD COLUMN access_updated_ts REAL NOT NULL DEFAULT 0"
+            )
+
+    except Exception:
+        # Do not block startup if ALTER TABLE fails
+        pass
+   
+    con.commit()
+    con.close()
+
+def _default_sessions_for_tz(tz_name: str) -> List[str]:
+    s = tz_name.lower()
+    if "america" in s or s.startswith("us/") or "new_york" in s:
+        return ["NY"]
+    if "europe" in s or "london" in s or "africa" in s:
+        return ["LON"]
+    return ["ASIA"]
+
+def _order_sessions(xs: List[str]) -> List[str]:
+    cleaned = []
+    for x in xs:
+        x = str(x).strip().upper()
+        if x in SESSIONS_UTC and x not in cleaned:
+            cleaned.append(x)
+    return [s for s in SESSION_PRIORITY if s in cleaned]
+
+def get_user(user_id: int) -> dict:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+
+    if not row:
+        tz_name = os.environ.get("DEFAULT_USER_TZ", "UTC")
+        sessions = ['NY']
+        now_local = datetime.now(ZoneInfo(tz_name)).date().isoformat()
+        cur.execute("""
+            INSERT INTO users (
+                user_id, tz, scan_profile, equity, risk_mode, risk_value,
+                daily_cap_mode, daily_cap_value,
+                max_trades_day, notify_on,
+                sessions_enabled, max_emails_per_session, email_gap_min,
+                max_emails_per_day, day_reset_hhmm,
+                day_trade_date, day_trade_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            tz_name,
+            str(DEFAULT_SCAN_PROFILE),
+            float(DEFAULT_EQUITY),
+            DEFAULT_RISK_MODE,
+            float(DEFAULT_RISK_VALUE),
+            DEFAULT_DAILY_CAP_MODE,
+            float(DEFAULT_DAILY_CAP_VALUE),
+            int(DEFAULT_MAX_TRADES_DAY),
+            
+            # ✅ FIX: default notify_on should NOT depend on EMAIL_ENABLED
+            1,
+            
+            json.dumps(sessions),
+            int(DEFAULT_MAX_EMAILS_PER_SESSION),
+            int(DEFAULT_MIN_EMAIL_GAP_MIN),
+            int(DEFAULT_MAX_EMAILS_PER_DAY),
+            str(DEFAULT_USER_DAY_RESET_HHMM),
+            now_local,
+            0
+        ))
+        con.commit()
+        cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+
+    con.close()
+    return dict(row)
+
+# =========================================================
+# ACCESS CONTROL (FREE TRIAL + PAYWALL)
+# =========================================================
+def trial_expired_legacy(user: dict) -> bool:
+    try:
+        created = datetime.fromisoformat(user["created_at"])
+    except Exception:
+        return True
+    return datetime.utcnow() > created + timedelta(days=FREE_TRIAL_DAYS)
+
+
+def has_active_access_legacy(user: dict) -> bool:
+    if user.get("plan") in ("standard", "pro"):
+        return True
+    if user.get("plan") == "free" and not trial_expired(user):
+        return True
+    return False
+
+
+def enforce_access_or_block(update: Update, command: str) -> bool:
+    uid = update.effective_user.id
+    if is_admin_user(uid):
+        return True
+
+    user = get_user(uid)
+
+    if has_active_access(uid, user):
+        return True
+
+    if command in ALLOWED_WHEN_LOCKED:
+        return True
+
+    update.message.reply_text(
+        "⛔ Access locked.\n\n"
+        "Your 7-day free trial has ended.\n\n"
+        "Plans:\n"
+        "• Standard — $50/month\n"
+        "• Pro — $99/month\n\n"
+        "👉 /billing"
+    )
+    return False
+
+def update_user(user_id: int, **kwargs):
+    if not kwargs:
+        return
+    con = db_connect()
+    cur = con.cursor()
+    sets = ", ".join([f"{k}=?" for k in kwargs.keys()])
+    vals = list(kwargs.values()) + [user_id]
+    cur.execute(f"UPDATE users SET {sets} WHERE user_id=?", vals)
+    con.commit()
+    con.close()
+
+def set_user_email(uid: int, email: str) -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        # ensure row exists
+        cur.execute(
+            "INSERT OR IGNORE INTO users(user_id) VALUES(?)",
+            (uid,)
+        )
+        cur.execute(
+            "UPDATE users SET email_to = ? WHERE user_id = ?",
+            (email, uid)
+        )
+        con.commit()
+
+def ensure_email_column():
+    """Backward-compatible email + access columns migration.
+
+    Also ensures billing/access columns exist (plan/trial/etc), because many commands
+    (e.g. /status, /screen gating) depend on them.
+    """
+    # Ensure billing/access columns exist first
+    ensure_billing_columns()
+
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+
+        # email address
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN email_to TEXT")
+            con.commit()
+            logger.info("Added email_to column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        # per-user email preferences
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN email_enabled INTEGER DEFAULT 1")
+            con.commit()
+            logger.info("Added email_enabled column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN notify_on INTEGER DEFAULT 1")
+            con.commit()
+            logger.info("Added notify_on column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert INTEGER DEFAULT 1")
+            con.commit()
+            logger.info("Added bigmove_alert column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN bigmove_min_usd REAL DEFAULT 5000000")
+            con.commit()
+            logger.info("Added bigmove_min_usd column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN sessions_unlimited INTEGER DEFAULT 0")
+            con.commit()
+            logger.info("Added sessions_unlimited column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+def ensure_billing_columns():
+    """Ensure billing / plan / trial columns exist on users table (backward compatible migrations)."""
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+
+        # Plan / trial columns
+        for ddl, label in [
+            ("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'", "plan"),
+            ("ALTER TABLE users ADD COLUMN trial_start_ts REAL DEFAULT 0", "trial_start_ts"),
+            ("ALTER TABLE users ADD COLUMN trial_until REAL DEFAULT 0", "trial_until"),
+            ("ALTER TABLE users ADD COLUMN plan_expires REAL DEFAULT 0", "plan_expires"),
+            ("ALTER TABLE users ADD COLUMN access_source TEXT", "access_source"),
+            ("ALTER TABLE users ADD COLUMN access_ref TEXT", "access_ref"),
+            ("ALTER TABLE users ADD COLUMN access_updated_ts REAL DEFAULT 0", "access_updated_ts"),
+        ]:
+            try:
+                cur.execute(ddl)
+                con.commit()
+                logger.info("Added %s column to users table", label)
+            except sqlite3.OperationalError:
+                # column already exists (or older sqlite limitation)
+                pass
+
+
+def reset_daily_if_needed(user: dict) -> dict:
+    user = dict(user or {})
+    uid = int(user.get("user_id") or 0)
+    if uid <= 0:
+        return user
+
+    start_local, _, _ = _user_today_window(user)
+    today_key = start_local.date().isoformat()
+
+    if str(user.get("day_trade_date") or "") != today_key:
+        update_user(uid, day_trade_date=today_key, day_trade_count=0)
+        user = get_user(uid)
+
+    return user
+
+
+def list_users_notify_on() -> List[dict]:
+    """Users who should receive *scan* emails.
+
+    Key points (matches the behavior of the 14–15 Feb working builds):
+    - Primary rule: notify_on=1 AND has a saved email address.
+    - Admins are ALWAYS included if they have an email saved, even if notify_on=0.
+      (This uses is_admin_user(), not ADMIN_USER_IDS, so it works with env single-admin setups.)
+    """
+    con = db_connect()
+    try:
+        import sqlite3
+        con.row_factory = sqlite3.Row
+    except Exception:
+        pass
+
+    cur = con.cursor()
+
+    # Detect whether DB uses users.email or only users.email_to (older schemas)
+    cols = set()
+    try:
+        cur.execute("PRAGMA table_info(users)")
+        cols = {str(r[1]) for r in cur.fetchall()}
+    except Exception:
+        cols = set()
+
+    email_fields = []
+    if "email" in cols:
+        email_fields.append("email")
+    if "email_to" in cols:
+        email_fields.append("email_to")
+
+    # If we can't detect, fall back to both names in the WHERE (SQLite will error),
+    # so only use a safe default.
+    if not email_fields:
+        email_fields = ["email_to"]
+
+    email_ok_where = " OR ".join([f"({c} IS NOT NULL AND TRIM({c})!='')" for c in email_fields])
+
+    # 1) notify_on users
+    try:
+        cur.execute(f"SELECT * FROM users WHERE notify_on=1 AND ({email_ok_where})")
+        rows = [dict(r) for r in cur.fetchall()]
+    except Exception:
+        # fallback: just notify_on=1
+        cur.execute("SELECT * FROM users WHERE notify_on=1")
+        rows = [dict(r) for r in cur.fetchall()]
+
+    # 2) admins with an email saved (even if notify_on=0)
+    try:
+        cur.execute(f"SELECT * FROM users WHERE ({email_ok_where})")
+        for r in cur.fetchall():
+            d = dict(r)
+            try:
+                uid = int(d.get("user_id") or 0)
+            except Exception:
+                uid = 0
+            if uid and is_admin_user(uid):
+                if not any(int(x.get("user_id") or 0) == uid for x in rows):
+                    rows.append(d)
+    except Exception:
+        pass
+
+    return rows
+
+
+def list_users_with_email() -> List[dict]:
+    """
+    Users eligible for email sends (have a saved recipient email).
+    This is used for Big-Move Alerts so it works even if notify_on=0.
+
+    IMPORTANT:
+    Some DB versions don't have users.email (only users.email_to).
+    This function auto-detects columns and builds a safe query.
+    """
+    con = db_connect()
+    try:
+        # Ensure rows are dict-convertible
+        try:
+            import sqlite3
+            con.row_factory = sqlite3.Row
+        except Exception:
+            pass
+
+        cur = con.cursor()
+
+        # Detect available columns in users table
+        try:
+            cur.execute("PRAGMA table_info(users)")
+            cols = {str(r[1]).lower() for r in cur.fetchall()}  # r[1] is column name
+        except Exception:
+            cols = set()
+
+        has_email_to = ("email_to" in cols)
+        has_email = ("email" in cols)
+        has_email_enabled = ("email_alerts_enabled" in cols)
+
+        # Build safe WHERE clause
+        where_parts = []
+        if has_email_to:
+            where_parts.append("(email_to IS NOT NULL AND TRIM(email_to) != '')")
+        if has_email:
+            where_parts.append("(email IS NOT NULL AND TRIM(email) != '')")
+
+        # If neither column exists, no one is eligible
+        if not where_parts:
+            return []
+
+        where_sql = " OR ".join(where_parts)
+        if has_email_enabled:
+            where_sql = f"({where_sql}) AND (COALESCE(email_alerts_enabled, 1) = 1)"
+
+        cur.execute(f"""
+            SELECT *
+            FROM users
+            WHERE {where_sql}
+        """)
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+    
+def email_state_get(user_id: int) -> dict:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM email_state WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO email_state (user_id, session_key, sent_count, last_email_ts) VALUES (?, ?, ?, ?)",
+                    (user_id, "NONE", 0, 0.0))
+        con.commit()
+        cur.execute("SELECT * FROM email_state WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+    con.close()
+    return dict(row)
+
+def email_state_set(user_id: int, **kwargs):
+    if not kwargs:
+        return
+    con = db_connect()
+    cur = con.cursor()
+    sets = ", ".join([f"{k}=?" for k in kwargs.keys()])
+    vals = list(kwargs.values()) + [user_id]
+    cur.execute(f"UPDATE email_state SET {sets} WHERE user_id=?", vals)
+    con.commit()
+    con.close()
+
+def mark_symbol_emailed(user_id: int, symbol: str, side: str, session_name: str = ""):
+    """
+    ✅ Direction-aware cooldown: stored per (symbol, side)
+    Optionally stores session name (NY/LON/ASIA) for audit.
+    """
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO emailed_symbols (user_id, symbol, side, session, emailed_ts)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, symbol, side) DO UPDATE SET
+            session=excluded.session,
+            emailed_ts=excluded.emailed_ts
+    """, (int(user_id), str(symbol).upper(), str(side).upper(), str(session_name or ""), time.time()))
+    con.commit()
+    con.close()
+
+def symbol_recently_emailed(
+    user_id: int,
+    symbol: str,
+    side: str,
+    session_name: str,
+) -> bool:
+    """
+    ✅ Session-aware + direction-aware cooldown check.
+    Cooldown hours depend on CURRENT session (NY/LON/ASIA).
+    """
+    cooldown_hours = float(cooldown_hours_for_session(session_name))
+
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT emailed_ts
+        FROM emailed_symbols
+        WHERE user_id=? AND symbol=? AND side=?
+    """, (int(user_id), str(symbol).upper(), str(side).upper()))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return False
+
+    last_ts = float(row["emailed_ts"])
+    return (time.time() - last_ts) < (cooldown_hours * 3600.0)
+
+def _safe_float(x, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        s = str(x).strip()
+        if s == "" or s == "-" or s.lower() == "none":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+
+
+BIGMOVE_COOLDOWN_SEC = 60 * 60 * 3  # 3 hours
+
+def bigmove_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT emailed_ts FROM emailed_bigmoves WHERE user_id=? AND symbol=? AND direction=?",
+                (int(uid), str(symbol), str(direction)),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            last_ts = float(row[0] or 0.0)
+            return (time.time() - last_ts) < BIGMOVE_COOLDOWN_SEC
+    except Exception:
+        return False
+
+def mark_bigmove_emailed(uid: int, symbol: str, direction: str) -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO emailed_bigmoves(user_id, symbol, direction, emailed_ts) VALUES(?,?,?,?)",
+                (int(uid), str(symbol), str(direction), time.time()),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+SPIKE_COOLDOWN_SEC = 60 * 60 * 3  # 3 hours
+
+def spike_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT emailed_ts FROM emailed_spikes WHERE user_id=? AND symbol=? AND direction=?",
+                (int(uid), str(symbol), str(direction)),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            last_ts = float(row[0] or 0.0)
+            return (time.time() - last_ts) < SPIKE_COOLDOWN_SEC
+    except Exception:
+        return False
+
+def mark_spike_emailed(uid: int, symbol: str, direction: str) -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO emailed_spikes(user_id, symbol, direction, emailed_ts) VALUES(?,?,?,?)",
+                (int(uid), str(symbol), str(direction), time.time()),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+EARLYWARN_COOLDOWN_SEC = 60 * 60 * 3  # 3 hours
+
+def earlywarn_recently_emailed(uid: int, symbol: str, side: str) -> bool:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT emailed_ts FROM emailed_earlywarnings WHERE user_id=? AND symbol=? AND side=?",
+                (int(uid), str(symbol), str(side).upper()),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            last_ts = float(row[0] or 0.0)
+            return (time.time() - last_ts) < EARLYWARN_COOLDOWN_SEC
+    except Exception:
+        return False
+
+def mark_earlywarn_emailed(uid: int, symbol: str, side: str) -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO emailed_earlywarnings(user_id, symbol, side, emailed_ts) VALUES(?,?,?,?)",
+                (int(uid), str(symbol), str(side).upper(), time.time()),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def _bigmove_candidates(best_fut: dict, p4: float, p1: float, min_vol_usd: float = 0.0, max_items: int = 12) -> list:
+    """
+    Returns list of dicts: {symbol, ch4, ch1, vol, direction, score}
+
+    direction:
+      - "UP"   → strong positive move
+      - "DOWN" → strong negative move
+
+    Triggers:
+      - UP   if ch4 >= +p4 OR ch1 >= +p1
+      - DOWN if ch4 <= -p4 OR ch1 <= -p1
+    """
+
+    def _pick_pct(mv, keys) -> float:
+        for k in keys:
+            try:
+                v = getattr(mv, k, None)
+                if v is None:
+                    continue
+                return float(v or 0.0)
+            except Exception:
+                continue
+        return 0.0
+
+    out = []
+
+    for sym, mv in (best_fut or {}).items():
+        try:
+            # Try multiple possible field names (fixes "different field names" issue)
+            ch4 = _pick_pct(mv, ["ch4", "pct_4h", "change_4h", "chg_4h", "percentage_4h", "p4", "h4"])
+            ch1 = _pick_pct(mv, ["ch1", "pct_1h", "change_1h", "chg_1h", "percentage_1h", "p1", "h1"])
+
+            # ✅ FIX: correct 24H USD volume (MarketVol does NOT have fut_vol_usd)
+            vol = float(usd_notional(mv) or 0.0)
+
+            # If still missing, compute from 1h candles (same logic as compute_metrics-style)
+            if (abs(ch4) < 1e-9 and abs(ch1) < 1e-9) and getattr(mv, "symbol", None):
+                try:
+                    c1 = fetch_ohlcv(mv.symbol, "1h", 6)
+                    if c1 and len(c1) >= 2:
+                        closes_1h = [float(x[4]) for x in c1]
+                        c_last = closes_1h[-1]
+                        c_prev1 = closes_1h[-2]
+                        c_prev4 = closes_1h[-5] if len(closes_1h) >= 5 else closes_1h[0]
+                        ch1 = ((c_last - c_prev1) / c_prev1) * 100.0 if c_prev1 else 0.0
+                        ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
+                except Exception:
+                    pass
+
+        except Exception:
+            continue
+
+        up_hit = (ch4 >= float(p4)) or (ch1 >= float(p1))
+        down_hit = (ch4 <= -float(p4)) or (ch1 <= -float(p1))
+
+        if not (up_hit or down_hit):
+            continue
+
+        # ✅ NEW: volume gate (skip low-volume coins completely)
+        if float(min_vol_usd or 0.0) > 0.0 and vol < float(min_vol_usd):
+            continue
+
+        if down_hit and not up_hit:
+            direction = "DOWN"
+        elif up_hit and not down_hit:
+            direction = "UP"
+        else:
+            direction = "UP" if ch1 >= 0 else "DOWN"
+
+        score_up = max(
+            (abs(ch4) / max(p4, 1e-9)) if ch4 > 0 else 0.0,
+            (abs(ch1) / max(p1, 1e-9)) if ch1 > 0 else 0.0,
+        )
+        score_dn = max(
+            (abs(ch4) / max(p4, 1e-9)) if ch4 < 0 else 0.0,
+            (abs(ch1) / max(p1, 1e-9)) if ch1 < 0 else 0.0,
+        )
+        score = max(score_up, score_dn)
+
+        out.append({
+            "symbol": sym,
+            "ch4": ch4,
+            "ch1": ch1,
+            "vol": vol,
+            "direction": direction,
+            "score": score,
+        })
+
+    out.sort(key=lambda x: (x["score"], x["vol"]), reverse=True)
+    return out[:max_items]
+
+
+def _spike_reversal_candidates(
+    best_fut: Dict[str, Any],
+    min_vol_usd: float = 15_000_000.0,
+    wick_ratio_min: float = 0.55,
+    atr_mult_min: float = 1.20,
+    max_items: int = 10,
+) -> List[dict]:
+    """
+    Detects wick-spike rejection in the direction opposite to the spike, aligned with the bigger trend.
+    Downtrend: upper-wick spike rejection -> SELL
+    Uptrend: lower-wick spike rejection -> BUY
+    """
+    out: List[dict] = []
+    if not best_fut:
+        return out
+
+    for base, mv in (best_fut or {}).items():
+        try:
+            sym_base = str(base).upper()
+            market_symbol = str(getattr(mv, "symbol", "") or "")
+            vol24 = float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+            if vol24 < float(min_vol_usd):
+                continue
+            if not market_symbol:
+                continue
+
+            # 1H candles for spike detection + ATR + trend
+            c1 = fetch_ohlcv(market_symbol, "1h", limit=max(ATR_PERIOD + 10, 220))
+            if not c1 or len(c1) < (ATR_PERIOD + 50):
+                continue
+
+            atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
+            if atr_1h <= 0:
+                continue
+
+            closes_1h = [float(x[4]) for x in c1]
+            ema50 = float(ema(closes_1h[-200:], 50) or 0.0)
+            ema200 = float(ema(closes_1h[-220:], 200) or 0.0)
+            if ema50 <= 0 or ema200 <= 0:
+                continue
+
+            uptrend = (ema50 > ema200)
+            downtrend = (ema50 < ema200)
+            if not (uptrend or downtrend):
+                continue
+
+            # Spike candle = most recent closed 1H candle
+            o = float(c1[-1][1]); h = float(c1[-1][2]); l = float(c1[-1][3]); c = float(c1[-1][4])
+            rng = max(1e-12, h - l)
+
+            upper_wick = h - max(o, c)
+            lower_wick = min(o, c) - l
+            upper_ratio = upper_wick / rng
+            lower_ratio = lower_wick / rng
+
+            big_range = (rng >= (atr_1h * float(atr_mult_min)))
+
+            
+            # 15m confirmation (stronger): last 15m close must confirm rejection
+            # SELL: close below spike mid (and preferably below spike open)
+            # BUY : close above spike mid (and preferably above spike open)
+            c15 = fetch_ohlcv(market_symbol, "15m", limit=60)
+            if not c15 or len(c15) < 12:
+                continue
+            c15_last_close = float(c15[-1][4])
+
+            spike_mid = (h + l) / 2.0
+            sell_confirm = (c15_last_close < spike_mid)
+            buy_confirm  = (c15_last_close > spike_mid)
+
+            # Downtrend: spike UP into resistance -> SELL reversal
+            if downtrend and big_range and upper_ratio >= float(wick_ratio_min) and c < o:
+                weak_confirm = (not sell_confirm)
+                # allow weak confirmations with lower confidence
+
+                entry = float(l)  # break of spike candle low
+                sl = float(h) + (0.10 * atr_1h)
+                r = max(1e-12, sl - entry)
+
+                tp1 = entry - 1.0 * r
+                tp2 = entry - 1.6 * r
+                tp3 = entry - 2.3 * r
+
+                conf = 82
+                if weak_confirm:
+                    conf -= 6
+                if (c - l) / rng < 0.40:
+                    conf += 4
+
+                out.append({
+                    "symbol": sym_base,
+                    "market_symbol": market_symbol,
+                    "side": "SELL",
+                    "direction": "DOWN",
+                    "conf": int(clamp(conf, 1, 99)),
+                    "entry": float(entry),
+                    "sl": float(sl),
+                    "tp1": float(tp1),
+                    "tp2": float(tp2),
+                    "tp3": float(tp3),
+                    "vol": float(vol24),
+                    "why": f"Downtrend (EMA50<EMA200). 1H upper-wick spike rejection (wick={upper_ratio:.2f}, range={rng/atr_1h:.2f} ATR). " + ("15m confirm: WEAK" if weak_confirm else "15m confirm: OK"),
+                })
+                continue
+
+            # Uptrend: spike DOWN into support -> BUY reversal
+            if uptrend and big_range and lower_ratio >= float(wick_ratio_min) and c > o:
+                weak_confirm = (not buy_confirm)
+                # allow weak confirmations with lower confidence
+
+                entry = float(h)  # break of spike candle high
+                sl = float(l) - (0.10 * atr_1h)
+                r = max(1e-12, entry - sl)
+
+                tp1 = entry + 1.0 * r
+                tp2 = entry + 1.6 * r
+                tp3 = entry + 2.3 * r
+
+                conf = 82
+                if weak_confirm:
+                    conf -= 6
+                if (h - c) / rng < 0.40:
+                    conf += 4
+
+                out.append({
+                    "symbol": sym_base,
+                    "market_symbol": market_symbol,
+                    "side": "BUY",
+                    "direction": "UP",
+                    "conf": int(clamp(conf, 1, 99)),
+                    "entry": float(entry),
+                    "sl": float(sl),
+                    "tp1": float(tp1),
+                    "tp2": float(tp2),
+                    "tp3": float(tp3),
+                    "vol": float(vol24),
+                    "why": f"Uptrend (EMA50>EMA200). 1H lower-wick spike rejection (wick={lower_ratio:.2f}, range={rng/atr_1h:.2f} ATR). " + ("15m confirm: WEAK" if weak_confirm else "15m confirm: OK"),
+                })
+                continue
+
+        except Exception:
+            continue
+
+    out = sorted(out, key=lambda x: (int(x.get("conf", 0)), float(x.get("vol", 0.0))), reverse=True)
+    return out[:max_items]
+
+
+
+def _spike_reversal_warnings(
+    best_fut: Dict[str, Any],
+    min_vol_usd: float = 15_000_000.0,
+    atr_mult_min: float = 1.05,
+    body_ratio_min: float = 0.50,
+    lookback_1h: int = 8,
+    retrace_min: float = 0.22,
+    max_items: int = 8,
+) -> List[dict]:
+    """
+    EARLY WARNING (non-trade):
+    Flags possible reversal zones after a recent 1H impulse (spike) when price starts
+    retracing and momentum cools, but BEFORE strict wick-rejection + 15m-confirm rules.
+
+    Output dict: {symbol, side, conf, vol, why}
+    """
+    out: List[dict] = []
+    if not best_fut:
+        return out
+
+    for base, mv in (best_fut or {}).items():
+        try:
+            sym_base = str(base).upper()
+            market_symbol = str(getattr(mv, "symbol", "") or "")
+            vol24 = float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+            if vol24 < float(min_vol_usd):
+                continue
+            if not market_symbol:
+                continue
+
+            c1 = fetch_ohlcv(market_symbol, "1h", limit=max(ATR_PERIOD + 10, 240))
+            if not c1 or len(c1) < (ATR_PERIOD + 60):
+                continue
+
+            atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
+            if atr_1h <= 0:
+                continue
+
+            closes_1h = [float(x[4]) for x in c1]
+            ema50 = float(ema(closes_1h[-200:], 50) or 0.0)
+            ema200 = float(ema(closes_1h[-220:], 200) or 0.0)
+            if ema50 <= 0 or ema200 <= 0:
+                continue
+
+            uptrend = (ema50 > ema200)
+            downtrend = (ema50 < ema200)
+
+            # find most recent impulse candle in lookback window
+            imp = None
+            for i in range(1, int(lookback_1h) + 1):
+                o = float(c1[-i][1]); h = float(c1[-i][2]); l = float(c1[-i][3]); c = float(c1[-i][4])
+                rng = max(1e-12, h - l)
+                body = abs(c - o)
+                if rng >= (atr_1h * float(atr_mult_min)) and (body / rng) >= float(body_ratio_min):
+                    imp = (i, o, h, l, c, rng, body)
+                    break
+            if not imp:
+                continue
+
+            i, oI, hI, lI, cI, rngI, bodyI = imp
+            impulse_up = (cI > oI)
+            impulse_dn = (cI < oI)
+            if not (impulse_up or impulse_dn):
+                continue
+
+            c0 = float(c1[-1][4])
+
+            # momentum cooling on 1H closes (soft)
+            cooling_dn = (float(c1[-1][4]) <= float(c1[-2][4]) <= float(c1[-3][4])) if len(c1) >= 3 else True
+            cooling_up = (float(c1[-1][4]) >= float(c1[-2][4]) >= float(c1[-3][4])) if len(c1) >= 3 else True
+
+            if impulse_up:
+                retrace = (hI - c0) / max(1e-12, rngI)
+                if retrace < float(retrace_min) or not cooling_dn:
+                    continue
+                trend_note = "Downtrend context. " if downtrend else ("Uptrend context. " if uptrend else "")
+                conf = 72 + int(clamp(retrace * 20.0, 0, 15))
+                out.append({
+                    "symbol": sym_base,
+                    "market_symbol": market_symbol,
+                    "side": "SELL",
+                    "conf": int(clamp(conf, 1, 99)),
+                    "vol": float(vol24),
+                    "why": f"{trend_note}Recent 1H impulse UP (range={rngI/atr_1h:.2f} ATR, body={bodyI/rngI:.2f}). Retrace={retrace:.2f}; cooling closes.",
+                })
+                continue
+
+            if impulse_dn:
+                retrace = (c0 - lI) / max(1e-12, rngI)
+                if retrace < float(retrace_min) or not cooling_up:
+                    continue
+                trend_note = "Uptrend context. " if uptrend else ("Downtrend context. " if downtrend else "")
+                conf = 72 + int(clamp(retrace * 20.0, 0, 15))
+                out.append({
+                    "symbol": sym_base,
+                    "market_symbol": market_symbol,
+                    "side": "BUY",
+                    "conf": int(clamp(conf, 1, 99)),
+                    "vol": float(vol24),
+                    "why": f"{trend_note}Recent 1H impulse DOWN (range={rngI/atr_1h:.2f} ATR, body={bodyI/rngI:.2f}). Retrace={retrace:.2f}; cooling closes.",
+                })
+                continue
+
+        except Exception:
+            continue
+
+    out = sorted(out, key=lambda x: (int(x.get("conf", 0)), float(x.get("vol", 0.0))), reverse=True)
+    return out[:max_items]
+
+def symbol_flip_guard_active(
+    user_id: int,
+    symbol: str,
+    side: str,
+    session_name: str,
+) -> bool:
+    """
+    Blocks opposite-direction alerts for the same symbol for a period.
+    Uses (session cooldown hours * FLIP_GUARD_MULT).
+    """
+    if not FLIP_GUARD_ENABLED:
+        return False
+
+    cooldown_hours = float(cooldown_hours_for_session(session_name)) * float(FLIP_GUARD_MULT)
+    opposite = "SELL" if str(side).upper() == "BUY" else "BUY"
+
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT emailed_ts
+        FROM emailed_symbols
+        WHERE user_id=? AND symbol=? AND side=?
+    """, (int(user_id), str(symbol).upper(), opposite))
+    row = cur.fetchone()
+    con.close()
+
+    if not row:
+        return False
+
+    last_ts = float(row["emailed_ts"])
+    return (time.time() - last_ts) < (cooldown_hours * 3600.0)
+
+
+def list_cooldowns(user_id: int) -> List[dict]:
+    """
+    Returns list of cooldown stamps for user:
+    [{symbol, side, session, emailed_ts}, ...]
+    """
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT symbol, side, session, emailed_ts
+        FROM emailed_symbols
+        WHERE user_id=?
+        ORDER BY emailed_ts DESC
+    """, (int(user_id),))
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def _fmt_dur(seconds: float) -> str:
+    s = int(max(0, seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    if h <= 0:
+        return f"{m}m"
+    return f"{h}h {m}m"
+
+def _email_daily_get(user_id: int, day_local: str) -> int:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT sent_count FROM email_daily WHERE user_id=? AND day_local=?", (user_id, day_local))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO email_daily (user_id, day_local, sent_count) VALUES (?, ?, ?)", (user_id, day_local, 0))
+        con.commit()
+        con.close()
+        return 0
+    con.close()
+    return int(row["sent_count"])
+
+def _email_daily_inc(user_id: int, day_local: str, inc: int = 1):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO email_daily (user_id, day_local, sent_count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, day_local) DO UPDATE SET sent_count = sent_count + excluded.sent_count
+    """, (user_id, day_local, int(inc)))
+    con.commit()
+    con.close()
+
+def _risk_daily_get(user_id: int, day_local: str) -> float:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT used_risk_usd FROM risk_daily WHERE user_id=? AND day_local=?", (user_id, day_local))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO risk_daily (user_id, day_local, used_risk_usd) VALUES (?, ?, ?)", (user_id, day_local, 0.0))
+        con.commit()
+        con.close()
+        return 0.0
+    con.close()
+    return float(row["used_risk_usd"])
+
+def _risk_daily_inc(user_id: int, day_local: str, inc_usd: float):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO risk_daily (user_id, day_local, used_risk_usd)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, day_local) DO UPDATE SET used_risk_usd = used_risk_usd + excluded.used_risk_usd
+    """, (user_id, day_local, float(inc_usd)))
+    con.commit()
+    con.close()
+
+def _user_day_local(user: dict) -> str:
+    start_local, _, _ = _user_today_window(user)
+    return start_local.date().isoformat()
+
+
+def _day_local_for_ts(user: dict, ts: float) -> str:
+    try:
+        dt_ref = datetime.fromtimestamp(float(ts), _user_tzinfo(user))
+    except Exception:
+        dt_ref = datetime.now(_user_tzinfo(user))
+    start_local, _ = _anchored_day_window(dt_ref, _user_day_reset_hhmm(user))
+    return start_local.date().isoformat()
+
+
+def _trading_day_context(user: dict, now_ts: Optional[float] = None) -> dict:
+    """Single source of truth for the active trading-day window.
+
+    Returns local + UTC boundaries using the user's timezone and configured /dayreset anchor.
+    Handles DST safely by building local wall-clock anchors for today/tomorrow.
+    """
+    tz = _user_tzinfo(user)
+    tz_name = tz.key if hasattr(tz, 'key') else str((user or {}).get('tz') or 'UTC')
+    anchor = _user_day_reset_hhmm(user)
+    hh, mm = _parse_anchor_hhmm(anchor)
+    now_local = datetime.fromtimestamp(float(now_ts), tz) if now_ts is not None else datetime.now(tz)
+
+    today_anchor = datetime(now_local.year, now_local.month, now_local.day, hh, mm, 0, 0, tzinfo=tz)
+    if now_local < today_anchor:
+        prev_day = (today_anchor - timedelta(days=1)).astimezone(tz)
+        start_local = datetime(prev_day.year, prev_day.month, prev_day.day, hh, mm, 0, 0, tzinfo=tz)
+        end_local = today_anchor
+    else:
+        next_day = (today_anchor + timedelta(days=1)).astimezone(tz)
+        start_local = today_anchor
+        end_local = datetime(next_day.year, next_day.month, next_day.day, hh, mm, 0, 0, tzinfo=tz)
+
+    return {
+        'tz': tz,
+        'tz_name': tz_name,
+        'anchor_hhmm': anchor,
+        'start_local': start_local,
+        'end_local': end_local,
+        'start_utc': start_local.astimezone(timezone.utc),
+        'end_utc': end_local.astimezone(timezone.utc),
+    }
+
+def _risk_used_today_from_open_trades(user_id: int, user: dict, day_local: str) -> float:
+    """Current-day open risk for manual trades.
+
+    Only risk from positions opened inside the user's active day window is charged to the
+    current day cap. Older open positions are shown separately as carried exposure.
+    """
+    try:
+        opens = db_open_trades(user_id) or []
+    except Exception:
+        opens = []
+    total = 0.0
+    for t in opens:
+        try:
+            opened_ts = float(t.get("opened_ts") or 0.0)
+            if opened_ts > 0 and _day_local_for_ts(user, opened_ts) != str(day_local):
+                continue
+            total += float(t.get("risk_usd") or 0.0)
+        except Exception:
+            continue
+    return float(max(0.0, total))
+
+def _risk_daily_sync(user_id: int, user: dict) -> float:
+    # Make risk_daily consistent even if a trade was logged before risk_daily updates ran.
+    day_local = _user_day_local(user)
+    used = _risk_used_today_from_open_trades(user_id, user, day_local)
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO risk_daily (user_id, day_local, used_risk_usd) VALUES (?, ?, ?) "
+        "ON CONFLICT(user_id, day_local) DO UPDATE SET used_risk_usd=excluded.used_risk_usd",
+        (int(user_id), str(day_local), float(used)),
+    )
+    con.commit()
+    con.close()
+    return float(used)
+
+def _pnl_today_closed_trades(user_id: int, user: dict) -> float:
+    """Sum of realized PnL for trades CLOSED today (user local day)."""
+    day_local = _user_day_local(user)
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT pnl AS pnl, closed_ts FROM trades WHERE user_id=? AND closed_ts IS NOT NULL",
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    total = 0.0
+    for r in rows:
+        try:
+            pnl = float(r["pnl"] or 0.0)
+            cts = float(r["closed_ts"] or 0.0)
+            if cts <= 0:
+                continue
+            if _day_local_for_ts(user, cts) != str(day_local):
+                continue
+            total += pnl
+        except Exception:
+            continue
+    return float(total)
+
+def _risk_used_total_today(user_id: int, user: dict) -> float:
+    """Daily used risk = current open risk minus realized net PnL for the active day window.
+
+    Governance model:
+    - losses reduce remaining capacity
+    - profits restore capacity
+    - remaining risk is never shown above the daily cap
+    """
+    day_local = _user_day_local(user)
+    open_risk = _risk_used_today_from_open_trades(user_id, user, day_local)
+    pnl_today = _pnl_today_closed_trades(user_id, user)
+    used = float(open_risk) - float(pnl_today)
+    return float(max(0.0, used))
+
+def _admin_today_window_utc(now_utc: Optional[datetime] = None, uid: Optional[int] = None, user: Optional[dict] = None) -> tuple[datetime, datetime]:
+    """Admin active trading day in UTC, derived from the admin user's timezone + /dayreset."""
+    owner_uid = int(uid or AUTOTRADE_OWNER_UID or 0)
+    base_user = dict(user or {}) if isinstance(user, dict) else {}
+    if not base_user and owner_uid > 0:
+        try:
+            base_user = get_user(owner_uid) or {}
+        except Exception:
+            base_user = {}
+    if not base_user:
+        base_user = {'tz': 'UTC', 'day_reset_hhmm': DEFAULT_USER_DAY_RESET_HHMM}
+
+    now_ts = None
+    if isinstance(now_utc, datetime):
+        try:
+            now_ts = float(now_utc.astimezone(timezone.utc).timestamp())
+        except Exception:
+            now_ts = None
+    ctx = _trading_day_context(base_user, now_ts=now_ts)
+    return ctx['start_utc'], ctx['end_utc']
+
+
+def _admin_today_key_utc(now_utc: Optional[datetime] = None, uid: Optional[int] = None, user: Optional[dict] = None) -> str:
+    start_utc, _ = _admin_today_window_utc(now_utc, uid=uid, user=user)
+    return start_utc.strftime("%Y-%m-%d")
+
+
+def _user_today_window(user: dict, now_ts: Optional[float] = None) -> tuple[datetime, datetime, str]:
+    ctx = _trading_day_context(user, now_ts=now_ts)
+    return ctx['start_local'], ctx['end_local'], ctx['tz_name']
+
+
+ADMIN_ASIA_DAY_START_HHMM = "00:00"
+DEFAULT_USER_DAY_RESET_HHMM = "00:00"
+
+
+def _parse_anchor_hhmm(anchor_hhmm: str) -> tuple[int, int]:
+    raw = str(anchor_hhmm or DEFAULT_USER_DAY_RESET_HHMM).strip() or DEFAULT_USER_DAY_RESET_HHMM
+    try:
+        h, m = parse_hhmm(raw)
+        return int(clamp(h, 0, 23)), int(clamp(m, 0, 59))
+    except Exception:
+        return 0, 0
+
+
+def _user_tzinfo(user: dict):
+    tz_name = str((user or {}).get("tz") or (user or {}).get("timezone") or "UTC").strip()
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def _user_day_reset_hhmm(user: dict) -> str:
+    raw = str((user or {}).get("day_reset_hhmm") or DEFAULT_USER_DAY_RESET_HHMM).strip()
+    h, m = _parse_anchor_hhmm(raw)
+    return f"{h:02d}:{m:02d}"
+
+
+def _anchored_day_window(dt_ref: datetime, anchor_hhmm: str) -> tuple[datetime, datetime]:
+    hh, mm = _parse_anchor_hhmm(anchor_hhmm)
+    start = dt_ref.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if dt_ref < start:
+        start -= timedelta(days=1)
+    end = start + timedelta(days=1)
+    return start, end
+
+
+def _manual_trades_today_count(user_id: int, user: dict) -> int:
+    try:
+        start_local, end_local, _ = _user_today_window(user)
+        start_ts = float(start_local.timestamp())
+        end_ts = float(end_local.timestamp())
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM trades WHERE user_id=? AND opened_ts>=? AND opened_ts<?",
+            (int(user_id), start_ts, end_ts),
+        )
+        row = cur.fetchone()
+        con.close()
+        return int((row[0] if row else 0) or 0)
+    except Exception:
+        return int(user.get("day_trade_count") or 0)
+
+
+def _manual_trades_closed_today_count(user_id: int, user: dict) -> int:
+    try:
+        start_local, end_local, _ = _user_today_window(user)
+        start_ts = float(start_local.timestamp())
+        end_ts = float(end_local.timestamp())
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM trades WHERE user_id=? AND closed_ts IS NOT NULL AND closed_ts>=? AND closed_ts<?",
+            (int(user_id), start_ts, end_ts),
+        )
+        row = cur.fetchone()
+        con.close()
+        return int((row[0] if row else 0) or 0)
+    except Exception:
+        return 0
+
+
+def _manual_position_metrics(user_id: int, user: dict) -> dict:
+    day_local = _user_day_local(user)
+    try:
+        opens = db_open_trades(user_id) or []
+    except Exception:
+        opens = []
+    total_open_risk = 0.0
+    current_day_open_risk = 0.0
+    carried_open_risk = 0.0
+    open_positions_now = len(opens)
+    inherited_open_positions = 0
+    for t in opens:
+        try:
+            risk = float(t.get('risk_usd') or 0.0)
+            total_open_risk += risk
+            opened_ts = float(t.get('opened_ts') or 0.0)
+            if opened_ts > 0 and _day_local_for_ts(user, opened_ts) != str(day_local):
+                carried_open_risk += risk
+                inherited_open_positions += 1
+            else:
+                current_day_open_risk += risk
+        except Exception:
+            continue
+    return {
+        'current_total_open_risk': float(max(0.0, total_open_risk)),
+        'current_day_open_risk': float(max(0.0, current_day_open_risk)),
+        'carried_open_risk': float(max(0.0, carried_open_risk)),
+        'open_positions_now': int(open_positions_now),
+        'inherited_open_positions': int(inherited_open_positions),
+        'opened_today_count': int(_manual_trades_today_count(user_id, user)),
+        'closed_today_count': int(_manual_trades_closed_today_count(user_id, user)),
+    }
+
+
+def _autotrade_trades_today_count(uid: int, now_utc: Optional[datetime] = None) -> int:
+    try:
+        user = _autotrade_user_settings(int(uid))
+        start_utc, end_utc = _admin_today_window_utc(now_utc, uid=int(uid), user=user)
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM autotrade_trades WHERE uid=? AND opened_ts>=? AND opened_ts<?",
+                (int(uid), int(start_utc.timestamp()), int(end_utc.timestamp())),
+            )
+            row = cur.fetchone()
+            return int((row[0] if row else 0) or 0)
+    except Exception:
+        return 0
+
+
+def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) -> dict:
+    """Single source of truth for status/debug/accounting fields."""
+    is_admin = is_admin_user(int(uid)) if is_admin is None else bool(is_admin)
+    user = dict(user or {})
+    ctx = _trading_day_context(user)
+    snap = {
+        "is_admin": is_admin,
+        "plan": str(effective_plan(uid, user)).upper(),
+        "equity": float(user.get("equity") or 0.0),
+        "pnl_today": 0.0,
+        "trades_today": 0,
+        "trades_today_limit": int(user.get("max_trades_day") or 0),
+        "cap": 0.0,
+        "open_risk_today": 0.0,
+        "current_day_open_risk": 0.0,
+        "carried_open_risk": 0.0,
+        "current_total_open_risk": 0.0,
+        "open_positions_now": 0,
+        "positions_opened_today": 0,
+        "positions_closed_today": 0,
+        "inherited_open_positions": 0,
+        "remaining_new_positions_today": 0,
+        "realized_loss_today": 0.0,
+        "used_today": 0.0,
+        "remaining_today": float("inf"),
+        "over_by": 0.0,
+        "today_basis": f"Anchored trading day ({ctx['tz_name']}, starts {ctx['anchor_hhmm']})",
+        "today_key": ctx['start_local'].date().isoformat(),
+        "today_window_label": f"{ctx['start_local'].strftime('%Y-%m-%d %H:%M')} → {ctx['end_local'].strftime('%Y-%m-%d %H:%M')} {ctx['tz_name']}",
+    }
+    if is_admin:
+        live_eq = _live_equity_usdt()
+        if live_eq is not None:
+            snap["equity"] = float(live_eq)
+            try:
+                update_user(int(uid), equity=float(live_eq))
+            except Exception:
+                pass
+        m = _autotrade_day_risk_metrics(int(uid), float(snap["equity"]))
+        snap["cap"] = float(m.get("cap") or 0.0)
+        snap["current_total_open_risk"] = float(m.get("current_total_open_risk") or 0.0)
+        snap["open_risk_today"] = float(m.get("current_day_open_risk") or 0.0)
+        snap["current_day_open_risk"] = float(m.get("current_day_open_risk") or 0.0)
+        snap["carried_open_risk"] = float(m.get("carried_open_risk") or 0.0)
+        snap["open_positions_now"] = int(m.get("open_positions_now") or 0)
+        snap["positions_opened_today"] = int(m.get("opened_today_count") or 0)
+        snap["positions_closed_today"] = int(m.get("closed_today_count") or 0)
+        snap["inherited_open_positions"] = int(m.get("inherited_open_positions") or 0)
+        snap["realized_loss_today"] = float(m.get("realized_loss_today") or 0.0)
+        snap["used_today"] = float(m.get("used_total") or 0.0)
+        snap["live_open_risk_charged_today"] = float(m.get("live_open_risk_charged_today") or m.get("current_day_open_risk") or 0.0)
+        rem = float(m.get("remaining")) if snap["cap"] > 0 else float("inf")
+        snap["remaining_today"] = max(0.0, rem) if math.isfinite(rem) and snap["cap"] > 0 else rem
+        snap["over_by"] = max(0.0, -rem) if math.isfinite(rem) and snap["cap"] > 0 else 0.0
+        snap["pnl_today"] = float(m.get("realized_pnl_today") or 0.0)
+        snap["trades_today"] = int(m.get("opened_today_count") or 0)
+        snap["trades_today_limit"] = 0
+        snap["remaining_new_positions_today"] = 0
+    else:
+        cap = float(daily_cap_usd(user) or 0.0)
+        pnl_today = float(_pnl_today_closed_trades(uid, user) or 0.0)
+        pm = _manual_position_metrics(uid, user)
+        current_day_open_risk = float(pm.get('current_day_open_risk') or 0.0)
+        current_total_open_risk = float(pm.get('current_total_open_risk') or 0.0)
+        carried_open_risk = float(pm.get('carried_open_risk') or 0.0)
+        used_today = float(max(0.0, current_day_open_risk - pnl_today))
+        remaining_raw = float("inf") if cap <= 0 else (cap - used_today)
+        opened_today = int(pm.get('opened_today_count') or 0)
+        closed_today = int(pm.get('closed_today_count') or 0)
+        open_now = int(pm.get('open_positions_now') or 0)
+        inherited_now = int(pm.get('inherited_open_positions') or 0)
+        trade_limit = int(user.get('max_trades_day') or 0)
+        snap.update({
+            "cap": cap,
+            "open_risk_today": current_day_open_risk,
+            "current_day_open_risk": current_day_open_risk,
+            "current_total_open_risk": current_total_open_risk,
+            "carried_open_risk": carried_open_risk,
+            "open_positions_now": open_now,
+            "positions_opened_today": opened_today,
+            "positions_closed_today": closed_today,
+            "inherited_open_positions": inherited_now,
+            "remaining_new_positions_today": max(0, trade_limit - opened_today) if trade_limit > 0 else 0,
+            "realized_loss_today": max(0.0, -pnl_today),
+            "used_today": used_today,
+            "remaining_today": max(0.0, remaining_raw) if cap > 0 else float("inf"),
+            "over_by": max(0.0, -remaining_raw) if cap > 0 else 0.0,
+            "pnl_today": pnl_today,
+            "trades_today": opened_today,
+        })
+    return snap
+
+
+
+
+
+
+def _admin_setup_lifecycle_migrate() -> None:
+    """Admin-only authoritative setup lifecycle table.
+
+    This keeps one stable setup identity across:
+    screen -> email -> executable pool -> execution attempt -> Bybit open -> close sync.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS admin_setup_lifecycle (
+                    setup_id TEXT PRIMARY KEY,
+                    uid INTEGER NOT NULL DEFAULT 0,
+                    symbol TEXT NOT NULL DEFAULT '',
+                    side TEXT NOT NULL DEFAULT '',
+                    session TEXT NOT NULL DEFAULT '',
+                    screened_ts REAL NOT NULL DEFAULT 0,
+                    emailed_ts REAL NOT NULL DEFAULT 0,
+                    executable_ts REAL NOT NULL DEFAULT 0,
+                    attempted_ts REAL NOT NULL DEFAULT 0,
+                    executed_ts REAL NOT NULL DEFAULT 0,
+                    closed_ts REAL NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL DEFAULT '',
+                    last_reason TEXT NOT NULL DEFAULT '',
+                    source_kind TEXT NOT NULL DEFAULT '',
+                    signal_created_ts REAL NOT NULL DEFAULT 0,
+                    generated_logged_ts REAL NOT NULL DEFAULT 0,
+                    bybit_order_id TEXT NOT NULL DEFAULT '',
+                    bybit_order_link_id TEXT NOT NULL DEFAULT '',
+                    bybit_position_symbol TEXT NOT NULL DEFAULT '',
+                    trade_id TEXT NOT NULL DEFAULT '',
+                    outcome TEXT NOT NULL DEFAULT '',
+                    pnl_usdt REAL NOT NULL DEFAULT 0,
+                    details_json TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_setup_lifecycle_uid_state ON admin_setup_lifecycle(uid, state, attempted_ts)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_setup_lifecycle_uid_emailed ON admin_setup_lifecycle(uid, emailed_ts)")
+            con.commit()
+    except Exception:
+        pass
+
+
+def _admin_setup_lifecycle_merge(uid: int, setup_id: str, **fields) -> None:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return
+    _admin_setup_lifecycle_migrate()
+    now_ts = float(time.time())
+    safe = {
+        'uid': int(uid or 0),
+        'symbol': str(fields.get('symbol') or ''),
+        'side': str(fields.get('side') or ''),
+        'session': str(fields.get('session') or ''),
+        'screened_ts': float(fields.get('screened_ts') or 0.0),
+        'emailed_ts': float(fields.get('emailed_ts') or 0.0),
+        'executable_ts': float(fields.get('executable_ts') or 0.0),
+        'attempted_ts': float(fields.get('attempted_ts') or 0.0),
+        'executed_ts': float(fields.get('executed_ts') or 0.0),
+        'closed_ts': float(fields.get('closed_ts') or 0.0),
+        'state': str(fields.get('state') or ''),
+        'last_reason': str(fields.get('last_reason') or ''),
+        'source_kind': str(fields.get('source_kind') or ''),
+        'signal_created_ts': float(fields.get('signal_created_ts') or 0.0),
+        'generated_logged_ts': float(fields.get('generated_logged_ts') or 0.0),
+        'bybit_order_id': str(fields.get('bybit_order_id') or ''),
+        'bybit_order_link_id': str(fields.get('bybit_order_link_id') or ''),
+        'bybit_position_symbol': str(fields.get('bybit_position_symbol') or ''),
+        'trade_id': str(fields.get('trade_id') or ''),
+        'outcome': str(fields.get('outcome') or ''),
+        'pnl_usdt': float(fields.get('pnl_usdt') or 0.0),
+        'details_json': str(fields.get('details_json') or ''),
+    }
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            row = cur.execute("SELECT * FROM admin_setup_lifecycle WHERE setup_id=?", (sid,)).fetchone()
+            current = dict(row) if row else {}
+            merged = dict(current)
+            merged.setdefault('setup_id', sid)
+            merged['uid'] = int(safe.get('uid') or current.get('uid') or 0)
+            for key, val in safe.items():
+                if key == 'uid':
+                    continue
+                old = current.get(key)
+                if key.endswith('_ts'):
+                    if float(val or 0.0) > 0:
+                        merged[key] = float(val)
+                    else:
+                        merged[key] = float(old or 0.0)
+                elif key == 'pnl_usdt':
+                    if ('pnl_usdt' in fields) or (float(val or 0.0) != 0.0):
+                        merged[key] = float(val or 0.0)
+                    else:
+                        merged[key] = float(old or 0.0)
+                else:
+                    merged[key] = val if str(val) != '' else str(old or '')
+            cur.execute(
+                """INSERT OR REPLACE INTO admin_setup_lifecycle (
+                    setup_id, uid, symbol, side, session, screened_ts, emailed_ts, executable_ts,
+                    attempted_ts, executed_ts, closed_ts, state, last_reason, source_kind,
+                    signal_created_ts, generated_logged_ts, bybit_order_id, bybit_order_link_id,
+                    bybit_position_symbol, trade_id, outcome, pnl_usdt, details_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    sid, int(merged.get('uid') or 0),
+                    str(merged.get('symbol') or ''), str(merged.get('side') or ''), str(merged.get('session') or ''),
+                    float(merged.get('screened_ts') or 0.0), float(merged.get('emailed_ts') or 0.0), float(merged.get('executable_ts') or 0.0),
+                    float(merged.get('attempted_ts') or 0.0), float(merged.get('executed_ts') or 0.0), float(merged.get('closed_ts') or 0.0),
+                    str(merged.get('state') or ''), str(merged.get('last_reason') or ''), str(merged.get('source_kind') or ''),
+                    float(merged.get('signal_created_ts') or 0.0), float(merged.get('generated_logged_ts') or 0.0),
+                    str(merged.get('bybit_order_id') or ''), str(merged.get('bybit_order_link_id') or ''),
+                    str(merged.get('bybit_position_symbol') or ''), str(merged.get('trade_id') or ''),
+                    str(merged.get('outcome') or ''), float(merged.get('pnl_usdt') or 0.0), str(merged.get('details_json') or ''),
+                )
+            )
+            con.commit()
+    except Exception:
+        pass
+
+
+def _admin_setup_lifecycle_get(setup_id: str) -> dict:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return {}
+    _admin_setup_lifecycle_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            row = cur.execute("SELECT * FROM admin_setup_lifecycle WHERE setup_id=?", (sid,)).fetchone()
+            return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+def _admin_setup_lifecycle_recent(uid: int, limit: int = 10) -> list[dict]:
+    _admin_setup_lifecycle_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            rows = cur.execute(
+                """SELECT * FROM admin_setup_lifecycle
+                   WHERE uid=?
+                   ORDER BY COALESCE(attempted_ts,0) DESC, COALESCE(emailed_ts,0) DESC, COALESCE(screened_ts,0) DESC
+                   LIMIT ?""",
+                (int(uid), int(limit))
+            ).fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _admin_setup_state_from_reason(reason: str) -> str:
+    r = str(reason or '').strip().lower()
+    if not r:
+        return 'rejected'
+    r = re.sub(r'[^a-z0-9_]+', '_', r)
+    if not r.startswith('emailed_not_executed_'):
+        r = f'emailed_not_executed_{r}'
+    return r[:80]
+
+def db_insert_signal(s: Setup, user_id: int | None = None):
+    """Upsert a setup into DB (signals table). Adds market_symbol when available.
+
+    Important: lifecycle updates must stay user-scoped. Do not default to the owner admin,
+    otherwise signals generated for other users can contaminate admin lifecycle tracking.
+    """
+    con = db_connect()
+    cur = con.cursor()
+    try:
+        cur.execute("""
+            INSERT OR REPLACE INTO signals (
+                setup_id, created_ts, symbol, market_symbol, side, conf, entry, sl, tp1, tp2, tp3,
+                fut_vol_usd, ch24, ch4, ch1, ch15
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            s.setup_id, s.created_ts, s.symbol, getattr(s, "market_symbol", None),
+            s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
+            s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+        ))
+    except Exception:
+        # Backward-compatible (older DB without market_symbol column)
+        cur.execute("""
+            INSERT OR REPLACE INTO signals (
+                setup_id, created_ts, symbol, side, conf, entry, sl, tp1, tp2, tp3,
+                fut_vol_usd, ch24, ch4, ch1, ch15
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            s.setup_id, s.created_ts, s.symbol, s.side, s.conf, s.entry, s.sl,
+            s.tp1, s.tp2, s.tp3, s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+        ))
+    con.commit()
+    con.close()
+    try:
+        if user_id is not None:
+            _admin_setup_lifecycle_merge(
+                int(user_id),
+                str(getattr(s, 'setup_id', '') or ''),
+                symbol=str(getattr(s, 'symbol', '') or ''),
+                side=str(getattr(s, 'side', '') or ''),
+                signal_created_ts=float(getattr(s, 'created_ts', 0.0) or 0.0),
+                state='screened',
+            )
+    except Exception:
+        pass
+
+def db_get_signal(setup_id: str) -> Optional[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM signals WHERE setup_id=?", (setup_id.strip(),))
+    row = cur.fetchone()
+    con.close()
+    return dict(row) if row else None
+
+def db_list_signals_since(ts_from: float) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM signals WHERE created_ts>=? ORDER BY created_ts ASC", (ts_from,))
+    rows = cur.fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+# =========================================================
+# SIGNAL EVALUATION (EMAIL -> OUTCOME TABLE)
+# =========================================================
+
+def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts: float):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """INSERT OR REPLACE INTO emailed_setups (user_id, setup_id, session, emailed_ts)
+           VALUES (?, ?, ?, ?)""",
+        (int(user_id), str(setup_id).strip(), str(session or ""), float(emailed_ts)),
+    )
+    con.commit()
+    con.close()
+    try:
+        _admin_setup_lifecycle_merge(
+            int(user_id),
+            str(setup_id).strip(),
+            session=str(session or ''),
+            emailed_ts=float(emailed_ts or 0.0),
+            state='emailed',
+            source_kind='emailed_setups',
+        )
+    except Exception:
+        pass
+
+
+
+
+def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executable_ts: float):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """INSERT OR REPLACE INTO executable_setups (user_id, setup_id, session, executable_ts)
+           VALUES (?, ?, ?, ?)""",
+        (int(user_id), str(setup_id).strip(), str(session or ""), float(executable_ts)),
+    )
+    con.commit()
+    con.close()
+    try:
+        _admin_setup_lifecycle_merge(
+            int(user_id),
+            str(setup_id).strip(),
+            session=str(session or ''),
+            executable_ts=float(executable_ts or 0.0),
+            state='executable_pending',
+            source_kind='executable_setups',
+        )
+    except Exception:
+        pass
+
+
+def db_recent_generated_setups(user_id: int, source: str, lookback_hours: int = 6, limit: int = 5) -> list[dict]:
+    """Fetch recent generated_setups rows for UI correlation (/screen showing email setups too)."""
+    try:
+        cutoff = time.time() - float(lookback_hours) * 3600.0
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute("""
+            SELECT setup_id, session, symbol, side, conf, created_ts
+            FROM generated_setups
+            WHERE user_id = ?
+              AND source = ?
+              AND created_ts >= ?
+            ORDER BY created_ts DESC
+            LIMIT ?
+        """, (int(user_id), str(source).strip().lower(), float(cutoff), int(limit)))
+        rows = cur.fetchall() or []
+        con.close()
+        out = []
+        for r in rows:
+            sid, sess, sym, side, conf, ts = r
+            out.append({
+                "setup_id": sid,
+                "session": sess,
+                "symbol": sym,
+                "side": side,
+                "conf": int(conf or 0),
+                "created_ts": float(ts or 0.0),
+            })
+        return out
+    except Exception:
+        return []
+
+def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
+    """Log a generated setup (from /screen) or a sent setup (email) for correlation."""
+    con = None
+    ts_now = float(time.time())
+    try:
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute(
+            """INSERT INTO generated_setups
+               (user_id, source, created_ts, session, setup_id, symbol, side, conf)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(user_id),
+                str(source or "").strip().lower(),
+                ts_now,
+                str(session or ""),
+                str(getattr(s, "setup_id", "") or ""),
+                str(getattr(s, "symbol", "") or ""),
+                str(getattr(s, "side", "") or ""),
+                int(getattr(s, "conf", 0) or 0),
+            ),
+        )
+        con.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            if con:
+                con.close()
+        except Exception:
+            pass
+    try:
+        sid = str(getattr(s, 'setup_id', '') or '')
+        state = 'screened' if str(source or '').strip().lower() == 'screen' else 'emailed'
+        payload = {
+            'session': str(session or ''),
+            'symbol': str(getattr(s, 'symbol', '') or ''),
+            'side': str(getattr(s, 'side', '') or ''),
+            'state': state,
+        }
+        if state == 'screened':
+            payload['screened_ts'] = ts_now
+            payload['source_kind'] = 'generated_setups'
+        else:
+            payload['emailed_ts'] = ts_now
+            payload['generated_logged_ts'] = ts_now
+            payload['source_kind'] = 'generated_setups'
+        _admin_setup_lifecycle_merge(int(user_id), sid, **payload)
+    except Exception:
+        pass
+
+def db_list_emailed_setups(user_id: int, ts_from: float) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """SELECT setup_id, session, emailed_ts
+           FROM emailed_setups
+           WHERE user_id=? AND emailed_ts>=?
+           ORDER BY emailed_ts ASC""",
+        (int(user_id), float(ts_from)),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+
+
+def db_list_autotrade_trades(user_id: int, ts_from: float) -> List[dict]:
+    """Autotrade trades opened by the bot (journal)."""
+    con = db_connect()
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute(
+        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status, closed_ts, outcome, pnl_usdt AS pnl
+           FROM autotrade_trades
+           WHERE uid=? AND opened_ts>=?
+           ORDER BY opened_ts ASC""",
+        (int(user_id), int(ts_from)),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+def db_list_autotrade_trades_all(user_id: int) -> List[dict]:
+    con = db_connect()
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute(
+        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status, closed_ts, outcome, pnl_usdt AS pnl
+           FROM autotrade_trades
+           WHERE uid=?
+           ORDER BY opened_ts ASC""",
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+
+
+def db_list_emailed_setups_all(user_id: int) -> List[dict]:
+    """All emailed setups for a user (no time filter)."""
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """SELECT setup_id, session, emailed_ts
+           FROM emailed_setups
+           WHERE user_id=?
+           ORDER BY emailed_ts ASC""",
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+def db_list_outcomes_for_user(user_id: int) -> List[dict]:
+    """Join emailed_setups -> signal_outcomes for a user. Only setups that have an outcome row."""
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """SELECT e.setup_id, e.session, e.emailed_ts,
+                  o.outcome, o.hit_level, o.hit_ts, o.best_level, o.best_ts, o.horizon_hours, o.evaluated_ts, o.note
+           FROM emailed_setups e
+           JOIN signal_outcomes o ON o.setup_id = e.setup_id
+           WHERE e.user_id=?
+           ORDER BY e.emailed_ts ASC""",
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+def db_get_outcome(setup_id: str) -> Optional[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM signal_outcomes WHERE setup_id=?", (str(setup_id).strip(),))
+    row = cur.fetchone()
+    con.close()
+    return dict(row) if row else None
+
+def db_upsert_outcome(setup_id: str, outcome: str, hit_level: str, hit_ts: Optional[float],
+                      horizon_hours: int, note: str = "", best_level: str = "", best_ts: Optional[float] = None):
+    con = db_connect()
+    cur = con.cursor()
+
+    # Backward compatible: if DB hasn't been migrated yet, insert only legacy columns.
+    try:
+        cols = [r["name"] for r in cur.execute("PRAGMA table_info(signal_outcomes)").fetchall()]
+    except Exception:
+        cols = []
+
+    if "best_level" in cols and "best_ts" in cols:
+        cur.execute(
+            """INSERT OR REPLACE INTO signal_outcomes
+               (setup_id, outcome, hit_level, hit_ts, evaluated_ts, horizon_hours, note, best_level, best_ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(setup_id).strip(),
+                str(outcome),
+                str(hit_level or ""),
+                (float(hit_ts) if hit_ts is not None else None),
+                float(time.time()),
+                int(horizon_hours),
+                str(note or ""),
+                str(best_level or ""),
+                (float(best_ts) if best_ts is not None else None),
+            ),
+        )
+    else:
+        cur.execute(
+            """INSERT OR REPLACE INTO signal_outcomes
+               (setup_id, outcome, hit_level, hit_ts, evaluated_ts, horizon_hours, note)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(setup_id).strip(),
+                str(outcome),
+                str(hit_level or ""),
+                (float(hit_ts) if hit_ts is not None else None),
+                float(time.time()),
+                int(horizon_hours),
+                str(note or ""),
+            ),
+        )
+    con.commit()
+    con.close()
+
+def _market_symbol_from_base(base: str) -> Optional[str]:
+    """Best-effort mapping base -> ccxt market symbol used by the bot (swap)."""
+    try:
+        b = str(base or "").upper().strip()
+        if not b:
+            return None
+        ex = get_exchange()
+        # Prefer Bybit linear swap format in ccxt, e.g. BTC/USDT:USDT
+        for cand in (f"{b}/USDT:USDT", f"{b}/USDT"):
+            if cand in getattr(ex, "markets", {}):
+                return cand
+        # Fallback: find any market whose base matches + quote USDT
+        for sym, m in (getattr(ex, "markets", {}) or {}).items():
+            try:
+                if str(m.get("base", "")).upper() == b and str(m.get("quote", "")).upper() == "USDT":
+                    return sym
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+def fetch_ohlcv_paged(symbol: str, timeframe: str, since_ms: int, until_ms: int, limit: int = 1000) -> List[List[float]]:
+    """Fetch OHLCV with pagination (best effort). Returns candles in ascending time."""
+    ex = get_exchange()
+    out: List[List[float]] = []
+    cur_since = int(since_ms)
+    # Safety limits
+    max_loops = 40
+    for _ in range(max_loops):
+        try:
+            chunk = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=cur_since, limit=limit) or []
+        except Exception:
+            break
+        if not chunk:
+            break
+        # ensure ascending
+        chunk = sorted(chunk, key=lambda r: r[0])
+        # stop if stuck
+        if out and chunk[0][0] <= out[-1][0] and len(chunk) == 1:
+            break
+        # append new only
+        for c in chunk:
+            if not out or c[0] > out[-1][0]:
+                out.append(c)
+        last_ts = out[-1][0]
+        if last_ts >= until_ms:
+            break
+        # advance since by 1 ms to avoid duplicates
+        cur_since = int(last_ts + 1)
+        # If chunk is tiny, likely end
+        if len(chunk) < max(10, int(limit * 0.2)):
+            break
+    return out
+
+def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: str = "1m") -> dict:
+    """Evaluate a setup using the canonical 2-TP model (TP1, TP2, SL, OPEN)."""
+    side = str(setup.get("side") or "").upper().strip()
+    entry = float(setup.get("entry") or 0.0)
+    sl = float(setup.get("sl") or 0.0)
+    tp1 = setup.get("tp1")
+    tp2 = setup.get("tp2") or setup.get("tp3")
+    t1, t2, _ = _ensure_three_tps(entry, sl, float(tp2 or 0.0), tp1, tp2, side)
+
+    created_ts = float(setup.get("created_ts") or 0.0)
+    market_symbol = str(setup.get("market_symbol") or "").strip() or _market_symbol_from_base(setup.get("symbol"))
+    if not market_symbol:
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "missing_market_symbol"}
+    if created_ts <= 0:
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "missing_created_ts"}
+
+    since_ms = int(created_ts * 1000)
+    until_ms = int(min(time.time(), created_ts + horizon_hours * 3600) * 1000)
+    candles = fetch_ohlcv_paged(market_symbol, timeframe, since_ms=since_ms, until_ms=until_ms, limit=1000)
+    if not candles:
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "no_ohlcv"}
+
+    t_sl_ts = t_tp1_ts = t_tp2_ts = None
+    mixed_first_ts = None
+    for c in candles:
+        try:
+            ts_ms, _o, h, l, _cl, _v = c
+            hi = float(h)
+            lo = float(l)
+        except Exception:
+            continue
+        ts_s = ts_ms / 1000.0
+        if side == 'BUY':
+            hit_sl = lo <= sl
+            hit1 = hi >= t1
+            hit2 = hi >= t2
+        else:
+            hit_sl = hi >= sl
+            hit1 = lo <= t1
+            hit2 = lo <= t2
+        if hit_sl and t_sl_ts is None:
+            t_sl_ts = ts_s
+        if hit1 and t_tp1_ts is None:
+            t_tp1_ts = ts_s
+        if hit2 and t_tp2_ts is None:
+            t_tp2_ts = ts_s
+        if hit_sl and (hit1 or hit2) and mixed_first_ts is None:
+            mixed_first_ts = ts_s
+        if (t_sl_ts is not None) and (t_tp1_ts is not None) and (t_tp2_ts is not None):
+            break
+
+    if (t_sl_ts is None) and (t_tp1_ts is None) and (t_tp2_ts is None):
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "horizon_not_hit"}
+
+    if t_tp1_ts is None:
+        if t_sl_ts is not None:
+            first_ts, first_level = t_sl_ts, 'SL'
+        else:
+            return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "no_tp1_and_no_sl"}
+    else:
+        if (t_sl_ts is not None) and (t_sl_ts < t_tp1_ts):
+            first_ts, first_level = t_sl_ts, 'SL'
+        else:
+            first_ts, first_level = t_tp1_ts, 'TP1'
+
+    if mixed_first_ts is not None and first_ts is not None and abs(mixed_first_ts - first_ts) < 0.9:
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "tp_and_sl_same_candle"}
+
+    def _tp_ok(tp_ts):
+        if tp_ts is None:
+            return False
+        if t_sl_ts is None:
+            return True
+        return tp_ts < t_sl_ts
+
+    best_level = 'NONE'
+    best_ts = None
+    if _tp_ok(t_tp2_ts):
+        best_level, best_ts = 'TP2', t_tp2_ts
+    elif _tp_ok(t_tp1_ts):
+        best_level, best_ts = 'TP1', t_tp1_ts
+
+    if first_level == 'SL':
+        return {"outcome": "SL", "hit_level": "SL", "hit_ts": first_ts, "best_level": best_level, "best_ts": best_ts, "note": ""}
+    if best_level == 'TP2':
+        return {"outcome": "TP2", "hit_level": "TP1", "hit_ts": first_ts, "best_level": "TP2", "best_ts": best_ts, "note": ""}
+    if best_level == 'TP1':
+        return {"outcome": "TP1", "hit_level": "TP1", "hit_ts": first_ts, "best_level": "TP1", "best_ts": best_ts, "note": ""}
+    return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "edge_case"}
+
+
+def _next_public_trade_id(user_id: int) -> int:
+    """Sequential per-user Trade ID shown to the user (starts at 1)."""
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS trade_id_seq (user_id INTEGER PRIMARY KEY, last_id INTEGER NOT NULL)")
+    cur.execute("SELECT last_id FROM trade_id_seq WHERE user_id=?", (int(user_id),))
+    row = cur.fetchone()
+    if row:
+        next_id = int(row["last_id"]) + 1
+        cur.execute("UPDATE trade_id_seq SET last_id=? WHERE user_id=?", (int(next_id), int(user_id)))
+    else:
+        next_id = 1
+        cur.execute("INSERT INTO trade_id_seq(user_id,last_id) VALUES(?,?)", (int(user_id), 1))
+    con.commit()
+    con.close()
+    return int(next_id)
+
+
+def _reset_public_trade_id(user_id: int):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS trade_id_seq (user_id INTEGER PRIMARY KEY, last_id INTEGER NOT NULL)")
+    cur.execute("INSERT OR REPLACE INTO trade_id_seq(user_id,last_id) VALUES(?,?)", (int(user_id), 0))
+    con.commit()
+    con.close()
+
+def db_trade_open(user_id: int, symbol: str, side: str, entry: float, sl: float,
+                  risk_usd: float, qty: float, note: str = "", signal_id: str = "") -> int:
+    # Public per-user Trade ID (start at 1; resettable)
+    public_id = _next_public_trade_id(user_id)
+
+    con = db_connect()
+    cur = con.cursor()
+
+    # Ensure column exists (for older DBs)
+    try:
+        cols_trades = [r[1] for r in cur.execute("PRAGMA table_info(trades)").fetchall()]
+        if "public_id" not in cols_trades:
+            cur.execute("ALTER TABLE trades ADD COLUMN public_id INTEGER")
+    except Exception:
+        pass
+
+    cur.execute("""
+        INSERT INTO trades (user_id, public_id, symbol, side, entry, sl, risk_usd, qty, opened_ts, note, signal_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id, int(public_id), symbol.upper(), side.upper(), float(entry), float(sl),
+        float(risk_usd), float(qty), time.time(), note, signal_id
+    ))
+    con.commit()
+    con.close()
+    return int(public_id)
+
+def db_trade_close(user_id: int, trade_id: int, pnl: float) -> Optional[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM trades WHERE public_id=? AND user_id=? AND closed_ts IS NULL", (trade_id, user_id))
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        return None
+    t = dict(row)
+
+    risk = float(t["risk_usd"]) if float(t["risk_usd"]) != 0 else 0.0
+    r_mult = (float(pnl) / risk) if risk > 0 else None
+
+    cur.execute("""
+        UPDATE trades
+        SET closed_ts=?, pnl=?, r_mult=?
+        WHERE public_id=? AND user_id=?
+    """, (time.time(), float(pnl), r_mult, trade_id, user_id))
+    con.commit()
+    con.close()
+
+    t["pnl"] = float(pnl)
+    t["r_mult"] = r_mult
+    return t
+
+def db_open_trades(user_id: int) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM trades WHERE user_id=? AND closed_ts IS NULL ORDER BY opened_ts ASC", (user_id,))
+    rows = cur.fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+def db_trades_since(user_id: int, ts_from: float) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT * FROM trades
+        WHERE user_id=? AND opened_ts>=?
+        ORDER BY opened_ts ASC
+    """, (user_id, ts_from))
+    rows = cur.fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def db_trades_closed_today(user_id: int, user: dict) -> List[dict]:
+    """Trades CLOSED today (user local day), regardless of when they were opened."""
+    day_local = str(_user_day_local(user))
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT * FROM trades
+        WHERE user_id=? AND closed_ts IS NOT NULL
+        ORDER BY closed_ts ASC
+        """,
+        (int(user_id),),
+    )
+    rows = cur.fetchall() or []
+    con.close()
+    out = []
+    for r in rows:
+        try:
+            d = dict(r)
+            cts = float(d.get("closed_ts") or 0.0)
+            if cts <= 0:
+                continue
+            if _day_local_for_ts(user, cts) != day_local:
+                continue
+            out.append(d)
+        except Exception:
+            continue
+    return out
+
+def db_trades_all(user_id: int) -> List[dict]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT * FROM trades
+        WHERE user_id=?
+        ORDER BY opened_ts ASC
+    """, (int(user_id),))
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(r) for r in rows]
+
+def _profit_factor(trades: List[dict]) -> Optional[float]:
+    closed = [t for t in trades if t.get("closed_ts") is not None and t.get("pnl") is not None]
+    if not closed:
+        return None
+    gp = sum(float(t["pnl"]) for t in closed if float(t["pnl"]) > 0)
+    gl = abs(sum(float(t["pnl"]) for t in closed if float(t["pnl"]) < 0))
+    if gl <= 0:
+        return None if gp <= 0 else float("inf")
+    return gp / gl
+
+def _expectancy_r(trades: List[dict]) -> Optional[float]:
+    closed = [t for t in trades if t.get("closed_ts") is not None and t.get("r_mult") is not None]
+    if not closed:
+        return None
+    rs = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
+    return (sum(rs) / len(rs)) if rs else None
+
+async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return
+
+    trades = db_trades_all(uid)
+    stats = _stats_from_trades(trades)
+
+    pf = _profit_factor(trades)
+    exp_r = _expectancy_r(trades)
+
+    msg = [
+        "📊 Overall Report (ALL TIME)",
+        HDR,
+        f"Closed: {stats['closed_n']} | Wins: {stats['wins']} | Losses: {stats['losses']}",
+        f"Win rate: {stats['win_rate']:.1f}%",
+        f"Net PnL: {stats['net']:+.2f}",
+        f"Avg R: {stats['avg_r']:+.2f}" if stats["avg_r"] is not None else "Avg R: -",
+        f"Expectancy (R): {exp_r:+.2f}" if exp_r is not None else "Expectancy (R): -",
+        f"Profit Factor: {pf:.2f}" if (pf is not None and pf != float('inf')) else ("Profit Factor: ∞" if pf == float('inf') else "Profit Factor: -"),
+        f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
+        HDR,
+        f"Equity (current): ${float(user['equity']):.2f}",
+    ]
+
+    await update.message.reply_text("\n".join(msg))
+
+# =========================================================
+# EXCHANGE HELPERS (FAST: singleton exchange + no repeated load_markets)
+# =========================================================
+import threading
+_EX: Optional[ccxt.Exchange] = None
+_EX_LOCK = threading.Lock()
+_EX_MARKETS_LOADED = False
+
+def get_exchange() -> ccxt.Exchange:
+    """
+    ✅ SINGLETON exchange instance
+    - Avoids building a new exchange per request
+    - Avoids calling load_markets() repeatedly
+    """
+    global _EX, _EX_MARKETS_LOADED
+    with _EX_LOCK:
+        if _EX is None:
+            klass = ccxt.__dict__[EXCHANGE_ID]
+            _EX = klass({
+                "enableRateLimit": True,
+                "timeout": 20000,
+                "options": {"defaultType": DEFAULT_TYPE},
+            })
+            _EX_MARKETS_LOADED = False
+
+        if not _EX_MARKETS_LOADED:
+            _EX.load_markets()
+            _EX_MARKETS_LOADED = True
+
+        return _EX
+
+def safe_split_symbol(sym: Optional[str]) -> Optional[Tuple[str, str]]:
+    if not sym:
+        return None
+    pair = sym.split(":")[0]
+    if "/" not in pair:
+        return None
+    return tuple(pair.split("/", 1))
+
+def usd_notional(mv: MarketVol) -> float:
+    if mv.quote in STABLES and mv.quote_vol:
+        return float(mv.quote_vol)
+    price = mv.vwap if mv.vwap else mv.last
+    if not price or not mv.base_vol:
+        return 0.0
+    return float(mv.base_vol) * float(price)
+
+def to_mv(t: dict) -> Optional[MarketVol]:
+    sym = t.get("symbol")
+    sp = safe_split_symbol(sym)
+    if not sp:
+        return None
+    base, quote = sp
+    return MarketVol(
+        symbol=sym,
+        base=base,
+        quote=quote,
+        last=float(t.get("last") or 0.0),
+        open=float(t.get("open") or 0.0),
+        percentage=float(t.get("percentage") or 0.0),
+        base_vol=float(t.get("baseVolume") or 0.0),
+        quote_vol=float(t.get("quoteVolume") or 0.0),
+        vwap=float(t.get("vwap") or 0.0),
+    )
+
+
+def get_cached_futures_tickers() -> Dict[str, MarketVol]:
+    """Fast, no-network accessor for last known futures tickers.
+
+    Used by instant commands like /size and /status to avoid blocking on CCXT calls.
+    Returns {} if nothing has been cached yet.
+    """
+    try:
+        obj = cache_get("tickers_best_fut")
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+def fetch_futures_tickers() -> Dict[str, MarketVol]:
+    """
+    ✅ Uses singleton exchange (no repeated load_markets)
+    """
+    if cache_valid("tickers_best_fut", TICKERS_TTL_SEC):
+        return cache_get("tickers_best_fut")
+
+    ex = get_exchange()
+    tickers = ex.fetch_tickers()
+
+    best: Dict[str, MarketVol] = {}
+    for t in tickers.values():
+        mv = to_mv(t)
+        if not mv:
+            continue
+        if mv.quote not in STABLES:
+            continue
+        if mv.base not in best or usd_notional(mv) > usd_notional(best[mv.base]):
+            best[mv.base] = mv
+
+    cache_set("tickers_best_fut", best)
+    return best
+
+def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
+    """
+    ✅ Uses singleton exchange (no repeated build + load_markets)
+    ✅ TTL cache already exists
+    """
+    key = f"ohlcv:{symbol}:{timeframe}:{limit}"
+    if cache_valid(key, OHLCV_TTL_SEC):
+        return cache_get(key)
+
+    ex = get_exchange()
+    data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
+    cache_set(key, data)
+    return data
+
+
+def ema7_1h_distance_pct(market_symbol: str) -> Tuple[float, float, float]:
+    """
+    Returns (dist_pct, last_close, ema7_1h).
+    dist_pct is absolute percent distance between last close and EMA7 on 1H candles.
+    """
+    try:
+        c1 = fetch_ohlcv(market_symbol, "1h", limit=40)
+        if not c1 or len(c1) < 10:
+            return 999.0, 0.0, 0.0
+        closes = [float(x[4]) for x in c1]
+        last_close = float(closes[-1])
+        # lightweight EMA
+        period = 7
+        k = 2.0 / (period + 1.0)
+        ema = float(closes[0])
+        for v in closes[1:]:
+            ema = (float(v) * k) + (ema * (1.0 - k))
+        if ema == 0.0:
+            return 999.0, last_close, ema
+        dist_pct = abs((last_close - ema) / ema) * 100.0
+        return dist_pct, last_close, ema
+    except Exception:
+        return 999.0, 0.0, 0.0
+
+
+def ema7_1h_is_close(market_symbol: str, max_dist_pct: float = EMA7_1H_MAX_DIST_PCT) -> Tuple[bool, float, float, float]:
+    dist_pct, last_close, ema = ema7_1h_distance_pct(market_symbol)
+    return (dist_pct <= float(max_dist_pct)), dist_pct, last_close, ema
+
+
+
+# =========================================================
+# EMA ANCHOR PROXIMITY GATE (DYNAMIC)
+# - Instead of hard-gating only EMA7 on 1H, we allow the engine to anchor
+#   around the *closest* EMA among a small set of periods on 1H.
+# - This keeps your original intention (avoid "far from EMA" signals)
+#   but prevents starving signals when EMA7 is not the relevant magnet.
+# =========================================================
+
+# Periods to consider as potential "magnet" EMAs on 1H candles.
+EMA_ANCHOR_1H_PERIODS = [7, 13, 21]
+
+# Base max distance (%) used for EMA7. Longer EMAs get a slightly wider allowance.
+# Example with default EMA7_1H_MAX_DIST_PCT=0.35:
+#   EMA7  -> 0.35%
+#   EMA13 -> ~0.48%
+#   EMA21 -> ~0.61%
+EMA_ANCHOR_BASE_MAX_DIST_PCT = EMA7_1H_MAX_DIST_PCT
+
+def _ema_last(closes: List[float], period: int) -> float:
+    """Lightweight EMA last value (no full series)."""
+    if not closes or len(closes) < max(3, period):
+        return 0.0
+    k = 2.0 / (period + 1.0)
+    ema = float(closes[0])
+    for v in closes[1:]:
+        ema = (float(v) * k) + (ema * (1.0 - k))
+    return float(ema)
+
+def ema_anchor_1h_distance_pct(
+    market_symbol: str,
+    periods: Optional[List[int]] = None,
+) -> Tuple[float, float, float, int]:
+    """Return (best_dist_pct, last_close, best_ema, best_period) for 1H EMA anchors."""
+    try:
+        ps = periods or EMA_ANCHOR_1H_PERIODS
+        c1 = fetch_ohlcv(market_symbol, "1h", limit=60)
+        if not c1 or len(c1) < 20:
+            return 999.0, 0.0, 0.0, 0
+        closes = [float(x[4]) for x in c1]
+        last_close = float(closes[-1])
+
+        best = (999.0, 0.0, 0)  # (dist_pct, ema, period)
+        for p in ps:
+            try:
+                ema = _ema_last(closes, int(p))
+                if not ema:
+                    continue
+                dist_pct = abs((last_close - ema) / ema) * 100.0
+                if dist_pct < best[0]:
+                    best = (dist_pct, ema, int(p))
+            except Exception:
+                continue
+
+        return float(best[0]), float(last_close), float(best[1]), int(best[2])
+    except Exception:
+        return 999.0, 0.0, 0.0, 0
+
+def ema_anchor_1h_is_close(
+    market_symbol: str,
+    base_max_dist_pct: float = EMA_ANCHOR_BASE_MAX_DIST_PCT,
+    periods: Optional[List[int]] = None,
+) -> Tuple[bool, float, float, float, int, float]:
+    """Return (ok, dist_pct, last_close, ema, period, allowed_max_pct)."""
+    dist_pct, last_close, ema, period = ema_anchor_1h_distance_pct(market_symbol, periods=periods)
+    # widen allowance slightly for longer EMAs
+    try:
+        p = int(period or 7)
+        allowed = float(base_max_dist_pct) * ((p / 7.0) ** 0.5)
+    except Exception:
+        allowed = float(base_max_dist_pct)
+    ok = (dist_pct <= allowed)
+    return ok, float(dist_pct), float(last_close), float(ema), int(period or 0), float(allowed)
+
+# =========================================================
+# ✅ Session resolution helpers (for /screen + engine)
+# =========================================================
+def parse_hhmm(s: str) -> Tuple[int, int]:
+    m = re.match(r"^(\d{2}):(\d{2})$", s.strip())
+    if not m:
+        raise ValueError("bad time")
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        raise ValueError("bad time")
+    return hh, mm
+
+
+def _parse_hhmm_local(s: str) -> Tuple[int, int]:
+    """Parse HH:MM (24h) and return (hour, minute)."""
+    return parse_hhmm(s)
+
+def in_trade_window_now(user: dict, now_local: Optional[datetime] = None) -> bool:
+    """
+    Trade window gate for email alerts.
+
+    - If user has Sessions UNLIMITED enabled -> always allow (24h).
+    - If trade_window_start/end are empty -> allow (no restriction).
+    - Otherwise checks local time window (supports overnight windows like 22:00 -> 06:00).
+    """
+    # Sessions UNLIMITED means 24h emailing (no trade-window restriction)
+    try:
+        if int(user.get("sessions_unlimited") or 0) == 1:
+            return True
+    except Exception:
+        pass
+
+    start_s = str(user.get("trade_window_start") or "").strip()
+    end_s = str(user.get("trade_window_end") or "").strip()
+    if not start_s or not end_s:
+        return True  # disabled => allow
+
+    # User timezone
+    try:
+        tz = ZoneInfo(str(user.get("tz") or "UTC"))
+    except Exception:
+        tz = timezone.utc
+
+    if now_local is None:
+        now_local = datetime.now(tz)
+
+    sh, sm = _parse_hhmm_local(start_s)
+    eh, em = _parse_hhmm_local(end_s)
+
+    start_dt = now_local.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end_dt = now_local.replace(hour=eh, minute=em, second=0, microsecond=0)
+
+    # Overnight window support
+    if end_dt <= start_dt:
+        if now_local >= start_dt:
+            return True
+        start_dt = start_dt - timedelta(days=1)
+        end_dt = end_dt + timedelta(days=1)
+
+    return start_dt <= now_local <= end_dt
+
+
+def current_session_utc(now_utc: Optional[datetime] = None) -> str:
+    """
+    Returns the live market session label in UTC, or ``"NONE"`` when we are
+    outside all configured session windows.
+
+    Windows:
+    - NY  : 13:00–23:00 UTC
+    - LON : 08:00–17:00 UTC
+    - ASIA: 00:00–08:00 UTC
+    Priority: NY > LON > ASIA
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    return _session_label_utc(now_utc) or "NONE"
+
+
+def scan_session_name_utc(now_utc: Optional[datetime] = None) -> str:
+    """
+    Session name used for informational/manual scans when we are in the
+    1-hour gap between NY close and ASIA open. The display/session truth should
+    still be ``NONE`` during that gap; this fallback is only for scan heuristics.
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    return _session_label_utc(now_utc) or "NY"
+
+
+# Some mobile apps (Gmail/iOS) may copy-paste commands with invisible Unicode markers
+# (LTR/RTL marks, BOM, etc.) before the leading '/'. Telegram then won't treat it as a command.
+# We strip those so users can paste /size directly from email.
+_INVISIBLE_PREFIX_CHARS = "\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\ufeff"
+
+def _strip_invisible_prefix(s: str) -> str:
+    try:
+        return (s or "").lstrip(_INVISIBLE_PREFIX_CHARS + " \t\r\n")
+    except Exception:
+        return s or ""
+
+def ema_support_proximity_ok(entry: float, ema_val: float, atr_1h: float, session_name: str):
+    """
+    Adaptive EMA proximity + structure check.
+    Returns: (ok, dist_pct, thr_pct, atr_pct)
+
+    Rules:
+    - Must be near EMA (ATR-adaptive)
+    - Price must be on the correct side of EMA
+      BUY  → entry >= EMA
+      SELL → entry <= EMA
+    """
+    if entry <= 0 or ema_val <= 0:
+        return False, 999.0, 0.0, 0.0
+
+    dist = abs(entry - ema_val)
+    dist_pct = (dist / entry) * 100.0
+
+    atr_pct = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
+
+    knobs = session_knobs(session_name)
+    prox_mult = knobs["ema_prox_mult"]
+
+    thr_pct = clamp(
+        (EMA_SUPPORT_MAX_DIST_ATR_MULT * prox_mult) * atr_pct,
+        EMA_SUPPORT_MAX_DIST_PCT_MIN,
+        EMA_SUPPORT_MAX_DIST_PCT_MAX,
+    )
+
+    # Near enough?
+    near_ok = dist_pct <= thr_pct
+
+    # Structure: entry must be on the correct side
+    # (side check is done outside, so infer by relative position)
+    structure_ok = (
+        (entry >= ema_val) or  # BUY-side structure
+        (entry <= ema_val)     # SELL-side structure
+    )
+
+    ok = bool(near_ok and structure_ok)
+    return ok, dist_pct, thr_pct, atr_pct
+
+
+def ema_support_reaction_ok_15m(c15: List[List[float]], ema_val: float, side: str, session_name: str) -> bool:
+    """
+    Strict EMA reaction confirmation (15m):
+
+    BUY:
+      - Candle touches/breaks EMA
+      - Closes back ABOVE EMA
+      - Bullish candle
+      - Close in top part of range
+      - Rejects EMA (not crossing through)
+
+    SELL: mirrored logic
+    """
+    if not c15 or len(c15) < 10 or ema_val <= 0:
+        return False
+
+    lookback_n = int(session_knobs(session_name)["ema_reaction_lookback"])
+    lookback_n = int(clamp(lookback_n, 4, 12))
+    lookback = c15[-lookback_n:]
+
+    reject_count = 0
+    cross_count = 0
+
+    for c in lookback:
+        o = float(c[1])
+        h = float(c[2])
+        l = float(c[3])
+        cl = float(c[4])
+
+        rng = max(1e-9, h - l)
+        close_pos = (cl - l) / rng  # 0..1
+
+        touched = (l <= ema_val <= h)
+
+        crossed = ((o - ema_val) * (cl - ema_val)) < 0
+        if crossed:
+            cross_count += 1
+
+        if not touched:
+            continue
+
+        if side == "BUY":
+            if cl > ema_val and cl > o and close_pos >= 0.65:
+                reject_count += 1
+        else:
+            if cl < ema_val and cl < o and close_pos <= 0.35:
+                reject_count += 1
+
+    # ❌ EMA chop → invalid
+    if cross_count >= 2:
+        return False
+
+    # ✅ Need at least ONE strong rejection
+    return reject_count >= 1
+
+
+# =========================================================
+# Optional pullback policy (do NOT hard-reject signals)
+# =========================================================
+
+PULLBACK_OPTIONAL_DEFAULT = True
+PULLBACK_MISS_PENALTY_CONF = 6.0
+
+def apply_pullback_policy(
+    *,
+    require_pullback: bool,
+    pullback_ok: bool,
+    pullback_price: float | None,
+    confidence: float,
+    notes: list[str],
+):
+    if pullback_ok:
+        return True, confidence
+
+    if require_pullback:
+        return False, confidence
+
+    confidence = max(0.0, confidence - float(PULLBACK_MISS_PENALTY_CONF))
+
+    if pullback_price and pullback_price > 0:
+        notes.append(f"📝 Optional: wait for pullback entry near {pullback_price:.6g}.")
+    else:
+        notes.append("📝 Optional: consider waiting for a pullback before entering.")
+
+    return True, confidence
+
+
+def ema_rejection_candle_ok_15m(c15: List[List[float]], ema_val: float, side: str) -> bool:
+    """
+    Strict confirmation on the MOST RECENT 15m candle:
+
+    BUY (support reclaim):
+      - low <= EMA
+      - close > EMA
+      - bullish candle
+      - close in top part of range (strength)
+
+    SELL (resistance reject):
+      - high >= EMA
+      - close < EMA
+      - bearish candle
+      - close in bottom part of range (strength)
+    """
+    if not c15 or len(c15) < 2 or ema_val <= 0:
+        return False
+
+    o = float(c15[-1][1])
+    h = float(c15[-1][2])
+    l = float(c15[-1][3])
+    c = float(c15[-1][4])
+
+    rng = max(1e-9, (h - l))
+    close_pos = (c - l) / rng  # 0..1
+
+    if side == "BUY":
+        if l <= ema_val and c > ema_val and c > o and close_pos >= float(REJECTION_CLOSE_POS_MIN):
+            return True
+        return False
+
+    # SELL
+    if h >= ema_val and c < ema_val and c < o and close_pos <= float(REJECTION_CLOSE_POS_MAX):
+        return True
+    return False
+
+
+def strong_reversal_exception_ok(side: str, ch24: float, ch4: float, ch1: float) -> bool:
+    """
+    Rare override: only allow counter-trend if the move is strong across TFs.
+    """
+    if not ALLOW_STRONG_REVERSAL_EXCEPTION:
+        return False
+    try:
+        return (abs(float(ch24)) >= float(REVERSAL_CH24_ABS_MIN)
+                and abs(float(ch4)) >= float(REVERSAL_CH4_ABS_MIN)
+                and abs(float(ch1)) >= float(REVERSAL_CH1_ABS_MIN))
+    except Exception:
+        return False
+
+
+def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float, float, float, int, List[List[float]], List[List[float]]]:
+    """
+    returns: ch1, ch4, ch15, atr_1h, ema_support_15m, ema_support_period, c15, c1
+    """
+    need_1h = max(ATR_PERIOD + 6, 35)
+    c1 = fetch_ohlcv(market_symbol, "1h", limit=need_1h)
+    if not c1 or len(c1) < 25:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0, [], []
+
+    closes_1h = [float(x[4]) for x in c1]
+    c_last = closes_1h[-1]
+    c_prev1 = closes_1h[-2]
+    c_prev4 = closes_1h[-5] if len(closes_1h) >= 5 else closes_1h[0]
+
+    ch1 = ((c_last - c_prev1) / c_prev1) * 100.0 if c_prev1 else 0.0
+    ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
+    atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
+
+    c15 = fetch_ohlcv(market_symbol, "15m", limit=80)
+    if not c15 or len(c15) < 20:
+        return ch1, ch4, 0.0, atr_1h, 0.0, 0, [], c1
+
+    closes_15 = [float(x[4]) for x in c15]
+    entry_proxy = float(closes_15[-1]) if closes_15 else 0.0
+    atr_pct_proxy = (atr_1h / entry_proxy) * 100.0 if (atr_1h and entry_proxy) else 2.0
+
+    ema_support_15m, ema_period = adaptive_ema_value(closes_15, atr_pct_proxy)
+
+    c15_last = float(c15[-1][4])
+    c15_prev = float(c15[-2][4])
+    ch15 = ((c15_last - c15_prev) / c15_prev) * 100.0 if c15_prev else 0.0
+
+    return ch1, ch4, ch15, atr_1h, ema_support_15m, int(ema_period), c15, c1
+
+
+# =========================================================
+# FORMATTING
+# =========================================================
+def fmt_money(x: float) -> str:
+    ax = abs(x)
+    if ax >= 1_000_000:
+        return f"{x/1_000_000:.1f}M"
+    if ax >= 1_000:
+        return f"{x/1_000:.1f}K"
+    return f"{x:.0f}"
+
+def pct_with_emoji(p: float) -> str:
+    val = int(round(p))
+    if val >= 3:
+        emo = "🟢"
+    elif val <= -3:
+        emo = "🔴"
+    else:
+        emo = "🟡"
+    return f"{val:+d}% {emo}"
+
+def _fmt_when(ts) -> str:
+    """Best-effort timestamp formatter for decision debug commands."""
+    try:
+        if ts is None:
+            return ""
+        # If already an ISO-ish string, return as-is
+        if isinstance(ts, str):
+            s = ts.strip()
+            if s:
+                return s
+            return ""
+        # Unix timestamp (sec)
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(float(ts), tz=_dt.timezone.utc).isoformat(timespec="seconds")
+    except Exception:
+        try:
+            return str(ts)
+        except Exception:
+            return ""
+
+
+
+def tv_chart_url(symbol_base: str) -> str:
+    return f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol_base.upper()}USDT.P"
+
+def table_md(rows: List[List[Any]], headers: List[str]) -> str:
+    return "```\n" + tabulate(rows, headers=headers, tablefmt="github") + "\n```"
+
+# Email-specific price formatting (less noisy)
+def fmt_price(x: float) -> str:
+    """
+    Telegram-friendly price formatting (less noisy than raw float).
+    """
+    try:
+        x = float(x)
+    except Exception:
+        return "0"
+
+    ax = abs(x)
+    if ax >= 1000:
+        return f"{x:.2f}"
+    if ax >= 100:
+        return f"{x:.2f}"
+    if ax >= 1:
+        return f"{x:.3f}"
+    if ax >= 0.1:
+        return f"{x:.4f}"
+    if ax >= 0.01:
+        return f"{x:.5f}"
+    return f"{x:.6f}"
+
+def fmt_price_email(x: float) -> str:
+    return fmt_price(x)
+
+# =========================================================
+# TELEGRAM SAFE SEND (chunking + markdown fallback)
+# =========================================================
+from telegram.error import BadRequest, TimedOut, NetworkError, RetryAfter
+
+SAFE_CHUNK = 3800
+
+async def send_long_message(
+    update: Update,
+    text: str,
+    parse_mode: Optional[str] = None,
+    disable_web_page_preview: bool = True,
+    reply_markup=None,
+):
+    """
+    Sends long messages safely by chunking and retrying.
+
+    Notes:
+    - Telegram max message length is ~4096 chars. We stay below that.
+    - If parse_mode causes BadRequest (HTML/Markdown formatting), we retry as plain text.
+    - Retries on RetryAfter and transient network errors to avoid losing chunks.
+    """
+    if not update or not getattr(update, "message", None):
+        return
+
+    s = text or ""
+
+    # Be safe if SAFE_CHUNK is missing or too large
+    max_len = 3800
+    try:
+        max_len = int(globals().get("SAFE_CHUNK", 3800))
+    except Exception:
+        max_len = 3800
+    if max_len > 3900:
+        max_len = 3900
+    if max_len < 500:
+        max_len = 2000
+
+    chunks = [s[i : i + max_len] for i in range(0, len(s), max_len)]
+
+    first = True
+    for ch in chunks:
+
+        async def _send(pm: Optional[str]):
+            await update.message.reply_text(
+                ch,
+                parse_mode=pm,
+                disable_web_page_preview=disable_web_page_preview,
+                reply_markup=reply_markup if first else None,
+            )
+
+        # Try with requested parse_mode first (or None)
+        try:
+            await _send(parse_mode)
+
+        except RetryAfter as e:
+            # Telegram rate limit: wait then retry once
+            wait_s = int(getattr(e, "retry_after", 1)) + 1
+            await asyncio.sleep(wait_s)
+            await _send(parse_mode)
+
+        except (TimedOut, NetworkError) as e:
+            # transient network: retry once
+            logger.warning("Telegram send failed (network): %s", e)
+            await asyncio.sleep(2)
+            try:
+                await _send(parse_mode)
+            except Exception as e2:
+                logger.warning("Telegram retry failed (network): %s", e2)
+
+        except BadRequest as e:
+            # Usually formatting issue -> fallback to plain text
+            logger.warning("Telegram BadRequest (parse_mode=%s): %s | Falling back to plain text.", parse_mode, e)
+            try:
+                await _send(None)
+            except Exception as e2:
+                logger.warning("Telegram fallback send failed: %s", e2)
+
+        except Exception as e:
+            logger.exception("Telegram send failed: %s", e)
+
+        first = False
+
+# =========================================================
+# SIGNAL IDs
+# =========================================================
+def next_setup_id() -> str:
+    today = datetime.utcnow().strftime("%Y%m%d")
+    con = db_connect()
+    cur = con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("""
+            INSERT INTO setup_counter (day_yyyymmdd, seq)
+            VALUES (?, 1)
+            ON CONFLICT(day_yyyymmdd) DO UPDATE SET seq = seq + 1
+        """, (today,))
+        cur.execute("SELECT seq FROM setup_counter WHERE day_yyyymmdd=?", (today,))
+        n = int(cur.fetchone()["seq"])
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return f"PF-{today}-{n:04d}"
+
+
+def make_setup_id(base: str = '', side: str = '') -> str:
+    """Backward-compatible setup ID helper.
+
+    Some setup builders still call make_setup_id(base, side). The setup identity
+    is intentionally sequence-based and globally unique for the day, so base/side
+    are accepted for compatibility but not embedded in the ID.
+    """
+    return next_setup_id()
+
+# =========================================================
+# SL/TP ENGINE (closer + dynamic cap + ✅ confidence-weighted TP scaling)
+# =========================================================
+def sl_mult_from_conf(conf: int) -> float:
+    # slightly tighter than old premium; tuned for higher win-rate with closer TPs
+    if conf >= 88:
+        return 2.2
+    if conf >= 80:
+        return 1.95
+    if conf >= 70:
+        return 1.70
+    return 1.55
+
+def tp3_rr_target_from_conf(conf: int) -> float:
+    """
+    ✅ TP scaling: confidence-weighted RR target for TP3.
+    """
+    if conf >= 88:
+        return 2.6
+    if conf >= 80:
+        return 2.4
+    if conf >= 72:
+        return 2.2
+    # below 72 we still may keep for /screen (awareness), but email floors will filter
+    return 2.0
+
+def tp_r_mults_from_conf(conf: int) -> Tuple[float, float, float]:
+    """Return a 2-TP ladder while preserving the legacy 3-value signature."""
+    tp2 = tp3_rr_target_from_conf(conf)
+    tp1 = max(0.9, min(1.2, tp2 * 0.50))
+    if tp1 >= tp2:
+        tp1 = max(0.9, tp2 - 0.8)
+    return (tp1, tp2, tp2)
+
+def compute_sl_tp(
+    entry: float,
+    side: str,
+    atr: float,
+    conf: int,
+    tp_cap_pct: float,
+    rr_bonus: float = 0.0,
+    tp_cap_bonus_pct: float = 0.0,
+) -> Tuple[float, float, float]:
+    """
+    Returns (sl, tp3, R)
+    """
+    if entry <= 0 or atr <= 0:
+        return 0.0, 0.0, 0.0
+
+    sl_dist = sl_mult_from_conf(conf) * atr
+
+    min_dist = (ATR_MIN_PCT / 100.0) * entry
+    max_dist = (ATR_MAX_PCT / 100.0) * entry
+    sl_dist = clamp(sl_dist, min_dist, max_dist)
+
+    R = sl_dist
+
+    # ✅ confidence-weighted RR + engine bonus
+    rr_target = tp3_rr_target_from_conf(conf) + rr_bonus
+    tp_dist = rr_target * R
+
+    # ✅ TP cap with engine bonus
+    tp_cap = ((tp_cap_pct + tp_cap_bonus_pct) / 100.0) * entry
+    tp_dist = min(tp_dist, tp_cap)
+
+    if side == "BUY":
+        sl = entry - sl_dist
+        tp3 = entry + tp_dist
+    else:
+        sl = entry + sl_dist
+        tp3 = entry - tp_dist
+
+    return sl, tp3, R
+
+def _distinctify(a: float, b: float, c: float, entry: float, side: str) -> Tuple[float, float, float]:
+    if entry <= 0:
+        return a, b, c
+    eps = max(entry * 1e-6, 1e-8)
+    if side == "BUY":
+        if a >= b: a = b - eps
+        if b >= c: b = c - eps
+        if a >= b: a = b - eps
+    else:
+        if a <= b: a = b + eps
+        if b <= c: b = c + eps
+        if a <= b: a = b + eps
+    if abs(a - b) < eps: a = a - eps if side == "BUY" else a + eps
+    if abs(b - c) < eps: b = b - eps if side == "BUY" else b + eps
+    if abs(a - c) < eps: a = a - 2*eps if side == "BUY" else a + 2*eps
+    return a, b, c
+
+
+def multi_tp(
+    entry: float,
+    side: str,
+    R: float,
+    tp_cap_pct: float,
+    conf: int,
+    rr_bonus: float = 0.0,
+    tp_cap_bonus_pct: float = 0.0,
+) -> Tuple[float, float, float]:
+    if entry <= 0 or R <= 0:
+        return 0.0, 0.0, 0.0
+
+    r1, r2, _legacy = tp_r_mults_from_conf(conf)
+    r2 += rr_bonus
+    maxd = ((tp_cap_pct + tp_cap_bonus_pct) / 100.0) * entry
+    d2 = min(r2 * R, maxd)
+    d1 = min(r1 * R, d2 * (r1 / r2 if r2 > 0 else 0.5))
+
+    if side == "BUY":
+        tp1, tp2 = (entry + d1, entry + d2)
+    else:
+        tp1, tp2 = (entry - d1, entry - d2)
+
+    tp1, tp2, _ = _distinctify(tp1, tp2, tp2, entry, side)
+    return tp1, tp2, tp2
+
+
+
+def _realized_r_option_b(outcome: str, side: str, entry: float, sl: float, tp1=None, tp2=None, tp3=None):
+    """Return realized R under the canonical 2-TP model.
+
+    TP2 is the only full win state. TP1 is a partial positive outcome but does not count as a
+    canonical win in win-rate reporting. SL is -1R.
+    """
+    try:
+        outcome = _canon_signal_outcome_label(outcome)
+        entry = float(entry)
+        sl = float(sl)
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return None
+        if outcome == 'SL':
+            return -1.0
+        tp = None
+        if outcome == 'TP1':
+            tp = tp1
+            fallback = 1.0
+        elif outcome == 'TP2':
+            tp = tp2 if tp2 not in (None, '', 0, 0.0) else tp3
+            fallback = 2.0
+        else:
+            return None
+        if tp is not None:
+            try:
+                rr = abs(float(tp) - entry) / risk
+                if math.isfinite(rr) and rr > 0:
+                    return float(rr)
+            except Exception:
+                pass
+        return float(fallback)
+    except Exception:
+        return None
+
+def rr_to_tp(entry: float, sl: float, tp: float) -> float:
+    d_sl = abs(entry - sl)
+    d_tp = abs(tp - entry)
+    if d_sl <= 0:
+        return 0.0
+    return d_tp / d_sl
+
+
+
+# =========================================================
+# INSTITUTIONAL-STYLE SETUP QUALITY (SCORING + LIGHT GATES)
+# - Replaces "many stacked hard filters" with: few mandatory gates + quality score.
+# - Used by both /screen and email selection, and by backtests.
+# =========================================================
+
+QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "62"))
+QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "70"))
+
+# Soft throttling: how many candidates we score before slicing (keeps compute bounded)
+QUALITY_SCORE_CAND_MULT_SCREEN = int(os.environ.get("QUALITY_SCORE_CAND_MULT_SCREEN", "8"))
+QUALITY_SCORE_CAND_MULT_EMAIL  = int(os.environ.get("QUALITY_SCORE_CAND_MULT_EMAIL",  "10"))
+
+def _clamp01(x: float) -> float:
+    try:
+        return max(0.0, min(1.0, float(x)))
+    except Exception:
+        return 0.0
+
+def _log_norm(x: float, lo: float, hi: float) -> float:
+    """Log-normalize x into [0,1] between lo..hi (robust for volume)."""
+    try:
+        x = float(x or 0.0)
+        lo = float(lo); hi = float(hi)
+        if x <= lo:
+            return 0.0
+        if x >= hi:
+            return 1.0
+        return _clamp01((math.log(x) - math.log(lo)) / (math.log(hi) - math.log(lo)))
+    except Exception:
+        return 0.0
+
+def _mid_pref(x: float, lo: float, hi: float, mid: float | None = None) -> float:
+    """Prefer a mid-range (e.g. ATR% not too low/high). Returns [0,1]."""
+    try:
+        x = float(x or 0.0)
+        lo = float(lo); hi = float(hi)
+        if mid is None:
+            mid = (lo + hi) / 2.0
+        mid = float(mid)
+        if x <= lo or x >= hi:
+            return 0.0
+        # triangular preference peaking at mid
+        if x <= mid:
+            return _clamp01((x - lo) / (mid - lo)) if mid > lo else 0.0
+        return _clamp01((hi - x) / (hi - mid)) if hi > mid else 0.0
+    except Exception:
+        return 0.0
+
+def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[float, dict]:
+    """Return (score, components). Score is 0..100.
+
+    NOTE: This is intentionally lightweight and deterministic.
+    """
+    # Base fields
+    conf = float(getattr(s, "conf", 0) or 0)
+    fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+    entry = float(getattr(s, "entry", 0.0) or 0.0)
+    sl = float(getattr(s, "sl", 0.0) or 0.0)
+    tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+
+    rr3 = 0.0
+    try:
+        rr3 = float(rr_to_tp(entry, sl, tp3))
+    except Exception:
+        rr3 = 0.0
+
+    # --- Component A: Market regime (lightweight, mandatory-ish) ---
+    regime = str(getattr(s, "regime", "") or "").upper()
+    # Trending regimes score higher; unstable is penalized; ranging is allowed but lower score.
+    regime_score = 0.55
+    if "TREND" in regime:
+        regime_score = 1.0
+    elif "RANG" in regime:
+        regime_score = 0.55
+    elif "VOL" in regime or "UNST" in regime:
+        regime_score = 0.20
+
+    # --- Component B: Trend/structure bias (simple alignment) ---
+    trend = str(getattr(s, "trend", "") or "").upper()
+    structure = str(getattr(s, "structure", "") or "").upper()
+    side = str(getattr(s, "side", "") or "").upper()
+    align = 0.5
+    want = "BULLISH" if side == "BUY" else "BEARISH" if side == "SELL" else ""
+    if want:
+        if want in trend:
+            align += 0.25
+        if want in structure:
+            align += 0.25
+    align = _clamp01(align)
+
+    # --- Component C: Entry trigger cleanliness (proxy: EMA distance + stop distance sanity) ---
+    ema_dist = float(getattr(s, "pullback_ema_dist_pct", 0.0) or 0.0)
+    # Prefer pullbacks not too far from EMA (but don't hard-gate)
+    ema_clean = 1.0 - _clamp01(ema_dist / 2.0)  # 0%..2% maps to 1..0
+
+    # Stop distance should not be absurdly tight or huge vs ATR (if atr_pct available)
+    atr_pct = float(getattr(s, "atr_pct", 0.0) or 0.0)
+    stop_pct = 0.0
+    try:
+        stop_pct = abs(entry - sl) / entry * 100.0 if entry > 0 else 0.0
+    except Exception:
+        stop_pct = 0.0
+    # Prefer stop roughly within [0.3%..3.5%] (crypto perps, 15m/1h)
+    stop_sane = _mid_pref(stop_pct, 0.25, 4.5, mid=1.4)
+
+    # --- Component D: Risk & trade construction (RR + TP validity) ---
+    rr_score = _clamp01(rr3 / 2.2)  # RR 2.2 ~ full
+    tp_valid = 1.0 if (entry > 0 and sl > 0 and tp3 > 0 and rr3 > 0.2) else 0.0
+
+    # --- Component E: Quality scoring inputs ---
+    vol_score = _log_norm(fut_vol, lo=float(MIN_FUT_VOL_USD or 10_000_000), hi=120_000_000.0)
+    atr_score = _mid_pref(atr_pct if atr_pct > 0 else stop_pct, 0.7, 9.0, mid=2.5)
+
+    sweep = str(getattr(s, "sweep", "") or "").upper()
+    sweep_score = 0.0 if sweep in ("", "NONE") else 0.7
+
+    smf_event = str(getattr(s, "smf_event", "") or "").upper()
+    smf_score_i = int(getattr(s, "smf_score", 0) or 0)
+    smf_bonus = 0.0
+    if side == "BUY" and smf_event in ("BUY_IGNITION", "LIQUIDATION_BUY"):
+        smf_bonus = 0.6 + 0.1 * min(3, max(0, smf_score_i))
+    if side == "SELL" and smf_event in ("SELL_IGNITION", "LIQUIDATION_SELL"):
+        smf_bonus = 0.6 + 0.1 * min(3, max(0, smf_score_i))
+    if (side == "BUY" and smf_event in ("SELL_IGNITION", "LIQUIDATION_SELL")) or (side == "SELL" and smf_event in ("BUY_IGNITION", "LIQUIDATION_BUY")):
+        smf_bonus -= 0.5  # soft penalty only (never a hard block)
+
+    # Weighting (total ~100)
+    components = {
+        "conf": conf,  # already 0..100-ish
+        "regime": regime_score,
+        "align": align,
+        "rr": rr_score,
+        "vol": vol_score,
+        "atr": atr_score,
+        "ema_clean": ema_clean,
+        "stop_sane": stop_sane,
+        "tp_valid": tp_valid,
+        "sweep": sweep_score,
+        "smf": smf_bonus,
+        "rr3": rr3,
+    }
+
+    # Weighted score (0..100) — weights come from StrategyConfig (see _QUALITY_W)
+    try:
+        w = dict(globals().get("_QUALITY_W") or {})
+    except Exception:
+        w = {}
+    def _w(name: str, default: float) -> float:
+        try:
+            return float(w.get(name, default))
+        except Exception:
+            return float(default)
+
+    score = (
+        _w("conf", 0.45) * _clamp01(conf / 100.0) * 100.0 +
+        _w("regime", 0.12) * regime_score * 100.0 +
+        _w("align", 0.10) * align * 100.0 +
+        _w("rr", 0.10) * rr_score * 100.0 +
+        _w("vol", 0.08) * vol_score * 100.0 +
+        _w("atr", 0.06) * atr_score * 100.0 +
+        _w("ema_clean", 0.04) * ema_clean * 100.0 +
+        _w("stop_sane", 0.04) * stop_sane * 100.0 +
+        _w("sweep", 0.03) * sweep_score * 100.0 +
+        _w("smf", 0.01) * (smf_bonus * 100.0)
+    )
+
+    # If TP is invalid, cap the score hard (still allows diagnostics/backtest)
+    if tp_valid <= 0:
+        score = min(score, 35.0)
+
+    # Session slight tuning (NY a bit looser)
+    sname = str(session_name or "").upper()
+    if sname == "NY":
+        score += 2.0
+    elif sname == "ASIA":
+        score -= 1.0
+
+    return float(clamp(score, 0.0, 100.0)), components
+
+# =========================================================
+# BACKTESTING (ADMIN) — lightweight, deterministic, no ML
+# =========================================================
+
+def _parse_days(s: str) -> int:
+    try:
+        s = str(s).strip().lower().replace("d", "")
+        return max(1, min(365, int(float(s))))
+    except Exception:
+        return 30
+
+def _tf_to_minutes(tf: str) -> int:
+    t = str(tf or "").strip().lower()
+    if t.endswith("m"):
+        return int(float(t[:-1] or 0))
+    if t.endswith("h"):
+        return int(float(t[:-1] or 0)) * 60
+    if t.endswith("d"):
+        return int(float(t[:-1] or 0)) * 1440
+    # common aliases
+    if t in ("15", "15min"):
+        return 15
+    if t in ("60", "1hour", "1hr"):
+        return 60
+    return 60
+
+def _ema_series(closes: list[float], period: int) -> list[float]:
+    if not closes:
+        return []
+    k = 2.0 / (period + 1.0)
+    ema = float(closes[0])
+    out = [ema]
+    for v in closes[1:]:
+        ema = (float(v) * k) + (ema * (1.0 - k))
+        out.append(float(ema))
+    return out
+
+def _atr_series(ohlcv: list, period: int = 14) -> list[float]:
+    # ohlcv: [ts, o, h, l, c, v]
+    if not ohlcv or len(ohlcv) < period + 2:
+        return []
+    trs = []
+    prev_close = float(ohlcv[0][4])
+    for i in range(1, len(ohlcv)):
+        h = float(ohlcv[i][2]); l = float(ohlcv[i][3]); c = float(ohlcv[i][4])
+        tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        trs.append(tr)
+        prev_close = c
+    # simple rolling ATR (Wilder-ish smoothing would be better; this is fast & ok)
+    out = [0.0] * len(ohlcv)
+    for i in range(period, len(trs)):
+        out[i+1] = float(sum(trs[i-period+1:i+1]) / period)
+    return out
+
+def _candle_strength(o: float, h: float, l: float, c: float, side: str) -> float:
+    # 0..1 where 1 = strong close in direction
+    try:
+        rng = max(1e-12, float(h) - float(l))
+        if str(side).upper() == "BUY":
+            return _clamp01((float(c) - float(l)) / rng)
+        return _clamp01((float(h) - float(c)) / rng)
+    except Exception:
+        return 0.5
+
+
+def _session_label_from_ts(ts_sec: float) -> str:
+    """Infer session from UTC hour. Ranges are approximate and intentionally simple."""
+    try:
+        dt = datetime.fromtimestamp(float(ts_sec), tz=timezone.utc)
+        h = int(dt.hour)
+    except Exception:
+        return "NY"
+    # ASIA ~ 00:00-08:00 UTC, LON ~ 08:00-16:00, NY ~ 16:00-24:00
+    if 0 <= h < 8:
+        return "ASIA"
+    if 8 <= h < 16:
+        return "LON"
+    return "NY"
+
+def _ts_in_session(ts_sec: float, session_name: str) -> bool:
+    s = (session_name or "").strip().upper()
+    if s not in {"ASIA","LON","NY"}:
+        return True
+    return _session_label_from_ts(ts_sec) == s
+
+from collections import Counter as _CounterBT
+_BT_LAST_REJECTS = _CounterBT()
+
+def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: str = "NY") -> list:
+    """Generate setups from historical bars using the same *architecture* (A-E).
+    Returns list of Setup-like dicts.
+    """
+    if not ohlcv or len(ohlcv) < 250:
+        return []
+
+    closes = [float(x[4]) for x in ohlcv]
+    highs  = [float(x[2]) for x in ohlcv]
+    lows   = [float(x[3]) for x in ohlcv]
+    opens  = [float(x[1]) for x in ohlcv]
+    vols   = [float(x[5] or 0.0) for x in ohlcv]
+
+    ema13 = _ema_series(closes, 13)
+    ema21 = _ema_series(closes, 21)
+    atr   = _atr_series(ohlcv, 14)
+
+    global _BT_LAST_REJECTS
+    _BT_LAST_REJECTS = Counter()
+
+    setups = []
+    warm = 80
+
+    # Pull regime thresholds from StrategyConfig (single source of truth)
+    cfg = load_strategy_config(force=False)
+    slope_thr = float(cfg.get("regime_slope_trend_min_pct", 0.06))
+    atr_lo = float(cfg.get("regime_atr_pct_min", 0.7))
+    atr_hi = float(cfg.get("regime_atr_pct_max", 9.0))
+    unstable_hi = float(cfg.get("regime_unstable_atr_hi", 10.5))
+    unstable_lo = float(cfg.get("regime_unstable_atr_lo", 0.3))
+
+
+    for i in range(warm, len(ohlcv) - 2):
+        px = closes[i]
+
+        # Session gating (optional)
+        try:
+            ts_raw = float(ohlcv[i][0] or 0.0)
+            ts_sec = (ts_raw / 1000.0) if ts_raw > 1e12 else ts_raw
+        except Exception:
+            ts_sec = 0.0
+        if session_name and (not _ts_in_session(ts_sec, session_name)):
+            try:
+                _BT_LAST_REJECTS["out_of_session"] += 1
+            except Exception:
+                pass
+            continue
+        if px <= 0:
+            continue
+
+        # --- A) Regime (light gate) ---
+        slope = (ema21[i] - ema21[i-3]) / px * 100.0 if i >= 3 else 0.0
+        atr_pct = (atr[i] / px * 100.0) if atr and atr[i] else 0.0
+
+        regime = "RANGING"
+        if abs(slope) >= slope_thr and atr_lo <= atr_pct <= atr_hi:
+            regime = "TRENDING"
+        if atr_pct >= unstable_hi or atr_pct <= unstable_lo:
+            regime = "UNSTABLE"
+
+        if regime == "UNSTABLE":
+            try:
+                _BT_LAST_REJECTS["regime_unstable"] += 1
+            except Exception:
+                pass
+            continue  # hard gate
+
+        # --- B) Trend/Bias ---
+        bias = "NONE"
+        if ema13[i] > ema21[i] and slope > 0:
+            bias = "BUY"
+        elif ema13[i] < ema21[i] and slope < 0:
+            bias = "SELL"
+        else:
+            bias = "NONE"
+
+        if bias == "NONE":
+            continue
+
+        # --- C) Triggers (pullback OR breakout) ---
+        trigger = None
+        side = bias
+        # pullback: price dipped through EMA13 then reclaimed with a strong candle
+        if side == "BUY":
+            dipped = min(lows[i-3:i+1]) < ema13[i] * (1.0 - 0.0015)
+            reclaimed = closes[i] > ema13[i] and closes[i-1] < ema13[i-1]
+            strength = _candle_strength(opens[i], highs[i], lows[i], closes[i], side)
+            if dipped and reclaimed and strength >= 0.60:
+                trigger = "PULLBACK"
+        else:
+            spiked = max(highs[i-3:i+1]) > ema13[i] * (1.0 + 0.0015)
+            reclaimed = closes[i] < ema13[i] and closes[i-1] > ema13[i-1]
+            strength = _candle_strength(opens[i], highs[i], lows[i], closes[i], side)
+            if spiked and reclaimed and strength >= 0.60:
+                trigger = "PULLBACK"
+
+        # breakout: 20-bar range break with volume
+        if trigger is None and regime == "TRENDING":
+            hh20 = max(highs[i-20:i]) if i >= 20 else highs[i]
+            ll20 = min(lows[i-20:i]) if i >= 20 else lows[i]
+            vavg = (sum(vols[i-20:i]) / 20.0) if i >= 20 else vols[i]
+            vnow = vols[i]
+            if side == "BUY" and closes[i] > hh20 and vnow >= max(1.0, vavg) * 1.10:
+                trigger = "BREAKOUT"
+            if side == "SELL" and closes[i] < ll20 and vnow >= max(1.0, vavg) * 1.10:
+                trigger = "BREAKOUT"
+
+        if trigger is None:
+            continue
+
+        # --- D) Risk construction (ATR/structure stop + R targets) ---
+        entry = opens[i+1]  # next bar open (deterministic)
+        if entry <= 0:
+            continue
+
+        if side == "BUY":
+            sl = min(lows[i-5:i+1]) if i >= 5 else lows[i]
+            sl = min(sl, entry - (atr[i] * 1.2 if atr and atr[i] else entry * 0.01))
+            if sl >= entry:
+                continue
+        else:
+            sl = max(highs[i-5:i+1]) if i >= 5 else highs[i]
+            sl = max(sl, entry + (atr[i] * 1.2 if atr and atr[i] else entry * 0.01))
+            if sl <= entry:
+                continue
+
+        R = abs(entry - sl)
+        tp3 = entry + 2.2 * R if side == "BUY" else entry - 2.2 * R
+
+        t1, t2, t3 = _ensure_three_tps(entry, sl, tp3, None, None, side)
+
+        # synthetic "conf" from components (kept consistent with live scoring)
+        conf = 60
+        conf += 6 if trigger == "PULLBACK" else 4
+        conf += 6 if regime == "TRENDING" else 1
+        conf += int(min(10, max(0.0, abs(slope) * 40)))
+        conf = int(clamp(conf, 0, 95))
+
+        s = Setup(
+            setup_id=f"BT-{i}",
+            symbol=str(symbol).upper().replace("USDT",""),
+            market_symbol=str(symbol).upper(),
+            side=side,
+            conf=int(conf),
+            entry=float(entry),
+            sl=float(sl),
+            tp1=float(t1),
+            tp2=float(t2),
+            tp3=float(t3),
+            fut_vol_usd=float(0.0),
+            ch24=float(0.0),
+            ch4=float(0.0),
+            ch1=float(0.0),
+            ch15=float(0.0),
+            ema_support_period=13,
+            ema_support_dist_pct=0.0,
+            pullback_ema_period=13,
+            pullback_ema_dist_pct=0.0,
+            pullback_ready=True,
+            pullback_bypass_hot=False,
+            engine="A" if trigger == "PULLBACK" else "B",
+            is_trailing_tp3=False,
+            created_ts=float(ohlcv[i][0]) / 1000.0 if float(ohlcv[i][0] or 0) > 1e12 else float(ohlcv[i][0] or 0.0),
+        )
+        setattr(s, "atr_pct", float(atr_pct))
+        setattr(s, "regime", regime)
+        try:
+            setattr(s, "session", _session_label_from_ts(getattr(s, "created_ts", 0.0)))
+        except Exception:
+            pass
+        setattr(s, "trend", "BULLISH" if side == "BUY" else "BEARISH")
+        setattr(s, "structure", getattr(s, "trend"))
+        score, _ = compute_setup_quality_score(s, session_name=session_name)
+        setattr(s, "quality_score", float(score))
+
+        # E) Score threshold
+        if float(score) >= float(QUALITY_SCORE_MIN_SCREEN):
+            setups.append(s)
+        else:
+            try:
+                _BT_LAST_REJECTS["score_below_min"] += 1
+            except Exception:
+                pass
+
+    return setups
+
+def _tp_split_two_target() -> tuple[float, float]:
+    """Collapse any configured TP split into canonical 2-target weights."""
+    try:
+        raw = list(AUTOTRADE_TP_SPLIT or [0.5, 0.5, 0.0])
+    except Exception:
+        raw = [0.5, 0.5, 0.0]
+    while len(raw) < 3:
+        raw.append(0.0)
+    w1 = float(raw[0] or 0.0)
+    w2 = float(raw[1] or 0.0) + float(raw[2] or 0.0)
+    s = w1 + w2
+    if s <= 0:
+        return 0.5, 0.5
+    return float(w1 / s), float(w2 / s)
+
+
+def _parse_days_ago(s: str | int | float | None) -> int:
+    try:
+        x = str(s or '0').strip().lower().replace('ago', '').replace('d', '')
+        return max(0, min(365, int(float(x))))
+    except Exception:
+        return 0
+
+
+def _backtest_window_bounds(days: int, end_days_ago: int = 0, warmup_bars: int = 300, tf: str = '1h') -> tuple[int, int, int, int]:
+    """Return (since_ms, until_ms, eval_since_ms, eval_until_ms)."""
+    now_ms = int(time.time() * 1000)
+    d = max(1, int(days or 1))
+    ago = max(0, int(end_days_ago or 0))
+    tf_min = max(1, _tf_to_minutes(tf))
+    eval_until_ms = now_ms - (ago * 86400 * 1000)
+    eval_since_ms = eval_until_ms - (d * 86400 * 1000)
+    warmup_ms = int(max(50, warmup_bars) * tf_min * 60 * 1000)
+    since_ms = max(0, eval_since_ms - warmup_ms)
+    until_ms = eval_until_ms
+    return int(since_ms), int(until_ms), int(eval_since_ms), int(eval_until_ms)
+
+
+def _simulate_one_setup(
+    ohlcv: list,
+    start_i: int,
+    setup: "Setup",
+    max_bars: int = 96,
+    move_sl_to_be_after_tp1: bool = True,
+) -> dict:
+    """Simulate canonical 2-TP behavior (TP1, TP2, SL, OPEN/TIMEOUT).
+
+    R multiple is weighted using the live TP split collapsed into two targets.
+    If TP1 is hit and BE-after-TP1 is enabled, the remaining size is assumed to be
+    protected at entry for the rest of the trade.
+    """
+    entry = float(getattr(setup, 'entry', 0.0) or 0.0)
+    sl = float(getattr(setup, 'sl', 0.0) or 0.0)
+    side = str(getattr(setup, 'side', '') or '').upper()
+    tp1 = float(getattr(setup, 'tp1', 0.0) or 0.0)
+    tp2 = float(getattr(setup, 'tp2', 0.0) or getattr(setup, 'tp3', 0.0) or 0.0)
+    tp1, tp2, _ = _ensure_three_tps(entry, sl, float(tp2 or 0.0), tp1, tp2, side)
+
+    R = abs(entry - sl)
+    if entry <= 0 or sl <= 0 or tp1 <= 0 or tp2 <= 0 or R <= 0:
+        return {'outcome': 'INVALID', 'R': 0.0, 'bars': 0, 'hit_tp1': False, 'hit_tp2': False}
+
+    w1, w2 = _tp_split_two_target()
+    rr1 = float(rr_to_tp(entry, sl, tp1) or 0.0)
+    rr2 = float(rr_to_tp(entry, sl, tp2) or 0.0)
+    end = min(len(ohlcv), start_i + max_bars)
+
+    tp1_hit = False
+    remaining_sl = sl
+    realized_r = 0.0
+
+    for j in range(start_i, end):
+        h = float(ohlcv[j][2]); l = float(ohlcv[j][3])
+        if side == 'BUY':
+            hit_sl = l <= remaining_sl
+            hit1 = h >= tp1
+            hit2 = h >= tp2
+        else:
+            hit_sl = h >= remaining_sl
+            hit1 = l <= tp1
+            hit2 = l <= tp2
+
+        if not tp1_hit:
+            if hit_sl and (hit1 or hit2):
+                return {'outcome': 'SL_FIRST', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_tp2': False}
+            if hit_sl:
+                return {'outcome': 'SL', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_tp2': False}
+            if hit2:
+                return {'outcome': 'TP2', 'R': float((w1 * rr1) + (w2 * rr2)), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': True}
+            if hit1:
+                tp1_hit = True
+                realized_r += float(w1 * rr1)
+                if move_sl_to_be_after_tp1:
+                    remaining_sl = entry
+                continue
+        else:
+            if hit2:
+                return {'outcome': 'TP2', 'R': float(realized_r + (w2 * rr2)), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': True}
+            if hit_sl:
+                if move_sl_to_be_after_tp1:
+                    return {'outcome': 'TP1_BE', 'R': float(realized_r), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': False}
+                return {'outcome': 'TP1_SL', 'R': float(realized_r - w2), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': False}
+
+    c = float(ohlcv[end - 1][4])
+    rem_r = ((c - entry) / R) if side == 'BUY' else ((entry - c) / R)
+    if tp1_hit:
+        return {'outcome': 'TP1_TIMEOUT', 'R': float(realized_r + (w2 * rem_r)), 'bars': end - start_i, 'hit_tp1': True, 'hit_tp2': False}
+    return {'outcome': 'TIMEOUT', 'R': float(rem_r), 'bars': end - start_i, 'hit_tp1': False, 'hit_tp2': False}
+
+
+def run_backtest(
+    symbol: str,
+    days: int = 30,
+    tf: str = '1h',
+    session_name: str = 'NY',
+    end_days_ago: int = 0,
+    initial_equity: float = 1000.0,
+    risk_pct: float = 1.0,
+    compounding: bool = True,
+    move_sl_to_be_after_tp1: bool = True,
+) -> dict:
+    """Admin backtest runner with anchored historical windows and equity-based results."""
+    sym = _bybit_linear_symbol(symbol)
+    d = _parse_days(str(days))
+    tf = str(tf or '1h').strip().lower()
+    end_days_ago = _parse_days_ago(end_days_ago)
+    sess = str(session_name or 'NY').strip().upper()
+    if sess in ('ALL', 'ANY', '*'):
+        sess = ''
+
+    tf_min = _tf_to_minutes(tf)
+    warmup_bars = 300
+    since_ms, until_ms, eval_since_ms, eval_until_ms = _backtest_window_bounds(d, end_days_ago=end_days_ago, warmup_bars=warmup_bars, tf=tf)
+    limit = 1000 if tf_min <= 60 else 500
+    ohlcv = fetch_ohlcv_paged(sym, tf, since_ms=since_ms, until_ms=until_ms, limit=limit)
+    if not ohlcv or len(ohlcv) < 300:
+        return {'ok': False, 'error': 'insufficient_ohlcv', 'symbol': sym, 'tf': tf, 'days': d, 'end_days_ago': end_days_ago}
+
+    ohlcv = [c for c in sorted(ohlcv, key=lambda r: r[0]) if int(c[0]) <= int(eval_until_ms)]
+    if not ohlcv:
+        return {'ok': False, 'error': 'empty_window', 'symbol': sym, 'tf': tf, 'days': d, 'end_days_ago': end_days_ago}
+
+    setups = _backtest_generate_setups(sym, ohlcv, tf, session_name=sess)
+    if eval_since_ms > 0:
+        filtered = []
+        for s in setups:
+            try:
+                cts = float(getattr(s, 'created_ts', 0.0) or 0.0)
+                ts_ms = int(cts * 1000)
+                if ts_ms < int(eval_since_ms) or ts_ms > int(eval_until_ms):
+                    continue
+                filtered.append(s)
+            except Exception:
+                continue
+        setups = filtered
+
+    if not setups:
+        return {
+            'ok': True, 'symbol': sym, 'tf': tf, 'days': d, 'end_days_ago': end_days_ago,
+            'window_start_ts': eval_since_ms / 1000.0, 'window_end_ts': eval_until_ms / 1000.0,
+            'setups': 0, 'trades': 0, 'win_rate': 0.0, 'tp1_rate': 0.0, 'tp2_rate': 0.0,
+            'avg_R': 0.0, 'profit_factor': 0.0, 'max_drawdown_R': 0.0, 'equity_R': 0.0,
+            'initial_equity': float(initial_equity), 'ending_equity': float(initial_equity), 'net_pnl_usd': 0.0,
+            'max_drawdown_usd': 0.0, 'reject_breakdown': dict(_BT_LAST_REJECTS), 'by_session': {},
+        }
+
+    results = []
+    eq_r = 0.0
+    peak_r = 0.0
+    max_dd_r = 0.0
+    eq_usd = float(max(1.0, initial_equity or 1000.0))
+    peak_usd = eq_usd
+    max_dd_usd = 0.0
+    fixed_risk_usd = float(eq_usd * (max(0.01, float(risk_pct or 1.0)) / 100.0))
+    by_session = defaultdict(lambda: {'setups': 0, 'wins': 0, 'losses': 0, 'tp1_hits': 0, 'tp2_hits': 0, 'r': []})
+    hold_bars = []
+
+    for s in setups:
+        try:
+            sid = str(getattr(s, 'setup_id', 'BT-0'))
+            i = int(sid.split('-')[-1])
+        except Exception:
+            i = 0
+
+        ts_sec = 0.0
+        try:
+            ts_raw = float((ohlcv[i][0] if i < len(ohlcv) else ohlcv[-1][0]) or 0.0)
+            ts_sec = (ts_raw / 1000.0) if ts_raw > 1e12 else ts_raw
+        except Exception:
+            ts_sec = 0.0
+        try:
+            sess_name = str(_session_label_from_ts(ts_sec) or '?')
+        except Exception:
+            sess_name = '?'
+
+        res = _simulate_one_setup(ohlcv, i + 1, s, move_sl_to_be_after_tp1=bool(move_sl_to_be_after_tp1))
+        r_mult = float(res.get('R', 0.0) or 0.0)
+        risk_usd = float(eq_usd * (max(0.01, float(risk_pct or 1.0)) / 100.0)) if compounding else fixed_risk_usd
+        pnl_usd = float(r_mult * risk_usd)
+        eq_usd += pnl_usd
+        peak_usd = max(peak_usd, eq_usd)
+        max_dd_usd = max(max_dd_usd, peak_usd - eq_usd)
+
+        eq_r += r_mult
+        peak_r = max(peak_r, eq_r)
+        max_dd_r = max(max_dd_r, peak_r - eq_r)
+
+        out = str(res.get('outcome') or '').upper().strip()
+        by_session[sess_name]['setups'] += 1
+        by_session[sess_name]['r'].append(r_mult)
+        if bool(res.get('hit_tp1')):
+            by_session[sess_name]['tp1_hits'] += 1
+        if bool(res.get('hit_tp2')):
+            by_session[sess_name]['tp2_hits'] += 1
+        if out in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2'):
+            by_session[sess_name]['wins'] += 1
+        elif out in ('SL', 'SL_FIRST', 'TP1_SL'):
+            by_session[sess_name]['losses'] += 1
+        try:
+            hold_bars.append(int(res.get('bars', 0) or 0))
+        except Exception:
+            pass
+
+        res['setup_id'] = getattr(s, 'setup_id', '')
+        res['score'] = float(getattr(s, 'quality_score', 0.0) or 0.0)
+        res['session'] = sess_name
+        res['pnl_usd'] = float(pnl_usd)
+        res['equity_after_usd'] = float(eq_usd)
+        results.append(res)
+
+    total = len(results)
+    wins = sum(1 for r in results if str(r.get('outcome') or '').upper().strip() in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2'))
+    tp1_hits = sum(1 for r in results if bool(r.get('hit_tp1')))
+    tp2_hits = sum(1 for r in results if bool(r.get('hit_tp2')))
+    win_rate = (wins / total * 100.0) if total else 0.0
+    tp1_rate = (tp1_hits / total * 100.0) if total else 0.0
+    tp2_rate = (tp2_hits / total * 100.0) if total else 0.0
+    avg_r = (sum(float(r.get('R', 0.0) or 0.0) for r in results) / total) if total else 0.0
+    gross_win = sum(max(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
+    gross_loss = sum(min(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float('inf') if gross_win > 0 else 0.0)
+
+    by_sess_out = {}
+    for sess_name, dct in dict(by_session).items():
+        s_n = int(dct.get('setups', 0) or 0)
+        s_w = int(dct.get('wins', 0) or 0)
+        rr = dct.get('r') or []
+        by_sess_out[str(sess_name)] = {
+            'setups': s_n,
+            'wins': s_w,
+            'losses': int(dct.get('losses', 0) or 0),
+            'win_rate': float((s_w / s_n * 100.0) if s_n else 0.0),
+            'tp1_rate': float((int(dct.get('tp1_hits', 0) or 0) / s_n * 100.0) if s_n else 0.0),
+            'tp2_rate': float((int(dct.get('tp2_hits', 0) or 0) / s_n * 100.0) if s_n else 0.0),
+            'avg_R': float((sum(float(x) for x in rr) / len(rr)) if rr else 0.0),
+        }
+
+    avg_hold_minutes = (sum(hold_bars) / len(hold_bars) * tf_min) if hold_bars else 0.0
+    return {
+        'ok': True,
+        'symbol': sym,
+        'tf': tf,
+        'days': d,
+        'end_days_ago': end_days_ago,
+        'window_start_ts': eval_since_ms / 1000.0,
+        'window_end_ts': eval_until_ms / 1000.0,
+        'setups': total,
+        'trades': total,
+        'win_rate': float(win_rate),
+        'tp1_rate': float(tp1_rate),
+        'tp2_rate': float(tp2_rate),
+        'avg_R': float(avg_r),
+        'profit_factor': pf,
+        'max_drawdown_R': float(max_dd_r),
+        'equity_R': float(eq_r),
+        'initial_equity': float(initial_equity),
+        'ending_equity': float(eq_usd),
+        'net_pnl_usd': float(eq_usd - float(initial_equity)),
+        'max_drawdown_usd': float(max_dd_usd),
+        'risk_pct': float(risk_pct),
+        'compounding': bool(compounding),
+        'avg_hold_minutes': float(avg_hold_minutes),
+        'reject_breakdown': dict(_BT_LAST_REJECTS),
+        'by_session': by_sess_out,
+        'sample': results[:12],
+    }
+
+
+async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text('Admin only.')
+        return
+    args = (context.args or [])
+    if len(args) < 3:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/backtest BTCUSDT 30d 1h\n"
+            "/backtest ETHUSDT 7d 15m NY 0ago 1000\n"
+            "/backtest BTCUSDT 14d 1h ALL 7ago 1000 1.0 on\n\n"
+            "Args: symbol days tf [session=NY|LON|ASIA|ALL] [end_days_ago=0ago] [equity=1000] [risk%=1.0] [compound=on|off]"
+        )
+        return
+    symbol = args[0]
+    days = args[1]
+    tf = args[2]
+    session_name = str(args[3]).upper().strip() if len(args) >= 4 else 'NY'
+    end_days_ago = _parse_days_ago(args[4]) if len(args) >= 5 else 0
+    try:
+        initial_equity = float(args[5]) if len(args) >= 6 else 1000.0
+    except Exception:
+        initial_equity = 1000.0
+    try:
+        risk_pct = float(args[6]) if len(args) >= 7 else 1.0
+    except Exception:
+        risk_pct = 1.0
+    compound = True
+    if len(args) >= 8:
+        compound = str(args[7]).strip().lower() not in ('off', 'false', '0', 'no')
+
+    await update.message.reply_text('⏳ Running backtest…')
+    try:
+        rep = await to_thread_heavy(
+            run_backtest,
+            symbol,
+            days,
+            tf,
+            session_name=session_name,
+            end_days_ago=end_days_ago,
+            initial_equity=initial_equity,
+            risk_pct=risk_pct,
+            compounding=compound,
+            move_sl_to_be_after_tp1=True,
+        )
+    except Exception as e:
+        await update.message.reply_text(f'Backtest failed: {type(e).__name__}: {e}')
+        return
+
+    if not rep.get('ok'):
+        await update.message.reply_text(f"Backtest error: {rep.get('error')}")
+        return
+
+    lines = []
+    lines.append('📊 Backtest Report')
+    lines.append(HDR)
+    lines.append(f"Symbol: {rep.get('symbol')}")
+    lines.append(f"TF: {rep.get('tf')} | Days: {rep.get('days')} | Session: {session_name}")
+    try:
+        ws = datetime.fromtimestamp(float(rep.get('window_start_ts') or 0.0), tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        we = datetime.fromtimestamp(float(rep.get('window_end_ts') or 0.0), tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        lines.append(f"Window: {ws} → {we} | End offset: {int(rep.get('end_days_ago', 0) or 0)}d ago")
+    except Exception:
+        pass
+    lines.append(SEP)
+    lines.append(f"Setups: {rep.get('setups')}")
+    try:
+        setups_day = (float(rep.get('setups', 0) or 0) / float(rep.get('days', 1) or 1))
+        lines.append(f"Setups/day: {setups_day:.2f}")
+    except Exception:
+        pass
+    lines.append(f"Win rate: {_fmt_num(rep.get('win_rate'), '.1f')}%")
+    lines.append(f"TP1 hit rate: {_fmt_num(rep.get('tp1_rate'), '.1f')}%")
+    lines.append(f"TP2 hit rate: {_fmt_num(rep.get('tp2_rate'), '.1f')}%")
+    lines.append(f"Avg R: {_fmt_num(rep.get('avg_R'), '.3f')}")
+    lines.append(f"Profit factor: {_fmt_num(rep.get('profit_factor'), '.2f')}")
+    lines.append(f"Max DD (R): {_fmt_num(rep.get('max_drawdown_R'), '.2f')}")
+    lines.append(f"Net (R): {_fmt_num(rep.get('equity_R'), '.2f')}")
+    lines.append(f"Start equity: ${float(rep.get('initial_equity', 0.0) or 0.0):,.2f}")
+    lines.append(f"End equity: ${float(rep.get('ending_equity', 0.0) or 0.0):,.2f}")
+    lines.append(f"Net PnL: ${float(rep.get('net_pnl_usd', 0.0) or 0.0):,.2f}")
+    lines.append(f"Max DD ($): ${float(rep.get('max_drawdown_usd', 0.0) or 0.0):,.2f}")
+    try:
+        lines.append(f"Avg hold: {float(rep.get('avg_hold_minutes', 0.0) or 0.0):.1f} min")
+    except Exception:
+        pass
+
+    try:
+        bs = rep.get('by_session') or {}
+        if isinstance(bs, dict) and bs:
+            lines.append(SEP)
+            lines.append('By session:')
+            for sname in ('NY', 'LON', 'ASIA'):
+                d = bs.get(sname) or {}
+                if not d:
+                    continue
+                lines.append(
+                    f"• {sname}: setups={int(d.get('setups', 0) or 0)} | WR={float(d.get('win_rate', 0.0) or 0.0):.1f}% | TP1={float(d.get('tp1_rate', 0.0) or 0.0):.1f}% | TP2={float(d.get('tp2_rate', 0.0) or 0.0):.1f}% | AvgR={float(d.get('avg_R', 0.0) or 0.0):.2f}"
+                )
+    except Exception:
+        pass
+
+    try:
+        rb = rep.get('reject_breakdown') or {}
+        if isinstance(rb, dict) and rb:
+            lines.append(SEP)
+            lines.append('Reject breakdown (top):')
+            items = sorted(rb.items(), key=lambda kv: int(kv[1]), reverse=True)[:10]
+            for k, v in items:
+                lines.append(f'• {k}: {v}')
+    except Exception:
+        pass
+
+    await update.message.reply_text('\\n'.join(lines))
+
+
+def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session_name: str) -> dict:
+    """Same as run_backtest but uses already-fetched ohlcv.
+
+    WIN DEFINITION (enforced everywhere in backtests/optimizer):
+    - WIN = TP1 is hit before SL within the evaluation window.
+      (If TP2/TP3 hit first, TP1 necessarily hit earlier, so TP2/TP3 are also wins.)
+    """
+    if not ohlcv or len(ohlcv) < 300:
+        return {"ok": False, "error": "insufficient_ohlcv", "symbol": symbol, "tf": tf, "days": days}
+
+    setups = _backtest_generate_setups(symbol, ohlcv, tf, session_name=session_name)
+    if not setups:
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "tf": tf,
+            "days": days,
+            "setups": 0,
+            "trades": 0,
+            "win_rate": 0.0,
+            "avg_R": 0.0,
+            "profit_factor": 0.0,
+            "max_drawdown_R": 0.0,
+            "equity_R": 0.0,
+            "reject_breakdown": dict(_BT_LAST_REJECTS),
+            "by_session": {},
+        }
+
+    results = []
+    eq = 0.0
+    peak = 0.0
+    max_dd = 0.0
+
+    by_session = defaultdict(lambda: {"setups": 0, "wins": 0, "losses": 0, "r": []})
+
+    for s in setups:
+        try:
+            sid = str(getattr(s, "setup_id", "BT-0"))
+            i = int(sid.split("-")[-1])
+        except Exception:
+            i = 0
+
+        # Infer the setup timestamp (UTC) from candle index
+        ts_sec = 0.0
+        try:
+            ts_raw = float((ohlcv[i][0] if i < len(ohlcv) else ohlcv[-1][0]) or 0.0)
+            ts_sec = (ts_raw / 1000.0) if ts_raw > 1e12 else ts_raw
+        except Exception:
+            ts_sec = 0.0
+
+        sess = "?"
+        try:
+            sess = str(_session_label_from_ts(ts_sec) or "?")
+        except Exception:
+            sess = "?"
+
+        res = _simulate_one_setup(ohlcv, i + 1, s)
+        res["R"] = float(res.get("R", 0.0) or 0.0)
+        res["session"] = sess
+        results.append(res)
+
+        eq += res["R"]
+        peak = max(peak, eq)
+        max_dd = max(max_dd, peak - eq)
+
+        out = str(res.get("outcome") or "").upper().strip()
+        by_session[sess]["setups"] += 1
+        by_session[sess]["r"].append(float(res["R"]))
+
+        # WIN definition: TP1 hit before SL => TP1/TP2/TP3 are all wins
+        if out in ("TP1", "TP1_BE", "TP1_TIMEOUT", "TP2", "TP3"):
+            by_session[sess]["wins"] += 1
+        elif out in ("SL", "LOSS"):
+            by_session[sess]["losses"] += 1
+
+    total = len(results)
+
+    # WIN definition: TP1 hit before SL (TP1/TP2/TP3 outcomes are wins)
+    wins = sum(1 for r in results if str(r.get("outcome") or "").upper().strip() in ("TP1", "TP1_BE", "TP1_TIMEOUT", "TP2", "TP3"))
+    win_rate = (wins / total * 100.0) if total else 0.0
+
+    avg_r = (sum(float(r.get("R", 0.0) or 0.0) for r in results) / total) if total else 0.0
+    gross_win = sum(max(0.0, float(r.get("R", 0.0) or 0.0)) for r in results)
+    gross_loss = sum(min(0.0, float(r.get("R", 0.0) or 0.0)) for r in results)
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float("inf") if gross_win > 0 else 0.0)
+
+    # Session summaries (win_rate + avg_R per session)
+    by_sess_out = {}
+    for sess, d in dict(by_session).items():
+        s_n = int(d.get("setups", 0) or 0)
+        s_w = int(d.get("wins", 0) or 0)
+        s_l = int(d.get("losses", 0) or 0)
+        s_dec = s_w + s_l
+        s_wr = (s_w / s_dec * 100.0) if s_dec else 0.0
+        rr = d.get("r") or []
+        s_avg_r = (sum(float(x) for x in rr) / len(rr)) if rr else 0.0
+        by_sess_out[str(sess)] = {
+            "setups": s_n,
+            "wins": s_w,
+            "losses": s_l,
+            "decided": s_dec,
+            "win_rate": float(s_wr),
+            "avg_R": float(s_avg_r),
+        }
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "tf": tf,
+        "days": days,
+        "setups": total,
+        "trades": total,
+        "win_rate": float(win_rate),
+        "avg_R": float(avg_r),
+        "profit_factor": pf,
+        "max_drawdown_R": float(max_dd),
+        "equity_R": float(eq),
+        "reject_breakdown": dict(_BT_LAST_REJECTS),
+        "by_session": by_sess_out,
+    }
+
+
+    total = len(results)
+    wins = [r for r in results if str(r.get("outcome")) == "TP3"]
+    win_rate = (len(wins)/total*100.0) if total else 0.0
+    avg_r = (sum(r["R"] for r in results)/total) if total else 0.0
+    gross_win = sum(max(0.0, r["R"]) for r in results)
+    gross_loss = sum(min(0.0, r["R"]) for r in results)
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float("inf") if gross_win > 0 else 0.0)
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "tf": tf,
+        "days": days,
+        "setups": total,
+        "trades": total,
+        "win_rate": win_rate,
+        "avg_R": float(avg_r),
+        "profit_factor": pf,
+        "max_drawdown_R": float(max_dd),
+        "equity_R": float(eq),
+        "reject_breakdown": dict(_BT_LAST_REJECTS),
+    }
+
+def _objective(oos: list[dict], days: int, cfg: dict) -> float:
+    """OOS-first objective with anti-overfitting safeguards.
+
+    - Primary: OOS expectancy (Avg R) + Profit Factor (PF)
+    - Enforces frequency target (3–5 setups/day) via penalty
+    - Penalizes: drawdown, low sample size, symbol concentration, session imbalance/instability
+    - WIN definition used in win_rate: TP1 hit before SL (TP1/TP2/TP3 outcomes are wins)
+    """
+    if not oos:
+        return -1e12
+
+    total_days = max(1.0, float(days))
+    ok_rows = [r for r in oos if r and r.get("ok")]
+
+    if not ok_rows:
+        return -1e12
+
+    total_setups = sum(int(r.get("setups", 0) or 0) for r in ok_rows)
+    setups_day = total_setups / total_days
+
+    # Hard minimum sample size to avoid fake win-rate / tiny samples
+    min_oos_setups = int(cfg.get("oos_min_setups", 30) or 30)
+    if total_setups < min_oos_setups:
+        # Still allow ranking (but heavily penalize) so optimizer can find something workable.
+        sample_pen = (min_oos_setups - total_setups) * 8.0
+    else:
+        sample_pen = 0.0
+
+    # Aggregate per-symbol metrics (weighted by setups)
+    w_sum = max(1.0, float(total_setups))
+    avg_r = sum(float(r.get("avg_R", 0.0) or 0.0) * float(r.get("setups", 0) or 0) for r in ok_rows) / w_sum
+    pf_vals = []
+    dd_vals = []
+    wr_num = 0.0
+    for r in ok_rows:
+        st = float(r.get("setups", 0) or 0)
+        pf_i = r.get("profit_factor")
+        pf_i = 10.0 if pf_i == float("inf") else float(pf_i or 0.0)
+        pf_vals.append(pf_i * st)
+        dd_vals.append(float(r.get("max_drawdown_R", 0.0) or 0.0) * st)
+        wr_num += float(r.get("win_rate", 0.0) or 0.0) * st
+    pf = (sum(pf_vals) / w_sum) if pf_vals else 0.0
+    dd = (sum(dd_vals) / w_sum) if dd_vals else 0.0
+    win_rate = (wr_num / w_sum) if w_sum else 0.0
+
+    # Frequency penalty (target band)
+    lo = float(cfg.get("target_setups_per_day_lo", 3.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 5.0))
+    freq_pen = 0.0
+    if setups_day < lo:
+        freq_pen = (lo - setups_day) * 4.0
+    elif setups_day > hi:
+        freq_pen = (setups_day - hi) * 4.0
+
+    # Concentration penalty: discourage all setups from one symbol
+    sym_counts = sorted([int(r.get("setups", 0) or 0) for r in ok_rows], reverse=True)
+    conc_cap = float(cfg.get("concentration_cap", 0.25) or 0.25)
+    conc_pen = 0.0
+    if sym_counts and total_setups > 0:
+        top_share = float(sym_counts[0]) / float(total_setups)
+        if top_share > conc_cap:
+            conc_pen = (top_share - conc_cap) * 20.0
+
+    # Stability penalty across symbols: high variance of Avg R is a red flag
+    try:
+        sym_avg_rs = [float(r.get("avg_R", 0.0) or 0.0) for r in ok_rows if int(r.get("setups", 0) or 0) >= 3]
+        if len(sym_avg_rs) >= 8:
+            mu = sum(sym_avg_rs) / len(sym_avg_rs)
+            var = sum((x - mu) ** 2 for x in sym_avg_rs) / max(1, (len(sym_avg_rs) - 1))
+            stab_pen = (var ** 0.5) * 10.0
+        else:
+            stab_pen = 0.0
+    except Exception:
+        stab_pen = 0.0
+
+    # Session-weighted performance (NY > LON > ASIA) if by_session is present
+    session_weights = cfg.get("session_weights") or {"NY": 1.0, "LON": 0.6, "ASIA": 0.3}
+    try:
+        wny = float(session_weights.get("NY", 1.0))
+        wlon = float(session_weights.get("LON", 0.6))
+        wasia = float(session_weights.get("ASIA", 0.3))
+    except Exception:
+        wny, wlon, wasia = 1.0, 0.6, 0.3
+
+    sess_acc = {"NY": {"n": 0, "wr": 0.0, "r": 0.0}, "LON": {"n": 0, "wr": 0.0, "r": 0.0}, "ASIA": {"n": 0, "wr": 0.0, "r": 0.0}}
+    for r in ok_rows:
+        bs = r.get("by_session") or {}
+        if not isinstance(bs, dict):
+            continue
+        for sname in ("NY", "LON", "ASIA"):
+            d = bs.get(sname) or {}
+            try:
+                n = float(d.get("setups", 0) or 0)
+                if n <= 0:
+                    continue
+                sess_acc[sname]["n"] += n
+                sess_acc[sname]["wr"] += float(d.get("win_rate", 0.0) or 0.0) * n
+                sess_acc[sname]["r"] += float(d.get("avg_R", 0.0) or 0.0) * n
+            except Exception:
+                continue
+
+    # Weighted avg_R / win_rate across sessions (only for those with data)
+    sw = 0.0
+    s_wr = 0.0
+    s_r = 0.0
+    for sname, w in (("NY", wny), ("LON", wlon), ("ASIA", wasia)):
+        n = float(sess_acc[sname]["n"] or 0.0)
+        if n <= 0:
+            continue
+        wr_i = float(sess_acc[sname]["wr"] / n) if n else 0.0
+        r_i = float(sess_acc[sname]["r"] / n) if n else 0.0
+        sw += float(w) * n
+        s_wr += float(w) * wr_i * n
+        s_r += float(w) * r_i * n
+
+    if sw > 0:
+        wr_weighted = s_wr / sw
+        r_weighted = s_r / sw
+    else:
+        wr_weighted = float(win_rate)
+        r_weighted = float(avg_r)
+
+    # Win-rate gating (only if sample is adequate)
+    min_wr = float(cfg.get("min_win_rate", 70.0) or 70.0)
+    min_wr_samples = int(cfg.get("min_win_rate_samples", 50) or 50)
+    wr_pen = 0.0
+    if total_setups >= min_wr_samples and wr_weighted < min_wr:
+        wr_pen = (min_wr - wr_weighted) * 2.5
+
+    # Drawdown penalty (harder once above cap)
+    dd_cap = float(cfg.get("max_drawdown_R_cap", 8.0) or 8.0)
+    dd_pen = 0.0
+    if dd > dd_cap:
+        dd_pen = (dd - dd_cap) * 6.0
+    else:
+        dd_pen = dd * 0.9
+
+    # Final score (maximize)
+    # Expectancy dominates, then PF; penalties enforce safety + frequency.
+    score = (r_weighted * 12.0) + (pf * 1.4) - dd_pen - freq_pen - conc_pen - stab_pen - sample_pen - wr_pen
+    return float(score)
+
+
+    avg_r = 0.0
+    pf = 0.0
+    dd = 0.0
+    n = 0
+    for r in oos:
+        if not r.get("ok"):
+            continue
+        n += 1
+        avg_r += float(r.get("avg_R", 0.0) or 0.0)
+        pf_i = r.get("profit_factor")
+        pf += (10.0 if pf_i == float("inf") else float(pf_i or 0.0))
+        dd += float(r.get("max_drawdown_R", 0.0) or 0.0)
+    if n <= 0:
+        return -1e9
+    avg_r /= n
+    pf /= n
+    dd /= n
+
+    lo = float(cfg.get("target_setups_per_day_lo", 3.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 5.0))
+    freq_pen = 0.0
+    if setups_day < lo:
+        freq_pen = (lo - setups_day) * 2.0
+    elif setups_day > hi:
+        freq_pen = (setups_day - hi) * 2.0
+
+    # Overconcentration penalty: discourage all performance from a single symbol
+    sym_counts = sorted([int(r.get("setups",0) or 0) for r in oos], reverse=True)
+    conc_pen = 0.0
+    if sym_counts and total_setups > 0:
+        top_share = sym_counts[0] / total_setups
+        if top_share > 0.25:
+            conc_pen = (top_share - 0.25) * 10.0
+
+    # Score
+    score = (avg_r * 8.0) + (pf * 1.2) - (dd * 0.8) - freq_pen - conc_pen
+    return float(score)
+
+def _generate_candidates(cfg: dict) -> list[dict]:
+    bounds = cfg.get("opt_bounds") or {}
+    def _rng(key, default_lo, default_hi):
+        try:
+            lo, hi = bounds.get(key, [default_lo, default_hi])
+            return float(lo), float(hi)
+        except Exception:
+            return float(default_lo), float(default_hi)
+
+    # Deterministic small grid (safe runtime)
+    qlo, qhi = _rng("quality_score_min_screen", 52, 70)
+    slo, shi = _rng("regime_slope_trend_min_pct", 0.04, 0.10)
+    a1lo, a1hi = _rng("tf_align_1h_min_abs", 0.3, 1.2)
+    a4lo, a4hi = _rng("tf_align_4h_min_abs", 0.3, 1.2)
+    atrlo, atrhi = _rng("atr_min_pct", 0.4, 1.5)
+    rrlo, rrhi = _rng("min_rr_tp3", 1.3, 2.4)
+
+    q_grid = [qlo, (qlo+qhi)/2.0, qhi]
+    s_grid = [slo, (slo+shi)/2.0, shi]
+    a_grid = [a1lo, (a1lo+a1hi)/2.0, a1hi]
+    atr_grid = [atrlo, (atrlo+atrhi)/2.0, atrhi]
+    rr_grid = [rrlo, (rrlo+rrhi)/2.0, rrhi]
+
+    cands = []
+    for q in q_grid:
+        for s in s_grid:
+            for a in a_grid:
+                for atrm in atr_grid:
+                    for rr in rr_grid:
+                        c = {
+                            "quality_score_min_screen": float(_clamp(q, qlo, qhi)),
+                            "quality_score_min_email": float(_clamp(q+6.0, qlo+2.0, qhi+10.0)),
+                            "regime_slope_trend_min_pct": float(_clamp(s, slo, shi)),
+                            "tf_align_1h_min_abs": float(_clamp(a, a1lo, a1hi)),
+                            "tf_align_4h_min_abs": float(_clamp(a, a4lo, a4hi)),
+                            "atr_min_pct": float(_clamp(atrm, atrlo, atrhi)),
+                            "min_rr_tp3": float(_clamp(rr, rrlo, rrhi)),
+                        }
+                        cands.append(c)
+    # Keep bounded
+    return cands[:180]
+
+async def cmd_optimize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    await update.message.reply_text(
+        "🤖 Manual /optimize is disabled.\n\n"
+        "The bot optimizes itself automatically in the background and only promotes validated parameter sets.\n"
+        "Use /optimize_report if you need the latest internal report."
+    )
+    return
+
+async def cmd_optimize_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    rep = load_opt_report()
+    if not rep:
+        await update.message.reply_text("No optimize report saved yet. Run /optimize first.")
+        return
+    pretty = json.dumps(rep, indent=2, ensure_ascii=False, sort_keys=True)
+    await send_long_message(update, f"🧪 Optimize Report (last)\n{HDR}\n```\n{pretty}\n```", parse_mode=ParseMode.MARKDOWN)
+
+
+
+
+
+
+
+
+# =========================================================
+# SELF-OPTIMIZATION v2 (ADMIN) — end-to-end, resumable, kill-switch
+# - Builds daily TOP100 universe (>= $10M 24h quote volume) and snapshots it in SQLite
+# - Runs bounded deterministic search across TF candidates and param grid
+# - Uses walk-forward split (70/30) and OOS-first objective with session weights (NY > LON > ASIA)
+# - Promotes config ONLY if stability gates pass
+# =========================================================
+
+SELF_OPT_DEFAULT_SESSION_MODE = "24H_WEIGHTED"  # NY weighted highest, then LON, then ASIA
+
+# Global job state (single-run at a time; Render-friendly)
+_SELF_OPT_STATE = {
+    "task": None,              # asyncio.Task
+    "stop_event": None,        # threading.Event (checked inside heavy loop)
+    "run_id": None,            # str
+    "started_ts": 0.0,
+}
+
+
+# Zero-touch autonomous optimization governance
+AUTONOMOUS_OPT_ENABLED = str(os.environ.get("AUTONOMOUS_OPT_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+AUTONOMOUS_OPT_INTERVAL_HOURS = float(os.environ.get("AUTONOMOUS_OPT_INTERVAL_HOURS", "6") or 6)
+AUTONOMOUS_OPT_MIN_INTERVAL_HOURS = float(os.environ.get("AUTONOMOUS_OPT_MIN_INTERVAL_HOURS", "6") or 6)
+AUTONOMOUS_OPT_DAYS = int(os.environ.get("AUTONOMOUS_OPT_DAYS", "60") or 60)
+AUTONOMOUS_OPT_SESSION_MODE = str(os.environ.get("AUTONOMOUS_OPT_SESSION_MODE", SELF_OPT_DEFAULT_SESSION_MODE) or SELF_OPT_DEFAULT_SESSION_MODE).strip().upper()
+AUTONOMOUS_OPT_LOOKBACK_HOURS = float(os.environ.get("AUTONOMOUS_OPT_LOOKBACK_HOURS", "72") or 72)
+AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS = int(os.environ.get("AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS", "18") or 18)
+AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW = float(os.environ.get("AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW", "70") or 70)
+
+def _opt_migrate_tables():
+    """Create/extend self-optimization tables (backward compatible)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+
+            c.execute("""CREATE TABLE IF NOT EXISTS universe_snapshots (
+                snap_id TEXT PRIMARY KEY,
+                day_utc TEXT NOT NULL,
+                created_ts REAL NOT NULL,
+                top_n INTEGER NOT NULL,
+                min_vol_usd REAL NOT NULL,
+                symbols_json TEXT NOT NULL,
+                meta_json TEXT NOT NULL DEFAULT ''
+            )""")
+
+            c.execute("""CREATE TABLE IF NOT EXISTS optimization_runs (
+                run_id TEXT PRIMARY KEY,
+                started_ts REAL NOT NULL,
+                finished_ts REAL,
+                status TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                session_mode TEXT NOT NULL,
+                tf_candidates_json TEXT NOT NULL,
+                universe_snap_id TEXT,
+                universe_size INTEGER DEFAULT 0,
+                progress_json TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT ''
+            )""")
+
+            c.execute("""CREATE TABLE IF NOT EXISTS optimization_results (
+                run_id TEXT PRIMARY KEY,
+                promoted INTEGER NOT NULL DEFAULT 0,
+                chosen_exec_tf TEXT,
+                best_score REAL,
+                best_params_json TEXT,
+                metrics_json TEXT,
+                reject_stats_json TEXT,
+                created_ts REAL NOT NULL
+            )""")
+
+            c.execute("""CREATE TABLE IF NOT EXISTS promotion_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                run_id TEXT NOT NULL,
+                from_cfg_json TEXT,
+                to_cfg_json TEXT,
+                decision TEXT NOT NULL,
+                reasons_json TEXT NOT NULL DEFAULT ''
+            )""")
+
+            try:
+                c.execute("CREATE INDEX IF NOT EXISTS idx_universe_day ON universe_snapshots(day_utc)")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_opt_runs_status ON optimization_runs(status)")
+            except Exception:
+                pass
+
+            conn.commit()
+    except Exception:
+        pass
+
+
+
+# =========================================================
+# EVOLUTION / LEARNING / LESSONS-LEARNED ENGINE
+# - Production-safe extension built on existing signals, signal_outcomes,
+#   autotrade_trades, strategy_config, and optimization_results.
+# - Uses bounded heuristics + persisted diagnostics, not fake AI reporting.
+# =========================================================
+EVOLUTION_ENABLED = str(os.environ.get("EVOLUTION_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+EVOLUTION_HOURLY_INTERVAL_MIN = int(os.environ.get("EVOLUTION_HOURLY_INTERVAL_MIN", "60") or 60)
+EVOLUTION_DAILY_INTERVAL_HOURS = int(os.environ.get("EVOLUTION_DAILY_INTERVAL_HOURS", "24") or 24)
+EVOLUTION_AUTO_APPLY_COOLDOWN_HOURS = float(os.environ.get("EVOLUTION_AUTO_APPLY_COOLDOWN_HOURS", "24") or 24)
+EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS = int(os.environ.get("EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS", "8") or 8)
+EVOLUTION_LOOKBACK_DAYS = int(os.environ.get("EVOLUTION_LOOKBACK_DAYS", "60") or 60)
+
+_EVOLUTION_STATE = {
+    "hourly_task": None,
+    "daily_task": None,
+}
+
+
+def _evolution_migrate_tables():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS evolution_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_ts REAL NOT NULL
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS evolution_runs (
+                run_id TEXT PRIMARY KEY,
+                cycle_type TEXT NOT NULL,
+                started_ts REAL NOT NULL,
+                finished_ts REAL,
+                status TEXT NOT NULL,
+                analyzed_setups INTEGER NOT NULL DEFAULT 0,
+                analyzed_trades INTEGER NOT NULL DEFAULT 0,
+                findings_json TEXT NOT NULL DEFAULT '',
+                metrics_json TEXT NOT NULL DEFAULT '',
+                actions_json TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS evolution_diagnostics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                processed_key TEXT NOT NULL UNIQUE,
+                source_type TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                created_ts REAL NOT NULL DEFAULT 0,
+                decided_ts REAL NOT NULL DEFAULT 0,
+                outcome TEXT NOT NULL DEFAULT '',
+                win_flag INTEGER NOT NULL DEFAULT 0,
+                tags_json TEXT NOT NULL DEFAULT '',
+                detail_json TEXT NOT NULL DEFAULT '',
+                recommendation TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0,
+                inserted_ts REAL NOT NULL DEFAULT 0
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS evolution_recommendations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_ts REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                scope TEXT NOT NULL DEFAULT '',
+                recommendation TEXT NOT NULL,
+                evidence_json TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0,
+                auto_applied INTEGER NOT NULL DEFAULT 0,
+                action_json TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_evolution_runs_cycle ON evolution_runs(cycle_type, started_ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_evolution_diag_source ON evolution_diagnostics(source_type, source_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_evolution_diag_session ON evolution_diagnostics(session, decided_ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_evolution_rec_status ON evolution_recommendations(status, created_ts)")
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _evolution_state_get(key: str, default=None):
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute("SELECT value FROM evolution_state WHERE key=?", (str(key),)).fetchone()
+            if not row:
+                return default
+            raw = row[0]
+            try:
+                return json.loads(raw)
+            except Exception:
+                return raw
+    except Exception:
+        return default
+
+
+def _evolution_state_set(key: str, value) -> None:
+    _evolution_migrate_tables()
+    try:
+        payload = _json_dumps_safe(value)
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO evolution_state(key,value,updated_ts) VALUES(?,?,?)",
+                (str(key), str(payload), float(time.time())),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _evolution_new_run(cycle_type: str) -> str:
+    _evolution_migrate_tables()
+    run_id = f"EVO-{str(cycle_type).upper()}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO evolution_runs(run_id, cycle_type, started_ts, status) VALUES(?,?,?,?)",
+                (run_id, str(cycle_type).lower(), float(time.time()), "RUNNING"),
+            )
+            conn.commit()
+    except Exception:
+        pass
+    return run_id
+
+
+def _evolution_finish_run(run_id: str, status: str, analyzed_setups: int, analyzed_trades: int, findings: dict, metrics: dict, actions: list, notes: str = "") -> None:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                """UPDATE evolution_runs
+                   SET finished_ts=?, status=?, analyzed_setups=?, analyzed_trades=?, findings_json=?, metrics_json=?, actions_json=?, notes=?
+                   WHERE run_id=?""",
+                (
+                    float(time.time()),
+                    str(status),
+                    int(analyzed_setups),
+                    int(analyzed_trades),
+                    _json_dumps_safe(findings or {}),
+                    _json_dumps_safe(metrics or {}),
+                    _json_dumps_safe(actions or []),
+                    str(notes or ""),
+                    str(run_id),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _evolution_get_last_run(cycle_type: str | None = None) -> dict:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            if cycle_type:
+                row = c.execute(
+                    "SELECT * FROM evolution_runs WHERE cycle_type=? ORDER BY started_ts DESC LIMIT 1",
+                    (str(cycle_type).lower(),),
+                ).fetchone()
+            else:
+                row = c.execute("SELECT * FROM evolution_runs ORDER BY started_ts DESC LIMIT 1").fetchone()
+            return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+def _evolution_insert_recommendation(scope: str, recommendation: str, evidence: dict, confidence: float, auto_applied: bool = False, action: dict | None = None, status: str = "OPEN") -> None:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                """INSERT INTO evolution_recommendations(created_ts, status, scope, recommendation, evidence_json, confidence, auto_applied, action_json)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    float(time.time()),
+                    str(status),
+                    str(scope or ""),
+                    str(recommendation or ""),
+                    _json_dumps_safe(evidence or {}),
+                    float(confidence or 0.0),
+                    1 if auto_applied else 0,
+                    _json_dumps_safe(action or {}),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _evolution_list_open_recommendations(limit: int = 8) -> list[dict]:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                "SELECT * FROM evolution_recommendations WHERE status='OPEN' ORDER BY created_ts DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _evolution_store_diagnostic(processed_key: str, source_type: str, source_id: str, session: str, symbol: str, side: str,
+                                created_ts: float, decided_ts: float, outcome: str, win_flag: bool,
+                                tags: list[str], detail: dict, recommendation: str, confidence: float) -> bool:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                """INSERT OR IGNORE INTO evolution_diagnostics
+                   (processed_key, source_type, source_id, session, symbol, side, created_ts, decided_ts, outcome, win_flag, tags_json, detail_json, recommendation, confidence, inserted_ts)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(processed_key),
+                    str(source_type),
+                    str(source_id),
+                    str(session or ""),
+                    str(symbol or ""),
+                    str(side or ""),
+                    float(created_ts or 0.0),
+                    float(decided_ts or 0.0),
+                    str(outcome or ""),
+                    1 if bool(win_flag) else 0,
+                    _json_dumps_safe(tags or []),
+                    _json_dumps_safe(detail or {}),
+                    str(recommendation or ""),
+                    float(confidence or 0.0),
+                    float(time.time()),
+                ),
+            )
+            conn.commit()
+            return int(c.rowcount or 0) > 0
+    except Exception:
+        return False
+
+
+def _evolution_recent_diagnostics(limit: int = 10, losses_only: bool = False, days: int = 30) -> list[dict]:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = "SELECT * FROM evolution_diagnostics WHERE decided_ts>=?"
+            params = [float(time.time() - max(1, int(days)) * 86400.0)]
+            if losses_only:
+                q += " AND win_flag=0"
+            q += " ORDER BY decided_ts DESC LIMIT ?"
+            params.append(int(limit))
+            rows = c.execute(q, tuple(params)).fetchall() or []
+            out = []
+            for r in rows:
+                d = dict(r)
+                try:
+                    d["tags"] = json.loads(d.get("tags_json") or "[]")
+                except Exception:
+                    d["tags"] = []
+                try:
+                    d["detail"] = json.loads(d.get("detail_json") or "{}")
+                except Exception:
+                    d["detail"] = {}
+                out.append(d)
+            return out
+    except Exception:
+        return []
+
+
+def _evolution_tag_counter(days: int = 30, session: str | None = None, losses_only: bool = True) -> Counter:
+    ctr = Counter()
+    try:
+        rows = _evolution_recent_diagnostics(limit=5000, losses_only=losses_only, days=days)
+        for r in rows:
+            if session and str(r.get("session") or "").upper().strip() != str(session).upper().strip():
+                continue
+            for tag in (r.get("tags") or []):
+                ctr[str(tag)] += 1
+    except Exception:
+        pass
+    return ctr
+
+
+def _evolution_outcome_winloss(outcome: str) -> tuple[int, int]:
+    out = str(outcome or "").upper().strip()
+    if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3"):
+        return (1, 0)
+    if out == "LOSS":
+        return (0, 1)
+    return (0, 0)
+
+
+def _evolution_sig_rr(sig: dict) -> float:
+    try:
+        entry = float(sig.get("entry") or 0.0)
+        sl = float(sig.get("sl") or 0.0)
+        tp3 = float(sig.get("tp3") or 0.0)
+        risk = abs(entry - sl)
+        reward = abs(tp3 - entry)
+        if risk <= 0:
+            return 0.0
+        return float(reward / risk)
+    except Exception:
+        return 0.0
+
+
+def _evolution_entry_context(symbol: str, market_symbol: str, created_ts: float, entry: float, side: str) -> dict:
+    """Best-effort entry-context analysis around the setup creation time.
+
+    We purposely keep this lightweight and bounded:
+    - 15m candles: entry extension vs EMA7/EMA21 and local range position
+    - 1h candles : entry distance vs EMA7 and ATR-based extension
+    If market data is unavailable, downstream logic falls back to stored setup metrics.
+    """
+    out = {
+        "ema7_15m_dist_pct": None,
+        "ema21_15m_dist_pct": None,
+        "ema7_1h_dist_pct": None,
+        "atr_pct_1h": None,
+        "bar_range_pos_15m": None,
+        "retracement_pct_15m": None,
+    }
+    try:
+        sym = str(market_symbol or _market_symbol_from_base(symbol) or "").strip()
+        if not sym or float(created_ts or 0.0) <= 0 or float(entry or 0.0) <= 0:
+            return out
+        end_ms = int((float(created_ts) + 3600.0) * 1000)
+        start_15 = int((float(created_ts) - 12 * 3600.0) * 1000)
+        c15 = fetch_ohlcv_paged(sym, "15m", start_15, end_ms, limit=500)
+        if c15 and len(c15) >= 30:
+            closes15 = [float(x[4]) for x in c15]
+            ema7_15 = float(ema(closes15[-40:], 7) or 0.0)
+            ema21_15 = float(ema(closes15[-80:], 21) or 0.0)
+            if ema7_15 > 0:
+                out["ema7_15m_dist_pct"] = abs(float(entry) - ema7_15) / float(entry) * 100.0
+            if ema21_15 > 0:
+                out["ema21_15m_dist_pct"] = abs(float(entry) - ema21_15) / float(entry) * 100.0
+            try:
+                near = min(c15, key=lambda row: abs((float(row[0]) / 1000.0) - float(created_ts)))
+                hi = float(near[2]); lo = float(near[3])
+                rng = max(1e-12, hi - lo)
+                out["bar_range_pos_15m"] = (float(entry) - lo) / rng
+                prior = c15[-8:-1] if len(c15) >= 8 else c15[:-1]
+                if prior:
+                    swing_hi = max(float(x[2]) for x in prior)
+                    swing_lo = min(float(x[3]) for x in prior)
+                    if str(side).upper() == "BUY":
+                        denom = max(1e-12, swing_hi - swing_lo)
+                        out["retracement_pct_15m"] = (swing_hi - float(entry)) / denom
+                    else:
+                        denom = max(1e-12, swing_hi - swing_lo)
+                        out["retracement_pct_15m"] = (float(entry) - swing_lo) / denom
+            except Exception:
+                pass
+        start_1h = int((float(created_ts) - 72 * 3600.0) * 1000)
+        c1 = fetch_ohlcv_paged(sym, "1h", start_1h, end_ms, limit=500)
+        if c1 and len(c1) >= 30:
+            closes1 = [float(x[4]) for x in c1]
+            ema7_1 = float(ema(closes1[-40:], 7) or 0.0)
+            atr_1 = float(compute_atr_from_ohlcv(c1[-80:], ATR_PERIOD) or 0.0)
+            if ema7_1 > 0:
+                out["ema7_1h_dist_pct"] = abs(float(entry) - ema7_1) / float(entry) * 100.0
+            if atr_1 > 0:
+                out["atr_pct_1h"] = float(atr_1 / float(entry) * 100.0)
+    except Exception:
+        return out
+    return out
+
+
+def _evolution_build_signal_diagnostic(sig: dict, session: str, outcome: str, decided_ts: float, source_type: str = "signal") -> tuple[list[str], dict, str, float]:
+    tags = []
+    detail = {}
+    try:
+        side = str(sig.get("side") or "").upper().strip()
+        entry = float(sig.get("entry") or 0.0)
+        ch24 = float(sig.get("ch24") or 0.0)
+        ch4 = float(sig.get("ch4") or 0.0)
+        ch1 = float(sig.get("ch1") or 0.0)
+        ch15 = float(sig.get("ch15") or 0.0)
+        fut_vol = float(sig.get("fut_vol_usd") or 0.0)
+        rr = float(_evolution_sig_rr(sig) or 0.0)
+        ctx = _evolution_entry_context(sig.get("symbol"), sig.get("market_symbol"), float(sig.get("created_ts") or 0.0), entry, side)
+        detail.update({
+            "rr_tp3": rr,
+            "ch24": ch24,
+            "ch4": ch4,
+            "ch1": ch1,
+            "ch15": ch15,
+            "fut_vol_usd": fut_vol,
+        })
+        detail.update(ctx)
+
+        ema15 = ctx.get("ema21_15m_dist_pct")
+        ema1h = ctx.get("ema7_1h_dist_pct")
+        retr = ctx.get("retracement_pct_15m")
+        atr_pct = ctx.get("atr_pct_1h")
+
+        if abs(ch15) >= 1.6 or abs(ch1) >= 3.5 or (ema15 is not None and float(ema15) > 1.2):
+            tags.append("entry_too_extended")
+        if abs(ch15) >= 1.2 and abs(ch1) >= 2.2:
+            tags.append("entry_too_late_after_breakout")
+        if retr is not None:
+            if float(retr) < 0.12:
+                tags.append("pullback_too_shallow")
+            elif float(retr) > 0.85:
+                tags.append("pullback_too_deep")
+        if ema1h is not None and float(ema1h) > float(EMA7_1H_MAX_DIST_PCT):
+            tags.append("entry_far_from_ema")
+        if abs(ch24) >= 20 and abs(ch1) <= 0.35:
+            tags.append("momentum_exhausted")
+        if fut_vol < max(float(MIN_FUT_VOL_USD), 10000000.0) * 1.2:
+            tags.append("thin_liquidity_context")
+        if rr >= 2.3:
+            tags.append("rr_too_ambitious")
+        if str(session).upper() == "ASIA":
+            tags.append("asia_session")
+        if str(session).upper() == "NY" and abs(ch1) >= 2.5 and abs(ch15) >= 1.0:
+            tags.append("ny_breakout_chase_risk")
+        if atr_pct is not None and (float(atr_pct) < 0.45 or float(atr_pct) > 9.0):
+            tags.append("poor_volatility_regime")
+
+        out_u = str(outcome or "").upper().strip()
+        if out_u.startswith("WIN_"):
+            if not tags:
+                tags.append("entry_quality_good")
+        elif out_u == "LOSS":
+            if "entry_too_extended" in tags or "entry_too_late_after_breakout" in tags:
+                tags.append("extended_entry_stopout_pattern")
+            if "rr_too_ambitious" in tags:
+                tags.append("tp_structure_too_ambitious")
+            if not tags:
+                tags.append("loss_without_clear_pattern")
+
+        tags = list(dict.fromkeys(tags))
+        primary = tags[0] if tags else "no_clear_pattern"
+        rec_map = {
+            "entry_too_extended": "Tighten entry quality when price is stretched away from the 15m/1h EMA rail.",
+            "entry_too_late_after_breakout": "Delay breakout entries unless structure resets with a cleaner pullback.",
+            "pullback_too_shallow": "Require a deeper pullback before continuation entries.",
+            "pullback_too_deep": "Reject pullbacks that lose too much structure before trigger.",
+            "entry_far_from_ema": "Tighten EMA-distance tolerance to avoid late continuation entries.",
+            "momentum_exhausted": "Demand stronger fresh momentum expansion before triggering continuation trades.",
+            "rr_too_ambitious": "Reduce TP ambition or require stronger trend context before using high RR targets.",
+            "poor_volatility_regime": "Avoid this volatility regime or apply stricter confirmation.",
+            "asia_session": "ASIA should remain more restrictive unless recent evidence improves.",
+            "ny_breakout_chase_risk": "In New York, tighten volume/confirmation on fast breakout-chase entries.",
+            "thin_liquidity_context": "Prefer thicker futures-volume names for production entries.",
+        }
+        recommendation = rec_map.get(primary, "Monitor recurring failures and tighten the weakest confirmation layer only if the pattern persists.")
+        confidence = 0.45 + min(0.4, 0.06 * len(tags))
+        if ctx.get("ema7_1h_dist_pct") is not None or ctx.get("retracement_pct_15m") is not None:
+            confidence += 0.08
+        return (tags, detail, recommendation, float(clamp(confidence, 0.25, 0.95)))
+    except Exception:
+        return (["diagnostic_error"], detail, "Review diagnostic engine error before making changes.", 0.25)
+
+
+def _evolution_pending_signal_rows(limit: int = 250) -> list[dict]:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                """SELECT e.setup_id, e.session, e.emailed_ts, o.outcome, o.hit_ts, o.evaluated_ts,
+                          s.symbol, s.market_symbol, s.side, s.created_ts, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
+                          s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id=e.setup_id
+                   JOIN signals s ON s.setup_id=e.setup_id
+                   LEFT JOIN evolution_diagnostics d ON d.processed_key=('signal:' || e.setup_id)
+                   WHERE d.id IS NULL
+                     AND UPPER(COALESCE(o.outcome,'')) IN ('WIN_TP1','WIN_TP2','WIN_TP3','LOSS')
+                   ORDER BY COALESCE(o.evaluated_ts, e.emailed_ts) ASC
+                   LIMIT ?""",
+                (int(limit),),
+            ).fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _evolution_pending_autotrade_rows(limit: int = 120) -> list[dict]:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                """SELECT t.trade_id, t.session, t.symbol, t.side, t.opened_ts, t.closed_ts, t.entry, t.sl, t.tp1, t.tp2, t.tp3,
+                          t.qty, t.status, t.note, t.pnl_usdt
+                   FROM autotrade_trades t
+                   LEFT JOIN evolution_diagnostics d ON d.processed_key=('autotrade:' || t.trade_id)
+                   WHERE d.id IS NULL
+                     AND t.opened_ts>0
+                     AND (COALESCE(t.closed_ts,0)>0 OR UPPER(COALESCE(t.status,'')) IN ('CLOSED','LOSE','LOSS','WIN'))
+                   ORDER BY COALESCE(t.closed_ts, t.opened_ts) ASC
+                   LIMIT ?""",
+                (int(limit),),
+            ).fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _evolution_resolve_autotrade_outcome(row: dict) -> tuple[str, float]:
+    try:
+        trade = {
+            "symbol": row.get("symbol"),
+            "market_symbol": _market_symbol_from_base(row.get("symbol")),
+            "side": row.get("side"),
+            "entry": row.get("entry"),
+            "sl": row.get("sl"),
+            "tp1": row.get("tp1"),
+            "tp2": row.get("tp2"),
+            "tp3": row.get("tp3"),
+            "created_ts": float(row.get("opened_ts") or 0.0),
+        }
+        res = evaluate_signal_hit_order(trade, horizon_hours=168, timeframe="1m")
+        outcome = str(res.get("outcome") or "OPEN").upper().strip()
+        decided_ts = float(res.get("hit_ts") or row.get("closed_ts") or 0.0)
+        if outcome in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+            return outcome, decided_ts
+    except Exception:
+        pass
+    try:
+        pnl = float(row.get("pnl_usdt") or 0.0)
+        if pnl > 0:
+            return "WIN_TP1", float(row.get("closed_ts") or 0.0)
+        if pnl < 0:
+            return "LOSS", float(row.get("closed_ts") or 0.0)
+    except Exception:
+        pass
+    return "OPEN", float(row.get("closed_ts") or 0.0)
+
+
+def _evolution_process_new_diagnostics() -> dict:
+    analyzed_setups = 0
+    analyzed_trades = 0
+    new_tags = Counter()
+
+    for row in _evolution_pending_signal_rows(limit=400):
+        outcome = str(row.get("outcome") or "").upper().strip()
+        decided_ts = float(row.get("hit_ts") or row.get("evaluated_ts") or time.time())
+        tags, detail, recommendation, confidence = _evolution_build_signal_diagnostic(row, row.get("session"), outcome, decided_ts, source_type="signal")
+        w, l = _evolution_outcome_winloss(outcome)
+        stored = _evolution_store_diagnostic(
+            processed_key=f"signal:{row.get('setup_id')}",
+            source_type="signal",
+            source_id=str(row.get("setup_id") or ""),
+            session=str(row.get("session") or ""),
+            symbol=str(row.get("symbol") or ""),
+            side=str(row.get("side") or ""),
+            created_ts=float(row.get("created_ts") or row.get("emailed_ts") or 0.0),
+            decided_ts=decided_ts,
+            outcome=outcome,
+            win_flag=bool(w and not l),
+            tags=tags,
+            detail=detail,
+            recommendation=recommendation,
+            confidence=confidence,
+        )
+        if stored:
+            analyzed_setups += 1
+            for tag in tags:
+                new_tags[str(tag)] += 1
+
+    for row in _evolution_pending_autotrade_rows(limit=150):
+        outcome, decided_ts = _evolution_resolve_autotrade_outcome(row)
+        if outcome not in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+            continue
+        diag_sig = {
+            "symbol": row.get("symbol"),
+            "market_symbol": _market_symbol_from_base(row.get("symbol")),
+            "side": row.get("side"),
+            "entry": row.get("entry"),
+            "sl": row.get("sl"),
+            "tp1": row.get("tp1"),
+            "tp2": row.get("tp2"),
+            "tp3": row.get("tp3"),
+            "created_ts": float(row.get("opened_ts") or 0.0),
+            "ch24": 0.0,
+            "ch4": 0.0,
+            "ch1": 0.0,
+            "ch15": 0.0,
+            "fut_vol_usd": 0.0,
+        }
+        tags, detail, recommendation, confidence = _evolution_build_signal_diagnostic(diag_sig, row.get("session"), outcome, decided_ts, source_type="autotrade")
+        detail["pnl_usdt"] = float(row.get("pnl_usdt") or 0.0)
+        w, l = _evolution_outcome_winloss(outcome)
+        stored = _evolution_store_diagnostic(
+            processed_key=f"autotrade:{row.get('trade_id')}",
+            source_type="autotrade",
+            source_id=str(row.get("trade_id") or ""),
+            session=str(row.get("session") or ""),
+            symbol=str(row.get("symbol") or ""),
+            side=str(row.get("side") or ""),
+            created_ts=float(row.get("opened_ts") or 0.0),
+            decided_ts=float(decided_ts or row.get("closed_ts") or time.time()),
+            outcome=outcome,
+            win_flag=bool(w and not l),
+            tags=tags,
+            detail=detail,
+            recommendation=recommendation,
+            confidence=confidence,
+        )
+        if stored:
+            analyzed_trades += 1
+            for tag in tags:
+                new_tags[str(tag)] += 1
+
+    return {
+        "analyzed_setups": analyzed_setups,
+        "analyzed_trades": analyzed_trades,
+        "new_tags": dict(new_tags),
+    }
+
+
+def _evolution_weighted_wr_from_signal_outcomes(days: int = 60, session: str | None = None) -> dict:
+    wins = 0
+    losses = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = """SELECT e.session, o.outcome
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id=e.setup_id
+                   WHERE e.emailed_ts>=?"""
+            params = [float(time.time() - max(1, int(days)) * 86400.0)]
+            if session:
+                q += " AND UPPER(COALESCE(e.session,''))=?"
+                params.append(str(session).upper())
+            rows = c.execute(q, tuple(params)).fetchall() or []
+            for r in rows:
+                w, l = _evolution_outcome_winloss(r["outcome"])
+                wins += int(w)
+                losses += int(l)
+    except Exception:
+        pass
+    n = wins + losses
+    return {"wins": wins, "losses": losses, "sample": n, "wr": (wins / n * 100.0) if n > 0 else 0.0}
+
+
+def _evolution_weighted_wr_from_diagnostics(days: int = 60, session: str | None = None, source_type: str | None = None) -> dict:
+    wins = 0
+    losses = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = "SELECT session, source_type, win_flag, outcome FROM evolution_diagnostics WHERE decided_ts>=?"
+            params = [float(time.time() - max(1, int(days)) * 86400.0)]
+            if session:
+                q += " AND UPPER(COALESCE(session,''))=?"
+                params.append(str(session).upper())
+            if source_type:
+                q += " AND source_type=?"
+                params.append(str(source_type))
+            rows = c.execute(q, tuple(params)).fetchall() or []
+            for r in rows:
+                out = str(r["outcome"] or "").upper().strip()
+                if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3"):
+                    wins += 1
+                elif out == "LOSS":
+                    losses += 1
+    except Exception:
+        pass
+    n = wins + losses
+    return {"wins": wins, "losses": losses, "sample": n, "wr": (wins / n * 100.0) if n > 0 else 0.0}
+
+
+def _evolution_optimizer_wr(session: str | None = None) -> dict:
+    report = load_opt_report() or {}
+    metrics = report.get("metrics") or {}
+    oos = metrics.get("oos") or {}
+    if session:
+        oos = (metrics.get("by_session") or {}).get(str(session).upper(), {}) or {}
+    sample = int(oos.get("setups", 0) or 0)
+    wr = float(oos.get("win_rate", 0.0) or 0.0)
+    return {"wins": int(round(sample * wr / 100.0)), "losses": max(0, sample - int(round(sample * wr / 100.0))), "sample": sample, "wr": wr}
+
+
+def _evolution_estimated_win_rate(session: str | None = None) -> dict:
+    """Current best-estimate win rate.
+
+    Methodology (kept intentionally explicit for live-account trustworthiness):
+    1) Use recent *live* evidence first (autotrade diagnostics + signal outcomes).
+    2) Use optimization OOS results only as a light stabilizer, never as the dominant source.
+    3) Convert all sources into wins/losses, then combine them through a Beta posterior.
+       This prevents tiny recent samples from producing misleading win-rate swings.
+    4) OOS/backtest evidence is sample-capped so live production evidence dominates when available.
+    """
+    sig = _evolution_weighted_wr_from_signal_outcomes(days=EVOLUTION_LOOKBACK_DAYS, session=session)
+    live_auto = _evolution_weighted_wr_from_diagnostics(days=EVOLUTION_LOOKBACK_DAYS, session=session, source_type="autotrade")
+    opt = _evolution_optimizer_wr(session=session)
+
+    # Base prior uses optimizer OOS if available; otherwise a conservative neutral prior.
+    prior_wr = float(opt.get("wr", 55.0) or 55.0) / 100.0 if int(opt.get("sample", 0) or 0) >= 20 else 0.55
+    prior_strength = 20.0
+    alpha = 1.0 + prior_wr * prior_strength
+    beta = 1.0 + (1.0 - prior_wr) * prior_strength
+
+    # Live evidence dominates.
+    alpha += float(sig.get("wins", 0) or 0)
+    beta += float(sig.get("losses", 0) or 0)
+    alpha += float(live_auto.get("wins", 0) or 0) * 1.2
+    beta += float(live_auto.get("losses", 0) or 0) * 1.2
+
+    # OOS evidence is capped so backtests cannot overwhelm live production reality.
+    oos_cap = min(25.0, float(opt.get("sample", 0) or 0) * 0.25)
+    if oos_cap > 0:
+        oos_wr = float(opt.get("wr", 0.0) or 0.0) / 100.0
+        alpha += oos_cap * oos_wr
+        beta += oos_cap * (1.0 - oos_wr)
+
+    est = float(alpha / max(1e-9, (alpha + beta)) * 100.0)
+    live_sample = int(sig.get("sample", 0) or 0) + int(live_auto.get("sample", 0) or 0)
+    confidence = "low"
+    if live_sample >= 40:
+        confidence = "high"
+    elif live_sample >= 15:
+        confidence = "medium"
+    return {
+        "estimated_wr": est,
+        "confidence": confidence,
+        "live_sample": live_sample,
+        "signal_sample": int(sig.get("sample", 0) or 0),
+        "autotrade_sample": int(live_auto.get("sample", 0) or 0),
+        "optimizer_sample": int(opt.get("sample", 0) or 0),
+        "components": {
+            "signals": sig,
+            "autotrade": live_auto,
+            "optimizer_oos": opt,
+        },
+    }
+
+
+def _evolution_period_wr(days: int, offset_days: int = 0, session: str | None = None) -> float:
+    try:
+        ts_to = float(time.time() - max(0, int(offset_days)) * 86400.0)
+        ts_from = float(ts_to - max(1, int(days)) * 86400.0)
+        wins = 0
+        losses = 0
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = """SELECT e.session, o.outcome
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id=e.setup_id
+                   WHERE e.emailed_ts>=? AND e.emailed_ts<?"""
+            params = [ts_from, ts_to]
+            if session:
+                q += " AND UPPER(COALESCE(e.session,''))=?"
+                params.append(str(session).upper())
+            rows = c.execute(q, tuple(params)).fetchall() or []
+            for r in rows:
+                w, l = _evolution_outcome_winloss(r["outcome"])
+                wins += w
+                losses += l
+        total = wins + losses
+        return (wins / total * 100.0) if total > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _evolution_trend_label(current_wr: float, previous_wr: float) -> str:
+    delta = float(current_wr) - float(previous_wr)
+    if delta >= 3.0:
+        return "improving"
+    if delta <= -3.0:
+        return "degrading"
+    return "stable"
+
+
+def _evolution_build_snapshot() -> dict:
+    overall = _evolution_estimated_win_rate(session=None)
+    ny = _evolution_estimated_win_rate(session="NY")
+    curr14 = _evolution_period_wr(14, offset_days=0)
+    prev14 = _evolution_period_wr(14, offset_days=14)
+    curr14_ny = _evolution_period_wr(14, offset_days=0, session="NY")
+    prev14_ny = _evolution_period_wr(14, offset_days=14, session="NY")
+    curr7 = _evolution_period_wr(7, offset_days=0)
+    prev7 = _evolution_period_wr(7, offset_days=7)
+    curr7_ny = _evolution_period_wr(7, offset_days=0, session="NY")
+    prev7_ny = _evolution_period_wr(7, offset_days=7, session="NY")
+    tag_ctr = _evolution_tag_counter(days=30, losses_only=True)
+    ny_tag_ctr = _evolution_tag_counter(days=30, session="NY", losses_only=True)
+    recs = _evolution_list_open_recommendations(limit=5)
+    cfg = load_strategy_config(force=True)
+    last_hourly = _evolution_get_last_run("hourly")
+    last_daily = _evolution_get_last_run("daily")
+
+    auto_applied_last = _evolution_state_get("last_auto_adjustment", {}) or {}
+    status = "stable"
+    if float(ny.get("estimated_wr", 0.0) or 0.0) < 58.0 or _evolution_trend_label(curr14_ny, prev14_ny) == "degrading":
+        status = "needs_intervention"
+    elif float(overall.get("estimated_wr", 0.0) or 0.0) >= 65.0 and _evolution_trend_label(curr14, prev14) != "degrading":
+        status = "healthy"
+
+    entry_issue_present = any(tag_ctr.get(k, 0) >= 4 for k in (
+        "entry_too_extended", "entry_too_late_after_breakout", "entry_far_from_ema", "pullback_too_shallow"
+    ))
+
+    snapshot = {
+        "updated_ts": float(time.time()),
+        "overall": overall,
+        "ny": ny,
+        "trend": {
+            "overall": _evolution_trend_label(curr14, prev14),
+            "ny": _evolution_trend_label(curr14_ny, prev14_ny),
+            "overall_7d": _evolution_trend_label(curr7, prev7),
+            "ny_7d": _evolution_trend_label(curr7_ny, prev7_ny),
+            "current14_wr": curr14,
+            "previous14_wr": prev14,
+            "current14_ny_wr": curr14_ny,
+            "previous14_ny_wr": prev14_ny,
+            "current7_wr": curr7,
+            "previous7_wr": prev7,
+            "current7_ny_wr": curr7_ny,
+            "previous7_ny_wr": prev7_ny,
+        },
+        "top_failure_tags": tag_ctr.most_common(6),
+        "top_failure_tags_ny": ny_tag_ctr.most_common(6),
+        "open_recommendations": recs,
+        "auto_applied_last": auto_applied_last,
+        "status": status,
+        "entry_issue_present": bool(entry_issue_present),
+        "last_hourly": last_hourly,
+        "last_daily": last_daily,
+        "quality_floor_email": float(cfg.get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
+        "min_rr_tp3": float(cfg.get("min_rr_tp3", MIN_RR_TP3) or MIN_RR_TP3),
+    }
+    _evolution_state_set("snapshot", snapshot)
+    return snapshot
+
+
+def _evolution_safe_apply_adjustments(snapshot: dict) -> list[dict]:
+    actions = []
+    tag_ctr = Counter(dict(snapshot.get("top_failure_tags") or []))
+    cfg = load_strategy_config(force=True)
+    bounds = cfg.get("opt_bounds") or {}
+    now = float(time.time())
+    last_adj = float((cfg.get("governor_last_adjust_ts", 0.0) or 0.0))
+    last_auto = _evolution_state_get("last_auto_adjustment", {}) or {}
+    last_auto_ts = float(last_auto.get("ts", 0.0) or 0.0)
+    if (now - max(last_adj, last_auto_ts)) < (EVOLUTION_AUTO_APPLY_COOLDOWN_HOURS * 3600.0):
+        return actions
+
+    def _bounded_set(key: str, delta: float, reason_tag: str, recommendation_text: str, confidence: float):
+        nonlocal cfg, actions
+        lo, hi = (bounds.get(key) or [None, None])
+        if lo is None or hi is None:
+            return
+        old = float(cfg.get(key, 0.0) or 0.0)
+        new = _clamp(old + float(delta), float(lo), float(hi))
+        if abs(new - old) < 1e-9:
+            return
+        cfg[key] = float(new)
+        action = {
+            "param": key,
+            "from": old,
+            "to": new,
+            "reason_tag": reason_tag,
+            "confidence": float(confidence),
+        }
+        actions.append(action)
+        _evolution_insert_recommendation(
+            scope="strategy_config",
+            recommendation=recommendation_text,
+            evidence={"tag": reason_tag, "count": int(tag_ctr.get(reason_tag, 0)), "snapshot_status": snapshot.get("status")},
+            confidence=float(confidence),
+            auto_applied=True,
+            action=action,
+            status="APPLIED",
+        )
+
+    # Tighten entry quality if repeated stretched-entry losses persist.
+    if int(tag_ctr.get("entry_too_extended", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
+        _bounded_set(
+            "quality_score_min_email",
+            +1.0,
+            "entry_too_extended",
+            "Auto-adjustment: raised email quality floor after repeated stretched-entry stop-outs.",
+            0.74,
+        )
+    if int(tag_ctr.get("entry_far_from_ema", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
+        _bounded_set(
+            "tf_align_1h_min_abs",
+            +0.05,
+            "entry_far_from_ema",
+            "Auto-adjustment: tightened 1H alignment floor after repeated entries too far from the EMA rail.",
+            0.71,
+        )
+    if int(tag_ctr.get("rr_too_ambitious", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
+        _bounded_set(
+            "min_rr_tp3",
+            -0.10,
+            "rr_too_ambitious",
+            "Auto-adjustment: reduced minimum TP3 RR slightly after repeated evidence that targets were too ambitious for current conditions.",
+            0.69,
+        )
+    if int(tag_ctr.get("pullback_too_shallow", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
+        _bounded_set(
+            "quality_score_min_screen",
+            +1.0,
+            "pullback_too_shallow",
+            "Auto-adjustment: tightened screen quality floor after repeated shallow-pullback failures.",
+            0.67,
+        )
+
+    if actions:
+        save_strategy_config(cfg)
+        apply_strategy_config(cfg)
+        _evolution_state_set("last_auto_adjustment", {"ts": now, "actions": actions})
+    return actions
+
+
+def _evolution_generate_recommendations(snapshot: dict) -> list[str]:
+    tag_ctr = Counter(dict(snapshot.get("top_failure_tags") or []))
+    recs = []
+    if int(tag_ctr.get("asia_session", 0)) >= 6 and float(snapshot.get("ny", {}).get("estimated_wr", 0.0) or 0.0) > float(snapshot.get("overall", {}).get("estimated_wr", 0.0) or 0.0):
+        txt = "Recommendation: restrict ASIA more aggressively until its loss patterns improve relative to New York."
+        recs.append(txt)
+        _evolution_insert_recommendation("session", txt, {"tag": "asia_session", "count": int(tag_ctr.get("asia_session", 0))}, 0.72)
+    if int(tag_ctr.get("ny_breakout_chase_risk", 0)) >= 5:
+        txt = "Recommendation: in New York, require stronger volume expansion / confirmation before allowing fast breakout-chase entries."
+        recs.append(txt)
+        _evolution_insert_recommendation("ny", txt, {"tag": "ny_breakout_chase_risk", "count": int(tag_ctr.get("ny_breakout_chase_risk", 0))}, 0.70)
+    if int(tag_ctr.get("thin_liquidity_context", 0)) >= 5:
+        txt = "Recommendation: deprioritize thinner names when multiple liquid alternatives exist."
+        recs.append(txt)
+        _evolution_insert_recommendation("universe", txt, {"tag": "thin_liquidity_context", "count": int(tag_ctr.get("thin_liquidity_context", 0))}, 0.65)
+    return recs
+
+
+def _run_evolution_cycle(cycle_type: str) -> dict:
+    _evolution_migrate_tables()
+    run_id = _evolution_new_run(cycle_type)
+    notes = ""
+    try:
+        processed = _evolution_process_new_diagnostics()
+        snapshot = _evolution_build_snapshot()
+        actions = []
+        recs = []
+        if str(cycle_type).lower() == "daily":
+            actions = _evolution_safe_apply_adjustments(snapshot)
+            recs = _evolution_generate_recommendations(snapshot)
+        findings = {
+            "new_tags": processed.get("new_tags") or {},
+            "top_failure_tags": snapshot.get("top_failure_tags") or [],
+            "top_failure_tags_ny": snapshot.get("top_failure_tags_ny") or [],
+            "recommendations_created": recs,
+        }
+        metrics = {
+            "overall": snapshot.get("overall") or {},
+            "ny": snapshot.get("ny") or {},
+            "trend": snapshot.get("trend") or {},
+            "status": snapshot.get("status") or "unknown",
+        }
+        _evolution_finish_run(
+            run_id,
+            "DONE",
+            int(processed.get("analyzed_setups", 0) or 0),
+            int(processed.get("analyzed_trades", 0) or 0),
+            findings,
+            metrics,
+            actions,
+            notes,
+        )
+        _evolution_state_set(f"last_{str(cycle_type).lower()}_cycle", {"run_id": run_id, "ts": time.time()})
+        return {
+            "run_id": run_id,
+            "processed": processed,
+            "snapshot": snapshot,
+            "actions": actions,
+            "recommendations": recs,
+            "ok": True,
+        }
+    except Exception as e:
+        notes = f"{type(e).__name__}: {e}"
+        _evolution_finish_run(run_id, "FAILED", 0, 0, {}, {}, [], notes)
+        return {"run_id": run_id, "ok": False, "error": notes}
+
+
+async def evolution_hourly_job(context: ContextTypes.DEFAULT_TYPE):
+    if not EVOLUTION_ENABLED:
+        return
+    try:
+        _hb_touch('learning_hourly', ok=True, details='cycle_start')
+        res = await to_thread_heavy(_run_evolution_cycle, "hourly")
+        if isinstance(res, dict) and res.get("ok"):
+            _evolution_state_set("last_hourly_snapshot", res.get("snapshot") or {})
+            _hb_touch('learning_hourly', ok=True, details='cycle_ok')
+    except Exception as e:
+        _hb_touch('learning_hourly', ok=False, error=f"{type(e).__name__}: {e}", details='cycle_error')
+        pass
+
+
+async def evolution_daily_job(context: ContextTypes.DEFAULT_TYPE):
+    if not EVOLUTION_ENABLED:
+        return
+    try:
+        _hb_touch('learning_daily', ok=True, details='cycle_start')
+        res = await to_thread_heavy(_run_evolution_cycle, "daily")
+        if isinstance(res, dict) and res.get("ok"):
+            snap = res.get("snapshot") or {}
+            if getattr(context, "bot", None):
+                msg = (
+                    "🧠 Evolution daily cycle complete\n"
+                    f"Overall WR est: {float((snap.get('overall') or {}).get('estimated_wr', 0.0) or 0.0):.1f}%\n"
+                    f"NY WR est: {float((snap.get('ny') or {}).get('estimated_wr', 0.0) or 0.0):.1f}%\n"
+                    f"Trend: overall {((snap.get('trend') or {}).get('overall') or 'n/a')} | NY {((snap.get('trend') or {}).get('ny') or 'n/a')}\n"
+                    f"Auto-adjustments: {len(res.get('actions') or [])}"
+                )
+                try:
+                    await _notify_admins_autonomous_opt(context.bot, msg)
+                except Exception:
+                    pass
+            _hb_touch('learning_daily', ok=True, details='cycle_ok')
+    except Exception as e:
+        _hb_touch('learning_daily', ok=False, error=f"{type(e).__name__}: {e}", details='cycle_error')
+        pass
+
+
+def _evolution_snapshot_cached() -> dict:
+    snap = _evolution_state_get("snapshot", {}) or {}
+    if not snap:
+        try:
+            snap = _run_evolution_cycle("hourly").get("snapshot") or {}
+        except Exception:
+            snap = {}
+    return snap
+
+
+def _fmt_wr_block(title: str, item: dict) -> str:
+    return (
+        f"{title}: {float(item.get('estimated_wr', 0.0) or 0.0):.1f}%"
+        f" (confidence: {str(item.get('confidence') or 'low')}, live sample: {int(item.get('live_sample', 0) or 0)})"
+    )
+
+
+async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    uid = int(update.effective_user.id)
+    snap = await to_thread_fast(_evolution_snapshot_cached)
+    if not snap:
+        await update.message.reply_text("No evolution snapshot yet.")
+        return
+
+    overall = snap.get("overall") or {}
+    ny = snap.get("ny") or {}
+    trend = snap.get("trend") or {}
+    last_opt = _db_get_last_opt_run() or {}
+    opt_res = _db_get_opt_result(str(last_opt.get("run_id") or "")) if last_opt else {}
+    verdict, blockers = _admin_assurance_verdict(uid)
+    opt_live = bool((opt_res or {}).get("promoted"))
+    owner = int(AUTOTRADE_OWNER_UID or uid)
+    overall_sig = _signal_wr_display_metrics(owner)
+    ny_sig = _signal_wr_display_metrics(owner, session='NY')
+
+    lines = [
+        "🧠 Edge Status",
+        HDR,
+        f"Engine verdict: {'HEALTHY' if verdict == 'HEALTHY' else 'ATTENTION NEEDED'}" + (f" | {'; '.join(blockers[:3])}" if blockers else ""),
+        f"Learning engine: {'ON' if EVOLUTION_ENABLED else 'OFF'}",
+        f"Optimizer engine: {'ON' if AUTONOMOUS_OPT_ENABLED else 'OFF'}",
+        f"Auto-trading engine: {'ON' if _autotrade_ready() else 'OFF'}",
+        f"Email pipeline: {'ON' if EMAIL_ENABLED and email_config_ok() else 'OFF'}",
+        SEP,
+        f"Overall signal WR: {float(overall_sig.get('binary_win_rate') or 0.0):.1f}% ({int(overall_sig.get('wins') or 0)}W / {int(overall_sig.get('losses') or 0)}L)",
+        f"New York signal WR: {float(ny_sig.get('binary_win_rate') or 0.0):.1f}% ({int(ny_sig.get('wins') or 0)}W / {int(ny_sig.get('losses') or 0)}L)",
+        f"Weighted TP-stage WR: {float(overall_sig.get('weighted_win_rate') or 0.0):.1f}%",
+        f"Trend vs prior 7d: overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')} | NY {str(trend.get('ny_7d') or trend.get('ny') or 'n/a')}",
+        f"Latest optimizer result: {'PROMOTED TO LIVE PARAMS' if opt_live else 'NO NEW LIVE PARAMS PROMOTED'}",
+        f"Detailed learning view: /learning_status",
+    ]
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+
+def _canon_signal_outcome_label(outcome: str, pnl: float | None = None) -> str:
+    """Canonical user-facing outcome model: TP1, TP2, SL, OPEN, UNTRACKED."""
+    o = str(outcome or '').upper().strip()
+    if o in {'UNTRACKED', 'UNTRACKED_OPEN', 'SKIPPED', 'NOT_TRADED'}:
+        return 'UNTRACKED'
+    try:
+        pnl_f = None if pnl is None else float(pnl)
+    except Exception:
+        pnl_f = None
+    if o in {'TP2', 'WIN_TP2', 'WIN_TP3', 'WIN'}:
+        return 'TP2'
+    if o in {'TP1', 'WIN_TP1'}:
+        return 'TP1'
+    if o in {'SL', 'LOSS'}:
+        return 'SL'
+    if o in {'BREAKEVEN', 'BE'}:
+        return 'OPEN'
+    if o.startswith('MANUAL_CLOSE_POSITIVE'):
+        return 'TP1'
+    if o.startswith('MANUAL_CLOSE_NEGATIVE'):
+        return 'SL'
+    if pnl_f is not None:
+        if pnl_f < 0:
+            return 'SL'
+        if pnl_f > 0:
+            return 'TP1'
+    return 'OPEN'
+
+
+def _canon_outcome_from_autotrade_trade(trade: dict) -> str:
+    pnl = None
+    try:
+        pnl = float(trade.get('pnl') if trade.get('pnl') is not None else trade.get('pnl_usdt') or 0.0)
+    except Exception:
+        pnl = None
+    raw = str(trade.get('outcome') or '').upper().strip()
+    if raw in {'WIN_TP2', 'WIN_TP3', 'TP2'}:
+        return 'TP2'
+    if raw in {'WIN_TP1', 'TP1'}:
+        return 'TP1'
+    if raw in {'LOSS', 'SL'}:
+        return 'SL'
+    if raw in {'WIN', 'BREAKEVEN'}:
+        return _canon_signal_outcome_label(raw, pnl=pnl)
+    return _canon_signal_outcome_label(raw, pnl=pnl)
+
+
+def _canonical_signal_outcome_for_setup(user_id: int, setup_id: str) -> tuple[str, dict]:
+    sid = str(setup_id or '').strip()
+    life = _admin_setup_lifecycle_get(sid) if sid else {}
+    trade = None
+    trade_id = str((life or {}).get('trade_id') or '').strip()
+
+    def _load_trade(_trade_id: str):
+        if not _trade_id:
+            return None
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                row = cur.execute("SELECT * FROM autotrade_trades WHERE trade_id=? LIMIT 1", (_trade_id,)).fetchone()
+                return dict(row) if row else None
+        except Exception:
+            return None
+
+    trade = _load_trade(trade_id)
+    if trade:
+        status = str(trade.get('status') or '').upper().strip()
+        if status == 'OPEN':
+            if str(AUTOTRADE_MODE).lower() == 'live':
+                pos = _autotrade_find_live_position(str(trade.get('symbol') or ''), side=str(trade.get('side') or ''))
+                if pos:
+                    return 'OPEN', {'source': 'live_position', 'trade': trade, 'lifecycle': life}
+                try:
+                    _autotrade_sync_closed_trades_from_exchange(int(user_id), lookback_days=30)
+                    refreshed = _load_trade(trade_id)
+                    if refreshed and (str(refreshed.get('status') or '').upper().strip() == 'CLOSED' or float(refreshed.get('closed_ts') or 0.0) > 0):
+                        return _canon_outcome_from_autotrade_trade(refreshed), {'source': 'autotrade_trade_sync', 'trade': refreshed, 'lifecycle': life}
+                except Exception:
+                    pass
+            return 'OPEN', {'source': 'autotrade_open_trade', 'trade': trade, 'lifecycle': life}
+        if status == 'CLOSED' or float(trade.get('closed_ts') or 0.0) > 0:
+            return _canon_outcome_from_autotrade_trade(trade), {'source': 'autotrade_trade', 'trade': trade, 'lifecycle': life}
+    stored = db_get_outcome(sid) if sid else None
+    if stored:
+        return _canon_signal_outcome_label(stored.get('outcome')), {'source': 'signal_outcomes', 'stored': stored, 'lifecycle': life}
+    return 'OPEN', {'source': 'none', 'lifecycle': life}
+
+
+def _signal_report_live_backed_only(user_id: int, meta: dict | None, canon: str) -> bool:
+    # Admin live-report gate: OPEN rows must be backed by a CURRENT live Bybit position.
+    # Local journal rows that still say OPEN are not enough, otherwise /signal_report can show
+    # stale OPEN items after the exchange position was already closed outside the bot.
+    try:
+        if str(AUTOTRADE_MODE).lower() != 'live':
+            return False
+        if int(user_id) != int(AUTOTRADE_OWNER_UID or 0):
+            return False
+        if str(canon or '').upper().strip() != 'OPEN':
+            return False
+        src = str(((meta or {}).get('source') or '')).strip().lower()
+        return src in {'live_position'}
+    except Exception:
+        return False
+
+
+def _canonical_wr_stats(rows: list[dict]) -> dict:
+    counts = Counter()
+    by_session = defaultdict(lambda: Counter())
+    decided = 0
+    wins = 0
+    losses = 0
+    for r in rows or []:
+        out = _canon_signal_outcome_label(r.get('outcome'))
+        sess = str(r.get('session') or '?').upper().strip() or '?'
+        counts[out] += 1
+        by_session[sess][out] += 1
+        if out in {'TP1', 'TP2', 'SL'}:
+            decided += 1
+        if out == 'TP2':
+            wins += 1
+        elif out == 'SL':
+            losses += 1
+    wr = (wins / decided * 100.0) if decided > 0 else 0.0
+    by_sess = {}
+    for sess, ctr in by_session.items():
+        s_dec = int(ctr.get('TP1', 0) + ctr.get('TP2', 0) + ctr.get('SL', 0))
+        s_win = int(ctr.get('TP2', 0))
+        by_sess[sess] = {
+            'total': int(sum(ctr.values())),
+            'decided': s_dec,
+            'wins': s_win,
+            'losses': int(ctr.get('SL', 0)),
+            'tp1': int(ctr.get('TP1', 0)),
+            'tp2': int(ctr.get('TP2', 0)),
+            'sl': int(ctr.get('SL', 0)),
+            'open': int(ctr.get('OPEN', 0)),
+            'untracked': int(ctr.get('UNTRACKED', 0)),
+            'win_rate': float((s_win / s_dec) * 100.0) if s_dec > 0 else 0.0,
+        }
+    return {
+        'counts': counts,
+        'by_session': by_sess,
+        'decided': int(decided),
+        'wins': int(wins),
+        'losses': int(losses),
+        'win_rate': float(wr),
+    }
+
+
+async def learning_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    await send_long_message(update, _learning_status_text(), parse_mode=None)
+
+
+def _signal_outcome_summary(user_id: int, session: str | None = None, days: int | None = None) -> dict:
+    """Canonical signal outcome summary from emailed setups, optionally live-synced for admin autotrade rows."""
+    rows = []
+    ts_from = None
+    if days is not None:
+        try:
+            ts_from = float(time.time() - max(1, int(days)) * 86400.0)
+        except Exception:
+            ts_from = None
+    user_id = int(user_id)
+    try:
+        if str(AUTOTRADE_MODE).lower() == 'live' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0):
+            _autotrade_sync_closed_trades_from_exchange(int(user_id), lookback_days=max(14, int(days or 30)))
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = """SELECT e.setup_id, e.session, e.emailed_ts FROM emailed_setups e WHERE e.user_id=?"""
+            params = [user_id]
+            if ts_from is not None:
+                q += " AND e.emailed_ts>=?"
+                params.append(float(ts_from))
+            if session:
+                q += " AND UPPER(COALESCE(e.session,''))=?"
+                params.append(str(session).upper())
+            q += " ORDER BY e.emailed_ts ASC"
+            emailed = [dict(r) for r in (c.execute(q, tuple(params)).fetchall() or [])]
+    except Exception:
+        emailed = []
+
+    rows = []
+    hidden_untracked_open = 0
+    for e in emailed:
+        sid = str(e.get('setup_id') or '').strip()
+        canon, meta = _canonical_signal_outcome_for_setup(user_id, sid)
+        if _signal_report_live_backed_only(int(user_id), meta, canon) is False and str(canon).upper().strip() == 'OPEN' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0) and str(AUTOTRADE_MODE).lower() == 'live':
+            hidden_untracked_open += 1
+            continue
+        stored = (meta or {}).get('stored') or {}
+        life = (meta or {}).get('lifecycle') or {}
+        trade = (meta or {}).get('trade') or {}
+        hit_ts = stored.get('hit_ts') or life.get('closed_ts') or trade.get('closed_ts')
+        rows.append({
+            'setup_id': sid,
+            'session': str(e.get('session') or '').strip().upper() or '?',
+            'emailed_ts': float(e.get('emailed_ts') or 0.0),
+            'outcome': canon,
+            'hit_ts': float(hit_ts or 0.0) if hit_ts else None,
+            'source': str((meta or {}).get('source') or ''),
+        })
+    stats = _canonical_wr_stats(rows)
+    return {
+        'rows': rows,
+        'counts': stats.get('counts') or Counter(),
+        'by_session': stats.get('by_session') or {},
+        'wins': int(stats.get('wins') or 0),
+        'losses': int(stats.get('losses') or 0),
+        'decided': int(stats.get('decided') or 0),
+        'win_rate': float(stats.get('win_rate') or 0.0),
+        'hidden_untracked_open': int(hidden_untracked_open or 0),
+    }
+
+
+def _signal_outcome_weighted_summary(user_id: int, session: str | None = None, days: int | None = None) -> dict:
+    summary = _signal_outcome_summary(int(user_id), session=session, days=days)
+    rows = summary.get('rows') or []
+    stats = _canonical_wr_stats(rows)
+    counts = stats.get('counts') or Counter()
+    return {
+        'rows': rows,
+        'counts': counts,
+        'by_session': stats.get('by_session') or {},
+        'total': int(len(rows)),
+        'decided': int(stats.get('decided') or 0),
+        'wins': int(stats.get('wins') or 0),
+        'losses': int(stats.get('losses') or 0),
+        'tp1_only': int(counts.get('TP1', 0)),
+        'tp2_plus': int(counts.get('TP2', 0)),
+        'tp3': 0,
+        'open': int(counts.get('OPEN', 0)),
+        'weighted_win_rate': float(stats.get('win_rate') or 0.0),
+        'binary_win_rate': float(stats.get('win_rate') or 0.0),
+        'avg_weighted_credit': float((int(counts.get('TP2', 0)) / int(stats.get('decided') or 1)) if int(stats.get('decided') or 0) > 0 else 0.0),
+    }
+
+
+def _signal_wr_display_metrics(user_id: int, session: str | None = None, days: int | None = None) -> dict:
+    roll = _signal_outcome_weighted_summary(int(user_id), session=session, days=days)
+    return {
+        'wins': int(roll.get('wins') or 0),
+        'losses': int(roll.get('losses') or 0),
+        'decided': int(roll.get('decided') or 0),
+        'binary_win_rate': float(roll.get('binary_win_rate') or 0.0),
+        'weighted_win_rate': float(roll.get('weighted_win_rate') or 0.0),
+        'avg_weighted_credit': float(roll.get('avg_weighted_credit') or 0.0),
+        'tp1_only': int(roll.get('tp1_only') or 0),
+        'tp2_plus': int(roll.get('tp2_plus') or 0),
+        'tp3': 0,
+        'open': int(roll.get('open') or 0),
+        'counts': roll.get('counts') or Counter(),
+        'rows': roll.get('rows') or [],
+        'by_session': roll.get('by_session') or {},
+    }
+
+
+def _signal_weighted_wr_daily_series(uid: int, days: int, session: str | None = None) -> list[tuple[str, float]]:
+    uid = int(uid)
+    days = int(max(1, days))
+    user = _autotrade_user_settings(uid)
+    now_local = datetime.now(_user_tzinfo(user))
+    start_local, _ = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
+    day_starts = [start_local - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    day_labels = [ds.strftime('%Y-%m-%d') for ds in day_starts]
+    summary = _signal_outcome_summary(uid, session=session, days=days)
+    rows = summary.get('rows') or []
+    buckets = {lab: [] for lab in day_labels}
+    for r in rows:
+        ts = float(r.get('emailed_ts') or 0.0)
+        if ts <= 0:
+            continue
+        lab = _autotrade_trade_day_label(ts, user)
+        if lab in buckets:
+            buckets[lab].append(_canon_signal_outcome_label(r.get('outcome')))
+    cumulative = []
+    cum_decided = 0
+    cum_wins = 0
+    for lab in day_labels:
+        for out in buckets.get(lab) or []:
+            if out in {'TP1', 'TP2', 'SL'}:
+                cum_decided += 1
+                if out == 'TP2':
+                    cum_wins += 1
+        wr = (cum_wins / cum_decided * 100.0) if cum_decided > 0 else 0.0
+        cumulative.append((lab, float(wr)))
+    return cumulative
+
+
+def _stage_credit_from_outcome(outcome: str) -> float:
+    return 1.0 if _canon_signal_outcome_label(outcome) == 'TP2' else 0.0
+
+
+def _autotrade_trade_signal_outcome(trade: dict) -> str:
+    try:
+        return _canon_outcome_from_autotrade_trade(trade)
+    except Exception:
+        return 'OPEN'
+
+
+def _weighted_rollup_from_outcomes(outcomes: list[tuple[str, str]]) -> dict:
+    rows = [{'session': sess, 'outcome': _canon_signal_outcome_label(outcome)} for sess, outcome in (outcomes or [])]
+    stats = _canonical_wr_stats(rows)
+    counts = stats.get('counts') or Counter()
+    return {
+        'total': int(len(rows)),
+        'decided': int(stats.get('decided') or 0),
+        'counts': counts,
+        'tp1_only': int(counts.get('TP1', 0)),
+        'tp2_plus': int(counts.get('TP2', 0)),
+        'tp3': 0,
+        'losses': int(counts.get('SL', 0)),
+        'open': int(counts.get('OPEN', 0)),
+        'weighted_win_rate': float(stats.get('win_rate') or 0.0),
+        'binary_win_rate': float(stats.get('win_rate') or 0.0),
+        'avg_weighted_credit': float((int(counts.get('TP2', 0)) / int(stats.get('decided') or 1)) if int(stats.get('decided') or 0) > 0 else 0.0),
+        'by_session': stats.get('by_session') or {},
+    }
+
+
+def _autotrade_weighted_outcome_summary(uid: int, days: int | None = None) -> dict:
+    trades = db_list_autotrade_trades_all(int(uid)) or []
+    if days is not None:
+        cutoff = float(time.time() - max(1, int(days)) * 86400.0)
+        trades = [t for t in trades if float(t.get('opened_ts') or 0.0) >= cutoff or float(t.get('closed_ts') or 0.0) >= cutoff]
+    outcomes = []
+    for t in trades:
+        outcomes.append((str(t.get('session') or '?'), _autotrade_trade_signal_outcome(t)))
+    return _weighted_rollup_from_outcomes(outcomes)
+
+
+def _learning_stage_outcome_summary(uid: int, days: int = 60) -> dict:
+    if int(uid or 0) <= 0:
+        return {'decided': 0, 'tp1_only': 0, 'tp2_plus': 0, 'tp3': 0, 'losses': 0, 'weighted_win_rate': 0.0, 'avg_weighted_credit': 0.0}
+    summary = _signal_outcome_summary(int(uid), days=int(days))
+    outcomes = []
+    for r in summary.get('rows') or []:
+        outcomes.append((str(r.get('session') or '?'), str(r.get('outcome') or 'OPEN')))
+    return _weighted_rollup_from_outcomes(outcomes)
+
+
+def _last_n_anchored_day_labels(uid: int, days: int) -> list[str]:
+    uid = int(uid)
+    days = int(max(1, days))
+    user = _autotrade_user_settings(uid)
+    now_local = datetime.now(_user_tzinfo(user))
+    start_local, _ = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
+    return [(start_local - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(days - 1, -1, -1)]
+
+def _autotrade_history_days_available(uid: int) -> int:
+    try:
+        user = _autotrade_user_settings(int(uid))
+        now_local = datetime.now(_user_tzinfo(user))
+        start_local, _ = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
+        earliest = None
+        trades = db_list_autotrade_trades_all(int(uid)) or []
+        for t in trades:
+            for key in ('opened_ts', 'closed_ts'):
+                try:
+                    ts = float(t.get(key) or 0.0)
+                except Exception:
+                    ts = 0.0
+                if ts > 0:
+                    earliest = ts if earliest is None else min(earliest, ts)
+        if earliest is None:
+            return 7
+        earliest_local = datetime.fromtimestamp(float(earliest), tz=timezone.utc).astimezone(_user_tzinfo(user))
+        earliest_day_local, _ = _anchored_day_window(earliest_local, _user_day_reset_hhmm(user))
+        days = int((start_local - earliest_day_local).days) + 1
+        return max(7, min(days, 3650))
+    except Exception:
+        return 7
+
+
+
+
+
+def _stage_credit_from_outcome(outcome: str) -> float:
+    """Canonical staged credit for the production 2-TP model.
+
+    TP1 = partial success, TP2 = full success, SL = loss, OPEN = unresolved.
+    """
+    canon = _canon_signal_outcome_label(outcome)
+    if canon == 'TP1':
+        return 0.50
+    if canon == 'TP2':
+        return 1.00
+    return 0.0
+
+
+def _autotrade_trade_signal_outcome(trade: dict) -> str:
+    """Use the journal / live-sync canonical outcome instead of re-simulating old 3-TP paths."""
+    try:
+        return _canon_outcome_from_autotrade_trade(trade)
+    except Exception:
+        return 'OPEN'
+
+
+def _weighted_rollup_from_outcomes(outcomes: list[tuple[str, str]]) -> dict:
+    rows = [{'session': sess, 'outcome': _canon_signal_outcome_label(outcome)} for sess, outcome in (outcomes or [])]
+    stats = _canonical_wr_stats(rows)
+    counts = stats.get('counts') or Counter()
+    decided = int(stats.get('decided') or 0)
+    tp1 = int(counts.get('TP1', 0))
+    tp2 = int(counts.get('TP2', 0))
+    weighted_credit = (tp1 * 0.50) + (tp2 * 1.00)
+    weighted_wr = float((weighted_credit / decided) * 100.0) if decided > 0 else 0.0
+
+    by_session_out = {}
+    for sess, item in (stats.get('by_session') or {}).items():
+        s_dec = int(item.get('decided') or 0)
+        s_tp1 = int(item.get('tp1') or 0)
+        s_tp2 = int(item.get('tp2') or 0)
+        s_weighted_credit = (s_tp1 * 0.50) + (s_tp2 * 1.00)
+        by_session_out[sess] = {
+            'total': int(item.get('total') or 0),
+            'decided': s_dec,
+            'tp1_only': s_tp1,
+            'tp2_plus': s_tp2,
+            'tp3': 0,
+            'losses': int(item.get('sl') or 0),
+            'open': int(item.get('open') or 0),
+            'weighted_win_rate': float((s_weighted_credit / s_dec) * 100.0) if s_dec > 0 else 0.0,
+            'binary_win_rate': float(item.get('win_rate') or 0.0),
+        }
+
+    return {
+        'total': int(len(rows)),
+        'decided': decided,
+        'counts': counts,
+        'tp1_only': tp1,
+        'tp2_plus': tp2,
+        'tp3': 0,
+        'losses': int(counts.get('SL', 0)),
+        'open': int(counts.get('OPEN', 0)),
+        'weighted_win_rate': weighted_wr,
+        'binary_win_rate': float(stats.get('win_rate') or 0.0),
+        'avg_weighted_credit': float(weighted_credit / decided) if decided > 0 else 0.0,
+        'by_session': by_session_out,
+    }
+
+
+def _autotrade_weighted_outcome_summary(uid: int, days: int | None = None) -> dict:
+    trades = db_list_autotrade_trades_all(int(uid)) or []
+    if days is not None:
+        cutoff = float(time.time() - max(1, int(days)) * 86400.0)
+        trades = [t for t in trades if float(t.get('opened_ts') or 0.0) >= cutoff or float(t.get('closed_ts') or 0.0) >= cutoff]
+    outcomes = []
+    for t in trades:
+        outcomes.append((str(t.get('session') or '?'), _autotrade_trade_signal_outcome(t)))
+    return _weighted_rollup_from_outcomes(outcomes)
+
+
+def _learning_stage_outcome_summary(uid: int, days: int = 60) -> dict:
+    if int(uid or 0) <= 0:
+        return {'decided': 0, 'tp1_only': 0, 'tp2_plus': 0, 'tp3': 0, 'losses': 0, 'weighted_win_rate': 0.0, 'avg_weighted_credit': 0.0}
+    summary = _signal_outcome_summary(int(uid), days=int(days))
+    outcomes = []
+    for r in summary.get('rows') or []:
+        outcomes.append((str(r.get('session') or '?'), str(r.get('outcome') or 'OPEN')))
+    return _weighted_rollup_from_outcomes(outcomes)
+
+
+def _learning_live_trade_summary(uid: int, days: int = 60) -> dict:
+    rows = _autotrade_performance_rows(int(uid), days=max(3, int(days))) if int(uid or 0) > 0 else []
+    s = _autotrade_performance_summary(rows)
+    return {
+        'closed': int(s.get('closed') or 0),
+        'net_pnl': float(s.get('net') or 0.0),
+        'win_rate': float(s.get('win_rate') or 0.0),
+    }
+
+
+def _learning_breakeven_after_tp1_analysis(uid: int, days: int = 60) -> dict:
+    stage = _learning_stage_outcome_summary(uid, days=days)
+    tp1_plus = int(stage.get('tp1_only') or 0) + int(stage.get('tp2_plus') or 0)
+    if tp1_plus <= 0:
+        return {
+            'recommendation': 'WAIT',
+            'sample_tp1_plus': 0,
+            'tp1_only_share': 0.0,
+            'explanation': 'No TP1-hit sample yet. Keep current code until more stage data is collected.',
+        }
+    tp1_only_share = (float(stage.get('tp1_only') or 0) / float(tp1_plus) * 100.0) if tp1_plus > 0 else 0.0
+    tp2_plus_share = (float(stage.get('tp2_plus') or 0) / float(tp1_plus) * 100.0) if tp1_plus > 0 else 0.0
+    if tp1_plus < 12:
+        rec = 'WAIT'
+        why = 'TP1-path sample is still small. No code change is required yet.'
+    elif tp1_only_share >= 60.0:
+        rec = 'CONDITIONAL'
+        why = 'Many TP1-hit setups do not extend to the final TP2 target. A conditional break-even-after-TP1 rule is supported by the data, but it should be filtered by setup quality / session / volatility rather than forced on every trade.'
+    elif tp2_plus_share >= 60.0:
+        rec = 'NO_GLOBAL_CHANGE'
+        why = 'Most TP1-hit setups continue to the final TP2 target. A global move-to-breakeven right after TP1 would likely cut stronger runners too early.'
+    else:
+        rec = 'CONDITIONAL'
+        why = 'Results are mixed. Keep current logic unless you want a bounded analytics-driven conditional rule after TP1.'
+    return {
+        'recommendation': rec,
+        'sample_tp1_plus': int(tp1_plus),
+        'tp1_only_share': float(tp1_only_share),
+        'explanation': why,
+    }
+
+
+def _autotrade_weighted_wr_daily_series(uid: int, days: int) -> list[tuple[str, float]]:
+    uid = int(uid)
+    user = _autotrade_user_settings(uid)
+    rows = db_list_autotrade_trades_all(uid) or []
+    now_local = datetime.now(_user_tzinfo(user))
+    start_local, _ = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
+    day_starts = [start_local - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    buckets = {ds.strftime('%Y-%m-%d'): [] for ds in day_starts}
+    for t in rows:
+        try:
+            ots = float(t.get('opened_ts') or 0.0)
+            if ots <= 0:
+                continue
+            lab = _autotrade_trade_day_label(ots, user)
+            if lab in buckets:
+                buckets[lab].append(_autotrade_trade_signal_outcome(t))
+        except Exception:
+            continue
+    series = []
+    for ds in day_starts:
+        lab = ds.strftime('%Y-%m-%d')
+        outs = [_canon_signal_outcome_label(o) for o in (buckets.get(lab) or [])]
+        decided = sum(1 for o in outs if o in {'TP1', 'TP2', 'SL'})
+        wsum = sum(_stage_credit_from_outcome(o) for o in outs if o in {'TP1', 'TP2', 'SL'})
+        wr = (wsum / decided * 100.0) if decided > 0 else 0.0
+        series.append((lab, float(wr)))
+    return series
+
+
+def _simple_line_chart_png(series_map: list[tuple[str, list[tuple[str, float]]]], title: str, ylabel: str, out_prefix: str) -> str | None:
+    try:
+        import os
+        import tempfile
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        cleaned_series = []
+        all_labels = []
+        for name, pts in (series_map or []):
+            clean_pts = []
+            for x, y in (pts or []):
+                try:
+                    yv = float(y or 0.0)
+                    if not math.isfinite(yv):
+                        yv = 0.0
+                    clean_pts.append((str(x), yv))
+                except Exception:
+                    continue
+            if clean_pts:
+                cleaned_series.append((str(name), clean_pts))
+                if not all_labels:
+                    all_labels = [x for x, _ in clean_pts]
+
+        if not cleaned_series:
+            cleaned_series = [('Series', [('N/A', 0.0)])]
+            all_labels = ['N/A']
+
+        fig, ax = plt.subplots(figsize=(11, 5.5))
+        x_index = {lab: idx for idx, lab in enumerate(all_labels)}
+
+        for name, pts in cleaned_series:
+            xs = [x_index.get(x, i) for i, (x, _y) in enumerate(pts)]
+            ys = [float(y) for _x, y in pts]
+            if not xs:
+                xs, ys = [0], [0.0]
+            ax.plot(xs, ys, linewidth=2, marker='o', markersize=3, label=str(name))
+
+        ax.set_title(str(title))
+        ax.set_xlabel('Trading day')
+        ax.set_ylabel(str(ylabel))
+        ax.grid(True, alpha=0.3)
+        ax.set_xticks(list(range(len(all_labels))))
+        ax.set_xticklabels(all_labels)
+
+        if len(all_labels) > 8:
+            for label in ax.get_xticklabels():
+                label.set_rotation(45)
+                label.set_horizontalalignment('right')
+
+        if len(cleaned_series) > 1:
+            ax.legend()
+
+        fig.tight_layout()
+
+        out_dir = os.environ.get("CHART_OUTPUT_DIR") or tempfile.gettempdir()
+        os.makedirs(out_dir, exist_ok=True)
+        out = os.path.join(out_dir, f"{out_prefix}_{int(time.time())}.png")
+
+        fig.savefig(out, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        return out
+
+    except Exception as e:
+        try:
+            logger.exception('simple chart build failed: %s', e)
+        except Exception:
+            pass
+        return None
+
+def _build_winrate_chart_png(uid: int, days: int, title: str = 'Overall Win-Rate Trend', session: str | None = None) -> str | None:
+    series = _signal_weighted_wr_daily_series(int(uid), int(days), session=session)
+    if not series:
+        labels = _last_n_anchored_day_labels(int(uid), int(days))
+        series = [(lab, 0.0) for lab in labels]
+    return _simple_line_chart_png([('Overall WR %', [(x, float(y)) for x, y in series])], str(title), 'Win rate %', 'winrate_chart')
+
+
+async def performance_chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    uid = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
+    owner_user = _autotrade_user_settings(uid)
+    equity_now = _effective_equity_for_risk(owner_user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
+    days = _autotrade_history_days_available(uid)
+    rows = _autotrade_performance_rows(uid, days=max(7, days))
+    if not rows:
+        rows = [{'day': lab, 'net_pnl': 0.0} for lab in _last_n_anchored_day_labels(uid, max(7, days))]
+    chart = _build_performance_chart_png(rows, equity=float(equity_now or 0.0))
+    if not chart:
+        await update.message.reply_text('Could not build the performance chart right now.')
+        return
+    with open(chart, 'rb') as f:
+        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=f, caption='📉 Overall equity + daily PnL trend')
+
+
+async def winrate_chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    uid = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
+    days = _autotrade_history_days_available(uid)
+    chart = _build_winrate_chart_png(uid, days=max(7, days), title='Overall Win-Rate Trend')
+    if not chart:
+        await update.message.reply_text('Could not build the win-rate chart right now.')
+        return
+    with open(chart, 'rb') as f:
+        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=f, caption='📊 Overall win-rate trend')
+
+
+def _autotrade_chart_series(rows: list[dict], starting_equity: float = 0.0) -> dict:
+    pnl_points = []
+    equity_points = []
+    running = float(starting_equity or 0.0)
+    ordered = sorted((rows or []), key=lambda r: str(r.get('day') or ''))
+    for r in ordered:
+        day = str(r.get('day') or '')
+        pnl = float(r.get('net_pnl') or 0.0)
+        running += pnl
+        pnl_points.append((day, pnl))
+        equity_points.append((day, running))
+    return {'pnl': pnl_points, 'equity': equity_points}
+
+
+def _build_performance_chart_png(rows: list[dict], equity: float = 0.0) -> str | None:
+    rows = rows or [{'day': 'N/A', 'net_pnl': 0.0}]
+    series = _autotrade_chart_series(rows, starting_equity=float(equity or 0.0))
+    days = [d for d, _ in series['pnl']] or ['N/A']
+    pnl_vals = [float(v) for _, v in series['pnl']] or [0.0]
+    eq_vals = [float(v) for _, v in series['equity']] or [float(equity or 0.0)]
+    return _simple_line_chart_png([('Equity', list(zip(days, eq_vals))), ('Daily PnL', list(zip(days, pnl_vals)))], 'Equity & Daily PnL Trend', 'USDT', 'performance_chart')
+
+
+def _fmt_wr_line(label: str, summary: dict) -> str:
+    return f"{label}: {int(summary.get('wins') or 0)}W / {int(summary.get('losses') or 0)}L | {float(summary.get('binary_win_rate') or summary.get('win_rate') or 0.0):.1f}%"
+
+
+async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    owner = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
+    overall = _signal_wr_display_metrics(owner)
+    msg = (
+        "📊 Win Rate\n"
+        f"{HDR}\n"
+        f"{_fmt_wr_line('Overall signal WR', overall)}"
+    )
+    await update.message.reply_text(msg)
+
+
+async def ny_winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    owner = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
+    overall = _signal_wr_display_metrics(owner, session='NY')
+    msg = (
+        "🗽 NY Win Rate\n"
+        f"{HDR}\n"
+        f"{_fmt_wr_line('Overall NY signal WR', overall)}"
+    )
+    await update.message.reply_text(msg)
+
+
+async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    rows = await to_thread_fast(_evolution_recent_diagnostics, 8, True, 30)
+    if not rows:
+        await update.message.reply_text("No lessons learned diagnostics recorded yet.")
+        return
+    lines = ["📚 Lessons Learned", HDR]
+    for r in rows[:8]:
+        tags = r.get("tags") or []
+        when = _fmt_dt_local(datetime.fromtimestamp(float(r.get("decided_ts") or time.time()), tz=timezone.utc))
+        lines.append(f"• {str(r.get('symbol') or '')} {str(r.get('side') or '')} | {str(r.get('session') or '')} | {when}")
+        lines.append(f"  Outcome: {str(r.get('outcome') or '')} | Tags: {', '.join(tags[:4]) if tags else '—'}")
+        rec = str(r.get("recommendation") or "").strip()
+        if rec:
+            lines.append(f"  Insight: {rec}")
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+
+# =========================================================
+# MARKET-SCAN SNAPSHOT INTELLIGENCE (zero-touch, low-maintenance)
+# - Captures repeated scan states several times per day
+# - Evaluates whether symbols later moved enough to count as missed opportunities
+# - Applies only bounded, evidence-based screen-side adjustments
+# =========================================================
+SCAN_INTELLIGENCE_ENABLED = str(os.environ.get("SCAN_INTELLIGENCE_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+SCAN_INTELLIGENCE_INTERVAL_MIN = int(os.environ.get("SCAN_INTELLIGENCE_INTERVAL_MIN", "180") or 180)
+SCAN_INTELLIGENCE_HORIZON_HOURS = float(os.environ.get("SCAN_INTELLIGENCE_HORIZON_HOURS", "6") or 6)
+SCAN_INTELLIGENCE_MAX_SYMBOLS = int(os.environ.get("SCAN_INTELLIGENCE_MAX_SYMBOLS", "24") or 24)
+SCAN_INTELLIGENCE_MIN_MFE_PCT = float(os.environ.get("SCAN_INTELLIGENCE_MIN_MFE_PCT", "1.4") or 1.4)
+SCAN_INTELLIGENCE_MAX_MAE_PCT = float(os.environ.get("SCAN_INTELLIGENCE_MAX_MAE_PCT", "1.2") or 1.2)
+SCAN_INTELLIGENCE_AUTO_APPLY_COOLDOWN_HOURS = float(os.environ.get("SCAN_INTELLIGENCE_AUTO_APPLY_COOLDOWN_HOURS", "18") or 18)
+SCAN_INTELLIGENCE_MIN_MISSED_GOOD = int(os.environ.get("SCAN_INTELLIGENCE_MIN_MISSED_GOOD", "6") or 6)
+
+def _scan_intel_migrate_tables():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS market_scan_snapshots (
+                snap_id TEXT PRIMARY KEY,
+                created_ts REAL NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT 'screen',
+                leaders_json TEXT NOT NULL DEFAULT '[]',
+                losers_json TEXT NOT NULL DEFAULT '[]',
+                market_leaders_json TEXT NOT NULL DEFAULT '[]',
+                waiting_json TEXT NOT NULL DEFAULT '[]',
+                trend_watch_json TEXT NOT NULL DEFAULT '[]',
+                top_setups_json TEXT NOT NULL DEFAULT '[]',
+                market_pulse_json TEXT NOT NULL DEFAULT '{}',
+                reject_summary_json TEXT NOT NULL DEFAULT '{}',
+                outcome_summary_json TEXT NOT NULL DEFAULT '{}'
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS market_scan_symbols (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snap_id TEXT NOT NULL,
+                created_ts REAL NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL,
+                bucket TEXT NOT NULL,
+                side TEXT NOT NULL DEFAULT '',
+                entry REAL NOT NULL DEFAULT 0,
+                ch24 REAL NOT NULL DEFAULT 0,
+                volume_usd REAL NOT NULL DEFAULT 0,
+                reject_reason TEXT NOT NULL DEFAULT '',
+                evaluated INTEGER NOT NULL DEFAULT 0,
+                evaluated_ts REAL,
+                mfe_pct REAL,
+                mae_pct REAL,
+                outcome TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                UNIQUE(snap_id, symbol, bucket)
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_market_scan_symbols_eval ON market_scan_symbols(evaluated, created_ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_market_scan_snapshots_ts ON market_scan_snapshots(created_ts)")
+            conn.commit()
+    except Exception:
+        pass
+
+def _scan_intel_compact_setup(s) -> dict:
+    try:
+        return {
+            "symbol": str(getattr(s, "symbol", "") or "").upper(),
+            "side": str(getattr(s, "side", "") or "").upper(),
+            "conf": int(getattr(s, "conf", 0) or 0),
+            "engine": str(getattr(s, "engine", "") or ""),
+            "entry": float(getattr(s, "entry", 0.0) or 0.0),
+            "sl": float(getattr(s, "sl", 0.0) or 0.0),
+            "tp3": float(getattr(s, "tp3", 0.0) or 0.0),
+            "ch24": float(getattr(s, "ch24", 0.0) or 0.0),
+            "fut_vol_usd": float(getattr(s, "fut_vol_usd", 0.0) or 0.0),
+        }
+    except Exception:
+        return {}
+
+def _scan_intel_market_pulse(best_fut: dict, leaders: list[str], losers: list[str], session_name: str) -> dict:
+    try:
+        adv = []
+        dec = []
+        vols = []
+        for _, mv in (best_fut or {}).items():
+            try:
+                ch24 = float(getattr(mv, "percentage", 0.0) or 0.0)
+                vol = float(usd_notional(mv) or 0.0)
+                vols.append(vol)
+                if ch24 > 0:
+                    adv.append(ch24)
+                elif ch24 < 0:
+                    dec.append(ch24)
+            except Exception:
+                continue
+        risk_tone = "balanced"
+        if len(leaders) >= max(3, len(losers) + 2):
+            risk_tone = "risk_on"
+        elif len(losers) >= max(3, len(leaders) + 2):
+            risk_tone = "risk_off"
+        return {
+            "session": str(session_name or "").upper(),
+            "leaders_n": int(len(leaders or [])),
+            "losers_n": int(len(losers or [])),
+            "breadth_adv": int(len(adv)),
+            "breadth_dec": int(len(dec)),
+            "avg_adv_24h": float(sum(adv) / len(adv)) if adv else 0.0,
+            "avg_dec_24h": float(sum(dec) / len(dec)) if dec else 0.0,
+            "median_vol_usd": float(sorted(vols)[len(vols)//2]) if vols else 0.0,
+            "risk_tone": risk_tone,
+        }
+    except Exception:
+        return {"session": str(session_name or "").upper(), "risk_tone": "unknown"}
+
+def _scan_intel_capture_snapshot(best_fut: dict, session_name: str, pool: dict, reject_ctx: dict | None = None, mode: str = "screen") -> str:
+    _scan_intel_migrate_tables()
+    created_ts = float(time.time())
+    snap_id = f"SCAN-{int(created_ts)}-{str(session_name or '').upper()}"
+    up_list, dn_list = compute_directional_lists(best_fut)
+    leaders = [str(t[0]).upper() for t in (up_list or [])[:10]]
+    losers = [str(t[0]).upper() for t in (dn_list or [])[:10]]
+    market_leaders = _market_leader_bases(best_fut, 10)
+    waiting = list(pool.get("waiting") or [])[:SCREEN_WAITING_N]
+    trend_watch = list(pool.get("trend_watch") or [])[:10]
+    top_setups = [ _scan_intel_compact_setup(s) for s in list(pool.get("setups") or [])[:6] ]
+    pulse = _scan_intel_market_pulse(best_fut, leaders, losers, session_name)
+    reject_summary = {}
+    per = {}
+    try:
+        per = dict((reject_ctx or {}).get("__per__") or {})
+        reason_ctr = Counter()
+        for sym, info in per.items():
+            try:
+                rr = str((info or {}).get("reason") or "").strip()
+                if rr and rr not in ("evaluated", "setup_generated", "not_evaluated"):
+                    reason_ctr[rr] += 1
+            except Exception:
+                continue
+        reject_summary = {"top_rejects": reason_ctr.most_common(8)}
+    except Exception:
+        reject_summary = {}
+
+    tracked = []
+    def _add_symbol(sym: str, bucket: str, side: str = ""):
+        s = str(sym or "").upper().strip()
+        if not s:
+            return
+        mv = (best_fut or {}).get(s)
+        if not mv:
+            return
+        info = per.get(s) or {}
+        tracked.append((
+            snap_id, created_ts, str(session_name or "").upper(), s, str(bucket), str(side or "").upper(),
+            float(getattr(mv, "last", 0.0) or 0.0), float(getattr(mv, "percentage", 0.0) or 0.0), float(usd_notional(mv) or 0.0),
+            str(info.get("reason") or "")
+        ))
+
+    for s in leaders[:8]:
+        _add_symbol(s, "leaders", "BUY")
+    for s in losers[:8]:
+        _add_symbol(s, "losers", "SELL")
+    for s in market_leaders[:8]:
+        _add_symbol(s, "market_leaders", "")
+    for s, info in waiting[:8]:
+        _add_symbol(s, "momentum_watch", str((info or {}).get("side") or ""))
+    for t in trend_watch[:8]:
+        _add_symbol(str((t or {}).get("symbol") or ""), "trend_watch", str((t or {}).get("side") or ""))
+    for s in list(pool.get("setups") or [])[:6]:
+        _add_symbol(str(getattr(s, "symbol", "") or ""), "top_setups", str(getattr(s, "side", "") or ""))
+
+    # Deduplicate by (symbol,bucket) while keeping first occurrence
+    dedup = []
+    seen = set()
+    for row in tracked[: max(8, int(SCAN_INTELLIGENCE_MAX_SYMBOLS))]:
+        k = (row[3], row[4])
+        if k in seen:
+            continue
+        seen.add(k)
+        dedup.append(row)
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO market_scan_snapshots(snap_id, created_ts, session, mode, leaders_json, losers_json, market_leaders_json, waiting_json, trend_watch_json, top_setups_json, market_pulse_json, reject_summary_json, outcome_summary_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (snap_id, created_ts, str(session_name or "").upper(), str(mode or "screen"), _json_dumps_safe(leaders), _json_dumps_safe(losers), _json_dumps_safe(market_leaders), _json_dumps_safe(waiting), _json_dumps_safe(trend_watch), _json_dumps_safe(top_setups), _json_dumps_safe(pulse), _json_dumps_safe(reject_summary), _json_dumps_safe({}))
+            )
+            if dedup:
+                c.executemany(
+                    "INSERT OR REPLACE INTO market_scan_symbols(snap_id, created_ts, session, symbol, bucket, side, entry, ch24, volume_usd, reject_reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    dedup,
+                )
+            conn.commit()
+    except Exception:
+        pass
+    return snap_id
+
+def _scan_intel_eval_one(symbol: str, side: str, entry: float, created_ts: float) -> tuple[float, float, str, str]:
+    try:
+        market_symbol = _bybit_linear_symbol(symbol)
+        candles = fetch_ohlcv(market_symbol, "15m", limit=240)
+        if not candles:
+            return (0.0, 0.0, "insufficient_data", "no_15m_data")
+        start_ms = int(float(created_ts) * 1000.0)
+        rows = [c for c in candles if int(c[0]) >= start_ms]
+        if len(rows) < 3:
+            rows = candles[-min(len(candles), 32):]
+        highs = [float(x[2]) for x in rows]
+        lows = [float(x[3]) for x in rows]
+        if not highs or not lows or float(entry or 0.0) <= 0:
+            return (0.0, 0.0, "insufficient_data", "bad_eval_window")
+        side_u = str(side or "").upper().strip()
+        if side_u == "SELL":
+            mfe = max(0.0, ((float(entry) - min(lows)) / float(entry)) * 100.0)
+            mae = max(0.0, ((max(highs) - float(entry)) / float(entry)) * 100.0)
+        else:
+            mfe = max(0.0, ((max(highs) - float(entry)) / float(entry)) * 100.0)
+            mae = max(0.0, ((float(entry) - min(lows)) / float(entry)) * 100.0)
+        return (float(mfe), float(mae), "ok", "")
+    except Exception as e:
+        return (0.0, 0.0, "eval_error", f"{type(e).__name__}: {e}")
+
+def _scan_intel_classify(bucket: str, mfe_pct: float, mae_pct: float, reject_reason: str) -> str:
+    rr = str(reject_reason or "").strip().lower()
+    if str(bucket or "") == "top_setups":
+        return "setup_worked" if float(mfe_pct) >= float(SCAN_INTELLIGENCE_MIN_MFE_PCT) else "setup_failed"
+    if float(mfe_pct) >= float(SCAN_INTELLIGENCE_MIN_MFE_PCT) and float(mae_pct) <= float(SCAN_INTELLIGENCE_MAX_MAE_PCT):
+        if rr in {"ch1_below_trigger", "no_breakout_trigger", "below_min_confidence", "no_engine_passed", "smc_structure_mismatch"}:
+            return "missed_due_to_over_filtering"
+        return "missed_but_good"
+    if float(mfe_pct) >= float(SCAN_INTELLIGENCE_MIN_MFE_PCT) * 0.70:
+        return "watch_state_never_converted"
+    return "correctly_skipped"
+
+def _scan_intel_summarize_recent(days: int = 14) -> dict:
+    _scan_intel_migrate_tables()
+    since_ts = float(time.time()) - (float(days) * 86400.0)
+    out_ctr = Counter()
+    reason_ctr = Counter()
+    session_ctr = Counter()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                "SELECT session, bucket, outcome, reject_reason FROM market_scan_symbols WHERE evaluated=1 AND created_ts>=?",
+                (since_ts,),
+            ).fetchall() or []
+        for r in rows:
+            outcome = str(r["outcome"] or "")
+            rr = str(r["reject_reason"] or "")
+            sess = str(r["session"] or "")
+            if outcome:
+                out_ctr[outcome] += 1
+            if outcome.startswith("missed") and rr:
+                reason_ctr[rr] += 1
+            if outcome.startswith("missed") and sess:
+                session_ctr[sess] += 1
+    except Exception:
+        pass
+    return {
+        "counts": dict(out_ctr),
+        "top_missed_reasons": reason_ctr.most_common(6),
+        "top_missed_sessions": session_ctr.most_common(3),
+    }
+
+def _scan_intel_safe_adjust(summary: dict) -> list[dict]:
+    actions = []
+    if not summary:
+        return actions
+    missed_total = int(summary.get("counts", {}).get("missed_but_good", 0) or 0) + int(summary.get("counts", {}).get("missed_due_to_over_filtering", 0) or 0)
+    if missed_total < int(SCAN_INTELLIGENCE_MIN_MISSED_GOOD):
+        return actions
+
+    cfg = load_strategy_config(force=True)
+    bounds = cfg.get("opt_bounds") or {}
+    now = float(time.time())
+    last_ts = float((_evolution_state_get("scan_intel_last_adjustment", {}) or {}).get("ts", 0.0) or 0.0)
+    if (now - last_ts) < float(SCAN_INTELLIGENCE_AUTO_APPLY_COOLDOWN_HOURS) * 3600.0:
+        return actions
+
+    top_reason = str((summary.get("top_missed_reasons") or [["", 0]])[0][0] or "")
+    if top_reason in {"ch1_below_trigger", "no_breakout_trigger", "below_min_confidence"}:
+        lo, hi = (bounds.get("quality_score_min_screen") or [52.0, 70.0])
+        old = float(cfg.get("quality_score_min_screen", QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
+        new = _clamp(old - 1.0, float(lo), float(hi))
+        if new < old:
+            cfg["quality_score_min_screen"] = float(new)
+            actions.append({"param": "quality_score_min_screen", "from": old, "to": new, "reason": top_reason})
+
+    if actions:
+        save_strategy_config(cfg)
+        apply_strategy_config(cfg)
+        _evolution_state_set("scan_intel_last_adjustment", {"ts": now, "actions": actions, "summary": summary})
+        try:
+            _evolution_insert_recommendation(
+                "scan_intelligence",
+                "Auto-adjustment: slightly loosened screen quality after repeated snapshot-based evidence of missed but tradeable movers.",
+                {"summary": summary, "actions": actions},
+                0.66,
+                auto_applied=True,
+                action=actions[0],
+                status="APPLIED",
+            )
+        except Exception:
+            pass
+    return actions
+
+def _scan_intel_evaluate_pending() -> dict:
+    _scan_intel_migrate_tables()
+    cutoff_ts = float(time.time()) - (float(SCAN_INTELLIGENCE_HORIZON_HOURS) * 3600.0)
+    evaluated = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                "SELECT id, snap_id, session, symbol, bucket, side, entry, created_ts, reject_reason FROM market_scan_symbols WHERE evaluated=0 AND created_ts<=? ORDER BY created_ts ASC LIMIT 120",
+                (cutoff_ts,),
+            ).fetchall() or []
+        for r in rows:
+            mfe, mae, status, note = _scan_intel_eval_one(str(r["symbol"] or ""), str(r["side"] or "BUY"), float(r["entry"] or 0.0), float(r["created_ts"] or 0.0))
+            outcome = _scan_intel_classify(str(r["bucket"] or ""), mfe, mae, str(r["reject_reason"] or "")) if status == "ok" else status
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    c = conn.cursor()
+                    c.execute(
+                        "UPDATE market_scan_symbols SET evaluated=1, evaluated_ts=?, mfe_pct=?, mae_pct=?, outcome=?, note=? WHERE id=?",
+                        (float(time.time()), float(mfe), float(mae), str(outcome), str(note or ""), int(r["id"])),
+                    )
+                    conn.commit()
+                evaluated += 1
+            except Exception:
+                pass
+        # refresh snapshot-level summaries
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                snap_ids = [str(r["snap_id"]) for r in rows]
+                for snap_id in sorted(set(snap_ids)):
+                    sr = c.execute("SELECT outcome, COUNT(1) AS n FROM market_scan_symbols WHERE snap_id=? AND evaluated=1 GROUP BY outcome", (snap_id,)).fetchall() or []
+                    outcome_summary = {str(x[0] or ""): int(x[1] or 0) for x in sr}
+                    c.execute("UPDATE market_scan_snapshots SET outcome_summary_json=? WHERE snap_id=?", (_json_dumps_safe(outcome_summary), snap_id))
+                conn.commit()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    summary = _scan_intel_summarize_recent(days=14)
+    actions = _scan_intel_safe_adjust(summary)
+    _evolution_state_set("scan_intel_summary", {"ts": time.time(), "summary": summary, "actions": actions, "evaluated": evaluated})
+    return {"evaluated": evaluated, "summary": summary, "actions": actions}
+
+def _scan_intel_summary_cached() -> dict:
+    snap = _evolution_state_get("scan_intel_summary", {}) or {}
+    if snap:
+        return snap
+    summary = _scan_intel_summarize_recent(days=14)
+    snap = {"ts": time.time(), "summary": summary, "actions": [], "evaluated": 0}
+    _evolution_state_set("scan_intel_summary", snap)
+    return snap
+
+async def scan_intelligence_job(context: ContextTypes.DEFAULT_TYPE):
+    if not SCAN_INTELLIGENCE_ENABLED:
+        return
+    try:
+        best_fut = await to_thread_heavy(fetch_futures_tickers)
+        if not best_fut:
+            return
+        session = scan_session_name_utc(datetime.now(timezone.utc))
+        pool = await build_priority_pool(best_fut, session, mode="screen", scan_profile=DEFAULT_SCAN_PROFILE, uid=None)
+        try:
+            rej_ctx = _REJECT_CTX.get() if isinstance(_REJECT_CTX.get(), dict) else None
+        except Exception:
+            rej_ctx = None
+        await to_thread_fast(_scan_intel_capture_snapshot, best_fut, session, pool, rej_ctx, "screen")
+        await to_thread_fast(_scan_intel_evaluate_pending)
+    except Exception:
+        pass
+
+def _utc_day_str(ts: float | None = None) -> str:
+    try:
+        dt = datetime.fromtimestamp(float(ts or time.time()), tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _json_dumps_safe(obj) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        try:
+            return json.dumps(str(obj), ensure_ascii=False)
+        except Exception:
+            return ""
+
+def _db_insert_universe_snapshot(day_utc: str, top_n: int, min_vol_usd: float, symbols: list[dict], meta: dict) -> str:
+    _opt_migrate_tables()
+    snap_id = f"UNIV-{day_utc}-{int(time.time())}"
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO universe_snapshots(snap_id, day_utc, created_ts, top_n, min_vol_usd, symbols_json, meta_json) VALUES(?,?,?,?,?,?,?)",
+                (snap_id, str(day_utc), float(time.time()), int(top_n), float(min_vol_usd), _json_dumps_safe(symbols), _json_dumps_safe(meta)),
+            )
+            conn.commit()
+    except Exception:
+        pass
+    return snap_id
+
+def _db_get_universe_snapshot(day_utc: str) -> Optional[dict]:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute(
+                "SELECT snap_id, created_ts, top_n, min_vol_usd, symbols_json, meta_json FROM universe_snapshots WHERE day_utc=? ORDER BY created_ts DESC LIMIT 1",
+                (str(day_utc),),
+            ).fetchone()
+            if not row:
+                return None
+            snap_id, created_ts, top_n, min_vol_usd, symbols_json, meta_json = row
+            return {
+                "snap_id": snap_id,
+                "day_utc": str(day_utc),
+                "created_ts": float(created_ts or 0.0),
+                "top_n": int(top_n or 0),
+                "min_vol_usd": float(min_vol_usd or 0.0),
+                "symbols": json.loads(symbols_json) if symbols_json else [],
+                "meta": json.loads(meta_json) if meta_json else {},
+            }
+    except Exception:
+        return None
+
+def _build_universe_snapshot_top_volume(top_n: int = 100, min_vol_usd: float = 10_000_000.0) -> dict:
+    """Build TOP-N USDT linear perpetual universe by 24-hour quote volume, store snapshot for reproducibility."""
+    _opt_migrate_tables()
+    day_utc = _utc_day_str()
+
+    ex = get_exchange()
+    markets = getattr(ex, "markets", {}) or {}
+
+    try:
+        best = fetch_futures_tickers()  # base -> MarketVol
+    except Exception:
+        best = {}
+
+    rows = []
+    for base, mv in (best or {}).items():
+        try:
+            sym = str(getattr(mv, "symbol", "") or "")
+            if not sym:
+                continue
+            m = markets.get(sym) or {}
+            if not bool(m.get("swap")):
+                continue
+            if str(m.get("quote", "")).upper() != "USDT":
+                continue
+            qv = float(getattr(mv, "quote_vol", 0.0) or 0.0)
+            if qv < float(min_vol_usd):
+                continue
+            last = float(getattr(mv, "last", 0.0) or 0.0)
+            if last <= 0:
+                continue
+            rows.append({"symbol": sym, "base": str(getattr(mv, "base", base) or base), "quote_vol_usd": float(qv), "last": float(last)})
+        except Exception:
+            continue
+
+    rows.sort(key=lambda r: float(r.get("quote_vol_usd", 0.0) or 0.0), reverse=True)
+    rows = rows[: max(1, int(top_n))]
+
+    meta = {"source": "ccxt.fetch_tickers (filtered swap USDT)", "count": int(len(rows)), "min_vol_usd": float(min_vol_usd)}
+    snap_id = _db_insert_universe_snapshot(day_utc=day_utc, top_n=int(top_n), min_vol_usd=float(min_vol_usd), symbols=rows, meta=meta)
+
+    return {"day_utc": day_utc, "snap_id": snap_id, "symbols": rows, "market_symbols": [str(r["symbol"]) for r in rows], "meta": meta}
+
+def _db_create_opt_run(run_id: str, days: int, session_mode: str, tf_candidates: list[str], universe_snap_id: str, universe_size: int) -> None:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO optimization_runs(run_id, started_ts, status, days, session_mode, tf_candidates_json, universe_snap_id, universe_size, progress_json, notes) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (str(run_id), float(time.time()), "RUNNING", int(days), str(session_mode), _json_dumps_safe(tf_candidates), str(universe_snap_id), int(universe_size), _json_dumps_safe({}), ""),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def _db_update_opt_run(run_id: str, status: Optional[str] = None, progress: Optional[dict] = None, notes: Optional[str] = None, finished: bool = False) -> None:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            fields = []
+            vals = []
+            if status is not None:
+                fields.append("status=?"); vals.append(str(status))
+            if progress is not None:
+                fields.append("progress_json=?"); vals.append(_json_dumps_safe(progress))
+            if notes is not None:
+                fields.append("notes=?"); vals.append(str(notes))
+            if finished:
+                fields.append("finished_ts=?"); vals.append(float(time.time()))
+            if not fields:
+                return
+            vals.append(str(run_id))
+            c.execute(f"UPDATE optimization_runs SET {', '.join(fields)} WHERE run_id=?", vals)
+            conn.commit()
+    except Exception:
+        pass
+
+def _db_save_opt_result(run_id: str, promoted: bool, chosen_exec_tf: str, best_score: float, best_params: dict, metrics: dict, reject_stats: dict) -> None:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO optimization_results(run_id, promoted, chosen_exec_tf, best_score, best_params_json, metrics_json, reject_stats_json, created_ts) VALUES(?,?,?,?,?,?,?,?)",
+                (str(run_id), 1 if promoted else 0, str(chosen_exec_tf or ""), float(best_score), _json_dumps_safe(best_params), _json_dumps_safe(metrics), _json_dumps_safe(reject_stats), float(time.time())),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def _db_get_last_opt_run() -> Optional[dict]:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute(
+                "SELECT run_id, started_ts, finished_ts, status, days, session_mode, tf_candidates_json, universe_snap_id, universe_size, progress_json, notes FROM optimization_runs ORDER BY started_ts DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            run_id, started_ts, finished_ts, status, days, session_mode, tf_json, universe_snap_id, universe_size, progress_json, notes = row
+            return {
+                "run_id": str(run_id),
+                "started_ts": float(started_ts or 0.0),
+                "finished_ts": float(finished_ts or 0.0) if finished_ts is not None else None,
+                "status": str(status),
+                "days": int(days or 0),
+                "session_mode": str(session_mode),
+                "tf_candidates": json.loads(tf_json) if tf_json else [],
+                "universe_snap_id": str(universe_snap_id or ""),
+                "universe_size": int(universe_size or 0),
+                "progress": json.loads(progress_json) if progress_json else {},
+                "notes": str(notes or ""),
+            }
+    except Exception:
+        return None
+
+def _db_get_opt_result(run_id: str) -> Optional[dict]:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute(
+                "SELECT promoted, chosen_exec_tf, best_score, best_params_json, metrics_json, reject_stats_json, created_ts FROM optimization_results WHERE run_id=?",
+                (str(run_id),),
+            ).fetchone()
+            if not row:
+                return None
+            promoted, chosen_exec_tf, best_score, best_params_json, metrics_json, reject_stats_json, created_ts = row
+            return {
+                "run_id": str(run_id),
+                "promoted": bool(int(promoted or 0)),
+                "chosen_exec_tf": str(chosen_exec_tf or ""),
+                "best_score": float(best_score or 0.0),
+                "best_params": json.loads(best_params_json) if best_params_json else {},
+                "metrics": json.loads(metrics_json) if metrics_json else {},
+                "reject_stats": json.loads(reject_stats_json) if reject_stats_json else {},
+                "created_ts": float(created_ts or 0.0),
+            }
+    except Exception:
+        return None
+
+def _db_log_promotion(run_id: str, from_cfg: dict, to_cfg: dict, decision: str, reasons: list[str]) -> None:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO promotion_log(ts, run_id, from_cfg_json, to_cfg_json, decision, reasons_json) VALUES(?,?,?,?,?,?)",
+                (float(time.time()), str(run_id), _json_dumps_safe(from_cfg), _json_dumps_safe(to_cfg), str(decision), _json_dumps_safe(reasons or [])),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def _governor_adjust_quality_floor(session_name: str = "NY") -> Optional[dict]:
+    """Setup governor to keep *email* setup frequency ~3–5/day without spamming."""
+    cfg = load_strategy_config(force=True)
+    if not bool(cfg.get("governor_enabled", True)):
+        return None
+
+    try:
+        window_h = float(cfg.get("governor_window_hours", 24) or 24)
+        target_lo = float(cfg.get("governor_target_lo", cfg.get("target_setups_per_day_lo", 3.0)) or 3.0)
+        target_hi = float(cfg.get("governor_target_hi", cfg.get("target_setups_per_day_hi", 5.0)) or 5.0)
+        step = float(cfg.get("governor_step_score", 1.0) or 1.0)
+        smin = float(cfg.get("governor_score_min", 52.0) or 52.0)
+        smax = float(cfg.get("governor_score_max", 82.0) or 82.0)
+        last_adj = float(cfg.get("governor_last_adjust_ts", 0.0) or 0.0)
+    except Exception:
+        return None
+
+    # Avoid oscillation
+    if time.time() - last_adj < 3600.0:
+        return None
+
+    since_ts = time.time() - window_h * 3600.0
+    sess = str(session_name or "").upper().strip() or "NY"
+
+    n = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            try:
+                n = int(c.execute(
+                    "SELECT COUNT(1) AS n FROM generated_setups WHERE source='email' AND created_ts>=? AND (session='' OR session IS NULL OR session=?)",
+                    (float(since_ts), sess),
+                ).fetchone()["n"])
+            except Exception:
+                n = int(c.execute(
+                    "SELECT COUNT(1) AS n FROM generated_setups WHERE source='email' AND created_ts>=?",
+                    (float(since_ts),),
+                ).fetchone()["n"])
+    except Exception:
+        n = 0
+
+    setups_per_day = float(n) / max(1e-9, (window_h / 24.0))
+
+    cur_q = float(cfg.get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
+    new_q = cur_q
+    action = "hold"
+
+    if setups_per_day > target_hi:
+        new_q = min(smax, cur_q + step); action = "tighten"
+    elif setups_per_day < target_lo:
+        new_q = max(smin, cur_q - step); action = "loosen"
+
+    if abs(new_q - cur_q) < 1e-9:
+        return None
+
+    cfg["quality_score_min_email"] = float(new_q)
+    cfg["governor_last_adjust_ts"] = float(time.time())
+    save_strategy_config(cfg)
+    apply_strategy_config(cfg)
+
+    return {"session": sess, "window_h": window_h, "setups_per_day": setups_per_day, "action": action, "from": cur_q, "to": new_q, "target_lo": target_lo, "target_hi": target_hi}
+
+def _self_opt_stability_gates(metrics: dict, cfg: dict) -> tuple[bool, list[str]]:
+    """Promotion gates (OOS). Returns (ok, reasons_if_not_ok)."""
+    reasons = []
+    try:
+        oos = metrics.get("oos") or {}
+        total_setups = int(oos.get("setups", 0) or 0)
+        setups_day = float(oos.get("setups_per_day", 0.0) or 0.0)
+        wr = float(oos.get("win_rate", 0.0) or 0.0)
+        avg_r = float(oos.get("avg_R", 0.0) or 0.0)
+        pf = float(oos.get("profit_factor", 0.0) or 0.0)
+        dd = float(oos.get("max_drawdown_R", 0.0) or 0.0)
+        conc = float(oos.get("top_symbol_share", 0.0) or 0.0)
+    except Exception:
+        return (False, ["metrics_parse_error"])
+
+    min_setups = int(cfg.get("oos_min_setups", 30) or 30)
+    if total_setups < min_setups:
+        reasons.append(f"oos_sample_too_small ({total_setups} < {min_setups})")
+
+    lo = float(cfg.get("target_setups_per_day_lo", 3.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 5.0))
+    if setups_day < lo:
+        reasons.append(f"frequency_too_low ({setups_day:.2f} < {lo:.2f})")
+    if setups_day > hi * 1.25:
+        reasons.append(f"frequency_too_high ({setups_day:.2f} > {hi*1.25:.2f})")
+
+    if pf < 1.15:
+        reasons.append(f"pf_too_low ({pf:.2f} < 1.15)")
+    if avg_r < 0.10:
+        reasons.append(f"avg_R_too_low ({avg_r:.3f} < 0.10)")
+
+    dd_cap = float(cfg.get("max_drawdown_R_cap", 8.0) or 8.0)
+    if dd > dd_cap:
+        reasons.append(f"drawdown_too_high ({dd:.2f}R > {dd_cap:.2f}R)")
+
+    conc_cap = float(cfg.get("concentration_cap", 0.25) or 0.25)
+    if conc > conc_cap:
+        reasons.append(f"overconcentrated (top_symbol_share={conc:.2%} > {conc_cap:.2%})")
+
+    min_wr = float(cfg.get("min_win_rate", 70.0) or 70.0)
+    min_wr_samples = int(cfg.get("min_win_rate_samples", 50) or 50)
+    if total_setups >= min_wr_samples and wr < min_wr:
+        reasons.append(f"win_rate_below_target ({wr:.1f}% < {min_wr:.1f}%)")
+
+    return (len(reasons) == 0), reasons
+
+def _self_opt_format_report(res: dict) -> str:
+    run_id = res.get("run_id") or "?"
+    promoted = bool(res.get("promoted"))
+    chosen_tf = res.get("chosen_exec_tf") or "?"
+    score = float(res.get("best_score", 0.0) or 0.0)
+    p = res.get("best_params") or {}
+    m = res.get("metrics") or {}
+    oos = m.get("oos") or {}
+    sess = m.get("by_session") or {}
+
+    def _sess_line(name: str):
+        d = sess.get(name) or {}
+        return f"{name}: setups={int(d.get('setups',0) or 0)} | WR={float(d.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(d.get('avg_R',0.0) or 0.0):.3f}"
+
+    lines = [
+        "🧠 Self-Optimize Report (last)",
+        HDR,
+        f"Run: {run_id}",
+        f"Decision: {'✅ PROMOTED' if promoted else '❌ NOT PROMOTED'}",
+        f"Chosen exec TF: {chosen_tf} | Objective: {score:.3f}",
+        SEP,
+        f"OOS setups/day: {float(oos.get('setups_per_day',0.0) or 0.0):.2f} (target {float(p.get('target_setups_per_day_lo',3.0) or 3.0):.0f}–{float(p.get('target_setups_per_day_hi',5.0) or 5.0):.0f})",
+        f"OOS setups: {int(oos.get('setups',0) or 0)} | Win rate: {float(oos.get('win_rate',0.0) or 0.0):.1f}%",
+        f"OOS Avg R: {float(oos.get('avg_R',0.0) or 0.0):.3f} | PF: {float(oos.get('profit_factor',0.0) or 0.0):.2f} | MaxDD(R): {float(oos.get('max_drawdown_R',0.0) or 0.0):.2f}",
+        f"Concentration: top_symbol_share={float(oos.get('top_symbol_share',0.0) or 0.0):.1%}",
+        SEP,
+        "Session breakdown (OOS):",
+        f"• {_sess_line('NY')}",
+        f"• {_sess_line('LON')}",
+        f"• {_sess_line('ASIA')}",
+        SEP,
+        "Best params (subset):",
+        f"quality_score_min_screen={p.get('quality_score_min_screen')} | quality_score_min_email={p.get('quality_score_min_email')}",
+        f"min_rr_tp3={p.get('min_rr_tp3')} | atr_min_pct={p.get('atr_min_pct')}",
+        f"tf_align_1h_min_abs={p.get('tf_align_1h_min_abs')} | tf_align_4h_min_abs={p.get('tf_align_4h_min_abs')}",
+    ]
+
+    try:
+        rejects = res.get("reject_stats") or {}
+        if isinstance(rejects, dict) and rejects:
+            lines.append(SEP)
+            lines.append("Top reject reasons (OOS generator):")
+            items = sorted(rejects.items(), key=lambda kv: int(kv[1]), reverse=True)[:10]
+            for k, v in items:
+                lines.append(f"• {k}: {int(v)}")
+    except Exception:
+        pass
+
+    try:
+        reasons = (m.get("promotion_reasons") or [])
+        if isinstance(reasons, list) and reasons:
+            lines.append(SEP)
+            lines.append("Promotion gate notes:")
+            for r in reasons[:12]:
+                lines.append(f"• {str(r)}")
+    except Exception:
+        pass
+
+    try:
+        win_blocks = m.get("autotune_windows") or []
+        if isinstance(win_blocks, list) and win_blocks:
+            lines.append(SEP)
+            lines.append("Autotune windows:")
+            for w in win_blocks[:8]:
+                ws = (w or {}).get("summary") or {}
+                lines.append(
+                    f"• {w.get('label')}: setups/day={float(ws.get('setups_per_day',0.0) or 0.0):.2f} | WR={float(ws.get('win_rate',0.0) or 0.0):.1f}% | avgR={float(ws.get('avg_R',0.0) or 0.0):.3f}"
+                )
+    except Exception:
+        pass
+
+    try:
+        lg = m.get("learning_guard") or {}
+        if isinstance(lg, dict) and lg:
+            lines.append(SEP)
+            lines.append(
+                f"Learning guard: estWR={float(lg.get('estimated_wr',0.0) or 0.0):.1f}% | conf={str(lg.get('confidence') or 'low')} | live_sample={int(lg.get('live_sample',0) or 0)} | recent_closed={int(lg.get('recent_closed',0) or 0)}"
+            )
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+def _compute_oos_summary(oos_rows: list[dict], days: float, conc_cap: float) -> dict:
+    ok_rows = [r for r in (oos_rows or []) if r and r.get("ok")]
+    total_setups = sum(int(r.get("setups",0) or 0) for r in ok_rows)
+    total_days = max(1.0, float(days))
+    setups_day = float(total_setups) / total_days
+
+    if total_setups <= 0:
+        return {"setups": 0, "setups_per_day": float(setups_day), "win_rate": 0.0, "avg_R": 0.0, "profit_factor": 0.0, "max_drawdown_R": 0.0, "top_symbol_share": 0.0}
+
+    w_sum = float(total_setups)
+    avg_r = sum(float(r.get("avg_R",0.0) or 0.0) * float(r.get("setups",0) or 0) for r in ok_rows) / w_sum
+    wr = sum(float(r.get("win_rate",0.0) or 0.0) * float(r.get("setups",0) or 0) for r in ok_rows) / w_sum
+    pf = sum((10.0 if r.get("profit_factor")==float("inf") else float(r.get("profit_factor") or 0.0)) * float(r.get("setups",0) or 0) for r in ok_rows) / w_sum
+    dd = sum(float(r.get("max_drawdown_R",0.0) or 0.0) * float(r.get("setups",0) or 0) for r in ok_rows) / w_sum
+
+    sym_counts = sorted([int(r.get("setups",0) or 0) for r in ok_rows], reverse=True)
+    top_share = (float(sym_counts[0]) / float(total_setups)) if sym_counts and total_setups > 0 else 0.0
+
+    return {"setups": int(total_setups), "setups_per_day": float(setups_day), "win_rate": float(wr), "avg_R": float(avg_r), "profit_factor": float(pf), "max_drawdown_R": float(dd), "top_symbol_share": float(top_share), "concentration_cap": float(conc_cap)}
+
+def _aggregate_by_session(oos_rows: list[dict]) -> dict:
+    out = {"NY": {"n": 0, "wr": 0.0, "r": 0.0}, "LON": {"n": 0, "wr": 0.0, "r": 0.0}, "ASIA": {"n": 0, "wr": 0.0, "r": 0.0}}
+    for r in (oos_rows or []):
+        if not r or not r.get("ok"):
+            continue
+        bs = r.get("by_session") or {}
+        if not isinstance(bs, dict):
+            continue
+        for sname in ("NY","LON","ASIA"):
+            d = bs.get(sname) or {}
+            try:
+                n = float(d.get("setups",0) or 0.0)
+                if n <= 0:
+                    continue
+                out[sname]["n"] += n
+                out[sname]["wr"] += float(d.get("win_rate",0.0) or 0.0) * n
+                out[sname]["r"] += float(d.get("avg_R",0.0) or 0.0) * n
+            except Exception:
+                continue
+    pretty = {}
+    for sname, d in out.items():
+        n = float(d["n"] or 0.0)
+        pretty[sname] = {"setups": int(n), "win_rate": float((d["wr"]/n) if n else 0.0), "avg_R": float((d["r"]/n) if n else 0.0)}
+    return pretty
+
+def _normalize_autotune_windows(cfg: dict) -> list[dict]:
+    """Safe normalized historical windows for zero-touch optimizer."""
+    raw = (cfg or {}).get("autotune_windows") or []
+    out = []
+    try:
+        for w in raw:
+            if not isinstance(w, dict):
+                continue
+            days = max(3, int(w.get("days", 7) or 7))
+            end_days_ago = max(0, int(w.get("end_days_ago", 0) or 0))
+            out.append({"days": days, "end_days_ago": end_days_ago, "label": f"{days}d_{end_days_ago}ago"})
+    except Exception:
+        out = []
+    if not out:
+        out = [
+            {"days": 7, "end_days_ago": 0, "label": "7d_0ago"},
+            {"days": 14, "end_days_ago": 0, "label": "14d_0ago"},
+            {"days": 21, "end_days_ago": 0, "label": "21d_0ago"},
+            {"days": 30, "end_days_ago": 0, "label": "30d_0ago"},
+        ]
+    return out
+
+
+def _slice_ohlcv_for_window(ohlcv: list, days: int, end_days_ago: int, tf: str, warmup_bars: int = 300) -> list:
+    if not ohlcv:
+        return []
+    try:
+        _since_ms, _until_ms, eval_since_ms, eval_until_ms = _backtest_window_bounds(days, end_days_ago=end_days_ago, warmup_bars=warmup_bars, tf=tf)
+        kept = []
+        for row in (ohlcv or []):
+            try:
+                ts = int(row[0])
+                if ts <= int(eval_until_ms):
+                    kept.append(row)
+            except Exception:
+                continue
+        if not kept:
+            return []
+        start_idx = 0
+        for i, row in enumerate(kept):
+            try:
+                if int(row[0]) >= int(eval_since_ms):
+                    start_idx = max(0, i - int(warmup_bars))
+                    break
+            except Exception:
+                continue
+        return kept[start_idx:]
+    except Exception:
+        return list(ohlcv or [])
+
+
+def _run_backtest_on_ohlcv_window(symbol: str, ohlcv: list, days: int, tf: str, session_name: str, end_days_ago: int = 0) -> dict:
+    sliced = _slice_ohlcv_for_window(ohlcv, days=days, end_days_ago=end_days_ago, tf=tf, warmup_bars=300)
+    rep = _run_backtest_on_ohlcv(symbol, sliced, days=days, tf=tf, session_name=session_name)
+    try:
+        rep["end_days_ago"] = int(end_days_ago)
+        rep["window_label"] = f"{int(days)}d_{int(end_days_ago)}ago"
+    except Exception:
+        pass
+    return rep
+
+
+def _window_bundle_summary(bundle_rows: dict, cfg: dict) -> dict:
+    windows = []
+    flat_rows = []
+    positive = 0
+    pass_wr = 0
+    scores = []
+    total_days = 0.0
+    min_wr_floor = float((cfg or {}).get("autotune_min_window_wr", 52.0) or 52.0)
+    for label, info in (bundle_rows or {}).items():
+        rows = list((info or {}).get("rows") or [])
+        days = int((info or {}).get("days", 0) or 0)
+        total_days += float(max(1, days))
+        summ = _compute_oos_summary(rows, days=float(max(1, days)), conc_cap=float((cfg or {}).get("concentration_cap", 0.25) or 0.25))
+        obj = _objective(rows, days=max(1, days), cfg=cfg) if rows else -1e12
+        windows.append({
+            "label": str(label),
+            "days": days,
+            "end_days_ago": int((info or {}).get("end_days_ago", 0) or 0),
+            "summary": summ,
+            "score": float(obj),
+        })
+        scores.append(float(obj))
+        flat_rows.extend(rows)
+        if float(summ.get("avg_R", 0.0) or 0.0) > 0:
+            positive += 1
+        if float(summ.get("win_rate", 0.0) or 0.0) >= min_wr_floor:
+            pass_wr += 1
+    agg = (_compute_oos_summary(
+        flat_rows,
+        days=float(max(1.0, total_days)),
+        conc_cap=float((cfg or {}).get("concentration_cap", 0.25) or 0.25),
+    ) if flat_rows else {})
+    std_pen = 0.0
+    if len(scores) >= 2:
+        try:
+            std_pen = float(statistics.pstdev(scores))
+        except Exception:
+            std_pen = 0.0
+    return {
+        "windows": windows,
+        "aggregate": agg,
+        "positive_windows": int(positive),
+        "passing_wr_windows": int(pass_wr),
+        "window_scores": [float(x) for x in scores],
+        "score_std": float(std_pen),
+    }
+
+
+def _autotune_learning_guard(session_mode: str = "ALL") -> dict:
+    try:
+        sess = None if str(session_mode).upper() == "ALL" else str(session_mode).upper()
+        live = _evolution_estimated_win_rate(session=sess)
+        recent = _autonomous_opt_performance_snapshot(window_hours=float(AUTONOMOUS_OPT_LOOKBACK_HOURS))
+        return {
+            "estimated_wr": float(live.get("estimated_wr", 0.0) or 0.0),
+            "confidence": str(live.get("confidence") or "low"),
+            "live_sample": int(live.get("live_sample", 0) or 0),
+            "recent_closed": int(recent.get("closed", 0) or 0),
+            "recent_win_rate": float(recent.get("win_rate", 0.0) or 0.0),
+        }
+    except Exception:
+        return {"estimated_wr": 0.0, "confidence": "low", "live_sample": 0, "recent_closed": 0, "recent_win_rate": 0.0}
+
+
+def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Event, progress_cb=None) -> dict:
+    """Runs full self-optimization pipeline in a worker thread.
+
+    Zero-touch design:
+    1) Search a bounded candidate grid on a primary window.
+    2) Re-test shortlisted candidates across multiple historical windows (7/14/21/30d by default).
+    3) Merge live-learning evidence as a promotion guard so weak real-world performance
+       can tighten promotion even if backtests look good.
+    """
+    _opt_migrate_tables()
+    base_cfg = load_strategy_config(force=True)
+    robust_windows = _normalize_autotune_windows(base_cfg)
+    primary_days = max(3, int(days or 7))
+
+    tf_candidates = list(base_cfg.get("exec_tf_candidates") or ["5m", "15m"])[:3]
+    if not tf_candidates:
+        tf_candidates = ["5m", "15m"]
+
+    univ = _build_universe_snapshot_top_volume(top_n=100, min_vol_usd=10_000_000.0)
+    universe_snap_id = str(univ.get("snap_id") or "")
+    universe = list(univ.get("market_symbols") or [])[:100]
+    universe_size = len(universe)
+
+    run_id = f"OPT-{_utc_day_str()}-{int(time.time())}"
+    _db_create_opt_run(run_id, days=int(primary_days), session_mode=str(session_mode), tf_candidates=tf_candidates, universe_snap_id=universe_snap_id, universe_size=universe_size)
+
+    cands = _generate_candidates(base_cfg)
+    days_test = max(7, int(primary_days * 0.3))
+    conc_cap = float(base_cfg.get("concentration_cap", 0.25) or 0.25)
+    robust_max_days = max([int(w.get("days", 0) or 0) for w in robust_windows] + [primary_days])
+    shortlist_n = max(4, int(base_cfg.get("autotune_shortlist", 10) or 10))
+
+    candidate_pool = []
+    ohlcv_cache_by_tf = {}
+
+    for exec_tf in tf_candidates:
+        if stop_event.is_set():
+            _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
+            return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
+
+        if progress_cb:
+            progress_cb(f"Fetching OHLCV for TF={exec_tf} (universe={len(universe)})…", {"stage": "fetch_ohlcv", "tf": exec_tf})
+
+        ohlcv_map = {}
+        tf_min = _tf_to_minutes(exec_tf)
+        bars = int((robust_max_days * 1440) / max(1, tf_min)) + 400
+        bars = int(min(12000, max(1200, bars)))
+        for si, sym in enumerate(universe):
+            if stop_event.is_set():
+                _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
+                return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
+            try:
+                ohlcv_map[sym] = fetch_ohlcv(sym, exec_tf, limit=bars)
+            except Exception:
+                ohlcv_map[sym] = []
+            if si % 15 == 0:
+                _db_update_opt_run(run_id, progress={"stage": "fetch_ohlcv", "tf": exec_tf, "symbol_idx": si, "universe": len(universe)})
+        ohlcv_cache_by_tf[exec_tf] = ohlcv_map
+
+        for ci, cand in enumerate(cands):
+            if stop_event.is_set():
+                _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
+                return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
+
+            cfg = dict(base_cfg)
+            cfg.update(cand)
+            cfg["exec_tf_default"] = str(exec_tf)
+            apply_strategy_config(cfg)
+
+            oos_rows = []
+            reject_acc = Counter()
+            for sym in universe:
+                ohl = ohlcv_map.get(sym) or []
+                rep = _run_backtest_on_ohlcv_window(sym, ohl, days=days_test, tf=exec_tf, session_name=session_mode, end_days_ago=0)
+                oos_rows.append(rep)
+                try:
+                    rb = rep.get("reject_breakdown") or {}
+                    if isinstance(rb, dict):
+                        reject_acc.update(rb)
+                except Exception:
+                    pass
+
+            sc = _objective(oos_rows, days=float(days_test), cfg=cfg)
+            oos_sum = _compute_oos_summary(oos_rows, days=float(days_test), conc_cap=conc_cap)
+            candidate_pool.append({
+                "score": float(sc),
+                "cfg": dict(cfg),
+                "tf": str(exec_tf),
+                "oos": dict(oos_sum),
+                "rejects": dict(reject_acc),
+            })
+
+            if ci % 5 == 0:
+                best_now = max([float(x.get("score", -1e18)) for x in candidate_pool] or [-1e18])
+                _db_update_opt_run(run_id, progress={"stage": "search", "tf": exec_tf, "cand_idx": ci, "cands": len(cands), "best_score": best_now})
+
+    if not candidate_pool:
+        _db_update_opt_run(run_id, status="FAILED", finished=True, notes="No viable candidate found")
+        _db_save_opt_result(run_id, promoted=False, chosen_exec_tf="", best_score=float(-1e18), best_params={}, metrics={}, reject_stats={})
+        return {"ok": False, "run_id": run_id, "status": "FAILED"}
+
+    shortlist = sorted(candidate_pool, key=lambda x: float(x.get("score", -1e18)), reverse=True)[:shortlist_n]
+    learning_guard = _autotune_learning_guard(session_mode=session_mode)
+
+    best_choice = None
+    best_robust_score = -1e18
+
+    for idx_c, item in enumerate(shortlist):
+        if stop_event.is_set():
+            _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
+            return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
+
+        cfg = dict(item.get("cfg") or {})
+        exec_tf = str(item.get("tf") or cfg.get("exec_tf_default") or "15m")
+        apply_strategy_config(cfg)
+        ohlcv_map = ohlcv_cache_by_tf.get(exec_tf) or {}
+
+        bundle = {}
+        reject_acc = Counter(item.get("rejects") or {})
+        for w in robust_windows:
+            label = str(w.get("label") or f"{int(w.get('days',7))}d_{int(w.get('end_days_ago',0))}ago")
+            rows = []
+            for sym in universe:
+                ohl = ohlcv_map.get(sym) or []
+                rep = _run_backtest_on_ohlcv_window(sym, ohl, days=int(w.get("days", 7) or 7), tf=exec_tf, session_name=session_mode, end_days_ago=int(w.get("end_days_ago", 0) or 0))
+                rows.append(rep)
+                try:
+                    rb = rep.get("reject_breakdown") or {}
+                    if isinstance(rb, dict):
+                        reject_acc.update(rb)
+                except Exception:
+                    pass
+            bundle[label] = {"rows": rows, "days": int(w.get("days", 7) or 7), "end_days_ago": int(w.get("end_days_ago", 0) or 0)}
+
+        bundle_sum = _window_bundle_summary(bundle, cfg)
+        agg = bundle_sum.get("aggregate") or {}
+        pos_windows = int(bundle_sum.get("positive_windows", 0) or 0)
+        pass_wr_windows = int(bundle_sum.get("passing_wr_windows", 0) or 0)
+        score_std = float(bundle_sum.get("score_std", 0.0) or 0.0)
+        cons_pen = float(base_cfg.get("autotune_consistency_penalty", 2.0) or 2.0) * score_std
+        robust_score = float(agg.get("avg_R", 0.0) or 0.0) * 14.0 + float(agg.get("profit_factor", 0.0) or 0.0) * 1.6 - float(agg.get("max_drawdown_R", 0.0) or 0.0) * 0.9
+        robust_score += (pos_windows * 1.5) + (pass_wr_windows * 0.75) - cons_pen
+
+        if bool(base_cfg.get("autotune_learning_guard_enabled", True)):
+            est_wr = float(learning_guard.get("estimated_wr", 0.0) or 0.0)
+            conf = str(learning_guard.get("confidence") or "low").lower()
+            if conf in {"medium", "high"} and est_wr < 52.0:
+                robust_score -= (52.0 - est_wr) * 0.35
+
+        if robust_score > best_robust_score:
+            best_robust_score = float(robust_score)
+            best_choice = {
+                "cfg": dict(cfg),
+                "tf": exec_tf,
+                "metrics": {
+                    "oos": dict(agg),
+                    "by_session": _aggregate_by_session([r for v in bundle.values() for r in (v.get("rows") or [])]),
+                    "autotune_windows": list(bundle_sum.get("windows") or []),
+                    "positive_windows": pos_windows,
+                    "passing_wr_windows": pass_wr_windows,
+                    "score_std": score_std,
+                    "learning_guard": dict(learning_guard),
+                },
+                "rejects": dict(reject_acc),
+                "robust_score": float(robust_score),
+            }
+
+        _db_update_opt_run(run_id, progress={"stage": "robustness", "candidate_idx": idx_c, "shortlist": len(shortlist), "best_score": float(best_robust_score)})
+
+    if not best_choice:
+        _db_update_opt_run(run_id, status="FAILED", finished=True, notes="No robust candidate found")
+        _db_save_opt_result(run_id, promoted=False, chosen_exec_tf="", best_score=float(best_robust_score), best_params={}, metrics={}, reject_stats={})
+        return {"ok": False, "run_id": run_id, "status": "FAILED"}
+
+    best_params = dict(best_choice.get("cfg") or {})
+    best_tf = str(best_choice.get("tf") or best_params.get("exec_tf_default") or "15m")
+    best_metrics = dict(best_choice.get("metrics") or {})
+    best_rejects = dict(best_choice.get("rejects") or {})
+
+    gate_ok, gate_reasons = _self_opt_stability_gates(metrics={"oos": best_metrics.get("oos") or {}, "by_session": best_metrics.get("by_session") or {}}, cfg=best_params)
+    min_positive = int(base_cfg.get("autotune_min_positive_windows", 3) or 3)
+    if int(best_metrics.get("positive_windows", 0) or 0) < min_positive:
+        gate_ok = False
+        gate_reasons = list(gate_reasons or []) + [f"positive_windows<{min_positive}"]
+    if int(best_metrics.get("passing_wr_windows", 0) or 0) < min_positive:
+        gate_ok = False
+        gate_reasons = list(gate_reasons or []) + [f"passing_wr_windows<{min_positive}"]
+    lg = best_metrics.get("learning_guard") or {}
+    if bool(base_cfg.get("autotune_learning_guard_enabled", True)) and str(lg.get("confidence") or "low").lower() == "high" and float(lg.get("estimated_wr", 0.0) or 0.0) < 50.0:
+        gate_ok = False
+        gate_reasons = list(gate_reasons or []) + ["learning_guard_live_wr_below_50"]
+
+    best_metrics["promotion_reasons"] = ([] if gate_ok else gate_reasons)
+    best_metrics["autotune_mode"] = "zero_touch_multi_window"
+
+    _db_save_opt_result(run_id, promoted=bool(gate_ok), chosen_exec_tf=str(best_tf), best_score=float(best_robust_score), best_params=dict(best_params), metrics=dict(best_metrics), reject_stats=dict(best_rejects or {}))
+
+    from_cfg = load_strategy_config(force=True)
+    promoted = False
+    if gate_ok:
+        save_strategy_config(best_params)
+        apply_strategy_config(best_params)
+        _db_log_promotion(run_id, from_cfg=from_cfg, to_cfg=best_params, decision="PROMOTED", reasons=[])
+        promoted = True
+        _db_update_opt_run(run_id, status="PROMOTED", finished=True, notes="PROMOTED")
+    else:
+        _db_log_promotion(run_id, from_cfg=from_cfg, to_cfg=best_params, decision="NOT_PROMOTED", reasons=gate_reasons)
+        _db_update_opt_run(run_id, status="NOT_PROMOTED", finished=True, notes="NOT_PROMOTED")
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "promoted": promoted,
+        "chosen_exec_tf": best_tf,
+        "best_score": float(best_robust_score),
+        "best_params": dict(best_params),
+        "metrics": dict(best_metrics),
+        "reject_stats": dict(best_rejects or {}),
+        "universe_snap_id": universe_snap_id,
+        "universe_size": universe_size,
+        "session_mode": str(session_mode),
+        "days_requested": int(primary_days),
+        "autotune_windows": robust_windows,
+    }
+
+async def _notify_admins_autonomous_opt(bot, text_msg: str):
+    """No-op: autonomous optimization is fully zero-touch; no Telegram notifications."""
+    return
+
+
+def _autonomous_opt_recent_enough(hours: float) -> bool:
+    """True when the last optimization run finished recently enough."""
+    try:
+        last = _db_get_last_opt_run()
+        if not last:
+            return False
+        finished_ts = float(last.get("finished_ts") or 0.0)
+        started_ts = float(last.get("started_ts") or 0.0)
+        ref_ts = finished_ts if finished_ts > 0 else started_ts
+        if ref_ts <= 0:
+            return False
+        return (time.time() - ref_ts) < (float(hours) * 3600.0)
+    except Exception:
+        return False
+
+
+def _autonomous_opt_performance_snapshot(window_hours: float = 72.0) -> dict:
+    """Read recent signal outcomes to decide whether optimization is warranted."""
+    out = {
+        "emailed": 0,
+        "closed": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0.0,
+    }
+    try:
+        ts_from = float(time.time()) - float(window_hours) * 3600.0
+        con = db_connect()
+        cur = con.cursor()
+        out["emailed"] = int(cur.execute(
+            "SELECT COUNT(1) AS n FROM emailed_setups WHERE emailed_ts>=?",
+            (float(ts_from),),
+        ).fetchone()[0] or 0)
+        rows = cur.execute(
+            """SELECT o.outcome
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id=e.setup_id
+                   WHERE e.emailed_ts>=?""",
+            (float(ts_from),),
+        ).fetchall() or []
+        con.close()
+        closed = 0
+        wins = 0
+        losses = 0
+        for r in rows:
+            outcome = str((r[0] if not isinstance(r, dict) else r.get("outcome")) or "").upper().strip()
+            if outcome in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+                closed += 1
+                if outcome.startswith("WIN_"):
+                    wins += 1
+                elif outcome == "LOSS":
+                    losses += 1
+        out["closed"] = int(closed)
+        out["wins"] = int(wins)
+        out["losses"] = int(losses)
+        out["win_rate"] = float((wins / closed) * 100.0) if closed > 0 else 0.0
+        return out
+    except Exception:
+        return out
+
+
+def _autonomous_opt_should_run() -> tuple[bool, str]:
+    """Decision gate for the zero-touch optimizer."""
+    try:
+        if not bool(AUTONOMOUS_OPT_ENABLED):
+            return (False, "disabled")
+        cur_task = _SELF_OPT_STATE.get("task")
+        if cur_task and not cur_task.done():
+            return (False, "already_running")
+        if _autonomous_opt_recent_enough(float(AUTONOMOUS_OPT_MIN_INTERVAL_HOURS)):
+            snap = _autonomous_opt_performance_snapshot(window_hours=float(AUTONOMOUS_OPT_LOOKBACK_HOURS))
+            min_closed = int(AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS)
+            wr_floor = float(AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW)
+            if int(snap.get("closed", 0) or 0) >= min_closed and float(snap.get("win_rate", 0.0) or 0.0) >= wr_floor:
+                return (False, "recent_run_and_performance_ok")
+        return (True, "run")
+    except Exception:
+        return (False, "gate_error")
+
+
+async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
+    """Internal autonomous optimizer. No manual trigger required."""
+    should_run, reason = _autonomous_opt_should_run()
+    if not should_run:
+        return
+
+    bot = getattr(context, "bot", None)
+    stop_event = threading.Event()
+    _SELF_OPT_STATE["stop_event"] = stop_event
+    _SELF_OPT_STATE["started_ts"] = float(time.time())
+
+    try:
+        res = await to_thread_heavy(
+            _self_optimize_engine,
+            int(AUTONOMOUS_OPT_DAYS),
+            str(AUTONOMOUS_OPT_SESSION_MODE),
+            stop_event,
+            None,
+        )
+    except Exception as e:
+        try:
+            if bot:
+                await _notify_admins_autonomous_opt(bot, f"⚠️ Autonomous optimization failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return
+    finally:
+        _SELF_OPT_STATE["stop_event"] = None
+
+    if not isinstance(res, dict):
+        return
+
+    try:
+        _SELF_OPT_STATE["run_id"] = str(res.get("run_id") or "")
+        save_opt_report(res)
+    except Exception:
+        pass
+
+    try:
+        if bot and bool(res.get("ok")):
+            promoted = bool(res.get("promoted"))
+            summ = res.get("metrics") or {}
+            oos = summ.get("oos") or {}
+            msg = (
+                "🤖 Autonomous optimization completed\n"
+                f"Run: {res.get('run_id','')}\n"
+                f"Promoted: {'YES' if promoted else 'NO'}\n"
+                f"Exec TF: {res.get('chosen_exec_tf','')}\n"
+                f"OOS setups/day: {float(oos.get('setups_per_day',0.0)):.2f}\n"
+                f"OOS win rate: {float(oos.get('win_rate',0.0)):.1f}%\n"
+                f"OOS avg R: {float(oos.get('avg_R',0.0)):.3f}"
+            )
+            await _notify_admins_autonomous_opt(bot, msg)
+    except Exception:
+        pass
+
+
+async def cmd_self_optimize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    await update.message.reply_text(
+        "🤖 Autonomous optimization is enabled internally.\n\n"
+        "Manual optimization triggers are disabled by design.\n"
+        "Use /optimize_report only if you need the latest internal decision snapshot."
+    )
+
+async def cmd_self_optimize_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    await update.message.reply_text(
+        "🤖 Manual stop is disabled.\n\n"
+        "The optimizer is autonomous and production-governed. It only promotes validated improvements automatically."
+    )
+
+async def cmd_self_optimize_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    last = _db_get_last_opt_run()
+    if not last:
+        await update.message.reply_text("No autonomous optimization runs recorded yet.")
+        return
+
+    res = _db_get_opt_result(str(last.get("run_id") or ""))
+    if not res:
+        await update.message.reply_text("No optimization result saved for the latest run yet.")
+        return
+
+    await send_long_message(update, _self_opt_format_report(res), parse_mode=None)
+
+
+def is_top_setup_eligible(
+
+    s: "Setup",
+    source: str = "screen",
+    session_name: str = "LON",
+) -> tuple[bool, str]:
+    """Unified eligibility using scoring + a few safety checks.
+
+    - source='screen' => slightly looser (more flow)
+    - source='email'  => slightly stricter (quality + anti-spam handled elsewhere)
+    """
+    try:
+        # Basic safety sanity (never create impossible orders)
+        entry = float(getattr(s, "entry", 0.0) or 0.0)
+        sl = float(getattr(s, "sl", 0.0) or 0.0)
+        tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+        side = str(getattr(s, "side", "") or "").upper()
+
+        if entry <= 0 or sl <= 0 or tp3 <= 0 or side not in ("BUY", "SELL"):
+            return (False, "bad_prices_or_side")
+
+        if side == "BUY" and not (sl < entry < tp3):
+            return (False, "bad_price_order_buy")
+        if side == "SELL" and not (tp3 < entry < sl):
+            return (False, "bad_price_order_sell")
+
+        # Always ensure TP ladder exists (derive if missing)
+        try:
+            t1, t2, t3 = _ensure_three_tps(entry, sl, tp3, getattr(s, "tp1", None), getattr(s, "tp2", None), side)
+            setattr(s, "tp1", t1)
+            setattr(s, "tp2", t2)
+            setattr(s, "tp3", t3)
+        except Exception:
+            pass
+
+        score, comps = compute_setup_quality_score(s, session_name=session_name)
+        setattr(s, "quality_score", float(score))
+        try:
+            setattr(s, "quality_components", comps)
+        except Exception:
+            pass
+
+        src = str(source or "screen").strip().lower()
+        min_score = float(QUALITY_SCORE_MIN_EMAIL if src == "email" else QUALITY_SCORE_MIN_SCREEN)
+
+        if float(score) < float(min_score):
+            return (False, f"below_score_{int(min_score)}")
+
+        # Liquidity floor remains a HARD safety gate (prevents junk illiquid coins)
+        fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+        if fut_vol < float(MIN_FUT_VOL_USD):
+            return (False, "below_min_fut_vol")
+
+        return (True, "ok")
+    except Exception:
+        return (False, "eligibility_exception")
+
+def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]:
+    """Session-aware production thresholds.
+
+    NY remains the preferred execution window, but London and Asia are still allowed
+    with slightly stricter requirements so the bot can surface high-quality global crypto
+    opportunities without turning the email/autotrade lane noisy.
+    """
+    sess = str(session_name or "").upper().strip()
+    if sess == "NY":
+        return (70.0, 78, 2.00)
+    if sess == "LON":
+        return (72.0, 80, 2.10)
+    if sess == "ASIA":
+        return (74.0, 82, 2.20)
+    return (72.0, 80, 2.10)
+
+
+def is_executable_setup_eligible(
+    s: "Setup",
+    session_name: str = "NY",
+    min_quality: float = 70.0,
+    min_conf: int = 78,
+    min_rr_final: float = 2.0,
+) -> tuple[bool, str]:
+    """Production-grade gate for email/executable/autotrade path.
+
+    Best-practice approach:
+    - allow the configured live session (ASIA/LON/NY), not NY-only
+    - keep Engine A as the default/highest-trust source
+    - allow Engine B breakouts only with *stricter* score/conf/RR/liquidity rules
+    - keep the sellable/live path tighter than /screen
+    """
+    try:
+        sess = str(session_name or "").upper().strip()
+        if sess not in {"ASIA", "LON", "NY"}:
+            return (False, "session_not_supported")
+
+        ok, why = is_top_setup_eligible(s, source='email', session_name=sess)
+        if not ok:
+            return (False, f"base_gate_{why}")
+
+        sess_quality, sess_conf, sess_rr = _execution_session_thresholds(sess)
+        score_floor = float(max(min_quality, QUALITY_SCORE_MIN_EMAIL, sess_quality))
+        conf_floor = int(max(min_conf, MIN_SETUP_CONF, sess_conf))
+        rr_floor = float(max(min_rr_final, sess_rr))
+
+        score = float(getattr(s, "quality_score", 0.0) or 0.0)
+        if score < score_floor:
+            return (False, "below_exec_quality")
+
+        conf = int(getattr(s, "conf", 0) or 0)
+        if conf < conf_floor:
+            return (False, "below_exec_conf")
+
+        entry = float(getattr(s, "entry", 0.0) or 0.0)
+        sl = float(getattr(s, "sl", 0.0) or 0.0)
+        final_tp = float(getattr(s, "tp2", 0.0) or getattr(s, "tp3", 0.0) or 0.0)
+        rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
+        if rr_final < rr_floor:
+            return (False, "below_exec_rr")
+
+        engine = str(getattr(s, "engine", "") or "").upper().strip()
+        fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+
+        if engine == "A":
+            if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
+                return (False, "pullback_not_ready")
+            return (True, "ok")
+
+        if engine == "B":
+            if not bool(EXECUTION_ENGINE_B_EMAIL_ENABLED):
+                return (False, "engine_b_disabled")
+            if score < (score_floor + 3.0):
+                return (False, "engine_b_below_quality")
+            if conf < (conf_floor + 2):
+                return (False, "engine_b_below_conf")
+            if rr_final < (rr_floor + 0.15):
+                return (False, "engine_b_below_rr")
+            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.5, 12_000_000.0)):
+                return (False, "engine_b_below_liquidity")
+            ch1 = abs(float(getattr(s, "ch1", 0.0) or 0.0))
+            ch4 = abs(float(getattr(s, "ch4", 0.0) or 0.0))
+            if ch1 < 0.8 or ch4 < 1.5:
+                return (False, "engine_b_trend_not_strong_enough")
+            return (True, "ok")
+
+        return (False, "engine_not_supported")
+    except Exception:
+        return (False, "exec_eligibility_exception")
+
+
+def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
+    """
+    Stricter confidence designed for:
+    - Fewer, higher quality continuation signals
+    - Avoiding mid-wave / pump entries
+    - Preferring "pullback then continuation" (15m should be mild or slightly counter-trend)
+    """
+    is_long = (side == "BUY")
+
+    # Base score starts lower to reduce inflated confidences
+    score = 36.0
+
+    # -----------------------------
+    # 1) Higher-TF alignment first
+    # -----------------------------
+    def aligned(x: float) -> bool:
+        return (x > 0) if is_long else (x < 0)
+
+    a24 = aligned(ch24)
+    a4  = aligned(ch4)
+    a1  = aligned(ch1)
+    a15 = aligned(ch15)
+
+    align_count = int(a24) + int(a4) + int(a1) + int(a15)
+
+    # Stronger reward for 4H/1H alignment (regime + execution TF)
+    score += 14.0 if a4 else -18.0
+    score += 12.0 if a1 else -16.0
+
+    # 24H matters, but less than 4H/1H for trade execution quality
+    score += 8.0 if a24 else -10.0
+
+    # 15m alignment is NOT always good for entries (pumps are bad entries)
+    # We'll handle 15m separately as "pullback quality"
+    # (so do not add big alignment reward here)
+    score += 2.0 if a15 else -2.0
+
+    # Hard cap if the structure is weak:
+    # If 4H+1H disagree with your side, confidence should never be high.
+    if (not a4) and (not a1):
+        return int(55)  # keep it low; you can also return 0 if you want total block
+
+    # If at least 3 TFs align (24/4/1/15), small boost
+    if align_count >= 3:
+        score += 6.0
+    elif align_count <= 1:
+        score -= 10.0
+
+    # -----------------------------
+    # 2) Magnitude scoring (capped)
+    # -----------------------------
+    def signed_mag(x: float, k: float) -> float:
+        return (abs(x) * k) if aligned(x) else (-abs(x) * k)
+
+    mag = (
+        signed_mag(ch24, 0.5) +
+        signed_mag(ch4,  0.9) +
+        signed_mag(ch1,  1.2) +
+        signed_mag(ch15, 0.6)
+    )
+    mag = clamp(mag, -18.0, 18.0)
+    score += mag
+
+    # -----------------------------
+    # 3) Anti-pump + pullback preference (15m behavior)
+    # -----------------------------
+    # For continuation entries:
+    # - We *don't* want 15m strongly in-trend (often means mid-wave / extended).
+    # - We *do* like mild pullback against the trend (e.g. -0.3% to -1.2% in BUY).
+    ch15_abs = abs(float(ch15))
+
+    if is_long:
+        # Mid-wave pump penalty: 15m strongly positive
+        if ch15 >= 0.8:
+            score -= 12.0
+        elif ch15 >= 0.4:
+            score -= 6.0
+
+        # Preferred pullback zone (slight red 15m)
+        if -1.2 <= ch15 <= -0.25:
+            score += 10.0
+        elif -2.2 <= ch15 < -1.2:
+            score += 4.0
+
+        # Too much dump into support = unstable
+        if ch15 <= -2.8:
+            score -= 10.0
+    else:
+        # Mid-wave dump penalty: 15m strongly negative
+        if ch15 <= -0.8:
+            score -= 12.0
+        elif ch15 <= -0.4:
+            score -= 6.0
+
+        # Preferred pullback zone (slight green 15m)
+        if 0.25 <= ch15 <= 1.2:
+            score += 10.0
+        elif 1.2 < ch15 <= 2.2:
+            score += 4.0
+
+        # Too much pump into resistance = unstable
+        if ch15 >= 2.8:
+            score -= 10.0
+
+    # -----------------------------
+    # 4) Volume bonus (smaller + only when structure is already good)
+    # -----------------------------
+    # Volume should NOT rescue a bad setup.
+    # Only add if score already indicates decent structure.
+    if score >= 60.0:
+        if fut_vol_usd >= 40_000_000:
+            score += 5.0
+        elif fut_vol_usd >= 15_000_000:
+            score += 3.0
+        elif fut_vol_usd >= 6_000_000:
+            score += 1.5
+
+    # Public confidence should remain conservative; quality_score is the main gate.
+    score = clamp(score, 0.0, 92.0)
+    return int(round(score))
+
+
+def build_leaders_table(best_fut: Dict[str, MarketVol]) -> str:
+    leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:LEADERS_N]
+    rows = []
+
+    for base, mv in leaders:
+        # ✅ 4H change from real 4h candles (light: limit=2)
+        ch4 = 0.0
+        try:
+            c4h = fetch_ohlcv(mv.symbol, "4h", limit=2)
+            if c4h and len(c4h) >= 2:
+                c_last = float(c4h[-1][4])
+                c_prev = float(c4h[-2][4])
+                if c_prev > 0:
+                    ch4 = ((c_last - c_prev) / c_prev) * 100.0
+        except Exception:
+            ch4 = 0.0
+
+        rows.append([
+            base,
+            fmt_money(usd_notional(mv)),
+            pct_with_emoji(float(mv.percentage or 0.0)),  # 24H
+            pct_with_emoji(float(ch4)),                  # 4H
+        ])
+
+    return "*Market Leaders (Top 10 by Futures Volume)*\n" + table_md(rows, ["SYM", "F Vol", "24H", "4H"])
+
+def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tuple], List[Tuple]]:
+    """
+    ✅ FAST version:
+    - For leaders/losers we only need: volume, 24H move, and 4H alignment
+    - So we fetch ONLY 4H candles (limit=2) instead of full 1H+15m metrics
+    """
+    up, dn = [], []
+
+    for base, mv in best_fut.items():
+        vol = usd_notional(mv)
+        if vol < MOVER_VOL_USD_MIN:
+            continue
+
+        ch24 = float(mv.percentage or 0.0)
+        if ch24 < MOVER_UP_24H_MIN and ch24 > MOVER_DN_24H_MAX:
+            continue
+
+        # ✅ 4H alignment using real 4H candles (very light)
+        c4h = fetch_ohlcv(mv.symbol, "4h", limit=2)
+        if not c4h or len(c4h) < 2:
+            continue
+
+        c_last = float(c4h[-1][4])
+        c_prev = float(c4h[-2][4])
+        if c_prev <= 0:
+            continue
+        ch4 = ((c_last - c_prev) / c_prev) * 100.0
+
+        if ch24 >= MOVER_UP_24H_MIN and ch4 > 0:
+            up.append((base, vol, ch24, ch4, float(mv.last or 0.0)))
+        if ch24 <= MOVER_DN_24H_MAX and ch4 < 0:
+            dn.append((base, vol, ch24, ch4, float(mv.last or 0.0)))
+
+    up.sort(key=lambda x: (x[2], x[1]), reverse=True)
+    dn.sort(key=lambda x: (x[2], x[1]))
+    return up, dn
+
+def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
+    up, dn = compute_directional_lists(best_fut)
+    up_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4)] for b, v, c24, c4, px in up[:10]]
+    dn_rows = [[b, fmt_money(v), pct_with_emoji(c24), pct_with_emoji(c4)] for b, v, c24, c4, px in dn[:10]]
+    up_txt = "*Directional Leaders (24H ≥ +10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(up_rows, ["SYM", "F Vol", "24H", "4H"]) if up_rows else "_None_")
+    dn_txt = "*Directional Losers (24H ≤ -10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(dn_rows, ["SYM", "F Vol", "24H", "4H"]) if dn_rows else "_None_")
+    return up_txt, dn_txt
+
+# =========================================================
+# make_setup
+# =========================================================
+def make_setup(
+    base: str,
+    mv: MarketVol,
+    strict_15m: bool = True,
+    session_name: str = "LON",
+    allow_no_pullback: bool = True,     # /screen True, Email False (except HOT bypass)
+    hot_vol_usd: float = HOT_VOL_USD,   # 50M
+    trigger_loosen_mult: float = 1.0,
+    waiting_near_pct: float = SCREEN_WAITING_NEAR_PCT,
+    scan_profile: str = DEFAULT_SCAN_PROFILE,
+) -> Optional[Setup]:
+
+    fut_vol = usd_notional(mv)
+    if fut_vol <= 0:
+        _rej("no_futures_volume", base, mv)
+        return None
+
+    entry = float(mv.last or 0.0)
+    if entry <= 0:
+        _rej("bad_entry", base, mv)
+        return None
+
+    ch24 = float(mv.percentage or 0.0)
+
+    _note_status("evaluated", base, mv)
+
+
+    notes = []  # collect internal notes for pullback policy / diagnostics
+    try:
+
+        ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
+
+    except Exception:
+
+        _rej("ohlcv_missing_or_insufficient", base, mv)
+
+        return None
+    # Use true 4H change from 4H candles (more stable than 1H*4 approximation)
+    try:
+        ch4_exact = 0.0
+        try:
+            c4h = fetch_ohlcv(mv.symbol, "4h", limit=6)
+            if c4h and len(c4h) >= 2:
+                c_last_4h = float(c4h[-1][4])
+                c_prev_4h = float(c4h[-2][4])
+                ch4_exact = ((c_last_4h - c_prev_4h) / c_prev_4h) * 100.0 if c_prev_4h else 0.0
+        except Exception:
+            ch4_exact = 0.0
+
+        ch4_used = ch4_exact if abs(ch4_exact) > 0.0001 else ch4
+
+        if (ch1 == 0.0 and ch4 == 0.0 and ch15 == 0.0 and atr_1h == 0.0) or (not c15) or (ema_support_15m == 0.0):
+            _rej("ohlcv_missing_or_insufficient", base, mv, "metrics/ema missing")
+            return None
+
+        # Scan profile tuning
+        prof = str(scan_profile or DEFAULT_SCAN_PROFILE).strip().lower()
+        if prof not in SCAN_PROFILES:
+            prof = DEFAULT_SCAN_PROFILE
+        aggressive_screen = (prof == "aggressive" and (not strict_15m))
+
+        # --------- SESSION-DYNAMIC 1H TRIGGER ----------
+        atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
+        trig_min_raw = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
+
+        floor_min = 0.025 if aggressive_screen else 0.05  # further loosened: allow setups in quiet 1H candles
+        trig_min = max(float(floor_min), float(trig_min_raw) * float(trigger_loosen_mult))
+
+        if abs(ch1) < trig_min:
+            # Waiting for Trigger (near-miss) — store ONLY side + a color dot (no numbers)
+            if trig_min > 0:
+                ratio = abs(ch1) / trig_min  # internal only
+                if ratio >= float(waiting_near_pct):
+                    # color indicates "how close" WITHOUT revealing thresholds
+                    if ratio >= 0.92:
+                        dot = "🟢"
+                    elif ratio >= 0.82:
+                        dot = "🟡"
+                    else:
+                        dot = "🟠"
+
+                    side_guess = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.25 else ("BUY" if ch1 > 0 else "SELL")
+                    _WAITING_TRIGGER[str(base)] = {"side": side_guess, "dot": dot}
+
+            # Balanced breakout override: even if 1H change is small, allow true breakouts
+            # Additional overrides: allow setups during quiet 1H candles if 4H/24H move is strong and 15m confirms.
+            override_4h = (abs(float(ch4_used or 0.0)) >= max(0.9, float(trig_min) * 1.6)) and (abs(float(ch15 or 0.0)) >= 0.10)
+            override_24h = (abs(float(ch24 or 0.0)) >= 10.0) and (abs(float(ch15 or 0.0)) >= 0.08)
+            # Extra override: if 24H is very strong AND 4H aligns, don't require 15m confirmation (quiet consolidation after a big move)
+            override_24h_strong = (abs(float(ch24 or 0.0)) >= 18.0) and (abs(float(ch4_used or 0.0)) >= 0.60) and (float(fut_vol or 0.0) >= 5_000_000.0)
+            breakout_override = False
+            # Trend override: if 4H regime move is meaningful, allow even if this 1H is quiet.
+            try:
+                if abs(float(ch4_used or 0.0)) >= max(0.75, float(trig_min) * 3.0) and float(fut_vol or 0.0) >= 5_000_000.0:
+                    breakout_override = True
+            except Exception:
+                pass
+            try:
+                if c1 and len(c1) >= 25 and abs(ch24) >= 6.0:
+                    highs_1h = [float(x[2]) for x in c1]
+                    lows_1h  = [float(x[3]) for x in c1]
+                    closes_1h = [float(x[4]) for x in c1]
+                    vols_1h  = [float(x[5]) for x in c1]
+                    last_close = float(closes_1h[-1])
+                    last_high  = float(highs_1h[-1])
+                    last_low   = float(lows_1h[-1])
+                    hh20 = max(highs_1h[-21:-1])
+                    ll20 = min(lows_1h[-21:-1])
+                    vnow = float(vols_1h[-1])
+                    vavg = (sum(vols_1h[-21:-1]) / 20.0) if vols_1h[-21:-1] else 0.0
+
+                    vol_mult = 1.08  # balanced default
+                    if (ch24 >= 6.0) and (last_high > hh20 or last_close > hh20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
+                        breakout_override = True
+                    if (ch24 <= -6.0) and (last_low < ll20 or last_close < ll20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
+                        breakout_override = True
+            except Exception:
+                breakout_override = False
+
+            # Soft override: if we are close to the trigger and the higher timeframe move supports direction,
+            # allow a lower-confidence setup instead of rejecting everything on a quiet 1H candle.
+            try:
+                ratio = (abs(float(ch1)) / float(trig_min)) if float(trig_min) > 0 else 0.0
+            except Exception:
+                ratio = 0.0
+            soft_override = (ratio >= 0.78) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
+                abs(float(ch4_used or 0.0)) >= 0.60 or abs(float(ch24 or 0.0)) >= 14.0
+            )
+
+            if not (breakout_override or override_4h or override_24h or override_24h_strong or soft_override):
+                _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% trig={trig_min:.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}% ch15={ch15:+.2f}%")
+                return None
+
+
+        # ✅ IMPORTANT: this must be OUTSIDE the if block (no extra indent)
+        side = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.40 else ("BUY" if ch1 > 0 else "SELL")  # trend-side gating: prefer 4H regime over 1H noise
+
+        # 4H alignment
+        # If 4H is basically flat, don't block (leaders often show ch4 ~ 0 while 24H is huge).
+        if abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
+            if side == "BUY" and ch4 < ALIGN_4H_MIN:
+                _rej("4h_not_aligned_for_long", base, mv, f"side=BUY ch4={ch4:+.2f}%")
+                return None
+            if side == "SELL" and ch4 > -ALIGN_4H_MIN:
+                _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4:+.2f}%")
+                return None
+
+        # ✅ HARD regime gate: don't fight the 4H direction (unless "strong reversal exception")
+        if TF_ALIGN_ENABLED and abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
+            if side == "BUY" and ch4 < 0:
+                if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
+                    _rej("4h_bear_regime_blocks_long", base, mv, f"ch4={ch4:+.2f}%")
+                    return None
+            if side == "SELL" and ch4 > 0:
+                if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
+                    _rej("4h_bull_regime_blocks_short", base, mv, f"ch4={ch4:+.2f}%")
+                    return None
+
+
+        # ✅ Approach A (ASIA): require basic 1H+4H alignment with the signal direction
+        # (NY/LON unchanged to keep flow)
+        try:
+            if str(session_name).upper() == "ASIA":
+                min1, min4 = tf_align_mins_for_session(session_name)
+                if side == "BUY":
+                    if not (ch1 >= min1 and ch4 >= min4):
+                        _rej("asia_tf_align_fail_long", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need>=({min1},{min4})")
+                        return None
+                else:
+                    if not (ch1 <= -min1 and ch4 <= -min4):
+                        _rej("asia_tf_align_fail_short", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need<=(-{min1},-{min4})")
+                        return None
+        except Exception:
+            pass
+
+        # =========================================================
+        # ✅ PULLBACK EMA (7/14/21) selection (15m)
+        # =========================================================
+        closes_15 = [float(x[4]) for x in c15]
+        pb_ema_val, pb_ema_p, pb_dist_pct = best_pullback_ema_15m(closes_15, c15, entry, side, session_name, atr_1h)
+
+        # ✅ No HOT bypass: pullback is ALWAYS required for high-quality continuation entries
+        pullback_bypass_hot = False
+
+        pb_ok = False
+        pb_thr_pct = 0.0
+        pb_dist_pct2 = 999.0
+
+        if pb_ema_val > 0:
+            pb_ok, pb_dist_pct2, pb_thr_pct, _ = ema_support_proximity_ok(entry, pb_ema_val, atr_1h, session_name)
+
+        pullback_ready = bool(pb_ok)
+
+        leader_base_override = _leader_base_override_ok(side, ch24, ch4_used, ch15, fut_vol, pullback_ready, pb_dist_pct2, session_name)
+
+        # Aggressive /screen: allow "near-EMA" pullback (slightly looser proximity)
+        if (not pullback_ready) and aggressive_screen and (pb_ema_val > 0) and (pb_thr_pct > 0):
+            try:
+                if float(pb_dist_pct2) <= float(pb_thr_pct) * 1.35:
+                    pullback_ready = True
+            except Exception:
+                pass
+
+        # 15m rejection candle requirement (skip in Aggressive /screen)
+        require_rejection = bool(REQUIRE_15M_EMA_REJECTION and (not aggressive_screen))
+
+        # ✅ Strict continuation entry: must show EMA interaction + strong 15m rejection/reclaim
+        if pullback_ready and require_rejection:
+            if (not c15) or (pb_ema_val <= 0):
+                _rej("no_ema_touch_reclaim_recent", base, mv,
+                     f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}% thr={pb_thr_pct:.2f}%")
+                return None
+
+            if not ema_rejection_candle_ok_15m(c15, pb_ema_val, side):
+                _rej("no_strong_rejection_candle_15m", base, mv, f"ema{pb_ema_p} pb_dist={pb_dist_pct2:.2f}%")
+                return None
+
+        # =========================================================
+        # ENGINE A (Mean-Reversion) vs ENGINE B (Momentum)
+        # =========================================================
+        engine_a_ok = bool(ENGINE_A_PULLBACK_ENABLED and pullback_ready)
+
+        engine_b_ok = False
+
+        if ENGINE_B_MOMENTUM_ENABLED:
+            # Aggressive /screen: slightly looser momentum requirements
+            mom_min_ch1 = float(MOMENTUM_MIN_CH1) * (0.75 if aggressive_screen else 1.0)
+            mom_min_24h = float(MOMENTUM_MIN_24H) * (0.75 if aggressive_screen else 1.0)
+            mom_body_mult = float(MOMENTUM_ATR_BODY_MULT) * (0.85 if aggressive_screen else 1.0)
+            mom_max_ema_dist = float(MOMENTUM_MAX_ADAPTIVE_EMA_DIST) * ((1.60 if (not strict_15m) else 1.0)) * (1.30 if aggressive_screen else 1.0)
+
+            # ------------------------------------------------------------------
+            # B1) Momentum continuation (existing)
+            # ------------------------------------------------------------------
+            if abs(ch1) >= mom_min_ch1 and abs(ch24) >= mom_min_24h:
+                if fut_vol >= (MOVER_VOL_USD_MIN * MOMENTUM_VOL_MULT):
+                    body_pct = abs(ch1)
+                    if atr_pct_now > 0 and body_pct >= (mom_body_mult * atr_pct_now):
+                        _, dist_pct, _, _ = ema_support_proximity_ok(entry, ema_support_15m, atr_1h, session_name)
+                        if dist_pct <= mom_max_ema_dist:
+                            engine_b_ok = True
+
+            # ------------------------------------------------------------------
+            # B2) Balanced Breakout continuation (NEW)
+            # Purpose: avoid "leaders full, setups empty" during expansion phases.
+            # Uses the already-fetched 1H candles (c1) to avoid extra API calls / rate limits.
+            # ------------------------------------------------------------------
+            try:
+                ch24_thr = 4.0 if aggressive_screen else 5.0
+                vol_mult = 1.05 if aggressive_screen else 1.08
+
+                # Use 4H/side gating already computed as the trend regime.
+                uptrend = (ch4_used >= 0)
+                downtrend = (ch4 < 0)
+
+                if abs(ch24) >= ch24_thr and fut_vol >= max(5_000_000.0, float(MOVER_VOL_USD_MIN) * 0.70) and c1 and len(c1) >= 25:
+                    highs_1h = [float(x[2]) for x in c1]
+                    lows_1h  = [float(x[3]) for x in c1]
+                    closes_1h = [float(x[4]) for x in c1]
+                    vols_1h  = [float(x[5]) for x in c1]
+
+                    last_close = float(closes_1h[-1])
+                    last_high = float(highs_1h[-1])
+                    last_low  = float(lows_1h[-1])
+                    vnow = float(vols_1h[-1])
+                    vavg = (sum(vols_1h[-21:-1]) / 20.0) if vols_1h[-21:-1] else 0.0
+
+                    # Prior 20-candle extremes (exclude the current candle)
+                    hh20 = max(highs_1h[-21:-1])
+                    ll20 = min(lows_1h[-21:-1])
+
+                    # Breakout BUY
+                    if uptrend and ch24 >= ch24_thr and (last_high > hh20 or last_close > hh20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
+                        engine_b_ok = True
+                        mv._pf_breakout_hint = "BUY"
+
+                    # Breakdown SELL
+                    if downtrend and ch24 <= -ch24_thr and (last_low < ll20 or last_close < ll20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
+                        engine_b_ok = True
+                        mv._pf_breakout_hint = "SELL"
+            except Exception:
+                pass
+    
+        # If breakout engine fired, force side to match the breakout direction (prevents green BUY / red mismatch)
+        try:
+            hint = getattr(mv, "_pf_breakout_hint", None)
+            if engine_b_ok and hint in ("BUY", "SELL"):
+                side = hint
+        except Exception:
+            pass
+
+        # If breakout engine fired, force side to match the breakout direction (prevents green BUY / red mismatch)
+        try:
+            hint = getattr(mv, "_pf_breakout_hint", None)
+            if engine_b_ok and hint in ("BUY", "SELL"):
+                side = hint
+        except Exception:
+            pass
+
+        if not engine_a_ok and not engine_b_ok:
+            _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}")
+            return None
+
+        # ---------------------------------------------------------
+        # Pullback policy (optional for Engine B)
+        # ---------------------------------------------------------
+        engine = "A" if engine_a_ok else "B"
+        require_pullback = (not bool(allow_no_pullback))
+
+        # Compute confidence BEFORE applying optional pullback penalty
+        conf = compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol)
+
+        # ---------------------------------------------------------
+        # ✅ PulseFutures PRO quality overlay (safe integration)
+        # Uses the appended advanced engines as a confirmation layer
+        # without rewriting the whole live signal pipeline.
+        # ---------------------------------------------------------
+        try:
+            # SMC structure (HH/HL/LH/LL + BOS/CHOCH) — higher-quality trend filter
+            smc = pf_market_structure_smc(c1[-220:] if c1 else c1, fractal=2, lookback=220)
+            structure = str(smc.get("bias", "UNKNOWN")).upper()
+            bos = str(smc.get("bos", "NONE")).upper()
+            choch = str(smc.get("choch", "NONE")).upper()
+
+            trend = pf_mtf_alignment(mv.symbol, fetch_ohlcv)  # 4H + 1H only (5m too noisy for hard gating)
+            regime = pf_market_regime(c1[-60:] if c1 else c1)
+
+            sweep_info = pf_liquidity_sweep_v2(c15[-90:] if c15 else c15, lookback_swings=90, fractal=2)
+            sweep = str(sweep_info.get("event", "NONE")).upper()
+
+            momentum = pf_orderflow_momentum(c15[-20:] if c15 else c15)
+
+            smf = pf_smart_money_flow(c15[-90:] if c15 else c15, vol_lookback=30)
+            smf_event = str(smf.get("event", "NONE")).upper()
+            smf_score = int(smf.get("score", 0) or 0)
+
+
+            want_trend = "BULLISH" if side == "BUY" else "BEARISH"
+            # Enforce key SMC rule:
+            #   LONG -> only if bullish structure
+            #   SHORT -> only if bearish structure
+            if structure != want_trend:
+                _rej("smc_structure_mismatch", base, mv, f"side={side} structure={structure} bos={bos} choch={choch} trend={trend} regime={regime} smf={smf_event}")
+                return None
+
+            # CHOCH indicates potential reversal against the prevailing bias — avoid entries against it.
+            if side == "BUY" and choch == "CHOCH_DOWN":
+                _rej("smc_choch_against_long", base, mv, f"choch={choch} bos={bos} structure={structure} smf={smf_event}")
+                return None
+            if side == "SELL" and choch == "CHOCH_UP":
+                _rej("smc_choch_against_short", base, mv, f"choch={choch} bos={bos} structure={structure} smf={smf_event}")
+                return None
+            opposite_trend = "BEARISH" if side == "BUY" else "BULLISH"
+            sweep_ok = (side == "BUY" and sweep == "BUY_SWEEP") or (side == "SELL" and sweep == "SELL_SWEEP")
+            momentum_ok = (side == "BUY" and momentum == "BULLISH") or (side == "SELL" and momentum == "BEARISH")
+            momentum_bad = (side == "BUY" and momentum == "BEARISH") or (side == "SELL" and momentum == "BULLISH")
+
+            # Hard block only when the advanced engines strongly disagree.
+            if structure == opposite_trend and trend == opposite_trend:
+                _rej("pro_structure_trend_conflict", base, mv, f"side={side} structure={structure} trend={trend}")
+                return None
+
+            # Momentum engine works best in trend regimes, not ranging.
+            if engine == "B" and strict_15m and regime == "RANGING" and (not sweep_ok):
+                _rej("pro_ranging_regime_blocks_momentum_soft", base, mv, f"side={side} regime={regime}")
+                conf -= 3
+                notes.append("ranging_penalty")
+
+            # Confidence nudges: reward alignment, penalize conflict.
+            if structure == want_trend:
+                conf += 3
+            elif structure == "RANGE":
+                conf -= 1
+
+            if trend == want_trend:
+                conf += 3
+            elif trend == "MIXED":
+                conf -= 1
+
+            if sweep_ok:
+                conf += 4
+            if momentum_ok:
+                conf += 3
+            if momentum_bad:
+                conf -= 4
+
+            # BOS adds confidence for continuation entries
+            if side == "BUY" and bos == "BOS_UP":
+                conf += 2
+            if side == "SELL" and bos == "BOS_DOWN":
+                conf += 2
+
+            # Smart Money Flow detection (institutional activity / liquidation / ignition)
+            smf_buy = smf_event in ("BUY_IGNITION", "LIQUIDATION_BUY")
+            smf_sell = smf_event in ("SELL_IGNITION", "LIQUIDATION_SELL")
+            if side == "BUY" and smf_buy:
+                conf += 2 + min(2, max(0, smf_score - 2))
+            elif side == "SELL" and smf_sell:
+                conf += 2 + min(2, max(0, smf_score - 2))
+            elif (side == "BUY" and smf_sell) or (side == "SELL" and smf_buy):
+                # Strong opposite smart-money signature: avoid
+                _rej("smart_money_opposes_side_soft", base, mv, f"side={side} smf={smf_event} score={smf_score} structure={structure} trend={trend}")
+                conf -= 6
+                notes.append("smf_opposes_soft")
+            # Require at least 2 of 3 core confirmations for aggressive momentum setups.
+            if engine == "B":
+                core_hits = 0
+                if trend == want_trend:
+                    core_hits += 1
+                if structure == want_trend:
+                    core_hits += 1
+                if sweep_ok or momentum_ok:
+                    core_hits += 1
+                if core_hits < 2:
+                    _rej("pro_quality_gate_failed_soft", base, mv, f"side={side} hits={core_hits} trend={trend} structure={structure} sweep={sweep} momentum={momentum}")
+                    conf -= 5
+                    notes.append(f"pro_hits={core_hits}")
+
+            conf = int(clamp(float(conf), 0.0, 100.0))
+        except Exception:
+            pass
+
+        # Email/autotrade quality path can require a real 15m pullback for both engines.
+        # This was previously bypassed for Engine B, which let too many NY momentum setups through.
+        pullback_ok_local = bool(pullback_ready) if require_pullback else True
+
+        keep, conf2 = apply_pullback_policy(
+            require_pullback=require_pullback,
+            pullback_ok=pullback_ok_local,
+            pullback_price=(pb_ema_val if pb_ema_val > 0 else None),
+            confidence=float(conf),
+            notes=notes,
+        )
+
+        conf = conf2
+
+        if not keep:
+            _rej("pullback_required_not_met", base, mv, "require_pullback=1")
+            return None
+
+        if engine == "A" and abs(float(ch1)) >= float(SHARP_1H_MOVE_PCT):
+            # EMA touch/reaction on 15m is OPTIONAL: do not hard-reject if it's missing.
+            # (Ramin requested: no hard requirement to touch 15m EMA.)
+            if not ema_support_reaction_ok_15m(c15, pb_ema_val, side, session_name):
+                notes.append("🟡 No strong 15m EMA reaction detected (optional check).")
+                conf = max(0.0, float(conf) - 4.0)
+
+        thr = clamp(max(12.0, 2.5 * ((atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0)), 12.0, 22.0)
+        if side == "BUY" and ch24 <= -thr:
+            _rej("24h_contradiction_for_long", base, mv, f"ch24={ch24:+.1f}% <= -{thr:.1f}%")
+            return None
+        if side == "SELL" and ch24 >= +thr:
+            _rej("24h_contradiction_for_short", base, mv, f"ch24={ch24:+.1f}% >= +{thr:.1f}%")
+            return None
+
+        is_confirm_15m = abs(ch15) >= CONFIRM_15M_ABS_MIN
+        is_early_allowed = (abs(ch1) >= EARLY_1H_ABS_MIN)
+
+        if strict_15m:
+            if (not is_confirm_15m) and (not is_early_allowed):
+                _rej("15m_weak_and_not_early", base, mv, f"ch15={ch15:+.2f}% ch1={ch1:+.2f}%")
+                return None
+
+        if strict_15m and (not is_confirm_15m):
+            conf = max(0, int(conf) - int(EARLY_CONF_PENALTY))
+
+
+        # ---------------------------------------------------------
+        # ✅ Global quality gate: session-aware confidence floor
+        # ---------------------------------------------------------
+        try:
+            sess_min = int(MIN_SETUP_CONF)
+            try:
+                if str(session_name or "").upper() == "ASIA":
+                    sess_min = max(sess_min, int(SESSION_MIN_CONF.get("ASIA", sess_min)))
+                elif str(session_name or "").upper() == "LON":
+                    sess_min = max(sess_min, int(SESSION_MIN_CONF.get("LON", sess_min)))
+                else:
+                    # Keep NY as-is (use global MIN_SETUP_CONF)
+                    sess_min = int(SESSION_MIN_CONF.get("NY", sess_min)) if str(session_name or "").upper() == "NY" else sess_min
+            except Exception:
+                sess_min = int(MIN_SETUP_CONF)
+
+            if str(session_name or '').upper() == 'NY' and require_pullback:
+                sess_min = max(int(sess_min), int(SESSION_MIN_CONF.get('NY', sess_min)) + 4)
+            if int(conf) < int(sess_min):
+                _rej("below_min_confidence", base, mv, f"conf={int(conf)} min={int(sess_min)} sess={session_name}")
+                return None
+        except Exception:
+
+            pass
+
+        tp_cap_pct = tp_cap_pct_for_coin(fut_vol, ch24)
+
+        rr_bonus = ENGINE_B_RR_BONUS if engine_b_ok else 0.0
+        tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine_b_ok else 0.0
+
+        # ✅ Approach A: volatility-aware TP cap tightening (higher hit-rate on choppy/high-ATR coins)
+        try:
+            atr_pct = (float(atr_1h) / float(entry)) * 100.0 if float(entry) > 0 else 0.0
+            if atr_pct >= 6.0:
+                tp_cap_pct = min(float(tp_cap_pct), 9.0)
+            elif atr_pct >= 4.5:
+                tp_cap_pct = min(float(tp_cap_pct), 10.5)
+        except Exception:
+            pass
+
+        atr_for_sl = float(atr_1h)
+        if leader_base_override:
+            try:
+                atr_for_sl = min(float(atr_for_sl), float(entry) * (float(_leader_base_sl_cap_pct(session_name)) / 100.0))
+                notes.append("leader_base_override")
+            except Exception:
+                atr_for_sl = float(atr_1h)
+
+        sl, tp3_single, R = compute_sl_tp(
+            entry, side, atr_for_sl, conf, tp_cap_pct,
+            rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
+        )
+        if sl <= 0 or tp3_single <= 0 or R <= 0:
+            _rej("bad_sl_tp_or_atr", base, mv, f"atr={atr_1h:.6g} entry={entry:.6g}")
+            return None
+
+        tp1 = None
+        tp2 = tp3_single
+        tp3 = tp3_single
+        _tp1, _tp2, _tp3 = multi_tp(
+            entry, side, R, tp_cap_pct, conf,
+            rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
+        )
+        if _tp1 and _tp2:
+            tp1, tp2, tp3 = _tp1, _tp2, _tp2
+
+
+        # ---------------------------------------------------------
+        # ✅ Session-aware TP3 RR floor (reduces low-quality signals, especially ASIA)
+        # ---------------------------------------------------------
+        try:
+            rr3 = rr_to_tp(entry, sl, tp3)
+            sess_rr_min = float(MIN_RR_TP3)
+            try:
+                sname = str(session_name or "").upper()
+                if sname == "ASIA":
+                    sess_rr_min = max(sess_rr_min, float(SESSION_MIN_RR_TP3.get("ASIA", sess_rr_min)))
+                elif sname == "LON":
+                    sess_rr_min = max(sess_rr_min, float(SESSION_MIN_RR_TP3.get("LON", sess_rr_min)))
+                else:
+                    # Keep NY as-is (use global MIN_RR_TP3)
+                    sess_rr_min = float(SESSION_MIN_RR_TP3.get("NY", sess_rr_min)) if sname == "NY" else sess_rr_min
+            except Exception:
+                sess_rr_min = float(MIN_RR_TP3)
+
+            if str(session_name or '').upper() == 'NY' and require_pullback:
+                sess_rr_min = max(float(sess_rr_min), float(SESSION_MIN_RR_TP3.get('NY', sess_rr_min)) + 0.10)
+            if float(rr3) < float(sess_rr_min):
+                _rej("below_min_rr_tp3_session", base, mv, f"rr3={rr3:.2f} min={sess_rr_min:.2f} sess={session_name}")
+                return None
+        except Exception:
+            pass
+
+        sid = next_setup_id()
+        hot = is_hot_coin(fut_vol, ch24)
+
+        # ✅ trailing only for the setups that need it (Momentum + Hot)
+        trailing_tp3 = False
+
+        s = Setup(
+            setup_id=sid,
+            symbol=base,
+            market_symbol=mv.symbol,
+            side=side,
+            conf=int(conf),
+            entry=entry,
+            sl=sl,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            fut_vol_usd=fut_vol,
+            ch24=ch24,
+            ch4=ch4,
+            ch1=ch1,
+            ch15=ch15,
+            ema_support_period=int(ema_period),
+            ema_support_dist_pct=float(abs(entry - float(ema_support_15m)) / entry * 100.0 if entry > 0 else 999.0),
+            pullback_ema_period=int(pb_ema_p),
+            pullback_ema_dist_pct=float(pb_dist_pct2),
+            pullback_ready=bool(pullback_ready),
+            pullback_bypass_hot=bool(pullback_bypass_hot),
+            leader_base_override=bool(leader_base_override),
+            engine=str(engine),
+            is_trailing_tp3=trailing_tp3,
+            created_ts=time.time(),
+        )
+        try:
+            # Attach lightweight diagnostics for scoring/backtests (safe even if unused elsewhere)
+            setattr(s, 'atr_pct', float(atr_pct_now or 0.0))
+            setattr(s, 'regime', str(regime or 'UNKNOWN'))
+            setattr(s, 'trend', str(trend or 'UNKNOWN'))
+            setattr(s, 'structure', str(structure or 'UNKNOWN'))
+            setattr(s, 'bos', str(bos or 'NONE'))
+            setattr(s, 'choch', str(choch or 'NONE'))
+            setattr(s, 'sweep', str(sweep or 'NONE'))
+            setattr(s, 'smf_event', str(smf_event or 'NONE'))
+            setattr(s, 'smf_score', int(smf_score or 0))
+            setattr(s, 'engine', str(engine or ''))
+            setattr(s, 'raw_conf', int(conf or 0))
+            # Ensure TP ladder is always present (derive TP1/TP2 if needed)
+            try:
+                t1, t2, t3 = _ensure_three_tps(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp3',0.0) or 0.0), getattr(s,'tp1',None), getattr(s,'tp2',None), str(getattr(s,'side','') or ''))
+                setattr(s, 'tp1', t1)
+                setattr(s, 'tp2', t2)
+                setattr(s, 'tp3', t3)
+            except Exception:
+                pass
+            try:
+                public_conf, quality_score, quality_components = _recalibrate_public_confidence(s, session_name=session_name)
+                setattr(s, 'quality_score', float(quality_score or 0.0))
+                setattr(s, 'quality_components', quality_components or {})
+                setattr(s, 'conf', int(public_conf or 0))
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return s
+    except Exception as e:
+        try:
+            _rej("exception_in_make_setup", base, mv, f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return None
+
+
+
+
+def make_breakout_setup(
+    base: str,
+    mv: MarketVol,
+    session_name: str = "LON",
+    scan_profile: str = DEFAULT_SCAN_PROFILE,
+) -> Optional[Setup]:
+    """
+    Engine B: Momentum Breakout/Breakdown setups.
+    Uses already-fetched 1H candles from metrics_from_candles_1h_15m().
+    """
+    fut_vol = usd_notional(mv)
+    if fut_vol <= 0:
+        _rej("no_futures_volume", base, mv)
+        return None
+
+    entry = float(mv.last or 0.0)
+    if entry <= 0:
+        _rej("bad_entry", base, mv)
+        return None
+
+    ch24 = float(mv.percentage or 0.0)
+
+    try:
+        ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
+    except Exception:
+        _rej("ohlcv_missing_or_insufficient", base, mv)
+        return None
+
+    # Align naming with make_setup()
+    ch4_used = float(ch4 or 0.0)
+
+    if not c1 or len(c1) < 25 or atr_1h <= 0:
+        _rej("no_candles_breakout", base, mv)
+        return None
+
+    # Prefer trend regime from 4H
+    trend_up = ch4_used > 0
+    trend_dn = ch4_used < 0
+
+    highs = [float(x[2]) for x in c1 if x and len(x) >= 6][-25:]
+    lows  = [float(x[3]) for x in c1 if x and len(x) >= 6][-25:]
+    closes= [float(x[4]) for x in c1 if x and len(x) >= 6][-25:]
+    vols  = [float(x[5]) for x in c1 if x and len(x) >= 6][-25:]
+
+    if len(highs) < 22 or len(vols) < 22:
+        _rej("insufficient_1h_window", base, mv)
+        return None
+
+    # prior window excludes the last candle to avoid self-referencing
+    prior_high20 = max(highs[-21:-1])
+    prior_low20  = min(lows[-21:-1])
+
+    last_high = highs[-1]
+    last_low  = lows[-1]
+    last_close = closes[-1]
+
+    vol_avg20 = sum(vols[-21:-1]) / 20.0
+    vol_now = vols[-1]
+    vol_ok = (vol_now > 0) and ((vol_avg20 <= 0) or (vol_now >= vol_avg20 * 1.00))  # looser
+
+    # Balanced thresholds
+    ch24_buy_min = 6.0
+    ch24_sell_max = -6.0
+
+    # Breakout/Breakdown by wick OR close
+    is_breakout = (last_high > prior_high20) or (last_close > prior_high20)
+    is_breakdown = (last_low < prior_low20) or (last_close < prior_low20)
+
+    # If 4H is strongly up/down, allow direction to follow regime
+    if trend_up and is_breakout and vol_ok and ch24 >= ch24_buy_min:
+        side = "BUY"
+    elif trend_dn and is_breakdown and vol_ok and ch24 <= ch24_sell_max:
+        side = "SELL"
+    else:
+        # As a fallback, allow if 4H is neutral but 24H is strong
+        if is_breakout and vol_ok and ch24 >= max(10.0, ch24_buy_min) and (ch4 >= 0):
+            side = "BUY"
+        elif is_breakdown and vol_ok and ch24 <= min(-10.0, ch24_sell_max) and (ch4_used <= 0):
+            side = "SELL"
+        else:
+            # Balanced fallback: strong momentum continuation (not a fresh HH/LL break)
+            if vol_ok:
+                if (ch4_used >= 4.0 and ch24 >= 12.0):
+                    side = "BUY"
+                elif (ch4_used <= -4.0 and ch24 <= -12.0):
+                    side = "SELL"
+                else:
+                    _rej("no_breakout_trigger", base, mv)
+                    return None
+            else:
+                _rej("no_breakout_trigger", base, mv)
+                return None
+
+
+    # SL/TP using ATR (simple + robust)
+    sl_atr = 1.35
+    rr_target = 2.0  # TP3 RR target for momentum
+    if side == "BUY":
+        sl = entry - (atr_1h * sl_atr)
+        tp3 = entry + (entry - sl) * rr_target
+    else:
+        sl = entry + (atr_1h * sl_atr)
+        tp3 = entry - (sl - entry) * rr_target
+
+    if sl <= 0 or tp3 <= 0:
+        _rej("bad_sl_tp", base, mv)
+        return None
+
+    # Confidence scoring (balanced)
+    conf = 80
+    if abs(ch4_used) >= 5:
+        conf += 2
+    if abs(ch24) >= 20:
+        conf += 2
+    if vol_avg20 > 0 and vol_now >= vol_avg20 * 1.25:
+        conf += 2
+    conf = int(min(conf, 90))
+
+    setup_id = make_setup_id(base, side)
+    return Setup(
+        setup_id=setup_id,
+        symbol=base,
+        market_symbol=mv.symbol,
+        side=side,
+        conf=conf,
+        entry=float(entry),
+        sl=float(sl),
+        tp1=None,
+        tp2=None,
+        tp3=float(tp3),
+        fut_vol_usd=float(fut_vol),
+        ch24=float(ch24),
+        ch4=float(ch4_used),
+        ch1=float(ch1),
+        ch15=float(ch15),
+        ema_support_period=int(ema_period or 0),
+        ema_support_dist_pct=float(0.0),
+        pullback_ema_period=int(0),
+        pullback_ema_dist_pct=float(0.0),
+        pullback_ready=False,
+        pullback_bypass_hot=False,
+        engine="B",
+        is_trailing_tp3=False,
+        created_ts=time.time(),
+    )
+
+
+def pick_setups(
+    best_fut: Dict[str, MarketVol],
+    n: int,
+    strict_15m: bool = True,
+    session_name: str = "LON",
+    universe_n: int = 35,
+    trigger_loosen_mult: float = 1.0,
+    waiting_near_pct: float = SCREEN_WAITING_NEAR_PCT,
+    allow_no_pullback: bool = False,   # /screen True, email False (except HOT bypass inside make_setup)
+    scan_profile: str = DEFAULT_SCAN_PROFILE,
+) -> List[Setup]:
+    global _REJECT_STATS, _REJECT_SAMPLES, _REJECT_BY_SYMBOL, _WAITING_TRIGGER
+    _REJECT_STATS = Counter()
+    _REJECT_SAMPLES = {}
+    _REJECT_BY_SYMBOL = {}
+    # _WAITING_TRIGGER is cleared once per scan inside build_priority_pool().
+    # Do not reset it here, otherwise later passes erase earlier near-miss symbols.
+
+    universe_n = int(max(10, universe_n))
+    universe = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:universe_n]
+
+    setups: List[Setup] = []
+    for base, mv in universe:
+        try:
+            s = make_setup(
+                base,
+                mv,
+                strict_15m=strict_15m,
+                session_name=session_name,
+                allow_no_pullback=allow_no_pullback,
+                trigger_loosen_mult=float(trigger_loosen_mult),
+                waiting_near_pct=float(waiting_near_pct),
+                scan_profile=str(scan_profile or DEFAULT_SCAN_PROFILE),
+            )
+        except Exception:
+            try:
+                _rej("make_setup_exception", base, mv)
+            except Exception:
+                pass
+            s = None
+
+        if s:
+            try:
+                _note_status("setup_generated", base, mv)
+            except Exception:
+                pass
+            setups.append(s)
+        else:
+            # If make_setup returns None without recording a reject, add a generic reject
+            # so /why is never empty and tuning is possible.
+            try:
+                ctx = _REJECT_CTX.get()
+                b = str(base or "").upper().strip()
+                per = (ctx or {}).get("__per__") if isinstance(ctx, dict) else None
+                if b and isinstance(ctx, dict) and (not isinstance(per, dict) or b not in per):
+                    _rej("no_setup_candidate", base, mv, "make_setup_returned_none")
+            except Exception:
+                pass
+
+    setups.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
+    return setups[:n]
+
+
+# =========================================================
+# EMAIL
+# =========================================================
+
+def pick_breakout_setups(
+    best_fut: Dict[str, MarketVol],
+    n: int,
+    session_name: str,
+    universe_cap: int,
+    scan_profile: str = DEFAULT_SCAN_PROFILE,
+) -> List[Setup]:
+    """
+    Engine B selector: iterate symbols and build momentum breakout/breakdown setups.
+    """
+    items = list((best_fut or {}).items())
+    # simple volume-based ordering
+    items.sort(key=lambda kv: usd_notional(kv[1] or MarketVol()), reverse=True)
+    if universe_cap and universe_cap > 0:
+        items = items[:universe_cap]
+
+    out: List[Setup] = []
+    for base, mv in items:
+        try:
+            s = make_breakout_setup(base, mv, session_name=session_name, scan_profile=scan_profile)
+            if s:
+                out.append(s)
+        except Exception:
+            continue
+
+    # order by confidence then volume
+    out.sort(key=lambda s: (s.conf, s.fut_vol_usd), reverse=True)
+    return out[: max(0, int(n)) ]
+
+
+
+
+def user_email_alerts_enabled(user: dict) -> bool:
+    # Admin always receives emails
+    try:
+        uid = int((user or {}).get("user_id") or 0)
+        if uid and is_admin_user(uid):
+            return True
+    except Exception:
+        pass
+    try:
+        return int((user or {}).get("email_alerts_enabled", 1)) == 1
+    except Exception:
+        return True
+
+
+def set_user_email_alerts_enabled(uid: int, enabled: bool):
+    update_user(int(uid), email_alerts_enabled=(1 if enabled else 0))
+
+async def email_on_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User command to enable/disable ALL email alerts without removing the saved email address."""
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+
+    arg = (context.args[0].strip().lower() if context.args else "")
+    if arg not in ("on", "off", "enable", "disable"):
+        cur = "ON" if user_email_alerts_enabled(user) else "OFF"
+        await update.message.reply_text(
+            "📧 Email alerts (master switch)\n"
+            "────────────────────\n"
+            f"Current: {cur}\n\n"
+            "Usage:\n"
+            "/email_on_off on\n"
+            "/email_on_off off\n\n"
+            "Note: This does not remove your saved email address."
+        )
+        return
+
+    enabled = arg in ("on", "enable")
+    set_user_email_alerts_enabled(uid, enabled)
+    await update.message.reply_text(
+        "✅ Email alerts updated\n"
+        "────────────────────\n"
+        f"Now: {'ON' if enabled else 'OFF'}"
+    )
+
+def email_config_ok() -> bool:
+    """
+    Only checks SMTP sender config.
+    Recipient is per-user (users.email_to OR users.email) OR fallback EMAIL_TO.
+    """
+    return all([EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM])
+
+
+def send_email(
+    subject: str,
+    body: str,
+    body_html: Optional[str] = None,
+    user_id_for_debug: Optional[int] = None,
+    enforce_trade_window: bool = True
+) -> bool:
+    """
+    Sends an email.
+
+    Recipient resolution:
+    - If user_id_for_debug is provided: uses users.email_to OR users.email
+    - Otherwise falls back to EMAIL_TO (if set)
+
+    Trade window:
+    - Enforced only if enforce_trade_window=True
+      (use False for system alerts like big-move alerts)
+
+    Tracks last SMTP error + last email decision for /health and /email_decision.
+    """
+    global _SMTP_CONN, _SMTP_CONN_IS_SSL, _SMTP_CONN_TS
+
+    # Per-user master email alerts switch
+    if user_id_for_debug is not None:
+        u = get_user(int(user_id_for_debug))
+        if u and not user_email_alerts_enabled(u):
+            _EMAIL_LAST_DECISION["reason"] = "user_email_alerts_disabled"
+            _EMAIL_LAST_DECISION["ts"] = _now()
+            return False
+
+    uid = int(user_id_for_debug) if user_id_for_debug is not None else None
+
+    # --- SMTP config check (sender side) ---
+    if not email_config_ok():
+        msg = "Email not configured (missing SMTP env vars)."
+        logger.warning(msg)
+        if uid is not None:
+            _LAST_SMTP_ERROR[uid] = msg
+            _LAST_EMAIL_DECISION[uid] = {
+                "status": "FAIL",
+                "reason": msg,
+                "ts": time.time(),
+            }
+        return False
+
+    # --- Resolve recipient ---
+    to_email = ""
+    user = None
+    now_local = None
+
+    if uid is not None:
+        user = get_user(uid) or {}
+        to_email = str(user.get("email_to") or user.get("email") or "").strip()
+
+        if not to_email:
+            _LAST_EMAIL_DECISION[uid] = {
+                "status": "FAIL",
+                "reasons": ["no_recipient_email_set"],
+                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            return False
+
+        if enforce_trade_window:
+            try:
+                try:
+                    tz = ZoneInfo(str(user.get("tz") or "UTC"))
+                except Exception:
+                    tz = timezone.utc
+                now_local = datetime.now(tz)
+
+                if not in_trade_window_now(user, now_local):
+                    _LAST_EMAIL_DECISION[uid] = {
+                        "status": "SKIP",
+                        "reason": "outside_trade_window",
+                        "ts": time.time(),
+                    }
+                    return False
+            except Exception:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reason": "trade_window_check_failed",
+                    "ts": time.time(),
+                }
+                return False
+    else:
+        to_email = str(EMAIL_TO or "").strip()
+        if not to_email:
+            logger.warning("No recipient email (EMAIL_TO empty and no user_id provided).")
+            return False
+
+    # --- Build message ---
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = to_email
+    msg.set_content(body)
+    if body_html:
+        try:
+            msg.add_alternative(body_html, subtype="html")
+        except Exception:
+            pass
+
+
+      
+    def _close_cached():
+        global _SMTP_CONN, _SMTP_CONN_IS_SSL, _SMTP_CONN_TS
+        try:
+            if _SMTP_CONN is not None:
+                try:
+                    _SMTP_CONN.quit()
+                except Exception:
+                    try:
+                        _SMTP_CONN.close()
+                    except Exception:
+                        pass
+        finally:
+            _SMTP_CONN = None
+            _SMTP_CONN_IS_SSL = None
+            _SMTP_CONN_TS = 0.0
+
+    def _need_new_conn(is_ssl: bool) -> bool:
+        global _SMTP_CONN, _SMTP_CONN_IS_SSL, _SMTP_CONN_TS
+        if _SMTP_CONN is None:
+            return True
+        if _SMTP_CONN_IS_SSL is None or _SMTP_CONN_IS_SSL != is_ssl:
+            return True
+        if (time.time() - float(_SMTP_CONN_TS or 0.0)) > float(SMTP_REUSE_TTL_SEC or 0.0):
+            return True
+        return False
+
+
+    def _connect_and_login(is_ssl: bool) -> smtplib.SMTP:
+        timeout = float(EMAIL_SEND_TIMEOUT_SEC)
+        if is_ssl:
+            ctx = ssl.create_default_context()
+            s = smtplib.SMTP_SSL(EMAIL_HOST, int(EMAIL_PORT), context=ctx, timeout=timeout)
+        else:
+            s = smtplib.SMTP(EMAIL_HOST, int(EMAIL_PORT), timeout=timeout)
+            s.ehlo()
+            s.starttls(context=ssl.create_default_context())
+            s.ehlo()
+
+        # login can be slow; keep under socket timeout
+        s.login(EMAIL_USER, EMAIL_PASS)
+        return s
+
+    # --- Send (with connection reuse + lock) ---
+    try:
+        is_ssl = (int(EMAIL_PORT) == 465)
+
+        with _SMTP_LOCK:
+            # Refresh connection if needed
+            if _need_new_conn(is_ssl):
+                _close_cached()
+                _SMTP_CONN = _connect_and_login(is_ssl)
+                _SMTP_CONN_IS_SSL = is_ssl
+                _SMTP_CONN_TS = time.time()
+            else:
+                # Light keepalive; if dropped, reconnect
+                try:
+                    _SMTP_CONN.noop()
+                except Exception:
+                    _close_cached()
+                    _SMTP_CONN = _connect_and_login(is_ssl)
+                    _SMTP_CONN_IS_SSL = is_ssl
+                    _SMTP_CONN_TS = time.time()
+
+            # Actual send
+            _SMTP_CONN.send_message(msg)
+            _SMTP_CONN_TS = time.time()
+
+        if uid is not None:
+            _LAST_SMTP_ERROR.pop(uid, None)
+            _tmp_dec = {
+                "status": "SENT",
+                "reason": "ok",
+                "ts": time.time(),
+            }
+            _LAST_EMAIL_DECISION[uid] = _tmp_dec
+            _LAST_EMAIL_SENT[uid] = dict(_tmp_dec)
+        return True
+
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        logger.exception("send_email failed: %s", err)
+
+        # On any send failure, drop cached connection (often becomes poisoned)
+        try:
+            with _SMTP_LOCK:
+                _close_cached()
+        except Exception:
+            pass
+
+        if uid is not None:
+            _LAST_SMTP_ERROR[uid] = err
+            _LAST_EMAIL_DECISION[uid] = {
+                "status": "FAIL",
+                "reason": err,
+                "ts": time.time(),
+            }
+        return False
+
+
+# =========================================================
+# STRIPE CHECKOUT / CUSTOMER PORTAL
+# =========================================================
+def create_checkout_session(email: str, plan: str) -> str:
+    price_id = (
+        os.environ.get("STRIPE_PRICE_STANDARD")
+        if plan == "standard"
+        else os.environ.get("STRIPE_PRICE_PRO")
+    )
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        customer_email=email,
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url=TELEGRAM_BOT_URL,
+        cancel_url=TELEGRAM_BOT_URL,
+        metadata={"plan": plan},
+    )
+    return session.url
+
+
+def create_customer_portal(email: str) -> str:
+    customer = stripe.Customer.list(email=email, limit=1).data[0]
+    portal = stripe.billing_portal.Session.create(
+        customer=customer.id,
+        return_url=TELEGRAM_BOT_URL,
+    )
+    return portal.url
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+
+    if not context.args:
+        cur = "ON" if user_email_alerts_enabled(user) else "OFF"
+        saved = (user.get("email_to") or user.get("email") or "").strip()
+        await update.message.reply_text(
+            "📧 Email Settings\n"
+            "────────────────────\n"
+            f"Alerts: {cur}\n"
+            f"Saved: {saved if saved else '(none)'}\n\n"
+            "Set email: /email you@example.com\n"
+            "Turn off: /email off\n"
+            "Turn on: /email on"
+        )
+        return
+
+    arg = context.args[0].strip().lower()
+
+    # Support /email off|on
+    if arg in ("off", "0", "disable", "disabled"):
+        set_user_email_alerts_enabled(uid, False)
+        await update.message.reply_text("✅ Email alerts: OFF")
+        return
+
+    if arg in ("on", "1", "enable", "enabled"):
+        set_user_email_alerts_enabled(uid, True)
+        await update.message.reply_text("✅ Email alerts: ON")
+        return
+
+    # Otherwise treat as an email address
+    email = context.args[0].strip()
+    if not EMAIL_RE.match(email):
+        await update.message.reply_text(
+            "❌ Invalid email format.\n"
+            "Example: /email you@example.com\n"
+            "Or: /email off"
+        )
+        return
+
+    try:
+        set_user_email(uid, email)
+        set_user_email_alerts_enabled(uid, True)
+
+        await update.message.reply_text(
+            f"✅ Recipient email saved:\n{email}\n\n"
+            "Email alerts are ON.\n"
+            "Test now: /email_test\n"
+            "Turn off any time: /email off"
+        )
+    except Exception as e:
+        logger.exception("email_cmd failed")
+        await update.message.reply_text(f"❌ Failed to save email: {type(e).__name__}: {e}")
+
+
+async def email_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: /email_on
+    context.args = ["on"]
+    await email_cmd(update, context)
+
+async def email_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: /email_off
+    context.args = ["off"]
+    await email_cmd(update, context)
+
+async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+
+    # Always respond immediately
+    await update.message.reply_text("📧 Running email test…")
+
+    # Config checks
+    if not EMAIL_ENABLED:
+        await update.message.reply_text("❌ Email is disabled (EMAIL_ENABLED=False). Turn it on in your config/env.")
+        return
+
+    if not email_config_ok():
+        await update.message.reply_text(
+            "❌ Email config is NOT OK.\n"
+            "Check env vars: EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM.\n"
+            "Tip: run /health_sys and verify Email: enabled/configured."
+        )
+        return
+
+    # Recipient (match your bot’s keys)
+    to_email = (user.get("email_to") or user.get("email") or "").strip()
+    if not to_email:
+        await update.message.reply_text(
+            "❌ No recipient email found for your user.\n"
+            "Set it first, e.g. /email your@email.com"
+        )
+        return
+
+    # Local time (user TZ)
+    tz_name = str(user.get("tz") or "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+        tz_name = "UTC"
+    now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+    subject = "PulseFutures — Email Test ✅"
+    body = (
+        f"{HDR}\n"
+        f"PulseFutures Email Test\n"
+        f"{HDR}\n\n"
+        f"User ID: {uid}\n"
+        f"Recipient: {to_email}\n"
+        f"Time: {now_local} ({tz_name})\n\n"
+        f"If you received this, SMTP is working.\n"
+        f"{HDR}\n"
+    )
+
+    status_msg = await update.message.reply_text("📤 Sending test email…")
+
+    # Clear previous error for clean reporting
+    try:
+        _LAST_SMTP_ERROR.pop(uid, None)
+    except Exception:
+        pass
+
+    # Email test should NOT be blocked by user's email master switch
+    prev_enabled = None
+    try:
+        prev_enabled = int((user or {}).get("email_alerts_enabled", 1))
+        if prev_enabled == 0:
+            update_user(uid, email_alerts_enabled=1)
+    except Exception:
+        prev_enabled = None
+
+    try:
+        # IMPORTANT: pass correct kwargs (avoid arg mis-binding)
+        ok = await _send_email_async(
+            int(EMAIL_SEND_TIMEOUT_SEC),
+            subject,
+            body,
+            user_id_for_debug=uid,
+            enforce_trade_window=False,
+        )
+    except Exception as e:
+        logger.exception("email_test_cmd failed")
+        msg = f"❌ Test email crashed: {type(e).__name__}: {e}"
+        try:
+            await status_msg.edit_text(msg)
+        except Exception:
+            await update.message.reply_text(msg)
+        return
+    finally:
+        # Restore user's email alerts flag if we temporarily changed it
+        try:
+            if prev_enabled is not None and prev_enabled in (0, 1):
+                update_user(uid, email_alerts_enabled=prev_enabled)
+        except Exception:
+            pass
+
+    if ok:
+        try:
+            await status_msg.edit_text(f"✅ Test email SENT to: {to_email}")
+        except Exception:
+            await update.message.reply_text(f"✅ Test email SENT to: {to_email}")
+        return
+
+    # FAILED: show real last smtp error if available
+    err = _LAST_SMTP_ERROR.get(uid) or "unknown_error"
+    await update.message.reply_text(
+        "❌ Test email FAILED.\n"
+        f"Reason: {err}\n\n"
+        "Common causes:\n"
+        "- Gmail: app password / 2FA issues\n"
+        "- Wrong EMAIL_HOST/PORT (465 SSL vs 587 STARTTLS)\n"
+        "- EMAIL_FROM not matching account"
+    )
+
+
+
+async def trade_window_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /trade_window
+    View: /trade_window
+    Set : /trade_window 09:00 17:30
+    Off : /trade_window off
+    """
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not context.args:
+        cur_s = (user.get("trade_window_start") or "").strip()
+        cur_e = (user.get("trade_window_end") or "").strip()
+        if not cur_s or not cur_e:
+            await update.message.reply_text(
+                "🕒 Trade Window (Email Signals)\n"
+                f"{HDR}\n"
+                "Current: OFF (no time restriction)\n\n"
+                "Set: /trade_window 09:00 17:30\n"
+                "Off: /trade_window off"
+            )
+        else:
+            await update.message.reply_text(
+                "🕒 Trade Window (Email Signals)\n"
+                f"{HDR}\n"
+                f"Current: {cur_s} → {cur_e} (local)\n\n"
+                "Change: /trade_window 09:00 17:30\n"
+                "Off: /trade_window off"
+            )
+        return
+
+    if len(context.args) == 1 and context.args[0].strip().lower() in {"off", "disable", "none"}:
+        update_user(uid, trade_window_start="", trade_window_end="")
+        await update.message.reply_text("✅ Trade window is now OFF (emails allowed anytime).")
+        return
+
+    if len(context.args) != 2:
+        await update.message.reply_text("Usage: /trade_window 09:00 17:30  OR  /trade_window off")
+        return
+
+    start_s = context.args[0].strip()
+    end_s = context.args[1].strip()
+
+    try:
+        _parse_hhmm_local(start_s)
+        _parse_hhmm_local(end_s)
+    except Exception:
+        await update.message.reply_text("Invalid time format. Use HH:MM (24h). Example: /trade_window 09:00 17:30")
+        return
+
+    update_user(uid, trade_window_start=start_s, trade_window_end=end_s)
+    await update.message.reply_text(f"✅ Trade window set: {start_s} → {end_s} (local time).")
+
+# =========================================================
+# SESSIONS (user)
+# =========================================================
+def user_enabled_sessions(user: dict) -> List[str]:
+    try:
+        xs = json.loads(user["sessions_enabled"])
+        if isinstance(xs, list) and xs:
+            ordered = _order_sessions(xs)
+            return ordered or ['NY']
+    except Exception:
+        return ['NY']
+
+def _session_label_utc(now_utc: datetime) -> Optional[str]:
+    """
+    Returns NY/LON/ASIA if within their UTC windows (priority NY > LON > ASIA).
+    Returns None if we are in the gap (not in any defined session window).
+    """
+    for name in SESSION_PRIORITY:  # ["NY","LON","ASIA"]
+        w = SESSIONS_UTC[name]
+        sh, sm = parse_hhmm(w["start"])
+        eh, em = parse_hhmm(w["end"])
+        start_utc = now_utc.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_utc = now_utc.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if end_utc <= start_utc:
+            end_utc += timedelta(days=1)
+        if now_utc < start_utc and (start_utc - now_utc) > timedelta(hours=12):
+            start_utc -= timedelta(days=1)
+            end_utc -= timedelta(days=1)
+        if start_utc <= now_utc < end_utc:
+            return name
+    return None
+
+
+def _guess_session_name_utc(now_utc: datetime) -> str:
+    """Backward-compatible alias for scan-session fallback logic."""
+    return scan_session_name_utc(now_utc)
+
+
+def in_session_now(user: dict) -> Optional[dict]:
+    tz = ZoneInfo(user["tz"])
+    now_local = datetime.now(tz)
+    now_utc = now_local.astimezone(timezone.utc)
+
+    # NEW: unlimited mode => always return a session key and bypass session gating
+    # In this mode, email setups are allowed 24/7 (subject to caps & gap).
+    if int(user.get("sessions_unlimited", 0) or 0) == 1:
+        name = "UNLIMITED"
+        session_key = f"{now_utc.strftime('%Y-%m-%d')}_{name}"
+        return {
+            "name": name,
+            "session_key": session_key,
+            "start_utc": now_utc,
+            "end_utc": now_utc,
+            "now_local": now_local,
+        }
+
+    enabled = user_enabled_sessions(user)
+    for name in enabled:
+        w = SESSIONS_UTC[name]
+        sh, sm = parse_hhmm(w["start"])
+        eh, em = parse_hhmm(w["end"])
+        start_utc = now_utc.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_utc = now_utc.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if end_utc <= start_utc:
+            end_utc += timedelta(days=1)
+        if now_utc < start_utc and (start_utc - now_utc) > timedelta(hours=12):
+            start_utc -= timedelta(days=1)
+            end_utc -= timedelta(days=1)
+        if start_utc <= now_utc < end_utc:
+            session_key = f"{start_utc.strftime('%Y-%m-%d')}_{name}"
+            return {
+                "name": name,
+                "session_key": session_key,
+                "start_utc": start_utc,
+                "end_utc": end_utc,
+                "now_local": now_local,
+            }
+    return None
+
+
+
+import difflib
+
+import base64
+import tempfile
+
+# =========================================================
+# UNKNOWN COMMAND + "DID YOU MEAN" SUGGESTION (ALL USERS)
+# =========================================================
+
+KNOWN_COMMANDS = sorted(set([
+    # Help
+    "help", "help_admin",
+
+    # Market scan
+    "screen",
+
+    # Position sizing / risk
+    "size", "riskmode", "dailycap",
+
+    # Trade journal & equity
+    "equity", "equity_reset",
+    "trade_open", "trade_sl", "trade_rf", "trade_close",
+
+    # Status
+    "status",
+
+    # Limits
+    "limits",
+
+    # Sessions
+    "sessions", "sessions_on", "sessions_off", "sessions_on_unlimited", "sessions_off_unlimited",
+
+    # Email alerts
+    "notify_on", "notify_off",
+    "trade_window",
+    "email_test", "email_decision",
+    "bigmove_alert",
+
+    # Cooldowns (user)
+    "cooldowns", "cooldown",
+
+    # Reports
+    "report_daily", "report_weekly", "report_overall",
+    "signals_daily", "signals_weekly",
+
+    # System health
+    "health", "health_sys",
+
+    # AutoTrade (admin)
+    "open_trades", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_debug_reset", "autotrade_report_overall", "autotrade_sessions",
+
+    # Admin diagnostics / optimization
+    "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
+    "signal_report", "signal_report_overall", "email_decision",
+    "params_show", "params_set", "params_reset", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report",
+
+    # Timezone
+    "tz",
+
+    # Billing / plan / support
+    "myplan", "billing", "support",
+
+    # USDT user
+    "usdt", "usdt_paid",
+
+    # Admin cooldown controls
+    "cooldown_clear", "cooldown_clear_all",
+
+    # Admin data/recovery
+    "reset", "restore",
+
+    # USDT admin
+    "usdt_pending", "usdt_approve", "usdt_reject",
+
+    # Payments & access admin
+    "admin_user", "admin_users", "admin_payments",
+    "admin_grant", "admin_revoke",
+]))
+
+def _normalize_cmd(text: str) -> str:
+    s = (text or "").strip()
+    if not s.startswith("/"):
+        return ""
+    s = s[1:]  # remove "/"
+    if " " in s:
+        s = s.split(" ", 1)[0]
+    if "@" in s:
+        s = s.split("@", 1)[0]
+    return s.lower()
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update or not update.message:
+        return
+
+    raw = update.message.text or ""
+    cmd = _normalize_cmd(raw)
+    if not cmd:
+        return
+
+    # Suggest closest command
+    matches = difflib.get_close_matches(cmd, KNOWN_COMMANDS, n=1, cutoff=0.62)
+    suggestion = matches[0] if matches else ""
+
+    if suggestion:
+        msg = (
+            "❌ *Unknown command*\n\n"
+            f"Did you mean: `/{suggestion}` ?\n\n"
+            "Type /help to see all commands."
+        )
+    else:
+        msg = (
+            "❌ *Unknown command*\n\n"
+            "Please check the spelling.\n"
+            "Type /help to see all commands."
+        )
+
+    try:
+        await update.message.reply_text(
+            msg,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        # plain text fallback
+        if suggestion:
+            await update.message.reply_text(
+                f"❌ Unknown command\n\nDid you mean: /{suggestion} ?\n\nType /help to see all commands."
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Unknown command\n\nPlease check the spelling.\nType /help to see all commands."
+            )
+
+
+
+# =========================================================
+# RISK
+# =========================================================
+def _prefer_live_equity_for_user(user: dict | None = None) -> bool:
+    try:
+        uid = int((user or {}).get("user_id") or 0)
+    except Exception:
+        uid = 0
+    if uid <= 0 or not is_admin_user(uid):
+        return False
+    return bool(AUTOTRADE_ENABLED) and str(AUTOTRADE_MODE).lower() == "live"
+
+
+def compute_risk_usd(user: dict, mode: str, value: float) -> float:
+    mode = str(mode or "").upper()
+    if mode == "USD":
+        return max(0.0, float(value))
+    eq = _effective_equity_for_risk(user, prefer_live=_prefer_live_equity_for_user(user))
+    if eq <= 0:
+        return 0.0
+    return _risk_amount_from_pct(eq, float(value))
+
+def calc_qty(entry: float, sl: float, risk_usd: float) -> float:
+    d = abs(entry - sl)
+    if entry <= 0 or d <= 0 or risk_usd <= 0:
+        return 0.0
+    return risk_usd / d
+
+def entry_sanity_check(entry: float, current: float) -> Tuple[Optional[str], bool]:
+    """
+    Returns (warning_message, severe_flag).
+    - warning_message is None if entry looks normal.
+    - severe_flag True means it's extremely off and should be blocked unless user confirms.
+    """
+    try:
+        e = float(entry)
+        c = float(current)
+    except Exception:
+        return ("⚠️ Entry sanity check: could not compare entry vs current price.", False)
+
+    if c <= 0 or e <= 0:
+        return ("⚠️ Entry sanity check: entry/current must be positive.", True)
+
+    diff_pct = abs(e - c) / c * 100.0
+    ratio = e / c
+
+    # Detect common decimal-shift mistakes (x10 or /10)
+    dec_shift = ""
+    if 8.0 <= ratio <= 12.5:
+        dec_shift = " (looks like ~x10 higher — possible decimal mistake)"
+    elif 0.08 <= ratio <= 0.125:
+        dec_shift = " (looks like ~x10 lower — possible decimal mistake)"
+
+    # Tune thresholds here
+    WARN_PCT = 15.0
+    SEVERE_PCT = 40.0
+
+    if diff_pct < WARN_PCT:
+        return (None, False)
+
+    if diff_pct >= SEVERE_PCT:
+        msg = (
+            f"🚨 ENTRY PRICE LOOKS WRONG\n"
+            f"- Current: {fmt_price(c)}\n"
+            f"- Entered: {fmt_price(e)}\n"
+            f"- Difference: {diff_pct:.1f}%{dec_shift}\n"
+            f"Double-check your entry value."
+        )
+        return (msg, True)
+
+    msg = (
+        f"⚠️ Entry looks unusual vs current price\n"
+        f"- Current: {fmt_price(c)}\n"
+        f"- Entered: {fmt_price(e)}\n"
+        f"- Difference: {diff_pct:.1f}%{dec_shift}\n"
+        f"Please double-check."
+    )
+    return (msg, False)
+
+
+def daily_cap_usd(user: dict) -> float:
+    mode = str(user.get("daily_cap_mode", DEFAULT_DAILY_CAP_MODE) or DEFAULT_DAILY_CAP_MODE).upper()
+    val = float(user.get("daily_cap_value", DEFAULT_DAILY_CAP_VALUE) or DEFAULT_DAILY_CAP_VALUE)
+    if mode == "USD":
+        return max(0.0, val)
+    eq = _effective_equity_for_risk(user, prefer_live=_prefer_live_equity_for_user(user))
+    if eq <= 0:
+        return 0.0
+    return _risk_amount_from_pct(eq, val)
+
+# =========================================================
+# REPORTING / ADVICE
+# =========================================================
+def _stats_from_trades(trades: List[dict]) -> dict:
+    closed = [t for t in trades if t.get("closed_ts") is not None and t.get("pnl") is not None]
+    wins = [t for t in closed if float(t["pnl"]) > 0]
+    losses = [t for t in closed if float(t["pnl"]) < 0]
+    net = sum(float(t["pnl"]) for t in closed) if closed else 0.0
+    denom = (len(wins) + len(losses))
+    win_rate = (len(wins) / denom * 100.0) if denom else 0.0
+    avg_r = None
+    r_vals = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
+    if r_vals:
+        avg_r = sum(r_vals) / len(r_vals)
+    biggest_loss = min((float(t["pnl"]) for t in closed), default=0.0)
+    biggest_win = max((float(t["pnl"]) for t in closed), default=0.0)
+    return {
+        "closed_n": len(closed),
+        "wins": len(wins),
+        "losses": len(losses),
+        "net": net,
+        "win_rate": win_rate,
+        "avg_r": avg_r,
+        "biggest_loss": biggest_loss,
+        "biggest_win": biggest_win,
+    }
+
+def _advice(user: dict, stats: dict) -> List[str]:
+    adv = []
+    if stats["closed_n"] < 5:
+        adv.append("📌 Not enough data yet: close at least 5–10 trades for meaningful statistics.")
+    if stats["win_rate"] < 45 and stats["closed_n"] >= 5:
+        adv.append("⚠️ Low win rate detected: reduce trade frequency and only take high-confidence setups.")
+    if stats["avg_r"] is not None and stats["avg_r"] < 0.2 and stats["closed_n"] >= 5:
+        adv.append("⚠️ Low R-multiple: stop-loss may be too tight or profits are taken too early.")
+    if stats["biggest_loss"] < -0.9 * max(1.0, float(user["equity"]) * 0.01):
+        adv.append("🛑 A large loss detected: review stop-loss execution and slippage/re-entry discipline.")
+    if int(user["max_trades_day"]) <= 5:
+        adv.append("✅ Daily trade limits help prevent overtrading. Focus only on top-quality setups.")
+    return adv[:6]
+
+
+
+# =========================================================
+# USDT Payment
+# =========================================================
+
+async def usdt_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage:\n/usdt_paid <TXID> <standard|pro>"
+        )
+        return
+
+    txid, plan = context.args
+    plan = plan.lower()
+
+    if plan not in ("standard", "pro"):
+        await update.message.reply_text("Plan must be 'standard' or 'pro'")
+        return
+
+    if not is_valid_txid(txid):
+        await update.message.reply_text("❌ Invalid TXID format.")
+        return
+
+    if usdt_txid_exists(txid):
+        await update.message.reply_text("⚠️ This TXID has already been used.")
+        return
+
+    save_usdt_payment(
+        update.effective_user.id,
+        update.effective_user.username,
+        txid,
+        plan
+    )
+
+    await update.message.reply_text(
+        "✅ Payment submitted.\n"
+        "Status: Pending admin approval."
+    )
+
+    await context.bot.send_message(
+        chat_id=int(os.getenv("USDT_ADMIN_CHAT_ID")),
+        text=(
+            "🧾 New USDT payment request\n\n"
+            f"User: @{update.effective_user.username}\n"
+            f"Plan: {plan.upper()}\n"
+            f"TXID: {txid}\n\n"
+            f"Approve with:\n"
+            f"/usdt_approve {txid}"
+        )
+    )
+
+
+def approve_usdt(txid: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE usdt_payments
+        SET status = 'APPROVED'
+        WHERE txid = ?
+    """, (txid,))
+    conn.commit()
+    conn.close()
+
+async def usdt_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != int(os.getenv("USDT_ADMIN_CHAT_ID")):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /usdt_approve <TXID>")
+        return
+
+    txid = context.args[0]
+
+    approve_usdt(txid)
+
+    await update.message.reply_text("✅ USDT payment approved.")
+
+    # 🔑 ACCESS GRANT HOOK
+    # TODO:
+    # grant_standard_access(user_id)
+    # grant_pro_access(user_id)
+
+# =========================================================
+# HELP TEXT (USER)
+# =========================================================
+
+def build_help_text() -> str:
+    return f"""🚀 PulseFutures — Trading System in Telegram
+────────────────────
+Core Commands
+────────────────────
+/screen
+• Scan the market for high-quality setups
+
+/status
+• Unified status: plan, day window, risk, position counts, carried risk, and open positions
+
+/commands
+• Full command guide + examples
+
+/guide_full
+• Download the full user guide (PDF)
+
+────────────────────
+Today / Risk model
+────────────────────
+• Your day uses your timezone + /dayreset anchor
+• Opened today = positions opened inside your active day window
+• Closed today = positions closed inside your active day window
+• Carried from prior day = positions still open now but opened before today
+• Live open risk charged today = open risk currently counted against today's cap
+• Daily risk used today = live open risk charged today + realised losses booked today
+
+────────────────────
+💎 Plans
+────────────────────
+🟢 Standard — Telegram only
+🔵 Pro — Telegram + Email alerts
+🎁 New users get a 7-day Pro trial automatically.
+
+🤖 Bot: @PulseFuturesBot
+📢 Updates: @PulseFutures
+🆘 Support: @PulseFuturesSupport
+"""
+
+
+def build_commands_text() -> str:
+    return f"""📘 PulseFutures — Command Guide & Examples
+
+PulseFutures is a full trading system inside Telegram.
+Below are the key commands with simple examples.
+
+────────────────────
+Core Commands
+────────────────────
+/status
+• Unified status: day window, opened/closed today, open positions now, carried exposure, risk, and daily cap
+
+/health
+• Bot & data health check 
+
+────────────────────
+Market & Signals 
+────────────────────
+/screen
+• Scans the market for high-quality setups
+
+/setups_log <n> <screen|email|all>
+• Shows recently generated setups saved by the bot
+• Example: /setups_log 20 all
+
+/why
+• Shows why the last scan rejected symbols
+
+/email_decision
+• Shows the latest email-pipeline decision and loop health
+
+────────────────────
+⚖️ RISK & POSITION SIZING
+────────────────────
+/equity
+• Set your equity
+
+/dailycap
+• Set your TOTAL daily risk cap for your anchored trading day
+
+/riskmode
+• Set your risk per trade (used by /size)
+
+/size <symbol> <side> <entry> <sl>
+• Calculates position size based on your per-trade risk
+• /status shows current-day risk, live cap-charged risk, carried risk, and remaining daily risk for new trades
+
+────────────────────
+Trade Journal
+────────────────────
+/trade_open
+• Log an opened position
+
+/trade_sl
+• Update Stop Loss
+
+/trade_rf
+• Risk-Free a position
+
+/trade_close
+• Log a closed position
+
+/trade_id_reset
+• Reset your Trade ID numbering (next trade starts from 1)
+
+────────────────────
+🕒 SESSION CONTROL
+────────────────────
+/sessions
+• View your session settings
+
+/sessions_on <ASIA|LON|NY>
+/sessions_off <ASIA|LON|NY>
+• Enable/disable sessions
+
+/sessions_on_unlimited
+/sessions_off_unlimited
+• 24-hour mode for scans
+
+/trade_window
+• Set allowed trading time window 
+
+────────────────────
+⚠️ EMAILS & ALERTS
+────────────────────
+/email you@gmail.com
+• Set your email for alerts
+
+/email_test
+• Send a test email to confirm delivery
+
+/email on
+• Enable email
+
+/email off
+• Disable email
+
+/limits emailcap 
+• Set number of emails per session
+
+/limits emailgap
+• Set min gap between emails 
+
+/limits emaildaycap 
+• Set max number of emails per day
+
+/bigmove_alert on|off [4H%] [1H%]
+• Big move alerts in either direction (UP or DOWN)
+
+────────────────────
+⏰ TIMEZONE (LOCAL TIME IN EMAILS)
+────────────────────
+/tz
+• Show your current timezone
+
+/tz <Region/City>
+• Set your timezone so emails and day-based stats use your local zone
+• Use IANA format: Region/City
+
+/dayreset
+• Show your active daily reset anchor
+
+/dayreset <HH:MM>
+• Set when your local trading day starts for risk/P&L/trade counters
+
+Examples:
+/tz Australia/Melbourne
+/tz Asia/Dubai   
+/tz Europe/London
+/tz America/New_York
+/dayreset 07:00
+
+────────────────────
+Reports 
+────────────────────
+/report_daily 
+• Daily performance report 
+
+/report_weekly 
+• Weekly performance report 
+
+/report_overall 
+• All-time performance report 
+
+/performance_report
+• Actual autotrade performance trend (exchange/journal based)
+
+────────────────────
+🆘 HELP & SUPPORT
+────────────────────
+/help
+• Quick overview
+
+/commands
+• Full guide (this)
+
+/guide_full
+• Download the full user guide (PDF)
+
+/Support
+• Submit your support request
+
+────────────────────
+📢 Channels
+────────────────────
+Channel: @PulseFutures
+Support: @PulseFuturesSupport
+YouTube: @PulseFutures
+Website: https://pulsefutures.com/
+
+"""
+
+
+ADMIN_HELP_DESCRIPTIONS = {
+    "admin_user": "View full user record (plan, trial, alerts, settings)",
+    "admin_users": "List users (overview)",
+    "admin_grant": "Grant or change user plan",
+    "admin_revoke": "Revoke paid access (sets to FREE)",
+    "admin_payments": "Show recent payment approvals and current plans",
+    "payment_approve": "Approve a payment (Stripe or USDT) and grant access",
+    "myplan": "View your own plan status (admins too)",
+    "billing": "Subscription and payment surface",
+    "support_open": "Open a support ticket as admin",
+    "support_close": "Close a support ticket as admin",
+    "health_sys": "Admin engine health summary",
+    "health": "General bot and data health",
+    "why": "Last scan reject reasons",
+    "edge_status": "Learning / optimizer / execution assurance view with synced signal WR",
+    "learning_status": "Detailed learning and optimizer status with synced signal WR",
+    "optimizer_status": "Alias of /learning_status",
+    "winrate": "Overall and last-7-days completed signal WR",
+    "ny_winrate": "Overall NY completed signal WR",
+    "lessons_learned": "Latest learning takeaways",
+    "email_decision": "Last email pipeline decision",
+    "email_pipeline_status": "Alias of /email_decision for email pipeline visibility",
+    "signal_report": "Recent emailed setup outcomes",
+    "signal_report_overall": "Overall emailed-signal outcome summary (WR, R, session split)",
+    "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
+    "autotrade_debug_reset": "Clear AutoTrade debug state",
+    "autotrade_last": "Show last autotrade attempt details",
+    "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows)",
+    "autotrade_report_overall": "AutoTrade overall performance summary",
+    "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
+    "autotrade_sessions": "Show or set allowed auto-trade sessions",
+    "open_trades": "Show live open Bybit positions",
+    "cooldown_clear": "Clear cooldown for one symbol + side",
+    "cooldown_clear_all": "Clear all cooldowns",
+    "admin_reset_report": "Archive signals/outcomes and reset live performance report",
+    "admin_reset_signal_reports": "Hard reset report-related tables",
+    "reset": "Reset bot data / clean DB (dangerous)",
+    "restore": "Restore from latest DB backup",
+    "params_show": "Show active strategy parameters",
+    "params_set": "Update one strategy parameter",
+    "params_reset": "Reset strategy parameters to defaults",
+    "optimize": "Manual optimizer entrypoint (intentionally informational)",
+    "optimize_report": "Show last saved optimization report",
+    "self_optimize": "Explain autonomous optimizer mode",
+    "self_optimize_stop": "Explain why manual stop is disabled",
+    "self_optimize_report": "Show latest autonomous optimization result",
+    "autopilot_report": "Alias of /self_optimize_report with multi-window autopilot details",
+    "autopilot_status": "Alias of /learning_status",
+    "trade_id_reset": "Reset your own Trade ID numbering",
+}
+
+ADMIN_HELP_GROUPS = [
+    ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
+    ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
+    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log"]),
+    ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
+    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "autotrade_sessions", "open_trades"]),
+    ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
+    ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
+]
+
+
+def _registered_command_names_from_source() -> set[str]:
+    try:
+        src = inspect.getsource(main)
+        found = re.findall(r'CommandHandler\("([^\"]+)"', src)
+        return {str(x).strip() for x in found if str(x).strip()}
+    except Exception:
+        return set()
+
+
+def build_help_text_admin() -> str:
+    registered = _registered_command_names_from_source()
+    lines = [
+        "🛠 PulseFutures — Admin Command Guide",
+    ]
+
+    for title, commands in ADMIN_HELP_GROUPS:
+        visible = [c for c in commands if (not registered or c in registered)]
+        if not visible:
+            continue
+        lines.extend(["", "────────────────────", title, "────────────────────"])
+        for cmd in visible:
+            desc = ADMIN_HELP_DESCRIPTIONS.get(cmd, "Registered admin command")
+            lines.append(f"/{cmd}")
+            lines.append(f"• {desc}")
+            lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+HELP_TEXT = build_help_text()
+
+COMMANDS_TEXT = build_commands_text()
+
+# =========================================================
+# HELP TEXT (ADMIN)
+# =========================================================
+
+HELP_TEXT_ADMIN = build_help_text_admin()
+
+def build_help_html(title: str, sections: list) -> str:
+    """
+    sections: [{"name": str, "rows": [...]}, ...]
+    Produces HTML message with <pre> monospace tables.
+    """
+    parts = [f"📘 <b>{html.escape(title)}</b>"]
+    for sec in sections:
+        parts.append(f"\n<b>• {html.escape(sec['name'])}</b>")
+        table = _format_help_table(sec["rows"])
+        parts.append(f"<pre>{html.escape(table)}</pre>")
+    return "\n".join(parts)
+
+
+# =========================================================
+# TELEGRAM COMMANDS
+# =========================================================
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Plain text help (no tables, no HTML builder)
+    await send_long_message(
+        update,
+        build_help_text(),
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
+
+async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Full command guide with examples
+    await send_long_message(
+        update,
+        build_commands_text(),
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
+
+
+
+
+async def guide_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Sends the full PulseFutures User Guide as a PDF document in Telegram.
+    """
+    try:
+        # The PDF should be committed to the repo alongside the bot code.
+        pdf_name = "PulseFutures_User_Guide.pdf"
+        pdf_path = pdf_name
+        if not os.path.exists(pdf_path):
+            # Fallback to the directory of this script (Render runs from /opt/render/project/src)
+            try:
+                pdf_path = os.path.join(os.path.dirname(__file__), pdf_name)
+            except Exception:
+                pdf_path = pdf_name
+
+        if not os.path.exists(pdf_path):
+            await update.message.reply_text("❌ PDF guide file is not available right now.")
+            return
+
+        caption = "📘 PulseFutures — Full User Guide (PDF)"
+        with open(pdf_path, "rb") as fh:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=fh,
+                filename=pdf_name,
+                caption=caption,
+            )
+    except Exception:
+        await update.message.reply_text("❌ Could not send the guide. Please try again.")
+
+async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+
+    await send_long_message(
+        update,
+        build_help_text_admin(),
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start — must never crash.
+
+    Rules:
+    - Any Telegram user can start the bot (after joining your channel you can optionally check elsewhere).
+    - New users get a 7-day trial automatically on first /start.
+    - If trial expired (and no paid plan), show upgrade message.
+    """
+    uid = update.effective_user.id
+
+    # Ensure DB schema is migrated before touching plan/trial columns
+    try:
+        ensure_email_column()   # includes ensure_billing_columns()
+    except Exception:
+        try:
+            ensure_billing_columns()
+        except Exception:
+            pass
+
+    # Ensure user row exists
+    try:
+        user = get_user(uid) or {}
+    except Exception as e:
+        logger.exception("/start get_user failed for uid=%s: %s", uid, e)
+        try:
+            await update.message.reply_text("❌ Internal error creating your account. Please try again.")
+        except Exception:
+            pass
+        return
+
+    # Start 7-day trial ONCE (only if currently free)
+    try:
+        ensure_trial_started(uid, user, force=True)
+    except Exception as e:
+        # One more attempt after re-migrating (covers older DBs missing columns)
+        logger.exception("/start ensure_trial_started failed for uid=%s: %s", uid, e)
+        try:
+            ensure_email_column()
+        except Exception:
+            try:
+                ensure_billing_columns()
+            except Exception:
+                pass
+        try:
+            user = get_user(uid) or {}
+            ensure_trial_started(uid, user, force=True)
+        except Exception as e2:
+            logger.exception("/start ensure_trial_started retry failed for uid=%s: %s", uid, e2)
+            try:
+                await update.message.reply_text("❌ Internal error starting your trial. Please try again.")
+            except Exception:
+                pass
+            return
+
+    # Refresh and gate access
+    try:
+        user = get_user(uid) or {}
+    except Exception:
+        user = user or {}
+
+    if not has_active_access(uid, user):
+        try:
+            await update.message.reply_text(
+                f"⛔️ Access locked.\n\n"
+                f"Your 7-day free trial has ended.\n\n"
+                f"To continue, choose a plan:\n"
+                f"• Standard — $49/month\n"
+                f"• Pro — $99/month\n\n"
+                f"👉 /billing\n\n"
+                f"📣 Optional updates: {REQUIRED_CHANNEL_PUBLIC_URL}"
+            )
+        except Exception:
+            pass
+        return
+
+    await cmd_help(update, context)
+
+
+# =========================================================
+# SUPPORT SYSTEM
+# =========================================================
+
+# Support notifications:
+# - Admin IDs always receive tickets
+# - Optionally forward to a dedicated support group/channel where the bot is admin:
+#     Set SUPPORT_CHAT_ID="-1001234567890"
+SUPPORT_CHAT_ID = os.getenv("SUPPORT_CHAT_ID", "").strip()
+
+def _admin_ids_all() -> List[int]:
+    ids = set()
+    # ADMIN_IDS is used in many places
+    try:
+        for x in (ADMIN_IDS or []):
+            try:
+                ids.add(int(x))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # ADMIN_USER_IDS (legacy)
+    try:
+        for x in (ADMIN_USER_IDS or []):
+            try:
+                ids.add(int(x))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Single env fallbacks
+    for k in ("ADMIN_TELEGRAM_ID", "OWNER_USER_ID", "ADMIN_ID"):
+        v = os.getenv(k, "").strip()
+        if v:
+            try:
+                ids.add(int(v))
+            except Exception:
+                pass
+    return sorted(ids)
+
+def _support_db_init() -> None:
+    con = None
+    try:
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                ticket_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                username TEXT,
+                message TEXT,
+                status TEXT,
+                created_ts REAL,
+                updated_ts REAL
+            )
+        """)
+        con.commit()
+    except Exception:
+        try:
+            if con:
+                con.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            if con:
+                con.close()
+        except Exception:
+            pass
+
+def _support_ticket_create(ticket_id: str, user_id: int, username: str, message: str):
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    ts = time.time()
+    cur.execute("""
+        INSERT OR REPLACE INTO support_tickets (ticket_id, user_id, username, message, status, created_ts, updated_ts)
+        VALUES (?, ?, ?, ?, 'OPEN', ?, ?)
+    """, (str(ticket_id), int(user_id), str(username or ""), str(message or ""), float(ts), float(ts)))
+    con.commit()
+    con.close()
+
+def _support_ticket_latest_for_user(user_id: int) -> Optional[dict]:
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM support_tickets WHERE user_id=? ORDER BY created_ts DESC LIMIT 1", (int(user_id),))
+    r = cur.fetchone()
+    con.close()
+    return dict(r) if r else None
+
+def _support_ticket_list_open(limit: int = 20) -> List[dict]:
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM support_tickets WHERE status='OPEN' ORDER BY created_ts DESC LIMIT ?", (int(limit),))
+    rows = cur.fetchall() or []
+    con.close()
+    return [dict(x) for x in rows]
+
+def _support_ticket_set_status(ticket_id: str, status: str):
+    _support_db_init()
+    con = db_connect()
+    cur = con.cursor()
+    ts = time.time()
+    cur.execute("UPDATE support_tickets SET status=?, updated_ts=? WHERE ticket_id=?", (str(status), float(ts), str(ticket_id)))
+    con.commit()
+    con.close()
+
+async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n/support <your issue>"
+        )
+        return
+
+    issue = " ".join(context.args).strip()
+    if not issue:
+        await update.message.reply_text(
+            "Usage:\n/support <your issue>"
+        )
+        return
+
+    ticket_id = f"TKT-{uid}-{int(time.time())}"
+    username = getattr(update.effective_user, "username", "") or ""
+
+    _support_ticket_create(ticket_id, uid, username, issue)
+
+    msg = (
+        f"🆘 Support Ticket {ticket_id}\n\n"
+        f"User: {uid} @{username}\n"
+        f"Message:\n{issue}"
+    )
+
+    # Notify admins
+    for admin in _admin_ids_all():
+        try:
+            await context.bot.send_message(admin, msg)
+        except Exception:
+            pass
+
+    # Optional: forward to a dedicated support group/channel
+    if SUPPORT_CHAT_ID:
+        try:
+            await context.bot.send_message(chat_id=SUPPORT_CHAT_ID, text=msg)
+        except Exception:
+            pass
+
+    await update.message.reply_text(
+        f"✅ Ticket created: {ticket_id}\n"
+        "Use /support_status to check progress."
+    )
+
+
+async def support_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    t = _support_ticket_latest_for_user(uid)
+
+    if not t:
+        await update.message.reply_text(
+            "📨 You have no support tickets yet. Use /support <your issue>."
+        )
+        return
+
+    status = str(t.get("status") or "OPEN").upper()
+    tid = str(t.get("ticket_id") or "")
+
+    await update.message.reply_text(
+        f"📨 Latest ticket: {tid}\n"
+        f"Status: {status}\n\n"
+        "If you need to add more info, create a new ticket with /support <your issue>."
+    )
+
+
+
+async def admin_support_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("Admin only.")
+        return
+
+    rows = _support_ticket_list_open(limit=30)
+    if not rows:
+        await update.message.reply_text("✅ No open support tickets.")
+        return
+
+    lines = ["🧾 Open support tickets", HDR]
+    for r in rows:
+        tid = r.get("ticket_id")
+        u = r.get("user_id")
+        un = r.get("username") or ""
+        msg = (r.get("message") or "").strip().replace("\n", " ")
+        if len(msg) > 80:
+            msg = msg[:77] + "..."
+        lines.append(f"- {tid} | {u} @{un} | {msg}")
+    lines.append(HDR)
+    lines.append("Close: /support_close <TICKET_ID>")
+    await send_long_message(update, "\n".join(lines), parse_mode=None, disable_web_page_preview=True)
+
+async def admin_support_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage:\n/support_close <TICKET_ID>")
+        return
+    tid = str(context.args[0]).strip()
+    _support_ticket_set_status(tid, "CLOSED")
+    await update.message.reply_text(f"✅ Closed: {tid}")
+
+
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    smtp_err = _LAST_SMTP_ERROR.get(uid, "")
+    msg = [
+        "🫀 PulseFutures Health",
+        HDR,
+        f"User TZ: {user['tz']}",
+        f"Email Engine: {'ACTIVE' if EMAIL_ENABLED and email_config_ok() else 'OFF/NOT CONFIGURED'}",
+        f"SMTP last error: {smtp_err if smtp_err else '-'}",
+        HDR,
+    ]
+    await update.message.reply_text("\n".join(msg).strip())
+
+
+
+async def diag_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /diag_on [friendly|off]
+    Non-admin can only choose friendly/off. Admin always full.
+    """
+    uid = update.effective_user.id
+    if is_admin_user(uid):
+        _USER_DIAG_MODE[uid] = "full"
+        await update.message.reply_text("✅ Diagnostics: FULL (admin).")
+        return
+
+    mode = (context.args[0].strip().lower() if context.args else "friendly")
+    if mode not in {"friendly", "off"}:
+        await update.message.reply_text("Usage: /diag_on friendly  OR  /diag_on off")
+        return
+    _USER_DIAG_MODE[uid] = mode
+    await update.message.reply_text(f"✅ Diagnostics set to: {mode}")
+
+async def diag_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /diag_off  -> hides diagnostics for this user (non-admin).
+    """
+    uid = update.effective_user.id
+    if is_admin_user(uid):
+        await update.message.reply_text("✅ Admin diagnostics همیشه FULL است.")
+        return
+    _USER_DIAG_MODE[uid] = "off"
+    await update.message.reply_text("✅ Diagnostics: OFF")
+
+async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not context.args:
+        await update.message.reply_text(
+            f"Your TZ: {user['tz']}\n\n"
+            "Set your timezone (IANA format Region/City):\n"
+            "• /tz Australia/Melbourne\n"
+            "• /tz Asia/Dubai (UAE)\n"
+            "• /tz Europe/London\n"
+            "• /tz America/New_York"
+        )
+        return
+    tz_name = " ".join(context.args).strip()
+    try:
+        ZoneInfo(tz_name)
+    except Exception:
+        await update.message.reply_text(
+            "Invalid timezone. Use Region/City, for example:\n"
+            "• /tz Australia/Melbourne\n"
+            "• /tz Asia/Dubai (UAE)\n"
+            "• /tz Europe/London\n"
+            "• /tz America/New_York"
+        )
+        return
+    sessions = ['NY']
+    update_user(uid, tz=tz_name, sessions_enabled=json.dumps(sessions))
+    await update.message.reply_text(f"✅ TZ set to {tz_name}\nDefault sessions updated. Use /sessions to view.")
+
+async def dayreset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+    current = _user_day_reset_hhmm(user)
+    if not context.args:
+        await update.message.reply_text(
+            f"Your daily reset anchor: {current} ({user.get('tz','UTC')})\n\n"
+            "Set with: /dayreset HH:MM\n"
+            "Examples:\n"
+            "• /dayreset 00:00\n"
+            "• /dayreset 07:00\n"
+            "• /dayreset 21:30"
+        )
+        return
+
+    raw = str(context.args[0]).strip()
+    if not re.fullmatch(r"\d{1,2}:\d{2}", raw):
+        await update.message.reply_text("Invalid time. Use HH:MM in 24h format, for example /dayreset 07:00")
+        return
+    h, m = _parse_anchor_hhmm(raw)
+    anchor = f"{h:02d}:{m:02d}"
+    update_user(uid, day_reset_hhmm=anchor)
+    user = reset_daily_if_needed(get_user(uid) or {})
+    start_local, end_local, tz_name = _user_today_window(user)
+    await update.message.reply_text(
+        f"✅ Daily reset anchor set to {anchor} ({tz_name}).\n"
+        f"Active trading day: {start_local.strftime('%Y-%m-%d %H:%M')} → {end_local.strftime('%Y-%m-%d %H:%M')} {tz_name}"
+    )
+
+
+async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+
+    # ✅ Admin: /equity is LIVE-synced with Bybit (same as /status)
+    if not context.args:
+        if is_admin_user(int(uid)):
+            live_eq = _live_equity_usdt()
+            if live_eq is not None:
+                eq = float(live_eq)
+                try:
+                    update_user(int(uid), equity=eq)
+                except Exception:
+                    pass
+                await update.message.reply_text(f"Equity (Bybit): ${eq:.2f}")
+                return
+
+        await update.message.reply_text(f"Equity: ${float(user.get('equity') or 0.0):.2f}")
+        return
+
+    # ✅ Non-admins: manual equity setting (used for /size and journaling)
+    if is_admin_user(int(uid)):
+        await update.message.reply_text(
+            "Admin equity is LIVE-synced with Bybit.\n"
+            "Manual override is disabled for Admin.\n\n"
+            "Tip: If you want manual equity, switch AutoTrade to paper or disable live sync."
+        )
+        return
+
+    try:
+        eq = float(context.args[0])
+        if eq < 0:
+            raise ValueError()
+        update_user(int(uid), equity=eq)
+        await update.message.reply_text(f"✅ Equity set: ${eq:.2f}")
+    except Exception:
+        await update.message.reply_text("Usage: /equity 1000")
+async def equity_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_user(uid, equity=0.0)
+    await update.message.reply_text("✅ Equity reset to $0.00")
+
+
+async def riskmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    # This is PER-TRADE risk used by /size (position sizing).
+    if len(context.args) != 2:
+        mode = str(user.get("risk_mode", DEFAULT_RISK_MODE)).upper()
+        val = float(user.get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
+        per_trade_usd = compute_risk_usd(user, mode, val)
+        await update.message.reply_text(
+            f"Risk per trade (used by /size): {mode} {val:.2f} (≈ ${per_trade_usd:.2f} per trade)\n"
+            f"Daily risk cap is separate: /dailycap\n\n"
+            "Set examples:\n"
+            "• /riskmode pct 2.5\n"
+            "• /riskmode usd 25"
+        )
+        return
+
+    mode = context.args[0].strip().upper()
+    try:
+        val = float(context.args[1])
+    except Exception:
+        await update.message.reply_text("Usage: /riskmode pct 2.5  OR  /riskmode usd 25")
+        return
+
+    if mode not in {"PCT", "USD"}:
+        await update.message.reply_text("Mode must be pct or usd")
+        return
+    if mode == "PCT" and not (0.0 <= val <= 10):
+        await update.message.reply_text("pct per-trade should be between 0 and 10")
+        return
+    if mode == "USD" and val < 0:
+        await update.message.reply_text("usd per-trade must be >= 0")
+        return
+
+    update_user(uid, risk_mode=mode, risk_value=val)
+    user = get_user(uid)
+    per_trade_usd = compute_risk_usd(user, mode, val)
+    await update.message.reply_text(
+        f"✅ Risk per trade updated: {mode} {val:.2f} (≈ ${per_trade_usd:.2f} per trade)\n"
+        f"Daily cap is separate: /dailycap"
+    )
+
+async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    # This is TOTAL DAILY risk cap (sum of open risks for today's trades).
+    if len(context.args) != 2:
+        cap = daily_cap_usd(user)
+        mode = str(user.get("daily_cap_mode", DEFAULT_DAILY_CAP_MODE)).upper()
+        val = float(user.get("daily_cap_value", DEFAULT_DAILY_CAP_VALUE) or DEFAULT_DAILY_CAP_VALUE)
+        await update.message.reply_text(
+            f"Daily risk cap (TOTAL per day): {mode} {val:.2f} (≈ ${cap:.2f} per day)\n"
+            f"Per-trade risk is separate: /riskmode\n\n"
+            "Set examples:\n"
+            "• /dailycap pct 5\n"
+            "• /dailycap usd 60"
+        )
+        return
+
+    mode = context.args[0].strip().upper()
+    try:
+        val = float(context.args[1])
+    except Exception:
+        await update.message.reply_text("Usage: /dailycap pct 5  OR  /dailycap usd 60")
+        return
+
+    if mode not in {"PCT", "USD"}:
+        await update.message.reply_text("Mode must be pct or usd")
+        return
+    if mode == "PCT" and not (0.0 <= val <= 30):
+        await update.message.reply_text("pct/day should be between 0 and 30")
+        return
+    if mode == "USD" and val < 0:
+        await update.message.reply_text("usd/day must be >= 0")
+        return
+
+    update_user(uid, daily_cap_mode=mode, daily_cap_value=val)
+    user = get_user(uid)
+    await update.message.reply_text(
+        f"✅ Daily risk cap updated: {mode} {float(val):.2f} (≈ ${daily_cap_usd(user):.2f} per day)"
+    )
+
+
+async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            f"Limits:\n"
+            f"- maxtrades: {int(user['max_trades_day'])}\n"
+            f"- emailcap: {int(user['max_emails_per_session'])} (0 = unlimited)\n"
+            f"- emailgap: {int(user['email_gap_min'])} min\n"
+            f"- emaildaycap: {int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0 = unlimited)\n\n"
+            f"Set examples:\n"
+            f"/limits maxtrades 5\n"
+            f"/limits emailcap 0\n"
+            f"/limits emailgap 60\n"
+            f"/limits emaildaycap 0\n"
+        )
+        return
+
+    key = context.args[0].strip().lower()
+    try:
+        val = int(float(context.args[1]))
+    except Exception:
+        await update.message.reply_text("Value must be a number.")
+        return
+
+    if key == "maxtrades":
+        if not (1 <= val <= 50):
+            await update.message.reply_text("maxtrades must be 1..50")
+            return
+        update_user(uid, max_trades_day=val)
+        await update.message.reply_text(f"✅ maxtrades/day set to {val}")
+
+    elif key == "emailcap":
+        if not (0 <= val <= 50):
+            await update.message.reply_text("emailcap must be 0..50 (0 = unlimited)")
+            return
+        update_user(uid, max_emails_per_session=val)
+        await update.message.reply_text(f"✅ emailcap/session set to {val} (0 = unlimited)")
+
+    elif key == "emailgap":
+        if not (0 <= val <= 360):
+            await update.message.reply_text("emailgap must be 0..360 minutes")
+            return
+        update_user(uid, email_gap_min=val)
+        await update.message.reply_text(f"✅ emailgap set to {val} minutes")
+
+    elif key in {"emaildaycap", "dailyemailcap", "emailcapday"}:
+        if not (0 <= val <= 50):
+            await update.message.reply_text("emaildaycap must be 0..50 (0 = unlimited)")
+            return
+        update_user(uid, max_emails_per_day=val)
+        await update.message.reply_text(f"✅ daily email cap set to {val} (0 = unlimited)")
+
+    else:
+        await update.message.reply_text("Unknown key. Use: maxtrades | emailcap | emailgap | emaildaycap")
+
+async def sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    enabled = user_enabled_sessions(user)
+    now_s = in_session_now(user)
+    now_live = current_session_utc(datetime.now(timezone.utc))
+    if int(user.get("sessions_unlimited", 0) or 0) == 1:
+        now_txt = f"Now in session: {now_live}"
+    else:
+        now_txt = f"Now in session: {now_s['name']}" if now_s else "Now in session: NONE"
+    await update.message.reply_text(
+        f"Your TZ: {user['tz']}\n"
+        f"{now_txt}\n\n"
+        f"Enabled sessions (priority): {', '.join(enabled)}\n"
+        f"Available: ASIA, LON, NY\n\n"
+        f"Enable: /sessions_on NY\n"
+        f"Disable: /sessions_off LON"
+    )
+
+async def sessions_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not context.args:
+        await update.message.reply_text("Usage: /sessions_on NY")
+        return
+    name = context.args[0].strip().upper()
+    if name not in SESSIONS_UTC:
+        await update.message.reply_text("Session must be one of: ASIA, LON, NY")
+        return
+
+    enabled = user_enabled_sessions(user)
+    if name not in enabled:
+        enabled.append(name)
+
+    enabled = _order_sessions(enabled) or enabled
+    update_user(uid, sessions_enabled=json.dumps(enabled))
+    await update.message.reply_text(f"✅ Enabled sessions: {', '.join(enabled)}")
+
+async def sessions_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not context.args:
+        await update.message.reply_text("Usage: /sessions_off ASIA")
+        return
+
+    name = context.args[0].strip().upper()
+    if name not in SESSIONS_UTC:
+        await update.message.reply_text("Session must be one of: ASIA, LON, NY")
+        return
+
+    enabled = [s for s in user_enabled_sessions(user) if s != name]
+
+    # Never allow "no sessions" — fall back to sensible defaults
+    if not enabled:
+        enabled = _default_sessions_for_tz(user["tz"])
+        enabled = _order_sessions(enabled) or enabled
+
+    update_user(uid, sessions_enabled=json.dumps(enabled))
+    await update.message.reply_text(
+        f"✅ Disabled: {name}\n"
+        f"Enabled sessions: {', '.join(enabled)}"
+    )
+
+
+async def sessions_on_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_user(uid, sessions_unlimited=1)
+    await update.message.reply_text("✅ Sessions: UNLIMITED (24h emailing enabled).")
+
+async def sessions_off_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_user(uid, sessions_unlimited=0)
+    await update.message.reply_text("✅ Sessions: back to normal (enabled sessions only).")
+
+async def sessions_unlimited_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: /sessions_unlimited_on
+    await sessions_on_unlimited_cmd(update, context)
+
+async def sessions_unlimited_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias: /sessions_unlimited_off
+    await sessions_off_unlimited_cmd(update, context)
+
+async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+        
+    if not context.args:
+        on = int(user.get("bigmove_alert_on", 1) or 0)
+        p4 = float(user.get("bigmove_alert_4h", 20) or 20)
+        p1 = float(user.get("bigmove_alert_1h", 10) or 10)
+        await update.message.reply_text(
+            "📣 Big-Move Alert Emails\n"
+            f"{HDR}\n"
+            f"Status: {'ON' if on else 'OFF'}\n"
+            f"Thresholds: |4H| ≥ {p4:.0f}% OR |1H| ≥ {p1:.0f}% (both directions)\n\n"
+            "Set: /bigmove_alert on 20 10\n"
+            "Off: /bigmove_alert off"
+        )
+        return
+
+    mode = context.args[0].strip().lower()
+
+    if mode in {"off", "0", "disable"}:
+        update_user(uid, bigmove_alert_on=0)
+        await update.message.reply_text("✅ Big-move alert emails: OFF")
+        return
+
+    if mode in {"on", "1", "enable"}:
+        p4 = 20.0
+        p1 = 10.0
+        if len(context.args) >= 3:
+            try:
+                p4 = float(context.args[1])
+                p1 = float(context.args[2])
+            except Exception:
+                await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)")
+                return
+        update_user(uid, bigmove_alert_on=1, bigmove_alert_4h=p4, bigmove_alert_1h=p1)
+        await update.message.reply_text(f"✅ Big-move alert emails: ON (4H≥{p4:.0f}% OR 1H≥{p1:.0f}%)")
+        return
+
+    await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)  OR  /bigmove_alert off")
+
+
+async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_user(uid, notify_on=1)
+    await update.message.reply_text("✅ Email alerts: ON")
+
+async def notify_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_user(uid, notify_on=0)
+    await update.message.reply_text("✅ Email alerts: OFF")
+
+def _equity_risk_pct_from_usd(user: dict, risk_usd: float) -> Optional[float]:
+    eq = _effective_equity_for_risk(user, prefer_live=True)
+    if eq <= 0:
+        return None
+    return _risk_pct_from_amount(eq, risk_usd)
+
+
+def _find_unknown_tokens(tokens: list) -> list:
+    """
+    Very strict validation:
+    - allowed keywords: symbol, side, sl, entry, risk, usd, pct
+    - side values: long/short/buy/sell
+    - everything else should be numeric (like prices/values)
+    Any unknown non-numeric token => error.
+    """
+    allowed = {
+        "sl", "stop",
+        "entry", "ent",
+        "risk",
+        "usd", "pct",
+        "long", "short", "buy", "sell",
+    }
+
+    unknown = []
+    for t in tokens:
+        tt = str(t).strip().lower()
+        if not tt:
+            continue
+        if tt in allowed:
+            continue
+        # numeric is OK
+        try:
+            float(tt)
+            continue
+        except Exception:
+            unknown.append(tt)
+    return unknown
+
+def _typo_hint_for_token(tok: str) -> str:
+    t = (tok or "").lower()
+    # common "entry" typos
+    if t.startswith("entr") and t not in ("entry", "ent"):
+        return "Did you mean `entry`?"
+    if t in ("enrty", "etry", "etryy", "enter", "entery", "enrt"):
+        return "Did you mean `entry`?"
+    return ""
+
+
+async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+        
+    raw = " ".join(context.args).strip()
+    if not raw:
+        await update.message.reply_text("Usage: /size <symbol> <LONG/SHORT> entry <VALUE> sl <VALUE>  (optional: risk pct <value> | risk usd <value>)\nIf risk is not entered, default risk is used (set in /riskmode).")
+        return
+
+    tokens = raw.split()
+    
+    # -------------------------------------------------
+    # REQUIRED POSITIONAL ARGS
+    # -------------------------------------------------
+    if len(tokens) < 4:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/size <SYMBOL> <long|short> entry <PRICE> sl <STOP>\n"
+            "Optional: risk <usd|pct> <VALUE> (default: 1.5%)"
+        )
+        return
+    
+    symbol = re.sub(r"[^A-Za-z0-9]", "", tokens[0]).upper()
+    direction = tokens[1].lower()
+    
+    if direction not in ("long", "short"):
+        await update.message.reply_text("Second argument must be long or short.")
+        return
+    
+    # Strip positional args BEFORE keyword parsing
+    tokens = tokens[2:]
+
+    # STRICT: reject unknown tokens (prevents silent fallback to live price on typos like "entrt")
+    allowed = {"sl", "entry", "risk", "usd", "pct"}
+    unknown = []
+    for t in tokens:
+        tt = str(t).strip().lower()
+        if not tt:
+            continue
+        if tt in allowed:
+            continue
+        # numeric token is OK
+        try:
+            float(tt)
+            continue
+        except Exception:
+            unknown.append(tt)
+
+    if unknown:
+        hint = ""
+        u0 = unknown[0]
+        if u0.startswith("entr") and u0 != "entry":
+            hint = "\nDid you mean `entry`?"
+        await update.message.reply_text(
+            "❌ Invalid /size syntax.\n\n"
+            f"Unknown keyword(s): {', '.join(unknown)}{hint}\n\n"
+            "Use:\n/size <SYMBOL> <long|short> entry <ENTRY> sl <STOP> [risk <usd|pct> <VALUE>]\n"
+            "Example:\n/size BTC long entry 43000 sl 42000 risk usd 40"
+        )
+        return
+
+    # -------------------------------------------------
+    # KEYWORD PARSING (entry + sl REQUIRED)
+    # -------------------------------------------------
+    side = "BUY" if direction == "long" else "SELL"
+    sym = symbol  # <- use the original parsed symbol (positional)
+
+    entry = None
+    sl = None
+
+    risk_mode = "PCT"
+    risk_val = 1.5  # <- DEFAULT: 1.5% of equity if user does not provide risk
+
+    i = 0
+    while i < len(tokens):
+        t = tokens[i].lower()
+
+        if t == "entry" and i + 1 < len(tokens):
+            try:
+                entry = float(tokens[i + 1])
+            except Exception:
+                await update.message.reply_text("Bad entry format. Example: entry 43000")
+                return
+            i += 2
+            continue
+
+        if t == "sl" and i + 1 < len(tokens):
+            try:
+                sl = float(tokens[i + 1])
+            except Exception:
+                await update.message.reply_text("Bad SL format. Example: sl 42000")
+                return
+            i += 2
+            continue
+
+        if t == "risk" and i + 2 < len(tokens):
+            rm = tokens[i + 1].lower()
+            if rm not in ("usd", "pct"):
+                await update.message.reply_text("Bad risk format. Use: risk pct 2  OR  risk usd 40")
+                return
+            try:
+                rv = float(tokens[i + 2])
+            except Exception:
+                await update.message.reply_text("Bad risk format. Use: risk pct 2  OR  risk usd 40")
+                return
+            risk_mode = rm.upper()
+            risk_val = rv
+            i += 3
+            continue
+
+        await update.message.reply_text(f"❌ Invalid keyword: {tokens[i]}")
+        return
+
+    # entry + sl are mandatory (as you requested)
+    if entry is None or sl is None:
+        await update.message.reply_text(
+            "❌ Missing entry or SL.\n"
+            "Use:\n/size <SYMBOL> <long|short> entry <ENTRY> sl <STOP>\n"
+            "Example:\n/size EUL long entry 2.46 sl 2.26"
+        )
+        return
+
+    # --- Entry sanity check vs last known price (warn only; NEVER blocks /size) ---
+    try:
+        best_now = get_cached_futures_tickers()
+        mv_now = best_now.get(sym) if isinstance(best_now, dict) else None
+        cur_px = float(mv_now.last) if mv_now and float(getattr(mv_now, "last", 0) or 0) > 0 else 0.0
+    except Exception:
+        cur_px = 0.0
+    
+    entry_warn = ""
+    if cur_px > 0:
+        w, severe = entry_sanity_check(entry, cur_px)
+        if w:
+            # /size: warn only (no blocking), but make severe warnings very visible
+            entry_warn = ("\n" + w + "\n")
+    # --------------------------------------------------------------
+
+    if entry <= 0 or sl <= 0 or entry == sl:
+        await update.message.reply_text("Entry/SL invalid. Ensure entry and sl are positive and not equal.")
+        return
+
+    if side == "BUY" and sl >= entry:
+        await update.message.reply_text("For LONG, SL should be BELOW entry.")
+        return
+    if side == "SELL" and sl <= entry:
+        await update.message.reply_text("For SHORT, SL should be ABOVE entry.")
+        return
+
+    risk_usd = compute_risk_usd(user, risk_mode, risk_val)
+
+    if risk_usd <= 0:
+        if risk_mode == "PCT":
+            await update.message.reply_text("Risk computed as $0. Set your equity first: /equity 1000")
+            return
+        await update.message.reply_text("Risk USD computed as 0. Check your risk value.")
+        return
+
+    qty = calc_qty(entry, sl, risk_usd)
+    if qty <= 0:
+        await update.message.reply_text("Could not compute qty. Check entry/sl/risk.")
+        return
+
+    warn = ""
+    if risk_mode == "PCT":
+        if float(risk_val) > float(WARN_RISK_PCT_PER_TRADE):
+            warn = (
+                f"⚠️ Warning: You are risking {float(risk_val):.2f}% of equity.\n"
+                f"Recommended max risk per trade is {WARN_RISK_PCT_PER_TRADE:.2f}%."
+            )
+    else:
+        pct_equiv = _equity_risk_pct_from_usd(user, risk_usd)
+        if pct_equiv is not None and pct_equiv > float(WARN_RISK_PCT_PER_TRADE):
+            warn = (
+                f"⚠️ Warning: This equals ~{pct_equiv:.2f}% of equity.\n"
+                f"Recommended max risk per trade is {WARN_RISK_PCT_PER_TRADE:.2f}%."
+            )
+
+    msg = (
+        f"✅ Position Size\n"
+        f"- Symbol: {sym}\n"
+        f"- Side: {side}\n"
+        f"- Entry: {fmt_price(entry)}\n"
+        f"- SL: {fmt_price(sl)}\n"
+        f"- Risk: ${risk_usd:.2f}\n"
+        f"- Qty: {qty:.6g}\n"
+    )
+
+    if warn:
+        msg += "\n" + warn + "\n"
+    if entry_warn:
+        msg += entry_warn
+    msg += f"\nChart: {tv_chart_url(sym)}"
+
+    await update.message.reply_text(msg)
+
+
+async def _size_paste_fallback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback for mobile copy/paste where Telegram doesn't parse it as a command.
+
+    Example: Gmail/iOS sometimes prefixes invisible Unicode markers before '/size'.
+    Then CommandHandler("size") won't fire. This router strips those markers and
+    re-dispatches to size_cmd.
+    """
+    try:
+        if not update.message or not update.message.text:
+            return
+        txt = update.message.text
+        # If Telegram already treated it as a command, CommandHandler will handle it.
+        if txt.startswith("/size"):
+            return
+
+        clean = _strip_invisible_prefix(txt)
+        if not clean.lower().startswith("/size"):
+            return
+
+        parts = clean.split()
+        if not parts:
+            return
+
+        cmd = parts[0]
+        if "@" in cmd:
+            cmd = cmd.split("@", 1)[0]
+        if cmd.lower() != "/size":
+            return
+
+        # Emulate CommandHandler args
+        context.args = parts[1:]
+        await size_cmd(update, context)
+    except Exception:
+        # Never crash generic text handling
+        return
+
+async def trade_open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = reset_daily_if_needed(get_user(uid))
+
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+        
+    raw_full = " ".join(context.args).strip()
+    if not raw_full:
+        await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 [risk usd 40|risk pct 2] [note ...] [sig PF-...]\nIf risk is omitted, it uses your /riskmode settings.")
+        return
+
+    bracket_parts = re.findall(r"\[([^\]]+)\]", raw_full)
+    raw = re.sub(r"\[[^\]]+\]", "", raw_full).strip()
+
+    tokens = raw.split()
+    # Minimum: <sym> <long|short> entry <px> sl <px> (risk is optional)
+    if len(tokens) < 6 or "entry" not in tokens or "sl" not in tokens:
+        await update.message.reply_text("Usage: /trade_open BTC long entry 43000 sl 42000 [risk usd 40|risk pct 2] [note ...] [sig PF-...]\nIf risk is omitted, it uses your /riskmode settings.")
+        return
+
+    sym = re.sub(r"[^A-Za-z0-9]", "", tokens[0]).upper()
+    direction = tokens[1].lower()
+    if direction not in {"long", "short"}:
+        await update.message.reply_text("Second arg must be long or short.")
+        return
+    side = "BUY" if direction == "long" else "SELL"
+
+    trades_today_now = int(_manual_trades_today_count(uid, user) or 0)
+    update_user(uid, day_trade_count=trades_today_now)
+    user = get_user(uid)
+    if trades_today_now >= int(user["max_trades_day"]):
+        await update.message.reply_text(f"⛔ Max trades for the active day reached ({user['max_trades_day']}).")
+        return
+
+    try:
+        def idx(x): return tokens.index(x)
+        entry = float(tokens[idx("entry")+1])
+        sl = float(tokens[idx("sl")+1])
+
+        if "risk" in tokens:
+            r_i = idx("risk")
+            if r_i + 2 >= len(tokens):
+                raise ValueError("risk missing args")
+            risk_mode = tokens[r_i+1].upper()
+            risk_val = float(tokens[r_i+2])
+        else:
+            # If omitted, auto-use /riskmode settings for this user.
+            risk_mode = str(user.get("risk_mode", DEFAULT_RISK_MODE)).upper()
+            risk_val = float(user.get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
+
+        note = ""
+        signal_id = ""
+
+        # Token-based (explicit keywords)
+        if "note" in tokens:
+            n_i = idx("note")
+            # note runs until "sig" if present
+            if "sig" in tokens[n_i+1:]:
+                s_rel = tokens[n_i+1:].index("sig")
+                note = " ".join(tokens[n_i+1:n_i+1+s_rel]).strip()
+            else:
+                note = " ".join(tokens[n_i+1:]).strip()
+
+        if "sig" in tokens:
+            s_i = idx("sig")
+            if s_i + 1 < len(tokens):
+                signal_id = tokens[s_i+1].strip()
+
+        # Bracket-based (legacy/quick typing): [my note] [sig PF-123]
+        for bp in bracket_parts or []:
+            seg = str(bp or "").strip()
+            if not seg:
+                continue
+            low = seg.lower()
+            if low.startswith("sig "):
+                signal_id = seg[4:].strip()
+                continue
+            m2 = re.match(r"^(sig)\s*[:\-]?\s*(.+)$", seg, flags=re.IGNORECASE)
+            if m2:
+                signal_id = m2.group(2).strip()
+                continue
+            note = (seg if not note else (note + " | " + seg)).strip()
+
+    except Exception:
+        await update.message.reply_text("Bad format. Example: /trade_open BTC long entry 43000 sl 42000 risk usd 40 note breakout sig PF-20251219-0007\nOr omit risk to use /riskmode automatically.")
+        return
+
+    if risk_mode not in {"USD", "PCT"}:
+        await update.message.reply_text("risk mode must be usd or pct")
+        return
+
+    # =========================================================
+    # ENTRY PRICE SANITY CHECK (BLOCK if severe unless "force")
+    # =========================================================
+    force = ("force" in tokens)  # user can add: force
+    
+    try:
+        best_now = get_cached_futures_tickers()
+        mv_now = best_now.get(sym)
+        cur_px = float(mv_now.last) if mv_now and float(mv_now.last or 0) > 0 else 0.0
+    except Exception:
+        cur_px = 0.0
+    
+    if cur_px > 0:
+        w, severe = entry_sanity_check(entry, cur_px)
+        if w and severe and not force:
+            await update.message.reply_text(
+                w
+                + "\n\n❌ Trade NOT opened to protect you from a bad entry.\n"
+                  "If you are 100% sure, re-run the command and add: force"
+            )
+            return
+        elif w and not severe:
+            await update.message.reply_text(w)
+    # =========================================================
+    
+    if side == "BUY" and sl >= entry:
+        await update.message.reply_text("For LONG, SL should be BELOW entry.")
+        return
+    if side == "SELL" and sl <= entry:
+        await update.message.reply_text("For SHORT, SL should be ABOVE entry.")
+        return
+  
+    risk_usd = compute_risk_usd(user, risk_mode, risk_val)
+    if risk_usd <= 0:
+        await update.message.reply_text("Risk USD computed as 0. If you used pct, set your equity first: /equity 1000")
+        return
+
+    qty = calc_qty(entry, sl, risk_usd)
+    if qty <= 0:
+        await update.message.reply_text("Could not compute qty. Check entry/sl/risk.")
+        return
+
+    cap = daily_cap_usd(user)
+    day_local = _user_day_local(user)
+    used_before = _risk_used_total_today(uid, user)
+    remaining_before = (cap - used_before) if cap > 0 else float("inf")
+
+    warn_daily = ""
+    if cap > 0 and float(risk_usd) > max(0.0, remaining_before) + 1e-9:
+        warn_daily = (
+            f"⚠️ Daily Risk Warning: "
+            f"This position (${risk_usd:.2f}) exceeds today's remaining risk "
+            f"(${max(0.0, remaining_before):.2f}).\n"
+        )
+
+    warn_trade_vs_cap = ""
+    if cap > 0 and float(risk_usd) > float(cap) + 1e-9:
+        warn_trade_vs_cap = f"⚠️ Note: This trade risk (${risk_usd:.2f}) exceeds the total Daily Risk Cap (${cap:.2f}).\n"
+
+    tid = db_trade_open(uid, sym, side, entry, sl, risk_usd, qty, note=note, signal_id=signal_id)
+    _risk_daily_inc(uid, day_local, float(risk_usd))
+
+    used_after = _risk_used_total_today(uid, get_user(uid))
+    remaining_after = (cap - used_after) if cap > 0 else float("inf")
+
+    update_user(uid, day_trade_count=int(trades_today_now) + 1)
+    user = get_user(uid)
+
+    daily_risk_line = (
+        f"- Daily risk limit: {user['daily_cap_mode']} {float(user['daily_cap_value']):.2f} (≈ ${cap:.2f})\n"
+        f"- Used today: ${used_after:.2f}\n"
+        f"- Remaining today: ${max(0.0, remaining_after):.2f}" if cap > 0 else
+        f"- Daily risk limit: {user['daily_cap_mode']} {float(user['daily_cap_value']):.2f} (≈ ${cap:.2f})\n"
+        f"- Used today: ${used_after:.2f}\n"
+        f"- Remaining today: ∞"
+    )
+
+    await update.message.reply_text(
+        f"✅ Trade OPENED (Journal)\n"
+        f"- ID: {tid}\n"
+        f"- {sym} {side}\n"
+        f"- Entry: {fmt_price(entry)}\n"
+        f"- SL: {fmt_price(sl)}\n"
+        f"- Risk: ${risk_usd:.2f}\n"
+        f"- Qty: {qty:.6g}\n"
+        f""
+        f"{daily_risk_line}\n"
+        f"- Trades today: {int(user['day_trade_count'])}/{int(user['max_trades_day'])}\n"
+        f"- Equity: ${float(user['equity']):.2f}\n"
+        f"- Signal: {signal_id if signal_id else '-'}\n"
+        f"- Note: {note if note else '-'}"
+    )
+
+async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+    
+    raw = " ".join(context.args).strip()
+    if not raw:
+        await update.message.reply_text("Usage: /trade_close <TRADE_ID> pnl <PNL>")
+        return
+
+    tokens = raw.split()
+    if len(tokens) < 3:
+        await update.message.reply_text("Usage: /trade_close <TRADE_ID> pnl <PNL>")
+        return
+
+    try:
+        trade_id = int(tokens[0])
+        if tokens[1].lower() != "pnl":
+            raise ValueError()
+        pnl = float(tokens[2])
+    except Exception:
+        await update.message.reply_text("Usage: /trade_close <TRADE_ID> pnl <PNL>  (example: /trade_close 12 pnl +85.5)")
+        return
+
+    t = db_trade_close(uid, trade_id, pnl)
+    
+    if not t:
+        await update.message.reply_text("Trade not found or already closed.")
+        return
+    
+    # Sync daily risk from CURRENT open positions (closing frees capacity instantly)
+    _risk_daily_sync(uid, user)
+    # ✅ Equity handling:
+    # - Admin: keep equity synced with Bybit (if live equity is available)
+    # - Others: manual equity updated by /trade_close pnl
+    if is_admin_user(int(uid)):
+        live_eq = _live_equity_usdt()
+        if live_eq is not None:
+            try:
+                update_user(int(uid), equity=float(live_eq))
+            except Exception:
+                pass
+            user = get_user(uid)
+        else:
+            # fallback to manual equity update (only if live equity unavailable)
+            new_eq = float(user["equity"]) + float(pnl)
+            update_user(uid, equity=new_eq)
+            user = get_user(uid)
+    else:
+        new_eq = float(user["equity"]) + float(pnl)
+        update_user(uid, equity=new_eq)
+        user = get_user(uid)
+
+    r_mult = t.get("r_mult")
+    r_txt = f"{r_mult:+.2f}R" if r_mult is not None else "-"
+    
+    await update.message.reply_text(
+        f"✅ Trade CLOSED\n"
+        f"- ID: {trade_id}\n"
+        f"- PnL: {float(pnl):+.2f}\n"
+        f"- R: {r_txt}\n"
+        f"- New Equity: ${float(user['equity']):.2f}"
+    )
+
+async def trade_id_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return
+
+    _reset_public_trade_id(uid)
+
+    await update.message.reply_text(
+        "✅ Trade ID counter reset.\n\n"
+        "Next /trade_open will start from Trade ID 1."
+    )
+
+
+async def trade_sl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    tokens = context.args
+    if len(tokens) != 2:
+        await update.message.reply_text("Usage: /trade_sl <TRADE_ID> <NEW_SL>")
+        return
+
+    try:
+        trade_id = int(tokens[0])
+        new_sl = float(tokens[1])
+    except Exception:
+        await update.message.reply_text("Invalid arguments.")
+        return
+
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT * FROM trades WHERE public_id=? AND user_id=? AND closed_ts IS NULL",
+        (trade_id, uid),
+    )
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        await update.message.reply_text("Open trade not found.")
+        return
+
+    t = dict(row)
+    entry = float(t["entry"])
+    side = str(t["side"]).upper()
+
+    # validate new SL direction
+    if side == "BUY" and new_sl >= entry:
+        con.close()
+        await update.message.reply_text("For BUY, SL must be below entry.")
+        return
+    if side == "SELL" and new_sl <= entry:
+        con.close()
+        await update.message.reply_text("For SELL, SL must be above entry.")
+        return
+
+    old_risk = float(t["risk_usd"])
+    qty = float(t["qty"])
+    new_risk = abs(entry - new_sl) * qty
+
+    # update trade
+    cur.execute(
+        "UPDATE trades SET sl=?, risk_usd=? WHERE public_id=? AND user_id=?",
+        (float(new_sl), float(new_risk), trade_id, uid),
+    )
+    con.commit()
+    con.close()
+
+    # update daily used risk by delta
+    user = get_user(uid)
+    day_local = _user_day_local(user)
+    delta = float(new_risk) - float(old_risk)
+
+    if abs(delta) > 1e-9:
+        _risk_daily_inc(uid, day_local, delta)
+
+        # clamp to 0 if negative due to edge cases
+        used_now = _risk_daily_sync(uid, user)
+        if used_now < 0:
+            con2 = db_connect()
+            cur2 = con2.cursor()
+            cur2.execute(
+                "UPDATE risk_daily SET used_risk_usd=? WHERE user_id=? AND day_local=?",
+                (0.0, uid, day_local),
+            )
+            con2.commit()
+            con2.close()
+
+    cap = daily_cap_usd(user)
+    pnl_today = _pnl_today_closed_trades(uid, user)
+    used_today = _risk_used_total_today(uid, user)
+    remaining_today = (cap - used_today) if cap > 0 else float("inf")
+
+    warn = ""
+    if new_risk > old_risk + 1e-9:
+        warn = "⚠️ Risk increased!"
+    elif new_risk < old_risk - 1e-9:
+        warn = "✅ Risk reduced (released daily risk)."
+
+    await update.message.reply_text(
+        f"✅ Stop Loss UPDATED\n"
+        f"- Trade ID: {trade_id}\n"
+        f"- Side: {side}\n"
+        f"- Entry: {fmt_price(entry)}\n"
+        f"- New SL: {fmt_price(new_sl)}\n"
+        f"- Old Risk: ${old_risk:.2f}\n"
+        f"- New Risk: ${new_risk:.2f}\n"
+        f"{warn}\n\n"
+        f"📌 Daily Risk\n"
+        f"- Cap: ≈ ${cap:.2f}\n"
+        f"- Used today: ${used_today:.2f}\n"
+        f"- Remaining today: ${max(0.0, remaining_today):.2f}" if cap > 0 else
+        f"📌 Daily Risk\n"
+        f"- Cap: ≈ ${cap:.2f}\n"
+        f"- Used today: ${used_today:.2f}\n"
+        f"- Remaining today: ∞"
+    )
+
+
+async def trade_rf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    # Ensure daily reset happens before any risk math
+    user = reset_daily_if_needed(get_user(uid))
+
+    if not context.args:
+        await update.message.reply_text("Usage: /trade_rf <TRADE_ID>")
+        return
+
+    try:
+        trade_id = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Usage: /trade_rf <TRADE_ID>")
+        return
+
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT * FROM trades WHERE public_id=? AND user_id=? AND closed_ts IS NULL",
+        (trade_id, uid),
+    )
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        await update.message.reply_text("Open trade not found.")
+        return
+
+    t = dict(row)
+    entry = float(t["entry"])
+    old_risk = float(t["risk_usd"])
+
+    # If already risk-free, don't release again
+    if old_risk <= 1e-9:
+        con.close()
+        cap = daily_cap_usd(user)
+        day_local = _user_day_local(user)
+        pnl_today = _pnl_today_closed_trades(uid, user)
+        used_today = _risk_used_total_today(uid, user)
+        remaining_today = (cap - used_today) if cap > 0 else float("inf")
+
+        await update.message.reply_text(
+            f"✅ Trade is already Risk-Free\n"
+            f"- Trade ID: {trade_id}\n"
+            f"- SL is already at Entry\n\n"
+            f"📌 Daily Risk\n"
+            f"- Cap: ≈ ${cap:.2f}\n"
+            f"- Used today: ${used_today:.2f}\n"
+            f"- Remaining today: ${max(0.0, remaining_today):.2f}" if cap > 0 else
+            f"📌 Daily Risk\n"
+            f"- Cap: ≈ ${cap:.2f}\n"
+            f"- Used today: ${used_today:.2f}\n"
+            f"- Remaining today: ∞"
+        )
+        return
+
+    # Move SL to entry and set trade risk to 0
+    cur.execute(
+        "UPDATE trades SET sl=?, risk_usd=? WHERE public_id=? AND user_id=?",
+        (entry, 0.0, trade_id, uid),
+    )
+    con.commit()
+    con.close()
+
+    # Release today's risk immediately
+    day_local = _user_day_local(user)
+    _risk_daily_inc(uid, day_local, -old_risk)
+
+    # Clamp used risk to 0 if it went negative (edge cases)
+    used_now = _risk_daily_sync(uid, user)
+    if used_now < 0:
+        con2 = db_connect()
+        cur2 = con2.cursor()
+        cur2.execute(
+            "UPDATE risk_daily SET used_risk_usd=? WHERE user_id=? AND day_local=?",
+            (0.0, uid, day_local),
+        )
+        con2.commit()
+        con2.close()
+        used_now = 0.0
+
+    cap = daily_cap_usd(user)
+    remaining_today = (cap - used_now) if cap > 0 else float("inf")
+
+    await update.message.reply_text(
+        f"✅ Trade Risk-Free\n"
+        f"- Trade ID: {trade_id}\n"
+        f"- SL moved to Entry\n"
+        f"- Released Risk: ${old_risk:.2f}\n\n"
+        f"📌 Daily Risk (updated)\n"
+        f"- Cap: ≈ ${cap:.2f}\n"
+        f"- Used today: ${used_now:.2f}\n"
+        f"- Remaining today: ${max(0.0, remaining_today):.2f}" if cap > 0 else
+        f"📌 Daily Risk (updated)\n"
+        f"- Cap: ≈ ${cap:.2f}\n"
+        f"- Used today: ${used_now:.2f}\n"
+        f"- Remaining today: ∞"
+    )
+
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = reset_daily_if_needed(get_user(uid))
+    is_admin = is_admin_user(int(uid))
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return
+
+    snap = _accounting_snapshot(uid, user, is_admin=is_admin)
+    equity = float(snap.get('equity') or 0.0)
+    cap = float(snap.get('cap') or 0.0)
+    pnl_today = float(snap.get('pnl_today') or 0.0)
+    realized_loss_today = float(snap.get('realized_loss_today') or 0.0)
+    used_today = float(snap.get('used_today') or 0.0)
+    remaining_today = snap.get('remaining_today', float('inf'))
+    over_by = float(snap.get('over_by') or 0.0)
+    enabled = user_enabled_sessions(user)
+    now_s = in_session_now(user)
+    now_live = current_session_utc(datetime.now(timezone.utc))
+    now_txt = now_live if int(user.get('sessions_unlimited', 0) or 0) == 1 else (now_s['name'] if now_s else 'NONE')
+    cur_s = (user.get('trade_window_start') or '').strip()
+    cur_e = (user.get('trade_window_end') or '').strip()
+    tw_txt = 'OFF' if (not cur_s or not cur_e) else f"{cur_s} → {cur_e} (local)"
+
+    lines = [
+        '📌 Status',
+        HDR,
+        'Account',
+        f"• Plan: {snap.get('plan')}",
+        f"• Trading day: {snap.get('today_window_label')}",
+        f"• Equity: ${equity:.2f}",
+        f"• PnL today (closed): ${pnl_today:+.2f}",
+        SEP,
+        'Risk',
+        f"• Opened today: {int(snap.get('positions_opened_today', 0))}" + (f"/{int(snap.get('trades_today_limit', 0))}" if int(snap.get('trades_today_limit', 0)) > 0 else ' (no count cap)'),
+        f"• Closed today: {int(snap.get('positions_closed_today', 0))}",
+        f"• Open positions now: {int(snap.get('open_positions_now', 0))}",
+        f"• Carried from prior day: {int(snap.get('inherited_open_positions', 0))}",
+        f"• Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f}",
+        f"• Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})",
+        f"• Current-day open risk: ${float(snap.get('current_day_open_risk', 0.0)):.2f}",
+        f"• Live open risk charged today: ${float(snap.get('live_open_risk_charged_today', snap.get('current_day_open_risk', 0.0))):.2f}",
+        f"• Carried open risk: ${float(snap.get('carried_open_risk', 0.0)):.2f}",
+        f"• Total open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
+        f"• Realised net today: ${pnl_today:+.2f}",
+        f"• Daily risk used (open risk - realised net): ${used_today:.2f}",
+        f"• Daily risk remaining: {'∞' if not math.isfinite(float(remaining_today)) else f'${float(remaining_today):.2f}'}",
+        SEP,
+        'Alerts & sessions',
+        f"• Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}",
+        f"• Sessions enabled: {' | '.join(enabled)}",
+        f"• Now: {now_txt}",
+        f"• Trade window: {tw_txt}",
+        f"• Today basis: {snap.get('today_basis')}",
+    ]
+    if over_by > 0:
+        lines.append(f"⚠️ Over daily cap by ${over_by:.2f}")
+
+    if is_admin:
+        live_positions = _bybit_get_open_positions_linear()
+        lines.extend([SEP, f"Open positions list: {len(live_positions)}"])
+        if not live_positions:
+            lines.append('• None')
+        else:
+            for p in live_positions[:12]:
+                lines.append(f"• {_pos_side_text(p)} {_pos_symbol(p)} | PnL {_pos_unreal_pnl(p):+.2f} USDT")
+    else:
+        opens = db_open_trades(uid)
+        lines.extend([SEP, f"Open trades list: {len(opens)}"])
+        if not opens:
+            lines.append('• None')
+        else:
+            for t in opens[:12]:
+                lines.append(f"• {t.get('symbol')} {t.get('side')} | Risk ${float(t.get('risk_usd') or 0.0):.2f}")
+
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+
+async def cooldowns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    now_sess = in_session_now(user)
+    current_session = (now_sess["name"] if now_sess else current_session_utc())
+    rows = list_cooldowns(uid)
+
+    if not rows:
+        await update.message.reply_text(
+            "⏱ Cooldowns\n"
+            f"{HDR}\n"
+            "No cooldowns recorded yet."
+        )
+        return
+
+    # We show remaining cooldown for ALL sessions (NY/LON/ASIA) per (symbol, side)
+    now_ts = time.time()
+    out = []
+    out.append("⏱ Cooldowns (All Sessions)")
+    out.append(HDR)
+    out.append(f"Current session: {current_session}")
+    out.append(f"Policy: NY={cooldown_hours_for_session('NY')}h | LON={cooldown_hours_for_session('LON')}h | ASIA={cooldown_hours_for_session('ASIA')}h")
+    out.append(SEP)
+
+    # keep only most recent per (symbol, side)
+    seen = set()
+    compact = []
+    for r in rows:
+        key = (str(r["symbol"]).upper(), str(r["side"]).upper())
+        if key in seen:
+            continue
+        seen.add(key)
+        compact.append(r)
+
+    # show top 20 recent
+    compact = compact[:20]
+
+    for r in compact:
+        sym = str(r["symbol"]).upper()
+        side = str(r["side"]).upper()
+        last_ts = float(r["emailed_ts"])
+        ago = now_ts - last_ts
+
+        rem_ny = max(0.0, cooldown_hours_for_session("NY") * 3600 - ago)
+        rem_lon = max(0.0, cooldown_hours_for_session("LON") * 3600 - ago)
+        rem_asia = max(0.0, cooldown_hours_for_session("ASIA") * 3600 - ago)
+
+        def tag(rem):
+            return "✅" if rem <= 0 else "⛔️"
+
+        out.append(
+            f"- {sym} {side} | "
+            f"NY: {tag(rem_ny)} {_fmt_dur(rem_ny)} | "
+            f"LON: {tag(rem_lon)} {_fmt_dur(rem_lon)} | "
+            f"ASIA: {tag(rem_asia)} {_fmt_dur(rem_asia)}"
+        )
+
+    await update.message.reply_text("\n".join(out))
+
+def clear_cooldown(user_id: int, symbol: str, side: str) -> int:
+    """
+    Deletes ONE cooldown row for (user, symbol, side).
+    Returns deleted row count.
+    """
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        DELETE FROM emailed_symbols
+        WHERE user_id=? AND symbol=? AND side=?
+    """, (int(user_id), str(symbol).upper(), str(side).upper()))
+    n = cur.rowcount
+    con.commit()
+    con.close()
+    return int(n)
+
+def clear_all_cooldowns(user_id: int) -> int:
+    """
+    Deletes ALL cooldown rows for this user.
+    Returns deleted row count.
+    """
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        DELETE FROM emailed_symbols
+        WHERE user_id=?
+    """, (int(user_id),))
+    n = cur.rowcount
+    con.commit()
+    con.close()
+    return int(n)
+
+async def cooldown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /cooldown <SYMBOL> <long|short>
+    Show remaining cooldown times for NY/LON/ASIA for that symbol+direction.
+    """
+    uid = update.effective_user.id
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /cooldown <SYMBOL> <long|short>\nExample: /cooldown BTC long")
+        return
+
+    sym = re.sub(r"[^A-Za-z0-9]", "", context.args[0]).upper()
+    direction = context.args[1].strip().lower()
+    if direction not in {"long", "short"}:
+        await update.message.reply_text("Second arg must be long or short.\nExample: /cooldown BTC long")
+        return
+
+    side = "BUY" if direction == "long" else "SELL"
+
+    # find latest cooldown row for this (sym, side)
+    rows = list_cooldowns(uid)
+    match = None
+    for r in rows:
+        if str(r["symbol"]).upper() == sym and str(r["side"]).upper() == side:
+            match = r
+            break
+
+    if not match:
+        await update.message.reply_text(
+            "⏱ Cooldown\n"
+            f"{HDR}\n"
+            f"{sym} {side}\n"
+            "No cooldown recorded yet (✅ available)."
+        )
+        return
+
+    now_ts = time.time()
+    last_ts = float(match["emailed_ts"])
+    ago = now_ts - last_ts
+
+    rem_ny = max(0.0, cooldown_hours_for_session("NY") * 3600 - ago)
+    rem_lon = max(0.0, cooldown_hours_for_session("LON") * 3600 - ago)
+    rem_asia = max(0.0, cooldown_hours_for_session("ASIA") * 3600 - ago)
+
+    def tag(rem): return "✅" if rem <= 0 else "⛔️"
+
+    await update.message.reply_text(
+        "⏱ Cooldown (per session policy)\n"
+        f"{HDR}\n"
+        f"{sym} {side}\n"
+        f"NY: {tag(rem_ny)} {_fmt_dur(rem_ny)}\n"
+        f"LON: {tag(rem_lon)} {_fmt_dur(rem_lon)}\n"
+        f"ASIA: {tag(rem_asia)} {_fmt_dur(rem_asia)}"
+    )
+
+async def cooldown_clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /cooldown_clear <SYMBOL> <long|short>  (admin only)
+    Clears one cooldown row.
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /cooldown_clear <SYMBOL> <long|short>\nExample: /cooldown_clear BTC long")
+        return
+
+    sym = re.sub(r"[^A-Za-z0-9]", "", context.args[0]).upper()
+    direction = context.args[1].strip().lower()
+    if direction not in {"long", "short"}:
+        await update.message.reply_text("Second arg must be long or short.")
+        return
+
+    side = "BUY" if direction == "long" else "SELL"
+    n = clear_cooldown(uid, sym, side)
+
+    if n > 0:
+        await update.message.reply_text(f"✅ Cooldown cleared: {sym} {side}")
+    else:
+        await update.message.reply_text(f"ℹ️ No cooldown found for: {sym} {side}")
+
+async def cooldown_clear_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /cooldown_clear_all  (admin only)
+    Clears all cooldown rows for the admin user.
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    n = clear_all_cooldowns(uid)
+    await update.message.reply_text(f"✅ Cleared {n} cooldown record(s).")
+
+async def report_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+    
+    tz = ZoneInfo(user["tz"])
+    trades = db_trades_closed_today(uid, user)
+    stats = _stats_from_trades(trades)
+
+    msg = [
+        "📊 Daily Report",
+        HDR,
+        f"Closed: {stats['closed_n']} | Wins: {stats['wins']} | Losses: {stats['losses']}",
+        f"Win rate: {stats['win_rate']:.1f}%",
+        f"Net PnL: {stats['net']:+.2f}",
+        f"Avg R: {stats['avg_r']:+.2f}" if stats["avg_r"] is not None else "Avg R: -",
+        f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
+        HDR,
+    ]
+
+    await update.message.reply_text("\n".join(msg))
+
+
+async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+    
+    tz = ZoneInfo(user["tz"])
+    now = datetime.now(tz)
+    start_dt = now - timedelta(days=7)
+    ts_from = start_dt.timestamp()
+
+    trades = db_trades_since(uid, ts_from)
+    stats = _stats_from_trades(trades)
+    adv = _advice(user, stats)
+
+    msg = [
+        "📊 Weekly Report (last 7 days)",
+        HDR,
+        f"Closed: {stats['closed_n']} | Wins: {stats['wins']} | Losses: {stats['losses']}",
+        f"Win rate: {stats['win_rate']:.1f}%",
+        f"Net PnL: {stats['net']:+.2f}",
+        f"Avg R: {stats['avg_r']:+.2f}" if stats["avg_r"] is not None else "Avg R: -",
+        f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
+        HDR,
+    ]
+
+    await update.message.reply_text("\n".join(msg))
+
+async def signals_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+    
+    tz = ZoneInfo(user["tz"])
+    start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).timestamp()
+    sigs = db_list_signals_since(start)
+
+    msg = ["📮 Signals Daily Summary (generated)"]
+    msg.append(HDR)
+    msg.append(f"Total setups generated today: {len(sigs)}")
+    msg.append(HDR)
+
+    trades = db_trades_since(uid, start)
+    linked = [t for t in trades if t.get("signal_id")]
+    closed_linked = [t for t in linked if t.get("closed_ts") and t.get("pnl") is not None]
+
+    if closed_linked:
+        win = len([t for t in closed_linked if float(t["pnl"]) > 0])
+        loss = len([t for t in closed_linked if float(t["pnl"]) < 0])
+        net = sum(float(t["pnl"]) for t in closed_linked)
+        msg.append(f"Your linked signal trades closed today: {len(closed_linked)} | W {win} / L {loss} | Net {net:+.2f}")
+    else:
+        msg.append("Your linked signal trades closed today: 0")
+
+    await update.message.reply_text("\n".join(msg))
+
+async def signals_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return   
+    
+    tz = ZoneInfo(user["tz"])
+    start_dt = datetime.now(tz) - timedelta(days=7)
+    start = start_dt.astimezone(timezone.utc).timestamp()
+
+    sigs = db_list_signals_since(start)
+    msg = ["📮 Signals Weekly Summary (last 7 days)"]
+    msg.append(HDR)
+    msg.append(f"Total setups generated: {len(sigs)}")
+    msg.append(HDR)
+
+    trades = db_trades_since(uid, start)
+    linked = [t for t in trades if t.get("signal_id")]
+    closed_linked = [t for t in linked if t.get("closed_ts") and t.get("pnl") is not None]
+
+    if closed_linked:
+        win = len([t for t in closed_linked if float(t["pnl"]) > 0])
+        loss = len([t for t in closed_linked if float(t["pnl"]) < 0])
+        net = sum(float(t["pnl"]) for t in closed_linked)
+        wr = (win / len(closed_linked) * 100.0) if closed_linked else 0.0
+        msg.append(f"Your linked signal trades closed: {len(closed_linked)} | WinRate {wr:.1f}% | Net {net:+.2f}")
+    else:
+        msg.append("Your linked signal trades closed: 0")
+
+    await update.message.reply_text("\n".join(msg))
+
+# =========================================================
+# TREND ENGINE — ADAPTIVE EMA (NO FIXED EMA7/21/50)
+# =========================================================
+
+TREND_EMA_PULLBACK_ATR = 1.2
+TREND_MAX_CONFIDENCE = 90
+
+def ema_series(values, period):
+    if not values or len(values) < period:
+        return []
+    k = 2.0 / (period + 1.0)
+    ema_vals = [values[0]]
+    for v in values[1:]:
+        ema_vals.append(v * k + ema_vals[-1] * (1 - k))
+    return ema_vals
+
+def ema_slope(series, n=3):
+    if len(series) < n + 1:
+        return 0.0
+    return series[-1] - series[-1 - n]
+
+def trend_dynamic_confidence(base_conf, price, ema_fast_last, atr_15m, ch24_pct, reclaimed):
+    score = base_conf
+    if reclaimed:
+        score += 8
+
+    dist_atr = abs(price - ema_fast_last) / atr_15m
+    if dist_atr < 0.4:
+        score += 8
+    elif dist_atr < 0.8:
+        score += 4
+
+    score += min(10, abs(ch24_pct) / 2)
+    return int(min(score, TREND_MAX_CONFIDENCE))
+
+
+# =====================================================================
+def trend_watch_for_symbol(base, mv, session_name):
+    try:
+
+        c4h = fetch_ohlcv(mv.symbol, "4h", 60)
+        c15 = fetch_ohlcv(mv.symbol, "15m", 140)
+        if not c4h or not c15 or len(c15) < 40:
+            return None
+
+        closes_4h = [float(x[4]) for x in c4h]
+        closes_15 = [float(x[4]) for x in c15]
+
+        ch24 = float(mv.percentage or 0.0)
+        side = "BUY" if ch24 > 0 else "SELL"
+
+        # volatility proxy for adaptive EMA
+        atr_15m = compute_atr_from_ohlcv(c15, ATR_PERIOD)
+        price = float(mv.last or closes_15[-1])
+        atr_pct = (atr_15m / price) * 100.0 if (atr_15m and price) else 2.0
+
+        # adaptive EMA periods
+        p_fast = adaptive_ema_period(atr_pct)          # 8..21
+        p_slow = int(clamp(p_fast * 2, 16, 55))        # adaptive slow
+
+        ema_fast = ema_series(closes_15[-120:], p_fast)
+        ema_slow = ema_series(closes_15[-120:], p_slow)
+        if not ema_fast or not ema_slow:
+            return None
+
+        if side == "BUY":
+            if not (ema_fast[-1] > ema_slow[-1]):
+                return None
+            if ema_slope(ema_fast, 3) <= 0:
+                return None
+
+            # pullback touch or near-touch
+            last = closes_15[-1]
+            near = abs(last - ema_fast[-1]) / last * 100.0
+            if near > 1.2:
+                return None
+
+        else:
+            if not (ema_fast[-1] < ema_slow[-1]):
+                return None
+            if ema_slope(ema_fast, 3) >= 0:
+                return None
+
+            last = closes_15[-1]
+            near = abs(last - ema_fast[-1]) / last * 100.0
+            if near > 1.2:
+                return None
+
+        conf = 80
+        # session boost (optional)
+        if session_name == "NY":
+            conf += 5
+        elif session_name == "LON":
+            conf += 2
+
+        return {
+            "symbol": base,
+            "side": side,
+            "conf": int(clamp(conf, 1, 99)),
+            "ch24": float(ch24),
+        }
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# PRIORITY SIGNAL POOL (USED BY /screen AND EMAIL)
+# Directional Leaders/Losers → Trend Continuation Watch → Waiting for Trigger → Market Leaders
+# =========================================================
+
+def _bases_from_directional(rows, n):
+    out = []
+    for r in (rows or [])[:n]:
+        try:
+            out.append(str(r[0]).upper())
+        except Exception:
+            continue
+    return out
+
+def _subset_best(best_fut: dict, bases: list) -> dict:
+    s = set([str(b).upper() for b in (bases or [])])
+    return {k: v for k, v in (best_fut or {}).items() if str(k).upper() in s}
+
+def _market_leader_bases(best_fut: dict, n: int) -> list:
+    """Top market leaders by true futures USD notional.
+
+    IMPORTANT:
+    MarketVol does not expose `fut_vol_usd`, so using getattr(..., "fut_vol_usd")
+    silently returns 0 and breaks the fallback market-leader universe.
+    """
+    try:
+        items = [(b, mv) for b, mv in (best_fut or {}).items()]
+        items = sorted(items, key=lambda x: float(usd_notional(x[1]) or 0.0), reverse=True)
+        return [str(b).upper() for b, _ in items[:n]]
+    except Exception:
+        return []
+
+def _norm_sym(s: str) -> str:
+    s = (s or "").upper().strip()
+    # common variants -> base
+    s = s.replace("USDT.P", "").replace("USDT", "")
+    s = s.replace("-PERP", "").replace("PERP", "")
+    s = s.replace("/", "").replace("-", "").replace("_", "")
+    return s
+
+def _best_fut_vol_usd(best_fut: dict, symbol: str) -> float:
+    """
+    Returns futures volume USD from best_fut dict using robust symbol matching.
+    Handles keys like BTC, BTCUSDT, BTCUSDT.P, BTC/USDT, etc.
+    """
+    if not best_fut:
+        return 0.0
+
+    sym_raw = str(symbol or "").upper().strip()
+    sym_n = _norm_sym(sym_raw)
+
+    # direct hits first
+    mv = (best_fut or {}).get(sym_raw)
+    if mv is None:
+        mv = (best_fut or {}).get(sym_n)
+
+    # brute search by normalized keys
+    if mv is None:
+        for k, v in (best_fut or {}).items():
+            if _norm_sym(str(k)) == sym_n:
+                mv = v
+                break
+
+    if mv is None:
+        return 0.0
+
+    try:
+        return float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _median(values: list) -> float:
+    try:
+        vals = sorted([float(x) for x in values if float(x) > 0])
+        if not vals:
+            return 0.0
+        mid = len(vals) // 2
+        if len(vals) % 2 == 1:
+            return float(vals[mid])
+        return float((vals[mid - 1] + vals[mid]) / 2.0)
+    except Exception:
+        return 0.0
+
+def _email_priority_bases(best_fut: dict, directional_take: int = 12) -> set:
+    # Directional Leaders/Losers = priority symbols (email override)
+    try:
+        up_list, dn_list = compute_directional_lists(best_fut)
+        leaders = _bases_from_directional(up_list, directional_take)
+        losers  = _bases_from_directional(dn_list, directional_take)
+        return set([str(x).upper() for x in (leaders + losers)])
+    except Exception:
+        return set()
+
+
+
+def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, market_bases: list, session_name: str, max_items: int = 4) -> list:
+    """Last-resort generator to avoid empty Top Trade Setups.
+
+    Creates simple ATR-based setups for the most active symbols in the
+    directional leaders/losers + market leaders universe.
+    """
+    bases = []
+    for b in (leaders or [])[:2]:
+        bases.append((str(b).upper(), "BUY"))
+    for b in (losers or [])[:2]:
+        bases.append((str(b).upper(), "SELL"))
+    for b in (market_bases or [])[:2]:
+        bb = str(b).upper()
+        if all(bb != x[0] for x in bases):
+            # Decide side by 4H sign if available later; default BUY
+            bases.append((bb, "BUY"))
+
+    setups = []
+    for base, side in bases:
+        mv = (best_fut or {}).get(base)
+        if not mv:
+            continue
+        market_symbol = str(getattr(mv, "symbol", base))
+        entry = float(getattr(mv, "last", 0.0) or 0.0)
+        if entry <= 0:
+            continue
+
+        try:
+            c1 = fetch_ohlcv(market_symbol, "1h", limit=max(ATR_PERIOD + 10, 80))
+            atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD) if c1 else 0.0
+        except Exception:
+            atr_1h = 0.0
+
+        if atr_1h <= 0:
+            # small default: 1% of price
+            atr_1h = max(entry * 0.01, 0.0000001)
+
+        sl_dist = 1.4 * atr_1h
+        tp_dist = 2.2 * atr_1h
+
+        if side == "BUY":
+            sl = max(entry - sl_dist, entry * 0.001)
+            tp3 = entry + tp_dist
+            tp1 = entry + tp_dist * 0.6
+            tp2 = entry + tp_dist * 0.85
+        else:
+            sl = entry + sl_dist
+            tp3 = max(entry - tp_dist, entry * 0.001)
+            tp1 = max(entry - tp_dist * 0.6, entry * 0.001)
+            tp2 = max(entry - tp_dist * 0.85, entry * 0.001)
+
+        fut_vol = _fut_vol_usd_from_best(best_fut, base)
+
+        setups.append(Setup(
+            setup_id=_new_setup_id(),
+            symbol=base,
+            market_symbol=market_symbol,
+            side=side,
+            conf=70,
+            entry=entry,
+            sl=sl,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            fut_vol_usd=float(fut_vol or 0.0),
+            ch24=float(getattr(mv, "percentage", 0.0) or 0.0),
+            ch4=0.0,
+            ch1=0.0,
+            ch15=0.0,
+            ema_support_period=0,
+            ema_support_dist_pct=0.0,
+            pullback_ema_period=0,
+            pullback_ema_dist_pct=0.0,
+            pullback_ready=True,
+            pullback_bypass_hot=True,
+            engine="F",
+            is_trailing_tp3=False,
+            created_ts=time.time(),
+        ))
+
+        if len(setups) >= int(max_items):
+            break
+    return setups
+
+async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/signal_report [hours] — canonical 2-TP summary for recently emailed setups."""
+    uid = update.effective_user.id
+    user = get_user(uid) or {}
+    lookback_h = 24
+    try:
+        if context.args and str(context.args[0]).strip():
+            lookback_h = int(float(context.args[0]))
+    except Exception:
+        lookback_h = 24
+    lookback_h = int(clamp(lookback_h, 1, 168))
+    ts_from = float(time.time() - lookback_h * 3600.0)
+    emailed = db_list_emailed_setups(uid, ts_from)
+    if not emailed:
+        await update.message.reply_text(f"No emailed setups found in the last {lookback_h}h.")
+        return
+
+    def _eval_all():
+        rows = []
+        hidden_untracked_open = 0
+        for e in emailed:
+            setup_id = str(e.get('setup_id') or '').strip()
+            sess = str(e.get('session') or '').strip().upper() or '?'
+            sig = db_get_signal(setup_id) or {}
+            canon, meta = _canonical_signal_outcome_for_setup(int(uid), setup_id)
+            if _signal_report_live_backed_only(int(uid), meta, canon) is False and str(canon).upper().strip() == 'OPEN' and int(uid) == int(AUTOTRADE_OWNER_UID or 0) and str(AUTOTRADE_MODE).lower() == 'live':
+                hidden_untracked_open += 1
+                canon = 'UNTRACKED'
+            created_ts = float(sig.get('created_ts') or e.get('emailed_ts') or 0.0)
+            try:
+                tz = ZoneInfo(str(user.get('tz') or 'UTC'))
+            except Exception:
+                tz = timezone.utc
+            created_str = datetime.fromtimestamp(created_ts, tz).strftime('%m-%d %H:%M') if created_ts > 0 else '-'
+            sym = str(sig.get('symbol') or '?')
+            side = str(sig.get('side') or '?').upper()
+            conf = int(sig.get('conf') or 0) if sig.get('conf') is not None else '-'
+            rows.append({
+                'session': sess,
+                'time': created_str,
+                'trade': f"{side} {sym}",
+                'confidence': conf,
+                'outcome': canon,
+            })
+        return rows, hidden_untracked_open
+
+    rows, hidden_untracked_open = await to_thread_heavy(_eval_all, timeout=120)
+    stats = _canonical_wr_stats(rows)
+    counts = stats.get('counts') or Counter()
+    header = [
+        f"📊 Signal Report (last {lookback_h}h)",
+        HDR,
+        f"Total: {len(rows)} | Decided: {int(stats.get('decided') or 0)} | Wins (TP2): {int(stats.get('wins') or 0)} | Losses: {int(stats.get('losses') or 0)} | Win rate: {float(stats.get('win_rate') or 0.0):.1f}%",
+        f"TP1: {counts.get('TP1',0)} | TP2: {counts.get('TP2',0)} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)} | Untracked: {counts.get('UNTRACKED',0)}",
+        HDR,
+    ]
+    table_rows = [[r['session'], r['time'], r['trade'], r['confidence'], r['outcome']] for r in rows]
+    table = tabulate(table_rows, headers=['Session','Time','Trade','Confidence','Outcome'], tablefmt='plain', colalign=('left','left','left','right','left'))
+    sess_lines = ['Session breakdown:']
+    for sname, c in sorted((stats.get('by_session') or {}).items(), key=lambda kv: kv[0]):
+        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} UNTRACKED {int(c.get('untracked') or 0)}")
+    if int(hidden_untracked_open or 0) > 0:
+        sess_lines.append(f"• Hidden untracked OPEN rows: {int(hidden_untracked_open)} (not backed by live Bybit/autotrade state)")
+    msg = "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>\n" + "\n".join(sess_lines)
+    await send_long_message(update, msg, parse_mode=ParseMode.HTML)
+
+
+
+
+
+
+
+async def setups_log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setups_log [n] [screen|email|all] — view recently generated setups."""
+    uid = update.effective_user.id
+    user = get_user(uid)
+    if not has_active_access(uid, user):
+        await update.message.reply_text("⛔️ Trial finished. 👉 /billing")
+        return
+
+    n = 30
+    src = "all"
+    if context.args:
+        if context.args[0].isdigit():
+            n = max(1, min(200, int(context.args[0])))
+            if len(context.args) > 1:
+                src = str(context.args[1]).strip().lower()
+        else:
+            src = str(context.args[0]).strip().lower()
+            if len(context.args) > 1 and context.args[1].isdigit():
+                n = max(1, min(200, int(context.args[1])))
+
+    if src not in ("all", "screen", "email"):
+        src = "all"
+
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            if src == "all":
+                cur.execute(
+                    """SELECT created_ts, source, session, setup_id, symbol, side, conf
+                       FROM generated_setups
+                       WHERE user_id=?
+                       ORDER BY created_ts DESC
+                       LIMIT ?""",
+                    (int(uid), int(n)),
+                )
+            else:
+                cur.execute(
+                    """SELECT created_ts, source, session, setup_id, symbol, side, conf
+                       FROM generated_setups
+                       WHERE user_id=? AND source=?
+                       ORDER BY created_ts DESC
+                       LIMIT ?""",
+                    (int(uid), str(src), int(n)),
+                )
+            rows = cur.fetchall() or []
+    except Exception as e:
+        await update.message.reply_text(f"❌ setups_log error: {e}")
+        return
+
+    if not rows:
+        await update.message.reply_text("📦 Setups Log\n\nNo rows yet.")
+        return
+
+    lines = ["📦 Setups Log", HDR, f"Showing last {len(rows)} ({src})", ""]
+    for r in rows:
+        try:
+            ts = float(r["created_ts"])
+            dt = datetime.fromtimestamp(ts, timezone.utc).strftime("%m-%d %H:%MZ")
+        except Exception:
+            dt = "?"
+        lines.append(
+            f"{dt} | {str(r['source']).upper():5s} | {str(r['session']):8.8s} | {str(r['setup_id'])} | {str(r['side']).upper():4s} {str(r['symbol']).upper():10s} | {int(r['conf'] or 0)}"
+        )
+
+    await send_long_message(update, "\n".join(lines), parse_mode=None, disable_web_page_preview=True)
+
+
+async def admin_reset_signal_reports_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/admin_reset_signal_reports — hard reset all report-related tables to empty/zero."""
+    if not _is_admin(update):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    try:
+        async with DB_FILE_LOCK:
+            with sqlite3.connect(DB_PATH) as con:
+                c = con.cursor()
+
+                # Clear live tables used by /signal_report & /signal_report_overall + correlation log
+                for t in ("signals", "emailed_setups", "generated_setups"):
+                    try:
+                        c.execute(f"DELETE FROM {t}")
+                    except Exception:
+                        pass
+
+                # Outcomes table name can vary across builds
+                try:
+                    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('signal_outcomes','outcomes')")
+                    row = c.fetchone()
+                    if row and row[0]:
+                        try:
+                            c.execute(f"DELETE FROM {row[0]}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Reset daily counters that affect totals
+                for t in ("email_daily", "risk_daily", "setup_counter", "emailed_symbols"):
+                    try:
+                        c.execute(f"DELETE FROM {t}")
+                    except Exception:
+                        pass
+
+                con.commit()
+
+        await update.message.reply_text("✅ Reports reset: all totals are now 0 and tables cleared.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ admin_reset_signal_reports failed: {e}")
+
+
+async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/signal_report_overall — overall canonical 2-TP summary with live sync for admin/autotrade rows."""
+    uid = update.effective_user.id
+    target_uid = int(AUTOTRADE_OWNER_UID or uid) if is_admin_user(uid) else int(uid)
+    all_emailed = db_list_emailed_setups_all(target_uid)
+    total = len(all_emailed)
+    if total == 0:
+        await update.message.reply_text("No emailed setups found yet for this account.")
+        return
+
+    summary = _signal_outcome_summary(target_uid)
+    rows = summary.get('rows') or []
+    stats = _canonical_wr_stats(rows)
+    counts = stats.get('counts') or Counter()
+    by_session = stats.get('by_session') or {}
+    evaluated = len(rows)
+    coverage = (evaluated / total * 100.0) if total > 0 else 0.0
+
+    lines = [
+        '📈 Signal Report — Overall',
+        HDR,
+        f'Total emailed setups: {total}',
+        f'Evaluated: {evaluated} ({coverage:.1f}% coverage)',
+        SEP,
+        f'Completed outcomes: {int(stats.get("decided") or 0)}',
+        f'Wins (TP2): {int(stats.get("wins") or 0)} | Losses: {int(stats.get("losses") or 0)} | Signal WR: {float(stats.get("win_rate") or 0.0):.1f}%',
+        f'TP1: {counts.get("TP1",0)} | TP2: {counts.get("TP2",0)} | SL: {counts.get("SL",0)} | Open: {counts.get("OPEN",0)}',
+    ]
+    if by_session:
+        lines.extend([SEP, 'By session'])
+        for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
+            lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} UNTRACKED {int(c.get('untracked') or 0)}")
+    hidden_untracked_open = int(summary.get('hidden_untracked_open') or 0)
+    if hidden_untracked_open > 0:
+        lines.extend([SEP, f'Hidden untracked OPEN rows: {hidden_untracked_open} (not backed by live Bybit/autotrade state)'])
+    await send_long_message(update, '\n'.join(lines), parse_mode=None)
+
+async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/autotrade_report [hours] — compact live journal view."""
+    _autotrade_migrate_tables()
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
+        await update.message.reply_text("⛔️ Owner/admin only.")
+        return
+
+    lookback_h = 24
+    try:
+        if context.args and str(context.args[0]).strip():
+            lookback_h = int(float(context.args[0]))
+    except Exception:
+        lookback_h = 24
+    lookback_h = int(clamp(lookback_h, 1, 168))
+
+    lines = ["📒 AutoTrade Journal", HDR, f"Window: last {lookback_h}h (Melbourne)"]
+    open_positions = _bybit_get_open_positions_linear() if str(AUTOTRADE_MODE).lower() == 'live' else []
+    lines.extend([SEP, 'Open positions'])
+    if not open_positions:
+        lines.append('• None')
+    else:
+        total_u = 0.0
+        for p in open_positions:
+            pnl = _pos_unreal_pnl(p)
+            total_u += pnl
+            lines.append(f"• {_pos_side_text(p)} {_pos_symbol(p)} | PnL {pnl:+.2f} USDT")
+        lines.append(f"Total open PnL: {total_u:+.2f} USDT")
+
+    lines.extend([SEP, 'Closed positions'])
+    closed_any = False
+    if str(AUTOTRADE_MODE).lower() == 'live':
+        try:
+            end_ms = int(time.time() * 1000)
+            start_ms = int((time.time() - lookback_h * 3600.0) * 1000)
+            res = _bybit_v5_request('GET', '/v5/position/closed-pnl', {
+                'category': 'linear', 'startTime': start_ms, 'endTime': end_ms, 'limit': 50,
+            })
+            closed = (((res or {}).get('result') or {}).get('list') or []) if int((res or {}).get('retCode', -1)) == 0 else []
+            total_closed = 0.0
+            for r in closed[:30]:
+                try:
+                    sym = _bybit_linear_symbol(str(r.get('symbol') or ''))
+                    side = str(r.get('side') or '').upper()
+                    pnl = float(r.get('closedPnl') or 0.0)
+                    total_closed += pnl
+                    lines.append(f"• {side} {sym} | PnL {pnl:+.2f} USDT")
+                    closed_any = True
+                except Exception:
+                    continue
+            if closed_any:
+                lines.append(f"Total closed PnL: {total_closed:+.2f} USDT")
+        except Exception:
+            pass
+    if not closed_any:
+        lines.append('• None in this window')
+
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+
+def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
+    """Journal-first reconciliation stats for performance reporting."""
+    days = int(max(2, min(int(days or 7), 60)))
+    user = _autotrade_user_settings(int(uid))
+    tz = _user_tzinfo(user)
+    start_local, _ = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(user))
+    start_local = start_local - timedelta(days=days - 1)
+    start_ts = float(start_local.astimezone(timezone.utc).timestamp())
+    end_ts = float((start_local + timedelta(days=days)).astimezone(timezone.utc).timestamp())
+    journal_closed = 0
+    exchange_reconciled = 0
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        rows = cur.execute(
+            """SELECT trade_id, note, closed_ts FROM autotrade_trades
+               WHERE uid=? AND closed_ts IS NOT NULL AND closed_ts>=? AND closed_ts<?""",
+            (int(uid), int(start_ts), int(end_ts))
+        ).fetchall() or []
+        for r in rows:
+            journal_closed += 1
+            note = str(r['note'] or '')
+            if 'exchange_close_sync' in note:
+                exchange_reconciled += 1
+    provisional_emailed = 0
+    provisional_keys = set()
+    try:
+        for t in (_autotrade_reconstruct_provisional_closes(int(uid), days=days) or []):
+            sym = str(t.get('symbol') or '').upper()
+            side = str(t.get('side') or '').upper()
+            ts = int(float(t.get('closed_ts') or 0.0))
+            pnl = round(float(t.get('pnl') or 0.0), 8)
+            provisional_keys.add((sym, side, ts, pnl))
+        provisional_emailed = len(provisional_keys)
+    except Exception:
+        provisional_emailed = 0
+        provisional_keys = set()
+
+    unmatched = 0
+    try:
+        seen = set()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            rows = cur.execute(
+                """SELECT symbol, side, closed_ts, pnl_usdt, note FROM autotrade_trades
+                   WHERE uid=? AND closed_ts IS NOT NULL AND closed_ts>=? AND closed_ts<?""",
+                (int(uid), int(start_ts), int(end_ts))
+            ).fetchall() or []
+            for r in rows:
+                key = (str(r['symbol'] or '').upper(), str(r['side'] or '').upper(), int(float(r['closed_ts'] or 0.0)), round(float(r['pnl_usdt'] or 0.0), 8))
+                seen.add(key)
+        seen |= provisional_keys
+        for ev in (_bybit_get_closed_pnl_linear(start_ts, end_ts, limit=max(200, days * 80)) or []):
+            sym = str(_bybit_linear_symbol((ev or {}).get('symbol') or '')).upper()
+            ts = int(float(_bybit_closed_pnl_event_ts(ev) or 0.0))
+            pnl = round(float((ev or {}).get('closedPnl') or 0.0), 8)
+            matched = False
+            for side in _bybit_closed_pnl_event_side_candidates(ev):
+                if (sym, side, ts, pnl) in seen:
+                    matched = True
+                    break
+            if not matched:
+                unmatched += 1
+    except Exception:
+        pass
+    return {
+        'journal_confirmed_closes': int(journal_closed),
+        'exchange_reconciled_closes': int(exchange_reconciled),
+        'provisional_emailed_setup_closes': int(provisional_emailed),
+        'unmatched_exchange_closes': int(unmatched),
+    }
+
+async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin bot-lifecycle performance report over recent and overall anchored trading days."""
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
+        await update.message.reply_text("⛔️ Owner/admin only.")
+        return
+
+    days = 7
+    try:
+        if context.args and str(context.args[0]).strip():
+            days = int(float(context.args[0]))
+    except Exception:
+        days = 7
+    days = int(clamp(days, 3, 30))
+
+    owner = int(AUTOTRADE_OWNER_UID or uid)
+    recent_rows = _autotrade_performance_rows(owner, days=days)
+    recent_summary = _autotrade_performance_summary(recent_rows)
+    overall_days = _autotrade_history_days_available(owner)
+    overall_rows = _autotrade_performance_rows(owner, days=overall_days)
+    overall_summary = _autotrade_performance_summary(overall_rows)
+    owner_user = _autotrade_user_settings(owner)
+    equity_now = _effective_equity_for_risk(owner_user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
+    weighted_recent = _autotrade_weighted_outcome_summary(owner, days=days)
+    weighted_overall = _autotrade_weighted_outcome_summary(owner, days=overall_days)
+
+    def _pf_txt(v):
+        return 'INF' if v == float('inf') else f"{float(v or 0.0):.2f}"
+
+    lines = [
+        '📈 Performance Report',
+        HDR,
+        f'Recent window: last {days} anchored trading day(s)',
+        f'Overall history: {int(overall_days)} anchored trading day(s)',
+        SEP,
+        'OVERALL',
+        f"Closed trades: {int(overall_summary.get('closed') or 0)} | Wins: {int(overall_summary.get('wins') or 0)} | Losses: {int(overall_summary.get('losses') or 0)}",
+        f"Net PnL: ${float(overall_summary.get('net') or 0.0):+.2f} | Profit factor: {_pf_txt(overall_summary.get('profit_factor'))} | Expectancy: ${float(overall_summary.get('expectancy') or 0.0):+.2f}",
+        f"Realized WR: {float(overall_summary.get('win_rate') or 0.0):.1f}% | Weighted TP WR: {float(weighted_overall.get('weighted_win_rate') or 0.0):.1f}%",
+        f"TP mix: TP1 {int(weighted_overall.get('tp1_only') or 0)} | TP2 {int(weighted_overall.get('tp2_plus') or 0)} | SL {int(weighted_overall.get('losses') or 0)} | OPEN {int(weighted_overall.get('open') or 0)}",
+    ]
+    bd = overall_summary.get('best_day') or {}
+    wd = overall_summary.get('worst_day') or {}
+    if bd:
+        lines.append(f"Best day: {bd.get('day')} | ${float(bd.get('net_pnl') or 0.0):+.2f}")
+    if wd:
+        lines.append(f"Worst day: {wd.get('day')} | ${float(wd.get('net_pnl') or 0.0):+.2f}")
+
+    lines.extend([
+        SEP,
+        f'RECENT ({days} day window)',
+        f"Closed: {int(recent_summary.get('closed') or 0)} | Net PnL: ${float(recent_summary.get('net') or 0.0):+.2f} | Realized WR: {float(recent_summary.get('win_rate') or 0.0):.1f}%",
+        f"Weighted TP WR: {float(weighted_recent.get('weighted_win_rate') or 0.0):.1f}% | TP1 {int(weighted_recent.get('tp1_only') or 0)} | TP2 {int(weighted_recent.get('tp2_plus') or 0)} | SL {int(weighted_recent.get('losses') or 0)} | OPEN {int(weighted_recent.get('open') or 0)}",
+        SEP,
+        'Daily trend',
+    ])
+    for r in recent_rows:
+        wl_total = int(r.get('wins') or 0) + int(r.get('losses') or 0)
+        wr = (float(r.get('wins') or 0) / wl_total * 100.0) if wl_total > 0 else 0.0
+        lines.append(f"• {r.get('day')} | PnL ${float(r.get('net_pnl') or 0.0):+.2f} | Realized WR {wr:.1f}%")
+
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+    chart_path = _build_performance_chart_png(overall_rows or recent_rows, equity=float(equity_now or 0.0))
+    if chart_path:
+        try:
+            with open(chart_path, 'rb') as f:
+                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=f, caption='📉 Equity & daily PnL trend')
+        except Exception:
+            pass
+
+async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show last autotrade attempt details (admin only)."""
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    owner = int(AUTOTRADE_OWNER_UID or uid)
+    det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
+    dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
+    when_raw = str(det.get("when") or dec.get("when") or "")
+    when_m = _fmt_iso_to_local(when_raw) if when_raw else "—"
+
+    lines = ["*AutoTrade — Last Attempt*", HDR]
+    if not det and not dec:
+        lines.append("No attempts recorded yet.")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    lines.append(f"*When:* `{when_m}`")
+    symbol_sent = str(det.get('symbol_sent','') or '')
+    symbol_raw = str(det.get('symbol_raw','') or '')
+    symbol = symbol_sent or symbol_raw or '—'
+    lines.append(f"*Symbol:* `{symbol}`")
+    lines.append(f"*Side:* `{str(det.get('side') or '—')}`")
+    lines.append(f"*Entry:* `{_autotrade_price_str(det.get('entry'))}`")
+    lines.append(f"*Stop loss:* `{_autotrade_price_str(det.get('sl'))}`")
+    lines.append(f"*Setup ID:* `{str(det.get('setup_id') or (dec.get('latest_candidate') or {}).get('setup_id') or '—')}`")
+    sig_time = det.get('signal_created_time') or ''
+    email_time = det.get('email_logged_time') or det.get('generated_logged_time') or ''
+    lines.append(f"*Signal created:* `{_fmt_iso_to_local(sig_time) if sig_time else '—'}`")
+    lines.append(f"*Email logged:* `{_fmt_iso_to_local(email_time) if email_time else '—'}`")
+    dec_status = str(dec.get('status') or '').strip()
+    dec_reason = str(dec.get('reason') or '').strip()
+    if dec_status or dec_reason:
+        lines.append(f"*Result:* `{dec_status or '—'}`{(' | ' + dec_reason) if dec_reason else ''}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """AutoTrade readiness + last decision diagnostics (admin only)."""
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    owner = int(AUTOTRADE_OWNER_UID or uid)
+    user = get_user(owner) or {}
+    now_utc = datetime.now(timezone.utc)
+    sess = current_session_utc(now_utc)
+    ready = _autotrade_ready()
+    sess_allowed = (sess != 'NONE') and _autotrade_allowed_session(sess)
+    snap = _accounting_snapshot(owner, user, is_admin=True)
+    equity = float(snap.get('equity') or 0.0)
+    mday = _autotrade_day_risk_metrics(int(owner), float(equity))
+    dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
+
+    reasons = []
+    if not AUTOTRADE_ENABLED:
+        reasons.append('AUTOTRADE_ENABLED=0')
+    if owner <= 0:
+        reasons.append('AUTOTRADE_OWNER_UID missing/0')
+    if str(AUTOTRADE_MODE).lower() == 'live' and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
+        reasons.append('missing BYBIT_API_KEY/SECRET')
+
+    lines = [
+        '🧪 AutoTrade Debug',
+        HDR,
+        f"Ready: {'✅' if ready else '❌'} | Mode: {str(AUTOTRADE_MODE).lower()} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
+        f"Trading day: {snap.get('today_window_label')}",
+        SEP,
+        f"Equity: ${equity:.2f}",
+        f"Daily cap: ${float(snap.get('cap') or 0.0):.2f}",
+        f"Open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
+        f"Realised net today: ${float(snap.get('pnl_today') or 0.0):+.2f}",
+        f"Daily risk used (open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
+        ('Daily risk remaining: ∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f"Daily risk remaining: ${float(snap.get('remaining_today')):.2f}"),
+    ]
+    if reasons and not ready:
+        lines.extend([SEP, 'Blocking reasons'])
+        for r in reasons[:6]:
+            lines.append(f"• {r}")
+    if dec:
+        lines.extend([SEP, 'Last decision'])
+        lines.append(f"• {dec.get('status','')} | {dec.get('reason','')}")
+    class_rows = mday.get('position_classifications') or []
+    if class_rows:
+        lines.extend([SEP, 'Position day buckets'])
+        live_positions = {f"{_pos_symbol(p)}|{_pos_side_text(p)}": float(_pos_unreal_pnl(p) or 0.0) for p in (_bybit_get_open_positions_linear() or [])}
+        for row in class_rows[:10]:
+            key = f"{row.get('symbol')}|{row.get('side')}"
+            pnl = float(live_positions.get(key, 0.0) or 0.0)
+            lines.append(f"• {row.get('symbol')} | {row.get('side')} | ${pnl:+.2f}")
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all open Bybit positions (admin only) with live PnL and estimated risk."""
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔️ Admin only.")
+        return
+
+    if str(AUTOTRADE_MODE).lower() != "live":
+        await update.message.reply_text("AutoTrade is not in LIVE mode. No live positions to display.")
+        return
+
+    positions = _bybit_get_open_positions_linear()
+    if not positions:
+        await update.message.reply_text("✅ No open positions found.")
+        return
+
+    lines: list[str] = []
+    lines.append("📌 Open Positions (Bybit)")
+    lines.append(HDR)
+
+    total_pnl = 0.0
+    total_risk = 0.0
+
+    for i, p in enumerate(positions, 1):
+        sym = _pos_symbol(p)
+        side = _pos_side_text(p)
+        size = _pos_size(p)
+        entry = _pos_entry(p)
+        mark = _pos_mark(p)
+        pnl = _pos_unreal_pnl(p)
+        sl = _pos_stop(p)
+        risk = _estimate_position_risk_usd(p)
+
+        total_pnl += pnl
+        total_risk += risk
+
+        lines.append(f"{i}) {side} {sym}")
+        lines.append(f"   • Size: {size:g}")
+        lines.append(f"   • Entry: {fmt_price(entry)}   | Mark: {fmt_price(mark)}")
+        lines.append(f"   • PnL: {pnl:+.2f} USDT")
+
+        if sl and sl > 0:
+            lines.append(f"   • SL: {fmt_price(sl)}   | Risk est: {risk:.2f} USDT")
+        else:
+            lines.append("   • SL: —   | Risk est: — (needs SL)")
+
+        ct = p.get("createdTime") or p.get("created_time") or ""
+        ut = p.get("updatedTime") or p.get("updated_time") or ""
+        if ct:
+            lines.append(f"   • Opened: {_ms_to_local_str(ct)}")
+        if ut:
+            lines.append(f"   • Updated: {_ms_to_local_str(ut)}")
+
+        if i != len(positions):
+            lines.append(SEP)
+
+    lines.append(HDR)
+    lines.append(f"TOTAL unrealised PnL: {total_pnl:+.2f} USDT")
+    lines.append(f"TOTAL risk est (needs SL): {total_risk:.2f} USDT")
+
+    await send_long_message(update, "\n".join(lines))
+
+async def autotrade_debug_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    # admin-only
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    _autotrade_clear_debug_state(uid=int(uid))
+
+    await update.message.reply_text(
+        "✅ AutoTrade debug state cleared.\n"
+        "Next setup attempt will start fresh."
+    )
+
+
+async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _autotrade_migrate_tables()
+    """/autotrade_report_overall — Overall performance summary for bot-opened trades."""
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
+        await update.message.reply_text("⛔️ Owner/admin only.")
+        return
+
+    owner = int(AUTOTRADE_OWNER_UID or uid)
+    days = _autotrade_history_days_available(owner)
+    weighted = _autotrade_weighted_outcome_summary(owner, days=days)
+    perf_rows = _autotrade_performance_rows(owner, days=days)
+    perf = _autotrade_performance_summary(perf_rows)
+    live_open_positions = _bybit_get_open_positions_linear() if str(AUTOTRADE_MODE).lower() == 'live' else []
+    live_open_count = len(live_open_positions or [])
+    weighted_total = int(weighted.get('total') or 0)
+    closed_total = int(perf.get('closed') or 0)
+    total_visible = max(weighted_total, closed_total) + int(live_open_count if weighted_total <= 0 else 0)
+    if total_visible <= 0 and weighted_total <= 0 and closed_total <= 0:
+        await update.message.reply_text("No autotrade lifecycle data found yet.")
+        return
+
+    by_session = weighted.get('by_session') or {}
+    lines = [
+        "📈 AutoTrade Report (overall)",
+        HDR,
+        f"Tracked autotrade rows: {max(weighted_total, closed_total)}",
+        f"Closed autotrades: {closed_total} | Current live open positions: {live_open_count}",
+    ]
+
+    if weighted_total > 0:
+        lines.extend([
+            f"Decided: {int(weighted.get('decided') or 0)} | Weighted WR: {float(weighted.get('weighted_win_rate') or 0.0):.1f}% | Binary WR: {float(weighted.get('binary_win_rate') or 0.0):.1f}%",
+            f"TP1: {int(weighted.get('tp1_only') or 0)} | TP2: {int(weighted.get('tp2_plus') or 0)} | SL: {int(weighted.get('losses') or 0)} | Open: {int(weighted.get('open') or 0)}",
+            f"Avg staged credit/trade: {float(weighted.get('avg_weighted_credit') or 0.0):.2f}",
+        ])
+    else:
+        lines.extend([
+            "Weighted lifecycle WR: pending journal/outcome data",
+            f"Closed autotrade PnL summary: {int(perf.get('wins') or 0)}W / {int(perf.get('losses') or 0)}L | {float(perf.get('win_rate') or 0.0):.1f}% | Net {float(perf.get('net') or 0.0):+.2f} USDT",
+        ])
+
+    if by_session:
+        lines.extend(["", "Session breakdown:"])
+        for sess, item in sorted(by_session.items()):
+            lines.append(
+                f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP1 {int(item.get('tp1_only') or 0)} TP2 {int(item.get('tp2_plus') or 0)} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
+            )
+
+    await update.message.reply_text("\n".join(lines))
+
+def _leader_base_override_ok(side: str, ch24: float, ch4: float, ch15: float, fut_vol_usd: float, pullback_ready: bool, pb_dist_pct: float, session_name: str) -> bool:
+    """Allow post-expansion continuation entries after a clean 15m base/reclaim.
+
+    This is specifically meant to avoid missing explosive leaders that are already far from the
+    1H EMA anchor, but have cooled down and rebuilt around the 15m pullback EMA.
+    """
+    try:
+        if not LEADER_BASE_OVERRIDE_ENABLED:
+            return False
+        side = str(side or "").upper().strip()
+        sess = str(session_name or "").upper().strip() or "NY"
+        if abs(float(ch24 or 0.0)) < float(LEADER_BASE_MIN_CH24):
+            return False
+        if float(fut_vol_usd or 0.0) < float(LEADER_BASE_MIN_FUT_VOL_USD):
+            return False
+        if not bool(pullback_ready):
+            return False
+        if float(pb_dist_pct or 999.0) > float(LEADER_BASE_MAX_PB_DIST_PCT):
+            return False
+        if abs(float(ch15 or 0.0)) > float(LEADER_BASE_MAX_CH15_ABS):
+            return False
+        if side == "BUY" and float(ch4 or 0.0) < float(LEADER_BASE_MIN_CH4):
+            return False
+        if side == "SELL" and float(ch4 or 0.0) > -float(LEADER_BASE_MIN_CH4):
+            return False
+        if sess == "ASIA" and abs(float(ch24 or 0.0)) < float(LEADER_BASE_MIN_CH24) + 5.0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _leader_base_sl_cap_pct(session_name: str) -> float:
+    try:
+        sess = str(session_name or "").upper().strip() or "NY"
+        if sess == "ASIA":
+            return float(LEADER_BASE_SL_CAP_PCT_ASIA)
+        if sess == "LON":
+            return float(LEADER_BASE_SL_CAP_PCT_LON)
+        return float(LEADER_BASE_SL_CAP_PCT_NY)
+    except Exception:
+        return 3.3
+
+
+def _setup_leader_base_override_ok(setup: "Setup", session_name: str) -> bool:
+    try:
+        return _leader_base_override_ok(
+            side=str(getattr(setup, "side", "") or ""),
+            ch24=float(getattr(setup, "ch24", 0.0) or 0.0),
+            ch4=float(getattr(setup, "ch4", 0.0) or 0.0),
+            ch15=float(getattr(setup, "ch15", 0.0) or 0.0),
+            fut_vol_usd=float(getattr(setup, "fut_vol_usd", 0.0) or 0.0),
+            pullback_ready=bool(getattr(setup, "pullback_ready", False)),
+            pb_dist_pct=float(getattr(setup, "pullback_ema_dist_pct", 999.0) or 999.0),
+            session_name=session_name,
+        )
+    except Exception:
+        return False
+
+
+def _adaptive_ema_anchor_limit_pct(setup: "Setup", session_name: str, fallback_allowed: float) -> float:
+    """Adaptive 1H EMA-anchor limit.
+
+    The older static 0.35% anchor was starving valid continuation setups, especially
+    on higher-ATR names and momentum breakouts. This keeps the anchor discipline but
+    scales the allowance by engine, session, and ATR regime.
+    """
+    try:
+        engine = str(getattr(setup, "engine", "") or "").upper()
+        atr_pct = float(getattr(setup, "atr_pct", 0.0) or 0.0)
+        sess = str(session_name or "").upper().strip() or "NY"
+        base = float(fallback_allowed or EMA_ANCHOR_BASE_MAX_DIST_PCT or 0.80)
+
+        if engine == "B":
+            limit = max(base, 0.70 + min(1.10, atr_pct * 0.22))
+        elif engine == "A":
+            limit = max(base, 0.55 + min(0.75, atr_pct * 0.18))
+        else:
+            limit = max(base, 0.60 + min(0.85, atr_pct * 0.20))
+
+        if sess == "ASIA":
+            limit *= 0.92
+        elif sess == "NY":
+            limit *= 1.08
+
+        return float(clamp(limit, 0.55, 1.85))
+    except Exception:
+        return float(fallback_allowed or EMA_ANCHOR_BASE_MAX_DIST_PCT or 0.80)
+
+
+def _recalibrate_public_confidence(setup: "Setup", session_name: str) -> tuple[int, float, dict]:
+    """Blend legacy confidence with quality score so displayed confidence matches real quality better."""
+    try:
+        score, comps = compute_setup_quality_score(setup, session_name=session_name)
+        raw_conf = float(getattr(setup, "conf", 0) or 0.0)
+        blended = (0.35 * raw_conf) + (0.65 * float(score))
+        if str(getattr(setup, "engine", "") or "").upper() == "B" and abs(float(getattr(setup, "ch15", 0.0) or 0.0)) >= 1.0:
+            blended -= 3.0
+        blended = float(clamp(blended, 0.0, 99.0))
+        return int(round(blended)), float(score), comps
+    except Exception:
+        raw = int(float(getattr(setup, "conf", 0) or 0.0))
+        return raw, float(raw), {}
+
+
+async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
+    """
+    mode: "screen" or "email"
+    returns: {
+        "setups": [Setup...],
+        "waiting": [(base, info_dict)...],
+        "trend_watch": [dict...],
+        "spikes": [dict...],   # NEW
+        "spike_warnings": [dict...],  # NEW (Early Warning, non-trade)
+    }
+    """
+
+    # Setup-count governor (email path): keep 3–5/day without spamming (safe bounds)
+    try:
+        if str(mode or '').lower().strip() == 'email':
+            _governor_adjust_quality_floor(session_name=session_name)
+    except Exception:
+        pass
+
+
+    # Diagnostics: collect reject reasons for this scan
+    # Keep a stable structure so /why is always meaningful.
+    _rej_ctx = {
+        "__agg__": {},          # aggregate counters per reason
+        "__per__": {},          # per-symbol last reason/status
+        "__allow__": set(),     # universe allow-list (uppercased bases)
+    }
+
+    # Fallback for nested threads that may lose contextvars
+    global _GLOBAL_REJECT_CTX
+    _GLOBAL_REJECT_CTX = _rej_ctx
+    _rej_token = _REJECT_CTX.set(_rej_ctx)
+
+    # Reset near-miss list for this scan (so /screen doesn't show stale symbols)
+    try:
+        _WAITING_TRIGGER.clear()
+    except Exception:
+        pass
+# knobs
+    if mode == "screen":
+        n_target = int(SETUPS_N)
+        strict_15m = True
+        universe_cap = int(max(SCREEN_UNIVERSE_N, 35))
+        # Ensure /screen is not stricter than email engine
+        trigger_loosen = float(min(SCREEN_TRIGGER_LOOSEN, 1.0))
+        waiting_near = float(SCREEN_WAITING_NEAR_PCT)
+        allow_no_pullback = True
+        scan_multiplier = 10
+        directional_take = 12
+        market_take = 15
+        trend_take = 12
+    else:  # email
+        n_target = int(max(EMAIL_SETUPS_N * 2, 6))
+        strict_15m = True
+        universe_cap = 35
+        trigger_loosen = 1.0
+        waiting_near = float(SCREEN_WAITING_NEAR_PCT)
+        allow_no_pullback = False
+        scan_multiplier = 10
+        directional_take = 12
+        market_take = 15
+        trend_take = 12
+
+    # Aggressive profile overrides
+    prof = str(scan_profile or DEFAULT_SCAN_PROFILE).strip().lower()
+    if prof not in SCAN_PROFILES:
+        prof = DEFAULT_SCAN_PROFILE
+
+    if prof == "aggressive":
+        if mode == "screen":
+            n_target = int(max(SETUPS_N, 8))
+            universe_cap = int(max(SCREEN_UNIVERSE_N, 110))
+            trigger_loosen = float(min(0.80, SCREEN_TRIGGER_LOOSEN))
+            waiting_near = float(min(0.70, SCREEN_WAITING_NEAR_PCT))
+            scan_multiplier = 12
+            directional_take = 16
+            market_take = 18
+            trend_take = 16
+            strict_15m = True
+            allow_no_pullback = True
+        else:
+            # Email pool becomes broader, but final email gates still apply
+            n_target = int(max(EMAIL_SETUPS_N * 3, 9))
+            universe_cap = int(max(60, universe_cap))
+            trigger_loosen = 0.95
+            waiting_near = float(SCREEN_WAITING_NEAR_PCT)
+            strict_15m = True
+            allow_no_pullback = False
+            scan_multiplier = 12
+            directional_take = 14
+            market_take = 16
+            trend_take = 14
+
+    # 1) Directional leaders / losers (priority #1)
+    up_list, dn_list = compute_directional_lists(best_fut)
+
+    directional_table_n = 10
+    leaders = [str(t[0]).upper() for t in (up_list or [])[:directional_table_n]]
+    losers  = [str(t[0]).upper() for t in (dn_list or [])[:directional_table_n]]
+
+    # Market Leaders (Top by Futures Volume)
+    market_bases = _market_leader_bases(best_fut, market_take)
+
+    # Active scan universe:
+    # keep the displayed leaders/losers/market leaders first, then widen with extra top-volume names
+    # so liquid symbols that are not in the visible top buckets can still be evaluated and explained in /why.
+    display_universe_bases = list(dict.fromkeys([b.upper() for b in (leaders + losers + (market_bases or []))]))
+    extra_top_volume_bases = []
+    try:
+        ranked_all = sorted((best_fut or {}).items(), key=lambda kv: usd_notional(kv[1]), reverse=True)
+        seen_display = set(display_universe_bases)
+        for base, _mv in ranked_all:
+            b = str(base or '').upper().strip()
+            if not b or b in seen_display:
+                continue
+            extra_top_volume_bases.append(b)
+            if len(display_universe_bases) + len(extra_top_volume_bases) >= int(max(universe_cap, len(display_universe_bases))):
+                break
+    except Exception:
+        extra_top_volume_bases = []
+
+    universe_bases = list(dict.fromkeys(display_universe_bases + extra_top_volume_bases))
+    universe_best = _subset_best(best_fut, universe_bases) if universe_bases else {}
+
+    # Diagnostics: keep /why focused on this scan universe
+    try:
+        _rej_ctx["__allow__"] = set(str(x).upper() for x in (universe_bases or []) if x)
+        _rej_ctx["__per__"] = {b: {"reason": "not_evaluated", "n": 0} for b in (_rej_ctx["__allow__"] or set())}
+
+        try:
+            global _LAST_SCAN_UNIVERSE
+            _LAST_SCAN_UNIVERSE = list(universe_bases or [])
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    priority_setups = []
+
+    # Leaders pass
+    if leaders:
+        sub = _subset_best(best_fut, leaders)
+        try:
+            tmp = pick_setups(
+                sub,
+                n_target * scan_multiplier,
+                strict_15m,
+                session_name,
+                min(int(universe_cap), len(sub) if sub else universe_cap),
+                trigger_loosen,
+                waiting_near,
+                allow_no_pullback,
+                scan_profile=prof,
+            )
+        except Exception:
+            tmp = []
+        for s in (tmp or []):
+            if s.side == "BUY":
+                priority_setups.append(s)
+
+    # Losers pass
+    if losers:
+        sub = _subset_best(best_fut, losers)
+        try:
+            tmp = pick_setups(
+                sub,
+                n_target * scan_multiplier,
+                strict_15m,
+                session_name,
+                min(int(universe_cap), len(sub) if sub else universe_cap),
+                trigger_loosen,
+                waiting_near,
+                allow_no_pullback,
+                scan_profile=prof,
+            )
+        except Exception:
+            tmp = []
+        for s in (tmp or []):
+            if s.side == "SELL":
+                priority_setups.append(s)
+
+    # 1b) Full universe pass (leaders + losers + market leaders)
+    try:
+        if universe_best:
+            tmp = pick_setups(
+                universe_best,
+                n_target * scan_multiplier,
+                strict_15m,
+                session_name,
+                min(int(universe_cap), len(universe_best) if universe_best else universe_cap),
+                trigger_loosen,
+                waiting_near,
+                allow_no_pullback,
+                scan_profile=prof,
+            )
+        else:
+            tmp = []
+    except Exception:
+        tmp = []
+    for s in (tmp or []):
+        priority_setups.append(s)
+
+    # ------------------------------------------------
+    # Engine B: Momentum Breakout Setups (Balanced)
+    # ------------------------------------------------
+    breakout_setups = []
+    try:
+        bases_for_breakout = list(dict.fromkeys([b.upper() for b in (leaders + losers)]))
+        if bases_for_breakout:
+            sub = _subset_best(best_fut, bases_for_breakout)
+            breakout_setups = pick_breakout_setups(
+                sub,
+                int(max(6, n_target)),   # allow a handful
+                session_name,
+                min(int(universe_cap), len(sub) if sub else universe_cap),
+                scan_profile=prof,
+            )
+    except Exception:
+        breakout_setups = []
+
+    if breakout_setups:
+        priority_setups.extend(breakout_setups)
+
+    # 2) Trend continuation watch (priority #2)
+    watch_bases = []
+    watch_bases.extend([b for b in leaders[:6]])
+    watch_bases.extend([b for b in losers[:6]])
+    watch_bases = list(dict.fromkeys([b.upper() for b in watch_bases]))
+
+    trend_watch = []
+    trend_bases = []
+    for base in watch_bases:
+        mv = (best_fut or {}).get(base)
+        if not mv:
+            continue
+        r = await to_thread_heavy(trend_watch_for_symbol, base, mv, session_name)
+        if r:
+            trend_watch.append(r)
+            trend_bases.append(base)
+
+    if trend_bases:
+        sub = _subset_best(best_fut, trend_bases[:trend_take])
+        try:
+            tmp = pick_setups(
+                sub,
+                n_target * scan_multiplier,
+                strict_15m,
+                session_name,
+                min(int(universe_cap), len(sub) if sub else universe_cap),
+                trigger_loosen,
+                waiting_near,
+                allow_no_pullback,
+                scan_profile=prof,
+            )
+        except Exception:
+            tmp = []
+
+        side_map = {str(t.get("symbol")).upper(): str(t.get("side")) for t in (trend_watch or []) if t.get("symbol")}
+        for s in (tmp or []):
+            want = side_map.get(str(s.symbol).upper())
+            if want and s.side == want:
+                priority_setups.append(s)
+
+    # 3) Waiting for Trigger (priority #3) is produced by pick_setups via _WAITING_TRIGGER
+    waiting_items = []
+    try:
+        if _WAITING_TRIGGER:
+            allow_set = set(str(x).upper() for x in (_LAST_SCAN_UNIVERSE or []))
+            waiting_items = [
+                (b, o)
+                for (b, o) in list(_WAITING_TRIGGER.items())
+                if (not allow_set) or (str(b).upper() in allow_set)
+            ][:SCREEN_WAITING_N]
+    except Exception:
+        waiting_items = []
+
+    # 4) Market leaders fallback (priority #4)
+    if len(priority_setups) < (n_target * 2):
+        if market_bases:
+            sub = _subset_best(best_fut, market_bases)
+            try:
+                tmp = pick_setups(
+                    sub,
+                    n_target * scan_multiplier,
+                    strict_15m,
+                    session_name,
+                    min(int(universe_cap), len(sub) if sub else universe_cap),
+                    trigger_loosen,
+                    waiting_near,
+                    allow_no_pullback,
+                    scan_profile=prof,
+                )
+            except Exception:
+                tmp = []
+            priority_setups.extend(tmp or [])
+
+    # 4B) Momentum Breakout setups (Engine B) — Balanced
+    try:
+        mom_n = max(6, int(n_target) * 2)
+        mom = pick_breakout_setups(
+            universe_best,  # ✅ restricted universe
+            mom_n,
+            session_name,
+            int(universe_cap),
+            scan_profile=prof,
+        )
+    except Exception:
+        mom = []
+    if mom:
+        priority_setups.extend(mom)
+
+
+    
+    # -----------------------------------------------------
+    # BALANCE MODE: If strict_15m produces too few candidates,
+    # add a relaxed 15m pass to avoid starving /screen and email pools.
+    # This keeps quality-first behavior, but prevents "no signals" sessions.
+    # -----------------------------------------------------
+    if strict_15m and str(mode or "").lower().strip() != "email" and len(priority_setups) < int(max(3, n_target)):
+        try:
+            if universe_best:
+                tmp = pick_setups(
+                    universe_best,
+                    n_target * scan_multiplier,
+                    False,  # relaxed 15m
+                    session_name,
+                    min(int(universe_cap), len(universe_best) if universe_best else universe_cap),
+                    trigger_loosen,
+                    waiting_near,
+                    allow_no_pullback,
+                    scan_profile=prof,
+                )
+                priority_setups.extend(tmp or [])
+        except Exception:
+            pass
+
+        # If still low, try market leaders once with relaxed 15m
+        try:
+            if len(priority_setups) < int(max(3, n_target)) and market_bases:
+                sub = _subset_best(best_fut, market_bases)
+                tmp = pick_setups(
+                    sub,
+                    n_target * scan_multiplier,
+                    False,  # relaxed 15m
+                    session_name,
+                    min(int(universe_cap), len(sub) if sub else universe_cap),
+                    trigger_loosen,
+                    waiting_near,
+                    allow_no_pullback,
+                    scan_profile=prof,
+                )
+                priority_setups.extend(tmp or [])
+        except Exception:
+            pass
+
+        # De-duplicate setups after relaxation
+        try:
+            seen = set()
+            deduped = []
+            for s in (priority_setups or []):
+                k = (
+                    getattr(s, "setup_id", None),
+                    getattr(s, "market_symbol", None),
+                    getattr(s, "side", None),
+                    getattr(s, "entry", None),
+                    getattr(s, "sl", None),
+                )
+                if k in seen:
+                    continue
+                seen.add(k)
+                deduped.append(s)
+            priority_setups = deduped
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------
+    # CRITICAL GATE (DYNAMIC EMA ANCHOR):
+    # Require price to be close to the *nearest* 1H EMA among {EMA_ANCHOR_1H_PERIODS}.
+    # This preserves your original intent (avoid "stretched" entries),
+    # but reduces missed opportunities when EMA7 isn't the active magnet.
+    # -----------------------------------------------------
+    ema_anchor_cache: Dict[str, Tuple[bool, float, float, float, int, float]] = {}
+    gated = []
+    for s in (priority_setups or []):
+        try:
+            mk = str(getattr(s, "market_symbol", "") or "")
+            base = str(getattr(s, "symbol", "") or "").upper().strip()
+            if not mk:
+                mv = (best_fut or {}).get(base)
+                _rej("missing_market_symbol", base, mv, "EMA-anchor gate")
+                continue
+
+            if mk not in ema_anchor_cache:
+                ema_anchor_cache[mk] = ema_anchor_1h_is_close(
+                    mk,
+                    base_max_dist_pct=EMA_ANCHOR_BASE_MAX_DIST_PCT,
+                    periods=EMA_ANCHOR_1H_PERIODS,
+                )
+
+            ok, dist_pct, last_close, ema_val, ema_p, allowed = ema_anchor_cache[mk]
+            adaptive_allowed = _adaptive_ema_anchor_limit_pct(s, session_name=session_name, fallback_allowed=allowed)
+            leader_base_ok = _setup_leader_base_override_ok(s, session_name=session_name)
+            if float(dist_pct) > float(adaptive_allowed) and not leader_base_ok:
+                mv = (best_fut or {}).get(base)
+                _rej(
+                    "far_from_ema_anchor_1h",
+                    base,
+                    mv,
+                    f"ema={ema_p} dist={dist_pct:.2f}% max={adaptive_allowed:.2f}% base={allowed:.2f}% close={last_close:.6g} emaV={ema_val:.6g}",
+                )
+                continue
+
+            try:
+                setattr(s, "ema_anchor_period", int(ema_p or 0))
+                setattr(s, "ema_anchor_dist_pct", float(dist_pct or 0.0))
+                setattr(s, "ema_anchor_limit_pct", float(adaptive_allowed or 0.0))
+                if float(dist_pct) > float(allowed or adaptive_allowed):
+                    if leader_base_ok:
+                        setattr(s, "leader_base_anchor_override", True)
+                    else:
+                        s.conf = int(max(0, int(getattr(s, "conf", 0) or 0) - 4))
+            except Exception:
+                pass
+
+            gated.append(s)
+        except Exception:
+            try:
+                base = str(getattr(s, "symbol", "") or "").upper().strip()
+                mv = (best_fut or {}).get(base)
+                _rej("ema_anchor_gate_error", base, mv)
+            except Exception:
+                pass
+            continue
+
+    priority_setups = gated
+
+
+    # de-dupe by (symbol, side, engine) keeping highest conf, preserving priority order
+    best = {}
+    for s in priority_setups:
+        k = (str(s.symbol).upper(), str(s.side), str(getattr(s, "engine", "")))
+        if k not in best or int(s.conf) > int(best[k].conf):
+            best[k] = s
+
+    ordered = []
+    seen = set()
+    for s in priority_setups:
+        k = (str(s.symbol).upper(), str(s.side), str(getattr(s, "engine", "")))
+        if k in seen:
+            continue
+        if k in best:
+            ordered.append(best[k])
+            seen.add(k)
+
+    # If still empty, create a small fallback set so /screen isn't blank.
+    if not ordered and mode == "screen":
+        try:
+            ordered = _fallback_setups_from_universe(best_fut, leaders, losers, market_bases, session_name, max_items=max(4, n_target))
+        except Exception:
+            pass
+
+    
+    # -----------------------------------------------------
+    # Shared Top Setup gate (applies to BOTH /screen and email)
+    # -----------------------------------------------------
+    try:
+        ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, source=mode, session_name=session_name)[0]]
+    except Exception:
+        pass
+# -----------------------------------------------------
+    # NEW: Spike Reversal candidates (15M+ Vol) — for /screen only
+    # -----------------------------------------------------
+    spike_candidates = []
+    if mode == "screen":
+        try:
+            spike_candidates = await to_thread_heavy(_spike_reversal_candidates,
+                universe_best,
+                10_000_000.0,  # min_vol_usd
+                0.55,          # wick_ratio_min
+                1.20,          # atr_mult_min
+                6,             # max_items
+            )
+        except Exception:
+            spike_candidates = []
+
+    # -----------------------------------------------------
+    # NEW: Early Warning — Possible Reversal Zones (non-trade)
+    # -----------------------------------------------------
+    spike_warnings = []
+    if mode == "screen":
+        try:
+            spike_warnings = await to_thread_heavy(_spike_reversal_warnings,
+                universe_best,
+                10_000_000.0,  # min_vol_usd
+                1.15,          # atr_mult_min
+                0.60,          # body_ratio_min
+                8,             # lookback_1h
+                0.30,          # retrace_min
+                6,             # max_items
+            )
+        except Exception:
+            spike_warnings = []
+
+    # Store diagnostics for /why, then ALWAYS reset context
+    try:
+        if uid is not None:
+            counts = {
+                str(k): int(v)
+                for k, v in dict(_rej_ctx or {}).items()
+                if not str(k).startswith("__")
+            }
+            payload = {
+                "ts": time.time(),
+                "mode": str(mode or ''),
+                "allow": list(_rej_ctx.get("__allow__") or []),
+                "counts": counts,
+                "per_symbol": dict((_rej_ctx.get("__per__") or {})),
+            }
+            bucket = _LAST_REJECTS.get(int(uid)) or {}
+            if isinstance(bucket, dict) and any(k in bucket for k in ("screen", "email", "latest")):
+                bucket = dict(bucket)
+            else:
+                bucket = {}
+            if str(mode or '').strip():
+                bucket[str(mode).strip().lower()] = payload
+            bucket["latest"] = payload
+            _LAST_REJECTS[int(uid)] = bucket
+    finally:
+        try:
+            _REJECT_CTX.reset(_rej_token)
+        except Exception:
+            pass
+        try:
+            _GLOBAL_REJECT_CTX = None
+        except Exception:
+            pass
+
+    return {
+        "setups": ordered,
+        "waiting": waiting_items,
+        "trend_watch": trend_watch,
+        "spikes": spike_candidates,
+        "spike_warnings": spike_warnings,
+    }
+
+
+
+
+# =========================================================
+# User location/time helpers
+# =========================================================
+def user_location_and_time(user: dict):
+    """
+    Returns: (location_label, time_str) based on user's tz
+    """
+    tz_name = str((user or {}).get("tz") or "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+        tz_name = "UTC"
+
+    now_local = datetime.now(tz)
+
+    if "/" in tz_name:
+        parts = tz_name.split("/")
+        region = parts[0].replace("_", " ")
+        city = parts[-1].replace("_", " ")
+        loc = f"{city} ({region})"
+    else:
+        loc = tz_name
+
+    return loc, now_local.strftime("%Y-%m-%d %H:%M")
+
+
+# =========================================================
+# /screen fast cache (per-instance)
+# =========================================================
+SCREEN_CACHE_TTL_SEC = 20  # seconds
+SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
+_SCREEN_CACHE: dict[str, dict] = {}
+_SCREEN_LOCK = asyncio.Lock()
+
+# Background refresh task for /screen (keeps UX instant)
+_SCREEN_REFRESH_TASK = None  # asyncio.Task
+
+async def _refresh_screen_cache_async():
+    """Refreshes _SCREEN_CACHE in the background (best effort)."""
+    global _SCREEN_REFRESH_TASK
+    try:
+        best_fut = await to_thread_heavy(fetch_futures_tickers)
+        if not best_fut:
+            return
+        now_utc = datetime.now(timezone.utc)
+        session = scan_session_name_utc(now_utc)
+        body, kb = await to_thread_heavy(_build_screen_body_and_kb,
+            best_fut,
+            session,
+            0,
+        )
+        cache_key = f"global::{str(session or '').upper()}"
+        _SCREEN_CACHE[cache_key] = {
+            "ts": time.time(),
+            "body": body,
+            "kb": list(kb or []),
+        }
+    except Exception:
+        # never let background refresh crash the bot
+        return
+    finally:
+        _SCREEN_REFRESH_TASK = None
+
+
+
+# =========================================================
+# /screen
+# =========================================================
+
+
+
+def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
+    """Heavy /screen builder (runs in a worker thread).
+
+    Top setups intentionally reuse the SAME email-grade pool for the active session.
+    That keeps /screen, emailed setups, and autotrade aligned; only delivery/execution
+    rules like gap/caps/risk may suppress sending or trading.
+
+    Returns:
+        body (str): cached body (header is built in the async handler)
+        kb (list[tuple[str,str]]): [(SYMBOL, SETUP_ID), ...] for TradingView buttons
+    """
+    # Build pool (coroutine) in this worker thread (isolated event loop)
+    pool = _run_coro_in_thread(
+        build_priority_pool(
+            best_fut,
+            session,
+            mode="email",
+            scan_profile=str(DEFAULT_SCAN_PROFILE),
+            uid=uid,
+        )
+    )
+
+    # Other heavy helpers are sync; run them here too.
+    # Market context inputs (keep /screen informative without becoming a data terminal)
+    leaders_txt = build_leaders_table(best_fut)  # fast (top by futures volume)
+    up_list, dn_list = compute_directional_lists(best_fut)
+
+    # Hard cap: never show more than 3 top setups on /screen
+    try:
+        setups = (pool.get("setups") or [])[:min(int(SETUPS_N), 3)]
+    except Exception:
+        setups = (pool.get("setups") or [])[:3]
+
+    # For UX: do not show the same symbol in Momentum Watch if it's already a Top Setup
+    try:
+        top_setup_syms = set(str(getattr(s, 'symbol', '') or '').upper() for s in (setups or []) if getattr(s, 'symbol', None))
+    except Exception:
+        top_setup_syms = set()
+    # Ensure conf exists + persist signal cards to DB (used by Signal ID lookup)
+    try:
+        for s in (setups or []):
+            if not hasattr(s, "conf") or s.conf is None:
+                s.conf = 0
+            db_insert_signal(s, user_id=uid)
+            try:
+                db_log_generated_setup(uid, "screen", session, s)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Setup cards -> combined text (single "Top Trade Setups" section)
+    combined_setups_txt = "_No high-quality setups right now._"
+    if setups:
+        def _mv_dot(p: float) -> str:
+            try:
+                p = float(p or 0.0)
+            except Exception:
+                p = 0.0
+            if abs(p) < 2.0:
+                return "🟡"
+            return "🟢" if p >= 0 else "🔴"
+
+        def _engine_label(e: str) -> str:
+            ee = str(e or "").strip().upper()
+            if ee == "A":
+                return "Pullback"
+            if ee == "B":
+                return "Momentum Breakout"
+            if ee == "F":
+                return "Fallback"
+            return "Setup"
+
+        lines2 = []
+        for s in setups:
+            try:
+                sym = str(getattr(s, "symbol", "")).upper()
+                sid = str(getattr(s, "setup_id", "") or "")
+                side = str(getattr(s, "side", "") or "").upper()
+                conf = int(getattr(s, "conf", 0) or 0)
+
+                entry = float(getattr(s, "entry", 0.0) or 0.0)
+                sl = float(getattr(s, "sl", 0.0) or 0.0)
+                tp1 = getattr(s, "tp1", None)
+                tp2 = getattr(s, "tp2", None)
+                tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+                vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+
+                ch24 = float(getattr(s, "ch24", 0.0) or 0.0)
+                ch4 = float(getattr(s, "ch4", 0.0) or 0.0)
+                ch1 = float(getattr(s, "ch1", 0.0) or 0.0)
+                ch15 = float(getattr(s, "ch15", 0.0) or 0.0)
+
+                rr_den = abs(entry - sl)
+                rr1 = (abs(float(tp1) - entry) / rr_den) if (rr_den > 0 and tp1 not in (None, 0, 0.0)) else 0.0
+                rr2 = (abs(float(tp2) - entry) / rr_den) if (rr_den > 0 and tp2 not in (None, 0, 0.0)) else 0.0
+                rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
+
+                pos_word = "long" if side == "BUY" else "short"
+                size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
+
+                emoji = "🟢" if side == "BUY" else "🔴"
+                typ = _engine_label(getattr(s, "engine", ""))
+
+                # Card-style formatting (same as previous detailed preview) + /size command
+                block = []
+                block.append(f"{emoji} *{side} — {sym}*")
+                block.append(f"`{sid}` | Conf: `{conf}`")
+                try:
+                    if symbol_recently_emailed(uid, sym, side, session):
+                        block.append("📩 *Email suppressed:* cooldown active")
+                except Exception:
+                    pass
+                if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
+                    block.append(f"Type: {typ} | RR(TP1): `{rr1:.2f}` | RR(TP2): `{rr2:.2f}`")
+                else:
+                    block.append(f"Type: {typ} | RR(TP2): `{rr2:.2f}`")
+                block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
+                if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
+                    block.append(f"TP1: `{fmt_price(float(tp1))}` | TP2: `{fmt_price(float(tp2))}`")
+                else:
+                    block.append(f"TP2: `{fmt_price(tp3)}`")
+                block.append(
+                    f"Moves: 24H {ch24:+.0f}% {_mv_dot(ch24)} • 4H {ch4:+.0f}% {_mv_dot(ch4)} • "
+                    f"1H {ch1:+.0f}% {_mv_dot(ch1)} • 15m {ch15:+.0f}% {_mv_dot(ch15)}"
+                )
+                block.append(f"Volume: ~{vol/1e6:.1f}M")
+                block.append(f"Chart: {tv_chart_url(sym)}")
+                block.append(f"`{size_cmd}`")
+                lines2.append("\n".join(block))
+            except Exception:
+                continue
+
+        combined_setups_txt = ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
+
+    # -----------------------------------------------------
+    # UX: Keep /screen clean and action-first.
+    # - Top Trade Setups = ONLY qualified, email-eligible setups.
+    # - Momentum Watch = small "FYI" list (no entry yet).
+    # - Market Context = compressed pulse of the market (tone + a few leaders/losers + BTC/ETH).
+    # -----------------------------------------------------
+
+    # Momentum Watch (No Entry Yet)
+    momentum_lines = []
+    try:
+        waiting_items = pool.get("waiting") or []
+    except Exception:
+        waiting_items = []
+
+    try:
+        trend_watch = pool.get("trend_watch") or []
+    except Exception:
+        trend_watch = []
+
+    try:
+        seen_syms = set()
+
+        # 1) Waiting-for-trigger items first (near-miss)
+        for item in (waiting_items or [])[:max(2, int(SCREEN_WAITING_N or 2))]:
+            try:
+                if not (isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[1], dict)):
+                    continue
+                base, d = item
+                sym = str(base).upper()
+                if sym in (top_setup_syms or set()):
+                    continue
+                raw_side = str(d.get("side", "BUY") or "BUY").strip().upper()
+                if raw_side in ("LONG",):
+                    side = "BUY"
+                elif raw_side in ("SHORT",):
+                    side = "SELL"
+                elif raw_side in ("BUY", "SELL"):
+                    side = raw_side
+                else:
+                    side = raw_side
+                dot = "🟢" if side == "BUY" else ("🔴" if side == "SELL" else "🟡")
+                if sym in seen_syms:
+                    continue
+                seen_syms.add(sym)
+                momentum_lines.append(f"• *{sym}* {dot} `{side}` — waiting for entry trigger")
+                if len(momentum_lines) >= 2:
+                    break
+            except Exception:
+                continue
+
+        # 2) Trend watch (strong trend but no valid entry) — fill remaining slots
+        if len(momentum_lines) < 2:
+            trend_watch_sorted = sorted(
+                (trend_watch or []),
+                key=lambda x: int(x.get("confidence", x.get("conf", 0)) or 0),
+                reverse=True
+            )
+            for t in trend_watch_sorted:
+                try:
+                    sym = str(t.get("symbol", "")).upper().strip()
+                    if sym in (top_setup_syms or set()):
+                        continue
+                    if not sym or sym in seen_syms:
+                        continue
+                    side = str(t.get("side", "BUY") or "BUY").strip().upper()
+                    dot = "🟢" if side == "BUY" else ("🔴" if side == "SELL" else "🟡")
+                    seen_syms.add(sym)
+                    momentum_lines.append(f"• *{sym}* {dot} `{side}` — strong trend, no qualified entry yet")
+                    if len(momentum_lines) >= 2:
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        momentum_lines = []
+
+    momentum_txt = ""
+    if momentum_lines:
+        momentum_txt = "*Momentum Watch (No Entry Yet)*\n" + SEP + "\n" + "\n".join(momentum_lines)
+
+    # Market Context (compressed)
+    market_txt = ""
+    try:
+        # Build Leaders/Losers for Market Context
+        # Goal: show up to 5 items each (when available), preferring "directional" movers,
+        # but backfilling with high-volume movers so the section is informative.
+        vol_min = float(MOVER_VOL_USD_MIN)
+
+        movers = []
+        for sym, mv in (best_fut or {}).items():
+            try:
+                v = float(usd_notional(mv) or 0.0)
+                c24 = float(getattr(mv, "percentage", 0.0) or 0.0)
+                movers.append((sym, v, c24))
+            except Exception:
+                continue
+
+        movers = [t for t in movers if t[1] >= vol_min]
+
+        # Backfill thresholds: start strict, relax if we don't have enough.
+        def _pick_top(movers_list, direction: str):
+            out = []
+            used = set()
+            if direction == "up":
+                thresholds = [float(MOVER_UP_24H_MIN), 5.0, 0.0]
+                key = lambda x: x[2]
+                filt = lambda x, th: x[2] >= th
+                sort_rev = True
+            else:
+                thresholds = [abs(float(MOVER_DN_24H_MAX)), 5.0, 0.0]  # compare on absolute move
+                key = lambda x: -x[2]  # more negative first when sorting ascending by c24
+                filt = lambda x, th: (-x[2]) >= th
+                sort_rev = False
+
+            for th in thresholds:
+                if direction == "up":
+                    cand = [x for x in movers_list if x[0] not in used and filt(x, th)]
+                    cand = sorted(cand, key=lambda x: x[2], reverse=True)
+                else:
+                    cand = [x for x in movers_list if x[0] not in used and filt(x, th)]
+                    cand = sorted(cand, key=lambda x: x[2])  # most negative first
+
+                for x in cand:
+                    out.append(x)
+                    used.add(x[0])
+                    if len(out) >= 5:
+                        return out
+            return out
+
+        up_picks = _pick_top(movers, "up")
+        dn_picks = _pick_top(movers, "dn")
+
+        up_top = [f"*{str(sym).upper()}* {pct_with_emoji(c24)} ({v/1e6:.1f}M)" for sym, v, c24 in up_picks]
+        dn_top = [f"*{str(sym).upper()}* {pct_with_emoji(c24)} ({v/1e6:.1f}M)" for sym, v, c24 in dn_picks]
+        # Tone heuristic (based on strict directional thresholds)
+        upn = sum(1 for _sym, _v, _c24 in movers if _c24 >= float(MOVER_UP_24H_MIN))
+        dnn = sum(1 for _sym, _v, _c24 in movers if _c24 <= float(MOVER_DN_24H_MAX))
+        if upn >= max(2, int(dnn * 1.5)):
+            tone = "🟢 Bullish"
+        elif dnn >= max(2, int(upn * 1.5)):
+            tone = "🔴 Bearish"
+        else:
+            tone = "🟡 Mixed"
+
+        # BTC/ETH pulse (if available)
+        btc = (best_fut or {}).get("BTC")
+        eth = (best_fut or {}).get("ETH")
+        btc24 = pct_with_emoji(float(getattr(btc, "percentage", 0.0) or 0.0)) if btc else "—"
+        eth24 = pct_with_emoji(float(getattr(eth, "percentage", 0.0) or 0.0)) if eth else "—"
+
+        lines = [
+            f"*Market Context*",
+            SEP,
+            f"*Risk Tone:* {tone}",
+            "",
+            f"*Pulse:* *BTC* {btc24} | *ETH* {eth24}",
+            "",
+        ]
+        if up_top:
+            lines.append(f"*Leaders:* " + ", ".join(up_top))
+            lines.append("")
+        if dn_top:
+            lines.append(f"*Losers:* " + ", ".join(dn_top))
+            lines.append("")
+
+        market_txt = "\n".join(lines).strip()
+    except Exception:
+        market_txt = ""
+
+    # Assemble body (cache THIS, header stays live)
+    def _is_empty(txt: str) -> bool:
+        t = (txt or "").strip()
+        if not t:
+            return True
+        return t.startswith("_No ") or t.startswith("No ") or t.endswith("right now._")
+
+    blocks = []
+    blocks.extend(["", "*Top Trade Setups*", SEP, combined_setups_txt])
+
+    # Only show momentum section if there are no qualified setups OR to give quick context.
+    if momentum_txt and (not _is_empty(momentum_txt)):
+        blocks.extend(["", momentum_txt])
+
+    if market_txt and (not _is_empty(market_txt)):
+        blocks.extend(["", market_txt])
+
+    body = "\n".join([b for b in blocks if b is not None]).strip()
+
+    kb = []
+    try:
+        kb = [(s.symbol, s.setup_id) for s in (setups or [])]
+    except Exception:
+        kb = []
+    return body, kb
+
+async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _hb_touch('screen', ok=True, details='screen_cmd_invoked')
+
+    uid = update.effective_user.id
+    user = get_user(uid)
+
+    if not has_active_access(uid, user):
+        await update.message.reply_text(
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+        return
+
+    # Avoid long scans blocking other commands on small instances
+    if SCAN_LOCK.locked():
+        await update.message.reply_text("⏳ Scan is running… please try /screen again in a moment.")
+        return
+
+    await SCAN_LOCK.acquire()
+    try:
+        # Send immediate response (fast perceived UX)
+        status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
+
+        reset_reject_tracker()
+
+        best_fut = await asyncio.to_thread(fetch_futures_tickers)
+        if not best_fut:
+            await status_msg.edit_text("❌ Failed to fetch futures data.")
+            return
+
+        # Header (always fresh)
+        uid = update.effective_user.id
+        user = get_user(uid)
+        live_session = current_session_utc()
+        scan_session = scan_session_name_utc()
+        loc_label, loc_time = user_location_and_time(user)
+
+        header = (
+            f"*PulseFutures — Market Scan*\n"
+            f"{HDR}\n"
+            f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+        )
+        if live_session == "NONE":
+            header += "_Outside live session window. Manual scan shown for reference only._\n"
+
+        now_ts = time.time()
+        cache_key = f"uid:{int(uid)}::{str(scan_session or '').upper()}"
+        cache_entry = _SCREEN_CACHE.get(cache_key) or {}
+
+        # ------------- FAST PATH (cache hit) -------------
+        cached_body = ""
+        cached_kb = []
+        if (cache_entry.get("body") and (now_ts - float(cache_entry.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
+            cached_body = str(cache_entry.get("body") or "")
+            cached_kb = list(cache_entry.get("kb") or [])
+
+            msg = (header + "\n" + cached_body).strip()
+
+            keyboard = [
+                [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                for (sym, sid) in (cached_kb or [])
+            ]
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+            await send_long_message(
+                update,
+                msg,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            )
+            return
+
+        # ------------- SLOW PATH (build once under lock) -------------
+        async with _SCREEN_LOCK:
+            # Re-check cache after waiting for lock (another request may have filled it)
+            now_ts = time.time()
+            cache_entry = _SCREEN_CACHE.get(cache_key) or {}
+            if (cache_entry.get("body") and (now_ts - float(cache_entry.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
+                cached_body = str(cache_entry.get("body") or "")
+                cached_kb = list(cache_entry.get("kb") or [])
+
+                msg = (header + "\n" + cached_body).strip()
+                keyboard = [
+                    [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                    for (sym, sid) in (cached_kb or [])
+                ]
+
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+
+                await send_long_message(
+                    update,
+                    msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+                )
+                return
+
+
+            # Heavy build MUST NOT run on the asyncio event loop.
+            # Only /screen is allowed to take longer; everything here runs in a worker thread.
+            body, kb = await asyncio.to_thread(
+                _build_screen_body_and_kb,
+                best_fut,
+                scan_session,
+                int(update.effective_user.id),
+            )
+
+            # Cache for fast subsequent /screen calls (user + session scoped)
+            _SCREEN_CACHE[cache_key] = {
+                "ts": time.time(),
+                "body": body,
+                "kb": list(kb or []),
+            }
+
+
+        # Send final
+        cache_entry = _SCREEN_CACHE.get(cache_key) or {}
+        msg = (header + "\n" + str(cache_entry.get("body") or "")).strip()
+        keyboard = [
+            [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+            for (sym, sid) in (cache_entry.get("kb") or [])
+        ]
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        await send_long_message(
+            update,
+            msg,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+        )
+
+    except Exception as e:
+        logger.exception("screen_cmd failed")
+        try:
+            await update.message.reply_text(f"❌ /screen failed: {e}")
+        except Exception:
+            pass
+
+
+
+# =========================================================
+# TEXT ROUTER (Signal ID lookup)
+# =========================================================
+    finally:
+        try:
+            if SCAN_LOCK.locked():
+                SCAN_LOCK.release()
+        except Exception:
+            pass
+
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text.startswith("PF-"):
+        sig = db_get_signal(text)
+        if not sig:
+            await update.message.reply_text("Signal ID not found.")
+            return
+
+        tps = f"TP2 {fmt_price(float(sig['tp2'] or sig['tp3']))}"
+        if sig.get("tp1") and sig.get("tp2") and int(sig["conf"]) >= MULTI_TP_MIN_CONF:
+            tps = f"TP1 {fmt_price(float(sig['tp1']))} | TP2 {fmt_price(float(sig['tp2'] or sig['tp3']))}"
+
+        rr3 = rr_to_tp(float(sig["entry"]), float(sig["sl"]), float(sig["tp3"]))
+
+        await update.message.reply_text(
+            f"🔎 Signal {sig['setup_id']}\n"
+            f"{sig['side']} {sig['symbol']} — Conf {sig['conf']}/100\n"
+            f"Entry {fmt_price(float(sig['entry']))} | SL {fmt_price(float(sig['sl']))}\n"
+            f"{tps}\n"
+            f"RR(TP2): {rr_to_tp(float(sig['entry']), float(sig['sl']), float(sig.get('tp2') or sig['tp3'])):.2f}\n"
+            f"Chart: {tv_chart_url(sig['symbol'])}\n\n"
+            f"To journal it:\n"
+            f"/trade_open {sig['symbol']} {'long' if sig['side']=='BUY' else 'short'} entry {sig['entry']} sl {sig['sl']} risk usd 40 sig {sig['setup_id']}"
+        )
+        return
+
+# =========================================================
+# EMAIL BODY
+# =========================================================
+
+def tz_location_label(tz_name: str) -> str:
+    """Return a friendly location label from an IANA tz like 'Australia/Sydney'."""
+    try:
+        tz_name = str(tz_name or '').strip()
+    except Exception:
+        tz_name = ''
+    if not tz_name:
+        return 'Local time'
+    parts = tz_name.split('/')
+    region = parts[0] if parts else tz_name
+    city = parts[-1] if parts else tz_name
+    try:
+        city = city.replace('_', ' ').strip()
+    except Exception:
+        pass
+    region_label = region
+    # Small UX mappings (keep it simple + safe)
+    if region == 'America':
+        region_label = 'USA'
+    elif region == 'Etc':
+        region_label = 'UTC'
+    return f"{city} ({region_label})" if city else str(region_label)
+
+
+def _email_body_pretty(
+    session_name: str,
+    now_local: datetime,
+    user_tz: str,
+    setups: List[Setup],
+    best_fut: Dict[str, MarketVol],
+) -> str:
+    loc_label = tz_location_label(user_tz)
+    when_str = now_local.strftime("%Y-%m-%d %H:%M")
+
+    parts = []
+    parts.append(HDR)
+    parts.append(f"📩 PulseFutures • {session_name} • {loc_label}: {when_str} ({user_tz})")
+    parts.append(HDR)
+    parts.append("")
+
+    up, dn = compute_directional_lists(best_fut)
+    leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:5]
+    parts.append("Market Snapshot")
+    parts.append(SEP)
+
+    if leaders:
+        topv = ", ".join([f"{b}({pct_with_emoji(float(mv.percentage or 0.0))})" for b, mv in leaders])
+        parts.append(f"Top Volume: {topv}")
+
+    if up:
+        parts.append("Leaders: " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in up[:5]]))
+    if dn:
+        parts.append("Losers:  " + ", ".join([f"{b}({pct_with_emoji(c24)})" for b, v, c24, c4, px in dn[:5]]))
+    parts.append("")
+
+    parts.append("Top Setups")
+    parts.append(SEP)
+    parts.append("")
+
+    for i, s in enumerate(setups, 1):
+        rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+
+        # ✅ "ID-" prefix
+        parts.append(f"ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
+        parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP2): {rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}")
+
+        _tp1, _tp2, _tp3 = _ensure_three_tps(s.entry, s.sl, s.tp3, getattr(s, "tp1", None), getattr(s, "tp2", None), getattr(s, "side", ""))
+        if _tp1 not in (None, 0, 0.0) and _tp2 not in (None, 0, 0.0) and _tp3 not in (None, 0, 0.0):
+            parts.append(
+                f"   TP1: {fmt_price_email(_tp1)} | TP2: {fmt_price_email(_tp2)}"
+            )
+        else:
+            parts.append(f"   TP2: {fmt_price_email(s.tp2 or s.tp3)}")
+
+        # ✅ only for t# trailing-needed setups
+        if getattr(s, 'is_trailing_tp3', False):
+            pass
+
+        parts.append(
+            f"   24H {pct_with_emoji(s.ch24)} | 4H {pct_with_emoji(s.ch4)} | "
+            f"1H {pct_with_emoji(s.ch1)} | 15m {pct_with_emoji(s.ch15)} | Vol~{fmt_money(s.fut_vol_usd)}"
+        )
+        parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
+        try:
+            _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
+            parts.append(f"/size {str(getattr(s, 'symbol', ''))} {_pos} entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}")
+        except Exception:
+            pass
+        parts.append("")
+
+    parts.append(HDR)
+    parts.append("🤖 Position Sizing")
+    parts.append("Use the PulseFutures Telegram bot to calculate safe position size based on your Stop Loss.")
+    parts.append(f"👉 {TELEGRAM_BOT_URL}")
+    parts.append(HDR)
+    parts.append("Not financial advice.")
+    parts.append("PulseFutures")
+    parts.append(HDR)
+
+    return "\n".join(parts).strip()
+
+
+def _email_body_pretty_html(
+    session_name: str,
+    now_local: datetime,
+    user_tz: str,
+    setups: List[Setup],
+    best_fut: Dict[str, MarketVol],
+) -> str:
+    """HTML version of the email body styled to resemble Telegram /screen cards (bold headings + code blocks)."""
+    loc_label = tz_location_label(user_tz)
+    when_str = now_local.strftime("%Y-%m-%d %H:%M")
+
+    def esc(s: str) -> str:
+        try:
+            import html as _html
+            return _html.escape(str(s))
+        except Exception:
+            return str(s)
+
+    lines = []
+    lines.append(f"<div style='font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.35'>")
+    lines.append(f"<div style='font-size:16px;font-weight:700'>📩 PulseFutures • {esc(session_name)} • {esc(loc_label)}: {esc(when_str)} ({esc(user_tz)})</div>")
+    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:10px 0'>")
+
+    up, dn = compute_directional_lists(best_fut)
+    leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:5]
+
+    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Market Snapshot</div>")
+    if leaders:
+        topv = ", ".join([f"{esc(b)}({esc(pct_with_emoji(float(mv.percentage or 0.0)))})" for b, mv in leaders])
+        lines.append(f"<div>Top Volume: {topv}</div>")
+    if up:
+        lines.append("<div>Leaders: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in up[:5]]) + "</div>")
+    if dn:
+        lines.append("<div>Losers: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in dn[:5]]) + "</div>")
+
+    lines.append("<hr style='border:none;border-top:1px solid #eee;margin:10px 0'>")
+    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Top Setups</div>")
+
+    for i, s in enumerate(setups, 1):
+        rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+        side = esc(s.side)
+        sym = esc(s.symbol)
+        conf = esc(s.conf)
+        setup_id = esc(s.setup_id)
+
+        card = []
+        card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
+        card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
+        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP2): <code>{rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}</code></div>")
+
+        if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
+            card.append(
+                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> &nbsp;|&nbsp; TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>"
+            )
+        else:
+            card.append(f"<div style='margin-top:4px'>TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>")
+
+        if s.is_trailing_tp3:
+            pass
+
+        card.append(
+            f"<div style='margin-top:6px'>24H {esc(pct_with_emoji(s.ch24))} &nbsp;|&nbsp; 4H {esc(pct_with_emoji(s.ch4))} &nbsp;|&nbsp; "
+            f"1H {esc(pct_with_emoji(s.ch1))} &nbsp;|&nbsp; 15m {esc(pct_with_emoji(s.ch15))} &nbsp;|&nbsp; Vol~{esc(fmt_money(s.fut_vol_usd))}</div>"
+        )
+        card.append(f"<div style='margin-top:6px'>Chart: {esc(tv_chart_url(s.symbol))}</div>")
+        try:
+            _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
+            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
+            card.append(f"<div style='margin-top:8px'><code style='background:#f7f7f7;padding:8px;border-radius:8px;display:inline-block;white-space:nowrap;font-family:Menlo,Consolas,monospace'>{esc(size_line)}</code></div>")
+        except Exception:
+            pass
+        card.append("</div>")
+        lines.extend(card)
+
+    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:12px 0'>")
+    lines.append("<div style='font-weight:700'>🤖 Position Sizing</div>")
+    lines.append("<div>Use the PulseFutures Telegram bot to calculate safe position size based on your Stop Loss.</div>")
+    lines.append(f"<div style='margin-top:4px'>👉 {esc(TELEGRAM_BOT_URL)}</div>")
+    lines.append("<div style='margin-top:10px;color:#666'>Not financial advice. PulseFutures</div>")
+    lines.append("</div>")
+    return "".join(lines).strip()
+
+
+    def esc(s: str) -> str:
+        try:
+            import html as _html
+            return _html.escape(str(s))
+        except Exception:
+            return str(s)
+
+    lines = []
+    lines.append(f"<div style='font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.35'>")
+    lines.append(f"<div style='font-size:16px;font-weight:700'>📩 PulseFutures • {esc(session_name)} • {esc(loc_label)}: {esc(when_str)} ({esc(user_tz)})</div>")
+    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:10px 0'>")
+
+    up, dn = compute_directional_lists(best_fut)
+    leaders = sorted(best_fut.items(), key=lambda kv: usd_notional(kv[1]), reverse=True)[:5]
+
+    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Market Snapshot</div>")
+    if leaders:
+        topv = ", ".join([f"{esc(b)}({esc(pct_with_emoji(float(mv.percentage or 0.0)))})" for b, mv in leaders])
+        lines.append(f"<div>Top Volume: {topv}</div>")
+    if up:
+        lines.append("<div>Leaders: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in up[:5]]) + "</div>")
+    if dn:
+        lines.append("<div>Losers: " + ", ".join([f"{esc(b)}({esc(pct_with_emoji(c24))})" for b, v, c24, c4, px in dn[:5]]) + "</div>")
+
+    lines.append("<hr style='border:none;border-top:1px solid #eee;margin:10px 0'>")
+    lines.append("<div style='font-weight:700;margin:8px 0 4px'>Top Setups</div>")
+
+    for i, s in enumerate(setups, 1):
+        rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+        side = esc(s.side)
+        sym = esc(s.symbol)
+        conf = esc(s.conf)
+        setup_id = esc(s.setup_id)
+
+        card = []
+        card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
+        card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
+        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP2): <code>{rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}</code></div>")
+
+        if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
+            card.append(
+                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> &nbsp;|&nbsp; TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>"
+            )
+        else:
+            card.append(f"<div style='margin-top:4px'>TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>")
+
+        if s.is_trailing_tp3:
+            pass
+
+        card.append(
+            f"<div style='margin-top:6px'>24H {esc(pct_with_emoji(s.ch24))} &nbsp;|&nbsp; 4H {esc(pct_with_emoji(s.ch4))} &nbsp;|&nbsp; "
+            f"1H {esc(pct_with_emoji(s.ch1))} &nbsp;|&nbsp; 15m {esc(pct_with_emoji(s.ch15))} &nbsp;|&nbsp; Vol~{esc(fmt_money(s.fut_vol_usd))}</div>"
+        )
+        card.append(f"<div style='margin-top:6px'>Chart: {esc(tv_chart_url(s.symbol))}</div>")
+        try:
+            _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
+            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
+            card.append(f"<div style='margin-top:8px'><code style='background:#f7f7f7;padding:8px;border-radius:8px;display:inline-block;white-space:nowrap;font-family:Menlo,Consolas,monospace'>{esc(size_line)}</code></div>")
+        except Exception:
+            pass
+        card.append("</div>")
+        lines.extend(card)
+
+    lines.append("<hr style='border:none;border-top:1px solid #ddd;margin:12px 0'>")
+    lines.append("<div style='font-weight:700'>🤖 Position Sizing</div>")
+    lines.append("<div>Use the PulseFutures Telegram bot to calculate safe position size based on your Stop Loss.</div>")
+    lines.append(f"<div style='margin-top:4px'>👉 {esc(TELEGRAM_BOT_URL)}</div>")
+    lines.append("<div style='margin-top:10px;color:#666'>Not financial advice. PulseFutures</div>")
+    lines.append("</div>")
+    return "".join(lines).strip()
+
+
+def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut) -> bool:
+    """
+    One email containing multiple setups.
+    Requires _email_body_pretty(...) and send_email(...).
+    """
+    if not setups:
+        return False
+
+    uid = int(user["user_id"])
+    user_tz = str(user.get("tz") or "UTC")
+    try:
+        tz = ZoneInfo(user_tz)
+    except Exception:
+        tz = timezone.utc
+        user_tz = "UTC"
+
+    now_local = datetime.now(tz)
+
+    # Display the *market* session (NY/LON/ASIA) in the email header.
+    # 'UNLIMITED' is an access mode, not a market session.
+    try:
+        live_sess = current_session_utc(datetime.now(timezone.utc))
+    except Exception:
+        live_sess = "NONE"
+    sess_name = str(sess.get("name") or "")
+    display_session = (live_sess if live_sess != "NONE" else "NY") if sess_name == "UNLIMITED" else sess_name
+
+    first = setups[0]
+    subject = f"PulseFutures • {display_session} • {first.side} {first.symbol}"
+    if len(setups) > 1:
+        subject += f" (+{len(setups)-1} more)"
+
+    body = _email_body_pretty(
+        session_name=str(display_session),
+        now_local=now_local,
+        user_tz=user_tz,
+        setups=setups,
+        best_fut=best_fut,
+    )
+
+    body_html = _email_body_pretty_html(
+        session_name=str(display_session),
+        now_local=now_local,
+        user_tz=user_tz,
+        setups=setups,
+        best_fut=best_fut,
+    )
+
+    try:
+        for s in setups:
+            try:
+                db_insert_signal(s, user_id=uid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    sent = send_email(subject, body, user_id_for_debug=uid, body_html=body_html)
+    if sent:
+        try:
+            now_ts = time.time()
+            for s in setups:
+                try:
+                    db_mark_emailed_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
+                except Exception:
+                    pass
+                try:
+                    db_mark_executable_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
+                except Exception:
+                    pass
+                try:
+                    db_log_generated_setup(uid, "email", str(display_session or ""), s)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    else:
+        try:
+            for s in setups:
+                try:
+                    _admin_setup_lifecycle_merge(
+                        int(uid),
+                        str(getattr(s, 'setup_id', '') or ''),
+                        session=str(display_session or ''),
+                        symbol=str(getattr(s, 'symbol', '') or ''),
+                        side=str(getattr(s, 'side', '') or ''),
+                        state='email_failed_not_executable',
+                        last_reason='smtp_send_failed',
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return sent
+
+
+
+
+# =========================================================
+# STRIPE WEBHOOK SERVER
+# =========================================================
+class StripeWebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        payload = self.rfile.read(int(self.headers["Content-Length"]))
+        sig = self.headers.get("Stripe-Signature")
+
+        try:
+            event = stripe.Webhook.construct_event(
+                payload,
+                sig,
+                os.environ.get("STRIPE_WEBHOOK_SECRET"),
+            )
+        except Exception:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        data = event["data"]["object"]
+
+        if event["type"] in ("checkout.session.completed", "invoice.paid"):
+            email = data.get("customer_email")
+        
+            # get price + plan
+            line = data["lines"]["data"][0]
+            price_id = line["price"]["id"]
+            plan = STRIPE_PRICE_TO_PLAN.get(price_id)
+        
+            # reference + amount
+            ref = data.get("id") or event.get("id")
+            amount = (line.get("amount_total") or data.get("amount_paid") or 0) / 100
+            currency = (data.get("currency") or "usd").upper()
+        
+            if email and plan:
+                activate_user_with_ledger_by_email(
+                    email=email,
+                    plan=plan,
+                    ref=ref,
+                    amount=amount,
+                    currency=currency,
+                )
+
+        if event["type"] == "customer.subscription.deleted":
+            email = data.get("customer_email")
+            ref = data.get("id") or event.get("id")
+            if email:
+                downgrade_user_with_ledger_by_email(email, ref=ref)
+
+        self.send_response(200)
+        self.end_headers()
+
+def start_stripe_webhook():
+    HTTPServer(("0.0.0.0", 4242), StripeWebhookHandler).serve_forever()
+
+# =========================================================
+# MY PLAN & BILLING
+# =========================================================
+
+async def myplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    user = get_user(user_id)  # however you fetch user data
+
+    plan = effective_plan(user_id, user)
+    expires = (user or {}).get("plan_expires")
+
+    msg = f"""\
+📦 Your Plan
+
+• Plan: {plan.upper()}
+• Status: {'Admin (Unlimited)' if is_admin_user(user_id) else ('Active' if plan != 'free' else 'Free user')}
+"""
+
+    if expires:
+        msg += f"• Expires: {expires}\n"
+
+    await update.message.reply_text(msg)
+
+
+
+async def billing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Billing menu: Stripe (Payment Links) + USDT.
+    - Uses env vars only (safe on Render)
+    - Does NOT call Stripe API (no stripe.api_key needed)
+    - Never crashes if not configured
+    """
+    user = update.effective_user
+    uid = user.id if user else None
+
+    # Stripe Payment Links
+    stripe_standard_url = _env("STRIPE_STANDARD_URL")
+    stripe_pro_url = _env("STRIPE_PRO_URL")
+
+    # USDT
+    usdt_network = _env("USDT_NETWORK", "TRC20")
+    usdt_address = _env("USDT_ADDRESS")
+    usdt_note = _env("USDT_NOTE")
+
+    # Support
+    support_handle = _env("BILLING_SUPPORT_HANDLE", "@PulseFuturesSupport")
+
+    # Reference for manual matching (USDT payments, or any support ticket)
+    ref = f"PF-{uid}" if uid else "PF-UNKNOWN"
+
+    lines = []
+    lines.append("💳 PulseFutures — Billing & Upgrade")
+    lines.append("")
+    lines.append("Choose your payment method below.")
+    lines.append(f"Reference (important): {ref}")
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("1) Stripe (Card / Apple Pay / Google Pay)")
+    lines.append("────────────────────")
+    if stripe_standard_url or stripe_pro_url:
+        lines.append("Tap a plan button to pay securely via Stripe.")
+    else:
+        lines.append("Stripe is not configured yet.")
+        lines.append("Admin: set STRIPE_STANDARD_URL / STRIPE_PRO_URL in Render env vars.")
+
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("2) USDT")
+    lines.append("────────────────────")
+    if usdt_address:
+        lines.append(f"Network: {usdt_network}")
+        lines.append(f"Address: {usdt_address}")
+        lines.append(f"(Short: {_mask_addr(usdt_address)})")
+        if usdt_note:
+            lines.append(f"Note: {usdt_note.replace('<REF>', ref)}")
+        else:
+            lines.append(f"Note: After sending, message support with TXID + reference '{ref}'.")
+    else:
+        lines.append("USDT is not configured yet.")
+        lines.append("Admin: set USDT_ADDRESS (+ optional USDT_NETWORK) in Render env vars.")
+
+    lines.append("")
+    lines.append("────────────────────")
+    lines.append("After payment")
+    lines.append("────────────────────")
+    lines.append("1) If Stripe: you’ll be activated after confirmation (or contact support if needed).")
+    lines.append("2) If USDT: submit TXID using /usdt_paid <TXID> <standard|pro>.")
+    lines.append(f"Support: {support_handle}")
+    lines.append(f"Reference: {ref}")
+
+    msg = "\n".join(lines)
+
+    # Buttons
+    buttons = []
+    stripe_row = []
+    if stripe_standard_url:
+        stripe_row.append(InlineKeyboardButton("✅ Stripe — Standard", url=stripe_standard_url))
+    if stripe_pro_url:
+        stripe_row.append(InlineKeyboardButton("🚀 Stripe — Pro", url=stripe_pro_url))
+    if stripe_row:
+        buttons.append(stripe_row)
+
+    howto_url = _env("BILLING_HOWTO_URL")
+    if howto_url:
+        buttons.append([InlineKeyboardButton("ℹ️ Payment Instructions", url=howto_url)])
+
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+
+    await send_long_message(
+        update,
+        msg,
+        parse_mode=None,
+        disable_web_page_preview=True,
+        reply_markup=reply_markup,
+    )
+
+def activate_user_with_ledger_by_email(email: str, plan: str, ref: str, amount: float = 0, currency: str = "USD"):
+    """
+    Activates user by email AND records payment in ledger.
+    """
+    user = get_user_by_email(email)
+    if not user:
+        return
+
+    user_id = user["user_id"]
+
+    # 1) grant access (existing behavior)
+    activate_user_by_email(email, plan)
+
+    # 2) write unified access state
+    _set_user_access(user_id, plan, "stripe", ref)
+
+    # 3) write payment ledger
+    _ledger_add(
+        user_id=user_id,
+        source="stripe",
+        ref=ref,
+        plan=plan,
+        amount=amount,
+        currency=currency,
+        status="paid",
+    )
+
+def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
+    user = get_user_by_email(email)
+    if not user:
+        return
+
+    user_id = user["user_id"]
+
+    downgrade_user_by_email(email)
+    _set_user_access(user_id, "free", "stripe", ref)
+
+
+
+# =========================================================
+# EMAIL JOB
+# =========================================================
+
+EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "60"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "60"))
+EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "60"))
+
+# SMTP connection reuse (Render speed fix)
+SMTP_REUSE_TTL_SEC = int(os.environ.get("SMTP_REUSE_TTL_SEC", "240"))  # 4 minutes
+
+_SMTP_LOCK = threading.RLock()
+_SMTP_CONN = None          # cached SMTP connection
+_SMTP_CONN_IS_SSL = None   # bool
+_SMTP_CONN_TS = 0.0        # last-used timestamp
+
+
+async def _to_thread_with_timeout(fn, timeout_sec: int, *args, **kwargs):
+    return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout_sec)
+
+def _run_coro_in_thread(coro):
+    """Run an awaitable inside a dedicated event loop in a worker thread.
+
+    Used when synchronous thread offloading needs the *result* of an async
+    function (for example build_priority_pool inside /screen or the email loop).
+    Keeps the main Telegram event loop non-blocking and avoids relying on any
+    ambient loop existing inside the worker thread.
+    """
+    if not inspect.isawaitable(coro):
+        return coro
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            asyncio.set_event_loop(None)
+            loop.close()
+
+async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
+    """
+    Runs send_email() in a worker thread with a hard timeout so SMTP/network stalls
+    can't block the Telegram event loop (Render lag fix).
+    """
+    try:
+        return bool(await _to_thread_with_timeout(send_email, timeout_sec, *args, **kwargs))
+    except asyncio.TimeoutError:
+        return False
+    except Exception:
+        return False
+
+async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
+    # Prevent overlapping runs (JobQueue can overlap if a run is slow)
+    if ALERT_LOCK.locked():
+        return
+
+    async with ALERT_LOCK:
+        # Keep it quiet if email is off or not configured
+        if not EMAIL_ENABLED:
+            return
+        if not email_config_ok():
+            return
+
+        # Trade-signal emails may be notify_on-gated,
+        # but Big-Move Alerts should go to anyone who has an email saved.
+
+        try:
+            users_notify = list_users_notify_on()
+        except Exception as e:
+            logger.exception("list_users_notify_on failed: %s", e)
+            users_notify = []
+
+        try:
+            users_bigmove = list_users_with_email()
+        except Exception as e:
+            logger.exception("list_users_with_email failed: %s", e)
+            users_bigmove = []
+
+        if not users_notify and not users_bigmove:
+            return
+
+        # TIMEOUT-PROTECTED fetch (prevents lock being held forever)
+        try:
+            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, EMAIL_FETCH_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            return
+        except Exception:
+            return
+
+        if not best_fut:
+            return
+
+        # -----------------------------------------------------
+        # Rule 2: Volume relative filter base line (killer rule)
+        # -----------------------------------------------------
+        _all_vols = []
+        for _b, _mv in (best_fut or {}).items():
+            try:
+                _all_vols.append(float(getattr(_mv, "fut_vol_usd", 0.0) or 0.0))
+            except Exception:
+                pass
+        MARKET_VOL_MEDIAN_USD = _median(_all_vols)
+
+        # -----------------------------------------------------
+        # Big-Move Alert Emails (independent of full trade setups)
+        # Trigger: |4H| >= user.bigmove_alert_4h  OR  |1H| >= user.bigmove_alert_1h
+        # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 10M)
+        # Defaults: 1H=7.5%, 4H=15%
+        # -----------------------------------------------------
+        for u in (users_bigmove or []):
+            # Pro/trial-only email features
+            try:
+                uid = int(u.get("user_id") or u.get("id") or 0)
+            except Exception:
+                uid = 0
+            if uid and (not user_has_pro(uid)):
+                continue
+
+            tz = timezone.utc
+            uid = 0
+            try:
+                try:
+                    uid = int(u.get("user_id") or u.get("id") or 0)
+                except Exception:
+                    uid = 0
+                if not uid:
+                    continue
+
+                uu = get_user(uid) or {}
+
+                tz_name = str((uu or {}).get("tz") or "UTC")
+                try:
+                    tz = ZoneInfo(tz_name)
+                except Exception:
+                    tz = timezone.utc
+
+                # Respect per-user ON/OFF
+                on = int(uu.get("bigmove_alert_on", 1) or 0)
+                if not on:
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": ["bigmove_alert_off"],
+                    }
+                    continue
+
+                try:
+                    p4 = float(uu.get("bigmove_alert_4h", 15.0) or 15.0)
+                    p1 = float(uu.get("bigmove_alert_1h", 7.5) or 7.5)
+                except Exception:
+                    p4, p1 = 15.0, 7.5
+
+                try:
+                    min_vol = float(uu.get("bigmove_min_vol_usd", 10_000_000) or 10_000_000)
+                except Exception:
+                    min_vol = 10_000_000.0
+
+                candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, min_vol_usd=min_vol, max_items=12)
+
+                # Debug counts from the SAME dataset used for bigmove (same field-name logic)
+                def _pick_pct(_mv, _keys) -> float:
+                    for _k in _keys:
+                        try:
+                            _v = getattr(_mv, _k, None)
+                            if _v is None:
+                                continue
+                            return float(_v or 0.0)
+                        except Exception:
+                            continue
+                    return 0.0
+
+                try:
+                    bm_any_4h = sum(
+                        1 for _sym, _mv in (best_fut or {}).items()
+                        if abs(_pick_pct(_mv, ["ch4", "pct_4h", "change_4h", "chg_4h", "percentage_4h", "p4", "h4"])) >= float(p4)
+                    )
+                except Exception:
+                    bm_any_4h = -1
+
+                try:
+                    bm_any_1h = sum(
+                        1 for _sym, _mv in (best_fut or {}).items()
+                        if abs(_pick_pct(_mv, ["ch1", "pct_1h", "change_1h", "chg_1h", "percentage_1h", "p1", "h1"])) >= float(p1)
+                    )
+                except Exception:
+                    bm_any_1h = -1
+
+                if not candidates:
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": [
+                            f"no_candidates (p4={p4}, p1={p1})",
+                            f"debug_raw_hits:4h={bm_any_4h},1h={bm_any_1h}",
+                        ],
+                    }
+                    continue
+
+                # Volume gate (default 10M) + remove ones emailed recently (per symbol + direction)
+                filtered = []
+                for c in candidates:
+                    try:
+                        vol = float(c.get("vol", 0.0) or 0.0)
+                    except Exception:
+                        vol = 0.0
+
+                    if vol > 0.0 and vol < float(min_vol):
+                        continue
+
+                    try:
+                        if not bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
+                            filtered.append(c)
+                    except Exception:
+                        filtered.append(c)
+
+                if not filtered:
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": [f"no_candidates_after_volume_or_cooldown (min_vol={min_vol/1e6:.1f}M)"],
+                    }
+                    continue
+
+                # Build email body
+                lines = []
+                lines.append("⚡ PulseFutures — BIG MOVE ALERT")
+                lines.append(HDR)
+                lines.append(f"Triggers: |4H| ≥ {p4:.1f}%  OR  |1H| ≥ {p1:.1f}%")
+                lines.append(f"Min Vol (24H): {min_vol/1e6:.1f}M")
+                lines.append("")
+
+                top = filtered[0]
+                top_sym = top["symbol"]
+                top_dir = "UP" if top.get("direction") == "UP" else "DOWN"
+                top_move = top["ch4"] if abs(top.get("ch4", 0.0)) >= abs(top.get("ch1", 0.0)) else top.get("ch1", 0.0)
+                top_tf = "4H" if abs(top.get("ch4", 0.0)) >= abs(top.get("ch1", 0.0)) else "1H"
+
+                subject = f"⚡ Big Move Alert • {top_sym} {top_dir} • {top_tf} {top_move:+.0f}%"
+                if len(filtered) > 1:
+                    subject += f" (+{len(filtered)-1} more)"
+
+                for c in filtered[:8]:
+                    sym = c["symbol"]
+                    ch4 = float(c.get("ch4", 0.0) or 0.0)
+                    ch1 = float(c.get("ch1", 0.0) or 0.0)
+                    vol = float(c.get("vol", 0.0) or 0.0)
+                    arrow = "🟢" if c.get("direction") == "UP" else "🔴"
+
+                    lines.append(f"{arrow} {sym}: 4H {ch4:+.0f}% | 1H {ch1:+.0f}% | Vol ~{vol/1e6:.1f}M")
+                    lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
+                    lines.append("")
+
+                body = "\n".join(lines).strip()
+
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "TRY_SEND",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": [
+                        f"candidates={len(filtered)}",
+                        f"p4={p4}",
+                        f"p1={p1}",
+                        f"min_vol={min_vol}",
+                    ],
+                }
+
+                ok = await _send_email_async(
+                    EMAIL_SEND_TIMEOUT_SEC,
+                    subject,
+                    body,
+                    user_id_for_debug=uid,
+                    enforce_trade_window=False
+                )
+
+
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "SENT" if ok else "FAIL",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": ["ok"] if ok else [_LAST_SMTP_ERROR.get(uid, "send_email_failed")],
+                }
+
+                if ok:
+                    for c in filtered[:8]:
+                        try:
+                            mark_bigmove_emailed(uid, c["symbol"], c["direction"])
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "ERROR",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": [f"{type(e).__name__}: {e}"],
+                }
+                continue
+        
+
+        # -----------------------------------------------------
+        setups_by_session: Dict[str, List[Setup]] = {}
+        for sess_name in (EMAIL_BUILD_SESSIONS or ["ASIA", "LON", "NY"]):
+            try:
+                pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=uid)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                pool = {"setups": []}
+            except Exception:
+                pool = {"setups": []}
+
+            setups = (pool.get("setups", []) or [])[:max(EMAIL_SETUPS_N * 3, 9)]
+
+            # Rule 3: Priority override (Directional Leaders/Losers first)
+            if EMAIL_PRIORITY_OVERRIDE_ON:
+                pri = _email_priority_bases(best_fut, directional_take=12)
+                setups = sorted(
+                    setups,
+                    key=lambda s: (0 if str(getattr(s, "symbol", "")).upper() in pri else 1)
+                )
+
+            setups_by_session[sess_name] = setups
+
+            for s in setups:
+                try:
+                    db_insert_signal(s)
+                except Exception:
+                    pass
+
+        # -----------------------------------------------------
+        # Per-user send / skip logic
+        # -----------------------------------------------------
+        for user in (users_notify or []):
+            # ✅ Robust uid resolution (supports either user_id or id)
+            try:
+                uid = int(user.get("user_id") or user.get("id") or 0)
+            except Exception:
+                uid = 0
+            if not uid:
+                continue
+
+            # ✅ Robust tz resolution (never crash job)
+            tz_name = str(user.get("tz") or "UTC")
+            try:
+                tz = ZoneInfo(tz_name)
+            except Exception:
+                tz = timezone.utc
+                tz_name = "UTC"
+
+            # ✅ Ensure session logic never crashes job
+            try:
+                sess = in_session_now(user)
+            except Exception as e:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"in_session_now_failed ({type(e).__name__})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # If user is NOT in an enabled session right now, skip
+            if not sess:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": ["not_in_enabled_session (outside live session window / gap)"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            sess_name = str(sess.get("name") or "").upper()
+            display_sess = sess_name
+            setups_all = setups_by_session.get(sess_name, []) or []
+            if not setups_all:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"no_setups_generated_for_session ({display_sess})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # state init must not crash job
+            try:
+                st = email_state_get(uid)
+            except Exception as e:
+                _tmp_dec = {
+                    "status": "ERROR",
+                    "reasons": [f"email_state_get_failed ({type(e).__name__})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                _LAST_EMAIL_DECISION[uid] = _tmp_dec
+                _LAST_EMAIL_ERROR[uid] = dict(_tmp_dec)
+                continue
+
+            # Reset session state if session_key changed
+            try:
+                if str(st.get("session_key")) != str(sess.get("session_key")):
+                    email_state_set(uid, session_key=str(sess.get("session_key")), sent_count=0, last_email_ts=0.0)
+                    st = email_state_get(uid)
+            except Exception:
+                pass
+
+            # Safe defaults (never KeyError)
+            try:
+                max_emails = int(user.get("max_emails_per_session", DEFAULT_MAX_EMAILS_PER_SESSION))
+            except Exception:
+                max_emails = int(DEFAULT_MAX_EMAILS_PER_SESSION)
+
+            try:
+                gap_min = int(user.get("email_gap_min", DEFAULT_MIN_EMAIL_GAP_MIN))
+            except Exception:
+                gap_min = int(DEFAULT_MIN_EMAIL_GAP_MIN)
+
+            gap_sec = max(0, gap_min) * 60
+
+            # Daily cap
+            day_local = datetime.now(tz).date().isoformat()
+            try:
+                sent_today = _email_daily_get(uid, day_local)
+            except Exception:
+                sent_today = 0
+
+            try:
+                day_cap = int(user.get("max_emails_per_day", DEFAULT_MAX_EMAILS_PER_DAY))
+            except Exception:
+                day_cap = int(DEFAULT_MAX_EMAILS_PER_DAY)
+
+            if day_cap > 0 and sent_today >= day_cap:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"daily_email_cap_reached ({sent_today}/{day_cap})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Session cap
+            try:
+                sent_in_session = int(st.get("sent_count", 0) or 0)
+            except Exception:
+                sent_in_session = 0
+
+            if max_emails > 0 and sent_in_session >= max_emails:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"session_email_cap_reached ({sent_in_session}/{max_emails})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Gap
+            now_ts = time.time()
+            try:
+                last_ts = float(st.get("last_email_ts", 0.0) or 0.0)
+            except Exception:
+                last_ts = 0.0
+
+            if gap_sec > 0 and (now_ts - last_ts) < gap_sec:
+                remain = int(gap_sec - (now_ts - last_ts))
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"email_gap_active (remain {remain}s)"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+                        # ---------------------------
+            # Unified /screen + /email Top Setup eligibility
+            # ---------------------------
+            # Email should send the SAME Top Trade Setups that /screen shows.
+            # Only user preferences (sessions/trade window/caps/gap/cooldown) can block sending.
+
+            skip_reasons_counter = Counter()
+            eligible: List[Setup] = []
+            for s in (setups_all or []):
+                ok, why = is_executable_setup_eligible(s, session_name=sess_name)
+                if ok:
+                    eligible.append(s)
+                else:
+                    skip_reasons_counter[str(why)] += 1
+
+            if not eligible:
+                top_reasons = dict(skip_reasons_counter.most_common(3))
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": ["no_setups_after_filters", f"top_reasons={top_reasons}"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Premium ordering: confidence desc, RR(TP3) desc
+            def _rr3(_s: Setup) -> float:
+                try:
+                    return float(rr_to_tp(float(_s.entry), float(_s.sl), float(_s.tp3)))
+                except Exception:
+                    return 0.0
+
+            eligible = sorted(
+                eligible,
+                key=lambda _s: (
+                    float(getattr(_s, "quality_score", 0.0) or 0.0),
+                    int(getattr(_s, "conf", 0) or 0),
+                    _rr3(_s),
+                    float(getattr(_s, "fut_vol_usd", 0.0) or 0.0),
+                ),
+                reverse=True,
+            )
+
+            # Candidate picks for cooldown/flip checks below
+            picks: List[Setup] = list(eligible[: max(int(EMAIL_SETUPS_N) * 6, 18)])
+
+            chosen_list: List[Setup] = []
+            _seen_setup_keys = set()
+            cooldown_blocked = 0
+            flip_blocked = 0
+
+            for s in picks:
+                if len(chosen_list) >= int(EMAIL_SETUPS_N):
+                    break
+
+                sym = str(getattr(s, "symbol", "")).upper()
+                side = str(getattr(s, "side", "")).upper()
+                try:
+                    _k = (
+                        sym,
+                        side,
+                        round(float(getattr(s, 'entry', 0.0) or 0.0), 8),
+                        round(float(getattr(s, 'sl', 0.0) or 0.0), 8),
+                        round(float(getattr(s, 'tp3', 0.0) or 0.0), 8),
+                    )
+                except Exception:
+                    _k = (sym, side, str(getattr(s, 'entry', '')), str(getattr(s, 'sl', '')), str(getattr(s, 'tp3', '')))
+                if _k in _seen_setup_keys:
+                    continue
+                _seen_setup_keys.add(_k)
+                sess_name = str(sess["name"])
+
+                if symbol_flip_guard_active(uid, sym, side, sess_name):
+                    flip_blocked += 1
+                    continue
+
+                if symbol_recently_emailed(uid, sym, side, sess_name):
+                    cooldown_blocked += 1
+                    continue
+
+                chosen_list.append(s)
+
+            if not chosen_list:
+                reasons = []
+                if cooldown_blocked:
+                    reasons.append(f"cooldown_blocked={cooldown_blocked}")
+                if flip_blocked:
+                    reasons.append(f"flip_guard_blocked={flip_blocked}")
+                reasons.append("all_candidates_blocked")
+
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": reasons,
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            # Send ONE email containing MULTIPLE setups (timeout-protected)
+            try:
+                ok = await asyncio.wait_for(
+                    asyncio.to_thread(send_email_alert_multi, user, sess, chosen_list, best_fut),
+                    timeout=EMAIL_SEND_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                ok = False
+                try:
+                    _LAST_SMTP_ERROR[uid] = f"timeout_after_{int(EMAIL_SEND_TIMEOUT_SEC)}s"
+                except Exception:
+                    pass
+            except Exception as e:
+                ok = False
+                logger.exception("send_email_alert_multi failed for uid=%s: %s", uid, e)
+                try:
+                    _LAST_SMTP_ERROR[uid] = f"{type(e).__name__}: {e}"
+                except Exception:
+                    pass
+
+            if ok:
+                try:
+                    email_state_set(uid, last_email_ts=time.time(), sent_count=int(st.get("sent_count", 0) or 0) + 1)
+                except Exception:
+                    pass
+
+                try:
+                    _email_daily_inc(uid, day_local)
+                except Exception:
+                    pass
+
+                for s in chosen_list:
+                    try:
+                        mark_symbol_emailed(uid, s.symbol, s.side, sess["name"])
+                    except Exception:
+                        pass
+
+                # AutoTrade is executed only by the dedicated autotrade_job.
+                # This avoids duplicate live orders from two separate execution paths.
+                autotrade_note = "queued_for_autotrade_job"
+
+                _tmp_dec = {
+                    "status": "SENT",
+                    "picked": ", ".join([f"{s.side} {s.symbol} conf={s.conf}" for s in chosen_list]),
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "autotrade": autotrade_note,
+                    "reasons": ["passed_filters_multi"],
+                }
+                _LAST_EMAIL_DECISION[uid] = _tmp_dec
+                _LAST_EMAIL_SENT[uid] = dict(_tmp_dec)
+            else:
+                _tmp_dec = {
+                    "status": "ERROR",
+                    "reasons": ["send_email_failed_or_timeout", _LAST_SMTP_ERROR.get(uid, "unknown_error")],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                _LAST_EMAIL_DECISION[uid] = _tmp_dec
+                _LAST_EMAIL_ERROR[uid] = dict(_tmp_dec)
+
+async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    # User timezone for consistent debug display (show local + UTC)
+    try:
+        from zoneinfo import ZoneInfo
+        user = get_user(uid) or {}
+        tz_name = str(user.get("tz") or "UTC")
+        tz_disp = ZoneInfo(tz_name)
+    except Exception:
+        tz_name = "UTC"
+        tz_disp = timezone.utc
+
+    def _fmt_when_both(v) -> str:
+        try:
+            if v is None:
+                return ""
+            import datetime as _dt
+            dt = None
+            if isinstance(v, (int, float)):
+                dt = _dt.datetime.fromtimestamp(float(v), tz=_dt.timezone.utc)
+            elif isinstance(v, str):
+                s = v.strip()
+                if not s:
+                    return ""
+                try:
+                    dt = _dt.datetime.fromisoformat(s)
+                except Exception:
+                    return s
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_dt.timezone.utc)
+            else:
+                return str(v)
+            utc = dt.astimezone(_dt.timezone.utc).isoformat(timespec="seconds")
+            loc = dt.astimezone(tz_disp).isoformat(timespec="seconds")
+            return f"{loc} | UTC {utc}"
+        except Exception:
+            try:
+                return str(v)
+            except Exception:
+                return ""
+
+    scan = _LAST_EMAIL_DECISION.get(uid) or {}
+    bigm = _LAST_BIGMOVE_DECISION.get(uid) or {}
+
+    # If nothing recorded
+    if not scan and not bigm:
+        await update.message.reply_text("No email decision recorded yet.")
+        return
+
+    lines = []
+    lines.append("📧 Email Decisions")
+    # Heartbeat
+    try:
+        last_tick = float(_EMAIL_LOOP_HEARTBEAT.get("last_tick_ts", 0.0) or 0.0)
+        next_tick = float(_EMAIL_LOOP_HEARTBEAT.get("next_tick_ts", 0.0) or 0.0)
+        alive = bool(_EMAIL_LOOP_HEARTBEAT.get("alive", False))
+        last_err = str(_EMAIL_LOOP_HEARTBEAT.get("last_error", "") or "")
+        lines.append("")
+        lines.append("🫀 Email Loop")
+        lines.append(f"Alive: {'YES' if alive else 'NO'}")
+        if last_tick > 0:
+            lines.append("Last tick: " + _fmt_when(last_tick))
+        if next_tick > 0:
+            lines.append("Next tick: " + _fmt_when(next_tick))
+        if last_err:
+            lines.append("Last error: " + last_err)
+    except Exception:
+        pass
+
+    # Last successful SENT email (not overwritten by later SKIPs)
+    sent = _LAST_EMAIL_SENT.get(uid) or {}
+    if sent:
+        lines.append("")
+        lines.append("✅ Last SENT Email")
+        lines.append(f"When: {_fmt_when_both(sent.get('when') or sent.get('ts'))}")
+        if sent.get('picked'):
+            lines.append("Picked: " + str(sent.get('picked')))
+        rs = sent.get('reasons') or []
+        if rs:
+            lines.append("Reasons:\n- " + "\n- ".join([str(x) for x in rs]))
+
+    err = _LAST_EMAIL_ERROR.get(uid) or {}
+    if err:
+        lines.append("")
+        lines.append("❌ Last Email ERROR")
+        lines.append(f"When: {_fmt_when_both(err.get('when') or err.get('ts'))}")
+        rs = err.get('reasons') or []
+        if rs:
+            lines.append("Reasons:\n- " + "\n- ".join([str(x) for x in rs]))
+
+
+    if bigm:
+        lines.append("")
+        lines.append("⚡ Big-Move Alert Decision")
+        lines.append(f"Status: {bigm.get('status')}")
+        lines.append("When: " + _fmt_when_both(bigm.get("when") or bigm.get("ts")))
+        rs = bigm.get("reasons") or []
+        if rs:
+            lines.append("Reasons:\n- " + "\n- ".join(rs))
+
+    if scan:
+        lines.append("")
+        lines.append("🧠 Market Scan Decision")
+        lines.append(f"Status: {scan.get('status')}")
+        lines.append("When: " + _fmt_when_both(scan.get("when") or scan.get("ts")))
+        rs = scan.get("reasons") or scan.get("reason")
+        if isinstance(rs, list):
+            lines.append("Reasons:\n- " + "\n- ".join(rs))
+        elif rs:
+            lines.append(f"Reason: {rs}")
+
+    await update.message.reply_text("\n".join(lines).strip())
+
+
+
+async def email_pipeline_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await email_decision_cmd(update, context)
+
+
+# =========================================================
+# /why (debug why no setups)
+# =========================================================
+async def why_no_setups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    txt = _reject_report_for_uid(uid)
+    await update.message.reply_text(txt)
+
+
+
+# =========================================================
+# /health (transparent system health)
+# =========================================================
+async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Transparent health check:
+    - DB reachable
+    - Exchange tickers reachable
+    - Email configured/enabled status
+    - Cache stats
+    - Blackout status
+    """
+    # DB check
+    db_ok = True
+    db_err = ""
+    try:
+        con = db_connect()
+        con.execute("SELECT 1")
+        con.close()
+    except Exception as e:
+        db_ok = False
+        db_err = str(e)
+
+    # Exchange check (quick)
+    ex_ok = True
+    ex_err = ""
+    tickers_n = 0
+    t0 = time.time()
+    try:
+        best = await to_thread_heavy(fetch_futures_tickers)
+        tickers_n = len(best or {})
+    except Exception as e:
+        ex_ok = False
+        ex_err = str(e)
+    dt_ms = int((time.time() - t0) * 1000)
+
+    # Cache stats
+    cache_items = len(_CACHE)
+
+    # Email status
+    email_cfg = email_config_ok()
+    email_on = EMAIL_ENABLED
+
+    # Sessions
+    uid = update.effective_user.id
+    user = get_user(uid)
+    enabled = user_enabled_sessions(user)
+    sess = in_session_now(user)
+    # Display the *live market session* (NY/LON/ASIA), not "UNLIMITED" access mode
+    now_s = current_session_utc(datetime.now(timezone.utc)) if int(user.get("sessions_unlimited", 0) or 0) == 1 else (sess["name"] if sess else "NONE")
+
+    # Blackout
+
+    msg = [
+        "🩺 PulseFutures • Health",
+        HDR,
+        f"DB: {'OK' if db_ok else 'FAIL'}" + (f" | {db_err}" if (not db_ok and db_err) else ""),
+        f"Bybit/CCXT: {'OK' if ex_ok else 'FAIL'} | tickers={tickers_n} | {dt_ms}ms" + (f" | {ex_err}" if (not ex_ok and ex_err) else ""),
+        f"Email: enabled={email_on} | configured={email_cfg}",
+        f"Cache: items={cache_items} | tickersTTL={TICKERS_TTL_SEC}s | ohlcvTTL={OHLCV_TTL_SEC}s",
+        HDR,
+        f"Your TZ: {user['tz']}",
+        f"Sessions enabled: {', '.join(enabled)} | Now: {now_s}",
+        f"Limits: emailcap/session={int(user['max_emails_per_session'])} (0=∞), emaildaycap={int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0=∞), gap={int(user['email_gap_min'])}m",
+    ]
+    await update.message.reply_text("\n".join(msg))
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    # Always log
+    logger.exception("Telegram error", exc_info=context.error)
+
+    # Also tell the user (otherwise it looks like "nothing happened")
+    try:
+        if update and getattr(update, "effective_message", None):
+            msg = "⚠️ Something crashed while handling your request."
+            # If admin, show the exception text as well
+            uid = getattr(getattr(update, "effective_user", None), "id", None)
+            if uid is not None and is_admin_user(int(uid)):
+                msg += f"\n\nError: {type(context.error).__name__}: {context.error}"
+            await update.effective_message.reply_text(msg)
+    except Exception:
+        # never let error handler crash
+        pass
+
+# =========================================================
+# MAIN (Background Worker = POLLING)
+# =========================================================
+
+async def _post_init(app: Application):
+    # If webhook was set previously, remove it so polling starts cleanly
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning("delete_webhook failed (ignored): %s", e)
+
+    # Bot menu + command list (Telegram "Menu" button)
+    try:
+        cmds = [
+            BotCommand("start", "Start"),
+            BotCommand("status", "Shows your plan & enabled features"),
+            BotCommand("screen", "Scans the market for high-quality setups"),
+
+            BotCommand("equity", "Set your equity"),
+            BotCommand("riskmode", "Set your per-trade risk (used by /size)"),
+            BotCommand("dailycap", "Set your total daily risk cap"),
+            BotCommand("size", "Position size calculator"),
+
+            BotCommand("trade_open", "Log an opened position"),
+            BotCommand("trade_sl", "Update Stop Loss"),
+            BotCommand("trade_rf", "Risk-Free a position"),
+            BotCommand("trade_close", "Log a closed position"),
+
+            BotCommand("sessions", "View your session settings"),
+            BotCommand("sessions_on", "Enable a session"),
+            BotCommand("sessions_off", "Disable a session"),
+            BotCommand("sessions_on_unlimited", "24-hour mode ON"),
+            BotCommand("sessions_off_unlimited", "24-hour mode OFF"),
+            BotCommand("trade_window", "Set allowed trading time window"),
+
+            BotCommand("email", "Set email / email on|off"),
+            BotCommand("email_test", "Send a test email"),
+            BotCommand("limits", "Set email caps/gaps"),
+            BotCommand("bigmove_alert", "Big move alerts"),
+
+            BotCommand("tz", "Show/set your timezone"),
+            BotCommand("dayreset", "Set your daily reset anchor"),
+
+            BotCommand("report_daily", "Daily performance report"),
+            BotCommand("report_weekly", "Weekly performance report"),
+            BotCommand("report_overall", "All-time performance report"),
+
+            BotCommand("help", "Quick overview"),
+            BotCommand("commands", "Full command guide"),
+            BotCommand("guide_full", "Download full user guide (PDF)"),
+
+            BotCommand("support", "Submit support request"),
+            BotCommand("support_status", "Check your latest support ticket"),
+
+            BotCommand("health", "Bot & data health check"),
+            BotCommand("health_sys", "Admin engine health"),
+
+            BotCommand("billing", "Subscription & payment info"),
+        ]
+        await app.bot.set_my_commands(cmds)
+        # Ensure menu button is enabled for private chats
+        try:
+            await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("set_my_commands failed (ignored): %s", e)
+
+
+
+# =========================================================
+# USDT (SEMI-AUTO) + ADMIN PAYMENTS/ACCESS MANAGEMENT
+# =========================================================
+import re
+import time
+
+TXID_REGEX = re.compile(r"^[A-Fa-f0-9]{64}$")
+
+USDT_NETWORK = os.getenv("USDT_NETWORK", "TRC20").strip().upper()
+USDT_RECEIVE_ADDRESS = os.getenv("USDT_RECEIVE_ADDRESS", "").strip()
+
+USDT_STANDARD_PRICE = float(os.getenv("USDT_STANDARD_PRICE", "45"))
+USDT_PRO_PRICE = float(os.getenv("USDT_PRO_PRICE", "99"))
+
+def _now() -> float:
+    return float(time.time())
+
+def _is_admin(update: Update) -> bool:
+    try:
+        return is_admin_user(update.effective_user.id)
+    except Exception:
+        return False
+
+def _db():
+    con = sqlite3.connect(
+        DB_PATH,
+        timeout=5,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    return con
+
+
+def _user_ident_str(uid: int) -> str:
+    return f"uid={uid}"
+
+def _ledger_add(user_id: int, source: str, ref: str, plan: str, amount: float, currency: str, status: str):
+    with _db() as con:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO payments_ledger (user_id, source, ref, plan, amount, currency, status, created_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (int(user_id), source, str(ref), str(plan), float(amount), str(currency), str(status), _now()))
+        con.commit()
+
+def _set_user_access(user_id: int, plan: str, source: str, ref: str):
+    update_user(
+        int(user_id),
+        plan=str(plan),
+        access_source=str(source),
+        access_ref=str(ref),
+        access_updated_ts=_now(),
+    )
+
+
+
+
+def _usdt_payment_row_by_txid(txid: str):
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("SELECT * FROM usdt_payments WHERE txid = ?", (txid,))
+        r = cur.fetchone()
+        return dict(r) if r else None
+
+def _usdt_insert_pending(user_id: int, username: str, txid: str, plan: str):
+    with _db() as con:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO usdt_payments (telegram_id, username, txid, plan, status, created_ts)
+            VALUES (?, ?, ?, ?, 'PENDING', ?)
+        """, (int(user_id), (username or ""), txid, plan, _now()))
+        con.commit()
+
+def _usdt_set_status(txid: str, status: str, decided_by: int, note: str = ""):
+    with _db() as con:
+        cur = con.cursor()
+        cur.execute("""
+            UPDATE usdt_payments
+            SET status = ?, decided_ts = ?, decided_by = ?, note = ?
+            WHERE txid = ?
+        """, (status, _now(), int(decided_by), (note or ""), txid))
+        con.commit()
+
+# ---------------- USER COMMANDS ----------------
+
+async def usdt_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    addr = USDT_RECEIVE_ADDRESS or "(not set)"
+    await update.message.reply_text(
+        "USDT Payment (Semi-Auto)\n\n"
+        f"Network: USDT ({USDT_NETWORK})\n"
+        f"Address: {addr}\n\n"
+        f"Standard: {USDT_STANDARD_PRICE:.0f} USDT\n"
+        f"Pro: {USDT_PRO_PRICE:.0f} USDT\n\n"
+        "After payment submit:\n"
+        "/usdt_paid <TXID> <standard|pro>\n\n"
+        "Example:\n"
+        "/usdt_paid 7f3a...c9 standard\n\n"
+        "Note: USDT payments are final. Access after admin approval."
+    )
+
+async def usdt_paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Usage:\n/usdt_paid <TXID> <standard|pro>")
+        return
+
+    txid = context.args[0].strip()
+    plan = context.args[1].strip().lower()
+
+    if plan not in ("standard", "pro"):
+        await update.message.reply_text("❌ Plan must be: standard or pro\nExample: /usdt_paid <TXID> standard")
+        return
+
+    if not TXID_REGEX.match(txid):
+        await update.message.reply_text("❌ TXID looks invalid.\nIt must be a 64-char hex hash.")
+        return
+
+    # prevent duplicates
+    existing = _usdt_payment_row_by_txid(txid)
+    if existing:
+        await update.message.reply_text(f"⚠️ This TXID is already in the system (status: {existing['status']}).")
+        return
+
+    uid = int(update.effective_user.id)
+    uname = update.effective_user.username or ""
+    try:
+        _usdt_insert_pending(uid, uname, txid, plan)
+    except sqlite3.IntegrityError:
+        await update.message.reply_text("⚠️ This TXID is already used.")
+        return
+    except Exception as e:
+        logger.exception("usdt_paid_cmd failed")
+        await update.message.reply_text(f"❌ Failed to save. {type(e).__name__}: {e}")
+        return
+
+    await update.message.reply_text(
+        "✅ USDT payment submitted.\n"
+        "Status: PENDING admin approval.\n\n"
+        "If you made a mistake, contact /support."
+    )
+
+    # Notify admins (send to each admin user id)
+    try:
+        for admin_id in (ADMIN_USER_IDS or set()):
+            await context.bot.send_message(
+                chat_id=int(admin_id),
+                text=(
+                    "🧾 New USDT Payment Request\n\n"
+                    f"User: @{uname or '(no username)'} ({uid})\n"
+                    f"Plan: {plan.upper()}\n"
+                    f"TXID: {txid}\n\n"
+                    f"Approve: /usdt_approve {txid}\n"
+                    f"Reject:  /usdt_reject {txid} <reason>"
+                )
+            )
+    except Exception:
+        # don't block user success if admin notify fails
+        logger.exception("Failed to notify admins about USDT request")
+
+# ---------------- ADMIN COMMANDS ----------------
+
+async def usdt_pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("""
+            SELECT txid, telegram_id, username, plan, created_ts
+            FROM usdt_payments
+            WHERE status='PENDING'
+            ORDER BY created_ts DESC
+            LIMIT 20
+        """)
+        rows = cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text("✅ No pending USDT requests.")
+        return
+
+    lines = ["Pending USDT requests (latest 20):\n"]
+    for r in rows:
+        lines.append(f"- {r['plan'].upper()} | @{r['username'] or 'n/a'} ({r['telegram_id']}) | {r['txid']}")
+    lines.append("\nApprove with: /usdt_approve <TXID>")
+    await update.message.reply_text("\n".join(lines))
+
+async def usdt_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /usdt_approve <TXID>")
+        return
+
+    txid = context.args[0].strip()
+    if not TXID_REGEX.match(txid):
+        await update.message.reply_text("❌ Invalid TXID format (must be 64-char hex).")
+        return
+
+    row = _usdt_payment_row_by_txid(txid)
+    if not row:
+        await update.message.reply_text("❌ TXID not found in DB. Ask user to re-submit with /usdt_paid.")
+        return
+
+    if row["status"] == "APPROVED":
+        await update.message.reply_text("⚠️ Already approved.")
+        return
+    if row["status"] == "REJECTED":
+        await update.message.reply_text("⚠️ This TXID was rejected earlier.")
+        return
+
+    plan = row["plan"].lower()
+    uid = int(row["telegram_id"])
+
+    # Grant access + ledger
+    amount = USDT_STANDARD_PRICE if plan == "standard" else USDT_PRO_PRICE
+    _set_user_access(uid, plan, "usdt", txid)
+    _ledger_add(uid, "usdt", txid, plan, amount, "USDT", "paid")
+    _usdt_set_status(txid, "APPROVED", update.effective_user.id, note="approved")
+
+    await update.message.reply_text(f"✅ Approved. Access granted: {plan.upper()} to user {uid}.")
+    try:
+        await context.bot.send_message(chat_id=uid, text=f"✅ Payment approved. Your plan is now: {plan.upper()}")
+    except Exception:
+        pass
+
+async def usdt_reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /usdt_reject <TXID> <reason(optional)>")
+        return
+
+    txid = context.args[0].strip()
+    reason = " ".join(context.args[1:]).strip() if len(context.args) > 1 else "rejected"
+    if not TXID_REGEX.match(txid):
+        await update.message.reply_text("❌ Invalid TXID format.")
+        return
+
+    row = _usdt_payment_row_by_txid(txid)
+    if not row:
+        await update.message.reply_text("❌ TXID not found.")
+        return
+
+    if row["status"] != "PENDING":
+        await update.message.reply_text(f"⚠️ Cannot reject (current status: {row['status']}).")
+        return
+
+    _usdt_set_status(txid, "REJECTED", update.effective_user.id, note=reason)
+    await update.message.reply_text("✅ Rejected.")
+    try:
+        await context.bot.send_message(chat_id=int(row["telegram_id"]), text=f"❌ USDT payment rejected: {reason}")
+    except Exception:
+        pass
+
+# ---------------- ADMIN: USERS / ACCESS / PAYMENTS ----------------
+
+async def admin_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /admin_user <telegram_id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("❌ telegram_id must be a number.")
+        return
+
+    # Ensure schema exists so this command never crashes on older DBs
+    try:
+        ensure_email_column()   # includes billing columns
+    except Exception:
+        try:
+            ensure_billing_columns()
+        except Exception:
+            pass
+
+    user = get_user(uid) or {}
+
+    stored_plan = str(user.get("plan") or "free").strip().lower()
+    eff_plan = str(effective_plan(uid, user)).strip().lower()
+
+    upd = 0.0
+    try:
+        upd = float(user.get("access_updated_ts") or 0.0)
+    except Exception:
+        upd = 0.0
+    upd_txt = datetime.utcfromtimestamp(upd).isoformat() + "Z" if upd else "n/a"
+
+    # Email field (handle old schemas)
+    email_val = ""
+    try:
+        email_val = (user.get("email_to") or user.get("email") or "").strip()
+    except Exception:
+        email_val = ""
+
+    # Latest payment (any) + latest PAID approval
+    last_any = None
+    last_paid = None
+    try:
+        with _db() as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            cur.execute(
+                "SELECT source, ref, plan, amount, currency, status, created_ts "
+                "FROM payments_ledger WHERE user_id=? ORDER BY created_ts DESC LIMIT 1",
+                (uid,)
+            )
+            last_any = cur.fetchone()
+            cur.execute(
+                "SELECT source, ref, plan, amount, currency, status, created_ts "
+                "FROM payments_ledger WHERE user_id=? AND status='paid' ORDER BY created_ts DESC LIMIT 1",
+                (uid,)
+            )
+            last_paid = cur.fetchone()
+    except Exception:
+        last_any = None
+        last_paid = None
+
+    def _fmt_pay(row):
+        if not row:
+            return "(none)"
+        ts = 0.0
+        try:
+            ts = float(row["created_ts"] or 0.0)
+        except Exception:
+            ts = 0.0
+        ts_txt = datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts else "n/a"
+        amt = row["amount"]
+        curcy = row["currency"] or ""
+        return f"{row['source']} | {row['plan']} | {amt} {curcy} | {row['status']} | {row['ref']} | {ts_txt}"
+
+    lines = [
+        f"User ID: {uid}",
+        f"Plan: {stored_plan.upper()} (effective: {eff_plan.upper()})",
+        f"Access Updated (UTC): {upd_txt}",
+        f"Email: {email_val or '-'}",
+        f"Last Payment (latest): {_fmt_pay(last_any)}",
+        f"Last Payment Approval (paid): {_fmt_pay(last_paid)}",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
+def _table_columns(conn, table_name: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(r[1]) for r in rows}
+
+def _first_existing_col(cols: set[str], candidates: list[str]):
+    for c in candidates:
+        if c in cols:
+            return c
+    return None
+
+async def admin_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    now_ts = time.time()
+
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("SELECT * FROM users")
+        rows = cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text("No users found.")
+        return
+
+    lines = ["📊 USERS OVERVIEW\n"]
+
+    for r in rows:
+        d = dict(r)
+        uid = int(d.get("user_id") or 0)
+        tz = str(d.get("tz") or "UTC")
+
+        # Use effective plan logic
+        plan = str(effective_plan(uid, d)).upper()
+
+        # Remaining days
+        days_left = "-"
+        until = 0
+
+        if plan == "TRIAL":
+            until = float(d.get("trial_until") or 0)
+        elif plan in ("STANDARD", "PRO"):
+            until = float(d.get("plan_expires") or 0)
+
+        if until and until > now_ts:
+            days_left = f"{int((until - now_ts + 86399)//86400)}d"
+        elif plan in ("TRIAL", "STANDARD", "PRO"):
+            days_left = "0d"
+
+        # Payment status
+        with _db() as con:
+            cur = con.cursor()
+            cur.execute("""
+                SELECT status
+                FROM payments_ledger
+                WHERE user_id = ?
+                ORDER BY created_ts DESC
+                LIMIT 1
+            """, (uid,))
+            p = cur.fetchone()
+
+        pay_status = p[0] if p else "None"
+
+        lines.append(f"{uid} | {plan} | {tz} | {days_left} | {pay_status}")
+
+    await update.message.reply_text("\n".join(lines))
+
+async def admin_grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Usage: /admin_grant <telegram_id> <standard|pro>")
+        return
+
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("❌ telegram_id must be a number.")
+        return
+
+    plan = str(context.args[1]).strip().lower()
+    if plan not in ("standard", "pro"):
+        await update.message.reply_text("❌ Plan must be: standard or pro")
+        return
+
+    # Grant access (sync plan + access metadata)
+    _set_user_access(uid, plan, "manual_admin", "admin_grant")
+
+    # IMPORTANT: prevent trial logic from overwriting the plan
+    # (Some parts of your code treat trial_until>0 as "still trial")
+    try:
+        update_user(uid, trial_until=0.0, trial_start_ts=0.0)
+    except Exception:
+        pass
+
+    user = get_user(uid) or {}
+
+    # Latest payment (1 row)
+    pay_line = "- (none)"
+    try:
+        with _db() as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            cur.execute("""
+                SELECT source, ref, plan, amount, currency, status, created_ts
+                FROM payments_ledger
+                WHERE user_id = ?
+                ORDER BY created_ts DESC
+                LIMIT 1
+            """, (uid,))
+            p = cur.fetchone()
+        if p:
+            pay_line = f"- {p['source']} | {p['plan']} | {p['amount']} {p['currency']} | {p['status']} | {p['ref']}"
+    except Exception:
+        pass
+
+    # Reply (as you requested)
+    lines = [
+        "✅ Access updated",
+        f"User: {uid}",
+        f"Plan: {str(user.get('plan') or plan).strip()}",
+        f"Access source/ref: {user.get('access_source','')} / {user.get('access_ref','')}",
+        f"Email: {user.get('email_to','') or ''}",
+        "",
+        "Last payments:",
+        pay_line
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
+
+async def payment_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only: approve a payment (Stripe or USDT) and grant access.
+    Usage: /payment_approve <user_id> <payment_id> <standard|pro>
+    """
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args or len(context.args) < 3:
+        await update.message.reply_text("Usage: /payment_approve <user_id> <payment_id> <standard|pro>")
+        return
+
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("❌ user_id must be a number.")
+        return
+
+    payment_id = str(context.args[1]).strip()
+    plan = str(context.args[2]).strip().lower()
+
+    if not payment_id:
+        await update.message.reply_text("❌ payment_id cannot be empty.")
+        return
+
+    if plan not in ("standard", "pro"):
+        await update.message.reply_text("❌ Plan must be: standard or pro")
+        return
+
+    # 1) Write payments ledger (single source of truth for approvals)
+    try:
+        _ledger_add(uid, "payment_approve", payment_id, plan, 0.0, "", "paid")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to write payment ledger: {e}")
+        return
+
+    # 2) Grant access (sync plan + access metadata)
+    _set_user_access(uid, plan, "payment_approve", payment_id)
+
+    # 3) Prevent trial logic from overwriting the plan
+    try:
+        update_user(uid, trial_until=0.0, trial_start_ts=0.0)
+    except Exception:
+        pass
+
+    user = get_user(uid) or {"plan": plan}
+
+    await update.message.reply_text(
+        "✅ Payment approved + access granted\n"
+        f"User: {uid}\n"
+        f"Plan: {str(user.get('plan') or plan).strip()}\n"
+        f"Payment ID: {payment_id}\n"
+        "Tip: /admin_user <user_id> to confirm."
+    )
+
+
+async def admin_revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /admin_revoke <telegram_id>")
+        return
+    uid = int(context.args[0])
+    _set_user_access(uid, "free", "manual", "revoked")
+    # HARDEN: prevent revoked users from restarting a new trial later (even if admin_grant reset trial_start_ts)
+    try:
+        u = get_user(uid) or {}
+        ts_start = float(u.get("trial_start_ts") or 0.0)
+        if ts_start <= 0:
+            update_user(uid, trial_start_ts=_now_ts(), trial_until=0.0)
+        else:
+            update_user(uid, trial_until=0.0)
+    except Exception:
+        pass
+
+    await update.message.reply_text(f"✅ Access revoked. User {uid} set to FREE.")
+
+
+async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/admin_reset_report — archive current signals + outcomes then reset live tables.
+
+    This is used after engine changes so new performance stats aren't mixed with old logic.
+    Archives into:
+      - signals_archive
+      - outcomes_archive (mirrors `signal_outcomes` if present; otherwise `outcomes` if present)
+    """
+    uid = update.effective_user.id
+    if not is_admin_user(uid):
+        return
+
+    try:
+        now_ts = time.time()
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+
+            # Detect which outcomes table exists in this build
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('signal_outcomes','outcomes')")
+            row = c.fetchone()
+            outcomes_src = row[0] if row else None
+
+            # --- Signals archive ---
+            c.execute("""CREATE TABLE IF NOT EXISTS signals_archive AS
+                         SELECT *, 0.0 AS archived_at FROM signals WHERE 0""")
+            try:
+                c.execute("ALTER TABLE signals_archive ADD COLUMN archived_at REAL")
+            except Exception:
+                pass
+
+            # Archive + clear signals
+            c.execute("INSERT INTO signals_archive SELECT *, ? FROM signals", (now_ts,))
+            c.execute("DELETE FROM signals")
+
+            # --- Outcomes archive (optional) ---
+            if outcomes_src:
+                # Create archive table based on the existing outcomes table schema
+                c.execute(f"""CREATE TABLE IF NOT EXISTS outcomes_archive AS
+                             SELECT *, 0.0 AS archived_at FROM {outcomes_src} WHERE 0""")
+                try:
+                    c.execute("ALTER TABLE outcomes_archive ADD COLUMN archived_at REAL")
+                except Exception:
+                    pass
+
+                # Archive + clear outcomes
+                c.execute(f"INSERT INTO outcomes_archive SELECT *, ? FROM {outcomes_src}", (now_ts,))
+                c.execute(f"DELETE FROM {outcomes_src}")
+
+            conn.commit()
+
+        msg = "✅ Signals archived and report reset."
+        if outcomes_src:
+            msg += f"\nArchived outcomes from `{outcomes_src}`."
+        else:
+            msg += "\n(No outcomes table found to archive in this DB.)"
+        await update.message.reply_text(msg)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ admin_reset_report failed: {e}")
+
+
+async def admin_payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    limit_n = 50
+    if context.args and context.args[0].isdigit():
+        limit_n = max(1, min(200, int(context.args[0])))
+
+    # Ensure schema exists
+    try:
+        ensure_email_column()
+    except Exception:
+        try:
+            ensure_billing_columns()
+        except Exception:
+            pass
+
+    with _db() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("SELECT * FROM users ORDER BY user_id ASC")
+        users = cur.fetchall() or []
+
+        # Preload last PAID payment per user (approval)
+        last_paid_map = {}
+        cur.execute("""
+            SELECT p.user_id, p.created_ts, p.ref
+            FROM payments_ledger p
+            JOIN (
+                SELECT user_id, MAX(created_ts) AS mx
+                FROM payments_ledger
+                WHERE status='paid'
+                GROUP BY user_id
+            ) t ON t.user_id = p.user_id AND t.mx = p.created_ts
+        """)
+        for r in cur.fetchall() or []:
+            last_paid_map[int(r["user_id"])] = (float(r["created_ts"] or 0.0), str(r["ref"] or ""))
+
+    if not users:
+        await update.message.reply_text("No users found.")
+        return
+
+    lines = []
+    lines.append(f"💳 Admin Payments (showing up to {limit_n} users)")
+    lines.append("User ID | Last Payment Approval (UTC) | Payment ID | Plan (stored/effective)")
+    lines.append("────────────────────────────────────────────────────────────────────────")
+
+    count = 0
+    for ur in users:
+        if count >= limit_n:
+            break
+        d = dict(ur)
+        uid = int(d.get("user_id") or 0)
+        stored_plan = str(d.get("plan") or "free").strip().lower()
+        eff_plan = str(effective_plan(uid, d)).strip().lower()
+
+        ts, pay_id = last_paid_map.get(uid, (0.0, ""))
+        ts_txt = datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts else "n/a"
+        pay_id = pay_id.strip() or "-"
+
+        lines.append(f"{uid} | {ts_txt} | {pay_id} | {stored_plan}/{eff_plan}")
+        count += 1
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def manage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Stripe customer portal link (if you have it).
+    If you are using Payment Links only and not portal, keep as-is or disable this command.
+    """
+    user = get_user(update.effective_user.id)
+    if user.get("plan") not in ("standard", "pro"):
+        await update.message.reply_text("No active subscription.")
+        return
+
+    # If you still use Stripe Customer Portal:
+    if user.get("email_to"):
+        await update.message.reply_text(create_customer_portal(user["email_to"]))
+        return
+
+    await update.message.reply_text("❌ No email on file for subscription management.")
+
+
+async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Upgrade opens the billing menu
+    return await billing_cmd(update, context)
+
+
+
+async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
+    """Background AutoTrade loop. Scans and opens trades for the owner when enabled.
+    Runs from the admin confirmed-email executable pool and only executes setups that were successfully emailed."""
+    try:
+        _hb_touch('autotrade', ok=True, details='job_tick')
+        if not _autotrade_ready():
+            return
+
+        uid = int(AUTOTRADE_OWNER_UID)
+        # If user record doesn't exist yet, do nothing (avoids writing defaults to DB)
+        user = get_user(uid) or {}
+        if not user:
+            return
+
+        # Session label in UTC (NY/LON/ASIA)
+        now_utc = datetime.now(timezone.utc)
+        live_sess = _session_label_utc(now_utc)
+        sess = current_session_utc(now_utc)
+
+        async with AUTOTRADE_EXEC_LOCK:
+            if not live_sess:
+                _LAST_AUTOTRADE_DECISION[uid] = {
+                    "status": "SKIP",
+                    "when": now_utc.isoformat(timespec="seconds"),
+                    "reason": "outside_live_session_window",
+                    "session": "NONE",
+                    "mode": AUTOTRADE_MODE,
+                }
+                return
+            if not _autotrade_allowed_session(sess):
+                _LAST_AUTOTRADE_DECISION[uid] = {
+                    "status": "SKIP",
+                    "when": now_utc.isoformat(timespec="seconds"),
+                    "reason": f"session_not_allowed ({sess})",
+                }
+                return
+
+            # Optional: respect user's trade window (if configured)
+            try:
+                if not trade_window_allows_now(user):
+                    _LAST_AUTOTRADE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": now_utc.isoformat(timespec="seconds"),
+                        "reason": "trade_window_block",
+                    }
+                    return
+            except Exception:
+                pass
+
+            # Keep live exit protection synchronized with Bybit before considering new entries.
+            try:
+                repaired = []
+                live_map = {(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper()): p for p in (_bybit_get_open_positions_linear() or [])}
+                for tr in (_autotrade_db_open_trades(int(uid)) or []):
+                    key = (str(tr.get('symbol') or '').upper(), str(tr.get('side') or '').upper())
+                    p = live_map.get(key)
+                    if not p:
+                        continue
+                    rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
+                    if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
+                        repaired.append(rr)
+                if repaired:
+                    _LAST_AUTOTRADE_DECISION[uid] = {
+                        "status": "MANAGED",
+                        "when": now_utc.isoformat(timespec="seconds"),
+                        "reason": f"managed_live_exits ({len(repaired)})",
+                        "session": sess,
+                        "mode": AUTOTRADE_MODE,
+                    }
+            except Exception:
+                pass
+
+            # Select multiple recent OPEN setups and let the hardened gatekeeper choose the first tradable one.
+            db_setups = _autotrade_select_db_setups(uid, sess, lookback_hours=12, limit=5)
+            attempt_summaries = [{
+                'setup_id': str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or ''),
+                'symbol': str(getattr(x, 'symbol', '') or ''),
+                'side': str(getattr(x, 'side', '') or ''),
+                'created_ts': float(getattr(x, 'created_ts', 0.0) or 0.0),
+                'source_kind': str(getattr(x, 'source_kind', '') or ''),
+                'source_session': str(getattr(x, 'source_session', '') or ''),
+            } for x in (db_setups or [])]
+            if not db_setups:
+                _LAST_AUTOTRADE_DECISION[uid] = {
+                    "status": "SKIP",
+                    "when": now_utc.isoformat(timespec="seconds"),
+                    "reason": "no_setups",
+                    "session": sess,
+                    "mode": AUTOTRADE_MODE,
+                    "attempted_candidates": attempt_summaries,
+                }
+                _hb_touch('autotrade', ok=True, details=f'no_setups sess={sess}')
+                return
+
+            ok = False
+            reason = 'no_tradable_setup'
+            attempted = 0
+            for cand in db_setups:
+                attempted += 1
+                ok, reason = _autotrade_place_trade(uid, sess, [cand])
+                if ok:
+                    break
+                if reason not in {
+                    'blocked_duplicate_open_position',
+                    'blocked_duplicate_pending_order',
+                    'blocked_duplicate_inflight_lock',
+                    'blocked_by_cooldown',
+                    'blocked_by_recent_symbol_trade',
+                    'blocked_by_existing_local_trade_state',
+                    'setup_expired',
+                }:
+                    break
+
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "PLACED" if ok else "SKIP",
+                "when": now_utc.isoformat(timespec="seconds"),
+                "reason": "" if ok else reason,
+                "attempted": attempted,
+                "session": sess,
+                "mode": AUTOTRADE_MODE,
+                "attempted_candidates": attempt_summaries,
+                "latest_candidate": attempt_summaries[0] if attempt_summaries else {},
+            }
+            _hb_touch('autotrade', ok=True, details=f"status={'PLACED' if ok else 'SKIP'} reason={'' if ok else reason}")
+
+    except Exception as e:
+        try:
+            uid = int(AUTOTRADE_OWNER_UID or 0)
+        except Exception:
+            uid = 0
+        if uid:
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "ERROR",
+                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "reason": f"{type(e).__name__}: {e}",
+            }
+        _hb_touch('autotrade', ok=False, error=f"{type(e).__name__}: {e}", details='job_error')
+        logger.exception("autotrade_job crashed: %s", e)
+
+
+async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+    """Background email engine (trade setups + big-move alerts).
+
+    IMPORTANT:
+    - Do NOT take ALERT_LOCK here.
+    - _alert_job_async_internal() already owns ALERT_LOCK to prevent overlap.
+
+    The previous version double-locked (wrapper + internal), which caused the
+    internal job to exit immediately every time, so no emails were ever sent
+    (while /email_test still worked).
+    """
+
+    # Heartbeat (so /email_decision can prove the loop is alive)
+    try:
+        _EMAIL_LOOP_HEARTBEAT["alive"] = True
+        now_ts = time.time()
+        _EMAIL_LOOP_HEARTBEAT["last_tick_ts"] = now_ts
+        job = getattr(context, "job", None)
+        interval = float(getattr(job, "interval", 0) or 0)
+        if interval > 0:
+            _EMAIL_LOOP_HEARTBEAT["next_tick_ts"] = now_ts + interval
+    except Exception:
+        pass
+
+    try:
+        await _alert_job_async_internal(context)
+        _hb_touch('email', ok=True, details='alert_job_ok')
+        try:
+            _EMAIL_LOOP_HEARTBEAT["last_error"] = ""
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            _EMAIL_LOOP_HEARTBEAT["last_error"] = f"{type(e).__name__}: {e}"
+        except Exception:
+            pass
+        _hb_touch('email', ok=False, error=f"{type(e).__name__}: {e}", details='alert_job_error')
+        logger.exception("Alert job failure: %s", e)
+
+
+
+async def autotrade_sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    if not context.args:
+        current = ",".join(_autotrade_get_sessions())
+        await update.message.reply_text(f"🤖 Current AutoTrade Sessions: {current}")
+        return
+
+    raw = context.args[0].upper()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+
+    valid = {"NY", "LON", "ASIA"}
+    if any(p not in valid for p in parts):
+        await update.message.reply_text("❌ Invalid session. Use NY,LON,ASIA")
+        return
+
+    _autotrade_set_sessions(",".join(parts))
+    await update.message.reply_text(f"✅ AutoTrade sessions updated: {','.join(parts)}")
+
+
+def main():
+    # Render note: if deployed as a Web Service, bind to $PORT so Render keeps the service alive.
+    if os.environ.get("RENDER_SERVICE_TYPE") == "web":
+        start_keepalive_http_server()
+        logger.warning("Running in Render Web Service mode: keepalive HTTP server enabled; polling will still run.")
+
+    # Single instance guard (Render overlap protection)
+    render_primary_only()
+
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN missing")
+
+    db_init()
+    ensure_email_column()
+    _evolution_migrate_tables()
+    
+    app = Application.builder().token(TOKEN).post_init(_post_init).concurrent_updates(32).build()
+
+    # Global access + Pro gating (runs before any other command handler)
+    app.add_handler(MessageHandler(filters.COMMAND, _command_guard), group=-1)
+    app.add_error_handler(error_handler)
+
+    # ================= Handlers =================
+    app.add_handler(CommandHandler("help", cmd_help, block=False))
+    app.add_handler(CommandHandler("commands", commands_cmd, block=False))
+    app.add_handler(CommandHandler("guide_full", guide_full_cmd, block=False))
+    app.add_handler(CommandHandler("start", cmd_start, block=False))
+    app.add_handler(CommandHandler("help_admin", cmd_help_admin, block=False))
+    app.add_handler(CommandHandler("manage", manage_cmd, block=False))
+    app.add_handler(CommandHandler("myplan", myplan_cmd, block=False))
+    app.add_handler(CommandHandler("support", support_cmd, block=False))
+    app.add_handler(CommandHandler("support_status", support_status_cmd, block=False))
+    app.add_handler(CommandHandler("support_open", admin_support_open_cmd, block=False))
+    app.add_handler(CommandHandler("support_close", admin_support_close_cmd, block=False))
+    app.add_handler(CommandHandler("tz", tz_cmd, block=False))
+    app.add_handler(CommandHandler("dayreset", dayreset_cmd, block=False))
+    app.add_handler(CommandHandler("screen", screen_cmd))
+    app.add_handler(CommandHandler("equity", equity_cmd, block=False))
+    app.add_handler(CommandHandler("equity_reset", equity_reset_cmd, block=False))
+    app.add_handler(CommandHandler("riskmode", riskmode_cmd, block=False))
+    app.add_handler(CommandHandler("dailycap", dailycap_cmd, block=False))
+    app.add_handler(CommandHandler("limits", limits_cmd, block=False))
+
+    app.add_handler(CommandHandler("trade_sl", trade_sl_cmd, block=False))
+    app.add_handler(CommandHandler("trade_rf", trade_rf_cmd, block=False))
+    
+    app.add_handler(CommandHandler("sessions", sessions_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_on", sessions_on_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_off", sessions_off_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_on_unlimited", sessions_on_unlimited_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_unlimited_on", sessions_unlimited_on_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_off_unlimited", sessions_off_unlimited_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_unlimited_off", sessions_unlimited_off_cmd, block=False))
+
+    app.add_handler(CommandHandler("bigmove_alert", bigmove_alert_cmd, block=False))
+    app.add_handler(CommandHandler("notify_on", notify_on, block=False))
+    app.add_handler(CommandHandler("notify_off", notify_off, block=False))
+    # Fallback: pasted "invisible-prefix" /size from mobile email clients
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _size_paste_fallback_router), group=-2)
+    app.add_handler(CommandHandler("size", size_cmd, block=False))
+    app.add_handler(CommandHandler("trade_open", trade_open_cmd, block=False))
+    app.add_handler(CommandHandler("trade_close", trade_close_cmd, block=False))
+    app.add_handler(CommandHandler("trade_id_reset", trade_id_reset_cmd, block=False))
+    app.add_handler(CommandHandler("status", status_cmd, block=False))
+    app.add_handler(CommandHandler("open_trades", open_trades_cmd, block=False))
+    app.add_handler(CommandHandler("cooldowns", cooldowns_cmd, block=False))
+    app.add_handler(CommandHandler("cooldown", cooldown_cmd, block=False))
+    app.add_handler(CommandHandler("cooldown_clear", cooldown_clear_cmd, block=False))
+    app.add_handler(CommandHandler("cooldown_clear_all", cooldown_clear_all_cmd, block=False))
+    app.add_handler(CommandHandler("report_daily", report_daily_cmd, block=False))
+    app.add_handler(CommandHandler("report_overall", report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("report_weekly", report_weekly_cmd, block=False))
+    app.add_handler(CommandHandler("signals_daily", signals_daily_cmd, block=False))
+    app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd, block=False))
+    app.add_handler(CommandHandler("signal_report", signal_report_cmd, block=False))
+    app.add_handler(CommandHandler("signbal_report", signal_report_cmd, block=False))
+    app.add_handler(CommandHandler("signal_report_overall", signal_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("health", health_cmd, block=False))
+    app.add_handler(CommandHandler("reset", reset_cmd, block=False))
+    app.add_handler(CommandHandler("restore", restore_cmd, block=False))
+    app.add_handler(CommandHandler("health_sys", health_sys_cmd, block=False))
+    app.add_handler(CommandHandler("billing", billing_cmd, block=False))
+    app.add_handler(CommandHandler("email_on_off", email_on_off_cmd, block=False))
+    app.add_handler(CommandHandler("upgrade", upgrade_cmd, block=False))
+    app.add_handler(CommandHandler("trade_window", trade_window_cmd, block=False))
+    app.add_handler(CommandHandler("email", email_cmd, block=False))
+    app.add_handler(CommandHandler("email_on", email_on_cmd, block=False))
+    app.add_handler(CommandHandler("email_off", email_off_cmd, block=False))
+    app.add_handler(CommandHandler("email_test", email_test_cmd, block=False))
+    app.add_handler(CommandHandler("email_decision", email_decision_cmd, block=False))
+    app.add_handler(CommandHandler("email_pipeline_status", email_pipeline_status_cmd, block=False))
+    app.add_handler(CommandHandler("setups_log", setups_log_cmd, block=False))
+
+    app.add_handler(CommandHandler("why", why_no_setups_cmd, block=False))
+    # ================= USDT (semi-auto) =================
+    app.add_handler(CommandHandler("usdt", usdt_info_cmd, block=False))
+    app.add_handler(CommandHandler("usdt_paid", usdt_paid_cmd, block=False))
+    
+    # ================= Admin: access & payments =================
+    
+    app.add_handler(CommandHandler("admin_user", admin_user_cmd, block=False))
+    app.add_handler(CommandHandler("admin_users", admin_users_cmd, block=False))
+    app.add_handler(CommandHandler("admin_grant", admin_grant_cmd, block=False))
+    app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd, block=False))
+    app.add_handler(CommandHandler("admin_reset_report", admin_reset_report_cmd, block=False))
+    app.add_handler(CommandHandler("admin_reset_signal_reports", admin_reset_signal_reports_cmd, block=False))
+    app.add_handler(CommandHandler("admin_payments", admin_payments_cmd, block=False))
+
+    # Admin: approve Stripe/USDT payments and grant access
+    app.add_handler(CommandHandler("payment_approve", payment_approve_cmd, block=False))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    
+    app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
+    app.add_handler(CommandHandler("performance_report", performance_report_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
+    app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_report_overal", autotrade_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("edge_status", edge_status_cmd, block=False))
+    app.add_handler(CommandHandler("optimizer_status", learning_status_cmd, block=False))
+    app.add_handler(CommandHandler("learning_status", learning_status_cmd, block=False))
+    app.add_handler(CommandHandler("winrate", winrate_cmd, block=False))
+    app.add_handler(CommandHandler("ny_winrate", ny_winrate_cmd, block=False))
+    app.add_handler(CommandHandler("nywinrate", ny_winrate_cmd, block=False))
+    app.add_handler(CommandHandler("lessons_learned", lessons_learned_cmd, block=False))
+    
+    # Strategy parameterization + optimization (admin)
+    app.add_handler(CommandHandler("params_show", cmd_params_show, block=False))
+    app.add_handler(CommandHandler("params_set", cmd_params_set, block=False))
+    app.add_handler(CommandHandler("params_reset", cmd_params_reset, block=False))
+    app.add_handler(CommandHandler("optimize", cmd_optimize, block=False))
+    app.add_handler(CommandHandler("optimize_report", cmd_optimize_report, block=False))
+    app.add_handler(CommandHandler("self_optimize", cmd_self_optimize, block=False))
+    app.add_handler(CommandHandler("self_optimize_stop", cmd_self_optimize_stop, block=False))
+    app.add_handler(CommandHandler("self_optimize_report", cmd_self_optimize_report, block=False))
+    app.add_handler(CommandHandler("autopilot_report", cmd_self_optimize_report, block=False))
+    app.add_handler(CommandHandler("autopilot_status", learning_status_cmd, block=False))
+
+# Catch-all for unknown /commands (MUST be after all CommandHandlers)
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+
+    if app.job_queue:
+        interval_sec = int(CHECK_INTERVAL_MIN * 60)
+    
+        app.job_queue.run_repeating(
+            alert_job,
+            interval=interval_sec,
+            first=90,
+            name="alert_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 60,
+            },
+        )
+
+        # AutoTrade loop (owner-only)
+        app.job_queue.run_repeating(
+            autotrade_job,
+            interval=60,
+            first=30,
+            name="autotrade_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 30,
+            },
+        )
+
+        # Autonomous optimizer loop (zero-touch governance)
+        if AUTONOMOUS_OPT_ENABLED:
+            app.job_queue.run_repeating(
+                autonomous_optimize_job,
+                interval=max(3600, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 3600)),
+                first=180,
+                name="autonomous_optimize_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 300,
+                },
+            )
+
+        if EVOLUTION_ENABLED:
+            app.job_queue.run_repeating(
+                evolution_hourly_job,
+                interval=max(900, int(EVOLUTION_HOURLY_INTERVAL_MIN * 60)),
+                first=120,
+                name="evolution_hourly_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 120,
+                },
+            )
+            app.job_queue.run_repeating(
+                evolution_daily_job,
+                interval=max(21600, int(EVOLUTION_DAILY_INTERVAL_HOURS * 3600)),
+                first=300,
+                name="evolution_daily_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 600,
+                },
+            )
+
+        if SCAN_INTELLIGENCE_ENABLED:
+            app.job_queue.run_repeating(
+                scan_intelligence_job,
+                interval=max(3600, int(SCAN_INTELLIGENCE_INTERVAL_MIN * 60)),
+                first=150,
+                name="scan_intelligence_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 300,
+                },
+            )
+    else:
+        logger.error("JobQueue NOT available – install python-telegram-bot[job-queue]")
+
+
+
+    # ================= Stripe Webhook ================= #
+    threading.Thread(
+        target=start_stripe_webhook,
+        daemon=True
+    ).start()
+
+    # Optional: if any other poller exists, don't crash-restart; just sleep.
+    from telegram.error import Conflict
+    # Ensure AutoTrade tables exist at startup (prevents 'no such table: autotrade_trades')
+
+    try:
+
+        _autotrade_migrate_tables()
+        _admin_setup_lifecycle_migrate()
+
+    except Exception:
+
+        pass
+
+
+    try:
+        app.run_polling(
+            drop_pending_updates=True,
+            close_loop=False,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    except Conflict:
+        logger.error("Another instance is polling. Sleeping forever.")
+        while True:
+            time.sleep(3600)
+
+
+if __name__ == "__main__":
+    main()
+
+
+# ===============================
+# QTY NORMALIZATION FIX (Bybit)
+# ===============================
+import math
+
+def _normalize_bybit_qty(exchange, symbol, qty):
+    try:
+        market = exchange.market(symbol)
+        info = market.get("info", {})
+        lot = info.get("lotSizeFilter", {})
+        step = float(lot.get("qtyStep", 0)) if lot.get("qtyStep") else None
+        min_qty = float(lot.get("minOrderQty", 0)) if lot.get("minOrderQty") else 0.0
+
+        if step and step > 0:
+            qty = math.floor(qty / step) * step
+
+        precision = market.get("precision", {}).get("amount", 8)
+        qty = float(f"{qty:.{precision}f}")
+
+        if qty < min_qty:
+            return 0.0
+
+        return qty
+    except Exception:
+        return 0.0
+
+
+# NOTE:
+# Before placing any Bybit order, call:
+# qty = _normalize_bybit_qty(exchange, symbol, qty)
+# If qty <= 0: skip trade with reason 'qty_below_min'
+
+
+
+# =========================================================
+# ===== PULSEFUTURES ULTRA INTELLIGENCE ENGINE (2026) =====
+# =========================================================
+
+# This block adds advanced analytical engines requested:
+# - Market Structure
+# - Multi‑Timeframe Alignment
+# - Liquidity Sweep Detection
+# - Orderflow Momentum
+# - Market Regime Detection
+# - Dynamic Risk Engine
+# - Trade Replay Analyzer
+# - Self‑Learning Strategy Analyzer
+
+# NOTE:
+# These functions are intentionally modular and safe.
+# They do NOT break existing signal logic. They enhance it.
+
+# ---------------------------------------------------------
+# Market Structure Engine (HH HL LH LL)
+# ---------------------------------------------------------
+# ---------------------------------------------------------
+# Smart Money Concepts (SMC) — Market Structure Engine
+# Detects: HH/HL/LH/LL, BOS, CHOCH, and returns a structure bias.
+# Safe: does not alter existing core logic unless you choose to gate with it.
+# ---------------------------------------------------------
+def _pf_swings_from_ohlcv(ohlcv, fractal: int = 2):
+    """Return swing highs/lows indices using a simple fractal window.
+    fractal=2 means current high > highs of 2 candles left and 2 right (same for lows).
+    """
+    highs = [float(c[2]) for c in ohlcv]
+    lows = [float(c[3]) for c in ohlcv]
+    n = len(ohlcv)
+    if n < (fractal * 2 + 5):
+        return [], []
+
+    swing_highs = []
+    swing_lows = []
+    for i in range(fractal, n - fractal):
+        h = highs[i]
+        l = lows[i]
+        if all(h > highs[j] for j in range(i - fractal, i)) and all(h >= highs[j] for j in range(i + 1, i + fractal + 1)):
+            swing_highs.append(i)
+        if all(l < lows[j] for j in range(i - fractal, i)) and all(l <= lows[j] for j in range(i + 1, i + fractal + 1)):
+            swing_lows.append(i)
+
+    return swing_highs, swing_lows
+
+
+def pf_market_structure_smc(ohlcv, fractal: int = 2, lookback: int = 160):
+    """Smart Money Concepts market-structure inference.
+
+    Returns dict:
+      bias: 'BULLISH' | 'BEARISH' | 'RANGE' | 'UNKNOWN'
+      hh_hl_lh_ll: last classified structure point ('HH','HL','LH','LL','NA')
+      bos: 'BOS_UP' | 'BOS_DOWN' | 'NONE'
+      choch: 'CHOCH_UP' | 'CHOCH_DOWN' | 'NONE'
+      last_swing_high: float|None
+      last_swing_low: float|None
+      debug: short text
+    """
+    try:
+        if not ohlcv:
+            return {"bias": "UNKNOWN", "hh_hl_lh_ll": "NA", "bos": "NONE", "choch": "NONE",
+                    "last_swing_high": None, "last_swing_low": None, "debug": "no_ohlcv"}
+
+        # work on a tail window for speed and stability
+        data = ohlcv[-max(lookback, 60):]
+        highs = [float(c[2]) for c in data]
+        lows = [float(c[3]) for c in data]
+        closes = [float(c[4]) for c in data]
+        last_close = closes[-1]
+
+        sh, sl = _pf_swings_from_ohlcv(data, fractal=fractal)
+
+        # Need at least 2 swing highs and 2 swing lows to classify structure
+        if len(sh) < 2 or len(sl) < 2:
+            return {"bias": "UNKNOWN", "hh_hl_lh_ll": "NA", "bos": "NONE", "choch": "NONE",
+                    "last_swing_high": highs[-2] if len(highs) >= 2 else None,
+                    "last_swing_low": lows[-2] if len(lows) >= 2 else None,
+                    "debug": f"insufficient_swings sh={len(sh)} sl={len(sl)}"}
+
+        # last two swing highs/lows
+        sh1, sh2 = sh[-2], sh[-1]
+        sl1, sl2 = sl[-2], sl[-1]
+
+        h1, h2 = highs[sh1], highs[sh2]
+        l1, l2 = lows[sl1], lows[sl2]
+
+        # Determine bias from HH/HL vs LH/LL logic
+        bias = "RANGE"
+        last_tag = "NA"
+        if h2 > h1 and l2 > l1:
+            bias = "BULLISH"
+            last_tag = "HH/HL"
+        elif h2 < h1 and l2 < l1:
+            bias = "BEARISH"
+            last_tag = "LH/LL"
+        else:
+            bias = "RANGE"
+            last_tag = "MIXED"
+
+        last_swing_high = h2
+        last_swing_low = l2
+
+        # BOS/CHOCH detection via break of most recent swing levels
+        bos = "NONE"
+        choch = "NONE"
+
+        broke_up = last_close > last_swing_high
+        broke_down = last_close < last_swing_low
+
+        if bias == "BULLISH":
+            if broke_up:
+                bos = "BOS_UP"
+            if broke_down:
+                choch = "CHOCH_DOWN"
+        elif bias == "BEARISH":
+            if broke_down:
+                bos = "BOS_DOWN"
+            if broke_up:
+                choch = "CHOCH_UP"
+        else:
+            # In range, treat breaks as potential CHOCH signals
+            if broke_up:
+                choch = "CHOCH_UP"
+            if broke_down:
+                choch = "CHOCH_DOWN"
+
+        return {"bias": bias, "hh_hl_lh_ll": last_tag, "bos": bos, "choch": choch,
+                "last_swing_high": float(last_swing_high), "last_swing_low": float(last_swing_low),
+                "debug": f"h1={h1:.6g} h2={h2:.6g} l1={l1:.6g} l2={l2:.6g} close={last_close:.6g}"}
+
+    except Exception as e:
+        return {"bias": "UNKNOWN", "hh_hl_lh_ll": "NA", "bos": "NONE", "choch": "NONE",
+                "last_swing_high": None, "last_swing_low": None, "debug": f"err:{e}"}
+
+
+# ---------------------------------------------------------
+# Liquidity Sweep Detection (Stop-Hunt Detection) — v2
+# Detects wick sweep beyond last swing, then close back inside.
+# ---------------------------------------------------------
+def pf_liquidity_sweep_v2(ohlcv, lookback_swings: int = 50, fractal: int = 2, wick_ratio: float = 0.35):
+    """Return dict with {event, level, debug}.
+
+    event:
+      - BUY_SWEEP  (sweep lows -> reversal up)
+      - SELL_SWEEP (sweep highs -> reversal down)
+      - NONE
+    """
+    try:
+        if not ohlcv or len(ohlcv) < 20:
+            return {"event": "NONE", "level": None, "debug": "insufficient_bars"}
+
+        data = ohlcv[-max(lookback_swings, 30):]
+        highs = [float(c[2]) for c in data]
+        lows = [float(c[3]) for c in data]
+        opens = [float(c[1]) for c in data]
+        closes = [float(c[4]) for c in data]
+
+        sh, sl = _pf_swings_from_ohlcv(data, fractal=fractal)
+
+        if len(sh) < 1 or len(sl) < 1:
+            # fallback to simple last-10 range
+            prev_high = max(highs[-10:-1])
+            prev_low = min(lows[-10:-1])
+            h = highs[-1]; l = lows[-1]; c = closes[-1]
+            if h > prev_high and c < prev_high:
+                return {"event": "SELL_SWEEP", "level": float(prev_high), "debug": "fallback_prev_high"}
+            if l < prev_low and c > prev_low:
+                return {"event": "BUY_SWEEP", "level": float(prev_low), "debug": "fallback_prev_low"}
+            return {"event": "NONE", "level": None, "debug": "no_swings_fallback_none"}
+
+        last_sh = highs[sh[-1]]
+        last_sl = lows[sl[-1]]
+
+        o = opens[-1]; h = highs[-1]; l = lows[-1]; c = closes[-1]
+        rng = max(1e-12, (h - l))
+        upper_wick = max(0.0, h - max(o, c))
+        lower_wick = max(0.0, min(o, c) - l)
+
+        # SELL sweep: wick above swing high, but close back below the swing level
+        if h > last_sh and c < last_sh and (upper_wick / rng) >= wick_ratio:
+            return {"event": "SELL_SWEEP", "level": float(last_sh), "debug": f"wick_up={upper_wick/rng:.2f}"}
+
+        # BUY sweep: wick below swing low, but close back above the swing level
+        if l < last_sl and c > last_sl and (lower_wick / rng) >= wick_ratio:
+            return {"event": "BUY_SWEEP", "level": float(last_sl), "debug": f"wick_dn={lower_wick/rng:.2f}"}
+
+        return {"event": "NONE", "level": None, "debug": "no_sweep"}
+
+    except Exception as e:
+        return {"event": "NONE", "level": None, "debug": f"err:{e}"}
+
+
+# ---------------------------------------------------------
+# Smart Money Flow Detection
+# Detects: institutional activity proxy, liquidation moves, momentum ignition.
+# Uses only OHLCV (safe, no external dependencies).
+# ---------------------------------------------------------
+def pf_smart_money_flow(ohlcv, vol_lookback: int = 30, spike_mult: float = 2.0, body_ratio: float = 0.55):
+    """Return dict with {event, score, debug}.
+
+    event values:
+      - BUY_IGNITION / SELL_IGNITION   (volume spike + expansion + directional close)
+      - LIQUIDATION_BUY / LIQUIDATION_SELL (long-wick sweep + volume spike)
+      - NONE
+    """
+    try:
+        if not ohlcv or len(ohlcv) < (vol_lookback + 5):
+            return {"event": "NONE", "score": 0, "debug": "insufficient_bars"}
+
+        data = ohlcv[-max(vol_lookback + 5, 40):]
+        vols = [float(c[5]) for c in data]
+        opens = [float(c[1]) for c in data]
+        highs = [float(c[2]) for c in data]
+        lows = [float(c[3]) for c in data]
+        closes = [float(c[4]) for c in data]
+
+        v_now = vols[-1]
+        v_avg = sum(vols[-vol_lookback-1:-1]) / max(1, len(vols[-vol_lookback-1:-1]))
+        v_spike = (v_now >= spike_mult * max(1e-12, v_avg))
+
+        o = opens[-1]; h = highs[-1]; l = lows[-1]; c = closes[-1]
+        rng = max(1e-12, (h - l))
+        body = abs(c - o)
+        body_ok = (body / rng) >= body_ratio
+
+        upper_wick = max(0.0, h - max(o, c)) / rng
+        lower_wick = max(0.0, min(o, c) - l) / rng
+
+        # Expansion proxy: last range vs average recent range
+        ranges = [(highs[i] - lows[i]) for i in range(-min(20, len(highs)), 0)]
+        avg_rng = sum(ranges[:-1]) / max(1, (len(ranges) - 1))
+        expansion = (ranges[-1] >= 1.5 * max(1e-12, avg_rng))
+
+        score = 0
+        if v_spike:
+            score += 2
+        if expansion:
+            score += 1
+        if body_ok:
+            score += 1
+
+        # Liquidation / stop-run style candles
+        if v_spike and lower_wick >= 0.55 and c > o:
+            return {"event": "LIQUIDATION_BUY", "score": score + 2, "debug": f"v_spike={v_spike} lw={lower_wick:.2f} exp={expansion}"}
+        if v_spike and upper_wick >= 0.55 and c < o:
+            return {"event": "LIQUIDATION_SELL", "score": score + 2, "debug": f"v_spike={v_spike} uw={upper_wick:.2f} exp={expansion}"}
+
+        # Momentum ignition
+        if v_spike and expansion and body_ok:
+            if c > o:
+                return {"event": "BUY_IGNITION", "score": score, "debug": f"v_spike={v_spike} exp={expansion} body={body/rng:.2f}"}
+            if c < o:
+                return {"event": "SELL_IGNITION", "score": score, "debug": f"v_spike={v_spike} exp={expansion} body={body/rng:.2f}"}
+
+        return {"event": "NONE", "score": score if score else 0, "debug": f"v_spike={v_spike} exp={expansion} body={body/rng:.2f}"}
+
+    except Exception as e:
+        return {"event": "NONE", "score": 0, "debug": f"err:{e}"}
+
+def pf_detect_market_structure(ohlcv):
+    """Backward-compatible wrapper.
+    Returns: 'BULLISH' | 'BEARISH' | 'RANGE' | 'UNKNOWN'
+    """
+    try:
+        info = pf_market_structure_smc(ohlcv)
+        return (info.get("bias") or "UNKNOWN")
+    except Exception:
+        return "UNKNOWN"
+
+def pf_mtf_alignment(symbol, fetch_func):
+
+    try:
+        ohlcv4 = fetch_func(symbol, "4h", 120)
+        ohlcv1 = fetch_func(symbol, "1h", 120)
+
+        if not ohlcv4 or not ohlcv1 or len(ohlcv4) < 30 or len(ohlcv1) < 30:
+            return "UNKNOWN"
+
+        c4 = [float(x[4]) for x in ohlcv4]
+        c1 = [float(x[4]) for x in ohlcv1]
+
+        ema4_fast = sum(c4[-10:]) / 10.0
+        ema4_slow = sum(c4[-20:]) / 20.0
+        ema1_fast = sum(c1[-10:]) / 10.0
+        ema1_slow = sum(c1[-20:]) / 20.0
+
+        up4 = c4[-1] > ema4_fast > ema4_slow
+        dn4 = c4[-1] < ema4_fast < ema4_slow
+        up1 = c1[-1] > ema1_fast > ema1_slow
+        dn1 = c1[-1] < ema1_fast < ema1_slow
+
+        if up4 and up1:
+            return "BULLISH"
+        if dn4 and dn1:
+            return "BEARISH"
+
+        # Allow 4H to dominate if 1H is only mildly lagging.
+        if up4 and c1[-1] >= ema1_slow:
+            return "BULLISH"
+        if dn4 and c1[-1] <= ema1_slow:
+            return "BEARISH"
+
+        return "MIXED"
+
+    except Exception:
+        return "UNKNOWN"
+
+
+# ---------------------------------------------------------
+# Liquidity Sweep Detection
+# ---------------------------------------------------------
+def pf_liquidity_sweep(ohlcv, lookback_swings: int = 40, fractal: int = 2):
+    """Detect stop-hunts (liquidity sweeps) above/below recent swing highs/lows.
+
+    Returns one of:
+      - 'BUY_SWEEP'  : sweep below recent swing low then close back above that level
+      - 'SELL_SWEEP' : sweep above recent swing high then close back below that level
+      - 'NONE'
+      - 'UNKNOWN'
+    """
+    try:
+        info = pf_liquidity_sweep_v2(ohlcv, lookback_swings=lookback_swings, fractal=fractal)
+        return info.get("event", "NONE")
+    except Exception:
+        return "UNKNOWN"
+
+def pf_orderflow_momentum(ohlcv):
+
+    try:
+        closes = [c[4] for c in ohlcv]
+
+        move = closes[-1] - closes[-5]
+
+        if move > 0:
+            return "BULLISH"
+
+        if move < 0:
+            return "BEARISH"
+
+        return "FLAT"
+
+    except Exception:
+        return "FLAT"
+
+
+# ---------------------------------------------------------
+# Market Regime Detection
+# ---------------------------------------------------------
+def pf_market_regime(ohlcv):
+
+    try:
+        closes = [c[4] for c in ohlcv]
+        highs = [c[2] for c in ohlcv]
+        lows = [c[3] for c in ohlcv]
+
+        rng = [(highs[i] - lows[i]) for i in range(-20, 0)]
+        avg_range = sum(rng) / len(rng)
+
+        move = abs(closes[-1] - closes[-20]) / closes[-20] * 100
+
+        if move > 4:
+            return "TRENDING"
+
+        if avg_range / closes[-1] > 0.02:
+            return "VOLATILE"
+
+        if move < 1:
+            return "RANGING"
+
+        return "NORMAL"
+
+    except Exception:
+        return "UNKNOWN"
+
+
+# ---------------------------------------------------------
+# Dynamic Risk Engine
+# Tiered multiplier for autotrade position sizing.
+# Base risk comes from /riskmode, then gets scaled by confidence,
+# market regime, and engine type in a conservative way.
+# ---------------------------------------------------------
+def pf_dynamic_risk_multiplier(confidence, regime=None, engine=None):
+
+    try:
+        conf = int(float(confidence or 0))
+        reg = str(regime or "UNKNOWN").upper()
+        eng = str(engine or "").upper()
+
+        if conf >= 90:
+            mult = 1.20
+        elif conf >= 85:
+            mult = 1.10
+        elif conf >= 80:
+            mult = 1.00
+        elif conf >= 75:
+            mult = 0.90
+        else:
+            mult = 0.75
+
+        # Regime adjustment
+        if reg == "TRENDING":
+            mult += 0.05
+        elif reg == "RANGING":
+            mult -= 0.15
+        elif reg == "VOLATILE":
+            mult -= 0.10
+
+        # Engine adjustment
+        # B = momentum breakout -> best in trend, worst in chop.
+        if eng == "B" and reg == "TRENDING":
+            mult += 0.05
+        elif eng == "B" and reg in ("RANGING", "VOLATILE"):
+            mult -= 0.10
+        elif eng == "A" and reg == "RANGING":
+            mult -= 0.05
+
+        return float(clamp(mult, 0.60, 1.30))
+
+    except Exception:
+        return 1.00
+
+
+def pf_dynamic_risk(confidence, base_risk, regime=None, engine=None):
+    """Backwards-compatible wrapper returning effective risk USD."""
+    try:
+        return float(base_risk) * float(pf_dynamic_risk_multiplier(confidence, regime=regime, engine=engine))
+    except Exception:
+        return float(base_risk or 0.0)
+
+
+# ---------------------------------------------------------
+# Trade Replay Analyzer
+# ---------------------------------------------------------
+def pf_trade_replay(symbol, entry, sl, fetch_func):
+
+    try:
+
+        ohlcv = fetch_func(symbol, "5m", 120)
+
+        highs = [c[2] for c in ohlcv]
+        lows = [c[3] for c in ohlcv]
+
+        max_move = max(highs) - entry
+        sl_dist = abs(entry - sl)
+
+        if sl_dist == 0:
+            return None
+
+        rr = max_move / sl_dist
+
+        if rr >= 3:
+            return "EXCELLENT"
+
+        if rr >= 2:
+            return "GOOD"
+
+        if rr >= 1:
+            return "OK"
+
+        return "POOR"
+
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------
+# Self Learning Strategy Analyzer
+# ---------------------------------------------------------
+def pf_strategy_learning(trades):
+
+    try:
+
+        wins = 0
+        losses = 0
+
+        for t in trades:
+
+            pnl = float(t.get("pnl", 0))
+
+            if pnl > 0:
+                wins += 1
+            else:
+                losses += 1
+
+        total = wins + losses
+
+        if total == 0:
+            return "No data"
+
+        winrate = wins / total
+
+        if winrate < 0.5:
+            return "Recommendation: tighten signal filters"
+
+        if winrate < 0.6:
+            return "Recommendation: adjust EMA proximity"
+
+        return "Strategy performing well"
+
+    except Exception:
+        return "Learning engine error"
+
+
+
+
+
+# ==========================================================
+# PULSEFUTURES SIGNAL QUALITY GATE ENGINE
+# Added safely for Ramin – does NOT modify existing logic
+# ==========================================================
+
+def pf_signal_quality_gate(trend=None, ema_pullback=None, liquidity_event=None):
+    """
+    Determines if a signal should be allowed based on three confirmations:
+    1. Trend confirmation
+    2. EMA pullback confirmation
+    3. Liquidity event confirmation (sweep or order block)
+    """
+
+    try:
+
+        score = 0
+
+        if trend in ("BULLISH", "BEARISH"):
+            score += 1
+
+        if ema_pullback is True:
+            score += 1
+
+        if liquidity_event in ("BUY_SWEEP", "SELL_SWEEP", "ORDER_BLOCK"):
+            score += 1
+
+        if score >= 3:
+            return True
+
+        return False
+
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------
+# Example helper to evaluate signal quality for a symbol
+# ----------------------------------------------------------
+def pf_evaluate_signal(symbol, trend, ema_pullback, liquidity_event):
+    """Returns signal approval and explanation"""
+
+    approved = pf_signal_quality_gate(trend, ema_pullback, liquidity_event)
+
+    if approved:
+        return True, f"Signal approved for {symbol}: Trend + EMA pullback + Liquidity confirmation"
+    else:
+        return False, f"Signal rejected for {symbol}: insufficient confirmations"
+
+
+# ==========================================================
+# END SIGNAL QUALITY GATE ENGINE
+# ==========================================================
