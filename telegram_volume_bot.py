@@ -19566,8 +19566,7 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines = ["🤖 AutoTrade — Last Attempt", HDR]
     if not det and not dec:
         lines.append("No attempts recorded yet.")
-        await send_long_message(update, "
-".join(lines), parse_mode=None)
+        await send_long_message(update, "\n".join(lines), parse_mode=None)
         return
 
     symbol_sent = str(det.get('symbol_sent', '') or '')
@@ -19588,8 +19587,7 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines.append(f"Signal created: {_fmt_iso_to_local(sig_time) if sig_time else '—'}")
     lines.append(f"Email logged: {_fmt_iso_to_local(email_time) if email_time else '—'}")
     lines.append(f"Result: {dec_status}{(' | ' + dec_reason) if dec_reason else ''}")
-    await send_long_message(update, "
-".join(lines), parse_mode=None)
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """AutoTrade readiness + last decision diagnostics (admin only)."""
