@@ -75,6 +75,35 @@ CHANGELOG (2026-03-06)
 # =========================================================
 
 import os
+
+
+# --- generic env helpers (added for leader-base patch safety) ---
+def env_bool(name: str, default=False):
+    try:
+        v = os.getenv(name, None)
+        if v is None:
+            return bool(default)
+        return str(v).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+    except Exception:
+        return bool(default)
+
+def env_float(name: str, default=0.0):
+    try:
+        v = os.getenv(name, None)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+def env_int(name: str, default=0):
+    try:
+        v = os.getenv(name, None)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
 import sys
 import time
 import logging
@@ -1299,6 +1328,25 @@ MOMENTUM_MAX_ADAPTIVE_EMA_DIST = 3.5   # percent, was 7.5
 # Higher TP behavior for Engine B (pumps)
 ENGINE_B_TP_CAP_BONUS_PCT = 4.0      # adds to TP cap %
 ENGINE_B_RR_BONUS = 0.35             # adds to RR target (TP3)
+
+# =========================================================
+# ✅ ENGINE C (PUMP-BASE / RANGE-CONTINUATION)
+# Purpose: capture symbols like ACX after the impulse candle, when price pauses,
+# compresses on 15m near support/resistance, then starts trending again.
+# =========================================================
+ENGINE_C_PUMP_BASE_ENABLED = True
+ENGINE_C_MIN_CH24 = 10.0
+ENGINE_C_MIN_ABS_CH4 = 1.2
+ENGINE_C_MIN_IMPULSE_15M_PCT = 4.0
+ENGINE_C_MIN_IMPULSE_VOL_MULT = 1.35
+ENGINE_C_MAX_BASE_BARS = 10
+ENGINE_C_MIN_BASE_BARS = 3
+ENGINE_C_MAX_BASE_WIDTH_PCT = 8.5
+ENGINE_C_HOLD_PORTION = 0.52
+ENGINE_C_BREAKOUT_BUFFER_PCT = 0.35
+ENGINE_C_MIN_FUT_VOL_USD = 8_000_000.0
+ENGINE_C_RR_BONUS = 0.20
+ENGINE_C_TP_CAP_BONUS_PCT = 2.0
 
 # =========================================================
 # RISK DEFAULTS
@@ -4255,25 +4303,6 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         live_open_count = int(mday.get('open_positions_now') or 0)
     except Exception:
         live_open_count = 0
-    try:
-        opened_today_count = int(mday.get('opened_today_count') or 0)
-    except Exception:
-        opened_today_count = 0
-    try:
-        admin_user = get_user(int(uid)) or {}
-        max_trades_day_limit = int(admin_user.get('max_trades_day') or 0)
-    except Exception:
-        max_trades_day_limit = 0
-    if max_trades_day_limit > 0 and opened_today_count >= max_trades_day_limit:
-        try:
-            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_trades_day_reached', 'opened_today_count': int(opened_today_count), 'max_trades_day': int(max_trades_day_limit)})
-        except Exception:
-            pass
-        try:
-            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'max_trades_day_reached ({opened_today_count}/{max_trades_day_limit})')
-        except Exception:
-            pass
-        return (False, 'max_trades_day_reached')
     if int(AUTOTRADE_MAX_OPEN_TRADES or 0) > 0 and live_open_count >= int(AUTOTRADE_MAX_OPEN_TRADES):
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_open_trades_reached', 'open_positions_now': int(live_open_count)})
@@ -4765,6 +4794,18 @@ SESSION_EMA_REACTION_LOOKBACK = {
     "LON": 7,
     "ASIA": 6,
 }
+
+# Leader-base continuation override (for explosive trend names like PIXEL after the first impulse)
+LEADER_BASE_OVERRIDE_ENABLED = env_bool("LEADER_BASE_OVERRIDE_ENABLED", True)
+LEADER_BASE_MIN_CH24 = env_float("LEADER_BASE_MIN_CH24", 25.0)
+LEADER_BASE_MIN_FUT_VOL_USD = env_float("LEADER_BASE_MIN_FUT_VOL_USD", 10_000_000.0)
+LEADER_BASE_MIN_CH4 = env_float("LEADER_BASE_MIN_CH4", 1.0)
+LEADER_BASE_MAX_CH15_ABS = env_float("LEADER_BASE_MAX_CH15_ABS", 1.25)
+LEADER_BASE_MAX_PB_DIST_PCT = env_float("LEADER_BASE_MAX_PB_DIST_PCT", 1.10)
+LEADER_BASE_SL_CAP_PCT_NY = env_float("LEADER_BASE_SL_CAP_PCT_NY", 3.6)
+LEADER_BASE_SL_CAP_PCT_LON = env_float("LEADER_BASE_SL_CAP_PCT_LON", 3.3)
+LEADER_BASE_SL_CAP_PCT_ASIA = env_float("LEADER_BASE_SL_CAP_PCT_ASIA", 3.0)
+
 
 # ✅ 1H trigger loosened per session (overall easier)
 SESSION_TRIGGER_ATR_MULT = {
@@ -7761,9 +7802,8 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["over_by"] = max(0.0, -rem) if math.isfinite(rem) and snap["cap"] > 0 else 0.0
         snap["pnl_today"] = float(m.get("realized_pnl_today") or 0.0)
         snap["trades_today"] = int(m.get("opened_today_count") or 0)
-        admin_trade_limit = int(user.get("max_trades_day") or 0)
-        snap["trades_today_limit"] = admin_trade_limit
-        snap["remaining_new_positions_today"] = max(0, admin_trade_limit - int(snap["trades_today"])) if admin_trade_limit > 0 else 0
+        snap["trades_today_limit"] = 0
+        snap["remaining_new_positions_today"] = 0
     else:
         cap = float(daily_cap_usd(user) or 0.0)
         pnl_today = float(_pnl_today_closed_trades(uid, user) or 0.0)
@@ -14173,6 +14213,24 @@ def is_executable_setup_eligible(
                 return (False, "pullback_not_ready")
             return (True, "ok")
 
+        if engine == "C":
+            if score < (score_floor + 1.5):
+                return (False, "engine_c_below_quality")
+            if conf < (conf_floor + 1):
+                return (False, "engine_c_below_conf")
+            if rr_final < (rr_floor + 0.05):
+                return (False, "engine_c_below_rr")
+            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.25, ENGINE_C_MIN_FUT_VOL_USD)):
+                return (False, "engine_c_below_liquidity")
+            ch24_abs = abs(float(getattr(s, "ch24", 0.0) or 0.0))
+            ch4_abs = abs(float(getattr(s, "ch4", 0.0) or 0.0))
+            ch15_abs = abs(float(getattr(s, "ch15", 0.0) or 0.0))
+            if ch24_abs < float(ENGINE_C_MIN_CH24) or ch4_abs < float(ENGINE_C_MIN_ABS_CH4):
+                return (False, "engine_c_context_too_weak")
+            if ch15_abs > 3.8:
+                return (False, "engine_c_still_too_extended")
+            return (True, "ok")
+
         if engine == "B":
             if not bool(EXECUTION_ENGINE_B_EMAIL_ENABLED):
                 return (False, "engine_b_disabled")
@@ -14388,6 +14446,194 @@ def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
     dn_txt = "*Directional Losers (24H ≤ -10%, F vol ≥ 5M, 4H aligned)*\n" + (table_md(dn_rows, ["SYM", "F Vol", "24H", "4H"]) if dn_rows else "_None_")
     return up_txt, dn_txt
 
+
+def _engine_c_detect_pump_base(
+    side: str,
+    entry: float,
+    atr_1h: float,
+    ch24: float,
+    ch4: float,
+    fut_vol: float,
+    c15: list,
+    ema_support_15m: float,
+    aggressive_screen: bool = False,
+) -> dict:
+    """Detect post-impulse 15m compression / range continuation.
+
+    Idea:
+    - a strong impulse already happened (pump/dump candle)
+    - then price pauses in a narrow 15m base near the impulse highs/lows
+    - support/resistance holds and price starts to break/reclaim the base again
+
+    This is deliberately stricter than Engine B so it targets "pump then base then continue"
+    instead of raw expansion candles.
+    """
+    out = {
+        'ok': False,
+        'reason': 'na',
+        'side': str(side or '').upper(),
+        'impulse_pct': 0.0,
+        'base_width_pct': 999.0,
+        'base_bars': 0,
+        'support_level': 0.0,
+        'resistance_level': 0.0,
+        'breakout_ready': False,
+    }
+    try:
+        side = str(side or '').upper().strip()
+        if side not in ('BUY', 'SELL'):
+            out['reason'] = 'bad_side'
+            return out
+        if entry <= 0 or atr_1h <= 0 or not c15 or len(c15) < 18:
+            out['reason'] = 'missing_inputs'
+            return out
+        if abs(float(ch24 or 0.0)) < float(ENGINE_C_MIN_CH24):
+            out['reason'] = 'ch24_too_small'
+            return out
+        if abs(float(ch4 or 0.0)) < float(ENGINE_C_MIN_ABS_CH4):
+            out['reason'] = 'ch4_too_small'
+            return out
+        if float(fut_vol or 0.0) < float(ENGINE_C_MIN_FUT_VOL_USD):
+            out['reason'] = 'fut_vol_too_small'
+            return out
+
+        bars = c15[-24:]
+        opens = [float(x[1]) for x in bars]
+        highs = [float(x[2]) for x in bars]
+        lows = [float(x[3]) for x in bars]
+        closes = [float(x[4]) for x in bars]
+        vols = [float(x[5]) for x in bars]
+        if len(closes) < 18:
+            out['reason'] = 'window_too_small'
+            return out
+
+        ranges = [max(0.0, h - l) for h, l in zip(highs, lows)]
+        prior = ranges[:-1]
+        med_range = sorted(prior)[len(prior)//2] if prior else 0.0
+        if med_range <= 0:
+            med_range = max(entry * 0.002, float(atr_1h) * 0.18)
+        vol_hist = vols[:-1]
+        vol_med = sorted(vol_hist)[len(vol_hist)//2] if vol_hist else 0.0
+
+        impulse_idx = None
+        impulse_score = -1.0
+        lookback = min(16, len(closes) - int(ENGINE_C_MIN_BASE_BARS) - 1)
+        for idx in range(max(1, len(closes) - lookback - 1), len(closes) - int(ENGINE_C_MIN_BASE_BARS)):
+            o = opens[idx]
+            h = highs[idx]
+            l = lows[idx]
+            c = closes[idx]
+            rng = max(1e-12, h - l)
+            body_pct = abs(c - o) / max(o, 1e-12) * 100.0
+            range_mult = rng / max(med_range, 1e-12)
+            vol_mult = (vols[idx] / max(vol_med, 1e-12)) if vol_med > 0 else 1.0
+            close_loc = (c - l) / rng if side == 'BUY' else (h - c) / rng
+            directional_ok = (c > o) if side == 'BUY' else (c < o)
+            if not directional_ok:
+                continue
+            need_impulse = float(ENGINE_C_MIN_IMPULSE_15M_PCT) * (0.88 if aggressive_screen else 1.0)
+            need_vol = float(ENGINE_C_MIN_IMPULSE_VOL_MULT) * (0.92 if aggressive_screen else 1.0)
+            if body_pct < need_impulse:
+                continue
+            if range_mult < 2.0:
+                continue
+            if close_loc < 0.60:
+                continue
+            if vol_mult < need_vol:
+                continue
+            score = body_pct + (range_mult * 1.2) + min(2.5, vol_mult)
+            if score > impulse_score:
+                impulse_score = score
+                impulse_idx = idx
+
+        if impulse_idx is None:
+            out['reason'] = 'no_impulse_bar'
+            return out
+
+        base = bars[impulse_idx + 1:]
+        if len(base) < int(ENGINE_C_MIN_BASE_BARS):
+            out['reason'] = 'base_too_short'
+            return out
+        if len(base) > int(ENGINE_C_MAX_BASE_BARS):
+            base = base[-int(ENGINE_C_MAX_BASE_BARS):]
+
+        b_highs = [float(x[2]) for x in base]
+        b_lows = [float(x[3]) for x in base]
+        b_closes = [float(x[4]) for x in base]
+        b_opens = [float(x[1]) for x in base]
+        b_ranges = [max(1e-12, float(x[2]) - float(x[3])) for x in base]
+
+        impulse_high = highs[impulse_idx]
+        impulse_low = lows[impulse_idx]
+        impulse_range = max(1e-12, impulse_high - impulse_low)
+        impulse_close = closes[impulse_idx]
+        last_close = b_closes[-1]
+        base_high = max(b_highs)
+        base_low = min(b_lows)
+        base_width_pct = ((base_high - base_low) / max(last_close, 1e-12)) * 100.0
+        out['impulse_pct'] = abs((impulse_close - opens[impulse_idx]) / max(opens[impulse_idx], 1e-12) * 100.0)
+        out['base_width_pct'] = float(base_width_pct)
+        out['base_bars'] = int(len(base))
+        out['support_level'] = float(base_low)
+        out['resistance_level'] = float(base_high)
+
+        width_limit = float(ENGINE_C_MAX_BASE_WIDTH_PCT) * (1.18 if aggressive_screen else 1.0)
+        if base_width_pct > width_limit:
+            out['reason'] = 'base_too_wide'
+            return out
+
+        hold_portion = float(ENGINE_C_HOLD_PORTION)
+        if side == 'BUY':
+            hold_line = impulse_low + (impulse_range * hold_portion)
+            if base_low < hold_line:
+                out['reason'] = 'lost_impulse_support'
+                return out
+            if ema_support_15m > 0 and last_close < (ema_support_15m * 0.985):
+                out['reason'] = 'below_ema_support'
+                return out
+            upper_half = sum(1 for c in b_closes if c >= (base_low + (base_high - base_low) * 0.50))
+            if upper_half < max(2, len(base) // 2):
+                out['reason'] = 'base_not_holding_high'
+                return out
+            breakout_ready = last_close >= (base_high * (1.0 - float(ENGINE_C_BREAKOUT_BUFFER_PCT) / 100.0))
+            reclaim_ok = b_closes[-1] >= b_opens[-1]
+            if not (breakout_ready and reclaim_ok):
+                out['reason'] = 'not_ready_for_breakout'
+                out['breakout_ready'] = bool(breakout_ready)
+                return out
+        else:
+            hold_line = impulse_high - (impulse_range * hold_portion)
+            if base_high > hold_line:
+                out['reason'] = 'lost_impulse_resistance'
+                return out
+            if ema_support_15m > 0 and last_close > (ema_support_15m * 1.015):
+                out['reason'] = 'above_ema_resistance'
+                return out
+            lower_half = sum(1 for c in b_closes if c <= (base_low + (base_high - base_low) * 0.50))
+            if lower_half < max(2, len(base) // 2):
+                out['reason'] = 'base_not_holding_low'
+                return out
+            breakout_ready = last_close <= (base_low * (1.0 + float(ENGINE_C_BREAKOUT_BUFFER_PCT) / 100.0))
+            reclaim_ok = b_closes[-1] <= b_opens[-1]
+            if not (breakout_ready and reclaim_ok):
+                out['reason'] = 'not_ready_for_breakdown'
+                out['breakout_ready'] = bool(breakout_ready)
+                return out
+
+        # Extra stability: base should actually compress after impulse.
+        avg_base_range = sum(b_ranges) / max(1, len(b_ranges))
+        if avg_base_range > (impulse_range * 0.62):
+            out['reason'] = 'base_not_compressed'
+            return out
+
+        out['ok'] = True
+        out['reason'] = 'ok'
+        out['breakout_ready'] = True
+        return out
+    except Exception as e:
+        out['reason'] = f'exception:{type(e).__name__}'
+        return out
+
 # =========================================================
 # make_setup
 # =========================================================
@@ -14584,6 +14830,8 @@ def make_setup(
 
         pullback_ready = bool(pb_ok)
 
+        leader_base_override = _leader_base_override_ok(side, ch24, ch4_used, ch15, fut_vol, pullback_ready, pb_dist_pct2, session_name)
+
         # Aggressive /screen: allow "near-EMA" pullback (slightly looser proximity)
         if (not pullback_ready) and aggressive_screen and (pb_ema_val > 0) and (pb_thr_pct > 0):
             try:
@@ -14612,6 +14860,8 @@ def make_setup(
         engine_a_ok = bool(ENGINE_A_PULLBACK_ENABLED and pullback_ready)
 
         engine_b_ok = False
+        engine_c_ok = False
+        engine_c_info = {"ok": False, "reason": "disabled"}
 
         if ENGINE_B_MOMENTUM_ENABLED:
             # Aggressive /screen: slightly looser momentum requirements
@@ -14688,14 +14938,34 @@ def make_setup(
         except Exception:
             pass
 
-        if not engine_a_ok and not engine_b_ok:
-            _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f}")
+        # ---------------------------------------------------------
+        # ENGINE C (Pump-base / range continuation after impulse)
+        # ---------------------------------------------------------
+        if ENGINE_C_PUMP_BASE_ENABLED:
+            try:
+                engine_c_info = _engine_c_detect_pump_base(
+                    side=side,
+                    entry=entry,
+                    atr_1h=atr_1h,
+                    ch24=ch24,
+                    ch4=ch4_used,
+                    fut_vol=fut_vol,
+                    c15=c15,
+                    ema_support_15m=ema_support_15m,
+                    aggressive_screen=aggressive_screen,
+                )
+                engine_c_ok = bool(engine_c_info.get('ok'))
+            except Exception:
+                engine_c_ok = False
+
+        if not engine_a_ok and not engine_b_ok and not engine_c_ok:
+            _rej("no_engine_passed", base, mv, f"ch1={ch1:.2f} ch24={ch24:.2f} pb_dist={pb_dist_pct:.2f} ec={engine_c_info.get('reason','na')}")
             return None
 
         # ---------------------------------------------------------
-        # Pullback policy (optional for Engine B)
+        # Pullback policy (optional for Engine B / Engine C on /screen)
         # ---------------------------------------------------------
-        engine = "A" if engine_a_ok else "B"
+        engine = "A" if engine_a_ok else ("C" if engine_c_ok else "B")
         require_pullback = (not bool(allow_no_pullback))
 
         # Compute confidence BEFORE applying optional pullback penalty
@@ -14807,6 +15077,23 @@ def make_setup(
                     conf -= 5
                     notes.append(f"pro_hits={core_hits}")
 
+            if engine == "C":
+                if trend == want_trend:
+                    conf += 2
+                if structure == want_trend:
+                    conf += 2
+                if bos in ("BOS_UP", "BOS_DOWN"):
+                    conf += 1
+                if str(regime or "").upper() == "RANGING":
+                    conf += 2
+                c_base_width = float(engine_c_info.get('base_width_pct', 999.0) or 999.0)
+                if c_base_width <= 4.0:
+                    conf += 3
+                elif c_base_width <= 6.5:
+                    conf += 1
+                else:
+                    conf -= 2
+
             conf = int(clamp(float(conf), 0.0, 100.0))
         except Exception:
             pass
@@ -14885,6 +15172,9 @@ def make_setup(
 
         rr_bonus = ENGINE_B_RR_BONUS if engine_b_ok else 0.0
         tp_cap_bonus = ENGINE_B_TP_CAP_BONUS_PCT if engine_b_ok else 0.0
+        if engine == "C":
+            rr_bonus = float(rr_bonus) + float(ENGINE_C_RR_BONUS)
+            tp_cap_bonus = float(tp_cap_bonus) + float(ENGINE_C_TP_CAP_BONUS_PCT)
 
         # ✅ Approach A: volatility-aware TP cap tightening (higher hit-rate on choppy/high-ATR coins)
         try:
@@ -14896,8 +15186,16 @@ def make_setup(
         except Exception:
             pass
 
+        atr_for_sl = float(atr_1h)
+        if leader_base_override:
+            try:
+                atr_for_sl = min(float(atr_for_sl), float(entry) * (float(_leader_base_sl_cap_pct(session_name)) / 100.0))
+                notes.append("leader_base_override")
+            except Exception:
+                atr_for_sl = float(atr_1h)
+
         sl, tp3_single, R = compute_sl_tp(
-            entry, side, atr_1h, conf, tp_cap_pct,
+            entry, side, atr_for_sl, conf, tp_cap_pct,
             rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
         )
         if sl <= 0 or tp3_single <= 0 or R <= 0:
@@ -14969,6 +15267,7 @@ def make_setup(
             pullback_ema_dist_pct=float(pb_dist_pct2),
             pullback_ready=bool(pullback_ready),
             pullback_bypass_hot=bool(pullback_bypass_hot),
+            leader_base_override=bool(leader_base_override),
             engine=str(engine),
             is_trailing_tp3=trailing_tp3,
             created_ts=time.time(),
@@ -14986,6 +15285,14 @@ def make_setup(
             setattr(s, 'smf_score', int(smf_score or 0))
             setattr(s, 'engine', str(engine or ''))
             setattr(s, 'raw_conf', int(conf or 0))
+            try:
+                setattr(s, 'engine_c_reason', str(engine_c_info.get('reason', '')))
+                setattr(s, 'engine_c_base_width_pct', float(engine_c_info.get('base_width_pct', 0.0) or 0.0))
+                setattr(s, 'engine_c_base_bars', int(engine_c_info.get('base_bars', 0) or 0))
+                setattr(s, 'engine_c_support_level', float(engine_c_info.get('support_level', 0.0) or 0.0))
+                setattr(s, 'engine_c_resistance_level', float(engine_c_info.get('resistance_level', 0.0) or 0.0))
+            except Exception:
+                pass
             # Ensure TP ladder is always present (derive TP1/TP2 if needed)
             try:
                 t1, t2, t3 = _ensure_three_tps(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp3',0.0) or 0.0), getattr(s,'tp1',None), getattr(s,'tp2',None), str(getattr(s,'side','') or ''))
@@ -19444,6 +19751,66 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
 
     await update.message.reply_text("\n".join(lines))
 
+def _leader_base_override_ok(side: str, ch24: float, ch4: float, ch15: float, fut_vol_usd: float, pullback_ready: bool, pb_dist_pct: float, session_name: str) -> bool:
+    """Allow post-expansion continuation entries after a clean 15m base/reclaim.
+
+    This is specifically meant to avoid missing explosive leaders that are already far from the
+    1H EMA anchor, but have cooled down and rebuilt around the 15m pullback EMA.
+    """
+    try:
+        if not LEADER_BASE_OVERRIDE_ENABLED:
+            return False
+        side = str(side or "").upper().strip()
+        sess = str(session_name or "").upper().strip() or "NY"
+        if abs(float(ch24 or 0.0)) < float(LEADER_BASE_MIN_CH24):
+            return False
+        if float(fut_vol_usd or 0.0) < float(LEADER_BASE_MIN_FUT_VOL_USD):
+            return False
+        if not bool(pullback_ready):
+            return False
+        if float(pb_dist_pct or 999.0) > float(LEADER_BASE_MAX_PB_DIST_PCT):
+            return False
+        if abs(float(ch15 or 0.0)) > float(LEADER_BASE_MAX_CH15_ABS):
+            return False
+        if side == "BUY" and float(ch4 or 0.0) < float(LEADER_BASE_MIN_CH4):
+            return False
+        if side == "SELL" and float(ch4 or 0.0) > -float(LEADER_BASE_MIN_CH4):
+            return False
+        if sess == "ASIA" and abs(float(ch24 or 0.0)) < float(LEADER_BASE_MIN_CH24) + 5.0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _leader_base_sl_cap_pct(session_name: str) -> float:
+    try:
+        sess = str(session_name or "").upper().strip() or "NY"
+        if sess == "ASIA":
+            return float(LEADER_BASE_SL_CAP_PCT_ASIA)
+        if sess == "LON":
+            return float(LEADER_BASE_SL_CAP_PCT_LON)
+        return float(LEADER_BASE_SL_CAP_PCT_NY)
+    except Exception:
+        return 3.3
+
+
+def _setup_leader_base_override_ok(setup: "Setup", session_name: str) -> bool:
+    try:
+        return _leader_base_override_ok(
+            side=str(getattr(setup, "side", "") or ""),
+            ch24=float(getattr(setup, "ch24", 0.0) or 0.0),
+            ch4=float(getattr(setup, "ch4", 0.0) or 0.0),
+            ch15=float(getattr(setup, "ch15", 0.0) or 0.0),
+            fut_vol_usd=float(getattr(setup, "fut_vol_usd", 0.0) or 0.0),
+            pullback_ready=bool(getattr(setup, "pullback_ready", False)),
+            pb_dist_pct=float(getattr(setup, "pullback_ema_dist_pct", 999.0) or 999.0),
+            session_name=session_name,
+        )
+    except Exception:
+        return False
+
+
 def _adaptive_ema_anchor_limit_pct(setup: "Setup", session_name: str, fallback_allowed: float) -> float:
     """Adaptive 1H EMA-anchor limit.
 
@@ -19461,6 +19828,8 @@ def _adaptive_ema_anchor_limit_pct(setup: "Setup", session_name: str, fallback_a
             limit = max(base, 0.70 + min(1.10, atr_pct * 0.22))
         elif engine == "A":
             limit = max(base, 0.55 + min(0.75, atr_pct * 0.18))
+        elif engine == "C":
+            limit = max(base, 0.65 + min(0.95, atr_pct * 0.20))
         else:
             limit = max(base, 0.60 + min(0.85, atr_pct * 0.20))
 
@@ -19891,7 +20260,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
             ok, dist_pct, last_close, ema_val, ema_p, allowed = ema_anchor_cache[mk]
             adaptive_allowed = _adaptive_ema_anchor_limit_pct(s, session_name=session_name, fallback_allowed=allowed)
-            if float(dist_pct) > float(adaptive_allowed):
+            leader_base_ok = _setup_leader_base_override_ok(s, session_name=session_name)
+            if float(dist_pct) > float(adaptive_allowed) and not leader_base_ok:
                 mv = (best_fut or {}).get(base)
                 _rej(
                     "far_from_ema_anchor_1h",
@@ -19906,7 +20276,10 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                 setattr(s, "ema_anchor_dist_pct", float(dist_pct or 0.0))
                 setattr(s, "ema_anchor_limit_pct", float(adaptive_allowed or 0.0))
                 if float(dist_pct) > float(allowed or adaptive_allowed):
-                    s.conf = int(max(0, int(getattr(s, "conf", 0) or 0) - 4))
+                    if leader_base_ok:
+                        setattr(s, "leader_base_anchor_override", True)
+                    else:
+                        s.conf = int(max(0, int(getattr(s, "conf", 0) or 0) - 4))
             except Exception:
                 pass
 
@@ -23739,6 +24112,10 @@ def pf_dynamic_risk_multiplier(confidence, regime=None, engine=None):
             mult -= 0.10
         elif eng == "A" and reg == "RANGING":
             mult -= 0.05
+        elif eng == "C" and reg == "RANGING":
+            mult += 0.03
+        elif eng == "C" and reg == "TRENDING":
+            mult += 0.01
 
         return float(clamp(mult, 0.60, 1.30))
 
