@@ -75,6 +75,35 @@ CHANGELOG (2026-03-06)
 # =========================================================
 
 import os
+
+
+# --- generic env helpers (added for leader-base patch safety) ---
+def env_bool(name: str, default=False):
+    try:
+        v = os.getenv(name, None)
+        if v is None:
+            return bool(default)
+        return str(v).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+    except Exception:
+        return bool(default)
+
+def env_float(name: str, default=0.0):
+    try:
+        v = os.getenv(name, None)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+def env_int(name: str, default=0):
+    try:
+        v = os.getenv(name, None)
+        if v is None or str(v).strip() == "":
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
 import sys
 import time
 import logging
