@@ -8143,6 +8143,33 @@ def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executab
         pass
 
 
+def _db_setup_stage_exists(table_name: str, user_id: int, setup_id: str, ts_column: str, lookback_hours: int = 12) -> bool:
+    try:
+        sid = str(setup_id or '').strip()
+        if not sid:
+            return False
+        cutoff = float(time.time()) - float(max(1, int(lookback_hours))) * 3600.0
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute(
+            f"SELECT 1 FROM {table_name} WHERE user_id=? AND setup_id=? AND {ts_column}>=? LIMIT 1",
+            (int(user_id), sid, float(cutoff)),
+        )
+        row = cur.fetchone()
+        con.close()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def db_has_emailed_setup(user_id: int, setup_id: str, lookback_hours: int = 12) -> bool:
+    return _db_setup_stage_exists('emailed_setups', user_id, setup_id, 'emailed_ts', lookback_hours=lookback_hours)
+
+
+def db_has_executable_setup(user_id: int, setup_id: str, lookback_hours: int = 12) -> bool:
+    return _db_setup_stage_exists('executable_setups', user_id, setup_id, 'executable_ts', lookback_hours=lookback_hours)
+
+
 def db_recent_generated_setups(user_id: int, source: str, lookback_hours: int = 6, limit: int = 5) -> list[dict]:
     """Fetch recent generated_setups rows for UI correlation (/screen showing email setups too)."""
     try:
@@ -20492,7 +20519,7 @@ async def _refresh_screen_cache_async():
             return
         now_utc = datetime.now(timezone.utc)
         session = scan_session_name_utc(now_utc)
-        body, kb = await to_thread_heavy(_build_screen_body_and_kb,
+        body, kb, _setups = await to_thread_heavy(_build_screen_body_and_kb,
             best_fut,
             session,
             0,
@@ -20520,18 +20547,17 @@ async def _refresh_screen_cache_async():
 def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     """Heavy /screen builder (runs in a worker thread).
 
-    Top setups intentionally reuse the SAME email-grade pool for the active session.
-    That keeps /screen, emailed setups, and autotrade aligned; only delivery/execution
-    rules like gap/caps/risk may suppress sending or trading.
+    Top setups must stay in the same lane used by email + autotrade.
+    If the executable/email-grade pool is empty, /screen should not silently fall back
+    to broader screen-only setups as "Top Trade Setups", because that breaks the
+    expected screen -> email -> autotrade sync.
 
     Returns:
         body (str): cached body (header is built in the async handler)
         kb (list[tuple[str,str]]): [(SYMBOL, SETUP_ID), ...] for TradingView buttons
+        setups (list[Setup]): synced executable-grade setups shown on /screen
     """
-    # Build pool (coroutine) in this worker thread (isolated event loop)
-    # Prefer the executable/email-aligned lane first, but if that is empty fall back
-    # to the screen lane so /screen never goes blank just because the email lane is
-    # temporarily stricter than the broader scan engine.
+    # Build only the executable/email-aligned pool for Top Trade Setups.
     pool = _run_coro_in_thread(
         build_priority_pool(
             best_fut,
@@ -20541,19 +20567,6 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
             uid=uid,
         )
     )
-    try:
-        if not (pool or {}).get("setups"):
-            pool = _run_coro_in_thread(
-                build_priority_pool(
-                    best_fut,
-                    session,
-                    mode="screen",
-                    scan_profile=str(DEFAULT_SCAN_PROFILE),
-                    uid=uid,
-                )
-            )
-    except Exception:
-        pass
 
     # Other heavy helpers are sync; run them here too.
     # Market context inputs (keep /screen informative without becoming a data terminal)
@@ -20860,7 +20873,66 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         kb = [(s.symbol, s.setup_id) for s in (setups or [])]
     except Exception:
         kb = []
-    return body, kb
+    return body, kb, list(setups or [])
+
+async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, scan_session: str, best_fut: dict, shown_setups: list["Setup"]):
+    """Immediately sync manual /screen top setups into the email -> autotrade lane.
+
+    This keeps manual scans aligned with the live pipeline instead of waiting for the
+    background email job to rediscover the same setup later.
+    """
+    try:
+        if not shown_setups:
+            return {"status": "skip", "reason": "no_shown_setups"}
+        live_session = str(live_session or '').upper().strip()
+        scan_session = str(scan_session or '').upper().strip()
+        if live_session not in {"ASIA", "LON", "NY"}:
+            return {"status": "skip", "reason": "outside_live_session_window"}
+        if scan_session and scan_session != live_session:
+            return {"status": "skip", "reason": f"session_mismatch ({scan_session}->{live_session})"}
+
+        try:
+            sess = in_session_now(user or {})
+        except Exception:
+            sess = None
+        if not sess:
+            return {"status": "skip", "reason": "user_not_in_enabled_session"}
+        if str(sess.get('name') or '').upper().strip() != live_session:
+            return {"status": "skip", "reason": f"user_session_mismatch ({str(sess.get('name') or '').upper()}!={live_session})"}
+
+        actionable = []
+        skipped = []
+        for s in (shown_setups or []):
+            sid = str(getattr(s, 'setup_id', '') or '').strip()
+            if not sid:
+                skipped.append('missing_setup_id')
+                continue
+            ok, why = is_executable_setup_eligible(s, session_name=live_session)
+            if not ok:
+                skipped.append(str(why))
+                continue
+            if db_has_executable_setup(int(uid), sid, lookback_hours=12):
+                skipped.append('already_executable')
+                continue
+            actionable.append(s)
+
+        if not actionable:
+            return {"status": "skip", "reason": f"no_actionable_screen_setups ({','.join(skipped[:3])})"}
+
+        actionable = list(actionable[:max(1, int(EMAIL_SETUPS_N))])
+        sent = await asyncio.to_thread(
+            send_email_alert_multi,
+            dict(user or {}),
+            {"name": str(live_session)},
+            actionable,
+            best_fut,
+        )
+        if sent:
+            return {"status": "sent", "reason": f"synced {len(actionable)} setup(s)", "setup_ids": [str(getattr(s, 'setup_id', '') or '') for s in actionable]}
+        return {"status": "skip", "reason": "screen_sync_email_send_failed"}
+    except Exception as e:
+        return {"status": "error", "reason": f"screen_sync_exception ({type(e).__name__}: {e})"}
+
 
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _hb_touch('screen', ok=True, details='screen_cmd_invoked')
@@ -20972,24 +21044,45 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Heavy build MUST NOT run on the asyncio event loop.
             # Only /screen is allowed to take longer; everything here runs in a worker thread.
-            body, kb = await asyncio.to_thread(
+            body, kb, shown_setups = await asyncio.to_thread(
                 _build_screen_body_and_kb,
                 best_fut,
                 scan_session,
                 int(update.effective_user.id),
             )
 
+            try:
+                sync_info = await _screen_sync_pipeline_async(
+                    int(update.effective_user.id),
+                    user or {},
+                    live_session,
+                    scan_session,
+                    best_fut,
+                    list(shown_setups or []),
+                )
+            except Exception:
+                sync_info = {"status": "error", "reason": "screen_sync_failed"}
+
             # Cache for fast subsequent /screen calls (user + session scoped)
             _SCREEN_CACHE[cache_key] = {
                 "ts": time.time(),
                 "body": body,
                 "kb": list(kb or []),
+                "sync_info": dict(sync_info or {}),
             }
 
 
         # Send final
         cache_entry = _SCREEN_CACHE.get(cache_key) or {}
         msg = (header + "\n" + str(cache_entry.get("body") or "")).strip()
+        sync_info = dict(cache_entry.get("sync_info") or {})
+        if sync_info:
+            sync_status = str(sync_info.get("status") or "").strip().lower()
+            sync_reason = str(sync_info.get("reason") or "").strip()
+            if sync_status == 'sent':
+                msg += f"\n\n✅ Sync: `{sync_reason}`"
+            elif sync_status in {'skip', 'error'} and sync_reason:
+                msg += f"\n\nℹ️ Sync: `{sync_reason}`"
         keyboard = [
             [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
             for (sym, sid) in (cache_entry.get("kb") or [])
