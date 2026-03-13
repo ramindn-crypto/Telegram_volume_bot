@@ -11796,6 +11796,7 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
     if not setups:
         rep = _run_backtest_on_ohlcv(symbol, ohlcv, days=days, tf=tf, session_name=session_name)
         rep['rows'] = []
+        rep['live_equivalent'] = {'setups': 0, 'trades': 0, 'win_rate': 0.0, 'avg_R': 0.0, 'profit_factor': 0.0, 'max_drawdown_R': 0.0, 'equity_R': 0.0, 'by_session': {s: {'setups': 0, 'win_rate': 0.0, 'avg_R': 0.0} for s in ('NY', 'LON', 'ASIA')}}
         return rep
     rows = []
     results = []
@@ -11803,6 +11804,11 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
     peak = 0.0
     max_dd = 0.0
     by_session = defaultdict(lambda: {'setups': 0, 'wins': 0, 'losses': 0, 'r': []})
+    live_results = []
+    live_eq = 0.0
+    live_peak = 0.0
+    live_max_dd = 0.0
+    by_session_live = defaultdict(lambda: {'setups': 0, 'wins': 0, 'losses': 0, 'r': []})
     for s in setups:
         try:
             sid = str(getattr(s, 'setup_id', 'BT-0'))
@@ -11835,6 +11841,24 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
             by_session[sess]['wins'] += 1
         elif lost:
             by_session[sess]['losses'] += 1
+
+        live_ok, live_why = is_executable_setup_eligible(s, session_name=sess if sess in ('NY', 'LON', 'ASIA') else 'NY')
+        if live_ok:
+            live_results.append(res)
+            live_eq += r_mult
+            live_peak = max(live_peak, live_eq)
+            live_max_dd = max(live_max_dd, live_peak - live_eq)
+            by_session_live[sess]['setups'] += 1
+            by_session_live[sess]['r'].append(r_mult)
+            if won:
+                by_session_live[sess]['wins'] += 1
+            elif lost:
+                by_session_live[sess]['losses'] += 1
+
+        entry = float(getattr(s, 'entry', 0.0) or 0.0)
+        sl = float(getattr(s, 'sl', 0.0) or 0.0)
+        final_tp = float(getattr(s, 'tp2', 0.0) or getattr(s, 'tp3', 0.0) or 0.0)
+        rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
         rows.append({
             'symbol': str(symbol),
             'setup_id': str(getattr(s, 'setup_id', '') or ''),
@@ -11845,6 +11869,11 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
             'R': float(r_mult),
             'win': bool(won),
             'score': float(getattr(s, 'quality_score', 0.0) or 0.0),
+            'conf': int(getattr(s, 'conf', 0) or 0),
+            'engine': str(getattr(s, 'engine', '') or ''),
+            'rr_final': float(rr_final),
+            'live_equivalent': bool(live_ok),
+            'live_reason': str(live_why or ''),
         })
     total = len(results)
     wins = sum(1 for r in results if str(r.get('outcome') or '').upper().strip() in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2', 'TP3'))
@@ -11867,6 +11896,27 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
             'win_rate': float((s_w / s_dec * 100.0) if s_dec else 0.0),
             'avg_R': float((sum(float(x) for x in rr) / len(rr)) if rr else 0.0),
         }
+    live_total = len(live_results)
+    live_wins = sum(1 for r in live_results if str(r.get('outcome') or '').upper().strip() in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2', 'TP3'))
+    live_avg_r = (sum(float(r.get('R', 0.0) or 0.0) for r in live_results) / live_total) if live_total else 0.0
+    live_gross_win = sum(max(0.0, float(r.get('R', 0.0) or 0.0)) for r in live_results)
+    live_gross_loss = sum(min(0.0, float(r.get('R', 0.0) or 0.0)) for r in live_results)
+    live_pf = (live_gross_win / abs(live_gross_loss)) if live_gross_loss < 0 else (float('inf') if live_gross_win > 0 else 0.0)
+    by_sess_live_out = {s: {'setups': 0, 'wins': 0, 'losses': 0, 'decided': 0, 'win_rate': 0.0, 'avg_R': 0.0} for s in ('NY', 'LON', 'ASIA')}
+    for sess, d in dict(by_session_live).items():
+        s_n = int(d.get('setups', 0) or 0)
+        s_w = int(d.get('wins', 0) or 0)
+        s_l = int(d.get('losses', 0) or 0)
+        s_dec = s_w + s_l
+        rr = d.get('r') or []
+        by_sess_live_out[str(sess)] = {
+            'setups': s_n,
+            'wins': s_w,
+            'losses': s_l,
+            'decided': s_dec,
+            'win_rate': float((s_w / s_dec * 100.0) if s_dec else 0.0),
+            'avg_R': float((sum(float(x) for x in rr) / len(rr)) if rr else 0.0),
+        }
     return {
         'ok': True,
         'symbol': symbol,
@@ -11881,6 +11931,16 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
         'equity_R': float(eq),
         'reject_breakdown': dict(_BT_LAST_REJECTS),
         'by_session': by_sess_out,
+        'live_equivalent': {
+            'setups': int(live_total),
+            'trades': int(live_total),
+            'win_rate': float((live_wins / live_total * 100.0) if live_total else 0.0),
+            'avg_R': float(live_avg_r),
+            'profit_factor': float(live_pf),
+            'max_drawdown_R': float(live_max_dd),
+            'equity_R': float(live_eq),
+            'by_session': by_sess_live_out,
+        },
         'rows': rows,
     }
 
@@ -11900,6 +11960,7 @@ def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | No
     rows = []
     symbol_reports = []
     reject_acc = Counter()
+    live_reject_acc = Counter()
     for sym in universe:
         try:
             ohl = fetch_ohlcv(sym, exec_tf, limit=bars)
@@ -11920,58 +11981,37 @@ def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | No
         for rr in (rep.get('rows') or []):
             if _session_mode_matches(session_mode, rr.get('session')):
                 rows.append(dict(rr))
-    overall = _compute_oos_summary(symbol_reports, days=float(d), conc_cap=float(cfg.get('concentration_cap', 0.25) or 0.25))
-    by_session = _aggregate_by_session(symbol_reports)
-    day_map = {}
-    for rr in rows:
-        day = str(rr.get('day') or '')
-        if not day:
-            continue
-        node = day_map.setdefault(day, {'day': day, 'setups': 0, 'wins': 0, 'losses': 0, 'avg_R_sum': 0.0, 'sessions': {'NY': 0, 'LON': 0, 'ASIA': 0}})
-        node['setups'] += 1
-        if bool(rr.get('win')):
-            node['wins'] += 1
-        else:
-            out = str(rr.get('outcome') or '').upper().strip()
-            if out in ('SL', 'LOSS', 'SL_FIRST', 'TP1_SL'):
-                node['losses'] += 1
-        node['avg_R_sum'] += float(rr.get('R', 0.0) or 0.0)
-        sess = str(rr.get('session') or '').upper()
-        if sess in node['sessions']:
-            node['sessions'][sess] += 1
-    per_day = []
-    for day in sorted(day_map):
-        node = day_map[day]
-        setups_n = int(node['setups'] or 0)
-        wins_n = int(node['wins'] or 0)
-        losses_n = int(node['losses'] or 0)
-        decided_n = wins_n + losses_n
-        per_day.append({
-            'day': day,
-            'setups': setups_n,
-            'wins': wins_n,
-            'losses': losses_n,
-            'win_rate': float((wins_n / decided_n * 100.0) if decided_n else 0.0),
-            'avg_R': float((float(node['avg_R_sum']) / setups_n) if setups_n else 0.0),
-            'by_session': dict(node['sessions']),
-        })
+                if not bool(rr.get('live_equivalent', False)):
+                    why = str(rr.get('live_reason') or '')
+                    if why:
+                        live_reject_acc[why] += 1
+    raw_overall, raw_per_day, raw_by_session = _summarize_universe_rows(rows, days=float(d), live_only=False)
+    live_overall, live_per_day, live_by_session = _summarize_universe_rows(rows, days=float(d), live_only=True)
     metrics = {
         'days': d,
         'session_mode': session_mode,
         'exec_tf': exec_tf,
-        'overall': dict(overall),
-        'overall_win_rate': float(overall.get('win_rate', 0.0) or 0.0),
-        'total_setups': int(overall.get('setups', 0) or 0),
-        'avg_setups_per_day': float(overall.get('setups_per_day', 0.0) or 0.0),
-        'by_session': dict(by_session),
+        'preferred_view': 'live_equivalent',
+        'overall': dict(live_overall),
+        'live_equivalent_overall': dict(live_overall),
+        'raw_overall': dict(raw_overall),
+        'overall_win_rate': float(live_overall.get('win_rate', 0.0) or 0.0),
+        'total_setups': int(live_overall.get('setups', 0) or 0),
+        'avg_setups_per_day': float(live_overall.get('setups_per_day', 0.0) or 0.0),
+        'raw_total_setups': int(raw_overall.get('setups', 0) or 0),
+        'raw_avg_setups_per_day': float(raw_overall.get('setups_per_day', 0.0) or 0.0),
+        'by_session': dict(live_by_session),
+        'live_equivalent_by_session': dict(live_by_session),
+        'raw_by_session': dict(raw_by_session),
         'universe_size': int(len(universe)),
         'top_n': int(top_n),
         'min_vol_usd': float(min_vol_usd),
         'reject_breakdown': dict(reject_acc),
+        'live_equivalent_reject_breakdown': dict(live_reject_acc),
     }
     run_id = ''
     if persist:
-        run_id = _db_save_universe_backtest_run(days=d, session_mode=session_mode, exec_tf=exec_tf, universe_snap_id=str(snap.get('snap_id') or ''), universe_size=len(universe), metrics=metrics, per_day=per_day, per_session=by_session, notes='auto' if promoted_context else 'manual', promoted_context=bool(promoted_context))
+        run_id = _db_save_universe_backtest_run(days=d, session_mode=session_mode, exec_tf=exec_tf, universe_snap_id=str(snap.get('snap_id') or ''), universe_size=len(universe), metrics=metrics, per_day=live_per_day, per_session=live_by_session, notes='auto' if promoted_context else 'manual', promoted_context=bool(promoted_context))
     return {
         'ok': True,
         'run_id': run_id,
@@ -11981,9 +12021,12 @@ def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | No
         'universe_snap_id': str(snap.get('snap_id') or ''),
         'universe_size': int(len(universe)),
         'metrics': metrics,
-        'overall': dict(overall),
-        'per_day': per_day,
-        'per_session': by_session,
+        'overall': dict(live_overall),
+        'raw_overall': dict(raw_overall),
+        'per_day': live_per_day,
+        'raw_per_day': raw_per_day,
+        'per_session': live_by_session,
+        'raw_per_session': raw_by_session,
         'symbol_reports': symbol_reports,
     }
 
@@ -11993,23 +12036,40 @@ def _format_universe_backtest_report(rep: dict) -> str:
         return 'No universe backtest report.'
     metrics = rep.get('metrics') or {}
     overall = rep.get('overall') or metrics.get('overall') or {}
+    raw_overall = rep.get('raw_overall') or metrics.get('raw_overall') or {}
     per_session = rep.get('per_session') or metrics.get('by_session') or {}
+    raw_per_session = rep.get('raw_per_session') or metrics.get('raw_by_session') or {}
     per_day = list(rep.get('per_day') or [])
+    raw_per_day = list(rep.get('raw_per_day') or [])
     lines = [
         f"🌐 Universe Backtest — {int(rep.get('days') or metrics.get('days') or 0)}d",
         HDR,
         f"TF: {str(rep.get('exec_tf') or metrics.get('exec_tf') or '15m')} | Session: {str(rep.get('session_mode') or metrics.get('session_mode') or 'ALL')} | Universe: {int(rep.get('universe_size') or metrics.get('universe_size') or 0)}",
-        f"Total setups: {int(overall.get('setups', 0) or 0)} | Avg/day: {float(overall.get('setups_per_day', 0.0) or 0.0):.2f} | Overall WR: {float(overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(overall.get('avg_R', 0.0) or 0.0):.3f}",
-        'Per session:',
+        f"Raw setups: {int(raw_overall.get('setups', 0) or 0)} | Avg/day: {float(raw_overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(raw_overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(raw_overall.get('avg_R', 0.0) or 0.0):.3f}",
+        f"Live-equivalent setups: {int(overall.get('setups', 0) or 0)} | Avg/day: {float(overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(overall.get('avg_R', 0.0) or 0.0):.3f}",
+        'Per session (raw -> live-equivalent):',
     ]
     for sess in ('NY','LON','ASIA'):
-        d = per_session.get(sess) or {}
-        lines.append(f"• {sess}: setups={int(d.get('setups',0) or 0)} | WR={float(d.get('win_rate',0.0) or 0.0):.1f}% | avgR={float(d.get('avg_R',0.0) or 0.0):.3f}")
-    if per_day:
-        lines.append('Per day:')
-        for row in per_day[:35]:
-            bs = row.get('by_session') or {}
-            lines.append(f"• {row.get('day')}: setups={int(row.get('setups',0) or 0)} | WR={float(row.get('win_rate',0.0) or 0.0):.1f}% | NY/LON/ASIA={int(bs.get('NY',0) or 0)}/{int(bs.get('LON',0) or 0)}/{int(bs.get('ASIA',0) or 0)}")
+        rd = raw_per_session.get(sess) or {}
+        ld = per_session.get(sess) or {}
+        lines.append(f"• {sess}: raw={int(rd.get('setups',0) or 0)} @ WR {float(rd.get('win_rate',0.0) or 0.0):.1f}% | live={int(ld.get('setups',0) or 0)} @ WR {float(ld.get('win_rate',0.0) or 0.0):.1f}%")
+    if per_day or raw_per_day:
+        lines.append('Per day (raw -> live-equivalent):')
+        live_map = {str(r.get('day') or ''): r for r in per_day}
+        for row in raw_per_day[:35]:
+            day = str(row.get('day') or '')
+            live_row = live_map.get(day) or {}
+            rbs = row.get('by_session') or {}
+            lbs = live_row.get('by_session') or {}
+            lines.append(
+                f"• {day}: raw={int(row.get('setups',0) or 0)} WR={float(row.get('win_rate',0.0) or 0.0):.1f}% | live={int(live_row.get('setups',0) or 0)} WR={float(live_row.get('win_rate',0.0) or 0.0):.1f}% | raw NY/LON/ASIA={int(rbs.get('NY',0) or 0)}/{int(rbs.get('LON',0) or 0)}/{int(rbs.get('ASIA',0) or 0)} | live NY/LON/ASIA={int(lbs.get('NY',0) or 0)}/{int(lbs.get('LON',0) or 0)}/{int(lbs.get('ASIA',0) or 0)}"
+            )
+    rej = metrics.get('live_equivalent_reject_breakdown') or {}
+    if isinstance(rej, dict) and rej:
+        top = sorted(rej.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:6]
+        lines.append('Top live-equivalent blockers:')
+        for k, v in top:
+            lines.append(f"• {k} = {int(v or 0)}")
     return "\n".join(lines)
 
 
@@ -14029,6 +14089,111 @@ def _aggregate_by_session(oos_rows: list[dict]) -> dict:
         n = float(d["n"] or 0.0)
         pretty[sname] = {"setups": int(n), "win_rate": float((d["wr"]/n) if n else 0.0), "avg_R": float((d["r"]/n) if n else 0.0)}
     return pretty
+
+def _summarize_universe_rows(rows: list[dict], days: float, live_only: bool = False) -> tuple[dict, list[dict], dict]:
+    total_days = max(1.0, float(days or 1.0))
+    filt = []
+    for rr in (rows or []):
+        if not isinstance(rr, dict):
+            continue
+        if live_only and not bool(rr.get('live_equivalent', False)):
+            continue
+        filt.append(rr)
+
+    total = len(filt)
+    if total <= 0:
+        empty = {'setups': 0, 'setups_per_day': 0.0, 'win_rate': 0.0, 'avg_R': 0.0, 'profit_factor': 0.0, 'max_drawdown_R': 0.0, 'equity_R': 0.0, 'top_symbol_share': 0.0}
+        per_session = {s: {'setups': 0, 'win_rate': 0.0, 'avg_R': 0.0} for s in ('NY', 'LON', 'ASIA')}
+        return empty, [], per_session
+
+    day_map = {}
+    sess_map = {s: {'setups': 0, 'wins': 0, 'losses': 0, 'r_sum': 0.0} for s in ('NY', 'LON', 'ASIA')}
+    sym_ctr = Counter()
+    wins = 0
+    losses = 0
+    r_sum = 0.0
+    gross_win = 0.0
+    gross_loss = 0.0
+    eq = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for rr in filt:
+        sym = str(rr.get('symbol') or '')
+        if sym:
+            sym_ctr[sym] += 1
+        won = bool(rr.get('win'))
+        out = str(rr.get('outcome') or '').upper().strip()
+        r_mult = float(rr.get('R', 0.0) or 0.0)
+        if won:
+            wins += 1
+        elif out in ('SL', 'LOSS', 'SL_FIRST', 'TP1_SL'):
+            losses += 1
+        r_sum += r_mult
+        gross_win += max(0.0, r_mult)
+        gross_loss += min(0.0, r_mult)
+        eq += r_mult
+        peak = max(peak, eq)
+        max_dd = max(max_dd, peak - eq)
+
+        sess = str(rr.get('session') or '').upper().strip()
+        if sess in sess_map:
+            sess_map[sess]['setups'] += 1
+            sess_map[sess]['r_sum'] += r_mult
+            if won:
+                sess_map[sess]['wins'] += 1
+            elif out in ('SL', 'LOSS', 'SL_FIRST', 'TP1_SL'):
+                sess_map[sess]['losses'] += 1
+
+        day = str(rr.get('day') or '')
+        if day:
+            node = day_map.setdefault(day, {'day': day, 'setups': 0, 'wins': 0, 'losses': 0, 'r_sum': 0.0, 'by_session': {'NY': 0, 'LON': 0, 'ASIA': 0}})
+            node['setups'] += 1
+            node['r_sum'] += r_mult
+            if won:
+                node['wins'] += 1
+            elif out in ('SL', 'LOSS', 'SL_FIRST', 'TP1_SL'):
+                node['losses'] += 1
+            if sess in node['by_session']:
+                node['by_session'][sess] += 1
+
+    per_day = []
+    for day in sorted(day_map):
+        node = day_map[day]
+        decided = int(node['wins']) + int(node['losses'])
+        n = int(node['setups'])
+        per_day.append({
+            'day': day,
+            'setups': n,
+            'wins': int(node['wins']),
+            'losses': int(node['losses']),
+            'win_rate': float((float(node['wins']) / decided) * 100.0) if decided else 0.0,
+            'avg_R': float(float(node['r_sum']) / n) if n else 0.0,
+            'by_session': dict(node['by_session']),
+        })
+
+    per_session = {}
+    for sess, d in sess_map.items():
+        n = int(d['setups'])
+        decided = int(d['wins']) + int(d['losses'])
+        per_session[sess] = {
+            'setups': n,
+            'win_rate': float((float(d['wins']) / decided) * 100.0) if decided else 0.0,
+            'avg_R': float(float(d['r_sum']) / n) if n else 0.0,
+        }
+
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float('inf') if gross_win > 0 else 0.0)
+    top_share = (float(max(sym_ctr.values())) / float(total)) if sym_ctr else 0.0
+    overall = {
+        'setups': int(total),
+        'setups_per_day': float(total / total_days),
+        'win_rate': float((wins / total) * 100.0) if total else 0.0,
+        'avg_R': float(r_sum / total) if total else 0.0,
+        'profit_factor': float(pf),
+        'max_drawdown_R': float(max_dd),
+        'equity_R': float(eq),
+        'top_symbol_share': float(top_share),
+    }
+    return overall, per_day, per_session
 
 def _normalize_autotune_windows(cfg: dict) -> list[dict]:
     """Safe normalized historical windows for zero-touch optimizer."""
