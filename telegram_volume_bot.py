@@ -1549,9 +1549,9 @@ except Exception:
 AUTOTRADE_LIVE_TP1_FRACTION = float(os.environ.get("AUTOTRADE_LIVE_TP1_FRACTION", "0.65") or 0.65)
 AUTOTRADE_LIVE_TP1_FRACTION = max(0.25, min(0.85, AUTOTRADE_LIVE_TP1_FRACTION))
 AUTOTRADE_BE_AFTER_TP1_ENABLED = str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ENABLED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
-AUTOTRADE_BE_AFTER_TP1_MIN_CONF = int(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MIN_CONF", "84") or 84)
-AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT", "4.5") or 4.5)
-AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY") or "NY").upper().replace(' ', '').split(','))
+AUTOTRADE_BE_AFTER_TP1_MIN_CONF = int(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MIN_CONF", "0") or 0)
+AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT", "999") or 999)
+AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY,LON,ASIA") or "NY,LON,ASIA").upper().replace(' ', '').split(','))
 # Live market-order entries must still stay close to the setup entry. Otherwise the bot can
 # execute a stale emailed setup at a materially worse price just because it is still inside
 # the time window. This guard keeps the email/setup engine and live execution aligned.
@@ -1806,33 +1806,6 @@ def _round_price_to_tick(symbol: str, price: float, rounding=ROUND_DOWN) -> floa
             return float(price)
         except Exception:
             return 0.0
-
-
-def _setup_exchange_synced_view(s: "Setup") -> "Setup":
-    """Return a setup view with exchange-tick-rounded entry/SL/TP prices."""
-    try:
-        sym = str(getattr(s, 'symbol', '') or '')
-        if not sym:
-            return s
-        side = str(getattr(s, 'side', '') or '').upper()
-        entry = _round_price_to_tick(sym, float(getattr(s, 'entry', 0.0) or 0.0), rounding=ROUND_DOWN)
-        sl_raw = float(getattr(s, 'sl', 0.0) or 0.0)
-        sl_round = ROUND_DOWN if side == 'BUY' else ROUND_UP
-        tp_round = ROUND_DOWN if side == 'BUY' else ROUND_UP
-        sl = _round_price_to_tick(sym, sl_raw, rounding=sl_round)
-        tp1 = _round_price_to_tick(sym, float(getattr(s, 'tp1', 0.0) or 0.0), rounding=tp_round) if float(getattr(s, 'tp1', 0.0) or 0.0) > 0 else 0.0
-        tp2 = _round_price_to_tick(sym, float(getattr(s, 'tp2', 0.0) or 0.0), rounding=tp_round) if float(getattr(s, 'tp2', 0.0) or 0.0) > 0 else 0.0
-        tp3 = _round_price_to_tick(sym, float(getattr(s, 'tp3', 0.0) or 0.0), rounding=tp_round) if float(getattr(s, 'tp3', 0.0) or 0.0) > 0 else 0.0
-        return replace(s, entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2), tp3=float(tp3))
-    except Exception:
-        return s
-
-
-def fmt_price_email_for_symbol(symbol: str, x: float) -> str:
-    try:
-        return fmt_price_email(_round_price_to_tick(symbol, float(x or 0.0), rounding=ROUND_DOWN))
-    except Exception:
-        return fmt_price_email(x)
 
 
 def _effective_equity_for_risk(user: dict | None = None, prefer_live: bool = True) -> float:
@@ -2172,19 +2145,13 @@ def _autotrade_live_exit_plan_from_targets(entry: float, sl: float, tp1, tp2, tp
 
 
 def _autotrade_live_exit_plan_for_trade(trade_or_setup) -> dict:
-    obj = trade_or_setup
-    try:
-        if hasattr(trade_or_setup, 'symbol'):
-            obj = _setup_exchange_synced_view(trade_or_setup)
-    except Exception:
-        obj = trade_or_setup
     return _autotrade_live_exit_plan_from_targets(
-        float(getattr(obj, 'entry', 0.0) if hasattr(obj, 'entry') else (obj.get('entry') if isinstance(obj, dict) else 0.0) or 0.0),
-        float(getattr(obj, 'sl', 0.0) if hasattr(obj, 'sl') else (obj.get('sl') if isinstance(obj, dict) else 0.0) or 0.0),
-        getattr(obj, 'tp1', None) if hasattr(obj, 'tp1') else (obj.get('tp1') if isinstance(obj, dict) else None),
-        getattr(obj, 'tp2', None) if hasattr(obj, 'tp2') else (obj.get('tp2') if isinstance(obj, dict) else None),
-        getattr(obj, 'tp3', None) if hasattr(obj, 'tp3') else (obj.get('tp3') if isinstance(obj, dict) else None),
-        getattr(obj, 'side', '') if hasattr(obj, 'side') else (obj.get('side') if isinstance(obj, dict) else ''),
+        float(getattr(trade_or_setup, 'entry', 0.0) if hasattr(trade_or_setup, 'entry') else (trade_or_setup.get('entry') if isinstance(trade_or_setup, dict) else 0.0) or 0.0),
+        float(getattr(trade_or_setup, 'sl', 0.0) if hasattr(trade_or_setup, 'sl') else (trade_or_setup.get('sl') if isinstance(trade_or_setup, dict) else 0.0) or 0.0),
+        getattr(trade_or_setup, 'tp1', None) if hasattr(trade_or_setup, 'tp1') else (trade_or_setup.get('tp1') if isinstance(trade_or_setup, dict) else None),
+        getattr(trade_or_setup, 'tp2', None) if hasattr(trade_or_setup, 'tp2') else (trade_or_setup.get('tp2') if isinstance(trade_or_setup, dict) else None),
+        getattr(trade_or_setup, 'tp3', None) if hasattr(trade_or_setup, 'tp3') else (trade_or_setup.get('tp3') if isinstance(trade_or_setup, dict) else None),
+        getattr(trade_or_setup, 'side', '') if hasattr(trade_or_setup, 'side') else (trade_or_setup.get('side') if isinstance(trade_or_setup, dict) else ''),
     )
 
 
@@ -2212,12 +2179,79 @@ def _bybit_has_matching_reduce_only_limit_tp(symbol: str, close_side: str, tp_pr
     return False
 
 
+def _autotrade_place_partial_tpsl_ladder(symbol: str, side: str, stop_loss: float, tp_targets: list[float], base_qty: float) -> list[dict]:
+    results = []
+    try:
+        sym = _bybit_linear_symbol(symbol)
+        filt = _bybit_get_instr_filters(sym)
+        qty_step = filt.get('qtyStep')
+        splits = list(AUTOTRADE_TP_SPLIT[:max(1, len(tp_targets))])
+        if len(splits) < len(tp_targets):
+            splits += [max(0.0, 1.0 - sum(splits))]
+        if sum(splits) <= 0:
+            splits = [1.0 / max(1, len(tp_targets))] * max(1, len(tp_targets))
+        total = float(sum(splits) or 1.0)
+        splits = [float(x) / total for x in splits]
+        remaining_qty = float(base_qty or 0.0)
+        for idx, tp in enumerate(tp_targets, start=1):
+            if float(tp or 0.0) <= 0 or remaining_qty <= 0:
+                continue
+            raw_qty = float(base_qty or 0.0) * float(splits[min(idx - 1, len(splits) - 1)])
+            if idx == len(tp_targets):
+                raw_qty = remaining_qty
+            qty_i, qreason = _round_qty_down(sym, raw_qty, _pos_mark({'markPrice': tp}) or tp)
+            if not qty_i or qty_i <= 0:
+                results.append({'idx': idx, 'tp': float(tp), 'qty': 0.0, 'ok': False, 'retMsg': str(qreason or 'qty_invalid')})
+                continue
+            remaining_qty = max(0.0, remaining_qty - float(qty_i))
+            payload = {
+                'category': 'linear',
+                'symbol': sym,
+                'tpslMode': 'Partial',
+                'positionIdx': 0,
+                'takeProfit': str(float(tp)),
+                'stopLoss': str(float(stop_loss or 0.0)),
+                'tpSize': _fmt_qty(qty_i, qty_step),
+                'slSize': _fmt_qty(qty_i, qty_step),
+                'tpOrderType': 'Market',
+                'slOrderType': 'Market',
+                'tpTriggerBy': 'LastPrice',
+                'slTriggerBy': 'LastPrice',
+            }
+            res = _bybit_v5_request('POST', '/v5/position/trading-stop', payload)
+            results.append({'idx': idx, 'tp': float(tp), 'qty': float(qty_i), 'ok': int((res or {}).get('retCode', -1)) == 0, 'retCode': (res or {}).get('retCode'), 'retMsg': (res or {}).get('retMsg')})
+        return results
+    except Exception as e:
+        return [{'idx': 0, 'tp': 0.0, 'qty': 0.0, 'ok': False, 'retMsg': f'{type(e).__name__}: {e}'}]
+
+
+def _autotrade_cancel_reduce_only_tp_orders(symbol: str) -> int:
+    count = 0
+    sym = _bybit_linear_symbol(symbol)
+    for o in _bybit_get_open_orders_linear(sym):
+        try:
+            if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
+                continue
+            if not _bybit_order_reduce_only(o):
+                continue
+            oid = str(o.get('orderId') or '')
+            if not oid:
+                continue
+            res = _bybit_v5_request('POST', '/v5/order/cancel', {'category': 'linear', 'symbol': sym, 'orderId': oid})
+            if int((res or {}).get('retCode', -1)) == 0:
+                count += 1
+        except Exception:
+            continue
+    return count
+
+
 def _autotrade_apply_position_tp_sl(symbol: str, stop_loss: float, take_profit: float) -> dict:
     payload = {
         'category': 'linear',
         'symbol': _bybit_linear_symbol(symbol),
-        'stopLoss': str(float(stop_loss or 0.0)),
+        'stopLoss': str(float(stop_loss or 0.0)) if float(stop_loss or 0.0) > 0 else '0',
         'tpslMode': 'Full',
+        'positionIdx': 0,
     }
     if float(take_profit or 0.0) > 0:
         payload['takeProfit'] = str(float(take_profit))
@@ -2248,33 +2282,11 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         current_sl = float(_pos_stop(pos) or 0.0)
         current_tp = float(_pos_take_profit(pos) or 0.0)
         target_sl = float(trade_row.get('sl') or 0.0)
-        if target_sl > 0 and final_tp > 0 and (current_sl <= 0 or not _price_close_enough(current_sl, target_sl) or current_tp <= 0 or not _price_close_enough(current_tp, final_tp)):
-            _autotrade_apply_position_tp_sl(sym, target_sl, final_tp)
-            result['sl_fixed'] = (current_sl <= 0 or not _price_close_enough(current_sl, target_sl))
-            result['tp_fixed'] = (current_tp <= 0 or not _price_close_enough(current_tp, final_tp))
+        if target_sl > 0 and (current_sl <= 0 or not _price_close_enough(current_sl, target_sl)):
+            _autotrade_apply_position_tp_sl(sym, target_sl, 0.0)
+            result['sl_fixed'] = True
         initial_qty = abs(float(trade_row.get('qty') or 0.0))
         live_qty = abs(float(_pos_size(pos) or 0.0))
-        close_side = 'Sell' if side == 'BUY' else 'Buy'
-        if partial_tp > 0 and initial_qty > 0 and live_qty > max(initial_qty * (1.0 - float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION)) + 1e-9, initial_qty * 0.45):
-            if not _bybit_has_matching_reduce_only_limit_tp(sym, close_side, partial_tp):
-                filt = _bybit_get_instr_filters(sym)
-                qty_step = filt.get('qtyStep')
-                tp1_qty = max(0.0, min(live_qty, initial_qty * float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION)))
-                tp1_qty, qreason = _round_qty_down(sym, tp1_qty, entry)
-                if tp1_qty and tp1_qty > 0:
-                    payload = {
-                        'category': 'linear',
-                        'symbol': sym,
-                        'side': close_side,
-                        'orderType': 'Limit',
-                        'qty': _fmt_qty(tp1_qty, qty_step),
-                        'price': str(partial_tp),
-                        'timeInForce': 'GTC',
-                        'reduceOnly': True,
-                    }
-                    res = _bybit_v5_request('POST', '/v5/order/create', payload)
-                    if int((res or {}).get('retCode', -1)) == 0:
-                        result['tp1_order_fixed'] = True
         conf = int(float(trade_row.get('conf') or 0) or 0)
         atr_pct = float(trade_row.get('atr_pct') or 0.0)
         sess = str(trade_row.get('session') or '').upper().strip()
@@ -2288,7 +2300,7 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
             sl_at_be = _price_close_enough(current_sl, entry)
             be_allowed = conf >= int(AUTOTRADE_BE_AFTER_TP1_MIN_CONF) and (atr_pct <= float(AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT) if atr_pct > 0 else True) and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS or sess in AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS)
             if tp1_hit and (not sl_at_be) and be_allowed:
-                _autotrade_apply_position_tp_sl(sym, entry, final_tp)
+                _autotrade_apply_position_tp_sl(sym, entry, 0.0)
                 result['be_applied'] = True
         return result
     except Exception:
@@ -4672,16 +4684,17 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             pass
 
         exit_plan = _autotrade_live_exit_plan_for_trade(s)
-        live_partial_tp = float(exit_plan.get('partial_tp') or 0.0)
-        live_final_tp = float(exit_plan.get('final_tp') or 0.0)
-        _autotrade_apply_position_tp_sl(sym, sl_for_order, live_final_tp)
+        live_partial_tp = float(exit_plan.get('effective_tp1') or 0.0)
+        live_tp2 = float(exit_plan.get('effective_tp2') or 0.0)
+        live_tp3 = float(exit_plan.get('effective_tp3') or 0.0)
+        _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
                 'position_opened_time': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-                'live_exit_partial_tp': float(live_partial_tp),
-                'live_exit_final_tp': float(live_final_tp),
-                'live_exit_partial_fraction': float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION),
-                'live_tp_design': 'partial_tp1_limit + final_tp_position',
+                'live_exit_tp1': float(live_partial_tp),
+                'live_exit_tp2': float(live_tp2),
+                'live_exit_tp3': float(live_tp3),
+                'live_tp_design': 'partial_tpsl_ladder + full_sl',
             })
         except Exception:
             pass
@@ -4730,48 +4743,18 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
         final_pos = _autotrade_find_live_position(sym, side=side)
         tp_base_qty = abs(float(_pos_size(final_pos) or qty)) if final_pos else float(qty)
-        tp_order_results = []
-        tp_success_count = 0
-        close_side = 'Sell' if side == 'BUY' else 'Buy'
-        if live_partial_tp > 0 and tp_base_qty > 0:
-            tp1_qty = max(0.0, tp_base_qty * float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
-            tp1_qty, tp1_qreason = _round_qty_down(sym, tp1_qty, price_ref)
-            if tp1_qty and tp1_qty > 0:
-                tp_payload = {
-                    'category': 'linear',
-                    'symbol': sym,
-                    'side': close_side,
-                    'orderType': 'Limit',
-                    'qty': _fmt_qty(tp1_qty, qty_step),
-                    'price': str(live_partial_tp),
-                    'timeInForce': 'GTC',
-                    'reduceOnly': True,
-                }
-                tp_res = _bybit_v5_request('POST', '/v5/order/create', tp_payload)
-                ok = int((tp_res or {}).get('retCode', -1)) == 0
-                if ok:
-                    tp_success_count += 1
-                tp_order_results.append({
-                    'idx': 1,
-                    'label': 'partial_tp1_limit',
-                    'price': float(live_partial_tp),
-                    'qty': float(tp1_qty),
-                    'ok': bool(ok),
-                    'retCode': (tp_res or {}).get('retCode'),
-                    'retMsg': (tp_res or {}).get('retMsg'),
-                    'orderId': (((tp_res or {}).get('result') or {}).get('orderId') or ''),
-                })
-            else:
-                tp_order_results.append({'idx': 1, 'label': 'partial_tp1_limit', 'price': float(live_partial_tp), 'qty': 0.0, 'ok': False, 'retCode': 'qty_invalid', 'retMsg': str(tp1_qreason or '')})
+        _autotrade_cancel_reduce_only_tp_orders(sym)
+        tp_order_results = _autotrade_place_partial_tpsl_ladder(sym, side, sl_for_order, [x for x in (live_partial_tp, live_tp2, live_tp3) if float(x or 0.0) > 0], tp_base_qty)
+        tp_success_count = sum(1 for x in (tp_order_results or []) if bool(x.get('ok')) )
 
         repair_res = _autotrade_repair_live_exit_protection(uid, {
             'symbol': sym,
             'side': side,
             'entry': float(_pos_entry(final_pos) or price_ref) if final_pos else float(price_ref),
             'sl': float(sl_for_order),
-            'tp1': float(exit_plan.get('effective_tp1') or live_partial_tp),
-            'tp2': float(exit_plan.get('final_tp') or 0.0),
-            'tp3': float(exit_plan.get('final_tp') or 0.0),
+            'tp1': float(live_partial_tp or 0.0),
+            'tp2': float(live_tp2 or 0.0),
+            'tp3': float(live_tp3 or 0.0),
             'qty': float(tp_base_qty if tp_base_qty > 0 else qty),
             'conf': int(getattr(s, 'conf', 0) or 0),
             'atr_pct': float(getattr(s, 'atr_pct', 0.0) or 0.0),
@@ -4790,8 +4773,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         qty_for_db = tp_base_qty if tp_base_qty > 0 else qty
         s_live = replace(s,
             tp1=float(exit_plan.get('effective_tp1') or live_partial_tp or getattr(s, 'tp1', 0.0) or 0.0),
-            tp2=float(exit_plan.get('final_tp') or getattr(s, 'tp2', 0.0) or getattr(s, 'tp3', 0.0) or 0.0),
-            tp3=float(exit_plan.get('final_tp') or getattr(s, 'tp3', 0.0) or 0.0),
+            tp2=float(live_tp2 or getattr(s, 'tp2', 0.0) or getattr(s, 'tp3', 0.0) or 0.0),
+            tp3=float(live_tp3 or getattr(s, 'tp3', 0.0) or getattr(s, 'tp2', 0.0) or 0.0),
         )
         trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened')
         _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
@@ -6965,38 +6948,6 @@ def email_state_set(user_id: int, **kwargs):
     cur.execute(f"UPDATE email_state SET {sets} WHERE user_id=?", vals)
     con.commit()
     con.close()
-
-def email_send_event_log(user_id: int, session_name: str, emailed_ts: float | None = None):
-    ts = float(emailed_ts or time.time())
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO email_send_events (user_id, session, emailed_ts) VALUES (?, ?, ?)",
-            (int(user_id), str(session_name or ''), ts),
-        )
-        conn.commit()
-
-
-def email_send_events_recent_count(user_id: int, seconds: int = 3600, session_name: str | None = None) -> int:
-    try:
-        since_ts = float(time.time()) - max(0, int(seconds or 0))
-        with db_conn() as conn:
-            cur = conn.cursor()
-            if session_name:
-                cur.execute(
-                    "SELECT COUNT(1) FROM email_send_events WHERE user_id=? AND emailed_ts>=? AND UPPER(COALESCE(session,''))=?",
-                    (int(user_id), since_ts, str(session_name or '').upper()),
-                )
-            else:
-                cur.execute(
-                    "SELECT COUNT(1) FROM email_send_events WHERE user_id=? AND emailed_ts>=?",
-                    (int(user_id), since_ts),
-                )
-            row = cur.fetchone()
-            return int((row[0] if row else 0) or 0)
-    except Exception:
-        return 0
-
 
 def mark_symbol_emailed(user_id: int, symbol: str, side: str, session_name: str = ""):
     """
@@ -12839,6 +12790,15 @@ def _signal_report_live_backed_only(user_id: int, meta: dict | None, canon: str)
         return False
 
 
+def _display_signal_outcome(raw) -> str:
+    lab = str(_canon_signal_outcome_label(raw) or '').upper().strip()
+    if lab in {'TP1', 'TP2', 'SL', 'OPEN'}:
+        return lab
+    if lab in {'UNTRACKED', 'NONE', ''}:
+        return 'None'
+    return 'None'
+
+
 def _canonical_wr_stats(rows: list[dict]) -> dict:
     counts = Counter()
     by_session = defaultdict(lambda: Counter())
@@ -12846,7 +12806,7 @@ def _canonical_wr_stats(rows: list[dict]) -> dict:
     wins = 0
     losses = 0
     for r in rows or []:
-        out = _canon_signal_outcome_label(r.get('outcome'))
+        out = _display_signal_outcome(r.get('outcome'))
         sess = str(r.get('session') or '?').upper().strip() or '?'
         counts[out] += 1
         by_session[sess][out] += 1
@@ -12870,7 +12830,7 @@ def _canonical_wr_stats(rows: list[dict]) -> dict:
             'tp2': int(ctr.get('TP2', 0)),
             'sl': int(ctr.get('SL', 0)),
             'open': int(ctr.get('OPEN', 0)),
-            'untracked': int(ctr.get('UNTRACKED', 0)),
+            'untracked': int(ctr.get('None', 0)),
             'win_rate': float((s_win / s_dec) * 100.0) if s_dec > 0 else 0.0,
         }
     return {
@@ -16471,7 +16431,10 @@ def _mask_email_addr(email: str) -> str:
 
 
 def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
-    user = dict(user or {})
+    fresh_user = get_user(int(uid)) or {}
+    merged = dict(fresh_user)
+    merged.update(dict(user or {}))
+    user = merged
     try:
         tz = ZoneInfo(str(user.get('tz') or 'UTC'))
     except Exception:
@@ -19453,8 +19416,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'Alerts & sessions',
         f"• Email alerts: {email_alerts_on}",
         f"• Email recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
-        f"• Email cap/session: {int(email_gate.get('sent_in_session', 0) or 0)}/{session_cap_txt}",
-        f"• Email day cap: {int(email_gate.get('sent_today', 0) or 0)}/{day_cap_txt}",
+        f"• Email cap/session: {int(email_gate.get('sent_in_session', 0) or 0)}/{session_cap_txt} (configured)",
+        f"• Email day cap: {int(email_gate.get('sent_today', 0) or 0)}/{day_cap_txt} (configured)",
         f"• Email gap: {gap_txt}",
         f"• Email lane: {email_lane_txt}" + (f" | {email_lane_reason}" if email_lane_reason else ''),
         f"• Sessions enabled: {' | '.join(enabled)}",
@@ -20122,7 +20085,9 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             canon, meta = _canonical_signal_outcome_for_setup(int(uid), setup_id)
             if _signal_report_live_backed_only(int(uid), meta, canon) is False and str(canon).upper().strip() == 'OPEN' and int(uid) == int(AUTOTRADE_OWNER_UID or 0) and str(AUTOTRADE_MODE).lower() == 'live':
                 hidden_untracked_open += 1
-                canon = 'UNTRACKED'
+                canon = 'None'
+            else:
+                canon = _display_signal_outcome(canon)
             created_ts = float(sig.get('created_ts') or e.get('emailed_ts') or 0.0)
             try:
                 tz = ZoneInfo(str(user.get('tz') or 'UTC'))
@@ -20148,16 +20113,16 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Signal Report (last {lookback_h}h)",
         HDR,
         f"Total: {len(rows)} | Decided: {int(stats.get('decided') or 0)} | Wins (TP2): {int(stats.get('wins') or 0)} | Losses: {int(stats.get('losses') or 0)} | Win rate: {float(stats.get('win_rate') or 0.0):.1f}%",
-        f"TP1: {counts.get('TP1',0)} | TP2: {counts.get('TP2',0)} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)} | Untracked: {counts.get('UNTRACKED',0)}",
+        f"TP1: {counts.get('TP1',0)} | TP2: {counts.get('TP2',0)} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)} | None: {counts.get('None',0)}",
         HDR,
     ]
     table_rows = [[r['session'], r['time'], r['trade'], r['confidence'], r['outcome']] for r in rows]
     table = tabulate(table_rows, headers=['Session','Time','Trade','Confidence','Outcome'], tablefmt='plain', colalign=('left','left','left','right','left'))
     sess_lines = ['Session breakdown:']
     for sname, c in sorted((stats.get('by_session') or {}).items(), key=lambda kv: kv[0]):
-        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} UNTRACKED {int(c.get('untracked') or 0)}")
+        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
     if int(hidden_untracked_open or 0) > 0:
-        sess_lines.append(f"• Hidden untracked OPEN rows: {int(hidden_untracked_open)} (not backed by live Bybit/autotrade state)")
+        sess_lines.append(f"• Hidden untracked OPEN rows: {int(hidden_untracked_open)} (no current live Bybit/autotrade match)")
     msg = "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>\n" + "\n".join(sess_lines)
     await send_long_message(update, msg, parse_mode=ParseMode.HTML)
 
@@ -20310,10 +20275,10 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
     if by_session:
         lines.extend([SEP, 'By session'])
         for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
-            lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} UNTRACKED {int(c.get('untracked') or 0)}")
+            lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
     hidden_untracked_open = int(summary.get('hidden_untracked_open') or 0)
     if hidden_untracked_open > 0:
-        lines.extend([SEP, f'Hidden untracked OPEN rows: {hidden_untracked_open} (not backed by live Bybit/autotrade state)'])
+        lines.extend([SEP, f'Hidden untracked OPEN rows: {hidden_untracked_open} (no current live Bybit/autotrade match)'])
     await send_long_message(update, '\n'.join(lines), parse_mode=None)
 
 async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -20347,29 +20312,34 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 
     lines.extend([SEP, 'Closed positions'])
     closed_any = False
-    if str(AUTOTRADE_MODE).lower() == 'live':
-        try:
-            end_ms = int(time.time() * 1000)
-            start_ms = int((time.time() - lookback_h * 3600.0) * 1000)
-            res = _bybit_v5_request('GET', '/v5/position/closed-pnl', {
-                'category': 'linear', 'startTime': start_ms, 'endTime': end_ms, 'limit': 50,
-            })
-            closed = (((res or {}).get('result') or {}).get('list') or []) if int((res or {}).get('retCode', -1)) == 0 else []
-            total_closed = 0.0
-            for r in closed[:30]:
-                try:
-                    sym = _bybit_linear_symbol(str(r.get('symbol') or ''))
-                    side = str(r.get('side') or '').upper()
-                    pnl = float(r.get('closedPnl') or 0.0)
-                    total_closed += pnl
-                    lines.append(f"• {side} {sym} | PnL {pnl:+.2f} USDT")
-                    closed_any = True
-                except Exception:
-                    continue
-            if closed_any:
-                lines.append(f"Total closed PnL: {total_closed:+.2f} USDT")
-        except Exception:
-            pass
+    try:
+        if str(AUTOTRADE_MODE).lower() == 'live':
+            _autotrade_sync_closed_trades_from_exchange(int(AUTOTRADE_OWNER_UID or uid), lookback_days=max(2, int(math.ceil(lookback_h / 24.0)) + 1))
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            ts_from = float(time.time() - lookback_h * 3600.0)
+            rows = cur.execute(
+                """SELECT trade_id, symbol, side, pnl_usdt, closed_ts, status FROM autotrade_trades
+                   WHERE uid=? AND closed_ts IS NOT NULL AND closed_ts>=?
+                   ORDER BY closed_ts DESC LIMIT 30""",
+                (int(AUTOTRADE_OWNER_UID or uid), float(ts_from))
+            ).fetchall() or []
+        total_closed = 0.0
+        live_keys = {(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper()) for p in open_positions}
+        for r in rows:
+            sym = _bybit_linear_symbol(str(r['symbol'] or ''))
+            side = str(r['side'] or '').upper()
+            if (sym, side) in live_keys:
+                continue
+            pnl = float(r['pnl_usdt'] or 0.0)
+            total_closed += pnl
+            lines.append(f"• {side} {sym} | PnL {pnl:+.2f} USDT")
+            closed_any = True
+        if closed_any:
+            lines.append(f"Total closed PnL: {total_closed:+.2f} USDT")
+    except Exception:
+        pass
     if not closed_any:
         lines.append('• None in this window')
 
@@ -20627,8 +20597,8 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         'Email → executable lane',
         f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
         f"Alerts: {'ON' if bool(email_gate.get('alerts_on')) else 'OFF'} | SMTP: {'READY' if bool(email_gate.get('smtp_ready')) else 'NOT READY'}",
-        f"Session email cap: {int(email_gate.get('sent_in_session', 0) or 0)}/{session_cap_txt}",
-        f"Daily email cap: {int(email_gate.get('sent_today', 0) or 0)}/{day_cap_txt}",
+        f"Session email cap: {int(email_gate.get('sent_in_session', 0) or 0)}/{session_cap_txt} (configured)",
+        f"Daily email cap: {int(email_gate.get('sent_today', 0) or 0)}/{day_cap_txt} (configured)",
         f"Email gap: {int(email_gate.get('gap_min', 0) or 0)}m" + (f" (remaining {_fmt_dur(gap_remaining)})" if gap_remaining > 0 else ''),
         f"Executable lane: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'}" + (f" | {gate_reason}" if gate_reason else ''),
         f"Recent emailed setups (12h): {emailed_recent}",
@@ -21890,10 +21860,6 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             pass
 
         email_gate = _email_runtime_limits_snapshot(int(uid), user)
-        _hourly_cap = int(max(0, EMAIL_MAX_SEND_EVENTS_PER_HOUR))
-        _sent_last_hour = email_send_events_recent_count(int(uid), seconds=3600) if _hourly_cap > 0 else 0
-        if _hourly_cap > 0 and _sent_last_hour >= _hourly_cap:
-            return {"status": "skip", "reason": f"rolling_hour_email_cap_reached ({_sent_last_hour}/{_hourly_cap})"}
         if not bool(email_gate.get('gate_open')):
             reason = ', '.join([str(r) for r in (email_gate.get('gate_reasons') or [])[:3]]) or 'email_gate_blocked'
             _LAST_EMAIL_DECISION[int(uid)] = {
@@ -22266,15 +22232,15 @@ def _email_body_pretty(
 
         # ✅ "ID-" prefix
         parts.append(f"ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
-        parts.append(f"   Entry: {fmt_price_email_for_symbol(s.symbol, s.entry)} | SL: {fmt_price_email_for_symbol(s.symbol, s.sl)} | RR(TP2): {rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}")
+        parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP2): {rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}")
 
         _tp1, _tp2, _tp3 = _ensure_three_tps(s.entry, s.sl, s.tp3, getattr(s, "tp1", None), getattr(s, "tp2", None), getattr(s, "side", ""))
         if _tp1 not in (None, 0, 0.0) and _tp2 not in (None, 0, 0.0) and _tp3 not in (None, 0, 0.0):
             parts.append(
-                f"   TP1: {fmt_price_email_for_symbol(s.symbol, _tp1)} | TP2: {fmt_price_email_for_symbol(s.symbol, _tp2)}"
+                f"   TP1: {fmt_price_email(_tp1)} | TP2: {fmt_price_email(_tp2)}"
             )
         else:
-            parts.append(f"   TP2: {fmt_price_email_for_symbol(s.symbol, (s.tp2 or s.tp3))}")
+            parts.append(f"   TP2: {fmt_price_email(s.tp2 or s.tp3)}")
 
         # ✅ only for t# trailing-needed setups
         if getattr(s, 'is_trailing_tp3', False):
@@ -22287,7 +22253,7 @@ def _email_body_pretty(
         parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
-            parts.append(f"/size {str(getattr(s, 'symbol', ''))} {_pos} entry {_round_price_to_tick(str(getattr(s,'symbol','') or ''), float(getattr(s, 'entry', 0.0) or 0.0)):.6g} sl {_round_price_to_tick(str(getattr(s,'symbol','') or ''), float(getattr(s, 'sl', 0.0) or 0.0)):.6g}")
+            parts.append(f"/size {str(getattr(s, 'symbol', ''))} {_pos} entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}")
         except Exception:
             pass
         parts.append("")
@@ -22352,14 +22318,14 @@ def _email_body_pretty_html(
         card = []
         card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
         card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
-        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email_for_symbol(s.symbol, s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email_for_symbol(s.symbol, s.sl))}</code> &nbsp;|&nbsp; RR(TP2): <code>{rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}</code></div>")
+        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP2): <code>{rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}</code></div>")
 
         if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
             card.append(
-                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> &nbsp;|&nbsp; TP2: <code>{esc(fmt_price_email_for_symbol(s.symbol, (s.tp2 or s.tp3)))}</code></div>"
+                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> &nbsp;|&nbsp; TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>"
             )
         else:
-            card.append(f"<div style='margin-top:4px'>TP2: <code>{esc(fmt_price_email_for_symbol(s.symbol, (s.tp2 or s.tp3)))}</code></div>")
+            card.append(f"<div style='margin-top:4px'>TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>")
 
         if s.is_trailing_tp3:
             pass
@@ -22371,7 +22337,7 @@ def _email_body_pretty_html(
         card.append(f"<div style='margin-top:6px'>Chart: {esc(tv_chart_url(s.symbol))}</div>")
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
-            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {_round_price_to_tick(str(getattr(s,'symbol','') or ''), float(getattr(s,'entry',0.0) or 0.0)):.6g} sl {_round_price_to_tick(str(getattr(s,'symbol','') or ''), float(getattr(s,'sl',0.0) or 0.0)):.6g}"
+            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
             card.append(f"<div style='margin-top:8px'><code style='background:#f7f7f7;padding:8px;border-radius:8px;display:inline-block;white-space:nowrap;font-family:Menlo,Consolas,monospace'>{esc(size_line)}</code></div>")
         except Exception:
             pass
@@ -22424,14 +22390,14 @@ def _email_body_pretty_html(
         card = []
         card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
         card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
-        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email_for_symbol(s.symbol, s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email_for_symbol(s.symbol, s.sl))}</code> &nbsp;|&nbsp; RR(TP2): <code>{rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}</code></div>")
+        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP2): <code>{rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}</code></div>")
 
         if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
             card.append(
-                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> &nbsp;|&nbsp; TP2: <code>{esc(fmt_price_email_for_symbol(s.symbol, (s.tp2 or s.tp3)))}</code></div>"
+                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> &nbsp;|&nbsp; TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>"
             )
         else:
-            card.append(f"<div style='margin-top:4px'>TP2: <code>{esc(fmt_price_email_for_symbol(s.symbol, (s.tp2 or s.tp3)))}</code></div>")
+            card.append(f"<div style='margin-top:4px'>TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>")
 
         if s.is_trailing_tp3:
             pass
@@ -22443,7 +22409,7 @@ def _email_body_pretty_html(
         card.append(f"<div style='margin-top:6px'>Chart: {esc(tv_chart_url(s.symbol))}</div>")
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
-            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {_round_price_to_tick(str(getattr(s,'symbol','') or ''), float(getattr(s,'entry',0.0) or 0.0)):.6g} sl {_round_price_to_tick(str(getattr(s,'symbol','') or ''), float(getattr(s,'sl',0.0) or 0.0)):.6g}"
+            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
             card.append(f"<div style='margin-top:8px'><code style='background:#f7f7f7;padding:8px;border-radius:8px;display:inline-block;white-space:nowrap;font-family:Menlo,Consolas,monospace'>{esc(size_line)}</code></div>")
         except Exception:
             pass
@@ -22486,8 +22452,6 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
     sess_name = str(sess.get("name") or "")
     display_session = (live_sess if live_sess != "NONE" else "NY") if sess_name == "UNLIMITED" else sess_name
 
-    setups = [_setup_exchange_synced_view(s) for s in list(setups or [])]
-
     first = setups[0]
     subject = f"PulseFutures • {display_session} • {first.side} {first.symbol}"
     if len(setups) > 1:
@@ -22522,10 +22486,6 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
     if sent:
         try:
             now_ts = time.time()
-            try:
-                email_send_event_log(uid, str(display_session), now_ts)
-            except Exception:
-                pass
             for s in setups:
                 try:
                     db_mark_emailed_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
@@ -22781,7 +22741,6 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "60"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "60"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "60"))
-EMAIL_MAX_SEND_EVENTS_PER_HOUR = int(os.environ.get("EMAIL_MAX_SEND_EVENTS_PER_HOUR", "2") or 2)
 
 # SMTP connection reuse (Render speed fix)
 SMTP_REUSE_TTL_SEC = int(os.environ.get("SMTP_REUSE_TTL_SEC", "240"))  # 4 minutes
@@ -23209,16 +23168,6 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
                     "reasons": [f"daily_email_cap_reached ({sent_today}/{day_cap})"],
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                }
-                continue
-
-            hourly_cap = int(max(0, EMAIL_MAX_SEND_EVENTS_PER_HOUR))
-            sent_last_hour = email_send_events_recent_count(uid, seconds=3600) if hourly_cap > 0 else 0
-            if hourly_cap > 0 and sent_last_hour >= hourly_cap:
-                _LAST_EMAIL_DECISION[uid] = {
-                    "status": "SKIP",
-                    "reasons": [f"rolling_hour_email_cap_reached ({sent_last_hour}/{hourly_cap})"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
