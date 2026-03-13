@@ -1090,11 +1090,6 @@ def _strategy_config_defaults() -> dict:
         "universe_backtest_min_vol_usd": 10000000.0,
         "universe_backtest_windows": [7, 30],
         "universe_backtest_exec_tf": "15m",
-        "universe_backtest_final_day_cap": 4,
-        "universe_backtest_final_score_buffer": 8.0,
-        "universe_backtest_final_min_conf": 70,
-        "universe_backtest_final_min_gap_minutes": 90,
-        "universe_backtest_final_symbol_day_cap": 1,
     }
 
 _STRATEGY_CFG_CACHE = {"ts": 0.0, "cfg": None}
@@ -1813,6 +1808,33 @@ def _round_price_to_tick(symbol: str, price: float, rounding=ROUND_DOWN) -> floa
             return 0.0
 
 
+def _setup_exchange_synced_view(s: "Setup") -> "Setup":
+    """Return a setup view with exchange-tick-rounded entry/SL/TP prices."""
+    try:
+        sym = str(getattr(s, 'symbol', '') or '')
+        if not sym:
+            return s
+        side = str(getattr(s, 'side', '') or '').upper()
+        entry = _round_price_to_tick(sym, float(getattr(s, 'entry', 0.0) or 0.0), rounding=ROUND_DOWN)
+        sl_raw = float(getattr(s, 'sl', 0.0) or 0.0)
+        sl_round = ROUND_DOWN if side == 'BUY' else ROUND_UP
+        tp_round = ROUND_DOWN if side == 'BUY' else ROUND_UP
+        sl = _round_price_to_tick(sym, sl_raw, rounding=sl_round)
+        tp1 = _round_price_to_tick(sym, float(getattr(s, 'tp1', 0.0) or 0.0), rounding=tp_round) if float(getattr(s, 'tp1', 0.0) or 0.0) > 0 else 0.0
+        tp2 = _round_price_to_tick(sym, float(getattr(s, 'tp2', 0.0) or 0.0), rounding=tp_round) if float(getattr(s, 'tp2', 0.0) or 0.0) > 0 else 0.0
+        tp3 = _round_price_to_tick(sym, float(getattr(s, 'tp3', 0.0) or 0.0), rounding=tp_round) if float(getattr(s, 'tp3', 0.0) or 0.0) > 0 else 0.0
+        return replace(s, entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2), tp3=float(tp3))
+    except Exception:
+        return s
+
+
+def fmt_price_email_for_symbol(symbol: str, x: float) -> str:
+    try:
+        return fmt_price_email(_round_price_to_tick(symbol, float(x or 0.0), rounding=ROUND_DOWN))
+    except Exception:
+        return fmt_price_email(x)
+
+
 def _effective_equity_for_risk(user: dict | None = None, prefer_live: bool = True) -> float:
     """Single source of truth for risk-based equity.
 
@@ -2150,13 +2172,19 @@ def _autotrade_live_exit_plan_from_targets(entry: float, sl: float, tp1, tp2, tp
 
 
 def _autotrade_live_exit_plan_for_trade(trade_or_setup) -> dict:
+    obj = trade_or_setup
+    try:
+        if hasattr(trade_or_setup, 'symbol'):
+            obj = _setup_exchange_synced_view(trade_or_setup)
+    except Exception:
+        obj = trade_or_setup
     return _autotrade_live_exit_plan_from_targets(
-        float(getattr(trade_or_setup, 'entry', 0.0) if hasattr(trade_or_setup, 'entry') else (trade_or_setup.get('entry') if isinstance(trade_or_setup, dict) else 0.0) or 0.0),
-        float(getattr(trade_or_setup, 'sl', 0.0) if hasattr(trade_or_setup, 'sl') else (trade_or_setup.get('sl') if isinstance(trade_or_setup, dict) else 0.0) or 0.0),
-        getattr(trade_or_setup, 'tp1', None) if hasattr(trade_or_setup, 'tp1') else (trade_or_setup.get('tp1') if isinstance(trade_or_setup, dict) else None),
-        getattr(trade_or_setup, 'tp2', None) if hasattr(trade_or_setup, 'tp2') else (trade_or_setup.get('tp2') if isinstance(trade_or_setup, dict) else None),
-        getattr(trade_or_setup, 'tp3', None) if hasattr(trade_or_setup, 'tp3') else (trade_or_setup.get('tp3') if isinstance(trade_or_setup, dict) else None),
-        getattr(trade_or_setup, 'side', '') if hasattr(trade_or_setup, 'side') else (trade_or_setup.get('side') if isinstance(trade_or_setup, dict) else ''),
+        float(getattr(obj, 'entry', 0.0) if hasattr(obj, 'entry') else (obj.get('entry') if isinstance(obj, dict) else 0.0) or 0.0),
+        float(getattr(obj, 'sl', 0.0) if hasattr(obj, 'sl') else (obj.get('sl') if isinstance(obj, dict) else 0.0) or 0.0),
+        getattr(obj, 'tp1', None) if hasattr(obj, 'tp1') else (obj.get('tp1') if isinstance(obj, dict) else None),
+        getattr(obj, 'tp2', None) if hasattr(obj, 'tp2') else (obj.get('tp2') if isinstance(obj, dict) else None),
+        getattr(obj, 'tp3', None) if hasattr(obj, 'tp3') else (obj.get('tp3') if isinstance(obj, dict) else None),
+        getattr(obj, 'side', '') if hasattr(obj, 'side') else (obj.get('side') if isinstance(obj, dict) else ''),
     )
 
 
@@ -6937,6 +6965,38 @@ def email_state_set(user_id: int, **kwargs):
     cur.execute(f"UPDATE email_state SET {sets} WHERE user_id=?", vals)
     con.commit()
     con.close()
+
+def email_send_event_log(user_id: int, session_name: str, emailed_ts: float | None = None):
+    ts = float(emailed_ts or time.time())
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO email_send_events (user_id, session, emailed_ts) VALUES (?, ?, ?)",
+            (int(user_id), str(session_name or ''), ts),
+        )
+        conn.commit()
+
+
+def email_send_events_recent_count(user_id: int, seconds: int = 3600, session_name: str | None = None) -> int:
+    try:
+        since_ts = float(time.time()) - max(0, int(seconds or 0))
+        with db_conn() as conn:
+            cur = conn.cursor()
+            if session_name:
+                cur.execute(
+                    "SELECT COUNT(1) FROM email_send_events WHERE user_id=? AND emailed_ts>=? AND UPPER(COALESCE(session,''))=?",
+                    (int(user_id), since_ts, str(session_name or '').upper()),
+                )
+            else:
+                cur.execute(
+                    "SELECT COUNT(1) FROM email_send_events WHERE user_id=? AND emailed_ts>=?",
+                    (int(user_id), since_ts),
+                )
+            row = cur.fetchone()
+            return int((row[0] if row else 0) or 0)
+    except Exception:
+        return 0
+
 
 def mark_symbol_emailed(user_id: int, symbol: str, side: str, session_name: str = ""):
     """
@@ -12120,42 +12180,34 @@ def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | No
                         live_reject_acc[why] += 1
     raw_overall, raw_per_day, raw_by_session = _summarize_universe_rows(rows, days=float(d), live_only=False)
     live_overall, live_per_day, live_by_session = _summarize_universe_rows(rows, days=float(d), live_only=True)
-    final_rows, final_blockers, final_meta = _apply_final_sale_grade_filter(rows, cfg, session_mode=session_mode)
-    final_overall, final_per_day, final_by_session = _summarize_universe_rows(final_rows, days=float(d), live_only=False)
     metrics = {
         'days': d,
         'session_mode': session_mode,
         'exec_tf': exec_tf,
-        'preferred_view': 'final_sale_grade',
-        'overall': dict(final_overall),
-        'final_sale_grade_overall': dict(final_overall),
+        'preferred_view': 'live_equivalent',
+        'overall': dict(live_overall),
         'live_equivalent_overall': dict(live_overall),
         'raw_overall': dict(raw_overall),
-        'overall_win_rate': float(final_overall.get('win_rate', 0.0) or 0.0),
-        'total_setups': int(final_overall.get('setups', 0) or 0),
-        'avg_setups_per_day': float(final_overall.get('setups_per_day', 0.0) or 0.0),
-        'live_equivalent_total_setups': int(live_overall.get('setups', 0) or 0),
-        'live_equivalent_avg_setups_per_day': float(live_overall.get('setups_per_day', 0.0) or 0.0),
+        'overall_win_rate': float(live_overall.get('win_rate', 0.0) or 0.0),
+        'total_setups': int(live_overall.get('setups', 0) or 0),
+        'avg_setups_per_day': float(live_overall.get('setups_per_day', 0.0) or 0.0),
         'raw_total_setups': int(raw_overall.get('setups', 0) or 0),
         'raw_avg_setups_per_day': float(raw_overall.get('setups_per_day', 0.0) or 0.0),
-        'by_session': dict(final_by_session),
-        'final_sale_grade_by_session': dict(final_by_session),
+        'by_session': dict(live_by_session),
         'live_equivalent_by_session': dict(live_by_session),
         'raw_by_session': dict(raw_by_session),
-        'final_sale_grade_meta': dict(final_meta),
         'universe_size': int(len(universe)),
         'top_n': int(top_n),
         'min_vol_usd': float(min_vol_usd),
         'reject_breakdown': dict(reject_acc),
         'live_equivalent_reject_breakdown': dict(live_reject_acc),
-        'final_sale_grade_reject_breakdown': dict(final_blockers),
         'eval_since_ts': float(eval_since_ms / 1000.0),
         'eval_until_ts': float(eval_until_ms / 1000.0),
         'fetch_errors': int(fetch_errors),
     }
     run_id = ''
     if persist:
-        run_id = _db_save_universe_backtest_run(days=d, session_mode=session_mode, exec_tf=exec_tf, universe_snap_id=str(snap.get('snap_id') or ''), universe_size=len(universe), metrics=metrics, per_day=final_per_day, per_session=final_by_session, notes='auto' if promoted_context else 'manual', promoted_context=bool(promoted_context))
+        run_id = _db_save_universe_backtest_run(days=d, session_mode=session_mode, exec_tf=exec_tf, universe_snap_id=str(snap.get('snap_id') or ''), universe_size=len(universe), metrics=metrics, per_day=live_per_day, per_session=live_by_session, notes='auto' if promoted_context else 'manual', promoted_context=bool(promoted_context))
     return {
         'ok': True,
         'run_id': run_id,
@@ -12165,17 +12217,11 @@ def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | No
         'universe_snap_id': str(snap.get('snap_id') or ''),
         'universe_size': int(len(universe)),
         'metrics': metrics,
-        'overall': dict(final_overall),
-        'final_overall': dict(final_overall),
-        'live_overall': dict(live_overall),
+        'overall': dict(live_overall),
         'raw_overall': dict(raw_overall),
-        'per_day': final_per_day,
-        'final_per_day': final_per_day,
-        'live_per_day': live_per_day,
+        'per_day': live_per_day,
         'raw_per_day': raw_per_day,
-        'per_session': final_by_session,
-        'final_per_session': final_by_session,
-        'live_per_session': live_by_session,
+        'per_session': live_by_session,
         'raw_per_session': raw_by_session,
         'symbol_reports': symbol_reports,
     }
@@ -12185,53 +12231,40 @@ def _format_universe_backtest_report(rep: dict) -> str:
     if not rep:
         return 'No universe backtest report.'
     metrics = rep.get('metrics') or {}
-    overall = rep.get('overall') or rep.get('final_overall') or metrics.get('overall') or {}
-    live_overall = rep.get('live_overall') or metrics.get('live_equivalent_overall') or {}
+    overall = rep.get('overall') or metrics.get('overall') or {}
     raw_overall = rep.get('raw_overall') or metrics.get('raw_overall') or {}
-    per_session = rep.get('per_session') or rep.get('final_per_session') or metrics.get('by_session') or {}
-    live_per_session = rep.get('live_per_session') or metrics.get('live_equivalent_by_session') or {}
+    per_session = rep.get('per_session') or metrics.get('by_session') or {}
     raw_per_session = rep.get('raw_per_session') or metrics.get('raw_by_session') or {}
-    per_day = list(rep.get('per_day') or rep.get('final_per_day') or [])
-    live_per_day = list(rep.get('live_per_day') or [])
+    per_day = list(rep.get('per_day') or [])
     raw_per_day = list(rep.get('raw_per_day') or [])
-    final_meta = metrics.get('final_sale_grade_meta') or {}
     lines = [
         f"🌐 Universe Backtest — {int(rep.get('days') or metrics.get('days') or 0)}d",
         HDR,
         f"TF: {str(rep.get('exec_tf') or metrics.get('exec_tf') or '15m')} | Session: {str(rep.get('session_mode') or metrics.get('session_mode') or 'ALL')} | Universe: {int(rep.get('universe_size') or metrics.get('universe_size') or 0)}",
         f"Window: {datetime.fromtimestamp(float(metrics.get('eval_since_ts', 0.0) or 0.0), tz=timezone.utc).strftime('%Y-%m-%d') if float(metrics.get('eval_since_ts', 0.0) or 0.0) > 0 else '?'} → {datetime.fromtimestamp(float(metrics.get('eval_until_ts', 0.0) or 0.0), tz=timezone.utc).strftime('%Y-%m-%d') if float(metrics.get('eval_until_ts', 0.0) or 0.0) > 0 else '?'} | Fetch errors: {int(metrics.get('fetch_errors', 0) or 0)}",
         f"Raw setups: {int(raw_overall.get('setups', 0) or 0)} | Avg/day: {float(raw_overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(raw_overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(raw_overall.get('avg_R', 0.0) or 0.0):.3f}",
-        f"Live-equivalent setups: {int(live_overall.get('setups', 0) or 0)} | Avg/day: {float(live_overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(live_overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(live_overall.get('avg_R', 0.0) or 0.0):.3f}",
-        f"Final sale-grade setups: {int(overall.get('setups', 0) or 0)} | Avg/day: {float(overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(overall.get('avg_R', 0.0) or 0.0):.3f}",
-        f"Final gate: day_cap={int(final_meta.get('day_cap', 0) or 0)} | score_floor={float(final_meta.get('score_floor', 0.0) or 0.0):.1f} | min_conf={int(final_meta.get('min_conf', 0) or 0)} | min_gap_min={int(final_meta.get('min_gap_minutes', 0) or 0)} | symbol_day_cap={int(final_meta.get('symbol_day_cap', 0) or 0)}",
-        'Per session (raw -> live-equivalent -> final):',
+        f"Live-equivalent setups: {int(overall.get('setups', 0) or 0)} | Avg/day: {float(overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(overall.get('avg_R', 0.0) or 0.0):.3f}",
+        'Per session (raw -> live-equivalent):',
     ]
     for sess in ('NY','LON','ASIA'):
         rd = raw_per_session.get(sess) or {}
-        ld = live_per_session.get(sess) or {}
-        fd = per_session.get(sess) or {}
-        lines.append(f"• {sess}: raw={int(rd.get('setups',0) or 0)} @ WR {float(rd.get('win_rate',0.0) or 0.0):.1f}% | live={int(ld.get('setups',0) or 0)} @ WR {float(ld.get('win_rate',0.0) or 0.0):.1f}% | final={int(fd.get('setups',0) or 0)} @ WR {float(fd.get('win_rate',0.0) or 0.0):.1f}%")
-    if per_day or live_per_day or raw_per_day:
-        lines.append('Per day (raw -> live-equivalent -> final):')
-        live_map = {str(r.get('day') or ''): r for r in live_per_day}
-        final_map = {str(r.get('day') or ''): r for r in per_day}
+        ld = per_session.get(sess) or {}
+        lines.append(f"• {sess}: raw={int(rd.get('setups',0) or 0)} @ WR {float(rd.get('win_rate',0.0) or 0.0):.1f}% | live={int(ld.get('setups',0) or 0)} @ WR {float(ld.get('win_rate',0.0) or 0.0):.1f}%")
+    if per_day or raw_per_day:
+        lines.append('Per day (raw -> live-equivalent):')
+        live_map = {str(r.get('day') or ''): r for r in per_day}
         for row in raw_per_day[:35]:
             day = str(row.get('day') or '')
             live_row = live_map.get(day) or {}
-            final_row = final_map.get(day) or {}
+            rbs = row.get('by_session') or {}
+            lbs = live_row.get('by_session') or {}
             lines.append(
-                f"• {day}: raw={int(row.get('setups',0) or 0)} WR={float(row.get('win_rate',0.0) or 0.0):.1f}% | live={int(live_row.get('setups',0) or 0)} WR={float(live_row.get('win_rate',0.0) or 0.0):.1f}% | final={int(final_row.get('setups',0) or 0)} WR={float(final_row.get('win_rate',0.0) or 0.0):.1f}%"
+                f"• {day}: raw={int(row.get('setups',0) or 0)} WR={float(row.get('win_rate',0.0) or 0.0):.1f}% | live={int(live_row.get('setups',0) or 0)} WR={float(live_row.get('win_rate',0.0) or 0.0):.1f}% | raw NY/LON/ASIA={int(rbs.get('NY',0) or 0)}/{int(rbs.get('LON',0) or 0)}/{int(rbs.get('ASIA',0) or 0)} | live NY/LON/ASIA={int(lbs.get('NY',0) or 0)}/{int(lbs.get('LON',0) or 0)}/{int(lbs.get('ASIA',0) or 0)}"
             )
     rej = metrics.get('live_equivalent_reject_breakdown') or {}
     if isinstance(rej, dict) and rej:
-        top = sorted(rej.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:5]
+        top = sorted(rej.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:6]
         lines.append('Top live-equivalent blockers:')
-        for k, v in top:
-            lines.append(f"• {k} = {int(v or 0)}")
-    frej = metrics.get('final_sale_grade_reject_breakdown') or {}
-    if isinstance(frej, dict) and frej:
-        top = sorted(frej.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:6]
-        lines.append('Top final sale-grade blockers:')
         for k, v in top:
             lines.append(f"• {k} = {int(v or 0)}")
     return "\n".join(lines)
@@ -14358,126 +14391,6 @@ def _summarize_universe_rows(rows: list[dict], days: float, live_only: bool = Fa
         'top_symbol_share': float(top_share),
     }
     return overall, per_day, per_session
-
-
-
-def _apply_final_sale_grade_filter(rows: list[dict], cfg: dict, session_mode: str = 'ALL') -> tuple[list[dict], dict, dict]:
-    """Select a scarce, sale-grade subset from live-equivalent historical rows.
-
-    Goal: make universe backtests reflect the final customer-facing scarcity layer rather
-    than every historically executable candidate. This keeps optimization and learning
-    aligned with the bot's intended 3-5 higher-quality setups/day target.
-    """
-    session_mode = str(session_mode or 'ALL').upper().strip()
-    live_rows = []
-    for rr in (rows or []):
-        if not isinstance(rr, dict):
-            continue
-        if not bool(rr.get('live_equivalent', False)):
-            continue
-        sess = str(rr.get('session') or '').upper().strip()
-        if session_mode != 'ALL' and sess != session_mode:
-            continue
-        live_rows.append(dict(rr))
-
-    blockers = Counter()
-    if not live_rows:
-        meta = {'day_cap': 0, 'session_caps': {}, 'score_floor': 0.0, 'min_conf': 0, 'min_gap_minutes': 0, 'symbol_day_cap': 0}
-        return [], {}, meta
-
-    target_lo = float(cfg.get('target_setups_per_day_lo', 3.0) or 3.0)
-    target_hi = float(cfg.get('target_setups_per_day_hi', 5.0) or 5.0)
-    default_day_cap = int(max(1, round((target_lo + target_hi) / 2.0)))
-    day_cap = int(max(1, cfg.get('universe_backtest_final_day_cap', default_day_cap) or default_day_cap))
-    score_floor = float((cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) + float(cfg.get('universe_backtest_final_score_buffer', 8.0) or 8.0))
-    min_conf = int(max(0, cfg.get('universe_backtest_final_min_conf', 70) or 70))
-    min_gap_minutes = float(max(0.0, cfg.get('universe_backtest_final_min_gap_minutes', 90) or 90))
-    symbol_day_cap = int(max(1, cfg.get('universe_backtest_final_symbol_day_cap', 1) or 1))
-
-    weights = cfg.get('session_weights') or {}
-    session_caps = {}
-    session_rank_bonus = {s: 0.0 for s in ('NY', 'LON', 'ASIA')}
-    if session_mode in ('NY', 'LON', 'ASIA'):
-        session_caps = {session_mode: day_cap}
-        session_rank_bonus[session_mode] = max(0.0, float(weights.get(session_mode, 0.0) or 0.0))
-    else:
-        raw_weights = {s: max(0.0, float(weights.get(s, 0.0) or 0.0)) for s in ('NY', 'LON', 'ASIA')}
-        if sum(raw_weights.values()) <= 0:
-            raw_weights = {'NY': 1.0, 'LON': 1.0, 'ASIA': 1.0}
-        # Do not hard-disable sessions in ALL mode. Use weights only as a soft ranking bonus.
-        # This keeps London/Asia eligible whenever their actual setups rank highly enough.
-        max_w = max(raw_weights.values()) if raw_weights else 1.0
-        if max_w <= 0:
-            max_w = 1.0
-        session_rank_bonus = {s: (raw_weights[s] / max_w) for s in ('NY', 'LON', 'ASIA')}
-
-    by_day = defaultdict(list)
-    for rr in live_rows:
-        by_day[str(rr.get('day') or '')].append(rr)
-
-    final_rows = []
-    for day in sorted(by_day):
-        selected = []
-        sess_counts = Counter()
-        sym_counts = Counter()
-        last_kept_ts = None
-        day_rows = sorted(
-            by_day[day],
-            key=lambda rr: (
-                -(float(rr.get('score', 0.0) or 0.0) + (3.0 * float(session_rank_bonus.get(str(rr.get('session') or '').upper().strip(), 0.0) or 0.0))),
-                -int(rr.get('conf', 0) or 0),
-                -float(rr.get('rr_final', 0.0) or 0.0),
-                float(rr.get('ts', 0.0) or 0.0),
-                str(rr.get('symbol') or ''),
-            )
-        )
-        for rr in day_rows:
-            sym = str(rr.get('symbol') or '')
-            sess = str(rr.get('session') or '').upper().strip()
-            score = float(rr.get('score', 0.0) or 0.0)
-            conf = int(rr.get('conf', 0) or 0)
-            ts = float(rr.get('ts', 0.0) or 0.0)
-            if score < score_floor:
-                blockers['final_below_score_floor'] += 1
-                continue
-            if conf < min_conf:
-                blockers['final_below_min_conf'] += 1
-                continue
-            if len(selected) >= day_cap:
-                blockers['final_day_cap_reached'] += 1
-                continue
-            if session_caps and session_caps.get(sess, 0) <= 0:
-                blockers[f'final_session_disabled_{sess or "UNK"}'] += 1
-                continue
-            if session_caps and sess_counts[sess] >= int(session_caps.get(sess, 0) or 0):
-                blockers[f'final_session_cap_{sess or "UNK"}'] += 1
-                continue
-            if sym and sym_counts[sym] >= symbol_day_cap:
-                blockers['final_symbol_day_cap'] += 1
-                continue
-            if last_kept_ts is not None and min_gap_minutes > 0 and ts > 0 and (ts - last_kept_ts) < (min_gap_minutes * 60.0):
-                blockers['final_min_gap'] += 1
-                continue
-            rr2 = dict(rr)
-            rr2['final_sale_grade'] = True
-            selected.append(rr2)
-            final_rows.append(rr2)
-            sess_counts[sess] += 1
-            if sym:
-                sym_counts[sym] += 1
-            if ts > 0:
-                last_kept_ts = ts
-
-    meta = {
-        'day_cap': int(day_cap),
-        'session_caps': dict(session_caps),
-        'session_rank_bonus': dict(session_rank_bonus),
-        'score_floor': float(score_floor),
-        'min_conf': int(min_conf),
-        'min_gap_minutes': float(min_gap_minutes),
-        'symbol_day_cap': int(symbol_day_cap),
-    }
-    return final_rows, dict(blockers), meta
 
 def _normalize_autotune_windows(cfg: dict) -> list[dict]:
     """Safe normalized historical windows for zero-touch optimizer."""
@@ -21977,6 +21890,10 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             pass
 
         email_gate = _email_runtime_limits_snapshot(int(uid), user)
+        _hourly_cap = int(max(0, EMAIL_MAX_SEND_EVENTS_PER_HOUR))
+        _sent_last_hour = email_send_events_recent_count(int(uid), seconds=3600) if _hourly_cap > 0 else 0
+        if _hourly_cap > 0 and _sent_last_hour >= _hourly_cap:
+            return {"status": "skip", "reason": f"rolling_hour_email_cap_reached ({_sent_last_hour}/{_hourly_cap})"}
         if not bool(email_gate.get('gate_open')):
             reason = ', '.join([str(r) for r in (email_gate.get('gate_reasons') or [])[:3]]) or 'email_gate_blocked'
             _LAST_EMAIL_DECISION[int(uid)] = {
@@ -22349,15 +22266,15 @@ def _email_body_pretty(
 
         # ✅ "ID-" prefix
         parts.append(f"ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
-        parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP2): {rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}")
+        parts.append(f"   Entry: {fmt_price_email_for_symbol(s.symbol, s.entry)} | SL: {fmt_price_email_for_symbol(s.symbol, s.sl)} | RR(TP2): {rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}")
 
         _tp1, _tp2, _tp3 = _ensure_three_tps(s.entry, s.sl, s.tp3, getattr(s, "tp1", None), getattr(s, "tp2", None), getattr(s, "side", ""))
         if _tp1 not in (None, 0, 0.0) and _tp2 not in (None, 0, 0.0) and _tp3 not in (None, 0, 0.0):
             parts.append(
-                f"   TP1: {fmt_price_email(_tp1)} | TP2: {fmt_price_email(_tp2)}"
+                f"   TP1: {fmt_price_email_for_symbol(s.symbol, _tp1)} | TP2: {fmt_price_email_for_symbol(s.symbol, _tp2)}"
             )
         else:
-            parts.append(f"   TP2: {fmt_price_email(s.tp2 or s.tp3)}")
+            parts.append(f"   TP2: {fmt_price_email_for_symbol(s.symbol, (s.tp2 or s.tp3))}")
 
         # ✅ only for t# trailing-needed setups
         if getattr(s, 'is_trailing_tp3', False):
@@ -22370,7 +22287,7 @@ def _email_body_pretty(
         parts.append(f"   Chart: {tv_chart_url(s.symbol)}")
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
-            parts.append(f"/size {str(getattr(s, 'symbol', ''))} {_pos} entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}")
+            parts.append(f"/size {str(getattr(s, 'symbol', ''))} {_pos} entry {_round_price_to_tick(str(getattr(s,'symbol','') or ''), float(getattr(s, 'entry', 0.0) or 0.0)):.6g} sl {_round_price_to_tick(str(getattr(s,'symbol','') or ''), float(getattr(s, 'sl', 0.0) or 0.0)):.6g}")
         except Exception:
             pass
         parts.append("")
@@ -22435,14 +22352,14 @@ def _email_body_pretty_html(
         card = []
         card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
         card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
-        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP2): <code>{rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}</code></div>")
+        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email_for_symbol(s.symbol, s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email_for_symbol(s.symbol, s.sl))}</code> &nbsp;|&nbsp; RR(TP2): <code>{rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}</code></div>")
 
         if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
             card.append(
-                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> &nbsp;|&nbsp; TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>"
+                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> &nbsp;|&nbsp; TP2: <code>{esc(fmt_price_email_for_symbol(s.symbol, (s.tp2 or s.tp3)))}</code></div>"
             )
         else:
-            card.append(f"<div style='margin-top:4px'>TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>")
+            card.append(f"<div style='margin-top:4px'>TP2: <code>{esc(fmt_price_email_for_symbol(s.symbol, (s.tp2 or s.tp3)))}</code></div>")
 
         if s.is_trailing_tp3:
             pass
@@ -22454,7 +22371,7 @@ def _email_body_pretty_html(
         card.append(f"<div style='margin-top:6px'>Chart: {esc(tv_chart_url(s.symbol))}</div>")
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
-            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
+            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {_round_price_to_tick(str(getattr(s,'symbol','') or ''), float(getattr(s,'entry',0.0) or 0.0)):.6g} sl {_round_price_to_tick(str(getattr(s,'symbol','') or ''), float(getattr(s,'sl',0.0) or 0.0)):.6g}"
             card.append(f"<div style='margin-top:8px'><code style='background:#f7f7f7;padding:8px;border-radius:8px;display:inline-block;white-space:nowrap;font-family:Menlo,Consolas,monospace'>{esc(size_line)}</code></div>")
         except Exception:
             pass
@@ -22507,14 +22424,14 @@ def _email_body_pretty_html(
         card = []
         card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
         card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
-        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP2): <code>{rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}</code></div>")
+        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email_for_symbol(s.symbol, s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email_for_symbol(s.symbol, s.sl))}</code> &nbsp;|&nbsp; RR(TP2): <code>{rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}</code></div>")
 
         if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
             card.append(
-                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> &nbsp;|&nbsp; TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>"
+                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> &nbsp;|&nbsp; TP2: <code>{esc(fmt_price_email_for_symbol(s.symbol, (s.tp2 or s.tp3)))}</code></div>"
             )
         else:
-            card.append(f"<div style='margin-top:4px'>TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>")
+            card.append(f"<div style='margin-top:4px'>TP2: <code>{esc(fmt_price_email_for_symbol(s.symbol, (s.tp2 or s.tp3)))}</code></div>")
 
         if s.is_trailing_tp3:
             pass
@@ -22526,7 +22443,7 @@ def _email_body_pretty_html(
         card.append(f"<div style='margin-top:6px'>Chart: {esc(tv_chart_url(s.symbol))}</div>")
         try:
             _pos = "long" if str(getattr(s, "side", "")).upper() == "BUY" else "short"
-            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {float(getattr(s,'entry',0.0) or 0.0):.6g} sl {float(getattr(s,'sl',0.0) or 0.0):.6g}"
+            size_line = f"/size {str(getattr(s,'symbol',''))} {_pos} entry {_round_price_to_tick(str(getattr(s,'symbol','') or ''), float(getattr(s,'entry',0.0) or 0.0)):.6g} sl {_round_price_to_tick(str(getattr(s,'symbol','') or ''), float(getattr(s,'sl',0.0) or 0.0)):.6g}"
             card.append(f"<div style='margin-top:8px'><code style='background:#f7f7f7;padding:8px;border-radius:8px;display:inline-block;white-space:nowrap;font-family:Menlo,Consolas,monospace'>{esc(size_line)}</code></div>")
         except Exception:
             pass
@@ -22569,6 +22486,8 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
     sess_name = str(sess.get("name") or "")
     display_session = (live_sess if live_sess != "NONE" else "NY") if sess_name == "UNLIMITED" else sess_name
 
+    setups = [_setup_exchange_synced_view(s) for s in list(setups or [])]
+
     first = setups[0]
     subject = f"PulseFutures • {display_session} • {first.side} {first.symbol}"
     if len(setups) > 1:
@@ -22603,6 +22522,10 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
     if sent:
         try:
             now_ts = time.time()
+            try:
+                email_send_event_log(uid, str(display_session), now_ts)
+            except Exception:
+                pass
             for s in setups:
                 try:
                     db_mark_emailed_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
@@ -22858,6 +22781,7 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "60"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "60"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "60"))
+EMAIL_MAX_SEND_EVENTS_PER_HOUR = int(os.environ.get("EMAIL_MAX_SEND_EVENTS_PER_HOUR", "2") or 2)
 
 # SMTP connection reuse (Render speed fix)
 SMTP_REUSE_TTL_SEC = int(os.environ.get("SMTP_REUSE_TTL_SEC", "240"))  # 4 minutes
@@ -23285,6 +23209,16 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
                     "reasons": [f"daily_email_cap_reached ({sent_today}/{day_cap})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
+
+            hourly_cap = int(max(0, EMAIL_MAX_SEND_EVENTS_PER_HOUR))
+            sent_last_hour = email_send_events_recent_count(uid, seconds=3600) if hourly_cap > 0 else 0
+            if hourly_cap > 0 and sent_last_hour >= hourly_cap:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"rolling_hour_email_cap_reached ({sent_last_hour}/{hourly_cap})"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
