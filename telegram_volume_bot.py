@@ -3353,6 +3353,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     inherited_open_positions = 0
     opened_today_count = 0
     closed_today_count = 0
+    closed_today_rows = []
     position_classifications = []
 
     try:
@@ -3364,20 +3365,14 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
             )
             row = cur.fetchone()
             opened_today_count = int((row[0] if row else 0) or 0)
-            cur.execute(
-                "SELECT COUNT(*) FROM autotrade_trades WHERE uid=? AND closed_ts IS NOT NULL AND closed_ts>=? AND closed_ts<?",
-                (int(uid), int(start_ts), int(end_ts)),
-            )
-            row = cur.fetchone()
-            closed_today_count = int((row[0] if row else 0) or 0)
     except Exception:
         opened_today_count = 0
+    try:
+        closed_today_rows = _autotrade_db_closed_trades_window(int(uid), float(start_ts), float(end_ts)) or []
+        closed_today_count = int(len(closed_today_rows))
+    except Exception:
+        closed_today_rows = []
         closed_today_count = 0
-    if mode == "live":
-        try:
-            closed_today_count = int((closed_summary or {}).get('count') or 0)
-        except Exception:
-            closed_today_count = 0
 
     journal_open = []
     try:
@@ -3502,6 +3497,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         "inherited_open_positions": int(inherited_open_positions),
         "opened_today_count": int(opened_today_count),
         "closed_today_count": int(closed_today_count),
+        "closed_today_rows": closed_today_rows,
         "day_start_ts": float(start_ts),
         "day_end_ts": float(end_ts),
         "position_classifications": position_classifications,
@@ -3587,6 +3583,18 @@ def _autotrade_db_open_trades(uid: int) -> list[dict]:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         c.execute("SELECT * FROM autotrade_trades WHERE uid=? AND status='OPEN' ORDER BY opened_ts DESC", (uid,))
+        return [dict(r) for r in c.fetchall()]
+
+def _autotrade_db_closed_trades_window(uid: int, start_ts: float, end_ts: float) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute(
+            """SELECT * FROM autotrade_trades
+               WHERE uid=? AND closed_ts IS NOT NULL AND closed_ts>=? AND closed_ts<?
+               ORDER BY closed_ts DESC""",
+            (int(uid), float(start_ts), float(end_ts)),
+        )
         return [dict(r) for r in c.fetchall()]
 
 AUTOTRADE_SYMBOL_GUARD_TTL_SEC = int(os.environ.get("AUTOTRADE_SYMBOL_GUARD_TTL_SEC", "1800") or 1800)
@@ -7848,6 +7856,7 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         "open_positions_now": 0,
         "positions_opened_today": 0,
         "positions_closed_today": 0,
+        "closed_today_rows": [],
         "inherited_open_positions": 0,
         "remaining_new_positions_today": 0,
         "realized_loss_today": 0.0,
@@ -7875,6 +7884,7 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["open_positions_now"] = int(m.get("open_positions_now") or 0)
         snap["positions_opened_today"] = int(m.get("opened_today_count") or 0)
         snap["positions_closed_today"] = int(m.get("closed_today_count") or 0)
+        snap["closed_today_rows"] = list(m.get("closed_today_rows") or [])
         snap["inherited_open_positions"] = int(m.get("inherited_open_positions") or 0)
         snap["realized_loss_today"] = float(m.get("realized_loss_today") or 0.0)
         snap["used_today"] = float(m.get("used_total") or 0.0)
@@ -19431,6 +19441,18 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"⚠️ Over daily cap by ${over_by:.2f}")
 
     if is_admin:
+        closed_today_rows = list(snap.get('closed_today_rows') or [])
+        if closed_today_rows:
+            lines.extend([SEP, f"Closed today list: {len(closed_today_rows)}"])
+            for t in closed_today_rows[:8]:
+                try:
+                    sym = str(t.get('symbol') or '').upper()
+                    side = str(t.get('side') or '').upper()
+                    outcome = str(t.get('outcome') or 'NONE').upper() or 'NONE'
+                    pnl_val = float(t.get('pnl_usdt') if t.get('pnl_usdt') is not None else t.get('pnl') or 0.0)
+                    lines.append(f"• {side} {sym} | {outcome} | PnL {pnl_val:+.2f} USDT")
+                except Exception:
+                    continue
         live_positions = _bybit_get_open_positions_linear()
         lines.extend([SEP, f"Open positions list: {len(live_positions)}"])
         if not live_positions:
