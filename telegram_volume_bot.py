@@ -10017,31 +10017,71 @@ def _historical_setup_features(closes: list[float], vols: list[float], ema13: li
     }
 
 
+def _hist_pct_change(closes: list[float], i: int, bars_back: int) -> float:
+    try:
+        idx = int(i)
+        back = max(1, int(bars_back or 1))
+        if idx - back < 0 or idx >= len(closes):
+            return 0.0
+        prev = float(closes[idx - back] or 0.0)
+        curr = float(closes[idx] or 0.0)
+        return float(((curr - prev) / prev) * 100.0) if prev else 0.0
+    except Exception:
+        return 0.0
+
+
+def _hist_quote_volume_usd(ohlcv: list, closes: list[float], i: int, tf: str) -> float:
+    """Best-effort historical 24h quote-volume estimate."""
+    try:
+        tf_min = max(1, _tf_to_minutes(tf))
+        bars_24h = max(1, int(round(1440.0 / float(tf_min))))
+        end_i = min(int(i), len(ohlcv) - 1)
+        start_i = max(0, end_i - bars_24h + 1)
+        total = 0.0
+        for j in range(start_i, end_i + 1):
+            row = ohlcv[j]
+            turnover = 0.0
+            try:
+                if len(row) >= 7:
+                    turnover = float(row[6] or 0.0)
+            except Exception:
+                turnover = 0.0
+            if turnover > 0:
+                total += abs(turnover)
+                continue
+            try:
+                vol = float(row[5] or 0.0)
+            except Exception:
+                vol = 0.0
+            close = float(closes[j] or 0.0) if j < len(closes) else 0.0
+            total += abs(close * vol)
+        return float(total)
+    except Exception:
+        return 0.0
+
+
 def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: str = "NY") -> list:
-    """Generate setups from historical bars using the same *architecture* (A-E).
-    Returns list of Setup-like dicts.
-    """
+    """Generate historical setups with realistic live-grade proxy fields."""
     ohlcv = _sanitize_ohlcv_rows(ohlcv)
     if not ohlcv or len(ohlcv) < 250:
         return []
 
     closes = [float(x[4]) for x in ohlcv]
-    highs  = [float(x[2]) for x in ohlcv]
-    lows   = [float(x[3]) for x in ohlcv]
-    opens  = [float(x[1]) for x in ohlcv]
-    vols   = [float(x[5] or 0.0) for x in ohlcv]
+    highs = [float(x[2]) for x in ohlcv]
+    lows = [float(x[3]) for x in ohlcv]
+    opens = [float(x[1]) for x in ohlcv]
+    vols = [float(x[5] or 0.0) for x in ohlcv]
 
     ema13 = _ema_series(closes, 13)
     ema21 = _ema_series(closes, 21)
-    atr   = _atr_series(ohlcv, 14)
+    atr = _atr_series(ohlcv, 14)
 
     global _BT_LAST_REJECTS
     _BT_LAST_REJECTS = Counter()
 
     setups = []
-    warm = 80
+    warm = 120
 
-    # Pull regime thresholds from StrategyConfig (single source of truth)
     cfg = load_strategy_config(force=False)
     slope_thr = float(cfg.get("regime_slope_trend_min_pct", 0.06))
     atr_lo = float(cfg.get("regime_atr_pct_min", 0.7))
@@ -10049,11 +10089,15 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
     unstable_hi = float(cfg.get("regime_unstable_atr_hi", 10.5))
     unstable_lo = float(cfg.get("regime_unstable_atr_lo", 0.3))
 
+    tf_min = max(1, _tf_to_minutes(tf))
+    bars_15m = max(1, int(round(15.0 / float(tf_min))))
+    bars_1h = max(1, int(round(60.0 / float(tf_min))))
+    bars_4h = max(1, int(round(240.0 / float(tf_min))))
+    bars_24h = max(1, int(round(1440.0 / float(tf_min))))
+    warm = max(warm, bars_24h + 5)
 
     for i in range(warm, len(ohlcv) - 2):
         px = closes[i]
-
-        # Session gating (optional)
         try:
             ts_raw = float(ohlcv[i][0] or 0.0)
             ts_sec = (ts_raw / 1000.0) if ts_raw > 1e12 else ts_raw
@@ -10068,8 +10112,7 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
         if px <= 0:
             continue
 
-        # --- A) Regime (light gate) ---
-        slope = (ema21[i] - ema21[i-3]) / px * 100.0 if i >= 3 else 0.0
+        slope = (ema21[i] - ema21[i - 3]) / px * 100.0 if i >= 3 else 0.0
         atr_pct = (atr[i] / px * 100.0) if atr and atr[i] else 0.0
 
         regime = "RANGING"
@@ -10077,48 +10120,40 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
             regime = "TRENDING"
         if atr_pct >= unstable_hi or atr_pct <= unstable_lo:
             regime = "UNSTABLE"
-
         if regime == "UNSTABLE":
             try:
                 _BT_LAST_REJECTS["regime_unstable"] += 1
             except Exception:
                 pass
-            continue  # hard gate
+            continue
 
-        # --- B) Trend/Bias ---
         bias = "NONE"
         if ema13[i] > ema21[i] and slope > 0:
             bias = "BUY"
         elif ema13[i] < ema21[i] and slope < 0:
             bias = "SELL"
-        else:
-            bias = "NONE"
-
         if bias == "NONE":
             continue
 
-        # --- C) Triggers (pullback OR breakout) ---
         trigger = None
         side = bias
-        # pullback: price dipped through EMA13 then reclaimed with a strong candle
         if side == "BUY":
-            dipped = min(lows[i-3:i+1]) < ema13[i] * (1.0 - 0.0015)
-            reclaimed = closes[i] > ema13[i] and closes[i-1] < ema13[i-1]
+            dipped = min(lows[i - 3:i + 1]) < ema13[i] * (1.0 - 0.0015)
+            reclaimed = closes[i] > ema13[i] and closes[i - 1] < ema13[i - 1]
             strength = _candle_strength(opens[i], highs[i], lows[i], closes[i], side)
             if dipped and reclaimed and strength >= 0.60:
                 trigger = "PULLBACK"
         else:
-            spiked = max(highs[i-3:i+1]) > ema13[i] * (1.0 + 0.0015)
-            reclaimed = closes[i] < ema13[i] and closes[i-1] > ema13[i-1]
+            spiked = max(highs[i - 3:i + 1]) > ema13[i] * (1.0 + 0.0015)
+            reclaimed = closes[i] < ema13[i] and closes[i - 1] > ema13[i - 1]
             strength = _candle_strength(opens[i], highs[i], lows[i], closes[i], side)
             if spiked and reclaimed and strength >= 0.60:
                 trigger = "PULLBACK"
 
-        # breakout: 20-bar range break with volume
         if trigger is None and regime == "TRENDING":
-            hh20 = max(highs[i-20:i]) if i >= 20 else highs[i]
-            ll20 = min(lows[i-20:i]) if i >= 20 else lows[i]
-            vavg = (sum(vols[i-20:i]) / 20.0) if i >= 20 else vols[i]
+            hh20 = max(highs[i - 20:i]) if i >= 20 else highs[i]
+            ll20 = min(lows[i - 20:i]) if i >= 20 else lows[i]
+            vavg = (sum(vols[i - 20:i]) / 20.0) if i >= 20 else vols[i]
             vnow = vols[i]
             if side == "BUY" and closes[i] > hh20 and vnow >= max(1.0, vavg) * 1.10:
                 trigger = "BREAKOUT"
@@ -10128,37 +10163,44 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
         if trigger is None:
             continue
 
-        # --- D) Risk construction (ATR/structure stop + R targets) ---
-        entry = opens[i+1]  # next bar open (deterministic)
+        entry = opens[i + 1]
         if entry <= 0:
             continue
 
         if side == "BUY":
-            sl = min(lows[i-5:i+1]) if i >= 5 else lows[i]
+            sl = min(lows[i - 5:i + 1]) if i >= 5 else lows[i]
             sl = min(sl, entry - (atr[i] * 1.2 if atr and atr[i] else entry * 0.01))
             if sl >= entry:
                 continue
         else:
-            sl = max(highs[i-5:i+1]) if i >= 5 else highs[i]
+            sl = max(highs[i - 5:i + 1]) if i >= 5 else highs[i]
             sl = max(sl, entry + (atr[i] * 1.2 if atr and atr[i] else entry * 0.01))
             if sl <= entry:
                 continue
 
         R = abs(entry - sl)
         tp3 = entry + 2.2 * R if side == "BUY" else entry - 2.2 * R
-
         t1, t2, t3 = _ensure_three_tps(entry, sl, tp3, None, None, side)
 
-        # synthetic "conf" from components (kept consistent with live scoring)
-        conf = 60
-        conf += 6 if trigger == "PULLBACK" else 4
-        conf += 6 if regime == "TRENDING" else 1
-        conf += int(min(10, max(0.0, abs(slope) * 40)))
+        ch15 = _hist_pct_change(closes, i, bars_15m)
+        ch1 = _hist_pct_change(closes, i, bars_1h)
+        ch4 = _hist_pct_change(closes, i, bars_4h)
+        ch24 = _hist_pct_change(closes, i, bars_24h)
+        fut_vol_usd = _hist_quote_volume_usd(ohlcv, closes, i, tf)
+        ema_dist_pct = abs(entry - ema13[i]) / entry * 100.0 if entry > 0 and ema13[i] > 0 else 0.0
+
+        conf = int(compute_confidence(side, ch24, ch4, ch1, ch15, fut_vol_usd))
+        if trigger == "PULLBACK":
+            conf += 4
+        elif trigger == "BREAKOUT":
+            conf += 2
+        if regime == "TRENDING":
+            conf += 2
         conf = int(clamp(conf, 0, 95))
 
         s = Setup(
             setup_id=f"BT-{i}",
-            symbol=str(symbol).upper().replace("USDT",""),
+            symbol=str(symbol).upper().replace("USDT", ""),
             market_symbol=str(symbol).upper(),
             side=side,
             conf=int(conf),
@@ -10167,17 +10209,17 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
             tp1=float(t1),
             tp2=float(t2),
             tp3=float(t3),
-            fut_vol_usd=float(0.0),
-            ch24=float(0.0),
-            ch4=float(0.0),
-            ch1=float(0.0),
-            ch15=float(0.0),
+            fut_vol_usd=float(fut_vol_usd),
+            ch24=float(ch24),
+            ch4=float(ch4),
+            ch1=float(ch1),
+            ch15=float(ch15),
             ema_support_period=13,
-            ema_support_dist_pct=0.0,
+            ema_support_dist_pct=float(ema_dist_pct),
             pullback_ema_period=13,
-            pullback_ema_dist_pct=0.0,
-            pullback_ready=True,
-            pullback_bypass_hot=False,
+            pullback_ema_dist_pct=float(ema_dist_pct),
+            pullback_ready=bool(trigger == "PULLBACK"),
+            pullback_bypass_hot=bool(fut_vol_usd >= 50_000_000.0 and abs(ch24) >= 5.0),
             leader_base_override=False,
             engine="A" if trigger == "PULLBACK" else "B",
             is_trailing_tp3=False,
@@ -10185,16 +10227,15 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
         )
         setattr(s, "atr_pct", float(atr_pct))
         setattr(s, "regime", regime)
+        setattr(s, "trend", "BULLISH" if side == "BUY" else "BEARISH")
+        setattr(s, "structure", getattr(s, "trend"))
         try:
             setattr(s, "session", _session_label_from_ts(getattr(s, "created_ts", 0.0)))
         except Exception:
             pass
-        setattr(s, "trend", "BULLISH" if side == "BUY" else "BEARISH")
-        setattr(s, "structure", getattr(s, "trend"))
         score, _ = compute_setup_quality_score(s, session_name=session_name)
         setattr(s, "quality_score", float(score))
 
-        # E) Score threshold
         if float(score) >= float(QUALITY_SCORE_MIN_SCREEN):
             setups.append(s)
         else:
