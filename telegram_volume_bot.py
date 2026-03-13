@@ -21342,7 +21342,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cache_entry = _SCREEN_CACHE.get(cache_key) or {}
         msg = (header + "\n" + str(cache_entry.get("body") or "")).strip()
         sync_info = dict(cache_entry.get("sync_info") or {})
-        if sync_info:
+        if sync_info and is_admin_user(int(update.effective_user.id)):
             sync_status = str(sync_info.get("status") or "").strip().lower()
             sync_reason = str(sync_info.get("reason") or "").strip()
             if sync_status == 'sent':
