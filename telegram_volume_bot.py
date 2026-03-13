@@ -16153,17 +16153,23 @@ def in_session_now(user: dict) -> Optional[dict]:
     now_local = datetime.now(tz)
     now_utc = now_local.astimezone(timezone.utc)
 
-    # NEW: unlimited mode => always return a session key and bypass session gating
-    # In this mode, email setups are allowed 24/7 (subject to caps & gap).
+    # Unlimited mode is an ACCESS mode, not a synthetic market session.
+    # We still need to resolve to a real setup bucket (ASIA/LON/NY), otherwise
+    # the email pipeline will look for setups under "UNLIMITED" and find none.
+    # During the 1-hour gap between NY close and ASIA open, fall back to the
+    # scan-session heuristic so 24h emailing can still work.
     if int(user.get("sessions_unlimited", 0) or 0) == 1:
-        name = "UNLIMITED"
-        session_key = f"{now_utc.strftime('%Y-%m-%d')}_{name}"
+        name = current_session_utc(now_utc)
+        if name == "NONE":
+            name = scan_session_name_utc(now_utc)
+        session_key = f"{now_utc.strftime('%Y-%m-%d')}_{name}_UNLIMITED"
         return {
-            "name": name,
+            "name": str(name or "NY"),
             "session_key": session_key,
             "start_utc": now_utc,
             "end_utc": now_utc,
             "now_local": now_local,
+            "access_mode": "UNLIMITED",
         }
 
     enabled = user_enabled_sessions(user)
