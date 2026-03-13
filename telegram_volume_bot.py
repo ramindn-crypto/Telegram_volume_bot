@@ -4961,6 +4961,7 @@ class Setup:
     pullback_ema_dist_pct: float
     pullback_ready: bool          # True => pullback happened / entry quality
     pullback_bypass_hot: bool     # True => volume>=50M bypass (no pullback needed)
+    leader_base_override: bool    # True => clean leader-base continuation override qualified
 
     # ✅ engine label (A pullback / B momentum)
     engine: str
@@ -21342,7 +21343,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cache_entry = _SCREEN_CACHE.get(cache_key) or {}
         msg = (header + "\n" + str(cache_entry.get("body") or "")).strip()
         sync_info = dict(cache_entry.get("sync_info") or {})
-        if sync_info and is_admin_user(int(update.effective_user.id)):
+        if sync_info:
             sync_status = str(sync_info.get("status") or "").strip().lower()
             sync_reason = str(sync_info.get("reason") or "").strip()
             if sync_status == 'sent':
