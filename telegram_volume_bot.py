@@ -15636,6 +15636,103 @@ def user_email_alerts_enabled(user: dict) -> bool:
 def set_user_email_alerts_enabled(uid: int, enabled: bool):
     update_user(int(uid), email_alerts_enabled=(1 if enabled else 0))
 
+
+def _mask_email_addr(email: str) -> str:
+    try:
+        email = str(email or '').strip()
+        if not email or '@' not in email:
+            return '(none)'
+        local, domain = email.split('@', 1)
+        if not local:
+            return f"***@{domain}"
+        if len(local) <= 2:
+            masked_local = local[0] + '*' * max(1, len(local) - 1)
+        else:
+            masked_local = local[0] + ('*' * max(1, len(local) - 2)) + local[-1]
+        return f"{masked_local}@{domain}"
+    except Exception:
+        return '(none)'
+
+
+def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
+    user = dict(user or {})
+    try:
+        tz = ZoneInfo(str(user.get('tz') or 'UTC'))
+    except Exception:
+        tz = timezone.utc
+    day_local = datetime.now(tz).date().isoformat()
+    recipient = str(user.get('email_to') or user.get('email') or '').strip()
+    alerts_on = bool(user_email_alerts_enabled(user))
+    smtp_ready = bool(EMAIL_ENABLED and email_config_ok())
+
+    try:
+        st = email_state_get(int(uid))
+    except Exception:
+        st = {'session_key': 'NONE', 'sent_count': 0, 'last_email_ts': 0.0}
+
+    try:
+        session_cap = int(user.get('max_emails_per_session', DEFAULT_MAX_EMAILS_PER_SESSION))
+    except Exception:
+        session_cap = int(DEFAULT_MAX_EMAILS_PER_SESSION)
+    try:
+        gap_min = int(user.get('email_gap_min', DEFAULT_MIN_EMAIL_GAP_MIN))
+    except Exception:
+        gap_min = int(DEFAULT_MIN_EMAIL_GAP_MIN)
+    try:
+        day_cap = int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))
+    except Exception:
+        day_cap = int(DEFAULT_MAX_EMAILS_PER_DAY)
+
+    try:
+        sent_in_session = int(st.get('sent_count', 0) or 0)
+    except Exception:
+        sent_in_session = 0
+    try:
+        last_email_ts = float(st.get('last_email_ts', 0.0) or 0.0)
+    except Exception:
+        last_email_ts = 0.0
+    try:
+        sent_today = int(_email_daily_get(int(uid), day_local))
+    except Exception:
+        sent_today = 0
+
+    gap_sec = max(0, int(gap_min)) * 60
+    gap_remaining_sec = max(0, int(round(gap_sec - (time.time() - last_email_ts)))) if gap_sec > 0 and last_email_ts > 0 else 0
+
+    reasons = []
+    if not alerts_on:
+        reasons.append('email_alerts_disabled')
+    if not recipient:
+        reasons.append('no_recipient_email_set')
+    if not EMAIL_ENABLED:
+        reasons.append('EMAIL_ENABLED=0')
+    elif not smtp_ready:
+        reasons.append('smtp_not_configured')
+    if day_cap > 0 and sent_today >= day_cap:
+        reasons.append(f'daily_email_cap_reached ({sent_today}/{day_cap})')
+    if session_cap > 0 and sent_in_session >= session_cap:
+        reasons.append(f'session_email_cap_reached ({sent_in_session}/{session_cap})')
+    if gap_remaining_sec > 0:
+        reasons.append(f'email_gap_active ({gap_remaining_sec}s remaining)')
+
+    return {
+        'alerts_on': alerts_on,
+        'smtp_ready': smtp_ready,
+        'recipient': recipient,
+        'recipient_masked': _mask_email_addr(recipient),
+        'session_key': str(st.get('session_key') or 'NONE'),
+        'sent_in_session': sent_in_session,
+        'session_cap': session_cap,
+        'sent_today': sent_today,
+        'day_cap': day_cap,
+        'gap_min': gap_min,
+        'gap_remaining_sec': gap_remaining_sec,
+        'last_email_ts': last_email_ts,
+        'gate_open': len(reasons) == 0,
+        'gate_reasons': reasons,
+        'day_local': day_local,
+    }
+
 async def email_on_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User command to enable/disable ALL email alerts without removing the saved email address."""
     uid = update.effective_user.id
@@ -18498,6 +18595,16 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur_s = (user.get('trade_window_start') or '').strip()
     cur_e = (user.get('trade_window_end') or '').strip()
     tw_txt = 'OFF' if (not cur_s or not cur_e) else f"{cur_s} → {cur_e} (local)"
+    email_gate = _email_runtime_limits_snapshot(int(uid), user)
+    email_alerts_on = 'ON' if bool(email_gate.get('alerts_on')) else 'OFF'
+    session_cap_txt = '∞' if int(email_gate.get('session_cap', 0) or 0) <= 0 else str(int(email_gate.get('session_cap', 0) or 0))
+    day_cap_txt = '∞' if int(email_gate.get('day_cap', 0) or 0) <= 0 else str(int(email_gate.get('day_cap', 0) or 0))
+    gap_remaining = int(email_gate.get('gap_remaining_sec', 0) or 0)
+    gap_txt = f"{int(email_gate.get('gap_min', 0) or 0)}m"
+    if gap_remaining > 0:
+        gap_txt += f" (remaining {_fmt_dur(gap_remaining)})"
+    email_lane_txt = 'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'
+    email_lane_reason = ', '.join([str(r) for r in (email_gate.get('gate_reasons') or [])[:3]])
 
     lines = [
         '📌 Status',
@@ -18524,7 +18631,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Daily risk remaining: {'∞' if not math.isfinite(float(remaining_today)) else f'${float(remaining_today):.2f}'}",
         SEP,
         'Alerts & sessions',
-        f"• Email alerts: {'ON' if int(user.get('notify_on',1))==1 else 'OFF'}",
+        f"• Email alerts: {email_alerts_on}",
+        f"• Email recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
+        f"• Email cap/session: {int(email_gate.get('sent_in_session', 0) or 0)}/{session_cap_txt}",
+        f"• Email day cap: {int(email_gate.get('sent_today', 0) or 0)}/{day_cap_txt}",
+        f"• Email gap: {gap_txt}",
+        f"• Email lane: {email_lane_txt}" + (f" | {email_lane_reason}" if email_lane_reason else ''),
         f"• Sessions enabled: {' | '.join(enabled)}",
         f"• Now: {now_txt}",
         f"• Trade window: {tw_txt}",
@@ -19644,6 +19756,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     equity = float(snap.get('equity') or 0.0)
     mday = _autotrade_day_risk_metrics(int(owner), float(equity))
     dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
+    email_gate = _email_runtime_limits_snapshot(int(owner), user)
 
     reasons = []
     if not AUTOTRADE_ENABLED:
@@ -19652,6 +19765,30 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         reasons.append('AUTOTRADE_OWNER_UID missing/0')
     if str(AUTOTRADE_MODE).lower() == 'live' and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
         reasons.append('missing BYBIT_API_KEY/SECRET')
+
+    session_cap_txt = '∞' if int(email_gate.get('session_cap', 0) or 0) <= 0 else str(int(email_gate.get('session_cap', 0) or 0))
+    day_cap_txt = '∞' if int(email_gate.get('day_cap', 0) or 0) <= 0 else str(int(email_gate.get('day_cap', 0) or 0))
+    gap_remaining = int(email_gate.get('gap_remaining_sec', 0) or 0)
+    gate_reason = ', '.join([str(r) for r in (email_gate.get('gate_reasons') or [])[:3]])
+
+    exec_recent = 0
+    emailed_recent = 0
+    try:
+        con = db_connect()
+        cur = con.cursor()
+        since_ts = time.time() - 12 * 3600
+        cur.execute("SELECT COUNT(1) AS n FROM executable_setups WHERE user_id=? AND executable_ts>=?", (int(owner), float(since_ts)))
+        row = cur.fetchone()
+        exec_recent = int((row or {}).get('n', 0) or 0)
+        cur.execute("SELECT COUNT(1) AS n FROM emailed_setups WHERE user_id=? AND emailed_ts>=?", (int(owner), float(since_ts)))
+        row = cur.fetchone()
+        emailed_recent = int((row or {}).get('n', 0) or 0)
+        con.close()
+    except Exception:
+        try:
+            con.close()
+        except Exception:
+            pass
 
     lines = [
         '🧪 AutoTrade Debug',
@@ -19665,6 +19802,16 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Realised net today: ${float(snap.get('pnl_today') or 0.0):+.2f}",
         f"Daily risk used (open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
         ('Daily risk remaining: ∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f"Daily risk remaining: ${float(snap.get('remaining_today')):.2f}"),
+        SEP,
+        'Email → executable lane',
+        f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
+        f"Alerts: {'ON' if bool(email_gate.get('alerts_on')) else 'OFF'} | SMTP: {'READY' if bool(email_gate.get('smtp_ready')) else 'NOT READY'}",
+        f"Session email cap: {int(email_gate.get('sent_in_session', 0) or 0)}/{session_cap_txt}",
+        f"Daily email cap: {int(email_gate.get('sent_today', 0) or 0)}/{day_cap_txt}",
+        f"Email gap: {int(email_gate.get('gap_min', 0) or 0)}m" + (f" (remaining {_fmt_dur(gap_remaining)})" if gap_remaining > 0 else ''),
+        f"Executable lane: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'}" + (f" | {gate_reason}" if gate_reason else ''),
+        f"Recent emailed setups (12h): {emailed_recent}",
+        f"Recent executable setups (12h): {exec_recent}",
     ]
     if reasons and not ready:
         lines.extend([SEP, 'Blocking reasons'])
@@ -19672,7 +19819,10 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             lines.append(f"• {r}")
     if dec:
         lines.extend([SEP, 'Last decision'])
-        lines.append(f"• {dec.get('status','')} | {dec.get('reason','')}")
+        dec_reason = str(dec.get('reason') or '').strip()
+        if not dec_reason and isinstance(dec.get('reasons'), list):
+            dec_reason = ', '.join([str(r) for r in (dec.get('reasons') or [])[:3]])
+        lines.append(f"• {dec.get('status','')} | {dec_reason}")
     class_rows = mday.get('position_classifications') or []
     if class_rows:
         lines.extend([SEP, 'Position day buckets'])
@@ -20880,6 +21030,10 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
 
     This keeps manual scans aligned with the live pipeline instead of waiting for the
     background email job to rediscover the same setup later.
+
+    IMPORTANT:
+    Manual /screen sync must honor the same email-session caps, daily caps, email gap,
+    cooldowns, and executable qualification rules as the background email pipeline.
     """
     try:
         if not shown_setups:
@@ -20891,6 +21045,7 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
         if scan_session and scan_session != live_session:
             return {"status": "skip", "reason": f"session_mismatch ({scan_session}->{live_session})"}
 
+        user = dict(user or {})
         try:
             sess = in_session_now(user or {})
         except Exception:
@@ -20900,8 +21055,32 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
         if str(sess.get('name') or '').upper().strip() != live_session:
             return {"status": "skip", "reason": f"user_session_mismatch ({str(sess.get('name') or '').upper()}!={live_session})"}
 
+        try:
+            st = email_state_get(int(uid))
+        except Exception as e:
+            return {"status": "error", "reason": f"email_state_get_failed ({type(e).__name__})"}
+
+        try:
+            sess_key = str(sess.get('session_key') or '')
+            if str(st.get('session_key')) != sess_key:
+                email_state_set(int(uid), session_key=sess_key, sent_count=0, last_email_ts=0.0)
+                st = email_state_get(int(uid))
+        except Exception:
+            pass
+
+        email_gate = _email_runtime_limits_snapshot(int(uid), user)
+        if not bool(email_gate.get('gate_open')):
+            reason = ', '.join([str(r) for r in (email_gate.get('gate_reasons') or [])[:3]]) or 'email_gate_blocked'
+            _LAST_EMAIL_DECISION[int(uid)] = {
+                'status': 'SKIP',
+                'reasons': [reason],
+                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            }
+            return {"status": "skip", "reason": f"screen_sync_blocked ({reason})"}
+
         actionable = []
         skipped = []
+        seen_keys = set()
         for s in (shown_setups or []):
             sid = str(getattr(s, 'setup_id', '') or '').strip()
             if not sid:
@@ -20914,6 +21093,28 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             if db_has_executable_setup(int(uid), sid, lookback_hours=12):
                 skipped.append('already_executable')
                 continue
+            sym = str(getattr(s, 'symbol', '') or '').upper()
+            side = str(getattr(s, 'side', '') or '').upper()
+            if symbol_flip_guard_active(int(uid), sym, side, live_session):
+                skipped.append('flip_guard_blocked')
+                continue
+            if symbol_recently_emailed(int(uid), sym, side, live_session):
+                skipped.append('cooldown_blocked')
+                continue
+            try:
+                dedupe_key = (
+                    sym,
+                    side,
+                    round(float(getattr(s, 'entry', 0.0) or 0.0), 8),
+                    round(float(getattr(s, 'sl', 0.0) or 0.0), 8),
+                    round(float(getattr(s, 'tp3', 0.0) or 0.0), 8),
+                )
+            except Exception:
+                dedupe_key = (sym, side, sid)
+            if dedupe_key in seen_keys:
+                skipped.append('duplicate_candidate')
+                continue
+            seen_keys.add(dedupe_key)
             actionable.append(s)
 
         if not actionable:
@@ -20928,8 +21129,33 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             best_fut,
         )
         if sent:
+            try:
+                sent_count_now = int(st.get('sent_count', 0) or 0)
+            except Exception:
+                sent_count_now = 0
+            try:
+                email_state_set(int(uid), last_email_ts=time.time(), sent_count=sent_count_now + 1)
+            except Exception:
+                pass
+            try:
+                _email_daily_inc(int(uid), str(email_gate.get('day_local') or ''))
+            except Exception:
+                pass
+            for s in actionable:
+                try:
+                    mark_symbol_emailed(int(uid), s.symbol, s.side, live_session)
+                except Exception:
+                    pass
             return {"status": "sent", "reason": f"synced {len(actionable)} setup(s)", "setup_ids": [str(getattr(s, 'setup_id', '') or '') for s in actionable]}
-        return {"status": "skip", "reason": "screen_sync_email_send_failed"}
+
+        fail_reason = ''
+        try:
+            dec = _LAST_EMAIL_DECISION.get(int(uid)) or {}
+            fail_reason = ', '.join([str(r) for r in (dec.get('reasons') or [])[:2]]) or str(dec.get('reason') or '')
+        except Exception:
+            fail_reason = ''
+        fail_reason = fail_reason or str(_LAST_SMTP_ERROR.get(int(uid)) or 'screen_sync_email_send_failed')
+        return {"status": "skip", "reason": f"screen_sync_email_send_failed ({fail_reason})"}
     except Exception as e:
         return {"status": "error", "reason": f"screen_sync_exception ({type(e).__name__}: {e})"}
 
