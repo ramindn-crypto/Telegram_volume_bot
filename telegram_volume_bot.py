@@ -1090,6 +1090,11 @@ def _strategy_config_defaults() -> dict:
         "universe_backtest_min_vol_usd": 10000000.0,
         "universe_backtest_windows": [7, 30],
         "universe_backtest_exec_tf": "15m",
+        "universe_backtest_final_day_cap": 4,
+        "universe_backtest_final_score_buffer": 8.0,
+        "universe_backtest_final_min_conf": 70,
+        "universe_backtest_final_min_gap_minutes": 90,
+        "universe_backtest_final_symbol_day_cap": 1,
     }
 
 _STRATEGY_CFG_CACHE = {"ts": 0.0, "cfg": None}
@@ -12115,34 +12120,42 @@ def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | No
                         live_reject_acc[why] += 1
     raw_overall, raw_per_day, raw_by_session = _summarize_universe_rows(rows, days=float(d), live_only=False)
     live_overall, live_per_day, live_by_session = _summarize_universe_rows(rows, days=float(d), live_only=True)
+    final_rows, final_blockers, final_meta = _apply_final_sale_grade_filter(rows, cfg, session_mode=session_mode)
+    final_overall, final_per_day, final_by_session = _summarize_universe_rows(final_rows, days=float(d), live_only=False)
     metrics = {
         'days': d,
         'session_mode': session_mode,
         'exec_tf': exec_tf,
-        'preferred_view': 'live_equivalent',
-        'overall': dict(live_overall),
+        'preferred_view': 'final_sale_grade',
+        'overall': dict(final_overall),
+        'final_sale_grade_overall': dict(final_overall),
         'live_equivalent_overall': dict(live_overall),
         'raw_overall': dict(raw_overall),
-        'overall_win_rate': float(live_overall.get('win_rate', 0.0) or 0.0),
-        'total_setups': int(live_overall.get('setups', 0) or 0),
-        'avg_setups_per_day': float(live_overall.get('setups_per_day', 0.0) or 0.0),
+        'overall_win_rate': float(final_overall.get('win_rate', 0.0) or 0.0),
+        'total_setups': int(final_overall.get('setups', 0) or 0),
+        'avg_setups_per_day': float(final_overall.get('setups_per_day', 0.0) or 0.0),
+        'live_equivalent_total_setups': int(live_overall.get('setups', 0) or 0),
+        'live_equivalent_avg_setups_per_day': float(live_overall.get('setups_per_day', 0.0) or 0.0),
         'raw_total_setups': int(raw_overall.get('setups', 0) or 0),
         'raw_avg_setups_per_day': float(raw_overall.get('setups_per_day', 0.0) or 0.0),
-        'by_session': dict(live_by_session),
+        'by_session': dict(final_by_session),
+        'final_sale_grade_by_session': dict(final_by_session),
         'live_equivalent_by_session': dict(live_by_session),
         'raw_by_session': dict(raw_by_session),
+        'final_sale_grade_meta': dict(final_meta),
         'universe_size': int(len(universe)),
         'top_n': int(top_n),
         'min_vol_usd': float(min_vol_usd),
         'reject_breakdown': dict(reject_acc),
         'live_equivalent_reject_breakdown': dict(live_reject_acc),
+        'final_sale_grade_reject_breakdown': dict(final_blockers),
         'eval_since_ts': float(eval_since_ms / 1000.0),
         'eval_until_ts': float(eval_until_ms / 1000.0),
         'fetch_errors': int(fetch_errors),
     }
     run_id = ''
     if persist:
-        run_id = _db_save_universe_backtest_run(days=d, session_mode=session_mode, exec_tf=exec_tf, universe_snap_id=str(snap.get('snap_id') or ''), universe_size=len(universe), metrics=metrics, per_day=live_per_day, per_session=live_by_session, notes='auto' if promoted_context else 'manual', promoted_context=bool(promoted_context))
+        run_id = _db_save_universe_backtest_run(days=d, session_mode=session_mode, exec_tf=exec_tf, universe_snap_id=str(snap.get('snap_id') or ''), universe_size=len(universe), metrics=metrics, per_day=final_per_day, per_session=final_by_session, notes='auto' if promoted_context else 'manual', promoted_context=bool(promoted_context))
     return {
         'ok': True,
         'run_id': run_id,
@@ -12152,11 +12165,17 @@ def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | No
         'universe_snap_id': str(snap.get('snap_id') or ''),
         'universe_size': int(len(universe)),
         'metrics': metrics,
-        'overall': dict(live_overall),
+        'overall': dict(final_overall),
+        'final_overall': dict(final_overall),
+        'live_overall': dict(live_overall),
         'raw_overall': dict(raw_overall),
-        'per_day': live_per_day,
+        'per_day': final_per_day,
+        'final_per_day': final_per_day,
+        'live_per_day': live_per_day,
         'raw_per_day': raw_per_day,
-        'per_session': live_by_session,
+        'per_session': final_by_session,
+        'final_per_session': final_by_session,
+        'live_per_session': live_by_session,
         'raw_per_session': raw_by_session,
         'symbol_reports': symbol_reports,
     }
@@ -12166,40 +12185,53 @@ def _format_universe_backtest_report(rep: dict) -> str:
     if not rep:
         return 'No universe backtest report.'
     metrics = rep.get('metrics') or {}
-    overall = rep.get('overall') or metrics.get('overall') or {}
+    overall = rep.get('overall') or rep.get('final_overall') or metrics.get('overall') or {}
+    live_overall = rep.get('live_overall') or metrics.get('live_equivalent_overall') or {}
     raw_overall = rep.get('raw_overall') or metrics.get('raw_overall') or {}
-    per_session = rep.get('per_session') or metrics.get('by_session') or {}
+    per_session = rep.get('per_session') or rep.get('final_per_session') or metrics.get('by_session') or {}
+    live_per_session = rep.get('live_per_session') or metrics.get('live_equivalent_by_session') or {}
     raw_per_session = rep.get('raw_per_session') or metrics.get('raw_by_session') or {}
-    per_day = list(rep.get('per_day') or [])
+    per_day = list(rep.get('per_day') or rep.get('final_per_day') or [])
+    live_per_day = list(rep.get('live_per_day') or [])
     raw_per_day = list(rep.get('raw_per_day') or [])
+    final_meta = metrics.get('final_sale_grade_meta') or {}
     lines = [
         f"🌐 Universe Backtest — {int(rep.get('days') or metrics.get('days') or 0)}d",
         HDR,
         f"TF: {str(rep.get('exec_tf') or metrics.get('exec_tf') or '15m')} | Session: {str(rep.get('session_mode') or metrics.get('session_mode') or 'ALL')} | Universe: {int(rep.get('universe_size') or metrics.get('universe_size') or 0)}",
         f"Window: {datetime.fromtimestamp(float(metrics.get('eval_since_ts', 0.0) or 0.0), tz=timezone.utc).strftime('%Y-%m-%d') if float(metrics.get('eval_since_ts', 0.0) or 0.0) > 0 else '?'} → {datetime.fromtimestamp(float(metrics.get('eval_until_ts', 0.0) or 0.0), tz=timezone.utc).strftime('%Y-%m-%d') if float(metrics.get('eval_until_ts', 0.0) or 0.0) > 0 else '?'} | Fetch errors: {int(metrics.get('fetch_errors', 0) or 0)}",
         f"Raw setups: {int(raw_overall.get('setups', 0) or 0)} | Avg/day: {float(raw_overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(raw_overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(raw_overall.get('avg_R', 0.0) or 0.0):.3f}",
-        f"Live-equivalent setups: {int(overall.get('setups', 0) or 0)} | Avg/day: {float(overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(overall.get('avg_R', 0.0) or 0.0):.3f}",
-        'Per session (raw -> live-equivalent):',
+        f"Live-equivalent setups: {int(live_overall.get('setups', 0) or 0)} | Avg/day: {float(live_overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(live_overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(live_overall.get('avg_R', 0.0) or 0.0):.3f}",
+        f"Final sale-grade setups: {int(overall.get('setups', 0) or 0)} | Avg/day: {float(overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(overall.get('avg_R', 0.0) or 0.0):.3f}",
+        f"Final gate: day_cap={int(final_meta.get('day_cap', 0) or 0)} | score_floor={float(final_meta.get('score_floor', 0.0) or 0.0):.1f} | min_conf={int(final_meta.get('min_conf', 0) or 0)} | min_gap_min={int(final_meta.get('min_gap_minutes', 0) or 0)} | symbol_day_cap={int(final_meta.get('symbol_day_cap', 0) or 0)}",
+        'Per session (raw -> live-equivalent -> final):',
     ]
     for sess in ('NY','LON','ASIA'):
         rd = raw_per_session.get(sess) or {}
-        ld = per_session.get(sess) or {}
-        lines.append(f"• {sess}: raw={int(rd.get('setups',0) or 0)} @ WR {float(rd.get('win_rate',0.0) or 0.0):.1f}% | live={int(ld.get('setups',0) or 0)} @ WR {float(ld.get('win_rate',0.0) or 0.0):.1f}%")
-    if per_day or raw_per_day:
-        lines.append('Per day (raw -> live-equivalent):')
-        live_map = {str(r.get('day') or ''): r for r in per_day}
+        ld = live_per_session.get(sess) or {}
+        fd = per_session.get(sess) or {}
+        lines.append(f"• {sess}: raw={int(rd.get('setups',0) or 0)} @ WR {float(rd.get('win_rate',0.0) or 0.0):.1f}% | live={int(ld.get('setups',0) or 0)} @ WR {float(ld.get('win_rate',0.0) or 0.0):.1f}% | final={int(fd.get('setups',0) or 0)} @ WR {float(fd.get('win_rate',0.0) or 0.0):.1f}%")
+    if per_day or live_per_day or raw_per_day:
+        lines.append('Per day (raw -> live-equivalent -> final):')
+        live_map = {str(r.get('day') or ''): r for r in live_per_day}
+        final_map = {str(r.get('day') or ''): r for r in per_day}
         for row in raw_per_day[:35]:
             day = str(row.get('day') or '')
             live_row = live_map.get(day) or {}
-            rbs = row.get('by_session') or {}
-            lbs = live_row.get('by_session') or {}
+            final_row = final_map.get(day) or {}
             lines.append(
-                f"• {day}: raw={int(row.get('setups',0) or 0)} WR={float(row.get('win_rate',0.0) or 0.0):.1f}% | live={int(live_row.get('setups',0) or 0)} WR={float(live_row.get('win_rate',0.0) or 0.0):.1f}% | raw NY/LON/ASIA={int(rbs.get('NY',0) or 0)}/{int(rbs.get('LON',0) or 0)}/{int(rbs.get('ASIA',0) or 0)} | live NY/LON/ASIA={int(lbs.get('NY',0) or 0)}/{int(lbs.get('LON',0) or 0)}/{int(lbs.get('ASIA',0) or 0)}"
+                f"• {day}: raw={int(row.get('setups',0) or 0)} WR={float(row.get('win_rate',0.0) or 0.0):.1f}% | live={int(live_row.get('setups',0) or 0)} WR={float(live_row.get('win_rate',0.0) or 0.0):.1f}% | final={int(final_row.get('setups',0) or 0)} WR={float(final_row.get('win_rate',0.0) or 0.0):.1f}%"
             )
     rej = metrics.get('live_equivalent_reject_breakdown') or {}
     if isinstance(rej, dict) and rej:
-        top = sorted(rej.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:6]
+        top = sorted(rej.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:5]
         lines.append('Top live-equivalent blockers:')
+        for k, v in top:
+            lines.append(f"• {k} = {int(v or 0)}")
+    frej = metrics.get('final_sale_grade_reject_breakdown') or {}
+    if isinstance(frej, dict) and frej:
+        top = sorted(frej.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:6]
+        lines.append('Top final sale-grade blockers:')
         for k, v in top:
             lines.append(f"• {k} = {int(v or 0)}")
     return "\n".join(lines)
@@ -14326,6 +14358,129 @@ def _summarize_universe_rows(rows: list[dict], days: float, live_only: bool = Fa
         'top_symbol_share': float(top_share),
     }
     return overall, per_day, per_session
+
+
+
+def _apply_final_sale_grade_filter(rows: list[dict], cfg: dict, session_mode: str = 'ALL') -> tuple[list[dict], dict, dict]:
+    """Select a scarce, sale-grade subset from live-equivalent historical rows.
+
+    Goal: make universe backtests reflect the final customer-facing scarcity layer rather
+    than every historically executable candidate. This keeps optimization and learning
+    aligned with the bot's intended 3-5 higher-quality setups/day target.
+    """
+    session_mode = str(session_mode or 'ALL').upper().strip()
+    live_rows = []
+    for rr in (rows or []):
+        if not isinstance(rr, dict):
+            continue
+        if not bool(rr.get('live_equivalent', False)):
+            continue
+        sess = str(rr.get('session') or '').upper().strip()
+        if session_mode != 'ALL' and sess != session_mode:
+            continue
+        live_rows.append(dict(rr))
+
+    blockers = Counter()
+    if not live_rows:
+        meta = {'day_cap': 0, 'session_caps': {}, 'score_floor': 0.0, 'min_conf': 0, 'min_gap_minutes': 0, 'symbol_day_cap': 0}
+        return [], {}, meta
+
+    target_lo = float(cfg.get('target_setups_per_day_lo', 3.0) or 3.0)
+    target_hi = float(cfg.get('target_setups_per_day_hi', 5.0) or 5.0)
+    default_day_cap = int(max(1, round((target_lo + target_hi) / 2.0)))
+    day_cap = int(max(1, cfg.get('universe_backtest_final_day_cap', default_day_cap) or default_day_cap))
+    score_floor = float((cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) + float(cfg.get('universe_backtest_final_score_buffer', 8.0) or 8.0))
+    min_conf = int(max(0, cfg.get('universe_backtest_final_min_conf', 70) or 70))
+    min_gap_minutes = float(max(0.0, cfg.get('universe_backtest_final_min_gap_minutes', 90) or 90))
+    symbol_day_cap = int(max(1, cfg.get('universe_backtest_final_symbol_day_cap', 1) or 1))
+
+    weights = cfg.get('session_weights') or {}
+    if session_mode in ('NY', 'LON', 'ASIA'):
+        session_caps = {session_mode: day_cap}
+    else:
+        raw_weights = {s: max(0.0, float(weights.get(s, 0.0) or 0.0)) for s in ('NY', 'LON', 'ASIA')}
+        if sum(raw_weights.values()) <= 0:
+            raw_weights = {'NY': 0.60, 'LON': 0.25, 'ASIA': 0.15}
+        total_w = max(1e-9, sum(raw_weights.values()))
+        norm = {s: (raw_weights[s] / total_w) for s in ('NY', 'LON', 'ASIA')}
+        session_caps = {s: int(day_cap * norm[s]) for s in ('NY', 'LON', 'ASIA')}
+        assigned = sum(session_caps.values())
+        order = sorted(('NY', 'LON', 'ASIA'), key=lambda s: (-norm[s], s))
+        idx = 0
+        while assigned < day_cap and order:
+            s = order[idx % len(order)]
+            session_caps[s] += 1
+            assigned += 1
+            idx += 1
+        if sum(session_caps.values()) <= 0:
+            session_caps = {'NY': day_cap, 'LON': 0, 'ASIA': 0}
+
+    by_day = defaultdict(list)
+    for rr in live_rows:
+        by_day[str(rr.get('day') or '')].append(rr)
+
+    final_rows = []
+    for day in sorted(by_day):
+        selected = []
+        sess_counts = Counter()
+        sym_counts = Counter()
+        last_kept_ts = None
+        day_rows = sorted(
+            by_day[day],
+            key=lambda rr: (
+                -float(rr.get('score', 0.0) or 0.0),
+                -int(rr.get('conf', 0) or 0),
+                -float(rr.get('rr_final', 0.0) or 0.0),
+                float(rr.get('ts', 0.0) or 0.0),
+                str(rr.get('symbol') or ''),
+            )
+        )
+        for rr in day_rows:
+            sym = str(rr.get('symbol') or '')
+            sess = str(rr.get('session') or '').upper().strip()
+            score = float(rr.get('score', 0.0) or 0.0)
+            conf = int(rr.get('conf', 0) or 0)
+            ts = float(rr.get('ts', 0.0) or 0.0)
+            if score < score_floor:
+                blockers['final_below_score_floor'] += 1
+                continue
+            if conf < min_conf:
+                blockers['final_below_min_conf'] += 1
+                continue
+            if len(selected) >= day_cap:
+                blockers['final_day_cap_reached'] += 1
+                continue
+            if session_caps.get(sess, 0) <= 0:
+                blockers[f'final_session_disabled_{sess or "UNK"}'] += 1
+                continue
+            if sess_counts[sess] >= int(session_caps.get(sess, 0) or 0):
+                blockers[f'final_session_cap_{sess or "UNK"}'] += 1
+                continue
+            if sym and sym_counts[sym] >= symbol_day_cap:
+                blockers['final_symbol_day_cap'] += 1
+                continue
+            if last_kept_ts is not None and min_gap_minutes > 0 and ts > 0 and (ts - last_kept_ts) < (min_gap_minutes * 60.0):
+                blockers['final_min_gap'] += 1
+                continue
+            rr2 = dict(rr)
+            rr2['final_sale_grade'] = True
+            selected.append(rr2)
+            final_rows.append(rr2)
+            sess_counts[sess] += 1
+            if sym:
+                sym_counts[sym] += 1
+            if ts > 0:
+                last_kept_ts = ts
+
+    meta = {
+        'day_cap': int(day_cap),
+        'session_caps': dict(session_caps),
+        'score_floor': float(score_floor),
+        'min_conf': int(min_conf),
+        'min_gap_minutes': float(min_gap_minutes),
+        'symbol_day_cap': int(symbol_day_cap),
+    }
+    return final_rows, dict(blockers), meta
 
 def _normalize_autotune_windows(cfg: dict) -> list[dict]:
     """Safe normalized historical windows for zero-touch optimizer."""
