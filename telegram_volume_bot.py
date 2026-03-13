@@ -9930,10 +9930,34 @@ def _ts_in_session(ts_sec: float, session_name: str) -> bool:
 from collections import Counter as _CounterBT
 _BT_LAST_REJECTS = _CounterBT()
 
+
+def _sanitize_ohlcv_rows(ohlcv: list) -> list:
+    """Return only well-formed numeric OHLCV rows to keep backtests resilient.
+    Filters out rows with missing / non-numeric OHLC values or non-positive prices.
+    """
+    out = []
+    for row in (ohlcv or []):
+        try:
+            if not row or len(row) < 6:
+                continue
+            ts = float(row[0])
+            op = float(row[1])
+            hi = float(row[2])
+            lo = float(row[3])
+            cl = float(row[4])
+            vol = float(row[5] or 0.0)
+            if hi <= 0 or lo <= 0 or op <= 0 or cl <= 0:
+                continue
+            out.append([ts, op, hi, lo, cl, vol])
+        except Exception:
+            continue
+    return out
+
 def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: str = "NY") -> list:
     """Generate setups from historical bars using the same *architecture* (A-E).
     Returns list of Setup-like dicts.
     """
+    ohlcv = _sanitize_ohlcv_rows(ohlcv)
     if not ohlcv or len(ohlcv) < 250:
         return []
 
@@ -11765,6 +11789,7 @@ def _session_mode_matches(target: str, sess: str) -> bool:
 
 
 def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str, session_name: str) -> dict:
+    ohlcv = _sanitize_ohlcv_rows(ohlcv)
     if not ohlcv or len(ohlcv) < 300:
         return {'ok': False, 'error': 'insufficient_ohlcv', 'symbol': symbol, 'tf': tf, 'days': days, 'rows': []}
     setups = _backtest_generate_setups(symbol, ohlcv, tf, session_name=session_name)
@@ -11880,7 +11905,11 @@ def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | No
             ohl = fetch_ohlcv(sym, exec_tf, limit=bars)
         except Exception:
             ohl = []
-        rep = _run_backtest_on_ohlcv_detailed(sym, ohl, days=d, tf=exec_tf, session_name=session_mode)
+        ohl = _sanitize_ohlcv_rows(ohl)
+        try:
+            rep = _run_backtest_on_ohlcv_detailed(sym, ohl, days=d, tf=exec_tf, session_name=session_mode)
+        except Exception as e:
+            rep = {'ok': False, 'symbol': sym, 'tf': exec_tf, 'days': d, 'rows': [], 'error': f'{type(e).__name__}: {e}'}
         symbol_reports.append(rep)
         try:
             rb = rep.get('reject_breakdown') or {}
