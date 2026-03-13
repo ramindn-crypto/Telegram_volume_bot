@@ -12762,6 +12762,190 @@ def _canon_outcome_from_autotrade_trade(trade: dict) -> str:
     return _canon_signal_outcome_label(raw, pnl=pnl)
 
 
+def _signal_report_setup_meta(setup_id: str) -> dict:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return {}
+    try:
+        sig = db_get_signal(sid) or {}
+    except Exception:
+        sig = {}
+    if sig:
+        return {
+            'symbol': _bybit_linear_symbol(str(sig.get('symbol') or '')),
+            'side': _norm_trade_side(str(sig.get('side') or '')),
+            'created_ts': float(sig.get('created_ts') or 0.0),
+            'conf': sig.get('conf'),
+        }
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            row = cur.execute(
+                """SELECT symbol, side, created_ts, conf FROM generated_setups
+                   WHERE setup_id=? ORDER BY created_ts DESC LIMIT 1""",
+                (sid,),
+            ).fetchone()
+            if row:
+                return {
+                    'symbol': _bybit_linear_symbol(str(row['symbol'] or '')),
+                    'side': _norm_trade_side(str(row['side'] or '')),
+                    'created_ts': float(row['created_ts'] or 0.0),
+                    'conf': row['conf'],
+                }
+    except Exception:
+        pass
+    return {}
+
+
+def _signal_report_load_recent_trades(user_id: int, limit: int = 1000) -> list[dict]:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            rows = cur.execute(
+                """SELECT * FROM autotrade_trades
+                   WHERE uid=?
+                   ORDER BY COALESCE(closed_ts, opened_ts, 0) DESC
+                   LIMIT ?""",
+                (int(user_id), int(limit)),
+            ).fetchall() or []
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _signal_report_find_trade_for_setup(user_id: int, symbol: str, side: str, ref_ts: float = 0.0) -> dict | None:
+    sym = _bybit_linear_symbol(symbol)
+    sd = _norm_trade_side(side)
+    if not sym or not sd:
+        return None
+    rows = _signal_report_load_recent_trades(int(user_id), limit=1000)
+    cands = []
+    for r in rows:
+        if _norm_trade_side(str(r.get('side') or '')) != sd:
+            continue
+        if not _symbol_match_loose(str(r.get('symbol') or ''), sym):
+            continue
+        cands.append(r)
+    if not cands:
+        return None
+    if float(ref_ts or 0.0) > 0:
+        def score(r):
+            opened = float(r.get('opened_ts') or 0.0)
+            closed = float(r.get('closed_ts') or 0.0)
+            nearest = min(abs(opened - float(ref_ts)), abs(closed - float(ref_ts)) if closed > 0 else 10**18)
+            return (0 if nearest <= 7 * 86400 else 1, nearest, -opened)
+        cands.sort(key=score)
+    return dict(cands[0]) if cands else None
+
+
+def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | None = None) -> tuple[list[dict], int]:
+    user_id = int(user_id)
+    try:
+        tz = ZoneInfo(str((user or {}).get('tz') or 'UTC'))
+    except Exception:
+        tz = timezone.utc
+    live_mode = str(AUTOTRADE_MODE).lower() == 'live' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0)
+    current_positions = []
+    if live_mode:
+        try:
+            current_positions = list(_bybit_get_open_positions_linear() or [])
+        except Exception:
+            current_positions = []
+    recent_trades = _signal_report_load_recent_trades(user_id, limit=1200)
+    rows = []
+    hidden_untracked_open = 0
+
+    for e in emailed or []:
+        setup_id = str(e.get('setup_id') or '').strip()
+        sess = str(e.get('session') or '').strip().upper() or '?'
+        meta_sig = _signal_report_setup_meta(setup_id)
+        life = _admin_setup_lifecycle_get(setup_id) if setup_id else {}
+        symbol = _bybit_linear_symbol(str(meta_sig.get('symbol') or life.get('symbol') or ''))
+        side = _norm_trade_side(str(meta_sig.get('side') or life.get('side') or ''))
+        canon, meta = _canonical_signal_outcome_for_setup(user_id, setup_id)
+        meta = dict(meta or {})
+        emailed_ts = float(e.get('emailed_ts') or meta_sig.get('created_ts') or 0.0)
+
+        matched_live = None
+        if live_mode and symbol and side:
+            for p in current_positions:
+                try:
+                    if _symbol_match_loose(_pos_symbol(p), symbol) and _norm_trade_side(_pos_side_text(p)) == side:
+                        matched_live = p
+                        break
+                except Exception:
+                    pass
+        if matched_live is not None:
+            canon = 'OPEN'
+            meta['source'] = 'matched_live_symbol_side'
+            meta['position'] = matched_live
+        elif symbol and side:
+            trade = _signal_report_find_trade_for_setup(user_id, symbol, side, emailed_ts)
+            if trade:
+                meta.setdefault('trade', trade)
+                status = str(trade.get('status') or '').upper().strip()
+                if status == 'OPEN':
+                    canon = 'OPEN'
+                    meta['source'] = 'matched_open_trade'
+                elif status == 'CLOSED' or float(trade.get('closed_ts') or 0.0) > 0:
+                    canon = _canon_outcome_from_autotrade_trade(trade)
+                    meta['source'] = 'matched_closed_trade'
+
+        src = str(meta.get('source') or '').lower()
+        if live_mode and str(canon).upper().strip() == 'OPEN' and src not in {'live_position', 'matched_live_symbol_side', 'matched_open_trade'}:
+            hidden_untracked_open += 1
+            canon = 'None'
+
+        created_ts = float(meta_sig.get('created_ts') or emailed_ts or 0.0)
+        created_str = datetime.fromtimestamp(created_ts, tz).strftime('%m-%d %H:%M') if created_ts > 0 else '-'
+        base_sym = _symbol_base(symbol) or '?'
+        conf = meta_sig.get('conf')
+        conf = int(conf or 0) if conf is not None else '-'
+        rows.append({
+            'setup_id': setup_id,
+            'session': sess,
+            'time': created_str,
+            'trade': f"{side or '?'} {base_sym}",
+            'confidence': conf,
+            'outcome': _display_signal_outcome(canon),
+            'emailed_ts': emailed_ts,
+            'source': str(meta.get('source') or ''),
+            'symbol': symbol,
+            'side': side,
+        })
+
+    # Secondary pass: if a current live Bybit position exists for symbol+side, keep the newest emailed row OPEN.
+    if live_mode and current_positions:
+        newest_by_key = {}
+        for idx, r in enumerate(rows):
+            key = (_bybit_linear_symbol(str(r.get('symbol') or '')), _norm_trade_side(str(r.get('side') or '')))
+            ts = float(r.get('emailed_ts') or 0.0)
+            cur = newest_by_key.get(key)
+            if cur is None or ts > cur[1]:
+                newest_by_key[key] = (idx, ts)
+        for p in current_positions:
+            try:
+                key = (_bybit_linear_symbol(_pos_symbol(p)), _norm_trade_side(_pos_side_text(p)))
+                item = newest_by_key.get(key)
+                if item is not None:
+                    idx = item[0]
+                    rows[idx]['outcome'] = 'OPEN'
+                    rows[idx]['source'] = 'matched_live_symbol_side'
+                # any older unresolved duplicate rows for same live key should become None
+                for j, r in enumerate(rows):
+                    if j == (item[0] if item is not None else -1):
+                        continue
+                    if (_bybit_linear_symbol(str(r.get('symbol') or '')), _norm_trade_side(str(r.get('side') or ''))) == key and str(r.get('outcome') or '') == 'OPEN':
+                        rows[j]['outcome'] = 'None'
+                        rows[j]['source'] = 'older_duplicate_live_signal'
+            except Exception:
+                pass
+
+    return rows, hidden_untracked_open
+
+
 def _canonical_signal_outcome_for_setup(user_id: int, setup_id: str) -> tuple[str, dict]:
     sid = str(setup_id or '').strip()
     life = _admin_setup_lifecycle_get(sid) if sid else {}
@@ -12816,7 +13000,7 @@ def _signal_report_live_backed_only(user_id: int, meta: dict | None, canon: str)
         if str(canon or '').upper().strip() != 'OPEN':
             return False
         src = str(((meta or {}).get('source') or '')).strip().lower()
-        return src in {'live_position'}
+        return src in {'live_position', 'matched_live_symbol_side', 'matched_open_trade'}
     except Exception:
         return False
 
@@ -12913,26 +13097,8 @@ def _signal_outcome_summary(user_id: int, session: str | None = None, days: int 
     except Exception:
         emailed = []
 
-    rows = []
-    hidden_untracked_open = 0
-    for e in emailed:
-        sid = str(e.get('setup_id') or '').strip()
-        canon, meta = _canonical_signal_outcome_for_setup(user_id, sid)
-        if _signal_report_live_backed_only(int(user_id), meta, canon) is False and str(canon).upper().strip() == 'OPEN' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0) and str(AUTOTRADE_MODE).lower() == 'live':
-            hidden_untracked_open += 1
-            continue
-        stored = (meta or {}).get('stored') or {}
-        life = (meta or {}).get('lifecycle') or {}
-        trade = (meta or {}).get('trade') or {}
-        hit_ts = stored.get('hit_ts') or life.get('closed_ts') or trade.get('closed_ts')
-        rows.append({
-            'setup_id': sid,
-            'session': str(e.get('session') or '').strip().upper() or '?',
-            'emailed_ts': float(e.get('emailed_ts') or 0.0),
-            'outcome': canon,
-            'hit_ts': float(hit_ts or 0.0) if hit_ts else None,
-            'source': str((meta or {}).get('source') or ''),
-        })
+    user = get_user(user_id) or {}
+    rows, hidden_untracked_open = _signal_report_resolve_rows(user_id, emailed, user=user)
     stats = _canonical_wr_stats(rows)
     return {
         'rows': rows,
@@ -20125,35 +20291,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     def _eval_all():
-        rows = []
-        hidden_untracked_open = 0
-        for e in emailed:
-            setup_id = str(e.get('setup_id') or '').strip()
-            sess = str(e.get('session') or '').strip().upper() or '?'
-            sig = db_get_signal(setup_id) or {}
-            canon, meta = _canonical_signal_outcome_for_setup(int(uid), setup_id)
-            if _signal_report_live_backed_only(int(uid), meta, canon) is False and str(canon).upper().strip() == 'OPEN' and int(uid) == int(AUTOTRADE_OWNER_UID or 0) and str(AUTOTRADE_MODE).lower() == 'live':
-                hidden_untracked_open += 1
-                canon = 'None'
-            else:
-                canon = _display_signal_outcome(canon)
-            created_ts = float(sig.get('created_ts') or e.get('emailed_ts') or 0.0)
-            try:
-                tz = ZoneInfo(str(user.get('tz') or 'UTC'))
-            except Exception:
-                tz = timezone.utc
-            created_str = datetime.fromtimestamp(created_ts, tz).strftime('%m-%d %H:%M') if created_ts > 0 else '-'
-            sym = str(sig.get('symbol') or '?')
-            side = str(sig.get('side') or '?').upper()
-            conf = int(sig.get('conf') or 0) if sig.get('conf') is not None else '-'
-            rows.append({
-                'session': sess,
-                'time': created_str,
-                'trade': f"{side} {sym}",
-                'confidence': conf,
-                'outcome': canon,
-            })
-        return rows, hidden_untracked_open
+        return _signal_report_resolve_rows(int(uid), emailed, user=user)
 
     rows, hidden_untracked_open = await to_thread_heavy(_eval_all, timeout=120)
     stats = _canonical_wr_stats(rows)
