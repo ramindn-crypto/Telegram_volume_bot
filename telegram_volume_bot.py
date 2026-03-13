@@ -9953,6 +9953,70 @@ def _sanitize_ohlcv_rows(ohlcv: list) -> list:
             continue
     return out
 
+def _hist_lb_from_minutes(tf_minutes: int, target_minutes: int) -> int:
+    return max(1, int(round(float(target_minutes) / max(1.0, float(tf_minutes)))))
+
+
+def _hist_pct_change(closes: list[float], i: int, lookback: int) -> float:
+    try:
+        j = max(0, int(i) - max(1, int(lookback)))
+        if j >= i:
+            return 0.0
+        base = float(closes[j] or 0.0)
+        cur = float(closes[i] or 0.0)
+        if base <= 0.0 or cur <= 0.0:
+            return 0.0
+        return float(((cur / base) - 1.0) * 100.0)
+    except Exception:
+        return 0.0
+
+
+def _rolling_quote_vol_usd(closes: list[float], vols: list[float], i: int, lookback: int) -> float:
+    try:
+        start = max(0, int(i) - max(1, int(lookback)) + 1)
+        tot = 0.0
+        for k in range(start, int(i) + 1):
+            px = float(closes[k] or 0.0)
+            vol = float(vols[k] or 0.0)
+            if px > 0.0 and vol > 0.0:
+                tot += px * vol
+        return float(tot)
+    except Exception:
+        return 0.0
+
+
+def _historical_setup_features(closes: list[float], vols: list[float], ema13: list[float], ema21: list[float], atr: list[float], i: int, tf: str) -> dict:
+    tf_min = max(1, _tf_to_minutes(tf))
+    lb15 = _hist_lb_from_minutes(tf_min, 15)
+    lb60 = _hist_lb_from_minutes(tf_min, 60)
+    lb240 = _hist_lb_from_minutes(tf_min, 240)
+    lb1440 = _hist_lb_from_minutes(tf_min, 1440)
+    px = float(closes[i] or 0.0)
+    ema13_v = float(ema13[i] or 0.0) if i < len(ema13) else 0.0
+    ema21_v = float(ema21[i] or 0.0) if i < len(ema21) else 0.0
+    atr_v = float(atr[i] or 0.0) if i < len(atr) else 0.0
+    slope = 0.0
+    try:
+        if i >= 3 and px > 0.0:
+            slope = float((ema21_v - float(ema21[i - 3] or 0.0)) / px * 100.0)
+    except Exception:
+        slope = 0.0
+    ema_dist_pct = (abs(px - ema13_v) / px * 100.0) if (px > 0.0 and ema13_v > 0.0) else 0.0
+    atr_pct = (atr_v / px * 100.0) if (px > 0.0 and atr_v > 0.0) else 0.0
+    return {
+        'tf_min': int(tf_min),
+        'lookbacks': {'15m': int(lb15), '1h': int(lb60), '4h': int(lb240), '24h': int(lb1440)},
+        'ch15': float(_hist_pct_change(closes, i, lb15)),
+        'ch1': float(_hist_pct_change(closes, i, lb60)),
+        'ch4': float(_hist_pct_change(closes, i, lb240)),
+        'ch24': float(_hist_pct_change(closes, i, lb1440)),
+        'fut_vol_usd': float(_rolling_quote_vol_usd(closes, vols, i, lb1440)),
+        'ema_dist_pct': float(ema_dist_pct),
+        'atr_pct': float(atr_pct),
+        'slope_pct': float(slope),
+    }
+
+
 def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: str = "NY") -> list:
     """Generate setups from historical bars using the same *architecture* (A-E).
     Returns list of Setup-like dicts.
@@ -11788,16 +11852,28 @@ def _session_mode_matches(target: str, sess: str) -> bool:
     return t in ('', 'ALL', 'ANY', '*') or s == t
 
 
-def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str, session_name: str) -> dict:
+def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str, session_name: str, eval_since_ts: float | None = None, eval_until_ts: float | None = None) -> dict:
     ohlcv = _sanitize_ohlcv_rows(ohlcv)
     if not ohlcv or len(ohlcv) < 300:
         return {'ok': False, 'error': 'insufficient_ohlcv', 'symbol': symbol, 'tf': tf, 'days': days, 'rows': []}
     setups = _backtest_generate_setups(symbol, ohlcv, tf, session_name=session_name)
+    if eval_since_ts is not None or eval_until_ts is not None:
+        filtered = []
+        lo = float(eval_since_ts or 0.0)
+        hi = float(eval_until_ts or 0.0) if eval_until_ts is not None else 0.0
+        for s in setups:
+            try:
+                cts = float(getattr(s, 'created_ts', 0.0) or 0.0)
+            except Exception:
+                cts = 0.0
+            if lo and cts < lo:
+                continue
+            if hi and cts > hi:
+                continue
+            filtered.append(s)
+        setups = filtered
     if not setups:
-        rep = _run_backtest_on_ohlcv(symbol, ohlcv, days=days, tf=tf, session_name=session_name)
-        rep['rows'] = []
-        rep['live_equivalent'] = {'setups': 0, 'trades': 0, 'win_rate': 0.0, 'avg_R': 0.0, 'profit_factor': 0.0, 'max_drawdown_R': 0.0, 'equity_R': 0.0, 'by_session': {s: {'setups': 0, 'win_rate': 0.0, 'avg_R': 0.0} for s in ('NY', 'LON', 'ASIA')}}
-        return rep
+        return {'ok': True, 'symbol': symbol, 'tf': tf, 'days': int(days), 'setups': 0, 'trades': 0, 'win_rate': 0.0, 'avg_R': 0.0, 'profit_factor': 0.0, 'max_drawdown_R': 0.0, 'equity_R': 0.0, 'reject_breakdown': dict(_BT_LAST_REJECTS), 'by_session': {}, 'rows': [], 'live_equivalent': {'setups': 0, 'trades': 0, 'win_rate': 0.0, 'avg_R': 0.0, 'profit_factor': 0.0, 'max_drawdown_R': 0.0, 'equity_R': 0.0, 'by_session': {s: {'setups': 0, 'win_rate': 0.0, 'avg_R': 0.0} for s in ('NY', 'LON', 'ASIA')}}}
     rows = []
     results = []
     eq = 0.0
@@ -11824,6 +11900,10 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
             sess = str(_session_label_from_ts(ts_sec) or '?')
         except Exception:
             sess = '?'
+        if eval_since_ts is not None and float(ts_sec) < float(eval_since_ts or 0.0):
+            continue
+        if eval_until_ts is not None and float(ts_sec) > float(eval_until_ts or 0.0):
+            continue
         res = _simulate_one_setup(ohlcv, i + 1, s)
         r_mult = float(res.get('R', 0.0) or 0.0)
         res['R'] = r_mult
@@ -11902,14 +11982,14 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
     live_gross_win = sum(max(0.0, float(r.get('R', 0.0) or 0.0)) for r in live_results)
     live_gross_loss = sum(min(0.0, float(r.get('R', 0.0) or 0.0)) for r in live_results)
     live_pf = (live_gross_win / abs(live_gross_loss)) if live_gross_loss < 0 else (float('inf') if live_gross_win > 0 else 0.0)
-    by_sess_live_out = {s: {'setups': 0, 'wins': 0, 'losses': 0, 'decided': 0, 'win_rate': 0.0, 'avg_R': 0.0} for s in ('NY', 'LON', 'ASIA')}
+    live_by_sess_out = {}
     for sess, d in dict(by_session_live).items():
         s_n = int(d.get('setups', 0) or 0)
         s_w = int(d.get('wins', 0) or 0)
         s_l = int(d.get('losses', 0) or 0)
         s_dec = s_w + s_l
         rr = d.get('r') or []
-        by_sess_live_out[str(sess)] = {
+        live_by_sess_out[str(sess)] = {
             'setups': s_n,
             'wins': s_w,
             'losses': s_l,
@@ -11921,7 +12001,7 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
         'ok': True,
         'symbol': symbol,
         'tf': tf,
-        'days': days,
+        'days': int(days),
         'setups': total,
         'trades': total,
         'win_rate': float((wins / total * 100.0) if total else 0.0),
@@ -11931,17 +12011,17 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
         'equity_R': float(eq),
         'reject_breakdown': dict(_BT_LAST_REJECTS),
         'by_session': by_sess_out,
+        'rows': rows,
         'live_equivalent': {
-            'setups': int(live_total),
-            'trades': int(live_total),
+            'setups': live_total,
+            'trades': live_total,
             'win_rate': float((live_wins / live_total * 100.0) if live_total else 0.0),
             'avg_R': float(live_avg_r),
             'profit_factor': float(live_pf),
             'max_drawdown_R': float(live_max_dd),
             'equity_R': float(live_eq),
-            'by_session': by_sess_live_out,
+            'by_session': live_by_sess_out,
         },
-        'rows': rows,
     }
 
 
@@ -11956,19 +12036,26 @@ def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | No
     snap = _build_universe_snapshot_top_volume(top_n=top_n, min_vol_usd=min_vol_usd)
     universe = list(snap.get('market_symbols') or [])[:top_n]
     tf_min = _tf_to_minutes(exec_tf)
-    bars = int(min(12000, max(1200, ((d * 1440) / max(1, tf_min)) + 450)))
+    warmup_bars = 300
+    since_ms, until_ms, eval_since_ms, eval_until_ms = _backtest_window_bounds(d, end_days_ago=0, warmup_bars=warmup_bars, tf=exec_tf)
+    page_limit = 1000 if tf_min <= 60 else 500
     rows = []
     symbol_reports = []
     reject_acc = Counter()
     live_reject_acc = Counter()
+    fetch_errors = 0
     for sym in universe:
         try:
-            ohl = fetch_ohlcv(sym, exec_tf, limit=bars)
+            ohl = fetch_ohlcv_paged(sym, exec_tf, since_ms=since_ms, until_ms=until_ms, limit=page_limit)
+            if not ohl:
+                bars = int(min(12000, max(1200, ((d * 1440) / max(1, tf_min)) + 450)))
+                ohl = fetch_ohlcv(sym, exec_tf, limit=bars)
         except Exception:
             ohl = []
+            fetch_errors += 1
         ohl = _sanitize_ohlcv_rows(ohl)
         try:
-            rep = _run_backtest_on_ohlcv_detailed(sym, ohl, days=d, tf=exec_tf, session_name=session_mode)
+            rep = _run_backtest_on_ohlcv_detailed(sym, ohl, days=d, tf=exec_tf, session_name=session_mode, eval_since_ts=(eval_since_ms / 1000.0), eval_until_ts=(eval_until_ms / 1000.0))
         except Exception as e:
             rep = {'ok': False, 'symbol': sym, 'tf': exec_tf, 'days': d, 'rows': [], 'error': f'{type(e).__name__}: {e}'}
         symbol_reports.append(rep)
@@ -12008,6 +12095,9 @@ def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | No
         'min_vol_usd': float(min_vol_usd),
         'reject_breakdown': dict(reject_acc),
         'live_equivalent_reject_breakdown': dict(live_reject_acc),
+        'eval_since_ts': float(eval_since_ms / 1000.0),
+        'eval_until_ts': float(eval_until_ms / 1000.0),
+        'fetch_errors': int(fetch_errors),
     }
     run_id = ''
     if persist:
@@ -12045,6 +12135,7 @@ def _format_universe_backtest_report(rep: dict) -> str:
         f"🌐 Universe Backtest — {int(rep.get('days') or metrics.get('days') or 0)}d",
         HDR,
         f"TF: {str(rep.get('exec_tf') or metrics.get('exec_tf') or '15m')} | Session: {str(rep.get('session_mode') or metrics.get('session_mode') or 'ALL')} | Universe: {int(rep.get('universe_size') or metrics.get('universe_size') or 0)}",
+        f"Window: {datetime.fromtimestamp(float(metrics.get('eval_since_ts', 0.0) or 0.0), tz=timezone.utc).strftime('%Y-%m-%d') if float(metrics.get('eval_since_ts', 0.0) or 0.0) > 0 else '?'} → {datetime.fromtimestamp(float(metrics.get('eval_until_ts', 0.0) or 0.0), tz=timezone.utc).strftime('%Y-%m-%d') if float(metrics.get('eval_until_ts', 0.0) or 0.0) > 0 else '?'} | Fetch errors: {int(metrics.get('fetch_errors', 0) or 0)}",
         f"Raw setups: {int(raw_overall.get('setups', 0) or 0)} | Avg/day: {float(raw_overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(raw_overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(raw_overall.get('avg_R', 0.0) or 0.0):.3f}",
         f"Live-equivalent setups: {int(overall.get('setups', 0) or 0)} | Avg/day: {float(overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(overall.get('avg_R', 0.0) or 0.0):.3f}",
         'Per session (raw -> live-equivalent):',
