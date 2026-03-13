@@ -2292,16 +2292,33 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         sess = str(trade_row.get('session') or '').upper().strip()
         if AUTOTRADE_BE_AFTER_TP1_ENABLED and entry > 0 and final_tp > 0 and initial_qty > 0 and live_qty > 0:
             # Production-safe TP1 -> risk-free handling:
-            # - TP1 is executed as a separate reduce-only limit order for a partial close.
-            # - After that partial fill is visible via reduced live position size, the remaining
-            #   position stop is moved to entry (breakeven) only when the configured filters allow it.
-            # - This is an active live-management rule, not just a learning note.
-            tp1_hit = live_qty <= max(initial_qty * 0.45, initial_qty * (1.0 - float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION) + 0.08))
+            # - TP1 is executed as a separate partial close / partial TP order.
+            # - After the first target is achieved, the remaining position stop is moved to entry
+            #   and the remaining TP ladder is rebuilt off the reduced live size.
+            # - This keeps the chart/order view aligned with the risk-free rule.
+            partial_fraction = float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION)
+            qty_drop_threshold = max(initial_qty * 0.45, initial_qty * (1.0 - partial_fraction + 0.08))
+            qty_reduced = live_qty < max(initial_qty * 0.98, initial_qty - max(1e-9, initial_qty * 0.02))
+            tp1_order_still_open = False
+            try:
+                tp1_order_still_open = _bybit_has_open_tp_order_at(sym, partial_tp) if partial_tp > 0 else False
+            except Exception:
+                tp1_order_still_open = False
+            tp1_hit = bool((live_qty <= qty_drop_threshold) or (qty_reduced and not tp1_order_still_open))
             sl_at_be = _price_close_enough(current_sl, entry)
             be_allowed = conf >= int(AUTOTRADE_BE_AFTER_TP1_MIN_CONF) and (atr_pct <= float(AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT) if atr_pct > 0 else True) and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS or sess in AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS)
-            if tp1_hit and (not sl_at_be) and be_allowed:
-                _autotrade_apply_position_tp_sl(sym, entry, 0.0)
-                result['be_applied'] = True
+            if tp1_hit and be_allowed:
+                if not sl_at_be:
+                    _autotrade_cancel_reduce_only_tp_orders(sym)
+                    _autotrade_apply_position_tp_sl(sym, entry, 0.0)
+                    remaining_targets = [x for x in (float(trade_row.get('tp2') or 0.0), float(trade_row.get('tp3') or 0.0)) if float(x or 0.0) > 0]
+                    if remaining_targets:
+                        try:
+                            _autotrade_place_partial_tpsl_ladder(sym, side, entry, remaining_targets, live_qty)
+                            result['tp1_order_fixed'] = True
+                        except Exception:
+                            pass
+                    result['be_applied'] = True
         return result
     except Exception:
         return result
@@ -2407,11 +2424,15 @@ def _autotrade_resolve_live_position_open_info(uid: int, p: dict, journal_open: 
     """Resolve the authoritative open timestamp for one live Bybit position.
 
     Evidence priority:
-    1) Bybit filled order history for the same symbol/side and same-position characteristics.
-    2) Matching autotrade journal OPEN row (only if it matches the live position, not merely symbol+side).
+    1) Matching autotrade journal OPEN row (authoritative for the bot's anchored trading-day accounting).
+    2) Bybit filled order history for the same symbol/side and same-position characteristics.
     3) Bybit live position createdTime.
 
-    This prevents stale internal rows from overriding clear exchange evidence.
+    Why journal-first:
+    - Bybit aggregate positions can be updated or scaled in later, which can make exchange-side
+      timestamps look newer than the real open for today's /dayreset bucket.
+    - The bot's own open-trade journal is the most reliable source for deciding whether a live
+      position is carried from a prior anchored day or opened today.
     """
     sym = _pos_symbol(p)
     side = _pos_side_text(p)
@@ -2520,14 +2541,14 @@ def _autotrade_resolve_live_position_open_info(uid: int, p: dict, journal_open: 
     journal_ts = float(info.get('journal_ts') or 0.0)
     created_ts = float(info.get('position_created_ts') or 0.0)
 
-    if exchange_ts > 0:
-        info['opened_ts'] = exchange_ts
-        info['source'] = 'bybit_order_history'
-        if journal_ts > 0 and abs(exchange_ts - journal_ts) > 3600.0:
-            info['notes'] = 'journal_mismatch_ignored'
-    elif journal_ts > 0:
+    if journal_ts > 0:
         info['opened_ts'] = journal_ts
         info['source'] = 'autotrade_journal'
+        if exchange_ts > 0 and abs(exchange_ts - journal_ts) > 3600.0:
+            info['notes'] = 'exchange_ts_ignored_for_day_bucket'
+    elif exchange_ts > 0:
+        info['opened_ts'] = exchange_ts
+        info['source'] = 'bybit_order_history'
     elif created_ts > 0:
         info['opened_ts'] = created_ts
         info['source'] = 'bybit_position_created'
@@ -16449,7 +16470,11 @@ def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
         tz = ZoneInfo(str(user.get('tz') or 'UTC'))
     except Exception:
         tz = timezone.utc
-    day_local = datetime.now(tz).date().isoformat()
+    # Use the anchored trading day (/dayreset), not midnight local day.
+    try:
+        day_local = _user_day_local(user)
+    except Exception:
+        day_local = datetime.now(tz).date().isoformat()
     recipient = str(user.get('email_to') or user.get('email') or '').strip()
     alerts_on = bool(user_email_alerts_enabled(user))
     smtp_ready = bool(EMAIL_ENABLED and email_config_ok())
@@ -23178,8 +23203,11 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
             gap_sec = max(0, gap_min) * 60
 
-            # Daily cap
-            day_local = datetime.now(tz).date().isoformat()
+            # Daily cap (anchored trading day via /dayreset, not midnight local day)
+            try:
+                day_local = _user_day_local(user)
+            except Exception:
+                day_local = datetime.now(tz).date().isoformat()
             try:
                 sent_today = _email_daily_get(uid, day_local)
             except Exception:
