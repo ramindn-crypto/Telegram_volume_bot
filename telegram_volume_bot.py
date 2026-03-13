@@ -14395,25 +14395,21 @@ def _apply_final_sale_grade_filter(rows: list[dict], cfg: dict, session_mode: st
     symbol_day_cap = int(max(1, cfg.get('universe_backtest_final_symbol_day_cap', 1) or 1))
 
     weights = cfg.get('session_weights') or {}
+    session_caps = {}
+    session_rank_bonus = {s: 0.0 for s in ('NY', 'LON', 'ASIA')}
     if session_mode in ('NY', 'LON', 'ASIA'):
         session_caps = {session_mode: day_cap}
+        session_rank_bonus[session_mode] = max(0.0, float(weights.get(session_mode, 0.0) or 0.0))
     else:
         raw_weights = {s: max(0.0, float(weights.get(s, 0.0) or 0.0)) for s in ('NY', 'LON', 'ASIA')}
         if sum(raw_weights.values()) <= 0:
-            raw_weights = {'NY': 0.60, 'LON': 0.25, 'ASIA': 0.15}
-        total_w = max(1e-9, sum(raw_weights.values()))
-        norm = {s: (raw_weights[s] / total_w) for s in ('NY', 'LON', 'ASIA')}
-        session_caps = {s: int(day_cap * norm[s]) for s in ('NY', 'LON', 'ASIA')}
-        assigned = sum(session_caps.values())
-        order = sorted(('NY', 'LON', 'ASIA'), key=lambda s: (-norm[s], s))
-        idx = 0
-        while assigned < day_cap and order:
-            s = order[idx % len(order)]
-            session_caps[s] += 1
-            assigned += 1
-            idx += 1
-        if sum(session_caps.values()) <= 0:
-            session_caps = {'NY': day_cap, 'LON': 0, 'ASIA': 0}
+            raw_weights = {'NY': 1.0, 'LON': 1.0, 'ASIA': 1.0}
+        # Do not hard-disable sessions in ALL mode. Use weights only as a soft ranking bonus.
+        # This keeps London/Asia eligible whenever their actual setups rank highly enough.
+        max_w = max(raw_weights.values()) if raw_weights else 1.0
+        if max_w <= 0:
+            max_w = 1.0
+        session_rank_bonus = {s: (raw_weights[s] / max_w) for s in ('NY', 'LON', 'ASIA')}
 
     by_day = defaultdict(list)
     for rr in live_rows:
@@ -14428,7 +14424,7 @@ def _apply_final_sale_grade_filter(rows: list[dict], cfg: dict, session_mode: st
         day_rows = sorted(
             by_day[day],
             key=lambda rr: (
-                -float(rr.get('score', 0.0) or 0.0),
+                -(float(rr.get('score', 0.0) or 0.0) + (3.0 * float(session_rank_bonus.get(str(rr.get('session') or '').upper().strip(), 0.0) or 0.0))),
                 -int(rr.get('conf', 0) or 0),
                 -float(rr.get('rr_final', 0.0) or 0.0),
                 float(rr.get('ts', 0.0) or 0.0),
@@ -14450,10 +14446,10 @@ def _apply_final_sale_grade_filter(rows: list[dict], cfg: dict, session_mode: st
             if len(selected) >= day_cap:
                 blockers['final_day_cap_reached'] += 1
                 continue
-            if session_caps.get(sess, 0) <= 0:
+            if session_caps and session_caps.get(sess, 0) <= 0:
                 blockers[f'final_session_disabled_{sess or "UNK"}'] += 1
                 continue
-            if sess_counts[sess] >= int(session_caps.get(sess, 0) or 0):
+            if session_caps and sess_counts[sess] >= int(session_caps.get(sess, 0) or 0):
                 blockers[f'final_session_cap_{sess or "UNK"}'] += 1
                 continue
             if sym and sym_counts[sym] >= symbol_day_cap:
@@ -14475,6 +14471,7 @@ def _apply_final_sale_grade_filter(rows: list[dict], cfg: dict, session_mode: st
     meta = {
         'day_cap': int(day_cap),
         'session_caps': dict(session_caps),
+        'session_rank_bonus': dict(session_rank_bonus),
         'score_floor': float(score_floor),
         'min_conf': int(min_conf),
         'min_gap_minutes': float(min_gap_minutes),
