@@ -1084,6 +1084,12 @@ def _strategy_config_defaults() -> dict:
         "autotune_min_window_wr": 52.0,
         "autotune_consistency_penalty": 2.0,
         "autotune_learning_guard_enabled": True,
+
+        # Universe backtest autopilot (zero-touch telemetry feeding learning/optimizer)
+        "universe_backtest_top_n": 80,
+        "universe_backtest_min_vol_usd": 10000000.0,
+        "universe_backtest_windows": [7, 30],
+        "universe_backtest_exec_tf": "15m",
     }
 
 _STRATEGY_CFG_CACHE = {"ts": 0.0, "cfg": None}
@@ -10998,6 +11004,26 @@ def _opt_migrate_tables():
             except Exception:
                 pass
 
+            c.execute("""CREATE TABLE IF NOT EXISTS universe_backtest_runs (
+                run_id TEXT PRIMARY KEY,
+                created_ts REAL NOT NULL,
+                days INTEGER NOT NULL,
+                session_mode TEXT NOT NULL,
+                exec_tf TEXT NOT NULL,
+                universe_snap_id TEXT NOT NULL DEFAULT '',
+                universe_size INTEGER NOT NULL DEFAULT 0,
+                promoted_context INTEGER NOT NULL DEFAULT 0,
+                metrics_json TEXT NOT NULL DEFAULT '',
+                per_day_json TEXT NOT NULL DEFAULT '',
+                per_session_json TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT ''
+            )""")
+            try:
+                c.execute("CREATE INDEX IF NOT EXISTS idx_ubt_created ON universe_backtest_runs(created_ts)")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_ubt_days ON universe_backtest_runs(days, created_ts)")
+            except Exception:
+                pass
+
             conn.commit()
     except Exception:
         pass
@@ -11680,6 +11706,317 @@ def _evolution_weighted_wr_from_diagnostics(days: int = 60, session: str | None 
     return {"wins": wins, "losses": losses, "sample": n, "wr": (wins / n * 100.0) if n > 0 else 0.0}
 
 
+
+def _db_save_universe_backtest_run(days: int, session_mode: str, exec_tf: str, universe_snap_id: str, universe_size: int, metrics: dict, per_day: list[dict], per_session: dict, notes: str = '', promoted_context: bool = False) -> str:
+    _opt_migrate_tables()
+    run_id = f"UBT-{int(days)}D-{int(time.time())}"
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO universe_backtest_runs(run_id, created_ts, days, session_mode, exec_tf, universe_snap_id, universe_size, promoted_context, metrics_json, per_day_json, per_session_json, notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(run_id), float(time.time()), int(days), str(session_mode or 'ALL').upper(), str(exec_tf or '15m'), str(universe_snap_id or ''), int(universe_size or 0), 1 if promoted_context else 0, _json_dumps_safe(metrics or {}), _json_dumps_safe(per_day or []), _json_dumps_safe(per_session or {}), str(notes or ''))
+            )
+            conn.commit()
+    except Exception:
+        pass
+    return str(run_id)
+
+
+def _db_get_latest_universe_backtest(days: int | None = None) -> Optional[dict]:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            if days is None:
+                row = c.execute(
+                    "SELECT run_id, created_ts, days, session_mode, exec_tf, universe_snap_id, universe_size, promoted_context, metrics_json, per_day_json, per_session_json, notes FROM universe_backtest_runs ORDER BY created_ts DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT run_id, created_ts, days, session_mode, exec_tf, universe_snap_id, universe_size, promoted_context, metrics_json, per_day_json, per_session_json, notes FROM universe_backtest_runs WHERE days=? ORDER BY created_ts DESC LIMIT 1",
+                    (int(days),)
+                ).fetchone()
+        if not row:
+            return None
+        return {
+            'run_id': str(row[0] or ''),
+            'created_ts': float(row[1] or 0.0),
+            'days': int(row[2] or 0),
+            'session_mode': str(row[3] or 'ALL'),
+            'exec_tf': str(row[4] or '15m'),
+            'universe_snap_id': str(row[5] or ''),
+            'universe_size': int(row[6] or 0),
+            'promoted_context': bool(row[7] or 0),
+            'metrics': _json_loads_safe(row[8], {}),
+            'per_day': _json_loads_safe(row[9], []),
+            'per_session': _json_loads_safe(row[10], {}),
+            'notes': str(row[11] or ''),
+        }
+    except Exception:
+        return None
+
+
+def _session_mode_matches(target: str, sess: str) -> bool:
+    t = str(target or 'ALL').upper().strip()
+    s = str(sess or '').upper().strip()
+    return t in ('', 'ALL', 'ANY', '*') or s == t
+
+
+def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str, session_name: str) -> dict:
+    if not ohlcv or len(ohlcv) < 300:
+        return {'ok': False, 'error': 'insufficient_ohlcv', 'symbol': symbol, 'tf': tf, 'days': days, 'rows': []}
+    setups = _backtest_generate_setups(symbol, ohlcv, tf, session_name=session_name)
+    if not setups:
+        rep = _run_backtest_on_ohlcv(symbol, ohlcv, days=days, tf=tf, session_name=session_name)
+        rep['rows'] = []
+        return rep
+    rows = []
+    results = []
+    eq = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    by_session = defaultdict(lambda: {'setups': 0, 'wins': 0, 'losses': 0, 'r': []})
+    for s in setups:
+        try:
+            sid = str(getattr(s, 'setup_id', 'BT-0'))
+            i = int(sid.split('-')[-1])
+        except Exception:
+            i = 0
+        try:
+            ts_raw = float((ohlcv[i][0] if i < len(ohlcv) else ohlcv[-1][0]) or 0.0)
+            ts_sec = (ts_raw / 1000.0) if ts_raw > 1e12 else ts_raw
+        except Exception:
+            ts_sec = 0.0
+        try:
+            sess = str(_session_label_from_ts(ts_sec) or '?')
+        except Exception:
+            sess = '?'
+        res = _simulate_one_setup(ohlcv, i + 1, s)
+        r_mult = float(res.get('R', 0.0) or 0.0)
+        res['R'] = r_mult
+        res['session'] = sess
+        results.append(res)
+        eq += r_mult
+        peak = max(peak, eq)
+        max_dd = max(max_dd, peak - eq)
+        out = str(res.get('outcome') or '').upper().strip()
+        won = out in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2', 'TP3')
+        lost = out in ('SL', 'LOSS', 'SL_FIRST', 'TP1_SL')
+        by_session[sess]['setups'] += 1
+        by_session[sess]['r'].append(r_mult)
+        if won:
+            by_session[sess]['wins'] += 1
+        elif lost:
+            by_session[sess]['losses'] += 1
+        rows.append({
+            'symbol': str(symbol),
+            'setup_id': str(getattr(s, 'setup_id', '') or ''),
+            'ts': float(ts_sec),
+            'day': (datetime.fromtimestamp(float(ts_sec), tz=timezone.utc).strftime('%Y-%m-%d') if ts_sec else ''),
+            'session': str(sess),
+            'outcome': out,
+            'R': float(r_mult),
+            'win': bool(won),
+            'score': float(getattr(s, 'quality_score', 0.0) or 0.0),
+        })
+    total = len(results)
+    wins = sum(1 for r in results if str(r.get('outcome') or '').upper().strip() in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2', 'TP3'))
+    avg_r = (sum(float(r.get('R', 0.0) or 0.0) for r in results) / total) if total else 0.0
+    gross_win = sum(max(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
+    gross_loss = sum(min(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float('inf') if gross_win > 0 else 0.0)
+    by_sess_out = {}
+    for sess, d in dict(by_session).items():
+        s_n = int(d.get('setups', 0) or 0)
+        s_w = int(d.get('wins', 0) or 0)
+        s_l = int(d.get('losses', 0) or 0)
+        s_dec = s_w + s_l
+        rr = d.get('r') or []
+        by_sess_out[str(sess)] = {
+            'setups': s_n,
+            'wins': s_w,
+            'losses': s_l,
+            'decided': s_dec,
+            'win_rate': float((s_w / s_dec * 100.0) if s_dec else 0.0),
+            'avg_R': float((sum(float(x) for x in rr) / len(rr)) if rr else 0.0),
+        }
+    return {
+        'ok': True,
+        'symbol': symbol,
+        'tf': tf,
+        'days': days,
+        'setups': total,
+        'trades': total,
+        'win_rate': float((wins / total * 100.0) if total else 0.0),
+        'avg_R': float(avg_r),
+        'profit_factor': float(pf),
+        'max_drawdown_R': float(max_dd),
+        'equity_R': float(eq),
+        'reject_breakdown': dict(_BT_LAST_REJECTS),
+        'by_session': by_sess_out,
+        'rows': rows,
+    }
+
+
+def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | None = None, top_n: int | None = None, min_vol_usd: float | None = None, persist: bool = True, promoted_context: bool = False) -> dict:
+    _opt_migrate_tables()
+    cfg = load_strategy_config(force=False)
+    exec_tf = str(tf or cfg.get('universe_backtest_exec_tf') or cfg.get('exec_tf_default') or '15m').strip().lower()
+    d = max(3, int(days or 7))
+    top_n = int(max(10, top_n or cfg.get('universe_backtest_top_n', 80) or 80))
+    min_vol_usd = float(min_vol_usd or cfg.get('universe_backtest_min_vol_usd', 10000000.0) or 10000000.0)
+    session_mode = str(session_mode or 'ALL').upper().strip()
+    snap = _build_universe_snapshot_top_volume(top_n=top_n, min_vol_usd=min_vol_usd)
+    universe = list(snap.get('market_symbols') or [])[:top_n]
+    tf_min = _tf_to_minutes(exec_tf)
+    bars = int(min(12000, max(1200, ((d * 1440) / max(1, tf_min)) + 450)))
+    rows = []
+    symbol_reports = []
+    reject_acc = Counter()
+    for sym in universe:
+        try:
+            ohl = fetch_ohlcv(sym, exec_tf, limit=bars)
+        except Exception:
+            ohl = []
+        rep = _run_backtest_on_ohlcv_detailed(sym, ohl, days=d, tf=exec_tf, session_name=session_mode)
+        symbol_reports.append(rep)
+        try:
+            rb = rep.get('reject_breakdown') or {}
+            if isinstance(rb, dict):
+                reject_acc.update(rb)
+        except Exception:
+            pass
+        for rr in (rep.get('rows') or []):
+            if _session_mode_matches(session_mode, rr.get('session')):
+                rows.append(dict(rr))
+    overall = _compute_oos_summary(symbol_reports, days=float(d), conc_cap=float(cfg.get('concentration_cap', 0.25) or 0.25))
+    by_session = _aggregate_by_session(symbol_reports)
+    day_map = {}
+    for rr in rows:
+        day = str(rr.get('day') or '')
+        if not day:
+            continue
+        node = day_map.setdefault(day, {'day': day, 'setups': 0, 'wins': 0, 'losses': 0, 'avg_R_sum': 0.0, 'sessions': {'NY': 0, 'LON': 0, 'ASIA': 0}})
+        node['setups'] += 1
+        if bool(rr.get('win')):
+            node['wins'] += 1
+        else:
+            out = str(rr.get('outcome') or '').upper().strip()
+            if out in ('SL', 'LOSS', 'SL_FIRST', 'TP1_SL'):
+                node['losses'] += 1
+        node['avg_R_sum'] += float(rr.get('R', 0.0) or 0.0)
+        sess = str(rr.get('session') or '').upper()
+        if sess in node['sessions']:
+            node['sessions'][sess] += 1
+    per_day = []
+    for day in sorted(day_map):
+        node = day_map[day]
+        setups_n = int(node['setups'] or 0)
+        wins_n = int(node['wins'] or 0)
+        losses_n = int(node['losses'] or 0)
+        decided_n = wins_n + losses_n
+        per_day.append({
+            'day': day,
+            'setups': setups_n,
+            'wins': wins_n,
+            'losses': losses_n,
+            'win_rate': float((wins_n / decided_n * 100.0) if decided_n else 0.0),
+            'avg_R': float((float(node['avg_R_sum']) / setups_n) if setups_n else 0.0),
+            'by_session': dict(node['sessions']),
+        })
+    metrics = {
+        'days': d,
+        'session_mode': session_mode,
+        'exec_tf': exec_tf,
+        'overall': dict(overall),
+        'overall_win_rate': float(overall.get('win_rate', 0.0) or 0.0),
+        'total_setups': int(overall.get('setups', 0) or 0),
+        'avg_setups_per_day': float(overall.get('setups_per_day', 0.0) or 0.0),
+        'by_session': dict(by_session),
+        'universe_size': int(len(universe)),
+        'top_n': int(top_n),
+        'min_vol_usd': float(min_vol_usd),
+        'reject_breakdown': dict(reject_acc),
+    }
+    run_id = ''
+    if persist:
+        run_id = _db_save_universe_backtest_run(days=d, session_mode=session_mode, exec_tf=exec_tf, universe_snap_id=str(snap.get('snap_id') or ''), universe_size=len(universe), metrics=metrics, per_day=per_day, per_session=by_session, notes='auto' if promoted_context else 'manual', promoted_context=bool(promoted_context))
+    return {
+        'ok': True,
+        'run_id': run_id,
+        'days': d,
+        'session_mode': session_mode,
+        'exec_tf': exec_tf,
+        'universe_snap_id': str(snap.get('snap_id') or ''),
+        'universe_size': int(len(universe)),
+        'metrics': metrics,
+        'overall': dict(overall),
+        'per_day': per_day,
+        'per_session': by_session,
+        'symbol_reports': symbol_reports,
+    }
+
+
+def _format_universe_backtest_report(rep: dict) -> str:
+    if not rep:
+        return 'No universe backtest report.'
+    metrics = rep.get('metrics') or {}
+    overall = rep.get('overall') or metrics.get('overall') or {}
+    per_session = rep.get('per_session') or metrics.get('by_session') or {}
+    per_day = list(rep.get('per_day') or [])
+    lines = [
+        f"🌐 Universe Backtest — {int(rep.get('days') or metrics.get('days') or 0)}d",
+        HDR,
+        f"TF: {str(rep.get('exec_tf') or metrics.get('exec_tf') or '15m')} | Session: {str(rep.get('session_mode') or metrics.get('session_mode') or 'ALL')} | Universe: {int(rep.get('universe_size') or metrics.get('universe_size') or 0)}",
+        f"Total setups: {int(overall.get('setups', 0) or 0)} | Avg/day: {float(overall.get('setups_per_day', 0.0) or 0.0):.2f} | Overall WR: {float(overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(overall.get('avg_R', 0.0) or 0.0):.3f}",
+        'Per session:',
+    ]
+    for sess in ('NY','LON','ASIA'):
+        d = per_session.get(sess) or {}
+        lines.append(f"• {sess}: setups={int(d.get('setups',0) or 0)} | WR={float(d.get('win_rate',0.0) or 0.0):.1f}% | avgR={float(d.get('avg_R',0.0) or 0.0):.3f}")
+    if per_day:
+        lines.append('Per day:')
+        for row in per_day[:35]:
+            bs = row.get('by_session') or {}
+            lines.append(f"• {row.get('day')}: setups={int(row.get('setups',0) or 0)} | WR={float(row.get('win_rate',0.0) or 0.0):.1f}% | NY/LON/ASIA={int(bs.get('NY',0) or 0)}/{int(bs.get('LON',0) or 0)}/{int(bs.get('ASIA',0) or 0)}")
+    return "\n".join(lines)
+
+
+async def cmd_universe_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text('Admin only.')
+        return
+    args = list(context.args or [])
+    days = 7
+    session_mode = 'ALL'
+    tf = None
+    top_n = None
+    if args:
+        try:
+            days = _parse_days(args[0])
+        except Exception:
+            days = 7
+    if len(args) >= 2:
+        session_mode = str(args[1] or 'ALL').upper().strip()
+    if len(args) >= 3:
+        tf = str(args[2] or '').strip() or None
+    if len(args) >= 4:
+        try:
+            top_n = int(args[3])
+        except Exception:
+            top_n = None
+    if int(days) not in (7, 30):
+        await update.message.reply_text('Use /universe_backtest 7 or /universe_backtest 30 [ALL|NY|LON|ASIA] [tf] [topN]')
+        return
+    await update.message.reply_text(f'⏳ Running {int(days)}d universe backtest…')
+    try:
+        rep = await to_thread_heavy(run_universe_backtest, int(days), session_mode, tf, top_n, None, True, False)
+        await send_long_message(update, _format_universe_backtest_report(rep), parse_mode=None)
+    except Exception as e:
+        await update.message.reply_text(f'Universe backtest failed: {type(e).__name__}: {e}')
+
+
 def _evolution_optimizer_wr(session: str | None = None) -> dict:
     report = load_opt_report() or {}
     metrics = report.get("metrics") or {}
@@ -11704,6 +12041,8 @@ def _evolution_estimated_win_rate(session: str | None = None) -> dict:
     sig = _evolution_weighted_wr_from_signal_outcomes(days=EVOLUTION_LOOKBACK_DAYS, session=session)
     live_auto = _evolution_weighted_wr_from_diagnostics(days=EVOLUTION_LOOKBACK_DAYS, session=session, source_type="autotrade")
     opt = _evolution_optimizer_wr(session=session)
+    ubt7 = _db_get_latest_universe_backtest(7) or {}
+    ubt30 = _db_get_latest_universe_backtest(30) or {}
 
     # Base prior uses optimizer OOS if available; otherwise a conservative neutral prior.
     prior_wr = float(opt.get("wr", 55.0) or 55.0) / 100.0 if int(opt.get("sample", 0) or 0) >= 20 else 0.55
@@ -11724,6 +12063,19 @@ def _evolution_estimated_win_rate(session: str | None = None) -> dict:
         alpha += oos_cap * oos_wr
         beta += oos_cap * (1.0 - oos_wr)
 
+    for ubt, cap in ((ubt7, 12.0), (ubt30, 18.0)):
+        try:
+            met = (ubt or {}).get('metrics') or {}
+            ov = met.get('overall') or {}
+            sample = float(ov.get('setups', 0) or 0)
+            wr = float(ov.get('win_rate', 0.0) or 0.0) / 100.0
+            applied = min(cap, sample * 0.10)
+            if applied > 0 and wr > 0:
+                alpha += applied * wr
+                beta += applied * (1.0 - wr)
+        except Exception:
+            continue
+
     est = float(alpha / max(1e-9, (alpha + beta)) * 100.0)
     live_sample = int(sig.get("sample", 0) or 0) + int(live_auto.get("sample", 0) or 0)
     confidence = "low"
@@ -11738,10 +12090,14 @@ def _evolution_estimated_win_rate(session: str | None = None) -> dict:
         "signal_sample": int(sig.get("sample", 0) or 0),
         "autotrade_sample": int(live_auto.get("sample", 0) or 0),
         "optimizer_sample": int(opt.get("sample", 0) or 0),
+        "universe_backtest_7d": (ubt7.get('metrics') or {}),
+        "universe_backtest_30d": (ubt30.get('metrics') or {}),
         "components": {
             "signals": sig,
             "autotrade": live_auto,
             "optimizer_oos": opt,
+            "universe_backtest_7d": ubt7.get('metrics') or {},
+            "universe_backtest_30d": ubt30.get('metrics') or {},
         },
     }
 
@@ -14074,14 +14430,43 @@ def _autonomous_opt_should_run() -> tuple[bool, str]:
             min_closed = int(AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS)
             wr_floor = float(AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW)
             if int(snap.get("closed", 0) or 0) >= min_closed and float(snap.get("win_rate", 0.0) or 0.0) >= wr_floor:
+                ub7 = _db_get_latest_universe_backtest(7) or {}
+                met7 = ub7.get('metrics') or {}
+                ov7 = met7.get('overall') or {}
+                if ov7 and float(ov7.get('win_rate', 0.0) or 0.0) < max(50.0, wr_floor - 10.0):
+                    return (True, 'recent_run_but_7d_universe_wr_soft')
                 return (False, "recent_run_and_performance_ok")
         return (True, "run")
     except Exception:
         return (False, "gate_error")
 
 
+
+async def _refresh_universe_backtests_for_autopilot() -> None:
+    try:
+        cfg = load_strategy_config(force=False)
+        windows = list(cfg.get('universe_backtest_windows') or [7, 30])
+        tf = str(cfg.get('universe_backtest_exec_tf') or cfg.get('exec_tf_default') or '15m')
+        top_n = int(cfg.get('universe_backtest_top_n', 80) or 80)
+        for d in windows[:4]:
+            try:
+                dd = int(d or 0)
+            except Exception:
+                continue
+            if dd < 3:
+                continue
+            last = _db_get_latest_universe_backtest(dd) or {}
+            age_h = (time.time() - float(last.get('created_ts', 0.0) or 0.0)) / 3600.0 if last else 1e9
+            if age_h <= 6.0:
+                continue
+            await to_thread_heavy(run_universe_backtest, dd, 'ALL', tf, top_n, None, True, True)
+    except Exception:
+        return
+
+
 async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
     """Internal autonomous optimizer. No manual trigger required."""
+    await _refresh_universe_backtests_for_autopilot()
     should_run, reason = _autonomous_opt_should_run()
     if not should_run:
         return
@@ -16416,7 +16801,7 @@ KNOWN_COMMANDS = sorted(set([
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
     "signal_report", "signal_report_overall", "email_decision",
-    "params_show", "params_set", "params_reset", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report",
+    "params_show", "params_set", "params_reset", "backtest", "universe_backtest", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report",
 
     # Timezone
     "tz",
@@ -16977,13 +17362,14 @@ ADMIN_HELP_DESCRIPTIONS = {
     "self_optimize_report": "Show latest autonomous optimization result",
     "autopilot_report": "Alias of /self_optimize_report with multi-window autopilot details",
     "autopilot_status": "Alias of /learning_status",
+    "universe_backtest": "Run 7d/30d universe backtest with daily + session summary",
     "trade_id_reset": "Reset your own Trade ID numbering",
 }
 
 ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
-    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log"]),
+    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "autotrade_sessions", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
@@ -23953,6 +24339,8 @@ def main():
     app.add_handler(CommandHandler("self_optimize_report", cmd_self_optimize_report, block=False))
     app.add_handler(CommandHandler("autopilot_report", cmd_self_optimize_report, block=False))
     app.add_handler(CommandHandler("autopilot_status", learning_status_cmd, block=False))
+    app.add_handler(CommandHandler("backtest", cmd_backtest, block=False))
+    app.add_handler(CommandHandler("universe_backtest", cmd_universe_backtest, block=False))
 
 # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
