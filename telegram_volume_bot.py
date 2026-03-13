@@ -4079,7 +4079,17 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             (int(uid), float(cutoff), int(limit)),
         )
         rows = cur.fetchall() or []
-        out = sorted(_load_signals(rows, 'executable_setups'), key=lambda x: (int(getattr(x, 'conf', 0) or 0), float(getattr(x, 'created_ts', 0.0) or 0.0)), reverse=True)
+        # Keep autotrade aligned with the newest executable email lane.
+        # Newest executable_ts / emailed_ts must win; confidence is only a tiebreaker.
+        out = sorted(
+            _load_signals(rows, 'executable_setups'),
+            key=lambda x: (
+                float(getattr(x, 'created_ts', 0.0) or 0.0),
+                float(getattr(x, 'email_logged_ts', 0.0) or 0.0),
+                int(getattr(x, 'conf', 0) or 0),
+            ),
+            reverse=True,
+        )
         if out:
             try:
                 for item in out:
@@ -4325,6 +4335,33 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         live_open_count = int(mday.get('open_positions_now') or 0)
     except Exception:
         live_open_count = 0
+    try:
+        max_trades_day = int((get_user(uid) or {}).get('max_trades_day') or 0)
+    except Exception:
+        max_trades_day = 0
+    try:
+        opened_today_count = int(mday.get('opened_today_count') or 0)
+    except Exception:
+        opened_today_count = 0
+    if max_trades_day > 0 and opened_today_count >= max_trades_day:
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'reject_reason': 'max_trades_day_reached',
+                'opened_today_count': int(opened_today_count),
+                'max_trades_day': int(max_trades_day),
+            })
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(
+                int(uid),
+                setup_id,
+                state=_admin_setup_state_from_reason('risk_cap'),
+                last_reason=f'max_trades_day_reached ({opened_today_count}/{max_trades_day})',
+            )
+        except Exception:
+            pass
+        return (False, 'max_trades_day_reached')
     if int(AUTOTRADE_MAX_OPEN_TRADES or 0) > 0 and live_open_count >= int(AUTOTRADE_MAX_OPEN_TRADES):
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_open_trades_reached', 'open_positions_now': int(live_open_count)})
@@ -15790,15 +15827,18 @@ def send_email(
     """
     global _SMTP_CONN, _SMTP_CONN_IS_SSL, _SMTP_CONN_TS
 
-    # Per-user master email alerts switch
-    if user_id_for_debug is not None:
-        u = get_user(int(user_id_for_debug))
-        if u and not user_email_alerts_enabled(u):
-            _EMAIL_LAST_DECISION["reason"] = "user_email_alerts_disabled"
-            _EMAIL_LAST_DECISION["ts"] = _now()
-            return False
-
     uid = int(user_id_for_debug) if user_id_for_debug is not None else None
+
+    # Per-user master email alerts switch
+    if uid is not None:
+        u = get_user(int(uid))
+        if u and not user_email_alerts_enabled(u):
+            _LAST_EMAIL_DECISION[int(uid)] = {
+                "status": "SKIP",
+                "reason": "user_email_alerts_disabled",
+                "ts": _now(),
+            }
+            return False
 
     # --- SMTP config check (sender side) ---
     if not email_config_ok():
