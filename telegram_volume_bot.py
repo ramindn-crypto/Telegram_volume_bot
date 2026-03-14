@@ -12779,22 +12779,91 @@ def _canon_signal_outcome_label(outcome: str, pnl: float | None = None) -> str:
     return 'OPEN'
 
 
-def _canon_outcome_from_autotrade_trade(trade: dict) -> str:
-    pnl = None
+def _estimate_trade_r_multiple(trade: dict) -> float | None:
     try:
-        pnl = float(trade.get('pnl') if trade.get('pnl') is not None else trade.get('pnl_usdt') or 0.0)
+        entry = float(trade.get('entry') or 0.0)
+        sl = float(trade.get('sl') or 0.0)
+        qty = abs(float(trade.get('qty') or 0.0))
+        pnl = float(trade.get('pnl_usdt') if trade.get('pnl_usdt') is not None else trade.get('pnl') or 0.0)
+        risk = abs(entry - sl) * qty
+        if entry <= 0 or sl <= 0 or qty <= 0 or risk <= 0:
+            return None
+        return float(pnl / risk)
     except Exception:
-        pnl = None
+        return None
+
+
+def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = None) -> str:
+    """Classify a trade into TP1 / TP2 / SL / OPEN using journal + live Bybit state.
+
+    Priority:
+    1) Explicit stored outcomes if present.
+    2) Live reduced-size detection => TP1 for still-open positions after partial take profit.
+    3) Closed trades use pnl/risk to distinguish TP1 vs TP2.
+    """
+    try:
+        pnl = float(trade.get('pnl_usdt') if trade.get('pnl_usdt') is not None else trade.get('pnl') or 0.0)
+    except Exception:
+        pnl = 0.0
     raw = str(trade.get('outcome') or '').upper().strip()
+    status = str(trade.get('status') or '').upper().strip()
+
     if raw in {'WIN_TP2', 'WIN_TP3', 'TP2'}:
         return 'TP2'
     if raw in {'WIN_TP1', 'TP1'}:
         return 'TP1'
-    if raw in {'LOSS', 'SL'}:
+    if raw in {'LOSS', 'SL', 'SL_FIRST', 'TP1_SL'}:
         return 'SL'
-    if raw in {'WIN', 'BREAKEVEN'}:
-        return _canon_signal_outcome_label(raw, pnl=pnl)
-    return _canon_signal_outcome_label(raw, pnl=pnl)
+
+    # Current live position => OPEN or TP1 if reduced after partial take profit.
+    if live_pos is not None or status == 'OPEN':
+        try:
+            orig_qty = abs(float(trade.get('qty') or 0.0))
+        except Exception:
+            orig_qty = 0.0
+        try:
+            live_qty = abs(_pos_size(live_pos)) if live_pos is not None else 0.0
+        except Exception:
+            live_qty = 0.0
+        if orig_qty > 0 and live_qty > 0:
+            try:
+                partial_fraction = float(AUTOTRADE_LIVE_TP1_FRACTION or 0.65)
+            except Exception:
+                partial_fraction = 0.65
+            partial_fraction = max(0.25, min(0.85, partial_fraction))
+            qty_drop_threshold = max(orig_qty * 0.45, orig_qty * (1.0 - partial_fraction + 0.08))
+            if live_qty <= qty_drop_threshold or live_qty < orig_qty * 0.88:
+                return 'TP1'
+        return 'OPEN'
+
+    # Closed trade with no explicit TP-stage label: infer from realized pnl versus planned risk.
+    if pnl < 0:
+        return 'SL'
+    if abs(pnl) < 1e-9:
+        return 'OPEN'
+
+    r_mult = _estimate_trade_r_multiple(trade)
+    try:
+        entry = float(trade.get('entry') or 0.0)
+        sl = float(trade.get('sl') or 0.0)
+        tp1 = float(trade.get('tp1') or 0.0)
+        tp2 = float(trade.get('tp2') or 0.0)
+        risk_per_unit = abs(entry - sl)
+        rr1 = (abs(tp1 - entry) / risk_per_unit) if risk_per_unit > 0 and tp1 > 0 else 0.0
+        rr2 = (abs(tp2 - entry) / risk_per_unit) if risk_per_unit > 0 and tp2 > 0 else 0.0
+        partial_fraction = max(0.25, min(0.85, float(AUTOTRADE_LIVE_TP1_FRACTION or 0.65)))
+        tp1_credit = partial_fraction * rr1 if rr1 > 0 else 0.0
+        tp2_credit = tp1_credit + ((1.0 - partial_fraction) * rr2 if rr2 > 0 else 0.0)
+    except Exception:
+        tp1_credit = 0.0
+        tp2_credit = 0.0
+
+    if r_mult is not None:
+        if tp2_credit > 0 and r_mult >= max(tp2_credit * 0.80, tp1_credit + 0.05):
+            return 'TP2'
+        if tp1_credit > 0 and r_mult >= max(tp1_credit * 0.55, 0.05):
+            return 'TP1'
+    return 'TP1'
 
 
 def _signal_report_setup_meta(setup_id: str) -> dict:
@@ -12888,57 +12957,109 @@ def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | 
             current_positions = list(_bybit_get_open_positions_linear() or [])
         except Exception:
             current_positions = []
-    recent_trades = _signal_report_load_recent_trades(user_id, limit=1200)
+
+    # Current live positions by symbol+side.
+    pos_map = {}
+    for p in current_positions or []:
+        try:
+            key = (_bybit_linear_symbol(_pos_symbol(p)), _norm_trade_side(_pos_side_text(p)))
+            if key[0] and key[1] and key not in pos_map:
+                pos_map[key] = p
+        except Exception:
+            pass
+
+    # Load recent autotrades and organize them by symbol+side for one-to-one matching.
+    recent_trades = _signal_report_load_recent_trades(user_id, limit=3000)
+    trades_by_key = {}
+    for t in recent_trades:
+        try:
+            key = (_bybit_linear_symbol(str(t.get('symbol') or '')), _norm_trade_side(str(t.get('side') or '')))
+            if key[0] and key[1]:
+                trades_by_key.setdefault(key, []).append(t)
+        except Exception:
+            pass
+    for key in list(trades_by_key.keys()):
+        trades_by_key[key].sort(key=lambda r: (float(r.get('opened_ts') or 0.0), float(r.get('closed_ts') or 0.0)))
+
+    used_trade_ids: set[str] = set()
     rows = []
     hidden_untracked_open = 0
 
-    for e in emailed or []:
+    # Resolve in chronological order so a repeated symbol+side maps to the nearest distinct trade lifecycle.
+    emailed_sorted = sorted(list(emailed or []), key=lambda e: float(e.get('emailed_ts') or 0.0))
+
+    def _best_trade_for_email(symbol: str, side: str, emailed_ts: float, exact_trade_id: str = '') -> dict | None:
+        key = (_bybit_linear_symbol(symbol), _norm_trade_side(side))
+        cands = [dict(x) for x in (trades_by_key.get(key) or []) if str(x.get('trade_id') or '') not in used_trade_ids]
+        if not cands:
+            return None
+        if exact_trade_id:
+            for c in cands:
+                if str(c.get('trade_id') or '') == str(exact_trade_id):
+                    return c
+        def _score(r: dict):
+            opened = float(r.get('opened_ts') or 0.0)
+            closed = float(r.get('closed_ts') or 0.0)
+            status = str(r.get('status') or '').upper().strip()
+            dt = abs(opened - float(emailed_ts or 0.0)) if opened > 0 and emailed_ts > 0 else 10**12
+            # Prefer trades opened near the emailed setup time; heavily penalize very distant rows.
+            far_pen = 0 if dt <= 12 * 3600 else (1 if dt <= 48 * 3600 else 2)
+            future_pen = 0 if opened >= (float(emailed_ts or 0.0) - 1800.0) else 1
+            status_pen = 0 if status == 'CLOSED' else 1
+            return (far_pen, future_pen, dt, status_pen, -opened, -closed)
+        cands.sort(key=_score)
+        return cands[0] if cands else None
+
+    unresolved_live_rows: dict[tuple[str, str], list[int]] = {}
+
+    for e in emailed_sorted:
         setup_id = str(e.get('setup_id') or '').strip()
         sess = str(e.get('session') or '').strip().upper() or '?'
         meta_sig = _signal_report_setup_meta(setup_id)
         life = _admin_setup_lifecycle_get(setup_id) if setup_id else {}
         symbol = _bybit_linear_symbol(str(meta_sig.get('symbol') or life.get('symbol') or ''))
         side = _norm_trade_side(str(meta_sig.get('side') or life.get('side') or ''))
-        canon, meta = _canonical_signal_outcome_for_setup(user_id, setup_id)
-        meta = dict(meta or {})
         emailed_ts = float(e.get('emailed_ts') or meta_sig.get('created_ts') or 0.0)
+        trade_id_exact = str((life or {}).get('trade_id') or '').strip()
 
-        matched_live = None
-        if live_mode and symbol and side:
-            for p in current_positions:
-                try:
-                    if _symbol_match_loose(_pos_symbol(p), symbol) and _norm_trade_side(_pos_side_text(p)) == side:
-                        matched_live = p
-                        break
-                except Exception:
-                    pass
-        if matched_live is not None:
-            canon = 'OPEN'
-            meta['source'] = 'matched_live_symbol_side'
-            meta['position'] = matched_live
-        elif symbol and side:
-            trade = _signal_report_find_trade_for_setup(user_id, symbol, side, emailed_ts)
-            if trade:
-                meta.setdefault('trade', trade)
-                status = str(trade.get('status') or '').upper().strip()
-                if status == 'OPEN':
+        canon = 'None'
+        meta = {}
+
+        # 1) Exact lifecycle-backed signal outcome / trade if present.
+        base_canon, base_meta = _canonical_signal_outcome_for_setup(user_id, setup_id)
+        base_meta = dict(base_meta or {})
+        trade = dict(base_meta.get('trade') or {}) if isinstance(base_meta.get('trade'), dict) else None
+        live_pos = None
+        if symbol and side:
+            live_pos = pos_map.get((symbol, side))
+
+        if trade and str(trade.get('trade_id') or ''):
+            used_trade_ids.add(str(trade.get('trade_id') or ''))
+            canon = _canon_outcome_from_autotrade_trade(trade, live_pos=live_pos)
+            meta = base_meta
+            meta['source'] = str(meta.get('source') or 'lifecycle_trade')
+        else:
+            # 2) One-to-one match by symbol+side and nearest open time.
+            matched = _best_trade_for_email(symbol, side, emailed_ts, exact_trade_id=trade_id_exact)
+            if matched is not None:
+                used_trade_ids.add(str(matched.get('trade_id') or ''))
+                canon = _canon_outcome_from_autotrade_trade(matched, live_pos=live_pos)
+                meta = {'source': 'matched_trade_by_symbol_side_time', 'trade': matched}
+            else:
+                # 3) No trade found. Only the newest unresolved row for a currently live symbol+side can be OPEN.
+                if live_pos is not None and symbol and side:
                     canon = 'OPEN'
-                    meta['source'] = 'matched_open_trade'
-                elif status == 'CLOSED' or float(trade.get('closed_ts') or 0.0) > 0:
-                    canon = _canon_outcome_from_autotrade_trade(trade)
-                    meta['source'] = 'matched_closed_trade'
-
-        src = str(meta.get('source') or '').lower()
-        if live_mode and str(canon).upper().strip() == 'OPEN' and src not in {'live_position', 'matched_live_symbol_side', 'matched_open_trade'}:
-            hidden_untracked_open += 1
-            canon = 'None'
+                    meta = {'source': 'fallback_live_symbol_side', 'position': live_pos}
+                else:
+                    canon = 'None'
+                    meta = {'source': 'untracked'}
 
         created_ts = float(meta_sig.get('created_ts') or emailed_ts or 0.0)
         created_str = datetime.fromtimestamp(created_ts, tz).strftime('%m-%d %H:%M') if created_ts > 0 else '-'
         base_sym = _symbol_base(symbol) or '?'
         conf = meta_sig.get('conf')
         conf = int(conf or 0) if conf is not None else '-'
-        rows.append({
+        row = {
             'setup_id': setup_id,
             'session': sess,
             'time': created_str,
@@ -12949,34 +13070,45 @@ def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | 
             'source': str(meta.get('source') or ''),
             'symbol': symbol,
             'side': side,
-        })
+        }
+        rows.append(row)
+        if row['outcome'] == 'OPEN' and str(meta.get('source') or '') == 'fallback_live_symbol_side' and symbol and side:
+            unresolved_live_rows.setdefault((symbol, side), []).append(len(rows) - 1)
+        if row['outcome'] == 'None' and live_mode:
+            hidden_untracked_open += 1
 
-    # Secondary pass: if a current live Bybit position exists for symbol+side, keep the newest emailed row OPEN.
-    if live_mode and current_positions:
-        newest_by_key = {}
-        for idx, r in enumerate(rows):
-            key = (_bybit_linear_symbol(str(r.get('symbol') or '')), _norm_trade_side(str(r.get('side') or '')))
-            ts = float(r.get('emailed_ts') or 0.0)
-            cur = newest_by_key.get(key)
-            if cur is None or ts > cur[1]:
-                newest_by_key[key] = (idx, ts)
-        for p in current_positions:
-            try:
-                key = (_bybit_linear_symbol(_pos_symbol(p)), _norm_trade_side(_pos_side_text(p)))
-                item = newest_by_key.get(key)
-                if item is not None:
-                    idx = item[0]
-                    rows[idx]['outcome'] = 'OPEN'
-                    rows[idx]['source'] = 'matched_live_symbol_side'
-                # any older unresolved duplicate rows for same live key should become None
-                for j, r in enumerate(rows):
-                    if j == (item[0] if item is not None else -1):
-                        continue
-                    if (_bybit_linear_symbol(str(r.get('symbol') or '')), _norm_trade_side(str(r.get('side') or ''))) == key and str(r.get('outcome') or '') == 'OPEN':
-                        rows[j]['outcome'] = 'None'
-                        rows[j]['source'] = 'older_duplicate_live_signal'
-            except Exception:
-                pass
+    # Keep only the newest fallback OPEN row per current live symbol+side; older duplicates become None.
+    for key, idxs in unresolved_live_rows.items():
+        if len(idxs) <= 1:
+            continue
+        idxs_sorted = sorted(idxs, key=lambda i: float(rows[i].get('emailed_ts') or 0.0), reverse=True)
+        keep = idxs_sorted[0]
+        for j in idxs_sorted[1:]:
+            rows[j]['outcome'] = 'None'
+            rows[j]['source'] = 'older_duplicate_live_signal'
+            hidden_untracked_open += 1
+
+    # Final guard: any OPEN row that is not backed by a current live position or an open matched trade becomes None.
+    for r in rows:
+        src = str(r.get('source') or '').lower()
+        if str(r.get('outcome') or '').upper().strip() == 'OPEN':
+            if src in {'matched_trade_by_symbol_side_time', 'lifecycle_trade', 'autotrade_open_trade', 'live_position', 'autotrade_trade_sync'}:
+                # Confirm open backing.
+                key = (_bybit_linear_symbol(str(r.get('symbol') or '')), _norm_trade_side(str(r.get('side') or '')))
+                if key not in pos_map:
+                    tr = None
+                    # best-effort check: still allow if matched trade itself remains OPEN and current position exists by exact lookup failed.
+                    # otherwise demote to None.
+                    tr = _signal_report_find_trade_for_setup(user_id, key[0], key[1], float(r.get('emailed_ts') or 0.0)) if key[0] and key[1] else None
+                    tr_status = str((tr or {}).get('status') or '').upper().strip() if tr else ''
+                    if tr_status != 'OPEN':
+                        r['outcome'] = 'None'
+                        r['source'] = 'stale_open_demoted'
+                        hidden_untracked_open += 1
+            elif src not in {'fallback_live_symbol_side', 'matched_open_trade', 'matched_live_symbol_side'}:
+                r['outcome'] = 'None'
+                r['source'] = 'untracked_open_demoted'
+                hidden_untracked_open += 1
 
     return rows, hidden_untracked_open
 
