@@ -7018,12 +7018,12 @@ def reset_daily_if_needed(user: dict) -> dict:
 
 
 def list_users_notify_on() -> List[dict]:
-    """Users who should receive *scan* emails.
+    """Users who should receive trade-signal / scan emails.
 
-    Key points (matches the behavior of the 14–15 Feb working builds):
-    - Primary rule: notify_on=1 AND has a saved email address.
-    - Admins are ALWAYS included if they have an email saved, even if notify_on=0.
-      (This uses is_admin_user(), not ADMIN_USER_IDS, so it works with env single-admin setups.)
+    Sync rules:
+    - Primary rule: notify_on=1 AND email_alerts_enabled=1 AND has a saved email address.
+    - Admins are ALWAYS included if they have an email saved, even if notify_on=0,
+      but still respect the master email switch when that column exists.
     """
     con = db_connect()
     try:
@@ -7034,7 +7034,6 @@ def list_users_notify_on() -> List[dict]:
 
     cur = con.cursor()
 
-    # Detect whether DB uses users.email or only users.email_to (older schemas)
     cols = set()
     try:
         cur.execute("PRAGMA table_info(users)")
@@ -7047,26 +7046,29 @@ def list_users_notify_on() -> List[dict]:
         email_fields.append("email")
     if "email_to" in cols:
         email_fields.append("email_to")
-
-    # If we can't detect, fall back to both names in the WHERE (SQLite will error),
-    # so only use a safe default.
     if not email_fields:
         email_fields = ["email_to"]
 
     email_ok_where = " OR ".join([f"({c} IS NOT NULL AND TRIM({c})!='')" for c in email_fields])
+    master_on_where = "COALESCE(email_alerts_enabled, 1) = 1" if "email_alerts_enabled" in cols else "1=1"
 
-    # 1) notify_on users
+    # 1) users opted into trade-signal emails
     try:
-        cur.execute(f"SELECT * FROM users WHERE notify_on=1 AND ({email_ok_where})")
+        cur.execute(
+            f"SELECT * FROM users WHERE notify_on=1 AND ({master_on_where}) AND ({email_ok_where})"
+        )
         rows = [dict(r) for r in cur.fetchall()]
     except Exception:
-        # fallback: just notify_on=1
-        cur.execute("SELECT * FROM users WHERE notify_on=1")
+        # fallback for older schemas
+        try:
+            cur.execute(f"SELECT * FROM users WHERE notify_on=1 AND ({email_ok_where})")
+        except Exception:
+            cur.execute("SELECT * FROM users WHERE notify_on=1")
         rows = [dict(r) for r in cur.fetchall()]
 
-    # 2) admins with an email saved (even if notify_on=0)
+    # 2) admins with an email saved (even if notify_on=0), but respect master switch
     try:
-        cur.execute(f"SELECT * FROM users WHERE ({email_ok_where})")
+        cur.execute(f"SELECT * FROM users WHERE ({master_on_where}) AND ({email_ok_where})")
         for r in cur.fetchall():
             d = dict(r)
             try:
@@ -17577,6 +17579,12 @@ def set_user_email_alerts_enabled(uid: int, enabled: bool):
     update_user(int(uid), email_alerts_enabled=(1 if enabled else 0))
 
 
+def set_user_trade_signal_email_enabled(uid: int, enabled: bool):
+    """Keep the trade-signal recipient gate aligned with the user's email master switch."""
+    flag = 1 if enabled else 0
+    update_user(int(uid), email_alerts_enabled=flag, notify_on=flag)
+
+
 def _mask_email_addr(email: str) -> str:
     try:
         email = str(email or '').strip()
@@ -17700,7 +17708,7 @@ async def email_on_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     enabled = arg in ("on", "enable")
-    set_user_email_alerts_enabled(uid, enabled)
+    set_user_trade_signal_email_enabled(uid, enabled)
     await update.message.reply_text(
         "✅ Email alerts updated\n"
         "────────────────────\n"
@@ -17975,12 +17983,12 @@ async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Support /email off|on
     if arg in ("off", "0", "disable", "disabled"):
-        set_user_email_alerts_enabled(uid, False)
+        set_user_trade_signal_email_enabled(uid, False)
         await update.message.reply_text("✅ Email alerts: OFF")
         return
 
     if arg in ("on", "1", "enable", "enabled"):
-        set_user_email_alerts_enabled(uid, True)
+        set_user_trade_signal_email_enabled(uid, True)
         await update.message.reply_text("✅ Email alerts: ON")
         return
 
@@ -17996,7 +18004,7 @@ async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         set_user_email(uid, email)
-        set_user_email_alerts_enabled(uid, True)
+        set_user_trade_signal_email_enabled(uid, True)
 
         await update.message.reply_text(
             f"✅ Recipient email saved:\n{email}\n\n"
