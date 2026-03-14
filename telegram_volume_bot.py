@@ -13279,6 +13279,7 @@ def _canonical_wr_stats(rows: list[dict]) -> dict:
     decided = 0
     wins = 0
     losses = 0
+    tp2_wins = 0
     for r in rows or []:
         out = _display_signal_outcome(r.get('outcome'))
         sess = str(r.get('session') or '?').upper().strip() or '?'
@@ -13286,19 +13287,22 @@ def _canonical_wr_stats(rows: list[dict]) -> dict:
         by_session[sess][out] += 1
         if out in {'TP1', 'TP2', 'SL'}:
             decided += 1
-        if out == 'TP2':
+        if out in {'TP1', 'TP2'}:
             wins += 1
+        if out == 'TP2':
+            tp2_wins += 1
         elif out == 'SL':
             losses += 1
     wr = (wins / decided * 100.0) if decided > 0 else 0.0
     by_sess = {}
     for sess, ctr in by_session.items():
         s_dec = int(ctr.get('TP1', 0) + ctr.get('TP2', 0) + ctr.get('SL', 0))
-        s_win = int(ctr.get('TP2', 0))
+        s_win = int(ctr.get('TP1', 0) + ctr.get('TP2', 0))
         by_sess[sess] = {
             'total': int(sum(ctr.values())),
             'decided': s_dec,
             'wins': s_win,
+            'tp2_wins': int(ctr.get('TP2', 0)),
             'losses': int(ctr.get('SL', 0)),
             'tp1': int(ctr.get('TP1', 0)),
             'tp2': int(ctr.get('TP2', 0)),
@@ -13312,6 +13316,7 @@ def _canonical_wr_stats(rows: list[dict]) -> dict:
         'by_session': by_sess,
         'decided': int(decided),
         'wins': int(wins),
+        'tp2_wins': int(tp2_wins),
         'losses': int(losses),
         'win_rate': float(wr),
     }
@@ -20558,7 +20563,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     header = [
         f"📊 Signal Report (last {lookback_h}h)",
         HDR,
-        f"Total: {len(rows)} | Decided: {int(stats.get('decided') or 0)} | Wins (TP2): {int(stats.get('wins') or 0)} | Losses: {int(stats.get('losses') or 0)} | Win rate: {float(stats.get('win_rate') or 0.0):.1f}%",
+        f"Total: {len(rows)} | Decided: {int(stats.get('decided') or 0)} | Wins (TP1/TP2): {int(stats.get('wins') or 0)} | TP2 wins: {int(stats.get('tp2_wins') or 0)} | Losses: {int(stats.get('losses') or 0)} | Win rate: {float(stats.get('win_rate') or 0.0):.1f}%",
         f"TP1: {counts.get('TP1',0)} | TP2: {counts.get('TP2',0)} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)} | None: {counts.get('None',0)}",
         HDR,
     ]
@@ -20715,7 +20720,7 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         f'Evaluated: {evaluated} ({coverage:.1f}% coverage)',
         SEP,
         f'Completed outcomes: {int(stats.get("decided") or 0)}',
-        f'Wins (TP2): {int(stats.get("wins") or 0)} | Losses: {int(stats.get("losses") or 0)} | Signal WR: {float(stats.get("win_rate") or 0.0):.1f}%',
+        f'Wins (TP1/TP2): {int(stats.get("wins") or 0)} | TP2 wins: {int(stats.get("tp2_wins") or 0)} | Losses: {int(stats.get("losses") or 0)} | Signal WR: {float(stats.get("win_rate") or 0.0):.1f}%',
         f'TP1: {counts.get("TP1",0)} | TP2: {counts.get("TP2",0)} | SL: {counts.get("SL",0)} | Open: {counts.get("OPEN",0)}',
     ]
     if by_session:
