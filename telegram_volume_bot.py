@@ -1124,6 +1124,25 @@ def _strategy_config_defaults() -> dict:
         "universe_backtest_min_vol_usd": 10000000.0,
         "universe_backtest_windows": [7, 30],
         "universe_backtest_exec_tf": "15m",
+
+        # Daily market-adaptive universe optimizer (runtime params only; no source rewriting)
+        "market_adaptive_enabled": True,
+        "market_adaptive_interval_hours": 24.0,
+        "market_adaptive_days": 30,
+        "market_adaptive_max_passes": 2,
+        "market_adaptive_min_improvement": 0.35,
+        "market_adaptive_target_setups_per_day_lo": 4.0,
+        "market_adaptive_target_setups_per_day_hi": 10.0,
+        "market_adaptive_session_wr_floor_ny": 46.0,
+        "market_adaptive_session_wr_floor_lon": 48.0,
+        "market_adaptive_cooldown_hours": 20.0,
+        "execution_asia_enabled": bool(EXECUTION_ASIA_ENABLED),
+        "execution_engine_b_email_enabled": bool(EXECUTION_ENGINE_B_EMAIL_ENABLED),
+        "session_exec_overrides": {
+            "NY": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
+            "LON": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
+            "ASIA": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
+        },
     }
 
 _STRATEGY_CFG_CACHE = {"ts": 0.0, "cfg": None}
@@ -1198,6 +1217,22 @@ def _clamp(v: float, lo: float, hi: float) -> float:
         return max(float(lo), min(float(hi), float(v)))
     except Exception:
         return float(lo)
+
+def _cfg_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    try:
+        s = str(value).strip().lower()
+        if s in {"1", "true", "yes", "on", "y"}:
+            return True
+        if s in {"0", "false", "no", "off", "n", ""}:
+            return False
+        return bool(int(float(s)))
+    except Exception:
+        return bool(default)
+
 
 def apply_strategy_config(cfg: dict) -> None:
     """Apply StrategyConfig into global tunables used throughout the bot."""
@@ -5645,9 +5680,13 @@ def _effective_hb_status_line(name: str, stale_after_sec: int, label: str | None
 def _admin_assurance_verdict(uid: int | None = None) -> tuple[str, list[str]]:
     blockers = []
     owner = int(uid or AUTOTRADE_OWNER_UID or 0)
-    for name, ttl in (("autotrade", 180), ("email", max(180, int(CHECK_INTERVAL_MIN * 120))), ("learning_hourly", max(1800, int(EVOLUTION_HOURLY_INTERVAL_MIN * 180))), ("optimizer", max(7200, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 7200)))):
+    market_cfg = load_strategy_config(force=False)
+    market_ttl = max(7200, int(float((market_cfg or {}).get("market_adaptive_interval_hours", 24.0) or 24.0) * 7200))
+    for name, ttl in (("autotrade", 180), ("email", max(180, int(CHECK_INTERVAL_MIN * 120))), ("learning_hourly", max(1800, int(EVOLUTION_HOURLY_INTERVAL_MIN * 180))), ("optimizer", max(7200, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 7200))), ("market_adaptive", market_ttl)):
         st, _ = _effective_hb_status_line(name, ttl, uid=owner)
         if name == "optimizer" and not AUTONOMOUS_OPT_ENABLED:
+            continue
+        if name == "market_adaptive" and not _cfg_bool((market_cfg or {}).get("market_adaptive_enabled", True), True):
             continue
         if name in {"learning_hourly"} and not EVOLUTION_ENABLED:
             continue
@@ -5727,6 +5766,8 @@ def _learning_status_text() -> str:
     hourly_state, hourly_reason = _component_runtime_state("learning_hourly", max(1800, int(EVOLUTION_HOURLY_INTERVAL_MIN * 180)), enabled=bool(EVOLUTION_ENABLED), no_data=hourly_no_data, waiting_text="waiting_for_hourly_cycle")
     daily_state, daily_reason = _component_runtime_state("learning_daily", max(21600, int(EVOLUTION_DAILY_INTERVAL_HOURS * 5400)), enabled=bool(EVOLUTION_ENABLED), no_data=daily_no_data, waiting_text="waiting_for_daily_cycle")
     opt_state, opt_reason = _component_runtime_state("optimizer", max(7200, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 7200)), enabled=bool(AUTONOMOUS_OPT_ENABLED), no_data=opt_no_data, waiting_text="waiting_for_optimizer_window")
+    market_cfg = load_strategy_config(force=False)
+    market_adaptive_state, market_adaptive_reason = _component_runtime_state("market_adaptive", max(7200, int(float((market_cfg or {}).get("market_adaptive_interval_hours", 24.0) or 24.0) * 7200)), enabled=_cfg_bool((market_cfg or {}).get("market_adaptive_enabled", True), True), no_data=False, waiting_text="waiting_for_daily_market_adaptive_cycle")
     email_state, _ = _component_runtime_state("email", max(180, int(CHECK_INTERVAL_MIN * 120)), enabled=bool(EMAIL_ENABLED and email_config_ok()), no_data=False, waiting_text="waiting_for_email_loop")
 
     optimizer_live_changes = []
@@ -5744,6 +5785,7 @@ def _learning_status_text() -> str:
         f"Hourly learning: {_status_label(hourly_state)}" + (f" | {hourly_reason}" if hourly_reason and hourly_state != "ACTIVE" else ""),
         f"Daily review: {_status_label(daily_state)}" + (f" | {daily_reason}" if daily_reason and daily_state != "ACTIVE" else ""),
         f"Optimizer: {_status_label(opt_state)}" + (f" | {opt_reason}" if opt_reason and opt_state != "ACTIVE" else ""),
+        f"Market-adaptive 30d tuner: {_status_label(market_adaptive_state)}" + (f" | {market_adaptive_reason}" if market_adaptive_reason and market_adaptive_state != "ACTIVE" else ""),
         f"Email loop: {_status_label(email_state)}",
         SEP,
         _format_last_run_line("Last hourly cycle", hourly),
@@ -5772,6 +5814,7 @@ def _learning_status_text() -> str:
         "• Closed-trade PnL is already used automatically for day-risk accounting and admin reports.",
         "• TP-stage learning is automatic through stored signal outcomes and now feeds the live conditional break-even-after-TP1 rule.",
         "• Zero-touch autopilot now re-tests shortlisted parameter sets across 7d / 14d / 21d / 30d windows before any live promotion.",
+        "• Daily market-adaptive tuning now runs a bounded 30d universe backtest loop and auto-adjusts live runtime parameters with automatic revert if the score gets worse.",
         "• The bot does NOT rewrite its own source code or GitHub file.",
     ])
 
@@ -15414,6 +15457,373 @@ async def _refresh_universe_backtests_for_autopilot() -> None:
         return
 
 
+def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
+    cfg = cfg or load_strategy_config(force=False)
+    overall = (rep or {}).get('overall') or ((rep or {}).get('metrics') or {}).get('overall') or {}
+    per_session = (rep or {}).get('per_session') or ((rep or {}).get('metrics') or {}).get('by_session') or {}
+    live_setups = int(overall.get('setups', 0) or 0)
+    setups_day = float(overall.get('setups_per_day', 0.0) or 0.0)
+    wr = float(overall.get('win_rate', 0.0) or 0.0)
+    avg_r = float(overall.get('avg_R', 0.0) or 0.0)
+    pf = float(overall.get('profit_factor', 0.0) or 0.0)
+
+    lo = float((cfg or {}).get('market_adaptive_target_setups_per_day_lo', 4.0) or 4.0)
+    hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 10.0) or 10.0)
+    ny_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
+    lon_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
+
+    score = 0.0
+    score += float(avg_r) * 320.0
+    score += (float(wr) - 45.0) * 1.35
+    score += max(0.0, float(pf) - 1.0) * 8.0
+    if live_setups < 45:
+        score -= float(45 - live_setups) * 0.18
+    if setups_day < lo:
+        score -= float(lo - setups_day) * 4.0
+    elif setups_day > hi:
+        score -= float(setups_day - hi) * 2.4
+
+    for sess, floor, wt in (('NY', ny_floor, 1.4), ('LON', lon_floor, 1.2)):
+        sd = (per_session or {}).get(sess) or {}
+        s_setups = int(sd.get('setups', 0) or 0)
+        s_wr = float(sd.get('win_rate', 0.0) or 0.0)
+        if s_setups >= 15 and s_wr < floor:
+            score -= float(floor - s_wr) * float(wt)
+        elif s_setups >= 12 and s_wr > (floor + 6.0):
+            score += float(min(4.0, s_wr - floor)) * 0.25
+
+    asia_live = int(((per_session or {}).get('ASIA') or {}).get('setups', 0) or 0)
+    if asia_live > 0 and not _cfg_bool((cfg or {}).get('execution_asia_enabled', False), False):
+        score -= float(asia_live) * 0.35
+    return float(score)
+
+
+def _market_adaptive_apply_action(cfg: dict, actions: list[dict], param: str, value, reason: str) -> None:
+    def _set_path(d: dict, parts: list[str], v):
+        cur = d
+        for key in parts[:-1]:
+            nxt = cur.get(key)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                cur[key] = nxt
+            cur = nxt
+        cur[parts[-1]] = v
+
+    parts = [p for p in str(param or '').split('.') if p]
+    if not parts:
+        return
+    cur = cfg
+    found = True
+    for key in parts:
+        if isinstance(cur, dict) and key in cur:
+            old = cur.get(key)
+            cur = cur.get(key)
+        else:
+            found = False
+            old = None
+            break
+    if found and old == value:
+        return
+    _set_path(cfg, parts, value)
+    actions.append({"param": str(param), "from": old, "to": value, "reason": str(reason)})
+
+
+def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
+    out = json.loads(json.dumps(cfg or {}))
+    bounds = (out.get('opt_bounds') or {})
+
+    def _rng(name: str, lo: float, hi: float) -> tuple[float, float]:
+        try:
+            r = bounds.get(name) or [lo, hi]
+            return float(r[0]), float(r[1])
+        except Exception:
+            return float(lo), float(hi)
+
+    qlo, qhi = _rng('quality_score_min_screen', 52.0, 70.0)
+    out['quality_score_min_screen'] = float(clamp(float(out.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), qlo, qhi))
+    email_lo = max(qlo + 2.0, 54.0)
+    email_hi = min(qhi + 12.0, 84.0)
+    out['quality_score_min_email'] = float(clamp(float(out.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), email_lo, email_hi))
+    rrlo, rrhi = _rng('min_rr_tp3', 1.3, 2.4)
+    out['min_rr_tp3'] = float(clamp(float(out.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3), rrlo, rrhi))
+    alo, ahi = _rng('atr_min_pct', 0.4, 1.5)
+    out['atr_min_pct'] = float(clamp(float(out.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT), alo, ahi))
+    tlo, thi = _rng('tf_align_1h_min_abs', 0.3, 1.2)
+    out['tf_align_1h_min_abs'] = float(clamp(float(out.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), tlo, thi))
+    out['execution_asia_enabled'] = _cfg_bool(out.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED))
+    out['execution_engine_b_email_enabled'] = _cfg_bool(out.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
+    sess_ov = out.get('session_exec_overrides') or {}
+    norm_ov = {}
+    for sess in ('NY', 'LON', 'ASIA'):
+        row = sess_ov.get(sess) or {}
+        norm_ov[sess] = {
+            'quality_add': float(clamp(float(row.get('quality_add', 0.0) or 0.0), -6.0, 6.0)),
+            'conf_add': int(max(-4, min(6, int(round(float(row.get('conf_add', 0) or 0)))))),
+            'rr_add': float(clamp(float(row.get('rr_add', 0.0) or 0.0), -0.30, 0.40)),
+        }
+    out['session_exec_overrides'] = norm_ov
+    return out
+
+
+def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], list[str]]:
+    cfg = _market_adaptive_clamp_cfg(cfg)
+    overall = (rep or {}).get('overall') or {}
+    per_session = (rep or {}).get('per_session') or {}
+    metrics = (rep or {}).get('metrics') or {}
+    live_rejects = metrics.get('live_equivalent_reject_breakdown') or {}
+    actions: list[dict] = []
+    notes: list[str] = []
+
+    setups_day = float(overall.get('setups_per_day', 0.0) or 0.0)
+    wr = float(overall.get('win_rate', 0.0) or 0.0)
+    avg_r = float(overall.get('avg_R', 0.0) or 0.0)
+    total_setups = int(overall.get('setups', 0) or 0)
+    lo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 4.0) or 4.0)
+    hi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 10.0) or 10.0)
+    ny_floor = float(cfg.get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
+    lon_floor = float(cfg.get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
+
+    if _cfg_bool(cfg.get('execution_asia_enabled', False), False):
+        asia = (per_session or {}).get('ASIA') or {}
+        if int(asia.get('setups', 0) or 0) >= 10 and float(asia.get('win_rate', 0.0) or 0.0) < 44.0:
+            _market_adaptive_apply_action(cfg, actions, 'execution_asia_enabled', False, 'ASIA_30d_live_WR_too_low')
+            notes.append('Disabled ASIA executable lane due to weak 30d live-equivalent session edge.')
+
+    for sess, floor in (('NY', ny_floor), ('LON', lon_floor)):
+        sd = (per_session or {}).get(sess) or {}
+        s_setups = int(sd.get('setups', 0) or 0)
+        s_wr = float(sd.get('win_rate', 0.0) or 0.0)
+        ov = ((cfg.get('session_exec_overrides') or {}).get(sess) or {}).copy()
+        if s_setups >= 15 and s_wr < floor:
+            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.quality_add', round(float(ov.get('quality_add', 0.0) or 0.0) + 0.75, 2), f'{sess}_WR_below_floor')
+            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.conf_add', int(float(ov.get('conf_add', 0) or 0)) + 1, f'{sess}_WR_below_floor')
+            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.rr_add', round(float(ov.get('rr_add', 0.0) or 0.0) + 0.03, 3), f'{sess}_WR_below_floor')
+            notes.append(f'{sess} live-equivalent WR is below the configured floor; tightened that session only.')
+        elif s_setups >= 12 and s_wr > (floor + 8.0) and setups_day < lo:
+            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.quality_add', round(float(ov.get('quality_add', 0.0) or 0.0) - 0.50, 2), f'{sess}_WR_strong_but_flow_low')
+            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.conf_add', int(float(ov.get('conf_add', 0) or 0)) - 1, f'{sess}_WR_strong_but_flow_low')
+            notes.append(f'{sess} is strong but flow is too low; slightly loosened that session.')
+
+    far_ema_block = int(live_rejects.get('base_gate_entry_far_from_pullback_ema', 0) or 0) + int(live_rejects.get('entry_far_from_pullback_ema', 0) or 0)
+    if setups_day > hi or (avg_r < 0.0 and setups_day > (hi * 0.85)):
+        _market_adaptive_apply_action(cfg, actions, 'quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) + 1.0, 2), 'flow_too_high_or_negative_expectancy')
+        _market_adaptive_apply_action(cfg, actions, 'quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) + 1.0, 2), 'flow_too_high_or_negative_expectancy')
+        if far_ema_block < 2200:
+            _market_adaptive_apply_action(cfg, actions, 'tf_align_1h_min_abs', round(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS) + 0.05, 3), 'stretched_entries_need_tighter_alignment')
+        notes.append('Executable flow is too high for recent 30d edge; tightened global quality and alignment slightly.')
+    elif setups_day < lo and total_setups < 180:
+        if wr >= 48.0 or avg_r >= 0.0:
+            _market_adaptive_apply_action(cfg, actions, 'quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 1.0, 2), 'flow_too_low')
+            _market_adaptive_apply_action(cfg, actions, 'quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.0, 2), 'flow_too_low')
+            _market_adaptive_apply_action(cfg, actions, 'min_rr_tp3', round(float(cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3) - 0.05, 3), 'flow_too_low')
+            notes.append('Executable flow is too low while edge is acceptable; loosened the global floor slightly.')
+
+    if avg_r < -0.08 and setups_day > max(lo, 6.0) and _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)):
+        _market_adaptive_apply_action(cfg, actions, 'execution_engine_b_email_enabled', False, 'engine_b_risk_off_due_to_negative_30d_expectancy')
+        notes.append('Disabled Engine B executable lane after materially negative 30d live-equivalent expectancy.')
+    elif avg_r > 0.05 and setups_day < lo and not _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)):
+        _market_adaptive_apply_action(cfg, actions, 'execution_engine_b_email_enabled', True, 'engine_b_restored_after_positive_edge_and_low_flow')
+        notes.append('Re-enabled Engine B executable lane because recent edge is positive but flow is too low.')
+
+    return actions, notes
+
+
+def _market_adaptive_status_snapshot() -> dict:
+    cfg = load_strategy_config(force=False)
+    last_run = _evolution_get_last_run('market_adaptive') or {}
+    last_report = _evolution_state_get('market_adaptive_last_report', {}) or {}
+    return {
+        'enabled': _cfg_bool((cfg or {}).get('market_adaptive_enabled', True), True),
+        'interval_hours': float((cfg or {}).get('market_adaptive_interval_hours', 24.0) or 24.0),
+        'days': int((cfg or {}).get('market_adaptive_days', 30) or 30),
+        'last_run': last_run,
+        'last_report': last_report,
+    }
+
+
+def _run_market_adaptive_cycle() -> dict:
+    cfg0 = load_strategy_config(force=True)
+    enabled = _cfg_bool((cfg0 or {}).get('market_adaptive_enabled', True), True)
+    run_id = _evolution_new_run('market_adaptive')
+    if not enabled:
+        _evolution_finish_run(run_id, 'SKIPPED', 0, 0, {}, {}, [], 'disabled_in_config')
+        return {'ok': False, 'status': 'DISABLED', 'run_id': run_id}
+
+    cooldown_h = float((cfg0 or {}).get('market_adaptive_cooldown_hours', 20.0) or 20.0)
+    last_report = _evolution_state_get('market_adaptive_last_report', {}) or {}
+    last_applied_ts = float(last_report.get('applied_ts', 0.0) or 0.0)
+    if last_applied_ts > 0 and (time.time() - last_applied_ts) < (cooldown_h * 3600.0):
+        _evolution_finish_run(run_id, 'SKIPPED', 0, 0, {}, {}, [], 'cooldown_active')
+        return {'ok': False, 'status': 'COOLDOWN', 'run_id': run_id}
+
+    if _SELF_OPT_STATE.get('stop_event') is not None:
+        _evolution_finish_run(run_id, 'SKIPPED', 0, 0, {}, {}, [], 'autonomous_optimizer_running')
+        return {'ok': False, 'status': 'OPTIMIZER_BUSY', 'run_id': run_id}
+
+    cfg_base = _market_adaptive_clamp_cfg(cfg0)
+    save_strategy_config(cfg_base)
+    apply_strategy_config(cfg_base)
+
+    days = int((cfg_base or {}).get('market_adaptive_days', 30) or 30)
+    tf = str((cfg_base or {}).get('universe_backtest_exec_tf') or (cfg_base or {}).get('exec_tf_default') or '15m')
+    top_n = int((cfg_base or {}).get('universe_backtest_top_n', 80) or 80)
+
+    baseline = run_universe_backtest(days, 'ALL', tf, top_n, None, True, True)
+    baseline_score = _market_adaptive_objective(baseline, cfg_base)
+    best_cfg = json.loads(json.dumps(cfg_base))
+    best_rep = baseline
+    best_score = float(baseline_score)
+    best_actions: list[dict] = []
+    pass_reports = []
+    notes_acc = []
+    max_passes = max(1, int((cfg_base or {}).get('market_adaptive_max_passes', 2) or 2))
+    min_improve = float((cfg_base or {}).get('market_adaptive_min_improvement', 0.35) or 0.35)
+
+    for idx in range(max_passes):
+        working_cfg = _market_adaptive_clamp_cfg(json.loads(json.dumps(best_cfg)))
+        actions, notes = _market_adaptive_propose_actions(best_rep, working_cfg)
+        if not actions:
+            pass_reports.append({'pass': idx + 1, 'status': 'NO_ACTION', 'score': best_score})
+            break
+        working_cfg = _market_adaptive_clamp_cfg(working_cfg)
+        save_strategy_config(working_cfg)
+        apply_strategy_config(working_cfg)
+        trial = run_universe_backtest(days, 'ALL', tf, top_n, None, True, True)
+        trial_score = _market_adaptive_objective(trial, working_cfg)
+        improved = float(trial_score) >= float(best_score + min_improve)
+        pass_reports.append({
+            'pass': idx + 1,
+            'status': 'KEPT' if improved else 'REVERTED',
+            'score_before': float(best_score),
+            'score_after': float(trial_score),
+            'actions': list(actions),
+            'overall_after': dict(trial.get('overall') or {}),
+        })
+        if improved:
+            best_cfg = json.loads(json.dumps(working_cfg))
+            best_rep = trial
+            best_score = float(trial_score)
+            best_actions.extend(actions)
+            notes_acc.extend(notes)
+        else:
+            save_strategy_config(best_cfg)
+            apply_strategy_config(best_cfg)
+            break
+
+    final_cfg = _market_adaptive_clamp_cfg(best_cfg)
+    save_strategy_config(final_cfg)
+    apply_strategy_config(final_cfg)
+    now_ts = float(time.time())
+    report = {
+        'run_id': run_id,
+        'ts': now_ts,
+        'applied_ts': now_ts if best_actions else float(last_applied_ts or 0.0),
+        'enabled': True,
+        'days': int(days),
+        'baseline': {
+            'overall': dict(baseline.get('overall') or {}),
+            'per_session': dict(baseline.get('per_session') or {}),
+            'score': float(baseline_score),
+        },
+        'final': {
+            'overall': dict(best_rep.get('overall') or {}),
+            'per_session': dict(best_rep.get('per_session') or {}),
+            'score': float(best_score),
+        },
+        'actions': list(best_actions),
+        'pass_reports': pass_reports,
+        'notes': notes_acc,
+        'current_live': {
+            'quality_score_min_email': float(final_cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
+            'quality_score_min_screen': float(final_cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN),
+            'min_rr_tp3': float(final_cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3),
+            'tf_align_1h_min_abs': float(final_cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS),
+            'atr_min_pct': float(final_cfg.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT),
+            'execution_asia_enabled': _cfg_bool(final_cfg.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED)),
+            'execution_engine_b_email_enabled': _cfg_bool(final_cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)),
+            'session_exec_overrides': final_cfg.get('session_exec_overrides') or {},
+        },
+    }
+    _evolution_state_set('market_adaptive_last_report', report)
+    _evolution_finish_run(
+        run_id,
+        'DONE',
+        int((best_rep.get('overall') or {}).get('setups', 0) or 0),
+        int((best_rep.get('overall') or {}).get('setups', 0) or 0),
+        {'baseline_score': float(baseline_score), 'final_score': float(best_score), 'notes': notes_acc, 'passes': pass_reports},
+        {'baseline': baseline.get('overall') or {}, 'final': best_rep.get('overall') or {}, 'per_session': best_rep.get('per_session') or {}},
+        list(best_actions),
+        '' if best_actions else 'no_improvement_or_no_action',
+    )
+    return {'ok': True, 'run_id': run_id, 'report': report, 'actions': best_actions, 'baseline': baseline, 'final': best_rep}
+
+
+async def market_adaptive_daily_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        _hb_touch('market_adaptive', ok=True, details='cycle_start')
+        res = await to_thread_heavy(_run_market_adaptive_cycle)
+        if isinstance(res, dict) and res.get('ok'):
+            _hb_touch('market_adaptive', ok=True, details='cycle_ok')
+            rep = (res.get('report') or {})
+            final = ((rep.get('final') or {}).get('overall') or {})
+            bot = getattr(context, 'bot', None)
+            if bot:
+                msg = (
+                    '📈 Market-adaptive 30d optimization completed\n'
+                    f"Run: {rep.get('run_id','')}\n"
+                    f"Actions applied: {len(rep.get('actions') or [])}\n"
+                    f"Live setups/day: {float(final.get('setups_per_day', 0.0) or 0.0):.2f}\n"
+                    f"Live WR: {float(final.get('win_rate', 0.0) or 0.0):.1f}%\n"
+                    f"Live AvgR: {float(final.get('avg_R', 0.0) or 0.0):.3f}"
+                )
+                try:
+                    await _notify_admins_autonomous_opt(bot, msg)
+                except Exception:
+                    pass
+        else:
+            _hb_touch('market_adaptive', ok=True, details=str((res or {}).get('status') or 'cycle_skipped').lower())
+    except Exception as e:
+        _hb_touch('market_adaptive', ok=False, error=f"{type(e).__name__}: {e}", details='cycle_error')
+
+
+async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    snap = await to_thread_fast(_market_adaptive_status_snapshot)
+    cfg = load_strategy_config(force=False)
+    hb_state, hb_reason = _component_runtime_state('market_adaptive', max(7200, int(float((cfg or {}).get('market_adaptive_interval_hours', 24.0) or 24.0) * 7200)), enabled=_cfg_bool((cfg or {}).get('market_adaptive_enabled', True), True), no_data=False, waiting_text='waiting_for_daily_market_adaptive_cycle')
+    last_run = snap.get('last_run') or {}
+    rep = snap.get('last_report') or {}
+    base = (rep.get('baseline') or {}).get('overall') or {}
+    final = (rep.get('final') or {}).get('overall') or {}
+    actions = list(rep.get('actions') or [])
+    lines = [
+        '📈 Market-Adaptive Optimization Status',
+        HDR,
+        f"Engine: {_status_label(hb_state)}" + (f" | {hb_reason}" if hb_reason and hb_state != 'ACTIVE' else ''),
+        f"Enabled: {'YES' if snap.get('enabled') else 'NO'} | Interval: {float(snap.get('interval_hours') or 24.0):.1f}h | Window: {int(snap.get('days') or 30)}d",
+        f"Last run: {_format_last_run_line('Cycle', last_run).replace('Cycle: ', '') if last_run else '—'}",
+        SEP,
+        f"Baseline live: setups/day={float(base.get('setups_per_day', 0.0) or 0.0):.2f} | WR={float(base.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(base.get('avg_R', 0.0) or 0.0):.3f}",
+        f"Final live: setups/day={float(final.get('setups_per_day', 0.0) or 0.0):.2f} | WR={float(final.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(final.get('avg_R', 0.0) or 0.0):.3f}",
+        f"Actions applied: {len(actions)}",
+    ]
+    if actions:
+        lines.append('Last actions:')
+        for a in actions[:6]:
+            lines.append(f"• {a.get('param')} {a.get('from')}→{a.get('to')} | {a.get('reason')}")
+    current_live = rep.get('current_live') or {}
+    if current_live:
+        lines.extend([
+            SEP,
+            f"Current live floors: email_quality={float(current_live.get('quality_score_min_email', 0.0) or 0.0):.1f} | screen_quality={float(current_live.get('quality_score_min_screen', 0.0) or 0.0):.1f} | min_rr_tp3={float(current_live.get('min_rr_tp3', 0.0) or 0.0):.2f}",
+            f"TF align 1h={float(current_live.get('tf_align_1h_min_abs', 0.0) or 0.0):.2f} | ATR min={float(current_live.get('atr_min_pct', 0.0) or 0.0):.2f}",
+            f"Engine B exec: {'ON' if _cfg_bool(current_live.get('execution_engine_b_email_enabled', True), True) else 'OFF'} | Asia exec: {'ON' if _cfg_bool(current_live.get('execution_asia_enabled', False), False) else 'OFF'}",
+        ])
+    await send_long_message(update, '\n'.join(lines), parse_mode=None)
+
+
 async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
     """Internal autonomous optimizer. No manual trigger required."""
     await _refresh_universe_backtests_for_autopilot()
@@ -15623,20 +16033,31 @@ def is_top_setup_eligible(
         return (False, "eligibility_exception")
 
 def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]:
-    """Session-aware production thresholds.
-
-    30d universe backtest shows the executable lane is still too loose, especially in ASIA
-    and on fast NY continuation entries. Keep NY/LON tradable, but require materially better
-    quality before a setup is allowed into email/execution.
-    """
+    """Session-aware production thresholds with config-driven runtime overrides."""
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        return (79.0, 84, 1.60)
-    if sess == "LON":
-        return (78.0, 83, 1.58)
-    if sess == "ASIA":
-        return (84.0, 87, 1.72)
-    return (78.0, 83, 1.58)
+        quality, conf, rr = 79.0, 84, 1.60
+    elif sess == "LON":
+        quality, conf, rr = 78.0, 83, 1.58
+    elif sess == "ASIA":
+        quality, conf, rr = 84.0, 87, 1.72
+    else:
+        quality, conf, rr = 78.0, 83, 1.58
+
+    try:
+        cfg = load_strategy_config(force=False)
+        ov_all = (cfg or {}).get("session_exec_overrides") or {}
+        ov = ov_all.get(sess) or {}
+        quality += float(ov.get("quality_add", 0.0) or 0.0)
+        conf += int(round(float(ov.get("conf_add", 0) or 0)))
+        rr += float(ov.get("rr_add", 0.0) or 0.0)
+    except Exception:
+        pass
+
+    quality = float(clamp(quality, 70.0, 92.0))
+    conf = int(max(78, min(95, conf)))
+    rr = float(clamp(rr, 1.35, 2.30))
+    return (quality, conf, rr)
 
 
 def is_executable_setup_eligible(
@@ -15658,7 +16079,10 @@ def is_executable_setup_eligible(
         sess = str(session_name or "").upper().strip()
         if sess not in {"ASIA", "LON", "NY"}:
             return (False, "session_not_supported")
-        if sess == "ASIA" and not bool(EXECUTION_ASIA_ENABLED):
+        cfg_live = load_strategy_config(force=False)
+        exec_asia_enabled = _cfg_bool((cfg_live or {}).get("execution_asia_enabled", EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED))
+        exec_engine_b_enabled = _cfg_bool((cfg_live or {}).get("execution_engine_b_email_enabled", EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
+        if sess == "ASIA" and not exec_asia_enabled:
             return (False, "asia_exec_disabled")
 
         ok, why = is_top_setup_eligible(s, source='email', session_name=sess)
@@ -15726,7 +16150,7 @@ def is_executable_setup_eligible(
             return (True, "ok")
 
         if engine == "B":
-            if not bool(EXECUTION_ENGINE_B_EMAIL_ENABLED):
+            if not exec_engine_b_enabled:
                 return (False, "engine_b_disabled")
             extra_score = 4.0 if sess == "NY" else 3.0
             extra_conf = 3 if sess == "NY" else 2
@@ -17837,7 +18261,7 @@ KNOWN_COMMANDS = sorted(set([
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
-    "signal_report", "signal_report_overall", "email_decision",
+    "signal_report", "signal_report_overall", "email_decision", "adaptive_status",
     "params_show", "params_set", "params_reset", "backtest", "universe_backtest", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report",
 
     # Timezone
@@ -18399,6 +18823,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "self_optimize_report": "Show latest autonomous optimization result",
     "autopilot_report": "Alias of /self_optimize_report with multi-window autopilot details",
     "autopilot_status": "Alias of /learning_status",
+    "adaptive_status": "Show daily market-adaptive 30d optimizer status and latest auto-applied actions",
     "universe_backtest": "Run 7d/30d universe backtest with daily + session summary",
     "trade_id_reset": "Reset your own Trade ID numbering",
 }
@@ -18406,7 +18831,7 @@ ADMIN_HELP_DESCRIPTIONS = {
 ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
-    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
+    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "autotrade_sessions", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
@@ -25375,6 +25800,7 @@ def main():
     app.add_handler(CommandHandler("self_optimize_report", cmd_self_optimize_report, block=False))
     app.add_handler(CommandHandler("autopilot_report", cmd_self_optimize_report, block=False))
     app.add_handler(CommandHandler("autopilot_status", learning_status_cmd, block=False))
+    app.add_handler(CommandHandler("adaptive_status", market_adaptive_status_cmd, block=False))
     app.add_handler(CommandHandler("backtest", cmd_backtest, block=False))
     app.add_handler(CommandHandler("universe_backtest", cmd_universe_backtest, block=False))
 
@@ -25446,6 +25872,23 @@ def main():
                     "misfire_grace_time": 600,
                 },
             )
+
+        try:
+            _market_cfg = load_strategy_config(force=False)
+            if _cfg_bool((_market_cfg or {}).get("market_adaptive_enabled", True), True):
+                app.job_queue.run_repeating(
+                    market_adaptive_daily_job,
+                    interval=max(21600, int(float((_market_cfg or {}).get("market_adaptive_interval_hours", 24.0) or 24.0) * 3600)),
+                    first=480,
+                    name="market_adaptive_daily_job",
+                    job_kwargs={
+                        "max_instances": 1,
+                        "coalesce": True,
+                        "misfire_grace_time": 1200,
+                    },
+                )
+        except Exception:
+            pass
 
         if SCAN_INTELLIGENCE_ENABLED:
             app.job_queue.run_repeating(
