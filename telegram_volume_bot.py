@@ -1554,7 +1554,8 @@ AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PC
 # Open-trade count cap for commercial/live safety.
 AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "0") or 0)
 EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
-EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
+EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "LON,NY") or "LON,NY").split(",") if s.strip()]
+EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", False)
 
 
 # Margin / leverage
@@ -4993,15 +4994,15 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 74,
-    "LON": 75,
-    "ASIA": 77,
+    "NY": 76,
+    "LON": 76,
+    "ASIA": 80,
 }
 
 SESSION_MIN_RR_TP3 = {
-    "NY": 1.55,
-    "LON": 1.65,
-    "ASIA": 1.80,
+    "NY": 1.60,
+    "LON": 1.62,
+    "ASIA": 1.90,
 }
 
 SESSION_EMA_PROX_MULT = {
@@ -15475,15 +15476,15 @@ async def cmd_self_optimize_report(update: Update, context: ContextTypes.DEFAULT
 def _session_entry_quality_limits(session_name: str, source: str = 'email') -> dict:
     sess = str(session_name or '').upper().strip() or 'NY'
     base = {
-        'NY': {'max_pb_ema_dist': 0.95, 'max_ch15_abs': 1.05, 'max_ch1_abs': 2.60, 'max_atr_pct': 6.5},
-        'LON': {'max_pb_ema_dist': 0.85, 'max_ch15_abs': 0.95, 'max_ch1_abs': 2.30, 'max_atr_pct': 6.0},
-        'ASIA': {'max_pb_ema_dist': 0.75, 'max_ch15_abs': 0.85, 'max_ch1_abs': 1.90, 'max_atr_pct': 5.5},
-    }.get(sess, {'max_pb_ema_dist': 0.85, 'max_ch15_abs': 0.95, 'max_ch1_abs': 2.30, 'max_atr_pct': 6.0}).copy()
+        'NY': {'max_pb_ema_dist': 0.82, 'max_ch15_abs': 0.92, 'max_ch1_abs': 2.25, 'max_atr_pct': 5.8},
+        'LON': {'max_pb_ema_dist': 0.78, 'max_ch15_abs': 0.88, 'max_ch1_abs': 2.05, 'max_atr_pct': 5.5},
+        'ASIA': {'max_pb_ema_dist': 0.68, 'max_ch15_abs': 0.78, 'max_ch1_abs': 1.70, 'max_atr_pct': 4.9},
+    }.get(sess, {'max_pb_ema_dist': 0.78, 'max_ch15_abs': 0.88, 'max_ch1_abs': 2.05, 'max_atr_pct': 5.5}).copy()
     if str(source or '').strip().lower() == 'screen':
-        base['max_pb_ema_dist'] *= 1.15
-        base['max_ch15_abs'] *= 1.12
-        base['max_ch1_abs'] *= 1.10
-        base['max_atr_pct'] *= 1.10
+        base['max_pb_ema_dist'] *= 1.12
+        base['max_ch15_abs'] *= 1.08
+        base['max_ch1_abs'] *= 1.08
+        base['max_atr_pct'] *= 1.08
     return base
 
 
@@ -15588,18 +15589,18 @@ def is_top_setup_eligible(
 def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]:
     """Session-aware production thresholds.
 
-    NY remains the preferred execution window, but London and Asia are still allowed
-    with slightly stricter requirements so the bot can surface high-quality global crypto
-    opportunities without turning the email/autotrade lane noisy.
+    30d universe backtest shows the executable lane is still too loose, especially in ASIA
+    and on fast NY continuation entries. Keep NY/LON tradable, but require materially better
+    quality before a setup is allowed into email/execution.
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        return (76.0, 82, 1.55)
+        return (79.0, 84, 1.60)
     if sess == "LON":
-        return (74.0, 80, 1.50)
+        return (78.0, 83, 1.58)
     if sess == "ASIA":
-        return (78.0, 84, 1.60)
-    return (74.0, 80, 1.50)
+        return (84.0, 87, 1.72)
+    return (78.0, 83, 1.58)
 
 
 def is_executable_setup_eligible(
@@ -15621,6 +15622,8 @@ def is_executable_setup_eligible(
         sess = str(session_name or "").upper().strip()
         if sess not in {"ASIA", "LON", "NY"}:
             return (False, "session_not_supported")
+        if sess == "ASIA" and not bool(EXECUTION_ASIA_ENABLED):
+            return (False, "asia_exec_disabled")
 
         ok, why = is_top_setup_eligible(s, source='email', session_name=sess)
         if not ok:
@@ -15648,6 +15651,20 @@ def is_executable_setup_eligible(
 
         engine = str(getattr(s, "engine", "") or "").upper().strip()
         fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+        pb_dist = float(getattr(s, "pullback_ema_dist_pct", 999.0) or 999.0)
+        ch15_abs = abs(float(getattr(s, "ch15", 0.0) or 0.0))
+        ch1_abs = abs(float(getattr(s, "ch1", 0.0) or 0.0))
+
+        if sess == "NY":
+            if pb_dist > 0.78 and (score < (score_floor + 3.0) or conf < (conf_floor + 2)):
+                return (False, "ny_entry_too_far_from_ema")
+            if ch15_abs > 0.95 and pb_dist > 0.70:
+                return (False, "ny_late_extension_exec")
+        elif sess == "LON":
+            if pb_dist > 0.76 and (score < (score_floor + 2.0) or conf < (conf_floor + 1)):
+                return (False, "lon_entry_too_far_from_ema")
+            if ch15_abs > 0.90 and ch1_abs > 1.70 and pb_dist > 0.68:
+                return (False, "lon_late_extension_exec")
 
         if engine == "A":
             if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
@@ -15675,18 +15692,25 @@ def is_executable_setup_eligible(
         if engine == "B":
             if not bool(EXECUTION_ENGINE_B_EMAIL_ENABLED):
                 return (False, "engine_b_disabled")
-            if score < (score_floor + 3.0):
+            extra_score = 4.0 if sess == "NY" else 3.0
+            extra_conf = 3 if sess == "NY" else 2
+            extra_rr = 0.20 if sess == "NY" else 0.15
+            if score < (score_floor + extra_score):
                 return (False, "engine_b_below_quality")
-            if conf < (conf_floor + 2):
+            if conf < (conf_floor + extra_conf):
                 return (False, "engine_b_below_conf")
-            if rr_final < (rr_floor + 0.15):
+            if rr_final < (rr_floor + extra_rr):
                 return (False, "engine_b_below_rr")
-            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.5, 12_000_000.0)):
+            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.6, 14_000_000.0)):
                 return (False, "engine_b_below_liquidity")
             ch1 = abs(float(getattr(s, "ch1", 0.0) or 0.0))
             ch4 = abs(float(getattr(s, "ch4", 0.0) or 0.0))
-            if ch1 < 0.8 or ch4 < 1.5:
+            if ch1 < 0.9 or ch4 < 1.7:
                 return (False, "engine_b_trend_not_strong_enough")
+            if pb_dist > (0.78 if sess == "NY" else 0.80):
+                return (False, "engine_b_entry_far_from_ema")
+            if ch15_abs > (0.90 if sess == "NY" else 0.95):
+                return (False, "engine_b_chase_risk")
             return (True, "ok")
 
         return (False, "engine_not_supported")
