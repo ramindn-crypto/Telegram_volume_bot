@@ -12793,13 +12793,13 @@ def _estimate_trade_r_multiple(trade: dict) -> float | None:
         return None
 
 
-def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = None) -> str:
+def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = None, exchange_events: list[dict] | None = None) -> str:
     """Classify a trade into TP1 / TP2 / SL / OPEN using journal + live Bybit state.
 
     Priority:
     1) Explicit stored outcomes if present.
-    2) Live reduced-size detection => TP1 for still-open positions after partial take profit.
-    3) Closed trades use pnl/risk to distinguish TP1 vs TP2.
+    2) Exchange partial-close evidence or live reduced-size detection => TP1.
+    3) Closed trades use pnl/risk or exchange close events to distinguish TP1 vs TP2 / SL.
     """
     try:
         pnl = float(trade.get('pnl_usdt') if trade.get('pnl_usdt') is not None else trade.get('pnl') or 0.0)
@@ -12815,7 +12815,7 @@ def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = Non
     if raw in {'LOSS', 'SL', 'SL_FIRST', 'TP1_SL'}:
         return 'SL'
 
-    # Current live position => OPEN or TP1 if reduced after partial take profit.
+    # Current live position => OPEN or TP1 if partial-close evidence exists.
     if live_pos is not None or status == 'OPEN':
         try:
             orig_qty = abs(float(trade.get('qty') or 0.0))
@@ -12825,6 +12825,26 @@ def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = Non
             live_qty = abs(_pos_size(live_pos)) if live_pos is not None else 0.0
         except Exception:
             live_qty = 0.0
+        try:
+            opened_ts = float(trade.get('opened_ts') or 0.0)
+        except Exception:
+            opened_ts = 0.0
+        # 1) Use actual Bybit close events first. Any positive partial close while the position is
+        #    still open means TP1 was achieved.
+        pos_partial_pnl = 0.0
+        pos_partial_qty = 0.0
+        for ev in (exchange_events or []):
+            try:
+                ev_ts = float((ev or {}).get('ts') or 0.0)
+                if opened_ts > 0 and ev_ts + 120.0 < opened_ts:
+                    continue
+                pos_partial_pnl += float((ev or {}).get('pnl') or 0.0)
+                pos_partial_qty += abs(float((ev or {}).get('qty') or 0.0))
+            except Exception:
+                continue
+        if live_pos is not None and (pos_partial_pnl > 0.0 or pos_partial_qty > 0.0):
+            return 'TP1'
+        # 2) Fallback to quantity reduction.
         if orig_qty > 0 and live_qty > 0:
             try:
                 partial_fraction = float(AUTOTRADE_LIVE_TP1_FRACTION or 0.65)
@@ -12836,7 +12856,12 @@ def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = Non
                 return 'TP1'
         return 'OPEN'
 
-    # Closed trade with no explicit TP-stage label: infer from realized pnl versus planned risk.
+    # Closed trade with no explicit TP-stage label: use exchange events and realized pnl.
+    if abs(pnl) < 1e-9 and exchange_events:
+        try:
+            pnl = float(sum(float((ev or {}).get('pnl') or 0.0) for ev in (exchange_events or [])))
+        except Exception:
+            pnl = 0.0
     if pnl < 0:
         return 'SL'
     if abs(pnl) < 1e-9:
@@ -12903,6 +12928,7 @@ def _signal_report_setup_meta(setup_id: str) -> dict:
 
 
 def _signal_report_load_recent_trades(user_id: int, limit: int = 1000) -> list[dict]:
+    rows_out: list[dict] = []
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
@@ -12914,9 +12940,23 @@ def _signal_report_load_recent_trades(user_id: int, limit: int = 1000) -> list[d
                    LIMIT ?""",
                 (int(user_id), int(limit)),
             ).fetchall() or []
-        return [dict(r) for r in rows]
+        rows_out.extend(dict(r) for r in rows)
     except Exception:
-        return []
+        pass
+    try:
+        # Include exchange-reconstructed provisional closes so /signal_report can use real Bybit
+        # close events even when the original setup_id -> trade_id chain is missing.
+        prov = _autotrade_reconstruct_provisional_closes(int(user_id), days=7) or []
+        for p in prov:
+            d = dict(p)
+            d.setdefault('trade_id', f"prov::{d.get('setup_id') or d.get('symbol') or ''}::{int(float(d.get('closed_ts') or 0))}")
+            d.setdefault('status', 'CLOSED')
+            d.setdefault('pnl_usdt', d.get('pnl'))
+            rows_out.append(d)
+    except Exception:
+        pass
+    rows_out.sort(key=lambda r: float(r.get('closed_ts') or r.get('opened_ts') or 0.0), reverse=True)
+    return rows_out[: max(1, int(limit))]
 
 
 def _signal_report_find_trade_for_setup(user_id: int, symbol: str, side: str, ref_ts: float = 0.0) -> dict | None:
@@ -12944,6 +12984,34 @@ def _signal_report_find_trade_for_setup(user_id: int, symbol: str, side: str, re
     return dict(cands[0]) if cands else None
 
 
+def _signal_report_exchange_events_by_key(ts_from: float) -> dict[tuple[str, str], list[dict]]:
+    out: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    if str(AUTOTRADE_MODE).lower() != 'live':
+        return out
+    try:
+        rows = _bybit_get_closed_pnl_linear(max(0.0, float(ts_from) - 86400.0 * 3.0), float(time.time()) + 3600.0, limit=500) or []
+    except Exception:
+        rows = []
+    for ev in rows:
+        try:
+            sym = _bybit_linear_symbol((ev or {}).get('symbol') or '')
+            ts = float(_bybit_closed_pnl_event_ts(ev) or 0.0)
+            qty = float(_bybit_closed_pnl_event_qty(ev) or 0.0)
+            pnl = float((ev or {}).get('closedPnl') or (ev or {}).get('closed_pnl') or 0.0)
+            if not sym or ts <= 0:
+                continue
+            for side in (_bybit_closed_pnl_event_side_candidates(ev) or {'BUY', 'SELL'}):
+                sd = _norm_trade_side(side)
+                if not sd:
+                    continue
+                out[(sym, sd)].append({'ts': ts, 'qty': qty, 'pnl': pnl, 'raw': ev})
+        except Exception:
+            continue
+    for k in list(out.keys()):
+        out[k].sort(key=lambda x: float(x.get('ts') or 0.0))
+    return out
+
+
 def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | None = None) -> tuple[list[dict], int]:
     user_id = int(user_id)
     try:
@@ -12952,11 +13020,17 @@ def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | 
         tz = timezone.utc
     live_mode = str(AUTOTRADE_MODE).lower() == 'live' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0)
     current_positions = []
+    exchange_events_by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
     if live_mode:
         try:
             current_positions = list(_bybit_get_open_positions_linear() or [])
         except Exception:
             current_positions = []
+        try:
+            min_email_ts = min((float(e.get('emailed_ts') or 0.0) for e in (emailed or []) if float(e.get('emailed_ts') or 0.0) > 0.0), default=float(time.time()) - 86400.0)
+            exchange_events_by_key = _signal_report_exchange_events_by_key(min_email_ts)
+        except Exception:
+            exchange_events_by_key = defaultdict(list)
 
     # Current live positions by symbol+side.
     pos_map = {}
@@ -13035,7 +13109,7 @@ def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | 
 
         if trade and str(trade.get('trade_id') or ''):
             used_trade_ids.add(str(trade.get('trade_id') or ''))
-            canon = _canon_outcome_from_autotrade_trade(trade, live_pos=live_pos)
+            canon = _canon_outcome_from_autotrade_trade(trade, live_pos=live_pos, exchange_events=exchange_events_by_key.get((symbol, side), []))
             meta = base_meta
             meta['source'] = str(meta.get('source') or 'lifecycle_trade')
         else:
@@ -13043,13 +13117,31 @@ def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | 
             matched = _best_trade_for_email(symbol, side, emailed_ts, exact_trade_id=trade_id_exact)
             if matched is not None:
                 used_trade_ids.add(str(matched.get('trade_id') or ''))
-                canon = _canon_outcome_from_autotrade_trade(matched, live_pos=live_pos)
+                canon = _canon_outcome_from_autotrade_trade(matched, live_pos=live_pos, exchange_events=exchange_events_by_key.get((symbol, side), []))
                 meta = {'source': 'matched_trade_by_symbol_side_time', 'trade': matched}
             else:
-                # 3) No trade found. Only the newest unresolved row for a currently live symbol+side can be OPEN.
+                # 3) No direct trade found. Use current live position or exchange close events as a last resort.
+                evs = exchange_events_by_key.get((symbol, side), []) if symbol and side else []
+                recent_evs = []
+                for ev in evs:
+                    try:
+                        ev_ts = float((ev or {}).get('ts') or 0.0)
+                        if emailed_ts > 0 and ev_ts + 300.0 < emailed_ts:
+                            continue
+                        recent_evs.append(ev)
+                    except Exception:
+                        continue
                 if live_pos is not None and symbol and side:
-                    canon = 'OPEN'
-                    meta = {'source': 'fallback_live_symbol_side', 'position': live_pos}
+                    if any(float((ev or {}).get('pnl') or 0.0) > 0.0 for ev in recent_evs):
+                        canon = 'TP1'
+                        meta = {'source': 'fallback_live_with_exchange_partial', 'position': live_pos}
+                    else:
+                        canon = 'OPEN'
+                        meta = {'source': 'fallback_live_symbol_side', 'position': live_pos}
+                elif recent_evs:
+                    net_pnl = sum(float((ev or {}).get('pnl') or 0.0) for ev in recent_evs)
+                    canon = 'TP1' if net_pnl > 0 else ('SL' if net_pnl < 0 else 'None')
+                    meta = {'source': 'fallback_exchange_close_events'}
                 else:
                     canon = 'None'
                     meta = {'source': 'untracked'}
@@ -13105,7 +13197,7 @@ def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | 
                         r['outcome'] = 'None'
                         r['source'] = 'stale_open_demoted'
                         hidden_untracked_open += 1
-            elif src not in {'fallback_live_symbol_side', 'matched_open_trade', 'matched_live_symbol_side'}:
+            elif src not in {'fallback_live_symbol_side', 'fallback_live_with_exchange_partial', 'matched_open_trade', 'matched_live_symbol_side'}:
                 r['outcome'] = 'None'
                 r['source'] = 'untracked_open_demoted'
                 hidden_untracked_open += 1
@@ -13143,7 +13235,7 @@ def _canonical_signal_outcome_for_setup(user_id: int, setup_id: str) -> tuple[st
                     _autotrade_sync_closed_trades_from_exchange(int(user_id), lookback_days=30)
                     refreshed = _load_trade(trade_id)
                     if refreshed and (str(refreshed.get('status') or '').upper().strip() == 'CLOSED' or float(refreshed.get('closed_ts') or 0.0) > 0):
-                        return _canon_outcome_from_autotrade_trade(refreshed), {'source': 'autotrade_trade_sync', 'trade': refreshed, 'lifecycle': life}
+                        return _canon_outcome_from_autotrade_trade(refreshed, exchange_events=_signal_report_exchange_events_by_key(float(trade.get('opened_ts') or 0.0)).get((_bybit_linear_symbol(str(refreshed.get('symbol') or '')), _norm_trade_side(str(refreshed.get('side') or ''))), [])), {'source': 'autotrade_trade_sync', 'trade': refreshed, 'lifecycle': life}
                 except Exception:
                     pass
             return 'OPEN', {'source': 'autotrade_open_trade', 'trade': trade, 'lifecycle': life}
