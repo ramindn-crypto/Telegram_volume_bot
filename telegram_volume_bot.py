@@ -2057,6 +2057,17 @@ def _bybit_get_open_positions_linear() -> list[dict]:
     except Exception:
         return []
 
+def _norm_trade_side(side: str) -> str:
+    try:
+        s = str(side or '').strip().upper()
+        if s in ('BUY', 'LONG'):
+            return 'BUY'
+        if s in ('SELL', 'SHORT'):
+            return 'SELL'
+        return s
+    except Exception:
+        return ''
+
 def _pos_side_text(p: dict) -> str:
     try:
         s = str(p.get("side") or "").upper()
