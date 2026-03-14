@@ -203,6 +203,7 @@ def _autotrade_migrate_tables():
                 opened_ts INTEGER,
                 day_utc TEXT NOT NULL DEFAULT \'\',
                 session TEXT,
+                setup_id TEXT,
                 symbol TEXT,
                 side TEXT,
                 entry REAL,
@@ -211,6 +212,10 @@ def _autotrade_migrate_tables():
                 tp2 REAL,
                 tp3 REAL,
                 qty REAL,
+                conf INTEGER,
+                quality_score REAL,
+                atr_pct REAL,
+                engine TEXT,
                 status TEXT,
                 closed_ts INTEGER,
                 pnl_usdt REAL,
@@ -232,6 +237,7 @@ def _autotrade_migrate_tables():
             add_col("uid", "uid INTEGER")
             add_col("opened_ts", "opened_ts INTEGER")
             add_col("session", "session TEXT")
+            add_col("setup_id", "setup_id TEXT")
             add_col("symbol", "symbol TEXT")
             add_col("side", "side TEXT")
             add_col("entry", "entry REAL")
@@ -240,6 +246,10 @@ def _autotrade_migrate_tables():
             add_col("tp2", "tp2 REAL")
             add_col("tp3", "tp3 REAL")
             add_col("qty", "qty REAL")
+            add_col("conf", "conf INTEGER")
+            add_col("quality_score", "quality_score REAL")
+            add_col("atr_pct", "atr_pct REAL")
+            add_col("engine", "engine TEXT")
             add_col("status", "status TEXT")
             add_col("closed_ts", "closed_ts INTEGER")
             add_col("pnl_usdt", "pnl_usdt REAL")
@@ -1573,9 +1583,11 @@ except Exception:
 AUTOTRADE_LIVE_TP1_FRACTION = float(os.environ.get("AUTOTRADE_LIVE_TP1_FRACTION", "0.65") or 0.65)
 AUTOTRADE_LIVE_TP1_FRACTION = max(0.25, min(0.85, AUTOTRADE_LIVE_TP1_FRACTION))
 AUTOTRADE_BE_AFTER_TP1_ENABLED = str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ENABLED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
-AUTOTRADE_BE_AFTER_TP1_MIN_CONF = int(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MIN_CONF", "0") or 0)
-AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT", "999") or 999)
-AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY,LON,ASIA") or "NY,LON,ASIA").upper().replace(' ', '').split(','))
+AUTOTRADE_BE_AFTER_TP1_MIN_CONF = int(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MIN_CONF", "82") or 82)
+AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY", "76") or 76)
+AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT", "6.0") or 6.0)
+AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY,LON") or "NY,LON").upper().replace(' ', '').split(','))
+AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES", "A,C") or "A,C").upper().replace(' ', '').split(','))
 # Live market-order entries must still stay close to the setup entry. Otherwise the bot can
 # execute a stale emailed setup at a materially worse price just because it is still inside
 # the time window. This guard keeps the email/setup engine and live execution aligned.
@@ -2165,6 +2177,36 @@ def _price_close_enough(a: float, b: float, rel_tol: float = 0.002, abs_tol: flo
         return False
 
 
+def _dedupe_price_targets(values: list[float], rel_tol: float = 0.0005) -> list[float]:
+    """Return ordered positive targets with near-duplicates removed."""
+    out: list[float] = []
+    try:
+        for raw in (values or []):
+            try:
+                px = float(raw or 0.0)
+            except Exception:
+                px = 0.0
+            if px <= 0:
+                continue
+            if any(_price_close_enough(px, seen, rel_tol=rel_tol) for seen in out):
+                continue
+            out.append(float(px))
+    except Exception:
+        return [float(x) for x in (values or []) if float(x or 0.0) > 0]
+    return out
+
+
+def _be_min_quality_for_session(session_name: str) -> float:
+    sess = str(session_name or '').upper().strip()
+    if sess == 'NY':
+        return max(float(AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY), 80.0)
+    if sess == 'LON':
+        return max(float(AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY), 76.0)
+    if sess == 'ASIA':
+        return max(float(AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY), 82.0)
+    return float(AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY)
+
+
 def _autotrade_live_exit_plan_from_targets(entry: float, sl: float, tp1, tp2, tp3, side: str) -> dict:
     t1, t2, t3 = _ensure_three_tps(float(entry or 0.0), float(sl or 0.0), float(tp3 or 0.0), tp1, tp2, str(side or ''))
     final_tp = float(t2 or t3 or t1 or 0.0)
@@ -2220,6 +2262,9 @@ def _autotrade_place_partial_tpsl_ladder(symbol: str, side: str, stop_loss: floa
         sym = _bybit_linear_symbol(symbol)
         filt = _bybit_get_instr_filters(sym)
         qty_step = filt.get('qtyStep')
+        tp_targets = _dedupe_price_targets([float(x or 0.0) for x in (tp_targets or [])])
+        if not tp_targets:
+            return []
         splits = list(AUTOTRADE_TP_SPLIT[:max(1, len(tp_targets))])
         if len(splits) < len(tp_targets):
             splits += [max(0.0, 1.0 - sum(splits))]
@@ -2323,7 +2368,9 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         initial_qty = abs(float(trade_row.get('qty') or 0.0))
         live_qty = abs(float(_pos_size(pos) or 0.0))
         conf = int(float(trade_row.get('conf') or 0) or 0)
+        quality_score = float(trade_row.get('quality_score') or 0.0)
         atr_pct = float(trade_row.get('atr_pct') or 0.0)
+        engine = str(trade_row.get('engine') or '').upper().strip()
         sess = str(trade_row.get('session') or '').upper().strip()
         if AUTOTRADE_BE_AFTER_TP1_ENABLED and entry > 0 and final_tp > 0 and initial_qty > 0 and live_qty > 0:
             # Production-safe TP1 -> risk-free handling:
@@ -2341,12 +2388,21 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
                 tp1_order_still_open = False
             tp1_hit = bool((live_qty <= qty_drop_threshold) or (qty_reduced and not tp1_order_still_open))
             sl_at_be = _price_close_enough(current_sl, entry)
-            be_allowed = conf >= int(AUTOTRADE_BE_AFTER_TP1_MIN_CONF) and (atr_pct <= float(AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT) if atr_pct > 0 else True) and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS or sess in AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS)
+            be_allowed = (
+                conf >= int(AUTOTRADE_BE_AFTER_TP1_MIN_CONF)
+                and quality_score >= float(_be_min_quality_for_session(sess))
+                and (atr_pct <= float(AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT) if atr_pct > 0 else True)
+                and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS or sess in AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS)
+                and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES or engine in AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES)
+            )
             if tp1_hit and be_allowed:
                 if not sl_at_be:
                     _autotrade_cancel_reduce_only_tp_orders(sym)
                     _autotrade_apply_position_tp_sl(sym, entry, 0.0)
-                    remaining_targets = [x for x in (float(trade_row.get('tp2') or 0.0), float(trade_row.get('tp3') or 0.0)) if float(x or 0.0) > 0]
+                    remaining_targets = _dedupe_price_targets([
+                        float(trade_row.get('tp2') or 0.0),
+                        float(trade_row.get('tp3') or 0.0),
+                    ])
                     if remaining_targets:
                         try:
                             _autotrade_place_partial_tpsl_ladder(sym, side, entry, remaining_targets, live_qty)
@@ -3616,6 +3672,7 @@ def _autotrade_db_init():
                 opened_ts INTEGER,
                 day_utc TEXT NOT NULL DEFAULT \'\',
                 session TEXT,
+                setup_id TEXT,
                 symbol TEXT,
                 side TEXT,
                 entry REAL,
@@ -3624,6 +3681,10 @@ def _autotrade_db_init():
                 tp2 REAL,
                 tp3 REAL,
                 qty REAL,
+                conf INTEGER,
+                quality_score REAL,
+                atr_pct REAL,
+                engine TEXT,
                 status TEXT DEFAULT 'OPEN',
                 closed_ts INTEGER,
                 outcome TEXT,
@@ -3980,14 +4041,15 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
         if has_day:
             c.execute(
                 """INSERT INTO autotrade_trades
-                       (trade_id, uid, opened_ts, day_utc, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
+                       (trade_id, uid, opened_ts, day_utc, session, setup_id, symbol, side, entry, sl, tp1, tp2, tp3, qty, conf, quality_score, atr_pct, engine, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
                 (
                     trade_id,
                     int(uid),
                     int(time.time()),
                     str(day_utc),
                     str(session_label),
+                    str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''),
                     str(getattr(s, 'symbol', '') or '').upper(),
                     str(getattr(s, 'side', '') or '').upper(),
                     float(getattr(s, 'entry', 0.0) or 0.0),
@@ -3996,18 +4058,23 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
                     float(getattr(s, 'tp2', 0.0) or 0.0),
                     float(getattr(s, 'tp3', 0.0) or 0.0),
                     float(qty),
+                    int(getattr(s, 'conf', 0) or 0),
+                    float(getattr(s, 'quality_score', 0.0) or 0.0),
+                    float(getattr(s, 'atr_pct', 0.0) or 0.0),
+                    str(getattr(s, 'engine', '') or ''),
                 ),
             )
         else:
             c.execute(
                 """INSERT INTO autotrade_trades
-                       (trade_id, uid, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
+                       (trade_id, uid, opened_ts, session, setup_id, symbol, side, entry, sl, tp1, tp2, tp3, qty, conf, quality_score, atr_pct, engine, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
                 (
                     trade_id,
                     int(uid),
                     int(time.time()),
                     str(session_label),
+                    str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''),
                     str(getattr(s, 'symbol', '') or '').upper(),
                     str(getattr(s, 'side', '') or '').upper(),
                     float(getattr(s, 'entry', 0.0) or 0.0),
@@ -4016,6 +4083,10 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
                     float(getattr(s, 'tp2', 0.0) or 0.0),
                     float(getattr(s, 'tp3', 0.0) or 0.0),
                     float(qty),
+                    int(getattr(s, 'conf', 0) or 0),
+                    float(getattr(s, 'quality_score', 0.0) or 0.0),
+                    float(getattr(s, 'atr_pct', 0.0) or 0.0),
+                    str(getattr(s, 'engine', '') or ''),
                 ),
             )
 
@@ -4758,6 +4829,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 'live_exit_tp1': float(live_partial_tp),
                 'live_exit_tp2': float(live_tp2),
                 'live_exit_tp3': float(live_tp3),
+                'live_final_tp': float(exit_plan.get('final_tp') or live_tp2 or live_tp3 or 0.0),
                 'live_tp_design': 'partial_tpsl_ladder + full_sl',
             })
         except Exception:
@@ -4807,8 +4879,10 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
         final_pos = _autotrade_find_live_position(sym, side=side)
         tp_base_qty = abs(float(_pos_size(final_pos) or qty)) if final_pos else float(qty)
+        live_final_tp = float(exit_plan.get('final_tp') or live_tp2 or live_tp3 or live_partial_tp or 0.0)
         _autotrade_cancel_reduce_only_tp_orders(sym)
-        tp_order_results = _autotrade_place_partial_tpsl_ladder(sym, side, sl_for_order, [x for x in (live_partial_tp, live_tp2, live_tp3) if float(x or 0.0) > 0], tp_base_qty)
+        tp_targets_live = _dedupe_price_targets([x for x in (live_partial_tp, live_tp2, live_tp3) if float(x or 0.0) > 0])
+        tp_order_results = _autotrade_place_partial_tpsl_ladder(sym, side, sl_for_order, tp_targets_live, tp_base_qty)
         tp_success_count = sum(1 for x in (tp_order_results or []) if bool(x.get('ok')) )
 
         repair_res = _autotrade_repair_live_exit_protection(uid, {
@@ -4821,7 +4895,9 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'tp3': float(live_tp3 or 0.0),
             'qty': float(tp_base_qty if tp_base_qty > 0 else qty),
             'conf': int(getattr(s, 'conf', 0) or 0),
+            'quality_score': float(getattr(s, 'quality_score', 0.0) or 0.0),
             'atr_pct': float(getattr(s, 'atr_pct', 0.0) or 0.0),
+            'engine': str(getattr(s, 'engine', '') or ''),
             'session': str(session_label or ''),
         }, live_pos=final_pos)
 
@@ -9595,23 +9671,25 @@ def sl_mult_from_conf(conf: int) -> float:
 
 def tp3_rr_target_from_conf(conf: int) -> float:
     """
-    ✅ TP scaling: confidence-weighted RR target for TP3.
+    Production 2-TP final target.
+
+    Recent live evidence shows TP1s are being reached but the old final target is too ambitious.
+    Keep a second TP, but bring it materially closer so the bot can actually realize full wins.
     """
-    if conf >= 88:
-        return 2.6
-    if conf >= 80:
-        return 2.4
-    if conf >= 72:
-        return 2.2
-    # below 72 we still may keep for /screen (awareness), but email floors will filter
-    return 2.0
+    if conf >= 90:
+        return 1.95
+    if conf >= 84:
+        return 1.80
+    if conf >= 78:
+        return 1.65
+    return 1.50
 
 def tp_r_mults_from_conf(conf: int) -> Tuple[float, float, float]:
-    """Return a 2-TP ladder while preserving the legacy 3-value signature."""
+    """Return a tighter 2-TP ladder while preserving the legacy 3-value signature."""
     tp2 = tp3_rr_target_from_conf(conf)
-    tp1 = max(0.9, min(1.2, tp2 * 0.50))
+    tp1 = max(0.75, min(0.95, tp2 * 0.55))
     if tp1 >= tp2:
-        tp1 = max(0.9, tp2 - 0.8)
+        tp1 = max(0.70, tp2 - 0.55)
     return (tp1, tp2, tp2)
 
 def compute_sl_tp(
@@ -9837,6 +9915,10 @@ def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[
 
     # --- Component C: Entry trigger cleanliness (proxy: EMA distance + stop distance sanity) ---
     ema_dist = float(getattr(s, "pullback_ema_dist_pct", 0.0) or 0.0)
+    ch1_abs = abs(float(getattr(s, "ch1", 0.0) or 0.0))
+    ch15_abs = abs(float(getattr(s, "ch15", 0.0) or 0.0))
+    leader_base_override = bool(getattr(s, "leader_base_override", False))
+    engine = str(getattr(s, "engine", "") or "").upper().strip()
     # Prefer pullbacks not too far from EMA (but don't hard-gate)
     ema_clean = 1.0 - _clamp01(ema_dist / 2.0)  # 0%..2% maps to 1..0
 
@@ -9915,12 +9997,30 @@ def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[
     if tp_valid <= 0:
         score = min(score, 35.0)
 
-    # Session slight tuning (NY a bit looser)
+    # Explicit penalty for stretched / late continuation entries.
+    limits = _session_entry_quality_limits(session_name, source='email')
+    extension_penalty = 0.0
+    if not leader_base_override:
+        if ema_dist > float(limits['max_pb_ema_dist']):
+            extension_penalty += min(16.0, (ema_dist - float(limits['max_pb_ema_dist'])) * 12.0)
+        if ch15_abs > float(limits['max_ch15_abs']):
+            extension_penalty += min(10.0, (ch15_abs - float(limits['max_ch15_abs'])) * 8.0)
+        if engine not in {'B', 'C'} and ch1_abs > float(limits['max_ch1_abs']):
+            extension_penalty += min(8.0, (ch1_abs - float(limits['max_ch1_abs'])) * 4.0)
+        if atr_pct > 0 and atr_pct > float(limits['max_atr_pct']):
+            extension_penalty += min(5.0, (atr_pct - float(limits['max_atr_pct'])) * 1.4)
+
+    # Session slight tuning with explicit NY chase-risk penalty.
     sname = str(session_name or "").upper()
     if sname == "NY":
-        score += 2.0
+        score += 1.0
+        if ch1_abs >= 1.8 and ch15_abs >= 0.8:
+            extension_penalty += 3.0
     elif sname == "ASIA":
         score -= 1.0
+
+    components['extension_penalty'] = float(extension_penalty)
+    score -= float(extension_penalty)
 
     return float(clamp(score, 0.0, 100.0)), components
 
@@ -12564,10 +12664,10 @@ def _evolution_safe_apply_adjustments(snapshot: dict) -> list[dict]:
         )
     if int(tag_ctr.get("rr_too_ambitious", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
         _bounded_set(
-            "min_rr_tp3",
-            -0.10,
+            "quality_score_min_email",
+            +1.0,
             "rr_too_ambitious",
-            "Auto-adjustment: reduced minimum TP3 RR slightly after repeated evidence that targets were too ambitious for current conditions.",
+            "Auto-adjustment: tightened email quality after repeated evidence that setups were not strong enough to justify ambitious final targets.",
             0.69,
         )
     if int(tag_ctr.get("pullback_too_shallow", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
@@ -15372,6 +15472,58 @@ async def cmd_self_optimize_report(update: Update, context: ContextTypes.DEFAULT
     await send_long_message(update, _self_opt_format_report(res), parse_mode=None)
 
 
+def _session_entry_quality_limits(session_name: str, source: str = 'email') -> dict:
+    sess = str(session_name or '').upper().strip() or 'NY'
+    base = {
+        'NY': {'max_pb_ema_dist': 0.95, 'max_ch15_abs': 1.05, 'max_ch1_abs': 2.60, 'max_atr_pct': 6.5},
+        'LON': {'max_pb_ema_dist': 0.85, 'max_ch15_abs': 0.95, 'max_ch1_abs': 2.30, 'max_atr_pct': 6.0},
+        'ASIA': {'max_pb_ema_dist': 0.75, 'max_ch15_abs': 0.85, 'max_ch1_abs': 1.90, 'max_atr_pct': 5.5},
+    }.get(sess, {'max_pb_ema_dist': 0.85, 'max_ch15_abs': 0.95, 'max_ch1_abs': 2.30, 'max_atr_pct': 6.0}).copy()
+    if str(source or '').strip().lower() == 'screen':
+        base['max_pb_ema_dist'] *= 1.15
+        base['max_ch15_abs'] *= 1.12
+        base['max_ch1_abs'] *= 1.10
+        base['max_atr_pct'] *= 1.10
+    return base
+
+
+def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str = 'email') -> tuple[bool, str]:
+    try:
+        limits = _session_entry_quality_limits(session_name, source=source)
+        leader_base = bool(getattr(s, 'leader_base_override', False))
+        engine = str(getattr(s, 'engine', '') or '').upper().strip()
+        conf = int(getattr(s, 'conf', 0) or 0)
+        score = float(getattr(s, 'quality_score', 0.0) or 0.0)
+        pb_dist = float(getattr(s, 'pullback_ema_dist_pct', 999.0) or 999.0)
+        ch15_abs = abs(float(getattr(s, 'ch15', 0.0) or 0.0))
+        ch1_abs = abs(float(getattr(s, 'ch1', 0.0) or 0.0))
+        atr_pct = float(getattr(s, 'atr_pct', 0.0) or 0.0)
+
+        if leader_base:
+            return (True, 'ok')
+
+        max_pb = float(limits['max_pb_ema_dist']) + (0.10 if engine == 'B' else 0.0)
+        max_ch15 = float(limits['max_ch15_abs']) + (0.20 if engine == 'B' else 0.0)
+        max_ch1 = float(limits['max_ch1_abs']) + (0.50 if engine == 'B' else 0.0)
+        max_atr = float(limits['max_atr_pct']) + (0.60 if engine == 'B' else 0.0)
+
+        if pb_dist > max_pb:
+            return (False, 'entry_far_from_pullback_ema')
+        if ch15_abs > max_ch15:
+            return (False, 'entry_too_extended_15m')
+        if engine not in {'B', 'C'} and ch1_abs > max_ch1:
+            return (False, 'entry_too_extended_1h')
+        if atr_pct > 0 and atr_pct > max_atr:
+            return (False, 'poor_volatility_regime_exec')
+
+        sess = str(session_name or '').upper().strip()
+        if sess == 'NY' and ch1_abs >= 1.8 and ch15_abs >= 0.8 and conf < 84 and score < 80.0:
+            return (False, 'ny_breakout_chase_risk')
+        return (True, 'ok')
+    except Exception:
+        return (False, 'entry_quality_gate_exception')
+
+
 def is_top_setup_eligible(
 
     s: "Setup",
@@ -15420,6 +15572,10 @@ def is_top_setup_eligible(
         if float(score) < float(min_score):
             return (False, f"below_score_{int(min_score)}")
 
+        ok_entry, why_entry = _setup_entry_quality_gate(s, session_name=session_name, source=src)
+        if not ok_entry:
+            return (False, why_entry)
+
         # Liquidity floor remains a HARD safety gate (prevents junk illiquid coins)
         fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
         if fut_vol < float(MIN_FUT_VOL_USD):
@@ -15438,12 +15594,12 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        return (70.0, 78, 2.00)
+        return (76.0, 82, 1.55)
     if sess == "LON":
-        return (72.0, 80, 2.10)
+        return (74.0, 80, 1.50)
     if sess == "ASIA":
-        return (74.0, 82, 2.20)
-    return (72.0, 80, 2.10)
+        return (78.0, 84, 1.60)
+    return (74.0, 80, 1.50)
 
 
 def is_executable_setup_eligible(
