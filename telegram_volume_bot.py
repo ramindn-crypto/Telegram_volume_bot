@@ -1553,7 +1553,7 @@ AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT"
 AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "3") or 3)
 # Open-trade count cap for commercial/live safety.
 AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "0") or 0)
-EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
 EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "LON,NY") or "LON,NY").split(",") if s.strip()]
 EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", False)
 
@@ -1563,7 +1563,7 @@ AUTOTRADE_ISOLATED = str(os.environ.get("AUTOTRADE_ISOLATED", "1")).strip() in (
 AUTOTRADE_LEVERAGE = int(os.environ.get("AUTOTRADE_LEVERAGE", "10") or 10)
 
 # TP split (fractions must sum ~1.0)
-_AUTOTRADE_TP_SPLIT_RAW = str(os.environ.get("AUTOTRADE_TP_SPLIT", "0.65,0.35,0.0") or "0.65,0.35,0.0")
+_AUTOTRADE_TP_SPLIT_RAW = str(os.environ.get("AUTOTRADE_TP_SPLIT", "0.75,0.25,0.0") or "0.75,0.25,0.0")
 try:
     AUTOTRADE_TP_SPLIT = [float(x) for x in _AUTOTRADE_TP_SPLIT_RAW.split(",")]
 except Exception:
@@ -15589,18 +15589,18 @@ def is_top_setup_eligible(
 def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]:
     """Session-aware production thresholds.
 
-    30d universe backtest shows the executable lane is still too loose, especially in ASIA
-    and on fast NY continuation entries. Keep NY/LON tradable, but require materially better
-    quality before a setup is allowed into email/execution.
+    30d universe backtest shows the executable lane improved on volume but still has
+    negative expectancy. Keep NY/LON tradable, but require materially better quality
+    and reduce breakout-chase exposure before a setup is allowed into email/execution.
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        return (79.0, 84, 1.60)
+        return (81.0, 85, 1.62)
     if sess == "LON":
-        return (78.0, 83, 1.58)
+        return (80.0, 84, 1.60)
     if sess == "ASIA":
         return (84.0, 87, 1.72)
-    return (78.0, 83, 1.58)
+    return (80.0, 84, 1.60)
 
 
 def is_executable_setup_eligible(
@@ -15656,14 +15656,16 @@ def is_executable_setup_eligible(
         ch1_abs = abs(float(getattr(s, "ch1", 0.0) or 0.0))
 
         if sess == "NY":
-            if pb_dist > 0.78 and (score < (score_floor + 3.0) or conf < (conf_floor + 2)):
+            if pb_dist > 0.72 and (score < (score_floor + 3.0) or conf < (conf_floor + 2)):
                 return (False, "ny_entry_too_far_from_ema")
-            if ch15_abs > 0.95 and pb_dist > 0.70:
+            if ch15_abs > 0.88 and pb_dist > 0.64:
                 return (False, "ny_late_extension_exec")
+            if ch1_abs > 1.55 and pb_dist > 0.62 and score < (score_floor + 4.0):
+                return (False, "ny_trend_extension_exec")
         elif sess == "LON":
-            if pb_dist > 0.76 and (score < (score_floor + 2.0) or conf < (conf_floor + 1)):
+            if pb_dist > 0.74 and (score < (score_floor + 2.0) or conf < (conf_floor + 1)):
                 return (False, "lon_entry_too_far_from_ema")
-            if ch15_abs > 0.90 and ch1_abs > 1.70 and pb_dist > 0.68:
+            if ch15_abs > 0.86 and ch1_abs > 1.55 and pb_dist > 0.64:
                 return (False, "lon_late_extension_exec")
 
         if engine == "A":
