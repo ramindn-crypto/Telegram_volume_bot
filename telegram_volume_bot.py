@@ -146,6 +146,30 @@ def _bybit_linear_symbol(sym: str) -> str:
     return f"{s}USDT"
 
 
+def _symbol_base(sym: str) -> str:
+    """Return base symbol without quote suffix, e.g. BNBUSDT -> BNB."""
+    try:
+        s = _bybit_linear_symbol(sym)
+        if s.endswith('USDT'):
+            return s[:-4]
+        return s
+    except Exception:
+        s = str(sym or '').replace('/', '').replace(' ', '').upper()
+        if s.endswith('USDT'):
+            return s[:-4]
+        return s
+
+
+def _symbol_match_loose(a: str, b: str) -> bool:
+    """Loose symbol matcher that treats BNB and BNBUSDT as equivalent."""
+    try:
+        aa = _symbol_base(str(a or ''))
+        bb = _symbol_base(str(b or ''))
+        return bool(aa) and aa == bb
+    except Exception:
+        return False
+
+
 logger = logging.getLogger(__name__)
 
 # Bybit instrument filters cache (qtyStep/minQty)
