@@ -12244,7 +12244,15 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
 
         entry = float(getattr(s, 'entry', 0.0) or 0.0)
         sl = float(getattr(s, 'sl', 0.0) or 0.0)
-        final_tp = float(getattr(s, 'tp2', 0.0) or getattr(s, 'tp3', 0.0) or 0.0)
+        side = str(getattr(s, 'side', '') or '').upper().strip()
+        tp3 = float(getattr(s, 'tp3', 0.0) or 0.0)
+        tp2 = float(getattr(s, 'tp2', 0.0) or 0.0)
+        if side == 'BUY':
+            final_tp = max([tp for tp in (tp3, tp2) if tp > entry], default=0.0)
+        elif side == 'SELL':
+            final_tp = min([tp for tp in (tp3, tp2) if 0.0 < tp < entry], default=0.0)
+        else:
+            final_tp = tp3 or tp2 or 0.0
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
         rows.append({
             'symbol': str(symbol),
@@ -16130,7 +16138,7 @@ def is_executable_setup_eligible(
     session_name: str = "NY",
     min_quality: float = 70.0,
     min_conf: int = 78,
-    min_rr_final: float = 2.0,
+    min_rr_final: Optional[float] = None,
 ) -> tuple[bool, str]:
     """Production-grade gate for email/executable/autotrade path.
 
@@ -16157,7 +16165,8 @@ def is_executable_setup_eligible(
         sess_quality, sess_conf, sess_rr = _execution_session_thresholds(sess)
         score_floor = float(max(min_quality, QUALITY_SCORE_MIN_EMAIL, sess_quality))
         conf_floor = int(max(min_conf, MIN_SETUP_CONF, sess_conf))
-        rr_floor = float(max(min_rr_final, sess_rr))
+        cfg_rr_floor = float(MIN_RR_TP3 if min_rr_final is None else min_rr_final)
+        rr_floor = float(max(cfg_rr_floor, sess_rr))
 
         score = float(getattr(s, "quality_score", 0.0) or 0.0)
         if score < score_floor:
@@ -16169,10 +16178,22 @@ def is_executable_setup_eligible(
 
         entry = float(getattr(s, "entry", 0.0) or 0.0)
         sl = float(getattr(s, "sl", 0.0) or 0.0)
-        final_tp = float(getattr(s, "tp2", 0.0) or getattr(s, "tp3", 0.0) or 0.0)
+        side = str(getattr(s, "side", "") or "").upper().strip()
+        tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+        tp2 = float(getattr(s, "tp2", 0.0) or 0.0)
+        final_tp = 0.0
+        tp_candidates = [tp for tp in (tp3, tp2) if tp > 0]
+        if side == "BUY":
+            tp_candidates = [tp for tp in tp_candidates if tp > entry]
+            final_tp = max(tp_candidates) if tp_candidates else 0.0
+        elif side == "SELL":
+            tp_candidates = [tp for tp in tp_candidates if tp < entry]
+            final_tp = min(tp_candidates) if tp_candidates else 0.0
+        else:
+            final_tp = tp3 or tp2 or 0.0
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
         if rr_final < rr_floor:
-            return (False, "below_exec_rr")
+            return (False, f"below_exec_rr (rr={rr_final:.2f} floor={rr_floor:.2f})")
 
         engine = str(getattr(s, "engine", "") or "").upper().strip()
         fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
