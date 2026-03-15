@@ -986,11 +986,20 @@ ADMIN_USER_IDS = set(
 )
 ADMIN_IDS = set(ADMIN_IDS) | set(ADMIN_USER_IDS)
 
-if AUTOTRADE_OWNER_UID <= 0 and ADMIN_USER_IDS:
+# Safe early owner fallback: avoid import-time NameError before the env-backed
+# AUTOTRADE_OWNER_UID config block is evaluated later in the file.
+if int(globals().get("AUTOTRADE_OWNER_UID", 0) or 0) <= 0 and ADMIN_USER_IDS:
     try:
-        AUTOTRADE_OWNER_UID = int(sorted(ADMIN_USER_IDS)[0])
+        _owner_env = int(os.environ.get("AUTOTRADE_OWNER_UID", "0") or 0)
     except Exception:
-        pass
+        _owner_env = 0
+    if _owner_env > 0:
+        AUTOTRADE_OWNER_UID = _owner_env
+    else:
+        try:
+            AUTOTRADE_OWNER_UID = int(sorted(ADMIN_USER_IDS)[0])
+        except Exception:
+            AUTOTRADE_OWNER_UID = 0
 
 # IMPORTANT CHANGE:
 # System sends signals only. It does NOT show reject reasons to public users.
