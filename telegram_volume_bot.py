@@ -8732,6 +8732,179 @@ def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
     except Exception:
         pass
 
+
+def _db_sync_email_pipeline_success(user_id: int, session: str, s, emailed_ts: float | None = None, retries: int = 3) -> tuple[bool, str]:
+    """Atomically persist the post-email pipeline state for one setup.
+
+    Why this exists:
+    - send_email() can succeed while one of the follow-up DB writes silently fails
+      (signals / emailed_setups / executable_setups / generated_setups were previously
+      written in separate best-effort blocks).
+    - When that happens, the visible email is sent but autotrade may never see the
+      executable row, which breaks the expected setup -> email -> autotrade chain.
+
+    This helper keeps those writes in one SQLite transaction with a short retry loop
+    for transient database locks.
+    """
+    uid = int(user_id)
+    sess = str(session or "")
+    ts_now = float(emailed_ts or time.time())
+    sid = str(getattr(s, 'setup_id', '') or '').strip()
+    if not sid:
+        return (False, 'missing_setup_id')
+
+    last_err = ''
+    for attempt in range(max(1, int(retries))):
+        con = None
+        try:
+            con = db_connect()
+            cur = con.cursor()
+            cur.execute('BEGIN IMMEDIATE')
+            try:
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO signals (
+                        setup_id, created_ts, symbol, market_symbol, side, conf, entry, sl, tp1, tp2, tp3,
+                        fut_vol_usd, ch24, ch4, ch1, ch15, engine, quality_score, atr_pct,
+                        pullback_ready, pullback_bypass_hot, leader_base_override, pullback_ema_dist_pct
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sid,
+                        float(getattr(s, 'created_ts', 0.0) or 0.0),
+                        str(getattr(s, 'symbol', '') or ''),
+                        getattr(s, 'market_symbol', None),
+                        str(getattr(s, 'side', '') or ''),
+                        int(getattr(s, 'conf', 0) or 0),
+                        float(getattr(s, 'entry', 0.0) or 0.0),
+                        float(getattr(s, 'sl', 0.0) or 0.0),
+                        getattr(s, 'tp1', None),
+                        getattr(s, 'tp2', None),
+                        getattr(s, 'tp3', None),
+                        float(getattr(s, 'fut_vol_usd', 0.0) or 0.0),
+                        float(getattr(s, 'ch24', 0.0) or 0.0),
+                        float(getattr(s, 'ch4', 0.0) or 0.0),
+                        float(getattr(s, 'ch1', 0.0) or 0.0),
+                        float(getattr(s, 'ch15', 0.0) or 0.0),
+                        str(getattr(s, 'engine', '') or ''),
+                        float(getattr(s, 'quality_score', 0.0) or 0.0),
+                        float(getattr(s, 'atr_pct', 0.0) or 0.0),
+                        1 if bool(getattr(s, 'pullback_ready', False)) else 0,
+                        1 if bool(getattr(s, 'pullback_bypass_hot', False)) else 0,
+                        1 if bool(getattr(s, 'leader_base_override', False)) else 0,
+                        float(getattr(s, 'pullback_ema_dist_pct', 0.0) or 0.0),
+                    ),
+                )
+            except Exception:
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO signals (
+                        setup_id, created_ts, symbol, side, conf, entry, sl, tp1, tp2, tp3,
+                        fut_vol_usd, ch24, ch4, ch1, ch15
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sid,
+                        float(getattr(s, 'created_ts', 0.0) or 0.0),
+                        str(getattr(s, 'symbol', '') or ''),
+                        str(getattr(s, 'side', '') or ''),
+                        int(getattr(s, 'conf', 0) or 0),
+                        float(getattr(s, 'entry', 0.0) or 0.0),
+                        float(getattr(s, 'sl', 0.0) or 0.0),
+                        getattr(s, 'tp1', None),
+                        getattr(s, 'tp2', None),
+                        getattr(s, 'tp3', None),
+                        float(getattr(s, 'fut_vol_usd', 0.0) or 0.0),
+                        float(getattr(s, 'ch24', 0.0) or 0.0),
+                        float(getattr(s, 'ch4', 0.0) or 0.0),
+                        float(getattr(s, 'ch1', 0.0) or 0.0),
+                        float(getattr(s, 'ch15', 0.0) or 0.0),
+                    ),
+                )
+
+            cur.execute(
+                """INSERT OR REPLACE INTO emailed_setups (user_id, setup_id, session, emailed_ts)
+                   VALUES (?, ?, ?, ?)""",
+                (uid, sid, sess, ts_now),
+            )
+            cur.execute(
+                """INSERT OR REPLACE INTO executable_setups (user_id, setup_id, session, executable_ts)
+                   VALUES (?, ?, ?, ?)""",
+                (uid, sid, sess, ts_now),
+            )
+            cur.execute(
+                """INSERT INTO generated_setups
+                   (user_id, source, created_ts, session, setup_id, symbol, side, conf)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    uid,
+                    'email',
+                    ts_now,
+                    sess,
+                    sid,
+                    str(getattr(s, 'symbol', '') or ''),
+                    str(getattr(s, 'side', '') or ''),
+                    int(getattr(s, 'conf', 0) or 0),
+                ),
+            )
+            con.commit()
+            try:
+                _admin_setup_lifecycle_merge(
+                    uid,
+                    sid,
+                    session=sess,
+                    symbol=str(getattr(s, 'symbol', '') or ''),
+                    side=str(getattr(s, 'side', '') or ''),
+                    emailed_ts=ts_now,
+                    executable_ts=ts_now,
+                    generated_logged_ts=ts_now,
+                    signal_created_ts=float(getattr(s, 'created_ts', 0.0) or 0.0),
+                    state='executable_pending',
+                    source_kind='executable_setups',
+                )
+            except Exception:
+                pass
+            return (True, '')
+        except sqlite3.OperationalError as e:
+            last_err = f'{type(e).__name__}: {e}'
+            try:
+                if con:
+                    con.rollback()
+            except Exception:
+                pass
+            if attempt < max(1, int(retries)) - 1 and 'locked' in str(e).lower():
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            break
+        except Exception as e:
+            last_err = f'{type(e).__name__}: {e}'
+            try:
+                if con:
+                    con.rollback()
+            except Exception:
+                pass
+            break
+        finally:
+            try:
+                if con:
+                    con.close()
+            except Exception:
+                pass
+
+    try:
+        _admin_setup_lifecycle_merge(
+            uid,
+            sid,
+            session=sess,
+            symbol=str(getattr(s, 'symbol', '') or ''),
+            side=str(getattr(s, 'side', '') or ''),
+            state='email_sent_db_sync_failed',
+            last_reason=str(last_err or 'email_sent_db_sync_failed'),
+        )
+    except Exception:
+        pass
+    return (False, str(last_err or 'email_sent_db_sync_failed'))
+
 def db_list_emailed_setups(user_id: int, ts_from: float) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
@@ -17689,6 +17862,50 @@ def make_breakout_setup(
     )
 
 
+def _setup_priority_rank(s: "Setup", session_name: str = "LON") -> tuple[float, int, float, float]:
+    """Shared premium ranking for setup generation, email, and autotrade lanes.
+
+    Why this exists:
+    - setup generation used to pre-truncate candidates by confidence only
+    - email / executable flow ranks by quality first
+    - that mismatch could drop the best executable-grade setups before the email path
+      ever saw them, especially when many symbols produced candidates in the same scan
+
+    We therefore rank with the same shape used later in build_priority_pool: quality,
+    then confidence, then final RR, then liquidity.
+    """
+    try:
+        score = float(getattr(s, "quality_score", 0.0) or 0.0)
+    except Exception:
+        score = 0.0
+    try:
+        if score <= 0:
+            score, comps = compute_setup_quality_score(s, session_name=session_name)
+            try:
+                setattr(s, "quality_score", float(score or 0.0))
+                setattr(s, "quality_components", comps)
+            except Exception:
+                pass
+    except Exception:
+        score = 0.0
+
+    try:
+        entry = float(getattr(s, "entry", 0.0) or 0.0)
+        sl = float(getattr(s, "sl", 0.0) or 0.0)
+        side = str(getattr(s, "side", "") or "")
+        final_tp = _setup_final_target(entry, side, getattr(s, "tp1", None), getattr(s, "tp2", None), getattr(s, "tp3", None))
+        rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
+    except Exception:
+        rr_final = 0.0
+
+    return (
+        float(score),
+        int(getattr(s, "conf", 0) or 0),
+        float(rr_final),
+        float(getattr(s, "fut_vol_usd", 0.0) or 0.0),
+    )
+
+
 def pick_setups(
     best_fut: Dict[str, MarketVol],
     n: int,
@@ -17748,7 +17965,7 @@ def pick_setups(
             except Exception:
                 pass
 
-    setups.sort(key=lambda x: (x.conf, x.fut_vol_usd), reverse=True)
+    setups.sort(key=lambda x: _setup_priority_rank(x, session_name=session_name), reverse=True)
     return setups[:n]
 
 
@@ -17781,8 +17998,8 @@ def pick_breakout_setups(
         except Exception:
             continue
 
-    # order by confidence then volume
-    out.sort(key=lambda s: (s.conf, s.fut_vol_usd), reverse=True)
+    # Keep breakout candidates aligned with the shared executable ranking lane.
+    out.sort(key=lambda s: _setup_priority_rank(s, session_name=session_name), reverse=True)
     return out[: max(0, int(n)) ]
 
 
@@ -22706,27 +22923,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # De-dupe by (symbol, side, engine) using the same premium ranking lane that drives
     # top-setup selection: quality first, then confidence, RR, then liquidity.
     def _dedupe_rank(_s: Setup):
-        try:
-            score = float(getattr(_s, "quality_score", 0.0) or 0.0)
-            if score <= 0:
-                score, _ = compute_setup_quality_score(_s, session_name=session_name)
-                try:
-                    setattr(_s, "quality_score", float(score or 0.0))
-                except Exception:
-                    pass
-        except Exception:
-            score = 0.0
-        try:
-            final_tp = _setup_final_target(float(_s.entry or 0.0), str(getattr(_s, "side", "") or ""), getattr(_s, "tp1", None), getattr(_s, "tp2", None), getattr(_s, "tp3", None))
-            rr_final = float(rr_to_tp(float(_s.entry or 0.0), float(_s.sl or 0.0), float(final_tp or 0.0))) if float(_s.entry or 0.0) > 0 and float(_s.sl or 0.0) > 0 and float(final_tp or 0.0) > 0 else 0.0
-        except Exception:
-            rr_final = 0.0
-        return (
-            float(score),
-            int(getattr(_s, "conf", 0) or 0),
-            float(rr_final),
-            float(getattr(_s, "fut_vol_usd", 0.0) or 0.0),
-        )
+        return _setup_priority_rank(_s, session_name=session_name)
 
     best = {}
     for s in priority_setups:
@@ -23342,13 +23539,23 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             return {"status": "skip", "reason": f"no_actionable_screen_setups ({','.join(skipped[:3])})"}
 
         actionable = list(actionable[:max(1, int(EMAIL_SETUPS_N))])
-        sent = await asyncio.to_thread(
-            send_email_alert_multi,
-            dict(user or {}),
-            {"name": str(live_session)},
-            actionable,
-            best_fut,
-        )
+        try:
+            sent = await asyncio.wait_for(
+                asyncio.to_thread(
+                    send_email_alert_multi,
+                    dict(user or {}),
+                    {"name": str(live_session)},
+                    actionable,
+                    best_fut,
+                ),
+                timeout=EMAIL_SEND_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            sent = False
+            try:
+                _LAST_SMTP_ERROR[int(uid)] = f"timeout_after_{int(EMAIL_SEND_TIMEOUT_SEC)}s"
+            except Exception:
+                pass
         if sent:
             try:
                 sent_count_now = int(st.get('sent_count', 0) or 0)
@@ -23972,41 +24179,18 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
     if sent:
         try:
             now_ts = time.time()
+            sync_failures = []
             for s in setups:
-                sid = str(getattr(s, "setup_id", "") or "").strip()
-                try:
-                    db_insert_signal(s, user_id=uid)
-                except Exception:
-                    pass
-                try:
-                    if sid and not db_get_signal(sid):
-                        db_insert_signal(s, user_id=uid)
-                except Exception:
-                    pass
-                try:
-                    db_mark_emailed_setup(uid, sid, str(display_session), now_ts)
-                except Exception:
-                    pass
-                try:
-                    if sid and not db_has_emailed_setup(uid, sid, lookback_hours=24):
-                        db_mark_emailed_setup(uid, sid, str(display_session), now_ts)
-                except Exception:
-                    pass
-                try:
-                    db_mark_executable_setup(uid, sid, str(display_session), now_ts)
-                except Exception:
-                    pass
-                try:
-                    if sid and not db_has_executable_setup(uid, sid, lookback_hours=24):
-                        db_mark_executable_setup(uid, sid, str(display_session), now_ts)
-                except Exception:
-                    pass
-                try:
-                    db_log_generated_setup(uid, "email", str(display_session or ""), s)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                ok_sync, sync_reason = _db_sync_email_pipeline_success(uid, str(display_session), s, emailed_ts=now_ts)
+                if not ok_sync:
+                    sync_failures.append(f"{str(getattr(s, 'setup_id', '') or '')}:{sync_reason}")
+            if sync_failures:
+                logger.warning("post-email DB sync incomplete for uid=%s: %s", uid, "; ".join(sync_failures))
+        except Exception as e:
+            try:
+                logger.exception("post-email pipeline sync failed for uid=%s: %s", uid, e)
+            except Exception:
+                pass
     else:
         try:
             for s in setups:
