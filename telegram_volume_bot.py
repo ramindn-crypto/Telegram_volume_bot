@@ -4349,6 +4349,11 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
     try:
         from types import SimpleNamespace
         cutoff = time.time() - float(lookback_hours) * 3600.0
+        # Over-fetch candidates before Python-side freshness/session filtering.
+        # Otherwise a few newest stale/mismatched executable rows can starve a still-valid
+        # candidate just below the SQL LIMIT and make autotrade look like it has "no setups".
+        sql_limit = max(int(limit or 1) * 8, 20)
+
 
         con = sqlite3.connect(DB_PATH)
         cur = con.cursor()
@@ -4447,7 +4452,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             ORDER BY executable_ts DESC, emailed_ts DESC, x.setup_id DESC
             LIMIT ?
             """,
-            (int(uid), float(cutoff), int(limit)),
+            (int(uid), float(cutoff), int(sql_limit)),
         )
         rows = cur.fetchall() or []
         # Keep autotrade aligned with the newest executable email lane.
@@ -4460,7 +4465,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                 int(getattr(x, 'conf', 0) or 0),
             ),
             reverse=True,
-        )
+        )[:max(1, int(limit or 1))]
         if out:
             try:
                 for item in out:
@@ -23344,8 +23349,35 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (cache_entry.get("body") and (now_ts - float(cache_entry.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
             cached_body = str(cache_entry.get("body") or "")
             cached_kb = list(cache_entry.get("kb") or [])
+            cached_sync_info = dict(cache_entry.get("sync_info") or {})
+            cached_shown_setups = list(cache_entry.get("shown_setups") or [])
+
+            if cached_shown_setups:
+                try:
+                    refreshed_sync = await _screen_sync_pipeline_async(
+                        int(update.effective_user.id),
+                        user or {},
+                        live_session,
+                        scan_session,
+                        best_fut,
+                        cached_shown_setups,
+                    )
+                    if refreshed_sync:
+                        cached_sync_info = dict(refreshed_sync)
+                        cache_entry = dict(cache_entry)
+                        cache_entry["sync_info"] = dict(cached_sync_info)
+                        _SCREEN_CACHE[cache_key] = cache_entry
+                except Exception:
+                    pass
 
             msg = (header + "\n" + cached_body).strip()
+            if cached_sync_info:
+                sync_status = str(cached_sync_info.get("status") or "").strip().lower()
+                sync_reason = str(cached_sync_info.get("reason") or "").strip()
+                if sync_status == 'sent':
+                    msg += f"\n\n✅ Sync: `{sync_reason}`"
+                elif sync_status in {'skip', 'error'} and sync_reason:
+                    msg += f"\n\nℹ️ Sync: `{sync_reason}`"
 
             keyboard = [
                 [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
@@ -23374,8 +23406,36 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if (cache_entry.get("body") and (now_ts - float(cache_entry.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
                 cached_body = str(cache_entry.get("body") or "")
                 cached_kb = list(cache_entry.get("kb") or [])
+                cached_sync_info = dict(cache_entry.get("sync_info") or {})
+                cached_shown_setups = list(cache_entry.get("shown_setups") or [])
+
+                if cached_shown_setups:
+                    try:
+                        refreshed_sync = await _screen_sync_pipeline_async(
+                            int(update.effective_user.id),
+                            user or {},
+                            live_session,
+                            scan_session,
+                            best_fut,
+                            cached_shown_setups,
+                        )
+                        if refreshed_sync:
+                            cached_sync_info = dict(refreshed_sync)
+                            cache_entry = dict(cache_entry)
+                            cache_entry["sync_info"] = dict(cached_sync_info)
+                            _SCREEN_CACHE[cache_key] = cache_entry
+                    except Exception:
+                        pass
 
                 msg = (header + "\n" + cached_body).strip()
+                if cached_sync_info:
+                    sync_status = str(cached_sync_info.get("status") or "").strip().lower()
+                    sync_reason = str(cached_sync_info.get("reason") or "").strip()
+                    if sync_status == 'sent':
+                        msg += f"\n\n✅ Sync: `{sync_reason}`"
+                    elif sync_status in {'skip', 'error'} and sync_reason:
+                        msg += f"\n\nℹ️ Sync: `{sync_reason}`"
+
                 keyboard = [
                     [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
                     for (sym, sid) in (cached_kb or [])
@@ -23423,6 +23483,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "body": body,
                 "kb": list(kb or []),
                 "sync_info": dict(sync_info or {}),
+                "shown_setups": list(shown_setups or []),
             }
 
 
