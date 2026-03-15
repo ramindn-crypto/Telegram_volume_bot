@@ -1406,11 +1406,9 @@ def apply_strategy_config(cfg: dict) -> None:
         "smf": float(cfg.get("score_w_smf", 0.01)),
     }
 
-# Initialize config on boot
-try:
-    apply_strategy_config(load_strategy_config(force=True))
-except Exception:
-    pass
+# Strategy config depends on threshold globals that are defined later in the file.
+# Apply it again after all scoring / setup globals are initialized, and refresh it at scan time.
+_strategy_config_boot_pending = True
 
 def _parse_param_value(s: str):
     """Parse param values for /params_set. Supports bool/int/float/json/raw string."""
@@ -10109,6 +10107,13 @@ def rr_to_tp(entry: float, sl: float, tp: float) -> float:
 
 QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "62"))
 QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "70"))
+
+# Final strategy-config sync: setup generation must use the live saved config, not only env defaults.
+try:
+    apply_strategy_config(load_strategy_config(force=True))
+    _strategy_config_boot_pending = False
+except Exception:
+    pass
 
 # Soft throttling: how many candidates we score before slicing (keeps compute bounded)
 QUALITY_SCORE_CAND_MULT_SCREEN = int(os.environ.get("QUALITY_SCORE_CAND_MULT_SCREEN", "8"))
@@ -22260,10 +22265,18 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     }
     """
 
+    # Always refresh live strategy config before building pools so setup generation,
+    # email eligibility, and autotrade read the same active thresholds.
+    try:
+        apply_strategy_config(load_strategy_config(force=False))
+    except Exception:
+        pass
+
     # Setup-count governor (email path): keep 3–5/day without spamming (safe bounds)
     try:
         if str(mode or '').lower().strip() == 'email':
             _governor_adjust_quality_floor(session_name=session_name)
+            apply_strategy_config(load_strategy_config(force=True))
     except Exception:
         pass
 
@@ -22690,11 +22703,35 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     priority_setups = gated
 
 
-    # de-dupe by (symbol, side, engine) keeping highest conf, preserving priority order
+    # De-dupe by (symbol, side, engine) using the same premium ranking lane that drives
+    # top-setup selection: quality first, then confidence, RR, then liquidity.
+    def _dedupe_rank(_s: Setup):
+        try:
+            score = float(getattr(_s, "quality_score", 0.0) or 0.0)
+            if score <= 0:
+                score, _ = compute_setup_quality_score(_s, session_name=session_name)
+                try:
+                    setattr(_s, "quality_score", float(score or 0.0))
+                except Exception:
+                    pass
+        except Exception:
+            score = 0.0
+        try:
+            final_tp = _setup_final_target(float(_s.entry or 0.0), str(getattr(_s, "side", "") or ""), getattr(_s, "tp1", None), getattr(_s, "tp2", None), getattr(_s, "tp3", None))
+            rr_final = float(rr_to_tp(float(_s.entry or 0.0), float(_s.sl or 0.0), float(final_tp or 0.0))) if float(_s.entry or 0.0) > 0 and float(_s.sl or 0.0) > 0 and float(final_tp or 0.0) > 0 else 0.0
+        except Exception:
+            rr_final = 0.0
+        return (
+            float(score),
+            int(getattr(_s, "conf", 0) or 0),
+            float(rr_final),
+            float(getattr(_s, "fut_vol_usd", 0.0) or 0.0),
+        )
+
     best = {}
     for s in priority_setups:
         k = (str(s.symbol).upper(), str(s.side), str(getattr(s, "engine", "")))
-        if k not in best or int(s.conf) > int(best[k].conf):
+        if k not in best or _dedupe_rank(s) > _dedupe_rank(best[k]):
             best[k] = s
 
     ordered = []
