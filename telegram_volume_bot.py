@@ -986,21 +986,6 @@ ADMIN_USER_IDS = set(
 )
 ADMIN_IDS = set(ADMIN_IDS) | set(ADMIN_USER_IDS)
 
-# Safe early owner fallback: avoid import-time NameError before the env-backed
-# AUTOTRADE_OWNER_UID config block is evaluated later in the file.
-if int(globals().get("AUTOTRADE_OWNER_UID", 0) or 0) <= 0 and ADMIN_USER_IDS:
-    try:
-        _owner_env = int(os.environ.get("AUTOTRADE_OWNER_UID", "0") or 0)
-    except Exception:
-        _owner_env = 0
-    if _owner_env > 0:
-        AUTOTRADE_OWNER_UID = _owner_env
-    else:
-        try:
-            AUTOTRADE_OWNER_UID = int(sorted(ADMIN_USER_IDS)[0])
-        except Exception:
-            AUTOTRADE_OWNER_UID = 0
-
 # IMPORTANT CHANGE:
 # System sends signals only. It does NOT show reject reasons to public users.
 # Admin can still see internals if you set PUBLIC_DIAGNOSTICS_MODE=admin
@@ -1118,15 +1103,15 @@ def _strategy_config_defaults() -> dict:
         "score_w_smf": 0.01,
 
         # Frequency targeting (used in /optimize objective)
-        "target_setups_per_day_lo": 3.0,
-        "target_setups_per_day_hi": 5.0,
+        "target_setups_per_day_lo": 4.0,
+        "target_setups_per_day_hi": 7.0,
 
         # Self-optimization governance
-        "session_weights": {"NY": 1.0, "LON": 0.0, "ASIA": 0.0},  # optimizer weighting (production bias: NY-only)
+        "session_weights": {"NY": 1.0, "LON": 0.85, "ASIA": 0.65},  # balanced live-session weighting
         "concentration_cap": 0.25,          # no single symbol >25% of setups (OOS)
-        "oos_min_setups": 30,               # minimum OOS sample size across universe before promotion
-        "min_win_rate": 70.0,               # enforced only when sample is adequate
-        "min_win_rate_samples": 50,         # require at least this many OOS setups to enforce min_win_rate
+        "oos_min_setups": 24,               # minimum OOS sample size across universe before promotion
+        "min_win_rate": 54.0,               # enforced only when sample is adequate
+        "min_win_rate_samples": 30,         # require at least this many OOS setups to enforce min_win_rate
         "max_drawdown_R_cap": 8.0,          # OOS max drawdown cap in R (penalize heavily above)
 
         # Setup-count governor (live engine + optimizer)
@@ -1159,14 +1144,14 @@ def _strategy_config_defaults() -> dict:
         ],
         "autotune_shortlist": 10,
         "autotune_min_positive_windows": 3,
-        "autotune_min_window_wr": 52.0,
+        "autotune_min_window_wr": 49.0,
         "autotune_consistency_penalty": 2.0,
         "autotune_learning_guard_enabled": True,
 
         # Universe backtest autopilot (zero-touch telemetry feeding learning/optimizer)
         "universe_backtest_top_n": 80,
         "universe_backtest_min_vol_usd": 10000000.0,
-        "universe_backtest_windows": [7, 30],
+        "universe_backtest_windows": [7, 14, 30],
         "universe_backtest_exec_tf": "15m",
 
         # Daily market-adaptive universe optimizer (runtime params only; no source rewriting)
@@ -1174,12 +1159,13 @@ def _strategy_config_defaults() -> dict:
         "market_adaptive_interval_hours": 24.0,
         "market_adaptive_first_delay_sec": 45,
         "market_adaptive_days": 30,
-        "market_adaptive_max_passes": 2,
-        "market_adaptive_min_improvement": 0.35,
+        "market_adaptive_max_passes": 3,
+        "market_adaptive_min_improvement": 0.20,
         "market_adaptive_target_setups_per_day_lo": 4.0,
         "market_adaptive_target_setups_per_day_hi": 10.0,
         "market_adaptive_session_wr_floor_ny": 46.0,
         "market_adaptive_session_wr_floor_lon": 48.0,
+        "market_adaptive_session_wr_floor_asia": 44.0,
         "market_adaptive_cooldown_hours": 20.0,
         "execution_asia_enabled": bool(EXECUTION_ASIA_ENABLED),
         "execution_engine_b_email_enabled": bool(EXECUTION_ENGINE_B_EMAIL_ENABLED),
@@ -1188,13 +1174,83 @@ def _strategy_config_defaults() -> dict:
             "LON": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
             "ASIA": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
         },
+        "_config_revision": 2,
+        "_migrated_balanced_sessions_v2": True,
     }
+
+
+
+def _strategy_cfg_parse_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    try:
+        s = str(value).strip().lower()
+        if s in {"1", "true", "yes", "on", "y"}:
+            return True
+        if s in {"0", "false", "no", "off", "n", ""}:
+            return False
+        return bool(int(float(s)))
+    except Exception:
+        return bool(default)
+
+
+def _deep_merge_dict(base: dict, override: dict) -> dict:
+    out = json.loads(json.dumps(base or {}))
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_dict(out.get(k) or {}, v)
+        else:
+            out[k] = v
+    return out
+
+
+def _normalize_strategy_config(cfg: dict) -> dict:
+    base = _strategy_config_defaults()
+    out = _deep_merge_dict(base, cfg if isinstance(cfg, dict) else {})
+
+    def _f(v, d):
+        try:
+            return float(v)
+        except Exception:
+            return float(d)
+
+    raw_sw = out.get("session_weights") or {}
+    wny = _f((raw_sw or {}).get("NY", 1.0), 1.0)
+    wlon = _f((raw_sw or {}).get("LON", 0.85), 0.85)
+    wasia = _f((raw_sw or {}).get("ASIA", 0.65), 0.65)
+    legacy_ny_only = (wny >= 0.99 and wlon <= 0.01 and wasia <= 0.01)
+    if legacy_ny_only:
+        out["session_weights"] = {"NY": 1.0, "LON": 0.85, "ASIA": 0.65}
+    else:
+        out["session_weights"] = {"NY": max(0.0, wny), "LON": max(0.0, wlon), "ASIA": max(0.0, wasia)}
+
+    so = out.get("session_exec_overrides") or {}
+    out["session_exec_overrides"] = {
+        "NY": dict((so.get("NY") or {})),
+        "LON": dict((so.get("LON") or {})),
+        "ASIA": dict((so.get("ASIA") or {})),
+    }
+
+    asia_requested_by_default = bool(EXECUTION_ASIA_ENABLED) or ("ASIA" in set(EMAIL_BUILD_SESSIONS or []))
+    already_migrated = _strategy_cfg_parse_bool(out.get("_migrated_balanced_sessions_v2", False), False)
+    if not already_migrated:
+        if legacy_ny_only:
+            out["session_weights"] = {"NY": 1.0, "LON": 0.85, "ASIA": 0.65}
+        if asia_requested_by_default and not _strategy_cfg_parse_bool(out.get("execution_asia_enabled", True), True):
+            out["execution_asia_enabled"] = True
+        out["_migrated_balanced_sessions_v2"] = True
+
+    out["_config_revision"] = max(2, int(_f(out.get("_config_revision", 2), 2)))
+    return out
 
 _STRATEGY_CFG_CACHE = {"ts": 0.0, "cfg": None}
 _STRATEGY_CFG_TTL = 15.0
 
+
 def load_strategy_config(force: bool = False) -> dict:
-    """Load StrategyConfig from SQLite; create defaults if missing."""
+    """Load StrategyConfig from SQLite; create defaults if missing and auto-heal legacy session bias."""
     _strategy_config_migrate()
     now = time.time()
     if (not force) and _STRATEGY_CFG_CACHE.get("cfg") is not None and (now - float(_STRATEGY_CFG_CACHE.get("ts") or 0.0)) < _STRATEGY_CFG_TTL:
@@ -1208,9 +1264,15 @@ def load_strategy_config(force: bool = False) -> dict:
                 cfg = json.loads(row[0])
     except Exception:
         cfg = None
+    original_cfg = dict(cfg) if isinstance(cfg, dict) else None
     if not isinstance(cfg, dict):
         cfg = _strategy_config_defaults()
-        save_strategy_config(cfg)
+    cfg = _normalize_strategy_config(cfg)
+    try:
+        if (original_cfg is None) or (json.dumps(original_cfg, ensure_ascii=False, sort_keys=True) != json.dumps(cfg, ensure_ascii=False, sort_keys=True)):
+            save_strategy_config(cfg)
+    except Exception:
+        pass
     _STRATEGY_CFG_CACHE["ts"] = now
     _STRATEGY_CFG_CACHE["cfg"] = dict(cfg)
     return dict(cfg)
@@ -1626,6 +1688,11 @@ try:
     AUTOTRADE_OWNER_UID = int(os.environ.get("AUTOTRADE_OWNER_UID", "0") or 0)
 except Exception:
     AUTOTRADE_OWNER_UID = 0
+if AUTOTRADE_OWNER_UID <= 0 and ADMIN_USER_IDS:
+    try:
+        AUTOTRADE_OWNER_UID = int(sorted(ADMIN_USER_IDS)[0])
+    except Exception:
+        AUTOTRADE_OWNER_UID = 0
 
 # Risk controls
 AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "1") or 1)
@@ -1667,7 +1734,7 @@ AUTOTRADE_BE_AFTER_TP1_ENABLED = str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ENAB
 AUTOTRADE_BE_AFTER_TP1_MIN_CONF = int(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MIN_CONF", "82") or 82)
 AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY", "76") or 76)
 AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT", "6.0") or 6.0)
-AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY,LON") or "NY,LON").upper().replace(' ', '').split(','))
+AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "ASIA,NY,LON") or "ASIA,NY,LON").upper().replace(' ', '').split(','))
 AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES", "A,C") or "A,C").upper().replace(' ', '').split(','))
 # Live market-order entries must still stay close to the setup entry. Otherwise the bot can
 # execute a stale emailed setup at a materially worse price just because it is still inside
@@ -4252,7 +4319,7 @@ def _autotrade_qty_from_risk(entry: float, sl: float, equity_usdt: float, risk_u
 def _autotrade_allowed_session(session_label: str) -> bool:
     allowed = set([s.strip().upper() for s in _autotrade_get_sessions() if s.strip()])
     if not allowed:
-        allowed = {'NY'}
+        allowed = {'ASIA', 'LON', 'NY'}
     return session_label.upper() in allowed
 
 
@@ -7125,19 +7192,7 @@ def list_users_notify_on() -> List[dict]:
     except Exception:
         pass
 
-    filtered_rows = []
-    for d in rows:
-        try:
-            uid = int(d.get("user_id") or d.get("id") or 0)
-        except Exception:
-            uid = 0
-        if uid and is_admin_user(uid):
-            filtered_rows.append(d)
-            continue
-        if uid and user_has_pro(uid, d):
-            filtered_rows.append(d)
-
-    return filtered_rows
+    return rows
 
 
 def list_users_with_email() -> List[dict]:
@@ -11192,13 +11247,13 @@ def _objective(oos: list[dict], days: int, cfg: dict) -> float:
         stab_pen = 0.0
 
     # Session-weighted performance (NY > LON > ASIA) if by_session is present
-    session_weights = cfg.get("session_weights") or {"NY": 1.0, "LON": 0.6, "ASIA": 0.3}
+    session_weights = cfg.get("session_weights") or {"NY": 1.0, "LON": 0.85, "ASIA": 0.65}
     try:
         wny = float(session_weights.get("NY", 1.0))
-        wlon = float(session_weights.get("LON", 0.6))
-        wasia = float(session_weights.get("ASIA", 0.3))
+        wlon = float(session_weights.get("LON", 0.85))
+        wasia = float(session_weights.get("ASIA", 0.65))
     except Exception:
-        wny, wlon, wasia = 1.0, 0.6, 0.3
+        wny, wlon, wasia = 1.0, 0.85, 0.65
 
     sess_acc = {"NY": {"n": 0, "wr": 0.0, "r": 0.0}, "LON": {"n": 0, "wr": 0.0, "r": 0.0}, "ASIA": {"n": 0, "wr": 0.0, "r": 0.0}}
     for r in ok_rows:
@@ -11395,8 +11450,8 @@ AUTONOMOUS_OPT_INTERVAL_HOURS = float(os.environ.get("AUTONOMOUS_OPT_INTERVAL_HO
 AUTONOMOUS_OPT_MIN_INTERVAL_HOURS = float(os.environ.get("AUTONOMOUS_OPT_MIN_INTERVAL_HOURS", "6") or 6)
 AUTONOMOUS_OPT_DAYS = int(os.environ.get("AUTONOMOUS_OPT_DAYS", "60") or 60)
 AUTONOMOUS_OPT_SESSION_MODE = str(os.environ.get("AUTONOMOUS_OPT_SESSION_MODE", SELF_OPT_DEFAULT_SESSION_MODE) or SELF_OPT_DEFAULT_SESSION_MODE).strip().upper()
-AUTONOMOUS_OPT_LOOKBACK_HOURS = float(os.environ.get("AUTONOMOUS_OPT_LOOKBACK_HOURS", "72") or 72)
-AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS = int(os.environ.get("AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS", "18") or 18)
+AUTONOMOUS_OPT_LOOKBACK_HOURS = float(os.environ.get("AUTONOMOUS_OPT_LOOKBACK_HOURS", "168") or 168)
+AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS = int(os.environ.get("AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS", "8") or 8)
 AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW = float(os.environ.get("AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW", "70") or 70)
 
 def _opt_migrate_tables():
@@ -14797,13 +14852,13 @@ def _self_opt_stability_gates(metrics: dict, cfg: dict) -> tuple[bool, list[str]
     hi = float(cfg.get("target_setups_per_day_hi", 5.0))
     if setups_day < lo:
         reasons.append(f"frequency_too_low ({setups_day:.2f} < {lo:.2f})")
-    if setups_day > hi * 1.25:
+    if setups_day > hi * 1.35:
         reasons.append(f"frequency_too_high ({setups_day:.2f} > {hi*1.25:.2f})")
 
-    if pf < 1.15:
-        reasons.append(f"pf_too_low ({pf:.2f} < 1.15)")
-    if avg_r < 0.10:
-        reasons.append(f"avg_R_too_low ({avg_r:.3f} < 0.10)")
+    if pf < 1.05:
+        reasons.append(f"pf_too_low ({pf:.2f} < 1.05)")
+    if avg_r < 0.04:
+        reasons.append(f"avg_R_too_low ({avg_r:.3f} < 0.04)")
 
     dd_cap = float(cfg.get("max_drawdown_R_cap", 8.0) or 8.0)
     if dd > dd_cap:
@@ -15517,6 +15572,7 @@ async def _refresh_universe_backtests_for_autopilot() -> None:
         return
 
 
+
 def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
     cfg = cfg or load_strategy_config(force=False)
     overall = (rep or {}).get('overall') or ((rep or {}).get('metrics') or {}).get('overall') or {}
@@ -15531,6 +15587,7 @@ def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
     hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 10.0) or 10.0)
     ny_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
     lon_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
+    asia_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_asia', 44.0) or 44.0)
 
     score = 0.0
     score += float(avg_r) * 320.0
@@ -15543,14 +15600,20 @@ def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
     elif setups_day > hi:
         score -= float(setups_day - hi) * 2.4
 
-    for sess, floor, wt in (('NY', ny_floor, 1.4), ('LON', lon_floor, 1.2)):
+    active_sessions = 0
+    for sess, floor, wt in (('NY', ny_floor, 1.4), ('LON', lon_floor, 1.2), ('ASIA', asia_floor, 0.95)):
         sd = (per_session or {}).get(sess) or {}
         s_setups = int(sd.get('setups', 0) or 0)
         s_wr = float(sd.get('win_rate', 0.0) or 0.0)
+        if s_setups >= 8:
+            active_sessions += 1
         if s_setups >= 15 and s_wr < floor:
             score -= float(floor - s_wr) * float(wt)
         elif s_setups >= 12 and s_wr > (floor + 6.0):
             score += float(min(4.0, s_wr - floor)) * 0.25
+
+    if active_sessions >= 2:
+        score += float(active_sessions - 1) * 1.5
 
     asia_live = int(((per_session or {}).get('ASIA') or {}).get('setups', 0) or 0)
     if asia_live > 0 and not _cfg_bool((cfg or {}).get('execution_asia_enabled', False), False):
@@ -15625,6 +15688,7 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
     return out
 
 
+
 def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], list[str]]:
     cfg = _market_adaptive_clamp_cfg(cfg)
     overall = (rep or {}).get('overall') or {}
@@ -15642,17 +15706,20 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
     hi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 10.0) or 10.0)
     ny_floor = float(cfg.get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
     lon_floor = float(cfg.get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
+    asia_floor = float(cfg.get('market_adaptive_session_wr_floor_asia', 44.0) or 44.0)
 
-    if _cfg_bool(cfg.get('execution_asia_enabled', False), False):
-        asia = (per_session or {}).get('ASIA') or {}
-        if int(asia.get('setups', 0) or 0) >= 10 and float(asia.get('win_rate', 0.0) or 0.0) < 44.0:
-            _market_adaptive_apply_action(cfg, actions, 'execution_asia_enabled', False, 'ASIA_30d_live_WR_too_low')
-            notes.append('Disabled ASIA executable lane due to weak 30d live-equivalent session edge.')
+    asia_disabled_block = int(live_rejects.get('asia_exec_disabled', 0) or 0)
+    asia_cfg_enabled = _cfg_bool(cfg.get('execution_asia_enabled', False), False)
+    if asia_disabled_block > 0 and (bool(EXECUTION_ASIA_ENABLED) or ('ASIA' in set(EMAIL_BUILD_SESSIONS or []))) and not asia_cfg_enabled:
+        _market_adaptive_apply_action(cfg, actions, 'execution_asia_enabled', True, 'heal_legacy_asia_exec_off')
+        notes.append('Re-enabled ASIA executable lane because the 30d backtest shows legacy ASIA-disabled blocking, not a true market-edge failure.')
+        asia_cfg_enabled = True
 
-    for sess, floor in (('NY', ny_floor), ('LON', lon_floor)):
+    for sess, floor in (('NY', ny_floor), ('LON', lon_floor), ('ASIA', asia_floor)):
         sd = (per_session or {}).get(sess) or {}
         s_setups = int(sd.get('setups', 0) or 0)
         s_wr = float(sd.get('win_rate', 0.0) or 0.0)
+        s_avg_r = float(sd.get('avg_R', 0.0) or 0.0)
         ov = ((cfg.get('session_exec_overrides') or {}).get(sess) or {}).copy()
         if s_setups >= 15 and s_wr < floor:
             _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.quality_add', round(float(ov.get('quality_add', 0.0) or 0.0) + 0.75, 2), f'{sess}_WR_below_floor')
@@ -15663,6 +15730,10 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
             _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.quality_add', round(float(ov.get('quality_add', 0.0) or 0.0) - 0.50, 2), f'{sess}_WR_strong_but_flow_low')
             _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.conf_add', int(float(ov.get('conf_add', 0) or 0)) - 1, f'{sess}_WR_strong_but_flow_low')
             notes.append(f'{sess} is strong but flow is too low; slightly loosened that session.')
+        if sess == 'ASIA' and asia_cfg_enabled and s_setups >= 28 and (s_wr < max(38.0, asia_floor - 6.0)) and s_avg_r < -0.12:
+            _market_adaptive_apply_action(cfg, actions, 'execution_asia_enabled', False, 'ASIA_30d_live_WR_and_avgR_critically_weak')
+            notes.append('Temporarily disabled ASIA executable lane only after a materially weak 30d ASIA edge with enough sample.')
+            asia_cfg_enabled = False
 
     far_ema_block = int(live_rejects.get('base_gate_entry_far_from_pullback_ema', 0) or 0) + int(live_rejects.get('entry_far_from_pullback_ema', 0) or 0)
     if setups_day > hi or (avg_r < 0.0 and setups_day > (hi * 0.85)):
