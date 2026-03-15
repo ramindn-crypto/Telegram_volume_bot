@@ -7296,6 +7296,16 @@ def reset_daily_if_needed(user: dict) -> dict:
     return user
 
 
+def _user_row_uid(row: dict | None) -> int:
+    """Resolve a user id from either modern or legacy user-row shapes."""
+    try:
+        if not isinstance(row, dict):
+            return 0
+        return int(row.get("user_id") or row.get("id") or 0)
+    except Exception:
+        return 0
+
+
 def list_users_notify_on() -> List[dict]:
     """Users who should receive trade-signal / scan emails.
 
@@ -7303,6 +7313,11 @@ def list_users_notify_on() -> List[dict]:
     - Primary rule: notify_on=1 AND email_alerts_enabled=1 AND has a saved email address.
     - Admins are ALWAYS included if they have an email saved, even if notify_on=0,
       but still respect the master email switch when that column exists.
+
+    Production note:
+    - Some legacy DB rows expose the telegram id as ``id`` instead of ``user_id``.
+      If we only read ``user_id``, the admin can silently disappear from the email lane,
+      which then breaks the expected setup -> email -> autotrade chain.
     """
     con = db_connect()
     try:
@@ -7311,56 +7326,65 @@ def list_users_notify_on() -> List[dict]:
     except Exception:
         pass
 
-    cur = con.cursor()
-
-    cols = set()
     try:
-        cur.execute("PRAGMA table_info(users)")
-        cols = {str(r[1]) for r in cur.fetchall()}
-    except Exception:
+        cur = con.cursor()
+
         cols = set()
-
-    email_fields = []
-    if "email" in cols:
-        email_fields.append("email")
-    if "email_to" in cols:
-        email_fields.append("email_to")
-    if not email_fields:
-        email_fields = ["email_to"]
-
-    email_ok_where = " OR ".join([f"({c} IS NOT NULL AND TRIM({c})!='')" for c in email_fields])
-    master_on_where = "COALESCE(email_alerts_enabled, 1) = 1" if "email_alerts_enabled" in cols else "1=1"
-
-    # 1) users opted into trade-signal emails
-    try:
-        cur.execute(
-            f"SELECT * FROM users WHERE notify_on=1 AND ({master_on_where}) AND ({email_ok_where})"
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-    except Exception:
-        # fallback for older schemas
         try:
-            cur.execute(f"SELECT * FROM users WHERE notify_on=1 AND ({email_ok_where})")
+            cur.execute("PRAGMA table_info(users)")
+            cols = {str(r[1]) for r in cur.fetchall()}
         except Exception:
-            cur.execute("SELECT * FROM users WHERE notify_on=1")
-        rows = [dict(r) for r in cur.fetchall()]
+            cols = set()
 
-    # 2) admins with an email saved (even if notify_on=0), but respect master switch
-    try:
-        cur.execute(f"SELECT * FROM users WHERE ({master_on_where}) AND ({email_ok_where})")
-        for r in cur.fetchall():
-            d = dict(r)
+        email_fields = []
+        if "email" in cols:
+            email_fields.append("email")
+        if "email_to" in cols:
+            email_fields.append("email_to")
+        if not email_fields:
+            email_fields = ["email_to"]
+
+        email_ok_where = " OR ".join([f"({c} IS NOT NULL AND TRIM({c})!='')" for c in email_fields])
+        master_on_where = "COALESCE(email_alerts_enabled, 1) = 1" if "email_alerts_enabled" in cols else "1=1"
+
+        # 1) users opted into trade-signal emails
+        try:
+            cur.execute(
+                f"SELECT * FROM users WHERE notify_on=1 AND ({master_on_where}) AND ({email_ok_where})"
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        except Exception:
+            # fallback for older schemas
             try:
-                uid = int(d.get("user_id") or 0)
+                cur.execute(f"SELECT * FROM users WHERE notify_on=1 AND ({email_ok_where})")
             except Exception:
-                uid = 0
-            if uid and is_admin_user(uid):
-                if not any(int(x.get("user_id") or 0) == uid for x in rows):
-                    rows.append(d)
-    except Exception:
-        pass
+                cur.execute("SELECT * FROM users WHERE notify_on=1")
+            rows = [dict(r) for r in cur.fetchall()]
 
-    return rows
+        seen_uids = set()
+        for row in rows:
+            uid = _user_row_uid(row)
+            if uid > 0:
+                seen_uids.add(uid)
+
+        # 2) admins with an email saved (even if notify_on=0), but respect master switch
+        try:
+            cur.execute(f"SELECT * FROM users WHERE ({master_on_where}) AND ({email_ok_where})")
+            for r in cur.fetchall():
+                d = dict(r)
+                uid = _user_row_uid(d)
+                if uid and is_admin_user(uid) and uid not in seen_uids:
+                    rows.append(d)
+                    seen_uids.add(uid)
+        except Exception:
+            pass
+
+        return rows
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
 
 
 def list_users_with_email() -> List[dict]:
@@ -24276,7 +24300,19 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
     if not setups:
         return False
 
-    uid = int(user["user_id"])
+    try:
+        uid = _user_row_uid(dict(user or {}))
+    except Exception:
+        uid = 0
+    if uid <= 0:
+        try:
+            logger.warning("send_email_alert_multi skipped: missing user_id/id on user payload")
+        except Exception:
+            pass
+        return False
+
+    user = dict(user or {})
+    user.setdefault("user_id", int(uid))
     user_tz = str(user.get("tz") or "UTC")
     try:
         tz = ZoneInfo(user_tz)
