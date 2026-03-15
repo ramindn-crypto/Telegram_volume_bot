@@ -19,7 +19,7 @@ def start_keepalive_http_server():
     Render 'Web Service' expects the process to bind to $PORT.
     If you deploy this bot as a Web Service (instead of a Background Worker),
     we start a tiny HTTP server on $PORT so Render keeps it alive, while the bot
-    still runs polling in the same process.
+    vc uhhchcicuc still runs polling in the same process.
     """
     try:
         port = int(os.environ.get("PORT", "10000"))
