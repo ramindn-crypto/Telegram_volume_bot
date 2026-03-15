@@ -7306,6 +7306,32 @@ def _user_row_uid(row: dict | None) -> int:
         return 0
 
 
+def _effective_user_email_recipient(row: dict | None) -> str:
+    """Resolve the effective recipient for trade-email / autotrade sync.
+
+    Priority:
+    1) per-user saved email_to / email
+    2) EMAIL_TO env fallback for admin / autotrade owner rows
+
+    Why: the execution lane is keyed per user. If the owner/admin relies on EMAIL_TO
+    env only, setups can be generated but never enter that user's email/executable lane
+    unless we treat EMAIL_TO as a valid recipient for that admin identity too.
+    """
+    try:
+        d = dict(row or {}) if isinstance(row, dict) else {}
+        recipient = str(d.get("email_to") or d.get("email") or "").strip()
+        if recipient:
+            return recipient
+        uid = _user_row_uid(d)
+        if uid > 0 and (is_admin_user(uid) or int(uid) == int(AUTOTRADE_OWNER_UID or 0)):
+            fallback = str(EMAIL_TO or "").strip()
+            if fallback:
+                return fallback
+        return ""
+    except Exception:
+        return ""
+
+
 def list_users_notify_on() -> List[dict]:
     """Users who should receive trade-signal / scan emails.
 
@@ -7367,13 +7393,18 @@ def list_users_notify_on() -> List[dict]:
             if uid > 0:
                 seen_uids.add(uid)
 
-        # 2) admins with an email saved (even if notify_on=0), but respect master switch
+        # 2) admins with an effective recipient (saved email OR EMAIL_TO fallback),
+        #    even if notify_on=0, but still respect the master switch when present.
         try:
-            cur.execute(f"SELECT * FROM users WHERE ({master_on_where}) AND ({email_ok_where})")
+            cur.execute("SELECT * FROM users")
             for r in cur.fetchall():
                 d = dict(r)
                 uid = _user_row_uid(d)
-                if uid and is_admin_user(uid) and uid not in seen_uids:
+                if not uid or uid in seen_uids or not is_admin_user(uid):
+                    continue
+                if "email_alerts_enabled" in cols and int(d.get("email_alerts_enabled", 1) or 1) == 0:
+                    continue
+                if _effective_user_email_recipient(d):
                     rows.append(d)
                     seen_uids.add(uid)
         except Exception:
@@ -7389,7 +7420,7 @@ def list_users_notify_on() -> List[dict]:
 
 def list_users_with_email() -> List[dict]:
     """
-    Users eligible for email sends (have a saved recipient email).
+    Users eligible for email sends (saved email or admin EMAIL_TO fallback).
     This is used for Big-Move Alerts so it works even if notify_on=0.
 
     IMPORTANT:
@@ -7438,8 +7469,26 @@ def list_users_with_email() -> List[dict]:
             FROM users
             WHERE {where_sql}
         """)
-        rows = cur.fetchall()
-        return [dict(r) for r in rows]
+        rows = [dict(r) for r in cur.fetchall()]
+
+        # Admin / owner may intentionally rely on EMAIL_TO env without saving a per-user
+        # email field. Include them too so big-move alerts and diagnostics stay aligned.
+        try:
+            cur.execute("SELECT * FROM users")
+            seen = { _user_row_uid(r) for r in rows if _user_row_uid(r) > 0 }
+            for r in cur.fetchall():
+                d = dict(r)
+                uid = _user_row_uid(d)
+                if not uid or uid in seen:
+                    continue
+                if has_email_enabled and int(d.get("email_alerts_enabled", 1) or 1) == 0:
+                    continue
+                if (is_admin_user(uid) or int(uid) == int(AUTOTRADE_OWNER_UID or 0)) and _effective_user_email_recipient(d):
+                    rows.append(d)
+                    seen.add(uid)
+        except Exception:
+            pass
+        return rows
     finally:
         try:
             con.close()
@@ -18438,7 +18487,7 @@ def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
         day_local = _user_day_local(user)
     except Exception:
         day_local = datetime.now(tz).date().isoformat()
-    recipient = str(user.get('email_to') or user.get('email') or '').strip()
+    recipient = _effective_user_email_recipient(user)
     alerts_on = bool(user_email_alerts_enabled(user))
     smtp_ready = bool(EMAIL_ENABLED and email_config_ok())
 
@@ -18600,7 +18649,7 @@ def send_email(
 
     if uid is not None:
         user = get_user(uid) or {}
-        to_email = str(user.get("email_to") or user.get("email") or "").strip()
+        to_email = _effective_user_email_recipient(user)
 
         if not to_email:
             _LAST_EMAIL_DECISION[uid] = {
@@ -18870,7 +18919,7 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Recipient (match your bot’s keys)
-    to_email = (user.get("email_to") or user.get("email") or "").strip()
+    to_email = _effective_user_email_recipient(user)
     if not to_email:
         await update.message.reply_text(
             "❌ No recipient email found for your user.\n"
