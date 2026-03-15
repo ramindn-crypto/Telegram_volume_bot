@@ -310,7 +310,7 @@ def _autotrade_get_sessions():
                 return [s.strip().upper() for s in row[0].split(",") if s.strip()]
     except Exception:
         pass
-    return ["NY"]
+    return ["ASIA", "LON", "NY"]
 
 def _autotrade_set_sessions(val: str):
     try:
@@ -986,6 +986,12 @@ ADMIN_USER_IDS = set(
 )
 ADMIN_IDS = set(ADMIN_IDS) | set(ADMIN_USER_IDS)
 
+if AUTOTRADE_OWNER_UID <= 0 and ADMIN_USER_IDS:
+    try:
+        AUTOTRADE_OWNER_UID = int(sorted(ADMIN_USER_IDS)[0])
+    except Exception:
+        pass
+
 # IMPORTANT CHANGE:
 # System sends signals only. It does NOT show reject reasons to public users.
 # Admin can still see internals if you set PUBLIC_DIAGNOSTICS_MODE=admin
@@ -1605,7 +1611,7 @@ SHARP_1H_MOVE_PCT = 20.0
 # 🤖 AUTOTRADE (Bybit V5) — LIVE/PAPER
 # =========================================================
 # NOTE: AutoTrade is owner-only (AUTOTRADE_OWNER_UID) and is gated by session + risk caps.
-AUTOTRADE_ENABLED = str(os.environ.get("AUTOTRADE_ENABLED", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
+AUTOTRADE_ENABLED = str(os.environ.get("AUTOTRADE_ENABLED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
 AUTOTRADE_MODE = str(os.environ.get("AUTOTRADE_MODE", "paper")).strip().lower()  # 'paper' | 'live'
 try:
     AUTOTRADE_OWNER_UID = int(os.environ.get("AUTOTRADE_OWNER_UID", "0") or 0)
@@ -1619,8 +1625,8 @@ AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PC
 # Open-trade count cap for commercial/live safety.
 AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "0") or 0)
 EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
-EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "LON,NY") or "LON,NY").split(",") if s.strip()]
-EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", False)
+EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
+EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", True)
 
 
 # Margin / leverage
@@ -1667,7 +1673,7 @@ BYBIT_TESTNET = str(os.environ.get("BYBIT_TESTNET", "0")).strip() in ("1", "true
 AUTOTRADE_ENTRY_WINDOW_MIN = int(os.environ.get("AUTOTRADE_ENTRY_WINDOW_MIN", "45") or 45)
 
 # Email
-EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
+EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "true").lower() == "true"
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
 EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465"))
 EMAIL_USER = os.environ.get("EMAIL_USER", "")
@@ -7110,7 +7116,19 @@ def list_users_notify_on() -> List[dict]:
     except Exception:
         pass
 
-    return rows
+    filtered_rows = []
+    for d in rows:
+        try:
+            uid = int(d.get("user_id") or d.get("id") or 0)
+        except Exception:
+            uid = 0
+        if uid and is_admin_user(uid):
+            filtered_rows.append(d)
+            continue
+        if uid and user_has_pro(uid, d):
+            filtered_rows.append(d)
+
+    return filtered_rows
 
 
 def list_users_with_email() -> List[dict]:
