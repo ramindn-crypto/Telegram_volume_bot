@@ -4333,8 +4333,8 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
     """Return recent OPEN setup candidates for autotrade.
 
     Production sync model:
-    - qualification source = emailed_setups (the setup really passed the email pipeline)
-    - live execution source = executable_setups (the explicit queue autotrade may consume)
+    - executable_setups is the authoritative live queue (it is only written after send_email() succeeds)
+    - emailed_setups is corroboration / reporting history and should not be able to block execution if its write lags
     - generated_setups(source='email') = audit/debug correlation only, never a direct trade source
 
     Ordering is newest-first, not confidence-first. That keeps autotrade aligned with the
@@ -4449,18 +4449,18 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                 ))
             return out
 
-        # 1) Live execution source: executable rows that also have a successful emailed row.
-        #    This keeps autotrade aligned with the real delivered setup pipeline.
+        # 1) Live execution source: executable rows are authoritative once SMTP succeeded.
+        #    emailed_setups is still joined for reporting/debug timestamps, but it must not block execution.
         cur.execute(
             """
             SELECT x.setup_id,
                    MAX(x.executable_ts) AS executable_ts,
-                   MAX(e.emailed_ts) AS emailed_ts,
+                   MAX(COALESCE(e.emailed_ts, x.executable_ts)) AS emailed_ts,
                    MAX(COALESCE(x.session, e.session, g.session, '')) AS src_session
             FROM executable_setups x
-            INNER JOIN emailed_setups e
-                    ON e.user_id = x.user_id
-                   AND e.setup_id = x.setup_id
+            LEFT JOIN emailed_setups e
+                   ON e.user_id = x.user_id
+                  AND e.setup_id = x.setup_id
             LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
             LEFT JOIN generated_setups g
                    ON g.user_id = x.user_id
@@ -4468,7 +4468,6 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                   AND g.source = 'email'
             WHERE x.user_id = ?
               AND x.executable_ts >= ?
-              AND e.emailed_ts > 0
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
             GROUP BY x.setup_id
             ORDER BY executable_ts DESC, emailed_ts DESC, x.setup_id DESC
@@ -17474,7 +17473,7 @@ def make_setup(
             tp3=tp3,
             fut_vol_usd=fut_vol,
             ch24=ch24,
-            ch4=ch4,
+            ch4=ch4_used,
             ch1=ch1,
             ch15=ch15,
             ema_support_period=int(ema_period),
@@ -23937,12 +23936,32 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
         try:
             now_ts = time.time()
             for s in setups:
+                sid = str(getattr(s, "setup_id", "") or "").strip()
                 try:
-                    db_mark_emailed_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
+                    db_insert_signal(s, user_id=uid)
                 except Exception:
                     pass
                 try:
-                    db_mark_executable_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
+                    if sid and not db_get_signal(sid):
+                        db_insert_signal(s, user_id=uid)
+                except Exception:
+                    pass
+                try:
+                    db_mark_emailed_setup(uid, sid, str(display_session), now_ts)
+                except Exception:
+                    pass
+                try:
+                    if sid and not db_has_emailed_setup(uid, sid, lookback_hours=24):
+                        db_mark_emailed_setup(uid, sid, str(display_session), now_ts)
+                except Exception:
+                    pass
+                try:
+                    db_mark_executable_setup(uid, sid, str(display_session), now_ts)
+                except Exception:
+                    pass
+                try:
+                    if sid and not db_has_executable_setup(uid, sid, lookback_hours=24):
+                        db_mark_executable_setup(uid, sid, str(display_session), now_ts)
                 except Exception:
                     pass
                 try:
