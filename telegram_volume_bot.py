@@ -1245,7 +1245,32 @@ def _normalize_strategy_config(cfg: dict) -> dict:
     if asia_requested_by_default and not _strategy_cfg_parse_bool(out.get("execution_asia_enabled", True), True):
         out["execution_asia_enabled"] = True
 
-    out["_config_revision"] = max(2, int(_f(out.get("_config_revision", 2), 2)))
+    # Clamp persisted runtime thresholds so stale / over-tuned configs cannot silently
+    # block setup generation, email selection, or admin autotrade for long periods.
+    try:
+        out["min_fut_vol_usd"] = float(clamp(_f(out.get("min_fut_vol_usd", MIN_FUT_VOL_USD), MIN_FUT_VOL_USD), 3_000_000.0, 60_000_000.0))
+        out["quality_score_min_screen"] = float(clamp(_f(out.get("quality_score_min_screen", QUALITY_SCORE_MIN_SCREEN), QUALITY_SCORE_MIN_SCREEN), 50.0, 78.0))
+        out["quality_score_min_email"] = float(clamp(_f(out.get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL), QUALITY_SCORE_MIN_EMAIL), 52.0, 82.0))
+        out["min_rr_tp3"] = float(clamp(_f(out.get("min_rr_tp3", MIN_RR_TP3), MIN_RR_TP3), 1.20, 2.40))
+        out["atr_min_pct"] = float(clamp(_f(out.get("atr_min_pct", ATR_MIN_PCT), ATR_MIN_PCT), 0.30, 2.00))
+        out["atr_max_pct"] = float(clamp(_f(out.get("atr_max_pct", ATR_MAX_PCT), ATR_MAX_PCT), max(out["atr_min_pct"] + 0.20, 2.50), 12.0))
+        out["tf_align_1h_min_abs"] = float(clamp(_f(out.get("tf_align_1h_min_abs", TF_ALIGN_1H_MIN_ABS), TF_ALIGN_1H_MIN_ABS), 0.0, 1.5))
+        out["tf_align_4h_min_abs"] = float(clamp(_f(out.get("tf_align_4h_min_abs", TF_ALIGN_4H_MIN_ABS), TF_ALIGN_4H_MIN_ABS), 0.0, 1.5))
+        out["universe_top_n"] = int(max(40, min(160, int(_f(out.get("universe_top_n", 120), 120)))))
+        out["min_setup_conf"] = int(max(74, min(90, int(_f(out.get("min_setup_conf", MIN_SETUP_CONF), MIN_SETUP_CONF)))))
+    except Exception:
+        pass
+
+    out["execution_engine_b_email_enabled"] = _strategy_cfg_parse_bool(
+        out.get("execution_engine_b_email_enabled", EXECUTION_ENGINE_B_EMAIL_ENABLED),
+        bool(EXECUTION_ENGINE_B_EMAIL_ENABLED),
+    )
+    out["execution_asia_enabled"] = _strategy_cfg_parse_bool(
+        out.get("execution_asia_enabled", EXECUTION_ASIA_ENABLED),
+        bool(EXECUTION_ASIA_ENABLED),
+    )
+
+    out["_config_revision"] = max(3, int(_f(out.get("_config_revision", 3), 3)))
     return out
 
 _STRATEGY_CFG_CACHE = {"ts": 0.0, "cfg": None}
@@ -4506,9 +4531,73 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             con.close()
             return out
 
-        # 2) No fallback to emailed_setups or generated_setups here.
-        # Live autotrade must consume only the explicit executable queue, and each row
-        # in that queue must also have a successful emailed_setups record.
+        # 2) Resilience fallback: if the SMTP send succeeded but the executable row was
+        # missed (legacy row / partial post-email DB sync), allow autotrade to recover
+        # from emailed_setups only. This still guarantees the setup was actually emailed.
+        cur.execute(
+            """
+            SELECT e.setup_id,
+                   MAX(e.emailed_ts) AS emailed_ts,
+                   MAX(COALESCE(g.created_ts, e.emailed_ts)) AS generated_ts,
+                   MAX(COALESCE(e.session, g.session, '')) AS src_session
+            FROM emailed_setups e
+            LEFT JOIN signal_outcomes o ON o.setup_id = e.setup_id
+            LEFT JOIN executable_setups x
+                   ON x.user_id = e.user_id
+                  AND x.setup_id = e.setup_id
+            LEFT JOIN generated_setups g
+                   ON g.user_id = e.user_id
+                  AND g.setup_id = e.setup_id
+                  AND g.source = 'email'
+            WHERE e.user_id = ?
+              AND e.emailed_ts >= ?
+              AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+              AND x.setup_id IS NULL
+            GROUP BY e.setup_id
+            ORDER BY emailed_ts DESC, generated_ts DESC, e.setup_id DESC
+            LIMIT ?
+            """,
+            (int(uid), float(cutoff), int(sql_limit)),
+        )
+        fallback_rows = cur.fetchall() or []
+        out = sorted(
+            _load_signals(fallback_rows, 'emailed_setups'),
+            key=lambda x: (
+                float(getattr(x, 'created_ts', 0.0) or 0.0),
+                float(getattr(x, 'email_logged_ts', 0.0) or 0.0),
+                int(getattr(x, 'conf', 0) or 0),
+            ),
+            reverse=True,
+        )[:max(1, int(limit or 1))]
+        if out:
+            try:
+                now_ts = float(time.time())
+                for item in out:
+                    sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '')
+                    src_sess = str(getattr(item, 'source_session', '') or session_label or '')
+                    if sid:
+                        try:
+                            db_mark_executable_setup(int(uid), sid, src_sess, now_ts)
+                        except Exception:
+                            pass
+                        _admin_setup_lifecycle_merge(
+                            int(uid),
+                            sid,
+                            session=src_sess,
+                            symbol=str(getattr(item, 'symbol', '') or ''),
+                            side=str(getattr(item, 'side', '') or ''),
+                            executable_ts=now_ts,
+                            state='executable_pending',
+                            source_kind='emailed_setups_fallback',
+                            signal_created_ts=float(getattr(item, 'signal_created_ts', 0.0) or 0.0),
+                            emailed_ts=float(getattr(item, 'email_logged_ts', 0.0) or 0.0),
+                            generated_logged_ts=float(getattr(item, 'generated_logged_ts', 0.0) or 0.0),
+                        )
+            except Exception:
+                pass
+            con.close()
+            return out
+
         con.close()
         return []
     except Exception as e:
@@ -24180,12 +24269,31 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
         try:
             now_ts = time.time()
             sync_failures = []
+            failed_setups = []
             for s in setups:
                 ok_sync, sync_reason = _db_sync_email_pipeline_success(uid, str(display_session), s, emailed_ts=now_ts)
                 if not ok_sync:
                     sync_failures.append(f"{str(getattr(s, 'setup_id', '') or '')}:{sync_reason}")
+                    failed_setups.append(s)
             if sync_failures:
                 logger.warning("post-email DB sync incomplete for uid=%s: %s", uid, "; ".join(sync_failures))
+                for s in failed_setups:
+                    try:
+                        db_insert_signal(s, user_id=uid)
+                    except Exception:
+                        pass
+                    try:
+                        db_mark_emailed_setup(uid, str(getattr(s, 'setup_id', '') or '').strip(), str(display_session), now_ts)
+                    except Exception:
+                        pass
+                    try:
+                        db_mark_executable_setup(uid, str(getattr(s, 'setup_id', '') or '').strip(), str(display_session), now_ts)
+                    except Exception:
+                        pass
+                    try:
+                        db_log_generated_setup(uid, 'email', str(display_session), s)
+                    except Exception:
+                        pass
         except Exception as e:
             try:
                 logger.exception("post-email pipeline sync failed for uid=%s: %s", uid, e)
