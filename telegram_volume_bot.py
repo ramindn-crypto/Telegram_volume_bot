@@ -4494,6 +4494,34 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             pass
         return []
 
+_AUTOTRADE_FATAL_SKIP_REASONS = {
+    'autotrade_not_ready_or_disabled',
+    'not_owner',
+    'equity_unavailable_or_zero',
+    'per_trade_risk_zero',
+    'daily_remaining_risk_zero',
+    'daily_risk_cap_reached',
+    'daily_risk_cap_already_exceeded',
+    'daily_cap_would_be_exceeded_by_new_trade',
+    'max_trades_day_reached',
+    'max_open_trades_reached',
+}
+
+
+def _autotrade_reason_is_fatal(reason: str) -> bool:
+    try:
+        r = str(reason or '').strip()
+        if not r:
+            return False
+        if r in _AUTOTRADE_FATAL_SKIP_REASONS:
+            return True
+        if r.startswith('autotrade_session_not_allowed'):
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def _autotrade_clear_debug_state(uid: int | None = None) -> None:
     """Clear in-memory autotrade debug state. If uid is None, clears all."""
     global _LAST_AUTOTRADE_DECISION, _LAST_AUTOTRADE_DETAIL
@@ -16846,7 +16874,7 @@ def make_setup(
                     else:
                         dot = "🟠"
 
-                    side_guess = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.25 else ("BUY" if ch1 > 0 else "SELL")
+                    side_guess = ("BUY" if ch4_used >= 0 else "SELL") if abs(ch4_used) >= 0.25 else ("BUY" if ch1 > 0 else "SELL")
                     _WAITING_TRIGGER[str(base)] = {"side": side_guess, "dot": dot}
 
             # Balanced breakout override: even if 1H change is small, allow true breakouts
@@ -16900,27 +16928,27 @@ def make_setup(
 
 
         # ✅ IMPORTANT: this must be OUTSIDE the if block (no extra indent)
-        side = ("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.40 else ("BUY" if ch1 > 0 else "SELL")  # trend-side gating: prefer 4H regime over 1H noise
+        side = ("BUY" if ch4_used >= 0 else "SELL") if abs(ch4_used) >= 0.40 else ("BUY" if ch1 > 0 else "SELL")  # trend-side gating: prefer exact 4H regime over 1H noise
 
         # 4H alignment
         # If 4H is basically flat, don't block (leaders often show ch4 ~ 0 while 24H is huge).
-        if abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
-            if side == "BUY" and ch4 < ALIGN_4H_MIN:
-                _rej("4h_not_aligned_for_long", base, mv, f"side=BUY ch4={ch4:+.2f}%")
+        if abs(ch4_used) >= float(ALIGN_4H_NEUTRAL_ZONE):
+            if side == "BUY" and ch4_used < ALIGN_4H_MIN:
+                _rej("4h_not_aligned_for_long", base, mv, f"side=BUY ch4={ch4_used:+.2f}%")
                 return None
-            if side == "SELL" and ch4 > -ALIGN_4H_MIN:
-                _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4:+.2f}%")
+            if side == "SELL" and ch4_used > -ALIGN_4H_MIN:
+                _rej("4h_not_aligned_for_short", base, mv, f"side=SELL ch4={ch4_used:+.2f}%")
                 return None
 
-        # ✅ HARD regime gate: don't fight the 4H direction (unless "strong reversal exception")
-        if TF_ALIGN_ENABLED and abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
-            if side == "BUY" and ch4 < 0:
-                if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
-                    _rej("4h_bear_regime_blocks_long", base, mv, f"ch4={ch4:+.2f}%")
+        # ✅ HARD regime gate: don't fight the exact 4H direction (unless "strong reversal exception")
+        if TF_ALIGN_ENABLED and abs(ch4_used) >= float(ALIGN_4H_NEUTRAL_ZONE):
+            if side == "BUY" and ch4_used < 0:
+                if not strong_reversal_exception_ok(side, ch24, ch4_used, ch1):
+                    _rej("4h_bear_regime_blocks_long", base, mv, f"ch4={ch4_used:+.2f}%")
                     return None
-            if side == "SELL" and ch4 > 0:
-                if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
-                    _rej("4h_bull_regime_blocks_short", base, mv, f"ch4={ch4:+.2f}%")
+            if side == "SELL" and ch4_used > 0:
+                if not strong_reversal_exception_ok(side, ch24, ch4_used, ch1):
+                    _rej("4h_bull_regime_blocks_short", base, mv, f"ch4={ch4_used:+.2f}%")
                     return None
 
 
@@ -16930,12 +16958,12 @@ def make_setup(
             if str(session_name).upper() == "ASIA":
                 min1, min4 = tf_align_mins_for_session(session_name)
                 if side == "BUY":
-                    if not (ch1 >= min1 and ch4 >= min4):
-                        _rej("asia_tf_align_fail_long", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need>=({min1},{min4})")
+                    if not (ch1 >= min1 and ch4_used >= min4):
+                        _rej("asia_tf_align_fail_long", base, mv, f"ch1={ch1:+.2f}% ch4={ch4_used:+.2f}% need>=({min1},{min4})")
                         return None
                 else:
-                    if not (ch1 <= -min1 and ch4 <= -min4):
-                        _rej("asia_tf_align_fail_short", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need<=(-{min1},-{min4})")
+                    if not (ch1 <= -min1 and ch4_used <= -min4):
+                        _rej("asia_tf_align_fail_short", base, mv, f"ch1={ch1:+.2f}% ch4={ch4_used:+.2f}% need<=(-{min1},-{min4})")
                         return None
         except Exception:
             pass
@@ -17020,7 +17048,7 @@ def make_setup(
 
                 # Use 4H/side gating already computed as the trend regime.
                 uptrend = (ch4_used >= 0)
-                downtrend = (ch4 < 0)
+                downtrend = (ch4_used < 0)
 
                 if abs(ch24) >= ch24_thr and fut_vol >= max(5_000_000.0, float(MOVER_VOL_USD_MIN) * 0.70) and c1 and len(c1) >= 25:
                     highs_1h = [float(x[2]) for x in c1]
@@ -17527,7 +17555,7 @@ def make_breakout_setup(
         side = "SELL"
     else:
         # As a fallback, allow if 4H is neutral but 24H is strong
-        if is_breakout and vol_ok and ch24 >= max(10.0, ch24_buy_min) and (ch4 >= 0):
+        if is_breakout and vol_ok and ch24 >= max(10.0, ch24_buy_min) and (ch4_used >= 0):
             side = "BUY"
         elif is_breakdown and vol_ok and ch24 <= min(-10.0, ch24_sell_max) and (ch4_used <= 0):
             side = "SELL"
@@ -25774,15 +25802,10 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 ok, reason = _autotrade_place_trade(uid, sess, [cand])
                 if ok:
                     break
-                if reason not in {
-                    'blocked_duplicate_open_position',
-                    'blocked_duplicate_pending_order',
-                    'blocked_duplicate_inflight_lock',
-                    'blocked_by_cooldown',
-                    'blocked_by_recent_symbol_trade',
-                    'blocked_by_existing_local_trade_state',
-                    'setup_expired',
-                }:
+                # Keep scanning the freshest executable candidates when the current one is
+                # stale, symbol-blocked, drifted away from entry, or otherwise invalid on
+                # its own. Only stop early for account/global hard stops.
+                if _autotrade_reason_is_fatal(reason):
                     break
 
             _LAST_AUTOTRADE_DECISION[uid] = {
