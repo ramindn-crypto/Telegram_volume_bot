@@ -4365,7 +4365,11 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     continue
                 cur.execute(
                     """
-                    SELECT s.setup_id, s.symbol, s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3, s.created_ts
+                    SELECT s.setup_id, s.symbol, s.market_symbol, s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
+                           s.created_ts, s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15,
+                           COALESCE(s.engine, ''), COALESCE(s.quality_score, 0), COALESCE(s.atr_pct, 0),
+                           COALESCE(s.pullback_ready, 0), COALESCE(s.pullback_bypass_hot, 0),
+                           COALESCE(s.leader_base_override, 0), COALESCE(s.pullback_ema_dist_pct, 0)
                     FROM signals s
                     WHERE s.setup_id = ?
                     LIMIT 1
@@ -4375,7 +4379,12 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                 row = cur.fetchone()
                 if not row:
                     continue
-                setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3, signal_created_ts = row
+                (
+                    setup_id, symbol, market_symbol, side, conf, entry, sl, tp1, tp2, tp3,
+                    signal_created_ts, fut_vol_usd, ch24, ch4, ch1, ch15,
+                    engine, quality_score, atr_pct, pullback_ready, pullback_bypass_hot,
+                    leader_base_override, pullback_ema_dist_pct,
+                ) = row
                 try:
                     signal_created_ts = float(signal_created_ts or 0.0)
                 except Exception:
@@ -4411,6 +4420,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     setup_id=setup_id,
                     id=setup_id,
                     symbol=symbol,
+                    market_symbol=str(market_symbol or symbol or ''),
                     side=side,
                     conf=int(conf or 0),
                     entry=float(entry or 0.0),
@@ -4418,6 +4428,18 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     tp1=tp1,
                     tp2=tp2,
                     tp3=tp3,
+                    fut_vol_usd=float(fut_vol_usd or 0.0),
+                    ch24=float(ch24 or 0.0),
+                    ch4=float(ch4 or 0.0),
+                    ch1=float(ch1 or 0.0),
+                    ch15=float(ch15 or 0.0),
+                    engine=str(engine or ''),
+                    quality_score=float(quality_score or 0.0),
+                    atr_pct=float(atr_pct or 0.0),
+                    pullback_ready=bool(int(pullback_ready or 0)),
+                    pullback_bypass_hot=bool(int(pullback_bypass_hot or 0)),
+                    leader_base_override=bool(int(leader_base_override or 0)),
+                    pullback_ema_dist_pct=float(pullback_ema_dist_pct or 0.0),
                     created_ts=float(canonical_ts or 0.0),
                     signal_created_ts=float(signal_created_ts or 0.0),
                     email_logged_ts=float(aux_ts_f or 0.0) if source_kind == 'executable_setups' else (float(chosen_ts_f or 0.0) if source_kind == 'emailed_setups' else 0.0),
@@ -6721,6 +6743,7 @@ def db_init():
         setup_id TEXT PRIMARY KEY,
         created_ts REAL NOT NULL,
         symbol TEXT NOT NULL,
+        market_symbol TEXT,
         side TEXT NOT NULL,
         conf INTEGER NOT NULL,
         entry REAL NOT NULL,
@@ -6732,7 +6755,14 @@ def db_init():
         ch24 REAL NOT NULL,
         ch4 REAL NOT NULL,
         ch1 REAL NOT NULL,
-        ch15 REAL NOT NULL
+        ch15 REAL NOT NULL,
+        engine TEXT,
+        quality_score REAL,
+        atr_pct REAL,
+        pullback_ready INTEGER DEFAULT 0,
+        pullback_bypass_hot INTEGER DEFAULT 0,
+        leader_base_override INTEGER DEFAULT 0,
+        pullback_ema_dist_pct REAL
     )
     """)
 
@@ -6740,12 +6770,26 @@ def db_init():
     # ✅ Signal evaluation tables (emailed setups + outcomes)
     # =========================================================
 
-    # Ensure signals table has market_symbol (migration-safe)
+    # Ensure signals table has full execution metadata (migration-safe)
     try:
         cur.execute("PRAGMA table_info(signals)")
         s_cols = {r[1] for r in cur.fetchall()}
         if "market_symbol" not in s_cols:
             cur.execute("ALTER TABLE signals ADD COLUMN market_symbol TEXT")
+        if "engine" not in s_cols:
+            cur.execute("ALTER TABLE signals ADD COLUMN engine TEXT")
+        if "quality_score" not in s_cols:
+            cur.execute("ALTER TABLE signals ADD COLUMN quality_score REAL")
+        if "atr_pct" not in s_cols:
+            cur.execute("ALTER TABLE signals ADD COLUMN atr_pct REAL")
+        if "pullback_ready" not in s_cols:
+            cur.execute("ALTER TABLE signals ADD COLUMN pullback_ready INTEGER DEFAULT 0")
+        if "pullback_bypass_hot" not in s_cols:
+            cur.execute("ALTER TABLE signals ADD COLUMN pullback_bypass_hot INTEGER DEFAULT 0")
+        if "leader_base_override" not in s_cols:
+            cur.execute("ALTER TABLE signals ADD COLUMN leader_base_override INTEGER DEFAULT 0")
+        if "pullback_ema_dist_pct" not in s_cols:
+            cur.execute("ALTER TABLE signals ADD COLUMN pullback_ema_dist_pct REAL")
     except Exception:
         pass
 
@@ -8460,7 +8504,7 @@ def _admin_setup_state_from_reason(reason: str) -> str:
     return r[:80]
 
 def db_insert_signal(s: Setup, user_id: int | None = None):
-    """Upsert a setup into DB (signals table). Adds market_symbol when available.
+    """Upsert a setup into DB (signals table) with execution-grade metadata.
 
     Important: lifecycle updates must stay user-scoped. Do not default to the owner admin,
     otherwise signals generated for other users can contaminate admin lifecycle tracking.
@@ -8471,15 +8515,23 @@ def db_insert_signal(s: Setup, user_id: int | None = None):
         cur.execute("""
             INSERT OR REPLACE INTO signals (
                 setup_id, created_ts, symbol, market_symbol, side, conf, entry, sl, tp1, tp2, tp3,
-                fut_vol_usd, ch24, ch4, ch1, ch15
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                fut_vol_usd, ch24, ch4, ch1, ch15, engine, quality_score, atr_pct,
+                pullback_ready, pullback_bypass_hot, leader_base_override, pullback_ema_dist_pct
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             s.setup_id, s.created_ts, s.symbol, getattr(s, "market_symbol", None),
             s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
-            s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+            s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15,
+            str(getattr(s, "engine", "") or ""),
+            float(getattr(s, "quality_score", 0.0) or 0.0),
+            float(getattr(s, "atr_pct", 0.0) or 0.0),
+            1 if bool(getattr(s, "pullback_ready", False)) else 0,
+            1 if bool(getattr(s, "pullback_bypass_hot", False)) else 0,
+            1 if bool(getattr(s, "leader_base_override", False)) else 0,
+            float(getattr(s, "pullback_ema_dist_pct", 0.0) or 0.0),
         ))
     except Exception:
-        # Backward-compatible (older DB without market_symbol column)
+        # Backward-compatible fallback for older DBs before the metadata migration.
         cur.execute("""
             INSERT OR REPLACE INTO signals (
                 setup_id, created_ts, symbol, side, conf, entry, sl, tp1, tp2, tp3,
