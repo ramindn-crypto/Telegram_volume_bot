@@ -4800,7 +4800,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             entry_drift_pct = abs((float(price_ref) - float(intended_entry)) / float(intended_entry)) * 100.0
     except Exception:
         entry_drift_pct = 0.0
-    if str(AUTOTRADE_MODE).lower() == 'live' and float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT) > 0 and entry_drift_pct > float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT):
+    entry_drift_limit_pct = _autotrade_entry_drift_limit_pct(s, session_name=session_label)
+    if str(AUTOTRADE_MODE).lower() == 'live' and float(entry_drift_limit_pct) > 0 and entry_drift_pct > float(entry_drift_limit_pct):
         try:
             _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
@@ -4808,12 +4809,13 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 'entry_source': 'live_ref',
                 'setup_entry': float(intended_entry),
                 'entry_drift_pct': float(entry_drift_pct),
+                'entry_drift_limit_pct': float(entry_drift_limit_pct),
                 'reject_reason': 'entry_drift_too_wide',
             })
         except Exception:
             pass
         try:
-            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('stale_deadline'), last_reason=f'entry_drift_too_wide ({entry_drift_pct:.2f}%>{float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT):.2f}%)')
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('stale_deadline'), last_reason=f'entry_drift_too_wide ({entry_drift_pct:.2f}%>{float(entry_drift_limit_pct):.2f}%)')
         except Exception:
             pass
         return (False, 'entry_drift_too_wide')
@@ -16606,6 +16608,39 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     return (quality, conf, rr)
 
 
+
+
+def _autotrade_entry_drift_limit_pct(s: "Setup", session_name: str = "NY") -> float:
+    """Adaptive live-entry drift allowance.
+
+    A flat 0.50% cap is too tight for crypto futures when a setup remains valid but
+    the market ticks slightly away from the email entry before the admin execution loop
+    reaches it. Keep the user-configured floor, then widen modestly for higher-ATR /
+    expansion setups without allowing stale chases.
+    """
+    try:
+        base_limit = float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT or 0.50)
+    except Exception:
+        base_limit = 0.50
+    try:
+        sess = str(session_name or "").upper().strip()
+        engine = str(getattr(s, 'engine', '') or '').upper().strip()
+        atr_pct = float(getattr(s, 'atr_pct', 0.0) or 0.0)
+        bonus = 0.0
+        if atr_pct > 0:
+            bonus += min(0.35, float(atr_pct) * 0.06)
+        if engine in {'B', 'C'}:
+            bonus += 0.15
+        if sess == 'ASIA':
+            cap_hi = 0.90
+        elif sess == 'LON':
+            cap_hi = 1.00
+        else:
+            cap_hi = 1.10
+        return float(clamp(base_limit + bonus, base_limit, cap_hi))
+    except Exception:
+        return float(base_limit)
+
 def is_executable_setup_eligible(
     s: "Setup",
     session_name: str = "NY",
@@ -16668,16 +16703,31 @@ def is_executable_setup_eligible(
         pb_dist = float(getattr(s, "pullback_ema_dist_pct", 999.0) or 999.0)
         ch15_abs = abs(float(getattr(s, "ch15", 0.0) or 0.0))
         ch1_abs = abs(float(getattr(s, "ch1", 0.0) or 0.0))
+        atr_pct = float(getattr(s, "atr_pct", 0.0) or 0.0)
 
+        # Allow very high-grade executable setups a little more room before rejecting
+        # them as late extensions. This keeps the sellable/email lane aligned with
+        # the stronger setups already admitted by the scoring engine.
+        high_grade_exec = bool(score >= (score_floor + 5.0) and conf >= (conf_floor + 3))
         if sess == "NY":
-            if pb_dist > 0.78 and (score < (score_floor + 3.0) or conf < (conf_floor + 2)):
+            pb_soft_cap = 0.92 if high_grade_exec else 0.78
+            ext_cap = 1.10 if high_grade_exec else 0.95
+            if atr_pct > 0:
+                pb_soft_cap = min(0.98, pb_soft_cap + min(0.08, atr_pct * 0.02))
+                ext_cap = min(1.18, ext_cap + min(0.10, atr_pct * 0.025))
+            if pb_dist > pb_soft_cap and (score < (score_floor + 2.0) or conf < (conf_floor + 1)):
                 return (False, "ny_entry_too_far_from_ema")
-            if ch15_abs > 0.95 and pb_dist > 0.70:
+            if ch15_abs > ext_cap and pb_dist > min(pb_soft_cap - 0.06, 0.84):
                 return (False, "ny_late_extension_exec")
         elif sess == "LON":
-            if pb_dist > 0.76 and (score < (score_floor + 2.0) or conf < (conf_floor + 1)):
+            pb_soft_cap = 0.86 if high_grade_exec else 0.76
+            ext_cap = 1.00 if high_grade_exec else 0.90
+            if atr_pct > 0:
+                pb_soft_cap = min(0.92, pb_soft_cap + min(0.06, atr_pct * 0.018))
+                ext_cap = min(1.08, ext_cap + min(0.08, atr_pct * 0.02))
+            if pb_dist > pb_soft_cap and (score < (score_floor + 1.5) or conf < conf_floor):
                 return (False, "lon_entry_too_far_from_ema")
-            if ch15_abs > 0.90 and ch1_abs > 1.70 and pb_dist > 0.68:
+            if ch15_abs > ext_cap and ch1_abs > 1.70 and pb_dist > min(pb_soft_cap - 0.08, 0.78):
                 return (False, "lon_late_extension_exec")
 
         if engine == "A":
@@ -16706,24 +16756,32 @@ def is_executable_setup_eligible(
         if engine == "B":
             if not exec_engine_b_enabled:
                 return (False, "engine_b_disabled")
-            extra_score = 4.0 if sess == "NY" else 3.0
-            extra_conf = 3 if sess == "NY" else 2
-            extra_rr = 0.20 if sess == "NY" else 0.15
+            extra_score = 3.0 if sess == "NY" else 2.5
+            extra_conf = 2 if sess == "NY" else 1
+            extra_rr = 0.15 if sess == "NY" else 0.10
             if score < (score_floor + extra_score):
                 return (False, "engine_b_below_quality")
             if conf < (conf_floor + extra_conf):
                 return (False, "engine_b_below_conf")
             if rr_final < (rr_floor + extra_rr):
                 return (False, "engine_b_below_rr")
-            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.6, 14_000_000.0)):
+            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.40, 12_000_000.0)):
                 return (False, "engine_b_below_liquidity")
             ch1 = abs(float(getattr(s, "ch1", 0.0) or 0.0))
             ch4 = abs(float(getattr(s, "ch4", 0.0) or 0.0))
-            if ch1 < 0.9 or ch4 < 1.7:
+            if ch1 < 0.75 or ch4 < 1.35:
                 return (False, "engine_b_trend_not_strong_enough")
-            if pb_dist > (0.78 if sess == "NY" else 0.80):
+            engine_b_pb_cap = 0.90 if sess == "NY" else 0.92
+            engine_b_ch15_cap = 1.00 if sess == "NY" else 1.05
+            if high_grade_exec:
+                engine_b_pb_cap += 0.06
+                engine_b_ch15_cap += 0.08
+            if atr_pct > 0:
+                engine_b_pb_cap = min(1.02, engine_b_pb_cap + min(0.08, atr_pct * 0.02))
+                engine_b_ch15_cap = min(1.15, engine_b_ch15_cap + min(0.10, atr_pct * 0.025))
+            if pb_dist > engine_b_pb_cap:
                 return (False, "engine_b_entry_far_from_ema")
-            if ch15_abs > (0.90 if sess == "NY" else 0.95):
+            if ch15_abs > engine_b_ch15_cap:
                 return (False, "engine_b_chase_risk")
             return (True, "ok")
 
@@ -22621,7 +22679,10 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     else:  # email
         n_target = int(max(EMAIL_SETUPS_N * 2, 6))
         strict_15m = True
-        universe_cap = 35
+        # Wider execution universe prevents the email/autotrade lane from starving
+        # when the top 35 volume symbols do not contain enough eligible pullback setups.
+        # Final executable gates still enforce quality, RR and liquidity.
+        universe_cap = 60
         trigger_loosen = 1.0
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
         allow_no_pullback = False
