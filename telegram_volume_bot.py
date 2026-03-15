@@ -3606,7 +3606,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     except Exception:
         opened_today_count = 0
     try:
-        closed_today_rows = _autotrade_db_closed_trades_window(int(uid), float(start_ts), float(end_ts)) or []
+        closed_today_rows = _autotrade_closed_activity_rows_window(int(uid), float(start_ts), float(end_ts)) or []
         closed_today_count = int(len(closed_today_rows))
     except Exception:
         closed_today_rows = []
@@ -3681,9 +3681,11 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         # anchored trading day. Carried exposure is shown separately but must not consume
         # today's new-trade budget again.
         live_open_risk_charged_today = float(current_day_open_risk)
-        # Do NOT inflate opened_today_count to all currently open positions.
-        # Keep the day-open count anchored to confirmed current-day opens.
+        # Keep the day-open count anchored to confirmed current-day opens, but if the
+        # local journal is incomplete, never understate day activity versus confirmed
+        # exchange closes plus current-day live positions.
         opened_today_count = max(int(opened_today_count), int(current_day_open_positions))
+        opened_today_count = max(int(opened_today_count), int(closed_today_count) + int(current_day_open_positions))
     else:
         open_positions_now = len(journal_open)
         for t in journal_open:
@@ -3839,6 +3841,87 @@ def _autotrade_db_closed_trades_window(uid: int, start_ts: float, end_ts: float)
             (int(uid), float(start_ts), float(end_ts)),
         )
         return [dict(r) for r in c.fetchall()]
+
+
+def _autotrade_closed_activity_rows_window(uid: int, start_ts: float, end_ts: float) -> list[dict]:
+    """Closed-trade activity rows, journal-first with Bybit fallback for live admin.
+
+    Why this exists:
+    - /status and /autotrade_report should not show zero closed trades just because the
+      local journal missed some closes during a restart or delayed reconciliation.
+    - In LIVE mode for the owner/admin, Bybit closed-PnL rows are the source of truth for
+      closed activity inside the requested window.
+    """
+    try:
+        base_rows = _autotrade_db_closed_trades_window(int(uid), float(start_ts), float(end_ts)) or []
+    except Exception:
+        base_rows = []
+
+    out = []
+    seen = set()
+
+    def _row_key(symbol: str, side: str, ts: float, pnl: float) -> tuple:
+        return (
+            str(_bybit_linear_symbol(symbol or '')).upper(),
+            str(side or '').upper().strip(),
+            int(float(ts or 0.0) // 60),
+            round(float(pnl or 0.0), 8),
+        )
+
+    for r in (base_rows or []):
+        try:
+            sym = str(_bybit_linear_symbol((r or {}).get('symbol') or '')).upper()
+            side = str((r or {}).get('side') or '').upper().strip()
+            ts = float((r or {}).get('closed_ts') or 0.0)
+            pnl = float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0)
+            if not sym or ts <= 0:
+                continue
+            out.append(dict(r))
+            seen.add(_row_key(sym, side, ts, pnl))
+        except Exception:
+            continue
+
+    live_owner = (str(AUTOTRADE_MODE).lower() == 'live') and (int(uid) == int(AUTOTRADE_OWNER_UID or 0))
+    if live_owner:
+        try:
+            span_hours = max(1.0, (float(end_ts) - float(start_ts)) / 3600.0)
+            exch_rows = _bybit_get_closed_pnl_linear(float(start_ts), float(end_ts), limit=max(200, int(span_hours * 40))) or []
+        except Exception:
+            exch_rows = []
+        for ev in (exch_rows or []):
+            try:
+                ts = float(_bybit_closed_pnl_event_ts(ev) or 0.0)
+                if ts <= 0 or ts < float(start_ts) or ts >= float(end_ts):
+                    continue
+                sym = str(_bybit_linear_symbol((ev or {}).get('symbol') or '')).upper()
+                if not sym:
+                    continue
+                pnl = float((ev or {}).get('closedPnl') or (ev or {}).get('closed_pnl') or 0.0)
+                raw_side = str((ev or {}).get('side') or '').upper().strip()
+                sides = _bybit_closed_pnl_event_side_candidates(ev) or {'BUY', 'SELL'}
+                if any(_row_key(sym, side, ts, pnl) in seen for side in sides):
+                    continue
+                side = raw_side if raw_side in sides else str(sorted(sides)[0] if sides else '').upper()
+                if not side:
+                    side = 'BUY'
+                row = {
+                    'trade_id': f"exchange::{sym}::{side}::{int(ts)}::{abs(hash((sym, side, int(ts), round(pnl, 8))))}",
+                    'uid': int(uid),
+                    'symbol': sym,
+                    'side': side,
+                    'pnl_usdt': float(pnl),
+                    'closed_ts': float(ts),
+                    'status': 'CLOSED',
+                    'outcome': 'WIN' if pnl > 0 else ('LOSS' if pnl < 0 else 'BREAKEVEN'),
+                    'note': 'exchange_closed_pnl_fallback',
+                }
+                out.append(row)
+                seen.add(_row_key(sym, side, ts, pnl))
+            except Exception:
+                continue
+
+    out.sort(key=lambda r: float((r or {}).get('closed_ts') or 0.0), reverse=True)
+    return out
 
 AUTOTRADE_SYMBOL_GUARD_TTL_SEC = int(os.environ.get("AUTOTRADE_SYMBOL_GUARD_TTL_SEC", "1800") or 1800)
 AUTOTRADE_RECENT_SYMBOL_SYNC_SEC = int(os.environ.get("AUTOTRADE_RECENT_SYMBOL_SYNC_SEC", "180") or 180)
@@ -21534,24 +21617,16 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         if str(AUTOTRADE_MODE).lower() == 'live':
             _autotrade_sync_closed_trades_from_exchange(int(AUTOTRADE_OWNER_UID or uid), lookback_days=max(2, int(math.ceil(lookback_h / 24.0)) + 1))
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            ts_from = float(time.time() - lookback_h * 3600.0)
-            rows = cur.execute(
-                """SELECT trade_id, symbol, side, pnl_usdt, closed_ts, status FROM autotrade_trades
-                   WHERE uid=? AND closed_ts IS NOT NULL AND closed_ts>=?
-                   ORDER BY closed_ts DESC LIMIT 30""",
-                (int(AUTOTRADE_OWNER_UID or uid), float(ts_from))
-            ).fetchall() or []
+        ts_from = float(time.time() - lookback_h * 3600.0)
+        rows = _autotrade_closed_activity_rows_window(int(AUTOTRADE_OWNER_UID or uid), float(ts_from), float(time.time()) + 60.0)[:30]
         total_closed = 0.0
         live_keys = {(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper()) for p in open_positions}
         for r in rows:
-            sym = _bybit_linear_symbol(str(r['symbol'] or ''))
-            side = str(r['side'] or '').upper()
+            sym = _bybit_linear_symbol(str((r or {}).get('symbol') or ''))
+            side = str((r or {}).get('side') or '').upper()
             if (sym, side) in live_keys:
                 continue
-            pnl = float(r['pnl_usdt'] or 0.0)
+            pnl = float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0)
             total_closed += pnl
             lines.append(f"• {side} {sym} | PnL {pnl:+.2f} USDT")
             closed_any = True
@@ -21808,6 +21883,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         SEP,
         f"Equity: ${equity:.2f}",
         f"Daily cap: ${float(snap.get('cap') or 0.0):.2f}",
+        f"Opened today: {int(snap.get('positions_opened_today', 0) or 0)} | Closed today: {int(snap.get('positions_closed_today', 0) or 0)} | Open now: {int(snap.get('open_positions_now', 0) or 0)}",
         f"Open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
         f"Realised net today: ${float(snap.get('pnl_today') or 0.0):+.2f}",
         f"Daily risk used (open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
