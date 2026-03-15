@@ -458,6 +458,35 @@ def _ensure_three_tps(entry: float, sl: float, tp3: float, tp1, tp2, side: str):
 
     return float(t1), float(t2), float(t2)
 
+
+def _setup_final_target(entry: float, side: str, tp1=None, tp2=None, tp3=None) -> float:
+    """Return the farthest valid final target in trade direction.
+
+    This keeps setup generation, email eligibility, reporting, and autotrade using the
+    same definition of the setup's final TP even when legacy callers still populate both
+    TP2 and TP3 fields.
+    """
+    try:
+        e = float(entry or 0.0)
+    except Exception:
+        e = 0.0
+    side_u = str(side or '').upper().strip()
+    vals = []
+    for raw in (tp2, tp3, tp1):
+        try:
+            v = float(raw or 0.0)
+        except Exception:
+            v = 0.0
+        if v > 0:
+            vals.append(v)
+    if e <= 0 or not vals:
+        return float(vals[0]) if vals else 0.0
+    if side_u == 'SELL':
+        valid = [v for v in vals if v < e]
+        return float(min(valid)) if valid else 0.0
+    valid = [v for v in vals if v > e]
+    return float(max(valid)) if valid else 0.0
+
 _LAST_SCAN_UNIVERSE = []
 _LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
 
@@ -12244,15 +12273,7 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
 
         entry = float(getattr(s, 'entry', 0.0) or 0.0)
         sl = float(getattr(s, 'sl', 0.0) or 0.0)
-        side = str(getattr(s, 'side', '') or '').upper().strip()
-        tp3 = float(getattr(s, 'tp3', 0.0) or 0.0)
-        tp2 = float(getattr(s, 'tp2', 0.0) or 0.0)
-        if side == 'BUY':
-            final_tp = max([tp for tp in (tp3, tp2) if tp > entry], default=0.0)
-        elif side == 'SELL':
-            final_tp = min([tp for tp in (tp3, tp2) if 0.0 < tp < entry], default=0.0)
-        else:
-            final_tp = tp3 or tp2 or 0.0
+        final_tp = _setup_final_target(entry, str(getattr(s, 'side', '') or ''), getattr(s, 'tp1', None), getattr(s, 'tp2', None), getattr(s, 'tp3', None))
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
         rows.append({
             'symbol': str(symbol),
@@ -16136,9 +16157,9 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
 def is_executable_setup_eligible(
     s: "Setup",
     session_name: str = "NY",
-    min_quality: float = 70.0,
-    min_conf: int = 78,
-    min_rr_final: Optional[float] = None,
+    min_quality: float | None = None,
+    min_conf: int | None = None,
+    min_rr_final: float | None = None,
 ) -> tuple[bool, str]:
     """Production-grade gate for email/executable/autotrade path.
 
@@ -16147,6 +16168,10 @@ def is_executable_setup_eligible(
     - keep Engine A as the default/highest-trust source
     - allow Engine B breakouts only with *stricter* score/conf/RR/liquidity rules
     - keep the sellable/live path tighter than /screen
+
+    The optional min_* overrides are additive hardening knobs. When omitted, the function
+    must respect the live config and session thresholds instead of re-introducing stale
+    hard-coded floors that can silently block email/autotrade flow.
     """
     try:
         sess = str(session_name or "").upper().strip()
@@ -16163,10 +16188,12 @@ def is_executable_setup_eligible(
             return (False, f"base_gate_{why}")
 
         sess_quality, sess_conf, sess_rr = _execution_session_thresholds(sess)
-        score_floor = float(max(min_quality, QUALITY_SCORE_MIN_EMAIL, sess_quality))
-        conf_floor = int(max(min_conf, MIN_SETUP_CONF, sess_conf))
-        cfg_rr_floor = float(MIN_RR_TP3 if min_rr_final is None else min_rr_final)
-        rr_floor = float(max(cfg_rr_floor, sess_rr))
+        cfg_quality = float((cfg_live or {}).get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
+        cfg_conf = int(float((cfg_live or {}).get("min_setup_conf", MIN_SETUP_CONF) or MIN_SETUP_CONF)) if isinstance((cfg_live or {}).get("min_setup_conf", MIN_SETUP_CONF), (int, float, str)) else int(MIN_SETUP_CONF)
+        cfg_rr = float((cfg_live or {}).get("min_rr_tp3", MIN_RR_TP3) or MIN_RR_TP3)
+        score_floor = float(max(cfg_quality, sess_quality, float(min_quality) if min_quality is not None else float('-inf')))
+        conf_floor = int(max(cfg_conf, sess_conf, int(min_conf) if min_conf is not None else -10**9))
+        rr_floor = float(max(cfg_rr, sess_rr, float(min_rr_final) if min_rr_final is not None else float('-inf')))
 
         score = float(getattr(s, "quality_score", 0.0) or 0.0)
         if score < score_floor:
@@ -16178,22 +16205,11 @@ def is_executable_setup_eligible(
 
         entry = float(getattr(s, "entry", 0.0) or 0.0)
         sl = float(getattr(s, "sl", 0.0) or 0.0)
-        side = str(getattr(s, "side", "") or "").upper().strip()
-        tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
-        tp2 = float(getattr(s, "tp2", 0.0) or 0.0)
-        final_tp = 0.0
-        tp_candidates = [tp for tp in (tp3, tp2) if tp > 0]
-        if side == "BUY":
-            tp_candidates = [tp for tp in tp_candidates if tp > entry]
-            final_tp = max(tp_candidates) if tp_candidates else 0.0
-        elif side == "SELL":
-            tp_candidates = [tp for tp in tp_candidates if tp < entry]
-            final_tp = min(tp_candidates) if tp_candidates else 0.0
-        else:
-            final_tp = tp3 or tp2 or 0.0
+        side = str(getattr(s, "side", "") or "")
+        final_tp = _setup_final_target(entry, side, getattr(s, "tp1", None), getattr(s, "tp2", None), getattr(s, "tp3", None))
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
         if rr_final < rr_floor:
-            return (False, f"below_exec_rr (rr={rr_final:.2f} floor={rr_floor:.2f})")
+            return (False, "below_exec_rr")
 
         engine = str(getattr(s, "engine", "") or "").upper().strip()
         fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
