@@ -23111,10 +23111,13 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             if not sid:
                 skipped.append('missing_setup_id')
                 continue
-            ok, why = is_executable_setup_eligible(s, session_name=target_session)
-            if not ok:
-                skipped.append(str(why))
-                continue
+            # IMPORTANT:
+            # shown_setups already come from /screen's email-mode priority pool.
+            # Re-running the stricter executable gate here can desync manual /screen
+            # from the email -> executable -> autotrade lane, especially in
+            # sessions_unlimited mode. Keep the manual sync aligned with exactly
+            # what /screen displayed, while still honoring all duplicate/cooldown/
+            # cap/session protections below.
             if db_has_executable_setup(int(uid), sid, lookback_hours=12):
                 skipped.append('already_executable')
                 continue
@@ -25614,15 +25617,32 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
         # Session label in UTC (NY/LON/ASIA)
         now_utc = datetime.now(timezone.utc)
         live_sess = _session_label_utc(now_utc)
-        sess = current_session_utc(now_utc)
+        owner_unlimited = int(user.get("sessions_unlimited", 0) or 0) == 1
+        if owner_unlimited:
+            try:
+                sess_ctx = in_session_now(user) or {}
+            except Exception:
+                sess_ctx = {}
+            sess = str(sess_ctx.get("name") or current_session_utc(now_utc) or "NONE").upper()
+        else:
+            sess = current_session_utc(now_utc)
 
         async with AUTOTRADE_EXEC_LOCK:
-            if not live_sess:
+            if not owner_unlimited and not live_sess:
                 _LAST_AUTOTRADE_DECISION[uid] = {
                     "status": "SKIP",
                     "when": now_utc.isoformat(timespec="seconds"),
                     "reason": "outside_live_session_window",
                     "session": "NONE",
+                    "mode": AUTOTRADE_MODE,
+                }
+                return
+            if sess not in {"ASIA", "LON", "NY"}:
+                _LAST_AUTOTRADE_DECISION[uid] = {
+                    "status": "SKIP",
+                    "when": now_utc.isoformat(timespec="seconds"),
+                    "reason": f"invalid_target_session ({sess or 'NONE'})",
+                    "session": str(sess or "NONE"),
                     "mode": AUTOTRADE_MODE,
                 }
                 return
