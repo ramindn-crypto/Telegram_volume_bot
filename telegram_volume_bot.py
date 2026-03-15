@@ -7410,6 +7410,38 @@ def list_users_notify_on() -> List[dict]:
         except Exception:
             pass
 
+        # 3) Synthetic admin/owner fallback if they rely only on EMAIL_TO and do not yet
+        #    have a persisted users row. This prevents the background email -> executable ->
+        #    autotrade lane from disappearing silently for the owner account.
+        try:
+            seen_uids = {int(_user_row_uid(r) or 0) for r in (rows or []) if int(_user_row_uid(r) or 0) > 0}
+            fallback_ids = set()
+            try:
+                fallback_ids.update(int(x) for x in (_admin_ids_all() or []) if int(x or 0) > 0)
+            except Exception:
+                pass
+            try:
+                if int(AUTOTRADE_OWNER_UID or 0) > 0:
+                    fallback_ids.add(int(AUTOTRADE_OWNER_UID))
+            except Exception:
+                pass
+            for admin_uid in sorted(fallback_ids):
+                if admin_uid in seen_uids:
+                    continue
+                synthetic = {
+                    "user_id": int(admin_uid),
+                    "id": int(admin_uid),
+                    "notify_on": 1,
+                    "email_alerts_enabled": 1,
+                    "sessions_unlimited": 1,
+                    "tz": "Australia/Melbourne",
+                }
+                if _effective_user_email_recipient(synthetic):
+                    rows.append(synthetic)
+                    seen_uids.add(admin_uid)
+        except Exception:
+            pass
+
         return rows
     finally:
         try:
@@ -7488,6 +7520,34 @@ def list_users_with_email() -> List[dict]:
                     seen.add(uid)
         except Exception:
             pass
+        try:
+            seen = {int(_user_row_uid(r) or 0) for r in (rows or []) if int(_user_row_uid(r) or 0) > 0}
+            fallback_ids = set()
+            try:
+                fallback_ids.update(int(x) for x in (_admin_ids_all() or []) if int(x or 0) > 0)
+            except Exception:
+                pass
+            try:
+                if int(AUTOTRADE_OWNER_UID or 0) > 0:
+                    fallback_ids.add(int(AUTOTRADE_OWNER_UID))
+            except Exception:
+                pass
+            for admin_uid in sorted(fallback_ids):
+                if admin_uid in seen:
+                    continue
+                synthetic = {
+                    "user_id": int(admin_uid),
+                    "id": int(admin_uid),
+                    "email_alerts_enabled": 1,
+                    "sessions_unlimited": 1,
+                    "tz": "Australia/Melbourne",
+                }
+                if _effective_user_email_recipient(synthetic):
+                    rows.append(synthetic)
+                    seen.add(admin_uid)
+        except Exception:
+            pass
+
         return rows
     finally:
         try:
@@ -16861,19 +16921,47 @@ def is_top_setup_eligible(
         return (False, "eligibility_exception")
 
 def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]:
-    """Session-aware production thresholds with config-driven runtime overrides."""
-    sess = str(session_name or "").upper().strip()
-    if sess == "NY":
-        quality, conf, rr = 79.0, 84, 1.60
-    elif sess == "LON":
-        quality, conf, rr = 78.0, 83, 1.58
-    elif sess == "ASIA":
-        quality, conf, rr = 84.0, 87, 1.72
-    else:
-        quality, conf, rr = 78.0, 83, 1.58
+    """Session-aware production thresholds aligned with the live strategy config.
+
+    Important:
+    - The executable lane must not silently re-introduce stale absolute floors that are
+      stricter than StrategyConfig / governor / optimizer settings.
+    - We therefore start from the active config, then apply *small* session-specific
+      hardening deltas plus optional runtime overrides.
+    """
+    sess = str(session_name or "").upper().strip() or "LON"
+    if sess not in {"NY", "LON", "ASIA"}:
+        sess = "LON"
 
     try:
         cfg = load_strategy_config(force=False)
+    except Exception:
+        cfg = {}
+
+    try:
+        base_quality = float((cfg or {}).get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
+    except Exception:
+        base_quality = float(QUALITY_SCORE_MIN_EMAIL)
+    try:
+        base_conf = int(float((cfg or {}).get("min_setup_conf", MIN_SETUP_CONF) or MIN_SETUP_CONF))
+    except Exception:
+        base_conf = int(MIN_SETUP_CONF)
+    try:
+        base_rr = float((cfg or {}).get("min_rr_tp3", MIN_RR_TP3) or MIN_RR_TP3)
+    except Exception:
+        base_rr = float(MIN_RR_TP3)
+
+    # Small session-specific hardening only. This keeps flow aligned with the sellable
+    # 3–5 setups/day goal while still making ASIA the tightest lane.
+    quality_add = {"NY": 0.0, "LON": 0.5, "ASIA": 2.0}.get(sess, 0.5)
+    session_conf_floor = int(SESSION_MIN_CONF.get(sess, base_conf))
+    session_rr_floor = float(SESSION_MIN_RR_TP3.get(sess, base_rr))
+
+    quality = max(float(base_quality), float(base_quality + quality_add))
+    conf = max(int(base_conf), int(session_conf_floor))
+    rr = max(float(base_rr), float(session_rr_floor))
+
+    try:
         ov_all = (cfg or {}).get("session_exec_overrides") or {}
         ov = ov_all.get(sess) or {}
         quality += float(ov.get("quality_add", 0.0) or 0.0)
@@ -16882,9 +16970,9 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     except Exception:
         pass
 
-    quality = float(clamp(quality, 70.0, 92.0))
-    conf = int(max(78, min(95, conf)))
-    rr = float(clamp(rr, 1.35, 2.30))
+    quality = float(clamp(quality, 68.0, 92.0))
+    conf = int(max(74, min(95, conf)))
+    rr = float(clamp(rr, 1.30, 2.30))
     return (quality, conf, rr)
 
 
@@ -22962,7 +23050,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         # Wider execution universe prevents the email/autotrade lane from starving
         # when the top 35 volume symbols do not contain enough eligible pullback setups.
         # Final executable gates still enforce quality, RR and liquidity.
-        universe_cap = 60
+        universe_cap = 80
         trigger_loosen = 1.0
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
         allow_no_pullback = False
@@ -26526,6 +26614,13 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
         # If user record doesn't exist yet, do nothing (avoids writing defaults to DB)
         user = get_user(uid) or {}
         if not user:
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "SKIP",
+                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "reason": "owner_user_record_missing",
+                "session": _session_label_utc(datetime.now(timezone.utc)) or "NONE",
+                "mode": AUTOTRADE_MODE,
+            }
             return
 
         # Session label in UTC (NY/LON/ASIA)
