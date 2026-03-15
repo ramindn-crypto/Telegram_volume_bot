@@ -1238,9 +1238,12 @@ def _normalize_strategy_config(cfg: dict) -> dict:
     if not already_migrated:
         if legacy_ny_only:
             out["session_weights"] = {"NY": 1.0, "LON": 0.85, "ASIA": 0.65}
-        if asia_requested_by_default and not _strategy_cfg_parse_bool(out.get("execution_asia_enabled", True), True):
-            out["execution_asia_enabled"] = True
         out["_migrated_balanced_sessions_v2"] = True
+
+    # Hard-heal legacy/stale configs: if this deployment expects ASIA to be executable,
+    # do not allow an older persisted StrategyConfig to keep ASIA silently disabled.
+    if asia_requested_by_default and not _strategy_cfg_parse_bool(out.get("execution_asia_enabled", True), True):
+        out["execution_asia_enabled"] = True
 
     out["_config_revision"] = max(2, int(_f(out.get("_config_revision", 2), 2)))
     return out
@@ -22629,10 +22632,15 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
     
     # -----------------------------------------------------
-    # Shared Top Setup gate (applies to BOTH /screen and email)
+    # Shared Top Setup gate
+    # - screen mode: quality/top-setup gate
+    # - email mode : MUST also satisfy executable eligibility so /screen, email,
+    #                and autotrade stay on the same lane when /screen uses mode="email".
     # -----------------------------------------------------
     try:
         ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, source=mode, session_name=session_name)[0]]
+        if str(mode or '').strip().lower() == 'email':
+            ordered = [s for s in (ordered or []) if is_executable_setup_eligible(s, session_name=session_name)[0]]
     except Exception:
         pass
 # -----------------------------------------------------
