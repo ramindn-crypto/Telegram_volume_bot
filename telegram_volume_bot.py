@@ -10221,6 +10221,213 @@ def make_setup_id(base: str = '', side: str = '') -> str:
     """
     return next_setup_id()
 
+
+# =========================================================
+# COMPAT / RUNTIME HELPERS (safe aliases + missing helpers)
+# =========================================================
+# Some older code paths still reference these names. Implement them explicitly so
+# setup generation, email pipeline, autotrade protection, and admin UX do not
+# silently degrade because of runtime NameError fallbacks.
+
+def _new_setup_id() -> str:
+    return next_setup_id()
+
+
+def _json_loads_safe(raw, default=None):
+    try:
+        if raw in (None, ''):
+            return default
+        return json.loads(raw)
+    except Exception:
+        return default
+
+
+def _format_help_table(rows) -> str:
+    try:
+        rows = list(rows or [])
+        if not rows:
+            return ''
+        if isinstance(rows[0], dict):
+            headers = list(rows[0].keys())
+            body = [[str(r.get(h, '')) for h in headers] for r in rows]
+        else:
+            body = [list(r) if isinstance(r, (list, tuple)) else [str(r)] for r in rows]
+            width = max(len(r) for r in body)
+            body = [r + [''] * (width - len(r)) for r in body]
+            headers = [f'C{i+1}' for i in range(len(body[0]))]
+        return tabulate(body, headers=headers, tablefmt='plain')
+    except Exception:
+        try:
+            return '\n'.join(' | '.join(str(x) for x in (r if isinstance(r, (list, tuple)) else [r])) for r in (rows or []))
+        except Exception:
+            return ''
+
+
+def _fut_vol_usd_from_best(best_fut: dict, base: str) -> float:
+    try:
+        mv = (best_fut or {}).get(str(base or '').upper())
+        if not mv:
+            return 0.0
+        for attr in ('fut_vol_usd', 'quote_vol', 'quoteVolume', 'turnover24h'):
+            try:
+                v = float(getattr(mv, attr, 0.0) or 0.0)
+                if v > 0:
+                    if attr == 'fut_vol_usd':
+                        return v
+                    px = float(getattr(mv, 'last', 0.0) or 0.0)
+                    return (v * px) if attr != 'quote_vol' else v
+            except Exception:
+                pass
+        px = float(getattr(mv, 'last', 0.0) or 0.0)
+        base_vol = float(getattr(mv, 'base_vol', 0.0) or 0.0)
+        return float(max(0.0, px * base_vol))
+    except Exception:
+        return 0.0
+
+
+def _db_recent_runtime_evidence(uid: int, hours: int = 24) -> dict:
+    out = {
+        'generated_screen_last_ts': 0.0,
+        'generated_email_last_ts': 0.0,
+        'signals_last_ts': 0.0,
+        'emailed_last_ts': 0.0,
+        'executable_last_ts': 0.0,
+    }
+    cutoff = float(time.time()) - (float(max(1, int(hours))) * 3600.0)
+    try:
+        con = db_connect()
+        cur = con.cursor()
+        try:
+            cur.execute("SELECT MAX(created_ts) FROM generated_setups WHERE user_id=? AND source='screen' AND created_ts>=?", (int(uid), float(cutoff)))
+            row = cur.fetchone()
+            out['generated_screen_last_ts'] = float((row[0] if row else 0.0) or 0.0)
+        except Exception:
+            pass
+        try:
+            cur.execute("SELECT MAX(created_ts) FROM generated_setups WHERE user_id=? AND source='email' AND created_ts>=?", (int(uid), float(cutoff)))
+            row = cur.fetchone()
+            out['generated_email_last_ts'] = float((row[0] if row else 0.0) or 0.0)
+        except Exception:
+            pass
+        try:
+            cur.execute("SELECT MAX(created_ts) FROM signals WHERE created_ts>=?", (float(cutoff),))
+            row = cur.fetchone()
+            out['signals_last_ts'] = float((row[0] if row else 0.0) or 0.0)
+        except Exception:
+            pass
+        try:
+            cur.execute("SELECT MAX(emailed_ts) FROM emailed_setups WHERE user_id=? AND emailed_ts>=?", (int(uid), float(cutoff)))
+            row = cur.fetchone()
+            out['emailed_last_ts'] = float((row[0] if row else 0.0) or 0.0)
+        except Exception:
+            pass
+        try:
+            cur.execute("SELECT MAX(executable_ts) FROM executable_setups WHERE user_id=? AND executable_ts>=?", (int(uid), float(cutoff)))
+            row = cur.fetchone()
+            out['executable_last_ts'] = float((row[0] if row else 0.0) or 0.0)
+        except Exception:
+            pass
+        con.close()
+    except Exception:
+        pass
+    return out
+
+
+def get_user_by_email(email: str):
+    needle = str(email or '').strip().lower()
+    if not needle:
+        return None
+    try:
+        con = db_connect()
+        cur = con.cursor()
+        cols = {r['name'] if isinstance(r, sqlite3.Row) else r[1] for r in cur.execute('PRAGMA table_info(users)').fetchall()}
+        clauses = []
+        params = []
+        if 'email_to' in cols:
+            clauses.append('LOWER(COALESCE(email_to, "")) = ?')
+            params.append(needle)
+        if 'email' in cols:
+            clauses.append('LOWER(COALESCE(email, "")) = ?')
+            params.append(needle)
+        if not clauses:
+            con.close()
+            return None
+        cur.execute(f"SELECT * FROM users WHERE {' OR '.join(clauses)} LIMIT 1", tuple(params))
+        row = cur.fetchone()
+        con.close()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def activate_user_by_email(email: str, plan: str):
+    user = get_user_by_email(email)
+    if not user:
+        return
+    uid = int(user.get('user_id') or user.get('id') or 0)
+    if uid <= 0:
+        return
+    try:
+        update_user(uid, plan=str(plan or 'standard').strip().lower(), access_updated_ts=float(time.time()))
+    except Exception:
+        pass
+
+
+def downgrade_user_by_email(email: str):
+    user = get_user_by_email(email)
+    if not user:
+        return
+    uid = int(user.get('user_id') or user.get('id') or 0)
+    if uid <= 0:
+        return
+    try:
+        update_user(uid, plan='free', access_updated_ts=float(time.time()))
+    except Exception:
+        pass
+
+
+def trade_window_allows_now(user: dict) -> bool:
+    try:
+        return bool(in_trade_window_now(user))
+    except Exception:
+        return True
+
+
+def _bybit_has_open_tp_order_at(symbol: str, tp_price: float, rel_tol: float = 0.0015) -> bool:
+    sym = _bybit_linear_symbol(symbol)
+    try:
+        want = float(tp_price or 0.0)
+    except Exception:
+        want = 0.0
+    if want <= 0:
+        return False
+    try:
+        for o in _bybit_get_open_orders_linear(sym):
+            try:
+                if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
+                    continue
+                if not _bybit_order_reduce_only(o):
+                    continue
+                status = str(o.get('orderStatus') or '').upper().strip()
+                if status in {'FILLED', 'CANCELLED', 'REJECTED', 'DEACTIVATED'}:
+                    continue
+                px = float(o.get('price') or o.get('triggerPrice') or 0.0)
+                if px > 0 and _price_close_enough(px, want, rel_tol=rel_tol):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+def trial_expired(user: dict) -> bool:
+    try:
+        created = datetime.fromisoformat(str(user.get('created_at') or ''))
+        return datetime.utcnow() > created + timedelta(days=FREE_TRIAL_DAYS)
+    except Exception:
+        return True
+
 # =========================================================
 # SL/TP ENGINE (closer + dynamic cap + ✅ confidence-weighted TP scaling)
 # =========================================================
