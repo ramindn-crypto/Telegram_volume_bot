@@ -23052,20 +23052,33 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             return {"status": "skip", "reason": "no_shown_setups"}
         live_session = str(live_session or '').upper().strip()
         scan_session = str(scan_session or '').upper().strip()
-        if live_session not in {"ASIA", "LON", "NY"}:
-            return {"status": "skip", "reason": "outside_live_session_window"}
-        if scan_session and scan_session != live_session:
-            return {"status": "skip", "reason": f"session_mismatch ({scan_session}->{live_session})"}
 
         user = dict(user or {})
+        unlimited_on = int(user.get("sessions_unlimited", 0) or 0) == 1
         try:
             sess = in_session_now(user or {})
         except Exception:
             sess = None
         if not sess:
             return {"status": "skip", "reason": "user_not_in_enabled_session"}
-        if str(sess.get('name') or '').upper().strip() != live_session:
-            return {"status": "skip", "reason": f"user_session_mismatch ({str(sess.get('name') or '').upper()}!={live_session})"}
+
+        sess_name = str(sess.get('name') or '').upper().strip()
+        if sess_name not in {"ASIA", "LON", "NY"}:
+            return {"status": "skip", "reason": f"invalid_target_session ({sess_name or 'NONE'})"}
+
+        # Normal mode: only sync when /screen is inside the real live market session.
+        # Sessions UNLIMITED: allow manual /screen outside live session too, but always
+        # sync into the real target bucket resolved by in_session_now()/scan-session logic
+        # so email logging and autotrade stay on the same session lane.
+        if not unlimited_on:
+            if live_session not in {"ASIA", "LON", "NY"}:
+                return {"status": "skip", "reason": "outside_live_session_window"}
+            if scan_session and scan_session != live_session:
+                return {"status": "skip", "reason": f"session_mismatch ({scan_session}->{live_session})"}
+            if sess_name != live_session:
+                return {"status": "skip", "reason": f"user_session_mismatch ({sess_name}!={live_session})"}
+
+        target_session = sess_name
 
         try:
             st = email_state_get(int(uid))
@@ -23098,7 +23111,7 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             if not sid:
                 skipped.append('missing_setup_id')
                 continue
-            ok, why = is_executable_setup_eligible(s, session_name=live_session)
+            ok, why = is_executable_setup_eligible(s, session_name=target_session)
             if not ok:
                 skipped.append(str(why))
                 continue
@@ -23107,10 +23120,10 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
                 continue
             sym = str(getattr(s, 'symbol', '') or '').upper()
             side = str(getattr(s, 'side', '') or '').upper()
-            if symbol_flip_guard_active(int(uid), sym, side, live_session):
+            if symbol_flip_guard_active(int(uid), sym, side, target_session):
                 skipped.append('flip_guard_blocked')
                 continue
-            if symbol_recently_emailed(int(uid), sym, side, live_session):
+            if symbol_recently_emailed(int(uid), sym, side, target_session):
                 skipped.append('cooldown_blocked')
                 continue
             try:
@@ -23136,7 +23149,7 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
         sent = await asyncio.to_thread(
             send_email_alert_multi,
             dict(user or {}),
-            {"name": str(live_session)},
+            {"name": str(target_session)},
             actionable,
             best_fut,
         )
@@ -23155,10 +23168,10 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
                 pass
             for s in actionable:
                 try:
-                    mark_symbol_emailed(int(uid), s.symbol, s.side, live_session)
+                    mark_symbol_emailed(int(uid), s.symbol, s.side, target_session)
                 except Exception:
                     pass
-            return {"status": "sent", "reason": f"synced {len(actionable)} setup(s)", "setup_ids": [str(getattr(s, 'setup_id', '') or '') for s in actionable]}
+            return {"status": "sent", "reason": f"synced {len(actionable)} setup(s)", "setup_ids": [str(getattr(s, 'setup_id', '') or '') for s in actionable], "target_session": target_session}
 
         fail_reason = ''
         try:
