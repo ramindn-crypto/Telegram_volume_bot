@@ -3567,6 +3567,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         pass
 
     start_utc, end_utc = _admin_today_window_utc(uid=int(uid), user=user)
+    closed_summary = {'count': 0, 'net_pnl': 0.0, 'realized_loss': 0.0}
     try:
         if mode == "live":
             closed_summary = _bybit_closed_pnl_summary(float(start_utc.timestamp()), float(end_utc.timestamp()))
@@ -3578,7 +3579,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     except Exception:
         realized_pnl_today = 0.0
         realized_loss_today = 0.0
-        closed_summary = {'count': 0}
+        closed_summary = {'count': 0, 'net_pnl': 0.0, 'realized_loss': 0.0}
 
     start_ts = float(start_utc.timestamp())
     end_ts = float(end_utc.timestamp())
@@ -3608,9 +3609,21 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     try:
         closed_today_rows = _autotrade_closed_activity_rows_window(int(uid), float(start_ts), float(end_ts)) or []
         closed_today_count = int(len(closed_today_rows))
+        if closed_today_rows:
+            realized_pnl_today = float(sum(
+                float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0)
+                for r in closed_today_rows
+            ))
+            realized_loss_today = float(sum(
+                abs(float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0))
+                for r in closed_today_rows
+                if float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0) < 0.0
+            ))
+        elif mode == "live":
+            closed_today_count = int(closed_summary.get('count') or 0)
     except Exception:
         closed_today_rows = []
-        closed_today_count = 0
+        closed_today_count = int(closed_summary.get('count') or 0) if mode == "live" else 0
 
     journal_open = []
     try:
