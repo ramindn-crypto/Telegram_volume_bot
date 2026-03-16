@@ -15886,6 +15886,25 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
     return actions, notes
 
 
+def humanize_seconds(seconds: int | float) -> str:
+    try:
+        s = max(0, int(float(seconds or 0)))
+    except Exception:
+        return "0s"
+    days, rem = divmod(s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs or not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts[:3])
+
 def _market_adaptive_cooldown_remaining_seconds(cfg: dict | None = None, last_report: dict | None = None) -> int:
     cfg = cfg or load_strategy_config(force=False) or {}
     last_report = last_report or (_evolution_state_get('market_adaptive_last_report', {}) or {})
