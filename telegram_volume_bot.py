@@ -9204,9 +9204,33 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if live_admin:
         owner = int(AUTOTRADE_OWNER_UID or uid)
         owner_user = get_user(owner) or user or {}
-        days = int(max(7, _autotrade_history_days_available(int(owner))))
+        days = int(max(7, _autotrade_history_days_available(int(owner)), 30))
         start_ts = max(0.0, time.time() - float(days) * 86400.0)
+        try:
+            _autotrade_sync_closed_trades_from_exchange(int(owner), lookback_days=max(14, int(days) + 3))
+        except Exception:
+            pass
         rows = _autotrade_closed_activity_rows_window(int(owner), float(start_ts), float(time.time()) + 60.0) or []
+        if not rows:
+            try:
+                exch = _bybit_get_closed_pnl_linear(float(start_ts), float(time.time()) + 60.0, limit=max(200, int(days) * 80)) or []
+            except Exception:
+                exch = []
+            rows = []
+            for ev in exch:
+                try:
+                    ts = float(_bybit_closed_pnl_event_ts(ev) or 0.0)
+                    if ts <= 0 or ts < float(start_ts):
+                        continue
+                    sym = str(_bybit_linear_symbol((ev or {}).get('symbol') or '')).upper()
+                    pnl = float((ev or {}).get('closedPnl') or (ev or {}).get('closed_pnl') or 0.0)
+                    sides = sorted(_bybit_closed_pnl_event_side_candidates(ev) or {'BUY', 'SELL'})
+                    side = str(((ev or {}).get('side') or '')).upper().strip()
+                    if side not in sides:
+                        side = str(sides[0] if sides else 'BUY')
+                    rows.append({'symbol': sym, 'side': side, 'closed_ts': ts, 'pnl_usdt': pnl})
+                except Exception:
+                    continue
         stats = _report_closed_activity_stats(rows)
         pf = _report_closed_activity_profit_factor(rows)
         exp_r = None
@@ -21099,7 +21123,31 @@ async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _admin_report_uses_live_autotrade(int(uid)):
         owner = int(AUTOTRADE_OWNER_UID or uid)
         ts_from = max(0.0, time.time() - 7.0 * 86400.0)
+        try:
+            _autotrade_sync_closed_trades_from_exchange(int(owner), lookback_days=10)
+        except Exception:
+            pass
         rows = _autotrade_closed_activity_rows_window(int(owner), float(ts_from), float(time.time()) + 60.0) or []
+        if not rows:
+            try:
+                exch = _bybit_get_closed_pnl_linear(float(ts_from), float(time.time()) + 60.0, limit=600) or []
+            except Exception:
+                exch = []
+            rows = []
+            for ev in exch:
+                try:
+                    ts = float(_bybit_closed_pnl_event_ts(ev) or 0.0)
+                    if ts <= 0 or ts < float(ts_from):
+                        continue
+                    sym = str(_bybit_linear_symbol((ev or {}).get('symbol') or '')).upper()
+                    pnl = float((ev or {}).get('closedPnl') or (ev or {}).get('closed_pnl') or 0.0)
+                    sides = sorted(_bybit_closed_pnl_event_side_candidates(ev) or {'BUY', 'SELL'})
+                    side = str(((ev or {}).get('side') or '')).upper().strip()
+                    if side not in sides:
+                        side = str(sides[0] if sides else 'BUY')
+                    rows.append({'symbol': sym, 'side': side, 'closed_ts': ts, 'pnl_usdt': pnl})
+                except Exception:
+                    continue
         stats = _report_closed_activity_stats(rows)
     else:
         tz = ZoneInfo(user["tz"])
