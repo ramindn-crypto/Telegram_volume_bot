@@ -15886,6 +15886,18 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
     return actions, notes
 
 
+def _market_adaptive_cooldown_remaining_seconds(cfg: dict | None = None, last_report: dict | None = None) -> int:
+    cfg = cfg or load_strategy_config(force=False) or {}
+    last_report = last_report or (_evolution_state_get('market_adaptive_last_report', {}) or {})
+    cooldown_h = float((cfg or {}).get('market_adaptive_cooldown_hours', 20.0) or 20.0)
+    last_applied_ts = float((last_report or {}).get('applied_ts', 0.0) or 0.0)
+    last_cycle_ts = float((last_report or {}).get('ts', 0.0) or last_applied_ts or 0.0)
+    if last_cycle_ts <= 0:
+        return 0
+    remain = int(round((last_cycle_ts + (cooldown_h * 3600.0)) - time.time()))
+    return max(0, remain)
+
+
 def _market_adaptive_status_snapshot() -> dict:
     cfg = load_strategy_config(force=False)
     last_run = _evolution_get_last_run('market_adaptive') or {}
@@ -16077,6 +16089,9 @@ async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAU
     ]
     if not last_run:
         lines.append(f"Bootstrap: first automatic cycle starts about {first_delay}s after bot startup | manual trigger: /adaptive_run")
+    remaining_cd = _market_adaptive_cooldown_remaining_seconds(cfg, rep)
+    if remaining_cd > 0:
+        lines.append(f"Cooldown remaining: {humanize_seconds(remaining_cd)} | override: /adaptive_run force")
     lines.extend([
         SEP,
         f"Baseline live: setups/day={float(base.get('setups_per_day', 0.0) or 0.0):.2f} | WR={float(base.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(base.get('avg_R', 0.0) or 0.0):.3f}",
@@ -16140,6 +16155,13 @@ async def market_adaptive_run_cmd(update: Update, context: ContextTypes.DEFAULT_
     }
     detail = reason_map.get(status, 'no changes were applied this time')
     _hb_touch('market_adaptive', ok=True, details=f'manual_run_{status.lower()}')
+    if status == 'COOLDOWN' and not force:
+        cfg_now = load_strategy_config(force=False)
+        last_rep = _evolution_state_get('market_adaptive_last_report', {}) or {}
+        remaining_cd = _market_adaptive_cooldown_remaining_seconds(cfg_now, last_rep)
+        extra = f" Remaining: {humanize_seconds(remaining_cd)}. Use /adaptive_run force to override." if remaining_cd > 0 else ' Use /adaptive_run force to override.'
+        await update.message.reply_text(f'ℹ️ /adaptive_run did not start a new cycle: {detail}.{extra}')
+        return
     await update.message.reply_text(f'ℹ️ /adaptive_run did not start a new cycle: {detail}.')
 
 
