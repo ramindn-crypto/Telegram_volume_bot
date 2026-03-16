@@ -9200,7 +9200,10 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    live_admin = _admin_report_uses_live_autotrade(int(uid))
+    # Admin/owner should always use the live autotrade/Bybit reporting lane when AutoTrade is live.
+    # Do not require AUTOTRADE_OWNER_UID to be configured for admin reads, because /autotrade_report
+    # already works for admins via the same exchange-backed lane.
+    live_admin = bool(str(AUTOTRADE_MODE).lower() == 'live' and (is_admin_user(uid) or int(uid) == int(AUTOTRADE_OWNER_UID or 0)))
     if live_admin:
         owner = int(AUTOTRADE_OWNER_UID or uid)
         owner_user = get_user(owner) or user or {}
@@ -21120,7 +21123,7 @@ async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return   
     
-    if _admin_report_uses_live_autotrade(int(uid)):
+    if bool(str(AUTOTRADE_MODE).lower() == 'live' and (is_admin_user(uid) or int(uid) == int(AUTOTRADE_OWNER_UID or 0))):
         owner = int(AUTOTRADE_OWNER_UID or uid)
         ts_from = max(0.0, time.time() - 7.0 * 86400.0)
         try:
