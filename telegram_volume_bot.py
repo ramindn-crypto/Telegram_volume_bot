@@ -1625,13 +1625,11 @@ AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY = float(os.environ.get("AUTOTRADE_BE_AFTER_TP
 AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT", "6.0") or 6.0)
 AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY,LON") or "NY,LON").upper().replace(' ', '').split(','))
 AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES", "A,C") or "A,C").upper().replace(' ', '').split(','))
+SCREEN_SYNC_PIPELINE_ENABLED = str(os.environ.get("SCREEN_SYNC_PIPELINE_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
 # Live market-order entries must still stay close to the setup entry. Otherwise the bot can
 # execute a stale emailed setup at a materially worse price just because it is still inside
 # the time window. This guard keeps the email/setup engine and live execution aligned.
 AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "0.50") or 0.50)
-AUTOTRADE_SL_REPAIR_ATTEMPTS = int(os.environ.get("AUTOTRADE_SL_REPAIR_ATTEMPTS", "4") or 4)
-AUTOTRADE_SL_REPAIR_SLEEP_SEC = float(os.environ.get("AUTOTRADE_SL_REPAIR_SLEEP_SEC", "1.2") or 1.2)
-SCREEN_SYNC_TO_PIPELINE = env_bool("SCREEN_SYNC_TO_PIPELINE", False)
 
 # Bybit V5 keys (required for live)
 BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
@@ -2177,40 +2175,9 @@ def _pos_entry(p: dict) -> float:
 
 def _pos_stop(p: dict) -> float:
     try:
-        sl = float(p.get("stopLoss") or 0.0)
-        if sl > 0:
-            return sl
+        return float(p.get("stopLoss") or 0.0)
     except Exception:
-        pass
-    try:
-        sym = _pos_symbol(p)
-        side = _pos_side_text(p)
-        entry = _pos_entry(p)
-        close_side = 'SELL' if side == 'BUY' else 'BUY' if side == 'SELL' else ''
-        candidates = []
-        for o in (_bybit_get_open_tpsl_orders_linear(sym) or []):
-            try:
-                if _bybit_linear_symbol(str(o.get('symbol') or '')) != _bybit_linear_symbol(sym):
-                    continue
-                o_side = str(o.get('side') or '').upper().strip()
-                if close_side and o_side and o_side != close_side:
-                    continue
-                trig = float(o.get('triggerPrice') or o.get('stopLoss') or o.get('price') or 0.0)
-                if trig <= 0:
-                    continue
-                if entry > 0:
-                    if side == 'BUY' and trig >= entry:
-                        continue
-                    if side == 'SELL' and trig <= entry:
-                        continue
-                candidates.append(float(trig))
-            except Exception:
-                continue
-        if candidates:
-            return max(candidates) if side == 'BUY' else min(candidates)
-    except Exception:
-        pass
-    return 0.0
+        return 0.0
 
 def _pos_size(p: dict) -> float:
     try:
@@ -2219,10 +2186,10 @@ def _pos_size(p: dict) -> float:
         return 0.0
 
 def _estimate_position_risk_usd(p: dict) -> float:
-    """Estimate risk using entry vs stopLoss if available; otherwise 0."""
+    """Estimate risk using the live protected stop (position stopLoss or explicit SL stop-order)."""
     try:
         entry = _pos_entry(p)
-        sl = _pos_stop(p)
+        sl = _pos_effective_stop(p)
         size = abs(_pos_size(p))
         if entry <= 0 or sl <= 0 or size <= 0:
             return 0.0
@@ -2372,6 +2339,163 @@ def _bybit_has_open_tp_order_at(symbol: str, tp_price: float, side: str | None =
     return _bybit_has_matching_reduce_only_limit_tp(sym, close_side, float(tp_price or 0.0))
 
 
+def _bybit_get_open_stop_orders_linear(symbol: str | None = None) -> list[dict]:
+    try:
+        if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+            return []
+        payload = {'category': 'linear', 'openOnly': 0, 'limit': 200, 'orderFilter': 'StopOrder'}
+        if symbol:
+            payload['symbol'] = _bybit_linear_symbol(symbol)
+        res = _bybit_v5_request('GET', '/v5/order/realtime', payload)
+        if int((res or {}).get('retCode', -1)) != 0:
+            return []
+        return (((res or {}).get('result') or {}).get('list') or [])
+    except Exception:
+        return []
+
+
+def _bybit_stop_trigger_price(order: dict) -> float:
+    try:
+        for key in ('triggerPrice', 'trigger_price', 'stopLoss', 'stop_loss', 'price'):
+            val = float(order.get(key) or 0.0)
+            if val > 0:
+                return val
+    except Exception:
+        pass
+    return 0.0
+
+
+def _bybit_is_reduce_only_stop_sl_order(order: dict, symbol: str | None = None, side: str | None = None) -> bool:
+    try:
+        if not order:
+            return False
+        if symbol and _bybit_linear_symbol(str(order.get('symbol') or '')) != _bybit_linear_symbol(symbol):
+            return False
+        status = str(order.get('orderStatus') or '').upper().strip()
+        if status in {'FILLED', 'CANCELLED', 'REJECTED', 'DEACTIVATED'}:
+            return False
+        if not _bybit_order_reduce_only(order):
+            return False
+        if str(order.get('closeOnTrigger') or '').strip().lower() not in {'true', '1', 'yes', 'y'} and order.get('closeOnTrigger') is not True:
+            return False
+        if _bybit_stop_trigger_price(order) <= 0:
+            return False
+        if side:
+            side_u = str(side or '').upper().strip()
+            close_side = 'SELL' if side_u == 'BUY' else ('BUY' if side_u == 'SELL' else '')
+            if close_side and str(order.get('side') or '').upper().strip() != close_side:
+                return False
+        stop_typ = str(order.get('stopOrderType') or '').upper().strip()
+        if stop_typ in {'TAKE_PROFIT', 'TP'}:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _bybit_find_open_sl_order(symbol: str, side: str | None = None) -> dict | None:
+    sym = _bybit_linear_symbol(symbol)
+    best = None
+    best_ts = -1.0
+    for o in _bybit_get_open_stop_orders_linear(sym):
+        try:
+            if not _bybit_is_reduce_only_stop_sl_order(o, symbol=sym, side=side):
+                continue
+            ts = _ts_seconds_from_any(o.get('updatedTime') or o.get('createdTime') or 0.0)
+            if ts >= best_ts:
+                best = o
+                best_ts = ts
+        except Exception:
+            continue
+    return best
+
+
+def _bybit_has_open_sl_order_at(symbol: str, sl_price: float, side: str | None = None) -> bool:
+    try:
+        order = _bybit_find_open_sl_order(symbol, side=side)
+        if not order:
+            return False
+        px = _bybit_stop_trigger_price(order)
+        return _price_close_enough(px, float(sl_price or 0.0), rel_tol=0.0010)
+    except Exception:
+        return False
+
+
+def _autotrade_cancel_reduce_only_sl_orders(symbol: str, side: str | None = None) -> int:
+    count = 0
+    sym = _bybit_linear_symbol(symbol)
+    for o in _bybit_get_open_stop_orders_linear(sym):
+        try:
+            if not _bybit_is_reduce_only_stop_sl_order(o, symbol=sym, side=side):
+                continue
+            oid = str(o.get('orderId') or '')
+            if not oid:
+                continue
+            res = _bybit_v5_request('POST', '/v5/order/cancel', {'category': 'linear', 'symbol': sym, 'orderId': oid})
+            if int((res or {}).get('retCode', -1)) == 0:
+                count += 1
+        except Exception:
+            continue
+    return count
+
+
+def _autotrade_place_reduce_only_sl_order(symbol: str, side: str, sl_price: float, qty: float) -> dict:
+    try:
+        sym = _bybit_linear_symbol(symbol)
+        side_u = str(side or '').upper().strip()
+        if side_u not in {'BUY', 'SELL'}:
+            return {'ok': False, 'retMsg': 'bad_side'}
+        sl_trigger = _round_price_to_tick(sym, float(sl_price or 0.0), rounding=(ROUND_DOWN if side_u == 'BUY' else ROUND_UP))
+        if sl_trigger <= 0:
+            sl_trigger = float(sl_price or 0.0)
+        filt = _bybit_get_instr_filters(sym)
+        qty_step = filt.get('qtyStep')
+        qty_i, qreason = _round_qty_down(sym, float(qty or 0.0), float(sl_trigger or 0.0))
+        if not qty_i or qty_i <= 0:
+            return {'ok': False, 'retMsg': str(qreason or 'qty_invalid')}
+        close_side = 'Sell' if side_u == 'BUY' else 'Buy'
+        trigger_direction = 2 if side_u == 'BUY' else 1
+        payload = {
+            'category': 'linear',
+            'symbol': sym,
+            'side': close_side,
+            'orderType': 'Market',
+            'qty': _fmt_qty(qty_i, qty_step),
+            'triggerPrice': str(float(sl_trigger)),
+            'triggerDirection': int(trigger_direction),
+            'triggerBy': 'MarkPrice',
+            'reduceOnly': True,
+            'closeOnTrigger': True,
+            'positionIdx': 0,
+        }
+        res = _bybit_v5_request('POST', '/v5/order/create', payload)
+        return {
+            'ok': int((res or {}).get('retCode', -1)) == 0,
+            'retCode': (res or {}).get('retCode'),
+            'retMsg': (res or {}).get('retMsg'),
+            'payload': payload,
+            'response': res,
+        }
+    except Exception as e:
+        return {'ok': False, 'retMsg': f'{type(e).__name__}: {e}'}
+
+
+def _pos_effective_stop(p: dict) -> float:
+    try:
+        sl = _pos_stop(p)
+        if sl > 0:
+            return sl
+    except Exception:
+        pass
+    try:
+        order = _bybit_find_open_sl_order(_pos_symbol(p), side=_pos_side_text(p))
+        if order:
+            return float(_bybit_stop_trigger_price(order) or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+
 def _autotrade_place_reduce_only_tp_orders(symbol: str, side: str, tp_targets: list[float], base_qty: float, tp1_fraction: float | None = None) -> list[dict]:
     """Place visible TP orders as explicit reduce-only limit orders.
 
@@ -2473,7 +2597,7 @@ def _autotrade_cancel_reduce_only_tp_orders(symbol: str) -> int:
     return count
 
 
-def _autotrade_apply_position_tp_sl(symbol: str, stop_loss: float, take_profit: float, side: str | None = None, confirm: bool = False) -> dict:
+def _autotrade_apply_position_tp_sl(symbol: str, stop_loss: float, take_profit: float) -> dict:
     payload = {
         'category': 'linear',
         'symbol': _bybit_linear_symbol(symbol),
@@ -2483,30 +2607,20 @@ def _autotrade_apply_position_tp_sl(symbol: str, stop_loss: float, take_profit: 
     }
     if float(take_profit or 0.0) > 0:
         payload['takeProfit'] = str(float(take_profit))
-    res = _bybit_v5_request('POST', '/v5/position/trading-stop', payload)
-    if bool(confirm) and float(stop_loss or 0.0) > 0 and str(side or '').upper().strip() in {'BUY', 'SELL'}:
-        try:
-            confirm_state = {'ok': False}
-            total_attempts = max(1, int(AUTOTRADE_SL_REPAIR_ATTEMPTS or 1))
-            for _ in range(total_attempts):
-                confirm_state = _autotrade_wait_for_stop_loss(symbol, side, float(stop_loss or 0.0), attempts=1, sleep_sec=0.15)
-                if bool((confirm_state or {}).get('ok')):
-                    break
-                try:
-                    time.sleep(max(0.15, float(AUTOTRADE_SL_REPAIR_SLEEP_SEC or 0.5)))
-                except Exception:
-                    pass
-                res = _bybit_v5_request('POST', '/v5/position/trading-stop', payload)
-            if not isinstance(res, dict):
-                res = {'result': res}
-            res['_sl_confirm'] = dict(confirm_state or {})
-        except Exception:
-            pass
-    return res
+    return _bybit_v5_request('POST', '/v5/position/trading-stop', payload)
 
 
 def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: dict | None = None) -> dict:
-    result = {'checked': False, 'sl_fixed': False, 'tp_fixed': False, 'tp1_order_fixed': False, 'be_applied': False, 'symbol': '', 'side': ''}
+    result = {
+        'checked': False,
+        'sl_fixed': False,
+        'sl_order_fixed': False,
+        'tp_fixed': False,
+        'tp1_order_fixed': False,
+        'be_applied': False,
+        'symbol': '',
+        'side': '',
+    }
     try:
         if str(AUTOTRADE_MODE).lower() != 'live':
             return result
@@ -2522,12 +2636,12 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         if not pos:
             return result
         result['checked'] = True
+
         plan = _autotrade_live_exit_plan_for_trade(trade_row)
         partial_tp = float(plan.get('partial_tp') or 0.0)
-        final_tp = float(plan.get('final_tp') or 0.0)
         entry = float(_pos_entry(pos) or trade_row.get('entry') or 0.0)
-        current_sl = float(_pos_stop(pos) or 0.0)
         target_sl = float(trade_row.get('sl') or 0.0)
+        current_sl = float(_pos_effective_stop(pos) or 0.0)
         initial_qty = abs(float(trade_row.get('qty') or 0.0))
         live_qty = abs(float(_pos_size(pos) or 0.0))
         conf = int(float(trade_row.get('conf') or 0) or 0)
@@ -2538,7 +2652,7 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
 
         tp1_hit = False
         be_allowed = False
-        if AUTOTRADE_BE_AFTER_TP1_ENABLED and entry > 0 and final_tp > 0 and initial_qty > 0 and live_qty > 0:
+        if AUTOTRADE_BE_AFTER_TP1_ENABLED and entry > 0 and initial_qty > 0 and live_qty > 0:
             partial_fraction = float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION)
             qty_drop_threshold = max(initial_qty * 0.45, initial_qty * (1.0 - partial_fraction + 0.08))
             qty_reduced = live_qty < max(initial_qty * 0.98, initial_qty - max(1e-9, initial_qty * 0.02))
@@ -2557,11 +2671,23 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
             )
 
         desired_sl = float(entry) if (tp1_hit and be_allowed and entry > 0) else float(target_sl)
-        if desired_sl > 0 and (current_sl <= 0 or not _price_close_enough(current_sl, desired_sl)):
-            _autotrade_apply_position_tp_sl(sym, desired_sl, 0.0, side=side, confirm=True)
-            result['sl_fixed'] = True
-            if tp1_hit and be_allowed:
-                result['be_applied'] = True
+        if desired_sl > 0:
+            # Best-effort position-level SL (helps Bybit show TP/SL on the position itself).
+            if current_sl <= 0 or not _price_close_enough(current_sl, desired_sl):
+                res = _autotrade_apply_position_tp_sl(sym, desired_sl, 0.0)
+                if int((res or {}).get('retCode', -1)) == 0:
+                    result['sl_fixed'] = True
+                if tp1_hit and be_allowed:
+                    result['be_applied'] = True
+            # Visible protective SL stop-order (authoritative for chart / orders / risk fallback).
+            sl_order_ok = _bybit_has_open_sl_order_at(sym, desired_sl, side=side)
+            if not sl_order_ok and live_qty > 0:
+                _autotrade_cancel_reduce_only_sl_orders(sym, side=side)
+                sl_res = _autotrade_place_reduce_only_sl_order(sym, side, desired_sl, live_qty)
+                result['sl_order_fixed'] = bool(sl_res.get('ok'))
+                sl_order_ok = _bybit_has_open_sl_order_at(sym, desired_sl, side=side)
+            if not result['sl_fixed'] and sl_order_ok:
+                result['sl_fixed'] = True
 
         if tp1_hit:
             desired_targets = _dedupe_price_targets([
@@ -2592,6 +2718,57 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         return result
     except Exception:
         return result
+
+
+def _autotrade_ensure_live_exit_protection(uid: int, trade_row: dict, live_pos: dict | None = None, passes: int = 4, sleep_sec: float = 1.25) -> dict:
+    merged = {
+        'checked': False,
+        'sl_fixed': False,
+        'sl_order_fixed': False,
+        'tp_fixed': False,
+        'tp1_order_fixed': False,
+        'be_applied': False,
+        'symbol': str((trade_row or {}).get('symbol') or ''),
+        'side': str((trade_row or {}).get('side') or ''),
+        'passes': 0,
+    }
+    try:
+        passes_i = max(1, int(passes or 1))
+    except Exception:
+        passes_i = 1
+    for i in range(passes_i):
+        pos = live_pos if i == 0 and live_pos is not None else _autotrade_find_live_position(str((trade_row or {}).get('symbol') or ''), side=str((trade_row or {}).get('side') or ''))
+        rr = _autotrade_repair_live_exit_protection(uid, trade_row, live_pos=pos)
+        for k, v in (rr or {}).items():
+            if isinstance(v, bool):
+                merged[k] = bool(merged.get(k)) or bool(v)
+            elif v not in (None, ''):
+                merged[k] = v
+        merged['passes'] = i + 1
+        try:
+            desired_sl = float((trade_row or {}).get('sl') or 0.0)
+            if bool(merged.get('be_applied')) and pos:
+                desired_sl = float(_pos_entry(pos) or desired_sl or 0.0)
+            sl_ok = False
+            if desired_sl > 0 and pos:
+                live_sl = float(_pos_effective_stop(pos) or 0.0)
+                sl_ok = bool(_price_close_enough(live_sl, desired_sl) or _bybit_has_open_sl_order_at(str((trade_row or {}).get('symbol') or ''), desired_sl, side=str((trade_row or {}).get('side') or '')))
+            desired_targets = []
+            if bool(merged.get('be_applied')):
+                desired_targets = _dedupe_price_targets([float((trade_row or {}).get('tp2') or 0.0), float((trade_row or {}).get('tp3') or 0.0)])
+            else:
+                desired_targets = _dedupe_price_targets([float((trade_row or {}).get('tp1') or 0.0), float((trade_row or {}).get('tp2') or 0.0), float((trade_row or {}).get('tp3') or 0.0)])
+            tp_ok = True if not desired_targets else all(_bybit_has_open_tp_order_at(str((trade_row or {}).get('symbol') or ''), px, side=str((trade_row or {}).get('side') or '')) for px in desired_targets)
+            if sl_ok and tp_ok:
+                break
+        except Exception:
+            pass
+        if i < passes_i - 1:
+            try:
+                time.sleep(max(0.15, float(sleep_sec or 0.0)))
+            except Exception:
+                pass
+    return merged
 
 def _ts_seconds_from_any(value) -> float:
     try:
@@ -3695,6 +3872,17 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
             positions = _bybit_get_open_positions_linear()
         except Exception:
             positions = []
+        try:
+            if positions and journal_open:
+                live_map_for_repair = {(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper()): p for p in positions}
+                for tr in journal_open:
+                    p = live_map_for_repair.get((str(tr.get('symbol') or '').upper(), str(tr.get('side') or '').upper()))
+                    if not p:
+                        continue
+                    _autotrade_ensure_live_exit_protection(int(uid), tr, live_pos=p, passes=2, sleep_sec=0.5)
+                positions = _bybit_get_open_positions_linear() or positions
+        except Exception:
+            pass
         open_positions_now = len(positions)
         open_pnl = float(sum(_pos_unreal_pnl(p) for p in positions) or 0.0) if positions else 0.0
 
@@ -4269,91 +4457,6 @@ def _bybit_get_open_orders_linear(symbol: str | None = None) -> list[dict]:
         return (((res or {}).get('result') or {}).get('list') or [])
     except Exception:
         return []
-
-
-def _bybit_get_open_tpsl_orders_linear(symbol: str | None = None) -> list[dict]:
-    """Fetch open TP/SL and stop orders for a linear symbol.
-
-    Bybit may surface position-level TP/SL protection in the TP/SL order lane rather than
-    the plain open-order lane, so we query both relevant orderFilter buckets and merge them.
-    """
-    try:
-        if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-            return []
-        merged = []
-        seen = set()
-        for order_filter in ('BidirectionalTpslOrder', 'StopOrder'):
-            payload = {'category': 'linear', 'openOnly': 0, 'limit': 200, 'orderFilter': order_filter}
-            if symbol:
-                payload['symbol'] = _bybit_linear_symbol(symbol)
-            res = _bybit_v5_request('GET', '/v5/order/realtime', payload)
-            if int((res or {}).get('retCode', -1)) != 0:
-                continue
-            for item in ((((res or {}).get('result') or {}).get('list') or [])):
-                try:
-                    oid = str(item.get('orderId') or '')
-                    if oid and oid in seen:
-                        continue
-                    if oid:
-                        seen.add(oid)
-                    merged.append(item)
-                except Exception:
-                    continue
-        return merged
-    except Exception:
-        return []
-
-
-def _bybit_has_matching_stop_loss_order(symbol: str, side: str, stop_price: float) -> bool:
-    try:
-        sym = _bybit_linear_symbol(symbol)
-        side_u = str(side or '').upper().strip()
-        close_side = 'SELL' if side_u == 'BUY' else 'BUY' if side_u == 'SELL' else ''
-        for o in (_bybit_get_open_tpsl_orders_linear(sym) or []):
-            try:
-                if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
-                    continue
-                o_side = str(o.get('side') or '').upper().strip()
-                if close_side and o_side and o_side != close_side:
-                    continue
-                status = str(o.get('orderStatus') or '').upper().strip()
-                if status in {'FILLED', 'CANCELLED', 'REJECTED', 'DEACTIVATED'}:
-                    continue
-                trig = float(o.get('triggerPrice') or o.get('stopLoss') or o.get('price') or 0.0)
-                if trig > 0 and _price_close_enough(trig, float(stop_price or 0.0), rel_tol=0.0010):
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return False
-
-
-def _autotrade_wait_for_stop_loss(symbol: str, side: str | None, desired_stop: float, attempts: int | None = None, sleep_sec: float | None = None) -> dict:
-    attempts = max(1, int(attempts or AUTOTRADE_SL_REPAIR_ATTEMPTS or 1))
-    sleep_sec = max(0.15, float(sleep_sec or AUTOTRADE_SL_REPAIR_SLEEP_SEC or 0.5))
-    sym = _bybit_linear_symbol(symbol)
-    side_u = str(side or '').upper().strip()
-    want = float(desired_stop or 0.0)
-    out = {'ok': False, 'attempts': 0, 'confirmed_via': '', 'observed_stop': 0.0}
-    if want <= 0 or side_u not in {'BUY', 'SELL'}:
-        return out
-    for i in range(1, attempts + 1):
-        out['attempts'] = i
-        pos = _autotrade_find_live_position(sym, side=side_u)
-        live_sl = float(_pos_stop(pos) or 0.0) if pos else 0.0
-        if live_sl > 0 and _price_close_enough(live_sl, want, rel_tol=0.0010):
-            out.update({'ok': True, 'confirmed_via': 'position', 'observed_stop': float(live_sl)})
-            return out
-        if _bybit_has_matching_stop_loss_order(sym, side_u, want):
-            out.update({'ok': True, 'confirmed_via': 'tpsl_order', 'observed_stop': float(want)})
-            return out
-        if i < attempts:
-            try:
-                time.sleep(sleep_sec)
-            except Exception:
-                pass
-    return out
 
 
 def _autotrade_has_live_open_order(symbol: str, side: str | None = None) -> bool:
@@ -5182,16 +5285,15 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         live_partial_tp = float(exit_plan.get('effective_tp1') or 0.0)
         live_tp2 = float(exit_plan.get('effective_tp2') or 0.0)
         live_tp3 = float(exit_plan.get('effective_tp3') or 0.0)
-        sl_apply_res = _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0, side=side, confirm=True)
+        _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                'sl_apply': sl_apply_res,
                 'position_opened_time': datetime.now(timezone.utc).isoformat(timespec='seconds'),
                 'live_exit_tp1': float(live_partial_tp),
                 'live_exit_tp2': float(live_tp2),
                 'live_exit_tp3': float(live_tp3),
                 'live_final_tp': float(exit_plan.get('final_tp') or live_tp2 or live_tp3 or 0.0),
-                'live_tp_design': 'reduce_only_limit_tp_orders + full_sl',
+                'live_tp_design': 'reduce_only_limit_tp_orders + visible_reduce_only_sl',
             })
         except Exception:
             pass
@@ -5246,7 +5348,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         tp_order_results = _autotrade_place_reduce_only_tp_orders(sym, side, tp_targets_live, tp_base_qty, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
         tp_success_count = sum(1 for x in (tp_order_results or []) if bool(x.get('ok')) )
 
-        repair_res = _autotrade_repair_live_exit_protection(uid, {
+        repair_res = _autotrade_ensure_live_exit_protection(uid, {
             'symbol': sym,
             'side': side,
             'entry': float(_pos_entry(final_pos) or price_ref) if final_pos else float(price_ref),
@@ -5260,7 +5362,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'atr_pct': float(getattr(s, 'atr_pct', 0.0) or 0.0),
             'engine': str(getattr(s, 'engine', '') or ''),
             'session': str(session_label or ''),
-        }, live_pos=final_pos)
+        }, live_pos=final_pos, passes=4, sleep_sec=1.25)
 
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
@@ -23397,18 +23499,14 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     return body, kb, list(setups or [])
 
 async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, scan_session: str, best_fut: dict, shown_setups: list["Setup"]):
-    """Immediately sync manual /screen top setups into the email -> autotrade lane.
+    """Optionally sync manual /screen top setups into the email -> autotrade lane.
 
-    This keeps manual scans aligned with the live pipeline instead of waiting for the
-    background email job to rediscover the same setup later.
-
-    IMPORTANT:
-    Manual /screen sync must honor the same email-session caps, daily caps, email gap,
-    cooldowns, and executable qualification rules as the background email pipeline.
+    Default is OFF. Manual /screen should stay a read-only scan unless the operator
+    explicitly enables this behavior through SCREEN_SYNC_PIPELINE_ENABLED.
     """
     try:
-        if not bool(SCREEN_SYNC_TO_PIPELINE):
-            return {"status": "skip", "reason": "screen_sync_disabled_manual_display_only"}
+        if not SCREEN_SYNC_PIPELINE_ENABLED:
+            return {"status": "skip", "reason": "screen_sync_disabled"}
         if not shown_setups:
             return {"status": "skip", "reason": "no_shown_setups"}
         live_session = str(live_session or '').upper().strip()
@@ -23696,7 +23794,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sync_reason = str(sync_info.get("reason") or "").strip()
             if sync_status == 'sent':
                 msg += f"\n\n✅ Sync: `{sync_reason}`"
-            elif sync_status in {'skip', 'error'} and sync_reason and sync_reason != 'screen_sync_disabled_manual_display_only':
+            elif sync_status in {'skip', 'error'} and sync_reason:
                 msg += f"\n\nℹ️ Sync: `{sync_reason}`"
         keyboard = [
             [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
@@ -26036,8 +26134,8 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     p = live_map.get(key)
                     if not p:
                         continue
-                    rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
-                    if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
+                    rr = _autotrade_ensure_live_exit_protection(int(uid), tr, live_pos=p, passes=2, sleep_sec=0.75)
+                    if any(bool(rr.get(k)) for k in ('sl_fixed', 'sl_order_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
                         repaired.append(rr)
                 if repaired:
                     _LAST_AUTOTRADE_DECISION[uid] = {
