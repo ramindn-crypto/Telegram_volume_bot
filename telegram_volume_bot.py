@@ -9125,6 +9125,69 @@ def _expectancy_r(trades: List[dict]) -> Optional[float]:
     rs = [float(t["r_mult"]) for t in closed if t.get("r_mult") is not None]
     return (sum(rs) / len(rs)) if rs else None
 
+
+def _admin_report_uses_live_autotrade(uid: int) -> bool:
+    try:
+        owner = int(AUTOTRADE_OWNER_UID or 0)
+    except Exception:
+        owner = 0
+    return bool(str(AUTOTRADE_MODE).lower() == 'live' and owner > 0 and (int(uid) == owner or is_admin_user(uid)))
+
+
+def _report_closed_activity_stats(rows: List[dict]) -> dict:
+    closed = []
+    for r in (rows or []):
+        try:
+            ts = float((r or {}).get('closed_ts') or 0.0)
+            if ts <= 0:
+                continue
+            pnl = (r or {}).get('pnl')
+            if pnl is None:
+                pnl = (r or {}).get('pnl_usdt')
+            if pnl is None:
+                continue
+            closed.append({'closed_ts': ts, 'pnl': float(pnl)})
+        except Exception:
+            continue
+    wins = [t for t in closed if float(t['pnl']) > 0]
+    losses = [t for t in closed if float(t['pnl']) < 0]
+    net = sum(float(t['pnl']) for t in closed) if closed else 0.0
+    denom = len(wins) + len(losses)
+    win_rate = (len(wins) / denom * 100.0) if denom else 0.0
+    biggest_loss = min((float(t['pnl']) for t in closed), default=0.0)
+    biggest_win = max((float(t['pnl']) for t in closed), default=0.0)
+    return {
+        'closed_n': len(closed),
+        'wins': len(wins),
+        'losses': len(losses),
+        'net': float(net),
+        'win_rate': float(win_rate),
+        'avg_r': None,
+        'biggest_loss': float(biggest_loss),
+        'biggest_win': float(biggest_win),
+    }
+
+
+def _report_closed_activity_profit_factor(rows: List[dict]) -> Optional[float]:
+    pnls = []
+    for r in (rows or []):
+        try:
+            pnl = (r or {}).get('pnl')
+            if pnl is None:
+                pnl = (r or {}).get('pnl_usdt')
+            if pnl is None:
+                continue
+            pnls.append(float(pnl))
+        except Exception:
+            continue
+    if not pnls:
+        return None
+    gp = sum(v for v in pnls if v > 0)
+    gl = abs(sum(v for v in pnls if v < 0))
+    if gl <= 0:
+        return None if gp <= 0 else float('inf')
+    return gp / gl
+
 async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid)
@@ -9137,11 +9200,23 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    trades = db_trades_all(uid)
-    stats = _stats_from_trades(trades)
-
-    pf = _profit_factor(trades)
-    exp_r = _expectancy_r(trades)
+    live_admin = _admin_report_uses_live_autotrade(int(uid))
+    if live_admin:
+        owner = int(AUTOTRADE_OWNER_UID or uid)
+        owner_user = get_user(owner) or user or {}
+        days = int(max(7, _autotrade_history_days_available(int(owner))))
+        start_ts = max(0.0, time.time() - float(days) * 86400.0)
+        rows = _autotrade_closed_activity_rows_window(int(owner), float(start_ts), float(time.time()) + 60.0) or []
+        stats = _report_closed_activity_stats(rows)
+        pf = _report_closed_activity_profit_factor(rows)
+        exp_r = None
+        equity_now = _effective_equity_for_risk(owner_user, prefer_live=True)
+    else:
+        trades = db_trades_all(uid)
+        stats = _stats_from_trades(trades)
+        pf = _profit_factor(trades)
+        exp_r = _expectancy_r(trades)
+        equity_now = float(user['equity'])
 
     msg = [
         "📊 Overall Report (ALL TIME)",
@@ -9154,10 +9229,11 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Profit Factor: {pf:.2f}" if (pf is not None and pf != float('inf')) else ("Profit Factor: ∞" if pf == float('inf') else "Profit Factor: -"),
         f"Best: {stats['biggest_win']:+.2f} | Worst: {stats['biggest_loss']:+.2f}",
         HDR,
-        f"Equity (current): ${float(user['equity']):.2f}",
+        f"Equity (current): ${float(equity_now or 0.0):.2f}",
     ]
 
     await update.message.reply_text("\n".join(msg))
+
 
 # =========================================================
 # EXCHANGE HELPERS (FAST: singleton exchange + no repeated load_markets)
@@ -21020,14 +21096,18 @@ async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return   
     
-    tz = ZoneInfo(user["tz"])
-    now = datetime.now(tz)
-    start_dt = now - timedelta(days=7)
-    ts_from = start_dt.timestamp()
-
-    trades = db_trades_since(uid, ts_from)
-    stats = _stats_from_trades(trades)
-    adv = _advice(user, stats)
+    if _admin_report_uses_live_autotrade(int(uid)):
+        owner = int(AUTOTRADE_OWNER_UID or uid)
+        ts_from = max(0.0, time.time() - 7.0 * 86400.0)
+        rows = _autotrade_closed_activity_rows_window(int(owner), float(ts_from), float(time.time()) + 60.0) or []
+        stats = _report_closed_activity_stats(rows)
+    else:
+        tz = ZoneInfo(user["tz"])
+        now = datetime.now(tz)
+        start_dt = now - timedelta(days=7)
+        ts_from = start_dt.timestamp()
+        trades = db_trades_since(uid, ts_from)
+        stats = _stats_from_trades(trades)
 
     msg = [
         "📊 Weekly Report (last 7 days)",
