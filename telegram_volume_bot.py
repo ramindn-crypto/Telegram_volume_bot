@@ -20176,7 +20176,7 @@ async def sessions_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sessions_on_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     update_user(uid, sessions_unlimited=1)
-    await update.message.reply_text("✅ Sessions: UNLIMITED (24h emailing enabled).")
+    await update.message.reply_text("✅ Sessions: UNLIMITED (24h emailing + autotrade access enabled).")
 
 async def sessions_off_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -26148,7 +26148,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     "managed_live_repair": int(repair_summary.get('repaired') or 0),
                 }
                 return
-            if not _autotrade_allowed_session(sess):
+            if (not owner_unlimited) and (not _autotrade_allowed_session(sess)):
                 _LAST_AUTOTRADE_DECISION[uid] = {
                     "status": "SKIP",
                     "when": now_utc.isoformat(timespec="seconds"),
@@ -26158,8 +26158,10 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # Optional: respect user's trade window (if configured) for NEW entries only.
+            # Sessions UNLIMITED means 24h new-entry access too, so reuse the same helper
+            # that already returns True when sessions_unlimited=1.
             try:
-                if not trade_window_allows_now(user):
+                if not in_trade_window_now(user):
                     _LAST_AUTOTRADE_DECISION[uid] = {
                         "status": "SKIP",
                         "when": now_utc.isoformat(timespec="seconds"),
