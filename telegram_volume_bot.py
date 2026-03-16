@@ -898,6 +898,7 @@ DEFAULT_TYPE = "swap"  # bybit futures
 DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
 
 CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "1"))
+MANUAL_SCREEN_SYNC_ENABLED = str(os.environ.get("MANUAL_SCREEN_SYNC_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 # -------------------------
 # LOGGING: redact secrets + quiet noisy libs (Render-safe)
@@ -2174,20 +2175,9 @@ def _pos_entry(p: dict) -> float:
 
 def _pos_stop(p: dict) -> float:
     try:
-        sl = float(p.get("stopLoss") or 0.0)
-        if sl > 0:
-            return sl
+        return float(p.get("stopLoss") or 0.0)
     except Exception:
-        pass
-    try:
-        sym = _pos_symbol(p)
-        side = _pos_side_text(p)
-        sl2 = float(_bybit_live_stop_order_price(sym, side) or 0.0)
-        if sl2 > 0:
-            return sl2
-    except Exception:
-        pass
-    return 0.0
+        return 0.0
 
 def _pos_size(p: dict) -> float:
     try:
@@ -2515,11 +2505,10 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
             )
 
         desired_sl = float(entry) if (tp1_hit and be_allowed and entry > 0) else float(target_sl)
-        if desired_sl > 0 and live_qty > 0 and (current_sl <= 0 or not _price_close_enough(current_sl, desired_sl)):
-            sl_res = _autotrade_apply_live_sl(sym, side, desired_sl, live_qty)
-            result['sl_fixed'] = bool((sl_res or {}).get('ok'))
-            result['sl_mode'] = str((sl_res or {}).get('mode') or '')
-            if tp1_hit and be_allowed and result['sl_fixed']:
+        if desired_sl > 0 and (current_sl <= 0 or not _price_close_enough(current_sl, desired_sl)):
+            _autotrade_apply_position_tp_sl(sym, desired_sl, 0.0)
+            result['sl_fixed'] = True
+            if tp1_hit and be_allowed:
                 result['be_applied'] = True
 
         if tp1_hit:
@@ -2551,6 +2540,248 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         return result
     except Exception:
         return result
+
+def _autotrade_row_matches_live_position(trade_row: dict, live_pos: dict, entry_tol: float = 0.08, qty_tol: float = 0.60) -> bool:
+    try:
+        sym = _pos_symbol(live_pos)
+        side = _pos_side_text(live_pos)
+        if str(trade_row.get('symbol') or '').upper() != str(sym).upper():
+            return False
+        if str(trade_row.get('side') or '').upper() != str(side).upper():
+            return False
+        live_entry = float(_pos_entry(live_pos) or 0.0)
+        row_entry = float(trade_row.get('entry') or 0.0)
+        live_qty = abs(float(_pos_size(live_pos) or 0.0))
+        row_qty = abs(float(trade_row.get('qty') or 0.0))
+        entry_rel = abs(live_entry - row_entry) / max(abs(live_entry), abs(row_entry), 1e-9) if live_entry > 0 and row_entry > 0 else 999.0
+        qty_rel = abs(live_qty - row_qty) / max(live_qty, row_qty, 1e-9) if live_qty > 0 and row_qty > 0 else 999.0
+        return bool(entry_rel <= float(entry_tol) or qty_rel <= float(qty_tol))
+    except Exception:
+        return False
+
+
+def _autotrade_trade_row_from_live_and_source(live_pos: dict, source_row: dict, source_name: str, note: str = '') -> dict:
+    live_entry = float(_pos_entry(live_pos) or source_row.get('entry') or 0.0)
+    live_qty = abs(float(_pos_size(live_pos) or source_row.get('qty') or 0.0))
+    out = {
+        'symbol': _pos_symbol(live_pos),
+        'side': _pos_side_text(live_pos),
+        'entry': float(live_entry or 0.0),
+        'sl': float(source_row.get('sl') or 0.0),
+        'tp1': float(source_row.get('tp1') or 0.0),
+        'tp2': float(source_row.get('tp2') or 0.0),
+        'tp3': float(source_row.get('tp3') or 0.0),
+        'qty': float(live_qty or 0.0),
+        'conf': int(float(source_row.get('conf') or 0) or 0),
+        'quality_score': float(source_row.get('quality_score') or 0.0),
+        'atr_pct': float(source_row.get('atr_pct') or 0.0),
+        'engine': str(source_row.get('engine') or ''),
+        'session': str(source_row.get('session') or ''),
+        'setup_id': str(source_row.get('setup_id') or ''),
+        '_mgmt_source': str(source_name or ''),
+        '_mgmt_note': str(note or ''),
+    }
+    try:
+        t1, t2, t3 = _ensure_three_tps(float(out.get('entry') or 0.0), float(out.get('sl') or 0.0), float(out.get('tp3') or 0.0), out.get('tp1'), out.get('tp2'), out.get('side'))
+        out['tp1'] = float(t1 or 0.0)
+        out['tp2'] = float(t2 or 0.0)
+        out['tp3'] = float(t3 or 0.0)
+    except Exception:
+        pass
+    return out
+
+
+def _autotrade_guess_management_source(uid: int, live_pos: dict, journal_open: list[dict] | None = None) -> dict | None:
+    sym = _pos_symbol(live_pos)
+    side = _pos_side_text(live_pos)
+    live_entry = float(_pos_entry(live_pos) or 0.0)
+    live_qty = abs(float(_pos_size(live_pos) or 0.0))
+
+    def _entry_rel(a: float, b: float) -> float:
+        try:
+            a = float(a or 0.0)
+            b = float(b or 0.0)
+            if a <= 0 or b <= 0:
+                return 999.0
+            return abs(a - b) / max(abs(a), abs(b), 1e-9)
+        except Exception:
+            return 999.0
+
+    def _qty_rel(a: float, b: float) -> float:
+        try:
+            a = abs(float(a or 0.0))
+            b = abs(float(b or 0.0))
+            if a <= 0 or b <= 0:
+                return 999.0
+            return abs(a - b) / max(a, b, 1e-9)
+        except Exception:
+            return 999.0
+
+    def _sl_ok(entry_v: float, sl_v: float) -> bool:
+        try:
+            entry_v = float(entry_v or 0.0)
+            sl_v = float(sl_v or 0.0)
+            if entry_v <= 0 or sl_v <= 0:
+                return False
+            return sl_v < entry_v if side == 'BUY' else sl_v > entry_v
+        except Exception:
+            return False
+
+    candidates = []
+
+    def _push(source_rank: int, source_name: str, row: dict, stage_ts: float = 0.0, note: str = ''):
+        try:
+            row = dict(row or {})
+            row_entry = float(row.get('entry') or 0.0)
+            row_sl = float(row.get('sl') or 0.0)
+            if not _sl_ok(row_entry or live_entry, row_sl):
+                return
+            rel_e = _entry_rel(row_entry or live_entry, live_entry)
+            rel_q = _qty_rel(float(row.get('qty') or 0.0), live_qty)
+            if rel_e > 0.08 and rel_q > 0.70:
+                return
+            candidates.append((int(source_rank), float(rel_e), float(rel_q), -float(stage_ts or 0.0), source_name, row, note))
+        except Exception:
+            return
+
+    for t in (journal_open or []):
+        try:
+            if not _autotrade_row_matches_live_position(t, live_pos, entry_tol=0.08, qty_tol=0.70):
+                continue
+            _push(0, 'autotrade_journal_open', t, float(t.get('opened_ts') or 0.0), note='journal_open_match')
+        except Exception:
+            continue
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT *
+                FROM autotrade_trades
+                WHERE uid=? AND UPPER(symbol)=? AND UPPER(side)=? AND COALESCE(sl,0) > 0
+                ORDER BY CASE WHEN status='OPEN' THEN 0 ELSE 1 END, opened_ts DESC
+                LIMIT 40
+                """,
+                (int(uid), str(sym).upper(), str(side).upper()),
+            )
+            for row in (cur.fetchall() or []):
+                row_d = dict(row)
+                _push(1, 'autotrade_journal_history', row_d, float(row_d.get('opened_ts') or 0.0), note=str(row_d.get('status') or '').lower() or 'journal_history')
+
+            cur.execute(
+                """
+                SELECT
+                    s.setup_id, s.created_ts, s.symbol, s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
+                    COALESCE((SELECT MAX(executable_ts) FROM executable_setups x WHERE x.user_id=? AND x.setup_id=s.setup_id), 0) AS executable_ts,
+                    COALESCE((SELECT MAX(emailed_ts) FROM emailed_setups e WHERE e.user_id=? AND e.setup_id=s.setup_id), 0) AS emailed_ts,
+                    COALESCE((SELECT MAX(created_ts) FROM generated_setups g WHERE g.user_id=? AND g.setup_id=s.setup_id), 0) AS generated_ts,
+                    COALESCE((SELECT session FROM executable_setups x WHERE x.user_id=? AND x.setup_id=s.setup_id ORDER BY executable_ts DESC LIMIT 1),
+                             (SELECT session FROM emailed_setups e WHERE e.user_id=? AND e.setup_id=s.setup_id ORDER BY emailed_ts DESC LIMIT 1),
+                             (SELECT session FROM generated_setups g WHERE g.user_id=? AND g.setup_id=s.setup_id ORDER BY created_ts DESC LIMIT 1),
+                             '') AS src_session
+                FROM signals s
+                WHERE UPPER(s.symbol)=? AND UPPER(s.side)=?
+                ORDER BY s.created_ts DESC
+                LIMIT 60
+                """,
+                (int(uid), int(uid), int(uid), int(uid), int(uid), int(uid), str(sym).upper(), str(side).upper()),
+            )
+            for row in (cur.fetchall() or []):
+                row_d = dict(row)
+                stage_ts = max(float(row_d.get('executable_ts') or 0.0), float(row_d.get('emailed_ts') or 0.0), float(row_d.get('generated_ts') or 0.0), float(row_d.get('created_ts') or 0.0))
+                source_name = 'signal_history'
+                if float(row_d.get('executable_ts') or 0.0) > 0:
+                    source_name = 'executable_signal'
+                elif float(row_d.get('emailed_ts') or 0.0) > 0:
+                    source_name = 'emailed_signal'
+                elif float(row_d.get('generated_ts') or 0.0) > 0:
+                    source_name = 'generated_signal'
+                _push(2, source_name, {
+                    'setup_id': row_d.get('setup_id'),
+                    'session': row_d.get('src_session') or '',
+                    'entry': row_d.get('entry') or 0.0,
+                    'sl': row_d.get('sl') or 0.0,
+                    'tp1': row_d.get('tp1') or 0.0,
+                    'tp2': row_d.get('tp2') or 0.0,
+                    'tp3': row_d.get('tp3') or 0.0,
+                    'qty': live_qty,
+                    'conf': row_d.get('conf') or 0,
+                }, stage_ts, note=str(row_d.get('setup_id') or ''))
+    except Exception:
+        pass
+
+    if not candidates:
+        return None
+
+    source_rank, rel_e, rel_q, neg_ts, source_name, row, note = sorted(candidates, key=lambda x: (x[0], x[1], x[2], x[3]))[0]
+    if float(rel_e or 999.0) > 0.05 and float(rel_q or 999.0) > 0.70:
+        return None
+    return _autotrade_trade_row_from_live_and_source(live_pos, row, source_name, note=note)
+
+
+def _autotrade_collect_live_management_rows(uid: int, positions: list[dict] | None = None, journal_open: list[dict] | None = None) -> tuple[list[tuple[dict, dict]], dict]:
+    positions = list(positions or _bybit_get_open_positions_linear() or [])
+    journal_open = list(journal_open or _autotrade_db_open_trades(int(uid)) or [])
+    managed_pairs: list[tuple[dict, dict]] = []
+    meta_by_key: dict = {}
+    used_trade_ids: set[str] = set()
+
+    for p in positions:
+        sym = _pos_symbol(p)
+        side = _pos_side_text(p)
+        key = (str(sym).upper(), str(side).upper())
+        row = None
+        for t in journal_open:
+            try:
+                tid = str(t.get('trade_id') or '')
+                if tid and tid in used_trade_ids:
+                    continue
+                if _autotrade_row_matches_live_position(t, p, entry_tol=0.08, qty_tol=0.70):
+                    row = _autotrade_trade_row_from_live_and_source(p, t, 'autotrade_journal_open', note='journal_open_match')
+                    if tid:
+                        used_trade_ids.add(tid)
+                    break
+            except Exception:
+                continue
+        if row is None:
+            row = _autotrade_guess_management_source(int(uid), p, journal_open=journal_open)
+        if row is not None:
+            meta_by_key[key] = {
+                'managed': True,
+                'source': str(row.get('_mgmt_source') or ''),
+                'note': str(row.get('_mgmt_note') or ''),
+                'setup_id': str(row.get('setup_id') or ''),
+            }
+            managed_pairs.append((p, row))
+        else:
+            meta_by_key[key] = {
+                'managed': False,
+                'source': '',
+                'note': 'no_reliable_bot_source',
+                'setup_id': '',
+            }
+    return managed_pairs, meta_by_key
+
+
+def _autotrade_best_effort_repair_live_positions(uid: int, positions: list[dict] | None = None, journal_open: list[dict] | None = None) -> dict:
+    out = {'checked': 0, 'repaired': 0, 'results': [], 'meta_by_key': {}}
+    try:
+        if str(AUTOTRADE_MODE).lower() != 'live':
+            return out
+        pairs, meta_by_key = _autotrade_collect_live_management_rows(int(uid), positions=positions, journal_open=journal_open)
+        out['meta_by_key'] = meta_by_key
+        for live_pos, trade_row in pairs:
+            rr = _autotrade_repair_live_exit_protection(int(uid), trade_row, live_pos=live_pos)
+            out['checked'] += 1
+            if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
+                out['repaired'] += 1
+            out['results'].append(rr)
+        return out
+    except Exception:
+        return out
+
 
 def _ts_seconds_from_any(value) -> float:
     try:
@@ -4215,172 +4446,19 @@ def _autotrade_can_open_symbol(uid: int, symbol: str, side: str, session_label: 
     return (True, '', detail)
 
 
-def _bybit_get_open_orders_linear(symbol: str | None = None, order_filter: str | None = None) -> list[dict]:
+def _bybit_get_open_orders_linear(symbol: str | None = None) -> list[dict]:
     try:
         if not BYBIT_API_KEY or not BYBIT_API_SECRET:
             return []
         payload = {'category': 'linear', 'openOnly': 0, 'limit': 200}
         if symbol:
             payload['symbol'] = _bybit_linear_symbol(symbol)
-        if order_filter:
-            payload['orderFilter'] = str(order_filter)
         res = _bybit_v5_request('GET', '/v5/order/realtime', payload)
         if int((res or {}).get('retCode', -1)) != 0:
             return []
         return (((res or {}).get('result') or {}).get('list') or [])
     except Exception:
         return []
-
-
-def _bybit_get_open_stop_orders_linear(symbol: str | None = None) -> list[dict]:
-    try:
-        return _bybit_get_open_orders_linear(symbol, order_filter='StopOrder')
-    except Exception:
-        return []
-
-
-def _bybit_order_trigger_price(order: dict) -> float:
-    try:
-        for key in ('triggerPrice', 'trigger_price', 'stopLoss', 'stop_loss', 'price'):
-            v = float(order.get(key) or 0.0)
-            if v > 0:
-                return v
-    except Exception:
-        pass
-    return 0.0
-
-
-def _bybit_live_stop_order_price(symbol: str, side: str) -> float:
-    sym = _bybit_linear_symbol(symbol)
-    side_u = str(side or '').upper().strip()
-    close_side = 'SELL' if side_u == 'BUY' else ('BUY' if side_u == 'SELL' else '')
-    if not close_side:
-        return 0.0
-    prices = []
-    for o in (_bybit_get_open_stop_orders_linear(sym) or []):
-        try:
-            if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
-                continue
-            if str(o.get('side') or '').upper().strip() != close_side:
-                continue
-            status = str(o.get('orderStatus') or '').upper().strip()
-            if status in {'FILLED', 'CANCELLED', 'REJECTED', 'DEACTIVATED'}:
-                continue
-            if not _bybit_order_reduce_only(o):
-                continue
-            px = float(_bybit_order_trigger_price(o) or 0.0)
-            if px > 0:
-                prices.append(px)
-        except Exception:
-            continue
-    if not prices:
-        return 0.0
-    return max(prices) if side_u == 'BUY' else min(prices)
-
-
-def _bybit_has_open_sl_order_at(symbol: str, sl_price: float, side: str | None = None) -> bool:
-    sym = _bybit_linear_symbol(symbol)
-    side_u = str(side or '').upper().strip()
-    close_side = 'SELL' if side_u == 'BUY' else ('BUY' if side_u == 'SELL' else '')
-    for o in (_bybit_get_open_stop_orders_linear(sym) or []):
-        try:
-            if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
-                continue
-            if close_side and str(o.get('side') or '').upper().strip() != close_side:
-                continue
-            if not _bybit_order_reduce_only(o):
-                continue
-            status = str(o.get('orderStatus') or '').upper().strip()
-            if status in {'FILLED', 'CANCELLED', 'REJECTED', 'DEACTIVATED'}:
-                continue
-            px = float(_bybit_order_trigger_price(o) or 0.0)
-            if _price_close_enough(px, float(sl_price or 0.0), rel_tol=0.0015):
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _autotrade_cancel_reduce_only_sl_orders(symbol: str) -> int:
-    count = 0
-    sym = _bybit_linear_symbol(symbol)
-    for o in (_bybit_get_open_stop_orders_linear(sym) or []):
-        try:
-            if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
-                continue
-            if not _bybit_order_reduce_only(o):
-                continue
-            oid = str(o.get('orderId') or '')
-            if not oid:
-                continue
-            res = _bybit_v5_request('POST', '/v5/order/cancel', {'category': 'linear', 'symbol': sym, 'orderId': oid})
-            if int((res or {}).get('retCode', -1)) == 0:
-                count += 1
-        except Exception:
-            continue
-    return count
-
-
-def _autotrade_place_reduce_only_sl_order(symbol: str, side: str, sl_price: float, qty: float) -> dict:
-    try:
-        sym = _bybit_linear_symbol(symbol)
-        side_u = str(side or '').upper().strip()
-        if side_u not in {'BUY', 'SELL'}:
-            return {'ok': False, 'retMsg': 'bad_side'}
-        filt = _bybit_get_instr_filters(sym)
-        qty_step = filt.get('qtyStep')
-        qty_i, qreason = _round_qty_down(sym, float(qty or 0.0), float(sl_price or 0.0))
-        if not qty_i or qty_i <= 0:
-            return {'ok': False, 'retMsg': str(qreason or 'qty_invalid')}
-        close_side = 'Sell' if side_u == 'BUY' else 'Buy'
-        trigger_direction = 2 if side_u == 'BUY' else 1
-        payload = {
-            'category': 'linear',
-            'symbol': sym,
-            'side': close_side,
-            'orderType': 'Market',
-            'qty': _fmt_qty(qty_i, qty_step),
-            'triggerPrice': str(float(sl_price)),
-            'triggerDirection': int(trigger_direction),
-            'reduceOnly': True,
-            'closeOnTrigger': True,
-            'orderFilter': 'StopOrder',
-        }
-        res = _bybit_v5_request('POST', '/v5/order/create', payload)
-        return {
-            'ok': int((res or {}).get('retCode', -1)) == 0,
-            'retCode': (res or {}).get('retCode'),
-            'retMsg': (res or {}).get('retMsg'),
-            'order_payload': payload,
-            'raw': res,
-        }
-    except Exception as e:
-        return {'ok': False, 'retMsg': f'{type(e).__name__}: {e}'}
-
-
-def _autotrade_apply_live_sl(symbol: str, side: str, stop_loss: float, qty: float) -> dict:
-    sym = _bybit_linear_symbol(symbol)
-    out = {'ok': False, 'mode': '', 'retMsg': ''}
-    try:
-        _autotrade_cancel_reduce_only_sl_orders(sym)
-    except Exception:
-        pass
-    try:
-        _autotrade_apply_position_tp_sl(sym, 0.0, 0.0)
-    except Exception:
-        pass
-    res = _autotrade_place_reduce_only_sl_order(sym, side, float(stop_loss or 0.0), float(qty or 0.0))
-    if bool((res or {}).get('ok')):
-        out.update({'ok': True, 'mode': 'visible_stop_order', 'retMsg': str((res or {}).get('retMsg') or ''), 'raw': res})
-        return out
-    fb = _autotrade_apply_position_tp_sl(sym, float(stop_loss or 0.0), 0.0)
-    out.update({
-        'ok': int((fb or {}).get('retCode', -1)) == 0,
-        'mode': 'position_trading_stop_fallback',
-        'retMsg': str((fb or {}).get('retMsg') or (res or {}).get('retMsg') or ''),
-        'raw': {'visible_stop_attempt': res, 'fallback': fb},
-    })
-    return out
 
 
 def _autotrade_has_live_open_order(symbol: str, side: str | None = None) -> bool:
@@ -5209,6 +5287,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         live_partial_tp = float(exit_plan.get('effective_tp1') or 0.0)
         live_tp2 = float(exit_plan.get('effective_tp2') or 0.0)
         live_tp3 = float(exit_plan.get('effective_tp3') or 0.0)
+        _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
                 'position_opened_time': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -5216,7 +5295,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 'live_exit_tp2': float(live_tp2),
                 'live_exit_tp3': float(live_tp3),
                 'live_final_tp': float(exit_plan.get('final_tp') or live_tp2 or live_tp3 or 0.0),
-                'live_tp_design': 'reduce_only_limit_tp_orders + visible_sl_stop_order',
+                'live_tp_design': 'reduce_only_limit_tp_orders + full_sl',
             })
         except Exception:
             pass
@@ -5265,7 +5344,6 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
         final_pos = _autotrade_find_live_position(sym, side=side)
         tp_base_qty = abs(float(_pos_size(final_pos) or qty)) if final_pos else float(qty)
-        sl_apply_res = _autotrade_apply_live_sl(sym, side, sl_for_order, tp_base_qty if tp_base_qty > 0 else qty)
         live_final_tp = float(exit_plan.get('final_tp') or live_tp2 or live_tp3 or live_partial_tp or 0.0)
         _autotrade_cancel_reduce_only_tp_orders(sym)
         tp_targets_live = _dedupe_price_targets([x for x in (live_partial_tp, live_tp2, live_tp3) if float(x or 0.0) > 0])
@@ -5290,7 +5368,6 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                'sl_apply': sl_apply_res,
                 'tp_orders': tp_order_results,
                 'tp_success_count': int(tp_success_count),
                 'protection_repair': repair_res,
@@ -20961,11 +21038,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if is_admin and str(AUTOTRADE_MODE).lower() == "live":
+    if is_admin and str(AUTOTRADE_MODE).lower() == 'live':
         try:
-            await asyncio.to_thread(_autotrade_repair_all_live_positions, int(uid))
+            _autotrade_best_effort_repair_live_positions(int(AUTOTRADE_OWNER_UID or uid))
         except Exception:
             pass
+
     snap = _accounting_snapshot(uid, user, is_admin=is_admin)
     equity = float(snap.get('equity') or 0.0)
     cap = float(snap.get('cap') or 0.0)
@@ -22247,11 +22325,14 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("AutoTrade is not in LIVE mode. No live positions to display.")
         return
 
-    try:
-        await asyncio.to_thread(_autotrade_repair_all_live_positions, int(uid))
-    except Exception:
-        pass
     positions = _bybit_get_open_positions_linear()
+    repair_summary = {'meta_by_key': {}, 'repaired': 0}
+    if positions:
+        try:
+            repair_summary = _autotrade_best_effort_repair_live_positions(int(AUTOTRADE_OWNER_UID or uid), positions=positions)
+            positions = _bybit_get_open_positions_linear()
+        except Exception:
+            repair_summary = {'meta_by_key': {}, 'repaired': 0}
     if not positions:
         await update.message.reply_text("✅ No open positions found.")
         return
@@ -22281,10 +22362,18 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"   • Entry: {fmt_price(entry)}   | Mark: {fmt_price(mark)}")
         lines.append(f"   • PnL: {pnl:+.2f} USDT")
 
+        meta = dict((repair_summary.get('meta_by_key') or {}).get((str(sym).upper(), str(side).upper())) or {})
         if sl and sl > 0:
             lines.append(f"   • SL: {fmt_price(sl)}   | Risk est: {risk:.2f} USDT")
         else:
-            lines.append("   • SL: —   | Risk est: — (needs SL)")
+            reason_txt = str(meta.get('note') or 'needs SL')
+            lines.append(f"   • SL: —   | Risk est: — ({reason_txt})")
+
+        if bool(meta.get('managed')):
+            src_txt = str(meta.get('source') or 'managed')
+            lines.append(f"   • Managed: YES | Source: {src_txt}")
+        else:
+            lines.append("   • Managed: NO | Source: unavailable")
 
         ct = p.get("createdTime") or p.get("created_time") or ""
         ut = p.get("updatedTime") or p.get("updated_time") or ""
@@ -23061,7 +23150,6 @@ def user_location_and_time(user: dict):
 # =========================================================
 SCREEN_CACHE_TTL_SEC = 20  # seconds
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
-SCREEN_MANUAL_SYNC_ENABLED = str(os.environ.get("SCREEN_MANUAL_SYNC_ENABLED", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
 _SCREEN_CACHE: dict[str, dict] = {}
 _SCREEN_LOCK = asyncio.Lock()
 
@@ -23701,7 +23789,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 int(update.effective_user.id),
             )
 
-            if SCREEN_MANUAL_SYNC_ENABLED:
+            sync_info = {}
+            if MANUAL_SCREEN_SYNC_ENABLED:
                 try:
                     sync_info = await _screen_sync_pipeline_async(
                         int(update.effective_user.id),
@@ -23713,8 +23802,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception:
                     sync_info = {"status": "error", "reason": "screen_sync_failed"}
-            else:
-                sync_info = {}
 
             # Cache for fast subsequent /screen calls (user + session scoped)
             _SCREEN_CACHE[cache_key] = {
@@ -26027,6 +26114,20 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             sess = current_session_utc(now_utc)
 
         async with AUTOTRADE_EXEC_LOCK:
+            repair_summary = {'checked': 0, 'repaired': 0, 'results': [], 'meta_by_key': {}}
+            try:
+                repair_summary = _autotrade_best_effort_repair_live_positions(int(uid))
+                if int(repair_summary.get('repaired') or 0) > 0:
+                    _LAST_AUTOTRADE_DECISION[uid] = {
+                        "status": "MANAGED",
+                        "when": now_utc.isoformat(timespec="seconds"),
+                        "reason": f"managed_live_exits ({int(repair_summary.get('repaired') or 0)})",
+                        "session": str(sess or 'NONE'),
+                        "mode": AUTOTRADE_MODE,
+                    }
+            except Exception:
+                repair_summary = {'checked': 0, 'repaired': 0, 'results': [], 'meta_by_key': {}}
+
             if not owner_unlimited and not live_sess:
                 _LAST_AUTOTRADE_DECISION[uid] = {
                     "status": "SKIP",
@@ -26034,6 +26135,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     "reason": "outside_live_session_window",
                     "session": "NONE",
                     "mode": AUTOTRADE_MODE,
+                    "managed_live_repair": int(repair_summary.get('repaired') or 0),
                 }
                 return
             if sess not in {"ASIA", "LON", "NY"}:
@@ -26043,6 +26145,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     "reason": f"invalid_target_session ({sess or 'NONE'})",
                     "session": str(sess or "NONE"),
                     "mode": AUTOTRADE_MODE,
+                    "managed_live_repair": int(repair_summary.get('repaired') or 0),
                 }
                 return
             if not _autotrade_allowed_session(sess):
@@ -26050,33 +26153,18 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     "status": "SKIP",
                     "when": now_utc.isoformat(timespec="seconds"),
                     "reason": f"session_not_allowed ({sess})",
+                    "managed_live_repair": int(repair_summary.get('repaired') or 0),
                 }
                 return
 
-            # Keep live exit protection synchronized with Bybit before considering new entries.
-            try:
-                live_positions = _bybit_get_open_positions_linear() or []
-                repair_summary = _autotrade_repair_all_live_positions(int(uid), positions=live_positions)
-                if int(repair_summary.get('repaired') or 0) > 0:
-                    _LAST_AUTOTRADE_DECISION[uid] = {
-                        "status": "MANAGED",
-                        "when": now_utc.isoformat(timespec="seconds"),
-                        "reason": f"managed_live_exits ({int(repair_summary.get('repaired') or 0)})",
-                        "session": sess,
-                        "mode": AUTOTRADE_MODE,
-                    }
-            except Exception:
-                live_positions = []
-
             # Optional: respect user's trade window (if configured) for NEW entries only.
             try:
-                if not in_trade_window_now(user):
+                if not trade_window_allows_now(user):
                     _LAST_AUTOTRADE_DECISION[uid] = {
                         "status": "SKIP",
                         "when": now_utc.isoformat(timespec="seconds"),
                         "reason": "trade_window_block",
-                        "session": sess,
-                        "mode": AUTOTRADE_MODE,
+                        "managed_live_repair": int(repair_summary.get('repaired') or 0),
                     }
                     return
             except Exception:
@@ -26189,125 +26277,6 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         _hb_touch('email', ok=False, error=f"{type(e).__name__}: {e}", details='alert_job_error')
         logger.exception("Alert job failure: %s", e)
 
-
-
-def _autotrade_match_trade_row_to_live_position(rows: list[dict], live_pos: dict) -> dict | None:
-    try:
-        sym = str(_pos_symbol(live_pos) or '').upper()
-        side = str(_pos_side_text(live_pos) or '').upper()
-        entry = float(_pos_entry(live_pos) or 0.0)
-        size = abs(float(_pos_size(live_pos) or 0.0))
-        best = None
-        best_key = None
-        for r in (rows or []):
-            try:
-                if str(r.get('symbol') or '').upper() != sym:
-                    continue
-                if str(r.get('side') or '').upper() != side:
-                    continue
-                r_entry = float(r.get('entry') or 0.0)
-                r_qty = abs(float(r.get('qty') or 0.0))
-                entry_rel = abs(r_entry - entry) / max(abs(entry), abs(r_entry), 1e-9) if entry > 0 and r_entry > 0 else 999.0
-                qty_rel = abs(r_qty - size) / max(size, r_qty, 1e-9) if size > 0 and r_qty > 0 else 999.0
-                key = (entry_rel, qty_rel, -float(r.get('opened_ts') or 0.0))
-                if best_key is None or key < best_key:
-                    best = dict(r)
-                    best_key = key
-            except Exception:
-                continue
-        if best_key is None:
-            return None
-        if best_key[0] > 0.08 and best_key[1] > 0.80:
-            return None
-        return best
-    except Exception:
-        return None
-
-
-def _autotrade_match_signal_row_to_live_position(uid: int, live_pos: dict, limit: int = 30) -> dict | None:
-    try:
-        sym = str(_pos_symbol(live_pos) or '').upper()
-        side = str(_pos_side_text(live_pos) or '').upper()
-        entry = float(_pos_entry(live_pos) or 0.0)
-        con = db_connect()
-        cur = con.cursor()
-        cur.execute(
-            """
-            SELECT s.setup_id, s.created_ts, s.symbol, s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
-                   COALESCE(x.session, e.session, '') AS session,
-                   CASE WHEN x.setup_id IS NOT NULL THEN 0 WHEN e.setup_id IS NOT NULL THEN 1 ELSE 2 END AS pri
-            FROM signals s
-            LEFT JOIN executable_setups x ON x.user_id=? AND x.setup_id=s.setup_id
-            LEFT JOIN emailed_setups e ON e.user_id=? AND e.setup_id=s.setup_id
-            WHERE UPPER(s.symbol)=? AND UPPER(s.side)=?
-            ORDER BY pri ASC, s.created_ts DESC
-            LIMIT ?
-            """,
-            (int(uid), int(uid), sym, side, int(limit)),
-        )
-        rows = cur.fetchall() or []
-        con.close()
-        best = None
-        best_key = None
-        for row in rows:
-            try:
-                d = dict(row) if not isinstance(row, dict) else row
-                s_entry = float(d.get('entry') or 0.0)
-                entry_rel = abs(s_entry - entry) / max(abs(entry), abs(s_entry), 1e-9) if entry > 0 and s_entry > 0 else 999.0
-                pri = int(d.get('pri') or 2)
-                key = (entry_rel, pri, -float(d.get('created_ts') or 0.0))
-                if best_key is None or key < best_key:
-                    best = d
-                    best_key = key
-            except Exception:
-                continue
-        if best_key is None:
-            return None
-        if best_key[0] > 0.08:
-            return None
-        return {
-            'setup_id': str(best.get('setup_id') or ''),
-            'symbol': sym,
-            'side': side,
-            'entry': float(best.get('entry') or 0.0),
-            'sl': float(best.get('sl') or 0.0),
-            'tp1': float(best.get('tp1') or 0.0),
-            'tp2': float(best.get('tp2') or 0.0),
-            'tp3': float(best.get('tp3') or 0.0),
-            'qty': abs(float(_pos_size(live_pos) or 0.0)),
-            'conf': int(best.get('conf') or 0),
-            'quality_score': 0.0,
-            'atr_pct': 0.0,
-            'engine': '',
-            'session': str(best.get('session') or ''),
-            'opened_ts': 0.0,
-        }
-    except Exception:
-        return None
-
-
-def _autotrade_repair_all_live_positions(uid: int, positions: list[dict] | None = None) -> dict:
-    out = {'checked': 0, 'repaired': 0, 'details': []}
-    try:
-        live_positions = list(positions or _bybit_get_open_positions_linear() or [])
-        journal_open = _autotrade_db_open_trades(int(uid)) or []
-        for p in live_positions:
-            try:
-                row = _autotrade_match_trade_row_to_live_position(journal_open, p)
-                if row is None:
-                    row = _autotrade_match_signal_row_to_live_position(int(uid), p)
-                if row is None:
-                    continue
-                rr = _autotrade_repair_live_exit_protection(int(uid), row, live_pos=p)
-                out['checked'] += 1
-                if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
-                    out['repaired'] += 1
-                out['details'].append(rr)
-            except Exception:
-                continue
-    except Exception:
-        return out
-    return out
 
 
 async def autotrade_sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
