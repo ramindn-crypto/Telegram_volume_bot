@@ -1629,6 +1629,9 @@ AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES = set(str(os.environ.get("AUTOTRADE_BE_AF
 # execute a stale emailed setup at a materially worse price just because it is still inside
 # the time window. This guard keeps the email/setup engine and live execution aligned.
 AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "0.50") or 0.50)
+AUTOTRADE_SL_REPAIR_ATTEMPTS = int(os.environ.get("AUTOTRADE_SL_REPAIR_ATTEMPTS", "4") or 4)
+AUTOTRADE_SL_REPAIR_SLEEP_SEC = float(os.environ.get("AUTOTRADE_SL_REPAIR_SLEEP_SEC", "1.2") or 1.2)
+SCREEN_SYNC_TO_PIPELINE = env_bool("SCREEN_SYNC_TO_PIPELINE", False)
 
 # Bybit V5 keys (required for live)
 BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
@@ -2174,9 +2177,40 @@ def _pos_entry(p: dict) -> float:
 
 def _pos_stop(p: dict) -> float:
     try:
-        return float(p.get("stopLoss") or 0.0)
+        sl = float(p.get("stopLoss") or 0.0)
+        if sl > 0:
+            return sl
     except Exception:
-        return 0.0
+        pass
+    try:
+        sym = _pos_symbol(p)
+        side = _pos_side_text(p)
+        entry = _pos_entry(p)
+        close_side = 'SELL' if side == 'BUY' else 'BUY' if side == 'SELL' else ''
+        candidates = []
+        for o in (_bybit_get_open_tpsl_orders_linear(sym) or []):
+            try:
+                if _bybit_linear_symbol(str(o.get('symbol') or '')) != _bybit_linear_symbol(sym):
+                    continue
+                o_side = str(o.get('side') or '').upper().strip()
+                if close_side and o_side and o_side != close_side:
+                    continue
+                trig = float(o.get('triggerPrice') or o.get('stopLoss') or o.get('price') or 0.0)
+                if trig <= 0:
+                    continue
+                if entry > 0:
+                    if side == 'BUY' and trig >= entry:
+                        continue
+                    if side == 'SELL' and trig <= entry:
+                        continue
+                candidates.append(float(trig))
+            except Exception:
+                continue
+        if candidates:
+            return max(candidates) if side == 'BUY' else min(candidates)
+    except Exception:
+        pass
+    return 0.0
 
 def _pos_size(p: dict) -> float:
     try:
@@ -2439,7 +2473,7 @@ def _autotrade_cancel_reduce_only_tp_orders(symbol: str) -> int:
     return count
 
 
-def _autotrade_apply_position_tp_sl(symbol: str, stop_loss: float, take_profit: float) -> dict:
+def _autotrade_apply_position_tp_sl(symbol: str, stop_loss: float, take_profit: float, side: str | None = None, confirm: bool = False) -> dict:
     payload = {
         'category': 'linear',
         'symbol': _bybit_linear_symbol(symbol),
@@ -2449,7 +2483,26 @@ def _autotrade_apply_position_tp_sl(symbol: str, stop_loss: float, take_profit: 
     }
     if float(take_profit or 0.0) > 0:
         payload['takeProfit'] = str(float(take_profit))
-    return _bybit_v5_request('POST', '/v5/position/trading-stop', payload)
+    res = _bybit_v5_request('POST', '/v5/position/trading-stop', payload)
+    if bool(confirm) and float(stop_loss or 0.0) > 0 and str(side or '').upper().strip() in {'BUY', 'SELL'}:
+        try:
+            confirm_state = {'ok': False}
+            total_attempts = max(1, int(AUTOTRADE_SL_REPAIR_ATTEMPTS or 1))
+            for _ in range(total_attempts):
+                confirm_state = _autotrade_wait_for_stop_loss(symbol, side, float(stop_loss or 0.0), attempts=1, sleep_sec=0.15)
+                if bool((confirm_state or {}).get('ok')):
+                    break
+                try:
+                    time.sleep(max(0.15, float(AUTOTRADE_SL_REPAIR_SLEEP_SEC or 0.5)))
+                except Exception:
+                    pass
+                res = _bybit_v5_request('POST', '/v5/position/trading-stop', payload)
+            if not isinstance(res, dict):
+                res = {'result': res}
+            res['_sl_confirm'] = dict(confirm_state or {})
+        except Exception:
+            pass
+    return res
 
 
 def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: dict | None = None) -> dict:
@@ -2505,7 +2558,7 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
 
         desired_sl = float(entry) if (tp1_hit and be_allowed and entry > 0) else float(target_sl)
         if desired_sl > 0 and (current_sl <= 0 or not _price_close_enough(current_sl, desired_sl)):
-            _autotrade_apply_position_tp_sl(sym, desired_sl, 0.0)
+            _autotrade_apply_position_tp_sl(sym, desired_sl, 0.0, side=side, confirm=True)
             result['sl_fixed'] = True
             if tp1_hit and be_allowed:
                 result['be_applied'] = True
@@ -4218,6 +4271,91 @@ def _bybit_get_open_orders_linear(symbol: str | None = None) -> list[dict]:
         return []
 
 
+def _bybit_get_open_tpsl_orders_linear(symbol: str | None = None) -> list[dict]:
+    """Fetch open TP/SL and stop orders for a linear symbol.
+
+    Bybit may surface position-level TP/SL protection in the TP/SL order lane rather than
+    the plain open-order lane, so we query both relevant orderFilter buckets and merge them.
+    """
+    try:
+        if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+            return []
+        merged = []
+        seen = set()
+        for order_filter in ('BidirectionalTpslOrder', 'StopOrder'):
+            payload = {'category': 'linear', 'openOnly': 0, 'limit': 200, 'orderFilter': order_filter}
+            if symbol:
+                payload['symbol'] = _bybit_linear_symbol(symbol)
+            res = _bybit_v5_request('GET', '/v5/order/realtime', payload)
+            if int((res or {}).get('retCode', -1)) != 0:
+                continue
+            for item in ((((res or {}).get('result') or {}).get('list') or [])):
+                try:
+                    oid = str(item.get('orderId') or '')
+                    if oid and oid in seen:
+                        continue
+                    if oid:
+                        seen.add(oid)
+                    merged.append(item)
+                except Exception:
+                    continue
+        return merged
+    except Exception:
+        return []
+
+
+def _bybit_has_matching_stop_loss_order(symbol: str, side: str, stop_price: float) -> bool:
+    try:
+        sym = _bybit_linear_symbol(symbol)
+        side_u = str(side or '').upper().strip()
+        close_side = 'SELL' if side_u == 'BUY' else 'BUY' if side_u == 'SELL' else ''
+        for o in (_bybit_get_open_tpsl_orders_linear(sym) or []):
+            try:
+                if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
+                    continue
+                o_side = str(o.get('side') or '').upper().strip()
+                if close_side and o_side and o_side != close_side:
+                    continue
+                status = str(o.get('orderStatus') or '').upper().strip()
+                if status in {'FILLED', 'CANCELLED', 'REJECTED', 'DEACTIVATED'}:
+                    continue
+                trig = float(o.get('triggerPrice') or o.get('stopLoss') or o.get('price') or 0.0)
+                if trig > 0 and _price_close_enough(trig, float(stop_price or 0.0), rel_tol=0.0010):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def _autotrade_wait_for_stop_loss(symbol: str, side: str | None, desired_stop: float, attempts: int | None = None, sleep_sec: float | None = None) -> dict:
+    attempts = max(1, int(attempts or AUTOTRADE_SL_REPAIR_ATTEMPTS or 1))
+    sleep_sec = max(0.15, float(sleep_sec or AUTOTRADE_SL_REPAIR_SLEEP_SEC or 0.5))
+    sym = _bybit_linear_symbol(symbol)
+    side_u = str(side or '').upper().strip()
+    want = float(desired_stop or 0.0)
+    out = {'ok': False, 'attempts': 0, 'confirmed_via': '', 'observed_stop': 0.0}
+    if want <= 0 or side_u not in {'BUY', 'SELL'}:
+        return out
+    for i in range(1, attempts + 1):
+        out['attempts'] = i
+        pos = _autotrade_find_live_position(sym, side=side_u)
+        live_sl = float(_pos_stop(pos) or 0.0) if pos else 0.0
+        if live_sl > 0 and _price_close_enough(live_sl, want, rel_tol=0.0010):
+            out.update({'ok': True, 'confirmed_via': 'position', 'observed_stop': float(live_sl)})
+            return out
+        if _bybit_has_matching_stop_loss_order(sym, side_u, want):
+            out.update({'ok': True, 'confirmed_via': 'tpsl_order', 'observed_stop': float(want)})
+            return out
+        if i < attempts:
+            try:
+                time.sleep(sleep_sec)
+            except Exception:
+                pass
+    return out
+
+
 def _autotrade_has_live_open_order(symbol: str, side: str | None = None) -> bool:
     sym = _bybit_linear_symbol(symbol)
     side_u = str(side or '').upper().strip()
@@ -5044,9 +5182,10 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         live_partial_tp = float(exit_plan.get('effective_tp1') or 0.0)
         live_tp2 = float(exit_plan.get('effective_tp2') or 0.0)
         live_tp3 = float(exit_plan.get('effective_tp3') or 0.0)
-        _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
+        sl_apply_res = _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0, side=side, confirm=True)
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'sl_apply': sl_apply_res,
                 'position_opened_time': datetime.now(timezone.utc).isoformat(timespec='seconds'),
                 'live_exit_tp1': float(live_partial_tp),
                 'live_exit_tp2': float(live_tp2),
@@ -23268,6 +23407,8 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
     cooldowns, and executable qualification rules as the background email pipeline.
     """
     try:
+        if not bool(SCREEN_SYNC_TO_PIPELINE):
+            return {"status": "skip", "reason": "screen_sync_disabled_manual_display_only"}
         if not shown_setups:
             return {"status": "skip", "reason": "no_shown_setups"}
         live_session = str(live_session or '').upper().strip()
@@ -23555,7 +23696,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sync_reason = str(sync_info.get("reason") or "").strip()
             if sync_status == 'sent':
                 msg += f"\n\n✅ Sync: `{sync_reason}`"
-            elif sync_status in {'skip', 'error'} and sync_reason:
+            elif sync_status in {'skip', 'error'} and sync_reason and sync_reason != 'screen_sync_disabled_manual_display_only':
                 msg += f"\n\nℹ️ Sync: `{sync_reason}`"
         keyboard = [
             [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
