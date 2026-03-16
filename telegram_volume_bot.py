@@ -26320,8 +26320,6 @@ def main():
             time.sleep(3600)
 
 
-if __name__ == "__main__":
-    main()
 
 
 # ===============================
@@ -26923,3 +26921,7 @@ def pf_evaluate_signal(symbol, trend, ema_pullback, liquidity_event):
 # ==========================================================
 # END SIGNAL QUALITY GATE ENGINE
 # ==========================================================
+
+
+if __name__ == "__main__":
+    main()
