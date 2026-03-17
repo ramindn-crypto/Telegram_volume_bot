@@ -294,7 +294,45 @@ def _autotrade_migrate_tables():
 
 
 # ================= AUTOTRADE SESSION STORAGE =================
-def _autotrade_get_sessions():
+def _autotrade_owner_user() -> dict:
+    try:
+        owner = int(AUTOTRADE_OWNER_UID or 0)
+    except Exception:
+        owner = 0
+    if owner <= 0:
+        return {}
+    try:
+        return get_user(owner) or {}
+    except Exception:
+        return {}
+
+
+def _autotrade_owner_sessions() -> list[str]:
+    """Resolve AutoTrade sessions from the OWNER'S /sessions settings.
+
+    AutoTrade is owner/admin only, so it must follow the admin user's live
+    session configuration instead of a legacy NY-only default or timezone-based
+    fallback. /sessions_unlimited_on means allow all real market sessions.
+    """
+    try:
+        owner_user = _autotrade_owner_user()
+    except Exception:
+        owner_user = {}
+
+    if owner_user:
+        try:
+            if int(owner_user.get("sessions_unlimited", 0) or 0) == 1:
+                return ["ASIA", "LON", "NY"]
+        except Exception:
+            pass
+        try:
+            enabled = _order_sessions(user_enabled_sessions(owner_user) or [])
+            if enabled:
+                return enabled
+        except Exception:
+            pass
+
+    # Backward-compatibility only: legacy autotrade_config table.
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
@@ -307,12 +345,26 @@ def _autotrade_get_sessions():
             c.execute("SELECT value FROM autotrade_config WHERE key='sessions'")
             row = c.fetchone()
             if row and row[0]:
-                return [s.strip().upper() for s in row[0].split(",") if s.strip()]
+                legacy = _order_sessions([s.strip().upper() for s in row[0].split(",") if s.strip()])
+                if legacy:
+                    return legacy
     except Exception:
         pass
-    return ["NY"]
+
+    # Safe owner-focused fallback: do not silently collapse back to NY-only.
+    return ["ASIA", "LON", "NY"]
+
+
+def _autotrade_get_sessions():
+    return _autotrade_owner_sessions()
+
 
 def _autotrade_set_sessions(val: str):
+    parts = _order_sessions([s.strip().upper() for s in str(val or '').split(',') if s.strip()])
+    if not parts:
+        parts = ["ASIA", "LON", "NY"]
+
+    # Keep legacy storage for backward compatibility / admin visibility.
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
@@ -324,11 +376,22 @@ def _autotrade_set_sessions(val: str):
             """)
             c.execute(
                 "INSERT OR REPLACE INTO autotrade_config(key,value) VALUES('sessions',?)",
-                (val.upper(),)
+                (",".join(parts),)
             )
             conn.commit()
     except Exception:
         pass
+
+    # Canonical source: owner admin /sessions settings.
+    try:
+        owner = int(AUTOTRADE_OWNER_UID or 0)
+    except Exception:
+        owner = 0
+    if owner > 0:
+        try:
+            update_user(owner, sessions_enabled=json.dumps(parts), sessions_unlimited=0)
+        except Exception:
+            pass
 # =============================================================
 
 import asyncio
@@ -4360,7 +4423,7 @@ def _autotrade_qty_from_risk(entry: float, sl: float, equity_usdt: float, risk_u
 def _autotrade_allowed_session(session_label: str) -> bool:
     allowed = set([s.strip().upper() for s in _autotrade_get_sessions() if s.strip()])
     if not allowed:
-        allowed = {'NY'}
+        allowed = {'ASIA', 'LON', 'NY'}
     return session_label.upper() in allowed
 
 
@@ -22956,11 +23019,27 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     leaders_txt = build_leaders_table(best_fut)  # fast (top by futures volume)
     up_list, dn_list = compute_directional_lists(best_fut)
 
+    # Keep the same ranked lane as the email pipeline before applying the UI cap.
+    try:
+        ranked_setups = list(pool.get("setups") or [])
+    except Exception:
+        ranked_setups = []
+
+    if EMAIL_PRIORITY_OVERRIDE_ON and ranked_setups:
+        try:
+            pri = _email_priority_bases(best_fut, directional_take=12)
+            ranked_setups = sorted(
+                ranked_setups,
+                key=lambda s: (0 if str(getattr(s, "symbol", "")).upper() in pri else 1)
+            )
+        except Exception:
+            pass
+
     # Hard cap: never show more than 3 top setups on /screen
     try:
-        setups = (pool.get("setups") or [])[:min(int(SETUPS_N), 3)]
+        setups = (ranked_setups or [])[:min(int(SETUPS_N), 3)]
     except Exception:
-        setups = (pool.get("setups") or [])[:3]
+        setups = (ranked_setups or [])[:3]
 
     # For UX: do not show the same symbol in Momentum Watch if it's already a Top Setup
     try:
@@ -24667,49 +24746,24 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 }
                 continue
 
-                        # ---------------------------
+            # ---------------------------
             # Unified /screen + /email Top Setup eligibility
             # ---------------------------
-            # Email should send the SAME Top Trade Setups that /screen shows.
-            # Only user preferences (sessions/trade window/caps/gap/cooldown) can block sending.
-
-            skip_reasons_counter = Counter()
-            eligible: List[Setup] = []
-            for s in (setups_all or []):
-                ok, why = is_executable_setup_eligible(s, session_name=sess_name)
-                if ok:
-                    eligible.append(s)
-                else:
-                    skip_reasons_counter[str(why)] += 1
-
+            # Email/autotrade must consume the SAME ranked setup lane that /screen uses.
+            # At this stage only user-specific runtime controls (sessions/trade window/
+            # email caps/gap/cooldown/flip guard) may block sending.
+            eligible: List[Setup] = list(setups_all or [])
             if not eligible:
-                top_reasons = dict(skip_reasons_counter.most_common(3))
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
-                    "reasons": ["no_setups_after_filters", f"top_reasons={top_reasons}"],
+                    "reasons": [f"no_screen_aligned_setups ({display_sess})"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
 
-            # Premium ordering: confidence desc, RR(TP3) desc
-            def _rr3(_s: Setup) -> float:
-                try:
-                    return float(rr_to_tp(float(_s.entry), float(_s.sl), float(_s.tp3)))
-                except Exception:
-                    return 0.0
-
-            eligible = sorted(
-                eligible,
-                key=lambda _s: (
-                    float(getattr(_s, "quality_score", 0.0) or 0.0),
-                    int(getattr(_s, "conf", 0) or 0),
-                    _rr3(_s),
-                    float(getattr(_s, "fut_vol_usd", 0.0) or 0.0),
-                ),
-                reverse=True,
-            )
-
-            # Candidate picks for cooldown/flip checks below
+            # Candidate picks for cooldown/flip checks below.
+            # Keep the existing ranked order from build_priority_pool(mode="email") so
+            # /screen, email, and autotrade stay in the same lane.
             picks: List[Setup] = list(eligible[: max(int(EMAIL_SETUPS_N) * 6, 18)])
 
             chosen_list: List[Setup] = []
@@ -26028,21 +26082,46 @@ async def autotrade_sessions_cmd(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Admin only.")
         return
 
+    owner_user = _autotrade_owner_user()
+    owner_unlimited = int(owner_user.get("sessions_unlimited", 0) or 0) == 1 if owner_user else False
+
     if not context.args:
         current = ",".join(_autotrade_get_sessions())
-        await update.message.reply_text(f"🤖 Current AutoTrade Sessions: {current}")
+        mode_txt = "UNLIMITED (follows /sessions_unlimited_on)" if owner_unlimited else "FOLLOWING OWNER /sessions"
+        await update.message.reply_text(f"🤖 AutoTrade sessions: {current}\nMode: {mode_txt}")
         return
 
-    raw = context.args[0].upper()
+    raw = context.args[0].upper().strip()
+    if raw in {"UNLIMITED", "ALL", "24H"}:
+        try:
+            owner = int(AUTOTRADE_OWNER_UID or 0)
+        except Exception:
+            owner = 0
+        if owner > 0:
+            update_user(owner, sessions_unlimited=1)
+        await update.message.reply_text("✅ AutoTrade now follows owner sessions in UNLIMITED mode (ASIA, LON, NY).")
+        return
+
+    if raw in {"LIMITED", "NORMAL", "OWNER"}:
+        try:
+            owner = int(AUTOTRADE_OWNER_UID or 0)
+        except Exception:
+            owner = 0
+        if owner > 0:
+            update_user(owner, sessions_unlimited=0)
+        await update.message.reply_text(f"✅ AutoTrade back to owner /sessions mode: {','.join(_autotrade_get_sessions())}")
+        return
+
     parts = [p.strip() for p in raw.split(",") if p.strip()]
 
     valid = {"NY", "LON", "ASIA"}
     if any(p not in valid for p in parts):
-        await update.message.reply_text("❌ Invalid session. Use NY,LON,ASIA")
+        await update.message.reply_text("❌ Invalid session. Use NY,LON,ASIA or UNLIMITED")
         return
 
-    _autotrade_set_sessions(",".join(parts))
-    await update.message.reply_text(f"✅ AutoTrade sessions updated: {','.join(parts)}")
+    ordered = _order_sessions(parts) or parts
+    _autotrade_set_sessions(",".join(ordered))
+    await update.message.reply_text(f"✅ AutoTrade sessions updated (synced to owner /sessions): {','.join(ordered)}")
 
 
 def main():
