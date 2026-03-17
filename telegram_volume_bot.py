@@ -22442,8 +22442,88 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             lines.append(f"• {row.get('symbol')} | {row.get('side')} | ${pnl:+.2f}")
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
+def _autotrade_find_open_trade_row_for_symbol(uid: int, symbol: str, side: str) -> dict | None:
+    """Return the newest OPEN autotrade row for a live symbol/side pair."""
+    try:
+        sym = _bybit_linear_symbol(symbol)
+        side_u = str(side or '').upper().strip()
+        best = None
+        best_ts = 0.0
+        for row in (_autotrade_db_open_trades(int(uid)) or []):
+            try:
+                row_sym = _bybit_linear_symbol(str((row or {}).get('symbol') or ''))
+                row_side = str((row or {}).get('side') or '').upper().strip()
+                if row_sym != sym or row_side != side_u:
+                    continue
+                opened_ts = float((row or {}).get('opened_ts') or (row or {}).get('created_ts') or 0.0)
+                if opened_ts >= best_ts:
+                    best = dict(row)
+                    best_ts = opened_ts
+            except Exception:
+                continue
+        return best
+    except Exception:
+        return None
+
+
+def _autotrade_live_position_exit_snapshot(uid: int, p: dict) -> dict:
+    """Build a bot-vs-exchange exit map for an open live position.
+
+    This is used for admin visibility so /open_trades can confirm that the live
+    exchange SL / TP and the manual TP1 order are aligned with the generated setup.
+    """
+    sym = _bybit_linear_symbol(_pos_symbol(p))
+    side = str(_pos_side_text(p) or '').upper().strip()
+    trade_row = _autotrade_find_open_trade_row_for_symbol(int(uid), sym, side) or {}
+
+    setup_sl = float((trade_row or {}).get('sl') or 0.0)
+    setup_tp1 = float((trade_row or {}).get('tp1') or 0.0)
+    setup_tp2 = float((trade_row or {}).get('tp2') or (trade_row or {}).get('tp3') or 0.0)
+    setup_tp3 = float((trade_row or {}).get('tp3') or (trade_row or {}).get('tp2') or 0.0)
+
+    live_sl = float(_pos_stop(p) or 0.0)
+    live_tp = float(_pos_take_profit(p) or 0.0)
+
+    plan = _autotrade_live_exit_plan_for_trade(trade_row) if trade_row else {}
+    partial_tp = float((plan or {}).get('partial_tp') or setup_tp1 or 0.0)
+    final_tp = float((plan or {}).get('final_tp') or setup_tp2 or setup_tp3 or setup_tp1 or 0.0)
+    partial_tp_distinct = bool(partial_tp > 0 and final_tp > 0 and not _price_close_enough(partial_tp, final_tp, rel_tol=0.0010))
+
+    tp1_order_open = False
+    try:
+        tp1_order_open = _bybit_has_open_tp_order_at(sym, partial_tp, side=side) if partial_tp_distinct else False
+    except Exception:
+        tp1_order_open = False
+
+    sl_match = bool(setup_sl <= 0 or (live_sl > 0 and _price_close_enough(live_sl, setup_sl, rel_tol=0.0040)))
+    final_tp_match = bool(final_tp <= 0 or (live_tp > 0 and _price_close_enough(live_tp, final_tp, rel_tol=0.0040)))
+    tp1_match = bool((not partial_tp_distinct) or tp1_order_open)
+
+    return {
+        'symbol': sym,
+        'side': side,
+        'trade_row': trade_row or None,
+        'setup_id': str((trade_row or {}).get('setup_id') or ''),
+        'setup_sl': float(setup_sl or 0.0),
+        'setup_tp1': float(setup_tp1 or partial_tp or 0.0),
+        'setup_tp2': float(setup_tp2 or final_tp or 0.0),
+        'setup_tp3': float(setup_tp3 or final_tp or 0.0),
+        'plan_tp1': float(partial_tp or 0.0),
+        'plan_final_tp': float(final_tp or 0.0),
+        'live_sl': float(live_sl or 0.0),
+        'live_tp': float(live_tp or 0.0),
+        'tp1_order_open': bool(tp1_order_open),
+        'tp1_order_price': float(partial_tp or 0.0),
+        'partial_tp_distinct': bool(partial_tp_distinct),
+        'sl_match': bool(sl_match),
+        'final_tp_match': bool(final_tp_match),
+        'tp1_match': bool(tp1_match),
+        'all_matched': bool(sl_match and final_tp_match and tp1_match),
+    }
+
+
 async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show all open Bybit positions (admin only) with live PnL and estimated risk."""
+    """Show all open Bybit positions (admin only) with live PnL and full exit mapping."""
     uid = update.effective_user.id
     if not is_admin_user(uid):
         await update.message.reply_text("⛔️ Admin only.")
@@ -22474,6 +22554,8 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pnl = _pos_unreal_pnl(p)
         sl = _pos_stop(p)
         risk = _estimate_position_risk_usd(p)
+        tp_live = _pos_take_profit(p)
+        exit_map = _autotrade_live_position_exit_snapshot(int(uid), p)
 
         total_pnl += pnl
         total_risk += risk
@@ -22484,9 +22566,37 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"   • PnL: {pnl:+.2f} USDT")
 
         if sl and sl > 0:
-            lines.append(f"   • SL: {fmt_price(sl)}   | Risk est: {risk:.2f} USDT")
+            lines.append(f"   • Live SL: {fmt_price(sl)}   | Risk est: {risk:.2f} USDT")
         else:
-            lines.append("   • SL: —   | Risk est: — (needs SL)")
+            lines.append("   • Live SL: —   | Risk est: — (needs SL)")
+
+        if tp_live and tp_live > 0:
+            lines.append(f"   • Live TP (position): {fmt_price(tp_live)}")
+        else:
+            lines.append("   • Live TP (position): —")
+
+        if exit_map.get('trade_row'):
+            setup_id = str(exit_map.get('setup_id') or '')
+            setup_sl = float(exit_map.get('setup_sl') or 0.0)
+            setup_tp1 = float(exit_map.get('plan_tp1') or exit_map.get('setup_tp1') or 0.0)
+            setup_tp2 = float(exit_map.get('plan_final_tp') or exit_map.get('setup_tp2') or exit_map.get('setup_tp3') or 0.0)
+            lines.append(
+                f"   • Setup exits: SL {fmt_price(setup_sl) if setup_sl > 0 else '—'} | "
+                f"TP1 {fmt_price(setup_tp1) if setup_tp1 > 0 else '—'} | "
+                f"TP2 {fmt_price(setup_tp2) if setup_tp2 > 0 else '—'}"
+                + (f" | Setup {setup_id}" if setup_id else "")
+            )
+            if bool(exit_map.get('partial_tp_distinct')):
+                tp1_status = 'OPEN' if bool(exit_map.get('tp1_order_open')) else 'MISSING'
+                lines.append(f"   • TP1 limit order: {tp1_status} @ {fmt_price(float(exit_map.get('tp1_order_price') or 0.0))}")
+            sync_ok = bool(exit_map.get('all_matched'))
+            if bool(exit_map.get('partial_tp_distinct')):
+                sync_bits = f"SL {'OK' if exit_map.get('sl_match') else 'MISS'} | TP2 {'OK' if exit_map.get('final_tp_match') else 'MISS'} | TP1 {'OK' if exit_map.get('tp1_match') else 'MISS'}"
+            else:
+                sync_bits = f"SL {'OK' if exit_map.get('sl_match') else 'MISS'} | TP {'OK' if exit_map.get('final_tp_match') else 'MISS'}"
+            lines.append(f"   • Exit sync: {'MATCHED' if sync_ok else 'MISMATCH'} | {sync_bits}")
+        else:
+            lines.append("   • Setup exits: — (no matching open trade row found in bot DB)")
 
         ct = p.get("createdTime") or p.get("created_time") or ""
         ut = p.get("updatedTime") or p.get("updated_time") or ""
