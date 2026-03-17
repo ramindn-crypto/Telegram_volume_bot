@@ -898,7 +898,7 @@ DEFAULT_TYPE = "swap"  # bybit futures
 DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
 
 CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "1"))
-MANUAL_SCREEN_SYNC_ENABLED = env_bool("MANUAL_SCREEN_SYNC_ENABLED", False)
+MANUAL_SCREEN_SYNC_ENABLED = _env_bool("MANUAL_SCREEN_SYNC_ENABLED", False)
 
 # -------------------------
 # LOGGING: redact secrets + quiet noisy libs (Render-safe)
@@ -23526,6 +23526,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 int(update.effective_user.id),
             )
 
+            sync_info = {}
             if MANUAL_SCREEN_SYNC_ENABLED:
                 try:
                     sync_info = await _screen_sync_pipeline_async(
@@ -25852,30 +25853,6 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             sess = current_session_utc(now_utc)
 
         async with AUTOTRADE_EXEC_LOCK:
-            # Keep live exit protection synchronized with Bybit before considering new entries.
-            # This must run even when new entries are blocked by session or trade window rules.
-            try:
-                repaired = []
-                live_map = {(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper()): p for p in (_bybit_get_open_positions_linear() or [])}
-                for tr in (_autotrade_db_open_trades(int(uid)) or []):
-                    key = (str(tr.get('symbol') or '').upper(), str(tr.get('side') or '').upper())
-                    p = live_map.get(key)
-                    if not p:
-                        continue
-                    rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
-                    if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
-                        repaired.append(rr)
-                if repaired:
-                    _LAST_AUTOTRADE_DECISION[uid] = {
-                        "status": "MANAGED",
-                        "when": now_utc.isoformat(timespec="seconds"),
-                        "reason": f"managed_live_exits ({len(repaired)})",
-                        "session": str(sess or "NONE"),
-                        "mode": AUTOTRADE_MODE,
-                    }
-            except Exception:
-                pass
-
             if not owner_unlimited and not live_sess:
                 _LAST_AUTOTRADE_DECISION[uid] = {
                     "status": "SKIP",
@@ -25901,6 +25878,29 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     "reason": f"session_not_allowed ({sess})",
                 }
                 return
+
+            # Keep live exit protection synchronized with Bybit before considering new entries.
+            try:
+                repaired = []
+                live_map = {(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper()): p for p in (_bybit_get_open_positions_linear() or [])}
+                for tr in (_autotrade_db_open_trades(int(uid)) or []):
+                    key = (str(tr.get('symbol') or '').upper(), str(tr.get('side') or '').upper())
+                    p = live_map.get(key)
+                    if not p:
+                        continue
+                    rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
+                    if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
+                        repaired.append(rr)
+                if repaired:
+                    _LAST_AUTOTRADE_DECISION[uid] = {
+                        "status": "MANAGED",
+                        "when": now_utc.isoformat(timespec="seconds"),
+                        "reason": f"managed_live_exits ({len(repaired)})",
+                        "session": sess,
+                        "mode": AUTOTRADE_MODE,
+                    }
+            except Exception:
+                pass
 
             # Optional: respect user's trade window (if configured)
             try:
@@ -26323,10 +26323,6 @@ def main():
         logger.error("Another instance is polling. Sleeping forever.")
         while True:
             time.sleep(3600)
-
-
-if __name__ == "__main__":
-    main()
 
 
 # ===============================
@@ -26928,3 +26924,6 @@ def pf_evaluate_signal(symbol, trend, ema_pullback, liquidity_event):
 # ==========================================================
 # END SIGNAL QUALITY GATE ENGINE
 # ==========================================================
+
+if __name__ == "__main__":
+    main()
