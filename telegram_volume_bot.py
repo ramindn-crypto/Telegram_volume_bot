@@ -897,7 +897,8 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DEFAULT_TYPE = "swap"  # bybit futures
 DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
 
-CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "5"))
+CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "1"))
+MANUAL_SCREEN_SYNC_ENABLED = env_bool("MANUAL_SCREEN_SYNC_ENABLED", False)
 
 # -------------------------
 # LOGGING: redact secrets + quiet noisy libs (Render-safe)
@@ -1590,8 +1591,8 @@ AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PC
 # Open-trade count cap for commercial/live safety.
 AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "0") or 0)
 EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
-EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "LON,NY") or "LON,NY").split(",") if s.strip()]
-EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", False)
+EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
+EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", True)
 
 
 # Margin / leverage
@@ -17905,19 +17906,6 @@ def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
     except Exception:
         sent_today = 0
 
-    # Session counters are per live session key. If the stored state still points
-    # to a previous session, do not leak the old session count/gap into the
-    # current status snapshot. This can happen when a new session has started but
-    # no email has been sent yet in that session.
-    try:
-        live_sess = in_session_now(user)
-    except Exception:
-        live_sess = None
-    live_session_key = str((live_sess or {}).get('session_key') or '')
-    if live_session_key and str(st.get('session_key') or '') != live_session_key:
-        sent_in_session = 0
-        last_email_ts = 0.0
-
     gap_sec = max(0, int(gap_min)) * 60
     gap_remaining_sec = max(0, int(round(gap_sec - (time.time() - last_email_ts)))) if gap_sec > 0 and last_email_ts > 0 else 0
 
@@ -23538,17 +23526,20 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 int(update.effective_user.id),
             )
 
-            try:
-                sync_info = await _screen_sync_pipeline_async(
-                    int(update.effective_user.id),
-                    user or {},
-                    live_session,
-                    scan_session,
-                    best_fut,
-                    list(shown_setups or []),
-                )
-            except Exception:
-                sync_info = {"status": "error", "reason": "screen_sync_failed"}
+            if MANUAL_SCREEN_SYNC_ENABLED:
+                try:
+                    sync_info = await _screen_sync_pipeline_async(
+                        int(update.effective_user.id),
+                        user or {},
+                        live_session,
+                        scan_session,
+                        best_fut,
+                        list(shown_setups or []),
+                    )
+                except Exception:
+                    sync_info = {"status": "error", "reason": "screen_sync_failed"}
+            else:
+                sync_info = {"status": "skip", "reason": "manual_screen_sync_disabled"}
 
             # Cache for fast subsequent /screen calls (user + session scoped)
             _SCREEN_CACHE[cache_key] = {
@@ -24579,6 +24570,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
             sess_name = str(sess.get("name") or "").upper()
             display_sess = sess_name
+            setups_all = setups_by_session.get(sess_name, []) or []
+            if not setups_all:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"no_setups_generated_for_session ({display_sess})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
 
             # state init must not crash job
             try:
@@ -24593,24 +24592,13 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 _LAST_EMAIL_ERROR[uid] = dict(_tmp_dec)
                 continue
 
-            # Reset session state as soon as the live session changes, even if
-            # this session has no setups yet. Otherwise /status can keep showing
-            # the previous session's sent_count until the first new email.
+            # Reset session state if session_key changed
             try:
                 if str(st.get("session_key")) != str(sess.get("session_key")):
                     email_state_set(uid, session_key=str(sess.get("session_key")), sent_count=0, last_email_ts=0.0)
                     st = email_state_get(uid)
             except Exception:
                 pass
-
-            setups_all = setups_by_session.get(sess_name, []) or []
-            if not setups_all:
-                _LAST_EMAIL_DECISION[uid] = {
-                    "status": "SKIP",
-                    "reasons": [f"no_setups_generated_for_session ({display_sess})"],
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                }
-                continue
 
             # Safe defaults (never KeyError)
             try:
@@ -25864,6 +25852,30 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             sess = current_session_utc(now_utc)
 
         async with AUTOTRADE_EXEC_LOCK:
+            # Keep live exit protection synchronized with Bybit before considering new entries.
+            # This must run even when new entries are blocked by session or trade window rules.
+            try:
+                repaired = []
+                live_map = {(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper()): p for p in (_bybit_get_open_positions_linear() or [])}
+                for tr in (_autotrade_db_open_trades(int(uid)) or []):
+                    key = (str(tr.get('symbol') or '').upper(), str(tr.get('side') or '').upper())
+                    p = live_map.get(key)
+                    if not p:
+                        continue
+                    rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
+                    if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
+                        repaired.append(rr)
+                if repaired:
+                    _LAST_AUTOTRADE_DECISION[uid] = {
+                        "status": "MANAGED",
+                        "when": now_utc.isoformat(timespec="seconds"),
+                        "reason": f"managed_live_exits ({len(repaired)})",
+                        "session": str(sess or "NONE"),
+                        "mode": AUTOTRADE_MODE,
+                    }
+            except Exception:
+                pass
+
             if not owner_unlimited and not live_sess:
                 _LAST_AUTOTRADE_DECISION[uid] = {
                     "status": "SKIP",
@@ -25899,29 +25911,6 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                         "reason": "trade_window_block",
                     }
                     return
-            except Exception:
-                pass
-
-            # Keep live exit protection synchronized with Bybit before considering new entries.
-            try:
-                repaired = []
-                live_map = {(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper()): p for p in (_bybit_get_open_positions_linear() or [])}
-                for tr in (_autotrade_db_open_trades(int(uid)) or []):
-                    key = (str(tr.get('symbol') or '').upper(), str(tr.get('side') or '').upper())
-                    p = live_map.get(key)
-                    if not p:
-                        continue
-                    rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
-                    if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
-                        repaired.append(rr)
-                if repaired:
-                    _LAST_AUTOTRADE_DECISION[uid] = {
-                        "status": "MANAGED",
-                        "when": now_utc.isoformat(timespec="seconds"),
-                        "reason": f"managed_live_exits ({len(repaired)})",
-                        "session": sess,
-                        "mode": AUTOTRADE_MODE,
-                    }
             except Exception:
                 pass
 
