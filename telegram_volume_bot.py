@@ -897,8 +897,7 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DEFAULT_TYPE = "swap"  # bybit futures
 DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
 
-CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "1"))
-MANUAL_SCREEN_SYNC_ENABLED = str(os.environ.get("MANUAL_SCREEN_SYNC_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
+CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "5"))
 
 # -------------------------
 # LOGGING: redact secrets + quiet noisy libs (Render-safe)
@@ -1591,8 +1590,8 @@ AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PC
 # Open-trade count cap for commercial/live safety.
 AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "0") or 0)
 EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
-EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
-EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", True)
+EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "LON,NY") or "LON,NY").split(",") if s.strip()]
+EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", False)
 
 
 # Margin / leverage
@@ -2540,248 +2539,6 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         return result
     except Exception:
         return result
-
-def _autotrade_row_matches_live_position(trade_row: dict, live_pos: dict, entry_tol: float = 0.08, qty_tol: float = 0.60) -> bool:
-    try:
-        sym = _pos_symbol(live_pos)
-        side = _pos_side_text(live_pos)
-        if str(trade_row.get('symbol') or '').upper() != str(sym).upper():
-            return False
-        if str(trade_row.get('side') or '').upper() != str(side).upper():
-            return False
-        live_entry = float(_pos_entry(live_pos) or 0.0)
-        row_entry = float(trade_row.get('entry') or 0.0)
-        live_qty = abs(float(_pos_size(live_pos) or 0.0))
-        row_qty = abs(float(trade_row.get('qty') or 0.0))
-        entry_rel = abs(live_entry - row_entry) / max(abs(live_entry), abs(row_entry), 1e-9) if live_entry > 0 and row_entry > 0 else 999.0
-        qty_rel = abs(live_qty - row_qty) / max(live_qty, row_qty, 1e-9) if live_qty > 0 and row_qty > 0 else 999.0
-        return bool(entry_rel <= float(entry_tol) or qty_rel <= float(qty_tol))
-    except Exception:
-        return False
-
-
-def _autotrade_trade_row_from_live_and_source(live_pos: dict, source_row: dict, source_name: str, note: str = '') -> dict:
-    live_entry = float(_pos_entry(live_pos) or source_row.get('entry') or 0.0)
-    live_qty = abs(float(_pos_size(live_pos) or source_row.get('qty') or 0.0))
-    out = {
-        'symbol': _pos_symbol(live_pos),
-        'side': _pos_side_text(live_pos),
-        'entry': float(live_entry or 0.0),
-        'sl': float(source_row.get('sl') or 0.0),
-        'tp1': float(source_row.get('tp1') or 0.0),
-        'tp2': float(source_row.get('tp2') or 0.0),
-        'tp3': float(source_row.get('tp3') or 0.0),
-        'qty': float(live_qty or 0.0),
-        'conf': int(float(source_row.get('conf') or 0) or 0),
-        'quality_score': float(source_row.get('quality_score') or 0.0),
-        'atr_pct': float(source_row.get('atr_pct') or 0.0),
-        'engine': str(source_row.get('engine') or ''),
-        'session': str(source_row.get('session') or ''),
-        'setup_id': str(source_row.get('setup_id') or ''),
-        '_mgmt_source': str(source_name or ''),
-        '_mgmt_note': str(note or ''),
-    }
-    try:
-        t1, t2, t3 = _ensure_three_tps(float(out.get('entry') or 0.0), float(out.get('sl') or 0.0), float(out.get('tp3') or 0.0), out.get('tp1'), out.get('tp2'), out.get('side'))
-        out['tp1'] = float(t1 or 0.0)
-        out['tp2'] = float(t2 or 0.0)
-        out['tp3'] = float(t3 or 0.0)
-    except Exception:
-        pass
-    return out
-
-
-def _autotrade_guess_management_source(uid: int, live_pos: dict, journal_open: list[dict] | None = None) -> dict | None:
-    sym = _pos_symbol(live_pos)
-    side = _pos_side_text(live_pos)
-    live_entry = float(_pos_entry(live_pos) or 0.0)
-    live_qty = abs(float(_pos_size(live_pos) or 0.0))
-
-    def _entry_rel(a: float, b: float) -> float:
-        try:
-            a = float(a or 0.0)
-            b = float(b or 0.0)
-            if a <= 0 or b <= 0:
-                return 999.0
-            return abs(a - b) / max(abs(a), abs(b), 1e-9)
-        except Exception:
-            return 999.0
-
-    def _qty_rel(a: float, b: float) -> float:
-        try:
-            a = abs(float(a or 0.0))
-            b = abs(float(b or 0.0))
-            if a <= 0 or b <= 0:
-                return 999.0
-            return abs(a - b) / max(a, b, 1e-9)
-        except Exception:
-            return 999.0
-
-    def _sl_ok(entry_v: float, sl_v: float) -> bool:
-        try:
-            entry_v = float(entry_v or 0.0)
-            sl_v = float(sl_v or 0.0)
-            if entry_v <= 0 or sl_v <= 0:
-                return False
-            return sl_v < entry_v if side == 'BUY' else sl_v > entry_v
-        except Exception:
-            return False
-
-    candidates = []
-
-    def _push(source_rank: int, source_name: str, row: dict, stage_ts: float = 0.0, note: str = ''):
-        try:
-            row = dict(row or {})
-            row_entry = float(row.get('entry') or 0.0)
-            row_sl = float(row.get('sl') or 0.0)
-            if not _sl_ok(row_entry or live_entry, row_sl):
-                return
-            rel_e = _entry_rel(row_entry or live_entry, live_entry)
-            rel_q = _qty_rel(float(row.get('qty') or 0.0), live_qty)
-            if rel_e > 0.08 and rel_q > 0.70:
-                return
-            candidates.append((int(source_rank), float(rel_e), float(rel_q), -float(stage_ts or 0.0), source_name, row, note))
-        except Exception:
-            return
-
-    for t in (journal_open or []):
-        try:
-            if not _autotrade_row_matches_live_position(t, live_pos, entry_tol=0.08, qty_tol=0.70):
-                continue
-            _push(0, 'autotrade_journal_open', t, float(t.get('opened_ts') or 0.0), note='journal_open_match')
-        except Exception:
-            continue
-
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT *
-                FROM autotrade_trades
-                WHERE uid=? AND UPPER(symbol)=? AND UPPER(side)=? AND COALESCE(sl,0) > 0
-                ORDER BY CASE WHEN status='OPEN' THEN 0 ELSE 1 END, opened_ts DESC
-                LIMIT 40
-                """,
-                (int(uid), str(sym).upper(), str(side).upper()),
-            )
-            for row in (cur.fetchall() or []):
-                row_d = dict(row)
-                _push(1, 'autotrade_journal_history', row_d, float(row_d.get('opened_ts') or 0.0), note=str(row_d.get('status') or '').lower() or 'journal_history')
-
-            cur.execute(
-                """
-                SELECT
-                    s.setup_id, s.created_ts, s.symbol, s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
-                    COALESCE((SELECT MAX(executable_ts) FROM executable_setups x WHERE x.user_id=? AND x.setup_id=s.setup_id), 0) AS executable_ts,
-                    COALESCE((SELECT MAX(emailed_ts) FROM emailed_setups e WHERE e.user_id=? AND e.setup_id=s.setup_id), 0) AS emailed_ts,
-                    COALESCE((SELECT MAX(created_ts) FROM generated_setups g WHERE g.user_id=? AND g.setup_id=s.setup_id), 0) AS generated_ts,
-                    COALESCE((SELECT session FROM executable_setups x WHERE x.user_id=? AND x.setup_id=s.setup_id ORDER BY executable_ts DESC LIMIT 1),
-                             (SELECT session FROM emailed_setups e WHERE e.user_id=? AND e.setup_id=s.setup_id ORDER BY emailed_ts DESC LIMIT 1),
-                             (SELECT session FROM generated_setups g WHERE g.user_id=? AND g.setup_id=s.setup_id ORDER BY created_ts DESC LIMIT 1),
-                             '') AS src_session
-                FROM signals s
-                WHERE UPPER(s.symbol)=? AND UPPER(s.side)=?
-                ORDER BY s.created_ts DESC
-                LIMIT 60
-                """,
-                (int(uid), int(uid), int(uid), int(uid), int(uid), int(uid), str(sym).upper(), str(side).upper()),
-            )
-            for row in (cur.fetchall() or []):
-                row_d = dict(row)
-                stage_ts = max(float(row_d.get('executable_ts') or 0.0), float(row_d.get('emailed_ts') or 0.0), float(row_d.get('generated_ts') or 0.0), float(row_d.get('created_ts') or 0.0))
-                source_name = 'signal_history'
-                if float(row_d.get('executable_ts') or 0.0) > 0:
-                    source_name = 'executable_signal'
-                elif float(row_d.get('emailed_ts') or 0.0) > 0:
-                    source_name = 'emailed_signal'
-                elif float(row_d.get('generated_ts') or 0.0) > 0:
-                    source_name = 'generated_signal'
-                _push(2, source_name, {
-                    'setup_id': row_d.get('setup_id'),
-                    'session': row_d.get('src_session') or '',
-                    'entry': row_d.get('entry') or 0.0,
-                    'sl': row_d.get('sl') or 0.0,
-                    'tp1': row_d.get('tp1') or 0.0,
-                    'tp2': row_d.get('tp2') or 0.0,
-                    'tp3': row_d.get('tp3') or 0.0,
-                    'qty': live_qty,
-                    'conf': row_d.get('conf') or 0,
-                }, stage_ts, note=str(row_d.get('setup_id') or ''))
-    except Exception:
-        pass
-
-    if not candidates:
-        return None
-
-    source_rank, rel_e, rel_q, neg_ts, source_name, row, note = sorted(candidates, key=lambda x: (x[0], x[1], x[2], x[3]))[0]
-    if float(rel_e or 999.0) > 0.05 and float(rel_q or 999.0) > 0.70:
-        return None
-    return _autotrade_trade_row_from_live_and_source(live_pos, row, source_name, note=note)
-
-
-def _autotrade_collect_live_management_rows(uid: int, positions: list[dict] | None = None, journal_open: list[dict] | None = None) -> tuple[list[tuple[dict, dict]], dict]:
-    positions = list(positions or _bybit_get_open_positions_linear() or [])
-    journal_open = list(journal_open or _autotrade_db_open_trades(int(uid)) or [])
-    managed_pairs: list[tuple[dict, dict]] = []
-    meta_by_key: dict = {}
-    used_trade_ids: set[str] = set()
-
-    for p in positions:
-        sym = _pos_symbol(p)
-        side = _pos_side_text(p)
-        key = (str(sym).upper(), str(side).upper())
-        row = None
-        for t in journal_open:
-            try:
-                tid = str(t.get('trade_id') or '')
-                if tid and tid in used_trade_ids:
-                    continue
-                if _autotrade_row_matches_live_position(t, p, entry_tol=0.08, qty_tol=0.70):
-                    row = _autotrade_trade_row_from_live_and_source(p, t, 'autotrade_journal_open', note='journal_open_match')
-                    if tid:
-                        used_trade_ids.add(tid)
-                    break
-            except Exception:
-                continue
-        if row is None:
-            row = _autotrade_guess_management_source(int(uid), p, journal_open=journal_open)
-        if row is not None:
-            meta_by_key[key] = {
-                'managed': True,
-                'source': str(row.get('_mgmt_source') or ''),
-                'note': str(row.get('_mgmt_note') or ''),
-                'setup_id': str(row.get('setup_id') or ''),
-            }
-            managed_pairs.append((p, row))
-        else:
-            meta_by_key[key] = {
-                'managed': False,
-                'source': '',
-                'note': 'no_reliable_bot_source',
-                'setup_id': '',
-            }
-    return managed_pairs, meta_by_key
-
-
-def _autotrade_best_effort_repair_live_positions(uid: int, positions: list[dict] | None = None, journal_open: list[dict] | None = None) -> dict:
-    out = {'checked': 0, 'repaired': 0, 'results': [], 'meta_by_key': {}}
-    try:
-        if str(AUTOTRADE_MODE).lower() != 'live':
-            return out
-        pairs, meta_by_key = _autotrade_collect_live_management_rows(int(uid), positions=positions, journal_open=journal_open)
-        out['meta_by_key'] = meta_by_key
-        for live_pos, trade_row in pairs:
-            rr = _autotrade_repair_live_exit_protection(int(uid), trade_row, live_pos=live_pos)
-            out['checked'] += 1
-            if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
-                out['repaired'] += 1
-            out['results'].append(rr)
-        return out
-    except Exception:
-        return out
-
 
 def _ts_seconds_from_any(value) -> float:
     try:
@@ -18148,6 +17905,19 @@ def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
     except Exception:
         sent_today = 0
 
+    # Session counters are per live session key. If the stored state still points
+    # to a previous session, do not leak the old session count/gap into the
+    # current status snapshot. This can happen when a new session has started but
+    # no email has been sent yet in that session.
+    try:
+        live_sess = in_session_now(user)
+    except Exception:
+        live_sess = None
+    live_session_key = str((live_sess or {}).get('session_key') or '')
+    if live_session_key and str(st.get('session_key') or '') != live_session_key:
+        sent_in_session = 0
+        last_email_ts = 0.0
+
     gap_sec = max(0, int(gap_min)) * 60
     gap_remaining_sec = max(0, int(round(gap_sec - (time.time() - last_email_ts)))) if gap_sec > 0 and last_email_ts > 0 else 0
 
@@ -20176,7 +19946,7 @@ async def sessions_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sessions_on_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     update_user(uid, sessions_unlimited=1)
-    await update.message.reply_text("✅ Sessions: UNLIMITED (24h emailing + autotrade access enabled).")
+    await update.message.reply_text("✅ Sessions: UNLIMITED (24h emailing enabled).")
 
 async def sessions_off_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -21037,12 +20807,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👉 /billing"
         )
         return
-
-    if is_admin and str(AUTOTRADE_MODE).lower() == 'live':
-        try:
-            _autotrade_best_effort_repair_live_positions(int(AUTOTRADE_OWNER_UID or uid))
-        except Exception:
-            pass
 
     snap = _accounting_snapshot(uid, user, is_admin=is_admin)
     equity = float(snap.get('equity') or 0.0)
@@ -22326,13 +22090,6 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     positions = _bybit_get_open_positions_linear()
-    repair_summary = {'meta_by_key': {}, 'repaired': 0}
-    if positions:
-        try:
-            repair_summary = _autotrade_best_effort_repair_live_positions(int(AUTOTRADE_OWNER_UID or uid), positions=positions)
-            positions = _bybit_get_open_positions_linear()
-        except Exception:
-            repair_summary = {'meta_by_key': {}, 'repaired': 0}
     if not positions:
         await update.message.reply_text("✅ No open positions found.")
         return
@@ -22362,18 +22119,10 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"   • Entry: {fmt_price(entry)}   | Mark: {fmt_price(mark)}")
         lines.append(f"   • PnL: {pnl:+.2f} USDT")
 
-        meta = dict((repair_summary.get('meta_by_key') or {}).get((str(sym).upper(), str(side).upper())) or {})
         if sl and sl > 0:
             lines.append(f"   • SL: {fmt_price(sl)}   | Risk est: {risk:.2f} USDT")
         else:
-            reason_txt = str(meta.get('note') or 'needs SL')
-            lines.append(f"   • SL: —   | Risk est: — ({reason_txt})")
-
-        if bool(meta.get('managed')):
-            src_txt = str(meta.get('source') or 'managed')
-            lines.append(f"   • Managed: YES | Source: {src_txt}")
-        else:
-            lines.append("   • Managed: NO | Source: unavailable")
+            lines.append("   • SL: —   | Risk est: — (needs SL)")
 
         ct = p.get("createdTime") or p.get("created_time") or ""
         ut = p.get("updatedTime") or p.get("updated_time") or ""
@@ -23789,19 +23538,17 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 int(update.effective_user.id),
             )
 
-            sync_info = {}
-            if MANUAL_SCREEN_SYNC_ENABLED:
-                try:
-                    sync_info = await _screen_sync_pipeline_async(
-                        int(update.effective_user.id),
-                        user or {},
-                        live_session,
-                        scan_session,
-                        best_fut,
-                        list(shown_setups or []),
-                    )
-                except Exception:
-                    sync_info = {"status": "error", "reason": "screen_sync_failed"}
+            try:
+                sync_info = await _screen_sync_pipeline_async(
+                    int(update.effective_user.id),
+                    user or {},
+                    live_session,
+                    scan_session,
+                    best_fut,
+                    list(shown_setups or []),
+                )
+            except Exception:
+                sync_info = {"status": "error", "reason": "screen_sync_failed"}
 
             # Cache for fast subsequent /screen calls (user + session scoped)
             _SCREEN_CACHE[cache_key] = {
@@ -24832,14 +24579,6 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
             sess_name = str(sess.get("name") or "").upper()
             display_sess = sess_name
-            setups_all = setups_by_session.get(sess_name, []) or []
-            if not setups_all:
-                _LAST_EMAIL_DECISION[uid] = {
-                    "status": "SKIP",
-                    "reasons": [f"no_setups_generated_for_session ({display_sess})"],
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                }
-                continue
 
             # state init must not crash job
             try:
@@ -24854,13 +24593,24 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 _LAST_EMAIL_ERROR[uid] = dict(_tmp_dec)
                 continue
 
-            # Reset session state if session_key changed
+            # Reset session state as soon as the live session changes, even if
+            # this session has no setups yet. Otherwise /status can keep showing
+            # the previous session's sent_count until the first new email.
             try:
                 if str(st.get("session_key")) != str(sess.get("session_key")):
                     email_state_set(uid, session_key=str(sess.get("session_key")), sent_count=0, last_email_ts=0.0)
                     st = email_state_get(uid)
             except Exception:
                 pass
+
+            setups_all = setups_by_session.get(sess_name, []) or []
+            if not setups_all:
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "SKIP",
+                    "reasons": [f"no_setups_generated_for_session ({display_sess})"],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                continue
 
             # Safe defaults (never KeyError)
             try:
@@ -26114,20 +25864,6 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             sess = current_session_utc(now_utc)
 
         async with AUTOTRADE_EXEC_LOCK:
-            repair_summary = {'checked': 0, 'repaired': 0, 'results': [], 'meta_by_key': {}}
-            try:
-                repair_summary = _autotrade_best_effort_repair_live_positions(int(uid))
-                if int(repair_summary.get('repaired') or 0) > 0:
-                    _LAST_AUTOTRADE_DECISION[uid] = {
-                        "status": "MANAGED",
-                        "when": now_utc.isoformat(timespec="seconds"),
-                        "reason": f"managed_live_exits ({int(repair_summary.get('repaired') or 0)})",
-                        "session": str(sess or 'NONE'),
-                        "mode": AUTOTRADE_MODE,
-                    }
-            except Exception:
-                repair_summary = {'checked': 0, 'repaired': 0, 'results': [], 'meta_by_key': {}}
-
             if not owner_unlimited and not live_sess:
                 _LAST_AUTOTRADE_DECISION[uid] = {
                     "status": "SKIP",
@@ -26135,7 +25871,6 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     "reason": "outside_live_session_window",
                     "session": "NONE",
                     "mode": AUTOTRADE_MODE,
-                    "managed_live_repair": int(repair_summary.get('repaired') or 0),
                 }
                 return
             if sess not in {"ASIA", "LON", "NY"}:
@@ -26145,30 +25880,48 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     "reason": f"invalid_target_session ({sess or 'NONE'})",
                     "session": str(sess or "NONE"),
                     "mode": AUTOTRADE_MODE,
-                    "managed_live_repair": int(repair_summary.get('repaired') or 0),
                 }
                 return
-            if (not owner_unlimited) and (not _autotrade_allowed_session(sess)):
+            if not _autotrade_allowed_session(sess):
                 _LAST_AUTOTRADE_DECISION[uid] = {
                     "status": "SKIP",
                     "when": now_utc.isoformat(timespec="seconds"),
                     "reason": f"session_not_allowed ({sess})",
-                    "managed_live_repair": int(repair_summary.get('repaired') or 0),
                 }
                 return
 
-            # Optional: respect user's trade window (if configured) for NEW entries only.
-            # Sessions UNLIMITED means 24h new-entry access too, so reuse the same helper
-            # that already returns True when sessions_unlimited=1.
+            # Optional: respect user's trade window (if configured)
             try:
-                if not in_trade_window_now(user):
+                if not trade_window_allows_now(user):
                     _LAST_AUTOTRADE_DECISION[uid] = {
                         "status": "SKIP",
                         "when": now_utc.isoformat(timespec="seconds"),
                         "reason": "trade_window_block",
-                        "managed_live_repair": int(repair_summary.get('repaired') or 0),
                     }
                     return
+            except Exception:
+                pass
+
+            # Keep live exit protection synchronized with Bybit before considering new entries.
+            try:
+                repaired = []
+                live_map = {(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper()): p for p in (_bybit_get_open_positions_linear() or [])}
+                for tr in (_autotrade_db_open_trades(int(uid)) or []):
+                    key = (str(tr.get('symbol') or '').upper(), str(tr.get('side') or '').upper())
+                    p = live_map.get(key)
+                    if not p:
+                        continue
+                    rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
+                    if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
+                        repaired.append(rr)
+                if repaired:
+                    _LAST_AUTOTRADE_DECISION[uid] = {
+                        "status": "MANAGED",
+                        "when": now_utc.isoformat(timespec="seconds"),
+                        "reason": f"managed_live_exits ({len(repaired)})",
+                        "session": sess,
+                        "mode": AUTOTRADE_MODE,
+                    }
             except Exception:
                 pass
 
