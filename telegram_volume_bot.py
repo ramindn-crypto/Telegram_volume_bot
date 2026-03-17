@@ -898,7 +898,7 @@ DEFAULT_TYPE = "swap"  # bybit futures
 DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
 
 CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "1"))
-MANUAL_SCREEN_SYNC_ENABLED = _env_bool("MANUAL_SCREEN_SYNC_ENABLED", False)
+MANUAL_SCREEN_SYNC_ENABLED = env_bool("MANUAL_SCREEN_SYNC_ENABLED", False)
 
 # -------------------------
 # LOGGING: redact secrets + quiet noisy libs (Render-safe)
