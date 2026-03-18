@@ -1689,6 +1689,7 @@ AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY = float(os.environ.get("AUTOTRADE_BE_AFTER_TP
 AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT", "6.0") or 6.0)
 AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY,LON") or "NY,LON").upper().replace(' ', '').split(','))
 AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES", "A,C") or "A,C").upper().replace(' ', '').split(','))
+AUTOTRADE_MIN_SL_LIQ_BUFFER_PCT = float(os.environ.get("AUTOTRADE_MIN_SL_LIQ_BUFFER_PCT", "0.15") or 0.15)
 # Live market-order entries must still stay close to the setup entry. Otherwise the bot can
 # execute a stale emailed setup at a materially worse price just because it is still inside
 # the time window. This guard keeps the email/setup engine and live execution aligned.
@@ -2277,6 +2278,12 @@ def _pos_take_profit(p: dict) -> float:
     except Exception:
         return 0.0
 
+def _pos_liq(p: dict) -> float:
+    try:
+        return float(p.get("liqPrice") or 0.0)
+    except Exception:
+        return 0.0
+
 
 def _price_close_enough(a: float, b: float, rel_tol: float = 0.002, abs_tol: float = 1e-8) -> bool:
     try:
@@ -2408,6 +2415,7 @@ def _backtest_should_move_sl_to_be_after_tp1(setup: "Setup", session_name: str) 
         return False
 
 
+
 def _autotrade_live_exit_plan_from_targets(entry: float, sl: float, tp1, tp2, tp3, side: str) -> dict:
     t1, t2, t3 = _ensure_three_tps(float(entry or 0.0), float(sl or 0.0), float(tp3 or 0.0), tp1, tp2, str(side or ''))
     final_tp = float(t2 or t3 or t1 or 0.0)
@@ -2433,172 +2441,149 @@ def _autotrade_live_exit_plan_for_trade(trade_or_setup) -> dict:
     )
 
 
-def _bybit_has_matching_reduce_only_limit_tp(symbol: str, close_side: str, tp_price: float) -> bool:
-    sym = _bybit_linear_symbol(symbol)
-    want_side = str(close_side or '').upper().strip()
-    for o in _bybit_get_open_orders_linear(sym):
+def _bybit_order_is_active(order: dict) -> bool:
+    try:
+        status = str((order or {}).get('orderStatus') or '').upper().strip()
+        return status not in {'FILLED', 'CANCELLED', 'REJECTED', 'DEACTIVATED'}
+    except Exception:
+        return False
+
+
+def _bybit_order_trigger_price(order: dict) -> float:
+    for key in ('triggerPrice', 'takeProfit', 'stopLoss', 'price'):
         try:
-            if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
-                continue
-            if want_side and str(o.get('side') or '').upper().strip() != want_side:
-                continue
-            if not _bybit_is_manual_reduce_only_limit_tp_order(o):
-                continue
-            px = float(o.get('price') or o.get('triggerPrice') or 0.0)
-            if _price_close_enough(px, tp_price, rel_tol=0.0010):
-                return True
+            v = float((order or {}).get(key) or 0.0)
+            if v > 0:
+                return v
         except Exception:
             continue
-    return False
+    return 0.0
 
 
-def _bybit_has_open_tp_order_at(symbol: str, tp_price: float, side: str | None = None) -> bool:
-    sym = _bybit_linear_symbol(symbol)
-    side_u = str(side or '').upper().strip()
-    close_side = ''
-    if side_u == 'BUY':
-        close_side = 'SELL'
-    elif side_u == 'SELL':
-        close_side = 'BUY'
-    return _bybit_has_matching_reduce_only_limit_tp(sym, close_side, float(tp_price or 0.0))
+def _bybit_order_qty_open(order: dict) -> float:
+    for key in ('leavesQty', 'qty'):
+        try:
+            v = float((order or {}).get(key) or 0.0)
+            if v > 0:
+                return v
+        except Exception:
+            continue
+    return 0.0
 
 
-def _autotrade_place_reduce_only_tp_orders(symbol: str, side: str, tp_targets: list[float], base_qty: float, tp1_fraction: float | None = None) -> list[dict]:
-    """Place visible TP orders as explicit reduce-only limit orders.
-
-    This is the live-test friendly architecture:
-    - SL stays on the position via /v5/position/trading-stop
-    - TP1 / TP2 sit on the order book as reduce-only limit orders
-
-    Result: exact TP prices are visible on the chart and in the Orders tab.
-    """
-    results = []
+def _bybit_get_open_stop_orders_linear(symbol: str | None = None) -> list[dict]:
     try:
-        sym = _bybit_linear_symbol(symbol)
-        side_u = str(side or '').upper().strip()
-        if side_u not in {'BUY', 'SELL'}:
-            return [{'idx': 0, 'tp': 0.0, 'qty': 0.0, 'ok': False, 'retMsg': 'bad_side'}]
-        filt = _bybit_get_instr_filters(sym)
-        qty_step = filt.get('qtyStep')
-        tp_targets = _dedupe_price_targets([float(x or 0.0) for x in (tp_targets or [])])
-        if not tp_targets:
+        if not BYBIT_API_KEY or not BYBIT_API_SECRET:
             return []
-
-        n_targets = len(tp_targets)
-        if n_targets == 1:
-            splits = [1.0]
-        elif n_targets == 2:
-            first = float(tp1_fraction if tp1_fraction is not None else AUTOTRADE_LIVE_TP1_FRACTION)
-            first = max(0.10, min(0.90, first))
-            splits = [first, max(0.0, 1.0 - first)]
-        else:
-            splits = list(AUTOTRADE_TP_SPLIT[:n_targets])
-            if len(splits) < n_targets:
-                splits += [0.0] * (n_targets - len(splits))
-            if sum(splits) <= 0:
-                splits = [1.0 / max(1, n_targets)] * max(1, n_targets)
-
-        total = float(sum(splits) or 1.0)
-        splits = [float(x) / total for x in splits]
-        remaining_qty = float(base_qty or 0.0)
-        close_side = 'Sell' if side_u == 'BUY' else 'Buy'
-        price_rounding = ROUND_DOWN if side_u == 'BUY' else ROUND_UP
-
-        for idx, tp in enumerate(tp_targets, start=1):
-            if float(tp or 0.0) <= 0 or remaining_qty <= 0:
-                continue
-            raw_qty = float(base_qty or 0.0) * float(splits[min(idx - 1, len(splits) - 1)])
-            if idx == len(tp_targets):
-                raw_qty = remaining_qty
-            qty_i, qreason = _round_qty_down(sym, raw_qty, tp)
-            if not qty_i or qty_i <= 0:
-                results.append({'idx': idx, 'tp': float(tp), 'qty': 0.0, 'ok': False, 'retMsg': str(qreason or 'qty_invalid')})
-                continue
-            remaining_qty = max(0.0, remaining_qty - float(qty_i))
-            limit_price = _round_price_to_tick(sym, float(tp), rounding=price_rounding)
-            if limit_price <= 0:
-                limit_price = float(tp)
-            payload = {
-                'category': 'linear',
-                'symbol': sym,
-                'side': close_side,
-                'orderType': 'Limit',
-                'qty': _fmt_qty(qty_i, qty_step),
-                'price': str(float(limit_price)),
-                'timeInForce': 'GTC',
-                'reduceOnly': True,
-                'closeOnTrigger': True,
-                'orderLinkId': _autotrade_manual_tp_order_link_id(sym, bucket=f'TP{idx}'),
-            }
-            res = _bybit_v5_request('POST', '/v5/order/create', payload)
-            results.append({
-                'idx': idx,
-                'tp': float(limit_price),
-                'qty': float(qty_i),
-                'ok': int((res or {}).get('retCode', -1)) == 0,
-                'retCode': (res or {}).get('retCode'),
-                'retMsg': (res or {}).get('retMsg'),
-                'order_payload': payload,
-            })
-        return results
-    except Exception as e:
-        return [{'idx': 0, 'tp': 0.0, 'qty': 0.0, 'ok': False, 'retMsg': f'{type(e).__name__}: {e}'}]
+        payload = {'category': 'linear', 'openOnly': 0, 'limit': 50, 'orderFilter': 'StopOrder'}
+        if symbol:
+            payload['symbol'] = _bybit_linear_symbol(symbol)
+        res = _bybit_v5_request('GET', '/v5/order/realtime', payload)
+        if int((res or {}).get('retCode', -1)) != 0:
+            return []
+        return (((res or {}).get('result') or {}).get('list') or [])
+    except Exception:
+        return []
 
 
+def _bybit_live_close_side_for_position(side: str | None) -> str:
+    side_u = str(side or '').upper().strip()
+    if side_u == 'BUY':
+        return 'SELL'
+    if side_u == 'SELL':
+        return 'BUY'
+    return ''
 
-def _autotrade_place_partial_tp1_order(symbol: str, side: str, tp_price: float, base_qty: float, tp1_fraction: float | None = None) -> dict:
-    """Place only the partial TP1 as a visible reduce-only limit order.
 
-    The final TP is attached directly to the live position via trading-stop so the
-    Bybit position screen always shows both SL and TP. This helper only handles the
-    partial TP1 ladder leg.
-    """
+def _bybit_list_live_exit_orders(symbol: str, side: str | None = None) -> list[dict]:
+    sym = _bybit_linear_symbol(symbol)
+    want_close_side = _bybit_live_close_side_for_position(side)
+    seen = set()
+    out = []
+    raw_orders = []
     try:
-        sym = _bybit_linear_symbol(symbol)
-        side_u = str(side or '').upper().strip()
-        tp_val = float(tp_price or 0.0)
-        base_qty = float(base_qty or 0.0)
-        if side_u not in {'BUY', 'SELL'}:
-            return {'idx': 1, 'tp': tp_val, 'qty': 0.0, 'ok': False, 'retMsg': 'bad_side'}
-        if tp_val <= 0 or base_qty <= 0:
-            return {'idx': 1, 'tp': tp_val, 'qty': 0.0, 'ok': False, 'retMsg': 'bad_tp_or_qty'}
-        filt = _bybit_get_instr_filters(sym)
-        qty_step = filt.get('qtyStep')
-        frac = float(tp1_fraction if tp1_fraction is not None else AUTOTRADE_LIVE_TP1_FRACTION)
-        frac = max(0.10, min(0.90, frac))
-        raw_qty = base_qty * frac
-        qty_i, qreason = _round_qty_down(sym, raw_qty, tp_val)
-        if not qty_i or qty_i <= 0:
-            return {'idx': 1, 'tp': tp_val, 'qty': 0.0, 'ok': False, 'retMsg': str(qreason or 'qty_invalid')}
-        close_side = 'Sell' if side_u == 'BUY' else 'Buy'
-        price_rounding = ROUND_DOWN if side_u == 'BUY' else ROUND_UP
-        limit_price = _round_price_to_tick(sym, tp_val, rounding=price_rounding)
-        if limit_price <= 0:
-            limit_price = tp_val
-        payload = {
-            'category': 'linear',
-            'symbol': sym,
-            'side': close_side,
-            'orderType': 'Limit',
-            'qty': _fmt_qty(qty_i, qty_step),
-            'price': str(float(limit_price)),
-            'timeInForce': 'GTC',
-            'reduceOnly': True,
-            'closeOnTrigger': True,
-            'orderLinkId': _autotrade_manual_tp_order_link_id(sym, bucket='TP1'),
-        }
-        res = _bybit_v5_request('POST', '/v5/order/create', payload)
-        return {
-            'idx': 1,
-            'tp': float(limit_price),
-            'qty': float(qty_i),
-            'ok': int((res or {}).get('retCode', -1)) == 0,
-            'retCode': (res or {}).get('retCode'),
-            'retMsg': (res or {}).get('retMsg'),
-            'order_payload': payload,
-        }
-    except Exception as e:
-        return {'idx': 1, 'tp': float(tp_price or 0.0), 'qty': 0.0, 'ok': False, 'retMsg': f'{type(e).__name__}: {e}'}
+        raw_orders.extend(_bybit_get_open_stop_orders_linear(sym) or [])
+    except Exception:
+        pass
+    try:
+        raw_orders.extend(_bybit_get_open_orders_linear(sym) or [])
+    except Exception:
+        pass
+    for o in raw_orders:
+        try:
+            oid = str((o or {}).get('orderId') or '')
+            if oid and oid in seen:
+                continue
+            if oid:
+                seen.add(oid)
+            if _bybit_linear_symbol(str((o or {}).get('symbol') or '')) != sym:
+                continue
+            if not _bybit_order_is_active(o):
+                continue
+            stop_type = str((o or {}).get('stopOrderType') or '').upper().strip()
+            if stop_type not in {'TAKEPROFIT', 'PARTIALTAKEPROFIT', 'STOPLOSS', 'PARTIALSTOPLOSS'}:
+                continue
+            o_side = str((o or {}).get('side') or '').upper().strip()
+            if want_close_side and o_side and o_side != want_close_side:
+                continue
+            kind = 'TP' if stop_type in {'TAKEPROFIT', 'PARTIALTAKEPROFIT'} else 'SL'
+            px = _bybit_order_trigger_price(o)
+            qty = _bybit_order_qty_open(o)
+            out.append({
+                'kind': kind,
+                'stopOrderType': stop_type,
+                'price': float(px or 0.0),
+                'qty': float(qty or 0.0),
+                'orderId': oid,
+                'side': o_side,
+                'positionIdx': int(float((o or {}).get('positionIdx') or 0) or 0),
+                'raw': o,
+            })
+        except Exception:
+            continue
+    return out
+
+
+def _bybit_collect_live_exit_snapshot(symbol: str, side: str | None, entry: float = 0.0) -> dict:
+    orders = _bybit_list_live_exit_orders(symbol, side=side)
+    tp_orders = [o for o in orders if o.get('kind') == 'TP' and float(o.get('price') or 0.0) > 0.0]
+    sl_orders = [o for o in orders if o.get('kind') == 'SL' and float(o.get('price') or 0.0) > 0.0]
+    entry = float(entry or 0.0)
+    if entry > 0:
+        tp_orders.sort(key=lambda x: abs(float(x.get('price') or 0.0) - entry))
+    else:
+        tp_orders.sort(key=lambda x: float(x.get('price') or 0.0))
+    uniq_tp_prices = []
+    for o in tp_orders:
+        px = float(o.get('price') or 0.0)
+        if px <= 0:
+            continue
+        if any(_price_close_enough(px, seen, rel_tol=0.0010) for seen in uniq_tp_prices):
+            continue
+        uniq_tp_prices.append(px)
+    sl_price = 0.0
+    for o in sl_orders:
+        px = float(o.get('price') or 0.0)
+        if px > 0:
+            sl_price = px
+            break
+    return {
+        'orders': orders,
+        'tp_orders': tp_orders,
+        'sl_orders': sl_orders,
+        'tp_prices': uniq_tp_prices,
+        'sl_price': float(sl_price or 0.0),
+    }
+
+
+def _bybit_has_live_exit_price(symbol: str, side: str | None, kind: str, price: float, entry: float = 0.0) -> bool:
+    if float(price or 0.0) <= 0:
+        return False
+    snap = _bybit_collect_live_exit_snapshot(symbol, side=side, entry=entry)
+    if str(kind or '').upper().strip() == 'TP':
+        return any(_price_close_enough(float(price), float(px), rel_tol=0.0010) for px in (snap.get('tp_prices') or []))
+    live_sl = float(snap.get('sl_price') or 0.0)
+    return live_sl > 0 and _price_close_enough(float(price), live_sl, rel_tol=0.0010)
 
 
 def _autotrade_cancel_reduce_only_tp_orders(symbol: str) -> int:
@@ -2620,6 +2605,263 @@ def _autotrade_cancel_reduce_only_tp_orders(symbol: str) -> int:
             continue
     return count
 
+
+def _autotrade_cancel_live_exit_orders(symbol: str, side: str | None = None) -> dict:
+    sym = _bybit_linear_symbol(symbol)
+    cancelled = 0
+    errors = []
+    seen = set()
+    _autotrade_cancel_reduce_only_tp_orders(sym)
+    for item in _bybit_list_live_exit_orders(sym, side=side):
+        try:
+            oid = str(item.get('orderId') or '')
+            if not oid or oid in seen:
+                continue
+            seen.add(oid)
+            payload = {'category': 'linear', 'symbol': sym, 'orderId': oid}
+            res = _bybit_v5_request('POST', '/v5/order/cancel', payload)
+            if int((res or {}).get('retCode', -1)) == 0:
+                cancelled += 1
+            else:
+                errors.append(str((res or {}).get('retMsg') or (res or {}).get('retCode') or 'cancel_failed'))
+        except Exception as e:
+            errors.append(f'{type(e).__name__}: {e}')
+    return {'cancelled': int(cancelled), 'errors': errors}
+
+
+def _autotrade_stop_vs_liq_invalid(symbol: str, side: str, stop_loss: float, live_pos: dict | None = None) -> dict:
+    sym = _bybit_linear_symbol(symbol)
+    side_u = str(side or '').upper().strip()
+    pos = live_pos or _autotrade_find_live_position(sym, side=side_u) or _autotrade_find_live_position(sym, side=None)
+    liq = float(_pos_liq(pos or {}) or 0.0)
+    sl = float(stop_loss or 0.0)
+    filt = _bybit_get_instr_filters(sym)
+    tick = 0.0
+    try:
+        tick = float(filt.get('tickSize') or 0.0)
+    except Exception:
+        tick = 0.0
+    buffer_abs = max((tick * 2.0) if tick > 0 else 0.0, liq * (float(AUTOTRADE_MIN_SL_LIQ_BUFFER_PCT or 0.0) / 100.0))
+    invalid = False
+    if liq > 0 and sl > 0:
+        if side_u == 'BUY':
+            invalid = sl <= (liq + buffer_abs)
+        elif side_u == 'SELL':
+            invalid = sl >= (liq - buffer_abs)
+    return {
+        'ok': not bool(invalid),
+        'invalid': bool(invalid),
+        'symbol': sym,
+        'side': side_u,
+        'liq_price': float(liq or 0.0),
+        'stop_loss': float(sl or 0.0),
+        'buffer_abs': float(buffer_abs or 0.0),
+    }
+
+
+def _autotrade_place_partial_tpsl_pair(symbol: str, side: str, tp_price: float, sl_price: float, qty: float, live_pos: dict | None = None) -> dict:
+    sym = _bybit_linear_symbol(symbol)
+    side_u = str(side or '').upper().strip()
+    tp_val = float(tp_price or 0.0)
+    sl_val = float(sl_price or 0.0)
+    qty_val = float(qty or 0.0)
+    out = {
+        'ok': False,
+        'symbol': sym,
+        'side': side_u,
+        'tp': float(tp_val or 0.0),
+        'sl': float(sl_val or 0.0),
+        'qty': float(qty_val or 0.0),
+        'retCode': -1,
+        'retMsg': 'not_attempted',
+    }
+    if side_u not in {'BUY', 'SELL'}:
+        out['retMsg'] = 'bad_side'
+        return out
+    if tp_val <= 0 or sl_val <= 0 or qty_val <= 0:
+        out['retMsg'] = 'bad_tp_sl_or_qty'
+        return out
+    filt = _bybit_get_instr_filters(sym)
+    qty_step = filt.get('qtyStep')
+    qty_i, qreason = _round_qty_down(sym, qty_val, tp_val)
+    if not qty_i or qty_i <= 0:
+        out['retMsg'] = str(qreason or 'qty_invalid')
+        return out
+    idx_candidates = _autotrade_position_idx_candidates(side=side_u, live_pos=live_pos)
+    last = dict(out)
+    for idx in idx_candidates:
+        payload = {
+            'category': 'linear',
+            'symbol': sym,
+            'tpslMode': 'Partial',
+            'positionIdx': int(idx),
+            'takeProfit': str(float(tp_val)),
+            'stopLoss': str(float(sl_val)),
+            'tpSize': _fmt_qty(qty_i, qty_step),
+            'slSize': _fmt_qty(qty_i, qty_step),
+            'tpOrderType': 'Market',
+            'slOrderType': 'Market',
+            'tpTriggerBy': 'MarkPrice',
+            'slTriggerBy': 'MarkPrice',
+        }
+        res = _bybit_v5_request('POST', '/v5/position/trading-stop', payload)
+        rc = int((res or {}).get('retCode', -1))
+        last = {
+            'ok': rc == 0,
+            'symbol': sym,
+            'side': side_u,
+            'tp': float(tp_val),
+            'sl': float(sl_val),
+            'qty': float(qty_i),
+            'retCode': rc,
+            'retMsg': str((res or {}).get('retMsg') or ''),
+            'payload': payload,
+            'response': res,
+        }
+        if rc == 0:
+            return last
+    return last
+
+
+def _autotrade_verify_exact_setup_exit_orders(symbol: str, side: str, entry: float, stop_loss: float, tp1: float, tp2: float) -> dict:
+    sym = _bybit_linear_symbol(symbol)
+    side_u = str(side or '').upper().strip()
+    entry = float(entry or 0.0)
+    sl = float(stop_loss or 0.0)
+    t1 = float(tp1 or 0.0)
+    t2 = float(tp2 or 0.0)
+    snap = _bybit_collect_live_exit_snapshot(sym, side=side_u, entry=entry)
+    tp_prices = list(snap.get('tp_prices') or [])
+    live_sl = float(snap.get('sl_price') or 0.0)
+    distinct_tps = []
+    for px in (t1, t2):
+        if px <= 0:
+            continue
+        if any(_price_close_enough(px, seen, rel_tol=0.0010) for seen in distinct_tps):
+            continue
+        distinct_tps.append(px)
+    tp_matches = []
+    for px in distinct_tps:
+        tp_matches.append({'price': float(px), 'matched': any(_price_close_enough(px, got, rel_tol=0.0010) for got in tp_prices)})
+    return {
+        'symbol': sym,
+        'side': side_u,
+        'live_sl': float(live_sl or 0.0),
+        'live_tp_prices': tp_prices,
+        'live_orders': snap.get('orders') or [],
+        'sl_match': bool(sl <= 0 or (live_sl > 0 and _price_close_enough(live_sl, sl, rel_tol=0.0010))),
+        'tp1_match': bool(t1 <= 0 or any(_price_close_enough(t1, got, rel_tol=0.0010) for got in tp_prices)),
+        'tp2_match': bool(t2 <= 0 or any(_price_close_enough(t2, got, rel_tol=0.0010) for got in tp_prices)),
+        'required_tp_count': len(distinct_tps),
+        'live_tp_count': len(tp_prices),
+        'tp_matches': tp_matches,
+        'all_matched': bool((sl <= 0 or (live_sl > 0 and _price_close_enough(live_sl, sl, rel_tol=0.0010))) and all(x.get('matched') for x in tp_matches)),
+    }
+
+
+def _autotrade_sync_exact_setup_exit_orders(symbol: str, side: str, entry: float, stop_loss: float, tp1: float, tp2: float, base_qty: float, live_pos: dict | None = None, verify: bool = False, verify_attempts: int = 6, verify_delay_sec: float = 0.50) -> dict:
+    sym = _bybit_linear_symbol(symbol)
+    side_u = str(side or '').upper().strip()
+    pos = live_pos or _autotrade_find_live_position(sym, side=side_u) or _autotrade_find_live_position(sym, side=None)
+    out = {
+        'ok': False,
+        'verified': False,
+        'symbol': sym,
+        'side': side_u,
+        'entry': float(entry or 0.0),
+        'sl': float(stop_loss or 0.0),
+        'tp1': float(tp1 or 0.0),
+        'tp2': float(tp2 or 0.0),
+        'qty': float(base_qty or 0.0),
+        'pairs': [],
+        'cancel': {'cancelled': 0, 'errors': []},
+        'verify': {},
+        'retMsg': 'not_attempted',
+    }
+    if side_u not in {'BUY', 'SELL'}:
+        out['retMsg'] = 'bad_side'
+        return out
+    if not pos:
+        out['retMsg'] = 'position_not_found'
+        return out
+    live_qty = abs(float(_pos_size(pos) or 0.0))
+    use_qty = min(float(base_qty or 0.0), live_qty) if float(base_qty or 0.0) > 0 else live_qty
+    if use_qty <= 0:
+        out['retMsg'] = 'qty_zero'
+        return out
+
+    liq_check = _autotrade_stop_vs_liq_invalid(sym, side_u, stop_loss, live_pos=pos)
+    out['liq_check'] = liq_check
+    if liq_check.get('invalid'):
+        out['retMsg'] = 'stop_beyond_liq'
+        return out
+
+    cancel_info = _autotrade_cancel_live_exit_orders(sym, side=side_u)
+    out['cancel'] = cancel_info
+
+    t1 = float(tp1 or 0.0)
+    t2 = float(tp2 or 0.0)
+    sl = float(stop_loss or 0.0)
+    distinct_targets = []
+    for px in (t1, t2):
+        if px <= 0:
+            continue
+        if any(_price_close_enough(px, seen, rel_tol=0.0010) for seen in distinct_targets):
+            continue
+        distinct_targets.append(px)
+    if not distinct_targets:
+        out['retMsg'] = 'no_tp_targets'
+        return out
+
+    filt = _bybit_get_instr_filters(sym)
+    qty_step = filt.get('qtyStep')
+    pair_specs = []
+    if len(distinct_targets) == 1:
+        qty_i, qreason = _round_qty_down(sym, use_qty, distinct_targets[0])
+        if not qty_i or qty_i <= 0:
+            out['retMsg'] = str(qreason or 'qty_invalid')
+            return out
+        pair_specs.append((distinct_targets[0], qty_i))
+    else:
+        frac = float(AUTOTRADE_LIVE_TP1_FRACTION)
+        frac = max(0.10, min(0.90, frac))
+        raw_q1 = use_qty * frac
+        q1, qreason1 = _round_qty_down(sym, raw_q1, distinct_targets[0])
+        if not q1 or q1 <= 0:
+            out['retMsg'] = str(qreason1 or 'tp1_qty_invalid')
+            return out
+        raw_q2 = max(0.0, use_qty - float(q1))
+        q2, qreason2 = _round_qty_down(sym, raw_q2, distinct_targets[1])
+        if not q2 or q2 <= 0:
+            out['retMsg'] = str(qreason2 or 'tp2_qty_invalid')
+            return out
+        pair_specs.append((distinct_targets[0], q1))
+        pair_specs.append((distinct_targets[1], q2))
+
+    pair_results = []
+    for tp_px, qty_i in pair_specs:
+        res = _autotrade_place_partial_tpsl_pair(sym, side_u, tp_px, sl, qty_i, live_pos=pos)
+        pair_results.append(res)
+    out['pairs'] = pair_results
+    if not pair_results or not all(bool(x.get('ok')) for x in pair_results):
+        out['retMsg'] = 'pair_create_failed'
+        return out
+
+    out['ok'] = True
+    out['retMsg'] = 'ok'
+    if not verify:
+        return out
+
+    verify_info = {}
+    for _ in range(max(1, int(verify_attempts or 1))):
+        verify_info = _autotrade_verify_exact_setup_exit_orders(sym, side_u, float(entry or 0.0), sl, t1, t2)
+        if bool(verify_info.get('all_matched')):
+            out['verified'] = True
+            out['verify'] = verify_info
+            return out
+        time.sleep(max(0.10, float(verify_delay_sec or 0.0)))
+    out['verify'] = verify_info
+    return out
 
 def _autotrade_position_idx_candidates(side: str | None = None, live_pos: dict | None = None) -> list[int]:
     side_u = str(side or '').upper().strip()
@@ -2762,6 +3004,7 @@ def _autotrade_close_live_position_market(symbol: str, side: str, live_pos: dict
     }
 
 
+
 def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: dict | None = None) -> dict:
     result = {'checked': False, 'sl_fixed': False, 'tp_fixed': False, 'tp1_order_fixed': False, 'be_applied': False, 'symbol': '', 'side': ''}
     try:
@@ -2783,8 +3026,6 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         partial_tp = float(plan.get('partial_tp') or 0.0)
         final_tp = float(plan.get('final_tp') or 0.0)
         entry = float(_pos_entry(pos) or trade_row.get('entry') or 0.0)
-        current_sl = float(_pos_stop(pos) or 0.0)
-        current_tp = float(_pos_take_profit(pos) or 0.0)
         target_sl = float(trade_row.get('sl') or 0.0)
         initial_qty = abs(float(trade_row.get('qty') or 0.0))
         live_qty = abs(float(_pos_size(pos) or 0.0))
@@ -2794,18 +3035,15 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         engine = str(trade_row.get('engine') or '').upper().strip()
         sess = str(trade_row.get('session') or '').upper().strip()
 
+        exit_snap = _autotrade_verify_exact_setup_exit_orders(sym, side, entry, target_sl, partial_tp, final_tp)
         tp1_hit = False
         be_allowed = False
-        partial_tp_distinct = bool(partial_tp > 0 and not _price_close_enough(partial_tp, final_tp, rel_tol=0.0010))
+        partial_tp_distinct = bool(partial_tp > 0 and final_tp > 0 and not _price_close_enough(partial_tp, final_tp, rel_tol=0.0010))
         if AUTOTRADE_BE_AFTER_TP1_ENABLED and entry > 0 and final_tp > 0 and initial_qty > 0 and live_qty > 0:
             partial_fraction = float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION)
             qty_drop_threshold = max(initial_qty * 0.45, initial_qty * (1.0 - partial_fraction + 0.08))
             qty_reduced = live_qty < max(initial_qty * 0.98, initial_qty - max(1e-9, initial_qty * 0.02))
-            tp1_order_still_open = False
-            try:
-                tp1_order_still_open = _bybit_has_open_tp_order_at(sym, partial_tp, side=side) if partial_tp_distinct else False
-            except Exception:
-                tp1_order_still_open = False
+            tp1_order_still_open = bool(exit_snap.get('tp1_match')) if partial_tp_distinct else False
             tp1_hit = bool((live_qty <= qty_drop_threshold) or (qty_reduced and partial_tp_distinct and not tp1_order_still_open))
             be_allowed = (
                 conf >= int(AUTOTRADE_BE_AFTER_TP1_MIN_CONF)
@@ -2816,33 +3054,35 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
             )
 
         desired_sl = float(entry) if (tp1_hit and be_allowed and entry > 0) else float(target_sl)
-        desired_tp = float(final_tp or 0.0)
-        sl_needs_fix = bool(desired_sl > 0 and (current_sl <= 0 or not _price_close_enough(current_sl, desired_sl, rel_tol=0.0040)))
-        tp_needs_fix = bool(desired_tp > 0 and (current_tp <= 0 or not _price_close_enough(current_tp, desired_tp, rel_tol=0.0040)))
-        if sl_needs_fix or tp_needs_fix:
-            sl_tp_res = _autotrade_apply_position_tp_sl(sym, desired_sl, desired_tp, side=side, live_pos=pos, verify=True)
-            result['sl_apply'] = sl_tp_res
-            result['sl_fixed'] = bool(sl_tp_res.get('ok')) and sl_needs_fix
-            result['tp_fixed'] = bool(sl_tp_res.get('ok')) and tp_needs_fix
-            if tp1_hit and be_allowed and bool(sl_tp_res.get('ok')):
-                result['be_applied'] = True
+        desired_tp1 = 0.0 if tp1_hit else float(partial_tp or 0.0)
+        desired_tp2 = float(final_tp or 0.0)
 
-        if live_qty > 0:
-            if tp1_hit or not partial_tp_distinct:
-                _autotrade_cancel_reduce_only_tp_orders(sym)
-            else:
-                tp1_ok = _bybit_has_open_tp_order_at(sym, partial_tp, side=side)
-                if not tp1_ok:
-                    _autotrade_cancel_reduce_only_tp_orders(sym)
-                    tp1_res = _autotrade_place_partial_tp1_order(
-                        sym,
-                        side,
-                        partial_tp,
-                        live_qty,
-                        tp1_fraction=float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION),
-                    )
-                    result['tp1_order'] = tp1_res
-                    result['tp1_order_fixed'] = bool(tp1_res.get('ok'))
+        desired_snap = _autotrade_verify_exact_setup_exit_orders(sym, side, entry, desired_sl, desired_tp1, desired_tp2)
+        needs_fix = not bool(desired_snap.get('all_matched'))
+        liq_check = _autotrade_stop_vs_liq_invalid(sym, side, desired_sl, live_pos=pos)
+        result['liq_check'] = liq_check
+        if liq_check.get('invalid'):
+            result['retMsg'] = 'stop_beyond_liq'
+            return result
+
+        if needs_fix:
+            sync_res = _autotrade_sync_exact_setup_exit_orders(
+                sym,
+                side,
+                float(entry or 0.0),
+                float(desired_sl or 0.0),
+                float(desired_tp1 or 0.0),
+                float(desired_tp2 or 0.0),
+                float(live_qty or 0.0),
+                live_pos=pos,
+                verify=True,
+            )
+            result['sync'] = sync_res
+            result['sl_fixed'] = bool(sync_res.get('ok'))
+            result['tp_fixed'] = bool(sync_res.get('ok'))
+            result['tp1_order_fixed'] = bool(sync_res.get('ok')) and bool(desired_tp1 > 0)
+            if tp1_hit and be_allowed and bool(sync_res.get('ok')):
+                result['be_applied'] = True
         return result
     except Exception:
         return result
@@ -5368,7 +5608,32 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         live_tp3 = float(exit_plan.get('effective_tp3') or 0.0)
         live_final_tp = float(exit_plan.get('final_tp') or live_tp2 or live_tp3 or live_partial_tp or 0.0)
         live_pos = _autotrade_wait_for_live_position(sym, side=side, timeout_sec=10.0, poll_sec=0.50)
-        sl_apply_res = _autotrade_apply_position_tp_sl(sym, sl_for_order, live_final_tp, side=side, live_pos=live_pos, verify=True)
+        liq_check = _autotrade_stop_vs_liq_invalid(sym, side, sl_for_order, live_pos=live_pos)
+        if liq_check.get('invalid'):
+            emergency_close = _autotrade_close_live_position_market(sym, side, live_pos=live_pos)
+            fail_reason = 'stop_beyond_liq'
+            _autotrade_exec_mark(reserved_keys, 'FAILED', f"{fail_reason}:{emergency_close.get('retMsg') or 'emergency_close_attempted'}")
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'liq_check': liq_check, 'emergency_close': emergency_close, 'reject_reason': fail_reason})
+            except Exception:
+                pass
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('exchange_reject'), last_reason=f'{fail_reason}_emergency_closed')
+            except Exception:
+                pass
+            return (False, f'{fail_reason}_emergency_closed')
+
+        exit_sync_res = _autotrade_sync_exact_setup_exit_orders(
+            sym,
+            side,
+            float(_pos_entry(live_pos) or price_ref) if live_pos else float(price_ref),
+            float(sl_for_order or 0.0),
+            float(live_partial_tp or 0.0),
+            float(live_tp2 or live_final_tp or 0.0),
+            float(abs(_pos_size(live_pos) or qty) if live_pos else qty),
+            live_pos=live_pos,
+            verify=True,
+        )
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
                 'position_opened_time': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -5376,17 +5641,16 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 'live_exit_tp2': float(live_tp2),
                 'live_exit_tp3': float(live_tp3),
                 'live_final_tp': float(live_final_tp),
-                'live_tp_design': 'position_final_tp + partial_tp1_limit + full_sl',
+                'live_tp_design': 'exact_setup_partial_tp_sl_pairs',
                 'initial_live_position_found': bool(live_pos),
-                'sl_apply': sl_apply_res,
+                'exit_sync': exit_sync_res,
+                'liq_check': liq_check,
             })
         except Exception:
             pass
-        sl_verified = bool(sl_apply_res.get('verified')) and float(sl_apply_res.get('live_stop_loss') or 0.0) > 0.0
-        tp_verified = bool(live_final_tp <= 0.0 or (bool(sl_apply_res.get('verified')) and float(sl_apply_res.get('live_take_profit') or 0.0) > 0.0))
-        if not (sl_verified and tp_verified):
+        if not bool(exit_sync_res.get('verified')):
             emergency_close = _autotrade_close_live_position_market(sym, side, live_pos=live_pos)
-            fail_reason = 'stop_or_take_profit_not_confirmed'
+            fail_reason = str(exit_sync_res.get('retMsg') or 'exact_exit_not_confirmed')
             _autotrade_exec_mark(reserved_keys, 'FAILED', f"{fail_reason}:{emergency_close.get('retMsg') or 'emergency_close_attempted'}")
             try:
                 _LAST_AUTOTRADE_DETAIL[int(uid)].update({'emergency_close': emergency_close, 'reject_reason': fail_reason})
@@ -5441,19 +5705,6 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
         final_pos = _autotrade_find_live_position(sym, side=side)
         tp_base_qty = abs(float(_pos_size(final_pos) or qty)) if final_pos else float(qty)
-        partial_tp_distinct = bool(float(live_partial_tp or 0.0) > 0.0 and not _price_close_enough(float(live_partial_tp or 0.0), float(live_final_tp or 0.0), rel_tol=0.0010))
-        _autotrade_cancel_reduce_only_tp_orders(sym)
-        tp_order_results = []
-        if partial_tp_distinct and tp_base_qty > 0:
-            tp1_order_res = _autotrade_place_partial_tp1_order(
-                sym,
-                side,
-                float(live_partial_tp or 0.0),
-                tp_base_qty,
-                tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION),
-            )
-            tp_order_results = [tp1_order_res]
-        tp_success_count = sum(1 for x in (tp_order_results or []) if bool(x.get('ok')) )
 
         repair_res = _autotrade_repair_live_exit_protection(uid, {
             'symbol': sym,
@@ -5472,21 +5723,18 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         }, live_pos=final_pos)
 
         final_pos_checked = _autotrade_wait_for_live_position(sym, side=side, timeout_sec=3.0, poll_sec=0.40) or final_pos
-        final_live_sl = float(_pos_stop(final_pos_checked) or 0.0) if final_pos_checked else 0.0
-        final_live_tp = float(_pos_take_profit(final_pos_checked) or 0.0) if final_pos_checked else 0.0
-        sl_protected = bool(final_live_sl > 0.0)
-        tp_protected = bool(float(live_final_tp or 0.0) <= 0.0 or (final_live_tp > 0.0 and _price_close_enough(final_live_tp, float(live_final_tp or 0.0), rel_tol=0.0040)))
+        final_entry = float(_pos_entry(final_pos_checked) or price_ref) if final_pos_checked else float(price_ref)
+        final_verify = _autotrade_verify_exact_setup_exit_orders(sym, side, final_entry, float(sl_for_order or 0.0), float(live_partial_tp or 0.0), float(live_tp2 or live_final_tp or 0.0))
+        sl_protected = bool(final_verify.get('sl_match'))
+        tp_protected = bool(final_verify.get('tp1_match')) and bool(final_verify.get('tp2_match') if float(live_tp2 or live_final_tp or 0.0) > 0 else True)
         if not (sl_protected and tp_protected):
             emergency_close = _autotrade_close_live_position_market(sym, side, live_pos=final_pos_checked)
-            fail_reason = 'live_position_missing_stop' if not sl_protected else 'live_position_missing_take_profit'
+            fail_reason = 'live_position_missing_exact_setup_exits'
             _autotrade_exec_mark(reserved_keys, 'FAILED', f"{fail_reason}:{emergency_close.get('retMsg') or 'emergency_close_attempted'}")
             try:
                 _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                    'tp_orders': tp_order_results,
-                    'tp_success_count': int(tp_success_count),
                     'protection_repair': repair_res,
-                    'final_live_stop_loss': float(final_live_sl or 0.0),
-                    'final_live_take_profit': float(final_live_tp or 0.0),
+                    'final_exit_verify': final_verify,
                     'emergency_close': emergency_close,
                     'reject_reason': fail_reason,
                 })
@@ -5500,11 +5748,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                'tp_orders': tp_order_results,
-                'tp_success_count': int(tp_success_count),
                 'protection_repair': repair_res,
-                'final_live_stop_loss': float(final_live_sl or 0.0),
-                'final_live_take_profit': float(final_live_tp or 0.0),
+                'final_exit_verify': final_verify,
             })
         except Exception:
             pass
@@ -5522,7 +5767,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         except Exception:
             pass
         suffix = ' corrected_for_post_fill_risk' if corrected else ''
-        return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty_for_db:.8g} SL={sl_for_order} TP1={live_partial_tp:g} finalTP={live_final_tp:g}{suffix}")
+        return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty_for_db:.8g} SL={sl_for_order} TP1={live_partial_tp:g} TP2={float(live_tp2 or live_final_tp or 0.0):g}{suffix}")
 
     except Exception as e:
         _autotrade_exec_mark(reserved_keys, 'FAILED', f'{type(e).__name__}: {e}')
@@ -22466,11 +22711,12 @@ def _autotrade_find_open_trade_row_for_symbol(uid: int, symbol: str, side: str) 
         return None
 
 
+
 def _autotrade_live_position_exit_snapshot(uid: int, p: dict) -> dict:
     """Build a bot-vs-exchange exit map for an open live position.
 
-    This is used for admin visibility so /open_trades can confirm that the live
-    exchange SL / TP and the manual TP1 order are aligned with the generated setup.
+    Exact live exits are read from active TP/SL stop orders so the admin can confirm
+    the exchange is holding the same SL / TP1 / TP2 as the generated setup.
     """
     sym = _bybit_linear_symbol(_pos_symbol(p))
     side = str(_pos_side_text(p) or '').upper().strip()
@@ -22480,24 +22726,25 @@ def _autotrade_live_position_exit_snapshot(uid: int, p: dict) -> dict:
     setup_tp1 = float((trade_row or {}).get('tp1') or 0.0)
     setup_tp2 = float((trade_row or {}).get('tp2') or (trade_row or {}).get('tp3') or 0.0)
     setup_tp3 = float((trade_row or {}).get('tp3') or (trade_row or {}).get('tp2') or 0.0)
-
-    live_sl = float(_pos_stop(p) or 0.0)
-    live_tp = float(_pos_take_profit(p) or 0.0)
+    entry = float(_pos_entry(p) or (trade_row or {}).get('entry') or 0.0)
 
     plan = _autotrade_live_exit_plan_for_trade(trade_row) if trade_row else {}
-    partial_tp = float((plan or {}).get('partial_tp') or setup_tp1 or 0.0)
-    final_tp = float((plan or {}).get('final_tp') or setup_tp2 or setup_tp3 or setup_tp1 or 0.0)
-    partial_tp_distinct = bool(partial_tp > 0 and final_tp > 0 and not _price_close_enough(partial_tp, final_tp, rel_tol=0.0010))
+    live_target_tp1 = float((plan or {}).get('partial_tp') or setup_tp1 or 0.0)
+    live_target_tp2 = float((plan or {}).get('final_tp') or setup_tp2 or setup_tp3 or setup_tp1 or 0.0)
 
-    tp1_order_open = False
-    try:
-        tp1_order_open = _bybit_has_open_tp_order_at(sym, partial_tp, side=side) if partial_tp_distinct else False
-    except Exception:
-        tp1_order_open = False
-
-    sl_match = bool(setup_sl <= 0 or (live_sl > 0 and _price_close_enough(live_sl, setup_sl, rel_tol=0.0040)))
-    final_tp_match = bool(final_tp <= 0 or (live_tp > 0 and _price_close_enough(live_tp, final_tp, rel_tol=0.0040)))
-    tp1_match = bool((not partial_tp_distinct) or tp1_order_open)
+    verify = _autotrade_verify_exact_setup_exit_orders(sym, side, entry, setup_sl, live_target_tp1, live_target_tp2)
+    live_tp_prices = list(verify.get('live_tp_prices') or [])
+    live_tp1 = 0.0
+    live_tp2 = 0.0
+    for px in live_tp_prices:
+        if live_target_tp1 > 0 and _price_close_enough(px, live_target_tp1, rel_tol=0.0010):
+            live_tp1 = float(px)
+        elif live_target_tp2 > 0 and _price_close_enough(px, live_target_tp2, rel_tol=0.0010):
+            live_tp2 = float(px)
+    if live_tp1 <= 0 and live_tp_prices:
+        live_tp1 = float(live_tp_prices[0])
+    if live_tp2 <= 0 and len(live_tp_prices) >= 2:
+        live_tp2 = float(live_tp_prices[1])
 
     return {
         'symbol': sym,
@@ -22505,22 +22752,21 @@ def _autotrade_live_position_exit_snapshot(uid: int, p: dict) -> dict:
         'trade_row': trade_row or None,
         'setup_id': str((trade_row or {}).get('setup_id') or ''),
         'setup_sl': float(setup_sl or 0.0),
-        'setup_tp1': float(setup_tp1 or partial_tp or 0.0),
-        'setup_tp2': float(setup_tp2 or final_tp or 0.0),
-        'setup_tp3': float(setup_tp3 or final_tp or 0.0),
-        'plan_tp1': float(partial_tp or 0.0),
-        'plan_final_tp': float(final_tp or 0.0),
-        'live_sl': float(live_sl or 0.0),
-        'live_tp': float(live_tp or 0.0),
-        'tp1_order_open': bool(tp1_order_open),
-        'tp1_order_price': float(partial_tp or 0.0),
-        'partial_tp_distinct': bool(partial_tp_distinct),
-        'sl_match': bool(sl_match),
-        'final_tp_match': bool(final_tp_match),
-        'tp1_match': bool(tp1_match),
-        'all_matched': bool(sl_match and final_tp_match and tp1_match),
+        'setup_tp1': float(setup_tp1 or live_target_tp1 or 0.0),
+        'setup_tp2': float(setup_tp2 or live_target_tp2 or 0.0),
+        'setup_tp3': float(setup_tp3 or live_target_tp2 or 0.0),
+        'plan_tp1': float(live_target_tp1 or 0.0),
+        'plan_final_tp': float(live_target_tp2 or 0.0),
+        'live_sl': float(verify.get('live_sl') or 0.0),
+        'live_tp_prices': live_tp_prices,
+        'live_tp1': float(live_tp1 or 0.0),
+        'live_tp2': float(live_tp2 or 0.0),
+        'sl_match': bool(verify.get('sl_match')),
+        'tp1_match': bool(verify.get('tp1_match')),
+        'tp2_match': bool(verify.get('tp2_match')),
+        'all_matched': bool(verify.get('all_matched')),
+        'verify': verify,
     }
-
 
 async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show all open Bybit positions (admin only) with live PnL and full exit mapping."""
@@ -22552,10 +22798,15 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry = _pos_entry(p)
         mark = _pos_mark(p)
         pnl = _pos_unreal_pnl(p)
-        sl = _pos_stop(p)
-        risk = _estimate_position_risk_usd(p)
-        tp_live = _pos_take_profit(p)
+        raw_sl = _pos_stop(p)
         exit_map = _autotrade_live_position_exit_snapshot(int(uid), p)
+        live_sl = float(exit_map.get('live_sl') or raw_sl or 0.0)
+        p_for_risk = dict(p)
+        if live_sl > 0:
+            p_for_risk['_bot_fallback_stop'] = float(live_sl)
+        risk = _estimate_position_risk_usd(p_for_risk)
+        live_tp1 = float(exit_map.get('live_tp1') or 0.0)
+        live_tp2 = float(exit_map.get('live_tp2') or 0.0)
 
         total_pnl += pnl
         total_risk += risk
@@ -22564,16 +22815,13 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"   • Size: {size:g}")
         lines.append(f"   • Entry: {fmt_price(entry)}   | Mark: {fmt_price(mark)}")
         lines.append(f"   • PnL: {pnl:+.2f} USDT")
-
-        if sl and sl > 0:
-            lines.append(f"   • Live SL: {fmt_price(sl)}   | Risk est: {risk:.2f} USDT")
-        else:
-            lines.append("   • Live SL: —   | Risk est: — (needs SL)")
-
-        if tp_live and tp_live > 0:
-            lines.append(f"   • Live TP (position): {fmt_price(tp_live)}")
-        else:
-            lines.append("   • Live TP (position): —")
+        lines.append(
+            f"   • Live exits: SL {fmt_price(live_sl) if live_sl > 0 else '—'} | "
+            f"TP1 {fmt_price(live_tp1) if live_tp1 > 0 else '—'} | "
+            f"TP2 {fmt_price(live_tp2) if live_tp2 > 0 else '—'} | "
+            f"Risk est: {risk:.2f} USDT" if live_sl > 0 else
+            f"   • Live exits: SL — | TP1 {fmt_price(live_tp1) if live_tp1 > 0 else '—'} | TP2 {fmt_price(live_tp2) if live_tp2 > 0 else '—'} | Risk est: — (needs SL)"
+        )
 
         if exit_map.get('trade_row'):
             setup_id = str(exit_map.get('setup_id') or '')
@@ -22586,14 +22834,8 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"TP2 {fmt_price(setup_tp2) if setup_tp2 > 0 else '—'}"
                 + (f" | Setup {setup_id}" if setup_id else "")
             )
-            if bool(exit_map.get('partial_tp_distinct')):
-                tp1_status = 'OPEN' if bool(exit_map.get('tp1_order_open')) else 'MISSING'
-                lines.append(f"   • TP1 limit order: {tp1_status} @ {fmt_price(float(exit_map.get('tp1_order_price') or 0.0))}")
             sync_ok = bool(exit_map.get('all_matched'))
-            if bool(exit_map.get('partial_tp_distinct')):
-                sync_bits = f"SL {'OK' if exit_map.get('sl_match') else 'MISS'} | TP2 {'OK' if exit_map.get('final_tp_match') else 'MISS'} | TP1 {'OK' if exit_map.get('tp1_match') else 'MISS'}"
-            else:
-                sync_bits = f"SL {'OK' if exit_map.get('sl_match') else 'MISS'} | TP {'OK' if exit_map.get('final_tp_match') else 'MISS'}"
+            sync_bits = f"SL {'OK' if exit_map.get('sl_match') else 'MISS'} | TP1 {'OK' if exit_map.get('tp1_match') else 'MISS'} | TP2 {'OK' if exit_map.get('tp2_match') else 'MISS'}"
             lines.append(f"   • Exit sync: {'MATCHED' if sync_ok else 'MISMATCH'} | {sync_bits}")
         else:
             lines.append("   • Setup exits: — (no matching open trade row found in bot DB)")
