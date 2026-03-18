@@ -897,8 +897,7 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DEFAULT_TYPE = "swap"  # bybit futures
 DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
 
-CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "1"))
-MANUAL_SCREEN_SYNC_ENABLED = env_bool("MANUAL_SCREEN_SYNC_ENABLED", False)
+CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "5"))
 
 # -------------------------
 # LOGGING: redact secrets + quiet noisy libs (Render-safe)
@@ -982,9 +981,7 @@ MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "78"))
 
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
 MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
-# Legacy variable name kept for DB/env compatibility. In the current 2-TP model this
-# is the minimum RR for the final target (TP2), not a third take-profit.
-MIN_RR_TP3 = float(os.environ.get("MIN_RR_TP2", os.environ.get("MIN_RR_TP3", "1.50")))
+MIN_RR_TP3 = float(os.environ.get("MIN_RR_TP3", "1.8"))
 
 # Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
 EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
@@ -1061,11 +1058,8 @@ def _strategy_config_defaults() -> dict:
         "tf_align_1h_min_abs": float(TF_ALIGN_1H_MIN_ABS),
         "tf_align_4h_min_abs": float(TF_ALIGN_4H_MIN_ABS),
 
-        # Final-target RR floor (2-TP model; legacy key retained for compatibility)
+        # RR floor
         "min_rr_tp3": float(MIN_RR_TP3),
-        "min_rr_tp2": float(MIN_RR_TP3),
-        "tp_count": 2,
-        "final_tp_label": "TP2",
 
         # Score weights (must sum ~1.0; scaled to 100 in compute_setup_quality_score)
         "score_w_conf": 0.45,
@@ -1173,32 +1167,6 @@ def load_strategy_config(force: bool = False) -> dict:
     if not isinstance(cfg, dict):
         cfg = _strategy_config_defaults()
         save_strategy_config(cfg)
-    # 2-TP migration: keep legacy keys for compatibility, but cap any older 3-TP
-    # RR floor down to the current final-target (TP2) default so old saved configs
-    # do not continue starving setup generation.
-    try:
-        changed = False
-        rr_cap = float(MIN_RR_TP3)
-        rr_final = float(cfg.get("min_rr_tp2", cfg.get("min_rr_tp3", rr_cap)) or rr_cap)
-        if rr_final > rr_cap:
-            rr_final = rr_cap
-            changed = True
-        if float(cfg.get("min_rr_tp3", rr_final) or rr_final) != rr_final:
-            cfg["min_rr_tp3"] = float(rr_final)
-            changed = True
-        if float(cfg.get("min_rr_tp2", rr_final) or rr_final) != rr_final:
-            cfg["min_rr_tp2"] = float(rr_final)
-            changed = True
-        if int(cfg.get("tp_count", 2) or 2) != 2:
-            cfg["tp_count"] = 2
-            changed = True
-        if str(cfg.get("final_tp_label", "TP2") or "TP2") != "TP2":
-            cfg["final_tp_label"] = "TP2"
-            changed = True
-        if changed:
-            save_strategy_config(cfg)
-    except Exception:
-        pass
     _STRATEGY_CFG_CACHE["ts"] = now
     _STRATEGY_CFG_CACHE["cfg"] = dict(cfg)
     return dict(cfg)
@@ -1285,7 +1253,7 @@ def apply_strategy_config(cfg: dict) -> None:
     except Exception:
         pass
     try:
-        MIN_RR_TP3 = float(cfg.get("min_rr_tp2", cfg.get("min_rr_tp3", MIN_RR_TP3)) or MIN_RR_TP3)
+        MIN_RR_TP3 = float(cfg.get("min_rr_tp3", MIN_RR_TP3))
     except Exception:
         pass
 
@@ -1622,8 +1590,8 @@ AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PC
 # Open-trade count cap for commercial/live safety.
 AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "0") or 0)
 EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
-EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
-EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", True)
+EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "LON,NY") or "LON,NY").split(",") if s.strip()]
+EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", False)
 
 
 # Margin / leverage
@@ -5252,12 +5220,10 @@ SESSION_MIN_CONF = {
     "ASIA": 80,
 }
 
-# Legacy constant name kept for compatibility. These are now the minimum RR floors
-# for the final target (TP2) in the 2-TP model.
 SESSION_MIN_RR_TP3 = {
-    "NY": 1.45,
-    "LON": 1.50,
-    "ASIA": 1.55,
+    "NY": 1.60,
+    "LON": 1.62,
+    "ASIA": 1.90,
 }
 
 SESSION_EMA_PROX_MULT = {
@@ -5303,7 +5269,6 @@ def session_knobs(session_name: str) -> dict:
         "trigger_atr_mult": float(SESSION_TRIGGER_ATR_MULT.get(s, 0.85)),
         "min_conf": int(SESSION_MIN_CONF.get(s, 78)),
         "min_rr_tp3": float(SESSION_MIN_RR_TP3.get(s, 2.0)),
-        "min_rr_tp2": float(SESSION_MIN_RR_TP3.get(s, 2.0)),
     }
 
 def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
@@ -6012,7 +5977,7 @@ def _learning_status_text() -> str:
 
     lines.extend([
         SEP,
-        f"Current live floors: email_quality={float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL):.1f} | screen_quality={float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN):.1f} | min_rr_tp2={float(cfg.get('min_rr_tp2', cfg.get('min_rr_tp3', MIN_RR_TP3)) or MIN_RR_TP3):.2f}",
+        f"Current live floors: email_quality={float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL):.1f} | screen_quality={float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN):.1f} | min_rr_tp3={float(cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3):.2f}",
         f"Signal win rate (completed outcomes): overall {_signal_wr_display_metrics(owner).get('binary_win_rate', 0.0):.1f}% | NY {_signal_wr_display_metrics(owner, session='NY').get('binary_win_rate', 0.0):.1f}% | trend overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}",
         SEP,
     ])
@@ -6113,6 +6078,7 @@ def reset_reject_tracker() -> None:
 # =========================================================
 _REJECT_CTX = contextvars.ContextVar("pf_reject_ctx", default=None)
 _LAST_REJECTS = {}  # uid -> {"ts": float, "counts": { "A:no_trigger": 12, ... }}
+_LAST_REJECTS_SHARED = {}  # mode/latest -> last background/shared reject payload
 _GLOBAL_REJECT_CTX = None  # fallback reject ctx when contextvars don't propagate across nested threads
 
 def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
@@ -6207,23 +6173,43 @@ def _note_status(status: str, base: str, mv: "MarketVol", extra: str = "") -> No
     return
 
 def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
-    """Explain why setups were rejected in the last meaningful scan for this user.
+    """Explain why setups were rejected in the most recent meaningful scan for this user.
 
-    Preference order:
-    - last manual /screen scan (what the user most likely wants from /why)
-    - otherwise the latest recorded scan (for example email/background)
+    Selection is timestamp-based, so /why stays fresh even when the latest scan was
+    produced by the background email loop instead of a manual /screen command.
     """
     raw = _LAST_REJECTS.get(int(uid)) or {}
-    rec = raw
+    candidates = []
+
     if isinstance(raw, dict) and any(k in raw for k in ("screen", "email", "latest")):
-        rec = raw.get("screen") or raw.get("latest") or raw.get("email") or {}
+        for _k in ("screen", "email", "latest"):
+            _v = raw.get(_k) or {}
+            if isinstance(_v, dict) and (_v.get("counts") or _v.get("per_symbol") or _v.get("allow")):
+                candidates.append(_v)
+    elif isinstance(raw, dict) and (raw.get("counts") or raw.get("per_symbol") or raw.get("allow")):
+        candidates.append(raw)
+
+    shared = _LAST_REJECTS_SHARED or {}
+    if isinstance(shared, dict):
+        for _k in ("email", "screen", "latest"):
+            _v = shared.get(_k) or {}
+            if isinstance(_v, dict) and (_v.get("counts") or _v.get("per_symbol") or _v.get("allow")):
+                candidates.append(_v)
+
+    def _ts(_r: dict) -> float:
+        try:
+            return float((_r or {}).get("ts") or 0.0)
+        except Exception:
+            return 0.0
+
+    rec = max(candidates, key=_ts) if candidates else {}
 
     counts = rec.get("counts") or {}
     allow = rec.get("allow") or []
     per_sym = rec.get("per_symbol") or {}  # base -> {"reason": str, "n": int}
 
     if not allow and not counts and not per_sym:
-        return "No reject stats recorded yet. Run /screen once."
+        return "No reject stats recorded yet. Wait for the background scan or run /screen once."
 
     allow_set = [str(x).upper() for x in (allow or []) if str(x).strip()]
     allow_set_unique = []
@@ -6290,6 +6276,24 @@ def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
         except Exception:
             return default
     lines.append("🧩 Last Scan Reject Reasons")
+    try:
+        _src = str(rec.get("mode") or "latest").strip().upper()
+        _sess = str(rec.get("session") or "").strip().upper()
+        _tsv = float(rec.get("ts") or 0.0)
+        _when = ""
+        if _tsv > 0:
+            _when = datetime.fromtimestamp(_tsv, tz=timezone.utc).astimezone(MEL_TZ).strftime("%Y-%m-%d %H:%M")
+        extra = []
+        if _src:
+            extra.append(f"Source: {_src}")
+        if _sess:
+            extra.append(f"Session: {_sess}")
+        if _when:
+            extra.append(f"Updated: {_when} Melbourne")
+        if extra:
+            lines.append(" • ".join(extra))
+    except Exception:
+        pass
     if allow_set_unique:
         lines.append(f"Universe (leaders/losers/market leaders): {len(allow_set_unique)} symbols")
         lines.append("Symbols: " + ", ".join(allow_set_unique[:30]) + ("…" if len(allow_set_unique) > 30 else ""))
@@ -15086,7 +15090,7 @@ def _self_opt_format_report(res: dict) -> str:
         SEP,
         "Best params (subset):",
         f"quality_score_min_screen={p.get('quality_score_min_screen')} | quality_score_min_email={p.get('quality_score_min_email')}",
-        f"min_rr_tp2={p.get('min_rr_tp2', p.get('min_rr_tp3'))} | atr_min_pct={p.get('atr_min_pct')}",
+        f"min_rr_tp3={p.get('min_rr_tp3')} | atr_min_pct={p.get('atr_min_pct')}",
         f"tf_align_1h_min_abs={p.get('tf_align_1h_min_abs')} | tf_align_4h_min_abs={p.get('tf_align_4h_min_abs')}",
     ]
 
@@ -16126,7 +16130,7 @@ async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAU
     if current_live:
         lines.extend([
             SEP,
-            f"Current live floors: email_quality={float(current_live.get('quality_score_min_email', 0.0) or 0.0):.1f} | screen_quality={float(current_live.get('quality_score_min_screen', 0.0) or 0.0):.1f} | min_rr_tp2={float(current_live.get('min_rr_tp2', current_live.get('min_rr_tp3', 0.0)) or 0.0):.2f}",
+            f"Current live floors: email_quality={float(current_live.get('quality_score_min_email', 0.0) or 0.0):.1f} | screen_quality={float(current_live.get('quality_score_min_screen', 0.0) or 0.0):.1f} | min_rr_tp3={float(current_live.get('min_rr_tp3', 0.0) or 0.0):.2f}",
             f"TF align 1h={float(current_live.get('tf_align_1h_min_abs', 0.0) or 0.0):.2f} | ATR min={float(current_live.get('atr_min_pct', 0.0) or 0.0):.2f}",
             f"Engine B exec: {'ON' if _cfg_bool(current_live.get('execution_engine_b_email_enabled', True), True) else 'OFF'} | Asia exec: {'ON' if _cfg_bool(current_live.get('execution_asia_enabled', False), False) else 'OFF'}",
         ])
@@ -17496,13 +17500,10 @@ def make_setup(
 
 
         # ---------------------------------------------------------
-        # ✅ Session-aware final-target RR floor (2-TP model).
-        #    The final target is TP2. We keep legacy tp3 storage mirrored to TP2
-        #    for DB/back-compat, but setup rejection must use the real final target.
+        # ✅ Session-aware TP3 RR floor (reduces low-quality signals, especially ASIA)
         # ---------------------------------------------------------
         try:
-            final_tp = float(tp2 or tp3 or 0.0)
-            rr_final = rr_to_tp(entry, sl, final_tp)
+            rr3 = rr_to_tp(entry, sl, tp3)
             sess_rr_min = float(MIN_RR_TP3)
             try:
                 sname = str(session_name or "").upper()
@@ -17511,14 +17512,15 @@ def make_setup(
                 elif sname == "LON":
                     sess_rr_min = max(sess_rr_min, float(SESSION_MIN_RR_TP3.get("LON", sess_rr_min)))
                 else:
+                    # Keep NY as-is (use global MIN_RR_TP3)
                     sess_rr_min = float(SESSION_MIN_RR_TP3.get("NY", sess_rr_min)) if sname == "NY" else sess_rr_min
             except Exception:
                 sess_rr_min = float(MIN_RR_TP3)
 
             if str(session_name or '').upper() == 'NY' and require_pullback:
-                sess_rr_min = max(float(sess_rr_min), float(SESSION_MIN_RR_TP3.get('NY', sess_rr_min)) + 0.05)
-            if float(rr_final) < float(sess_rr_min):
-                _rej("below_min_rr_tp2_session", base, mv, f"rr2={rr_final:.2f} min={sess_rr_min:.2f} sess={session_name}")
+                sess_rr_min = max(float(sess_rr_min), float(SESSION_MIN_RR_TP3.get('NY', sess_rr_min)) + 0.10)
+            if float(rr3) < float(sess_rr_min):
+                _rej("below_min_rr_tp3_session", base, mv, f"rr3={rr3:.2f} min={sess_rr_min:.2f} sess={session_name}")
                 return None
         except Exception:
             pass
@@ -17701,7 +17703,7 @@ def make_breakout_setup(
 
     # SL/TP using ATR (simple + robust)
     sl_atr = 1.35
-    rr_target = 2.0  # final TP2 RR target for momentum
+    rr_target = 2.0  # TP3 RR target for momentum
     if side == "BUY":
         sl = entry - (atr_1h * sl_atr)
         tp3 = entry + (entry - sl) * rr_target
@@ -22857,19 +22859,30 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             payload = {
                 "ts": time.time(),
                 "mode": str(mode or ''),
+                "session": str(session_name or ''),
                 "allow": list(_rej_ctx.get("__allow__") or []),
                 "counts": counts,
                 "per_symbol": dict((_rej_ctx.get("__per__") or {})),
             }
-            bucket = _LAST_REJECTS.get(int(uid)) or {}
-            if isinstance(bucket, dict) and any(k in bucket for k in ("screen", "email", "latest")):
-                bucket = dict(bucket)
-            else:
-                bucket = {}
-            if str(mode or '').strip():
-                bucket[str(mode).strip().lower()] = payload
-            bucket["latest"] = payload
-            _LAST_REJECTS[int(uid)] = bucket
+            try:
+                shared_bucket = _LAST_REJECTS_SHARED if isinstance(_LAST_REJECTS_SHARED, dict) else {}
+                if str(mode or '').strip():
+                    shared_bucket[str(mode).strip().lower()] = dict(payload)
+                shared_bucket["latest"] = dict(payload)
+                _LAST_REJECTS_SHARED.clear()
+                _LAST_REJECTS_SHARED.update(shared_bucket)
+            except Exception:
+                pass
+            if uid is not None:
+                bucket = _LAST_REJECTS.get(int(uid)) or {}
+                if isinstance(bucket, dict) and any(k in bucket for k in ("screen", "email", "latest")):
+                    bucket = dict(bucket)
+                else:
+                    bucket = {}
+                if str(mode or '').strip():
+                    bucket[str(mode).strip().lower()] = payload
+                bucket["latest"] = payload
+                _LAST_REJECTS[int(uid)] = bucket
     finally:
         try:
             _REJECT_CTX.reset(_rej_token)
@@ -23562,21 +23575,17 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 int(update.effective_user.id),
             )
 
-            sync_info = {}
-            if MANUAL_SCREEN_SYNC_ENABLED:
-                try:
-                    sync_info = await _screen_sync_pipeline_async(
-                        int(update.effective_user.id),
-                        user or {},
-                        live_session,
-                        scan_session,
-                        best_fut,
-                        list(shown_setups or []),
-                    )
-                except Exception:
-                    sync_info = {"status": "error", "reason": "screen_sync_failed"}
-            else:
-                sync_info = {"status": "skip", "reason": "manual_screen_sync_disabled"}
+            try:
+                sync_info = await _screen_sync_pipeline_async(
+                    int(update.effective_user.id),
+                    user or {},
+                    live_session,
+                    scan_session,
+                    best_fut,
+                    list(shown_setups or []),
+                )
+            except Exception:
+                sync_info = {"status": "error", "reason": "screen_sync_failed"}
 
             # Cache for fast subsequent /screen calls (user + session scoped)
             _SCREEN_CACHE[cache_key] = {
@@ -25915,6 +25924,18 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 }
                 return
 
+            # Optional: respect user's trade window (if configured)
+            try:
+                if not trade_window_allows_now(user):
+                    _LAST_AUTOTRADE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": now_utc.isoformat(timespec="seconds"),
+                        "reason": "trade_window_block",
+                    }
+                    return
+            except Exception:
+                pass
+
             # Keep live exit protection synchronized with Bybit before considering new entries.
             try:
                 repaired = []
@@ -25935,18 +25956,6 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                         "session": sess,
                         "mode": AUTOTRADE_MODE,
                     }
-            except Exception:
-                pass
-
-            # Optional: respect user's trade window (if configured)
-            try:
-                if not trade_window_allows_now(user):
-                    _LAST_AUTOTRADE_DECISION[uid] = {
-                        "status": "SKIP",
-                        "when": now_utc.isoformat(timespec="seconds"),
-                        "reason": "trade_window_block",
-                    }
-                    return
             except Exception:
                 pass
 
@@ -26359,6 +26368,10 @@ def main():
         logger.error("Another instance is polling. Sleeping forever.")
         while True:
             time.sleep(3600)
+
+
+if __name__ == "__main__":
+    main()
 
 
 # ===============================
@@ -26960,6 +26973,3 @@ def pf_evaluate_signal(symbol, trend, ema_pullback, liquidity_event):
 # ==========================================================
 # END SIGNAL QUALITY GATE ENGINE
 # ==========================================================
-
-if __name__ == "__main__":
-    main()
