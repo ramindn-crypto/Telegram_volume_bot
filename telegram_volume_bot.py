@@ -897,7 +897,8 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DEFAULT_TYPE = "swap"  # bybit futures
 DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
 
-CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "5"))
+CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "1"))
+MANUAL_SCREEN_SYNC_ENABLED = env_bool("MANUAL_SCREEN_SYNC_ENABLED", False)
 
 # -------------------------
 # LOGGING: redact secrets + quiet noisy libs (Render-safe)
@@ -1590,8 +1591,8 @@ AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PC
 # Open-trade count cap for commercial/live safety.
 AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "0") or 0)
 EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
-EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "LON,NY") or "LON,NY").split(",") if s.strip()]
-EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", False)
+EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
+EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", True)
 
 
 # Margin / leverage
@@ -23575,17 +23576,23 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 int(update.effective_user.id),
             )
 
-            try:
-                sync_info = await _screen_sync_pipeline_async(
-                    int(update.effective_user.id),
-                    user or {},
-                    live_session,
-                    scan_session,
-                    best_fut,
-                    list(shown_setups or []),
-                )
-            except Exception:
-                sync_info = {"status": "error", "reason": "screen_sync_failed"}
+            if MANUAL_SCREEN_SYNC_ENABLED and list(shown_setups or []):
+                try:
+                    sync_info = await _screen_sync_pipeline_async(
+                        int(update.effective_user.id),
+                        user or {},
+                        live_session,
+                        scan_session,
+                        best_fut,
+                        list(shown_setups or []),
+                    )
+                except Exception:
+                    sync_info = {"status": "error", "reason": "screen_sync_failed"}
+            else:
+                sync_info = {
+                    "status": "skip",
+                    "reason": ("manual_screen_sync_disabled" if not MANUAL_SCREEN_SYNC_ENABLED else "no_shown_setups"),
+                }
 
             # Cache for fast subsequent /screen calls (user + session scoped)
             _SCREEN_CACHE[cache_key] = {
@@ -26370,9 +26377,6 @@ def main():
             time.sleep(3600)
 
 
-if __name__ == "__main__":
-    main()
-
 
 # ===============================
 # QTY NORMALIZATION FIX (Bybit)
@@ -26973,3 +26977,6 @@ def pf_evaluate_signal(symbol, trend, ema_pullback, liquidity_event):
 # ==========================================================
 # END SIGNAL QUALITY GATE ENGINE
 # ==========================================================
+
+if __name__ == "__main__":
+    main()
