@@ -1104,7 +1104,7 @@ def _strategy_config_defaults() -> dict:
             "tf_align_1h_min_abs": [0.3, 1.2],
             "tf_align_4h_min_abs": [0.3, 1.2],
             "atr_min_pct": [0.4, 1.5],
-            "min_rr_tp3": [1.3, 2.4],
+            "min_rr_tp3": [1.3, 1.75],
         },
 
         # Zero-touch autopilot optimizer windows
@@ -1169,13 +1169,49 @@ def load_strategy_config(force: bool = False) -> dict:
         cfg = _strategy_config_defaults()
         save_strategy_config(cfg)
 
-    # Normalize legacy RR floors from the pre-2TP model.
-    # Older deployments commonly persisted min_rr_tp3=1.80, which now blocks
-    # setup creation because the live target model intentionally tops out near 1.95R.
+    # Normalize persisted live floors from older or over-tight configs.
+    # The current 2-TP model intentionally targets roughly 1.50R..1.95R final RR.
+    # If SQLite still carries older/high RR floors or extreme score floors, setup
+    # generation can silently starve before email/autotrade ever sees a candidate.
     try:
+        changed = False
+
+        q_screen = float(cfg.get("quality_score_min_screen", QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
+        q_screen_clamped = float(clamp(q_screen, 52.0, 70.0))
+        if abs(q_screen_clamped - q_screen) > 1e-9:
+            cfg["quality_score_min_screen"] = q_screen_clamped
+            changed = True
+
+        q_email = float(cfg.get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
+        q_email_lo = max(q_screen_clamped + 2.0, 54.0)
+        q_email_clamped = float(clamp(q_email, q_email_lo, 82.0))
+        if abs(q_email_clamped - q_email) > 1e-9:
+            cfg["quality_score_min_email"] = q_email_clamped
+            changed = True
+
         rr_cfg = float(cfg.get("min_rr_tp3", MIN_RR_TP3) or MIN_RR_TP3)
+        rr_clamped = float(clamp(rr_cfg, 1.30, 1.75))
+        # Legacy exact 1.80 also deserves an immediate reset back to the live default.
         if abs(rr_cfg - 1.80) <= 0.01:
-            cfg["min_rr_tp3"] = float(MIN_RR_TP3)
+            rr_clamped = float(MIN_RR_TP3)
+        if abs(rr_clamped - rr_cfg) > 1e-9:
+            cfg["min_rr_tp3"] = rr_clamped
+            changed = True
+
+        bounds = dict(cfg.get("opt_bounds") or {})
+        bounds_rr = bounds.get("min_rr_tp3") or [1.3, 1.75]
+        try:
+            blo = float(bounds_rr[0])
+        except Exception:
+            blo = 1.3
+        bhi = 1.75
+        norm_bounds_rr = [float(max(1.3, min(blo, 1.75))), float(bhi)]
+        if list(bounds_rr) != norm_bounds_rr:
+            bounds["min_rr_tp3"] = norm_bounds_rr
+            cfg["opt_bounds"] = bounds
+            changed = True
+
+        if changed:
             save_strategy_config(cfg)
     except Exception:
         pass
@@ -2301,7 +2337,11 @@ def _autotrade_live_exit_plan_from_targets(entry: float, sl: float, tp1, tp2, tp
         'partial_fraction': float(AUTOTRADE_LIVE_TP1_FRACTION),
         'effective_tp1': float(t1 or 0.0),
         'effective_tp2': float(t2 or 0.0),
+        # Live execution is strictly a 2-TP model: one partial TP + one final TP.
+        # Keep tp3 mirrored in storage for older analytics, but never place or require a
+        # third live target on Bybit.
         'effective_tp3': float(t3 or 0.0),
+        'live_tp_targets': _dedupe_price_targets([float(t1 or 0.0), float(t2 or 0.0)]),
     }
 
 
@@ -2465,6 +2505,81 @@ def _autotrade_apply_position_tp_sl(symbol: str, stop_loss: float, take_profit: 
     return _bybit_v5_request('POST', '/v5/position/trading-stop', payload)
 
 
+def _autotrade_verify_live_exit_stack(symbol: str, side: str, stop_loss: float, tp_targets: list[float], wait_sec: float = 0.65, attempts: int = 3) -> dict:
+    """Verify the live trade shows exactly one SL and exactly the requested TP lines.
+
+    We intentionally require only the current 2-TP model: one SL on the position and
+    two reduce-only limit TP orders (or one TP after TP1 has already filled).
+    """
+    sym = _bybit_linear_symbol(symbol)
+    side_u = str(side or '').upper().strip()
+    expected_tps = _dedupe_price_targets([float(x or 0.0) for x in (tp_targets or [])])
+    expected_tps = [float(x) for x in expected_tps if float(x or 0.0) > 0]
+    stop_loss_f = float(stop_loss or 0.0)
+    details = {
+        'ok': False,
+        'symbol': sym,
+        'side': side_u,
+        'expected_stop': stop_loss_f,
+        'expected_tps': expected_tps,
+        'actual_stop': 0.0,
+        'actual_tps': [],
+        'missing_tps': [],
+        'attempts': 0,
+    }
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        details['attempts'] = attempt
+        pos = _autotrade_find_live_position(sym, side=side_u)
+        actual_stop = float(_pos_stop(pos) or 0.0) if pos else 0.0
+        actual_tps = []
+        for px in expected_tps:
+            try:
+                if _bybit_has_open_tp_order_at(sym, px, side=side_u):
+                    actual_tps.append(float(px))
+            except Exception:
+                continue
+        sl_ok = (stop_loss_f <= 0.0) or (actual_stop > 0.0 and _price_close_enough(actual_stop, stop_loss_f, rel_tol=0.0010))
+        tp_ok = len(actual_tps) == len(expected_tps)
+        details.update({
+            'actual_stop': actual_stop,
+            'actual_tps': actual_tps,
+            'missing_tps': [float(px) for px in expected_tps if not any(_price_close_enough(float(px), float(ax), rel_tol=0.0010) for ax in actual_tps)],
+            'sl_ok': bool(sl_ok),
+            'tp_ok': bool(tp_ok),
+        })
+        if sl_ok and tp_ok:
+            details['ok'] = True
+            return details
+        if attempt < max(1, int(attempts)):
+            time.sleep(max(0.10, float(wait_sec)))
+    return details
+
+
+def _autotrade_close_live_position_market(symbol: str, side: str, qty: float) -> dict:
+    sym = _bybit_linear_symbol(symbol)
+    side_u = str(side or '').upper().strip()
+    close_side = 'Sell' if side_u == 'BUY' else 'Buy'
+    qty_f = float(qty or 0.0)
+    if qty_f <= 0 or close_side not in {'Buy', 'Sell'}:
+        return {'retCode': -1, 'retMsg': 'invalid_close_request'}
+    filt = _bybit_get_instr_filters(sym)
+    qty_step = filt.get('qtyStep')
+    qty_rounded, qreason = _round_qty_down(sym, qty_f, 0.0)
+    if qty_rounded is None or qty_rounded <= 0:
+        return {'retCode': -2, 'retMsg': f'invalid_close_qty:{qreason}'}
+    payload = {
+        'category': 'linear',
+        'symbol': sym,
+        'side': close_side,
+        'orderType': 'Market',
+        'qty': _fmt_qty(qty_rounded, qty_step),
+        'timeInForce': 'IOC',
+        'reduceOnly': True,
+        'closeOnTrigger': True,
+    }
+    return _bybit_v5_request('POST', '/v5/order/create', payload)
+
+
 def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: dict | None = None) -> dict:
     result = {'checked': False, 'sl_fixed': False, 'tp_fixed': False, 'tp1_order_fixed': False, 'be_applied': False, 'symbol': '', 'side': ''}
     try:
@@ -2526,13 +2641,11 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         if tp1_hit:
             desired_targets = _dedupe_price_targets([
                 float(trade_row.get('tp2') or 0.0),
-                float(trade_row.get('tp3') or 0.0),
             ])
         else:
             desired_targets = _dedupe_price_targets([
                 float(partial_tp or 0.0),
                 float(trade_row.get('tp2') or 0.0),
-                float(trade_row.get('tp3') or 0.0),
             ])
 
         if desired_targets and live_qty > 0:
@@ -4476,6 +4589,27 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         #    This keeps autotrade aligned with the real delivered setup pipeline.
         cur.execute(
             """
+            SELECT MAX(e.emailed_ts)
+            FROM executable_setups x
+            INNER JOIN emailed_setups e
+                    ON e.user_id = x.user_id
+                   AND e.setup_id = x.setup_id
+            LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
+            WHERE x.user_id = ?
+              AND x.executable_ts >= ?
+              AND e.emailed_ts > 0
+              AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+            """,
+            (int(uid), float(cutoff)),
+        )
+        latest_batch_row = cur.fetchone()
+        latest_batch_ts = float(latest_batch_row[0] or 0.0) if latest_batch_row and latest_batch_row[0] is not None else 0.0
+        if latest_batch_ts <= 0:
+            con.close()
+            return []
+
+        cur.execute(
+            """
             SELECT x.setup_id,
                    MAX(x.executable_ts) AS executable_ts,
                    MAX(e.emailed_ts) AS emailed_ts,
@@ -4492,12 +4626,13 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             WHERE x.user_id = ?
               AND x.executable_ts >= ?
               AND e.emailed_ts > 0
+              AND ABS(e.emailed_ts - ?) <= 0.001
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
             GROUP BY x.setup_id
             ORDER BY executable_ts DESC, emailed_ts DESC, x.setup_id DESC
             LIMIT ?
             """,
-            (int(uid), float(cutoff), int(limit)),
+            (int(uid), float(cutoff), float(latest_batch_ts), int(limit)),
         )
         rows = cur.fetchall() or []
         # Keep autotrade aligned with the newest executable email lane.
@@ -5057,6 +5192,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         live_partial_tp = float(exit_plan.get('effective_tp1') or 0.0)
         live_tp2 = float(exit_plan.get('effective_tp2') or 0.0)
         live_tp3 = float(exit_plan.get('effective_tp3') or 0.0)
+        live_tp_targets = _dedupe_price_targets(exit_plan.get('live_tp_targets') or [live_partial_tp, live_tp2])
         _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
@@ -5116,7 +5252,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         tp_base_qty = abs(float(_pos_size(final_pos) or qty)) if final_pos else float(qty)
         live_final_tp = float(exit_plan.get('final_tp') or live_tp2 or live_tp3 or live_partial_tp or 0.0)
         _autotrade_cancel_reduce_only_tp_orders(sym)
-        tp_targets_live = _dedupe_price_targets([x for x in (live_partial_tp, live_tp2, live_tp3) if float(x or 0.0) > 0])
+        time.sleep(0.25)
+        tp_targets_live = _dedupe_price_targets([x for x in (live_partial_tp, live_tp2) if float(x or 0.0) > 0])
         tp_order_results = _autotrade_place_reduce_only_tp_orders(sym, side, tp_targets_live, tp_base_qty, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
         tp_success_count = sum(1 for x in (tp_order_results or []) if bool(x.get('ok')) )
 
@@ -5136,14 +5273,39 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'session': str(session_label or ''),
         }, live_pos=final_pos)
 
+        exit_verify = _autotrade_verify_live_exit_stack(sym, side, sl_for_order, tp_targets_live, wait_sec=0.75, attempts=3)
+        if not bool(exit_verify.get('ok')):
+            # One retry after the exchange has had a moment to register the orders.
+            _autotrade_cancel_reduce_only_tp_orders(sym)
+            time.sleep(0.35)
+            _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
+            time.sleep(0.35)
+            tp_order_results_retry = _autotrade_place_reduce_only_tp_orders(sym, side, tp_targets_live, tp_base_qty, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
+            tp_order_results = list(tp_order_results or []) + list(tp_order_results_retry or [])
+            tp_success_count = sum(1 for x in (tp_order_results or []) if bool(x.get('ok')) )
+            exit_verify = _autotrade_verify_live_exit_stack(sym, side, sl_for_order, tp_targets_live, wait_sec=0.75, attempts=3)
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
                 'tp_orders': tp_order_results,
                 'tp_success_count': int(tp_success_count),
                 'protection_repair': repair_res,
+                'exit_verify': exit_verify,
             })
         except Exception:
             pass
+        if not bool(exit_verify.get('ok')):
+            close_res = _autotrade_close_live_position_market(sym, side, float(tp_base_qty if tp_base_qty > 0 else qty))
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'forced_close_due_to_exit_stack_failure': close_res})
+            except Exception:
+                pass
+            err = f"exit_stack_incomplete sl={int(bool(exit_verify.get('sl_ok')))} tp={len(exit_verify.get('actual_tps') or [])}/{len(exit_verify.get('expected_tps') or [])}"
+            _autotrade_exec_mark(reserved_keys, 'FAILED', err)
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state='execution_failed_protection', last_reason=err)
+            except Exception:
+                pass
+            return (False, err)
 
         qty_for_db = tp_base_qty if tp_base_qty > 0 else qty
         s_live = replace(s,
@@ -11564,7 +11726,7 @@ def _generate_candidates(cfg: dict) -> list[dict]:
     a1lo, a1hi = _rng("tf_align_1h_min_abs", 0.3, 1.2)
     a4lo, a4hi = _rng("tf_align_4h_min_abs", 0.3, 1.2)
     atrlo, atrhi = _rng("atr_min_pct", 0.4, 1.5)
-    rrlo, rrhi = _rng("min_rr_tp3", 1.3, 2.4)
+    rrlo, rrhi = _rng("min_rr_tp3", 1.3, 1.75)
 
     q_grid = [qlo, (qlo+qhi)/2.0, qhi]
     s_grid = [slo, (slo+shi)/2.0, shi]
@@ -15856,7 +16018,7 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
     email_lo = max(qlo + 2.0, 54.0)
     email_hi = min(qhi + 12.0, 84.0)
     out['quality_score_min_email'] = float(clamp(float(out.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), email_lo, email_hi))
-    rrlo, rrhi = _rng('min_rr_tp3', 1.3, 2.4)
+    rrlo, rrhi = _rng('min_rr_tp3', 1.3, 1.75)
     out['min_rr_tp3'] = float(clamp(float(out.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3), rrlo, rrhi))
     alo, ahi = _rng('atr_min_pct', 0.4, 1.5)
     out['atr_min_pct'] = float(clamp(float(out.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT), alo, ahi))
