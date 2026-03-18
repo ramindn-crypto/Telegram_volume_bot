@@ -1561,8 +1561,8 @@ REPEAT_SYMBOL_COOLDOWN_HOURS = {
 # Fallback if session unknown
 SYMBOL_COOLDOWN_HOURS = 4
 
-TARGET_MAX_HOLD_HOURS = float(os.environ.get("TARGET_MAX_HOLD_HOURS", "18") or 18)
-SETUP_OUTCOME_HORIZON_HOURS = float(os.environ.get("SETUP_OUTCOME_HORIZON_HOURS", "18") or 18)
+TARGET_MAX_HOLD_HOURS = float(os.environ.get("TARGET_MAX_HOLD_HOURS", "12") or 12)
+SETUP_OUTCOME_HORIZON_HOURS = float(os.environ.get("SETUP_OUTCOME_HORIZON_HOURS", "12") or 12)
 SETUP_STALE_TIMEOUT_CLOSE_ENABLED = str(os.environ.get("SETUP_STALE_TIMEOUT_CLOSE_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
 
 # =========================================================
@@ -1626,12 +1626,10 @@ def repeated_symbol_cooldown_hours_for_session(session_name: str) -> int:
 
 def setup_outcome_horizon_hours_for_session(session_name: str) -> float:
     s = (session_name or "").strip().upper()
-    base = float(SETUP_OUTCOME_HORIZON_HOURS or TARGET_MAX_HOLD_HOURS or 18.0)
-    if s == "ASIA":
-        return float(max(base, 20.0))
-    if s == "LON":
-        return float(max(base, 18.0))
-    return float(max(base, 18.0))
+    # 12h default horizon for daily-trader resolution bias.
+    # Keep session-specific overrides environment-driven rather than hard-forcing 18-20h.
+    base = float(SETUP_OUTCOME_HORIZON_HOURS or TARGET_MAX_HOLD_HOURS or 12.0)
+    return float(max(base, 12.0))
 
 # Multi-TP
 ATR_PERIOD = 14
@@ -10659,7 +10657,7 @@ def tp3_rr_target_from_conf(conf: int) -> float:
     Production 2-TP final target.
 
     Recent live evidence shows TP1s are being reached but the old final target is still too ambitious.
-    Keep TP2, but bias it toward sub-18h resolution.
+    Keep TP2, but bias it toward roughly 12h resolution.
     """
     if conf >= 92:
         return 1.72
@@ -26691,7 +26689,7 @@ def _autotrade_close_stale_live_positions(uid: int, session_label: str = '') -> 
     summary = {'checked': 0, 'closed': 0, 'errors': []}
     if str(AUTOTRADE_MODE).lower() != 'live' or not SETUP_STALE_TIMEOUT_CLOSE_ENABLED:
         return summary
-    max_hold_h = float(TARGET_MAX_HOLD_HOURS or 18.0)
+    max_hold_h = float(TARGET_MAX_HOLD_HOURS or 12.0)
     if max_hold_h <= 0:
         return summary
     now_ts = float(time.time())
