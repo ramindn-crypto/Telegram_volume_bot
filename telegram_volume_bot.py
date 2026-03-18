@@ -982,7 +982,7 @@ MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "78"))
 
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
 MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
-MIN_RR_TP3 = float(os.environ.get("MIN_RR_TP3", "1.8"))
+MIN_RR_TP3 = float(os.environ.get("MIN_RR_TP3", "1.55"))
 
 # Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
 EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
@@ -1168,6 +1168,18 @@ def load_strategy_config(force: bool = False) -> dict:
     if not isinstance(cfg, dict):
         cfg = _strategy_config_defaults()
         save_strategy_config(cfg)
+
+    # Normalize legacy RR floors from the pre-2TP model.
+    # Older deployments commonly persisted min_rr_tp3=1.80, which now blocks
+    # setup creation because the live target model intentionally tops out near 1.95R.
+    try:
+        rr_cfg = float(cfg.get("min_rr_tp3", MIN_RR_TP3) or MIN_RR_TP3)
+        if abs(rr_cfg - 1.80) <= 0.01:
+            cfg["min_rr_tp3"] = float(MIN_RR_TP3)
+            save_strategy_config(cfg)
+    except Exception:
+        pass
+
     _STRATEGY_CFG_CACHE["ts"] = now
     _STRATEGY_CFG_CACHE["cfg"] = dict(cfg)
     return dict(cfg)
@@ -5222,9 +5234,11 @@ SESSION_MIN_CONF = {
 }
 
 SESSION_MIN_RR_TP3 = {
-    "NY": 1.60,
-    "LON": 1.62,
-    "ASIA": 1.90,
+    # Aligned with the current 2-TP generator (~1.50R–1.95R final target).
+    # The old 1.80/1.90 floors were starving setup creation before email/autotrade.
+    "NY": 1.55,
+    "LON": 1.58,
+    "ASIA": 1.70,
 }
 
 SESSION_EMA_PROX_MULT = {
