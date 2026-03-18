@@ -16424,7 +16424,7 @@ def is_executable_setup_eligible(
     session_name: str = "NY",
     min_quality: float = 70.0,
     min_conf: int = 78,
-    min_rr_final: float = 2.0,
+    min_rr_final: float = 1.55,
 ) -> tuple[bool, str]:
     """Production-grade gate for email/executable/autotrade path.
 
@@ -16451,6 +16451,11 @@ def is_executable_setup_eligible(
         sess_quality, sess_conf, sess_rr = _execution_session_thresholds(sess)
         score_floor = float(max(min_quality, QUALITY_SCORE_MIN_EMAIL, sess_quality))
         conf_floor = int(max(min_conf, MIN_SETUP_CONF, sess_conf))
+        # IMPORTANT: live execution must use the same 2-TP reality as the setup builder.
+        # The old hard floor of 2.0R starved the whole email/autotrade lane because
+        # tp_r_mults_from_conf()/tp3_rr_target_from_conf() now intentionally target
+        # ~1.50R–1.95R. Keep a modest base floor here and let the session thresholds
+        # (NY/LON/ASIA) enforce the real production minimum.
         rr_floor = float(max(min_rr_final, sess_rr))
 
         score = float(getattr(s, "quality_score", 0.0) or 0.0)
