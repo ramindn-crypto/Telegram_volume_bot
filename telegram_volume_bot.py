@@ -13819,16 +13819,32 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No evolution snapshot yet.")
         return
 
+    def _edge_status_extra_payload(_uid: int) -> dict:
+        last_opt = _db_get_last_opt_run() or {}
+        opt_res = _db_get_opt_result(str(last_opt.get("run_id") or "")) if last_opt else {}
+        verdict, blockers = _admin_assurance_verdict(_uid)
+        owner = int(AUTOTRADE_OWNER_UID or _uid)
+        return {
+            "last_opt": last_opt,
+            "opt_res": opt_res,
+            "verdict": verdict,
+            "blockers": blockers,
+            "owner": owner,
+            "overall_sig": _signal_wr_display_metrics(owner),
+            "ny_sig": _signal_wr_display_metrics(owner, session='NY'),
+        }
+
+    extra = await to_thread_heavy(_edge_status_extra_payload, uid, timeout=25)
     overall = snap.get("overall") or {}
     ny = snap.get("ny") or {}
     trend = snap.get("trend") or {}
-    last_opt = _db_get_last_opt_run() or {}
-    opt_res = _db_get_opt_result(str(last_opt.get("run_id") or "")) if last_opt else {}
-    verdict, blockers = _admin_assurance_verdict(uid)
+    last_opt = extra.get("last_opt") or {}
+    opt_res = extra.get("opt_res") or {}
+    verdict, blockers = extra.get("verdict"), extra.get("blockers") or []
     opt_live = bool((opt_res or {}).get("promoted"))
-    owner = int(AUTOTRADE_OWNER_UID or uid)
-    overall_sig = _signal_wr_display_metrics(owner)
-    ny_sig = _signal_wr_display_metrics(owner, session='NY')
+    owner = int(extra.get("owner") or uid)
+    overall_sig = extra.get("overall_sig") or {}
+    ny_sig = extra.get("ny_sig") or {}
 
     lines = [
         "🧠 Edge Status",
@@ -14500,7 +14516,8 @@ async def learning_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
-    await send_long_message(update, _learning_status_text(), parse_mode=None)
+    text = await to_thread_heavy(_learning_status_text, timeout=25)
+    await send_long_message(update, text, parse_mode=None)
 
 
 def _signal_outcome_summary(user_id: int, session: str | None = None, days: int | None = None) -> dict:
@@ -15424,7 +15441,7 @@ async def scan_intelligence_job(context: ContextTypes.DEFAULT_TYPE):
         if not best_fut:
             return
         session = scan_session_name_utc(datetime.now(timezone.utc))
-        pool = await build_priority_pool(best_fut, session, mode="screen", scan_profile=DEFAULT_SCAN_PROFILE, uid=None)
+        pool = await to_thread_heavy(_build_priority_pool_sync, best_fut, session, "screen", DEFAULT_SCAN_PROFILE, None, timeout=max(30, int(EMAIL_BUILD_POOL_TIMEOUT_SEC)))
         try:
             rej_ctx = _REJECT_CTX.get() if isinstance(_REJECT_CTX.get(), dict) else None
         except Exception:
@@ -25076,9 +25093,9 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # EMAIL JOB
 # =========================================================
 
-EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "60"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "60"))
-EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "60"))
+EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "25"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "20"))
+EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "25"))
 
 # SMTP connection reuse (Render speed fix)
 SMTP_REUSE_TTL_SEC = int(os.environ.get("SMTP_REUSE_TTL_SEC", "240"))  # 4 minutes
@@ -25116,6 +25133,76 @@ def _run_coro_in_thread(coro):
                 pass
             asyncio.set_event_loop(None)
             loop.close()
+
+def _build_priority_pool_sync(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
+    """Run build_priority_pool off the main event loop."""
+    return _run_coro_in_thread(build_priority_pool(best_fut, session_name, mode=mode, scan_profile=scan_profile, uid=uid))
+
+def _derive_needed_email_sessions(users_notify: list[dict] | None, now_utc: datetime | None = None) -> list[str]:
+    """Build only the session pools that at least one active user can use right now."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    fallback = list(EMAIL_BUILD_SESSIONS or ["ASIA", "LON", "NY"])
+    needed: list[str] = []
+    for user in (users_notify or []):
+        try:
+            uid = int((user or {}).get("user_id") or (user or {}).get("id") or 0)
+        except Exception:
+            uid = 0
+        if not uid:
+            continue
+        try:
+            uu = get_user(uid) or {}
+            if int((uu or {}).get("sessions_unlimited", 0) or 0) == 1:
+                sess_ctx = in_session_now(uu) or {}
+                sess_name = str(sess_ctx.get("name") or current_session_utc(now_utc) or "").upper()
+            else:
+                sess_name = str(current_session_utc(now_utc) or "").upper()
+        except Exception:
+            sess_name = str(current_session_utc(now_utc) or "").upper()
+        if sess_name in {"ASIA", "LON", "NY"} and sess_name not in needed:
+            needed.append(sess_name)
+    if not needed:
+        live = str(current_session_utc(now_utc) or "").upper()
+        if live in {"ASIA", "LON", "NY"}:
+            needed.append(live)
+    if not needed:
+        needed = [s for s in fallback if s in {"ASIA", "LON", "NY"}]
+    return needed or ["NY"]
+
+def _autotrade_manage_live_positions_sync(uid: int, sess: str) -> dict:
+    repaired = []
+    live_map = {(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper()): p for p in (_bybit_get_open_positions_linear() or [])}
+    for tr in (_autotrade_db_open_trades(int(uid)) or []):
+        key = (str(tr.get('symbol') or '').upper(), str(tr.get('side') or '').upper())
+        p = live_map.get(key)
+        if not p:
+            continue
+        rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
+        if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
+            repaired.append(rr)
+    stale_summary = _autotrade_close_stale_live_positions(int(uid), sess)
+    return {"repaired": repaired, "stale_summary": stale_summary}
+
+def _autotrade_attempt_trade_candidates_sync(uid: int, sess: str, db_setups: list) -> tuple[bool, str, int]:
+    ok = False
+    reason = 'no_tradable_setup'
+    attempted = 0
+    for cand in (db_setups or []):
+        attempted += 1
+        ok, reason = _autotrade_place_trade(uid, sess, [cand])
+        if ok:
+            break
+        if reason not in {
+            'blocked_duplicate_open_position',
+            'blocked_duplicate_pending_order',
+            'blocked_duplicate_inflight_lock',
+            'blocked_by_cooldown',
+            'blocked_by_recent_symbol_trade',
+            'blocked_by_existing_local_trade_state',
+            'setup_expired',
+        }:
+            break
+    return ok, reason, attempted
 
 async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
     """
@@ -25377,16 +25464,19 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
         # -----------------------------------------------------
         setups_by_session: Dict[str, List[Setup]] = {}
-        for sess_name in (EMAIL_BUILD_SESSIONS or ["ASIA", "LON", "NY"]):
-            try:
-                # Session pools are shared across users, so do not bind them to a stale uid
-                # leaked from an earlier loop iteration.
-                pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=None)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
-            except asyncio.TimeoutError:
-                pool = {"setups": []}
-            except Exception:
-                pool = {"setups": []}
-
+        needed_sessions = _derive_needed_email_sessions(users_notify, datetime.now(timezone.utc))
+        session_tasks = [
+            asyncio.create_task(
+                asyncio.wait_for(
+                    asyncio.to_thread(_build_priority_pool_sync, best_fut, sess_name, "email", str(DEFAULT_SCAN_PROFILE), None),
+                    timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
+                )
+            )
+            for sess_name in needed_sessions
+        ]
+        session_results = await asyncio.gather(*session_tasks, return_exceptions=True) if session_tasks else []
+        for sess_name, pool_res in zip(needed_sessions, session_results):
+            pool = pool_res if isinstance(pool_res, dict) else {"setups": []}
             setups = (pool.get("setups", []) or [])[:max(EMAIL_SETUPS_N * 3, 9)]
 
             # Rule 3: Priority override (Directional Leaders/Losers first)
@@ -26785,17 +26875,9 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
 
             # Keep live exit protection synchronized with Bybit before considering new entries.
             try:
-                repaired = []
-                live_map = {(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper()): p for p in (_bybit_get_open_positions_linear() or [])}
-                for tr in (_autotrade_db_open_trades(int(uid)) or []):
-                    key = (str(tr.get('symbol') or '').upper(), str(tr.get('side') or '').upper())
-                    p = live_map.get(key)
-                    if not p:
-                        continue
-                    rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
-                    if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
-                        repaired.append(rr)
-                stale_summary = _autotrade_close_stale_live_positions(int(uid), sess)
+                managed = await to_thread_heavy(_autotrade_manage_live_positions_sync, int(uid), sess, timeout=25)
+                repaired = list((managed or {}).get('repaired') or [])
+                stale_summary = (managed or {}).get('stale_summary') or {}
                 if repaired or int(stale_summary.get('closed') or 0) > 0:
                     _LAST_AUTOTRADE_DECISION[uid] = {
                         "status": "MANAGED",
@@ -26841,24 +26923,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 _hb_touch('autotrade', ok=True, details=f'no_setups sess={sess}')
                 return
 
-            ok = False
-            reason = 'no_tradable_setup'
-            attempted = 0
-            for cand in db_setups:
-                attempted += 1
-                ok, reason = _autotrade_place_trade(uid, sess, [cand])
-                if ok:
-                    break
-                if reason not in {
-                    'blocked_duplicate_open_position',
-                    'blocked_duplicate_pending_order',
-                    'blocked_duplicate_inflight_lock',
-                    'blocked_by_cooldown',
-                    'blocked_by_recent_symbol_trade',
-                    'blocked_by_existing_local_trade_state',
-                    'setup_expired',
-                }:
-                    break
+            ok, reason, attempted = await to_thread_heavy(_autotrade_attempt_trade_candidates_sync, uid, sess, db_setups, timeout=30)
 
             _LAST_AUTOTRADE_DECISION[uid] = {
                 "status": "PLACED" if ok else "SKIP",
@@ -27147,7 +27212,7 @@ def main():
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
-                "misfire_grace_time": 30,
+                "misfire_grace_time": 90,
             },
         )
 
