@@ -6554,9 +6554,11 @@ def _learning_status_text() -> str:
     auto_last = snap.get("auto_applied_last") or _evolution_state_get("last_auto_adjustment", {}) or {}
 
     owner = int(AUTOTRADE_OWNER_UID or 0)
-    stage = _learning_stage_outcome_summary(owner, days=60)
+    stage = _learning_stage_outcome_summary(owner, days=60, sync_exchange=False, use_cache=True)
     be = _learning_breakeven_after_tp1_analysis(owner, days=60)
     live = _learning_live_trade_summary(owner, days=60)
+    overall_sig = _signal_wr_display_metrics(owner, sync_exchange=False, use_cache=True)
+    ny_sig = _signal_wr_display_metrics(owner, session='NY', sync_exchange=False, use_cache=True)
 
     hourly_no_data = int(hourly.get("analyzed_setups", 0) or 0) == 0 and int(hourly.get("analyzed_trades", 0) or 0) == 0
     daily_no_data = int(daily.get("analyzed_setups", 0) or 0) == 0 and int(daily.get("analyzed_trades", 0) or 0) == 0
@@ -6626,7 +6628,7 @@ def _learning_status_text() -> str:
     lines.extend([
         SEP,
         f"Current live floors: email_quality={float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL):.1f} | screen_quality={float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN):.1f} | min_rr_tp3={float(cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3):.2f}",
-        f"Signal win rate (completed outcomes): overall {_signal_wr_display_metrics(owner).get('binary_win_rate', 0.0):.1f}% | NY {_signal_wr_display_metrics(owner, session='NY').get('binary_win_rate', 0.0):.1f}% | trend overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}",
+        f"Signal win rate (completed outcomes): overall {overall_sig.get('binary_win_rate', 0.0):.1f}% | NY {ny_sig.get('binary_win_rate', 0.0):.1f}% | trend overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}",
         SEP,
     ])
 
@@ -6639,6 +6641,18 @@ def _learning_status_text() -> str:
         manual_action = "enable EVOLUTION_ENABLED and/or AUTONOMOUS_OPT_ENABLED in the environment, then redeploy"
     lines.append(f"Manual action: {manual_action}.")
     return "\n".join(lines)
+
+
+def _learning_status_text_cached(force: bool = False) -> str:
+    key = "status_text:learning"
+    ttl = int(os.getenv("LEARNING_STATUS_CACHE_TTL_SEC", "30"))
+    if not force and cache_valid(key, ttl):
+        cached = cache_get(key)
+        if isinstance(cached, str) and cached.strip():
+            return cached
+    text = _learning_status_text()
+    cache_set(key, text)
+    return text
 
 def _fmt_iso_local_label(iso_s: str, fallback: str = "") -> str:
     if not iso_s:
@@ -13830,11 +13844,19 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "verdict": verdict,
             "blockers": blockers,
             "owner": owner,
-            "overall_sig": _signal_wr_display_metrics(owner),
-            "ny_sig": _signal_wr_display_metrics(owner, session='NY'),
+            "overall_sig": _signal_wr_display_metrics(owner, sync_exchange=False, use_cache=True),
+            "ny_sig": _signal_wr_display_metrics(owner, session='NY', sync_exchange=False, use_cache=True),
         }
 
-    extra = await to_thread_heavy(_edge_status_extra_payload, uid, timeout=25)
+    edge_cache_key = f"status_payload:edge:{int(uid)}"
+    try:
+        extra = await to_thread_heavy(_edge_status_extra_payload, uid, timeout=35)
+        cache_set(edge_cache_key, extra)
+    except asyncio.TimeoutError:
+        extra = cache_get(edge_cache_key) or {
+            "last_opt": {}, "opt_res": {}, "verdict": "REFRESHING", "blockers": ["edge_status_refresh_in_progress"],
+            "owner": int(AUTOTRADE_OWNER_UID or uid), "overall_sig": {}, "ny_sig": {}
+        }
     overall = snap.get("overall") or {}
     ny = snap.get("ny") or {}
     trend = snap.get("trend") or {}
@@ -14516,12 +14538,19 @@ async def learning_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
-    text = await to_thread_heavy(_learning_status_text, timeout=25)
+    try:
+        text = await to_thread_heavy(_learning_status_text_cached, timeout=35)
+    except asyncio.TimeoutError:
+        text = cache_get("status_text:learning") or "⏳ /learning_status is still refreshing. Please retry in a few seconds."
     await send_long_message(update, text, parse_mode=None)
 
 
-def _signal_outcome_summary(user_id: int, session: str | None = None, days: int | None = None) -> dict:
-    """Canonical signal outcome summary from emailed setups, optionally live-synced for admin autotrade rows."""
+def _signal_outcome_summary(user_id: int, session: str | None = None, days: int | None = None, *, sync_exchange: bool = True, use_cache: bool = True) -> dict:
+    """Canonical signal outcome summary from emailed setups.
+
+    For lightweight status commands, set ``sync_exchange=False`` so the bot can reuse DB state
+    without forcing a fresh Bybit reconciliation on every request.
+    """
     rows = []
     ts_from = None
     if days is not None:
@@ -14530,9 +14559,19 @@ def _signal_outcome_summary(user_id: int, session: str | None = None, days: int 
         except Exception:
             ts_from = None
     user_id = int(user_id)
+    cache_ttl = int(os.getenv("SIGNAL_OUTCOME_CACHE_TTL_SEC", "45"))
+    cache_key = f"signal_outcome:{int(user_id)}:{str(session or '*').upper()}:{int(days or 0)}:{1 if sync_exchange else 0}"
+    if use_cache and cache_valid(cache_key, cache_ttl):
+        cached = cache_get(cache_key)
+        if isinstance(cached, dict) and cached:
+            return cached
     try:
-        if str(AUTOTRADE_MODE).lower() == 'live' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0):
-            _autotrade_sync_closed_trades_from_exchange(int(user_id), lookback_days=max(14, int(days or 30)))
+        if sync_exchange and str(AUTOTRADE_MODE).lower() == 'live' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0):
+            sync_ttl = int(os.getenv("SIGNAL_EXCHANGE_SYNC_TTL_SEC", "120"))
+            sync_key = f"signal_exchange_sync:{int(user_id)}"
+            if not cache_valid(sync_key, sync_ttl):
+                _autotrade_sync_closed_trades_from_exchange(int(user_id), lookback_days=max(14, int(days or 30)))
+                cache_set(sync_key, {"ok": True, "ts": time.time()})
     except Exception:
         pass
     try:
@@ -14555,7 +14594,7 @@ def _signal_outcome_summary(user_id: int, session: str | None = None, days: int 
     user = get_user(user_id) or {}
     rows, hidden_untracked_open = _signal_report_resolve_rows(user_id, emailed, user=user)
     stats = _canonical_wr_stats(rows)
-    return {
+    result = {
         'rows': rows,
         'counts': stats.get('counts') or Counter(),
         'by_session': stats.get('by_session') or {},
@@ -14565,10 +14604,13 @@ def _signal_outcome_summary(user_id: int, session: str | None = None, days: int 
         'win_rate': float(stats.get('win_rate') or 0.0),
         'hidden_untracked_open': int(hidden_untracked_open or 0),
     }
+    if use_cache:
+        cache_set(cache_key, result)
+    return result
 
 
-def _signal_outcome_weighted_summary(user_id: int, session: str | None = None, days: int | None = None) -> dict:
-    summary = _signal_outcome_summary(int(user_id), session=session, days=days)
+def _signal_outcome_weighted_summary(user_id: int, session: str | None = None, days: int | None = None, *, sync_exchange: bool = True, use_cache: bool = True) -> dict:
+    summary = _signal_outcome_summary(int(user_id), session=session, days=days, sync_exchange=sync_exchange, use_cache=use_cache)
     rows = summary.get('rows') or []
     stats = _canonical_wr_stats(rows)
     counts = stats.get('counts') or Counter()
@@ -14590,8 +14632,8 @@ def _signal_outcome_weighted_summary(user_id: int, session: str | None = None, d
     }
 
 
-def _signal_wr_display_metrics(user_id: int, session: str | None = None, days: int | None = None) -> dict:
-    roll = _signal_outcome_weighted_summary(int(user_id), session=session, days=days)
+def _signal_wr_display_metrics(user_id: int, session: str | None = None, days: int | None = None, *, sync_exchange: bool = True, use_cache: bool = True) -> dict:
+    roll = _signal_outcome_weighted_summary(int(user_id), session=session, days=days, sync_exchange=sync_exchange, use_cache=use_cache)
     return {
         'wins': int(roll.get('wins') or 0),
         'losses': int(roll.get('losses') or 0),
@@ -14683,10 +14725,10 @@ def _autotrade_weighted_outcome_summary(uid: int, days: int | None = None) -> di
     return _weighted_rollup_from_outcomes(outcomes)
 
 
-def _learning_stage_outcome_summary(uid: int, days: int = 60) -> dict:
+def _learning_stage_outcome_summary(uid: int, days: int = 60, *, sync_exchange: bool = True, use_cache: bool = True) -> dict:
     if int(uid or 0) <= 0:
         return {'decided': 0, 'tp1_only': 0, 'tp2_plus': 0, 'tp3': 0, 'losses': 0, 'weighted_win_rate': 0.0, 'avg_weighted_credit': 0.0}
-    summary = _signal_outcome_summary(int(uid), days=int(days))
+    summary = _signal_outcome_summary(int(uid), days=int(days), sync_exchange=sync_exchange, use_cache=use_cache)
     outcomes = []
     for r in summary.get('rows') or []:
         outcomes.append((str(r.get('session') or '?'), str(r.get('outcome') or 'OPEN')))
