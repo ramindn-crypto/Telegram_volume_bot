@@ -6650,9 +6650,15 @@ def _learning_status_text_cached(force: bool = False) -> str:
         cached = cache_get(key)
         if isinstance(cached, str) and cached.strip():
             return cached
-    text = _learning_status_text()
-    cache_set(key, text)
-    return text
+    try:
+        text = _learning_status_text()
+        cache_set(key, text)
+        return text
+    except Exception:
+        cached = cache_get(key)
+        if isinstance(cached, str) and cached.strip():
+            return cached
+        raise
 
 def _fmt_iso_local_label(iso_s: str, fallback: str = "") -> str:
     if not iso_s:
@@ -9947,6 +9953,16 @@ def get_exchange() -> ccxt.Exchange:
                 "timeout": 20000,
                 "options": {"defaultType": DEFAULT_TYPE},
             })
+            try:
+                import requests as _pf_requests
+                from requests.adapters import HTTPAdapter as _PFHTTPAdapter
+                sess = _pf_requests.Session()
+                adapter = _PFHTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=0)
+                sess.mount("https://", adapter)
+                sess.mount("http://", adapter)
+                _EX.session = sess
+            except Exception:
+                pass
             _EX_MARKETS_LOADED = False
 
         if not _EX_MARKETS_LOADED:
@@ -14539,9 +14555,11 @@ async def learning_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⛔ Admin only.")
         return
     try:
-        text = await to_thread_heavy(_learning_status_text_cached, timeout=35)
+        text = await to_thread_heavy(_learning_status_text_cached, timeout=25)
     except asyncio.TimeoutError:
         text = cache_get("status_text:learning") or "⏳ /learning_status is still refreshing. Please retry in a few seconds."
+    except Exception:
+        text = cache_get("status_text:learning") or "⚠️ /learning_status hit a temporary refresh issue. Please retry in a few seconds."
     await send_long_message(update, text, parse_mode=None)
 
 
@@ -14847,10 +14865,10 @@ def _autotrade_weighted_outcome_summary(uid: int, days: int | None = None) -> di
     return _weighted_rollup_from_outcomes(outcomes)
 
 
-def _learning_stage_outcome_summary(uid: int, days: int = 60) -> dict:
+def _learning_stage_outcome_summary(uid: int, days: int = 60, *, sync_exchange: bool = True, use_cache: bool = True) -> dict:
     if int(uid or 0) <= 0:
         return {'decided': 0, 'tp1_only': 0, 'tp2_plus': 0, 'tp3': 0, 'losses': 0, 'weighted_win_rate': 0.0, 'avg_weighted_credit': 0.0}
-    summary = _signal_outcome_summary(int(uid), days=int(days))
+    summary = _signal_outcome_summary(int(uid), days=int(days), sync_exchange=sync_exchange, use_cache=use_cache)
     outcomes = []
     for r in summary.get('rows') or []:
         outcomes.append((str(r.get('session') or '?'), str(r.get('outcome') or 'OPEN')))
@@ -23804,7 +23822,7 @@ def user_location_and_time(user: dict):
 # =========================================================
 # /screen fast cache (per-instance)
 # =========================================================
-SCREEN_CACHE_TTL_SEC = 20  # seconds
+SCREEN_CACHE_TTL_SEC = 30  # seconds
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 _SCREEN_CACHE: dict[str, dict] = {}
 _SCREEN_LOCK = asyncio.Lock()
@@ -24370,12 +24388,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         reset_reject_tracker()
 
-        best_fut = await asyncio.to_thread(fetch_futures_tickers)
-        if not best_fut:
-            await status_msg.edit_text("❌ Failed to fetch futures data.")
-            return
-
-        # Header (always fresh)
+        # Header + cache keys can be built without hitting the exchange.
         uid = update.effective_user.id
         user = get_user(uid)
         live_session = current_session_utc()
@@ -24392,7 +24405,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         now_ts = time.time()
         cache_key = f"uid:{int(uid)}::{str(scan_session or '').upper()}"
-        cache_entry = _SCREEN_CACHE.get(cache_key) or {}
+        global_cache_key = f"global::{str(scan_session or '').upper()}"
+        cache_entry = _SCREEN_CACHE.get(cache_key) or _SCREEN_CACHE.get(global_cache_key) or {}
 
         # ------------- FAST PATH (cache hit) -------------
         cached_body = ""
@@ -24426,7 +24440,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with _SCREEN_LOCK:
             # Re-check cache after waiting for lock (another request may have filled it)
             now_ts = time.time()
-            cache_entry = _SCREEN_CACHE.get(cache_key) or {}
+            cache_entry = _SCREEN_CACHE.get(cache_key) or _SCREEN_CACHE.get(global_cache_key) or {}
             if (cache_entry.get("body") and (now_ts - float(cache_entry.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
                 cached_body = str(cache_entry.get("body") or "")
                 cached_kb = list(cache_entry.get("kb") or [])
@@ -24451,6 +24465,11 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
+
+            best_fut = await asyncio.to_thread(fetch_futures_tickers)
+            if not best_fut:
+                await status_msg.edit_text("❌ Failed to fetch futures data.")
+                return
 
             # Heavy build MUST NOT run on the asyncio event loop.
             # Only /screen is allowed to take longer; everything here runs in a worker thread.
@@ -24478,12 +24497,14 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sync_info = {"status": "skip", "reason": "manual_screen_sync_disabled"}
 
             # Cache for fast subsequent /screen calls (user + session scoped)
-            _SCREEN_CACHE[cache_key] = {
+            _screen_cache_payload = {
                 "ts": time.time(),
                 "body": body,
                 "kb": list(kb or []),
                 "sync_info": dict(sync_info or {}),
             }
+            _SCREEN_CACHE[cache_key] = dict(_screen_cache_payload)
+            _SCREEN_CACHE[global_cache_key] = dict(_screen_cache_payload)
 
 
         # Send final
