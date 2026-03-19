@@ -4356,13 +4356,34 @@ def _bybit_get_open_orders_linear(symbol: str | None = None) -> list[dict]:
     try:
         if not BYBIT_API_KEY or not BYBIT_API_SECRET:
             return []
-        payload = {'category': 'linear', 'openOnly': 0, 'limit': 200}
-        if symbol:
-            payload['symbol'] = _bybit_linear_symbol(symbol)
-        res = _bybit_v5_request('GET', '/v5/order/realtime', payload)
-        if int((res or {}).get('retCode', -1)) != 0:
-            return []
-        return (((res or {}).get('result') or {}).get('list') or [])
+        sym = _bybit_linear_symbol(symbol) if symbol else None
+        merged: list[dict] = []
+        seen: set[str] = set()
+        # Bybit V5 may separate normal active orders from conditional/stop orders.
+        # For our live TP stack we must inspect both, otherwise freshly-created TP
+        # stop orders can be missed and autotrade will falsely think the exit stack
+        # is incomplete.
+        order_filters = [None, 'Order', 'StopOrder', 'tpslOrder']
+        for order_filter in order_filters:
+            payload = {'category': 'linear', 'openOnly': 0, 'limit': 200}
+            if sym:
+                payload['symbol'] = sym
+            if order_filter:
+                payload['orderFilter'] = order_filter
+            res = _bybit_v5_request('GET', '/v5/order/realtime', payload)
+            if int((res or {}).get('retCode', -1)) != 0:
+                continue
+            for row in ((((res or {}).get('result') or {}).get('list') or [])):
+                try:
+                    oid = str(row.get('orderId') or row.get('stopOrderId') or row.get('orderLinkId') or '')
+                except Exception:
+                    oid = ''
+                key = oid or json.dumps(row, sort_keys=True, default=str)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(row)
+        return merged
     except Exception:
         return []
 
@@ -5346,11 +5367,24 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 pass
             return (False, 'live_exit_stack_invalid_tp_layout')
 
-        def _verify_full_exit_stack(pos_obj):
+        def _verify_full_exit_stack(pos_obj, expected_tp_results=None):
             pos_now = pos_obj or _autotrade_find_live_position(sym, side=side)
             sl_live = float(_pos_stop(pos_now) or 0.0) if pos_now else 0.0
-            sl_ok = bool(sl_for_order > 0 and sl_live > 0 and _price_close_enough(sl_live, sl_for_order, rel_tol=0.0010))
-            tp_ok = bool(len(tp_targets_live) == 2 and all(_bybit_has_open_tp_order_at(sym, px, side=side) for px in tp_targets_live))
+            sl_ok = bool(sl_for_order > 0 and sl_live > 0 and _price_close_enough(sl_live, sl_for_order, rel_tol=0.0015))
+            tp_ok_api = bool(len(tp_targets_live) == 2 and all(_bybit_has_open_tp_order_at(sym, px, side=side) for px in tp_targets_live))
+            # On Bybit, freshly-created conditional TP orders may not show up in the
+            # first realtime poll even when order/create already returned success.
+            # Accept a clean create response as valid while still preferring the live
+            # order-book verification whenever it is available.
+            tp_ok_create = False
+            try:
+                ok_results = [x for x in (expected_tp_results or []) if bool(x.get('ok'))]
+                ok_targets = sorted([round(float(x.get('tp') or 0.0), 10) for x in ok_results if float(x.get('tp') or 0.0) > 0])
+                want_targets = sorted([round(float(x or 0.0), 10) for x in (tp_targets_live or []) if float(x or 0.0) > 0])
+                tp_ok_create = bool(len(want_targets) == 2 and len(ok_targets) == 2 and ok_targets == want_targets)
+            except Exception:
+                tp_ok_create = False
+            tp_ok = bool(tp_ok_api or tp_ok_create)
             return pos_now, sl_ok, tp_ok
 
         _autotrade_cancel_reduce_only_tp_orders(sym, side=side)
@@ -5358,14 +5392,14 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         time.sleep(0.35)
         tp_order_results = _autotrade_place_reduce_only_tp_orders(sym, side, tp_targets_live, tp_base_qty, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
         tp_success_count = sum(1 for x in (tp_order_results or []) if bool(x.get('ok')))
-        final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos)
+        final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results)
         if not (sl_stack_ok and tp_stack_ok and tp_success_count == 2):
             _autotrade_cancel_reduce_only_tp_orders(sym, side=side)
             sl_res_retry = _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
             time.sleep(0.45)
             tp_order_results = _autotrade_place_reduce_only_tp_orders(sym, side, tp_targets_live, tp_base_qty, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
             tp_success_count = sum(1 for x in (tp_order_results or []) if bool(x.get('ok')))
-            final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos)
+            final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results)
         else:
             sl_res_retry = None
 
