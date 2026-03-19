@@ -4515,6 +4515,43 @@ def _autotrade_allowed_session(session_label: str) -> bool:
 # =========================================================
 # AUTOTRADE: select best OPEN setup from DB (generated_setups + signals)
 # =========================================================
+def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") -> tuple[bool, str]:
+    """Lightweight eligibility check for DB-hydrated executable rows.
+
+    Email already applied the full live execution gate before a setup was written into
+    emailed_setups/executable_setups. When autotrade reloads that row from the DB, the
+    signals table does not carry every rich runtime field (quality_score, engine,
+    pullback flags, etc.), so re-running is_executable_setup_eligible() on the stripped
+    DB object can incorrectly reject valid emailed setups as "no_setups".
+
+    Here we keep only the checks that can be evaluated faithfully from persisted data.
+    """
+    try:
+        sess = str(session_name or "").upper().strip()
+        if sess not in {"ASIA", "LON", "NY"}:
+            return (False, "session_not_supported")
+        entry = float(getattr(s, "entry", 0.0) or 0.0)
+        sl = float(getattr(s, "sl", 0.0) or 0.0)
+        final_tp = float(getattr(s, "tp2", 0.0) or getattr(s, "tp3", 0.0) or 0.0)
+        if entry <= 0 or sl <= 0:
+            return (False, "missing_prices")
+        if final_tp <= 0:
+            return (False, "missing_tp")
+        if abs(entry - sl) <= 0:
+            return (False, "zero_risk_distance")
+        _, sess_conf, sess_rr = _execution_session_thresholds(sess)
+        conf_floor = int(max(MIN_SETUP_CONF, sess_conf))
+        conf = int(getattr(s, "conf", 0) or 0)
+        if conf < conf_floor:
+            return (False, "below_exec_conf")
+        rr_final = float(rr_to_tp(entry, sl, final_tp)) if final_tp > 0 else 0.0
+        if rr_final < float(sess_rr):
+            return (False, "below_exec_rr")
+        return (True, "ok")
+    except Exception:
+        return (False, "db_exec_validation_exception")
+
+
 def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1) -> list:
     """Return recent OPEN setup candidates for autotrade.
 
@@ -4546,7 +4583,8 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     continue
                 cur.execute(
                     """
-                    SELECT s.setup_id, s.symbol, s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3, s.created_ts
+                    SELECT s.setup_id, s.symbol, s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3, s.created_ts,
+                           s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15, COALESCE(s.market_symbol, '')
                     FROM signals s
                     WHERE s.setup_id = ?
                     LIMIT 1
@@ -4556,7 +4594,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                 row = cur.fetchone()
                 if not row:
                     continue
-                setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3, signal_created_ts = row
+                setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3, signal_created_ts, fut_vol_usd, ch24, ch4, ch1, ch15, market_symbol = row
                 try:
                     signal_created_ts = float(signal_created_ts or 0.0)
                 except Exception:
@@ -4592,6 +4630,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     setup_id=setup_id,
                     id=setup_id,
                     symbol=symbol,
+                    market_symbol=str(market_symbol or ''),
                     side=side,
                     conf=int(conf or 0),
                     entry=float(entry or 0.0),
@@ -4599,6 +4638,11 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     tp1=tp1,
                     tp2=tp2,
                     tp3=tp3,
+                    fut_vol_usd=float(fut_vol_usd or 0.0),
+                    ch24=float(ch24 or 0.0),
+                    ch4=float(ch4 or 0.0),
+                    ch1=float(ch1 or 0.0),
+                    ch15=float(ch15 or 0.0),
                     created_ts=float(canonical_ts or 0.0),
                     signal_created_ts=float(signal_created_ts or 0.0),
                     email_logged_ts=float(aux_ts_f or 0.0) if source_kind == 'executable_setups' else (float(chosen_ts_f or 0.0) if source_kind == 'emailed_setups' else 0.0),
@@ -4606,7 +4650,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     source_kind=str(source_kind),
                     source_session=str(src_session or ''),
                 )
-                exec_ok, exec_why = is_executable_setup_eligible(item, session_name=req_session_u or src_session_u or session_label)
+                exec_ok, exec_why = _autotrade_db_signal_structurally_valid(item, session_name=req_session_u or src_session_u or session_label)
                 if not exec_ok:
                     try:
                         if setup_id:
@@ -23280,15 +23324,100 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     """Heavy /screen builder (runs in a worker thread).
 
     Top setups must stay in the same lane used by email + autotrade.
-    If the executable/email-grade pool is empty, /screen should not silently fall back
-    to broader screen-only setups as "Top Trade Setups", because that breaks the
-    expected screen -> email -> autotrade sync.
+    If a setup was just emailed to this user, /screen should reflect that same live setup
+    for a short freshness window instead of immediately showing an empty screen because the
+    next scan tick no longer rebuilt the same candidate.
 
     Returns:
         body (str): cached body (header is built in the async handler)
         kb (list[tuple[str,str]]): [(SYMBOL, SETUP_ID), ...] for TradingView buttons
         setups (list[Setup]): synced executable-grade setups shown on /screen
     """
+    from types import SimpleNamespace
+
+    def _recent_email_lane_screen_setups(_uid: int, _session: str, max_age_min: int = 20, limit: int = 3):
+        out = []
+        try:
+            cutoff = float(time.time()) - float(max_age_min) * 60.0
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute(
+                """
+                SELECT e.setup_id,
+                       MAX(e.emailed_ts) AS emailed_ts,
+                       MAX(COALESCE(x.executable_ts, 0)) AS executable_ts,
+                       MAX(COALESCE(e.session, x.session, '')) AS src_session
+                FROM emailed_setups e
+                LEFT JOIN executable_setups x
+                       ON x.user_id = e.user_id
+                      AND x.setup_id = e.setup_id
+                LEFT JOIN signal_outcomes o ON o.setup_id = e.setup_id
+                WHERE e.user_id = ?
+                  AND e.emailed_ts >= ?
+                  AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+                GROUP BY e.setup_id
+                ORDER BY emailed_ts DESC, executable_ts DESC, e.setup_id DESC
+                LIMIT ?
+                """,
+                (int(_uid), float(cutoff), int(limit * 4)),
+            )
+            rows = cur.fetchall() or []
+            for sid, emailed_ts, executable_ts, src_session in rows:
+                src_session_u = str(src_session or '').upper().strip()
+                req_session_u = str(_session or '').upper().strip()
+                if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
+                    continue
+                cur.execute(
+                    """
+                    SELECT setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3, created_ts,
+                           fut_vol_usd, ch24, ch4, ch1, ch15, COALESCE(market_symbol, '')
+                    FROM signals
+                    WHERE setup_id = ?
+                    LIMIT 1
+                    """,
+                    (sid,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    continue
+                setup_id, symbol, side, conf, entry, sl, tp1, tp2, tp3, created_ts, fut_vol_usd, ch24, ch4, ch1, ch15, market_symbol = row
+                item = SimpleNamespace(
+                    setup_id=setup_id,
+                    id=setup_id,
+                    symbol=symbol,
+                    market_symbol=str(market_symbol or ''),
+                    side=side,
+                    conf=int(conf or 0),
+                    entry=float(entry or 0.0),
+                    sl=float(sl or 0.0),
+                    tp1=tp1,
+                    tp2=tp2,
+                    tp3=tp3,
+                    fut_vol_usd=float(fut_vol_usd or 0.0),
+                    ch24=float(ch24 or 0.0),
+                    ch4=float(ch4 or 0.0),
+                    ch1=float(ch1 or 0.0),
+                    ch15=float(ch15 or 0.0),
+                    created_ts=float(max(float(created_ts or 0.0), float(emailed_ts or 0.0), float(executable_ts or 0.0)) or 0.0),
+                    source_kind='recent_email_lane',
+                    source_session=str(src_session or ''),
+                )
+                ok_exec, _why_exec = _autotrade_db_signal_structurally_valid(item, session_name=req_session_u or src_session_u or _session)
+                if ok_exec:
+                    out.append(item)
+                if len(out) >= int(limit):
+                    break
+            try:
+                con.close()
+            except Exception:
+                pass
+        except Exception:
+            try:
+                con.close()
+            except Exception:
+                pass
+        return out[:int(limit)]
+
     # Build only the executable/email-aligned pool for Top Trade Setups.
     pool = _run_coro_in_thread(
         build_priority_pool(
@@ -23305,20 +23434,28 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     leaders_txt = build_leaders_table(best_fut)  # fast (top by futures volume)
     up_list, dn_list = compute_directional_lists(best_fut)
 
-    # Hard cap: never show more than 3 top setups on /screen
+    # First preference: show very recent emailed/executable lane setups for this user/session.
+    # This keeps /screen visually aligned with the live email/autotrade pipeline.
     try:
-        _raw_pool_setups = list(pool.get("setups") or [])
-        _exec_ready = []
-        for _s in _raw_pool_setups:
-            try:
-                _ok_exec, _why_exec = is_executable_setup_eligible(_s, session_name=session)
-            except Exception:
-                _ok_exec, _why_exec = False, 'screen_exec_gate_exception'
-            if _ok_exec:
-                _exec_ready.append(_s)
-        setups = _exec_ready[:min(int(SETUPS_N), 3)]
+        setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=min(int(SETUPS_N), 3)))
     except Exception:
         setups = []
+
+    # If nothing recent was emailed, fall back to the current live email-grade pool.
+    if not setups:
+        try:
+            _raw_pool_setups = list(pool.get("setups") or [])
+            _exec_ready = []
+            for _s in _raw_pool_setups:
+                try:
+                    _ok_exec, _why_exec = is_executable_setup_eligible(_s, session_name=session)
+                except Exception:
+                    _ok_exec, _why_exec = False, 'screen_exec_gate_exception'
+                if _ok_exec:
+                    _exec_ready.append(_s)
+            setups = _exec_ready[:min(int(SETUPS_N), 3)]
+        except Exception:
+            setups = []
 
     # For UX: do not show the same symbol in Momentum Watch if it's already a Top Setup
     try:
