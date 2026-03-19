@@ -4587,7 +4587,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     except Exception:
                         pass
                     continue
-                out.append(SimpleNamespace(
+                item = SimpleNamespace(
                     setup_id=setup_id,
                     id=setup_id,
                     symbol=symbol,
@@ -4604,7 +4604,16 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     generated_logged_ts=float(aux_ts_f or 0.0) if source_kind == 'emailed_setups' else (float(aux_ts_f or 0.0) if source_kind == 'executable_setups' else float(chosen_ts_f or 0.0)),
                     source_kind=str(source_kind),
                     source_session=str(src_session or ''),
-                ))
+                )
+                exec_ok, exec_why = is_executable_setup_eligible(item, session_name=req_session_u or src_session_u or session_label)
+                if not exec_ok:
+                    try:
+                        if setup_id:
+                            _admin_setup_lifecycle_merge(int(uid), str(setup_id), session=src_session_u or req_session_u, symbol=str(symbol or ''), side=str(side or ''), state=_admin_setup_state_from_reason(exec_why), last_reason=str(exec_why))
+                    except Exception:
+                        pass
+                    continue
+                out.append(item)
             return out
 
         # 1) Live execution source: executable rows that also have a successful emailed row.
@@ -4809,6 +4818,14 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             return (False, 'setup_expired')
     except Exception:
         pass
+
+    exec_ok, exec_why = is_executable_setup_eligible(s, session_name=session_label)
+    if not exec_ok:
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(exec_why), last_reason=str(exec_why))
+        except Exception:
+            pass
+        return (False, str(exec_why))
 
     def _as_pos_float(x):
         try:
@@ -16633,7 +16650,7 @@ def is_executable_setup_eligible(
     session_name: str = "NY",
     min_quality: float = 70.0,
     min_conf: int = 78,
-    min_rr_final: float = 2.0,
+    min_rr_final: float = 0.0,
 ) -> tuple[bool, str]:
     """Production-grade gate for email/executable/autotrade path.
 
@@ -23217,9 +23234,18 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
     # Hard cap: never show more than 3 top setups on /screen
     try:
-        setups = (pool.get("setups") or [])[:min(int(SETUPS_N), 3)]
+        _raw_pool_setups = list(pool.get("setups") or [])
+        _exec_ready = []
+        for _s in _raw_pool_setups:
+            try:
+                _ok_exec, _why_exec = is_executable_setup_eligible(_s, session_name=session)
+            except Exception:
+                _ok_exec, _why_exec = False, 'screen_exec_gate_exception'
+            if _ok_exec:
+                _exec_ready.append(_s)
+        setups = _exec_ready[:min(int(SETUPS_N), 3)]
     except Exception:
-        setups = (pool.get("setups") or [])[:3]
+        setups = []
 
     # For UX: do not show the same symbol in Momentum Watch if it's already a Top Setup
     try:
@@ -23591,13 +23617,16 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             if not sid:
                 skipped.append('missing_setup_id')
                 continue
-            # IMPORTANT:
-            # shown_setups already come from /screen's email-mode priority pool.
-            # Re-running the stricter executable gate here can desync manual /screen
-            # from the email -> executable -> autotrade lane, especially in
-            # sessions_unlimited mode. Keep the manual sync aligned with exactly
-            # what /screen displayed, while still honoring all duplicate/cooldown/
-            # cap/session protections below.
+            # Manual /screen sync must NOT bypass the executable gate.
+            # Only setups that are valid for the background email/autotrade lane
+            # may be emailed and queued here.
+            try:
+                _exec_ok, _exec_why = is_executable_setup_eligible(s, session_name=target_session)
+            except Exception:
+                _exec_ok, _exec_why = False, 'screen_sync_exec_gate_exception'
+            if not _exec_ok:
+                skipped.append(f'exec_gate:{_exec_why}')
+                continue
             if db_has_executable_setup(int(uid), sid, lookback_hours=12):
                 skipped.append('already_executable')
                 continue
