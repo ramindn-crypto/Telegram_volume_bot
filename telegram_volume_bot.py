@@ -24287,19 +24287,35 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
     if sent:
         try:
             now_ts = time.time()
+            try:
+                owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+            except Exception:
+                owner_uid = 0
+            # IMPORTANT:
+            # The email recipient uid and the autotrade owner uid can diverge in live admin setups
+            # (for example, a current admin tester receives the email while AUTOTRADE_OWNER_UID points
+            # to the dedicated owner record). Mirror the confirmed email/executable queue rows to the
+            # owner uid so autotrade always consumes the same setup that was actually emailed.
+            target_uids = [int(uid)]
+            try:
+                if owner_uid > 0 and int(owner_uid) not in target_uids and is_admin_user(int(uid)):
+                    target_uids.append(int(owner_uid))
+            except Exception:
+                pass
             for s in setups:
-                try:
-                    db_mark_emailed_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
-                except Exception:
-                    pass
-                try:
-                    db_mark_executable_setup(uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
-                except Exception:
-                    pass
-                try:
-                    db_log_generated_setup(uid, "email", str(display_session or ""), s)
-                except Exception:
-                    pass
+                for _target_uid in target_uids:
+                    try:
+                        db_mark_emailed_setup(_target_uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
+                    except Exception:
+                        pass
+                    try:
+                        db_mark_executable_setup(_target_uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
+                    except Exception:
+                        pass
+                    try:
+                        db_log_generated_setup(_target_uid, "email", str(display_session or ""), s)
+                    except Exception:
+                        pass
         except Exception:
             pass
     else:
