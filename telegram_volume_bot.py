@@ -5367,10 +5367,19 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 pass
             return (False, 'live_exit_stack_invalid_tp_layout')
 
-        def _verify_full_exit_stack(pos_obj, expected_tp_results=None):
+        def _verify_full_exit_stack(pos_obj, expected_tp_results=None, expected_sl_results=None):
             pos_now = pos_obj or _autotrade_find_live_position(sym, side=side)
             sl_live = float(_pos_stop(pos_now) or 0.0) if pos_now else 0.0
-            sl_ok = bool(sl_for_order > 0 and sl_live > 0 and _price_close_enough(sl_live, sl_for_order, rel_tol=0.0015))
+            sl_ok_api = bool(sl_for_order > 0 and sl_live > 0 and _price_close_enough(sl_live, sl_for_order, rel_tol=0.0015))
+            # Bybit may lag in reflecting a just-set position SL even when
+            # trading-stop already returned success. Treat a clean create/update
+            # response as acceptable, while still preferring the live position view.
+            sl_ok_create = False
+            try:
+                sl_ok_create = any(int((x or {}).get('retCode', -1)) == 0 for x in (expected_sl_results or []) if isinstance(x, dict))
+            except Exception:
+                sl_ok_create = False
+            sl_ok = bool(sl_ok_api or sl_ok_create)
             tp_ok_api = bool(len(tp_targets_live) == 2 and all(_bybit_has_open_tp_order_at(sym, px, side=side) for px in tp_targets_live))
             # On Bybit, freshly-created conditional TP orders may not show up in the
             # first realtime poll even when order/create already returned success.
@@ -5392,40 +5401,87 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         time.sleep(0.35)
         tp_order_results = _autotrade_place_reduce_only_tp_orders(sym, side, tp_targets_live, tp_base_qty, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
         tp_success_count = sum(1 for x in (tp_order_results or []) if bool(x.get('ok')))
-        final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results)
+        final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results, expected_sl_results=[sl_res])
         if not (sl_stack_ok and tp_stack_ok and tp_success_count == 2):
             _autotrade_cancel_reduce_only_tp_orders(sym, side=side)
             sl_res_retry = _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
             time.sleep(0.45)
             tp_order_results = _autotrade_place_reduce_only_tp_orders(sym, side, tp_targets_live, tp_base_qty, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
             tp_success_count = sum(1 for x in (tp_order_results or []) if bool(x.get('ok')))
-            final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results)
+            final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results, expected_sl_results=[sl_res, sl_res_retry])
         else:
             sl_res_retry = None
 
+        protection_pending = False
         if not (sl_stack_ok and tp_stack_ok and tp_success_count == 2):
-            fc_res = _autotrade_force_close_live_position(sym, side, qty=tp_base_qty)
             try:
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                    'tp_targets_live': tp_targets_live,
-                    'tp_slice_preview': tp_slice_preview,
-                    'tp_orders': tp_order_results,
-                    'tp_success_count': int(tp_success_count),
-                    'sl_apply_res': sl_res,
-                    'sl_apply_retry_res': sl_res_retry,
-                    'sl_stack_ok': bool(sl_stack_ok),
-                    'tp_stack_ok': bool(tp_stack_ok),
-                    'exit_stack_force_close': fc_res,
-                    'reject_reason': 'live_exit_stack_incomplete',
-                })
+                pending_repair = _autotrade_repair_live_exit_protection(uid, {
+                    'symbol': sym,
+                    'side': side,
+                    'entry': float(_pos_entry(final_pos) or price_ref) if final_pos else float(price_ref),
+                    'sl': float(sl_for_order),
+                    'tp1': float(live_partial_tp or 0.0),
+                    'tp2': float(live_tp2 or 0.0),
+                    'tp3': float(live_tp3 or 0.0),
+                    'qty': float(tp_base_qty if tp_base_qty > 0 else qty),
+                    'conf': int(getattr(s, 'conf', 0) or 0),
+                    'quality_score': float(getattr(s, 'quality_score', 0.0) or 0.0),
+                    'atr_pct': float(getattr(s, 'atr_pct', 0.0) or 0.0),
+                    'engine': str(getattr(s, 'engine', '') or ''),
+                    'session': str(session_label or ''),
+                }, live_pos=final_pos)
             except Exception:
-                pass
-            _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_exit_stack_incomplete')
-            try:
-                _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason='live_exit_stack_incomplete')
-            except Exception:
-                pass
-            return (False, 'live_exit_stack_incomplete')
+                pending_repair = {}
+            time.sleep(0.55)
+            final_pos = _autotrade_find_live_position(sym, side=side) or final_pos
+            final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results, expected_sl_results=[sl_res, sl_res_retry])
+            live_qty_after = abs(float(_pos_size(final_pos) or 0.0)) if final_pos else 0.0
+            # Critical rule: if the live position is open and SL is in place, do not
+            # immediately kill the trade just because TP visibility is lagging. Keep
+            # the trade open and let the repair loop complete the TP stack on the
+            # next management cycle.
+            if final_pos and live_qty_after > 0 and sl_stack_ok:
+                protection_pending = True
+                try:
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                        'tp_targets_live': tp_targets_live,
+                        'tp_slice_preview': tp_slice_preview,
+                        'tp_orders': tp_order_results,
+                        'tp_success_count': int(tp_success_count),
+                        'sl_apply_res': sl_res,
+                        'sl_apply_retry_res': sl_res_retry,
+                        'sl_stack_ok': bool(sl_stack_ok),
+                        'tp_stack_ok': bool(tp_stack_ok),
+                        'pending_repair': pending_repair,
+                        'protection_pending': True,
+                        'warning': 'live_tp_stack_pending_repair',
+                    })
+                except Exception:
+                    pass
+            else:
+                fc_res = _autotrade_force_close_live_position(sym, side, qty=tp_base_qty)
+                try:
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                        'tp_targets_live': tp_targets_live,
+                        'tp_slice_preview': tp_slice_preview,
+                        'tp_orders': tp_order_results,
+                        'tp_success_count': int(tp_success_count),
+                        'sl_apply_res': sl_res,
+                        'sl_apply_retry_res': sl_res_retry,
+                        'sl_stack_ok': bool(sl_stack_ok),
+                        'tp_stack_ok': bool(tp_stack_ok),
+                        'pending_repair': pending_repair,
+                        'exit_stack_force_close': fc_res,
+                        'reject_reason': 'live_exit_stack_incomplete',
+                    })
+                except Exception:
+                    pass
+                _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_exit_stack_incomplete')
+                try:
+                    _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason='live_exit_stack_incomplete')
+                except Exception:
+                    pass
+                return (False, 'live_exit_stack_incomplete')
 
         repair_res = _autotrade_repair_live_exit_protection(uid, {
             'symbol': sym,
@@ -5458,13 +5514,17 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             tp2=float(live_tp2 or getattr(s, 'tp2', 0.0) or getattr(s, 'tp3', 0.0) or 0.0),
             tp3=float(live_tp3 or getattr(s, 'tp3', 0.0) or getattr(s, 'tp2', 0.0) or 0.0),
         )
-        trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened')
+        trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason=('live_opened_pending_tp_repair' if protection_pending else 'live_opened'))
         _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
         try:
-            _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='executed_open', last_reason='live_opened')
+            _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='executed_open', last_reason=('live_opened_pending_tp_repair' if protection_pending else 'live_opened'))
         except Exception:
             pass
         suffix = ' corrected_for_post_fill_risk' if corrected else ''
+        if protection_pending:
+            suffix = f"{suffix} pending_tp_repair".strip()
+            if suffix and not suffix.startswith(' '):
+                suffix = ' ' + suffix
         return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty_for_db:.8g} SL={sl_for_order} TP1={live_partial_tp:g} finalTP={live_final_tp:g}{suffix}")
 
     except Exception as e:
