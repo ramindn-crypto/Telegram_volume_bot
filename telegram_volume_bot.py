@@ -4570,6 +4570,13 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
       - source_session: session recorded when the row was logged
     """
     try:
+        try:
+            cached = list(_recent_cached_emailed_setups(int(uid), str(session_label or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=max(1, int(limit))))
+        except Exception:
+            cached = []
+        if cached:
+            return cached[:max(1, int(limit))]
+
         from types import SimpleNamespace
         cutoff = time.time() - float(lookback_hours) * 3600.0
 
@@ -4864,7 +4871,14 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
 
-    exec_ok, exec_why = is_executable_setup_eligible(s, session_name=session_label)
+    try:
+        _source_kind_u = str(getattr(s, 'source_kind', '') or '').lower().strip()
+    except Exception:
+        _source_kind_u = ''
+    if _source_kind_u in {'executable_setups', 'emailed_setups', 'recent_email_lane', 'recent_email_cache'}:
+        exec_ok, exec_why = _autotrade_db_signal_structurally_valid(s, session_name=session_label)
+    else:
+        exec_ok, exec_why = is_executable_setup_eligible(s, session_name=session_label)
     if not exec_ok:
         try:
             _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(exec_why), last_reason=str(exec_why))
@@ -8903,6 +8917,120 @@ def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executab
     except Exception:
         pass
 
+
+
+# =========================================================
+# RECENT EMAILED SETUP CACHE (exact email -> screen/autotrade sync)
+# =========================================================
+_RECENT_EMAILED_SETUP_CACHE: Dict[int, List[dict]] = {}
+
+def _recent_emailed_cache_ttl_sec() -> int:
+    try:
+        return int(max(1800, int(AUTOTRADE_ENTRY_WINDOW_MIN) * 60 + 900))
+    except Exception:
+        return 1800
+
+def _recent_emailed_cache_prune(uid: int | None = None) -> None:
+    cutoff = float(time.time()) - float(_recent_emailed_cache_ttl_sec())
+    try:
+        targets = [int(uid)] if uid is not None else list(_RECENT_EMAILED_SETUP_CACHE.keys())
+    except Exception:
+        targets = []
+    for _uid in (targets or []):
+        rows = []
+        for row in list(_RECENT_EMAILED_SETUP_CACHE.get(int(_uid), []) or []):
+            try:
+                ts = float(row.get('emailed_ts', 0.0) or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts >= cutoff:
+                rows.append(row)
+        if rows:
+            _RECENT_EMAILED_SETUP_CACHE[int(_uid)] = rows
+        else:
+            _RECENT_EMAILED_SETUP_CACHE.pop(int(_uid), None)
+
+def _cache_recent_emailed_setup(user_id: int, setup: Any, session: str = '', emailed_ts: float | None = None, source_kind: str = 'recent_email_cache') -> None:
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        uid = 0
+    if uid <= 0 or setup is None:
+        return
+    ts = float(emailed_ts or time.time())
+    row = {
+        'setup_id': str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or '').strip(),
+        'symbol': str(getattr(setup, 'symbol', '') or '').upper(),
+        'market_symbol': str(getattr(setup, 'market_symbol', '') or ''),
+        'side': str(getattr(setup, 'side', '') or '').upper(),
+        'conf': int(getattr(setup, 'conf', 0) or 0),
+        'entry': float(getattr(setup, 'entry', 0.0) or 0.0),
+        'sl': float(getattr(setup, 'sl', 0.0) or 0.0),
+        'tp1': getattr(setup, 'tp1', None),
+        'tp2': getattr(setup, 'tp2', None),
+        'tp3': float(getattr(setup, 'tp3', 0.0) or 0.0),
+        'fut_vol_usd': float(getattr(setup, 'fut_vol_usd', 0.0) or 0.0),
+        'ch24': float(getattr(setup, 'ch24', 0.0) or 0.0),
+        'ch4': float(getattr(setup, 'ch4', 0.0) or 0.0),
+        'ch1': float(getattr(setup, 'ch1', 0.0) or 0.0),
+        'ch15': float(getattr(setup, 'ch15', 0.0) or 0.0),
+        'ema_support_period': int(getattr(setup, 'ema_support_period', 0) or 0),
+        'ema_support_dist_pct': float(getattr(setup, 'ema_support_dist_pct', 0.0) or 0.0),
+        'pullback_ema_period': int(getattr(setup, 'pullback_ema_period', 0) or 0),
+        'pullback_ema_dist_pct': float(getattr(setup, 'pullback_ema_dist_pct', 0.0) or 0.0),
+        'pullback_ready': bool(getattr(setup, 'pullback_ready', False)),
+        'pullback_bypass_hot': bool(getattr(setup, 'pullback_bypass_hot', False)),
+        'leader_base_override': bool(getattr(setup, 'leader_base_override', False)),
+        'engine': str(getattr(setup, 'engine', '') or ''),
+        'is_trailing_tp3': bool(getattr(setup, 'is_trailing_tp3', False)),
+        'created_ts': float(getattr(setup, 'created_ts', 0.0) or 0.0),
+        'signal_created_ts': float(getattr(setup, 'created_ts', 0.0) or 0.0),
+        'emailed_ts': ts,
+        'email_logged_ts': ts,
+        'generated_logged_ts': float(getattr(setup, 'created_ts', 0.0) or 0.0),
+        'source_session': str(session or ''),
+        'source_kind': str(source_kind or 'recent_email_cache'),
+    }
+    if not row['setup_id']:
+        return
+    bucket = list(_RECENT_EMAILED_SETUP_CACHE.get(uid, []) or [])
+    bucket = [r for r in bucket if str(r.get('setup_id') or '') != row['setup_id']]
+    bucket.insert(0, row)
+    _RECENT_EMAILED_SETUP_CACHE[uid] = bucket[:50]
+    _recent_emailed_cache_prune(uid)
+
+def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_min: int = 20, limit: int = 3) -> list:
+    from types import SimpleNamespace
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        uid = 0
+    if uid <= 0:
+        return []
+    cutoff = float(time.time()) - float(max_age_min) * 60.0
+    req_session_u = str(session_name or '').upper().strip()
+    _recent_emailed_cache_prune(uid)
+    out = []
+    seen = set()
+    for row in list(_RECENT_EMAILED_SETUP_CACHE.get(uid, []) or []):
+        try:
+            sid = str(row.get('setup_id') or '').strip()
+            if not sid or sid in seen:
+                continue
+            ts = float(row.get('emailed_ts', 0.0) or 0.0)
+            if ts < cutoff:
+                continue
+            src_session_u = str(row.get('source_session') or '').upper().strip()
+            if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
+                continue
+            seen.add(sid)
+            item = SimpleNamespace(**row)
+            out.append(item)
+            if len(out) >= int(limit):
+                break
+        except Exception:
+            continue
+    return out[:int(limit)]
 
 def _db_setup_stage_exists(table_name: str, user_id: int, setup_id: str, ts_column: str, lookback_hours: int = 12) -> bool:
     try:
@@ -23418,31 +23546,38 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 pass
         return out[:int(limit)]
 
-    # Build only the executable/email-aligned pool for Top Trade Setups.
-    pool = _run_coro_in_thread(
-        build_priority_pool(
-            best_fut,
-            session,
-            mode="email",
-            scan_profile=str(DEFAULT_SCAN_PROFILE),
-            uid=uid,
-        )
-    )
-
-    # Other heavy helpers are sync; run them here too.
     # Market context inputs (keep /screen informative without becoming a data terminal)
     leaders_txt = build_leaders_table(best_fut)  # fast (top by futures volume)
     up_list, dn_list = compute_directional_lists(best_fut)
 
-    # First preference: show very recent emailed/executable lane setups for this user/session.
-    # This keeps /screen visually aligned with the live email/autotrade pipeline.
+    # First preference: exact recent emailed setups for this user (in-memory cache).
+    # This keeps /screen visually synced with the actual email the user just received,
+    # even if the next background scan no longer rebuilds the same setup.
     try:
-        setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=min(int(SETUPS_N), 3)))
+        setups = list(_recent_cached_emailed_setups(int(uid), str(session or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=min(int(SETUPS_N), 3)))
     except Exception:
         setups = []
 
-    # If nothing recent was emailed, fall back to the current live email-grade pool.
+    # Second preference: persisted emailed/executable lane from DB.
     if not setups:
+        try:
+            setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=min(int(SETUPS_N), 3)))
+        except Exception:
+            setups = []
+
+    pool = {'setups': [], 'waiting': [], 'trend_watch': []}
+
+    # Only run the heavy live pool build when we do not already have a recent emailed setup to show.
+    if not setups:
+        pool = _run_coro_in_thread(
+            build_priority_pool(
+                best_fut,
+                session,
+                mode="email",
+                scan_profile=str(DEFAULT_SCAN_PROFILE),
+                uid=uid,
+            )
+        )
         try:
             _raw_pool_setups = list(pool.get("setups") or [])
             _exec_ready = []
@@ -24451,6 +24586,10 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                         pass
                     try:
                         db_log_generated_setup(_target_uid, "email", str(display_session or ""), s)
+                    except Exception:
+                        pass
+                    try:
+                        _cache_recent_emailed_setup(int(_target_uid), s, session=str(display_session or ''), emailed_ts=float(now_ts), source_kind='recent_email_cache')
                     except Exception:
                         pass
         except Exception:
