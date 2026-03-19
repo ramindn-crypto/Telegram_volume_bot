@@ -898,7 +898,7 @@ DEFAULT_TYPE = "swap"  # bybit futures
 DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
 
 CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "1"))
-MANUAL_SCREEN_SYNC_ENABLED = env_bool("MANUAL_SCREEN_SYNC_ENABLED", False)
+MANUAL_SCREEN_SYNC_ENABLED = False  # hard-disabled: /screen is informational only
 
 # -------------------------
 # LOGGING: redact secrets + quiet noisy libs (Render-safe)
@@ -7498,7 +7498,21 @@ def list_users_notify_on() -> List[dict]:
     except Exception:
         pass
 
-    return rows
+    filtered_rows = []
+    for d in (rows or []):
+        try:
+            uid = int(d.get("user_id") or 0)
+        except Exception:
+            uid = 0
+        if not uid:
+            continue
+        try:
+            if is_admin_user(uid) or user_has_pro(uid, d):
+                filtered_rows.append(d)
+        except Exception:
+            continue
+
+    return filtered_rows
 
 
 def list_users_with_email() -> List[dict]:
@@ -23169,6 +23183,62 @@ _SCREEN_LOCK = asyncio.Lock()
 # Background refresh task for /screen (keeps UX instant)
 _SCREEN_REFRESH_TASK = None  # asyncio.Task
 
+# /screen is informational only. Keep recent screen cards in memory for PF- lookup,
+# but do NOT persist them into the live email/autotrade lane or reporting tables.
+RECENT_SCREEN_SIGNAL_TTL_SEC = int(os.environ.get("RECENT_SCREEN_SIGNAL_TTL_SEC", "1800"))
+_RECENT_SCREEN_SIGNALS: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+def _recent_screen_signal_prune() -> None:
+    try:
+        ttl = max(60, int(RECENT_SCREEN_SIGNAL_TTL_SEC))
+        cutoff = time.time() - float(ttl)
+        stale = [sid for sid, (ts, _payload) in list(_RECENT_SCREEN_SIGNALS.items()) if float(ts or 0.0) < cutoff]
+        for sid in stale:
+            _RECENT_SCREEN_SIGNALS.pop(sid, None)
+    except Exception:
+        pass
+
+def _remember_recent_screen_signal(s: Setup, session: str = "", user_id: int | None = None) -> None:
+    try:
+        sid = str(getattr(s, "setup_id", "") or "").strip()
+        if not sid:
+            return
+        payload = {
+            "setup_id": sid,
+            "created_ts": float(getattr(s, "created_ts", time.time()) or time.time()),
+            "session": str(session or ""),
+            "user_id": int(user_id or 0),
+            "symbol": str(getattr(s, "symbol", "") or ""),
+            "market_symbol": getattr(s, "market_symbol", None),
+            "side": str(getattr(s, "side", "") or ""),
+            "conf": int(getattr(s, "conf", 0) or 0),
+            "entry": float(getattr(s, "entry", 0.0) or 0.0),
+            "sl": float(getattr(s, "sl", 0.0) or 0.0),
+            "tp1": getattr(s, "tp1", None),
+            "tp2": getattr(s, "tp2", None),
+            "tp3": float(getattr(s, "tp3", 0.0) or 0.0),
+            "fut_vol_usd": float(getattr(s, "fut_vol_usd", 0.0) or 0.0),
+            "ch24": float(getattr(s, "ch24", 0.0) or 0.0),
+            "ch4": float(getattr(s, "ch4", 0.0) or 0.0),
+            "ch1": float(getattr(s, "ch1", 0.0) or 0.0),
+            "ch15": float(getattr(s, "ch15", 0.0) or 0.0),
+        }
+        _RECENT_SCREEN_SIGNALS[sid] = (time.time(), payload)
+        _recent_screen_signal_prune()
+    except Exception:
+        pass
+
+def _recent_screen_signal_lookup(setup_id: str) -> Optional[dict]:
+    try:
+        sid = str(setup_id or "").strip()
+        if not sid:
+            return None
+        _recent_screen_signal_prune()
+        hit = _RECENT_SCREEN_SIGNALS.get(sid)
+        return dict(hit[1]) if hit else None
+    except Exception:
+        return None
+
 async def _refresh_screen_cache_async():
     """Refreshes _SCREEN_CACHE in the background (best effort)."""
     global _SCREEN_REFRESH_TASK
@@ -23252,14 +23322,14 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         top_setup_syms = set(str(getattr(s, 'symbol', '') or '').upper() for s in (setups or []) if getattr(s, 'symbol', None))
     except Exception:
         top_setup_syms = set()
-    # Ensure conf exists + persist signal cards to DB (used by Signal ID lookup)
+    # /screen is informational only. Keep recent cards in memory for PF- lookup,
+    # but do NOT log them into the live email/autotrade pipeline or reports.
     try:
         for s in (setups or []):
             if not hasattr(s, "conf") or s.conf is None:
                 s.conf = 0
-            db_insert_signal(s, user_id=uid)
             try:
-                db_log_generated_setup(uid, "screen", session, s)
+                _remember_recent_screen_signal(s, session=session, user_id=uid)
             except Exception:
                 pass
     except Exception:
@@ -23814,44 +23884,20 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 int(update.effective_user.id),
             )
 
-            if MANUAL_SCREEN_SYNC_ENABLED and list(shown_setups or []):
-                try:
-                    sync_info = await _screen_sync_pipeline_async(
-                        int(update.effective_user.id),
-                        user or {},
-                        live_session,
-                        scan_session,
-                        best_fut,
-                        list(shown_setups or []),
-                    )
-                except Exception:
-                    sync_info = {"status": "error", "reason": "screen_sync_failed"}
-            else:
-                sync_info = {
-                    "status": "skip",
-                    "reason": ("manual_screen_sync_disabled" if not MANUAL_SCREEN_SYNC_ENABLED else "no_shown_setups"),
-                }
+            # /screen is informational only. It must never push setups into
+            # the background email/autotrade lane.
 
             # Cache for fast subsequent /screen calls (user + session scoped)
             _SCREEN_CACHE[cache_key] = {
                 "ts": time.time(),
                 "body": body,
                 "kb": list(kb or []),
-                "sync_info": dict(sync_info or {}),
             }
 
 
         # Send final
         cache_entry = _SCREEN_CACHE.get(cache_key) or {}
         msg = (header + "\n" + str(cache_entry.get("body") or "")).strip()
-        sync_info = dict(cache_entry.get("sync_info") or {})
-        if sync_info:
-            sync_status = str(sync_info.get("status") or "").strip().lower()
-            sync_reason = str(sync_info.get("reason") or "").strip()
-            if sync_status == 'sent':
-                msg += f"\n\n✅ Sync: `{sync_reason}`"
-            elif sync_status in {'skip', 'error'} and sync_reason:
-                msg += f"\n\nℹ️ Sync: `{sync_reason}`"
         keyboard = [
             [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
             for (sym, sid) in (cache_entry.get("kb") or [])
@@ -23893,7 +23939,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text.startswith("PF-"):
-        sig = db_get_signal(text)
+        sig = db_get_signal(text) or _recent_screen_signal_lookup(text)
         if not sig:
             await update.message.reply_text("Signal ID not found.")
             return
