@@ -982,7 +982,8 @@ MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "78"))
 
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
 MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
-MIN_RR_TP3 = float(os.environ.get("MIN_RR_TP3", "1.8"))
+MIN_RR_FINAL = float(os.environ.get("MIN_RR_FINAL", os.environ.get("MIN_RR_TP2", os.environ.get("MIN_RR_TP3", "1.8"))))
+MIN_RR_TP3 = MIN_RR_FINAL  # legacy compatibility only; live model uses TP2 as final target
 
 # Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
 EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
@@ -5447,11 +5448,13 @@ SESSION_MIN_CONF = {
     "ASIA": 80,
 }
 
-SESSION_MIN_RR_TP3 = {
+SESSION_MIN_RR_FINAL = {
     "NY": 1.60,
     "LON": 1.62,
     "ASIA": 1.90,
 }
+
+SESSION_MIN_RR_TP3 = SESSION_MIN_RR_FINAL  # legacy compatibility only
 
 SESSION_EMA_PROX_MULT = {
     "NY": 1.60,
@@ -5495,7 +5498,7 @@ def session_knobs(session_name: str) -> dict:
         "ema_reaction_lookback": int(SESSION_EMA_REACTION_LOOKBACK.get(s, 7)),
         "trigger_atr_mult": float(SESSION_TRIGGER_ATR_MULT.get(s, 0.85)),
         "min_conf": int(SESSION_MIN_CONF.get(s, 78)),
-        "min_rr_tp3": float(SESSION_MIN_RR_TP3.get(s, 2.0)),
+        "min_rr_tp3": float(SESSION_MIN_RR_FINAL.get(s, 2.0)),
     }
 
 def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
@@ -17741,27 +17744,27 @@ def make_setup(
 
 
         # ---------------------------------------------------------
-        # ✅ Session-aware TP3 RR floor (reduces low-quality signals, especially ASIA)
+        # ✅ Session-aware final-target RR floor (TP2 in the live 2-TP model)
         # ---------------------------------------------------------
         try:
-            rr3 = rr_to_tp(entry, sl, tp3)
-            sess_rr_min = float(MIN_RR_TP3)
+            rr_final = rr_to_tp(entry, sl, tp2 or tp3)
+            sess_rr_min = float(MIN_RR_FINAL)
             try:
                 sname = str(session_name or "").upper()
                 if sname == "ASIA":
-                    sess_rr_min = max(sess_rr_min, float(SESSION_MIN_RR_TP3.get("ASIA", sess_rr_min)))
+                    sess_rr_min = max(sess_rr_min, float(SESSION_MIN_RR_FINAL.get("ASIA", sess_rr_min)))
                 elif sname == "LON":
-                    sess_rr_min = max(sess_rr_min, float(SESSION_MIN_RR_TP3.get("LON", sess_rr_min)))
+                    sess_rr_min = max(sess_rr_min, float(SESSION_MIN_RR_FINAL.get("LON", sess_rr_min)))
                 else:
-                    # Keep NY as-is (use global MIN_RR_TP3)
-                    sess_rr_min = float(SESSION_MIN_RR_TP3.get("NY", sess_rr_min)) if sname == "NY" else sess_rr_min
+                    # Keep NY as-is (use global final-target RR floor)
+                    sess_rr_min = float(SESSION_MIN_RR_FINAL.get("NY", sess_rr_min)) if sname == "NY" else sess_rr_min
             except Exception:
-                sess_rr_min = float(MIN_RR_TP3)
+                sess_rr_min = float(MIN_RR_FINAL)
 
             if str(session_name or '').upper() == 'NY' and require_pullback:
-                sess_rr_min = max(float(sess_rr_min), float(SESSION_MIN_RR_TP3.get('NY', sess_rr_min)) + 0.10)
-            if float(rr3) < float(sess_rr_min):
-                _rej("below_min_rr_tp3_session", base, mv, f"rr3={rr3:.2f} min={sess_rr_min:.2f} sess={session_name}")
+                sess_rr_min = max(float(sess_rr_min), float(SESSION_MIN_RR_FINAL.get('NY', sess_rr_min)) + 0.10)
+            if float(rr_final) < float(sess_rr_min):
+                _rej("below_min_rr_tp2_session", base, mv, f"rr_final={rr_final:.2f} min={sess_rr_min:.2f} sess={session_name}")
                 return None
         except Exception:
             pass
@@ -25027,7 +25030,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 }
                 continue
 
-            # Premium ordering: confidence desc, RR(TP3) desc
+            # Premium ordering: confidence desc, RR(final TP) desc
             def _rr3(_s: Setup) -> float:
                 try:
                     return float(rr_to_tp(float(_s.entry), float(_s.sl), float(_s.tp3)))
