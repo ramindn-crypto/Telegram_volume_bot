@@ -1632,10 +1632,18 @@ except Exception:
     AUTOTRADE_TP_SPLIT = [0.4, 0.4, 0.2]
 
 # Live exit architecture: keep the stop-loss on Bybit's position-level trading-stop and
-# place TP1 / TP2 as explicit reduce-only limit orders. This keeps the exact target prices
-# visible on the chart, in open orders, and under position details for live testing.
+# attach TP1 / TP2 as native exchange exits. The primary lane uses reduce-only close-trigger
+# orders; if Bybit accepts the request but the TP orders are not actually visible, the bot
+# immediately falls back to native partial TP/SL pairs so two TPs are truly present on the
+# exchange instead of only being assumed from an ACK.
 AUTOTRADE_LIVE_TP1_FRACTION = float(os.environ.get("AUTOTRADE_LIVE_TP1_FRACTION", "0.65") or 0.65)
 AUTOTRADE_LIVE_TP1_FRACTION = max(0.25, min(0.85, AUTOTRADE_LIVE_TP1_FRACTION))
+AUTOTRADE_LIVE_TP_TRIGGER_BY = str(os.environ.get("AUTOTRADE_LIVE_TP_TRIGGER_BY", "LastPrice") or "LastPrice").strip() or "LastPrice"
+if AUTOTRADE_LIVE_TP_TRIGGER_BY not in {"LastPrice", "MarkPrice", "IndexPrice"}:
+    AUTOTRADE_LIVE_TP_TRIGGER_BY = "LastPrice"
+AUTOTRADE_TP_CONFIRM_WAIT_SEC = float(os.environ.get("AUTOTRADE_TP_CONFIRM_WAIT_SEC", "2.8") or 2.8)
+AUTOTRADE_TP_CONFIRM_STEP_SEC = float(os.environ.get("AUTOTRADE_TP_CONFIRM_STEP_SEC", "0.35") or 0.35)
+AUTOTRADE_TP_FALLBACK_TO_PARTIAL_TPSL = str(os.environ.get("AUTOTRADE_TP_FALLBACK_TO_PARTIAL_TPSL", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
 AUTOTRADE_BE_AFTER_TP1_ENABLED = str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ENABLED", "1")).strip() in ("1", "true", "TRUE", "yes", "YES")
 AUTOTRADE_BE_AFTER_TP1_MIN_CONF = int(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MIN_CONF", "82") or 82)
 AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY", "76") or 76)
@@ -2539,7 +2547,7 @@ def _autotrade_place_reduce_only_tp_order_slice(symbol: str, side: str, idx: int
             'qty': _fmt_qty(float(qty_i or 0.0), qty_step),
             'triggerPrice': str(float(tp_px)),
             'triggerDirection': int(trigger_direction),
-            'triggerBy': 'LastPrice',
+            'triggerBy': str(AUTOTRADE_LIVE_TP_TRIGGER_BY),
             'timeInForce': 'IOC',
             'reduceOnly': True,
             'closeOnTrigger': True,
@@ -2576,6 +2584,103 @@ def _autotrade_place_reduce_only_tp_orders(symbol: str, side: str, tp_targets: l
         return results
     except Exception as e:
         return [{'idx': 0, 'tp': 0.0, 'qty': 0.0, 'ok': False, 'retMsg': f'{type(e).__name__}: {e}'}]
+
+
+def _autotrade_confirm_tp_targets_present(symbol: str, side: str, tp_targets: list[float], wait_sec: float | None = None, step_sec: float | None = None) -> tuple[bool, list[float]]:
+    want = _dedupe_price_targets([float(x or 0.0) for x in (tp_targets or []) if float(x or 0.0) > 0])
+    if not want:
+        return False, []
+    deadline = time.time() + float(wait_sec if wait_sec is not None else AUTOTRADE_TP_CONFIRM_WAIT_SEC)
+    step = max(0.10, float(step_sec if step_sec is not None else AUTOTRADE_TP_CONFIRM_STEP_SEC))
+    missing = list(want)
+    while True:
+        try:
+            missing = [px for px in want if not _bybit_has_open_tp_order_at(symbol, px, side=side)]
+        except Exception:
+            missing = list(want)
+        if not missing:
+            return True, []
+        if time.time() >= deadline:
+            return False, missing
+        time.sleep(step)
+
+
+def _autotrade_place_partial_tpsl_pair_slice(symbol: str, side: str, idx: int, tp_price: float, stop_loss: float, qty_i: float) -> dict:
+    try:
+        sym = _bybit_linear_symbol(symbol)
+        side_u = str(side or '').upper().strip()
+        if side_u not in {'BUY', 'SELL'}:
+            return {'idx': int(idx or 0), 'tp': float(tp_price or 0.0), 'qty': float(qty_i or 0.0), 'ok': False, 'retMsg': 'bad_side', 'placement': 'partial_pair'}
+        tp_px = _round_price_to_tick(sym, float(tp_price or 0.0), rounding=ROUND_HALF_UP)
+        sl_px = _round_price_to_tick(sym, float(stop_loss or 0.0), rounding=ROUND_HALF_UP)
+        if tp_px <= 0 or sl_px <= 0:
+            return {'idx': int(idx or 0), 'tp': float(tp_price or 0.0), 'qty': float(qty_i or 0.0), 'ok': False, 'retMsg': 'bad_tp_or_sl', 'placement': 'partial_pair'}
+        filt = _bybit_get_instr_filters(sym)
+        qty_step = filt.get('qtyStep')
+        payload = {
+            'category': 'linear',
+            'symbol': sym,
+            'tpslMode': 'Partial',
+            'positionIdx': 0,
+            'takeProfit': str(float(tp_px)),
+            'stopLoss': str(float(sl_px)),
+            'tpTriggerBy': str(AUTOTRADE_LIVE_TP_TRIGGER_BY),
+            'slTriggerBy': str(AUTOTRADE_LIVE_TP_TRIGGER_BY),
+            'tpOrderType': 'Market',
+            'slOrderType': 'Market',
+            'tpSize': _fmt_qty(float(qty_i or 0.0), qty_step),
+            'slSize': _fmt_qty(float(qty_i or 0.0), qty_step),
+        }
+        res = _bybit_v5_request('POST', '/v5/position/trading-stop', payload)
+        ok = int((res or {}).get('retCode', -1)) == 0
+        return {
+            'idx': int(idx or 0),
+            'tp': float(tp_px),
+            'qty': float(qty_i or 0.0),
+            'ok': bool(ok),
+            'retCode': (res or {}).get('retCode'),
+            'retMsg': (res or {}).get('retMsg'),
+            'order_payload': payload,
+            'placement': 'partial_pair',
+        }
+    except Exception as e:
+        return {'idx': int(idx or 0), 'tp': float(tp_price or 0.0), 'qty': float(qty_i or 0.0), 'ok': False, 'retMsg': f'{type(e).__name__}: {e}', 'placement': 'partial_pair'}
+
+
+def _autotrade_place_confirmed_tp_orders(symbol: str, side: str, tp_targets: list[float], base_qty: float, stop_loss: float, tp1_fraction: float | None = None) -> list[dict]:
+    results: list[dict] = []
+    try:
+        want = _dedupe_price_targets([float(x or 0.0) for x in (tp_targets or []) if float(x or 0.0) > 0])
+        if len(want) != 2 or float(base_qty or 0.0) <= 0:
+            return [{'idx': 0, 'tp': 0.0, 'qty': 0.0, 'ok': False, 'retMsg': 'invalid_tp_layout'}]
+
+        primary = _autotrade_place_reduce_only_tp_orders(symbol, side, want, base_qty, tp1_fraction=tp1_fraction)
+        results.extend(primary or [])
+        ok_now, missing = _autotrade_confirm_tp_targets_present(symbol, side, want)
+        if ok_now:
+            return results
+
+        if AUTOTRADE_TP_FALLBACK_TO_PARTIAL_TPSL and float(stop_loss or 0.0) > 0 and missing:
+            slices = _autotrade_build_tp_order_slices(symbol, want, base_qty, tp1_fraction=tp1_fraction)
+            for item in (slices or []):
+                try:
+                    if not bool(item.get('ok')):
+                        continue
+                    tp_px = float(item.get('tp') or 0.0)
+                    if tp_px <= 0:
+                        continue
+                    if tp_px not in missing and _bybit_has_open_tp_order_at(symbol, tp_px, side=side):
+                        continue
+                    results.append(_autotrade_place_partial_tpsl_pair_slice(symbol, side, int(item.get('idx') or 0), tp_px, float(stop_loss or 0.0), float(item.get('qty') or 0.0)))
+                except Exception:
+                    continue
+            ok_now, missing = _autotrade_confirm_tp_targets_present(symbol, side, want, wait_sec=max(AUTOTRADE_TP_CONFIRM_WAIT_SEC, 3.5), step_sec=AUTOTRADE_TP_CONFIRM_STEP_SEC)
+
+        if missing:
+            results.append({'idx': 0, 'tp': 0.0, 'qty': float(base_qty or 0.0), 'ok': False, 'retMsg': 'tp_not_confirmed_on_exchange', 'missing_targets': missing})
+        return results
+    except Exception as e:
+        return [{'idx': 0, 'tp': 0.0, 'qty': float(base_qty or 0.0), 'ok': False, 'retMsg': f'{type(e).__name__}: {e}'}]
 
 
 def _autotrade_cancel_reduce_only_tp_orders(symbol: str, side: str | None = None, keep_stop_price: float | None = None) -> int:
@@ -2801,11 +2906,19 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
                 except Exception:
                     continue
             if missing_slices:
-                for item in missing_slices:
-                    _autotrade_place_reduce_only_tp_order_slice(sym, side, int(item.get('idx') or 0), float(item.get('tp') or 0.0), float(item.get('qty') or 0.0))
-                result['tp_fixed'] = True
+                _autotrade_place_confirmed_tp_orders(
+                    sym,
+                    side,
+                    desired_targets,
+                    live_qty,
+                    desired_sl if float(desired_sl or 0.0) > 0 else float(target_sl or 0.0),
+                    tp1_fraction=float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION),
+                )
+                ok_after_repair, missing_after_repair = _autotrade_confirm_tp_targets_present(sym, side, desired_targets, wait_sec=max(AUTOTRADE_TP_CONFIRM_WAIT_SEC, 3.0), step_sec=AUTOTRADE_TP_CONFIRM_STEP_SEC)
+                result['tp_fixed'] = bool(ok_after_repair)
+                result['missing_tp_after_repair'] = list(missing_after_repair or [])
                 if tp1_hit:
-                    result['tp1_order_fixed'] = True
+                    result['tp1_order_fixed'] = bool(ok_after_repair)
         return result
     except Exception:
         return result
@@ -5598,17 +5711,13 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             except Exception:
                 sl_ok_create = False
             sl_ok = bool(sl_ok_api or sl_ok_create)
-            tp_ok_api = bool(len(tp_targets_live) == 2 and all(_bybit_has_open_tp_order_at(sym, px, side=side) for px in tp_targets_live))
-            tp_ok_create = False
+            tp_ok, missing_tp = _autotrade_confirm_tp_targets_present(sym, side, tp_targets_live, wait_sec=max(0.9, AUTOTRADE_TP_CONFIRM_WAIT_SEC * 0.5), step_sec=AUTOTRADE_TP_CONFIRM_STEP_SEC)
             try:
-                ok_results = [x for x in (expected_tp_results or []) if bool(x.get('ok'))]
-                ok_targets = sorted([round(float(x.get('tp') or 0.0), 10) for x in ok_results if float(x.get('tp') or 0.0) > 0])
-                want_targets = sorted([round(float(x or 0.0), 10) for x in (tp_targets_live or []) if float(x or 0.0) > 0])
-                tp_ok_create = bool(len(want_targets) == 2 and len(set(ok_targets)) == 2 and all(t in ok_targets for t in want_targets))
+                _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'missing_tp_targets_after_verify': missing_tp})
             except Exception:
-                tp_ok_create = False
-            tp_ok = bool(tp_ok_api or tp_ok_create)
-            return pos_now, sl_ok, tp_ok
+                pass
+            return pos_now, sl_ok, bool(tp_ok)
 
         tp_order_results = []
         sl_res = None
@@ -5619,12 +5728,12 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             _autotrade_cancel_reduce_only_tp_orders(sym, side=side)
             sl_res = _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
             time.sleep(0.35)
-            tp_order_results = _autotrade_place_reduce_only_tp_orders(sym, side, tp_targets_live, tp_base_qty, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
+            tp_order_results = _autotrade_place_confirmed_tp_orders(sym, side, tp_targets_live, tp_base_qty, sl_for_order, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
             final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results, expected_sl_results=[sl_res])
             if not (sl_stack_ok and tp_stack_ok):
                 sl_res_retry = _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
                 time.sleep(0.55)
-                tp_order_results += _autotrade_place_reduce_only_tp_orders(sym, side, tp_targets_live, tp_base_qty, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
+                tp_order_results += _autotrade_place_confirmed_tp_orders(sym, side, tp_targets_live, tp_base_qty, sl_for_order, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
                 final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results, expected_sl_results=[sl_res, sl_res_retry])
 
             pending_repair = {}
