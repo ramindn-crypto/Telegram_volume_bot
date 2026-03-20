@@ -1139,6 +1139,21 @@ def _strategy_config_defaults() -> dict:
         "market_adaptive_session_wr_floor_ny": 46.0,
         "market_adaptive_session_wr_floor_lon": 48.0,
         "market_adaptive_cooldown_hours": 20.0,
+
+        # DB-backed runtime profile governance / probation / revert
+        "runtime_profile_probation_hours": 72.0,
+        "runtime_profile_min_signal_decisions": 12,
+        "runtime_profile_min_live_closes": 8,
+        "runtime_profile_revert_wr_floor": 45.0,
+        "runtime_profile_revert_live_wr_floor": 38.0,
+        "runtime_profile_revert_vs_baseline_gap": 3.0,
+
+        # Email lane diversification / counter-regime guardrails
+        "email_same_side_cap": {"NY": 2, "LON": 2, "ASIA": 1},
+        "email_cluster_side_cap": 1,
+        "counter_regime_quality_add": {"NY": 2.5, "LON": 2.5, "ASIA": 3.0},
+        "counter_regime_conf_add": {"NY": 2, "LON": 2, "ASIA": 3},
+        "counter_regime_rr_add": {"NY": 0.10, "LON": 0.10, "ASIA": 0.12},
         "execution_asia_enabled": bool(EXECUTION_ASIA_ENABLED),
         "execution_engine_b_email_enabled": bool(EXECUTION_ENGINE_B_EMAIL_ENABLED),
         "session_exec_overrides": {
@@ -6522,6 +6537,8 @@ def _learning_status_text() -> str:
                 pass
 
     opt_promoted = bool((opt_res or {}).get("promoted"))
+    runtime_profile = _runtime_profile_bootstrap_if_missing(cfg)
+    runtime_review = _runtime_profile_review_probation(owner, force=False) if owner > 0 else {}
     lines = [
         "🧠 Learning / Optimization Status",
         HDR,
@@ -6538,7 +6555,9 @@ def _learning_status_text() -> str:
 
     if last_opt:
         oos = ((opt_res or {}).get("metrics") or {}).get("oos") or {}
-        lines.append(f"Optimizer effect on live strategy: {'LIVE PARAMS UPDATED' if opt_promoted else 'ADVISORY ONLY'}")
+        rp_state = str((runtime_profile or {}).get('status') or 'ACTIVE').upper()
+        rp_source = str((runtime_profile or {}).get('source') or 'bootstrap')
+        lines.append(f"Optimizer / live effect: {'DB-BACKED PROFILE ACTIVE' if rp_state == 'ACTIVE' else ('DB-BACKED PROFILE IN PROBATION' if rp_state == 'PROBATION' else ('LIVE PARAMS UPDATED' if opt_promoted else 'ADVISORY ONLY'))} | source={rp_source}")
         if oos:
             lines.append(f"Latest optimizer OOS: setups/day={float(oos.get('setups_per_day', 0.0) or 0.0):.2f} | WR={float(oos.get('win_rate', 0.0) or 0.0):.1f}% | avgR={float(oos.get('avg_R', 0.0) or 0.0):.3f}")
 
@@ -6565,6 +6584,10 @@ def _learning_status_text() -> str:
         lines.append("• Last live parameter changes: " + "; ".join(optimizer_live_changes[:3]))
     else:
         lines.append("• Last live parameter changes: none recorded yet.")
+    if runtime_profile:
+        lines.append(f"• Active runtime profile: {str((runtime_profile or {}).get('status') or 'ACTIVE').upper()} | source={str((runtime_profile or {}).get('source') or 'bootstrap')}")
+        if runtime_review and str(runtime_review.get('status') or '').upper() not in {'', 'NO_PROBATION', 'NO_PROFILE'}:
+            lines.append(f"• Latest runtime-profile review: {str(runtime_review.get('status') or '')}")
 
     lines.extend([
         SEP,
@@ -9725,6 +9748,151 @@ def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: s
         return {"outcome": "TP1", "hit_level": "TP1", "hit_ts": first_ts, "best_level": "TP1", "best_ts": best_ts, "note": ""}
     return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "edge_case"}
 
+
+
+
+def _signal_setup_eval_payload(setup_id: str) -> dict:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return {}
+    try:
+        sig = db_get_signal(sid) or {}
+    except Exception:
+        sig = {}
+    if sig:
+        out = dict(sig)
+        out['setup_id'] = sid
+        out['symbol'] = _bybit_linear_symbol(str(out.get('symbol') or ''))
+        out['market_symbol'] = str(out.get('market_symbol') or '').strip() or _market_symbol_from_base(out.get('symbol'))
+        try:
+            out['created_ts'] = float(out.get('created_ts') or 0.0)
+        except Exception:
+            out['created_ts'] = 0.0
+        return out
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            row = cur.execute(
+                """SELECT setup_id, symbol, side, entry, sl, tp1, tp2, tp3, created_ts, market_symbol
+                   FROM generated_setups
+                   WHERE setup_id=?
+                   ORDER BY created_ts DESC
+                   LIMIT 1""",
+                (sid,),
+            ).fetchone()
+            if row:
+                out = dict(row)
+                out['setup_id'] = sid
+                out['symbol'] = _bybit_linear_symbol(str(out.get('symbol') or ''))
+                out['market_symbol'] = str(out.get('market_symbol') or '').strip() or _market_symbol_from_base(out.get('symbol'))
+                try:
+                    out['created_ts'] = float(out.get('created_ts') or 0.0)
+                except Exception:
+                    out['created_ts'] = 0.0
+                return out
+    except Exception:
+        pass
+    return {}
+
+
+def _signal_outcome_sync_for_setup(user_id: int, setup_id: str, horizon_hours: int = 24, min_age_min: int = 25, force: bool = False) -> dict:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return {}
+    existing = db_get_outcome(sid) or {}
+    existing_canon = _canon_signal_outcome_label((existing or {}).get('outcome'))
+    if (not force) and existing and existing_canon in {'TP1', 'TP2', 'SL'}:
+        return existing
+
+    payload = _signal_setup_eval_payload(sid)
+    if not payload:
+        return existing
+
+    created_ts = float(payload.get('created_ts') or 0.0)
+    now_ts = float(time.time())
+    if (not force) and created_ts > 0 and (now_ts - created_ts) < (max(5, int(min_age_min)) * 60.0):
+        return existing
+
+    try:
+        life = _admin_setup_lifecycle_get(sid) or {}
+    except Exception:
+        life = {}
+    trade_id = str((life or {}).get('trade_id') or '').strip()
+    trade = None
+    if trade_id:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                row = cur.execute("SELECT * FROM autotrade_trades WHERE trade_id=? LIMIT 1", (trade_id,)).fetchone()
+                trade = dict(row) if row else None
+        except Exception:
+            trade = None
+    if trade and (str(trade.get('status') or '').upper().strip() == 'CLOSED' or float(trade.get('closed_ts') or 0.0) > 0):
+        canon = _canon_outcome_from_autotrade_trade(trade)
+        canon = _canon_signal_outcome_label(canon)
+        if canon in {'TP1', 'TP2', 'SL'}:
+            hit_level = 'SL' if canon == 'SL' else 'TP1'
+            hit_ts = float(trade.get('closed_ts') or trade.get('opened_ts') or created_ts or now_ts)
+            best_level = 'TP2' if canon == 'TP2' else ('TP1' if canon == 'TP1' else 'NONE')
+            db_upsert_outcome(sid, canon, hit_level, hit_ts, int(horizon_hours), note='sync_from_autotrade_trade', best_level=best_level, best_ts=hit_ts if best_level != 'NONE' else None)
+            return db_get_outcome(sid) or {'setup_id': sid, 'outcome': canon}
+
+    try:
+        res = evaluate_signal_hit_order(payload, horizon_hours=int(horizon_hours), timeframe='1m')
+        if isinstance(res, dict):
+            db_upsert_outcome(
+                sid,
+                str(res.get('outcome') or 'OPEN'),
+                str(res.get('hit_level') or ''),
+                (float(res.get('hit_ts')) if res.get('hit_ts') is not None else None),
+                int(horizon_hours),
+                note=str(res.get('note') or ''),
+                best_level=str(res.get('best_level') or ''),
+                best_ts=(float(res.get('best_ts')) if res.get('best_ts') is not None else None),
+            )
+            return db_get_outcome(sid) or dict(res)
+    except Exception:
+        pass
+    return existing
+
+
+def _signal_outcome_sync_for_user(user_id: int, days: int | None = None, limit: int = 800, force: bool = False) -> dict:
+    synced = 0
+    decided = 0
+    errors = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            q = "SELECT setup_id FROM emailed_setups WHERE user_id=?"
+            params = [int(user_id)]
+            if days is not None:
+                try:
+                    cutoff = float(time.time() - max(1, int(days)) * 86400.0)
+                    q += " AND emailed_ts>=?"
+                    params.append(cutoff)
+                except Exception:
+                    pass
+            q += " ORDER BY emailed_ts DESC LIMIT ?"
+            params.append(int(max(50, min(int(limit), 5000))))
+            rows = cur.execute(q, tuple(params)).fetchall() or []
+        for row in rows:
+            sid = str((dict(row) or {}).get('setup_id') or '').strip()
+            if not sid:
+                continue
+            try:
+                out = _signal_outcome_sync_for_setup(int(user_id), sid, force=bool(force))
+                synced += 1
+                if _canon_signal_outcome_label((out or {}).get('outcome')) in {'TP1', 'TP2', 'SL'}:
+                    decided += 1
+            except Exception:
+                errors += 1
+                continue
+    except Exception:
+        pass
+    return {'synced': int(synced), 'decided': int(decided), 'errors': int(errors)}
 
 def _next_public_trade_id(user_id: int) -> int:
     """Sequential per-user Trade ID shown to the user (starts at 1)."""
@@ -14440,6 +14608,12 @@ def _canonical_signal_outcome_for_setup(user_id: int, setup_id: str) -> tuple[st
     stored = db_get_outcome(sid) if sid else None
     if stored:
         return _canon_signal_outcome_label(stored.get('outcome')), {'source': 'signal_outcomes', 'stored': stored, 'lifecycle': life}
+    try:
+        synced = _signal_outcome_sync_for_setup(int(user_id), sid, force=False)
+    except Exception:
+        synced = {}
+    if synced:
+        return _canon_signal_outcome_label((synced or {}).get('outcome')), {'source': 'signal_outcomes_sync', 'stored': synced, 'lifecycle': life}
     return 'OPEN', {'source': 'none', 'lifecycle': life}
 
 
@@ -14557,6 +14731,10 @@ def _signal_outcome_summary(user_id: int, session: str | None = None, days: int 
     except Exception:
         emailed = []
 
+    try:
+        _signal_outcome_sync_for_user(int(user_id), days=(int(days) if days is not None else None), limit=max(200, len(emailed) or 0), force=False)
+    except Exception:
+        pass
     user = get_user(user_id) or {}
     rows, hidden_untracked_open = _signal_report_resolve_rows(user_id, emailed, user=user)
     stats = _canonical_wr_stats(rows)
@@ -16557,8 +16735,8 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
 
     qlo, qhi = _rng('quality_score_min_screen', 52.0, 70.0)
     out['quality_score_min_screen'] = float(clamp(float(out.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), qlo, qhi))
-    email_lo = max(qlo + 2.0, 54.0)
-    email_hi = min(qhi + 12.0, 84.0)
+    email_lo = max(qlo + 6.0, 66.0)
+    email_hi = min(qhi + 14.0, 90.0)
     out['quality_score_min_email'] = float(clamp(float(out.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), email_lo, email_hi))
     rrlo, rrhi = _rng('min_rr_tp3', 1.3, 2.4)
     out['min_rr_tp3'] = float(clamp(float(out.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3), rrlo, rrhi))
@@ -16644,8 +16822,294 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
     return actions, notes
 
 
+
+
+def _runtime_profile_migrate_tables():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS runtime_profiles (
+                profile_id TEXT PRIMARY KEY,
+                created_ts REAL NOT NULL,
+                applied_ts REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ACTIVE',
+                source TEXT NOT NULL DEFAULT '',
+                baseline_profile_id TEXT NOT NULL DEFAULT '',
+                probation_until_ts REAL NOT NULL DEFAULT 0,
+                score REAL NOT NULL DEFAULT 0,
+                params_json TEXT NOT NULL DEFAULT '',
+                summary_json TEXT NOT NULL DEFAULT '',
+                revert_reason TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS runtime_profile_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                profile_id TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL DEFAULT '',
+                detail_json TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT ''
+            )""")
+            try:
+                c.execute("CREATE INDEX IF NOT EXISTS idx_runtime_profiles_status ON runtime_profiles(status, applied_ts)")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_runtime_profile_events_ts ON runtime_profile_events(ts DESC)")
+            except Exception:
+                pass
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _runtime_profile_snapshot_from_cfg(cfg: dict | None = None) -> dict:
+    cfg = _market_adaptive_clamp_cfg(cfg or load_strategy_config(force=False))
+    return {
+        'quality_score_min_email': float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
+        'quality_score_min_screen': float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN),
+        'min_rr_tp3': float(cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3),
+        'tf_align_1h_min_abs': float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS),
+        'atr_min_pct': float(cfg.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT),
+        'execution_asia_enabled': _cfg_bool(cfg.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED)),
+        'execution_engine_b_email_enabled': _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)),
+        'session_exec_overrides': json.loads(json.dumps(cfg.get('session_exec_overrides') or {})),
+    }
+
+
+def _runtime_profile_log_event(profile_id: str, event_type: str, detail: dict | None = None, note: str = '') -> None:
+    _runtime_profile_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO runtime_profile_events(ts, profile_id, event_type, detail_json, note) VALUES(?,?,?,?,?)",
+                (float(time.time()), str(profile_id or ''), str(event_type or ''), _json_dumps_safe(detail or {}), str(note or '')),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _runtime_profile_get_current() -> dict:
+    _runtime_profile_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            row = c.execute(
+                "SELECT * FROM runtime_profiles WHERE status IN ('PROBATION','ACTIVE') ORDER BY applied_ts DESC, created_ts DESC LIMIT 1"
+            ).fetchone()
+            out = dict(row) if row else {}
+            if out:
+                try:
+                    out['params'] = json.loads(out.get('params_json') or '{}')
+                except Exception:
+                    out['params'] = {}
+                try:
+                    out['summary'] = json.loads(out.get('summary_json') or '{}')
+                except Exception:
+                    out['summary'] = {}
+            return out
+    except Exception:
+        return {}
+
+
+def _runtime_profile_get_by_id(profile_id: str) -> dict:
+    _runtime_profile_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            row = c.execute("SELECT * FROM runtime_profiles WHERE profile_id=? LIMIT 1", (str(profile_id or ''),)).fetchone()
+            out = dict(row) if row else {}
+            if out:
+                try:
+                    out['params'] = json.loads(out.get('params_json') or '{}')
+                except Exception:
+                    out['params'] = {}
+                try:
+                    out['summary'] = json.loads(out.get('summary_json') or '{}')
+                except Exception:
+                    out['summary'] = {}
+            return out
+    except Exception:
+        return {}
+
+
+def _runtime_profile_bootstrap_if_missing(cfg: dict | None = None) -> dict:
+    cur = _runtime_profile_get_current()
+    if cur:
+        return cur
+    _runtime_profile_migrate_tables()
+    cfg = _market_adaptive_clamp_cfg(cfg or load_strategy_config(force=True))
+    params = _runtime_profile_snapshot_from_cfg(cfg)
+    profile_id = f"RP-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+    summary = {
+        'baseline_signal_wr': float(_signal_wr_display_metrics(int(AUTOTRADE_OWNER_UID or 0)).get('binary_win_rate', 0.0) if int(AUTOTRADE_OWNER_UID or 0) > 0 else 0.0),
+        'baseline_live_wr': float(_learning_live_trade_summary(int(AUTOTRADE_OWNER_UID or 0), days=30).get('win_rate', 0.0) if int(AUTOTRADE_OWNER_UID or 0) > 0 else 0.0),
+        'bootstrap': True,
+    }
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO runtime_profiles(profile_id, created_ts, applied_ts, status, source, baseline_profile_id, probation_until_ts, score, params_json, summary_json, revert_reason, notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(profile_id), float(time.time()), float(time.time()), 'ACTIVE', 'bootstrap', '', 0.0, 0.0, _json_dumps_safe(params), _json_dumps_safe(summary), '', 'initial_bootstrap_from_strategy_config'),
+            )
+            conn.commit()
+        _runtime_profile_log_event(profile_id, 'BOOTSTRAP', summary, 'Initial DB-backed runtime profile created.')
+    except Exception:
+        pass
+    return _runtime_profile_get_current()
+
+
+def _runtime_profile_create_from_cfg(cfg: dict, source: str, status: str = 'PROBATION', baseline_profile_id: str = '', score: float = 0.0, probation_hours: float = 72.0, summary: dict | None = None, notes: str = '') -> dict:
+    _runtime_profile_migrate_tables()
+    cfg = _market_adaptive_clamp_cfg(cfg or load_strategy_config(force=True))
+    params = _runtime_profile_snapshot_from_cfg(cfg)
+    profile_id = f"RP-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+    now_ts = float(time.time())
+    probation_until = now_ts + max(1.0, float(probation_hours or 72.0)) * 3600.0 if str(status or '').upper() == 'PROBATION' else 0.0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("UPDATE runtime_profiles SET status='SUPERSEDED' WHERE status='ACTIVE'")
+            c.execute("UPDATE runtime_profiles SET status='SUPERSEDED_PENDING' WHERE status='PROBATION'")
+            c.execute(
+                "INSERT OR REPLACE INTO runtime_profiles(profile_id, created_ts, applied_ts, status, source, baseline_profile_id, probation_until_ts, score, params_json, summary_json, revert_reason, notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(profile_id), now_ts, now_ts, str(status or 'PROBATION').upper(), str(source or ''), str(baseline_profile_id or ''), float(probation_until), float(score or 0.0), _json_dumps_safe(params), _json_dumps_safe(summary or {}), '', str(notes or '')),
+            )
+            conn.commit()
+        _runtime_profile_log_event(profile_id, 'PROFILE_CREATED', summary or {}, notes)
+    except Exception:
+        pass
+    return _runtime_profile_get_by_id(profile_id)
+
+
+def _signal_outcome_summary_since(user_id: int, since_ts: float, session: str | None = None) -> dict:
+    user_id = int(user_id or 0)
+    try:
+        _signal_outcome_sync_for_user(user_id, days=None, limit=1200, force=False)
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = "SELECT setup_id, session, emailed_ts FROM emailed_setups WHERE user_id=? AND emailed_ts>=?"
+            params = [int(user_id), float(since_ts or 0.0)]
+            if session:
+                q += " AND UPPER(COALESCE(session,''))=?"
+                params.append(str(session).upper())
+            q += " ORDER BY emailed_ts ASC"
+            emailed = [dict(r) for r in (c.execute(q, tuple(params)).fetchall() or [])]
+    except Exception:
+        emailed = []
+    user = get_user(user_id) or {}
+    rows, hidden = _signal_report_resolve_rows(user_id, emailed, user=user)
+    stats = _canonical_wr_stats(rows)
+    return {
+        'rows': rows,
+        'decided': int(stats.get('decided') or 0),
+        'wins': int(stats.get('wins') or 0),
+        'losses': int(stats.get('losses') or 0),
+        'win_rate': float(stats.get('win_rate') or 0.0),
+        'by_session': stats.get('by_session') or {},
+        'hidden_untracked_open': int(hidden or 0),
+    }
+
+
+def _autotrade_live_summary_since(uid: int, since_ts: float) -> dict:
+    trades = db_list_autotrade_trades_all(int(uid)) or []
+    sel = [t for t in trades if float(t.get('closed_ts') or 0.0) >= float(since_ts or 0.0)]
+    wins = 0
+    losses = 0
+    net = 0.0
+    for t in sel:
+        try:
+            pnl = float(t.get('pnl') or t.get('pnl_usdt') or 0.0)
+        except Exception:
+            pnl = 0.0
+        net += pnl
+        if pnl > 0:
+            wins += 1
+        elif pnl < 0:
+            losses += 1
+    decided = wins + losses
+    wr = (wins / decided * 100.0) if decided > 0 else 0.0
+    return {'closed': int(decided), 'wins': int(wins), 'losses': int(losses), 'win_rate': float(wr), 'net_pnl': float(net)}
+
+
+def _runtime_profile_review_probation(uid: int | None = None, force: bool = False) -> dict:
+    owner = int(uid or AUTOTRADE_OWNER_UID or 0)
+    cur = _runtime_profile_bootstrap_if_missing()
+    if not cur:
+        return {'status': 'NO_PROFILE'}
+    if str(cur.get('status') or '').upper() != 'PROBATION':
+        return {'status': 'NO_PROBATION', 'profile': cur}
+    cfg = load_strategy_config(force=False)
+    min_sig = int((cfg or {}).get('runtime_profile_min_signal_decisions', 12) or 12)
+    min_live = int((cfg or {}).get('runtime_profile_min_live_closes', 8) or 8)
+    wr_floor = float((cfg or {}).get('runtime_profile_revert_wr_floor', 45.0) or 45.0)
+    live_floor = float((cfg or {}).get('runtime_profile_revert_live_wr_floor', 38.0) or 38.0)
+    gap = float((cfg or {}).get('runtime_profile_revert_vs_baseline_gap', 3.0) or 3.0)
+    since_ts = float(cur.get('applied_ts') or cur.get('created_ts') or time.time())
+    probation_until = float(cur.get('probation_until_ts') or 0.0)
+    sig = _signal_outcome_summary_since(owner, since_ts) if owner > 0 else {'decided': 0, 'win_rate': 0.0}
+    live = _autotrade_live_summary_since(owner, since_ts) if owner > 0 else {'closed': 0, 'win_rate': 0.0}
+    baseline = _runtime_profile_get_by_id(str(cur.get('baseline_profile_id') or ''))
+    base_summary = baseline.get('summary') or {}
+    baseline_sig_wr = float(base_summary.get('baseline_signal_wr') or base_summary.get('probation_signal_wr') or 0.0)
+    baseline_live_wr = float(base_summary.get('baseline_live_wr') or base_summary.get('probation_live_wr') or 0.0)
+    enough_sample = bool(force) or int(sig.get('decided') or 0) >= min_sig or int(live.get('closed') or 0) >= min_live or (probation_until > 0 and time.time() >= probation_until)
+    if not enough_sample:
+        return {'status': 'WAITING', 'profile': cur, 'signal': sig, 'live': live}
+    revert = False
+    reasons = []
+    if int(sig.get('decided') or 0) >= min_sig:
+        if float(sig.get('win_rate') or 0.0) < wr_floor:
+            revert = True
+            reasons.append(f"signal_wr_below_floor ({float(sig.get('win_rate') or 0.0):.1f}%<{wr_floor:.1f}%)")
+        elif baseline_sig_wr > 0 and float(sig.get('win_rate') or 0.0) < (baseline_sig_wr - gap):
+            revert = True
+            reasons.append(f"signal_wr_below_baseline_gap ({float(sig.get('win_rate') or 0.0):.1f}%<{baseline_sig_wr - gap:.1f}%)")
+    if int(live.get('closed') or 0) >= min_live:
+        if float(live.get('win_rate') or 0.0) < live_floor:
+            revert = True
+            reasons.append(f"live_wr_below_floor ({float(live.get('win_rate') or 0.0):.1f}%<{live_floor:.1f}%)")
+        elif baseline_live_wr > 0 and float(live.get('win_rate') or 0.0) < (baseline_live_wr - gap):
+            revert = True
+            reasons.append(f"live_wr_below_baseline_gap ({float(live.get('win_rate') or 0.0):.1f}%<{baseline_live_wr - gap:.1f}%)")
+
+    if revert and baseline and baseline.get('params'):
+        save_strategy_config(_market_adaptive_clamp_cfg(baseline.get('params') or {}))
+        apply_strategy_config(load_strategy_config(force=True))
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute("UPDATE runtime_profiles SET status='REVERTED', revert_reason=? WHERE profile_id=?", ('; '.join(reasons), str(cur.get('profile_id') or '')))
+                c.execute("UPDATE runtime_profiles SET status='ACTIVE' WHERE profile_id=?", (str(baseline.get('profile_id') or ''),))
+                conn.commit()
+        except Exception:
+            pass
+        _runtime_profile_log_event(str(cur.get('profile_id') or ''), 'PROBATION_REVERT', {'signal': sig, 'live': live, 'reasons': reasons}, '; '.join(reasons))
+        return {'status': 'REVERTED', 'profile': _runtime_profile_get_by_id(str(cur.get('profile_id') or '')), 'baseline': baseline, 'signal': sig, 'live': live, 'reasons': reasons}
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE runtime_profiles SET status='ACTIVE', summary_json=? WHERE profile_id=?",
+                (_json_dumps_safe({'probation_signal_wr': float(sig.get('win_rate') or 0.0), 'probation_live_wr': float(live.get('win_rate') or 0.0), 'signal_decided': int(sig.get('decided') or 0), 'live_closed': int(live.get('closed') or 0), 'baseline_signal_wr': baseline_sig_wr, 'baseline_live_wr': baseline_live_wr}), str(cur.get('profile_id') or '')),
+            )
+            conn.commit()
+    except Exception:
+        pass
+    _runtime_profile_log_event(str(cur.get('profile_id') or ''), 'PROBATION_PROMOTED', {'signal': sig, 'live': live}, 'Probation passed; profile is now fully active.')
+    return {'status': 'PROMOTED', 'profile': _runtime_profile_get_by_id(str(cur.get('profile_id') or '')), 'signal': sig, 'live': live}
+
 def _market_adaptive_status_snapshot() -> dict:
     cfg = load_strategy_config(force=False)
+    profile = _runtime_profile_bootstrap_if_missing(cfg)
+    review = _runtime_profile_review_probation(int(AUTOTRADE_OWNER_UID or 0), force=False)
     last_run = _evolution_get_last_run('market_adaptive') or {}
     last_report = _evolution_state_get('market_adaptive_last_report', {}) or {}
     return {
@@ -16654,11 +17118,15 @@ def _market_adaptive_status_snapshot() -> dict:
         'days': int((cfg or {}).get('market_adaptive_days', 30) or 30),
         'last_run': last_run,
         'last_report': last_report,
+        'runtime_profile': _runtime_profile_get_current() or profile or {},
+        'runtime_profile_review': review or {},
     }
 
 
 def _run_market_adaptive_cycle(force: bool = False) -> dict:
     cfg0 = load_strategy_config(force=True)
+    _runtime_profile_bootstrap_if_missing(cfg0)
+    probation_review = _runtime_profile_review_probation(int(AUTOTRADE_OWNER_UID or 0), force=False)
     enabled = _cfg_bool((cfg0 or {}).get('market_adaptive_enabled', True), True)
     run_id = _evolution_new_run('market_adaptive')
     if not enabled:
@@ -16732,10 +17200,36 @@ def _run_market_adaptive_cycle(force: bool = False) -> dict:
                 apply_strategy_config(best_cfg)
                 break
 
+        current_profile = _runtime_profile_get_current() or _runtime_profile_bootstrap_if_missing(best_cfg)
         final_cfg = _market_adaptive_clamp_cfg(best_cfg)
         save_strategy_config(final_cfg)
         apply_strategy_config(final_cfg)
         now_ts = float(time.time())
+        runtime_profile = dict(current_profile or {})
+        try:
+            current_params = (current_profile or {}).get('params') or {}
+            new_params = _runtime_profile_snapshot_from_cfg(final_cfg)
+            if best_actions and _json_dumps_safe(current_params) != _json_dumps_safe(new_params):
+                baseline_wr = _signal_wr_display_metrics(int(AUTOTRADE_OWNER_UID or 0)).get('binary_win_rate', 0.0) if int(AUTOTRADE_OWNER_UID or 0) > 0 else 0.0
+                baseline_live_wr = _learning_live_trade_summary(int(AUTOTRADE_OWNER_UID or 0), days=30).get('win_rate', 0.0) if int(AUTOTRADE_OWNER_UID or 0) > 0 else 0.0
+                runtime_profile = _runtime_profile_create_from_cfg(
+                    final_cfg,
+                    source='market_adaptive',
+                    status='PROBATION',
+                    baseline_profile_id=str((current_profile or {}).get('profile_id') or ''),
+                    score=float(best_score),
+                    probation_hours=float((final_cfg or {}).get('runtime_profile_probation_hours', 72.0) or 72.0),
+                    summary={
+                        'baseline_signal_wr': float(baseline_wr or 0.0),
+                        'baseline_live_wr': float(baseline_live_wr or 0.0),
+                        'baseline_score': float(baseline_score),
+                        'final_score': float(best_score),
+                        'actions': list(best_actions),
+                    },
+                    notes='; '.join(notes_acc[:8]),
+                )
+        except Exception:
+            runtime_profile = _runtime_profile_get_current() or {}
         report = {
             'run_id': run_id,
             'ts': now_ts,
@@ -16765,6 +17259,8 @@ def _run_market_adaptive_cycle(force: bool = False) -> dict:
                 'execution_engine_b_email_enabled': _cfg_bool(final_cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)),
                 'session_exec_overrides': final_cfg.get('session_exec_overrides') or {},
             },
+            'runtime_profile': runtime_profile or {},
+            'runtime_profile_review': probation_review or {},
         }
         _evolution_state_set('market_adaptive_last_report', report)
         _evolution_finish_run(
@@ -16846,6 +17342,8 @@ async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAU
         for a in actions[:6]:
             lines.append(f"• {a.get('param')} {a.get('from')}→{a.get('to')} | {a.get('reason')}")
     current_live = rep.get('current_live') or {}
+    profile = snap.get('runtime_profile') or {}
+    profile_review = snap.get('runtime_profile_review') or {}
     if current_live:
         lines.extend([
             SEP,
@@ -16853,6 +17351,28 @@ async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAU
             f"TF align 1h={float(current_live.get('tf_align_1h_min_abs', 0.0) or 0.0):.2f} | ATR min={float(current_live.get('atr_min_pct', 0.0) or 0.0):.2f}",
             f"Engine B exec: {'ON' if _cfg_bool(current_live.get('execution_engine_b_email_enabled', True), True) else 'OFF'} | Asia exec: {'ON' if _cfg_bool(current_live.get('execution_asia_enabled', False), False) else 'OFF'}",
         ])
+        lines.append('Session-specific executable thresholds:')
+        for _sess in ('NY', 'LON', 'ASIA'):
+            _q, _c, _r = _execution_session_thresholds(_sess)
+            lines.append(f"• {_sess}: quality≥{float(_q):.1f} | conf≥{int(_c)} | final RR≥{float(_r):.2f}")
+    if profile:
+        pstatus = str(profile.get('status') or 'ACTIVE').upper()
+        psrc = str(profile.get('source') or 'bootstrap')
+        pid = str(profile.get('profile_id') or '')[:22]
+        lines.extend([
+            SEP,
+            f"Runtime profile: {pstatus} | source={psrc} | id={pid}",
+        ])
+        if pstatus == 'PROBATION':
+            try:
+                until_txt = _fmt_dt_local(datetime.fromtimestamp(float(profile.get('probation_until_ts') or 0.0), tz=timezone.utc)) if float(profile.get('probation_until_ts') or 0.0) > 0 else '—'
+            except Exception:
+                until_txt = '—'
+            lines.append(f"Probation until: {until_txt}")
+        if profile_review:
+            lines.append(f"Latest probation review: {str(profile_review.get('status') or 'n/a')}")
+            if (profile_review.get('reasons') or []):
+                lines.append("• " + "; ".join([str(x) for x in (profile_review.get('reasons') or [])[:3]]))
     await send_long_message(update, '\n'.join(lines), parse_mode=None)
 
 
@@ -17113,13 +17633,13 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """Session-aware production thresholds with config-driven runtime overrides."""
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 79.0, 84, 1.60
+        quality, conf, rr = 80.5, 85, 1.65
     elif sess == "LON":
-        quality, conf, rr = 78.0, 83, 1.58
+        quality, conf, rr = 80.0, 84, 1.62
     elif sess == "ASIA":
-        quality, conf, rr = 84.0, 87, 1.72
+        quality, conf, rr = 86.0, 88, 1.78
     else:
-        quality, conf, rr = 78.0, 83, 1.58
+        quality, conf, rr = 80.0, 84, 1.62
 
     try:
         cfg = load_strategy_config(force=False)
@@ -17193,19 +17713,23 @@ def is_executable_setup_eligible(
         ch1_abs = abs(float(getattr(s, "ch1", 0.0) or 0.0))
 
         if sess == "NY":
-            if pb_dist > 0.78 and (score < (score_floor + 3.0) or conf < (conf_floor + 2)):
+            if pb_dist > 0.74 and (score < (score_floor + 3.0) or conf < (conf_floor + 2)):
                 return (False, "ny_entry_too_far_from_ema")
-            if ch15_abs > 0.95 and pb_dist > 0.70:
+            if ch15_abs > 0.88 and pb_dist > 0.66:
                 return (False, "ny_late_extension_exec")
+            if ch15_abs > 0.78 and ch1_abs > 1.60 and conf < (conf_floor + 3):
+                return (False, "ny_stretched_continuation_exec")
         elif sess == "LON":
-            if pb_dist > 0.76 and (score < (score_floor + 2.0) or conf < (conf_floor + 1)):
+            if pb_dist > 0.72 and (score < (score_floor + 2.0) or conf < (conf_floor + 1)):
                 return (False, "lon_entry_too_far_from_ema")
-            if ch15_abs > 0.90 and ch1_abs > 1.70 and pb_dist > 0.68:
+            if ch15_abs > 0.84 and ch1_abs > 1.55 and pb_dist > 0.62:
                 return (False, "lon_late_extension_exec")
 
         if engine == "A":
             if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
                 return (False, "pullback_not_ready")
+            if pb_dist > (0.68 if sess == 'ASIA' else (0.72 if sess == 'LON' else 0.74)) and conf < (conf_floor + 2):
+                return (False, "pullback_still_too_shallow")
             return (True, "ok")
 
         if engine == "C":
@@ -18572,6 +19096,91 @@ def pick_breakout_setups(
 
 
 
+
+
+
+def _email_market_regime(best_fut: dict) -> str:
+    try:
+        best = dict(best_fut or {})
+        vals = list(best.values())
+        if not vals:
+            return 'mixed'
+        adv = sum(1 for mv in vals[:40] if float(getattr(mv, 'percentage', 0.0) or 0.0) > 0.0)
+        dec = sum(1 for mv in vals[:40] if float(getattr(mv, 'percentage', 0.0) or 0.0) < 0.0)
+        btc = float(getattr(best.get('BTC') or MarketVol('','','',0,0,0,0,0,0), 'percentage', 0.0) or 0.0)
+        eth = float(getattr(best.get('ETH') or MarketVol('','','',0,0,0,0,0,0), 'percentage', 0.0) or 0.0)
+        if adv >= dec + 8 and btc >= 0.8 and eth >= 0.8:
+            return 'risk_on'
+        if dec >= adv + 8 and btc <= -0.8 and eth <= -0.8:
+            return 'risk_off'
+        return 'mixed'
+    except Exception:
+        return 'mixed'
+
+
+def _email_symbol_cluster(symbol: str) -> str:
+    b = _symbol_base(symbol)
+    if b in {'BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'ADA', 'LINK', 'NEAR', 'AAVE', 'TAO'}:
+        return 'majors'
+    if b in {'XAU', 'XAUT', 'PAXG'}:
+        return 'metals'
+    if b in {'PEPE', '1000PEPE', 'FARTCOIN', 'TRUMP', 'WIF', 'BONK', 'FLOKI'}:
+        return 'memes'
+    if b in {'UAI', 'SAHARA', 'FET', 'AGIX', 'RNDR'}:
+        return 'ai'
+    return b or 'other'
+
+
+def _email_diversification_guard(s: 'Setup', chosen_list: list, best_fut: dict, session_name: str) -> tuple[bool, str]:
+    try:
+        cfg = load_strategy_config(force=False)
+        sess = str(session_name or '').upper().strip() or 'NY'
+        caps = (cfg or {}).get('email_same_side_cap') or {}
+        same_side_cap = int((caps.get(sess) if isinstance(caps, dict) else None) or (1 if sess == 'ASIA' else 2))
+        cluster_cap = int((cfg or {}).get('email_cluster_side_cap', 1) or 1)
+        bias = _email_market_regime(best_fut)
+        score = float(getattr(s, 'quality_score', 0.0) or 0.0)
+        conf = int(getattr(s, 'conf', 0) or 0)
+        entry = float(getattr(s, 'entry', 0.0) or 0.0)
+        sl = float(getattr(s, 'sl', 0.0) or 0.0)
+        final_tp = float(getattr(s, 'tp2', 0.0) or getattr(s, 'tp3', 0.0) or 0.0)
+        rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
+        side = str(getattr(s, 'side', '') or '').upper().strip()
+        cluster = _email_symbol_cluster(str(getattr(s, 'symbol', '') or ''))
+        same_side_count = 0
+        same_cluster_side_count = 0
+        for c in (chosen_list or []):
+            c_side = str(getattr(c, 'side', '') or '').upper().strip()
+            if c_side == side:
+                same_side_count += 1
+                if _email_symbol_cluster(str(getattr(c, 'symbol', '') or '')) == cluster:
+                    same_cluster_side_count += 1
+        if same_side_count >= same_side_cap:
+            return (False, 'same_side_burst_cap')
+        if same_cluster_side_count >= cluster_cap and not (score >= 86.0 and conf >= 90 and rr_final >= 1.90):
+            return (False, 'cluster_side_burst_cap')
+
+        q_add_map = (cfg or {}).get('counter_regime_quality_add') or {}
+        c_add_map = (cfg or {}).get('counter_regime_conf_add') or {}
+        r_add_map = (cfg or {}).get('counter_regime_rr_add') or {}
+        q_add = float((q_add_map.get(sess) if isinstance(q_add_map, dict) else None) or (3.0 if sess == 'ASIA' else 2.5))
+        c_add = int((c_add_map.get(sess) if isinstance(c_add_map, dict) else None) or (3 if sess == 'ASIA' else 2))
+        r_add = float((r_add_map.get(sess) if isinstance(r_add_map, dict) else None) or (0.12 if sess == 'ASIA' else 0.10))
+        sess_q, sess_c, sess_r = _execution_session_thresholds(sess)
+        if bias == 'risk_on' and side == 'SELL':
+            if not (score >= (sess_q + q_add) and conf >= (sess_c + c_add) and rr_final >= (sess_r + r_add)):
+                return (False, 'counter_regime_sell')
+        if bias == 'risk_off' and side == 'BUY':
+            if not (score >= (sess_q + q_add) and conf >= (sess_c + c_add) and rr_final >= (sess_r + r_add)):
+                return (False, 'counter_regime_buy')
+
+        ch15_abs = abs(float(getattr(s, 'ch15', 0.0) or 0.0))
+        pb_dist = float(getattr(s, 'pullback_ema_dist_pct', 999.0) or 999.0)
+        if cluster == 'majors' and same_side_count >= 1 and ch15_abs > 0.82 and pb_dist > 0.62 and conf < 90:
+            return (False, 'correlated_major_chase')
+        return (True, 'ok')
+    except Exception:
+        return (True, 'ok')
 
 def user_email_alerts_enabled(user: dict) -> bool:
     # Admin always receives emails
@@ -22326,7 +22935,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for sname, c in sorted((stats.get('by_session') or {}).items(), key=lambda kv: kv[0]):
         sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
     if int(hidden_untracked_open or 0) > 0:
-        sess_lines.append(f"• Hidden untracked OPEN rows: {int(hidden_untracked_open)} (no current live Bybit/autotrade match)")
+        sess_lines.append(f"• Hidden untracked rows: {int(hidden_untracked_open)} (no current live Bybit/autotrade match)")
     msg = "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>\n" + "\n".join(sess_lines)
     await send_long_message(update, msg, parse_mode=ParseMode.HTML)
 
@@ -22482,7 +23091,7 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
             lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
     hidden_untracked_open = int(summary.get('hidden_untracked_open') or 0)
     if hidden_untracked_open > 0:
-        lines.extend([SEP, f'Hidden untracked OPEN rows: {hidden_untracked_open} (no current live Bybit/autotrade match)'])
+        lines.extend([SEP, f'Hidden untracked rows: {hidden_untracked_open} (no current live Bybit/autotrade match)'])
     await send_long_message(update, '\n'.join(lines), parse_mode=None)
 
 async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -25650,6 +26259,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             _seen_setup_keys = set()
             cooldown_blocked = 0
             flip_blocked = 0
+            diversify_blocked = Counter()
 
             for s in picks:
                 if len(chosen_list) >= int(EMAIL_SETUPS_N):
@@ -25676,6 +26286,11 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     flip_blocked += 1
                     continue
 
+                ok_div, why_div = _email_diversification_guard(s, chosen_list, best_fut, sess_name)
+                if not ok_div:
+                    diversify_blocked[str(why_div)] += 1
+                    continue
+
                 if symbol_recently_emailed(uid, sym, side, sess_name):
                     cooldown_blocked += 1
                     continue
@@ -25688,6 +26303,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     reasons.append(f"cooldown_blocked={cooldown_blocked}")
                 if flip_blocked:
                     reasons.append(f"flip_guard_blocked={flip_blocked}")
+                if diversify_blocked:
+                    reasons.append(f"diversified_blocked={dict(diversify_blocked.most_common(3))}")
                 reasons.append("all_candidates_blocked")
 
                 _LAST_EMAIL_DECISION[uid] = {
