@@ -2197,9 +2197,113 @@ def _pos_entry(p: dict) -> float:
     except Exception:
         return 0.0
 
+def _bybit_exit_close_side_for_position_side(side: str | None) -> str:
+    try:
+        s = str(side or '').upper().strip()
+        if s == 'BUY':
+            return 'SELL'
+        if s == 'SELL':
+            return 'BUY'
+    except Exception:
+        pass
+    return ''
+
+
+def _bybit_order_close_side(order: dict) -> str:
+    """Best-effort close-side for Bybit exit orders.
+
+    For TP/SL orders Bybit may not always expose a normal side field consistently,
+    so we also infer from text like 'close short' / 'close long'.
+    Returned value is the exchange order side that would close the position: BUY or SELL.
+    """
+    try:
+        s = str((order or {}).get('side') or '').upper().strip()
+        if s in {'BUY', 'SELL'}:
+            return s
+    except Exception:
+        pass
+    try:
+        txt = _bybit_order_kind_text(order)
+        if 'close short' in txt:
+            return 'BUY'
+        if 'close long' in txt:
+            return 'SELL'
+    except Exception:
+        pass
+    return ''
+
+
+def _bybit_order_matches_close_side(order: dict, want_close_side: str | None = None) -> bool:
+    try:
+        want = str(want_close_side or '').upper().strip()
+        if not want:
+            return True
+        got = _bybit_order_close_side(order)
+        if not got:
+            # Do not reject an otherwise valid TP/SL order just because Bybit omitted side.
+            return True
+        return got == want
+    except Exception:
+        return False
+
+
+def _bybit_detect_open_sl_price(symbol: str, side: str | None = None) -> float:
+    """Detect the effective SL price from active exchange TP/SL orders.
+
+    This is needed because Bybit partial TP/SL pairs do not always populate the
+    position-level stopLoss field, even though the SL is real and active.
+    """
+    sym = _bybit_linear_symbol(symbol)
+    if not sym:
+        return 0.0
+    want_close_side = _bybit_exit_close_side_for_position_side(side)
+    buckets: list[dict] = []
+    try:
+        for o in (_bybit_get_open_orders_linear(sym) or []):
+            try:
+                if _bybit_linear_symbol(str((o or {}).get('symbol') or '')) != sym:
+                    continue
+                if not _bybit_order_matches_close_side(o, want_close_side):
+                    continue
+                if not _bybit_is_sl_exit_order(o):
+                    continue
+                px = float(_bybit_order_working_price(o) or 0.0)
+                if px <= 0:
+                    continue
+                qty = abs(float(_bybit_order_filled_qty(o) or 0.0))
+                if qty <= 0:
+                    qty = 1.0
+                matched = False
+                for b in buckets:
+                    if _price_close_enough(float(b.get('price') or 0.0), px, rel_tol=0.0010):
+                        b['qty'] = float(b.get('qty') or 0.0) + qty
+                        b['count'] = int(b.get('count') or 0) + 1
+                        matched = True
+                        break
+                if not matched:
+                    buckets.append({'price': float(px), 'qty': float(qty), 'count': 1})
+            except Exception:
+                continue
+    except Exception:
+        return 0.0
+    if not buckets:
+        return 0.0
+    buckets.sort(key=lambda x: (float(x.get('qty') or 0.0), int(x.get('count') or 0), float(x.get('price') or 0.0)), reverse=True)
+    try:
+        return float((buckets[0] or {}).get('price') or 0.0)
+    except Exception:
+        return 0.0
+
+
 def _pos_stop(p: dict) -> float:
     try:
-        return float(p.get("stopLoss") or 0.0)
+        raw = float(p.get("stopLoss") or 0.0)
+        if raw > 0:
+            return raw
+    except Exception:
+        pass
+    try:
+        return float(_bybit_detect_open_sl_price(_pos_symbol(p), _pos_side_text(p)) or 0.0)
     except Exception:
         return 0.0
 
@@ -2409,7 +2513,7 @@ def _bybit_has_matching_tp_exit(symbol: str, close_side: str, tp_price: float) -
         try:
             if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
                 continue
-            if want_side and str(o.get('side') or '').upper().strip() != want_side:
+            if not _bybit_order_matches_close_side(o, want_side):
                 continue
             if not _bybit_is_tp_exit_order(o):
                 continue
@@ -2439,7 +2543,7 @@ def _bybit_has_matching_sl_exit(symbol: str, close_side: str, sl_price: float) -
         try:
             if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
                 continue
-            if want_side and str(o.get('side') or '').upper().strip() != want_side:
+            if not _bybit_order_matches_close_side(o, want_side):
                 continue
             if not _bybit_is_sl_exit_order(o):
                 continue
@@ -2476,7 +2580,7 @@ def _bybit_sum_open_exit_qty_at(symbol: str, trigger_price: float, side: str | N
         try:
             if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
                 continue
-            if close_side and str(o.get('side') or '').upper().strip() != close_side:
+            if not _bybit_order_matches_close_side(o, close_side):
                 continue
             is_match = _bybit_is_sl_exit_order(o) if want_kind == 'sl' else _bybit_is_tp_exit_order(o)
             if not is_match:
@@ -2789,7 +2893,7 @@ def _autotrade_cancel_reduce_only_tp_orders(symbol: str, side: str | None = None
         try:
             if _bybit_linear_symbol(str(o.get('symbol') or '')) != sym:
                 continue
-            if close_side and str(o.get('side') or '').upper().strip() != close_side:
+            if not _bybit_order_matches_close_side(o, close_side):
                 continue
             if not _bybit_order_reduce_only(o):
                 continue
@@ -2977,17 +3081,34 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
             )
 
         desired_sl = float(entry) if (tp1_hit and be_allowed and entry > 0) else float(target_sl)
+        effective_sl = 0.0
         has_partial_sl = False
+        try:
+            effective_sl = float(_bybit_detect_open_sl_price(sym, side=side) or 0.0)
+        except Exception:
+            effective_sl = 0.0
         try:
             has_partial_sl = _bybit_has_open_sl_order_at(sym, desired_sl, side=side) if desired_sl > 0 else False
         except Exception:
             has_partial_sl = False
-        if desired_sl > 0 and not has_partial_sl and (current_sl <= 0 or not _price_close_enough(current_sl, desired_sl)):
-            if not (float(partial_tp or 0.0) > 0 or float(final_tp or 0.0) > 0):
-                _autotrade_apply_position_tp_sl(sym, desired_sl, 0.0)
+        has_any_real_sl = bool((current_sl > 0) or (effective_sl > 0) or has_partial_sl)
+        sl_matches_target = bool(desired_sl > 0 and ((current_sl > 0 and _price_close_enough(current_sl, desired_sl)) or (effective_sl > 0 and _price_close_enough(effective_sl, desired_sl)) or has_partial_sl))
+        if desired_sl > 0 and (not has_any_real_sl or not sl_matches_target):
+            sl_apply = _autotrade_apply_position_tp_sl(sym, desired_sl, 0.0)
+            time.sleep(0.20)
+            refreshed_pos = _autotrade_find_live_position(sym, side=side) or pos
+            refreshed_sl = float(_pos_stop(refreshed_pos) or 0.0) if refreshed_pos else 0.0
+            if refreshed_sl <= 0:
+                try:
+                    refreshed_sl = float(_bybit_detect_open_sl_price(sym, side=side) or 0.0)
+                except Exception:
+                    refreshed_sl = 0.0
+            if refreshed_sl > 0 and _price_close_enough(refreshed_sl, desired_sl):
                 result['sl_fixed'] = True
-                if tp1_hit and be_allowed:
+                if tp1_hit and be_allowed and desired_sl == float(entry):
                     result['be_applied'] = True
+            else:
+                result['sl_apply_res'] = sl_apply
 
         if tp1_hit:
             desired_targets = _dedupe_price_targets([
@@ -5861,12 +5982,16 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             _autotrade_clear_position_full_tp_sl(sym)
             time.sleep(0.20)
             tp_order_results = _autotrade_place_confirmed_tp_orders(sym, side, tp_targets_live, tp_base_qty, sl_for_order, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
-            final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results, expected_sl_results=[])
+            sl_res = _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
+            time.sleep(0.15)
+            final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results, expected_sl_results=[sl_res])
             if not (sl_stack_ok and tp_stack_ok):
                 _autotrade_clear_position_full_tp_sl(sym)
                 time.sleep(0.35)
                 tp_order_results += _autotrade_place_confirmed_tp_orders(sym, side, tp_targets_live, tp_base_qty, sl_for_order, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
-                final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results, expected_sl_results=[])
+                sl_res_retry = _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
+                time.sleep(0.15)
+                final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results, expected_sl_results=[sl_res, sl_res_retry])
 
             pending_repair = {}
             if not (sl_stack_ok and tp_stack_ok):
