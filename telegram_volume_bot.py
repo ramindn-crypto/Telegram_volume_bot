@@ -1080,7 +1080,7 @@ def _strategy_config_defaults() -> dict:
         "target_setups_per_day_hi": 5.0,
 
         # Self-optimization governance
-        "session_weights": {"NY": 1.0, "LON": 0.0, "ASIA": 0.0},  # optimizer weighting (production bias: NY-only)
+        "session_weights": {"NY": 0.85, "LON": 1.00, "ASIA": 0.35},  # optimizer weighting (live-evidence bias: favor healthiest executable sessions)
         "concentration_cap": 0.25,          # no single symbol >25% of setups (OOS)
         "oos_min_setups": 30,               # minimum OOS sample size across universe before promotion
         "min_win_rate": 70.0,               # enforced only when sample is adequate
@@ -7320,7 +7320,11 @@ def db_connect() -> sqlite3.Connection:
 
 
 def _migrate_generated_setups():
-    """Ensure generated_setups table exists (used by /screen, email, and autotrade)."""
+    """Ensure generated_setups table exists (used by /screen, email, and autotrade).
+
+    Newer builds persist full setup geometry so archived / reconstructed signal evaluation
+    can still resolve entry/SL/TP values even after the live `signals` table is reset.
+    """
     try:
         con = sqlite3.connect(DB_PATH)
         cur = con.cursor()
@@ -7334,9 +7338,32 @@ def _migrate_generated_setups():
                 setup_id TEXT NOT NULL DEFAULT '',
                 symbol TEXT NOT NULL DEFAULT '',
                 side TEXT NOT NULL DEFAULT '',
-                conf INTEGER DEFAULT 0
+                conf INTEGER DEFAULT 0,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                market_symbol TEXT NOT NULL DEFAULT ''
             )
         """)
+        try:
+            cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(generated_setups)").fetchall()}
+        except Exception:
+            cols = set()
+        for ddl in (
+            ("entry", "ALTER TABLE generated_setups ADD COLUMN entry REAL"),
+            ("sl", "ALTER TABLE generated_setups ADD COLUMN sl REAL"),
+            ("tp1", "ALTER TABLE generated_setups ADD COLUMN tp1 REAL"),
+            ("tp2", "ALTER TABLE generated_setups ADD COLUMN tp2 REAL"),
+            ("tp3", "ALTER TABLE generated_setups ADD COLUMN tp3 REAL"),
+            ("market_symbol", "ALTER TABLE generated_setups ADD COLUMN market_symbol TEXT NOT NULL DEFAULT ''"),
+        ):
+            try:
+                if ddl[0] not in cols:
+                    cur.execute(ddl[1])
+            except Exception:
+                pass
         cur.execute("CREATE INDEX IF NOT EXISTS idx_generated_setups_uid_ts ON generated_setups(user_id, created_ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_generated_setups_setupid ON generated_setups(setup_id)")
         con.commit()
@@ -7805,15 +7832,36 @@ def db_init():
         setup_id TEXT NOT NULL DEFAULT '',
         symbol TEXT NOT NULL DEFAULT '',
         side TEXT NOT NULL DEFAULT '',
-        conf INTEGER DEFAULT 0
+        conf INTEGER DEFAULT 0,
+        entry REAL,
+        sl REAL,
+        tp1 REAL,
+        tp2 REAL,
+        tp3 REAL,
+        market_symbol TEXT NOT NULL DEFAULT ''
     )
     """)
+
+    try:
+        g_cols = {r["name"] for r in cur.execute("PRAGMA table_info(generated_setups)").fetchall()}
+        for col_name, ddl in (
+            ("entry", "ALTER TABLE generated_setups ADD COLUMN entry REAL"),
+            ("sl", "ALTER TABLE generated_setups ADD COLUMN sl REAL"),
+            ("tp1", "ALTER TABLE generated_setups ADD COLUMN tp1 REAL"),
+            ("tp2", "ALTER TABLE generated_setups ADD COLUMN tp2 REAL"),
+            ("tp3", "ALTER TABLE generated_setups ADD COLUMN tp3 REAL"),
+            ("market_symbol", "ALTER TABLE generated_setups ADD COLUMN market_symbol TEXT NOT NULL DEFAULT ''"),
+        ):
+            if col_name not in g_cols:
+                cur.execute(ddl)
+    except Exception:
+        pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS signal_outcomes (
         setup_id TEXT PRIMARY KEY,
-        outcome TEXT NOT NULL,              -- WIN_TP1 | WIN_TP2 | WIN_TP3 | LOSS | OPEN | AMBIGUOUS
-        hit_level TEXT,                     -- TP1 | TP2 | TP3 | SL | NONE
+        outcome TEXT NOT NULL,              -- canonical: TP1 | TP2 | SL | OPEN | UNTRACKED (legacy values still accepted on read)
+        hit_level TEXT,                     -- TP1 | SL | NONE
         hit_ts REAL,                        -- UTC epoch seconds of first touch (best effort)
         evaluated_ts REAL NOT NULL,          -- UTC epoch seconds
         horizon_hours INTEGER NOT NULL DEFAULT 24,
@@ -9549,6 +9597,64 @@ def db_get_signal(setup_id: str) -> Optional[dict]:
     con.close()
     return dict(row) if row else None
 
+
+def _db_table_exists(table_name: str) -> bool:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+                (str(table_name or '').strip(),),
+            ).fetchone()
+            return bool(row)
+    except Exception:
+        return False
+
+
+def db_get_signal_any(setup_id: str) -> Optional[dict]:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return None
+    row = db_get_signal(sid)
+    if row:
+        return row
+    if not _db_table_exists('signals_archive'):
+        return None
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT * FROM signals_archive WHERE setup_id=? ORDER BY COALESCE(archived_at, created_ts, 0) DESC LIMIT 1",
+                (sid,),
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def db_get_outcome_any(setup_id: str) -> Optional[dict]:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return None
+    row = db_get_outcome(sid)
+    if row:
+        return row
+    if not _db_table_exists('outcomes_archive'):
+        return None
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT * FROM outcomes_archive WHERE setup_id=? ORDER BY COALESCE(archived_at, evaluated_ts, 0) DESC LIMIT 1",
+                (sid,),
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+
+
 def db_list_signals_since(ts_from: float) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
@@ -9784,27 +9890,42 @@ def db_recent_generated_setups(user_id: int, source: str, lookback_hours: int = 
         return []
 
 def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
-    """Log a generated setup (from /screen) or a sent setup (email) for correlation."""
+    """Log a generated setup (from /screen) or a sent setup (email) for correlation.
+
+    Newer rows also persist full geometry so signal/outcome evaluation still works after
+    live tables are archived/reset.
+    """
     con = None
     ts_now = float(time.time())
     try:
         con = db_connect()
         cur = con.cursor()
-        cur.execute(
-            """INSERT INTO generated_setups
-               (user_id, source, created_ts, session, setup_id, symbol, side, conf)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                int(user_id),
-                str(source or "").strip().lower(),
-                ts_now,
-                str(session or ""),
-                str(getattr(s, "setup_id", "") or ""),
-                str(getattr(s, "symbol", "") or ""),
-                str(getattr(s, "side", "") or ""),
-                int(getattr(s, "conf", 0) or 0),
-            ),
-        )
+        try:
+            cols = {r["name"] for r in cur.execute("PRAGMA table_info(generated_setups)").fetchall()}
+        except Exception:
+            cols = set()
+        payload = {
+            "user_id": int(user_id),
+            "source": str(source or "").strip().lower(),
+            "created_ts": ts_now,
+            "session": str(session or ""),
+            "setup_id": str(getattr(s, "setup_id", "") or ""),
+            "symbol": str(getattr(s, "symbol", "") or ""),
+            "side": str(getattr(s, "side", "") or ""),
+            "conf": int(getattr(s, "conf", 0) or 0),
+            "entry": float(getattr(s, "entry", 0.0) or 0.0),
+            "sl": float(getattr(s, "sl", 0.0) or 0.0),
+            "tp1": float(getattr(s, "tp1", 0.0) or 0.0) if getattr(s, "tp1", None) is not None else None,
+            "tp2": float(getattr(s, "tp2", 0.0) or 0.0) if getattr(s, "tp2", None) is not None else None,
+            "tp3": float(getattr(s, "tp3", 0.0) or 0.0) if getattr(s, "tp3", None) is not None else None,
+            "market_symbol": str(getattr(s, "market_symbol", "") or _market_symbol_from_base(getattr(s, "symbol", "")) or ""),
+        }
+        core_cols = ["user_id", "source", "created_ts", "session", "setup_id", "symbol", "side", "conf"]
+        extra_cols = [c for c in ("entry", "sl", "tp1", "tp2", "tp3", "market_symbol") if c in cols]
+        ordered_cols = core_cols + extra_cols
+        placeholders = ", ".join(["?"] * len(ordered_cols))
+        sql = f"INSERT INTO generated_setups ({', '.join(ordered_cols)}) VALUES ({placeholders})"
+        cur.execute(sql, tuple(payload.get(col) for col in ordered_cols))
         con.commit()
     except Exception:
         pass
@@ -9928,6 +10049,15 @@ def db_upsert_outcome(setup_id: str, outcome: str, hit_level: str, hit_ts: Optio
     con = db_connect()
     cur = con.cursor()
 
+    # Persist outcomes in one canonical language so reports / learning / optimizer all read the same truth.
+    canon = _canon_signal_outcome_label(outcome)
+    canon_best = str(best_level or '').upper().strip()
+    if canon_best not in {'TP1', 'TP2'}:
+        canon_best = 'TP2' if canon == 'TP2' else ('TP1' if canon == 'TP1' else 'NONE')
+    canon_hit = str(hit_level or '').upper().strip()
+    if canon_hit not in {'TP1', 'SL'}:
+        canon_hit = 'SL' if canon == 'SL' else ('TP1' if canon in {'TP1', 'TP2'} else 'NONE')
+
     # Backward compatible: if DB hasn't been migrated yet, insert only legacy columns.
     try:
         cols = [r["name"] for r in cur.execute("PRAGMA table_info(signal_outcomes)").fetchall()]
@@ -9941,13 +10071,13 @@ def db_upsert_outcome(setup_id: str, outcome: str, hit_level: str, hit_ts: Optio
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 str(setup_id).strip(),
-                str(outcome),
-                str(hit_level or ""),
+                str(canon),
+                str(canon_hit or ""),
                 (float(hit_ts) if hit_ts is not None else None),
                 float(time.time()),
                 int(horizon_hours),
                 str(note or ""),
-                str(best_level or ""),
+                str(canon_best or ""),
                 (float(best_ts) if best_ts is not None else None),
             ),
         )
@@ -9958,8 +10088,8 @@ def db_upsert_outcome(setup_id: str, outcome: str, hit_level: str, hit_ts: Optio
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
                 str(setup_id).strip(),
-                str(outcome),
-                str(hit_level or ""),
+                str(canon),
+                str(canon_hit or ""),
                 (float(hit_ts) if hit_ts is not None else None),
                 float(time.time()),
                 int(horizon_hours),
@@ -10122,7 +10252,7 @@ def _signal_setup_eval_payload(setup_id: str) -> dict:
     if not sid:
         return {}
     try:
-        sig = db_get_signal(sid) or {}
+        sig = db_get_signal_any(sid) or {}
     except Exception:
         sig = {}
     if sig:
@@ -10140,7 +10270,7 @@ def _signal_setup_eval_payload(setup_id: str) -> dict:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             row = cur.execute(
-                """SELECT setup_id, symbol, side, entry, sl, tp1, tp2, tp3, created_ts, market_symbol
+                """SELECT *
                    FROM generated_setups
                    WHERE setup_id=?
                    ORDER BY created_ts DESC
@@ -10152,6 +10282,12 @@ def _signal_setup_eval_payload(setup_id: str) -> dict:
                 out['setup_id'] = sid
                 out['symbol'] = _bybit_linear_symbol(str(out.get('symbol') or ''))
                 out['market_symbol'] = str(out.get('market_symbol') or '').strip() or _market_symbol_from_base(out.get('symbol'))
+                for key in ('entry', 'sl', 'tp1', 'tp2', 'tp3'):
+                    try:
+                        if out.get(key) is not None:
+                            out[key] = float(out.get(key) or 0.0)
+                    except Exception:
+                        out[key] = 0.0 if key in {'entry', 'sl'} else None
                 try:
                     out['created_ts'] = float(out.get('created_ts') or 0.0)
                 except Exception:
@@ -12681,8 +12817,8 @@ def _objective(oos: list[dict], days: int, cfg: dict) -> float:
     except Exception:
         stab_pen = 0.0
 
-    # Session-weighted performance (NY > LON > ASIA) if by_session is present
-    session_weights = cfg.get("session_weights") or {"NY": 1.0, "LON": 0.6, "ASIA": 0.3}
+    # Session-weighted performance (favor healthiest executable sessions, not a fixed NY-only bias)
+    session_weights = cfg.get("session_weights") or {"NY": 0.85, "LON": 1.0, "ASIA": 0.35}
     try:
         wny = float(session_weights.get("NY", 1.0))
         wlon = float(session_weights.get("LON", 0.6))
@@ -13262,10 +13398,10 @@ def _evolution_tag_counter(days: int = 30, session: str | None = None, losses_on
 
 
 def _evolution_outcome_winloss(outcome: str) -> tuple[int, int]:
-    out = str(outcome or "").upper().strip()
-    if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3"):
+    out = _canon_signal_outcome_label(outcome)
+    if out in ("TP1", "TP2"):
         return (1, 0)
-    if out == "LOSS":
+    if out == "SL":
         return (0, 1)
     return (0, 0)
 
@@ -14626,7 +14762,7 @@ def _signal_report_setup_meta(setup_id: str) -> dict:
     if not sid:
         return {}
     try:
-        sig = db_get_signal(sid) or {}
+        sig = db_get_signal_any(sid) or {}
     except Exception:
         sig = {}
     if sig:
@@ -14636,6 +14772,25 @@ def _signal_report_setup_meta(setup_id: str) -> dict:
             'created_ts': float(sig.get('created_ts') or 0.0),
             'conf': sig.get('conf'),
         }
+    try:
+        if _db_table_exists('signals_archive'):
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                row = cur.execute(
+                    """SELECT symbol, side, created_ts, conf FROM signals_archive
+                       WHERE setup_id=? ORDER BY COALESCE(archived_at, created_ts, 0) DESC LIMIT 1""",
+                    (sid,),
+                ).fetchone()
+                if row:
+                    return {
+                        'symbol': _bybit_linear_symbol(str(row['symbol'] or '')),
+                        'side': _norm_trade_side(str(row['side'] or '')),
+                        'created_ts': float(row['created_ts'] or 0.0),
+                        'conf': row['conf'],
+                    }
+    except Exception:
+        pass
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
@@ -14971,7 +15126,7 @@ def _canonical_signal_outcome_for_setup(user_id: int, setup_id: str) -> tuple[st
             return 'OPEN', {'source': 'autotrade_open_trade', 'trade': trade, 'lifecycle': life}
         if status == 'CLOSED' or float(trade.get('closed_ts') or 0.0) > 0:
             return _canon_outcome_from_autotrade_trade(trade), {'source': 'autotrade_trade', 'trade': trade, 'lifecycle': life}
-    stored = db_get_outcome(sid) if sid else None
+    stored = db_get_outcome_any(sid) if sid else None
     if stored:
         return _canon_signal_outcome_label(stored.get('outcome')), {'source': 'signal_outcomes', 'stored': stored, 'lifecycle': life}
     try:
@@ -17031,30 +17186,39 @@ def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
     hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 10.0) or 10.0)
     ny_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
     lon_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
+    asia_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_asia', 44.0) or 44.0)
 
     score = 0.0
-    score += float(avg_r) * 320.0
-    score += (float(wr) - 45.0) * 1.35
-    score += max(0.0, float(pf) - 1.0) * 8.0
-    if live_setups < 45:
-        score -= float(45 - live_setups) * 0.18
+    # Prioritize live-equivalent quality over raw flow.
+    score += float(avg_r) * 360.0
+    score += (float(wr) - 50.0) * 2.4
+    score += max(0.0, float(pf) - 1.0) * 10.0
+    if float(wr) < 50.0:
+        score -= float(50.0 - float(wr)) * 1.8
+    if float(avg_r) < 0.0:
+        score -= abs(float(avg_r)) * 160.0
+    if live_setups < 35:
+        score -= float(35 - live_setups) * 0.10
     if setups_day < lo:
-        score -= float(lo - setups_day) * 4.0
+        score -= float(lo - setups_day) * 3.2
     elif setups_day > hi:
-        score -= float(setups_day - hi) * 2.4
+        score -= float(setups_day - hi) * 3.4
 
-    for sess, floor, wt in (('NY', ny_floor, 1.4), ('LON', lon_floor, 1.2)):
+    for sess, floor, wt, min_n in (('NY', ny_floor, 1.8, 10), ('LON', lon_floor, 1.4, 8), ('ASIA', asia_floor, 1.2, 6)):
         sd = (per_session or {}).get(sess) or {}
         s_setups = int(sd.get('setups', 0) or 0)
         s_wr = float(sd.get('win_rate', 0.0) or 0.0)
-        if s_setups >= 15 and s_wr < floor:
+        s_avg_r = float(sd.get('avg_R', 0.0) or 0.0)
+        if s_setups >= min_n and s_wr < floor:
             score -= float(floor - s_wr) * float(wt)
-        elif s_setups >= 12 and s_wr > (floor + 6.0):
-            score += float(min(4.0, s_wr - floor)) * 0.25
+        elif s_setups >= min_n and s_wr > (floor + 6.0):
+            score += float(min(5.0, s_wr - floor)) * 0.35
+        if s_setups >= min_n and s_avg_r < 0.0:
+            score -= abs(s_avg_r) * (55.0 if sess == 'NY' else 35.0)
 
     asia_live = int(((per_session or {}).get('ASIA') or {}).get('setups', 0) or 0)
     if asia_live > 0 and not _cfg_bool((cfg or {}).get('execution_asia_enabled', False), False):
-        score -= float(asia_live) * 0.35
+        score -= float(asia_live) * 0.45
     return float(score)
 
 
