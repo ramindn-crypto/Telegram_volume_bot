@@ -1471,7 +1471,7 @@ DEFAULT_RISK_MODE = "PCT"
 DEFAULT_RISK_VALUE = 1.5
 DEFAULT_DAILY_CAP_MODE = "PCT"
 DEFAULT_DAILY_CAP_VALUE = 5.0
-DEFAULT_MAX_TRADES_DAY = 5
+DEFAULT_MAX_TRADES_DAY = 100
 DEFAULT_MIN_EMAIL_GAP_MIN = 30
 
 # Backward-compat alias
@@ -1658,7 +1658,7 @@ AUTOTRADE_EXIT_ENFORCE_EXACT = str(os.environ.get("AUTOTRADE_EXIT_ENFORCE_EXACT"
 AUTOTRADE_EXIT_FORCE_CLOSE_UNTRACKED = str(os.environ.get("AUTOTRADE_EXIT_FORCE_CLOSE_UNTRACKED", "1")).strip().lower() in ("1", "true", "yes", "on")
 AUTOTRADE_EXIT_RESOLVE_LOOKBACK_DAYS = int(os.environ.get("AUTOTRADE_EXIT_RESOLVE_LOOKBACK_DAYS", "21") or 21)
 AUTOTRADE_EXIT_MATCH_ENTRY_TOL_PCT = float(os.environ.get("AUTOTRADE_EXIT_MATCH_ENTRY_TOL_PCT", "3.0") or 3.0)
-AUTOTRADE_EXIT_PROTECTION_GRACE_SEC = float(os.environ.get("AUTOTRADE_EXIT_PROTECTION_GRACE_SEC", "120") or 120.0)
+AUTOTRADE_EXIT_PROTECTION_GRACE_SEC = float(os.environ.get("AUTOTRADE_EXIT_PROTECTION_GRACE_SEC", "600") or 600.0)
 AUTOTRADE_EXIT_PROTECTION_GRACE_SEC = max(0.0, min(600.0, AUTOTRADE_EXIT_PROTECTION_GRACE_SEC))
 
 # Bybit V5 keys (required for live)
@@ -2722,7 +2722,7 @@ def _autotrade_resolve_expected_trade_row_for_live_position(uid: int, live_pos: 
 
 
 def _autotrade_exit_stack_grace_state(trade_row: dict | None = None, live_pos: dict | None = None, start_ts: float | None = None, now_ts: float | None = None) -> dict:
-    """Return whether a live position is still inside the short protection-reconciliation grace window.
+    """Return whether a live position is still inside the protection-reconciliation grace window.
 
     Purpose:
     - prevent brand-new positions from being force-closed only because Bybit has not yet
@@ -2769,7 +2769,7 @@ def _autotrade_manage_live_position_protection(uid: int, live_pos: dict, cached_
     Rules enforced:
     - every live position must resolve back to one emailed/bot setup
     - every resolved position must show exact SL + TP1 + TP2 on Bybit
-    - if exact repair still fails after the short grace window, the position is force-closed
+    - if exact repair still fails after the grace window, the position is force-closed
     """
     out = {
         'symbol': _bybit_linear_symbol(_pos_symbol(live_pos)),
@@ -8388,7 +8388,7 @@ def db_init():
         risk_value REAL DEFAULT 1.0,
         daily_cap_mode TEXT DEFAULT 'percent',
         daily_cap_value REAL DEFAULT 3.0,
-        max_trades_day INTEGER DEFAULT 3,
+        max_trades_day INTEGER DEFAULT 100,
         notify_on INTEGER DEFAULT 0,
 
         sessions_enabled TEXT DEFAULT '',
@@ -22540,7 +22540,7 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- emailgap: {int(user['email_gap_min'])} min\n"
             f"- emaildaycap: {int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0 = unlimited)\n\n"
             f"Set examples:\n"
-            f"/limits maxtrades 5\n"
+            f"/limits maxtrades 100\n"
             f"/limits emailcap 0\n"
             f"/limits emailgap 60\n"
             f"/limits emaildaycap 0\n"
@@ -22555,8 +22555,8 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if key == "maxtrades":
-        if not (1 <= val <= 50):
-            await update.message.reply_text("maxtrades must be 1..50")
+        if not (1 <= val <= 100):
+            await update.message.reply_text("maxtrades must be 1..100")
             return
         update_user(uid, max_trades_day=val)
         await update.message.reply_text(f"✅ maxtrades/day set to {val}")
