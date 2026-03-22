@@ -1472,6 +1472,7 @@ DEFAULT_RISK_VALUE = 1.5
 DEFAULT_DAILY_CAP_MODE = "PCT"
 DEFAULT_DAILY_CAP_VALUE = 5.0
 DEFAULT_MAX_TRADES_DAY = 100
+LEGACY_DEFAULT_MAX_TRADES_DAY = 50  # older deployments persisted 50 for the owner row
 DEFAULT_MIN_EMAIL_GAP_MIN = 30
 
 # Backward-compat alias
@@ -4997,6 +4998,8 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     open_positions_now = 0
     inherited_open_positions = 0
     opened_today_count = 0
+    journal_opened_today_count = 0
+    lifecycle_opened_today_count = 0
     closed_today_count = 0
     closed_today_rows = []
     position_classifications = []
@@ -5005,13 +5008,31 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT COUNT(*) FROM autotrade_trades WHERE uid=? AND opened_ts>=? AND opened_ts<?",
+                "SELECT COUNT(DISTINCT trade_id) FROM autotrade_trades WHERE uid=? AND opened_ts>=? AND opened_ts<?",
                 (int(uid), int(start_ts), int(end_ts)),
             )
             row = cur.fetchone()
-            opened_today_count = int((row[0] if row else 0) or 0)
+            journal_opened_today_count = int((row[0] if row else 0) or 0)
     except Exception:
-        opened_today_count = 0
+        journal_opened_today_count = 0
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT COUNT(DISTINCT COALESCE(NULLIF(trade_id,''), NULLIF(setup_id,'')))
+                FROM admin_setup_lifecycle
+                WHERE uid=? AND executed_ts>=? AND executed_ts<?
+                """,
+                (int(uid), float(start_ts), float(end_ts)),
+            )
+            row = cur.fetchone()
+            lifecycle_opened_today_count = int((row[0] if row else 0) or 0)
+    except Exception:
+        lifecycle_opened_today_count = 0
+
+    opened_today_count = max(int(journal_opened_today_count), int(lifecycle_opened_today_count))
     try:
         closed_today_rows = _autotrade_closed_activity_rows_window(int(uid), float(start_ts), float(end_ts)) or []
         closed_today_count = int(len(closed_today_rows))
@@ -5100,11 +5121,12 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         # anchored trading day. Carried exposure is shown separately but must not consume
         # today's new-trade budget again.
         live_open_risk_charged_today = float(current_day_open_risk)
-        # Keep the day-open count anchored to confirmed current-day opens, but if the
-        # local journal is incomplete, never understate day activity versus confirmed
-        # exchange closes plus current-day live positions.
+        # IMPORTANT: max_trades_day must count actual positions opened inside the trading
+        # day, not Bybit close events. A single trade can emit multiple close rows because
+        # TP1/TP2 are partial exits. Counting closes here would falsely exhaust the daily
+        # trade cap. Use journal/lifecycle opens as the base and only fall back to the
+        # number of confirmed current-day live positions when the local journal is behind.
         opened_today_count = max(int(opened_today_count), int(current_day_open_positions))
-        opened_today_count = max(int(opened_today_count), int(closed_today_count) + int(current_day_open_positions))
     else:
         open_positions_now = len(journal_open)
         for t in journal_open:
@@ -6276,9 +6298,9 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         live_open_count = 0
     try:
-        max_trades_day = int((get_user(uid) or {}).get('max_trades_day') or 0)
+        max_trades_day = int(_effective_max_trades_day(get_user(uid) or {}))
     except Exception:
-        max_trades_day = 0
+        max_trades_day = int(DEFAULT_MAX_TRADES_DAY)
     try:
         opened_today_count = int(mday.get('opened_today_count') or 0)
     except Exception:
@@ -8845,6 +8867,60 @@ def _order_sessions(xs: List[str]) -> List[str]:
             cleaned.append(x)
     return [s for s in SESSION_PRIORITY if s in cleaned]
 
+def _normalize_max_trades_day_value(raw: Any, fallback: int | None = None) -> int:
+    """Return a safe max_trades_day integer.
+
+    Notes:
+    - New default is 100.
+    - Older DB rows may still persist the legacy default 50.
+    - Keep invalid / blank / zero values from silently throttling autotrade.
+    """
+    fb = int(fallback if fallback is not None else DEFAULT_MAX_TRADES_DAY)
+    try:
+        val = int(float(raw))
+    except Exception:
+        val = 0
+    if val <= 0:
+        return int(fb)
+    return int(val)
+
+
+def _effective_max_trades_day(user: dict | None, persist: bool = False) -> int:
+    """Return the effective per-day trade cap used by autotrade.
+
+    Safety rules:
+    - blank/invalid/zero => use current default
+    - autotrade owner still on legacy default 50 => auto-upgrade to 100
+      so live execution is not silently blocked by an old persisted default
+    """
+    user = dict(user or {})
+    uid = int(user.get('user_id') or 0)
+    raw = user.get('max_trades_day')
+    val = _normalize_max_trades_day_value(raw, DEFAULT_MAX_TRADES_DAY)
+
+    owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+    should_upgrade_legacy_owner = bool(
+        uid > 0
+        and owner_uid > 0
+        and uid == owner_uid
+        and int(val) == int(LEGACY_DEFAULT_MAX_TRADES_DAY)
+        and int(DEFAULT_MAX_TRADES_DAY) != int(LEGACY_DEFAULT_MAX_TRADES_DAY)
+    )
+
+    target = int(DEFAULT_MAX_TRADES_DAY) if should_upgrade_legacy_owner else int(val)
+
+    if persist and uid > 0:
+        try:
+            current_val = int(float(raw))
+        except Exception:
+            current_val = None
+        if current_val != target:
+            try:
+                update_user(uid, max_trades_day=int(target))
+            except Exception:
+                pass
+    return int(target)
+
 def get_user(user_id: int) -> dict:
     con = db_connect()
     cur = con.cursor()
@@ -8891,8 +8967,13 @@ def get_user(user_id: int) -> dict:
         cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
         row = cur.fetchone()
 
+    user = dict(row) if row else {}
     con.close()
-    return dict(row)
+
+    if user:
+        eff_max_trades = _effective_max_trades_day(user, persist=True)
+        user['max_trades_day'] = int(eff_max_trades)
+    return user
 
 # =========================================================
 # ACCESS CONTROL (FREE TRIAL + PAYWALL)
