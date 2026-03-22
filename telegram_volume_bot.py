@@ -1658,6 +1658,8 @@ AUTOTRADE_EXIT_ENFORCE_EXACT = str(os.environ.get("AUTOTRADE_EXIT_ENFORCE_EXACT"
 AUTOTRADE_EXIT_FORCE_CLOSE_UNTRACKED = str(os.environ.get("AUTOTRADE_EXIT_FORCE_CLOSE_UNTRACKED", "1")).strip().lower() in ("1", "true", "yes", "on")
 AUTOTRADE_EXIT_RESOLVE_LOOKBACK_DAYS = int(os.environ.get("AUTOTRADE_EXIT_RESOLVE_LOOKBACK_DAYS", "21") or 21)
 AUTOTRADE_EXIT_MATCH_ENTRY_TOL_PCT = float(os.environ.get("AUTOTRADE_EXIT_MATCH_ENTRY_TOL_PCT", "3.0") or 3.0)
+AUTOTRADE_EXIT_PROTECTION_GRACE_SEC = float(os.environ.get("AUTOTRADE_EXIT_PROTECTION_GRACE_SEC", "120") or 120.0)
+AUTOTRADE_EXIT_PROTECTION_GRACE_SEC = max(0.0, min(600.0, AUTOTRADE_EXIT_PROTECTION_GRACE_SEC))
 
 # Bybit V5 keys (required for live)
 BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
@@ -2719,13 +2721,55 @@ def _autotrade_resolve_expected_trade_row_for_live_position(uid: int, live_pos: 
     return {}
 
 
+def _autotrade_exit_stack_grace_state(trade_row: dict | None = None, live_pos: dict | None = None, start_ts: float | None = None, now_ts: float | None = None) -> dict:
+    """Return whether a live position is still inside the short protection-reconciliation grace window.
+
+    Purpose:
+    - prevent brand-new positions from being force-closed only because Bybit has not yet
+      surfaced the exact SL/TP stack
+    - keep the strict exact-exit rule after the grace window expires
+    """
+    now_ts = float(now_ts or time.time())
+    grace_sec = float(AUTOTRADE_EXIT_PROTECTION_GRACE_SEC or 0.0)
+    candidates: list[float] = []
+
+    def _push(v):
+        try:
+            vv = float(v or 0.0)
+            if vv > 0:
+                candidates.append(vv)
+        except Exception:
+            pass
+
+    if isinstance(trade_row, dict):
+        _push(trade_row.get('opened_ts'))
+        _push(trade_row.get('executed_ts'))
+        _push(trade_row.get('attempted_ts'))
+    if isinstance(live_pos, dict):
+        _push(_ts_seconds_from_any(live_pos.get('createdTime') or live_pos.get('created_time')))
+        _push(_ts_seconds_from_any(live_pos.get('updatedTime') or live_pos.get('updated_time')))
+    _push(start_ts)
+
+    base_ts = max(candidates) if candidates else 0.0
+    within = bool(grace_sec > 0 and base_ts > 0 and now_ts < (base_ts + grace_sec))
+    remaining = max(0.0, (base_ts + grace_sec) - now_ts) if base_ts > 0 and grace_sec > 0 else 0.0
+    return {
+        'enabled': bool(grace_sec > 0),
+        'grace_sec': float(grace_sec),
+        'base_ts': float(base_ts or 0.0),
+        'within_grace': bool(within),
+        'remaining_sec': float(remaining),
+        'deadline_ts': float((base_ts + grace_sec) if base_ts > 0 and grace_sec > 0 else 0.0),
+    }
+
+
 def _autotrade_manage_live_position_protection(uid: int, live_pos: dict, cached_open_rows: list[dict] | None = None, force_close_untracked: bool | None = None) -> dict:
     """Hard watchdog for every open Bybit position.
 
     Rules enforced:
     - every live position must resolve back to one emailed/bot setup
     - every resolved position must show exact SL + TP1 + TP2 on Bybit
-    - if exact repair fails, the position is force-closed immediately
+    - if exact repair still fails after the short grace window, the position is force-closed
     """
     out = {
         'symbol': _bybit_linear_symbol(_pos_symbol(live_pos)),
@@ -2736,6 +2780,9 @@ def _autotrade_manage_live_position_protection(uid: int, live_pos: dict, cached_
         'repair_passes': 0,
         'forced_close': None,
         'forced_close_reason': '',
+        'grace_active': False,
+        'grace_remaining_sec': 0.0,
+        'grace_until_ts': 0.0,
         'exact_status': {},
     }
     try:
@@ -2746,6 +2793,13 @@ def _autotrade_manage_live_position_protection(uid: int, live_pos: dict, cached_
             return out
         repair_trade_row = _autotrade_resolve_expected_trade_row_for_live_position(int(uid), live_pos, cached_open_rows=cached_open_rows)
         if not repair_trade_row:
+            grace = _autotrade_exit_stack_grace_state(live_pos=live_pos)
+            if bool(grace.get('within_grace')):
+                out['forced_close_reason'] = 'untracked_live_position_grace'
+                out['grace_active'] = True
+                out['grace_remaining_sec'] = float(grace.get('remaining_sec') or 0.0)
+                out['grace_until_ts'] = float(grace.get('deadline_ts') or 0.0)
+                return out
             out['forced_close_reason'] = 'untracked_live_position_no_setup_match'
             if bool(AUTOTRADE_EXIT_FORCE_CLOSE_UNTRACKED if force_close_untracked is None else force_close_untracked):
                 out['forced_close'] = _autotrade_force_close_live_position(sym, side, qty=abs(float(_pos_size(live_pos) or 0.0)))
@@ -2812,6 +2866,14 @@ def _autotrade_manage_live_position_protection(uid: int, live_pos: dict, cached_
         )
         out['exact_status'] = exact_status
         if bool(exact_status.get('exact_ok')):
+            return out
+
+        grace = _autotrade_exit_stack_grace_state(repair_trade_row, live_pos=live_pos)
+        if bool(grace.get('within_grace')):
+            out['forced_close_reason'] = 'live_exit_stack_not_exact_grace'
+            out['grace_active'] = True
+            out['grace_remaining_sec'] = float(grace.get('remaining_sec') or 0.0)
+            out['grace_until_ts'] = float(grace.get('deadline_ts') or 0.0)
             return out
 
         out['forced_close_reason'] = 'live_exit_stack_not_exact_watchdog'
@@ -6530,6 +6592,22 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         sl_res = None
         sl_res_retry = None
         protection_pending = False
+        protection_grace_start_ts = float(time.time())
+
+        def _record_live_open(lifecycle_reason: str = 'live_opened'):
+            qty_for_db_local = tp_base_qty if tp_base_qty > 0 else qty
+            s_live_local = replace(s,
+                tp1=float(exit_plan.get('effective_tp1') or live_partial_tp or getattr(s, 'tp1', 0.0) or 0.0),
+                tp2=float(live_tp2 or getattr(s, 'tp2', 0.0) or getattr(s, 'tp3', 0.0) or 0.0),
+                tp3=float(live_tp3 or getattr(s, 'tp3', 0.0) or getattr(s, 'tp2', 0.0) or 0.0),
+            )
+            trade_id_local = _autotrade_db_add_trade(uid, session_label, s_live_local, qty_for_db_local, lifecycle_state='executed_open', lifecycle_reason=str(lifecycle_reason or 'live_opened'))
+            _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id_local)
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id_local), bybit_position_symbol=str(sym or ''), state='executed_open', last_reason=str(lifecycle_reason or 'live_opened'))
+            except Exception:
+                pass
+            return trade_id_local, qty_for_db_local, s_live_local
 
         if final_pos and tp_base_qty > 0:
             _autotrade_cancel_reduce_only_tp_orders(sym, side=side)
@@ -6570,8 +6648,12 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 time.sleep(0.55)
                 final_pos = _autotrade_find_live_position(sym, side=side) or final_pos
                 final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results, expected_sl_results=[sl_res, sl_res_retry])
-                live_qty_after = abs(float(_pos_size(final_pos) or 0.0)) if final_pos else 0.0
-                fc_res = _autotrade_force_close_live_position(sym, side, qty=(live_qty_after if live_qty_after > 0 else tp_base_qty))
+                protection_pending = True
+                grace = _autotrade_exit_stack_grace_state(
+                    {'executed_ts': protection_grace_start_ts, 'opened_ts': protection_grace_start_ts},
+                    live_pos=final_pos,
+                    start_ts=protection_grace_start_ts,
+                )
                 try:
                     _LAST_AUTOTRADE_DETAIL[int(uid)].update({
                         'tp_targets_live': tp_targets_live,
@@ -6582,17 +6664,11 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                         'sl_stack_ok': bool(sl_stack_ok),
                         'tp_stack_ok': bool(tp_stack_ok),
                         'pending_repair': pending_repair,
-                        'exit_stack_force_close': fc_res,
-                        'reject_reason': 'live_exit_stack_incomplete',
+                        'exit_stack_grace': grace,
+                        'warning': 'live_exit_stack_incomplete_within_grace',
                     })
                 except Exception:
                     pass
-                _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_exit_stack_incomplete')
-                try:
-                    _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason='live_exit_stack_incomplete')
-                except Exception:
-                    pass
-                return (False, 'live_exit_stack_incomplete')
         else:
             try:
                 _LAST_AUTOTRADE_DETAIL[int(uid)].update({
@@ -6662,6 +6738,24 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             pass
 
         if not bool(exact_status.get('exact_ok')):
+            grace = _autotrade_exit_stack_grace_state(
+                repair_trade_row,
+                live_pos=final_pos,
+                start_ts=protection_grace_start_ts,
+            )
+            if bool(grace.get('within_grace')):
+                try:
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                        'exact_exit_status': exact_status,
+                        'exit_stack_grace': grace,
+                        'warning': 'live_exit_stack_not_exact_within_grace',
+                    })
+                except Exception:
+                    pass
+                trade_id, qty_for_db, s_live = _record_live_open('live_open_exit_grace')
+                suffix = ' corrected_for_post_fill_risk' if corrected else ''
+                return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty_for_db:.8g} SL={sl_for_order} TP1={live_partial_tp:g} TP2={live_tp2:g}{suffix} | exit stack pending verify ({int(round(float(grace.get('remaining_sec') or 0.0)))}s grace)")
+
             live_qty_for_close = abs(float(_pos_size(final_pos) or 0.0)) if final_pos else float(tp_base_qty if tp_base_qty > 0 else qty)
             fc_res = _autotrade_force_close_live_position(sym, side, qty=live_qty_for_close)
             try:
@@ -6678,18 +6772,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 pass
             return (False, 'live_exit_stack_not_exact')
 
-        qty_for_db = tp_base_qty if tp_base_qty > 0 else qty
-        s_live = replace(s,
-            tp1=float(exit_plan.get('effective_tp1') or live_partial_tp or getattr(s, 'tp1', 0.0) or 0.0),
-            tp2=float(live_tp2 or getattr(s, 'tp2', 0.0) or getattr(s, 'tp3', 0.0) or 0.0),
-            tp3=float(live_tp3 or getattr(s, 'tp3', 0.0) or getattr(s, 'tp2', 0.0) or 0.0),
-        )
-        trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened')
-        _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
-        try:
-            _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='executed_open', last_reason='live_opened')
-        except Exception:
-            pass
+        trade_id, qty_for_db, s_live = _record_live_open('live_opened')
         suffix = ' corrected_for_post_fill_risk' if corrected else ''
         return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty_for_db:.8g} SL={sl_for_order} TP1={live_partial_tp:g} TP2={live_tp2:g}{suffix}")
 
