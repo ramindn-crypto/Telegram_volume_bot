@@ -1651,13 +1651,14 @@ AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY = float(os.environ.get("AUTOTRADE_BE_AFTER_TP
 AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT = float(os.environ.get("AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT", "6.0") or 6.0)
 AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS", "NY,LON") or "NY,LON").upper().replace(' ', '').split(','))
 AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES = set(str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES", "A,C") or "A,C").upper().replace(' ', '').split(','))
+AUTOTRADE_BE_AFTER_TP1_REQUIRE_FILTERS = str(os.environ.get("AUTOTRADE_BE_AFTER_TP1_REQUIRE_FILTERS", "0")).strip().lower() in ("1", "true", "yes", "on")
 # Live market-order entries must still stay close to the setup entry. Otherwise the bot can
 # execute a stale emailed setup at a materially worse price just because it is still inside
 # the time window. This guard keeps the email/setup engine and live execution aligned.
 AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "0.50") or 0.50)
 AUTOTRADE_EXIT_ENFORCE_EXACT = str(os.environ.get("AUTOTRADE_EXIT_ENFORCE_EXACT", "1")).strip().lower() in ("1", "true", "yes", "on")
-AUTOTRADE_EXIT_FORCE_CLOSE_UNTRACKED = str(os.environ.get("AUTOTRADE_EXIT_FORCE_CLOSE_UNTRACKED", "1")).strip().lower() in ("1", "true", "yes", "on")
-AUTOTRADE_EXIT_RESOLVE_LOOKBACK_DAYS = int(os.environ.get("AUTOTRADE_EXIT_RESOLVE_LOOKBACK_DAYS", "21") or 21)
+AUTOTRADE_EXIT_FORCE_CLOSE_UNTRACKED = str(os.environ.get("AUTOTRADE_EXIT_FORCE_CLOSE_UNTRACKED", "0")).strip().lower() in ("1", "true", "yes", "on")
+AUTOTRADE_EXIT_RESOLVE_LOOKBACK_DAYS = int(os.environ.get("AUTOTRADE_EXIT_RESOLVE_LOOKBACK_DAYS", "45") or 45)
 AUTOTRADE_EXIT_MATCH_ENTRY_TOL_PCT = float(os.environ.get("AUTOTRADE_EXIT_MATCH_ENTRY_TOL_PCT", "3.0") or 3.0)
 AUTOTRADE_EXIT_PROTECTION_GRACE_SEC = float(os.environ.get("AUTOTRADE_EXIT_PROTECTION_GRACE_SEC", "600") or 600.0)
 AUTOTRADE_EXIT_PROTECTION_GRACE_SEC = max(0.0, min(600.0, AUTOTRADE_EXIT_PROTECTION_GRACE_SEC))
@@ -2383,29 +2384,34 @@ def _be_min_quality_for_session(session_name: str) -> float:
     return float(AUTOTRADE_BE_AFTER_TP1_MIN_QUALITY)
 
 
-def _backtest_should_move_sl_to_be_after_tp1(setup: "Setup", session_name: str) -> bool:
-    """Mirror the live conditional TP1 -> break-even rule inside historical simulation.
+def _autotrade_should_apply_be_after_tp1(trade_like, session_name: str | None = None) -> bool:
+    """Whether live autotrade should move the stop to break-even after TP1.
 
-    Universe/backtest results should reflect the same intent as live execution:
-    - do NOT force BE after TP1 on every setup
-    - only apply it for higher-quality setups in the allowed sessions / engines
-    - keep the decision bounded to setup fields already stored on the signal
+    Default behavior is now trader-friendly and simple: once TP1 is taken, move SL to
+    entry unless the owner explicitly re-enables the older quality/session filters via
+    AUTOTRADE_BE_AFTER_TP1_REQUIRE_FILTERS=1.
     """
     try:
         if not AUTOTRADE_BE_AFTER_TP1_ENABLED:
             return False
-        sess = str(session_name or '').upper().strip()
-        conf = int(float(getattr(setup, 'conf', 0) or 0) or 0)
-        quality_score = float(getattr(setup, 'quality_score', 0.0) or 0.0)
-        atr_pct = float(getattr(setup, 'atr_pct', 0.0) or 0.0)
+        if not AUTOTRADE_BE_AFTER_TP1_REQUIRE_FILTERS:
+            return True
+        if isinstance(trade_like, dict):
+            getter = trade_like.get
+        else:
+            getter = lambda k, d=None: getattr(trade_like, k, d)
+        sess = str(session_name or getter('session', '') or '').upper().strip()
+        conf = int(float(getter('conf', 0) or 0) or 0)
+        quality_score = float(getter('quality_score', 0.0) or 0.0)
+        atr_pct = float(getter('atr_pct', 0.0) or 0.0)
         if atr_pct <= 0:
             try:
-                entry = float(getattr(setup, 'entry', 0.0) or 0.0)
-                atr_1h = float(getattr(setup, 'atr_1h', 0.0) or 0.0)
+                entry = float(getter('entry', 0.0) or 0.0)
+                atr_1h = float(getter('atr_1h', 0.0) or 0.0)
                 atr_pct = ((atr_1h / entry) * 100.0) if entry > 0 and atr_1h > 0 else 0.0
             except Exception:
                 atr_pct = 0.0
-        engine = str(getattr(setup, 'engine', '') or '').upper().strip()
+        engine = str(getter('engine', '') or '').upper().strip()
         return bool(
             conf >= int(AUTOTRADE_BE_AFTER_TP1_MIN_CONF)
             and quality_score >= float(_be_min_quality_for_session(sess))
@@ -2413,6 +2419,14 @@ def _backtest_should_move_sl_to_be_after_tp1(setup: "Setup", session_name: str) 
             and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS or sess in AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS)
             and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES or engine in AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES)
         )
+    except Exception:
+        return False
+
+
+def _backtest_should_move_sl_to_be_after_tp1(setup: "Setup", session_name: str) -> bool:
+    """Mirror the live TP1 -> break-even rule inside historical simulation."""
+    try:
+        return bool(_autotrade_should_apply_be_after_tp1(setup, session_name=session_name))
     except Exception:
         return False
 
@@ -2488,13 +2502,8 @@ def _autotrade_expected_live_exit_state(trade_row: dict, live_pos: dict | None =
             except Exception:
                 tp1_order_still_open = False
             tp1_hit = bool((live_qty <= qty_drop_threshold) or (qty_reduced and not tp1_order_still_open))
-            be_allowed = (
-                conf >= int(AUTOTRADE_BE_AFTER_TP1_MIN_CONF)
-                and quality_score >= float(_be_min_quality_for_session(sess))
-                and (atr_pct <= float(AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT) if atr_pct > 0 else True)
-                and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS or sess in AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS)
-                and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES or engine in AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES)
-            )
+            if tp1_hit:
+                be_allowed = bool(_autotrade_should_apply_be_after_tp1(trade_row, session_name=sess))
 
         desired_sl = float(entry) if (tp1_hit and be_allowed and entry > 0) else float(trade_row.get('sl') or 0.0)
         if tp1_hit:
@@ -2805,6 +2814,7 @@ def _autotrade_manage_live_position_protection(uid: int, live_pos: dict, cached_
                 out['grace_until_ts'] = float(grace.get('deadline_ts') or 0.0)
                 return out
             out['forced_close_reason'] = 'untracked_live_position_no_setup_match'
+            out['monitor_only'] = True
             if bool(AUTOTRADE_EXIT_FORCE_CLOSE_UNTRACKED if force_close_untracked is None else force_close_untracked):
                 out['forced_close'] = _autotrade_force_close_live_position(sym, side, qty=abs(float(_pos_size(live_pos) or 0.0)))
             return out
@@ -3991,13 +4001,8 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
             except Exception:
                 tp1_order_still_open = False
             tp1_hit = bool((live_qty <= qty_drop_threshold) or (qty_reduced and not tp1_order_still_open))
-            be_allowed = (
-                conf >= int(AUTOTRADE_BE_AFTER_TP1_MIN_CONF)
-                and quality_score >= float(_be_min_quality_for_session(sess))
-                and (atr_pct <= float(AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT) if atr_pct > 0 else True)
-                and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS or sess in AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS)
-                and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES or engine in AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES)
-            )
+            if tp1_hit:
+                be_allowed = bool(_autotrade_should_apply_be_after_tp1(trade_row, session_name=sess))
 
         desired_sl = float(entry) if (tp1_hit and be_allowed and entry > 0) else float(target_sl)
         if tp1_hit:
@@ -6912,8 +6917,16 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         sl_res_retry = None
         protection_pending = False
         protection_grace_start_ts = float(time.time())
+        persisted_live_open = {'trade_id': '', 'qty_for_db': 0.0, 's_live': None}
 
         def _record_live_open(lifecycle_reason: str = 'live_opened'):
+            if persisted_live_open.get('trade_id'):
+                _autotrade_exec_mark(reserved_keys, 'PLACED', str(persisted_live_open.get('trade_id') or ''))
+                return (
+                    str(persisted_live_open.get('trade_id') or ''),
+                    float(persisted_live_open.get('qty_for_db') or 0.0),
+                    persisted_live_open.get('s_live'),
+                )
             qty_for_db_local = tp_base_qty if tp_base_qty > 0 else qty
             s_live_local = replace(s,
                 tp1=float(exit_plan.get('effective_tp1') or live_partial_tp or getattr(s, 'tp1', 0.0) or 0.0),
@@ -6921,6 +6934,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 tp3=float(live_tp3 or getattr(s, 'tp3', 0.0) or getattr(s, 'tp2', 0.0) or 0.0),
             )
             trade_id_local = _autotrade_db_add_trade(uid, session_label, s_live_local, qty_for_db_local, lifecycle_state='executed_open', lifecycle_reason=str(lifecycle_reason or 'live_opened'))
+            persisted_live_open.update({'trade_id': str(trade_id_local or ''), 'qty_for_db': float(qty_for_db_local or 0.0), 's_live': s_live_local})
             _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id_local)
             try:
                 _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id_local), bybit_position_symbol=str(sym or ''), state='executed_open', last_reason=str(lifecycle_reason or 'live_opened'))
@@ -6929,6 +6943,10 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             return trade_id_local, qty_for_db_local, s_live_local
 
         if final_pos and tp_base_qty > 0:
+            try:
+                _record_live_open('live_open_pending_protection')
+            except Exception:
+                pass
             _autotrade_cancel_reduce_only_tp_orders(sym, side=side)
             _autotrade_cancel_reduce_only_sl_orders(sym, side=side)
             _autotrade_clear_position_full_tp_sl(sym)
@@ -29098,11 +29116,14 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 if repaired:
                     managed_closed = sum(1 for x in repaired if bool(x.get('forced_close')))
                     managed_untracked = sum(1 for x in repaired if str(x.get('forced_close_reason') or '') == 'untracked_live_position_no_setup_match')
+                    managed_monitor_only = sum(1 for x in repaired if bool(x.get('monitor_only')) and not bool(x.get('forced_close')))
                     reason_txt = f"managed_live_exits ({len(repaired)})"
                     if managed_closed > 0:
                         reason_txt += f" | force_closed_unprotected={managed_closed}"
                     if managed_untracked > 0:
                         reason_txt += f" | force_closed_untracked={managed_untracked}"
+                    if managed_monitor_only > 0:
+                        reason_txt += f" | monitor_only={managed_monitor_only}"
                     _LAST_AUTOTRADE_DECISION[uid] = {
                         "status": "MANAGED",
                         "when": now_utc.isoformat(timespec="seconds"),
