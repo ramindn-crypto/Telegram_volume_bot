@@ -1080,7 +1080,7 @@ def _strategy_config_defaults() -> dict:
         "target_setups_per_day_hi": 5.0,
 
         # Self-optimization governance
-        "session_weights": {"NY": 1.0, "LON": 0.0, "ASIA": 0.0},  # optimizer weighting (production bias: NY-only)
+        "session_weights": {"NY": 0.85, "LON": 1.0, "ASIA": 0.0},  # session governance: favour proven LON edge, tighten weak NY, suppress ASIA
         "concentration_cap": 0.25,          # no single symbol >25% of setups (OOS)
         "oos_min_setups": 30,               # minimum OOS sample size across universe before promotion
         "min_win_rate": 70.0,               # enforced only when sample is adequate
@@ -1134,18 +1134,18 @@ def _strategy_config_defaults() -> dict:
         "market_adaptive_days": 30,
         "market_adaptive_max_passes": 2,
         "market_adaptive_min_improvement": 0.35,
-        "market_adaptive_target_setups_per_day_lo": 4.0,
-        "market_adaptive_target_setups_per_day_hi": 10.0,
-        "market_adaptive_session_wr_floor_ny": 46.0,
-        "market_adaptive_session_wr_floor_lon": 48.0,
+        "market_adaptive_target_setups_per_day_lo": 3.0,
+        "market_adaptive_target_setups_per_day_hi": 5.0,
+        "market_adaptive_session_wr_floor_ny": 50.0,
+        "market_adaptive_session_wr_floor_lon": 50.0,
         "market_adaptive_cooldown_hours": 20.0,
 
         # DB-backed runtime profile governance / probation / revert
         "runtime_profile_probation_hours": 72.0,
         "runtime_profile_min_signal_decisions": 12,
         "runtime_profile_min_live_closes": 8,
-        "runtime_profile_revert_wr_floor": 45.0,
-        "runtime_profile_revert_live_wr_floor": 38.0,
+        "runtime_profile_revert_wr_floor": 48.0,
+        "runtime_profile_revert_live_wr_floor": 44.0,
         "runtime_profile_revert_vs_baseline_gap": 3.0,
 
         # Email lane diversification / counter-regime guardrails
@@ -1155,11 +1155,12 @@ def _strategy_config_defaults() -> dict:
         "counter_regime_conf_add": {"NY": 2, "LON": 2, "ASIA": 3},
         "counter_regime_rr_add": {"NY": 0.10, "LON": 0.10, "ASIA": 0.12},
         "execution_asia_enabled": bool(EXECUTION_ASIA_ENABLED),
+        "session_governance_version": 20260323,
         "execution_engine_b_email_enabled": bool(EXECUTION_ENGINE_B_EMAIL_ENABLED),
         "session_exec_overrides": {
-            "NY": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
+            "NY": {"quality_add": 1.0, "conf_add": 1, "rr_add": 0.05},
             "LON": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
-            "ASIA": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
+            "ASIA": {"quality_add": 2.0, "conf_add": 2, "rr_add": 0.10},
         },
     }
 
@@ -1183,6 +1184,10 @@ def load_strategy_config(force: bool = False) -> dict:
         cfg = None
     if not isinstance(cfg, dict):
         cfg = _strategy_config_defaults()
+        save_strategy_config(cfg)
+    migrated = _apply_session_governance_migration(cfg)
+    if migrated != cfg:
+        cfg = migrated
         save_strategy_config(cfg)
     _STRATEGY_CFG_CACHE["ts"] = now
     _STRATEGY_CFG_CACHE["cfg"] = dict(cfg)
@@ -1235,6 +1240,55 @@ def _clamp(v: float, lo: float, hi: float) -> float:
         return max(float(lo), min(float(hi), float(v)))
     except Exception:
         return float(lo)
+
+SESSION_GOVERNANCE_VERSION = 20260323
+
+def _apply_session_governance_migration(cfg: dict) -> dict:
+    """One-way governance migration based on 30d live-equivalent session edge.
+
+    Goals:
+    - favour proven LON edge
+    - tighten NY because recent 30d live-equivalent WR is materially below target
+    - suppress ASIA executable trading by default until it proves positive edge again
+    - keep system-wide setup targets aligned to the user's stated 3-5 setups/day preference
+    """
+    out = json.loads(json.dumps(cfg or {}))
+    try:
+        ver = int(out.get('session_governance_version', 0) or 0)
+    except Exception:
+        ver = 0
+    if ver >= SESSION_GOVERNANCE_VERSION:
+        return out
+
+    out['session_weights'] = {'NY': 0.85, 'LON': 1.0, 'ASIA': 0.0}
+    out['target_setups_per_day_lo'] = 3.0
+    out['target_setups_per_day_hi'] = 5.0
+    out['governor_target_lo'] = 3.0
+    out['governor_target_hi'] = 5.0
+    out['market_adaptive_target_setups_per_day_lo'] = 3.0
+    out['market_adaptive_target_setups_per_day_hi'] = 5.0
+    out['market_adaptive_session_wr_floor_ny'] = max(50.0, float(out.get('market_adaptive_session_wr_floor_ny', 0.0) or 0.0))
+    out['market_adaptive_session_wr_floor_lon'] = max(50.0, float(out.get('market_adaptive_session_wr_floor_lon', 0.0) or 0.0))
+    out['runtime_profile_revert_wr_floor'] = max(48.0, float(out.get('runtime_profile_revert_wr_floor', 0.0) or 0.0))
+    out['runtime_profile_revert_live_wr_floor'] = max(44.0, float(out.get('runtime_profile_revert_live_wr_floor', 0.0) or 0.0))
+    out['execution_asia_enabled'] = False
+
+    sess_ov = out.get('session_exec_overrides') or {}
+    ny = dict(sess_ov.get('NY') or {})
+    lon = dict(sess_ov.get('LON') or {})
+    asia = dict(sess_ov.get('ASIA') or {})
+    ny['quality_add'] = max(1.0, float(ny.get('quality_add', 0.0) or 0.0))
+    ny['conf_add'] = max(1, int(round(float(ny.get('conf_add', 0) or 0))))
+    ny['rr_add'] = max(0.05, float(ny.get('rr_add', 0.0) or 0.0))
+    lon['quality_add'] = float(lon.get('quality_add', 0.0) or 0.0)
+    lon['conf_add'] = int(round(float(lon.get('conf_add', 0) or 0)))
+    lon['rr_add'] = float(lon.get('rr_add', 0.0) or 0.0)
+    asia['quality_add'] = max(2.0, float(asia.get('quality_add', 0.0) or 0.0))
+    asia['conf_add'] = max(2, int(round(float(asia.get('conf_add', 0) or 0))))
+    asia['rr_add'] = max(0.10, float(asia.get('rr_add', 0.0) or 0.0))
+    out['session_exec_overrides'] = {'NY': ny, 'LON': lon, 'ASIA': asia}
+    out['session_governance_version'] = SESSION_GOVERNANCE_VERSION
+    return out
 
 def _cfg_bool(value, default: bool = False) -> bool:
     if isinstance(value, bool):
@@ -1424,9 +1478,9 @@ TREND_24H_TOL = 0.5
 # ✅ Session-based 1H strictness:
 # ASIA = tightest, LON = medium, NY = loosest
 SESSION_1H_BASE_MULT = {
-    "NY": 0.85,
+    "NY": 1.00,
     "LON": 1.00,
-    "ASIA": 1.20,
+    "ASIA": 1.30,
 }
 
 # =========================================================
@@ -1608,7 +1662,7 @@ AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PC
 AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "0") or 0)
 EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
 EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
-EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", True)
+EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", False)
 
 
 # Margin / leverage
@@ -6185,23 +6239,23 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 76,
+    "NY": 78,
     "LON": 76,
-    "ASIA": 80,
+    "ASIA": 84,
 }
 
 SESSION_MIN_RR_FINAL = {
-    "NY": 1.60,
+    "NY": 1.68,
     "LON": 1.62,
-    "ASIA": 1.90,
+    "ASIA": 2.05,
 }
 
 SESSION_MIN_RR_TP3 = SESSION_MIN_RR_FINAL  # legacy compatibility only
 
 SESSION_EMA_PROX_MULT = {
-    "NY": 1.60,
+    "NY": 1.35,
     "LON": 1.40,
-    "ASIA": 1.20,
+    "ASIA": 1.05,
 }
 
 SESSION_EMA_REACTION_LOOKBACK = {
@@ -6224,9 +6278,9 @@ LEADER_BASE_SL_CAP_PCT_ASIA = env_float("LEADER_BASE_SL_CAP_PCT_ASIA", 3.0)
 
 # ✅ 1H trigger loosened per session (overall easier)
 SESSION_TRIGGER_ATR_MULT = {
-    "NY": 0.50,
-    "LON": 0.7,
-    "ASIA": 0.9,
+    "NY": 0.65,
+    "LON": 0.70,
+    "ASIA": 1.00,
 }
 
 # Conservative London-only micro-relief.
@@ -17039,10 +17093,10 @@ def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
     avg_r = float(overall.get('avg_R', 0.0) or 0.0)
     pf = float(overall.get('profit_factor', 0.0) or 0.0)
 
-    lo = float((cfg or {}).get('market_adaptive_target_setups_per_day_lo', 4.0) or 4.0)
-    hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 10.0) or 10.0)
-    ny_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
-    lon_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
+    lo = float((cfg or {}).get('market_adaptive_target_setups_per_day_lo', 3.0) or 3.0)
+    hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 5.0) or 5.0)
+    ny_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_ny', 50.0) or 50.0)
+    lon_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_lon', 50.0) or 50.0)
 
     score = 0.0
     score += float(avg_r) * 320.0
@@ -17124,16 +17178,44 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
     out['tf_align_1h_min_abs'] = float(clamp(float(out.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), tlo, thi))
     out['execution_asia_enabled'] = _cfg_bool(out.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED))
     out['execution_engine_b_email_enabled'] = _cfg_bool(out.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
+    out['session_weights'] = out.get('session_weights') or {'NY': 0.85, 'LON': 1.0, 'ASIA': 0.0}
+    try:
+        sw = out['session_weights']
+        out['session_weights'] = {
+            'NY': float(max(0.50, min(1.20, float(sw.get('NY', 0.85) or 0.85)))),
+            'LON': float(max(0.80, min(1.20, float(sw.get('LON', 1.0) or 1.0)))),
+            'ASIA': float(max(0.0, min(0.40, float(sw.get('ASIA', 0.0) or 0.0)))),
+        }
+    except Exception:
+        out['session_weights'] = {'NY': 0.85, 'LON': 1.0, 'ASIA': 0.0}
+    out['target_setups_per_day_lo'] = float(clamp(float(out.get('target_setups_per_day_lo', 3.0) or 3.0), 2.0, 4.0))
+    out['target_setups_per_day_hi'] = float(clamp(float(out.get('target_setups_per_day_hi', 5.0) or 5.0), 4.0, 6.0))
+    out['governor_target_lo'] = float(clamp(float(out.get('governor_target_lo', out.get('target_setups_per_day_lo', 3.0)) or 3.0), 2.0, 4.0))
+    out['governor_target_hi'] = float(clamp(float(out.get('governor_target_hi', out.get('target_setups_per_day_hi', 5.0)) or 5.0), 4.0, 6.0))
+    out['market_adaptive_target_setups_per_day_lo'] = float(clamp(float(out.get('market_adaptive_target_setups_per_day_lo', 3.0) or 3.0), 2.0, 4.0))
+    out['market_adaptive_target_setups_per_day_hi'] = float(clamp(float(out.get('market_adaptive_target_setups_per_day_hi', 5.0) or 5.0), 4.0, 6.0))
+    out['market_adaptive_session_wr_floor_ny'] = float(clamp(float(out.get('market_adaptive_session_wr_floor_ny', 50.0) or 50.0), 48.0, 60.0))
+    out['market_adaptive_session_wr_floor_lon'] = float(clamp(float(out.get('market_adaptive_session_wr_floor_lon', 50.0) or 50.0), 49.0, 62.0))
+    out['runtime_profile_revert_wr_floor'] = float(clamp(float(out.get('runtime_profile_revert_wr_floor', 48.0) or 48.0), 46.0, 60.0))
+    out['runtime_profile_revert_live_wr_floor'] = float(clamp(float(out.get('runtime_profile_revert_live_wr_floor', 44.0) or 44.0), 42.0, 58.0))
     sess_ov = out.get('session_exec_overrides') or {}
     norm_ov = {}
     for sess in ('NY', 'LON', 'ASIA'):
         row = sess_ov.get(sess) or {}
-        norm_ov[sess] = {
-            'quality_add': float(clamp(float(row.get('quality_add', 0.0) or 0.0), -6.0, 6.0)),
-            'conf_add': int(max(-4, min(6, int(round(float(row.get('conf_add', 0) or 0)))))),
-            'rr_add': float(clamp(float(row.get('rr_add', 0.0) or 0.0), -0.30, 0.40)),
-        }
+        q = float(clamp(float(row.get('quality_add', 0.0) or 0.0), -6.0, 6.0))
+        c = int(max(-4, min(6, int(round(float(row.get('conf_add', 0) or 0))))))
+        r = float(clamp(float(row.get('rr_add', 0.0) or 0.0), -0.30, 0.40))
+        if sess == 'NY':
+            q = max(1.0, q)
+            c = max(1, c)
+            r = max(0.05, r)
+        elif sess == 'ASIA':
+            q = max(2.0, q)
+            c = max(2, c)
+            r = max(0.10, r)
+        norm_ov[sess] = {'quality_add': q, 'conf_add': c, 'rr_add': r}
     out['session_exec_overrides'] = norm_ov
+    out['session_governance_version'] = max(int(out.get('session_governance_version', 0) or 0), SESSION_GOVERNANCE_VERSION)
     return out
 
 
@@ -17150,14 +17232,14 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
     wr = float(overall.get('win_rate', 0.0) or 0.0)
     avg_r = float(overall.get('avg_R', 0.0) or 0.0)
     total_setups = int(overall.get('setups', 0) or 0)
-    lo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 4.0) or 4.0)
-    hi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 10.0) or 10.0)
-    ny_floor = float(cfg.get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
-    lon_floor = float(cfg.get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
+    lo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 3.0) or 3.0)
+    hi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 5.0) or 5.0)
+    ny_floor = float(cfg.get('market_adaptive_session_wr_floor_ny', 50.0) or 50.0)
+    lon_floor = float(cfg.get('market_adaptive_session_wr_floor_lon', 50.0) or 50.0)
 
     if _cfg_bool(cfg.get('execution_asia_enabled', False), False):
         asia = (per_session or {}).get('ASIA') or {}
-        if int(asia.get('setups', 0) or 0) >= 10 and float(asia.get('win_rate', 0.0) or 0.0) < 44.0:
+        if int(asia.get('setups', 0) or 0) >= 6 and float(asia.get('win_rate', 0.0) or 0.0) < 46.0:
             _market_adaptive_apply_action(cfg, actions, 'execution_asia_enabled', False, 'ASIA_30d_live_WR_too_low')
             notes.append('Disabled ASIA executable lane due to weak 30d live-equivalent session edge.')
 
@@ -17167,9 +17249,12 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
         s_wr = float(sd.get('win_rate', 0.0) or 0.0)
         ov = ((cfg.get('session_exec_overrides') or {}).get(sess) or {}).copy()
         if s_setups >= 15 and s_wr < floor:
-            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.quality_add', round(float(ov.get('quality_add', 0.0) or 0.0) + 0.75, 2), f'{sess}_WR_below_floor')
-            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.conf_add', int(float(ov.get('conf_add', 0) or 0)) + 1, f'{sess}_WR_below_floor')
-            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.rr_add', round(float(ov.get('rr_add', 0.0) or 0.0) + 0.03, 3), f'{sess}_WR_below_floor')
+            q_step = 1.00 if sess == 'NY' else 0.75
+            c_step = 2 if sess == 'NY' else 1
+            rr_step = 0.05 if sess == 'NY' else 0.03
+            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.quality_add', round(float(ov.get('quality_add', 0.0) or 0.0) + q_step, 2), f'{sess}_WR_below_floor')
+            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.conf_add', int(float(ov.get('conf_add', 0) or 0)) + c_step, f'{sess}_WR_below_floor')
+            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.rr_add', round(float(ov.get('rr_add', 0.0) or 0.0) + rr_step, 3), f'{sess}_WR_below_floor')
             notes.append(f'{sess} live-equivalent WR is below the configured floor; tightened that session only.')
         elif s_setups >= 12 and s_wr > (floor + 8.0) and setups_day < lo:
             _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.quality_add', round(float(ov.get('quality_add', 0.0) or 0.0) - 0.50, 2), f'{sess}_WR_strong_but_flow_low')
@@ -17426,8 +17511,8 @@ def _runtime_profile_review_probation(uid: int | None = None, force: bool = Fals
     cfg = load_strategy_config(force=False)
     min_sig = int((cfg or {}).get('runtime_profile_min_signal_decisions', 12) or 12)
     min_live = int((cfg or {}).get('runtime_profile_min_live_closes', 8) or 8)
-    wr_floor = float((cfg or {}).get('runtime_profile_revert_wr_floor', 45.0) or 45.0)
-    live_floor = float((cfg or {}).get('runtime_profile_revert_live_wr_floor', 38.0) or 38.0)
+    wr_floor = float((cfg or {}).get('runtime_profile_revert_wr_floor', 48.0) or 48.0)
+    live_floor = float((cfg or {}).get('runtime_profile_revert_live_wr_floor', 44.0) or 44.0)
     gap = float((cfg or {}).get('runtime_profile_revert_vs_baseline_gap', 3.0) or 3.0)
     since_ts = float(cur.get('applied_ts') or cur.get('created_ts') or time.time())
     probation_until = float(cur.get('probation_until_ts') or 0.0)
@@ -18011,11 +18096,11 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """Session-aware production thresholds with config-driven runtime overrides."""
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 80.5, 85, 1.65
+        quality, conf, rr = 81.5, 86, 1.70
     elif sess == "LON":
         quality, conf, rr = 80.0, 84, 1.62
     elif sess == "ASIA":
-        quality, conf, rr = 86.0, 88, 1.78
+        quality, conf, rr = 88.0, 90, 1.95
     else:
         quality, conf, rr = 80.0, 84, 1.62
 
@@ -18091,11 +18176,11 @@ def is_executable_setup_eligible(
         ch1_abs = abs(float(getattr(s, "ch1", 0.0) or 0.0))
 
         if sess == "NY":
-            if pb_dist > 0.74 and (score < (score_floor + 3.0) or conf < (conf_floor + 2)):
+            if pb_dist > 0.68 and (score < (score_floor + 3.5) or conf < (conf_floor + 2)):
                 return (False, "ny_entry_too_far_from_ema")
-            if ch15_abs > 0.88 and pb_dist > 0.66:
+            if ch15_abs > 0.82 and pb_dist > 0.60:
                 return (False, "ny_late_extension_exec")
-            if ch15_abs > 0.78 and ch1_abs > 1.60 and conf < (conf_floor + 3):
+            if ch15_abs > 0.72 and ch1_abs > 1.50 and conf < (conf_floor + 3):
                 return (False, "ny_stretched_continuation_exec")
         elif sess == "LON":
             if pb_dist > 0.72 and (score < (score_floor + 2.0) or conf < (conf_floor + 1)):
