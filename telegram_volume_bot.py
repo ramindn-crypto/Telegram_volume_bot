@@ -1145,7 +1145,7 @@ def _strategy_config_defaults() -> dict:
         "runtime_profile_min_signal_decisions": 12,
         "runtime_profile_min_live_closes": 8,
         "runtime_profile_revert_wr_floor": 48.0,
-        "runtime_profile_revert_live_wr_floor": 44.0,
+        "runtime_profile_revert_live_wr_floor": 45.0,
         "runtime_profile_revert_vs_baseline_gap": 3.0,
 
         # Email lane diversification / counter-regime guardrails
@@ -1270,7 +1270,7 @@ def _apply_session_governance_migration(cfg: dict) -> dict:
     out['market_adaptive_session_wr_floor_ny'] = max(50.0, float(out.get('market_adaptive_session_wr_floor_ny', 0.0) or 0.0))
     out['market_adaptive_session_wr_floor_lon'] = max(50.0, float(out.get('market_adaptive_session_wr_floor_lon', 0.0) or 0.0))
     out['runtime_profile_revert_wr_floor'] = max(48.0, float(out.get('runtime_profile_revert_wr_floor', 0.0) or 0.0))
-    out['runtime_profile_revert_live_wr_floor'] = max(44.0, float(out.get('runtime_profile_revert_live_wr_floor', 0.0) or 0.0))
+    out['runtime_profile_revert_live_wr_floor'] = max(45.0, float(out.get('runtime_profile_revert_live_wr_floor', 0.0) or 0.0))
     out['execution_asia_enabled'] = False
 
     sess_ov = out.get('session_exec_overrides') or {}
@@ -1476,7 +1476,7 @@ EMAIL_PRIORITY_OVERRIDE_ON = True
 TREND_24H_TOL = 0.5
 
 # ✅ Session-based 1H strictness:
-# ASIA = tightest, LON = medium, NY = loosest
+# ASIA = tightest, LON = benchmark, NY = tightened toward LON
 SESSION_1H_BASE_MULT = {
     "NY": 1.00,
     "LON": 1.00,
@@ -1525,7 +1525,7 @@ DEFAULT_RISK_MODE = "PCT"
 DEFAULT_RISK_VALUE = 1.5
 DEFAULT_DAILY_CAP_MODE = "PCT"
 DEFAULT_DAILY_CAP_VALUE = 5.0
-DEFAULT_MAX_TRADES_DAY = 5
+DEFAULT_MAX_TRADES_DAY = 100
 DEFAULT_MIN_EMAIL_GAP_MIN = 30
 
 # Backward-compat alias
@@ -6276,7 +6276,7 @@ LEADER_BASE_SL_CAP_PCT_LON = env_float("LEADER_BASE_SL_CAP_PCT_LON", 3.3)
 LEADER_BASE_SL_CAP_PCT_ASIA = env_float("LEADER_BASE_SL_CAP_PCT_ASIA", 3.0)
 
 
-# ✅ 1H trigger loosened per session (overall easier)
+# ✅ 1H trigger by session (NY tightened vs old loose defaults)
 SESSION_TRIGGER_ATR_MULT = {
     "NY": 0.65,
     "LON": 0.70,
@@ -6311,7 +6311,7 @@ def session_knobs(session_name: str) -> dict:
 
 def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
     """
-    Session‑dynamic 1H trigger (loosened so signals actually fire).
+    Session‑dynamic 1H trigger.
 
     Goal:
     - Still ATR-adaptive (avoid tiny noise when ATR is high)
@@ -7605,7 +7605,7 @@ def db_init():
         risk_value REAL DEFAULT 1.0,
         daily_cap_mode TEXT DEFAULT 'percent',
         daily_cap_value REAL DEFAULT 3.0,
-        max_trades_day INTEGER DEFAULT 3,
+        max_trades_day INTEGER DEFAULT 100,
         notify_on INTEGER DEFAULT 0,
 
         sessions_enabled TEXT DEFAULT '',
@@ -12748,13 +12748,13 @@ def _objective(oos: list[dict], days: int, cfg: dict) -> float:
         stab_pen = 0.0
 
     # Session-weighted performance (NY > LON > ASIA) if by_session is present
-    session_weights = cfg.get("session_weights") or {"NY": 1.0, "LON": 0.6, "ASIA": 0.3}
+    session_weights = cfg.get("session_weights") or {"NY": 0.85, "LON": 1.0, "ASIA": 0.0}
     try:
-        wny = float(session_weights.get("NY", 1.0))
-        wlon = float(session_weights.get("LON", 0.6))
-        wasia = float(session_weights.get("ASIA", 0.3))
+        wny = float(session_weights.get("NY", 0.85))
+        wlon = float(session_weights.get("LON", 1.0))
+        wasia = float(session_weights.get("ASIA", 0.0))
     except Exception:
-        wny, wlon, wasia = 1.0, 0.6, 0.3
+        wny, wlon, wasia = 0.85, 1.0, 0.0
 
     sess_acc = {"NY": {"n": 0, "wr": 0.0, "r": 0.0}, "LON": {"n": 0, "wr": 0.0, "r": 0.0}, "ASIA": {"n": 0, "wr": 0.0, "r": 0.0}}
     for r in ok_rows:
@@ -17099,8 +17099,8 @@ def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
     lon_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_lon', 50.0) or 50.0)
 
     score = 0.0
-    score += float(avg_r) * 320.0
-    score += (float(wr) - 45.0) * 1.35
+    score += float(avg_r) * 340.0
+    score += (float(wr) - 47.0) * 1.55
     score += max(0.0, float(pf) - 1.0) * 8.0
     if live_setups < 45:
         score -= float(45 - live_setups) * 0.18
@@ -17109,7 +17109,7 @@ def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
     elif setups_day > hi:
         score -= float(setups_day - hi) * 2.4
 
-    for sess, floor, wt in (('NY', ny_floor, 1.4), ('LON', lon_floor, 1.2)):
+    for sess, floor, wt in (('NY', ny_floor, 1.55), ('LON', lon_floor, 1.25)):
         sd = (per_session or {}).get(sess) or {}
         s_setups = int(sd.get('setups', 0) or 0)
         s_wr = float(sd.get('win_rate', 0.0) or 0.0)
@@ -17155,7 +17155,7 @@ def _market_adaptive_apply_action(cfg: dict, actions: list[dict], param: str, va
 
 
 def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
-    out = json.loads(json.dumps(cfg or {}))
+    out = _upgrade_session_governance_cfg(json.loads(json.dumps(cfg or {})))
     bounds = (out.get('opt_bounds') or {})
 
     def _rng(name: str, lo: float, hi: float) -> tuple[float, float]:
@@ -17197,7 +17197,7 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
     out['market_adaptive_session_wr_floor_ny'] = float(clamp(float(out.get('market_adaptive_session_wr_floor_ny', 50.0) or 50.0), 48.0, 60.0))
     out['market_adaptive_session_wr_floor_lon'] = float(clamp(float(out.get('market_adaptive_session_wr_floor_lon', 50.0) or 50.0), 49.0, 62.0))
     out['runtime_profile_revert_wr_floor'] = float(clamp(float(out.get('runtime_profile_revert_wr_floor', 48.0) or 48.0), 46.0, 60.0))
-    out['runtime_profile_revert_live_wr_floor'] = float(clamp(float(out.get('runtime_profile_revert_live_wr_floor', 44.0) or 44.0), 42.0, 58.0))
+    out['runtime_profile_revert_live_wr_floor'] = float(clamp(float(out.get('runtime_profile_revert_live_wr_floor', 45.0) or 45.0), 42.0, 58.0))
     sess_ov = out.get('session_exec_overrides') or {}
     norm_ov = {}
     for sess in ('NY', 'LON', 'ASIA'):
@@ -17512,7 +17512,7 @@ def _runtime_profile_review_probation(uid: int | None = None, force: bool = Fals
     min_sig = int((cfg or {}).get('runtime_profile_min_signal_decisions', 12) or 12)
     min_live = int((cfg or {}).get('runtime_profile_min_live_closes', 8) or 8)
     wr_floor = float((cfg or {}).get('runtime_profile_revert_wr_floor', 48.0) or 48.0)
-    live_floor = float((cfg or {}).get('runtime_profile_revert_live_wr_floor', 44.0) or 44.0)
+    live_floor = float((cfg or {}).get('runtime_profile_revert_live_wr_floor', 45.0) or 45.0)
     gap = float((cfg or {}).get('runtime_profile_revert_vs_baseline_gap', 3.0) or 3.0)
     since_ts = float(cur.get('applied_ts') or cur.get('created_ts') or time.time())
     probation_until = float(cur.get('probation_until_ts') or 0.0)
@@ -21682,7 +21682,7 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- emailgap: {int(user['email_gap_min'])} min\n"
             f"- emaildaycap: {int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0 = unlimited)\n\n"
             f"Set examples:\n"
-            f"/limits maxtrades 5\n"
+            f"/limits maxtrades 100\n"
             f"/limits emailcap 0\n"
             f"/limits emailgap 60\n"
             f"/limits emaildaycap 0\n"
@@ -21697,8 +21697,8 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if key == "maxtrades":
-        if not (1 <= val <= 50):
-            await update.message.reply_text("maxtrades must be 1..50")
+        if not (1 <= val <= 100):
+            await update.message.reply_text("maxtrades must be 1..100")
             return
         update_user(uid, max_trades_day=val)
         await update.message.reply_text(f"✅ maxtrades/day set to {val}")
