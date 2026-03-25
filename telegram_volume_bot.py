@@ -23826,6 +23826,11 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total_pnl = 0.0
     total_risk = 0.0
+    journal_open = []
+    try:
+        journal_open = _autotrade_db_open_trades(int(uid)) or []
+    except Exception:
+        journal_open = []
 
     for i, p in enumerate(positions, 1):
         sym = _pos_symbol(p)
@@ -23850,10 +23855,15 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append("   • SL: —   | Risk est: — (needs SL)")
 
-        ct = p.get("createdTime") or p.get("created_time") or ""
+        open_info = _autotrade_resolve_live_position_open_info(int(uid), p, journal_open=journal_open)
+        opened_ts = float(open_info.get("opened_ts") or 0.0)
         ut = p.get("updatedTime") or p.get("updated_time") or ""
-        if ct:
-            lines.append(f"   • Opened: {_ms_to_local_str(ct)}")
+        if opened_ts > 0:
+            lines.append(f"   • Opened: {_fmt_dt_local(datetime.fromtimestamp(opened_ts, tz=timezone.utc))}")
+        else:
+            ct = p.get("createdTime") or p.get("created_time") or ""
+            if ct:
+                lines.append(f"   • Opened: {_ms_to_local_str(ct)}")
         if ut:
             lines.append(f"   • Updated: {_ms_to_local_str(ut)}")
 
