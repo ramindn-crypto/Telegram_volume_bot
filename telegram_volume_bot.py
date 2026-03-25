@@ -3062,7 +3062,7 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
 
         tp1_hit = False
         be_allowed = False
-        if AUTOTRADE_BE_AFTER_TP1_ENABLED and entry > 0 and final_tp > 0 and initial_qty > 0 and live_qty > 0:
+        if entry > 0 and final_tp > 0 and initial_qty > 0 and live_qty > 0:
             partial_fraction = float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION)
             qty_drop_threshold = max(initial_qty * 0.45, initial_qty * (1.0 - partial_fraction + 0.08))
             qty_reduced = live_qty < max(initial_qty * 0.98, initial_qty - max(1e-9, initial_qty * 0.02))
@@ -3072,13 +3072,9 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
             except Exception:
                 tp1_order_still_open = False
             tp1_hit = bool((live_qty <= qty_drop_threshold) or (qty_reduced and not tp1_order_still_open))
-            be_allowed = (
-                conf >= int(AUTOTRADE_BE_AFTER_TP1_MIN_CONF)
-                and quality_score >= float(_be_min_quality_for_session(sess))
-                and (atr_pct <= float(AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT) if atr_pct > 0 else True)
-                and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS or sess in AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS)
-                and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES or engine in AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES)
-            )
+            # User hard rule: after TP1 is achieved, the remaining live position must become
+            # risk-free by moving the stop-loss to the entry price for every trade.
+            be_allowed = bool(tp1_hit)
 
         desired_sl = float(entry) if (tp1_hit and be_allowed and entry > 0) else float(target_sl)
         effective_sl = 0.0
