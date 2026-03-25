@@ -13272,6 +13272,35 @@ def _evolution_recent_diagnostics(limit: int = 10, losses_only: bool = False, da
         return []
 
 
+def _evolution_latest_lessons(limit: int = 8, days: int = 30) -> list[dict]:
+    """Return the freshest lesson rows and force an on-demand refresh first."""
+    try:
+        _evolution_process_new_diagnostics()
+    except Exception:
+        pass
+    rows = _evolution_recent_diagnostics(limit=max(int(limit) * 6, 48), losses_only=False, days=days)
+    rows = sorted(rows, key=lambda r: float(r.get("decided_ts") or 0.0), reverse=True)
+    out = []
+    seen = set()
+    for r in rows:
+        try:
+            bucket = (
+                str(r.get("symbol") or "").upper().strip(),
+                str(r.get("side") or "").upper().strip(),
+                int(float(r.get("decided_ts") or 0.0) // 60),
+                str(r.get("outcome") or "").upper().strip(),
+            )
+        except Exception:
+            bucket = (str(r.get("id") or len(out)),)
+        if bucket in seen:
+            continue
+        seen.add(bucket)
+        out.append(r)
+        if len(out) >= int(limit):
+            break
+    return out
+
+
 def _evolution_tag_counter(days: int = 30, session: str | None = None, losses_only: bool = True) -> Counter:
     ctr = Counter()
     try:
@@ -15631,7 +15660,7 @@ async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
-    rows = await to_thread_fast(_evolution_recent_diagnostics, 8, True, 30)
+    rows = await to_thread_fast(_evolution_latest_lessons, 8, 30)
     if not rows:
         await update.message.reply_text("No lessons learned diagnostics recorded yet.")
         return
