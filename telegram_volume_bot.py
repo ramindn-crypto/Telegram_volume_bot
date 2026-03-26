@@ -9721,6 +9721,67 @@ def _trade_lifecycle_fmt_value(val, fmt: str = '.2f') -> str:
         return '—'
 
 
+def _trade_lifecycle_bool_text(flag) -> str:
+    txt = str(flag or '').strip().upper()
+    if txt in {'YES', 'NO', 'UNKNOWN'}:
+        return txt
+    if isinstance(flag, bool):
+        return 'YES' if flag else 'NO'
+    return 'UNKNOWN'
+
+
+def _trade_lifecycle_engine_text(val) -> str:
+    txt = str(val or '').strip()
+    if not txt:
+        return 'N/A'
+    return txt.replace('_', ' ').strip()
+
+
+def _trade_lifecycle_reason_text(val, fallback: str = 'N/A') -> str:
+    txt = str(val or '').strip()
+    return txt if txt else fallback
+
+
+def _trade_lifecycle_weekday_text(ts: float, user: dict) -> str:
+    try:
+        if float(ts or 0.0) <= 0:
+            return ''
+        dt_local = datetime.fromtimestamp(float(ts), _user_tzinfo(user))
+        return dt_local.strftime('%a')
+    except Exception:
+        return ''
+
+
+def _trade_lifecycle_day_text(ts: float, user: dict, fallback: str = '') -> str:
+    day = str(fallback or '').strip()
+    try:
+        if float(ts or 0.0) > 0:
+            if not day:
+                day = _autotrade_trade_day_label(float(ts), user)
+            wd = _trade_lifecycle_weekday_text(float(ts), user)
+            if wd and day:
+                return f"{wd} {day}"
+            if wd:
+                return wd
+    except Exception:
+        pass
+    return day or '—'
+
+
+def _trade_lifecycle_time_text(ts: float) -> str:
+    try:
+        return _fmt_dt_local(datetime.fromtimestamp(float(ts), tz=timezone.utc)) if float(ts or 0.0) > 0 else '—'
+    except Exception:
+        return '—'
+
+
+def _trade_lifecycle_hit_text(ts_val) -> str:
+    try:
+        return 'YES' if float(ts_val or 0.0) > 0 else 'NO'
+    except Exception:
+        return 'NO'
+
+
 def _trade_lifecycle_risk_pct_estimate(uid: int, risk_usdt: float) -> tuple[float | None, str]:
     user = _autotrade_user_settings(int(uid))
     try:
@@ -10049,6 +10110,43 @@ def _trade_lifecycle_manual_close_events(orders: list[dict], side: str) -> list[
     return out
 
 
+def _trade_lifecycle_be_stop_history_event(side: str, entry: float, orders: list[dict], after_ts: float = 0.0) -> dict | None:
+    try:
+        side_u = _norm_trade_side(side)
+        entry_f = float(entry or 0.0)
+        after_f = float(after_ts or 0.0)
+        if side_u not in {'BUY', 'SELL'} or entry_f <= 0:
+            return None
+        close_side = _trade_lifecycle_close_side(side_u)
+        best = None
+        for o in (orders or []):
+            try:
+                got_side = str((o or {}).get('side') or '').upper().strip()
+                if close_side and got_side and got_side != close_side:
+                    continue
+                txt = _bybit_order_kind_text(o)
+                trig = float((o or {}).get('triggerPrice') or (o or {}).get('trigger_price') or 0.0)
+                order_type = str((o or {}).get('orderType') or '').upper().strip()
+                if not ('stoploss' in txt or 'pf_sl' in txt or (_bybit_order_reduce_only(o) and order_type == 'MARKET' and trig > 0)):
+                    continue
+                px = float(_bybit_order_working_price(o) or trig or _bybit_order_avg_price(o) or 0.0)
+                if px <= 0 or not _trade_lifecycle_is_be_or_better(side_u, px, entry_f):
+                    continue
+                ts_val = float(_bybit_order_filled_time_ts(o) or 0.0)
+                if ts_val <= 0:
+                    ts_val = float(max(_ts_seconds_from_any((o or {}).get('updatedTime')), _ts_seconds_from_any((o or {}).get('createdTime')), _ts_seconds_from_any((o or {}).get('orderTime'))))
+                if after_f > 0 and ts_val > 0 and ts_val + 1.0 < after_f:
+                    continue
+                ev = {'ts': ts_val, 'price': px, 'raw': dict(o or {})}
+                if best is None or (float(ev.get('ts') or 0.0) > 0 and float(ev.get('ts') or 0.0) < float(best.get('ts') or 0.0)):
+                    best = ev
+            except Exception:
+                continue
+        return best
+    except Exception:
+        return None
+
+
 def _trade_lifecycle_upsert_row(row: dict) -> None:
     if not row or not str(row.get('trade_id') or '').strip():
         return
@@ -10060,7 +10158,7 @@ def _trade_lifecycle_upsert_row(row: dict) -> None:
         'sl_hit_ts', 'be_armed_ts', 'be_hit_ts', 'result_path', 'result_label', 'close_reason',
         'risk_free_flag', 'pnl_usdt', 'r_multiple', 'duration_total_sec', 'duration_to_tp1_sec',
         'duration_to_tp2_sec', 'duration_to_sl_sec', 'source_confidence', 'source_note',
-        'exchange_confirmed', 'last_sync_ts'
+        'exchange_confirmed', 'last_sync_ts', 'open_reason'
     ]
     vals = [row.get(c) for c in cols]
     try:
@@ -10398,8 +10496,9 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
     rr1 = float(rr_to_tp(entry, sl, tp1) or 0.0) if entry > 0 and sl > 0 and float(tp1 or 0.0) > 0 else None
     rr2 = float(rr_to_tp(entry, sl, tp2) or 0.0) if entry > 0 and sl > 0 and float(tp2 or 0.0) > 0 else None
 
-    open_session = str(trade.get('session') or '').upper().strip() or _session_label_from_ts(opened_ts)
+    open_session = str(trade.get('session') or '').upper().strip() or str((trade.get('source_session') or '')).upper().strip() or _session_label_from_ts(opened_ts)
     open_day = _autotrade_trade_day_label(opened_ts, user) if opened_ts > 0 else ''
+    open_reason = str(trade.get('open_reason') or '').strip()
 
     window_end = float(next_open_ts or 0.0) - 1.0 if float(next_open_ts or 0.0) > float(opened_ts or 0.0) else 0.0
     if closed_ts_journal > 0:
@@ -10547,13 +10646,14 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
         elif live_pos is not None and current_sl_price > 0 and _trade_lifecycle_is_be_or_better(side, current_sl_price, entry):
             risk_free_flag = 'YES'
             be_armed_ts = tp1_hit_ts
+        elif be_stop_history_event is not None:
+            risk_free_flag = 'YES'
+            be_armed_ts = float(tp1_hit_ts or be_stop_history_event.get('ts') or 0.0) or None
         elif result_path == 'HIT_TP2_WIN':
-            if be_sl_event is not None:
-                risk_free_flag = 'YES'
-                be_armed_ts = tp1_hit_ts
-            else:
-                risk_free_flag = 'UNKNOWN'
+            risk_free_flag = 'UNKNOWN'
         elif result_path == 'HIT_TP1_THEN_SL':
+            risk_free_flag = 'NO'
+        elif result_path == 'OPEN' and live_pos is not None and current_sl_price > 0:
             risk_free_flag = 'NO'
         else:
             risk_free_flag = 'UNKNOWN'
@@ -10640,6 +10740,7 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
         'confidence': int(trade.get('conf') or 0) if trade.get('conf') is not None else None,
         'quality_score': float(trade.get('quality_score') or 0.0) if trade.get('quality_score') is not None else None,
         'engine': str(trade.get('engine') or ''),
+        'open_reason': open_reason,
         'tp1_hit_ts': tp1_hit_ts,
         'tp2_hit_ts': tp2_hit_ts,
         'sl_hit_ts': sl_hit_ts,
@@ -10702,7 +10803,7 @@ def _trade_lifecycle_signal_snapshot(setup_id: str) -> dict:
             con.row_factory = sqlite3.Row
             cur = con.cursor()
             row = cur.execute(
-                """SELECT created_ts, symbol, side, conf
+                """SELECT created_ts, symbol, side, conf, source, session
                        FROM generated_setups WHERE setup_id=?
                        ORDER BY created_ts DESC LIMIT 1""",
                 (sid,),
@@ -10716,6 +10817,34 @@ def _trade_lifecycle_signal_snapshot(setup_id: str) -> dict:
                     out['side'] = _norm_trade_side(str(row['side'] or ''))
                 if out.get('conf') is None and row['conf'] is not None:
                     out['conf'] = int(row['conf'] or 0)
+                if not out.get('source_kind') and row['source']:
+                    out['source_kind'] = str(row['source'] or '')
+                if not out.get('session') and row['session']:
+                    out['session'] = str(row['session'] or '')
+            row2 = cur.execute(
+                """SELECT session, source_kind, state, details_json
+                       FROM admin_setup_lifecycle WHERE setup_id=?
+                       ORDER BY COALESCE(executed_ts, attempted_ts, executable_ts, emailed_ts, signal_created_ts, generated_logged_ts, 0) DESC
+                       LIMIT 1""",
+                (sid,),
+            ).fetchone()
+            if row2:
+                det = _trade_lifecycle_parse_details_json(row2['details_json'])
+                if not out.get('session') and row2['session']:
+                    out['session'] = str(row2['session'] or '')
+                if not out.get('source_kind') and row2['source_kind']:
+                    out['source_kind'] = str(row2['source_kind'] or '')
+                if not out.get('open_reason'):
+                    state_txt = str(row2['state'] or '').strip()
+                    source_kind = str(row2['source_kind'] or '').strip()
+                    if source_kind and state_txt:
+                        out['open_reason'] = f"{source_kind}:{state_txt}"
+                    elif state_txt:
+                        out['open_reason'] = state_txt
+                if not out.get('engine'):
+                    out['engine'] = str(det.get('engine') or det.get('strategy') or '')
+                if out.get('quality_score') is None and det.get('quality_score') not in (None, ''):
+                    out['quality_score'] = float(det.get('quality_score'))
     except Exception:
         pass
     return out
@@ -10819,7 +10948,8 @@ def _trade_lifecycle_collect_candidates(owner_uid: int, sync_cutoff: float, days
                 'conf': snap.get('conf'),
                 'quality_score': None,
                 'atr_pct': None,
-                'engine': '',
+                'engine': str(snap.get('engine') or ''),
+                'open_reason': str(snap.get('open_reason') or 'provisional_exchange_match_from_setup_history'),
                 'status': 'CLOSED',
                 'closed_ts': closed_ts,
                 'pnl_usdt': float((p or {}).get('pnl') or (p or {}).get('pnl_usdt') or 0.0),
@@ -10897,7 +11027,8 @@ def _trade_lifecycle_collect_candidates(owner_uid: int, sync_cutoff: float, days
                 'conf': (details.get('conf') if details.get('conf') is not None else snap.get('conf')),
                 'quality_score': (float(details.get('quality_score')) if details.get('quality_score') not in (None, '') else None),
                 'atr_pct': (float(details.get('atr_pct')) if details.get('atr_pct') not in (None, '') else None),
-                'engine': str(details.get('engine') or details.get('strategy') or ''),
+                'engine': str(details.get('engine') or details.get('strategy') or snap.get('engine') or ''),
+                'open_reason': str(details.get('open_reason') or snap.get('open_reason') or ((life or {}).get('source_kind') or '') or 'bot_executed_setup'),
                 'status': status,
                 'closed_ts': closed_ts if closed_ts > 0 else None,
                 'pnl_usdt': (float((life or {}).get('pnl_usdt') or 0.0) if ((life or {}).get('pnl_usdt') is not None) else 0.0),
@@ -11163,6 +11294,57 @@ def _trade_lifecycle_recent_email_rows(owner_uid: int, start_ts: float, session:
         return []
 
 
+def _trade_lifecycle_render_row(r: dict, user: dict, show_trade_id: bool = True) -> list[str]:
+    trade_id = str(r.get('trade_id') or '').strip()
+    setup_id = str(r.get('setup_id') or '').strip()
+    symbol = str(r.get('symbol') or '?')
+    side = str(r.get('side') or '?')
+    open_ts = float(r.get('opened_ts') or 0.0)
+    close_ts = float(r.get('closed_ts') or 0.0)
+    open_txt = _trade_lifecycle_time_text(open_ts)
+    close_txt = _trade_lifecycle_time_text(close_ts)
+    open_day_txt = _trade_lifecycle_day_text(open_ts, user, str(r.get('open_day') or ''))
+    close_day_txt = _trade_lifecycle_day_text(close_ts, user, str(r.get('close_day') or '')) if close_ts > 0 else '—'
+    hits = ', '.join(_trade_lifecycle_levels_hit(r)) or '—'
+    confirm_txt = 'exchange-confirmed' if int(r.get('exchange_confirmed') or 0) == 1 else 'inferred'
+    sync_note = str(r.get('source_note') or '').strip()
+    open_reason = _trade_lifecycle_reason_text(r.get('open_reason'))
+    engine_txt = _trade_lifecycle_engine_text(r.get('engine'))
+    risk_free_txt = _trade_lifecycle_bool_text(r.get('risk_free_flag'))
+    tp1_hit_txt = _trade_lifecycle_hit_text(r.get('tp1_hit_ts'))
+    tp2_hit_txt = _trade_lifecycle_hit_text(r.get('tp2_hit_ts'))
+    sl_hit_txt = _trade_lifecycle_hit_text(r.get('sl_hit_ts'))
+    be_move_txt = risk_free_txt if tp1_hit_txt == 'YES' else 'NO'
+    header = f"• {symbol} {side} | {str(r.get('result_path') or '').upper()}"
+    if show_trade_id:
+        header += f" | {trade_id}"
+    if setup_id:
+        header += f" | {setup_id}"
+    lines = [header]
+    lines.append(
+        f"  Entry {fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '—'} | SL {fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '—'} | TP1 {fmt_price(float(r.get('tp1') or 0.0)) if float(r.get('tp1') or 0.0) > 0 else '—'} | TP2 {fmt_price(float(r.get('tp2') or 0.0)) if float(r.get('tp2') or 0.0) > 0 else '—'}"
+    )
+    lines.append(
+        f"  RR1 {_trade_lifecycle_fmt_value(r.get('rr_tp1'), '.2f')} | RR2 {_trade_lifecycle_fmt_value(r.get('rr_tp2'), '.2f')} | Risk {_trade_lifecycle_fmt_value(r.get('risk_usdt'), '.2f')} USDT ({_trade_lifecycle_fmt_value(r.get('risk_pct'), '.2f')}%) | Conf {str(r.get('confidence') if r.get('confidence') is not None else '—')} | Q {_trade_lifecycle_fmt_value(r.get('quality_score'), '.1f')}"
+    )
+    lines.append(
+        f"  Open {open_txt} | Open Day {open_day_txt} | Open Session {str(r.get('open_session') or '—')} | Open Reason {open_reason} | Engine {engine_txt}"
+    )
+    lines.append(
+        f"  Result {str(r.get('result_label') or '—')} | Path {str(r.get('result_path') or '—')} | Hits {hits} | TP1 {tp1_hit_txt} | TP2 {tp2_hit_txt} | SL {sl_hit_txt} | BE Move {be_move_txt} | Risk-Free {risk_free_txt}"
+    )
+    lines.append(
+        f"  Close {close_txt} | Close Day {close_day_txt} | Close Session {str(r.get('close_session') or '—') if close_ts > 0 else '—'} | Reason {str(r.get('close_reason') or ('open' if str(r.get('result_path') or '').upper() == 'OPEN' else '—'))}"
+    )
+    lines.append(
+        f"  TP1 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp1_sec'))} | TP2 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(r.get('duration_to_sl_sec'))} | Total {_trade_lifecycle_fmt_duration(r.get('duration_total_sec'))}"
+    )
+    lines.append(
+        f"  PnL {_trade_lifecycle_fmt_value(r.get('pnl_usdt'), '.2f')} USDT | R {_trade_lifecycle_fmt_value(r.get('r_multiple'), '.2f')} | {confirm_txt}" + (f" | Note {sync_note}" if sync_note else '')
+    )
+    return lines
+
+
 def _trade_lifecycle_recent_report(owner_uid: int, hours: int = 48, session: str = 'ALL') -> str:
     owner_uid = int(owner_uid)
     hours = int(max(1, min(int(hours or 48), 24 * 90)))
@@ -11201,37 +11383,9 @@ def _trade_lifecycle_recent_report(owner_uid: int, hours: int = 48, session: str
         lines.append('• No bot trades found in this rolling window.')
         return '\n'.join(lines)
 
+    user = _autotrade_user_settings(owner_uid)
     for r in rows[:60]:
-        trade_id = str(r.get('trade_id') or '')
-        setup_id = str(r.get('setup_id') or '')
-        symbol = str(r.get('symbol') or '?')
-        side = str(r.get('side') or '?')
-        open_ts = float(r.get('opened_ts') or 0.0)
-        close_ts = float(r.get('closed_ts') or 0.0)
-        open_txt = _fmt_dt_local(datetime.fromtimestamp(open_ts, tz=timezone.utc)) if open_ts > 0 else '—'
-        close_txt = _fmt_dt_local(datetime.fromtimestamp(close_ts, tz=timezone.utc)) if close_ts > 0 else '—'
-        hits = ', '.join(_trade_lifecycle_levels_hit(r)) or '—'
-        confirm_txt = 'exchange-confirmed' if int(r.get('exchange_confirmed') or 0) == 1 else 'inferred'
-        sync_note = str(r.get('source_note') or '').strip()
-        lines.append(f"• {trade_id} | {setup_id or '-'} | {symbol} {side} | {str(r.get('result_path') or '').upper()}")
-        lines.append(
-            f"  Entry {fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '—'} | SL {fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '—'} | TP1 {fmt_price(float(r.get('tp1') or 0.0)) if float(r.get('tp1') or 0.0) > 0 else '—'} | TP2 {fmt_price(float(r.get('tp2') or 0.0)) if float(r.get('tp2') or 0.0) > 0 else '—'}"
-        )
-        lines.append(
-            f"  RR1 {_trade_lifecycle_fmt_value(r.get('rr_tp1'), '.2f')} | RR2 {_trade_lifecycle_fmt_value(r.get('rr_tp2'), '.2f')} | Risk {_trade_lifecycle_fmt_value(r.get('risk_usdt'), '.2f')} USDT ({_trade_lifecycle_fmt_value(r.get('risk_pct'), '.2f')}%) | Conf {str(r.get('confidence') if r.get('confidence') is not None else '—')} | Q {_trade_lifecycle_fmt_value(r.get('quality_score'), '.1f')} | Engine {str(r.get('engine') or '—')}"
-        )
-        lines.append(
-            f"  Open {open_txt} | Day {str(r.get('open_day') or '—')} | Session {str(r.get('open_session') or '—')} | Close {close_txt} | Day {str(r.get('close_day') or '—')} | Session {str(r.get('close_session') or '—')}"
-        )
-        lines.append(
-            f"  Result {str(r.get('result_label') or '—')} | Result Path {str(r.get('result_path') or '—')} | Hits {hits} | Risk-Free {str(r.get('risk_free_flag') or 'UNKNOWN')} | Reason {str(r.get('close_reason') or ('open' if str(r.get('result_path') or '').upper() == 'OPEN' else '—'))}"
-        )
-        lines.append(
-            f"  TP1 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp1_sec'))} | TP2 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(r.get('duration_to_sl_sec'))} | Total {_trade_lifecycle_fmt_duration(r.get('duration_total_sec'))}"
-        )
-        lines.append(
-            f"  PnL {_trade_lifecycle_fmt_value(r.get('pnl_usdt'), '.2f')} USDT | R {_trade_lifecycle_fmt_value(r.get('r_multiple'), '.2f')} | {confirm_txt}" + (f" | Note {sync_note}" if sync_note else '')
-        )
+        lines.extend(_trade_lifecycle_render_row(r, user, show_trade_id=True))
     if len(rows) > 60:
         lines.append(f"Showing first 60 of {len(rows)} real bot trades in this window.")
     return '\n'.join(lines)
@@ -11265,39 +11419,9 @@ def _trade_lifecycle_compact_report(owner_uid: int, days: int = 7, session: str 
         summary.append('• No bot trades found in this window.')
         return '\n'.join(summary)
 
+    user = _autotrade_user_settings(owner_uid)
     for r in rows[:80]:
-        trade_id = str(r.get('trade_id') or '')
-        setup_id = str(r.get('setup_id') or '')
-        symbol = str(r.get('symbol') or '?')
-        side = str(r.get('side') or '?')
-        open_ts = float(r.get('opened_ts') or 0.0)
-        close_ts = float(r.get('closed_ts') or 0.0)
-        open_txt = _fmt_dt_local(datetime.fromtimestamp(open_ts, tz=timezone.utc)) if open_ts > 0 else '—'
-        close_txt = _fmt_dt_local(datetime.fromtimestamp(close_ts, tz=timezone.utc)) if close_ts > 0 else '—'
-        hits = ', '.join(_trade_lifecycle_levels_hit(r)) or '—'
-        confirm_txt = 'exchange-confirmed' if int(r.get('exchange_confirmed') or 0) == 1 else 'inferred'
-        sync_note = str(r.get('source_note') or '').strip()
-        summary.append(
-            f"• {trade_id} | {setup_id or '-'} | {symbol} {side} | {str(r.get('result_path') or '').upper()}"
-        )
-        summary.append(
-            f"  Entry {fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '—'} | SL {fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '—'} | TP1 {fmt_price(float(r.get('tp1') or 0.0)) if float(r.get('tp1') or 0.0) > 0 else '—'} | TP2 {fmt_price(float(r.get('tp2') or 0.0)) if float(r.get('tp2') or 0.0) > 0 else '—'}"
-        )
-        summary.append(
-            f"  RR1 {_trade_lifecycle_fmt_value(r.get('rr_tp1'), '.2f')} | RR2 {_trade_lifecycle_fmt_value(r.get('rr_tp2'), '.2f')} | Risk {_trade_lifecycle_fmt_value(r.get('risk_usdt'), '.2f')} USDT ({_trade_lifecycle_fmt_value(r.get('risk_pct'), '.2f')}%) | Conf {str(r.get('confidence') if r.get('confidence') is not None else '—')} | Q {_trade_lifecycle_fmt_value(r.get('quality_score'), '.1f')} | Engine {str(r.get('engine') or '—')}"
-        )
-        summary.append(
-            f"  Open {open_txt} | Day {str(r.get('open_day') or '—')} | Session {str(r.get('open_session') or '—')} | Close {close_txt} | Day {str(r.get('close_day') or '—')} | Session {str(r.get('close_session') or '—')}"
-        )
-        summary.append(
-            f"  Result {str(r.get('result_label') or '—')} | Hits {hits} | Risk-Free {str(r.get('risk_free_flag') or 'UNKNOWN')} | Reason {str(r.get('close_reason') or ('open' if str(r.get('result_path') or '').upper() == 'OPEN' else '—'))}"
-        )
-        summary.append(
-            f"  TP1 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp1_sec'))} | TP2 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(r.get('duration_to_sl_sec'))} | Total {_trade_lifecycle_fmt_duration(r.get('duration_total_sec'))}"
-        )
-        summary.append(
-            f"  PnL {_trade_lifecycle_fmt_value(r.get('pnl_usdt'), '.2f')} USDT | R {_trade_lifecycle_fmt_value(r.get('r_multiple'), '.2f')} | {confirm_txt}" + (f" | Note {sync_note}" if sync_note else '')
-        )
+        summary.extend(_trade_lifecycle_render_row(r, user, show_trade_id=True))
     if len(rows) > 80:
         summary.extend([SEP, f"Showing first 80 of {len(rows)} trades. Narrow the window with /trade_lifecycle <days> [ASIA|LON|NY]."])
     return '\n'.join(summary)
@@ -11309,21 +11433,17 @@ def _trade_lifecycle_detail_report(owner_uid: int, ident: str) -> str:
         return 'No matching trade lifecycle row found.'
     trade_id = str(row.get('trade_id') or '')
     setup_id = str(row.get('setup_id') or '')
+    user = _autotrade_user_settings(owner_uid)
     lines = [
         '🧬 Trade Lifecycle Detail',
         HDR,
         f"Trade ID: {trade_id}",
         f"Setup ID: {setup_id or '—'}",
-        f"Symbol: {str(row.get('symbol') or '—')} | Type: {str(row.get('side') or '—')}",
-        f"Entry: {fmt_price(float(row.get('entry') or 0.0)) if float(row.get('entry') or 0.0) > 0 else '—'} | SL: {fmt_price(float(row.get('sl') or 0.0)) if float(row.get('sl') or 0.0) > 0 else '—'} | TP1: {fmt_price(float(row.get('tp1') or 0.0)) if float(row.get('tp1') or 0.0) > 0 else '—'} | TP2: {fmt_price(float(row.get('tp2') or 0.0)) if float(row.get('tp2') or 0.0) > 0 else '—'}",
-        f"Result path: {str(row.get('result_path') or '—')} | Result: {str(row.get('result_label') or '—')}",
-        f"Risk: {_trade_lifecycle_fmt_value(row.get('risk_usdt'), '.2f')} USDT ({_trade_lifecycle_fmt_value(row.get('risk_pct'), '.2f')}%) | R: {_trade_lifecycle_fmt_value(row.get('r_multiple'), '.2f')} | PnL: {_trade_lifecycle_fmt_value(row.get('pnl_usdt'), '.2f')} USDT",
-        f"Open: {(_fmt_dt_local(datetime.fromtimestamp(float(row.get('opened_ts') or 0.0), tz=timezone.utc)) if float(row.get('opened_ts') or 0.0) > 0 else '—')} | Close: {(_fmt_dt_local(datetime.fromtimestamp(float(row.get('closed_ts') or 0.0), tz=timezone.utc)) if float(row.get('closed_ts') or 0.0) > 0 else '—')}",
-        f"Durations → TP1 {_trade_lifecycle_fmt_duration(row.get('duration_to_tp1_sec'))} | TP2 {_trade_lifecycle_fmt_duration(row.get('duration_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(row.get('duration_to_sl_sec'))} | Total {_trade_lifecycle_fmt_duration(row.get('duration_total_sec'))}",
-        f"Risk-Free: {str(row.get('risk_free_flag') or 'UNKNOWN')} | Exchange: {'exchange-confirmed' if int(row.get('exchange_confirmed') or 0) == 1 else 'inferred'} | Sync: {str(row.get('source_confidence') or '—')}",
-        f"Sync note: {str(row.get('source_note') or '—')}",
     ]
+    lines.extend(_trade_lifecycle_render_row(row, user, show_trade_id=False))
+    lines.append(f"  Sync confidence {str(row.get('source_confidence') or '—')}")
     try:
+
         with sqlite3.connect(DB_PATH) as con:
             con.row_factory = sqlite3.Row
             cur = con.cursor()
