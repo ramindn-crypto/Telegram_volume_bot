@@ -10423,6 +10423,8 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
     sl_hit_ts = _trade_lifecycle_pick_ts([ev.get('ts') for ev in sl_events], pick='min')
 
     source_bits = []
+    if bool(trade.get('_synthetic_backfill')):
+        source_bits.append(str(trade.get('_synthetic_note') or 'setup_lifecycle_backfill'))
     source_conf = 'LOW'
     exchange_confirmed = 0
     if tp1_events or tp2_events or sl_events or manual_events or matched_pnl:
@@ -10437,6 +10439,20 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
         source_bits.append(risk_note)
 
     live_qty = abs(float(_pos_size(live_pos) or 0.0)) if live_pos is not None else 0.0
+    if entry <= 0 and live_pos is not None:
+        try:
+            live_entry = float(_pos_entry(live_pos) or 0.0)
+        except Exception:
+            live_entry = 0.0
+        if live_entry > 0:
+            entry = float(live_entry)
+            tp1, tp2, _ = _ensure_three_tps(entry, sl, float(tp3_raw or 0.0), tp1_raw, tp2_raw, side)
+            rr1 = float(rr_to_tp(entry, sl, tp1) or 0.0) if entry > 0 and sl > 0 and float(tp1 or 0.0) > 0 else None
+            rr2 = float(rr_to_tp(entry, sl, tp2) or 0.0) if entry > 0 and sl > 0 and float(tp2 or 0.0) > 0 else None
+    if qty <= 0 and live_qty > 0:
+        qty = float(live_qty)
+        risk_usdt = float(_autotrade_estimated_risk_usd(entry, sl, qty) or 0.0)
+        risk_pct, risk_note = _trade_lifecycle_risk_pct_estimate(int(uid), risk_usdt)
     qty_reduction_confirmed = bool(live_pos is not None and qty > 0 and live_qty > 0 and live_qty < max(qty * 0.98, qty - max(1e-9, qty * 0.02)))
     if (tp1_hit_ts is None) and positive_pnl_events:
         tp1_hit_ts = _trade_lifecycle_pick_ts([ev.get('ts') for ev in positive_pnl_events], pick='min')
@@ -10476,7 +10492,7 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
             continue
 
     status = str(trade.get('status') or '').upper().strip()
-    if live_pos is not None and status == 'OPEN':
+    if status == 'OPEN' and (live_pos is not None or not live_mode):
         result_path = 'OPEN'
         result_label = _trade_lifecycle_result_label(result_path)
         close_reason = ''
@@ -10647,6 +10663,257 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
     return row, events
 
 
+def _trade_lifecycle_parse_details_json(raw) -> dict:
+    try:
+        if isinstance(raw, dict):
+            return dict(raw)
+        txt = str(raw or '').strip()
+        if not txt:
+            return {}
+        obj = json.loads(txt)
+        return dict(obj) if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _trade_lifecycle_signal_snapshot(setup_id: str) -> dict:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return {}
+    out = {}
+    try:
+        sig = db_get_signal(sid) or {}
+    except Exception:
+        sig = {}
+    if sig:
+        out.update({
+            'symbol': _bybit_linear_symbol(str(sig.get('symbol') or '')),
+            'side': _norm_trade_side(str(sig.get('side') or '')),
+            'created_ts': float(sig.get('created_ts') or 0.0),
+            'conf': int(sig.get('conf') or 0) if sig.get('conf') is not None else None,
+            'entry': float(sig.get('entry') or 0.0) if sig.get('entry') is not None else 0.0,
+            'sl': float(sig.get('sl') or 0.0) if sig.get('sl') is not None else 0.0,
+            'tp1': float(sig.get('tp1') or 0.0) if sig.get('tp1') is not None else 0.0,
+            'tp2': float(sig.get('tp2') or 0.0) if sig.get('tp2') is not None else 0.0,
+            'tp3': float(sig.get('tp3') or 0.0) if sig.get('tp3') is not None else 0.0,
+        })
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            row = cur.execute(
+                """SELECT created_ts, symbol, side, conf
+                       FROM generated_setups WHERE setup_id=?
+                       ORDER BY created_ts DESC LIMIT 1""",
+                (sid,),
+            ).fetchone()
+            if row:
+                if not out.get('created_ts'):
+                    out['created_ts'] = float(row['created_ts'] or 0.0)
+                if not out.get('symbol'):
+                    out['symbol'] = _bybit_linear_symbol(str(row['symbol'] or ''))
+                if not out.get('side'):
+                    out['side'] = _norm_trade_side(str(row['side'] or ''))
+                if out.get('conf') is None and row['conf'] is not None:
+                    out['conf'] = int(row['conf'] or 0)
+    except Exception:
+        pass
+    return out
+
+
+def _trade_lifecycle_is_executed_lifecycle_row(life: dict) -> bool:
+    try:
+        state = str((life or {}).get('state') or '').strip().lower()
+        if state.startswith('executed'):
+            return True
+        if 'live_opened' in state or 'paper_opened' in state:
+            return True
+        if state in {'closed', 'executed_closed'}:
+            return True
+        if float((life or {}).get('executed_ts') or 0.0) > 0:
+            return True
+        if str((life or {}).get('trade_id') or '').strip():
+            return True
+        if str((life or {}).get('bybit_order_id') or '').strip() or str((life or {}).get('bybit_order_link_id') or '').strip():
+            return True
+        if str((life or {}).get('bybit_position_symbol') or '').strip():
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _trade_lifecycle_synthetic_trade_id(prefix: str, setup_id: str, opened_ts: float = 0.0) -> str:
+    sid = re.sub(r'[^A-Za-z0-9_-]+', '-', str(setup_id or '').strip()) or 'UNKNOWN'
+    ts_txt = str(int(float(opened_ts or 0.0))) if float(opened_ts or 0.0) > 0 else '0'
+    return f"{str(prefix or 'TL').upper()}-{sid}-{ts_txt}"
+
+
+def _trade_lifecycle_collect_candidates(owner_uid: int, sync_cutoff: float, days: int = 30) -> list[dict]:
+    owner_uid = int(owner_uid)
+    _autotrade_migrate_tables()
+    _admin_setup_lifecycle_migrate()
+    base_rows = []
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            rows = cur.execute(
+                """
+                SELECT * FROM autotrade_trades
+                WHERE uid=? AND (
+                    COALESCE(opened_ts,0)>=? OR COALESCE(closed_ts,0)>=? OR UPPER(COALESCE(status,''))='OPEN'
+                )
+                ORDER BY COALESCE(opened_ts,0) ASC, COALESCE(closed_ts,0) ASC
+                """,
+                (owner_uid, float(sync_cutoff), float(sync_cutoff)),
+            ).fetchall() or []
+            base_rows = [dict(r) for r in rows]
+    except Exception:
+        base_rows = []
+
+    out = []
+    seen_trade_ids = set()
+    seen_setup_ids = set()
+
+    def _remember(row: dict):
+        d = dict(row or {})
+        tid = str(d.get('trade_id') or '').strip()
+        sid = str(d.get('setup_id') or '').strip()
+        if tid:
+            seen_trade_ids.add(tid)
+        if sid:
+            seen_setup_ids.add(sid)
+        out.append(d)
+
+    for row in (base_rows or []):
+        _remember(row)
+
+    try:
+        provisional = _autotrade_reconstruct_provisional_closes(owner_uid, days=max(7, int(days or 30) + 5)) or []
+    except Exception:
+        provisional = []
+    for p in provisional:
+        try:
+            sid = str((p or {}).get('setup_id') or '').strip()
+            tid = str((p or {}).get('trade_id') or '').strip() or _trade_lifecycle_synthetic_trade_id('TLPROV', sid or ((p or {}).get('symbol') or 'TRADE'), (p or {}).get('opened_ts') or (p or {}).get('closed_ts') or 0.0)
+            if tid in seen_trade_ids or (sid and sid in seen_setup_ids):
+                continue
+            snap = _trade_lifecycle_signal_snapshot(sid)
+            opened_ts = float((p or {}).get('opened_ts') or snap.get('created_ts') or 0.0)
+            closed_ts = float((p or {}).get('closed_ts') or 0.0)
+            row = {
+                'trade_id': tid,
+                'uid': owner_uid,
+                'opened_ts': opened_ts,
+                'session': _session_label_from_ts(opened_ts) if opened_ts > 0 else '',
+                'setup_id': sid,
+                'symbol': _bybit_linear_symbol(str((p or {}).get('symbol') or snap.get('symbol') or '')),
+                'side': _norm_trade_side(str((p or {}).get('side') or snap.get('side') or '')),
+                'entry': float((snap.get('entry') or 0.0) or 0.0),
+                'sl': float((snap.get('sl') or 0.0) or 0.0),
+                'tp1': float((snap.get('tp1') or 0.0) or 0.0),
+                'tp2': float((snap.get('tp2') or 0.0) or 0.0),
+                'tp3': float((snap.get('tp3') or 0.0) or 0.0),
+                'qty': 0.0,
+                'conf': snap.get('conf'),
+                'quality_score': None,
+                'atr_pct': None,
+                'engine': '',
+                'status': 'CLOSED',
+                'closed_ts': closed_ts,
+                'pnl_usdt': float((p or {}).get('pnl') or (p or {}).get('pnl_usdt') or 0.0),
+                'outcome': str((p or {}).get('outcome') or ''),
+                'note': str((p or {}).get('note') or 'provisional_exchange_match_from_setup_history'),
+                '_synthetic_backfill': True,
+                '_synthetic_note': 'setup_linked_provisional_close',
+            }
+            if row['symbol'] and row['side']:
+                _remember(row)
+        except Exception:
+            continue
+
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            life_rows = cur.execute(
+                """
+                SELECT * FROM admin_setup_lifecycle
+                WHERE uid=? AND (
+                    COALESCE(executed_ts,0)>=? OR COALESCE(closed_ts,0)>=? OR (
+                        COALESCE(closed_ts,0)<=0 AND (
+                            TRIM(COALESCE(trade_id,''))<>'' OR
+                            TRIM(COALESCE(bybit_order_id,''))<>'' OR
+                            TRIM(COALESCE(bybit_order_link_id,''))<>'' OR
+                            TRIM(COALESCE(bybit_position_symbol,''))<>'' OR
+                            UPPER(COALESCE(state,'')) LIKE 'EXECUTED%' OR
+                            LOWER(COALESCE(state,'')) LIKE '%open%'
+                        )
+                    )
+                )
+                ORDER BY COALESCE(executed_ts, attempted_ts, executable_ts, emailed_ts, signal_created_ts, generated_logged_ts, 0) ASC
+                """,
+                (owner_uid, float(sync_cutoff), float(sync_cutoff)),
+            ).fetchall() or []
+            life_rows = [dict(r) for r in life_rows]
+    except Exception:
+        life_rows = []
+
+    for life in life_rows:
+        try:
+            if not _trade_lifecycle_is_executed_lifecycle_row(life):
+                continue
+            sid = str((life or {}).get('setup_id') or '').strip()
+            trade_id = str((life or {}).get('trade_id') or '').strip() or _trade_lifecycle_synthetic_trade_id('TLLIFE', sid or ((life or {}).get('symbol') or 'TRADE'), (life or {}).get('executed_ts') or (life or {}).get('attempted_ts') or 0.0)
+            if trade_id in seen_trade_ids or (sid and sid in seen_setup_ids):
+                continue
+            snap = _trade_lifecycle_signal_snapshot(sid)
+            details = _trade_lifecycle_parse_details_json((life or {}).get('details_json'))
+            opened_ts = float((life or {}).get('executed_ts') or (life or {}).get('attempted_ts') or (life or {}).get('executable_ts') or (life or {}).get('emailed_ts') or (life or {}).get('signal_created_ts') or (life or {}).get('generated_logged_ts') or snap.get('created_ts') or 0.0)
+            if opened_ts <= 0:
+                continue
+            symbol = _bybit_linear_symbol(str(snap.get('symbol') or details.get('symbol') or (life or {}).get('symbol') or (life or {}).get('bybit_position_symbol') or ''))
+            side = _norm_trade_side(str(snap.get('side') or details.get('side') or (life or {}).get('side') or ''))
+            if not symbol or not side:
+                continue
+            state_txt = str((life or {}).get('state') or '').strip().lower()
+            closed_ts = float((life or {}).get('closed_ts') or 0.0)
+            status = 'CLOSED' if (closed_ts > 0 or str((life or {}).get('outcome') or '').strip() or 'closed' in state_txt) else 'OPEN'
+            row = {
+                'trade_id': trade_id,
+                'uid': owner_uid,
+                'opened_ts': opened_ts,
+                'session': str((life or {}).get('session') or _session_label_from_ts(opened_ts) or ''),
+                'setup_id': sid,
+                'symbol': symbol,
+                'side': side,
+                'entry': float(details.get('entry') or snap.get('entry') or 0.0),
+                'sl': float(details.get('sl') or snap.get('sl') or 0.0),
+                'tp1': float(details.get('tp1') or snap.get('tp1') or 0.0),
+                'tp2': float(details.get('tp2') or snap.get('tp2') or 0.0),
+                'tp3': float(details.get('tp3') or snap.get('tp3') or 0.0),
+                'qty': float(details.get('qty') or 0.0),
+                'conf': (details.get('conf') if details.get('conf') is not None else snap.get('conf')),
+                'quality_score': (float(details.get('quality_score')) if details.get('quality_score') not in (None, '') else None),
+                'atr_pct': (float(details.get('atr_pct')) if details.get('atr_pct') not in (None, '') else None),
+                'engine': str(details.get('engine') or details.get('strategy') or ''),
+                'status': status,
+                'closed_ts': closed_ts if closed_ts > 0 else None,
+                'pnl_usdt': (float((life or {}).get('pnl_usdt') or 0.0) if ((life or {}).get('pnl_usdt') is not None) else 0.0),
+                'outcome': str((life or {}).get('outcome') or ''),
+                'note': str((life or {}).get('last_reason') or 'setup_lifecycle_backfill'),
+                '_synthetic_backfill': True,
+                '_synthetic_note': ('setup_lifecycle_backfill:' + state_txt)[:120],
+            }
+            _remember(row)
+        except Exception:
+            continue
+
+    out.sort(key=lambda r: (float((r or {}).get('opened_ts') or 0.0), float((r or {}).get('closed_ts') or 0.0), str((r or {}).get('trade_id') or '')))
+    return out
+
+
 def _trade_lifecycle_sync(owner_uid: int, days: int = 30, force: bool = False) -> dict:
     owner_uid = int(owner_uid)
     _trade_lifecycle_migrate()
@@ -10675,20 +10942,7 @@ def _trade_lifecycle_sync(owner_uid: int, days: int = 30, force: bool = False) -
         pass
 
     try:
-        with sqlite3.connect(DB_PATH) as con:
-            con.row_factory = sqlite3.Row
-            cur = con.cursor()
-            rows = cur.execute(
-                """
-                SELECT * FROM autotrade_trades
-                WHERE uid=? AND (
-                    COALESCE(opened_ts,0)>=? OR COALESCE(closed_ts,0)>=? OR UPPER(COALESCE(status,''))='OPEN'
-                )
-                ORDER BY COALESCE(opened_ts,0) ASC, COALESCE(closed_ts,0) ASC
-                """,
-                (owner_uid, float(sync_cutoff), float(sync_cutoff)),
-            ).fetchall() or []
-            trades = [dict(r) for r in rows]
+        trades = _trade_lifecycle_collect_candidates(owner_uid, float(sync_cutoff), days=int(days))
     except Exception:
         trades = []
 
@@ -10921,20 +11175,14 @@ def _trade_lifecycle_recent_report(owner_uid: int, hours: int = 48, session: str
     start_ts = float(time.time()) - float(hours) * 3600.0
     rows = _trade_lifecycle_query_rows(owner_uid, start_ts=float(start_ts), session=session)
     analytics = _trade_lifecycle_metrics_from_rows(rows)
-    email_rows = _trade_lifecycle_recent_email_rows(owner_uid, start_ts=float(start_ts), session=session, limit=200)
-    emailed_total = len(email_rows)
-    emailed_executed = sum(1 for r in email_rows if str(r.get('trade_id') or '').strip())
-    emailed_queued = sum(1 for r in email_rows if float(r.get('executable_ts') or 0.0) > 0 and not str(r.get('trade_id') or '').strip())
-    emailed_only = max(0, emailed_total - emailed_executed - emailed_queued)
 
     lines = [
         '🧬 Trade Lifecycle Detail',
         HDR,
         f"Window: last {hours} hour(s) | Session: {session}",
-        f"Real bot trades: {int(analytics.get('total') or 0)} | Wins: {int(analytics.get('wins') or 0)} | Partial wins: {int(analytics.get('partial_wins') or 0)} | Losses: {int(analytics.get('losses') or 0)} | Open: {int(analytics.get('open') or 0)}",
+        f"Total trades: {int(analytics.get('total') or 0)} | Wins: {int(analytics.get('wins') or 0)} | Partial wins: {int(analytics.get('partial_wins') or 0)} | Losses: {int(analytics.get('losses') or 0)} | Open: {int(analytics.get('open') or 0)}",
         f"TP1 hits: {int(analytics.get('tp1_hits') or 0)} | TP2 hits: {int(analytics.get('tp2_hits') or 0)} | SL hits: {int(analytics.get('sl_hits') or 0)} | Risk-free: {int(analytics.get('risk_free_trades') or 0)}",
         f"Avg PnL: {float(analytics.get('avg_pnl') or 0.0):+.2f} USDT | Avg R: {float(analytics.get('avg_r') or 0.0):+.2f} | Win rate: {float(analytics.get('win_rate') or 0.0):.1f}%",
-        f"Email lane: emailed {emailed_total} | executed {emailed_executed} | queued/not-yet-synced {emailed_queued} | emailed-only {emailed_only}",
     ]
     sess_bits = []
     for sess in ('ASIA', 'LON', 'NY'):
@@ -10948,84 +11196,44 @@ def _trade_lifecycle_recent_report(owner_uid: int, hours: int = 48, session: str
         for s in (analytics.get('signs') or [])[:4]:
             lines.append(f"• {s}")
 
-    lines.extend([SEP, 'Executed Bybit-backed bot trades'])
+    lines.extend([SEP, 'Detailed trades'])
     if not rows:
-        lines.append('• No real bot trades found in this rolling window.')
-    else:
-        for r in rows[:60]:
-            trade_id = str(r.get('trade_id') or '')
-            setup_id = str(r.get('setup_id') or '')
-            symbol = str(r.get('symbol') or '?')
-            side = str(r.get('side') or '?')
-            open_ts = float(r.get('opened_ts') or 0.0)
-            close_ts = float(r.get('closed_ts') or 0.0)
-            open_txt = _fmt_dt_local(datetime.fromtimestamp(open_ts, tz=timezone.utc)) if open_ts > 0 else '—'
-            close_txt = _fmt_dt_local(datetime.fromtimestamp(close_ts, tz=timezone.utc)) if close_ts > 0 else '—'
-            hits = ', '.join(_trade_lifecycle_levels_hit(r)) or '—'
-            confirm_txt = 'exchange-confirmed' if int(r.get('exchange_confirmed') or 0) == 1 else 'inferred'
-            sync_note = str(r.get('source_note') or '').strip()
-            lines.append(f"• {trade_id} | {setup_id or '-'} | {symbol} {side} | {str(r.get('result_path') or '').upper()}")
-            lines.append(
-                f"  Entry {fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '—'} | SL {fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '—'} | TP1 {fmt_price(float(r.get('tp1') or 0.0)) if float(r.get('tp1') or 0.0) > 0 else '—'} | TP2 {fmt_price(float(r.get('tp2') or 0.0)) if float(r.get('tp2') or 0.0) > 0 else '—'}"
-            )
-            lines.append(
-                f"  RR1 {_trade_lifecycle_fmt_value(r.get('rr_tp1'), '.2f')} | RR2 {_trade_lifecycle_fmt_value(r.get('rr_tp2'), '.2f')} | Risk {_trade_lifecycle_fmt_value(r.get('risk_usdt'), '.2f')} USDT ({_trade_lifecycle_fmt_value(r.get('risk_pct'), '.2f')}%) | Conf {str(r.get('confidence') if r.get('confidence') is not None else '—')} | Q {_trade_lifecycle_fmt_value(r.get('quality_score'), '.1f')} | Engine {str(r.get('engine') or '—')}"
-            )
-            lines.append(
-                f"  Open {open_txt} | Day {str(r.get('open_day') or '—')} | Session {str(r.get('open_session') or '—')} | Close {close_txt} | Day {str(r.get('close_day') or '—')} | Session {str(r.get('close_session') or '—')}"
-            )
-            lines.append(
-                f"  Result {str(r.get('result_label') or '—')} | Hits {hits} | Risk-Free {str(r.get('risk_free_flag') or 'UNKNOWN')} | Reason {str(r.get('close_reason') or ('open' if str(r.get('result_path') or '').upper() == 'OPEN' else '—'))}"
-            )
-            lines.append(
-                f"  TP1 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp1_sec'))} | TP2 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(r.get('duration_to_sl_sec'))} | Total {_trade_lifecycle_fmt_duration(r.get('duration_total_sec'))}"
-            )
-            lines.append(
-                f"  PnL {_trade_lifecycle_fmt_value(r.get('pnl_usdt'), '.2f')} USDT | R {_trade_lifecycle_fmt_value(r.get('r_multiple'), '.2f')} | {confirm_txt}" + (f" | Note {sync_note}" if sync_note else '')
-            )
-        if len(rows) > 60:
-            lines.append(f"Showing first 60 of {len(rows)} real bot trades in this window.")
+        lines.append('• No bot trades found in this rolling window.')
+        return '\n'.join(lines)
 
-    lines.extend([SEP, 'Recent emailed setups'])
-    if not email_rows:
-        lines.append('• No emailed setups found in this rolling window.')
-    else:
-        for r in email_rows[:25]:
-            setup_id = str(r.get('setup_id') or '—')
-            symbol = str(r.get('symbol') or '?')
-            side = str(r.get('side') or '?')
-            emailed_ts = float(r.get('emailed_ts') or 0.0)
-            exe_ts = float(r.get('executable_ts') or 0.0)
-            trade_id = str(r.get('trade_id') or '').strip()
-            result_path = str(r.get('result_path') or '').upper().strip()
-            state = 'EMAILED_ONLY'
-            if trade_id:
-                state = result_path or 'EXECUTED'
-            elif exe_ts > 0:
-                state = 'QUEUED_OR_WAITING_SYNC'
-            email_txt = _fmt_dt_local(datetime.fromtimestamp(emailed_ts, tz=timezone.utc)) if emailed_ts > 0 else '—'
-            exe_txt = _fmt_dt_local(datetime.fromtimestamp(exe_ts, tz=timezone.utc)) if exe_ts > 0 else '—'
-            pnl_txt = _trade_lifecycle_fmt_value(r.get('pnl_usdt'), '.2f') if r.get('pnl_usdt') is not None else '—'
-            r_txt = _trade_lifecycle_fmt_value(r.get('r_multiple'), '.2f') if r.get('r_multiple') is not None else '—'
-            lines.append(f"• {setup_id} | {symbol} {side} | {state} | emailed {email_txt}")
-            lines.append(
-                f"  Entry {fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '—'} | SL {fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '—'} | TP1 {fmt_price(float(r.get('tp1') or 0.0)) if float(r.get('tp1') or 0.0) > 0 else '—'} | TP2 {fmt_price(float(r.get('tp2') or 0.0)) if float(r.get('tp2') or 0.0) > 0 else '—'} | Conf {str(r.get('conf') if r.get('conf') is not None else '—')}"
-            )
-            extras = []
-            if exe_ts > 0:
-                extras.append(f"executable {exe_txt}")
-            if trade_id:
-                extras.append(f"trade {trade_id}")
-            if result_path:
-                extras.append(result_path)
-            if pnl_txt != '—':
-                extras.append(f"PnL {pnl_txt} USDT")
-            if r_txt != '—':
-                extras.append(f"R {r_txt}")
-            if extras:
-                lines.append('  ' + ' | '.join(extras))
-        if len(email_rows) > 25:
-            lines.append(f"Showing first 25 of {len(email_rows)} emailed setups in this window.")
+    for r in rows[:60]:
+        trade_id = str(r.get('trade_id') or '')
+        setup_id = str(r.get('setup_id') or '')
+        symbol = str(r.get('symbol') or '?')
+        side = str(r.get('side') or '?')
+        open_ts = float(r.get('opened_ts') or 0.0)
+        close_ts = float(r.get('closed_ts') or 0.0)
+        open_txt = _fmt_dt_local(datetime.fromtimestamp(open_ts, tz=timezone.utc)) if open_ts > 0 else '—'
+        close_txt = _fmt_dt_local(datetime.fromtimestamp(close_ts, tz=timezone.utc)) if close_ts > 0 else '—'
+        hits = ', '.join(_trade_lifecycle_levels_hit(r)) or '—'
+        confirm_txt = 'exchange-confirmed' if int(r.get('exchange_confirmed') or 0) == 1 else 'inferred'
+        sync_note = str(r.get('source_note') or '').strip()
+        lines.append(f"• {trade_id} | {setup_id or '-'} | {symbol} {side} | {str(r.get('result_path') or '').upper()}")
+        lines.append(
+            f"  Entry {fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '—'} | SL {fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '—'} | TP1 {fmt_price(float(r.get('tp1') or 0.0)) if float(r.get('tp1') or 0.0) > 0 else '—'} | TP2 {fmt_price(float(r.get('tp2') or 0.0)) if float(r.get('tp2') or 0.0) > 0 else '—'}"
+        )
+        lines.append(
+            f"  RR1 {_trade_lifecycle_fmt_value(r.get('rr_tp1'), '.2f')} | RR2 {_trade_lifecycle_fmt_value(r.get('rr_tp2'), '.2f')} | Risk {_trade_lifecycle_fmt_value(r.get('risk_usdt'), '.2f')} USDT ({_trade_lifecycle_fmt_value(r.get('risk_pct'), '.2f')}%) | Conf {str(r.get('confidence') if r.get('confidence') is not None else '—')} | Q {_trade_lifecycle_fmt_value(r.get('quality_score'), '.1f')} | Engine {str(r.get('engine') or '—')}"
+        )
+        lines.append(
+            f"  Open {open_txt} | Day {str(r.get('open_day') or '—')} | Session {str(r.get('open_session') or '—')} | Close {close_txt} | Day {str(r.get('close_day') or '—')} | Session {str(r.get('close_session') or '—')}"
+        )
+        lines.append(
+            f"  Result {str(r.get('result_label') or '—')} | Result Path {str(r.get('result_path') or '—')} | Hits {hits} | Risk-Free {str(r.get('risk_free_flag') or 'UNKNOWN')} | Reason {str(r.get('close_reason') or ('open' if str(r.get('result_path') or '').upper() == 'OPEN' else '—'))}"
+        )
+        lines.append(
+            f"  TP1 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp1_sec'))} | TP2 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(r.get('duration_to_sl_sec'))} | Total {_trade_lifecycle_fmt_duration(r.get('duration_total_sec'))}"
+        )
+        lines.append(
+            f"  PnL {_trade_lifecycle_fmt_value(r.get('pnl_usdt'), '.2f')} USDT | R {_trade_lifecycle_fmt_value(r.get('r_multiple'), '.2f')} | {confirm_txt}" + (f" | Note {sync_note}" if sync_note else '')
+        )
+    if len(rows) > 60:
+        lines.append(f"Showing first 60 of {len(rows)} real bot trades in this window.")
     return '\n'.join(lines)
 
 
@@ -11183,7 +11391,6 @@ async def trade_lifecycle_detail_cmd(update: Update, context: ContextTypes.DEFAU
     raw_args = [str(a or '').strip() for a in (context.args or []) if str(a or '').strip()]
     hours = 48
     session = 'ALL'
-    ident = ''
     for raw in raw_args:
         up = raw.upper().strip()
         if up in {'ALL', 'ASIA', 'LON', 'NY'}:
@@ -11193,15 +11400,10 @@ async def trade_lifecycle_detail_cmd(update: Update, context: ContextTypes.DEFAU
         if re.fullmatch(r"\d+(?:\.\d+)?", num_txt or ''):
             try:
                 hours = int(max(1, min(int(float(num_txt)), 24 * 90)))
-                continue
             except Exception:
                 pass
-        ident = raw
-        break
-    if ident:
-        text_out = await to_thread_heavy(_trade_lifecycle_detail_report, owner_uid, ident)
-    else:
-        text_out = await to_thread_heavy(_trade_lifecycle_recent_report, owner_uid, hours, session)
+            continue
+    text_out = await to_thread_heavy(_trade_lifecycle_recent_report, owner_uid, hours, session)
     await send_long_message(update, text_out, parse_mode=None)
 
 
@@ -22610,7 +22812,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_report_overall": "AutoTrade overall performance summary",
     "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
     "trade_lifecycle": "Exchange-backed per-trade lifecycle analytics with TP/SL path classification",
-    "trade_lifecycle_detail": "Detailed lifecycle report for the last 48h (or N hours), with optional setup_id/trade_id lookup",
+    "trade_lifecycle_detail": "Detailed rolling lifecycle report for the last 48h (or N hours), optional session filter",
     "autotrade_sessions": "Show or set allowed auto-trade sessions",
     "open_trades": "Show live open Bybit positions",
     "cooldown_clear": "Clear cooldown for one symbol + side",
