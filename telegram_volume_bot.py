@@ -10823,18 +10823,210 @@ def _trade_lifecycle_detail_row(owner_uid: int, ident: str, sync: bool = True) -
             _trade_lifecycle_sync(owner_uid, days=90, force=False)
         except Exception:
             pass
+    keys = []
+    for cand in [key, key.upper(), key.lower()]:
+        cand = str(cand or '').strip()
+        if cand:
+            keys.append(cand)
+            if cand.startswith('ID-'):
+                keys.append(cand[3:])
+            else:
+                keys.append(f'ID-{cand}')
+    norm_keys = []
+    seen = set()
+    for item in keys:
+        item = str(item or '').strip()
+        if item and item not in seen:
+            seen.add(item)
+            norm_keys.append(item)
+    if not norm_keys:
+        return {}
     _trade_lifecycle_migrate()
     try:
         with sqlite3.connect(DB_PATH) as con:
             con.row_factory = sqlite3.Row
             cur = con.cursor()
+            placeholders = ','.join(['?'] * len(norm_keys))
             row = cur.execute(
-                "SELECT * FROM trade_lifecycle WHERE uid=? AND (trade_id=? OR setup_id=?) ORDER BY COALESCE(opened_ts,0) DESC LIMIT 1",
-                (owner_uid, key, key),
+                f"SELECT * FROM trade_lifecycle WHERE uid=? AND (trade_id IN ({placeholders}) OR setup_id IN ({placeholders})) ORDER BY COALESCE(opened_ts,0) DESC LIMIT 1",
+                tuple([owner_uid] + norm_keys + norm_keys),
             ).fetchone()
             return dict(row) if row else {}
     except Exception:
         return {}
+
+
+def _trade_lifecycle_recent_email_rows(owner_uid: int, start_ts: float, session: str = 'ALL', limit: int = 200) -> list[dict]:
+    owner_uid = int(owner_uid)
+    _trade_lifecycle_migrate()
+    params = [owner_uid, float(start_ts or 0.0)]
+    q = """
+        SELECT
+            e.setup_id,
+            e.session AS emailed_session,
+            e.emailed_ts,
+            x.executable_ts,
+            s.symbol,
+            s.side,
+            s.conf,
+            s.entry,
+            s.sl,
+            s.tp1,
+            s.tp2,
+            tl.trade_id,
+            tl.result_path,
+            tl.result_label,
+            tl.opened_ts,
+            tl.closed_ts,
+            tl.open_session,
+            tl.close_session,
+            tl.pnl_usdt,
+            tl.r_multiple,
+            tl.risk_free_flag,
+            tl.exchange_confirmed,
+            tl.source_note
+        FROM emailed_setups e
+        LEFT JOIN executable_setups x
+               ON x.user_id=e.user_id AND x.setup_id=e.setup_id
+        LEFT JOIN signals s
+               ON s.setup_id=e.setup_id
+        LEFT JOIN trade_lifecycle tl
+               ON tl.uid=e.user_id AND tl.setup_id=e.setup_id
+        WHERE e.user_id=? AND e.emailed_ts>=?
+    """
+    sess = str(session or 'ALL').upper().strip()
+    if sess in {'ASIA', 'LON', 'NY'}:
+        q += " AND UPPER(COALESCE(e.session,''))=?"
+        params.append(sess)
+    q += " ORDER BY COALESCE(e.emailed_ts,0) DESC LIMIT ?"
+    params.append(int(max(1, min(int(limit or 200), 500))))
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            return [dict(r) for r in (cur.execute(q, tuple(params)).fetchall() or [])]
+    except Exception:
+        return []
+
+
+def _trade_lifecycle_recent_report(owner_uid: int, hours: int = 48, session: str = 'ALL') -> str:
+    owner_uid = int(owner_uid)
+    hours = int(max(1, min(int(hours or 48), 24 * 90)))
+    session = str(session or 'ALL').upper().strip() or 'ALL'
+    sync_days = max(7, int(math.ceil(float(hours) / 24.0)) + 3)
+    try:
+        _trade_lifecycle_sync(owner_uid, days=sync_days, force=True)
+    except Exception:
+        pass
+    start_ts = float(time.time()) - float(hours) * 3600.0
+    rows = _trade_lifecycle_query_rows(owner_uid, start_ts=float(start_ts), session=session)
+    analytics = _trade_lifecycle_metrics_from_rows(rows)
+    email_rows = _trade_lifecycle_recent_email_rows(owner_uid, start_ts=float(start_ts), session=session, limit=200)
+    emailed_total = len(email_rows)
+    emailed_executed = sum(1 for r in email_rows if str(r.get('trade_id') or '').strip())
+    emailed_queued = sum(1 for r in email_rows if float(r.get('executable_ts') or 0.0) > 0 and not str(r.get('trade_id') or '').strip())
+    emailed_only = max(0, emailed_total - emailed_executed - emailed_queued)
+
+    lines = [
+        '🧬 Trade Lifecycle Detail',
+        HDR,
+        f"Window: last {hours} hour(s) | Session: {session}",
+        f"Real bot trades: {int(analytics.get('total') or 0)} | Wins: {int(analytics.get('wins') or 0)} | Partial wins: {int(analytics.get('partial_wins') or 0)} | Losses: {int(analytics.get('losses') or 0)} | Open: {int(analytics.get('open') or 0)}",
+        f"TP1 hits: {int(analytics.get('tp1_hits') or 0)} | TP2 hits: {int(analytics.get('tp2_hits') or 0)} | SL hits: {int(analytics.get('sl_hits') or 0)} | Risk-free: {int(analytics.get('risk_free_trades') or 0)}",
+        f"Avg PnL: {float(analytics.get('avg_pnl') or 0.0):+.2f} USDT | Avg R: {float(analytics.get('avg_r') or 0.0):+.2f} | Win rate: {float(analytics.get('win_rate') or 0.0):.1f}%",
+        f"Email lane: emailed {emailed_total} | executed {emailed_executed} | queued/not-yet-synced {emailed_queued} | emailed-only {emailed_only}",
+    ]
+    sess_bits = []
+    for sess in ('ASIA', 'LON', 'NY'):
+        item = (analytics.get('by_open_session') or {}).get(sess) or {}
+        if item:
+            sess_bits.append(f"{sess} {int(item.get('total') or 0)}T / WR {float(item.get('win_rate') or 0.0):.1f}% / AvgR {float(item.get('avg_r') or 0.0):+.2f}")
+    lines.append('Session breakdown: ' + (' | '.join(sess_bits) if sess_bits else '—'))
+
+    if analytics.get('signs'):
+        lines.extend([SEP, 'Optimization signals'])
+        for s in (analytics.get('signs') or [])[:4]:
+            lines.append(f"• {s}")
+
+    lines.extend([SEP, 'Executed Bybit-backed bot trades'])
+    if not rows:
+        lines.append('• No real bot trades found in this rolling window.')
+    else:
+        for r in rows[:60]:
+            trade_id = str(r.get('trade_id') or '')
+            setup_id = str(r.get('setup_id') or '')
+            symbol = str(r.get('symbol') or '?')
+            side = str(r.get('side') or '?')
+            open_ts = float(r.get('opened_ts') or 0.0)
+            close_ts = float(r.get('closed_ts') or 0.0)
+            open_txt = _fmt_dt_local(datetime.fromtimestamp(open_ts, tz=timezone.utc)) if open_ts > 0 else '—'
+            close_txt = _fmt_dt_local(datetime.fromtimestamp(close_ts, tz=timezone.utc)) if close_ts > 0 else '—'
+            hits = ', '.join(_trade_lifecycle_levels_hit(r)) or '—'
+            confirm_txt = 'exchange-confirmed' if int(r.get('exchange_confirmed') or 0) == 1 else 'inferred'
+            sync_note = str(r.get('source_note') or '').strip()
+            lines.append(f"• {trade_id} | {setup_id or '-'} | {symbol} {side} | {str(r.get('result_path') or '').upper()}")
+            lines.append(
+                f"  Entry {fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '—'} | SL {fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '—'} | TP1 {fmt_price(float(r.get('tp1') or 0.0)) if float(r.get('tp1') or 0.0) > 0 else '—'} | TP2 {fmt_price(float(r.get('tp2') or 0.0)) if float(r.get('tp2') or 0.0) > 0 else '—'}"
+            )
+            lines.append(
+                f"  RR1 {_trade_lifecycle_fmt_value(r.get('rr_tp1'), '.2f')} | RR2 {_trade_lifecycle_fmt_value(r.get('rr_tp2'), '.2f')} | Risk {_trade_lifecycle_fmt_value(r.get('risk_usdt'), '.2f')} USDT ({_trade_lifecycle_fmt_value(r.get('risk_pct'), '.2f')}%) | Conf {str(r.get('confidence') if r.get('confidence') is not None else '—')} | Q {_trade_lifecycle_fmt_value(r.get('quality_score'), '.1f')} | Engine {str(r.get('engine') or '—')}"
+            )
+            lines.append(
+                f"  Open {open_txt} | Day {str(r.get('open_day') or '—')} | Session {str(r.get('open_session') or '—')} | Close {close_txt} | Day {str(r.get('close_day') or '—')} | Session {str(r.get('close_session') or '—')}"
+            )
+            lines.append(
+                f"  Result {str(r.get('result_label') or '—')} | Hits {hits} | Risk-Free {str(r.get('risk_free_flag') or 'UNKNOWN')} | Reason {str(r.get('close_reason') or ('open' if str(r.get('result_path') or '').upper() == 'OPEN' else '—'))}"
+            )
+            lines.append(
+                f"  TP1 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp1_sec'))} | TP2 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(r.get('duration_to_sl_sec'))} | Total {_trade_lifecycle_fmt_duration(r.get('duration_total_sec'))}"
+            )
+            lines.append(
+                f"  PnL {_trade_lifecycle_fmt_value(r.get('pnl_usdt'), '.2f')} USDT | R {_trade_lifecycle_fmt_value(r.get('r_multiple'), '.2f')} | {confirm_txt}" + (f" | Note {sync_note}" if sync_note else '')
+            )
+        if len(rows) > 60:
+            lines.append(f"Showing first 60 of {len(rows)} real bot trades in this window.")
+
+    lines.extend([SEP, 'Recent emailed setups'])
+    if not email_rows:
+        lines.append('• No emailed setups found in this rolling window.')
+    else:
+        for r in email_rows[:25]:
+            setup_id = str(r.get('setup_id') or '—')
+            symbol = str(r.get('symbol') or '?')
+            side = str(r.get('side') or '?')
+            emailed_ts = float(r.get('emailed_ts') or 0.0)
+            exe_ts = float(r.get('executable_ts') or 0.0)
+            trade_id = str(r.get('trade_id') or '').strip()
+            result_path = str(r.get('result_path') or '').upper().strip()
+            state = 'EMAILED_ONLY'
+            if trade_id:
+                state = result_path or 'EXECUTED'
+            elif exe_ts > 0:
+                state = 'QUEUED_OR_WAITING_SYNC'
+            email_txt = _fmt_dt_local(datetime.fromtimestamp(emailed_ts, tz=timezone.utc)) if emailed_ts > 0 else '—'
+            exe_txt = _fmt_dt_local(datetime.fromtimestamp(exe_ts, tz=timezone.utc)) if exe_ts > 0 else '—'
+            pnl_txt = _trade_lifecycle_fmt_value(r.get('pnl_usdt'), '.2f') if r.get('pnl_usdt') is not None else '—'
+            r_txt = _trade_lifecycle_fmt_value(r.get('r_multiple'), '.2f') if r.get('r_multiple') is not None else '—'
+            lines.append(f"• {setup_id} | {symbol} {side} | {state} | emailed {email_txt}")
+            lines.append(
+                f"  Entry {fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '—'} | SL {fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '—'} | TP1 {fmt_price(float(r.get('tp1') or 0.0)) if float(r.get('tp1') or 0.0) > 0 else '—'} | TP2 {fmt_price(float(r.get('tp2') or 0.0)) if float(r.get('tp2') or 0.0) > 0 else '—'} | Conf {str(r.get('conf') if r.get('conf') is not None else '—')}"
+            )
+            extras = []
+            if exe_ts > 0:
+                extras.append(f"executable {exe_txt}")
+            if trade_id:
+                extras.append(f"trade {trade_id}")
+            if result_path:
+                extras.append(result_path)
+            if pnl_txt != '—':
+                extras.append(f"PnL {pnl_txt} USDT")
+            if r_txt != '—':
+                extras.append(f"R {r_txt}")
+            if extras:
+                lines.append('  ' + ' | '.join(extras))
+        if len(email_rows) > 25:
+            lines.append(f"Showing first 25 of {len(email_rows)} emailed setups in this window.")
+    return '\n'.join(lines)
 
 
 def _trade_lifecycle_compact_report(owner_uid: int, days: int = 7, session: str = 'ALL') -> str:
@@ -10987,12 +11179,29 @@ async def trade_lifecycle_detail_cmd(update: Update, context: ContextTypes.DEFAU
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text('⛔️ Owner/admin only.')
         return
-    ident = str(' '.join(context.args or [])).strip()
-    if not ident:
-        await update.message.reply_text('Usage: /trade_lifecycle_detail <setup_id or trade_id>')
-        return
     owner_uid = _trade_lifecycle_owner_uid(uid)
-    text_out = await to_thread_heavy(_trade_lifecycle_detail_report, owner_uid, ident)
+    raw_args = [str(a or '').strip() for a in (context.args or []) if str(a or '').strip()]
+    hours = 48
+    session = 'ALL'
+    ident = ''
+    for raw in raw_args:
+        up = raw.upper().strip()
+        if up in {'ALL', 'ASIA', 'LON', 'NY'}:
+            session = up
+            continue
+        num_txt = up[:-1] if up.endswith('H') else up
+        if re.fullmatch(r"\d+(?:\.\d+)?", num_txt or ''):
+            try:
+                hours = int(max(1, min(int(float(num_txt)), 24 * 90)))
+                continue
+            except Exception:
+                pass
+        ident = raw
+        break
+    if ident:
+        text_out = await to_thread_heavy(_trade_lifecycle_detail_report, owner_uid, ident)
+    else:
+        text_out = await to_thread_heavy(_trade_lifecycle_recent_report, owner_uid, hours, session)
     await send_long_message(update, text_out, parse_mode=None)
 
 
@@ -22401,7 +22610,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_report_overall": "AutoTrade overall performance summary",
     "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
     "trade_lifecycle": "Exchange-backed per-trade lifecycle analytics with TP/SL path classification",
-    "trade_lifecycle_detail": "Detailed lifecycle timeline for one setup_id or trade_id",
+    "trade_lifecycle_detail": "Detailed lifecycle report for the last 48h (or N hours), with optional setup_id/trade_id lookup",
     "autotrade_sessions": "Show or set allowed auto-trade sessions",
     "open_trades": "Show live open Bybit positions",
     "cooldown_clear": "Clear cooldown for one symbol + side",
