@@ -10578,6 +10578,26 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
             if source_conf != 'HIGH':
                 source_conf = 'MEDIUM'
 
+    # Historical BE-stop evidence is used later when classifying TP1 -> risk-free paths.
+    # This must be initialized here; otherwise the later reference can raise NameError,
+    # which makes the sync loop silently skip valid trades and leaves
+    # /trade_lifecycle_detail empty even when bot trades exist.
+    be_stop_history_event = None
+    try:
+        be_stop_history_event = _trade_lifecycle_be_stop_history_event(
+            side,
+            entry,
+            matched_orders,
+            after_ts=float(tp1_hit_ts or 0.0),
+        )
+        if be_stop_history_event is not None:
+            source_bits.append('be_stop_from_order_history')
+            exchange_confirmed = 1
+            if source_conf == 'LOW':
+                source_conf = 'MEDIUM'
+    except Exception:
+        be_stop_history_event = None
+
     be_sl_event = None
     non_be_sl_event = None
     for ev in (sl_events or []):
