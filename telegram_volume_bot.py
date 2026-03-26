@@ -6906,6 +6906,7 @@ def _learning_status_text() -> str:
     stage = _learning_stage_outcome_summary(owner, days=60)
     be = _learning_breakeven_after_tp1_analysis(owner, days=60)
     live = _learning_live_trade_summary(owner, days=60)
+    lifecycle = _trade_lifecycle_analytics(owner, days=30, session='ALL', sync=True, force=False) if owner > 0 else {}
 
     hourly_no_data = int(hourly.get("analyzed_setups", 0) or 0) == 0 and int(hourly.get("analyzed_trades", 0) or 0) == 0
     daily_no_data = int(daily.get("analyzed_setups", 0) or 0) == 0 and int(daily.get("analyzed_trades", 0) or 0) == 0
@@ -6959,6 +6960,7 @@ def _learning_status_text() -> str:
         f"TP1: {int(stage.get('tp1_only') or 0)} | TP2: {int(stage.get('tp2_plus') or 0)} | SL: {int(stage.get('losses') or 0)} | OPEN: {int(stage.get('open') or 0)}",
         f"Weighted TP accuracy: {float(stage.get('weighted_win_rate') or 0.0):.1f}% | Avg staged credit/trade: {float(stage.get('avg_weighted_credit') or 0.0):.2f}",
         f"Live autotrade closes available: {int(live.get('closed') or 0)} | Net PnL: ${float(live.get('net_pnl') or 0.0):+.2f} | Win rate: {float(live.get('win_rate') or 0.0):.1f}%",
+        f"Lifecycle 30d: TP1 hits {int(lifecycle.get('tp1_hits') or 0)} | TP2 conversion {float(lifecycle.get('tp2_conversion_after_tp1') or 0.0):.1f}% | Risk-free save {float(lifecycle.get('risk_free_save_rate') or 0.0):.1f}% | Avg TP1 {_trade_lifecycle_fmt_duration(lifecycle.get('avg_time_to_tp1_sec'))}",
         f"Breakeven after TP1: {str(be.get('recommendation') or 'NEUTRAL')} | TP1+ sample: {int(be.get('sample_tp1_plus') or 0)} | TP1-only share: {float(be.get('tp1_only_share') or 0.0):.1f}%",
         f"Why: {str(be.get('explanation') or 'Not enough TP1-path data yet.')}",
         SEP,
@@ -9510,6 +9512,1488 @@ def _admin_setup_lifecycle_recent(uid: int, limit: int = 10) -> list[dict]:
             return [dict(r) for r in rows]
     except Exception:
         return []
+
+
+
+# =========================================================
+# TRADE LIFECYCLE ANALYTICS (exchange-backed, conservative)
+# =========================================================
+
+def _trade_lifecycle_migrate() -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trade_lifecycle (
+                    trade_id TEXT PRIMARY KEY,
+                    setup_id TEXT NOT NULL DEFAULT '',
+                    uid INTEGER NOT NULL DEFAULT 0,
+                    symbol TEXT NOT NULL DEFAULT '',
+                    side TEXT NOT NULL DEFAULT '',
+                    entry REAL,
+                    sl REAL,
+                    tp1 REAL,
+                    tp2 REAL,
+                    rr_tp1 REAL,
+                    rr_tp2 REAL,
+                    opened_ts REAL,
+                    closed_ts REAL,
+                    open_day TEXT NOT NULL DEFAULT '',
+                    close_day TEXT NOT NULL DEFAULT '',
+                    open_session TEXT NOT NULL DEFAULT '',
+                    close_session TEXT NOT NULL DEFAULT '',
+                    risk_usdt REAL,
+                    risk_pct REAL,
+                    confidence INTEGER,
+                    quality_score REAL,
+                    engine TEXT NOT NULL DEFAULT '',
+                    tp1_hit_ts REAL,
+                    tp2_hit_ts REAL,
+                    sl_hit_ts REAL,
+                    be_armed_ts REAL,
+                    be_hit_ts REAL,
+                    result_path TEXT NOT NULL DEFAULT '',
+                    result_label TEXT NOT NULL DEFAULT '',
+                    close_reason TEXT NOT NULL DEFAULT '',
+                    risk_free_flag TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    pnl_usdt REAL,
+                    r_multiple REAL,
+                    duration_total_sec REAL,
+                    duration_to_tp1_sec REAL,
+                    duration_to_tp2_sec REAL,
+                    duration_to_sl_sec REAL,
+                    source_confidence TEXT NOT NULL DEFAULT '',
+                    source_note TEXT NOT NULL DEFAULT '',
+                    exchange_confirmed INTEGER NOT NULL DEFAULT 0,
+                    last_sync_ts REAL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trade_lifecycle_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_ts REAL,
+                    price REAL,
+                    qty REAL,
+                    pnl_usdt REAL,
+                    source TEXT NOT NULL DEFAULT '',
+                    details_json TEXT NOT NULL DEFAULT '',
+                    UNIQUE(trade_id, event_type, event_ts, price, qty, source)
+                )
+            """)
+            cols = {r[1] for r in cur.execute("PRAGMA table_info(trade_lifecycle)").fetchall()}
+            def add_col(name: str, ddl: str):
+                if name not in cols:
+                    cur.execute(f"ALTER TABLE trade_lifecycle ADD COLUMN {ddl}")
+                    cols.add(name)
+            add_col('setup_id', "setup_id TEXT NOT NULL DEFAULT ''")
+            add_col('uid', 'uid INTEGER NOT NULL DEFAULT 0')
+            add_col('symbol', "symbol TEXT NOT NULL DEFAULT ''")
+            add_col('side', "side TEXT NOT NULL DEFAULT ''")
+            add_col('entry', 'entry REAL')
+            add_col('sl', 'sl REAL')
+            add_col('tp1', 'tp1 REAL')
+            add_col('tp2', 'tp2 REAL')
+            add_col('rr_tp1', 'rr_tp1 REAL')
+            add_col('rr_tp2', 'rr_tp2 REAL')
+            add_col('opened_ts', 'opened_ts REAL')
+            add_col('closed_ts', 'closed_ts REAL')
+            add_col('open_day', "open_day TEXT NOT NULL DEFAULT ''")
+            add_col('close_day', "close_day TEXT NOT NULL DEFAULT ''")
+            add_col('open_session', "open_session TEXT NOT NULL DEFAULT ''")
+            add_col('close_session', "close_session TEXT NOT NULL DEFAULT ''")
+            add_col('risk_usdt', 'risk_usdt REAL')
+            add_col('risk_pct', 'risk_pct REAL')
+            add_col('confidence', 'confidence INTEGER')
+            add_col('quality_score', 'quality_score REAL')
+            add_col('engine', "engine TEXT NOT NULL DEFAULT ''")
+            add_col('tp1_hit_ts', 'tp1_hit_ts REAL')
+            add_col('tp2_hit_ts', 'tp2_hit_ts REAL')
+            add_col('sl_hit_ts', 'sl_hit_ts REAL')
+            add_col('be_armed_ts', 'be_armed_ts REAL')
+            add_col('be_hit_ts', 'be_hit_ts REAL')
+            add_col('result_path', "result_path TEXT NOT NULL DEFAULT ''")
+            add_col('result_label', "result_label TEXT NOT NULL DEFAULT ''")
+            add_col('close_reason', "close_reason TEXT NOT NULL DEFAULT ''")
+            add_col('risk_free_flag', "risk_free_flag TEXT NOT NULL DEFAULT 'UNKNOWN'")
+            add_col('pnl_usdt', 'pnl_usdt REAL')
+            add_col('r_multiple', 'r_multiple REAL')
+            add_col('duration_total_sec', 'duration_total_sec REAL')
+            add_col('duration_to_tp1_sec', 'duration_to_tp1_sec REAL')
+            add_col('duration_to_tp2_sec', 'duration_to_tp2_sec REAL')
+            add_col('duration_to_sl_sec', 'duration_to_sl_sec REAL')
+            add_col('source_confidence', "source_confidence TEXT NOT NULL DEFAULT ''")
+            add_col('source_note', "source_note TEXT NOT NULL DEFAULT ''")
+            add_col('exchange_confirmed', 'exchange_confirmed INTEGER NOT NULL DEFAULT 0')
+            add_col('last_sync_ts', 'last_sync_ts REAL')
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_lifecycle_uid_opened ON trade_lifecycle(uid, opened_ts DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_lifecycle_uid_closed ON trade_lifecycle(uid, closed_ts DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_lifecycle_uid_session ON trade_lifecycle(uid, open_session, opened_ts DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_lifecycle_setup ON trade_lifecycle(setup_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_lifecycle_events_trade ON trade_lifecycle_events(trade_id, event_ts)")
+            con.commit()
+    except Exception:
+        pass
+
+
+def _trade_lifecycle_result_label(path: str) -> str:
+    p = str(path or '').upper().strip()
+    if p == 'HIT_SL_LOSS':
+        return 'hit SL (Loss)'
+    if p == 'HIT_TP1_THEN_BE_SL':
+        return 'hit TP1 then BE SL (Partial Win / Risk-Free)'
+    if p == 'HIT_TP1_THEN_SL':
+        return 'hit TP1 then SL (Partial Win)'
+    if p == 'HIT_TP2_WIN':
+        return 'hit TP2 (Win)'
+    if p == 'MANUAL_OR_UNKNOWN_CLOSE':
+        return 'manual / unknown exchange close'
+    if p == 'OPEN':
+        return 'still open'
+    return ''
+
+
+def _trade_lifecycle_fmt_duration(sec) -> str:
+    try:
+        if sec is None:
+            return '—'
+        total = int(round(float(sec)))
+        if total < 0:
+            return '—'
+        d, rem = divmod(total, 86400)
+        h, rem = divmod(rem, 3600)
+        m, s = divmod(rem, 60)
+        if d > 0:
+            return f"{d}d {h:02d}:{m:02d}"
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    except Exception:
+        return '—'
+
+
+def _trade_lifecycle_event_ts(obj: dict) -> float:
+    try:
+        return float(obj.get('ts') or obj.get('event_ts') or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _trade_lifecycle_pick_ts(values: list[float], pick: str = 'min'):
+    vals = [float(v) for v in (values or []) if float(v or 0.0) > 0]
+    if not vals:
+        return None
+    return min(vals) if str(pick or 'min').lower() == 'min' else max(vals)
+
+
+def _trade_lifecycle_is_be_or_better(side: str, price: float, entry: float, rel_tol: float = 0.0015) -> bool:
+    try:
+        p = float(price or 0.0)
+        e = float(entry or 0.0)
+        if p <= 0 or e <= 0:
+            return False
+        if _price_close_enough(p, e, rel_tol=rel_tol):
+            return True
+        sd = str(side or '').upper().strip()
+        if sd == 'BUY':
+            return p > e
+        if sd == 'SELL':
+            return p < e
+        return False
+    except Exception:
+        return False
+
+
+def _trade_lifecycle_close_side(side: str) -> str:
+    sd = str(side or '').upper().strip()
+    if sd == 'BUY':
+        return 'SELL'
+    if sd == 'SELL':
+        return 'BUY'
+    return ''
+
+
+def _trade_lifecycle_fmt_value(val, fmt: str = '.2f') -> str:
+    try:
+        if val is None:
+            return '—'
+        return format(float(val), fmt)
+    except Exception:
+        return '—'
+
+
+def _trade_lifecycle_risk_pct_estimate(uid: int, risk_usdt: float) -> tuple[float | None, str]:
+    user = _autotrade_user_settings(int(uid))
+    try:
+        mode = str(user.get('risk_mode', DEFAULT_RISK_MODE) or DEFAULT_RISK_MODE).upper().strip()
+    except Exception:
+        mode = str(DEFAULT_RISK_MODE).upper()
+    try:
+        val = float(user.get('risk_value', DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
+    except Exception:
+        val = float(DEFAULT_RISK_VALUE)
+    if mode == 'PCT' and val > 0:
+        return (float(val), 'risk_pct_from_user_setting')
+    try:
+        eq = float(_effective_equity_for_risk(user, prefer_live=False) or 0.0)
+        if eq > 0 and float(risk_usdt or 0.0) >= 0:
+            return (float(risk_usdt or 0.0) / eq * 100.0, 'risk_pct_estimated_from_current_equity')
+    except Exception:
+        pass
+    return (None, 'risk_pct_unknown')
+
+
+def _trade_lifecycle_conf_bucket(conf) -> str:
+    try:
+        c = int(float(conf or 0))
+    except Exception:
+        c = 0
+    if c >= 90:
+        return '90+'
+    if c >= 85:
+        return '85-89'
+    if c >= 80:
+        return '80-84'
+    if c >= 75:
+        return '75-79'
+    if c > 0:
+        return '<75'
+    return 'UNKNOWN'
+
+
+def _trade_lifecycle_quality_bucket(score) -> str:
+    try:
+        q = float(score or 0.0)
+    except Exception:
+        q = 0.0
+    if q >= 85:
+        return '85+'
+    if q >= 80:
+        return '80-84'
+    if q >= 75:
+        return '75-79'
+    if q >= 70:
+        return '70-74'
+    if q > 0:
+        return '<70'
+    return 'UNKNOWN'
+
+
+def _trade_lifecycle_levels_hit(row: dict) -> list[str]:
+    levels = []
+    try:
+        if float(row.get('tp1_hit_ts') or 0.0) > 0:
+            levels.append('TP1')
+    except Exception:
+        pass
+    try:
+        if float(row.get('tp2_hit_ts') or 0.0) > 0:
+            levels.append('TP2')
+    except Exception:
+        pass
+    try:
+        if float(row.get('sl_hit_ts') or 0.0) > 0:
+            levels.append('SL')
+    except Exception:
+        pass
+    return levels
+
+
+def _trade_lifecycle_safe_setup_id(trade: dict) -> str:
+    sid = str((trade or {}).get('setup_id') or '').strip()
+    if sid:
+        return sid
+    tid = str((trade or {}).get('trade_id') or '').strip()
+    if not tid:
+        return ''
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            row = cur.execute("SELECT setup_id FROM admin_setup_lifecycle WHERE trade_id=? LIMIT 1", (tid,)).fetchone()
+            return str((row[0] if row else '') or '').strip()
+    except Exception:
+        return ''
+
+
+def _bybit_get_order_history_linear(symbol: str, start_ts: float, end_ts: float, limit: int = 200) -> list[dict]:
+    sym = _bybit_linear_symbol(symbol)
+    if not sym or not BYBIT_API_KEY or not BYBIT_API_SECRET:
+        return []
+    try:
+        st = max(0, int(float(start_ts or 0.0) * 1000))
+        et = max(st, int(float(end_ts or 0.0) * 1000))
+    except Exception:
+        return []
+    cache_key = f"trade_lifecycle:order_history:{sym}:{st}:{et}:{int(limit)}"
+    try:
+        if cache_valid(cache_key, 90):
+            return list(cache_get(cache_key) or [])
+    except Exception:
+        pass
+    out = []
+    seen = set()
+    for order_filter in (None, 'Order', 'StopOrder', 'tpslOrder', 'TPSLOrder'):
+        cursor = None
+        for _ in range(6):
+            payload = {
+                'category': 'linear',
+                'symbol': sym,
+                'startTime': st,
+                'endTime': et,
+                'limit': int(max(20, min(int(limit or 200), 200))),
+            }
+            if order_filter:
+                payload['orderFilter'] = order_filter
+            if cursor:
+                payload['cursor'] = cursor
+            try:
+                res = _bybit_v5_request('GET', '/v5/order/history', payload)
+            except Exception:
+                break
+            if int((res or {}).get('retCode', -1)) != 0:
+                break
+            result = (res or {}).get('result') or {}
+            rows = result.get('list') or []
+            if not rows:
+                break
+            added = 0
+            for row in rows:
+                try:
+                    key = (
+                        str((row or {}).get('orderId') or ''),
+                        str((row or {}).get('orderLinkId') or ''),
+                        int(_bybit_order_filled_time_ts(row) or 0),
+                        str((row or {}).get('orderStatus') or ''),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(dict(row or {}))
+                    added += 1
+                except Exception:
+                    continue
+            cursor = str(result.get('nextPageCursor') or result.get('nextPageToken') or '').strip()
+            if not cursor or added <= 0:
+                break
+    out.sort(key=lambda r: float(_bybit_order_filled_time_ts(r) or 0.0))
+    try:
+        cache_set(cache_key, list(out))
+    except Exception:
+        pass
+    return out
+
+
+def _trade_lifecycle_order_is_filled(order: dict) -> bool:
+    try:
+        status = str((order or {}).get('orderStatus') or '').upper().replace(' ', '')
+        if status in {'FILLED', 'PARTIALLYFILLED', 'PARTIALLY_FILLED'}:
+            return True
+        return float(_bybit_order_filled_qty(order) or 0.0) > 0.0
+    except Exception:
+        return False
+
+
+def _trade_lifecycle_hist_is_tp_exit_order(order: dict) -> bool:
+    if not _trade_lifecycle_order_is_filled(order):
+        return False
+    txt = _bybit_order_kind_text(order)
+    if 'stoploss' in txt:
+        return False
+    if 'partialtakeprofit' in txt or 'takeprofit' in txt or 'pf_tp' in txt:
+        return True
+    try:
+        if _bybit_order_reduce_only(order) and float((order or {}).get('triggerPrice') or (order or {}).get('trigger_price') or 0.0) > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _trade_lifecycle_hist_is_sl_exit_order(order: dict) -> bool:
+    if not _trade_lifecycle_order_is_filled(order):
+        return False
+    txt = _bybit_order_kind_text(order)
+    if 'partialtakeprofit' in txt or 'takeprofit' in txt or 'pf_tp' in txt:
+        return False
+    if 'stoploss' in txt or 'pf_sl' in txt:
+        return True
+    try:
+        order_type = str((order or {}).get('orderType') or '').upper().strip()
+        trig = float((order or {}).get('triggerPrice') or (order or {}).get('trigger_price') or 0.0)
+        if _bybit_order_reduce_only(order) and order_type == 'MARKET' and trig > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _trade_lifecycle_hist_is_manual_close_order(order: dict, side: str) -> bool:
+    if not _trade_lifecycle_order_is_filled(order):
+        return False
+    if _trade_lifecycle_hist_is_tp_exit_order(order) or _trade_lifecycle_hist_is_sl_exit_order(order):
+        return False
+    txt = _bybit_order_kind_text(order)
+    if 'pf_fc_' in txt or 'close' in txt:
+        return True
+    close_side = _trade_lifecycle_close_side(side)
+    got = str((order or {}).get('side') or '').upper().strip()
+    if close_side and got and got == close_side and _bybit_order_reduce_only(order):
+        return True
+    return False
+
+
+def _trade_lifecycle_match_orders(symbol: str, side: str, orders: list[dict], start_ts: float, end_ts: float) -> list[dict]:
+    sym = _bybit_linear_symbol(symbol)
+    close_side = _trade_lifecycle_close_side(side)
+    out = []
+    for o in (orders or []):
+        try:
+            if _bybit_linear_symbol(str((o or {}).get('symbol') or '')) != sym:
+                continue
+            ts = float(_bybit_order_filled_time_ts(o) or 0.0)
+            if ts <= 0 or ts + 300.0 < float(start_ts or 0.0) or ts > float(end_ts or 0.0) + 300.0:
+                continue
+            got_side = str((o or {}).get('side') or '').upper().strip()
+            if close_side and got_side and got_side != close_side and not _trade_lifecycle_hist_is_manual_close_order(o, side):
+                continue
+            out.append(dict(o or {}))
+        except Exception:
+            continue
+    out.sort(key=lambda r: float(_bybit_order_filled_time_ts(r) or 0.0))
+    return out
+
+
+def _trade_lifecycle_match_closed_pnl(symbol: str, side: str, rows: list[dict], start_ts: float, end_ts: float) -> list[dict]:
+    sym = _bybit_linear_symbol(symbol)
+    side_u = str(side or '').upper().strip()
+    out = []
+    for ev in (rows or []):
+        try:
+            if _bybit_linear_symbol(str((ev or {}).get('symbol') or '')) != sym:
+                continue
+            ts = float(_bybit_closed_pnl_event_ts(ev) or 0.0)
+            if ts <= 0 or ts + 300.0 < float(start_ts or 0.0) or ts > float(end_ts or 0.0) + 300.0:
+                continue
+            if side_u and side_u not in (_bybit_closed_pnl_event_side_candidates(ev) or {side_u}):
+                continue
+            out.append({
+                'ts': ts,
+                'qty': float(_bybit_closed_pnl_event_qty(ev) or 0.0),
+                'pnl': float((ev or {}).get('closedPnl') or (ev or {}).get('closed_pnl') or 0.0),
+                'raw': dict(ev or {}),
+            })
+        except Exception:
+            continue
+    out.sort(key=lambda r: float(r.get('ts') or 0.0))
+    return out
+
+
+def _trade_lifecycle_pick_target_events(target_price: float, orders: list[dict], kind: str = 'tp') -> list[dict]:
+    out = []
+    want_tp = str(kind or 'tp').lower().strip() != 'sl'
+    for o in (orders or []):
+        try:
+            if want_tp:
+                if not _trade_lifecycle_hist_is_tp_exit_order(o):
+                    continue
+            else:
+                if not _trade_lifecycle_hist_is_sl_exit_order(o):
+                    continue
+            px = float(_bybit_order_working_price(o) or _bybit_order_avg_price(o) or 0.0)
+            if target_price > 0 and not _price_close_enough(px, float(target_price), rel_tol=0.0040):
+                continue
+            out.append({
+                'ts': float(_bybit_order_filled_time_ts(o) or 0.0),
+                'price': px,
+                'qty': float(_bybit_order_filled_qty(o) or 0.0),
+                'raw': dict(o or {}),
+            })
+        except Exception:
+            continue
+    out.sort(key=lambda r: float(r.get('ts') or 0.0))
+    return out
+
+
+def _trade_lifecycle_generic_sl_events(orders: list[dict]) -> list[dict]:
+    out = []
+    for o in (orders or []):
+        try:
+            if not _trade_lifecycle_hist_is_sl_exit_order(o):
+                continue
+            out.append({
+                'ts': float(_bybit_order_filled_time_ts(o) or 0.0),
+                'price': float(_bybit_order_working_price(o) or _bybit_order_avg_price(o) or 0.0),
+                'qty': float(_bybit_order_filled_qty(o) or 0.0),
+                'raw': dict(o or {}),
+            })
+        except Exception:
+            continue
+    out.sort(key=lambda r: float(r.get('ts') or 0.0))
+    return out
+
+
+def _trade_lifecycle_manual_close_events(orders: list[dict], side: str) -> list[dict]:
+    out = []
+    for o in (orders or []):
+        try:
+            if not _trade_lifecycle_hist_is_manual_close_order(o, side):
+                continue
+            out.append({
+                'ts': float(_bybit_order_filled_time_ts(o) or 0.0),
+                'price': float(_bybit_order_avg_price(o) or _bybit_order_working_price(o) or 0.0),
+                'qty': float(_bybit_order_filled_qty(o) or 0.0),
+                'raw': dict(o or {}),
+            })
+        except Exception:
+            continue
+    out.sort(key=lambda r: float(r.get('ts') or 0.0))
+    return out
+
+
+def _trade_lifecycle_upsert_row(row: dict) -> None:
+    if not row or not str(row.get('trade_id') or '').strip():
+        return
+    _trade_lifecycle_migrate()
+    cols = [
+        'trade_id', 'setup_id', 'uid', 'symbol', 'side', 'entry', 'sl', 'tp1', 'tp2', 'rr_tp1', 'rr_tp2',
+        'opened_ts', 'closed_ts', 'open_day', 'close_day', 'open_session', 'close_session',
+        'risk_usdt', 'risk_pct', 'confidence', 'quality_score', 'engine', 'tp1_hit_ts', 'tp2_hit_ts',
+        'sl_hit_ts', 'be_armed_ts', 'be_hit_ts', 'result_path', 'result_label', 'close_reason',
+        'risk_free_flag', 'pnl_usdt', 'r_multiple', 'duration_total_sec', 'duration_to_tp1_sec',
+        'duration_to_tp2_sec', 'duration_to_sl_sec', 'source_confidence', 'source_note',
+        'exchange_confirmed', 'last_sync_ts'
+    ]
+    vals = [row.get(c) for c in cols]
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            cur.execute(
+                f"INSERT OR REPLACE INTO trade_lifecycle ({', '.join(cols)}) VALUES ({', '.join(['?'] * len(cols))})",
+                vals,
+            )
+            con.commit()
+    except Exception:
+        pass
+
+
+def _trade_lifecycle_store_events(trade_id: str, events: list[dict]) -> None:
+    if not trade_id or not events:
+        return
+    _trade_lifecycle_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            for ev in (events or []):
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO trade_lifecycle_events
+                    (trade_id, event_type, event_ts, price, qty, pnl_usdt, source, details_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(trade_id),
+                        str(ev.get('event_type') or ''),
+                        float(ev.get('event_ts') or 0.0) if ev.get('event_ts') is not None else None,
+                        float(ev.get('price') or 0.0) if ev.get('price') is not None else None,
+                        float(ev.get('qty') or 0.0) if ev.get('qty') is not None else None,
+                        float(ev.get('pnl_usdt') or 0.0) if ev.get('pnl_usdt') is not None else None,
+                        str(ev.get('source') or ''),
+                        _json_dumps_safe(ev.get('details') or {}),
+                    ),
+                )
+            con.commit()
+    except Exception:
+        pass
+
+
+def _trade_lifecycle_owner_uid(request_uid: int) -> int:
+    try:
+        owner = int(AUTOTRADE_OWNER_UID or 0)
+    except Exception:
+        owner = 0
+    if owner > 0:
+        return owner
+    return int(request_uid)
+
+
+def _trade_lifecycle_query_rows(uid: int, start_ts: float = 0.0, session: str = 'ALL', limit: int | None = None) -> list[dict]:
+    _trade_lifecycle_migrate()
+    params = [int(uid)]
+    q = "SELECT * FROM trade_lifecycle WHERE uid=?"
+    if float(start_ts or 0.0) > 0:
+        q += " AND (COALESCE(opened_ts,0)>=? OR COALESCE(closed_ts,0)>=?)"
+        params.extend([float(start_ts), float(start_ts)])
+    sess = str(session or 'ALL').upper().strip()
+    if sess in {'ASIA', 'LON', 'NY'}:
+        q += " AND UPPER(COALESCE(open_session,''))=?"
+        params.append(sess)
+    q += " ORDER BY COALESCE(opened_ts,0) DESC, COALESCE(closed_ts,0) DESC"
+    if limit is not None:
+        q += " LIMIT ?"
+        params.append(int(limit))
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            rows = cur.execute(q, tuple(params)).fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
+    rows = [dict(r) for r in (rows or [])]
+    total = len(rows)
+    wins = sum(1 for r in rows if str(r.get('result_path') or '').upper() == 'HIT_TP2_WIN')
+    partial_wins = sum(1 for r in rows if str(r.get('result_path') or '').upper() in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'})
+    losses = sum(1 for r in rows if str(r.get('result_path') or '').upper() == 'HIT_SL_LOSS')
+    open_n = sum(1 for r in rows if str(r.get('result_path') or '').upper() == 'OPEN')
+    manual_unknown = sum(1 for r in rows if str(r.get('result_path') or '').upper() == 'MANUAL_OR_UNKNOWN_CLOSE')
+    closed_decided = wins + partial_wins + losses
+    tp1_hits = sum(1 for r in rows if float(r.get('tp1_hit_ts') or 0.0) > 0 or str(r.get('result_path') or '').upper() in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'})
+    tp2_hits = sum(1 for r in rows if float(r.get('tp2_hit_ts') or 0.0) > 0 or str(r.get('result_path') or '').upper() == 'HIT_TP2_WIN')
+    sl_hits = sum(1 for r in rows if float(r.get('sl_hit_ts') or 0.0) > 0 or str(r.get('result_path') or '').upper() in {'HIT_SL_LOSS', 'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'})
+    risk_free = sum(1 for r in rows if str(r.get('risk_free_flag') or '').upper() == 'YES')
+    pnls = [float(r.get('pnl_usdt') or 0.0) for r in rows if r.get('pnl_usdt') is not None and str(r.get('result_path') or '').upper() != 'OPEN']
+    rs = [float(r.get('r_multiple') or 0.0) for r in rows if r.get('r_multiple') is not None and str(r.get('result_path') or '').upper() != 'OPEN']
+    avg_pnl = (sum(pnls) / len(pnls)) if pnls else 0.0
+    avg_r = (sum(rs) / len(rs)) if rs else 0.0
+    win_rate = ((wins + partial_wins) / closed_decided * 100.0) if closed_decided > 0 else 0.0
+
+    by_open_session = defaultdict(lambda: {'total': 0, 'closed': 0, 'wins': 0, 'partial_wins': 0, 'losses': 0, 'manual_unknown': 0, 'tp1_hits': 0, 'tp2_hits': 0, 'sl_hits': 0, 'risk_free': 0, 'r': [], 'pnl': []})
+    by_close_session = defaultdict(lambda: {'total': 0, 'closed': 0, 'wins': 0, 'partial_wins': 0, 'losses': 0, 'manual_unknown': 0})
+    by_engine = defaultdict(lambda: {'closed': 0, 'r': [], 'wins': 0, 'partial_wins': 0, 'losses': 0})
+    by_conf = defaultdict(lambda: {'closed': 0, 'r': [], 'wins': 0, 'losses': 0, 'partial_wins': 0})
+    by_quality = defaultdict(lambda: {'closed': 0, 'r': [], 'wins': 0, 'losses': 0, 'partial_wins': 0})
+    symbols = defaultdict(lambda: {'trades': 0, 'wins': 0, 'partial_wins': 0, 'losses': 0, 'tp1_hits': 0, 'tp2_hits': 0, 'manual_unknown': 0, 'net_pnl': 0.0, 'r': []})
+    durations_tp1 = []
+    durations_tp2 = []
+    durations_sl = []
+
+    for r in rows:
+        path = str(r.get('result_path') or '').upper().strip()
+        osess = str(r.get('open_session') or '?').upper().strip() or '?'
+        csess = str(r.get('close_session') or '?').upper().strip() or '?'
+        eng = str(r.get('engine') or 'UNKNOWN').upper().strip() or 'UNKNOWN'
+        conf_bucket = _trade_lifecycle_conf_bucket(r.get('confidence'))
+        quality_bucket = _trade_lifecycle_quality_bucket(r.get('quality_score'))
+        sym = str(r.get('symbol') or '?').upper().strip() or '?'
+        pnl = float(r.get('pnl_usdt') or 0.0) if r.get('pnl_usdt') is not None else 0.0
+        rr = float(r.get('r_multiple') or 0.0) if r.get('r_multiple') is not None else None
+
+        bo = by_open_session[osess]
+        bo['total'] += 1
+        if path != 'OPEN':
+            bo['closed'] += 1
+            bo['pnl'].append(pnl)
+            if rr is not None:
+                bo['r'].append(rr)
+        if path == 'HIT_TP2_WIN':
+            bo['wins'] += 1
+        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
+            bo['partial_wins'] += 1
+        elif path == 'HIT_SL_LOSS':
+            bo['losses'] += 1
+        elif path == 'MANUAL_OR_UNKNOWN_CLOSE':
+            bo['manual_unknown'] += 1
+        if float(r.get('tp1_hit_ts') or 0.0) > 0:
+            bo['tp1_hits'] += 1
+            if r.get('duration_to_tp1_sec') is not None:
+                durations_tp1.append(float(r.get('duration_to_tp1_sec') or 0.0))
+        if float(r.get('tp2_hit_ts') or 0.0) > 0:
+            bo['tp2_hits'] += 1
+            if r.get('duration_to_tp2_sec') is not None:
+                durations_tp2.append(float(r.get('duration_to_tp2_sec') or 0.0))
+        if float(r.get('sl_hit_ts') or 0.0) > 0:
+            bo['sl_hits'] += 1
+            if r.get('duration_to_sl_sec') is not None:
+                durations_sl.append(float(r.get('duration_to_sl_sec') or 0.0))
+        if str(r.get('risk_free_flag') or '').upper() == 'YES':
+            bo['risk_free'] += 1
+
+        bc = by_close_session[csess]
+        if path != 'OPEN':
+            bc['total'] += 1
+            bc['closed'] += 1
+            if path == 'HIT_TP2_WIN':
+                bc['wins'] += 1
+            elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
+                bc['partial_wins'] += 1
+            elif path == 'HIT_SL_LOSS':
+                bc['losses'] += 1
+            elif path == 'MANUAL_OR_UNKNOWN_CLOSE':
+                bc['manual_unknown'] += 1
+
+        be = by_engine[eng]
+        if path != 'OPEN':
+            be['closed'] += 1
+            if rr is not None:
+                be['r'].append(rr)
+        if path == 'HIT_TP2_WIN':
+            be['wins'] += 1
+        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
+            be['partial_wins'] += 1
+        elif path == 'HIT_SL_LOSS':
+            be['losses'] += 1
+
+        bcg = by_conf[conf_bucket]
+        if path != 'OPEN':
+            bcg['closed'] += 1
+            if rr is not None:
+                bcg['r'].append(rr)
+        if path == 'HIT_TP2_WIN':
+            bcg['wins'] += 1
+        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
+            bcg['partial_wins'] += 1
+        elif path == 'HIT_SL_LOSS':
+            bcg['losses'] += 1
+
+        bq = by_quality[quality_bucket]
+        if path != 'OPEN':
+            bq['closed'] += 1
+            if rr is not None:
+                bq['r'].append(rr)
+        if path == 'HIT_TP2_WIN':
+            bq['wins'] += 1
+        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
+            bq['partial_wins'] += 1
+        elif path == 'HIT_SL_LOSS':
+            bq['losses'] += 1
+
+        sy = symbols[sym]
+        sy['trades'] += 1
+        sy['net_pnl'] += pnl
+        if rr is not None:
+            sy['r'].append(rr)
+        if path == 'HIT_TP2_WIN':
+            sy['wins'] += 1
+        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
+            sy['partial_wins'] += 1
+        elif path == 'HIT_SL_LOSS':
+            sy['losses'] += 1
+        elif path == 'MANUAL_OR_UNKNOWN_CLOSE':
+            sy['manual_unknown'] += 1
+        if float(r.get('tp1_hit_ts') or 0.0) > 0:
+            sy['tp1_hits'] += 1
+        if float(r.get('tp2_hit_ts') or 0.0) > 0:
+            sy['tp2_hits'] += 1
+
+    def _finalize_group(src: dict) -> dict:
+        out = {}
+        for k, v in src.items():
+            decided_k = int(v.get('wins', 0) or 0) + int(v.get('partial_wins', 0) or 0) + int(v.get('losses', 0) or 0)
+            tp1_hits_k = int(v.get('tp1_hits', 0) or 0)
+            tp2_hits_k = int(v.get('tp2_hits', 0) or 0)
+            out[k] = {
+                **{kk: vv for kk, vv in v.items() if kk not in {'r', 'pnl'}},
+                'avg_r': (sum(v.get('r') or []) / len(v.get('r') or [])) if (v.get('r') or []) else 0.0,
+                'avg_pnl': (sum(v.get('pnl') or []) / len(v.get('pnl') or [])) if (v.get('pnl') or []) else 0.0,
+                'win_rate': ((int(v.get('wins', 0) or 0) + int(v.get('partial_wins', 0) or 0)) / decided_k * 100.0) if decided_k > 0 else 0.0,
+                'tp1_hit_rate': (tp1_hits_k / int(v.get('total', 0) or 1) * 100.0) if int(v.get('total', 0) or 0) > 0 else 0.0,
+                'tp2_conversion_after_tp1': (tp2_hits_k / tp1_hits_k * 100.0) if tp1_hits_k > 0 else 0.0,
+                'sl_before_tp1_rate': (int(v.get('losses', 0) or 0) / decided_k * 100.0) if decided_k > 0 else 0.0,
+                'risk_free_save_rate': (int(v.get('risk_free', 0) or 0) / tp1_hits_k * 100.0) if tp1_hits_k > 0 else 0.0,
+            }
+        return out
+
+    by_open_session_out = _finalize_group(by_open_session)
+    by_close_session_out = _finalize_group(by_close_session)
+    by_engine_out = _finalize_group(by_engine)
+    by_conf_out = _finalize_group(by_conf)
+    by_quality_out = _finalize_group(by_quality)
+
+    symbol_rows = []
+    for sym, v in symbols.items():
+        tp1_only_fails = max(0, int(v.get('tp1_hits', 0) or 0) - int(v.get('tp2_hits', 0) or 0))
+        symbol_rows.append({
+            'symbol': sym,
+            'trades': int(v.get('trades', 0) or 0),
+            'wins': int(v.get('wins', 0) or 0),
+            'partial_wins': int(v.get('partial_wins', 0) or 0),
+            'losses': int(v.get('losses', 0) or 0),
+            'tp1_hits': int(v.get('tp1_hits', 0) or 0),
+            'tp2_hits': int(v.get('tp2_hits', 0) or 0),
+            'tp1_only_fails': int(tp1_only_fails),
+            'net_pnl': float(v.get('net_pnl') or 0.0),
+            'avg_r': (sum(v.get('r') or []) / len(v.get('r') or [])) if (v.get('r') or []) else 0.0,
+        })
+    top_winners = sorted(symbol_rows, key=lambda x: (float(x.get('net_pnl') or 0.0), float(x.get('avg_r') or 0.0)), reverse=True)[:5]
+    top_losers = sorted(symbol_rows, key=lambda x: (float(x.get('net_pnl') or 0.0), float(x.get('avg_r') or 0.0)))[:5]
+    tp1_fail_symbols = sorted(
+        [x for x in symbol_rows if int(x.get('tp1_hits') or 0) >= 2 and int(x.get('tp1_only_fails') or 0) > 0],
+        key=lambda x: ((float(x.get('tp1_only_fails') or 0.0) / max(1.0, float(x.get('tp1_hits') or 0.0))), int(x.get('tp1_hits') or 0)),
+        reverse=True,
+    )[:5]
+
+    tp2_conv = (tp2_hits / tp1_hits * 100.0) if tp1_hits > 0 else 0.0
+    sl_before_tp1_rate = (losses / closed_decided * 100.0) if closed_decided > 0 else 0.0
+    risk_free_save_rate = (risk_free / tp1_hits * 100.0) if tp1_hits > 0 else 0.0
+    signs = []
+    if tp1_hits >= 8 and tp2_conv < 35.0:
+        signs.append('TP2 may be too ambitious: many trades reach TP1 but do not convert to TP2.')
+    if closed_decided >= 8 and sl_before_tp1_rate >= 55.0:
+        signs.append('Many trades hit SL before TP1: stop may be too tight or entries too early.')
+    avg_tp1 = (sum(durations_tp1) / len(durations_tp1)) if durations_tp1 else 0.0
+    avg_sl = (sum(durations_sl) / len(durations_sl)) if durations_sl else 0.0
+    if avg_sl > 0 and avg_tp1 > 0 and avg_sl > (avg_tp1 * 2.0):
+        signs.append('Losing trades hold much longer than TP1 winners: stop placement may be too wide or trade management too slow.')
+    if tp1_hits >= 8 and risk_free_save_rate >= 25.0:
+        signs.append('Break-even after TP1 is saving a meaningful share of TP1-hit trades.')
+
+    return {
+        'rows': rows,
+        'total': int(total),
+        'wins': int(wins),
+        'partial_wins': int(partial_wins),
+        'losses': int(losses),
+        'open': int(open_n),
+        'manual_unknown': int(manual_unknown),
+        'closed': int(sum(1 for r in rows if str(r.get('result_path') or '').upper() != 'OPEN')),
+        'closed_decided': int(closed_decided),
+        'tp1_hits': int(tp1_hits),
+        'tp2_hits': int(tp2_hits),
+        'sl_hits': int(sl_hits),
+        'risk_free_trades': int(risk_free),
+        'avg_pnl': float(avg_pnl),
+        'avg_r': float(avg_r),
+        'net_pnl': float(sum(pnls) if pnls else 0.0),
+        'win_rate': float(win_rate),
+        'tp2_conversion_after_tp1': float(tp2_conv),
+        'sl_before_tp1_rate': float(sl_before_tp1_rate),
+        'risk_free_save_rate': float(risk_free_save_rate),
+        'avg_time_to_tp1_sec': float(avg_tp1),
+        'avg_time_to_tp2_sec': float((sum(durations_tp2) / len(durations_tp2)) if durations_tp2 else 0.0),
+        'avg_time_to_sl_sec': float(avg_sl),
+        'by_open_session': by_open_session_out,
+        'by_close_session': by_close_session_out,
+        'by_engine': by_engine_out,
+        'by_conf_bucket': by_conf_out,
+        'by_quality_bucket': by_quality_out,
+        'top_winning_symbols': top_winners,
+        'top_losing_symbols': top_losers,
+        'symbols_tp1_but_fail_tp2': tp1_fail_symbols,
+        'signs': signs,
+    }
+
+
+def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_open_ts: float = 0.0,
+                                     live_mode: bool = False, live_pos: dict | None = None,
+                                     order_rows: list[dict] | None = None, closed_pnl_rows: list[dict] | None = None) -> tuple[dict, list[dict]]:
+    now_ts = float(time.time())
+    trade = dict(trade or {})
+    trade_id = str(trade.get('trade_id') or '').strip()
+    setup_id = _trade_lifecycle_safe_setup_id(trade)
+    symbol = _bybit_linear_symbol(str(trade.get('symbol') or ''))
+    side = _norm_trade_side(str(trade.get('side') or ''))
+    entry = float(trade.get('entry') or 0.0)
+    sl = float(trade.get('sl') or 0.0)
+    tp1_raw = trade.get('tp1')
+    tp2_raw = trade.get('tp2')
+    tp3_raw = trade.get('tp3')
+    tp1, tp2, _ = _ensure_three_tps(entry, sl, float(tp3_raw or 0.0), tp1_raw, tp2_raw, side)
+    opened_ts = float(trade.get('opened_ts') or 0.0)
+    closed_ts_journal = float(trade.get('closed_ts') or 0.0)
+    qty = abs(float(trade.get('qty') or 0.0))
+    risk_usdt = float(_autotrade_estimated_risk_usd(entry, sl, qty) or 0.0)
+    risk_pct, risk_note = _trade_lifecycle_risk_pct_estimate(int(uid), risk_usdt)
+    rr1 = float(rr_to_tp(entry, sl, tp1) or 0.0) if entry > 0 and sl > 0 and float(tp1 or 0.0) > 0 else None
+    rr2 = float(rr_to_tp(entry, sl, tp2) or 0.0) if entry > 0 and sl > 0 and float(tp2 or 0.0) > 0 else None
+
+    open_session = str(trade.get('session') or '').upper().strip() or _session_label_from_ts(opened_ts)
+    open_day = _autotrade_trade_day_label(opened_ts, user) if opened_ts > 0 else ''
+
+    window_end = float(next_open_ts or 0.0) - 1.0 if float(next_open_ts or 0.0) > float(opened_ts or 0.0) else 0.0
+    if closed_ts_journal > 0:
+        if window_end <= 0 or window_end > (closed_ts_journal + 21600.0):
+            window_end = closed_ts_journal + 21600.0
+    if window_end <= 0:
+        window_end = now_ts + 300.0
+
+    matched_orders = _trade_lifecycle_match_orders(symbol, side, order_rows or [], opened_ts, window_end)
+    matched_pnl = _trade_lifecycle_match_closed_pnl(symbol, side, closed_pnl_rows or [], opened_ts, window_end)
+
+    tp1_events = _trade_lifecycle_pick_target_events(float(tp1 or 0.0), matched_orders, kind='tp') if float(tp1 or 0.0) > 0 else []
+    tp2_events = _trade_lifecycle_pick_target_events(float(tp2 or 0.0), matched_orders, kind='tp') if float(tp2 or 0.0) > 0 else []
+    sl_events = _trade_lifecycle_generic_sl_events(matched_orders)
+    manual_events = _trade_lifecycle_manual_close_events(matched_orders, side)
+    positive_pnl_events = [ev for ev in matched_pnl if float(ev.get('pnl') or 0.0) > 0.0]
+    negative_pnl_events = [ev for ev in matched_pnl if float(ev.get('pnl') or 0.0) < 0.0]
+
+    tp1_hit_ts = _trade_lifecycle_pick_ts([ev.get('ts') for ev in tp1_events], pick='min')
+    tp2_hit_ts = _trade_lifecycle_pick_ts([ev.get('ts') for ev in tp2_events], pick='min')
+    sl_hit_ts = _trade_lifecycle_pick_ts([ev.get('ts') for ev in sl_events], pick='min')
+
+    source_bits = []
+    source_conf = 'LOW'
+    exchange_confirmed = 0
+    if tp1_events or tp2_events or sl_events or manual_events or matched_pnl:
+        exchange_confirmed = 1
+        source_conf = 'MEDIUM'
+    if tp1_events or tp2_events or sl_events:
+        source_conf = 'HIGH'
+        source_bits.append('bybit_order_history')
+    elif matched_pnl:
+        source_bits.append('bybit_closed_pnl')
+    if risk_note and risk_note != 'risk_pct_from_user_setting':
+        source_bits.append(risk_note)
+
+    live_qty = abs(float(_pos_size(live_pos) or 0.0)) if live_pos is not None else 0.0
+    qty_reduction_confirmed = bool(live_pos is not None and qty > 0 and live_qty > 0 and live_qty < max(qty * 0.98, qty - max(1e-9, qty * 0.02)))
+    if (tp1_hit_ts is None) and positive_pnl_events:
+        tp1_hit_ts = _trade_lifecycle_pick_ts([ev.get('ts') for ev in positive_pnl_events], pick='min')
+        source_bits.append('tp1_from_positive_closed_pnl')
+        source_conf = 'MEDIUM' if source_conf != 'HIGH' else source_conf
+        exchange_confirmed = 1
+
+    tp1_confirmed = bool(tp1_hit_ts or qty_reduction_confirmed)
+    if qty_reduction_confirmed and tp1_hit_ts is None:
+        source_bits.append('tp1_from_live_qty_reduction')
+        source_conf = 'MEDIUM' if source_conf != 'HIGH' else source_conf
+        exchange_confirmed = 1
+
+    current_sl_price = 0.0
+    if live_pos is not None:
+        try:
+            current_sl_price = float(_pos_stop(live_pos) or _bybit_detect_open_sl_price(symbol, side) or 0.0)
+        except Exception:
+            current_sl_price = 0.0
+        if current_sl_price > 0:
+            source_bits.append('live_position_sl_state')
+            exchange_confirmed = 1
+            if source_conf != 'HIGH':
+                source_conf = 'MEDIUM'
+
+    be_sl_event = None
+    non_be_sl_event = None
+    for ev in (sl_events or []):
+        try:
+            if _trade_lifecycle_is_be_or_better(side, float(ev.get('price') or 0.0), entry):
+                if be_sl_event is None or float(ev.get('ts') or 0.0) < float(be_sl_event.get('ts') or 0.0):
+                    be_sl_event = ev
+            else:
+                if non_be_sl_event is None or float(ev.get('ts') or 0.0) < float(non_be_sl_event.get('ts') or 0.0):
+                    non_be_sl_event = ev
+        except Exception:
+            continue
+
+    status = str(trade.get('status') or '').upper().strip()
+    if live_pos is not None and status == 'OPEN':
+        result_path = 'OPEN'
+        result_label = _trade_lifecycle_result_label(result_path)
+        close_reason = ''
+        final_close_ts = None
+    else:
+        result_path = 'MANUAL_OR_UNKNOWN_CLOSE'
+        result_label = _trade_lifecycle_result_label(result_path)
+        close_reason = result_label
+        final_close_ts = closed_ts_journal or _trade_lifecycle_pick_ts([ev.get('ts') for ev in matched_pnl] + [ev.get('ts') for ev in manual_events], pick='max')
+        if tp2_hit_ts is not None and (sl_hit_ts is None or float(tp2_hit_ts) <= float(sl_hit_ts) + 120.0):
+            result_path = 'HIT_TP2_WIN'
+            result_label = _trade_lifecycle_result_label(result_path)
+            close_reason = 'hit TP2'
+            final_close_ts = float(tp2_hit_ts)
+        elif sl_hit_ts is not None:
+            if tp1_confirmed:
+                if be_sl_event is not None and _trade_lifecycle_is_be_or_better(side, float(be_sl_event.get('price') or 0.0), entry):
+                    result_path = 'HIT_TP1_THEN_BE_SL'
+                    result_label = _trade_lifecycle_result_label(result_path)
+                    close_reason = 'hit TP1 then BE SL'
+                    final_close_ts = float(be_sl_event.get('ts') or sl_hit_ts)
+                else:
+                    result_path = 'HIT_TP1_THEN_SL'
+                    result_label = _trade_lifecycle_result_label(result_path)
+                    close_reason = 'hit TP1 then SL'
+                    final_close_ts = float((non_be_sl_event or {}).get('ts') or sl_hit_ts)
+            else:
+                result_path = 'HIT_SL_LOSS'
+                result_label = _trade_lifecycle_result_label(result_path)
+                close_reason = 'hit SL'
+                final_close_ts = float(sl_hit_ts)
+        elif status == 'OPEN' and live_pos is None:
+            # Journal still shows OPEN but exchange no longer does; stay conservative.
+            result_path = 'MANUAL_OR_UNKNOWN_CLOSE'
+            result_label = _trade_lifecycle_result_label(result_path)
+            close_reason = result_label
+            final_close_ts = closed_ts_journal or _trade_lifecycle_pick_ts([ev.get('ts') for ev in matched_pnl] + [ev.get('ts') for ev in manual_events], pick='max')
+        elif closed_ts_journal <= 0 and live_pos is None and not matched_pnl and not manual_events:
+            result_path = 'OPEN'
+            result_label = _trade_lifecycle_result_label(result_path)
+            close_reason = ''
+            final_close_ts = None
+
+    risk_free_flag = 'NO'
+    be_armed_ts = None
+    be_hit_ts = None
+    if tp1_confirmed:
+        if result_path == 'HIT_TP1_THEN_BE_SL':
+            risk_free_flag = 'YES'
+            be_armed_ts = tp1_hit_ts
+            be_hit_ts = float((be_sl_event or {}).get('ts') or 0.0) or final_close_ts
+        elif live_pos is not None and current_sl_price > 0 and _trade_lifecycle_is_be_or_better(side, current_sl_price, entry):
+            risk_free_flag = 'YES'
+            be_armed_ts = tp1_hit_ts
+        elif result_path == 'HIT_TP2_WIN':
+            if be_sl_event is not None:
+                risk_free_flag = 'YES'
+                be_armed_ts = tp1_hit_ts
+            else:
+                risk_free_flag = 'UNKNOWN'
+        elif result_path == 'HIT_TP1_THEN_SL':
+            risk_free_flag = 'NO'
+        else:
+            risk_free_flag = 'UNKNOWN'
+
+    close_ts = float(final_close_ts or 0.0) if final_close_ts else None
+    if result_path == 'OPEN' and live_pos is not None:
+        pnl_usdt = float(_pos_unreal_pnl(live_pos) or 0.0)
+    else:
+        try:
+            pnl_usdt = float(trade.get('pnl_usdt') if trade.get('pnl_usdt') is not None else trade.get('pnl') or 0.0)
+        except Exception:
+            pnl_usdt = 0.0
+        if abs(pnl_usdt) < 1e-9 and matched_pnl:
+            pnl_usdt = float(sum(float(ev.get('pnl') or 0.0) for ev in matched_pnl))
+
+    r_multiple = (float(pnl_usdt) / float(risk_usdt)) if risk_usdt > 0 and pnl_usdt is not None else None
+    close_day = _autotrade_trade_day_label(close_ts, user) if close_ts else ''
+    close_session = _session_label_from_ts(close_ts) if close_ts else ''
+    duration_total_sec = (float(close_ts) - float(opened_ts)) if close_ts and opened_ts > 0 else ((now_ts - float(opened_ts)) if opened_ts > 0 else None)
+    duration_to_tp1_sec = (float(tp1_hit_ts) - float(opened_ts)) if tp1_hit_ts and opened_ts > 0 else None
+    duration_to_tp2_sec = (float(tp2_hit_ts) - float(opened_ts)) if tp2_hit_ts and opened_ts > 0 else None
+    duration_to_sl_sec = (float(sl_hit_ts) - float(opened_ts)) if sl_hit_ts and opened_ts > 0 else None
+
+    if result_path == 'MANUAL_OR_UNKNOWN_CLOSE' and manual_events:
+        source_bits.append('manual_close_fill_detected')
+        exchange_confirmed = 1
+        if source_conf == 'LOW':
+            source_conf = 'MEDIUM'
+    elif result_path == 'MANUAL_OR_UNKNOWN_CLOSE' and matched_pnl:
+        source_bits.append('exchange_closed_pnl_without_path_proof')
+        exchange_confirmed = 1
+        if source_conf == 'LOW':
+            source_conf = 'MEDIUM'
+    elif result_path == 'OPEN' and live_pos is not None:
+        source_bits.append('live_position_open')
+        exchange_confirmed = 1
+        if source_conf == 'LOW':
+            source_conf = 'MEDIUM'
+    elif result_path in {'HIT_SL_LOSS', 'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP2_WIN'}:
+        exchange_confirmed = 1
+
+    if not source_bits and live_mode:
+        source_bits.append('journal_only_no_exchange_match')
+    elif not source_bits:
+        source_bits.append('journal_only')
+
+    events = []
+    if opened_ts > 0:
+        events.append({'event_type': 'OPEN', 'event_ts': opened_ts, 'price': entry, 'qty': qty, 'source': 'journal', 'details': {'open_session': open_session, 'setup_id': setup_id}})
+    if tp1_hit_ts is not None:
+        events.append({'event_type': 'TP1_HIT', 'event_ts': tp1_hit_ts, 'price': float(tp1 or 0.0), 'qty': None, 'source': 'exchange' if exchange_confirmed else 'inferred', 'details': {'symbol': symbol}})
+    if tp2_hit_ts is not None:
+        events.append({'event_type': 'TP2_HIT', 'event_ts': tp2_hit_ts, 'price': float(tp2 or 0.0), 'qty': None, 'source': 'exchange' if exchange_confirmed else 'inferred', 'details': {'symbol': symbol}})
+    if sl_hit_ts is not None:
+        sl_px = float((be_sl_event or non_be_sl_event or {}).get('price') or sl or 0.0)
+        events.append({'event_type': 'SL_HIT', 'event_ts': sl_hit_ts, 'price': sl_px, 'qty': None, 'source': 'exchange' if exchange_confirmed else 'inferred', 'details': {'symbol': symbol}})
+    if be_armed_ts is not None:
+        events.append({'event_type': 'BE_ARMED', 'event_ts': be_armed_ts, 'price': entry, 'qty': None, 'source': 'exchange' if exchange_confirmed else 'inferred', 'details': {'risk_free_flag': risk_free_flag}})
+    if be_hit_ts is not None:
+        events.append({'event_type': 'BE_HIT', 'event_ts': be_hit_ts, 'price': entry, 'qty': None, 'source': 'exchange' if exchange_confirmed else 'inferred', 'details': {'risk_free_flag': risk_free_flag}})
+    if close_ts is not None:
+        events.append({'event_type': 'CLOSE', 'event_ts': close_ts, 'price': None, 'qty': None, 'pnl_usdt': pnl_usdt, 'source': 'exchange' if exchange_confirmed else 'journal', 'details': {'result_path': result_path, 'reason': close_reason}})
+
+    row = {
+        'trade_id': trade_id,
+        'setup_id': setup_id,
+        'uid': int(uid),
+        'symbol': symbol,
+        'side': side,
+        'entry': entry,
+        'sl': sl,
+        'tp1': float(tp1 or 0.0) if float(tp1 or 0.0) > 0 else None,
+        'tp2': float(tp2 or 0.0) if float(tp2 or 0.0) > 0 else None,
+        'rr_tp1': rr1,
+        'rr_tp2': rr2,
+        'opened_ts': opened_ts if opened_ts > 0 else None,
+        'closed_ts': close_ts,
+        'open_day': open_day,
+        'close_day': close_day,
+        'open_session': open_session,
+        'close_session': close_session,
+        'risk_usdt': risk_usdt if risk_usdt > 0 else None,
+        'risk_pct': risk_pct,
+        'confidence': int(trade.get('conf') or 0) if trade.get('conf') is not None else None,
+        'quality_score': float(trade.get('quality_score') or 0.0) if trade.get('quality_score') is not None else None,
+        'engine': str(trade.get('engine') or ''),
+        'tp1_hit_ts': tp1_hit_ts,
+        'tp2_hit_ts': tp2_hit_ts,
+        'sl_hit_ts': sl_hit_ts,
+        'be_armed_ts': be_armed_ts,
+        'be_hit_ts': be_hit_ts,
+        'result_path': result_path,
+        'result_label': result_label,
+        'close_reason': close_reason,
+        'risk_free_flag': risk_free_flag,
+        'pnl_usdt': pnl_usdt,
+        'r_multiple': r_multiple,
+        'duration_total_sec': duration_total_sec,
+        'duration_to_tp1_sec': duration_to_tp1_sec,
+        'duration_to_tp2_sec': duration_to_tp2_sec,
+        'duration_to_sl_sec': duration_to_sl_sec,
+        'source_confidence': source_conf,
+        'source_note': '; '.join(dict.fromkeys([s for s in source_bits if s]))[:220],
+        'exchange_confirmed': int(bool(exchange_confirmed)),
+        'last_sync_ts': now_ts,
+    }
+    return row, events
+
+
+def _trade_lifecycle_sync(owner_uid: int, days: int = 30, force: bool = False) -> dict:
+    owner_uid = int(owner_uid)
+    _trade_lifecycle_migrate()
+    _autotrade_migrate_tables()
+    if owner_uid <= 0:
+        return {'synced': 0, 'rows': 0, 'skipped': 0}
+    cache_key = f"trade_lifecycle_sync:{owner_uid}:{int(days)}"
+    if (not force):
+        try:
+            if cache_valid(cache_key, 90):
+                return dict(cache_get(cache_key) or {'synced': 0, 'rows': 0, 'skipped': 0})
+        except Exception:
+            pass
+
+    user = _autotrade_user_settings(owner_uid)
+    tz = _user_tzinfo(user)
+    start_local, _ = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(user))
+    start_local = start_local - timedelta(days=max(1, int(days)) - 1)
+    start_ts = float(start_local.astimezone(timezone.utc).timestamp())
+    sync_cutoff = start_ts - 86400.0 * 5.0
+
+    try:
+        if str(AUTOTRADE_MODE).lower() == 'live' and owner_uid == int(AUTOTRADE_OWNER_UID or owner_uid):
+            _autotrade_sync_closed_trades_from_exchange(owner_uid, lookback_days=max(14, int(days) + 5))
+    except Exception:
+        pass
+
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            rows = cur.execute(
+                """
+                SELECT * FROM autotrade_trades
+                WHERE uid=? AND (
+                    COALESCE(opened_ts,0)>=? OR COALESCE(closed_ts,0)>=? OR UPPER(COALESCE(status,''))='OPEN'
+                )
+                ORDER BY COALESCE(opened_ts,0) ASC, COALESCE(closed_ts,0) ASC
+                """,
+                (owner_uid, float(sync_cutoff), float(sync_cutoff)),
+            ).fetchall() or []
+            trades = [dict(r) for r in rows]
+    except Exception:
+        trades = []
+
+    if not trades:
+        out = {'synced': 0, 'rows': 0, 'skipped': 0}
+        try:
+            cache_set(cache_key, out)
+        except Exception:
+            pass
+        return out
+
+    by_key = defaultdict(list)
+    for t in trades:
+        key = (_bybit_linear_symbol(str(t.get('symbol') or '')), _norm_trade_side(str(t.get('side') or '')))
+        by_key[key].append(t)
+    for key in list(by_key.keys()):
+        by_key[key].sort(key=lambda r: float(r.get('opened_ts') or 0.0))
+
+    windows = {}
+    symbol_ranges = defaultdict(lambda: {'start': None, 'end': None})
+    now_ts = float(time.time())
+    for key, items in by_key.items():
+        for i, tr in enumerate(items):
+            opened_ts = float(tr.get('opened_ts') or 0.0)
+            next_open_ts = float(items[i + 1].get('opened_ts') or 0.0) if i + 1 < len(items) else 0.0
+            closed_ts = float(tr.get('closed_ts') or 0.0)
+            end_ts = (next_open_ts - 1.0) if next_open_ts > opened_ts else (closed_ts + 21600.0 if closed_ts > 0 else now_ts + 300.0)
+            windows[str(tr.get('trade_id') or '')] = {'next_open_ts': next_open_ts, 'window_end': end_ts}
+            rng = symbol_ranges[key[0]]
+            st = max(0.0, opened_ts - 86400.0)
+            et = max(float(end_ts or 0.0), closed_ts, now_ts if str(tr.get('status') or '').upper().strip() == 'OPEN' else 0.0) + 3600.0
+            rng['start'] = st if rng['start'] is None else min(float(rng['start']), st)
+            rng['end'] = et if rng['end'] is None else max(float(rng['end']), et)
+
+    live_mode = bool(str(AUTOTRADE_MODE).lower() == 'live' and owner_uid == int(AUTOTRADE_OWNER_UID or owner_uid))
+    position_map = {}
+    if live_mode:
+        try:
+            for p in (_bybit_get_open_positions_linear() or []):
+                key = (_pos_symbol(p), _pos_side_text(p))
+                if key[0] and key[1]:
+                    position_map[key] = p
+        except Exception:
+            position_map = {}
+
+    order_cache = {}
+    pnl_cache = {}
+    if live_mode:
+        for sym, rng in symbol_ranges.items():
+            try:
+                order_cache[sym] = _bybit_get_order_history_linear(sym, float(rng['start'] or 0.0), float(rng['end'] or (now_ts + 3600.0)), limit=200)
+            except Exception:
+                order_cache[sym] = []
+            try:
+                pnl_cache[sym] = _bybit_get_closed_pnl_linear(float(rng['start'] or 0.0), float(rng['end'] or (now_ts + 3600.0)), symbol=sym, limit=200)
+            except Exception:
+                pnl_cache[sym] = []
+
+    synced = 0
+    for tr in trades:
+        try:
+            tid = str(tr.get('trade_id') or '').strip()
+            if not tid:
+                continue
+            sym = _bybit_linear_symbol(str(tr.get('symbol') or ''))
+            side = _norm_trade_side(str(tr.get('side') or ''))
+            live_pos = position_map.get((sym, side)) if live_mode else None
+            win = windows.get(tid) or {}
+            row, events = _trade_lifecycle_build_trade_row(
+                owner_uid,
+                tr,
+                user,
+                next_open_ts=float(win.get('next_open_ts') or 0.0),
+                live_mode=live_mode,
+                live_pos=live_pos,
+                order_rows=order_cache.get(sym) or [],
+                closed_pnl_rows=pnl_cache.get(sym) or [],
+            )
+            _trade_lifecycle_upsert_row(row)
+            _trade_lifecycle_store_events(tid, events)
+            synced += 1
+        except Exception:
+            continue
+
+    out = {'synced': int(synced), 'rows': int(len(trades)), 'skipped': int(max(0, len(trades) - synced))}
+    try:
+        cache_set(cache_key, out)
+    except Exception:
+        pass
+    return out
+
+
+def _trade_lifecycle_analytics(owner_uid: int, days: int = 30, session: str = 'ALL', sync: bool = True, force: bool = False) -> dict:
+    owner_uid = int(owner_uid)
+    days = int(max(1, min(int(days or 30), 3650)))
+    owner_user = _autotrade_user_settings(owner_uid)
+    tz = _user_tzinfo(owner_user)
+    start_local, _ = _anchored_day_window(datetime.now(tz), _user_day_reset_hhmm(owner_user))
+    start_local = start_local - timedelta(days=days - 1)
+    start_ts = float(start_local.astimezone(timezone.utc).timestamp())
+    cache_key = f"trade_lifecycle_analytics:{owner_uid}:{days}:{str(session or 'ALL').upper()}"
+    if (not force):
+        try:
+            if cache_valid(cache_key, 120):
+                return dict(cache_get(cache_key) or {})
+        except Exception:
+            pass
+    if sync:
+        try:
+            _trade_lifecycle_sync(owner_uid, days=max(7, days), force=force)
+        except Exception:
+            pass
+    rows = _trade_lifecycle_query_rows(owner_uid, start_ts=float(start_ts), session=session)
+    out = _trade_lifecycle_metrics_from_rows(rows)
+    out['days'] = int(days)
+    out['session_filter'] = str(session or 'ALL').upper().strip() or 'ALL'
+    out['start_ts'] = float(start_ts)
+    try:
+        cache_set(cache_key, out)
+    except Exception:
+        pass
+    return out
+
+
+def _trade_lifecycle_detail_row(owner_uid: int, ident: str, sync: bool = True) -> dict:
+    owner_uid = int(owner_uid)
+    key = str(ident or '').strip()
+    if not key:
+        return {}
+    if sync:
+        try:
+            _trade_lifecycle_sync(owner_uid, days=90, force=False)
+        except Exception:
+            pass
+    _trade_lifecycle_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            row = cur.execute(
+                "SELECT * FROM trade_lifecycle WHERE uid=? AND (trade_id=? OR setup_id=?) ORDER BY COALESCE(opened_ts,0) DESC LIMIT 1",
+                (owner_uid, key, key),
+            ).fetchone()
+            return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+def _trade_lifecycle_compact_report(owner_uid: int, days: int = 7, session: str = 'ALL') -> str:
+    analytics = _trade_lifecycle_analytics(owner_uid, days=days, session=session, sync=True, force=True)
+    rows = analytics.get('rows') or []
+    summary = [
+        '🧬 Trade Lifecycle Analytics',
+        HDR,
+        f"Window: last {int(analytics.get('days') or days)} anchored trading day(s) | Session: {str(analytics.get('session_filter') or session).upper()}",
+        f"Total trades: {int(analytics.get('total') or 0)} | Wins: {int(analytics.get('wins') or 0)} | Partial wins: {int(analytics.get('partial_wins') or 0)} | Losses: {int(analytics.get('losses') or 0)} | Open: {int(analytics.get('open') or 0)}",
+        f"TP1 hits: {int(analytics.get('tp1_hits') or 0)} | TP2 hits: {int(analytics.get('tp2_hits') or 0)} | SL hits: {int(analytics.get('sl_hits') or 0)} | Risk-free: {int(analytics.get('risk_free_trades') or 0)}",
+        f"Avg PnL: {float(analytics.get('avg_pnl') or 0.0):+.2f} USDT | Avg R: {float(analytics.get('avg_r') or 0.0):+.2f} | Overall win rate: {float(analytics.get('win_rate') or 0.0):.1f}%",
+    ]
+    sess_bits = []
+    for sess in ('ASIA', 'LON', 'NY'):
+        item = (analytics.get('by_open_session') or {}).get(sess) or {}
+        if item:
+            sess_bits.append(f"{sess} {int(item.get('total') or 0)}T / WR {float(item.get('win_rate') or 0.0):.1f}% / AvgR {float(item.get('avg_r') or 0.0):+.2f}")
+    summary.append('Session breakdown: ' + (' | '.join(sess_bits) if sess_bits else '—'))
+
+    if analytics.get('signs'):
+        summary.extend([SEP, 'Optimization signals'])
+        for s in (analytics.get('signs') or [])[:4]:
+            summary.append(f"• {s}")
+
+    summary.extend([SEP, 'Detailed trades'])
+    if not rows:
+        summary.append('• No bot trades found in this window.')
+        return '\n'.join(summary)
+
+    for r in rows[:80]:
+        trade_id = str(r.get('trade_id') or '')
+        setup_id = str(r.get('setup_id') or '')
+        symbol = str(r.get('symbol') or '?')
+        side = str(r.get('side') or '?')
+        open_ts = float(r.get('opened_ts') or 0.0)
+        close_ts = float(r.get('closed_ts') or 0.0)
+        open_txt = _fmt_dt_local(datetime.fromtimestamp(open_ts, tz=timezone.utc)) if open_ts > 0 else '—'
+        close_txt = _fmt_dt_local(datetime.fromtimestamp(close_ts, tz=timezone.utc)) if close_ts > 0 else '—'
+        hits = ', '.join(_trade_lifecycle_levels_hit(r)) or '—'
+        confirm_txt = 'exchange-confirmed' if int(r.get('exchange_confirmed') or 0) == 1 else 'inferred'
+        sync_note = str(r.get('source_note') or '').strip()
+        summary.append(
+            f"• {trade_id} | {setup_id or '-'} | {symbol} {side} | {str(r.get('result_path') or '').upper()}"
+        )
+        summary.append(
+            f"  Entry {fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '—'} | SL {fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '—'} | TP1 {fmt_price(float(r.get('tp1') or 0.0)) if float(r.get('tp1') or 0.0) > 0 else '—'} | TP2 {fmt_price(float(r.get('tp2') or 0.0)) if float(r.get('tp2') or 0.0) > 0 else '—'}"
+        )
+        summary.append(
+            f"  RR1 {_trade_lifecycle_fmt_value(r.get('rr_tp1'), '.2f')} | RR2 {_trade_lifecycle_fmt_value(r.get('rr_tp2'), '.2f')} | Risk {_trade_lifecycle_fmt_value(r.get('risk_usdt'), '.2f')} USDT ({_trade_lifecycle_fmt_value(r.get('risk_pct'), '.2f')}%) | Conf {str(r.get('confidence') if r.get('confidence') is not None else '—')} | Q {_trade_lifecycle_fmt_value(r.get('quality_score'), '.1f')} | Engine {str(r.get('engine') or '—')}"
+        )
+        summary.append(
+            f"  Open {open_txt} | Day {str(r.get('open_day') or '—')} | Session {str(r.get('open_session') or '—')} | Close {close_txt} | Day {str(r.get('close_day') or '—')} | Session {str(r.get('close_session') or '—')}"
+        )
+        summary.append(
+            f"  Result {str(r.get('result_label') or '—')} | Hits {hits} | Risk-Free {str(r.get('risk_free_flag') or 'UNKNOWN')} | Reason {str(r.get('close_reason') or ('open' if str(r.get('result_path') or '').upper() == 'OPEN' else '—'))}"
+        )
+        summary.append(
+            f"  TP1 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp1_sec'))} | TP2 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(r.get('duration_to_sl_sec'))} | Total {_trade_lifecycle_fmt_duration(r.get('duration_total_sec'))}"
+        )
+        summary.append(
+            f"  PnL {_trade_lifecycle_fmt_value(r.get('pnl_usdt'), '.2f')} USDT | R {_trade_lifecycle_fmt_value(r.get('r_multiple'), '.2f')} | {confirm_txt}" + (f" | Note {sync_note}" if sync_note else '')
+        )
+    if len(rows) > 80:
+        summary.extend([SEP, f"Showing first 80 of {len(rows)} trades. Narrow the window with /trade_lifecycle <days> [ASIA|LON|NY]."])
+    return '\n'.join(summary)
+
+
+def _trade_lifecycle_detail_report(owner_uid: int, ident: str) -> str:
+    row = _trade_lifecycle_detail_row(owner_uid, ident, sync=True)
+    if not row:
+        return 'No matching trade lifecycle row found.'
+    trade_id = str(row.get('trade_id') or '')
+    setup_id = str(row.get('setup_id') or '')
+    lines = [
+        '🧬 Trade Lifecycle Detail',
+        HDR,
+        f"Trade ID: {trade_id}",
+        f"Setup ID: {setup_id or '—'}",
+        f"Symbol: {str(row.get('symbol') or '—')} | Type: {str(row.get('side') or '—')}",
+        f"Entry: {fmt_price(float(row.get('entry') or 0.0)) if float(row.get('entry') or 0.0) > 0 else '—'} | SL: {fmt_price(float(row.get('sl') or 0.0)) if float(row.get('sl') or 0.0) > 0 else '—'} | TP1: {fmt_price(float(row.get('tp1') or 0.0)) if float(row.get('tp1') or 0.0) > 0 else '—'} | TP2: {fmt_price(float(row.get('tp2') or 0.0)) if float(row.get('tp2') or 0.0) > 0 else '—'}",
+        f"Result path: {str(row.get('result_path') or '—')} | Result: {str(row.get('result_label') or '—')}",
+        f"Risk: {_trade_lifecycle_fmt_value(row.get('risk_usdt'), '.2f')} USDT ({_trade_lifecycle_fmt_value(row.get('risk_pct'), '.2f')}%) | R: {_trade_lifecycle_fmt_value(row.get('r_multiple'), '.2f')} | PnL: {_trade_lifecycle_fmt_value(row.get('pnl_usdt'), '.2f')} USDT",
+        f"Open: {(_fmt_dt_local(datetime.fromtimestamp(float(row.get('opened_ts') or 0.0), tz=timezone.utc)) if float(row.get('opened_ts') or 0.0) > 0 else '—')} | Close: {(_fmt_dt_local(datetime.fromtimestamp(float(row.get('closed_ts') or 0.0), tz=timezone.utc)) if float(row.get('closed_ts') or 0.0) > 0 else '—')}",
+        f"Durations → TP1 {_trade_lifecycle_fmt_duration(row.get('duration_to_tp1_sec'))} | TP2 {_trade_lifecycle_fmt_duration(row.get('duration_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(row.get('duration_to_sl_sec'))} | Total {_trade_lifecycle_fmt_duration(row.get('duration_total_sec'))}",
+        f"Risk-Free: {str(row.get('risk_free_flag') or 'UNKNOWN')} | Exchange: {'exchange-confirmed' if int(row.get('exchange_confirmed') or 0) == 1 else 'inferred'} | Sync: {str(row.get('source_confidence') or '—')}",
+        f"Sync note: {str(row.get('source_note') or '—')}",
+    ]
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            ev_rows = cur.execute(
+                "SELECT * FROM trade_lifecycle_events WHERE trade_id=? ORDER BY COALESCE(event_ts,0) ASC, id ASC",
+                (trade_id,),
+            ).fetchall() or []
+            if ev_rows:
+                lines.extend([SEP, 'Events'])
+                for ev in ev_rows[:20]:
+                    d = dict(ev)
+                    ts = float(d.get('event_ts') or 0.0)
+                    ts_txt = _fmt_dt_local(datetime.fromtimestamp(ts, tz=timezone.utc)) if ts > 0 else '—'
+                    px = float(d.get('price') or 0.0)
+                    qty = float(d.get('qty') or 0.0)
+                    pnl = d.get('pnl_usdt')
+                    parts = [f"• {str(d.get('event_type') or '')} | {ts_txt}"]
+                    if px > 0:
+                        parts.append(f"px {fmt_price(px)}")
+                    if qty > 0:
+                        parts.append(f"qty {qty:g}")
+                    if pnl is not None:
+                        try:
+                            parts.append(f"pnl {float(pnl):+.2f}")
+                        except Exception:
+                            pass
+                    if str(d.get('source') or '').strip():
+                        parts.append(str(d.get('source') or '').strip())
+                    lines.append(' | '.join(parts))
+    except Exception:
+        pass
+    return '\n'.join(lines)
+
+
+async def trade_lifecycle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
+        await update.message.reply_text('⛔️ Owner/admin only.')
+        return
+    days = 7
+    session = 'ALL'
+    try:
+        for arg in (context.args or []):
+            raw = str(arg or '').strip().upper()
+            if not raw:
+                continue
+            if raw in {'ALL', 'ASIA', 'LON', 'NY'}:
+                session = raw
+            else:
+                days = int(float(raw))
+    except Exception:
+        days = 7
+    days = int(max(1, min(days, 3650)))
+    owner_uid = _trade_lifecycle_owner_uid(uid)
+    text_out = await to_thread_heavy(_trade_lifecycle_compact_report, owner_uid, days, session)
+    await send_long_message(update, text_out, parse_mode=None)
+
+
+async def trade_lifecycle_detail_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
+        await update.message.reply_text('⛔️ Owner/admin only.')
+        return
+    ident = str(' '.join(context.args or [])).strip()
+    if not ident:
+        await update.message.reply_text('Usage: /trade_lifecycle_detail <setup_id or trade_id>')
+        return
+    owner_uid = _trade_lifecycle_owner_uid(uid)
+    text_out = await to_thread_heavy(_trade_lifecycle_detail_report, owner_uid, ident)
+    await send_long_message(update, text_out, parse_mode=None)
 
 
 def _admin_setup_state_from_reason(reason: str) -> str:
@@ -15419,6 +16903,18 @@ def _learning_stage_outcome_summary(uid: int, days: int = 60) -> dict:
 
 
 def _learning_live_trade_summary(uid: int, days: int = 60) -> dict:
+    if int(uid or 0) <= 0:
+        return {'closed': 0, 'net_pnl': 0.0, 'win_rate': 0.0}
+    try:
+        life = _trade_lifecycle_analytics(int(uid), days=max(3, int(days)), session='ALL', sync=True, force=False)
+        if life and int(life.get('total') or 0) > 0:
+            return {
+                'closed': int(life.get('closed_decided') or life.get('closed') or 0),
+                'net_pnl': float(life.get('net_pnl') or 0.0),
+                'win_rate': float(life.get('win_rate') or 0.0),
+            }
+    except Exception:
+        pass
     rows = _autotrade_performance_rows(int(uid), days=max(3, int(days))) if int(uid or 0) > 0 else []
     s = _autotrade_performance_summary(rows)
     return {
@@ -15429,8 +16925,18 @@ def _learning_live_trade_summary(uid: int, days: int = 60) -> dict:
 
 
 def _learning_breakeven_after_tp1_analysis(uid: int, days: int = 60) -> dict:
-    stage = _learning_stage_outcome_summary(uid, days=days)
-    tp1_plus = int(stage.get('tp1_only') or 0) + int(stage.get('tp2_plus') or 0)
+    try:
+        life = _trade_lifecycle_analytics(int(uid), days=max(3, int(days)), session='ALL', sync=True, force=False) if int(uid or 0) > 0 else {}
+    except Exception:
+        life = {}
+    tp1_plus = int(life.get('tp1_hits') or 0) if life else 0
+    tp1_only = int(life.get('partial_wins') or 0) if life else 0
+    tp2_plus = int(life.get('wins') or 0) if life else 0
+    if tp1_plus <= 0:
+        stage = _learning_stage_outcome_summary(uid, days=days)
+        tp1_plus = int(stage.get('tp1_only') or 0) + int(stage.get('tp2_plus') or 0)
+        tp1_only = int(stage.get('tp1_only') or 0)
+        tp2_plus = int(stage.get('tp2_plus') or 0)
     if tp1_plus <= 0:
         return {
             'recommendation': 'WAIT',
@@ -15438,20 +16944,20 @@ def _learning_breakeven_after_tp1_analysis(uid: int, days: int = 60) -> dict:
             'tp1_only_share': 0.0,
             'explanation': 'No TP1-hit sample yet. Keep current code until more stage data is collected.',
         }
-    tp1_only_share = (float(stage.get('tp1_only') or 0) / float(tp1_plus) * 100.0) if tp1_plus > 0 else 0.0
-    tp2_plus_share = (float(stage.get('tp2_plus') or 0) / float(tp1_plus) * 100.0) if tp1_plus > 0 else 0.0
+    tp1_only_share = (float(tp1_only) / float(tp1_plus) * 100.0) if tp1_plus > 0 else 0.0
+    tp2_plus_share = (float(tp2_plus) / float(tp1_plus) * 100.0) if tp1_plus > 0 else 0.0
     if tp1_plus < 12:
         rec = 'WAIT'
         why = 'TP1-path sample is still small. No code change is required yet.'
     elif tp1_only_share >= 60.0:
         rec = 'CONDITIONAL'
-        why = 'Many TP1-hit setups do not extend to the final TP2 target. A conditional break-even-after-TP1 rule is supported by the data, but it should be filtered by setup quality / session / volatility rather than forced on every trade.'
+        why = 'Many TP1-hit live trades do not extend to TP2. A conditional break-even-after-TP1 rule is supported by the lifecycle data, but it should stay filtered by quality / session / volatility rather than forced globally.'
     elif tp2_plus_share >= 60.0:
         rec = 'NO_GLOBAL_CHANGE'
-        why = 'Most TP1-hit setups continue to the final TP2 target. A global move-to-breakeven right after TP1 would likely cut stronger runners too early.'
+        why = 'Most TP1-hit live trades continue to TP2. A global move-to-breakeven immediately after TP1 would likely cut stronger runners too early.'
     else:
         rec = 'CONDITIONAL'
-        why = 'Results are mixed. Keep current logic unless you want a bounded analytics-driven conditional rule after TP1.'
+        why = 'Results are mixed. Keep the current bounded conditional logic unless you want a stricter post-TP1 break-even policy.'
     return {
         'recommendation': rec,
         'sample_tp1_plus': int(tp1_plus),
@@ -20346,7 +21852,7 @@ KNOWN_COMMANDS = sorted(set([
     "health", "health_sys",
 
     # AutoTrade (admin)
-    "open_trades", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_debug_reset", "autotrade_report_overall", "autotrade_sessions",
+    "open_trades", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_debug_reset", "autotrade_report_overall", "autotrade_sessions", "trade_lifecycle", "trade_lifecycle_detail",
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
@@ -20894,6 +22400,8 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows)",
     "autotrade_report_overall": "AutoTrade overall performance summary",
     "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
+    "trade_lifecycle": "Exchange-backed per-trade lifecycle analytics with TP/SL path classification",
+    "trade_lifecycle_detail": "Detailed lifecycle timeline for one setup_id or trade_id",
     "autotrade_sessions": "Show or set allowed auto-trade sessions",
     "open_trades": "Show live open Bybit positions",
     "cooldown_clear": "Clear cooldown for one symbol + side",
@@ -20923,7 +22431,7 @@ ADMIN_HELP_GROUPS = [
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "adaptive_run", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
-    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "autotrade_sessions", "open_trades"]),
+    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
 ]
@@ -28130,6 +29638,8 @@ def main():
     app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
     app.add_handler(CommandHandler("performance_report", performance_report_cmd, block=False))
+    app.add_handler(CommandHandler("trade_lifecycle", trade_lifecycle_cmd, block=False))
+    app.add_handler(CommandHandler("trade_lifecycle_detail", trade_lifecycle_detail_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
@@ -28276,6 +29786,7 @@ def main():
 
         _autotrade_migrate_tables()
         _admin_setup_lifecycle_migrate()
+        _trade_lifecycle_migrate()
 
     except Exception:
 
