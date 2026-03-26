@@ -6961,7 +6961,6 @@ def _learning_status_text() -> str:
         f"Weighted TP accuracy: {float(stage.get('weighted_win_rate') or 0.0):.1f}% | Avg staged credit/trade: {float(stage.get('avg_weighted_credit') or 0.0):.2f}",
         f"Live autotrade closes available: {int(live.get('closed') or 0)} | Net PnL: ${float(live.get('net_pnl') or 0.0):+.2f} | Win rate: {float(live.get('win_rate') or 0.0):.1f}%",
         f"Lifecycle 30d: TP1 hits {int(lifecycle.get('tp1_hits') or 0)} | TP2 conversion {float(lifecycle.get('tp2_conversion_after_tp1') or 0.0):.1f}% | Risk-free save {float(lifecycle.get('risk_free_save_rate') or 0.0):.1f}% | Avg TP1 {_trade_lifecycle_fmt_duration(lifecycle.get('avg_time_to_tp1_sec'))}",
-        *_trade_lifecycle_analytics_lines(lifecycle, heading='Lifecycle optimization feed (30d)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2),
         f"Breakeven after TP1: {str(be.get('recommendation') or 'NEUTRAL')} | TP1+ sample: {int(be.get('sample_tp1_plus') or 0)} | TP1-only share: {float(be.get('tp1_only_share') or 0.0):.1f}%",
         f"Why: {str(be.get('explanation') or 'Not enough TP1-path data yet.')}",
         SEP,
@@ -11363,10 +11362,23 @@ def _trade_lifecycle_recent_report(owner_uid: int, hours: int = 48, session: str
         '🧬 Trade Lifecycle Detail',
         HDR,
         f"Window: last {hours} hour(s) | Session: {session}",
-        *_trade_lifecycle_analytics_lines(analytics, heading='Lifecycle summary', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=3),
-        SEP,
-        'Detailed trades',
+        f"Total trades: {int(analytics.get('total') or 0)} | Wins: {int(analytics.get('wins') or 0)} | Partial wins: {int(analytics.get('partial_wins') or 0)} | Losses: {int(analytics.get('losses') or 0)} | Open: {int(analytics.get('open') or 0)}",
+        f"TP1 hits: {int(analytics.get('tp1_hits') or 0)} | TP2 hits: {int(analytics.get('tp2_hits') or 0)} | SL hits: {int(analytics.get('sl_hits') or 0)} | Risk-free: {int(analytics.get('risk_free_trades') or 0)}",
+        f"Avg PnL: {float(analytics.get('avg_pnl') or 0.0):+.2f} USDT | Avg R: {float(analytics.get('avg_r') or 0.0):+.2f} | Win rate: {float(analytics.get('win_rate') or 0.0):.1f}%",
     ]
+    sess_bits = []
+    for sess in ('ASIA', 'LON', 'NY'):
+        item = (analytics.get('by_open_session') or {}).get(sess) or {}
+        if item:
+            sess_bits.append(f"{sess} {int(item.get('total') or 0)}T / WR {float(item.get('win_rate') or 0.0):.1f}% / AvgR {float(item.get('avg_r') or 0.0):+.2f}")
+    lines.append('Session breakdown: ' + (' | '.join(sess_bits) if sess_bits else '—'))
+
+    if analytics.get('signs'):
+        lines.extend([SEP, 'Optimization signals'])
+        for s in (analytics.get('signs') or [])[:4]:
+            lines.append(f"• {s}")
+
+    lines.extend([SEP, 'Detailed trades'])
     if not rows:
         lines.append('• No bot trades found in this rolling window.')
         return '\n'.join(lines)
@@ -11386,10 +11398,23 @@ def _trade_lifecycle_compact_report(owner_uid: int, days: int = 7, session: str 
         '🧬 Trade Lifecycle Analytics',
         HDR,
         f"Window: last {int(analytics.get('days') or days)} anchored trading day(s) | Session: {str(analytics.get('session_filter') or session).upper()}",
-        *_trade_lifecycle_analytics_lines(analytics, heading='Lifecycle summary', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=3),
-        SEP,
-        'Detailed trades',
+        f"Total trades: {int(analytics.get('total') or 0)} | Wins: {int(analytics.get('wins') or 0)} | Partial wins: {int(analytics.get('partial_wins') or 0)} | Losses: {int(analytics.get('losses') or 0)} | Open: {int(analytics.get('open') or 0)}",
+        f"TP1 hits: {int(analytics.get('tp1_hits') or 0)} | TP2 hits: {int(analytics.get('tp2_hits') or 0)} | SL hits: {int(analytics.get('sl_hits') or 0)} | Risk-free: {int(analytics.get('risk_free_trades') or 0)}",
+        f"Avg PnL: {float(analytics.get('avg_pnl') or 0.0):+.2f} USDT | Avg R: {float(analytics.get('avg_r') or 0.0):+.2f} | Overall win rate: {float(analytics.get('win_rate') or 0.0):.1f}%",
     ]
+    sess_bits = []
+    for sess in ('ASIA', 'LON', 'NY'):
+        item = (analytics.get('by_open_session') or {}).get(sess) or {}
+        if item:
+            sess_bits.append(f"{sess} {int(item.get('total') or 0)}T / WR {float(item.get('win_rate') or 0.0):.1f}% / AvgR {float(item.get('avg_r') or 0.0):+.2f}")
+    summary.append('Session breakdown: ' + (' | '.join(sess_bits) if sess_bits else '—'))
+
+    if analytics.get('signs'):
+        summary.extend([SEP, 'Optimization signals'])
+        for s in (analytics.get('signs') or [])[:4]:
+            summary.append(f"• {s}")
+
+    summary.extend([SEP, 'Detailed trades'])
     if not rows:
         summary.append('• No bot trades found in this window.')
         return '\n'.join(summary)
@@ -11400,127 +11425,6 @@ def _trade_lifecycle_compact_report(owner_uid: int, days: int = 7, session: str 
     if len(rows) > 80:
         summary.extend([SEP, f"Showing first 80 of {len(rows)} trades. Narrow the window with /trade_lifecycle <days> [ASIA|LON|NY]."])
     return '\n'.join(summary)
-
-
-
-
-def _trade_lifecycle_recent_analytics(owner_uid: int, hours: int = 48, session: str = 'ALL', force: bool = False) -> dict:
-    owner_uid = int(owner_uid)
-    hours = int(max(1, min(int(hours or 48), 24 * 90)))
-    session = str(session or 'ALL').upper().strip() or 'ALL'
-    sync_days = max(7, int(math.ceil(float(hours) / 24.0)) + 3)
-    try:
-        _trade_lifecycle_sync(owner_uid, days=sync_days, force=bool(force))
-    except Exception:
-        pass
-    start_ts = float(time.time()) - float(hours) * 3600.0
-    out = _trade_lifecycle_metrics_from_rows(_trade_lifecycle_query_rows(owner_uid, start_ts=float(start_ts), session=session))
-    out['hours'] = int(hours)
-    out['session_filter'] = session
-    return out
-
-
-def _trade_lifecycle_best_bucket(group_map: dict, metric: str = 'avg_r', min_sample: int = 3, prefer_high: bool = True) -> tuple[str, dict]:
-    items = []
-    for name, data in (group_map or {}).items():
-        d = dict(data or {})
-        sample = int(d.get('closed') or d.get('total') or 0)
-        if sample < int(min_sample):
-            continue
-        try:
-            score = float(d.get(metric) or 0.0)
-        except Exception:
-            score = 0.0
-        items.append((str(name), d, sample, score))
-    if not items:
-        return '', {}
-    items.sort(key=lambda x: (x[3], x[2], x[0]), reverse=bool(prefer_high))
-    return items[0][0], items[0][1]
-
-
-def _trade_lifecycle_analytics_lines(analytics: dict, heading: str = 'Lifecycle analytics', include_sessions: bool = True,
-                                    include_engines: bool = True, include_buckets: bool = True,
-                                    include_symbols: bool = True, include_signs: bool = True,
-                                    max_signs: int = 3) -> list[str]:
-    a = dict(analytics or {})
-    total = int(a.get('total') or 0)
-    if total <= 0:
-        return [heading, '• No exchange-backed executed bot trades in this window yet.']
-
-    closed = int(a.get('closed_decided') or a.get('closed') or 0)
-    tp1_hits = int(a.get('tp1_hits') or 0)
-    tp1_hit_rate = (float(tp1_hits) / float(total) * 100.0) if total > 0 else 0.0
-    lines = [heading]
-    lines.append(
-        f"• Trades {total} | Closed {closed} | WR {float(a.get('win_rate') or 0.0):.1f}% | AvgR {float(a.get('avg_r') or 0.0):+.2f} | Net {float(a.get('net_pnl') or 0.0):+.2f} USDT"
-    )
-    lines.append(
-        f"• TP1 hit {tp1_hits} ({tp1_hit_rate:.1f}%) | TP2 after TP1 {float(a.get('tp2_conversion_after_tp1') or 0.0):.1f}% | SL-before-TP1 {float(a.get('sl_before_tp1_rate') or 0.0):.1f}% | Risk-free save {float(a.get('risk_free_save_rate') or 0.0):.1f}%"
-    )
-    lines.append(
-        f"• Timing: TP1 {_trade_lifecycle_fmt_duration(a.get('avg_time_to_tp1_sec'))} | TP2 {_trade_lifecycle_fmt_duration(a.get('avg_time_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(a.get('avg_time_to_sl_sec'))}"
-    )
-
-    if include_sessions:
-        best_sess_name, best_sess = _trade_lifecycle_best_bucket(a.get('by_open_session') or {}, metric='avg_r', min_sample=2, prefer_high=True)
-        weak_sess_name, weak_sess = _trade_lifecycle_best_bucket(a.get('by_open_session') or {}, metric='avg_r', min_sample=2, prefer_high=False)
-        if best_sess_name:
-            lines.append(
-                f"• Best open session: {best_sess_name} | WR {float(best_sess.get('win_rate') or 0.0):.1f}% | AvgR {float(best_sess.get('avg_r') or 0.0):+.2f} | TP2/TP1 {float(best_sess.get('tp2_conversion_after_tp1') or 0.0):.1f}%"
-            )
-        if weak_sess_name:
-            lines.append(
-                f"• Weakest open session: {weak_sess_name} | WR {float(weak_sess.get('win_rate') or 0.0):.1f}% | AvgR {float(weak_sess.get('avg_r') or 0.0):+.2f} | SL-before-TP1 {float(weak_sess.get('sl_before_tp1_rate') or 0.0):.1f}%"
-            )
-
-    if include_engines:
-        best_engine_name, best_engine = _trade_lifecycle_best_bucket(a.get('by_engine') or {}, metric='avg_r', min_sample=2, prefer_high=True)
-        weak_engine_name, weak_engine = _trade_lifecycle_best_bucket(a.get('by_engine') or {}, metric='avg_r', min_sample=2, prefer_high=False)
-        if best_engine_name:
-            lines.append(
-                f"• Best engine: {best_engine_name} | WR {float(best_engine.get('win_rate') or 0.0):.1f}% | AvgR {float(best_engine.get('avg_r') or 0.0):+.2f}"
-            )
-        if weak_engine_name and weak_engine_name != best_engine_name:
-            lines.append(
-                f"• Weak engine: {weak_engine_name} | WR {float(weak_engine.get('win_rate') or 0.0):.1f}% | AvgR {float(weak_engine.get('avg_r') or 0.0):+.2f}"
-            )
-
-    if include_buckets:
-        best_conf_name, best_conf = _trade_lifecycle_best_bucket(a.get('by_conf_bucket') or {}, metric='avg_r', min_sample=2, prefer_high=True)
-        weak_conf_name, weak_conf = _trade_lifecycle_best_bucket(a.get('by_conf_bucket') or {}, metric='avg_r', min_sample=2, prefer_high=False)
-        best_quality_name, best_quality = _trade_lifecycle_best_bucket(a.get('by_quality_bucket') or {}, metric='avg_r', min_sample=2, prefer_high=True)
-        if best_conf_name:
-            lines.append(
-                f"• Best confidence bucket: {best_conf_name} | WR {float(best_conf.get('win_rate') or 0.0):.1f}% | AvgR {float(best_conf.get('avg_r') or 0.0):+.2f}"
-            )
-        if weak_conf_name and weak_conf_name != best_conf_name:
-            lines.append(
-                f"• Weak confidence bucket: {weak_conf_name} | WR {float(weak_conf.get('win_rate') or 0.0):.1f}% | AvgR {float(weak_conf.get('avg_r') or 0.0):+.2f}"
-            )
-        if best_quality_name:
-            lines.append(
-                f"• Best quality bucket: {best_quality_name} | WR {float(best_quality.get('win_rate') or 0.0):.1f}% | AvgR {float(best_quality.get('avg_r') or 0.0):+.2f}"
-            )
-
-    if include_symbols:
-        top_win = list(a.get('top_winning_symbols') or [])
-        top_lose = list(a.get('top_losing_symbols') or [])
-        tp1_fail = list(a.get('symbols_tp1_but_fail_tp2') or [])
-        if top_win:
-            x = dict(top_win[0] or {})
-            lines.append(f"• Top winner: {str(x.get('symbol') or '?')} | PnL {float(x.get('net_pnl') or 0.0):+.2f} | AvgR {float(x.get('avg_r') or 0.0):+.2f}")
-        if top_lose:
-            x = dict(top_lose[0] or {})
-            lines.append(f"• Top loser: {str(x.get('symbol') or '?')} | PnL {float(x.get('net_pnl') or 0.0):+.2f} | AvgR {float(x.get('avg_r') or 0.0):+.2f}")
-        if tp1_fail:
-            x = dict(tp1_fail[0] or {})
-            lines.append(f"• TP1-but-miss-TP2 symbol: {str(x.get('symbol') or '?')} | TP1 {int(x.get('tp1_hits') or 0)} | TP2 {int(x.get('tp2_hits') or 0)}")
-
-    if include_signs and (a.get('signs') or []):
-        lines.append('• Optimization signals:')
-        for s in list(a.get('signs') or [])[:max(1, int(max_signs))]:
-            lines.append(f"  - {s}")
-    return lines
 
 
 def _trade_lifecycle_detail_report(owner_uid: int, ident: str) -> str:
@@ -19665,12 +19569,6 @@ def _market_adaptive_status_snapshot() -> dict:
     review = _runtime_profile_review_probation(int(AUTOTRADE_OWNER_UID or 0), force=False)
     last_run = _evolution_get_last_run('market_adaptive') or {}
     last_report = _evolution_state_get('market_adaptive_last_report', {}) or {}
-    owner = int(AUTOTRADE_OWNER_UID or 0)
-    life_days = int((cfg or {}).get('market_adaptive_days', 30) or 30)
-    try:
-        lifecycle = _trade_lifecycle_analytics(owner, days=max(7, life_days), session='ALL', sync=True, force=False) if owner > 0 else {}
-    except Exception:
-        lifecycle = {}
     return {
         'enabled': _cfg_bool((cfg or {}).get('market_adaptive_enabled', True), True),
         'interval_hours': float((cfg or {}).get('market_adaptive_interval_hours', 24.0) or 24.0),
@@ -19679,7 +19577,6 @@ def _market_adaptive_status_snapshot() -> dict:
         'last_report': last_report,
         'runtime_profile': _runtime_profile_get_current() or profile or {},
         'runtime_profile_review': review or {},
-        'lifecycle': lifecycle or {},
     }
 
 
@@ -19915,10 +19812,6 @@ async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAU
         for _sess in ('NY', 'LON', 'ASIA'):
             _q, _c, _r = _execution_session_thresholds(_sess)
             lines.append(f"• {_sess}: quality≥{float(_q):.1f} | conf≥{int(_c)} | final RR≥{float(_r):.2f}")
-    lifecycle = snap.get('lifecycle') or {}
-    life_lines = _trade_lifecycle_analytics_lines(lifecycle, heading=f"Live-trade lifecycle feed ({int(snap.get('days') or 30)}d)", include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2)
-    if life_lines:
-        lines.extend([SEP, *life_lines])
     if profile:
         pstatus = str(profile.get('status') or 'ACTIVE').upper()
         psrc = str(profile.get('source') or 'bootstrap')
@@ -25465,11 +25358,6 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows, hidden_untracked_open = await to_thread_heavy(_eval_all, timeout=120)
     stats = _canonical_wr_stats(rows)
     counts = stats.get('counts') or Counter()
-    life_uid = int(AUTOTRADE_OWNER_UID or uid) if is_admin_user(uid) else int(uid)
-    try:
-        lifecycle_recent = await to_thread_heavy(_trade_lifecycle_recent_analytics, life_uid, lookback_h, 'ALL', False, timeout=120)
-    except Exception:
-        lifecycle_recent = {}
     header = [
         f"📊 Signal Report (last {lookback_h}h)",
         HDR,
@@ -25477,7 +25365,6 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"TP1: {counts.get('TP1',0)} | TP2: {counts.get('TP2',0)} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)} | None: {counts.get('None',0)}",
         HDR,
     ]
-    life_lines = _trade_lifecycle_analytics_lines(lifecycle_recent, heading=f"Exchange-backed lifecycle ({lookback_h}h)", include_sessions=True, include_engines=True, include_buckets=False, include_symbols=True, include_signs=True, max_signs=2)
     table_rows = [[r['session'], r['time'], r['trade'], r['confidence'], r['outcome']] for r in rows]
     table = tabulate(table_rows, headers=['Session','Time','Trade','Confidence','Outcome'], tablefmt='plain', colalign=('left','left','left','right','left'))
     sess_lines = ['Session breakdown:']
@@ -25485,8 +25372,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
     if int(hidden_untracked_open or 0) > 0:
         sess_lines.append(f"• Hidden untracked rows: {int(hidden_untracked_open)} (no current live Bybit/autotrade match)")
-    body_text = '\n'.join(header + life_lines + sess_lines)
-    msg = html.escape(body_text) + "\n<pre>" + html.escape(table) + "</pre>"
+    msg = "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>\n" + "\n".join(sess_lines)
     await send_long_message(update, msg, parse_mode=ParseMode.HTML)
 
 
@@ -25625,14 +25511,6 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
     evaluated = len(rows)
     coverage = (evaluated / total * 100.0) if total > 0 else 0.0
 
-    try:
-        life_days = max(7, min(90, int(_autotrade_history_days_available(target_uid) or 30)))
-    except Exception:
-        life_days = 30
-    try:
-        lifecycle = _trade_lifecycle_analytics(target_uid, days=life_days, session='ALL', sync=True, force=False)
-    except Exception:
-        lifecycle = {}
     lines = [
         '📈 Signal Report — Overall',
         HDR,
@@ -25643,7 +25521,6 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         f'Wins (TP1/TP2): {int(stats.get("wins") or 0)} | TP2 wins: {int(stats.get("tp2_wins") or 0)} | Losses: {int(stats.get("losses") or 0)} | Signal WR: {float(stats.get("win_rate") or 0.0):.1f}%',
         f'TP1: {counts.get("TP1",0)} | TP2: {counts.get("TP2",0)} | SL: {counts.get("SL",0)} | Open: {counts.get("OPEN",0)}',
     ]
-    lines.extend([SEP, *_trade_lifecycle_analytics_lines(lifecycle, heading=f'Exchange-backed lifecycle ({life_days}d)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2)])
     if by_session:
         lines.extend([SEP, 'By session'])
         for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
@@ -25808,16 +25685,6 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
     equity_now = _effective_equity_for_risk(owner_user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
     weighted_recent = _autotrade_weighted_outcome_summary(owner, days=days)
     weighted_overall = _autotrade_weighted_outcome_summary(owner, days=overall_days)
-    try:
-        lifecycle_recent = _trade_lifecycle_analytics(owner, days=max(3, int(days)), session='ALL', sync=True, force=False)
-    except Exception:
-        lifecycle_recent = {}
-    try:
-        lifecycle_overall_days = max(7, min(90, int(overall_days or 30)))
-        lifecycle_overall = _trade_lifecycle_analytics(owner, days=lifecycle_overall_days, session='ALL', sync=True, force=False)
-    except Exception:
-        lifecycle_overall_days = max(7, min(90, int(overall_days or 30)))
-        lifecycle_overall = {}
 
     def _pf_txt(v):
         return 'INF' if v == float('inf') else f"{float(v or 0.0):.2f}"
@@ -25841,15 +25708,14 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
     if wd:
         lines.append(f"Worst day: {wd.get('day')} | ${float(wd.get('net_pnl') or 0.0):+.2f}")
 
-    lines.extend([SEP, *_trade_lifecycle_analytics_lines(lifecycle_overall, heading=f'Lifecycle feed (overall, {int(lifecycle_overall_days)}d cap)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2)])
-
     lines.extend([
         SEP,
         f'RECENT ({days} day window)',
         f"Closed: {int(recent_summary.get('closed') or 0)} | Net PnL: ${float(recent_summary.get('net') or 0.0):+.2f} | Realized WR: {float(recent_summary.get('win_rate') or 0.0):.1f}%",
         f"Weighted TP WR: {float(weighted_recent.get('weighted_win_rate') or 0.0):.1f}% | TP1 {int(weighted_recent.get('tp1_only') or 0)} | TP2 {int(weighted_recent.get('tp2_plus') or 0)} | SL {int(weighted_recent.get('losses') or 0)} | OPEN {int(weighted_recent.get('open') or 0)}",
+        SEP,
+        'Daily trend',
     ])
-    lines.extend([SEP, *_trade_lifecycle_analytics_lines(lifecycle_recent, heading=f'Lifecycle feed ({days}d)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2), SEP, 'Daily trend'])
     for r in recent_rows:
         wl_total = int(r.get('wins') or 0) + int(r.get('losses') or 0)
         wr = (float(r.get('wins') or 0) / wl_total * 100.0) if wl_total > 0 else 0.0
