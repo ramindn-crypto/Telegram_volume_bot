@@ -25979,7 +25979,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         if len(lifecycle_rows) > 20:
             lines.append(f"Showing first 20 of {len(lifecycle_rows)} closed lifecycle rows in this window.")
 
-    PLACEHOLDER_REPORT_JOIN
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
     """Journal-first reconciliation stats for performance reporting."""
@@ -26327,7 +26327,7 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"TOTAL unrealised PnL: {total_pnl:+.2f} USDT")
     lines.append(f"TOTAL risk est: {total_risk:.2f} USDT")
 
-    PLACEHOLDER_OPEN_JOIN
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 async def autotrade_debug_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
