@@ -23086,8 +23086,58 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
             pnl_cache[sym] = _bybit_get_closed_pnl_linear(hist_start, hist_end, symbol=sym, limit=200) or []
         except Exception:
             pnl_cache[sym] = []
+    journal_candidates = []
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            journal_candidates = [
+                dict(r) for r in (cur.execute(
+                    """SELECT * FROM autotrade_trades
+                           WHERE uid=? AND COALESCE(opened_ts,0) >= ? AND COALESCE(opened_ts,0) < ?
+                           ORDER BY COALESCE(opened_ts,0) DESC, trade_id DESC""",
+                    (int(owner_uid), float(max(0.0, start_ts - 86400.0 * 14.0)), float(end_ts + 86400.0))
+                ).fetchall() or [])
+            ]
+    except Exception:
+        journal_candidates = []
+    journal_by_symbol = defaultdict(list)
+    for cand in (journal_candidates or []):
+        sym = str(_bybit_linear_symbol((cand or {}).get('symbol') or '')).upper()
+        if not sym:
+            continue
+        journal_by_symbol[sym].append(dict(cand))
+    for sym in list(journal_by_symbol.keys()):
+        journal_by_symbol[sym].sort(key=lambda x: (float((x or {}).get('opened_ts') or 0.0), str((x or {}).get('trade_id') or '')), reverse=True)
+    lifecycle_setup_candidates = []
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            lifecycle_setup_candidates = [
+                dict(r) for r in (cur.execute(
+                    """SELECT * FROM admin_setup_lifecycle
+                           WHERE uid=? AND COALESCE(closed_ts, executed_ts, attempted_ts, executable_ts, emailed_ts, screened_ts, signal_created_ts, generated_logged_ts, 0) >= ?
+                           ORDER BY COALESCE(closed_ts, executed_ts, attempted_ts, executable_ts, emailed_ts, screened_ts, signal_created_ts, generated_logged_ts, 0) DESC, setup_id DESC""",
+                    (int(owner_uid), float(max(0.0, start_ts - 86400.0 * 14.0)))
+                ).fetchall() or [])
+            ]
+    except Exception:
+        lifecycle_setup_candidates = []
+    setup_by_symbol = defaultdict(list)
+    for cand in (lifecycle_setup_candidates or []):
+        sym = str(_bybit_linear_symbol((cand or {}).get('symbol') or '')).upper()
+        if not sym:
+            continue
+        cc = dict(cand)
+        cc['_event_ts'] = float(cc.get('closed_ts') or cc.get('executed_ts') or cc.get('attempted_ts') or cc.get('executable_ts') or cc.get('emailed_ts') or cc.get('screened_ts') or cc.get('signal_created_ts') or cc.get('generated_logged_ts') or 0.0)
+        setup_by_symbol[sym].append(cc)
+    for sym in list(setup_by_symbol.keys()):
+        setup_by_symbol[sym].sort(key=lambda x: (float((x or {}).get('_event_ts') or 0.0), str((x or {}).get('setup_id') or '')), reverse=True)
     user = _autotrade_user_settings(owner_uid)
     seen_out = set()
+    used_trade_ids = set()
+    used_setup_ids = set()
     def _out_key(row: dict) -> tuple:
         sym = str(_bybit_linear_symbol((row or {}).get('symbol') or '')).upper()
         side = str((row or {}).get('side') or '').upper().strip()
@@ -23109,6 +23159,65 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                 seen_local.add(key)
                 keys.append(key)
         return keys
+    def _base_side_candidates(base_row: dict) -> list[str]:
+        sides = [str(x or '').upper().strip() for x in ((base_row or {}).get('_side_candidates') or []) if str(x or '').strip()]
+        side_txt = str((base_row or {}).get('side') or '').upper().strip()
+        if side_txt and side_txt not in sides:
+            sides.append(side_txt)
+        return sides or ['BUY', 'SELL']
+    def _match_journal_trade(base_row: dict) -> dict:
+        sym = str(_bybit_linear_symbol((base_row or {}).get('symbol') or '')).upper()
+        if not sym:
+            return {}
+        cts = float((base_row or {}).get('closed_ts') or 0.0)
+        side_candidates = set(_base_side_candidates(base_row))
+        scored = []
+        for cand in (journal_by_symbol.get(sym) or []):
+            try:
+                tid = str((cand or {}).get('trade_id') or '').strip()
+                side = str((cand or {}).get('side') or '').upper().strip()
+                if side_candidates and side and side not in side_candidates:
+                    continue
+                opened = float((cand or {}).get('opened_ts') or 0.0)
+                closed = float((cand or {}).get('closed_ts') or 0.0)
+                if opened > 0 and cts > 0 and opened > cts + 900.0:
+                    continue
+                status = str((cand or {}).get('status') or '').upper().strip()
+                close_delta = abs(closed - cts) if closed > 0 and cts > 0 else 10**12
+                closed_hint = 0 if (closed > 0 and cts > 0 and abs(closed - cts) <= 6 * 3600.0) else 1
+                opened_gap = (cts - opened) if opened > 0 and cts > 0 and opened <= cts + 900.0 else 10**12
+                status_pref = 0 if status == 'CLOSED' else 1
+                has_setup = 0 if str((cand or {}).get('setup_id') or '').strip() else 1
+                used_penalty = 1 if (tid and tid in used_trade_ids) else 0
+                scored.append(((used_penalty, has_setup, closed_hint, close_delta, status_pref, opened_gap, -opened), dict(cand)))
+            except Exception:
+                continue
+        return dict(sorted(scored, key=lambda x: x[0])[0][1]) if scored else {}
+    def _match_setup_candidate(base_row: dict) -> dict:
+        sym = str(_bybit_linear_symbol((base_row or {}).get('symbol') or '')).upper()
+        if not sym:
+            return {}
+        cts = float((base_row or {}).get('closed_ts') or 0.0)
+        side_candidates = set(_base_side_candidates(base_row))
+        scored = []
+        for cand in (setup_by_symbol.get(sym) or []):
+            try:
+                sid = str((cand or {}).get('setup_id') or '').strip()
+                side = str((cand or {}).get('side') or '').upper().strip()
+                if side_candidates and side and side not in side_candidates:
+                    continue
+                evt = float((cand or {}).get('_event_ts') or 0.0)
+                if evt > 0 and cts > 0 and evt > cts + 1800.0:
+                    continue
+                close_delta = abs(float((cand or {}).get('closed_ts') or 0.0) - cts) if float((cand or {}).get('closed_ts') or 0.0) > 0 and cts > 0 else 10**12
+                event_gap = (cts - evt) if evt > 0 and cts > 0 and evt <= cts + 1800.0 else 10**12
+                used_penalty = 1 if (sid and sid in used_setup_ids) else 0
+                state = str((cand or {}).get('state') or '').lower().strip()
+                state_pref = 0 if state in {'closed', 'executed_open', 'executed', 'attempted'} else 1
+                scored.append(((used_penalty, close_delta, state_pref, event_gap, -evt), dict(cand)))
+            except Exception:
+                continue
+        return dict(sorted(scored, key=lambda x: x[0])[0][1]) if scored else {}
     for base in (base_rows or []):
         try:
             b = dict(base or {})
@@ -23117,10 +23226,11 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
             cts = float(b.get('closed_ts') or 0.0)
             pnl = float(b.get('pnl_usdt') or 0.0) if b.get('pnl_usdt') is not None else float(b.get('pnl') or 0.0)
             event_keys = _candidate_event_keys(b)
-            primary_event_key = event_keys[0] if event_keys else (sym, side, int(cts // 60), round(float(pnl or 0.0), 8))
             detail = {}
             tid = str(b.get('trade_id') or '').strip()
             sid = str(b.get('setup_id') or '').strip()
+            matched_trade = {}
+            matched_setup = {}
             if tid:
                 detail = dict(life_by_ident.get(('trade', tid)) or {})
             if (not detail) and sid:
@@ -23142,7 +23252,6 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                     out.append(detail)
                     seen_out.add(ok)
                 continue
-            prov = {}
             if not sid:
                 prov_candidates = []
                 for ek in event_keys:
@@ -23152,7 +23261,7 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                         prov_candidates,
                         key=lambda x: (
                             abs(float((x or {}).get('closed_ts') or 0.0) - cts),
-                            0 if str((x or {}).get('side') or '').upper().strip() == str((x or {}).get('side') or '').upper().strip() else 1,
+                            0 if str((x or {}).get('side') or '').upper().strip() in set(_base_side_candidates(b)) else 1,
                         ),
                     )[0]
                     sid = str(prov.get('setup_id') or '').strip()
@@ -23164,6 +23273,52 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                         side = prov_side
                     if float(b.get('opened_ts') or 0.0) <= 0 and float(prov.get('opened_ts') or 0.0) > 0:
                         b['opened_ts'] = float(prov.get('opened_ts') or 0.0)
+            matched_trade = _match_journal_trade(b) if not sid or float(b.get('entry') or 0.0) <= 0 or float(b.get('sl') or 0.0) <= 0 else {}
+            if matched_trade:
+                mtid = str(matched_trade.get('trade_id') or '').strip()
+                msid = str(matched_trade.get('setup_id') or '').strip()
+                if mtid:
+                    b['trade_id'] = mtid
+                if msid and not sid:
+                    sid = msid
+                    b['setup_id'] = sid
+                mside = str(matched_trade.get('side') or '').upper().strip()
+                if mside:
+                    b['side'] = mside
+                    side = mside
+                for fld in ('entry', 'sl', 'tp1', 'tp2', 'tp3', 'qty', 'opened_ts', 'closed_ts'):
+                    try:
+                        cand_val = float(matched_trade.get(fld) or 0.0)
+                    except Exception:
+                        cand_val = 0.0
+                    try:
+                        cur_val = float(b.get(fld) or 0.0)
+                    except Exception:
+                        cur_val = 0.0
+                    if fld == 'closed_ts':
+                        continue
+                    if cur_val <= 0 and cand_val > 0:
+                        b[fld] = cand_val
+                if mtid:
+                    used_trade_ids.add(mtid)
+            if not sid:
+                matched_setup = _match_setup_candidate(b)
+                if matched_setup:
+                    msid = str(matched_setup.get('setup_id') or '').strip()
+                    mtid = str(matched_setup.get('trade_id') or '').strip()
+                    if msid:
+                        sid = msid
+                        b['setup_id'] = sid
+                        used_setup_ids.add(msid)
+                    if mtid and not str(b.get('trade_id') or '').strip():
+                        b['trade_id'] = mtid
+                    mside = str(matched_setup.get('side') or '').upper().strip()
+                    if mside:
+                        b['side'] = mside
+                        side = mside
+                    evt_open = float(matched_setup.get('executed_ts') or matched_setup.get('attempted_ts') or matched_setup.get('executable_ts') or matched_setup.get('emailed_ts') or matched_setup.get('screened_ts') or 0.0)
+                    if float(b.get('opened_ts') or 0.0) <= 0 and evt_open > 0:
+                        b['opened_ts'] = evt_open
             payload = _signal_setup_eval_payload(sid) if sid else {}
             if payload:
                 for fld in ('symbol', 'side', 'entry', 'sl', 'tp1', 'tp2', 'tp3'):
@@ -23176,7 +23331,7 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                         if cur_num <= 0 and float(payload.get(fld) or 0.0) > 0:
                             b[fld] = float(payload.get(fld) or 0.0)
                     else:
-                        if not str(cur or '').strip() and str(payload.get(fld) or '').strip():
+                        if (not str(cur or '').strip()) and str(payload.get(fld) or '').strip():
                             b[fld] = payload.get(fld)
                 if float(b.get('opened_ts') or 0.0) <= 0 and float(payload.get('created_ts') or 0.0) > 0:
                     b['opened_ts'] = float(payload.get('created_ts') or 0.0)
@@ -23213,7 +23368,18 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                         signal_outcome = _signal_outcome_sync_for_setup(owner_uid, sid_for_fallback, force=False) or {}
                     except Exception:
                         signal_outcome = {}
+                if not signal_outcome and payload:
+                    try:
+                        signal_outcome = _signal_outcome_sync_for_setup(owner_uid, sid_for_fallback, force=True) or {}
+                    except Exception:
+                        signal_outcome = {}
                 signal_canon = _canon_signal_outcome_label((signal_outcome or {}).get('outcome'))
+            journal_canon = ''
+            if matched_trade:
+                try:
+                    journal_canon = _canon_signal_outcome_label(_canon_outcome_from_autotrade_trade(matched_trade), float(matched_trade.get('pnl_usdt') if matched_trade.get('pnl_usdt') is not None else matched_trade.get('pnl') or 0.0))
+                except Exception:
+                    journal_canon = _canon_signal_outcome_label(str((matched_trade or {}).get('outcome') or ''), float((matched_trade or {}).get('pnl_usdt') if (matched_trade or {}).get('pnl_usdt') is not None else (matched_trade or {}).get('pnl') or 0.0))
             if str(row.get('result_path') or '').upper().strip() == 'OPEN':
                 row['status'] = 'CLOSED'
                 row['closed_ts'] = float(cts or 0.0)
@@ -23232,19 +23398,31 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                     row['side'] = str(payload.get('side') or '').upper().strip()
                 if float(row.get('opened_ts') or 0.0) <= 0 and float(payload.get('created_ts') or 0.0) > 0:
                     row['opened_ts'] = float(payload.get('created_ts') or 0.0)
-            if signal_canon in {'TP1', 'TP2', 'SL'}:
+            if matched_trade:
+                for fld in ('entry', 'sl', 'tp1', 'tp2', 'tp3', 'opened_ts'):
+                    try:
+                        if float(row.get(fld) or 0.0) <= 0 and float(matched_trade.get(fld) or 0.0) > 0:
+                            row[fld] = float(matched_trade.get(fld) or 0.0)
+                    except Exception:
+                        pass
+                if str(matched_trade.get('side') or '').strip():
+                    row['side'] = str(matched_trade.get('side') or '').upper().strip()
+                if not str(row.get('setup_id') or '').strip() and str(matched_trade.get('setup_id') or '').strip():
+                    row['setup_id'] = str(matched_trade.get('setup_id') or '').strip()
+            effective_canon = signal_canon or journal_canon
+            if effective_canon in {'TP1', 'TP2', 'SL'}:
                 hit_ts = float((signal_outcome or {}).get('best_ts') or (signal_outcome or {}).get('hit_ts') or row.get('closed_ts') or cts or 0.0)
-                if signal_canon == 'SL':
+                if effective_canon == 'SL':
                     row['sl_hit_ts'] = float(row.get('sl_hit_ts') or 0.0) or hit_ts
-                elif signal_canon == 'TP1':
+                elif effective_canon == 'TP1':
                     row['tp1_hit_ts'] = float(row.get('tp1_hit_ts') or 0.0) or hit_ts
-                elif signal_canon == 'TP2':
+                elif effective_canon == 'TP2':
                     row['tp1_hit_ts'] = float(row.get('tp1_hit_ts') or 0.0) or hit_ts
                     row['tp2_hit_ts'] = float(row.get('tp2_hit_ts') or 0.0) or hit_ts
                 if str(row.get('result_path') or '').upper().strip() in {'OPEN', 'MANUAL_OR_UNKNOWN_CLOSE', ''}:
-                    row['result_path'] = signal_canon
-                    row['result_label'] = signal_canon
-                    row['close_reason'] = str(row.get('close_reason') or 'signal_outcome_sync')
+                    row['result_path'] = effective_canon
+                    row['result_label'] = effective_canon
+                    row['close_reason'] = str(row.get('close_reason') or ('signal_outcome_sync' if signal_canon else 'autotrade_journal_match'))
             ok = _out_key(row)
             if ok not in seen_out:
                 out.append(row)
@@ -23253,6 +23431,7 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
             continue
     out.sort(key=lambda r: float((r or {}).get('closed_ts') or 0.0), reverse=True)
     return out[:limit]
+
 async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/autotrade_report [hours] — live journal with explicit SL / TP1 / TP2 hit state."""
     _autotrade_migrate_tables()
