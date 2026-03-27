@@ -4676,7 +4676,8 @@ def _autotrade_symbol_lock_key(uid: int, symbol: str) -> str:
     return f"{int(uid)}:{_bybit_linear_symbol(symbol)}"
 
 def _autotrade_runtime_symbol_lock_acquire(uid: int, symbol: str, ttl_sec: int | None = None) -> bool:
-    ttl = int(ttl_sec or AUTOTRADE_SYMBOL_GUARD_TTL_SEC)
+    ttl_default = int(globals().get("AUTOTRADE_SYMBOL_GUARD_TTL_SEC", os.environ.get("AUTOTRADE_SYMBOL_GUARD_TTL_SEC", "1800")) or 1800)
+    ttl = int(ttl_sec or ttl_default)
     key = _autotrade_symbol_lock_key(uid, symbol)
     now = float(time.time())
     with _AUTOTRADE_RUNTIME_SYMBOL_LOCKS_GUARD:
@@ -4699,7 +4700,8 @@ def _autotrade_runtime_symbol_lock_release(uid: int, symbol: str) -> None:
         _AUTOTRADE_RUNTIME_SYMBOL_LOCKS.pop(key, None)
 
 def _autotrade_runtime_symbol_lock_active(uid: int, symbol: str, ttl_sec: int | None = None) -> bool:
-    ttl = int(ttl_sec or AUTOTRADE_SYMBOL_GUARD_TTL_SEC)
+    ttl_default = int(globals().get("AUTOTRADE_SYMBOL_GUARD_TTL_SEC", os.environ.get("AUTOTRADE_SYMBOL_GUARD_TTL_SEC", "1800")) or 1800)
+    ttl = int(ttl_sec or ttl_default)
     key = _autotrade_symbol_lock_key(uid, symbol)
     now = float(time.time())
     with _AUTOTRADE_RUNTIME_SYMBOL_LOCKS_GUARD:
@@ -4711,8 +4713,10 @@ def _autotrade_runtime_symbol_lock_active(uid: int, symbol: str, ttl_sec: int | 
             return False
         return True
 
-def _autotrade_exec_cleanup(stale_pending_sec: int = 1800, stale_failed_sec: int = 86400, stale_placed_sec: int = AUTOTRADE_PLACED_GUARD_CLEANUP_SEC) -> None:
+def _autotrade_exec_cleanup(stale_pending_sec: int = 1800, stale_failed_sec: int = 86400, stale_placed_sec: int | None = None) -> None:
     try:
+        stale_placed_default = int(globals().get("AUTOTRADE_PLACED_GUARD_CLEANUP_SEC", os.environ.get("AUTOTRADE_PLACED_GUARD_CLEANUP_SEC", "172800")) or 172800)
+        stale_placed_sec = int(stale_placed_sec or stale_placed_default)
         now = float(time.time())
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
@@ -4724,7 +4728,7 @@ def _autotrade_exec_cleanup(stale_pending_sec: int = 1800, stale_failed_sec: int
         pass
 
 
-def _autotrade_exec_reserve(uid: int, setup_id: str, symbol: str, side: str, setup_ttl_sec: int = 86400, symbol_ttl_sec: int = AUTOTRADE_SYMBOL_GUARD_TTL_SEC, symdir_ttl_sec: int = AUTOTRADE_SYMBOL_GUARD_TTL_SEC) -> tuple[bool, list[str], str]:
+def _autotrade_exec_reserve(uid: int, setup_id: str, symbol: str, side: str, setup_ttl_sec: int = 86400, symbol_ttl_sec: int | None = None, symdir_ttl_sec: int | None = None) -> tuple[bool, list[str], str]:
     """Atomically reserve execution keys to prevent duplicate orders."""
     now = float(time.time())
     sid = str(setup_id or '').strip()
