@@ -18319,6 +18319,8 @@ async def scan_intelligence_job(context: ContextTypes.DEFAULT_TYPE):
         best_fut = await to_thread_heavy(fetch_futures_tickers)
         if not best_fut:
             return
+        if _job_budget_exhausted():
+            return
         session = scan_session_name_utc(datetime.now(timezone.utc))
         pool = await build_priority_pool(best_fut, session, mode="screen", scan_profile=DEFAULT_SCAN_PROFILE, uid=None)
         try:
@@ -26201,32 +26203,31 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
     return out[:limit]
 
 
-async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/autotrade_report [hours] — live journal with explicit SL / TP1 / TP2 hit state."""
-    _autotrade_migrate_tables()
-    uid = update.effective_user.id
-    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
-        await update.message.reply_text("⛔️ Owner/admin only.")
-        return
-
-    lookback_h = 24
+def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
+    owner_uid = int(owner_uid)
+    lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
+    cache_key = f"autotrade_report_text:{owner_uid}:{lookback_h}"
     try:
-        if context.args and str(context.args[0]).strip():
-            lookback_h = int(float(context.args[0]))
+        if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
+            cached = cache_get(cache_key)
+            if isinstance(cached, str) and cached.strip():
+                return cached
     except Exception:
-        lookback_h = 24
-    lookback_h = int(clamp(lookback_h, 1, 168))
-    owner_uid = int(AUTOTRADE_OWNER_UID or uid)
+        pass
 
+    _autotrade_migrate_tables()
     try:
         if str(AUTOTRADE_MODE).lower() == 'live':
-            _autotrade_monitor_live_exit_protection(owner_uid)
+            guardian_key = f"autotrade_report_guardian:{owner_uid}"
+            if not cache_valid(guardian_key, 90):
+                _autotrade_monitor_live_exit_protection(owner_uid)
+                cache_set(guardian_key, {'ts': time.time()})
     except Exception:
         pass
 
     sync_days = max(7, int(math.ceil(float(lookback_h) / 24.0)) + 3)
     try:
-        _trade_lifecycle_sync(owner_uid, days=sync_days, force=True)
+        _trade_lifecycle_sync(owner_uid, days=sync_days, force=False)
     except Exception:
         pass
 
@@ -26256,10 +26257,11 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lines.append(f"Total open PnL: {total_u:+.2f} USDT | Total risk est: {total_risk:.2f} USDT")
 
     lines.extend([SEP, 'Closed positions'])
-    start_ts = float(time.time()) - float(lookback_h) * 3600.0
+    now_ts = float(time.time())
+    start_ts = now_ts - float(lookback_h) * 3600.0
     closed_rows = []
     try:
-        closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(time.time()), lookback_h=lookback_h, limit=80) or []
+        closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=80) or []
     except Exception:
         closed_rows = []
 
@@ -26280,7 +26282,177 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         if len(closed_rows) > 20:
             lines.append(f"Showing first 20 of {len(closed_rows)} closed trades in this window.")
 
-    await send_long_message(update, "\n".join(lines), parse_mode=None)
+    out = "\n".join(lines)
+    try:
+        cache_set(cache_key, out)
+    except Exception:
+        pass
+    return out
+
+
+def _autotrade_report_overall_text_cached(owner: int) -> str:
+    owner = int(owner)
+    cache_key = f"autotrade_report_overall_text:{owner}"
+    try:
+        if cache_valid(cache_key, int(PERFORMANCE_REPORT_CACHE_TTL_SEC or 30)):
+            cached = cache_get(cache_key)
+            if isinstance(cached, str) and cached.strip():
+                return cached
+    except Exception:
+        pass
+
+    _autotrade_migrate_tables()
+    days = _autotrade_history_days_available(owner)
+    weighted = _autotrade_weighted_outcome_summary(owner, days=days)
+    perf_rows = _autotrade_performance_rows(owner, days=days)
+    perf = _autotrade_performance_summary(perf_rows)
+    live_open_positions = _bybit_get_open_positions_linear() if str(AUTOTRADE_MODE).lower() == 'live' else []
+    live_open_count = len(live_open_positions or [])
+    weighted_total = int(weighted.get('total') or 0)
+    closed_total = int(perf.get('closed') or 0)
+    total_visible = max(weighted_total, closed_total) + int(live_open_count if weighted_total <= 0 else 0)
+    if total_visible <= 0 and weighted_total <= 0 and closed_total <= 0:
+        return ""
+
+    by_session = weighted.get('by_session') or {}
+    lines = [
+        "📈 AutoTrade Report (overall)",
+        HDR,
+        f"Tracked autotrade rows: {max(weighted_total, closed_total)}",
+        f"Closed autotrades: {closed_total} | Current live open positions: {live_open_count}",
+    ]
+
+    if weighted_total > 0:
+        lines.extend([
+            f"Decided: {int(weighted.get('decided') or 0)} | Weighted WR: {float(weighted.get('weighted_win_rate') or 0.0):.1f}% | Binary WR: {float(weighted.get('binary_win_rate') or 0.0):.1f}%",
+            f"TP1: {int(weighted.get('tp1_only') or 0)} | TP2: {int(weighted.get('tp2_plus') or 0)} | SL: {int(weighted.get('losses') or 0)} | Open: {int(weighted.get('open') or 0)}",
+            f"Avg staged credit/trade: {float(weighted.get('avg_weighted_credit') or 0.0):.2f}",
+        ])
+    else:
+        lines.extend([
+            "Weighted lifecycle WR: pending journal/outcome data",
+            f"Closed autotrade PnL summary: {int(perf.get('wins') or 0)}W / {int(perf.get('losses') or 0)}L | {float(perf.get('win_rate') or 0.0):.1f}% | Net {float(perf.get('net') or 0.0):+.2f} USDT",
+        ])
+
+    if by_session:
+        lines.extend(["", "Session breakdown:"])
+        for sess, item in sorted(by_session.items()):
+            lines.append(
+                f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP1 {int(item.get('tp1_only') or 0)} TP2 {int(item.get('tp2_plus') or 0)} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
+            )
+
+    out = "\n".join(lines)
+    try:
+        cache_set(cache_key, out)
+    except Exception:
+        pass
+    return out
+
+
+def _performance_report_payload_cached(owner: int, days: int) -> dict:
+    owner = int(owner)
+    days = int(clamp(int(days or 7), 3, 30))
+    cache_key = f"performance_report_payload:{owner}:{days}"
+    try:
+        if cache_valid(cache_key, int(PERFORMANCE_REPORT_CACHE_TTL_SEC or 30)):
+            cached = cache_get(cache_key)
+            if isinstance(cached, dict) and cached.get('text'):
+                return cached
+    except Exception:
+        pass
+
+    recent_rows = _autotrade_performance_rows(owner, days=days)
+    recent_summary = _autotrade_performance_summary(recent_rows)
+    overall_days = _autotrade_history_days_available(owner)
+    overall_rows = _autotrade_performance_rows(owner, days=overall_days)
+    overall_summary = _autotrade_performance_summary(overall_rows)
+    owner_user = _autotrade_user_settings(owner)
+    equity_now = _effective_equity_for_risk(owner_user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
+    weighted_recent = _autotrade_weighted_outcome_summary(owner, days=days)
+    weighted_overall = _autotrade_weighted_outcome_summary(owner, days=overall_days)
+    try:
+        lifecycle_recent = _trade_lifecycle_analytics(owner, days=max(3, int(days)), session='ALL', sync=True, force=False)
+    except Exception:
+        lifecycle_recent = {}
+    try:
+        lifecycle_overall_days = max(7, min(90, int(overall_days or 30)))
+        lifecycle_overall = _trade_lifecycle_analytics(owner, days=lifecycle_overall_days, session='ALL', sync=True, force=False)
+    except Exception:
+        lifecycle_overall_days = max(7, min(90, int(overall_days or 30)))
+        lifecycle_overall = {}
+
+    def _pf_txt(v):
+        return 'INF' if v == float('inf') else f"{float(v or 0.0):.2f}"
+
+    lines = [
+        '📈 Performance Report',
+        HDR,
+        f'Recent window: last {days} anchored trading day(s)',
+        f'Overall history: {int(overall_days)} anchored trading day(s)',
+        SEP,
+        'OVERALL',
+        f"Closed trades: {int(overall_summary.get('closed') or 0)} | Wins: {int(overall_summary.get('wins') or 0)} | Losses: {int(overall_summary.get('losses') or 0)}",
+        f"Net PnL: ${float(overall_summary.get('net') or 0.0):+.2f} | Profit factor: {_pf_txt(overall_summary.get('profit_factor'))} | Expectancy: ${float(overall_summary.get('expectancy') or 0.0):+.2f}",
+        f"Realized WR: {float(overall_summary.get('win_rate') or 0.0):.1f}% | Weighted TP WR: {float(weighted_overall.get('weighted_win_rate') or 0.0):.1f}%",
+        f"TP mix: TP1 {int(weighted_overall.get('tp1_only') or 0)} | TP2 {int(weighted_overall.get('tp2_plus') or 0)} | SL {int(weighted_overall.get('losses') or 0)} | OPEN {int(weighted_overall.get('open') or 0)}",
+    ]
+    bd = overall_summary.get('best_day') or {}
+    wd = overall_summary.get('worst_day') or {}
+    if bd:
+        lines.append(f"Best day: {bd.get('day')} | ${float(bd.get('net_pnl') or 0.0):+.2f}")
+    if wd:
+        lines.append(f"Worst day: {wd.get('day')} | ${float(wd.get('net_pnl') or 0.0):+.2f}")
+
+    lines.extend([SEP, *_trade_lifecycle_analytics_lines(lifecycle_overall, heading=f'Lifecycle feed (overall, {int(lifecycle_overall_days)}d cap)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2)])
+
+    lines.extend([
+        SEP,
+        f'RECENT ({days} day window)',
+        f"Closed: {int(recent_summary.get('closed') or 0)} | Net PnL: ${float(recent_summary.get('net') or 0.0):+.2f} | Realized WR: {float(recent_summary.get('win_rate') or 0.0):.1f}%",
+        f"Weighted TP WR: {float(weighted_recent.get('weighted_win_rate') or 0.0):.1f}% | TP1 {int(weighted_recent.get('tp1_only') or 0)} | TP2 {int(weighted_recent.get('tp2_plus') or 0)} | SL {int(weighted_recent.get('losses') or 0)} | OPEN {int(weighted_recent.get('open') or 0)}",
+    ])
+    lines.extend([SEP, *_trade_lifecycle_analytics_lines(lifecycle_recent, heading=f'Lifecycle feed ({days}d)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2), SEP, 'Daily trend'])
+    for r in recent_rows:
+        wl_total = int(r.get('wins') or 0) + int(r.get('losses') or 0)
+        wr = (float(r.get('wins') or 0) / wl_total * 100.0) if wl_total > 0 else 0.0
+        lines.append(f"• {r.get('day')} | PnL ${float(r.get('net_pnl') or 0.0):+.2f} | Realized WR {wr:.1f}%")
+
+    chart_path = _build_performance_chart_png(overall_rows or recent_rows, equity=float(equity_now or 0.0))
+    payload = {'text': "\n".join(lines), 'chart_path': chart_path}
+    try:
+        cache_set(cache_key, payload)
+    except Exception:
+        pass
+    return payload
+
+
+
+async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/autotrade_report [hours] — live journal with explicit SL / TP1 / TP2 hit state."""
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
+        await update.message.reply_text("⛔️ Owner/admin only.")
+        return
+
+    lookback_h = 24
+    try:
+        if context.args and str(context.args[0]).strip():
+            lookback_h = int(float(context.args[0]))
+    except Exception:
+        lookback_h = 24
+    lookback_h = int(clamp(lookback_h, 1, 168))
+    owner_uid = int(AUTOTRADE_OWNER_UID or uid)
+
+    try:
+        text_out = await to_thread_heavy(_autotrade_report_text_cached, owner_uid, lookback_h, timeout=AUTOTRADE_REPORT_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        await update.message.reply_text(f"⚠️ /autotrade_report timed out after {int(AUTOTRADE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
+        return
+    except Exception as e:
+        await update.message.reply_text(f"❌ /autotrade_report failed: {type(e).__name__}: {e}")
+        return
+
+    await send_long_message(update, text_out, parse_mode=None)
 
 def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
     """Journal-first reconciliation stats for performance reporting."""
@@ -26371,64 +26543,17 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
     days = int(clamp(days, 3, 30))
 
     owner = int(AUTOTRADE_OWNER_UID or uid)
-    recent_rows = _autotrade_performance_rows(owner, days=days)
-    recent_summary = _autotrade_performance_summary(recent_rows)
-    overall_days = _autotrade_history_days_available(owner)
-    overall_rows = _autotrade_performance_rows(owner, days=overall_days)
-    overall_summary = _autotrade_performance_summary(overall_rows)
-    owner_user = _autotrade_user_settings(owner)
-    equity_now = _effective_equity_for_risk(owner_user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
-    weighted_recent = _autotrade_weighted_outcome_summary(owner, days=days)
-    weighted_overall = _autotrade_weighted_outcome_summary(owner, days=overall_days)
     try:
-        lifecycle_recent = _trade_lifecycle_analytics(owner, days=max(3, int(days)), session='ALL', sync=True, force=False)
-    except Exception:
-        lifecycle_recent = {}
-    try:
-        lifecycle_overall_days = max(7, min(90, int(overall_days or 30)))
-        lifecycle_overall = _trade_lifecycle_analytics(owner, days=lifecycle_overall_days, session='ALL', sync=True, force=False)
-    except Exception:
-        lifecycle_overall_days = max(7, min(90, int(overall_days or 30)))
-        lifecycle_overall = {}
+        payload = await to_thread_heavy(_performance_report_payload_cached, owner, days, timeout=PERFORMANCE_REPORT_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        await update.message.reply_text(f"⚠️ /performance_report timed out after {int(PERFORMANCE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
+        return
+    except Exception as e:
+        await update.message.reply_text(f"❌ /performance_report failed: {type(e).__name__}: {e}")
+        return
 
-    def _pf_txt(v):
-        return 'INF' if v == float('inf') else f"{float(v or 0.0):.2f}"
-
-    lines = [
-        '📈 Performance Report',
-        HDR,
-        f'Recent window: last {days} anchored trading day(s)',
-        f'Overall history: {int(overall_days)} anchored trading day(s)',
-        SEP,
-        'OVERALL',
-        f"Closed trades: {int(overall_summary.get('closed') or 0)} | Wins: {int(overall_summary.get('wins') or 0)} | Losses: {int(overall_summary.get('losses') or 0)}",
-        f"Net PnL: ${float(overall_summary.get('net') or 0.0):+.2f} | Profit factor: {_pf_txt(overall_summary.get('profit_factor'))} | Expectancy: ${float(overall_summary.get('expectancy') or 0.0):+.2f}",
-        f"Realized WR: {float(overall_summary.get('win_rate') or 0.0):.1f}% | Weighted TP WR: {float(weighted_overall.get('weighted_win_rate') or 0.0):.1f}%",
-        f"TP mix: TP1 {int(weighted_overall.get('tp1_only') or 0)} | TP2 {int(weighted_overall.get('tp2_plus') or 0)} | SL {int(weighted_overall.get('losses') or 0)} | OPEN {int(weighted_overall.get('open') or 0)}",
-    ]
-    bd = overall_summary.get('best_day') or {}
-    wd = overall_summary.get('worst_day') or {}
-    if bd:
-        lines.append(f"Best day: {bd.get('day')} | ${float(bd.get('net_pnl') or 0.0):+.2f}")
-    if wd:
-        lines.append(f"Worst day: {wd.get('day')} | ${float(wd.get('net_pnl') or 0.0):+.2f}")
-
-    lines.extend([SEP, *_trade_lifecycle_analytics_lines(lifecycle_overall, heading=f'Lifecycle feed (overall, {int(lifecycle_overall_days)}d cap)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2)])
-
-    lines.extend([
-        SEP,
-        f'RECENT ({days} day window)',
-        f"Closed: {int(recent_summary.get('closed') or 0)} | Net PnL: ${float(recent_summary.get('net') or 0.0):+.2f} | Realized WR: {float(recent_summary.get('win_rate') or 0.0):.1f}%",
-        f"Weighted TP WR: {float(weighted_recent.get('weighted_win_rate') or 0.0):.1f}% | TP1 {int(weighted_recent.get('tp1_only') or 0)} | TP2 {int(weighted_recent.get('tp2_plus') or 0)} | SL {int(weighted_recent.get('losses') or 0)} | OPEN {int(weighted_recent.get('open') or 0)}",
-    ])
-    lines.extend([SEP, *_trade_lifecycle_analytics_lines(lifecycle_recent, heading=f'Lifecycle feed ({days}d)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2), SEP, 'Daily trend'])
-    for r in recent_rows:
-        wl_total = int(r.get('wins') or 0) + int(r.get('losses') or 0)
-        wr = (float(r.get('wins') or 0) / wl_total * 100.0) if wl_total > 0 else 0.0
-        lines.append(f"• {r.get('day')} | PnL ${float(r.get('net_pnl') or 0.0):+.2f} | Realized WR {wr:.1f}%")
-
-    await send_long_message(update, "\n".join(lines), parse_mode=None)
-    chart_path = _build_performance_chart_png(overall_rows or recent_rows, equity=float(equity_now or 0.0))
+    await send_long_message(update, str(payload.get('text') or ''), parse_mode=None)
+    chart_path = str(payload.get('chart_path') or '')
     if chart_path:
         try:
             with open(chart_path, 'rb') as f:
@@ -26647,7 +26772,6 @@ async def autotrade_debug_reset_cmd(update: Update, context: ContextTypes.DEFAUL
 
 
 async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _autotrade_migrate_tables()
     """/autotrade_report_overall — Overall performance summary for bot-opened trades."""
     uid = update.effective_user.id
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
@@ -26655,47 +26779,20 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
         return
 
     owner = int(AUTOTRADE_OWNER_UID or uid)
-    days = _autotrade_history_days_available(owner)
-    weighted = _autotrade_weighted_outcome_summary(owner, days=days)
-    perf_rows = _autotrade_performance_rows(owner, days=days)
-    perf = _autotrade_performance_summary(perf_rows)
-    live_open_positions = _bybit_get_open_positions_linear() if str(AUTOTRADE_MODE).lower() == 'live' else []
-    live_open_count = len(live_open_positions or [])
-    weighted_total = int(weighted.get('total') or 0)
-    closed_total = int(perf.get('closed') or 0)
-    total_visible = max(weighted_total, closed_total) + int(live_open_count if weighted_total <= 0 else 0)
-    if total_visible <= 0 and weighted_total <= 0 and closed_total <= 0:
+    try:
+        text_out = await to_thread_heavy(_autotrade_report_overall_text_cached, owner, timeout=PERFORMANCE_REPORT_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        await update.message.reply_text(f"⚠️ /autotrade_report_overall timed out after {int(PERFORMANCE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
+        return
+    except Exception as e:
+        await update.message.reply_text(f"❌ /autotrade_report_overall failed: {type(e).__name__}: {e}")
+        return
+
+    if not str(text_out or '').strip():
         await update.message.reply_text("No autotrade lifecycle data found yet.")
         return
 
-    by_session = weighted.get('by_session') or {}
-    lines = [
-        "📈 AutoTrade Report (overall)",
-        HDR,
-        f"Tracked autotrade rows: {max(weighted_total, closed_total)}",
-        f"Closed autotrades: {closed_total} | Current live open positions: {live_open_count}",
-    ]
-
-    if weighted_total > 0:
-        lines.extend([
-            f"Decided: {int(weighted.get('decided') or 0)} | Weighted WR: {float(weighted.get('weighted_win_rate') or 0.0):.1f}% | Binary WR: {float(weighted.get('binary_win_rate') or 0.0):.1f}%",
-            f"TP1: {int(weighted.get('tp1_only') or 0)} | TP2: {int(weighted.get('tp2_plus') or 0)} | SL: {int(weighted.get('losses') or 0)} | Open: {int(weighted.get('open') or 0)}",
-            f"Avg staged credit/trade: {float(weighted.get('avg_weighted_credit') or 0.0):.2f}",
-        ])
-    else:
-        lines.extend([
-            "Weighted lifecycle WR: pending journal/outcome data",
-            f"Closed autotrade PnL summary: {int(perf.get('wins') or 0)}W / {int(perf.get('losses') or 0)}L | {float(perf.get('win_rate') or 0.0):.1f}% | Net {float(perf.get('net') or 0.0):+.2f} USDT",
-        ])
-
-    if by_session:
-        lines.extend(["", "Session breakdown:"])
-        for sess, item in sorted(by_session.items()):
-            lines.append(
-                f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP1 {int(item.get('tp1_only') or 0)} TP2 {int(item.get('tp2_plus') or 0)} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
-            )
-
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(str(text_out))
 
 def _leader_base_override_ok(side: str, ch24: float, ch4: float, ch15: float, fut_vol_usd: float, pullback_ready: bool, pb_dist_pct: float, session_name: str) -> bool:
     """Allow post-expansion continuation entries after a clean 15m base/reclaim.
@@ -28882,9 +28979,14 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # EMAIL JOB
 # =========================================================
 
-EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "60"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "60"))
-EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "60"))
+EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "18"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "25"))
+EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "45"))
+AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "20"))
+AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "45"))
+PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "30"))
+PERFORMANCE_REPORT_TIMEOUT_SEC = int(os.environ.get("PERFORMANCE_REPORT_TIMEOUT_SEC", "60"))
 
 # SMTP connection reuse (Render speed fix)
 SMTP_REUSE_TTL_SEC = int(os.environ.get("SMTP_REUSE_TTL_SEC", "240"))  # 4 minutes
@@ -28941,6 +29043,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with ALERT_LOCK:
+        job_started_ts = time.time()
+
+        def _job_budget_exhausted() -> bool:
+            try:
+                return (time.time() - job_started_ts) >= float(ALERT_JOB_MAX_RUNTIME_SEC or 45)
+            except Exception:
+                return False
+
         # Keep it quiet if email is off or not configured
         if not EMAIL_ENABLED:
             return
@@ -28963,6 +29073,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             users_bigmove = []
 
         if not users_notify and not users_bigmove:
+            return
+        if _job_budget_exhausted():
             return
 
         # TIMEOUT-PROTECTED fetch (prevents lock being held forever)
@@ -28994,6 +29106,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # Defaults: 1H=7.5%, 4H=15%
         # -----------------------------------------------------
         for u in (users_bigmove or []):
+            if _job_budget_exhausted():
+                logger.warning("alert_job bigmove loop budget exhausted after %.1fs", time.time() - job_started_ts)
+                return
             # Pro/trial-only email features
             try:
                 uid = int(u.get("user_id") or u.get("id") or 0)
@@ -29186,6 +29301,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # This is a major Render speed win versus rebuilding ASIA/LON/NY every minute
         # even when no user is currently inside those sessions.
         # -----------------------------------------------------
+        if _job_budget_exhausted():
+            logger.warning("alert_job runtime budget exhausted before session pools after %.1fs", time.time() - job_started_ts)
+            return
+
         notify_runtime = []
         required_pool_sessions = []
         for user in (users_notify or []):
@@ -29275,6 +29394,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # Per-user send / skip logic
         # -----------------------------------------------------
         for meta in (notify_runtime or []):
+            if _job_budget_exhausted():
+                logger.warning("alert_job notify loop budget exhausted after %.1fs", time.time() - job_started_ts)
+                return
             user = dict(meta.get("user") or {})
             uid = int(meta.get("uid") or 0)
             tz = meta.get("tz") or timezone.utc
