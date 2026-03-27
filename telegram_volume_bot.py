@@ -4665,6 +4665,13 @@ def _autotrade_closed_activity_rows_window(uid: int, start_ts: float, end_ts: fl
     out.sort(key=lambda r: float((r or {}).get('closed_ts') or 0.0), reverse=True)
     return out
 
+AUTOTRADE_SYMBOL_GUARD_TTL_SEC = int(os.environ.get("AUTOTRADE_SYMBOL_GUARD_TTL_SEC", "1800") or 1800)
+AUTOTRADE_RECENT_SYMBOL_SYNC_SEC = int(os.environ.get("AUTOTRADE_RECENT_SYMBOL_SYNC_SEC", "180") or 180)
+AUTOTRADE_PLACED_GUARD_CLEANUP_SEC = int(os.environ.get("AUTOTRADE_PLACED_GUARD_CLEANUP_SEC", "172800") or 172800)
+
+_AUTOTRADE_RUNTIME_SYMBOL_LOCKS: dict[str, float] = {}
+_AUTOTRADE_RUNTIME_SYMBOL_LOCKS_GUARD = threading.Lock()
+
 def _autotrade_symbol_lock_key(uid: int, symbol: str) -> str:
     return f"{int(uid)}:{_bybit_linear_symbol(symbol)}"
 
