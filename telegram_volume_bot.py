@@ -3046,23 +3046,26 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         if not pos:
             return result
         result['checked'] = True
+
         plan = _autotrade_live_exit_plan_for_trade(trade_row)
         partial_tp = float(plan.get('partial_tp') or 0.0)
-        final_tp = float(plan.get('final_tp') or 0.0)
         entry = float(_pos_entry(pos) or trade_row.get('entry') or 0.0)
         current_sl = float(_pos_stop(pos) or 0.0)
         target_sl = float(trade_row.get('sl') or 0.0)
         initial_qty = abs(float(trade_row.get('qty') or 0.0))
         live_qty = abs(float(_pos_size(pos) or 0.0))
-        conf = int(float(trade_row.get('conf') or 0) or 0)
-        quality_score = float(trade_row.get('quality_score') or 0.0)
-        atr_pct = float(trade_row.get('atr_pct') or 0.0)
-        engine = str(trade_row.get('engine') or '').upper().strip()
-        sess = str(trade_row.get('session') or '').upper().strip()
 
-        tp1_hit = False
-        be_allowed = False
-        if entry > 0 and final_tp > 0 and initial_qty > 0 and live_qty > 0:
+        lifecycle_row = {}
+        try:
+            ident = str(trade_row.get('trade_id') or trade_row.get('setup_id') or '').strip()
+            if ident:
+                lifecycle_row = _trade_lifecycle_detail_row(int(uid), ident, sync=False) or {}
+        except Exception:
+            lifecycle_row = {}
+
+        tp1_hit = bool(float((lifecycle_row or {}).get('tp1_hit_ts') or 0.0) > 0)
+        be_allowed = bool(tp1_hit)
+        if entry > 0 and initial_qty > 0 and live_qty > 0 and not tp1_hit:
             partial_fraction = float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION)
             qty_drop_threshold = max(initial_qty * 0.45, initial_qty * (1.0 - partial_fraction + 0.08))
             qty_reduced = live_qty < max(initial_qty * 0.98, initial_qty - max(1e-9, initial_qty * 0.02))
@@ -3071,9 +3074,8 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
                 tp1_order_still_open = _bybit_has_open_tp_order_at(sym, partial_tp, side=side) if partial_tp > 0 else False
             except Exception:
                 tp1_order_still_open = False
-            tp1_hit = bool((live_qty <= qty_drop_threshold) or (qty_reduced and not tp1_order_still_open))
-            # User hard rule: after TP1 is achieved, the remaining live position must become
-            # risk-free by moving the stop-loss to the entry price for every trade.
+            current_sl_is_be = bool(entry > 0 and current_sl > 0 and _trade_lifecycle_is_be_or_better(side, current_sl, entry))
+            tp1_hit = bool((live_qty <= qty_drop_threshold) or (qty_reduced and not tp1_order_still_open) or current_sl_is_be)
             be_allowed = bool(tp1_hit)
 
         desired_sl = float(entry) if (tp1_hit and be_allowed and entry > 0) else float(target_sl)
@@ -3087,8 +3089,17 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
             has_partial_sl = _bybit_has_open_sl_order_at(sym, desired_sl, side=side) if desired_sl > 0 else False
         except Exception:
             has_partial_sl = False
+        current_or_detected_sl = float(current_sl or effective_sl or 0.0)
+        current_sl_is_be = bool(entry > 0 and current_or_detected_sl > 0 and _trade_lifecycle_is_be_or_better(side, current_or_detected_sl, entry))
         has_any_real_sl = bool((current_sl > 0) or (effective_sl > 0) or has_partial_sl)
-        sl_matches_target = bool(desired_sl > 0 and ((current_sl > 0 and _price_close_enough(current_sl, desired_sl)) or (effective_sl > 0 and _price_close_enough(effective_sl, desired_sl)) or has_partial_sl))
+        sl_matches_target = bool(
+            desired_sl > 0 and (
+                (current_sl > 0 and _price_close_enough(current_sl, desired_sl))
+                or (effective_sl > 0 and _price_close_enough(effective_sl, desired_sl))
+                or has_partial_sl
+                or (tp1_hit and current_sl_is_be and desired_sl == float(entry))
+            )
+        )
         if desired_sl > 0 and (not has_any_real_sl or not sl_matches_target):
             sl_apply = _autotrade_apply_position_tp_sl(sym, desired_sl, 0.0)
             time.sleep(0.20)
@@ -3099,12 +3110,14 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
                     refreshed_sl = float(_bybit_detect_open_sl_price(sym, side=side) or 0.0)
                 except Exception:
                     refreshed_sl = 0.0
-            if refreshed_sl > 0 and _price_close_enough(refreshed_sl, desired_sl):
+            if refreshed_sl > 0 and (_price_close_enough(refreshed_sl, desired_sl) or (tp1_hit and desired_sl == float(entry) and _trade_lifecycle_is_be_or_better(side, refreshed_sl, entry))):
                 result['sl_fixed'] = True
                 if tp1_hit and be_allowed and desired_sl == float(entry):
                     result['be_applied'] = True
             else:
                 result['sl_apply_res'] = sl_apply
+        elif tp1_hit and be_allowed and desired_sl == float(entry) and current_sl_is_be:
+            result['be_applied'] = True
 
         if tp1_hit:
             desired_targets = _dedupe_price_targets([
@@ -25673,8 +25686,220 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         lines.extend([SEP, f'Hidden untracked rows: {hidden_untracked_open} (no current live Bybit/autotrade match)'])
     await send_long_message(update, '\n'.join(lines), parse_mode=None)
 
+def _autotrade_checkbox(flag: bool) -> str:
+    return '✅' if bool(flag) else '☐'
+
+
+def _autotrade_sort_targets_for_side(side: str, prices: list[float]) -> list[float]:
+    vals = _dedupe_price_targets([float(x or 0.0) for x in (prices or []) if float(x or 0.0) > 0.0])
+    vals.sort(reverse=(str(side or '').upper().strip() == 'SELL'))
+    return vals
+
+
+def _autotrade_visible_tp_targets(symbol: str, side: str, open_orders: list[dict] | None = None) -> list[float]:
+    sym = _bybit_linear_symbol(symbol)
+    orders = open_orders if open_orders is not None else _bybit_get_open_orders_linear(sym)
+    close_side = _bybit_exit_close_side_for_position_side(side)
+    found = []
+    for o in (orders or []):
+        try:
+            if _bybit_linear_symbol(str((o or {}).get('symbol') or '')) != sym:
+                continue
+            if not _bybit_order_matches_close_side(o, close_side):
+                continue
+            if not _bybit_is_tp_exit_order(o):
+                continue
+            px = float(_bybit_order_working_price(o) or 0.0)
+            if px > 0:
+                found.append(px)
+        except Exception:
+            continue
+    return _autotrade_sort_targets_for_side(side, found)
+
+
+def _autotrade_find_open_trade_for_live_position(uid: int, live_pos: dict, journal_open: list[dict] | None = None) -> dict:
+    candidates = [dict(r) for r in (journal_open or _autotrade_db_open_trades(int(uid)) or [])]
+    sym = str(_pos_symbol(live_pos) or '').upper()
+    side = str(_pos_side_text(live_pos) or '').upper()
+    matches = [r for r in candidates if str(r.get('symbol') or '').upper() == sym and str(r.get('side') or '').upper() == side]
+    if not matches:
+        return {}
+    if len(matches) == 1:
+        return dict(matches[0])
+    try:
+        info = _autotrade_resolve_live_position_open_info(int(uid), live_pos, journal_open=matches)
+    except Exception:
+        info = {}
+    journal_tid = str(info.get('journal_trade_id') or '').strip()
+    if journal_tid:
+        for row in matches:
+            if str(row.get('trade_id') or '').strip() == journal_tid:
+                return dict(row)
+    target_opened = float(info.get('opened_ts') or 0.0)
+    live_entry = float(_pos_entry(live_pos) or 0.0)
+    def _score(row: dict):
+        opened = float(row.get('opened_ts') or 0.0)
+        entry = float(row.get('entry') or 0.0)
+        open_delta = abs(opened - target_opened) if target_opened > 0 and opened > 0 else 10**18
+        entry_delta = abs(entry - live_entry) if entry > 0 and live_entry > 0 else 10**18
+        return (open_delta, entry_delta, -opened)
+    return dict(sorted(matches, key=_score)[0])
+
+
+def _autotrade_live_position_status(uid: int, live_pos: dict, trade_row: dict | None = None, lifecycle_row: dict | None = None, open_orders: list[dict] | None = None) -> dict:
+    sym = _bybit_linear_symbol(_pos_symbol(live_pos))
+    side = str(_pos_side_text(live_pos) or '').upper().strip()
+    trade_row = dict(trade_row or {})
+    lifecycle_row = dict(lifecycle_row or {})
+    if (not lifecycle_row) and trade_row:
+        try:
+            ident = str(trade_row.get('trade_id') or trade_row.get('setup_id') or '').strip()
+            if ident:
+                lifecycle_row = _trade_lifecycle_detail_row(int(uid), ident, sync=False) or {}
+        except Exception:
+            lifecycle_row = {}
+
+    visible_tp_targets = _autotrade_visible_tp_targets(sym, side, open_orders=open_orders)
+    current_sl = float(_pos_stop(live_pos) or _bybit_detect_open_sl_price(sym, side=side) or 0.0)
+    current_qty = abs(float(_pos_size(live_pos) or 0.0))
+    entry_live = float(_pos_entry(live_pos) or trade_row.get('entry') or 0.0)
+    pnl = float(_pos_unreal_pnl(live_pos) or 0.0)
+    mark = float(_pos_mark(live_pos) or 0.0)
+    risk_est = float(_estimate_position_risk_usd(live_pos) or 0.0)
+
+    expected_sl = float(trade_row.get('sl') or current_sl or 0.0)
+    expected_tp1 = 0.0
+    expected_tp2 = 0.0
+    initial_qty = abs(float(trade_row.get('qty') or 0.0))
+    partial_fraction = float(AUTOTRADE_LIVE_TP1_FRACTION)
+    if trade_row:
+        try:
+            plan = _autotrade_live_exit_plan_for_trade(trade_row)
+            expected_tp1 = float(plan.get('effective_tp1') or 0.0)
+            expected_tp2 = float(plan.get('effective_tp2') or 0.0)
+            partial_fraction = float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION)
+        except Exception:
+            expected_tp1 = float(trade_row.get('tp1') or 0.0)
+            expected_tp2 = float(trade_row.get('tp2') or 0.0)
+    if expected_tp1 <= 0 and visible_tp_targets:
+        expected_tp1 = float(visible_tp_targets[0] or 0.0)
+    if expected_tp2 <= 0 and len(visible_tp_targets) >= 2:
+        expected_tp2 = float(visible_tp_targets[1] or 0.0)
+
+    tp1_hit = bool(float((lifecycle_row or {}).get('tp1_hit_ts') or 0.0) > 0.0)
+    tp2_hit = bool(float((lifecycle_row or {}).get('tp2_hit_ts') or 0.0) > 0.0)
+    sl_hit = bool(float((lifecycle_row or {}).get('sl_hit_ts') or 0.0) > 0.0)
+    if trade_row and initial_qty > 0 and current_qty > 0 and not tp1_hit:
+        qty_reduced = current_qty < max(initial_qty * 0.98, initial_qty - max(1e-9, initial_qty * 0.02))
+        qty_drop_threshold = max(initial_qty * 0.45, initial_qty * (1.0 - partial_fraction + 0.08))
+        tp1_hit = bool((current_qty <= qty_drop_threshold) or qty_reduced)
+    be_active = bool(tp1_hit and entry_live > 0 and current_sl > 0 and _trade_lifecycle_is_be_or_better(side, current_sl, entry_live))
+    risk_free = bool(be_active or str((lifecycle_row or {}).get('risk_free_flag') or '').upper().strip() == 'YES')
+
+    tp1_order_live = bool(expected_tp1 > 0 and _bybit_has_open_tp_order_at(sym, expected_tp1, side=side))
+    tp2_order_live = bool(expected_tp2 > 0 and _bybit_has_open_tp_order_at(sym, expected_tp2, side=side))
+    sl_order_live = bool(current_sl > 0 or (expected_sl > 0 and _bybit_has_open_sl_order_at(sym, expected_sl, side=side)))
+
+    missing_sl = bool(expected_sl > 0 and not sl_order_live and not sl_hit)
+    missing_tp1 = bool(expected_tp1 > 0 and not tp1_hit and not tp1_order_live)
+    missing_tp2 = bool(expected_tp2 > 0 and not tp2_hit and not tp2_order_live)
+
+    opened_ts = 0.0
+    open_source = ''
+    try:
+        info = _autotrade_resolve_live_position_open_info(int(uid), live_pos, journal_open=[trade_row] if trade_row else None)
+        opened_ts = float(info.get('opened_ts') or 0.0)
+        open_source = str(info.get('source') or '')
+    except Exception:
+        pass
+
+    return {
+        'symbol': sym,
+        'side': side,
+        'trade_id': str(trade_row.get('trade_id') or ''),
+        'setup_id': str(trade_row.get('setup_id') or ''),
+        'entry': float(entry_live or 0.0),
+        'mark': float(mark or 0.0),
+        'pnl': float(pnl or 0.0),
+        'qty': float(current_qty or 0.0),
+        'risk_est': float(risk_est or 0.0),
+        'expected_sl': float(expected_sl or 0.0),
+        'expected_tp1': float(expected_tp1 or 0.0),
+        'expected_tp2': float(expected_tp2 or 0.0),
+        'current_sl': float(current_sl or 0.0),
+        'visible_tp_targets': list(visible_tp_targets or []),
+        'sl_hit': bool(sl_hit),
+        'tp1_hit': bool(tp1_hit),
+        'tp2_hit': bool(tp2_hit),
+        'sl_order_live': bool(sl_order_live),
+        'tp1_order_live': bool(tp1_order_live),
+        'tp2_order_live': bool(tp2_order_live),
+        'missing_sl': bool(missing_sl),
+        'missing_tp1': bool(missing_tp1),
+        'missing_tp2': bool(missing_tp2),
+        'be_active': bool(be_active),
+        'risk_free': bool(risk_free),
+        'opened_ts': float(opened_ts or 0.0),
+        'open_source': open_source,
+        'lifecycle_row': dict(lifecycle_row or {}),
+    }
+
+
+def _autotrade_render_live_position_snapshot(snapshot: dict, index: int | None = None) -> list[str]:
+    label = f"{int(index)}) " if index is not None else "• "
+    header = f"{label}{snapshot.get('side')} {snapshot.get('symbol')}"
+    if snapshot.get('trade_id'):
+        header += f" | {snapshot.get('trade_id')}"
+    elif snapshot.get('setup_id'):
+        header += f" | {snapshot.get('setup_id')}"
+    lines = [header]
+    lines.append(
+        f"   • Qty: {float(snapshot.get('qty') or 0.0):g} | Entry: {fmt_price(float(snapshot.get('entry') or 0.0)) if float(snapshot.get('entry') or 0.0) > 0 else '—'} | Mark: {fmt_price(float(snapshot.get('mark') or 0.0)) if float(snapshot.get('mark') or 0.0) > 0 else '—'} | PnL: {float(snapshot.get('pnl') or 0.0):+.2f} USDT"
+    )
+    lines.append(
+        f"   • SL: {fmt_price(float(snapshot.get('expected_sl') or 0.0)) if float(snapshot.get('expected_sl') or 0.0) > 0 else '—'} | Hit {_autotrade_checkbox(snapshot.get('sl_hit'))} | Live order {_autotrade_checkbox(snapshot.get('sl_order_live'))}"
+    )
+    lines.append(
+        f"   • TP1: {fmt_price(float(snapshot.get('expected_tp1') or 0.0)) if float(snapshot.get('expected_tp1') or 0.0) > 0 else '—'} | Hit {_autotrade_checkbox(snapshot.get('tp1_hit'))} | Live order {_autotrade_checkbox(snapshot.get('tp1_order_live'))}"
+    )
+    lines.append(
+        f"   • TP2: {fmt_price(float(snapshot.get('expected_tp2') or 0.0)) if float(snapshot.get('expected_tp2') or 0.0) > 0 else '—'} | Hit {_autotrade_checkbox(snapshot.get('tp2_hit'))} | Live order {_autotrade_checkbox(snapshot.get('tp2_order_live'))}"
+    )
+    lines.append(
+        f"   • Risk-free / BE: {_autotrade_checkbox(snapshot.get('risk_free'))} | Estimated risk now: {float(snapshot.get('risk_est') or 0.0):.2f} USDT"
+    )
+    missing = [name for name, flag in (('SL', snapshot.get('missing_sl')), ('TP1', snapshot.get('missing_tp1')), ('TP2', snapshot.get('missing_tp2'))) if bool(flag)]
+    if missing:
+        lines.append(f"   • Protection repair pending: {', '.join(missing)}")
+    if float(snapshot.get('opened_ts') or 0.0) > 0:
+        lines.append(f"   • Opened: {_fmt_dt_local(datetime.fromtimestamp(float(snapshot.get('opened_ts')), tz=timezone.utc))}")
+    return lines
+
+
+def _autotrade_render_closed_lifecycle_row_compact(row: dict) -> list[str]:
+    sym = str(row.get('symbol') or '?')
+    side = str(row.get('side') or '?')
+    result_txt = str(row.get('result_label') or row.get('result_path') or '—')
+    pnl = float(row.get('pnl_usdt') or 0.0) if row.get('pnl_usdt') is not None else 0.0
+    trade_id = str(row.get('trade_id') or '').strip()
+    setup_id = str(row.get('setup_id') or '').strip()
+    header = f"• {side} {sym} | {result_txt}"
+    if trade_id:
+        header += f" | {trade_id}"
+    elif setup_id:
+        header += f" | {setup_id}"
+    lines = [header]
+    lines.append(
+        f"  SL {fmt_price(float(row.get('sl') or 0.0)) if float(row.get('sl') or 0.0) > 0 else '—'} {_autotrade_checkbox(float(row.get('sl_hit_ts') or 0.0) > 0)} | TP1 {fmt_price(float(row.get('tp1') or 0.0)) if float(row.get('tp1') or 0.0) > 0 else '—'} {_autotrade_checkbox(float(row.get('tp1_hit_ts') or 0.0) > 0)} | TP2 {fmt_price(float(row.get('tp2') or 0.0)) if float(row.get('tp2') or 0.0) > 0 else '—'} {_autotrade_checkbox(float(row.get('tp2_hit_ts') or 0.0) > 0)} | BE {_autotrade_checkbox(str(row.get('risk_free_flag') or '').upper().strip() == 'YES')}"
+    )
+    lines.append(
+        f"  Open {_trade_lifecycle_time_text(float(row.get('opened_ts') or 0.0))} | Close {_trade_lifecycle_time_text(float(row.get('closed_ts') or 0.0)) if float(row.get('closed_ts') or 0.0) > 0 else '—'} | PnL {pnl:+.2f} USDT | R {_trade_lifecycle_fmt_value(row.get('r_multiple'), '.2f')}"
+    )
+    return lines
+
+
 async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/autotrade_report [hours] — compact live journal view."""
+    """/autotrade_report [hours] — live journal with explicit SL / TP1 / TP2 hit state."""
     _autotrade_migrate_tables()
     uid = update.effective_user.id
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
@@ -25688,47 +25913,73 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
+    owner_uid = int(AUTOTRADE_OWNER_UID or uid)
+
+    try:
+        if str(AUTOTRADE_MODE).lower() == 'live':
+            _autotrade_monitor_live_exit_protection(owner_uid)
+    except Exception:
+        pass
+
+    sync_days = max(7, int(math.ceil(float(lookback_h) / 24.0)) + 3)
+    try:
+        _trade_lifecycle_sync(owner_uid, days=sync_days, force=False)
+    except Exception:
+        pass
 
     lines = ["📒 AutoTrade Journal", HDR, f"Window: last {lookback_h}h (Melbourne)"]
+
     open_positions = _bybit_get_open_positions_linear() if str(AUTOTRADE_MODE).lower() == 'live' else []
+    journal_open = []
+    try:
+        journal_open = _autotrade_db_open_trades(owner_uid) or []
+    except Exception:
+        journal_open = []
+
     lines.extend([SEP, 'Open positions'])
     if not open_positions:
         lines.append('• None')
     else:
         total_u = 0.0
-        for p in open_positions:
-            pnl = _pos_unreal_pnl(p)
-            total_u += pnl
-            lines.append(f"• {_pos_side_text(p)} {_pos_symbol(p)} | PnL {pnl:+.2f} USDT")
-        lines.append(f"Total open PnL: {total_u:+.2f} USDT")
+        total_risk = 0.0
+        for i, p in enumerate(open_positions, 1):
+            tr = _autotrade_find_open_trade_for_live_position(owner_uid, p, journal_open=journal_open)
+            snap = _autotrade_live_position_status(owner_uid, p, trade_row=tr)
+            total_u += float(snap.get('pnl') or 0.0)
+            total_risk += float(snap.get('risk_est') or 0.0)
+            lines.extend(_autotrade_render_live_position_snapshot(snap, index=i))
+            if i != len(open_positions):
+                lines.append(SEP)
+        lines.append(f"Total open PnL: {total_u:+.2f} USDT | Total risk est: {total_risk:.2f} USDT")
 
     lines.extend([SEP, 'Closed positions'])
-    closed_any = False
+    start_ts = float(time.time()) - float(lookback_h) * 3600.0
+    lifecycle_rows = []
     try:
-        if str(AUTOTRADE_MODE).lower() == 'live':
-            _autotrade_sync_closed_trades_from_exchange(int(AUTOTRADE_OWNER_UID or uid), lookback_days=max(2, int(math.ceil(lookback_h / 24.0)) + 1))
-        ts_from = float(time.time() - lookback_h * 3600.0)
-        rows = _autotrade_closed_activity_rows_window(int(AUTOTRADE_OWNER_UID or uid), float(ts_from), float(time.time()) + 60.0)[:30]
-        total_closed = 0.0
-        live_keys = {(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper()) for p in open_positions}
-        for r in rows:
-            sym = _bybit_linear_symbol(str((r or {}).get('symbol') or ''))
-            side = str((r or {}).get('side') or '').upper()
-            if (sym, side) in live_keys:
-                continue
-            pnl = float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0)
-            total_closed += pnl
-            lines.append(f"• {side} {sym} | PnL {pnl:+.2f} USDT")
-            closed_any = True
-        if closed_any:
-            lines.append(f"Total closed PnL: {total_closed:+.2f} USDT")
+        lifecycle_rows = [
+            r for r in (_trade_lifecycle_query_rows(owner_uid, start_ts=float(start_ts), session='ALL', limit=80) or [])
+            if str(r.get('result_path') or '').upper().strip() != 'OPEN'
+        ]
     except Exception:
-        pass
-    if not closed_any:
+        lifecycle_rows = []
+
+    if not lifecycle_rows:
         lines.append('• None in this window')
+    else:
+        total_closed = 0.0
+        for idx, row in enumerate(lifecycle_rows[:20], 1):
+            try:
+                total_closed += float(row.get('pnl_usdt') or 0.0)
+            except Exception:
+                pass
+            lines.extend(_autotrade_render_closed_lifecycle_row_compact(row))
+            if idx != min(len(lifecycle_rows), 20):
+                lines.append(SEP)
+        lines.append(f"Total closed PnL: {total_closed:+.2f} USDT")
+        if len(lifecycle_rows) > 20:
+            lines.append(f"Showing first 20 of {len(lifecycle_rows)} closed lifecycle rows in this window.")
 
-    await send_long_message(update, "\n".join(lines), parse_mode=None)
-
+    PLACEHOLDER_REPORT_JOIN
 
 def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
     """Journal-first reconciliation stats for performance reporting."""
@@ -26023,7 +26274,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show all open Bybit positions (admin only) with live PnL and estimated risk."""
+    """Show all open Bybit positions (admin only) with explicit SL / TP1 / TP2 state."""
     uid = update.effective_user.id
     if not is_admin_user(uid):
         await update.message.reply_text("⛔️ Admin only.")
@@ -26032,6 +26283,16 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(AUTOTRADE_MODE).lower() != "live":
         await update.message.reply_text("AutoTrade is not in LIVE mode. No live positions to display.")
         return
+
+    owner_uid = int(AUTOTRADE_OWNER_UID or uid)
+    try:
+        _autotrade_monitor_live_exit_protection(owner_uid)
+    except Exception:
+        pass
+    try:
+        _trade_lifecycle_sync(owner_uid, days=7, force=False)
+    except Exception:
+        pass
 
     positions = _bybit_get_open_positions_linear()
     if not positions:
@@ -26046,53 +26307,27 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_risk = 0.0
     journal_open = []
     try:
-        journal_open = _autotrade_db_open_trades(int(uid)) or []
+        journal_open = _autotrade_db_open_trades(owner_uid) or []
     except Exception:
         journal_open = []
 
     for i, p in enumerate(positions, 1):
-        sym = _pos_symbol(p)
-        side = _pos_side_text(p)
-        size = _pos_size(p)
-        entry = _pos_entry(p)
-        mark = _pos_mark(p)
-        pnl = _pos_unreal_pnl(p)
-        sl = _pos_stop(p)
-        risk = _estimate_position_risk_usd(p)
-
-        total_pnl += pnl
-        total_risk += risk
-
-        lines.append(f"{i}) {side} {sym}")
-        lines.append(f"   • Size: {size:g}")
-        lines.append(f"   • Entry: {fmt_price(entry)}   | Mark: {fmt_price(mark)}")
-        lines.append(f"   • PnL: {pnl:+.2f} USDT")
-
-        if sl and sl > 0:
-            lines.append(f"   • SL: {fmt_price(sl)}   | Risk est: {risk:.2f} USDT")
-        else:
-            lines.append("   • SL: —   | Risk est: — (needs SL)")
-
-        open_info = _autotrade_resolve_live_position_open_info(int(uid), p, journal_open=journal_open)
-        opened_ts = float(open_info.get("opened_ts") or 0.0)
+        tr = _autotrade_find_open_trade_for_live_position(owner_uid, p, journal_open=journal_open)
+        snap = _autotrade_live_position_status(owner_uid, p, trade_row=tr)
+        total_pnl += float(snap.get('pnl') or 0.0)
+        total_risk += float(snap.get('risk_est') or 0.0)
+        lines.extend(_autotrade_render_live_position_snapshot(snap, index=i))
         ut = p.get("updatedTime") or p.get("updated_time") or ""
-        if opened_ts > 0:
-            lines.append(f"   • Opened: {_fmt_dt_local(datetime.fromtimestamp(opened_ts, tz=timezone.utc))}")
-        else:
-            ct = p.get("createdTime") or p.get("created_time") or ""
-            if ct:
-                lines.append(f"   • Opened: {_ms_to_local_str(ct)}")
         if ut:
             lines.append(f"   • Updated: {_ms_to_local_str(ut)}")
-
         if i != len(positions):
             lines.append(SEP)
 
     lines.append(HDR)
     lines.append(f"TOTAL unrealised PnL: {total_pnl:+.2f} USDT")
-    lines.append(f"TOTAL risk est (needs SL): {total_risk:.2f} USDT")
+    lines.append(f"TOTAL risk est: {total_risk:.2f} USDT")
 
-    await send_long_message(update, "\n".join(lines))
+    PLACEHOLDER_OPEN_JOIN
 
 async def autotrade_debug_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -29982,10 +30217,38 @@ async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
     repaired = []
     try:
-        live_map = {(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper()): p for p in (_bybit_get_open_positions_linear() or [])}
-        for tr in (_autotrade_db_open_trades(int(uid)) or []):
-            key = (str(tr.get('symbol') or '').upper(), str(tr.get('side') or '').upper())
-            p = live_map.get(key)
+        live_positions = _bybit_get_open_positions_linear() or []
+        journal_open = _autotrade_db_open_trades(int(uid)) or []
+        used_trade_ids = set()
+
+        for p in live_positions:
+            tr = _autotrade_find_open_trade_for_live_position(int(uid), p, journal_open=journal_open)
+            if tr:
+                tid = str(tr.get('trade_id') or '').strip()
+                if tid:
+                    used_trade_ids.add(tid)
+                rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
+                snap = _autotrade_live_position_status(int(uid), p, trade_row=tr)
+                if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')) or any(bool(snap.get(k)) for k in ('missing_sl', 'missing_tp1', 'missing_tp2')):
+                    if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
+                        repaired.append(rr)
+                    else:
+                        repaired.append({
+                            'checked': True,
+                            'symbol': str(snap.get('symbol') or ''),
+                            'side': str(snap.get('side') or ''),
+                            'sl_fixed': False,
+                            'tp_fixed': False,
+                            'tp1_order_fixed': False,
+                            'be_applied': bool(snap.get('be_active')),
+                            'pending_missing': [name for name, flag in (('SL', snap.get('missing_sl')), ('TP1', snap.get('missing_tp1')), ('TP2', snap.get('missing_tp2'))) if bool(flag)],
+                        })
+
+        for tr in journal_open:
+            tid = str(tr.get('trade_id') or '').strip()
+            if tid and tid in used_trade_ids:
+                continue
+            p = _autotrade_find_live_position(str(tr.get('symbol') or ''), side=str(tr.get('side') or ''))
             if not p:
                 continue
             rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
@@ -29994,6 +30257,30 @@ def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
     except Exception:
         return repaired
     return repaired
+
+
+async def autotrade_exit_guardian_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not _autotrade_ready():
+            return
+        if str(AUTOTRADE_MODE).lower() != 'live':
+            return
+        uid = int(AUTOTRADE_OWNER_UID or 0)
+        if uid <= 0:
+            return
+        repaired = _autotrade_monitor_live_exit_protection(int(uid))
+        if repaired:
+            _LAST_AUTOTRADE_DECISION[int(uid)] = {
+                'status': 'MANAGED',
+                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                'reason': f"managed_live_exits ({len(repaired)})",
+                'session': current_session_utc(datetime.now(timezone.utc)),
+                'mode': AUTOTRADE_MODE,
+            }
+        _hb_touch('autotrade_guardian', ok=True, details=f'repairs={len(repaired)}')
+    except Exception as e:
+        _hb_touch('autotrade_guardian', ok=False, error=f"{type(e).__name__}: {e}", details='guardian_error')
+        logger.exception('autotrade_exit_guardian_job crashed: %s', e)
 
 
 async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
@@ -30369,6 +30656,19 @@ def main():
                 "max_instances": 1,
                 "coalesce": True,
                 "misfire_grace_time": 60,
+            },
+        )
+
+        # AutoTrade live protection guardian (repairs missing SL / TP stacks continuously)
+        app.job_queue.run_repeating(
+            autotrade_exit_guardian_job,
+            interval=30,
+            first=20,
+            name="autotrade_exit_guardian_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 15,
             },
         )
 
