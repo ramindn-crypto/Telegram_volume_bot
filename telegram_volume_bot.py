@@ -8605,6 +8605,8 @@ def _trade_lifecycle_result_label(path: str) -> str:
         return 'hit TP1 then BE SL (Partial Win / Risk-Free)'
     if p == 'HIT_TP1_THEN_SL':
         return 'hit TP1 then SL (Partial Win)'
+    if p == 'HIT_TP1_ONLY_CLOSE':
+        return 'hit TP1 only (Partial Win)'
     if p == 'HIT_TP2_WIN':
         return 'hit TP2 (Win)'
     if p == 'MANUAL_OR_UNKNOWN_CLOSE':
@@ -8612,6 +8614,17 @@ def _trade_lifecycle_result_label(path: str) -> str:
     if p == 'OPEN':
         return 'still open'
     return ''
+def _trade_lifecycle_result_path_from_canon(outcome: str, risk_free_hint: bool = False) -> str:
+    canon = str(outcome or '').upper().strip()
+    if canon == 'TP2':
+        return 'HIT_TP2_WIN'
+    if canon == 'TP1':
+        return 'HIT_TP1_THEN_BE_SL' if bool(risk_free_hint) else 'HIT_TP1_ONLY_CLOSE'
+    if canon == 'SL':
+        return 'HIT_SL_LOSS'
+    if canon == 'OPEN':
+        return 'OPEN'
+    return 'MANUAL_OR_UNKNOWN_CLOSE'
 def _trade_lifecycle_fmt_duration(sec) -> str:
     try:
         if sec is None:
@@ -9138,12 +9151,12 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
     rows = [dict(r) for r in (rows or [])]
     total = len(rows)
     wins = sum(1 for r in rows if str(r.get('result_path') or '').upper() == 'HIT_TP2_WIN')
-    partial_wins = sum(1 for r in rows if str(r.get('result_path') or '').upper() in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'})
+    partial_wins = sum(1 for r in rows if str(r.get('result_path') or '').upper() in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP1_ONLY_CLOSE'})
     losses = sum(1 for r in rows if str(r.get('result_path') or '').upper() == 'HIT_SL_LOSS')
     open_n = sum(1 for r in rows if str(r.get('result_path') or '').upper() == 'OPEN')
     manual_unknown = sum(1 for r in rows if str(r.get('result_path') or '').upper() == 'MANUAL_OR_UNKNOWN_CLOSE')
     closed_decided = wins + partial_wins + losses
-    tp1_hits = sum(1 for r in rows if float(r.get('tp1_hit_ts') or 0.0) > 0 or str(r.get('result_path') or '').upper() in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'})
+    tp1_hits = sum(1 for r in rows if float(r.get('tp1_hit_ts') or 0.0) > 0 or str(r.get('result_path') or '').upper() in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP1_ONLY_CLOSE'})
     tp2_hits = sum(1 for r in rows if float(r.get('tp2_hit_ts') or 0.0) > 0 or str(r.get('result_path') or '').upper() == 'HIT_TP2_WIN')
     sl_hits = sum(1 for r in rows if float(r.get('sl_hit_ts') or 0.0) > 0 or str(r.get('result_path') or '').upper() in {'HIT_SL_LOSS', 'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'})
     risk_free = sum(1 for r in rows if str(r.get('risk_free_flag') or '').upper() == 'YES')
@@ -9180,7 +9193,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
                 bo['r'].append(rr)
         if path == 'HIT_TP2_WIN':
             bo['wins'] += 1
-        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
+        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP1_ONLY_CLOSE'}:
             bo['partial_wins'] += 1
         elif path == 'HIT_SL_LOSS':
             bo['losses'] += 1
@@ -9206,7 +9219,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
             bc['closed'] += 1
             if path == 'HIT_TP2_WIN':
                 bc['wins'] += 1
-            elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
+            elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP1_ONLY_CLOSE'}:
                 bc['partial_wins'] += 1
             elif path == 'HIT_SL_LOSS':
                 bc['losses'] += 1
@@ -9219,7 +9232,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
                 be['r'].append(rr)
         if path == 'HIT_TP2_WIN':
             be['wins'] += 1
-        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
+        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP1_ONLY_CLOSE'}:
             be['partial_wins'] += 1
         elif path == 'HIT_SL_LOSS':
             be['losses'] += 1
@@ -9230,7 +9243,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
                 bcg['r'].append(rr)
         if path == 'HIT_TP2_WIN':
             bcg['wins'] += 1
-        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
+        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP1_ONLY_CLOSE'}:
             bcg['partial_wins'] += 1
         elif path == 'HIT_SL_LOSS':
             bcg['losses'] += 1
@@ -9241,7 +9254,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
                 bq['r'].append(rr)
         if path == 'HIT_TP2_WIN':
             bq['wins'] += 1
-        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
+        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP1_ONLY_CLOSE'}:
             bq['partial_wins'] += 1
         elif path == 'HIT_SL_LOSS':
             bq['losses'] += 1
@@ -9252,7 +9265,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
             sy['r'].append(rr)
         if path == 'HIT_TP2_WIN':
             sy['wins'] += 1
-        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
+        elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP1_ONLY_CLOSE'}:
             sy['partial_wins'] += 1
         elif path == 'HIT_SL_LOSS':
             sy['losses'] += 1
@@ -9512,6 +9525,11 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
                 result_label = _trade_lifecycle_result_label(result_path)
                 close_reason = 'hit SL'
                 final_close_ts = float(sl_hit_ts)
+        elif tp1_confirmed and (closed_ts_journal > 0 or matched_pnl or manual_events or live_pos is None):
+            result_path = 'HIT_TP1_ONLY_CLOSE'
+            result_label = _trade_lifecycle_result_label(result_path)
+            close_reason = 'hit TP1 only / closed after TP1'
+            final_close_ts = closed_ts_journal or _trade_lifecycle_pick_ts([ev.get('ts') for ev in matched_pnl] + [ev.get('ts') for ev in manual_events], pick='max') or tp1_hit_ts
         elif status == 'OPEN' and live_pos is None:
             # Journal still shows OPEN but exchange no longer does; stay conservative.
             result_path = 'MANUAL_OR_UNKNOWN_CLOSE'
@@ -10037,7 +10055,7 @@ def _trade_lifecycle_analytics(owner_uid: int, days: int = 30, session: str = 'A
             _trade_lifecycle_sync(owner_uid, days=max(7, days), force=force)
         except Exception:
             pass
-    rows = _trade_lifecycle_query_rows(owner_uid, start_ts=float(start_ts), session=session)
+    rows = _trade_lifecycle_rows_with_fallback(owner_uid, start_ts=float(start_ts), session=session, end_ts=time.time(), limit=240, persist=True)
     out = _trade_lifecycle_metrics_from_rows(rows)
     out['days'] = int(days)
     out['session_filter'] = str(session or 'ALL').upper().strip() or 'ALL'
@@ -10198,7 +10216,7 @@ def _trade_lifecycle_recent_report(owner_uid: int, hours: int = 48, session: str
     except Exception:
         pass
     start_ts = float(time.time()) - float(hours) * 3600.0
-    rows = _trade_lifecycle_query_rows(owner_uid, start_ts=float(start_ts), session=session)
+    rows = _trade_lifecycle_rows_with_fallback(owner_uid, start_ts=float(start_ts), session=session, end_ts=time.time(), limit=240, persist=True)
     analytics = _trade_lifecycle_metrics_from_rows(rows)
     lines = [
         '🧬 Trade Lifecycle Detail',
@@ -10247,10 +10265,74 @@ def _trade_lifecycle_recent_analytics(owner_uid: int, hours: int = 48, session: 
     except Exception:
         pass
     start_ts = float(time.time()) - float(hours) * 3600.0
-    out = _trade_lifecycle_metrics_from_rows(_trade_lifecycle_query_rows(owner_uid, start_ts=float(start_ts), session=session))
+    out = _trade_lifecycle_metrics_from_rows(_trade_lifecycle_rows_with_fallback(owner_uid, start_ts=float(start_ts), session=session, end_ts=time.time(), limit=480, persist=True))
     out['hours'] = int(hours)
     out['session_filter'] = session
     return out
+def _trade_lifecycle_rows_with_fallback(owner_uid: int, start_ts: float = 0.0, session: str = 'ALL',
+                                      end_ts: float | None = None, limit: int | None = None,
+                                      persist: bool = True) -> list[dict]:
+    owner_uid = int(owner_uid)
+    sess = str(session or 'ALL').upper().strip() or 'ALL'
+    rows = [dict(r) for r in (_trade_lifecycle_query_rows(owner_uid, start_ts=float(start_ts), session=sess, limit=limit) or [])]
+    try:
+        end_f = float(end_ts or time.time())
+    except Exception:
+        end_f = float(time.time())
+    try:
+        fallback_limit = int(max(limit * 2, 240)) if limit is not None else 240
+    except Exception:
+        fallback_limit = 240
+    try:
+        fallback_rows = _autotrade_report_closed_rows_window(owner_uid, float(start_ts or 0.0), end_f, limit=fallback_limit) or []
+    except Exception:
+        fallback_rows = []
+    if not fallback_rows:
+        return rows
+    merged = []
+    seen = set()
+    def _row_key(r: dict) -> tuple:
+        return (
+            str(r.get('trade_id') or '').strip(),
+            str(r.get('setup_id') or '').strip(),
+            str(_bybit_linear_symbol(r.get('symbol') or '')).upper(),
+            str(r.get('side') or '').upper().strip(),
+            int(float(r.get('closed_ts') or 0.0) // 60),
+            round(float(r.get('pnl_usdt') if r.get('pnl_usdt') is not None else r.get('pnl') or 0.0), 8),
+        )
+    for row in (rows or []):
+        rr = dict(row or {})
+        key = _row_key(rr)
+        seen.add(key)
+        merged.append(rr)
+    for row in (fallback_rows or []):
+        rr = dict(row or {})
+        path = str(rr.get('result_path') or '').upper().strip()
+        if path in {'TP1', 'TP2', 'SL', 'OPEN', ''}:
+            be_hint = str(rr.get('risk_free_flag') or '').upper().strip() == 'YES'
+            new_path = _trade_lifecycle_result_path_from_canon(path or _canon_signal_outcome_label(str(rr.get('outcome') or ''), float(rr.get('pnl_usdt') if rr.get('pnl_usdt') is not None else rr.get('pnl') or 0.0)), risk_free_hint=be_hint)
+            rr['result_path'] = new_path
+            rr['result_label'] = _trade_lifecycle_result_label(new_path)
+            if not str(rr.get('close_reason') or '').strip():
+                rr['close_reason'] = rr['result_label']
+        if sess in {'ASIA', 'LON', 'NY'}:
+            row_sess = str(rr.get('open_session') or rr.get('close_session') or '').upper().strip()
+            if row_sess and row_sess != sess:
+                continue
+        key = _row_key(rr)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(rr)
+        if bool(persist) and str(rr.get('trade_id') or '').strip():
+            try:
+                _trade_lifecycle_upsert_row(rr)
+            except Exception:
+                pass
+    merged.sort(key=lambda r: (float(r.get('opened_ts') or 0.0), float(r.get('closed_ts') or 0.0)), reverse=True)
+    if limit is not None:
+        return merged[:int(limit)]
+    return merged
 def _trade_lifecycle_best_bucket(group_map: dict, metric: str = 'avg_r', min_sample: int = 3, prefer_high: bool = True) -> tuple[str, dict]:
     items = []
     for name, data in (group_map or {}).items():
@@ -23419,9 +23501,13 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                 elif effective_canon == 'TP2':
                     row['tp1_hit_ts'] = float(row.get('tp1_hit_ts') or 0.0) or hit_ts
                     row['tp2_hit_ts'] = float(row.get('tp2_hit_ts') or 0.0) or hit_ts
-                if str(row.get('result_path') or '').upper().strip() in {'OPEN', 'MANUAL_OR_UNKNOWN_CLOSE', ''}:
-                    row['result_path'] = effective_canon
-                    row['result_label'] = effective_canon
+                if str(row.get('result_path') or '').upper().strip() in {'OPEN', 'MANUAL_OR_UNKNOWN_CLOSE', '', 'TP1', 'TP2', 'SL'}:
+                    path_from_canon = _trade_lifecycle_result_path_from_canon(
+                        effective_canon,
+                        risk_free_hint=(str(row.get('risk_free_flag') or '').upper().strip() == 'YES'),
+                    )
+                    row['result_path'] = path_from_canon
+                    row['result_label'] = _trade_lifecycle_result_label(path_from_canon)
                     row['close_reason'] = str(row.get('close_reason') or ('signal_outcome_sync' if signal_canon else 'autotrade_journal_match'))
             ok = _out_key(row)
             if ok not in seen_out:
@@ -26047,8 +26133,23 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 continue
         
         # -----------------------------------------------------
+        active_build_sessions = []
+        try:
+            seen_sessions = set()
+            for _u in (users_notify or []):
+                try:
+                    _sess = in_session_now(_u)
+                except Exception:
+                    _sess = None
+                _name = str((_sess or {}).get("name") or "").upper().strip()
+                if _name in {"ASIA", "LON", "NY"} and _name not in seen_sessions:
+                    seen_sessions.add(_name)
+                    active_build_sessions.append(_name)
+        except Exception:
+            active_build_sessions = []
+        build_sessions = active_build_sessions or []
         setups_by_session: Dict[str, List[Setup]] = {}
-        for sess_name in (EMAIL_BUILD_SESSIONS or ["ASIA", "LON", "NY"]):
+        for sess_name in build_sessions:
             try:
                 # Session pools are shared across users, so do not bind them to a stale uid
                 # leaked from an earlier loop iteration.
