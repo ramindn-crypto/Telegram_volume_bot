@@ -406,57 +406,47 @@ TXID_REGEX = re.compile(r"^[A-Fa-f0-9]{64}$")
 
 
 
-def _ensure_three_tps(entry: float, sl: float, tp3: float, tp1, tp2, side: str):
-    """Legacy compatibility helper for the bot's 2-TP model.
+def _resolve_single_tp(entry: float, sl: float, tp1=None, tp2=None, tp3=None, side: str = '') -> float:
+    """Resolve the bot's single take-profit target.
 
-    Returns a normalized ladder ``(tp1, tp2, tp3_legacy)`` where the third value is
-    always mirrored to TP2 so any older callers that still read ``tp3`` cannot create
-    a distinct third target.
+    Compatibility rules:
+    - prefer tp1 when present (new single-TP model stores the only target there)
+    - otherwise fall back to tp2, then tp3
+    - validate direction against entry when possible
     """
     try:
         e = float(entry or 0.0)
-        s = float(sl or 0.0)
-        raw_tp2 = float(tp2 or tp3 or 0.0)
     except Exception:
-        return tp1, tp2, tp2 if tp2 not in (None, '', 0, 0.0) else tp3
-    if e <= 0 or s <= 0 or raw_tp2 <= 0:
-        return tp1, tp2, tp2 if tp2 not in (None, '', 0, 0.0) else tp3
-
-    try:
-        t1_ok = tp1 not in (None, '', 0, 0.0)
-        t2_ok = tp2 not in (None, '', 0, 0.0)
-    except Exception:
-        t1_ok = t2_ok = False
-
-    if t2_ok:
-        t2 = float(tp2)
-    else:
-        t2 = float(raw_tp2)
-
-    if t1_ok:
-        t1 = float(tp1)
-    else:
-        # Derive TP1 as a conservative partial target between entry and TP2.
-        t1 = e + (t2 - e) * 0.45
-
+        e = 0.0
     side_u = str(side or '').upper().strip()
-    eps = max(abs(e) * 1e-6, 1e-8)
-    if side_u == 'SELL':
-        if not (t2 < e):
-            t2 = e - abs(e - raw_tp2 or abs(e - s))
-        if not (t1 < e):
-            t1 = e - abs(e - t2) * 0.45
-        if t1 <= t2:
-            t1 = t2 + eps
-    else:
-        if not (t2 > e):
-            t2 = e + abs(raw_tp2 - e or abs(e - s))
-        if not (t1 > e):
-            t1 = e + abs(t2 - e) * 0.45
-        if t1 >= t2:
-            t1 = t2 - eps
+    raw = []
+    for v in (tp1, tp2, tp3):
+        try:
+            fv = float(v or 0.0)
+        except Exception:
+            fv = 0.0
+        if fv > 0:
+            raw.append(fv)
+    if not raw:
+        return 0.0
+    for cand in raw:
+        if e <= 0:
+            return float(cand)
+        if side_u == 'SELL' and cand < e:
+            return float(cand)
+        if side_u != 'SELL' and cand > e:
+            return float(cand)
+    return float(raw[0])
 
-    return float(t1), float(t2), float(t2)
+def _ensure_three_tps(entry: float, sl: float, tp3: float, tp1, tp2, side: str):
+    """Backward-compatible single-TP resolver.
+
+    The bot now uses exactly one TP. For old code paths that still expect a 3-value
+    tuple we mirror the same resolved target into all three positions so downstream
+    calculations stay stable without creating extra targets.
+    """
+    tp = _resolve_single_tp(entry, sl, tp1=tp1, tp2=tp2, tp3=tp3, side=side)
+    return float(tp or 0.0), float(tp or 0.0), float(tp or 0.0)
 
 _LAST_SCAN_UNIVERSE = []
 _LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
@@ -2374,50 +2364,18 @@ def _be_min_quality_for_session(session_name: str) -> float:
 
 
 def _backtest_should_move_sl_to_be_after_tp1(setup: "Setup", session_name: str) -> bool:
-    """Mirror the live conditional TP1 -> break-even rule inside historical simulation.
-
-    Universe/backtest results should reflect the same intent as live execution:
-    - do NOT force BE after TP1 on every setup
-    - only apply it for higher-quality setups in the allowed sessions / engines
-    - keep the decision bounded to setup fields already stored on the signal
-    """
-    try:
-        if not AUTOTRADE_BE_AFTER_TP1_ENABLED:
-            return False
-        sess = str(session_name or '').upper().strip()
-        conf = int(float(getattr(setup, 'conf', 0) or 0) or 0)
-        quality_score = float(getattr(setup, 'quality_score', 0.0) or 0.0)
-        atr_pct = float(getattr(setup, 'atr_pct', 0.0) or 0.0)
-        if atr_pct <= 0:
-            try:
-                entry = float(getattr(setup, 'entry', 0.0) or 0.0)
-                atr_1h = float(getattr(setup, 'atr_1h', 0.0) or 0.0)
-                atr_pct = ((atr_1h / entry) * 100.0) if entry > 0 and atr_1h > 0 else 0.0
-            except Exception:
-                atr_pct = 0.0
-        engine = str(getattr(setup, 'engine', '') or '').upper().strip()
-        return bool(
-            conf >= int(AUTOTRADE_BE_AFTER_TP1_MIN_CONF)
-            and quality_score >= float(_be_min_quality_for_session(sess))
-            and (atr_pct <= float(AUTOTRADE_BE_AFTER_TP1_MAX_ATR_PCT) if atr_pct > 0 else True)
-            and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS or sess in AUTOTRADE_BE_AFTER_TP1_ALLOWED_SESSIONS)
-            and (not AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES or engine in AUTOTRADE_BE_AFTER_TP1_ALLOWED_ENGINES)
-        )
-    except Exception:
-        return False
-
+    """Single-TP model: no break-even step is used."""
+    return False
 
 def _autotrade_live_exit_plan_from_targets(entry: float, sl: float, tp1, tp2, tp3, side: str) -> dict:
-    t1, t2, t3 = _ensure_three_tps(float(entry or 0.0), float(sl or 0.0), float(tp3 or 0.0), tp1, tp2, str(side or ''))
-    final_tp = float(t2 or t3 or t1 or 0.0)
-    partial_tp = float(t1 or 0.0)
+    tp = _resolve_single_tp(entry, sl, tp1=tp1, tp2=tp2, tp3=tp3, side=side)
     return {
-        'partial_tp': float(partial_tp),
-        'final_tp': float(final_tp),
-        'partial_fraction': float(AUTOTRADE_LIVE_TP1_FRACTION),
-        'effective_tp1': float(t1 or 0.0),
-        'effective_tp2': float(t2 or 0.0),
-        'effective_tp3': float(t3 or 0.0),
+        'partial_tp': 0.0,
+        'final_tp': float(tp or 0.0),
+        'partial_fraction': 1.0,
+        'effective_tp1': float(tp or 0.0),
+        'effective_tp2': 0.0,
+        'effective_tp3': 0.0,
     }
 
 
@@ -3088,6 +3046,45 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
             return result
         result['checked'] = True
 
+        entry = float(_pos_entry(pos) or trade_row.get('entry') or 0.0)
+        target_sl = float(trade_row.get('sl') or 0.0)
+        target_tp = _resolve_single_tp(entry, target_sl, trade_row.get('tp1'), trade_row.get('tp2'), trade_row.get('tp3'), side)
+
+        current_sl = float(_pos_stop(pos) or _bybit_detect_open_sl_price(sym, side=side) or 0.0)
+        current_tp = float(_pos_take_profit(pos) or 0.0)
+
+        sl_ok = bool(target_sl > 0 and current_sl > 0 and _price_close_enough(current_sl, target_sl, rel_tol=0.0020))
+        tp_ok = bool(target_tp > 0 and current_tp > 0 and _price_close_enough(current_tp, target_tp, rel_tol=0.0020))
+
+        if not (sl_ok and tp_ok):
+            last_res = _autotrade_apply_position_tp_sl(sym, target_sl, target_tp)
+            time.sleep(0.35)
+            pos = _autotrade_find_live_position(sym, side=side) or pos
+            current_sl = float(_pos_stop(pos) or _bybit_detect_open_sl_price(sym, side=side) or 0.0)
+            current_tp = float(_pos_take_profit(pos) or 0.0)
+            sl_ok = bool(target_sl > 0 and current_sl > 0 and _price_close_enough(current_sl, target_sl, rel_tol=0.0020))
+            tp_ok = bool(target_tp > 0 and current_tp > 0 and _price_close_enough(current_tp, target_tp, rel_tol=0.0020))
+            result['sl_apply_res'] = last_res
+
+        result['sl_fixed'] = bool(sl_ok)
+        result['tp_fixed'] = bool(tp_ok)
+        result['pending_missing'] = [name for name, flag in (('SL', not sl_ok), ('TP', not tp_ok)) if bool(flag)]
+        return result
+    except Exception:
+        return result
+        if not trade_row:
+            return result
+        sym = _bybit_linear_symbol(str(trade_row.get('symbol') or ''))
+        side = str(trade_row.get('side') or '').upper().strip()
+        result['symbol'] = sym
+        result['side'] = side
+        if side not in {'BUY', 'SELL'} or not sym:
+            return result
+        pos = live_pos or _autotrade_find_live_position(sym, side=side)
+        if not pos:
+            return result
+        result['checked'] = True
+
         plan = _autotrade_live_exit_plan_for_trade(trade_row)
         partial_tp = float(plan.get('partial_tp') or 0.0)
         entry = float(_pos_entry(pos) or trade_row.get('entry') or 0.0)
@@ -3250,7 +3247,7 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         try:
             final_pos = _autotrade_find_live_position(sym, side=side) or pos
             snap = _autotrade_live_position_status(int(uid), final_pos, trade_row=trade_row) if final_pos else {}
-            result['pending_missing'] = [name for name, flag in (('SL', snap.get('missing_sl')), ('TP1', snap.get('missing_tp1')), ('TP2', snap.get('missing_tp2'))) if bool(flag)]
+            result['pending_missing'] = [name for name, flag in (('SL', snap.get('missing_sl')), ('TP', snap.get('missing_tp') or snap.get('missing_tp1'))) if bool(flag)]
             if tp1_hit and bool(snap.get('be_active')):
                 result['be_applied'] = True
         except Exception:
@@ -5516,13 +5513,13 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     tp1 = _as_pos_float(getattr(s, 'tp1', None))
     tp2 = _as_pos_float(getattr(s, 'tp2', None))
     tp3 = _as_pos_float(getattr(s, 'tp3', None))
-    tps = [v for v in (tp1, tp2, tp3) if v is not None]
+    final_tp = _resolve_single_tp(intended_entry, intended_sl, tp1, tp2, tp3, side)
 
     if side not in {'BUY', 'SELL'}:
         return (False, f'bad_side ({side})')
     if intended_entry <= 0 or intended_sl <= 0:
         return (False, 'bad_prices')
-    if not tps:
+    if final_tp <= 0:
         return (False, 'missing_tp')
     if side == 'BUY' and intended_sl >= intended_entry:
         return (False, 'sl_not_below_entry_for_buy')
@@ -5746,182 +5743,13 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
 
-    exit_plan = _autotrade_live_exit_plan_for_trade(s)
-    planned_partial_tp = float(exit_plan.get('effective_tp1') or 0.0)
-    planned_tp2 = float(exit_plan.get('effective_tp2') or 0.0)
-    planned_tp3 = float(exit_plan.get('effective_tp3') or 0.0)
-    planned_tp_targets_live = _dedupe_price_targets([x for x in (planned_partial_tp, planned_tp2, planned_tp3) if float(x or 0.0) > 0])
-    planned_tp_slice_preview = _autotrade_build_tp_order_slices(sym, planned_tp_targets_live, qty, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
-    planned_tp_slice_ok = [x for x in (planned_tp_slice_preview or []) if bool(x.get('ok')) and float(x.get('qty') or 0.0) > 0]
-    try:
-        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-            'planned_tp_targets_live': planned_tp_targets_live,
-            'planned_tp_slice_preview': planned_tp_slice_preview,
-        })
-    except Exception:
-        pass
-    if len(planned_tp_targets_live) != 2 or len(planned_tp_slice_ok) != 2:
-        try:
-            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'pre_entry_exit_stack_invalid_tp_layout'})
-        except Exception:
-            pass
-        try:
-            _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason='pre_entry_exit_stack_invalid_tp_layout')
-        except Exception:
-            pass
-        return (False, 'pre_entry_exit_stack_invalid_tp_layout')
-
-    gate_ok, gate_reason, gate_detail = _autotrade_can_open_symbol(uid, sym, side, session_label)
-    try:
-        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-            'symbol_gate_allowed': bool(gate_ok),
-            'symbol_gate_reason': gate_reason,
-            'symbol_gate_detail': gate_detail,
-        })
-    except Exception:
-        pass
-    if not gate_ok:
-        try:
-            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': gate_reason})
-        except Exception:
-            pass
-        try:
-            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(gate_reason), last_reason=gate_reason)
-        except Exception:
-            pass
-        return (False, gate_reason)
-
-    reserved_keys = []
-    runtime_lock_acquired = False
-    try:
-        runtime_lock_acquired = _autotrade_runtime_symbol_lock_acquire(uid, sym)
-        if not runtime_lock_acquired:
-            try:
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'blocked_duplicate_inflight_lock'})
-            except Exception:
-                pass
-            _autotrade_log_symbol_block(uid, sym, side, 'blocked_duplicate_inflight_lock', 'runtime_lock_acquire_failed')
-            return (False, 'blocked_duplicate_inflight_lock')
-
-        _autotrade_exec_cleanup()
-        ok_guard, reserved_keys, guard_reason = _autotrade_exec_reserve(uid, setup_id, sym, side)
-        if not ok_guard:
-            mapped_reason = {
-                'duplicate_guard_block:symbol': 'blocked_duplicate_inflight_lock',
-                'duplicate_guard_block:symdir': 'blocked_duplicate_inflight_lock',
-                'duplicate_guard_block:setup': 'blocked_duplicate_pending_order',
-            }.get(guard_reason, guard_reason)
-            try:
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': mapped_reason})
-            except Exception:
-                pass
-            _autotrade_log_symbol_block(uid, sym, side, mapped_reason, guard_reason)
-            try:
-                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(mapped_reason), last_reason=mapped_reason)
-            except Exception:
-                pass
-            return (False, mapped_reason)
-
-        gate_ok_after, gate_reason_after, gate_detail_after = _autotrade_can_open_symbol(uid, sym, side, session_label)
-        if not gate_ok_after and gate_reason_after not in {'blocked_duplicate_inflight_lock', 'blocked_duplicate_pending_order'}:
-            _autotrade_exec_mark(reserved_keys, 'FAILED', gate_reason_after)
-            try:
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                    'symbol_gate_allowed': False,
-                    'symbol_gate_reason': gate_reason_after,
-                    'symbol_gate_detail': gate_detail_after,
-                    'reject_reason': gate_reason_after,
-                })
-            except Exception:
-                pass
-            try:
-                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(gate_reason_after), last_reason=gate_reason_after)
-            except Exception:
-                pass
-            return (False, gate_reason_after)
-
-        if str(AUTOTRADE_MODE).lower() == 'paper':
-            trade_id = _autotrade_db_add_trade(uid, session_label, s, qty, lifecycle_state='executed_open', lifecycle_reason='paper_opened')
-            _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
-            try:
-                _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), state='executed_open', last_reason='paper_opened')
-            except Exception:
-                pass
-            return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.8g} SL={sl_for_order} TPs={','.join([f'{x:g}' for x in tps])}")
-
-        if AUTOTRADE_ISOLATED:
-            _bybit_v5_request('POST', '/v5/position/switch-isolated', {
-                'category': 'linear',
-                'symbol': sym,
-                'tradeMode': 1,
-                'buyLeverage': str(AUTOTRADE_LEVERAGE),
-                'sellLeverage': str(AUTOTRADE_LEVERAGE),
-            })
-        _bybit_v5_request('POST', '/v5/position/set-leverage', {
-            'category': 'linear',
-            'symbol': sym,
-            'buyLeverage': str(AUTOTRADE_LEVERAGE),
-            'sellLeverage': str(AUTOTRADE_LEVERAGE),
-        })
-
-        qty_step = filt.get('qtyStep')
-        qty_str = _fmt_qty(qty, qty_step)
-        order_payload = {
-            'category': 'linear',
-            'symbol': sym,
-            'side': 'Buy' if side == 'BUY' else 'Sell',
-            'orderType': 'Market',
-            'qty': qty_str,
-            'timeInForce': 'IOC',
-        }
-        try:
-            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                'qty_step': qty_step,
-                'min_qty': filt.get('minQty'),
-                'min_notional': filt.get('minNotional'),
-                'qty_str': qty_str,
-                'order_payload': {k: (v if k != 'qty' else str(v)) for k, v in (order_payload or {}).items()},
-            })
-        except Exception:
-            pass
-        open_res = _bybit_v5_request('POST', '/v5/order/create', order_payload)
-        try:
-            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'bybit': open_res})
-        except Exception:
-            pass
-        if int(open_res.get('retCode', -1)) != 0:
-            err = f"{open_res.get('retCode')} {open_res.get('retMsg')}"
-            _autotrade_exec_mark(reserved_keys, 'FAILED', err)
-            try:
-                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('exchange_reject'), last_reason=f'bybit_open_failed ({err})')
-            except Exception:
-                pass
-            return (False, f'bybit_open_failed ({err})')
-
-        try:
-            _admin_setup_lifecycle_merge(
-                int(uid), setup_id,
-                state='bybit_order_accepted',
-                last_reason='order_accepted',
-                bybit_order_id=str(((open_res or {}).get('result') or {}).get('orderId') or ''),
-                bybit_order_link_id=str(((open_res or {}).get('result') or {}).get('orderLinkId') or ''),
-                bybit_position_symbol=str(sym or ''),
-            )
-        except Exception:
-            pass
-
         exit_plan = _autotrade_live_exit_plan_for_trade(s)
-        live_partial_tp = float(exit_plan.get('effective_tp1') or 0.0)
-        live_tp2 = float(exit_plan.get('effective_tp2') or 0.0)
-        live_tp3 = float(exit_plan.get('effective_tp3') or 0.0)
+        live_final_tp = float(exit_plan.get('final_tp') or final_tp or 0.0)
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
                 'position_opened_time': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-                'live_exit_tp1': float(live_partial_tp),
-                'live_exit_tp2': float(live_tp2),
-                'live_exit_tp3': float(live_tp3),
-                'live_final_tp': float(exit_plan.get('final_tp') or live_tp2 or live_tp3 or 0.0),
-                'live_tp_design': 'conditional_market_tp_orders + full_sl',
+                'live_exit_tp': float(live_final_tp or 0.0),
+                'live_tp_design': 'single_full_position_tp_sl',
             })
         except Exception:
             pass
@@ -5930,7 +5758,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         open_order_result = ((open_res or {}).get('result') or {})
         open_order_id = str(open_order_result.get('orderId') or '')
         open_order_link_id = str(open_order_result.get('orderLinkId') or '')
-        live_conf = _autotrade_wait_live_entry_confirmation(sym, side=side, order_id=open_order_id, order_link_id=open_order_link_id, wait_sec=9.0, step_sec=0.4)
+        live_conf = _autotrade_wait_live_entry_confirmation(sym, side=side, order_id=open_order_id, order_link_id=open_order_link_id, wait_sec=10.0, step_sec=0.4)
         live_pos = live_conf.get('position')
         confirmed_filled = bool(live_conf.get('filled_confirmed'))
         filled_qty = abs(float((live_conf.get('filled_qty') or (_pos_size(live_pos) if live_pos else qty)) or 0.0))
@@ -5994,224 +5822,75 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                     _autotrade_exec_mark(reserved_keys, 'FAILED', f'post_fill_risk_breach_reduce_failed:{err}')
                     return (False, f'post_fill_risk_breach_reduce_failed ({err})')
                 corrected = True
-                live_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=2.5, step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or live_pos
+                live_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=3.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or live_pos
                 filled_qty = abs(float((_pos_size(live_pos) if live_pos else allowed_qty) or allowed_qty or 0.0))
                 filled_entry = float((_pos_entry(live_pos) if live_pos else filled_entry) or filled_entry or price_ref)
 
-        final_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=3.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or live_pos
-        tp_base_qty = abs(float((_pos_size(final_pos) if final_pos else filled_qty) or qty))
-        live_final_tp = float(exit_plan.get('final_tp') or live_tp2 or live_tp3 or live_partial_tp or 0.0)
-        tp_targets_live = _dedupe_price_targets([x for x in (live_partial_tp, live_tp2, live_tp3) if float(x or 0.0) > 0])
-        tp_slice_preview = _autotrade_build_tp_order_slices(sym, tp_targets_live, tp_base_qty, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
-        tp_slice_ok = [x for x in (tp_slice_preview or []) if bool(x.get('ok')) and float(x.get('qty') or 0.0) > 0]
-        if len(tp_targets_live) != 2 or len(tp_slice_ok) != 2:
-            if final_pos and tp_base_qty > 0:
-                fc_res = _autotrade_force_close_live_position(sym, side, qty=tp_base_qty)
-                try:
-                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                        'tp_targets_live': tp_targets_live,
-                        'tp_slice_preview': tp_slice_preview,
-                        'exit_stack_force_close': fc_res,
-                        'reject_reason': 'live_exit_stack_invalid_tp_layout',
-                    })
-                except Exception:
-                    pass
-                _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_exit_stack_invalid_tp_layout')
-                try:
-                    _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason='live_exit_stack_invalid_tp_layout')
-                except Exception:
-                    pass
-                return (False, 'live_exit_stack_invalid_tp_layout')
+        final_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=5.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or live_pos
+        qty_for_db = abs(float((_pos_size(final_pos) if final_pos else filled_qty) or qty))
+        if final_pos is None:
             try:
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                    'tp_targets_live': tp_targets_live,
-                    'tp_slice_preview': tp_slice_preview,
-                    'reject_reason': 'live_exit_stack_invalid_tp_layout_pending_visibility',
-                })
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_position_visibility_pending_for_sltp_attach'})
             except Exception:
                 pass
-            _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_exit_stack_invalid_tp_layout_pending_visibility')
+            _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_position_visibility_pending_for_sltp_attach')
             try:
-                _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason='live_exit_stack_invalid_tp_layout_pending_visibility')
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason='live_position_visibility_pending_for_sltp_attach')
             except Exception:
                 pass
-            return (False, 'live_exit_stack_invalid_tp_layout_pending_visibility')
+            return (False, 'live_position_visibility_pending_for_sltp_attach')
 
-        def _verify_full_exit_stack(pos_obj, expected_tp_results=None, expected_sl_results=None):
-            pos_now = pos_obj or _autotrade_find_live_position(sym, side=side)
-            sl_live = float(_pos_stop(pos_now) or 0.0) if pos_now else 0.0
-            sl_ok_api = bool(sl_for_order > 0 and sl_live > 0 and _price_close_enough(sl_live, sl_for_order, rel_tol=0.0015))
-            sl_ok_create = False
-            try:
-                sl_ok_create = any(int((x or {}).get('retCode', -1)) == 0 for x in (expected_sl_results or []) if isinstance(x, dict))
-            except Exception:
-                sl_ok_create = False
-            sl_ok_open = False
-            try:
-                sl_ok_open = _bybit_has_open_sl_order_at(sym, sl_for_order, side=side)
-                if not sl_ok_open and float(tp_base_qty or 0.0) > 0:
-                    sl_qty = _bybit_sum_open_exit_qty_at(sym, sl_for_order, side=side, kind='sl')
-                    sl_ok_open = bool(sl_qty >= max(0.0, float(tp_base_qty or 0.0) * 0.90))
-            except Exception:
-                sl_ok_open = False
-            sl_ok_pair = False
-            try:
-                sl_ok_pair = any(bool((x or {}).get('ok')) and str((x or {}).get('placement') or '') == 'partial_pair' for x in (expected_tp_results or []))
-            except Exception:
-                sl_ok_pair = False
-            sl_ok = bool(sl_ok_api or sl_ok_create or sl_ok_open or sl_ok_pair)
-            tp_ok, missing_tp = _autotrade_confirm_tp_targets_present(sym, side, tp_targets_live, wait_sec=max(0.9, AUTOTRADE_TP_CONFIRM_WAIT_SEC * 0.5), step_sec=AUTOTRADE_TP_CONFIRM_STEP_SEC)
-            try:
-                _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'missing_tp_targets_after_verify': missing_tp})
-            except Exception:
-                pass
-            return pos_now, sl_ok, bool(tp_ok)
-
-        tp_order_results = []
-        sl_res = None
-        sl_res_retry = None
-        protection_pending = False
-
-        if final_pos and tp_base_qty > 0:
-            _autotrade_cancel_reduce_only_tp_orders(sym, side=side)
-            _autotrade_clear_position_full_tp_sl(sym)
-            time.sleep(0.20)
-            tp_order_results = _autotrade_place_confirmed_tp_orders(sym, side, tp_targets_live, tp_base_qty, sl_for_order, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
-            sl_res = _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
-            time.sleep(0.15)
-            final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results, expected_sl_results=[sl_res])
-            if not (sl_stack_ok and tp_stack_ok):
-                _autotrade_clear_position_full_tp_sl(sym)
-                time.sleep(0.35)
-                tp_order_results += _autotrade_place_confirmed_tp_orders(sym, side, tp_targets_live, tp_base_qty, sl_for_order, tp1_fraction=float(exit_plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION))
-                sl_res_retry = _autotrade_apply_position_tp_sl(sym, sl_for_order, 0.0)
-                time.sleep(0.15)
-                final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results, expected_sl_results=[sl_res, sl_res_retry])
-
-            pending_repair = {}
-            if not (sl_stack_ok and tp_stack_ok):
-                try:
-                    pending_repair = _autotrade_repair_live_exit_protection(uid, {
-                        'symbol': sym,
-                        'side': side,
-                        'entry': float(_pos_entry(final_pos) or filled_entry or price_ref) if final_pos else float(filled_entry or price_ref),
-                        'sl': float(sl_for_order),
-                        'tp1': float(live_partial_tp or 0.0),
-                        'tp2': float(live_tp2 or 0.0),
-                        'tp3': float(live_tp3 or 0.0),
-                        'qty': float(tp_base_qty if tp_base_qty > 0 else qty),
-                        'conf': int(getattr(s, 'conf', 0) or 0),
-                        'quality_score': float(getattr(s, 'quality_score', 0.0) or 0.0),
-                        'atr_pct': float(getattr(s, 'atr_pct', 0.0) or 0.0),
-                        'engine': str(getattr(s, 'engine', '') or ''),
-                        'session': str(session_label or ''),
-                    }, live_pos=final_pos)
-                except Exception:
-                    pending_repair = {}
-                time.sleep(0.55)
-                final_pos = _autotrade_find_live_position(sym, side=side) or final_pos
-                final_pos, sl_stack_ok, tp_stack_ok = _verify_full_exit_stack(final_pos, expected_tp_results=tp_order_results, expected_sl_results=[sl_res, sl_res_retry])
-                live_qty_after = abs(float(_pos_size(final_pos) or 0.0)) if final_pos else 0.0
-                if final_pos and live_qty_after > 0 and sl_stack_ok:
-                    protection_pending = True
-                    try:
-                        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                            'tp_targets_live': tp_targets_live,
-                            'tp_slice_preview': tp_slice_preview,
-                            'tp_orders': tp_order_results,
-                            'sl_apply_res': sl_res,
-                            'sl_apply_retry_res': sl_res_retry,
-                            'sl_stack_ok': bool(sl_stack_ok),
-                            'tp_stack_ok': bool(tp_stack_ok),
-                            'pending_repair': pending_repair,
-                            'protection_pending': True,
-                            'warning': 'live_tp_stack_pending_repair',
-                        })
-                    except Exception:
-                        pass
-                else:
-                    fc_res = _autotrade_force_close_live_position(sym, side, qty=tp_base_qty)
-                    try:
-                        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                            'tp_targets_live': tp_targets_live,
-                            'tp_slice_preview': tp_slice_preview,
-                            'tp_orders': tp_order_results,
-                            'sl_apply_res': sl_res,
-                            'sl_apply_retry_res': sl_res_retry,
-                            'sl_stack_ok': bool(sl_stack_ok),
-                            'tp_stack_ok': bool(tp_stack_ok),
-                            'pending_repair': pending_repair,
-                            'exit_stack_force_close': fc_res,
-                            'reject_reason': 'live_exit_stack_incomplete',
-                        })
-                    except Exception:
-                        pass
-                    _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_exit_stack_incomplete')
-                    try:
-                        _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason='live_exit_stack_incomplete')
-                    except Exception:
-                        pass
-                    return (False, 'live_exit_stack_incomplete')
-        else:
-            protection_pending = True
-            try:
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                    'tp_targets_live': tp_targets_live,
-                    'tp_slice_preview': tp_slice_preview,
-                    'tp_orders': [],
-                    'sl_apply_res': {'retCode': -2, 'retMsg': 'position_visibility_pending'},
-                    'sl_stack_ok': False,
-                    'tp_stack_ok': False,
-                    'protection_pending': True,
-                    'warning': 'live_position_visibility_pending',
-                })
-            except Exception:
-                pass
-
-        repair_res = _autotrade_repair_live_exit_protection(uid, {
-            'symbol': sym,
-            'side': side,
-            'entry': float(_pos_entry(final_pos) or price_ref) if final_pos else float(price_ref),
-            'sl': float(sl_for_order),
-            'tp1': float(live_partial_tp or 0.0),
-            'tp2': float(live_tp2 or 0.0),
-            'tp3': float(live_tp3 or 0.0),
-            'qty': float(tp_base_qty if tp_base_qty > 0 else qty),
-            'conf': int(getattr(s, 'conf', 0) or 0),
-            'quality_score': float(getattr(s, 'quality_score', 0.0) or 0.0),
-            'atr_pct': float(getattr(s, 'atr_pct', 0.0) or 0.0),
-            'engine': str(getattr(s, 'engine', '') or ''),
-            'session': str(session_label or ''),
-        }, live_pos=final_pos)
-
-        try:
+        sl_res = _autotrade_apply_position_tp_sl(sym, sl_for_order, live_final_tp)
+        time.sleep(0.40)
+        final_pos = _autotrade_find_live_position(sym, side=side) or final_pos
+        sl_live = float(_pos_stop(final_pos) or _bybit_detect_open_sl_price(sym, side=side) or 0.0) if final_pos else 0.0
+        tp_live = float(_pos_take_profit(final_pos) or 0.0) if final_pos else 0.0
+        sl_ok = bool(sl_for_order > 0 and sl_live > 0 and _price_close_enough(sl_live, sl_for_order, rel_tol=0.0020))
+        tp_ok = bool(live_final_tp > 0 and tp_live > 0 and _price_close_enough(tp_live, live_final_tp, rel_tol=0.0020))
+        if not (sl_ok and tp_ok):
+            sl_res_retry = _autotrade_apply_position_tp_sl(sym, sl_for_order, live_final_tp)
+            time.sleep(0.45)
+            final_pos = _autotrade_find_live_position(sym, side=side) or final_pos
+            sl_live = float(_pos_stop(final_pos) or _bybit_detect_open_sl_price(sym, side=side) or 0.0) if final_pos else 0.0
+            tp_live = float(_pos_take_profit(final_pos) or 0.0) if final_pos else 0.0
+            sl_ok = bool(sl_for_order > 0 and sl_live > 0 and _price_close_enough(sl_live, sl_for_order, rel_tol=0.0020))
+            tp_ok = bool(live_final_tp > 0 and tp_live > 0 and _price_close_enough(tp_live, live_final_tp, rel_tol=0.0020))
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                'tp_orders': tp_order_results,
-                'tp_success_count': int(sum(1 for x in (tp_order_results or []) if bool(x.get('ok')))),
-                'protection_repair': repair_res,
+                'sl_apply_res': sl_res,
+                'sl_apply_retry_res': sl_res_retry,
+                'tp_apply_res': sl_res,
+                'sl_stack_ok': bool(sl_ok),
+                'tp_stack_ok': bool(tp_ok),
             })
-        except Exception:
-            pass
+        else:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'sl_apply_res': sl_res,
+                'tp_apply_res': sl_res,
+                'sl_stack_ok': bool(sl_ok),
+                'tp_stack_ok': bool(tp_ok),
+            })
 
-        qty_for_db = tp_base_qty if tp_base_qty > 0 else qty
-        s_live = replace(s,
-            tp1=float(exit_plan.get('effective_tp1') or live_partial_tp or getattr(s, 'tp1', 0.0) or 0.0),
-            tp2=float(live_tp2 or getattr(s, 'tp2', 0.0) or getattr(s, 'tp3', 0.0) or 0.0),
-            tp3=float(live_tp3 or getattr(s, 'tp3', 0.0) or getattr(s, 'tp2', 0.0) or 0.0),
-        )
-        trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason=('live_opened_pending_tp_repair' if protection_pending else 'live_opened'))
+        if not (sl_ok and tp_ok):
+            _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_exit_stack_incomplete')
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_exit_stack_incomplete'})
+            except Exception:
+                pass
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason='live_exit_stack_incomplete')
+            except Exception:
+                pass
+            return (False, 'live_exit_stack_incomplete')
+
+        s_live = replace(s, tp1=float(live_final_tp or 0.0), tp2=0.0, tp3=0.0)
+        trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened')
         _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
         try:
-            _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='executed_open', last_reason=('live_opened_pending_tp_repair' if protection_pending else 'live_opened'))
+            _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='executed_open', last_reason='live_opened')
         except Exception:
             pass
         suffix = ' corrected_for_post_fill_risk' if corrected else ''
-        if protection_pending:
-            suffix = f"{suffix} pending_tp_repair".strip()
-            if suffix and not suffix.startswith(' '):
-                suffix = ' ' + suffix
-        return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty_for_db:.8g} SL={sl_for_order} TP1={live_partial_tp:g} finalTP={live_final_tp:g}{suffix}")
+        return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty_for_db:.8g} SL={sl_for_order} TP={live_final_tp:g}{suffix}")
 
     except Exception as e:
         _autotrade_exec_mark(reserved_keys, 'FAILED', f'{type(e).__name__}: {e}')
@@ -7076,18 +6755,18 @@ def _learning_status_text() -> str:
         SEP,
         "Outcome learning (last 60d)",
         f"Stage-learning source: emailed setup outcomes with TP-stage resolution | sample {int(stage.get('decided') or 0)} decided",
-        f"TP1: {int(stage.get('tp1_only') or 0)} | TP2: {int(stage.get('tp2_plus') or 0)} | SL: {int(stage.get('losses') or 0)} | OPEN: {int(stage.get('open') or 0)}",
+        f"TP: {int(stage.get('tp1_only') or 0) + int(stage.get('tp2_plus') or 0)} | SL: {int(stage.get('losses') or 0)} | OPEN: {int(stage.get('open') or 0)}",
         f"Weighted TP accuracy: {float(stage.get('weighted_win_rate') or 0.0):.1f}% | Avg staged credit/trade: {float(stage.get('avg_weighted_credit') or 0.0):.2f}",
         f"Live autotrade closes available: {int(live.get('closed') or 0)} | Net PnL: ${float(live.get('net_pnl') or 0.0):+.2f} | Win rate: {float(live.get('win_rate') or 0.0):.1f}%",
-        f"Lifecycle 30d: TP1 hits {int(lifecycle.get('tp1_hits') or 0)} | TP2 conversion {float(lifecycle.get('tp2_conversion_after_tp1') or 0.0):.1f}% | Risk-free save {float(lifecycle.get('risk_free_save_rate') or 0.0):.1f}% | Avg TP1 {_trade_lifecycle_fmt_duration(lifecycle.get('avg_time_to_tp1_sec'))}",
+        f"Lifecycle 30d: TP hits {int(lifecycle.get('tp1_hits') or 0) + int(lifecycle.get('tp2_hits') or 0)} | Avg TP {_trade_lifecycle_fmt_duration(lifecycle.get('avg_time_to_tp1_sec') or lifecycle.get('avg_time_to_tp2_sec'))}",
         *_trade_lifecycle_analytics_lines(lifecycle, heading='Lifecycle optimization feed (30d)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2),
-        f"Breakeven after TP1: {str(be.get('recommendation') or 'NEUTRAL')} | TP1+ sample: {int(be.get('sample_tp1_plus') or 0)} | TP1-only share: {float(be.get('tp1_only_share') or 0.0):.1f}%",
-        f"Why: {str(be.get('explanation') or 'Not enough TP1-path data yet.')}",
+        f"Single-TP mode: break-even logic disabled | TP sample: {int(be.get('sample_tp1_plus') or 0)}",
+        f"Why: single take profit is now used across signals, autotrade, and reporting.",
         SEP,
         "What is automatic now",
         f"• Runtime parameter changes: {'YES' if optimizer_live_changes or opt_promoted else 'YES, but no change has been promoted yet'}",
         "• Closed-trade PnL is already used automatically for day-risk accounting and admin reports.",
-        "• TP-stage learning is automatic through stored signal outcomes and now feeds the live conditional break-even-after-TP1 rule.",
+        "• Signal learning now uses a simpler TP / SL outcome model.",
         "• Zero-touch autopilot now re-tests shortlisted parameter sets across 7d / 14d / 21d / 30d windows before any live promotion.",
         "• Daily market-adaptive tuning now runs a bounded 30d universe backtest loop and auto-adjusts live runtime parameters with automatic revert if the score gets worse.",
         "• The bot does NOT rewrite its own source code or GitHub file.",
@@ -7113,7 +6792,7 @@ def _learning_status_text() -> str:
     if int(stage.get('decided') or 0) < 20:
         manual_action = "no code change needed yet; more closed outcome data is needed before TP/SL recommendations become reliable"
     elif str(be.get('recommendation') or '').upper() == 'CONDITIONAL':
-        manual_action = "optional code redesign if you want conditional break-even-after-TP1 rules by setup quality / session / volatility"
+        manual_action = "single-TP mode is active; no break-even redesign is required"
     elif not EVOLUTION_ENABLED and not AUTONOMOUS_OPT_ENABLED:
         manual_action = "enable EVOLUTION_ENABLED and/or AUTONOMOUS_OPT_ENABLED in the environment, then redeploy"
     lines.append(f"Manual action: {manual_action}.")
@@ -9761,12 +9440,8 @@ def _trade_lifecycle_result_label(path: str) -> str:
     p = str(path or '').upper().strip()
     if p == 'HIT_SL_LOSS':
         return 'hit SL (Loss)'
-    if p == 'HIT_TP1_THEN_BE_SL':
-        return 'hit TP1 then BE SL (Partial Win / Risk-Free)'
-    if p == 'HIT_TP1_THEN_SL':
-        return 'hit TP1 then SL (Partial Win)'
-    if p == 'HIT_TP2_WIN':
-        return 'hit TP2 (Win)'
+    if p in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP2_WIN', 'HIT_TP_WIN'}:
+        return 'hit TP (Win)'
     if p == 'MANUAL_OR_UNKNOWN_CLOSE':
         return 'manual / unknown exchange close'
     if p == 'OPEN':
@@ -10551,15 +10226,15 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
     risk_free_save_rate = (risk_free / tp1_hits * 100.0) if tp1_hits > 0 else 0.0
     signs = []
     if tp1_hits >= 8 and tp2_conv < 35.0:
-        signs.append('TP2 may be too ambitious: many trades reach TP1 but do not convert to TP2.')
+        signs.append('Take profit may still be too ambitious for some symbols.')
     if closed_decided >= 8 and sl_before_tp1_rate >= 55.0:
-        signs.append('Many trades hit SL before TP1: stop may be too tight or entries too early.')
+        signs.append('Many trades hit SL before TP: stop may be too tight or entries too early.')
     avg_tp1 = (sum(durations_tp1) / len(durations_tp1)) if durations_tp1 else 0.0
     avg_sl = (sum(durations_sl) / len(durations_sl)) if durations_sl else 0.0
     if avg_sl > 0 and avg_tp1 > 0 and avg_sl > (avg_tp1 * 2.0):
-        signs.append('Losing trades hold much longer than TP1 winners: stop placement may be too wide or trade management too slow.')
+        signs.append('Losing trades hold much longer than TP winners: stop placement may be too wide or trade management too slow.')
     if tp1_hits >= 8 and risk_free_save_rate >= 25.0:
-        signs.append('Break-even after TP1 is saving a meaningful share of TP1-hit trades.')
+        signs.append('Single-TP mode is active, so break-even logic is no longer part of the trade path.')
 
     return {
         'rows': rows,
@@ -10748,19 +10423,19 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
         if tp2_hit_ts is not None and (sl_hit_ts is None or float(tp2_hit_ts) <= float(sl_hit_ts) + 120.0):
             result_path = 'HIT_TP2_WIN'
             result_label = _trade_lifecycle_result_label(result_path)
-            close_reason = 'hit TP2'
+            close_reason = 'hit TP'
             final_close_ts = float(tp2_hit_ts)
         elif sl_hit_ts is not None:
             if tp1_confirmed:
                 if be_sl_event is not None and _trade_lifecycle_is_be_or_better(side, float(be_sl_event.get('price') or 0.0), entry):
                     result_path = 'HIT_TP1_THEN_BE_SL'
                     result_label = _trade_lifecycle_result_label(result_path)
-                    close_reason = 'hit TP1 then BE SL'
+                    close_reason = 'hit TP'
                     final_close_ts = float(be_sl_event.get('ts') or sl_hit_ts)
                 else:
                     result_path = 'HIT_TP1_THEN_SL'
                     result_label = _trade_lifecycle_result_label(result_path)
-                    close_reason = 'hit TP1 then SL'
+                    close_reason = 'hit TP'
                     final_close_ts = float((non_be_sl_event or {}).get('ts') or sl_hit_ts)
             else:
                 result_path = 'HIT_SL_LOSS'
@@ -11466,22 +11141,22 @@ def _trade_lifecycle_render_row(r: dict, user: dict, show_trade_id: bool = True)
         header += f" | {setup_id}"
     lines = [header]
     lines.append(
-        f"  Entry {fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '—'} | SL {fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '—'} | TP1 {fmt_price(float(r.get('tp1') or 0.0)) if float(r.get('tp1') or 0.0) > 0 else '—'} | TP2 {fmt_price(float(r.get('tp2') or 0.0)) if float(r.get('tp2') or 0.0) > 0 else '—'}"
+        f"  Entry {fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '—'} | SL {fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '—'} | TP {fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp1'), r.get('tp2'), r.get('tp3'), str(r.get('side') or '')) or 0.0)) if float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp1'), r.get('tp2'), r.get('tp3'), str(r.get('side') or '')) or 0.0) > 0 else '—'}"
     )
     lines.append(
-        f"  RR1 {_trade_lifecycle_fmt_value(r.get('rr_tp1'), '.2f')} | RR2 {_trade_lifecycle_fmt_value(r.get('rr_tp2'), '.2f')} | Risk {_trade_lifecycle_fmt_value(r.get('risk_usdt'), '.2f')} USDT ({_trade_lifecycle_fmt_value(r.get('risk_pct'), '.2f')}%) | Conf {str(r.get('confidence') if r.get('confidence') is not None else '—')} | Q {_trade_lifecycle_fmt_value(r.get('quality_score'), '.1f')}"
+        f"  RR {_trade_lifecycle_fmt_value(r.get('rr_tp1') or r.get('rr_tp2'), '.2f')} | Risk {_trade_lifecycle_fmt_value(r.get('risk_usdt'), '.2f')} USDT ({_trade_lifecycle_fmt_value(r.get('risk_pct'), '.2f')}%) | Conf {str(r.get('confidence') if r.get('confidence') is not None else '—')} | Q {_trade_lifecycle_fmt_value(r.get('quality_score'), '.1f')}"
     )
     lines.append(
         f"  Open {open_txt} | Open Day {open_day_txt} | Open Session {str(r.get('open_session') or '—')} | Open Reason {open_reason} | Engine {engine_txt}"
     )
     lines.append(
-        f"  Result {str(r.get('result_label') or '—')} | Path {str(r.get('result_path') or '—')} | Hits {hits} | TP1 {tp1_hit_txt} | TP2 {tp2_hit_txt} | SL {sl_hit_txt} | BE Move {be_move_txt} | Risk-Free {risk_free_txt}"
+        f"  Result {str(r.get('result_label') or '—')} | Path {str(r.get('result_path') or '—')} | Hits {hits} | TP {tp1_hit_txt if tp1_hit_txt == 'YES' or tp2_hit_txt == 'YES' else 'NO'} | SL {sl_hit_txt}"
     )
     lines.append(
         f"  Close {close_txt} | Close Day {close_day_txt} | Close Session {str(r.get('close_session') or '—') if close_ts > 0 else '—'} | Reason {str(r.get('close_reason') or ('open' if str(r.get('result_path') or '').upper() == 'OPEN' else '—'))}"
     )
     lines.append(
-        f"  TP1 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp1_sec'))} | TP2 {_trade_lifecycle_fmt_duration(r.get('duration_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(r.get('duration_to_sl_sec'))} | Total {_trade_lifecycle_fmt_duration(r.get('duration_total_sec'))}"
+        f"  TP {_trade_lifecycle_fmt_duration(r.get('duration_to_tp1_sec') or r.get('duration_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(r.get('duration_to_sl_sec'))} | Total {_trade_lifecycle_fmt_duration(r.get('duration_total_sec'))}"
     )
     lines.append(
         f"  PnL {_trade_lifecycle_fmt_value(r.get('pnl_usdt'), '.2f')} USDT | R {_trade_lifecycle_fmt_value(r.get('r_multiple'), '.2f')} | {confirm_txt}" + (f" | Note {sync_note}" if sync_note else '')
@@ -11598,10 +11273,10 @@ def _trade_lifecycle_analytics_lines(analytics: dict, heading: str = 'Lifecycle 
         f"• Trades {total} | Closed {closed} | WR {float(a.get('win_rate') or 0.0):.1f}% | AvgR {float(a.get('avg_r') or 0.0):+.2f} | Net {float(a.get('net_pnl') or 0.0):+.2f} USDT"
     )
     lines.append(
-        f"• TP1 hit {tp1_hits} ({tp1_hit_rate:.1f}%) | TP2 after TP1 {float(a.get('tp2_conversion_after_tp1') or 0.0):.1f}% | SL-before-TP1 {float(a.get('sl_before_tp1_rate') or 0.0):.1f}% | Risk-free save {float(a.get('risk_free_save_rate') or 0.0):.1f}%"
+        f"• TP hit {tp1_hits + int(a.get('tp2_hits') or 0)} ({tp1_hit_rate:.1f}%) | SL hits {int(a.get('sl_hits') or 0)}"
     )
     lines.append(
-        f"• Timing: TP1 {_trade_lifecycle_fmt_duration(a.get('avg_time_to_tp1_sec'))} | TP2 {_trade_lifecycle_fmt_duration(a.get('avg_time_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(a.get('avg_time_to_sl_sec'))}"
+        f"• Timing: TP {_trade_lifecycle_fmt_duration(a.get('avg_time_to_tp1_sec') or a.get('avg_time_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(a.get('avg_time_to_sl_sec'))}"
     )
 
     if include_sessions:
@@ -11609,11 +11284,11 @@ def _trade_lifecycle_analytics_lines(analytics: dict, heading: str = 'Lifecycle 
         weak_sess_name, weak_sess = _trade_lifecycle_best_bucket(a.get('by_open_session') or {}, metric='avg_r', min_sample=2, prefer_high=False)
         if best_sess_name:
             lines.append(
-                f"• Best open session: {best_sess_name} | WR {float(best_sess.get('win_rate') or 0.0):.1f}% | AvgR {float(best_sess.get('avg_r') or 0.0):+.2f} | TP2/TP1 {float(best_sess.get('tp2_conversion_after_tp1') or 0.0):.1f}%"
+                f"• Best open session: {best_sess_name} | WR {float(best_sess.get('win_rate') or 0.0):.1f}% | AvgR {float(best_sess.get('avg_r') or 0.0):+.2f}"
             )
         if weak_sess_name:
             lines.append(
-                f"• Weakest open session: {weak_sess_name} | WR {float(weak_sess.get('win_rate') or 0.0):.1f}% | AvgR {float(weak_sess.get('avg_r') or 0.0):+.2f} | SL-before-TP1 {float(weak_sess.get('sl_before_tp1_rate') or 0.0):.1f}%"
+                f"• Weakest open session: {weak_sess_name} | WR {float(weak_sess.get('win_rate') or 0.0):.1f}% | AvgR {float(weak_sess.get('avg_r') or 0.0):+.2f}"
             )
 
     if include_engines:
@@ -11657,7 +11332,7 @@ def _trade_lifecycle_analytics_lines(analytics: dict, heading: str = 'Lifecycle 
             lines.append(f"• Top loser: {str(x.get('symbol') or '?')} | PnL {float(x.get('net_pnl') or 0.0):+.2f} | AvgR {float(x.get('avg_r') or 0.0):+.2f}")
         if tp1_fail:
             x = dict(tp1_fail[0] or {})
-            lines.append(f"• TP1-but-miss-TP2 symbol: {str(x.get('symbol') or '?')} | TP1 {int(x.get('tp1_hits') or 0)} | TP2 {int(x.get('tp2_hits') or 0)}")
+            lines.append(f"• Frequent TP symbol: {str(x.get('symbol') or '?')} | TP hits {int(x.get('tp1_hits') or 0) + int(x.get('tp2_hits') or 0)}")
 
     if include_signs and (a.get('signs') or []):
         lines.append('• Optimization signals:')
@@ -12304,13 +11979,11 @@ def fetch_ohlcv_paged(symbol: str, timeframe: str, since_ms: int, until_ms: int,
     return out
 
 def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: str = "1m") -> dict:
-    """Evaluate a setup using the canonical 2-TP model (TP1, TP2, SL, OPEN)."""
+    """Evaluate a setup using the single-TP model (TP, SL, OPEN)."""
     side = str(setup.get("side") or "").upper().strip()
     entry = float(setup.get("entry") or 0.0)
     sl = float(setup.get("sl") or 0.0)
-    tp1 = setup.get("tp1")
-    tp2 = setup.get("tp2") or setup.get("tp3")
-    t1, t2, _ = _ensure_three_tps(entry, sl, float(tp2 or 0.0), tp1, tp2, side)
+    tp = _resolve_single_tp(entry, sl, setup.get("tp1"), setup.get("tp2"), setup.get("tp3"), side)
 
     created_ts = float(setup.get("created_ts") or 0.0)
     market_symbol = str(setup.get("market_symbol") or "").strip() or _market_symbol_from_base(setup.get("symbol"))
@@ -12318,6 +11991,8 @@ def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: s
         return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "missing_market_symbol"}
     if created_ts <= 0:
         return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "missing_created_ts"}
+    if entry <= 0 or sl <= 0 or tp <= 0:
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "invalid_trade_levels"}
 
     since_ms = int(created_ts * 1000)
     until_ms = int(min(time.time(), created_ts + horizon_hours * 3600) * 1000)
@@ -12325,7 +12000,7 @@ def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: s
     if not candles:
         return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "no_ohlcv"}
 
-    t_sl_ts = t_tp1_ts = t_tp2_ts = None
+    t_sl_ts = t_tp_ts = None
     mixed_first_ts = None
     for c in candles:
         try:
@@ -12337,60 +12012,27 @@ def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: s
         ts_s = ts_ms / 1000.0
         if side == 'BUY':
             hit_sl = lo <= sl
-            hit1 = hi >= t1
-            hit2 = hi >= t2
+            hit_tp = hi >= tp
         else:
             hit_sl = hi >= sl
-            hit1 = lo <= t1
-            hit2 = lo <= t2
+            hit_tp = lo <= tp
         if hit_sl and t_sl_ts is None:
             t_sl_ts = ts_s
-        if hit1 and t_tp1_ts is None:
-            t_tp1_ts = ts_s
-        if hit2 and t_tp2_ts is None:
-            t_tp2_ts = ts_s
-        if hit_sl and (hit1 or hit2) and mixed_first_ts is None:
+        if hit_tp and t_tp_ts is None:
+            t_tp_ts = ts_s
+        if hit_sl and hit_tp and mixed_first_ts is None:
             mixed_first_ts = ts_s
-        if (t_sl_ts is not None) and (t_tp1_ts is not None) and (t_tp2_ts is not None):
+        if (t_sl_ts is not None) and (t_tp_ts is not None):
             break
 
-    if (t_sl_ts is None) and (t_tp1_ts is None) and (t_tp2_ts is None):
+    if t_sl_ts is None and t_tp_ts is None:
         return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "horizon_not_hit"}
-
-    if t_tp1_ts is None:
-        if t_sl_ts is not None:
-            first_ts, first_level = t_sl_ts, 'SL'
-        else:
-            return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "no_tp1_and_no_sl"}
-    else:
-        if (t_sl_ts is not None) and (t_sl_ts < t_tp1_ts):
-            first_ts, first_level = t_sl_ts, 'SL'
-        else:
-            first_ts, first_level = t_tp1_ts, 'TP1'
-
-    if mixed_first_ts is not None and first_ts is not None and abs(mixed_first_ts - first_ts) < 0.9:
+    if mixed_first_ts is not None and ((t_sl_ts is not None and abs(mixed_first_ts - t_sl_ts) < 0.9) or (t_tp_ts is not None and abs(mixed_first_ts - t_tp_ts) < 0.9)):
         return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "tp_and_sl_same_candle"}
-
-    def _tp_ok(tp_ts):
-        if tp_ts is None:
-            return False
-        if t_sl_ts is None:
-            return True
-        return tp_ts < t_sl_ts
-
-    best_level = 'NONE'
-    best_ts = None
-    if _tp_ok(t_tp2_ts):
-        best_level, best_ts = 'TP2', t_tp2_ts
-    elif _tp_ok(t_tp1_ts):
-        best_level, best_ts = 'TP1', t_tp1_ts
-
-    if first_level == 'SL':
-        return {"outcome": "SL", "hit_level": "SL", "hit_ts": first_ts, "best_level": best_level, "best_ts": best_ts, "note": ""}
-    if best_level == 'TP2':
-        return {"outcome": "TP2", "hit_level": "TP1", "hit_ts": first_ts, "best_level": "TP2", "best_ts": best_ts, "note": ""}
-    if best_level == 'TP1':
-        return {"outcome": "TP1", "hit_level": "TP1", "hit_ts": first_ts, "best_level": "TP1", "best_ts": best_ts, "note": ""}
+    if t_tp_ts is not None and (t_sl_ts is None or t_tp_ts < t_sl_ts):
+        return {"outcome": "TP", "hit_level": "TP", "hit_ts": t_tp_ts, "best_level": "TP", "best_ts": t_tp_ts, "note": ""}
+    if t_sl_ts is not None:
+        return {"outcome": "SL", "hit_level": "SL", "hit_ts": t_sl_ts, "best_level": "SL", "best_ts": t_sl_ts, "note": ""}
     return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "edge_case"}
 
 
@@ -13576,27 +13218,19 @@ def sl_mult_from_conf(conf: int) -> float:
     return 1.55
 
 def tp3_rr_target_from_conf(conf: int) -> float:
-    """
-    Production 2-TP final target.
-
-    Recent live evidence shows TP1s are being reached but the old final target is too ambitious.
-    Keep a second TP, but bring it materially closer so the bot can actually realize full wins.
-    """
+    """Single final TP RR target."""
     if conf >= 90:
-        return 1.95
+        return 1.70
     if conf >= 84:
-        return 1.80
+        return 1.55
     if conf >= 78:
-        return 1.65
-    return 1.50
+        return 1.40
+    return 1.30
 
 def tp_r_mults_from_conf(conf: int) -> Tuple[float, float, float]:
-    """Return a tighter 2-TP ladder while preserving the legacy 3-value signature."""
-    tp2 = tp3_rr_target_from_conf(conf)
-    tp1 = max(0.75, min(0.95, tp2 * 0.55))
-    if tp1 >= tp2:
-        tp1 = max(0.70, tp2 - 0.55)
-    return (tp1, tp2, tp2)
+    """Backward-compatible single-target RR signature."""
+    rr = tp3_rr_target_from_conf(conf)
+    return (rr, rr, rr)
 
 def compute_sl_tp(
     entry: float,
@@ -13665,31 +13299,23 @@ def multi_tp(
     rr_bonus: float = 0.0,
     tp_cap_bonus_pct: float = 0.0,
 ) -> Tuple[float, float, float]:
+    """Backward-compatible single-target TP generator.
+
+    Returns the same TP in all tuple positions so legacy callers remain safe while
+    the trading model uses just one take profit.
+    """
     if entry <= 0 or R <= 0:
         return 0.0, 0.0, 0.0
-
-    r1, r2, _legacy = tp_r_mults_from_conf(conf)
-    r2 += rr_bonus
+    rr = tp3_rr_target_from_conf(conf) + rr_bonus
     maxd = ((tp_cap_pct + tp_cap_bonus_pct) / 100.0) * entry
-    d2 = min(r2 * R, maxd)
-    d1 = min(r1 * R, d2 * (r1 / r2 if r2 > 0 else 0.5))
-
-    if side == "BUY":
-        tp1, tp2 = (entry + d1, entry + d2)
-    else:
-        tp1, tp2 = (entry - d1, entry - d2)
-
-    tp1, tp2, _ = _distinctify(tp1, tp2, tp2, entry, side)
-    return tp1, tp2, tp2
+    dist = min(rr * R, maxd)
+    tp = (entry + dist) if side == "BUY" else (entry - dist)
+    return float(tp), float(tp), float(tp)
 
 
 
 def _realized_r_option_b(outcome: str, side: str, entry: float, sl: float, tp1=None, tp2=None, tp3=None):
-    """Return realized R under the canonical 2-TP model.
-
-    TP2 is the only full win state. TP1 is a partial positive outcome but does not count as a
-    canonical win in win-rate reporting. SL is -1R.
-    """
+    """Return realized R under the single-TP model."""
     try:
         outcome = _canon_signal_outcome_label(outcome)
         entry = float(entry)
@@ -13697,6 +13323,18 @@ def _realized_r_option_b(outcome: str, side: str, entry: float, sl: float, tp1=N
         risk = abs(entry - sl)
         if risk <= 0:
             return None
+        if outcome == 'SL':
+            return -1.0
+        if outcome != 'TP':
+            return None
+        tp = _resolve_single_tp(entry, sl, tp1=tp1, tp2=tp2, tp3=tp3, side=side)
+        if tp > 0:
+            rr = abs(float(tp) - entry) / risk
+            if math.isfinite(rr) and rr > 0:
+                return float(rr)
+        return None
+    except Exception:
+        return None
         if outcome == 'SL':
             return -1.0
         tp = None
@@ -14379,69 +14017,38 @@ def _simulate_one_setup(
     max_bars: int = 96,
     move_sl_to_be_after_tp1: bool = True,
 ) -> dict:
-    """Simulate canonical 2-TP behavior (TP1, TP2, SL, OPEN/TIMEOUT).
-
-    R multiple is weighted using the live TP split collapsed into two targets.
-    If TP1 is hit and BE-after-TP1 is enabled, the remaining size is assumed to be
-    protected at entry for the rest of the trade.
-    """
+    """Simulate the single-TP model (TP, SL, TIMEOUT)."""
     entry = float(getattr(setup, 'entry', 0.0) or 0.0)
     sl = float(getattr(setup, 'sl', 0.0) or 0.0)
     side = str(getattr(setup, 'side', '') or '').upper()
-    tp1 = float(getattr(setup, 'tp1', 0.0) or 0.0)
-    tp2 = float(getattr(setup, 'tp2', 0.0) or getattr(setup, 'tp3', 0.0) or 0.0)
-    tp1, tp2, _ = _ensure_three_tps(entry, sl, float(tp2 or 0.0), tp1, tp2, side)
+    tp = _resolve_single_tp(entry, sl, getattr(setup, 'tp1', 0.0), getattr(setup, 'tp2', 0.0), getattr(setup, 'tp3', 0.0), side)
 
     R = abs(entry - sl)
-    if entry <= 0 or sl <= 0 or tp1 <= 0 or tp2 <= 0 or R <= 0:
-        return {'outcome': 'INVALID', 'R': 0.0, 'bars': 0, 'hit_tp1': False, 'hit_tp2': False}
+    if entry <= 0 or sl <= 0 or tp <= 0 or R <= 0:
+        return {'outcome': 'INVALID', 'R': 0.0, 'bars': 0, 'hit_tp1': False, 'hit_tp2': False, 'hit_tp': False}
 
-    w1, w2 = _tp_split_two_target()
-    rr1 = float(rr_to_tp(entry, sl, tp1) or 0.0)
-    rr2 = float(rr_to_tp(entry, sl, tp2) or 0.0)
+    rr = float(rr_to_tp(entry, sl, tp) or 0.0)
     end = min(len(ohlcv), start_i + max_bars)
-
-    tp1_hit = False
-    remaining_sl = sl
-    realized_r = 0.0
 
     for j in range(start_i, end):
         h = float(ohlcv[j][2]); l = float(ohlcv[j][3])
         if side == 'BUY':
-            hit_sl = l <= remaining_sl
-            hit1 = h >= tp1
-            hit2 = h >= tp2
+            hit_sl = l <= sl
+            hit_tp = h >= tp
         else:
-            hit_sl = h >= remaining_sl
-            hit1 = l <= tp1
-            hit2 = l <= tp2
+            hit_sl = h >= sl
+            hit_tp = l <= tp
 
-        if not tp1_hit:
-            if hit_sl and (hit1 or hit2):
-                return {'outcome': 'SL_FIRST', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_tp2': False}
-            if hit_sl:
-                return {'outcome': 'SL', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_tp2': False}
-            if hit2:
-                return {'outcome': 'TP2', 'R': float((w1 * rr1) + (w2 * rr2)), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': True}
-            if hit1:
-                tp1_hit = True
-                realized_r += float(w1 * rr1)
-                if move_sl_to_be_after_tp1:
-                    remaining_sl = entry
-                continue
-        else:
-            if hit2:
-                return {'outcome': 'TP2', 'R': float(realized_r + (w2 * rr2)), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': True}
-            if hit_sl:
-                if move_sl_to_be_after_tp1:
-                    return {'outcome': 'TP1_BE', 'R': float(realized_r), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': False}
-                return {'outcome': 'TP1_SL', 'R': float(realized_r - w2), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': False}
+        if hit_sl and hit_tp:
+            return {'outcome': 'SL_FIRST', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_tp2': False, 'hit_tp': False}
+        if hit_tp:
+            return {'outcome': 'TP', 'R': float(rr), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': False, 'hit_tp': True}
+        if hit_sl:
+            return {'outcome': 'SL', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_tp2': False, 'hit_tp': False}
 
     c = float(ohlcv[end - 1][4])
     rem_r = ((c - entry) / R) if side == 'BUY' else ((entry - c) / R)
-    if tp1_hit:
-        return {'outcome': 'TP1_TIMEOUT', 'R': float(realized_r + (w2 * rem_r)), 'bars': end - start_i, 'hit_tp1': True, 'hit_tp2': False}
-    return {'outcome': 'TIMEOUT', 'R': float(rem_r), 'bars': end - start_i, 'hit_tp1': False, 'hit_tp2': False}
+    return {'outcome': 'TIMEOUT', 'R': float(rem_r), 'bars': end - start_i, 'hit_tp1': False, 'hit_tp2': False, 'hit_tp': False}
 
 
 def run_backtest(
@@ -14695,8 +14302,8 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     lines.append(f"Win rate: {_fmt_num(rep.get('win_rate'), '.1f')}%")
-    lines.append(f"TP1 hit rate: {_fmt_num(rep.get('tp1_rate'), '.1f')}%")
-    lines.append(f"TP2 hit rate: {_fmt_num(rep.get('tp2_rate'), '.1f')}%")
+    lines.append(f"TP hit rate: {_fmt_num((float(rep.get('tp1_rate') or 0.0) + float(rep.get('tp2_rate') or 0.0)), '.1f')}%")
+    lines.append(f"SL / timeout balance: {_fmt_num(100.0 - (float(rep.get('tp1_rate') or 0.0) + float(rep.get('tp2_rate') or 0.0)), '.1f')}%")
     lines.append(f"Avg R: {_fmt_num(rep.get('avg_R'), '.3f')}")
     lines.append(f"Profit factor: {_fmt_num(rep.get('profit_factor'), '.2f')}")
     lines.append(f"Max DD (R): {_fmt_num(rep.get('max_drawdown_R'), '.2f')}")
@@ -14720,7 +14327,7 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not d:
                     continue
                 lines.append(
-                    f"• {sname}: setups={int(d.get('setups', 0) or 0)} | WR={float(d.get('win_rate', 0.0) or 0.0):.1f}% | TP1={float(d.get('tp1_rate', 0.0) or 0.0):.1f}% | TP2={float(d.get('tp2_rate', 0.0) or 0.0):.1f}% | AvgR={float(d.get('avg_R', 0.0) or 0.0):.2f}"
+                    f"• {sname}: setups={int(d.get('setups', 0) or 0)} | WR={float(d.get('win_rate', 0.0) or 0.0):.1f}% | TP={float(d.get('tp1_rate', 0.0) or 0.0) + float(d.get('tp2_rate', 0.0) or 0.0):.1f}% | AvgR={float(d.get('avg_R', 0.0) or 0.0):.2f}"
                 )
     except Exception:
         pass
@@ -16789,7 +16396,7 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _canon_signal_outcome_label(outcome: str, pnl: float | None = None) -> str:
-    """Canonical user-facing outcome model: TP1, TP2, SL, OPEN, UNTRACKED."""
+    """Canonical user-facing outcome model: TP, SL, OPEN, UNTRACKED."""
     o = str(outcome or '').upper().strip()
     if o in {'UNTRACKED', 'UNTRACKED_OPEN', 'SKIPPED', 'NOT_TRADED'}:
         return 'UNTRACKED'
@@ -16797,14 +16404,22 @@ def _canon_signal_outcome_label(outcome: str, pnl: float | None = None) -> str:
         pnl_f = None if pnl is None else float(pnl)
     except Exception:
         pnl_f = None
-    if o in {'TP2', 'WIN_TP2', 'WIN_TP3', 'WIN'}:
-        return 'TP2'
-    if o in {'TP1', 'WIN_TP1'}:
-        return 'TP1'
-    if o in {'SL', 'LOSS'}:
+    if o in {'TP', 'TP1', 'TP2', 'WIN_TP1', 'WIN_TP2', 'WIN_TP3', 'WIN'}:
+        return 'TP'
+    if o in {'SL', 'LOSS', 'SL_FIRST', 'TP1_SL'}:
         return 'SL'
     if o in {'BREAKEVEN', 'BE'}:
         return 'OPEN'
+    if o.startswith('MANUAL_CLOSE_POSITIVE'):
+        return 'TP'
+    if o.startswith('MANUAL_CLOSE_NEGATIVE'):
+        return 'SL'
+    if pnl_f is not None:
+        if pnl_f < 0:
+            return 'SL'
+        if pnl_f > 0:
+            return 'TP'
+    return 'OPEN'
     if o.startswith('MANUAL_CLOSE_POSITIVE'):
         return 'TP1'
     if o.startswith('MANUAL_CLOSE_NEGATIVE'):
@@ -16832,13 +16447,7 @@ def _estimate_trade_r_multiple(trade: dict) -> float | None:
 
 
 def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = None, exchange_events: list[dict] | None = None) -> str:
-    """Classify a trade into TP1 / TP2 / SL / OPEN using journal + live Bybit state.
-
-    Priority:
-    1) Explicit stored outcomes if present.
-    2) Exchange partial-close evidence or live reduced-size detection => TP1.
-    3) Closed trades use pnl/risk or exchange close events to distinguish TP1 vs TP2 / SL.
-    """
+    """Classify a trade into TP / SL / OPEN using journal + live Bybit state."""
     try:
         pnl = float(trade.get('pnl_usdt') if trade.get('pnl_usdt') is not None else trade.get('pnl') or 0.0)
     except Exception:
@@ -16846,53 +16455,19 @@ def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = Non
     raw = str(trade.get('outcome') or '').upper().strip()
     status = str(trade.get('status') or '').upper().strip()
 
-    if raw in {'WIN_TP2', 'WIN_TP3', 'TP2'}:
-        return 'TP2'
-    if raw in {'WIN_TP1', 'TP1'}:
-        return 'TP1'
+    if raw in {'WIN_TP1', 'WIN_TP2', 'WIN_TP3', 'TP1', 'TP2', 'TP'}:
+        return 'TP'
     if raw in {'LOSS', 'SL', 'SL_FIRST', 'TP1_SL'}:
         return 'SL'
 
-    # Current live position => OPEN or TP1 if partial-close evidence exists.
     if live_pos is not None or status == 'OPEN':
-        try:
-            orig_qty = abs(float(trade.get('qty') or 0.0))
-        except Exception:
-            orig_qty = 0.0
-        try:
-            live_qty = abs(_pos_size(live_pos)) if live_pos is not None else 0.0
-        except Exception:
-            live_qty = 0.0
-        try:
-            opened_ts = float(trade.get('opened_ts') or 0.0)
-        except Exception:
-            opened_ts = 0.0
-        # 1) Use actual Bybit close events first. Any positive partial close while the position is
-        #    still open means TP1 was achieved.
-        pos_partial_pnl = 0.0
-        pos_partial_qty = 0.0
-        for ev in (exchange_events or []):
-            try:
-                ev_ts = float((ev or {}).get('ts') or 0.0)
-                if opened_ts > 0 and ev_ts + 120.0 < opened_ts:
-                    continue
-                pos_partial_pnl += float((ev or {}).get('pnl') or 0.0)
-                pos_partial_qty += abs(float((ev or {}).get('qty') or 0.0))
-            except Exception:
-                continue
-        if live_pos is not None and (pos_partial_pnl > 0.0 or pos_partial_qty > 0.0):
-            return 'TP1'
-        # 2) Fallback to quantity reduction.
-        if orig_qty > 0 and live_qty > 0:
-            try:
-                partial_fraction = float(AUTOTRADE_LIVE_TP1_FRACTION or 0.65)
-            except Exception:
-                partial_fraction = 0.65
-            partial_fraction = max(0.25, min(0.85, partial_fraction))
-            qty_drop_threshold = max(orig_qty * 0.45, orig_qty * (1.0 - partial_fraction + 0.08))
-            if live_qty <= qty_drop_threshold or live_qty < orig_qty * 0.88:
-                return 'TP1'
         return 'OPEN'
+
+    if pnl > 0:
+        return 'TP'
+    if pnl < 0:
+        return 'SL'
+    return 'OPEN'
 
     # Closed trade with no explicit TP-stage label: use exchange events and realized pnl.
     if abs(pnl) < 1e-9 and exchange_events:
@@ -17712,22 +17287,22 @@ def _learning_breakeven_after_tp1_analysis(uid: int, days: int = 60) -> dict:
             'recommendation': 'WAIT',
             'sample_tp1_plus': 0,
             'tp1_only_share': 0.0,
-            'explanation': 'No TP1-hit sample yet. Keep current code until more stage data is collected.',
+            'explanation': 'Single-TP mode is active. More live sample will improve the learning summary.',
         }
     tp1_only_share = (float(tp1_only) / float(tp1_plus) * 100.0) if tp1_plus > 0 else 0.0
     tp2_plus_share = (float(tp2_plus) / float(tp1_plus) * 100.0) if tp1_plus > 0 else 0.0
     if tp1_plus < 12:
         rec = 'WAIT'
-        why = 'TP1-path sample is still small. No code change is required yet.'
+        why = 'TP-path sample is still small. No code change is required yet.'
     elif tp1_only_share >= 60.0:
         rec = 'CONDITIONAL'
-        why = 'Many TP1-hit live trades do not extend to TP2. A conditional break-even-after-TP1 rule is supported by the lifecycle data, but it should stay filtered by quality / session / volatility rather than forced globally.'
+        why = 'Single-TP mode is active, so no secondary target extension logic is needed.'
     elif tp2_plus_share >= 60.0:
         rec = 'NO_GLOBAL_CHANGE'
-        why = 'Most TP1-hit live trades continue to TP2. A global move-to-breakeven immediately after TP1 would likely cut stronger runners too early.'
+        why = 'Single-TP mode is active, so runner management beyond the first target is not needed.'
     else:
         rec = 'CONDITIONAL'
-        why = 'Results are mixed. Keep the current bounded conditional logic unless you want a stricter post-TP1 break-even policy.'
+        why = 'Results are mixed, but the single-TP model keeps execution simpler and more consistent.'
     return {
         'recommendation': rec,
         'sample_tp1_plus': int(tp1_plus),
@@ -25618,8 +25193,8 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     header = [
         f"📊 Signal Report (last {lookback_h}h)",
         HDR,
-        f"Total: {len(rows)} | Decided: {int(stats.get('decided') or 0)} | Wins (TP1/TP2): {int(stats.get('wins') or 0)} | TP2 wins: {int(stats.get('tp2_wins') or 0)} | Losses: {int(stats.get('losses') or 0)} | Win rate: {float(stats.get('win_rate') or 0.0):.1f}%",
-        f"TP1: {counts.get('TP1',0)} | TP2: {counts.get('TP2',0)} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)} | None: {counts.get('None',0)}",
+        f"Total: {len(rows)} | Decided: {int(stats.get('decided') or 0)} | TP wins: {int(stats.get('wins') or 0)} | Losses: {int(stats.get('losses') or 0)} | Win rate: {float(stats.get('win_rate') or 0.0):.1f}%",
+        f"TP: {int(counts.get('TP1',0)) + int(counts.get('TP2',0)) + int(counts.get('TP',0))} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)} | None: {counts.get('None',0)}",
         HDR,
     ]
     life_lines = _trade_lifecycle_analytics_lines(lifecycle_recent, heading=f"Exchange-backed lifecycle ({lookback_h}h)", include_sessions=True, include_engines=True, include_buckets=False, include_symbols=True, include_signs=True, max_signs=2)
@@ -25627,7 +25202,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     table = tabulate(table_rows, headers=['Session','Time','Trade','Confidence','Outcome'], tablefmt='plain', colalign=('left','left','left','right','left'))
     sess_lines = ['Session breakdown:']
     for sname, c in sorted((stats.get('by_session') or {}).items(), key=lambda kv: kv[0]):
-        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
+        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP {int(c.get('tp1') or 0) + int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
     if int(hidden_untracked_open or 0) > 0:
         sess_lines.append(f"• Hidden untracked rows: {int(hidden_untracked_open)} (no current live Bybit/autotrade match)")
     body_text = '\n'.join(header + life_lines + sess_lines)
@@ -25785,14 +25360,14 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         f'Evaluated: {evaluated} ({coverage:.1f}% coverage)',
         SEP,
         f'Completed outcomes: {int(stats.get("decided") or 0)}',
-        f'Wins (TP1/TP2): {int(stats.get("wins") or 0)} | TP2 wins: {int(stats.get("tp2_wins") or 0)} | Losses: {int(stats.get("losses") or 0)} | Signal WR: {float(stats.get("win_rate") or 0.0):.1f}%',
-        f'TP1: {counts.get("TP1",0)} | TP2: {counts.get("TP2",0)} | SL: {counts.get("SL",0)} | Open: {counts.get("OPEN",0)}',
+        f'TP wins: {int(stats.get("wins") or 0)} | Losses: {int(stats.get("losses") or 0)} | Signal WR: {float(stats.get("win_rate") or 0.0):.1f}%',
+        f'TP: {int(counts.get("TP1",0)) + int(counts.get("TP2",0)) + int(counts.get("TP",0))} | SL: {counts.get("SL",0)} | Open: {counts.get("OPEN",0)}',
     ]
     lines.extend([SEP, *_trade_lifecycle_analytics_lines(lifecycle, heading=f'Exchange-backed lifecycle ({life_days}d)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2)])
     if by_session:
         lines.extend([SEP, 'By session'])
         for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
-            lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP1 {int(c.get('tp1') or 0)} TP2 {int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
+            lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP {int(c.get('tp1') or 0) + int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
     hidden_untracked_open = int(summary.get('hidden_untracked_open') or 0)
     if hidden_untracked_open > 0:
         lines.extend([SEP, f'Hidden untracked rows: {hidden_untracked_open} (no current live Bybit/autotrade match)'])
@@ -25880,41 +25455,17 @@ def _autotrade_live_position_status(uid: int, live_pos: dict, trade_row: dict | 
     risk_est = float(_estimate_position_risk_usd(live_pos) or 0.0)
 
     expected_sl = float(trade_row.get('sl') or current_sl or 0.0)
-    expected_tp1 = 0.0
-    expected_tp2 = 0.0
-    initial_qty = abs(float(trade_row.get('qty') or 0.0))
-    partial_fraction = float(AUTOTRADE_LIVE_TP1_FRACTION)
-    if trade_row:
-        try:
-            plan = _autotrade_live_exit_plan_for_trade(trade_row)
-            expected_tp1 = float(plan.get('effective_tp1') or 0.0)
-            expected_tp2 = float(plan.get('effective_tp2') or 0.0)
-            partial_fraction = float(plan.get('partial_fraction') or AUTOTRADE_LIVE_TP1_FRACTION)
-        except Exception:
-            expected_tp1 = float(trade_row.get('tp1') or 0.0)
-            expected_tp2 = float(trade_row.get('tp2') or 0.0)
-    if expected_tp1 <= 0 and visible_tp_targets:
-        expected_tp1 = float(visible_tp_targets[0] or 0.0)
-    if expected_tp2 <= 0 and len(visible_tp_targets) >= 2:
-        expected_tp2 = float(visible_tp_targets[1] or 0.0)
+    expected_tp = _resolve_single_tp(entry_live, expected_sl, trade_row.get('tp1'), trade_row.get('tp2'), trade_row.get('tp3'), side)
+    if expected_tp <= 0 and visible_tp_targets:
+        expected_tp = float(visible_tp_targets[0] or 0.0)
 
-    tp1_hit = bool(float((lifecycle_row or {}).get('tp1_hit_ts') or 0.0) > 0.0)
-    tp2_hit = bool(float((lifecycle_row or {}).get('tp2_hit_ts') or 0.0) > 0.0)
+    tp_hit = bool(float((lifecycle_row or {}).get('tp1_hit_ts') or 0.0) > 0.0 or float((lifecycle_row or {}).get('tp2_hit_ts') or 0.0) > 0.0)
     sl_hit = bool(float((lifecycle_row or {}).get('sl_hit_ts') or 0.0) > 0.0)
-    if trade_row and initial_qty > 0 and current_qty > 0 and not tp1_hit:
-        qty_reduced = current_qty < max(initial_qty * 0.98, initial_qty - max(1e-9, initial_qty * 0.02))
-        qty_drop_threshold = max(initial_qty * 0.45, initial_qty * (1.0 - partial_fraction + 0.08))
-        tp1_hit = bool((current_qty <= qty_drop_threshold) or qty_reduced)
-    be_active = bool(tp1_hit and entry_live > 0 and current_sl > 0 and _trade_lifecycle_is_be_or_better(side, current_sl, entry_live))
-    risk_free = bool(be_active or str((lifecycle_row or {}).get('risk_free_flag') or '').upper().strip() == 'YES')
-
-    tp1_order_live = bool(expected_tp1 > 0 and _bybit_has_open_tp_order_at(sym, expected_tp1, side=side))
-    tp2_order_live = bool(expected_tp2 > 0 and _bybit_has_open_tp_order_at(sym, expected_tp2, side=side))
+    tp_order_live = bool(expected_tp > 0 and ((float(_pos_take_profit(live_pos) or 0.0) > 0 and _price_close_enough(float(_pos_take_profit(live_pos) or 0.0), expected_tp, rel_tol=0.0020)) or _bybit_has_open_tp_order_at(sym, expected_tp, side=side)))
     sl_order_live = bool(current_sl > 0 or (expected_sl > 0 and _bybit_has_open_sl_order_at(sym, expected_sl, side=side)))
 
     missing_sl = bool(expected_sl > 0 and not sl_order_live and not sl_hit)
-    missing_tp1 = bool(expected_tp1 > 0 and not tp1_hit and not tp1_order_live)
-    missing_tp2 = bool(expected_tp2 > 0 and not tp2_hit and not tp2_order_live)
+    missing_tp = bool(expected_tp > 0 and not tp_hit and not tp_order_live)
 
     opened_ts = 0.0
     open_source = ''
@@ -25936,21 +25487,25 @@ def _autotrade_live_position_status(uid: int, live_pos: dict, trade_row: dict | 
         'qty': float(current_qty or 0.0),
         'risk_est': float(risk_est or 0.0),
         'expected_sl': float(expected_sl or 0.0),
-        'expected_tp1': float(expected_tp1 or 0.0),
-        'expected_tp2': float(expected_tp2 or 0.0),
+        'expected_tp': float(expected_tp or 0.0),
+        'expected_tp1': float(expected_tp or 0.0),
+        'expected_tp2': 0.0,
         'current_sl': float(current_sl or 0.0),
         'visible_tp_targets': list(visible_tp_targets or []),
         'sl_hit': bool(sl_hit),
-        'tp1_hit': bool(tp1_hit),
-        'tp2_hit': bool(tp2_hit),
+        'tp_hit': bool(tp_hit),
+        'tp1_hit': bool(tp_hit),
+        'tp2_hit': False,
         'sl_order_live': bool(sl_order_live),
-        'tp1_order_live': bool(tp1_order_live),
-        'tp2_order_live': bool(tp2_order_live),
+        'tp_order_live': bool(tp_order_live),
+        'tp1_order_live': bool(tp_order_live),
+        'tp2_order_live': False,
         'missing_sl': bool(missing_sl),
-        'missing_tp1': bool(missing_tp1),
-        'missing_tp2': bool(missing_tp2),
-        'be_active': bool(be_active),
-        'risk_free': bool(risk_free),
+        'missing_tp': bool(missing_tp),
+        'missing_tp1': bool(missing_tp),
+        'missing_tp2': False,
+        'be_active': False,
+        'risk_free': False,
         'opened_ts': float(opened_ts or 0.0),
         'open_source': open_source,
         'lifecycle_row': dict(lifecycle_row or {}),
@@ -25972,15 +25527,12 @@ def _autotrade_render_live_position_snapshot(snapshot: dict, index: int | None =
         f"   • SL: {fmt_price(float(snapshot.get('expected_sl') or 0.0)) if float(snapshot.get('expected_sl') or 0.0) > 0 else '—'} | Hit: {_autotrade_checkbox(snapshot.get('sl_hit'))} | Live order: {_autotrade_checkbox(snapshot.get('sl_order_live'))}"
     )
     lines.append(
-        f"   • TP1: {fmt_price(float(snapshot.get('expected_tp1') or 0.0)) if float(snapshot.get('expected_tp1') or 0.0) > 0 else '—'} | Hit: {_autotrade_checkbox(snapshot.get('tp1_hit'))} | Live order: {_autotrade_checkbox(snapshot.get('tp1_order_live'))}"
+        f"   • TP: {fmt_price(float(snapshot.get('expected_tp') or 0.0)) if float(snapshot.get('expected_tp') or 0.0) > 0 else '—'} | Hit: {_autotrade_checkbox(snapshot.get('tp_hit'))} | Live order: {_autotrade_checkbox(snapshot.get('tp_order_live'))}"
     )
     lines.append(
-        f"   • TP2: {fmt_price(float(snapshot.get('expected_tp2') or 0.0)) if float(snapshot.get('expected_tp2') or 0.0) > 0 else '—'} | Hit: {_autotrade_checkbox(snapshot.get('tp2_hit'))} | Live order: {_autotrade_checkbox(snapshot.get('tp2_order_live'))}"
+        f"   • Estimated risk now: {float(snapshot.get('risk_est') or 0.0):.2f} USDT"
     )
-    lines.append(
-        f"   • Risk-free / BE: {_autotrade_checkbox(snapshot.get('risk_free'))} | Estimated risk now: {float(snapshot.get('risk_est') or 0.0):.2f} USDT"
-    )
-    missing = [name for name, flag in (('SL', snapshot.get('missing_sl')), ('TP1', snapshot.get('missing_tp1')), ('TP2', snapshot.get('missing_tp2'))) if bool(flag)]
+    missing = [name for name, flag in (('SL', snapshot.get('missing_sl')), ('TP', snapshot.get('missing_tp'))) if bool(flag)]
     if missing:
         lines.append(f"   • Protection repair pending: {', '.join(missing)}")
     if float(snapshot.get('opened_ts') or 0.0) > 0:
@@ -26008,14 +25560,13 @@ def _autotrade_render_closed_lifecycle_row_compact(row: dict, index: int | None 
     lines.append(
         f"   • SL: {fmt_price(float(row.get('sl') or 0.0)) if float(row.get('sl') or 0.0) > 0 else '—'} | Hit: {_autotrade_checkbox(float(row.get('sl_hit_ts') or 0.0) > 0)}"
     )
+    tp_val = _resolve_single_tp(float(row.get('entry') or 0.0), float(row.get('sl') or 0.0), row.get('tp1'), row.get('tp2'), row.get('tp3'), str(row.get('side') or ''))
+    tp_hit = bool(float(row.get('tp1_hit_ts') or 0.0) > 0 or float(row.get('tp2_hit_ts') or 0.0) > 0)
     lines.append(
-        f"   • TP1: {fmt_price(float(row.get('tp1') or 0.0)) if float(row.get('tp1') or 0.0) > 0 else '—'} | Hit: {_autotrade_checkbox(float(row.get('tp1_hit_ts') or 0.0) > 0)}"
+        f"   • TP: {fmt_price(float(tp_val or 0.0)) if float(tp_val or 0.0) > 0 else '—'} | Hit: {_autotrade_checkbox(tp_hit)}"
     )
     lines.append(
-        f"   • TP2: {fmt_price(float(row.get('tp2') or 0.0)) if float(row.get('tp2') or 0.0) > 0 else '—'} | Hit: {_autotrade_checkbox(float(row.get('tp2_hit_ts') or 0.0) > 0)}"
-    )
-    lines.append(
-        f"   • Risk-free / BE: {_autotrade_checkbox(str(row.get('risk_free_flag') or '').upper().strip() == 'YES')} | Close reason: {str(row.get('close_reason') or result_txt or '—')}"
+        f"   • Close reason: {str(row.get('close_reason') or result_txt or '—')}"
     )
     if float(row.get('opened_ts') or 0.0) > 0:
         lines.append(f"   • Opened: {_trade_lifecycle_time_text(float(row.get('opened_ts') or 0.0))}")
@@ -26325,7 +25876,7 @@ def _autotrade_report_overall_text_cached(owner: int) -> str:
     if weighted_total > 0:
         lines.extend([
             f"Decided: {int(weighted.get('decided') or 0)} | Weighted WR: {float(weighted.get('weighted_win_rate') or 0.0):.1f}% | Binary WR: {float(weighted.get('binary_win_rate') or 0.0):.1f}%",
-            f"TP1: {int(weighted.get('tp1_only') or 0)} | TP2: {int(weighted.get('tp2_plus') or 0)} | SL: {int(weighted.get('losses') or 0)} | Open: {int(weighted.get('open') or 0)}",
+            f"TP: {int(weighted.get('tp1_only') or 0) + int(weighted.get('tp2_plus') or 0)} | SL: {int(weighted.get('losses') or 0)} | Open: {int(weighted.get('open') or 0)}",
             f"Avg staged credit/trade: {float(weighted.get('avg_weighted_credit') or 0.0):.2f}",
         ])
     else:
@@ -26338,7 +25889,7 @@ def _autotrade_report_overall_text_cached(owner: int) -> str:
         lines.extend(["", "Session breakdown:"])
         for sess, item in sorted(by_session.items()):
             lines.append(
-                f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP1 {int(item.get('tp1_only') or 0)} TP2 {int(item.get('tp2_plus') or 0)} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
+                f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP {int(item.get('tp1_only') or 0) + int(item.get('tp2_plus') or 0)} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
             )
 
     out = "\n".join(lines)
@@ -26394,7 +25945,7 @@ def _performance_report_payload_cached(owner: int, days: int) -> dict:
         f"Closed trades: {int(overall_summary.get('closed') or 0)} | Wins: {int(overall_summary.get('wins') or 0)} | Losses: {int(overall_summary.get('losses') or 0)}",
         f"Net PnL: ${float(overall_summary.get('net') or 0.0):+.2f} | Profit factor: {_pf_txt(overall_summary.get('profit_factor'))} | Expectancy: ${float(overall_summary.get('expectancy') or 0.0):+.2f}",
         f"Realized WR: {float(overall_summary.get('win_rate') or 0.0):.1f}% | Weighted TP WR: {float(weighted_overall.get('weighted_win_rate') or 0.0):.1f}%",
-        f"TP mix: TP1 {int(weighted_overall.get('tp1_only') or 0)} | TP2 {int(weighted_overall.get('tp2_plus') or 0)} | SL {int(weighted_overall.get('losses') or 0)} | OPEN {int(weighted_overall.get('open') or 0)}",
+        f"TP mix: TP {int(weighted_overall.get('tp1_only') or 0) + int(weighted_overall.get('tp2_plus') or 0)} | SL {int(weighted_overall.get('losses') or 0)} | OPEN {int(weighted_overall.get('open') or 0)}",
     ]
     bd = overall_summary.get('best_day') or {}
     wd = overall_summary.get('worst_day') or {}
@@ -26409,7 +25960,7 @@ def _performance_report_payload_cached(owner: int, days: int) -> dict:
         SEP,
         f'RECENT ({days} day window)',
         f"Closed: {int(recent_summary.get('closed') or 0)} | Net PnL: ${float(recent_summary.get('net') or 0.0):+.2f} | Realized WR: {float(recent_summary.get('win_rate') or 0.0):.1f}%",
-        f"Weighted TP WR: {float(weighted_recent.get('weighted_win_rate') or 0.0):.1f}% | TP1 {int(weighted_recent.get('tp1_only') or 0)} | TP2 {int(weighted_recent.get('tp2_plus') or 0)} | SL {int(weighted_recent.get('losses') or 0)} | OPEN {int(weighted_recent.get('open') or 0)}",
+        f"Weighted TP WR: {float(weighted_recent.get('weighted_win_rate') or 0.0):.1f}% | TP {int(weighted_recent.get('tp1_only') or 0) + int(weighted_recent.get('tp2_plus') or 0)} | SL {int(weighted_recent.get('losses') or 0)} | OPEN {int(weighted_recent.get('open') or 0)}",
     ])
     lines.extend([SEP, *_trade_lifecycle_analytics_lines(lifecycle_recent, heading=f'Lifecycle feed ({days}d)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2), SEP, 'Daily trend'])
     for r in recent_rows:
@@ -26428,7 +25979,7 @@ def _performance_report_payload_cached(owner: int, days: int) -> dict:
 
 
 async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/autotrade_report [hours] — live journal with explicit SL / TP1 / TP2 hit state."""
+    """/autotrade_report [hours] — live journal with explicit SL / TP hit state."""
     uid = update.effective_user.id
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text("⛔️ Owner/admin only.")
@@ -26700,7 +26251,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show all open Bybit positions (admin only) with explicit SL / TP1 / TP2 state."""
+    """Show all open Bybit positions (admin only) with explicit SL / TP state."""
     uid = update.effective_user.id
     if not is_admin_user(uid):
         await update.message.reply_text("⛔️ Admin only.")
@@ -27821,14 +27372,14 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 except Exception:
                     pass
                 if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
-                    block.append(f"Type: {typ} | RR(TP1): `{rr1:.2f}` | RR(TP2): `{rr2:.2f}`")
+                    block.append(f"Type: {typ} | RR(TP): `{(rr1 or rr2 or rr3):.2f}`")
                 else:
-                    block.append(f"Type: {typ} | RR(TP2): `{rr2:.2f}`")
+                    block.append(f"Type: {typ} | RR(TP): `{(rr1 or rr2 or rr3):.2f}`")
                 block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
                 if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
-                    block.append(f"TP1: `{fmt_price(float(tp1))}` | TP2: `{fmt_price(float(tp2))}`")
+                    block.append(f"TP: `{fmt_price(float(_resolve_single_tp(entry, sl, tp1, tp2, tp3, side) or 0.0))}`")
                 else:
-                    block.append(f"TP2: `{fmt_price(tp3)}`")
+                    block.append(f"TP: `{fmt_price(float(_resolve_single_tp(entry, sl, tp1, tp2, tp3, side) or 0.0))}`")
                 block.append(
                     f"Moves: 24H {ch24:+.0f}% {_mv_dot(ch24)} • 4H {ch4:+.0f}% {_mv_dot(ch4)} • "
                     f"1H {ch1:+.0f}% {_mv_dot(ch1)} • 15m {ch15:+.0f}% {_mv_dot(ch15)}"
@@ -28367,18 +27918,17 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Signal ID not found.")
             return
 
-        tps = f"TP2 {fmt_price(float(sig['tp2'] or sig['tp3']))}"
-        if sig.get("tp1") and sig.get("tp2") and int(sig["conf"]) >= MULTI_TP_MIN_CONF:
-            tps = f"TP1 {fmt_price(float(sig['tp1']))} | TP2 {fmt_price(float(sig['tp2'] or sig['tp3']))}"
+        tp_val = _resolve_single_tp(float(sig.get('entry') or 0.0), float(sig.get('sl') or 0.0), sig.get('tp1'), sig.get('tp2'), sig.get('tp3'), str(sig.get('side') or ''))
+        tps = f"TP {fmt_price(float(tp_val or 0.0))}"
 
-        rr3 = rr_to_tp(float(sig["entry"]), float(sig["sl"]), float(sig["tp3"]))
+        rr3 = rr_to_tp(float(sig["entry"]), float(sig["sl"]), float(tp_val or 0.0))
 
         await update.message.reply_text(
             f"🔎 Signal {sig['setup_id']}\n"
             f"{sig['side']} {sig['symbol']} — Conf {sig['conf']}/100\n"
             f"Entry {fmt_price(float(sig['entry']))} | SL {fmt_price(float(sig['sl']))}\n"
             f"{tps}\n"
-            f"RR(TP2): {rr_to_tp(float(sig['entry']), float(sig['sl']), float(sig.get('tp2') or sig['tp3'])):.2f}\n"
+            f"RR(TP): {rr_to_tp(float(sig['entry']), float(sig['sl']), float(tp_val or 0.0)):.2f}\n"
             f"Chart: {tv_chart_url(sig['symbol'])}\n\n"
             f"To journal it:\n"
             f"/trade_open {sig['symbol']} {'long' if sig['side']=='BUY' else 'short'} entry {sig['entry']} sl {sig['sl']} risk usd 40 sig {sig['setup_id']}"
@@ -28453,15 +28003,10 @@ def _email_body_pretty(
 
         # ✅ "ID-" prefix
         parts.append(f"ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
-        parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP2): {rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}")
+        _tp = _resolve_single_tp(s.entry, s.sl, getattr(s, 'tp1', None), getattr(s, 'tp2', None), getattr(s, 'tp3', None), getattr(s, 'side', ''))
+        parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP): {rr_to_tp(s.entry, s.sl, float(_tp or 0.0)):.2f}")
 
-        _tp1, _tp2, _tp3 = _ensure_three_tps(s.entry, s.sl, s.tp3, getattr(s, "tp1", None), getattr(s, "tp2", None), getattr(s, "side", ""))
-        if _tp1 not in (None, 0, 0.0) and _tp2 not in (None, 0, 0.0) and _tp3 not in (None, 0, 0.0):
-            parts.append(
-                f"   TP1: {fmt_price_email(_tp1)} | TP2: {fmt_price_email(_tp2)}"
-            )
-        else:
-            parts.append(f"   TP2: {fmt_price_email(s.tp2 or s.tp3)}")
+        parts.append(f"   TP: {fmt_price_email(_tp)}")
 
         # ✅ only for t# trailing-needed setups
         if getattr(s, 'is_trailing_tp3', False):
@@ -28539,14 +28084,10 @@ def _email_body_pretty_html(
         card = []
         card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
         card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
-        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP2): <code>{rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}</code></div>")
+        _tp = _resolve_single_tp(s.entry, s.sl, getattr(s, 'tp1', None), getattr(s, 'tp2', None), getattr(s, 'tp3', None), getattr(s, 'side', ''))
+        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP): <code>{rr_to_tp(s.entry, s.sl, float(_tp or 0.0)):.2f}</code></div>")
 
-        if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
-            card.append(
-                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> &nbsp;|&nbsp; TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>"
-            )
-        else:
-            card.append(f"<div style='margin-top:4px'>TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>")
+        card.append(f"<div style='margin-top:4px'>TP: <code>{esc(fmt_price_email(_tp))}</code></div>")
 
         if s.is_trailing_tp3:
             pass
@@ -28611,14 +28152,10 @@ def _email_body_pretty_html(
         card = []
         card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
         card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
-        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP2): <code>{rr_to_tp(s.entry, s.sl, float(s.tp2 or s.tp3)):.2f}</code></div>")
+        _tp = _resolve_single_tp(s.entry, s.sl, getattr(s, 'tp1', None), getattr(s, 'tp2', None), getattr(s, 'tp3', None), getattr(s, 'side', ''))
+        card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP): <code>{rr_to_tp(s.entry, s.sl, float(_tp or 0.0)):.2f}</code></div>")
 
-        if s.tp1 and s.tp2 and s.conf >= MULTI_TP_MIN_CONF:
-            card.append(
-                f"<div style='margin-top:4px'>TP1: <code>{esc(fmt_price_email(s.tp1))}</code> &nbsp;|&nbsp; TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>"
-            )
-        else:
-            card.append(f"<div style='margin-top:4px'>TP2: <code>{esc(fmt_price_email(s.tp2 or s.tp3))}</code></div>")
+        card.append(f"<div style='margin-top:4px'>TP: <code>{esc(fmt_price_email(_tp))}</code></div>")
 
         if s.is_trailing_tp3:
             pass
@@ -30704,7 +30241,7 @@ def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
                             'tp_fixed': False,
                             'tp1_order_fixed': False,
                             'be_applied': bool(snap.get('be_active')),
-                            'pending_missing': [name for name, flag in (('SL', snap.get('missing_sl')), ('TP1', snap.get('missing_tp1')), ('TP2', snap.get('missing_tp2'))) if bool(flag)],
+                            'pending_missing': [name for name, flag in (('SL', snap.get('missing_sl')), ('TP', snap.get('missing_tp') or snap.get('missing_tp1'))) if bool(flag)],
                         })
 
         for tr in journal_open:
