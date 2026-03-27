@@ -23323,7 +23323,8 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lines.append(f"Total closed PnL: {total_closed:+.2f} USDT")
         if len(closed_rows) > 20:
             lines.append(f"Showing first 20 of {len(closed_rows)} closed trades in this window.")
-TEMP_JOIN_SENTINEL
+    await send_long_message(update, "\n".join(lines))
+
 def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
     """Journal-first reconciliation stats for performance reporting."""
     days = int(max(2, min(int(days or 7), 60)))
