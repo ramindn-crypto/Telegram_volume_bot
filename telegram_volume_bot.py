@@ -384,7 +384,7 @@ from concurrent.futures import ThreadPoolExecutor
 import functools as _functools
 
 _FAST_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("FAST_EXECUTOR_WORKERS", "8")))
-_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "2")))
+_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "4")))
 
 async def _run_in_executor(executor, fn, *args, timeout: int | None = None, **kwargs):
     loop = asyncio.get_running_loop()
@@ -6235,6 +6235,25 @@ SEP = "────────────────────"
 ALERT_LOCK = asyncio.Lock()
 SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
+AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "25") or 25)
+AUTOTRADE_GUARDIAN_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_TIMEOUT_SEC", "20") or 20)
+AUTOTRADE_GUARDIAN_MIN_GAP_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_MIN_GAP_SEC", "20") or 20)
+_LAST_AUTOTRADE_GUARDIAN_TS = 0.0
+
+def _autotrade_guardian_recent(max_age_sec: int | None = None) -> bool:
+    try:
+        max_age = int(max_age_sec or AUTOTRADE_GUARDIAN_MIN_GAP_SEC)
+        last_ts = float(_LAST_AUTOTRADE_GUARDIAN_TS or 0.0)
+        return last_ts > 0.0 and (time.time() - last_ts) < float(max_age)
+    except Exception:
+        return False
+
+def _autotrade_guardian_touch(repaired_count: int = 0) -> None:
+    global _LAST_AUTOTRADE_GUARDIAN_TS
+    try:
+        _LAST_AUTOTRADE_GUARDIAN_TS = float(time.time())
+    except Exception:
+        pass
 
 
 # =========================================================
@@ -28932,13 +28951,13 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # but Big-Move Alerts should go to anyone who has an email saved.
 
         try:
-            users_notify = list_users_notify_on()
+            users_notify = await to_thread_fast(list_users_notify_on, timeout=10)
         except Exception as e:
             logger.exception("list_users_notify_on failed: %s", e)
             users_notify = []
 
         try:
-            users_bigmove = list_users_with_email()
+            users_bigmove = await to_thread_fast(list_users_with_email, timeout=10)
         except Exception as e:
             logger.exception("list_users_with_email failed: %s", e)
             users_bigmove = []
@@ -29163,40 +29182,13 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         
 
         # -----------------------------------------------------
-        setups_by_session: Dict[str, List[Setup]] = {}
-        for sess_name in (EMAIL_BUILD_SESSIONS or ["ASIA", "LON", "NY"]):
-            try:
-                # Session pools are shared across users, so do not bind them to a stale uid
-                # leaked from an earlier loop iteration.
-                pool = await asyncio.wait_for(asyncio.to_thread(_run_coro_in_thread, build_priority_pool(best_fut, sess_name, mode="email", scan_profile=str(DEFAULT_SCAN_PROFILE), uid=None)), timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC)
-            except asyncio.TimeoutError:
-                pool = {"setups": []}
-            except Exception:
-                pool = {"setups": []}
-
-            setups = (pool.get("setups", []) or [])[:max(EMAIL_SETUPS_N * 3, 9)]
-
-            # Rule 3: Priority override (Directional Leaders/Losers first)
-            if EMAIL_PRIORITY_OVERRIDE_ON:
-                pri = _email_priority_bases(best_fut, directional_take=12)
-                setups = sorted(
-                    setups,
-                    key=lambda s: (0 if str(getattr(s, "symbol", "")).upper() in pri else 1)
-                )
-
-            setups_by_session[sess_name] = setups
-
-            for s in setups:
-                try:
-                    db_insert_signal(s)
-                except Exception:
-                    pass
-
+        # Build only the session pools that are actually needed right now.
+        # This is a major Render speed win versus rebuilding ASIA/LON/NY every minute
+        # even when no user is currently inside those sessions.
         # -----------------------------------------------------
-        # Per-user send / skip logic
-        # -----------------------------------------------------
+        notify_runtime = []
+        required_pool_sessions = []
         for user in (users_notify or []):
-            # ✅ Robust uid resolution (supports either user_id or id)
             try:
                 uid = int(user.get("user_id") or user.get("id") or 0)
             except Exception:
@@ -29204,15 +29196,12 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             if not uid:
                 continue
 
-            # ✅ Robust tz resolution (never crash job)
             tz_name = str(user.get("tz") or "UTC")
             try:
                 tz = ZoneInfo(tz_name)
             except Exception:
                 tz = timezone.utc
-                tz_name = "UTC"
 
-            # ✅ Ensure session logic never crashes job
             try:
                 sess = in_session_now(user)
             except Exception as e:
@@ -29221,6 +29210,76 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     "reasons": [f"in_session_now_failed ({type(e).__name__})"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
+                sess = None
+
+            notify_runtime.append({
+                "user": user,
+                "uid": uid,
+                "tz": tz,
+                "sess": sess,
+            })
+
+            if sess:
+                sess_name = str((sess or {}).get("name") or "").upper().strip()
+                if sess_name and sess_name not in required_pool_sessions:
+                    required_pool_sessions.append(sess_name)
+
+        setups_by_session: Dict[str, List[Setup]] = {}
+
+        async def _build_email_pool_for_session(sess_name: str) -> tuple[str, list]:
+            try:
+                pool = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _run_coro_in_thread,
+                        build_priority_pool(
+                            best_fut,
+                            sess_name,
+                            mode="email",
+                            scan_profile=str(DEFAULT_SCAN_PROFILE),
+                            uid=None,
+                        ),
+                    ),
+                    timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                pool = {"setups": []}
+            except Exception:
+                pool = {"setups": []}
+
+            setups = (pool.get("setups", []) or [])[:max(EMAIL_SETUPS_N * 3, 9)]
+            if EMAIL_PRIORITY_OVERRIDE_ON:
+                pri = _email_priority_bases(best_fut, directional_take=12)
+                setups = sorted(
+                    setups,
+                    key=lambda s: (0 if str(getattr(s, "symbol", "")).upper() in pri else 1)
+                )
+            return str(sess_name).upper(), list(setups or [])
+
+        if required_pool_sessions:
+            built_sessions = await asyncio.gather(
+                *[_build_email_pool_for_session(sess_name) for sess_name in required_pool_sessions],
+                return_exceptions=True,
+            )
+            for item in (built_sessions or []):
+                if isinstance(item, Exception):
+                    continue
+                sess_name, setups = item
+                setups_by_session[str(sess_name).upper()] = list(setups or [])
+                for s in (setups or []):
+                    try:
+                        db_insert_signal(s)
+                    except Exception:
+                        pass
+
+        # -----------------------------------------------------
+        # Per-user send / skip logic
+        # -----------------------------------------------------
+        for meta in (notify_runtime or []):
+            user = dict(meta.get("user") or {})
+            uid = int(meta.get("uid") or 0)
+            tz = meta.get("tz") or timezone.utc
+            sess = meta.get("sess")
+            if not uid:
                 continue
 
             # If user is NOT in an enabled session right now, skip
@@ -30550,7 +30609,27 @@ async def autotrade_exit_guardian_job(context: ContextTypes.DEFAULT_TYPE):
         uid = int(AUTOTRADE_OWNER_UID or 0)
         if uid <= 0:
             return
-        repaired = _autotrade_monitor_live_exit_protection(int(uid))
+        if AUTOTRADE_EXEC_LOCK.locked():
+            _hb_touch('autotrade_guardian', ok=True, details='busy_skip')
+            return
+        if _autotrade_guardian_recent():
+            _hb_touch('autotrade_guardian', ok=True, details='cooldown_skip')
+            return
+
+        async with AUTOTRADE_EXEC_LOCK:
+            try:
+                repaired = await to_thread_heavy(
+                    _autotrade_monitor_live_exit_protection,
+                    int(uid),
+                    timeout=AUTOTRADE_GUARDIAN_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                _hb_touch('autotrade_guardian', ok=False, error=f'timeout>{AUTOTRADE_GUARDIAN_TIMEOUT_SEC}s', details='guardian_timeout')
+                logger.warning('autotrade_exit_guardian_job timed out after %ss', AUTOTRADE_GUARDIAN_TIMEOUT_SEC)
+                return
+
+        repaired = list(repaired or [])
+        _autotrade_guardian_touch(len(repaired))
         if repaired:
             _LAST_AUTOTRADE_DECISION[int(uid)] = {
                 'status': 'MANAGED',
@@ -30594,8 +30673,19 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
 
         async with AUTOTRADE_EXEC_LOCK:
             # Always monitor and repair live SL/TP protection first, even outside the entry session window.
+            # Run it in the heavy worker pool so the Telegram event loop stays responsive.
             try:
-                repaired = _autotrade_monitor_live_exit_protection(int(uid))
+                repaired = []
+                if str(AUTOTRADE_MODE).lower() == 'live' and (not _autotrade_guardian_recent(max(45, AUTOTRADE_GUARDIAN_MIN_GAP_SEC * 2))):
+                    repaired = await to_thread_heavy(
+                        _autotrade_monitor_live_exit_protection,
+                        int(uid),
+                        timeout=AUTOTRADE_GUARDIAN_TIMEOUT_SEC,
+                    )
+                    _autotrade_guardian_touch(len(repaired or []))
+            except asyncio.TimeoutError:
+                repaired = []
+                logger.warning('autotrade_job inline guardian timed out after %ss', AUTOTRADE_GUARDIAN_TIMEOUT_SEC)
             except Exception:
                 repaired = []
             if repaired:
@@ -30646,7 +30736,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 pass
 
             # Select multiple recent OPEN setups and let the hardened gatekeeper choose the first tradable one.
-            db_setups = _autotrade_select_db_setups(uid, sess, lookback_hours=12, limit=5)
+            db_setups = await to_thread_fast(_autotrade_select_db_setups, uid, sess, lookback_hours=12, limit=5, timeout=8)
             attempt_summaries = [{
                 'setup_id': str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or ''),
                 'symbol': str(getattr(x, 'symbol', '') or ''),
@@ -30672,7 +30762,16 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             attempted = 0
             for cand in db_setups:
                 attempted += 1
-                ok, reason = _autotrade_place_trade(uid, sess, [cand])
+                try:
+                    ok, reason = await to_thread_heavy(
+                        _autotrade_place_trade,
+                        uid,
+                        sess,
+                        [cand],
+                        timeout=AUTOTRADE_JOB_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    ok, reason = False, f'autotrade_place_trade_timeout>{AUTOTRADE_JOB_TIMEOUT_SEC}s'
                 if ok:
                     break
                 if reason not in {
