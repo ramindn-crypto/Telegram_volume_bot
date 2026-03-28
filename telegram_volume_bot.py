@@ -15253,32 +15253,181 @@ def _evolution_recent_diagnostics(limit: int = 10, losses_only: bool = False, da
         return []
 
 
-def _evolution_latest_lessons(limit: int = 8, days: int = 30) -> list[dict]:
-    """Return the freshest lesson rows and force an on-demand refresh first."""
-    try:
-        _refresh_learning_data(int(AUTOTRADE_OWNER_UID or 0), force=True, max_age_sec=15.0)
-    except Exception:
-        try:
-            _evolution_process_new_diagnostics()
-        except Exception:
-            pass
-    rows = _evolution_recent_diagnostics(limit=max(int(limit) * 10, 80), losses_only=False, days=days)
-    rows = sorted(rows, key=lambda r: float(r.get("decided_ts") or 0.0), reverse=True)
+def _evolution_fallback_recent_lessons(limit: int = 8, days: int = 30) -> list[dict]:
+    """Build fresh lesson rows directly from current signal_outcomes and autotrade_trades.
+
+    This bypasses stale evolution_diagnostics rows when the diagnostics table has not been
+    refreshed yet, or when older March diagnostics still dominate the cached lesson surface.
+    """
+    owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+    since_ts = float(time.time() - max(1, int(days)) * 86400.0)
     out = []
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                """SELECT e.setup_id, e.session, e.emailed_ts,
+                          COALESCE(o.hit_ts, o.best_ts, o.evaluated_ts, e.emailed_ts, 0) AS decided_ts,
+                          o.outcome,
+                          s.symbol, s.market_symbol, s.side, s.created_ts, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
+                          s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id = e.setup_id
+                   JOIN signals s ON s.setup_id = e.setup_id
+                   WHERE e.user_id = ?
+                     AND COALESCE(o.hit_ts, o.best_ts, o.evaluated_ts, e.emailed_ts, 0) >= ?
+                   ORDER BY COALESCE(o.hit_ts, o.best_ts, o.evaluated_ts, e.emailed_ts, 0) DESC
+                   LIMIT ?""",
+                (int(owner_uid), float(since_ts), int(max(int(limit) * 8, 64))),
+            ).fetchall() or []
+            for row in rows:
+                r = dict(row)
+                canon = _canon_signal_outcome_label(r.get('outcome'))
+                if canon not in {'TP', 'SL'}:
+                    continue
+                decided_ts = float(r.get('decided_ts') or 0.0)
+                tags, detail, recommendation, confidence = _evolution_build_signal_diagnostic(r, r.get('session'), canon, decided_ts, source_type='signal')
+                out.append({
+                    'source_type': 'signal',
+                    'source_id': str(r.get('setup_id') or ''),
+                    'session': str(r.get('session') or ''),
+                    'symbol': str(r.get('symbol') or ''),
+                    'side': str(r.get('side') or ''),
+                    'created_ts': float(r.get('created_ts') or r.get('emailed_ts') or 0.0),
+                    'decided_ts': decided_ts,
+                    'outcome': canon,
+                    'win_flag': 1 if canon == 'TP' else 0,
+                    'tags': list(tags or []),
+                    'detail': dict(detail or {}),
+                    'recommendation': str(recommendation or ''),
+                    'confidence': float(confidence or 0.0),
+                })
+    except Exception:
+        pass
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                """SELECT trade_id, session, symbol, side, opened_ts, closed_ts, entry, sl, tp1, tp2, tp3,
+                          qty, status, note, pnl_usdt
+                   FROM autotrade_trades
+                   WHERE uid = ?
+                     AND COALESCE(closed_ts, opened_ts, 0) >= ?
+                     AND (COALESCE(closed_ts,0) > 0 OR UPPER(COALESCE(status,'')) IN ('CLOSED','WIN','LOSS','LOSE'))
+                   ORDER BY COALESCE(closed_ts, opened_ts, 0) DESC
+                   LIMIT ?""",
+                (int(owner_uid), float(since_ts), int(max(int(limit) * 6, 48))),
+            ).fetchall() or []
+            for row in rows:
+                r = dict(row)
+                outcome, decided_ts = _evolution_resolve_autotrade_outcome(r)
+                canon = _canon_signal_outcome_label(outcome, r.get('pnl_usdt'))
+                if canon not in {'TP', 'SL'}:
+                    continue
+                diag_sig = {
+                    'symbol': r.get('symbol'),
+                    'market_symbol': _market_symbol_from_base(r.get('symbol')),
+                    'side': r.get('side'),
+                    'entry': r.get('entry'),
+                    'sl': r.get('sl'),
+                    'tp1': r.get('tp1'),
+                    'tp2': r.get('tp2'),
+                    'tp3': r.get('tp3'),
+                    'created_ts': float(r.get('opened_ts') or 0.0),
+                    'ch24': 0.0,
+                    'ch4': 0.0,
+                    'ch1': 0.0,
+                    'ch15': 0.0,
+                    'fut_vol_usd': 0.0,
+                }
+                tags, detail, recommendation, confidence = _evolution_build_signal_diagnostic(diag_sig, r.get('session'), canon, decided_ts, source_type='autotrade')
+                detail['pnl_usdt'] = float(r.get('pnl_usdt') or 0.0)
+                out.append({
+                    'source_type': 'autotrade',
+                    'source_id': str(r.get('trade_id') or ''),
+                    'session': str(r.get('session') or ''),
+                    'symbol': str(r.get('symbol') or ''),
+                    'side': str(r.get('side') or ''),
+                    'created_ts': float(r.get('opened_ts') or 0.0),
+                    'decided_ts': float(decided_ts or r.get('closed_ts') or 0.0),
+                    'outcome': canon,
+                    'win_flag': 1 if canon == 'TP' else 0,
+                    'tags': list(tags or []),
+                    'detail': dict(detail or {}),
+                    'recommendation': str(recommendation or ''),
+                    'confidence': float(confidence or 0.0),
+                })
+    except Exception:
+        pass
+
+    out = sorted(out, key=lambda r: float(r.get('decided_ts') or 0.0), reverse=True)
+    dedup = []
     seen = set()
-    for r in rows:
-        try:
-            bucket = (
-                str(r.get("symbol") or "").upper().strip(),
-                str(r.get("side") or "").upper().strip(),
-                int(float(r.get("decided_ts") or 0.0) // 60),
-                str(r.get("outcome") or "").upper().strip(),
-            )
-        except Exception:
-            bucket = (str(r.get("id") or len(out)),)
+    for r in out:
+        bucket = (
+            str(r.get('source_type') or ''),
+            str(r.get('source_id') or ''),
+            str(r.get('symbol') or '').upper(),
+            str(r.get('side') or '').upper(),
+            int(float(r.get('decided_ts') or 0.0) // 60),
+            str(r.get('outcome') or '').upper(),
+        )
         if bucket in seen:
             continue
         seen.add(bucket)
+        dedup.append(r)
+        if len(dedup) >= int(limit):
+            break
+    return dedup
+
+
+def _evolution_latest_lessons(limit: int = 8, days: int = 30) -> list[dict]:
+    """Return the freshest lesson rows.
+
+    Strategy:
+    1) Try to refresh and use stored diagnostics.
+    2) Build a direct fallback from live signal_outcomes/autotrade_trades.
+    3) Prefer whichever source is actually fresher, so stale March diagnostics cannot dominate.
+    """
+    try:
+        _evolution_process_new_diagnostics()
+    except Exception:
+        pass
+    diag_rows = _evolution_recent_diagnostics(limit=max(int(limit) * 8, 64), losses_only=False, days=days)
+    fallback_rows = _evolution_fallback_recent_lessons(limit=max(int(limit) * 3, 24), days=days)
+
+    combined = []
+    for r in (diag_rows or []):
+        d = dict(r)
+        d.setdefault('tags', d.get('tags') or [])
+        d.setdefault('detail', d.get('detail') or {})
+        combined.append(d)
+    combined.extend(fallback_rows or [])
+
+    combined = sorted(combined, key=lambda r: float(r.get('decided_ts') or 0.0), reverse=True)
+    out = []
+    seen = set()
+    for r in combined:
+        try:
+            pnl_hint = (r.get('detail') or {}).get('pnl_usdt') if isinstance(r.get('detail'), dict) else None
+            canon = _canon_signal_outcome_label(r.get('outcome'), pnl_hint)
+            bucket = (
+                str(r.get('symbol') or '').upper().strip(),
+                str(r.get('side') or '').upper().strip(),
+                int(float(r.get('decided_ts') or 0.0) // 60),
+                str(canon or '').upper().strip(),
+            )
+        except Exception:
+            canon = str(r.get('outcome') or '')
+            bucket = (str(r.get('source_type') or ''), str(r.get('source_id') or ''), str(r.get('id') or len(out)))
+        if bucket in seen:
+            continue
+        seen.add(bucket)
+        r['outcome'] = canon
         out.append(r)
         if len(out) >= int(limit):
             break
@@ -15301,9 +15450,9 @@ def _evolution_tag_counter(days: int = 30, session: str | None = None, losses_on
 
 def _evolution_outcome_winloss(outcome: str) -> tuple[int, int]:
     out = str(outcome or "").upper().strip()
-    if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "TP", "WIN"):
+    if out in ("TP", "TP1", "TP2", "TP3", "TP1_BE", "TP1_TIMEOUT", "WIN_TP1", "WIN_TP2", "WIN_TP3", "WIN"):
         return (1, 0)
-    if out in ("LOSS", "SL"):
+    if out in ("SL", "LOSS", "SL_FIRST", "TP1_SL", "LOSE"):
         return (0, 1)
     return (0, 0)
 
@@ -17652,8 +17801,11 @@ async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     for r in rows[:8]:
         tags = r.get("tags") or []
         when = _fmt_dt_local(datetime.fromtimestamp(float(r.get("decided_ts") or time.time()), tz=timezone.utc))
-        lines.append(f"• {str(r.get('symbol') or '')} {str(r.get('side') or '')} | {str(r.get('session') or '')} | {when}")
-        lines.append(f"  Outcome: {str(r.get('outcome') or '')} | Tags: {', '.join(tags[:4]) if tags else '—'}")
+        src = str(r.get('source_type') or '').strip().lower()
+        src_txt = f" [{src}]" if src else ""
+        pnl_hint = (r.get('detail') or {}).get('pnl_usdt') if isinstance(r.get('detail'), dict) else None
+        lines.append(f"• {str(r.get('symbol') or '')} {str(r.get('side') or '')} | {str(r.get('session') or '')} | {when}{src_txt}")
+        lines.append(f"  Outcome: {str(_canon_signal_outcome_label(r.get('outcome'), pnl_hint) or '')} | Tags: {', '.join(tags[:4]) if tags else '—'}")
         rec = str(r.get("recommendation") or "").strip()
         if rec:
             lines.append(f"  Insight: {rec}")
