@@ -295,6 +295,7 @@ def _autotrade_migrate_tables():
 
 # ================= AUTOTRADE SESSION STORAGE =================
 def _autotrade_get_sessions():
+    default_sessions = ["NY", "ASIA"]
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
@@ -308,9 +309,14 @@ def _autotrade_get_sessions():
             row = c.fetchone()
             if row and row[0]:
                 return [s.strip().upper() for s in row[0].split(",") if s.strip()]
+            c.execute(
+                "INSERT OR REPLACE INTO autotrade_config(key,value) VALUES('sessions',?)",
+                (",".join(default_sessions),)
+            )
+            conn.commit()
     except Exception:
         pass
-    return ["NY"]
+    return list(default_sessions)
 
 def _autotrade_set_sessions(val: str):
     try:
@@ -5126,7 +5132,7 @@ def _autotrade_qty_from_risk(entry: float, sl: float, equity_usdt: float, risk_u
 def _autotrade_allowed_session(session_label: str) -> bool:
     allowed = set([s.strip().upper() for s in _autotrade_get_sessions() if s.strip()])
     if not allowed:
-        allowed = {'NY'}
+        allowed = {'NY', 'ASIA'}
     return session_label.upper() in allowed
 
 
@@ -7809,7 +7815,7 @@ def get_user(user_id: int) -> dict:
 
     if not row:
         tz_name = os.environ.get("DEFAULT_USER_TZ", "UTC")
-        sessions = ['NY']
+        sessions = ['NY', 'ASIA']
         now_local = datetime.now(ZoneInfo(tz_name)).date().isoformat()
         cur.execute("""
             INSERT INTO users (
@@ -22082,9 +22088,9 @@ def user_enabled_sessions(user: dict) -> List[str]:
         xs = json.loads(user["sessions_enabled"])
         if isinstance(xs, list) and xs:
             ordered = _order_sessions(xs)
-            return ordered or ['NY']
+            return ordered or ['NY', 'ASIA']
     except Exception:
-        return ['NY']
+        return ['NY', 'ASIA']
 
 def _session_label_utc(now_utc: datetime) -> Optional[str]:
     """
@@ -23277,9 +23283,9 @@ async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /tz America/New_York"
         )
         return
-    sessions = ['NY']
-    update_user(uid, tz=tz_name, sessions_enabled=json.dumps(sessions))
-    await update.message.reply_text(f"✅ TZ set to {tz_name}\nDefault sessions updated. Use /sessions to view.")
+    sessions = ['NY', 'ASIA']
+    update_user(uid, tz=tz_name, sessions_enabled=json.dumps(_order_sessions(sessions)))
+    await update.message.reply_text(f"✅ TZ set to {tz_name}\nDefault sessions updated to: {', '.join(_order_sessions(sessions))}. Use /sessions to view.")
 
 async def dayreset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
