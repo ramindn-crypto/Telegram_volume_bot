@@ -3,6 +3,7 @@
 # - Daily risk remaining now restores capacity from positive realized PnL and reduces it from losses.
 # - /performance_report and /autotrade_report_overall now use the canonical 2-TP outcome model for reporting.
 # - Added /performance_chart and /winrate_chart plus admin help entries.
+# - v4: made admin diagnostics non-blocking/cached, delayed heavy startup jobs, and added stale-lessons banner.
 
 
 # --- ASIA tightening (hard-coded, no env vars) ---
@@ -1338,7 +1339,7 @@ def _parse_param_value(s: str):
     return v
 
 async def cmd_params_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cfg = load_strategy_config(force=True)
+    cfg = load_strategy_config(force=False)
     pretty = json.dumps(cfg, indent=2, ensure_ascii=False, sort_keys=True)
     await send_long_message(update, f"⚙️ Strategy Params (active)\n{HDR}\n```\n{pretty}\n```", parse_mode=ParseMode.MARKDOWN)
 
@@ -6760,12 +6761,13 @@ def _refresh_learning_data(owner_uid: int, force: bool = False, max_age_sec: flo
             pass
 
 
-def _learning_status_text() -> str:
+def _learning_status_text(use_live_refresh: bool = False, sync_lifecycle: bool = False) -> str:
     owner = int(AUTOTRADE_OWNER_UID or 0)
-    try:
-        _refresh_learning_data(owner, force=False, max_age_sec=180.0)
-    except Exception:
-        pass
+    if use_live_refresh:
+        try:
+            _refresh_learning_data(owner, force=False, max_age_sec=180.0)
+        except Exception:
+            pass
     snap = _evolution_snapshot_cached() or {}
     overall = snap.get("overall") or {}
     ny = snap.get("ny") or {}
@@ -6780,7 +6782,7 @@ def _learning_status_text() -> str:
     stage = _learning_stage_outcome_summary(owner, days=60)
     be = _learning_breakeven_after_tp1_analysis(owner, days=60)
     live = _learning_live_trade_summary(owner, days=60)
-    lifecycle = _trade_lifecycle_analytics(owner, days=30, session='ALL', sync=True, force=False) if owner > 0 else {}
+    lifecycle = _trade_lifecycle_analytics(owner, days=30, session='ALL', sync=bool(sync_lifecycle), force=False) if owner > 0 else {}
 
     hourly_no_data = int(hourly.get("analyzed_setups", 0) or 0) == 0 and int(hourly.get("analyzed_trades", 0) or 0) == 0
     daily_no_data = int(daily.get("analyzed_setups", 0) or 0) == 0 and int(daily.get("analyzed_trades", 0) or 0) == 0
@@ -6860,7 +6862,7 @@ def _learning_status_text() -> str:
     lines.extend([
         SEP,
         f"Current live floors: email_quality={float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL):.1f} | screen_quality={float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN):.1f} | min_rr_tp3={float(cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3):.2f}",
-        f"Signal win rate (completed outcomes): overall {_signal_wr_display_metrics(owner).get('binary_win_rate', 0.0):.1f}% | NY {_signal_wr_display_metrics(owner, session='NY').get('binary_win_rate', 0.0):.1f}% | trend overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}",
+        f"Signal win rate (completed outcomes): overall {float(_evolution_weighted_wr_from_signal_outcomes(days=EVOLUTION_LOOKBACK_DAYS).get('wr', 0.0) or 0.0):.1f}% | NY {float(_evolution_weighted_wr_from_signal_outcomes(days=EVOLUTION_LOOKBACK_DAYS, session='NY').get('wr', 0.0) or 0.0):.1f}% | trend overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}",
         SEP,
     ])
 
@@ -15385,18 +15387,23 @@ def _evolution_fallback_recent_lessons(limit: int = 8, days: int = 30) -> list[d
     return dedup
 
 
-def _evolution_latest_lessons(limit: int = 8, days: int = 30) -> list[dict]:
+def _evolution_latest_lessons(limit: int = 8, days: int = 30, refresh: bool = False) -> list[dict]:
     """Return the freshest lesson rows.
 
     Strategy:
-    1) Try to refresh and use stored diagnostics.
+    1) Optionally refresh and use stored diagnostics.
     2) Build a direct fallback from live signal_outcomes/autotrade_trades.
     3) Prefer whichever source is actually fresher, so stale March diagnostics cannot dominate.
+
+    Notes:
+    - Command surfaces should stay fast, so refresh is OFF by default.
+    - Background evolution jobs are responsible for keeping diagnostics warm.
     """
-    try:
-        _evolution_process_new_diagnostics()
-    except Exception:
-        pass
+    if refresh:
+        try:
+            _evolution_process_new_diagnostics()
+        except Exception:
+            pass
     diag_rows = _evolution_recent_diagnostics(limit=max(int(limit) * 8, 64), losses_only=False, days=days)
     fallback_rows = _evolution_fallback_recent_lessons(limit=max(int(limit) * 3, 24), days=days)
 
@@ -16621,13 +16628,22 @@ async def evolution_daily_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _evolution_snapshot_cached() -> dict:
+    """Return the latest stored evolution snapshot without running a fresh cycle inline.
+
+    Admin status commands must stay responsive. Running a full evolution cycle here can block
+    the main event loop for seconds and starve setup-generation jobs. Background jobs are
+    responsible for refreshing the stored snapshots.
+    """
     snap = _evolution_state_get("snapshot", {}) or {}
-    if not snap:
-        try:
-            snap = _run_evolution_cycle("hourly").get("snapshot") or {}
-        except Exception:
-            snap = {}
-    return snap
+    if snap:
+        return snap
+    snap = _evolution_state_get("last_hourly_snapshot", {}) or {}
+    if snap:
+        return snap
+    snap = _evolution_state_get("last_daily_snapshot", {}) or {}
+    if snap:
+        return snap
+    return {}
 
 
 def _fmt_wr_block(title: str, item: dict) -> str:
@@ -17229,7 +17245,8 @@ async def learning_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
-    await send_long_message(update, _learning_status_text(), parse_mode=None)
+    txt = await to_thread_heavy(_learning_status_text, False, False, timeout=20)
+    await send_long_message(update, txt, parse_mode=None)
 
 
 def _signal_outcome_summary(user_id: int, session: str | None = None, days: int | None = None) -> dict:
@@ -17793,11 +17810,18 @@ async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
-    rows = await to_thread_fast(_evolution_latest_lessons, 8, 45)
+    rows = await to_thread_heavy(_evolution_latest_lessons, 8, 45, False, timeout=20)
     if not rows:
         await update.message.reply_text("No lessons learned diagnostics recorded yet.")
         return
     lines = ["📚 Lessons Learned", HDR]
+    try:
+        freshest_ts = max(float(r.get("decided_ts") or 0.0) for r in (rows or []))
+    except Exception:
+        freshest_ts = 0.0
+    if freshest_ts > 0 and (time.time() - freshest_ts) > 72 * 3600:
+        lines.append(f"• No fresh lessons were decided recently. Latest archived lesson time: {_fmt_dt_local(datetime.fromtimestamp(freshest_ts, tz=timezone.utc))}")
+        lines.append(SEP)
     for r in rows[:8]:
         tags = r.get("tags") or []
         when = _fmt_dt_local(datetime.fromtimestamp(float(r.get("decided_ts") or time.time()), tz=timezone.utc))
@@ -19681,10 +19705,6 @@ def _runtime_profile_review_probation(uid: int | None = None, force: bool = Fals
     return {'status': 'PROMOTED', 'profile': _runtime_profile_get_by_id(str(cur.get('profile_id') or '')), 'signal': sig, 'live': live}
 
 def _market_adaptive_status_snapshot() -> dict:
-    try:
-        _refresh_learning_data(int(AUTOTRADE_OWNER_UID or 0), force=False, max_age_sec=180.0)
-    except Exception:
-        pass
     cfg = load_strategy_config(force=False)
     profile = _runtime_profile_bootstrap_if_missing(cfg)
     review = _runtime_profile_review_probation(int(AUTOTRADE_OWNER_UID or 0), force=False)
@@ -19693,7 +19713,7 @@ def _market_adaptive_status_snapshot() -> dict:
     owner = int(AUTOTRADE_OWNER_UID or 0)
     life_days = int((cfg or {}).get('market_adaptive_days', 30) or 30)
     try:
-        lifecycle = _trade_lifecycle_analytics(owner, days=max(7, life_days), session='ALL', sync=True, force=False) if owner > 0 else {}
+        lifecycle = _trade_lifecycle_analytics(owner, days=max(7, life_days), session='ALL', sync=False, force=False) if owner > 0 else {}
     except Exception:
         lifecycle = {}
     return {
@@ -19898,7 +19918,7 @@ async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAU
     if not _is_admin(update):
         await update.message.reply_text('⛔ Admin only.')
         return
-    snap = await to_thread_fast(_market_adaptive_status_snapshot)
+    snap = await to_thread_heavy(_market_adaptive_status_snapshot, timeout=20)
     cfg = load_strategy_config(force=False)
     hb_state, hb_reason = _component_runtime_state('market_adaptive', max(7200, int(float((cfg or {}).get('market_adaptive_interval_hours', 24.0) or 24.0) * 7200)), enabled=_cfg_bool((cfg or {}).get('market_adaptive_enabled', True), True), no_data=False, waiting_text='waiting_for_daily_market_adaptive_cycle')
     last_run = snap.get('last_run') or {}
@@ -30998,7 +31018,7 @@ def main():
         app.job_queue.run_repeating(
             alert_job,
             interval=interval_sec,
-            first=90,
+            first=min(20, max(5, interval_sec // 2)),
             name="alert_job",
             job_kwargs={
                 "max_instances": 1,
@@ -31038,7 +31058,7 @@ def main():
             app.job_queue.run_repeating(
                 autonomous_optimize_job,
                 interval=max(3600, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 3600)),
-                first=180,
+                first=max(600, 180),
                 name="autonomous_optimize_job",
                 job_kwargs={
                     "max_instances": 1,
@@ -31051,7 +31071,7 @@ def main():
             app.job_queue.run_repeating(
                 evolution_hourly_job,
                 interval=max(900, int(EVOLUTION_HOURLY_INTERVAL_MIN * 60)),
-                first=120,
+                first=max(600, 120),
                 name="evolution_hourly_job",
                 job_kwargs={
                     "max_instances": 1,
@@ -31062,7 +31082,7 @@ def main():
             app.job_queue.run_repeating(
                 evolution_daily_job,
                 interval=max(21600, int(EVOLUTION_DAILY_INTERVAL_HOURS * 3600)),
-                first=300,
+                first=max(900, 300),
                 name="evolution_daily_job",
                 job_kwargs={
                     "max_instances": 1,
@@ -31077,7 +31097,7 @@ def main():
                 app.job_queue.run_repeating(
                     market_adaptive_daily_job,
                     interval=max(21600, int(float((_market_cfg or {}).get("market_adaptive_interval_hours", 24.0) or 24.0) * 3600)),
-                    first=max(30, int(float((_market_cfg or {}).get("market_adaptive_first_delay_sec", 45) or 45))),
+                    first=max(900, int(float((_market_cfg or {}).get("market_adaptive_first_delay_sec", 45) or 45))),
                     name="market_adaptive_daily_job",
                     job_kwargs={
                         "max_instances": 1,
@@ -31092,7 +31112,7 @@ def main():
             app.job_queue.run_repeating(
                 scan_intelligence_job,
                 interval=max(3600, int(SCAN_INTELLIGENCE_INTERVAL_MIN * 60)),
-                first=150,
+                first=max(900, 150),
                 name="scan_intelligence_job",
                 job_kwargs={
                     "max_instances": 1,
