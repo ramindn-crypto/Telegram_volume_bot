@@ -895,7 +895,7 @@ DEFAULT_TYPE = "swap"  # bybit futures
 DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
 
 CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "1"))
-MANUAL_SCREEN_SYNC_ENABLED = False  # hard-disabled: /screen is informational only
+MANUAL_SCREEN_SYNC_ENABLED = True  # /screen uses the executable lane and may sync shown setups into email/autotrade
 
 # -------------------------
 # LOGGING: redact secrets + quiet noisy libs (Render-safe)
@@ -27382,8 +27382,9 @@ _SCREEN_LOCK = asyncio.Lock()
 # Background refresh task for /screen (keeps UX instant)
 _SCREEN_REFRESH_TASK = None  # asyncio.Task
 
-# /screen is informational only. Keep recent screen cards in memory for PF- lookup,
-# but do NOT persist them into the live email/autotrade lane or reporting tables.
+# Keep recent screen cards in memory for PF- lookup.
+# /screen is built from the executable lane, but these cached cards themselves are
+# not standalone trade/report records until the normal email/autotrade sync writes them.
 RECENT_SCREEN_SIGNAL_TTL_SEC = int(os.environ.get("RECENT_SCREEN_SIGNAL_TTL_SEC", "1800"))
 _RECENT_SCREEN_SIGNALS: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
@@ -27574,45 +27575,40 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     leaders_txt = build_leaders_table(best_fut)  # fast (top by futures volume)
     up_list, dn_list = compute_directional_lists(best_fut)
 
-    # First preference: exact recent emailed setups for this user (in-memory cache).
-    # This keeps /screen visually synced with the actual email the user just received,
-    # even if the next background scan no longer rebuilds the same setup.
+    # Build the CURRENT executable pool first so /screen reflects the exact lane
+    # that email/autotrade can act on. Recent emailed items are only a fallback.
+    pool = _run_coro_in_thread(
+        build_priority_pool(
+            best_fut,
+            session,
+            mode="email",
+            scan_profile=str(DEFAULT_SCAN_PROFILE),
+            uid=uid,
+        )
+    )
     try:
-        setups = list(_recent_cached_emailed_setups(int(uid), str(session or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=min(int(SETUPS_N), 3)))
+        _raw_pool_setups = list(pool.get("setups") or [])
+        _exec_ready = []
+        for _s in _raw_pool_setups:
+            try:
+                _ok_exec, _why_exec = is_executable_setup_eligible(_s, session_name=session)
+            except Exception:
+                _ok_exec, _why_exec = False, 'screen_exec_gate_exception'
+            if _ok_exec:
+                _exec_ready.append(_s)
+        setups = _exec_ready[:max(1, int(SETUPS_N))]
     except Exception:
         setups = []
 
-    # Second preference: persisted emailed/executable lane from DB.
     if not setups:
         try:
-            setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=min(int(SETUPS_N), 3)))
+            setups = list(_recent_cached_emailed_setups(int(uid), str(session or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=max(1, int(SETUPS_N))))
         except Exception:
             setups = []
 
-    pool = {'setups': [], 'waiting': [], 'trend_watch': []}
-
-    # Only run the heavy live pool build when we do not already have a recent emailed setup to show.
     if not setups:
-        pool = _run_coro_in_thread(
-            build_priority_pool(
-                best_fut,
-                session,
-                mode="email",
-                scan_profile=str(DEFAULT_SCAN_PROFILE),
-                uid=uid,
-            )
-        )
         try:
-            _raw_pool_setups = list(pool.get("setups") or [])
-            _exec_ready = []
-            for _s in _raw_pool_setups:
-                try:
-                    _ok_exec, _why_exec = is_executable_setup_eligible(_s, session_name=session)
-                except Exception:
-                    _ok_exec, _why_exec = False, 'screen_exec_gate_exception'
-                if _ok_exec:
-                    _exec_ready.append(_s)
-            setups = _exec_ready[:min(int(SETUPS_N), 3)]
+            setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=max(1, int(SETUPS_N))))
         except Exception:
             setups = []
 
@@ -27621,8 +27617,8 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         top_setup_syms = set(str(getattr(s, 'symbol', '') or '').upper() for s in (setups or []) if getattr(s, 'symbol', None))
     except Exception:
         top_setup_syms = set()
-    # /screen is informational only. Keep recent cards in memory for PF- lookup,
-    # but do NOT log them into the live email/autotrade pipeline or reports.
+    # Keep recent cards in memory for PF- lookup. The screen itself is now built from
+    # the executable lane, but these cached cards are not report rows by themselves.
     try:
         for s in (setups or []):
             if not hasattr(s, "conf") or s.conf is None:
@@ -28183,8 +28179,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 int(update.effective_user.id),
             )
 
-            # /screen is informational only. It must never push setups into
-            # the background email/autotrade lane.
+            # /screen now renders from the executable lane. After the message is sent,
+            # the same shown setups may be synced into the normal email/autotrade flow
+            # subject to the user's runtime email/session/cap configuration.
 
             # Cache for fast subsequent /screen calls (user + session scoped)
             _SCREEN_CACHE[cache_key] = {
@@ -28214,6 +28211,36 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
         )
+
+        if MANUAL_SCREEN_SYNC_ENABLED and shown_setups:
+            try:
+                async def _run_screen_sync_once():
+                    try:
+                        res = await _screen_sync_pipeline_async(
+                            int(uid),
+                            dict(user or {}),
+                            str(live_session or ''),
+                            str(scan_session or ''),
+                            best_fut,
+                            list(shown_setups or []),
+                        )
+                        try:
+                            logger.info(
+                                "screen_sync uid=%s status=%s reason=%s",
+                                uid,
+                                str((res or {}).get('status') or ''),
+                                str((res or {}).get('reason') or ''),
+                            )
+                        except Exception:
+                            pass
+                    except Exception as sync_e:
+                        try:
+                            logger.warning("screen_sync failed uid=%s: %s", uid, sync_e)
+                        except Exception:
+                            pass
+                asyncio.create_task(_run_screen_sync_once())
+            except Exception:
+                pass
 
     except Exception as e:
         logger.exception("screen_cmd failed")
