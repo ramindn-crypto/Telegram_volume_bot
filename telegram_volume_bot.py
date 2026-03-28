@@ -7677,6 +7677,27 @@ def db_init():
     except Exception:
         pass
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS setup_pipeline_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL DEFAULT 0,
+        event_ts REAL NOT NULL DEFAULT 0,
+        stage TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT '',
+        session TEXT NOT NULL DEFAULT '',
+        mode TEXT NOT NULL DEFAULT '',
+        setup_id TEXT NOT NULL DEFAULT '',
+        symbol TEXT NOT NULL DEFAULT '',
+        side TEXT NOT NULL DEFAULT '',
+        details_json TEXT NOT NULL DEFAULT ''
+    )
+    """)
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_setup_pipeline_events_uid_ts ON setup_pipeline_events(user_id, event_ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_setup_pipeline_events_stage_ts ON setup_pipeline_events(stage, event_ts)")
+    except Exception:
+        pass
+
     # =========================================================
     # ✅ Generated setups log (screen vs email correlation)
     # =========================================================
@@ -11595,6 +11616,67 @@ def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts:
         pass
 
 
+_LAST_SETUP_PIPELINE_EVENT: Dict[str, dict] = {}
+
+
+def _setup_pipeline_event_key(user_id: int | None = None, stage: str = '', session: str = '', mode: str = '') -> str:
+    try:
+        return f"{int(user_id or 0)}::{str(stage or '').strip().lower()}::{str(session or '').strip().upper()}::{str(mode or '').strip().lower()}"
+    except Exception:
+        return f"0::{str(stage or '').strip().lower()}::{str(session or '').strip().upper()}::{str(mode or '').strip().lower()}"
+
+
+def db_log_setup_pipeline_event(user_id: int | None, stage: str, status: str, session: str = '', mode: str = '', setup_id: str = '', symbol: str = '', side: str = '', details: dict | None = None) -> None:
+    payload = dict(details or {})
+    ts = float(time.time())
+    row = {
+        'user_id': int(user_id or 0),
+        'event_ts': ts,
+        'stage': str(stage or ''),
+        'status': str(status or ''),
+        'session': str(session or ''),
+        'mode': str(mode or ''),
+        'setup_id': str(setup_id or ''),
+        'symbol': str(symbol or ''),
+        'side': str(side or ''),
+        'details_json': json.dumps(payload, separators=(",", ":"), ensure_ascii=False, sort_keys=True),
+    }
+    try:
+        _LAST_SETUP_PIPELINE_EVENT[_setup_pipeline_event_key(user_id, stage, session, mode)] = dict(row)
+        _LAST_SETUP_PIPELINE_EVENT[_setup_pipeline_event_key(user_id, 'latest', session, mode)] = dict(row)
+    except Exception:
+        pass
+    try:
+        con = db_connect()
+        cur = con.cursor()
+        cur.execute(
+            """INSERT INTO setup_pipeline_events (user_id, event_ts, stage, status, session, mode, setup_id, symbol, side, details_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(row['user_id']), float(row['event_ts']), str(row['stage']), str(row['status']),
+                str(row['session']), str(row['mode']), str(row['setup_id']), str(row['symbol']),
+                str(row['side']), str(row['details_json']),
+            ),
+        )
+        cutoff = float(time.time()) - 86400.0 * 14.0
+        cur.execute("DELETE FROM setup_pipeline_events WHERE event_ts < ?", (float(cutoff),))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+def _pipeline_top_reasons(counts: dict | Counter | None, limit: int = 5) -> dict:
+    try:
+        if isinstance(counts, Counter):
+            items = counts.most_common(int(limit))
+        else:
+            items = Counter(dict(counts or {})).most_common(int(limit))
+        return {str(k): int(v) for k, v in items}
+    except Exception:
+        return {}
+
+
 def _setup_executable_details_json(s, session: str = '') -> str:
     try:
         details = {
@@ -11731,10 +11813,17 @@ def db_list_executable_setups(user_id: int, session_name: str = '', ts_from: flo
     return [dict(r) for r in rows]
 
 
-def _persist_executable_candidates(user_id: int, session_name: str, setups: List[Setup], source_kind: str = 'executable_setups') -> None:
+def _persist_executable_candidates(user_id: int, session_name: str, setups: List[Setup], source_kind: str = 'executable_setups', mode: str = 'email') -> dict:
+    stats = {
+        'attempted': 0,
+        'persisted': 0,
+        'signal_errors': 0,
+        'queue_errors': 0,
+        'errors': [],
+    }
     try:
         if int(user_id or 0) <= 0:
-            return
+            return stats
         now_ts = float(time.time())
         sess = str(session_name or '').upper().strip()
         target_uids = [int(user_id)]
@@ -11748,17 +11837,65 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
         except Exception:
             pass
         for s in (setups or []):
+            sid = str(getattr(s, 'setup_id', '') or '').strip()
+            sym = str(getattr(s, 'symbol', '') or '').upper()
+            side = str(getattr(s, 'side', '') or '').upper()
             for _target_uid in target_uids:
+                stats['attempted'] += 1
                 try:
                     db_insert_signal(s, user_id=int(_target_uid))
-                except Exception:
-                    pass
+                except Exception as e:
+                    stats['signal_errors'] += 1
+                    if len(stats['errors']) < 6:
+                        stats['errors'].append(f"signal:{sid or sym}:{type(e).__name__}")
                 try:
-                    db_mark_executable_setup(int(_target_uid), str(getattr(s, 'setup_id', '') or ''), sess, float(now_ts), s=s, source_kind=str(source_kind or 'executable_setups'))
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                    db_mark_executable_setup(int(_target_uid), sid, sess, float(now_ts), s=s, source_kind=str(source_kind or 'executable_setups'))
+                    stats['persisted'] += 1
+                except Exception as e:
+                    stats['queue_errors'] += 1
+                    if len(stats['errors']) < 6:
+                        stats['errors'].append(f"queue:{sid or sym}:{type(e).__name__}")
+                    db_log_setup_pipeline_event(
+                        int(_target_uid),
+                        stage='executable_queue_write',
+                        status='error',
+                        session=sess,
+                        mode=str(mode or ''),
+                        setup_id=sid,
+                        symbol=sym,
+                        side=side,
+                        details={'source_kind': str(source_kind or 'executable_setups'), 'error': f'{type(e).__name__}: {e}'},
+                    )
+        if stats['queue_errors'] or stats['signal_errors']:
+            db_log_setup_pipeline_event(
+                int(user_id),
+                stage='executable_queue_write',
+                status='partial_error' if stats['persisted'] > 0 else 'error',
+                session=sess,
+                mode=str(mode or ''),
+                details=dict(stats),
+            )
+        elif stats['persisted'] > 0:
+            db_log_setup_pipeline_event(
+                int(user_id),
+                stage='executable_queue_write',
+                status='ok',
+                session=sess,
+                mode=str(mode or ''),
+                details=dict(stats),
+            )
+        return stats
+    except Exception as e:
+        stats['errors'].append(f"persist_exception:{type(e).__name__}")
+        db_log_setup_pipeline_event(
+            int(user_id or 0),
+            stage='executable_queue_write',
+            status='error',
+            session=str(session_name or ''),
+            mode=str(mode or ''),
+            details={'error': f'{type(e).__name__}: {e}', **stats},
+        )
+        return stats
 
 
 def _executable_rows_to_setup_objects(rows: List[dict], session_name: str = '') -> list:
@@ -27498,6 +27635,26 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         except Exception:
             pass
 
+    try:
+        db_log_setup_pipeline_event(
+            int(uid or 0),
+            stage='build_priority_pool',
+            status='ok' if ordered else 'empty',
+            session=str(session_name or ''),
+            mode=str(mode or ''),
+            details={
+                'setups': len(ordered or []),
+                'waiting': len(waiting_items or []),
+                'trend_watch': len(trend_watch or []),
+                'spikes': len(spike_candidates or []),
+                'spike_warnings': len(spike_warnings or []),
+                'top_rejects': _pipeline_top_reasons(dict((_rej_ctx or {}).get('__agg__') or {}), 5),
+                'make_setup_exception_count': int(((_rej_ctx or {}).get('__agg__') or {}).get('make_setup_exception', 0) or 0),
+            },
+        )
+    except Exception:
+        pass
+
     return {
         "setups": ordered,
         "waiting": waiting_items,
@@ -27679,18 +27836,23 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     # Build the CURRENT executable pool first, persist it as the authoritative
     # executable queue for this user/session, then read /screen back from that same
     # source of truth so /screen and autotrade are wired to the same lane.
-    pool = _run_coro_in_thread(
-        build_priority_pool(
-            best_fut,
-            session,
-            mode="email",
-            scan_profile=str(DEFAULT_SCAN_PROFILE),
-            uid=uid,
+    try:
+        pool = _run_coro_in_thread(
+            build_priority_pool(
+                best_fut,
+                session,
+                mode="email",
+                scan_profile=str(DEFAULT_SCAN_PROFILE),
+                uid=uid,
+            )
         )
-    )
+    except Exception as e:
+        db_log_setup_pipeline_event(int(uid), stage='build_priority_pool', status='error', session=str(session or ''), mode='screen', details={'error': f'{type(e).__name__}: {e}'})
+        pool = {'setups': [], 'waiting': [], 'trend_watch': [], 'spikes': [], 'spike_warnings': []}
     try:
         _raw_pool_setups = list(pool.get("setups") or [])
         _exec_ready = []
+        _exec_rejects = Counter()
         for _s in _raw_pool_setups:
             try:
                 _ok_exec, _why_exec = is_executable_setup_eligible(_s, session_name=session)
@@ -27698,9 +27860,15 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 _ok_exec, _why_exec = False, 'screen_exec_gate_exception'
             if _ok_exec:
                 _exec_ready.append(_s)
+            else:
+                _exec_rejects[str(_why_exec)] += 1
         if _exec_ready:
-            _persist_executable_candidates(int(uid), str(session or ''), _exec_ready, source_kind='executable_setups')
-    except Exception:
+            _persist_stats = _persist_executable_candidates(int(uid), str(session or ''), _exec_ready, source_kind='executable_setups', mode='screen')
+            db_log_setup_pipeline_event(int(uid), stage='screen_executable_pool', status='ok', session=str(session or ''), mode='screen', details={'raw_pool': len(_raw_pool_setups), 'executable_ready': len(_exec_ready), 'persisted': int((_persist_stats or {}).get('persisted') or 0), 'top_exec_rejects': _pipeline_top_reasons(_exec_rejects, 5)})
+        else:
+            db_log_setup_pipeline_event(int(uid), stage='screen_executable_pool', status='empty', session=str(session or ''), mode='screen', details={'raw_pool': len(_raw_pool_setups), 'top_exec_rejects': _pipeline_top_reasons(_exec_rejects, 5)})
+    except Exception as e:
+        db_log_setup_pipeline_event(int(uid), stage='screen_executable_pool', status='error', session=str(session or ''), mode='screen', details={'error': f'{type(e).__name__}: {e}'})
         _exec_ready = []
 
     try:
@@ -27997,7 +28165,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     screen_lane_note = ""
     try:
         if setups and any(str(getattr(s, 'source_kind', '') or '') not in {'', 'executable_setups'} for s in (setups or [])):
-            screen_lane_note = "_Showing recent queued setups while the fresh executable scan rebuilds._"
+            screen_lane_note = "_Showing recent emailed fallback setups while the current executable scan rebuilds._"
     except Exception:
         screen_lane_note = ""
 
@@ -28710,6 +28878,10 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
     sent = send_email(subject, body, user_id_for_debug=uid, body_html=body_html)
     if sent:
         try:
+            db_log_setup_pipeline_event(int(uid), stage='email_delivery', status='sent', session=str(display_session or ''), mode='email', details={'setups': len(setups or []), 'subject': str(subject or '')[:180]})
+        except Exception:
+            pass
+        try:
             now_ts = time.time()
             try:
                 owner_uid = int(AUTOTRADE_OWNER_UID or 0)
@@ -28743,6 +28915,10 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
         except Exception:
             pass
     else:
+        try:
+            db_log_setup_pipeline_event(int(uid), stage='email_delivery', status='failed', session=str(display_session or ''), mode='email', details={'setups': len(setups or []), 'subject': str(subject or '')[:180], 'smtp_error': str(_LAST_SMTP_ERROR.get(uid, 'smtp_send_failed') or 'smtp_send_failed')})
+        except Exception:
+            pass
         try:
             for s in setups:
                 try:
@@ -29361,8 +29537,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
                 )
             except asyncio.TimeoutError:
+                db_log_setup_pipeline_event(0, stage='build_priority_pool', status='timeout', session=str(sess_name or ''), mode='email', details={'timeout_sec': float(EMAIL_BUILD_POOL_TIMEOUT_SEC)})
                 pool = {"setups": []}
-            except Exception:
+            except Exception as e:
+                db_log_setup_pipeline_event(0, stage='build_priority_pool', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(e).__name__}: {e}'})
                 pool = {"setups": []}
 
             setups = (pool.get("setups", []) or [])[:max(EMAIL_SETUPS_N * 3, 9)]
@@ -29372,6 +29550,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     setups,
                     key=lambda s: (0 if str(getattr(s, "symbol", "")).upper() in pri else 1)
                 )
+            try:
+                db_log_setup_pipeline_event(0, stage='email_pool_session', status='ok' if setups else 'empty', session=str(sess_name or ''), mode='email', details={'setups': len(setups or [])})
+            except Exception:
+                pass
             return str(sess_name).upper(), list(setups or [])
 
         if required_pool_sessions:
@@ -29528,12 +29710,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
             if eligible:
                 try:
-                    _persist_executable_candidates(int(uid), str(sess_name or ''), list(eligible or []), source_kind='executable_setups')
-                except Exception:
-                    pass
+                    _persist_stats = _persist_executable_candidates(int(uid), str(sess_name or ''), list(eligible or []), source_kind='executable_setups', mode='email')
+                    db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='ok', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'persisted': int((_persist_stats or {}).get('persisted') or 0), 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
+                except Exception as e:
+                    db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(e).__name__}: {e}', 'eligible': len(eligible or []), 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
 
             if not eligible:
                 top_reasons = dict(skip_reasons_counter.most_common(3))
+                db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='empty', session=str(sess_name or ''), mode='email', details={'eligible': 0, 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
                     "reasons": ["no_setups_after_filters", f"top_reasons={top_reasons}"],
