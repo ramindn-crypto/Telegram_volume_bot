@@ -5351,6 +5351,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     intended_sl = float(getattr(s, 'sl', 0.0) or 0.0)
     sym = _bybit_linear_symbol(str(getattr(s, 'symbol', '') or '').upper())
     setup_id = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
+    reserved_keys: list[str] = []
+    runtime_lock_acquired = False
 
     try:
         _admin_setup_lifecycle_merge(
@@ -5434,6 +5436,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             return v if v > 0 else None
         except Exception:
             return None
+
     tp1 = _as_pos_float(getattr(s, 'tp1', None))
     tp2 = _as_pos_float(getattr(s, 'tp2', None))
     tp3 = _as_pos_float(getattr(s, 'tp3', None))
@@ -5481,6 +5484,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (False, 'entry_drift_too_wide')
 
     filt = _bybit_get_instr_filters(sym)
+    qty_step = filt.get('qtyStep')
     contract_size = float(filt.get('contractSize') or 1.0)
     stop_rounding = ROUND_UP if side == 'BUY' else ROUND_DOWN
     sl_for_order = _round_price_to_tick(sym, intended_sl, rounding=stop_rounding)
@@ -5667,16 +5671,91 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
 
-        exit_plan = _autotrade_live_exit_plan_for_trade(s)
-        live_final_tp = float(exit_plan.get('final_tp') or final_tp or 0.0)
+    can_open, can_open_reason, can_open_detail = _autotrade_can_open_symbol(uid, sym, side, session_label)
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'can_open_symbol': bool(can_open),
+            'can_open_reason': str(can_open_reason or ''),
+            'can_open_detail': can_open_detail,
+        })
+    except Exception:
+        pass
+    if not can_open:
         try:
-            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                'position_opened_time': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-                'live_exit_tp': float(live_final_tp or 0.0),
-                'live_tp_design': 'single_full_position_tp_sl',
-            })
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(can_open_reason), last_reason=str(can_open_reason))
         except Exception:
             pass
+        return (False, str(can_open_reason or 'blocked_before_order'))
+
+    runtime_lock_acquired = _autotrade_runtime_symbol_lock_acquire(uid, sym)
+    if not runtime_lock_acquired:
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'blocked_duplicate_inflight_lock'})
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('blocked_duplicate_inflight_lock'), last_reason='blocked_duplicate_inflight_lock')
+        except Exception:
+            pass
+        return (False, 'blocked_duplicate_inflight_lock')
+
+    ok_reserve, reserved_keys, reserve_reason = _autotrade_exec_reserve(uid, setup_id, sym, side)
+    if not ok_reserve:
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': str(reserve_reason or 'guard_reserve_failed')})
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(reserve_reason), last_reason=str(reserve_reason or 'guard_reserve_failed'))
+        except Exception:
+            pass
+        return (False, str(reserve_reason or 'guard_reserve_failed'))
+
+    exit_plan = _autotrade_live_exit_plan_for_trade(s)
+    live_final_tp = float(exit_plan.get('final_tp') or final_tp or 0.0)
+    try:
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'position_opened_time': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'live_exit_tp': float(live_final_tp or 0.0),
+            'live_tp_design': 'single_full_position_tp_sl',
+        })
+    except Exception:
+        pass
+
+    try:
+        if str(AUTOTRADE_MODE).lower() != 'live':
+            s_paper = replace(s, entry=float(price_ref), sl=float(sl_for_order), tp1=float(live_final_tp or 0.0), tp2=0.0, tp3=0.0)
+            trade_id = _autotrade_db_add_trade(uid, session_label, s_paper, float(qty), lifecycle_state='executed_open', lifecycle_reason='paper_opened')
+            _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'trade_id': str(trade_id), 'mode': 'paper'})
+            except Exception:
+                pass
+            return (True, f"[PAPER] Opened {trade_id}: {side} {sym} qty={qty:.8g} SL={sl_for_order:g} TP={live_final_tp:g}")
+
+        open_payload = {
+            'category': 'linear',
+            'symbol': sym,
+            'side': 'Buy' if side == 'BUY' else 'Sell',
+            'orderType': 'Market',
+            'qty': _fmt_qty(float(qty), qty_step),
+            'timeInForce': 'IOC',
+            'positionIdx': 0,
+            'orderLinkId': f"pf_op_{sym}_{int(time.time()*1000)%100000000}_{uuid.uuid4().hex[:6]}"[:36],
+        }
+        open_res = _bybit_v5_request('POST', '/v5/order/create', open_payload)
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'open_payload': open_payload, 'open_res': open_res})
+        except Exception:
+            pass
+        if int((open_res or {}).get('retCode', -1)) != 0:
+            err = f"{(open_res or {}).get('retCode')} {(open_res or {}).get('retMsg')}"
+            _autotrade_exec_mark(reserved_keys, 'FAILED', err)
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('exchange_reject'), last_reason=str(err))
+            except Exception:
+                pass
+            return (False, f'live_open_failed ({err})')
 
         corrected = False
         open_order_result = ((open_res or {}).get('result') or {})
@@ -5741,8 +5820,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 }
                 reduce_res = _bybit_v5_request('POST', '/v5/order/create', reduce_payload)
                 _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reduce_payload': reduce_payload, 'reduce_res': reduce_res})
-                if int(reduce_res.get('retCode', -1)) != 0:
-                    err = f"{reduce_res.get('retCode')} {reduce_res.get('retMsg')}"
+                if int((reduce_res or {}).get('retCode', -1)) != 0:
+                    err = f"{(reduce_res or {}).get('retCode')} {(reduce_res or {}).get('retMsg')}"
                     _autotrade_exec_mark(reserved_keys, 'FAILED', f'post_fill_risk_breach_reduce_failed:{err}')
                     return (False, f'post_fill_risk_breach_reduce_failed ({err})')
                 corrected = True
@@ -5806,7 +5885,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 pass
             return (False, 'live_exit_stack_incomplete')
 
-        s_live = replace(s, tp1=float(live_final_tp or 0.0), tp2=0.0, tp3=0.0)
+        s_live = replace(s, entry=float(filled_entry or price_ref), sl=float(sl_for_order), tp1=float(live_final_tp or 0.0), tp2=0.0, tp3=0.0)
         trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened')
         _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
         try:
@@ -5814,10 +5893,13 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         except Exception:
             pass
         suffix = ' corrected_for_post_fill_risk' if corrected else ''
-        return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty_for_db:.8g} SL={sl_for_order} TP={live_final_tp:g}{suffix}")
+        return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty_for_db:.8g} SL={sl_for_order:g} TP={live_final_tp:g}{suffix}")
 
     except Exception as e:
-        _autotrade_exec_mark(reserved_keys, 'FAILED', f'{type(e).__name__}: {e}')
+        try:
+            _autotrade_exec_mark(reserved_keys, 'FAILED', f'{type(e).__name__}: {e}')
+        except Exception:
+            pass
         return (False, f'autotrade_execution_error:{type(e).__name__}')
     finally:
         if runtime_lock_acquired:
@@ -27879,11 +27961,6 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     if not setups and _exec_ready:
         setups = list(_exec_ready[:max(1, int(SETUPS_N))])
 
-    if not setups:
-        try:
-            setups = list(_recent_cached_emailed_setups(int(uid), str(session or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=max(1, int(SETUPS_N))))
-        except Exception:
-            setups = []
 
     # For UX: do not show the same symbol in Momentum Watch if it's already a Top Setup
     try:
@@ -28928,7 +29005,7 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                         session=str(display_session or ''),
                         symbol=str(getattr(s, 'symbol', '') or ''),
                         side=str(getattr(s, 'side', '') or ''),
-                        state='email_failed_not_executable',
+                        state='email_failed',
                         last_reason='smtp_send_failed',
                     )
                 except Exception:
