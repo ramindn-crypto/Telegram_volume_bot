@@ -295,7 +295,7 @@ def _autotrade_migrate_tables():
 
 # ================= AUTOTRADE SESSION STORAGE =================
 def _autotrade_get_sessions():
-    default_sessions = ["NY", "ASIA"]
+    default_sessions = ["NY", "LON", "ASIA"]
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
@@ -7792,12 +7792,9 @@ def db_init():
     con.close()
 
 def _default_sessions_for_tz(tz_name: str) -> List[str]:
-    s = tz_name.lower()
-    if "america" in s or s.startswith("us/") or "new_york" in s:
-        return ["NY"]
-    if "europe" in s or "london" in s or "africa" in s:
-        return ["LON"]
-    return ["ASIA"]
+    # Default-enabled trading sessions for signaling.
+    # Users can still deactivate any of them via /sessions_off.
+    return ["NY", "LON", "ASIA"]
 
 def _order_sessions(xs: List[str]) -> List[str]:
     cleaned = []
@@ -7815,7 +7812,7 @@ def get_user(user_id: int) -> dict:
 
     if not row:
         tz_name = os.environ.get("DEFAULT_USER_TZ", "UTC")
-        sessions = ['NY', 'ASIA']
+        sessions = ['NY', 'LON', 'ASIA']
         now_local = datetime.now(ZoneInfo(tz_name)).date().isoformat()
         cur.execute("""
             INSERT INTO users (
@@ -23283,7 +23280,7 @@ async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /tz America/New_York"
         )
         return
-    sessions = ['NY', 'ASIA']
+    sessions = ['NY', 'LON', 'ASIA']
     update_user(uid, tz=tz_name, sessions_enabled=json.dumps(_order_sessions(sessions)))
     await update.message.reply_text(f"✅ TZ set to {tz_name}\nDefault sessions updated to: {', '.join(_order_sessions(sessions))}. Use /sessions to view.")
 
