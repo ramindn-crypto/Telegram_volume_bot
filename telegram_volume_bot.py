@@ -15151,14 +15151,54 @@ def _evolution_list_open_recommendations(limit: int = 8) -> list[dict]:
 def _evolution_store_diagnostic(processed_key: str, source_type: str, source_id: str, session: str, symbol: str, side: str,
                                 created_ts: float, decided_ts: float, outcome: str, win_flag: bool,
                                 tags: list[str], detail: dict, recommendation: str, confidence: float) -> bool:
+    """Insert or refresh one learning diagnostic row.
+
+    Important: diagnostics must be refreshable. A setup/trade can be discovered earlier and then
+    later receive a fresher decided_ts or a corrected TP/SL outcome after exchange sync. The older
+    implementation used INSERT OR IGNORE which permanently froze the first lesson row and caused
+    /lessons_learned to keep showing stale March rows even after newer outcomes existed.
+    """
     _evolution_migrate_tables()
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
+            existing = c.execute(
+                "SELECT decided_ts, outcome, tags_json, recommendation FROM evolution_diagnostics WHERE processed_key=? LIMIT 1",
+                (str(processed_key),),
+            ).fetchone()
+            existing_decided = float((existing[0] if existing else 0.0) or 0.0)
+            existing_outcome = str((existing[1] if existing else '') or '').upper().strip()
+            existing_tags = str((existing[2] if existing else '') or '')
+            existing_rec = str((existing[3] if existing else '') or '')
+            new_tags_json = _json_dumps_safe(tags or [])
+            should_update = bool(
+                (existing is None)
+                or float(decided_ts or 0.0) > existing_decided + 1.0
+                or str(outcome or '').upper().strip() != existing_outcome
+                or new_tags_json != existing_tags
+                or str(recommendation or '') != existing_rec
+            )
+            if not should_update:
+                return False
             c.execute(
-                """INSERT OR IGNORE INTO evolution_diagnostics
+                """INSERT INTO evolution_diagnostics
                    (processed_key, source_type, source_id, session, symbol, side, created_ts, decided_ts, outcome, win_flag, tags_json, detail_json, recommendation, confidence, inserted_ts)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(processed_key) DO UPDATE SET
+                       source_type=excluded.source_type,
+                       source_id=excluded.source_id,
+                       session=excluded.session,
+                       symbol=excluded.symbol,
+                       side=excluded.side,
+                       created_ts=excluded.created_ts,
+                       decided_ts=excluded.decided_ts,
+                       outcome=excluded.outcome,
+                       win_flag=excluded.win_flag,
+                       tags_json=excluded.tags_json,
+                       detail_json=excluded.detail_json,
+                       recommendation=excluded.recommendation,
+                       confidence=excluded.confidence,
+                       inserted_ts=excluded.inserted_ts""",
                 (
                     str(processed_key),
                     str(source_type),
@@ -15170,7 +15210,7 @@ def _evolution_store_diagnostic(processed_key: str, source_type: str, source_id:
                     float(decided_ts or 0.0),
                     str(outcome or ""),
                     1 if bool(win_flag) else 0,
-                    _json_dumps_safe(tags or []),
+                    new_tags_json,
                     _json_dumps_safe(detail or {}),
                     str(recommendation or ""),
                     float(confidence or 0.0),
@@ -15178,7 +15218,7 @@ def _evolution_store_diagnostic(processed_key: str, source_type: str, source_id:
                 ),
             )
             conn.commit()
-            return int(c.rowcount or 0) > 0
+            return True
     except Exception:
         return False
 
@@ -15216,13 +15256,13 @@ def _evolution_recent_diagnostics(limit: int = 10, losses_only: bool = False, da
 def _evolution_latest_lessons(limit: int = 8, days: int = 30) -> list[dict]:
     """Return the freshest lesson rows and force an on-demand refresh first."""
     try:
-        _refresh_learning_data(int(AUTOTRADE_OWNER_UID or 0), force=False, max_age_sec=120.0)
+        _refresh_learning_data(int(AUTOTRADE_OWNER_UID or 0), force=True, max_age_sec=15.0)
     except Exception:
         try:
             _evolution_process_new_diagnostics()
         except Exception:
             pass
-    rows = _evolution_recent_diagnostics(limit=max(int(limit) * 6, 48), losses_only=False, days=days)
+    rows = _evolution_recent_diagnostics(limit=max(int(limit) * 10, 80), losses_only=False, days=days)
     rows = sorted(rows, key=lambda r: float(r.get("decided_ts") or 0.0), reverse=True)
     out = []
     seen = set()
@@ -15441,14 +15481,19 @@ def _evolution_pending_signal_rows(limit: int = 250) -> list[dict]:
             rows = c.execute(
                 """SELECT e.setup_id, e.session, e.emailed_ts, o.outcome, o.hit_ts, o.evaluated_ts,
                           s.symbol, s.market_symbol, s.side, s.created_ts, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
-                          s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+                          s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15,
+                          d.decided_ts AS diag_decided_ts, d.outcome AS diag_outcome
                    FROM emailed_setups e
                    JOIN signal_outcomes o ON o.setup_id=e.setup_id
                    JOIN signals s ON s.setup_id=e.setup_id
                    LEFT JOIN evolution_diagnostics d ON d.processed_key=('signal:' || e.setup_id)
-                   WHERE d.id IS NULL
-                     AND UPPER(COALESCE(o.outcome,'')) IN ('WIN_TP1','WIN_TP2','WIN_TP3','LOSS','TP','SL')
-                   ORDER BY COALESCE(o.evaluated_ts, e.emailed_ts) ASC
+                   WHERE UPPER(COALESCE(o.outcome,'')) IN ('WIN_TP1','WIN_TP2','WIN_TP3','LOSS','TP','SL','WIN')
+                     AND (
+                           d.id IS NULL
+                           OR COALESCE(o.hit_ts, o.evaluated_ts, e.emailed_ts, 0) > COALESCE(d.decided_ts, 0) + 1
+                           OR UPPER(COALESCE(o.outcome,'')) <> UPPER(COALESCE(d.outcome,''))
+                         )
+                   ORDER BY COALESCE(o.hit_ts, o.evaluated_ts, e.emailed_ts) ASC
                    LIMIT ?""",
                 (int(limit),),
             ).fetchall() or []
@@ -15459,20 +15504,27 @@ def _evolution_pending_signal_rows(limit: int = 250) -> list[dict]:
 
 def _evolution_pending_autotrade_rows(limit: int = 120) -> list[dict]:
     try:
+        cutoff = float(time.time() - max(30, EVOLUTION_LOOKBACK_DAYS) * 86400.0)
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
             rows = c.execute(
                 """SELECT t.trade_id, t.session, t.symbol, t.side, t.opened_ts, t.closed_ts, t.entry, t.sl, t.tp1, t.tp2, t.tp3,
-                          t.qty, t.status, t.note, t.pnl_usdt
+                          t.qty, t.status, t.note, t.pnl_usdt,
+                          d.decided_ts AS diag_decided_ts, d.outcome AS diag_outcome
                    FROM autotrade_trades t
                    LEFT JOIN evolution_diagnostics d ON d.processed_key=('autotrade:' || t.trade_id)
-                   WHERE d.id IS NULL
-                     AND t.opened_ts>0
+                   WHERE t.opened_ts>0
+                     AND COALESCE(t.opened_ts,0) >= ?
                      AND (COALESCE(t.closed_ts,0)>0 OR UPPER(COALESCE(t.status,'')) IN ('CLOSED','LOSE','LOSS','WIN'))
+                     AND (
+                           d.id IS NULL
+                           OR COALESCE(t.closed_ts, t.opened_ts, 0) > COALESCE(d.decided_ts, 0) + 1
+                           OR (ABS(COALESCE(t.pnl_usdt,0)) > 0.0000001 AND UPPER(COALESCE(d.outcome,'')) NOT IN ('TP','SL','WIN_TP1','WIN_TP2','WIN_TP3','LOSS'))
+                         )
                    ORDER BY COALESCE(t.closed_ts, t.opened_ts) ASC
                    LIMIT ?""",
-                (int(limit),),
+                (float(cutoff), int(limit)),
             ).fetchall() or []
             return [dict(r) for r in rows]
     except Exception:
@@ -17316,7 +17368,16 @@ def _learning_stage_outcome_summary(uid: int, days: int = 60) -> dict:
     outcomes = []
     for r in summary.get('rows') or []:
         outcomes.append((str(r.get('session') or '?'), str(r.get('outcome') or 'OPEN')))
-    return _weighted_rollup_from_outcomes(outcomes)
+    roll = _weighted_rollup_from_outcomes(outcomes)
+    if int(roll.get('decided') or 0) > 0:
+        return roll
+    # Fallback: when emailed signal outcomes are still sparse or not fully synced, use the
+    # live autotrade journal as secondary evidence so learning status does not stay frozen at 0.
+    live_roll = _autotrade_weighted_outcome_summary(int(uid), days=int(days))
+    if int(live_roll.get('decided') or 0) > 0:
+        live_roll['source_fallback'] = 'autotrade_journal'
+        return live_roll
+    return roll
 
 
 def _learning_live_trade_summary(uid: int, days: int = 60) -> dict:
@@ -17583,7 +17644,7 @@ async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
-    rows = await to_thread_fast(_evolution_latest_lessons, 8, 30)
+    rows = await to_thread_fast(_evolution_latest_lessons, 8, 45)
     if not rows:
         await update.message.reply_text("No lessons learned diagnostics recorded yet.")
         return
@@ -19078,8 +19139,8 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
             return float(lo), float(hi)
 
     qlo, qhi = _rng('quality_score_min_screen', 52.0, 70.0)
-    out['quality_score_min_screen'] = float(clamp(float(out.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), qlo, qhi))
-    email_lo = max(qlo + 6.0, 66.0)
+    out['quality_score_min_screen'] = float(clamp(float(out.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), max(qlo, 60.0), qhi))
+    email_lo = max(qlo + 8.0, 72.0)
     email_hi = min(qhi + 14.0, 90.0)
     out['quality_score_min_email'] = float(clamp(float(out.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), email_lo, email_hi))
     rrlo, rrhi = _rng('min_rr_tp3', 1.3, 2.4)
@@ -19162,6 +19223,23 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
     elif avg_r > 0.05 and setups_day < lo and not _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)):
         _market_adaptive_apply_action(cfg, actions, 'execution_engine_b_email_enabled', True, 'engine_b_restored_after_positive_edge_and_low_flow')
         notes.append('Re-enabled Engine B executable lane because recent edge is positive but flow is too low.')
+
+    # Production safety ratchet: when 30d live-equivalent edge is clearly weak, tighten faster.
+    if total_setups >= 100 and (wr < 40.0 or avg_r < -0.01):
+        _market_adaptive_apply_action(cfg, actions, 'quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) + 2.0, 2), '30d_live_wr_below_40_or_negative_expectancy')
+        _market_adaptive_apply_action(cfg, actions, 'quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) + 1.0, 2), '30d_live_wr_below_40_or_negative_expectancy')
+        _market_adaptive_apply_action(cfg, actions, 'min_rr_tp3', round(float(cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3) + 0.10, 3), 'raise_reward_floor_when_edge_is_weak')
+        _market_adaptive_apply_action(cfg, actions, 'tf_align_1h_min_abs', round(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS) + 0.10, 3), 'tighter_alignment_when_edge_is_weak')
+        if _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)):
+            _market_adaptive_apply_action(cfg, actions, 'execution_engine_b_email_enabled', False, 'disable_engine_b_until_30d_edge_recovers')
+        for sess in ('NY', 'LON'):
+            sd = (per_session or {}).get(sess) or {}
+            if int(sd.get('setups', 0) or 0) >= 20 and float(sd.get('win_rate', 0.0) or 0.0) < 50.0:
+                ov = ((cfg.get('session_exec_overrides') or {}).get(sess) or {}).copy()
+                _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.quality_add', round(float(ov.get('quality_add', 0.0) or 0.0) + 1.25, 2), f'{sess}_targeting_50_WR_recovery')
+                _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.conf_add', int(float(ov.get('conf_add', 0) or 0)) + 1, f'{sess}_targeting_50_WR_recovery')
+                _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.rr_add', round(float(ov.get('rr_add', 0.0) or 0.0) + 0.05, 3), f'{sess}_targeting_50_WR_recovery')
+        notes.append('30d live-equivalent edge is below target; applied a stronger safety tightening to pursue a higher-quality lane.')
 
     return actions, notes
 
