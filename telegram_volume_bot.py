@@ -455,6 +455,24 @@ def _ensure_three_tps(entry: float, sl: float, tp3: float, tp1, tp2, side: str):
     tp = _resolve_single_tp(entry, sl, tp1=tp1, tp2=tp2, tp3=tp3, side=side)
     return float(tp or 0.0), float(tp or 0.0), float(tp or 0.0)
 
+
+def _setup_target_tp(obj, default: float = 0.0) -> float:
+    """Canonical single-TP accessor for Setup objects / dict rows.
+
+    New setups store the only real target in tp1 and leave tp2/tp3 empty.
+    Older rows may still carry tp2/tp3, so we resolve defensively.
+    """
+    try:
+        if isinstance(obj, dict):
+            entry = float(obj.get('entry') or 0.0)
+            sl = float(obj.get('sl') or 0.0)
+            return float(_resolve_single_tp(entry, sl, obj.get('tp1'), obj.get('tp2'), obj.get('tp3'), str(obj.get('side') or '')) or default)
+        entry = float(getattr(obj, 'entry', 0.0) or 0.0)
+        sl = float(getattr(obj, 'sl', 0.0) or 0.0)
+        return float(_resolve_single_tp(entry, sl, getattr(obj, 'tp1', None), getattr(obj, 'tp2', None), getattr(obj, 'tp3', None), str(getattr(obj, 'side', '') or '')) or default)
+    except Exception:
+        return float(default or 0.0)
+
 _LAST_SCAN_UNIVERSE = []
 _LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
 
@@ -1058,6 +1076,7 @@ def _strategy_config_defaults() -> dict:
         "tf_align_4h_min_abs": float(TF_ALIGN_4H_MIN_ABS),
 
         # RR floor
+        "min_rr_tp": float(MIN_RR_TP3),
         "min_rr_tp3": float(MIN_RR_TP3),
 
         # Score weights (must sum ~1.0; scaled to 100 in compute_setup_quality_score)
@@ -1102,7 +1121,7 @@ def _strategy_config_defaults() -> dict:
             "tf_align_1h_min_abs": [0.3, 1.2],
             "tf_align_4h_min_abs": [0.3, 1.2],
             "atr_min_pct": [0.4, 1.5],
-            "min_rr_tp3": [1.3, 2.4],
+            "min_rr_tp": [1.3, 2.4],
         },
 
         # Zero-touch autopilot optimizer windows
@@ -1267,7 +1286,7 @@ def apply_strategy_config(cfg: dict) -> None:
     except Exception:
         pass
     try:
-        MIN_RR_TP3 = float(cfg.get("min_rr_tp3", MIN_RR_TP3))
+        MIN_RR_TP3 = float(cfg.get("min_rr_tp", cfg.get("min_rr_tp3", MIN_RR_TP3)))
     except Exception:
         pass
 
@@ -5156,7 +5175,7 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
 
         entry = float(getattr(s, "entry", 0.0) or 0.0)
         sl = float(getattr(s, "sl", 0.0) or 0.0)
-        final_tp = float(getattr(s, "tp2", 0.0) or getattr(s, "tp3", 0.0) or 0.0)
+        final_tp = float(_setup_target_tp(s, 0.0) or 0.0)
         if entry <= 0 or sl <= 0:
             return (False, "missing_prices")
         if final_tp <= 0:
@@ -6070,7 +6089,7 @@ def session_knobs(session_name: str) -> dict:
         "ema_reaction_lookback": int(SESSION_EMA_REACTION_LOOKBACK.get(s, 7)),
         "trigger_atr_mult": float(SESSION_TRIGGER_ATR_MULT.get(s, 0.85)),
         "min_conf": int(SESSION_MIN_CONF.get(s, 78)),
-        "min_rr_tp3": float(SESSION_MIN_RR_FINAL.get(s, 2.0)),
+        "min_rr_tp": float(SESSION_MIN_RR_FINAL.get(s, 2.0)),
     }
 
 def trigger_1h_abs_min_atr_adaptive(atr_pct: float, session_name: str) -> float:
@@ -6837,7 +6856,7 @@ def _learning_status_text(use_live_refresh: bool = False, sync_lifecycle: bool =
         f"Live autotrade closes available: {int(live.get('closed') or 0)} | Net PnL: ${float(live.get('net_pnl') or 0.0):+.2f} | Win rate: {float(live.get('win_rate') or 0.0):.1f}%",
         f"Lifecycle 30d: TP hits {int(lifecycle.get('tp1_hits') or 0) + int(lifecycle.get('tp2_hits') or 0)} | Avg TP {_trade_lifecycle_fmt_duration(lifecycle.get('avg_time_to_tp1_sec') or lifecycle.get('avg_time_to_tp2_sec'))}",
         *_trade_lifecycle_analytics_lines(lifecycle, heading='Lifecycle optimization feed (30d)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2),
-        f"Single-TP mode: break-even logic disabled | TP sample: {int(be.get('sample_tp1_plus') or 0)}",
+        f"Single-TP mode | TP sample: {int(be.get('sample_tp1_plus') or 0)}",
         f"Why: single take profit is now used across signals, autotrade, and reporting.",
         SEP,
         "What is automatic now",
@@ -6860,7 +6879,7 @@ def _learning_status_text(use_live_refresh: bool = False, sync_lifecycle: bool =
 
     lines.extend([
         SEP,
-        f"Current live floors: email_quality={float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL):.1f} | screen_quality={float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN):.1f} | min_rr_tp3={float(cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3):.2f}",
+        f"Current live floors: email_quality={float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL):.1f} | screen_quality={float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN):.1f} | min_rr_tp={float(cfg.get('min_rr_tp', cfg.get('min_rr_tp3', MIN_RR_TP3)) or MIN_RR_TP3):.2f}",
         f"Signal win rate (completed outcomes): overall {float(_evolution_weighted_wr_from_signal_outcomes(days=EVOLUTION_LOOKBACK_DAYS).get('wr', 0.0) or 0.0):.1f}% | NY {float(_evolution_weighted_wr_from_signal_outcomes(days=EVOLUTION_LOOKBACK_DAYS, session='NY').get('wr', 0.0) or 0.0):.1f}% | trend overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}",
         SEP,
     ])
@@ -14371,8 +14390,7 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
                 continue
 
         R = abs(entry - sl)
-        tp3 = entry + 2.2 * R if side == "BUY" else entry - 2.2 * R
-        t1, t2, t3 = _ensure_three_tps(entry, sl, tp3, None, None, side)
+        tp_target = entry + 2.2 * R if side == "BUY" else entry - 2.2 * R
 
         ch15 = _hist_pct_change(closes, i, bars_15m)
         ch1 = _hist_pct_change(closes, i, bars_1h)
@@ -14398,9 +14416,9 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
             conf=int(conf),
             entry=float(entry),
             sl=float(sl),
-            tp1=float(t1),
-            tp2=float(t2),
-            tp3=float(t3),
+            tp1=float(tp_target),
+            tp2=0.0,
+            tp3=0.0,
             fut_vol_usd=float(fut_vol_usd),
             ch24=float(ch24),
             ch4=float(ch4),
@@ -15154,7 +15172,7 @@ def _generate_candidates(cfg: dict) -> list[dict]:
     a1lo, a1hi = _rng("tf_align_1h_min_abs", 0.3, 1.2)
     a4lo, a4hi = _rng("tf_align_4h_min_abs", 0.3, 1.2)
     atrlo, atrhi = _rng("atr_min_pct", 0.4, 1.5)
-    rrlo, rrhi = _rng("min_rr_tp3", 1.3, 2.4)
+    rrlo, rrhi = _rng("min_rr_tp", 1.3, 2.4)
 
     q_grid = [qlo, (qlo+qhi)/2.0, qhi]
     s_grid = [slo, (slo+shi)/2.0, shi]
@@ -15175,7 +15193,7 @@ def _generate_candidates(cfg: dict) -> list[dict]:
                             "tf_align_1h_min_abs": float(_clamp(a, a1lo, a1hi)),
                             "tf_align_4h_min_abs": float(_clamp(a, a4lo, a4hi)),
                             "atr_min_pct": float(_clamp(atrm, atrlo, atrhi)),
-                            "min_rr_tp3": float(_clamp(rr, rrlo, rrhi)),
+                            "min_rr_tp": float(_clamp(rr, rrlo, rrhi)),
                         }
                         cands.append(c)
     # Keep bounded
@@ -16817,7 +16835,7 @@ def _evolution_build_snapshot() -> dict:
         "last_hourly": last_hourly,
         "last_daily": last_daily,
         "quality_floor_email": float(cfg.get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
-        "min_rr_tp3": float(cfg.get("min_rr_tp3", MIN_RR_TP3) or MIN_RR_TP3),
+        "min_rr_tp": float(cfg.get("min_rr_tp", cfg.get("min_rr_tp3", MIN_RR_TP3)) or MIN_RR_TP3),
     }
     _evolution_state_set("snapshot", snapshot)
     return snapshot
@@ -18953,7 +18971,7 @@ def _self_opt_format_report(res: dict) -> str:
         SEP,
         "Best params (subset):",
         f"quality_score_min_screen={p.get('quality_score_min_screen')} | quality_score_min_email={p.get('quality_score_min_email')}",
-        f"min_rr_tp3={p.get('min_rr_tp3')} | atr_min_pct={p.get('atr_min_pct')}",
+        f"min_rr_tp={p.get('min_rr_tp', p.get('min_rr_tp3'))} | atr_min_pct={p.get('atr_min_pct')}",
         f"tf_align_1h_min_abs={p.get('tf_align_1h_min_abs')} | tf_align_4h_min_abs={p.get('tf_align_4h_min_abs')}",
     ]
 
@@ -19703,8 +19721,8 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
     email_lo = max(qlo + 8.0, 72.0)
     email_hi = min(qhi + 14.0, 90.0)
     out['quality_score_min_email'] = float(clamp(float(out.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), email_lo, email_hi))
-    rrlo, rrhi = _rng('min_rr_tp3', 1.3, 2.4)
-    out['min_rr_tp3'] = float(clamp(float(out.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3), rrlo, rrhi))
+    rrlo, rrhi = _rng('min_rr_tp', 1.3, 2.4)
+    out['min_rr_tp'] = float(clamp(float(out.get('min_rr_tp', MIN_RR_TP3) or MIN_RR_TP3), rrlo, rrhi))
     alo, ahi = _rng('atr_min_pct', 0.4, 1.5)
     out['atr_min_pct'] = float(clamp(float(out.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT), alo, ahi))
     tlo, thi = _rng('tf_align_1h_min_abs', 0.3, 1.2)
@@ -19774,7 +19792,7 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
         if wr >= 48.0 or avg_r >= 0.0:
             _market_adaptive_apply_action(cfg, actions, 'quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 1.0, 2), 'flow_too_low')
             _market_adaptive_apply_action(cfg, actions, 'quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.0, 2), 'flow_too_low')
-            _market_adaptive_apply_action(cfg, actions, 'min_rr_tp3', round(float(cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3) - 0.05, 3), 'flow_too_low')
+            _market_adaptive_apply_action(cfg, actions, 'min_rr_tp', round(float(cfg.get('min_rr_tp', cfg.get('min_rr_tp3', MIN_RR_TP3)) or MIN_RR_TP3) - 0.05, 3), 'flow_too_low')
             notes.append('Executable flow is too low while edge is acceptable; loosened the global floor slightly.')
 
     if avg_r < -0.08 and setups_day > max(lo, 6.0) and _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)):
@@ -19788,7 +19806,7 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
     if total_setups >= 100 and (wr < 40.0 or avg_r < -0.01):
         _market_adaptive_apply_action(cfg, actions, 'quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) + 2.0, 2), '30d_live_wr_below_40_or_negative_expectancy')
         _market_adaptive_apply_action(cfg, actions, 'quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) + 1.0, 2), '30d_live_wr_below_40_or_negative_expectancy')
-        _market_adaptive_apply_action(cfg, actions, 'min_rr_tp3', round(float(cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3) + 0.10, 3), 'raise_reward_floor_when_edge_is_weak')
+        _market_adaptive_apply_action(cfg, actions, 'min_rr_tp', round(float(cfg.get('min_rr_tp', cfg.get('min_rr_tp3', MIN_RR_TP3)) or MIN_RR_TP3) + 0.10, 3), 'raise_reward_floor_when_edge_is_weak')
         _market_adaptive_apply_action(cfg, actions, 'tf_align_1h_min_abs', round(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS) + 0.10, 3), 'tighter_alignment_when_edge_is_weak')
         if _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)):
             _market_adaptive_apply_action(cfg, actions, 'execution_engine_b_email_enabled', False, 'disable_engine_b_until_30d_edge_recovers')
@@ -19847,7 +19865,7 @@ def _runtime_profile_snapshot_from_cfg(cfg: dict | None = None) -> dict:
     return {
         'quality_score_min_email': float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
         'quality_score_min_screen': float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN),
-        'min_rr_tp3': float(cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3),
+        'min_rr_tp': float(cfg.get('min_rr_tp', cfg.get('min_rr_tp3', MIN_RR_TP3)) or MIN_RR_TP3),
         'tf_align_1h_min_abs': float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS),
         'atr_min_pct': float(cfg.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT),
         'execution_asia_enabled': _cfg_bool(cfg.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED)),
@@ -20241,7 +20259,7 @@ def _run_market_adaptive_cycle(force: bool = False) -> dict:
             'current_live': {
                 'quality_score_min_email': float(final_cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
                 'quality_score_min_screen': float(final_cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN),
-                'min_rr_tp3': float(final_cfg.get('min_rr_tp3', MIN_RR_TP3) or MIN_RR_TP3),
+                'min_rr_tp': float(final_cfg.get('min_rr_tp', final_cfg.get('min_rr_tp3', MIN_RR_TP3)) or MIN_RR_TP3),
                 'tf_align_1h_min_abs': float(final_cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS),
                 'atr_min_pct': float(final_cfg.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT),
                 'execution_asia_enabled': _cfg_bool(final_cfg.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED)),
@@ -20336,7 +20354,7 @@ async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAU
     if current_live:
         lines.extend([
             SEP,
-            f"Current live floors: email_quality={float(current_live.get('quality_score_min_email', 0.0) or 0.0):.1f} | screen_quality={float(current_live.get('quality_score_min_screen', 0.0) or 0.0):.1f} | min_rr_tp3={float(current_live.get('min_rr_tp3', 0.0) or 0.0):.2f}",
+            f"Current live floors: email_quality={float(current_live.get('quality_score_min_email', 0.0) or 0.0):.1f} | screen_quality={float(current_live.get('quality_score_min_screen', 0.0) or 0.0):.1f} | min_rr_tp={float(current_live.get('min_rr_tp', current_live.get('min_rr_tp3', 0.0)) or 0.0):.2f}",
             f"TF align 1h={float(current_live.get('tf_align_1h_min_abs', 0.0) or 0.0):.2f} | ATR min={float(current_live.get('atr_min_pct', 0.0) or 0.0):.2f}",
             f"Engine B exec: {'ON' if _cfg_bool(current_live.get('execution_engine_b_email_enabled', True), True) else 'OFF'} | Asia exec: {'ON' if _cfg_bool(current_live.get('execution_asia_enabled', False), False) else 'OFF'}",
         ])
@@ -20694,7 +20712,7 @@ def is_executable_setup_eligible(
 
         entry = float(getattr(s, "entry", 0.0) or 0.0)
         sl = float(getattr(s, "sl", 0.0) or 0.0)
-        final_tp = float(getattr(s, "tp2", 0.0) or getattr(s, "tp3", 0.0) or 0.0)
+        final_tp = float(_setup_target_tp(s, 0.0) or 0.0)
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
         if rr_final < rr_floor:
             return (False, "below_exec_rr")
@@ -21713,27 +21731,18 @@ def make_setup(
             _rej("bad_sl_tp_or_atr", base, mv, f"atr={atr_1h:.6g} entry={entry:.6g}")
             return None
 
-        tp1 = None
-        tp2 = tp3_single
-        tp3 = tp3_single
-        _tp1, _tp2, _tp3 = multi_tp(
-            entry, side, R, tp_cap_pct, conf,
-            rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
-        )
-        if _tp1 and _tp2:
-            tp1, tp2, tp3 = _tp1, _tp2, _tp2
-
+        tp_target = float(tp3_single)
 
         # ---------------------------------------------------------
-        # ✅ Session-aware final-target RR floor (TP2 in the live 2-TP model)
+        # ✅ Session-aware final-target RR floor (single TP model)
         # ---------------------------------------------------------
         try:
-            rr_final = rr_to_tp(entry, sl, tp2 or tp3)
+            rr_final = rr_to_tp(entry, sl, tp_target)
             sess_rr_min = float(_session_generation_rr_floor(session_name))
             if str(session_name or '').upper() == 'NY' and require_pullback:
                 sess_rr_min = max(float(sess_rr_min), float(_session_generation_rr_floor('NY')) + 0.10)
             if float(rr_final) < float(sess_rr_min):
-                _rej("below_min_rr_tp2_session", base, mv, f"rr_final={rr_final:.2f} min={sess_rr_min:.2f} sess={session_name}")
+                _rej("below_min_rr_tp_session", base, mv, f"rr_final={rr_final:.2f} min={sess_rr_min:.2f} sess={session_name}")
                 return None
         except Exception:
             pass
@@ -21752,9 +21761,9 @@ def make_setup(
             conf=int(conf),
             entry=entry,
             sl=sl,
-            tp1=tp1,
-            tp2=tp2,
-            tp3=tp3,
+            tp1=float(tp_target),
+            tp2=0.0,
+            tp3=0.0,
             fut_vol_usd=fut_vol,
             ch24=ch24,
             ch4=ch4,
@@ -21768,7 +21777,7 @@ def make_setup(
             pullback_bypass_hot=bool(pullback_bypass_hot),
             leader_base_override=bool(leader_base_override),
             engine=str(engine),
-            is_trailing_tp3=trailing_tp3,
+            is_trailing_tp3=False,
             created_ts=time.time(),
         )
         try:
@@ -21792,12 +21801,12 @@ def make_setup(
                 setattr(s, 'engine_c_resistance_level', float(engine_c_info.get('resistance_level', 0.0) or 0.0))
             except Exception:
                 pass
-            # Ensure TP ladder is always present (derive TP1/TP2 if needed)
+            # Single-TP model: keep only one authoritative target on tp1.
             try:
-                t1, t2, t3 = _ensure_three_tps(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp3',0.0) or 0.0), getattr(s,'tp1',None), getattr(s,'tp2',None), str(getattr(s,'side','') or ''))
-                setattr(s, 'tp1', t1)
-                setattr(s, 'tp2', t2)
-                setattr(s, 'tp3', t3)
+                t = float(_setup_target_tp(s, 0.0) or 0.0)
+                setattr(s, 'tp1', t)
+                setattr(s, 'tp2', 0.0)
+                setattr(s, 'tp3', 0.0)
             except Exception:
                 pass
             try:
@@ -21916,15 +21925,15 @@ def make_breakout_setup(
 
     # SL/TP using ATR (simple + robust)
     sl_atr = 1.35
-    rr_target = 2.0  # TP3 RR target for momentum
+    rr_target = 2.0  # TP RR target for momentum
     if side == "BUY":
         sl = entry - (atr_1h * sl_atr)
-        tp3 = entry + (entry - sl) * rr_target
+        tp_target = entry + (entry - sl) * rr_target
     else:
         sl = entry + (atr_1h * sl_atr)
-        tp3 = entry - (sl - entry) * rr_target
+        tp_target = entry - (sl - entry) * rr_target
 
-    if sl <= 0 or tp3 <= 0:
+    if sl <= 0 or tp_target <= 0:
         _rej("bad_sl_tp", base, mv)
         return None
 
@@ -21947,9 +21956,9 @@ def make_breakout_setup(
         conf=conf,
         entry=float(entry),
         sl=float(sl),
-        tp1=None,
-        tp2=None,
-        tp3=float(tp3),
+        tp1=float(tp_target),
+        tp2=0.0,
+        tp3=0.0,
         fut_vol_usd=float(fut_vol),
         ch24=float(ch24),
         ch4=float(ch4_used),
@@ -25828,14 +25837,10 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
 
         if side == "BUY":
             sl = max(entry - sl_dist, entry * 0.001)
-            tp3 = entry + tp_dist
-            tp1 = entry + tp_dist * 0.6
-            tp2 = entry + tp_dist * 0.85
+            tp_target = entry + tp_dist
         else:
             sl = entry + sl_dist
-            tp3 = max(entry - tp_dist, entry * 0.001)
-            tp1 = max(entry - tp_dist * 0.6, entry * 0.001)
-            tp2 = max(entry - tp_dist * 0.85, entry * 0.001)
+            tp_target = max(entry - tp_dist, entry * 0.001)
 
         fut_vol = _fut_vol_usd_from_best(best_fut, base)
 
@@ -25847,9 +25852,9 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
             conf=70,
             entry=entry,
             sl=sl,
-            tp1=tp1,
-            tp2=tp2,
-            tp3=tp3,
+            tp1=tp_target,
+            tp2=0.0,
+            tp3=0.0,
             fut_vol_usd=float(fut_vol or 0.0),
             ch24=float(getattr(mv, "percentage", 0.0) or 0.0),
             ch4=0.0,
