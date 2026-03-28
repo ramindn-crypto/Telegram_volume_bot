@@ -5921,6 +5921,7 @@ ALERT_LOCK = asyncio.Lock()
 SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
 AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "25") or 25)
+AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "40") or 40)
 AUTOTRADE_GUARDIAN_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_TIMEOUT_SEC", "20") or 20)
 AUTOTRADE_GUARDIAN_MIN_GAP_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_MIN_GAP_SEC", "20") or 20)
 _LAST_AUTOTRADE_GUARDIAN_TS = 0.0
@@ -6694,7 +6695,77 @@ def _format_last_run_line(title: str, run: dict) -> str:
     return f"{title}: {when} | status={status} | setups={analyzed_setups} | trades={analyzed_trades}"
 
 
+_DIAGNOSTIC_REFRESH_CACHE = {"ts": 0.0, "result": {}}
+_DIAGNOSTIC_REFRESH_LOCK = threading.Lock()
+
+
+def _refresh_learning_data(owner_uid: int, force: bool = False, max_age_sec: float = 180.0) -> dict:
+    """Refresh exchange-backed learning inputs with a short TTL.
+
+    This keeps diagnostics fresh without re-running expensive Bybit and outcome sync work
+    on every single admin command.
+    """
+    try:
+        uid = int(owner_uid or 0)
+    except Exception:
+        uid = 0
+    if uid <= 0:
+        return {}
+
+    now_ts = float(time.time())
+    cached = dict(_DIAGNOSTIC_REFRESH_CACHE.get('result') or {})
+    cached_ts = float(_DIAGNOSTIC_REFRESH_CACHE.get('ts') or 0.0)
+    if (not force) and cached and (now_ts - cached_ts) < float(max_age_sec or 180.0):
+        return cached
+
+    if not _DIAGNOSTIC_REFRESH_LOCK.acquire(blocking=False):
+        return cached
+
+    try:
+        cached = dict(_DIAGNOSTIC_REFRESH_CACHE.get('result') or {})
+        cached_ts = float(_DIAGNOSTIC_REFRESH_CACHE.get('ts') or 0.0)
+        if (not force) and cached and (now_ts - cached_ts) < float(max_age_sec or 180.0):
+            return cached
+
+        out = {
+            'trade_sync': {},
+            'signal_sync': {},
+            'diagnostic_sync': {},
+            'ts': now_ts,
+        }
+        try:
+            out['trade_sync'] = _autotrade_sync_closed_trades_from_exchange(uid, lookback_days=max(14, EVOLUTION_LOOKBACK_DAYS)) or {}
+        except Exception as e:
+            out['trade_sync'] = {'error': f'{type(e).__name__}: {e}'}
+        try:
+            out['signal_sync'] = _signal_outcome_sync_for_user(uid, days=max(30, EVOLUTION_LOOKBACK_DAYS), limit=600, force=force) or {}
+        except Exception as e:
+            out['signal_sync'] = {'error': f'{type(e).__name__}: {e}'}
+        try:
+            out['diagnostic_sync'] = _evolution_process_new_diagnostics() or {}
+        except Exception as e:
+            out['diagnostic_sync'] = {'error': f'{type(e).__name__}: {e}'}
+
+        _DIAGNOSTIC_REFRESH_CACHE['ts'] = now_ts
+        _DIAGNOSTIC_REFRESH_CACHE['result'] = dict(out)
+        try:
+            _evolution_state_set('last_learning_data_refresh', out)
+        except Exception:
+            pass
+        return out
+    finally:
+        try:
+            _DIAGNOSTIC_REFRESH_LOCK.release()
+        except Exception:
+            pass
+
+
 def _learning_status_text() -> str:
+    owner = int(AUTOTRADE_OWNER_UID or 0)
+    try:
+        _refresh_learning_data(owner, force=False, max_age_sec=180.0)
+    except Exception:
+        pass
     snap = _evolution_snapshot_cached() or {}
     overall = snap.get("overall") or {}
     ny = snap.get("ny") or {}
@@ -6706,7 +6777,6 @@ def _learning_status_text() -> str:
     cfg = load_strategy_config(force=True)
     auto_last = snap.get("auto_applied_last") or _evolution_state_get("last_auto_adjustment", {}) or {}
 
-    owner = int(AUTOTRADE_OWNER_UID or 0)
     stage = _learning_stage_outcome_summary(owner, days=60)
     be = _learning_breakeven_after_tp1_analysis(owner, days=60)
     live = _learning_live_trade_summary(owner, days=60)
@@ -12092,7 +12162,7 @@ def _signal_outcome_sync_for_setup(user_id: int, setup_id: str, horizon_hours: i
         return {}
     existing = db_get_outcome(sid) or {}
     existing_canon = _canon_signal_outcome_label((existing or {}).get('outcome'))
-    if (not force) and existing and existing_canon in {'TP1', 'TP2', 'SL'}:
+    if (not force) and existing and existing_canon in {'TP', 'TP1', 'TP2', 'SL'}:
         return existing
 
     payload = _signal_setup_eval_payload(sid)
@@ -12122,11 +12192,11 @@ def _signal_outcome_sync_for_setup(user_id: int, setup_id: str, horizon_hours: i
     if trade and (str(trade.get('status') or '').upper().strip() == 'CLOSED' or float(trade.get('closed_ts') or 0.0) > 0):
         canon = _canon_outcome_from_autotrade_trade(trade)
         canon = _canon_signal_outcome_label(canon)
-        if canon in {'TP1', 'TP2', 'SL'}:
-            hit_level = 'SL' if canon == 'SL' else 'TP1'
+        if canon in {'TP', 'TP1', 'TP2', 'SL'}:
+            hit_level = 'SL' if canon == 'SL' else ('TP' if canon == 'TP' else 'TP1')
             hit_ts = float(trade.get('closed_ts') or trade.get('opened_ts') or created_ts or now_ts)
-            best_level = 'TP2' if canon == 'TP2' else ('TP1' if canon == 'TP1' else 'NONE')
-            db_upsert_outcome(sid, canon, hit_level, hit_ts, int(horizon_hours), note='sync_from_autotrade_trade', best_level=best_level, best_ts=hit_ts if best_level != 'NONE' else None)
+            best_level = 'SL' if canon == 'SL' else ('TP' if canon == 'TP' else ('TP2' if canon == 'TP2' else 'TP1'))
+            db_upsert_outcome(sid, canon, hit_level, hit_ts, int(horizon_hours), note='sync_from_autotrade_trade', best_level=best_level, best_ts=hit_ts if best_level not in {'', 'NONE'} else None)
             return db_get_outcome(sid) or {'setup_id': sid, 'outcome': canon}
 
     try:
@@ -12175,7 +12245,7 @@ def _signal_outcome_sync_for_user(user_id: int, days: int | None = None, limit: 
             try:
                 out = _signal_outcome_sync_for_setup(int(user_id), sid, force=bool(force))
                 synced += 1
-                if _canon_signal_outcome_label((out or {}).get('outcome')) in {'TP1', 'TP2', 'SL'}:
+                if _canon_signal_outcome_label((out or {}).get('outcome')) in {'TP', 'TP1', 'TP2', 'SL'}:
                     decided += 1
             except Exception:
                 errors += 1
@@ -12774,6 +12844,13 @@ def current_session_utc(now_utc: Optional[datetime] = None) -> str:
     """
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
+        job_started_ts = time.time()
+
+        def _job_budget_exhausted() -> bool:
+            try:
+                return (time.time() - job_started_ts) >= float(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40)
+            except Exception:
+                return False
     return _session_label_utc(now_utc) or "NONE"
 
 
@@ -14159,7 +14236,7 @@ def run_backtest(
             by_session[sess_name]['tp1_hits'] += 1
         if bool(res.get('hit_tp2')):
             by_session[sess_name]['tp2_hits'] += 1
-        if out in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2'):
+        if out in ('TP', 'TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2'):
             by_session[sess_name]['wins'] += 1
         elif out in ('SL', 'SL_FIRST', 'TP1_SL'):
             by_session[sess_name]['losses'] += 1
@@ -14176,7 +14253,7 @@ def run_backtest(
         results.append(res)
 
     total = len(results)
-    wins = sum(1 for r in results if str(r.get('outcome') or '').upper().strip() in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2'))
+    wins = sum(1 for r in results if str(r.get('outcome') or '').upper().strip() in ('TP', 'TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2'))
     tp1_hits = sum(1 for r in results if bool(r.get('hit_tp1')))
     tp2_hits = sum(1 for r in results if bool(r.get('hit_tp2')))
     win_rate = (wins / total * 100.0) if total else 0.0
@@ -14420,7 +14497,7 @@ def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session
         by_session[sess]["r"].append(float(res["R"]))
 
         # WIN definition: TP1 hit before SL => TP1/TP2/TP3 are all wins
-        if out in ("TP1", "TP1_BE", "TP1_TIMEOUT", "TP2", "TP3"):
+        if out in ("TP", "TP1", "TP1_BE", "TP1_TIMEOUT", "TP2", "TP3"):
             by_session[sess]["wins"] += 1
         elif out in ("SL", "LOSS"):
             by_session[sess]["losses"] += 1
@@ -14428,7 +14505,7 @@ def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session
     total = len(results)
 
     # WIN definition: TP1 hit before SL (TP1/TP2/TP3 outcomes are wins)
-    wins = sum(1 for r in results if str(r.get("outcome") or "").upper().strip() in ("TP1", "TP1_BE", "TP1_TIMEOUT", "TP2", "TP3"))
+    wins = sum(1 for r in results if str(r.get("outcome") or "").upper().strip() in ("TP", "TP1", "TP1_BE", "TP1_TIMEOUT", "TP2", "TP3"))
     win_rate = (wins / total * 100.0) if total else 0.0
 
     avg_r = (sum(float(r.get("R", 0.0) or 0.0) for r in results) / total) if total else 0.0
@@ -15139,9 +15216,12 @@ def _evolution_recent_diagnostics(limit: int = 10, losses_only: bool = False, da
 def _evolution_latest_lessons(limit: int = 8, days: int = 30) -> list[dict]:
     """Return the freshest lesson rows and force an on-demand refresh first."""
     try:
-        _evolution_process_new_diagnostics()
+        _refresh_learning_data(int(AUTOTRADE_OWNER_UID or 0), force=False, max_age_sec=120.0)
     except Exception:
-        pass
+        try:
+            _evolution_process_new_diagnostics()
+        except Exception:
+            pass
     rows = _evolution_recent_diagnostics(limit=max(int(limit) * 6, 48), losses_only=False, days=days)
     rows = sorted(rows, key=lambda r: float(r.get("decided_ts") or 0.0), reverse=True)
     out = []
@@ -15181,9 +15261,9 @@ def _evolution_tag_counter(days: int = 30, session: str | None = None, losses_on
 
 def _evolution_outcome_winloss(outcome: str) -> tuple[int, int]:
     out = str(outcome or "").upper().strip()
-    if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3"):
+    if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "TP", "WIN"):
         return (1, 0)
-    if out == "LOSS":
+    if out in ("LOSS", "SL"):
         return (0, 1)
     return (0, 0)
 
@@ -15318,10 +15398,10 @@ def _evolution_build_signal_diagnostic(sig: dict, session: str, outcome: str, de
             tags.append("poor_volatility_regime")
 
         out_u = str(outcome or "").upper().strip()
-        if out_u.startswith("WIN_"):
+        if out_u.startswith("WIN_") or out_u == "TP":
             if not tags:
                 tags.append("entry_quality_good")
-        elif out_u == "LOSS":
+        elif out_u in {"LOSS", "SL"}:
             if "entry_too_extended" in tags or "entry_too_late_after_breakout" in tags:
                 tags.append("extended_entry_stopout_pattern")
             if "rr_too_ambitious" in tags:
@@ -15367,7 +15447,7 @@ def _evolution_pending_signal_rows(limit: int = 250) -> list[dict]:
                    JOIN signals s ON s.setup_id=e.setup_id
                    LEFT JOIN evolution_diagnostics d ON d.processed_key=('signal:' || e.setup_id)
                    WHERE d.id IS NULL
-                     AND UPPER(COALESCE(o.outcome,'')) IN ('WIN_TP1','WIN_TP2','WIN_TP3','LOSS')
+                     AND UPPER(COALESCE(o.outcome,'')) IN ('WIN_TP1','WIN_TP2','WIN_TP3','LOSS','TP','SL')
                    ORDER BY COALESCE(o.evaluated_ts, e.emailed_ts) ASC
                    LIMIT ?""",
                 (int(limit),),
@@ -15415,16 +15495,16 @@ def _evolution_resolve_autotrade_outcome(row: dict) -> tuple[str, float]:
         res = evaluate_signal_hit_order(trade, horizon_hours=168, timeframe="1m")
         outcome = str(res.get("outcome") or "OPEN").upper().strip()
         decided_ts = float(res.get("hit_ts") or row.get("closed_ts") or 0.0)
-        if outcome in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+        if outcome in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS", "TP", "SL"):
             return outcome, decided_ts
     except Exception:
         pass
     try:
         pnl = float(row.get("pnl_usdt") or 0.0)
         if pnl > 0:
-            return "WIN_TP1", float(row.get("closed_ts") or 0.0)
+            return "TP", float(row.get("closed_ts") or 0.0)
         if pnl < 0:
-            return "LOSS", float(row.get("closed_ts") or 0.0)
+            return "SL", float(row.get("closed_ts") or 0.0)
     except Exception:
         pass
     return "OPEN", float(row.get("closed_ts") or 0.0)
@@ -15463,7 +15543,7 @@ def _evolution_process_new_diagnostics() -> dict:
 
     for row in _evolution_pending_autotrade_rows(limit=150):
         outcome, decided_ts = _evolution_resolve_autotrade_outcome(row)
-        if outcome not in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+        if _evolution_outcome_winloss(outcome) == (0, 0):
             continue
         diag_sig = {
             "symbol": row.get("symbol"),
@@ -15555,11 +15635,9 @@ def _evolution_weighted_wr_from_diagnostics(days: int = 60, session: str | None 
                 params.append(str(source_type))
             rows = c.execute(q, tuple(params)).fetchall() or []
             for r in rows:
-                out = str(r["outcome"] or "").upper().strip()
-                if out in ("WIN_TP1", "WIN_TP2", "WIN_TP3"):
-                    wins += 1
-                elif out == "LOSS":
-                    losses += 1
+                w, l = _evolution_outcome_winloss(r["outcome"])
+                wins += int(w)
+                losses += int(l)
     except Exception:
         pass
     n = wins + losses
@@ -15684,7 +15762,7 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
         peak = max(peak, eq)
         max_dd = max(max_dd, peak - eq)
         out = str(res.get('outcome') or '').upper().strip()
-        won = out in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2', 'TP3')
+        won = out in ('TP', 'TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2', 'TP3')
         lost = out in ('SL', 'LOSS', 'SL_FIRST', 'TP1_SL')
         by_session[sess]['setups'] += 1
         by_session[sess]['r'].append(r_mult)
@@ -15748,7 +15826,7 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
             'avg_R': float((sum(float(x) for x in rr) / len(rr)) if rr else 0.0),
         }
     live_total = len(live_results)
-    live_wins = sum(1 for r in live_results if str(r.get('outcome') or '').upper().strip() in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2', 'TP3'))
+    live_wins = sum(1 for r in live_results if str(r.get('outcome') or '').upper().strip() in ('TP', 'TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2', 'TP3'))
     live_avg_r = (sum(float(r.get('R', 0.0) or 0.0) for r in live_results) / live_total) if live_total else 0.0
     live_gross_win = sum(max(0.0, float(r.get('R', 0.0) or 0.0)) for r in live_results)
     live_gross_loss = sum(min(0.0, float(r.get('R', 0.0) or 0.0)) for r in live_results)
@@ -16888,7 +16966,7 @@ def _signal_report_live_backed_only(user_id: int, meta: dict | None, canon: str)
 
 def _display_signal_outcome(raw) -> str:
     lab = str(_canon_signal_outcome_label(raw) or '').upper().strip()
-    if lab in {'TP1', 'TP2', 'SL', 'OPEN'}:
+    if lab in {'TP', 'TP1', 'TP2', 'SL', 'OPEN'}:
         return lab
     if lab in {'UNTRACKED', 'NONE', ''}:
         return 'None'
@@ -16901,33 +16979,35 @@ def _canonical_wr_stats(rows: list[dict]) -> dict:
     decided = 0
     wins = 0
     losses = 0
-    tp2_wins = 0
+    tp_full_wins = 0
     for r in rows or []:
         out = _display_signal_outcome(r.get('outcome'))
         sess = str(r.get('session') or '?').upper().strip() or '?'
         counts[out] += 1
         by_session[sess][out] += 1
-        if out in {'TP1', 'TP2', 'SL'}:
+        if out in {'TP', 'TP1', 'TP2', 'SL'}:
             decided += 1
-        if out in {'TP1', 'TP2'}:
+        if out in {'TP', 'TP1', 'TP2'}:
             wins += 1
-        if out == 'TP2':
-            tp2_wins += 1
+        if out in {'TP', 'TP2'}:
+            tp_full_wins += 1
         elif out == 'SL':
             losses += 1
     wr = (wins / decided * 100.0) if decided > 0 else 0.0
     by_sess = {}
     for sess, ctr in by_session.items():
-        s_dec = int(ctr.get('TP1', 0) + ctr.get('TP2', 0) + ctr.get('SL', 0))
-        s_win = int(ctr.get('TP1', 0) + ctr.get('TP2', 0))
+        s_tp_full = int(ctr.get('TP', 0) + ctr.get('TP2', 0))
+        s_dec = int(ctr.get('TP', 0) + ctr.get('TP1', 0) + ctr.get('TP2', 0) + ctr.get('SL', 0))
+        s_win = int(ctr.get('TP', 0) + ctr.get('TP1', 0) + ctr.get('TP2', 0))
         by_sess[sess] = {
             'total': int(sum(ctr.values())),
             'decided': s_dec,
             'wins': s_win,
-            'tp2_wins': int(ctr.get('TP2', 0)),
+            'tp2_wins': s_tp_full,
             'losses': int(ctr.get('SL', 0)),
+            'tp': int(ctr.get('TP', 0)),
             'tp1': int(ctr.get('TP1', 0)),
-            'tp2': int(ctr.get('TP2', 0)),
+            'tp2': s_tp_full,
             'sl': int(ctr.get('SL', 0)),
             'open': int(ctr.get('OPEN', 0)),
             'untracked': int(ctr.get('None', 0)),
@@ -16938,7 +17018,7 @@ def _canonical_wr_stats(rows: list[dict]) -> dict:
         'by_session': by_sess,
         'decided': int(decided),
         'wins': int(wins),
-        'tp2_wins': int(tp2_wins),
+        'tp2_wins': int(tp_full_wins),
         'losses': int(losses),
         'win_rate': float(wr),
     }
@@ -17005,24 +17085,12 @@ def _signal_outcome_summary(user_id: int, session: str | None = None, days: int 
 def _signal_outcome_weighted_summary(user_id: int, session: str | None = None, days: int | None = None) -> dict:
     summary = _signal_outcome_summary(int(user_id), session=session, days=days)
     rows = summary.get('rows') or []
-    stats = _canonical_wr_stats(rows)
-    counts = stats.get('counts') or Counter()
-    return {
-        'rows': rows,
-        'counts': counts,
-        'by_session': stats.get('by_session') or {},
-        'total': int(len(rows)),
-        'decided': int(stats.get('decided') or 0),
-        'wins': int(stats.get('wins') or 0),
-        'losses': int(stats.get('losses') or 0),
-        'tp1_only': int(counts.get('TP1', 0)),
-        'tp2_plus': int(counts.get('TP2', 0)),
-        'tp3': 0,
-        'open': int(counts.get('OPEN', 0)),
-        'weighted_win_rate': float(stats.get('win_rate') or 0.0),
-        'binary_win_rate': float(stats.get('win_rate') or 0.0),
-        'avg_weighted_credit': float((int(counts.get('TP2', 0)) / int(stats.get('decided') or 1)) if int(stats.get('decided') or 0) > 0 else 0.0),
-    }
+    weighted = _weighted_rollup_from_outcomes([
+        (str(r.get('session') or '?'), str(r.get('outcome') or 'OPEN'))
+        for r in rows
+    ])
+    weighted['rows'] = rows
+    return weighted
 
 
 def _signal_wr_display_metrics(user_id: int, session: str | None = None, days: int | None = None) -> dict:
@@ -17067,9 +17135,9 @@ def _signal_weighted_wr_daily_series(uid: int, days: int, session: str | None = 
     cum_wins = 0
     for lab in day_labels:
         for out in buckets.get(lab) or []:
-            if out in {'TP1', 'TP2', 'SL'}:
+            if out in {'TP', 'TP1', 'TP2', 'SL'}:
                 cum_decided += 1
-                if out == 'TP2':
+                if out in {'TP', 'TP1', 'TP2'}:
                     cum_wins += 1
         wr = (cum_wins / cum_decided * 100.0) if cum_decided > 0 else 0.0
         cumulative.append((lab, float(wr)))
@@ -17077,7 +17145,12 @@ def _signal_weighted_wr_daily_series(uid: int, days: int, session: str | None = 
 
 
 def _stage_credit_from_outcome(outcome: str) -> float:
-    return 1.0 if _canon_signal_outcome_label(outcome) == 'TP2' else 0.0
+    canon = _canon_signal_outcome_label(outcome)
+    if canon in {'TP', 'TP2'}:
+        return 1.0
+    if canon == 'TP1':
+        return 0.5
+    return 0.0
 
 
 def _autotrade_trade_signal_outcome(trade: dict) -> str:
@@ -17165,15 +17238,11 @@ def _autotrade_history_days_available(uid: int) -> int:
 
 
 def _stage_credit_from_outcome(outcome: str) -> float:
-    """Canonical staged credit for the production 2-TP model.
-
-    TP1 = partial success, TP2 = full success, SL = loss, OPEN = unresolved.
-    """
     canon = _canon_signal_outcome_label(outcome)
+    if canon in {'TP', 'TP2'}:
+        return 1.0
     if canon == 'TP1':
-        return 0.50
-    if canon == 'TP2':
-        return 1.00
+        return 0.5
     return 0.0
 
 
@@ -17191,21 +17260,21 @@ def _weighted_rollup_from_outcomes(outcomes: list[tuple[str, str]]) -> dict:
     counts = stats.get('counts') or Counter()
     decided = int(stats.get('decided') or 0)
     tp1 = int(counts.get('TP1', 0))
-    tp2 = int(counts.get('TP2', 0))
-    weighted_credit = (tp1 * 0.50) + (tp2 * 1.00)
+    tp_full = int(counts.get('TP', 0) + counts.get('TP2', 0))
+    weighted_credit = (tp1 * 0.50) + (tp_full * 1.00)
     weighted_wr = float((weighted_credit / decided) * 100.0) if decided > 0 else 0.0
 
     by_session_out = {}
     for sess, item in (stats.get('by_session') or {}).items():
         s_dec = int(item.get('decided') or 0)
         s_tp1 = int(item.get('tp1') or 0)
-        s_tp2 = int(item.get('tp2') or 0)
-        s_weighted_credit = (s_tp1 * 0.50) + (s_tp2 * 1.00)
+        s_tp_full = int(item.get('tp') or 0) + int(item.get('tp2') or 0)
+        s_weighted_credit = (s_tp1 * 0.50) + (s_tp_full * 1.00)
         by_session_out[sess] = {
             'total': int(item.get('total') or 0),
             'decided': s_dec,
             'tp1_only': s_tp1,
-            'tp2_plus': s_tp2,
+            'tp2_plus': s_tp_full,
             'tp3': 0,
             'losses': int(item.get('sl') or 0),
             'open': int(item.get('open') or 0),
@@ -17218,7 +17287,7 @@ def _weighted_rollup_from_outcomes(outcomes: list[tuple[str, str]]) -> dict:
         'decided': decided,
         'counts': counts,
         'tp1_only': tp1,
-        'tp2_plus': tp2,
+        'tp2_plus': tp_full,
         'tp3': 0,
         'losses': int(counts.get('SL', 0)),
         'open': int(counts.get('OPEN', 0)),
@@ -17336,8 +17405,8 @@ def _autotrade_weighted_wr_daily_series(uid: int, days: int) -> list[tuple[str, 
     for ds in day_starts:
         lab = ds.strftime('%Y-%m-%d')
         outs = [_canon_signal_outcome_label(o) for o in (buckets.get(lab) or [])]
-        decided = sum(1 for o in outs if o in {'TP1', 'TP2', 'SL'})
-        wsum = sum(_stage_credit_from_outcome(o) for o in outs if o in {'TP1', 'TP2', 'SL'})
+        decided = sum(1 for o in outs if o in {'TP', 'TP1', 'TP2', 'SL'})
+        wsum = sum(_stage_credit_from_outcome(o) for o in outs if o in {'TP', 'TP1', 'TP2', 'SL'})
         wr = (wsum / decided * 100.0) if decided > 0 else 0.0
         series.append((lab, float(wr)))
     return series
@@ -18865,12 +18934,11 @@ def _autonomous_opt_performance_snapshot(window_hours: float = 72.0) -> dict:
         losses = 0
         for r in rows:
             outcome = str((r[0] if not isinstance(r, dict) else r.get("outcome")) or "").upper().strip()
-            if outcome in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS"):
+            w, l = _evolution_outcome_winloss(outcome)
+            if w or l:
                 closed += 1
-                if outcome.startswith("WIN_"):
-                    wins += 1
-                elif outcome == "LOSS":
-                    losses += 1
+                wins += int(w)
+                losses += int(l)
         out["closed"] = int(closed)
         out["wins"] = int(wins)
         out["losses"] = int(losses)
@@ -19383,6 +19451,10 @@ def _runtime_profile_review_probation(uid: int | None = None, force: bool = Fals
     return {'status': 'PROMOTED', 'profile': _runtime_profile_get_by_id(str(cur.get('profile_id') or '')), 'signal': sig, 'live': live}
 
 def _market_adaptive_status_snapshot() -> dict:
+    try:
+        _refresh_learning_data(int(AUTOTRADE_OWNER_UID or 0), force=False, max_age_sec=180.0)
+    except Exception:
+        pass
     cfg = load_strategy_config(force=False)
     profile = _runtime_profile_bootstrap_if_missing(cfg)
     review = _runtime_profile_review_probation(int(AUTOTRADE_OWNER_UID or 0), force=False)
@@ -30423,6 +30495,9 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             reason = 'no_tradable_setup'
             attempted = 0
             for cand in db_setups:
+                if _job_budget_exhausted():
+                    reason = f'autotrade_job_budget_exhausted>{int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40)}s'
+                    break
                 attempted += 1
                 try:
                     ok, reason = await to_thread_heavy(
