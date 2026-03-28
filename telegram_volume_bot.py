@@ -210,8 +210,8 @@ def _autotrade_migrate_tables():
                 entry REAL,
                 sl REAL,
                 tp1 REAL,
-                tp2 REAL,
-                tp3 REAL,
+                alt_target_a REAL,
+                alt_target_b REAL,
                 qty REAL,
                 conf INTEGER,
                 quality_score REAL,
@@ -244,8 +244,8 @@ def _autotrade_migrate_tables():
             add_col("entry", "entry REAL")
             add_col("sl", "sl REAL")
             add_col("tp1", "tp1 REAL")
-            add_col("tp2", "tp2 REAL")
-            add_col("tp3", "tp3 REAL")
+            add_col("alt_target_a", "alt_target_a REAL")
+            add_col("alt_target_b", "alt_target_b REAL")
             add_col("qty", "qty REAL")
             add_col("conf", "conf INTEGER")
             add_col("quality_score", "quality_score REAL")
@@ -413,12 +413,12 @@ TXID_REGEX = re.compile(r"^[A-Fa-f0-9]{64}$")
 
 
 
-def _resolve_single_tp(entry: float, sl: float, tp1=None, tp2=None, tp3=None, side: str = '') -> float:
+def _resolve_single_tp(entry: float, sl: float, tp1=None, alt_target_a=None, alt_target_b=None, side: str = '') -> float:
     """Resolve the bot's single take-profit target.
 
     Compatibility rules:
     - prefer tp1 when present (new single-TP model stores the only target there)
-    - otherwise fall back to tp2, then tp3
+    - otherwise fall back to alt_target_a, then alt_target_b
     - validate direction against entry when possible
     """
     try:
@@ -427,7 +427,7 @@ def _resolve_single_tp(entry: float, sl: float, tp1=None, tp2=None, tp3=None, si
         e = 0.0
     side_u = str(side or '').upper().strip()
     raw = []
-    for v in (tp1, tp2, tp3):
+    for v in (tp1, alt_target_a, alt_target_b):
         try:
             fv = float(v or 0.0)
         except Exception:
@@ -445,31 +445,31 @@ def _resolve_single_tp(entry: float, sl: float, tp1=None, tp2=None, tp3=None, si
             return float(cand)
     return float(raw[0])
 
-def _ensure_three_tps(entry: float, sl: float, tp3: float, tp1, tp2, side: str):
+def _ensure_three_tps(entry: float, sl: float, alt_target_b: float, tp1, alt_target_a, side: str):
     """Backward-compatible single-TP resolver.
 
     The bot now uses exactly one TP. For old code paths that still expect a 3-value
     tuple we mirror the same resolved target into all three positions so downstream
     calculations stay stable without creating extra targets.
     """
-    tp = _resolve_single_tp(entry, sl, tp1=tp1, tp2=tp2, tp3=tp3, side=side)
+    tp = _resolve_single_tp(entry, sl, tp1=tp1, alt_target_a=alt_target_a, alt_target_b=alt_target_b, side=side)
     return float(tp or 0.0), float(tp or 0.0), float(tp or 0.0)
 
 
 def _setup_target_tp(obj, default: float = 0.0) -> float:
     """Canonical single-TP accessor for Setup objects / dict rows.
 
-    New setups store the only real target in tp1 and leave tp2/tp3 empty.
-    Older rows may still carry tp2/tp3, so we resolve defensively.
+    New setups store the only real target in tp1 and leave alt_target_a/alt_target_b empty.
+    Older rows may still carry alt_target_a/alt_target_b, so we resolve defensively.
     """
     try:
         if isinstance(obj, dict):
             entry = float(obj.get('entry') or 0.0)
             sl = float(obj.get('sl') or 0.0)
-            return float(_resolve_single_tp(entry, sl, obj.get('tp1'), obj.get('tp2'), obj.get('tp3'), str(obj.get('side') or '')) or default)
+            return float(_resolve_single_tp(entry, sl, obj.get('tp1'), obj.get('alt_target_a'), obj.get('alt_target_b'), str(obj.get('side') or '')) or default)
         entry = float(getattr(obj, 'entry', 0.0) or 0.0)
         sl = float(getattr(obj, 'sl', 0.0) or 0.0)
-        return float(_resolve_single_tp(entry, sl, getattr(obj, 'tp1', None), getattr(obj, 'tp2', None), getattr(obj, 'tp3', None), str(getattr(obj, 'side', '') or '')) or default)
+        return float(_resolve_single_tp(entry, sl, getattr(obj, 'tp1', None), getattr(obj, 'alt_target_a', None), getattr(obj, 'alt_target_b', None), str(getattr(obj, 'side', '') or '')) or default)
     except Exception:
         return float(default or 0.0)
 
@@ -997,8 +997,8 @@ MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "78"))
 
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
 MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
-MIN_RR_FINAL = float(os.environ.get("MIN_RR_FINAL", os.environ.get("MIN_RR_TP2", os.environ.get("MIN_RR_TP3", "1.8"))))
-MIN_RR_TP3 = MIN_RR_FINAL  # legacy compatibility only; live model uses TP2 as final target
+MIN_RR_FINAL = float(os.environ.get("MIN_RR_FINAL", os.environ.get("MIN_RR_TP", os.environ.get("MIN_RR_TP", "1.8"))))
+MIN_RR_TP = MIN_RR_FINAL  # legacy compatibility only; live model uses TP as final target
 
 # Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
 EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
@@ -1076,8 +1076,8 @@ def _strategy_config_defaults() -> dict:
         "tf_align_4h_min_abs": float(TF_ALIGN_4H_MIN_ABS),
 
         # RR floor
-        "min_rr_tp": float(MIN_RR_TP3),
-        "min_rr_tp3": float(MIN_RR_TP3),
+        "min_rr_tp": float(MIN_RR_TP),
+        "min_rr_tp": float(MIN_RR_TP),
 
         # Score weights (must sum ~1.0; scaled to 100 in compute_setup_quality_score)
         "score_w_conf": 0.45,
@@ -1270,7 +1270,7 @@ def _cfg_bool(value, default: bool = False) -> bool:
 
 def apply_strategy_config(cfg: dict) -> None:
     """Apply StrategyConfig into global tunables used throughout the bot."""
-    global MIN_FUT_VOL_USD, EMAIL_MIN_FUT_VOL_USD, MIN_RR_TP3
+    global MIN_FUT_VOL_USD, EMAIL_MIN_FUT_VOL_USD, MIN_RR_TP
     global QUALITY_SCORE_MIN_SCREEN, QUALITY_SCORE_MIN_EMAIL
     global TF_ALIGN_ENABLED, TF_ALIGN_1H_MIN_ABS, TF_ALIGN_4H_MIN_ABS
     global ATR_MIN_PCT, ATR_MAX_PCT
@@ -1286,7 +1286,7 @@ def apply_strategy_config(cfg: dict) -> None:
     except Exception:
         pass
     try:
-        MIN_RR_TP3 = float(cfg.get("min_rr_tp", cfg.get("min_rr_tp3", MIN_RR_TP3)))
+        MIN_RR_TP = float(cfg.get("min_rr_tp", cfg.get("min_rr_tp", MIN_RR_TP)))
     except Exception:
         pass
 
@@ -1458,7 +1458,7 @@ MOMENTUM_MAX_ADAPTIVE_EMA_DIST = 3.5   # percent, was 7.5
 
 # Higher TP behavior for Engine B (pumps)
 ENGINE_B_TP_CAP_BONUS_PCT = 4.0      # adds to TP cap %
-ENGINE_B_RR_BONUS = 0.35             # adds to RR target (TP3)
+ENGINE_B_RR_BONUS = 0.35             # adds to RR target (TP)
 
 # =========================================================
 # ✅ ENGINE C (PUMP-BASE / RANGE-CONTINUATION)
@@ -1648,7 +1648,7 @@ except Exception:
     AUTOTRADE_TP_SPLIT = [0.4, 0.4, 0.2]
 
 # Live exit architecture: keep the stop-loss on Bybit's position-level trading-stop and
-# attach TP1 / TP2 as native exchange exits. The primary lane uses reduce-only close-trigger
+# attach TP1 / TP as native exchange exits. The primary lane uses reduce-only close-trigger
 # orders; if Bybit accepts the request but the TP orders are not actually visible, the bot
 # immediately falls back to native partial TP/SL pairs so two TPs are truly present on the
 # exchange instead of only being assumed from an ACK.
@@ -2393,15 +2393,15 @@ def _backtest_should_move_sl_to_be_after_tp1(setup: "Setup", session_name: str) 
     """Single-TP model: no break-even step is used."""
     return False
 
-def _autotrade_live_exit_plan_from_targets(entry: float, sl: float, tp1, tp2, tp3, side: str) -> dict:
-    tp = _resolve_single_tp(entry, sl, tp1=tp1, tp2=tp2, tp3=tp3, side=side)
+def _autotrade_live_exit_plan_from_targets(entry: float, sl: float, tp1, alt_target_a, alt_target_b, side: str) -> dict:
+    tp = _resolve_single_tp(entry, sl, tp1=tp1, alt_target_a=alt_target_a, alt_target_b=alt_target_b, side=side)
     return {
         'partial_tp': 0.0,
         'final_tp': float(tp or 0.0),
         'partial_fraction': 1.0,
         'effective_tp1': float(tp or 0.0),
-        'effective_tp2': 0.0,
-        'effective_tp3': 0.0,
+        'effective_alt_target_a': 0.0,
+        'effective_alt_target_b': 0.0,
     }
 
 
@@ -2410,8 +2410,8 @@ def _autotrade_live_exit_plan_for_trade(trade_or_setup) -> dict:
         float(getattr(trade_or_setup, 'entry', 0.0) if hasattr(trade_or_setup, 'entry') else (trade_or_setup.get('entry') if isinstance(trade_or_setup, dict) else 0.0) or 0.0),
         float(getattr(trade_or_setup, 'sl', 0.0) if hasattr(trade_or_setup, 'sl') else (trade_or_setup.get('sl') if isinstance(trade_or_setup, dict) else 0.0) or 0.0),
         getattr(trade_or_setup, 'tp1', None) if hasattr(trade_or_setup, 'tp1') else (trade_or_setup.get('tp1') if isinstance(trade_or_setup, dict) else None),
-        getattr(trade_or_setup, 'tp2', None) if hasattr(trade_or_setup, 'tp2') else (trade_or_setup.get('tp2') if isinstance(trade_or_setup, dict) else None),
-        getattr(trade_or_setup, 'tp3', None) if hasattr(trade_or_setup, 'tp3') else (trade_or_setup.get('tp3') if isinstance(trade_or_setup, dict) else None),
+        getattr(trade_or_setup, 'alt_target_a', None) if hasattr(trade_or_setup, 'alt_target_a') else (trade_or_setup.get('alt_target_a') if isinstance(trade_or_setup, dict) else None),
+        getattr(trade_or_setup, 'alt_target_b', None) if hasattr(trade_or_setup, 'alt_target_b') else (trade_or_setup.get('alt_target_b') if isinstance(trade_or_setup, dict) else None),
         getattr(trade_or_setup, 'side', '') if hasattr(trade_or_setup, 'side') else (trade_or_setup.get('side') if isinstance(trade_or_setup, dict) else ''),
     )
 
@@ -3074,7 +3074,7 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
 
         entry = float(_pos_entry(pos) or trade_row.get('entry') or 0.0)
         target_sl = float(trade_row.get('sl') or 0.0)
-        target_tp = _resolve_single_tp(entry, target_sl, trade_row.get('tp1'), trade_row.get('tp2'), trade_row.get('tp3'), side)
+        target_tp = _resolve_single_tp(entry, target_sl, trade_row.get('tp1'), trade_row.get('alt_target_a'), trade_row.get('alt_target_b'), side)
 
         current_sl = float(_pos_stop(pos) or _bybit_detect_open_sl_price(sym, side=side) or 0.0)
         current_tp = float(_pos_take_profit(pos) or 0.0)
@@ -3191,12 +3191,12 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
             result['be_applied'] = True
 
         desired_targets = _dedupe_price_targets([
-            float(trade_row.get('tp2') or 0.0),
-            float(trade_row.get('tp3') or 0.0),
+            float(trade_row.get('alt_target_a') or 0.0),
+            float(trade_row.get('alt_target_b') or 0.0),
         ]) if tp1_hit else _dedupe_price_targets([
             float(partial_tp or 0.0),
-            float(trade_row.get('tp2') or 0.0),
-            float(trade_row.get('tp3') or 0.0),
+            float(trade_row.get('alt_target_a') or 0.0),
+            float(trade_row.get('alt_target_b') or 0.0),
         ])
 
         need_tp_rebuild = False
@@ -4561,8 +4561,8 @@ def _autotrade_db_init():
                 entry REAL,
                 sl REAL,
                 tp1 REAL,
-                tp2 REAL,
-                tp3 REAL,
+                alt_target_a REAL,
+                alt_target_b REAL,
                 qty REAL,
                 conf INTEGER,
                 quality_score REAL,
@@ -5056,7 +5056,7 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
         if has_day:
             c.execute(
                 """INSERT INTO autotrade_trades
-                       (trade_id, uid, opened_ts, day_utc, session, setup_id, symbol, side, entry, sl, tp1, tp2, tp3, qty, conf, quality_score, atr_pct, engine, status)
+                       (trade_id, uid, opened_ts, day_utc, session, setup_id, symbol, side, entry, sl, tp1, alt_target_a, alt_target_b, qty, conf, quality_score, atr_pct, engine, status)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
                 (
                     trade_id,
@@ -5070,8 +5070,8 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
                     float(getattr(s, 'entry', 0.0) or 0.0),
                     float(getattr(s, 'sl', 0.0) or 0.0),
                     float(getattr(s, 'tp1', 0.0) or 0.0),
-                    float(getattr(s, 'tp2', 0.0) or 0.0),
-                    float(getattr(s, 'tp3', 0.0) or 0.0),
+                    float(getattr(s, 'alt_target_a', 0.0) or 0.0),
+                    float(getattr(s, 'alt_target_b', 0.0) or 0.0),
                     float(qty),
                     int(getattr(s, 'conf', 0) or 0),
                     float(getattr(s, 'quality_score', 0.0) or 0.0),
@@ -5082,7 +5082,7 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
         else:
             c.execute(
                 """INSERT INTO autotrade_trades
-                       (trade_id, uid, opened_ts, session, setup_id, symbol, side, entry, sl, tp1, tp2, tp3, qty, conf, quality_score, atr_pct, engine, status)
+                       (trade_id, uid, opened_ts, session, setup_id, symbol, side, entry, sl, tp1, alt_target_a, alt_target_b, qty, conf, quality_score, atr_pct, engine, status)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
                 (
                     trade_id,
@@ -5095,8 +5095,8 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
                     float(getattr(s, 'entry', 0.0) or 0.0),
                     float(getattr(s, 'sl', 0.0) or 0.0),
                     float(getattr(s, 'tp1', 0.0) or 0.0),
-                    float(getattr(s, 'tp2', 0.0) or 0.0),
-                    float(getattr(s, 'tp3', 0.0) or 0.0),
+                    float(getattr(s, 'alt_target_a', 0.0) or 0.0),
+                    float(getattr(s, 'alt_target_b', 0.0) or 0.0),
                     float(qty),
                     int(getattr(s, 'conf', 0) or 0),
                     float(getattr(s, 'quality_score', 0.0) or 0.0),
@@ -5457,9 +5457,9 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             return None
 
     tp1 = _as_pos_float(getattr(s, 'tp1', None))
-    tp2 = _as_pos_float(getattr(s, 'tp2', None))
-    tp3 = _as_pos_float(getattr(s, 'tp3', None))
-    final_tp = _resolve_single_tp(intended_entry, intended_sl, tp1, tp2, tp3, side)
+    alt_target_a = _as_pos_float(getattr(s, 'alt_target_a', None))
+    alt_target_b = _as_pos_float(getattr(s, 'alt_target_b', None))
+    final_tp = _resolve_single_tp(intended_entry, intended_sl, tp1, alt_target_a, alt_target_b, side)
 
     if side not in {'BUY', 'SELL'}:
         return (False, f'bad_side ({side})')
@@ -5743,7 +5743,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
     try:
         if str(AUTOTRADE_MODE).lower() != 'live':
-            s_paper = replace(s, entry=float(price_ref), sl=float(sl_for_order), tp1=float(live_final_tp or 0.0), tp2=0.0, tp3=0.0)
+            s_paper = replace(s, entry=float(price_ref), sl=float(sl_for_order), tp1=float(live_final_tp or 0.0), alt_target_a=0.0, alt_target_b=0.0)
             trade_id = _autotrade_db_add_trade(uid, session_label, s_paper, float(qty), lifecycle_state='executed_open', lifecycle_reason='paper_opened')
             _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
             try:
@@ -5904,7 +5904,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 pass
             return (False, 'live_exit_stack_incomplete')
 
-        s_live = replace(s, entry=float(filled_entry or price_ref), sl=float(sl_for_order), tp1=float(live_final_tp or 0.0), tp2=0.0, tp3=0.0)
+        s_live = replace(s, entry=float(filled_entry or price_ref), sl=float(sl_for_order), tp1=float(live_final_tp or 0.0), alt_target_a=0.0, alt_target_b=0.0)
         trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened')
         _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
         try:
@@ -6016,7 +6016,7 @@ SESSION_MIN_RR_FINAL = {
     "ASIA": 1.90,
 }
 
-SESSION_MIN_RR_TP3 = SESSION_MIN_RR_FINAL  # legacy compatibility only
+SESSION_MIN_RR_TP = SESSION_MIN_RR_FINAL  # legacy compatibility only
 
 def _session_generation_conf_floor(session_name: str) -> int:
     """Generation-time confidence floor by session.
@@ -6149,8 +6149,8 @@ class Setup:
     entry: float
     sl: float
     tp1: Optional[float]
-    tp2: Optional[float]
-    tp3: float
+    alt_target_a: Optional[float]
+    alt_target_b: float
     fut_vol_usd: float
     ch24: float
     ch4: float
@@ -6171,7 +6171,7 @@ class Setup:
     # ✅ engine label (A pullback / B momentum)
     engine: str
 
-    is_trailing_tp3: bool
+    is_trailing_alt_target_b: bool
     created_ts: float
 
 # =========================================================
@@ -6275,7 +6275,7 @@ def is_hot_coin(fut_vol_usd: float, ch24: float) -> bool:
 
 def tp_cap_pct_for_coin(fut_vol_usd: float, ch24: float) -> float:
     """
-    Dynamic TP3 cap % based on coin hotness.
+    Dynamic TP cap % based on coin hotness.
     """
     return float(TP_MAX_PCT_HOT) if is_hot_coin(fut_vol_usd, ch24) else float(TP_MAX_PCT_NORMAL)
 
@@ -6851,10 +6851,10 @@ def _learning_status_text(use_live_refresh: bool = False, sync_lifecycle: bool =
         SEP,
         "Outcome learning (last 60d)",
         f"Stage-learning source: emailed setup outcomes with TP-stage resolution | sample {int(stage.get('decided') or 0)} decided",
-        f"TP: {int(stage.get('tp1_only') or 0) + int(stage.get('tp2_plus') or 0)} | SL: {int(stage.get('losses') or 0)} | OPEN: {int(stage.get('open') or 0)}",
+        f"TP: {int(stage.get('tp1_only') or 0) + int(stage.get('alt_target_a_plus') or 0)} | SL: {int(stage.get('losses') or 0)} | OPEN: {int(stage.get('open') or 0)}",
         f"Weighted TP accuracy: {float(stage.get('weighted_win_rate') or 0.0):.1f}% | Avg staged credit/trade: {float(stage.get('avg_weighted_credit') or 0.0):.2f}",
         f"Live autotrade closes available: {int(live.get('closed') or 0)} | Net PnL: ${float(live.get('net_pnl') or 0.0):+.2f} | Win rate: {float(live.get('win_rate') or 0.0):.1f}%",
-        f"Lifecycle 30d: TP hits {int(lifecycle.get('tp1_hits') or 0) + int(lifecycle.get('tp2_hits') or 0)} | Avg TP {_trade_lifecycle_fmt_duration(lifecycle.get('avg_time_to_tp1_sec') or lifecycle.get('avg_time_to_tp2_sec'))}",
+        f"Lifecycle 30d: TP hits {int(lifecycle.get('tp1_hits') or 0) + int(lifecycle.get('alt_target_a_hits') or 0)} | Avg TP {_trade_lifecycle_fmt_duration(lifecycle.get('avg_time_to_tp1_sec') or lifecycle.get('avg_time_to_alt_target_a_sec'))}",
         *_trade_lifecycle_analytics_lines(lifecycle, heading='Lifecycle optimization feed (30d)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2),
         f"Single-TP mode | TP sample: {int(be.get('sample_tp1_plus') or 0)}",
         f"Why: single take profit is now used across signals, autotrade, and reporting.",
@@ -6879,7 +6879,7 @@ def _learning_status_text(use_live_refresh: bool = False, sync_lifecycle: bool =
 
     lines.extend([
         SEP,
-        f"Current live floors: email_quality={float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL):.1f} | screen_quality={float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN):.1f} | min_rr_tp={float(cfg.get('min_rr_tp', cfg.get('min_rr_tp3', MIN_RR_TP3)) or MIN_RR_TP3):.2f}",
+        f"Current live floors: email_quality={float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL):.1f} | screen_quality={float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN):.1f} | min_rr_tp={float(cfg.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP)) or MIN_RR_TP):.2f}",
         f"Signal win rate (completed outcomes): overall {float(_evolution_weighted_wr_from_signal_outcomes(days=EVOLUTION_LOOKBACK_DAYS).get('wr', 0.0) or 0.0):.1f}% | NY {float(_evolution_weighted_wr_from_signal_outcomes(days=EVOLUTION_LOOKBACK_DAYS, session='NY').get('wr', 0.0) or 0.0):.1f}% | trend overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')}",
         SEP,
     ])
@@ -7671,8 +7671,8 @@ def db_init():
         entry REAL NOT NULL,
         sl REAL NOT NULL,
         tp1 REAL,
-        tp2 REAL,
-        tp3 REAL NOT NULL,
+        alt_target_a REAL,
+        alt_target_b REAL NOT NULL,
         fut_vol_usd REAL NOT NULL,
         ch24 REAL NOT NULL,
         ch4 REAL NOT NULL,
@@ -7718,8 +7718,8 @@ def db_init():
         entry REAL NOT NULL DEFAULT 0,
         sl REAL NOT NULL DEFAULT 0,
         tp1 REAL,
-        tp2 REAL,
-        tp3 REAL NOT NULL DEFAULT 0,
+        alt_target_a REAL,
+        alt_target_b REAL NOT NULL DEFAULT 0,
         fut_vol_usd REAL NOT NULL DEFAULT 0,
         ch24 REAL NOT NULL DEFAULT 0,
         ch4 REAL NOT NULL DEFAULT 0,
@@ -7751,8 +7751,8 @@ def db_init():
             'entry': "REAL NOT NULL DEFAULT 0",
             'sl': "REAL NOT NULL DEFAULT 0",
             'tp1': "REAL",
-            'tp2': "REAL",
-            'tp3': "REAL NOT NULL DEFAULT 0",
+            'alt_target_a': "REAL",
+            'alt_target_b': "REAL NOT NULL DEFAULT 0",
             'fut_vol_usd': "REAL NOT NULL DEFAULT 0",
             'ch24': "REAL NOT NULL DEFAULT 0",
             'ch4': "REAL NOT NULL DEFAULT 0",
@@ -7819,8 +7819,8 @@ def db_init():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS signal_outcomes (
         setup_id TEXT PRIMARY KEY,
-        outcome TEXT NOT NULL,              -- WIN_TP1 | WIN_TP2 | WIN_TP3 | LOSS | OPEN | AMBIGUOUS
-        hit_level TEXT,                     -- TP1 | TP2 | TP3 | SL | NONE
+        outcome TEXT NOT NULL,              -- WIN_TP1 | WIN_TP | WIN_TP | LOSS | OPEN | AMBIGUOUS
+        hit_level TEXT,                     -- TP1 | TP | TP | SL | NONE
         hit_ts REAL,                        -- UTC epoch seconds of first touch (best effort)
         evaluated_ts REAL NOT NULL,          -- UTC epoch seconds
         horizon_hours INTEGER NOT NULL DEFAULT 24,
@@ -8678,8 +8678,8 @@ def _spike_reversal_candidates(
                 r = max(1e-12, sl - entry)
 
                 tp1 = entry - 1.0 * r
-                tp2 = entry - 1.6 * r
-                tp3 = entry - 2.3 * r
+                alt_target_a = 0.0
+                alt_target_b = 0.0
 
                 conf = 82
                 if weak_confirm:
@@ -8696,8 +8696,8 @@ def _spike_reversal_candidates(
                     "entry": float(entry),
                     "sl": float(sl),
                     "tp1": float(tp1),
-                    "tp2": float(tp2),
-                    "tp3": float(tp3),
+                    "alt_target_a": float(alt_target_a),
+                    "alt_target_b": float(alt_target_b),
                     "vol": float(vol24),
                     "why": f"Downtrend (EMA50<EMA200). 1H upper-wick spike rejection (wick={upper_ratio:.2f}, range={rng/atr_1h:.2f} ATR). " + ("15m confirm: WEAK" if weak_confirm else "15m confirm: OK"),
                 })
@@ -8713,8 +8713,8 @@ def _spike_reversal_candidates(
                 r = max(1e-12, entry - sl)
 
                 tp1 = entry + 1.0 * r
-                tp2 = entry + 1.6 * r
-                tp3 = entry + 2.3 * r
+                alt_target_a = 0.0
+                alt_target_b = 0.0
 
                 conf = 82
                 if weak_confirm:
@@ -8731,8 +8731,8 @@ def _spike_reversal_candidates(
                     "entry": float(entry),
                     "sl": float(sl),
                     "tp1": float(tp1),
-                    "tp2": float(tp2),
-                    "tp3": float(tp3),
+                    "alt_target_a": float(alt_target_a),
+                    "alt_target_b": float(alt_target_b),
                     "vol": float(vol24),
                     "why": f"Uptrend (EMA50>EMA200). 1H lower-wick spike rejection (wick={lower_ratio:.2f}, range={rng/atr_1h:.2f} ATR). " + ("15m confirm: WEAK" if weak_confirm else "15m confirm: OK"),
                 })
@@ -9510,9 +9510,9 @@ def _trade_lifecycle_migrate() -> None:
                     entry REAL,
                     sl REAL,
                     tp1 REAL,
-                    tp2 REAL,
+                    alt_target_a REAL,
                     rr_tp1 REAL,
-                    rr_tp2 REAL,
+                    rr_tp REAL,
                     opened_ts REAL,
                     closed_ts REAL,
                     open_day TEXT NOT NULL DEFAULT '',
@@ -9525,7 +9525,7 @@ def _trade_lifecycle_migrate() -> None:
                     quality_score REAL,
                     engine TEXT NOT NULL DEFAULT '',
                     tp1_hit_ts REAL,
-                    tp2_hit_ts REAL,
+                    alt_target_a_hit_ts REAL,
                     sl_hit_ts REAL,
                     be_armed_ts REAL,
                     be_hit_ts REAL,
@@ -9537,7 +9537,7 @@ def _trade_lifecycle_migrate() -> None:
                     r_multiple REAL,
                     duration_total_sec REAL,
                     duration_to_tp1_sec REAL,
-                    duration_to_tp2_sec REAL,
+                    duration_to_alt_target_a_sec REAL,
                     duration_to_sl_sec REAL,
                     source_confidence TEXT NOT NULL DEFAULT '',
                     source_note TEXT NOT NULL DEFAULT '',
@@ -9571,9 +9571,9 @@ def _trade_lifecycle_migrate() -> None:
             add_col('entry', 'entry REAL')
             add_col('sl', 'sl REAL')
             add_col('tp1', 'tp1 REAL')
-            add_col('tp2', 'tp2 REAL')
+            add_col('alt_target_a', 'alt_target_a REAL')
             add_col('rr_tp1', 'rr_tp1 REAL')
-            add_col('rr_tp2', 'rr_tp2 REAL')
+            add_col('rr_tp', 'rr_tp REAL')
             add_col('opened_ts', 'opened_ts REAL')
             add_col('closed_ts', 'closed_ts REAL')
             add_col('open_day', "open_day TEXT NOT NULL DEFAULT ''")
@@ -9586,7 +9586,7 @@ def _trade_lifecycle_migrate() -> None:
             add_col('quality_score', 'quality_score REAL')
             add_col('engine', "engine TEXT NOT NULL DEFAULT ''")
             add_col('tp1_hit_ts', 'tp1_hit_ts REAL')
-            add_col('tp2_hit_ts', 'tp2_hit_ts REAL')
+            add_col('alt_target_a_hit_ts', 'alt_target_a_hit_ts REAL')
             add_col('sl_hit_ts', 'sl_hit_ts REAL')
             add_col('be_armed_ts', 'be_armed_ts REAL')
             add_col('be_hit_ts', 'be_hit_ts REAL')
@@ -9598,7 +9598,7 @@ def _trade_lifecycle_migrate() -> None:
             add_col('r_multiple', 'r_multiple REAL')
             add_col('duration_total_sec', 'duration_total_sec REAL')
             add_col('duration_to_tp1_sec', 'duration_to_tp1_sec REAL')
-            add_col('duration_to_tp2_sec', 'duration_to_tp2_sec REAL')
+            add_col('duration_to_alt_target_a_sec', 'duration_to_alt_target_a_sec REAL')
             add_col('duration_to_sl_sec', 'duration_to_sl_sec REAL')
             add_col('source_confidence', "source_confidence TEXT NOT NULL DEFAULT ''")
             add_col('source_note', "source_note TEXT NOT NULL DEFAULT ''")
@@ -9618,7 +9618,7 @@ def _trade_lifecycle_result_label(path: str) -> str:
     p = str(path or '').upper().strip()
     if p == 'HIT_SL_LOSS':
         return 'hit SL (Loss)'
-    if p in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP2_WIN', 'HIT_TP_WIN'}:
+    if p in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP_WIN', 'HIT_TP_WIN'}:
         return 'hit TP (Win)'
     if p == 'MANUAL_OR_UNKNOWN_CLOSE':
         return 'manual / unknown exchange close'
@@ -9820,8 +9820,8 @@ def _trade_lifecycle_levels_hit(row: dict) -> list[str]:
     except Exception:
         pass
     try:
-        if float(row.get('tp2_hit_ts') or 0.0) > 0:
-            levels.append('TP2')
+        if float(row.get('alt_target_a_hit_ts') or 0.0) > 0:
+            levels.append('TP')
     except Exception:
         pass
     try:
@@ -10129,12 +10129,12 @@ def _trade_lifecycle_upsert_row(row: dict) -> None:
         return
     _trade_lifecycle_migrate()
     cols = [
-        'trade_id', 'setup_id', 'uid', 'symbol', 'side', 'entry', 'sl', 'tp1', 'tp2', 'rr_tp1', 'rr_tp2',
+        'trade_id', 'setup_id', 'uid', 'symbol', 'side', 'entry', 'sl', 'tp1', 'alt_target_a', 'rr_tp1', 'rr_tp',
         'opened_ts', 'closed_ts', 'open_day', 'close_day', 'open_session', 'close_session',
-        'risk_usdt', 'risk_pct', 'confidence', 'quality_score', 'engine', 'tp1_hit_ts', 'tp2_hit_ts',
+        'risk_usdt', 'risk_pct', 'confidence', 'quality_score', 'engine', 'tp1_hit_ts', 'alt_target_a_hit_ts',
         'sl_hit_ts', 'be_armed_ts', 'be_hit_ts', 'result_path', 'result_label', 'close_reason',
         'risk_free_flag', 'pnl_usdt', 'r_multiple', 'duration_total_sec', 'duration_to_tp1_sec',
-        'duration_to_tp2_sec', 'duration_to_sl_sec', 'source_confidence', 'source_note',
+        'duration_to_alt_target_a_sec', 'duration_to_sl_sec', 'source_confidence', 'source_note',
         'exchange_confirmed', 'last_sync_ts', 'open_reason'
     ]
     vals = [row.get(c) for c in cols]
@@ -10218,14 +10218,14 @@ def _trade_lifecycle_query_rows(uid: int, start_ts: float = 0.0, session: str = 
 def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
     rows = [dict(r) for r in (rows or [])]
     total = len(rows)
-    wins = sum(1 for r in rows if str(r.get('result_path') or '').upper() == 'HIT_TP2_WIN')
+    wins = sum(1 for r in rows if str(r.get('result_path') or '').upper() == 'HIT_TP_WIN')
     partial_wins = sum(1 for r in rows if str(r.get('result_path') or '').upper() in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'})
     losses = sum(1 for r in rows if str(r.get('result_path') or '').upper() == 'HIT_SL_LOSS')
     open_n = sum(1 for r in rows if str(r.get('result_path') or '').upper() == 'OPEN')
     manual_unknown = sum(1 for r in rows if str(r.get('result_path') or '').upper() == 'MANUAL_OR_UNKNOWN_CLOSE')
     closed_decided = wins + partial_wins + losses
     tp1_hits = sum(1 for r in rows if float(r.get('tp1_hit_ts') or 0.0) > 0 or str(r.get('result_path') or '').upper() in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'})
-    tp2_hits = sum(1 for r in rows if float(r.get('tp2_hit_ts') or 0.0) > 0 or str(r.get('result_path') or '').upper() == 'HIT_TP2_WIN')
+    alt_target_a_hits = sum(1 for r in rows if float(r.get('alt_target_a_hit_ts') or 0.0) > 0 or str(r.get('result_path') or '').upper() == 'HIT_TP_WIN')
     sl_hits = sum(1 for r in rows if float(r.get('sl_hit_ts') or 0.0) > 0 or str(r.get('result_path') or '').upper() in {'HIT_SL_LOSS', 'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'})
     risk_free = sum(1 for r in rows if str(r.get('risk_free_flag') or '').upper() == 'YES')
     pnls = [float(r.get('pnl_usdt') or 0.0) for r in rows if r.get('pnl_usdt') is not None and str(r.get('result_path') or '').upper() != 'OPEN']
@@ -10234,14 +10234,14 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
     avg_r = (sum(rs) / len(rs)) if rs else 0.0
     win_rate = ((wins + partial_wins) / closed_decided * 100.0) if closed_decided > 0 else 0.0
 
-    by_open_session = defaultdict(lambda: {'total': 0, 'closed': 0, 'wins': 0, 'partial_wins': 0, 'losses': 0, 'manual_unknown': 0, 'tp1_hits': 0, 'tp2_hits': 0, 'sl_hits': 0, 'risk_free': 0, 'r': [], 'pnl': []})
+    by_open_session = defaultdict(lambda: {'total': 0, 'closed': 0, 'wins': 0, 'partial_wins': 0, 'losses': 0, 'manual_unknown': 0, 'tp1_hits': 0, 'alt_target_a_hits': 0, 'sl_hits': 0, 'risk_free': 0, 'r': [], 'pnl': []})
     by_close_session = defaultdict(lambda: {'total': 0, 'closed': 0, 'wins': 0, 'partial_wins': 0, 'losses': 0, 'manual_unknown': 0})
     by_engine = defaultdict(lambda: {'closed': 0, 'r': [], 'wins': 0, 'partial_wins': 0, 'losses': 0})
     by_conf = defaultdict(lambda: {'closed': 0, 'r': [], 'wins': 0, 'losses': 0, 'partial_wins': 0})
     by_quality = defaultdict(lambda: {'closed': 0, 'r': [], 'wins': 0, 'losses': 0, 'partial_wins': 0})
-    symbols = defaultdict(lambda: {'trades': 0, 'wins': 0, 'partial_wins': 0, 'losses': 0, 'tp1_hits': 0, 'tp2_hits': 0, 'manual_unknown': 0, 'net_pnl': 0.0, 'r': []})
+    symbols = defaultdict(lambda: {'trades': 0, 'wins': 0, 'partial_wins': 0, 'losses': 0, 'tp1_hits': 0, 'alt_target_a_hits': 0, 'manual_unknown': 0, 'net_pnl': 0.0, 'r': []})
     durations_tp1 = []
-    durations_tp2 = []
+    durations_alt_target_a = []
     durations_sl = []
 
     for r in rows:
@@ -10262,7 +10262,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
             bo['pnl'].append(pnl)
             if rr is not None:
                 bo['r'].append(rr)
-        if path == 'HIT_TP2_WIN':
+        if path == 'HIT_TP_WIN':
             bo['wins'] += 1
         elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
             bo['partial_wins'] += 1
@@ -10274,10 +10274,10 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
             bo['tp1_hits'] += 1
             if r.get('duration_to_tp1_sec') is not None:
                 durations_tp1.append(float(r.get('duration_to_tp1_sec') or 0.0))
-        if float(r.get('tp2_hit_ts') or 0.0) > 0:
-            bo['tp2_hits'] += 1
-            if r.get('duration_to_tp2_sec') is not None:
-                durations_tp2.append(float(r.get('duration_to_tp2_sec') or 0.0))
+        if float(r.get('alt_target_a_hit_ts') or 0.0) > 0:
+            bo['alt_target_a_hits'] += 1
+            if r.get('duration_to_alt_target_a_sec') is not None:
+                durations_alt_target_a.append(float(r.get('duration_to_alt_target_a_sec') or 0.0))
         if float(r.get('sl_hit_ts') or 0.0) > 0:
             bo['sl_hits'] += 1
             if r.get('duration_to_sl_sec') is not None:
@@ -10289,7 +10289,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
         if path != 'OPEN':
             bc['total'] += 1
             bc['closed'] += 1
-            if path == 'HIT_TP2_WIN':
+            if path == 'HIT_TP_WIN':
                 bc['wins'] += 1
             elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
                 bc['partial_wins'] += 1
@@ -10303,7 +10303,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
             be['closed'] += 1
             if rr is not None:
                 be['r'].append(rr)
-        if path == 'HIT_TP2_WIN':
+        if path == 'HIT_TP_WIN':
             be['wins'] += 1
         elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
             be['partial_wins'] += 1
@@ -10315,7 +10315,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
             bcg['closed'] += 1
             if rr is not None:
                 bcg['r'].append(rr)
-        if path == 'HIT_TP2_WIN':
+        if path == 'HIT_TP_WIN':
             bcg['wins'] += 1
         elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
             bcg['partial_wins'] += 1
@@ -10327,7 +10327,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
             bq['closed'] += 1
             if rr is not None:
                 bq['r'].append(rr)
-        if path == 'HIT_TP2_WIN':
+        if path == 'HIT_TP_WIN':
             bq['wins'] += 1
         elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
             bq['partial_wins'] += 1
@@ -10339,7 +10339,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
         sy['net_pnl'] += pnl
         if rr is not None:
             sy['r'].append(rr)
-        if path == 'HIT_TP2_WIN':
+        if path == 'HIT_TP_WIN':
             sy['wins'] += 1
         elif path in {'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL'}:
             sy['partial_wins'] += 1
@@ -10349,22 +10349,22 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
             sy['manual_unknown'] += 1
         if float(r.get('tp1_hit_ts') or 0.0) > 0:
             sy['tp1_hits'] += 1
-        if float(r.get('tp2_hit_ts') or 0.0) > 0:
-            sy['tp2_hits'] += 1
+        if float(r.get('alt_target_a_hit_ts') or 0.0) > 0:
+            sy['alt_target_a_hits'] += 1
 
     def _finalize_group(src: dict) -> dict:
         out = {}
         for k, v in src.items():
             decided_k = int(v.get('wins', 0) or 0) + int(v.get('partial_wins', 0) or 0) + int(v.get('losses', 0) or 0)
             tp1_hits_k = int(v.get('tp1_hits', 0) or 0)
-            tp2_hits_k = int(v.get('tp2_hits', 0) or 0)
+            alt_target_a_hits_k = int(v.get('alt_target_a_hits', 0) or 0)
             out[k] = {
                 **{kk: vv for kk, vv in v.items() if kk not in {'r', 'pnl'}},
                 'avg_r': (sum(v.get('r') or []) / len(v.get('r') or [])) if (v.get('r') or []) else 0.0,
                 'avg_pnl': (sum(v.get('pnl') or []) / len(v.get('pnl') or [])) if (v.get('pnl') or []) else 0.0,
                 'win_rate': ((int(v.get('wins', 0) or 0) + int(v.get('partial_wins', 0) or 0)) / decided_k * 100.0) if decided_k > 0 else 0.0,
                 'tp1_hit_rate': (tp1_hits_k / int(v.get('total', 0) or 1) * 100.0) if int(v.get('total', 0) or 0) > 0 else 0.0,
-                'tp2_conversion_after_tp1': (tp2_hits_k / tp1_hits_k * 100.0) if tp1_hits_k > 0 else 0.0,
+                'alt_target_a_conversion_after_tp1': (alt_target_a_hits_k / tp1_hits_k * 100.0) if tp1_hits_k > 0 else 0.0,
                 'sl_before_tp1_rate': (int(v.get('losses', 0) or 0) / decided_k * 100.0) if decided_k > 0 else 0.0,
                 'risk_free_save_rate': (int(v.get('risk_free', 0) or 0) / tp1_hits_k * 100.0) if tp1_hits_k > 0 else 0.0,
             }
@@ -10378,7 +10378,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
 
     symbol_rows = []
     for sym, v in symbols.items():
-        tp1_only_fails = max(0, int(v.get('tp1_hits', 0) or 0) - int(v.get('tp2_hits', 0) or 0))
+        tp1_only_fails = max(0, int(v.get('tp1_hits', 0) or 0) - int(v.get('alt_target_a_hits', 0) or 0))
         symbol_rows.append({
             'symbol': sym,
             'trades': int(v.get('trades', 0) or 0),
@@ -10386,7 +10386,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
             'partial_wins': int(v.get('partial_wins', 0) or 0),
             'losses': int(v.get('losses', 0) or 0),
             'tp1_hits': int(v.get('tp1_hits', 0) or 0),
-            'tp2_hits': int(v.get('tp2_hits', 0) or 0),
+            'alt_target_a_hits': int(v.get('alt_target_a_hits', 0) or 0),
             'tp1_only_fails': int(tp1_only_fails),
             'net_pnl': float(v.get('net_pnl') or 0.0),
             'avg_r': (sum(v.get('r') or []) / len(v.get('r') or [])) if (v.get('r') or []) else 0.0,
@@ -10399,11 +10399,11 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
         reverse=True,
     )[:5]
 
-    tp2_conv = (tp2_hits / tp1_hits * 100.0) if tp1_hits > 0 else 0.0
+    alt_target_a_conv = (alt_target_a_hits / tp1_hits * 100.0) if tp1_hits > 0 else 0.0
     sl_before_tp1_rate = (losses / closed_decided * 100.0) if closed_decided > 0 else 0.0
     risk_free_save_rate = (risk_free / tp1_hits * 100.0) if tp1_hits > 0 else 0.0
     signs = []
-    if tp1_hits >= 8 and tp2_conv < 35.0:
+    if tp1_hits >= 8 and alt_target_a_conv < 35.0:
         signs.append('Take profit may still be too ambitious for some symbols.')
     if closed_decided >= 8 and sl_before_tp1_rate >= 55.0:
         signs.append('Many trades hit SL before TP: stop may be too tight or entries too early.')
@@ -10425,18 +10425,18 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
         'closed': int(sum(1 for r in rows if str(r.get('result_path') or '').upper() != 'OPEN')),
         'closed_decided': int(closed_decided),
         'tp1_hits': int(tp1_hits),
-        'tp2_hits': int(tp2_hits),
+        'alt_target_a_hits': int(alt_target_a_hits),
         'sl_hits': int(sl_hits),
         'risk_free_trades': int(risk_free),
         'avg_pnl': float(avg_pnl),
         'avg_r': float(avg_r),
         'net_pnl': float(sum(pnls) if pnls else 0.0),
         'win_rate': float(win_rate),
-        'tp2_conversion_after_tp1': float(tp2_conv),
+        'alt_target_a_conversion_after_tp1': float(alt_target_a_conv),
         'sl_before_tp1_rate': float(sl_before_tp1_rate),
         'risk_free_save_rate': float(risk_free_save_rate),
         'avg_time_to_tp1_sec': float(avg_tp1),
-        'avg_time_to_tp2_sec': float((sum(durations_tp2) / len(durations_tp2)) if durations_tp2 else 0.0),
+        'avg_time_to_alt_target_a_sec': float((sum(durations_alt_target_a) / len(durations_alt_target_a)) if durations_alt_target_a else 0.0),
         'avg_time_to_sl_sec': float(avg_sl),
         'by_open_session': by_open_session_out,
         'by_close_session': by_close_session_out,
@@ -10445,7 +10445,7 @@ def _trade_lifecycle_metrics_from_rows(rows: list[dict]) -> dict:
         'by_quality_bucket': by_quality_out,
         'top_winning_symbols': top_winners,
         'top_losing_symbols': top_losers,
-        'symbols_tp1_but_fail_tp2': tp1_fail_symbols,
+        'symbols_tp1_but_fail_alt_target_a': tp1_fail_symbols,
         'signs': signs,
     }
 
@@ -10462,16 +10462,16 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
     entry = float(trade.get('entry') or 0.0)
     sl = float(trade.get('sl') or 0.0)
     tp1_raw = trade.get('tp1')
-    tp2_raw = trade.get('tp2')
-    tp3_raw = trade.get('tp3')
-    tp1, tp2, _ = _ensure_three_tps(entry, sl, float(tp3_raw or 0.0), tp1_raw, tp2_raw, side)
+    alt_target_a_raw = trade.get('alt_target_a')
+    alt_target_b_raw = trade.get('alt_target_b')
+    tp1, alt_target_a, _ = _ensure_three_tps(entry, sl, float(alt_target_b_raw or 0.0), tp1_raw, alt_target_a_raw, side)
     opened_ts = float(trade.get('opened_ts') or 0.0)
     closed_ts_journal = float(trade.get('closed_ts') or 0.0)
     qty = abs(float(trade.get('qty') or 0.0))
     risk_usdt = float(_autotrade_estimated_risk_usd(entry, sl, qty) or 0.0)
     risk_pct, risk_note = _trade_lifecycle_risk_pct_estimate(int(uid), risk_usdt)
     rr1 = float(rr_to_tp(entry, sl, tp1) or 0.0) if entry > 0 and sl > 0 and float(tp1 or 0.0) > 0 else None
-    rr2 = float(rr_to_tp(entry, sl, tp2) or 0.0) if entry > 0 and sl > 0 and float(tp2 or 0.0) > 0 else None
+    rr2 = float(rr_to_tp(entry, sl, alt_target_a) or 0.0) if entry > 0 and sl > 0 and float(alt_target_a or 0.0) > 0 else None
 
     open_session = str(trade.get('session') or '').upper().strip() or str((trade.get('source_session') or '')).upper().strip() or _session_label_from_ts(opened_ts)
     open_day = _autotrade_trade_day_label(opened_ts, user) if opened_ts > 0 else ''
@@ -10488,14 +10488,14 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
     matched_pnl = _trade_lifecycle_match_closed_pnl(symbol, side, closed_pnl_rows or [], opened_ts, window_end)
 
     tp1_events = _trade_lifecycle_pick_target_events(float(tp1 or 0.0), matched_orders, kind='tp') if float(tp1 or 0.0) > 0 else []
-    tp2_events = _trade_lifecycle_pick_target_events(float(tp2 or 0.0), matched_orders, kind='tp') if float(tp2 or 0.0) > 0 else []
+    alt_target_a_events = _trade_lifecycle_pick_target_events(float(alt_target_a or 0.0), matched_orders, kind='tp') if float(alt_target_a or 0.0) > 0 else []
     sl_events = _trade_lifecycle_generic_sl_events(matched_orders)
     manual_events = _trade_lifecycle_manual_close_events(matched_orders, side)
     positive_pnl_events = [ev for ev in matched_pnl if float(ev.get('pnl') or 0.0) > 0.0]
     negative_pnl_events = [ev for ev in matched_pnl if float(ev.get('pnl') or 0.0) < 0.0]
 
     tp1_hit_ts = _trade_lifecycle_pick_ts([ev.get('ts') for ev in tp1_events], pick='min')
-    tp2_hit_ts = _trade_lifecycle_pick_ts([ev.get('ts') for ev in tp2_events], pick='min')
+    alt_target_a_hit_ts = _trade_lifecycle_pick_ts([ev.get('ts') for ev in alt_target_a_events], pick='min')
     sl_hit_ts = _trade_lifecycle_pick_ts([ev.get('ts') for ev in sl_events], pick='min')
 
     source_bits = []
@@ -10503,10 +10503,10 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
         source_bits.append(str(trade.get('_synthetic_note') or 'setup_lifecycle_backfill'))
     source_conf = 'LOW'
     exchange_confirmed = 0
-    if tp1_events or tp2_events or sl_events or manual_events or matched_pnl:
+    if tp1_events or alt_target_a_events or sl_events or manual_events or matched_pnl:
         exchange_confirmed = 1
         source_conf = 'MEDIUM'
-    if tp1_events or tp2_events or sl_events:
+    if tp1_events or alt_target_a_events or sl_events:
         source_conf = 'HIGH'
         source_bits.append('bybit_order_history')
     elif matched_pnl:
@@ -10522,9 +10522,9 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
             live_entry = 0.0
         if live_entry > 0:
             entry = float(live_entry)
-            tp1, tp2, _ = _ensure_three_tps(entry, sl, float(tp3_raw or 0.0), tp1_raw, tp2_raw, side)
+            tp1, alt_target_a, _ = _ensure_three_tps(entry, sl, float(alt_target_b_raw or 0.0), tp1_raw, alt_target_a_raw, side)
             rr1 = float(rr_to_tp(entry, sl, tp1) or 0.0) if entry > 0 and sl > 0 and float(tp1 or 0.0) > 0 else None
-            rr2 = float(rr_to_tp(entry, sl, tp2) or 0.0) if entry > 0 and sl > 0 and float(tp2 or 0.0) > 0 else None
+            rr2 = float(rr_to_tp(entry, sl, alt_target_a) or 0.0) if entry > 0 and sl > 0 and float(alt_target_a or 0.0) > 0 else None
     if qty <= 0 and live_qty > 0:
         qty = float(live_qty)
         risk_usdt = float(_autotrade_estimated_risk_usd(entry, sl, qty) or 0.0)
@@ -10598,11 +10598,11 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
         result_label = _trade_lifecycle_result_label(result_path)
         close_reason = result_label
         final_close_ts = closed_ts_journal or _trade_lifecycle_pick_ts([ev.get('ts') for ev in matched_pnl] + [ev.get('ts') for ev in manual_events], pick='max')
-        if tp2_hit_ts is not None and (sl_hit_ts is None or float(tp2_hit_ts) <= float(sl_hit_ts) + 120.0):
-            result_path = 'HIT_TP2_WIN'
+        if alt_target_a_hit_ts is not None and (sl_hit_ts is None or float(alt_target_a_hit_ts) <= float(sl_hit_ts) + 120.0):
+            result_path = 'HIT_TP_WIN'
             result_label = _trade_lifecycle_result_label(result_path)
             close_reason = 'hit TP'
-            final_close_ts = float(tp2_hit_ts)
+            final_close_ts = float(alt_target_a_hit_ts)
         elif sl_hit_ts is not None:
             if tp1_confirmed:
                 if be_sl_event is not None and _trade_lifecycle_is_be_or_better(side, float(be_sl_event.get('price') or 0.0), entry):
@@ -10646,7 +10646,7 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
         elif be_stop_history_event is not None:
             risk_free_flag = 'YES'
             be_armed_ts = float(tp1_hit_ts or be_stop_history_event.get('ts') or 0.0) or None
-        elif result_path == 'HIT_TP2_WIN':
+        elif result_path == 'HIT_TP_WIN':
             risk_free_flag = 'UNKNOWN'
         elif result_path == 'HIT_TP1_THEN_SL':
             risk_free_flag = 'NO'
@@ -10671,7 +10671,7 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
     close_session = _session_label_from_ts(close_ts) if close_ts else ''
     duration_total_sec = (float(close_ts) - float(opened_ts)) if close_ts and opened_ts > 0 else ((now_ts - float(opened_ts)) if opened_ts > 0 else None)
     duration_to_tp1_sec = (float(tp1_hit_ts) - float(opened_ts)) if tp1_hit_ts and opened_ts > 0 else None
-    duration_to_tp2_sec = (float(tp2_hit_ts) - float(opened_ts)) if tp2_hit_ts and opened_ts > 0 else None
+    duration_to_alt_target_a_sec = (float(alt_target_a_hit_ts) - float(opened_ts)) if alt_target_a_hit_ts and opened_ts > 0 else None
     duration_to_sl_sec = (float(sl_hit_ts) - float(opened_ts)) if sl_hit_ts and opened_ts > 0 else None
 
     if result_path == 'MANUAL_OR_UNKNOWN_CLOSE' and manual_events:
@@ -10689,7 +10689,7 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
         exchange_confirmed = 1
         if source_conf == 'LOW':
             source_conf = 'MEDIUM'
-    elif result_path in {'HIT_SL_LOSS', 'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP2_WIN'}:
+    elif result_path in {'HIT_SL_LOSS', 'HIT_TP1_THEN_BE_SL', 'HIT_TP1_THEN_SL', 'HIT_TP_WIN'}:
         exchange_confirmed = 1
 
     if not source_bits and live_mode:
@@ -10702,8 +10702,8 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
         events.append({'event_type': 'OPEN', 'event_ts': opened_ts, 'price': entry, 'qty': qty, 'source': 'journal', 'details': {'open_session': open_session, 'setup_id': setup_id}})
     if tp1_hit_ts is not None:
         events.append({'event_type': 'TP1_HIT', 'event_ts': tp1_hit_ts, 'price': float(tp1 or 0.0), 'qty': None, 'source': 'exchange' if exchange_confirmed else 'inferred', 'details': {'symbol': symbol}})
-    if tp2_hit_ts is not None:
-        events.append({'event_type': 'TP2_HIT', 'event_ts': tp2_hit_ts, 'price': float(tp2 or 0.0), 'qty': None, 'source': 'exchange' if exchange_confirmed else 'inferred', 'details': {'symbol': symbol}})
+    if alt_target_a_hit_ts is not None:
+        events.append({'event_type': 'TP_HIT', 'event_ts': alt_target_a_hit_ts, 'price': float(alt_target_a or 0.0), 'qty': None, 'source': 'exchange' if exchange_confirmed else 'inferred', 'details': {'symbol': symbol}})
     if sl_hit_ts is not None:
         sl_px = float((be_sl_event or non_be_sl_event or {}).get('price') or sl or 0.0)
         events.append({'event_type': 'SL_HIT', 'event_ts': sl_hit_ts, 'price': sl_px, 'qty': None, 'source': 'exchange' if exchange_confirmed else 'inferred', 'details': {'symbol': symbol}})
@@ -10723,9 +10723,9 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
         'entry': entry,
         'sl': sl,
         'tp1': float(tp1 or 0.0) if float(tp1 or 0.0) > 0 else None,
-        'tp2': float(tp2 or 0.0) if float(tp2 or 0.0) > 0 else None,
+        'alt_target_a': float(alt_target_a or 0.0) if float(alt_target_a or 0.0) > 0 else None,
         'rr_tp1': rr1,
-        'rr_tp2': rr2,
+        'rr_tp': rr2,
         'opened_ts': opened_ts if opened_ts > 0 else None,
         'closed_ts': close_ts,
         'open_day': open_day,
@@ -10739,7 +10739,7 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
         'engine': str(trade.get('engine') or ''),
         'open_reason': open_reason,
         'tp1_hit_ts': tp1_hit_ts,
-        'tp2_hit_ts': tp2_hit_ts,
+        'alt_target_a_hit_ts': alt_target_a_hit_ts,
         'sl_hit_ts': sl_hit_ts,
         'be_armed_ts': be_armed_ts,
         'be_hit_ts': be_hit_ts,
@@ -10751,7 +10751,7 @@ def _trade_lifecycle_build_trade_row(uid: int, trade: dict, user: dict, next_ope
         'r_multiple': r_multiple,
         'duration_total_sec': duration_total_sec,
         'duration_to_tp1_sec': duration_to_tp1_sec,
-        'duration_to_tp2_sec': duration_to_tp2_sec,
+        'duration_to_alt_target_a_sec': duration_to_alt_target_a_sec,
         'duration_to_sl_sec': duration_to_sl_sec,
         'source_confidence': source_conf,
         'source_note': '; '.join(dict.fromkeys([s for s in source_bits if s]))[:220],
@@ -10792,8 +10792,8 @@ def _trade_lifecycle_signal_snapshot(setup_id: str) -> dict:
             'entry': float(sig.get('entry') or 0.0) if sig.get('entry') is not None else 0.0,
             'sl': float(sig.get('sl') or 0.0) if sig.get('sl') is not None else 0.0,
             'tp1': float(sig.get('tp1') or 0.0) if sig.get('tp1') is not None else 0.0,
-            'tp2': float(sig.get('tp2') or 0.0) if sig.get('tp2') is not None else 0.0,
-            'tp3': float(sig.get('tp3') or 0.0) if sig.get('tp3') is not None else 0.0,
+            'alt_target_a': float(sig.get('alt_target_a') or 0.0) if sig.get('alt_target_a') is not None else 0.0,
+            'alt_target_b': float(sig.get('alt_target_b') or 0.0) if sig.get('alt_target_b') is not None else 0.0,
         })
     try:
         with sqlite3.connect(DB_PATH) as con:
@@ -10939,8 +10939,8 @@ def _trade_lifecycle_collect_candidates(owner_uid: int, sync_cutoff: float, days
                 'entry': float((snap.get('entry') or 0.0) or 0.0),
                 'sl': float((snap.get('sl') or 0.0) or 0.0),
                 'tp1': float((snap.get('tp1') or 0.0) or 0.0),
-                'tp2': float((snap.get('tp2') or 0.0) or 0.0),
-                'tp3': float((snap.get('tp3') or 0.0) or 0.0),
+                'alt_target_a': float((snap.get('alt_target_a') or 0.0) or 0.0),
+                'alt_target_b': float((snap.get('alt_target_b') or 0.0) or 0.0),
                 'qty': 0.0,
                 'conf': snap.get('conf'),
                 'quality_score': None,
@@ -11018,8 +11018,8 @@ def _trade_lifecycle_collect_candidates(owner_uid: int, sync_cutoff: float, days
                 'entry': float(details.get('entry') or snap.get('entry') or 0.0),
                 'sl': float(details.get('sl') or snap.get('sl') or 0.0),
                 'tp1': float(details.get('tp1') or snap.get('tp1') or 0.0),
-                'tp2': float(details.get('tp2') or snap.get('tp2') or 0.0),
-                'tp3': float(details.get('tp3') or snap.get('tp3') or 0.0),
+                'alt_target_a': float(details.get('alt_target_a') or snap.get('alt_target_a') or 0.0),
+                'alt_target_b': float(details.get('alt_target_b') or snap.get('alt_target_b') or 0.0),
                 'qty': float(details.get('qty') or 0.0),
                 'conf': (details.get('conf') if details.get('conf') is not None else snap.get('conf')),
                 'quality_score': (float(details.get('quality_score')) if details.get('quality_score') not in (None, '') else None),
@@ -11254,7 +11254,7 @@ def _trade_lifecycle_recent_email_rows(owner_uid: int, start_ts: float, session:
             s.entry,
             s.sl,
             s.tp1,
-            s.tp2,
+            s.alt_target_a,
             tl.trade_id,
             tl.result_path,
             tl.result_label,
@@ -11309,7 +11309,7 @@ def _trade_lifecycle_render_row(r: dict, user: dict, show_trade_id: bool = True)
     engine_txt = _trade_lifecycle_engine_text(r.get('engine'))
     risk_free_txt = _trade_lifecycle_bool_text(r.get('risk_free_flag'))
     tp1_hit_txt = _trade_lifecycle_hit_text(r.get('tp1_hit_ts'))
-    tp2_hit_txt = _trade_lifecycle_hit_text(r.get('tp2_hit_ts'))
+    alt_target_a_hit_txt = _trade_lifecycle_hit_text(r.get('alt_target_a_hit_ts'))
     sl_hit_txt = _trade_lifecycle_hit_text(r.get('sl_hit_ts'))
     be_move_txt = risk_free_txt if tp1_hit_txt == 'YES' else 'NO'
     header = f"• {symbol} {side} | {str(r.get('result_path') or '').upper()}"
@@ -11319,22 +11319,22 @@ def _trade_lifecycle_render_row(r: dict, user: dict, show_trade_id: bool = True)
         header += f" | {setup_id}"
     lines = [header]
     lines.append(
-        f"  Entry {fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '—'} | SL {fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '—'} | TP {fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp1'), r.get('tp2'), r.get('tp3'), str(r.get('side') or '')) or 0.0)) if float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp1'), r.get('tp2'), r.get('tp3'), str(r.get('side') or '')) or 0.0) > 0 else '—'}"
+        f"  Entry {fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '—'} | SL {fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '—'} | TP {fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp1'), r.get('alt_target_a'), r.get('alt_target_b'), str(r.get('side') or '')) or 0.0)) if float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp1'), r.get('alt_target_a'), r.get('alt_target_b'), str(r.get('side') or '')) or 0.0) > 0 else '—'}"
     )
     lines.append(
-        f"  RR {_trade_lifecycle_fmt_value(r.get('rr_tp1') or r.get('rr_tp2'), '.2f')} | Risk {_trade_lifecycle_fmt_value(r.get('risk_usdt'), '.2f')} USDT ({_trade_lifecycle_fmt_value(r.get('risk_pct'), '.2f')}%) | Conf {str(r.get('confidence') if r.get('confidence') is not None else '—')} | Q {_trade_lifecycle_fmt_value(r.get('quality_score'), '.1f')}"
+        f"  RR {_trade_lifecycle_fmt_value(r.get('rr_tp1') or r.get('rr_tp'), '.2f')} | Risk {_trade_lifecycle_fmt_value(r.get('risk_usdt'), '.2f')} USDT ({_trade_lifecycle_fmt_value(r.get('risk_pct'), '.2f')}%) | Conf {str(r.get('confidence') if r.get('confidence') is not None else '—')} | Q {_trade_lifecycle_fmt_value(r.get('quality_score'), '.1f')}"
     )
     lines.append(
         f"  Open {open_txt} | Open Day {open_day_txt} | Open Session {str(r.get('open_session') or '—')} | Open Reason {open_reason} | Engine {engine_txt}"
     )
     lines.append(
-        f"  Result {str(r.get('result_label') or '—')} | Path {str(r.get('result_path') or '—')} | Hits {hits} | TP {tp1_hit_txt if tp1_hit_txt == 'YES' or tp2_hit_txt == 'YES' else 'NO'} | SL {sl_hit_txt}"
+        f"  Result {str(r.get('result_label') or '—')} | Path {str(r.get('result_path') or '—')} | Hits {hits} | TP {tp1_hit_txt if tp1_hit_txt == 'YES' or alt_target_a_hit_txt == 'YES' else 'NO'} | SL {sl_hit_txt}"
     )
     lines.append(
         f"  Close {close_txt} | Close Day {close_day_txt} | Close Session {str(r.get('close_session') or '—') if close_ts > 0 else '—'} | Reason {str(r.get('close_reason') or ('open' if str(r.get('result_path') or '').upper() == 'OPEN' else '—'))}"
     )
     lines.append(
-        f"  TP {_trade_lifecycle_fmt_duration(r.get('duration_to_tp1_sec') or r.get('duration_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(r.get('duration_to_sl_sec'))} | Total {_trade_lifecycle_fmt_duration(r.get('duration_total_sec'))}"
+        f"  TP {_trade_lifecycle_fmt_duration(r.get('duration_to_tp1_sec') or r.get('duration_to_alt_target_a_sec'))} | SL {_trade_lifecycle_fmt_duration(r.get('duration_to_sl_sec'))} | Total {_trade_lifecycle_fmt_duration(r.get('duration_total_sec'))}"
     )
     lines.append(
         f"  PnL {_trade_lifecycle_fmt_value(r.get('pnl_usdt'), '.2f')} USDT | R {_trade_lifecycle_fmt_value(r.get('r_multiple'), '.2f')} | {confirm_txt}" + (f" | Note {sync_note}" if sync_note else '')
@@ -11451,10 +11451,10 @@ def _trade_lifecycle_analytics_lines(analytics: dict, heading: str = 'Lifecycle 
         f"• Trades {total} | Closed {closed} | WR {float(a.get('win_rate') or 0.0):.1f}% | AvgR {float(a.get('avg_r') or 0.0):+.2f} | Net {float(a.get('net_pnl') or 0.0):+.2f} USDT"
     )
     lines.append(
-        f"• TP hit {tp1_hits + int(a.get('tp2_hits') or 0)} ({tp1_hit_rate:.1f}%) | SL hits {int(a.get('sl_hits') or 0)}"
+        f"• TP hit {tp1_hits + int(a.get('alt_target_a_hits') or 0)} ({tp1_hit_rate:.1f}%) | SL hits {int(a.get('sl_hits') or 0)}"
     )
     lines.append(
-        f"• Timing: TP {_trade_lifecycle_fmt_duration(a.get('avg_time_to_tp1_sec') or a.get('avg_time_to_tp2_sec'))} | SL {_trade_lifecycle_fmt_duration(a.get('avg_time_to_sl_sec'))}"
+        f"• Timing: TP {_trade_lifecycle_fmt_duration(a.get('avg_time_to_tp1_sec') or a.get('avg_time_to_alt_target_a_sec'))} | SL {_trade_lifecycle_fmt_duration(a.get('avg_time_to_sl_sec'))}"
     )
 
     if include_sessions:
@@ -11501,7 +11501,7 @@ def _trade_lifecycle_analytics_lines(analytics: dict, heading: str = 'Lifecycle 
     if include_symbols:
         top_win = list(a.get('top_winning_symbols') or [])
         top_lose = list(a.get('top_losing_symbols') or [])
-        tp1_fail = list(a.get('symbols_tp1_but_fail_tp2') or [])
+        tp1_fail = list(a.get('symbols_tp1_but_fail_alt_target_a') or [])
         if top_win:
             x = dict(top_win[0] or {})
             lines.append(f"• Top winner: {str(x.get('symbol') or '?')} | PnL {float(x.get('net_pnl') or 0.0):+.2f} | AvgR {float(x.get('avg_r') or 0.0):+.2f}")
@@ -11510,7 +11510,7 @@ def _trade_lifecycle_analytics_lines(analytics: dict, heading: str = 'Lifecycle 
             lines.append(f"• Top loser: {str(x.get('symbol') or '?')} | PnL {float(x.get('net_pnl') or 0.0):+.2f} | AvgR {float(x.get('avg_r') or 0.0):+.2f}")
         if tp1_fail:
             x = dict(tp1_fail[0] or {})
-            lines.append(f"• Frequent TP symbol: {str(x.get('symbol') or '?')} | TP hits {int(x.get('tp1_hits') or 0) + int(x.get('tp2_hits') or 0)}")
+            lines.append(f"• Frequent TP symbol: {str(x.get('symbol') or '?')} | TP hits {int(x.get('tp1_hits') or 0) + int(x.get('alt_target_a_hits') or 0)}")
 
     if include_signs and (a.get('signs') or []):
         lines.append('• Optimization signals:')
@@ -11639,24 +11639,24 @@ def db_insert_signal(s: Setup, user_id: int | None = None):
     try:
         cur.execute("""
             INSERT OR REPLACE INTO signals (
-                setup_id, created_ts, symbol, market_symbol, side, conf, entry, sl, tp1, tp2, tp3,
+                setup_id, created_ts, symbol, market_symbol, side, conf, entry, sl, tp1, alt_target_a, alt_target_b,
                 fut_vol_usd, ch24, ch4, ch1, ch15
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             s.setup_id, s.created_ts, s.symbol, getattr(s, "market_symbol", None),
-            s.side, s.conf, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
+            s.side, s.conf, s.entry, s.sl, s.tp1, s.alt_target_a, s.alt_target_b,
             s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
         ))
     except Exception:
         # Backward-compatible (older DB without market_symbol column)
         cur.execute("""
             INSERT OR REPLACE INTO signals (
-                setup_id, created_ts, symbol, side, conf, entry, sl, tp1, tp2, tp3,
+                setup_id, created_ts, symbol, side, conf, entry, sl, tp1, alt_target_a, alt_target_b,
                 fut_vol_usd, ch24, ch4, ch1, ch15
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             s.setup_id, s.created_ts, s.symbol, s.side, s.conf, s.entry, s.sl,
-            s.tp1, s.tp2, s.tp3, s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+            s.tp1, s.alt_target_a, s.alt_target_b, s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
         ))
     con.commit()
     con.close()
@@ -11811,8 +11811,8 @@ def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executab
     entry = float(getattr(s, 'entry', 0.0) or 0.0) if s is not None else 0.0
     sl = float(getattr(s, 'sl', 0.0) or 0.0) if s is not None else 0.0
     tp1 = getattr(s, 'tp1', None) if s is not None else None
-    tp2 = getattr(s, 'tp2', None) if s is not None else None
-    tp3 = float(getattr(s, 'tp3', 0.0) or 0.0) if s is not None else 0.0
+    alt_target_a = getattr(s, 'alt_target_a', None) if s is not None else None
+    alt_target_b = float(getattr(s, 'alt_target_b', 0.0) or 0.0) if s is not None else 0.0
     fut_vol_usd = float(getattr(s, 'fut_vol_usd', 0.0) or 0.0) if s is not None else 0.0
     ch24 = float(getattr(s, 'ch24', 0.0) or 0.0) if s is not None else 0.0
     ch4 = float(getattr(s, 'ch4', 0.0) or 0.0) if s is not None else 0.0
@@ -11833,14 +11833,14 @@ def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executab
     cur.execute(
         """INSERT OR REPLACE INTO executable_setups (
                user_id, setup_id, session, executable_ts, signal_created_ts,
-               symbol, market_symbol, side, conf, entry, sl, tp1, tp2, tp3,
+               symbol, market_symbol, side, conf, entry, sl, tp1, alt_target_a, alt_target_b,
                fut_vol_usd, ch24, ch4, ch1, ch15, quality_score, atr_pct, engine,
                pullback_ready, pullback_bypass_hot, pullback_ema_dist_pct,
                ema_support_period, ema_support_dist_pct, source_kind, details_json
            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             int(user_id), sid, session_txt, exec_ts, signal_created_ts,
-            symbol, market_symbol, side, conf, entry, sl, tp1, tp2, tp3,
+            symbol, market_symbol, side, conf, entry, sl, tp1, alt_target_a, alt_target_b,
             fut_vol_usd, ch24, ch4, ch1, ch15, quality_score, atr_pct, engine,
             int(pullback_ready), int(pullback_bypass_hot), pullback_ema_dist_pct,
             int(ema_support_period), ema_support_dist_pct, str(source_kind or 'executable_setups'), details_json,
@@ -12014,8 +12014,8 @@ def _executable_rows_to_setup_objects(rows: List[dict], session_name: str = '') 
                 entry=float(row.get('entry') or 0.0),
                 sl=float(row.get('sl') or 0.0),
                 tp1=row.get('tp1'),
-                tp2=row.get('tp2'),
-                tp3=float(row.get('tp3') or 0.0),
+                alt_target_a=row.get('alt_target_a'),
+                alt_target_b=float(row.get('alt_target_b') or 0.0),
                 fut_vol_usd=float(row.get('fut_vol_usd') or 0.0),
                 ch24=float(row.get('ch24') or 0.0),
                 ch4=float(row.get('ch4') or 0.0),
@@ -12091,8 +12091,8 @@ def _cache_recent_emailed_setup(user_id: int, setup: Any, session: str = '', ema
         'entry': float(getattr(setup, 'entry', 0.0) or 0.0),
         'sl': float(getattr(setup, 'sl', 0.0) or 0.0),
         'tp1': getattr(setup, 'tp1', None),
-        'tp2': getattr(setup, 'tp2', None),
-        'tp3': float(getattr(setup, 'tp3', 0.0) or 0.0),
+        'alt_target_a': getattr(setup, 'alt_target_a', None),
+        'alt_target_b': float(getattr(setup, 'alt_target_b', 0.0) or 0.0),
         'fut_vol_usd': float(getattr(setup, 'fut_vol_usd', 0.0) or 0.0),
         'ch24': float(getattr(setup, 'ch24', 0.0) or 0.0),
         'ch4': float(getattr(setup, 'ch4', 0.0) or 0.0),
@@ -12106,7 +12106,7 @@ def _cache_recent_emailed_setup(user_id: int, setup: Any, session: str = '', ema
         'pullback_bypass_hot': bool(getattr(setup, 'pullback_bypass_hot', False)),
         'leader_base_override': bool(getattr(setup, 'leader_base_override', False)),
         'engine': str(getattr(setup, 'engine', '') or ''),
-        'is_trailing_tp3': bool(getattr(setup, 'is_trailing_tp3', False)),
+        'is_trailing_alt_target_b': bool(getattr(setup, 'is_trailing_alt_target_b', False)),
         'created_ts': float(getattr(setup, 'created_ts', 0.0) or 0.0),
         'signal_created_ts': float(getattr(setup, 'created_ts', 0.0) or 0.0),
         'emailed_ts': ts,
@@ -12288,7 +12288,7 @@ def db_list_autotrade_trades(user_id: int, ts_from: float) -> List[dict]:
     con.row_factory = sqlite3.Row
     cur = con.cursor()
     cur.execute(
-        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status, closed_ts, outcome, pnl_usdt AS pnl
+        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, alt_target_a, alt_target_b, qty, status, closed_ts, outcome, pnl_usdt AS pnl
            FROM autotrade_trades
            WHERE uid=? AND opened_ts>=?
            ORDER BY opened_ts ASC""",
@@ -12303,7 +12303,7 @@ def db_list_autotrade_trades_all(user_id: int) -> List[dict]:
     con.row_factory = sqlite3.Row
     cur = con.cursor()
     cur.execute(
-        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, tp2, tp3, qty, status, closed_ts, outcome, pnl_usdt AS pnl
+        """SELECT trade_id, opened_ts, session, symbol, side, entry, sl, tp1, alt_target_a, alt_target_b, qty, status, closed_ts, outcome, pnl_usdt AS pnl
            FROM autotrade_trades
            WHERE uid=?
            ORDER BY opened_ts ASC""",
@@ -12461,7 +12461,7 @@ def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: s
     side = str(setup.get("side") or "").upper().strip()
     entry = float(setup.get("entry") or 0.0)
     sl = float(setup.get("sl") or 0.0)
-    tp = _resolve_single_tp(entry, sl, setup.get("tp1"), setup.get("tp2"), setup.get("tp3"), side)
+    tp = _resolve_single_tp(entry, sl, setup.get("tp1"), setup.get("alt_target_a"), setup.get("alt_target_b"), side)
 
     created_ts = float(setup.get("created_ts") or 0.0)
     market_symbol = str(setup.get("market_symbol") or "").strip() or _market_symbol_from_base(setup.get("symbol"))
@@ -12539,7 +12539,7 @@ def _signal_setup_eval_payload(setup_id: str) -> dict:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             row = cur.execute(
-                """SELECT setup_id, symbol, side, entry, sl, tp1, tp2, tp3, created_ts, market_symbol
+                """SELECT setup_id, symbol, side, entry, sl, tp1, alt_target_a, alt_target_b, created_ts, market_symbol
                    FROM generated_setups
                    WHERE setup_id=?
                    ORDER BY created_ts DESC
@@ -12567,7 +12567,7 @@ def _signal_outcome_sync_for_setup(user_id: int, setup_id: str, horizon_hours: i
         return {}
     existing = db_get_outcome(sid) or {}
     existing_canon = _canon_signal_outcome_label((existing or {}).get('outcome'))
-    if (not force) and existing and existing_canon in {'TP', 'TP1', 'TP2', 'SL'}:
+    if (not force) and existing and existing_canon in {'TP', 'TP1', 'TP', 'SL'}:
         return existing
 
     payload = _signal_setup_eval_payload(sid)
@@ -12597,10 +12597,10 @@ def _signal_outcome_sync_for_setup(user_id: int, setup_id: str, horizon_hours: i
     if trade and (str(trade.get('status') or '').upper().strip() == 'CLOSED' or float(trade.get('closed_ts') or 0.0) > 0):
         canon = _canon_outcome_from_autotrade_trade(trade)
         canon = _canon_signal_outcome_label(canon)
-        if canon in {'TP', 'TP1', 'TP2', 'SL'}:
+        if canon in {'TP', 'TP1', 'TP', 'SL'}:
             hit_level = 'SL' if canon == 'SL' else ('TP' if canon == 'TP' else 'TP1')
             hit_ts = float(trade.get('closed_ts') or trade.get('opened_ts') or created_ts or now_ts)
-            best_level = 'SL' if canon == 'SL' else ('TP' if canon == 'TP' else ('TP2' if canon == 'TP2' else 'TP1'))
+            best_level = 'SL' if canon == 'SL' else ('TP' if canon == 'TP' else ('TP' if canon == 'TP' else 'TP1'))
             db_upsert_outcome(sid, canon, hit_level, hit_ts, int(horizon_hours), note='sync_from_autotrade_trade', best_level=best_level, best_ts=hit_ts if best_level not in {'', 'NONE'} else None)
             return db_get_outcome(sid) or {'setup_id': sid, 'outcome': canon}
 
@@ -12650,7 +12650,7 @@ def _signal_outcome_sync_for_user(user_id: int, days: int | None = None, limit: 
             try:
                 out = _signal_outcome_sync_for_setup(int(user_id), sid, force=bool(force))
                 synced += 1
-                if _canon_signal_outcome_label((out or {}).get('outcome')) in {'TP', 'TP1', 'TP2', 'SL'}:
+                if _canon_signal_outcome_label((out or {}).get('outcome')) in {'TP', 'TP1', 'TP', 'SL'}:
                     decided += 1
             except Exception:
                 errors += 1
@@ -13702,7 +13702,7 @@ def sl_mult_from_conf(conf: int) -> float:
         return 1.70
     return 1.55
 
-def tp3_rr_target_from_conf(conf: int) -> float:
+def tp_rr_target_from_conf(conf: int) -> float:
     """Single final TP RR target."""
     if conf >= 90:
         return 1.70
@@ -13714,7 +13714,7 @@ def tp3_rr_target_from_conf(conf: int) -> float:
 
 def tp_r_mults_from_conf(conf: int) -> Tuple[float, float, float]:
     """Backward-compatible single-target RR signature."""
-    rr = tp3_rr_target_from_conf(conf)
+    rr = tp_rr_target_from_conf(conf)
     return (rr, rr, rr)
 
 def compute_sl_tp(
@@ -13727,7 +13727,7 @@ def compute_sl_tp(
     tp_cap_bonus_pct: float = 0.0,
 ) -> Tuple[float, float, float]:
     """
-    Returns (sl, tp3, R)
+    Returns (sl, tp, R)
     """
     if entry <= 0 or atr <= 0:
         return 0.0, 0.0, 0.0
@@ -13741,7 +13741,7 @@ def compute_sl_tp(
     R = sl_dist
 
     # ✅ confidence-weighted RR + engine bonus
-    rr_target = tp3_rr_target_from_conf(conf) + rr_bonus
+    rr_target = tp_rr_target_from_conf(conf) + rr_bonus
     tp_dist = rr_target * R
 
     # ✅ TP cap with engine bonus
@@ -13750,12 +13750,12 @@ def compute_sl_tp(
 
     if side == "BUY":
         sl = entry - sl_dist
-        tp3 = entry + tp_dist
+        alt_target_b = entry + tp_dist
     else:
         sl = entry + sl_dist
-        tp3 = entry - tp_dist
+        alt_target_b = entry - tp_dist
 
-    return sl, tp3, R
+    return sl, alt_target_b, R
 
 def _distinctify(a: float, b: float, c: float, entry: float, side: str) -> Tuple[float, float, float]:
     if entry <= 0:
@@ -13791,7 +13791,7 @@ def multi_tp(
     """
     if entry <= 0 or R <= 0:
         return 0.0, 0.0, 0.0
-    rr = tp3_rr_target_from_conf(conf) + rr_bonus
+    rr = tp_rr_target_from_conf(conf) + rr_bonus
     maxd = ((tp_cap_pct + tp_cap_bonus_pct) / 100.0) * entry
     dist = min(rr * R, maxd)
     tp = (entry + dist) if side == "BUY" else (entry - dist)
@@ -13799,7 +13799,7 @@ def multi_tp(
 
 
 
-def _realized_r_option_b(outcome: str, side: str, entry: float, sl: float, tp1=None, tp2=None, tp3=None):
+def _realized_r_option_b(outcome: str, side: str, entry: float, sl: float, tp1=None, alt_target_a=None, alt_target_b=None):
     """Return realized R under the single-TP model."""
     try:
         outcome = _canon_signal_outcome_label(outcome)
@@ -13812,7 +13812,7 @@ def _realized_r_option_b(outcome: str, side: str, entry: float, sl: float, tp1=N
             return -1.0
         if outcome != 'TP':
             return None
-        tp = _resolve_single_tp(entry, sl, tp1=tp1, tp2=tp2, tp3=tp3, side=side)
+        tp = _resolve_single_tp(entry, sl, tp1=tp1, alt_target_a=alt_target_a, alt_target_b=alt_target_b, side=side)
         if tp > 0:
             rr = abs(float(tp) - entry) / risk
             if math.isfinite(rr) and rr > 0:
@@ -13826,8 +13826,8 @@ def _realized_r_option_b(outcome: str, side: str, entry: float, sl: float, tp1=N
         if outcome == 'TP1':
             tp = tp1
             fallback = 1.0
-        elif outcome == 'TP2':
-            tp = tp2 if tp2 not in (None, '', 0, 0.0) else tp3
+        elif outcome == 'TP':
+            tp = alt_target_a if alt_target_a not in (None, '', 0, 0.0) else alt_target_b
             fallback = 2.0
         else:
             return None
@@ -13910,11 +13910,11 @@ def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[
     fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
     entry = float(getattr(s, "entry", 0.0) or 0.0)
     sl = float(getattr(s, "sl", 0.0) or 0.0)
-    tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+    alt_target_b = float(getattr(s, "alt_target_b", 0.0) or 0.0)
 
     rr3 = 0.0
     try:
-        rr3 = float(rr_to_tp(entry, sl, tp3))
+        rr3 = float(rr_to_tp(entry, sl, alt_target_b))
     except Exception:
         rr3 = 0.0
 
@@ -13963,7 +13963,7 @@ def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[
 
     # --- Component D: Risk & trade construction (RR + TP validity) ---
     rr_score = _clamp01(rr3 / 2.2)  # RR 2.2 ~ full
-    tp_valid = 1.0 if (entry > 0 and sl > 0 and tp3 > 0 and rr3 > 0.2) else 0.0
+    tp_valid = 1.0 if (entry > 0 and sl > 0 and alt_target_b > 0 and rr3 > 0.2) else 0.0
 
     # --- Component E: Quality scoring inputs ---
     vol_score = _log_norm(fut_vol, lo=float(MIN_FUT_VOL_USD or 10_000_000), hi=120_000_000.0)
@@ -14417,8 +14417,8 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
             entry=float(entry),
             sl=float(sl),
             tp1=float(tp_target),
-            tp2=0.0,
-            tp3=0.0,
+            alt_target_a=0.0,
+            alt_target_b=0.0,
             fut_vol_usd=float(fut_vol_usd),
             ch24=float(ch24),
             ch4=float(ch4),
@@ -14432,7 +14432,7 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
             pullback_bypass_hot=bool(fut_vol_usd >= 50_000_000.0 and abs(ch24) >= 5.0),
             leader_base_override=False,
             engine="A" if trigger == "PULLBACK" else "B",
-            is_trailing_tp3=False,
+            is_trailing_alt_target_b=False,
             created_ts=float(ohlcv[i][0]) / 1000.0 if float(ohlcv[i][0] or 0) > 1e12 else float(ohlcv[i][0] or 0.0),
         )
         setattr(s, "atr_pct", float(atr_pct))
@@ -14505,11 +14505,11 @@ def _simulate_one_setup(
     entry = float(getattr(setup, 'entry', 0.0) or 0.0)
     sl = float(getattr(setup, 'sl', 0.0) or 0.0)
     side = str(getattr(setup, 'side', '') or '').upper()
-    tp = _resolve_single_tp(entry, sl, getattr(setup, 'tp1', 0.0), getattr(setup, 'tp2', 0.0), getattr(setup, 'tp3', 0.0), side)
+    tp = _resolve_single_tp(entry, sl, getattr(setup, 'tp1', 0.0), getattr(setup, 'alt_target_a', 0.0), getattr(setup, 'alt_target_b', 0.0), side)
 
     R = abs(entry - sl)
     if entry <= 0 or sl <= 0 or tp <= 0 or R <= 0:
-        return {'outcome': 'INVALID', 'R': 0.0, 'bars': 0, 'hit_tp1': False, 'hit_tp2': False, 'hit_tp': False}
+        return {'outcome': 'INVALID', 'R': 0.0, 'bars': 0, 'hit_tp1': False, 'hit_alt_target_a': False, 'hit_tp': False}
 
     rr = float(rr_to_tp(entry, sl, tp) or 0.0)
     end = min(len(ohlcv), start_i + max_bars)
@@ -14524,15 +14524,15 @@ def _simulate_one_setup(
             hit_tp = l <= tp
 
         if hit_sl and hit_tp:
-            return {'outcome': 'SL_FIRST', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_tp2': False, 'hit_tp': False}
+            return {'outcome': 'SL_FIRST', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_alt_target_a': False, 'hit_tp': False}
         if hit_tp:
-            return {'outcome': 'TP', 'R': float(rr), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_tp2': False, 'hit_tp': True}
+            return {'outcome': 'TP', 'R': float(rr), 'bars': j - start_i + 1, 'hit_tp1': True, 'hit_alt_target_a': False, 'hit_tp': True}
         if hit_sl:
-            return {'outcome': 'SL', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_tp2': False, 'hit_tp': False}
+            return {'outcome': 'SL', 'R': -1.0, 'bars': j - start_i + 1, 'hit_tp1': False, 'hit_alt_target_a': False, 'hit_tp': False}
 
     c = float(ohlcv[end - 1][4])
     rem_r = ((c - entry) / R) if side == 'BUY' else ((entry - c) / R)
-    return {'outcome': 'TIMEOUT', 'R': float(rem_r), 'bars': end - start_i, 'hit_tp1': False, 'hit_tp2': False, 'hit_tp': False}
+    return {'outcome': 'TIMEOUT', 'R': float(rem_r), 'bars': end - start_i, 'hit_tp1': False, 'hit_alt_target_a': False, 'hit_tp': False}
 
 
 def run_backtest(
@@ -14585,7 +14585,7 @@ def run_backtest(
         return {
             'ok': True, 'symbol': sym, 'tf': tf, 'days': d, 'end_days_ago': end_days_ago,
             'window_start_ts': eval_since_ms / 1000.0, 'window_end_ts': eval_until_ms / 1000.0,
-            'setups': 0, 'trades': 0, 'win_rate': 0.0, 'tp1_rate': 0.0, 'tp2_rate': 0.0,
+            'setups': 0, 'trades': 0, 'win_rate': 0.0, 'tp1_rate': 0.0, 'alt_target_a_rate': 0.0,
             'avg_R': 0.0, 'profit_factor': 0.0, 'max_drawdown_R': 0.0, 'equity_R': 0.0,
             'initial_equity': float(initial_equity), 'ending_equity': float(initial_equity), 'net_pnl_usd': 0.0,
             'max_drawdown_usd': 0.0, 'reject_breakdown': dict(_BT_LAST_REJECTS), 'by_session': {},
@@ -14599,7 +14599,7 @@ def run_backtest(
     peak_usd = eq_usd
     max_dd_usd = 0.0
     fixed_risk_usd = float(eq_usd * (max(0.01, float(risk_pct or 1.0)) / 100.0))
-    by_session = defaultdict(lambda: {'setups': 0, 'wins': 0, 'losses': 0, 'tp1_hits': 0, 'tp2_hits': 0, 'r': []})
+    by_session = defaultdict(lambda: {'setups': 0, 'wins': 0, 'losses': 0, 'tp1_hits': 0, 'alt_target_a_hits': 0, 'r': []})
     hold_bars = []
 
     for s in setups:
@@ -14638,9 +14638,9 @@ def run_backtest(
         by_session[sess_name]['r'].append(r_mult)
         if bool(res.get('hit_tp1')):
             by_session[sess_name]['tp1_hits'] += 1
-        if bool(res.get('hit_tp2')):
-            by_session[sess_name]['tp2_hits'] += 1
-        if out in ('TP', 'TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2'):
+        if bool(res.get('hit_alt_target_a')):
+            by_session[sess_name]['alt_target_a_hits'] += 1
+        if out in ('TP', 'TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP'):
             by_session[sess_name]['wins'] += 1
         elif out in ('SL', 'SL_FIRST', 'TP1_SL'):
             by_session[sess_name]['losses'] += 1
@@ -14657,12 +14657,12 @@ def run_backtest(
         results.append(res)
 
     total = len(results)
-    wins = sum(1 for r in results if str(r.get('outcome') or '').upper().strip() in ('TP', 'TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2'))
+    wins = sum(1 for r in results if str(r.get('outcome') or '').upper().strip() in ('TP', 'TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP'))
     tp1_hits = sum(1 for r in results if bool(r.get('hit_tp1')))
-    tp2_hits = sum(1 for r in results if bool(r.get('hit_tp2')))
+    alt_target_a_hits = sum(1 for r in results if bool(r.get('hit_alt_target_a')))
     win_rate = (wins / total * 100.0) if total else 0.0
     tp1_rate = (tp1_hits / total * 100.0) if total else 0.0
-    tp2_rate = (tp2_hits / total * 100.0) if total else 0.0
+    alt_target_a_rate = (alt_target_a_hits / total * 100.0) if total else 0.0
     avg_r = (sum(float(r.get('R', 0.0) or 0.0) for r in results) / total) if total else 0.0
     gross_win = sum(max(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
     gross_loss = sum(min(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
@@ -14679,7 +14679,7 @@ def run_backtest(
             'losses': int(dct.get('losses', 0) or 0),
             'win_rate': float((s_w / s_n * 100.0) if s_n else 0.0),
             'tp1_rate': float((int(dct.get('tp1_hits', 0) or 0) / s_n * 100.0) if s_n else 0.0),
-            'tp2_rate': float((int(dct.get('tp2_hits', 0) or 0) / s_n * 100.0) if s_n else 0.0),
+            'alt_target_a_rate': float((int(dct.get('alt_target_a_hits', 0) or 0) / s_n * 100.0) if s_n else 0.0),
             'avg_R': float((sum(float(x) for x in rr) / len(rr)) if rr else 0.0),
         }
 
@@ -14696,7 +14696,7 @@ def run_backtest(
         'trades': total,
         'win_rate': float(win_rate),
         'tp1_rate': float(tp1_rate),
-        'tp2_rate': float(tp2_rate),
+        'alt_target_a_rate': float(alt_target_a_rate),
         'avg_R': float(avg_r),
         'profit_factor': pf,
         'max_drawdown_R': float(max_dd_r),
@@ -14786,8 +14786,8 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     lines.append(f"Win rate: {_fmt_num(rep.get('win_rate'), '.1f')}%")
-    lines.append(f"TP hit rate: {_fmt_num((float(rep.get('tp1_rate') or 0.0) + float(rep.get('tp2_rate') or 0.0)), '.1f')}%")
-    lines.append(f"SL / timeout balance: {_fmt_num(100.0 - (float(rep.get('tp1_rate') or 0.0) + float(rep.get('tp2_rate') or 0.0)), '.1f')}%")
+    lines.append(f"TP hit rate: {_fmt_num((float(rep.get('tp1_rate') or 0.0) + float(rep.get('alt_target_a_rate') or 0.0)), '.1f')}%")
+    lines.append(f"SL / timeout balance: {_fmt_num(100.0 - (float(rep.get('tp1_rate') or 0.0) + float(rep.get('alt_target_a_rate') or 0.0)), '.1f')}%")
     lines.append(f"Avg R: {_fmt_num(rep.get('avg_R'), '.3f')}")
     lines.append(f"Profit factor: {_fmt_num(rep.get('profit_factor'), '.2f')}")
     lines.append(f"Max DD (R): {_fmt_num(rep.get('max_drawdown_R'), '.2f')}")
@@ -14811,7 +14811,7 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not d:
                     continue
                 lines.append(
-                    f"• {sname}: setups={int(d.get('setups', 0) or 0)} | WR={float(d.get('win_rate', 0.0) or 0.0):.1f}% | TP={float(d.get('tp1_rate', 0.0) or 0.0) + float(d.get('tp2_rate', 0.0) or 0.0):.1f}% | AvgR={float(d.get('avg_R', 0.0) or 0.0):.2f}"
+                    f"• {sname}: setups={int(d.get('setups', 0) or 0)} | WR={float(d.get('win_rate', 0.0) or 0.0):.1f}% | TP={float(d.get('tp1_rate', 0.0) or 0.0) + float(d.get('alt_target_a_rate', 0.0) or 0.0):.1f}% | AvgR={float(d.get('avg_R', 0.0) or 0.0):.2f}"
                 )
     except Exception:
         pass
@@ -14835,7 +14835,7 @@ def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session
 
     WIN DEFINITION (enforced everywhere in backtests/optimizer):
     - WIN = TP1 is hit before SL within the evaluation window.
-      (If TP2/TP3 hit first, TP1 necessarily hit earlier, so TP2/TP3 are also wins.)
+      (If TP/TP hit first, TP1 necessarily hit earlier, so TP/TP are also wins.)
     """
     if not ohlcv or len(ohlcv) < 300:
         return {"ok": False, "error": "insufficient_ohlcv", "symbol": symbol, "tf": tf, "days": days}
@@ -14900,16 +14900,16 @@ def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session
         by_session[sess]["setups"] += 1
         by_session[sess]["r"].append(float(res["R"]))
 
-        # WIN definition: TP1 hit before SL => TP1/TP2/TP3 are all wins
-        if out in ("TP", "TP1", "TP1_BE", "TP1_TIMEOUT", "TP2", "TP3"):
+        # WIN definition: TP1 hit before SL => TP1/TP/TP are all wins
+        if out in ("TP", "TP1", "TP1_BE", "TP1_TIMEOUT", "TP", "TP"):
             by_session[sess]["wins"] += 1
         elif out in ("SL", "LOSS"):
             by_session[sess]["losses"] += 1
 
     total = len(results)
 
-    # WIN definition: TP1 hit before SL (TP1/TP2/TP3 outcomes are wins)
-    wins = sum(1 for r in results if str(r.get("outcome") or "").upper().strip() in ("TP", "TP1", "TP1_BE", "TP1_TIMEOUT", "TP2", "TP3"))
+    # WIN definition: TP1 hit before SL (TP1/TP/TP outcomes are wins)
+    wins = sum(1 for r in results if str(r.get("outcome") or "").upper().strip() in ("TP", "TP1", "TP1_BE", "TP1_TIMEOUT", "TP", "TP"))
     win_rate = (wins / total * 100.0) if total else 0.0
 
     avg_r = (sum(float(r.get("R", 0.0) or 0.0) for r in results) / total) if total else 0.0
@@ -14954,7 +14954,7 @@ def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session
 
 
     total = len(results)
-    wins = [r for r in results if str(r.get("outcome")) == "TP3"]
+    wins = [r for r in results if str(r.get("outcome")) == "TP"]
     win_rate = (len(wins)/total*100.0) if total else 0.0
     avg_r = (sum(r["R"] for r in results)/total) if total else 0.0
     gross_win = sum(max(0.0, r["R"]) for r in results)
@@ -14982,7 +14982,7 @@ def _objective(oos: list[dict], days: int, cfg: dict) -> float:
     - Primary: OOS expectancy (Avg R) + Profit Factor (PF)
     - Enforces frequency target (3–5 setups/day) via penalty
     - Penalizes: drawdown, low sample size, symbol concentration, session imbalance/instability
-    - WIN definition used in win_rate: TP1 hit before SL (TP1/TP2/TP3 outcomes are wins)
+    - WIN definition used in win_rate: TP1 hit before SL (TP1/TP/TP outcomes are wins)
     """
     if not oos:
         return -1e12
@@ -15675,7 +15675,7 @@ def _evolution_fallback_recent_lessons(limit: int = 8, days: int = 30) -> list[d
                 """SELECT e.setup_id, e.session, e.emailed_ts,
                           COALESCE(o.hit_ts, o.best_ts, o.evaluated_ts, e.emailed_ts, 0) AS decided_ts,
                           o.outcome,
-                          s.symbol, s.market_symbol, s.side, s.created_ts, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
+                          s.symbol, s.market_symbol, s.side, s.created_ts, s.entry, s.sl, s.tp1, s.alt_target_a, s.alt_target_b,
                           s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
                    FROM emailed_setups e
                    JOIN signal_outcomes o ON o.setup_id = e.setup_id
@@ -15716,7 +15716,7 @@ def _evolution_fallback_recent_lessons(limit: int = 8, days: int = 30) -> list[d
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
             rows = c.execute(
-                """SELECT trade_id, session, symbol, side, opened_ts, closed_ts, entry, sl, tp1, tp2, tp3,
+                """SELECT trade_id, session, symbol, side, opened_ts, closed_ts, entry, sl, tp1, alt_target_a, alt_target_b,
                           qty, status, note, pnl_usdt
                    FROM autotrade_trades
                    WHERE uid = ?
@@ -15739,8 +15739,8 @@ def _evolution_fallback_recent_lessons(limit: int = 8, days: int = 30) -> list[d
                     'entry': r.get('entry'),
                     'sl': r.get('sl'),
                     'tp1': r.get('tp1'),
-                    'tp2': r.get('tp2'),
-                    'tp3': r.get('tp3'),
+                    'alt_target_a': r.get('alt_target_a'),
+                    'alt_target_b': r.get('alt_target_b'),
                     'created_ts': float(r.get('opened_ts') or 0.0),
                     'ch24': 0.0,
                     'ch4': 0.0,
@@ -15859,7 +15859,7 @@ def _evolution_tag_counter(days: int = 30, session: str | None = None, losses_on
 
 def _evolution_outcome_winloss(outcome: str) -> tuple[int, int]:
     out = str(outcome or "").upper().strip()
-    if out in ("TP", "TP1", "TP2", "TP3", "TP1_BE", "TP1_TIMEOUT", "WIN_TP1", "WIN_TP2", "WIN_TP3", "WIN"):
+    if out in ("TP", "TP1", "TP", "TP", "TP1_BE", "TP1_TIMEOUT", "WIN_TP1", "WIN_TP", "WIN_TP", "WIN"):
         return (1, 0)
     if out in ("SL", "LOSS", "SL_FIRST", "TP1_SL", "LOSE"):
         return (0, 1)
@@ -15870,9 +15870,9 @@ def _evolution_sig_rr(sig: dict) -> float:
     try:
         entry = float(sig.get("entry") or 0.0)
         sl = float(sig.get("sl") or 0.0)
-        tp3 = float(sig.get("tp3") or 0.0)
+        alt_target_b = float(sig.get("alt_target_b") or 0.0)
         risk = abs(entry - sl)
-        reward = abs(tp3 - entry)
+        reward = abs(alt_target_b - entry)
         if risk <= 0:
             return 0.0
         return float(reward / risk)
@@ -15957,7 +15957,7 @@ def _evolution_build_signal_diagnostic(sig: dict, session: str, outcome: str, de
         rr = float(_evolution_sig_rr(sig) or 0.0)
         ctx = _evolution_entry_context(sig.get("symbol"), sig.get("market_symbol"), float(sig.get("created_ts") or 0.0), entry, side)
         detail.update({
-            "rr_tp3": rr,
+            "rr_tp": rr,
             "ch24": ch24,
             "ch4": ch4,
             "ch1": ch1,
@@ -16038,14 +16038,14 @@ def _evolution_pending_signal_rows(limit: int = 250) -> list[dict]:
             c = conn.cursor()
             rows = c.execute(
                 """SELECT e.setup_id, e.session, e.emailed_ts, o.outcome, o.hit_ts, o.evaluated_ts,
-                          s.symbol, s.market_symbol, s.side, s.created_ts, s.entry, s.sl, s.tp1, s.tp2, s.tp3,
+                          s.symbol, s.market_symbol, s.side, s.created_ts, s.entry, s.sl, s.tp1, s.alt_target_a, s.alt_target_b,
                           s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15,
                           d.decided_ts AS diag_decided_ts, d.outcome AS diag_outcome
                    FROM emailed_setups e
                    JOIN signal_outcomes o ON o.setup_id=e.setup_id
                    JOIN signals s ON s.setup_id=e.setup_id
                    LEFT JOIN evolution_diagnostics d ON d.processed_key=('signal:' || e.setup_id)
-                   WHERE UPPER(COALESCE(o.outcome,'')) IN ('WIN_TP1','WIN_TP2','WIN_TP3','LOSS','TP','SL','WIN')
+                   WHERE UPPER(COALESCE(o.outcome,'')) IN ('WIN_TP1','WIN_TP','WIN_TP','LOSS','TP','SL','WIN')
                      AND (
                            d.id IS NULL
                            OR COALESCE(o.hit_ts, o.evaluated_ts, e.emailed_ts, 0) > COALESCE(d.decided_ts, 0) + 1
@@ -16067,7 +16067,7 @@ def _evolution_pending_autotrade_rows(limit: int = 120) -> list[dict]:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
             rows = c.execute(
-                """SELECT t.trade_id, t.session, t.symbol, t.side, t.opened_ts, t.closed_ts, t.entry, t.sl, t.tp1, t.tp2, t.tp3,
+                """SELECT t.trade_id, t.session, t.symbol, t.side, t.opened_ts, t.closed_ts, t.entry, t.sl, t.tp1, t.alt_target_a, t.alt_target_b,
                           t.qty, t.status, t.note, t.pnl_usdt,
                           d.decided_ts AS diag_decided_ts, d.outcome AS diag_outcome
                    FROM autotrade_trades t
@@ -16078,7 +16078,7 @@ def _evolution_pending_autotrade_rows(limit: int = 120) -> list[dict]:
                      AND (
                            d.id IS NULL
                            OR COALESCE(t.closed_ts, t.opened_ts, 0) > COALESCE(d.decided_ts, 0) + 1
-                           OR (ABS(COALESCE(t.pnl_usdt,0)) > 0.0000001 AND UPPER(COALESCE(d.outcome,'')) NOT IN ('TP','SL','WIN_TP1','WIN_TP2','WIN_TP3','LOSS'))
+                           OR (ABS(COALESCE(t.pnl_usdt,0)) > 0.0000001 AND UPPER(COALESCE(d.outcome,'')) NOT IN ('TP','SL','WIN_TP1','WIN_TP','WIN_TP','LOSS'))
                          )
                    ORDER BY COALESCE(t.closed_ts, t.opened_ts) ASC
                    LIMIT ?""",
@@ -16098,14 +16098,14 @@ def _evolution_resolve_autotrade_outcome(row: dict) -> tuple[str, float]:
             "entry": row.get("entry"),
             "sl": row.get("sl"),
             "tp1": row.get("tp1"),
-            "tp2": row.get("tp2"),
-            "tp3": row.get("tp3"),
+            "alt_target_a": row.get("alt_target_a"),
+            "alt_target_b": row.get("alt_target_b"),
             "created_ts": float(row.get("opened_ts") or 0.0),
         }
         res = evaluate_signal_hit_order(trade, horizon_hours=168, timeframe="1m")
         outcome = str(res.get("outcome") or "OPEN").upper().strip()
         decided_ts = float(res.get("hit_ts") or row.get("closed_ts") or 0.0)
-        if outcome in ("WIN_TP1", "WIN_TP2", "WIN_TP3", "LOSS", "TP", "SL"):
+        if outcome in ("WIN_TP1", "WIN_TP", "WIN_TP", "LOSS", "TP", "SL"):
             return outcome, decided_ts
     except Exception:
         pass
@@ -16162,8 +16162,8 @@ def _evolution_process_new_diagnostics() -> dict:
             "entry": row.get("entry"),
             "sl": row.get("sl"),
             "tp1": row.get("tp1"),
-            "tp2": row.get("tp2"),
-            "tp3": row.get("tp3"),
+            "alt_target_a": row.get("alt_target_a"),
+            "alt_target_b": row.get("alt_target_b"),
             "created_ts": float(row.get("opened_ts") or 0.0),
             "ch24": 0.0,
             "ch4": 0.0,
@@ -16372,7 +16372,7 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
         peak = max(peak, eq)
         max_dd = max(max_dd, peak - eq)
         out = str(res.get('outcome') or '').upper().strip()
-        won = out in ('TP', 'TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2', 'TP3')
+        won = out in ('TP', 'TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP', 'TP')
         lost = out in ('SL', 'LOSS', 'SL_FIRST', 'TP1_SL')
         by_session[sess]['setups'] += 1
         by_session[sess]['r'].append(r_mult)
@@ -16396,7 +16396,7 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
 
         entry = float(getattr(s, 'entry', 0.0) or 0.0)
         sl = float(getattr(s, 'sl', 0.0) or 0.0)
-        final_tp = float(getattr(s, 'tp2', 0.0) or getattr(s, 'tp3', 0.0) or 0.0)
+        final_tp = float(getattr(s, 'alt_target_a', 0.0) or getattr(s, 'alt_target_b', 0.0) or 0.0)
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
         rows.append({
             'symbol': str(symbol),
@@ -16415,7 +16415,7 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
             'live_reason': str(live_why or ''),
         })
     total = len(results)
-    wins = sum(1 for r in results if str(r.get('outcome') or '').upper().strip() in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2', 'TP3'))
+    wins = sum(1 for r in results if str(r.get('outcome') or '').upper().strip() in ('TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP', 'TP'))
     avg_r = (sum(float(r.get('R', 0.0) or 0.0) for r in results) / total) if total else 0.0
     gross_win = sum(max(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
     gross_loss = sum(min(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
@@ -16436,7 +16436,7 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
             'avg_R': float((sum(float(x) for x in rr) / len(rr)) if rr else 0.0),
         }
     live_total = len(live_results)
-    live_wins = sum(1 for r in live_results if str(r.get('outcome') or '').upper().strip() in ('TP', 'TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP2', 'TP3'))
+    live_wins = sum(1 for r in live_results if str(r.get('outcome') or '').upper().strip() in ('TP', 'TP1', 'TP1_BE', 'TP1_TIMEOUT', 'TP', 'TP'))
     live_avg_r = (sum(float(r.get('R', 0.0) or 0.0) for r in live_results) / live_total) if live_total else 0.0
     live_gross_win = sum(max(0.0, float(r.get('R', 0.0) or 0.0)) for r in live_results)
     live_gross_loss = sum(min(0.0, float(r.get('R', 0.0) or 0.0)) for r in live_results)
@@ -16835,7 +16835,7 @@ def _evolution_build_snapshot() -> dict:
         "last_hourly": last_hourly,
         "last_daily": last_daily,
         "quality_floor_email": float(cfg.get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
-        "min_rr_tp": float(cfg.get("min_rr_tp", cfg.get("min_rr_tp3", MIN_RR_TP3)) or MIN_RR_TP3),
+        "min_rr_tp": float(cfg.get("min_rr_tp", cfg.get("min_rr_tp", MIN_RR_TP)) or MIN_RR_TP),
     }
     _evolution_state_set("snapshot", snapshot)
     return snapshot
@@ -17104,7 +17104,7 @@ def _canon_signal_outcome_label(outcome: str, pnl: float | None = None) -> str:
         pnl_f = None if pnl is None else float(pnl)
     except Exception:
         pnl_f = None
-    if o in {'TP', 'TP1', 'TP2', 'WIN_TP1', 'WIN_TP2', 'WIN_TP3', 'WIN'}:
+    if o in {'TP', 'TP1', 'TP', 'WIN_TP1', 'WIN_TP', 'WIN_TP', 'WIN'}:
         return 'TP'
     if o in {'SL', 'LOSS', 'SL_FIRST', 'TP1_SL'}:
         return 'SL'
@@ -17155,7 +17155,7 @@ def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = Non
     raw = str(trade.get('outcome') or '').upper().strip()
     status = str(trade.get('status') or '').upper().strip()
 
-    if raw in {'WIN_TP1', 'WIN_TP2', 'WIN_TP3', 'TP1', 'TP2', 'TP'}:
+    if raw in {'WIN_TP1', 'WIN_TP', 'WIN_TP', 'TP1', 'TP', 'TP'}:
         return 'TP'
     if raw in {'LOSS', 'SL', 'SL_FIRST', 'TP1_SL'}:
         return 'SL'
@@ -17185,20 +17185,20 @@ def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = Non
         entry = float(trade.get('entry') or 0.0)
         sl = float(trade.get('sl') or 0.0)
         tp1 = float(trade.get('tp1') or 0.0)
-        tp2 = float(trade.get('tp2') or 0.0)
+        alt_target_a = float(trade.get('alt_target_a') or 0.0)
         risk_per_unit = abs(entry - sl)
         rr1 = (abs(tp1 - entry) / risk_per_unit) if risk_per_unit > 0 and tp1 > 0 else 0.0
-        rr2 = (abs(tp2 - entry) / risk_per_unit) if risk_per_unit > 0 and tp2 > 0 else 0.0
+        rr2 = (abs(alt_target_a - entry) / risk_per_unit) if risk_per_unit > 0 and alt_target_a > 0 else 0.0
         partial_fraction = max(0.25, min(0.85, float(AUTOTRADE_LIVE_TP1_FRACTION or 0.65)))
         tp1_credit = partial_fraction * rr1 if rr1 > 0 else 0.0
-        tp2_credit = tp1_credit + ((1.0 - partial_fraction) * rr2 if rr2 > 0 else 0.0)
+        alt_target_a_credit = tp1_credit + ((1.0 - partial_fraction) * rr2 if rr2 > 0 else 0.0)
     except Exception:
         tp1_credit = 0.0
-        tp2_credit = 0.0
+        alt_target_a_credit = 0.0
 
     if r_mult is not None:
-        if tp2_credit > 0 and r_mult >= max(tp2_credit * 0.80, tp1_credit + 0.05):
-            return 'TP2'
+        if alt_target_a_credit > 0 and r_mult >= max(alt_target_a_credit * 0.80, tp1_credit + 0.05):
+            return 'TP'
         if tp1_credit > 0 and r_mult >= max(tp1_credit * 0.55, 0.05):
             return 'TP1'
     return 'TP1'
@@ -17585,7 +17585,7 @@ def _signal_report_live_backed_only(user_id: int, meta: dict | None, canon: str)
 
 def _display_signal_outcome(raw) -> str:
     lab = str(_canon_signal_outcome_label(raw) or '').upper().strip()
-    if lab in {'TP', 'TP1', 'TP2', 'SL', 'OPEN'}:
+    if lab in {'TP', 'TP1', 'TP', 'SL', 'OPEN'}:
         return lab
     if lab in {'UNTRACKED', 'NONE', ''}:
         return 'None'
@@ -17604,29 +17604,29 @@ def _canonical_wr_stats(rows: list[dict]) -> dict:
         sess = str(r.get('session') or '?').upper().strip() or '?'
         counts[out] += 1
         by_session[sess][out] += 1
-        if out in {'TP', 'TP1', 'TP2', 'SL'}:
+        if out in {'TP', 'TP1', 'TP', 'SL'}:
             decided += 1
-        if out in {'TP', 'TP1', 'TP2'}:
+        if out in {'TP', 'TP1', 'TP'}:
             wins += 1
-        if out in {'TP', 'TP2'}:
+        if out in {'TP', 'TP'}:
             tp_full_wins += 1
         elif out == 'SL':
             losses += 1
     wr = (wins / decided * 100.0) if decided > 0 else 0.0
     by_sess = {}
     for sess, ctr in by_session.items():
-        s_tp_full = int(ctr.get('TP', 0) + ctr.get('TP2', 0))
-        s_dec = int(ctr.get('TP', 0) + ctr.get('TP1', 0) + ctr.get('TP2', 0) + ctr.get('SL', 0))
-        s_win = int(ctr.get('TP', 0) + ctr.get('TP1', 0) + ctr.get('TP2', 0))
+        s_tp_full = int(ctr.get('TP', 0) + ctr.get('TP', 0))
+        s_dec = int(ctr.get('TP', 0) + ctr.get('TP1', 0) + ctr.get('TP', 0) + ctr.get('SL', 0))
+        s_win = int(ctr.get('TP', 0) + ctr.get('TP1', 0) + ctr.get('TP', 0))
         by_sess[sess] = {
             'total': int(sum(ctr.values())),
             'decided': s_dec,
             'wins': s_win,
-            'tp2_wins': s_tp_full,
+            'alt_target_a_wins': s_tp_full,
             'losses': int(ctr.get('SL', 0)),
             'tp': int(ctr.get('TP', 0)),
             'tp1': int(ctr.get('TP1', 0)),
-            'tp2': s_tp_full,
+            'alt_target_a': s_tp_full,
             'sl': int(ctr.get('SL', 0)),
             'open': int(ctr.get('OPEN', 0)),
             'untracked': int(ctr.get('None', 0)),
@@ -17637,7 +17637,7 @@ def _canonical_wr_stats(rows: list[dict]) -> dict:
         'by_session': by_sess,
         'decided': int(decided),
         'wins': int(wins),
-        'tp2_wins': int(tp_full_wins),
+        'alt_target_a_wins': int(tp_full_wins),
         'losses': int(losses),
         'win_rate': float(wr),
     }
@@ -17723,8 +17723,8 @@ def _signal_wr_display_metrics(user_id: int, session: str | None = None, days: i
         'weighted_win_rate': float(roll.get('weighted_win_rate') or 0.0),
         'avg_weighted_credit': float(roll.get('avg_weighted_credit') or 0.0),
         'tp1_only': int(roll.get('tp1_only') or 0),
-        'tp2_plus': int(roll.get('tp2_plus') or 0),
-        'tp3': 0,
+        'alt_target_a_plus': int(roll.get('alt_target_a_plus') or 0),
+        'alt_target_b': 0,
         'open': int(roll.get('open') or 0),
         'counts': roll.get('counts') or Counter(),
         'rows': roll.get('rows') or [],
@@ -17755,9 +17755,9 @@ def _signal_weighted_wr_daily_series(uid: int, days: int, session: str | None = 
     cum_wins = 0
     for lab in day_labels:
         for out in buckets.get(lab) or []:
-            if out in {'TP', 'TP1', 'TP2', 'SL'}:
+            if out in {'TP', 'TP1', 'TP', 'SL'}:
                 cum_decided += 1
-                if out in {'TP', 'TP1', 'TP2'}:
+                if out in {'TP', 'TP1', 'TP'}:
                     cum_wins += 1
         wr = (cum_wins / cum_decided * 100.0) if cum_decided > 0 else 0.0
         cumulative.append((lab, float(wr)))
@@ -17766,7 +17766,7 @@ def _signal_weighted_wr_daily_series(uid: int, days: int, session: str | None = 
 
 def _stage_credit_from_outcome(outcome: str) -> float:
     canon = _canon_signal_outcome_label(outcome)
-    if canon in {'TP', 'TP2'}:
+    if canon in {'TP', 'TP'}:
         return 1.0
     if canon == 'TP1':
         return 0.5
@@ -17789,13 +17789,13 @@ def _weighted_rollup_from_outcomes(outcomes: list[tuple[str, str]]) -> dict:
         'decided': int(stats.get('decided') or 0),
         'counts': counts,
         'tp1_only': int(counts.get('TP1', 0)),
-        'tp2_plus': int(counts.get('TP2', 0)),
-        'tp3': 0,
+        'alt_target_a_plus': int(counts.get('TP', 0)),
+        'alt_target_b': 0,
         'losses': int(counts.get('SL', 0)),
         'open': int(counts.get('OPEN', 0)),
         'weighted_win_rate': float(stats.get('win_rate') or 0.0),
         'binary_win_rate': float(stats.get('win_rate') or 0.0),
-        'avg_weighted_credit': float((int(counts.get('TP2', 0)) / int(stats.get('decided') or 1)) if int(stats.get('decided') or 0) > 0 else 0.0),
+        'avg_weighted_credit': float((int(counts.get('TP', 0)) / int(stats.get('decided') or 1)) if int(stats.get('decided') or 0) > 0 else 0.0),
         'by_session': stats.get('by_session') or {},
     }
 
@@ -17813,7 +17813,7 @@ def _autotrade_weighted_outcome_summary(uid: int, days: int | None = None) -> di
 
 def _learning_stage_outcome_summary(uid: int, days: int = 60) -> dict:
     if int(uid or 0) <= 0:
-        return {'decided': 0, 'tp1_only': 0, 'tp2_plus': 0, 'tp3': 0, 'losses': 0, 'weighted_win_rate': 0.0, 'avg_weighted_credit': 0.0}
+        return {'decided': 0, 'tp1_only': 0, 'alt_target_a_plus': 0, 'alt_target_b': 0, 'losses': 0, 'weighted_win_rate': 0.0, 'avg_weighted_credit': 0.0}
     summary = _signal_outcome_summary(int(uid), days=int(days))
     outcomes = []
     for r in summary.get('rows') or []:
@@ -17859,7 +17859,7 @@ def _autotrade_history_days_available(uid: int) -> int:
 
 def _stage_credit_from_outcome(outcome: str) -> float:
     canon = _canon_signal_outcome_label(outcome)
-    if canon in {'TP', 'TP2'}:
+    if canon in {'TP', 'TP'}:
         return 1.0
     if canon == 'TP1':
         return 0.5
@@ -17880,7 +17880,7 @@ def _weighted_rollup_from_outcomes(outcomes: list[tuple[str, str]]) -> dict:
     counts = stats.get('counts') or Counter()
     decided = int(stats.get('decided') or 0)
     tp1 = int(counts.get('TP1', 0))
-    tp_full = int(counts.get('TP', 0) + counts.get('TP2', 0))
+    tp_full = int(counts.get('TP', 0) + counts.get('TP', 0))
     weighted_credit = (tp1 * 0.50) + (tp_full * 1.00)
     weighted_wr = float((weighted_credit / decided) * 100.0) if decided > 0 else 0.0
 
@@ -17888,14 +17888,14 @@ def _weighted_rollup_from_outcomes(outcomes: list[tuple[str, str]]) -> dict:
     for sess, item in (stats.get('by_session') or {}).items():
         s_dec = int(item.get('decided') or 0)
         s_tp1 = int(item.get('tp1') or 0)
-        s_tp_full = int(item.get('tp') or 0) + int(item.get('tp2') or 0)
+        s_tp_full = int(item.get('tp') or 0) + int(item.get('alt_target_a') or 0)
         s_weighted_credit = (s_tp1 * 0.50) + (s_tp_full * 1.00)
         by_session_out[sess] = {
             'total': int(item.get('total') or 0),
             'decided': s_dec,
             'tp1_only': s_tp1,
-            'tp2_plus': s_tp_full,
-            'tp3': 0,
+            'alt_target_a_plus': s_tp_full,
+            'alt_target_b': 0,
             'losses': int(item.get('sl') or 0),
             'open': int(item.get('open') or 0),
             'weighted_win_rate': float((s_weighted_credit / s_dec) * 100.0) if s_dec > 0 else 0.0,
@@ -17907,8 +17907,8 @@ def _weighted_rollup_from_outcomes(outcomes: list[tuple[str, str]]) -> dict:
         'decided': decided,
         'counts': counts,
         'tp1_only': tp1,
-        'tp2_plus': tp_full,
-        'tp3': 0,
+        'alt_target_a_plus': tp_full,
+        'alt_target_b': 0,
         'losses': int(counts.get('SL', 0)),
         'open': int(counts.get('OPEN', 0)),
         'weighted_win_rate': weighted_wr,
@@ -17931,7 +17931,7 @@ def _autotrade_weighted_outcome_summary(uid: int, days: int | None = None) -> di
 
 def _learning_stage_outcome_summary(uid: int, days: int = 60) -> dict:
     if int(uid or 0) <= 0:
-        return {'decided': 0, 'tp1_only': 0, 'tp2_plus': 0, 'tp3': 0, 'losses': 0, 'weighted_win_rate': 0.0, 'avg_weighted_credit': 0.0}
+        return {'decided': 0, 'tp1_only': 0, 'alt_target_a_plus': 0, 'alt_target_b': 0, 'losses': 0, 'weighted_win_rate': 0.0, 'avg_weighted_credit': 0.0}
     summary = _signal_outcome_summary(int(uid), days=int(days))
     outcomes = []
     for r in summary.get('rows') or []:
@@ -17977,12 +17977,12 @@ def _learning_breakeven_after_tp1_analysis(uid: int, days: int = 60) -> dict:
         life = {}
     tp1_plus = int(life.get('tp1_hits') or 0) if life else 0
     tp1_only = int(life.get('partial_wins') or 0) if life else 0
-    tp2_plus = int(life.get('wins') or 0) if life else 0
+    alt_target_a_plus = int(life.get('wins') or 0) if life else 0
     if tp1_plus <= 0:
         stage = _learning_stage_outcome_summary(uid, days=days)
-        tp1_plus = int(stage.get('tp1_only') or 0) + int(stage.get('tp2_plus') or 0)
+        tp1_plus = int(stage.get('tp1_only') or 0) + int(stage.get('alt_target_a_plus') or 0)
         tp1_only = int(stage.get('tp1_only') or 0)
-        tp2_plus = int(stage.get('tp2_plus') or 0)
+        alt_target_a_plus = int(stage.get('alt_target_a_plus') or 0)
     if tp1_plus <= 0:
         return {
             'recommendation': 'WAIT',
@@ -17991,14 +17991,14 @@ def _learning_breakeven_after_tp1_analysis(uid: int, days: int = 60) -> dict:
             'explanation': 'Single-TP mode is active. More live sample will improve the learning summary.',
         }
     tp1_only_share = (float(tp1_only) / float(tp1_plus) * 100.0) if tp1_plus > 0 else 0.0
-    tp2_plus_share = (float(tp2_plus) / float(tp1_plus) * 100.0) if tp1_plus > 0 else 0.0
+    alt_target_a_plus_share = (float(alt_target_a_plus) / float(tp1_plus) * 100.0) if tp1_plus > 0 else 0.0
     if tp1_plus < 12:
         rec = 'WAIT'
         why = 'TP-path sample is still small. No code change is required yet.'
     elif tp1_only_share >= 60.0:
         rec = 'CONDITIONAL'
         why = 'Single-TP mode is active, so no secondary target extension logic is needed.'
-    elif tp2_plus_share >= 60.0:
+    elif alt_target_a_plus_share >= 60.0:
         rec = 'NO_GLOBAL_CHANGE'
         why = 'Single-TP mode is active, so runner management beyond the first target is not needed.'
     else:
@@ -18034,8 +18034,8 @@ def _autotrade_weighted_wr_daily_series(uid: int, days: int) -> list[tuple[str, 
     for ds in day_starts:
         lab = ds.strftime('%Y-%m-%d')
         outs = [_canon_signal_outcome_label(o) for o in (buckets.get(lab) or [])]
-        decided = sum(1 for o in outs if o in {'TP', 'TP1', 'TP2', 'SL'})
-        wsum = sum(_stage_credit_from_outcome(o) for o in outs if o in {'TP', 'TP1', 'TP2', 'SL'})
+        decided = sum(1 for o in outs if o in {'TP', 'TP1', 'TP', 'SL'})
+        wsum = sum(_stage_credit_from_outcome(o) for o in outs if o in {'TP', 'TP1', 'TP', 'SL'})
         wr = (wsum / decided * 100.0) if decided > 0 else 0.0
         series.append((lab, float(wr)))
     return series
@@ -18307,7 +18307,7 @@ def _scan_intel_compact_setup(s) -> dict:
             "engine": str(getattr(s, "engine", "") or ""),
             "entry": float(getattr(s, "entry", 0.0) or 0.0),
             "sl": float(getattr(s, "sl", 0.0) or 0.0),
-            "tp3": float(getattr(s, "tp3", 0.0) or 0.0),
+            "alt_target_b": float(getattr(s, "alt_target_b", 0.0) or 0.0),
             "ch24": float(getattr(s, "ch24", 0.0) or 0.0),
             "fut_vol_usd": float(getattr(s, "fut_vol_usd", 0.0) or 0.0),
         }
@@ -18971,7 +18971,7 @@ def _self_opt_format_report(res: dict) -> str:
         SEP,
         "Best params (subset):",
         f"quality_score_min_screen={p.get('quality_score_min_screen')} | quality_score_min_email={p.get('quality_score_min_email')}",
-        f"min_rr_tp={p.get('min_rr_tp', p.get('min_rr_tp3'))} | atr_min_pct={p.get('atr_min_pct')}",
+        f"min_rr_tp={p.get('min_rr_tp', p.get('min_rr_tp'))} | atr_min_pct={p.get('atr_min_pct')}",
         f"tf_align_1h_min_abs={p.get('tf_align_1h_min_abs')} | tf_align_4h_min_abs={p.get('tf_align_4h_min_abs')}",
     ]
 
@@ -19722,7 +19722,7 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
     email_hi = min(qhi + 14.0, 90.0)
     out['quality_score_min_email'] = float(clamp(float(out.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), email_lo, email_hi))
     rrlo, rrhi = _rng('min_rr_tp', 1.3, 2.4)
-    out['min_rr_tp'] = float(clamp(float(out.get('min_rr_tp', MIN_RR_TP3) or MIN_RR_TP3), rrlo, rrhi))
+    out['min_rr_tp'] = float(clamp(float(out.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), rrlo, rrhi))
     alo, ahi = _rng('atr_min_pct', 0.4, 1.5)
     out['atr_min_pct'] = float(clamp(float(out.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT), alo, ahi))
     tlo, thi = _rng('tf_align_1h_min_abs', 0.3, 1.2)
@@ -19792,7 +19792,7 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
         if wr >= 48.0 or avg_r >= 0.0:
             _market_adaptive_apply_action(cfg, actions, 'quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 1.0, 2), 'flow_too_low')
             _market_adaptive_apply_action(cfg, actions, 'quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.0, 2), 'flow_too_low')
-            _market_adaptive_apply_action(cfg, actions, 'min_rr_tp', round(float(cfg.get('min_rr_tp', cfg.get('min_rr_tp3', MIN_RR_TP3)) or MIN_RR_TP3) - 0.05, 3), 'flow_too_low')
+            _market_adaptive_apply_action(cfg, actions, 'min_rr_tp', round(float(cfg.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP)) or MIN_RR_TP) - 0.05, 3), 'flow_too_low')
             notes.append('Executable flow is too low while edge is acceptable; loosened the global floor slightly.')
 
     if avg_r < -0.08 and setups_day > max(lo, 6.0) and _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)):
@@ -19806,7 +19806,7 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
     if total_setups >= 100 and (wr < 40.0 or avg_r < -0.01):
         _market_adaptive_apply_action(cfg, actions, 'quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) + 2.0, 2), '30d_live_wr_below_40_or_negative_expectancy')
         _market_adaptive_apply_action(cfg, actions, 'quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) + 1.0, 2), '30d_live_wr_below_40_or_negative_expectancy')
-        _market_adaptive_apply_action(cfg, actions, 'min_rr_tp', round(float(cfg.get('min_rr_tp', cfg.get('min_rr_tp3', MIN_RR_TP3)) or MIN_RR_TP3) + 0.10, 3), 'raise_reward_floor_when_edge_is_weak')
+        _market_adaptive_apply_action(cfg, actions, 'min_rr_tp', round(float(cfg.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP)) or MIN_RR_TP) + 0.10, 3), 'raise_reward_floor_when_edge_is_weak')
         _market_adaptive_apply_action(cfg, actions, 'tf_align_1h_min_abs', round(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS) + 0.10, 3), 'tighter_alignment_when_edge_is_weak')
         if _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)):
             _market_adaptive_apply_action(cfg, actions, 'execution_engine_b_email_enabled', False, 'disable_engine_b_until_30d_edge_recovers')
@@ -19865,7 +19865,7 @@ def _runtime_profile_snapshot_from_cfg(cfg: dict | None = None) -> dict:
     return {
         'quality_score_min_email': float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
         'quality_score_min_screen': float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN),
-        'min_rr_tp': float(cfg.get('min_rr_tp', cfg.get('min_rr_tp3', MIN_RR_TP3)) or MIN_RR_TP3),
+        'min_rr_tp': float(cfg.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP)) or MIN_RR_TP),
         'tf_align_1h_min_abs': float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS),
         'atr_min_pct': float(cfg.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT),
         'execution_asia_enabled': _cfg_bool(cfg.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED)),
@@ -20259,7 +20259,7 @@ def _run_market_adaptive_cycle(force: bool = False) -> dict:
             'current_live': {
                 'quality_score_min_email': float(final_cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
                 'quality_score_min_screen': float(final_cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN),
-                'min_rr_tp': float(final_cfg.get('min_rr_tp', final_cfg.get('min_rr_tp3', MIN_RR_TP3)) or MIN_RR_TP3),
+                'min_rr_tp': float(final_cfg.get('min_rr_tp', final_cfg.get('min_rr_tp', MIN_RR_TP)) or MIN_RR_TP),
                 'tf_align_1h_min_abs': float(final_cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS),
                 'atr_min_pct': float(final_cfg.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT),
                 'execution_asia_enabled': _cfg_bool(final_cfg.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED)),
@@ -20354,7 +20354,7 @@ async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAU
     if current_live:
         lines.extend([
             SEP,
-            f"Current live floors: email_quality={float(current_live.get('quality_score_min_email', 0.0) or 0.0):.1f} | screen_quality={float(current_live.get('quality_score_min_screen', 0.0) or 0.0):.1f} | min_rr_tp={float(current_live.get('min_rr_tp', current_live.get('min_rr_tp3', 0.0)) or 0.0):.2f}",
+            f"Current live floors: email_quality={float(current_live.get('quality_score_min_email', 0.0) or 0.0):.1f} | screen_quality={float(current_live.get('quality_score_min_screen', 0.0) or 0.0):.1f} | min_rr_tp={float(current_live.get('min_rr_tp', current_live.get('min_rr_tp', 0.0)) or 0.0):.2f}",
             f"TF align 1h={float(current_live.get('tf_align_1h_min_abs', 0.0) or 0.0):.2f} | ATR min={float(current_live.get('atr_min_pct', 0.0) or 0.0):.2f}",
             f"Engine B exec: {'ON' if _cfg_bool(current_live.get('execution_engine_b_email_enabled', True), True) else 'OFF'} | Asia exec: {'ON' if _cfg_bool(current_live.get('execution_asia_enabled', False), False) else 'OFF'}",
         ])
@@ -20594,23 +20594,23 @@ def is_top_setup_eligible(
         # Basic safety sanity (never create impossible orders)
         entry = float(getattr(s, "entry", 0.0) or 0.0)
         sl = float(getattr(s, "sl", 0.0) or 0.0)
-        tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+        alt_target_b = float(getattr(s, "alt_target_b", 0.0) or 0.0)
         side = str(getattr(s, "side", "") or "").upper()
 
-        if entry <= 0 or sl <= 0 or tp3 <= 0 or side not in ("BUY", "SELL"):
+        if entry <= 0 or sl <= 0 or alt_target_b <= 0 or side not in ("BUY", "SELL"):
             return (False, "bad_prices_or_side")
 
-        if side == "BUY" and not (sl < entry < tp3):
+        if side == "BUY" and not (sl < entry < alt_target_b):
             return (False, "bad_price_order_buy")
-        if side == "SELL" and not (tp3 < entry < sl):
+        if side == "SELL" and not (alt_target_b < entry < sl):
             return (False, "bad_price_order_sell")
 
         # Always ensure TP ladder exists (derive if missing)
         try:
-            t1, t2, t3 = _ensure_three_tps(entry, sl, tp3, getattr(s, "tp1", None), getattr(s, "tp2", None), side)
+            t1, t2, t3 = _ensure_three_tps(entry, sl, alt_target_b, getattr(s, "tp1", None), getattr(s, "alt_target_a", None), side)
             setattr(s, "tp1", t1)
-            setattr(s, "tp2", t2)
-            setattr(s, "tp3", t3)
+            setattr(s, "alt_target_a", t2)
+            setattr(s, "alt_target_b", t3)
         except Exception:
             pass
 
@@ -21723,15 +21723,15 @@ def make_setup(
             except Exception:
                 atr_for_sl = float(atr_1h)
 
-        sl, tp3_single, R = compute_sl_tp(
+        sl, alt_target_b_single, R = compute_sl_tp(
             entry, side, atr_for_sl, conf, tp_cap_pct,
             rr_bonus=rr_bonus, tp_cap_bonus_pct=tp_cap_bonus
         )
-        if sl <= 0 or tp3_single <= 0 or R <= 0:
+        if sl <= 0 or alt_target_b_single <= 0 or R <= 0:
             _rej("bad_sl_tp_or_atr", base, mv, f"atr={atr_1h:.6g} entry={entry:.6g}")
             return None
 
-        tp_target = float(tp3_single)
+        tp_target = float(alt_target_b_single)
 
         # ---------------------------------------------------------
         # ✅ Session-aware final-target RR floor (single TP model)
@@ -21751,7 +21751,7 @@ def make_setup(
         hot = is_hot_coin(fut_vol, ch24)
 
         # ✅ trailing only for the setups that need it (Momentum + Hot)
-        trailing_tp3 = False
+        trailing_alt_target_b = False
 
         s = Setup(
             setup_id=sid,
@@ -21762,8 +21762,8 @@ def make_setup(
             entry=entry,
             sl=sl,
             tp1=float(tp_target),
-            tp2=0.0,
-            tp3=0.0,
+            alt_target_a=0.0,
+            alt_target_b=0.0,
             fut_vol_usd=fut_vol,
             ch24=ch24,
             ch4=ch4,
@@ -21777,7 +21777,7 @@ def make_setup(
             pullback_bypass_hot=bool(pullback_bypass_hot),
             leader_base_override=bool(leader_base_override),
             engine=str(engine),
-            is_trailing_tp3=False,
+            is_trailing_alt_target_b=False,
             created_ts=time.time(),
         )
         try:
@@ -21805,8 +21805,8 @@ def make_setup(
             try:
                 t = float(_setup_target_tp(s, 0.0) or 0.0)
                 setattr(s, 'tp1', t)
-                setattr(s, 'tp2', 0.0)
-                setattr(s, 'tp3', 0.0)
+                setattr(s, 'alt_target_a', 0.0)
+                setattr(s, 'alt_target_b', 0.0)
             except Exception:
                 pass
             try:
@@ -21957,8 +21957,8 @@ def make_breakout_setup(
         entry=float(entry),
         sl=float(sl),
         tp1=float(tp_target),
-        tp2=0.0,
-        tp3=0.0,
+        alt_target_a=0.0,
+        alt_target_b=0.0,
         fut_vol_usd=float(fut_vol),
         ch24=float(ch24),
         ch4=float(ch4_used),
@@ -21972,7 +21972,7 @@ def make_breakout_setup(
         pullback_bypass_hot=False,
         leader_base_override=False,
         engine="B",
-        is_trailing_tp3=False,
+        is_trailing_alt_target_b=False,
         created_ts=time.time(),
     )
 
@@ -22122,7 +22122,7 @@ def _email_diversification_guard(s: 'Setup', chosen_list: list, best_fut: dict, 
         conf = int(getattr(s, 'conf', 0) or 0)
         entry = float(getattr(s, 'entry', 0.0) or 0.0)
         sl = float(getattr(s, 'sl', 0.0) or 0.0)
-        final_tp = float(getattr(s, 'tp2', 0.0) or getattr(s, 'tp3', 0.0) or 0.0)
+        final_tp = float(getattr(s, 'alt_target_a', 0.0) or getattr(s, 'alt_target_b', 0.0) or 0.0)
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
         side = str(getattr(s, 'side', '') or '').upper().strip()
         cluster = _email_symbol_cluster(str(getattr(s, 'symbol', '') or ''))
@@ -25853,8 +25853,8 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
             entry=entry,
             sl=sl,
             tp1=tp_target,
-            tp2=0.0,
-            tp3=0.0,
+            alt_target_a=0.0,
+            alt_target_b=0.0,
             fut_vol_usd=float(fut_vol or 0.0),
             ch24=float(getattr(mv, "percentage", 0.0) or 0.0),
             ch4=0.0,
@@ -25868,7 +25868,7 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
             pullback_bypass_hot=True,
             leader_base_override=False,
             engine="F",
-            is_trailing_tp3=False,
+            is_trailing_alt_target_b=False,
             created_ts=time.time(),
         ))
 
@@ -25908,7 +25908,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Signal Report (last {lookback_h}h)",
         HDR,
         f"Total: {len(rows)} | Decided: {int(stats.get('decided') or 0)} | TP wins: {int(stats.get('wins') or 0)} | Losses: {int(stats.get('losses') or 0)} | Win rate: {float(stats.get('win_rate') or 0.0):.1f}%",
-        f"TP: {int(counts.get('TP1',0)) + int(counts.get('TP2',0)) + int(counts.get('TP',0))} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)} | None: {counts.get('None',0)}",
+        f"TP: {int(counts.get('TP1',0)) + int(counts.get('TP',0)) + int(counts.get('TP',0))} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)} | None: {counts.get('None',0)}",
         HDR,
     ]
     life_lines = _trade_lifecycle_analytics_lines(lifecycle_recent, heading=f"Exchange-backed lifecycle ({lookback_h}h)", include_sessions=True, include_engines=True, include_buckets=False, include_symbols=True, include_signs=True, max_signs=2)
@@ -25916,7 +25916,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     table = tabulate(table_rows, headers=['Session','Time','Trade','Confidence','Outcome'], tablefmt='plain', colalign=('left','left','left','right','left'))
     sess_lines = ['Session breakdown:']
     for sname, c in sorted((stats.get('by_session') or {}).items(), key=lambda kv: kv[0]):
-        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP {int(c.get('tp1') or 0) + int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
+        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP {int(c.get('tp1') or 0) + int(c.get('alt_target_a') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
     if int(hidden_untracked_open or 0) > 0:
         sess_lines.append(f"• Hidden untracked rows: {int(hidden_untracked_open)} (no current live Bybit/autotrade match)")
     body_text = '\n'.join(header + life_lines + sess_lines)
@@ -26075,13 +26075,13 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         SEP,
         f'Completed outcomes: {int(stats.get("decided") or 0)}',
         f'TP wins: {int(stats.get("wins") or 0)} | Losses: {int(stats.get("losses") or 0)} | Signal WR: {float(stats.get("win_rate") or 0.0):.1f}%',
-        f'TP: {int(counts.get("TP1",0)) + int(counts.get("TP2",0)) + int(counts.get("TP",0))} | SL: {counts.get("SL",0)} | Open: {counts.get("OPEN",0)}',
+        f'TP: {int(counts.get("TP1",0)) + int(counts.get("TP",0)) + int(counts.get("TP",0))} | SL: {counts.get("SL",0)} | Open: {counts.get("OPEN",0)}',
     ]
     lines.extend([SEP, *_trade_lifecycle_analytics_lines(lifecycle, heading=f'Exchange-backed lifecycle ({life_days}d)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2)])
     if by_session:
         lines.extend([SEP, 'By session'])
         for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
-            lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP {int(c.get('tp1') or 0) + int(c.get('tp2') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
+            lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP {int(c.get('tp1') or 0) + int(c.get('alt_target_a') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
     hidden_untracked_open = int(summary.get('hidden_untracked_open') or 0)
     if hidden_untracked_open > 0:
         lines.extend([SEP, f'Hidden untracked rows: {hidden_untracked_open} (no current live Bybit/autotrade match)'])
@@ -26169,11 +26169,11 @@ def _autotrade_live_position_status(uid: int, live_pos: dict, trade_row: dict | 
     risk_est = float(_estimate_position_risk_usd(live_pos) or 0.0)
 
     expected_sl = float(trade_row.get('sl') or current_sl or 0.0)
-    expected_tp = _resolve_single_tp(entry_live, expected_sl, trade_row.get('tp1'), trade_row.get('tp2'), trade_row.get('tp3'), side)
+    expected_tp = _resolve_single_tp(entry_live, expected_sl, trade_row.get('tp1'), trade_row.get('alt_target_a'), trade_row.get('alt_target_b'), side)
     if expected_tp <= 0 and visible_tp_targets:
         expected_tp = float(visible_tp_targets[0] or 0.0)
 
-    tp_hit = bool(float((lifecycle_row or {}).get('tp1_hit_ts') or 0.0) > 0.0 or float((lifecycle_row or {}).get('tp2_hit_ts') or 0.0) > 0.0)
+    tp_hit = bool(float((lifecycle_row or {}).get('tp1_hit_ts') or 0.0) > 0.0 or float((lifecycle_row or {}).get('alt_target_a_hit_ts') or 0.0) > 0.0)
     sl_hit = bool(float((lifecycle_row or {}).get('sl_hit_ts') or 0.0) > 0.0)
     tp_order_live = bool(expected_tp > 0 and ((float(_pos_take_profit(live_pos) or 0.0) > 0 and _price_close_enough(float(_pos_take_profit(live_pos) or 0.0), expected_tp, rel_tol=0.0020)) or _bybit_has_open_tp_order_at(sym, expected_tp, side=side)))
     sl_order_live = bool(current_sl > 0 or (expected_sl > 0 and _bybit_has_open_sl_order_at(sym, expected_sl, side=side)))
@@ -26203,21 +26203,21 @@ def _autotrade_live_position_status(uid: int, live_pos: dict, trade_row: dict | 
         'expected_sl': float(expected_sl or 0.0),
         'expected_tp': float(expected_tp or 0.0),
         'expected_tp1': float(expected_tp or 0.0),
-        'expected_tp2': 0.0,
+        'expected_alt_target_a': 0.0,
         'current_sl': float(current_sl or 0.0),
         'visible_tp_targets': list(visible_tp_targets or []),
         'sl_hit': bool(sl_hit),
         'tp_hit': bool(tp_hit),
         'tp1_hit': bool(tp_hit),
-        'tp2_hit': False,
+        'alt_target_a_hit': False,
         'sl_order_live': bool(sl_order_live),
         'tp_order_live': bool(tp_order_live),
         'tp1_order_live': bool(tp_order_live),
-        'tp2_order_live': False,
+        'alt_target_a_order_live': False,
         'missing_sl': bool(missing_sl),
         'missing_tp': bool(missing_tp),
         'missing_tp1': bool(missing_tp),
-        'missing_tp2': False,
+        'missing_alt_target_a': False,
         'be_active': False,
         'risk_free': False,
         'opened_ts': float(opened_ts or 0.0),
@@ -26274,8 +26274,8 @@ def _autotrade_render_closed_lifecycle_row_compact(row: dict, index: int | None 
     lines.append(
         f"   • SL: {fmt_price(float(row.get('sl') or 0.0)) if float(row.get('sl') or 0.0) > 0 else '—'} | Hit: {_autotrade_checkbox(float(row.get('sl_hit_ts') or 0.0) > 0)}"
     )
-    tp_val = _resolve_single_tp(float(row.get('entry') or 0.0), float(row.get('sl') or 0.0), row.get('tp1'), row.get('tp2'), row.get('tp3'), str(row.get('side') or ''))
-    tp_hit = bool(float(row.get('tp1_hit_ts') or 0.0) > 0 or float(row.get('tp2_hit_ts') or 0.0) > 0)
+    tp_val = _resolve_single_tp(float(row.get('entry') or 0.0), float(row.get('sl') or 0.0), row.get('tp1'), row.get('alt_target_a'), row.get('alt_target_b'), str(row.get('side') or ''))
+    tp_hit = bool(float(row.get('tp1_hit_ts') or 0.0) > 0 or float(row.get('alt_target_a_hit_ts') or 0.0) > 0)
     lines.append(
         f"   • TP: {fmt_price(float(tp_val or 0.0)) if float(tp_val or 0.0) > 0 else '—'} | Hit: {_autotrade_checkbox(tp_hit)}"
     )
@@ -26414,13 +26414,13 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
 
             payload = _signal_setup_eval_payload(sid) if sid else {}
             if payload:
-                for fld in ('symbol', 'side', 'entry', 'sl', 'tp1', 'tp2', 'tp3'):
+                for fld in ('symbol', 'side', 'entry', 'sl', 'tp1', 'alt_target_a', 'alt_target_b'):
                     cur = b.get(fld)
                     try:
                         cur_num = float(cur or 0.0)
                     except Exception:
                         cur_num = 0.0
-                    if fld in {'entry', 'sl', 'tp1', 'tp2', 'tp3'}:
+                    if fld in {'entry', 'sl', 'tp1', 'alt_target_a', 'alt_target_b'}:
                         if cur_num <= 0 and float(payload.get(fld) or 0.0) > 0:
                             b[fld] = float(payload.get(fld) or 0.0)
                     else:
@@ -26590,7 +26590,7 @@ def _autotrade_report_overall_text_cached(owner: int) -> str:
     if weighted_total > 0:
         lines.extend([
             f"Decided: {int(weighted.get('decided') or 0)} | Weighted WR: {float(weighted.get('weighted_win_rate') or 0.0):.1f}% | Binary WR: {float(weighted.get('binary_win_rate') or 0.0):.1f}%",
-            f"TP: {int(weighted.get('tp1_only') or 0) + int(weighted.get('tp2_plus') or 0)} | SL: {int(weighted.get('losses') or 0)} | Open: {int(weighted.get('open') or 0)}",
+            f"TP: {int(weighted.get('tp1_only') or 0) + int(weighted.get('alt_target_a_plus') or 0)} | SL: {int(weighted.get('losses') or 0)} | Open: {int(weighted.get('open') or 0)}",
             f"Avg staged credit/trade: {float(weighted.get('avg_weighted_credit') or 0.0):.2f}",
         ])
     else:
@@ -26603,7 +26603,7 @@ def _autotrade_report_overall_text_cached(owner: int) -> str:
         lines.extend(["", "Session breakdown:"])
         for sess, item in sorted(by_session.items()):
             lines.append(
-                f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP {int(item.get('tp1_only') or 0) + int(item.get('tp2_plus') or 0)} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
+                f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP {int(item.get('tp1_only') or 0) + int(item.get('alt_target_a_plus') or 0)} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
             )
 
     out = "\n".join(lines)
@@ -26659,7 +26659,7 @@ def _performance_report_payload_cached(owner: int, days: int) -> dict:
         f"Closed trades: {int(overall_summary.get('closed') or 0)} | Wins: {int(overall_summary.get('wins') or 0)} | Losses: {int(overall_summary.get('losses') or 0)}",
         f"Net PnL: ${float(overall_summary.get('net') or 0.0):+.2f} | Profit factor: {_pf_txt(overall_summary.get('profit_factor'))} | Expectancy: ${float(overall_summary.get('expectancy') or 0.0):+.2f}",
         f"Realized WR: {float(overall_summary.get('win_rate') or 0.0):.1f}% | Weighted TP WR: {float(weighted_overall.get('weighted_win_rate') or 0.0):.1f}%",
-        f"TP mix: TP {int(weighted_overall.get('tp1_only') or 0) + int(weighted_overall.get('tp2_plus') or 0)} | SL {int(weighted_overall.get('losses') or 0)} | OPEN {int(weighted_overall.get('open') or 0)}",
+        f"TP mix: TP {int(weighted_overall.get('tp1_only') or 0) + int(weighted_overall.get('alt_target_a_plus') or 0)} | SL {int(weighted_overall.get('losses') or 0)} | OPEN {int(weighted_overall.get('open') or 0)}",
     ]
     bd = overall_summary.get('best_day') or {}
     wd = overall_summary.get('worst_day') or {}
@@ -26674,7 +26674,7 @@ def _performance_report_payload_cached(owner: int, days: int) -> dict:
         SEP,
         f'RECENT ({days} day window)',
         f"Closed: {int(recent_summary.get('closed') or 0)} | Net PnL: ${float(recent_summary.get('net') or 0.0):+.2f} | Realized WR: {float(recent_summary.get('win_rate') or 0.0):.1f}%",
-        f"Weighted TP WR: {float(weighted_recent.get('weighted_win_rate') or 0.0):.1f}% | TP {int(weighted_recent.get('tp1_only') or 0) + int(weighted_recent.get('tp2_plus') or 0)} | SL {int(weighted_recent.get('losses') or 0)} | OPEN {int(weighted_recent.get('open') or 0)}",
+        f"Weighted TP WR: {float(weighted_recent.get('weighted_win_rate') or 0.0):.1f}% | TP {int(weighted_recent.get('tp1_only') or 0) + int(weighted_recent.get('alt_target_a_plus') or 0)} | SL {int(weighted_recent.get('losses') or 0)} | OPEN {int(weighted_recent.get('open') or 0)}",
     ])
     lines.extend([SEP, *_trade_lifecycle_analytics_lines(lifecycle_recent, heading=f'Lifecycle feed ({days}d)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2), SEP, 'Daily trend'])
     for r in recent_rows:
@@ -27824,8 +27824,8 @@ def _remember_recent_screen_signal(s: Setup, session: str = "", user_id: int | N
             "entry": float(getattr(s, "entry", 0.0) or 0.0),
             "sl": float(getattr(s, "sl", 0.0) or 0.0),
             "tp1": getattr(s, "tp1", None),
-            "tp2": getattr(s, "tp2", None),
-            "tp3": float(getattr(s, "tp3", 0.0) or 0.0),
+            "alt_target_a": getattr(s, "alt_target_a", None),
+            "alt_target_b": float(getattr(s, "alt_target_b", 0.0) or 0.0),
             "fut_vol_usd": float(getattr(s, "fut_vol_usd", 0.0) or 0.0),
             "ch24": float(getattr(s, "ch24", 0.0) or 0.0),
             "ch4": float(getattr(s, "ch4", 0.0) or 0.0),
@@ -28018,8 +28018,8 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 entry = float(getattr(s, "entry", 0.0) or 0.0)
                 sl = float(getattr(s, "sl", 0.0) or 0.0)
                 tp1 = getattr(s, "tp1", None)
-                tp2 = getattr(s, "tp2", None)
-                tp3 = float(getattr(s, "tp3", 0.0) or 0.0)
+                alt_target_a = getattr(s, "alt_target_a", None)
+                alt_target_b = float(getattr(s, "alt_target_b", 0.0) or 0.0)
                 vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
 
                 ch24 = float(getattr(s, "ch24", 0.0) or 0.0)
@@ -28029,8 +28029,8 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
                 rr_den = abs(entry - sl)
                 rr1 = (abs(float(tp1) - entry) / rr_den) if (rr_den > 0 and tp1 not in (None, 0, 0.0)) else 0.0
-                rr2 = (abs(float(tp2) - entry) / rr_den) if (rr_den > 0 and tp2 not in (None, 0, 0.0)) else 0.0
-                rr3 = (abs(tp3 - entry) / rr_den) if rr_den > 0 else 0.0
+                rr2 = (abs(float(alt_target_a) - entry) / rr_den) if (rr_den > 0 and alt_target_a not in (None, 0, 0.0)) else 0.0
+                rr3 = (abs(alt_target_b - entry) / rr_den) if rr_den > 0 else 0.0
 
                 pos_word = "long" if side == "BUY" else "short"
                 size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
@@ -28047,15 +28047,15 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                         block.append("📩 *Email suppressed:* cooldown active")
                 except Exception:
                     pass
-                if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
+                if tp1 not in (None, 0, 0.0) and alt_target_a not in (None, 0, 0.0):
                     block.append(f"Type: {typ} | RR(TP): `{(rr1 or rr2 or rr3):.2f}`")
                 else:
                     block.append(f"Type: {typ} | RR(TP): `{(rr1 or rr2 or rr3):.2f}`")
                 block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
-                if tp1 not in (None, 0, 0.0) and tp2 not in (None, 0, 0.0):
-                    block.append(f"TP: `{fmt_price(float(_resolve_single_tp(entry, sl, tp1, tp2, tp3, side) or 0.0))}`")
+                if tp1 not in (None, 0, 0.0) and alt_target_a not in (None, 0, 0.0):
+                    block.append(f"TP: `{fmt_price(float(_resolve_single_tp(entry, sl, tp1, alt_target_a, alt_target_b, side) or 0.0))}`")
                 else:
-                    block.append(f"TP: `{fmt_price(float(_resolve_single_tp(entry, sl, tp1, tp2, tp3, side) or 0.0))}`")
+                    block.append(f"TP: `{fmt_price(float(_resolve_single_tp(entry, sl, tp1, alt_target_a, alt_target_b, side) or 0.0))}`")
                 block.append(
                     f"Moves: 24H {ch24:+.0f}% {_mv_dot(ch24)} • 4H {ch4:+.0f}% {_mv_dot(ch4)} • "
                     f"1H {ch1:+.0f}% {_mv_dot(ch1)} • 15m {ch15:+.0f}% {_mv_dot(ch15)}"
@@ -28374,7 +28374,7 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
                     side,
                     round(float(getattr(s, 'entry', 0.0) or 0.0), 8),
                     round(float(getattr(s, 'sl', 0.0) or 0.0), 8),
-                    round(float(getattr(s, 'tp3', 0.0) or 0.0), 8),
+                    round(float(getattr(s, 'alt_target_b', 0.0) or 0.0), 8),
                 )
             except Exception:
                 dedupe_key = (sym, side, sid)
@@ -28635,7 +28635,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Signal ID not found.")
             return
 
-        tp_val = _resolve_single_tp(float(sig.get('entry') or 0.0), float(sig.get('sl') or 0.0), sig.get('tp1'), sig.get('tp2'), sig.get('tp3'), str(sig.get('side') or ''))
+        tp_val = _resolve_single_tp(float(sig.get('entry') or 0.0), float(sig.get('sl') or 0.0), sig.get('tp1'), sig.get('alt_target_a'), sig.get('alt_target_b'), str(sig.get('side') or ''))
         tps = f"TP {fmt_price(float(tp_val or 0.0))}"
 
         rr3 = rr_to_tp(float(sig["entry"]), float(sig["sl"]), float(tp_val or 0.0))
@@ -28716,17 +28716,17 @@ def _email_body_pretty(
     parts.append("")
 
     for i, s in enumerate(setups, 1):
-        rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+        rr3 = rr_to_tp(s.entry, s.sl, s.alt_target_b)
 
         # ✅ "ID-" prefix
         parts.append(f"ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
-        _tp = _resolve_single_tp(s.entry, s.sl, getattr(s, 'tp1', None), getattr(s, 'tp2', None), getattr(s, 'tp3', None), getattr(s, 'side', ''))
+        _tp = _resolve_single_tp(s.entry, s.sl, getattr(s, 'tp1', None), getattr(s, 'alt_target_a', None), getattr(s, 'alt_target_b', None), getattr(s, 'side', ''))
         parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP): {rr_to_tp(s.entry, s.sl, float(_tp or 0.0)):.2f}")
 
         parts.append(f"   TP: {fmt_price_email(_tp)}")
 
         # ✅ only for t# trailing-needed setups
-        if getattr(s, 'is_trailing_tp3', False):
+        if getattr(s, 'is_trailing_alt_target_b', False):
             pass
 
         parts.append(
@@ -28792,7 +28792,7 @@ def _email_body_pretty_html(
     lines.append("<div style='font-weight:700;margin:8px 0 4px'>Top Setups</div>")
 
     for i, s in enumerate(setups, 1):
-        rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+        rr3 = rr_to_tp(s.entry, s.sl, s.alt_target_b)
         side = esc(s.side)
         sym = esc(s.symbol)
         conf = esc(s.conf)
@@ -28801,12 +28801,12 @@ def _email_body_pretty_html(
         card = []
         card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
         card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
-        _tp = _resolve_single_tp(s.entry, s.sl, getattr(s, 'tp1', None), getattr(s, 'tp2', None), getattr(s, 'tp3', None), getattr(s, 'side', ''))
+        _tp = _resolve_single_tp(s.entry, s.sl, getattr(s, 'tp1', None), getattr(s, 'alt_target_a', None), getattr(s, 'alt_target_b', None), getattr(s, 'side', ''))
         card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP): <code>{rr_to_tp(s.entry, s.sl, float(_tp or 0.0)):.2f}</code></div>")
 
         card.append(f"<div style='margin-top:4px'>TP: <code>{esc(fmt_price_email(_tp))}</code></div>")
 
-        if s.is_trailing_tp3:
+        if s.is_trailing_alt_target_b:
             pass
 
         card.append(
@@ -28860,7 +28860,7 @@ def _email_body_pretty_html(
     lines.append("<div style='font-weight:700;margin:8px 0 4px'>Top Setups</div>")
 
     for i, s in enumerate(setups, 1):
-        rr3 = rr_to_tp(s.entry, s.sl, s.tp3)
+        rr3 = rr_to_tp(s.entry, s.sl, s.alt_target_b)
         side = esc(s.side)
         sym = esc(s.symbol)
         conf = esc(s.conf)
@@ -28869,12 +28869,12 @@ def _email_body_pretty_html(
         card = []
         card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
         card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
-        _tp = _resolve_single_tp(s.entry, s.sl, getattr(s, 'tp1', None), getattr(s, 'tp2', None), getattr(s, 'tp3', None), getattr(s, 'side', ''))
+        _tp = _resolve_single_tp(s.entry, s.sl, getattr(s, 'tp1', None), getattr(s, 'alt_target_a', None), getattr(s, 'alt_target_b', None), getattr(s, 'side', ''))
         card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP): <code>{rr_to_tp(s.entry, s.sl, float(_tp or 0.0)):.2f}</code></div>")
 
         card.append(f"<div style='margin-top:4px'>TP: <code>{esc(fmt_price_email(_tp))}</code></div>")
 
-        if s.is_trailing_tp3:
+        if s.is_trailing_alt_target_b:
             pass
 
         card.append(
@@ -29810,7 +29810,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # Premium ordering: confidence desc, RR(final TP) desc
             def _rr3(_s: Setup) -> float:
                 try:
-                    return float(rr_to_tp(float(_s.entry), float(_s.sl), float(_s.tp3)))
+                    return float(rr_to_tp(float(_s.entry), float(_s.sl), float(_s.alt_target_b)))
                 except Exception:
                     return 0.0
 
@@ -29846,10 +29846,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         side,
                         round(float(getattr(s, 'entry', 0.0) or 0.0), 8),
                         round(float(getattr(s, 'sl', 0.0) or 0.0), 8),
-                        round(float(getattr(s, 'tp3', 0.0) or 0.0), 8),
+                        round(float(getattr(s, 'alt_target_b', 0.0) or 0.0), 8),
                     )
                 except Exception:
-                    _k = (sym, side, str(getattr(s, 'entry', '')), str(getattr(s, 'sl', '')), str(getattr(s, 'tp3', '')))
+                    _k = (sym, side, str(getattr(s, 'entry', '')), str(getattr(s, 'sl', '')), str(getattr(s, 'alt_target_b', '')))
                 if _k in _seen_setup_keys:
                     continue
                 _seen_setup_keys.add(_k)
@@ -30964,7 +30964,7 @@ def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
                     used_trade_ids.add(tid)
                 rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
                 snap = _autotrade_live_position_status(int(uid), p, trade_row=tr)
-                if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')) or any(bool(snap.get(k)) for k in ('missing_sl', 'missing_tp1', 'missing_tp2')):
+                if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')) or any(bool(snap.get(k)) for k in ('missing_sl', 'missing_tp1', 'missing_alt_target_a')):
                     if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp1_order_fixed', 'be_applied')):
                         repaired.append(rr)
                     else:
