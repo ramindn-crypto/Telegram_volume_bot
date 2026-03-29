@@ -13265,19 +13265,47 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
     cache_set("tickers_best_fut", best)
     return best
 
+_OHLCV_RATE_LIMIT_UNTIL: Dict[str, float] = {}
+
+
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     """
-    ✅ Uses singleton exchange (no repeated build + load_markets)
-    ✅ TTL cache already exists
+    Singleton + TTL cached OHLCV fetch.
+
+    Production hardening:
+    - never let a Bybit rate-limit exception crash /screen or other jobs
+    - when the request was recently rate-limited, serve stale cache (if any) instead of hammering Bybit again
+    - on transient failures, prefer stale cache over raising
     """
     key = f"ohlcv:{symbol}:{timeframe}:{limit}"
     if cache_valid(key, OHLCV_TTL_SEC):
         return cache_get(key)
 
+    now_ts = float(time.time())
+    cool_until = float(_OHLCV_RATE_LIMIT_UNTIL.get(key) or 0.0)
+    if cool_until > now_ts:
+        stale = cache_get(key)
+        return stale if isinstance(stale, list) else []
+
     ex = get_exchange()
-    data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
-    cache_set(key, data)
-    return data
+    try:
+        data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
+        cache_set(key, data)
+        _OHLCV_RATE_LIMIT_UNTIL.pop(key, None)
+        return data
+    except Exception as e:
+        name = type(e).__name__
+        msg = str(e or '')
+        if 'RateLimitExceeded' in name or '10006' in msg or 'rate limit' in msg.lower() or 'too many visits' in msg.lower():
+            _OHLCV_RATE_LIMIT_UNTIL[key] = now_ts + max(3.0, float(OHLCV_TTL_SEC))
+            try:
+                logger.warning('fetch_ohlcv rate-limited for %s %s x%s; using stale cache if available', symbol, timeframe, limit)
+            except Exception:
+                pass
+        stale = cache_get(key)
+        if isinstance(stale, list):
+            return stale
+        return []
 
 
 def ema7_1h_distance_pct(market_symbol: str) -> Tuple[float, float, float]:
@@ -21151,31 +21179,40 @@ def build_leaders_table(best_fut: Dict[str, MarketVol]) -> str:
 
 def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tuple], List[Tuple]]:
     """
-    ✅ FAST version:
-    - For leaders/losers we only need: volume, 24H move, and 4H alignment
-    - So we fetch ONLY 4H candles (limit=2) instead of full 1H+15m metrics
+    Fast + rate-limit-safe directional movers.
+
+    We only need enough symbols to build the top leaders/losers tables shown on /screen,
+    so do not walk the entire universe with fresh 4H requests on every manual scan.
     """
     up, dn = [], []
+    try:
+        candidates = []
+        for base, mv in best_fut.items():
+            vol = usd_notional(mv)
+            if vol < MOVER_VOL_USD_MIN:
+                continue
+            ch24 = float(mv.percentage or 0.0)
+            if ch24 < MOVER_UP_24H_MIN and ch24 > MOVER_DN_24H_MAX:
+                continue
+            candidates.append((base, mv, vol, ch24))
+        # Hard cap the number of 4H lookups per /screen build.
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        candidates = candidates[:25]
+    except Exception:
+        candidates = []
 
-    for base, mv in best_fut.items():
-        vol = usd_notional(mv)
-        if vol < MOVER_VOL_USD_MIN:
+    for base, mv, vol, ch24 in candidates:
+        try:
+            c4h = fetch_ohlcv(mv.symbol, "4h", limit=2)
+            if not c4h or len(c4h) < 2:
+                continue
+            c_last = float(c4h[-1][4])
+            c_prev = float(c4h[-2][4])
+            if c_prev <= 0:
+                continue
+            ch4 = ((c_last - c_prev) / c_prev) * 100.0
+        except Exception:
             continue
-
-        ch24 = float(mv.percentage or 0.0)
-        if ch24 < MOVER_UP_24H_MIN and ch24 > MOVER_DN_24H_MAX:
-            continue
-
-        # ✅ 4H alignment using real 4H candles (very light)
-        c4h = fetch_ohlcv(mv.symbol, "4h", limit=2)
-        if not c4h or len(c4h) < 2:
-            continue
-
-        c_last = float(c4h[-1][4])
-        c_prev = float(c4h[-2][4])
-        if c_prev <= 0:
-            continue
-        ch4 = ((c_last - c_prev) / c_prev) * 100.0
 
         if ch24 >= MOVER_UP_24H_MIN and ch4 > 0:
             up.append((base, vol, ch24, ch4, float(mv.last or 0.0)))
