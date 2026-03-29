@@ -29903,7 +29903,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 10M)
         # Defaults: 1H=7.5%, 4H=15%
         # -----------------------------------------------------
-        for u in (users_bigmove or []):
+        users_bigmove = list(users_bigmove or [])[:max(1, int(ALERT_JOB_BIGMOVE_MAX_USERS or 25))]
+        for u in users_bigmove:
             if _job_budget_exhausted():
                 logger.warning("alert_job bigmove loop budget exhausted after %.1fs", time.time() - job_started_ts)
                 return
@@ -30144,38 +30145,49 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         setups_by_session: Dict[str, List[Setup]] = {}
 
         async def _build_email_pool_for_session(sess_name: str) -> tuple[str, list]:
-            try:
-                # build_priority_pool is already async and internally offloads heavy work.
-                # Running it again inside a separate worker-thread event loop can starve
-                # the email lane and cause avoidable timeouts.
-                pool = await asyncio.wait_for(
-                    build_priority_pool(
-                        best_fut,
-                        sess_name,
-                        mode="email",
-                        scan_profile=str(DEFAULT_SCAN_PROFILE),
-                        uid=None,
-                    ),
-                    timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
-                )
-            except asyncio.TimeoutError:
-                db_log_setup_pipeline_event(0, stage='build_priority_pool', status='timeout', session=str(sess_name or ''), mode='email', details={'timeout_sec': float(EMAIL_BUILD_POOL_TIMEOUT_SEC)})
-                pool = {"setups": []}
-            except Exception as e:
-                db_log_setup_pipeline_event(0, stage='build_priority_pool', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(e).__name__}: {e}'})
-                pool = {"setups": []}
+            sess_key = str(sess_name or '').upper().strip()
+            cache_entry = _email_pool_cache_entry(sess_key)
+            cache_age = float(time.time()) - float(cache_entry.get('ts') or 0.0)
+            cached_setups = list(cache_entry.get('setups') or []) if cache_entry else []
 
-            setups = list(pool.get("setups", []) or [])
-            if not setups:
-                cached = _email_pool_cache_get(sess_name)
-                if cached:
-                    setups = list(cached)
+            # Cache-first: avoid rebuilding the full email pool every 60s when a recent
+            # authoritative session pool already exists. This is the main guard against
+            # alert_job overrunning its own schedule on Render.
+            if cached_setups and cache_age <= float(EMAIL_POOL_REBUILD_MIN_SEC or 180):
+                setups = list(cached_setups)
+                try:
+                    db_log_setup_pipeline_event(0, stage='email_pool_session_cache', status='ok', session=str(sess_name or ''), mode='email', details={'setups': len(setups or []), 'cache_age_sec': round(cache_age, 1)})
+                except Exception:
+                    pass
+            else:
+                try:
+                    # build_priority_pool is already async and internally offloads heavy work.
+                    pool = await asyncio.wait_for(
+                        build_priority_pool(
+                            best_fut,
+                            sess_name,
+                            mode="email",
+                            scan_profile=str(DEFAULT_SCAN_PROFILE),
+                            uid=None,
+                        ),
+                        timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    db_log_setup_pipeline_event(0, stage='build_priority_pool', status='timeout', session=str(sess_name or ''), mode='email', details={'timeout_sec': float(EMAIL_BUILD_POOL_TIMEOUT_SEC)})
+                    pool = {"setups": []}
+                except Exception as e:
+                    db_log_setup_pipeline_event(0, stage='build_priority_pool', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(e).__name__}: {e}'})
+                    pool = {"setups": []}
+
+                setups = list(pool.get("setups", []) or [])
+                if setups:
+                    _email_pool_cache_set(sess_name, setups)
+                elif cached_setups:
+                    setups = list(cached_setups)
                     try:
-                        db_log_setup_pipeline_event(0, stage='email_pool_session_cache', status='ok', session=str(sess_name or ''), mode='email', details={'setups': len(setups or [])})
+                        db_log_setup_pipeline_event(0, stage='email_pool_session_cache', status='stale_fallback', session=str(sess_name or ''), mode='email', details={'setups': len(setups or []), 'cache_age_sec': round(cache_age, 1)})
                     except Exception:
                         pass
-            else:
-                _email_pool_cache_set(sess_name, setups)
 
             # Do not starve the executable lane by clipping the pre-filter pool too early.
             setups = setups[:max(EMAIL_SETUPS_N * 12, 36)]
@@ -30210,7 +30222,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # -----------------------------------------------------
         # Per-user send / skip logic
         # -----------------------------------------------------
-        for meta in (notify_runtime or []):
+        notify_runtime = list(notify_runtime or [])[:max(1, int(ALERT_JOB_NOTIFY_MAX_USERS or 25))]
+        for meta in notify_runtime:
             if _job_budget_exhausted():
                 logger.warning("alert_job notify loop budget exhausted after %.1fs", time.time() - job_started_ts)
                 return
@@ -31987,7 +32000,7 @@ def main():
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
     if app.job_queue:
-        interval_sec = int(CHECK_INTERVAL_MIN * 60)
+        interval_sec = max(int(CHECK_INTERVAL_MIN * 60), 75)
     
         app.job_queue.run_repeating(
             alert_job,
@@ -31997,7 +32010,7 @@ def main():
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
-                "misfire_grace_time": 60,
+                "misfire_grace_time": 90,
             },
         )
 
