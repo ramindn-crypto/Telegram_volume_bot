@@ -7,8 +7,8 @@
 
 
 # --- ASIA tightening (hard-coded, no env vars) ---
-ASIA_MIN_CONF_BOOST = 9
-ASIA_MIN_FUT_VOL_USD = 10_000_000
+ASIA_MIN_CONF_BOOST = 10
+ASIA_MIN_FUT_VOL_USD = 12_000_000
 ASIA_EXCLUDED_PREFIXES = ("1000",)
 ASIA_SYMBOL_COOLDOWN_HOURS = 6
 
@@ -397,7 +397,7 @@ from concurrent.futures import ThreadPoolExecutor
 import functools as _functools
 
 _FAST_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("FAST_EXECUTOR_WORKERS", "8")))
-_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "4")))
+_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "6")))
 
 async def _run_in_executor(executor, fn, *args, timeout: int | None = None, **kwargs):
     loop = asyncio.get_running_loop()
@@ -1021,7 +1021,7 @@ SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
 SCREEN_WAITING_N = 10
 
 # EMA proximity gate: never generate setups if price is far from EMA7 (1H)
-EMA7_1H_MAX_DIST_PCT = float(os.environ.get("EMA7_1H_MAX_DIST_PCT", "0.80") or 0.80)  # adaptive base anchor distance (%)
+EMA7_1H_MAX_DIST_PCT = float(os.environ.get("EMA7_1H_MAX_DIST_PCT", "0.65") or 0.65)  # adaptive base anchor distance (%)
 
 # Directional Leaders/Losers thresholds
 MOVER_VOL_USD_MIN = 5_000_000
@@ -1182,6 +1182,7 @@ def _strategy_config_defaults() -> dict:
         "counter_regime_conf_add": {"NY": 2, "LON": 2, "ASIA": 3},
         "counter_regime_rr_add": {"NY": 0.10, "LON": 0.10, "ASIA": 0.12},
         "execution_asia_enabled": bool(EXECUTION_ASIA_ENABLED),
+        "execution_asia_user_override": False,
         "execution_engine_b_email_enabled": bool(EXECUTION_ENGINE_B_EMAIL_ENABLED),
         "session_exec_overrides": {
             "NY": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
@@ -1277,6 +1278,22 @@ def _cfg_bool(value, default: bool = False) -> bool:
         return bool(int(float(s)))
     except Exception:
         return bool(default)
+
+def _strategy_cfg_execution_asia_enabled(cfg: dict | None) -> bool:
+    """ASIA execution defaults to ON unless an explicit manual override disables it.
+
+    This prevents older auto-disabled config states from silently keeping ASIA off forever,
+    while still allowing a deliberate /params_set execution_asia_enabled false choice.
+    """
+    try:
+        cfg = cfg or {}
+        manual = _cfg_bool((cfg or {}).get('execution_asia_user_override', False), False)
+        enabled = _cfg_bool((cfg or {}).get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED))
+        if manual:
+            return bool(enabled)
+        return bool(enabled) or bool(EXECUTION_ASIA_ENABLED)
+    except Exception:
+        return bool(EXECUTION_ASIA_ENABLED)
 
 
 def apply_strategy_config(cfg: dict) -> None:
@@ -1407,6 +1424,9 @@ async def cmd_params_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         cfg[key] = val
 
+    if key == 'execution_asia_enabled':
+        cfg['execution_asia_user_override'] = True
+
     save_strategy_config(cfg)
     apply_strategy_config(cfg)
     await update.message.reply_text(f"✅ Updated: {key} = {val_raw}")
@@ -1464,7 +1484,7 @@ MOMENTUM_MIN_24H = 8.0              # must be moving
 MOMENTUM_VOL_MULT = 1.2              # volume spike vs mover min
 MOMENTUM_ATR_BODY_MULT = 0.95        # expansion vs ATR% (easier)
 # ✅ MUCH STRICTER: avoid pump / mid-wave momentum entries
-MOMENTUM_MAX_ADAPTIVE_EMA_DIST = 3.5   # percent, was 7.5
+MOMENTUM_MAX_ADAPTIVE_EMA_DIST = 2.6   # percent, tighter to avoid chasing momentum
 
 
 # Higher TP behavior for Engine B (pumps)
@@ -1480,10 +1500,10 @@ ENGINE_C_PUMP_BASE_ENABLED = True
 ENGINE_C_MIN_CH24 = 10.0
 ENGINE_C_MIN_ABS_CH4 = 1.2
 ENGINE_C_MIN_IMPULSE_15M_PCT = 4.0
-ENGINE_C_MIN_IMPULSE_VOL_MULT = 1.35
+ENGINE_C_MIN_IMPULSE_VOL_MULT = 1.45
 ENGINE_C_MAX_BASE_BARS = 10
 ENGINE_C_MIN_BASE_BARS = 3
-ENGINE_C_MAX_BASE_WIDTH_PCT = 8.5
+ENGINE_C_MAX_BASE_WIDTH_PCT = 7.2
 ENGINE_C_HOLD_PORTION = 0.52
 ENGINE_C_BREAKOUT_BUFFER_PCT = 0.35
 ENGINE_C_MIN_FUT_VOL_USD = 8_000_000.0
@@ -1549,14 +1569,14 @@ TF_ALIGN_4H_MIN_ABS = 0.5   # percent
 
 # ✅ Approach A: session-aware TF alignment floors (higher win-rate, esp. ASIA)
 TF_ALIGN_1H_MIN_ABS_BY_SESSION = {
-    "NY": TF_ALIGN_1H_MIN_ABS,
-    "LON": TF_ALIGN_1H_MIN_ABS,
-    "ASIA": 0.8,
+    "NY": 0.70,
+    "LON": 0.55,
+    "ASIA": 0.85,
 }
 TF_ALIGN_4H_MIN_ABS_BY_SESSION = {
-    "NY": TF_ALIGN_4H_MIN_ABS,
-    "LON": TF_ALIGN_4H_MIN_ABS,
-    "ASIA": 0.8,
+    "NY": 0.60,
+    "LON": 0.50,
+    "ASIA": 0.80,
 }
 
 def tf_align_mins_for_session(session_name: str) -> tuple[float, float]:
@@ -2155,9 +2175,19 @@ def _ms_to_local_str(ms: int | str | None) -> str:
         return ""
 
 def _bybit_get_open_positions_linear() -> list[dict]:
-    """Return a list of open linear USDT positions (Bybit V5).
-    Each item: {symbol, side, size, avgPrice, markPrice, unrealisedPnl, stopLoss, createdTime, updatedTime, positionValue, leverage}
+    """Return cached open linear USDT positions (Bybit V5).
+
+    Short cache keeps status/report/autotrade commands responsive and avoids repeated
+    position-list hits within the same second burst.
     """
+    cache_key = 'bybit_open_positions_linear'
+    try:
+        ttl = max(1, int(BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC or 6))
+        if cache_valid(cache_key, ttl):
+            cached = cache_get(cache_key)
+            return list(cached or []) if isinstance(cached, list) else []
+    except Exception:
+        pass
     try:
         if not BYBIT_API_KEY or not BYBIT_API_SECRET:
             return []
@@ -2178,9 +2208,14 @@ def _bybit_get_open_positions_linear() -> list[dict]:
             if size == 0:
                 continue
             out.append(p)
+        try:
+            cache_set(cache_key, list(out))
+        except Exception:
+            pass
         return out
     except Exception:
-        return []
+        stale = cache_get(cache_key)
+        return list(stale or []) if isinstance(stale, list) else []
 
 def _norm_trade_side(side: str) -> str:
     try:
@@ -4957,10 +4992,18 @@ def _autotrade_can_open_symbol(uid: int, symbol: str, side: str, session_label: 
 
 
 def _bybit_get_open_orders_linear(symbol: str | None = None) -> list[dict]:
+    sym = _bybit_linear_symbol(symbol) if symbol else None
+    cache_key = f"bybit_open_orders_linear:{sym or 'ALL'}"
+    try:
+        ttl = max(1, int(BYBIT_OPEN_ORDERS_CACHE_TTL_SEC or 6))
+        if cache_valid(cache_key, ttl):
+            cached = cache_get(cache_key)
+            return list(cached or []) if isinstance(cached, list) else []
+    except Exception:
+        pass
     try:
         if not BYBIT_API_KEY or not BYBIT_API_SECRET:
             return []
-        sym = _bybit_linear_symbol(symbol) if symbol else None
         merged: list[dict] = []
         seen: set[str] = set()
         order_filters = [None, 'Order', 'StopOrder', 'tpslOrder', 'TPSLOrder']
@@ -4983,9 +5026,14 @@ def _bybit_get_open_orders_linear(symbol: str | None = None) -> list[dict]:
                     continue
                 seen.add(key)
                 merged.append(row)
+        try:
+            cache_set(cache_key, list(merged))
+        except Exception:
+            pass
         return merged
     except Exception:
-        return []
+        stale = cache_get(cache_key)
+        return list(stale or []) if isinstance(stale, list) else []
 
 
 def _bybit_get_order_linear_state(symbol: str, order_id: str = '', order_link_id: str = '') -> dict:
@@ -6043,15 +6091,15 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 76,
-    "LON": 76,
-    "ASIA": 80,
+    "NY": 79,
+    "LON": 78,
+    "ASIA": 83,
 }
 
 SESSION_MIN_RR_FINAL = {
-    "NY": 1.50,
-    "LON": 1.52,
-    "ASIA": 1.75,
+    "NY": 1.62,
+    "LON": 1.58,
+    "ASIA": 1.82,
 }
 
 SESSION_MIN_RR_TP = SESSION_MIN_RR_FINAL  # legacy compatibility only
@@ -6086,9 +6134,9 @@ def _session_generation_rr_floor(session_name: str) -> float:
     return float(MIN_RR_FINAL)
 
 SESSION_EMA_PROX_MULT = {
-    "NY": 1.60,
-    "LON": 1.40,
-    "ASIA": 1.20,
+    "NY": 1.45,
+    "LON": 1.30,
+    "ASIA": 1.10,
 }
 
 SESSION_EMA_REACTION_LOOKBACK = {
@@ -11241,7 +11289,11 @@ def _trade_lifecycle_analytics(owner_uid: int, days: int = 30, session: str = 'A
             pass
     if sync:
         try:
-            _trade_lifecycle_sync(owner_uid, days=max(7, days), force=force)
+            sync_days = max(7, days)
+            sync_gate = f"trade_lifecycle_sync_guard:{owner_uid}:{int(sync_days)}"
+            if force or (not cache_valid(sync_gate, 300)):
+                _trade_lifecycle_sync(owner_uid, days=sync_days, force=force)
+                cache_set(sync_gate, {'ts': time.time()})
         except Exception:
             pass
     rows = _trade_lifecycle_query_rows(owner_uid, start_ts=float(start_ts), session=session)
@@ -13266,6 +13318,9 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
     return best
 
 _OHLCV_RATE_LIMIT_UNTIL: Dict[str, float] = {}
+BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC", "6") or 6)
+BYBIT_OPEN_ORDERS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_ORDERS_CACHE_TTL_SEC", "6") or 6)
+SCREEN_DIRECTIONAL_CACHE_TTL_SEC = int(os.getenv("SCREEN_DIRECTIONAL_CACHE_TTL_SEC", "45") or 45)
 
 
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
@@ -14096,8 +14151,8 @@ def rr_to_tp(entry: float, sl: float, tp: float) -> float:
 # - Used by both /screen and email selection, and by backtests.
 # =========================================================
 
-QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "62"))
-QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "70"))
+QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "65"))
+QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "73"))
 
 # Soft throttling: how many candidates we score before slicing (keeps compute bounded)
 QUALITY_SCORE_CAND_MULT_SCREEN = int(os.environ.get("QUALITY_SCORE_CAND_MULT_SCREEN", "8"))
@@ -14188,7 +14243,7 @@ def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[
     leader_base_override = bool(getattr(s, "leader_base_override", False))
     engine = str(getattr(s, "engine", "") or "").upper().strip()
     # Prefer pullbacks not too far from EMA (but don't hard-gate)
-    ema_clean = 1.0 - _clamp01(ema_dist / 2.0)  # 0%..2% maps to 1..0
+    ema_clean = 1.0 - _clamp01(ema_dist / 1.6)  # tighter penalty for stretched entries
 
     # Stop distance should not be absurdly tight or huge vs ATR (if atr_pct available)
     atr_pct = float(getattr(s, "atr_pct", 0.0) or 0.0)
@@ -14201,7 +14256,7 @@ def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[
     stop_sane = _mid_pref(stop_pct, 0.25, 4.5, mid=1.4)
 
     # --- Component D: Risk & trade construction (RR + TP validity) ---
-    rr_score = _clamp01(rr3 / 2.2)  # RR 2.2 ~ full
+    rr_score = _clamp01(rr3 / 2.0)  # require cleaner final-target RR
     tp_valid = 1.0 if (entry > 0 and sl > 0 and final_tp > 0 and rr3 > 0.2) else 0.0
 
     # --- Component E: Quality scoring inputs ---
@@ -14270,22 +14325,28 @@ def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[
     extension_penalty = 0.0
     if not leader_base_override:
         if ema_dist > float(limits['max_pb_ema_dist']):
-            extension_penalty += min(16.0, (ema_dist - float(limits['max_pb_ema_dist'])) * 12.0)
+            extension_penalty += min(18.0, (ema_dist - float(limits['max_pb_ema_dist'])) * 15.0)
         if ch15_abs > float(limits['max_ch15_abs']):
-            extension_penalty += min(10.0, (ch15_abs - float(limits['max_ch15_abs'])) * 8.0)
+            extension_penalty += min(12.0, (ch15_abs - float(limits['max_ch15_abs'])) * 10.0)
         if engine not in {'B', 'C'} and ch1_abs > float(limits['max_ch1_abs']):
-            extension_penalty += min(8.0, (ch1_abs - float(limits['max_ch1_abs'])) * 4.0)
+            extension_penalty += min(10.0, (ch1_abs - float(limits['max_ch1_abs'])) * 5.0)
         if atr_pct > 0 and atr_pct > float(limits['max_atr_pct']):
-            extension_penalty += min(5.0, (atr_pct - float(limits['max_atr_pct'])) * 1.4)
+            extension_penalty += min(6.0, (atr_pct - float(limits['max_atr_pct'])) * 1.8)
 
     # Session slight tuning with explicit NY chase-risk penalty.
     sname = str(session_name or "").upper()
     if sname == "NY":
-        score += 1.0
-        if ch1_abs >= 1.8 and ch15_abs >= 0.8:
-            extension_penalty += 3.0
+        if ch1_abs >= 1.6 and ch15_abs >= 0.75:
+            extension_penalty += 4.0
+        if ema_dist > 0.72 and ch15_abs > 0.80:
+            extension_penalty += 2.0
+    elif sname == "LON":
+        if ema_dist <= 0.45 and ch15_abs <= 0.55:
+            score += 0.75
     elif sname == "ASIA":
-        score -= 1.0
+        score -= 1.5
+        if fut_vol < float(max(MIN_FUT_VOL_USD * 1.15, ASIA_MIN_FUT_VOL_USD)):
+            extension_penalty += 2.0
 
     components['extension_penalty'] = float(extension_penalty)
     score -= float(extension_penalty)
@@ -19909,7 +19970,7 @@ def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
             score += float(min(4.0, s_wr - floor)) * 0.25
 
     asia_live = int(((per_session or {}).get('ASIA') or {}).get('setups', 0) or 0)
-    if asia_live > 0 and not _cfg_bool((cfg or {}).get('execution_asia_enabled', False), False):
+    if asia_live > 0 and not _strategy_cfg_execution_asia_enabled(cfg):
         score -= float(asia_live) * 0.35
     return float(score)
 
@@ -19966,7 +20027,7 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
     out['atr_min_pct'] = float(clamp(float(out.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT), alo, ahi))
     tlo, thi = _rng('tf_align_1h_min_abs', 0.3, 1.2)
     out['tf_align_1h_min_abs'] = float(clamp(float(out.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), tlo, thi))
-    out['execution_asia_enabled'] = _cfg_bool(out.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED))
+    out['execution_asia_enabled'] = _strategy_cfg_execution_asia_enabled(out)
     out['execution_engine_b_email_enabled'] = _cfg_bool(out.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
     sess_ov = out.get('session_exec_overrides') or {}
     norm_ov = {}
@@ -19999,11 +20060,13 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
     ny_floor = float(cfg.get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
     lon_floor = float(cfg.get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
 
-    if _cfg_bool(cfg.get('execution_asia_enabled', False), False):
+    if _strategy_cfg_execution_asia_enabled(cfg):
         asia = (per_session or {}).get('ASIA') or {}
         if int(asia.get('setups', 0) or 0) >= 10 and float(asia.get('win_rate', 0.0) or 0.0) < 44.0:
-            _market_adaptive_apply_action(cfg, actions, 'execution_asia_enabled', False, 'ASIA_30d_live_WR_too_low')
-            notes.append('Disabled ASIA executable lane due to weak 30d live-equivalent session edge.')
+            _market_adaptive_apply_action(cfg, actions, 'session_exec_overrides.ASIA.quality_add', 1.25, 'ASIA_30d_live_WR_too_low')
+            _market_adaptive_apply_action(cfg, actions, 'session_exec_overrides.ASIA.conf_add', 1, 'ASIA_30d_live_WR_too_low')
+            _market_adaptive_apply_action(cfg, actions, 'session_exec_overrides.ASIA.rr_add', 0.08, 'ASIA_30d_live_WR_too_low')
+            notes.append('Kept ASIA executable lane ON by default and tightened ASIA execution thresholds instead of disabling it.')
 
     for sess, floor in (('NY', ny_floor), ('LON', lon_floor)):
         sd = (per_session or {}).get(sess) or {}
@@ -20107,7 +20170,7 @@ def _runtime_profile_snapshot_from_cfg(cfg: dict | None = None) -> dict:
         'min_rr_tp': float(cfg.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP)) or MIN_RR_TP),
         'tf_align_1h_min_abs': float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS),
         'atr_min_pct': float(cfg.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT),
-        'execution_asia_enabled': _cfg_bool(cfg.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED)),
+        'execution_asia_enabled': _strategy_cfg_execution_asia_enabled(cfg),
         'execution_engine_b_email_enabled': _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)),
         'session_exec_overrides': json.loads(json.dumps(cfg.get('session_exec_overrides') or {})),
     }
@@ -20501,7 +20564,7 @@ def _run_market_adaptive_cycle(force: bool = False) -> dict:
                 'min_rr_tp': float(final_cfg.get('min_rr_tp', final_cfg.get('min_rr_tp', MIN_RR_TP)) or MIN_RR_TP),
                 'tf_align_1h_min_abs': float(final_cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS),
                 'atr_min_pct': float(final_cfg.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT),
-                'execution_asia_enabled': _cfg_bool(final_cfg.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED)),
+                'execution_asia_enabled': _strategy_cfg_execution_asia_enabled(final_cfg),
                 'execution_engine_b_email_enabled': _cfg_bool(final_cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)),
                 'session_exec_overrides': final_cfg.get('session_exec_overrides') or {},
             },
@@ -20595,7 +20658,7 @@ async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAU
             SEP,
             f"Current live floors: email_quality={float(current_live.get('quality_score_min_email', 0.0) or 0.0):.1f} | screen_quality={float(current_live.get('quality_score_min_screen', 0.0) or 0.0):.1f} | min_rr_tp={float(current_live.get('min_rr_tp', current_live.get('min_rr_tp', 0.0)) or 0.0):.2f}",
             f"TF align 1h={float(current_live.get('tf_align_1h_min_abs', 0.0) or 0.0):.2f} | ATR min={float(current_live.get('atr_min_pct', 0.0) or 0.0):.2f}",
-            f"Engine B exec: {'ON' if _cfg_bool(current_live.get('execution_engine_b_email_enabled', True), True) else 'OFF'} | Asia exec: {'ON' if _cfg_bool(current_live.get('execution_asia_enabled', False), False) else 'OFF'}",
+            f"Engine B exec: {'ON' if _cfg_bool(current_live.get('execution_engine_b_email_enabled', True), True) else 'OFF'} | Asia exec: {'ON' if _strategy_cfg_execution_asia_enabled(current_live) else 'OFF'}",
         ])
         lines.append('Session-specific executable thresholds:')
         for _sess in ('NY', 'LON', 'ASIA'):
@@ -20769,15 +20832,15 @@ async def cmd_self_optimize_report(update: Update, context: ContextTypes.DEFAULT
 def _session_entry_quality_limits(session_name: str, source: str = 'email') -> dict:
     sess = str(session_name or '').upper().strip() or 'NY'
     base = {
-        'NY': {'max_pb_ema_dist': 0.88, 'max_ch15_abs': 0.98, 'max_ch1_abs': 2.40, 'max_atr_pct': 6.2},
-        'LON': {'max_pb_ema_dist': 0.84, 'max_ch15_abs': 0.93, 'max_ch1_abs': 2.15, 'max_atr_pct': 5.9},
-        'ASIA': {'max_pb_ema_dist': 0.74, 'max_ch15_abs': 0.82, 'max_ch1_abs': 1.80, 'max_atr_pct': 5.2},
-    }.get(sess, {'max_pb_ema_dist': 0.84, 'max_ch15_abs': 0.93, 'max_ch1_abs': 2.15, 'max_atr_pct': 5.9}).copy()
+        'NY': {'max_pb_ema_dist': 0.80, 'max_ch15_abs': 0.88, 'max_ch1_abs': 2.05, 'max_atr_pct': 5.7},
+        'LON': {'max_pb_ema_dist': 0.78, 'max_ch15_abs': 0.86, 'max_ch1_abs': 1.95, 'max_atr_pct': 5.4},
+        'ASIA': {'max_pb_ema_dist': 0.66, 'max_ch15_abs': 0.70, 'max_ch1_abs': 1.60, 'max_atr_pct': 4.8},
+    }.get(sess, {'max_pb_ema_dist': 0.78, 'max_ch15_abs': 0.86, 'max_ch1_abs': 1.95, 'max_atr_pct': 5.4}).copy()
     if str(source or '').strip().lower() == 'screen':
-        base['max_pb_ema_dist'] *= 1.12
-        base['max_ch15_abs'] *= 1.08
-        base['max_ch1_abs'] *= 1.08
-        base['max_atr_pct'] *= 1.08
+        base['max_pb_ema_dist'] *= 1.10
+        base['max_ch15_abs'] *= 1.06
+        base['max_ch1_abs'] *= 1.06
+        base['max_atr_pct'] *= 1.06
     return base
 
 
@@ -20883,13 +20946,13 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 78.5, 82, 1.55
+        quality, conf, rr = 81.5, 84, 1.62
     elif sess == "LON":
-        quality, conf, rr = 78.0, 81, 1.54
+        quality, conf, rr = 79.0, 82, 1.58
     elif sess == "ASIA":
-        quality, conf, rr = 84.0, 85, 1.70
+        quality, conf, rr = 84.5, 86, 1.80
     else:
-        quality, conf, rr = 78.0, 81, 1.54
+        quality, conf, rr = 79.0, 82, 1.58
 
     try:
         cfg = load_strategy_config(force=False)
@@ -20927,7 +20990,7 @@ def is_executable_setup_eligible(
         if sess not in {"ASIA", "LON", "NY"}:
             return (False, "session_not_supported")
         cfg_live = load_strategy_config(force=False)
-        exec_asia_enabled = _cfg_bool((cfg_live or {}).get("execution_asia_enabled", EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED))
+        exec_asia_enabled = _strategy_cfg_execution_asia_enabled(cfg_live)
         exec_engine_b_enabled = _cfg_bool((cfg_live or {}).get("execution_engine_b_email_enabled", EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
         if sess == "ASIA" and not exec_asia_enabled:
             return (False, "asia_exec_disabled")
@@ -20963,22 +21026,29 @@ def is_executable_setup_eligible(
         ch1_abs = abs(float(getattr(s, "ch1", 0.0) or 0.0))
 
         if sess == "NY":
-            if pb_dist > 0.80 and (score < (score_floor + 3.0) or conf < (conf_floor + 2)):
+            if pb_dist > 0.72 and (score < (score_floor + 3.0) or conf < (conf_floor + 2)):
                 return (False, "ny_entry_too_far_from_ema")
-            if ch15_abs > 0.95 and pb_dist > 0.70:
+            if ch15_abs > 0.88 and pb_dist > 0.64:
                 return (False, "ny_late_extension_exec")
-            if ch15_abs > 0.84 and ch1_abs > 1.75 and conf < (conf_floor + 3):
+            if ch15_abs > 0.78 and ch1_abs > 1.60 and conf < (conf_floor + 3):
                 return (False, "ny_stretched_continuation_exec")
         elif sess == "LON":
-            if pb_dist > 0.78 and (score < (score_floor + 2.0) or conf < (conf_floor + 1)):
+            if pb_dist > 0.74 and (score < (score_floor + 2.0) or conf < (conf_floor + 1)):
                 return (False, "lon_entry_too_far_from_ema")
-            if ch15_abs > 0.90 and ch1_abs > 1.70 and pb_dist > 0.66:
+            if ch15_abs > 0.84 and ch1_abs > 1.55 and pb_dist > 0.62:
                 return (False, "lon_late_extension_exec")
+        elif sess == "ASIA":
+            if pb_dist > 0.64 and (score < (score_floor + 2.0) or conf < (conf_floor + 1)):
+                return (False, "asia_entry_too_far_from_ema")
+            if ch15_abs > 0.72 or (ch15_abs > 0.66 and ch1_abs > 1.45):
+                return (False, "asia_late_extension_exec")
+            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.15, ASIA_MIN_FUT_VOL_USD)):
+                return (False, "asia_below_liquidity")
 
         if engine == "A":
             if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
                 return (False, "pullback_not_ready")
-            if pb_dist > (0.68 if sess == 'ASIA' else (0.72 if sess == 'LON' else 0.74)) and conf < (conf_floor + 2):
+            if pb_dist > (0.62 if sess == 'ASIA' else (0.68 if sess == 'LON' else 0.70)) and conf < (conf_floor + 2):
                 return (False, "pullback_still_too_shallow")
             return (True, "ok")
 
@@ -21003,24 +21073,24 @@ def is_executable_setup_eligible(
         if engine == "B":
             if not exec_engine_b_enabled:
                 return (False, "engine_b_disabled")
-            extra_score = 3.0 if sess == "NY" else 2.0
-            extra_conf = 2 if sess == "NY" else 1
-            extra_rr = 0.15 if sess == "NY" else 0.12
+            extra_score = 4.0 if sess == "NY" else (3.0 if sess == "ASIA" else 2.5)
+            extra_conf = 3 if sess == "NY" else (2 if sess == "ASIA" else 2)
+            extra_rr = 0.18 if sess == "NY" else (0.16 if sess == "ASIA" else 0.14)
             if score < (score_floor + extra_score):
                 return (False, "engine_b_below_quality")
             if conf < (conf_floor + extra_conf):
                 return (False, "engine_b_below_conf")
             if rr_final < (rr_floor + extra_rr):
                 return (False, "engine_b_below_rr")
-            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.6, 14_000_000.0)):
+            if fut_vol < float(max(MIN_FUT_VOL_USD * (1.7 if sess == 'NY' else 1.5), 16_000_000.0 if sess in {'NY','ASIA'} else 14_000_000.0)):
                 return (False, "engine_b_below_liquidity")
             ch1 = abs(float(getattr(s, "ch1", 0.0) or 0.0))
             ch4 = abs(float(getattr(s, "ch4", 0.0) or 0.0))
             if ch1 < 0.9 or ch4 < 1.7:
                 return (False, "engine_b_trend_not_strong_enough")
-            if pb_dist > (0.78 if sess == "NY" else 0.80):
+            if pb_dist > (0.70 if sess == "NY" else (0.72 if sess == "ASIA" else 0.76)):
                 return (False, "engine_b_entry_far_from_ema")
-            if ch15_abs > (0.90 if sess == "NY" else 0.95):
+            if ch15_abs > (0.82 if sess == "NY" else (0.84 if sess == "ASIA" else 0.88)):
                 return (False, "engine_b_chase_risk")
             return (True, "ok")
 
@@ -21181,9 +21251,23 @@ def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tupl
     """
     Fast + rate-limit-safe directional movers.
 
-    We only need enough symbols to build the top leaders/losers tables shown on /screen,
-    so do not walk the entire universe with fresh 4H requests on every manual scan.
+    Cached briefly because /screen may be called repeatedly while the market snapshot
+    itself has barely changed.
     """
+    try:
+        bases = sorted(str(k) for k in (best_fut or {}).keys())
+        fingerprint = f"{len(bases)}:{'|'.join(bases[:30])}:{'|'.join(bases[-5:]) if len(bases) > 35 else ''}"
+    except Exception:
+        fingerprint = f"{len(best_fut or {})}"
+    cache_key = f"screen_directional_lists:{fingerprint}"
+    try:
+        if cache_valid(cache_key, int(SCREEN_DIRECTIONAL_CACHE_TTL_SEC or 45)):
+            cached = cache_get(cache_key)
+            if isinstance(cached, dict):
+                return list(cached.get('up') or []), list(cached.get('dn') or [])
+    except Exception:
+        pass
+
     up, dn = [], []
     try:
         candidates = []
@@ -21195,9 +21279,8 @@ def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tupl
             if ch24 < MOVER_UP_24H_MIN and ch24 > MOVER_DN_24H_MAX:
                 continue
             candidates.append((base, mv, vol, ch24))
-        # Hard cap the number of 4H lookups per /screen build.
         candidates.sort(key=lambda x: x[2], reverse=True)
-        candidates = candidates[:25]
+        candidates = candidates[:18]
     except Exception:
         candidates = []
 
@@ -21221,6 +21304,10 @@ def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tupl
 
     up.sort(key=lambda x: (x[2], x[1]), reverse=True)
     dn.sort(key=lambda x: (x[2], x[1]))
+    try:
+        cache_set(cache_key, {'up': list(up), 'dn': list(dn)})
+    except Exception:
+        pass
     return up, dn
 
 def movers_tables(best_fut: Dict[str, MarketVol]) -> Tuple[str, str]:
@@ -26554,11 +26641,12 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
         base_rows = []
     if not base_rows:
         return []
+    base_rows = list(base_rows[:max(limit * 2, 40)])
 
     lifecycle_rows = []
     try:
         lifecycle_rows = [
-            dict(r) for r in (_trade_lifecycle_query_rows(owner_uid, start_ts=float(start_ts), session='ALL', limit=max(limit * 3, 120)) or [])
+            dict(r) for r in (_trade_lifecycle_query_rows(owner_uid, start_ts=float(start_ts), session='ALL', limit=max(limit * 2, 80)) or [])
             if str((r or {}).get('result_path') or '').upper().strip() != 'OPEN'
         ]
     except Exception:
@@ -26600,21 +26688,26 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
 
     hist_start = max(0.0, start_ts - 86400.0 * 5.0)
     hist_end = max(end_ts, float(time.time())) + 86400.0
-    symbols = sorted({str(_bybit_linear_symbol((r or {}).get('symbol') or '')).upper() for r in (base_rows or []) if str((r or {}).get('symbol') or '').strip()})
     order_cache = {}
     pnl_cache = {}
-    for sym in symbols:
-        try:
-            order_cache[sym] = _bybit_get_order_history_linear(sym, hist_start, hist_end, limit=200) or []
-        except Exception:
-            order_cache[sym] = []
-        try:
-            pnl_cache[sym] = _bybit_get_closed_pnl_linear(hist_start, hist_end, symbol=sym, limit=200) or []
-        except Exception:
-            pnl_cache[sym] = []
+    def _lazy_order_rows(sym: str):
+        if sym not in order_cache:
+            try:
+                order_cache[sym] = _bybit_get_order_history_linear(sym, hist_start, hist_end, limit=120) or []
+            except Exception:
+                order_cache[sym] = []
+        return order_cache.get(sym) or []
+    def _lazy_pnl_rows(sym: str):
+        if sym not in pnl_cache:
+            try:
+                pnl_cache[sym] = _bybit_get_closed_pnl_linear(hist_start, hist_end, symbol=sym, limit=120) or []
+            except Exception:
+                pnl_cache[sym] = []
+        return pnl_cache.get(sym) or []
 
     user = _autotrade_user_settings(owner_uid)
     seen_out = set()
+    enrich_budget = 8
 
     def _out_key(row: dict) -> tuple:
         sym = str(_bybit_linear_symbol((row or {}).get('symbol') or '')).upper()
@@ -26641,11 +26734,12 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                 detail = dict(life_by_ident.get(('setup', sid)) or {})
             if (not detail):
                 detail = dict(life_by_key.get(event_key) or {})
-            if (not detail) and (tid or sid):
+            if (not detail) and (tid or sid) and enrich_budget > 0:
                 try:
                     detail = _trade_lifecycle_detail_row(owner_uid, tid or sid, sync=False) or {}
                 except Exception:
                     detail = {}
+                enrich_budget -= 1
 
             if detail:
                 ok = _out_key(detail)
@@ -26692,23 +26786,30 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                 ident_seed = str(b.get('setup_id') or '') or f"{sym}:{side}:{int(cts)}:{round(float(pnl or 0.0), 8)}"
                 b['trade_id'] = f"report::{ident_seed}"
 
-            row, _events = _trade_lifecycle_build_trade_row(
-                owner_uid,
-                b,
-                user,
-                next_open_ts=0.0,
-                live_mode=False,
-                live_pos=None,
-                order_rows=order_cache.get(sym) or [],
-                closed_pnl_rows=pnl_cache.get(sym) or [],
-            )
-            if str(row.get('result_path') or '').upper().strip() == 'OPEN':
-                row['status'] = 'CLOSED'
-                row['closed_ts'] = float(cts or 0.0)
-                row['pnl_usdt'] = float(pnl or 0.0)
-                row['result_path'] = 'MANUAL_OR_UNKNOWN_CLOSE'
-                row['result_label'] = _trade_lifecycle_result_label('MANUAL_OR_UNKNOWN_CLOSE')
-                row['close_reason'] = str(b.get('note') or b.get('outcome') or row.get('result_label') or 'exchange_close')
+            if enrich_budget > 0:
+                row, _events = _trade_lifecycle_build_trade_row(
+                    owner_uid,
+                    b,
+                    user,
+                    next_open_ts=0.0,
+                    live_mode=False,
+                    live_pos=None,
+                    order_rows=_lazy_order_rows(sym),
+                    closed_pnl_rows=_lazy_pnl_rows(sym),
+                )
+                enrich_budget -= 1
+                if str(row.get('result_path') or '').upper().strip() == 'OPEN':
+                    row['status'] = 'CLOSED'
+                    row['closed_ts'] = float(cts or 0.0)
+                    row['pnl_usdt'] = float(pnl or 0.0)
+                    row['result_path'] = 'MANUAL_OR_UNKNOWN_CLOSE'
+                    row['result_label'] = _trade_lifecycle_result_label('MANUAL_OR_UNKNOWN_CLOSE')
+                    row['close_reason'] = str(b.get('note') or b.get('outcome') or row.get('result_label') or 'exchange_close')
+            else:
+                row = dict(b)
+                row['result_path'] = str(row.get('result_path') or 'MANUAL_OR_UNKNOWN_CLOSE')
+                row['result_label'] = str(row.get('result_label') or _trade_lifecycle_result_label('MANUAL_OR_UNKNOWN_CLOSE'))
+                row['close_reason'] = str(row.get('note') or row.get('outcome') or row.get('result_label') or 'exchange_close')
             ok = _out_key(row)
             if ok not in seen_out:
                 out.append(row)
@@ -26733,18 +26834,15 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         pass
 
     _autotrade_migrate_tables()
-    try:
-        if str(AUTOTRADE_MODE).lower() == 'live':
-            guardian_key = f"autotrade_report_guardian:{owner_uid}"
-            if not cache_valid(guardian_key, 90):
-                _autotrade_monitor_live_exit_protection(owner_uid)
-                cache_set(guardian_key, {'ts': time.time()})
-    except Exception:
-        pass
 
-    sync_days = max(7, int(math.ceil(float(lookback_h) / 24.0)) + 3)
+    # Keep report requests lightweight. Exit guardian already runs on its own schedule,
+    # so the report path should not trigger another expensive protection sweep.
+    sync_days = max(3, min(10, int(math.ceil(float(lookback_h) / 24.0)) + 2))
+    sync_gate = f"autotrade_report_sync_gate:{owner_uid}:{sync_days}"
     try:
-        _trade_lifecycle_sync(owner_uid, days=sync_days, force=False)
+        if not cache_valid(sync_gate, 300):
+            _trade_lifecycle_sync(owner_uid, days=sync_days, force=False)
+            cache_set(sync_gate, {'ts': time.time()})
     except Exception:
         pass
 
@@ -26763,9 +26861,16 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     else:
         total_u = 0.0
         total_risk = 0.0
+        open_order_cache = {}
         for i, p in enumerate(open_positions, 1):
             tr = _autotrade_find_open_trade_for_live_position(owner_uid, p, journal_open=journal_open)
-            snap = _autotrade_live_position_status(owner_uid, p, trade_row=tr)
+            sym = _bybit_linear_symbol(_pos_symbol(p))
+            if sym not in open_order_cache:
+                try:
+                    open_order_cache[sym] = _bybit_get_open_orders_linear(sym) or []
+                except Exception:
+                    open_order_cache[sym] = []
+            snap = _autotrade_live_position_status(owner_uid, p, trade_row=tr, open_orders=open_order_cache.get(sym) or [])
             total_u += float(snap.get('pnl') or 0.0)
             total_risk += float(snap.get('risk_est') or 0.0)
             lines.extend(_autotrade_render_live_position_snapshot(snap, index=i))
@@ -26778,7 +26883,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     start_ts = now_ts - float(lookback_h) * 3600.0
     closed_rows = []
     try:
-        closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=80) or []
+        closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=40) or []
     except Exception:
         closed_rows = []
 
@@ -26786,8 +26891,8 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         lines.append('• None in this window')
     else:
         total_closed = 0.0
-        show_n = min(len(closed_rows), 20)
-        for idx, row in enumerate(closed_rows[:20], 1):
+        show_n = min(len(closed_rows), 16)
+        for idx, row in enumerate(closed_rows[:show_n], 1):
             try:
                 total_closed += float(row.get('pnl_usdt') or 0.0)
             except Exception:
@@ -26796,8 +26901,8 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             if idx != show_n:
                 lines.append(SEP)
         lines.append(f"Total closed PnL: {total_closed:+.2f} USDT")
-        if len(closed_rows) > 20:
-            lines.append(f"Showing first 20 of {len(closed_rows)} closed trades in this window.")
+        if len(closed_rows) > show_n:
+            lines.append(f"Showing first {show_n} of {len(closed_rows)} closed trades in this window.")
 
     out = "\n".join(lines)
     try:
@@ -28665,7 +28770,7 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             return {"status": "skip", "reason": f"no_actionable_screen_setups ({','.join(skipped[:3])})"}
 
         actionable = list(actionable[:max(1, int(EMAIL_SETUPS_N))])
-        sent = await asyncio.to_thread(
+        sent = await to_thread_heavy(
             send_email_alert_multi,
             dict(user or {}),
             {"name": str(target_session)},
@@ -28730,7 +28835,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         reset_reject_tracker()
 
-        best_fut = await asyncio.to_thread(fetch_futures_tickers)
+        best_fut = await to_thread_heavy(fetch_futures_tickers, timeout=15)
         if not best_fut:
             await status_msg.edit_text("❌ Failed to fetch futures data.")
             return
@@ -28814,7 +28919,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Heavy build MUST NOT run on the asyncio event loop.
             # Only /screen is allowed to take longer; everything here runs in a worker thread.
-            body, kb, shown_setups = await asyncio.to_thread(
+            body, kb, shown_setups = await to_thread_heavy(
                 _build_screen_body_and_kb,
                 best_fut,
                 scan_session,
@@ -29533,10 +29638,10 @@ EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "18"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "40"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
 ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "60"))
-AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "20"))
-AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "45"))
-PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "30"))
-PERFORMANCE_REPORT_TIMEOUT_SEC = int(os.environ.get("PERFORMANCE_REPORT_TIMEOUT_SEC", "60"))
+AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
+AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
+PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "60"))
+PERFORMANCE_REPORT_TIMEOUT_SEC = int(os.environ.get("PERFORMANCE_REPORT_TIMEOUT_SEC", "75"))
 
 # SMTP connection reuse (Render speed fix)
 SMTP_REUSE_TTL_SEC = int(os.environ.get("SMTP_REUSE_TTL_SEC", "240"))  # 4 minutes
@@ -29548,7 +29653,7 @@ _SMTP_CONN_TS = 0.0        # last-used timestamp
 
 
 async def _to_thread_with_timeout(fn, timeout_sec: int, *args, **kwargs):
-    return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout_sec)
+    return await to_thread_heavy(fn, *args, timeout=timeout_sec, **kwargs)
 
 def _run_coro_in_thread(coro):
     """Run an awaitable inside a dedicated event loop in a worker thread.
@@ -30209,8 +30314,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # Send ONE email containing MULTIPLE setups (timeout-protected)
             try:
                 ok = await asyncio.wait_for(
-                    asyncio.to_thread(send_email_alert_multi, user, sess, chosen_list, best_fut),
-                    timeout=EMAIL_SEND_TIMEOUT_SEC,
+                    to_thread_heavy(send_email_alert_multi, user, sess, chosen_list, best_fut, timeout=EMAIL_SEND_TIMEOUT_SEC),
+                    timeout=EMAIL_SEND_TIMEOUT_SEC + 2,
                 )
             except asyncio.TimeoutError:
                 ok = False
