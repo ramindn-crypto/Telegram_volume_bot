@@ -29778,9 +29778,12 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "18"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "40"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "25"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "60"))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "35"))
+ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "12"))
+ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "18"))
+EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "180"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
 PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "60"))
@@ -29834,6 +29837,15 @@ async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
         return False
     except Exception:
         return False
+
+
+def _alert_job_limit(name: str, default: int) -> int:
+    """Safe lookup for alert-job limits and cache windows."""
+    try:
+        val = globals().get(name, default)
+        return max(1, int(val if val is not None else default))
+    except Exception:
+        return max(1, int(default))
 
 async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
     # Prevent overlapping runs (JobQueue can overlap if a run is slow)
@@ -29903,7 +29915,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 10M)
         # Defaults: 1H=7.5%, 4H=15%
         # -----------------------------------------------------
-        users_bigmove = list(users_bigmove or [])[:max(1, int(ALERT_JOB_BIGMOVE_MAX_USERS or 25))]
+        users_bigmove = list(users_bigmove or [])[:_alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 12)]
         for u in users_bigmove:
             if _job_budget_exhausted():
                 logger.warning("alert_job bigmove loop budget exhausted after %.1fs", time.time() - job_started_ts)
@@ -30153,7 +30165,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # Cache-first: avoid rebuilding the full email pool every 60s when a recent
             # authoritative session pool already exists. This is the main guard against
             # alert_job overrunning its own schedule on Render.
-            if cached_setups and cache_age <= float(EMAIL_POOL_REBUILD_MIN_SEC or 180):
+            if cached_setups and cache_age <= float(_alert_job_limit('EMAIL_POOL_REBUILD_MIN_SEC', 180)):
                 setups = list(cached_setups)
                 try:
                     db_log_setup_pipeline_event(0, stage='email_pool_session_cache', status='ok', session=str(sess_name or ''), mode='email', details={'setups': len(setups or []), 'cache_age_sec': round(cache_age, 1)})
@@ -30222,7 +30234,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # -----------------------------------------------------
         # Per-user send / skip logic
         # -----------------------------------------------------
-        notify_runtime = list(notify_runtime or [])[:max(1, int(ALERT_JOB_NOTIFY_MAX_USERS or 25))]
+        notify_runtime = list(notify_runtime or [])[:_alert_job_limit('ALERT_JOB_NOTIFY_MAX_USERS', 18)]
         for meta in notify_runtime:
             if _job_budget_exhausted():
                 logger.warning("alert_job notify loop budget exhausted after %.1fs", time.time() - job_started_ts)
