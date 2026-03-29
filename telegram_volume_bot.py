@@ -6022,9 +6022,9 @@ SESSION_MIN_CONF = {
 }
 
 SESSION_MIN_RR_FINAL = {
-    "NY": 1.60,
-    "LON": 1.62,
-    "ASIA": 1.90,
+    "NY": 1.50,
+    "LON": 1.52,
+    "ASIA": 1.75,
 }
 
 SESSION_MIN_RR_TP = SESSION_MIN_RR_FINAL  # legacy compatibility only
@@ -6507,6 +6507,29 @@ _EMAIL_LOOP_HEARTBEAT: Dict[str, Any] = {
     "next_tick_ts": 0.0,
     "last_error": "",
 }
+
+_EMAIL_POOL_CACHE_TTL_SEC = int(os.environ.get("EMAIL_POOL_CACHE_TTL_SEC", "900") or 900)
+_EMAIL_POOL_CACHE: dict[str, dict] = {}
+
+def _email_pool_cache_get(session_name: str, max_age_sec: int | None = None) -> list:
+    sess = str(session_name or "").upper().strip()
+    age_limit = int(max_age_sec or EMAIL_POOL_CACHE_TTL_SEC)
+    try:
+        row = _EMAIL_POOL_CACHE.get(sess) or {}
+        ts = float(row.get("ts") or 0.0)
+        if ts <= 0 or (time.time() - ts) > age_limit:
+            return []
+        return list(row.get("setups") or [])
+    except Exception:
+        return []
+
+def _email_pool_cache_set(session_name: str, setups: list) -> None:
+    sess = str(session_name or "").upper().strip()
+    try:
+        _EMAIL_POOL_CACHE[sess] = {"ts": float(time.time()), "setups": list(setups or [])}
+    except Exception:
+        pass
+
 
 _ENGINE_HEARTBEAT: Dict[str, Dict[str, Any]] = {
     "screen": {"alive": False, "last_ts": 0.0, "last_ok_ts": 0.0, "last_error": "", "details": ""},
@@ -20541,10 +20564,10 @@ async def cmd_self_optimize_report(update: Update, context: ContextTypes.DEFAULT
 def _session_entry_quality_limits(session_name: str, source: str = 'email') -> dict:
     sess = str(session_name or '').upper().strip() or 'NY'
     base = {
-        'NY': {'max_pb_ema_dist': 0.82, 'max_ch15_abs': 0.92, 'max_ch1_abs': 2.25, 'max_atr_pct': 5.8},
-        'LON': {'max_pb_ema_dist': 0.78, 'max_ch15_abs': 0.88, 'max_ch1_abs': 2.05, 'max_atr_pct': 5.5},
-        'ASIA': {'max_pb_ema_dist': 0.68, 'max_ch15_abs': 0.78, 'max_ch1_abs': 1.70, 'max_atr_pct': 4.9},
-    }.get(sess, {'max_pb_ema_dist': 0.78, 'max_ch15_abs': 0.88, 'max_ch1_abs': 2.05, 'max_atr_pct': 5.5}).copy()
+        'NY': {'max_pb_ema_dist': 0.88, 'max_ch15_abs': 0.98, 'max_ch1_abs': 2.40, 'max_atr_pct': 6.2},
+        'LON': {'max_pb_ema_dist': 0.84, 'max_ch15_abs': 0.93, 'max_ch1_abs': 2.15, 'max_atr_pct': 5.9},
+        'ASIA': {'max_pb_ema_dist': 0.74, 'max_ch15_abs': 0.82, 'max_ch1_abs': 1.80, 'max_atr_pct': 5.2},
+    }.get(sess, {'max_pb_ema_dist': 0.84, 'max_ch15_abs': 0.93, 'max_ch1_abs': 2.15, 'max_atr_pct': 5.9}).copy()
     if str(source or '').strip().lower() == 'screen':
         base['max_pb_ema_dist'] *= 1.12
         base['max_ch15_abs'] *= 1.08
@@ -20648,16 +20671,20 @@ def is_top_setup_eligible(
         return (False, "eligibility_exception")
 
 def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]:
-    """Session-aware production thresholds with config-driven runtime overrides."""
+    """Session-aware production thresholds with config-driven runtime overrides.
+
+    These floors stay stricter than /screen, but they should not be so tight that
+    the executable/email lane goes silent in normal market conditions.
+    """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 80.5, 85, 1.65
+        quality, conf, rr = 78.5, 82, 1.55
     elif sess == "LON":
-        quality, conf, rr = 80.0, 84, 1.62
+        quality, conf, rr = 78.0, 81, 1.54
     elif sess == "ASIA":
-        quality, conf, rr = 86.0, 88, 1.78
+        quality, conf, rr = 84.0, 85, 1.70
     else:
-        quality, conf, rr = 80.0, 84, 1.62
+        quality, conf, rr = 78.0, 81, 1.54
 
     try:
         cfg = load_strategy_config(force=False)
@@ -20731,16 +20758,16 @@ def is_executable_setup_eligible(
         ch1_abs = abs(float(getattr(s, "ch1", 0.0) or 0.0))
 
         if sess == "NY":
-            if pb_dist > 0.74 and (score < (score_floor + 3.0) or conf < (conf_floor + 2)):
+            if pb_dist > 0.80 and (score < (score_floor + 3.0) or conf < (conf_floor + 2)):
                 return (False, "ny_entry_too_far_from_ema")
-            if ch15_abs > 0.88 and pb_dist > 0.66:
+            if ch15_abs > 0.95 and pb_dist > 0.70:
                 return (False, "ny_late_extension_exec")
-            if ch15_abs > 0.78 and ch1_abs > 1.60 and conf < (conf_floor + 3):
+            if ch15_abs > 0.84 and ch1_abs > 1.75 and conf < (conf_floor + 3):
                 return (False, "ny_stretched_continuation_exec")
         elif sess == "LON":
-            if pb_dist > 0.72 and (score < (score_floor + 2.0) or conf < (conf_floor + 1)):
+            if pb_dist > 0.78 and (score < (score_floor + 2.0) or conf < (conf_floor + 1)):
                 return (False, "lon_entry_too_far_from_ema")
-            if ch15_abs > 0.84 and ch1_abs > 1.55 and pb_dist > 0.62:
+            if ch15_abs > 0.90 and ch1_abs > 1.70 and pb_dist > 0.66:
                 return (False, "lon_late_extension_exec")
 
         if engine == "A":
@@ -20751,11 +20778,11 @@ def is_executable_setup_eligible(
             return (True, "ok")
 
         if engine == "C":
-            if score < (score_floor + 1.5):
+            if score < (score_floor + 1.0):
                 return (False, "engine_c_below_quality")
             if conf < (conf_floor + 1):
                 return (False, "engine_c_below_conf")
-            if rr_final < (rr_floor + 0.05):
+            if rr_final < (rr_floor + 0.03):
                 return (False, "engine_c_below_rr")
             if fut_vol < float(max(MIN_FUT_VOL_USD * 1.25, ENGINE_C_MIN_FUT_VOL_USD)):
                 return (False, "engine_c_below_liquidity")
@@ -20771,9 +20798,9 @@ def is_executable_setup_eligible(
         if engine == "B":
             if not exec_engine_b_enabled:
                 return (False, "engine_b_disabled")
-            extra_score = 4.0 if sess == "NY" else 3.0
-            extra_conf = 3 if sess == "NY" else 2
-            extra_rr = 0.20 if sess == "NY" else 0.15
+            extra_score = 3.0 if sess == "NY" else 2.0
+            extra_conf = 2 if sess == "NY" else 1
+            extra_rr = 0.15 if sess == "NY" else 0.12
             if score < (score_floor + extra_score):
                 return (False, "engine_b_below_quality")
             if conf < (conf_floor + extra_conf):
@@ -22838,7 +22865,11 @@ def _guess_session_name_utc(now_utc: datetime) -> str:
 
 
 def in_session_now(user: dict) -> Optional[dict]:
-    tz = ZoneInfo(user["tz"])
+    try:
+        tz_name = str((user or {}).get("tz") or "UTC")
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
     now_local = datetime.now(tz)
     now_utc = now_local.astimezone(timezone.utc)
 
@@ -22847,7 +22878,7 @@ def in_session_now(user: dict) -> Optional[dict]:
     # the email pipeline will look for setups under "UNLIMITED" and find none.
     # During the 1-hour gap between NY close and ASIA open, fall back to the
     # scan-session heuristic so 24h emailing can still work.
-    if int(user.get("sessions_unlimited", 0) or 0) == 1:
+    if int((user or {}).get("sessions_unlimited", 0) or 0) == 1:
         name = current_session_utc(now_utc)
         if name == "NONE":
             name = scan_session_name_utc(now_utc)
@@ -22861,7 +22892,7 @@ def in_session_now(user: dict) -> Optional[dict]:
             "access_mode": "UNLIMITED",
         }
 
-    enabled = user_enabled_sessions(user)
+    enabled = user_enabled_sessions(user or {})
     for name in enabled:
         w = SESSIONS_UTC[name]
         sh, sm = parse_hhmm(w["start"])
@@ -27225,16 +27256,18 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         market_take = 15
         trend_take = 12
     else:  # email
-        n_target = int(max(EMAIL_SETUPS_N * 2, 6))
+        # Build a broader candidate pool for the downstream executable gate.
+        # The final email/autotrade lane remains strict; the pool itself should not be starved.
+        n_target = int(max(EMAIL_SETUPS_N * 4, 12))
         strict_15m = True
-        universe_cap = 35
+        universe_cap = int(max(60, SCREEN_UNIVERSE_N))
         trigger_loosen = 1.0
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
         allow_no_pullback = False
-        scan_multiplier = 10
-        directional_take = 12
-        market_take = 15
-        trend_take = 12
+        scan_multiplier = 12
+        directional_take = 14
+        market_take = 18
+        trend_take = 14
 
     # Aggressive profile overrides
     prof = str(scan_profile or DEFAULT_SCAN_PROFILE).strip().lower()
@@ -29245,9 +29278,9 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "18"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "25"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "40"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "45"))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "60"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "20"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "45"))
 PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "30"))
@@ -29612,16 +29645,16 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
         async def _build_email_pool_for_session(sess_name: str) -> tuple[str, list]:
             try:
+                # build_priority_pool is already async and internally offloads heavy work.
+                # Running it again inside a separate worker-thread event loop can starve
+                # the email lane and cause avoidable timeouts.
                 pool = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        _run_coro_in_thread,
-                        build_priority_pool(
-                            best_fut,
-                            sess_name,
-                            mode="email",
-                            scan_profile=str(DEFAULT_SCAN_PROFILE),
-                            uid=None,
-                        ),
+                    build_priority_pool(
+                        best_fut,
+                        sess_name,
+                        mode="email",
+                        scan_profile=str(DEFAULT_SCAN_PROFILE),
+                        uid=None,
                     ),
                     timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
                 )
@@ -29632,9 +29665,22 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 db_log_setup_pipeline_event(0, stage='build_priority_pool', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(e).__name__}: {e}'})
                 pool = {"setups": []}
 
-            setups = (pool.get("setups", []) or [])[:max(EMAIL_SETUPS_N * 3, 9)]
+            setups = list(pool.get("setups", []) or [])
+            if not setups:
+                cached = _email_pool_cache_get(sess_name)
+                if cached:
+                    setups = list(cached)
+                    try:
+                        db_log_setup_pipeline_event(0, stage='email_pool_session_cache', status='ok', session=str(sess_name or ''), mode='email', details={'setups': len(setups or [])})
+                    except Exception:
+                        pass
+            else:
+                _email_pool_cache_set(sess_name, setups)
+
+            # Do not starve the executable lane by clipping the pre-filter pool too early.
+            setups = setups[:max(EMAIL_SETUPS_N * 12, 36)]
             if EMAIL_PRIORITY_OVERRIDE_ON:
-                pri = _email_priority_bases(best_fut, directional_take=12)
+                pri = _email_priority_bases(best_fut, directional_take=14)
                 setups = sorted(
                     setups,
                     key=lambda s: (0 if str(getattr(s, "symbol", "")).upper() in pri else 1)
@@ -29805,14 +29851,27 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(e).__name__}: {e}', 'eligible': len(eligible or []), 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
 
             if not eligible:
-                top_reasons = dict(skip_reasons_counter.most_common(3))
-                db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='empty', session=str(sess_name or ''), mode='email', details={'eligible': 0, 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
-                _LAST_EMAIL_DECISION[uid] = {
-                    "status": "SKIP",
-                    "reasons": ["no_setups_after_filters", f"top_reasons={top_reasons}"],
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                }
-                continue
+                # Fallback: consume the same persisted executable lane used by /screen/autotrade
+                # if it has very recent rows for this session/user.
+                try:
+                    exec_rows = db_list_executable_setups(int(uid), session_name=str(sess_name or ''), ts_from=float(time.time() - 1800), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
+                except Exception:
+                    exec_rows = []
+                if exec_rows:
+                    try:
+                        hydrated = _executable_rows_to_setup_objects(list(exec_rows or []), session_name=str(sess_name or ''))
+                    except Exception:
+                        hydrated = []
+                    eligible = [s for s in (hydrated or []) if s is not None]
+                if not eligible:
+                    top_reasons = dict(skip_reasons_counter.most_common(3))
+                    db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='empty', session=str(sess_name or ''), mode='email', details={'eligible': 0, 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
+                    _LAST_EMAIL_DECISION[uid] = {
+                        "status": "SKIP",
+                        "reasons": ["no_setups_after_filters", f"top_reasons={top_reasons}"],
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    }
+                    continue
 
             # Premium ordering: confidence desc, RR(final TP) desc
             def _rr3(_s: Setup) -> float:
@@ -29834,7 +29893,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             )
 
             # Candidate picks for cooldown/flip checks below
-            picks: List[Setup] = list(eligible[: max(int(EMAIL_SETUPS_N) * 6, 18)])
+            picks: List[Setup] = list(eligible[: max(int(EMAIL_SETUPS_N) * 10, 30)])
 
             chosen_list: List[Setup] = []
             _seen_setup_keys = set()
