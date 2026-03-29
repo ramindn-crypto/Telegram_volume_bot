@@ -5080,9 +5080,9 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
                     str(getattr(s, 'side', '') or '').upper(),
                     float(getattr(s, 'entry', 0.0) or 0.0),
                     float(getattr(s, 'sl', 0.0) or 0.0),
-                    float(getattr(s, 'tp', 0.0) or 0.0),
-                    float(getattr(s, 'alt_target_a', 0.0) or 0.0),
-                    float(getattr(s, 'alt_target_b', 0.0) or 0.0),
+                    float(_setup_target_tp(s, 0.0) or 0.0),
+                    0.0,
+                    0.0,
                     float(qty),
                     int(getattr(s, 'conf', 0) or 0),
                     float(getattr(s, 'quality_score', 0.0) or 0.0),
@@ -5105,9 +5105,9 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
                     str(getattr(s, 'side', '') or '').upper(),
                     float(getattr(s, 'entry', 0.0) or 0.0),
                     float(getattr(s, 'sl', 0.0) or 0.0),
-                    float(getattr(s, 'tp', 0.0) or 0.0),
-                    float(getattr(s, 'alt_target_a', 0.0) or 0.0),
-                    float(getattr(s, 'alt_target_b', 0.0) or 0.0),
+                    float(_setup_target_tp(s, 0.0) or 0.0),
+                    0.0,
+                    0.0,
                     float(qty),
                     int(getattr(s, 'conf', 0) or 0),
                     float(getattr(s, 'quality_score', 0.0) or 0.0),
@@ -11655,7 +11655,7 @@ def db_insert_signal(s: Setup, user_id: int | None = None):
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             s.setup_id, s.created_ts, s.symbol, getattr(s, "market_symbol", None),
-            s.side, s.conf, s.entry, s.sl, s.tp, s.alt_target_a, s.alt_target_b,
+            s.side, s.conf, s.entry, s.sl, float(_setup_target_tp(s, 0.0) or 0.0), 0.0, 0.0,
             s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
         ))
     except Exception:
@@ -11667,7 +11667,7 @@ def db_insert_signal(s: Setup, user_id: int | None = None):
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             s.setup_id, s.created_ts, s.symbol, s.side, s.conf, s.entry, s.sl,
-            s.tp, s.alt_target_a, s.alt_target_b, s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+            float(_setup_target_tp(s, 0.0) or 0.0), 0.0, 0.0, s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
         ))
     con.commit()
     con.close()
@@ -11821,9 +11821,9 @@ def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executab
     conf = int(getattr(s, 'conf', 0) or 0) if s is not None else 0
     entry = float(getattr(s, 'entry', 0.0) or 0.0) if s is not None else 0.0
     sl = float(getattr(s, 'sl', 0.0) or 0.0) if s is not None else 0.0
-    tp = getattr(s, 'tp', None) if s is not None else None
-    alt_target_a = getattr(s, 'alt_target_a', None) if s is not None else None
-    alt_target_b = float(getattr(s, 'alt_target_b', 0.0) or 0.0) if s is not None else 0.0
+    tp = float(_setup_target_tp(s, 0.0) or 0.0) if s is not None else 0.0
+    alt_target_a = 0.0
+    alt_target_b = 0.0
     fut_vol_usd = float(getattr(s, 'fut_vol_usd', 0.0) or 0.0) if s is not None else 0.0
     ch24 = float(getattr(s, 'ch24', 0.0) or 0.0) if s is not None else 0.0
     ch4 = float(getattr(s, 'ch4', 0.0) or 0.0) if s is not None else 0.0
@@ -12024,9 +12024,9 @@ def _executable_rows_to_setup_objects(rows: List[dict], session_name: str = '') 
                 conf=int(row.get('conf') or 0),
                 entry=float(row.get('entry') or 0.0),
                 sl=float(row.get('sl') or 0.0),
-                tp=row.get('tp'),
-                alt_target_a=row.get('alt_target_a'),
-                alt_target_b=float(row.get('alt_target_b') or 0.0),
+                tp=float(_setup_target_tp(row, 0.0) or 0.0),
+                alt_target_a=0.0,
+                alt_target_b=0.0,
                 fut_vol_usd=float(row.get('fut_vol_usd') or 0.0),
                 ch24=float(row.get('ch24') or 0.0),
                 ch4=float(row.get('ch4') or 0.0),
@@ -12101,9 +12101,9 @@ def _cache_recent_emailed_setup(user_id: int, setup: Any, session: str = '', ema
         'conf': int(getattr(setup, 'conf', 0) or 0),
         'entry': float(getattr(setup, 'entry', 0.0) or 0.0),
         'sl': float(getattr(setup, 'sl', 0.0) or 0.0),
-        'tp': getattr(setup, 'tp', None),
-        'alt_target_a': getattr(setup, 'alt_target_a', None),
-        'alt_target_b': float(getattr(setup, 'alt_target_b', 0.0) or 0.0),
+        'tp': float(_setup_target_tp(setup, 0.0) or 0.0),
+        'alt_target_a': 0.0,
+        'alt_target_b': 0.0,
         'fut_vol_usd': float(getattr(setup, 'fut_vol_usd', 0.0) or 0.0),
         'ch24': float(getattr(setup, 'ch24', 0.0) or 0.0),
         'ch4': float(getattr(setup, 'ch4', 0.0) or 0.0),
@@ -13921,11 +13921,11 @@ def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[
     fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
     entry = float(getattr(s, "entry", 0.0) or 0.0)
     sl = float(getattr(s, "sl", 0.0) or 0.0)
-    alt_target_b = float(getattr(s, "alt_target_b", 0.0) or 0.0)
+    final_tp = float(_setup_target_tp(s, 0.0) or 0.0)
 
     rr3 = 0.0
     try:
-        rr3 = float(rr_to_tp(entry, sl, alt_target_b))
+        rr3 = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
     except Exception:
         rr3 = 0.0
 
@@ -13974,7 +13974,7 @@ def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[
 
     # --- Component D: Risk & trade construction (RR + TP validity) ---
     rr_score = _clamp01(rr3 / 2.2)  # RR 2.2 ~ full
-    tp_valid = 1.0 if (entry > 0 and sl > 0 and alt_target_b > 0 and rr3 > 0.2) else 0.0
+    tp_valid = 1.0 if (entry > 0 and sl > 0 and final_tp > 0 and rr3 > 0.2) else 0.0
 
     # --- Component E: Quality scoring inputs ---
     vol_score = _log_norm(fut_vol, lo=float(MIN_FUT_VOL_USD or 10_000_000), hi=120_000_000.0)
@@ -15881,9 +15881,9 @@ def _evolution_sig_rr(sig: dict) -> float:
     try:
         entry = float(sig.get("entry") or 0.0)
         sl = float(sig.get("sl") or 0.0)
-        alt_target_b = float(sig.get("alt_target_b") or 0.0)
+        final_tp = float(_setup_target_tp(sig, 0.0) or 0.0)
         risk = abs(entry - sl)
-        reward = abs(alt_target_b - entry)
+        reward = abs(final_tp - entry)
         if risk <= 0:
             return 0.0
         return float(reward / risk)
@@ -16407,7 +16407,7 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
 
         entry = float(getattr(s, 'entry', 0.0) or 0.0)
         sl = float(getattr(s, 'sl', 0.0) or 0.0)
-        final_tp = float(getattr(s, 'alt_target_a', 0.0) or getattr(s, 'alt_target_b', 0.0) or 0.0)
+        final_tp = float(_setup_target_tp(s, 0.0) or 0.0)
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
         rows.append({
             'symbol': str(symbol),
@@ -18318,7 +18318,7 @@ def _scan_intel_compact_setup(s) -> dict:
             "engine": str(getattr(s, "engine", "") or ""),
             "entry": float(getattr(s, "entry", 0.0) or 0.0),
             "sl": float(getattr(s, "sl", 0.0) or 0.0),
-            "alt_target_b": float(getattr(s, "alt_target_b", 0.0) or 0.0),
+            "alt_target_b": 0.0,
             "ch24": float(getattr(s, "ch24", 0.0) or 0.0),
             "fut_vol_usd": float(getattr(s, "fut_vol_usd", 0.0) or 0.0),
         }
@@ -20596,32 +20596,29 @@ def is_top_setup_eligible(
     source: str = "screen",
     session_name: str = "LON",
 ) -> tuple[bool, str]:
-    """Unified eligibility using scoring + a few safety checks.
+    """Unified single-TP eligibility using scoring + a few safety checks.
 
     - source='screen' => slightly looser (more flow)
     - source='email'  => slightly stricter (quality + anti-spam handled elsewhere)
     """
     try:
-        # Basic safety sanity (never create impossible orders)
         entry = float(getattr(s, "entry", 0.0) or 0.0)
         sl = float(getattr(s, "sl", 0.0) or 0.0)
-        alt_target_b = float(getattr(s, "alt_target_b", 0.0) or 0.0)
+        final_tp = float(_setup_target_tp(s, 0.0) or 0.0)
         side = str(getattr(s, "side", "") or "").upper()
 
-        if entry <= 0 or sl <= 0 or alt_target_b <= 0 or side not in ("BUY", "SELL"):
+        if entry <= 0 or sl <= 0 or final_tp <= 0 or side not in ("BUY", "SELL"):
             return (False, "bad_prices_or_side")
 
-        if side == "BUY" and not (sl < entry < alt_target_b):
+        if side == "BUY" and not (sl < entry < final_tp):
             return (False, "bad_price_order_buy")
-        if side == "SELL" and not (alt_target_b < entry < sl):
+        if side == "SELL" and not (final_tp < entry < sl):
             return (False, "bad_price_order_sell")
 
-        # Always ensure TP ladder exists (derive if missing)
         try:
-            t1, t2, t3 = _ensure_three_tps(entry, sl, alt_target_b, getattr(s, "tp", None), getattr(s, "alt_target_a", None), side)
-            setattr(s, "tp", t1)
-            setattr(s, "alt_target_a", t2)
-            setattr(s, "alt_target_b", t3)
+            setattr(s, "tp", float(final_tp))
+            setattr(s, "alt_target_a", 0.0)
+            setattr(s, "alt_target_b", 0.0)
         except Exception:
             pass
 
@@ -20642,7 +20639,6 @@ def is_top_setup_eligible(
         if not ok_entry:
             return (False, why_entry)
 
-        # Liquidity floor remains a HARD safety gate (prevents junk illiquid coins)
         fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
         if fut_vol < float(MIN_FUT_VOL_USD):
             return (False, "below_min_fut_vol")
@@ -22133,7 +22129,7 @@ def _email_diversification_guard(s: 'Setup', chosen_list: list, best_fut: dict, 
         conf = int(getattr(s, 'conf', 0) or 0)
         entry = float(getattr(s, 'entry', 0.0) or 0.0)
         sl = float(getattr(s, 'sl', 0.0) or 0.0)
-        final_tp = float(getattr(s, 'alt_target_a', 0.0) or getattr(s, 'alt_target_b', 0.0) or 0.0)
+        final_tp = float(_setup_target_tp(s, 0.0) or 0.0)
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
         side = str(getattr(s, 'side', '') or '').upper().strip()
         cluster = _email_symbol_cluster(str(getattr(s, 'symbol', '') or ''))
@@ -27835,8 +27831,8 @@ def _remember_recent_screen_signal(s: Setup, session: str = "", user_id: int | N
             "entry": float(getattr(s, "entry", 0.0) or 0.0),
             "sl": float(getattr(s, "sl", 0.0) or 0.0),
             "tp": getattr(s, "tp", None),
-            "alt_target_a": getattr(s, "alt_target_a", None),
-            "alt_target_b": float(getattr(s, "alt_target_b", 0.0) or 0.0),
+            "alt_target_a": 0.0,
+            "alt_target_b": 0.0,
             "fut_vol_usd": float(getattr(s, "fut_vol_usd", 0.0) or 0.0),
             "ch24": float(getattr(s, "ch24", 0.0) or 0.0),
             "ch4": float(getattr(s, "ch4", 0.0) or 0.0),
@@ -28028,9 +28024,9 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
                 entry = float(getattr(s, "entry", 0.0) or 0.0)
                 sl = float(getattr(s, "sl", 0.0) or 0.0)
-                tp = getattr(s, "tp", None)
-                alt_target_a = getattr(s, "alt_target_a", None)
-                alt_target_b = float(getattr(s, "alt_target_b", 0.0) or 0.0)
+                tp = float(_setup_target_tp(s, 0.0) or 0.0)
+                alt_target_a = 0.0
+                alt_target_b = 0.0
                 vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
 
                 ch24 = float(getattr(s, "ch24", 0.0) or 0.0)
@@ -28040,8 +28036,8 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
                 rr_den = abs(entry - sl)
                 rr1 = (abs(float(tp) - entry) / rr_den) if (rr_den > 0 and tp not in (None, 0, 0.0)) else 0.0
-                rr2 = (abs(float(alt_target_a) - entry) / rr_den) if (rr_den > 0 and alt_target_a not in (None, 0, 0.0)) else 0.0
-                rr3 = (abs(alt_target_b - entry) / rr_den) if rr_den > 0 else 0.0
+                rr2 = 0.0
+                rr3 = rr1
 
                 pos_word = "long" if side == "BUY" else "short"
                 size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
@@ -28385,7 +28381,7 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
                     side,
                     round(float(getattr(s, 'entry', 0.0) or 0.0), 8),
                     round(float(getattr(s, 'sl', 0.0) or 0.0), 8),
-                    round(float(getattr(s, 'alt_target_b', 0.0) or 0.0), 8),
+                    round(float(_setup_target_tp(s, 0.0) or 0.0), 8),
                 )
             except Exception:
                 dedupe_key = (sym, side, sid)
@@ -28727,7 +28723,7 @@ def _email_body_pretty(
     parts.append("")
 
     for i, s in enumerate(setups, 1):
-        rr3 = rr_to_tp(s.entry, s.sl, s.alt_target_b)
+        rr3 = rr_to_tp(s.entry, s.sl, float(_setup_target_tp(s, 0.0) or 0.0))
 
         # ✅ "ID-" prefix
         parts.append(f"ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
@@ -28803,7 +28799,7 @@ def _email_body_pretty_html(
     lines.append("<div style='font-weight:700;margin:8px 0 4px'>Top Setups</div>")
 
     for i, s in enumerate(setups, 1):
-        rr3 = rr_to_tp(s.entry, s.sl, s.alt_target_b)
+        rr3 = rr_to_tp(s.entry, s.sl, float(_setup_target_tp(s, 0.0) or 0.0))
         side = esc(s.side)
         sym = esc(s.symbol)
         conf = esc(s.conf)
@@ -28871,7 +28867,7 @@ def _email_body_pretty_html(
     lines.append("<div style='font-weight:700;margin:8px 0 4px'>Top Setups</div>")
 
     for i, s in enumerate(setups, 1):
-        rr3 = rr_to_tp(s.entry, s.sl, s.alt_target_b)
+        rr3 = rr_to_tp(s.entry, s.sl, float(_setup_target_tp(s, 0.0) or 0.0))
         side = esc(s.side)
         sym = esc(s.symbol)
         conf = esc(s.conf)
@@ -29821,7 +29817,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # Premium ordering: confidence desc, RR(final TP) desc
             def _rr3(_s: Setup) -> float:
                 try:
-                    return float(rr_to_tp(float(_s.entry), float(_s.sl), float(_s.alt_target_b)))
+                    final_tp = float(_setup_target_tp(_s, 0.0) or 0.0)
+                    return float(rr_to_tp(float(_s.entry), float(_s.sl), final_tp)) if final_tp > 0 else 0.0
                 except Exception:
                     return 0.0
 
@@ -29857,10 +29854,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         side,
                         round(float(getattr(s, 'entry', 0.0) or 0.0), 8),
                         round(float(getattr(s, 'sl', 0.0) or 0.0), 8),
-                        round(float(getattr(s, 'alt_target_b', 0.0) or 0.0), 8),
+                        round(float(_setup_target_tp(s, 0.0) or 0.0), 8),
                     )
                 except Exception:
-                    _k = (sym, side, str(getattr(s, 'entry', '')), str(getattr(s, 'sl', '')), str(getattr(s, 'alt_target_b', '')))
+                    _k = (sym, side, str(getattr(s, 'entry', '')), str(getattr(s, 'sl', '')), str(_setup_target_tp(s, 0.0) or ''))
                 if _k in _seen_setup_keys:
                     continue
                 _seen_setup_keys.add(_k)
