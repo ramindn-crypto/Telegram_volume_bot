@@ -31321,21 +31321,32 @@ async def autotrade_exit_guardian_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
-    """Background AutoTrade loop. Scans and opens trades for the owner when enabled.
-    Runs from the admin confirmed-email executable pool and only executes setups that were successfully emailed."""
+    """Background AutoTrade loop.
+
+    Important runtime rule:
+    - entry execution must stay lean and bounded
+    - live SL/TP repair belongs to the dedicated guardian job, not inline here
+    This prevents lock contention and long-running autotrade ticks that cause missed scheduler runs.
+    """
     try:
         _hb_touch('autotrade', ok=True, details='job_tick')
         if not _autotrade_ready():
             return
 
         uid = int(AUTOTRADE_OWNER_UID)
-        # If user record doesn't exist yet, do nothing (avoids writing defaults to DB)
         user = get_user(uid) or {}
         if not user:
             return
 
-        # Session label in UTC (NY/LON/ASIA)
         now_utc = datetime.now(timezone.utc)
+        job_started_ts = time.time()
+
+        def _job_budget_exhausted() -> bool:
+            try:
+                return (time.time() - job_started_ts) >= float(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40)
+            except Exception:
+                return False
+
         live_sess = _session_label_utc(now_utc)
         owner_unlimited = int(user.get("sessions_unlimited", 0) or 0) == 1
         if owner_unlimited:
@@ -31347,32 +31358,18 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
         else:
             sess = current_session_utc(now_utc)
 
-        async with AUTOTRADE_EXEC_LOCK:
-            # Always monitor and repair live SL/TP protection first, even outside the entry session window.
-            # Run it in the heavy worker pool so the Telegram event loop stays responsive.
-            try:
-                repaired = []
-                if str(AUTOTRADE_MODE).lower() == 'live' and (not _autotrade_guardian_recent(max(45, AUTOTRADE_GUARDIAN_MIN_GAP_SEC * 2))):
-                    repaired = await to_thread_heavy(
-                        _autotrade_monitor_live_exit_protection,
-                        int(uid),
-                        timeout=AUTOTRADE_GUARDIAN_TIMEOUT_SEC,
-                    )
-                    _autotrade_guardian_touch(len(repaired or []))
-            except asyncio.TimeoutError:
-                repaired = []
-                logger.warning('autotrade_job inline guardian timed out after %ss', AUTOTRADE_GUARDIAN_TIMEOUT_SEC)
-            except Exception:
-                repaired = []
-            if repaired:
-                _LAST_AUTOTRADE_DECISION[uid] = {
-                    "status": "MANAGED",
-                    "when": now_utc.isoformat(timespec="seconds"),
-                    "reason": f"managed_live_exits ({len(repaired)})",
-                    "session": sess,
-                    "mode": AUTOTRADE_MODE,
-                }
+        if AUTOTRADE_EXEC_LOCK.locked():
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                "status": "SKIP",
+                "when": now_utc.isoformat(timespec="seconds"),
+                "reason": "autotrade_exec_lock_busy",
+                "session": str(sess or "NONE"),
+                "mode": AUTOTRADE_MODE,
+            }
+            _hb_touch('autotrade', ok=True, details='busy_skip')
+            return
 
+        async with AUTOTRADE_EXEC_LOCK:
             if not owner_unlimited and not live_sess:
                 _LAST_AUTOTRADE_DECISION[uid] = {
                     "status": "SKIP",
@@ -31399,7 +31396,6 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 }
                 return
 
-            # Optional: respect user's trade window (if configured)
             try:
                 if not trade_window_allows_now(user):
                     _LAST_AUTOTRADE_DECISION[uid] = {
@@ -31411,7 +31407,6 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            # Select multiple recent OPEN setups and let the hardened gatekeeper choose the first tradable one.
             db_setups = await to_thread_fast(_autotrade_select_db_setups, uid, sess, lookback_hours=12, limit=5, timeout=8)
             attempt_summaries = [{
                 'setup_id': str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or ''),
@@ -31441,16 +31436,18 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     reason = f'autotrade_job_budget_exhausted>{int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40)}s'
                     break
                 attempted += 1
+                remaining_budget = max(3.0, float(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40) - (time.time() - job_started_ts))
+                per_candidate_timeout = min(float(AUTOTRADE_JOB_TIMEOUT_SEC or 25), remaining_budget)
                 try:
                     ok, reason = await to_thread_heavy(
                         _autotrade_place_trade,
                         uid,
                         sess,
                         [cand],
-                        timeout=AUTOTRADE_JOB_TIMEOUT_SEC,
+                        timeout=per_candidate_timeout,
                     )
                 except asyncio.TimeoutError:
-                    ok, reason = False, f'autotrade_place_trade_timeout>{AUTOTRADE_JOB_TIMEOUT_SEC}s'
+                    ok, reason = False, f'autotrade_place_trade_timeout>{int(per_candidate_timeout)}s'
                 if ok:
                     break
                 if reason not in {
@@ -31722,13 +31719,13 @@ def main():
         # AutoTrade live protection guardian (repairs missing SL / TP stacks continuously)
         app.job_queue.run_repeating(
             autotrade_exit_guardian_job,
-            interval=30,
+            interval=45,
             first=20,
             name="autotrade_exit_guardian_job",
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
-                "misfire_grace_time": 15,
+                "misfire_grace_time": 45,
             },
         )
 
@@ -31736,12 +31733,12 @@ def main():
         app.job_queue.run_repeating(
             autotrade_job,
             interval=60,
-            first=30,
+            first=35,
             name="autotrade_job",
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
-                "misfire_grace_time": 30,
+                "misfire_grace_time": 90,
             },
         )
 
