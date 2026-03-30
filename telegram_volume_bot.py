@@ -1067,8 +1067,11 @@ def _strategy_config_defaults() -> dict:
         "context_tf_2": "4h",
 
         # Quality floors (0..100)
-        "quality_score_min_screen": float(QUALITY_SCORE_MIN_SCREEN),
-        "quality_score_min_email": float(QUALITY_SCORE_MIN_EMAIL),
+        # Keep the upstream pool broad enough so the downstream executable gate
+        # can do the real filtering. Older builds starved the pipeline by forcing
+        # very high email/screen score floors before executability was even tested.
+        "quality_score_min_screen": 62.0,
+        "quality_score_min_email": 68.0,
 
         # Regime thresholds (used by backtest generator + some live scoring)
         "regime_slope_trend_min_pct": 0.06,
@@ -1107,10 +1110,12 @@ def _strategy_config_defaults() -> dict:
         "target_setups_per_day_hi": 3.0,
 
         # Self-optimization governance
-        "session_weights": {"NY": 0.0, "LON": 1.0, "ASIA": 0.0},  # optimizer weighting (production bias: LON-only high-win mode)
+        "session_weights": {"NY": 0.25, "LON": 0.75, "ASIA": 0.0},  # optimizer weighting (LON-focused, overlap-aware)
         "high_win_mode": True,
         "execution_sessions_allowed": ["LON"],
-        "preferred_trade_window": {"start": "19:00", "end": "23:30"},
+        "preferred_trade_window": {"start": "19:00", "end": "01:00"},
+        "enforce_preferred_trade_window_by_default": False,
+        "strategy_bootstrap_version": 2,
         "concentration_cap": 0.25,          # no single symbol >25% of setups (OOS)
         "oos_min_setups": 30,               # minimum OOS sample size across universe before promotion
         "min_win_rate": 70.0,               # enforced only when sample is adequate
@@ -1322,79 +1327,77 @@ def _strategy_cfg_preferred_trade_window(cfg: dict | None) -> tuple[str, str]:
         return '19:00', '23:30'
 
 def _strategy_config_bootstrap_recommendations() -> None:
-    """One-time safety migration for the current production tuning target.
+    """Non-destructive strategy-config migration.
 
-    Goal of this patch:
-    - aim for roughly 4–8 executable/email-quality setups per day
-    - keep ASIA enabled by default unless the user explicitly disabled it
-    - avoid stale loose score floors and stale session overrides from older configs
+    Older builds force-overwrote the persisted live profile on every boot. That made
+    strategy_config look editable while silently restoring a LON-only, high-win,
+    narrow-window profile with hard session execution add-ons. This migration now:
+    - fills only missing keys
+    - preserves intentional user/admin choices
+    - repairs the known stale forced-bootstrap profile when it is detected verbatim
     """
     try:
         cfg = load_strategy_config(force=True)
+        defaults = _strategy_config_defaults()
         changed = False
 
-        q_email = float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
-        q_screen = float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
-        if q_email < 74.0 or q_email > 76.0:
-            cfg['quality_score_min_email'] = 74.0
-            changed = True
-        if q_screen < 66.0 or q_screen > 68.0:
-            cfg['quality_score_min_screen'] = 66.0
+        # Merge missing top-level keys only.
+        for key, value in (defaults or {}).items():
+            if key not in cfg:
+                cfg[key] = value
+                changed = True
+
+        # Merge missing session override keys only.
+        sess_ov = dict(cfg.get('session_exec_overrides') or {})
+        default_sess_ov = dict((defaults or {}).get('session_exec_overrides') or {})
+        for sess, vals in (default_sess_ov or {}).items():
+            cur = dict(sess_ov.get(sess) or {})
+            for k, v in dict(vals or {}).items():
+                if k not in cur:
+                    cur[k] = v
+                    changed = True
+            sess_ov[sess] = cur
+        if sess_ov != dict(cfg.get('session_exec_overrides') or {}):
+            cfg['session_exec_overrides'] = sess_ov
             changed = True
 
-        if float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) > 1.50 or float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) < 1.38:
-            cfg['min_rr_tp'] = 1.42
-            changed = True
-
-        if float(cfg.get('target_setups_per_day_lo', 0.0) or 0.0) != 1.0:
-            cfg['target_setups_per_day_lo'] = 1.0
-            changed = True
-        if float(cfg.get('target_setups_per_day_hi', 0.0) or 0.0) != 3.0:
-            cfg['target_setups_per_day_hi'] = 3.0
-            changed = True
-        if float(cfg.get('governor_target_lo', 0.0) or 0.0) != 1.0:
-            cfg['governor_target_lo'] = 1.0
-            changed = True
-        if float(cfg.get('governor_target_hi', 0.0) or 0.0) != 3.0:
-            cfg['governor_target_hi'] = 3.0
-            changed = True
-        if float(cfg.get('market_adaptive_target_setups_per_day_lo', 0.0) or 0.0) != 1.0:
-            cfg['market_adaptive_target_setups_per_day_lo'] = 1.0
-            changed = True
-        if float(cfg.get('market_adaptive_target_setups_per_day_hi', 0.0) or 0.0) != 3.0:
-            cfg['market_adaptive_target_setups_per_day_hi'] = 3.0
-            changed = True
-
+        # Keep ASIA enabled unless the user explicitly disabled it.
         manual_asia = _cfg_bool(cfg.get('execution_asia_user_override', False), False)
         if not manual_asia and not _cfg_bool(cfg.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED)):
             cfg['execution_asia_enabled'] = True
             changed = True
 
-        sess_ov = dict(cfg.get('session_exec_overrides') or {})
-        desired = {
-            'NY': {'quality_add': 4.0, 'conf_add': 3, 'rr_add': 0.18},
-            'LON': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.00},
-            'ASIA': {'quality_add': 5.0, 'conf_add': 4, 'rr_add': 0.25},
-        }
-        if cfg.get('session_weights') != {'NY': 0.0, 'LON': 1.0, 'ASIA': 0.0}:
-            cfg['session_weights'] = {'NY': 0.0, 'LON': 1.0, 'ASIA': 0.0}
+        # Detect the stale boot-forced profile and migrate it once to the new defaults.
+        stale_forced_profile = (
+            float(cfg.get('quality_score_min_email', 0.0) or 0.0) == 74.0
+            and float(cfg.get('quality_score_min_screen', 0.0) or 0.0) == 66.0
+            and round(float(cfg.get('min_rr_tp', 0.0) or 0.0), 2) == 1.42
+            and cfg.get('session_weights') == {'NY': 0.0, 'LON': 1.0, 'ASIA': 0.0}
+            and list(cfg.get('execution_sessions_allowed') or []) == ['LON']
+            and dict(cfg.get('preferred_trade_window') or {}) == {'start': '19:00', 'end': '23:30'}
+            and dict((cfg.get('session_exec_overrides') or {}).get('NY') or {}) == {'quality_add': 4.0, 'conf_add': 3, 'rr_add': 0.18}
+            and dict((cfg.get('session_exec_overrides') or {}).get('ASIA') or {}) == {'quality_add': 5.0, 'conf_add': 4, 'rr_add': 0.25}
+            and int(cfg.get('strategy_bootstrap_version', 0) or 0) < 2
+        )
+        if stale_forced_profile:
+            cfg['quality_score_min_email'] = 68.0
+            cfg['quality_score_min_screen'] = 62.0
+            cfg['min_rr_tp'] = 1.40
+            cfg['session_weights'] = {'NY': 0.25, 'LON': 0.75, 'ASIA': 0.0}
+            cfg['preferred_trade_window'] = {'start': '19:00', 'end': '01:00'}
+            cfg['enforce_preferred_trade_window_by_default'] = False
+            cfg['session_exec_overrides'] = {
+                'NY': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0},
+                'LON': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0},
+                'ASIA': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0},
+            }
+            cfg['strategy_bootstrap_version'] = 2
             changed = True
-        if _cfg_bool(cfg.get('high_win_mode', True), True) is not True:
-            cfg['high_win_mode'] = True
+        elif int(cfg.get('strategy_bootstrap_version', 0) or 0) < 2:
+            cfg['strategy_bootstrap_version'] = 2
             changed = True
-        if list(cfg.get('execution_sessions_allowed') or []) != ['LON']:
-            cfg['execution_sessions_allowed'] = ['LON']
-            changed = True
-        if dict(cfg.get('preferred_trade_window') or {}) != {'start': '19:00', 'end': '23:30'}:
-            cfg['preferred_trade_window'] = {'start': '19:00', 'end': '23:30'}
-            changed = True
-        for sess, vals in desired.items():
-            cur = dict(sess_ov.get(sess) or {})
-            if cur != vals:
-                sess_ov[sess] = vals
-                changed = True
+
         if changed:
-            cfg['session_exec_overrides'] = sess_ov
             save_strategy_config(cfg)
             apply_strategy_config(cfg)
     except Exception:
@@ -6196,15 +6199,15 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 82,
-    "LON": 80,
-    "ASIA": 85,
+    "NY": 80,
+    "LON": 78,
+    "ASIA": 84,
 }
 
 SESSION_MIN_RR_FINAL = {
-    "NY": 1.74,
-    "LON": 1.66,
-    "ASIA": 1.95,
+    "NY": 1.62,
+    "LON": 1.50,
+    "ASIA": 1.90,
 }
 
 SESSION_MIN_RR_TP = SESSION_MIN_RR_FINAL  # legacy compatibility only
@@ -13610,7 +13613,7 @@ def in_trade_window_now(user: dict, now_local: Optional[datetime] = None) -> boo
     if not start_s or not end_s:
         try:
             cfg_live = load_strategy_config(force=False)
-            if _strategy_cfg_high_win_mode(cfg_live):
+            if _cfg_bool((cfg_live or {}).get('enforce_preferred_trade_window_by_default', False), False):
                 start_s, end_s = _strategy_cfg_preferred_trade_window(cfg_live)
             else:
                 return True
@@ -21124,13 +21127,13 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 90.0, 91, 1.70
+        quality, conf, rr = 88.0, 89, 1.62
     elif sess == "LON":
-        quality, conf, rr = 85.0, 87, 1.42
+        quality, conf, rr = 82.0, 84, 1.40
     elif sess == "ASIA":
-        quality, conf, rr = 92.0, 92, 1.80
+        quality, conf, rr = 91.0, 92, 1.78
     else:
-        quality, conf, rr = 85.0, 87, 1.42
+        quality, conf, rr = 82.0, 84, 1.40
 
     try:
         cfg = load_strategy_config(force=False)
@@ -21185,27 +21188,27 @@ def is_executable_setup_eligible(
         structure = str(getattr(s, 'structure', '') or '').upper()
         side = str(getattr(s, 'side', '') or '').upper()
         want = 'BULLISH' if side == 'BUY' else 'BEARISH' if side == 'SELL' else ''
-        if high_win_mode and engine != 'A':
+        if high_win_mode and engine not in {'A', 'C'}:
             return (False, f'engine_{engine.lower() or "unknown"}_disabled_high_win_mode')
         if engine == 'A':
             if sess == 'LON':
-                score_floor = max(85.0, score_floor)
-                conf_floor = max(87, conf_floor)
-                rr_floor = max(1.45, rr_floor)
+                score_floor = max(82.0, score_floor)
+                conf_floor = max(84, conf_floor)
+                rr_floor = max(1.40, rr_floor)
             elif sess == 'NY':
-                score_floor = max(90.0, score_floor)
-                conf_floor = max(91, conf_floor)
-                rr_floor = max(1.70, rr_floor)
+                score_floor = max(88.0, score_floor)
+                conf_floor = max(89, conf_floor)
+                rr_floor = max(1.62, rr_floor)
             else:
-                score_floor = max(92.0, score_floor)
+                score_floor = max(91.0, score_floor)
                 conf_floor = max(92, conf_floor)
-                rr_floor = max(1.80, rr_floor)
+                rr_floor = max(1.78, rr_floor)
         elif engine == 'C':
             if sess != 'LON':
                 return (False, 'engine_c_only_lon')
-            score_floor = max(85.0, score_floor + 1.5)
-            conf_floor = max(87, conf_floor + 2)
-            rr_floor = max(1.74, rr_floor + 0.10)
+            score_floor = max(83.0, score_floor + 1.0)
+            conf_floor = max(85, conf_floor + 1)
+            rr_floor = max(1.58, rr_floor + 0.08)
         elif engine == 'B':
             if sess != 'LON':
                 return (False, f'engine_b_{sess.lower()}_disabled')
@@ -21244,24 +21247,24 @@ def is_executable_setup_eligible(
         ch24_abs = abs(float(getattr(s, "ch24", 0.0) or 0.0))
 
         if sess == "NY":
-            if pb_dist > 0.66:
+            if pb_dist > 0.72:
                 return (False, "ny_entry_too_far_from_ema")
-            if ch15_abs > 0.72 or (ch15_abs > 0.64 and ch1_abs > 1.35):
+            if ch15_abs > 0.82 or (ch15_abs > 0.72 and ch1_abs > 1.45):
                 return (False, "ny_late_extension_exec")
-            if ch4_abs < 0.70 or ch1_abs < 0.38:
+            if ch4_abs < 0.66 or ch1_abs < 0.34:
                 return (False, "ny_context_too_weak_exec")
-            if fut_vol < max(MIN_FUT_VOL_USD, 13_000_000.0):
+            if fut_vol < max(MIN_FUT_VOL_USD, 12_000_000.0):
                 return (False, "ny_below_liquidity")
         elif sess == "LON":
-            if pb_dist > 0.42:
+            if pb_dist > 0.48:
                 return (False, "lon_entry_too_far_from_ema")
-            if ch15_abs > 0.34 or ch1_abs > 0.92:
+            if ch15_abs > 0.40 or ch1_abs > 1.05:
                 return (False, "lon_late_extension_exec")
-            if ch4_abs < 0.70 or ch1_abs < 0.34:
+            if ch4_abs < 0.62 or ch1_abs < 0.30:
                 return (False, "lon_context_too_weak_exec")
-            if ch4_abs > 1.90 or ch24_abs > 10.5:
+            if ch4_abs > 2.15 or ch24_abs > 12.5:
                 return (False, "lon_trend_overheated_exec")
-            if fut_vol < max(MIN_FUT_VOL_USD, 18_000_000.0):
+            if fut_vol < max(MIN_FUT_VOL_USD, 14_000_000.0):
                 return (False, "lon_below_liquidity")
         elif sess == "ASIA":
             if pb_dist > 0.52:
@@ -21276,9 +21279,9 @@ def is_executable_setup_eligible(
         if engine == "A":
             if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
                 return (False, "pullback_not_ready")
-            if pb_dist > (0.42 if sess == 'LON' else (0.52 if sess == 'NY' else 0.44)):
+            if pb_dist > (0.48 if sess == 'LON' else (0.58 if sess == 'NY' else 0.46)):
                 return (False, "pullback_still_too_shallow")
-            if sess == 'LON' and (ch15_abs > 0.32 or ch1_abs < 0.35 or ch1_abs > 0.90 or ch4_abs < 0.72):
+            if sess == 'LON' and (ch15_abs > 0.38 or ch1_abs < 0.30 or ch1_abs > 1.00 or ch4_abs < 0.60):
                 return (False, 'lon_pullback_not_clean_enough')
             return (True, "ok")
 
@@ -31747,14 +31750,17 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
 
         live_sess = _session_label_utc(now_utc)
         owner_unlimited = int(user.get("sessions_unlimited", 0) or 0) == 1
+        try:
+            sess_ctx = in_session_now(user) or {}
+        except Exception:
+            sess_ctx = {}
         if owner_unlimited:
-            try:
-                sess_ctx = in_session_now(user) or {}
-            except Exception:
-                sess_ctx = {}
             sess = str(sess_ctx.get("name") or current_session_utc(now_utc) or "NONE").upper()
         else:
-            sess = current_session_utc(now_utc)
+            # Respect the owner's enabled-session selection during overlap windows.
+            # Using current_session_utc() alone flips 13:00–17:00 UTC into NY by priority,
+            # which can silently suppress a LON-only executable lane.
+            sess = str(sess_ctx.get("name") or current_session_utc(now_utc) or "NONE").upper()
 
         if AUTOTRADE_EXEC_LOCK.locked():
             _LAST_AUTOTRADE_DECISION[uid] = {
