@@ -314,8 +314,10 @@ def _autotrade_get_sessions():
             """)
             c.execute("SELECT value FROM autotrade_config WHERE key='sessions'")
             row = c.fetchone()
-            if row and row[0]:
-                return [s.strip().upper() for s in row[0].split(",") if s.strip()]
+            if row is not None:
+                parsed = [s.strip().upper() for s in str(row[0] or '').split(",") if s.strip()]
+                if parsed:
+                    return parsed
             c.execute(
                 "INSERT OR REPLACE INTO autotrade_config(key,value) VALUES('sessions',?)",
                 (",".join(default_sessions),)
@@ -5359,10 +5361,10 @@ def _autotrade_qty_from_risk(entry: float, sl: float, equity_usdt: float, risk_u
     return float(qty)
 
 def _autotrade_allowed_session(session_label: str) -> bool:
-    allowed = set([s.strip().upper() for s in _autotrade_get_sessions() if s.strip()])
+    allowed = {s.strip().upper() for s in (_autotrade_get_sessions() or []) if s.strip()}
     if not allowed:
-        allowed = {'NY', 'ASIA'}
-    return session_label.upper() in allowed
+        allowed = {'NY', 'LON', 'ASIA'}
+    return str(session_label or '').upper() in allowed
 
 
 # =========================================================
