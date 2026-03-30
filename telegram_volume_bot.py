@@ -1067,11 +1067,8 @@ def _strategy_config_defaults() -> dict:
         "context_tf_2": "4h",
 
         # Quality floors (0..100)
-        # Keep the upstream pool broad enough so the downstream executable gate
-        # can do the real filtering. Older builds starved the pipeline by forcing
-        # very high email/screen score floors before executability was even tested.
-        "quality_score_min_screen": 62.0,
-        "quality_score_min_email": 68.0,
+        "quality_score_min_screen": float(QUALITY_SCORE_MIN_SCREEN),
+        "quality_score_min_email": float(QUALITY_SCORE_MIN_EMAIL),
 
         # Regime thresholds (used by backtest generator + some live scoring)
         "regime_slope_trend_min_pct": 0.06,
@@ -1110,12 +1107,10 @@ def _strategy_config_defaults() -> dict:
         "target_setups_per_day_hi": 3.0,
 
         # Self-optimization governance
-        "session_weights": {"NY": 0.25, "LON": 0.50, "ASIA": 0.25},  # optimizer weighting only; executable gating is cross-session
-        "high_win_mode": False,  # deprecated as an executable-session clamp; preserved only for backward compatibility
-        "execution_sessions_allowed": ["NY", "LON", "ASIA"],  # deprecated for executable gating; downstream email/autotrade own session control
-        "preferred_trade_window": {"start": "19:00", "end": "01:00"},
-        "enforce_preferred_trade_window_by_default": False,
-        "strategy_bootstrap_version": 3,
+        "session_weights": {"NY": 0.45, "LON": 0.40, "ASIA": 0.15},  # optimizer weighting (cross-session executable pool with NY/LON preference)
+        "high_win_mode": False,
+        "execution_sessions_allowed": ["NY", "LON", "ASIA"],
+        "preferred_trade_window": {"start": "00:00", "end": "23:59"},
         "concentration_cap": 0.25,          # no single symbol >25% of setups (OOS)
         "oos_min_setups": 30,               # minimum OOS sample size across universe before promotion
         "min_win_rate": 70.0,               # enforced only when sample is adequate
@@ -1320,94 +1315,104 @@ def _strategy_cfg_execution_sessions_allowed(cfg: dict | None) -> set[str]:
 def _strategy_cfg_preferred_trade_window(cfg: dict | None) -> tuple[str, str]:
     try:
         tw = dict((cfg or {}).get('preferred_trade_window') or {})
-        start_s = str(tw.get('start') or '19:00').strip() or '19:00'
-        end_s = str(tw.get('end') or '23:30').strip() or '23:30'
+        start_s = str(tw.get('start') or '00:00').strip() or '00:00'
+        end_s = str(tw.get('end') or '23:59').strip() or '23:59'
         return start_s, end_s
     except Exception:
-        return '19:00', '23:30'
+        return '00:00', '23:59'
 
 def _strategy_config_bootstrap_recommendations() -> None:
-    """Non-destructive strategy-config migration.
+    """One-time safety migration for stale high-win LON-only bootstrap profiles.
 
-    Older builds force-overwrote the persisted live profile on every boot. That made
-    strategy_config look editable while silently restoring a LON-only, high-win,
-    narrow-window profile with hidden executable-session clamps. This migration now:
-    - fills only missing keys
-    - preserves intentional user/admin choices
-    - repairs known stale forced-bootstrap profiles
-    - removes deprecated hidden executable-session clamps from persisted config
+    This migration is intentionally non-destructive:
+    - it preserves user/runtime tuning when config already looks intentional
+    - it only neutralizes the old hidden starvation profile
+    - it keeps target setup frequency aligned to ~1–3/day
     """
     try:
         cfg = load_strategy_config(force=True)
-        defaults = _strategy_config_defaults()
         changed = False
 
-        # Merge missing top-level keys only.
-        for key, value in (defaults or {}).items():
-            if key not in cfg:
-                cfg[key] = value
-                changed = True
+        def _same_window(obj: dict | None, start_s: str, end_s: str) -> bool:
+            try:
+                tw = dict(obj or {})
+                return str(tw.get('start') or '').strip() == str(start_s) and str(tw.get('end') or '').strip() == str(end_s)
+            except Exception:
+                return False
 
-        # Merge missing session override keys only.
-        sess_ov = dict(cfg.get('session_exec_overrides') or {})
-        default_sess_ov = dict((defaults or {}).get('session_exec_overrides') or {})
-        for sess, vals in (default_sess_ov or {}).items():
-            cur = dict(sess_ov.get(sess) or {})
-            for k, v in dict(vals or {}).items():
-                if k not in cur:
-                    cur[k] = v
-                    changed = True
-            sess_ov[sess] = cur
-        if sess_ov != dict(cfg.get('session_exec_overrides') or {}):
-            cfg['session_exec_overrides'] = sess_ov
+        # Keep frequency targets sane if missing/corrupted.
+        try:
+            lo = float(cfg.get('target_setups_per_day_lo', 0.0) or 0.0)
+            hi = float(cfg.get('target_setups_per_day_hi', 0.0) or 0.0)
+            if lo <= 0 or abs(lo - 1.0) > 0.001:
+                cfg['target_setups_per_day_lo'] = 1.0
+                changed = True
+            if hi <= 0 or abs(hi - 3.0) > 0.001:
+                cfg['target_setups_per_day_hi'] = 3.0
+                changed = True
+        except Exception:
+            cfg['target_setups_per_day_lo'] = 1.0
+            cfg['target_setups_per_day_hi'] = 3.0
             changed = True
 
-        # Keep ASIA enabled unless the user explicitly disabled it.
+        try:
+            glo = float(cfg.get('governor_target_lo', 0.0) or 0.0)
+            ghi = float(cfg.get('governor_target_hi', 0.0) or 0.0)
+            if glo <= 0 or abs(glo - 1.0) > 0.001:
+                cfg['governor_target_lo'] = 1.0
+                changed = True
+            if ghi <= 0 or abs(ghi - 3.0) > 0.001:
+                cfg['governor_target_hi'] = 3.0
+                changed = True
+        except Exception:
+            cfg['governor_target_lo'] = 1.0
+            cfg['governor_target_hi'] = 3.0
+            changed = True
+
+        try:
+            mlo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 0.0) or 0.0)
+            mhi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 0.0) or 0.0)
+            if mlo <= 0 or abs(mlo - 1.0) > 0.001:
+                cfg['market_adaptive_target_setups_per_day_lo'] = 1.0
+                changed = True
+            if mhi <= 0 or abs(mhi - 3.0) > 0.001:
+                cfg['market_adaptive_target_setups_per_day_hi'] = 3.0
+                changed = True
+        except Exception:
+            cfg['market_adaptive_target_setups_per_day_lo'] = 1.0
+            cfg['market_adaptive_target_setups_per_day_hi'] = 3.0
+            changed = True
+
         manual_asia = _cfg_bool(cfg.get('execution_asia_user_override', False), False)
         if not manual_asia and not _cfg_bool(cfg.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED)):
             cfg['execution_asia_enabled'] = True
             changed = True
 
-        # Detect the stale boot-forced profile and migrate it once to the new defaults.
-        stale_forced_profile = (
-            float(cfg.get('quality_score_min_email', 0.0) or 0.0) == 74.0
-            and float(cfg.get('quality_score_min_screen', 0.0) or 0.0) == 66.0
-            and round(float(cfg.get('min_rr_tp', 0.0) or 0.0), 2) == 1.42
-            and cfg.get('session_weights') == {'NY': 0.0, 'LON': 1.0, 'ASIA': 0.0}
+        stale_lon_only = (
+            _cfg_bool(cfg.get('high_win_mode', False), False) is True
             and list(cfg.get('execution_sessions_allowed') or []) == ['LON']
-            and dict(cfg.get('preferred_trade_window') or {}) == {'start': '19:00', 'end': '23:30'}
-            and dict((cfg.get('session_exec_overrides') or {}).get('NY') or {}) == {'quality_add': 4.0, 'conf_add': 3, 'rr_add': 0.18}
-            and dict((cfg.get('session_exec_overrides') or {}).get('ASIA') or {}) == {'quality_add': 5.0, 'conf_add': 4, 'rr_add': 0.25}
-            and int(cfg.get('strategy_bootstrap_version', 0) or 0) < 3
+            and _same_window(cfg.get('preferred_trade_window') or {}, '19:00', '23:30')
+            and dict(cfg.get('session_weights') or {}) == {'NY': 0.0, 'LON': 1.0, 'ASIA': 0.0}
         )
-        if stale_forced_profile:
-            cfg['quality_score_min_email'] = 68.0
-            cfg['quality_score_min_screen'] = 62.0
-            cfg['min_rr_tp'] = 1.40
-            cfg['session_weights'] = {'NY': 0.25, 'LON': 0.50, 'ASIA': 0.25}
-            cfg['preferred_trade_window'] = {'start': '19:00', 'end': '01:00'}
-            cfg['enforce_preferred_trade_window_by_default'] = False
+        stale_exec_overrides = dict(cfg.get('session_exec_overrides') or {}) == {
+            'NY': {'quality_add': 4.0, 'conf_add': 3, 'rr_add': 0.18},
+            'LON': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0},
+            'ASIA': {'quality_add': 5.0, 'conf_add': 4, 'rr_add': 0.25},
+        }
+
+        if stale_lon_only:
             cfg['high_win_mode'] = False
             cfg['execution_sessions_allowed'] = ['NY', 'LON', 'ASIA']
-            cfg['session_exec_overrides'] = {
-                'NY': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0},
-                'LON': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0},
-                'ASIA': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0},
-            }
-            cfg['strategy_bootstrap_version'] = 3
+            cfg['preferred_trade_window'] = {'start': '00:00', 'end': '23:59'}
+            cfg['session_weights'] = {'NY': 0.45, 'LON': 0.40, 'ASIA': 0.15}
             changed = True
-        elif int(cfg.get('strategy_bootstrap_version', 0) or 0) < 3:
-            # Version 3 migration: keep strategy thresholds/session overrides,
-            # but remove deprecated hidden executable-session clamps so redeploys
-            # cannot silently force a LON-only upstream lane again.
-            if _cfg_bool(cfg.get('high_win_mode', False), False):
-                cfg['high_win_mode'] = False
-                changed = True
-            raw_exec_sessions = [str(x).upper().strip() for x in (cfg.get('execution_sessions_allowed') or []) if str(x).strip()]
-            if raw_exec_sessions == ['LON'] or not raw_exec_sessions:
-                cfg['execution_sessions_allowed'] = ['NY', 'LON', 'ASIA']
-                changed = True
-            cfg['strategy_bootstrap_version'] = 3
+
+        if stale_exec_overrides:
+            cfg['session_exec_overrides'] = {
+                'NY': {'quality_add': 1.0, 'conf_add': 1, 'rr_add': 0.06},
+                'LON': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.00},
+                'ASIA': {'quality_add': 1.5, 'conf_add': 1, 'rr_add': 0.10},
+            }
             changed = True
 
         if changed:
@@ -6212,15 +6217,15 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 80,
-    "LON": 78,
-    "ASIA": 84,
+    "NY": 78,
+    "LON": 76,
+    "ASIA": 81,
 }
 
 SESSION_MIN_RR_FINAL = {
-    "NY": 1.62,
-    "LON": 1.50,
-    "ASIA": 1.90,
+    "NY": 1.55,
+    "LON": 1.42,
+    "ASIA": 1.62,
 }
 
 SESSION_MIN_RR_TP = SESSION_MIN_RR_FINAL  # legacy compatibility only
@@ -7250,12 +7255,13 @@ def _rej(reason: str, base: str, mv: "MarketVol", extra: str = "") -> None:
 
     key = f"{b}:{r}"
     ctx[key] = int(ctx.get(key, 0)) + 1
+
     try:
         agg = ctx.get("__agg__")
         if not isinstance(agg, dict):
             agg = {}
             ctx["__agg__"] = agg
-        agg[r] = int(agg.get(r, 0)) + 1
+        agg[r] = int(agg.get(r, 0) or 0) + 1
     except Exception:
         pass
 
@@ -7448,58 +7454,6 @@ def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
     lines.extend(per_lines)
     if per_tail:
         lines.append(per_tail)
-
-    # Executable-lane diagnostics: surface why the top-setup pool did not survive
-    # executable qualification, using the same pipeline events that /screen/email write.
-    try:
-        exec_events = db_get_recent_setup_pipeline_events(
-            user_id=int(uid),
-            stages=['screen_executable_pool', 'email_executable_pool'],
-            limit=8,
-        )
-    except Exception:
-        exec_events = []
-
-    seen_exec_sections = set()
-    for ev in (exec_events or []):
-        try:
-            stage = str(ev.get('stage') or '').strip()
-            sess = str(ev.get('session') or '').strip().upper()
-            mode = str(ev.get('mode') or '').strip().lower()
-            key = (stage, sess, mode)
-            if key in seen_exec_sections:
-                continue
-            seen_exec_sections.add(key)
-            details = dict(ev.get('details') or {})
-            top_exec = dict(details.get('top_exec_rejects') or details.get('top_reasons') or {})
-            if not top_exec:
-                continue
-            raw_pool = int(details.get('raw_pool') or 0)
-            eligible = int(details.get('eligible') or details.get('executable_ready') or 0)
-            persisted = int(details.get('persisted') or 0)
-            title = 'Executable qualification'
-            if stage == 'screen_executable_pool':
-                title += ' (/screen lane)'
-            elif stage == 'email_executable_pool':
-                title += ' (email lane)'
-            if sess:
-                title += f' [{sess}]'
-            lines.append('')
-            lines.append(title)
-            meta_bits = []
-            if raw_pool:
-                meta_bits.append(f'pool={raw_pool}')
-            if eligible:
-                meta_bits.append(f'eligible={eligible}')
-            if persisted:
-                meta_bits.append(f'persisted={persisted}')
-            if meta_bits:
-                lines.append('• ' + ' | '.join(meta_bits))
-            for k, v in list(sorted(top_exec.items(), key=lambda kv: (-int(kv[1]), str(kv[0]))))[:6]:
-                lines.append(f'• {k} = {int(v)}')
-        except Exception:
-            continue
-
     return "\n".join(lines)
 
 
@@ -12060,46 +12014,6 @@ def db_log_setup_pipeline_event(user_id: int | None, stage: str, status: str, se
     except Exception:
         pass
 
-def db_get_recent_setup_pipeline_events(user_id: int | None = None, stages: list[str] | None = None, mode: str = '', session: str = '', limit: int = 10) -> list[dict]:
-    try:
-        params = []
-        where = []
-        if user_id is not None:
-            where.append("user_id IN (?, 0)")
-            params.append(int(user_id or 0))
-        if stages:
-            stage_vals = [str(s or '').strip() for s in (stages or []) if str(s or '').strip()]
-            if stage_vals:
-                where.append(f"stage IN ({','.join(['?'] * len(stage_vals))})")
-                params.extend(stage_vals)
-        if str(mode or '').strip():
-            where.append("LOWER(COALESCE(mode,'')) = ?")
-            params.append(str(mode or '').strip().lower())
-        if str(session or '').strip():
-            where.append("UPPER(COALESCE(session,'')) = ?")
-            params.append(str(session or '').strip().upper())
-        q = "SELECT user_id, event_ts, stage, status, session, mode, setup_id, symbol, side, details_json FROM setup_pipeline_events"
-        if where:
-            q += " WHERE " + " AND ".join(where)
-        q += " ORDER BY event_ts DESC LIMIT ?"
-        params.append(int(max(1, limit)))
-        con = db_connect()
-        cur = con.cursor()
-        rows = cur.execute(q, tuple(params)).fetchall() or []
-        con.close()
-        out = []
-        for row in rows:
-            rec = dict(row)
-            try:
-                rec['details'] = json.loads(str(rec.get('details_json') or '{}'))
-            except Exception:
-                rec['details'] = {}
-            out.append(rec)
-        return out
-    except Exception:
-        return []
-
-
 
 def _pipeline_top_reasons(counts: dict | Counter | None, limit: int = 5) -> dict:
     try:
@@ -13724,14 +13638,7 @@ def in_trade_window_now(user: dict, now_local: Optional[datetime] = None) -> boo
     start_s = str(user.get("trade_window_start") or "").strip()
     end_s = str(user.get("trade_window_end") or "").strip()
     if not start_s or not end_s:
-        try:
-            cfg_live = load_strategy_config(force=False)
-            if _cfg_bool((cfg_live or {}).get('enforce_preferred_trade_window_by_default', False), False):
-                start_s, end_s = _strategy_cfg_preferred_trade_window(cfg_live)
-            else:
-                return True
-        except Exception:
-            return True  # disabled => allow
+        return True
 
     # User timezone
     try:
@@ -13783,6 +13690,33 @@ def current_session_utc(now_utc: Optional[datetime] = None) -> str:
             except Exception:
                 return False
     return _session_label_utc(now_utc) or "NONE"
+
+
+def _current_session_for_allowed(now_utc: Optional[datetime] = None, allowed_sessions: Optional[List[str]] = None) -> str:
+    """Return the best live session among the allowed set, preserving caller order.
+
+    This avoids overlap mismatches such as NY>LON priority hiding a still-open LON
+    lane when the owner intentionally enabled LON but not NY.
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    allowed = [str(x).upper().strip() for x in (allowed_sessions or []) if str(x).strip().upper() in SESSIONS_UTC]
+    if not allowed:
+        return current_session_utc(now_utc)
+    for name in allowed:
+        w = SESSIONS_UTC.get(name) or {}
+        sh, sm = parse_hhmm(w.get("start", "00:00"))
+        eh, em = parse_hhmm(w.get("end", "00:00"))
+        start_utc = now_utc.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_utc = now_utc.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if end_utc <= start_utc:
+            end_utc += timedelta(days=1)
+        if now_utc < start_utc and (start_utc - now_utc) > timedelta(hours=12):
+            start_utc -= timedelta(days=1)
+            end_utc -= timedelta(days=1)
+        if start_utc <= now_utc < end_utc:
+            return name
+    return "NONE"
 
 
 def scan_session_name_utc(now_utc: Optional[datetime] = None) -> str:
@@ -21091,11 +21025,17 @@ def _session_entry_quality_limits(session_name: str, source: str = 'email') -> d
         'LON': {'max_pb_ema_dist': 0.52, 'max_ch15_abs': 0.44, 'max_ch1_abs': 1.00, 'max_atr_pct': 4.0},
         'ASIA': {'max_pb_ema_dist': 0.44, 'max_ch15_abs': 0.38, 'max_ch1_abs': 0.90, 'max_atr_pct': 3.3},
     }.get(sess, {'max_pb_ema_dist': 0.52, 'max_ch15_abs': 0.44, 'max_ch1_abs': 1.00, 'max_atr_pct': 4.0}).copy()
-    if str(source or '').strip().lower() == 'screen':
+    src = str(source or '').strip().lower()
+    if src == 'screen':
         base['max_pb_ema_dist'] *= (1.07 if sess != 'ASIA' else 1.04)
         base['max_ch15_abs'] *= (1.05 if sess != 'ASIA' else 1.03)
         base['max_ch1_abs'] *= (1.05 if sess != 'ASIA' else 1.03)
         base['max_atr_pct'] *= (1.04 if sess != 'ASIA' else 1.02)
+    elif src == 'exec':
+        base['max_pb_ema_dist'] *= (1.03 if sess != 'ASIA' else 1.01)
+        base['max_ch15_abs'] *= (1.02 if sess != 'ASIA' else 1.01)
+        base['max_ch1_abs'] *= (1.02 if sess != 'ASIA' else 1.01)
+        base['max_atr_pct'] *= (1.02 if sess != 'ASIA' else 1.01)
     return base
 
 
@@ -21153,11 +21093,11 @@ def is_top_setup_eligible(
     source: str = "screen",
     session_name: str = "LON",
 ) -> tuple[bool, str]:
-    """Unified top-setup gate before executable qualification.
+    """Unified single-TP eligibility using scoring + a few safety checks.
 
-    - source='screen' => slightly looser display-oriented gate
-    - source='exec'   => authoritative pool gate (shared by /screen, email, autotrade)
-    - source='email'  => delivery lane, kept a touch stricter than the executable pool
+    - source='screen' => loosest display lane
+    - source='exec'   => authoritative executable pool pre-gate
+    - source='email'  => strictest downstream lane
     """
     try:
         entry = float(getattr(s, "entry", 0.0) or 0.0)
@@ -21188,7 +21128,7 @@ def is_top_setup_eligible(
             pass
 
         src = str(source or "screen").strip().lower()
-        if src not in {"screen", "exec", "email"}:
+        if src not in {"screen", "email", "exec"}:
             src = "screen"
         sess = str(session_name or 'LON').upper().strip()
         engine = str(getattr(s, 'engine', '') or '').upper().strip()
@@ -21196,42 +21136,51 @@ def is_top_setup_eligible(
         if src == "screen":
             min_score = float(QUALITY_SCORE_MIN_SCREEN)
         elif src == "exec":
-            min_score = float(max(QUALITY_SCORE_MIN_SCREEN + 1.0, QUALITY_SCORE_MIN_EMAIL - 1.5))
+            min_score = float(max(QUALITY_SCORE_MIN_SCREEN + 3.0, QUALITY_SCORE_MIN_EMAIL - 2.0))
         else:
             min_score = float(QUALITY_SCORE_MIN_EMAIL)
 
-        if engine == 'A':
-            if src == 'email':
-                min_score += 0.5 if sess == 'LON' else (0.9 if sess == 'NY' else 1.2)
-            elif src == 'exec':
-                min_score += 0.25 if sess == 'LON' else (0.45 if sess == 'NY' else 0.7)
-            else:
-                min_score += 0.0 if sess == 'LON' else (0.35 if sess == 'NY' else 0.6)
-        elif engine == 'B':
-            if src == 'email':
-                min_score += 2.6 if sess in {'NY', 'ASIA'} else 1.8
-            elif src == 'exec':
-                min_score += 1.6 if sess in {'NY', 'ASIA'} else 1.0
-            else:
-                min_score += 1.0 if sess in {'NY', 'ASIA'} else 0.6
-        elif engine == 'C':
-            if src == 'email':
-                min_score += 1.4 if sess != 'ASIA' else 1.7
-            elif src == 'exec':
-                min_score += 0.9 if sess != 'ASIA' else 1.1
-            else:
-                min_score += 0.6 if sess != 'ASIA' else 0.9
+        if src == 'email':
+            if engine == 'A':
+                if sess == 'LON':
+                    min_score += 0.5
+                elif sess == 'NY':
+                    min_score += 1.0
+                elif sess == 'ASIA':
+                    min_score += 1.5
+            elif engine == 'B':
+                min_score += 4.0 if sess in {'NY', 'ASIA'} else 2.5
+            elif engine == 'C':
+                min_score += 1.5 if sess != 'ASIA' else 2.0
+        elif src == 'exec':
+            if engine == 'A':
+                min_score += 0.25 if sess == 'LON' else (0.50 if sess == 'NY' else 0.75)
+            elif engine == 'B':
+                min_score += 1.5 if sess in {'NY', 'ASIA'} else 1.0
+            elif engine == 'C':
+                min_score += 1.0 if sess != 'ASIA' else 1.5
+        else:
+            if engine == 'A':
+                min_score += 0.0 if sess == 'LON' else (0.5 if sess == 'NY' else 1.0)
+            elif engine == 'B':
+                min_score += 2.0 if sess in {'NY', 'ASIA'} else 1.0
+            elif engine == 'C':
+                min_score += 0.8 if sess != 'ASIA' else 1.2
         min_score = float(clamp(min_score, 60.0, 90.0))
 
         if float(score) < float(min_score):
             return (False, f"below_score_{int(round(min_score))}")
 
-        ok_entry, why_entry = _setup_entry_quality_gate(s, session_name=session_name, source='email' if src == 'email' else 'screen')
+        ok_entry, why_entry = _setup_entry_quality_gate(s, session_name=session_name, source=src)
         if not ok_entry:
             return (False, why_entry)
 
         fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
-        vol_floor = float(max(MIN_FUT_VOL_USD, 10_000_000.0))
+        vol_floor = float(MIN_FUT_VOL_USD)
+        if sess == 'NY':
+            vol_floor = max(vol_floor, 12_000_000.0)
+        elif sess == 'ASIA':
+            vol_floor = max(vol_floor * 1.05, ASIA_MIN_FUT_VOL_USD)
         if fut_vol < vol_floor:
             return (False, "below_min_fut_vol")
 
@@ -21240,21 +21189,20 @@ def is_top_setup_eligible(
         return (False, "eligibility_exception")
 
 def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]:
-    """Session-aware executable floors for the persisted cross-session queue.
+    """Moderately strict executable thresholds for a shared cross-session pool.
 
-    These are intentionally moderate: the executable lane must be selective, but it must
-    not starve before /screen, email, and autotrade can consume it. Session-specific
-    tightening remains available through strategy_config.session_exec_overrides.
+    These floors are intentionally below the final per-engine executable checks so the
+    authoritative executable lane does not self-starve before email/autotrade consume it.
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 78.5, 80, 1.34
+        quality, conf, rr = 82.0, 83, 1.48
     elif sess == "LON":
-        quality, conf, rr = 77.5, 79, 1.32
+        quality, conf, rr = 78.0, 80, 1.38
     elif sess == "ASIA":
-        quality, conf, rr = 79.0, 80, 1.36
+        quality, conf, rr = 84.0, 85, 1.55
     else:
-        quality, conf, rr = 78.0, 79, 1.33
+        quality, conf, rr = 80.0, 82, 1.42
 
     try:
         cfg = load_strategy_config(force=False)
@@ -21266,9 +21214,9 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     except Exception:
         pass
 
-    quality = float(clamp(quality, 74.0, 92.0))
-    conf = int(max(78, min(95, conf)))
-    rr = float(clamp(rr, 1.28, 2.25))
+    quality = float(clamp(quality, 72.0, 92.0))
+    conf = int(max(76, min(95, conf)))
+    rr = float(clamp(rr, 1.32, 2.30))
     return (quality, conf, rr)
 
 
@@ -21279,11 +21227,18 @@ def is_executable_setup_eligible(
     min_conf: int = 78,
     min_rr_final: float = 0.0,
 ) -> tuple[bool, str]:
-    """Authoritative executable gate for the persisted shared queue."""
+    """Production-grade gate for executable/email/autotrade path.
+
+    Key rule:
+    - executability is session-aware by thresholds
+    - executability is NOT silently session-blocked by strategy policy
+    - downstream email/autotrade session preferences decide consumption
+    """
     try:
         sess = str(session_name or "").upper().strip()
         if sess not in {"ASIA", "LON", "NY"}:
             return (False, "session_not_supported")
+
         cfg_live = load_strategy_config(force=False)
         exec_engine_b_enabled = _cfg_bool((cfg_live or {}).get("execution_engine_b_email_enabled", EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
 
@@ -21292,7 +21247,7 @@ def is_executable_setup_eligible(
             return (False, f"base_gate_{why}")
 
         sess_quality, sess_conf, sess_rr = _execution_session_thresholds(sess)
-        score_floor = float(max(min_quality, sess_quality))
+        score_floor = float(max(min_quality, QUALITY_SCORE_MIN_EMAIL - 2.0, sess_quality))
         conf_floor = int(max(min_conf, MIN_SETUP_CONF, sess_conf))
         rr_floor = float(max(min_rr_final, sess_rr))
 
@@ -21304,21 +21259,48 @@ def is_executable_setup_eligible(
         want = 'BULLISH' if side == 'BUY' else 'BEARISH' if side == 'SELL' else ''
 
         if engine == 'A':
-            score_floor = max(score_floor, sess_quality + 0.5)
-            conf_floor = max(conf_floor, sess_conf)
-            rr_floor = max(rr_floor, sess_rr + 0.02)
+            if sess == 'LON':
+                score_floor = max(79.0, score_floor)
+                conf_floor = max(81, conf_floor)
+                rr_floor = max(1.40, rr_floor)
+            elif sess == 'NY':
+                score_floor = max(83.0, score_floor)
+                conf_floor = max(84, conf_floor)
+                rr_floor = max(1.50, rr_floor)
+            else:
+                score_floor = max(85.0, score_floor)
+                conf_floor = max(86, conf_floor)
+                rr_floor = max(1.58, rr_floor)
         elif engine == 'C':
-            score_floor = max(score_floor, sess_quality + 1.2)
-            conf_floor = max(conf_floor, sess_conf + 1)
-            rr_floor = max(rr_floor, sess_rr + 0.05)
+            if sess == 'LON':
+                score_floor = max(82.0, score_floor + 1.5)
+                conf_floor = max(84, conf_floor + 1)
+                rr_floor = max(1.50, rr_floor + 0.06)
+            elif sess == 'NY':
+                score_floor = max(84.0, score_floor + 1.5)
+                conf_floor = max(85, conf_floor + 1)
+                rr_floor = max(1.56, rr_floor + 0.08)
+            else:
+                score_floor = max(87.0, score_floor + 2.0)
+                conf_floor = max(88, conf_floor + 2)
+                rr_floor = max(1.66, rr_floor + 0.10)
         elif engine == 'B':
             if not exec_engine_b_enabled:
-                return (False, 'engine_not_allowed_for_exec')
-            score_floor = max(score_floor, sess_quality + 2.0)
-            conf_floor = max(conf_floor, sess_conf + 2)
-            rr_floor = max(rr_floor, sess_rr + 0.10)
+                return (False, 'engine_b_disabled')
+            if sess == 'LON':
+                score_floor = max(84.0, score_floor + 2.5)
+                conf_floor = max(85, conf_floor + 2)
+                rr_floor = max(1.58, rr_floor + 0.10)
+            elif sess == 'NY':
+                score_floor = max(86.0, score_floor + 3.0)
+                conf_floor = max(87, conf_floor + 3)
+                rr_floor = max(1.66, rr_floor + 0.12)
+            else:
+                score_floor = max(89.0, score_floor + 3.5)
+                conf_floor = max(89, conf_floor + 3)
+                rr_floor = max(1.74, rr_floor + 0.14)
         else:
-            return (False, 'engine_not_allowed_for_exec')
+            return (False, 'engine_not_supported')
 
         if 'TREND' not in regime:
             return (False, 'regime_not_trend')
@@ -21347,75 +21329,72 @@ def is_executable_setup_eligible(
         ch4_abs = abs(float(getattr(s, "ch4", 0.0) or 0.0))
         ch24_abs = abs(float(getattr(s, "ch24", 0.0) or 0.0))
 
-        min_liquidity = float(max(MIN_FUT_VOL_USD, 10_000_000.0))
-        if fut_vol < min_liquidity:
-            return (False, "below_exec_liquidity")
-
         if sess == "NY":
-            if pb_dist > 0.88:
+            if pb_dist > 0.75:
                 return (False, "ny_entry_too_far_from_ema")
-            if ch15_abs > 1.00 or (ch15_abs > 0.86 and ch1_abs > 1.70):
+            if ch15_abs > 0.82 or (ch15_abs > 0.72 and ch1_abs > 1.55):
                 return (False, "ny_late_extension_exec")
-            if ch4_abs < 0.58 or ch1_abs < 0.28:
+            if ch4_abs < 0.62 or ch1_abs < 0.32:
                 return (False, "ny_context_too_weak_exec")
+            if fut_vol < max(MIN_FUT_VOL_USD, 12_000_000.0):
+                return (False, "ny_below_liquidity")
         elif sess == "LON":
-            if pb_dist > 0.62:
+            if pb_dist > 0.50:
                 return (False, "lon_entry_too_far_from_ema")
-            if ch15_abs > 0.55 or ch1_abs > 1.20:
+            if ch15_abs > 0.42 or ch1_abs > 1.05:
                 return (False, "lon_late_extension_exec")
-            if ch4_abs < 0.55 or ch1_abs < 0.26:
+            if ch4_abs < 0.62 or ch1_abs < 0.28:
                 return (False, "lon_context_too_weak_exec")
-            if ch4_abs > 2.45 or ch24_abs > 13.5:
+            if ch4_abs > 2.20 or ch24_abs > 12.0:
                 return (False, "lon_trend_overheated_exec")
+            if fut_vol < max(MIN_FUT_VOL_USD, 14_000_000.0):
+                return (False, "lon_below_liquidity")
         elif sess == "ASIA":
-            if pb_dist > 0.68:
+            if pb_dist > 0.58:
                 return (False, "asia_entry_too_far_from_ema")
-            if ch15_abs > 0.62 or ch1_abs > 1.30:
+            if ch15_abs > 0.58 or ch1_abs > 1.22:
                 return (False, "asia_late_extension_exec")
-            if ch4_abs < 0.72 or ch1_abs < 0.34:
+            if ch4_abs < 0.78 or ch1_abs < 0.38:
                 return (False, "asia_context_too_weak_exec")
+            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.05, ASIA_MIN_FUT_VOL_USD)):
+                return (False, "asia_below_liquidity")
 
         if engine == "A":
             if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
                 return (False, "pullback_not_ready")
-            if pb_dist > (0.62 if sess == 'LON' else (0.72 if sess == 'NY' else 0.58)):
+            if pb_dist > (0.50 if sess == 'LON' else (0.60 if sess == 'NY' else 0.54)):
                 return (False, "pullback_still_too_shallow")
-            if sess == 'LON' and (ch15_abs > 0.52 or ch1_abs < 0.24 or ch1_abs > 1.18 or ch4_abs < 0.52):
+            if sess == 'LON' and (ch15_abs > 0.40 or ch1_abs < 0.30 or ch1_abs > 1.00 or ch4_abs < 0.65):
                 return (False, 'lon_pullback_not_clean_enough')
             return (True, "ok")
 
         if engine == "C":
-            if score < (score_floor + 0.8):
+            if score < (score_floor + 1.0):
                 return (False, "engine_c_below_quality")
             if conf < (conf_floor + 1):
                 return (False, "engine_c_below_conf")
-            if rr_final < (rr_floor + 0.03):
+            if rr_final < (rr_floor + 0.04):
                 return (False, "engine_c_below_rr")
-            if fut_vol < float(max(min_liquidity, ENGINE_C_MIN_FUT_VOL_USD)):
+            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.10, ENGINE_C_MIN_FUT_VOL_USD)):
                 return (False, "engine_c_below_liquidity")
-            if ch15_abs > 3.6:
-                return (False, "engine_c_still_too_extended")
+            if ch1_abs > (1.20 if sess == 'LON' else (1.45 if sess == 'NY' else 1.10)):
+                return (False, "engine_c_too_extended")
             return (True, "ok")
 
         if engine == "B":
-            if score < (score_floor + 0.6):
+            if score < (score_floor + 1.5):
                 return (False, "engine_b_below_quality")
             if conf < (conf_floor + 1):
                 return (False, "engine_b_below_conf")
-            if rr_final < (rr_floor + 0.03):
+            if rr_final < (rr_floor + 0.05):
                 return (False, "engine_b_below_rr")
-            if fut_vol < float(max(min_liquidity, 12_000_000.0)):
+            if fut_vol < float(max(MIN_FUT_VOL_USD * (1.10 if sess != 'ASIA' else 1.18), 15_000_000.0 if sess != 'ASIA' else ASIA_MIN_FUT_VOL_USD)):
                 return (False, "engine_b_below_liquidity")
-            if ch1_abs < 0.85 or ch4_abs < 1.45:
-                return (False, "engine_b_trend_not_strong_enough")
-            if pb_dist > 0.78 or ch15_abs > 0.92:
-                return (False, "engine_b_chase_risk")
             return (True, "ok")
 
-        return (False, "engine_not_allowed_for_exec")
+        return (False, "engine_not_supported")
     except Exception:
-        return (False, "exec_eligibility_exception")
-
+        return (False, "executable_gate_exception")
 
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
     """
@@ -23406,15 +23385,7 @@ async def trade_window_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur_s = (user.get("trade_window_start") or "").strip()
         cur_e = (user.get("trade_window_end") or "").strip()
         if not cur_s or not cur_e:
-            try:
-                cfg_live = load_strategy_config(force=False)
-                if _strategy_cfg_high_win_mode(cfg_live):
-                    pref_s, pref_e = _strategy_cfg_preferred_trade_window(cfg_live)
-                    current_line = f"Current: default HIGH-WIN window {pref_s} → {pref_e} (local)\n\n"
-                else:
-                    current_line = "Current: OFF (no time restriction)\n\n"
-            except Exception:
-                current_line = "Current: OFF (no time restriction)\n\n"
+            current_line = "Current: OFF (no time restriction)\n\n"
             await update.message.reply_text(
                 "🕒 Trade Window (Email Signals)\n"
                 f"{HDR}\n"
@@ -23464,7 +23435,8 @@ def user_enabled_sessions(user: dict) -> List[str]:
             ordered = _order_sessions(xs)
             return ordered or ['NY', 'LON', 'ASIA']
     except Exception:
-        return ['NY', 'LON', 'ASIA']
+        pass
+    return ['NY', 'LON', 'ASIA']
 
 def _session_label_utc(now_utc: datetime) -> Optional[str]:
     """
@@ -27852,7 +27824,7 @@ def _recalibrate_public_confidence(setup: "Setup", session_name: str) -> tuple[i
 
 async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
     """
-    mode: "screen" or "email"
+    mode: "screen", "exec", or "email"
     returns: {
         "setups": [Setup...],
         "waiting": [(base, info_dict)...],
@@ -27862,9 +27834,10 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     }
     """
 
-    # Setup-count governor (email path): keep 3–5/day without spamming (safe bounds)
+    # Setup-count governor (authoritative executable lane): keep flow near target without
+    # making /screen and email diverge.
     try:
-        if str(mode or '').lower().strip() == 'email':
+        if str(mode or '').lower().strip() in {'email', 'exec'}:
             _governor_adjust_quality_floor(session_name=session_name)
     except Exception:
         pass
@@ -28326,8 +28299,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Shared Top Setup gate (applies to BOTH /screen and email)
     # -----------------------------------------------------
     try:
-        gate_source = 'screen' if str(mode or '').strip().lower() == 'screen' else ('email' if str(mode or '').strip().lower() == 'email' else 'exec')
-        ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, source=gate_source, session_name=session_name)[0]]
+        ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, source=mode, session_name=session_name)[0]]
     except Exception:
         pass
 # -----------------------------------------------------
@@ -28584,14 +28556,15 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     """
     from types import SimpleNamespace
 
-    def _authoritative_screen_setups(_uid: int, _session: str, max_age_min: int = 20, limit: int = 3):
+    def _recent_email_lane_screen_setups(_uid: int, _session: str, max_age_min: int = 20, limit: int = 3):
         try:
             req_session_u = str(_session or '').upper().strip()
             out = []
             seen = set()
-
             cutoff = float(time.time()) - float(max_age_min) * 60.0
-            rows = db_list_executable_setups(int(_uid), session_name=str(_session or ''), ts_from=float(cutoff), limit=max(1, int(limit * 6)))
+
+            # Authoritative source first: persisted executable pool shared with autotrade.
+            rows = db_list_executable_setups(int(_uid), session_name=str(_session or ''), ts_from=float(cutoff), limit=max(1, int(limit * 4)))
             for item in _executable_rows_to_setup_objects(rows, session_name=req_session_u):
                 src_session_u = str(getattr(item, 'source_session', '') or '').upper().strip()
                 sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
@@ -28606,6 +28579,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 if len(out) >= int(limit):
                     return out[:int(limit)]
 
+            # Recovery fallback only: recent delivery-lane objects.
             for item in (_recent_delivery_lane_setup_objects(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(1, int(limit * 2))) or []):
                 try:
                     sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
@@ -28669,7 +28643,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         _exec_ready = []
 
     try:
-        setups = list(_authoritative_screen_setups(int(uid), str(session or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=max(1, int(SETUPS_N))))
+        setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=max(1, int(SETUPS_N))))
     except Exception:
         setups = []
 
@@ -30539,10 +30513,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
                         # ---------------------------
-            # Unified /screen + /email Top Setup eligibility
+            # Unified executable lane consumption
             # ---------------------------
-            # Email should send the SAME Top Trade Setups that /screen shows.
-            # Only user preferences (sessions/trade window/caps/gap/cooldown) can block sending.
+            # The authoritative lane is executable_setups. Email may help populate it,
+            # but it must always re-read that persisted queue before selection/sending.
 
             skip_reasons_counter = Counter()
             eligible: List[Setup] = []
@@ -30553,30 +30527,28 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     skip_reasons_counter[str(why)] += 1
 
+            persisted_count = 0
             if eligible:
                 try:
                     _persist_stats = _persist_executable_candidates(int(uid), str(sess_name or ''), list(eligible or []), source_kind='executable_setups', mode='email')
-                    db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='ok', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'persisted': int((_persist_stats or {}).get('persisted') or 0), 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
+                    persisted_count = int((_persist_stats or {}).get('persisted') or 0)
+                    db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='ok', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'persisted': persisted_count, 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
                 except Exception as e:
                     db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(e).__name__}: {e}', 'eligible': len(eligible or []), 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
 
-            # Authoritative source of truth for delivery: persisted executable_setups.
             try:
                 exec_rows = db_list_executable_setups(int(uid), session_name=str(sess_name or ''), ts_from=float(time.time() - 1800), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
             except Exception:
                 exec_rows = []
-            if exec_rows:
-                try:
-                    hydrated = _executable_rows_to_setup_objects(list(exec_rows or []), session_name=str(sess_name or ''))
-                except Exception:
-                    hydrated = []
-                eligible = [s for s in (hydrated or []) if s is not None]
-            else:
-                eligible = []
+            try:
+                hydrated = _executable_rows_to_setup_objects(list(exec_rows or []), session_name=str(sess_name or ''))
+            except Exception:
+                hydrated = []
+            eligible = [s for s in (hydrated or []) if s is not None]
 
             if not eligible:
                 top_reasons = dict(skip_reasons_counter.most_common(3))
-                db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='empty', session=str(sess_name or ''), mode='email', details={'eligible': 0, 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
+                db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='empty', session=str(sess_name or ''), mode='email', details={'eligible': 0, 'persisted': persisted_count, 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
                     "reasons": ["no_setups_after_filters", f"top_reasons={top_reasons}"],
@@ -31843,19 +31815,12 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 return False
 
-        live_sess = _session_label_utc(now_utc)
         owner_unlimited = int(user.get("sessions_unlimited", 0) or 0) == 1
-        try:
-            sess_ctx = in_session_now(user) or {}
-        except Exception:
-            sess_ctx = {}
-        if owner_unlimited:
-            sess = str(sess_ctx.get("name") or current_session_utc(now_utc) or "NONE").upper()
-        else:
-            # Respect the owner's enabled-session selection during overlap windows.
-            # Using current_session_utc() alone flips 13:00–17:00 UTC into NY by priority,
-            # which can silently suppress a LON-only executable lane.
-            sess = str(sess_ctx.get("name") or current_session_utc(now_utc) or "NONE").upper()
+        autotrade_allowed_sessions = [str(s).upper().strip() for s in (_autotrade_get_sessions() or []) if str(s).strip()]
+        live_sess = _current_session_for_allowed(now_utc, autotrade_allowed_sessions)
+        sess = _current_session_for_allowed(now_utc, autotrade_allowed_sessions)
+        if owner_unlimited and sess == "NONE":
+            sess = scan_session_name_utc(now_utc)
 
         if AUTOTRADE_EXEC_LOCK.locked():
             _LAST_AUTOTRADE_DECISION[uid] = {
