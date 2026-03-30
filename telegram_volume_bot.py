@@ -1415,6 +1415,30 @@ def _strategy_config_bootstrap_recommendations() -> None:
             }
             changed = True
 
+        # Cap stale live-tightened floors so a previous adaptive/governor run cannot
+        # silently keep the bot above the 1–3 setups/day target after redeploy.
+        try:
+            q_screen = float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
+            if q_screen > 68.0:
+                cfg['quality_score_min_screen'] = 68.0
+                changed = True
+        except Exception:
+            pass
+        try:
+            q_email = float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
+            if q_email > 75.0:
+                cfg['quality_score_min_email'] = 75.0
+                changed = True
+        except Exception:
+            pass
+        try:
+            rr_live = float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP)
+            if rr_live > 1.46:
+                cfg['min_rr_tp'] = 1.46
+                changed = True
+        except Exception:
+            pass
+
         if changed:
             save_strategy_config(cfg)
             apply_strategy_config(cfg)
@@ -1568,14 +1592,14 @@ ENGINE_B_MOMENTUM_ENABLED = True     # pump / expansion
 # ✅ 1H MOMENTUM INTENSITY (SESSION-DYNAMIC)
 # =========================================================
 # Base floor (still used), but we now scale it per session:
-TRIGGER_1H_ABS_MIN_BASE = 0.15        # global floor
+TRIGGER_1H_ABS_MIN_BASE = 0.12        # global floor
 CONFIRM_15M_ABS_MIN = 0.25
 ALIGN_4H_MIN = 0.0
 ALIGN_4H_NEUTRAL_ZONE = 0.35  # if |4H| < this, treat regime as neutral (avoid blocking leaders)
 
 # "EARLY" filler (email only)
 EARLY_1H_ABS_MIN = 1.8
-EARLY_CONF_PENALTY = 4
+EARLY_CONF_PENALTY = 3
 EARLY_EMAIL_EXTRA_CONF = 4
 EARLY_EMAIL_MAX_FILL = 1
 
@@ -1597,9 +1621,9 @@ TREND_24H_TOL = 0.5
 # ✅ Session-based 1H strictness:
 # ASIA = tightest, LON = medium, NY = loosest
 SESSION_1H_BASE_MULT = {
-    "NY": 0.85,
-    "LON": 1.00,
-    "ASIA": 1.20,
+    "NY": 0.78,
+    "LON": 0.92,
+    "ASIA": 1.08,
 }
 
 # =========================================================
@@ -6217,15 +6241,15 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 78,
-    "LON": 76,
-    "ASIA": 81,
+    "NY": 75,
+    "LON": 74,
+    "ASIA": 80,
 }
 
 SESSION_MIN_RR_FINAL = {
-    "NY": 1.55,
-    "LON": 1.42,
-    "ASIA": 1.62,
+    "NY": 1.46,
+    "LON": 1.36,
+    "ASIA": 1.54,
 }
 
 SESSION_MIN_RR_TP = SESSION_MIN_RR_FINAL  # legacy compatibility only
@@ -6285,9 +6309,9 @@ LEADER_BASE_SL_CAP_PCT_ASIA = env_float("LEADER_BASE_SL_CAP_PCT_ASIA", 3.0)
 
 # ✅ 1H trigger loosened per session (overall easier)
 SESSION_TRIGGER_ATR_MULT = {
-    "NY": 0.50,
-    "LON": 0.7,
-    "ASIA": 0.9,
+    "NY": 0.42,
+    "LON": 0.62,
+    "ASIA": 0.82,
 }
 
 
@@ -21196,13 +21220,13 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 82.0, 83, 1.48
+        quality, conf, rr = 80.0, 81, 1.44
     elif sess == "LON":
-        quality, conf, rr = 78.0, 80, 1.38
+        quality, conf, rr = 77.0, 79, 1.35
     elif sess == "ASIA":
-        quality, conf, rr = 84.0, 85, 1.55
+        quality, conf, rr = 83.0, 84, 1.50
     else:
-        quality, conf, rr = 80.0, 82, 1.42
+        quality, conf, rr = 79.0, 80, 1.38
 
     try:
         cfg = load_strategy_config(force=False)
@@ -21215,8 +21239,8 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
         pass
 
     quality = float(clamp(quality, 72.0, 92.0))
-    conf = int(max(76, min(95, conf)))
-    rr = float(clamp(rr, 1.32, 2.30))
+    conf = int(max(74, min(95, conf)))
+    rr = float(clamp(rr, 1.30, 2.30))
     return (quality, conf, rr)
 
 
@@ -21247,7 +21271,7 @@ def is_executable_setup_eligible(
             return (False, f"base_gate_{why}")
 
         sess_quality, sess_conf, sess_rr = _execution_session_thresholds(sess)
-        score_floor = float(max(min_quality, QUALITY_SCORE_MIN_EMAIL - 2.0, sess_quality))
+        score_floor = float(max(min_quality, QUALITY_SCORE_MIN_EMAIL - 3.0, sess_quality))
         conf_floor = int(max(min_conf, MIN_SETUP_CONF, sess_conf))
         rr_floor = float(max(min_rr_final, sess_rr))
 
@@ -21260,45 +21284,45 @@ def is_executable_setup_eligible(
 
         if engine == 'A':
             if sess == 'LON':
-                score_floor = max(79.0, score_floor)
-                conf_floor = max(81, conf_floor)
-                rr_floor = max(1.40, rr_floor)
+                score_floor = max(78.0, score_floor)
+                conf_floor = max(80, conf_floor)
+                rr_floor = max(1.36, rr_floor)
             elif sess == 'NY':
-                score_floor = max(83.0, score_floor)
-                conf_floor = max(84, conf_floor)
-                rr_floor = max(1.50, rr_floor)
+                score_floor = max(81.0, score_floor)
+                conf_floor = max(82, conf_floor)
+                rr_floor = max(1.45, rr_floor)
             else:
-                score_floor = max(85.0, score_floor)
-                conf_floor = max(86, conf_floor)
-                rr_floor = max(1.58, rr_floor)
+                score_floor = max(84.0, score_floor)
+                conf_floor = max(85, conf_floor)
+                rr_floor = max(1.52, rr_floor)
         elif engine == 'C':
             if sess == 'LON':
-                score_floor = max(82.0, score_floor + 1.5)
-                conf_floor = max(84, conf_floor + 1)
-                rr_floor = max(1.50, rr_floor + 0.06)
+                score_floor = max(81.0, score_floor + 1.25)
+                conf_floor = max(83, conf_floor + 1)
+                rr_floor = max(1.44, rr_floor + 0.05)
             elif sess == 'NY':
-                score_floor = max(84.0, score_floor + 1.5)
-                conf_floor = max(85, conf_floor + 1)
-                rr_floor = max(1.56, rr_floor + 0.08)
+                score_floor = max(83.0, score_floor + 1.5)
+                conf_floor = max(84, conf_floor + 1)
+                rr_floor = max(1.48, rr_floor + 0.06)
             else:
-                score_floor = max(87.0, score_floor + 2.0)
-                conf_floor = max(88, conf_floor + 2)
-                rr_floor = max(1.66, rr_floor + 0.10)
+                score_floor = max(86.0, score_floor + 1.75)
+                conf_floor = max(87, conf_floor + 2)
+                rr_floor = max(1.58, rr_floor + 0.08)
         elif engine == 'B':
             if not exec_engine_b_enabled:
                 return (False, 'engine_b_disabled')
             if sess == 'LON':
-                score_floor = max(84.0, score_floor + 2.5)
+                score_floor = max(84.0, score_floor + 2.0)
                 conf_floor = max(85, conf_floor + 2)
-                rr_floor = max(1.58, rr_floor + 0.10)
+                rr_floor = max(1.54, rr_floor + 0.08)
             elif sess == 'NY':
-                score_floor = max(86.0, score_floor + 3.0)
-                conf_floor = max(87, conf_floor + 3)
-                rr_floor = max(1.66, rr_floor + 0.12)
+                score_floor = max(86.0, score_floor + 2.5)
+                conf_floor = max(87, conf_floor + 2)
+                rr_floor = max(1.62, rr_floor + 0.10)
             else:
-                score_floor = max(89.0, score_floor + 3.5)
-                conf_floor = max(89, conf_floor + 3)
-                rr_floor = max(1.74, rr_floor + 0.14)
+                score_floor = max(88.0, score_floor + 3.0)
+                conf_floor = max(88, conf_floor + 3)
+                rr_floor = max(1.68, rr_floor + 0.12)
         else:
             return (False, 'engine_not_supported')
 
@@ -21336,7 +21360,7 @@ def is_executable_setup_eligible(
                 return (False, "ny_late_extension_exec")
             if ch4_abs < 0.62 or ch1_abs < 0.32:
                 return (False, "ny_context_too_weak_exec")
-            if fut_vol < max(MIN_FUT_VOL_USD, 12_000_000.0):
+            if fut_vol < max(MIN_FUT_VOL_USD, 10_500_000.0):
                 return (False, "ny_below_liquidity")
         elif sess == "LON":
             if pb_dist > 0.50:
@@ -21871,7 +21895,7 @@ def make_setup(
         atr_pct_now = (atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0
         trig_min_raw = trigger_1h_abs_min_atr_adaptive(atr_pct_now, session_name)
 
-        floor_min = 0.025 if aggressive_screen else 0.05  # further loosened: allow setups in quiet 1H candles
+        floor_min = 0.02 if aggressive_screen else 0.04  # further loosened: allow setups in quiet 1H candles
         trig_min = max(float(floor_min), float(trig_min_raw) * float(trigger_loosen_mult))
 
         if abs(ch1) < trig_min:
@@ -21892,19 +21916,19 @@ def make_setup(
 
             # Balanced breakout override: even if 1H change is small, allow true breakouts
             # Additional overrides: allow setups during quiet 1H candles if 4H/24H move is strong and 15m confirms.
-            override_4h = (abs(float(ch4_used or 0.0)) >= max(0.9, float(trig_min) * 1.6)) and (abs(float(ch15 or 0.0)) >= 0.10)
-            override_24h = (abs(float(ch24 or 0.0)) >= 10.0) and (abs(float(ch15 or 0.0)) >= 0.08)
+            override_4h = (abs(float(ch4_used or 0.0)) >= max(0.75, float(trig_min) * 1.45)) and (abs(float(ch15 or 0.0)) >= 0.08)
+            override_24h = (abs(float(ch24 or 0.0)) >= 8.0) and (abs(float(ch15 or 0.0)) >= 0.06)
             # Extra override: if 24H is very strong AND 4H aligns, don't require 15m confirmation (quiet consolidation after a big move)
-            override_24h_strong = (abs(float(ch24 or 0.0)) >= 18.0) and (abs(float(ch4_used or 0.0)) >= 0.60) and (float(fut_vol or 0.0) >= 5_000_000.0)
+            override_24h_strong = (abs(float(ch24 or 0.0)) >= 15.0) and (abs(float(ch4_used or 0.0)) >= 0.50) and (float(fut_vol or 0.0) >= 5_000_000.0)
             breakout_override = False
             # Trend override: if 4H regime move is meaningful, allow even if this 1H is quiet.
             try:
-                if abs(float(ch4_used or 0.0)) >= max(0.75, float(trig_min) * 3.0) and float(fut_vol or 0.0) >= 5_000_000.0:
+                if abs(float(ch4_used or 0.0)) >= max(0.60, float(trig_min) * 2.5) and float(fut_vol or 0.0) >= 5_000_000.0:
                     breakout_override = True
             except Exception:
                 pass
             try:
-                if c1 and len(c1) >= 25 and abs(ch24) >= 6.0:
+                if c1 and len(c1) >= 25 and abs(ch24) >= 5.0:
                     highs_1h = [float(x[2]) for x in c1]
                     lows_1h  = [float(x[3]) for x in c1]
                     closes_1h = [float(x[4]) for x in c1]
@@ -21917,7 +21941,7 @@ def make_setup(
                     vnow = float(vols_1h[-1])
                     vavg = (sum(vols_1h[-21:-1]) / 20.0) if vols_1h[-21:-1] else 0.0
 
-                    vol_mult = 1.08  # balanced default
+                    vol_mult = 1.04  # balanced default
                     if (ch24 >= 6.0) and (last_high > hh20 or last_close > hh20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
                         breakout_override = True
                     if (ch24 <= -6.0) and (last_low < ll20 or last_close < ll20) and ((vavg > 0 and vnow >= vavg * vol_mult) or (vavg <= 0 and vnow > 0)):
@@ -21931,8 +21955,8 @@ def make_setup(
                 ratio = (abs(float(ch1)) / float(trig_min)) if float(trig_min) > 0 else 0.0
             except Exception:
                 ratio = 0.0
-            soft_override = (ratio >= 0.78) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
-                abs(float(ch4_used or 0.0)) >= 0.60 or abs(float(ch24 or 0.0)) >= 14.0
+            soft_override = (ratio >= 0.70) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
+                abs(float(ch4_used or 0.0)) >= 0.50 or abs(float(ch24 or 0.0)) >= 12.0
             )
 
             if not (breakout_override or override_4h or override_24h or override_24h_strong or soft_override):
@@ -22321,7 +22345,7 @@ def make_setup(
         try:
             sess_min = int(_session_generation_conf_floor(session_name))
             if str(session_name or '').upper() == 'NY' and require_pullback:
-                sess_min = max(int(sess_min), int(_session_generation_conf_floor('NY')) + 4)
+                sess_min = max(int(sess_min), int(_session_generation_conf_floor('NY')) + 2)
             if int(conf) < int(sess_min):
                 _rej("below_min_confidence", base, mv, f"conf={int(conf)} min={int(sess_min)} sess={session_name}")
                 return None
@@ -22372,7 +22396,7 @@ def make_setup(
             rr_final = rr_to_tp(entry, sl, tp_target)
             sess_rr_min = float(_session_generation_rr_floor(session_name))
             if str(session_name or '').upper() == 'NY' and require_pullback:
-                sess_rr_min = max(float(sess_rr_min), float(_session_generation_rr_floor('NY')) + 0.10)
+                sess_rr_min = max(float(sess_rr_min), float(_session_generation_rr_floor('NY')) + 0.05)
             if float(rr_final) < float(sess_rr_min):
                 _rej("below_min_rr_tp_session", base, mv, f"rr_final={rr_final:.2f} min={sess_rr_min:.2f} sess={session_name}")
                 return None
