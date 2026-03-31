@@ -1183,6 +1183,7 @@ def _strategy_config_defaults() -> dict:
         ],
         "execution_engines_allowed": ["A", "B", "C"],
         "goal_profile_active_profile": "BASELINE",
+        "goal_profile_schema_version": 3,
         "goal_profile_last_run_ts": 0.0,
         "goal_profile_allow_ny": False,
         "goal_profile_allow_asia": False,
@@ -1541,6 +1542,35 @@ def _strategy_config_bootstrap_recommendations() -> None:
                 changed = True
         except Exception:
             pass
+
+        try:
+            gp_ver = int(float(cfg.get('goal_profile_schema_version', 0) or 0))
+        except Exception:
+            gp_ver = 0
+        if gp_ver < 3:
+            cfg['goal_profile_schema_version'] = 3
+            cfg['goal_profile_candidate_profiles'] = [
+                {"name": "LON_A_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+                {"name": "LON_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+                {"name": "LON_A_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+            ]
+            cfg['goal_profile_candidate_bundles'] = [
+                {"name": "strict", "quality_score_min_screen": 64.0, "quality_score_min_email": 72.0, "tf_align_1h_min_abs": 0.65, "tf_align_4h_min_abs": 0.60, "atr_min_pct": 1.00, "min_rr_tp": 1.45, "regime_slope_trend_min_pct": 0.060, "lon_quality_add": 1.0, "lon_conf_add": 1, "lon_rr_add": 0.04, "engine_c_base_score_add": 0.0, "engine_c_exec_quality_add": 0.0, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.10, "engine_c_exec_ch1_cap_lon": 1.20, "engine_c_exec_pb_dist_lon": 0.68},
+                {"name": "balanced", "quality_score_min_screen": 62.0, "quality_score_min_email": 70.0, "tf_align_1h_min_abs": 0.55, "tf_align_4h_min_abs": 0.50, "atr_min_pct": 0.95, "min_rr_tp": 1.40, "regime_slope_trend_min_pct": 0.055, "lon_quality_add": 0.0, "lon_conf_add": 0, "lon_rr_add": 0.00, "engine_c_base_score_add": 0.0, "engine_c_exec_quality_add": 0.0, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.08, "engine_c_exec_ch1_cap_lon": 1.22, "engine_c_exec_pb_dist_lon": 0.70},
+                {"name": "flex", "quality_score_min_screen": 60.0, "quality_score_min_email": 68.0, "tf_align_1h_min_abs": 0.45, "tf_align_4h_min_abs": 0.45, "atr_min_pct": 0.85, "min_rr_tp": 1.35, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -1.0, "lon_conf_add": -1, "lon_rr_add": -0.04, "engine_c_base_score_add": -0.5, "engine_c_exec_quality_add": -0.5, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": -0.02, "engine_c_exec_liq_mult": 1.05, "engine_c_exec_ch1_cap_lon": 1.24, "engine_c_exec_pb_dist_lon": 0.72},
+                {"name": "c_breakout_focus", "quality_score_min_screen": 58.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.40, "tf_align_4h_min_abs": 0.40, "atr_min_pct": 0.78, "min_rr_tp": 1.30, "regime_slope_trend_min_pct": 0.046, "lon_quality_add": -1.5, "lon_conf_add": -1, "lon_rr_add": -0.04, "engine_c_base_score_add": -2.0, "engine_c_exec_quality_add": -2.0, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.04, "engine_c_exec_liq_mult": 1.00, "engine_c_exec_ch1_cap_lon": 1.34, "engine_c_exec_pb_dist_lon": 0.78},
+            ]
+            cfg['goal_profile_shortlist'] = 2
+            cfg['goal_profile_max_run_minutes'] = 14.0
+            sessions = [str(x).upper().strip() for x in (cfg.get('execution_sessions_allowed') or []) if str(x).strip()]
+            engines = [str(x).upper().strip() for x in (cfg.get('execution_engines_allowed') or []) if str(x).strip()]
+            if sessions == ['LON'] and engines == ['A']:
+                cfg['goal_profile_active_profile'] = 'LON_A_ONLY'
+            elif sessions == ['LON'] and engines == ['C']:
+                cfg['goal_profile_active_profile'] = 'LON_C_ONLY'
+            elif sessions == ['LON'] and set(engines) == {'A', 'C'}:
+                cfg['goal_profile_active_profile'] = 'LON_A_C_ONLY'
+            changed = True
 
         if changed:
             save_strategy_config(cfg)
@@ -21184,8 +21214,8 @@ def _goal_profile_targets(cfg: dict | None = None) -> dict:
         'allow_ny': _cfg_bool((cfg or {}).get('goal_profile_allow_ny', False), False),
         'allow_asia': _cfg_bool((cfg or {}).get('goal_profile_allow_asia', False), False),
         'allow_engine_b': _cfg_bool((cfg or {}).get('goal_profile_allow_engine_b', False), False),
-        'shortlist': int((cfg or {}).get('goal_profile_shortlist', 4) or 4),
-        'max_run_minutes': float((cfg or {}).get('goal_profile_max_run_minutes', 18.0) or 18.0),
+        'shortlist': int((cfg or {}).get('goal_profile_shortlist', 2) or 2),
+        'max_run_minutes': float((cfg or {}).get('goal_profile_max_run_minutes', 14.0) or 14.0),
     }
 
 
@@ -21268,6 +21298,23 @@ def _goal_profile_candidate_bundles(cfg: dict | None = None) -> list[dict]:
         {'name': 'c_breakout_focus', 'quality_score_min_screen': 58.0, 'quality_score_min_email': 66.0, 'tf_align_1h_min_abs': 0.40, 'tf_align_4h_min_abs': 0.40, 'atr_min_pct': 0.78, 'min_rr_tp': 1.30, 'regime_slope_trend_min_pct': 0.046, 'lon_quality_add': -1.5, 'lon_conf_add': -1, 'lon_rr_add': -0.04, 'engine_c_base_score_add': -2.0, 'engine_c_exec_quality_add': -2.0, 'engine_c_exec_conf_add': -1, 'engine_c_exec_rr_add': -0.04, 'engine_c_exec_liq_mult': 1.00, 'engine_c_exec_ch1_cap_lon': 1.34, 'engine_c_exec_pb_dist_lon': 0.78},
     ]
 
+
+
+
+def _goal_profile_profile_bundles(profile_name: str, bundles: list[dict]) -> list[dict]:
+    name = str(profile_name or '').upper().strip()
+    if not bundles:
+        return []
+    by_name = {str((b or {}).get('name') or '').strip(): dict(b or {}) for b in (bundles or [])}
+    preferred = {
+        'LON_A_ONLY': ['strict', 'balanced', 'flex'],
+        'LON_C_ONLY': ['balanced', 'c_breakout_focus'],
+        'LON_A_C_ONLY': ['balanced', 'flex'],
+    }.get(name, [])
+    out = [by_name[n] for n in preferred if n in by_name]
+    if out:
+        return out
+    return list(bundles or [])
 
 def _goal_profile_apply_candidate(base_cfg: dict, profile: dict, bundle: dict) -> dict:
     cfg = json.loads(json.dumps(base_cfg or {}))
@@ -21497,11 +21544,12 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
         stage2_rows = []
         profiles = _goal_profile_candidate_profiles(base_cfg)
         bundles = _goal_profile_candidate_bundles(base_cfg)
-        candidate_total = max(0, len(profiles) * len(bundles))
+        bundle_plan = {str((p or {}).get('name') or ''): _goal_profile_profile_bundles(str((p or {}).get('name') or ''), bundles) for p in profiles}
+        candidate_total = max(0, sum(len(bundle_plan.get(str((p or {}).get('name') or ''), [])) for p in profiles))
         cand_counter = 0
 
         for profile in profiles:
-            for bundle in bundles:
+            for bundle in (bundle_plan.get(str((profile or {}).get('name') or ''), []) or []):
                 cand_counter += 1
                 if stop_event.is_set():
                     raise TimeoutError('goal_profile_aborted')
@@ -21663,9 +21711,10 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
         except Exception:
             pass
         final_eval = dict(partial_best_eval) if (promote_partial and isinstance(partial_best_eval, dict)) else (dict(baseline_eval) if isinstance(locals().get('baseline_eval'), dict) else {})
+        final_status = 'TIMEOUT_PROMOTED' if promote_partial else ('TIMEOUT_NO_BETTER_PROFILE' if timed_out and baseline_score >= best_score else status)
         err_report = {
             'ok': False,
-            'status': ('TIMEOUT_PROMOTED' if promote_partial else status),
+            'status': final_status,
             'ts': float(time.time()),
             'started_ts': started_ts,
             'finished_ts': float(time.time()),
