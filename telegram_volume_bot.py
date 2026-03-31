@@ -21216,6 +21216,7 @@ def _goal_profile_candidate_bundles(cfg: dict | None = None) -> list[dict]:
         {'name': 'rr_bias', 'quality_score_min_screen': 61.0, 'quality_score_min_email': 69.0, 'tf_align_1h_min_abs': 0.50, 'tf_align_4h_min_abs': 0.45, 'atr_min_pct': 0.90, 'min_rr_tp': 1.50, 'regime_slope_trend_min_pct': 0.050, 'lon_quality_add': -1.0, 'lon_conf_add': 0, 'lon_rr_add': 0.08},
         {'name': 'lon_mid_push', 'quality_score_min_screen': 59.0, 'quality_score_min_email': 67.0, 'tf_align_1h_min_abs': 0.42, 'tf_align_4h_min_abs': 0.42, 'atr_min_pct': 0.80, 'min_rr_tp': 1.32, 'regime_slope_trend_min_pct': 0.048, 'lon_quality_add': -2.0, 'lon_conf_add': -1, 'lon_rr_add': -0.05},
         {'name': 'lon_freq_push', 'quality_score_min_screen': 58.0, 'quality_score_min_email': 66.0, 'tf_align_1h_min_abs': 0.40, 'tf_align_4h_min_abs': 0.40, 'atr_min_pct': 0.75, 'min_rr_tp': 1.30, 'regime_slope_trend_min_pct': 0.046, 'lon_quality_add': -2.5, 'lon_conf_add': -1, 'lon_rr_add': -0.06},
+        {'name': 'lon_reach', 'quality_score_min_screen': 57.0, 'quality_score_min_email': 64.0, 'tf_align_1h_min_abs': 0.38, 'tf_align_4h_min_abs': 0.38, 'atr_min_pct': 0.72, 'min_rr_tp': 1.28, 'regime_slope_trend_min_pct': 0.044, 'lon_quality_add': -3.0, 'lon_conf_add': -1, 'lon_rr_add': -0.08},
     ]
 
 
@@ -21299,7 +21300,7 @@ def _goal_profile_score_candidate(rep30: dict, rep7: dict, cfg: dict) -> dict:
     sample_pen = max(0, tgt['min_live_30d'] - n30) * 7.0 + max(0, tgt['min_live_7d'] - n7) * 4.5
     instability_pen = abs(wr30 - wr7) * (0.10 if (n30 > 0 and n7 > 0) else 0.0)
     zero_pen = 350.0 if n30 <= 0 else 0.0
-    score = (wr30 * 2.2) + (wr7 * 0.7) + (ar30 * 55.0) + (ar7 * 15.0) - freq_pen - wr_pen - avg_r_pen - sample_pen - instability_pen - zero_pen
+    score = (wr30 * 2.2) + (wr7 * 0.7) + (ar30 * 55.0) + (ar7 * 15.0) + (sdp30 * 8.0) + (sdp7 * 2.0) - freq_pen - wr_pen - avg_r_pen - sample_pen - instability_pen - zero_pen
     feasible = bool(n30 >= tgt['min_live_30d'] and n7 >= tgt['min_live_7d'] and wr30 >= tgt['target_wr'] and ar30 >= tgt['target_avg_r'] and sdp30 >= (tgt['target_lo'] * 0.70) and sdp30 <= (tgt['target_hi'] * 1.25))
     return {
         'score': float(score),
@@ -21320,16 +21321,61 @@ def _goal_profile_score_candidate(rep30: dict, rep7: dict, cfg: dict) -> dict:
 def _run_goal_profile_cycle(force: bool = False) -> dict:
     cfg0 = load_strategy_config(force=True)
     tgt = _goal_profile_targets(cfg0)
+    now_ts = float(time.time())
+    current_profile = str((cfg0 or {}).get('goal_profile_active_profile') or 'BASELINE')
+    current_sessions = list((cfg0 or {}).get('execution_sessions_allowed') or [])
+    current_engines = list((cfg0 or {}).get('execution_engines_allowed') or [])
     if not tgt['enabled']:
-        rep = {'ok': False, 'status': 'DISABLED', 'ts': float(time.time()), 'targets': tgt}
+        rep = {
+            'ok': False,
+            'status': 'DISABLED',
+            'ts': now_ts,
+            'started_ts': now_ts,
+            'targets': tgt,
+            'current': {
+                'goal_profile_active_profile': current_profile,
+                'execution_sessions_allowed': current_sessions,
+                'execution_engines_allowed': current_engines,
+            },
+        }
         save_goal_profile_report(rep)
         return rep
     if not _GOAL_PROFILE_LOCK.acquire(blocking=False):
-        return {'ok': False, 'status': 'BUSY', 'ts': float(time.time()), 'targets': tgt}
+        return {
+            'ok': False,
+            'status': 'BUSY',
+            'ts': now_ts,
+            'started_ts': now_ts,
+            'targets': tgt,
+            'current': {
+                'goal_profile_active_profile': current_profile,
+                'execution_sessions_allowed': current_sessions,
+                'execution_engines_allowed': current_engines,
+            },
+        }
+    started_ts = float(time.time())
     try:
-        last = load_goal_profile_report() or {}
-        if (not force) and float(last.get('applied_ts', 0.0) or 0.0) > 0 and (time.time() - float(last.get('applied_ts', 0.0) or 0.0)) < (tgt['cooldown_hours'] * 3600.0):
-            return {'ok': False, 'status': 'COOLDOWN', 'ts': float(time.time()), 'targets': tgt, 'last': last}
+        save_goal_profile_report({
+            'ok': True,
+            'status': 'RUNNING',
+            'ts': started_ts,
+            'started_ts': started_ts,
+            'targets': tgt,
+            'current': {
+                'goal_profile_active_profile': current_profile,
+                'execution_sessions_allowed': current_sessions,
+                'execution_engines_allowed': current_engines,
+            },
+        })
+
+        # Cooldown uses the last finalized report, not the RUNNING marker we just saved.
+        last_final = load_goal_profile_report() or {}
+        if str(last_final.get('status') or '').upper() == 'RUNNING':
+            last_final = {}
+        if (not force) and float(last_final.get('applied_ts', 0.0) or 0.0) > 0 and (time.time() - float(last_final.get('applied_ts', 0.0) or 0.0)) < (tgt['cooldown_hours'] * 3600.0):
+            rep = {'ok': False, 'status': 'COOLDOWN', 'ts': float(time.time()), 'started_ts': started_ts, 'targets': tgt, 'last': last_final}
+            save_goal_profile_report(rep)
+            return rep
 
         base_cfg = json.loads(json.dumps(cfg0 or {}))
         exec_tf = str((base_cfg or {}).get('universe_backtest_exec_tf') or (base_cfg or {}).get('exec_tf_default') or '15m').strip().lower()
@@ -21391,7 +21437,9 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
             'ok': True,
             'status': 'PROMOTED' if promoted else 'NO_BETTER_PROFILE',
             'ts': float(time.time()),
-            'applied_ts': float(time.time()) if promoted else float((last or {}).get('applied_ts', 0.0) or 0.0),
+            'started_ts': started_ts,
+            'finished_ts': float(time.time()),
+            'applied_ts': float(time.time()) if promoted else float((last_final or {}).get('applied_ts', 0.0) or 0.0),
             'targets': tgt,
             'baseline': {'score': float(baseline_eval.get('score', -1e9)), 'metrics_30d': baseline_eval.get('metrics_30d') or {}, 'metrics_7d': baseline_eval.get('metrics_7d') or {}},
             'best_candidate': {'profile': str(best_profile.get('name') or ''), 'bundle': str(best_bundle.get('name') or ''), 'score': float(best_eval.get('score', -1e9)), 'feasible': bool(best_eval.get('feasible')), 'metrics_30d': best_eval.get('metrics_30d') or {}, 'metrics_7d': best_eval.get('metrics_7d') or {}, 'execution_sessions_allowed': list(best_cfg.get('execution_sessions_allowed') or []), 'execution_engines_allowed': list(best_cfg.get('execution_engines_allowed') or [])},
@@ -21400,9 +21448,29 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
         }
         save_goal_profile_report(report)
         return report
+    except Exception as e:
+        try:
+            err_cfg = load_strategy_config(force=True)
+        except Exception:
+            err_cfg = cfg0 or {}
+        err_report = {
+            'ok': False,
+            'status': 'ERROR',
+            'ts': float(time.time()),
+            'started_ts': started_ts,
+            'finished_ts': float(time.time()),
+            'targets': tgt,
+            'error': f'{type(e).__name__}: {e}',
+            'current': {
+                'goal_profile_active_profile': str((err_cfg or {}).get('goal_profile_active_profile') or current_profile),
+                'execution_sessions_allowed': list((err_cfg or {}).get('execution_sessions_allowed') or current_sessions),
+                'execution_engines_allowed': list((err_cfg or {}).get('execution_engines_allowed') or current_engines),
+            },
+        }
+        save_goal_profile_report(err_report)
+        return err_report
     finally:
         _GOAL_PROFILE_LOCK.release()
-
 
 async def goal_profile_run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
@@ -21415,12 +21483,18 @@ async def goal_profile_run_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         force = False
     await update.message.reply_text('⏳ Running goal-profile optimizer now…')
-    rep = await to_thread_heavy(_run_goal_profile_cycle, force)
+    try:
+        rep = await to_thread_heavy(_run_goal_profile_cycle, force)
+    except Exception as e:
+        await update.message.reply_text(f'Goal-profile optimizer failed: {type(e).__name__}: {e}')
+        return
     if not isinstance(rep, dict):
         await update.message.reply_text('Goal-profile optimizer returned no report.')
         return
     if not rep.get('ok'):
-        await update.message.reply_text(f"Goal-profile optimizer status: {str(rep.get('status') or 'UNKNOWN')}")
+        status = str(rep.get('status') or 'UNKNOWN')
+        extra = str(rep.get('error') or '').strip()
+        await update.message.reply_text(f"Goal-profile optimizer status: {status}{(' | ' + extra) if extra else ''}")
         return
     final = rep.get('final') or {}
     m30 = final.get('metrics_30d') or {}
@@ -21439,8 +21513,10 @@ async def goal_profile_run_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         for row in top:
             m30c = row.get('metrics_30d') or {}
             lines.append(f"• {row.get('profile')}/{row.get('bundle')} | score={float(row.get('score',0.0) or 0.0):.2f} | 30d {float(m30c.get('setups_per_day',0.0) or 0.0):.2f}/day @ WR {float(m30c.get('win_rate',0.0) or 0.0):.1f}%")
-    await send_long_message(update, '\n'.join(lines), parse_mode=None)
-
+    try:
+        await send_long_message(update, '\n'.join(lines), parse_mode=None)
+    except Exception:
+        await update.message.reply_text('\n'.join(lines))
 
 async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
@@ -21450,22 +21526,33 @@ async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_
     tgt = _goal_profile_targets(cfg)
     rep = load_goal_profile_report() or {}
     final = rep.get('final') or {}
+    current = rep.get('current') or {}
     m30 = final.get('metrics_30d') or {}
     m7 = final.get('metrics_7d') or {}
+    current_profile = str(cfg.get('goal_profile_active_profile') or current.get('goal_profile_active_profile') or 'BASELINE')
+    current_sessions = ','.join(cfg.get('execution_sessions_allowed') or current.get('execution_sessions_allowed') or []) or '-'
+    current_engines = ','.join(cfg.get('execution_engines_allowed') or current.get('execution_engines_allowed') or []) or '-'
     lines = [
         '🎯 Goal Profile Status',
         HDR,
         f"Enabled: {'ON' if tgt['enabled'] else 'OFF'} | Interval: {float(tgt['interval_hours']):.1f}h | Cooldown: {float(tgt['cooldown_hours']):.1f}h",
         f"Target: {float(tgt['target_lo']):.2f}–{float(tgt['target_hi']):.2f} setups/day | WR≥{float(tgt['target_wr']):.1f}% | AvgR≥{float(tgt['target_avg_r']):.2f}",
         f"Minimum live sample: 30d≥{int(tgt['min_live_30d'])} | 7d≥{int(tgt['min_live_7d'])}",
-        f"Current execution profile: {str(cfg.get('goal_profile_active_profile') or 'BASELINE')} | sessions={','.join(cfg.get('execution_sessions_allowed') or []) or '-'} | engines={','.join(cfg.get('execution_engines_allowed') or []) or '-'}",
+        f"Current execution profile: {current_profile} | sessions={current_sessions} | engines={current_engines}",
     ]
     if rep:
-        lines.append(f"Last run status: {rep.get('status','')} | ts={_fmt_dt_local(datetime.fromtimestamp(float(rep.get('ts',0.0) or 0.0), tz=timezone.utc)) if float(rep.get('ts',0.0) or 0.0) > 0 else '—'}")
-        lines.append(f"30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}")
-        lines.append(f"7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}")
+        ts_val = float(rep.get('ts', 0.0) or 0.0)
+        lines.append(f"Last run status: {rep.get('status','')} | ts={_fmt_dt_local(datetime.fromtimestamp(ts_val, tz=timezone.utc)) if ts_val > 0 else '—'}")
+        if str(rep.get('status') or '').upper() == 'RUNNING':
+            started_ts = float(rep.get('started_ts', 0.0) or 0.0)
+            if started_ts > 0:
+                lines.append(f"Started: {_fmt_dt_local(datetime.fromtimestamp(started_ts, tz=timezone.utc))}")
+        elif final:
+            lines.append(f"30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}")
+            lines.append(f"7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}")
+        if rep.get('error'):
+            lines.append(f"Error: {rep.get('error')}")
     await send_long_message(update, '\n'.join(lines), parse_mode=None)
-
 
 async def goal_profile_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
