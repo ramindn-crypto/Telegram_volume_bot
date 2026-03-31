@@ -1171,17 +1171,18 @@ def _strategy_config_defaults() -> dict:
         "goal_profile_min_live_setups_30d": 8,
         "goal_profile_min_live_setups_7d": 2,
         "goal_profile_candidate_bundles": [
-            {"name": "strict", "quality_score_min_screen": 64.0, "quality_score_min_email": 72.0, "tf_align_1h_min_abs": 0.65, "tf_align_4h_min_abs": 0.60, "atr_min_pct": 1.00, "min_rr_tp": 1.45, "regime_slope_trend_min_pct": 0.060, "lon_quality_add": 1.0, "lon_conf_add": 1, "lon_rr_add": 0.04},
-            {"name": "balanced", "quality_score_min_screen": 62.0, "quality_score_min_email": 70.0, "tf_align_1h_min_abs": 0.55, "tf_align_4h_min_abs": 0.50, "atr_min_pct": 0.95, "min_rr_tp": 1.40, "regime_slope_trend_min_pct": 0.055, "lon_quality_add": 0.0, "lon_conf_add": 0, "lon_rr_add": 0.00},
-            {"name": "flex", "quality_score_min_screen": 60.0, "quality_score_min_email": 68.0, "tf_align_1h_min_abs": 0.45, "tf_align_4h_min_abs": 0.45, "atr_min_pct": 0.85, "min_rr_tp": 1.35, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -1.0, "lon_conf_add": -1, "lon_rr_add": -0.04},
-            {"name": "rr_bias", "quality_score_min_screen": 61.0, "quality_score_min_email": 69.0, "tf_align_1h_min_abs": 0.50, "tf_align_4h_min_abs": 0.45, "atr_min_pct": 0.90, "min_rr_tp": 1.50, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -1.0, "lon_conf_add": 0, "lon_rr_add": 0.08},
-            {"name": "lon_relaxed", "quality_score_min_screen": 59.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.42, "tf_align_4h_min_abs": 0.42, "atr_min_pct": 0.80, "min_rr_tp": 1.32, "regime_slope_trend_min_pct": 0.048, "lon_quality_add": -1.5, "lon_conf_add": -1, "lon_rr_add": -0.05},
+            {"name": "strict", "quality_score_min_screen": 64.0, "quality_score_min_email": 72.0, "tf_align_1h_min_abs": 0.65, "tf_align_4h_min_abs": 0.60, "atr_min_pct": 1.00, "min_rr_tp": 1.45, "regime_slope_trend_min_pct": 0.060, "lon_quality_add": 1.0, "lon_conf_add": 1, "lon_rr_add": 0.04, "engine_c_base_score_add": 0.0, "engine_c_exec_quality_add": 0.0, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.10, "engine_c_exec_ch1_cap_lon": 1.20, "engine_c_exec_pb_dist_lon": 0.68},
+            {"name": "balanced", "quality_score_min_screen": 62.0, "quality_score_min_email": 70.0, "tf_align_1h_min_abs": 0.55, "tf_align_4h_min_abs": 0.50, "atr_min_pct": 0.95, "min_rr_tp": 1.40, "regime_slope_trend_min_pct": 0.055, "lon_quality_add": 0.0, "lon_conf_add": 0, "lon_rr_add": 0.00, "engine_c_base_score_add": 0.0, "engine_c_exec_quality_add": 0.0, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.08, "engine_c_exec_ch1_cap_lon": 1.22, "engine_c_exec_pb_dist_lon": 0.70},
+            {"name": "flex", "quality_score_min_screen": 60.0, "quality_score_min_email": 68.0, "tf_align_1h_min_abs": 0.45, "tf_align_4h_min_abs": 0.45, "atr_min_pct": 0.85, "min_rr_tp": 1.35, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -1.0, "lon_conf_add": -1, "lon_rr_add": -0.04, "engine_c_base_score_add": -0.5, "engine_c_exec_quality_add": -0.5, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": -0.02, "engine_c_exec_liq_mult": 1.05, "engine_c_exec_ch1_cap_lon": 1.24, "engine_c_exec_pb_dist_lon": 0.72},
+            {"name": "rr_bias", "quality_score_min_screen": 61.0, "quality_score_min_email": 69.0, "tf_align_1h_min_abs": 0.50, "tf_align_4h_min_abs": 0.45, "atr_min_pct": 0.90, "min_rr_tp": 1.50, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -1.0, "lon_conf_add": 0, "lon_rr_add": 0.08, "engine_c_base_score_add": -0.5, "engine_c_exec_quality_add": -0.5, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.05, "engine_c_exec_ch1_cap_lon": 1.24, "engine_c_exec_pb_dist_lon": 0.72},
+            {"name": "lon_mid_push", "quality_score_min_screen": 59.0, "quality_score_min_email": 67.0, "tf_align_1h_min_abs": 0.42, "tf_align_4h_min_abs": 0.42, "atr_min_pct": 0.80, "min_rr_tp": 1.32, "regime_slope_trend_min_pct": 0.048, "lon_quality_add": -2.0, "lon_conf_add": -1, "lon_rr_add": -0.05, "engine_c_base_score_add": -1.0, "engine_c_exec_quality_add": -1.0, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.03, "engine_c_exec_liq_mult": 1.02, "engine_c_exec_ch1_cap_lon": 1.28, "engine_c_exec_pb_dist_lon": 0.74},
+            {"name": "c_breakout_focus", "quality_score_min_screen": 58.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.40, "tf_align_4h_min_abs": 0.40, "atr_min_pct": 0.78, "min_rr_tp": 1.30, "regime_slope_trend_min_pct": 0.046, "lon_quality_add": -1.5, "lon_conf_add": -1, "lon_rr_add": -0.04, "engine_c_base_score_add": -2.0, "engine_c_exec_quality_add": -2.0, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.04, "engine_c_exec_liq_mult": 1.00, "engine_c_exec_ch1_cap_lon": 1.34, "engine_c_exec_pb_dist_lon": 0.78},
         ],
         "goal_profile_candidate_profiles": [
             {"name": "LON_A_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+            {"name": "LON_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
             {"name": "LON_A_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
-            {"name": "LON_A_C_BALANCED", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
-            {"name": "LON_NY_A_ONLY", "execution_sessions_allowed": ["LON", "NY"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+            {"name": "LON_A_C_SCOUT", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
         ],
         "execution_engines_allowed": ["A", "B", "C"],
         "goal_profile_active_profile": "BASELINE",
@@ -1191,6 +1192,13 @@ def _strategy_config_defaults() -> dict:
         "goal_profile_allow_engine_b": False,
         "goal_profile_shortlist": 4,
         "goal_profile_max_run_minutes": 18.0,
+        "engine_c_base_score_add": 0.0,
+        "engine_c_exec_quality_add": 0.0,
+        "engine_c_exec_conf_add": 0,
+        "engine_c_exec_rr_add": 0.0,
+        "engine_c_exec_liq_mult": 1.10,
+        "engine_c_exec_ch1_cap_lon": 1.20,
+        "engine_c_exec_pb_dist_lon": 0.68,
 
         # Daily market-adaptive universe optimizer (runtime params only; no source rewriting)
         "market_adaptive_enabled": True,
@@ -21216,6 +21224,7 @@ def _goal_profile_candidate_profiles(cfg: dict | None = None) -> list[dict]:
         return out
     fallback = [
         {'name': 'LON_A_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
+        {'name': 'LON_C_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['C'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
         {'name': 'LON_A_C_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A', 'C'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
         {'name': 'LON_A_C_SCOUT', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A', 'C'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
     ]
@@ -21242,19 +21251,25 @@ def _goal_profile_candidate_bundles(cfg: dict | None = None) -> list[dict]:
                 'lon_quality_add': float((item or {}).get('lon_quality_add', 0.0) or 0.0),
                 'lon_conf_add': int(round(float((item or {}).get('lon_conf_add', 0) or 0))),
                 'lon_rr_add': float((item or {}).get('lon_rr_add', 0.0) or 0.0),
+                'engine_c_base_score_add': float((item or {}).get('engine_c_base_score_add', (cfg or {}).get('engine_c_base_score_add', 0.0)) or 0.0),
+                'engine_c_exec_quality_add': float((item or {}).get('engine_c_exec_quality_add', (cfg or {}).get('engine_c_exec_quality_add', 0.0)) or 0.0),
+                'engine_c_exec_conf_add': int(round(float((item or {}).get('engine_c_exec_conf_add', (cfg or {}).get('engine_c_exec_conf_add', 0)) or 0))),
+                'engine_c_exec_rr_add': float((item or {}).get('engine_c_exec_rr_add', (cfg or {}).get('engine_c_exec_rr_add', 0.0)) or 0.0),
+                'engine_c_exec_liq_mult': float((item or {}).get('engine_c_exec_liq_mult', (cfg or {}).get('engine_c_exec_liq_mult', 1.10)) or 1.10),
+                'engine_c_exec_ch1_cap_lon': float((item or {}).get('engine_c_exec_ch1_cap_lon', (cfg or {}).get('engine_c_exec_ch1_cap_lon', 1.20)) or 1.20),
+                'engine_c_exec_pb_dist_lon': float((item or {}).get('engine_c_exec_pb_dist_lon', (cfg or {}).get('engine_c_exec_pb_dist_lon', 0.68)) or 0.68),
             })
         except Exception:
             continue
     if out:
         return out
     return [
-        {'name': 'strict', 'quality_score_min_screen': 64.0, 'quality_score_min_email': 72.0, 'tf_align_1h_min_abs': 0.65, 'tf_align_4h_min_abs': 0.60, 'atr_min_pct': 1.00, 'min_rr_tp': 1.45, 'regime_slope_trend_min_pct': 0.060, 'lon_quality_add': 1.0, 'lon_conf_add': 1, 'lon_rr_add': 0.04},
-        {'name': 'balanced', 'quality_score_min_screen': 62.0, 'quality_score_min_email': 70.0, 'tf_align_1h_min_abs': 0.55, 'tf_align_4h_min_abs': 0.50, 'atr_min_pct': 0.95, 'min_rr_tp': 1.40, 'regime_slope_trend_min_pct': 0.055, 'lon_quality_add': 0.0, 'lon_conf_add': 0, 'lon_rr_add': 0.00},
-        {'name': 'flex', 'quality_score_min_screen': 60.0, 'quality_score_min_email': 68.0, 'tf_align_1h_min_abs': 0.45, 'tf_align_4h_min_abs': 0.45, 'atr_min_pct': 0.85, 'min_rr_tp': 1.35, 'regime_slope_trend_min_pct': 0.050, 'lon_quality_add': -1.0, 'lon_conf_add': -1, 'lon_rr_add': -0.04},
-        {'name': 'rr_bias', 'quality_score_min_screen': 61.0, 'quality_score_min_email': 69.0, 'tf_align_1h_min_abs': 0.50, 'tf_align_4h_min_abs': 0.45, 'atr_min_pct': 0.90, 'min_rr_tp': 1.50, 'regime_slope_trend_min_pct': 0.050, 'lon_quality_add': -1.0, 'lon_conf_add': 0, 'lon_rr_add': 0.08},
-        {'name': 'lon_mid_push', 'quality_score_min_screen': 59.0, 'quality_score_min_email': 67.0, 'tf_align_1h_min_abs': 0.42, 'tf_align_4h_min_abs': 0.42, 'atr_min_pct': 0.80, 'min_rr_tp': 1.32, 'regime_slope_trend_min_pct': 0.048, 'lon_quality_add': -2.0, 'lon_conf_add': -1, 'lon_rr_add': -0.05},
-        {'name': 'lon_freq_push', 'quality_score_min_screen': 58.0, 'quality_score_min_email': 66.0, 'tf_align_1h_min_abs': 0.40, 'tf_align_4h_min_abs': 0.40, 'atr_min_pct': 0.75, 'min_rr_tp': 1.30, 'regime_slope_trend_min_pct': 0.046, 'lon_quality_add': -2.5, 'lon_conf_add': -1, 'lon_rr_add': -0.06},
-        {'name': 'lon_reach', 'quality_score_min_screen': 57.0, 'quality_score_min_email': 64.0, 'tf_align_1h_min_abs': 0.38, 'tf_align_4h_min_abs': 0.38, 'atr_min_pct': 0.72, 'min_rr_tp': 1.28, 'regime_slope_trend_min_pct': 0.044, 'lon_quality_add': -3.0, 'lon_conf_add': -1, 'lon_rr_add': -0.08},
+        {'name': 'strict', 'quality_score_min_screen': 64.0, 'quality_score_min_email': 72.0, 'tf_align_1h_min_abs': 0.65, 'tf_align_4h_min_abs': 0.60, 'atr_min_pct': 1.00, 'min_rr_tp': 1.45, 'regime_slope_trend_min_pct': 0.060, 'lon_quality_add': 1.0, 'lon_conf_add': 1, 'lon_rr_add': 0.04, 'engine_c_base_score_add': 0.0, 'engine_c_exec_quality_add': 0.0, 'engine_c_exec_conf_add': 0, 'engine_c_exec_rr_add': 0.00, 'engine_c_exec_liq_mult': 1.10, 'engine_c_exec_ch1_cap_lon': 1.20, 'engine_c_exec_pb_dist_lon': 0.68},
+        {'name': 'balanced', 'quality_score_min_screen': 62.0, 'quality_score_min_email': 70.0, 'tf_align_1h_min_abs': 0.55, 'tf_align_4h_min_abs': 0.50, 'atr_min_pct': 0.95, 'min_rr_tp': 1.40, 'regime_slope_trend_min_pct': 0.055, 'lon_quality_add': 0.0, 'lon_conf_add': 0, 'lon_rr_add': 0.00, 'engine_c_base_score_add': 0.0, 'engine_c_exec_quality_add': 0.0, 'engine_c_exec_conf_add': 0, 'engine_c_exec_rr_add': 0.00, 'engine_c_exec_liq_mult': 1.08, 'engine_c_exec_ch1_cap_lon': 1.22, 'engine_c_exec_pb_dist_lon': 0.70},
+        {'name': 'flex', 'quality_score_min_screen': 60.0, 'quality_score_min_email': 68.0, 'tf_align_1h_min_abs': 0.45, 'tf_align_4h_min_abs': 0.45, 'atr_min_pct': 0.85, 'min_rr_tp': 1.35, 'regime_slope_trend_min_pct': 0.050, 'lon_quality_add': -1.0, 'lon_conf_add': -1, 'lon_rr_add': -0.04, 'engine_c_base_score_add': -0.5, 'engine_c_exec_quality_add': -0.5, 'engine_c_exec_conf_add': 0, 'engine_c_exec_rr_add': -0.02, 'engine_c_exec_liq_mult': 1.05, 'engine_c_exec_ch1_cap_lon': 1.24, 'engine_c_exec_pb_dist_lon': 0.72},
+        {'name': 'rr_bias', 'quality_score_min_screen': 61.0, 'quality_score_min_email': 69.0, 'tf_align_1h_min_abs': 0.50, 'tf_align_4h_min_abs': 0.45, 'atr_min_pct': 0.90, 'min_rr_tp': 1.50, 'regime_slope_trend_min_pct': 0.050, 'lon_quality_add': -1.0, 'lon_conf_add': 0, 'lon_rr_add': 0.08, 'engine_c_base_score_add': -0.5, 'engine_c_exec_quality_add': -0.5, 'engine_c_exec_conf_add': 0, 'engine_c_exec_rr_add': 0.00, 'engine_c_exec_liq_mult': 1.05, 'engine_c_exec_ch1_cap_lon': 1.24, 'engine_c_exec_pb_dist_lon': 0.72},
+        {'name': 'lon_mid_push', 'quality_score_min_screen': 59.0, 'quality_score_min_email': 67.0, 'tf_align_1h_min_abs': 0.42, 'tf_align_4h_min_abs': 0.42, 'atr_min_pct': 0.80, 'min_rr_tp': 1.32, 'regime_slope_trend_min_pct': 0.048, 'lon_quality_add': -2.0, 'lon_conf_add': -1, 'lon_rr_add': -0.05, 'engine_c_base_score_add': -1.0, 'engine_c_exec_quality_add': -1.0, 'engine_c_exec_conf_add': -1, 'engine_c_exec_rr_add': -0.03, 'engine_c_exec_liq_mult': 1.02, 'engine_c_exec_ch1_cap_lon': 1.28, 'engine_c_exec_pb_dist_lon': 0.74},
+        {'name': 'c_breakout_focus', 'quality_score_min_screen': 58.0, 'quality_score_min_email': 66.0, 'tf_align_1h_min_abs': 0.40, 'tf_align_4h_min_abs': 0.40, 'atr_min_pct': 0.78, 'min_rr_tp': 1.30, 'regime_slope_trend_min_pct': 0.046, 'lon_quality_add': -1.5, 'lon_conf_add': -1, 'lon_rr_add': -0.04, 'engine_c_base_score_add': -2.0, 'engine_c_exec_quality_add': -2.0, 'engine_c_exec_conf_add': -1, 'engine_c_exec_rr_add': -0.04, 'engine_c_exec_liq_mult': 1.00, 'engine_c_exec_ch1_cap_lon': 1.34, 'engine_c_exec_pb_dist_lon': 0.78},
     ]
 
 
@@ -21927,6 +21942,8 @@ def is_top_setup_eligible(
         except Exception:
             pass
 
+        cfg_live = load_strategy_config(force=False)
+        engine_c_base_score_add = float((cfg_live or {}).get('engine_c_base_score_add', 0.0) or 0.0)
         src = str(source or "screen").strip().lower()
         if src not in {"screen", "email", "exec"}:
             src = "screen"
@@ -21951,21 +21968,21 @@ def is_top_setup_eligible(
             elif engine == 'B':
                 min_score += 4.0 if sess in {'NY', 'ASIA'} else 2.5
             elif engine == 'C':
-                min_score += 1.5 if sess != 'ASIA' else 2.0
+                min_score += (1.5 if sess != 'ASIA' else 2.0) + engine_c_base_score_add
         elif src == 'exec':
             if engine == 'A':
                 min_score += -0.25 if sess == 'LON' else (0.50 if sess == 'NY' else 0.75)
             elif engine == 'B':
                 min_score += 1.5 if sess in {'NY', 'ASIA'} else 1.0
             elif engine == 'C':
-                min_score += 1.0 if sess != 'ASIA' else 1.5
+                min_score += (1.0 if sess != 'ASIA' else 1.5) + engine_c_base_score_add
         else:
             if engine == 'A':
                 min_score += 0.0 if sess == 'LON' else (0.5 if sess == 'NY' else 1.0)
             elif engine == 'B':
                 min_score += 2.0 if sess in {'NY', 'ASIA'} else 1.0
             elif engine == 'C':
-                min_score += 0.8 if sess != 'ASIA' else 1.2
+                min_score += (0.8 if sess != 'ASIA' else 1.2) + engine_c_base_score_add
         min_score = float(clamp(min_score, 60.0, 90.0))
 
         if float(score) < float(min_score):
@@ -22041,6 +22058,12 @@ def is_executable_setup_eligible(
 
         cfg_live = load_strategy_config(force=False)
         exec_engine_b_enabled = _cfg_bool((cfg_live or {}).get("execution_engine_b_email_enabled", EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
+        engine_c_exec_quality_add = float((cfg_live or {}).get('engine_c_exec_quality_add', 0.0) or 0.0)
+        engine_c_exec_conf_add = int(round(float((cfg_live or {}).get('engine_c_exec_conf_add', 0) or 0)))
+        engine_c_exec_rr_add = float((cfg_live or {}).get('engine_c_exec_rr_add', 0.0) or 0.0)
+        engine_c_exec_liq_mult = float((cfg_live or {}).get('engine_c_exec_liq_mult', 1.10) or 1.10)
+        engine_c_exec_ch1_cap_lon = float((cfg_live or {}).get('engine_c_exec_ch1_cap_lon', 1.20) or 1.20)
+        engine_c_exec_pb_dist_lon = float((cfg_live or {}).get('engine_c_exec_pb_dist_lon', 0.68) or 0.68)
         allowed_sessions = _strategy_cfg_execution_sessions_allowed(cfg_live)
         if allowed_sessions and sess not in allowed_sessions:
             return (False, 'execution_profile_session_disabled')
@@ -22080,17 +22103,17 @@ def is_executable_setup_eligible(
                 rr_floor = max(1.52, rr_floor)
         elif engine == 'C':
             if sess == 'LON':
-                score_floor = max(78.0, score_floor + 0.25)
-                conf_floor = max(81, conf_floor + 0)
-                rr_floor = max(1.38, rr_floor + 0.02)
+                score_floor = max(74.5, score_floor - 0.25 + engine_c_exec_quality_add)
+                conf_floor = max(78, conf_floor + engine_c_exec_conf_add)
+                rr_floor = max(1.32, rr_floor - 0.01 + engine_c_exec_rr_add)
             elif sess == 'NY':
-                score_floor = max(83.0, score_floor + 1.5)
-                conf_floor = max(84, conf_floor + 1)
-                rr_floor = max(1.48, rr_floor + 0.06)
+                score_floor = max(80.0, score_floor + 1.0 + engine_c_exec_quality_add)
+                conf_floor = max(83, conf_floor + 1 + engine_c_exec_conf_add)
+                rr_floor = max(1.44, rr_floor + 0.05 + engine_c_exec_rr_add)
             else:
-                score_floor = max(86.0, score_floor + 1.75)
-                conf_floor = max(87, conf_floor + 2)
-                rr_floor = max(1.58, rr_floor + 0.08)
+                score_floor = max(84.0, score_floor + 1.25 + engine_c_exec_quality_add)
+                conf_floor = max(86, conf_floor + 2 + engine_c_exec_conf_add)
+                rr_floor = max(1.54, rr_floor + 0.07 + engine_c_exec_rr_add)
         elif engine == 'B':
             if not exec_engine_b_enabled:
                 return (False, 'engine_b_disabled')
@@ -22146,15 +22169,27 @@ def is_executable_setup_eligible(
             if fut_vol < max(MIN_FUT_VOL_USD, 10_500_000.0):
                 return (False, "ny_below_liquidity")
         elif sess == "LON":
-            if pb_dist > 0.60:
+            lon_pb_max = 0.60
+            lon_ch15_cap = 0.54
+            lon_ch1_cap = 1.18
+            lon_ctx_ch4_min = 0.52
+            lon_ctx_ch1_min = 0.24
+            lon_liq_floor = max(MIN_FUT_VOL_USD, 11_000_000.0)
+            if engine == 'C':
+                lon_pb_max = max(lon_pb_max, engine_c_exec_pb_dist_lon)
+                lon_ch1_cap = max(lon_ch1_cap, engine_c_exec_ch1_cap_lon)
+                lon_liq_floor = max(MIN_FUT_VOL_USD * engine_c_exec_liq_mult, ENGINE_C_MIN_FUT_VOL_USD)
+                lon_ctx_ch4_min = min(lon_ctx_ch4_min, 0.48)
+                lon_ctx_ch1_min = min(lon_ctx_ch1_min, 0.22)
+            if pb_dist > lon_pb_max:
                 return (False, "lon_entry_too_far_from_ema")
-            if ch15_abs > 0.54 or ch1_abs > 1.18:
+            if ch15_abs > lon_ch15_cap or ch1_abs > lon_ch1_cap:
                 return (False, "lon_late_extension_exec")
-            if ch4_abs < 0.52 or ch1_abs < 0.24:
+            if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                 return (False, "lon_context_too_weak_exec")
             if ch4_abs > 2.55 or ch24_abs > 13.8:
                 return (False, "lon_trend_overheated_exec")
-            if fut_vol < max(MIN_FUT_VOL_USD, 11_000_000.0):
+            if fut_vol < lon_liq_floor:
                 return (False, "lon_below_liquidity")
         elif sess == "ASIA":
             if pb_dist > 0.58:
@@ -22176,15 +22211,20 @@ def is_executable_setup_eligible(
             return (True, "ok")
 
         if engine == "C":
-            if score < (score_floor + 1.0):
+            c_quality_floor = score_floor + 0.25
+            c_conf_floor = conf_floor
+            c_rr_floor = rr_floor
+            c_liq_floor = float(max(MIN_FUT_VOL_USD * engine_c_exec_liq_mult, ENGINE_C_MIN_FUT_VOL_USD))
+            c_ch1_cap = engine_c_exec_ch1_cap_lon if sess == 'LON' else (1.45 if sess == 'NY' else 1.10)
+            if score < c_quality_floor:
                 return (False, "engine_c_below_quality")
-            if conf < (conf_floor + 1):
+            if conf < c_conf_floor:
                 return (False, "engine_c_below_conf")
-            if rr_final < (rr_floor + 0.04):
+            if rr_final < c_rr_floor:
                 return (False, "engine_c_below_rr")
-            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.10, ENGINE_C_MIN_FUT_VOL_USD)):
+            if fut_vol < c_liq_floor:
                 return (False, "engine_c_below_liquidity")
-            if ch1_abs > (1.20 if sess == 'LON' else (1.45 if sess == 'NY' else 1.10)):
+            if ch1_abs > c_ch1_cap:
                 return (False, "engine_c_too_extended")
             return (True, "ok")
 
