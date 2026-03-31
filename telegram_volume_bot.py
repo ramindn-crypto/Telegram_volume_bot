@@ -22003,8 +22003,10 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
         limits = _session_entry_quality_limits(session_name, source=source)
         leader_base = bool(getattr(s, 'leader_base_override', False))
         engine = str(getattr(s, 'engine', '') or '').upper().strip()
+        cfg_live = load_strategy_config(force=False)
         active_profile = str((cfg_live or {}).get('goal_profile_active_profile', '') or '').upper().strip()
         reach_mode = bool(_cfg_bool((cfg_live or {}).get('goal_profile_reach_mode', False), False) or ('REACH' in active_profile) or active_profile.endswith('_SCOUT'))
+        sess = str(session_name or '').upper().strip()
         conf = int(getattr(s, 'conf', 0) or 0)
         score = float(getattr(s, 'quality_score', 0.0) or 0.0)
         pb_dist = float(getattr(s, 'pullback_ema_dist_pct', 999.0) or 999.0)
@@ -22013,9 +22015,6 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
         ch4_abs = abs(float(getattr(s, 'ch4', 0.0) or 0.0))
         ch24_abs = abs(float(getattr(s, 'ch24', 0.0) or 0.0))
         atr_pct = float(getattr(s, 'atr_pct', 0.0) or 0.0)
-        cfg_live = load_strategy_config(force=False)
-        active_profile = str((cfg_live or {}).get('goal_profile_active_profile', '') or '').upper().strip()
-        reach_mode = bool(_cfg_bool((cfg_live or {}).get('goal_profile_reach_mode', False), False) or ('REACH' in active_profile) or active_profile.endswith('_SCOUT'))
 
         if leader_base:
             return (True, 'ok')
@@ -22025,10 +22024,10 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
         max_ch1 = float(limits['max_ch1_abs']) + (0.50 if engine == 'B' else 0.0)
         max_atr = float(limits['max_atr_pct']) + (0.60 if engine == 'B' else 0.0)
         if reach_mode and sess == 'LON' and engine in {'A', 'C'}:
-            max_pb += 0.08
-            max_ch15 += 0.10
-            max_ch1 += 0.12
-            max_atr += 0.35
+            max_pb += 0.14
+            max_ch15 += 0.16
+            max_ch1 += 0.18
+            max_atr += 0.45
 
         if pb_dist > max_pb:
             return (False, 'entry_far_from_pullback_ema')
@@ -22039,18 +22038,17 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
         if atr_pct > 0 and atr_pct > max_atr:
             return (False, 'poor_volatility_regime_exec')
 
-        sess = str(session_name or '').upper().strip()
         if engine == 'A':
             if sess == 'LON':
-                lon_ctx_ch4_min = 0.56 if reach_mode else 0.64
-                lon_ctx_ch1_min = 0.22 if reach_mode else 0.30
+                lon_ctx_ch4_min = 0.48 if reach_mode else 0.64
+                lon_ctx_ch1_min = 0.18 if reach_mode else 0.30
                 if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                     return (False, 'lon_pullback_context_too_weak')
             if sess == 'NY' and (ch4_abs < 0.80 or ch1_abs < 0.42):
                 return (False, 'ny_pullback_context_too_weak')
             if sess == 'ASIA' and (ch4_abs < 0.95 or ch1_abs < 0.50):
                 return (False, 'asia_pullback_context_too_weak')
-            if sess == 'LON' and ch24_abs > (12.8 if reach_mode else 11.5) and pb_dist > (0.42 if reach_mode else 0.34):
+            if sess == 'LON' and ch24_abs > (13.6 if reach_mode else 11.5) and pb_dist > (0.48 if reach_mode else 0.34):
                 return (False, 'lon_trend_overheated')
         if sess == 'NY' and ch1_abs >= 1.55 and ch15_abs >= 0.70 and conf < 86 and score < 82.0:
             return (False, 'ny_breakout_chase_risk')
@@ -22106,6 +22104,8 @@ def is_top_setup_eligible(
             src = "screen"
         sess = str(session_name or 'LON').upper().strip()
         engine = str(getattr(s, 'engine', '') or '').upper().strip()
+        active_profile = str((cfg_live or {}).get('goal_profile_active_profile', '') or '').upper().strip()
+        reach_mode = bool(_cfg_bool((cfg_live or {}).get('goal_profile_reach_mode', False), False) or ('REACH' in active_profile) or active_profile.endswith('_SCOUT'))
 
         if src == "screen":
             min_score = float(QUALITY_SCORE_MIN_SCREEN)
@@ -22140,9 +22140,14 @@ def is_top_setup_eligible(
                 min_score += 2.0 if sess in {'NY', 'ASIA'} else 1.0
             elif engine == 'C':
                 min_score += (0.8 if sess != 'ASIA' else 1.2) + engine_c_base_score_add
-        if reach_mode and src == 'exec' and sess == 'LON' and engine in {'A', 'C'}:
-            min_score -= 2.0 if engine == 'A' else 1.5
-        min_score = float(clamp(min_score, 58.0 if reach_mode and sess == 'LON' else 60.0, 90.0))
+        if reach_mode and sess == 'LON' and engine in {'A', 'C'}:
+            if src == 'exec':
+                min_score -= 4.0 if engine == 'A' else 3.0
+            elif src == 'email':
+                min_score -= 1.5 if engine == 'A' else 1.0
+            else:
+                min_score -= 0.75 if engine == 'A' else 0.50
+        min_score = float(clamp(min_score, 56.0 if reach_mode and sess == 'LON' else 60.0, 90.0))
 
         if float(score) < float(min_score):
             return (False, f"below_score_{int(round(min_score))}")
@@ -22251,9 +22256,9 @@ def is_executable_setup_eligible(
 
         if engine == 'A':
             if sess == 'LON':
-                score_floor = max((72.0 if reach_mode else 75.0), score_floor)
-                conf_floor = max((78 if reach_mode else 79), conf_floor)
-                rr_floor = max((1.30 if reach_mode else 1.34), rr_floor)
+                score_floor = max((69.0 if reach_mode else 75.0), score_floor)
+                conf_floor = max((75 if reach_mode else 79), conf_floor)
+                rr_floor = max((1.24 if reach_mode else 1.34), rr_floor)
             elif sess == 'NY':
                 score_floor = max(81.0, score_floor)
                 conf_floor = max(82, conf_floor)
@@ -22264,9 +22269,9 @@ def is_executable_setup_eligible(
                 rr_floor = max(1.52, rr_floor)
         elif engine == 'C':
             if sess == 'LON':
-                score_floor = max((71.5 if reach_mode else 74.5), score_floor - 0.25 + engine_c_exec_quality_add)
-                conf_floor = max((77 if reach_mode else 78), conf_floor + engine_c_exec_conf_add)
-                rr_floor = max((1.28 if reach_mode else 1.32), rr_floor - 0.01 + engine_c_exec_rr_add)
+                score_floor = max((68.5 if reach_mode else 74.5), score_floor - 0.50 + engine_c_exec_quality_add)
+                conf_floor = max((75 if reach_mode else 78), conf_floor + engine_c_exec_conf_add)
+                rr_floor = max((1.22 if reach_mode else 1.32), rr_floor - 0.03 + engine_c_exec_rr_add)
             elif sess == 'NY':
                 score_floor = max(80.0, score_floor + 1.0 + engine_c_exec_quality_add)
                 conf_floor = max(83, conf_floor + 1 + engine_c_exec_conf_add)
@@ -22330,12 +22335,12 @@ def is_executable_setup_eligible(
             if fut_vol < max(MIN_FUT_VOL_USD, 10_500_000.0):
                 return (False, "ny_below_liquidity")
         elif sess == "LON":
-            lon_pb_max = 0.68 if reach_mode else 0.60
-            lon_ch15_cap = 0.62 if reach_mode else 0.54
-            lon_ch1_cap = 1.28 if reach_mode else 1.18
-            lon_ctx_ch4_min = 0.46 if reach_mode else 0.52
-            lon_ctx_ch1_min = 0.20 if reach_mode else 0.24
-            lon_liq_floor = max(MIN_FUT_VOL_USD * (0.92 if reach_mode else 1.0), 10_000_000.0 if reach_mode else 11_000_000.0)
+            lon_pb_max = 0.74 if reach_mode else 0.60
+            lon_ch15_cap = 0.68 if reach_mode else 0.54
+            lon_ch1_cap = 1.35 if reach_mode else 1.18
+            lon_ctx_ch4_min = 0.40 if reach_mode else 0.52
+            lon_ctx_ch1_min = 0.16 if reach_mode else 0.24
+            lon_liq_floor = max(MIN_FUT_VOL_USD * (0.82 if reach_mode else 1.0), 8_500_000.0 if reach_mode else 11_000_000.0)
             if engine == 'C':
                 lon_pb_max = max(lon_pb_max, engine_c_exec_pb_dist_lon)
                 lon_ch1_cap = max(lon_ch1_cap, engine_c_exec_ch1_cap_lon)
@@ -22348,7 +22353,7 @@ def is_executable_setup_eligible(
                 return (False, "lon_late_extension_exec")
             if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                 return (False, "lon_context_too_weak_exec")
-            if ch4_abs > 2.55 or ch24_abs > 13.8:
+            if ch4_abs > (2.85 if reach_mode else 2.55) or ch24_abs > (15.2 if reach_mode else 13.8):
                 return (False, "lon_trend_overheated_exec")
             if fut_vol < lon_liq_floor:
                 return (False, "lon_below_liquidity")
@@ -22365,18 +22370,18 @@ def is_executable_setup_eligible(
         if engine == "A":
             if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
                 return (False, "pullback_not_ready")
-            if pb_dist > ((0.60 if reach_mode else 0.54) if sess == 'LON' else (0.60 if sess == 'NY' else 0.54)):
+            if pb_dist > ((0.68 if reach_mode else 0.54) if sess == 'LON' else (0.60 if sess == 'NY' else 0.54)):
                 return (False, "pullback_still_too_shallow")
-            if sess == 'LON' and (ch15_abs > (0.54 if reach_mode else 0.46) or ch1_abs < (0.22 if reach_mode else 0.28) or ch1_abs > (1.18 if reach_mode else 1.08) or ch4_abs < (0.54 if reach_mode else 0.60)):
+            if sess == 'LON' and (ch15_abs > (0.62 if reach_mode else 0.46) or ch1_abs < (0.16 if reach_mode else 0.28) or ch1_abs > (1.28 if reach_mode else 1.08) or ch4_abs < (0.48 if reach_mode else 0.60)):
                 return (False, 'lon_pullback_not_clean_enough')
             return (True, "ok")
 
         if engine == "C":
-            c_quality_floor = score_floor + (0.10 if reach_mode and sess == 'LON' else 0.25)
-            c_conf_floor = max(76 if (reach_mode and sess == 'LON') else conf_floor, conf_floor - (1 if reach_mode and sess == 'LON' else 0))
-            c_rr_floor = max(1.26 if (reach_mode and sess == 'LON') else rr_floor, rr_floor - (0.02 if reach_mode and sess == 'LON' else 0.0))
-            c_liq_floor = float(max(MIN_FUT_VOL_USD * (engine_c_exec_liq_mult if not (reach_mode and sess == 'LON') else 0.95), 9_000_000.0 if (reach_mode and sess == 'LON') else ENGINE_C_MIN_FUT_VOL_USD))
-            c_ch1_cap = (max(engine_c_exec_ch1_cap_lon, 1.42) if (reach_mode and sess == 'LON') else engine_c_exec_ch1_cap_lon) if sess == 'LON' else (1.45 if sess == 'NY' else 1.10)
+            c_quality_floor = score_floor + (0.00 if reach_mode and sess == 'LON' else 0.25)
+            c_conf_floor = max(75 if (reach_mode and sess == 'LON') else conf_floor, conf_floor - (1 if reach_mode and sess == 'LON' else 0))
+            c_rr_floor = max(1.20 if (reach_mode and sess == 'LON') else rr_floor, rr_floor - (0.04 if reach_mode and sess == 'LON' else 0.0))
+            c_liq_floor = float(max(MIN_FUT_VOL_USD * (engine_c_exec_liq_mult if not (reach_mode and sess == 'LON') else 0.85), 8_000_000.0 if (reach_mode and sess == 'LON') else ENGINE_C_MIN_FUT_VOL_USD))
+            c_ch1_cap = (max(engine_c_exec_ch1_cap_lon, 1.55) if (reach_mode and sess == 'LON') else engine_c_exec_ch1_cap_lon) if sess == 'LON' else (1.45 if sess == 'NY' else 1.10)
             if score < c_quality_floor:
                 return (False, "engine_c_below_quality")
             if conf < c_conf_floor:
