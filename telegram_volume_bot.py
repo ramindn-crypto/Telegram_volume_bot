@@ -32653,6 +32653,12 @@ def main():
     app.add_handler(CommandHandler("autopilot_status", learning_status_cmd, block=False))
     app.add_handler(CommandHandler("adaptive_status", market_adaptive_status_cmd, block=False))
     app.add_handler(CommandHandler("adaptive_run", market_adaptive_run_cmd, block=False))
+    app.add_handler(CommandHandler("goal_status", goal_profile_status_cmd, block=False))
+    app.add_handler(CommandHandler("goal_run", goal_profile_run_cmd, block=False))
+    app.add_handler(CommandHandler("goal_set", goal_profile_set_cmd, block=False))
+    app.add_handler(CommandHandler("goalstatus", goal_profile_status_cmd, block=False))
+    app.add_handler(CommandHandler("goalrun", goal_profile_run_cmd, block=False))
+    app.add_handler(CommandHandler("goalset", goal_profile_set_cmd, block=False))
     app.add_handler(CommandHandler("backtest", cmd_backtest, block=False))
     app.add_handler(CommandHandler("universe_backtest", cmd_universe_backtest, block=False))
 
