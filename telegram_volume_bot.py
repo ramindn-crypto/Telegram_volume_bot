@@ -1186,6 +1186,11 @@ def _strategy_config_defaults() -> dict:
         "execution_engines_allowed": ["A", "B", "C"],
         "goal_profile_active_profile": "BASELINE",
         "goal_profile_last_run_ts": 0.0,
+        "goal_profile_allow_ny": False,
+        "goal_profile_allow_asia": False,
+        "goal_profile_allow_engine_b": False,
+        "goal_profile_shortlist": 4,
+        "goal_profile_max_run_minutes": 18.0,
 
         # Daily market-adaptive universe optimizer (runtime params only; no source rewriting)
         "market_adaptive_enabled": True,
@@ -17249,6 +17254,9 @@ async def cmd_universe_backtest(update: Update, context: ContextTypes.DEFAULT_TY
     if int(days) not in (7, 30):
         await update.message.reply_text('Use /universe_backtest 7 or /universe_backtest 30 [ALL|NY|LON|ASIA] [tf] [topN]')
         return
+    if _goal_profile_is_running():
+        await update.message.reply_text('⏸️ Universe backtest is blocked while the goal-profile optimizer is running. Use /goal_status or /goal_abort first.')
+        return
     await update.message.reply_text(f'⏳ Running {int(days)}d universe backtest…')
     try:
         rep = await to_thread_heavy(run_universe_backtest, int(days), session_mode, tf, top_n, None, True, False)
@@ -21141,6 +21149,19 @@ async def cmd_self_optimize_report(update: Update, context: ContextTypes.DEFAULT
 # GOAL-PROFILE OPTIMIZER — bounded objective search toward target setups/day + WR
 # =========================================================
 _GOAL_PROFILE_LOCK = threading.Lock()
+_GOAL_PROFILE_STATE = {
+    'stop_event': None,
+    'started_ts': 0.0,
+    'run_id': '',
+}
+
+
+def _goal_profile_is_running() -> bool:
+    try:
+        ev = _GOAL_PROFILE_STATE.get('stop_event')
+        return bool(ev is not None and not ev.is_set())
+    except Exception:
+        return False
 
 
 def _goal_profile_targets(cfg: dict | None = None) -> dict:
@@ -21155,11 +21176,20 @@ def _goal_profile_targets(cfg: dict | None = None) -> dict:
         'target_avg_r': float((cfg or {}).get('goal_profile_target_avg_r', 0.10) or 0.10),
         'min_live_30d': int((cfg or {}).get('goal_profile_min_live_setups_30d', 8) or 8),
         'min_live_7d': int((cfg or {}).get('goal_profile_min_live_setups_7d', 2) or 2),
+        'allow_ny': _cfg_bool((cfg or {}).get('goal_profile_allow_ny', False), False),
+        'allow_asia': _cfg_bool((cfg or {}).get('goal_profile_allow_asia', False), False),
+        'allow_engine_b': _cfg_bool((cfg or {}).get('goal_profile_allow_engine_b', False), False),
+        'shortlist': int((cfg or {}).get('goal_profile_shortlist', 4) or 4),
+        'max_run_minutes': float((cfg or {}).get('goal_profile_max_run_minutes', 18.0) or 18.0),
     }
 
 
 def _goal_profile_candidate_profiles(cfg: dict | None = None) -> list[dict]:
     cfg = cfg or load_strategy_config(force=False)
+    tgt = _goal_profile_targets(cfg)
+    allow_ny = bool(tgt.get('allow_ny'))
+    allow_asia = bool(tgt.get('allow_asia'))
+    allow_engine_b = bool(tgt.get('allow_engine_b'))
     out = []
     raw = list((cfg or {}).get('goal_profile_candidate_profiles') or [])
     for item in raw:
@@ -21167,23 +21197,31 @@ def _goal_profile_candidate_profiles(cfg: dict | None = None) -> list[dict]:
             name = str((item or {}).get('name') or '').strip() or 'PROFILE'
             sessions = [str(x).upper().strip() for x in ((item or {}).get('execution_sessions_allowed') or []) if str(x).strip()]
             engines = [str(x).upper().strip() for x in ((item or {}).get('execution_engines_allowed') or []) if str(x).strip()]
+            if (not allow_ny) and 'NY' in sessions:
+                continue
+            if (not allow_asia) and 'ASIA' in sessions:
+                continue
+            if (not allow_engine_b) and 'B' in engines:
+                continue
             out.append({
                 'name': name,
                 'execution_sessions_allowed': sessions or ['LON'],
                 'execution_engines_allowed': engines or ['A'],
-                'execution_asia_enabled': _cfg_bool((item or {}).get('execution_asia_enabled', False), False),
-                'execution_engine_b_email_enabled': _cfg_bool((item or {}).get('execution_engine_b_email_enabled', False), False),
+                'execution_asia_enabled': _cfg_bool((item or {}).get('execution_asia_enabled', False), False) and allow_asia,
+                'execution_engine_b_email_enabled': _cfg_bool((item or {}).get('execution_engine_b_email_enabled', False), False) and allow_engine_b,
             })
         except Exception:
             continue
     if out:
         return out
-    return [
+    fallback = [
         {'name': 'LON_A_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
         {'name': 'LON_A_C_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A', 'C'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
-        {'name': 'LON_NY_A_ONLY', 'execution_sessions_allowed': ['LON', 'NY'], 'execution_engines_allowed': ['A'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
         {'name': 'LON_A_C_SCOUT', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A', 'C'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
     ]
+    if allow_ny:
+        fallback.append({'name': 'LON_NY_A_ONLY', 'execution_sessions_allowed': ['LON', 'NY'], 'execution_engines_allowed': ['A'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False})
+    return fallback
 
 
 def _goal_profile_candidate_bundles(cfg: dict | None = None) -> list[dict]:
@@ -21274,6 +21312,40 @@ def _goal_profile_summary_from_rep(rep: dict) -> dict:
     }
 
 
+def _goal_profile_stage1_score(rep30: dict, cfg: dict) -> dict:
+    tgt = _goal_profile_targets(cfg)
+    s30 = _goal_profile_summary_from_rep(rep30)
+    n30 = int(s30['setups'])
+    sdp30 = float(s30['setups_per_day'])
+    wr30 = float(s30['win_rate'])
+    ar30 = float(s30['avg_R'])
+
+    def _freq_pen(v: float, lo: float, hi: float, weight_under: float, weight_over: float) -> float:
+        if v < lo:
+            return (lo - v) * weight_under
+        if v > hi:
+            return (v - hi) * weight_over
+        return 0.0
+
+    freq_pen = _freq_pen(sdp30, tgt['target_lo'], tgt['target_hi'], 40.0, 18.0)
+    wr_pen = max(0.0, tgt['target_wr'] - wr30) * 2.4
+    avg_r_pen = max(0.0, tgt['target_avg_r'] - ar30) * 62.0
+    sample_pen = max(0, tgt['min_live_30d'] - n30) * 7.0
+    zero_pen = 350.0 if n30 <= 0 else 0.0
+    score = (wr30 * 2.2) + (ar30 * 55.0) + (sdp30 * 10.0) - freq_pen - wr_pen - avg_r_pen - sample_pen - zero_pen
+    return {
+        'score': float(score),
+        'metrics_30d': s30,
+        'penalties': {
+            'freq_pen': float(freq_pen),
+            'wr_pen': float(wr_pen),
+            'avg_r_pen': float(avg_r_pen),
+            'sample_pen': float(sample_pen),
+            'zero_pen': float(zero_pen),
+        },
+    }
+
+
 def _goal_profile_score_candidate(rep30: dict, rep7: dict, cfg: dict) -> dict:
     tgt = _goal_profile_targets(cfg)
     s30 = _goal_profile_summary_from_rep(rep30)
@@ -21341,11 +21413,12 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
         save_goal_profile_report(rep)
         return rep
     if not _GOAL_PROFILE_LOCK.acquire(blocking=False):
+        rep = load_goal_profile_report() or {}
         return {
             'ok': False,
             'status': 'BUSY',
             'ts': now_ts,
-            'started_ts': now_ts,
+            'started_ts': float(rep.get('started_ts', now_ts) or now_ts),
             'targets': tgt,
             'current': {
                 'goal_profile_active_profile': current_profile,
@@ -21354,11 +21427,19 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
             },
         }
     started_ts = float(time.time())
-    try:
-        save_goal_profile_report({
+    stop_event = threading.Event()
+    _GOAL_PROFILE_STATE['stop_event'] = stop_event
+    _GOAL_PROFILE_STATE['started_ts'] = started_ts
+    _GOAL_PROFILE_STATE['run_id'] = f"goal-{int(started_ts)}"
+    last_final = load_goal_profile_report() or {}
+    if str(last_final.get('status') or '').upper() == 'RUNNING':
+        last_final = {}
+
+    def _persist_running(stage: str, candidate_idx: int = 0, candidate_total: int = 0, current_candidate: dict | None = None, best_candidate: dict | None = None, note: str = ''):
+        rep = {
             'ok': True,
             'status': 'RUNNING',
-            'ts': started_ts,
+            'ts': float(time.time()),
             'started_ts': started_ts,
             'targets': tgt,
             'current': {
@@ -21366,12 +21447,20 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
                 'execution_sessions_allowed': current_sessions,
                 'execution_engines_allowed': current_engines,
             },
-        })
+            'progress': {
+                'stage': str(stage or 'running'),
+                'candidate_idx': int(candidate_idx or 0),
+                'candidate_total': int(candidate_total or 0),
+                'current_candidate': current_candidate or {},
+                'best_candidate': best_candidate or {},
+                'elapsed_sec': float(max(0.0, time.time() - started_ts)),
+                'note': str(note or ''),
+            },
+            'last_final': last_final if isinstance(last_final, dict) else {},
+        }
+        save_goal_profile_report(rep)
 
-        # Cooldown uses the last finalized report, not the RUNNING marker we just saved.
-        last_final = load_goal_profile_report() or {}
-        if str(last_final.get('status') or '').upper() == 'RUNNING':
-            last_final = {}
+    try:
         if (not force) and float(last_final.get('applied_ts', 0.0) or 0.0) > 0 and (time.time() - float(last_final.get('applied_ts', 0.0) or 0.0)) < (tgt['cooldown_hours'] * 3600.0):
             rep = {'ok': False, 'status': 'COOLDOWN', 'ts': float(time.time()), 'started_ts': started_ts, 'targets': tgt, 'last': last_final}
             save_goal_profile_report(rep)
@@ -21380,9 +21469,11 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
         base_cfg = json.loads(json.dumps(cfg0 or {}))
         exec_tf = str((base_cfg or {}).get('universe_backtest_exec_tf') or (base_cfg or {}).get('exec_tf_default') or '15m').strip().lower()
         top_n = int((base_cfg or {}).get('universe_backtest_top_n', 80) or 80)
+        max_run_sec = max(180.0, float(tgt.get('max_run_minutes', 18.0) or 18.0) * 60.0)
 
         save_strategy_config(base_cfg)
         apply_strategy_config(base_cfg)
+        _persist_running('baseline')
         baseline30 = run_universe_backtest(30, 'ALL', exec_tf, top_n, None, False, False)
         baseline7 = run_universe_backtest(7, 'ALL', exec_tf, top_n, None, False, False)
         baseline_eval = _goal_profile_score_candidate(baseline30, baseline7, base_cfg)
@@ -21391,47 +21482,95 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
         best_eval = dict(baseline_eval)
         best_profile = {'name': 'BASELINE'}
         best_bundle = {'name': 'current'}
-        candidates = []
+        stage1_rows = []
+        stage2_rows = []
+        profiles = _goal_profile_candidate_profiles(base_cfg)
+        bundles = _goal_profile_candidate_bundles(base_cfg)
+        candidate_total = max(0, len(profiles) * len(bundles))
+        cand_counter = 0
 
-        for profile in _goal_profile_candidate_profiles(base_cfg):
-            for bundle in _goal_profile_candidate_bundles(base_cfg):
-                cand_cfg = _goal_profile_apply_candidate(base_cfg, profile, bundle)
-                save_strategy_config(cand_cfg)
-                apply_strategy_config(cand_cfg)
-                rep30 = run_universe_backtest(30, 'ALL', exec_tf, top_n, None, False, False)
-                rep7 = run_universe_backtest(7, 'ALL', exec_tf, top_n, None, False, False)
-                evald = _goal_profile_score_candidate(rep30, rep7, cand_cfg)
-                row = {
+        for profile in profiles:
+            for bundle in bundles:
+                cand_counter += 1
+                if stop_event.is_set():
+                    raise TimeoutError('goal_profile_aborted')
+                if (time.time() - started_ts) > max_run_sec:
+                    raise TimeoutError('goal_profile_timeout')
+                current_row = {
                     'profile': str(profile.get('name') or ''),
                     'bundle': str(bundle.get('name') or ''),
-                    'score': float(evald.get('score', -1e9)),
-                    'feasible': bool(evald.get('feasible')),
-                    'metrics_30d': evald.get('metrics_30d') or {},
-                    'metrics_7d': evald.get('metrics_7d') or {},
-                    'penalties': evald.get('penalties') or {},
+                    'sessions': list(profile.get('execution_sessions_allowed') or []),
+                    'engines': list(profile.get('execution_engines_allowed') or []),
+                }
+                _persist_running('search_30d', cand_counter, candidate_total, current_row, {
+                    'profile': str(best_profile.get('name') or 'BASELINE'),
+                    'bundle': str(best_bundle.get('name') or 'current'),
+                    'score': float(best_eval.get('score', -1e9)),
+                })
+                cand_cfg = _goal_profile_apply_candidate(base_cfg, profile, bundle)
+                apply_strategy_config(cand_cfg)
+                rep30 = run_universe_backtest(30, 'ALL', exec_tf, top_n, None, False, False)
+                apply_strategy_config(base_cfg)
+                stage1 = _goal_profile_stage1_score(rep30, cand_cfg)
+                stage1_rows.append({
+                    'profile': str(profile.get('name') or ''),
+                    'bundle': str(bundle.get('name') or ''),
+                    'stage1_score': float(stage1.get('score', -1e9)),
+                    'metrics_30d': stage1.get('metrics_30d') or {},
+                    'penalties_30d': stage1.get('penalties') or {},
                     'execution_sessions_allowed': list(cand_cfg.get('execution_sessions_allowed') or []),
                     'execution_engines_allowed': list(cand_cfg.get('execution_engines_allowed') or []),
-                }
-                candidates.append(row)
-                if float(evald.get('score', -1e9)) > float(best_eval.get('score', -1e9)):
-                    best_cfg = cand_cfg
-                    best_eval = evald
-                    best_profile = profile
-                    best_bundle = bundle
+                    'cand_cfg': cand_cfg,
+                })
+
+        shortlist_n = max(1, min(int(tgt.get('shortlist', 4) or 4), len(stage1_rows) or 1))
+        shortlist = sorted(stage1_rows, key=lambda x: float(x.get('stage1_score', -1e9)), reverse=True)[:shortlist_n]
+
+        for idx, row in enumerate(shortlist, start=1):
+            if stop_event.is_set():
+                raise TimeoutError('goal_profile_aborted')
+            if (time.time() - started_ts) > max_run_sec:
+                raise TimeoutError('goal_profile_timeout')
+            current_row = {
+                'profile': str(row.get('profile') or ''),
+                'bundle': str(row.get('bundle') or ''),
+                'sessions': list(row.get('execution_sessions_allowed') or []),
+                'engines': list(row.get('execution_engines_allowed') or []),
+            }
+            _persist_running('search_7d', idx, len(shortlist), current_row, {
+                'profile': str(best_profile.get('name') or 'BASELINE'),
+                'bundle': str(best_bundle.get('name') or 'current'),
+                'score': float(best_eval.get('score', -1e9)),
+            }, note=f"shortlist={len(shortlist)} of {candidate_total}")
+            cand_cfg = dict(row.get('cand_cfg') or {})
+            apply_strategy_config(cand_cfg)
+            rep7 = run_universe_backtest(7, 'ALL', exec_tf, top_n, None, False, False)
+            apply_strategy_config(base_cfg)
+            evald = _goal_profile_score_candidate({'overall': row.get('metrics_30d') or {}}, rep7, cand_cfg)
+            full_row = {
+                'profile': str(row.get('profile') or ''),
+                'bundle': str(row.get('bundle') or ''),
+                'score': float(evald.get('score', -1e9)),
+                'feasible': bool(evald.get('feasible')),
+                'metrics_30d': evald.get('metrics_30d') or {},
+                'metrics_7d': evald.get('metrics_7d') or {},
+                'penalties': evald.get('penalties') or {},
+                'execution_sessions_allowed': list(cand_cfg.get('execution_sessions_allowed') or []),
+                'execution_engines_allowed': list(cand_cfg.get('execution_engines_allowed') or []),
+            }
+            stage2_rows.append(full_row)
+            if float(evald.get('score', -1e9)) > float(best_eval.get('score', -1e9)):
+                best_cfg = json.loads(json.dumps(cand_cfg))
+                best_eval = dict(evald)
+                best_profile = {'name': str(row.get('profile') or '')}
+                best_bundle = {'name': str(row.get('bundle') or '')}
 
         promoted = float(best_eval.get('score', -1e9)) > float(baseline_eval.get('score', -1e9)) + 0.5
-        final_cfg = best_cfg if promoted else base_cfg
+        final_cfg = json.loads(json.dumps(best_cfg if promoted else base_cfg))
+        final_eval = dict(best_eval if promoted else baseline_eval)
+        final_cfg['goal_profile_last_run_ts'] = float(time.time())
         save_strategy_config(final_cfg)
         apply_strategy_config(final_cfg)
-        final30 = run_universe_backtest(30, 'ALL', exec_tf, top_n, None, False, False)
-        final7 = run_universe_backtest(7, 'ALL', exec_tf, top_n, None, False, False)
-        final_eval = _goal_profile_score_candidate(final30, final7, final_cfg)
-        try:
-            final_cfg['goal_profile_last_run_ts'] = float(time.time())
-            save_strategy_config(final_cfg)
-            apply_strategy_config(final_cfg)
-        except Exception:
-            pass
 
         report = {
             'ok': True,
@@ -21441,15 +21580,45 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
             'finished_ts': float(time.time()),
             'applied_ts': float(time.time()) if promoted else float((last_final or {}).get('applied_ts', 0.0) or 0.0),
             'targets': tgt,
+            'current': {
+                'goal_profile_active_profile': str(final_cfg.get('goal_profile_active_profile') or current_profile),
+                'execution_sessions_allowed': list(final_cfg.get('execution_sessions_allowed') or current_sessions),
+                'execution_engines_allowed': list(final_cfg.get('execution_engines_allowed') or current_engines),
+            },
             'baseline': {'score': float(baseline_eval.get('score', -1e9)), 'metrics_30d': baseline_eval.get('metrics_30d') or {}, 'metrics_7d': baseline_eval.get('metrics_7d') or {}},
             'best_candidate': {'profile': str(best_profile.get('name') or ''), 'bundle': str(best_bundle.get('name') or ''), 'score': float(best_eval.get('score', -1e9)), 'feasible': bool(best_eval.get('feasible')), 'metrics_30d': best_eval.get('metrics_30d') or {}, 'metrics_7d': best_eval.get('metrics_7d') or {}, 'execution_sessions_allowed': list(best_cfg.get('execution_sessions_allowed') or []), 'execution_engines_allowed': list(best_cfg.get('execution_engines_allowed') or [])},
             'final': {'score': float(final_eval.get('score', -1e9)), 'metrics_30d': final_eval.get('metrics_30d') or {}, 'metrics_7d': final_eval.get('metrics_7d') or {}, 'execution_sessions_allowed': list(final_cfg.get('execution_sessions_allowed') or []), 'execution_engines_allowed': list(final_cfg.get('execution_engines_allowed') or []), 'goal_profile_active_profile': str(final_cfg.get('goal_profile_active_profile') or 'BASELINE')},
-            'top_candidates': sorted(candidates, key=lambda x: float(x.get('score', -1e9)), reverse=True)[:8],
+            'progress': {'stage': 'done', 'candidate_idx': len(stage2_rows), 'candidate_total': len(shortlist), 'elapsed_sec': float(max(0.0, time.time() - started_ts)), 'shortlist_from': int(candidate_total)},
+            'top_candidates': sorted(stage2_rows, key=lambda x: float(x.get('score', -1e9)), reverse=True)[:8],
+            'stage1_shortlist': [{k: v for k, v in row.items() if k != 'cand_cfg'} for row in shortlist],
         }
         save_goal_profile_report(report)
         return report
+    except TimeoutError as e:
+        apply_strategy_config(cfg0 or {})
+        save_strategy_config(cfg0 or {})
+        status = 'ABORTED' if 'aborted' in str(e).lower() else 'TIMEOUT'
+        err_report = {
+            'ok': False,
+            'status': status,
+            'ts': float(time.time()),
+            'started_ts': started_ts,
+            'finished_ts': float(time.time()),
+            'targets': tgt,
+            'error': str(e),
+            'current': {
+                'goal_profile_active_profile': current_profile,
+                'execution_sessions_allowed': current_sessions,
+                'execution_engines_allowed': current_engines,
+            },
+            'last_final': last_final if isinstance(last_final, dict) else {},
+        }
+        save_goal_profile_report(err_report)
+        return err_report
     except Exception as e:
         try:
+            save_strategy_config(cfg0 or {})
+            apply_strategy_config(cfg0 or {})
             err_cfg = load_strategy_config(force=True)
         except Exception:
             err_cfg = cfg0 or {}
@@ -21466,11 +21635,41 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
                 'execution_sessions_allowed': list((err_cfg or {}).get('execution_sessions_allowed') or current_sessions),
                 'execution_engines_allowed': list((err_cfg or {}).get('execution_engines_allowed') or current_engines),
             },
+            'last_final': last_final if isinstance(last_final, dict) else {},
         }
         save_goal_profile_report(err_report)
         return err_report
     finally:
+        try:
+            ev = _GOAL_PROFILE_STATE.get('stop_event')
+            if ev is not None:
+                ev.set()
+        except Exception:
+            pass
+        _GOAL_PROFILE_STATE['stop_event'] = None
+        _GOAL_PROFILE_STATE['started_ts'] = 0.0
+        _GOAL_PROFILE_STATE['run_id'] = ''
         _GOAL_PROFILE_LOCK.release()
+
+
+async def goal_profile_abort_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    ev = _GOAL_PROFILE_STATE.get('stop_event')
+    if ev is None or ev.is_set():
+        await update.message.reply_text('No goal-profile optimizer run is active.')
+        return
+    ev.set()
+    rep = load_goal_profile_report() or {}
+    rep['status'] = 'STOPPING'
+    rep['ts'] = float(time.time())
+    prog = dict(rep.get('progress') or {})
+    prog['note'] = 'Abort requested by admin.'
+    rep['progress'] = prog
+    save_goal_profile_report(rep)
+    await update.message.reply_text('🛑 Goal-profile optimizer abort requested. It will stop after the current evaluation step.')
+
 
 async def goal_profile_run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
@@ -21543,10 +21742,33 @@ async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_
     if rep:
         ts_val = float(rep.get('ts', 0.0) or 0.0)
         lines.append(f"Last run status: {rep.get('status','')} | ts={_fmt_dt_local(datetime.fromtimestamp(ts_val, tz=timezone.utc)) if ts_val > 0 else '—'}")
-        if str(rep.get('status') or '').upper() == 'RUNNING':
+        if str(rep.get('status') or '').upper() in ('RUNNING', 'STOPPING'):
             started_ts = float(rep.get('started_ts', 0.0) or 0.0)
             if started_ts > 0:
                 lines.append(f"Started: {_fmt_dt_local(datetime.fromtimestamp(started_ts, tz=timezone.utc))}")
+            prog = dict(rep.get('progress') or {})
+            if prog:
+                idx = int(prog.get('candidate_idx', 0) or 0)
+                total = int(prog.get('candidate_total', 0) or 0)
+                stage = str(prog.get('stage') or 'running')
+                elapsed = float(prog.get('elapsed_sec', 0.0) or 0.0)
+                lines.append(f"Progress: {stage} | candidate {idx}/{total} | elapsed {elapsed/60.0:.1f} min")
+                cur = dict(prog.get('current_candidate') or {})
+                if cur:
+                    lines.append(f"Current candidate: {cur.get('profile','?')}/{cur.get('bundle','?')} | sessions={','.join(cur.get('sessions') or []) or '-'} | engines={','.join(cur.get('engines') or []) or '-'}")
+                best = dict(prog.get('best_candidate') or {})
+                if best:
+                    lines.append(f"Best so far: {best.get('profile','?')}/{best.get('bundle','?')} | score={float(best.get('score',0.0) or 0.0):.2f}")
+                note = str(prog.get('note') or '').strip()
+                if note:
+                    lines.append(f"Note: {note}")
+            last_final = dict(rep.get('last_final') or {})
+            last_final_metrics = dict((last_final.get('final') or {}).get('metrics_30d') or {})
+            last_final_metrics7 = dict((last_final.get('final') or {}).get('metrics_7d') or {})
+            if last_final_metrics:
+                lines.append(f"Last finalized 30d: setups/day={float(last_final_metrics.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(last_final_metrics.get('setups',0) or 0)} | WR={float(last_final_metrics.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(last_final_metrics.get('avg_R',0.0) or 0.0):.3f}")
+            if last_final_metrics7:
+                lines.append(f"Last finalized 7d: setups/day={float(last_final_metrics7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(last_final_metrics7.get('setups',0) or 0)} | WR={float(last_final_metrics7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(last_final_metrics7.get('avg_R',0.0) or 0.0):.3f}")
         elif final:
             lines.append(f"30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}")
             lines.append(f"7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}")
@@ -21588,6 +21810,8 @@ async def goal_profile_job(context: ContextTypes.DEFAULT_TYPE):
         if not tgt['enabled']:
             return
         if _SELF_OPT_STATE.get('stop_event') is not None:
+            return
+        if _goal_profile_is_running():
             return
         await to_thread_heavy(_run_goal_profile_cycle, False)
     except Exception:
@@ -24723,13 +24947,14 @@ ADMIN_HELP_DESCRIPTIONS = {
     "goal_status": "Show goal-profile optimizer targets, current execution profile, and latest results",
     "goal_run": "Run bounded goal-profile optimizer now against 7d and 30d universe backtests",
     "goal_set": "Set goal targets: setups/day low-high, WR target, optional AvgR target",
+    "goal_abort": "Abort a running goal-profile optimizer cycle safely after the current evaluation step",
     "trade_id_reset": "Reset your own Trade ID numbering",
 }
 
 ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
-    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "adaptive_run", "goal_status", "goal_run", "goal_set", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
+    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "adaptive_run", "goal_status", "goal_run", "goal_set", "goal_abort", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
@@ -32748,9 +32973,11 @@ def main():
     app.add_handler(CommandHandler("goal_status", goal_profile_status_cmd, block=False))
     app.add_handler(CommandHandler("goal_run", goal_profile_run_cmd, block=False))
     app.add_handler(CommandHandler("goal_set", goal_profile_set_cmd, block=False))
+    app.add_handler(CommandHandler("goal_abort", goal_profile_abort_cmd, block=False))
     app.add_handler(CommandHandler("goalstatus", goal_profile_status_cmd, block=False))
     app.add_handler(CommandHandler("goalrun", goal_profile_run_cmd, block=False))
     app.add_handler(CommandHandler("goalset", goal_profile_set_cmd, block=False))
+    app.add_handler(CommandHandler("goalabort", goal_profile_abort_cmd, block=False))
     app.add_handler(CommandHandler("backtest", cmd_backtest, block=False))
     app.add_handler(CommandHandler("universe_backtest", cmd_universe_backtest, block=False))
 
