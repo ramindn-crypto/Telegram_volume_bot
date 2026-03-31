@@ -1069,8 +1069,8 @@ def _strategy_config_defaults() -> dict:
         "context_tf_2": "4h",
 
         # Quality floors (0..100)
-        "quality_score_min_screen":  67.0,
-        "quality_score_min_email":  72.0,
+        "quality_score_min_screen":  68.0,
+        "quality_score_min_email":  71.0,
 
         # Regime thresholds (used by backtest generator + some live scoring)
         "regime_slope_trend_min_pct": 0.06,
@@ -1109,7 +1109,7 @@ def _strategy_config_defaults() -> dict:
         "target_setups_per_day_hi": 1.5,
 
         # Explicit production execution profile (no hidden session clamp).
-        "execution_profile_version": 20260331.1,
+        "execution_profile_version": 20260331.2,
         "execution_profile_mode": "LON_PULLBACK_ONLY",
         "executable_allowed_sessions": ["LON"],
         "executable_allowed_engines": ["A"],
@@ -1451,7 +1451,7 @@ def _strategy_config_bootstrap_recommendations() -> None:
             prof_ver = float(cfg.get('execution_profile_version', 0.0) or 0.0)
         except Exception:
             prof_ver = 0.0
-        target_profile_ver = 20260331.1
+        target_profile_ver = 20260331.2
         if prof_ver < target_profile_ver:
             cfg['execution_profile_version'] = target_profile_ver
             cfg['execution_profile_mode'] = 'LON_PULLBACK_ONLY'
@@ -1463,8 +1463,8 @@ def _strategy_config_bootstrap_recommendations() -> None:
             cfg['execution_asia_user_override'] = True
             cfg['execution_engine_b_email_enabled'] = False
             cfg['execution_engine_c_email_enabled'] = False
-            cfg['quality_score_min_screen'] = 67.0
-            cfg['quality_score_min_email'] = 72.0
+            cfg['quality_score_min_screen'] = 68.0
+            cfg['quality_score_min_email'] = 71.0
             cfg['min_rr_tp'] = 1.30
             cfg['target_setups_per_day_lo'] = 0.5
             cfg['target_setups_per_day_hi'] = 1.5
@@ -21158,7 +21158,18 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
 
         if pb_dist > max_pb:
             return (False, 'entry_far_from_pullback_ema')
-        if ch15_abs > max_ch15:
+        lon_exec_extension_ok = False
+        if fixed_lon_pullback and str(source or '').strip().lower() == 'exec' and sess == 'LON' and engine == 'A':
+            lon_exec_extension_ok = bool(
+                score >= 74.0
+                and conf >= 78
+                and pb_dist <= 0.24
+                and ch1_abs >= 0.24
+                and ch4_abs >= 0.55
+                and (atr_pct <= 0.0 or atr_pct <= 4.2)
+                and ch15_abs <= (max_ch15 + 0.05)
+            )
+        if ch15_abs > max_ch15 and not lon_exec_extension_ok:
             return (False, 'entry_too_extended_15m')
         if engine not in {'B', 'C'} and ch1_abs > max_ch1:
             return (False, 'entry_too_extended_1h')
@@ -21170,9 +21181,9 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
         fixed_lon_pullback = _strategy_cfg_is_fixed_lon_pullback(cfg_live)
         if engine == 'A':
             if fixed_lon_pullback and str(source or '').strip().lower() == 'exec' and sess == 'LON':
-                if ch4_abs < 0.45 or ch1_abs < 0.18:
+                if ch4_abs < 0.40 or ch1_abs < 0.16:
                     return (False, 'lon_pullback_context_too_weak')
-                if ch24_abs > 11.5 and pb_dist > 0.30:
+                if ch24_abs > 12.5 and pb_dist > 0.34:
                     return (False, 'lon_trend_overheated')
             else:
                 if sess == 'LON' and (ch4_abs < 0.70 or ch1_abs < 0.34):
@@ -21242,7 +21253,7 @@ def is_top_setup_eligible(
             min_score = float(QUALITY_SCORE_MIN_SCREEN)
         elif src == "exec":
             if fixed_lon_pullback and sess == 'LON' and engine == 'A':
-                min_score = float(max(68.0, QUALITY_SCORE_MIN_SCREEN + 1.0))
+                min_score = float(max(69.0, QUALITY_SCORE_MIN_SCREEN + 1.0))
             else:
                 min_score = float(max(QUALITY_SCORE_MIN_SCREEN + 3.0, QUALITY_SCORE_MIN_EMAIL - 2.0))
         else:
@@ -21395,7 +21406,7 @@ def is_executable_setup_eligible(
             if engine != 'A':
                 return (False, 'exec_engine_disabled')
 
-            score_floor = max(74.0, float(min_quality or 70.0), float(QUALITY_SCORE_MIN_EMAIL))
+            score_floor = max(73.0, float(min_quality or 70.0), float(QUALITY_SCORE_MIN_EMAIL) + 1.0)
             conf_floor = max(76, int(min_conf or 78))
             rr_floor = max(1.30, float(min_rr_final or 0.0))
 
@@ -21409,17 +21420,25 @@ def is_executable_setup_eligible(
                 return (False, 'lon_below_liquidity')
             if not pullback_ready:
                 return (False, 'pullback_not_ready')
-            if pb_dist > 0.42:
+            strong_lon_exec = bool(
+                score >= 74.0
+                and conf >= 78
+                and pb_dist <= 0.24
+                and ch1_abs >= 0.24
+                and ch4_abs >= 0.55
+                and (atr_pct <= 0.0 or atr_pct <= 4.2)
+            )
+            if pb_dist > 0.44:
                 return (False, 'lon_entry_too_far_from_ema')
-            if ch15_abs > 0.34:
+            if ch15_abs > 0.34 and not (strong_lon_exec and ch15_abs <= 0.40):
                 return (False, 'lon_late_extension_exec')
-            if ch1_abs < 0.18:
+            if ch1_abs < 0.16:
                 return (False, 'lon_context_too_weak_exec')
             if ch1_abs > 0.90:
                 return (False, 'lon_late_extension_exec')
-            if ch4_abs < 0.45:
+            if ch4_abs < 0.40:
                 return (False, 'lon_context_too_weak_exec')
-            if ch4_abs > 2.20 or ch24_abs > 11.0:
+            if ch4_abs > 2.30 or ch24_abs > 12.0:
                 return (False, 'lon_trend_overheated_exec')
             if atr_pct > 0.0 and atr_pct > 4.8:
                 return (False, 'lon_volatility_too_high_exec')
