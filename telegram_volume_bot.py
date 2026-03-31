@@ -1040,6 +1040,7 @@ MOVER_DN_24H_MAX = -10.0
 
 STRATEGY_CONFIG_KEY_ACTIVE = "active"
 STRATEGY_CONFIG_KEY_OPT_REPORT = "opt_report"
+STRATEGY_CONFIG_KEY_GOAL_REPORT = "goal_profile_report"
 
 def _strategy_config_migrate():
     """Ensure strategy_config table exists."""
@@ -1069,8 +1070,8 @@ def _strategy_config_defaults() -> dict:
         "context_tf_2": "4h",
 
         # Quality floors (0..100)
-        "quality_score_min_screen":  68.0,
-        "quality_score_min_email":  71.0,
+        "quality_score_min_screen": float(QUALITY_SCORE_MIN_SCREEN),
+        "quality_score_min_email": float(QUALITY_SCORE_MIN_EMAIL),
 
         # Regime thresholds (used by backtest generator + some live scoring)
         "regime_slope_trend_min_pct": 0.06,
@@ -1089,8 +1090,8 @@ def _strategy_config_defaults() -> dict:
         "tf_align_4h_min_abs": float(TF_ALIGN_4H_MIN_ABS),
 
         # RR floor
-        "min_rr_tp":  1.30,
-        "min_rr_tp": 1.30,
+        "min_rr_tp": float(MIN_RR_TP),
+        "min_rr_tp": float(MIN_RR_TP),
 
         # Score weights (must sum ~1.0; scaled to 100 in compute_setup_quality_score)
         "score_w_conf": 0.45,
@@ -1105,19 +1106,13 @@ def _strategy_config_defaults() -> dict:
         "score_w_smf": 0.01,
 
         # Frequency targeting (used in /optimize objective)
-        "target_setups_per_day_lo": 0.5,
-        "target_setups_per_day_hi": 1.5,
-
-        # Explicit production execution profile (no hidden session clamp).
-        "execution_profile_version": 20260331.2,
-        "execution_profile_mode": "LON_PULLBACK_ONLY",
-        "executable_allowed_sessions": ["LON"],
-        "executable_allowed_engines": ["A"],
+        "target_setups_per_day_lo": 1.0,
+        "target_setups_per_day_hi": 3.0,
 
         # Self-optimization governance
-        "session_weights": {"NY": 0.0, "LON": 1.0, "ASIA": 0.0},
+        "session_weights": {"NY": 0.45, "LON": 0.40, "ASIA": 0.15},  # optimizer weighting (cross-session executable pool with NY/LON preference)
         "high_win_mode": False,
-        "execution_sessions_allowed": ["LON"],
+        "execution_sessions_allowed": ["NY", "LON", "ASIA"],
         "preferred_trade_window": {"start": "00:00", "end": "23:59"},
         "concentration_cap": 0.25,          # no single symbol >25% of setups (OOS)
         "oos_min_setups": 30,               # minimum OOS sample size across universe before promotion
@@ -1126,10 +1121,10 @@ def _strategy_config_defaults() -> dict:
         "max_drawdown_R_cap": 8.0,          # OOS max drawdown cap in R (penalize heavily above)
 
         # Setup-count governor (live engine + optimizer)
-        "governor_enabled": False,
+        "governor_enabled": True,
         "governor_window_hours": 24,
-        "governor_target_lo": 0.5,
-        "governor_target_hi": 1.5,
+        "governor_target_lo": 1.0,
+        "governor_target_hi": 3.0,
         "governor_step_score": 1.0,         # +/- points applied to quality_score_min_email when adjusting
         "governor_score_min": 52.0,         # absolute lower bound for quality_score_min_email
         "governor_score_max": 82.0,         # absolute upper bound for quality_score_min_email
@@ -1165,15 +1160,40 @@ def _strategy_config_defaults() -> dict:
         "universe_backtest_windows": [7, 30],
         "universe_backtest_exec_tf": "15m",
 
+        # Goal-profile optimizer (bounded search toward commercial setup quality targets)
+        "goal_profile_enabled": True,
+        "goal_profile_interval_hours": 24.0,
+        "goal_profile_cooldown_hours": 20.0,
+        "goal_profile_target_setups_per_day_lo": 1.0,
+        "goal_profile_target_setups_per_day_hi": 3.0,
+        "goal_profile_target_win_rate": 50.0,
+        "goal_profile_target_avg_r": 0.10,
+        "goal_profile_min_live_setups_30d": 8,
+        "goal_profile_min_live_setups_7d": 2,
+        "goal_profile_candidate_bundles": [
+            {"name": "strict", "quality_score_min_screen": 64.0, "quality_score_min_email": 72.0, "tf_align_1h_min_abs": 0.65, "tf_align_4h_min_abs": 0.60, "atr_min_pct": 1.00, "min_rr_tp": 1.45, "regime_slope_trend_min_pct": 0.060, "lon_quality_add": 1.0, "lon_conf_add": 1, "lon_rr_add": 0.04},
+            {"name": "balanced", "quality_score_min_screen": 62.0, "quality_score_min_email": 70.0, "tf_align_1h_min_abs": 0.55, "tf_align_4h_min_abs": 0.50, "atr_min_pct": 0.95, "min_rr_tp": 1.40, "regime_slope_trend_min_pct": 0.055, "lon_quality_add": 0.0, "lon_conf_add": 0, "lon_rr_add": 0.00},
+            {"name": "flex", "quality_score_min_screen": 60.0, "quality_score_min_email": 68.0, "tf_align_1h_min_abs": 0.45, "tf_align_4h_min_abs": 0.45, "atr_min_pct": 0.85, "min_rr_tp": 1.35, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -1.0, "lon_conf_add": -1, "lon_rr_add": -0.04},
+            {"name": "rr_bias", "quality_score_min_screen": 61.0, "quality_score_min_email": 69.0, "tf_align_1h_min_abs": 0.50, "tf_align_4h_min_abs": 0.45, "atr_min_pct": 0.90, "min_rr_tp": 1.50, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -1.0, "lon_conf_add": 0, "lon_rr_add": 0.08},
+        ],
+        "goal_profile_candidate_profiles": [
+            {"name": "LON_A_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+            {"name": "LON_A_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+            {"name": "LON_NY_A_ONLY", "execution_sessions_allowed": ["LON", "NY"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+        ],
+        "execution_engines_allowed": ["A", "B", "C"],
+        "goal_profile_active_profile": "BASELINE",
+        "goal_profile_last_run_ts": 0.0,
+
         # Daily market-adaptive universe optimizer (runtime params only; no source rewriting)
-        "market_adaptive_enabled": False,
+        "market_adaptive_enabled": True,
         "market_adaptive_interval_hours": 24.0,
         "market_adaptive_first_delay_sec": 45,
         "market_adaptive_days": 30,
         "market_adaptive_max_passes": 2,
         "market_adaptive_min_improvement": 0.35,
-        "market_adaptive_target_setups_per_day_lo": 0.5,
-        "market_adaptive_target_setups_per_day_hi": 1.5,
+        "market_adaptive_target_setups_per_day_lo": 1.0,
+        "market_adaptive_target_setups_per_day_hi": 3.0,
         "market_adaptive_session_wr_floor_ny": 46.0,
         "market_adaptive_session_wr_floor_lon": 48.0,
         "market_adaptive_cooldown_hours": 20.0,
@@ -1192,10 +1212,9 @@ def _strategy_config_defaults() -> dict:
         "counter_regime_quality_add": {"NY": 2.5, "LON": 2.5, "ASIA": 3.0},
         "counter_regime_conf_add": {"NY": 2, "LON": 2, "ASIA": 3},
         "counter_regime_rr_add": {"NY": 0.10, "LON": 0.10, "ASIA": 0.12},
-        "execution_asia_enabled": False,
-        "execution_asia_user_override": True,
-        "execution_engine_b_email_enabled": False,
-        "execution_engine_c_email_enabled": False,
+        "execution_asia_enabled": bool(EXECUTION_ASIA_ENABLED),
+        "execution_asia_user_override": False,
+        "execution_engine_b_email_enabled": bool(EXECUTION_ENGINE_B_EMAIL_ENABLED),
         "session_exec_overrides": {
             "NY": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
             "LON": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
@@ -1270,6 +1289,35 @@ def load_opt_report() -> dict:
         pass
     return {}
 
+
+def save_goal_profile_report(report: dict) -> None:
+    _strategy_config_migrate()
+    try:
+        payload = json.dumps(report, ensure_ascii=False, sort_keys=True)
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO strategy_config(key,value,updated_ts) VALUES(?,?,?)",
+                (STRATEGY_CONFIG_KEY_GOAL_REPORT, payload, float(time.time()))
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def load_goal_profile_report() -> dict:
+    _strategy_config_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute("SELECT value FROM strategy_config WHERE key=?", (STRATEGY_CONFIG_KEY_GOAL_REPORT,)).fetchone()
+            if row and row[0]:
+                obj = json.loads(row[0])
+                return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    return {}
+
 def _clamp(v: float, lo: float, hi: float) -> float:
     try:
         return max(float(lo), min(float(hi), float(v)))
@@ -1292,48 +1340,20 @@ def _cfg_bool(value, default: bool = False) -> bool:
         return bool(default)
 
 def _strategy_cfg_execution_asia_enabled(cfg: dict | None) -> bool:
-    """Return the explicit ASIA execution setting only.
+    """ASIA execution defaults to ON unless an explicit manual override disables it.
 
-    The redesigned executable lane must never silently re-enable ASIA on startup.
+    This prevents older auto-disabled config states from silently keeping ASIA off forever,
+    while still allowing a deliberate /params_set execution_asia_enabled false choice.
     """
     try:
         cfg = cfg or {}
-        return _cfg_bool((cfg or {}).get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED))
+        manual = _cfg_bool((cfg or {}).get('execution_asia_user_override', False), False)
+        enabled = _cfg_bool((cfg or {}).get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED))
+        if manual:
+            return bool(enabled)
+        return bool(enabled) or bool(EXECUTION_ASIA_ENABLED)
     except Exception:
         return bool(EXECUTION_ASIA_ENABLED)
-
-
-def _strategy_cfg_exec_mode(cfg: dict | None) -> str:
-    try:
-        return str((cfg or {}).get('execution_profile_mode', 'BALANCED') or 'BALANCED').upper().strip()
-    except Exception:
-        return 'BALANCED'
-
-
-def _strategy_cfg_exec_allowed_sessions(cfg: dict | None) -> set[str]:
-    try:
-        raw = (cfg or {}).get('executable_allowed_sessions') or (cfg or {}).get('execution_sessions_allowed') or ['LON']
-        out = {str(x).upper().strip() for x in raw if str(x).strip()}
-        return out or {'LON'}
-    except Exception:
-        return {'LON'}
-
-
-def _strategy_cfg_exec_allowed_engines(cfg: dict | None) -> set[str]:
-    try:
-        raw = (cfg or {}).get('executable_allowed_engines') or ['A']
-        out = {str(x).upper().strip() for x in raw if str(x).strip()}
-        return out or {'A'}
-    except Exception:
-        return {'A'}
-
-
-def _strategy_cfg_is_fixed_lon_pullback(cfg: dict | None) -> bool:
-    try:
-        mode = _strategy_cfg_exec_mode(cfg)
-        return mode == 'LON_PULLBACK_ONLY'
-    except Exception:
-        return False
 
 def _strategy_cfg_high_win_mode(cfg: dict | None) -> bool:
     try:
@@ -1348,6 +1368,16 @@ def _strategy_cfg_execution_sessions_allowed(cfg: dict | None) -> set[str]:
         return out or {'NY', 'LON', 'ASIA'}
     except Exception:
         return {'NY', 'LON', 'ASIA'}
+
+
+def _strategy_cfg_execution_engines_allowed(cfg: dict | None) -> set[str]:
+    try:
+        raw = (cfg or {}).get('execution_engines_allowed', ['A', 'B', 'C']) or ['A', 'B', 'C']
+        out = {str(x).upper().strip() for x in raw if str(x).strip()}
+        cleaned = {x for x in out if x in {'A', 'B', 'C'}}
+        return cleaned or {'A', 'B', 'C'}
+    except Exception:
+        return {'A', 'B', 'C'}
 
 def _strategy_cfg_preferred_trade_window(cfg: dict | None) -> tuple[str, str]:
     try:
@@ -1382,42 +1412,47 @@ def _strategy_config_bootstrap_recommendations() -> None:
             lo = float(cfg.get('target_setups_per_day_lo', 0.0) or 0.0)
             hi = float(cfg.get('target_setups_per_day_hi', 0.0) or 0.0)
             if lo <= 0 or abs(lo - 1.0) > 0.001:
-                cfg['target_setups_per_day_lo'] = 0.5
+                cfg['target_setups_per_day_lo'] = 1.0
                 changed = True
             if hi <= 0 or abs(hi - 3.0) > 0.001:
-                cfg['target_setups_per_day_hi'] = 1.5
+                cfg['target_setups_per_day_hi'] = 3.0
                 changed = True
         except Exception:
-            cfg['target_setups_per_day_lo'] = 0.5
-            cfg['target_setups_per_day_hi'] = 1.5
+            cfg['target_setups_per_day_lo'] = 1.0
+            cfg['target_setups_per_day_hi'] = 3.0
             changed = True
 
         try:
             glo = float(cfg.get('governor_target_lo', 0.0) or 0.0)
             ghi = float(cfg.get('governor_target_hi', 0.0) or 0.0)
             if glo <= 0 or abs(glo - 1.0) > 0.001:
-                cfg['governor_target_lo'] = 0.5
+                cfg['governor_target_lo'] = 1.0
                 changed = True
             if ghi <= 0 or abs(ghi - 3.0) > 0.001:
-                cfg['governor_target_hi'] = 1.5
+                cfg['governor_target_hi'] = 3.0
                 changed = True
         except Exception:
-            cfg['governor_target_lo'] = 0.5
-            cfg['governor_target_hi'] = 1.5
+            cfg['governor_target_lo'] = 1.0
+            cfg['governor_target_hi'] = 3.0
             changed = True
 
         try:
             mlo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 0.0) or 0.0)
             mhi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 0.0) or 0.0)
             if mlo <= 0 or abs(mlo - 1.0) > 0.001:
-                cfg['market_adaptive_target_setups_per_day_lo'] = 0.5
+                cfg['market_adaptive_target_setups_per_day_lo'] = 1.0
                 changed = True
             if mhi <= 0 or abs(mhi - 3.0) > 0.001:
-                cfg['market_adaptive_target_setups_per_day_hi'] = 1.5
+                cfg['market_adaptive_target_setups_per_day_hi'] = 3.0
                 changed = True
         except Exception:
-            cfg['market_adaptive_target_setups_per_day_lo'] = 0.5
-            cfg['market_adaptive_target_setups_per_day_hi'] = 1.5
+            cfg['market_adaptive_target_setups_per_day_lo'] = 1.0
+            cfg['market_adaptive_target_setups_per_day_hi'] = 3.0
+            changed = True
+
+        manual_asia = _cfg_bool(cfg.get('execution_asia_user_override', False), False)
+        if not manual_asia and not _cfg_bool(cfg.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED)):
+            cfg['execution_asia_enabled'] = True
             changed = True
 
         stale_lon_only = (
@@ -1445,38 +1480,10 @@ def _strategy_config_bootstrap_recommendations() -> None:
                 'LON': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.00},
                 'ASIA': {'quality_add': 1.5, 'conf_add': 1, 'rr_add': 0.10},
             }
-            changed = True        # Apply the decisive March-31 redesign once so stale runtime config cannot preserve
-        # the weak multi-session mixed executable lane after redeploy.
-        try:
-            prof_ver = float(cfg.get('execution_profile_version', 0.0) or 0.0)
-        except Exception:
-            prof_ver = 0.0
-        target_profile_ver = 20260331.2
-        if prof_ver < target_profile_ver:
-            cfg['execution_profile_version'] = target_profile_ver
-            cfg['execution_profile_mode'] = 'LON_PULLBACK_ONLY'
-            cfg['executable_allowed_sessions'] = ['LON']
-            cfg['executable_allowed_engines'] = ['A']
-            cfg['execution_sessions_allowed'] = ['LON']
-            cfg['session_weights'] = {'NY': 0.0, 'LON': 1.0, 'ASIA': 0.0}
-            cfg['execution_asia_enabled'] = False
-            cfg['execution_asia_user_override'] = True
-            cfg['execution_engine_b_email_enabled'] = False
-            cfg['execution_engine_c_email_enabled'] = False
-            cfg['quality_score_min_screen'] = 68.0
-            cfg['quality_score_min_email'] = 71.0
-            cfg['min_rr_tp'] = 1.30
-            cfg['target_setups_per_day_lo'] = 0.5
-            cfg['target_setups_per_day_hi'] = 1.5
-            cfg['governor_enabled'] = False
-            cfg['market_adaptive_enabled'] = False
-            cfg['session_exec_overrides'] = {
-                'NY': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0},
-                'LON': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0},
-                'ASIA': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0},
-            }
             changed = True
 
+        # Cap stale live-tightened floors so a previous adaptive/governor run cannot
+        # silently keep the bot above the 1–3 setups/day target after redeploy.
         try:
             q_screen = float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
             if q_screen > 68.0:
@@ -1495,6 +1502,30 @@ def _strategy_config_bootstrap_recommendations() -> None:
             rr_live = float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP)
             if rr_live > 1.46:
                 cfg['min_rr_tp'] = 1.46
+                changed = True
+        except Exception:
+            pass
+
+        try:
+            if 'execution_engines_allowed' not in cfg or not isinstance(cfg.get('execution_engines_allowed'), list):
+                cfg['execution_engines_allowed'] = ['A', 'B', 'C']
+                changed = True
+        except Exception:
+            cfg['execution_engines_allowed'] = ['A', 'B', 'C']
+            changed = True
+
+        try:
+            if 'goal_profile_target_setups_per_day_lo' not in cfg:
+                cfg['goal_profile_target_setups_per_day_lo'] = 1.0
+                changed = True
+            if 'goal_profile_target_setups_per_day_hi' not in cfg:
+                cfg['goal_profile_target_setups_per_day_hi'] = 3.0
+                changed = True
+            if 'goal_profile_target_win_rate' not in cfg:
+                cfg['goal_profile_target_win_rate'] = 50.0
+                changed = True
+            if 'goal_profile_target_avg_r' not in cfg:
+                cfg['goal_profile_target_avg_r'] = 0.10
                 changed = True
         except Exception:
             pass
@@ -15589,8 +15620,8 @@ def _objective(oos: list[dict], days: int, cfg: dict) -> float:
     win_rate = (wr_num / w_sum) if w_sum else 0.0
 
     # Frequency penalty (target band)
-    lo = float(cfg.get("target_setups_per_day_lo", 0.5))
-    hi = float(cfg.get("target_setups_per_day_hi", 1.5))
+    lo = float(cfg.get("target_setups_per_day_lo", 1.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 3.0))
     freq_pen = 0.0
     if setups_day < lo:
         freq_pen = (lo - setups_day) * 4.0
@@ -15704,8 +15735,8 @@ def _objective(oos: list[dict], days: int, cfg: dict) -> float:
     pf /= n
     dd /= n
 
-    lo = float(cfg.get("target_setups_per_day_lo", 0.5))
-    hi = float(cfg.get("target_setups_per_day_hi", 1.5))
+    lo = float(cfg.get("target_setups_per_day_lo", 1.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 3.0))
     freq_pen = 0.0
     if setups_day < lo:
         freq_pen = (lo - setups_day) * 2.0
@@ -19404,8 +19435,8 @@ def _governor_adjust_quality_floor(session_name: str = "NY") -> Optional[dict]:
 
     try:
         window_h = float(cfg.get("governor_window_hours", 24) or 24)
-        target_lo = float(cfg.get("governor_target_lo", cfg.get("target_setups_per_day_lo", 0.5)) or 0.5)
-        target_hi = float(cfg.get("governor_target_hi", cfg.get("target_setups_per_day_hi", 1.5)) or 1.5)
+        target_lo = float(cfg.get("governor_target_lo", cfg.get("target_setups_per_day_lo", 3.0)) or 3.0)
+        target_hi = float(cfg.get("governor_target_hi", cfg.get("target_setups_per_day_hi", 5.0)) or 5.0)
         step = float(cfg.get("governor_step_score", 1.0) or 1.0)
         smin = float(cfg.get("governor_score_min", 52.0) or 52.0)
         smax = float(cfg.get("governor_score_max", 82.0) or 82.0)
@@ -19478,8 +19509,8 @@ def _self_opt_stability_gates(metrics: dict, cfg: dict) -> tuple[bool, list[str]
     if total_setups < min_setups:
         reasons.append(f"oos_sample_too_small ({total_setups} < {min_setups})")
 
-    lo = float(cfg.get("target_setups_per_day_lo", 0.5))
-    hi = float(cfg.get("target_setups_per_day_hi", 1.5))
+    lo = float(cfg.get("target_setups_per_day_lo", 1.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 3.0))
     if setups_day < lo:
         reasons.append(f"frequency_too_low ({setups_day:.2f} < {lo:.2f})")
     if setups_day > hi * 1.25:
@@ -19526,7 +19557,7 @@ def _self_opt_format_report(res: dict) -> str:
         f"Decision: {'✅ PROMOTED' if promoted else '❌ NOT PROMOTED'}",
         f"Chosen exec TF: {chosen_tf} | Objective: {score:.3f}",
         SEP,
-        f"OOS setups/day: {float(oos.get('setups_per_day',0.0) or 0.0):.2f} (target {float(p.get('target_setups_per_day_lo',0.5) or 0.5):.1f}–{float(p.get('target_setups_per_day_hi',1.5) or 1.5):.1f})",
+        f"OOS setups/day: {float(oos.get('setups_per_day',0.0) or 0.0):.2f} (target {float(p.get('target_setups_per_day_lo',1.0) or 1.0):.0f}–{float(p.get('target_setups_per_day_hi',3.0) or 3.0):.0f})",
         f"OOS setups: {int(oos.get('setups',0) or 0)} | Win rate: {float(oos.get('win_rate',0.0) or 0.0):.1f}%",
         f"OOS Avg R: {float(oos.get('avg_R',0.0) or 0.0):.3f} | PF: {float(oos.get('profit_factor',0.0) or 0.0):.2f} | MaxDD(R): {float(oos.get('max_drawdown_R',0.0) or 0.0):.2f}",
         f"Concentration: top_symbol_share={float(oos.get('top_symbol_share',0.0) or 0.0):.1%}",
@@ -20211,8 +20242,8 @@ def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
     avg_r = float(overall.get('avg_R', 0.0) or 0.0)
     pf = float(overall.get('profit_factor', 0.0) or 0.0)
 
-    lo = float((cfg or {}).get('market_adaptive_target_setups_per_day_lo', 0.5) or 0.5)
-    hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 1.5) or 1.5)
+    lo = float((cfg or {}).get('market_adaptive_target_setups_per_day_lo', 1.0) or 1.0)
+    hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 3.0) or 3.0)
     ny_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
     lon_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
 
@@ -20275,7 +20306,6 @@ def _market_adaptive_apply_action(cfg: dict, actions: list[dict], param: str, va
 def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
     out = json.loads(json.dumps(cfg or {}))
     bounds = (out.get('opt_bounds') or {})
-    fixed_lon_pullback = _strategy_cfg_is_fixed_lon_pullback(out)
 
     def _rng(name: str, lo: float, hi: float) -> tuple[float, float]:
         try:
@@ -20297,14 +20327,6 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
     out['tf_align_1h_min_abs'] = float(clamp(float(out.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), tlo, thi))
     out['execution_asia_enabled'] = _strategy_cfg_execution_asia_enabled(out)
     out['execution_engine_b_email_enabled'] = _cfg_bool(out.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
-    out['execution_engine_c_email_enabled'] = _cfg_bool(out.get('execution_engine_c_email_enabled', False), False)
-    if fixed_lon_pullback:
-        out['execution_asia_enabled'] = False
-        out['execution_engine_b_email_enabled'] = False
-        out['execution_engine_c_email_enabled'] = False
-        out['execution_sessions_allowed'] = ['LON']
-        out['executable_allowed_sessions'] = ['LON']
-        out['executable_allowed_engines'] = ['A']
     sess_ov = out.get('session_exec_overrides') or {}
     norm_ov = {}
     for sess in ('NY', 'LON', 'ASIA'):
@@ -20320,8 +20342,6 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
 
 def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], list[str]]:
     cfg = _market_adaptive_clamp_cfg(cfg)
-    if _strategy_cfg_is_fixed_lon_pullback(cfg):
-        return [], ['Fixed LON pullback-only execution profile active; adaptive cross-session and multi-engine actions are disabled.']
     overall = (rep or {}).get('overall') or {}
     per_session = (rep or {}).get('per_session') or {}
     metrics = (rep or {}).get('metrics') or {}
@@ -20333,8 +20353,8 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
     wr = float(overall.get('win_rate', 0.0) or 0.0)
     avg_r = float(overall.get('avg_R', 0.0) or 0.0)
     total_setups = int(overall.get('setups', 0) or 0)
-    lo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 0.5) or 0.5)
-    hi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 1.5) or 1.5)
+    lo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 1.0) or 1.0)
+    hi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 3.0) or 3.0)
     ny_floor = float(cfg.get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
     lon_floor = float(cfg.get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
 
@@ -21113,6 +21133,375 @@ async def cmd_self_optimize_report(update: Update, context: ContextTypes.DEFAULT
     await send_long_message(update, _self_opt_format_report(res), parse_mode=None)
 
 
+
+
+# =========================================================
+# GOAL-PROFILE OPTIMIZER — bounded objective search toward target setups/day + WR
+# =========================================================
+_GOAL_PROFILE_LOCK = threading.Lock()
+
+
+def _goal_profile_targets(cfg: dict | None = None) -> dict:
+    cfg = cfg or load_strategy_config(force=False)
+    return {
+        'enabled': _cfg_bool((cfg or {}).get('goal_profile_enabled', True), True),
+        'interval_hours': float((cfg or {}).get('goal_profile_interval_hours', 24.0) or 24.0),
+        'cooldown_hours': float((cfg or {}).get('goal_profile_cooldown_hours', 20.0) or 20.0),
+        'target_lo': float((cfg or {}).get('goal_profile_target_setups_per_day_lo', 1.0) or 1.0),
+        'target_hi': float((cfg or {}).get('goal_profile_target_setups_per_day_hi', 3.0) or 3.0),
+        'target_wr': float((cfg or {}).get('goal_profile_target_win_rate', 50.0) or 50.0),
+        'target_avg_r': float((cfg or {}).get('goal_profile_target_avg_r', 0.10) or 0.10),
+        'min_live_30d': int((cfg or {}).get('goal_profile_min_live_setups_30d', 8) or 8),
+        'min_live_7d': int((cfg or {}).get('goal_profile_min_live_setups_7d', 2) or 2),
+    }
+
+
+def _goal_profile_candidate_profiles(cfg: dict | None = None) -> list[dict]:
+    cfg = cfg or load_strategy_config(force=False)
+    out = []
+    raw = list((cfg or {}).get('goal_profile_candidate_profiles') or [])
+    for item in raw:
+        try:
+            name = str((item or {}).get('name') or '').strip() or 'PROFILE'
+            sessions = [str(x).upper().strip() for x in ((item or {}).get('execution_sessions_allowed') or []) if str(x).strip()]
+            engines = [str(x).upper().strip() for x in ((item or {}).get('execution_engines_allowed') or []) if str(x).strip()]
+            out.append({
+                'name': name,
+                'execution_sessions_allowed': sessions or ['LON'],
+                'execution_engines_allowed': engines or ['A'],
+                'execution_asia_enabled': _cfg_bool((item or {}).get('execution_asia_enabled', False), False),
+                'execution_engine_b_email_enabled': _cfg_bool((item or {}).get('execution_engine_b_email_enabled', False), False),
+            })
+        except Exception:
+            continue
+    if out:
+        return out
+    return [
+        {'name': 'LON_A_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
+        {'name': 'LON_A_C_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A', 'C'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
+        {'name': 'LON_NY_A_ONLY', 'execution_sessions_allowed': ['LON', 'NY'], 'execution_engines_allowed': ['A'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
+    ]
+
+
+def _goal_profile_candidate_bundles(cfg: dict | None = None) -> list[dict]:
+    cfg = cfg or load_strategy_config(force=False)
+    out = []
+    raw = list((cfg or {}).get('goal_profile_candidate_bundles') or [])
+    for item in raw:
+        try:
+            out.append({
+                'name': str((item or {}).get('name') or 'bundle').strip() or 'bundle',
+                'quality_score_min_screen': float((item or {}).get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN),
+                'quality_score_min_email': float((item or {}).get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
+                'tf_align_1h_min_abs': float((item or {}).get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS),
+                'tf_align_4h_min_abs': float((item or {}).get('tf_align_4h_min_abs', TF_ALIGN_4H_MIN_ABS) or TF_ALIGN_4H_MIN_ABS),
+                'atr_min_pct': float((item or {}).get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT),
+                'min_rr_tp': float((item or {}).get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP),
+                'regime_slope_trend_min_pct': float((item or {}).get('regime_slope_trend_min_pct', 0.06) or 0.06),
+                'lon_quality_add': float((item or {}).get('lon_quality_add', 0.0) or 0.0),
+                'lon_conf_add': int(round(float((item or {}).get('lon_conf_add', 0) or 0))),
+                'lon_rr_add': float((item or {}).get('lon_rr_add', 0.0) or 0.0),
+            })
+        except Exception:
+            continue
+    if out:
+        return out
+    return [
+        {'name': 'strict', 'quality_score_min_screen': 64.0, 'quality_score_min_email': 72.0, 'tf_align_1h_min_abs': 0.65, 'tf_align_4h_min_abs': 0.60, 'atr_min_pct': 1.00, 'min_rr_tp': 1.45, 'regime_slope_trend_min_pct': 0.060, 'lon_quality_add': 1.0, 'lon_conf_add': 1, 'lon_rr_add': 0.04},
+        {'name': 'balanced', 'quality_score_min_screen': 62.0, 'quality_score_min_email': 70.0, 'tf_align_1h_min_abs': 0.55, 'tf_align_4h_min_abs': 0.50, 'atr_min_pct': 0.95, 'min_rr_tp': 1.40, 'regime_slope_trend_min_pct': 0.055, 'lon_quality_add': 0.0, 'lon_conf_add': 0, 'lon_rr_add': 0.00},
+        {'name': 'flex', 'quality_score_min_screen': 60.0, 'quality_score_min_email': 68.0, 'tf_align_1h_min_abs': 0.45, 'tf_align_4h_min_abs': 0.45, 'atr_min_pct': 0.85, 'min_rr_tp': 1.35, 'regime_slope_trend_min_pct': 0.050, 'lon_quality_add': -1.0, 'lon_conf_add': -1, 'lon_rr_add': -0.04},
+        {'name': 'rr_bias', 'quality_score_min_screen': 61.0, 'quality_score_min_email': 69.0, 'tf_align_1h_min_abs': 0.50, 'tf_align_4h_min_abs': 0.45, 'atr_min_pct': 0.90, 'min_rr_tp': 1.50, 'regime_slope_trend_min_pct': 0.050, 'lon_quality_add': -1.0, 'lon_conf_add': 0, 'lon_rr_add': 0.08},
+    ]
+
+
+def _goal_profile_apply_candidate(base_cfg: dict, profile: dict, bundle: dict) -> dict:
+    cfg = json.loads(json.dumps(base_cfg or {}))
+    cfg['quality_score_min_screen'] = float(bundle.get('quality_score_min_screen', cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN)))
+    cfg['quality_score_min_email'] = float(bundle.get('quality_score_min_email', cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL)))
+    cfg['tf_align_1h_min_abs'] = float(bundle.get('tf_align_1h_min_abs', cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS)))
+    cfg['tf_align_4h_min_abs'] = float(bundle.get('tf_align_4h_min_abs', cfg.get('tf_align_4h_min_abs', TF_ALIGN_4H_MIN_ABS)))
+    cfg['atr_min_pct'] = float(bundle.get('atr_min_pct', cfg.get('atr_min_pct', ATR_MIN_PCT)))
+    cfg['min_rr_tp'] = float(bundle.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP)))
+    cfg['regime_slope_trend_min_pct'] = float(bundle.get('regime_slope_trend_min_pct', cfg.get('regime_slope_trend_min_pct', 0.06)))
+    cfg['execution_sessions_allowed'] = [str(x).upper().strip() for x in (profile.get('execution_sessions_allowed') or ['LON']) if str(x).strip()]
+    cfg['execution_engines_allowed'] = [str(x).upper().strip() for x in (profile.get('execution_engines_allowed') or ['A']) if str(x).strip()]
+    cfg['execution_asia_enabled'] = bool(profile.get('execution_asia_enabled', False))
+    cfg['execution_asia_user_override'] = True
+    cfg['execution_engine_b_email_enabled'] = bool(profile.get('execution_engine_b_email_enabled', False))
+    cfg['goal_profile_active_profile'] = str(profile.get('name') or 'PROFILE')
+    sess_ov = json.loads(json.dumps(cfg.get('session_exec_overrides') or {}))
+    for sess in ('NY', 'LON', 'ASIA'):
+        sess_ov.setdefault(sess, {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0})
+    sess_ov['LON'] = {
+        'quality_add': float(bundle.get('lon_quality_add', 0.0) or 0.0),
+        'conf_add': int(bundle.get('lon_conf_add', 0) or 0),
+        'rr_add': float(bundle.get('lon_rr_add', 0.0) or 0.0),
+    }
+    if 'NY' not in cfg.get('execution_sessions_allowed', []):
+        sess_ov['NY'] = {'quality_add': max(2.0, float((sess_ov.get('NY') or {}).get('quality_add', 0.0) or 0.0)), 'conf_add': max(2, int((sess_ov.get('NY') or {}).get('conf_add', 0) or 0)), 'rr_add': max(0.12, float((sess_ov.get('NY') or {}).get('rr_add', 0.0) or 0.0))}
+    if 'ASIA' not in cfg.get('execution_sessions_allowed', []):
+        sess_ov['ASIA'] = {'quality_add': max(3.0, float((sess_ov.get('ASIA') or {}).get('quality_add', 0.0) or 0.0)), 'conf_add': max(3, int((sess_ov.get('ASIA') or {}).get('conf_add', 0) or 0)), 'rr_add': max(0.16, float((sess_ov.get('ASIA') or {}).get('rr_add', 0.0) or 0.0))}
+    cfg['session_exec_overrides'] = sess_ov
+    weights = {'NY': 0.0, 'LON': 0.0, 'ASIA': 0.0}
+    allowed = cfg.get('execution_sessions_allowed') or []
+    if allowed == ['LON']:
+        weights = {'NY': 0.0, 'LON': 1.0, 'ASIA': 0.0}
+    elif allowed == ['LON', 'NY'] or allowed == ['NY', 'LON']:
+        weights = {'NY': 0.35, 'LON': 0.65, 'ASIA': 0.0}
+    else:
+        for sess in allowed:
+            if sess in weights:
+                weights[sess] = 1.0
+        tot = sum(weights.values()) or 1.0
+        weights = {k: float(v) / float(tot) for k, v in weights.items()}
+    cfg['session_weights'] = weights
+    return cfg
+
+
+def _goal_profile_summary_from_rep(rep: dict) -> dict:
+    ov = dict((rep or {}).get('overall') or {})
+    return {
+        'setups': int(ov.get('setups', 0) or 0),
+        'setups_per_day': float(ov.get('setups_per_day', 0.0) or 0.0),
+        'win_rate': float(ov.get('win_rate', 0.0) or 0.0),
+        'avg_R': float(ov.get('avg_R', 0.0) or 0.0),
+    }
+
+
+def _goal_profile_score_candidate(rep30: dict, rep7: dict, cfg: dict) -> dict:
+    tgt = _goal_profile_targets(cfg)
+    s30 = _goal_profile_summary_from_rep(rep30)
+    s7 = _goal_profile_summary_from_rep(rep7)
+    n30 = int(s30['setups'])
+    n7 = int(s7['setups'])
+    sdp30 = float(s30['setups_per_day'])
+    sdp7 = float(s7['setups_per_day'])
+    wr30 = float(s30['win_rate'])
+    wr7 = float(s7['win_rate'])
+    ar30 = float(s30['avg_R'])
+    ar7 = float(s7['avg_R'])
+
+    def _freq_pen(v: float, lo: float, hi: float, weight_under: float, weight_over: float) -> float:
+        if v < lo:
+            return (lo - v) * weight_under
+        if v > hi:
+            return (v - hi) * weight_over
+        return 0.0
+
+    freq_pen = _freq_pen(sdp30, tgt['target_lo'], tgt['target_hi'], 38.0, 20.0) + _freq_pen(sdp7, tgt['target_lo'], tgt['target_hi'], 12.0, 6.0)
+    wr_pen = max(0.0, tgt['target_wr'] - wr30) * 3.0 + max(0.0, tgt['target_wr'] - wr7) * 0.8
+    avg_r_pen = max(0.0, tgt['target_avg_r'] - ar30) * 65.0 + max(0.0, tgt['target_avg_r'] - ar7) * 18.0
+    sample_pen = max(0, tgt['min_live_30d'] - n30) * 6.0 + max(0, tgt['min_live_7d'] - n7) * 4.0
+    instability_pen = abs(wr30 - wr7) * (0.10 if (n30 > 0 and n7 > 0) else 0.0)
+    zero_pen = 350.0 if n30 <= 0 else 0.0
+    score = (wr30 * 2.2) + (wr7 * 0.7) + (ar30 * 55.0) + (ar7 * 15.0) - freq_pen - wr_pen - avg_r_pen - sample_pen - instability_pen - zero_pen
+    feasible = bool(n30 >= tgt['min_live_30d'] and n7 >= tgt['min_live_7d'] and wr30 >= tgt['target_wr'] and ar30 >= tgt['target_avg_r'] and sdp30 >= (tgt['target_lo'] * 0.70) and sdp30 <= (tgt['target_hi'] * 1.25))
+    return {
+        'score': float(score),
+        'feasible': feasible,
+        'metrics_30d': s30,
+        'metrics_7d': s7,
+        'penalties': {
+            'freq_pen': float(freq_pen),
+            'wr_pen': float(wr_pen),
+            'avg_r_pen': float(avg_r_pen),
+            'sample_pen': float(sample_pen),
+            'instability_pen': float(instability_pen),
+            'zero_pen': float(zero_pen),
+        },
+    }
+
+
+def _run_goal_profile_cycle(force: bool = False) -> dict:
+    cfg0 = load_strategy_config(force=True)
+    tgt = _goal_profile_targets(cfg0)
+    if not tgt['enabled']:
+        rep = {'ok': False, 'status': 'DISABLED', 'ts': float(time.time()), 'targets': tgt}
+        save_goal_profile_report(rep)
+        return rep
+    if not _GOAL_PROFILE_LOCK.acquire(blocking=False):
+        return {'ok': False, 'status': 'BUSY', 'ts': float(time.time()), 'targets': tgt}
+    try:
+        last = load_goal_profile_report() or {}
+        if (not force) and float(last.get('applied_ts', 0.0) or 0.0) > 0 and (time.time() - float(last.get('applied_ts', 0.0) or 0.0)) < (tgt['cooldown_hours'] * 3600.0):
+            return {'ok': False, 'status': 'COOLDOWN', 'ts': float(time.time()), 'targets': tgt, 'last': last}
+
+        base_cfg = json.loads(json.dumps(cfg0 or {}))
+        exec_tf = str((base_cfg or {}).get('universe_backtest_exec_tf') or (base_cfg or {}).get('exec_tf_default') or '15m').strip().lower()
+        top_n = int((base_cfg or {}).get('universe_backtest_top_n', 80) or 80)
+
+        save_strategy_config(base_cfg)
+        apply_strategy_config(base_cfg)
+        baseline30 = run_universe_backtest(30, 'ALL', exec_tf, top_n, None, False, False)
+        baseline7 = run_universe_backtest(7, 'ALL', exec_tf, top_n, None, False, False)
+        baseline_eval = _goal_profile_score_candidate(baseline30, baseline7, base_cfg)
+
+        best_cfg = json.loads(json.dumps(base_cfg))
+        best_eval = dict(baseline_eval)
+        best_profile = {'name': 'BASELINE'}
+        best_bundle = {'name': 'current'}
+        candidates = []
+
+        for profile in _goal_profile_candidate_profiles(base_cfg):
+            for bundle in _goal_profile_candidate_bundles(base_cfg):
+                cand_cfg = _goal_profile_apply_candidate(base_cfg, profile, bundle)
+                save_strategy_config(cand_cfg)
+                apply_strategy_config(cand_cfg)
+                rep30 = run_universe_backtest(30, 'ALL', exec_tf, top_n, None, False, False)
+                rep7 = run_universe_backtest(7, 'ALL', exec_tf, top_n, None, False, False)
+                evald = _goal_profile_score_candidate(rep30, rep7, cand_cfg)
+                row = {
+                    'profile': str(profile.get('name') or ''),
+                    'bundle': str(bundle.get('name') or ''),
+                    'score': float(evald.get('score', -1e9)),
+                    'feasible': bool(evald.get('feasible')),
+                    'metrics_30d': evald.get('metrics_30d') or {},
+                    'metrics_7d': evald.get('metrics_7d') or {},
+                    'penalties': evald.get('penalties') or {},
+                    'execution_sessions_allowed': list(cand_cfg.get('execution_sessions_allowed') or []),
+                    'execution_engines_allowed': list(cand_cfg.get('execution_engines_allowed') or []),
+                }
+                candidates.append(row)
+                if float(evald.get('score', -1e9)) > float(best_eval.get('score', -1e9)):
+                    best_cfg = cand_cfg
+                    best_eval = evald
+                    best_profile = profile
+                    best_bundle = bundle
+
+        promoted = float(best_eval.get('score', -1e9)) > float(baseline_eval.get('score', -1e9)) + 0.5
+        final_cfg = best_cfg if promoted else base_cfg
+        save_strategy_config(final_cfg)
+        apply_strategy_config(final_cfg)
+        final30 = run_universe_backtest(30, 'ALL', exec_tf, top_n, None, False, False)
+        final7 = run_universe_backtest(7, 'ALL', exec_tf, top_n, None, False, False)
+        final_eval = _goal_profile_score_candidate(final30, final7, final_cfg)
+        try:
+            final_cfg['goal_profile_last_run_ts'] = float(time.time())
+            save_strategy_config(final_cfg)
+            apply_strategy_config(final_cfg)
+        except Exception:
+            pass
+
+        report = {
+            'ok': True,
+            'status': 'PROMOTED' if promoted else 'NO_BETTER_PROFILE',
+            'ts': float(time.time()),
+            'applied_ts': float(time.time()) if promoted else float((last or {}).get('applied_ts', 0.0) or 0.0),
+            'targets': tgt,
+            'baseline': {'score': float(baseline_eval.get('score', -1e9)), 'metrics_30d': baseline_eval.get('metrics_30d') or {}, 'metrics_7d': baseline_eval.get('metrics_7d') or {}},
+            'best_candidate': {'profile': str(best_profile.get('name') or ''), 'bundle': str(best_bundle.get('name') or ''), 'score': float(best_eval.get('score', -1e9)), 'feasible': bool(best_eval.get('feasible')), 'metrics_30d': best_eval.get('metrics_30d') or {}, 'metrics_7d': best_eval.get('metrics_7d') or {}, 'execution_sessions_allowed': list(best_cfg.get('execution_sessions_allowed') or []), 'execution_engines_allowed': list(best_cfg.get('execution_engines_allowed') or [])},
+            'final': {'score': float(final_eval.get('score', -1e9)), 'metrics_30d': final_eval.get('metrics_30d') or {}, 'metrics_7d': final_eval.get('metrics_7d') or {}, 'execution_sessions_allowed': list(final_cfg.get('execution_sessions_allowed') or []), 'execution_engines_allowed': list(final_cfg.get('execution_engines_allowed') or []), 'goal_profile_active_profile': str(final_cfg.get('goal_profile_active_profile') or 'BASELINE')},
+            'top_candidates': sorted(candidates, key=lambda x: float(x.get('score', -1e9)), reverse=True)[:8],
+        }
+        save_goal_profile_report(report)
+        return report
+    finally:
+        _GOAL_PROFILE_LOCK.release()
+
+
+async def goal_profile_run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    force = False
+    try:
+        args = list(context.args or [])
+        force = bool(args and str(args[0]).strip().lower() in ('force', 'now', 'override'))
+    except Exception:
+        force = False
+    await update.message.reply_text('⏳ Running goal-profile optimizer now…')
+    rep = await to_thread_heavy(_run_goal_profile_cycle, force)
+    if not isinstance(rep, dict):
+        await update.message.reply_text('Goal-profile optimizer returned no report.')
+        return
+    if not rep.get('ok'):
+        await update.message.reply_text(f"Goal-profile optimizer status: {str(rep.get('status') or 'UNKNOWN')}")
+        return
+    final = rep.get('final') or {}
+    m30 = final.get('metrics_30d') or {}
+    m7 = final.get('metrics_7d') or {}
+    lines = [
+        '🎯 Goal-Profile Optimizer',
+        HDR,
+        f"Status: {rep.get('status','')}",
+        f"Final profile: {final.get('goal_profile_active_profile','BASELINE')} | sessions={','.join(final.get('execution_sessions_allowed') or []) or '-'} | engines={','.join(final.get('execution_engines_allowed') or []) or '-'}",
+        f"30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}",
+        f"7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}",
+    ]
+    top = list(rep.get('top_candidates') or [])[:5]
+    if top:
+        lines.append('Top candidates:')
+        for row in top:
+            m30c = row.get('metrics_30d') or {}
+            lines.append(f"• {row.get('profile')}/{row.get('bundle')} | score={float(row.get('score',0.0) or 0.0):.2f} | 30d {float(m30c.get('setups_per_day',0.0) or 0.0):.2f}/day @ WR {float(m30c.get('win_rate',0.0) or 0.0):.1f}%")
+    await send_long_message(update, '\n'.join(lines), parse_mode=None)
+
+
+async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    cfg = load_strategy_config(force=False)
+    tgt = _goal_profile_targets(cfg)
+    rep = load_goal_profile_report() or {}
+    final = rep.get('final') or {}
+    m30 = final.get('metrics_30d') or {}
+    m7 = final.get('metrics_7d') or {}
+    lines = [
+        '🎯 Goal Profile Status',
+        HDR,
+        f"Enabled: {'ON' if tgt['enabled'] else 'OFF'} | Interval: {float(tgt['interval_hours']):.1f}h | Cooldown: {float(tgt['cooldown_hours']):.1f}h",
+        f"Target: {float(tgt['target_lo']):.2f}–{float(tgt['target_hi']):.2f} setups/day | WR≥{float(tgt['target_wr']):.1f}% | AvgR≥{float(tgt['target_avg_r']):.2f}",
+        f"Minimum live sample: 30d≥{int(tgt['min_live_30d'])} | 7d≥{int(tgt['min_live_7d'])}",
+        f"Current execution profile: {str(cfg.get('goal_profile_active_profile') or 'BASELINE')} | sessions={','.join(cfg.get('execution_sessions_allowed') or []) or '-'} | engines={','.join(cfg.get('execution_engines_allowed') or []) or '-'}",
+    ]
+    if rep:
+        lines.append(f"Last run status: {rep.get('status','')} | ts={_fmt_dt_local(datetime.fromtimestamp(float(rep.get('ts',0.0) or 0.0), tz=timezone.utc)) if float(rep.get('ts',0.0) or 0.0) > 0 else '—'}")
+        lines.append(f"30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}")
+        lines.append(f"7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}")
+    await send_long_message(update, '\n'.join(lines), parse_mode=None)
+
+
+async def goal_profile_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    args = list(context.args or [])
+    if len(args) < 3:
+        await update.message.reply_text('Usage: /goal_set <setups_per_day_low> <setups_per_day_high> <win_rate_target> [avgR_target]')
+        return
+    try:
+        lo = float(args[0])
+        hi = float(args[1])
+        wr = float(args[2])
+        avg_r = float(args[3]) if len(args) >= 4 else None
+    except Exception:
+        await update.message.reply_text('Invalid numbers. Example: /goal_set 1 3 50 0.10')
+        return
+    cfg = load_strategy_config(force=True)
+    cfg['goal_profile_target_setups_per_day_lo'] = float(max(0.1, lo))
+    cfg['goal_profile_target_setups_per_day_hi'] = float(max(cfg['goal_profile_target_setups_per_day_lo'], hi))
+    cfg['goal_profile_target_win_rate'] = float(max(1.0, min(95.0, wr)))
+    if avg_r is not None:
+        cfg['goal_profile_target_avg_r'] = float(avg_r)
+    save_strategy_config(cfg)
+    apply_strategy_config(cfg)
+    await update.message.reply_text(f"✅ Goal updated: {cfg['goal_profile_target_setups_per_day_lo']:.2f}–{cfg['goal_profile_target_setups_per_day_hi']:.2f}/day | WR≥{cfg['goal_profile_target_win_rate']:.1f}% | AvgR≥{float(cfg.get('goal_profile_target_avg_r', 0.10) or 0.10):.2f}")
+
+
+async def goal_profile_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        cfg = load_strategy_config(force=False)
+        tgt = _goal_profile_targets(cfg)
+        if not tgt['enabled']:
+            return
+        if _SELF_OPT_STATE.get('stop_event') is not None:
+            return
+        await to_thread_heavy(_run_goal_profile_cycle, False)
+    except Exception:
+        return
+
+
 def _session_entry_quality_limits(session_name: str, source: str = 'email') -> dict:
     sess = str(session_name or '').upper().strip() or 'NY'
     base = {
@@ -21158,18 +21547,7 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
 
         if pb_dist > max_pb:
             return (False, 'entry_far_from_pullback_ema')
-        lon_exec_extension_ok = False
-        if fixed_lon_pullback and str(source or '').strip().lower() == 'exec' and sess == 'LON' and engine == 'A':
-            lon_exec_extension_ok = bool(
-                score >= 74.0
-                and conf >= 78
-                and pb_dist <= 0.24
-                and ch1_abs >= 0.24
-                and ch4_abs >= 0.55
-                and (atr_pct <= 0.0 or atr_pct <= 4.2)
-                and ch15_abs <= (max_ch15 + 0.05)
-            )
-        if ch15_abs > max_ch15 and not lon_exec_extension_ok:
+        if ch15_abs > max_ch15:
             return (False, 'entry_too_extended_15m')
         if engine not in {'B', 'C'} and ch1_abs > max_ch1:
             return (False, 'entry_too_extended_1h')
@@ -21177,23 +21555,15 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
             return (False, 'poor_volatility_regime_exec')
 
         sess = str(session_name or '').upper().strip()
-        cfg_live = load_strategy_config(force=False)
-        fixed_lon_pullback = _strategy_cfg_is_fixed_lon_pullback(cfg_live)
         if engine == 'A':
-            if fixed_lon_pullback and str(source or '').strip().lower() == 'exec' and sess == 'LON':
-                if ch4_abs < 0.40 or ch1_abs < 0.16:
-                    return (False, 'lon_pullback_context_too_weak')
-                if ch24_abs > 12.5 and pb_dist > 0.34:
-                    return (False, 'lon_trend_overheated')
-            else:
-                if sess == 'LON' and (ch4_abs < 0.70 or ch1_abs < 0.34):
-                    return (False, 'lon_pullback_context_too_weak')
-                if sess == 'NY' and (ch4_abs < 0.80 or ch1_abs < 0.42):
-                    return (False, 'ny_pullback_context_too_weak')
-                if sess == 'ASIA' and (ch4_abs < 0.95 or ch1_abs < 0.50):
-                    return (False, 'asia_pullback_context_too_weak')
-                if sess == 'LON' and ch24_abs > 10.5 and pb_dist > 0.28:
-                    return (False, 'lon_trend_overheated')
+            if sess == 'LON' and (ch4_abs < 0.70 or ch1_abs < 0.34):
+                return (False, 'lon_pullback_context_too_weak')
+            if sess == 'NY' and (ch4_abs < 0.80 or ch1_abs < 0.42):
+                return (False, 'ny_pullback_context_too_weak')
+            if sess == 'ASIA' and (ch4_abs < 0.95 or ch1_abs < 0.50):
+                return (False, 'asia_pullback_context_too_weak')
+            if sess == 'LON' and ch24_abs > 10.5 and pb_dist > 0.28:
+                return (False, 'lon_trend_overheated')
         if sess == 'NY' and ch1_abs >= 1.55 and ch15_abs >= 0.70 and conf < 86 and score < 82.0:
             return (False, 'ny_breakout_chase_risk')
         return (True, 'ok')
@@ -21247,15 +21617,10 @@ def is_top_setup_eligible(
         sess = str(session_name or 'LON').upper().strip()
         engine = str(getattr(s, 'engine', '') or '').upper().strip()
 
-        cfg_live = load_strategy_config(force=False)
-        fixed_lon_pullback = _strategy_cfg_is_fixed_lon_pullback(cfg_live)
         if src == "screen":
             min_score = float(QUALITY_SCORE_MIN_SCREEN)
         elif src == "exec":
-            if fixed_lon_pullback and sess == 'LON' and engine == 'A':
-                min_score = float(max(69.0, QUALITY_SCORE_MIN_SCREEN + 1.0))
-            else:
-                min_score = float(max(QUALITY_SCORE_MIN_SCREEN + 3.0, QUALITY_SCORE_MIN_EMAIL - 2.0))
+            min_score = float(max(QUALITY_SCORE_MIN_SCREEN + 3.0, QUALITY_SCORE_MIN_EMAIL - 2.0))
         else:
             min_score = float(QUALITY_SCORE_MIN_EMAIL)
 
@@ -21272,13 +21637,12 @@ def is_top_setup_eligible(
             elif engine == 'C':
                 min_score += 1.5 if sess != 'ASIA' else 2.0
         elif src == 'exec':
-            if not (fixed_lon_pullback and sess == 'LON' and engine == 'A'):
-                if engine == 'A':
-                    min_score += 0.25 if sess == 'LON' else (0.50 if sess == 'NY' else 0.75)
-                elif engine == 'B':
-                    min_score += 1.5 if sess in {'NY', 'ASIA'} else 1.0
-                elif engine == 'C':
-                    min_score += 1.0 if sess != 'ASIA' else 1.5
+            if engine == 'A':
+                min_score += 0.25 if sess == 'LON' else (0.50 if sess == 'NY' else 0.75)
+            elif engine == 'B':
+                min_score += 1.5 if sess in {'NY', 'ASIA'} else 1.0
+            elif engine == 'C':
+                min_score += 1.0 if sess != 'ASIA' else 1.5
         else:
             if engine == 'A':
                 min_score += 0.0 if sess == 'LON' else (0.5 if sess == 'NY' else 1.0)
@@ -21347,12 +21711,12 @@ def is_executable_setup_eligible(
     min_conf: int = 78,
     min_rr_final: float = 0.0,
 ) -> tuple[bool, str]:
-    """Executable gate for the decisive production redesign.
+    """Production-grade gate for executable/email/autotrade path.
 
-    Design goals:
-    - no hidden cross-session clamp
-    - one clear executable family by default: LON + Engine A + pullback continuation
-    - reduce duplicated score-gate stacking; let explicit shape/context rules do the real work
+    Key rule:
+    - executability is session-aware by thresholds
+    - executability is NOT silently session-blocked by strategy policy
+    - downstream email/autotrade session preferences decide consumption
     """
     try:
         sess = str(session_name or "").upper().strip()
@@ -21360,103 +21724,168 @@ def is_executable_setup_eligible(
             return (False, "session_not_supported")
 
         cfg_live = load_strategy_config(force=False)
-        allowed_sessions = _strategy_cfg_exec_allowed_sessions(cfg_live)
-        allowed_engines = _strategy_cfg_exec_allowed_engines(cfg_live)
-        fixed_lon_pullback = _strategy_cfg_is_fixed_lon_pullback(cfg_live)
-
+        exec_engine_b_enabled = _cfg_bool((cfg_live or {}).get("execution_engine_b_email_enabled", EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
+        allowed_sessions = _strategy_cfg_execution_sessions_allowed(cfg_live)
         if allowed_sessions and sess not in allowed_sessions:
-            return (False, "exec_session_disabled")
-
-        engine = str(getattr(s, "engine", "") or "").upper().strip()
-        if allowed_engines and engine not in allowed_engines:
-            return (False, "exec_engine_disabled")
+            return (False, 'execution_profile_session_disabled')
+        allowed_engines = _strategy_cfg_execution_engines_allowed(cfg_live)
+        _engine_pre = str(getattr(s, "engine", "") or "").upper().strip()
+        if allowed_engines and _engine_pre and _engine_pre not in allowed_engines:
+            return (False, 'execution_profile_engine_disabled')
 
         ok, why = is_top_setup_eligible(s, source='exec', session_name=sess)
         if not ok:
             return (False, f"base_gate_{why}")
 
+        sess_quality, sess_conf, sess_rr = _execution_session_thresholds(sess)
+        score_floor = float(max(min_quality, QUALITY_SCORE_MIN_EMAIL - 3.0, sess_quality))
+        conf_floor = int(max(min_conf, MIN_SETUP_CONF, sess_conf))
+        rr_floor = float(max(min_rr_final, sess_rr))
+
+        engine = str(getattr(s, "engine", "") or "").upper().strip()
         regime = str(getattr(s, 'regime', '') or '').upper()
         trend = str(getattr(s, 'trend', '') or '').upper()
         structure = str(getattr(s, 'structure', '') or '').upper()
         side = str(getattr(s, 'side', '') or '').upper()
         want = 'BULLISH' if side == 'BUY' else 'BEARISH' if side == 'SELL' else ''
+
+        if engine == 'A':
+            if sess == 'LON':
+                score_floor = max(78.0, score_floor)
+                conf_floor = max(80, conf_floor)
+                rr_floor = max(1.36, rr_floor)
+            elif sess == 'NY':
+                score_floor = max(81.0, score_floor)
+                conf_floor = max(82, conf_floor)
+                rr_floor = max(1.45, rr_floor)
+            else:
+                score_floor = max(84.0, score_floor)
+                conf_floor = max(85, conf_floor)
+                rr_floor = max(1.52, rr_floor)
+        elif engine == 'C':
+            if sess == 'LON':
+                score_floor = max(81.0, score_floor + 1.25)
+                conf_floor = max(83, conf_floor + 1)
+                rr_floor = max(1.44, rr_floor + 0.05)
+            elif sess == 'NY':
+                score_floor = max(83.0, score_floor + 1.5)
+                conf_floor = max(84, conf_floor + 1)
+                rr_floor = max(1.48, rr_floor + 0.06)
+            else:
+                score_floor = max(86.0, score_floor + 1.75)
+                conf_floor = max(87, conf_floor + 2)
+                rr_floor = max(1.58, rr_floor + 0.08)
+        elif engine == 'B':
+            if not exec_engine_b_enabled:
+                return (False, 'engine_b_disabled')
+            if sess == 'LON':
+                score_floor = max(84.0, score_floor + 2.0)
+                conf_floor = max(85, conf_floor + 2)
+                rr_floor = max(1.54, rr_floor + 0.08)
+            elif sess == 'NY':
+                score_floor = max(86.0, score_floor + 2.5)
+                conf_floor = max(87, conf_floor + 2)
+                rr_floor = max(1.62, rr_floor + 0.10)
+            else:
+                score_floor = max(88.0, score_floor + 3.0)
+                conf_floor = max(88, conf_floor + 3)
+                rr_floor = max(1.68, rr_floor + 0.12)
+        else:
+            return (False, 'engine_not_supported')
+
         if 'TREND' not in regime:
             return (False, 'regime_not_trend')
         if want and (want not in trend or want not in structure):
             return (False, 'trend_structure_not_aligned')
 
-        entry = float(getattr(s, 'entry', 0.0) or 0.0)
-        sl = float(getattr(s, 'sl', 0.0) or 0.0)
+        score = float(getattr(s, "quality_score", 0.0) or 0.0)
+        if score < score_floor:
+            return (False, "below_exec_quality")
+
+        conf = int(getattr(s, "conf", 0) or 0)
+        if conf < conf_floor:
+            return (False, "below_exec_conf")
+
+        entry = float(getattr(s, "entry", 0.0) or 0.0)
+        sl = float(getattr(s, "sl", 0.0) or 0.0)
         final_tp = float(_setup_target_tp(s, 0.0) or 0.0)
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
-        score = float(getattr(s, 'quality_score', 0.0) or 0.0)
-        conf = int(getattr(s, 'conf', 0) or 0)
-        fut_vol = float(getattr(s, 'fut_vol_usd', 0.0) or 0.0)
-        pb_dist = float(getattr(s, 'pullback_ema_dist_pct', 999.0) or 999.0)
-        ch15_abs = abs(float(getattr(s, 'ch15', 0.0) or 0.0))
-        ch1_abs = abs(float(getattr(s, 'ch1', 0.0) or 0.0))
-        ch4_abs = abs(float(getattr(s, 'ch4', 0.0) or 0.0))
-        ch24_abs = abs(float(getattr(s, 'ch24', 0.0) or 0.0))
-        atr_pct = float(getattr(s, 'atr_pct', 0.0) or 0.0)
-        pullback_ready = bool(getattr(s, 'pullback_ready', False) or getattr(s, 'pullback_bypass_hot', False))
-
-        if fixed_lon_pullback:
-            if sess != 'LON':
-                return (False, 'exec_session_disabled')
-            if engine != 'A':
-                return (False, 'exec_engine_disabled')
-
-            score_floor = max(73.0, float(min_quality or 70.0), float(QUALITY_SCORE_MIN_EMAIL) + 1.0)
-            conf_floor = max(76, int(min_conf or 78))
-            rr_floor = max(1.30, float(min_rr_final or 0.0))
-
-            if score < score_floor:
-                return (False, 'below_exec_quality')
-            if conf < conf_floor:
-                return (False, 'below_exec_conf')
-            if rr_final < rr_floor:
-                return (False, 'below_exec_rr')
-            if fut_vol < max(float(MIN_FUT_VOL_USD), 14_000_000.0):
-                return (False, 'lon_below_liquidity')
-            if not pullback_ready:
-                return (False, 'pullback_not_ready')
-            strong_lon_exec = bool(
-                score >= 74.0
-                and conf >= 78
-                and pb_dist <= 0.24
-                and ch1_abs >= 0.24
-                and ch4_abs >= 0.55
-                and (atr_pct <= 0.0 or atr_pct <= 4.2)
-            )
-            if pb_dist > 0.44:
-                return (False, 'lon_entry_too_far_from_ema')
-            if ch15_abs > 0.34 and not (strong_lon_exec and ch15_abs <= 0.40):
-                return (False, 'lon_late_extension_exec')
-            if ch1_abs < 0.16:
-                return (False, 'lon_context_too_weak_exec')
-            if ch1_abs > 0.90:
-                return (False, 'lon_late_extension_exec')
-            if ch4_abs < 0.40:
-                return (False, 'lon_context_too_weak_exec')
-            if ch4_abs > 2.30 or ch24_abs > 12.0:
-                return (False, 'lon_trend_overheated_exec')
-            if atr_pct > 0.0 and atr_pct > 4.8:
-                return (False, 'lon_volatility_too_high_exec')
-            return (True, 'ok')
-
-        sess_quality, sess_conf, sess_rr = _execution_session_thresholds(sess)
-        score_floor = float(max(min_quality, QUALITY_SCORE_MIN_EMAIL - 3.0, sess_quality))
-        conf_floor = int(max(min_conf, MIN_SETUP_CONF, sess_conf))
-        rr_floor = float(max(min_rr_final, sess_rr))
-        if score < score_floor:
-            return (False, 'below_exec_quality')
-        if conf < conf_floor:
-            return (False, 'below_exec_conf')
         if rr_final < rr_floor:
-            return (False, 'below_exec_rr')
-        return (True, 'ok')
+            return (False, "below_exec_rr")
+
+        fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+        pb_dist = float(getattr(s, "pullback_ema_dist_pct", 999.0) or 999.0)
+        ch15_abs = abs(float(getattr(s, "ch15", 0.0) or 0.0))
+        ch1_abs = abs(float(getattr(s, "ch1", 0.0) or 0.0))
+        ch4_abs = abs(float(getattr(s, "ch4", 0.0) or 0.0))
+        ch24_abs = abs(float(getattr(s, "ch24", 0.0) or 0.0))
+
+        if sess == "NY":
+            if pb_dist > 0.75:
+                return (False, "ny_entry_too_far_from_ema")
+            if ch15_abs > 0.82 or (ch15_abs > 0.72 and ch1_abs > 1.55):
+                return (False, "ny_late_extension_exec")
+            if ch4_abs < 0.62 or ch1_abs < 0.32:
+                return (False, "ny_context_too_weak_exec")
+            if fut_vol < max(MIN_FUT_VOL_USD, 10_500_000.0):
+                return (False, "ny_below_liquidity")
+        elif sess == "LON":
+            if pb_dist > 0.50:
+                return (False, "lon_entry_too_far_from_ema")
+            if ch15_abs > 0.42 or ch1_abs > 1.05:
+                return (False, "lon_late_extension_exec")
+            if ch4_abs < 0.62 or ch1_abs < 0.28:
+                return (False, "lon_context_too_weak_exec")
+            if ch4_abs > 2.20 or ch24_abs > 12.0:
+                return (False, "lon_trend_overheated_exec")
+            if fut_vol < max(MIN_FUT_VOL_USD, 14_000_000.0):
+                return (False, "lon_below_liquidity")
+        elif sess == "ASIA":
+            if pb_dist > 0.58:
+                return (False, "asia_entry_too_far_from_ema")
+            if ch15_abs > 0.58 or ch1_abs > 1.22:
+                return (False, "asia_late_extension_exec")
+            if ch4_abs < 0.78 or ch1_abs < 0.38:
+                return (False, "asia_context_too_weak_exec")
+            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.05, ASIA_MIN_FUT_VOL_USD)):
+                return (False, "asia_below_liquidity")
+
+        if engine == "A":
+            if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
+                return (False, "pullback_not_ready")
+            if pb_dist > (0.50 if sess == 'LON' else (0.60 if sess == 'NY' else 0.54)):
+                return (False, "pullback_still_too_shallow")
+            if sess == 'LON' and (ch15_abs > 0.40 or ch1_abs < 0.30 or ch1_abs > 1.00 or ch4_abs < 0.65):
+                return (False, 'lon_pullback_not_clean_enough')
+            return (True, "ok")
+
+        if engine == "C":
+            if score < (score_floor + 1.0):
+                return (False, "engine_c_below_quality")
+            if conf < (conf_floor + 1):
+                return (False, "engine_c_below_conf")
+            if rr_final < (rr_floor + 0.04):
+                return (False, "engine_c_below_rr")
+            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.10, ENGINE_C_MIN_FUT_VOL_USD)):
+                return (False, "engine_c_below_liquidity")
+            if ch1_abs > (1.20 if sess == 'LON' else (1.45 if sess == 'NY' else 1.10)):
+                return (False, "engine_c_too_extended")
+            return (True, "ok")
+
+        if engine == "B":
+            if score < (score_floor + 1.5):
+                return (False, "engine_b_below_quality")
+            if conf < (conf_floor + 1):
+                return (False, "engine_b_below_conf")
+            if rr_final < (rr_floor + 0.05):
+                return (False, "engine_b_below_rr")
+            if fut_vol < float(max(MIN_FUT_VOL_USD * (1.10 if sess != 'ASIA' else 1.18), 15_000_000.0 if sess != 'ASIA' else ASIA_MIN_FUT_VOL_USD)):
+                return (False, "engine_b_below_liquidity")
+            return (True, "ok")
+
+        return (False, "engine_not_supported")
     except Exception:
-        return (False, 'executable_gate_exception')
+        return (False, "executable_gate_exception")
 
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
     """
@@ -24199,13 +24628,16 @@ ADMIN_HELP_DESCRIPTIONS = {
     "adaptive_status": "Show daily market-adaptive 30d optimizer status, bootstrap state, and latest auto-applied actions",
     "adaptive_run": "Run the market-adaptive 30d optimizer now (admin check / bootstrap trigger)",
     "universe_backtest": "Run 7d/30d universe backtest with daily + session summary",
+    "goal_status": "Show goal-profile optimizer targets, current execution profile, and latest results",
+    "goal_run": "Run bounded goal-profile optimizer now against 7d and 30d universe backtests",
+    "goal_set": "Set goal targets: setups/day low-high, WR target, optional AvgR target",
     "trade_id_reset": "Reset your own Trade ID numbering",
 }
 
 ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
-    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "adaptive_run", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
+    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "adaptive_run", "goal_status", "goal_run", "goal_set", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
@@ -27896,15 +28328,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     }
     """
 
-    try:
-        cfg_live = load_strategy_config(force=False)
-        if str(mode or '').lower().strip() in {'exec', 'email'} and _strategy_cfg_is_fixed_lon_pullback(cfg_live):
-            allowed_sessions = _strategy_cfg_exec_allowed_sessions(cfg_live)
-            if allowed_sessions and str(session_name or '').upper().strip() not in allowed_sessions:
-                return {'setups': [], 'waiting': [], 'trend_watch': [], 'spikes': [], 'spike_warnings': []}
-    except Exception:
-        pass
-
     # Setup-count governor (authoritative executable lane): keep flow near target without
     # making /screen and email diverge.
     try:
@@ -28103,10 +28526,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # ------------------------------------------------
     breakout_setups = []
     try:
-        cfg_live = load_strategy_config(force=False)
-        allow_breakout_engine = not (str(mode or '').lower().strip() in {'exec', 'email'} and _strategy_cfg_is_fixed_lon_pullback(cfg_live))
         bases_for_breakout = list(dict.fromkeys([b.upper() for b in (leaders + losers)]))
-        if allow_breakout_engine and bases_for_breakout:
+        if bases_for_breakout:
             sub = _subset_best(best_fut, bases_for_breakout)
             breakout_setups = pick_breakout_setups(
                 sub,
@@ -32329,6 +32750,23 @@ def main():
                         "max_instances": 1,
                         "coalesce": True,
                         "misfire_grace_time": 1200,
+                    },
+                )
+        except Exception:
+            pass
+
+        try:
+            _goal_cfg = load_strategy_config(force=False)
+            if _cfg_bool((_goal_cfg or {}).get("goal_profile_enabled", True), True):
+                app.job_queue.run_repeating(
+                    goal_profile_job,
+                    interval=max(21600, int(float((_goal_cfg or {}).get("goal_profile_interval_hours", 24.0) or 24.0) * 3600)),
+                    first=max(1200, 420),
+                    name="goal_profile_job",
+                    job_kwargs={
+                        "max_instances": 1,
+                        "coalesce": True,
+                        "misfire_grace_time": 1800,
                     },
                 )
         except Exception:
