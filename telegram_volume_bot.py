@@ -1173,10 +1173,11 @@ def _strategy_config_defaults() -> dict:
         
         "goal_profile_candidate_bundles": [
             {"name": "strict", "quality_score_min_screen": 64.0, "quality_score_min_email": 72.0, "tf_align_1h_min_abs": 0.65, "tf_align_4h_min_abs": 0.60, "atr_min_pct": 1.00, "min_rr_tp": 1.45, "regime_slope_trend_min_pct": 0.060, "lon_quality_add": 1.0, "lon_conf_add": 1, "lon_rr_add": 0.04, "engine_c_base_score_add": 0.0, "engine_c_exec_quality_add": 0.0, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.10, "engine_c_exec_ch1_cap_lon": 1.20, "engine_c_exec_pb_dist_lon": 0.68},
-            {"name": "balanced", "quality_score_min_screen": 62.0, "quality_score_min_email": 70.0, "tf_align_1h_min_abs": 0.55, "tf_align_4h_min_abs": 0.50, "atr_min_pct": 0.95, "min_rr_tp": 1.40, "regime_slope_trend_min_pct": 0.055, "lon_quality_add": 0.0, "lon_conf_add": 0, "lon_rr_add": 0.00, "engine_c_base_score_add": 0.0, "engine_c_exec_quality_add": 0.0, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.08, "engine_c_exec_ch1_cap_lon": 1.22, "engine_c_exec_pb_dist_lon": 0.70},
-            {"name": "flex", "quality_score_min_screen": 60.0, "quality_score_min_email": 68.0, "tf_align_1h_min_abs": 0.45, "tf_align_4h_min_abs": 0.45, "atr_min_pct": 0.85, "min_rr_tp": 1.35, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -1.0, "lon_conf_add": -1, "lon_rr_add": -0.04, "engine_c_base_score_add": -0.5, "engine_c_exec_quality_add": -0.5, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": -0.02, "engine_c_exec_liq_mult": 1.05, "engine_c_exec_ch1_cap_lon": 1.24, "engine_c_exec_pb_dist_lon": 0.72},
-            {"name": "reach", "quality_score_min_screen": 58.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.38, "tf_align_4h_min_abs": 0.38, "atr_min_pct": 0.76, "min_rr_tp": 1.28, "regime_slope_trend_min_pct": 0.044, "lon_quality_add": -2.0, "lon_conf_add": -1, "lon_rr_add": -0.06, "engine_c_base_score_add": -1.5, "engine_c_exec_quality_add": -1.5, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.04, "engine_c_exec_liq_mult": 0.98, "engine_c_exec_ch1_cap_lon": 1.36, "engine_c_exec_pb_dist_lon": 0.80},
-            {"name": "c_breakout_focus", "quality_score_min_screen": 58.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.40, "tf_align_4h_min_abs": 0.40, "atr_min_pct": 0.78, "min_rr_tp": 1.30, "regime_slope_trend_min_pct": 0.046, "lon_quality_add": -1.5, "lon_conf_add": -1, "lon_rr_add": -0.04, "engine_c_base_score_add": -2.0, "engine_c_exec_quality_add": -2.0, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.04, "engine_c_exec_liq_mult": 1.00, "engine_c_exec_ch1_cap_lon": 1.34, "engine_c_exec_pb_dist_lon": 0.78},
+            {"name": "balanced", "quality_score_min_screen": 61.0, "quality_score_min_email": 69.0, "tf_align_1h_min_abs": 0.50, "tf_align_4h_min_abs": 0.46, "atr_min_pct": 0.90, "min_rr_tp": 1.34, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -0.5, "lon_conf_add": 0, "lon_rr_add": -0.02, "engine_c_base_score_add": -0.5, "engine_c_exec_quality_add": -0.5, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": -0.02, "engine_c_exec_liq_mult": 1.04, "engine_c_exec_ch1_cap_lon": 1.26, "engine_c_exec_pb_dist_lon": 0.74},
+            {"name": "flex", "quality_score_min_screen": 58.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.38, "tf_align_4h_min_abs": 0.38, "atr_min_pct": 0.78, "min_rr_tp": 1.24, "regime_slope_trend_min_pct": 0.043, "lon_quality_add": -2.0, "lon_conf_add": -1, "lon_rr_add": -0.06, "engine_c_base_score_add": -1.5, "engine_c_exec_quality_add": -1.5, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.05, "engine_c_exec_liq_mult": 0.96, "engine_c_exec_ch1_cap_lon": 1.38, "engine_c_exec_pb_dist_lon": 0.82},
+            {"name": "reach", "quality_score_min_screen": 56.0, "quality_score_min_email": 64.0, "tf_align_1h_min_abs": 0.30, "tf_align_4h_min_abs": 0.30, "atr_min_pct": 0.70, "min_rr_tp": 1.18, "regime_slope_trend_min_pct": 0.038, "lon_quality_add": -3.0, "lon_conf_add": -2, "lon_rr_add": -0.10, "engine_c_base_score_add": -2.5, "engine_c_exec_quality_add": -2.5, "engine_c_exec_conf_add": -2, "engine_c_exec_rr_add": -0.08, "engine_c_exec_liq_mult": 0.88, "engine_c_exec_ch1_cap_lon": 1.48, "engine_c_exec_pb_dist_lon": 0.88},
+            {"name": "yield", "quality_score_min_screen": 54.0, "quality_score_min_email": 62.0, "tf_align_1h_min_abs": 0.22, "tf_align_4h_min_abs": 0.22, "atr_min_pct": 0.65, "min_rr_tp": 1.12, "regime_slope_trend_min_pct": 0.032, "lon_quality_add": -4.0, "lon_conf_add": -3, "lon_rr_add": -0.12, "engine_c_base_score_add": -3.5, "engine_c_exec_quality_add": -3.0, "engine_c_exec_conf_add": -2, "engine_c_exec_rr_add": -0.10, "engine_c_exec_liq_mult": 0.80, "engine_c_exec_ch1_cap_lon": 1.62, "engine_c_exec_pb_dist_lon": 0.96},
+            {"name": "c_breakout_focus", "quality_score_min_screen": 56.0, "quality_score_min_email": 64.0, "tf_align_1h_min_abs": 0.28, "tf_align_4h_min_abs": 0.28, "atr_min_pct": 0.70, "min_rr_tp": 1.18, "regime_slope_trend_min_pct": 0.036, "lon_quality_add": -2.5, "lon_conf_add": -2, "lon_rr_add": -0.08, "engine_c_base_score_add": -3.0, "engine_c_exec_quality_add": -3.0, "engine_c_exec_conf_add": -2, "engine_c_exec_rr_add": -0.08, "engine_c_exec_liq_mult": 0.84, "engine_c_exec_ch1_cap_lon": 1.58, "engine_c_exec_pb_dist_lon": 0.94},
         ],
         "goal_profile_candidate_profiles": [
             {"name": "LON_A_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
@@ -1187,7 +1188,7 @@ def _strategy_config_defaults() -> dict:
         ],
         "execution_engines_allowed": ["A", "B", "C"],
         "goal_profile_active_profile": "BASELINE",
-        "goal_profile_schema_version": 4,
+        "goal_profile_schema_version": 5,
         "goal_profile_last_run_ts": 0.0,
         "goal_profile_allow_ny": False,
         "goal_profile_allow_asia": False,
@@ -1554,8 +1555,8 @@ def _strategy_config_bootstrap_recommendations() -> None:
         except Exception:
             gp_ver = 0
         
-        if gp_ver < 4:
-            cfg['goal_profile_schema_version'] = 4
+        if gp_ver < 5:
+            cfg['goal_profile_schema_version'] = 5
             cfg['goal_profile_candidate_profiles'] = [
                 {"name": "LON_A_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
                 {"name": "LON_A_REACH", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
@@ -1577,11 +1578,14 @@ def _strategy_config_bootstrap_recommendations() -> None:
             engines = [str(x).upper().strip() for x in (cfg.get('execution_engines_allowed') or []) if str(x).strip()]
             reach_mode = bool(cfg.get('goal_profile_reach_mode', False)) or str(cfg.get('goal_profile_active_profile', '') or '').upper().strip().endswith('_SCOUT')
             if sessions == ['LON'] and engines == ['A']:
-                cfg['goal_profile_active_profile'] = 'LON_A_REACH' if reach_mode else 'LON_A_ONLY'
+                cfg['goal_profile_active_profile'] = 'LON_A_REACH'
+                cfg['goal_profile_reach_mode'] = True
             elif sessions == ['LON'] and engines == ['C']:
                 cfg['goal_profile_active_profile'] = 'LON_C_ONLY'
+                cfg['goal_profile_reach_mode'] = True
             elif sessions == ['LON'] and set(engines) == {'A', 'C'}:
-                cfg['goal_profile_active_profile'] = 'LON_A_C_REACH' if reach_mode else 'LON_A_C_ONLY'
+                cfg['goal_profile_active_profile'] = 'LON_A_C_REACH'
+                cfg['goal_profile_reach_mode'] = True
             changed = True
 
 
@@ -21320,11 +21324,11 @@ def _goal_profile_profile_bundles(profile_name: str, bundles: list[dict]) -> lis
         return []
     by_name = {str((b or {}).get('name') or '').strip(): dict(b or {}) for b in (bundles or [])}
     preferred = {
-        'LON_A_ONLY': ['strict', 'balanced'],
-        'LON_A_REACH': ['flex', 'reach'],
-        'LON_C_ONLY': ['balanced', 'c_breakout_focus'],
-        'LON_A_C_ONLY': ['balanced'],
-        'LON_A_C_REACH': ['flex', 'reach'],
+        'LON_A_ONLY': ['strict', 'balanced', 'flex'],
+        'LON_A_REACH': ['reach', 'yield'],
+        'LON_C_ONLY': ['balanced', 'c_breakout_focus', 'yield'],
+        'LON_A_C_ONLY': ['balanced', 'flex'],
+        'LON_A_C_REACH': ['reach', 'yield', 'flex'],
     }.get(name, [])
     out = [by_name[n] for n in preferred if n in by_name]
     if out:
@@ -21403,12 +21407,12 @@ def _goal_profile_stage1_score(rep30: dict, cfg: dict) -> dict:
             return (v - hi) * weight_over
         return 0.0
 
-    freq_pen = _freq_pen(sdp30, tgt['target_lo'], tgt['target_hi'], 40.0, 18.0)
-    wr_pen = max(0.0, tgt['target_wr'] - wr30) * 2.4
-    avg_r_pen = max(0.0, tgt['target_avg_r'] - ar30) * 62.0
-    sample_pen = max(0, tgt['min_live_30d'] - n30) * 7.0
+    freq_pen = _freq_pen(sdp30, tgt['target_lo'], tgt['target_hi'], 28.0, 16.0)
+    wr_pen = max(0.0, tgt['target_wr'] - wr30) * 1.7
+    avg_r_pen = max(0.0, tgt['target_avg_r'] - ar30) * 48.0
+    sample_pen = max(0, tgt['min_live_30d'] - n30) * 5.0
     zero_pen = 350.0 if n30 <= 0 else 0.0
-    score = (wr30 * 2.2) + (ar30 * 55.0) + (sdp30 * 10.0) - freq_pen - wr_pen - avg_r_pen - sample_pen - zero_pen
+    score = (wr30 * 1.9) + (ar30 * 45.0) + (sdp30 * 24.0) - freq_pen - wr_pen - avg_r_pen - sample_pen - zero_pen
     return {
         'score': float(score),
         'metrics_30d': s30,
@@ -21442,14 +21446,14 @@ def _goal_profile_score_candidate(rep30: dict, rep7: dict, cfg: dict) -> dict:
             return (v - hi) * weight_over
         return 0.0
 
-    freq_pen = _freq_pen(sdp30, tgt['target_lo'], tgt['target_hi'], 52.0, 18.0) + _freq_pen(sdp7, tgt['target_lo'], tgt['target_hi'], 18.0, 5.0)
-    wr_pen = max(0.0, tgt['target_wr'] - wr30) * 2.3 + max(0.0, tgt['target_wr'] - wr7) * 0.6
-    avg_r_pen = max(0.0, tgt['target_avg_r'] - ar30) * 65.0 + max(0.0, tgt['target_avg_r'] - ar7) * 18.0
-    sample_pen = max(0, tgt['min_live_30d'] - n30) * 7.0 + max(0, tgt['min_live_7d'] - n7) * 4.5
+    freq_pen = _freq_pen(sdp30, tgt['target_lo'], tgt['target_hi'], 34.0, 16.0) + _freq_pen(sdp7, tgt['target_lo'], tgt['target_hi'], 12.0, 4.0)
+    wr_pen = max(0.0, tgt['target_wr'] - wr30) * 1.8 + max(0.0, tgt['target_wr'] - wr7) * 0.5
+    avg_r_pen = max(0.0, tgt['target_avg_r'] - ar30) * 48.0 + max(0.0, tgt['target_avg_r'] - ar7) * 14.0
+    sample_pen = max(0, tgt['min_live_30d'] - n30) * 5.0 + max(0, tgt['min_live_7d'] - n7) * 4.5
     instability_pen = abs(wr30 - wr7) * (0.10 if (n30 > 0 and n7 > 0) else 0.0)
     zero_pen = 350.0 if n30 <= 0 else 0.0
-    score = (wr30 * 2.1) + (wr7 * 0.6) + (ar30 * 55.0) + (ar7 * 15.0) + (sdp30 * 14.0) + (sdp7 * 4.0) - freq_pen - wr_pen - avg_r_pen - sample_pen - instability_pen - zero_pen
-    feasible = bool(n30 >= tgt['min_live_30d'] and n7 >= tgt['min_live_7d'] and wr30 >= tgt['target_wr'] and ar30 >= tgt['target_avg_r'] and sdp30 >= (tgt['target_lo'] * 0.70) and sdp30 <= (tgt['target_hi'] * 1.25))
+    score = (wr30 * 1.9) + (wr7 * 0.5) + (ar30 * 44.0) + (ar7 * 12.0) + (sdp30 * 32.0) + (sdp7 * 8.0) - freq_pen - wr_pen - avg_r_pen - sample_pen - instability_pen - zero_pen
+    feasible = bool(n30 >= tgt['min_live_30d'] and n7 >= tgt['min_live_7d'] and wr30 >= max(45.0, tgt['target_wr'] - 5.0) and ar30 >= tgt['target_avg_r'] and sdp30 >= (tgt['target_lo'] * 0.55) and sdp30 <= (tgt['target_hi'] * 1.35))
     return {
         'score': float(score),
         'feasible': feasible,
@@ -22024,10 +22028,10 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
         max_ch1 = float(limits['max_ch1_abs']) + (0.50 if engine == 'B' else 0.0)
         max_atr = float(limits['max_atr_pct']) + (0.60 if engine == 'B' else 0.0)
         if reach_mode and sess == 'LON' and engine in {'A', 'C'}:
-            max_pb += 0.14
-            max_ch15 += 0.16
-            max_ch1 += 0.18
-            max_atr += 0.45
+            max_pb += 0.24
+            max_ch15 += 0.24
+            max_ch1 += 0.28
+            max_atr += 0.70
 
         if pb_dist > max_pb:
             return (False, 'entry_far_from_pullback_ema')
@@ -22040,15 +22044,15 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
 
         if engine == 'A':
             if sess == 'LON':
-                lon_ctx_ch4_min = 0.48 if reach_mode else 0.64
-                lon_ctx_ch1_min = 0.18 if reach_mode else 0.30
+                lon_ctx_ch4_min = 0.32 if reach_mode else 0.64
+                lon_ctx_ch1_min = 0.10 if reach_mode else 0.30
                 if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                     return (False, 'lon_pullback_context_too_weak')
             if sess == 'NY' and (ch4_abs < 0.80 or ch1_abs < 0.42):
                 return (False, 'ny_pullback_context_too_weak')
             if sess == 'ASIA' and (ch4_abs < 0.95 or ch1_abs < 0.50):
                 return (False, 'asia_pullback_context_too_weak')
-            if sess == 'LON' and ch24_abs > (13.6 if reach_mode else 11.5) and pb_dist > (0.48 if reach_mode else 0.34):
+            if sess == 'LON' and ch24_abs > (16.5 if reach_mode else 11.5) and pb_dist > (0.60 if reach_mode else 0.34):
                 return (False, 'lon_trend_overheated')
         if sess == 'NY' and ch1_abs >= 1.55 and ch15_abs >= 0.70 and conf < 86 and score < 82.0:
             return (False, 'ny_breakout_chase_risk')
@@ -22142,12 +22146,12 @@ def is_top_setup_eligible(
                 min_score += (0.8 if sess != 'ASIA' else 1.2) + engine_c_base_score_add
         if reach_mode and sess == 'LON' and engine in {'A', 'C'}:
             if src == 'exec':
-                min_score -= 4.0 if engine == 'A' else 3.0
+                min_score -= 6.0 if engine == 'A' else 5.0
             elif src == 'email':
-                min_score -= 1.5 if engine == 'A' else 1.0
+                min_score -= 2.5 if engine == 'A' else 2.0
             else:
-                min_score -= 0.75 if engine == 'A' else 0.50
-        min_score = float(clamp(min_score, 56.0 if reach_mode and sess == 'LON' else 60.0, 90.0))
+                min_score -= 1.5 if engine == 'A' else 1.25
+        min_score = float(clamp(min_score, 52.0 if reach_mode and sess == 'LON' else 60.0, 90.0))
 
         if float(score) < float(min_score):
             return (False, f"below_score_{int(round(min_score))}")
@@ -22162,6 +22166,8 @@ def is_top_setup_eligible(
             vol_floor = max(vol_floor, 12_000_000.0)
         elif sess == 'ASIA':
             vol_floor = max(vol_floor * 1.05, ASIA_MIN_FUT_VOL_USD)
+        elif sess == 'LON' and reach_mode:
+            vol_floor = max(MIN_FUT_VOL_USD * 0.70, 6_500_000.0)
         if fut_vol < vol_floor:
             return (False, "below_min_fut_vol")
 
@@ -22256,9 +22262,9 @@ def is_executable_setup_eligible(
 
         if engine == 'A':
             if sess == 'LON':
-                score_floor = max((69.0 if reach_mode else 75.0), score_floor)
-                conf_floor = max((75 if reach_mode else 79), conf_floor)
-                rr_floor = max((1.24 if reach_mode else 1.34), rr_floor)
+                score_floor = max((64.0 if reach_mode else 75.0), score_floor)
+                conf_floor = max((72 if reach_mode else 79), conf_floor)
+                rr_floor = max((1.14 if reach_mode else 1.34), rr_floor)
             elif sess == 'NY':
                 score_floor = max(81.0, score_floor)
                 conf_floor = max(82, conf_floor)
@@ -22269,9 +22275,9 @@ def is_executable_setup_eligible(
                 rr_floor = max(1.52, rr_floor)
         elif engine == 'C':
             if sess == 'LON':
-                score_floor = max((68.5 if reach_mode else 74.5), score_floor - 0.50 + engine_c_exec_quality_add)
-                conf_floor = max((75 if reach_mode else 78), conf_floor + engine_c_exec_conf_add)
-                rr_floor = max((1.22 if reach_mode else 1.32), rr_floor - 0.03 + engine_c_exec_rr_add)
+                score_floor = max((63.5 if reach_mode else 74.5), score_floor - 1.00 + engine_c_exec_quality_add)
+                conf_floor = max((72 if reach_mode else 78), conf_floor - 1 + engine_c_exec_conf_add)
+                rr_floor = max((1.12 if reach_mode else 1.32), rr_floor - 0.08 + engine_c_exec_rr_add)
             elif sess == 'NY':
                 score_floor = max(80.0, score_floor + 1.0 + engine_c_exec_quality_add)
                 conf_floor = max(83, conf_floor + 1 + engine_c_exec_conf_add)
@@ -22335,25 +22341,25 @@ def is_executable_setup_eligible(
             if fut_vol < max(MIN_FUT_VOL_USD, 10_500_000.0):
                 return (False, "ny_below_liquidity")
         elif sess == "LON":
-            lon_pb_max = 0.74 if reach_mode else 0.60
-            lon_ch15_cap = 0.68 if reach_mode else 0.54
-            lon_ch1_cap = 1.35 if reach_mode else 1.18
-            lon_ctx_ch4_min = 0.40 if reach_mode else 0.52
-            lon_ctx_ch1_min = 0.16 if reach_mode else 0.24
-            lon_liq_floor = max(MIN_FUT_VOL_USD * (0.82 if reach_mode else 1.0), 8_500_000.0 if reach_mode else 11_000_000.0)
+            lon_pb_max = 0.90 if reach_mode else 0.60
+            lon_ch15_cap = 0.82 if reach_mode else 0.54
+            lon_ch1_cap = 1.65 if reach_mode else 1.18
+            lon_ctx_ch4_min = 0.28 if reach_mode else 0.52
+            lon_ctx_ch1_min = 0.08 if reach_mode else 0.24
+            lon_liq_floor = max(MIN_FUT_VOL_USD * (0.62 if reach_mode else 1.0), 6_000_000.0 if reach_mode else 11_000_000.0)
             if engine == 'C':
                 lon_pb_max = max(lon_pb_max, engine_c_exec_pb_dist_lon)
                 lon_ch1_cap = max(lon_ch1_cap, engine_c_exec_ch1_cap_lon)
                 lon_liq_floor = max(MIN_FUT_VOL_USD * engine_c_exec_liq_mult, ENGINE_C_MIN_FUT_VOL_USD)
-                lon_ctx_ch4_min = min(lon_ctx_ch4_min, 0.48)
-                lon_ctx_ch1_min = min(lon_ctx_ch1_min, 0.22)
+                lon_ctx_ch4_min = min(lon_ctx_ch4_min, 0.24 if reach_mode else 0.48)
+                lon_ctx_ch1_min = min(lon_ctx_ch1_min, 0.06 if reach_mode else 0.22)
             if pb_dist > lon_pb_max:
                 return (False, "lon_entry_too_far_from_ema")
             if ch15_abs > lon_ch15_cap or ch1_abs > lon_ch1_cap:
                 return (False, "lon_late_extension_exec")
             if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                 return (False, "lon_context_too_weak_exec")
-            if ch4_abs > (2.85 if reach_mode else 2.55) or ch24_abs > (15.2 if reach_mode else 13.8):
+            if ch4_abs > (3.40 if reach_mode else 2.55) or ch24_abs > (18.5 if reach_mode else 13.8):
                 return (False, "lon_trend_overheated_exec")
             if fut_vol < lon_liq_floor:
                 return (False, "lon_below_liquidity")
