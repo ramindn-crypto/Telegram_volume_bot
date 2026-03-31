@@ -1069,8 +1069,8 @@ def _strategy_config_defaults() -> dict:
         "context_tf_2": "4h",
 
         # Quality floors (0..100)
-        "quality_score_min_screen": float(QUALITY_SCORE_MIN_SCREEN),
-        "quality_score_min_email": float(QUALITY_SCORE_MIN_EMAIL),
+        "quality_score_min_screen":  67.0,
+        "quality_score_min_email":  72.0,
 
         # Regime thresholds (used by backtest generator + some live scoring)
         "regime_slope_trend_min_pct": 0.06,
@@ -1089,8 +1089,8 @@ def _strategy_config_defaults() -> dict:
         "tf_align_4h_min_abs": float(TF_ALIGN_4H_MIN_ABS),
 
         # RR floor
-        "min_rr_tp": float(MIN_RR_TP),
-        "min_rr_tp": float(MIN_RR_TP),
+        "min_rr_tp":  1.30,
+        "min_rr_tp": 1.30,
 
         # Score weights (must sum ~1.0; scaled to 100 in compute_setup_quality_score)
         "score_w_conf": 0.45,
@@ -1105,13 +1105,19 @@ def _strategy_config_defaults() -> dict:
         "score_w_smf": 0.01,
 
         # Frequency targeting (used in /optimize objective)
-        "target_setups_per_day_lo": 1.0,
-        "target_setups_per_day_hi": 3.0,
+        "target_setups_per_day_lo": 0.5,
+        "target_setups_per_day_hi": 1.5,
+
+        # Explicit production execution profile (no hidden session clamp).
+        "execution_profile_version": 20260331.1,
+        "execution_profile_mode": "LON_PULLBACK_ONLY",
+        "executable_allowed_sessions": ["LON"],
+        "executable_allowed_engines": ["A"],
 
         # Self-optimization governance
-        "session_weights": {"NY": 0.45, "LON": 0.40, "ASIA": 0.15},  # optimizer weighting (cross-session executable pool with NY/LON preference)
+        "session_weights": {"NY": 0.0, "LON": 1.0, "ASIA": 0.0},
         "high_win_mode": False,
-        "execution_sessions_allowed": ["NY", "LON", "ASIA"],
+        "execution_sessions_allowed": ["LON"],
         "preferred_trade_window": {"start": "00:00", "end": "23:59"},
         "concentration_cap": 0.25,          # no single symbol >25% of setups (OOS)
         "oos_min_setups": 30,               # minimum OOS sample size across universe before promotion
@@ -1120,10 +1126,10 @@ def _strategy_config_defaults() -> dict:
         "max_drawdown_R_cap": 8.0,          # OOS max drawdown cap in R (penalize heavily above)
 
         # Setup-count governor (live engine + optimizer)
-        "governor_enabled": True,
+        "governor_enabled": False,
         "governor_window_hours": 24,
-        "governor_target_lo": 1.0,
-        "governor_target_hi": 3.0,
+        "governor_target_lo": 0.5,
+        "governor_target_hi": 1.5,
         "governor_step_score": 1.0,         # +/- points applied to quality_score_min_email when adjusting
         "governor_score_min": 52.0,         # absolute lower bound for quality_score_min_email
         "governor_score_max": 82.0,         # absolute upper bound for quality_score_min_email
@@ -1160,14 +1166,14 @@ def _strategy_config_defaults() -> dict:
         "universe_backtest_exec_tf": "15m",
 
         # Daily market-adaptive universe optimizer (runtime params only; no source rewriting)
-        "market_adaptive_enabled": True,
+        "market_adaptive_enabled": False,
         "market_adaptive_interval_hours": 24.0,
         "market_adaptive_first_delay_sec": 45,
         "market_adaptive_days": 30,
         "market_adaptive_max_passes": 2,
         "market_adaptive_min_improvement": 0.35,
-        "market_adaptive_target_setups_per_day_lo": 1.0,
-        "market_adaptive_target_setups_per_day_hi": 3.0,
+        "market_adaptive_target_setups_per_day_lo": 0.5,
+        "market_adaptive_target_setups_per_day_hi": 1.5,
         "market_adaptive_session_wr_floor_ny": 46.0,
         "market_adaptive_session_wr_floor_lon": 48.0,
         "market_adaptive_cooldown_hours": 20.0,
@@ -1186,9 +1192,10 @@ def _strategy_config_defaults() -> dict:
         "counter_regime_quality_add": {"NY": 2.5, "LON": 2.5, "ASIA": 3.0},
         "counter_regime_conf_add": {"NY": 2, "LON": 2, "ASIA": 3},
         "counter_regime_rr_add": {"NY": 0.10, "LON": 0.10, "ASIA": 0.12},
-        "execution_asia_enabled": bool(EXECUTION_ASIA_ENABLED),
-        "execution_asia_user_override": False,
-        "execution_engine_b_email_enabled": bool(EXECUTION_ENGINE_B_EMAIL_ENABLED),
+        "execution_asia_enabled": False,
+        "execution_asia_user_override": True,
+        "execution_engine_b_email_enabled": False,
+        "execution_engine_c_email_enabled": False,
         "session_exec_overrides": {
             "NY": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
             "LON": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
@@ -1285,20 +1292,48 @@ def _cfg_bool(value, default: bool = False) -> bool:
         return bool(default)
 
 def _strategy_cfg_execution_asia_enabled(cfg: dict | None) -> bool:
-    """ASIA execution defaults to ON unless an explicit manual override disables it.
+    """Return the explicit ASIA execution setting only.
 
-    This prevents older auto-disabled config states from silently keeping ASIA off forever,
-    while still allowing a deliberate /params_set execution_asia_enabled false choice.
+    The redesigned executable lane must never silently re-enable ASIA on startup.
     """
     try:
         cfg = cfg or {}
-        manual = _cfg_bool((cfg or {}).get('execution_asia_user_override', False), False)
-        enabled = _cfg_bool((cfg or {}).get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED))
-        if manual:
-            return bool(enabled)
-        return bool(enabled) or bool(EXECUTION_ASIA_ENABLED)
+        return _cfg_bool((cfg or {}).get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED))
     except Exception:
         return bool(EXECUTION_ASIA_ENABLED)
+
+
+def _strategy_cfg_exec_mode(cfg: dict | None) -> str:
+    try:
+        return str((cfg or {}).get('execution_profile_mode', 'BALANCED') or 'BALANCED').upper().strip()
+    except Exception:
+        return 'BALANCED'
+
+
+def _strategy_cfg_exec_allowed_sessions(cfg: dict | None) -> set[str]:
+    try:
+        raw = (cfg or {}).get('executable_allowed_sessions') or (cfg or {}).get('execution_sessions_allowed') or ['LON']
+        out = {str(x).upper().strip() for x in raw if str(x).strip()}
+        return out or {'LON'}
+    except Exception:
+        return {'LON'}
+
+
+def _strategy_cfg_exec_allowed_engines(cfg: dict | None) -> set[str]:
+    try:
+        raw = (cfg or {}).get('executable_allowed_engines') or ['A']
+        out = {str(x).upper().strip() for x in raw if str(x).strip()}
+        return out or {'A'}
+    except Exception:
+        return {'A'}
+
+
+def _strategy_cfg_is_fixed_lon_pullback(cfg: dict | None) -> bool:
+    try:
+        mode = _strategy_cfg_exec_mode(cfg)
+        return mode == 'LON_PULLBACK_ONLY'
+    except Exception:
+        return False
 
 def _strategy_cfg_high_win_mode(cfg: dict | None) -> bool:
     try:
@@ -1347,47 +1382,42 @@ def _strategy_config_bootstrap_recommendations() -> None:
             lo = float(cfg.get('target_setups_per_day_lo', 0.0) or 0.0)
             hi = float(cfg.get('target_setups_per_day_hi', 0.0) or 0.0)
             if lo <= 0 or abs(lo - 1.0) > 0.001:
-                cfg['target_setups_per_day_lo'] = 1.0
+                cfg['target_setups_per_day_lo'] = 0.5
                 changed = True
             if hi <= 0 or abs(hi - 3.0) > 0.001:
-                cfg['target_setups_per_day_hi'] = 3.0
+                cfg['target_setups_per_day_hi'] = 1.5
                 changed = True
         except Exception:
-            cfg['target_setups_per_day_lo'] = 1.0
-            cfg['target_setups_per_day_hi'] = 3.0
+            cfg['target_setups_per_day_lo'] = 0.5
+            cfg['target_setups_per_day_hi'] = 1.5
             changed = True
 
         try:
             glo = float(cfg.get('governor_target_lo', 0.0) or 0.0)
             ghi = float(cfg.get('governor_target_hi', 0.0) or 0.0)
             if glo <= 0 or abs(glo - 1.0) > 0.001:
-                cfg['governor_target_lo'] = 1.0
+                cfg['governor_target_lo'] = 0.5
                 changed = True
             if ghi <= 0 or abs(ghi - 3.0) > 0.001:
-                cfg['governor_target_hi'] = 3.0
+                cfg['governor_target_hi'] = 1.5
                 changed = True
         except Exception:
-            cfg['governor_target_lo'] = 1.0
-            cfg['governor_target_hi'] = 3.0
+            cfg['governor_target_lo'] = 0.5
+            cfg['governor_target_hi'] = 1.5
             changed = True
 
         try:
             mlo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 0.0) or 0.0)
             mhi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 0.0) or 0.0)
             if mlo <= 0 or abs(mlo - 1.0) > 0.001:
-                cfg['market_adaptive_target_setups_per_day_lo'] = 1.0
+                cfg['market_adaptive_target_setups_per_day_lo'] = 0.5
                 changed = True
             if mhi <= 0 or abs(mhi - 3.0) > 0.001:
-                cfg['market_adaptive_target_setups_per_day_hi'] = 3.0
+                cfg['market_adaptive_target_setups_per_day_hi'] = 1.5
                 changed = True
         except Exception:
-            cfg['market_adaptive_target_setups_per_day_lo'] = 1.0
-            cfg['market_adaptive_target_setups_per_day_hi'] = 3.0
-            changed = True
-
-        manual_asia = _cfg_bool(cfg.get('execution_asia_user_override', False), False)
-        if not manual_asia and not _cfg_bool(cfg.get('execution_asia_enabled', EXECUTION_ASIA_ENABLED), bool(EXECUTION_ASIA_ENABLED)):
-            cfg['execution_asia_enabled'] = True
+            cfg['market_adaptive_target_setups_per_day_lo'] = 0.5
+            cfg['market_adaptive_target_setups_per_day_hi'] = 1.5
             changed = True
 
         stale_lon_only = (
@@ -1415,10 +1445,38 @@ def _strategy_config_bootstrap_recommendations() -> None:
                 'LON': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.00},
                 'ASIA': {'quality_add': 1.5, 'conf_add': 1, 'rr_add': 0.10},
             }
+            changed = True        # Apply the decisive March-31 redesign once so stale runtime config cannot preserve
+        # the weak multi-session mixed executable lane after redeploy.
+        try:
+            prof_ver = float(cfg.get('execution_profile_version', 0.0) or 0.0)
+        except Exception:
+            prof_ver = 0.0
+        target_profile_ver = 20260331.1
+        if prof_ver < target_profile_ver:
+            cfg['execution_profile_version'] = target_profile_ver
+            cfg['execution_profile_mode'] = 'LON_PULLBACK_ONLY'
+            cfg['executable_allowed_sessions'] = ['LON']
+            cfg['executable_allowed_engines'] = ['A']
+            cfg['execution_sessions_allowed'] = ['LON']
+            cfg['session_weights'] = {'NY': 0.0, 'LON': 1.0, 'ASIA': 0.0}
+            cfg['execution_asia_enabled'] = False
+            cfg['execution_asia_user_override'] = True
+            cfg['execution_engine_b_email_enabled'] = False
+            cfg['execution_engine_c_email_enabled'] = False
+            cfg['quality_score_min_screen'] = 67.0
+            cfg['quality_score_min_email'] = 72.0
+            cfg['min_rr_tp'] = 1.30
+            cfg['target_setups_per_day_lo'] = 0.5
+            cfg['target_setups_per_day_hi'] = 1.5
+            cfg['governor_enabled'] = False
+            cfg['market_adaptive_enabled'] = False
+            cfg['session_exec_overrides'] = {
+                'NY': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0},
+                'LON': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0},
+                'ASIA': {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0},
+            }
             changed = True
 
-        # Cap stale live-tightened floors so a previous adaptive/governor run cannot
-        # silently keep the bot above the 1–3 setups/day target after redeploy.
         try:
             q_screen = float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
             if q_screen > 68.0:
@@ -15531,8 +15589,8 @@ def _objective(oos: list[dict], days: int, cfg: dict) -> float:
     win_rate = (wr_num / w_sum) if w_sum else 0.0
 
     # Frequency penalty (target band)
-    lo = float(cfg.get("target_setups_per_day_lo", 1.0))
-    hi = float(cfg.get("target_setups_per_day_hi", 3.0))
+    lo = float(cfg.get("target_setups_per_day_lo", 0.5))
+    hi = float(cfg.get("target_setups_per_day_hi", 1.5))
     freq_pen = 0.0
     if setups_day < lo:
         freq_pen = (lo - setups_day) * 4.0
@@ -15646,8 +15704,8 @@ def _objective(oos: list[dict], days: int, cfg: dict) -> float:
     pf /= n
     dd /= n
 
-    lo = float(cfg.get("target_setups_per_day_lo", 1.0))
-    hi = float(cfg.get("target_setups_per_day_hi", 3.0))
+    lo = float(cfg.get("target_setups_per_day_lo", 0.5))
+    hi = float(cfg.get("target_setups_per_day_hi", 1.5))
     freq_pen = 0.0
     if setups_day < lo:
         freq_pen = (lo - setups_day) * 2.0
@@ -19346,8 +19404,8 @@ def _governor_adjust_quality_floor(session_name: str = "NY") -> Optional[dict]:
 
     try:
         window_h = float(cfg.get("governor_window_hours", 24) or 24)
-        target_lo = float(cfg.get("governor_target_lo", cfg.get("target_setups_per_day_lo", 3.0)) or 3.0)
-        target_hi = float(cfg.get("governor_target_hi", cfg.get("target_setups_per_day_hi", 5.0)) or 5.0)
+        target_lo = float(cfg.get("governor_target_lo", cfg.get("target_setups_per_day_lo", 0.5)) or 0.5)
+        target_hi = float(cfg.get("governor_target_hi", cfg.get("target_setups_per_day_hi", 1.5)) or 1.5)
         step = float(cfg.get("governor_step_score", 1.0) or 1.0)
         smin = float(cfg.get("governor_score_min", 52.0) or 52.0)
         smax = float(cfg.get("governor_score_max", 82.0) or 82.0)
@@ -19420,8 +19478,8 @@ def _self_opt_stability_gates(metrics: dict, cfg: dict) -> tuple[bool, list[str]
     if total_setups < min_setups:
         reasons.append(f"oos_sample_too_small ({total_setups} < {min_setups})")
 
-    lo = float(cfg.get("target_setups_per_day_lo", 1.0))
-    hi = float(cfg.get("target_setups_per_day_hi", 3.0))
+    lo = float(cfg.get("target_setups_per_day_lo", 0.5))
+    hi = float(cfg.get("target_setups_per_day_hi", 1.5))
     if setups_day < lo:
         reasons.append(f"frequency_too_low ({setups_day:.2f} < {lo:.2f})")
     if setups_day > hi * 1.25:
@@ -19468,7 +19526,7 @@ def _self_opt_format_report(res: dict) -> str:
         f"Decision: {'✅ PROMOTED' if promoted else '❌ NOT PROMOTED'}",
         f"Chosen exec TF: {chosen_tf} | Objective: {score:.3f}",
         SEP,
-        f"OOS setups/day: {float(oos.get('setups_per_day',0.0) or 0.0):.2f} (target {float(p.get('target_setups_per_day_lo',1.0) or 1.0):.0f}–{float(p.get('target_setups_per_day_hi',3.0) or 3.0):.0f})",
+        f"OOS setups/day: {float(oos.get('setups_per_day',0.0) or 0.0):.2f} (target {float(p.get('target_setups_per_day_lo',0.5) or 0.5):.1f}–{float(p.get('target_setups_per_day_hi',1.5) or 1.5):.1f})",
         f"OOS setups: {int(oos.get('setups',0) or 0)} | Win rate: {float(oos.get('win_rate',0.0) or 0.0):.1f}%",
         f"OOS Avg R: {float(oos.get('avg_R',0.0) or 0.0):.3f} | PF: {float(oos.get('profit_factor',0.0) or 0.0):.2f} | MaxDD(R): {float(oos.get('max_drawdown_R',0.0) or 0.0):.2f}",
         f"Concentration: top_symbol_share={float(oos.get('top_symbol_share',0.0) or 0.0):.1%}",
@@ -20153,8 +20211,8 @@ def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
     avg_r = float(overall.get('avg_R', 0.0) or 0.0)
     pf = float(overall.get('profit_factor', 0.0) or 0.0)
 
-    lo = float((cfg or {}).get('market_adaptive_target_setups_per_day_lo', 1.0) or 1.0)
-    hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 3.0) or 3.0)
+    lo = float((cfg or {}).get('market_adaptive_target_setups_per_day_lo', 0.5) or 0.5)
+    hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 1.5) or 1.5)
     ny_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
     lon_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
 
@@ -20217,6 +20275,7 @@ def _market_adaptive_apply_action(cfg: dict, actions: list[dict], param: str, va
 def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
     out = json.loads(json.dumps(cfg or {}))
     bounds = (out.get('opt_bounds') or {})
+    fixed_lon_pullback = _strategy_cfg_is_fixed_lon_pullback(out)
 
     def _rng(name: str, lo: float, hi: float) -> tuple[float, float]:
         try:
@@ -20238,6 +20297,14 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
     out['tf_align_1h_min_abs'] = float(clamp(float(out.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), tlo, thi))
     out['execution_asia_enabled'] = _strategy_cfg_execution_asia_enabled(out)
     out['execution_engine_b_email_enabled'] = _cfg_bool(out.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
+    out['execution_engine_c_email_enabled'] = _cfg_bool(out.get('execution_engine_c_email_enabled', False), False)
+    if fixed_lon_pullback:
+        out['execution_asia_enabled'] = False
+        out['execution_engine_b_email_enabled'] = False
+        out['execution_engine_c_email_enabled'] = False
+        out['execution_sessions_allowed'] = ['LON']
+        out['executable_allowed_sessions'] = ['LON']
+        out['executable_allowed_engines'] = ['A']
     sess_ov = out.get('session_exec_overrides') or {}
     norm_ov = {}
     for sess in ('NY', 'LON', 'ASIA'):
@@ -20253,6 +20320,8 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
 
 def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], list[str]]:
     cfg = _market_adaptive_clamp_cfg(cfg)
+    if _strategy_cfg_is_fixed_lon_pullback(cfg):
+        return [], ['Fixed LON pullback-only execution profile active; adaptive cross-session and multi-engine actions are disabled.']
     overall = (rep or {}).get('overall') or {}
     per_session = (rep or {}).get('per_session') or {}
     metrics = (rep or {}).get('metrics') or {}
@@ -20264,8 +20333,8 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
     wr = float(overall.get('win_rate', 0.0) or 0.0)
     avg_r = float(overall.get('avg_R', 0.0) or 0.0)
     total_setups = int(overall.get('setups', 0) or 0)
-    lo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 1.0) or 1.0)
-    hi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 3.0) or 3.0)
+    lo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 0.5) or 0.5)
+    hi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 1.5) or 1.5)
     ny_floor = float(cfg.get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
     lon_floor = float(cfg.get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
 
@@ -21097,15 +21166,23 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
             return (False, 'poor_volatility_regime_exec')
 
         sess = str(session_name or '').upper().strip()
+        cfg_live = load_strategy_config(force=False)
+        fixed_lon_pullback = _strategy_cfg_is_fixed_lon_pullback(cfg_live)
         if engine == 'A':
-            if sess == 'LON' and (ch4_abs < 0.70 or ch1_abs < 0.34):
-                return (False, 'lon_pullback_context_too_weak')
-            if sess == 'NY' and (ch4_abs < 0.80 or ch1_abs < 0.42):
-                return (False, 'ny_pullback_context_too_weak')
-            if sess == 'ASIA' and (ch4_abs < 0.95 or ch1_abs < 0.50):
-                return (False, 'asia_pullback_context_too_weak')
-            if sess == 'LON' and ch24_abs > 10.5 and pb_dist > 0.28:
-                return (False, 'lon_trend_overheated')
+            if fixed_lon_pullback and str(source or '').strip().lower() == 'exec' and sess == 'LON':
+                if ch4_abs < 0.45 or ch1_abs < 0.18:
+                    return (False, 'lon_pullback_context_too_weak')
+                if ch24_abs > 11.5 and pb_dist > 0.30:
+                    return (False, 'lon_trend_overheated')
+            else:
+                if sess == 'LON' and (ch4_abs < 0.70 or ch1_abs < 0.34):
+                    return (False, 'lon_pullback_context_too_weak')
+                if sess == 'NY' and (ch4_abs < 0.80 or ch1_abs < 0.42):
+                    return (False, 'ny_pullback_context_too_weak')
+                if sess == 'ASIA' and (ch4_abs < 0.95 or ch1_abs < 0.50):
+                    return (False, 'asia_pullback_context_too_weak')
+                if sess == 'LON' and ch24_abs > 10.5 and pb_dist > 0.28:
+                    return (False, 'lon_trend_overheated')
         if sess == 'NY' and ch1_abs >= 1.55 and ch15_abs >= 0.70 and conf < 86 and score < 82.0:
             return (False, 'ny_breakout_chase_risk')
         return (True, 'ok')
@@ -21159,10 +21236,15 @@ def is_top_setup_eligible(
         sess = str(session_name or 'LON').upper().strip()
         engine = str(getattr(s, 'engine', '') or '').upper().strip()
 
+        cfg_live = load_strategy_config(force=False)
+        fixed_lon_pullback = _strategy_cfg_is_fixed_lon_pullback(cfg_live)
         if src == "screen":
             min_score = float(QUALITY_SCORE_MIN_SCREEN)
         elif src == "exec":
-            min_score = float(max(QUALITY_SCORE_MIN_SCREEN + 3.0, QUALITY_SCORE_MIN_EMAIL - 2.0))
+            if fixed_lon_pullback and sess == 'LON' and engine == 'A':
+                min_score = float(max(68.0, QUALITY_SCORE_MIN_SCREEN + 1.0))
+            else:
+                min_score = float(max(QUALITY_SCORE_MIN_SCREEN + 3.0, QUALITY_SCORE_MIN_EMAIL - 2.0))
         else:
             min_score = float(QUALITY_SCORE_MIN_EMAIL)
 
@@ -21179,12 +21261,13 @@ def is_top_setup_eligible(
             elif engine == 'C':
                 min_score += 1.5 if sess != 'ASIA' else 2.0
         elif src == 'exec':
-            if engine == 'A':
-                min_score += 0.25 if sess == 'LON' else (0.50 if sess == 'NY' else 0.75)
-            elif engine == 'B':
-                min_score += 1.5 if sess in {'NY', 'ASIA'} else 1.0
-            elif engine == 'C':
-                min_score += 1.0 if sess != 'ASIA' else 1.5
+            if not (fixed_lon_pullback and sess == 'LON' and engine == 'A'):
+                if engine == 'A':
+                    min_score += 0.25 if sess == 'LON' else (0.50 if sess == 'NY' else 0.75)
+                elif engine == 'B':
+                    min_score += 1.5 if sess in {'NY', 'ASIA'} else 1.0
+                elif engine == 'C':
+                    min_score += 1.0 if sess != 'ASIA' else 1.5
         else:
             if engine == 'A':
                 min_score += 0.0 if sess == 'LON' else (0.5 if sess == 'NY' else 1.0)
@@ -21253,12 +21336,12 @@ def is_executable_setup_eligible(
     min_conf: int = 78,
     min_rr_final: float = 0.0,
 ) -> tuple[bool, str]:
-    """Production-grade gate for executable/email/autotrade path.
+    """Executable gate for the decisive production redesign.
 
-    Key rule:
-    - executability is session-aware by thresholds
-    - executability is NOT silently session-blocked by strategy policy
-    - downstream email/autotrade session preferences decide consumption
+    Design goals:
+    - no hidden cross-session clamp
+    - one clear executable family by default: LON + Engine A + pullback continuation
+    - reduce duplicated score-gate stacking; let explicit shape/context rules do the real work
     """
     try:
         sess = str(session_name or "").upper().strip()
@@ -21266,161 +21349,95 @@ def is_executable_setup_eligible(
             return (False, "session_not_supported")
 
         cfg_live = load_strategy_config(force=False)
-        exec_engine_b_enabled = _cfg_bool((cfg_live or {}).get("execution_engine_b_email_enabled", EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
+        allowed_sessions = _strategy_cfg_exec_allowed_sessions(cfg_live)
+        allowed_engines = _strategy_cfg_exec_allowed_engines(cfg_live)
+        fixed_lon_pullback = _strategy_cfg_is_fixed_lon_pullback(cfg_live)
+
+        if allowed_sessions and sess not in allowed_sessions:
+            return (False, "exec_session_disabled")
+
+        engine = str(getattr(s, "engine", "") or "").upper().strip()
+        if allowed_engines and engine not in allowed_engines:
+            return (False, "exec_engine_disabled")
 
         ok, why = is_top_setup_eligible(s, source='exec', session_name=sess)
         if not ok:
             return (False, f"base_gate_{why}")
 
-        sess_quality, sess_conf, sess_rr = _execution_session_thresholds(sess)
-        score_floor = float(max(min_quality, QUALITY_SCORE_MIN_EMAIL - 3.0, sess_quality))
-        conf_floor = int(max(min_conf, MIN_SETUP_CONF, sess_conf))
-        rr_floor = float(max(min_rr_final, sess_rr))
-
-        engine = str(getattr(s, "engine", "") or "").upper().strip()
         regime = str(getattr(s, 'regime', '') or '').upper()
         trend = str(getattr(s, 'trend', '') or '').upper()
         structure = str(getattr(s, 'structure', '') or '').upper()
         side = str(getattr(s, 'side', '') or '').upper()
         want = 'BULLISH' if side == 'BUY' else 'BEARISH' if side == 'SELL' else ''
-
-        if engine == 'A':
-            if sess == 'LON':
-                score_floor = max(78.0, score_floor)
-                conf_floor = max(80, conf_floor)
-                rr_floor = max(1.36, rr_floor)
-            elif sess == 'NY':
-                score_floor = max(81.0, score_floor)
-                conf_floor = max(82, conf_floor)
-                rr_floor = max(1.45, rr_floor)
-            else:
-                score_floor = max(84.0, score_floor)
-                conf_floor = max(85, conf_floor)
-                rr_floor = max(1.52, rr_floor)
-        elif engine == 'C':
-            if sess == 'LON':
-                score_floor = max(81.0, score_floor + 1.25)
-                conf_floor = max(83, conf_floor + 1)
-                rr_floor = max(1.44, rr_floor + 0.05)
-            elif sess == 'NY':
-                score_floor = max(83.0, score_floor + 1.5)
-                conf_floor = max(84, conf_floor + 1)
-                rr_floor = max(1.48, rr_floor + 0.06)
-            else:
-                score_floor = max(86.0, score_floor + 1.75)
-                conf_floor = max(87, conf_floor + 2)
-                rr_floor = max(1.58, rr_floor + 0.08)
-        elif engine == 'B':
-            if not exec_engine_b_enabled:
-                return (False, 'engine_b_disabled')
-            if sess == 'LON':
-                score_floor = max(84.0, score_floor + 2.0)
-                conf_floor = max(85, conf_floor + 2)
-                rr_floor = max(1.54, rr_floor + 0.08)
-            elif sess == 'NY':
-                score_floor = max(86.0, score_floor + 2.5)
-                conf_floor = max(87, conf_floor + 2)
-                rr_floor = max(1.62, rr_floor + 0.10)
-            else:
-                score_floor = max(88.0, score_floor + 3.0)
-                conf_floor = max(88, conf_floor + 3)
-                rr_floor = max(1.68, rr_floor + 0.12)
-        else:
-            return (False, 'engine_not_supported')
-
         if 'TREND' not in regime:
             return (False, 'regime_not_trend')
         if want and (want not in trend or want not in structure):
             return (False, 'trend_structure_not_aligned')
 
-        score = float(getattr(s, "quality_score", 0.0) or 0.0)
-        if score < score_floor:
-            return (False, "below_exec_quality")
-
-        conf = int(getattr(s, "conf", 0) or 0)
-        if conf < conf_floor:
-            return (False, "below_exec_conf")
-
-        entry = float(getattr(s, "entry", 0.0) or 0.0)
-        sl = float(getattr(s, "sl", 0.0) or 0.0)
+        entry = float(getattr(s, 'entry', 0.0) or 0.0)
+        sl = float(getattr(s, 'sl', 0.0) or 0.0)
         final_tp = float(_setup_target_tp(s, 0.0) or 0.0)
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
+        score = float(getattr(s, 'quality_score', 0.0) or 0.0)
+        conf = int(getattr(s, 'conf', 0) or 0)
+        fut_vol = float(getattr(s, 'fut_vol_usd', 0.0) or 0.0)
+        pb_dist = float(getattr(s, 'pullback_ema_dist_pct', 999.0) or 999.0)
+        ch15_abs = abs(float(getattr(s, 'ch15', 0.0) or 0.0))
+        ch1_abs = abs(float(getattr(s, 'ch1', 0.0) or 0.0))
+        ch4_abs = abs(float(getattr(s, 'ch4', 0.0) or 0.0))
+        ch24_abs = abs(float(getattr(s, 'ch24', 0.0) or 0.0))
+        atr_pct = float(getattr(s, 'atr_pct', 0.0) or 0.0)
+        pullback_ready = bool(getattr(s, 'pullback_ready', False) or getattr(s, 'pullback_bypass_hot', False))
+
+        if fixed_lon_pullback:
+            if sess != 'LON':
+                return (False, 'exec_session_disabled')
+            if engine != 'A':
+                return (False, 'exec_engine_disabled')
+
+            score_floor = max(74.0, float(min_quality or 70.0), float(QUALITY_SCORE_MIN_EMAIL))
+            conf_floor = max(76, int(min_conf or 78))
+            rr_floor = max(1.30, float(min_rr_final or 0.0))
+
+            if score < score_floor:
+                return (False, 'below_exec_quality')
+            if conf < conf_floor:
+                return (False, 'below_exec_conf')
+            if rr_final < rr_floor:
+                return (False, 'below_exec_rr')
+            if fut_vol < max(float(MIN_FUT_VOL_USD), 14_000_000.0):
+                return (False, 'lon_below_liquidity')
+            if not pullback_ready:
+                return (False, 'pullback_not_ready')
+            if pb_dist > 0.42:
+                return (False, 'lon_entry_too_far_from_ema')
+            if ch15_abs > 0.34:
+                return (False, 'lon_late_extension_exec')
+            if ch1_abs < 0.18:
+                return (False, 'lon_context_too_weak_exec')
+            if ch1_abs > 0.90:
+                return (False, 'lon_late_extension_exec')
+            if ch4_abs < 0.45:
+                return (False, 'lon_context_too_weak_exec')
+            if ch4_abs > 2.20 or ch24_abs > 11.0:
+                return (False, 'lon_trend_overheated_exec')
+            if atr_pct > 0.0 and atr_pct > 4.8:
+                return (False, 'lon_volatility_too_high_exec')
+            return (True, 'ok')
+
+        sess_quality, sess_conf, sess_rr = _execution_session_thresholds(sess)
+        score_floor = float(max(min_quality, QUALITY_SCORE_MIN_EMAIL - 3.0, sess_quality))
+        conf_floor = int(max(min_conf, MIN_SETUP_CONF, sess_conf))
+        rr_floor = float(max(min_rr_final, sess_rr))
+        if score < score_floor:
+            return (False, 'below_exec_quality')
+        if conf < conf_floor:
+            return (False, 'below_exec_conf')
         if rr_final < rr_floor:
-            return (False, "below_exec_rr")
-
-        fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
-        pb_dist = float(getattr(s, "pullback_ema_dist_pct", 999.0) or 999.0)
-        ch15_abs = abs(float(getattr(s, "ch15", 0.0) or 0.0))
-        ch1_abs = abs(float(getattr(s, "ch1", 0.0) or 0.0))
-        ch4_abs = abs(float(getattr(s, "ch4", 0.0) or 0.0))
-        ch24_abs = abs(float(getattr(s, "ch24", 0.0) or 0.0))
-
-        if sess == "NY":
-            if pb_dist > 0.75:
-                return (False, "ny_entry_too_far_from_ema")
-            if ch15_abs > 0.82 or (ch15_abs > 0.72 and ch1_abs > 1.55):
-                return (False, "ny_late_extension_exec")
-            if ch4_abs < 0.62 or ch1_abs < 0.32:
-                return (False, "ny_context_too_weak_exec")
-            if fut_vol < max(MIN_FUT_VOL_USD, 10_500_000.0):
-                return (False, "ny_below_liquidity")
-        elif sess == "LON":
-            if pb_dist > 0.50:
-                return (False, "lon_entry_too_far_from_ema")
-            if ch15_abs > 0.42 or ch1_abs > 1.05:
-                return (False, "lon_late_extension_exec")
-            if ch4_abs < 0.62 or ch1_abs < 0.28:
-                return (False, "lon_context_too_weak_exec")
-            if ch4_abs > 2.20 or ch24_abs > 12.0:
-                return (False, "lon_trend_overheated_exec")
-            if fut_vol < max(MIN_FUT_VOL_USD, 14_000_000.0):
-                return (False, "lon_below_liquidity")
-        elif sess == "ASIA":
-            if pb_dist > 0.58:
-                return (False, "asia_entry_too_far_from_ema")
-            if ch15_abs > 0.58 or ch1_abs > 1.22:
-                return (False, "asia_late_extension_exec")
-            if ch4_abs < 0.78 or ch1_abs < 0.38:
-                return (False, "asia_context_too_weak_exec")
-            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.05, ASIA_MIN_FUT_VOL_USD)):
-                return (False, "asia_below_liquidity")
-
-        if engine == "A":
-            if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
-                return (False, "pullback_not_ready")
-            if pb_dist > (0.50 if sess == 'LON' else (0.60 if sess == 'NY' else 0.54)):
-                return (False, "pullback_still_too_shallow")
-            if sess == 'LON' and (ch15_abs > 0.40 or ch1_abs < 0.30 or ch1_abs > 1.00 or ch4_abs < 0.65):
-                return (False, 'lon_pullback_not_clean_enough')
-            return (True, "ok")
-
-        if engine == "C":
-            if score < (score_floor + 1.0):
-                return (False, "engine_c_below_quality")
-            if conf < (conf_floor + 1):
-                return (False, "engine_c_below_conf")
-            if rr_final < (rr_floor + 0.04):
-                return (False, "engine_c_below_rr")
-            if fut_vol < float(max(MIN_FUT_VOL_USD * 1.10, ENGINE_C_MIN_FUT_VOL_USD)):
-                return (False, "engine_c_below_liquidity")
-            if ch1_abs > (1.20 if sess == 'LON' else (1.45 if sess == 'NY' else 1.10)):
-                return (False, "engine_c_too_extended")
-            return (True, "ok")
-
-        if engine == "B":
-            if score < (score_floor + 1.5):
-                return (False, "engine_b_below_quality")
-            if conf < (conf_floor + 1):
-                return (False, "engine_b_below_conf")
-            if rr_final < (rr_floor + 0.05):
-                return (False, "engine_b_below_rr")
-            if fut_vol < float(max(MIN_FUT_VOL_USD * (1.10 if sess != 'ASIA' else 1.18), 15_000_000.0 if sess != 'ASIA' else ASIA_MIN_FUT_VOL_USD)):
-                return (False, "engine_b_below_liquidity")
-            return (True, "ok")
-
-        return (False, "engine_not_supported")
+            return (False, 'below_exec_rr')
+        return (True, 'ok')
     except Exception:
-        return (False, "executable_gate_exception")
+        return (False, 'executable_gate_exception')
 
 def compute_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float) -> int:
     """
@@ -27860,6 +27877,15 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     }
     """
 
+    try:
+        cfg_live = load_strategy_config(force=False)
+        if str(mode or '').lower().strip() in {'exec', 'email'} and _strategy_cfg_is_fixed_lon_pullback(cfg_live):
+            allowed_sessions = _strategy_cfg_exec_allowed_sessions(cfg_live)
+            if allowed_sessions and str(session_name or '').upper().strip() not in allowed_sessions:
+                return {'setups': [], 'waiting': [], 'trend_watch': [], 'spikes': [], 'spike_warnings': []}
+    except Exception:
+        pass
+
     # Setup-count governor (authoritative executable lane): keep flow near target without
     # making /screen and email diverge.
     try:
@@ -28058,8 +28084,10 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # ------------------------------------------------
     breakout_setups = []
     try:
+        cfg_live = load_strategy_config(force=False)
+        allow_breakout_engine = not (str(mode or '').lower().strip() in {'exec', 'email'} and _strategy_cfg_is_fixed_lon_pullback(cfg_live))
         bases_for_breakout = list(dict.fromkeys([b.upper() for b in (leaders + losers)]))
-        if bases_for_breakout:
+        if allow_breakout_engine and bases_for_breakout:
             sub = _subset_best(best_fut, bases_for_breakout)
             breakout_setups = pick_breakout_setups(
                 sub,
