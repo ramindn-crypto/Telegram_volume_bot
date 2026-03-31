@@ -1174,15 +1174,12 @@ def _strategy_config_defaults() -> dict:
             {"name": "strict", "quality_score_min_screen": 64.0, "quality_score_min_email": 72.0, "tf_align_1h_min_abs": 0.65, "tf_align_4h_min_abs": 0.60, "atr_min_pct": 1.00, "min_rr_tp": 1.45, "regime_slope_trend_min_pct": 0.060, "lon_quality_add": 1.0, "lon_conf_add": 1, "lon_rr_add": 0.04, "engine_c_base_score_add": 0.0, "engine_c_exec_quality_add": 0.0, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.10, "engine_c_exec_ch1_cap_lon": 1.20, "engine_c_exec_pb_dist_lon": 0.68},
             {"name": "balanced", "quality_score_min_screen": 62.0, "quality_score_min_email": 70.0, "tf_align_1h_min_abs": 0.55, "tf_align_4h_min_abs": 0.50, "atr_min_pct": 0.95, "min_rr_tp": 1.40, "regime_slope_trend_min_pct": 0.055, "lon_quality_add": 0.0, "lon_conf_add": 0, "lon_rr_add": 0.00, "engine_c_base_score_add": 0.0, "engine_c_exec_quality_add": 0.0, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.08, "engine_c_exec_ch1_cap_lon": 1.22, "engine_c_exec_pb_dist_lon": 0.70},
             {"name": "flex", "quality_score_min_screen": 60.0, "quality_score_min_email": 68.0, "tf_align_1h_min_abs": 0.45, "tf_align_4h_min_abs": 0.45, "atr_min_pct": 0.85, "min_rr_tp": 1.35, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -1.0, "lon_conf_add": -1, "lon_rr_add": -0.04, "engine_c_base_score_add": -0.5, "engine_c_exec_quality_add": -0.5, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": -0.02, "engine_c_exec_liq_mult": 1.05, "engine_c_exec_ch1_cap_lon": 1.24, "engine_c_exec_pb_dist_lon": 0.72},
-            {"name": "rr_bias", "quality_score_min_screen": 61.0, "quality_score_min_email": 69.0, "tf_align_1h_min_abs": 0.50, "tf_align_4h_min_abs": 0.45, "atr_min_pct": 0.90, "min_rr_tp": 1.50, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -1.0, "lon_conf_add": 0, "lon_rr_add": 0.08, "engine_c_base_score_add": -0.5, "engine_c_exec_quality_add": -0.5, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.05, "engine_c_exec_ch1_cap_lon": 1.24, "engine_c_exec_pb_dist_lon": 0.72},
-            {"name": "lon_mid_push", "quality_score_min_screen": 59.0, "quality_score_min_email": 67.0, "tf_align_1h_min_abs": 0.42, "tf_align_4h_min_abs": 0.42, "atr_min_pct": 0.80, "min_rr_tp": 1.32, "regime_slope_trend_min_pct": 0.048, "lon_quality_add": -2.0, "lon_conf_add": -1, "lon_rr_add": -0.05, "engine_c_base_score_add": -1.0, "engine_c_exec_quality_add": -1.0, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.03, "engine_c_exec_liq_mult": 1.02, "engine_c_exec_ch1_cap_lon": 1.28, "engine_c_exec_pb_dist_lon": 0.74},
             {"name": "c_breakout_focus", "quality_score_min_screen": 58.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.40, "tf_align_4h_min_abs": 0.40, "atr_min_pct": 0.78, "min_rr_tp": 1.30, "regime_slope_trend_min_pct": 0.046, "lon_quality_add": -1.5, "lon_conf_add": -1, "lon_rr_add": -0.04, "engine_c_base_score_add": -2.0, "engine_c_exec_quality_add": -2.0, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.04, "engine_c_exec_liq_mult": 1.00, "engine_c_exec_ch1_cap_lon": 1.34, "engine_c_exec_pb_dist_lon": 0.78},
         ],
         "goal_profile_candidate_profiles": [
             {"name": "LON_A_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
             {"name": "LON_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
             {"name": "LON_A_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
-            {"name": "LON_A_C_SCOUT", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
         ],
         "execution_engines_allowed": ["A", "B", "C"],
         "goal_profile_active_profile": "BASELINE",
@@ -1190,8 +1187,8 @@ def _strategy_config_defaults() -> dict:
         "goal_profile_allow_ny": False,
         "goal_profile_allow_asia": False,
         "goal_profile_allow_engine_b": False,
-        "goal_profile_shortlist": 4,
-        "goal_profile_max_run_minutes": 18.0,
+        "goal_profile_shortlist": 3,
+        "goal_profile_max_run_minutes": 16.0,
         "engine_c_base_score_add": 0.0,
         "engine_c_exec_quality_add": 0.0,
         "engine_c_exec_conf_add": 0,
@@ -21226,7 +21223,6 @@ def _goal_profile_candidate_profiles(cfg: dict | None = None) -> list[dict]:
         {'name': 'LON_A_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
         {'name': 'LON_C_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['C'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
         {'name': 'LON_A_C_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A', 'C'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
-        {'name': 'LON_A_C_SCOUT', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A', 'C'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
     ]
     if allow_ny:
         fallback.append({'name': 'LON_NY_A_ONLY', 'execution_sessions_allowed': ['LON', 'NY'], 'execution_engines_allowed': ['A'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False})
@@ -21610,22 +21606,103 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
         save_goal_profile_report(report)
         return report
     except TimeoutError as e:
-        apply_strategy_config(cfg0 or {})
-        save_strategy_config(cfg0 or {})
         status = 'ABORTED' if 'aborted' in str(e).lower() else 'TIMEOUT'
+        timed_out = (status == 'TIMEOUT')
+        partial_best_cfg = None
+        partial_best_eval = None
+        partial_best_profile = {'name': ''}
+        partial_best_bundle = {'name': ''}
+        try:
+            partial_best_cfg = json.loads(json.dumps(best_cfg)) if isinstance(best_cfg, dict) else None
+            partial_best_eval = dict(best_eval) if isinstance(best_eval, dict) else None
+            partial_best_profile = dict(best_profile) if isinstance(best_profile, dict) else {'name': ''}
+            partial_best_bundle = dict(best_bundle) if isinstance(best_bundle, dict) else {'name': ''}
+        except Exception:
+            partial_best_cfg = None
+            partial_best_eval = None
+        if timed_out and (not stage2_rows) and stage1_rows:
+            try:
+                top_stage1 = sorted(stage1_rows, key=lambda x: float(x.get('stage1_score', -1e9)), reverse=True)[0]
+                cand_cfg = dict(top_stage1.get('cand_cfg') or {})
+                if cand_cfg:
+                    apply_strategy_config(cand_cfg)
+                    rep7 = run_universe_backtest(7, 'ALL', exec_tf, top_n, None, False, False)
+                    apply_strategy_config(base_cfg)
+                    evald = _goal_profile_score_candidate({'overall': top_stage1.get('metrics_30d') or {}}, rep7, cand_cfg)
+                    partial_best_cfg = json.loads(json.dumps(cand_cfg))
+                    partial_best_eval = dict(evald)
+                    partial_best_profile = {'name': str(top_stage1.get('profile') or '')}
+                    partial_best_bundle = {'name': str(top_stage1.get('bundle') or '')}
+                    stage2_rows.append({
+                        'profile': str(top_stage1.get('profile') or ''),
+                        'bundle': str(top_stage1.get('bundle') or ''),
+                        'score': float(evald.get('score', -1e9)),
+                        'feasible': bool(evald.get('feasible')),
+                        'metrics_30d': evald.get('metrics_30d') or {},
+                        'metrics_7d': evald.get('metrics_7d') or {},
+                        'penalties': evald.get('penalties') or {},
+                        'execution_sessions_allowed': list(cand_cfg.get('execution_sessions_allowed') or []),
+                        'execution_engines_allowed': list(cand_cfg.get('execution_engines_allowed') or []),
+                    })
+            except Exception:
+                try:
+                    apply_strategy_config(base_cfg)
+                except Exception:
+                    pass
+        baseline_score = float((baseline_eval or {}).get('score', -1e9) if isinstance(locals().get('baseline_eval'), dict) else -1e9)
+        best_score = float((partial_best_eval or {}).get('score', -1e9) if isinstance(partial_best_eval, dict) else -1e9)
+        promote_partial = bool(timed_out and isinstance(partial_best_cfg, dict) and best_score > baseline_score + 0.5)
+        final_cfg = json.loads(json.dumps(partial_best_cfg if promote_partial else (cfg0 or {})))
+        try:
+            final_cfg['goal_profile_last_run_ts'] = float(time.time())
+        except Exception:
+            pass
+        try:
+            save_strategy_config(final_cfg)
+            apply_strategy_config(final_cfg)
+        except Exception:
+            pass
+        final_eval = dict(partial_best_eval) if (promote_partial and isinstance(partial_best_eval, dict)) else (dict(baseline_eval) if isinstance(locals().get('baseline_eval'), dict) else {})
         err_report = {
             'ok': False,
-            'status': status,
+            'status': ('TIMEOUT_PROMOTED' if promote_partial else status),
             'ts': float(time.time()),
             'started_ts': started_ts,
             'finished_ts': float(time.time()),
             'targets': tgt,
             'error': str(e),
             'current': {
-                'goal_profile_active_profile': current_profile,
-                'execution_sessions_allowed': current_sessions,
-                'execution_engines_allowed': current_engines,
+                'goal_profile_active_profile': str(final_cfg.get('goal_profile_active_profile') or current_profile),
+                'execution_sessions_allowed': list(final_cfg.get('execution_sessions_allowed') or current_sessions),
+                'execution_engines_allowed': list(final_cfg.get('execution_engines_allowed') or current_engines),
             },
+            'baseline': {'score': baseline_score, 'metrics_30d': (baseline_eval or {}).get('metrics_30d') or {}, 'metrics_7d': (baseline_eval or {}).get('metrics_7d') or {}},
+            'best_candidate': {
+                'profile': str((partial_best_profile or {}).get('name') or ''),
+                'bundle': str((partial_best_bundle or {}).get('name') or ''),
+                'score': best_score,
+                'feasible': bool((partial_best_eval or {}).get('feasible')) if isinstance(partial_best_eval, dict) else False,
+                'metrics_30d': (partial_best_eval or {}).get('metrics_30d') or {},
+                'metrics_7d': (partial_best_eval or {}).get('metrics_7d') or {},
+                'execution_sessions_allowed': list((partial_best_cfg or {}).get('execution_sessions_allowed') or []),
+                'execution_engines_allowed': list((partial_best_cfg or {}).get('execution_engines_allowed') or []),
+            },
+            'final': {
+                'score': float(final_eval.get('score', -1e9)) if isinstance(final_eval, dict) else -1e9,
+                'metrics_30d': (final_eval or {}).get('metrics_30d') or {},
+                'metrics_7d': (final_eval or {}).get('metrics_7d') or {},
+                'execution_sessions_allowed': list(final_cfg.get('execution_sessions_allowed') or current_sessions),
+                'execution_engines_allowed': list(final_cfg.get('execution_engines_allowed') or current_engines),
+                'goal_profile_active_profile': str(final_cfg.get('goal_profile_active_profile') or current_profile),
+            },
+            'progress': {
+                'stage': 'timeout_finalize' if timed_out else 'aborted',
+                'candidate_idx': int(len(stage1_rows) if isinstance(locals().get('stage1_rows'), list) else 0),
+                'candidate_total': int(candidate_total if 'candidate_total' in locals() else 0),
+                'elapsed_sec': float(max(0.0, time.time() - started_ts)),
+                'shortlist_from': int(len(stage1_rows) if isinstance(locals().get('stage1_rows'), list) else 0),
+            },
+            'top_candidates': sorted(stage2_rows, key=lambda x: float(x.get('score', -1e9)), reverse=True)[:8] if isinstance(locals().get('stage2_rows'), list) else [],
             'last_final': last_final if isinstance(last_final, dict) else {},
         }
         save_goal_profile_report(err_report)
