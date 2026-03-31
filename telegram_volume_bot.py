@@ -1175,10 +1175,12 @@ def _strategy_config_defaults() -> dict:
             {"name": "balanced", "quality_score_min_screen": 62.0, "quality_score_min_email": 70.0, "tf_align_1h_min_abs": 0.55, "tf_align_4h_min_abs": 0.50, "atr_min_pct": 0.95, "min_rr_tp": 1.40, "regime_slope_trend_min_pct": 0.055, "lon_quality_add": 0.0, "lon_conf_add": 0, "lon_rr_add": 0.00},
             {"name": "flex", "quality_score_min_screen": 60.0, "quality_score_min_email": 68.0, "tf_align_1h_min_abs": 0.45, "tf_align_4h_min_abs": 0.45, "atr_min_pct": 0.85, "min_rr_tp": 1.35, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -1.0, "lon_conf_add": -1, "lon_rr_add": -0.04},
             {"name": "rr_bias", "quality_score_min_screen": 61.0, "quality_score_min_email": 69.0, "tf_align_1h_min_abs": 0.50, "tf_align_4h_min_abs": 0.45, "atr_min_pct": 0.90, "min_rr_tp": 1.50, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -1.0, "lon_conf_add": 0, "lon_rr_add": 0.08},
+            {"name": "lon_relaxed", "quality_score_min_screen": 59.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.42, "tf_align_4h_min_abs": 0.42, "atr_min_pct": 0.80, "min_rr_tp": 1.32, "regime_slope_trend_min_pct": 0.048, "lon_quality_add": -1.5, "lon_conf_add": -1, "lon_rr_add": -0.05},
         ],
         "goal_profile_candidate_profiles": [
             {"name": "LON_A_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
             {"name": "LON_A_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+            {"name": "LON_A_C_BALANCED", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
             {"name": "LON_NY_A_ONLY", "execution_sessions_allowed": ["LON", "NY"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
         ],
         "execution_engines_allowed": ["A", "B", "C"],
@@ -21291,10 +21293,10 @@ def _goal_profile_score_candidate(rep30: dict, rep7: dict, cfg: dict) -> dict:
             return (v - hi) * weight_over
         return 0.0
 
-    freq_pen = _freq_pen(sdp30, tgt['target_lo'], tgt['target_hi'], 38.0, 20.0) + _freq_pen(sdp7, tgt['target_lo'], tgt['target_hi'], 12.0, 6.0)
-    wr_pen = max(0.0, tgt['target_wr'] - wr30) * 3.0 + max(0.0, tgt['target_wr'] - wr7) * 0.8
+    freq_pen = _freq_pen(sdp30, tgt['target_lo'], tgt['target_hi'], 44.0, 18.0) + _freq_pen(sdp7, tgt['target_lo'], tgt['target_hi'], 14.0, 5.0)
+    wr_pen = max(0.0, tgt['target_wr'] - wr30) * 2.6 + max(0.0, tgt['target_wr'] - wr7) * 0.7
     avg_r_pen = max(0.0, tgt['target_avg_r'] - ar30) * 65.0 + max(0.0, tgt['target_avg_r'] - ar7) * 18.0
-    sample_pen = max(0, tgt['min_live_30d'] - n30) * 6.0 + max(0, tgt['min_live_7d'] - n7) * 4.0
+    sample_pen = max(0, tgt['min_live_30d'] - n30) * 7.0 + max(0, tgt['min_live_7d'] - n7) * 4.5
     instability_pen = abs(wr30 - wr7) * (0.10 if (n30 > 0 and n7 > 0) else 0.0)
     zero_pen = 350.0 if n30 <= 0 else 0.0
     score = (wr30 * 2.2) + (wr7 * 0.7) + (ar30 * 55.0) + (ar7 * 15.0) - freq_pen - wr_pen - avg_r_pen - sample_pen - instability_pen - zero_pen
@@ -21509,7 +21511,7 @@ def _session_entry_quality_limits(session_name: str, source: str = 'email') -> d
     sess = str(session_name or '').upper().strip() or 'NY'
     base = {
         'NY': {'max_pb_ema_dist': 0.60, 'max_ch15_abs': 0.52, 'max_ch1_abs': 1.15, 'max_atr_pct': 4.0},
-        'LON': {'max_pb_ema_dist': 0.56, 'max_ch15_abs': 0.48, 'max_ch1_abs': 1.08, 'max_atr_pct': 4.2},
+        'LON': {'max_pb_ema_dist': 0.60, 'max_ch15_abs': 0.52, 'max_ch1_abs': 1.14, 'max_atr_pct': 4.4},
         'ASIA': {'max_pb_ema_dist': 0.44, 'max_ch15_abs': 0.38, 'max_ch1_abs': 0.90, 'max_atr_pct': 3.3},
     }.get(sess, {'max_pb_ema_dist': 0.52, 'max_ch15_abs': 0.44, 'max_ch1_abs': 1.00, 'max_atr_pct': 4.0}).copy()
     src = str(source or '').strip().lower()
@@ -21519,10 +21521,10 @@ def _session_entry_quality_limits(session_name: str, source: str = 'email') -> d
         base['max_ch1_abs'] *= (1.05 if sess != 'ASIA' else 1.03)
         base['max_atr_pct'] *= (1.04 if sess != 'ASIA' else 1.02)
     elif src == 'exec':
-        base['max_pb_ema_dist'] *= (1.03 if sess != 'ASIA' else 1.01)
-        base['max_ch15_abs'] *= (1.02 if sess != 'ASIA' else 1.01)
-        base['max_ch1_abs'] *= (1.02 if sess != 'ASIA' else 1.01)
-        base['max_atr_pct'] *= (1.02 if sess != 'ASIA' else 1.01)
+        base['max_pb_ema_dist'] *= (1.05 if sess == 'LON' else (1.03 if sess != 'ASIA' else 1.01))
+        base['max_ch15_abs'] *= (1.05 if sess == 'LON' else (1.02 if sess != 'ASIA' else 1.01))
+        base['max_ch1_abs'] *= (1.04 if sess == 'LON' else (1.02 if sess != 'ASIA' else 1.01))
+        base['max_atr_pct'] *= (1.03 if sess == 'LON' else (1.02 if sess != 'ASIA' else 1.01))
     return base
 
 
@@ -21754,9 +21756,9 @@ def is_executable_setup_eligible(
 
         if engine == 'A':
             if sess == 'LON':
-                score_floor = max(76.0, score_floor)
-                conf_floor = max(80, conf_floor)
-                rr_floor = max(1.36, rr_floor)
+                score_floor = max(75.0, score_floor)
+                conf_floor = max(79, conf_floor)
+                rr_floor = max(1.34, rr_floor)
             elif sess == 'NY':
                 score_floor = max(81.0, score_floor)
                 conf_floor = max(82, conf_floor)
@@ -21767,9 +21769,9 @@ def is_executable_setup_eligible(
                 rr_floor = max(1.52, rr_floor)
         elif engine == 'C':
             if sess == 'LON':
-                score_floor = max(81.0, score_floor + 1.25)
-                conf_floor = max(83, conf_floor + 1)
-                rr_floor = max(1.44, rr_floor + 0.05)
+                score_floor = max(78.0, score_floor + 0.25)
+                conf_floor = max(81, conf_floor + 0)
+                rr_floor = max(1.38, rr_floor + 0.02)
             elif sess == 'NY':
                 score_floor = max(83.0, score_floor + 1.5)
                 conf_floor = max(84, conf_floor + 1)
@@ -21833,15 +21835,15 @@ def is_executable_setup_eligible(
             if fut_vol < max(MIN_FUT_VOL_USD, 10_500_000.0):
                 return (False, "ny_below_liquidity")
         elif sess == "LON":
-            if pb_dist > 0.54:
+            if pb_dist > 0.60:
                 return (False, "lon_entry_too_far_from_ema")
-            if ch15_abs > 0.48 or ch1_abs > 1.12:
+            if ch15_abs > 0.54 or ch1_abs > 1.18:
                 return (False, "lon_late_extension_exec")
-            if ch4_abs < 0.58 or ch1_abs < 0.26:
+            if ch4_abs < 0.52 or ch1_abs < 0.24:
                 return (False, "lon_context_too_weak_exec")
-            if ch4_abs > 2.40 or ch24_abs > 13.0:
+            if ch4_abs > 2.55 or ch24_abs > 13.8:
                 return (False, "lon_trend_overheated_exec")
-            if fut_vol < max(MIN_FUT_VOL_USD, 13_000_000.0):
+            if fut_vol < max(MIN_FUT_VOL_USD, 11_000_000.0):
                 return (False, "lon_below_liquidity")
         elif sess == "ASIA":
             if pb_dist > 0.58:
