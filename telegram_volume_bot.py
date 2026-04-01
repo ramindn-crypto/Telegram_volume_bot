@@ -262,6 +262,10 @@ def _autotrade_migrate_tables():
             add_col("pnl_usdt", "pnl_usdt REAL")
             add_col("outcome", "outcome TEXT")
             add_col("note", "note TEXT")
+            add_col("family_id", "family_id TEXT NOT NULL DEFAULT ''")
+            add_col("regime_primary", "regime_primary TEXT NOT NULL DEFAULT ''")
+            add_col("allocator_plan_id", "allocator_plan_id TEXT NOT NULL DEFAULT ''")
+            add_col("param_set_id", "param_set_id TEXT NOT NULL DEFAULT ''")
 
             # Backfill trade_id for legacy rows (uses rowid).
             try:
@@ -1173,12 +1177,10 @@ def _strategy_config_defaults() -> dict:
         
         "goal_profile_candidate_bundles": [
             {"name": "strict", "quality_score_min_screen": 64.0, "quality_score_min_email": 72.0, "tf_align_1h_min_abs": 0.65, "tf_align_4h_min_abs": 0.60, "atr_min_pct": 1.00, "min_rr_tp": 1.45, "regime_slope_trend_min_pct": 0.060, "lon_quality_add": 1.0, "lon_conf_add": 1, "lon_rr_add": 0.04, "engine_c_base_score_add": 0.0, "engine_c_exec_quality_add": 0.0, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.10, "engine_c_exec_ch1_cap_lon": 1.20, "engine_c_exec_pb_dist_lon": 0.68},
-            {"name": "balanced", "quality_score_min_screen": 61.0, "quality_score_min_email": 69.0, "tf_align_1h_min_abs": 0.50, "tf_align_4h_min_abs": 0.46, "atr_min_pct": 0.90, "min_rr_tp": 1.34, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -0.5, "lon_conf_add": 0, "lon_rr_add": -0.02, "engine_c_base_score_add": -0.5, "engine_c_exec_quality_add": -0.5, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": -0.02, "engine_c_exec_liq_mult": 1.04, "engine_c_exec_ch1_cap_lon": 1.26, "engine_c_exec_pb_dist_lon": 0.74},
-            {"name": "flex", "quality_score_min_screen": 58.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.38, "tf_align_4h_min_abs": 0.38, "atr_min_pct": 0.78, "min_rr_tp": 1.24, "regime_slope_trend_min_pct": 0.043, "lon_quality_add": -2.0, "lon_conf_add": -1, "lon_rr_add": -0.06, "engine_c_base_score_add": -1.5, "engine_c_exec_quality_add": -1.5, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.05, "engine_c_exec_liq_mult": 0.96, "engine_c_exec_ch1_cap_lon": 1.38, "engine_c_exec_pb_dist_lon": 0.82},
-            {"name": "midreach", "quality_score_min_screen": 57.0, "quality_score_min_email": 65.0, "tf_align_1h_min_abs": 0.34, "tf_align_4h_min_abs": 0.34, "atr_min_pct": 0.74, "min_rr_tp": 1.20, "regime_slope_trend_min_pct": 0.040, "lon_quality_add": -2.4, "lon_conf_add": -1, "lon_rr_add": -0.08, "engine_c_base_score_add": -2.0, "engine_c_exec_quality_add": -2.0, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.06, "engine_c_exec_liq_mult": 0.92, "engine_c_exec_ch1_cap_lon": 1.42, "engine_c_exec_pb_dist_lon": 0.84},
-            {"name": "reach", "quality_score_min_screen": 56.0, "quality_score_min_email": 64.0, "tf_align_1h_min_abs": 0.30, "tf_align_4h_min_abs": 0.30, "atr_min_pct": 0.70, "min_rr_tp": 1.18, "regime_slope_trend_min_pct": 0.038, "lon_quality_add": -3.0, "lon_conf_add": -2, "lon_rr_add": -0.10, "engine_c_base_score_add": -2.5, "engine_c_exec_quality_add": -2.5, "engine_c_exec_conf_add": -2, "engine_c_exec_rr_add": -0.08, "engine_c_exec_liq_mult": 0.88, "engine_c_exec_ch1_cap_lon": 1.48, "engine_c_exec_pb_dist_lon": 0.88},
-            {"name": "yield", "quality_score_min_screen": 54.0, "quality_score_min_email": 62.0, "tf_align_1h_min_abs": 0.22, "tf_align_4h_min_abs": 0.22, "atr_min_pct": 0.65, "min_rr_tp": 1.12, "regime_slope_trend_min_pct": 0.032, "lon_quality_add": -4.0, "lon_conf_add": -3, "lon_rr_add": -0.12, "engine_c_base_score_add": -3.5, "engine_c_exec_quality_add": -3.0, "engine_c_exec_conf_add": -2, "engine_c_exec_rr_add": -0.10, "engine_c_exec_liq_mult": 0.80, "engine_c_exec_ch1_cap_lon": 1.62, "engine_c_exec_pb_dist_lon": 0.96},
-            {"name": "c_breakout_focus", "quality_score_min_screen": 56.0, "quality_score_min_email": 64.0, "tf_align_1h_min_abs": 0.28, "tf_align_4h_min_abs": 0.28, "atr_min_pct": 0.70, "min_rr_tp": 1.18, "regime_slope_trend_min_pct": 0.036, "lon_quality_add": -2.5, "lon_conf_add": -2, "lon_rr_add": -0.08, "engine_c_base_score_add": -3.0, "engine_c_exec_quality_add": -3.0, "engine_c_exec_conf_add": -2, "engine_c_exec_rr_add": -0.08, "engine_c_exec_liq_mult": 0.84, "engine_c_exec_ch1_cap_lon": 1.58, "engine_c_exec_pb_dist_lon": 0.94},
+            {"name": "balanced", "quality_score_min_screen": 62.0, "quality_score_min_email": 70.0, "tf_align_1h_min_abs": 0.55, "tf_align_4h_min_abs": 0.50, "atr_min_pct": 0.95, "min_rr_tp": 1.40, "regime_slope_trend_min_pct": 0.055, "lon_quality_add": 0.0, "lon_conf_add": 0, "lon_rr_add": 0.00, "engine_c_base_score_add": 0.0, "engine_c_exec_quality_add": 0.0, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.08, "engine_c_exec_ch1_cap_lon": 1.22, "engine_c_exec_pb_dist_lon": 0.70},
+            {"name": "flex", "quality_score_min_screen": 60.0, "quality_score_min_email": 68.0, "tf_align_1h_min_abs": 0.45, "tf_align_4h_min_abs": 0.45, "atr_min_pct": 0.85, "min_rr_tp": 1.35, "regime_slope_trend_min_pct": 0.050, "lon_quality_add": -1.0, "lon_conf_add": -1, "lon_rr_add": -0.04, "engine_c_base_score_add": -0.5, "engine_c_exec_quality_add": -0.5, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": -0.02, "engine_c_exec_liq_mult": 1.05, "engine_c_exec_ch1_cap_lon": 1.24, "engine_c_exec_pb_dist_lon": 0.72},
+            {"name": "reach", "quality_score_min_screen": 58.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.38, "tf_align_4h_min_abs": 0.38, "atr_min_pct": 0.76, "min_rr_tp": 1.28, "regime_slope_trend_min_pct": 0.044, "lon_quality_add": -2.0, "lon_conf_add": -1, "lon_rr_add": -0.06, "engine_c_base_score_add": -1.5, "engine_c_exec_quality_add": -1.5, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.04, "engine_c_exec_liq_mult": 0.98, "engine_c_exec_ch1_cap_lon": 1.36, "engine_c_exec_pb_dist_lon": 0.80},
+            {"name": "c_breakout_focus", "quality_score_min_screen": 58.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.40, "tf_align_4h_min_abs": 0.40, "atr_min_pct": 0.78, "min_rr_tp": 1.30, "regime_slope_trend_min_pct": 0.046, "lon_quality_add": -1.5, "lon_conf_add": -1, "lon_rr_add": -0.04, "engine_c_base_score_add": -2.0, "engine_c_exec_quality_add": -2.0, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.04, "engine_c_exec_liq_mult": 1.00, "engine_c_exec_ch1_cap_lon": 1.34, "engine_c_exec_pb_dist_lon": 0.78},
         ],
         "goal_profile_candidate_profiles": [
             {"name": "LON_A_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
@@ -1189,10 +1191,7 @@ def _strategy_config_defaults() -> dict:
         ],
         "execution_engines_allowed": ["A", "B", "C"],
         "goal_profile_active_profile": "BASELINE",
-        "goal_profile_auto_validate": True,
-        "goal_profile_notify_admin": True,
-        "goal_profile_validation_session_7d": "LON",
-        "goal_profile_schema_version": 7,
+        "goal_profile_schema_version": 4,
         "goal_profile_last_run_ts": 0.0,
         "goal_profile_allow_ny": False,
         "goal_profile_allow_asia": False,
@@ -1244,6 +1243,18 @@ def _strategy_config_defaults() -> dict:
             "LON": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
             "ASIA": {"quality_add": 0.0, "conf_add": 0, "rr_add": 0.0},
         },
+
+        # Formal family allocator / regime framework (production-safe defaults)
+        "family_allocator_enabled": True,
+        "family_allocator_shadow_mode": True,
+        "family_allocator_enforce_live": False,
+        "family_allocator_interval_hours": 24.0,
+        "family_regime_refresh_enabled": True,
+        "family_regime_refresh_interval_hours": 4.0,
+        "family_allocator_max_active_per_cell": 2,
+        "family_allocator_min_score": -999.0,
+        "family_allocator_min_sample": 0,
+        "family_allocator_plan_ttl_hours": 36.0,
     }
 
 _STRATEGY_CFG_CACHE = {"ts": 0.0, "cfg": None}
@@ -1559,11 +1570,8 @@ def _strategy_config_bootstrap_recommendations() -> None:
         except Exception:
             gp_ver = 0
         
-        if gp_ver < 5:
-            cfg['goal_profile_schema_version'] = 7
-            cfg['goal_profile_auto_validate'] = _cfg_bool(cfg.get('goal_profile_auto_validate', True), True)
-            cfg['goal_profile_notify_admin'] = _cfg_bool(cfg.get('goal_profile_notify_admin', True), True)
-            cfg['goal_profile_validation_session_7d'] = str(cfg.get('goal_profile_validation_session_7d', 'LON') or 'LON').upper().strip() or 'LON'
+        if gp_ver < 4:
+            cfg['goal_profile_schema_version'] = 4
             cfg['goal_profile_candidate_profiles'] = [
                 {"name": "LON_A_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
                 {"name": "LON_A_REACH", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
@@ -1585,14 +1593,11 @@ def _strategy_config_bootstrap_recommendations() -> None:
             engines = [str(x).upper().strip() for x in (cfg.get('execution_engines_allowed') or []) if str(x).strip()]
             reach_mode = bool(cfg.get('goal_profile_reach_mode', False)) or str(cfg.get('goal_profile_active_profile', '') or '').upper().strip().endswith('_SCOUT')
             if sessions == ['LON'] and engines == ['A']:
-                cfg['goal_profile_active_profile'] = 'LON_A_REACH'
-                cfg['goal_profile_reach_mode'] = True
+                cfg['goal_profile_active_profile'] = 'LON_A_REACH' if reach_mode else 'LON_A_ONLY'
             elif sessions == ['LON'] and engines == ['C']:
                 cfg['goal_profile_active_profile'] = 'LON_C_ONLY'
-                cfg['goal_profile_reach_mode'] = True
             elif sessions == ['LON'] and set(engines) == {'A', 'C'}:
-                cfg['goal_profile_active_profile'] = 'LON_A_C_REACH'
-                cfg['goal_profile_reach_mode'] = True
+                cfg['goal_profile_active_profile'] = 'LON_A_C_REACH' if reach_mode else 'LON_A_C_ONLY'
             changed = True
 
 
@@ -1737,1034 +1742,6 @@ async def cmd_params_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_strategy_config(cfg)
     apply_strategy_config(cfg)
     await update.message.reply_text(f"✅ Updated: {key} = {val_raw}")
-
-
-
-# =========================================================
-# ADAPTIVE FAMILY / REGIME FRAMEWORK
-# =========================================================
-
-ADAPTIVE_FAMILY_CFG_DEFAULTS = {
-    'adaptive_family_framework_enabled': True,
-    'adaptive_family_max_active': 3,
-    'adaptive_family_max_challengers': 1,
-    'adaptive_family_live_challengers_enabled': False,
-    'adaptive_family_selection_refresh_hours': 24.0,
-    'adaptive_family_regime_refresh_hours': 4.0,
-    'adaptive_family_recent_weight_7d': 0.60,
-    'adaptive_family_stabilizer_weight_30d': 0.30,
-    'adaptive_family_prior_weight': 0.10,
-    'adaptive_family_min_completed_7d': 4,
-    'adaptive_family_min_completed_30d': 12,
-    'adaptive_family_min_distinct_days': 4,
-    'adaptive_family_pause_lb_wr_floor': 0.38,
-    'adaptive_family_probation_loss_streak': 4,
-    'adaptive_family_prototype_screen_enabled': True,
-    'adaptive_family_prototype_exec_enabled': False,
-    'adaptive_family_force_regime_bucket': '',
-    'adaptive_family_last_selection_ts': 0.0,
-}
-
-
-@dataclass(frozen=True)
-class AdaptiveFamilySpec:
-    family_id: str
-    name: str
-    engine_hint: str
-    style: str
-    active_sessions: tuple[str, ...]
-    regime_buckets: tuple[str, ...]
-    core_features: tuple[str, ...]
-    stage: str = 'production'
-    live_enabled: bool = True
-    prior_score: float = 0.0
-    notes: str = ''
-
-
-def _adaptive_family_catalog() -> dict[str, AdaptiveFamilySpec]:
-    return {
-        'F1': AdaptiveFamilySpec(
-            family_id='F1',
-            name='Trend Pullback Continuation',
-            engine_hint='A',
-            style='pullback_continuation',
-            active_sessions=('LON', 'NY'),
-            regime_buckets=('trend_persistent', 'trend_expanding', 'trend_balanced'),
-            core_features=('pullback_ready', 'ema_proximity', 'tf_alignment', 'rr_clean'),
-            stage='production',
-            live_enabled=True,
-            prior_score=0.72,
-            notes='Current Engine A mapped to formal family governance.',
-        ),
-        'F2': AdaptiveFamilySpec(
-            family_id='F2',
-            name='Expansion Breakout',
-            engine_hint='B',
-            style='breakout_expansion',
-            active_sessions=('LON', 'NY'),
-            regime_buckets=('trend_expanding', 'trend_persistent'),
-            core_features=('breakout_trigger', 'volume_expansion', 'no_late_extension'),
-            stage='production',
-            live_enabled=True,
-            prior_score=0.68,
-            notes='Current Engine B mapped to expansion-only usage.',
-        ),
-        'F3': AdaptiveFamilySpec(
-            family_id='F3',
-            name='Base Continuation After Impulse',
-            engine_hint='C',
-            style='base_continuation',
-            active_sessions=('LON', 'NY'),
-            regime_buckets=('trend_balanced', 'trend_expanding', 'leader_continuation'),
-            core_features=('impulse_then_base', 'base_width', 'breakout_reclaim', 'rr_clean'),
-            stage='production',
-            live_enabled=True,
-            prior_score=0.70,
-            notes='Current Engine C mapped to formal base-continuation family.',
-        ),
-        'F4': AdaptiveFamilySpec(
-            family_id='F4',
-            name='Range Mean Reversion',
-            engine_hint='A',
-            style='range_mean_reversion',
-            active_sessions=('ASIA',),
-            regime_buckets=('range_compressed', 'range_balanced'),
-            core_features=('range_edges', 'rejection', 'low_persistence'),
-            stage='prototype',
-            live_enabled=False,
-            prior_score=0.55,
-            notes='Formal family wired into allocator, currently sourced from existing detectors only when context looks range-like.',
-        ),
-        'F5': AdaptiveFamilySpec(
-            family_id='F5',
-            name='Failed Breakout Trap Reversal',
-            engine_hint='B',
-            style='trap_reversal',
-            active_sessions=('LON', 'NY'),
-            regime_buckets=('rotation_choppy', 'range_balanced', 'reversal_trap'),
-            core_features=('failed_acceptance', 'reclaim', 'trap_signature', 'speed'),
-            stage='prototype',
-            live_enabled=False,
-            prior_score=0.52,
-            notes='Prototype governance family; only lightweight routing hooks are bound in this patch.',
-        ),
-        'F6': AdaptiveFamilySpec(
-            family_id='F6',
-            name='Liquidity Sweep Reversal',
-            engine_hint='A',
-            style='liquidity_sweep_reversal',
-            active_sessions=('LON', 'NY'),
-            regime_buckets=('reversal_trap', 'range_balanced'),
-            core_features=('sweep', 'reclaim', 'structure_shift', 'tight_stop'),
-            stage='prototype',
-            live_enabled=False,
-            prior_score=0.50,
-            notes='Prototype governance family; current code only routes compatible setups into this bucket when sweep diagnostics exist.',
-        ),
-        'F7': AdaptiveFamilySpec(
-            family_id='F7',
-            name='Relative-Strength Leader Continuation',
-            engine_hint='A/C',
-            style='leader_continuation',
-            active_sessions=('LON', 'NY'),
-            regime_buckets=('leader_continuation', 'trend_expanding', 'trend_persistent'),
-            core_features=('leader_base_override', 'relative_strength', 'breadth_support'),
-            stage='production',
-            live_enabled=True,
-            prior_score=0.66,
-            notes='Uses existing leader-base override / strong relative-strength signatures.',
-        ),
-    }
-
-
-_ADAPTIVE_FAMILY_CACHE_PREFIX = 'adaptive_family::'
-
-
-def _adaptive_safe_json_loads(raw, default=None):
-    if default is None:
-        default = {}
-    try:
-        if isinstance(raw, dict):
-            return dict(raw)
-        txt = str(raw or '').strip()
-        if not txt:
-            return dict(default) if isinstance(default, dict) else default
-        obj = json.loads(txt)
-        if isinstance(default, dict):
-            return obj if isinstance(obj, dict) else dict(default)
-        return obj
-    except Exception:
-        return dict(default) if isinstance(default, dict) else default
-
-
-def _adaptive_cfg_merge_defaults(cfg: dict | None = None) -> dict:
-    base = dict(cfg or {})
-    changed = False
-    for k, v in ADAPTIVE_FAMILY_CFG_DEFAULTS.items():
-        if k not in base:
-            base[k] = v
-            changed = True
-    if 'execution_family_allowlist' not in base:
-        base['execution_family_allowlist'] = ['F1', 'F2', 'F3', 'F7']
-        changed = True
-    if 'prototype_family_allowlist' not in base:
-        base['prototype_family_allowlist'] = ['F4', 'F5', 'F6']
-        changed = True
-    if 'family_allocator_notes' not in base:
-        base['family_allocator_notes'] = 'champion_challenger'
-        changed = True
-    return base if changed else dict(base)
-
-
-def _adaptive_family_framework_migrate() -> None:
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            cur = con.cursor()
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS adaptive_regime_snapshots (
-                    snapshot_key TEXT PRIMARY KEY,
-                    session TEXT NOT NULL DEFAULT '',
-                    snapshot_ts REAL NOT NULL DEFAULT 0,
-                    horizon_label TEXT NOT NULL DEFAULT '',
-                    regime_json TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS adaptive_family_registry (
-                    family_id TEXT PRIMARY KEY,
-                    family_name TEXT NOT NULL DEFAULT '',
-                    stage TEXT NOT NULL DEFAULT '',
-                    live_enabled INTEGER NOT NULL DEFAULT 0,
-                    engine_hint TEXT NOT NULL DEFAULT '',
-                    spec_json TEXT NOT NULL DEFAULT '',
-                    updated_ts REAL NOT NULL DEFAULT 0
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS adaptive_family_selection (
-                    selection_key TEXT PRIMARY KEY,
-                    trading_day_local TEXT NOT NULL DEFAULT '',
-                    session TEXT NOT NULL DEFAULT '',
-                    selection_ts REAL NOT NULL DEFAULT 0,
-                    regime_json TEXT NOT NULL DEFAULT '',
-                    selected_json TEXT NOT NULL DEFAULT '',
-                    scoreboard_json TEXT NOT NULL DEFAULT '',
-                    notes TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS adaptive_family_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_ts REAL NOT NULL DEFAULT 0,
-                    event_type TEXT NOT NULL DEFAULT '',
-                    session TEXT NOT NULL DEFAULT '',
-                    family_id TEXT NOT NULL DEFAULT '',
-                    trading_day_local TEXT NOT NULL DEFAULT '',
-                    details_json TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_family_selection_session_ts ON adaptive_family_selection(session, selection_ts)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_family_events_session_ts ON adaptive_family_events(session, event_ts)")
-            con.commit()
-    except Exception:
-        pass
-
-
-def _adaptive_family_registry_sync() -> None:
-    try:
-        cat = _adaptive_family_catalog()
-        now_ts = float(time.time())
-        with sqlite3.connect(DB_PATH) as con:
-            cur = con.cursor()
-            for spec in cat.values():
-                cur.execute(
-                    """INSERT OR REPLACE INTO adaptive_family_registry
-                           (family_id, family_name, stage, live_enabled, engine_hint, spec_json, updated_ts)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        str(spec.family_id),
-                        str(spec.name),
-                        str(spec.stage),
-                        1 if bool(spec.live_enabled) else 0,
-                        str(spec.engine_hint),
-                        json.dumps(spec.__dict__, ensure_ascii=False, sort_keys=True),
-                        now_ts,
-                    ),
-                )
-            con.commit()
-    except Exception:
-        pass
-
-
-def _adaptive_family_framework_bootstrap() -> None:
-    try:
-        _adaptive_family_framework_migrate()
-        cfg = load_strategy_config(force=True) or {}
-        merged = _adaptive_cfg_merge_defaults(cfg)
-        if merged != cfg:
-            save_strategy_config(merged)
-        _adaptive_family_registry_sync()
-    except Exception:
-        pass
-
-
-def _adaptive_family_log_event(event_type: str, session_name: str = '', family_id: str = '', trading_day_local: str = '', details: dict | None = None) -> None:
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            cur = con.cursor()
-            cur.execute(
-                """INSERT INTO adaptive_family_events (event_ts, event_type, session, family_id, trading_day_local, details_json)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    float(time.time()),
-                    str(event_type or ''),
-                    str(session_name or '').upper(),
-                    str(family_id or '').upper(),
-                    str(trading_day_local or ''),
-                    json.dumps(dict(details or {}), ensure_ascii=False, sort_keys=True),
-                ),
-            )
-            con.commit()
-    except Exception:
-        pass
-
-
-def _adaptive_now_melbourne() -> datetime:
-    try:
-        return datetime.now(ZoneInfo('Australia/Melbourne'))
-    except Exception:
-        return datetime.now(timezone.utc)
-
-
-def _adaptive_trading_day_label(ts: float | None = None) -> str:
-    try:
-        dt = datetime.fromtimestamp(float(ts or time.time()), ZoneInfo('Australia/Melbourne'))
-    except Exception:
-        try:
-            dt = datetime.fromtimestamp(float(ts or time.time()), timezone.utc)
-        except Exception:
-            dt = datetime.now(timezone.utc)
-    return dt.strftime('%Y-%m-%d')
-
-
-def _adaptive_selection_cache_key(session_name: str, trading_day_local: str | None = None) -> str:
-    day = str(trading_day_local or _adaptive_trading_day_label())
-    sess = str(session_name or '').upper().strip() or 'ALL'
-    return f"{_ADAPTIVE_FAMILY_CACHE_PREFIX}{day}::{sess}"
-
-
-def _adaptive_regime_cache_key(session_name: str) -> str:
-    return f"{_ADAPTIVE_FAMILY_CACHE_PREFIX}regime::{str(session_name or '').upper().strip() or 'ALL'}"
-
-
-def _adaptive_market_profile(best_fut: dict | None, top_n: int = 30) -> dict:
-    rows = []
-    for _base, mv in (best_fut or {}).items():
-        try:
-            fut_vol = float(usd_notional(mv) or 0.0)
-            ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0)
-            rows.append((str(_base or '').upper().strip(), fut_vol, ch24))
-        except Exception:
-            continue
-    rows = [r for r in rows if r[0] and float(r[1]) > 0.0]
-    rows.sort(key=lambda x: x[1], reverse=True)
-    rows = rows[:max(8, int(top_n or 30))]
-    if not rows:
-        return {
-            'n': 0,
-            'breadth_up': 0.0,
-            'breadth_down': 0.0,
-            'median_abs_24h': 0.0,
-            'avg_abs_24h': 0.0,
-            'top5_avg_abs_24h': 0.0,
-            'unstable_mix': 0.0,
-            'leader_strength': 0.0,
-        }
-    vals = [float(r[2]) for r in rows]
-    abs_vals = [abs(v) for v in vals]
-    n = len(vals)
-    breadth_up = sum(1 for v in vals if v >= 1.0) / max(1, n)
-    breadth_down = sum(1 for v in vals if v <= -1.0) / max(1, n)
-    unstable_mix = sum(1 for v in vals if abs(v) >= 3.5) / max(1, n)
-    top5 = abs_vals[:min(5, len(abs_vals))]
-    return {
-        'n': int(n),
-        'breadth_up': float(breadth_up),
-        'breadth_down': float(breadth_down),
-        'median_abs_24h': float(sorted(abs_vals)[len(abs_vals)//2] if abs_vals else 0.0),
-        'avg_abs_24h': float(sum(abs_vals) / max(1, len(abs_vals))),
-        'top5_avg_abs_24h': float(sum(top5) / max(1, len(top5))) if top5 else 0.0,
-        'unstable_mix': float(unstable_mix),
-        'leader_strength': float(max(abs_vals) if abs_vals else 0.0),
-    }
-
-
-def _adaptive_classify_session_regime(best_fut: dict | None = None, session_name: str = '', force: bool = False) -> dict:
-    sess = str(session_name or '').upper().strip() or 'ALL'
-    cache_key = _adaptive_regime_cache_key(sess)
-    ttl = 60 if force else 300
-    try:
-        if (not force) and cache_valid(cache_key, ttl):
-            cached = cache_get(cache_key)
-            if isinstance(cached, dict) and cached:
-                return dict(cached)
-    except Exception:
-        pass
-
-    cfg = _adaptive_cfg_merge_defaults(load_strategy_config(force=False) or {})
-    forced_bucket = str(cfg.get('adaptive_family_force_regime_bucket') or '').strip().lower()
-    profile = _adaptive_market_profile(best_fut, top_n=30)
-    breadth_up = float(profile.get('breadth_up') or 0.0)
-    breadth_down = float(profile.get('breadth_down') or 0.0)
-    median_abs = float(profile.get('median_abs_24h') or 0.0)
-    avg_abs = float(profile.get('avg_abs_24h') or 0.0)
-    unstable_mix = float(profile.get('unstable_mix') or 0.0)
-    leader_strength = float(profile.get('leader_strength') or 0.0)
-
-    bucket = 'trend_balanced'
-    bias = 'NEUTRAL'
-    persistence = 'medium'
-    volatility_state = 'normal'
-
-    if forced_bucket:
-        bucket = forced_bucket
-    else:
-        if unstable_mix >= 0.40 and min(breadth_up, breadth_down) >= 0.18:
-            bucket = 'rotation_choppy'
-            bias = 'NEUTRAL'
-            persistence = 'low'
-        elif sess == 'ASIA' and median_abs <= 1.6 and unstable_mix <= 0.18:
-            bucket = 'range_compressed'
-            bias = 'NEUTRAL'
-            persistence = 'low'
-        elif max(breadth_up, breadth_down) >= 0.62 and median_abs >= 2.0:
-            bias = 'UP' if breadth_up >= breadth_down else 'DOWN'
-            persistence = 'high'
-            bucket = 'trend_expanding' if (avg_abs >= 4.0 or leader_strength >= 7.5) else 'trend_persistent'
-        elif max(breadth_up, breadth_down) >= 0.48:
-            bias = 'UP' if breadth_up >= breadth_down else 'DOWN'
-            bucket = 'trend_balanced'
-            persistence = 'medium'
-        elif max(breadth_up, breadth_down) <= 0.36 and median_abs <= 2.0:
-            bucket = 'range_balanced'
-            bias = 'NEUTRAL'
-            persistence = 'low'
-        elif leader_strength >= 10.0 and max(breadth_up, breadth_down) >= 0.44:
-            bucket = 'leader_continuation'
-            bias = 'UP' if breadth_up >= breadth_down else 'DOWN'
-            persistence = 'medium'
-        elif unstable_mix >= 0.28:
-            bucket = 'reversal_trap'
-            bias = 'NEUTRAL'
-            persistence = 'low'
-
-    if avg_abs >= 4.5 or leader_strength >= 8.5:
-        volatility_state = 'expanded'
-    elif median_abs <= 1.5:
-        volatility_state = 'compressed'
-    else:
-        volatility_state = 'normal'
-
-    regime = {
-        'session': sess,
-        'bucket': str(bucket),
-        'bias': str(bias),
-        'persistence': str(persistence),
-        'volatility_state': str(volatility_state),
-        'breadth_up': round(breadth_up, 4),
-        'breadth_down': round(breadth_down, 4),
-        'median_abs_24h': round(median_abs, 4),
-        'avg_abs_24h': round(avg_abs, 4),
-        'leader_strength': round(leader_strength, 4),
-        'unstable_mix': round(unstable_mix, 4),
-        'snapshot_ts': float(time.time()),
-        'trading_day_local': _adaptive_trading_day_label(),
-    }
-
-    try:
-        cache_set(cache_key, dict(regime))
-    except Exception:
-        pass
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            cur = con.cursor()
-            key = f"{regime['trading_day_local']}::{sess}"
-            cur.execute(
-                """INSERT OR REPLACE INTO adaptive_regime_snapshots (snapshot_key, session, snapshot_ts, horizon_label, regime_json)
-                       VALUES (?, ?, ?, ?, ?)""",
-                (key, sess, float(regime.get('snapshot_ts') or time.time()), 'intraday', json.dumps(regime, ensure_ascii=False, sort_keys=True)),
-            )
-            con.commit()
-    except Exception:
-        pass
-    return regime
-
-
-def _adaptive_family_allowed_for_regime(spec: AdaptiveFamilySpec, regime_bucket: str) -> bool:
-    bucket = str(regime_bucket or '').lower().strip()
-    allowed = {str(x).lower().strip() for x in (spec.regime_buckets or ())}
-    if not allowed or bucket in allowed:
-        return True
-    if bucket.startswith('trend') and any(x.startswith('trend') for x in allowed):
-        return True
-    if bucket.startswith('range') and any(x.startswith('range') for x in allowed):
-        return True
-    if bucket in {'leader_continuation'} and 'trend_expanding' in allowed:
-        return True
-    return False
-
-
-def _adaptive_family_id_from_rowish(obj, session_name: str = '', regime: dict | None = None) -> str:
-    sess = str(session_name or '').upper().strip() or str((regime or {}).get('session') or '').upper().strip()
-    bucket = str((regime or {}).get('bucket') or '').lower().strip()
-    try:
-        engine = str((obj.get('engine') if isinstance(obj, dict) else getattr(obj, 'engine', '')) or '').upper().strip()
-    except Exception:
-        engine = ''
-    try:
-        leader_base = bool((obj.get('leader_base_override') if isinstance(obj, dict) else getattr(obj, 'leader_base_override', False)))
-    except Exception:
-        leader_base = False
-    try:
-        sweep = str((obj.get('sweep') if isinstance(obj, dict) else getattr(obj, 'sweep', '')) or '').upper().strip()
-    except Exception:
-        sweep = ''
-    try:
-        smf_event = str((obj.get('smf_event') if isinstance(obj, dict) else getattr(obj, 'smf_event', '')) or '').upper().strip()
-    except Exception:
-        smf_event = ''
-    if engine == 'C':
-        return 'F7' if leader_base else 'F3'
-    if engine == 'B':
-        if ('SWEEP' in sweep) or ('TRAP' in smf_event):
-            return 'F5'
-        return 'F2'
-    if engine == 'A':
-        if leader_base:
-            return 'F7'
-        if sess == 'ASIA' and bucket.startswith('range'):
-            return 'F4'
-        if 'SWEEP' in sweep:
-            return 'F6'
-        return 'F1'
-    return 'F1'
-
-
-def _adaptive_annotate_setup(obj, session_name: str = '', regime: dict | None = None):
-    if obj is None:
-        return obj
-    sess = str(session_name or '').upper().strip() or str((regime or {}).get('session') or '').upper().strip()
-    if not regime:
-        regime = _adaptive_classify_session_regime(None, sess, force=False)
-    fid = _adaptive_family_id_from_rowish(obj, session_name=sess, regime=regime)
-    spec = _adaptive_family_catalog().get(fid)
-    try:
-        setattr(obj, 'family_id', str(fid))
-        setattr(obj, 'family_name', str(spec.name if spec else fid))
-        setattr(obj, 'family_stage', str(spec.stage if spec else 'production'))
-        setattr(obj, 'family_live_enabled', bool(spec.live_enabled if spec else True))
-        setattr(obj, 'regime_bucket', str((regime or {}).get('bucket') or ''))
-        setattr(obj, 'regime_bias', str((regime or {}).get('bias') or ''))
-    except Exception:
-        pass
-    return obj
-
-
-def _adaptive_selection_read(session_name: str, trading_day_local: str | None = None) -> dict:
-    sess = str(session_name or '').upper().strip() or 'ALL'
-    day = str(trading_day_local or _adaptive_trading_day_label())
-    cache_key = _adaptive_selection_cache_key(sess, day)
-    try:
-        if cache_valid(cache_key, 300):
-            cached = cache_get(cache_key)
-            if isinstance(cached, dict) and cached:
-                return dict(cached)
-    except Exception:
-        pass
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            con.row_factory = sqlite3.Row
-            cur = con.cursor()
-            row = cur.execute(
-                "SELECT * FROM adaptive_family_selection WHERE selection_key=?",
-                (f"{day}::{sess}",),
-            ).fetchone()
-            if row:
-                obj = {
-                    'trading_day_local': day,
-                    'session': sess,
-                    'selection_ts': float(row['selection_ts'] or 0.0),
-                    'regime': _adaptive_safe_json_loads(row['regime_json'], {}),
-                    'selection': _adaptive_safe_json_loads(row['selected_json'], {}),
-                    'scoreboard': _adaptive_safe_json_loads(row['scoreboard_json'], {}),
-                    'notes': str(row['notes'] or ''),
-                }
-                cache_set(cache_key, dict(obj))
-                return obj
-    except Exception:
-        pass
-    return {}
-
-
-def _adaptive_selection_write(session_name: str, regime: dict, selection: dict, scoreboard: dict, notes: str = '') -> None:
-    sess = str(session_name or '').upper().strip() or 'ALL'
-    day = str((regime or {}).get('trading_day_local') or _adaptive_trading_day_label())
-    payload = {
-        'trading_day_local': day,
-        'session': sess,
-        'selection_ts': float(time.time()),
-        'regime': dict(regime or {}),
-        'selection': dict(selection or {}),
-        'scoreboard': dict(scoreboard or {}),
-        'notes': str(notes or ''),
-    }
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            cur = con.cursor()
-            cur.execute(
-                """INSERT OR REPLACE INTO adaptive_family_selection
-                       (selection_key, trading_day_local, session, selection_ts, regime_json, selected_json, scoreboard_json, notes)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    f"{day}::{sess}", day, sess, float(payload['selection_ts']),
-                    json.dumps(payload['regime'], ensure_ascii=False, sort_keys=True),
-                    json.dumps(payload['selection'], ensure_ascii=False, sort_keys=True),
-                    json.dumps(payload['scoreboard'], ensure_ascii=False, sort_keys=True),
-                    str(payload['notes']),
-                ),
-            )
-            con.commit()
-    except Exception:
-        pass
-    try:
-        cache_set(_adaptive_selection_cache_key(sess, day), dict(payload))
-    except Exception:
-        pass
-
-
-def _adaptive_wilson_lb(wins: int, total: int, z: float = 1.281551565545) -> float:
-    try:
-        wins = int(max(0, wins))
-        total = int(max(0, total))
-        if total <= 0:
-            return 0.0
-        phat = wins / total
-        denom = 1.0 + (z * z) / total
-        centre = phat + (z * z) / (2.0 * total)
-        margin = z * math.sqrt((phat * (1.0 - phat) + (z * z) / (4.0 * total)) / total)
-        return max(0.0, (centre - margin) / denom)
-    except Exception:
-        return 0.0
-
-
-def _adaptive_normalize_outcome(signal_outcome: str = '', life_outcome: str = '', state: str = '') -> str:
-    sig = str(signal_outcome or '').upper().strip()
-    life = str(life_outcome or '').upper().strip()
-    st = str(state or '').lower().strip()
-    if sig in {'WIN_TP', 'WIN'} or life in {'WIN', 'WIN_TP'}:
-        return 'WIN'
-    if sig in {'LOSS', 'SL'} or life in {'LOSS', 'SL'}:
-        return 'LOSS'
-    if life in {'BREAKEVEN', 'BE'}:
-        return 'BREAKEVEN'
-    if sig in {'AMBIGUOUS'}:
-        return 'AMBIGUOUS'
-    if 'open' in st or 'executed' in st or 'emailed' in st:
-        return 'OPEN'
-    return 'OPEN'
-
-
-def _adaptive_family_recent_samples(window_days: int = 30) -> list[dict]:
-    cutoff = float(time.time()) - float(max(1, int(window_days)) * 86400)
-    rows_out = []
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            con.row_factory = sqlite3.Row
-            cur = con.cursor()
-            rows = cur.execute(
-                """
-                SELECT l.setup_id,
-                       l.session,
-                       l.symbol,
-                       l.side,
-                       l.executable_ts,
-                       l.emailed_ts,
-                       l.signal_created_ts,
-                       l.state,
-                       l.outcome AS lifecycle_outcome,
-                       l.pnl_usdt,
-                       l.details_json,
-                       s.ch24,
-                       s.ch4,
-                       s.ch1,
-                       s.ch15,
-                       o.outcome AS signal_outcome
-                  FROM admin_setup_lifecycle l
-             LEFT JOIN signals s ON s.setup_id = l.setup_id
-             LEFT JOIN signal_outcomes o ON o.setup_id = l.setup_id
-                 WHERE COALESCE(l.executable_ts, l.emailed_ts, l.signal_created_ts, 0) >= ?
-                 ORDER BY COALESCE(l.executable_ts, l.emailed_ts, l.signal_created_ts, 0) DESC
-                """,
-                (float(cutoff),),
-            ).fetchall() or []
-        seen = set()
-        for row in rows:
-            sid = str(row['setup_id'] or '').strip()
-            if not sid or sid in seen:
-                continue
-            seen.add(sid)
-            det = _adaptive_safe_json_loads(row['details_json'], {})
-            sess = str(row['session'] or det.get('session') or '').upper().strip()
-            event_ts = float(row['executable_ts'] or row['emailed_ts'] or row['signal_created_ts'] or 0.0)
-            regime = {
-                'session': sess,
-                'bucket': str(det.get('regime_bucket') or ''),
-                'bias': str(det.get('regime_bias') or ''),
-            }
-            family_id = str(det.get('family_id') or '').upper().strip()
-            if not family_id:
-                base_obj = {
-                    'engine': det.get('engine'),
-                    'leader_base_override': det.get('leader_base_override', False),
-                    'sweep': det.get('sweep', ''),
-                    'smf_event': det.get('smf_event', ''),
-                }
-                family_id = _adaptive_family_id_from_rowish(base_obj, session_name=sess, regime=regime)
-            outcome = _adaptive_normalize_outcome(row['signal_outcome'], row['lifecycle_outcome'], row['state'])
-            rows_out.append({
-                'setup_id': sid,
-                'session': sess,
-                'symbol': str(row['symbol'] or '').upper(),
-                'event_ts': float(event_ts),
-                'event_day': _adaptive_trading_day_label(event_ts),
-                'family_id': str(family_id or 'F1'),
-                'outcome': str(outcome),
-                'pnl_usdt': float(row['pnl_usdt'] or 0.0),
-                'details': det,
-                'regime_bucket': str(regime.get('bucket') or ''),
-            })
-    except Exception:
-        return []
-    return rows_out
-
-
-def _adaptive_family_window_stats(session_name: str = '', window_days: int = 30) -> dict[str, dict]:
-    sess = str(session_name or '').upper().strip()
-    agg: dict[str, dict] = {}
-    for row in _adaptive_family_recent_samples(window_days=window_days):
-        try:
-            if sess and str(row.get('session') or '').upper().strip() not in {'', sess}:
-                continue
-            fid = str(row.get('family_id') or 'F1').upper()
-            bucket = agg.setdefault(fid, {
-                'family_id': fid,
-                'window_days': int(window_days),
-                'samples': 0,
-                'completed': 0,
-                'wins': 0,
-                'losses': 0,
-                'breakeven': 0,
-                'ambiguous': 0,
-                'days': set(),
-                'symbols': set(),
-                'pnl_usdt': 0.0,
-            })
-            bucket['samples'] += 1
-            bucket['days'].add(str(row.get('event_day') or ''))
-            bucket['symbols'].add(str(row.get('symbol') or ''))
-            bucket['pnl_usdt'] += float(row.get('pnl_usdt') or 0.0)
-            outc = str(row.get('outcome') or 'OPEN').upper()
-            if outc == 'WIN':
-                bucket['completed'] += 1
-                bucket['wins'] += 1
-            elif outc == 'LOSS':
-                bucket['completed'] += 1
-                bucket['losses'] += 1
-            elif outc == 'BREAKEVEN':
-                bucket['completed'] += 1
-                bucket['breakeven'] += 1
-            elif outc == 'AMBIGUOUS':
-                bucket['ambiguous'] += 1
-        except Exception:
-            continue
-    for fid, stats in agg.items():
-        completed = int(stats.get('completed') or 0)
-        wins = int(stats.get('wins') or 0)
-        losses = int(stats.get('losses') or 0)
-        stats['distinct_days'] = int(len(stats.get('days') or set()))
-        stats['distinct_symbols'] = int(len(stats.get('symbols') or set()))
-        stats['days'] = sorted(list(stats.get('days') or set()))
-        stats['symbols'] = sorted(list(stats.get('symbols') or set()))
-        stats['win_rate'] = (wins / completed) if completed > 0 else 0.0
-        stats['wilson_lb'] = _adaptive_wilson_lb(wins, completed)
-        stats['unit_expectancy'] = ((wins - losses) / completed) if completed > 0 else 0.0
-    return agg
-
-
-def _adaptive_family_rank_rows(session_name: str, regime: dict | None = None) -> list[dict]:
-    cfg = _adaptive_cfg_merge_defaults(load_strategy_config(force=False) or {})
-    cat = _adaptive_family_catalog()
-    regime = dict(regime or {})
-    bucket = str(regime.get('bucket') or '').lower().strip()
-    s7 = _adaptive_family_window_stats(session_name=session_name, window_days=7)
-    s30 = _adaptive_family_window_stats(session_name=session_name, window_days=30)
-    w7 = float(cfg.get('adaptive_family_recent_weight_7d', 0.60) or 0.60)
-    w30 = float(cfg.get('adaptive_family_stabilizer_weight_30d', 0.30) or 0.30)
-    wprior = float(cfg.get('adaptive_family_prior_weight', 0.10) or 0.10)
-    min7 = int(cfg.get('adaptive_family_min_completed_7d', 4) or 4)
-    min30 = int(cfg.get('adaptive_family_min_completed_30d', 12) or 12)
-    min_days = int(cfg.get('adaptive_family_min_distinct_days', 4) or 4)
-    pause_floor = float(cfg.get('adaptive_family_pause_lb_wr_floor', 0.38) or 0.38)
-    loss_streak_probation = int(cfg.get('adaptive_family_probation_loss_streak', 4) or 4)
-    allow_exec = {str(x).upper().strip() for x in (cfg.get('execution_family_allowlist') or []) if str(x).strip()}
-    allow_proto = {str(x).upper().strip() for x in (cfg.get('prototype_family_allowlist') or []) if str(x).strip()}
-
-    rows = []
-    for fid, spec in cat.items():
-        if str(session_name or '').upper().strip() not in set(spec.active_sessions):
-            continue
-        stats7 = dict(s7.get(fid) or {'completed': 0, 'wins': 0, 'losses': 0, 'distinct_days': 0, 'unit_expectancy': 0.0, 'wilson_lb': 0.0})
-        stats30 = dict(s30.get(fid) or {'completed': 0, 'wins': 0, 'losses': 0, 'distinct_days': 0, 'unit_expectancy': 0.0, 'wilson_lb': 0.0})
-        fit = _adaptive_family_allowed_for_regime(spec, bucket)
-        s7_completed = int(stats7.get('completed') or 0)
-        s30_completed = int(stats30.get('completed') or 0)
-        s7_days = int(stats7.get('distinct_days') or 0)
-        s30_days = int(stats30.get('distinct_days') or 0)
-        score7 = float(stats7.get('unit_expectancy') or 0.0) * 100.0 + float(stats7.get('wilson_lb') or 0.0) * 35.0
-        score30 = float(stats30.get('unit_expectancy') or 0.0) * 100.0 + float(stats30.get('wilson_lb') or 0.0) * 35.0
-        sample_penalty = 0.0
-        if s7_completed < min7:
-            sample_penalty -= (min7 - s7_completed) * 2.5
-        if s30_completed < min30:
-            sample_penalty -= (min30 - s30_completed) * 1.2
-        if max(s7_days, s30_days) < min_days:
-            sample_penalty -= (min_days - max(s7_days, s30_days)) * 1.5
-        fit_bonus = 9.0 if fit else -25.0
-        stage_penalty = 0.0
-        if spec.stage != 'production':
-            stage_penalty -= 6.0
-            if fid not in allow_proto:
-                stage_penalty -= 6.0
-        if allow_exec and fid not in allow_exec and spec.stage == 'production':
-            stage_penalty -= 25.0
-        total_score = (w7 * score7) + (w30 * score30) + (wprior * float(spec.prior_score) * 100.0) + fit_bonus + sample_penalty + stage_penalty
-        status = 'eligible'
-        if max(float(stats7.get('wilson_lb') or 0.0), float(stats30.get('wilson_lb') or 0.0)) < pause_floor and max(s7_completed, s30_completed) >= max(min7, 6):
-            status = 'paused'
-            total_score -= 25.0
-        if int(stats7.get('losses') or 0) >= loss_streak_probation and s7_completed >= min7:
-            status = 'probation'
-            total_score -= 10.0
-        if spec.stage != 'production' and status == 'eligible':
-            status = 'challenger_only'
-        rows.append({
-            'family_id': fid,
-            'family_name': spec.name,
-            'stage': spec.stage,
-            'live_enabled': bool(spec.live_enabled),
-            'regime_fit': bool(fit),
-            'status': status,
-            'score': round(float(total_score), 4),
-            'stats_7d': stats7,
-            'stats_30d': stats30,
-            'notes': spec.notes,
-        })
-    rows.sort(key=lambda x: (float(x.get('score') or 0.0), 1 if x.get('stage') == 'production' else 0, x.get('family_id')), reverse=True)
-    return rows
-
-
-def _adaptive_family_select_for_session(session_name: str, best_fut: dict | None = None, force: bool = False) -> dict:
-    sess = str(session_name or '').upper().strip() or 'ALL'
-    cfg = _adaptive_cfg_merge_defaults(load_strategy_config(force=False) or {})
-    if not _cfg_bool(cfg.get('adaptive_family_framework_enabled', True), True):
-        fallback = {
-            'champions': ['F1', 'F2', 'F3'],
-            'challengers': ['F7'],
-            'selection_mode': 'disabled',
-        }
-        return {
-            'session': sess,
-            'trading_day_local': _adaptive_trading_day_label(),
-            'regime': _adaptive_classify_session_regime(best_fut, sess, force=force),
-            'selection': fallback,
-            'scoreboard': {},
-            'notes': 'framework_disabled',
-        }
-
-    day = _adaptive_trading_day_label()
-    cached = _adaptive_selection_read(sess, day)
-    refresh_h = float(cfg.get('adaptive_family_selection_refresh_hours', 24.0) or 24.0)
-    if cached and not force:
-        age_sec = float(time.time()) - float(cached.get('selection_ts') or 0.0)
-        if age_sec <= max(300.0, refresh_h * 3600.0):
-            return dict(cached)
-
-    regime = _adaptive_classify_session_regime(best_fut, sess, force=force)
-    rows = _adaptive_family_rank_rows(sess, regime=regime)
-    max_active = int(max(1, min(3, int(cfg.get('adaptive_family_max_active', 3) or 3))))
-    max_challengers = int(max(0, min(2, int(cfg.get('adaptive_family_max_challengers', 1) or 1))))
-
-    champions = []
-    challengers = []
-    for row in rows:
-        fid = str(row.get('family_id') or '').upper().strip()
-        status = str(row.get('status') or '')
-        if not fid:
-            continue
-        if row.get('stage') == 'production' and row.get('regime_fit') and status in {'eligible', 'probation'} and len(champions) < max_active:
-            champions.append(fid)
-        elif len(challengers) < max_challengers and status in {'challenger_only', 'eligible', 'probation'}:
-            challengers.append(fid)
-    if not champions and rows:
-        fallback = next((r for r in rows if r.get('stage') == 'production'), rows[0])
-        fid = str(fallback.get('family_id') or '').upper().strip()
-        if fid:
-            champions = [fid]
-    challengers = [fid for fid in challengers if fid not in set(champions)][:max_challengers]
-
-    selection = {
-        'champions': list(champions),
-        'challengers': list(challengers),
-        'selection_mode': 'champion_challenger',
-    }
-    scoreboard = {str(r.get('family_id') or ''): r for r in rows}
-    notes = f"bucket={str(regime.get('bucket') or '')} bias={str(regime.get('bias') or '')} champions={','.join(champions) or '-'} challengers={','.join(challengers) or '-'}"
-    payload = {
-        'session': sess,
-        'trading_day_local': day,
-        'selection_ts': float(time.time()),
-        'regime': dict(regime),
-        'selection': dict(selection),
-        'scoreboard': dict(scoreboard),
-        'notes': notes,
-    }
-    _adaptive_selection_write(sess, regime, selection, scoreboard, notes=notes)
-    try:
-        _adaptive_family_log_event('selection_refresh', session_name=sess, trading_day_local=day, details=payload)
-    except Exception:
-        pass
-    return payload
-
-
-def _adaptive_family_runtime_policy(session_name: str, best_fut: dict | None = None, force: bool = False) -> dict:
-    return _adaptive_family_select_for_session(session_name=session_name, best_fut=best_fut, force=force)
-
-
-def _adaptive_family_gate_for_setup(s, session_name: str = '', cfg_live: dict | None = None, allow_challenger: bool = False, best_fut: dict | None = None) -> tuple[bool, str]:
-    cfg = _adaptive_cfg_merge_defaults(cfg_live or load_strategy_config(force=False) or {})
-    if not _cfg_bool(cfg.get('adaptive_family_framework_enabled', True), True):
-        return (True, 'framework_disabled')
-    sess = str(session_name or '').upper().strip() or 'ALL'
-    regime = _adaptive_classify_session_regime(best_fut, sess, force=False) if best_fut is not None else _adaptive_selection_read(sess).get('regime') or {'session': sess}
-    _adaptive_annotate_setup(s, session_name=sess, regime=regime)
-    fid = str(getattr(s, 'family_id', '') or '').upper().strip()
-    if not fid:
-        return (False, 'family_unresolved')
-    policy = _adaptive_family_runtime_policy(sess, best_fut=best_fut, force=False)
-    champions = {str(x).upper().strip() for x in (policy.get('selection') or {}).get('champions', []) if str(x).strip()}
-    challengers = {str(x).upper().strip() for x in (policy.get('selection') or {}).get('challengers', []) if str(x).strip()}
-    if fid in champions:
-        return (True, 'family_champion')
-    if fid in challengers and bool(allow_challenger):
-        return (True, 'family_challenger')
-    return (False, 'family_not_active')
-
-
-def _adaptive_family_status_text(session_name: str = '') -> str:
-    cfg = _adaptive_cfg_merge_defaults(load_strategy_config(force=False) or {})
-    sessions = [str(session_name).upper().strip()] if str(session_name or '').strip() else ['ASIA', 'LON', 'NY']
-    sessions = [s for s in sessions if s]
-    lines = [
-        "🧠 Adaptive Family Allocator",
-        HDR,
-        f"Framework: {'ON' if _cfg_bool(cfg.get('adaptive_family_framework_enabled', True), True) else 'OFF'} | Max active: {int(cfg.get('adaptive_family_max_active', 3) or 3)} | Max challengers: {int(cfg.get('adaptive_family_max_challengers', 1) or 1)}",
-        f"Weights: 7d={float(cfg.get('adaptive_family_recent_weight_7d', 0.60) or 0.60):.2f} | 30d={float(cfg.get('adaptive_family_stabilizer_weight_30d', 0.30) or 0.30):.2f} | prior={float(cfg.get('adaptive_family_prior_weight', 0.10) or 0.10):.2f}",
-    ]
-    for sess in sessions:
-        sel = _adaptive_family_runtime_policy(sess, best_fut=None, force=False)
-        regime = dict(sel.get('regime') or {})
-        scoreboard = dict(sel.get('scoreboard') or {})
-        champs = list((sel.get('selection') or {}).get('champions', []) or [])
-        challs = list((sel.get('selection') or {}).get('challengers', []) or [])
-        lines.append(f"\n• {sess}: {str(regime.get('bucket') or 'unknown')} | bias={str(regime.get('bias') or 'NEUTRAL')} | vol={str(regime.get('volatility_state') or 'n/a')}")
-        lines.append(f"  Champions: {', '.join(champs) if champs else '-'}")
-        lines.append(f"  Challengers: {', '.join(challs) if challs else '-'}")
-        ranked = sorted(list(scoreboard.values()), key=lambda x: float(x.get('score') or 0.0), reverse=True)[:5]
-        for row in ranked:
-            s7 = row.get('stats_7d') or {}
-            s30 = row.get('stats_30d') or {}
-            lines.append(
-                f"  - {row.get('family_id')} {row.get('family_name')} | score={float(row.get('score') or 0.0):.1f} | {row.get('status')} | fit={'Y' if row.get('regime_fit') else 'N'} | 7d {int(s7.get('wins') or 0)}/{int(s7.get('completed') or 0)} WR={float(s7.get('win_rate') or 0.0)*100.0:.1f}% | 30d {int(s30.get('wins') or 0)}/{int(s30.get('completed') or 0)} WR={float(s30.get('win_rate') or 0.0)*100.0:.1f}%"
-            )
-    return "\n".join(lines)
-
-
-async def family_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = _adaptive_family_status_text(' '.join(context.args or []).strip())
-    await send_long_message(update, txt, parse_mode=None)
-
-
-async def allocator_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await family_status_cmd(update, context)
-
-
-async def regime_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    arg = ' '.join(context.args or []).strip().upper()
-    sessions = [arg] if arg in {'ASIA', 'LON', 'NY'} else ['ASIA', 'LON', 'NY']
-    lines = ["🌦 Regime Status", HDR]
-    for sess in sessions:
-        reg = _adaptive_classify_session_regime(None, sess, force=False)
-        lines.append(
-            f"• {sess}: bucket={str(reg.get('bucket') or 'unknown')} | bias={str(reg.get('bias') or 'NEUTRAL')} | persistence={str(reg.get('persistence') or 'n/a')} | vol={str(reg.get('volatility_state') or 'n/a')} | breadth_up={float(reg.get('breadth_up') or 0.0):.2f} | breadth_down={float(reg.get('breadth_down') or 0.0):.2f}"
-        )
-    await send_long_message(update, "\n".join(lines), parse_mode=None)
-
-
-async def allocator_run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_user(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    best_fut = await to_thread_heavy(fetch_futures_tickers)
-    lines = ["✅ Adaptive family allocator refreshed", HDR]
-    for sess in ['ASIA', 'LON', 'NY']:
-        sel = await to_thread_heavy(_adaptive_family_select_for_session, sess, best_fut, True)
-        champs = ', '.join((sel.get('selection') or {}).get('champions', []) or []) or '-'
-        challs = ', '.join((sel.get('selection') or {}).get('challengers', []) or []) or '-'
-        reg = sel.get('regime') or {}
-        lines.append(f"• {sess}: {str(reg.get('bucket') or 'unknown')} | champions={champs} | challengers={challs}")
-    await send_long_message(update, "\n".join(lines), parse_mode=None)
-
-
-async def adaptive_family_daily_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        best_fut = await to_thread_heavy(fetch_futures_tickers)
-        for sess in ['ASIA', 'LON', 'NY']:
-            await to_thread_heavy(_adaptive_family_select_for_session, sess, best_fut, True)
-    except Exception:
-        return
-
-
-async def adaptive_family_regime_refresh_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        best_fut = await to_thread_heavy(fetch_futures_tickers)
-        for sess in ['ASIA', 'LON', 'NY']:
-            await to_thread_heavy(_adaptive_classify_session_regime, best_fut, sess, True)
-    except Exception:
-        return
-
-
-try:
-    _adaptive_family_framework_bootstrap()
-except Exception:
-    pass
 
 
 # =========================================================
@@ -6499,6 +5476,27 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
                 ),
             )
 
+        try:
+            if cols:
+                extra_updates = []
+                extra_params = []
+                if 'family_id' in cols:
+                    extra_updates.append('family_id=?')
+                    extra_params.append(str(getattr(s, 'family_id', '') or ''))
+                if 'regime_primary' in cols:
+                    extra_updates.append('regime_primary=?')
+                    extra_params.append(str(getattr(s, 'regime_primary', '') or ''))
+                if 'allocator_plan_id' in cols:
+                    extra_updates.append('allocator_plan_id=?')
+                    extra_params.append(str(getattr(s, 'allocator_plan_id', '') or ''))
+                if 'param_set_id' in cols:
+                    extra_updates.append('param_set_id=?')
+                    extra_params.append(str(getattr(s, 'param_set_id', '') or ''))
+                if extra_updates:
+                    extra_params.append(str(trade_id))
+                    c.execute(f"UPDATE autotrade_trades SET {', '.join(extra_updates)} WHERE trade_id=?", tuple(extra_params))
+        except Exception:
+            pass
         conn.commit()
 
     try:
@@ -7595,10 +6593,672 @@ class Setup:
     is_trailing_alt_target_b: bool
     created_ts: float
 
+    # Research / allocator metadata (safe defaults for backward compatibility)
+    family_id: str = ""
+    family_name: str = ""
+    family_version: str = "2026-04-01"
+    regime_id: str = ""
+    regime_primary: str = ""
+    regime_secondary: str = ""
+    regime_confidence: float = 0.0
+    param_set_id: str = ""
+    allocator_plan_id: str = ""
+    family_score: float = 0.0
+    exec_score: float = 0.0
+    validation_state: str = "approved"
+    challenger_flag: bool = False
+    session: str = ""
+
 # =========================================================
 # SIMPLE TTL CACHE (in-memory)
 # =========================================================
 _CACHE: Dict[str, Tuple[float, Any]] = {}
+
+
+
+RESEARCH_FAMILY_VERSION = "2026-04-01"
+
+@dataclass
+class RegimeState:
+    snapshot_id: str
+    ts: float
+    trading_day: str
+    session: str
+    refresh_window: str
+    primary: str
+    secondary: str
+    confidence: float
+    features: dict
+
+
+@dataclass
+class FamilyActivationPlan:
+    plan_id: str
+    trading_day: str
+    created_ts: float
+    refresh_window: str
+    session: str
+    regime_cell: str
+    champion_family_id: str
+    challenger_family_id: str
+    active_families: list[str]
+    blocked_families: list[str]
+    rationale: dict
+    state: str = "active"
+
+
+@dataclass
+class FamilySpec:
+    family_id: str
+    family_name: str
+    status: str
+    eligible_sessions: tuple[str, ...]
+    eligible_regimes: tuple[str, ...]
+    thesis: str = ""
+    family_version: str = RESEARCH_FAMILY_VERSION
+
+
+def _research_family_registry_defaults() -> list[dict]:
+    return [
+        {
+            "family_id": "F1_PULLBACK_CONT",
+            "family_name": "Pullback Continuation",
+            "status": "active",
+            "eligible_sessions_json": json.dumps(["ASIA", "LON", "NY"]),
+            "eligible_regimes_json": json.dumps(["TREND_UP", "TREND_DOWN", "EXPANSION"]),
+            "thesis": "Trend continuation after controlled pullback into adaptive EMA support/resistance.",
+        },
+        {
+            "family_id": "F2_MOMENTUM_IGNITION",
+            "family_name": "Momentum Ignition",
+            "status": "active",
+            "eligible_sessions_json": json.dumps(["LON", "NY"]),
+            "eligible_regimes_json": json.dumps(["EXPANSION", "TREND_UP", "TREND_DOWN"]),
+            "thesis": "Fresh intraday expansion after compression or ignition velocity.",
+        },
+        {
+            "family_id": "F3_IMPULSE_BASE_CONT",
+            "family_name": "Impulse Base Continuation",
+            "status": "active",
+            "eligible_sessions_json": json.dumps(["LON", "NY"]),
+            "eligible_regimes_json": json.dumps(["EXPANSION", "TREND_UP", "TREND_DOWN", "SQUEEZE"]),
+            "thesis": "Impulse → base → continuation break structure.",
+        },
+        {
+            "family_id": "F4_SWEEP_RECLAIM",
+            "family_name": "Sweep Reclaim Reversal",
+            "status": "experimental",
+            "eligible_sessions_json": json.dumps(["ASIA", "LON", "NY"]),
+            "eligible_regimes_json": json.dumps(["BALANCE", "EXHAUSTION"]),
+            "thesis": "Liquidity sweep and reclaim reversal at range edges.",
+        },
+        {
+            "family_id": "F5_ORB_RETEST",
+            "family_name": "Opening Range Breakout Retest",
+            "status": "experimental",
+            "eligible_sessions_json": json.dumps(["LON", "NY"]),
+            "eligible_regimes_json": json.dumps(["SQUEEZE", "EXPANSION"]),
+            "thesis": "Opening-range break then retest continuation.",
+        },
+        {
+            "family_id": "F6_VWAP_RECLAIM",
+            "family_name": "VWAP Reclaim",
+            "status": "experimental",
+            "eligible_sessions_json": json.dumps(["LON", "NY"]),
+            "eligible_regimes_json": json.dumps(["TREND_UP", "TREND_DOWN", "BALANCE"]),
+            "thesis": "VWAP reclaim or rejection aligned with intraday directional bias.",
+        },
+        {
+            "family_id": "F7_EXHAUSTION_FAILURE",
+            "family_name": "Exhaustion Failure Reversal",
+            "status": "experimental",
+            "eligible_sessions_json": json.dumps(["NY", "LON"]),
+            "eligible_regimes_json": json.dumps(["EXHAUSTION", "UNSTABLE_HIGH_VOL"]),
+            "thesis": "Parabolic exhaustion followed by failed continuation and reversal.",
+        },
+    ]
+
+
+def _family_id_from_engine(engine: str, setup: Any | None = None) -> str:
+    eng = str(engine or '').upper().strip()
+    if eng == 'A':
+        return 'F1_PULLBACK_CONT'
+    if eng == 'B':
+        return 'F2_MOMENTUM_IGNITION'
+    if eng == 'C':
+        return 'F3_IMPULSE_BASE_CONT'
+    try:
+        rid = str(getattr(setup, 'family_id', '') or '').strip()
+        if rid:
+            return rid
+    except Exception:
+        pass
+    return 'F0_UNKNOWN'
+
+
+def _family_name_from_id(family_id: str) -> str:
+    fam = str(family_id or '').strip().upper()
+    mapping = {
+        'F1_PULLBACK_CONT': 'Pullback Continuation',
+        'F2_MOMENTUM_IGNITION': 'Momentum Ignition',
+        'F3_IMPULSE_BASE_CONT': 'Impulse Base Continuation',
+        'F4_SWEEP_RECLAIM': 'Sweep Reclaim Reversal',
+        'F5_ORB_RETEST': 'Opening Range Breakout Retest',
+        'F6_VWAP_RECLAIM': 'VWAP Reclaim',
+        'F7_EXHAUSTION_FAILURE': 'Exhaustion Failure Reversal',
+    }
+    return mapping.get(fam, fam or 'Unknown Family')
+
+
+def _research_trading_day_label(ts: float | None = None) -> str:
+    try:
+        dt = datetime.fromtimestamp(float(ts or time.time()), tz=timezone.utc)
+        return dt.strftime('%Y-%m-%d')
+    except Exception:
+        return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+
+def _research_plan_lookup_key(ts: float | None = None) -> str:
+    return _research_trading_day_label(ts)
+
+
+def _research_infer_regime_from_setup(s: Any, session_name: str = '') -> tuple[str, str, float]:
+    try:
+        raw = str(getattr(s, 'regime', '') or '').upper().strip()
+        side = str(getattr(s, 'side', '') or '').upper().strip()
+        engine = str(getattr(s, 'engine', '') or '').upper().strip()
+        ch1 = abs(float(getattr(s, 'ch1', 0.0) or 0.0))
+        ch15 = abs(float(getattr(s, 'ch15', 0.0) or 0.0))
+        ch4 = abs(float(getattr(s, 'ch4', 0.0) or 0.0))
+        atr_pct = float(getattr(s, 'atr_pct', 0.0) or 0.0)
+        pb = float(getattr(s, 'pullback_ema_dist_pct', 0.0) or 0.0)
+        if 'TREND' in raw:
+            return ('TREND_UP' if side == 'BUY' else 'TREND_DOWN', raw, 0.78)
+        if 'RANG' in raw or 'BAL' in raw:
+            return ('BALANCE', raw or 'BALANCE', 0.70)
+        if 'UNST' in raw or 'VOL' in raw:
+            return ('UNSTABLE_HIGH_VOL', raw, 0.72)
+        if engine == 'B' or (ch1 >= 1.1 and ch15 >= 0.35):
+            return ('EXPANSION', 'TREND_UP' if side == 'BUY' else 'TREND_DOWN', 0.76)
+        if engine == 'C':
+            return ('EXPANSION' if ch1 >= 0.45 else 'SQUEEZE', 'TREND_UP' if side == 'BUY' else 'TREND_DOWN', 0.74)
+        if atr_pct >= 6.0 or pb >= 1.15:
+            return ('EXHAUSTION', 'UNSTABLE_HIGH_VOL', 0.66)
+        if ch4 <= 0.30 and ch15 <= 0.10:
+            return ('BALANCE', 'SQUEEZE', 0.64)
+        return ('TREND_UP' if side == 'BUY' else 'TREND_DOWN', 'TREND', 0.68)
+    except Exception:
+        return ('BALANCE', 'UNKNOWN', 0.50)
+
+
+def _research_exec_score(s: Any) -> float:
+    try:
+        entry = float(getattr(s, 'entry', 0.0) or 0.0)
+        sl = float(getattr(s, 'sl', 0.0) or 0.0)
+        tp = float(_setup_target_tp(s, 0.0) or 0.0)
+        rr = float(rr_to_tp(entry, sl, tp)) if entry > 0 and sl > 0 and tp > 0 else 0.0
+        score = 0.55 * float(getattr(s, 'quality_score', 0.0) or 0.0) + 0.25 * float(getattr(s, 'conf', 0) or 0.0) + 10.0 * min(3.0, rr)
+        return float(score)
+    except Exception:
+        return float(getattr(s, 'quality_score', 0.0) or 0.0)
+
+
+def _research_latest_allocator_plan(session_name: str, regime_primary: str = '') -> dict:
+    try:
+        sess = str(session_name or '').upper().strip()
+        regime = str(regime_primary or '').upper().strip()
+        plan_day = _research_plan_lookup_key()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            sql = "SELECT * FROM allocator_plans WHERE trading_day=? AND state='active' AND UPPER(COALESCE(session,''))=? "
+            params = [plan_day, sess]
+            if regime:
+                sql += " AND UPPER(COALESCE(regime_cell,''))=? "
+                params.append(regime)
+            sql += " ORDER BY created_ts DESC LIMIT 1 "
+            row = cur.execute(sql, tuple(params)).fetchone()
+            return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+def _research_plan_allows_setup(s: Any, session_name: str = '') -> tuple[bool, str]:
+    try:
+        cfg = load_strategy_config(force=False)
+        if not _cfg_bool((cfg or {}).get('family_allocator_enabled', True), True):
+            return (True, 'allocator_disabled')
+        if _cfg_bool((cfg or {}).get('family_allocator_shadow_mode', True), True) and not _cfg_bool((cfg or {}).get('family_allocator_enforce_live', False), False):
+            return (True, 'shadow_mode')
+        sess = str(session_name or getattr(s, 'session', '') or '').upper().strip() or 'NY'
+        fam = str(getattr(s, 'family_id', '') or _family_id_from_engine(getattr(s, 'engine', ''), s)).upper().strip()
+        regime_primary = str(getattr(s, 'regime_primary', '') or '').upper().strip()
+        plan = _research_latest_allocator_plan(sess, regime_primary=regime_primary)
+        if not plan:
+            return (True, 'no_plan')
+        try:
+            active = json.loads(str(plan.get('active_families_json') or '[]'))
+            active = [str(x).upper().strip() for x in (active or []) if str(x).strip()]
+        except Exception:
+            active = []
+        if not active:
+            return (True, 'empty_plan')
+        if fam in active:
+            try:
+                setattr(s, 'allocator_plan_id', str(plan.get('plan_id') or ''))
+            except Exception:
+                pass
+            return (True, 'family_active')
+        return (False, 'allocator_family_not_active')
+    except Exception:
+        return (True, 'allocator_guard_error')
+
+
+def _research_finalize_setup(s: Any, session_name: str = '') -> Any:
+    try:
+        if s is None:
+            return s
+        sess = str(session_name or getattr(s, 'session', '') or '').upper().strip()
+        if not sess:
+            try:
+                sess = _session_label_from_ts(float(getattr(s, 'created_ts', 0.0) or time.time()))
+            except Exception:
+                sess = 'NY'
+        fam = str(getattr(s, 'family_id', '') or '').strip() or _family_id_from_engine(getattr(s, 'engine', ''), s)
+        setattr(s, 'family_id', fam)
+        setattr(s, 'family_name', str(getattr(s, 'family_name', '') or _family_name_from_id(fam)))
+        setattr(s, 'family_version', str(getattr(s, 'family_version', '') or RESEARCH_FAMILY_VERSION))
+        primary, secondary, conf = _research_infer_regime_from_setup(s, session_name=sess)
+        setattr(s, 'regime_primary', str(getattr(s, 'regime_primary', '') or primary))
+        setattr(s, 'regime_secondary', str(getattr(s, 'regime_secondary', '') or secondary))
+        setattr(s, 'regime_confidence', float(getattr(s, 'regime_confidence', 0.0) or conf))
+        if not str(getattr(s, 'regime_id', '') or '').strip():
+            setattr(s, 'regime_id', f"RG-{_research_trading_day_label(getattr(s, 'created_ts', 0.0))}-{sess}-{getattr(s, 'regime_primary', primary)}")
+        if not str(getattr(s, 'param_set_id', '') or '').strip():
+            setattr(s, 'param_set_id', f"PS-{fam}-LIVE")
+        setattr(s, 'family_score', float(getattr(s, 'family_score', 0.0) or getattr(s, 'quality_score', 0.0) or 0.0))
+        setattr(s, 'exec_score', float(getattr(s, 'exec_score', 0.0) or _research_exec_score(s)))
+        setattr(s, 'validation_state', str(getattr(s, 'validation_state', '') or 'approved'))
+        setattr(s, 'challenger_flag', bool(getattr(s, 'challenger_flag', False)))
+        setattr(s, 'session', sess)
+        try:
+            plan = _research_latest_allocator_plan(sess, regime_primary=str(getattr(s, 'regime_primary', '') or primary))
+            if plan and not str(getattr(s, 'allocator_plan_id', '') or '').strip():
+                setattr(s, 'allocator_plan_id', str(plan.get('plan_id') or ''))
+        except Exception:
+            pass
+        return s
+    except Exception:
+        return s
+
+
+def _research_finalize_setups(items: list[Any], session_name: str = '') -> list[Any]:
+    out = []
+    for item in (items or []):
+        try:
+            out.append(_research_finalize_setup(item, session_name=session_name))
+        except Exception:
+            out.append(item)
+    return out
+
+
+def _research_market_regime_from_best_fut(best_fut: dict, session_name: str, refresh_window: str = 'daily') -> RegimeState:
+    sess = str(session_name or '').upper().strip() or 'NY'
+    trading_day = _research_trading_day_label()
+    ts_now = float(time.time())
+    vals = list((best_fut or {}).values())
+    vols = []
+    adv = dec = 0
+    for mv in vals[:40]:
+        try:
+            pct = float(getattr(mv, 'percentage', 0.0) or 0.0)
+            vols.append(abs(pct))
+            if pct > 0:
+                adv += 1
+            elif pct < 0:
+                dec += 1
+        except Exception:
+            pass
+    try:
+        btc = float(getattr((best_fut or {}).get('BTC') or MarketVol('BTC','BTC','USDT',0,0,0,0,0,0), 'percentage', 0.0) or 0.0)
+        eth = float(getattr((best_fut or {}).get('ETH') or MarketVol('ETH','ETH','USDT',0,0,0,0,0,0), 'percentage', 0.0) or 0.0)
+    except Exception:
+        btc = eth = 0.0
+    median_abs = sorted(vols)[len(vols)//2] if vols else 0.0
+    bias = _email_market_regime(best_fut)
+    if median_abs <= 0.8:
+        primary = 'SQUEEZE'
+        secondary = 'BALANCE'
+        conf = 0.62
+    elif bias == 'risk_on' and median_abs >= 3.5:
+        primary = 'EXPANSION'
+        secondary = 'TREND_UP'
+        conf = 0.82
+    elif bias == 'risk_off' and median_abs >= 3.5:
+        primary = 'EXPANSION'
+        secondary = 'TREND_DOWN'
+        conf = 0.82
+    elif bias == 'risk_on':
+        primary = 'TREND_UP'
+        secondary = 'BALANCE'
+        conf = 0.74
+    elif bias == 'risk_off':
+        primary = 'TREND_DOWN'
+        secondary = 'BALANCE'
+        conf = 0.74
+    elif median_abs >= 5.5:
+        primary = 'UNSTABLE_HIGH_VOL'
+        secondary = 'EXHAUSTION' if abs(btc) >= 6.0 or abs(eth) >= 6.0 else 'BALANCE'
+        conf = 0.71
+    else:
+        primary = 'BALANCE'
+        secondary = 'MIXED'
+        conf = 0.58
+    snap_id = f"RGS-{int(ts_now)}-{sess}-{refresh_window}"
+    return RegimeState(
+        snapshot_id=snap_id,
+        ts=ts_now,
+        trading_day=trading_day,
+        session=sess,
+        refresh_window=str(refresh_window or 'daily'),
+        primary=primary,
+        secondary=secondary,
+        confidence=float(conf),
+        features={
+            'median_abs_pct': float(median_abs),
+            'adv': int(adv),
+            'dec': int(dec),
+            'btc_pct': float(btc),
+            'eth_pct': float(eth),
+            'bias': str(bias),
+        },
+    )
+
+
+def _research_store_regime_snapshot(snap: RegimeState) -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT OR REPLACE INTO regime_snapshots
+                       (snapshot_id, ts, trading_day, refresh_window, session, primary_regime, secondary_regime, confidence, features_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(snap.snapshot_id), float(snap.ts), str(snap.trading_day), str(snap.refresh_window),
+                    str(snap.session), str(snap.primary), str(snap.secondary), float(snap.confidence),
+                    json.dumps(dict(snap.features or {}), separators=(",", ":"), ensure_ascii=False),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _research_latest_regime_snapshot(session_name: str, refresh_window: str | None = None) -> dict:
+    try:
+        sess = str(session_name or '').upper().strip()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            sql = "SELECT * FROM regime_snapshots WHERE UPPER(COALESCE(session,''))=? "
+            params = [sess]
+            if refresh_window:
+                sql += " AND LOWER(COALESCE(refresh_window,''))=? "
+                params.append(str(refresh_window).lower())
+            sql += " ORDER BY ts DESC LIMIT 1 "
+            row = cur.execute(sql, tuple(params)).fetchone()
+            return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+def _research_seed_family_registry() -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            for item in _research_family_registry_defaults():
+                cur.execute(
+                    """INSERT OR IGNORE INTO family_registry
+                           (family_id, family_name, family_version, status, thesis, eligible_sessions_json, eligible_regimes_json, param_schema_json, created_ts, updated_ts)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(item.get('family_id') or ''),
+                        str(item.get('family_name') or ''),
+                        RESEARCH_FAMILY_VERSION,
+                        str(item.get('status') or 'active'),
+                        str(item.get('thesis') or ''),
+                        str(item.get('eligible_sessions_json') or '[]'),
+                        str(item.get('eligible_regimes_json') or '[]'),
+                        '{}', float(time.time()), float(time.time()),
+                    ),
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _research_family_eligible_for_cell(family_id: str, session_name: str, regime_primary: str) -> bool:
+    fam = str(family_id or '').upper().strip()
+    sess = str(session_name or '').upper().strip()
+    regime = str(regime_primary or '').upper().strip()
+    for item in _research_family_registry_defaults():
+        if str(item.get('family_id') or '').upper().strip() != fam:
+            continue
+        try:
+            sessions = [str(x).upper().strip() for x in json.loads(str(item.get('eligible_sessions_json') or '[]'))]
+            regimes = [str(x).upper().strip() for x in json.loads(str(item.get('eligible_regimes_json') or '[]'))]
+        except Exception:
+            sessions, regimes = [], []
+        return ((not sessions or sess in sessions) and (not regimes or regime in regimes))
+    return True
+
+
+def _research_default_family_for_cell(session_name: str, regime_primary: str) -> list[str]:
+    sess = str(session_name or '').upper().strip()
+    regime = str(regime_primary or '').upper().strip()
+    if regime in {'TREND_UP', 'TREND_DOWN'}:
+        return ['F1_PULLBACK_CONT', 'F6_VWAP_RECLAIM'] if sess == 'NY' else ['F1_PULLBACK_CONT', 'F3_IMPULSE_BASE_CONT']
+    if regime == 'EXPANSION':
+        return ['F2_MOMENTUM_IGNITION', 'F3_IMPULSE_BASE_CONT']
+    if regime in {'BALANCE', 'SQUEEZE'}:
+        return ['F4_SWEEP_RECLAIM', 'F5_ORB_RETEST']
+    if regime in {'EXHAUSTION', 'UNSTABLE_HIGH_VOL'}:
+        return ['F7_EXHAUSTION_FAILURE', 'F4_SWEEP_RECLAIM']
+    return ['F1_PULLBACK_CONT', 'F3_IMPULSE_BASE_CONT']
+
+
+def _research_compute_family_eval_snapshot(trading_day: str | None = None) -> list[dict]:
+    trading_day = str(trading_day or _research_trading_day_label())
+    cutoff_30d = float(time.time()) - 86400.0 * 30.0
+    cutoff_7d = float(time.time()) - 86400.0 * 7.0
+    rows_out = []
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(NULLIF(t.family_id,''), CASE UPPER(COALESCE(t.engine,'')) WHEN 'A' THEN 'F1_PULLBACK_CONT' WHEN 'B' THEN 'F2_MOMENTUM_IGNITION' WHEN 'C' THEN 'F3_IMPULSE_BASE_CONT' ELSE 'F0_UNKNOWN' END) AS family_id,
+                    UPPER(COALESCE(NULLIF(t.session,''),'NY')) AS session,
+                    UPPER(COALESCE(NULLIF(t.regime_primary,''), CASE UPPER(COALESCE(t.side,'')) WHEN 'BUY' THEN 'TREND_UP' WHEN 'SELL' THEN 'TREND_DOWN' ELSE 'BALANCE' END)) AS regime_cell,
+                    t.opened_ts, t.closed_ts,
+                    COALESCE(t.pnl_usdt, t.pnl, 0) AS pnl,
+                    ABS(COALESCE(t.entry,0) - COALESCE(t.sl,0)) AS risk_abs
+                FROM autotrade_trades t
+                WHERE COALESCE(t.closed_ts,0) >= ? AND UPPER(COALESCE(t.status,''))='CLOSED'
+                """,
+                (float(cutoff_30d),),
+            )
+            rows = [dict(r) for r in (cur.fetchall() or [])]
+        buckets = {}
+        for r in rows:
+            fam = str(r.get('family_id') or 'F0_UNKNOWN').upper()
+            sess = str(r.get('session') or 'NY').upper()
+            regime = str(r.get('regime_cell') or 'BALANCE').upper()
+            k = (fam, sess, regime)
+            b = buckets.setdefault(k, {'family_id': fam, 'session': sess, 'regime_cell': regime, 'r_7d': [], 'r_30d': [], 'wins_7d': 0, 'losses_7d': 0, 'wins_30d': 0, 'losses_30d': 0})
+            pnl = float(r.get('pnl') or 0.0)
+            risk_abs = float(r.get('risk_abs') or 0.0)
+            r_mult = (pnl / risk_abs) if risk_abs > 0 else (1.0 if pnl > 0 else -1.0 if pnl < 0 else 0.0)
+            close_ts = float(r.get('closed_ts') or 0.0)
+            b['r_30d'].append(float(r_mult))
+            if r_mult > 0:
+                b['wins_30d'] += 1
+            elif r_mult < 0:
+                b['losses_30d'] += 1
+            if close_ts >= cutoff_7d:
+                b['r_7d'].append(float(r_mult))
+                if r_mult > 0:
+                    b['wins_7d'] += 1
+                elif r_mult < 0:
+                    b['losses_7d'] += 1
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM family_eval_daily WHERE trading_day=?", (trading_day,))
+            for (fam, sess, regime), b in buckets.items():
+                r7 = list(b.get('r_7d') or [])
+                r30 = list(b.get('r_30d') or [])
+                wr7 = (100.0 * b['wins_7d'] / max(1, b['wins_7d'] + b['losses_7d'])) if (b['wins_7d'] + b['losses_7d']) else 0.0
+                wr30 = (100.0 * b['wins_30d'] / max(1, b['wins_30d'] + b['losses_30d'])) if (b['wins_30d'] + b['losses_30d']) else 0.0
+                exp7 = (sum(r7) / len(r7)) if r7 else 0.0
+                exp30 = (sum(r30) / len(r30)) if r30 else 0.0
+                med30 = sorted(r30)[len(r30)//2] if r30 else 0.0
+                score7 = 0.65 * exp7 + 0.35 * (wr7 / 100.0)
+                score30 = 0.65 * exp30 + 0.35 * (wr30 / 100.0)
+                shrunk = 0.70 * score7 + 0.30 * score30
+                row = {
+                    'eval_id': f"FE-{trading_day}-{fam}-{sess}-{regime}",
+                    'trading_day': trading_day,
+                    'family_id': fam,
+                    'session': sess,
+                    'regime_cell': regime,
+                    'sample_n': int(len(r30)),
+                    'wins': int(b['wins_30d']),
+                    'losses': int(b['losses_30d']),
+                    'expectancy_r': float(exp30),
+                    'median_r': float(med30),
+                    'wr': float(wr30),
+                    'pf': float((sum(x for x in r30 if x > 0) / max(0.0001, abs(sum(x for x in r30 if x < 0)))) if r30 else 0.0),
+                    'max_dd_r': float(min(0.0, min(r30) if r30 else 0.0)),
+                    'concentration_symbol': 0.0,
+                    'concentration_day': 0.0,
+                    'score_7d': float(score7),
+                    'score_30d': float(score30),
+                    'shrunk_score': float(shrunk),
+                    'created_ts': float(time.time()),
+                }
+                rows_out.append(row)
+                cur.execute(
+                    """INSERT OR REPLACE INTO family_eval_daily
+                           (eval_id, trading_day, family_id, session, regime_cell, sample_n, wins, losses, expectancy_r, median_r, wr, pf, max_dd_r, concentration_symbol, concentration_day, score_7d, score_30d, shrunk_score, created_ts)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (row['eval_id'], row['trading_day'], row['family_id'], row['session'], row['regime_cell'], row['sample_n'], row['wins'], row['losses'], row['expectancy_r'], row['median_r'], row['wr'], row['pf'], row['max_dd_r'], row['concentration_symbol'], row['concentration_day'], row['score_7d'], row['score_30d'], row['shrunk_score'], row['created_ts'])
+                )
+            conn.commit()
+    except Exception:
+        pass
+    return rows_out
+
+
+def _research_build_allocator_plans(best_fut: dict | None = None, trading_day: str | None = None) -> list[dict]:
+    trading_day = str(trading_day or _research_trading_day_label())
+    best_fut = dict(best_fut or {})
+    _research_compute_family_eval_snapshot(trading_day=trading_day)
+    plans = []
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            eval_rows = [dict(r) for r in cur.execute('SELECT * FROM family_eval_daily WHERE trading_day=?', (trading_day,)).fetchall() or []]
+            eval_map = {}
+            for r in eval_rows:
+                key = (str(r.get('session') or '').upper(), str(r.get('regime_cell') or '').upper())
+                eval_map.setdefault(key, []).append(r)
+
+            cfg = load_strategy_config(force=False)
+            shadow = _cfg_bool((cfg or {}).get('family_allocator_shadow_mode', True), True)
+            max_active = max(1, int((cfg or {}).get('family_allocator_max_active_per_cell', 2) or 2))
+            min_score = float((cfg or {}).get('family_allocator_min_score', -999.0) or -999.0)
+            min_sample = int((cfg or {}).get('family_allocator_min_sample', 0) or 0)
+            cur.execute("UPDATE allocator_plans SET state='superseded' WHERE trading_day=? AND state='active'", (trading_day,))
+
+            for sess in ('ASIA', 'LON', 'NY'):
+                snap = _research_market_regime_from_best_fut(best_fut, sess, refresh_window='daily')
+                _research_store_regime_snapshot(snap)
+                regime = str(snap.primary or 'BALANCE').upper()
+                candidates = [r for r in (eval_map.get((sess, regime), []) or []) if float(r.get('shrunk_score') or 0.0) >= min_score and int(r.get('sample_n') or 0) >= min_sample and _research_family_eligible_for_cell(str(r.get('family_id') or ''), sess, regime)]
+                candidates = sorted(candidates, key=lambda x: (float(x.get('shrunk_score') or 0.0), float(x.get('expectancy_r') or 0.0), float(x.get('wr') or 0.0)), reverse=True)
+                if not candidates:
+                    defaults = [f for f in _research_default_family_for_cell(sess, regime) if _research_family_eligible_for_cell(f, sess, regime)]
+                    champion = defaults[0] if defaults else ''
+                    challenger = defaults[1] if len(defaults) > 1 else ''
+                    active = [x for x in defaults[:max_active] if x]
+                    rationale = {'source': 'heuristic_default', 'shadow_mode': bool(shadow), 'regime': regime, 'regime_confidence': float(snap.confidence)}
+                else:
+                    champion = str(candidates[0].get('family_id') or '')
+                    challenger = str(candidates[1].get('family_id') or '') if len(candidates) > 1 else ''
+                    active = [str(r.get('family_id') or '') for r in candidates[:max_active] if str(r.get('family_id') or '')]
+                    rationale = {'source': 'family_eval_daily', 'shadow_mode': bool(shadow), 'regime': regime, 'regime_confidence': float(snap.confidence), 'scores': {str(r.get('family_id') or ''): float(r.get('shrunk_score') or 0.0) for r in candidates[:4]}}
+                plan_id = f"AP-{trading_day}-{sess}-{int(time.time())}"
+                plan = {
+                    'plan_id': plan_id,
+                    'trading_day': trading_day,
+                    'created_ts': float(time.time()),
+                    'refresh_window': 'daily',
+                    'session': sess,
+                    'regime_cell': regime,
+                    'champion_family_id': champion,
+                    'challenger_family_id': challenger,
+                    'active_families_json': json.dumps(active, separators=(",", ":"), ensure_ascii=False),
+                    'blocked_families_json': json.dumps([], separators=(",", ":"), ensure_ascii=False),
+                    'rationale_json': json.dumps(rationale, separators=(",", ":"), ensure_ascii=False),
+                    'state': 'active',
+                }
+                cur.execute(
+                    """INSERT OR REPLACE INTO allocator_plans
+                           (plan_id, trading_day, created_ts, refresh_window, session, regime_cell, champion_family_id, challenger_family_id, active_families_json, blocked_families_json, rationale_json, state)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (plan['plan_id'], plan['trading_day'], plan['created_ts'], plan['refresh_window'], plan['session'], plan['regime_cell'], plan['champion_family_id'], plan['challenger_family_id'], plan['active_families_json'], plan['blocked_families_json'], plan['rationale_json'], plan['state'])
+                )
+                plans.append(plan)
+            conn.commit()
+    except Exception:
+        pass
+    return plans
+
+
+def _research_run_allocator_cycle(force: bool = False) -> dict:
+    try:
+        best_fut = fetch_futures_tickers() or {}
+    except Exception:
+        best_fut = {}
+    _research_seed_family_registry()
+    trading_day = _research_trading_day_label()
+    plans = _research_build_allocator_plans(best_fut, trading_day=trading_day)
+    return {'status': 'ok', 'trading_day': trading_day, 'plans': plans, 'count': len(plans or [])}
+
+
+async def research_regime_refresh_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        best_fut = await to_thread_heavy(fetch_futures_tickers)
+        for sess in ('ASIA', 'LON', 'NY'):
+            snap = await to_thread_heavy(_research_market_regime_from_best_fut, best_fut or {}, sess, '4h')
+            await to_thread_fast(_research_store_regime_snapshot, snap)
+    except Exception:
+        return
+
+
+async def research_allocator_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await to_thread_heavy(_research_run_allocator_cycle)
+    except Exception:
+        return
+
 
 def cache_get(key: str) -> Optional[Any]:
     v = _CACHE.get(key)
@@ -8892,6 +8552,159 @@ async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"✅ Database RESTORED.\n{msg}")
 
+def _research_db_migrate(cur) -> None:
+    try:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS family_registry (
+            family_id TEXT PRIMARY KEY,
+            family_name TEXT NOT NULL,
+            family_version TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            thesis TEXT NOT NULL DEFAULT '',
+            eligible_sessions_json TEXT NOT NULL DEFAULT '[]',
+            eligible_regimes_json TEXT NOT NULL DEFAULT '[]',
+            param_schema_json TEXT NOT NULL DEFAULT '{}',
+            created_ts REAL NOT NULL DEFAULT 0,
+            updated_ts REAL NOT NULL DEFAULT 0
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS family_param_sets (
+            param_set_id TEXT PRIMARY KEY,
+            family_id TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT 'global',
+            scope_key TEXT NOT NULL DEFAULT '',
+            params_json TEXT NOT NULL DEFAULT '{}',
+            source TEXT NOT NULL DEFAULT 'manual',
+            parent_param_set_id TEXT NOT NULL DEFAULT '',
+            created_ts REAL NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 0
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS regime_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            ts REAL NOT NULL,
+            trading_day TEXT NOT NULL,
+            refresh_window TEXT NOT NULL,
+            session TEXT NOT NULL,
+            primary_regime TEXT NOT NULL,
+            secondary_regime TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 0,
+            features_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS family_eval_daily (
+            eval_id TEXT PRIMARY KEY,
+            trading_day TEXT NOT NULL,
+            family_id TEXT NOT NULL,
+            session TEXT NOT NULL,
+            regime_cell TEXT NOT NULL,
+            sample_n INTEGER NOT NULL DEFAULT 0,
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+            expectancy_r REAL NOT NULL DEFAULT 0,
+            median_r REAL NOT NULL DEFAULT 0,
+            wr REAL NOT NULL DEFAULT 0,
+            pf REAL NOT NULL DEFAULT 0,
+            max_dd_r REAL NOT NULL DEFAULT 0,
+            concentration_symbol REAL NOT NULL DEFAULT 0,
+            concentration_day REAL NOT NULL DEFAULT 0,
+            score_7d REAL NOT NULL DEFAULT 0,
+            score_30d REAL NOT NULL DEFAULT 0,
+            shrunk_score REAL NOT NULL DEFAULT 0,
+            created_ts REAL NOT NULL DEFAULT 0
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS allocator_plans (
+            plan_id TEXT PRIMARY KEY,
+            trading_day TEXT NOT NULL,
+            created_ts REAL NOT NULL,
+            refresh_window TEXT NOT NULL DEFAULT 'daily',
+            session TEXT NOT NULL,
+            regime_cell TEXT NOT NULL,
+            champion_family_id TEXT NOT NULL DEFAULT '',
+            challenger_family_id TEXT NOT NULL DEFAULT '',
+            active_families_json TEXT NOT NULL DEFAULT '[]',
+            blocked_families_json TEXT NOT NULL DEFAULT '[]',
+            rationale_json TEXT NOT NULL DEFAULT '{}',
+            state TEXT NOT NULL DEFAULT 'active'
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS research_decision_audit (
+            audit_id TEXT PRIMARY KEY,
+            ts REAL NOT NULL,
+            family_id TEXT NOT NULL,
+            decision_type TEXT NOT NULL,
+            session TEXT NOT NULL DEFAULT '',
+            regime_cell TEXT NOT NULL DEFAULT '',
+            old_state_json TEXT NOT NULL DEFAULT '{}',
+            new_state_json TEXT NOT NULL DEFAULT '{}',
+            reason_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """)
+
+        for table_name, col_map in {
+            'signals': {
+                'family_id': "TEXT NOT NULL DEFAULT ''",
+                'family_version': "TEXT NOT NULL DEFAULT ''",
+                'regime_id': "TEXT NOT NULL DEFAULT ''",
+                'regime_primary': "TEXT NOT NULL DEFAULT ''",
+                'allocator_plan_id': "TEXT NOT NULL DEFAULT ''",
+                'param_set_id': "TEXT NOT NULL DEFAULT ''",
+            },
+            'generated_setups': {
+                'family_id': "TEXT NOT NULL DEFAULT ''",
+                'regime_primary': "TEXT NOT NULL DEFAULT ''",
+                'allocator_plan_id': "TEXT NOT NULL DEFAULT ''",
+                'param_set_id': "TEXT NOT NULL DEFAULT ''",
+            },
+            'executable_setups': {
+                'family_id': "TEXT NOT NULL DEFAULT ''",
+                'family_version': "TEXT NOT NULL DEFAULT ''",
+                'regime_id': "TEXT NOT NULL DEFAULT ''",
+                'regime_primary': "TEXT NOT NULL DEFAULT ''",
+                'allocator_plan_id': "TEXT NOT NULL DEFAULT ''",
+                'param_set_id': "TEXT NOT NULL DEFAULT ''",
+                'family_score': "REAL NOT NULL DEFAULT 0",
+                'exec_score': "REAL NOT NULL DEFAULT 0",
+                'validation_state': "TEXT NOT NULL DEFAULT 'approved'",
+                'challenger_flag': "INTEGER NOT NULL DEFAULT 0",
+            },
+        }.items():
+            try:
+                cols = {r[1] for r in cur.execute(f"PRAGMA table_info({table_name})").fetchall()}
+            except Exception:
+                cols = set()
+            for col, ddl in col_map.items():
+                if col not in cols:
+                    cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {col} {ddl}")
+                    cols.add(col)
+
+        try:
+            at_cols = {r[1] for r in cur.execute("PRAGMA table_info(autotrade_trades)").fetchall()}
+        except Exception:
+            at_cols = set()
+        if at_cols:
+            for col, ddl in {
+                'family_id': "TEXT NOT NULL DEFAULT ''",
+                'regime_primary': "TEXT NOT NULL DEFAULT ''",
+                'allocator_plan_id': "TEXT NOT NULL DEFAULT ''",
+                'param_set_id': "TEXT NOT NULL DEFAULT ''",
+            }.items():
+                if col not in at_cols:
+                    cur.execute(f"ALTER TABLE autotrade_trades ADD COLUMN {col} {ddl}")
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_regime_snapshots_day_session ON regime_snapshots(trading_day, refresh_window, session, ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_family_eval_daily_lookup ON family_eval_daily(trading_day, family_id, session, regime_cell)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_allocator_plans_day_session ON allocator_plans(trading_day, refresh_window, session, regime_cell, created_ts)")
+    except Exception:
+        pass
+
+
 def db_init():
     # ensures folder exists before creating DB file
     db_dir = os.path.dirname(DB_PATH)
@@ -9268,6 +9081,27 @@ def db_init():
         conf INTEGER DEFAULT 0
     )
     """)
+
+    try:
+        _research_db_migrate(cur)
+    except Exception:
+        pass
+
+    try:
+        for item in _research_family_registry_defaults():
+            cur.execute(
+                """INSERT OR IGNORE INTO family_registry
+                       (family_id, family_name, family_version, status, thesis, eligible_sessions_json, eligible_regimes_json, param_schema_json, created_ts, updated_ts)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(item.get('family_id') or ''), str(item.get('family_name') or ''), RESEARCH_FAMILY_VERSION,
+                    str(item.get('status') or 'active'), str(item.get('thesis') or ''),
+                    str(item.get('eligible_sessions_json') or '[]'), str(item.get('eligible_regimes_json') or '[]'), '{}', float(time.time()), float(time.time()),
+                ),
+            )
+    except Exception:
+        pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS signal_outcomes (
@@ -13091,6 +12925,10 @@ def db_insert_signal(s: Setup, user_id: int | None = None):
     Important: lifecycle updates must stay user-scoped. Do not default to the owner admin,
     otherwise signals generated for other users can contaminate admin lifecycle tracking.
     """
+    try:
+        s = _research_finalize_setup(s, session_name=str(getattr(s, 'session', '') or ''))
+    except Exception:
+        pass
     con = db_connect()
     cur = con.cursor()
     try:
@@ -13115,6 +12953,23 @@ def db_insert_signal(s: Setup, user_id: int | None = None):
             s.setup_id, s.created_ts, s.symbol, s.side, s.conf, s.entry, s.sl,
             float(_setup_target_tp(s, 0.0) or 0.0), 0.0, 0.0, s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
         ))
+    try:
+        cur.execute(
+            """UPDATE signals SET family_id=?, family_version=?, regime_id=?, regime_primary=?, allocator_plan_id=?, param_set_id=?
+                   WHERE setup_id=?
+            """,
+            (
+                str(getattr(s, 'family_id', '') or ''),
+                str(getattr(s, 'family_version', '') or RESEARCH_FAMILY_VERSION),
+                str(getattr(s, 'regime_id', '') or ''),
+                str(getattr(s, 'regime_primary', '') or ''),
+                str(getattr(s, 'allocator_plan_id', '') or ''),
+                str(getattr(s, 'param_set_id', '') or ''),
+                str(getattr(s, 'setup_id', '') or ''),
+            ),
+        )
+    except Exception:
+        pass
     con.commit()
     con.close()
     try:
@@ -13159,6 +13014,30 @@ def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts:
            VALUES (?, ?, ?, ?)""",
         (int(user_id), str(setup_id).strip(), str(session or ""), float(emailed_ts)),
     )
+    try:
+        if s is not None:
+            cur.execute(
+                """UPDATE executable_setups SET
+                       family_id=?, family_version=?, regime_id=?, regime_primary=?, allocator_plan_id=?,
+                       param_set_id=?, family_score=?, exec_score=?, validation_state=?, challenger_flag=?
+                       WHERE user_id=? AND setup_id=?
+                """,
+                (
+                    str(getattr(s, 'family_id', '') or ''),
+                    str(getattr(s, 'family_version', '') or RESEARCH_FAMILY_VERSION),
+                    str(getattr(s, 'regime_id', '') or ''),
+                    str(getattr(s, 'regime_primary', '') or ''),
+                    str(getattr(s, 'allocator_plan_id', '') or ''),
+                    str(getattr(s, 'param_set_id', '') or ''),
+                    float(getattr(s, 'family_score', 0.0) or 0.0),
+                    float(getattr(s, 'exec_score', 0.0) or 0.0),
+                    str(getattr(s, 'validation_state', '') or 'approved'),
+                    1 if bool(getattr(s, 'challenger_flag', False)) else 0,
+                    int(user_id), sid,
+                ),
+            )
+    except Exception:
+        pass
     con.commit()
     con.close()
     try:
@@ -13237,7 +13116,7 @@ def _pipeline_top_reasons(counts: dict | Counter | None, limit: int = 5) -> dict
 
 def _setup_executable_details_json(s, session: str = '') -> str:
     try:
-        _adaptive_annotate_setup(s, session_name=str(session or ''), regime={'session': str(session or ''), 'bucket': str(getattr(s, 'regime_bucket', '') or '')})
+        s = _research_finalize_setup(s, session_name=str(session or getattr(s, 'session', '') or ''))
         details = {
             'session': str(session or ''),
             'engine': str(getattr(s, 'engine', '') or ''),
@@ -13251,12 +13130,17 @@ def _setup_executable_details_json(s, session: str = '') -> str:
             'created_ts': float(getattr(s, 'created_ts', 0.0) or 0.0),
             'family_id': str(getattr(s, 'family_id', '') or ''),
             'family_name': str(getattr(s, 'family_name', '') or ''),
-            'family_stage': str(getattr(s, 'family_stage', '') or ''),
-            'regime_bucket': str(getattr(s, 'regime_bucket', '') or ''),
-            'regime_bias': str(getattr(s, 'regime_bias', '') or ''),
-            'leader_base_override': bool(getattr(s, 'leader_base_override', False)),
-            'sweep': str(getattr(s, 'sweep', '') or ''),
-            'smf_event': str(getattr(s, 'smf_event', '') or ''),
+            'family_version': str(getattr(s, 'family_version', '') or RESEARCH_FAMILY_VERSION),
+            'regime_id': str(getattr(s, 'regime_id', '') or ''),
+            'regime_primary': str(getattr(s, 'regime_primary', '') or ''),
+            'regime_secondary': str(getattr(s, 'regime_secondary', '') or ''),
+            'regime_confidence': float(getattr(s, 'regime_confidence', 0.0) or 0.0),
+            'allocator_plan_id': str(getattr(s, 'allocator_plan_id', '') or ''),
+            'param_set_id': str(getattr(s, 'param_set_id', '') or ''),
+            'family_score': float(getattr(s, 'family_score', 0.0) or 0.0),
+            'exec_score': float(getattr(s, 'exec_score', 0.0) or 0.0),
+            'validation_state': str(getattr(s, 'validation_state', '') or 'approved'),
+            'challenger_flag': bool(getattr(s, 'challenger_flag', False)),
         }
         return json.dumps(details, separators=(",", ":"), ensure_ascii=False)
     except Exception:
@@ -13264,6 +13148,11 @@ def _setup_executable_details_json(s, session: str = '') -> str:
 
 
 def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executable_ts: float, s=None, source_kind: str = 'executable_setups', state: str = 'executable_pending'):
+    try:
+        if s is not None:
+            s = _research_finalize_setup(s, session_name=str(session or getattr(s, 'session', '') or ''))
+    except Exception:
+        pass
     sid = str(setup_id or getattr(s, 'setup_id', '') or '').strip()
     if not sid:
         return
@@ -13502,21 +13391,18 @@ def _executable_rows_to_setup_objects(rows: List[dict], session_name: str = '') 
                 generated_logged_ts=0.0,
                 source_kind=str(row.get('source_kind') or 'executable_setups'),
                 source_session=str(row.get('session') or ''),
+                family_id=str(row.get('family_id') or ''),
+                family_version=str(row.get('family_version') or RESEARCH_FAMILY_VERSION),
+                regime_id=str(row.get('regime_id') or ''),
+                regime_primary=str(row.get('regime_primary') or ''),
+                allocator_plan_id=str(row.get('allocator_plan_id') or ''),
+                param_set_id=str(row.get('param_set_id') or ''),
+                family_score=float(row.get('family_score') or 0.0),
+                exec_score=float(row.get('exec_score') or 0.0),
+                validation_state=str(row.get('validation_state') or 'approved'),
+                challenger_flag=bool(int(row.get('challenger_flag') or 0)),
             )
-            try:
-                _det = _adaptive_safe_json_loads(row.get('details_json') or '', {})
-                setattr(item, 'family_id', str(_det.get('family_id') or ''))
-                setattr(item, 'family_name', str(_det.get('family_name') or ''))
-                setattr(item, 'family_stage', str(_det.get('family_stage') or ''))
-                setattr(item, 'regime_bucket', str(_det.get('regime_bucket') or ''))
-                setattr(item, 'regime_bias', str(_det.get('regime_bias') or ''))
-                if not str(getattr(item, 'family_id', '') or '').strip():
-                    _adaptive_annotate_setup(item, session_name=session_name, regime={'session': str(session_name or ''), 'bucket': str(_det.get('regime_bucket') or '')})
-            except Exception:
-                try:
-                    _adaptive_annotate_setup(item, session_name=session_name, regime={'session': str(session_name or '')})
-                except Exception:
-                    pass
+            item = _research_finalize_setup(item, session_name=str(row.get('session') or session_name or ''))
             out.append(item)
         except Exception:
             continue
@@ -13589,6 +13475,16 @@ def _cache_recent_emailed_setup(user_id: int, setup: Any, session: str = '', ema
         'is_trailing_alt_target_b': bool(getattr(setup, 'is_trailing_alt_target_b', False)),
         'created_ts': float(getattr(setup, 'created_ts', 0.0) or 0.0),
         'signal_created_ts': float(getattr(setup, 'created_ts', 0.0) or 0.0),
+        'family_id': str(getattr(setup, 'family_id', '') or ''),
+        'family_version': str(getattr(setup, 'family_version', '') or RESEARCH_FAMILY_VERSION),
+        'regime_id': str(getattr(setup, 'regime_id', '') or ''),
+        'regime_primary': str(getattr(setup, 'regime_primary', '') or ''),
+        'allocator_plan_id': str(getattr(setup, 'allocator_plan_id', '') or ''),
+        'param_set_id': str(getattr(setup, 'param_set_id', '') or ''),
+        'family_score': float(getattr(setup, 'family_score', 0.0) or 0.0),
+        'exec_score': float(getattr(setup, 'exec_score', 0.0) or 0.0),
+        'validation_state': str(getattr(setup, 'validation_state', '') or 'approved'),
+        'challenger_flag': bool(getattr(setup, 'challenger_flag', False)),
         'emailed_ts': ts,
         'email_logged_ts': ts,
         'generated_logged_ts': float(getattr(setup, 'created_ts', 0.0) or 0.0),
@@ -13629,6 +13525,7 @@ def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_
                 continue
             seen.add(sid)
             item = SimpleNamespace(**row)
+            item = _research_finalize_setup(item, session_name=str(row.get('session') or req_session_u or ''))
             out.append(item)
             if len(out) >= int(limit):
                 break
@@ -16160,6 +16057,7 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
             pass
         score, _ = compute_setup_quality_score(s, session_name=session_name)
         setattr(s, "quality_score", float(score))
+        s = _research_finalize_setup(s, session_name=session_name)
 
         if float(score) >= float(QUALITY_SCORE_MIN_SCREEN):
             setups.append(s)
@@ -16481,11 +16379,6463 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rep.get('ok'):
         await update.message.reply_text(f"Backtest error: {rep.get('error')}")
         return
-    lines = _goal_profile_report_lines(rep)
+
+    lines = []
+    lines.append('📊 Backtest Report')
+    lines.append(HDR)
+    lines.append(f"Symbol: {rep.get('symbol')}")
+    lines.append(f"TF: {rep.get('tf')} | Days: {rep.get('days')} | Session: {session_name}")
+    try:
+        ws = datetime.fromtimestamp(float(rep.get('window_start_ts') or 0.0), tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        we = datetime.fromtimestamp(float(rep.get('window_end_ts') or 0.0), tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        lines.append(f"Window: {ws} → {we} | End offset: {int(rep.get('end_days_ago', 0) or 0)}d ago")
+    except Exception:
+        pass
+    lines.append(SEP)
+    lines.append(f"Setups: {rep.get('setups')}")
+    try:
+        setups_day = (float(rep.get('setups', 0) or 0) / float(rep.get('days', 1) or 1))
+        lines.append(f"Setups/day: {setups_day:.2f}")
+    except Exception:
+        pass
+    lines.append(f"Win rate: {_fmt_num(rep.get('win_rate'), '.1f')}%")
+    lines.append(f"TP hit rate: {_fmt_num((float(rep.get('tp_rate') or 0.0) + float(rep.get('alt_target_a_rate') or 0.0)), '.1f')}%")
+    lines.append(f"SL / timeout balance: {_fmt_num(100.0 - (float(rep.get('tp_rate') or 0.0) + float(rep.get('alt_target_a_rate') or 0.0)), '.1f')}%")
+    lines.append(f"Avg R: {_fmt_num(rep.get('avg_R'), '.3f')}")
+    lines.append(f"Profit factor: {_fmt_num(rep.get('profit_factor'), '.2f')}")
+    lines.append(f"Max DD (R): {_fmt_num(rep.get('max_drawdown_R'), '.2f')}")
+    lines.append(f"Net (R): {_fmt_num(rep.get('equity_R'), '.2f')}")
+    lines.append(f"Start equity: ${float(rep.get('initial_equity', 0.0) or 0.0):,.2f}")
+    lines.append(f"End equity: ${float(rep.get('ending_equity', 0.0) or 0.0):,.2f}")
+    lines.append(f"Net PnL: ${float(rep.get('net_pnl_usd', 0.0) or 0.0):,.2f}")
+    lines.append(f"Max DD ($): ${float(rep.get('max_drawdown_usd', 0.0) or 0.0):,.2f}")
+    try:
+        lines.append(f"Avg hold: {float(rep.get('avg_hold_minutes', 0.0) or 0.0):.1f} min")
+    except Exception:
+        pass
+
+    try:
+        bs = rep.get('by_session') or {}
+        if isinstance(bs, dict) and bs:
+            lines.append(SEP)
+            lines.append('By session:')
+            for sname in ('NY', 'LON', 'ASIA'):
+                d = bs.get(sname) or {}
+                if not d:
+                    continue
+                lines.append(
+                    f"• {sname}: setups={int(d.get('setups', 0) or 0)} | WR={float(d.get('win_rate', 0.0) or 0.0):.1f}% | TP={float(d.get('tp_rate', 0.0) or 0.0) + float(d.get('alt_target_a_rate', 0.0) or 0.0):.1f}% | AvgR={float(d.get('avg_R', 0.0) or 0.0):.2f}"
+                )
+    except Exception:
+        pass
+
+    try:
+        rb = rep.get('reject_breakdown') or {}
+        if isinstance(rb, dict) and rb:
+            lines.append(SEP)
+            lines.append('Reject breakdown (top):')
+            items = sorted(rb.items(), key=lambda kv: int(kv[1]), reverse=True)[:10]
+            for k, v in items:
+                lines.append(f'• {k}: {v}')
+    except Exception:
+        pass
+
+    await update.message.reply_text('\\n'.join(lines))
+
+
+def _run_backtest_on_ohlcv(symbol: str, ohlcv: list, days: int, tf: str, session_name: str) -> dict:
+    """Same as run_backtest but uses already-fetched ohlcv.
+
+    WIN DEFINITION (enforced everywhere in backtests/optimizer):
+    - WIN = TP is hit before SL within the evaluation window.
+      (If TP/TP hit first, TP necessarily hit earlier, so TP/TP are also wins.)
+    """
+    if not ohlcv or len(ohlcv) < 300:
+        return {"ok": False, "error": "insufficient_ohlcv", "symbol": symbol, "tf": tf, "days": days}
+
+    setups = _backtest_generate_setups(symbol, ohlcv, tf, session_name=session_name)
+    if not setups:
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "tf": tf,
+            "days": days,
+            "setups": 0,
+            "trades": 0,
+            "win_rate": 0.0,
+            "avg_R": 0.0,
+            "profit_factor": 0.0,
+            "max_drawdown_R": 0.0,
+            "equity_R": 0.0,
+            "reject_breakdown": dict(_BT_LAST_REJECTS),
+            "by_session": {},
+        }
+
+    results = []
+    eq = 0.0
+    peak = 0.0
+    max_dd = 0.0
+
+    by_session = defaultdict(lambda: {"setups": 0, "wins": 0, "losses": 0, "r": []})
+
+    for s in setups:
+        try:
+            sid = str(getattr(s, "setup_id", "BT-0"))
+            i = int(sid.split("-")[-1])
+        except Exception:
+            i = 0
+
+        # Infer the setup timestamp (UTC) from candle index
+        ts_sec = 0.0
+        try:
+            ts_raw = float((ohlcv[i][0] if i < len(ohlcv) else ohlcv[-1][0]) or 0.0)
+            ts_sec = (ts_raw / 1000.0) if ts_raw > 1e12 else ts_raw
+        except Exception:
+            ts_sec = 0.0
+
+        sess = "?"
+        try:
+            sess = str(_session_label_from_ts(ts_sec) or "?")
+        except Exception:
+            sess = "?"
+
+        move_be_live = _backtest_should_move_sl_to_be_after_tp(s, sess if sess in ('NY', 'LON', 'ASIA') else session_name)
+        res = _simulate_one_setup(ohlcv, i + 1, s, move_sl_to_be_after_tp=bool(move_be_live))
+        res["R"] = float(res.get("R", 0.0) or 0.0)
+        res["session"] = sess
+        results.append(res)
+
+        eq += res["R"]
+        peak = max(peak, eq)
+        max_dd = max(max_dd, peak - eq)
+
+        out = str(res.get("outcome") or "").upper().strip()
+        by_session[sess]["setups"] += 1
+        by_session[sess]["r"].append(float(res["R"]))
+
+        # WIN definition: TP hit before SL => TP/TP/TP are all wins
+        if out in ("TP", "TP", "TP_BE", "TP_TIMEOUT", "TP", "TP"):
+            by_session[sess]["wins"] += 1
+        elif out in ("SL", "LOSS"):
+            by_session[sess]["losses"] += 1
+
+    total = len(results)
+
+    # WIN definition: TP hit before SL (TP/TP/TP outcomes are wins)
+    wins = sum(1 for r in results if str(r.get("outcome") or "").upper().strip() in ("TP", "TP", "TP_BE", "TP_TIMEOUT", "TP", "TP"))
+    win_rate = (wins / total * 100.0) if total else 0.0
+
+    avg_r = (sum(float(r.get("R", 0.0) or 0.0) for r in results) / total) if total else 0.0
+    gross_win = sum(max(0.0, float(r.get("R", 0.0) or 0.0)) for r in results)
+    gross_loss = sum(min(0.0, float(r.get("R", 0.0) or 0.0)) for r in results)
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float("inf") if gross_win > 0 else 0.0)
+
+    # Session summaries (win_rate + avg_R per session)
+    by_sess_out = {}
+    for sess, d in dict(by_session).items():
+        s_n = int(d.get("setups", 0) or 0)
+        s_w = int(d.get("wins", 0) or 0)
+        s_l = int(d.get("losses", 0) or 0)
+        s_dec = s_w + s_l
+        s_wr = (s_w / s_dec * 100.0) if s_dec else 0.0
+        rr = d.get("r") or []
+        s_avg_r = (sum(float(x) for x in rr) / len(rr)) if rr else 0.0
+        by_sess_out[str(sess)] = {
+            "setups": s_n,
+            "wins": s_w,
+            "losses": s_l,
+            "decided": s_dec,
+            "win_rate": float(s_wr),
+            "avg_R": float(s_avg_r),
+        }
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "tf": tf,
+        "days": days,
+        "setups": total,
+        "trades": total,
+        "win_rate": float(win_rate),
+        "avg_R": float(avg_r),
+        "profit_factor": pf,
+        "max_drawdown_R": float(max_dd),
+        "equity_R": float(eq),
+        "reject_breakdown": dict(_BT_LAST_REJECTS),
+        "by_session": by_sess_out,
+    }
+
+
+    total = len(results)
+    wins = [r for r in results if str(r.get("outcome")) == "TP"]
+    win_rate = (len(wins)/total*100.0) if total else 0.0
+    avg_r = (sum(r["R"] for r in results)/total) if total else 0.0
+    gross_win = sum(max(0.0, r["R"]) for r in results)
+    gross_loss = sum(min(0.0, r["R"]) for r in results)
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float("inf") if gross_win > 0 else 0.0)
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "tf": tf,
+        "days": days,
+        "setups": total,
+        "trades": total,
+        "win_rate": win_rate,
+        "avg_R": float(avg_r),
+        "profit_factor": pf,
+        "max_drawdown_R": float(max_dd),
+        "equity_R": float(eq),
+        "reject_breakdown": dict(_BT_LAST_REJECTS),
+    }
+
+def _objective(oos: list[dict], days: int, cfg: dict) -> float:
+    """OOS-first objective with anti-overfitting safeguards.
+
+    - Primary: OOS expectancy (Avg R) + Profit Factor (PF)
+    - Enforces frequency target (3–5 setups/day) via penalty
+    - Penalizes: drawdown, low sample size, symbol concentration, session imbalance/instability
+    - WIN definition used in win_rate: TP hit before SL (TP/TP/TP outcomes are wins)
+    """
+    if not oos:
+        return -1e12
+
+    total_days = max(1.0, float(days))
+    ok_rows = [r for r in oos if r and r.get("ok")]
+
+    if not ok_rows:
+        return -1e12
+
+    total_setups = sum(int(r.get("setups", 0) or 0) for r in ok_rows)
+    setups_day = total_setups / total_days
+
+    # Hard minimum sample size to avoid fake win-rate / tiny samples
+    min_oos_setups = int(cfg.get("oos_min_setups", 30) or 30)
+    if total_setups < min_oos_setups:
+        # Still allow ranking (but heavily penalize) so optimizer can find something workable.
+        sample_pen = (min_oos_setups - total_setups) * 8.0
+    else:
+        sample_pen = 0.0
+
+    # Aggregate per-symbol metrics (weighted by setups)
+    w_sum = max(1.0, float(total_setups))
+    avg_r = sum(float(r.get("avg_R", 0.0) or 0.0) * float(r.get("setups", 0) or 0) for r in ok_rows) / w_sum
+    pf_vals = []
+    dd_vals = []
+    wr_num = 0.0
+    for r in ok_rows:
+        st = float(r.get("setups", 0) or 0)
+        pf_i = r.get("profit_factor")
+        pf_i = 10.0 if pf_i == float("inf") else float(pf_i or 0.0)
+        pf_vals.append(pf_i * st)
+        dd_vals.append(float(r.get("max_drawdown_R", 0.0) or 0.0) * st)
+        wr_num += float(r.get("win_rate", 0.0) or 0.0) * st
+    pf = (sum(pf_vals) / w_sum) if pf_vals else 0.0
+    dd = (sum(dd_vals) / w_sum) if dd_vals else 0.0
+    win_rate = (wr_num / w_sum) if w_sum else 0.0
+
+    # Frequency penalty (target band)
+    lo = float(cfg.get("target_setups_per_day_lo", 1.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 3.0))
+    freq_pen = 0.0
+    if setups_day < lo:
+        freq_pen = (lo - setups_day) * 4.0
+    elif setups_day > hi:
+        freq_pen = (setups_day - hi) * 4.0
+
+    # Concentration penalty: discourage all setups from one symbol
+    sym_counts = sorted([int(r.get("setups", 0) or 0) for r in ok_rows], reverse=True)
+    conc_cap = float(cfg.get("concentration_cap", 0.25) or 0.25)
+    conc_pen = 0.0
+    if sym_counts and total_setups > 0:
+        top_share = float(sym_counts[0]) / float(total_setups)
+        if top_share > conc_cap:
+            conc_pen = (top_share - conc_cap) * 20.0
+
+    # Stability penalty across symbols: high variance of Avg R is a red flag
+    try:
+        sym_avg_rs = [float(r.get("avg_R", 0.0) or 0.0) for r in ok_rows if int(r.get("setups", 0) or 0) >= 3]
+        if len(sym_avg_rs) >= 8:
+            mu = sum(sym_avg_rs) / len(sym_avg_rs)
+            var = sum((x - mu) ** 2 for x in sym_avg_rs) / max(1, (len(sym_avg_rs) - 1))
+            stab_pen = (var ** 0.5) * 10.0
+        else:
+            stab_pen = 0.0
+    except Exception:
+        stab_pen = 0.0
+
+    # Session-weighted performance (NY > LON > ASIA) if by_session is present
+    session_weights = cfg.get("session_weights") or {"NY": 1.0, "LON": 0.6, "ASIA": 0.3}
+    try:
+        wny = float(session_weights.get("NY", 1.0))
+        wlon = float(session_weights.get("LON", 0.6))
+        wasia = float(session_weights.get("ASIA", 0.3))
+    except Exception:
+        wny, wlon, wasia = 1.0, 0.6, 0.3
+
+    sess_acc = {"NY": {"n": 0, "wr": 0.0, "r": 0.0}, "LON": {"n": 0, "wr": 0.0, "r": 0.0}, "ASIA": {"n": 0, "wr": 0.0, "r": 0.0}}
+    for r in ok_rows:
+        bs = r.get("by_session") or {}
+        if not isinstance(bs, dict):
+            continue
+        for sname in ("NY", "LON", "ASIA"):
+            d = bs.get(sname) or {}
+            try:
+                n = float(d.get("setups", 0) or 0)
+                if n <= 0:
+                    continue
+                sess_acc[sname]["n"] += n
+                sess_acc[sname]["wr"] += float(d.get("win_rate", 0.0) or 0.0) * n
+                sess_acc[sname]["r"] += float(d.get("avg_R", 0.0) or 0.0) * n
+            except Exception:
+                continue
+
+    # Weighted avg_R / win_rate across sessions (only for those with data)
+    sw = 0.0
+    s_wr = 0.0
+    s_r = 0.0
+    for sname, w in (("NY", wny), ("LON", wlon), ("ASIA", wasia)):
+        n = float(sess_acc[sname]["n"] or 0.0)
+        if n <= 0:
+            continue
+        wr_i = float(sess_acc[sname]["wr"] / n) if n else 0.0
+        r_i = float(sess_acc[sname]["r"] / n) if n else 0.0
+        sw += float(w) * n
+        s_wr += float(w) * wr_i * n
+        s_r += float(w) * r_i * n
+
+    if sw > 0:
+        wr_weighted = s_wr / sw
+        r_weighted = s_r / sw
+    else:
+        wr_weighted = float(win_rate)
+        r_weighted = float(avg_r)
+
+    # Win-rate gating (only if sample is adequate)
+    min_wr = float(cfg.get("min_win_rate", 70.0) or 70.0)
+    min_wr_samples = int(cfg.get("min_win_rate_samples", 50) or 50)
+    wr_pen = 0.0
+    if total_setups >= min_wr_samples and wr_weighted < min_wr:
+        wr_pen = (min_wr - wr_weighted) * 2.5
+
+    # Drawdown penalty (harder once above cap)
+    dd_cap = float(cfg.get("max_drawdown_R_cap", 8.0) or 8.0)
+    dd_pen = 0.0
+    if dd > dd_cap:
+        dd_pen = (dd - dd_cap) * 6.0
+    else:
+        dd_pen = dd * 0.9
+
+    # Final score (maximize)
+    # Expectancy dominates, then PF; penalties enforce safety + frequency.
+    score = (r_weighted * 12.0) + (pf * 1.4) - dd_pen - freq_pen - conc_pen - stab_pen - sample_pen - wr_pen
+    return float(score)
+
+
+    avg_r = 0.0
+    pf = 0.0
+    dd = 0.0
+    n = 0
+    for r in oos:
+        if not r.get("ok"):
+            continue
+        n += 1
+        avg_r += float(r.get("avg_R", 0.0) or 0.0)
+        pf_i = r.get("profit_factor")
+        pf += (10.0 if pf_i == float("inf") else float(pf_i or 0.0))
+        dd += float(r.get("max_drawdown_R", 0.0) or 0.0)
+    if n <= 0:
+        return -1e9
+    avg_r /= n
+    pf /= n
+    dd /= n
+
+    lo = float(cfg.get("target_setups_per_day_lo", 1.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 3.0))
+    freq_pen = 0.0
+    if setups_day < lo:
+        freq_pen = (lo - setups_day) * 2.0
+    elif setups_day > hi:
+        freq_pen = (setups_day - hi) * 2.0
+
+    # Overconcentration penalty: discourage all performance from a single symbol
+    sym_counts = sorted([int(r.get("setups",0) or 0) for r in oos], reverse=True)
+    conc_pen = 0.0
+    if sym_counts and total_setups > 0:
+        top_share = sym_counts[0] / total_setups
+        if top_share > 0.25:
+            conc_pen = (top_share - 0.25) * 10.0
+
+    # Score
+    score = (avg_r * 8.0) + (pf * 1.2) - (dd * 0.8) - freq_pen - conc_pen
+    return float(score)
+
+def _generate_candidates(cfg: dict) -> list[dict]:
+    bounds = cfg.get("opt_bounds") or {}
+    def _rng(key, default_lo, default_hi):
+        try:
+            lo, hi = bounds.get(key, [default_lo, default_hi])
+            return float(lo), float(hi)
+        except Exception:
+            return float(default_lo), float(default_hi)
+
+    # Deterministic small grid (safe runtime)
+    qlo, qhi = _rng("quality_score_min_screen", 52, 70)
+    slo, shi = _rng("regime_slope_trend_min_pct", 0.04, 0.10)
+    a1lo, a1hi = _rng("tf_align_1h_min_abs", 0.3, 1.2)
+    a4lo, a4hi = _rng("tf_align_4h_min_abs", 0.3, 1.2)
+    atrlo, atrhi = _rng("atr_min_pct", 0.4, 1.5)
+    rrlo, rrhi = _rng("min_rr_tp", 1.3, 2.4)
+
+    q_grid = [qlo, (qlo+qhi)/2.0, qhi]
+    s_grid = [slo, (slo+shi)/2.0, shi]
+    a_grid = [a1lo, (a1lo+a1hi)/2.0, a1hi]
+    atr_grid = [atrlo, (atrlo+atrhi)/2.0, atrhi]
+    rr_grid = [rrlo, (rrlo+rrhi)/2.0, rrhi]
+
+    cands = []
+    for q in q_grid:
+        for s in s_grid:
+            for a in a_grid:
+                for atrm in atr_grid:
+                    for rr in rr_grid:
+                        c = {
+                            "quality_score_min_screen": float(_clamp(q, qlo, qhi)),
+                            "quality_score_min_email": float(_clamp(q+6.0, qlo+2.0, qhi+10.0)),
+                            "regime_slope_trend_min_pct": float(_clamp(s, slo, shi)),
+                            "tf_align_1h_min_abs": float(_clamp(a, a1lo, a1hi)),
+                            "tf_align_4h_min_abs": float(_clamp(a, a4lo, a4hi)),
+                            "atr_min_pct": float(_clamp(atrm, atrlo, atrhi)),
+                            "min_rr_tp": float(_clamp(rr, rrlo, rrhi)),
+                        }
+                        cands.append(c)
+    # Keep bounded
+    return cands[:180]
+
+async def cmd_optimize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    await update.message.reply_text(
+        "🤖 Manual /optimize is disabled.\n\n"
+        "The bot optimizes itself automatically in the background and only promotes validated parameter sets.\n"
+        "Use /optimize_report if you need the latest internal report."
+    )
+    return
+
+async def cmd_optimize_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    rep = load_opt_report()
+    if not rep:
+        await update.message.reply_text("No optimize report saved yet. Run /optimize first.")
+        return
+    pretty = json.dumps(rep, indent=2, ensure_ascii=False, sort_keys=True)
+    await send_long_message(update, f"🧪 Optimize Report (last)\n{HDR}\n```\n{pretty}\n```", parse_mode=ParseMode.MARKDOWN)
+
+
+
+
+
+
+
+
+# =========================================================
+# SELF-OPTIMIZATION v2 (ADMIN) — end-to-end, resumable, kill-switch
+# - Builds daily TOP100 universe (>= $10M 24h quote volume) and snapshots it in SQLite
+# - Runs bounded deterministic search across TF candidates and param grid
+# - Uses walk-forward split (70/30) and OOS-first objective with session weights (NY > LON > ASIA)
+# - Promotes config ONLY if stability gates pass
+# =========================================================
+
+SELF_OPT_DEFAULT_SESSION_MODE = "24H_WEIGHTED"  # NY weighted highest, then LON, then ASIA
+
+# Global job state (single-run at a time; Render-friendly)
+_SELF_OPT_STATE = {
+    "task": None,              # asyncio.Task
+    "stop_event": None,        # threading.Event (checked inside heavy loop)
+    "run_id": None,            # str
+    "started_ts": 0.0,
+}
+
+_MARKET_ADAPTIVE_LOCK = threading.Lock()
+
+# Zero-touch autonomous optimization governance
+AUTONOMOUS_OPT_ENABLED = str(os.environ.get("AUTONOMOUS_OPT_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+AUTONOMOUS_OPT_INTERVAL_HOURS = float(os.environ.get("AUTONOMOUS_OPT_INTERVAL_HOURS", "6") or 6)
+AUTONOMOUS_OPT_MIN_INTERVAL_HOURS = float(os.environ.get("AUTONOMOUS_OPT_MIN_INTERVAL_HOURS", "6") or 6)
+AUTONOMOUS_OPT_DAYS = int(os.environ.get("AUTONOMOUS_OPT_DAYS", "60") or 60)
+AUTONOMOUS_OPT_SESSION_MODE = str(os.environ.get("AUTONOMOUS_OPT_SESSION_MODE", SELF_OPT_DEFAULT_SESSION_MODE) or SELF_OPT_DEFAULT_SESSION_MODE).strip().upper()
+AUTONOMOUS_OPT_LOOKBACK_HOURS = float(os.environ.get("AUTONOMOUS_OPT_LOOKBACK_HOURS", "72") or 72)
+AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS = int(os.environ.get("AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS", "18") or 18)
+AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW = float(os.environ.get("AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW", "70") or 70)
+
+def _opt_migrate_tables():
+    """Create/extend self-optimization tables (backward compatible)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+
+            c.execute("""CREATE TABLE IF NOT EXISTS universe_snapshots (
+                snap_id TEXT PRIMARY KEY,
+                day_utc TEXT NOT NULL,
+                created_ts REAL NOT NULL,
+                top_n INTEGER NOT NULL,
+                min_vol_usd REAL NOT NULL,
+                symbols_json TEXT NOT NULL,
+                meta_json TEXT NOT NULL DEFAULT ''
+            )""")
+
+            c.execute("""CREATE TABLE IF NOT EXISTS optimization_runs (
+                run_id TEXT PRIMARY KEY,
+                started_ts REAL NOT NULL,
+                finished_ts REAL,
+                status TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                session_mode TEXT NOT NULL,
+                tf_candidates_json TEXT NOT NULL,
+                universe_snap_id TEXT,
+                universe_size INTEGER DEFAULT 0,
+                progress_json TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT ''
+            )""")
+
+            c.execute("""CREATE TABLE IF NOT EXISTS optimization_results (
+                run_id TEXT PRIMARY KEY,
+                promoted INTEGER NOT NULL DEFAULT 0,
+                chosen_exec_tf TEXT,
+                best_score REAL,
+                best_params_json TEXT,
+                metrics_json TEXT,
+                reject_stats_json TEXT,
+                created_ts REAL NOT NULL
+            )""")
+
+            c.execute("""CREATE TABLE IF NOT EXISTS promotion_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                run_id TEXT NOT NULL,
+                from_cfg_json TEXT,
+                to_cfg_json TEXT,
+                decision TEXT NOT NULL,
+                reasons_json TEXT NOT NULL DEFAULT ''
+            )""")
+
+            try:
+                c.execute("CREATE INDEX IF NOT EXISTS idx_universe_day ON universe_snapshots(day_utc)")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_opt_runs_status ON optimization_runs(status)")
+            except Exception:
+                pass
+
+            c.execute("""CREATE TABLE IF NOT EXISTS universe_backtest_runs (
+                run_id TEXT PRIMARY KEY,
+                created_ts REAL NOT NULL,
+                days INTEGER NOT NULL,
+                session_mode TEXT NOT NULL,
+                exec_tf TEXT NOT NULL,
+                universe_snap_id TEXT NOT NULL DEFAULT '',
+                universe_size INTEGER NOT NULL DEFAULT 0,
+                promoted_context INTEGER NOT NULL DEFAULT 0,
+                metrics_json TEXT NOT NULL DEFAULT '',
+                per_day_json TEXT NOT NULL DEFAULT '',
+                per_session_json TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT ''
+            )""")
+            try:
+                c.execute("CREATE INDEX IF NOT EXISTS idx_ubt_created ON universe_backtest_runs(created_ts)")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_ubt_days ON universe_backtest_runs(days, created_ts)")
+            except Exception:
+                pass
+
+            conn.commit()
+    except Exception:
+        pass
+
+
+
+# =========================================================
+# EVOLUTION / LEARNING / LESSONS-LEARNED ENGINE
+# - Production-safe extension built on existing signals, signal_outcomes,
+#   autotrade_trades, strategy_config, and optimization_results.
+# - Uses bounded heuristics + persisted diagnostics, not fake AI reporting.
+# =========================================================
+EVOLUTION_ENABLED = str(os.environ.get("EVOLUTION_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+EVOLUTION_HOURLY_INTERVAL_MIN = int(os.environ.get("EVOLUTION_HOURLY_INTERVAL_MIN", "60") or 60)
+EVOLUTION_DAILY_INTERVAL_HOURS = int(os.environ.get("EVOLUTION_DAILY_INTERVAL_HOURS", "24") or 24)
+EVOLUTION_AUTO_APPLY_COOLDOWN_HOURS = float(os.environ.get("EVOLUTION_AUTO_APPLY_COOLDOWN_HOURS", "24") or 24)
+EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS = int(os.environ.get("EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS", "8") or 8)
+EVOLUTION_LOOKBACK_DAYS = int(os.environ.get("EVOLUTION_LOOKBACK_DAYS", "60") or 60)
+
+_EVOLUTION_STATE = {
+    "hourly_task": None,
+    "daily_task": None,
+}
+
+
+def _evolution_migrate_tables():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS evolution_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_ts REAL NOT NULL
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS evolution_runs (
+                run_id TEXT PRIMARY KEY,
+                cycle_type TEXT NOT NULL,
+                started_ts REAL NOT NULL,
+                finished_ts REAL,
+                status TEXT NOT NULL,
+                analyzed_setups INTEGER NOT NULL DEFAULT 0,
+                analyzed_trades INTEGER NOT NULL DEFAULT 0,
+                findings_json TEXT NOT NULL DEFAULT '',
+                metrics_json TEXT NOT NULL DEFAULT '',
+                actions_json TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS evolution_diagnostics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                processed_key TEXT NOT NULL UNIQUE,
+                source_type TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                created_ts REAL NOT NULL DEFAULT 0,
+                decided_ts REAL NOT NULL DEFAULT 0,
+                outcome TEXT NOT NULL DEFAULT '',
+                win_flag INTEGER NOT NULL DEFAULT 0,
+                tags_json TEXT NOT NULL DEFAULT '',
+                detail_json TEXT NOT NULL DEFAULT '',
+                recommendation TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0,
+                inserted_ts REAL NOT NULL DEFAULT 0
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS evolution_recommendations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_ts REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                scope TEXT NOT NULL DEFAULT '',
+                recommendation TEXT NOT NULL,
+                evidence_json TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0,
+                auto_applied INTEGER NOT NULL DEFAULT 0,
+                action_json TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_evolution_runs_cycle ON evolution_runs(cycle_type, started_ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_evolution_diag_source ON evolution_diagnostics(source_type, source_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_evolution_diag_session ON evolution_diagnostics(session, decided_ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_evolution_rec_status ON evolution_recommendations(status, created_ts)")
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _evolution_state_get(key: str, default=None):
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute("SELECT value FROM evolution_state WHERE key=?", (str(key),)).fetchone()
+            if not row:
+                return default
+            raw = row[0]
+            try:
+                return json.loads(raw)
+            except Exception:
+                return raw
+    except Exception:
+        return default
+
+
+def _evolution_state_set(key: str, value) -> None:
+    _evolution_migrate_tables()
+    try:
+        payload = _json_dumps_safe(value)
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO evolution_state(key,value,updated_ts) VALUES(?,?,?)",
+                (str(key), str(payload), float(time.time())),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _evolution_new_run(cycle_type: str) -> str:
+    _evolution_migrate_tables()
+    run_id = f"EVO-{str(cycle_type).upper()}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO evolution_runs(run_id, cycle_type, started_ts, status) VALUES(?,?,?,?)",
+                (run_id, str(cycle_type).lower(), float(time.time()), "RUNNING"),
+            )
+            conn.commit()
+    except Exception:
+        pass
+    return run_id
+
+
+def _evolution_finish_run(run_id: str, status: str, analyzed_setups: int, analyzed_trades: int, findings: dict, metrics: dict, actions: list, notes: str = "") -> None:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                """UPDATE evolution_runs
+                   SET finished_ts=?, status=?, analyzed_setups=?, analyzed_trades=?, findings_json=?, metrics_json=?, actions_json=?, notes=?
+                   WHERE run_id=?""",
+                (
+                    float(time.time()),
+                    str(status),
+                    int(analyzed_setups),
+                    int(analyzed_trades),
+                    _json_dumps_safe(findings or {}),
+                    _json_dumps_safe(metrics or {}),
+                    _json_dumps_safe(actions or []),
+                    str(notes or ""),
+                    str(run_id),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _evolution_get_last_run(cycle_type: str | None = None) -> dict:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            if cycle_type:
+                row = c.execute(
+                    "SELECT * FROM evolution_runs WHERE cycle_type=? ORDER BY started_ts DESC LIMIT 1",
+                    (str(cycle_type).lower(),),
+                ).fetchone()
+            else:
+                row = c.execute("SELECT * FROM evolution_runs ORDER BY started_ts DESC LIMIT 1").fetchone()
+            return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+def _evolution_insert_recommendation(scope: str, recommendation: str, evidence: dict, confidence: float, auto_applied: bool = False, action: dict | None = None, status: str = "OPEN") -> None:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                """INSERT INTO evolution_recommendations(created_ts, status, scope, recommendation, evidence_json, confidence, auto_applied, action_json)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    float(time.time()),
+                    str(status),
+                    str(scope or ""),
+                    str(recommendation or ""),
+                    _json_dumps_safe(evidence or {}),
+                    float(confidence or 0.0),
+                    1 if auto_applied else 0,
+                    _json_dumps_safe(action or {}),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _evolution_list_open_recommendations(limit: int = 8) -> list[dict]:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                "SELECT * FROM evolution_recommendations WHERE status='OPEN' ORDER BY created_ts DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _evolution_store_diagnostic(processed_key: str, source_type: str, source_id: str, session: str, symbol: str, side: str,
+                                created_ts: float, decided_ts: float, outcome: str, win_flag: bool,
+                                tags: list[str], detail: dict, recommendation: str, confidence: float) -> bool:
+    """Insert or refresh one learning diagnostic row.
+
+    Important: diagnostics must be refreshable. A setup/trade can be discovered earlier and then
+    later receive a fresher decided_ts or a corrected TP/SL outcome after exchange sync. The older
+    implementation used INSERT OR IGNORE which permanently froze the first lesson row and caused
+    /lessons_learned to keep showing stale March rows even after newer outcomes existed.
+    """
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            existing = c.execute(
+                "SELECT decided_ts, outcome, tags_json, recommendation FROM evolution_diagnostics WHERE processed_key=? LIMIT 1",
+                (str(processed_key),),
+            ).fetchone()
+            existing_decided = float((existing[0] if existing else 0.0) or 0.0)
+            existing_outcome = str((existing[1] if existing else '') or '').upper().strip()
+            existing_tags = str((existing[2] if existing else '') or '')
+            existing_rec = str((existing[3] if existing else '') or '')
+            new_tags_json = _json_dumps_safe(tags or [])
+            should_update = bool(
+                (existing is None)
+                or float(decided_ts or 0.0) > existing_decided + 1.0
+                or str(outcome or '').upper().strip() != existing_outcome
+                or new_tags_json != existing_tags
+                or str(recommendation or '') != existing_rec
+            )
+            if not should_update:
+                return False
+            c.execute(
+                """INSERT INTO evolution_diagnostics
+                   (processed_key, source_type, source_id, session, symbol, side, created_ts, decided_ts, outcome, win_flag, tags_json, detail_json, recommendation, confidence, inserted_ts)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(processed_key) DO UPDATE SET
+                       source_type=excluded.source_type,
+                       source_id=excluded.source_id,
+                       session=excluded.session,
+                       symbol=excluded.symbol,
+                       side=excluded.side,
+                       created_ts=excluded.created_ts,
+                       decided_ts=excluded.decided_ts,
+                       outcome=excluded.outcome,
+                       win_flag=excluded.win_flag,
+                       tags_json=excluded.tags_json,
+                       detail_json=excluded.detail_json,
+                       recommendation=excluded.recommendation,
+                       confidence=excluded.confidence,
+                       inserted_ts=excluded.inserted_ts""",
+                (
+                    str(processed_key),
+                    str(source_type),
+                    str(source_id),
+                    str(session or ""),
+                    str(symbol or ""),
+                    str(side or ""),
+                    float(created_ts or 0.0),
+                    float(decided_ts or 0.0),
+                    str(outcome or ""),
+                    1 if bool(win_flag) else 0,
+                    new_tags_json,
+                    _json_dumps_safe(detail or {}),
+                    str(recommendation or ""),
+                    float(confidence or 0.0),
+                    float(time.time()),
+                ),
+            )
+            conn.commit()
+            return True
+    except Exception:
+        return False
+
+
+def _evolution_recent_diagnostics(limit: int = 10, losses_only: bool = False, days: int = 30) -> list[dict]:
+    _evolution_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = "SELECT * FROM evolution_diagnostics WHERE decided_ts>=?"
+            params = [float(time.time() - max(1, int(days)) * 86400.0)]
+            if losses_only:
+                q += " AND win_flag=0"
+            q += " ORDER BY decided_ts DESC LIMIT ?"
+            params.append(int(limit))
+            rows = c.execute(q, tuple(params)).fetchall() or []
+            out = []
+            for r in rows:
+                d = dict(r)
+                try:
+                    d["tags"] = json.loads(d.get("tags_json") or "[]")
+                except Exception:
+                    d["tags"] = []
+                try:
+                    d["detail"] = json.loads(d.get("detail_json") or "{}")
+                except Exception:
+                    d["detail"] = {}
+                out.append(d)
+            return out
+    except Exception:
+        return []
+
+
+def _evolution_fallback_recent_lessons(limit: int = 8, days: int = 30) -> list[dict]:
+    """Build fresh lesson rows directly from current signal_outcomes and autotrade_trades.
+
+    This bypasses stale evolution_diagnostics rows when the diagnostics table has not been
+    refreshed yet, or when older March diagnostics still dominate the cached lesson surface.
+    """
+    owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+    since_ts = float(time.time() - max(1, int(days)) * 86400.0)
+    out = []
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                """SELECT e.setup_id, e.session, e.emailed_ts,
+                          COALESCE(o.hit_ts, o.best_ts, o.evaluated_ts, e.emailed_ts, 0) AS decided_ts,
+                          o.outcome,
+                          s.symbol, s.market_symbol, s.side, s.created_ts, s.entry, s.sl, s.tp, s.alt_target_a, s.alt_target_b,
+                          s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id = e.setup_id
+                   JOIN signals s ON s.setup_id = e.setup_id
+                   WHERE e.user_id = ?
+                     AND COALESCE(o.hit_ts, o.best_ts, o.evaluated_ts, e.emailed_ts, 0) >= ?
+                   ORDER BY COALESCE(o.hit_ts, o.best_ts, o.evaluated_ts, e.emailed_ts, 0) DESC
+                   LIMIT ?""",
+                (int(owner_uid), float(since_ts), int(max(int(limit) * 8, 64))),
+            ).fetchall() or []
+            for row in rows:
+                r = dict(row)
+                canon = _canon_signal_outcome_label(r.get('outcome'))
+                if canon not in {'TP', 'SL'}:
+                    continue
+                decided_ts = float(r.get('decided_ts') or 0.0)
+                tags, detail, recommendation, confidence = _evolution_build_signal_diagnostic(r, r.get('session'), canon, decided_ts, source_type='signal')
+                out.append({
+                    'source_type': 'signal',
+                    'source_id': str(r.get('setup_id') or ''),
+                    'session': str(r.get('session') or ''),
+                    'symbol': str(r.get('symbol') or ''),
+                    'side': str(r.get('side') or ''),
+                    'created_ts': float(r.get('created_ts') or r.get('emailed_ts') or 0.0),
+                    'decided_ts': decided_ts,
+                    'outcome': canon,
+                    'win_flag': 1 if canon == 'TP' else 0,
+                    'tags': list(tags or []),
+                    'detail': dict(detail or {}),
+                    'recommendation': str(recommendation or ''),
+                    'confidence': float(confidence or 0.0),
+                })
+    except Exception:
+        pass
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                """SELECT trade_id, session, symbol, side, opened_ts, closed_ts, entry, sl, tp, alt_target_a, alt_target_b,
+                          qty, status, note, pnl_usdt
+                   FROM autotrade_trades
+                   WHERE uid = ?
+                     AND COALESCE(closed_ts, opened_ts, 0) >= ?
+                     AND (COALESCE(closed_ts,0) > 0 OR UPPER(COALESCE(status,'')) IN ('CLOSED','WIN','LOSS','LOSE'))
+                   ORDER BY COALESCE(closed_ts, opened_ts, 0) DESC
+                   LIMIT ?""",
+                (int(owner_uid), float(since_ts), int(max(int(limit) * 6, 48))),
+            ).fetchall() or []
+            for row in rows:
+                r = dict(row)
+                outcome, decided_ts = _evolution_resolve_autotrade_outcome(r)
+                canon = _canon_signal_outcome_label(outcome, r.get('pnl_usdt'))
+                if canon not in {'TP', 'SL'}:
+                    continue
+                diag_sig = {
+                    'symbol': r.get('symbol'),
+                    'market_symbol': _market_symbol_from_base(r.get('symbol')),
+                    'side': r.get('side'),
+                    'entry': r.get('entry'),
+                    'sl': r.get('sl'),
+                    'tp': r.get('tp'),
+                    'alt_target_a': r.get('alt_target_a'),
+                    'alt_target_b': r.get('alt_target_b'),
+                    'created_ts': float(r.get('opened_ts') or 0.0),
+                    'ch24': 0.0,
+                    'ch4': 0.0,
+                    'ch1': 0.0,
+                    'ch15': 0.0,
+                    'fut_vol_usd': 0.0,
+                }
+                tags, detail, recommendation, confidence = _evolution_build_signal_diagnostic(diag_sig, r.get('session'), canon, decided_ts, source_type='autotrade')
+                detail['pnl_usdt'] = float(r.get('pnl_usdt') or 0.0)
+                out.append({
+                    'source_type': 'autotrade',
+                    'source_id': str(r.get('trade_id') or ''),
+                    'session': str(r.get('session') or ''),
+                    'symbol': str(r.get('symbol') or ''),
+                    'side': str(r.get('side') or ''),
+                    'created_ts': float(r.get('opened_ts') or 0.0),
+                    'decided_ts': float(decided_ts or r.get('closed_ts') or 0.0),
+                    'outcome': canon,
+                    'win_flag': 1 if canon == 'TP' else 0,
+                    'tags': list(tags or []),
+                    'detail': dict(detail or {}),
+                    'recommendation': str(recommendation or ''),
+                    'confidence': float(confidence or 0.0),
+                })
+    except Exception:
+        pass
+
+    out = sorted(out, key=lambda r: float(r.get('decided_ts') or 0.0), reverse=True)
+    dedup = []
+    seen = set()
+    for r in out:
+        bucket = (
+            str(r.get('source_type') or ''),
+            str(r.get('source_id') or ''),
+            str(r.get('symbol') or '').upper(),
+            str(r.get('side') or '').upper(),
+            int(float(r.get('decided_ts') or 0.0) // 60),
+            str(r.get('outcome') or '').upper(),
+        )
+        if bucket in seen:
+            continue
+        seen.add(bucket)
+        dedup.append(r)
+        if len(dedup) >= int(limit):
+            break
+    return dedup
+
+
+def _evolution_latest_lessons(limit: int = 8, days: int = 30, refresh: bool = False) -> list[dict]:
+    """Return the freshest lesson rows.
+
+    Strategy:
+    1) Optionally refresh and use stored diagnostics.
+    2) Build a direct fallback from live signal_outcomes/autotrade_trades.
+    3) Prefer whichever source is actually fresher, so stale March diagnostics cannot dominate.
+
+    Notes:
+    - Command surfaces should stay fast, so refresh is OFF by default.
+    - Background evolution jobs are responsible for keeping diagnostics warm.
+    """
+    if refresh:
+        try:
+            _evolution_process_new_diagnostics()
+        except Exception:
+            pass
+    diag_rows = _evolution_recent_diagnostics(limit=max(int(limit) * 8, 64), losses_only=False, days=days)
+    fallback_rows = _evolution_fallback_recent_lessons(limit=max(int(limit) * 3, 24), days=days)
+
+    combined = []
+    for r in (diag_rows or []):
+        d = dict(r)
+        d.setdefault('tags', d.get('tags') or [])
+        d.setdefault('detail', d.get('detail') or {})
+        combined.append(d)
+    combined.extend(fallback_rows or [])
+
+    combined = sorted(combined, key=lambda r: float(r.get('decided_ts') or 0.0), reverse=True)
+    out = []
+    seen = set()
+    for r in combined:
+        try:
+            pnl_hint = (r.get('detail') or {}).get('pnl_usdt') if isinstance(r.get('detail'), dict) else None
+            canon = _canon_signal_outcome_label(r.get('outcome'), pnl_hint)
+            bucket = (
+                str(r.get('symbol') or '').upper().strip(),
+                str(r.get('side') or '').upper().strip(),
+                int(float(r.get('decided_ts') or 0.0) // 60),
+                str(canon or '').upper().strip(),
+            )
+        except Exception:
+            canon = str(r.get('outcome') or '')
+            bucket = (str(r.get('source_type') or ''), str(r.get('source_id') or ''), str(r.get('id') or len(out)))
+        if bucket in seen:
+            continue
+        seen.add(bucket)
+        r['outcome'] = canon
+        out.append(r)
+        if len(out) >= int(limit):
+            break
+    return out
+
+
+def _evolution_tag_counter(days: int = 30, session: str | None = None, losses_only: bool = True) -> Counter:
+    ctr = Counter()
+    try:
+        rows = _evolution_recent_diagnostics(limit=5000, losses_only=losses_only, days=days)
+        for r in rows:
+            if session and str(r.get("session") or "").upper().strip() != str(session).upper().strip():
+                continue
+            for tag in (r.get("tags") or []):
+                ctr[str(tag)] += 1
+    except Exception:
+        pass
+    return ctr
+
+
+def _evolution_outcome_winloss(outcome: str) -> tuple[int, int]:
+    out = str(outcome or "").upper().strip()
+    if out in ("TP", "TP", "TP", "TP", "TP_BE", "TP_TIMEOUT", "WIN_TP", "WIN_TP", "WIN_TP", "WIN"):
+        return (1, 0)
+    if out in ("SL", "LOSS", "SL_FIRST", "TP_SL", "LOSE"):
+        return (0, 1)
+    return (0, 0)
+
+
+def _evolution_sig_rr(sig: dict) -> float:
+    try:
+        entry = float(sig.get("entry") or 0.0)
+        sl = float(sig.get("sl") or 0.0)
+        final_tp = float(_setup_target_tp(sig, 0.0) or 0.0)
+        risk = abs(entry - sl)
+        reward = abs(final_tp - entry)
+        if risk <= 0:
+            return 0.0
+        return float(reward / risk)
+    except Exception:
+        return 0.0
+
+
+def _evolution_entry_context(symbol: str, market_symbol: str, created_ts: float, entry: float, side: str) -> dict:
+    """Best-effort entry-context analysis around the setup creation time.
+
+    We purposely keep this lightweight and bounded:
+    - 15m candles: entry extension vs EMA7/EMA21 and local range position
+    - 1h candles : entry distance vs EMA7 and ATR-based extension
+    If market data is unavailable, downstream logic falls back to stored setup metrics.
+    """
+    out = {
+        "ema7_15m_dist_pct": None,
+        "ema21_15m_dist_pct": None,
+        "ema7_1h_dist_pct": None,
+        "atr_pct_1h": None,
+        "bar_range_pos_15m": None,
+        "retracement_pct_15m": None,
+    }
+    try:
+        sym = str(market_symbol or _market_symbol_from_base(symbol) or "").strip()
+        if not sym or float(created_ts or 0.0) <= 0 or float(entry or 0.0) <= 0:
+            return out
+        end_ms = int((float(created_ts) + 3600.0) * 1000)
+        start_15 = int((float(created_ts) - 12 * 3600.0) * 1000)
+        c15 = fetch_ohlcv_paged(sym, "15m", start_15, end_ms, limit=500)
+        if c15 and len(c15) >= 30:
+            closes15 = [float(x[4]) for x in c15]
+            ema7_15 = float(ema(closes15[-40:], 7) or 0.0)
+            ema21_15 = float(ema(closes15[-80:], 21) or 0.0)
+            if ema7_15 > 0:
+                out["ema7_15m_dist_pct"] = abs(float(entry) - ema7_15) / float(entry) * 100.0
+            if ema21_15 > 0:
+                out["ema21_15m_dist_pct"] = abs(float(entry) - ema21_15) / float(entry) * 100.0
+            try:
+                near = min(c15, key=lambda row: abs((float(row[0]) / 1000.0) - float(created_ts)))
+                hi = float(near[2]); lo = float(near[3])
+                rng = max(1e-12, hi - lo)
+                out["bar_range_pos_15m"] = (float(entry) - lo) / rng
+                prior = c15[-8:-1] if len(c15) >= 8 else c15[:-1]
+                if prior:
+                    swing_hi = max(float(x[2]) for x in prior)
+                    swing_lo = min(float(x[3]) for x in prior)
+                    if str(side).upper() == "BUY":
+                        denom = max(1e-12, swing_hi - swing_lo)
+                        out["retracement_pct_15m"] = (swing_hi - float(entry)) / denom
+                    else:
+                        denom = max(1e-12, swing_hi - swing_lo)
+                        out["retracement_pct_15m"] = (float(entry) - swing_lo) / denom
+            except Exception:
+                pass
+        start_1h = int((float(created_ts) - 72 * 3600.0) * 1000)
+        c1 = fetch_ohlcv_paged(sym, "1h", start_1h, end_ms, limit=500)
+        if c1 and len(c1) >= 30:
+            closes1 = [float(x[4]) for x in c1]
+            ema7_1 = float(ema(closes1[-40:], 7) or 0.0)
+            atr_1 = float(compute_atr_from_ohlcv(c1[-80:], ATR_PERIOD) or 0.0)
+            if ema7_1 > 0:
+                out["ema7_1h_dist_pct"] = abs(float(entry) - ema7_1) / float(entry) * 100.0
+            if atr_1 > 0:
+                out["atr_pct_1h"] = float(atr_1 / float(entry) * 100.0)
+    except Exception:
+        return out
+    return out
+
+
+def _evolution_build_signal_diagnostic(sig: dict, session: str, outcome: str, decided_ts: float, source_type: str = "signal") -> tuple[list[str], dict, str, float]:
+    tags = []
+    detail = {}
+    try:
+        side = str(sig.get("side") or "").upper().strip()
+        entry = float(sig.get("entry") or 0.0)
+        ch24 = float(sig.get("ch24") or 0.0)
+        ch4 = float(sig.get("ch4") or 0.0)
+        ch1 = float(sig.get("ch1") or 0.0)
+        ch15 = float(sig.get("ch15") or 0.0)
+        fut_vol = float(sig.get("fut_vol_usd") or 0.0)
+        rr = float(_evolution_sig_rr(sig) or 0.0)
+        ctx = _evolution_entry_context(sig.get("symbol"), sig.get("market_symbol"), float(sig.get("created_ts") or 0.0), entry, side)
+        detail.update({
+            "rr_tp": rr,
+            "ch24": ch24,
+            "ch4": ch4,
+            "ch1": ch1,
+            "ch15": ch15,
+            "fut_vol_usd": fut_vol,
+        })
+        detail.update(ctx)
+
+        ema15 = ctx.get("ema21_15m_dist_pct")
+        ema1h = ctx.get("ema7_1h_dist_pct")
+        retr = ctx.get("retracement_pct_15m")
+        atr_pct = ctx.get("atr_pct_1h")
+
+        if abs(ch15) >= 1.6 or abs(ch1) >= 3.5 or (ema15 is not None and float(ema15) > 1.2):
+            tags.append("entry_too_extended")
+        if abs(ch15) >= 1.2 and abs(ch1) >= 2.2:
+            tags.append("entry_too_late_after_breakout")
+        if retr is not None:
+            if float(retr) < 0.12:
+                tags.append("pullback_too_shallow")
+            elif float(retr) > 0.85:
+                tags.append("pullback_too_deep")
+        if ema1h is not None and float(ema1h) > float(EMA7_1H_MAX_DIST_PCT):
+            tags.append("entry_far_from_ema")
+        if abs(ch24) >= 20 and abs(ch1) <= 0.35:
+            tags.append("momentum_exhausted")
+        if fut_vol < max(float(MIN_FUT_VOL_USD), 10000000.0) * 1.2:
+            tags.append("thin_liquidity_context")
+        if rr >= 2.3:
+            tags.append("rr_too_ambitious")
+        if str(session).upper() == "ASIA":
+            tags.append("asia_session")
+        if str(session).upper() == "NY" and abs(ch1) >= 2.5 and abs(ch15) >= 1.0:
+            tags.append("ny_breakout_chase_risk")
+        if atr_pct is not None and (float(atr_pct) < 0.45 or float(atr_pct) > 9.0):
+            tags.append("poor_volatility_regime")
+
+        out_u = str(outcome or "").upper().strip()
+        if out_u.startswith("WIN_") or out_u == "TP":
+            if not tags:
+                tags.append("entry_quality_good")
+        elif out_u in {"LOSS", "SL"}:
+            if "entry_too_extended" in tags or "entry_too_late_after_breakout" in tags:
+                tags.append("extended_entry_stopout_pattern")
+            if "rr_too_ambitious" in tags:
+                tags.append("tp_structure_too_ambitious")
+            if not tags:
+                tags.append("loss_without_clear_pattern")
+
+        tags = list(dict.fromkeys(tags))
+        primary = tags[0] if tags else "no_clear_pattern"
+        rec_map = {
+            "entry_too_extended": "Tighten entry quality when price is stretched away from the 15m/1h EMA rail.",
+            "entry_too_late_after_breakout": "Delay breakout entries unless structure resets with a cleaner pullback.",
+            "pullback_too_shallow": "Require a deeper pullback before continuation entries.",
+            "pullback_too_deep": "Reject pullbacks that lose too much structure before trigger.",
+            "entry_far_from_ema": "Tighten EMA-distance tolerance to avoid late continuation entries.",
+            "momentum_exhausted": "Demand stronger fresh momentum expansion before triggering continuation trades.",
+            "rr_too_ambitious": "Reduce TP ambition or require stronger trend context before using high RR targets.",
+            "poor_volatility_regime": "Avoid this volatility regime or apply stricter confirmation.",
+            "asia_session": "ASIA should remain more restrictive unless recent evidence improves.",
+            "ny_breakout_chase_risk": "In New York, tighten volume/confirmation on fast breakout-chase entries.",
+            "thin_liquidity_context": "Prefer thicker futures-volume names for production entries.",
+        }
+        recommendation = rec_map.get(primary, "Monitor recurring failures and tighten the weakest confirmation layer only if the pattern persists.")
+        confidence = 0.45 + min(0.4, 0.06 * len(tags))
+        if ctx.get("ema7_1h_dist_pct") is not None or ctx.get("retracement_pct_15m") is not None:
+            confidence += 0.08
+        return (tags, detail, recommendation, float(clamp(confidence, 0.25, 0.95)))
+    except Exception:
+        return (["diagnostic_error"], detail, "Review diagnostic engine error before making changes.", 0.25)
+
+
+def _evolution_pending_signal_rows(limit: int = 250) -> list[dict]:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                """SELECT e.setup_id, e.session, e.emailed_ts, o.outcome, o.hit_ts, o.evaluated_ts,
+                          s.symbol, s.market_symbol, s.side, s.created_ts, s.entry, s.sl, s.tp, s.alt_target_a, s.alt_target_b,
+                          s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15,
+                          d.decided_ts AS diag_decided_ts, d.outcome AS diag_outcome
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id=e.setup_id
+                   JOIN signals s ON s.setup_id=e.setup_id
+                   LEFT JOIN evolution_diagnostics d ON d.processed_key=('signal:' || e.setup_id)
+                   WHERE UPPER(COALESCE(o.outcome,'')) IN ('WIN_TP','WIN_TP','WIN_TP','LOSS','TP','SL','WIN')
+                     AND (
+                           d.id IS NULL
+                           OR COALESCE(o.hit_ts, o.evaluated_ts, e.emailed_ts, 0) > COALESCE(d.decided_ts, 0) + 1
+                           OR UPPER(COALESCE(o.outcome,'')) <> UPPER(COALESCE(d.outcome,''))
+                         )
+                   ORDER BY COALESCE(o.hit_ts, o.evaluated_ts, e.emailed_ts) ASC
+                   LIMIT ?""",
+                (int(limit),),
+            ).fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _evolution_pending_autotrade_rows(limit: int = 120) -> list[dict]:
+    try:
+        cutoff = float(time.time() - max(30, EVOLUTION_LOOKBACK_DAYS) * 86400.0)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                """SELECT t.trade_id, t.session, t.symbol, t.side, t.opened_ts, t.closed_ts, t.entry, t.sl, t.tp, t.alt_target_a, t.alt_target_b,
+                          t.qty, t.status, t.note, t.pnl_usdt,
+                          d.decided_ts AS diag_decided_ts, d.outcome AS diag_outcome
+                   FROM autotrade_trades t
+                   LEFT JOIN evolution_diagnostics d ON d.processed_key=('autotrade:' || t.trade_id)
+                   WHERE t.opened_ts>0
+                     AND COALESCE(t.opened_ts,0) >= ?
+                     AND (COALESCE(t.closed_ts,0)>0 OR UPPER(COALESCE(t.status,'')) IN ('CLOSED','LOSE','LOSS','WIN'))
+                     AND (
+                           d.id IS NULL
+                           OR COALESCE(t.closed_ts, t.opened_ts, 0) > COALESCE(d.decided_ts, 0) + 1
+                           OR (ABS(COALESCE(t.pnl_usdt,0)) > 0.0000001 AND UPPER(COALESCE(d.outcome,'')) NOT IN ('TP','SL','WIN_TP','WIN_TP','WIN_TP','LOSS'))
+                         )
+                   ORDER BY COALESCE(t.closed_ts, t.opened_ts) ASC
+                   LIMIT ?""",
+                (float(cutoff), int(limit)),
+            ).fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _evolution_resolve_autotrade_outcome(row: dict) -> tuple[str, float]:
+    try:
+        trade = {
+            "symbol": row.get("symbol"),
+            "market_symbol": _market_symbol_from_base(row.get("symbol")),
+            "side": row.get("side"),
+            "entry": row.get("entry"),
+            "sl": row.get("sl"),
+            "tp": row.get("tp"),
+            "alt_target_a": row.get("alt_target_a"),
+            "alt_target_b": row.get("alt_target_b"),
+            "created_ts": float(row.get("opened_ts") or 0.0),
+        }
+        res = evaluate_signal_hit_order(trade, horizon_hours=168, timeframe="1m")
+        outcome = str(res.get("outcome") or "OPEN").upper().strip()
+        decided_ts = float(res.get("hit_ts") or row.get("closed_ts") or 0.0)
+        if outcome in ("WIN_TP", "WIN_TP", "WIN_TP", "LOSS", "TP", "SL"):
+            return outcome, decided_ts
+    except Exception:
+        pass
+    try:
+        pnl = float(row.get("pnl_usdt") or 0.0)
+        if pnl > 0:
+            return "TP", float(row.get("closed_ts") or 0.0)
+        if pnl < 0:
+            return "SL", float(row.get("closed_ts") or 0.0)
+    except Exception:
+        pass
+    return "OPEN", float(row.get("closed_ts") or 0.0)
+
+
+def _evolution_process_new_diagnostics() -> dict:
+    analyzed_setups = 0
+    analyzed_trades = 0
+    new_tags = Counter()
+
+    for row in _evolution_pending_signal_rows(limit=400):
+        outcome = str(row.get("outcome") or "").upper().strip()
+        decided_ts = float(row.get("hit_ts") or row.get("evaluated_ts") or time.time())
+        tags, detail, recommendation, confidence = _evolution_build_signal_diagnostic(row, row.get("session"), outcome, decided_ts, source_type="signal")
+        w, l = _evolution_outcome_winloss(outcome)
+        stored = _evolution_store_diagnostic(
+            processed_key=f"signal:{row.get('setup_id')}",
+            source_type="signal",
+            source_id=str(row.get("setup_id") or ""),
+            session=str(row.get("session") or ""),
+            symbol=str(row.get("symbol") or ""),
+            side=str(row.get("side") or ""),
+            created_ts=float(row.get("created_ts") or row.get("emailed_ts") or 0.0),
+            decided_ts=decided_ts,
+            outcome=outcome,
+            win_flag=bool(w and not l),
+            tags=tags,
+            detail=detail,
+            recommendation=recommendation,
+            confidence=confidence,
+        )
+        if stored:
+            analyzed_setups += 1
+            for tag in tags:
+                new_tags[str(tag)] += 1
+
+    for row in _evolution_pending_autotrade_rows(limit=150):
+        outcome, decided_ts = _evolution_resolve_autotrade_outcome(row)
+        if _evolution_outcome_winloss(outcome) == (0, 0):
+            continue
+        diag_sig = {
+            "symbol": row.get("symbol"),
+            "market_symbol": _market_symbol_from_base(row.get("symbol")),
+            "side": row.get("side"),
+            "entry": row.get("entry"),
+            "sl": row.get("sl"),
+            "tp": row.get("tp"),
+            "alt_target_a": row.get("alt_target_a"),
+            "alt_target_b": row.get("alt_target_b"),
+            "created_ts": float(row.get("opened_ts") or 0.0),
+            "ch24": 0.0,
+            "ch4": 0.0,
+            "ch1": 0.0,
+            "ch15": 0.0,
+            "fut_vol_usd": 0.0,
+        }
+        tags, detail, recommendation, confidence = _evolution_build_signal_diagnostic(diag_sig, row.get("session"), outcome, decided_ts, source_type="autotrade")
+        detail["pnl_usdt"] = float(row.get("pnl_usdt") or 0.0)
+        w, l = _evolution_outcome_winloss(outcome)
+        stored = _evolution_store_diagnostic(
+            processed_key=f"autotrade:{row.get('trade_id')}",
+            source_type="autotrade",
+            source_id=str(row.get("trade_id") or ""),
+            session=str(row.get("session") or ""),
+            symbol=str(row.get("symbol") or ""),
+            side=str(row.get("side") or ""),
+            created_ts=float(row.get("opened_ts") or 0.0),
+            decided_ts=float(decided_ts or row.get("closed_ts") or time.time()),
+            outcome=outcome,
+            win_flag=bool(w and not l),
+            tags=tags,
+            detail=detail,
+            recommendation=recommendation,
+            confidence=confidence,
+        )
+        if stored:
+            analyzed_trades += 1
+            for tag in tags:
+                new_tags[str(tag)] += 1
+
+    return {
+        "analyzed_setups": analyzed_setups,
+        "analyzed_trades": analyzed_trades,
+        "new_tags": dict(new_tags),
+    }
+
+
+def _evolution_weighted_wr_from_signal_outcomes(days: int = 60, session: str | None = None) -> dict:
+    wins = 0
+    losses = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = """SELECT e.session, o.outcome
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id=e.setup_id
+                   WHERE e.emailed_ts>=?"""
+            params = [float(time.time() - max(1, int(days)) * 86400.0)]
+            if session:
+                q += " AND UPPER(COALESCE(e.session,''))=?"
+                params.append(str(session).upper())
+            rows = c.execute(q, tuple(params)).fetchall() or []
+            for r in rows:
+                w, l = _evolution_outcome_winloss(r["outcome"])
+                wins += int(w)
+                losses += int(l)
+    except Exception:
+        pass
+    n = wins + losses
+    return {"wins": wins, "losses": losses, "sample": n, "wr": (wins / n * 100.0) if n > 0 else 0.0}
+
+
+def _evolution_weighted_wr_from_diagnostics(days: int = 60, session: str | None = None, source_type: str | None = None) -> dict:
+    wins = 0
+    losses = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = "SELECT session, source_type, win_flag, outcome FROM evolution_diagnostics WHERE decided_ts>=?"
+            params = [float(time.time() - max(1, int(days)) * 86400.0)]
+            if session:
+                q += " AND UPPER(COALESCE(session,''))=?"
+                params.append(str(session).upper())
+            if source_type:
+                q += " AND source_type=?"
+                params.append(str(source_type))
+            rows = c.execute(q, tuple(params)).fetchall() or []
+            for r in rows:
+                w, l = _evolution_outcome_winloss(r["outcome"])
+                wins += int(w)
+                losses += int(l)
+    except Exception:
+        pass
+    n = wins + losses
+    return {"wins": wins, "losses": losses, "sample": n, "wr": (wins / n * 100.0) if n > 0 else 0.0}
+
+
+
+def _db_save_universe_backtest_run(days: int, session_mode: str, exec_tf: str, universe_snap_id: str, universe_size: int, metrics: dict, per_day: list[dict], per_session: dict, notes: str = '', promoted_context: bool = False) -> str:
+    _opt_migrate_tables()
+    run_id = f"UBT-{int(days)}D-{int(time.time())}"
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO universe_backtest_runs(run_id, created_ts, days, session_mode, exec_tf, universe_snap_id, universe_size, promoted_context, metrics_json, per_day_json, per_session_json, notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(run_id), float(time.time()), int(days), str(session_mode or 'ALL').upper(), str(exec_tf or '15m'), str(universe_snap_id or ''), int(universe_size or 0), 1 if promoted_context else 0, _json_dumps_safe(metrics or {}), _json_dumps_safe(per_day or []), _json_dumps_safe(per_session or {}), str(notes or ''))
+            )
+            conn.commit()
+    except Exception:
+        pass
+    return str(run_id)
+
+
+def _db_get_latest_universe_backtest(days: int | None = None) -> Optional[dict]:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            if days is None:
+                row = c.execute(
+                    "SELECT run_id, created_ts, days, session_mode, exec_tf, universe_snap_id, universe_size, promoted_context, metrics_json, per_day_json, per_session_json, notes FROM universe_backtest_runs ORDER BY created_ts DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT run_id, created_ts, days, session_mode, exec_tf, universe_snap_id, universe_size, promoted_context, metrics_json, per_day_json, per_session_json, notes FROM universe_backtest_runs WHERE days=? ORDER BY created_ts DESC LIMIT 1",
+                    (int(days),)
+                ).fetchone()
+        if not row:
+            return None
+        return {
+            'run_id': str(row[0] or ''),
+            'created_ts': float(row[1] or 0.0),
+            'days': int(row[2] or 0),
+            'session_mode': str(row[3] or 'ALL'),
+            'exec_tf': str(row[4] or '15m'),
+            'universe_snap_id': str(row[5] or ''),
+            'universe_size': int(row[6] or 0),
+            'promoted_context': bool(row[7] or 0),
+            'metrics': _json_loads_safe(row[8], {}),
+            'per_day': _json_loads_safe(row[9], []),
+            'per_session': _json_loads_safe(row[10], {}),
+            'notes': str(row[11] or ''),
+        }
+    except Exception:
+        return None
+
+
+def _session_mode_matches(target: str, sess: str) -> bool:
+    t = str(target or 'ALL').upper().strip()
+    s = str(sess or '').upper().strip()
+    return t in ('', 'ALL', 'ANY', '*') or s == t
+
+
+def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str, session_name: str, eval_since_ts: float | None = None, eval_until_ts: float | None = None) -> dict:
+    ohlcv = _sanitize_ohlcv_rows(ohlcv)
+    if not ohlcv or len(ohlcv) < 300:
+        return {'ok': False, 'error': 'insufficient_ohlcv', 'symbol': symbol, 'tf': tf, 'days': days, 'rows': []}
+    setups = _backtest_generate_setups(symbol, ohlcv, tf, session_name=session_name)
+    if eval_since_ts is not None or eval_until_ts is not None:
+        filtered = []
+        lo = float(eval_since_ts or 0.0)
+        hi = float(eval_until_ts or 0.0) if eval_until_ts is not None else 0.0
+        for s in setups:
+            try:
+                cts = float(getattr(s, 'created_ts', 0.0) or 0.0)
+            except Exception:
+                cts = 0.0
+            if lo and cts < lo:
+                continue
+            if hi and cts > hi:
+                continue
+            filtered.append(s)
+        setups = filtered
+    if not setups:
+        return {'ok': True, 'symbol': symbol, 'tf': tf, 'days': int(days), 'setups': 0, 'trades': 0, 'win_rate': 0.0, 'avg_R': 0.0, 'profit_factor': 0.0, 'max_drawdown_R': 0.0, 'equity_R': 0.0, 'reject_breakdown': dict(_BT_LAST_REJECTS), 'by_session': {}, 'rows': [], 'live_equivalent': {'setups': 0, 'trades': 0, 'win_rate': 0.0, 'avg_R': 0.0, 'profit_factor': 0.0, 'max_drawdown_R': 0.0, 'equity_R': 0.0, 'by_session': {s: {'setups': 0, 'win_rate': 0.0, 'avg_R': 0.0} for s in ('NY', 'LON', 'ASIA')}}}
+    rows = []
+    results = []
+    eq = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    by_session = defaultdict(lambda: {'setups': 0, 'wins': 0, 'losses': 0, 'r': []})
+    live_results = []
+    live_eq = 0.0
+    live_peak = 0.0
+    live_max_dd = 0.0
+    by_session_live = defaultdict(lambda: {'setups': 0, 'wins': 0, 'losses': 0, 'r': []})
+    for s in setups:
+        try:
+            sid = str(getattr(s, 'setup_id', 'BT-0'))
+            i = int(sid.split('-')[-1])
+        except Exception:
+            i = 0
+        try:
+            ts_raw = float((ohlcv[i][0] if i < len(ohlcv) else ohlcv[-1][0]) or 0.0)
+            ts_sec = (ts_raw / 1000.0) if ts_raw > 1e12 else ts_raw
+        except Exception:
+            ts_sec = 0.0
+        try:
+            sess = str(_session_label_from_ts(ts_sec) or '?')
+        except Exception:
+            sess = '?'
+        if eval_since_ts is not None and float(ts_sec) < float(eval_since_ts or 0.0):
+            continue
+        if eval_until_ts is not None and float(ts_sec) > float(eval_until_ts or 0.0):
+            continue
+        res = _simulate_one_setup(ohlcv, i + 1, s)
+        r_mult = float(res.get('R', 0.0) or 0.0)
+        res['R'] = r_mult
+        res['session'] = sess
+        results.append(res)
+        eq += r_mult
+        peak = max(peak, eq)
+        max_dd = max(max_dd, peak - eq)
+        out = str(res.get('outcome') or '').upper().strip()
+        won = out in ('TP', 'TP', 'TP_BE', 'TP_TIMEOUT', 'TP', 'TP')
+        lost = out in ('SL', 'LOSS', 'SL_FIRST', 'TP_SL')
+        by_session[sess]['setups'] += 1
+        by_session[sess]['r'].append(r_mult)
+        if won:
+            by_session[sess]['wins'] += 1
+        elif lost:
+            by_session[sess]['losses'] += 1
+
+        live_ok, live_why = is_executable_setup_eligible(s, session_name=sess if sess in ('NY', 'LON', 'ASIA') else 'NY')
+        if live_ok:
+            live_results.append(res)
+            live_eq += r_mult
+            live_peak = max(live_peak, live_eq)
+            live_max_dd = max(live_max_dd, live_peak - live_eq)
+            by_session_live[sess]['setups'] += 1
+            by_session_live[sess]['r'].append(r_mult)
+            if won:
+                by_session_live[sess]['wins'] += 1
+            elif lost:
+                by_session_live[sess]['losses'] += 1
+
+        entry = float(getattr(s, 'entry', 0.0) or 0.0)
+        sl = float(getattr(s, 'sl', 0.0) or 0.0)
+        final_tp = float(_setup_target_tp(s, 0.0) or 0.0)
+        rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
+        rows.append({
+            'symbol': str(symbol),
+            'setup_id': str(getattr(s, 'setup_id', '') or ''),
+            'ts': float(ts_sec),
+            'day': (datetime.fromtimestamp(float(ts_sec), tz=timezone.utc).strftime('%Y-%m-%d') if ts_sec else ''),
+            'session': str(sess),
+            'outcome': out,
+            'R': float(r_mult),
+            'win': bool(won),
+            'score': float(getattr(s, 'quality_score', 0.0) or 0.0),
+            'conf': int(getattr(s, 'conf', 0) or 0),
+            'engine': str(getattr(s, 'engine', '') or ''),
+            'rr_final': float(rr_final),
+            'live_equivalent': bool(live_ok),
+            'live_reason': str(live_why or ''),
+        })
+    total = len(results)
+    wins = sum(1 for r in results if str(r.get('outcome') or '').upper().strip() in ('TP', 'TP_BE', 'TP_TIMEOUT', 'TP', 'TP'))
+    avg_r = (sum(float(r.get('R', 0.0) or 0.0) for r in results) / total) if total else 0.0
+    gross_win = sum(max(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
+    gross_loss = sum(min(0.0, float(r.get('R', 0.0) or 0.0)) for r in results)
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float('inf') if gross_win > 0 else 0.0)
+    by_sess_out = {}
+    for sess, d in dict(by_session).items():
+        s_n = int(d.get('setups', 0) or 0)
+        s_w = int(d.get('wins', 0) or 0)
+        s_l = int(d.get('losses', 0) or 0)
+        s_dec = s_w + s_l
+        rr = d.get('r') or []
+        by_sess_out[str(sess)] = {
+            'setups': s_n,
+            'wins': s_w,
+            'losses': s_l,
+            'decided': s_dec,
+            'win_rate': float((s_w / s_dec * 100.0) if s_dec else 0.0),
+            'avg_R': float((sum(float(x) for x in rr) / len(rr)) if rr else 0.0),
+        }
+    live_total = len(live_results)
+    live_wins = sum(1 for r in live_results if str(r.get('outcome') or '').upper().strip() in ('TP', 'TP', 'TP_BE', 'TP_TIMEOUT', 'TP', 'TP'))
+    live_avg_r = (sum(float(r.get('R', 0.0) or 0.0) for r in live_results) / live_total) if live_total else 0.0
+    live_gross_win = sum(max(0.0, float(r.get('R', 0.0) or 0.0)) for r in live_results)
+    live_gross_loss = sum(min(0.0, float(r.get('R', 0.0) or 0.0)) for r in live_results)
+    live_pf = (live_gross_win / abs(live_gross_loss)) if live_gross_loss < 0 else (float('inf') if live_gross_win > 0 else 0.0)
+    live_by_sess_out = {}
+    for sess, d in dict(by_session_live).items():
+        s_n = int(d.get('setups', 0) or 0)
+        s_w = int(d.get('wins', 0) or 0)
+        s_l = int(d.get('losses', 0) or 0)
+        s_dec = s_w + s_l
+        rr = d.get('r') or []
+        live_by_sess_out[str(sess)] = {
+            'setups': s_n,
+            'wins': s_w,
+            'losses': s_l,
+            'decided': s_dec,
+            'win_rate': float((s_w / s_dec * 100.0) if s_dec else 0.0),
+            'avg_R': float((sum(float(x) for x in rr) / len(rr)) if rr else 0.0),
+        }
+    return {
+        'ok': True,
+        'symbol': symbol,
+        'tf': tf,
+        'days': int(days),
+        'setups': total,
+        'trades': total,
+        'win_rate': float((wins / total * 100.0) if total else 0.0),
+        'avg_R': float(avg_r),
+        'profit_factor': float(pf),
+        'max_drawdown_R': float(max_dd),
+        'equity_R': float(eq),
+        'reject_breakdown': dict(_BT_LAST_REJECTS),
+        'by_session': by_sess_out,
+        'rows': rows,
+        'live_equivalent': {
+            'setups': live_total,
+            'trades': live_total,
+            'win_rate': float((live_wins / live_total * 100.0) if live_total else 0.0),
+            'avg_R': float(live_avg_r),
+            'profit_factor': float(live_pf),
+            'max_drawdown_R': float(live_max_dd),
+            'equity_R': float(live_eq),
+            'by_session': live_by_sess_out,
+        },
+    }
+
+
+def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | None = None, top_n: int | None = None, min_vol_usd: float | None = None, persist: bool = True, promoted_context: bool = False) -> dict:
+    _opt_migrate_tables()
+    cfg = load_strategy_config(force=False)
+    exec_tf = str(tf or cfg.get('universe_backtest_exec_tf') or cfg.get('exec_tf_default') or '15m').strip().lower()
+    d = max(3, int(days or 7))
+    top_n = int(max(10, top_n or cfg.get('universe_backtest_top_n', 80) or 80))
+    min_vol_usd = float(min_vol_usd or cfg.get('universe_backtest_min_vol_usd', 10000000.0) or 10000000.0)
+    session_mode = str(session_mode or 'ALL').upper().strip()
+    snap = _build_universe_snapshot_top_volume(top_n=top_n, min_vol_usd=min_vol_usd)
+    universe = list(snap.get('market_symbols') or [])[:top_n]
+    tf_min = _tf_to_minutes(exec_tf)
+    warmup_bars = 300
+    since_ms, until_ms, eval_since_ms, eval_until_ms = _backtest_window_bounds(d, end_days_ago=0, warmup_bars=warmup_bars, tf=exec_tf)
+    page_limit = 1000 if tf_min <= 60 else 500
+    rows = []
+    symbol_reports = []
+    reject_acc = Counter()
+    live_reject_acc = Counter()
+    fetch_errors = 0
+    for sym in universe:
+        try:
+            ohl = fetch_ohlcv_paged(sym, exec_tf, since_ms=since_ms, until_ms=until_ms, limit=page_limit)
+            if not ohl:
+                bars = int(min(12000, max(1200, ((d * 1440) / max(1, tf_min)) + 450)))
+                ohl = fetch_ohlcv(sym, exec_tf, limit=bars)
+        except Exception:
+            ohl = []
+            fetch_errors += 1
+        ohl = _sanitize_ohlcv_rows(ohl)
+        try:
+            rep = _run_backtest_on_ohlcv_detailed(sym, ohl, days=d, tf=exec_tf, session_name=session_mode, eval_since_ts=(eval_since_ms / 1000.0), eval_until_ts=(eval_until_ms / 1000.0))
+        except Exception as e:
+            rep = {'ok': False, 'symbol': sym, 'tf': exec_tf, 'days': d, 'rows': [], 'error': f'{type(e).__name__}: {e}'}
+        symbol_reports.append(rep)
+        try:
+            rb = rep.get('reject_breakdown') or {}
+            if isinstance(rb, dict):
+                reject_acc.update(rb)
+        except Exception:
+            pass
+        for rr in (rep.get('rows') or []):
+            if _session_mode_matches(session_mode, rr.get('session')):
+                rows.append(dict(rr))
+                if not bool(rr.get('live_equivalent', False)):
+                    why = str(rr.get('live_reason') or '')
+                    if why:
+                        live_reject_acc[why] += 1
+    raw_overall, raw_per_day, raw_by_session = _summarize_universe_rows(rows, days=float(d), live_only=False)
+    live_overall, live_per_day, live_by_session = _summarize_universe_rows(rows, days=float(d), live_only=True)
+    metrics = {
+        'days': d,
+        'session_mode': session_mode,
+        'exec_tf': exec_tf,
+        'preferred_view': 'live_equivalent',
+        'overall': dict(live_overall),
+        'live_equivalent_overall': dict(live_overall),
+        'raw_overall': dict(raw_overall),
+        'overall_win_rate': float(live_overall.get('win_rate', 0.0) or 0.0),
+        'total_setups': int(live_overall.get('setups', 0) or 0),
+        'avg_setups_per_day': float(live_overall.get('setups_per_day', 0.0) or 0.0),
+        'raw_total_setups': int(raw_overall.get('setups', 0) or 0),
+        'raw_avg_setups_per_day': float(raw_overall.get('setups_per_day', 0.0) or 0.0),
+        'by_session': dict(live_by_session),
+        'live_equivalent_by_session': dict(live_by_session),
+        'raw_by_session': dict(raw_by_session),
+        'universe_size': int(len(universe)),
+        'top_n': int(top_n),
+        'min_vol_usd': float(min_vol_usd),
+        'reject_breakdown': dict(reject_acc),
+        'live_equivalent_reject_breakdown': dict(live_reject_acc),
+        'eval_since_ts': float(eval_since_ms / 1000.0),
+        'eval_until_ts': float(eval_until_ms / 1000.0),
+        'fetch_errors': int(fetch_errors),
+    }
+    run_id = ''
+    if persist:
+        run_id = _db_save_universe_backtest_run(days=d, session_mode=session_mode, exec_tf=exec_tf, universe_snap_id=str(snap.get('snap_id') or ''), universe_size=len(universe), metrics=metrics, per_day=live_per_day, per_session=live_by_session, notes='auto' if promoted_context else 'manual', promoted_context=bool(promoted_context))
+    return {
+        'ok': True,
+        'run_id': run_id,
+        'days': d,
+        'session_mode': session_mode,
+        'exec_tf': exec_tf,
+        'universe_snap_id': str(snap.get('snap_id') or ''),
+        'universe_size': int(len(universe)),
+        'metrics': metrics,
+        'overall': dict(live_overall),
+        'raw_overall': dict(raw_overall),
+        'per_day': live_per_day,
+        'raw_per_day': raw_per_day,
+        'per_session': live_by_session,
+        'raw_per_session': raw_by_session,
+        'symbol_reports': symbol_reports,
+    }
+
+
+def _format_universe_backtest_report(rep: dict) -> str:
+    if not rep:
+        return 'No universe backtest report.'
+    metrics = rep.get('metrics') or {}
+    overall = rep.get('overall') or metrics.get('overall') or {}
+    raw_overall = rep.get('raw_overall') or metrics.get('raw_overall') or {}
+    per_session = rep.get('per_session') or metrics.get('by_session') or {}
+    raw_per_session = rep.get('raw_per_session') or metrics.get('raw_by_session') or {}
+    per_day = list(rep.get('per_day') or [])
+    raw_per_day = list(rep.get('raw_per_day') or [])
+    lines = [
+        f"🌐 Universe Backtest — {int(rep.get('days') or metrics.get('days') or 0)}d",
+        HDR,
+        f"TF: {str(rep.get('exec_tf') or metrics.get('exec_tf') or '15m')} | Session: {str(rep.get('session_mode') or metrics.get('session_mode') or 'ALL')} | Universe: {int(rep.get('universe_size') or metrics.get('universe_size') or 0)}",
+        f"Window: {datetime.fromtimestamp(float(metrics.get('eval_since_ts', 0.0) or 0.0), tz=timezone.utc).strftime('%Y-%m-%d') if float(metrics.get('eval_since_ts', 0.0) or 0.0) > 0 else '?'} → {datetime.fromtimestamp(float(metrics.get('eval_until_ts', 0.0) or 0.0), tz=timezone.utc).strftime('%Y-%m-%d') if float(metrics.get('eval_until_ts', 0.0) or 0.0) > 0 else '?'} | Fetch errors: {int(metrics.get('fetch_errors', 0) or 0)}",
+        f"Raw setups: {int(raw_overall.get('setups', 0) or 0)} | Avg/day: {float(raw_overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(raw_overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(raw_overall.get('avg_R', 0.0) or 0.0):.3f}",
+        f"Live-equivalent setups: {int(overall.get('setups', 0) or 0)} | Avg/day: {float(overall.get('setups_per_day', 0.0) or 0.0):.2f} | WR: {float(overall.get('win_rate', 0.0) or 0.0):.1f}% | AvgR: {float(overall.get('avg_R', 0.0) or 0.0):.3f}",
+        'Per session (raw -> live-equivalent):',
+    ]
+    for sess in ('NY','LON','ASIA'):
+        rd = raw_per_session.get(sess) or {}
+        ld = per_session.get(sess) or {}
+        lines.append(f"• {sess}: raw={int(rd.get('setups',0) or 0)} @ WR {float(rd.get('win_rate',0.0) or 0.0):.1f}% | live={int(ld.get('setups',0) or 0)} @ WR {float(ld.get('win_rate',0.0) or 0.0):.1f}%")
+    if per_day or raw_per_day:
+        lines.append('Per day (raw -> live-equivalent):')
+        live_map = {str(r.get('day') or ''): r for r in per_day}
+        for row in raw_per_day[:35]:
+            day = str(row.get('day') or '')
+            live_row = live_map.get(day) or {}
+            rbs = row.get('by_session') or {}
+            lbs = live_row.get('by_session') or {}
+            lines.append(
+                f"• {day}: raw={int(row.get('setups',0) or 0)} WR={float(row.get('win_rate',0.0) or 0.0):.1f}% | live={int(live_row.get('setups',0) or 0)} WR={float(live_row.get('win_rate',0.0) or 0.0):.1f}% | raw NY/LON/ASIA={int(rbs.get('NY',0) or 0)}/{int(rbs.get('LON',0) or 0)}/{int(rbs.get('ASIA',0) or 0)} | live NY/LON/ASIA={int(lbs.get('NY',0) or 0)}/{int(lbs.get('LON',0) or 0)}/{int(lbs.get('ASIA',0) or 0)}"
+            )
+    rej = metrics.get('live_equivalent_reject_breakdown') or {}
+    if isinstance(rej, dict) and rej:
+        top = sorted(rej.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:6]
+        lines.append('Top live-equivalent blockers:')
+        for k, v in top:
+            lines.append(f"• {k} = {int(v or 0)}")
+    return "\n".join(lines)
+
+
+async def cmd_universe_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text('Admin only.')
+        return
+    args = list(context.args or [])
+    days = 7
+    session_mode = 'ALL'
+    tf = None
+    top_n = None
+    if args:
+        try:
+            days = _parse_days(args[0])
+        except Exception:
+            days = 7
+    if len(args) >= 2:
+        session_mode = str(args[1] or 'ALL').upper().strip()
+    if len(args) >= 3:
+        tf = str(args[2] or '').strip() or None
+    if len(args) >= 4:
+        try:
+            top_n = int(args[3])
+        except Exception:
+            top_n = None
+    if int(days) not in (7, 30):
+        await update.message.reply_text('Use /universe_backtest 7 or /universe_backtest 30 [ALL|NY|LON|ASIA] [tf] [topN]')
+        return
+    if _goal_profile_is_running():
+        await update.message.reply_text('⏸️ Universe backtest is blocked while the goal-profile optimizer is running. Use /goal_status or /goal_abort first.')
+        return
+    await update.message.reply_text(f'⏳ Running {int(days)}d universe backtest…')
+    try:
+        rep = await to_thread_heavy(run_universe_backtest, int(days), session_mode, tf, top_n, None, True, False)
+        await send_long_message(update, _format_universe_backtest_report(rep), parse_mode=None)
+    except Exception as e:
+        await update.message.reply_text(f'Universe backtest failed: {type(e).__name__}: {e}')
+
+
+def _evolution_optimizer_wr(session: str | None = None) -> dict:
+    report = load_opt_report() or {}
+    metrics = report.get("metrics") or {}
+    oos = metrics.get("oos") or {}
+    if session:
+        oos = (metrics.get("by_session") or {}).get(str(session).upper(), {}) or {}
+    sample = int(oos.get("setups", 0) or 0)
+    wr = float(oos.get("win_rate", 0.0) or 0.0)
+    return {"wins": int(round(sample * wr / 100.0)), "losses": max(0, sample - int(round(sample * wr / 100.0))), "sample": sample, "wr": wr}
+
+
+def _evolution_estimated_win_rate(session: str | None = None) -> dict:
+    """Current best-estimate win rate.
+
+    Methodology (kept intentionally explicit for live-account trustworthiness):
+    1) Use recent *live* evidence first (autotrade diagnostics + signal outcomes).
+    2) Use optimization OOS results only as a light stabilizer, never as the dominant source.
+    3) Convert all sources into wins/losses, then combine them through a Beta posterior.
+       This prevents tiny recent samples from producing misleading win-rate swings.
+    4) OOS/backtest evidence is sample-capped so live production evidence dominates when available.
+    """
+    sig = _evolution_weighted_wr_from_signal_outcomes(days=EVOLUTION_LOOKBACK_DAYS, session=session)
+    live_auto = _evolution_weighted_wr_from_diagnostics(days=EVOLUTION_LOOKBACK_DAYS, session=session, source_type="autotrade")
+    opt = _evolution_optimizer_wr(session=session)
+    ubt7 = _db_get_latest_universe_backtest(7) or {}
+    ubt30 = _db_get_latest_universe_backtest(30) or {}
+
+    # Base prior uses optimizer OOS if available; otherwise a conservative neutral prior.
+    prior_wr = float(opt.get("wr", 55.0) or 55.0) / 100.0 if int(opt.get("sample", 0) or 0) >= 20 else 0.55
+    prior_strength = 20.0
+    alpha = 1.0 + prior_wr * prior_strength
+    beta = 1.0 + (1.0 - prior_wr) * prior_strength
+
+    # Live evidence dominates.
+    alpha += float(sig.get("wins", 0) or 0)
+    beta += float(sig.get("losses", 0) or 0)
+    alpha += float(live_auto.get("wins", 0) or 0) * 1.2
+    beta += float(live_auto.get("losses", 0) or 0) * 1.2
+
+    # OOS evidence is capped so backtests cannot overwhelm live production reality.
+    oos_cap = min(25.0, float(opt.get("sample", 0) or 0) * 0.25)
+    if oos_cap > 0:
+        oos_wr = float(opt.get("wr", 0.0) or 0.0) / 100.0
+        alpha += oos_cap * oos_wr
+        beta += oos_cap * (1.0 - oos_wr)
+
+    for ubt, cap in ((ubt7, 12.0), (ubt30, 18.0)):
+        try:
+            met = (ubt or {}).get('metrics') or {}
+            ov = met.get('overall') or {}
+            sample = float(ov.get('setups', 0) or 0)
+            wr = float(ov.get('win_rate', 0.0) or 0.0) / 100.0
+            applied = min(cap, sample * 0.10)
+            if applied > 0 and wr > 0:
+                alpha += applied * wr
+                beta += applied * (1.0 - wr)
+        except Exception:
+            continue
+
+    est = float(alpha / max(1e-9, (alpha + beta)) * 100.0)
+    live_sample = int(sig.get("sample", 0) or 0) + int(live_auto.get("sample", 0) or 0)
+    confidence = "low"
+    if live_sample >= 40:
+        confidence = "high"
+    elif live_sample >= 15:
+        confidence = "medium"
+    return {
+        "estimated_wr": est,
+        "confidence": confidence,
+        "live_sample": live_sample,
+        "signal_sample": int(sig.get("sample", 0) or 0),
+        "autotrade_sample": int(live_auto.get("sample", 0) or 0),
+        "optimizer_sample": int(opt.get("sample", 0) or 0),
+        "universe_backtest_7d": (ubt7.get('metrics') or {}),
+        "universe_backtest_30d": (ubt30.get('metrics') or {}),
+        "components": {
+            "signals": sig,
+            "autotrade": live_auto,
+            "optimizer_oos": opt,
+            "universe_backtest_7d": ubt7.get('metrics') or {},
+            "universe_backtest_30d": ubt30.get('metrics') or {},
+        },
+    }
+
+
+def _evolution_period_wr(days: int, offset_days: int = 0, session: str | None = None) -> float:
+    try:
+        ts_to = float(time.time() - max(0, int(offset_days)) * 86400.0)
+        ts_from = float(ts_to - max(1, int(days)) * 86400.0)
+        wins = 0
+        losses = 0
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = """SELECT e.session, o.outcome
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id=e.setup_id
+                   WHERE e.emailed_ts>=? AND e.emailed_ts<?"""
+            params = [ts_from, ts_to]
+            if session:
+                q += " AND UPPER(COALESCE(e.session,''))=?"
+                params.append(str(session).upper())
+            rows = c.execute(q, tuple(params)).fetchall() or []
+            for r in rows:
+                w, l = _evolution_outcome_winloss(r["outcome"])
+                wins += w
+                losses += l
+        total = wins + losses
+        return (wins / total * 100.0) if total > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _evolution_trend_label(current_wr: float, previous_wr: float) -> str:
+    delta = float(current_wr) - float(previous_wr)
+    if delta >= 3.0:
+        return "improving"
+    if delta <= -3.0:
+        return "degrading"
+    return "stable"
+
+
+def _evolution_build_snapshot() -> dict:
+    overall = _evolution_estimated_win_rate(session=None)
+    ny = _evolution_estimated_win_rate(session="NY")
+    curr14 = _evolution_period_wr(14, offset_days=0)
+    prev14 = _evolution_period_wr(14, offset_days=14)
+    curr14_ny = _evolution_period_wr(14, offset_days=0, session="NY")
+    prev14_ny = _evolution_period_wr(14, offset_days=14, session="NY")
+    curr7 = _evolution_period_wr(7, offset_days=0)
+    prev7 = _evolution_period_wr(7, offset_days=7)
+    curr7_ny = _evolution_period_wr(7, offset_days=0, session="NY")
+    prev7_ny = _evolution_period_wr(7, offset_days=7, session="NY")
+    tag_ctr = _evolution_tag_counter(days=30, losses_only=True)
+    ny_tag_ctr = _evolution_tag_counter(days=30, session="NY", losses_only=True)
+    recs = _evolution_list_open_recommendations(limit=5)
+    cfg = load_strategy_config(force=True)
+    last_hourly = _evolution_get_last_run("hourly")
+    last_daily = _evolution_get_last_run("daily")
+
+    auto_applied_last = _evolution_state_get("last_auto_adjustment", {}) or {}
+    status = "stable"
+    if float(ny.get("estimated_wr", 0.0) or 0.0) < 58.0 or _evolution_trend_label(curr14_ny, prev14_ny) == "degrading":
+        status = "needs_intervention"
+    elif float(overall.get("estimated_wr", 0.0) or 0.0) >= 65.0 and _evolution_trend_label(curr14, prev14) != "degrading":
+        status = "healthy"
+
+    entry_issue_present = any(tag_ctr.get(k, 0) >= 4 for k in (
+        "entry_too_extended", "entry_too_late_after_breakout", "entry_far_from_ema", "pullback_too_shallow"
+    ))
+
+    snapshot = {
+        "updated_ts": float(time.time()),
+        "overall": overall,
+        "ny": ny,
+        "trend": {
+            "overall": _evolution_trend_label(curr14, prev14),
+            "ny": _evolution_trend_label(curr14_ny, prev14_ny),
+            "overall_7d": _evolution_trend_label(curr7, prev7),
+            "ny_7d": _evolution_trend_label(curr7_ny, prev7_ny),
+            "current14_wr": curr14,
+            "previous14_wr": prev14,
+            "current14_ny_wr": curr14_ny,
+            "previous14_ny_wr": prev14_ny,
+            "current7_wr": curr7,
+            "previous7_wr": prev7,
+            "current7_ny_wr": curr7_ny,
+            "previous7_ny_wr": prev7_ny,
+        },
+        "top_failure_tags": tag_ctr.most_common(6),
+        "top_failure_tags_ny": ny_tag_ctr.most_common(6),
+        "open_recommendations": recs,
+        "auto_applied_last": auto_applied_last,
+        "status": status,
+        "entry_issue_present": bool(entry_issue_present),
+        "last_hourly": last_hourly,
+        "last_daily": last_daily,
+        "quality_floor_email": float(cfg.get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
+        "min_rr_tp": float(cfg.get("min_rr_tp", cfg.get("min_rr_tp", MIN_RR_TP)) or MIN_RR_TP),
+    }
+    _evolution_state_set("snapshot", snapshot)
+    return snapshot
+
+
+def _evolution_safe_apply_adjustments(snapshot: dict) -> list[dict]:
+    actions = []
+    tag_ctr = Counter(dict(snapshot.get("top_failure_tags") or []))
+    cfg = load_strategy_config(force=True)
+    bounds = cfg.get("opt_bounds") or {}
+    now = float(time.time())
+    last_adj = float((cfg.get("governor_last_adjust_ts", 0.0) or 0.0))
+    last_auto = _evolution_state_get("last_auto_adjustment", {}) or {}
+    last_auto_ts = float(last_auto.get("ts", 0.0) or 0.0)
+    if (now - max(last_adj, last_auto_ts)) < (EVOLUTION_AUTO_APPLY_COOLDOWN_HOURS * 3600.0):
+        return actions
+
+    def _bounded_set(key: str, delta: float, reason_tag: str, recommendation_text: str, confidence: float):
+        nonlocal cfg, actions
+        lo, hi = (bounds.get(key) or [None, None])
+        if lo is None or hi is None:
+            return
+        old = float(cfg.get(key, 0.0) or 0.0)
+        new = _clamp(old + float(delta), float(lo), float(hi))
+        if abs(new - old) < 1e-9:
+            return
+        cfg[key] = float(new)
+        action = {
+            "param": key,
+            "from": old,
+            "to": new,
+            "reason_tag": reason_tag,
+            "confidence": float(confidence),
+        }
+        actions.append(action)
+        _evolution_insert_recommendation(
+            scope="strategy_config",
+            recommendation=recommendation_text,
+            evidence={"tag": reason_tag, "count": int(tag_ctr.get(reason_tag, 0)), "snapshot_status": snapshot.get("status")},
+            confidence=float(confidence),
+            auto_applied=True,
+            action=action,
+            status="APPLIED",
+        )
+
+    # Tighten entry quality if repeated stretched-entry losses persist.
+    if int(tag_ctr.get("entry_too_extended", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
+        _bounded_set(
+            "quality_score_min_email",
+            +1.0,
+            "entry_too_extended",
+            "Auto-adjustment: raised email quality floor after repeated stretched-entry stop-outs.",
+            0.74,
+        )
+    if int(tag_ctr.get("entry_far_from_ema", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
+        _bounded_set(
+            "tf_align_1h_min_abs",
+            +0.05,
+            "entry_far_from_ema",
+            "Auto-adjustment: tightened 1H alignment floor after repeated entries too far from the EMA rail.",
+            0.71,
+        )
+    if int(tag_ctr.get("rr_too_ambitious", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
+        _bounded_set(
+            "quality_score_min_email",
+            +1.0,
+            "rr_too_ambitious",
+            "Auto-adjustment: tightened email quality after repeated evidence that setups were not strong enough to justify ambitious final targets.",
+            0.69,
+        )
+    if int(tag_ctr.get("pullback_too_shallow", 0)) >= int(EVOLUTION_AUTO_APPLY_MIN_LOSS_DIAGS):
+        _bounded_set(
+            "quality_score_min_screen",
+            +1.0,
+            "pullback_too_shallow",
+            "Auto-adjustment: tightened screen quality floor after repeated shallow-pullback failures.",
+            0.67,
+        )
+
+    if actions:
+        save_strategy_config(cfg)
+        apply_strategy_config(cfg)
+        _evolution_state_set("last_auto_adjustment", {"ts": now, "actions": actions})
+    return actions
+
+
+def _evolution_generate_recommendations(snapshot: dict) -> list[str]:
+    tag_ctr = Counter(dict(snapshot.get("top_failure_tags") or []))
+    recs = []
+    if int(tag_ctr.get("asia_session", 0)) >= 6 and float(snapshot.get("ny", {}).get("estimated_wr", 0.0) or 0.0) > float(snapshot.get("overall", {}).get("estimated_wr", 0.0) or 0.0):
+        txt = "Recommendation: restrict ASIA more aggressively until its loss patterns improve relative to New York."
+        recs.append(txt)
+        _evolution_insert_recommendation("session", txt, {"tag": "asia_session", "count": int(tag_ctr.get("asia_session", 0))}, 0.72)
+    if int(tag_ctr.get("ny_breakout_chase_risk", 0)) >= 5:
+        txt = "Recommendation: in New York, require stronger volume expansion / confirmation before allowing fast breakout-chase entries."
+        recs.append(txt)
+        _evolution_insert_recommendation("ny", txt, {"tag": "ny_breakout_chase_risk", "count": int(tag_ctr.get("ny_breakout_chase_risk", 0))}, 0.70)
+    if int(tag_ctr.get("thin_liquidity_context", 0)) >= 5:
+        txt = "Recommendation: deprioritize thinner names when multiple liquid alternatives exist."
+        recs.append(txt)
+        _evolution_insert_recommendation("universe", txt, {"tag": "thin_liquidity_context", "count": int(tag_ctr.get("thin_liquidity_context", 0))}, 0.65)
+    return recs
+
+
+def _run_evolution_cycle(cycle_type: str) -> dict:
+    _evolution_migrate_tables()
+    run_id = _evolution_new_run(cycle_type)
+    notes = ""
+    try:
+        processed = _evolution_process_new_diagnostics()
+        snapshot = _evolution_build_snapshot()
+        actions = []
+        recs = []
+        if str(cycle_type).lower() == "daily":
+            actions = _evolution_safe_apply_adjustments(snapshot)
+            recs = _evolution_generate_recommendations(snapshot)
+        findings = {
+            "new_tags": processed.get("new_tags") or {},
+            "top_failure_tags": snapshot.get("top_failure_tags") or [],
+            "top_failure_tags_ny": snapshot.get("top_failure_tags_ny") or [],
+            "recommendations_created": recs,
+        }
+        metrics = {
+            "overall": snapshot.get("overall") or {},
+            "ny": snapshot.get("ny") or {},
+            "trend": snapshot.get("trend") or {},
+            "status": snapshot.get("status") or "unknown",
+        }
+        _evolution_finish_run(
+            run_id,
+            "DONE",
+            int(processed.get("analyzed_setups", 0) or 0),
+            int(processed.get("analyzed_trades", 0) or 0),
+            findings,
+            metrics,
+            actions,
+            notes,
+        )
+        _evolution_state_set(f"last_{str(cycle_type).lower()}_cycle", {"run_id": run_id, "ts": time.time()})
+        return {
+            "run_id": run_id,
+            "processed": processed,
+            "snapshot": snapshot,
+            "actions": actions,
+            "recommendations": recs,
+            "ok": True,
+        }
+    except Exception as e:
+        notes = f"{type(e).__name__}: {e}"
+        _evolution_finish_run(run_id, "FAILED", 0, 0, {}, {}, [], notes)
+        return {"run_id": run_id, "ok": False, "error": notes}
+
+
+async def evolution_hourly_job(context: ContextTypes.DEFAULT_TYPE):
+    if not EVOLUTION_ENABLED:
+        return
+    try:
+        _hb_touch('learning_hourly', ok=True, details='cycle_start')
+        res = await to_thread_heavy(_run_evolution_cycle, "hourly")
+        if isinstance(res, dict) and res.get("ok"):
+            _evolution_state_set("last_hourly_snapshot", res.get("snapshot") or {})
+            _hb_touch('learning_hourly', ok=True, details='cycle_ok')
+    except Exception as e:
+        _hb_touch('learning_hourly', ok=False, error=f"{type(e).__name__}: {e}", details='cycle_error')
+        pass
+
+
+async def evolution_daily_job(context: ContextTypes.DEFAULT_TYPE):
+    if not EVOLUTION_ENABLED:
+        return
+    try:
+        _hb_touch('learning_daily', ok=True, details='cycle_start')
+        res = await to_thread_heavy(_run_evolution_cycle, "daily")
+        if isinstance(res, dict) and res.get("ok"):
+            snap = res.get("snapshot") or {}
+            if getattr(context, "bot", None):
+                msg = (
+                    "🧠 Evolution daily cycle complete\n"
+                    f"Overall WR est: {float((snap.get('overall') or {}).get('estimated_wr', 0.0) or 0.0):.1f}%\n"
+                    f"NY WR est: {float((snap.get('ny') or {}).get('estimated_wr', 0.0) or 0.0):.1f}%\n"
+                    f"Trend: overall {((snap.get('trend') or {}).get('overall') or 'n/a')} | NY {((snap.get('trend') or {}).get('ny') or 'n/a')}\n"
+                    f"Auto-adjustments: {len(res.get('actions') or [])}"
+                )
+                try:
+                    await _notify_admins_autonomous_opt(context.bot, msg)
+                except Exception:
+                    pass
+            _hb_touch('learning_daily', ok=True, details='cycle_ok')
+    except Exception as e:
+        _hb_touch('learning_daily', ok=False, error=f"{type(e).__name__}: {e}", details='cycle_error')
+        pass
+
+
+def _evolution_snapshot_cached() -> dict:
+    """Return the latest stored evolution snapshot without running a fresh cycle inline.
+
+    Admin status commands must stay responsive. Running a full evolution cycle here can block
+    the main event loop for seconds and starve setup-generation jobs. Background jobs are
+    responsible for refreshing the stored snapshots.
+    """
+    snap = _evolution_state_get("snapshot", {}) or {}
+    if snap:
+        return snap
+    snap = _evolution_state_get("last_hourly_snapshot", {}) or {}
+    if snap:
+        return snap
+    snap = _evolution_state_get("last_daily_snapshot", {}) or {}
+    if snap:
+        return snap
+    return {}
+
+
+def _fmt_wr_block(title: str, item: dict) -> str:
+    return (
+        f"{title}: {float(item.get('estimated_wr', 0.0) or 0.0):.1f}%"
+        f" (confidence: {str(item.get('confidence') or 'low')}, live sample: {int(item.get('live_sample', 0) or 0)})"
+    )
+
+
+async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    uid = int(update.effective_user.id)
+    snap = await to_thread_fast(_evolution_snapshot_cached)
+    if not snap:
+        await update.message.reply_text("No evolution snapshot yet.")
+        return
+
+    overall = snap.get("overall") or {}
+    ny = snap.get("ny") or {}
+    trend = snap.get("trend") or {}
+    last_opt = _db_get_last_opt_run() or {}
+    opt_res = _db_get_opt_result(str(last_opt.get("run_id") or "")) if last_opt else {}
+    verdict, blockers = _admin_assurance_verdict(uid)
+    opt_live = bool((opt_res or {}).get("promoted"))
+    owner = int(AUTOTRADE_OWNER_UID or uid)
+    overall_sig = _signal_wr_display_metrics(owner)
+    ny_sig = _signal_wr_display_metrics(owner, session='NY')
+
+    lines = [
+        "🧠 Edge Status",
+        HDR,
+        f"Engine verdict: {'HEALTHY' if verdict == 'HEALTHY' else 'ATTENTION NEEDED'}" + (f" | {'; '.join(blockers[:3])}" if blockers else ""),
+        f"Learning engine: {'ON' if EVOLUTION_ENABLED else 'OFF'}",
+        f"Optimizer engine: {'ON' if AUTONOMOUS_OPT_ENABLED else 'OFF'}",
+        f"Auto-trading engine: {'ON' if _autotrade_ready() else 'OFF'}",
+        f"Email pipeline: {'ON' if EMAIL_ENABLED and email_config_ok() else 'OFF'}",
+        SEP,
+        f"Overall signal WR: {float(overall_sig.get('binary_win_rate') or 0.0):.1f}% ({int(overall_sig.get('wins') or 0)}W / {int(overall_sig.get('losses') or 0)}L)",
+        f"New York signal WR: {float(ny_sig.get('binary_win_rate') or 0.0):.1f}% ({int(ny_sig.get('wins') or 0)}W / {int(ny_sig.get('losses') or 0)}L)",
+        f"Weighted TP-stage WR: {float(overall_sig.get('weighted_win_rate') or 0.0):.1f}%",
+        f"Trend vs prior 7d: overall {str(trend.get('overall_7d') or trend.get('overall') or 'n/a')} | NY {str(trend.get('ny_7d') or trend.get('ny') or 'n/a')}",
+        f"Latest optimizer result: {'PROMOTED TO LIVE PARAMS' if opt_live else 'NO NEW LIVE PARAMS PROMOTED'}",
+        f"Detailed learning view: /learning_status",
+    ]
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+
+def _canon_signal_outcome_label(outcome: str, pnl: float | None = None) -> str:
+    """Canonical user-facing outcome model: TP, SL, OPEN, UNTRACKED."""
+    o = str(outcome or '').upper().strip()
+    if o in {'UNTRACKED', 'UNTRACKED_OPEN', 'SKIPPED', 'NOT_TRADED'}:
+        return 'UNTRACKED'
+    try:
+        pnl_f = None if pnl is None else float(pnl)
+    except Exception:
+        pnl_f = None
+    if o in {'TP', 'TP', 'TP', 'WIN_TP', 'WIN_TP', 'WIN_TP', 'WIN'}:
+        return 'TP'
+    if o in {'SL', 'LOSS', 'SL_FIRST', 'TP_SL'}:
+        return 'SL'
+    if o in {'BREAKEVEN', 'BE'}:
+        return 'OPEN'
+    if o.startswith('MANUAL_CLOSE_POSITIVE'):
+        return 'TP'
+    if o.startswith('MANUAL_CLOSE_NEGATIVE'):
+        return 'SL'
+    if pnl_f is not None:
+        if pnl_f < 0:
+            return 'SL'
+        if pnl_f > 0:
+            return 'TP'
+    return 'OPEN'
+    if o.startswith('MANUAL_CLOSE_POSITIVE'):
+        return 'TP'
+    if o.startswith('MANUAL_CLOSE_NEGATIVE'):
+        return 'SL'
+    if pnl_f is not None:
+        if pnl_f < 0:
+            return 'SL'
+        if pnl_f > 0:
+            return 'TP'
+    return 'OPEN'
+
+
+def _estimate_trade_r_multiple(trade: dict) -> float | None:
+    try:
+        entry = float(trade.get('entry') or 0.0)
+        sl = float(trade.get('sl') or 0.0)
+        qty = abs(float(trade.get('qty') or 0.0))
+        pnl = float(trade.get('pnl_usdt') if trade.get('pnl_usdt') is not None else trade.get('pnl') or 0.0)
+        risk = abs(entry - sl) * qty
+        if entry <= 0 or sl <= 0 or qty <= 0 or risk <= 0:
+            return None
+        return float(pnl / risk)
+    except Exception:
+        return None
+
+
+def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = None, exchange_events: list[dict] | None = None) -> str:
+    """Classify a trade into TP / SL / OPEN using journal + live Bybit state."""
+    try:
+        pnl = float(trade.get('pnl_usdt') if trade.get('pnl_usdt') is not None else trade.get('pnl') or 0.0)
+    except Exception:
+        pnl = 0.0
+    raw = str(trade.get('outcome') or '').upper().strip()
+    status = str(trade.get('status') or '').upper().strip()
+
+    if raw in {'WIN_TP', 'WIN_TP', 'WIN_TP', 'TP', 'TP', 'TP'}:
+        return 'TP'
+    if raw in {'LOSS', 'SL', 'SL_FIRST', 'TP_SL'}:
+        return 'SL'
+
+    if live_pos is not None or status == 'OPEN':
+        return 'OPEN'
+
+    if pnl > 0:
+        return 'TP'
+    if pnl < 0:
+        return 'SL'
+    return 'OPEN'
+
+    # Closed trade with no explicit TP-stage label: use exchange events and realized pnl.
+    if abs(pnl) < 1e-9 and exchange_events:
+        try:
+            pnl = float(sum(float((ev or {}).get('pnl') or 0.0) for ev in (exchange_events or [])))
+        except Exception:
+            pnl = 0.0
+    if pnl < 0:
+        return 'SL'
+    if abs(pnl) < 1e-9:
+        return 'OPEN'
+
+    r_mult = _estimate_trade_r_multiple(trade)
+    try:
+        entry = float(trade.get('entry') or 0.0)
+        sl = float(trade.get('sl') or 0.0)
+        tp = float(trade.get('tp') or 0.0)
+        alt_target_a = float(trade.get('alt_target_a') or 0.0)
+        risk_per_unit = abs(entry - sl)
+        rr1 = (abs(tp - entry) / risk_per_unit) if risk_per_unit > 0 and tp > 0 else 0.0
+        rr2 = (abs(alt_target_a - entry) / risk_per_unit) if risk_per_unit > 0 and alt_target_a > 0 else 0.0
+        partial_fraction = max(0.25, min(0.85, float(AUTOTRADE_LIVE_TP_FRACTION or 0.65)))
+        tp_credit = partial_fraction * rr1 if rr1 > 0 else 0.0
+        alt_target_a_credit = tp_credit + ((1.0 - partial_fraction) * rr2 if rr2 > 0 else 0.0)
+    except Exception:
+        tp_credit = 0.0
+        alt_target_a_credit = 0.0
+
+    if r_mult is not None:
+        if alt_target_a_credit > 0 and r_mult >= max(alt_target_a_credit * 0.80, tp_credit + 0.05):
+            return 'TP'
+        if tp_credit > 0 and r_mult >= max(tp_credit * 0.55, 0.05):
+            return 'TP'
+    return 'TP'
+
+
+def _signal_report_setup_meta(setup_id: str) -> dict:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return {}
+    try:
+        sig = db_get_signal(sid) or {}
+    except Exception:
+        sig = {}
+    if sig:
+        return {
+            'symbol': _bybit_linear_symbol(str(sig.get('symbol') or '')),
+            'side': _norm_trade_side(str(sig.get('side') or '')),
+            'created_ts': float(sig.get('created_ts') or 0.0),
+            'conf': sig.get('conf'),
+        }
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            row = cur.execute(
+                """SELECT symbol, side, created_ts, conf FROM generated_setups
+                   WHERE setup_id=? ORDER BY created_ts DESC LIMIT 1""",
+                (sid,),
+            ).fetchone()
+            if row:
+                return {
+                    'symbol': _bybit_linear_symbol(str(row['symbol'] or '')),
+                    'side': _norm_trade_side(str(row['side'] or '')),
+                    'created_ts': float(row['created_ts'] or 0.0),
+                    'conf': row['conf'],
+                }
+    except Exception:
+        pass
+    return {}
+
+
+def _signal_report_load_recent_trades(user_id: int, limit: int = 1000) -> list[dict]:
+    rows_out: list[dict] = []
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            rows = cur.execute(
+                """SELECT * FROM autotrade_trades
+                   WHERE uid=?
+                   ORDER BY COALESCE(closed_ts, opened_ts, 0) DESC
+                   LIMIT ?""",
+                (int(user_id), int(limit)),
+            ).fetchall() or []
+        rows_out.extend(dict(r) for r in rows)
+    except Exception:
+        pass
+    try:
+        # Include exchange-reconstructed provisional closes so /signal_report can use real Bybit
+        # close events even when the original setup_id -> trade_id chain is missing.
+        prov = _autotrade_reconstruct_provisional_closes(int(user_id), days=7) or []
+        for p in prov:
+            d = dict(p)
+            d.setdefault('trade_id', f"prov::{d.get('setup_id') or d.get('symbol') or ''}::{int(float(d.get('closed_ts') or 0))}")
+            d.setdefault('status', 'CLOSED')
+            d.setdefault('pnl_usdt', d.get('pnl'))
+            rows_out.append(d)
+    except Exception:
+        pass
+    rows_out.sort(key=lambda r: float(r.get('closed_ts') or r.get('opened_ts') or 0.0), reverse=True)
+    return rows_out[: max(1, int(limit))]
+
+
+def _signal_report_find_trade_for_setup(user_id: int, symbol: str, side: str, ref_ts: float = 0.0) -> dict | None:
+    sym = _bybit_linear_symbol(symbol)
+    sd = _norm_trade_side(side)
+    if not sym or not sd:
+        return None
+    rows = _signal_report_load_recent_trades(int(user_id), limit=1000)
+    cands = []
+    for r in rows:
+        if _norm_trade_side(str(r.get('side') or '')) != sd:
+            continue
+        if not _symbol_match_loose(str(r.get('symbol') or ''), sym):
+            continue
+        cands.append(r)
+    if not cands:
+        return None
+    if float(ref_ts or 0.0) > 0:
+        def score(r):
+            opened = float(r.get('opened_ts') or 0.0)
+            closed = float(r.get('closed_ts') or 0.0)
+            nearest = min(abs(opened - float(ref_ts)), abs(closed - float(ref_ts)) if closed > 0 else 10**18)
+            return (0 if nearest <= 7 * 86400 else 1, nearest, -opened)
+        cands.sort(key=score)
+    return dict(cands[0]) if cands else None
+
+
+def _signal_report_exchange_events_by_key(ts_from: float) -> dict[tuple[str, str], list[dict]]:
+    out: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    if str(AUTOTRADE_MODE).lower() != 'live':
+        return out
+    try:
+        rows = _bybit_get_closed_pnl_linear(max(0.0, float(ts_from) - 86400.0 * 3.0), float(time.time()) + 3600.0, limit=500) or []
+    except Exception:
+        rows = []
+    for ev in rows:
+        try:
+            sym = _bybit_linear_symbol((ev or {}).get('symbol') or '')
+            ts = float(_bybit_closed_pnl_event_ts(ev) or 0.0)
+            qty = float(_bybit_closed_pnl_event_qty(ev) or 0.0)
+            pnl = float((ev or {}).get('closedPnl') or (ev or {}).get('closed_pnl') or 0.0)
+            if not sym or ts <= 0:
+                continue
+            for side in (_bybit_closed_pnl_event_side_candidates(ev) or {'BUY', 'SELL'}):
+                sd = _norm_trade_side(side)
+                if not sd:
+                    continue
+                out[(sym, sd)].append({'ts': ts, 'qty': qty, 'pnl': pnl, 'raw': ev})
+        except Exception:
+            continue
+    for k in list(out.keys()):
+        out[k].sort(key=lambda x: float(x.get('ts') or 0.0))
+    return out
+
+
+def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | None = None) -> tuple[list[dict], int]:
+    user_id = int(user_id)
+    try:
+        tz = ZoneInfo(str((user or {}).get('tz') or 'UTC'))
+    except Exception:
+        tz = timezone.utc
+    live_mode = str(AUTOTRADE_MODE).lower() == 'live' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0)
+    current_positions = []
+    exchange_events_by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    if live_mode:
+        try:
+            current_positions = list(_bybit_get_open_positions_linear() or [])
+        except Exception:
+            current_positions = []
+        try:
+            min_email_ts = min((float(e.get('emailed_ts') or 0.0) for e in (emailed or []) if float(e.get('emailed_ts') or 0.0) > 0.0), default=float(time.time()) - 86400.0)
+            exchange_events_by_key = _signal_report_exchange_events_by_key(min_email_ts)
+        except Exception:
+            exchange_events_by_key = defaultdict(list)
+
+    # Current live positions by symbol+side.
+    pos_map = {}
+    for p in current_positions or []:
+        try:
+            key = (_bybit_linear_symbol(_pos_symbol(p)), _norm_trade_side(_pos_side_text(p)))
+            if key[0] and key[1] and key not in pos_map:
+                pos_map[key] = p
+        except Exception:
+            pass
+
+    # Load recent autotrades and organize them by symbol+side for one-to-one matching.
+    recent_trades = _signal_report_load_recent_trades(user_id, limit=3000)
+    trades_by_key = {}
+    for t in recent_trades:
+        try:
+            key = (_bybit_linear_symbol(str(t.get('symbol') or '')), _norm_trade_side(str(t.get('side') or '')))
+            if key[0] and key[1]:
+                trades_by_key.setdefault(key, []).append(t)
+        except Exception:
+            pass
+    for key in list(trades_by_key.keys()):
+        trades_by_key[key].sort(key=lambda r: (float(r.get('opened_ts') or 0.0), float(r.get('closed_ts') or 0.0)))
+
+    used_trade_ids: set[str] = set()
+    rows = []
+    hidden_untracked_open = 0
+
+    # Resolve in chronological order so a repeated symbol+side maps to the nearest distinct trade lifecycle.
+    emailed_sorted = sorted(list(emailed or []), key=lambda e: float(e.get('emailed_ts') or 0.0))
+
+    def _best_trade_for_email(symbol: str, side: str, emailed_ts: float, exact_trade_id: str = '') -> dict | None:
+        key = (_bybit_linear_symbol(symbol), _norm_trade_side(side))
+        cands = [dict(x) for x in (trades_by_key.get(key) or []) if str(x.get('trade_id') or '') not in used_trade_ids]
+        if not cands:
+            return None
+        if exact_trade_id:
+            for c in cands:
+                if str(c.get('trade_id') or '') == str(exact_trade_id):
+                    return c
+        def _score(r: dict):
+            opened = float(r.get('opened_ts') or 0.0)
+            closed = float(r.get('closed_ts') or 0.0)
+            status = str(r.get('status') or '').upper().strip()
+            dt = abs(opened - float(emailed_ts or 0.0)) if opened > 0 and emailed_ts > 0 else 10**12
+            # Prefer trades opened near the emailed setup time; heavily penalize very distant rows.
+            far_pen = 0 if dt <= 12 * 3600 else (1 if dt <= 48 * 3600 else 2)
+            future_pen = 0 if opened >= (float(emailed_ts or 0.0) - 1800.0) else 1
+            status_pen = 0 if status == 'CLOSED' else 1
+            return (far_pen, future_pen, dt, status_pen, -opened, -closed)
+        cands.sort(key=_score)
+        return cands[0] if cands else None
+
+    unresolved_live_rows: dict[tuple[str, str], list[int]] = {}
+
+    for e in emailed_sorted:
+        setup_id = str(e.get('setup_id') or '').strip()
+        sess = str(e.get('session') or '').strip().upper() or '?'
+        meta_sig = _signal_report_setup_meta(setup_id)
+        life = _admin_setup_lifecycle_get(setup_id) if setup_id else {}
+        symbol = _bybit_linear_symbol(str(meta_sig.get('symbol') or life.get('symbol') or ''))
+        side = _norm_trade_side(str(meta_sig.get('side') or life.get('side') or ''))
+        emailed_ts = float(e.get('emailed_ts') or meta_sig.get('created_ts') or 0.0)
+        trade_id_exact = str((life or {}).get('trade_id') or '').strip()
+
+        canon = 'None'
+        meta = {}
+
+        # 1) Exact lifecycle-backed signal outcome / trade if present.
+        base_canon, base_meta = _canonical_signal_outcome_for_setup(user_id, setup_id)
+        base_meta = dict(base_meta or {})
+        trade = dict(base_meta.get('trade') or {}) if isinstance(base_meta.get('trade'), dict) else None
+        live_pos = None
+        if symbol and side:
+            live_pos = pos_map.get((symbol, side))
+
+        if trade and str(trade.get('trade_id') or ''):
+            used_trade_ids.add(str(trade.get('trade_id') or ''))
+            canon = _canon_outcome_from_autotrade_trade(trade, live_pos=live_pos, exchange_events=exchange_events_by_key.get((symbol, side), []))
+            meta = base_meta
+            meta['source'] = str(meta.get('source') or 'lifecycle_trade')
+        else:
+            # 2) One-to-one match by symbol+side and nearest open time.
+            matched = _best_trade_for_email(symbol, side, emailed_ts, exact_trade_id=trade_id_exact)
+            if matched is not None:
+                used_trade_ids.add(str(matched.get('trade_id') or ''))
+                canon = _canon_outcome_from_autotrade_trade(matched, live_pos=live_pos, exchange_events=exchange_events_by_key.get((symbol, side), []))
+                meta = {'source': 'matched_trade_by_symbol_side_time', 'trade': matched}
+            else:
+                # 3) No direct trade found. Use current live position or exchange close events as a last resort.
+                evs = exchange_events_by_key.get((symbol, side), []) if symbol and side else []
+                recent_evs = []
+                for ev in evs:
+                    try:
+                        ev_ts = float((ev or {}).get('ts') or 0.0)
+                        if emailed_ts > 0 and ev_ts + 300.0 < emailed_ts:
+                            continue
+                        recent_evs.append(ev)
+                    except Exception:
+                        continue
+                if live_pos is not None and symbol and side:
+                    if any(float((ev or {}).get('pnl') or 0.0) > 0.0 for ev in recent_evs):
+                        canon = 'TP'
+                        meta = {'source': 'fallback_live_with_exchange_partial', 'position': live_pos}
+                    else:
+                        canon = 'OPEN'
+                        meta = {'source': 'fallback_live_symbol_side', 'position': live_pos}
+                elif recent_evs:
+                    net_pnl = sum(float((ev or {}).get('pnl') or 0.0) for ev in recent_evs)
+                    canon = 'TP' if net_pnl > 0 else ('SL' if net_pnl < 0 else 'None')
+                    meta = {'source': 'fallback_exchange_close_events'}
+                else:
+                    canon = 'None'
+                    meta = {'source': 'untracked'}
+
+        created_ts = float(meta_sig.get('created_ts') or emailed_ts or 0.0)
+        created_str = datetime.fromtimestamp(created_ts, tz).strftime('%m-%d %H:%M') if created_ts > 0 else '-'
+        base_sym = _symbol_base(symbol) or '?'
+        conf = meta_sig.get('conf')
+        conf = int(conf or 0) if conf is not None else '-'
+        row = {
+            'setup_id': setup_id,
+            'session': sess,
+            'time': created_str,
+            'trade': f"{side or '?'} {base_sym}",
+            'confidence': conf,
+            'outcome': _display_signal_outcome(canon),
+            'emailed_ts': emailed_ts,
+            'source': str(meta.get('source') or ''),
+            'symbol': symbol,
+            'side': side,
+        }
+        rows.append(row)
+        if row['outcome'] == 'OPEN' and str(meta.get('source') or '') == 'fallback_live_symbol_side' and symbol and side:
+            unresolved_live_rows.setdefault((symbol, side), []).append(len(rows) - 1)
+        if row['outcome'] == 'None' and live_mode:
+            hidden_untracked_open += 1
+
+    # Keep only the newest fallback OPEN row per current live symbol+side; older duplicates become None.
+    for key, idxs in unresolved_live_rows.items():
+        if len(idxs) <= 1:
+            continue
+        idxs_sorted = sorted(idxs, key=lambda i: float(rows[i].get('emailed_ts') or 0.0), reverse=True)
+        keep = idxs_sorted[0]
+        for j in idxs_sorted[1:]:
+            rows[j]['outcome'] = 'None'
+            rows[j]['source'] = 'older_duplicate_live_signal'
+            hidden_untracked_open += 1
+
+    # Final guard: any OPEN row that is not backed by a current live position or an open matched trade becomes None.
+    for r in rows:
+        src = str(r.get('source') or '').lower()
+        if str(r.get('outcome') or '').upper().strip() == 'OPEN':
+            if src in {'matched_trade_by_symbol_side_time', 'lifecycle_trade', 'autotrade_open_trade', 'live_position', 'autotrade_trade_sync'}:
+                # Confirm open backing.
+                key = (_bybit_linear_symbol(str(r.get('symbol') or '')), _norm_trade_side(str(r.get('side') or '')))
+                if key not in pos_map:
+                    tr = None
+                    # best-effort check: still allow if matched trade itself remains OPEN and current position exists by exact lookup failed.
+                    # otherwise demote to None.
+                    tr = _signal_report_find_trade_for_setup(user_id, key[0], key[1], float(r.get('emailed_ts') or 0.0)) if key[0] and key[1] else None
+                    tr_status = str((tr or {}).get('status') or '').upper().strip() if tr else ''
+                    if tr_status != 'OPEN':
+                        r['outcome'] = 'None'
+                        r['source'] = 'stale_open_demoted'
+                        hidden_untracked_open += 1
+            elif src not in {'fallback_live_symbol_side', 'fallback_live_with_exchange_partial', 'matched_open_trade', 'matched_live_symbol_side'}:
+                r['outcome'] = 'None'
+                r['source'] = 'untracked_open_demoted'
+                hidden_untracked_open += 1
+
+    return rows, hidden_untracked_open
+
+
+def _canonical_signal_outcome_for_setup(user_id: int, setup_id: str) -> tuple[str, dict]:
+    sid = str(setup_id or '').strip()
+    life = _admin_setup_lifecycle_get(sid) if sid else {}
+    trade = None
+    trade_id = str((life or {}).get('trade_id') or '').strip()
+
+    def _load_trade(_trade_id: str):
+        if not _trade_id:
+            return None
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                row = cur.execute("SELECT * FROM autotrade_trades WHERE trade_id=? LIMIT 1", (_trade_id,)).fetchone()
+                return dict(row) if row else None
+        except Exception:
+            return None
+
+    trade = _load_trade(trade_id)
+    if trade:
+        status = str(trade.get('status') or '').upper().strip()
+        if status == 'OPEN':
+            if str(AUTOTRADE_MODE).lower() == 'live':
+                pos = _autotrade_find_live_position(str(trade.get('symbol') or ''), side=str(trade.get('side') or ''))
+                if pos:
+                    return 'OPEN', {'source': 'live_position', 'trade': trade, 'lifecycle': life}
+                try:
+                    _autotrade_sync_closed_trades_from_exchange(int(user_id), lookback_days=30)
+                    refreshed = _load_trade(trade_id)
+                    if refreshed and (str(refreshed.get('status') or '').upper().strip() == 'CLOSED' or float(refreshed.get('closed_ts') or 0.0) > 0):
+                        return _canon_outcome_from_autotrade_trade(refreshed, exchange_events=_signal_report_exchange_events_by_key(float(trade.get('opened_ts') or 0.0)).get((_bybit_linear_symbol(str(refreshed.get('symbol') or '')), _norm_trade_side(str(refreshed.get('side') or ''))), [])), {'source': 'autotrade_trade_sync', 'trade': refreshed, 'lifecycle': life}
+                except Exception:
+                    pass
+            return 'OPEN', {'source': 'autotrade_open_trade', 'trade': trade, 'lifecycle': life}
+        if status == 'CLOSED' or float(trade.get('closed_ts') or 0.0) > 0:
+            return _canon_outcome_from_autotrade_trade(trade), {'source': 'autotrade_trade', 'trade': trade, 'lifecycle': life}
+    stored = db_get_outcome(sid) if sid else None
+    if stored:
+        return _canon_signal_outcome_label(stored.get('outcome')), {'source': 'signal_outcomes', 'stored': stored, 'lifecycle': life}
+    try:
+        synced = _signal_outcome_sync_for_setup(int(user_id), sid, force=False)
+    except Exception:
+        synced = {}
+    if synced:
+        return _canon_signal_outcome_label((synced or {}).get('outcome')), {'source': 'signal_outcomes_sync', 'stored': synced, 'lifecycle': life}
+    return 'OPEN', {'source': 'none', 'lifecycle': life}
+
+
+def _signal_report_live_backed_only(user_id: int, meta: dict | None, canon: str) -> bool:
+    # Admin live-report gate: OPEN rows must be backed by a CURRENT live Bybit position.
+    # Local journal rows that still say OPEN are not enough, otherwise /signal_report can show
+    # stale OPEN items after the exchange position was already closed outside the bot.
+    try:
+        if str(AUTOTRADE_MODE).lower() != 'live':
+            return False
+        if int(user_id) != int(AUTOTRADE_OWNER_UID or 0):
+            return False
+        if str(canon or '').upper().strip() != 'OPEN':
+            return False
+        src = str(((meta or {}).get('source') or '')).strip().lower()
+        return src in {'live_position', 'matched_live_symbol_side', 'matched_open_trade'}
+    except Exception:
+        return False
+
+
+def _display_signal_outcome(raw) -> str:
+    lab = str(_canon_signal_outcome_label(raw) or '').upper().strip()
+    if lab in {'TP', 'TP', 'TP', 'SL', 'OPEN'}:
+        return lab
+    if lab in {'UNTRACKED', 'NONE', ''}:
+        return 'None'
+    return 'None'
+
+
+def _canonical_wr_stats(rows: list[dict]) -> dict:
+    counts = Counter()
+    by_session = defaultdict(lambda: Counter())
+    decided = 0
+    wins = 0
+    losses = 0
+    tp_full_wins = 0
+    for r in rows or []:
+        out = _display_signal_outcome(r.get('outcome'))
+        sess = str(r.get('session') or '?').upper().strip() or '?'
+        counts[out] += 1
+        by_session[sess][out] += 1
+        if out in {'TP', 'TP', 'TP', 'SL'}:
+            decided += 1
+        if out in {'TP'}:
+            wins += 1
+        if out in {'TP', 'TP'}:
+            tp_full_wins += 1
+        elif out == 'SL':
+            losses += 1
+    wr = (wins / decided * 100.0) if decided > 0 else 0.0
+    by_sess = {}
+    for sess, ctr in by_session.items():
+        s_tp_full = int(ctr.get('TP', 0) + ctr.get('TP', 0))
+        s_dec = int(ctr.get('TP', 0) + ctr.get('TP', 0) + ctr.get('TP', 0) + ctr.get('SL', 0))
+        s_win = int(ctr.get('TP', 0) + ctr.get('TP', 0) + ctr.get('TP', 0))
+        by_sess[sess] = {
+            'total': int(sum(ctr.values())),
+            'decided': s_dec,
+            'wins': s_win,
+            'alt_target_a_wins': s_tp_full,
+            'losses': int(ctr.get('SL', 0)),
+            'tp': int(ctr.get('TP', 0)),
+            'tp': int(ctr.get('TP', 0)),
+            'alt_target_a': s_tp_full,
+            'sl': int(ctr.get('SL', 0)),
+            'open': int(ctr.get('OPEN', 0)),
+            'untracked': int(ctr.get('None', 0)),
+            'win_rate': float((s_win / s_dec) * 100.0) if s_dec > 0 else 0.0,
+        }
+    return {
+        'counts': counts,
+        'by_session': by_sess,
+        'decided': int(decided),
+        'wins': int(wins),
+        'alt_target_a_wins': int(tp_full_wins),
+        'losses': int(losses),
+        'win_rate': float(wr),
+    }
+
+
+async def learning_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    txt = await to_thread_heavy(_learning_status_text, False, False, timeout=20)
+    await send_long_message(update, txt, parse_mode=None)
+
+
+def _signal_outcome_summary(user_id: int, session: str | None = None, days: int | None = None) -> dict:
+    """Canonical signal outcome summary from emailed setups, optionally live-synced for admin autotrade rows."""
+    rows = []
+    ts_from = None
+    if days is not None:
+        try:
+            ts_from = float(time.time() - max(1, int(days)) * 86400.0)
+        except Exception:
+            ts_from = None
+    user_id = int(user_id)
+    try:
+        if str(AUTOTRADE_MODE).lower() == 'live' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0):
+            _autotrade_sync_closed_trades_from_exchange(int(user_id), lookback_days=max(14, int(days or 30)))
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = """SELECT e.setup_id, e.session, e.emailed_ts FROM emailed_setups e WHERE e.user_id=?"""
+            params = [user_id]
+            if ts_from is not None:
+                q += " AND e.emailed_ts>=?"
+                params.append(float(ts_from))
+            if session:
+                q += " AND UPPER(COALESCE(e.session,''))=?"
+                params.append(str(session).upper())
+            q += " ORDER BY e.emailed_ts ASC"
+            emailed = [dict(r) for r in (c.execute(q, tuple(params)).fetchall() or [])]
+    except Exception:
+        emailed = []
+
+    try:
+        _signal_outcome_sync_for_user(int(user_id), days=(int(days) if days is not None else None), limit=max(200, len(emailed) or 0), force=False)
+    except Exception:
+        pass
+    user = get_user(user_id) or {}
+    rows, hidden_untracked_open = _signal_report_resolve_rows(user_id, emailed, user=user)
+    stats = _canonical_wr_stats(rows)
+    return {
+        'rows': rows,
+        'counts': stats.get('counts') or Counter(),
+        'by_session': stats.get('by_session') or {},
+        'wins': int(stats.get('wins') or 0),
+        'losses': int(stats.get('losses') or 0),
+        'decided': int(stats.get('decided') or 0),
+        'win_rate': float(stats.get('win_rate') or 0.0),
+        'hidden_untracked_open': int(hidden_untracked_open or 0),
+    }
+
+
+def _signal_outcome_weighted_summary(user_id: int, session: str | None = None, days: int | None = None) -> dict:
+    summary = _signal_outcome_summary(int(user_id), session=session, days=days)
+    rows = summary.get('rows') or []
+    weighted = _weighted_rollup_from_outcomes([
+        (str(r.get('session') or '?'), str(r.get('outcome') or 'OPEN'))
+        for r in rows
+    ])
+    weighted['rows'] = rows
+    return weighted
+
+
+def _signal_wr_display_metrics(user_id: int, session: str | None = None, days: int | None = None) -> dict:
+    roll = _signal_outcome_weighted_summary(int(user_id), session=session, days=days)
+    return {
+        'wins': int(roll.get('wins') or 0),
+        'losses': int(roll.get('losses') or 0),
+        'decided': int(roll.get('decided') or 0),
+        'binary_win_rate': float(roll.get('binary_win_rate') or 0.0),
+        'weighted_win_rate': float(roll.get('weighted_win_rate') or 0.0),
+        'avg_weighted_credit': float(roll.get('avg_weighted_credit') or 0.0),
+        'tp_only': int(roll.get('tp_only') or 0),
+        'alt_target_a_plus': int(roll.get('alt_target_a_plus') or 0),
+        'alt_target_b': 0,
+        'open': int(roll.get('open') or 0),
+        'counts': roll.get('counts') or Counter(),
+        'rows': roll.get('rows') or [],
+        'by_session': roll.get('by_session') or {},
+    }
+
+
+def _signal_weighted_wr_daily_series(uid: int, days: int, session: str | None = None) -> list[tuple[str, float]]:
+    uid = int(uid)
+    days = int(max(1, days))
+    user = _autotrade_user_settings(uid)
+    now_local = datetime.now(_user_tzinfo(user))
+    start_local, _ = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
+    day_starts = [start_local - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    day_labels = [ds.strftime('%Y-%m-%d') for ds in day_starts]
+    summary = _signal_outcome_summary(uid, session=session, days=days)
+    rows = summary.get('rows') or []
+    buckets = {lab: [] for lab in day_labels}
+    for r in rows:
+        ts = float(r.get('emailed_ts') or 0.0)
+        if ts <= 0:
+            continue
+        lab = _autotrade_trade_day_label(ts, user)
+        if lab in buckets:
+            buckets[lab].append(_canon_signal_outcome_label(r.get('outcome')))
+    cumulative = []
+    cum_decided = 0
+    cum_wins = 0
+    for lab in day_labels:
+        for out in buckets.get(lab) or []:
+            if out in {'TP', 'TP', 'TP', 'SL'}:
+                cum_decided += 1
+                if out in {'TP'}:
+                    cum_wins += 1
+        wr = (cum_wins / cum_decided * 100.0) if cum_decided > 0 else 0.0
+        cumulative.append((lab, float(wr)))
+    return cumulative
+
+
+def _stage_credit_from_outcome(outcome: str) -> float:
+    canon = _canon_signal_outcome_label(outcome)
+    if canon in {'TP', 'TP'}:
+        return 1.0
+    if canon == 'TP':
+        return 0.5
+    return 0.0
+
+
+def _autotrade_trade_signal_outcome(trade: dict) -> str:
+    try:
+        return _canon_outcome_from_autotrade_trade(trade)
+    except Exception:
+        return 'OPEN'
+
+
+def _weighted_rollup_from_outcomes(outcomes: list[tuple[str, str]]) -> dict:
+    rows = [{'session': sess, 'outcome': _canon_signal_outcome_label(outcome)} for sess, outcome in (outcomes or [])]
+    stats = _canonical_wr_stats(rows)
+    counts = stats.get('counts') or Counter()
+    return {
+        'total': int(len(rows)),
+        'decided': int(stats.get('decided') or 0),
+        'counts': counts,
+        'tp_only': int(counts.get('TP', 0)),
+        'alt_target_a_plus': int(counts.get('TP', 0)),
+        'alt_target_b': 0,
+        'losses': int(counts.get('SL', 0)),
+        'open': int(counts.get('OPEN', 0)),
+        'weighted_win_rate': float(stats.get('win_rate') or 0.0),
+        'binary_win_rate': float(stats.get('win_rate') or 0.0),
+        'avg_weighted_credit': float((int(counts.get('TP', 0)) / int(stats.get('decided') or 1)) if int(stats.get('decided') or 0) > 0 else 0.0),
+        'by_session': stats.get('by_session') or {},
+    }
+
+
+def _autotrade_weighted_outcome_summary(uid: int, days: int | None = None) -> dict:
+    trades = db_list_autotrade_trades_all(int(uid)) or []
+    if days is not None:
+        cutoff = float(time.time() - max(1, int(days)) * 86400.0)
+        trades = [t for t in trades if float(t.get('opened_ts') or 0.0) >= cutoff or float(t.get('closed_ts') or 0.0) >= cutoff]
+    outcomes = []
+    for t in trades:
+        outcomes.append((str(t.get('session') or '?'), _autotrade_trade_signal_outcome(t)))
+    return _weighted_rollup_from_outcomes(outcomes)
+
+
+def _learning_stage_outcome_summary(uid: int, days: int = 60) -> dict:
+    if int(uid or 0) <= 0:
+        return {'decided': 0, 'tp_only': 0, 'alt_target_a_plus': 0, 'alt_target_b': 0, 'losses': 0, 'weighted_win_rate': 0.0, 'avg_weighted_credit': 0.0}
+    summary = _signal_outcome_summary(int(uid), days=int(days))
+    outcomes = []
+    for r in summary.get('rows') or []:
+        outcomes.append((str(r.get('session') or '?'), str(r.get('outcome') or 'OPEN')))
+    return _weighted_rollup_from_outcomes(outcomes)
+
+
+def _last_n_anchored_day_labels(uid: int, days: int) -> list[str]:
+    uid = int(uid)
+    days = int(max(1, days))
+    user = _autotrade_user_settings(uid)
+    now_local = datetime.now(_user_tzinfo(user))
+    start_local, _ = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
+    return [(start_local - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(days - 1, -1, -1)]
+
+def _autotrade_history_days_available(uid: int) -> int:
+    try:
+        user = _autotrade_user_settings(int(uid))
+        now_local = datetime.now(_user_tzinfo(user))
+        start_local, _ = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
+        earliest = None
+        trades = db_list_autotrade_trades_all(int(uid)) or []
+        for t in trades:
+            for key in ('opened_ts', 'closed_ts'):
+                try:
+                    ts = float(t.get(key) or 0.0)
+                except Exception:
+                    ts = 0.0
+                if ts > 0:
+                    earliest = ts if earliest is None else min(earliest, ts)
+        if earliest is None:
+            return 7
+        earliest_local = datetime.fromtimestamp(float(earliest), tz=timezone.utc).astimezone(_user_tzinfo(user))
+        earliest_day_local, _ = _anchored_day_window(earliest_local, _user_day_reset_hhmm(user))
+        days = int((start_local - earliest_day_local).days) + 1
+        return max(7, min(days, 3650))
+    except Exception:
+        return 7
+
+
+
+
+
+def _stage_credit_from_outcome(outcome: str) -> float:
+    canon = _canon_signal_outcome_label(outcome)
+    if canon in {'TP', 'TP'}:
+        return 1.0
+    if canon == 'TP':
+        return 0.5
+    return 0.0
+
+
+def _autotrade_trade_signal_outcome(trade: dict) -> str:
+    """Use the journal / live-sync canonical outcome instead of re-simulating old 3-TP paths."""
+    try:
+        return _canon_outcome_from_autotrade_trade(trade)
+    except Exception:
+        return 'OPEN'
+
+
+def _weighted_rollup_from_outcomes(outcomes: list[tuple[str, str]]) -> dict:
+    rows = [{'session': sess, 'outcome': _canon_signal_outcome_label(outcome)} for sess, outcome in (outcomes or [])]
+    stats = _canonical_wr_stats(rows)
+    counts = stats.get('counts') or Counter()
+    decided = int(stats.get('decided') or 0)
+    tp = int(counts.get('TP', 0))
+    tp_full = int(counts.get('TP', 0) + counts.get('TP', 0))
+    weighted_credit = (tp * 0.50) + (tp_full * 1.00)
+    weighted_wr = float((weighted_credit / decided) * 100.0) if decided > 0 else 0.0
+
+    by_session_out = {}
+    for sess, item in (stats.get('by_session') or {}).items():
+        s_dec = int(item.get('decided') or 0)
+        s_tp = int(item.get('tp') or 0)
+        s_tp_full = int(item.get('tp') or 0) + int(item.get('alt_target_a') or 0)
+        s_weighted_credit = (s_tp * 0.50) + (s_tp_full * 1.00)
+        by_session_out[sess] = {
+            'total': int(item.get('total') or 0),
+            'decided': s_dec,
+            'tp_only': s_tp,
+            'alt_target_a_plus': s_tp_full,
+            'alt_target_b': 0,
+            'losses': int(item.get('sl') or 0),
+            'open': int(item.get('open') or 0),
+            'weighted_win_rate': float((s_weighted_credit / s_dec) * 100.0) if s_dec > 0 else 0.0,
+            'binary_win_rate': float(item.get('win_rate') or 0.0),
+        }
+
+    return {
+        'total': int(len(rows)),
+        'decided': decided,
+        'counts': counts,
+        'tp_only': tp,
+        'alt_target_a_plus': tp_full,
+        'alt_target_b': 0,
+        'losses': int(counts.get('SL', 0)),
+        'open': int(counts.get('OPEN', 0)),
+        'weighted_win_rate': weighted_wr,
+        'binary_win_rate': float(stats.get('win_rate') or 0.0),
+        'avg_weighted_credit': float(weighted_credit / decided) if decided > 0 else 0.0,
+        'by_session': by_session_out,
+    }
+
+
+def _autotrade_weighted_outcome_summary(uid: int, days: int | None = None) -> dict:
+    trades = db_list_autotrade_trades_all(int(uid)) or []
+    if days is not None:
+        cutoff = float(time.time() - max(1, int(days)) * 86400.0)
+        trades = [t for t in trades if float(t.get('opened_ts') or 0.0) >= cutoff or float(t.get('closed_ts') or 0.0) >= cutoff]
+    outcomes = []
+    for t in trades:
+        outcomes.append((str(t.get('session') or '?'), _autotrade_trade_signal_outcome(t)))
+    return _weighted_rollup_from_outcomes(outcomes)
+
+
+def _learning_stage_outcome_summary(uid: int, days: int = 60) -> dict:
+    if int(uid or 0) <= 0:
+        return {'decided': 0, 'tp_only': 0, 'alt_target_a_plus': 0, 'alt_target_b': 0, 'losses': 0, 'weighted_win_rate': 0.0, 'avg_weighted_credit': 0.0}
+    summary = _signal_outcome_summary(int(uid), days=int(days))
+    outcomes = []
+    for r in summary.get('rows') or []:
+        outcomes.append((str(r.get('session') or '?'), str(r.get('outcome') or 'OPEN')))
+    roll = _weighted_rollup_from_outcomes(outcomes)
+    if int(roll.get('decided') or 0) > 0:
+        return roll
+    # Fallback: when emailed signal outcomes are still sparse or not fully synced, use the
+    # live autotrade journal as secondary evidence so learning status does not stay frozen at 0.
+    live_roll = _autotrade_weighted_outcome_summary(int(uid), days=int(days))
+    if int(live_roll.get('decided') or 0) > 0:
+        live_roll['source_fallback'] = 'autotrade_journal'
+        return live_roll
+    return roll
+
+
+def _learning_live_trade_summary(uid: int, days: int = 60) -> dict:
+    if int(uid or 0) <= 0:
+        return {'closed': 0, 'net_pnl': 0.0, 'win_rate': 0.0}
+    try:
+        life = _trade_lifecycle_analytics(int(uid), days=max(3, int(days)), session='ALL', sync=True, force=False)
+        if life and int(life.get('total') or 0) > 0:
+            return {
+                'closed': int(life.get('closed_decided') or life.get('closed') or 0),
+                'net_pnl': float(life.get('net_pnl') or 0.0),
+                'win_rate': float(life.get('win_rate') or 0.0),
+            }
+    except Exception:
+        pass
+    rows = _autotrade_performance_rows(int(uid), days=max(3, int(days))) if int(uid or 0) > 0 else []
+    s = _autotrade_performance_summary(rows)
+    return {
+        'closed': int(s.get('closed') or 0),
+        'net_pnl': float(s.get('net') or 0.0),
+        'win_rate': float(s.get('win_rate') or 0.0),
+    }
+
+
+def _learning_breakeven_after_tp_analysis(uid: int, days: int = 60) -> dict:
+    try:
+        life = _trade_lifecycle_analytics(int(uid), days=max(3, int(days)), session='ALL', sync=True, force=False) if int(uid or 0) > 0 else {}
+    except Exception:
+        life = {}
+    tp_plus = int(life.get('tp_hits') or 0) if life else 0
+    tp_only = int(life.get('partial_wins') or 0) if life else 0
+    alt_target_a_plus = int(life.get('wins') or 0) if life else 0
+    if tp_plus <= 0:
+        stage = _learning_stage_outcome_summary(uid, days=days)
+        tp_plus = int(stage.get('tp_only') or 0) + int(stage.get('alt_target_a_plus') or 0)
+        tp_only = int(stage.get('tp_only') or 0)
+        alt_target_a_plus = int(stage.get('alt_target_a_plus') or 0)
+    if tp_plus <= 0:
+        return {
+            'recommendation': 'WAIT',
+            'sample_tp_plus': 0,
+            'tp_only_share': 0.0,
+            'explanation': 'Single-TP mode is active. More live sample will improve the learning summary.',
+        }
+    tp_only_share = (float(tp_only) / float(tp_plus) * 100.0) if tp_plus > 0 else 0.0
+    alt_target_a_plus_share = (float(alt_target_a_plus) / float(tp_plus) * 100.0) if tp_plus > 0 else 0.0
+    if tp_plus < 12:
+        rec = 'WAIT'
+        why = 'TP-path sample is still small. No code change is required yet.'
+    elif tp_only_share >= 60.0:
+        rec = 'CONDITIONAL'
+        why = 'Single-TP mode is active, so no secondary target extension logic is needed.'
+    elif alt_target_a_plus_share >= 60.0:
+        rec = 'NO_GLOBAL_CHANGE'
+        why = 'Single-TP mode is active, so runner management beyond the first target is not needed.'
+    else:
+        rec = 'CONDITIONAL'
+        why = 'Results are mixed, but the single-TP model keeps execution simpler and more consistent.'
+    return {
+        'recommendation': rec,
+        'sample_tp_plus': int(tp_plus),
+        'tp_only_share': float(tp_only_share),
+        'explanation': why,
+    }
+
+
+def _autotrade_weighted_wr_daily_series(uid: int, days: int) -> list[tuple[str, float]]:
+    uid = int(uid)
+    user = _autotrade_user_settings(uid)
+    rows = db_list_autotrade_trades_all(uid) or []
+    now_local = datetime.now(_user_tzinfo(user))
+    start_local, _ = _anchored_day_window(now_local, _user_day_reset_hhmm(user))
+    day_starts = [start_local - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    buckets = {ds.strftime('%Y-%m-%d'): [] for ds in day_starts}
+    for t in rows:
+        try:
+            ots = float(t.get('opened_ts') or 0.0)
+            if ots <= 0:
+                continue
+            lab = _autotrade_trade_day_label(ots, user)
+            if lab in buckets:
+                buckets[lab].append(_autotrade_trade_signal_outcome(t))
+        except Exception:
+            continue
+    series = []
+    for ds in day_starts:
+        lab = ds.strftime('%Y-%m-%d')
+        outs = [_canon_signal_outcome_label(o) for o in (buckets.get(lab) or [])]
+        decided = sum(1 for o in outs if o in {'TP', 'TP', 'TP', 'SL'})
+        wsum = sum(_stage_credit_from_outcome(o) for o in outs if o in {'TP', 'TP', 'TP', 'SL'})
+        wr = (wsum / decided * 100.0) if decided > 0 else 0.0
+        series.append((lab, float(wr)))
+    return series
+
+
+def _simple_line_chart_png(series_map: list[tuple[str, list[tuple[str, float]]]], title: str, ylabel: str, out_prefix: str) -> str | None:
+    try:
+        import os
+        import tempfile
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        cleaned_series = []
+        all_labels = []
+        for name, pts in (series_map or []):
+            clean_pts = []
+            for x, y in (pts or []):
+                try:
+                    yv = float(y or 0.0)
+                    if not math.isfinite(yv):
+                        yv = 0.0
+                    clean_pts.append((str(x), yv))
+                except Exception:
+                    continue
+            if clean_pts:
+                cleaned_series.append((str(name), clean_pts))
+                if not all_labels:
+                    all_labels = [x for x, _ in clean_pts]
+
+        if not cleaned_series:
+            cleaned_series = [('Series', [('N/A', 0.0)])]
+            all_labels = ['N/A']
+
+        fig, ax = plt.subplots(figsize=(11, 5.5))
+        x_index = {lab: idx for idx, lab in enumerate(all_labels)}
+
+        for name, pts in cleaned_series:
+            xs = [x_index.get(x, i) for i, (x, _y) in enumerate(pts)]
+            ys = [float(y) for _x, y in pts]
+            if not xs:
+                xs, ys = [0], [0.0]
+            ax.plot(xs, ys, linewidth=2, marker='o', markersize=3, label=str(name))
+
+        ax.set_title(str(title))
+        ax.set_xlabel('Trading day')
+        ax.set_ylabel(str(ylabel))
+        ax.grid(True, alpha=0.3)
+        ax.set_xticks(list(range(len(all_labels))))
+        ax.set_xticklabels(all_labels)
+
+        if len(all_labels) > 8:
+            for label in ax.get_xticklabels():
+                label.set_rotation(45)
+                label.set_horizontalalignment('right')
+
+        if len(cleaned_series) > 1:
+            ax.legend()
+
+        fig.tight_layout()
+
+        out_dir = os.environ.get("CHART_OUTPUT_DIR") or tempfile.gettempdir()
+        os.makedirs(out_dir, exist_ok=True)
+        out = os.path.join(out_dir, f"{out_prefix}_{int(time.time())}.png")
+
+        fig.savefig(out, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        return out
+
+    except Exception as e:
+        try:
+            logger.exception('simple chart build failed: %s', e)
+        except Exception:
+            pass
+        return None
+
+def _build_winrate_chart_png(uid: int, days: int, title: str = 'Overall Win-Rate Trend', session: str | None = None) -> str | None:
+    series = _signal_weighted_wr_daily_series(int(uid), int(days), session=session)
+    if not series:
+        labels = _last_n_anchored_day_labels(int(uid), int(days))
+        series = [(lab, 0.0) for lab in labels]
+    return _simple_line_chart_png([('Overall WR %', [(x, float(y)) for x, y in series])], str(title), 'Win rate %', 'winrate_chart')
+
+
+async def performance_chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    uid = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
+    owner_user = _autotrade_user_settings(uid)
+    equity_now = _effective_equity_for_risk(owner_user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
+    days = _autotrade_history_days_available(uid)
+    rows = _autotrade_performance_rows(uid, days=max(7, days))
+    if not rows:
+        rows = [{'day': lab, 'net_pnl': 0.0} for lab in _last_n_anchored_day_labels(uid, max(7, days))]
+    chart = _build_performance_chart_png(rows, equity=float(equity_now or 0.0))
+    if not chart:
+        await update.message.reply_text('Could not build the performance chart right now.')
+        return
+    with open(chart, 'rb') as f:
+        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=f, caption='📉 Overall equity + daily PnL trend')
+
+
+async def winrate_chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    uid = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
+    days = _autotrade_history_days_available(uid)
+    chart = _build_winrate_chart_png(uid, days=max(7, days), title='Overall Win-Rate Trend')
+    if not chart:
+        await update.message.reply_text('Could not build the win-rate chart right now.')
+        return
+    with open(chart, 'rb') as f:
+        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=f, caption='📊 Overall win-rate trend')
+
+
+def _autotrade_chart_series(rows: list[dict], starting_equity: float = 0.0) -> dict:
+    pnl_points = []
+    equity_points = []
+    running = float(starting_equity or 0.0)
+    ordered = sorted((rows or []), key=lambda r: str(r.get('day') or ''))
+    for r in ordered:
+        day = str(r.get('day') or '')
+        pnl = float(r.get('net_pnl') or 0.0)
+        running += pnl
+        pnl_points.append((day, pnl))
+        equity_points.append((day, running))
+    return {'pnl': pnl_points, 'equity': equity_points}
+
+
+def _build_performance_chart_png(rows: list[dict], equity: float = 0.0) -> str | None:
+    rows = rows or [{'day': 'N/A', 'net_pnl': 0.0}]
+    series = _autotrade_chart_series(rows, starting_equity=float(equity or 0.0))
+    days = [d for d, _ in series['pnl']] or ['N/A']
+    pnl_vals = [float(v) for _, v in series['pnl']] or [0.0]
+    eq_vals = [float(v) for _, v in series['equity']] or [float(equity or 0.0)]
+    return _simple_line_chart_png([('Equity', list(zip(days, eq_vals))), ('Daily PnL', list(zip(days, pnl_vals)))], 'Equity & Daily PnL Trend', 'USDT', 'performance_chart')
+
+
+def _fmt_wr_line(label: str, summary: dict) -> str:
+    return f"{label}: {int(summary.get('wins') or 0)}W / {int(summary.get('losses') or 0)}L | {float(summary.get('binary_win_rate') or summary.get('win_rate') or 0.0):.1f}%"
+
+
+async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    owner = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
+    overall = _signal_wr_display_metrics(owner)
+    msg = (
+        "📊 Win Rate\n"
+        f"{HDR}\n"
+        f"{_fmt_wr_line('Overall signal WR', overall)}"
+    )
+    await update.message.reply_text(msg)
+
+
+async def ny_winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    owner = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
+    overall = _signal_wr_display_metrics(owner, session='NY')
+    msg = (
+        "🗽 NY Win Rate\n"
+        f"{HDR}\n"
+        f"{_fmt_wr_line('Overall NY signal WR', overall)}"
+    )
+    await update.message.reply_text(msg)
+
+
+async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    rows = await to_thread_heavy(_evolution_latest_lessons, 8, 45, False, timeout=20)
+    if not rows:
+        await update.message.reply_text("No lessons learned diagnostics recorded yet.")
+        return
+    lines = ["📚 Lessons Learned", HDR]
+    try:
+        freshest_ts = max(float(r.get("decided_ts") or 0.0) for r in (rows or []))
+    except Exception:
+        freshest_ts = 0.0
+    if freshest_ts > 0 and (time.time() - freshest_ts) > 72 * 3600:
+        lines.append(f"• No fresh lessons were decided recently. Latest archived lesson time: {_fmt_dt_local(datetime.fromtimestamp(freshest_ts, tz=timezone.utc))}")
+        lines.append(SEP)
+    for r in rows[:8]:
+        tags = r.get("tags") or []
+        when = _fmt_dt_local(datetime.fromtimestamp(float(r.get("decided_ts") or time.time()), tz=timezone.utc))
+        src = str(r.get('source_type') or '').strip().lower()
+        src_txt = f" [{src}]" if src else ""
+        pnl_hint = (r.get('detail') or {}).get('pnl_usdt') if isinstance(r.get('detail'), dict) else None
+        lines.append(f"• {str(r.get('symbol') or '')} {str(r.get('side') or '')} | {str(r.get('session') or '')} | {when}{src_txt}")
+        lines.append(f"  Outcome: {str(_canon_signal_outcome_label(r.get('outcome'), pnl_hint) or '')} | Tags: {', '.join(tags[:4]) if tags else '—'}")
+        rec = str(r.get("recommendation") or "").strip()
+        if rec:
+            lines.append(f"  Insight: {rec}")
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+
+# =========================================================
+# MARKET-SCAN SNAPSHOT INTELLIGENCE (zero-touch, low-maintenance)
+# - Captures repeated scan states several times per day
+# - Evaluates whether symbols later moved enough to count as missed opportunities
+# - Applies only bounded, evidence-based screen-side adjustments
+# =========================================================
+SCAN_INTELLIGENCE_ENABLED = str(os.environ.get("SCAN_INTELLIGENCE_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+SCAN_INTELLIGENCE_INTERVAL_MIN = int(os.environ.get("SCAN_INTELLIGENCE_INTERVAL_MIN", "180") or 180)
+SCAN_INTELLIGENCE_HORIZON_HOURS = float(os.environ.get("SCAN_INTELLIGENCE_HORIZON_HOURS", "6") or 6)
+SCAN_INTELLIGENCE_MAX_SYMBOLS = int(os.environ.get("SCAN_INTELLIGENCE_MAX_SYMBOLS", "24") or 24)
+SCAN_INTELLIGENCE_MIN_MFE_PCT = float(os.environ.get("SCAN_INTELLIGENCE_MIN_MFE_PCT", "1.4") or 1.4)
+SCAN_INTELLIGENCE_MAX_MAE_PCT = float(os.environ.get("SCAN_INTELLIGENCE_MAX_MAE_PCT", "1.2") or 1.2)
+SCAN_INTELLIGENCE_AUTO_APPLY_COOLDOWN_HOURS = float(os.environ.get("SCAN_INTELLIGENCE_AUTO_APPLY_COOLDOWN_HOURS", "18") or 18)
+SCAN_INTELLIGENCE_MIN_MISSED_GOOD = int(os.environ.get("SCAN_INTELLIGENCE_MIN_MISSED_GOOD", "6") or 6)
+
+def _scan_intel_migrate_tables():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS market_scan_snapshots (
+                snap_id TEXT PRIMARY KEY,
+                created_ts REAL NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT 'screen',
+                leaders_json TEXT NOT NULL DEFAULT '[]',
+                losers_json TEXT NOT NULL DEFAULT '[]',
+                market_leaders_json TEXT NOT NULL DEFAULT '[]',
+                waiting_json TEXT NOT NULL DEFAULT '[]',
+                trend_watch_json TEXT NOT NULL DEFAULT '[]',
+                top_setups_json TEXT NOT NULL DEFAULT '[]',
+                market_pulse_json TEXT NOT NULL DEFAULT '{}',
+                reject_summary_json TEXT NOT NULL DEFAULT '{}',
+                outcome_summary_json TEXT NOT NULL DEFAULT '{}'
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS market_scan_symbols (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snap_id TEXT NOT NULL,
+                created_ts REAL NOT NULL,
+                session TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL,
+                bucket TEXT NOT NULL,
+                side TEXT NOT NULL DEFAULT '',
+                entry REAL NOT NULL DEFAULT 0,
+                ch24 REAL NOT NULL DEFAULT 0,
+                volume_usd REAL NOT NULL DEFAULT 0,
+                reject_reason TEXT NOT NULL DEFAULT '',
+                evaluated INTEGER NOT NULL DEFAULT 0,
+                evaluated_ts REAL,
+                mfe_pct REAL,
+                mae_pct REAL,
+                outcome TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                UNIQUE(snap_id, symbol, bucket)
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_market_scan_symbols_eval ON market_scan_symbols(evaluated, created_ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_market_scan_snapshots_ts ON market_scan_snapshots(created_ts)")
+            conn.commit()
+    except Exception:
+        pass
+
+def _scan_intel_compact_setup(s) -> dict:
+    try:
+        return {
+            "symbol": str(getattr(s, "symbol", "") or "").upper(),
+            "side": str(getattr(s, "side", "") or "").upper(),
+            "conf": int(getattr(s, "conf", 0) or 0),
+            "engine": str(getattr(s, "engine", "") or ""),
+            "entry": float(getattr(s, "entry", 0.0) or 0.0),
+            "sl": float(getattr(s, "sl", 0.0) or 0.0),
+            "alt_target_b": 0.0,
+            "ch24": float(getattr(s, "ch24", 0.0) or 0.0),
+            "fut_vol_usd": float(getattr(s, "fut_vol_usd", 0.0) or 0.0),
+        }
+    except Exception:
+        return {}
+
+def _scan_intel_market_pulse(best_fut: dict, leaders: list[str], losers: list[str], session_name: str) -> dict:
+    try:
+        adv = []
+        dec = []
+        vols = []
+        for _, mv in (best_fut or {}).items():
+            try:
+                ch24 = float(getattr(mv, "percentage", 0.0) or 0.0)
+                vol = float(usd_notional(mv) or 0.0)
+                vols.append(vol)
+                if ch24 > 0:
+                    adv.append(ch24)
+                elif ch24 < 0:
+                    dec.append(ch24)
+            except Exception:
+                continue
+        risk_tone = "balanced"
+        if len(leaders) >= max(3, len(losers) + 2):
+            risk_tone = "risk_on"
+        elif len(losers) >= max(3, len(leaders) + 2):
+            risk_tone = "risk_off"
+        return {
+            "session": str(session_name or "").upper(),
+            "leaders_n": int(len(leaders or [])),
+            "losers_n": int(len(losers or [])),
+            "breadth_adv": int(len(adv)),
+            "breadth_dec": int(len(dec)),
+            "avg_adv_24h": float(sum(adv) / len(adv)) if adv else 0.0,
+            "avg_dec_24h": float(sum(dec) / len(dec)) if dec else 0.0,
+            "median_vol_usd": float(sorted(vols)[len(vols)//2]) if vols else 0.0,
+            "risk_tone": risk_tone,
+        }
+    except Exception:
+        return {"session": str(session_name or "").upper(), "risk_tone": "unknown"}
+
+def _scan_intel_capture_snapshot(best_fut: dict, session_name: str, pool: dict, reject_ctx: dict | None = None, mode: str = "screen") -> str:
+    _scan_intel_migrate_tables()
+    created_ts = float(time.time())
+    snap_id = f"SCAN-{int(created_ts)}-{str(session_name or '').upper()}"
+    up_list, dn_list = compute_directional_lists(best_fut)
+    leaders = [str(t[0]).upper() for t in (up_list or [])[:10]]
+    losers = [str(t[0]).upper() for t in (dn_list or [])[:10]]
+    market_leaders = _market_leader_bases(best_fut, 10)
+    waiting = list(pool.get("waiting") or [])[:SCREEN_WAITING_N]
+    trend_watch = list(pool.get("trend_watch") or [])[:10]
+    top_setups = [ _scan_intel_compact_setup(s) for s in list(pool.get("setups") or [])[:6] ]
+    pulse = _scan_intel_market_pulse(best_fut, leaders, losers, session_name)
+    reject_summary = {}
+    per = {}
+    try:
+        per = dict((reject_ctx or {}).get("__per__") or {})
+        reason_ctr = Counter()
+        for sym, info in per.items():
+            try:
+                rr = str((info or {}).get("reason") or "").strip()
+                if rr and rr not in ("evaluated", "setup_generated", "not_evaluated"):
+                    reason_ctr[rr] += 1
+            except Exception:
+                continue
+        reject_summary = {"top_rejects": reason_ctr.most_common(8)}
+    except Exception:
+        reject_summary = {}
+
+    tracked = []
+    def _add_symbol(sym: str, bucket: str, side: str = ""):
+        s = str(sym or "").upper().strip()
+        if not s:
+            return
+        mv = (best_fut or {}).get(s)
+        if not mv:
+            return
+        info = per.get(s) or {}
+        tracked.append((
+            snap_id, created_ts, str(session_name or "").upper(), s, str(bucket), str(side or "").upper(),
+            float(getattr(mv, "last", 0.0) or 0.0), float(getattr(mv, "percentage", 0.0) or 0.0), float(usd_notional(mv) or 0.0),
+            str(info.get("reason") or "")
+        ))
+
+    for s in leaders[:8]:
+        _add_symbol(s, "leaders", "BUY")
+    for s in losers[:8]:
+        _add_symbol(s, "losers", "SELL")
+    for s in market_leaders[:8]:
+        _add_symbol(s, "market_leaders", "")
+    for s, info in waiting[:8]:
+        _add_symbol(s, "momentum_watch", str((info or {}).get("side") or ""))
+    for t in trend_watch[:8]:
+        _add_symbol(str((t or {}).get("symbol") or ""), "trend_watch", str((t or {}).get("side") or ""))
+    for s in list(pool.get("setups") or [])[:6]:
+        _add_symbol(str(getattr(s, "symbol", "") or ""), "top_setups", str(getattr(s, "side", "") or ""))
+
+    # Deduplicate by (symbol,bucket) while keeping first occurrence
+    dedup = []
+    seen = set()
+    for row in tracked[: max(8, int(SCAN_INTELLIGENCE_MAX_SYMBOLS))]:
+        k = (row[3], row[4])
+        if k in seen:
+            continue
+        seen.add(k)
+        dedup.append(row)
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO market_scan_snapshots(snap_id, created_ts, session, mode, leaders_json, losers_json, market_leaders_json, waiting_json, trend_watch_json, top_setups_json, market_pulse_json, reject_summary_json, outcome_summary_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (snap_id, created_ts, str(session_name or "").upper(), str(mode or "screen"), _json_dumps_safe(leaders), _json_dumps_safe(losers), _json_dumps_safe(market_leaders), _json_dumps_safe(waiting), _json_dumps_safe(trend_watch), _json_dumps_safe(top_setups), _json_dumps_safe(pulse), _json_dumps_safe(reject_summary), _json_dumps_safe({}))
+            )
+            if dedup:
+                c.executemany(
+                    "INSERT OR REPLACE INTO market_scan_symbols(snap_id, created_ts, session, symbol, bucket, side, entry, ch24, volume_usd, reject_reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    dedup,
+                )
+            conn.commit()
+    except Exception:
+        pass
+    return snap_id
+
+def _scan_intel_eval_one(symbol: str, side: str, entry: float, created_ts: float) -> tuple[float, float, str, str]:
+    try:
+        market_symbol = _bybit_linear_symbol(symbol)
+        candles = fetch_ohlcv(market_symbol, "15m", limit=240)
+        if not candles:
+            return (0.0, 0.0, "insufficient_data", "no_15m_data")
+        start_ms = int(float(created_ts) * 1000.0)
+        rows = [c for c in candles if int(c[0]) >= start_ms]
+        if len(rows) < 3:
+            rows = candles[-min(len(candles), 32):]
+        highs = [float(x[2]) for x in rows]
+        lows = [float(x[3]) for x in rows]
+        if not highs or not lows or float(entry or 0.0) <= 0:
+            return (0.0, 0.0, "insufficient_data", "bad_eval_window")
+        side_u = str(side or "").upper().strip()
+        if side_u == "SELL":
+            mfe = max(0.0, ((float(entry) - min(lows)) / float(entry)) * 100.0)
+            mae = max(0.0, ((max(highs) - float(entry)) / float(entry)) * 100.0)
+        else:
+            mfe = max(0.0, ((max(highs) - float(entry)) / float(entry)) * 100.0)
+            mae = max(0.0, ((float(entry) - min(lows)) / float(entry)) * 100.0)
+        return (float(mfe), float(mae), "ok", "")
+    except Exception as e:
+        return (0.0, 0.0, "eval_error", f"{type(e).__name__}: {e}")
+
+def _scan_intel_classify(bucket: str, mfe_pct: float, mae_pct: float, reject_reason: str) -> str:
+    rr = str(reject_reason or "").strip().lower()
+    if str(bucket or "") == "top_setups":
+        return "setup_worked" if float(mfe_pct) >= float(SCAN_INTELLIGENCE_MIN_MFE_PCT) else "setup_failed"
+    if float(mfe_pct) >= float(SCAN_INTELLIGENCE_MIN_MFE_PCT) and float(mae_pct) <= float(SCAN_INTELLIGENCE_MAX_MAE_PCT):
+        if rr in {"ch1_below_trigger", "no_breakout_trigger", "below_min_confidence", "no_engine_passed", "smc_structure_mismatch"}:
+            return "missed_due_to_over_filtering"
+        return "missed_but_good"
+    if float(mfe_pct) >= float(SCAN_INTELLIGENCE_MIN_MFE_PCT) * 0.70:
+        return "watch_state_never_converted"
+    return "correctly_skipped"
+
+def _scan_intel_summarize_recent(days: int = 14) -> dict:
+    _scan_intel_migrate_tables()
+    since_ts = float(time.time()) - (float(days) * 86400.0)
+    out_ctr = Counter()
+    reason_ctr = Counter()
+    session_ctr = Counter()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                "SELECT session, bucket, outcome, reject_reason FROM market_scan_symbols WHERE evaluated=1 AND created_ts>=?",
+                (since_ts,),
+            ).fetchall() or []
+        for r in rows:
+            outcome = str(r["outcome"] or "")
+            rr = str(r["reject_reason"] or "")
+            sess = str(r["session"] or "")
+            if outcome:
+                out_ctr[outcome] += 1
+            if outcome.startswith("missed") and rr:
+                reason_ctr[rr] += 1
+            if outcome.startswith("missed") and sess:
+                session_ctr[sess] += 1
+    except Exception:
+        pass
+    return {
+        "counts": dict(out_ctr),
+        "top_missed_reasons": reason_ctr.most_common(6),
+        "top_missed_sessions": session_ctr.most_common(3),
+    }
+
+def _scan_intel_safe_adjust(summary: dict) -> list[dict]:
+    actions = []
+    if not summary:
+        return actions
+    missed_total = int(summary.get("counts", {}).get("missed_but_good", 0) or 0) + int(summary.get("counts", {}).get("missed_due_to_over_filtering", 0) or 0)
+    if missed_total < int(SCAN_INTELLIGENCE_MIN_MISSED_GOOD):
+        return actions
+
+    cfg = load_strategy_config(force=True)
+    bounds = cfg.get("opt_bounds") or {}
+    now = float(time.time())
+    last_ts = float((_evolution_state_get("scan_intel_last_adjustment", {}) or {}).get("ts", 0.0) or 0.0)
+    if (now - last_ts) < float(SCAN_INTELLIGENCE_AUTO_APPLY_COOLDOWN_HOURS) * 3600.0:
+        return actions
+
+    top_reason = str((summary.get("top_missed_reasons") or [["", 0]])[0][0] or "")
+    if top_reason in {"ch1_below_trigger", "no_breakout_trigger", "below_min_confidence"}:
+        lo, hi = (bounds.get("quality_score_min_screen") or [52.0, 70.0])
+        old = float(cfg.get("quality_score_min_screen", QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
+        new = _clamp(old - 1.0, float(lo), float(hi))
+        if new < old:
+            cfg["quality_score_min_screen"] = float(new)
+            actions.append({"param": "quality_score_min_screen", "from": old, "to": new, "reason": top_reason})
+
+    if actions:
+        save_strategy_config(cfg)
+        apply_strategy_config(cfg)
+        _evolution_state_set("scan_intel_last_adjustment", {"ts": now, "actions": actions, "summary": summary})
+        try:
+            _evolution_insert_recommendation(
+                "scan_intelligence",
+                "Auto-adjustment: slightly loosened screen quality after repeated snapshot-based evidence of missed but tradeable movers.",
+                {"summary": summary, "actions": actions},
+                0.66,
+                auto_applied=True,
+                action=actions[0],
+                status="APPLIED",
+            )
+        except Exception:
+            pass
+    return actions
+
+def _scan_intel_evaluate_pending() -> dict:
+    _scan_intel_migrate_tables()
+    cutoff_ts = float(time.time()) - (float(SCAN_INTELLIGENCE_HORIZON_HOURS) * 3600.0)
+    evaluated = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                "SELECT id, snap_id, session, symbol, bucket, side, entry, created_ts, reject_reason FROM market_scan_symbols WHERE evaluated=0 AND created_ts<=? ORDER BY created_ts ASC LIMIT 120",
+                (cutoff_ts,),
+            ).fetchall() or []
+        for r in rows:
+            mfe, mae, status, note = _scan_intel_eval_one(str(r["symbol"] or ""), str(r["side"] or "BUY"), float(r["entry"] or 0.0), float(r["created_ts"] or 0.0))
+            outcome = _scan_intel_classify(str(r["bucket"] or ""), mfe, mae, str(r["reject_reason"] or "")) if status == "ok" else status
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    c = conn.cursor()
+                    c.execute(
+                        "UPDATE market_scan_symbols SET evaluated=1, evaluated_ts=?, mfe_pct=?, mae_pct=?, outcome=?, note=? WHERE id=?",
+                        (float(time.time()), float(mfe), float(mae), str(outcome), str(note or ""), int(r["id"])),
+                    )
+                    conn.commit()
+                evaluated += 1
+            except Exception:
+                pass
+        # refresh snapshot-level summaries
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                snap_ids = [str(r["snap_id"]) for r in rows]
+                for snap_id in sorted(set(snap_ids)):
+                    sr = c.execute("SELECT outcome, COUNT(1) AS n FROM market_scan_symbols WHERE snap_id=? AND evaluated=1 GROUP BY outcome", (snap_id,)).fetchall() or []
+                    outcome_summary = {str(x[0] or ""): int(x[1] or 0) for x in sr}
+                    c.execute("UPDATE market_scan_snapshots SET outcome_summary_json=? WHERE snap_id=?", (_json_dumps_safe(outcome_summary), snap_id))
+                conn.commit()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    summary = _scan_intel_summarize_recent(days=14)
+    actions = _scan_intel_safe_adjust(summary)
+    _evolution_state_set("scan_intel_summary", {"ts": time.time(), "summary": summary, "actions": actions, "evaluated": evaluated})
+    return {"evaluated": evaluated, "summary": summary, "actions": actions}
+
+def _scan_intel_summary_cached() -> dict:
+    snap = _evolution_state_get("scan_intel_summary", {}) or {}
+    if snap:
+        return snap
+    summary = _scan_intel_summarize_recent(days=14)
+    snap = {"ts": time.time(), "summary": summary, "actions": [], "evaluated": 0}
+    _evolution_state_set("scan_intel_summary", snap)
+    return snap
+
+async def scan_intelligence_job(context: ContextTypes.DEFAULT_TYPE):
+    if not SCAN_INTELLIGENCE_ENABLED:
+        return
+    try:
+        best_fut = await to_thread_heavy(fetch_futures_tickers)
+        if not best_fut:
+            return
+        if _job_budget_exhausted():
+            return
+        session = scan_session_name_utc(datetime.now(timezone.utc))
+        pool = await build_priority_pool(best_fut, session, mode="screen", scan_profile=DEFAULT_SCAN_PROFILE, uid=None)
+        try:
+            rej_ctx = _REJECT_CTX.get() if isinstance(_REJECT_CTX.get(), dict) else None
+        except Exception:
+            rej_ctx = None
+        await to_thread_fast(_scan_intel_capture_snapshot, best_fut, session, pool, rej_ctx, "screen")
+        await to_thread_fast(_scan_intel_evaluate_pending)
+    except Exception:
+        pass
+
+def _utc_day_str(ts: float | None = None) -> str:
+    try:
+        dt = datetime.fromtimestamp(float(ts or time.time()), tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _json_dumps_safe(obj) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        try:
+            return json.dumps(str(obj), ensure_ascii=False)
+        except Exception:
+            return ""
+
+def _db_insert_universe_snapshot(day_utc: str, top_n: int, min_vol_usd: float, symbols: list[dict], meta: dict) -> str:
+    _opt_migrate_tables()
+    snap_id = f"UNIV-{day_utc}-{int(time.time())}"
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO universe_snapshots(snap_id, day_utc, created_ts, top_n, min_vol_usd, symbols_json, meta_json) VALUES(?,?,?,?,?,?,?)",
+                (snap_id, str(day_utc), float(time.time()), int(top_n), float(min_vol_usd), _json_dumps_safe(symbols), _json_dumps_safe(meta)),
+            )
+            conn.commit()
+    except Exception:
+        pass
+    return snap_id
+
+def _db_get_universe_snapshot(day_utc: str) -> Optional[dict]:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute(
+                "SELECT snap_id, created_ts, top_n, min_vol_usd, symbols_json, meta_json FROM universe_snapshots WHERE day_utc=? ORDER BY created_ts DESC LIMIT 1",
+                (str(day_utc),),
+            ).fetchone()
+            if not row:
+                return None
+            snap_id, created_ts, top_n, min_vol_usd, symbols_json, meta_json = row
+            return {
+                "snap_id": snap_id,
+                "day_utc": str(day_utc),
+                "created_ts": float(created_ts or 0.0),
+                "top_n": int(top_n or 0),
+                "min_vol_usd": float(min_vol_usd or 0.0),
+                "symbols": json.loads(symbols_json) if symbols_json else [],
+                "meta": json.loads(meta_json) if meta_json else {},
+            }
+    except Exception:
+        return None
+
+def _build_universe_snapshot_top_volume(top_n: int = 100, min_vol_usd: float = 10_000_000.0) -> dict:
+    """Build TOP-N USDT linear perpetual universe by 24-hour quote volume, store snapshot for reproducibility."""
+    _opt_migrate_tables()
+    day_utc = _utc_day_str()
+
+    ex = get_exchange()
+    markets = getattr(ex, "markets", {}) or {}
+
+    try:
+        best = fetch_futures_tickers()  # base -> MarketVol
+    except Exception:
+        best = {}
+
+    rows = []
+    for base, mv in (best or {}).items():
+        try:
+            sym = str(getattr(mv, "symbol", "") or "")
+            if not sym:
+                continue
+            m = markets.get(sym) or {}
+            if not bool(m.get("swap")):
+                continue
+            if str(m.get("quote", "")).upper() != "USDT":
+                continue
+            qv = float(getattr(mv, "quote_vol", 0.0) or 0.0)
+            if qv < float(min_vol_usd):
+                continue
+            last = float(getattr(mv, "last", 0.0) or 0.0)
+            if last <= 0:
+                continue
+            rows.append({"symbol": sym, "base": str(getattr(mv, "base", base) or base), "quote_vol_usd": float(qv), "last": float(last)})
+        except Exception:
+            continue
+
+    rows.sort(key=lambda r: float(r.get("quote_vol_usd", 0.0) or 0.0), reverse=True)
+    rows = rows[: max(1, int(top_n))]
+
+    meta = {"source": "ccxt.fetch_tickers (filtered swap USDT)", "count": int(len(rows)), "min_vol_usd": float(min_vol_usd)}
+    snap_id = _db_insert_universe_snapshot(day_utc=day_utc, top_n=int(top_n), min_vol_usd=float(min_vol_usd), symbols=rows, meta=meta)
+
+    return {"day_utc": day_utc, "snap_id": snap_id, "symbols": rows, "market_symbols": [str(r["symbol"]) for r in rows], "meta": meta}
+
+def _db_create_opt_run(run_id: str, days: int, session_mode: str, tf_candidates: list[str], universe_snap_id: str, universe_size: int) -> None:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO optimization_runs(run_id, started_ts, status, days, session_mode, tf_candidates_json, universe_snap_id, universe_size, progress_json, notes) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (str(run_id), float(time.time()), "RUNNING", int(days), str(session_mode), _json_dumps_safe(tf_candidates), str(universe_snap_id), int(universe_size), _json_dumps_safe({}), ""),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def _db_update_opt_run(run_id: str, status: Optional[str] = None, progress: Optional[dict] = None, notes: Optional[str] = None, finished: bool = False) -> None:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            fields = []
+            vals = []
+            if status is not None:
+                fields.append("status=?"); vals.append(str(status))
+            if progress is not None:
+                fields.append("progress_json=?"); vals.append(_json_dumps_safe(progress))
+            if notes is not None:
+                fields.append("notes=?"); vals.append(str(notes))
+            if finished:
+                fields.append("finished_ts=?"); vals.append(float(time.time()))
+            if not fields:
+                return
+            vals.append(str(run_id))
+            c.execute(f"UPDATE optimization_runs SET {', '.join(fields)} WHERE run_id=?", vals)
+            conn.commit()
+    except Exception:
+        pass
+
+def _db_save_opt_result(run_id: str, promoted: bool, chosen_exec_tf: str, best_score: float, best_params: dict, metrics: dict, reject_stats: dict) -> None:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO optimization_results(run_id, promoted, chosen_exec_tf, best_score, best_params_json, metrics_json, reject_stats_json, created_ts) VALUES(?,?,?,?,?,?,?,?)",
+                (str(run_id), 1 if promoted else 0, str(chosen_exec_tf or ""), float(best_score), _json_dumps_safe(best_params), _json_dumps_safe(metrics), _json_dumps_safe(reject_stats), float(time.time())),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def _db_get_last_opt_run() -> Optional[dict]:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute(
+                "SELECT run_id, started_ts, finished_ts, status, days, session_mode, tf_candidates_json, universe_snap_id, universe_size, progress_json, notes FROM optimization_runs ORDER BY started_ts DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            run_id, started_ts, finished_ts, status, days, session_mode, tf_json, universe_snap_id, universe_size, progress_json, notes = row
+            return {
+                "run_id": str(run_id),
+                "started_ts": float(started_ts or 0.0),
+                "finished_ts": float(finished_ts or 0.0) if finished_ts is not None else None,
+                "status": str(status),
+                "days": int(days or 0),
+                "session_mode": str(session_mode),
+                "tf_candidates": json.loads(tf_json) if tf_json else [],
+                "universe_snap_id": str(universe_snap_id or ""),
+                "universe_size": int(universe_size or 0),
+                "progress": json.loads(progress_json) if progress_json else {},
+                "notes": str(notes or ""),
+            }
+    except Exception:
+        return None
+
+def _db_get_opt_result(run_id: str) -> Optional[dict]:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute(
+                "SELECT promoted, chosen_exec_tf, best_score, best_params_json, metrics_json, reject_stats_json, created_ts FROM optimization_results WHERE run_id=?",
+                (str(run_id),),
+            ).fetchone()
+            if not row:
+                return None
+            promoted, chosen_exec_tf, best_score, best_params_json, metrics_json, reject_stats_json, created_ts = row
+            return {
+                "run_id": str(run_id),
+                "promoted": bool(int(promoted or 0)),
+                "chosen_exec_tf": str(chosen_exec_tf or ""),
+                "best_score": float(best_score or 0.0),
+                "best_params": json.loads(best_params_json) if best_params_json else {},
+                "metrics": json.loads(metrics_json) if metrics_json else {},
+                "reject_stats": json.loads(reject_stats_json) if reject_stats_json else {},
+                "created_ts": float(created_ts or 0.0),
+            }
+    except Exception:
+        return None
+
+def _db_log_promotion(run_id: str, from_cfg: dict, to_cfg: dict, decision: str, reasons: list[str]) -> None:
+    _opt_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO promotion_log(ts, run_id, from_cfg_json, to_cfg_json, decision, reasons_json) VALUES(?,?,?,?,?,?)",
+                (float(time.time()), str(run_id), _json_dumps_safe(from_cfg), _json_dumps_safe(to_cfg), str(decision), _json_dumps_safe(reasons or [])),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+def _governor_adjust_quality_floor(session_name: str = "NY") -> Optional[dict]:
+    """Setup governor to keep *email* setup frequency roughly 7–10/day without spamming."""
+    cfg = load_strategy_config(force=True)
+    if not bool(cfg.get("governor_enabled", True)):
+        return None
+
+    try:
+        window_h = float(cfg.get("governor_window_hours", 24) or 24)
+        target_lo = float(cfg.get("governor_target_lo", cfg.get("target_setups_per_day_lo", 3.0)) or 3.0)
+        target_hi = float(cfg.get("governor_target_hi", cfg.get("target_setups_per_day_hi", 5.0)) or 5.0)
+        step = float(cfg.get("governor_step_score", 1.0) or 1.0)
+        smin = float(cfg.get("governor_score_min", 52.0) or 52.0)
+        smax = float(cfg.get("governor_score_max", 82.0) or 82.0)
+        last_adj = float(cfg.get("governor_last_adjust_ts", 0.0) or 0.0)
+    except Exception:
+        return None
+
+    # Avoid oscillation
+    if time.time() - last_adj < 3600.0:
+        return None
+
+    since_ts = time.time() - window_h * 3600.0
+    sess = str(session_name or "").upper().strip() or "NY"
+
+    n = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            try:
+                n = int(c.execute(
+                    "SELECT COUNT(1) AS n FROM generated_setups WHERE source='email' AND created_ts>=? AND (session='' OR session IS NULL OR session=?)",
+                    (float(since_ts), sess),
+                ).fetchone()["n"])
+            except Exception:
+                n = int(c.execute(
+                    "SELECT COUNT(1) AS n FROM generated_setups WHERE source='email' AND created_ts>=?",
+                    (float(since_ts),),
+                ).fetchone()["n"])
+    except Exception:
+        n = 0
+
+    setups_per_day = float(n) / max(1e-9, (window_h / 24.0))
+
+    cur_q = float(cfg.get("quality_score_min_email", QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
+    new_q = cur_q
+    action = "hold"
+
+    if setups_per_day > target_hi:
+        new_q = min(smax, cur_q + step); action = "tighten"
+    elif setups_per_day < target_lo:
+        new_q = max(smin, cur_q - step); action = "loosen"
+
+    if abs(new_q - cur_q) < 1e-9:
+        return None
+
+    cfg["quality_score_min_email"] = float(new_q)
+    cfg["governor_last_adjust_ts"] = float(time.time())
+    save_strategy_config(cfg)
+    apply_strategy_config(cfg)
+
+    return {"session": sess, "window_h": window_h, "setups_per_day": setups_per_day, "action": action, "from": cur_q, "to": new_q, "target_lo": target_lo, "target_hi": target_hi}
+
+def _self_opt_stability_gates(metrics: dict, cfg: dict) -> tuple[bool, list[str]]:
+    """Promotion gates (OOS). Returns (ok, reasons_if_not_ok)."""
+    reasons = []
+    try:
+        oos = metrics.get("oos") or {}
+        total_setups = int(oos.get("setups", 0) or 0)
+        setups_day = float(oos.get("setups_per_day", 0.0) or 0.0)
+        wr = float(oos.get("win_rate", 0.0) or 0.0)
+        avg_r = float(oos.get("avg_R", 0.0) or 0.0)
+        pf = float(oos.get("profit_factor", 0.0) or 0.0)
+        dd = float(oos.get("max_drawdown_R", 0.0) or 0.0)
+        conc = float(oos.get("top_symbol_share", 0.0) or 0.0)
+    except Exception:
+        return (False, ["metrics_parse_error"])
+
+    min_setups = int(cfg.get("oos_min_setups", 30) or 30)
+    if total_setups < min_setups:
+        reasons.append(f"oos_sample_too_small ({total_setups} < {min_setups})")
+
+    lo = float(cfg.get("target_setups_per_day_lo", 1.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 3.0))
+    if setups_day < lo:
+        reasons.append(f"frequency_too_low ({setups_day:.2f} < {lo:.2f})")
+    if setups_day > hi * 1.25:
+        reasons.append(f"frequency_too_high ({setups_day:.2f} > {hi*1.25:.2f})")
+
+    if pf < 1.15:
+        reasons.append(f"pf_too_low ({pf:.2f} < 1.15)")
+    if avg_r < 0.10:
+        reasons.append(f"avg_R_too_low ({avg_r:.3f} < 0.10)")
+
+    dd_cap = float(cfg.get("max_drawdown_R_cap", 8.0) or 8.0)
+    if dd > dd_cap:
+        reasons.append(f"drawdown_too_high ({dd:.2f}R > {dd_cap:.2f}R)")
+
+    conc_cap = float(cfg.get("concentration_cap", 0.25) or 0.25)
+    if conc > conc_cap:
+        reasons.append(f"overconcentrated (top_symbol_share={conc:.2%} > {conc_cap:.2%})")
+
+    min_wr = float(cfg.get("min_win_rate", 70.0) or 70.0)
+    min_wr_samples = int(cfg.get("min_win_rate_samples", 50) or 50)
+    if total_setups >= min_wr_samples and wr < min_wr:
+        reasons.append(f"win_rate_below_target ({wr:.1f}% < {min_wr:.1f}%)")
+
+    return (len(reasons) == 0), reasons
+
+def _self_opt_format_report(res: dict) -> str:
+    run_id = res.get("run_id") or "?"
+    promoted = bool(res.get("promoted"))
+    chosen_tf = res.get("chosen_exec_tf") or "?"
+    score = float(res.get("best_score", 0.0) or 0.0)
+    p = res.get("best_params") or {}
+    m = res.get("metrics") or {}
+    oos = m.get("oos") or {}
+    sess = m.get("by_session") or {}
+
+    def _sess_line(name: str):
+        d = sess.get(name) or {}
+        return f"{name}: setups={int(d.get('setups',0) or 0)} | WR={float(d.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(d.get('avg_R',0.0) or 0.0):.3f}"
+
+    lines = [
+        "🧠 Self-Optimize Report (last)",
+        HDR,
+        f"Run: {run_id}",
+        f"Decision: {'✅ PROMOTED' if promoted else '❌ NOT PROMOTED'}",
+        f"Chosen exec TF: {chosen_tf} | Objective: {score:.3f}",
+        SEP,
+        f"OOS setups/day: {float(oos.get('setups_per_day',0.0) or 0.0):.2f} (target {float(p.get('target_setups_per_day_lo',1.0) or 1.0):.0f}–{float(p.get('target_setups_per_day_hi',3.0) or 3.0):.0f})",
+        f"OOS setups: {int(oos.get('setups',0) or 0)} | Win rate: {float(oos.get('win_rate',0.0) or 0.0):.1f}%",
+        f"OOS Avg R: {float(oos.get('avg_R',0.0) or 0.0):.3f} | PF: {float(oos.get('profit_factor',0.0) or 0.0):.2f} | MaxDD(R): {float(oos.get('max_drawdown_R',0.0) or 0.0):.2f}",
+        f"Concentration: top_symbol_share={float(oos.get('top_symbol_share',0.0) or 0.0):.1%}",
+        SEP,
+        "Session breakdown (OOS):",
+        f"• {_sess_line('NY')}",
+        f"• {_sess_line('LON')}",
+        f"• {_sess_line('ASIA')}",
+        SEP,
+        "Best params (subset):",
+        f"quality_score_min_screen={p.get('quality_score_min_screen')} | quality_score_min_email={p.get('quality_score_min_email')}",
+        f"min_rr_tp={p.get('min_rr_tp', p.get('min_rr_tp'))} | atr_min_pct={p.get('atr_min_pct')}",
+        f"tf_align_1h_min_abs={p.get('tf_align_1h_min_abs')} | tf_align_4h_min_abs={p.get('tf_align_4h_min_abs')}",
+    ]
+
+    try:
+        rejects = res.get("reject_stats") or {}
+        if isinstance(rejects, dict) and rejects:
+            lines.append(SEP)
+            lines.append("Top reject reasons (OOS generator):")
+            items = sorted(rejects.items(), key=lambda kv: int(kv[1]), reverse=True)[:10]
+            for k, v in items:
+                lines.append(f"• {k}: {int(v)}")
+    except Exception:
+        pass
+
+    try:
+        reasons = (m.get("promotion_reasons") or [])
+        if isinstance(reasons, list) and reasons:
+            lines.append(SEP)
+            lines.append("Promotion gate notes:")
+            for r in reasons[:12]:
+                lines.append(f"• {str(r)}")
+    except Exception:
+        pass
+
+    try:
+        win_blocks = m.get("autotune_windows") or []
+        if isinstance(win_blocks, list) and win_blocks:
+            lines.append(SEP)
+            lines.append("Autotune windows:")
+            for w in win_blocks[:8]:
+                ws = (w or {}).get("summary") or {}
+                lines.append(
+                    f"• {w.get('label')}: setups/day={float(ws.get('setups_per_day',0.0) or 0.0):.2f} | WR={float(ws.get('win_rate',0.0) or 0.0):.1f}% | avgR={float(ws.get('avg_R',0.0) or 0.0):.3f}"
+                )
+    except Exception:
+        pass
+
+    try:
+        lg = m.get("learning_guard") or {}
+        if isinstance(lg, dict) and lg:
+            lines.append(SEP)
+            lines.append(
+                f"Learning guard: estWR={float(lg.get('estimated_wr',0.0) or 0.0):.1f}% | conf={str(lg.get('confidence') or 'low')} | live_sample={int(lg.get('live_sample',0) or 0)} | recent_closed={int(lg.get('recent_closed',0) or 0)}"
+            )
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+def _compute_oos_summary(oos_rows: list[dict], days: float, conc_cap: float) -> dict:
+    ok_rows = [r for r in (oos_rows or []) if r and r.get("ok")]
+    total_setups = sum(int(r.get("setups",0) or 0) for r in ok_rows)
+    total_days = max(1.0, float(days))
+    setups_day = float(total_setups) / total_days
+
+    if total_setups <= 0:
+        return {"setups": 0, "setups_per_day": float(setups_day), "win_rate": 0.0, "avg_R": 0.0, "profit_factor": 0.0, "max_drawdown_R": 0.0, "top_symbol_share": 0.0}
+
+    w_sum = float(total_setups)
+    avg_r = sum(float(r.get("avg_R",0.0) or 0.0) * float(r.get("setups",0) or 0) for r in ok_rows) / w_sum
+    wr = sum(float(r.get("win_rate",0.0) or 0.0) * float(r.get("setups",0) or 0) for r in ok_rows) / w_sum
+    pf = sum((10.0 if r.get("profit_factor")==float("inf") else float(r.get("profit_factor") or 0.0)) * float(r.get("setups",0) or 0) for r in ok_rows) / w_sum
+    dd = sum(float(r.get("max_drawdown_R",0.0) or 0.0) * float(r.get("setups",0) or 0) for r in ok_rows) / w_sum
+
+    sym_counts = sorted([int(r.get("setups",0) or 0) for r in ok_rows], reverse=True)
+    top_share = (float(sym_counts[0]) / float(total_setups)) if sym_counts and total_setups > 0 else 0.0
+
+    return {"setups": int(total_setups), "setups_per_day": float(setups_day), "win_rate": float(wr), "avg_R": float(avg_r), "profit_factor": float(pf), "max_drawdown_R": float(dd), "top_symbol_share": float(top_share), "concentration_cap": float(conc_cap)}
+
+def _aggregate_by_session(oos_rows: list[dict]) -> dict:
+    out = {"NY": {"n": 0, "wr": 0.0, "r": 0.0}, "LON": {"n": 0, "wr": 0.0, "r": 0.0}, "ASIA": {"n": 0, "wr": 0.0, "r": 0.0}}
+    for r in (oos_rows or []):
+        if not r or not r.get("ok"):
+            continue
+        bs = r.get("by_session") or {}
+        if not isinstance(bs, dict):
+            continue
+        for sname in ("NY","LON","ASIA"):
+            d = bs.get(sname) or {}
+            try:
+                n = float(d.get("setups",0) or 0.0)
+                if n <= 0:
+                    continue
+                out[sname]["n"] += n
+                out[sname]["wr"] += float(d.get("win_rate",0.0) or 0.0) * n
+                out[sname]["r"] += float(d.get("avg_R",0.0) or 0.0) * n
+            except Exception:
+                continue
+    pretty = {}
+    for sname, d in out.items():
+        n = float(d["n"] or 0.0)
+        pretty[sname] = {"setups": int(n), "win_rate": float((d["wr"]/n) if n else 0.0), "avg_R": float((d["r"]/n) if n else 0.0)}
+    return pretty
+
+def _summarize_universe_rows(rows: list[dict], days: float, live_only: bool = False) -> tuple[dict, list[dict], dict]:
+    total_days = max(1.0, float(days or 1.0))
+    filt = []
+    for rr in (rows or []):
+        if not isinstance(rr, dict):
+            continue
+        if live_only and not bool(rr.get('live_equivalent', False)):
+            continue
+        filt.append(rr)
+
+    total = len(filt)
+    if total <= 0:
+        empty = {'setups': 0, 'setups_per_day': 0.0, 'win_rate': 0.0, 'avg_R': 0.0, 'profit_factor': 0.0, 'max_drawdown_R': 0.0, 'equity_R': 0.0, 'top_symbol_share': 0.0}
+        per_session = {s: {'setups': 0, 'win_rate': 0.0, 'avg_R': 0.0} for s in ('NY', 'LON', 'ASIA')}
+        return empty, [], per_session
+
+    day_map = {}
+    sess_map = {s: {'setups': 0, 'wins': 0, 'losses': 0, 'r_sum': 0.0} for s in ('NY', 'LON', 'ASIA')}
+    sym_ctr = Counter()
+    wins = 0
+    losses = 0
+    r_sum = 0.0
+    gross_win = 0.0
+    gross_loss = 0.0
+    eq = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for rr in filt:
+        sym = str(rr.get('symbol') or '')
+        if sym:
+            sym_ctr[sym] += 1
+        won = bool(rr.get('win'))
+        out = str(rr.get('outcome') or '').upper().strip()
+        r_mult = float(rr.get('R', 0.0) or 0.0)
+        if won:
+            wins += 1
+        elif out in ('SL', 'LOSS', 'SL_FIRST', 'TP_SL'):
+            losses += 1
+        r_sum += r_mult
+        gross_win += max(0.0, r_mult)
+        gross_loss += min(0.0, r_mult)
+        eq += r_mult
+        peak = max(peak, eq)
+        max_dd = max(max_dd, peak - eq)
+
+        sess = str(rr.get('session') or '').upper().strip()
+        if sess in sess_map:
+            sess_map[sess]['setups'] += 1
+            sess_map[sess]['r_sum'] += r_mult
+            if won:
+                sess_map[sess]['wins'] += 1
+            elif out in ('SL', 'LOSS', 'SL_FIRST', 'TP_SL'):
+                sess_map[sess]['losses'] += 1
+
+        day = str(rr.get('day') or '')
+        if day:
+            node = day_map.setdefault(day, {'day': day, 'setups': 0, 'wins': 0, 'losses': 0, 'r_sum': 0.0, 'by_session': {'NY': 0, 'LON': 0, 'ASIA': 0}})
+            node['setups'] += 1
+            node['r_sum'] += r_mult
+            if won:
+                node['wins'] += 1
+            elif out in ('SL', 'LOSS', 'SL_FIRST', 'TP_SL'):
+                node['losses'] += 1
+            if sess in node['by_session']:
+                node['by_session'][sess] += 1
+
+    per_day = []
+    for day in sorted(day_map):
+        node = day_map[day]
+        decided = int(node['wins']) + int(node['losses'])
+        n = int(node['setups'])
+        per_day.append({
+            'day': day,
+            'setups': n,
+            'wins': int(node['wins']),
+            'losses': int(node['losses']),
+            'win_rate': float((float(node['wins']) / decided) * 100.0) if decided else 0.0,
+            'avg_R': float(float(node['r_sum']) / n) if n else 0.0,
+            'by_session': dict(node['by_session']),
+        })
+
+    per_session = {}
+    for sess, d in sess_map.items():
+        n = int(d['setups'])
+        decided = int(d['wins']) + int(d['losses'])
+        per_session[sess] = {
+            'setups': n,
+            'win_rate': float((float(d['wins']) / decided) * 100.0) if decided else 0.0,
+            'avg_R': float(float(d['r_sum']) / n) if n else 0.0,
+        }
+
+    pf = (gross_win / abs(gross_loss)) if gross_loss < 0 else (float('inf') if gross_win > 0 else 0.0)
+    top_share = (float(max(sym_ctr.values())) / float(total)) if sym_ctr else 0.0
+    overall = {
+        'setups': int(total),
+        'setups_per_day': float(total / total_days),
+        'win_rate': float((wins / total) * 100.0) if total else 0.0,
+        'avg_R': float(r_sum / total) if total else 0.0,
+        'profit_factor': float(pf),
+        'max_drawdown_R': float(max_dd),
+        'equity_R': float(eq),
+        'top_symbol_share': float(top_share),
+    }
+    return overall, per_day, per_session
+
+def _normalize_autotune_windows(cfg: dict) -> list[dict]:
+    """Safe normalized historical windows for zero-touch optimizer."""
+    raw = (cfg or {}).get("autotune_windows") or []
+    out = []
+    try:
+        for w in raw:
+            if not isinstance(w, dict):
+                continue
+            days = max(3, int(w.get("days", 7) or 7))
+            end_days_ago = max(0, int(w.get("end_days_ago", 0) or 0))
+            out.append({"days": days, "end_days_ago": end_days_ago, "label": f"{days}d_{end_days_ago}ago"})
+    except Exception:
+        out = []
+    if not out:
+        out = [
+            {"days": 7, "end_days_ago": 0, "label": "7d_0ago"},
+            {"days": 14, "end_days_ago": 0, "label": "14d_0ago"},
+            {"days": 21, "end_days_ago": 0, "label": "21d_0ago"},
+            {"days": 30, "end_days_ago": 0, "label": "30d_0ago"},
+        ]
+    return out
+
+
+def _slice_ohlcv_for_window(ohlcv: list, days: int, end_days_ago: int, tf: str, warmup_bars: int = 300) -> list:
+    if not ohlcv:
+        return []
+    try:
+        _since_ms, _until_ms, eval_since_ms, eval_until_ms = _backtest_window_bounds(days, end_days_ago=end_days_ago, warmup_bars=warmup_bars, tf=tf)
+        kept = []
+        for row in (ohlcv or []):
+            try:
+                ts = int(row[0])
+                if ts <= int(eval_until_ms):
+                    kept.append(row)
+            except Exception:
+                continue
+        if not kept:
+            return []
+        start_idx = 0
+        for i, row in enumerate(kept):
+            try:
+                if int(row[0]) >= int(eval_since_ms):
+                    start_idx = max(0, i - int(warmup_bars))
+                    break
+            except Exception:
+                continue
+        return kept[start_idx:]
+    except Exception:
+        return list(ohlcv or [])
+
+
+def _run_backtest_on_ohlcv_window(symbol: str, ohlcv: list, days: int, tf: str, session_name: str, end_days_ago: int = 0) -> dict:
+    sliced = _slice_ohlcv_for_window(ohlcv, days=days, end_days_ago=end_days_ago, tf=tf, warmup_bars=300)
+    rep = _run_backtest_on_ohlcv(symbol, sliced, days=days, tf=tf, session_name=session_name)
+    try:
+        rep["end_days_ago"] = int(end_days_ago)
+        rep["window_label"] = f"{int(days)}d_{int(end_days_ago)}ago"
+    except Exception:
+        pass
+    return rep
+
+
+def _window_bundle_summary(bundle_rows: dict, cfg: dict) -> dict:
+    windows = []
+    flat_rows = []
+    positive = 0
+    pass_wr = 0
+    scores = []
+    total_days = 0.0
+    min_wr_floor = float((cfg or {}).get("autotune_min_window_wr", 52.0) or 52.0)
+    for label, info in (bundle_rows or {}).items():
+        rows = list((info or {}).get("rows") or [])
+        days = int((info or {}).get("days", 0) or 0)
+        total_days += float(max(1, days))
+        summ = _compute_oos_summary(rows, days=float(max(1, days)), conc_cap=float((cfg or {}).get("concentration_cap", 0.25) or 0.25))
+        obj = _objective(rows, days=max(1, days), cfg=cfg) if rows else -1e12
+        windows.append({
+            "label": str(label),
+            "days": days,
+            "end_days_ago": int((info or {}).get("end_days_ago", 0) or 0),
+            "summary": summ,
+            "score": float(obj),
+        })
+        scores.append(float(obj))
+        flat_rows.extend(rows)
+        if float(summ.get("avg_R", 0.0) or 0.0) > 0:
+            positive += 1
+        if float(summ.get("win_rate", 0.0) or 0.0) >= min_wr_floor:
+            pass_wr += 1
+    agg = (_compute_oos_summary(
+        flat_rows,
+        days=float(max(1.0, total_days)),
+        conc_cap=float((cfg or {}).get("concentration_cap", 0.25) or 0.25),
+    ) if flat_rows else {})
+    std_pen = 0.0
+    if len(scores) >= 2:
+        try:
+            std_pen = float(statistics.pstdev(scores))
+        except Exception:
+            std_pen = 0.0
+    return {
+        "windows": windows,
+        "aggregate": agg,
+        "positive_windows": int(positive),
+        "passing_wr_windows": int(pass_wr),
+        "window_scores": [float(x) for x in scores],
+        "score_std": float(std_pen),
+    }
+
+
+def _autotune_learning_guard(session_mode: str = "ALL") -> dict:
+    try:
+        sess = None if str(session_mode).upper() == "ALL" else str(session_mode).upper()
+        live = _evolution_estimated_win_rate(session=sess)
+        recent = _autonomous_opt_performance_snapshot(window_hours=float(AUTONOMOUS_OPT_LOOKBACK_HOURS))
+        return {
+            "estimated_wr": float(live.get("estimated_wr", 0.0) or 0.0),
+            "confidence": str(live.get("confidence") or "low"),
+            "live_sample": int(live.get("live_sample", 0) or 0),
+            "recent_closed": int(recent.get("closed", 0) or 0),
+            "recent_win_rate": float(recent.get("win_rate", 0.0) or 0.0),
+        }
+    except Exception:
+        return {"estimated_wr": 0.0, "confidence": "low", "live_sample": 0, "recent_closed": 0, "recent_win_rate": 0.0}
+
+
+def _self_optimize_engine(days: int, session_mode: str, stop_event: threading.Event, progress_cb=None) -> dict:
+    """Runs full self-optimization pipeline in a worker thread.
+
+    Zero-touch design:
+    1) Search a bounded candidate grid on a primary window.
+    2) Re-test shortlisted candidates across multiple historical windows (7/14/21/30d by default).
+    3) Merge live-learning evidence as a promotion guard so weak real-world performance
+       can tighten promotion even if backtests look good.
+    """
+    _opt_migrate_tables()
+    base_cfg = load_strategy_config(force=True)
+    robust_windows = _normalize_autotune_windows(base_cfg)
+    primary_days = max(3, int(days or 7))
+
+    tf_candidates = list(base_cfg.get("exec_tf_candidates") or ["5m", "15m"])[:3]
+    if not tf_candidates:
+        tf_candidates = ["5m", "15m"]
+
+    univ = _build_universe_snapshot_top_volume(top_n=100, min_vol_usd=10_000_000.0)
+    universe_snap_id = str(univ.get("snap_id") or "")
+    universe = list(univ.get("market_symbols") or [])[:100]
+    universe_size = len(universe)
+
+    run_id = f"OPT-{_utc_day_str()}-{int(time.time())}"
+    _db_create_opt_run(run_id, days=int(primary_days), session_mode=str(session_mode), tf_candidates=tf_candidates, universe_snap_id=universe_snap_id, universe_size=universe_size)
+
+    cands = _generate_candidates(base_cfg)
+    days_test = max(7, int(primary_days * 0.3))
+    conc_cap = float(base_cfg.get("concentration_cap", 0.25) or 0.25)
+    robust_max_days = max([int(w.get("days", 0) or 0) for w in robust_windows] + [primary_days])
+    shortlist_n = max(4, int(base_cfg.get("autotune_shortlist", 10) or 10))
+
+    candidate_pool = []
+    ohlcv_cache_by_tf = {}
+
+    for exec_tf in tf_candidates:
+        if stop_event.is_set():
+            _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
+            return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
+
+        if progress_cb:
+            progress_cb(f"Fetching OHLCV for TF={exec_tf} (universe={len(universe)})…", {"stage": "fetch_ohlcv", "tf": exec_tf})
+
+        ohlcv_map = {}
+        tf_min = _tf_to_minutes(exec_tf)
+        bars = int((robust_max_days * 1440) / max(1, tf_min)) + 400
+        bars = int(min(12000, max(1200, bars)))
+        for si, sym in enumerate(universe):
+            if stop_event.is_set():
+                _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
+                return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
+            try:
+                ohlcv_map[sym] = fetch_ohlcv(sym, exec_tf, limit=bars)
+            except Exception:
+                ohlcv_map[sym] = []
+            if si % 15 == 0:
+                _db_update_opt_run(run_id, progress={"stage": "fetch_ohlcv", "tf": exec_tf, "symbol_idx": si, "universe": len(universe)})
+        ohlcv_cache_by_tf[exec_tf] = ohlcv_map
+
+        for ci, cand in enumerate(cands):
+            if stop_event.is_set():
+                _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
+                return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
+
+            cfg = dict(base_cfg)
+            cfg.update(cand)
+            cfg["exec_tf_default"] = str(exec_tf)
+            apply_strategy_config(cfg)
+
+            oos_rows = []
+            reject_acc = Counter()
+            for sym in universe:
+                ohl = ohlcv_map.get(sym) or []
+                rep = _run_backtest_on_ohlcv_window(sym, ohl, days=days_test, tf=exec_tf, session_name=session_mode, end_days_ago=0)
+                oos_rows.append(rep)
+                try:
+                    rb = rep.get("reject_breakdown") or {}
+                    if isinstance(rb, dict):
+                        reject_acc.update(rb)
+                except Exception:
+                    pass
+
+            sc = _objective(oos_rows, days=float(days_test), cfg=cfg)
+            oos_sum = _compute_oos_summary(oos_rows, days=float(days_test), conc_cap=conc_cap)
+            candidate_pool.append({
+                "score": float(sc),
+                "cfg": dict(cfg),
+                "tf": str(exec_tf),
+                "oos": dict(oos_sum),
+                "rejects": dict(reject_acc),
+            })
+
+            if ci % 5 == 0:
+                best_now = max([float(x.get("score", -1e18)) for x in candidate_pool] or [-1e18])
+                _db_update_opt_run(run_id, progress={"stage": "search", "tf": exec_tf, "cand_idx": ci, "cands": len(cands), "best_score": best_now})
+
+    if not candidate_pool:
+        _db_update_opt_run(run_id, status="FAILED", finished=True, notes="No viable candidate found")
+        _db_save_opt_result(run_id, promoted=False, chosen_exec_tf="", best_score=float(-1e18), best_params={}, metrics={}, reject_stats={})
+        return {"ok": False, "run_id": run_id, "status": "FAILED"}
+
+    shortlist = sorted(candidate_pool, key=lambda x: float(x.get("score", -1e18)), reverse=True)[:shortlist_n]
+    learning_guard = _autotune_learning_guard(session_mode=session_mode)
+
+    best_choice = None
+    best_robust_score = -1e18
+
+    for idx_c, item in enumerate(shortlist):
+        if stop_event.is_set():
+            _db_update_opt_run(run_id, status="CANCELLED", finished=True, notes="Stopped by /self_optimize_stop")
+            return {"ok": False, "run_id": run_id, "status": "CANCELLED"}
+
+        cfg = dict(item.get("cfg") or {})
+        exec_tf = str(item.get("tf") or cfg.get("exec_tf_default") or "15m")
+        apply_strategy_config(cfg)
+        ohlcv_map = ohlcv_cache_by_tf.get(exec_tf) or {}
+
+        bundle = {}
+        reject_acc = Counter(item.get("rejects") or {})
+        for w in robust_windows:
+            label = str(w.get("label") or f"{int(w.get('days',7))}d_{int(w.get('end_days_ago',0))}ago")
+            rows = []
+            for sym in universe:
+                ohl = ohlcv_map.get(sym) or []
+                rep = _run_backtest_on_ohlcv_window(sym, ohl, days=int(w.get("days", 7) or 7), tf=exec_tf, session_name=session_mode, end_days_ago=int(w.get("end_days_ago", 0) or 0))
+                rows.append(rep)
+                try:
+                    rb = rep.get("reject_breakdown") or {}
+                    if isinstance(rb, dict):
+                        reject_acc.update(rb)
+                except Exception:
+                    pass
+            bundle[label] = {"rows": rows, "days": int(w.get("days", 7) or 7), "end_days_ago": int(w.get("end_days_ago", 0) or 0)}
+
+        bundle_sum = _window_bundle_summary(bundle, cfg)
+        agg = bundle_sum.get("aggregate") or {}
+        pos_windows = int(bundle_sum.get("positive_windows", 0) or 0)
+        pass_wr_windows = int(bundle_sum.get("passing_wr_windows", 0) or 0)
+        score_std = float(bundle_sum.get("score_std", 0.0) or 0.0)
+        cons_pen = float(base_cfg.get("autotune_consistency_penalty", 2.0) or 2.0) * score_std
+        robust_score = float(agg.get("avg_R", 0.0) or 0.0) * 14.0 + float(agg.get("profit_factor", 0.0) or 0.0) * 1.6 - float(agg.get("max_drawdown_R", 0.0) or 0.0) * 0.9
+        robust_score += (pos_windows * 1.5) + (pass_wr_windows * 0.75) - cons_pen
+
+        if bool(base_cfg.get("autotune_learning_guard_enabled", True)):
+            est_wr = float(learning_guard.get("estimated_wr", 0.0) or 0.0)
+            conf = str(learning_guard.get("confidence") or "low").lower()
+            if conf in {"medium", "high"} and est_wr < 52.0:
+                robust_score -= (52.0 - est_wr) * 0.35
+
+        if robust_score > best_robust_score:
+            best_robust_score = float(robust_score)
+            best_choice = {
+                "cfg": dict(cfg),
+                "tf": exec_tf,
+                "metrics": {
+                    "oos": dict(agg),
+                    "by_session": _aggregate_by_session([r for v in bundle.values() for r in (v.get("rows") or [])]),
+                    "autotune_windows": list(bundle_sum.get("windows") or []),
+                    "positive_windows": pos_windows,
+                    "passing_wr_windows": pass_wr_windows,
+                    "score_std": score_std,
+                    "learning_guard": dict(learning_guard),
+                },
+                "rejects": dict(reject_acc),
+                "robust_score": float(robust_score),
+            }
+
+        _db_update_opt_run(run_id, progress={"stage": "robustness", "candidate_idx": idx_c, "shortlist": len(shortlist), "best_score": float(best_robust_score)})
+
+    if not best_choice:
+        _db_update_opt_run(run_id, status="FAILED", finished=True, notes="No robust candidate found")
+        _db_save_opt_result(run_id, promoted=False, chosen_exec_tf="", best_score=float(best_robust_score), best_params={}, metrics={}, reject_stats={})
+        return {"ok": False, "run_id": run_id, "status": "FAILED"}
+
+    best_params = dict(best_choice.get("cfg") or {})
+    best_tf = str(best_choice.get("tf") or best_params.get("exec_tf_default") or "15m")
+    best_metrics = dict(best_choice.get("metrics") or {})
+    best_rejects = dict(best_choice.get("rejects") or {})
+
+    gate_ok, gate_reasons = _self_opt_stability_gates(metrics={"oos": best_metrics.get("oos") or {}, "by_session": best_metrics.get("by_session") or {}}, cfg=best_params)
+    min_positive = int(base_cfg.get("autotune_min_positive_windows", 3) or 3)
+    if int(best_metrics.get("positive_windows", 0) or 0) < min_positive:
+        gate_ok = False
+        gate_reasons = list(gate_reasons or []) + [f"positive_windows<{min_positive}"]
+    if int(best_metrics.get("passing_wr_windows", 0) or 0) < min_positive:
+        gate_ok = False
+        gate_reasons = list(gate_reasons or []) + [f"passing_wr_windows<{min_positive}"]
+    lg = best_metrics.get("learning_guard") or {}
+    if bool(base_cfg.get("autotune_learning_guard_enabled", True)) and str(lg.get("confidence") or "low").lower() == "high" and float(lg.get("estimated_wr", 0.0) or 0.0) < 50.0:
+        gate_ok = False
+        gate_reasons = list(gate_reasons or []) + ["learning_guard_live_wr_below_50"]
+
+    best_metrics["promotion_reasons"] = ([] if gate_ok else gate_reasons)
+    best_metrics["autotune_mode"] = "zero_touch_multi_window"
+
+    _db_save_opt_result(run_id, promoted=bool(gate_ok), chosen_exec_tf=str(best_tf), best_score=float(best_robust_score), best_params=dict(best_params), metrics=dict(best_metrics), reject_stats=dict(best_rejects or {}))
+
+    from_cfg = load_strategy_config(force=True)
+    promoted = False
+    if gate_ok:
+        save_strategy_config(best_params)
+        apply_strategy_config(best_params)
+        _db_log_promotion(run_id, from_cfg=from_cfg, to_cfg=best_params, decision="PROMOTED", reasons=[])
+        promoted = True
+        _db_update_opt_run(run_id, status="PROMOTED", finished=True, notes="PROMOTED")
+    else:
+        _db_log_promotion(run_id, from_cfg=from_cfg, to_cfg=best_params, decision="NOT_PROMOTED", reasons=gate_reasons)
+        _db_update_opt_run(run_id, status="NOT_PROMOTED", finished=True, notes="NOT_PROMOTED")
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "promoted": promoted,
+        "chosen_exec_tf": best_tf,
+        "best_score": float(best_robust_score),
+        "best_params": dict(best_params),
+        "metrics": dict(best_metrics),
+        "reject_stats": dict(best_rejects or {}),
+        "universe_snap_id": universe_snap_id,
+        "universe_size": universe_size,
+        "session_mode": str(session_mode),
+        "days_requested": int(primary_days),
+        "autotune_windows": robust_windows,
+    }
+
+async def _notify_admins_autonomous_opt(bot, text_msg: str):
+    """No-op: autonomous optimization is fully zero-touch; no Telegram notifications."""
+    return
+
+
+def _autonomous_opt_recent_enough(hours: float) -> bool:
+    """True when the last optimization run finished recently enough."""
+    try:
+        last = _db_get_last_opt_run()
+        if not last:
+            return False
+        finished_ts = float(last.get("finished_ts") or 0.0)
+        started_ts = float(last.get("started_ts") or 0.0)
+        ref_ts = finished_ts if finished_ts > 0 else started_ts
+        if ref_ts <= 0:
+            return False
+        return (time.time() - ref_ts) < (float(hours) * 3600.0)
+    except Exception:
+        return False
+
+
+def _autonomous_opt_performance_snapshot(window_hours: float = 72.0) -> dict:
+    """Read recent signal outcomes to decide whether optimization is warranted."""
+    out = {
+        "emailed": 0,
+        "closed": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0.0,
+    }
+    try:
+        ts_from = float(time.time()) - float(window_hours) * 3600.0
+        con = db_connect()
+        cur = con.cursor()
+        out["emailed"] = int(cur.execute(
+            "SELECT COUNT(1) AS n FROM emailed_setups WHERE emailed_ts>=?",
+            (float(ts_from),),
+        ).fetchone()[0] or 0)
+        rows = cur.execute(
+            """SELECT o.outcome
+                   FROM emailed_setups e
+                   JOIN signal_outcomes o ON o.setup_id=e.setup_id
+                   WHERE e.emailed_ts>=?""",
+            (float(ts_from),),
+        ).fetchall() or []
+        con.close()
+        closed = 0
+        wins = 0
+        losses = 0
+        for r in rows:
+            outcome = str((r[0] if not isinstance(r, dict) else r.get("outcome")) or "").upper().strip()
+            w, l = _evolution_outcome_winloss(outcome)
+            if w or l:
+                closed += 1
+                wins += int(w)
+                losses += int(l)
+        out["closed"] = int(closed)
+        out["wins"] = int(wins)
+        out["losses"] = int(losses)
+        out["win_rate"] = float((wins / closed) * 100.0) if closed > 0 else 0.0
+        return out
+    except Exception:
+        return out
+
+
+def _autonomous_opt_should_run() -> tuple[bool, str]:
+    """Decision gate for the zero-touch optimizer."""
+    try:
+        if not bool(AUTONOMOUS_OPT_ENABLED):
+            return (False, "disabled")
+        cur_task = _SELF_OPT_STATE.get("task")
+        if cur_task and not cur_task.done():
+            return (False, "already_running")
+        if _autonomous_opt_recent_enough(float(AUTONOMOUS_OPT_MIN_INTERVAL_HOURS)):
+            snap = _autonomous_opt_performance_snapshot(window_hours=float(AUTONOMOUS_OPT_LOOKBACK_HOURS))
+            min_closed = int(AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS)
+            wr_floor = float(AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW)
+            if int(snap.get("closed", 0) or 0) >= min_closed and float(snap.get("win_rate", 0.0) or 0.0) >= wr_floor:
+                ub7 = _db_get_latest_universe_backtest(7) or {}
+                met7 = ub7.get('metrics') or {}
+                ov7 = met7.get('overall') or {}
+                if ov7 and float(ov7.get('win_rate', 0.0) or 0.0) < max(50.0, wr_floor - 10.0):
+                    return (True, 'recent_run_but_7d_universe_wr_soft')
+                return (False, "recent_run_and_performance_ok")
+        return (True, "run")
+    except Exception:
+        return (False, "gate_error")
+
+
+
+async def _refresh_universe_backtests_for_autopilot() -> None:
+    try:
+        cfg = load_strategy_config(force=False)
+        windows = list(cfg.get('universe_backtest_windows') or [7, 30])
+        tf = str(cfg.get('universe_backtest_exec_tf') or cfg.get('exec_tf_default') or '15m')
+        top_n = int(cfg.get('universe_backtest_top_n', 80) or 80)
+        for d in windows[:4]:
+            try:
+                dd = int(d or 0)
+            except Exception:
+                continue
+            if dd < 3:
+                continue
+            last = _db_get_latest_universe_backtest(dd) or {}
+            age_h = (time.time() - float(last.get('created_ts', 0.0) or 0.0)) / 3600.0 if last else 1e9
+            if age_h <= 6.0:
+                continue
+            await to_thread_heavy(run_universe_backtest, dd, 'ALL', tf, top_n, None, True, True)
+    except Exception:
+        return
+
+
+def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
+    cfg = cfg or load_strategy_config(force=False)
+    overall = (rep or {}).get('overall') or ((rep or {}).get('metrics') or {}).get('overall') or {}
+    per_session = (rep or {}).get('per_session') or ((rep or {}).get('metrics') or {}).get('by_session') or {}
+    live_setups = int(overall.get('setups', 0) or 0)
+    setups_day = float(overall.get('setups_per_day', 0.0) or 0.0)
+    wr = float(overall.get('win_rate', 0.0) or 0.0)
+    avg_r = float(overall.get('avg_R', 0.0) or 0.0)
+    pf = float(overall.get('profit_factor', 0.0) or 0.0)
+
+    lo = float((cfg or {}).get('market_adaptive_target_setups_per_day_lo', 1.0) or 1.0)
+    hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 3.0) or 3.0)
+    ny_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
+    lon_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
+
+    score = 0.0
+    score += float(avg_r) * 320.0
+    score += (float(wr) - 45.0) * 1.35
+    score += max(0.0, float(pf) - 1.0) * 8.0
+    if live_setups < 45:
+        score -= float(45 - live_setups) * 0.18
+    if setups_day < lo:
+        score -= float(lo - setups_day) * 4.0
+    elif setups_day > hi:
+        score -= float(setups_day - hi) * 2.4
+
+    for sess, floor, wt in (('NY', ny_floor, 1.4), ('LON', lon_floor, 1.2)):
+        sd = (per_session or {}).get(sess) or {}
+        s_setups = int(sd.get('setups', 0) or 0)
+        s_wr = float(sd.get('win_rate', 0.0) or 0.0)
+        if s_setups >= 15 and s_wr < floor:
+            score -= float(floor - s_wr) * float(wt)
+        elif s_setups >= 12 and s_wr > (floor + 6.0):
+            score += float(min(4.0, s_wr - floor)) * 0.25
+
+    asia_live = int(((per_session or {}).get('ASIA') or {}).get('setups', 0) or 0)
+    if asia_live > 0 and not _strategy_cfg_execution_asia_enabled(cfg):
+        score -= float(asia_live) * 0.35
+    return float(score)
+
+
+def _market_adaptive_apply_action(cfg: dict, actions: list[dict], param: str, value, reason: str) -> None:
+    def _set_path(d: dict, parts: list[str], v):
+        cur = d
+        for key in parts[:-1]:
+            nxt = cur.get(key)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                cur[key] = nxt
+            cur = nxt
+        cur[parts[-1]] = v
+
+    parts = [p for p in str(param or '').split('.') if p]
+    if not parts:
+        return
+    cur = cfg
+    found = True
+    for key in parts:
+        if isinstance(cur, dict) and key in cur:
+            old = cur.get(key)
+            cur = cur.get(key)
+        else:
+            found = False
+            old = None
+            break
+    if found and old == value:
+        return
+    _set_path(cfg, parts, value)
+    actions.append({"param": str(param), "from": old, "to": value, "reason": str(reason)})
+
+
+def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
+    out = json.loads(json.dumps(cfg or {}))
+    bounds = (out.get('opt_bounds') or {})
+
+    def _rng(name: str, lo: float, hi: float) -> tuple[float, float]:
+        try:
+            r = bounds.get(name) or [lo, hi]
+            return float(r[0]), float(r[1])
+        except Exception:
+            return float(lo), float(hi)
+
+    qlo, qhi = _rng('quality_score_min_screen', 52.0, 70.0)
+    out['quality_score_min_screen'] = float(clamp(float(out.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), max(qlo, 60.0), qhi))
+    email_lo = max(qlo + 8.0, 72.0)
+    email_hi = min(qhi + 14.0, 90.0)
+    out['quality_score_min_email'] = float(clamp(float(out.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), email_lo, email_hi))
+    rrlo, rrhi = _rng('min_rr_tp', 1.3, 2.4)
+    out['min_rr_tp'] = float(clamp(float(out.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), rrlo, rrhi))
+    alo, ahi = _rng('atr_min_pct', 0.4, 1.5)
+    out['atr_min_pct'] = float(clamp(float(out.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT), alo, ahi))
+    tlo, thi = _rng('tf_align_1h_min_abs', 0.3, 1.2)
+    out['tf_align_1h_min_abs'] = float(clamp(float(out.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), tlo, thi))
+    out['execution_asia_enabled'] = _strategy_cfg_execution_asia_enabled(out)
+    out['execution_engine_b_email_enabled'] = _cfg_bool(out.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
+    sess_ov = out.get('session_exec_overrides') or {}
+    norm_ov = {}
+    for sess in ('NY', 'LON', 'ASIA'):
+        row = sess_ov.get(sess) or {}
+        norm_ov[sess] = {
+            'quality_add': float(clamp(float(row.get('quality_add', 0.0) or 0.0), -6.0, 6.0)),
+            'conf_add': int(max(-4, min(6, int(round(float(row.get('conf_add', 0) or 0)))))),
+            'rr_add': float(clamp(float(row.get('rr_add', 0.0) or 0.0), -0.30, 0.40)),
+        }
+    out['session_exec_overrides'] = norm_ov
+    return out
+
+
+def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], list[str]]:
+    cfg = _market_adaptive_clamp_cfg(cfg)
+    overall = (rep or {}).get('overall') or {}
+    per_session = (rep or {}).get('per_session') or {}
+    metrics = (rep or {}).get('metrics') or {}
+    live_rejects = metrics.get('live_equivalent_reject_breakdown') or {}
+    actions: list[dict] = []
+    notes: list[str] = []
+
+    setups_day = float(overall.get('setups_per_day', 0.0) or 0.0)
+    wr = float(overall.get('win_rate', 0.0) or 0.0)
+    avg_r = float(overall.get('avg_R', 0.0) or 0.0)
+    total_setups = int(overall.get('setups', 0) or 0)
+    lo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 1.0) or 1.0)
+    hi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 3.0) or 3.0)
+    ny_floor = float(cfg.get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
+    lon_floor = float(cfg.get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
+
+    if _strategy_cfg_execution_asia_enabled(cfg):
+        asia = (per_session or {}).get('ASIA') or {}
+        if int(asia.get('setups', 0) or 0) >= 10 and float(asia.get('win_rate', 0.0) or 0.0) < 44.0:
+            _market_adaptive_apply_action(cfg, actions, 'session_exec_overrides.ASIA.quality_add', 1.25, 'ASIA_30d_live_WR_too_low')
+            _market_adaptive_apply_action(cfg, actions, 'session_exec_overrides.ASIA.conf_add', 1, 'ASIA_30d_live_WR_too_low')
+            _market_adaptive_apply_action(cfg, actions, 'session_exec_overrides.ASIA.rr_add', 0.08, 'ASIA_30d_live_WR_too_low')
+            notes.append('Kept ASIA executable lane ON by default and tightened ASIA execution thresholds instead of disabling it.')
+
+    for sess, floor in (('NY', ny_floor), ('LON', lon_floor)):
+        sd = (per_session or {}).get(sess) or {}
+        s_setups = int(sd.get('setups', 0) or 0)
+        s_wr = float(sd.get('win_rate', 0.0) or 0.0)
+        ov = ((cfg.get('session_exec_overrides') or {}).get(sess) or {}).copy()
+        if s_setups >= 15 and s_wr < floor:
+            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.quality_add', round(float(ov.get('quality_add', 0.0) or 0.0) + 0.75, 2), f'{sess}_WR_below_floor')
+            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.conf_add', int(float(ov.get('conf_add', 0) or 0)) + 1, f'{sess}_WR_below_floor')
+            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.rr_add', round(float(ov.get('rr_add', 0.0) or 0.0) + 0.03, 3), f'{sess}_WR_below_floor')
+            notes.append(f'{sess} live-equivalent WR is below the configured floor; tightened that session only.')
+        elif s_setups >= 12 and s_wr > (floor + 8.0) and setups_day < lo:
+            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.quality_add', round(float(ov.get('quality_add', 0.0) or 0.0) - 0.50, 2), f'{sess}_WR_strong_but_flow_low')
+            _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.conf_add', int(float(ov.get('conf_add', 0) or 0)) - 1, f'{sess}_WR_strong_but_flow_low')
+            notes.append(f'{sess} is strong but flow is too low; slightly loosened that session.')
+
+    far_ema_block = int(live_rejects.get('base_gate_entry_far_from_pullback_ema', 0) or 0) + int(live_rejects.get('entry_far_from_pullback_ema', 0) or 0)
+    score_gate_block = int(sum(int(v or 0) for k, v in (live_rejects or {}).items() if 'below_score_' in str(k))) + int(live_rejects.get('below_exec_quality', 0) or 0)
+    if setups_day > hi or (avg_r < 0.0 and setups_day > (hi * 0.95)):
+        if score_gate_block < max(500, far_ema_block * 2):
+            _market_adaptive_apply_action(cfg, actions, 'quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) + 0.5, 2), 'flow_too_high_or_negative_expectancy')
+            _market_adaptive_apply_action(cfg, actions, 'quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) + 0.5, 2), 'flow_too_high_or_negative_expectancy')
+        if far_ema_block < 2200:
+            _market_adaptive_apply_action(cfg, actions, 'tf_align_1h_min_abs', round(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS) + 0.05, 3), 'stretched_entries_need_tighter_alignment')
+        notes.append('Executable flow is too high for recent 30d edge; tightened alignment first and only nudged global score floors when score-blockers were not already dominant.')
+    elif setups_day < lo and total_setups < 180:
+        if wr >= 48.0 or avg_r >= 0.0:
+            _market_adaptive_apply_action(cfg, actions, 'quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 1.0, 2), 'flow_too_low')
+            _market_adaptive_apply_action(cfg, actions, 'quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.0, 2), 'flow_too_low')
+            _market_adaptive_apply_action(cfg, actions, 'min_rr_tp', round(float(cfg.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP)) or MIN_RR_TP) - 0.05, 3), 'flow_too_low')
+            notes.append('Executable flow is too low while edge is acceptable; loosened the global floor slightly.')
+
+    if avg_r < -0.08 and setups_day > max(lo, 4.0) and _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)):
+        _market_adaptive_apply_action(cfg, actions, 'execution_engine_b_email_enabled', False, 'engine_b_risk_off_due_to_negative_30d_expectancy')
+        notes.append('Disabled Engine B executable lane after materially negative 30d live-equivalent expectancy.')
+    elif avg_r > 0.05 and setups_day < lo and not _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)):
+        _market_adaptive_apply_action(cfg, actions, 'execution_engine_b_email_enabled', True, 'engine_b_restored_after_positive_edge_and_low_flow')
+        notes.append('Re-enabled Engine B executable lane because recent edge is positive but flow is too low.')
+
+    # Production safety ratchet: when 30d live-equivalent edge is clearly weak, tighten faster.
+    if total_setups >= 100 and (wr < 40.0 or avg_r < -0.01):
+        if score_gate_block < max(650, far_ema_block * 2):
+            _market_adaptive_apply_action(cfg, actions, 'quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) + 1.0, 2), '30d_live_wr_below_40_or_negative_expectancy')
+            _market_adaptive_apply_action(cfg, actions, 'quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) + 0.5, 2), '30d_live_wr_below_40_or_negative_expectancy')
+        _market_adaptive_apply_action(cfg, actions, 'min_rr_tp', round(float(cfg.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP)) or MIN_RR_TP) + 0.08, 3), 'raise_reward_floor_when_edge_is_weak')
+        _market_adaptive_apply_action(cfg, actions, 'tf_align_1h_min_abs', round(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS) + 0.08, 3), 'tighter_alignment_when_edge_is_weak')
+        if _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)):
+            _market_adaptive_apply_action(cfg, actions, 'execution_engine_b_email_enabled', False, 'disable_engine_b_until_30d_edge_recovers')
+        for sess in ('NY', 'LON', 'ASIA'):
+            sd = (per_session or {}).get(sess) or {}
+            if int(sd.get('setups', 0) or 0) >= 12 and float(sd.get('win_rate', 0.0) or 0.0) < (50.0 if sess != 'ASIA' else 55.0):
+                ov = ((cfg.get('session_exec_overrides') or {}).get(sess) or {}).copy()
+                q_add = 1.25 if sess != 'LON' else 0.50
+                c_add = 1 if sess != 'LON' else 0
+                rr_add = 0.05 if sess != 'LON' else 0.02
+                _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.quality_add', round(float(ov.get('quality_add', 0.0) or 0.0) + q_add, 2), f'{sess}_targeting_50_WR_recovery')
+                _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.conf_add', int(float(ov.get('conf_add', 0) or 0)) + c_add, f'{sess}_targeting_50_WR_recovery')
+                _market_adaptive_apply_action(cfg, actions, f'session_exec_overrides.{sess}.rr_add', round(float(ov.get('rr_add', 0.0) or 0.0) + rr_add, 3), f'{sess}_targeting_50_WR_recovery')
+        notes.append('30d live-equivalent edge is below target; tightened weak sessions and stretched-entry tolerance first, and only raised global score floors when score-blockers were not already dominating.')
+
+    return actions, notes
+
+
+
+
+def _runtime_profile_migrate_tables():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS runtime_profiles (
+                profile_id TEXT PRIMARY KEY,
+                created_ts REAL NOT NULL,
+                applied_ts REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ACTIVE',
+                source TEXT NOT NULL DEFAULT '',
+                baseline_profile_id TEXT NOT NULL DEFAULT '',
+                probation_until_ts REAL NOT NULL DEFAULT 0,
+                score REAL NOT NULL DEFAULT 0,
+                params_json TEXT NOT NULL DEFAULT '',
+                summary_json TEXT NOT NULL DEFAULT '',
+                revert_reason TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS runtime_profile_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                profile_id TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL DEFAULT '',
+                detail_json TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT ''
+            )""")
+            try:
+                c.execute("CREATE INDEX IF NOT EXISTS idx_runtime_profiles_status ON runtime_profiles(status, applied_ts)")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_runtime_profile_events_ts ON runtime_profile_events(ts DESC)")
+            except Exception:
+                pass
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _runtime_profile_snapshot_from_cfg(cfg: dict | None = None) -> dict:
+    cfg = _market_adaptive_clamp_cfg(cfg or load_strategy_config(force=False))
+    return {
+        'quality_score_min_email': float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
+        'quality_score_min_screen': float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN),
+        'min_rr_tp': float(cfg.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP)) or MIN_RR_TP),
+        'tf_align_1h_min_abs': float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS),
+        'atr_min_pct': float(cfg.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT),
+        'execution_asia_enabled': _strategy_cfg_execution_asia_enabled(cfg),
+        'execution_engine_b_email_enabled': _cfg_bool(cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)),
+        'session_exec_overrides': json.loads(json.dumps(cfg.get('session_exec_overrides') or {})),
+    }
+
+
+def _runtime_profile_log_event(profile_id: str, event_type: str, detail: dict | None = None, note: str = '') -> None:
+    _runtime_profile_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO runtime_profile_events(ts, profile_id, event_type, detail_json, note) VALUES(?,?,?,?,?)",
+                (float(time.time()), str(profile_id or ''), str(event_type or ''), _json_dumps_safe(detail or {}), str(note or '')),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _runtime_profile_get_current() -> dict:
+    _runtime_profile_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            row = c.execute(
+                "SELECT * FROM runtime_profiles WHERE status IN ('PROBATION','ACTIVE') ORDER BY applied_ts DESC, created_ts DESC LIMIT 1"
+            ).fetchone()
+            out = dict(row) if row else {}
+            if out:
+                try:
+                    out['params'] = json.loads(out.get('params_json') or '{}')
+                except Exception:
+                    out['params'] = {}
+                try:
+                    out['summary'] = json.loads(out.get('summary_json') or '{}')
+                except Exception:
+                    out['summary'] = {}
+            return out
+    except Exception:
+        return {}
+
+
+def _runtime_profile_get_by_id(profile_id: str) -> dict:
+    _runtime_profile_migrate_tables()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            row = c.execute("SELECT * FROM runtime_profiles WHERE profile_id=? LIMIT 1", (str(profile_id or ''),)).fetchone()
+            out = dict(row) if row else {}
+            if out:
+                try:
+                    out['params'] = json.loads(out.get('params_json') or '{}')
+                except Exception:
+                    out['params'] = {}
+                try:
+                    out['summary'] = json.loads(out.get('summary_json') or '{}')
+                except Exception:
+                    out['summary'] = {}
+            return out
+    except Exception:
+        return {}
+
+
+def _runtime_profile_bootstrap_if_missing(cfg: dict | None = None) -> dict:
+    cur = _runtime_profile_get_current()
+    if cur:
+        return cur
+    _runtime_profile_migrate_tables()
+    cfg = _market_adaptive_clamp_cfg(cfg or load_strategy_config(force=True))
+    params = _runtime_profile_snapshot_from_cfg(cfg)
+    profile_id = f"RP-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+    summary = {
+        'baseline_signal_wr': float(_signal_wr_display_metrics(int(AUTOTRADE_OWNER_UID or 0)).get('binary_win_rate', 0.0) if int(AUTOTRADE_OWNER_UID or 0) > 0 else 0.0),
+        'baseline_live_wr': float(_learning_live_trade_summary(int(AUTOTRADE_OWNER_UID or 0), days=30).get('win_rate', 0.0) if int(AUTOTRADE_OWNER_UID or 0) > 0 else 0.0),
+        'bootstrap': True,
+    }
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO runtime_profiles(profile_id, created_ts, applied_ts, status, source, baseline_profile_id, probation_until_ts, score, params_json, summary_json, revert_reason, notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(profile_id), float(time.time()), float(time.time()), 'ACTIVE', 'bootstrap', '', 0.0, 0.0, _json_dumps_safe(params), _json_dumps_safe(summary), '', 'initial_bootstrap_from_strategy_config'),
+            )
+            conn.commit()
+        _runtime_profile_log_event(profile_id, 'BOOTSTRAP', summary, 'Initial DB-backed runtime profile created.')
+    except Exception:
+        pass
+    return _runtime_profile_get_current()
+
+
+def _runtime_profile_create_from_cfg(cfg: dict, source: str, status: str = 'PROBATION', baseline_profile_id: str = '', score: float = 0.0, probation_hours: float = 72.0, summary: dict | None = None, notes: str = '') -> dict:
+    _runtime_profile_migrate_tables()
+    cfg = _market_adaptive_clamp_cfg(cfg or load_strategy_config(force=True))
+    params = _runtime_profile_snapshot_from_cfg(cfg)
+    profile_id = f"RP-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+    now_ts = float(time.time())
+    probation_until = now_ts + max(1.0, float(probation_hours or 72.0)) * 3600.0 if str(status or '').upper() == 'PROBATION' else 0.0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("UPDATE runtime_profiles SET status='SUPERSEDED' WHERE status='ACTIVE'")
+            c.execute("UPDATE runtime_profiles SET status='SUPERSEDED_PENDING' WHERE status='PROBATION'")
+            c.execute(
+                "INSERT OR REPLACE INTO runtime_profiles(profile_id, created_ts, applied_ts, status, source, baseline_profile_id, probation_until_ts, score, params_json, summary_json, revert_reason, notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(profile_id), now_ts, now_ts, str(status or 'PROBATION').upper(), str(source or ''), str(baseline_profile_id or ''), float(probation_until), float(score or 0.0), _json_dumps_safe(params), _json_dumps_safe(summary or {}), '', str(notes or '')),
+            )
+            conn.commit()
+        _runtime_profile_log_event(profile_id, 'PROFILE_CREATED', summary or {}, notes)
+    except Exception:
+        pass
+    return _runtime_profile_get_by_id(profile_id)
+
+
+def _signal_outcome_summary_since(user_id: int, since_ts: float, session: str | None = None) -> dict:
+    user_id = int(user_id or 0)
+    try:
+        _signal_outcome_sync_for_user(user_id, days=None, limit=1200, force=False)
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = "SELECT setup_id, session, emailed_ts FROM emailed_setups WHERE user_id=? AND emailed_ts>=?"
+            params = [int(user_id), float(since_ts or 0.0)]
+            if session:
+                q += " AND UPPER(COALESCE(session,''))=?"
+                params.append(str(session).upper())
+            q += " ORDER BY emailed_ts ASC"
+            emailed = [dict(r) for r in (c.execute(q, tuple(params)).fetchall() or [])]
+    except Exception:
+        emailed = []
+    user = get_user(user_id) or {}
+    rows, hidden = _signal_report_resolve_rows(user_id, emailed, user=user)
+    stats = _canonical_wr_stats(rows)
+    return {
+        'rows': rows,
+        'decided': int(stats.get('decided') or 0),
+        'wins': int(stats.get('wins') or 0),
+        'losses': int(stats.get('losses') or 0),
+        'win_rate': float(stats.get('win_rate') or 0.0),
+        'by_session': stats.get('by_session') or {},
+        'hidden_untracked_open': int(hidden or 0),
+    }
+
+
+def _autotrade_live_summary_since(uid: int, since_ts: float) -> dict:
+    trades = db_list_autotrade_trades_all(int(uid)) or []
+    sel = [t for t in trades if float(t.get('closed_ts') or 0.0) >= float(since_ts or 0.0)]
+    wins = 0
+    losses = 0
+    net = 0.0
+    for t in sel:
+        try:
+            pnl = float(t.get('pnl') or t.get('pnl_usdt') or 0.0)
+        except Exception:
+            pnl = 0.0
+        net += pnl
+        if pnl > 0:
+            wins += 1
+        elif pnl < 0:
+            losses += 1
+    decided = wins + losses
+    wr = (wins / decided * 100.0) if decided > 0 else 0.0
+    return {'closed': int(decided), 'wins': int(wins), 'losses': int(losses), 'win_rate': float(wr), 'net_pnl': float(net)}
+
+
+def _runtime_profile_review_probation(uid: int | None = None, force: bool = False) -> dict:
+    owner = int(uid or AUTOTRADE_OWNER_UID or 0)
+    cur = _runtime_profile_bootstrap_if_missing()
+    if not cur:
+        return {'status': 'NO_PROFILE'}
+    if str(cur.get('status') or '').upper() != 'PROBATION':
+        return {'status': 'NO_PROBATION', 'profile': cur}
+    cfg = load_strategy_config(force=False)
+    min_sig = int((cfg or {}).get('runtime_profile_min_signal_decisions', 12) or 12)
+    min_live = int((cfg or {}).get('runtime_profile_min_live_closes', 8) or 8)
+    wr_floor = float((cfg or {}).get('runtime_profile_revert_wr_floor', 45.0) or 45.0)
+    live_floor = float((cfg or {}).get('runtime_profile_revert_live_wr_floor', 38.0) or 38.0)
+    gap = float((cfg or {}).get('runtime_profile_revert_vs_baseline_gap', 3.0) or 3.0)
+    since_ts = float(cur.get('applied_ts') or cur.get('created_ts') or time.time())
+    probation_until = float(cur.get('probation_until_ts') or 0.0)
+    sig = _signal_outcome_summary_since(owner, since_ts) if owner > 0 else {'decided': 0, 'win_rate': 0.0}
+    live = _autotrade_live_summary_since(owner, since_ts) if owner > 0 else {'closed': 0, 'win_rate': 0.0}
+    baseline = _runtime_profile_get_by_id(str(cur.get('baseline_profile_id') or ''))
+    base_summary = baseline.get('summary') or {}
+    baseline_sig_wr = float(base_summary.get('baseline_signal_wr') or base_summary.get('probation_signal_wr') or 0.0)
+    baseline_live_wr = float(base_summary.get('baseline_live_wr') or base_summary.get('probation_live_wr') or 0.0)
+    enough_sample = bool(force) or int(sig.get('decided') or 0) >= min_sig or int(live.get('closed') or 0) >= min_live or (probation_until > 0 and time.time() >= probation_until)
+    if not enough_sample:
+        return {'status': 'WAITING', 'profile': cur, 'signal': sig, 'live': live}
+    revert = False
+    reasons = []
+    if int(sig.get('decided') or 0) >= min_sig:
+        if float(sig.get('win_rate') or 0.0) < wr_floor:
+            revert = True
+            reasons.append(f"signal_wr_below_floor ({float(sig.get('win_rate') or 0.0):.1f}%<{wr_floor:.1f}%)")
+        elif baseline_sig_wr > 0 and float(sig.get('win_rate') or 0.0) < (baseline_sig_wr - gap):
+            revert = True
+            reasons.append(f"signal_wr_below_baseline_gap ({float(sig.get('win_rate') or 0.0):.1f}%<{baseline_sig_wr - gap:.1f}%)")
+    if int(live.get('closed') or 0) >= min_live:
+        if float(live.get('win_rate') or 0.0) < live_floor:
+            revert = True
+            reasons.append(f"live_wr_below_floor ({float(live.get('win_rate') or 0.0):.1f}%<{live_floor:.1f}%)")
+        elif baseline_live_wr > 0 and float(live.get('win_rate') or 0.0) < (baseline_live_wr - gap):
+            revert = True
+            reasons.append(f"live_wr_below_baseline_gap ({float(live.get('win_rate') or 0.0):.1f}%<{baseline_live_wr - gap:.1f}%)")
+
+    if revert and baseline and baseline.get('params'):
+        save_strategy_config(_market_adaptive_clamp_cfg(baseline.get('params') or {}))
+        apply_strategy_config(load_strategy_config(force=True))
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute("UPDATE runtime_profiles SET status='REVERTED', revert_reason=? WHERE profile_id=?", ('; '.join(reasons), str(cur.get('profile_id') or '')))
+                c.execute("UPDATE runtime_profiles SET status='ACTIVE' WHERE profile_id=?", (str(baseline.get('profile_id') or ''),))
+                conn.commit()
+        except Exception:
+            pass
+        _runtime_profile_log_event(str(cur.get('profile_id') or ''), 'PROBATION_REVERT', {'signal': sig, 'live': live, 'reasons': reasons}, '; '.join(reasons))
+        return {'status': 'REVERTED', 'profile': _runtime_profile_get_by_id(str(cur.get('profile_id') or '')), 'baseline': baseline, 'signal': sig, 'live': live, 'reasons': reasons}
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE runtime_profiles SET status='ACTIVE', summary_json=? WHERE profile_id=?",
+                (_json_dumps_safe({'probation_signal_wr': float(sig.get('win_rate') or 0.0), 'probation_live_wr': float(live.get('win_rate') or 0.0), 'signal_decided': int(sig.get('decided') or 0), 'live_closed': int(live.get('closed') or 0), 'baseline_signal_wr': baseline_sig_wr, 'baseline_live_wr': baseline_live_wr}), str(cur.get('profile_id') or '')),
+            )
+            conn.commit()
+    except Exception:
+        pass
+    _runtime_profile_log_event(str(cur.get('profile_id') or ''), 'PROBATION_PROMOTED', {'signal': sig, 'live': live}, 'Probation passed; profile is now fully active.')
+    return {'status': 'PROMOTED', 'profile': _runtime_profile_get_by_id(str(cur.get('profile_id') or '')), 'signal': sig, 'live': live}
+
+def _market_adaptive_status_snapshot() -> dict:
+    cfg = load_strategy_config(force=False)
+    profile = _runtime_profile_bootstrap_if_missing(cfg)
+    review = _runtime_profile_review_probation(int(AUTOTRADE_OWNER_UID or 0), force=False)
+    last_run = _evolution_get_last_run('market_adaptive') or {}
+    last_report = _evolution_state_get('market_adaptive_last_report', {}) or {}
+    owner = int(AUTOTRADE_OWNER_UID or 0)
+    life_days = int((cfg or {}).get('market_adaptive_days', 30) or 30)
+    try:
+        lifecycle = _trade_lifecycle_analytics(owner, days=max(7, life_days), session='ALL', sync=False, force=False) if owner > 0 else {}
+    except Exception:
+        lifecycle = {}
+    return {
+        'enabled': _cfg_bool((cfg or {}).get('market_adaptive_enabled', True), True),
+        'interval_hours': float((cfg or {}).get('market_adaptive_interval_hours', 24.0) or 24.0),
+        'days': int((cfg or {}).get('market_adaptive_days', 30) or 30),
+        'last_run': last_run,
+        'last_report': last_report,
+        'runtime_profile': _runtime_profile_get_current() or profile or {},
+        'runtime_profile_review': review or {},
+        'lifecycle': lifecycle or {},
+    }
+
+
+def _run_market_adaptive_cycle(force: bool = False) -> dict:
+    cfg0 = load_strategy_config(force=True)
+    _runtime_profile_bootstrap_if_missing(cfg0)
+    probation_review = _runtime_profile_review_probation(int(AUTOTRADE_OWNER_UID or 0), force=False)
+    enabled = _cfg_bool((cfg0 or {}).get('market_adaptive_enabled', True), True)
+    run_id = _evolution_new_run('market_adaptive')
+    if not enabled:
+        _evolution_finish_run(run_id, 'SKIPPED', 0, 0, {}, {}, [], 'disabled_in_config')
+        return {'ok': False, 'status': 'DISABLED', 'run_id': run_id}
+
+    if not _MARKET_ADAPTIVE_LOCK.acquire(blocking=False):
+        _evolution_finish_run(run_id, 'SKIPPED', 0, 0, {}, {}, [], 'market_adaptive_already_running')
+        return {'ok': False, 'status': 'BUSY', 'run_id': run_id}
+
+    try:
+        cooldown_h = float((cfg0 or {}).get('market_adaptive_cooldown_hours', 20.0) or 20.0)
+        last_report = _evolution_state_get('market_adaptive_last_report', {}) or {}
+        last_applied_ts = float(last_report.get('applied_ts', 0.0) or 0.0)
+        last_cycle_ts = float(last_report.get('ts', 0.0) or last_applied_ts or 0.0)
+        if (not force) and last_cycle_ts > 0 and (time.time() - last_cycle_ts) < (cooldown_h * 3600.0):
+            _evolution_finish_run(run_id, 'SKIPPED', 0, 0, {}, {}, [], 'cooldown_active')
+            return {'ok': False, 'status': 'COOLDOWN', 'run_id': run_id}
+
+        if _SELF_OPT_STATE.get('stop_event') is not None:
+            _evolution_finish_run(run_id, 'SKIPPED', 0, 0, {}, {}, [], 'autonomous_optimizer_running')
+            return {'ok': False, 'status': 'OPTIMIZER_BUSY', 'run_id': run_id}
+
+        cfg_base = _market_adaptive_clamp_cfg(cfg0)
+        save_strategy_config(cfg_base)
+        apply_strategy_config(cfg_base)
+
+        days = int((cfg_base or {}).get('market_adaptive_days', 30) or 30)
+        tf = str((cfg_base or {}).get('universe_backtest_exec_tf') or (cfg_base or {}).get('exec_tf_default') or '15m')
+        top_n = int((cfg_base or {}).get('universe_backtest_top_n', 80) or 80)
+
+        baseline = run_universe_backtest(days, 'ALL', tf, top_n, None, True, True)
+        baseline_score = _market_adaptive_objective(baseline, cfg_base)
+        best_cfg = json.loads(json.dumps(cfg_base))
+        best_rep = baseline
+        best_score = float(baseline_score)
+        best_actions: list[dict] = []
+        pass_reports = []
+        notes_acc = []
+        max_passes = max(1, int((cfg_base or {}).get('market_adaptive_max_passes', 2) or 2))
+        min_improve = float((cfg_base or {}).get('market_adaptive_min_improvement', 0.35) or 0.35)
+
+        for idx in range(max_passes):
+            working_cfg = _market_adaptive_clamp_cfg(json.loads(json.dumps(best_cfg)))
+            actions, notes = _market_adaptive_propose_actions(best_rep, working_cfg)
+            if not actions:
+                pass_reports.append({'pass': idx + 1, 'status': 'NO_ACTION', 'score': best_score})
+                break
+            working_cfg = _market_adaptive_clamp_cfg(working_cfg)
+            save_strategy_config(working_cfg)
+            apply_strategy_config(working_cfg)
+            trial = run_universe_backtest(days, 'ALL', tf, top_n, None, True, True)
+            trial_score = _market_adaptive_objective(trial, working_cfg)
+            improved = float(trial_score) >= float(best_score + min_improve)
+            pass_reports.append({
+                'pass': idx + 1,
+                'status': 'KEPT' if improved else 'REVERTED',
+                'score_before': float(best_score),
+                'score_after': float(trial_score),
+                'actions': list(actions),
+                'overall_after': dict(trial.get('overall') or {}),
+            })
+            if improved:
+                best_cfg = json.loads(json.dumps(working_cfg))
+                best_rep = trial
+                best_score = float(trial_score)
+                best_actions.extend(actions)
+                notes_acc.extend(notes)
+            else:
+                save_strategy_config(best_cfg)
+                apply_strategy_config(best_cfg)
+                break
+
+        current_profile = _runtime_profile_get_current() or _runtime_profile_bootstrap_if_missing(best_cfg)
+        final_cfg = _market_adaptive_clamp_cfg(best_cfg)
+        save_strategy_config(final_cfg)
+        apply_strategy_config(final_cfg)
+        now_ts = float(time.time())
+        runtime_profile = dict(current_profile or {})
+        try:
+            current_params = (current_profile or {}).get('params') or {}
+            new_params = _runtime_profile_snapshot_from_cfg(final_cfg)
+            if best_actions and _json_dumps_safe(current_params) != _json_dumps_safe(new_params):
+                baseline_wr = _signal_wr_display_metrics(int(AUTOTRADE_OWNER_UID or 0)).get('binary_win_rate', 0.0) if int(AUTOTRADE_OWNER_UID or 0) > 0 else 0.0
+                baseline_live_wr = _learning_live_trade_summary(int(AUTOTRADE_OWNER_UID or 0), days=30).get('win_rate', 0.0) if int(AUTOTRADE_OWNER_UID or 0) > 0 else 0.0
+                runtime_profile = _runtime_profile_create_from_cfg(
+                    final_cfg,
+                    source='market_adaptive',
+                    status='PROBATION',
+                    baseline_profile_id=str((current_profile or {}).get('profile_id') or ''),
+                    score=float(best_score),
+                    probation_hours=float((final_cfg or {}).get('runtime_profile_probation_hours', 72.0) or 72.0),
+                    summary={
+                        'baseline_signal_wr': float(baseline_wr or 0.0),
+                        'baseline_live_wr': float(baseline_live_wr or 0.0),
+                        'baseline_score': float(baseline_score),
+                        'final_score': float(best_score),
+                        'actions': list(best_actions),
+                    },
+                    notes='; '.join(notes_acc[:8]),
+                )
+        except Exception:
+            runtime_profile = _runtime_profile_get_current() or {}
+        report = {
+            'run_id': run_id,
+            'ts': now_ts,
+            'applied_ts': now_ts if best_actions else float(last_applied_ts or 0.0),
+            'enabled': True,
+            'days': int(days),
+            'baseline': {
+                'overall': dict(baseline.get('overall') or {}),
+                'per_session': dict(baseline.get('per_session') or {}),
+                'score': float(baseline_score),
+            },
+            'final': {
+                'overall': dict(best_rep.get('overall') or {}),
+                'per_session': dict(best_rep.get('per_session') or {}),
+                'score': float(best_score),
+            },
+            'actions': list(best_actions),
+            'pass_reports': pass_reports,
+            'notes': notes_acc,
+            'current_live': {
+                'quality_score_min_email': float(final_cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
+                'quality_score_min_screen': float(final_cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN),
+                'min_rr_tp': float(final_cfg.get('min_rr_tp', final_cfg.get('min_rr_tp', MIN_RR_TP)) or MIN_RR_TP),
+                'tf_align_1h_min_abs': float(final_cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS),
+                'atr_min_pct': float(final_cfg.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT),
+                'execution_asia_enabled': _strategy_cfg_execution_asia_enabled(final_cfg),
+                'execution_engine_b_email_enabled': _cfg_bool(final_cfg.get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)),
+                'session_exec_overrides': final_cfg.get('session_exec_overrides') or {},
+            },
+            'runtime_profile': runtime_profile or {},
+            'runtime_profile_review': probation_review or {},
+        }
+        _evolution_state_set('market_adaptive_last_report', report)
+        _evolution_finish_run(
+            run_id,
+            'DONE',
+            int((best_rep.get('overall') or {}).get('setups', 0) or 0),
+            int((best_rep.get('overall') or {}).get('setups', 0) or 0),
+            {'baseline_score': float(baseline_score), 'final_score': float(best_score), 'notes': notes_acc, 'passes': pass_reports},
+            {'baseline': baseline.get('overall') or {}, 'final': best_rep.get('overall') or {}, 'per_session': best_rep.get('per_session') or {}},
+            list(best_actions),
+            '' if best_actions else 'no_improvement_or_no_action',
+        )
+        return {'ok': True, 'run_id': run_id, 'report': report, 'actions': best_actions, 'baseline': baseline, 'final': best_rep}
+    finally:
+        try:
+            _MARKET_ADAPTIVE_LOCK.release()
+        except Exception:
+            pass
+
+
+async def market_adaptive_daily_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        _hb_touch('market_adaptive', ok=True, details='cycle_start')
+        res = await to_thread_heavy(_run_market_adaptive_cycle)
+        if isinstance(res, dict) and res.get('ok'):
+            _hb_touch('market_adaptive', ok=True, details='cycle_ok')
+            rep = (res.get('report') or {})
+            final = ((rep.get('final') or {}).get('overall') or {})
+            bot = getattr(context, 'bot', None)
+            if bot:
+                msg = (
+                    '📈 Market-adaptive 30d optimization completed\n'
+                    f"Run: {rep.get('run_id','')}\n"
+                    f"Actions applied: {len(rep.get('actions') or [])}\n"
+                    f"Live setups/day: {float(final.get('setups_per_day', 0.0) or 0.0):.2f}\n"
+                    f"Live WR: {float(final.get('win_rate', 0.0) or 0.0):.1f}%\n"
+                    f"Live AvgR: {float(final.get('avg_R', 0.0) or 0.0):.3f}"
+                )
+                try:
+                    await _notify_admins_autonomous_opt(bot, msg)
+                except Exception:
+                    pass
+        else:
+            _hb_touch('market_adaptive', ok=True, details=str((res or {}).get('status') or 'cycle_skipped').lower())
+    except Exception as e:
+        _hb_touch('market_adaptive', ok=False, error=f"{type(e).__name__}: {e}", details='cycle_error')
+
+
+async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    snap = await to_thread_heavy(_market_adaptive_status_snapshot, timeout=20)
+    cfg = load_strategy_config(force=False)
+    hb_state, hb_reason = _component_runtime_state('market_adaptive', max(7200, int(float((cfg or {}).get('market_adaptive_interval_hours', 24.0) or 24.0) * 7200)), enabled=_cfg_bool((cfg or {}).get('market_adaptive_enabled', True), True), no_data=False, waiting_text='waiting_for_daily_market_adaptive_cycle')
+    last_run = snap.get('last_run') or {}
+    rep = snap.get('last_report') or {}
+    base = (rep.get('baseline') or {}).get('overall') or {}
+    final = (rep.get('final') or {}).get('overall') or {}
+    actions = list(rep.get('actions') or [])
+    first_delay = int(float((cfg or {}).get('market_adaptive_first_delay_sec', 45) or 45))
+    lines = [
+        '📈 Market-Adaptive Optimization Status',
+        HDR,
+        f"Engine: {_status_label(hb_state)}" + (f" | {hb_reason}" if hb_reason and hb_state != 'ACTIVE' else ''),
+        f"Enabled: {'YES' if snap.get('enabled') else 'NO'} | Interval: {float(snap.get('interval_hours') or 24.0):.1f}h | Window: {int(snap.get('days') or 30)}d",
+        f"Last run: {_format_last_run_line('Cycle', last_run).replace('Cycle: ', '') if last_run else '—'}",
+    ]
+    if not last_run:
+        lines.append(f"Bootstrap: first automatic cycle starts about {first_delay}s after bot startup | manual trigger: /adaptive_run")
+    lines.extend([
+        SEP,
+        f"Baseline live: setups/day={float(base.get('setups_per_day', 0.0) or 0.0):.2f} | WR={float(base.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(base.get('avg_R', 0.0) or 0.0):.3f}",
+        f"Final live: setups/day={float(final.get('setups_per_day', 0.0) or 0.0):.2f} | WR={float(final.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(final.get('avg_R', 0.0) or 0.0):.3f}",
+        f"Actions applied: {len(actions)}",
+    ])
+    if actions:
+        lines.append('Last actions:')
+        for a in actions[:6]:
+            lines.append(f"• {a.get('param')} {a.get('from')}→{a.get('to')} | {a.get('reason')}")
+    current_live = rep.get('current_live') or {}
+    profile = snap.get('runtime_profile') or {}
+    profile_review = snap.get('runtime_profile_review') or {}
+    if current_live:
+        lines.extend([
+            SEP,
+            f"Current live floors: email_quality={float(current_live.get('quality_score_min_email', 0.0) or 0.0):.1f} | screen_quality={float(current_live.get('quality_score_min_screen', 0.0) or 0.0):.1f} | min_rr_tp={float(current_live.get('min_rr_tp', current_live.get('min_rr_tp', 0.0)) or 0.0):.2f}",
+            f"TF align 1h={float(current_live.get('tf_align_1h_min_abs', 0.0) or 0.0):.2f} | ATR min={float(current_live.get('atr_min_pct', 0.0) or 0.0):.2f}",
+            f"Engine B exec: {'ON' if _cfg_bool(current_live.get('execution_engine_b_email_enabled', True), True) else 'OFF'} | Asia exec: {'ON' if _strategy_cfg_execution_asia_enabled(current_live) else 'OFF'}",
+        ])
+        lines.append('Session-specific executable thresholds:')
+        for _sess in ('NY', 'LON', 'ASIA'):
+            _q, _c, _r = _execution_session_thresholds(_sess)
+            lines.append(f"• {_sess}: quality≥{float(_q):.1f} | conf≥{int(_c)} | final RR≥{float(_r):.2f}")
+    lifecycle = snap.get('lifecycle') or {}
+    life_lines = _trade_lifecycle_analytics_lines(lifecycle, heading=f"Live-trade lifecycle feed ({int(snap.get('days') or 30)}d)", include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2)
+    if life_lines:
+        lines.extend([SEP, *life_lines])
+    if profile:
+        pstatus = str(profile.get('status') or 'ACTIVE').upper()
+        psrc = str(profile.get('source') or 'bootstrap')
+        pid = str(profile.get('profile_id') or '')[:22]
+        lines.extend([
+            SEP,
+            f"Runtime profile: {pstatus} | source={psrc} | id={pid}",
+        ])
+        if pstatus == 'PROBATION':
+            try:
+                until_txt = _fmt_dt_local(datetime.fromtimestamp(float(profile.get('probation_until_ts') or 0.0), tz=timezone.utc)) if float(profile.get('probation_until_ts') or 0.0) > 0 else '—'
+            except Exception:
+                until_txt = '—'
+            lines.append(f"Probation until: {until_txt}")
+        if profile_review:
+            lines.append(f"Latest probation review: {str(profile_review.get('status') or 'n/a')}")
+            if (profile_review.get('reasons') or []):
+                lines.append("• " + "; ".join([str(x) for x in (profile_review.get('reasons') or [])[:3]]))
+    await send_long_message(update, '\n'.join(lines), parse_mode=None)
+
+
+async def market_adaptive_run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    force = False
+    try:
+        args = list(context.args or [])
+        force = bool(args and str(args[0]).strip().lower() in ('force', 'now', 'override'))
+    except Exception:
+        force = False
+    await update.message.reply_text('⏳ Running market-adaptive 30d optimization now…')
+    _hb_touch('market_adaptive', ok=True, details='manual_run_start')
+    res = await to_thread_heavy(_run_market_adaptive_cycle, force)
+    if isinstance(res, dict) and res.get('ok'):
+        _hb_touch('market_adaptive', ok=True, details='manual_run_ok')
+        rep = (res.get('report') or {})
+        base = ((rep.get('baseline') or {}).get('overall') or {})
+        final = ((rep.get('final') or {}).get('overall') or {})
+        actions = list(rep.get('actions') or [])
+        lines = [
+            '📈 Market-Adaptive Optimization Completed',
+            HDR,
+            f"Run: {rep.get('run_id','')}",
+            f"Baseline live: setups/day={float(base.get('setups_per_day', 0.0) or 0.0):.2f} | WR={float(base.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(base.get('avg_R', 0.0) or 0.0):.3f}",
+            f"Final live: setups/day={float(final.get('setups_per_day', 0.0) or 0.0):.2f} | WR={float(final.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(final.get('avg_R', 0.0) or 0.0):.3f}",
+            f"Actions applied: {len(actions)}",
+        ]
+        if actions:
+            lines.append('Actions:')
+            for a in actions[:8]:
+                lines.append(f"• {a.get('param')} {a.get('from')}→{a.get('to')} | {a.get('reason')}")
+        await send_long_message(update, '\n'.join(lines), parse_mode=None)
+        return
+    status = str((res or {}).get('status') or 'UNKNOWN').upper()
+    reason_map = {
+        'COOLDOWN': 'cooldown is active since the last cycle',
+        'BUSY': 'another market-adaptive cycle is already running',
+        'OPTIMIZER_BUSY': 'the autonomous optimizer is running right now',
+        'DISABLED': 'market-adaptive optimization is disabled in config',
+    }
+    detail = reason_map.get(status, 'no changes were applied this time')
+    _hb_touch('market_adaptive', ok=True, details=f'manual_run_{status.lower()}')
+    await update.message.reply_text(f'ℹ️ /adaptive_run did not start a new cycle: {detail}.')
+
+
+async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
+    """Internal autonomous optimizer. No manual trigger required."""
+    await _refresh_universe_backtests_for_autopilot()
+    should_run, reason = _autonomous_opt_should_run()
+    if not should_run:
+        return
+
+    bot = getattr(context, "bot", None)
+    stop_event = threading.Event()
+    _SELF_OPT_STATE["stop_event"] = stop_event
+    _SELF_OPT_STATE["started_ts"] = float(time.time())
+
+    try:
+        res = await to_thread_heavy(
+            _self_optimize_engine,
+            int(AUTONOMOUS_OPT_DAYS),
+            str(AUTONOMOUS_OPT_SESSION_MODE),
+            stop_event,
+            None,
+        )
+    except Exception as e:
+        try:
+            if bot:
+                await _notify_admins_autonomous_opt(bot, f"⚠️ Autonomous optimization failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return
+    finally:
+        _SELF_OPT_STATE["stop_event"] = None
+
+    if not isinstance(res, dict):
+        return
+
+    try:
+        _SELF_OPT_STATE["run_id"] = str(res.get("run_id") or "")
+        save_opt_report(res)
+    except Exception:
+        pass
+
+    try:
+        if bot and bool(res.get("ok")):
+            promoted = bool(res.get("promoted"))
+            summ = res.get("metrics") or {}
+            oos = summ.get("oos") or {}
+            msg = (
+                "🤖 Autonomous optimization completed\n"
+                f"Run: {res.get('run_id','')}\n"
+                f"Promoted: {'YES' if promoted else 'NO'}\n"
+                f"Exec TF: {res.get('chosen_exec_tf','')}\n"
+                f"OOS setups/day: {float(oos.get('setups_per_day',0.0)):.2f}\n"
+                f"OOS win rate: {float(oos.get('win_rate',0.0)):.1f}%\n"
+                f"OOS avg R: {float(oos.get('avg_R',0.0)):.3f}"
+            )
+            await _notify_admins_autonomous_opt(bot, msg)
+    except Exception:
+        pass
+
+
+async def cmd_self_optimize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    await update.message.reply_text(
+        "🤖 Autonomous optimization is enabled internally.\n\n"
+        "Manual optimization triggers are disabled by design.\n"
+        "Use /optimize_report only if you need the latest internal decision snapshot."
+    )
+
+async def cmd_self_optimize_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    await update.message.reply_text(
+        "🤖 Manual stop is disabled.\n\n"
+        "The optimizer is autonomous and production-governed. It only promotes validated improvements automatically."
+    )
+
+async def cmd_self_optimize_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_user(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    last = _db_get_last_opt_run()
+    if not last:
+        await update.message.reply_text("No autonomous optimization runs recorded yet.")
+        return
+
+    res = _db_get_opt_result(str(last.get("run_id") or ""))
+    if not res:
+        await update.message.reply_text("No optimization result saved for the latest run yet.")
+        return
+
+    await send_long_message(update, _self_opt_format_report(res), parse_mode=None)
+
+
+
+
+# =========================================================
+# GOAL-PROFILE OPTIMIZER — bounded objective search toward target setups/day + WR
+# =========================================================
+_GOAL_PROFILE_LOCK = threading.Lock()
+_GOAL_PROFILE_STATE = {
+    'stop_event': None,
+    'started_ts': 0.0,
+    'run_id': '',
+}
+
+
+def _goal_profile_is_running() -> bool:
+    try:
+        ev = _GOAL_PROFILE_STATE.get('stop_event')
+        return bool(ev is not None and not ev.is_set())
+    except Exception:
+        return False
+
+
+def _goal_profile_targets(cfg: dict | None = None) -> dict:
+    cfg = cfg or load_strategy_config(force=False)
+    return {
+        'enabled': _cfg_bool((cfg or {}).get('goal_profile_enabled', True), True),
+        'interval_hours': float((cfg or {}).get('goal_profile_interval_hours', 24.0) or 24.0),
+        'cooldown_hours': float((cfg or {}).get('goal_profile_cooldown_hours', 20.0) or 20.0),
+        'target_lo': float((cfg or {}).get('goal_profile_target_setups_per_day_lo', 1.0) or 1.0),
+        'target_hi': float((cfg or {}).get('goal_profile_target_setups_per_day_hi', 3.0) or 3.0),
+        'target_wr': float((cfg or {}).get('goal_profile_target_win_rate', 50.0) or 50.0),
+        'target_avg_r': float((cfg or {}).get('goal_profile_target_avg_r', 0.10) or 0.10),
+        'min_live_30d': int((cfg or {}).get('goal_profile_min_live_setups_30d', 8) or 8),
+        'min_live_7d': int((cfg or {}).get('goal_profile_min_live_setups_7d', 2) or 2),
+        'allow_ny': _cfg_bool((cfg or {}).get('goal_profile_allow_ny', False), False),
+        'allow_asia': _cfg_bool((cfg or {}).get('goal_profile_allow_asia', False), False),
+        'allow_engine_b': _cfg_bool((cfg or {}).get('goal_profile_allow_engine_b', False), False),
+        'shortlist': int((cfg or {}).get('goal_profile_shortlist', 2) or 2),
+        'max_run_minutes': float((cfg or {}).get('goal_profile_max_run_minutes', 14.0) or 14.0),
+    }
+
+
+def _goal_profile_candidate_profiles(cfg: dict | None = None) -> list[dict]:
+    cfg = cfg or load_strategy_config(force=False)
+    tgt = _goal_profile_targets(cfg)
+    allow_ny = bool(tgt.get('allow_ny'))
+    allow_asia = bool(tgt.get('allow_asia'))
+    allow_engine_b = bool(tgt.get('allow_engine_b'))
+    out = []
+    raw = list((cfg or {}).get('goal_profile_candidate_profiles') or [])
+    for item in raw:
+        try:
+            name = str((item or {}).get('name') or '').strip() or 'PROFILE'
+            sessions = [str(x).upper().strip() for x in ((item or {}).get('execution_sessions_allowed') or []) if str(x).strip()]
+            engines = [str(x).upper().strip() for x in ((item or {}).get('execution_engines_allowed') or []) if str(x).strip()]
+            if (not allow_ny) and 'NY' in sessions:
+                continue
+            if (not allow_asia) and 'ASIA' in sessions:
+                continue
+            if (not allow_engine_b) and 'B' in engines:
+                continue
+            out.append({
+                'name': name,
+                'execution_sessions_allowed': sessions or ['LON'],
+                'execution_engines_allowed': engines or ['A'],
+                'execution_asia_enabled': _cfg_bool((item or {}).get('execution_asia_enabled', False), False) and allow_asia,
+                'execution_engine_b_email_enabled': _cfg_bool((item or {}).get('execution_engine_b_email_enabled', False), False) and allow_engine_b,
+            })
+        except Exception:
+            continue
+    if out:
+        return out
+    fallback = [
+        {'name': 'LON_A_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
+        {'name': 'LON_C_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['C'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
+        {'name': 'LON_A_C_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A', 'C'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
+    ]
+    if allow_ny:
+        fallback.append({'name': 'LON_NY_A_ONLY', 'execution_sessions_allowed': ['LON', 'NY'], 'execution_engines_allowed': ['A'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False})
+    return fallback
+
+
+def _goal_profile_candidate_bundles(cfg: dict | None = None) -> list[dict]:
+    cfg = cfg or load_strategy_config(force=False)
+    out = []
+    raw = list((cfg or {}).get('goal_profile_candidate_bundles') or [])
+    for item in raw:
+        try:
+            out.append({
+                'name': str((item or {}).get('name') or 'bundle').strip() or 'bundle',
+                'quality_score_min_screen': float((item or {}).get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN),
+                'quality_score_min_email': float((item or {}).get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
+                'tf_align_1h_min_abs': float((item or {}).get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS),
+                'tf_align_4h_min_abs': float((item or {}).get('tf_align_4h_min_abs', TF_ALIGN_4H_MIN_ABS) or TF_ALIGN_4H_MIN_ABS),
+                'atr_min_pct': float((item or {}).get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT),
+                'min_rr_tp': float((item or {}).get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP),
+                'regime_slope_trend_min_pct': float((item or {}).get('regime_slope_trend_min_pct', 0.06) or 0.06),
+                'lon_quality_add': float((item or {}).get('lon_quality_add', 0.0) or 0.0),
+                'lon_conf_add': int(round(float((item or {}).get('lon_conf_add', 0) or 0))),
+                'lon_rr_add': float((item or {}).get('lon_rr_add', 0.0) or 0.0),
+                'engine_c_base_score_add': float((item or {}).get('engine_c_base_score_add', (cfg or {}).get('engine_c_base_score_add', 0.0)) or 0.0),
+                'engine_c_exec_quality_add': float((item or {}).get('engine_c_exec_quality_add', (cfg or {}).get('engine_c_exec_quality_add', 0.0)) or 0.0),
+                'engine_c_exec_conf_add': int(round(float((item or {}).get('engine_c_exec_conf_add', (cfg or {}).get('engine_c_exec_conf_add', 0)) or 0))),
+                'engine_c_exec_rr_add': float((item or {}).get('engine_c_exec_rr_add', (cfg or {}).get('engine_c_exec_rr_add', 0.0)) or 0.0),
+                'engine_c_exec_liq_mult': float((item or {}).get('engine_c_exec_liq_mult', (cfg or {}).get('engine_c_exec_liq_mult', 1.10)) or 1.10),
+                'engine_c_exec_ch1_cap_lon': float((item or {}).get('engine_c_exec_ch1_cap_lon', (cfg or {}).get('engine_c_exec_ch1_cap_lon', 1.20)) or 1.20),
+                'engine_c_exec_pb_dist_lon': float((item or {}).get('engine_c_exec_pb_dist_lon', (cfg or {}).get('engine_c_exec_pb_dist_lon', 0.68)) or 0.68),
+            })
+        except Exception:
+            continue
+    if out:
+        return out
+    return [
+        {'name': 'strict', 'quality_score_min_screen': 64.0, 'quality_score_min_email': 72.0, 'tf_align_1h_min_abs': 0.65, 'tf_align_4h_min_abs': 0.60, 'atr_min_pct': 1.00, 'min_rr_tp': 1.45, 'regime_slope_trend_min_pct': 0.060, 'lon_quality_add': 1.0, 'lon_conf_add': 1, 'lon_rr_add': 0.04, 'engine_c_base_score_add': 0.0, 'engine_c_exec_quality_add': 0.0, 'engine_c_exec_conf_add': 0, 'engine_c_exec_rr_add': 0.00, 'engine_c_exec_liq_mult': 1.10, 'engine_c_exec_ch1_cap_lon': 1.20, 'engine_c_exec_pb_dist_lon': 0.68},
+        {'name': 'balanced', 'quality_score_min_screen': 62.0, 'quality_score_min_email': 70.0, 'tf_align_1h_min_abs': 0.55, 'tf_align_4h_min_abs': 0.50, 'atr_min_pct': 0.95, 'min_rr_tp': 1.40, 'regime_slope_trend_min_pct': 0.055, 'lon_quality_add': 0.0, 'lon_conf_add': 0, 'lon_rr_add': 0.00, 'engine_c_base_score_add': 0.0, 'engine_c_exec_quality_add': 0.0, 'engine_c_exec_conf_add': 0, 'engine_c_exec_rr_add': 0.00, 'engine_c_exec_liq_mult': 1.08, 'engine_c_exec_ch1_cap_lon': 1.22, 'engine_c_exec_pb_dist_lon': 0.70},
+        {'name': 'flex', 'quality_score_min_screen': 60.0, 'quality_score_min_email': 68.0, 'tf_align_1h_min_abs': 0.45, 'tf_align_4h_min_abs': 0.45, 'atr_min_pct': 0.85, 'min_rr_tp': 1.35, 'regime_slope_trend_min_pct': 0.050, 'lon_quality_add': -1.0, 'lon_conf_add': -1, 'lon_rr_add': -0.04, 'engine_c_base_score_add': -0.5, 'engine_c_exec_quality_add': -0.5, 'engine_c_exec_conf_add': 0, 'engine_c_exec_rr_add': -0.02, 'engine_c_exec_liq_mult': 1.05, 'engine_c_exec_ch1_cap_lon': 1.24, 'engine_c_exec_pb_dist_lon': 0.72},
+        {'name': 'rr_bias', 'quality_score_min_screen': 61.0, 'quality_score_min_email': 69.0, 'tf_align_1h_min_abs': 0.50, 'tf_align_4h_min_abs': 0.45, 'atr_min_pct': 0.90, 'min_rr_tp': 1.50, 'regime_slope_trend_min_pct': 0.050, 'lon_quality_add': -1.0, 'lon_conf_add': 0, 'lon_rr_add': 0.08, 'engine_c_base_score_add': -0.5, 'engine_c_exec_quality_add': -0.5, 'engine_c_exec_conf_add': 0, 'engine_c_exec_rr_add': 0.00, 'engine_c_exec_liq_mult': 1.05, 'engine_c_exec_ch1_cap_lon': 1.24, 'engine_c_exec_pb_dist_lon': 0.72},
+        {'name': 'lon_mid_push', 'quality_score_min_screen': 59.0, 'quality_score_min_email': 67.0, 'tf_align_1h_min_abs': 0.42, 'tf_align_4h_min_abs': 0.42, 'atr_min_pct': 0.80, 'min_rr_tp': 1.32, 'regime_slope_trend_min_pct': 0.048, 'lon_quality_add': -2.0, 'lon_conf_add': -1, 'lon_rr_add': -0.05, 'engine_c_base_score_add': -1.0, 'engine_c_exec_quality_add': -1.0, 'engine_c_exec_conf_add': -1, 'engine_c_exec_rr_add': -0.03, 'engine_c_exec_liq_mult': 1.02, 'engine_c_exec_ch1_cap_lon': 1.28, 'engine_c_exec_pb_dist_lon': 0.74},
+        {'name': 'c_breakout_focus', 'quality_score_min_screen': 58.0, 'quality_score_min_email': 66.0, 'tf_align_1h_min_abs': 0.40, 'tf_align_4h_min_abs': 0.40, 'atr_min_pct': 0.78, 'min_rr_tp': 1.30, 'regime_slope_trend_min_pct': 0.046, 'lon_quality_add': -1.5, 'lon_conf_add': -1, 'lon_rr_add': -0.04, 'engine_c_base_score_add': -2.0, 'engine_c_exec_quality_add': -2.0, 'engine_c_exec_conf_add': -1, 'engine_c_exec_rr_add': -0.04, 'engine_c_exec_liq_mult': 1.00, 'engine_c_exec_ch1_cap_lon': 1.34, 'engine_c_exec_pb_dist_lon': 0.78},
+    ]
+
+
+
+
+def _goal_profile_profile_bundles(profile_name: str, bundles: list[dict]) -> list[dict]:
+    name = str(profile_name or '').upper().strip()
+    if not bundles:
+        return []
+    by_name = {str((b or {}).get('name') or '').strip(): dict(b or {}) for b in (bundles or [])}
+    preferred = {
+        'LON_A_ONLY': ['strict', 'balanced'],
+        'LON_A_REACH': ['flex', 'reach'],
+        'LON_C_ONLY': ['balanced', 'c_breakout_focus'],
+        'LON_A_C_ONLY': ['balanced'],
+        'LON_A_C_REACH': ['flex', 'reach'],
+    }.get(name, [])
+    out = [by_name[n] for n in preferred if n in by_name]
+    if out:
+        return out
+    return list(bundles or [])
+
+def _goal_profile_apply_candidate(base_cfg: dict, profile: dict, bundle: dict) -> dict:
+    cfg = json.loads(json.dumps(base_cfg or {}))
+    cfg['quality_score_min_screen'] = float(bundle.get('quality_score_min_screen', cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN)))
+    cfg['quality_score_min_email'] = float(bundle.get('quality_score_min_email', cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL)))
+    cfg['tf_align_1h_min_abs'] = float(bundle.get('tf_align_1h_min_abs', cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS)))
+    cfg['tf_align_4h_min_abs'] = float(bundle.get('tf_align_4h_min_abs', cfg.get('tf_align_4h_min_abs', TF_ALIGN_4H_MIN_ABS)))
+    cfg['atr_min_pct'] = float(bundle.get('atr_min_pct', cfg.get('atr_min_pct', ATR_MIN_PCT)))
+    cfg['min_rr_tp'] = float(bundle.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP)))
+    cfg['regime_slope_trend_min_pct'] = float(bundle.get('regime_slope_trend_min_pct', cfg.get('regime_slope_trend_min_pct', 0.06)))
+    cfg['execution_sessions_allowed'] = [str(x).upper().strip() for x in (profile.get('execution_sessions_allowed') or ['LON']) if str(x).strip()]
+    cfg['execution_engines_allowed'] = [str(x).upper().strip() for x in (profile.get('execution_engines_allowed') or ['A']) if str(x).strip()]
+    cfg['execution_asia_enabled'] = bool(profile.get('execution_asia_enabled', False))
+    cfg['execution_asia_user_override'] = True
+    cfg['execution_engine_b_email_enabled'] = bool(profile.get('execution_engine_b_email_enabled', False))
+    cfg['goal_profile_active_profile'] = str(profile.get('name') or 'PROFILE')
+    bundle_name = str(bundle.get('name') or '').upper().strip()
+    profile_name = str(profile.get('name') or '').upper().strip()
+    cfg['goal_profile_reach_mode'] = bool(('REACH' in profile_name) or bundle_name in {'FLEX', 'REACH', 'C_BREAKOUT_FOCUS'})
+    sess_ov = json.loads(json.dumps(cfg.get('session_exec_overrides') or {}))
+    for sess in ('NY', 'LON', 'ASIA'):
+        sess_ov.setdefault(sess, {'quality_add': 0.0, 'conf_add': 0, 'rr_add': 0.0})
+    sess_ov['LON'] = {
+        'quality_add': float(bundle.get('lon_quality_add', 0.0) or 0.0),
+        'conf_add': int(bundle.get('lon_conf_add', 0) or 0),
+        'rr_add': float(bundle.get('lon_rr_add', 0.0) or 0.0),
+    }
+    if 'NY' not in cfg.get('execution_sessions_allowed', []):
+        sess_ov['NY'] = {'quality_add': max(2.0, float((sess_ov.get('NY') or {}).get('quality_add', 0.0) or 0.0)), 'conf_add': max(2, int((sess_ov.get('NY') or {}).get('conf_add', 0) or 0)), 'rr_add': max(0.12, float((sess_ov.get('NY') or {}).get('rr_add', 0.0) or 0.0))}
+    if 'ASIA' not in cfg.get('execution_sessions_allowed', []):
+        sess_ov['ASIA'] = {'quality_add': max(3.0, float((sess_ov.get('ASIA') or {}).get('quality_add', 0.0) or 0.0)), 'conf_add': max(3, int((sess_ov.get('ASIA') or {}).get('conf_add', 0) or 0)), 'rr_add': max(0.16, float((sess_ov.get('ASIA') or {}).get('rr_add', 0.0) or 0.0))}
+    cfg['session_exec_overrides'] = sess_ov
+    weights = {'NY': 0.0, 'LON': 0.0, 'ASIA': 0.0}
+    allowed = cfg.get('execution_sessions_allowed') or []
+    if allowed == ['LON']:
+        weights = {'NY': 0.0, 'LON': 1.0, 'ASIA': 0.0}
+    elif allowed == ['LON', 'NY'] or allowed == ['NY', 'LON']:
+        weights = {'NY': 0.35, 'LON': 0.65, 'ASIA': 0.0}
+    else:
+        for sess in allowed:
+            if sess in weights:
+                weights[sess] = 1.0
+        tot = sum(weights.values()) or 1.0
+        weights = {k: float(v) / float(tot) for k, v in weights.items()}
+    cfg['session_weights'] = weights
+    return cfg
+
+
+def _goal_profile_summary_from_rep(rep: dict) -> dict:
+    ov = dict((rep or {}).get('overall') or {})
+    return {
+        'setups': int(ov.get('setups', 0) or 0),
+        'setups_per_day': float(ov.get('setups_per_day', 0.0) or 0.0),
+        'win_rate': float(ov.get('win_rate', 0.0) or 0.0),
+        'avg_R': float(ov.get('avg_R', 0.0) or 0.0),
+    }
+
+
+def _goal_profile_stage1_score(rep30: dict, cfg: dict) -> dict:
+    tgt = _goal_profile_targets(cfg)
+    s30 = _goal_profile_summary_from_rep(rep30)
+    n30 = int(s30['setups'])
+    sdp30 = float(s30['setups_per_day'])
+    wr30 = float(s30['win_rate'])
+    ar30 = float(s30['avg_R'])
+
+    def _freq_pen(v: float, lo: float, hi: float, weight_under: float, weight_over: float) -> float:
+        if v < lo:
+            return (lo - v) * weight_under
+        if v > hi:
+            return (v - hi) * weight_over
+        return 0.0
+
+    freq_pen = _freq_pen(sdp30, tgt['target_lo'], tgt['target_hi'], 40.0, 18.0)
+    wr_pen = max(0.0, tgt['target_wr'] - wr30) * 2.4
+    avg_r_pen = max(0.0, tgt['target_avg_r'] - ar30) * 62.0
+    sample_pen = max(0, tgt['min_live_30d'] - n30) * 7.0
+    zero_pen = 350.0 if n30 <= 0 else 0.0
+    score = (wr30 * 2.2) + (ar30 * 55.0) + (sdp30 * 10.0) - freq_pen - wr_pen - avg_r_pen - sample_pen - zero_pen
+    return {
+        'score': float(score),
+        'metrics_30d': s30,
+        'penalties': {
+            'freq_pen': float(freq_pen),
+            'wr_pen': float(wr_pen),
+            'avg_r_pen': float(avg_r_pen),
+            'sample_pen': float(sample_pen),
+            'zero_pen': float(zero_pen),
+        },
+    }
+
+
+def _goal_profile_score_candidate(rep30: dict, rep7: dict, cfg: dict) -> dict:
+    tgt = _goal_profile_targets(cfg)
+    s30 = _goal_profile_summary_from_rep(rep30)
+    s7 = _goal_profile_summary_from_rep(rep7)
+    n30 = int(s30['setups'])
+    n7 = int(s7['setups'])
+    sdp30 = float(s30['setups_per_day'])
+    sdp7 = float(s7['setups_per_day'])
+    wr30 = float(s30['win_rate'])
+    wr7 = float(s7['win_rate'])
+    ar30 = float(s30['avg_R'])
+    ar7 = float(s7['avg_R'])
+
+    def _freq_pen(v: float, lo: float, hi: float, weight_under: float, weight_over: float) -> float:
+        if v < lo:
+            return (lo - v) * weight_under
+        if v > hi:
+            return (v - hi) * weight_over
+        return 0.0
+
+    freq_pen = _freq_pen(sdp30, tgt['target_lo'], tgt['target_hi'], 52.0, 18.0) + _freq_pen(sdp7, tgt['target_lo'], tgt['target_hi'], 18.0, 5.0)
+    wr_pen = max(0.0, tgt['target_wr'] - wr30) * 2.3 + max(0.0, tgt['target_wr'] - wr7) * 0.6
+    avg_r_pen = max(0.0, tgt['target_avg_r'] - ar30) * 65.0 + max(0.0, tgt['target_avg_r'] - ar7) * 18.0
+    sample_pen = max(0, tgt['min_live_30d'] - n30) * 7.0 + max(0, tgt['min_live_7d'] - n7) * 4.5
+    instability_pen = abs(wr30 - wr7) * (0.10 if (n30 > 0 and n7 > 0) else 0.0)
+    zero_pen = 350.0 if n30 <= 0 else 0.0
+    score = (wr30 * 2.1) + (wr7 * 0.6) + (ar30 * 55.0) + (ar7 * 15.0) + (sdp30 * 14.0) + (sdp7 * 4.0) - freq_pen - wr_pen - avg_r_pen - sample_pen - instability_pen - zero_pen
+    feasible = bool(n30 >= tgt['min_live_30d'] and n7 >= tgt['min_live_7d'] and wr30 >= tgt['target_wr'] and ar30 >= tgt['target_avg_r'] and sdp30 >= (tgt['target_lo'] * 0.70) and sdp30 <= (tgt['target_hi'] * 1.25))
+    return {
+        'score': float(score),
+        'feasible': feasible,
+        'metrics_30d': s30,
+        'metrics_7d': s7,
+        'penalties': {
+            'freq_pen': float(freq_pen),
+            'wr_pen': float(wr_pen),
+            'avg_r_pen': float(avg_r_pen),
+            'sample_pen': float(sample_pen),
+            'instability_pen': float(instability_pen),
+            'zero_pen': float(zero_pen),
+        },
+    }
+
+
+def _run_goal_profile_cycle(force: bool = False) -> dict:
+    cfg0 = load_strategy_config(force=True)
+    tgt = _goal_profile_targets(cfg0)
+    now_ts = float(time.time())
+    current_profile = str((cfg0 or {}).get('goal_profile_active_profile') or 'BASELINE')
+    current_sessions = list((cfg0 or {}).get('execution_sessions_allowed') or [])
+    current_engines = list((cfg0 or {}).get('execution_engines_allowed') or [])
+    if not tgt['enabled']:
+        rep = {
+            'ok': False,
+            'status': 'DISABLED',
+            'ts': now_ts,
+            'started_ts': now_ts,
+            'targets': tgt,
+            'current': {
+                'goal_profile_active_profile': current_profile,
+                'execution_sessions_allowed': current_sessions,
+                'execution_engines_allowed': current_engines,
+            },
+        }
+        save_goal_profile_report(rep)
+        return rep
+    if not _GOAL_PROFILE_LOCK.acquire(blocking=False):
+        rep = load_goal_profile_report() or {}
+        return {
+            'ok': False,
+            'status': 'BUSY',
+            'ts': now_ts,
+            'started_ts': float(rep.get('started_ts', now_ts) or now_ts),
+            'targets': tgt,
+            'current': {
+                'goal_profile_active_profile': current_profile,
+                'execution_sessions_allowed': current_sessions,
+                'execution_engines_allowed': current_engines,
+            },
+        }
+    started_ts = float(time.time())
+    stop_event = threading.Event()
+    _GOAL_PROFILE_STATE['stop_event'] = stop_event
+    _GOAL_PROFILE_STATE['started_ts'] = started_ts
+    _GOAL_PROFILE_STATE['run_id'] = f"goal-{int(started_ts)}"
+    last_final = load_goal_profile_report() or {}
+    if str(last_final.get('status') or '').upper() == 'RUNNING':
+        last_final = {}
+
+    def _persist_running(stage: str, candidate_idx: int = 0, candidate_total: int = 0, current_candidate: dict | None = None, best_candidate: dict | None = None, note: str = ''):
+        rep = {
+            'ok': True,
+            'status': 'RUNNING',
+            'ts': float(time.time()),
+            'started_ts': started_ts,
+            'targets': tgt,
+            'current': {
+                'goal_profile_active_profile': current_profile,
+                'execution_sessions_allowed': current_sessions,
+                'execution_engines_allowed': current_engines,
+            },
+            'progress': {
+                'stage': str(stage or 'running'),
+                'candidate_idx': int(candidate_idx or 0),
+                'candidate_total': int(candidate_total or 0),
+                'current_candidate': current_candidate or {},
+                'best_candidate': best_candidate or {},
+                'elapsed_sec': float(max(0.0, time.time() - started_ts)),
+                'note': str(note or ''),
+            },
+            'last_final': last_final if isinstance(last_final, dict) else {},
+        }
+        save_goal_profile_report(rep)
+
+    try:
+        if (not force) and float(last_final.get('applied_ts', 0.0) or 0.0) > 0 and (time.time() - float(last_final.get('applied_ts', 0.0) or 0.0)) < (tgt['cooldown_hours'] * 3600.0):
+            rep = {'ok': False, 'status': 'COOLDOWN', 'ts': float(time.time()), 'started_ts': started_ts, 'targets': tgt, 'last': last_final}
+            save_goal_profile_report(rep)
+            return rep
+
+        base_cfg = json.loads(json.dumps(cfg0 or {}))
+        exec_tf = str((base_cfg or {}).get('universe_backtest_exec_tf') or (base_cfg or {}).get('exec_tf_default') or '15m').strip().lower()
+        top_n = int((base_cfg or {}).get('universe_backtest_top_n', 80) or 80)
+        max_run_sec = max(180.0, float(tgt.get('max_run_minutes', 18.0) or 18.0) * 60.0)
+
+        save_strategy_config(base_cfg)
+        apply_strategy_config(base_cfg)
+        _persist_running('baseline')
+        baseline30 = run_universe_backtest(30, 'ALL', exec_tf, top_n, None, False, False)
+        baseline7 = run_universe_backtest(7, 'ALL', exec_tf, top_n, None, False, False)
+        baseline_eval = _goal_profile_score_candidate(baseline30, baseline7, base_cfg)
+
+        best_cfg = json.loads(json.dumps(base_cfg))
+        best_eval = dict(baseline_eval)
+        best_profile = {'name': 'BASELINE'}
+        best_bundle = {'name': 'current'}
+        stage1_rows = []
+        stage2_rows = []
+        profiles = _goal_profile_candidate_profiles(base_cfg)
+        bundles = _goal_profile_candidate_bundles(base_cfg)
+        bundle_plan = {str((p or {}).get('name') or ''): _goal_profile_profile_bundles(str((p or {}).get('name') or ''), bundles) for p in profiles}
+        candidate_total = max(0, sum(len(bundle_plan.get(str((p or {}).get('name') or ''), [])) for p in profiles))
+        cand_counter = 0
+
+        for profile in profiles:
+            for bundle in (bundle_plan.get(str((profile or {}).get('name') or ''), []) or []):
+                cand_counter += 1
+                if stop_event.is_set():
+                    raise TimeoutError('goal_profile_aborted')
+                if (time.time() - started_ts) > max_run_sec:
+                    raise TimeoutError('goal_profile_timeout')
+                current_row = {
+                    'profile': str(profile.get('name') or ''),
+                    'bundle': str(bundle.get('name') or ''),
+                    'sessions': list(profile.get('execution_sessions_allowed') or []),
+                    'engines': list(profile.get('execution_engines_allowed') or []),
+                }
+                _persist_running('search_30d', cand_counter, candidate_total, current_row, {
+                    'profile': str(best_profile.get('name') or 'BASELINE'),
+                    'bundle': str(best_bundle.get('name') or 'current'),
+                    'score': float(best_eval.get('score', -1e9)),
+                })
+                cand_cfg = _goal_profile_apply_candidate(base_cfg, profile, bundle)
+                apply_strategy_config(cand_cfg)
+                rep30 = run_universe_backtest(30, 'ALL', exec_tf, top_n, None, False, False)
+                apply_strategy_config(base_cfg)
+                stage1 = _goal_profile_stage1_score(rep30, cand_cfg)
+                stage1_rows.append({
+                    'profile': str(profile.get('name') or ''),
+                    'bundle': str(bundle.get('name') or ''),
+                    'stage1_score': float(stage1.get('score', -1e9)),
+                    'metrics_30d': stage1.get('metrics_30d') or {},
+                    'penalties_30d': stage1.get('penalties') or {},
+                    'execution_sessions_allowed': list(cand_cfg.get('execution_sessions_allowed') or []),
+                    'execution_engines_allowed': list(cand_cfg.get('execution_engines_allowed') or []),
+                    'cand_cfg': cand_cfg,
+                })
+
+        shortlist_n = max(1, min(int(tgt.get('shortlist', 4) or 4), len(stage1_rows) or 1))
+        shortlist = sorted(stage1_rows, key=lambda x: float(x.get('stage1_score', -1e9)), reverse=True)[:shortlist_n]
+
+        for idx, row in enumerate(shortlist, start=1):
+            if stop_event.is_set():
+                raise TimeoutError('goal_profile_aborted')
+            if (time.time() - started_ts) > max_run_sec:
+                raise TimeoutError('goal_profile_timeout')
+            current_row = {
+                'profile': str(row.get('profile') or ''),
+                'bundle': str(row.get('bundle') or ''),
+                'sessions': list(row.get('execution_sessions_allowed') or []),
+                'engines': list(row.get('execution_engines_allowed') or []),
+            }
+            _persist_running('search_7d', idx, len(shortlist), current_row, {
+                'profile': str(best_profile.get('name') or 'BASELINE'),
+                'bundle': str(best_bundle.get('name') or 'current'),
+                'score': float(best_eval.get('score', -1e9)),
+            }, note=f"shortlist={len(shortlist)} of {candidate_total}")
+            cand_cfg = dict(row.get('cand_cfg') or {})
+            apply_strategy_config(cand_cfg)
+            rep7 = run_universe_backtest(7, 'ALL', exec_tf, top_n, None, False, False)
+            apply_strategy_config(base_cfg)
+            evald = _goal_profile_score_candidate({'overall': row.get('metrics_30d') or {}}, rep7, cand_cfg)
+            full_row = {
+                'profile': str(row.get('profile') or ''),
+                'bundle': str(row.get('bundle') or ''),
+                'score': float(evald.get('score', -1e9)),
+                'feasible': bool(evald.get('feasible')),
+                'metrics_30d': evald.get('metrics_30d') or {},
+                'metrics_7d': evald.get('metrics_7d') or {},
+                'penalties': evald.get('penalties') or {},
+                'execution_sessions_allowed': list(cand_cfg.get('execution_sessions_allowed') or []),
+                'execution_engines_allowed': list(cand_cfg.get('execution_engines_allowed') or []),
+            }
+            stage2_rows.append(full_row)
+            if float(evald.get('score', -1e9)) > float(best_eval.get('score', -1e9)):
+                best_cfg = json.loads(json.dumps(cand_cfg))
+                best_eval = dict(evald)
+                best_profile = {'name': str(row.get('profile') or '')}
+                best_bundle = {'name': str(row.get('bundle') or '')}
+
+        promoted = float(best_eval.get('score', -1e9)) > float(baseline_eval.get('score', -1e9)) + 0.5
+        final_cfg = json.loads(json.dumps(best_cfg if promoted else base_cfg))
+        final_eval = dict(best_eval if promoted else baseline_eval)
+        final_cfg['goal_profile_last_run_ts'] = float(time.time())
+        save_strategy_config(final_cfg)
+        apply_strategy_config(final_cfg)
+
+        report = {
+            'ok': True,
+            'status': 'PROMOTED' if promoted else 'NO_BETTER_PROFILE',
+            'ts': float(time.time()),
+            'started_ts': started_ts,
+            'finished_ts': float(time.time()),
+            'applied_ts': float(time.time()) if promoted else float((last_final or {}).get('applied_ts', 0.0) or 0.0),
+            'targets': tgt,
+            'current': {
+                'goal_profile_active_profile': str(final_cfg.get('goal_profile_active_profile') or current_profile),
+                'execution_sessions_allowed': list(final_cfg.get('execution_sessions_allowed') or current_sessions),
+                'execution_engines_allowed': list(final_cfg.get('execution_engines_allowed') or current_engines),
+            },
+            'baseline': {'score': float(baseline_eval.get('score', -1e9)), 'metrics_30d': baseline_eval.get('metrics_30d') or {}, 'metrics_7d': baseline_eval.get('metrics_7d') or {}},
+            'best_candidate': {'profile': str(best_profile.get('name') or ''), 'bundle': str(best_bundle.get('name') or ''), 'score': float(best_eval.get('score', -1e9)), 'feasible': bool(best_eval.get('feasible')), 'metrics_30d': best_eval.get('metrics_30d') or {}, 'metrics_7d': best_eval.get('metrics_7d') or {}, 'execution_sessions_allowed': list(best_cfg.get('execution_sessions_allowed') or []), 'execution_engines_allowed': list(best_cfg.get('execution_engines_allowed') or [])},
+            'final': {'score': float(final_eval.get('score', -1e9)), 'metrics_30d': final_eval.get('metrics_30d') or {}, 'metrics_7d': final_eval.get('metrics_7d') or {}, 'execution_sessions_allowed': list(final_cfg.get('execution_sessions_allowed') or []), 'execution_engines_allowed': list(final_cfg.get('execution_engines_allowed') or []), 'goal_profile_active_profile': str(final_cfg.get('goal_profile_active_profile') or 'BASELINE')},
+            'progress': {'stage': 'done', 'candidate_idx': len(stage2_rows), 'candidate_total': len(shortlist), 'elapsed_sec': float(max(0.0, time.time() - started_ts)), 'shortlist_from': int(candidate_total)},
+            'top_candidates': sorted(stage2_rows, key=lambda x: float(x.get('score', -1e9)), reverse=True)[:8],
+            'stage1_shortlist': [{k: v for k, v in row.items() if k != 'cand_cfg'} for row in shortlist],
+        }
+        save_goal_profile_report(report)
+        return report
+    except TimeoutError as e:
+        status = 'ABORTED' if 'aborted' in str(e).lower() else 'TIMEOUT'
+        timed_out = (status == 'TIMEOUT')
+        partial_best_cfg = None
+        partial_best_eval = None
+        partial_best_profile = {'name': ''}
+        partial_best_bundle = {'name': ''}
+        try:
+            partial_best_cfg = json.loads(json.dumps(best_cfg)) if isinstance(best_cfg, dict) else None
+            partial_best_eval = dict(best_eval) if isinstance(best_eval, dict) else None
+            partial_best_profile = dict(best_profile) if isinstance(best_profile, dict) else {'name': ''}
+            partial_best_bundle = dict(best_bundle) if isinstance(best_bundle, dict) else {'name': ''}
+        except Exception:
+            partial_best_cfg = None
+            partial_best_eval = None
+        if timed_out and (not stage2_rows) and stage1_rows:
+            try:
+                top_stage1 = sorted(stage1_rows, key=lambda x: float(x.get('stage1_score', -1e9)), reverse=True)[0]
+                cand_cfg = dict(top_stage1.get('cand_cfg') or {})
+                if cand_cfg:
+                    apply_strategy_config(cand_cfg)
+                    rep7 = run_universe_backtest(7, 'ALL', exec_tf, top_n, None, False, False)
+                    apply_strategy_config(base_cfg)
+                    evald = _goal_profile_score_candidate({'overall': top_stage1.get('metrics_30d') or {}}, rep7, cand_cfg)
+                    partial_best_cfg = json.loads(json.dumps(cand_cfg))
+                    partial_best_eval = dict(evald)
+                    partial_best_profile = {'name': str(top_stage1.get('profile') or '')}
+                    partial_best_bundle = {'name': str(top_stage1.get('bundle') or '')}
+                    stage2_rows.append({
+                        'profile': str(top_stage1.get('profile') or ''),
+                        'bundle': str(top_stage1.get('bundle') or ''),
+                        'score': float(evald.get('score', -1e9)),
+                        'feasible': bool(evald.get('feasible')),
+                        'metrics_30d': evald.get('metrics_30d') or {},
+                        'metrics_7d': evald.get('metrics_7d') or {},
+                        'penalties': evald.get('penalties') or {},
+                        'execution_sessions_allowed': list(cand_cfg.get('execution_sessions_allowed') or []),
+                        'execution_engines_allowed': list(cand_cfg.get('execution_engines_allowed') or []),
+                    })
+            except Exception:
+                try:
+                    apply_strategy_config(base_cfg)
+                except Exception:
+                    pass
+        baseline_score = float((baseline_eval or {}).get('score', -1e9) if isinstance(locals().get('baseline_eval'), dict) else -1e9)
+        best_score = float((partial_best_eval or {}).get('score', -1e9) if isinstance(partial_best_eval, dict) else -1e9)
+        promote_partial = bool(timed_out and isinstance(partial_best_cfg, dict) and best_score > baseline_score + 0.5)
+        final_cfg = json.loads(json.dumps(partial_best_cfg if promote_partial else (cfg0 or {})))
+        try:
+            final_cfg['goal_profile_last_run_ts'] = float(time.time())
+        except Exception:
+            pass
+        try:
+            save_strategy_config(final_cfg)
+            apply_strategy_config(final_cfg)
+        except Exception:
+            pass
+        final_eval = dict(partial_best_eval) if (promote_partial and isinstance(partial_best_eval, dict)) else (dict(baseline_eval) if isinstance(locals().get('baseline_eval'), dict) else {})
+        final_status = 'TIMEOUT_PROMOTED' if promote_partial else ('TIMEOUT_NO_BETTER_PROFILE' if timed_out and baseline_score >= best_score else status)
+        err_report = {
+            'ok': False,
+            'status': final_status,
+            'ts': float(time.time()),
+            'started_ts': started_ts,
+            'finished_ts': float(time.time()),
+            'targets': tgt,
+            'error': str(e),
+            'current': {
+                'goal_profile_active_profile': str(final_cfg.get('goal_profile_active_profile') or current_profile),
+                'execution_sessions_allowed': list(final_cfg.get('execution_sessions_allowed') or current_sessions),
+                'execution_engines_allowed': list(final_cfg.get('execution_engines_allowed') or current_engines),
+            },
+            'baseline': {'score': baseline_score, 'metrics_30d': (baseline_eval or {}).get('metrics_30d') or {}, 'metrics_7d': (baseline_eval or {}).get('metrics_7d') or {}},
+            'best_candidate': {
+                'profile': str((partial_best_profile or {}).get('name') or ''),
+                'bundle': str((partial_best_bundle or {}).get('name') or ''),
+                'score': best_score,
+                'feasible': bool((partial_best_eval or {}).get('feasible')) if isinstance(partial_best_eval, dict) else False,
+                'metrics_30d': (partial_best_eval or {}).get('metrics_30d') or {},
+                'metrics_7d': (partial_best_eval or {}).get('metrics_7d') or {},
+                'execution_sessions_allowed': list((partial_best_cfg or {}).get('execution_sessions_allowed') or []),
+                'execution_engines_allowed': list((partial_best_cfg or {}).get('execution_engines_allowed') or []),
+            },
+            'final': {
+                'score': float(final_eval.get('score', -1e9)) if isinstance(final_eval, dict) else -1e9,
+                'metrics_30d': (final_eval or {}).get('metrics_30d') or {},
+                'metrics_7d': (final_eval or {}).get('metrics_7d') or {},
+                'execution_sessions_allowed': list(final_cfg.get('execution_sessions_allowed') or current_sessions),
+                'execution_engines_allowed': list(final_cfg.get('execution_engines_allowed') or current_engines),
+                'goal_profile_active_profile': str(final_cfg.get('goal_profile_active_profile') or current_profile),
+            },
+            'progress': {
+                'stage': 'timeout_finalize' if timed_out else 'aborted',
+                'candidate_idx': int(len(stage1_rows) if isinstance(locals().get('stage1_rows'), list) else 0),
+                'candidate_total': int(candidate_total if 'candidate_total' in locals() else 0),
+                'elapsed_sec': float(max(0.0, time.time() - started_ts)),
+                'shortlist_from': int(len(stage1_rows) if isinstance(locals().get('stage1_rows'), list) else 0),
+            },
+            'top_candidates': sorted(stage2_rows, key=lambda x: float(x.get('score', -1e9)), reverse=True)[:8] if isinstance(locals().get('stage2_rows'), list) else [],
+            'last_final': last_final if isinstance(last_final, dict) else {},
+        }
+        save_goal_profile_report(err_report)
+        return err_report
+    except Exception as e:
+        try:
+            save_strategy_config(cfg0 or {})
+            apply_strategy_config(cfg0 or {})
+            err_cfg = load_strategy_config(force=True)
+        except Exception:
+            err_cfg = cfg0 or {}
+        err_report = {
+            'ok': False,
+            'status': 'ERROR',
+            'ts': float(time.time()),
+            'started_ts': started_ts,
+            'finished_ts': float(time.time()),
+            'targets': tgt,
+            'error': f'{type(e).__name__}: {e}',
+            'current': {
+                'goal_profile_active_profile': str((err_cfg or {}).get('goal_profile_active_profile') or current_profile),
+                'execution_sessions_allowed': list((err_cfg or {}).get('execution_sessions_allowed') or current_sessions),
+                'execution_engines_allowed': list((err_cfg or {}).get('execution_engines_allowed') or current_engines),
+            },
+            'last_final': last_final if isinstance(last_final, dict) else {},
+        }
+        save_goal_profile_report(err_report)
+        return err_report
+    finally:
+        try:
+            ev = _GOAL_PROFILE_STATE.get('stop_event')
+            if ev is not None:
+                ev.set()
+        except Exception:
+            pass
+        _GOAL_PROFILE_STATE['stop_event'] = None
+        _GOAL_PROFILE_STATE['started_ts'] = 0.0
+        _GOAL_PROFILE_STATE['run_id'] = ''
+        _GOAL_PROFILE_LOCK.release()
+
+
+async def goal_profile_abort_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    ev = _GOAL_PROFILE_STATE.get('stop_event')
+    if ev is None or ev.is_set():
+        await update.message.reply_text('No goal-profile optimizer run is active.')
+        return
+    ev.set()
+    rep = load_goal_profile_report() or {}
+    rep['status'] = 'STOPPING'
+    rep['ts'] = float(time.time())
+    prog = dict(rep.get('progress') or {})
+    prog['note'] = 'Abort requested by admin.'
+    rep['progress'] = prog
+    save_goal_profile_report(rep)
+    await update.message.reply_text('🛑 Goal-profile optimizer abort requested. It will stop after the current evaluation step.')
+
+
+async def goal_profile_run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    force = False
+    try:
+        args = list(context.args or [])
+        force = bool(args and str(args[0]).strip().lower() in ('force', 'now', 'override'))
+    except Exception:
+        force = False
+    await update.message.reply_text('⏳ Running goal-profile optimizer now…')
+    try:
+        rep = await to_thread_heavy(_run_goal_profile_cycle, force)
+    except Exception as e:
+        await update.message.reply_text(f'Goal-profile optimizer failed: {type(e).__name__}: {e}')
+        return
+    if not isinstance(rep, dict):
+        await update.message.reply_text('Goal-profile optimizer returned no report.')
+        return
+    if not rep.get('ok'):
+        status = str(rep.get('status') or 'UNKNOWN')
+        extra = str(rep.get('error') or '').strip()
+        await update.message.reply_text(f"Goal-profile optimizer status: {status}{(' | ' + extra) if extra else ''}")
+        return
+    final = rep.get('final') or {}
+    m30 = final.get('metrics_30d') or {}
+    m7 = final.get('metrics_7d') or {}
+    lines = [
+        '🎯 Goal-Profile Optimizer',
+        HDR,
+        f"Status: {rep.get('status','')}",
+        f"Final profile: {final.get('goal_profile_active_profile','BASELINE')} | sessions={','.join(final.get('execution_sessions_allowed') or []) or '-'} | engines={','.join(final.get('execution_engines_allowed') or []) or '-'}",
+        f"30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}",
+        f"7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}",
+    ]
+    top = list(rep.get('top_candidates') or [])[:5]
+    if top:
+        lines.append('Top candidates:')
+        for row in top:
+            m30c = row.get('metrics_30d') or {}
+            lines.append(f"• {row.get('profile')}/{row.get('bundle')} | score={float(row.get('score',0.0) or 0.0):.2f} | 30d {float(m30c.get('setups_per_day',0.0) or 0.0):.2f}/day @ WR {float(m30c.get('win_rate',0.0) or 0.0):.1f}%")
     try:
         await send_long_message(update, '\n'.join(lines), parse_mode=None)
     except Exception:
         await update.message.reply_text('\n'.join(lines))
+
 async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         await update.message.reply_text('⛔ Admin only.')
@@ -16539,15 +22889,8 @@ async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_
             if last_final_metrics7:
                 lines.append(f"Last finalized 7d: setups/day={float(last_final_metrics7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(last_final_metrics7.get('setups',0) or 0)} | WR={float(last_final_metrics7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(last_final_metrics7.get('avg_R',0.0) or 0.0):.3f}")
         elif final:
-            lines.append(f"Search 30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}")
-            lines.append(f"Search 7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}")
-        validation = dict(rep.get('validation') or {})
-        if validation:
-            v30 = dict(validation.get('metrics_30d') or {})
-            v7 = dict(validation.get('metrics_7d') or {})
-            sess7 = str(validation.get('session_7d') or 'LON')
-            lines.append(f"Validation 30d: setups/day={float(v30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(v30.get('setups',0) or 0)} | WR={float(v30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(v30.get('avg_R',0.0) or 0.0):.3f}")
-            lines.append(f"Validation 7d {sess7}: setups/day={float(v7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(v7.get('setups',0) or 0)} | WR={float(v7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(v7.get('avg_R',0.0) or 0.0):.3f}")
+            lines.append(f"30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}")
+            lines.append(f"7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}")
         if rep.get('error'):
             lines.append(f"Error: {rep.get('error')}")
     await send_long_message(update, '\n'.join(lines), parse_mode=None)
@@ -16589,9 +22932,7 @@ async def goal_profile_job(context: ContextTypes.DEFAULT_TYPE):
             return
         if _goal_profile_is_running():
             return
-        rep = await to_thread_heavy(_run_goal_profile_cycle, False)
-        if isinstance(rep, dict):
-            await _goal_profile_notify_admins(context, rep, scheduled=True)
+        await to_thread_heavy(_run_goal_profile_cycle, False)
     except Exception:
         return
 
@@ -16643,10 +22984,10 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
         max_ch1 = float(limits['max_ch1_abs']) + (0.50 if engine == 'B' else 0.0)
         max_atr = float(limits['max_atr_pct']) + (0.60 if engine == 'B' else 0.0)
         if reach_mode and sess == 'LON' and engine in {'A', 'C'}:
-            max_pb += 0.24
-            max_ch15 += 0.24
-            max_ch1 += 0.28
-            max_atr += 0.70
+            max_pb += 0.14
+            max_ch15 += 0.16
+            max_ch1 += 0.18
+            max_atr += 0.45
 
         if pb_dist > max_pb:
             return (False, 'entry_far_from_pullback_ema')
@@ -16659,15 +23000,15 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
 
         if engine == 'A':
             if sess == 'LON':
-                lon_ctx_ch4_min = 0.32 if reach_mode else 0.64
-                lon_ctx_ch1_min = 0.10 if reach_mode else 0.30
+                lon_ctx_ch4_min = 0.48 if reach_mode else 0.64
+                lon_ctx_ch1_min = 0.18 if reach_mode else 0.30
                 if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                     return (False, 'lon_pullback_context_too_weak')
             if sess == 'NY' and (ch4_abs < 0.80 or ch1_abs < 0.42):
                 return (False, 'ny_pullback_context_too_weak')
             if sess == 'ASIA' and (ch4_abs < 0.95 or ch1_abs < 0.50):
                 return (False, 'asia_pullback_context_too_weak')
-            if sess == 'LON' and ch24_abs > (16.5 if reach_mode else 11.5) and pb_dist > (0.60 if reach_mode else 0.34):
+            if sess == 'LON' and ch24_abs > (13.6 if reach_mode else 11.5) and pb_dist > (0.48 if reach_mode else 0.34):
                 return (False, 'lon_trend_overheated')
         if sess == 'NY' and ch1_abs >= 1.55 and ch15_abs >= 0.70 and conf < 86 and score < 82.0:
             return (False, 'ny_breakout_chase_risk')
@@ -16761,12 +23102,12 @@ def is_top_setup_eligible(
                 min_score += (0.8 if sess != 'ASIA' else 1.2) + engine_c_base_score_add
         if reach_mode and sess == 'LON' and engine in {'A', 'C'}:
             if src == 'exec':
-                min_score -= 6.0 if engine == 'A' else 5.0
+                min_score -= 4.0 if engine == 'A' else 3.0
             elif src == 'email':
-                min_score -= 2.5 if engine == 'A' else 2.0
+                min_score -= 1.5 if engine == 'A' else 1.0
             else:
-                min_score -= 1.5 if engine == 'A' else 1.25
-        min_score = float(clamp(min_score, 52.0 if reach_mode and sess == 'LON' else 60.0, 90.0))
+                min_score -= 0.75 if engine == 'A' else 0.50
+        min_score = float(clamp(min_score, 56.0 if reach_mode and sess == 'LON' else 60.0, 90.0))
 
         if float(score) < float(min_score):
             return (False, f"below_score_{int(round(min_score))}")
@@ -16781,8 +23122,6 @@ def is_top_setup_eligible(
             vol_floor = max(vol_floor, 12_000_000.0)
         elif sess == 'ASIA':
             vol_floor = max(vol_floor * 1.05, ASIA_MIN_FUT_VOL_USD)
-        elif sess == 'LON' and reach_mode:
-            vol_floor = max(MIN_FUT_VOL_USD * 0.70, 6_500_000.0)
         if fut_vol < vol_floor:
             return (False, "below_min_fut_vol")
 
@@ -16855,14 +23194,17 @@ def is_executable_setup_eligible(
         if allowed_sessions and sess not in allowed_sessions:
             return (False, 'execution_profile_session_disabled')
         allowed_engines = _strategy_cfg_execution_engines_allowed(cfg_live)
+        try:
+            s = _research_finalize_setup(s, session_name=sess)
+        except Exception:
+            pass
         _engine_pre = str(getattr(s, "engine", "") or "").upper().strip()
         if allowed_engines and _engine_pre and _engine_pre not in allowed_engines:
             return (False, 'execution_profile_engine_disabled')
 
-        _allow_family_challenger = bool(_cfg_bool((cfg_live or {}).get('adaptive_family_live_challengers_enabled', False), False))
-        _family_ok, _family_why = _adaptive_family_gate_for_setup(s, session_name=sess, cfg_live=cfg_live, allow_challenger=_allow_family_challenger, best_fut=None)
-        if not _family_ok:
-            return (False, _family_why)
+        alloc_ok, alloc_why = _research_plan_allows_setup(s, session_name=sess)
+        if not alloc_ok:
+            return (False, str(alloc_why or 'allocator_blocked'))
 
         ok, why = is_top_setup_eligible(s, source='exec', session_name=sess)
         if not ok:
@@ -16882,9 +23224,9 @@ def is_executable_setup_eligible(
 
         if engine == 'A':
             if sess == 'LON':
-                score_floor = max((66.0 if reach_mode else 72.0), score_floor)
-                conf_floor = max((73 if reach_mode else 77), conf_floor)
-                rr_floor = max((1.18 if reach_mode else 1.30), rr_floor)
+                score_floor = max((69.0 if reach_mode else 75.0), score_floor)
+                conf_floor = max((75 if reach_mode else 79), conf_floor)
+                rr_floor = max((1.24 if reach_mode else 1.34), rr_floor)
             elif sess == 'NY':
                 score_floor = max(81.0, score_floor)
                 conf_floor = max(82, conf_floor)
@@ -16895,9 +23237,9 @@ def is_executable_setup_eligible(
                 rr_floor = max(1.52, rr_floor)
         elif engine == 'C':
             if sess == 'LON':
-                score_floor = max((65.5 if reach_mode else 71.5), score_floor - 0.60 + engine_c_exec_quality_add)
-                conf_floor = max((73 if reach_mode else 77), conf_floor - 1 + engine_c_exec_conf_add)
-                rr_floor = max((1.16 if reach_mode else 1.28), rr_floor - 0.05 + engine_c_exec_rr_add)
+                score_floor = max((68.5 if reach_mode else 74.5), score_floor - 0.50 + engine_c_exec_quality_add)
+                conf_floor = max((75 if reach_mode else 78), conf_floor + engine_c_exec_conf_add)
+                rr_floor = max((1.22 if reach_mode else 1.32), rr_floor - 0.03 + engine_c_exec_rr_add)
             elif sess == 'NY':
                 score_floor = max(80.0, score_floor + 1.0 + engine_c_exec_quality_add)
                 conf_floor = max(83, conf_floor + 1 + engine_c_exec_conf_add)
@@ -16961,25 +23303,25 @@ def is_executable_setup_eligible(
             if fut_vol < max(MIN_FUT_VOL_USD, 10_500_000.0):
                 return (False, "ny_below_liquidity")
         elif sess == "LON":
-            lon_pb_max = 0.82 if reach_mode else 0.68
-            lon_ch15_cap = 0.72 if reach_mode else 0.60
-            lon_ch1_cap = 1.42 if reach_mode else 1.16
-            lon_ctx_ch4_min = 0.36 if reach_mode else 0.44
-            lon_ctx_ch1_min = 0.14 if reach_mode else 0.18
-            lon_liq_floor = max(MIN_FUT_VOL_USD * (0.72 if reach_mode else 0.88), 7_500_000.0 if reach_mode else 9_000_000.0)
+            lon_pb_max = 0.74 if reach_mode else 0.60
+            lon_ch15_cap = 0.68 if reach_mode else 0.54
+            lon_ch1_cap = 1.35 if reach_mode else 1.18
+            lon_ctx_ch4_min = 0.40 if reach_mode else 0.52
+            lon_ctx_ch1_min = 0.16 if reach_mode else 0.24
+            lon_liq_floor = max(MIN_FUT_VOL_USD * (0.82 if reach_mode else 1.0), 8_500_000.0 if reach_mode else 11_000_000.0)
             if engine == 'C':
                 lon_pb_max = max(lon_pb_max, engine_c_exec_pb_dist_lon)
                 lon_ch1_cap = max(lon_ch1_cap, engine_c_exec_ch1_cap_lon)
                 lon_liq_floor = max(MIN_FUT_VOL_USD * engine_c_exec_liq_mult, ENGINE_C_MIN_FUT_VOL_USD)
-                lon_ctx_ch4_min = min(lon_ctx_ch4_min, 0.32 if reach_mode else 0.40)
-                lon_ctx_ch1_min = min(lon_ctx_ch1_min, 0.12 if reach_mode else 0.16)
+                lon_ctx_ch4_min = min(lon_ctx_ch4_min, 0.48)
+                lon_ctx_ch1_min = min(lon_ctx_ch1_min, 0.22)
             if pb_dist > lon_pb_max:
                 return (False, "lon_entry_too_far_from_ema")
             if ch15_abs > lon_ch15_cap or ch1_abs > lon_ch1_cap:
                 return (False, "lon_late_extension_exec")
             if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                 return (False, "lon_context_too_weak_exec")
-            if ch4_abs > (3.00 if reach_mode else 2.70) or ch24_abs > (16.5 if reach_mode else 14.2):
+            if ch4_abs > (2.85 if reach_mode else 2.55) or ch24_abs > (15.2 if reach_mode else 13.8):
                 return (False, "lon_trend_overheated_exec")
             if fut_vol < lon_liq_floor:
                 return (False, "lon_below_liquidity")
@@ -16996,18 +23338,18 @@ def is_executable_setup_eligible(
         if engine == "A":
             if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
                 return (False, "pullback_not_ready")
-            if pb_dist > ((0.64 if reach_mode else 0.58) if sess == 'LON' else (0.60 if sess == 'NY' else 0.54)):
+            if pb_dist > ((0.68 if reach_mode else 0.54) if sess == 'LON' else (0.60 if sess == 'NY' else 0.54)):
                 return (False, "pullback_still_too_shallow")
-            if sess == 'LON' and (ch15_abs > (0.54 if reach_mode else 0.42) or ch1_abs < (0.22 if reach_mode else 0.26) or ch1_abs > (1.12 if reach_mode else 1.02) or ch4_abs < (0.56 if reach_mode else 0.58)):
+            if sess == 'LON' and (ch15_abs > (0.62 if reach_mode else 0.46) or ch1_abs < (0.16 if reach_mode else 0.28) or ch1_abs > (1.28 if reach_mode else 1.08) or ch4_abs < (0.48 if reach_mode else 0.60)):
                 return (False, 'lon_pullback_not_clean_enough')
             return (True, "ok")
 
         if engine == "C":
-            c_quality_floor = score_floor + (0.40 if reach_mode and sess == 'LON' else 0.25)
-            c_conf_floor = max(75 if (reach_mode and sess == 'LON') else conf_floor, conf_floor - (0 if reach_mode and sess == 'LON' else 0))
-            c_rr_floor = max(1.22 if (reach_mode and sess == 'LON') else rr_floor, rr_floor - (0.02 if reach_mode and sess == 'LON' else 0.0))
-            c_liq_floor = float(max(MIN_FUT_VOL_USD * (engine_c_exec_liq_mult if not (reach_mode and sess == 'LON') else 0.92), 8_500_000.0 if (reach_mode and sess == 'LON') else ENGINE_C_MIN_FUT_VOL_USD))
-            c_ch1_cap = (max(engine_c_exec_ch1_cap_lon, 1.40) if (reach_mode and sess == 'LON') else engine_c_exec_ch1_cap_lon) if sess == 'LON' else (1.45 if sess == 'NY' else 1.10)
+            c_quality_floor = score_floor + (0.00 if reach_mode and sess == 'LON' else 0.25)
+            c_conf_floor = max(75 if (reach_mode and sess == 'LON') else conf_floor, conf_floor - (1 if reach_mode and sess == 'LON' else 0))
+            c_rr_floor = max(1.20 if (reach_mode and sess == 'LON') else rr_floor, rr_floor - (0.04 if reach_mode and sess == 'LON' else 0.0))
+            c_liq_floor = float(max(MIN_FUT_VOL_USD * (engine_c_exec_liq_mult if not (reach_mode and sess == 'LON') else 0.85), 8_000_000.0 if (reach_mode and sess == 'LON') else ENGINE_C_MIN_FUT_VOL_USD))
+            c_ch1_cap = (max(engine_c_exec_ch1_cap_lon, 1.55) if (reach_mode and sess == 'LON') else engine_c_exec_ch1_cap_lon) if sess == 'LON' else (1.45 if sess == 'NY' else 1.10)
             if score < c_quality_floor:
                 return (False, "engine_c_below_quality")
             if conf < c_conf_floor:
@@ -18089,6 +24431,10 @@ def make_setup(
                 pass
         except Exception:
             pass
+        try:
+            s = _research_finalize_setup(s, session_name=session_name)
+        except Exception:
+            pass
         return s
     except Exception as e:
         try:
@@ -18219,7 +24565,7 @@ def make_breakout_setup(
     conf = int(min(conf, 90))
 
     setup_id = make_setup_id(base, side)
-    return Setup(
+    s = Setup(
         setup_id=setup_id,
         symbol=base,
         market_symbol=mv.symbol,
@@ -18246,6 +24592,16 @@ def make_breakout_setup(
         is_trailing_alt_target_b=False,
         created_ts=time.time(),
     )
+    setattr(s, 'atr_pct', float((float(atr_1h) / float(entry) * 100.0) if float(entry) > 0 and float(atr_1h) > 0 else 0.0))
+    setattr(s, 'regime', 'EXPANSION' if abs(float(ch1 or 0.0)) >= 1.0 else ('TRENDING' if abs(float(ch4_used or 0.0)) >= 1.0 else 'BALANCE'))
+    setattr(s, 'trend', 'BULLISH' if side == 'BUY' else 'BEARISH')
+    setattr(s, 'structure', getattr(s, 'trend'))
+    try:
+        score, _ = compute_setup_quality_score(s, session_name=session_name)
+        setattr(s, 'quality_score', float(score))
+    except Exception:
+        pass
+    return _research_finalize_setup(s, session_name=session_name)
 
 
 def pick_setups(
@@ -23945,54 +30301,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, source=mode, session_name=session_name)[0]]
     except Exception:
         pass
-
-    # -----------------------------------------------------
-    # Adaptive family allocator / regime layer
-    # -----------------------------------------------------
-    try:
-        _adaptive_regime = _adaptive_classify_session_regime(best_fut, session_name=session_name, force=False)
-        _adaptive_cfg_live = load_strategy_config(force=False) or {}
-        _allow_screen_challengers = bool(_cfg_bool((_adaptive_cfg_live or {}).get('adaptive_family_prototype_screen_enabled', True), True))
-        _family_rows = []
-        _family_rejects = Counter()
-        for _s in (ordered or []):
-            try:
-                _adaptive_annotate_setup(_s, session_name=session_name, regime=_adaptive_regime)
-                _ok_family, _why_family = _adaptive_family_gate_for_setup(
-                    _s,
-                    session_name=session_name,
-                    cfg_live=_adaptive_cfg_live,
-                    allow_challenger=(mode == 'screen' and _allow_screen_challengers),
-                    best_fut=best_fut,
-                )
-            except Exception as _fam_e:
-                _ok_family, _why_family = False, f'family_gate_exception:{type(_fam_e).__name__}'
-            if _ok_family:
-                _family_rows.append(_s)
-            else:
-                _family_rejects[str(_why_family)] += 1
-        ordered = list(_family_rows)
-        try:
-            db_log_setup_pipeline_event(
-                int(uid or 0),
-                stage='adaptive_family_filter',
-                status='ok' if ordered else 'empty',
-                session=str(session_name or ''),
-                mode=str(mode or ''),
-                details={
-                    'setups_after_family_filter': len(ordered or []),
-                    'rejects': _pipeline_top_reasons(_family_rejects, 6),
-                    'regime_bucket': str((_adaptive_regime or {}).get('bucket') or ''),
-                    'regime_bias': str((_adaptive_regime or {}).get('bias') or ''),
-                },
-            )
-        except Exception:
-            pass
-    except Exception as _fam_outer:
-        try:
-            db_log_setup_pipeline_event(int(uid or 0), stage='adaptive_family_filter', status='error', session=str(session_name or ''), mode=str(mode or ''), details={'error': f'{type(_fam_outer).__name__}: {_fam_outer}'})
-        except Exception:
-            pass
 # -----------------------------------------------------
     # NEW: Spike Reversal candidates (15M+ Vol) — for /screen only
     # -----------------------------------------------------
@@ -24089,6 +30397,11 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                 'make_setup_exception_count': int(((_rej_ctx or {}).get('__agg__') or {}).get('make_setup_exception', 0) or 0),
             },
         )
+    except Exception:
+        pass
+
+    try:
+        ordered = _research_finalize_setups(list(ordered or []), session_name=str(session_name or ""))
     except Exception:
         pass
 
@@ -27850,10 +34163,6 @@ def main():
     app.add_handler(CommandHandler("autopilot_status", learning_status_cmd, block=False))
     app.add_handler(CommandHandler("adaptive_status", market_adaptive_status_cmd, block=False))
     app.add_handler(CommandHandler("adaptive_run", market_adaptive_run_cmd, block=False))
-    app.add_handler(CommandHandler("family_status", family_status_cmd, block=False))
-    app.add_handler(CommandHandler("allocator_status", allocator_status_cmd, block=False))
-    app.add_handler(CommandHandler("allocator_run", allocator_run_cmd, block=False))
-    app.add_handler(CommandHandler("regime_status", regime_status_cmd, block=False))
     app.add_handler(CommandHandler("goal_status", goal_profile_status_cmd, block=False))
     app.add_handler(CommandHandler("goal_run", goal_profile_run_cmd, block=False))
     app.add_handler(CommandHandler("goal_set", goal_profile_set_cmd, block=False))
@@ -27981,34 +34290,6 @@ def main():
         except Exception:
             pass
 
-        try:
-            _fam_cfg = _adaptive_cfg_merge_defaults(load_strategy_config(force=False) or {})
-            if _cfg_bool((_fam_cfg or {}).get('adaptive_family_framework_enabled', True), True):
-                app.job_queue.run_repeating(
-                    adaptive_family_daily_job,
-                    interval=max(21600, int(float((_fam_cfg or {}).get('adaptive_family_selection_refresh_hours', 24.0) or 24.0) * 3600)),
-                    first=max(1500, 480),
-                    name="adaptive_family_daily_job",
-                    job_kwargs={
-                        "max_instances": 1,
-                        "coalesce": True,
-                        "misfire_grace_time": 1800,
-                    },
-                )
-                app.job_queue.run_repeating(
-                    adaptive_family_regime_refresh_job,
-                    interval=max(7200, int(float((_fam_cfg or {}).get('adaptive_family_regime_refresh_hours', 4.0) or 4.0) * 3600)),
-                    first=max(1200, 360),
-                    name="adaptive_family_regime_refresh_job",
-                    job_kwargs={
-                        "max_instances": 1,
-                        "coalesce": True,
-                        "misfire_grace_time": 900,
-                    },
-                )
-        except Exception:
-            pass
-
         if SCAN_INTELLIGENCE_ENABLED:
             app.job_queue.run_repeating(
                 scan_intelligence_job,
@@ -28021,6 +34302,35 @@ def main():
                     "misfire_grace_time": 300,
                 },
             )
+
+        try:
+            _family_cfg = load_strategy_config(force=False)
+            if _cfg_bool((_family_cfg or {}).get("family_regime_refresh_enabled", True), True):
+                app.job_queue.run_repeating(
+                    research_regime_refresh_job,
+                    interval=max(3600, int(float((_family_cfg or {}).get("family_regime_refresh_interval_hours", 4.0) or 4.0) * 3600)),
+                    first=max(600, 240),
+                    name="research_regime_refresh_job",
+                    job_kwargs={
+                        "max_instances": 1,
+                        "coalesce": True,
+                        "misfire_grace_time": 900,
+                    },
+                )
+            if _cfg_bool((_family_cfg or {}).get("family_allocator_enabled", True), True):
+                app.job_queue.run_repeating(
+                    research_allocator_job,
+                    interval=max(21600, int(float((_family_cfg or {}).get("family_allocator_interval_hours", 24.0) or 24.0) * 3600)),
+                    first=max(900, 360),
+                    name="research_allocator_job",
+                    job_kwargs={
+                        "max_instances": 1,
+                        "coalesce": True,
+                        "misfire_grace_time": 1800,
+                    },
+                )
+        except Exception:
+            pass
     else:
         logger.error("JobQueue NOT available – install python-telegram-bot[job-queue]")
 
