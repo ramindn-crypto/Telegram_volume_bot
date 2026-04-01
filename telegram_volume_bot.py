@@ -1060,6 +1060,27 @@ def _strategy_config_migrate():
     except Exception:
         pass
 
+def _goal_profile_expanded_candidate_profiles() -> list[dict]:
+    """Broader execution-profile search space for goal optimizer.
+
+    Keeps legacy LON-only variants for comparison, but defaults to cross-session candidates
+    so the optimizer can escape a narrow LON-only lane.
+    """
+    return [
+        {"name": "GLOBAL_A_B_C_BALANCED", "execution_sessions_allowed": ["ASIA", "LON", "NY"], "execution_engines_allowed": ["A", "B", "C"], "execution_asia_enabled": True, "execution_engine_b_email_enabled": True},
+        {"name": "GLOBAL_A_C_BALANCED", "execution_sessions_allowed": ["ASIA", "LON", "NY"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": True, "execution_engine_b_email_enabled": False},
+        {"name": "LON_NY_A_B_C", "execution_sessions_allowed": ["LON", "NY"], "execution_engines_allowed": ["A", "B", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": True},
+        {"name": "LON_NY_A_C", "execution_sessions_allowed": ["LON", "NY"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+        {"name": "NY_A_B_C_ONLY", "execution_sessions_allowed": ["NY"], "execution_engines_allowed": ["A", "B", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": True},
+        {"name": "NY_A_C_ONLY", "execution_sessions_allowed": ["NY"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+        {"name": "ASIA_LON_A_B_C", "execution_sessions_allowed": ["ASIA", "LON"], "execution_engines_allowed": ["A", "B", "C"], "execution_asia_enabled": True, "execution_engine_b_email_enabled": True},
+        {"name": "ASIA_LON_A_C", "execution_sessions_allowed": ["ASIA", "LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": True, "execution_engine_b_email_enabled": False},
+        {"name": "LON_A_C_REACH", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+        {"name": "LON_A_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+        {"name": "LON_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
+    ]
+
+
 def _strategy_config_defaults() -> dict:
     """Defaults are chosen to target ~3–5 setups/day across universe with robust quality."""
     return {
@@ -1182,20 +1203,14 @@ def _strategy_config_defaults() -> dict:
             {"name": "reach", "quality_score_min_screen": 58.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.38, "tf_align_4h_min_abs": 0.38, "atr_min_pct": 0.76, "min_rr_tp": 1.28, "regime_slope_trend_min_pct": 0.044, "lon_quality_add": -2.0, "lon_conf_add": -1, "lon_rr_add": -0.06, "engine_c_base_score_add": -1.5, "engine_c_exec_quality_add": -1.5, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.04, "engine_c_exec_liq_mult": 0.98, "engine_c_exec_ch1_cap_lon": 1.36, "engine_c_exec_pb_dist_lon": 0.80},
             {"name": "c_breakout_focus", "quality_score_min_screen": 58.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.40, "tf_align_4h_min_abs": 0.40, "atr_min_pct": 0.78, "min_rr_tp": 1.30, "regime_slope_trend_min_pct": 0.046, "lon_quality_add": -1.5, "lon_conf_add": -1, "lon_rr_add": -0.04, "engine_c_base_score_add": -2.0, "engine_c_exec_quality_add": -2.0, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.04, "engine_c_exec_liq_mult": 1.00, "engine_c_exec_ch1_cap_lon": 1.34, "engine_c_exec_pb_dist_lon": 0.78},
         ],
-        "goal_profile_candidate_profiles": [
-            {"name": "LON_A_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
-            {"name": "LON_A_REACH", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
-            {"name": "LON_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
-            {"name": "LON_A_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
-            {"name": "LON_A_C_REACH", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
-        ],
+        "goal_profile_candidate_profiles": _goal_profile_expanded_candidate_profiles(),
         "execution_engines_allowed": ["A", "B", "C"],
-        "goal_profile_active_profile": "BASELINE",
-        "goal_profile_schema_version": 4,
+        "goal_profile_active_profile": "GLOBAL_A_B_C_BALANCED",
+        "goal_profile_schema_version": 5,
         "goal_profile_last_run_ts": 0.0,
-        "goal_profile_allow_ny": False,
-        "goal_profile_allow_asia": False,
-        "goal_profile_allow_engine_b": False,
+        "goal_profile_allow_ny": True,
+        "goal_profile_allow_asia": True,
+        "goal_profile_allow_engine_b": True,
         "goal_profile_shortlist": 2,
         "goal_profile_max_run_minutes": 15.0,
         "goal_profile_reach_mode": False,
@@ -1570,15 +1585,12 @@ def _strategy_config_bootstrap_recommendations() -> None:
         except Exception:
             gp_ver = 0
         
-        if gp_ver < 4:
-            cfg['goal_profile_schema_version'] = 4
-            cfg['goal_profile_candidate_profiles'] = [
-                {"name": "LON_A_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
-                {"name": "LON_A_REACH", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
-                {"name": "LON_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
-                {"name": "LON_A_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
-                {"name": "LON_A_C_REACH", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
-            ]
+        if gp_ver < 5:
+            cfg['goal_profile_schema_version'] = 5
+            cfg['goal_profile_candidate_profiles'] = _goal_profile_expanded_candidate_profiles()
+            cfg['goal_profile_allow_ny'] = True
+            cfg['goal_profile_allow_asia'] = True
+            cfg['goal_profile_allow_engine_b'] = True
             cfg['goal_profile_candidate_bundles'] = [
                 {"name": "strict", "quality_score_min_screen": 64.0, "quality_score_min_email": 72.0, "tf_align_1h_min_abs": 0.65, "tf_align_4h_min_abs": 0.60, "atr_min_pct": 1.00, "min_rr_tp": 1.45, "regime_slope_trend_min_pct": 0.060, "lon_quality_add": 1.0, "lon_conf_add": 1, "lon_rr_add": 0.04, "engine_c_base_score_add": 0.0, "engine_c_exec_quality_add": 0.0, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.10, "engine_c_exec_ch1_cap_lon": 1.20, "engine_c_exec_pb_dist_lon": 0.68},
                 {"name": "balanced", "quality_score_min_screen": 62.0, "quality_score_min_email": 70.0, "tf_align_1h_min_abs": 0.55, "tf_align_4h_min_abs": 0.50, "atr_min_pct": 0.95, "min_rr_tp": 1.40, "regime_slope_trend_min_pct": 0.055, "lon_quality_add": 0.0, "lon_conf_add": 0, "lon_rr_add": 0.00, "engine_c_base_score_add": 0.0, "engine_c_exec_quality_add": 0.0, "engine_c_exec_conf_add": 0, "engine_c_exec_rr_add": 0.00, "engine_c_exec_liq_mult": 1.08, "engine_c_exec_ch1_cap_lon": 1.22, "engine_c_exec_pb_dist_lon": 0.70},
@@ -1592,14 +1604,50 @@ def _strategy_config_bootstrap_recommendations() -> None:
             sessions = [str(x).upper().strip() for x in (cfg.get('execution_sessions_allowed') or []) if str(x).strip()]
             engines = [str(x).upper().strip() for x in (cfg.get('execution_engines_allowed') or []) if str(x).strip()]
             reach_mode = bool(cfg.get('goal_profile_reach_mode', False)) or str(cfg.get('goal_profile_active_profile', '') or '').upper().strip().endswith('_SCOUT')
-            if sessions == ['LON'] and engines == ['A']:
-                cfg['goal_profile_active_profile'] = 'LON_A_REACH' if reach_mode else 'LON_A_ONLY'
+            sess_set = set(sessions)
+            eng_set = set(engines)
+            if sess_set == {'ASIA', 'LON', 'NY'} and eng_set == {'A', 'B', 'C'}:
+                cfg['goal_profile_active_profile'] = 'GLOBAL_A_B_C_BALANCED'
+            elif sess_set == {'ASIA', 'LON', 'NY'} and eng_set == {'A', 'C'}:
+                cfg['goal_profile_active_profile'] = 'GLOBAL_A_C_BALANCED'
+            elif sess_set == {'LON', 'NY'} and eng_set == {'A', 'B', 'C'}:
+                cfg['goal_profile_active_profile'] = 'LON_NY_A_B_C'
+            elif sess_set == {'LON', 'NY'} and eng_set == {'A', 'C'}:
+                cfg['goal_profile_active_profile'] = 'LON_NY_A_C'
+            elif sessions == ['NY'] and eng_set == {'A', 'B', 'C'}:
+                cfg['goal_profile_active_profile'] = 'NY_A_B_C_ONLY'
+            elif sessions == ['NY'] and eng_set == {'A', 'C'}:
+                cfg['goal_profile_active_profile'] = 'NY_A_C_ONLY'
+            elif sess_set == {'ASIA', 'LON'} and eng_set == {'A', 'B', 'C'}:
+                cfg['goal_profile_active_profile'] = 'ASIA_LON_A_B_C'
+            elif sess_set == {'ASIA', 'LON'} and eng_set == {'A', 'C'}:
+                cfg['goal_profile_active_profile'] = 'ASIA_LON_A_C'
+            elif sessions == ['LON'] and engines == ['A']:
+                cfg['goal_profile_active_profile'] = 'LON_A_ONLY'
             elif sessions == ['LON'] and engines == ['C']:
                 cfg['goal_profile_active_profile'] = 'LON_C_ONLY'
-            elif sessions == ['LON'] and set(engines) == {'A', 'C'}:
-                cfg['goal_profile_active_profile'] = 'LON_A_C_REACH' if reach_mode else 'LON_A_C_ONLY'
+            elif sessions == ['LON'] and eng_set == {'A', 'C'}:
+                cfg['goal_profile_active_profile'] = 'LON_A_C_REACH' if reach_mode else 'LON_A_C_REACH'
             changed = True
 
+
+        legacy_lon_only_profiles = {'LON_A_ONLY', 'LON_A_REACH', 'LON_C_ONLY', 'LON_A_C_ONLY', 'LON_A_C_REACH'}
+        try:
+            cur_profile = str(cfg.get('goal_profile_active_profile', '') or '').upper().strip()
+            cur_sessions = [str(x).upper().strip() for x in (cfg.get('execution_sessions_allowed') or []) if str(x).strip()]
+            cur_engines = [str(x).upper().strip() for x in (cfg.get('execution_engines_allowed') or []) if str(x).strip()]
+            if cur_sessions == ['LON'] and (cur_profile in legacy_lon_only_profiles or set(cur_engines).issubset({'A', 'C'})):
+                cfg['goal_profile_allow_ny'] = True
+                cfg['goal_profile_allow_asia'] = True
+                cfg['goal_profile_allow_engine_b'] = True
+                cfg['execution_sessions_allowed'] = ['ASIA', 'LON', 'NY']
+                cfg['execution_engines_allowed'] = ['A', 'B', 'C']
+                cfg['execution_asia_enabled'] = True
+                cfg['execution_engine_b_email_enabled'] = True
+                cfg['goal_profile_active_profile'] = 'GLOBAL_A_B_C_BALANCED'
+                changed = True
+        except Exception:
+            pass
 
         if changed:
             save_strategy_config(cfg)
@@ -22184,9 +22232,9 @@ def _goal_profile_targets(cfg: dict | None = None) -> dict:
         'target_avg_r': float((cfg or {}).get('goal_profile_target_avg_r', 0.10) or 0.10),
         'min_live_30d': int((cfg or {}).get('goal_profile_min_live_setups_30d', 8) or 8),
         'min_live_7d': int((cfg or {}).get('goal_profile_min_live_setups_7d', 2) or 2),
-        'allow_ny': _cfg_bool((cfg or {}).get('goal_profile_allow_ny', False), False),
-        'allow_asia': _cfg_bool((cfg or {}).get('goal_profile_allow_asia', False), False),
-        'allow_engine_b': _cfg_bool((cfg or {}).get('goal_profile_allow_engine_b', False), False),
+        'allow_ny': _cfg_bool((cfg or {}).get('goal_profile_allow_ny', True), True),
+        'allow_asia': _cfg_bool((cfg or {}).get('goal_profile_allow_asia', True), True),
+        'allow_engine_b': _cfg_bool((cfg or {}).get('goal_profile_allow_engine_b', True), True),
         'shortlist': int((cfg or {}).get('goal_profile_shortlist', 2) or 2),
         'max_run_minutes': float((cfg or {}).get('goal_profile_max_run_minutes', 14.0) or 14.0),
     }
@@ -22199,7 +22247,7 @@ def _goal_profile_candidate_profiles(cfg: dict | None = None) -> list[dict]:
     allow_asia = bool(tgt.get('allow_asia'))
     allow_engine_b = bool(tgt.get('allow_engine_b'))
     out = []
-    raw = list((cfg or {}).get('goal_profile_candidate_profiles') or [])
+    raw = list((cfg or {}).get('goal_profile_candidate_profiles') or _goal_profile_expanded_candidate_profiles())
     for item in raw:
         try:
             name = str((item or {}).get('name') or '').strip() or 'PROFILE'
@@ -22213,23 +22261,14 @@ def _goal_profile_candidate_profiles(cfg: dict | None = None) -> list[dict]:
                 continue
             out.append({
                 'name': name,
-                'execution_sessions_allowed': sessions or ['LON'],
-                'execution_engines_allowed': engines or ['A'],
-                'execution_asia_enabled': _cfg_bool((item or {}).get('execution_asia_enabled', False), False) and allow_asia,
-                'execution_engine_b_email_enabled': _cfg_bool((item or {}).get('execution_engine_b_email_enabled', False), False) and allow_engine_b,
+                'execution_sessions_allowed': sessions or ['LON', 'NY', 'ASIA'],
+                'execution_engines_allowed': engines or ['A', 'B', 'C'],
+                'execution_asia_enabled': _cfg_bool((item or {}).get('execution_asia_enabled', True), True) and allow_asia,
+                'execution_engine_b_email_enabled': _cfg_bool((item or {}).get('execution_engine_b_email_enabled', True), True) and allow_engine_b,
             })
         except Exception:
             continue
-    if out:
-        return out
-    fallback = [
-        {'name': 'LON_A_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
-        {'name': 'LON_C_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['C'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
-        {'name': 'LON_A_C_ONLY', 'execution_sessions_allowed': ['LON'], 'execution_engines_allowed': ['A', 'C'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False},
-    ]
-    if allow_ny:
-        fallback.append({'name': 'LON_NY_A_ONLY', 'execution_sessions_allowed': ['LON', 'NY'], 'execution_engines_allowed': ['A'], 'execution_asia_enabled': False, 'execution_engine_b_email_enabled': False})
-    return fallback
+    return out or list(_goal_profile_expanded_candidate_profiles())
 
 
 def _goal_profile_candidate_bundles(cfg: dict | None = None) -> list[dict]:
@@ -22856,6 +22895,7 @@ async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_
         f"Enabled: {'ON' if tgt['enabled'] else 'OFF'} | Interval: {float(tgt['interval_hours']):.1f}h | Cooldown: {float(tgt['cooldown_hours']):.1f}h",
         f"Target: {float(tgt['target_lo']):.2f}–{float(tgt['target_hi']):.2f} setups/day | WR≥{float(tgt['target_wr']):.1f}% | AvgR≥{float(tgt['target_avg_r']):.2f}",
         f"Minimum live sample: 30d≥{int(tgt['min_live_30d'])} | 7d≥{int(tgt['min_live_7d'])}",
+        f"Search space: NY={'ON' if bool(tgt.get('allow_ny')) else 'OFF'} | ASIA={'ON' if bool(tgt.get('allow_asia')) else 'OFF'} | Engine B={'ON' if bool(tgt.get('allow_engine_b')) else 'OFF'}",
         f"Current execution profile: {current_profile} | sessions={current_sessions} | engines={current_engines}",
     ]
     if rep:
@@ -24865,8 +24905,18 @@ def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
     except Exception:
         day_cap = int(DEFAULT_MAX_EMAILS_PER_DAY)
 
+    current_sess = None
+    current_session_key = ''
+    try:
+        current_sess = in_session_now(user)
+        current_session_key = str((current_sess or {}).get('session_key') or '')
+    except Exception:
+        current_sess = None
+        current_session_key = ''
     try:
         sent_in_session = int(st.get('sent_count', 0) or 0)
+        if (not current_session_key) or str(st.get('session_key') or '') != current_session_key:
+            sent_in_session = 0
     except Exception:
         sent_in_session = 0
     try:
@@ -24902,7 +24952,7 @@ def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
         'smtp_ready': smtp_ready,
         'recipient': recipient,
         'recipient_masked': _mask_email_addr(recipient),
-        'session_key': str(st.get('session_key') or 'NONE'),
+        'session_key': str(current_session_key or st.get('session_key') or 'NONE'),
         'sent_in_session': sent_in_session,
         'session_cap': session_cap,
         'sent_today': sent_today,
@@ -26091,6 +26141,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "support_open": "Open a support ticket as admin",
     "support_close": "Close a support ticket as admin",
     "health_sys": "Admin engine health summary",
+    "dev_status": "Developer system summary (goal, allocator, regime, data)",
     "health": "General bot and data health",
     "why": "Last scan reject reasons",
     "edge_status": "Learning / optimizer / execution assurance view with synced signal WR",
@@ -26142,7 +26193,7 @@ ADMIN_HELP_DESCRIPTIONS = {
 ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
-    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "adaptive_run", "goal_status", "goal_run", "goal_set", "goal_abort", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
+    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "adaptive_run", "goal_status", "goal_run", "goal_set", "goal_abort", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
@@ -32833,6 +32884,99 @@ async def why_no_setups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # /health (transparent system health)
 # =========================================================
+async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    uid = int(update.effective_user.id)
+    user = reset_daily_if_needed(get_user(uid))
+    cfg = load_strategy_config(force=False)
+    tgt = _goal_profile_targets(cfg)
+    goal_rep = load_goal_profile_report() or {}
+    final = dict(goal_rep.get('final') or {})
+    m30 = dict(final.get('metrics_30d') or {})
+    m7 = dict(final.get('metrics_7d') or {})
+    email_gate = _email_runtime_limits_snapshot(uid, user)
+    adaptive = _market_adaptive_status_snapshot() or {}
+    now_utc = datetime.now(timezone.utc)
+    now_session = current_session_utc(now_utc)
+
+    data_counts = {'signals_24h': 0, 'exec_24h': 0, 'emailed_24h': 0, 'pipeline_events_24h': 0, 'family_eval_rows_today': 0}
+    try:
+        since_ts = float(time.time() - 24 * 3600)
+        trading_day = _research_trading_day_label(time.time())
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(1) AS n FROM signals WHERE created_ts>=?", (since_ts,))
+            row = cur.fetchone()
+            data_counts['signals_24h'] = int((row['n'] if row else 0) or 0)
+            cur.execute("SELECT COUNT(1) AS n FROM executable_setups WHERE executable_ts>=?", (since_ts,))
+            row = cur.fetchone()
+            data_counts['exec_24h'] = int((row['n'] if row else 0) or 0)
+            cur.execute("SELECT COUNT(1) AS n FROM emailed_setups WHERE emailed_ts>=?", (since_ts,))
+            row = cur.fetchone()
+            data_counts['emailed_24h'] = int((row['n'] if row else 0) or 0)
+            cur.execute("SELECT COUNT(1) AS n FROM setup_pipeline_events WHERE event_ts>=?", (since_ts,))
+            row = cur.fetchone()
+            data_counts['pipeline_events_24h'] = int((row['n'] if row else 0) or 0)
+            cur.execute("SELECT COUNT(1) AS n FROM family_eval_daily WHERE trading_day=?", (trading_day,))
+            row = cur.fetchone()
+            data_counts['family_eval_rows_today'] = int((row['n'] if row else 0) or 0)
+    except Exception:
+        pass
+
+    def _fmt_regime(refresh_window: str, sess: str) -> str:
+        snap = _research_latest_regime_snapshot(sess, refresh_window=refresh_window) or {}
+        primary = str(snap.get('primary_regime') or '-').strip() or '-'
+        conf = float(snap.get('confidence') or 0.0)
+        ts = float(snap.get('ts') or 0.0)
+        ts_txt = _fmt_dt_local(datetime.fromtimestamp(ts, tz=timezone.utc), '%H:%M') if ts > 0 else '—'
+        return f"{sess}:{primary} ({conf:.2f}) @{ts_txt}"
+
+    def _fmt_plan(sess: str) -> str:
+        plan = _research_latest_allocator_plan(sess, '') or {}
+        active = ','.join(plan.get('active_families_json') or []) if isinstance(plan.get('active_families_json'), list) else ','.join(json.loads(plan.get('active_families_json') or '[]')) if str(plan.get('active_families_json') or '').startswith('[') else ''
+        champ = str(plan.get('champion_family_id') or '-')
+        regime = str(plan.get('regime_cell') or '-')
+        return f"{sess}:{regime} | champion={champ} | active={active or '-'}"
+
+    goal_ts = float(goal_rep.get('ts', 0.0) or 0.0)
+    goal_ts_txt = _fmt_dt_local(datetime.fromtimestamp(goal_ts, tz=timezone.utc)) if goal_ts > 0 else '—'
+    ad_last = dict(adaptive.get('last_run') or {})
+    ad_last_ts = float(ad_last.get('finished_ts', 0.0) or ad_last.get('started_ts', 0.0) or 0.0)
+    ad_last_txt = _fmt_dt_local(datetime.fromtimestamp(ad_last_ts, tz=timezone.utc)) if ad_last_ts > 0 else '—'
+    current_sessions = ','.join(cfg.get('execution_sessions_allowed') or []) or '-'
+    current_engines = ','.join(cfg.get('execution_engines_allowed') or []) or '-'
+
+    lines = [
+        '🧭 Developer Status',
+        HDR,
+        f"Now: {now_session} | Trading day: {_research_trading_day_label(time.time())}",
+        f"Goal profile: {str(cfg.get('goal_profile_active_profile') or 'BASELINE')} | sessions={current_sessions} | engines={current_engines}",
+        f"Goal scheduler: {'ON' if bool(tgt.get('enabled')) else 'OFF'} | every {float(tgt.get('interval_hours', 24.0) or 24.0):.1f}h | cooldown {float(tgt.get('cooldown_hours', 20.0) or 20.0):.1f}h",
+        f"Goal search space: NY={'ON' if bool(tgt.get('allow_ny')) else 'OFF'} | ASIA={'ON' if bool(tgt.get('allow_asia')) else 'OFF'} | Engine B={'ON' if bool(tgt.get('allow_engine_b')) else 'OFF'}",
+        f"Goal last run: {str(goal_rep.get('status') or '-')} | {goal_ts_txt}",
+        f"Goal 30d: {float(m30.get('setups_per_day', 0.0) or 0.0):.2f}/day | setups={int(m30.get('setups', 0) or 0)} | WR={float(m30.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R', 0.0) or 0.0):.3f}",
+        f"Goal 7d: {float(m7.get('setups_per_day', 0.0) or 0.0):.2f}/day | setups={int(m7.get('setups', 0) or 0)} | WR={float(m7.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R', 0.0) or 0.0):.3f}",
+        SEP,
+        f"Family allocator: {'ON' if _cfg_bool((cfg or {}).get('family_allocator_enabled', True), True) else 'OFF'} | shadow={'ON' if _cfg_bool((cfg or {}).get('family_allocator_shadow_mode', True), True) else 'OFF'} | live_enforce={'ON' if _cfg_bool((cfg or {}).get('family_allocator_enforce_live', False), False) else 'OFF'} | max_active={int((cfg or {}).get('family_allocator_max_active_per_cell', 2) or 2)}",
+        f"Regime refresh: {'ON' if _cfg_bool((cfg or {}).get('family_regime_refresh_enabled', True), True) else 'OFF'} | every {float((cfg or {}).get('family_regime_refresh_interval_hours', 4.0) or 4.0):.1f}h",
+        'Daily regimes: ' + ' | '.join([_fmt_regime('daily', s) for s in ['ASIA', 'LON', 'NY']]),
+        '4h regimes: ' + ' | '.join([_fmt_regime('4h', s) for s in ['ASIA', 'LON', 'NY']]),
+        'Allocator plans: ' + ' || '.join([_fmt_plan(s) for s in ['ASIA', 'LON', 'NY']]),
+        SEP,
+        f"Adaptive optimizer: {'ON' if bool(adaptive.get('enabled')) else 'OFF'} | every {float(adaptive.get('interval_hours', 24.0) or 24.0):.1f}h | last={str(ad_last.get('status') or '-')}/{ad_last_txt}",
+        f"Data 24h: signals={int(data_counts.get('signals_24h', 0) or 0)} | executable={int(data_counts.get('exec_24h', 0) or 0)} | emailed={int(data_counts.get('emailed_24h', 0) or 0)} | pipeline_events={int(data_counts.get('pipeline_events_24h', 0) or 0)} | family_eval_rows_today={int(data_counts.get('family_eval_rows_today', 0) or 0)}",
+        SEP,
+        f"Email lane: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'} | sent_session={int(email_gate.get('sent_in_session', 0) or 0)} | sent_today={int(email_gate.get('sent_today', 0) or 0)} | recipient={str(email_gate.get('recipient_masked') or '(none)')}",
+    ]
+    gate_reason = ', '.join([str(x) for x in (email_gate.get('gate_reasons') or [])[:4]])
+    if gate_reason:
+        lines.append(f"Email reasons: {gate_reason}")
+    await send_long_message(update, "\n".join(lines), parse_mode=None)
+
+
 async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Transparent health check:
@@ -32970,6 +33114,7 @@ async def _post_init(app: Application):
 
             BotCommand("health", "Bot & data health check"),
             BotCommand("health_sys", "Admin engine health"),
+            BotCommand("dev_status", "Developer system summary"),
 
             BotCommand("billing", "Subscription & payment info"),
         ]
@@ -34100,6 +34245,8 @@ def main():
     app.add_handler(CommandHandler("reset", reset_cmd, block=False))
     app.add_handler(CommandHandler("restore", restore_cmd, block=False))
     app.add_handler(CommandHandler("health_sys", health_sys_cmd, block=False))
+    app.add_handler(CommandHandler("dev_status", dev_status_cmd, block=False))
+    app.add_handler(CommandHandler("framework_status", dev_status_cmd, block=False))
     app.add_handler(CommandHandler("billing", billing_cmd, block=False))
     app.add_handler(CommandHandler("email_on_off", email_on_off_cmd, block=False))
     app.add_handler(CommandHandler("upgrade", upgrade_cmd, block=False))
