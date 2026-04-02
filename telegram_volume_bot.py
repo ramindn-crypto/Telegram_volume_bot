@@ -1068,7 +1068,9 @@ def _goal_profile_expanded_candidate_profiles() -> list[dict]:
     """
     return [
         {"name": "GLOBAL_A_B_C_BALANCED", "execution_sessions_allowed": ["ASIA", "LON", "NY"], "execution_engines_allowed": ["A", "B", "C"], "execution_asia_enabled": True, "execution_engine_b_email_enabled": True},
+        {"name": "GLOBAL_A_B_C_REACH", "execution_sessions_allowed": ["ASIA", "LON", "NY"], "execution_engines_allowed": ["A", "B", "C"], "execution_asia_enabled": True, "execution_engine_b_email_enabled": True},
         {"name": "GLOBAL_A_C_BALANCED", "execution_sessions_allowed": ["ASIA", "LON", "NY"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": True, "execution_engine_b_email_enabled": False},
+        {"name": "GLOBAL_A_C_REACH", "execution_sessions_allowed": ["ASIA", "LON", "NY"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": True, "execution_engine_b_email_enabled": False},
         {"name": "LON_NY_A_B_C", "execution_sessions_allowed": ["LON", "NY"], "execution_engines_allowed": ["A", "B", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": True},
         {"name": "LON_NY_A_C", "execution_sessions_allowed": ["LON", "NY"], "execution_engines_allowed": ["A", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
         {"name": "NY_A_B_C_ONLY", "execution_sessions_allowed": ["NY"], "execution_engines_allowed": ["A", "B", "C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": True},
@@ -1079,7 +1081,6 @@ def _goal_profile_expanded_candidate_profiles() -> list[dict]:
         {"name": "LON_A_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["A"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
         {"name": "LON_C_ONLY", "execution_sessions_allowed": ["LON"], "execution_engines_allowed": ["C"], "execution_asia_enabled": False, "execution_engine_b_email_enabled": False},
     ]
-
 
 def _strategy_config_defaults() -> dict:
     """Defaults are chosen to target ~3–5 setups/day across universe with robust quality."""
@@ -1212,7 +1213,7 @@ def _strategy_config_defaults() -> dict:
         "goal_profile_allow_asia": True,
         "goal_profile_allow_engine_b": True,
         "goal_profile_shortlist": 2,
-        "goal_profile_max_run_minutes": 15.0,
+        "goal_profile_max_run_minutes": 22.0,
         "goal_profile_reach_mode": False,
 
         "engine_c_base_score_add": 0.0,
@@ -1599,7 +1600,7 @@ def _strategy_config_bootstrap_recommendations() -> None:
                 {"name": "c_breakout_focus", "quality_score_min_screen": 58.0, "quality_score_min_email": 66.0, "tf_align_1h_min_abs": 0.40, "tf_align_4h_min_abs": 0.40, "atr_min_pct": 0.78, "min_rr_tp": 1.30, "regime_slope_trend_min_pct": 0.046, "lon_quality_add": -1.5, "lon_conf_add": -1, "lon_rr_add": -0.04, "engine_c_base_score_add": -2.0, "engine_c_exec_quality_add": -2.0, "engine_c_exec_conf_add": -1, "engine_c_exec_rr_add": -0.04, "engine_c_exec_liq_mult": 1.00, "engine_c_exec_ch1_cap_lon": 1.34, "engine_c_exec_pb_dist_lon": 0.78},
             ]
             cfg['goal_profile_shortlist'] = 2
-            cfg['goal_profile_max_run_minutes'] = 15.0
+            cfg['goal_profile_max_run_minutes'] = 22.0
             cfg['goal_profile_reach_mode'] = bool(cfg.get('goal_profile_reach_mode', False))
             sessions = [str(x).upper().strip() for x in (cfg.get('execution_sessions_allowed') or []) if str(x).strip()]
             engines = [str(x).upper().strip() for x in (cfg.get('execution_engines_allowed') or []) if str(x).strip()]
@@ -7154,7 +7155,7 @@ def _research_compute_family_eval_snapshot(trading_day: str | None = None) -> li
             sess = str(r.get('session') or 'NY').upper()
             regime = str(r.get('regime_cell') or 'BALANCE').upper()
             k = (fam, sess, regime)
-            b = buckets.setdefault(k, {'family_id': fam, 'session': sess, 'regime_cell': regime, 'r_7d': [], 'r_30d': [], 'wins_7d': 0, 'losses_7d': 0, 'wins_30d': 0, 'losses_30d': 0})
+            b = buckets.setdefault(k, {'family_id': fam, 'session': sess, 'regime_cell': regime, 'r_7d': [], 'r_30d': [], 'wins_7d': 0, 'losses_7d': 0, 'wins_30d': 0, 'losses_30d': 0, 'sample_hint_30d': 0, 'sample_hint_7d': 0, 'score_hint_30d': 0.0, 'score_hint_7d': 0.0})
             pnl = float(r.get('pnl') or 0.0)
             risk_abs = float(r.get('risk_abs') or 0.0)
             r_mult = (pnl / risk_abs) if risk_abs > 0 else (1.0 if pnl > 0 else -1.0 if pnl < 0 else 0.0)
@@ -7170,29 +7171,92 @@ def _research_compute_family_eval_snapshot(trading_day: str | None = None) -> li
                     b['wins_7d'] += 1
                 elif r_mult < 0:
                     b['losses_7d'] += 1
+
+        # Fallback heuristic: seed daily family-eval rows from executable/generated activity
+        # when there are not enough closed autotrade samples yet.
+        if not buckets:
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cur = conn.cursor()
+                    hint_rows = [dict(r) for r in (cur.execute(
+                        """
+                        SELECT
+                            UPPER(COALESCE(NULLIF(x.family_id,''), CASE UPPER(COALESCE(x.engine,'')) WHEN 'A' THEN 'F1_PULLBACK_CONT' WHEN 'B' THEN 'F2_MOMENTUM_IGNITION' WHEN 'C' THEN 'F3_IMPULSE_BASE_CONT' ELSE 'F0_UNKNOWN' END)) AS family_id,
+                            UPPER(COALESCE(NULLIF(x.session,''),'NY')) AS session,
+                            UPPER(COALESCE(NULLIF(x.regime_primary,''), CASE UPPER(COALESCE(x.side,'')) WHEN 'BUY' THEN 'TREND_UP' WHEN 'SELL' THEN 'TREND_DOWN' ELSE 'BALANCE' END)) AS regime_cell,
+                            x.executable_ts AS ts_event,
+                            COALESCE(x.exec_score, x.quality_score, 0) AS score_hint
+                        FROM executable_setups x
+                        WHERE COALESCE(x.executable_ts,0) >= ?
+                        UNION ALL
+                        SELECT
+                            UPPER(COALESCE(NULLIF(s.family_id,''), 'F0_UNKNOWN')) AS family_id,
+                            UPPER(COALESCE(NULLIF(g.session,''),'NY')) AS session,
+                            UPPER(COALESCE(NULLIF(s.regime_primary,''), CASE UPPER(COALESCE(s.side,'')) WHEN 'BUY' THEN 'TREND_UP' WHEN 'SELL' THEN 'TREND_DOWN' ELSE 'BALANCE' END)) AS regime_cell,
+                            COALESCE(g.created_ts, s.created_ts, 0) AS ts_event,
+                            COALESCE(s.exec_score, s.family_score, 0) AS score_hint
+                        FROM generated_setups g
+                        LEFT JOIN signals s ON s.setup_id = g.setup_id
+                        WHERE COALESCE(g.created_ts,0) >= ?
+                        """,
+                        (float(cutoff_30d), float(cutoff_30d))
+                    ).fetchall() or [])]
+                for r in hint_rows:
+                    fam = str(r.get('family_id') or 'F0_UNKNOWN').upper()
+                    sess = str(r.get('session') or 'NY').upper()
+                    regime = str(r.get('regime_cell') or 'BALANCE').upper()
+                    if fam in {'', 'F0_UNKNOWN'}:
+                        continue
+                    k = (fam, sess, regime)
+                    b = buckets.setdefault(k, {'family_id': fam, 'session': sess, 'regime_cell': regime, 'r_7d': [], 'r_30d': [], 'wins_7d': 0, 'losses_7d': 0, 'wins_30d': 0, 'losses_30d': 0, 'sample_hint_30d': 0, 'sample_hint_7d': 0, 'score_hint_30d': 0.0, 'score_hint_7d': 0.0})
+                    ts_event = float(r.get('ts_event') or 0.0)
+                    score_hint = float(r.get('score_hint') or 0.0)
+                    b['sample_hint_30d'] += 1
+                    b['score_hint_30d'] += score_hint
+                    if ts_event >= cutoff_7d:
+                        b['sample_hint_7d'] += 1
+                        b['score_hint_7d'] += score_hint
+            except Exception:
+                pass
+
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
             cur.execute("DELETE FROM family_eval_daily WHERE trading_day=?", (trading_day,))
             for (fam, sess, regime), b in buckets.items():
                 r7 = list(b.get('r_7d') or [])
                 r30 = list(b.get('r_30d') or [])
-                wr7 = (100.0 * b['wins_7d'] / max(1, b['wins_7d'] + b['losses_7d'])) if (b['wins_7d'] + b['losses_7d']) else 0.0
-                wr30 = (100.0 * b['wins_30d'] / max(1, b['wins_30d'] + b['losses_30d'])) if (b['wins_30d'] + b['losses_30d']) else 0.0
+                wins7 = int(b.get('wins_7d', 0) or 0)
+                losses7 = int(b.get('losses_7d', 0) or 0)
+                wins30 = int(b.get('wins_30d', 0) or 0)
+                losses30 = int(b.get('losses_30d', 0) or 0)
+                sample_hint_30d = int(b.get('sample_hint_30d', 0) or 0)
+                sample_hint_7d = int(b.get('sample_hint_7d', 0) or 0)
+                avg_hint_30d = (float(b.get('score_hint_30d', 0.0) or 0.0) / max(1, sample_hint_30d)) if sample_hint_30d > 0 else 0.0
+                avg_hint_7d = (float(b.get('score_hint_7d', 0.0) or 0.0) / max(1, sample_hint_7d)) if sample_hint_7d > 0 else 0.0
+
+                wr7 = (100.0 * wins7 / max(1, wins7 + losses7)) if (wins7 + losses7) else 0.0
+                wr30 = (100.0 * wins30 / max(1, wins30 + losses30)) if (wins30 + losses30) else 0.0
                 exp7 = (sum(r7) / len(r7)) if r7 else 0.0
                 exp30 = (sum(r30) / len(r30)) if r30 else 0.0
                 med30 = sorted(r30)[len(r30)//2] if r30 else 0.0
                 score7 = 0.65 * exp7 + 0.35 * (wr7 / 100.0)
                 score30 = 0.65 * exp30 + 0.35 * (wr30 / 100.0)
                 shrunk = 0.70 * score7 + 0.30 * score30
+                if not r30 and sample_hint_30d > 0:
+                    score30 = 0.20 * (avg_hint_30d / 100.0) + 0.05 * min(1.0, sample_hint_30d / 5.0)
+                    score7 = 0.25 * (avg_hint_7d / 100.0) + 0.05 * min(1.0, sample_hint_7d / 3.0)
+                    shrunk = 0.70 * score7 + 0.30 * score30
+
                 row = {
                     'eval_id': f"FE-{trading_day}-{fam}-{sess}-{regime}",
                     'trading_day': trading_day,
                     'family_id': fam,
                     'session': sess,
                     'regime_cell': regime,
-                    'sample_n': int(len(r30)),
-                    'wins': int(b['wins_30d']),
-                    'losses': int(b['losses_30d']),
+                    'sample_n': int(len(r30) if r30 else sample_hint_30d),
+                    'wins': int(wins30),
+                    'losses': int(losses30),
                     'expectancy_r': float(exp30),
                     'median_r': float(med30),
                     'wr': float(wr30),
@@ -7217,7 +7281,6 @@ def _research_compute_family_eval_snapshot(trading_day: str | None = None) -> li
     except Exception:
         pass
     return rows_out
-
 
 def _research_build_allocator_plans(best_fut: dict | None = None, trading_day: str | None = None) -> list[dict]:
     trading_day = str(trading_day or _research_trading_day_label())
@@ -8054,6 +8117,38 @@ def _learning_status_text(use_live_refresh: bool = False, sync_lifecycle: bool =
     opt_promoted = bool((opt_res or {}).get("promoted"))
     runtime_profile = _runtime_profile_bootstrap_if_missing(cfg)
     runtime_review = _runtime_profile_review_probation(owner, force=False) if owner > 0 else {}
+    def _fmt_pipe(label: str, row: dict) -> str:
+        try:
+            if not row:
+                return f"{label}: -"
+            status = str(row.get('status') or '-')
+            stage = str(row.get('stage') or label)
+            sess = str(row.get('session') or '-').upper()
+            mode = str(row.get('mode') or '-').lower()
+            try:
+                details = json.loads(str(row.get('details_json') or '{}'))
+            except Exception:
+                details = {}
+            parts = []
+            if isinstance(details, dict):
+                for key in ('setups', 'eligible', 'persisted', 'raw_pool'):
+                    if key in details:
+                        parts.append(f"{key}={details.get(key)}")
+                tr = details.get('top_reasons') or details.get('top_exec_rejects') or {}
+                if tr:
+                    try:
+                        k0, v0 = next(iter(tr.items()))
+                        parts.append(f"top={k0}:{v0}")
+                    except Exception:
+                        pass
+                err = details.get('error')
+                if err:
+                    parts.append(str(err))
+            suffix = (' | ' + ' | '.join(parts[:3])) if parts else ''
+            return f"{label}: {stage}/{status} [{mode}:{sess}]{suffix}"
+        except Exception:
+            return f"{label}: -"
+
     lines = [
         "🧠 Learning / Optimization Status",
         HDR,
@@ -13235,6 +13330,39 @@ def _pipeline_top_reasons(counts: dict | Counter | None, limit: int = 5) -> dict
         else:
             items = Counter(dict(counts or {})).most_common(int(limit))
         return {str(k): int(v) for k, v in items}
+    except Exception:
+        return {}
+
+
+def _latest_setup_pipeline_event(user_id: int | None = None, stage: str = '', session: str = '', mode: str = '') -> dict:
+    try:
+        key = _setup_pipeline_event_key(user_id, stage or 'latest', session, mode)
+        row = dict(_LAST_SETUP_PIPELINE_EVENT.get(key) or {})
+        if row:
+            return row
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            sql = "SELECT * FROM setup_pipeline_events WHERE 1=1 "
+            params = []
+            if user_id is not None:
+                sql += " AND user_id=? "
+                params.append(int(user_id))
+            if stage:
+                sql += " AND LOWER(COALESCE(stage,''))=? "
+                params.append(str(stage).strip().lower())
+            if session:
+                sql += " AND UPPER(COALESCE(session,''))=? "
+                params.append(str(session).strip().upper())
+            if mode:
+                sql += " AND LOWER(COALESCE(mode,''))=? "
+                params.append(str(mode).strip().lower())
+            sql += " ORDER BY event_ts DESC LIMIT 1 "
+            row = cur.execute(sql, tuple(params)).fetchone()
+            return dict(row) if row else {}
     except Exception:
         return {}
 
@@ -32529,6 +32657,28 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     pool = {"setups": []}
 
                 setups = list(pool.get("setups", []) or [])
+                if (not setups) and str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
+                    try:
+                        fallback_pool = await asyncio.wait_for(
+                            build_priority_pool(
+                                best_fut,
+                                sess_name,
+                                mode="screen",
+                                scan_profile="aggressive",
+                                uid=None,
+                            ),
+                            timeout=max(20, int(EMAIL_BUILD_POOL_TIMEOUT_SEC)),
+                        )
+                        setups = list((fallback_pool or {}).get("setups", []) or [])
+                        try:
+                            db_log_setup_pipeline_event(0, stage='build_priority_pool_fallback', status='ok' if setups else 'empty', session=str(sess_name or ''), mode='email', details={'fallback_mode': 'screen_aggressive', 'setups': len(setups or [])})
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        try:
+                            db_log_setup_pipeline_event(0, stage='build_priority_pool_fallback', status='error', session=str(sess_name or ''), mode='email', details={'fallback_mode': 'screen_aggressive', 'error': f'{type(e).__name__}: {e}'})
+                        except Exception:
+                            pass
                 if setups:
                     _email_pool_cache_set(sess_name, setups)
                 elif cached_setups:
@@ -33025,6 +33175,7 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now_session = current_session_utc(now_utc)
 
     data_counts = {'signals_24h': 0, 'exec_24h': 0, 'emailed_24h': 0, 'pipeline_events_24h': 0, 'family_eval_rows_today': 0, 'autotrade_opened_24h': 0, 'autotrade_closed_24h': 0}
+    pipeline_latest = {'email_latest': {}, 'email_build': {}, 'email_exec': {}, 'screen_exec': {}}
     try:
         since_ts = float(time.time() - 24 * 3600)
         trading_day = _research_trading_day_label(time.time())
@@ -33052,6 +33203,14 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur.execute("SELECT COUNT(1) AS n FROM autotrade_trades WHERE closed_ts IS NOT NULL AND closed_ts>=?", (since_ts,))
             row = cur.fetchone()
             data_counts['autotrade_closed_24h'] = int((row['n'] if row else 0) or 0)
+    except Exception:
+        pass
+
+    try:
+        pipeline_latest['email_latest'] = _latest_setup_pipeline_event(uid, stage='latest', mode='email') or {}
+        pipeline_latest['email_build'] = _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or {}
+        pipeline_latest['email_exec'] = _latest_setup_pipeline_event(uid, stage='email_executable_pool', mode='email') or {}
+        pipeline_latest['screen_exec'] = _latest_setup_pipeline_event(uid, stage='screen_executable_pool', mode='screen') or {}
     except Exception:
         pass
 
@@ -33097,6 +33256,10 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         SEP,
         f"Adaptive optimizer: {'ON' if bool(adaptive.get('enabled')) else 'OFF'} | every {float(adaptive.get('interval_hours', 24.0) or 24.0):.1f}h | last={str(ad_last.get('status') or '-')}/{ad_last_txt}",
         f"Data 24h: signals={int(data_counts.get('signals_24h', 0) or 0)} | executable={int(data_counts.get('exec_24h', 0) or 0)} | emailed={int(data_counts.get('emailed_24h', 0) or 0)} | pipeline_events={int(data_counts.get('pipeline_events_24h', 0) or 0)} | family_eval_rows_today={int(data_counts.get('family_eval_rows_today', 0) or 0)} | autotrade_opened={int(data_counts.get('autotrade_opened_24h', 0) or 0)} | autotrade_closed={int(data_counts.get('autotrade_closed_24h', 0) or 0)}",
+        _fmt_pipe('Pipeline latest', pipeline_latest.get('email_latest') or {}),
+        _fmt_pipe('Email build', pipeline_latest.get('email_build') or {}),
+        _fmt_pipe('Email exec', pipeline_latest.get('email_exec') or {}),
+        _fmt_pipe('Screen exec', pipeline_latest.get('screen_exec') or {}),
         SEP,
         f"Email lane: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'} | sent_session={int(email_gate.get('sent_in_session', 0) or 0)} | sent_today={int(email_gate.get('sent_today', 0) or 0)} | recipient={str(email_gate.get('recipient_masked') or '(none)')}",
     ]
