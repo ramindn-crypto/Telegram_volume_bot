@@ -14835,6 +14835,10 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
     return best
 
 _OHLCV_RATE_LIMIT_UNTIL: Dict[str, float] = {}
+_OHLCV_TF_RATE_LIMIT_UNTIL: Dict[str, float] = {}
+_OHLCV_RATE_LIMIT_WARN_UNTIL: Dict[str, float] = {}
+OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "20") or 20)
+OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "30") or 30)
 BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC", "6") or 6)
 BYBIT_OPEN_ORDERS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_ORDERS_CACHE_TTL_SEC", "6") or 6)
 SCREEN_DIRECTIONAL_CACHE_TTL_SEC = int(os.getenv("SCREEN_DIRECTIONAL_CACHE_TTL_SEC", "45") or 45)
@@ -14854,8 +14858,10 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         return cache_get(key)
 
     now_ts = float(time.time())
+    tf_key = str(timeframe or '').lower().strip() or 'na'
     cool_until = float(_OHLCV_RATE_LIMIT_UNTIL.get(key) or 0.0)
-    if cool_until > now_ts:
+    tf_cool_until = float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0)
+    if cool_until > now_ts or tf_cool_until > now_ts:
         stale = cache_get(key)
         return stale if isinstance(stale, list) else []
 
@@ -14864,16 +14870,23 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
         cache_set(key, data)
         _OHLCV_RATE_LIMIT_UNTIL.pop(key, None)
+        _OHLCV_TF_RATE_LIMIT_UNTIL.pop(tf_key, None)
         return data
     except Exception as e:
         name = type(e).__name__
         msg = str(e or '')
         if 'RateLimitExceeded' in name or '10006' in msg or 'rate limit' in msg.lower() or 'too many visits' in msg.lower():
-            _OHLCV_RATE_LIMIT_UNTIL[key] = now_ts + max(3.0, float(OHLCV_TTL_SEC))
-            try:
-                logger.warning('fetch_ohlcv rate-limited for %s %s x%s; using stale cache if available', symbol, timeframe, limit)
-            except Exception:
-                pass
+            key_cd = max(3.0, float(OHLCV_TTL_SEC))
+            tf_cd = max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 20.0), min(key_cd, 30.0))
+            _OHLCV_RATE_LIMIT_UNTIL[key] = now_ts + key_cd
+            _OHLCV_TF_RATE_LIMIT_UNTIL[tf_key] = max(float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0), now_ts + tf_cd)
+            warn_key = f'{tf_key}:rate_limit'
+            if float(_OHLCV_RATE_LIMIT_WARN_UNTIL.get(warn_key) or 0.0) <= now_ts:
+                _OHLCV_RATE_LIMIT_WARN_UNTIL[warn_key] = now_ts + max(5.0, float(OHLCV_WARN_SUPPRESS_SEC or 30.0))
+                try:
+                    logger.warning('fetch_ohlcv rate-limited for %s %s x%s; cooling %ss and using stale cache if available', symbol, timeframe, limit, int(tf_cd))
+                except Exception:
+                    pass
         stale = cache_get(key)
         if isinstance(stale, list):
             return stale
@@ -32246,13 +32259,16 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # EMAIL JOB
 # =========================================================
 
-EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "18"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "35"))
+EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "30"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "50"))
-ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "12"))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "85"))
+ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "135"))
+ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "3"))
 ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "18"))
-EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "180"))
+ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING", True)
+ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.25") or 0.25)
+EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "240"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
 PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "60"))
@@ -32384,7 +32400,16 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 10M)
         # Defaults: 1H=7.5%, 4H=15%
         # -----------------------------------------------------
-        users_bigmove = list(users_bigmove or [])[:_alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 12)]
+        try:
+            if bool(ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING) and _goal_profile_is_running():
+                users_bigmove = []
+            else:
+                used_pct = (time.time() - job_started_ts) / max(1.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 1))
+                if float(ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT or 0.0) > 0 and used_pct >= float(ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT):
+                    users_bigmove = []
+        except Exception:
+            pass
+        users_bigmove = list(users_bigmove or [])[:_alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 3)]
         for u in users_bigmove:
             if _job_budget_exhausted():
                 logger.warning("alert_job bigmove loop budget exhausted after %.1fs", time.time() - job_started_ts)
@@ -34703,7 +34728,7 @@ def main():
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
     if app.job_queue:
-        interval_sec = max(int(CHECK_INTERVAL_MIN * 60), 75)
+        interval_sec = max(int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or 135), int(ALERT_JOB_MAX_RUNTIME_SEC or 60) + 30)
     
         app.job_queue.run_repeating(
             alert_job,
@@ -34720,7 +34745,7 @@ def main():
         # AutoTrade live protection guardian (repairs missing SL / TP stacks continuously)
         app.job_queue.run_repeating(
             autotrade_exit_guardian_job,
-            interval=45,
+            interval=60,
             first=20,
             name="autotrade_exit_guardian_job",
             job_kwargs={
