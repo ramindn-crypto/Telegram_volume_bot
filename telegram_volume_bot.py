@@ -23524,6 +23524,7 @@ def is_executable_setup_eligible(
         rr_floor = float(max(min_rr_final, sess_rr))
 
         engine = str(getattr(s, "engine", "") or "").upper().strip()
+        fam = str(getattr(s, 'family_id', '') or _family_id_from_engine(engine, s)).upper().strip()
         regime = str(getattr(s, 'regime', '') or '').upper()
         trend = str(getattr(s, 'trend', '') or '').upper()
         structure = str(getattr(s, 'structure', '') or '').upper()
@@ -23574,7 +23575,34 @@ def is_executable_setup_eligible(
         else:
             return (False, 'engine_not_supported')
 
-        if 'TREND' not in regime:
+        # Modest profile-aware relaxation for currently active research families in GLOBAL profiles.
+        # This helps the widened family allocator actually surface candidates without turning the
+        # executable lane into a loose screen lane.
+        try:
+            plan = _research_latest_allocator_plan(sess, regime_primary=str(getattr(s, 'regime_primary', '') or '').upper().strip()) or {}
+            active_json = plan.get('active_families_json') or []
+            if isinstance(active_json, str):
+                active_fams = [str(x).upper().strip() for x in json.loads(active_json or '[]') if str(x).strip()]
+            else:
+                active_fams = [str(x).upper().strip() for x in (active_json or []) if str(x).strip()]
+        except Exception:
+            active_fams = []
+
+        if active_profile.startswith('GLOBAL_') and fam and fam in set(active_fams):
+            if engine in {'A', 'C'} and sess in {'LON', 'NY'} and ('TREND' in regime or 'EXPANSION' in regime):
+                score_floor -= 1.5
+                conf_floor -= 1
+                rr_floor -= 0.03
+            elif engine == 'B' and sess in {'LON', 'NY'} and 'EXPANSION' in regime:
+                score_floor -= 2.5
+                conf_floor -= 1
+                rr_floor -= 0.05
+
+        score_floor = float(clamp(score_floor, 66.0 if active_profile.startswith('GLOBAL_') else 68.0, 92.0))
+        conf_floor = int(max(74, min(95, conf_floor)))
+        rr_floor = float(clamp(rr_floor, 1.20 if active_profile.startswith('GLOBAL_') else 1.24, 2.30))
+
+        if 'TREND' not in regime and 'EXPANSION' not in regime:
             return (False, 'regime_not_trend')
         if want and (want not in trend or want not in structure):
             return (False, 'trend_structure_not_aligned')
@@ -32260,7 +32288,7 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "30"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
 ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "85"))
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "135"))
@@ -32909,6 +32937,22 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 hydrated = []
             eligible = [s for s in (hydrated or []) if s is not None]
 
+            if (not eligible) and str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
+                try:
+                    exec_rows_fallback = db_list_executable_setups(int(uid), session_name=str(sess_name or ''), ts_from=float(time.time() - 7200), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
+                except Exception:
+                    exec_rows_fallback = []
+                try:
+                    hydrated_fallback = _executable_rows_to_setup_objects(list(exec_rows_fallback or []), session_name=str(sess_name or ''))
+                except Exception:
+                    hydrated_fallback = []
+                if hydrated_fallback:
+                    eligible = [s for s in (hydrated_fallback or []) if s is not None]
+                    try:
+                        db_log_setup_pipeline_event(int(uid), stage='email_executable_pool_fallback', status='ok', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'source': 'exec_db_2h'})
+                    except Exception:
+                        pass
+
             if not eligible:
                 top_reasons = dict(skip_reasons_counter.most_common(3))
                 db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='empty', session=str(sess_name or ''), mode='email', details={'eligible': 0, 'persisted': persisted_count, 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
@@ -33371,6 +33415,7 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _fmt_pipe('Email build', pipeline_latest.get('email_build') or {}),
         _fmt_pipe('Email exec', pipeline_latest.get('email_exec') or {}),
         _fmt_pipe('Screen exec', pipeline_latest.get('screen_exec') or {}),
+        _fmt_last_email_decision(last_email_decision),
         SEP,
         f"Email lane: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'} | sent_session={int(email_gate.get('sent_in_session', 0) or 0)} | sent_today={int(email_gate.get('sent_today', 0) or 0)} | recipient={str(email_gate.get('recipient_masked') or '(none)')}",
     ]
