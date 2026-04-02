@@ -6799,11 +6799,18 @@ def _family_name_from_id(family_id: str) -> str:
 
 
 def _research_trading_day_label(ts: float | None = None) -> str:
+    """Research trading day aligned to the admin anchored trading day.
+
+    Falls back to UTC date only if the admin/user day-reset context is unavailable.
+    """
     try:
-        dt = datetime.fromtimestamp(float(ts or time.time()), tz=timezone.utc)
-        return dt.strftime('%Y-%m-%d')
+        dt_utc = datetime.fromtimestamp(float(ts or time.time()), tz=timezone.utc)
+        return _admin_today_key_utc(dt_utc)
     except Exception:
-        return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        try:
+            return _admin_today_key_utc(datetime.now(timezone.utc))
+        except Exception:
+            return datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
 
 def _research_plan_lookup_key(ts: float | None = None) -> str:
@@ -7291,6 +7298,76 @@ def _research_run_allocator_cycle(force: bool = False) -> dict:
     return {'status': 'ok', 'trading_day': trading_day, 'plans': plans, 'count': len(plans or [])}
 
 
+def _research_daily_state_snapshot(trading_day: str | None = None) -> dict:
+    trading_day = str(trading_day or _research_trading_day_label())
+    out = {
+        'trading_day': trading_day,
+        'daily_regime_count': 0,
+        'active_plan_count': 0,
+        'family_eval_rows': 0,
+        'latest_daily_ts': 0.0,
+        'latest_plan_ts': 0.0,
+    }
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT COUNT(1) AS n, COALESCE(MAX(ts),0) AS max_ts FROM regime_snapshots WHERE trading_day=? AND LOWER(COALESCE(refresh_window,''))='daily'",
+                (trading_day,),
+            ).fetchone()
+            if row:
+                out['daily_regime_count'] = int((row['n'] if isinstance(row, sqlite3.Row) else row[0]) or 0)
+                out['latest_daily_ts'] = float((row['max_ts'] if isinstance(row, sqlite3.Row) else row[1]) or 0.0)
+            row = cur.execute(
+                "SELECT COUNT(1) AS n, COALESCE(MAX(created_ts),0) AS max_ts FROM allocator_plans WHERE trading_day=? AND state='active'",
+                (trading_day,),
+            ).fetchone()
+            if row:
+                out['active_plan_count'] = int((row['n'] if isinstance(row, sqlite3.Row) else row[0]) or 0)
+                out['latest_plan_ts'] = float((row['max_ts'] if isinstance(row, sqlite3.Row) else row[1]) or 0.0)
+            row = cur.execute("SELECT COUNT(1) AS n FROM family_eval_daily WHERE trading_day=?", (trading_day,)).fetchone()
+            if row:
+                out['family_eval_rows'] = int((row['n'] if isinstance(row, sqlite3.Row) else row[0]) or 0)
+    except Exception:
+        pass
+    return out
+
+
+def _research_daily_refresh_due(now_ts: float | None = None, trading_day: str | None = None) -> bool:
+    trading_day = str(trading_day or _research_trading_day_label(now_ts))
+    state = _research_daily_state_snapshot(trading_day)
+    if int(state.get('daily_regime_count', 0) or 0) < 3:
+        return True
+    if int(state.get('active_plan_count', 0) or 0) < 3:
+        return True
+    if int(state.get('family_eval_rows', 0) or 0) <= 0:
+        return True
+    return False
+
+
+def _research_run_daily_refresh(force: bool = False) -> dict:
+    trading_day = _research_trading_day_label()
+    state_before = _research_daily_state_snapshot(trading_day)
+    if (not force) and (not _research_daily_refresh_due(time.time(), trading_day)):
+        return {'status': 'up_to_date', 'trading_day': trading_day, 'state': state_before}
+    try:
+        best_fut = fetch_futures_tickers() or {}
+    except Exception:
+        best_fut = {}
+    _research_seed_family_registry()
+    plans = _research_build_allocator_plans(best_fut, trading_day=trading_day)
+    state_after = _research_daily_state_snapshot(trading_day)
+    return {
+        'status': 'refreshed',
+        'trading_day': trading_day,
+        'plans': plans,
+        'count': len(plans or []),
+        'state_before': state_before,
+        'state_after': state_after,
+    }
+
+
 async def research_regime_refresh_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         best_fut = await to_thread_heavy(fetch_futures_tickers)
@@ -7303,7 +7380,7 @@ async def research_regime_refresh_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def research_allocator_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        await to_thread_heavy(_research_run_allocator_cycle)
+        await to_thread_heavy(_research_run_daily_refresh, True)
     except Exception:
         return
 
@@ -22465,6 +22542,27 @@ def _goal_profile_score_candidate(rep30: dict, rep7: dict, cfg: dict) -> dict:
     }
 
 
+def _goal_profile_is_due(now_ts: float | None = None, cfg: dict | None = None, rep: dict | None = None) -> bool:
+    now_ts = float(now_ts or time.time())
+    cfg = dict(cfg or load_strategy_config(force=False) or {})
+    tgt = _goal_profile_targets(cfg)
+    if not bool(tgt.get('enabled')):
+        return False
+    rep = dict(rep or load_goal_profile_report() or {})
+    status = str(rep.get('status') or '').upper().strip()
+    if status in {'RUNNING', 'STOPPING'} and _goal_profile_is_running():
+        return False
+    last_ts = max(
+        float(rep.get('ts', 0.0) or 0.0),
+        float((cfg or {}).get('goal_profile_last_run_ts', 0.0) or 0.0),
+        float(rep.get('started_ts', 0.0) or 0.0),
+    )
+    if last_ts <= 0:
+        return True
+    due_after = max(3600.0, float(tgt.get('interval_hours', 24.0) or 24.0) * 3600.0)
+    return (now_ts - last_ts) >= max(60.0, due_after - 120.0)
+
+
 def _run_goal_profile_cycle(force: bool = False) -> dict:
     cfg0 = load_strategy_config(force=True)
     tgt = _goal_profile_targets(cfg0)
@@ -22972,7 +23070,32 @@ async def goal_profile_job(context: ContextTypes.DEFAULT_TYPE):
             return
         if _goal_profile_is_running():
             return
+        if not _goal_profile_is_due(time.time(), cfg=cfg):
+            return
         await to_thread_heavy(_run_goal_profile_cycle, False)
+    except Exception:
+        return
+
+
+async def research_framework_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
+    """Safety net for daily research refresh and goal-profile automation.
+
+    Why it exists:
+    - repeating jobs can drift or miss the exact anchored-day rollover
+    - the daily research layer must populate even if the 24h job has not fired yet
+    - goal-profile monitoring should auto-run when due, even after a timeout report
+    """
+    try:
+        now_ts = float(time.time())
+        cfg = load_strategy_config(force=False)
+
+        if _cfg_bool((cfg or {}).get('family_allocator_enabled', True), True):
+            if _research_daily_refresh_due(now_ts):
+                await to_thread_heavy(_research_run_daily_refresh, True)
+
+        if _goal_profile_is_due(now_ts, cfg=cfg):
+            if _cfg_bool((cfg or {}).get('goal_profile_enabled', True), True) and (not _goal_profile_is_running()) and _SELF_OPT_STATE.get('stop_event') is None:
+                await to_thread_heavy(_run_goal_profile_cycle, False)
     except Exception:
         return
 
@@ -32901,7 +33024,7 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now_utc = datetime.now(timezone.utc)
     now_session = current_session_utc(now_utc)
 
-    data_counts = {'signals_24h': 0, 'exec_24h': 0, 'emailed_24h': 0, 'pipeline_events_24h': 0, 'family_eval_rows_today': 0}
+    data_counts = {'signals_24h': 0, 'exec_24h': 0, 'emailed_24h': 0, 'pipeline_events_24h': 0, 'family_eval_rows_today': 0, 'autotrade_opened_24h': 0, 'autotrade_closed_24h': 0}
     try:
         since_ts = float(time.time() - 24 * 3600)
         trading_day = _research_trading_day_label(time.time())
@@ -32923,6 +33046,12 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur.execute("SELECT COUNT(1) AS n FROM family_eval_daily WHERE trading_day=?", (trading_day,))
             row = cur.fetchone()
             data_counts['family_eval_rows_today'] = int((row['n'] if row else 0) or 0)
+            cur.execute("SELECT COUNT(1) AS n FROM autotrade_trades WHERE opened_ts>=?", (since_ts,))
+            row = cur.fetchone()
+            data_counts['autotrade_opened_24h'] = int((row['n'] if row else 0) or 0)
+            cur.execute("SELECT COUNT(1) AS n FROM autotrade_trades WHERE closed_ts IS NOT NULL AND closed_ts>=?", (since_ts,))
+            row = cur.fetchone()
+            data_counts['autotrade_closed_24h'] = int((row['n'] if row else 0) or 0)
     except Exception:
         pass
 
@@ -32967,7 +33096,7 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'Allocator plans: ' + ' || '.join([_fmt_plan(s) for s in ['ASIA', 'LON', 'NY']]),
         SEP,
         f"Adaptive optimizer: {'ON' if bool(adaptive.get('enabled')) else 'OFF'} | every {float(adaptive.get('interval_hours', 24.0) or 24.0):.1f}h | last={str(ad_last.get('status') or '-')}/{ad_last_txt}",
-        f"Data 24h: signals={int(data_counts.get('signals_24h', 0) or 0)} | executable={int(data_counts.get('exec_24h', 0) or 0)} | emailed={int(data_counts.get('emailed_24h', 0) or 0)} | pipeline_events={int(data_counts.get('pipeline_events_24h', 0) or 0)} | family_eval_rows_today={int(data_counts.get('family_eval_rows_today', 0) or 0)}",
+        f"Data 24h: signals={int(data_counts.get('signals_24h', 0) or 0)} | executable={int(data_counts.get('exec_24h', 0) or 0)} | emailed={int(data_counts.get('emailed_24h', 0) or 0)} | pipeline_events={int(data_counts.get('pipeline_events_24h', 0) or 0)} | family_eval_rows_today={int(data_counts.get('family_eval_rows_today', 0) or 0)} | autotrade_opened={int(data_counts.get('autotrade_opened_24h', 0) or 0)} | autotrade_closed={int(data_counts.get('autotrade_closed_24h', 0) or 0)}",
         SEP,
         f"Email lane: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'} | sent_session={int(email_gate.get('sent_in_session', 0) or 0)} | sent_today={int(email_gate.get('sent_today', 0) or 0)} | recipient={str(email_gate.get('recipient_masked') or '(none)')}",
     ]
@@ -34476,6 +34605,17 @@ def main():
                         "misfire_grace_time": 1800,
                     },
                 )
+            app.job_queue.run_repeating(
+                research_framework_watchdog_job,
+                interval=600,
+                first=180,
+                name="research_framework_watchdog_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 300,
+                },
+            )
         except Exception:
             pass
     else:
