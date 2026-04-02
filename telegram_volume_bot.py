@@ -33214,6 +33214,38 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    def _fmt_pipe(label: str, row: dict) -> str:
+        try:
+            if not row:
+                return f"{label}: -"
+            status = str(row.get('status') or '-')
+            stage = str(row.get('stage') or label)
+            sess = str(row.get('session') or '-').upper()
+            mode = str(row.get('mode') or '-').lower()
+            try:
+                details = json.loads(str(row.get('details_json') or '{}'))
+            except Exception:
+                details = {}
+            parts = []
+            if isinstance(details, dict):
+                for key in ('setups', 'eligible', 'persisted', 'raw_pool'):
+                    if key in details:
+                        parts.append(f"{key}={details.get(key)}")
+                tr = details.get('top_reasons') or details.get('top_exec_rejects') or {}
+                if tr:
+                    try:
+                        k0, v0 = next(iter(tr.items()))
+                        parts.append(f"top={k0}:{v0}")
+                    except Exception:
+                        pass
+                err = details.get('error')
+                if err:
+                    parts.append(str(err))
+            suffix = (' | ' + ' | '.join(parts[:3])) if parts else ''
+            return f"{label}: {stage}/{status} [{mode}:{sess}]{suffix}"
+        except Exception:
+            return f"{label}: -"
+
     def _fmt_regime(refresh_window: str, sess: str) -> str:
         snap = _research_latest_regime_snapshot(sess, refresh_window=refresh_window) or {}
         primary = str(snap.get('primary_regime') or '-').strip() or '-'
