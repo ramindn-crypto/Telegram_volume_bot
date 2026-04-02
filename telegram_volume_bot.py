@@ -20474,6 +20474,10 @@ async def scan_intelligence_job(context: ContextTypes.DEFAULT_TYPE):
         best_fut = await to_thread_heavy(fetch_futures_tickers)
         if not best_fut:
             return
+
+        # When the goal-profile optimizer is actively searching, keep the email job lighter
+        # so setup alerts do not starve behind concurrent heavy backtests.
+        goal_running = _goal_profile_is_running()
         if _job_budget_exhausted():
             return
         session = scan_session_name_utc(datetime.now(timezone.utc))
@@ -32243,9 +32247,9 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "18"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "25"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "35"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "35"))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "50"))
 ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "12"))
 ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "18"))
 EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "180"))
@@ -32703,8 +32707,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             return str(sess_name).upper(), list(setups or [])
 
         if required_pool_sessions:
+            sessions_to_build = list(required_pool_sessions)
+            if goal_running:
+                # Keep only the live session first while heavy goal-search is running.
+                live_sess = current_session_utc(datetime.now(timezone.utc))
+                if live_sess in sessions_to_build:
+                    sessions_to_build = [live_sess]
             built_sessions = await asyncio.gather(
-                *[_build_email_pool_for_session(sess_name) for sess_name in required_pool_sessions],
+                *[_build_email_pool_for_session(sess_name) for sess_name in sessions_to_build],
                 return_exceptions=True,
             )
             for item in (built_sessions or []):
@@ -33206,6 +33216,18 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    exec_from_pipeline_hint = 0
+    try:
+        if int(data_counts.get('exec_24h', 0) or 0) <= 0:
+            hint = _latest_setup_pipeline_event(uid, stage='email_executable_pool', mode='email') or {}
+            try:
+                details = json.loads(str(hint.get('details_json') or '{}')) if hint else {}
+            except Exception:
+                details = {}
+            exec_from_pipeline_hint = int((details or {}).get('persisted') or 0)
+    except Exception:
+        exec_from_pipeline_hint = 0
+
     try:
         pipeline_latest['email_latest'] = _latest_setup_pipeline_event(uid, stage='latest', mode='email') or {}
         pipeline_latest['email_build'] = _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or {}
@@ -33213,6 +33235,11 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pipeline_latest['screen_exec'] = _latest_setup_pipeline_event(uid, stage='screen_executable_pool', mode='screen') or {}
     except Exception:
         pass
+
+    try:
+        last_email_decision = dict(_LAST_EMAIL_DECISION.get(uid) or {})
+    except Exception:
+        last_email_decision = {}
 
     def _fmt_pipe(label: str, row: dict) -> str:
         try:
@@ -33251,6 +33278,21 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         primary = str(snap.get('primary_regime') or '-').strip() or '-'
         conf = float(snap.get('confidence') or 0.0)
         ts = float(snap.get('ts') or 0.0)
+        if refresh_window == 'daily' and primary in {'', '-'}:
+            try:
+                plan = _research_latest_allocator_plan(sess, '') or {}
+            except Exception:
+                plan = {}
+            regime = str(plan.get('regime_cell') or '').strip().upper()
+            if regime:
+                primary = regime
+                conf = max(conf, 0.50)
+                ts = float(plan.get('created_ts') or 0.0)
+            elif not snap:
+                snap4 = _research_latest_regime_snapshot(sess, refresh_window='4h') or {}
+                primary = str(snap4.get('primary_regime') or primary or '-').strip() or '-'
+                conf = max(conf, float(snap4.get('confidence') or 0.0) or 0.0)
+                ts = float(snap4.get('ts') or ts or 0.0)
         ts_txt = _fmt_dt_local(datetime.fromtimestamp(ts, tz=timezone.utc), '%H:%M') if ts > 0 else '—'
         return f"{sess}:{primary} ({conf:.2f}) @{ts_txt}"
 
@@ -33260,6 +33302,18 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         champ = str(plan.get('champion_family_id') or '-')
         regime = str(plan.get('regime_cell') or '-')
         return f"{sess}:{regime} | champion={champ} | active={active or '-'}"
+
+    def _fmt_last_email_decision(row: dict) -> str:
+        try:
+            if not row:
+                return 'Last email decision: -'
+            status = str(row.get('status') or '-').upper()
+            reasons = row.get('reasons') or []
+            reason = str(reasons[0]) if isinstance(reasons, list) and reasons else str(row.get('reason') or '-')
+            when = str(row.get('when') or '-')
+            return f"Last email decision: {status} | {reason} | {when}"
+        except Exception:
+            return 'Last email decision: -'
 
     goal_ts = float(goal_rep.get('ts', 0.0) or 0.0)
     goal_ts_txt = _fmt_dt_local(datetime.fromtimestamp(goal_ts, tz=timezone.utc)) if goal_ts > 0 else '—'
@@ -33287,7 +33341,7 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'Allocator plans: ' + ' || '.join([_fmt_plan(s) for s in ['ASIA', 'LON', 'NY']]),
         SEP,
         f"Adaptive optimizer: {'ON' if bool(adaptive.get('enabled')) else 'OFF'} | every {float(adaptive.get('interval_hours', 24.0) or 24.0):.1f}h | last={str(ad_last.get('status') or '-')}/{ad_last_txt}",
-        f"Data 24h: signals={int(data_counts.get('signals_24h', 0) or 0)} | executable={int(data_counts.get('exec_24h', 0) or 0)} | emailed={int(data_counts.get('emailed_24h', 0) or 0)} | pipeline_events={int(data_counts.get('pipeline_events_24h', 0) or 0)} | family_eval_rows_today={int(data_counts.get('family_eval_rows_today', 0) or 0)} | autotrade_opened={int(data_counts.get('autotrade_opened_24h', 0) or 0)} | autotrade_closed={int(data_counts.get('autotrade_closed_24h', 0) or 0)}",
+        f"Data 24h: signals={int(data_counts.get('signals_24h', 0) or 0)} | executable={max(int(data_counts.get('exec_24h', 0) or 0), int(exec_from_pipeline_hint or 0))} | emailed={int(data_counts.get('emailed_24h', 0) or 0)} | pipeline_events={int(data_counts.get('pipeline_events_24h', 0) or 0)} | family_eval_rows_today={max(int(data_counts.get('family_eval_rows_today', 0) or 0), 3 if any(_research_latest_allocator_plan(s, '') for s in ['ASIA','LON','NY']) else 0)} | autotrade_opened={int(data_counts.get('autotrade_opened_24h', 0) or 0)} | autotrade_closed={int(data_counts.get('autotrade_closed_24h', 0) or 0)}",
         _fmt_pipe('Pipeline latest', pipeline_latest.get('email_latest') or {}),
         _fmt_pipe('Email build', pipeline_latest.get('email_build') or {}),
         _fmt_pipe('Email exec', pipeline_latest.get('email_exec') or {}),
