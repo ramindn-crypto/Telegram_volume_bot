@@ -25281,11 +25281,13 @@ def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
     try:
         last_sent = _last_sent_email_meta(int(uid), user)
         last_sent_ts = float(last_sent.get('ts') or 0.0)
+        current_sess_name = str((current_sess or {}).get('session_name') or current_session_utc(datetime.now(timezone.utc)) or 'NONE').upper().strip()
         if last_sent_ts > 0 and str(last_sent.get('day_local') or '') == str(day_local or ''):
             inferred_sent_today = 1
             evt_sess = str(last_sent.get('session_name') or 'NONE').upper().strip()
-            if evt_sess and evt_sess != 'NONE' and str(current_session_key or '').upper().endswith('_' + evt_sess):
-                inferred_sent_in_session = 1
+            if evt_sess and evt_sess != 'NONE':
+                if str(current_session_key or '').upper().endswith('_' + evt_sess) or evt_sess == current_sess_name:
+                    inferred_sent_in_session = 1
     except Exception:
         inferred_sent_today = 0
         inferred_sent_in_session = 0
@@ -29978,10 +29980,10 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         con = db_connect()
         cur = con.cursor()
         since_ts = time.time() - 12 * 3600
-        cur.execute("SELECT COUNT(1) AS n FROM executable_setups WHERE user_id=? AND executable_ts>=?", (int(owner), float(since_ts)))
+        cur.execute("SELECT COUNT(1) AS n FROM executable_setups WHERE user_id IN (?,0) AND executable_ts>=?", (int(owner), float(since_ts)))
         row = cur.fetchone()
         exec_recent = int((row or {}).get('n', 0) or 0)
-        cur.execute("SELECT COUNT(1) AS n FROM emailed_setups WHERE user_id=? AND emailed_ts>=?", (int(owner), float(since_ts)))
+        cur.execute("SELECT COUNT(1) AS n FROM emailed_setups WHERE user_id IN (?,0) AND emailed_ts>=?", (int(owner), float(since_ts)))
         row = cur.fetchone()
         emailed_recent = int((row or {}).get('n', 0) or 0)
         con.close()
@@ -32488,6 +32490,11 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         if not best_fut:
             return
 
+        try:
+            goal_running = bool(_goal_profile_is_running())
+        except Exception:
+            goal_running = False
+
         # -----------------------------------------------------
         # Rule 2: Volume relative filter base line (killer rule)
         # -----------------------------------------------------
@@ -32506,7 +32513,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # Defaults: 1H=7.5%, 4H=15%
         # -----------------------------------------------------
         try:
-            if bool(ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING) and _goal_profile_is_running():
+            if bool(ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING) and goal_running:
                 users_bigmove = []
             else:
                 used_pct = (time.time() - job_started_ts) / max(1.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 1))
