@@ -9865,6 +9865,58 @@ def email_state_set(user_id: int, **kwargs):
     con.commit()
     con.close()
 
+
+def _last_sent_email_meta(user_id: int, user: dict | None = None) -> dict:
+    """Best-effort last successful email metadata for telemetry counters.
+
+    This reconciles counters when SMTP succeeded but setup/email state tables lag or when
+    the email was a market-scan / big-move email rather than an emailed_setup row.
+    """
+    try:
+        row = dict(_LAST_EMAIL_SENT.get(int(user_id)) or {})
+    except Exception:
+        row = {}
+    if not row:
+        try:
+            dec = dict(_LAST_EMAIL_DECISION.get(int(user_id)) or {})
+            if str(dec.get('status') or '').upper().strip() == 'SENT':
+                row = dec
+        except Exception:
+            row = {}
+    ts_val = 0.0
+    try:
+        raw = row.get('ts')
+        if raw not in (None, '', 0, '0'):
+            ts_val = float(raw)
+    except Exception:
+        ts_val = 0.0
+    if ts_val <= 0:
+        try:
+            dt = _parse_iso_utcish(str(row.get('when') or '').strip())
+            ts_val = float(dt.timestamp()) if dt else 0.0
+        except Exception:
+            ts_val = 0.0
+    sess_name = 'NONE'
+    try:
+        if ts_val > 0:
+            sess_name = current_session_utc(datetime.fromtimestamp(float(ts_val), tz=timezone.utc)) or 'NONE'
+    except Exception:
+        sess_name = 'NONE'
+    day_local = ''
+    try:
+        tz = _user_tzinfo(user or {})
+        if ts_val > 0:
+            day_local = datetime.fromtimestamp(float(ts_val), tz).date().isoformat()
+    except Exception:
+        day_local = ''
+    return {
+        'row': row,
+        'ts': float(ts_val or 0.0),
+        'session_name': str(sess_name or 'NONE'),
+        'day_local': str(day_local or ''),
+        'status': str(row.get('status') or '').upper().strip(),
+    }
+
 def mark_symbol_emailed(user_id: int, symbol: str, side: str, session_name: str = ""):
     """
     ✅ Direction-aware cooldown: stored per (symbol, side)
@@ -13336,7 +13388,7 @@ def _pipeline_top_reasons(counts: dict | Counter | None, limit: int = 5) -> dict
 
 def _latest_setup_pipeline_event(user_id: int | None = None, stage: str = '', session: str = '', mode: str = '') -> dict:
     try:
-        key = _setup_pipeline_event_key(user_id, stage or 'latest', session, mode)
+        key = _setup_pipeline_event_key(user_id, (stage if str(stage).strip().lower() != 'latest' else '') or 'latest', session, mode)
         row = dict(_LAST_SETUP_PIPELINE_EVENT.get(key) or {})
         if row:
             return row
@@ -13351,7 +13403,7 @@ def _latest_setup_pipeline_event(user_id: int | None = None, stage: str = '', se
             if user_id is not None:
                 sql += " AND user_id=? "
                 params.append(int(user_id))
-            if stage:
+            if stage and str(stage).strip().lower() != 'latest':
                 sql += " AND LOWER(COALESCE(stage,''))=? "
                 params.append(str(stage).strip().lower())
             if session:
@@ -23174,7 +23226,7 @@ async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_
         elif final:
             lines.append(f"30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}")
             lines.append(f"7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}")
-        if rep.get('error'):
+        if rep.get('error') and str(rep.get('status') or '').upper().strip() not in {'TIMEOUT_PROMOTED'}:
             lines.append(f"Error: {rep.get('error')}")
     await send_long_message(update, '\n'.join(lines), parse_mode=None)
 
@@ -25224,6 +25276,23 @@ def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
     except Exception:
         sent_today = 0
 
+    inferred_sent_today = 0
+    inferred_sent_in_session = 0
+    try:
+        last_sent = _last_sent_email_meta(int(uid), user)
+        last_sent_ts = float(last_sent.get('ts') or 0.0)
+        if last_sent_ts > 0 and str(last_sent.get('day_local') or '') == str(day_local or ''):
+            inferred_sent_today = 1
+            evt_sess = str(last_sent.get('session_name') or 'NONE').upper().strip()
+            if evt_sess and evt_sess != 'NONE' and str(current_session_key or '').upper().endswith('_' + evt_sess):
+                inferred_sent_in_session = 1
+    except Exception:
+        inferred_sent_today = 0
+        inferred_sent_in_session = 0
+
+    sent_today = max(int(sent_today or 0), int(inferred_sent_today or 0))
+    sent_in_session = max(int(sent_in_session or 0), int(inferred_sent_in_session or 0))
+
     gap_sec = max(0, int(gap_min)) * 60
     gap_remaining_sec = max(0, int(round(gap_sec - (time.time() - last_email_ts)))) if gap_sec > 0 and last_email_ts > 0 else 0
 
@@ -25253,6 +25322,8 @@ def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
         'session_cap': session_cap,
         'sent_today': sent_today,
         'day_cap': day_cap,
+        'sent_today_inferred': inferred_sent_today,
+        'sent_in_session_inferred': inferred_sent_in_session,
         'gap_min': gap_min,
         'gap_remaining_sec': gap_remaining_sec,
         'last_email_ts': last_email_ts,
@@ -29946,6 +30017,12 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Recent emailed setups (12h): {emailed_recent}",
         f"Recent executable setups (12h): {exec_recent}",
     ]
+    try:
+        _sent_meta = _last_sent_email_meta(int(owner), get_user(int(owner)) or {})
+        _sent_recent = 1 if float(_sent_meta.get('ts') or 0.0) >= float(since_ts or 0.0) else 0
+        lines.append(f"Recent sent emails (12h): {_sent_recent}")
+    except Exception:
+        pass
     if reasons and not ready:
         lines.extend([SEP, 'Blocking reasons'])
         for r in reasons[:6]:
@@ -33296,6 +33373,11 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             exec_from_pipeline_hint = int((details or {}).get('persisted') or 0)
     except Exception:
         exec_from_pipeline_hint = 0
+    try:
+        if int(data_counts.get('signals_24h', 0) or 0) <= 0 and int(data_counts.get('emailed_24h', 0) or 0) > 0:
+            data_counts['signals_24h'] = int(data_counts.get('emailed_24h', 0) or 0)
+    except Exception:
+        pass
 
     try:
         pipeline_latest['email_latest'] = _latest_setup_pipeline_event(uid, stage='latest', mode='email') or {}
