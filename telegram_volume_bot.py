@@ -23327,6 +23327,9 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
         active_profile = str((cfg_live or {}).get('goal_profile_active_profile', '') or '').upper().strip()
         reach_mode = bool(_cfg_bool((cfg_live or {}).get('goal_profile_reach_mode', False), False) or ('REACH' in active_profile) or active_profile.endswith('_SCOUT'))
         sess = str(session_name or '').upper().strip()
+        engine = str(getattr(s, 'engine', '') or '').upper().strip()
+        fam = str(getattr(s, 'family_id', '') or _family_id_from_engine(engine, s)).upper().strip()
+        regime = str(getattr(s, 'regime_primary', '') or getattr(s, 'regime', '') or '').upper().strip()
         conf = int(getattr(s, 'conf', 0) or 0)
         score = float(getattr(s, 'quality_score', 0.0) or 0.0)
         pb_dist = float(getattr(s, 'pullback_ema_dist_pct', 999.0) or 999.0)
@@ -23348,6 +23351,34 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
             max_ch15 += 0.16
             max_ch1 += 0.18
             max_atr += 0.45
+
+        # Family-aware calibration: modest session/regime tuning only.
+        # Keep ASIA tighter, allow a little more conversion in LON/NY where the allocator
+        # already selected the family as active.
+        if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
+            if sess in {'LON', 'NY'}:
+                max_pb += 0.10
+                max_ch15 += 0.08
+                max_ch1 += 0.10
+            else:
+                max_pb += 0.03
+                max_ch15 += 0.02
+        elif fam == 'F2_MOMENTUM_IGNITION' and regime == 'EXPANSION':
+            if sess in {'LON', 'NY'}:
+                max_pb += 0.08
+                max_ch15 += 0.10
+                max_ch1 += 0.18
+                max_atr += 0.18
+        elif fam == 'F3_IMPULSE_BASE_CONT' and regime in {'EXPANSION', 'SQUEEZE'}:
+            if sess in {'LON', 'NY'}:
+                max_pb += 0.06
+                max_ch15 += 0.08
+                max_ch1 += 0.14
+                max_atr += 0.12
+        elif fam == 'F1_PULLBACK_CONT' and 'TREND' in regime and sess == 'LON':
+            max_pb += 0.04
+            max_ch15 += 0.05
+            max_ch1 += 0.08
 
         if pb_dist > max_pb:
             return (False, 'entry_far_from_pullback_ema')
@@ -23424,6 +23455,8 @@ def is_top_setup_eligible(
             src = "screen"
         sess = str(session_name or 'LON').upper().strip()
         engine = str(getattr(s, 'engine', '') or '').upper().strip()
+        fam = str(getattr(s, 'family_id', '') or _family_id_from_engine(engine, s)).upper().strip()
+        regime = str(getattr(s, 'regime_primary', '') or getattr(s, 'regime', '') or '').upper().strip()
         active_profile = str((cfg_live or {}).get('goal_profile_active_profile', '') or '').upper().strip()
         reach_mode = bool(_cfg_bool((cfg_live or {}).get('goal_profile_reach_mode', False), False) or ('REACH' in active_profile) or active_profile.endswith('_SCOUT'))
 
@@ -23467,6 +23500,23 @@ def is_top_setup_eligible(
                 min_score -= 1.5 if engine == 'A' else 1.0
             else:
                 min_score -= 0.75 if engine == 'A' else 0.50
+
+        # Family-aware score calibration: modest conversion help where the allocator already
+        # indicates family/regime fit. Keep ASIA comparatively tighter.
+        if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
+            if sess in {'LON', 'NY'}:
+                min_score -= 2.0 if src == 'exec' else (1.5 if src == 'email' else 1.0)
+            else:
+                min_score -= 0.5 if src == 'exec' else 0.25
+        elif fam == 'F2_MOMENTUM_IGNITION' and regime == 'EXPANSION':
+            if sess in {'LON', 'NY'}:
+                min_score -= 1.5 if src == 'exec' else (0.75 if src == 'email' else 0.50)
+        elif fam == 'F3_IMPULSE_BASE_CONT' and regime in {'EXPANSION', 'SQUEEZE'}:
+            if sess in {'LON', 'NY'}:
+                min_score -= 1.25 if src == 'exec' else (0.60 if src == 'email' else 0.50)
+        elif fam == 'F1_PULLBACK_CONT' and 'TREND' in regime and sess == 'LON':
+            min_score -= 0.75 if src == 'exec' else 0.50
+
         min_score = float(clamp(min_score, 56.0 if reach_mode and sess == 'LON' else 60.0, 90.0))
 
         if float(score) < float(min_score):
@@ -23650,13 +23700,45 @@ def is_executable_setup_eligible(
                 conf_floor -= 1
                 rr_floor -= 0.05
 
-        score_floor = float(clamp(score_floor, 66.0 if active_profile.startswith('GLOBAL_') else 68.0, 92.0))
+        # Family-aware executable calibration. These are deliberately modest and only help
+        # regime-consistent families convert a little better without turning the email lane
+        # into a loose screen lane.
+        if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
+            if sess in {'LON', 'NY'}:
+                score_floor -= 2.25
+                conf_floor -= 1
+                rr_floor -= 0.04
+            else:
+                score_floor -= 0.50
+                rr_floor -= 0.01
+        elif fam == 'F2_MOMENTUM_IGNITION' and regime == 'EXPANSION':
+            if sess in {'LON', 'NY'}:
+                score_floor -= 1.50
+                conf_floor -= 1
+                rr_floor -= 0.03
+        elif fam == 'F3_IMPULSE_BASE_CONT' and regime in {'EXPANSION', 'SQUEEZE'}:
+            if sess in {'LON', 'NY'}:
+                score_floor -= 1.25
+                conf_floor -= 1
+                rr_floor -= 0.03
+        elif fam == 'F1_PULLBACK_CONT' and 'TREND' in regime and sess == 'LON':
+            score_floor -= 0.75
+            rr_floor -= 0.02
+
+        score_floor = float(clamp(score_floor, 65.0 if active_profile.startswith('GLOBAL_') else 68.0, 92.0))
         conf_floor = int(max(74, min(95, conf_floor)))
         rr_floor = float(clamp(rr_floor, 1.20 if active_profile.startswith('GLOBAL_') else 1.24, 2.30))
 
-        if 'TREND' not in regime and 'EXPANSION' not in regime:
+        if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
+            pass
+        elif fam == 'F5_ORB_RETEST' and regime in {'SQUEEZE', 'EXPANSION'}:
+            pass
+        elif 'TREND' not in regime and 'EXPANSION' not in regime:
             return (False, 'regime_not_trend')
-        if want and (want not in trend or want not in structure):
+        if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
+            if want and (want not in trend and want not in structure):
+                return (False, 'trend_structure_not_aligned')
+        elif want and (want not in trend or want not in structure):
             return (False, 'trend_structure_not_aligned')
 
         score = float(getattr(s, "quality_score", 0.0) or 0.0)
