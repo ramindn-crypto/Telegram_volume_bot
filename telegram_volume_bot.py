@@ -1537,15 +1537,15 @@ def _strategy_config_bootstrap_recommendations() -> None:
         # silently keep the bot above the 1–3 setups/day target after redeploy.
         try:
             q_screen = float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
-            if q_screen > 68.0:
-                cfg['quality_score_min_screen'] = 68.0
+            if q_screen > 66.0:
+                cfg['quality_score_min_screen'] = 66.0
                 changed = True
         except Exception:
             pass
         try:
             q_email = float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
-            if q_email > 75.0:
-                cfg['quality_score_min_email'] = 75.0
+            if q_email > 70.0:
+                cfg['quality_score_min_email'] = 70.0
                 changed = True
         except Exception:
             pass
@@ -1554,6 +1554,30 @@ def _strategy_config_bootstrap_recommendations() -> None:
             if rr_live > 1.46:
                 cfg['min_rr_tp'] = 1.46
                 changed = True
+        except Exception:
+            pass
+        try:
+            sess_ov = dict(cfg.get('session_exec_overrides') or {})
+            cap_map = {
+                'NY': {'quality_add': 1.0, 'conf_add': 1, 'rr_add': 0.06},
+                'LON': {'quality_add': 0.5, 'conf_add': 1, 'rr_add': 0.04},
+                'ASIA': {'quality_add': 1.0, 'conf_add': 1, 'rr_add': 0.08},
+            }
+            norm = {}
+            for _sess in ('NY', 'LON', 'ASIA'):
+                raw_ov = dict(sess_ov.get(_sess) or {})
+                caps = cap_map[_sess]
+                qv = float(raw_ov.get('quality_add', 0.0) or 0.0)
+                cv = int(round(float(raw_ov.get('conf_add', 0) or 0)))
+                rv = float(raw_ov.get('rr_add', 0.0) or 0.0)
+                nq = min(qv, float(caps['quality_add']))
+                nc = min(cv, int(caps['conf_add']))
+                nr = min(rv, float(caps['rr_add']))
+                norm[_sess] = {'quality_add': nq, 'conf_add': nc, 'rr_add': nr}
+                if abs(nq - qv) > 1e-9 or nc != cv or abs(nr - rv) > 1e-9:
+                    changed = True
+            if norm:
+                cfg['session_exec_overrides'] = norm
         except Exception:
             pass
 
@@ -1932,12 +1956,12 @@ TF_ALIGN_4H_MIN_ABS = 0.5   # percent
 TF_ALIGN_1H_MIN_ABS_BY_SESSION = {
     "NY": 0.70,
     "LON": 0.55,
-    "ASIA": 0.85,
+    "ASIA": 0.65,
 }
 TF_ALIGN_4H_MIN_ABS_BY_SESSION = {
     "NY": 0.60,
     "LON": 0.50,
-    "ASIA": 0.80,
+    "ASIA": 0.55,
 }
 
 def tf_align_mins_for_session(session_name: str) -> tuple[float, float]:
@@ -6473,15 +6497,15 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 75,
-    "LON": 74,
-    "ASIA": 80,
+    "NY": 74,
+    "LON": 73,
+    "ASIA": 77,
 }
 
 SESSION_MIN_RR_FINAL = {
-    "NY": 1.46,
-    "LON": 1.36,
-    "ASIA": 1.54,
+    "NY": 1.42,
+    "LON": 1.32,
+    "ASIA": 1.44,
 }
 
 SESSION_MIN_RR_TP = SESSION_MIN_RR_FINAL  # legacy compatibility only
@@ -7123,6 +7147,24 @@ def _research_default_family_for_cell(session_name: str, regime_primary: str) ->
     if regime in {'EXHAUSTION', 'UNSTABLE_HIGH_VOL'}:
         return ['F7_EXHAUSTION_FAILURE', 'F4_SWEEP_RECLAIM']
     return ['F1_PULLBACK_CONT', 'F3_IMPULSE_BASE_CONT']
+
+
+def _research_balance_reversal_mode(session_name: str) -> bool:
+    """True when the current allocator/regime context favors sweep/reclaim style logic."""
+    try:
+        sess = str(session_name or '').upper().strip()
+        plan = _research_latest_allocator_plan(sess) or {}
+        regime = str((plan or {}).get('regime_cell') or '').upper().strip()
+        if regime not in {'BALANCE', 'EXHAUSTION', 'SQUEEZE'}:
+            return False
+        active_json = (plan or {}).get('active_families_json') or []
+        if isinstance(active_json, str):
+            active = [str(x).upper().strip() for x in json.loads(active_json or '[]') if str(x).strip()]
+        else:
+            active = [str(x).upper().strip() for x in (active_json or []) if str(x).strip()]
+        return any(f in {'F4_SWEEP_RECLAIM', 'F5_ORB_RETEST', 'F7_EXHAUSTION_FAILURE'} for f in active)
+    except Exception:
+        return False
 
 
 def _research_compute_family_eval_snapshot(trading_day: str | None = None) -> list[dict]:
@@ -19581,7 +19623,13 @@ async def learning_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
-    txt = await to_thread_heavy(_learning_status_text, False, False, timeout=20)
+    try:
+        txt = await to_thread_heavy(_learning_status_text, False, False, timeout=45)
+    except asyncio.TimeoutError:
+        try:
+            txt = _learning_status_text(False, True)
+        except Exception:
+            txt = "⚠️ Learning/optimizer status timed out. Try again shortly."
     await send_long_message(update, txt, parse_mode=None)
 
 
@@ -23226,7 +23274,7 @@ async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_
         elif final:
             lines.append(f"30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}")
             lines.append(f"7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}")
-        if rep.get('error') and str(rep.get('status') or '').upper().strip() not in {'TIMEOUT_PROMOTED'}:
+        if rep.get('error') and str(rep.get('status') or '').upper().strip() not in {'TIMEOUT_PROMOTED', 'TIMEOUT_NO_BETTER_PROFILE'}:
             lines.append(f"Error: {rep.get('error')}")
     await send_long_message(update, '\n'.join(lines), parse_mode=None)
 
@@ -23547,13 +23595,13 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 80.0, 81, 1.44
+        quality, conf, rr = 77.0, 79, 1.40
     elif sess == "LON":
-        quality, conf, rr = 77.0, 79, 1.35
+        quality, conf, rr = 74.0, 76, 1.30
     elif sess == "ASIA":
-        quality, conf, rr = 83.0, 84, 1.50
+        quality, conf, rr = 79.0, 80, 1.42
     else:
-        quality, conf, rr = 79.0, 80, 1.38
+        quality, conf, rr = 76.0, 78, 1.34
 
     try:
         cfg = load_strategy_config(force=False)
@@ -24385,8 +24433,17 @@ def make_setup(
             soft_override = (ratio >= 0.70) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
                 abs(float(ch4_used or 0.0)) >= 0.50 or abs(float(ch24 or 0.0)) >= 12.0
             )
+            balance_reversal_mode = _research_balance_reversal_mode(session_name)
+            balance_reversal_override = False
+            try:
+                if str(session_name).upper() == 'ASIA' and balance_reversal_mode:
+                    balance_reversal_override = (ratio >= 0.50) and (float(fut_vol or 0.0) >= 6_000_000.0) and (
+                        abs(float(ch24 or 0.0)) >= 6.0 or abs(float(ch4_used or 0.0)) >= 0.35
+                    )
+            except Exception:
+                balance_reversal_override = False
 
-            if not (breakout_override or override_4h or override_24h or override_24h_strong or soft_override):
+            if not (breakout_override or override_4h or override_24h or override_24h_strong or soft_override or balance_reversal_override):
                 _rej("ch1_below_trigger", base, mv, f"ch1={ch1:+.2f}% trig={trig_min:.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}% ch15={ch15:+.2f}%")
                 return None
 
@@ -24421,12 +24478,18 @@ def make_setup(
         try:
             if str(session_name).upper() == "ASIA":
                 min1, min4 = tf_align_mins_for_session(session_name)
+                balance_reversal_mode = _research_balance_reversal_mode(session_name)
+                if balance_reversal_mode:
+                    min1 = max(0.22, float(min1) * 0.55)
+                    min4 = max(0.12, float(min4) * 0.35)
                 if side == "BUY":
-                    if not (ch1 >= min1 and ch4 >= min4):
+                    asia_ok = bool(ch1 >= min1 and (ch4 >= min4 or balance_reversal_mode and ch24 >= 6.0))
+                    if not asia_ok:
                         _rej("asia_tf_align_fail_long", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need>=({min1},{min4})")
                         return None
                 else:
-                    if not (ch1 <= -min1 and ch4 <= -min4):
+                    asia_ok = bool(ch1 <= -min1 and (ch4 <= -min4 or balance_reversal_mode and ch24 <= -6.0))
+                    if not asia_ok:
                         _rej("asia_tf_align_fail_short", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need<=(-{min1},-{min4})")
                         return None
         except Exception:
@@ -24736,8 +24799,14 @@ def make_setup(
         conf = conf2
 
         if not keep:
-            _rej("pullback_required_not_met", base, mv, "require_pullback=1")
-            return None
+            balance_reversal_mode = _research_balance_reversal_mode(session_name)
+            if balance_reversal_mode and engine in {"A", "C"}:
+                notes.append("🟡 balance_reversal_pullback_override")
+                conf = max(0.0, float(conf) - 4.0)
+                keep = True
+            else:
+                _rej("pullback_required_not_met", base, mv, "require_pullback=1")
+                return None
 
         if engine == "A" and abs(float(ch1)) >= float(SHARP_1H_MOVE_PCT):
             # EMA touch/reaction on 15m is OPTIONAL: do not hard-reject if it's missing.
@@ -30738,6 +30807,11 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
             ok, dist_pct, last_close, ema_val, ema_p, allowed = ema_anchor_cache[mk]
             adaptive_allowed = _adaptive_ema_anchor_limit_pct(s, session_name=session_name, fallback_allowed=allowed)
+            try:
+                if _research_balance_reversal_mode(session_name):
+                    adaptive_allowed = float(clamp(float(adaptive_allowed) * 1.22, float(adaptive_allowed), max(float(allowed) * 1.35, float(adaptive_allowed))))
+            except Exception:
+                pass
             leader_base_ok = _setup_leader_base_override_ok(s, session_name=session_name)
             if float(dist_pct) > float(adaptive_allowed) and not leader_base_ok:
                 mv = (best_fut or {}).get(base)
