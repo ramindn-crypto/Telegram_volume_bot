@@ -1064,6 +1064,7 @@ MOVER_DN_24H_MAX = -10.0
 STRATEGY_CONFIG_KEY_ACTIVE = "active"
 STRATEGY_CONFIG_KEY_OPT_REPORT = "opt_report"
 STRATEGY_CONFIG_KEY_GOAL_REPORT = "goal_profile_report"
+STRATEGY_CONFIG_KEY_FAMILY_AUTOTUNE_REPORT = "family_autotune_report"
 
 def _strategy_config_migrate():
     """Ensure strategy_config table exists."""
@@ -1290,6 +1291,16 @@ def _strategy_config_defaults() -> dict:
         "family_allocator_min_score": -999.0,
         "family_allocator_min_sample": 0,
         "family_allocator_plan_ttl_hours": 36.0,
+        "family_autotune_enabled": True,
+        "family_autotune_interval_hours": 6.0,
+        "family_autotune_cooldown_hours": 4.0,
+        "family_autotune_max_actions_per_run": 4,
+        "family_f4_balance_score_relax": 0.0,
+        "family_f4_balance_conf_relax": 0,
+        "family_f4_balance_rr_relax": 0.0,
+        "family_f4_balance_pb_relax": 0.0,
+        "family_f4_balance_ch1_relax": 0.0,
+        "family_f4_balance_ch15_relax": 0.0,
     }
 
 _STRATEGY_CFG_CACHE = {"ts": 0.0, "cfg": None}
@@ -1381,6 +1392,35 @@ def load_goal_profile_report() -> dict:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
             row = c.execute("SELECT value FROM strategy_config WHERE key=?", (STRATEGY_CONFIG_KEY_GOAL_REPORT,)).fetchone()
+            if row and row[0]:
+                obj = json.loads(row[0])
+                return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def save_family_autotune_report(report: dict) -> None:
+    _strategy_config_migrate()
+    try:
+        payload = json.dumps(report, ensure_ascii=False, sort_keys=True)
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO strategy_config(key,value,updated_ts) VALUES(?,?,?)",
+                (STRATEGY_CONFIG_KEY_FAMILY_AUTOTUNE_REPORT, payload, float(time.time()))
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def load_family_autotune_report() -> dict:
+    _strategy_config_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute("SELECT value FROM strategy_config WHERE key=?", (STRATEGY_CONFIG_KEY_FAMILY_AUTOTUNE_REPORT,)).fetchone()
             if row and row[0]:
                 obj = json.loads(row[0])
                 return obj if isinstance(obj, dict) else {}
@@ -1692,6 +1732,22 @@ def _strategy_config_bootstrap_recommendations() -> None:
                 changed = True
         except Exception:
             pass
+
+        for _k, _v in {
+            'family_autotune_enabled': True,
+            'family_autotune_interval_hours': 6.0,
+            'family_autotune_cooldown_hours': 4.0,
+            'family_autotune_max_actions_per_run': 4,
+            'family_f4_balance_score_relax': 0.0,
+            'family_f4_balance_conf_relax': 0,
+            'family_f4_balance_rr_relax': 0.0,
+            'family_f4_balance_pb_relax': 0.0,
+            'family_f4_balance_ch1_relax': 0.0,
+            'family_f4_balance_ch15_relax': 0.0,
+        }.items():
+            if _k not in cfg:
+                cfg[_k] = _v
+                changed = True
 
         if changed:
             save_strategy_config(cfg)
@@ -23361,6 +23417,155 @@ async def goal_profile_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(f"✅ Goal updated: {cfg['goal_profile_target_setups_per_day_lo']:.2f}–{cfg['goal_profile_target_setups_per_day_hi']:.2f}/day | WR≥{cfg['goal_profile_target_win_rate']:.1f}% | AvgR≥{float(cfg.get('goal_profile_target_avg_r', 0.10) or 0.10):.2f}")
 
 
+
+_FAMILY_AUTOTUNE_LOCK = threading.Lock()
+
+
+def _family_autotune_is_running() -> bool:
+    try:
+        return bool(_FAMILY_AUTOTUNE_LOCK.locked())
+    except Exception:
+        return False
+
+
+def _family_autotune_latest_reject_agg() -> dict:
+    cand = []
+    try:
+        for bucket in ('latest', 'email', 'screen'):
+            rec = (_LAST_REJECTS_SHARED or {}).get(bucket) or {}
+            if isinstance(rec, dict):
+                cand.append(rec)
+    except Exception:
+        pass
+    if not cand:
+        return {}
+    try:
+        rec = max(cand, key=lambda r: float((r or {}).get('ts') or 0.0))
+    except Exception:
+        rec = cand[-1]
+    agg = dict((rec or {}).get('__agg__') or {})
+    if agg:
+        return agg
+    counts = dict((rec or {}).get('counts') or {})
+    out = {}
+    for k, v in counts.items():
+        rr = str(k).split(':', 1)[-1]
+        out[rr] = int(out.get(rr, 0) or 0) + int(v or 0)
+    return out
+
+
+def _family_autotune_data_snapshot(hours: int = 24) -> dict:
+    out = {'signals': 0, 'exec': 0, 'emailed': 0, 'trading_day': _research_trading_day_label(time.time())}
+    since_ts = float(time.time() - max(1, int(hours)) * 3600.0)
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute('SELECT COUNT(1) FROM signals WHERE created_ts>=?', (since_ts,))
+            out['signals'] = int((cur.fetchone() or [0])[0] or 0)
+            cur.execute('SELECT COUNT(1) FROM executable_setups WHERE executable_ts>=?', (since_ts,))
+            out['exec'] = int((cur.fetchone() or [0])[0] or 0)
+            cur.execute('SELECT COUNT(1) FROM emailed_setups WHERE emailed_ts>=?', (since_ts,))
+            out['emailed'] = int((cur.fetchone() or [0])[0] or 0)
+    except Exception:
+        pass
+    return out
+
+
+def _family_autotune_clamp_cfg(cfg: dict) -> dict:
+    cfg = dict(cfg or {})
+    cfg['family_f4_balance_score_relax'] = round(_clamp(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0), 0.0, 4.0), 2)
+    cfg['family_f4_balance_conf_relax'] = int(_clamp(int(float(cfg.get('family_f4_balance_conf_relax', 0) or 0)), 0, 6))
+    cfg['family_f4_balance_rr_relax'] = round(_clamp(float(cfg.get('family_f4_balance_rr_relax', 0.0) or 0.0), 0.0, 0.25), 3)
+    cfg['family_f4_balance_pb_relax'] = round(_clamp(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0), 0.0, 0.40), 3)
+    cfg['family_f4_balance_ch1_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0), 0.0, 0.80), 3)
+    cfg['family_f4_balance_ch15_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0), 0.0, 0.40), 3)
+    cfg['quality_score_min_screen'] = round(_clamp(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), 60.0, 80.0), 2)
+    cfg['quality_score_min_email'] = round(_clamp(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), 66.0, 86.0), 2)
+    cfg['min_rr_tp'] = round(_clamp(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), 1.20, 1.80), 3)
+    cfg['tf_align_1h_min_abs'] = round(_clamp(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), 0.30, 1.20), 3)
+    return cfg
+
+
+def _run_family_autotune_cycle(force: bool = False) -> dict:
+    if not _FAMILY_AUTOTUNE_LOCK.acquire(blocking=False):
+        return {'status': 'BUSY'}
+    try:
+        cfg = load_strategy_config(force=True)
+        if not _cfg_bool((cfg or {}).get('family_autotune_enabled', True), True):
+            return {'status': 'DISABLED'}
+        rep = load_family_autotune_report() or {}
+        now_ts = float(time.time())
+        cooldown_h = float((cfg or {}).get('family_autotune_cooldown_hours', 4.0) or 4.0)
+        last_ts = float((rep or {}).get('ts') or 0.0)
+        if (not force) and last_ts > 0 and (now_ts - last_ts) < cooldown_h * 3600.0:
+            return {'status': 'COOLDOWN', 'remaining_sec': int(cooldown_h * 3600.0 - (now_ts - last_ts))}
+
+        snap = _family_autotune_data_snapshot(24)
+        rejects = _family_autotune_latest_reject_agg()
+        plans = {s: _research_latest_allocator_plan(s, '') or {} for s in ['ASIA', 'LON', 'NY']}
+        balance_f4 = any(str((plans.get(s) or {}).get('champion_family_id') or '') == 'F4_SWEEP_RECLAIM' and str((plans.get(s) or {}).get('regime_cell') or '').upper() in {'BALANCE', 'EXHAUSTION'} for s in plans)
+        mrep = load_goal_profile_report() or {}
+        final = dict((mrep or {}).get('final') or {})
+        m30 = dict(final.get('metrics_30d') or {})
+        wr30 = float(m30.get('win_rate') or 0.0)
+        spd30 = float(m30.get('setups_per_day') or 0.0)
+
+        actions = []
+        max_actions = int((cfg or {}).get('family_autotune_max_actions_per_run', 4) or 4)
+        def act(key, new_val, why):
+            nonlocal actions, cfg
+            if len(actions) >= max_actions:
+                return
+            old = cfg.get(key)
+            if old == new_val:
+                return
+            cfg[key] = new_val
+            actions.append({'key': key, 'old': old, 'new': new_val, 'why': why})
+
+        low_flow = int(snap.get('signals', 0) or 0) < 1 and int(snap.get('emailed', 0) or 0) < 1
+        if balance_f4 and low_flow:
+            if int(rejects.get('no_breakout_trigger', 0) or 0) >= 3 or int(rejects.get('no_engine_passed', 0) or 0) >= 3:
+                act('family_f4_balance_score_relax', round(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0) + 0.5, 2), 'low_flow_balance_no_breakout')
+                act('family_f4_balance_pb_relax', round(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0) + 0.05, 3), 'low_flow_balance_no_breakout')
+                act('family_f4_balance_ch1_relax', round(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0) + 0.08, 3), 'low_flow_balance_no_breakout')
+                act('family_f4_balance_ch15_relax', round(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0) + 0.04, 3), 'low_flow_balance_no_breakout')
+            if int(rejects.get('below_min_confidence', 0) or 0) >= 2:
+                act('family_f4_balance_conf_relax', int(float(cfg.get('family_f4_balance_conf_relax', 0) or 0)) + 1, 'low_flow_balance_conf')
+                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.0, 2), 'low_flow_balance_conf')
+            if int(rejects.get('below_min_rr_tp_session', 0) or 0) >= 2:
+                act('family_f4_balance_rr_relax', round(float(cfg.get('family_f4_balance_rr_relax', 0.0) or 0.0) + 0.03, 3), 'low_flow_balance_rr')
+                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.03, 3), 'low_flow_balance_rr')
+            if int(rejects.get('far_from_ema_anchor_1h', 0) or 0) >= 2 or int(rejects.get('pullback_required_not_met', 0) or 0) >= 2:
+                act('family_f4_balance_pb_relax', round(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0) + 0.05, 3), 'low_flow_balance_ema')
+        elif spd30 > 4.5 and wr30 < 42.0:
+            act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) + 1.0, 2), 'tighten_high_flow_low_wr')
+            act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) + 0.03, 3), 'tighten_high_flow_low_wr')
+
+        cfg = _family_autotune_clamp_cfg(cfg)
+        save_strategy_config(cfg)
+        apply_strategy_config(cfg)
+        report = {
+            'ts': now_ts, 'status': 'ADJUSTED' if actions else 'NO_CHANGE',
+            'actions': actions, 'snapshot': snap, 'rejects': dict(sorted(rejects.items(), key=lambda kv: int(kv[1]), reverse=True)[:8]),
+            'goal_30d': {'setups_per_day': spd30, 'win_rate': wr30},
+        }
+        save_family_autotune_report(report)
+        return report
+    except Exception as e:
+        rep = {'ts': float(time.time()), 'status': 'ERROR', 'error': f'{type(e).__name__}: {e}'}
+        save_family_autotune_report(rep)
+        return rep
+    finally:
+        try:
+            _FAMILY_AUTOTUNE_LOCK.release()
+        except Exception:
+            pass
+
+
+async def family_autotune_job(context: ContextTypes.DEFAULT_TYPE):
+    await to_thread_heavy(_run_family_autotune_cycle)
+
+
 async def goal_profile_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         if _recent_user_activity(25):
@@ -23474,14 +23679,18 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
         # Family-aware calibration: modest session/regime tuning only.
         # Keep ASIA tighter, allow a little more conversion in LON/NY where the allocator
         # already selected the family as active.
+        f4_pb_relax = float((cfg_live or {}).get('family_f4_balance_pb_relax', 0.0) or 0.0)
+        f4_ch1_relax = float((cfg_live or {}).get('family_f4_balance_ch1_relax', 0.0) or 0.0)
+        f4_ch15_relax = float((cfg_live or {}).get('family_f4_balance_ch15_relax', 0.0) or 0.0)
         if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
             if sess in {'LON', 'NY'}:
-                max_pb += 0.10
-                max_ch15 += 0.08
-                max_ch1 += 0.10
+                max_pb += 0.10 + f4_pb_relax
+                max_ch15 += 0.08 + f4_ch15_relax
+                max_ch1 += 0.10 + f4_ch1_relax
             else:
-                max_pb += 0.03
-                max_ch15 += 0.02
+                max_pb += 0.03 + f4_pb_relax
+                max_ch15 += 0.02 + f4_ch15_relax
+                max_ch1 += f4_ch1_relax
         elif fam == 'F2_MOMENTUM_IGNITION' and regime == 'EXPANSION':
             if sess in {'LON', 'NY'}:
                 max_pb += 0.08
@@ -23626,11 +23835,17 @@ def is_top_setup_eligible(
 
         # Family-aware score calibration: modest conversion help where the allocator already
         # indicates family/regime fit. Keep ASIA comparatively tighter.
+        f4_score_relax = float((cfg_live or {}).get('family_f4_balance_score_relax', 0.0) or 0.0)
+        f4_conf_relax = int(float((cfg_live or {}).get('family_f4_balance_conf_relax', 0) or 0))
+        f4_rr_relax = float((cfg_live or {}).get('family_f4_balance_rr_relax', 0.0) or 0.0)
+        f4_pb_relax = float((cfg_live or {}).get('family_f4_balance_pb_relax', 0.0) or 0.0)
+        f4_ch1_relax = float((cfg_live or {}).get('family_f4_balance_ch1_relax', 0.0) or 0.0)
+        f4_ch15_relax = float((cfg_live or {}).get('family_f4_balance_ch15_relax', 0.0) or 0.0)
         if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
             if sess in {'LON', 'NY'}:
-                min_score -= 2.0 if src == 'exec' else (1.5 if src == 'email' else 1.0)
+                min_score -= (2.0 if src == 'exec' else (1.5 if src == 'email' else 1.0)) + f4_score_relax
             else:
-                min_score -= 2.75 if src == 'exec' else (1.5 if src == 'email' else 1.0)
+                min_score -= (2.75 if src == 'exec' else (1.5 if src == 'email' else 1.0)) + f4_score_relax
         elif fam == 'F2_MOMENTUM_IGNITION' and regime == 'EXPANSION':
             if sess in {'LON', 'NY'}:
                 min_score -= 1.5 if src == 'exec' else (0.75 if src == 'email' else 0.50)
@@ -23900,9 +24115,9 @@ def is_executable_setup_eligible(
 
         if sess == "NY":
             if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
-                if pb_dist > 1.10:
+                if pb_dist > (1.10 + f4_pb_relax):
                     return (False, "ny_entry_too_far_from_ema")
-                if ch15_abs > 1.05 or ch1_abs > 1.90:
+                if ch15_abs > (1.05 + f4_ch15_relax) or ch1_abs > (1.90 + f4_ch1_relax):
                     return (False, "ny_late_extension_exec")
                 if ch24_abs < 4.0:
                     return (False, "ny_context_too_weak_exec")
@@ -23919,9 +24134,9 @@ def is_executable_setup_eligible(
                     return (False, "ny_below_liquidity")
         elif sess == "LON":
             if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
-                if pb_dist > 1.00:
+                if pb_dist > (1.00 + f4_pb_relax):
                     return (False, "lon_entry_too_far_from_ema")
-                if ch15_abs > 0.96 or ch1_abs > 1.75:
+                if ch15_abs > (0.96 + f4_ch15_relax) or ch1_abs > (1.75 + f4_ch1_relax):
                     return (False, "lon_late_extension_exec")
                 if ch24_abs < 4.2:
                     return (False, "lon_context_too_weak_exec")
@@ -23952,9 +24167,9 @@ def is_executable_setup_eligible(
                     return (False, "lon_below_liquidity")
         elif sess == "ASIA":
             if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
-                if pb_dist > 1.05:
+                if pb_dist > (1.05 + f4_pb_relax):
                     return (False, "asia_entry_too_far_from_ema")
-                if ch15_abs > 0.98 or ch1_abs > 1.70:
+                if ch15_abs > (0.98 + f4_ch15_relax) or ch1_abs > (1.70 + f4_ch1_relax):
                     return (False, "asia_late_extension_exec")
                 if ch24_abs < 5.5:
                     return (False, "asia_context_too_weak_exec")
@@ -33939,6 +34154,7 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Goal 7d: {float(m7.get('setups_per_day', 0.0) or 0.0):.2f}/day | setups={int(m7.get('setups', 0) or 0)} | WR={float(m7.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R', 0.0) or 0.0):.3f}",
         SEP,
         f"Family allocator: {'ON' if _cfg_bool((cfg or {}).get('family_allocator_enabled', True), True) else 'OFF'} | shadow={'ON' if _cfg_bool((cfg or {}).get('family_allocator_shadow_mode', True), True) else 'OFF'} | live_enforce={'ON' if _cfg_bool((cfg or {}).get('family_allocator_enforce_live', False), False) else 'OFF'} | max_active={int((cfg or {}).get('family_allocator_max_active_per_cell', 2) or 2)}",
+        f"Family autotune: {'ON' if _cfg_bool((cfg or {}).get('family_autotune_enabled', True), True) else 'OFF'} | every {float((cfg or {}).get('family_autotune_interval_hours', 6.0) or 6.0):.1f}h | f4_relax(score/conf/rr)={float((cfg or {}).get('family_f4_balance_score_relax', 0.0) or 0.0):.1f}/{int(float((cfg or {}).get('family_f4_balance_conf_relax', 0) or 0))}/{float((cfg or {}).get('family_f4_balance_rr_relax', 0.0) or 0.0):.2f}",
         f"Regime refresh: {'ON' if _cfg_bool((cfg or {}).get('family_regime_refresh_enabled', True), True) else 'OFF'} | every {float((cfg or {}).get('family_regime_refresh_interval_hours', 4.0) or 4.0):.1f}h",
         'Daily regimes: ' + ' | '.join([_fmt_regime('daily', s) for s in ['ASIA', 'LON', 'NY']]),
         '4h regimes: ' + ' | '.join([_fmt_regime('4h', s) for s in ['ASIA', 'LON', 'NY']]),
@@ -35470,6 +35686,18 @@ def main():
                     "misfire_grace_time": 300,
                 },
             )
+            if _cfg_bool((_family_cfg or {}).get("family_autotune_enabled", True), True):
+                app.job_queue.run_repeating(
+                    family_autotune_job,
+                    interval=max(7200, int(float((_family_cfg or {}).get("family_autotune_interval_hours", 6.0) or 6.0) * 3600)),
+                    first=max(900, 420),
+                    name="family_autotune_job",
+                    job_kwargs={
+                        "max_instances": 1,
+                        "coalesce": True,
+                        "misfire_grace_time": 900,
+                    },
+                )
         except Exception:
             pass
     else:
