@@ -6417,8 +6417,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             _autotrade_runtime_symbol_lock_release(uid, sym)
 
 # Caching for speed
-TICKERS_TTL_SEC = 45
-OHLCV_TTL_SEC = 60
+TICKERS_TTL_SEC = 75
+OHLCV_TTL_SEC = 120
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pulsefutures")
@@ -6433,7 +6433,7 @@ SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands unde
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
 AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "25") or 25)
 AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "40") or 40)
-AUTOTRADE_GUARDIAN_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_TIMEOUT_SEC", "20") or 20)
+AUTOTRADE_GUARDIAN_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_TIMEOUT_SEC", "15") or 15)
 AUTOTRADE_GUARDIAN_MIN_GAP_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_MIN_GAP_SEC", "20") or 20)
 _LAST_AUTOTRADE_GUARDIAN_TS = 0.0
 
@@ -14922,6 +14922,16 @@ def get_cached_futures_tickers() -> Dict[str, MarketVol]:
     except Exception:
         return {}
 
+def _screen_best_fut_fast() -> Dict[str, MarketVol]:
+    """Prefer cached tickers for /screen responsiveness; fetch only when cache is cold."""
+    try:
+        cached = get_cached_futures_tickers() or {}
+        if cached:
+            return cached
+    except Exception:
+        pass
+    return fetch_futures_tickers()
+
 def fetch_futures_tickers() -> Dict[str, MarketVol]:
     """
     ✅ Uses singleton exchange (no repeated load_markets)
@@ -14948,8 +14958,8 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
 _OHLCV_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 _OHLCV_TF_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 _OHLCV_RATE_LIMIT_WARN_UNTIL: Dict[str, float] = {}
-OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "20") or 20)
-OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "30") or 30)
+OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "60") or 60)
+OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "90") or 90)
 BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC", "6") or 6)
 BYBIT_OPEN_ORDERS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_ORDERS_CACHE_TTL_SEC", "6") or 6)
 SCREEN_DIRECTIONAL_CACHE_TTL_SEC = int(os.getenv("SCREEN_DIRECTIONAL_CACHE_TTL_SEC", "45") or 45)
@@ -23332,32 +23342,43 @@ async def goal_profile_job(context: ContextTypes.DEFAULT_TYPE):
             return
         if _goal_profile_is_running():
             return
+        if ALERT_LOCK.locked() or SCAN_LOCK.locked() or _SCREEN_LOCK.locked():
+            return
         if not _goal_profile_is_due(time.time(), cfg=cfg):
             return
-        await to_thread_heavy(_run_goal_profile_cycle, False)
+        await to_thread_heavy(_run_goal_profile_cycle, False, timeout=max(900, int(float(tgt.get('interval_hours', 24.0) or 24.0) * 1800)))
     except Exception:
         return
 
 
 async def research_framework_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
-    """Safety net for daily research refresh and goal-profile automation.
+    """Cheap safety net for daily research refresh and overdue goal cycles.
 
-    Why it exists:
-    - repeating jobs can drift or miss the exact anchored-day rollover
-    - the daily research layer must populate even if the 24h job has not fired yet
-    - goal-profile monitoring should auto-run when due, even after a timeout report
+    This watchdog must stay light so it cannot starve user commands on small Render instances.
     """
     try:
         now_ts = float(time.time())
         cfg = load_strategy_config(force=False)
+        if ALERT_LOCK.locked() or SCAN_LOCK.locked() or _SCREEN_LOCK.locked() or _goal_profile_is_running():
+            return
 
-        if _cfg_bool((cfg or {}).get('family_allocator_enabled', True), True):
-            if _research_daily_refresh_due(now_ts):
-                await to_thread_heavy(_research_run_daily_refresh, True)
+        if _cfg_bool((cfg or {}).get('family_allocator_enabled', True), True) and _research_daily_refresh_due(now_ts):
+            try:
+                await to_thread_heavy(_research_run_daily_refresh, True, timeout=45)
+            except Exception:
+                pass
 
-        if _goal_profile_is_due(now_ts, cfg=cfg):
-            if _cfg_bool((cfg or {}).get('goal_profile_enabled', True), True) and (not _goal_profile_is_running()) and _SELF_OPT_STATE.get('stop_event') is None:
-                await to_thread_heavy(_run_goal_profile_cycle, False)
+        tgt = _goal_profile_targets(cfg)
+        if _cfg_bool((cfg or {}).get('goal_profile_enabled', True), True) and _SELF_OPT_STATE.get('stop_event') is None:
+            rep = load_goal_profile_report() or {}
+            last_ts = float(rep.get('ts', 0.0) or 0.0)
+            interval_sec = max(21600.0, float(tgt.get('interval_hours', 24.0) or 24.0) * 3600.0)
+            overdue = (last_ts <= 0.0) or ((now_ts - last_ts) >= (interval_sec + 5400.0))
+            if overdue and _goal_profile_is_due(now_ts, cfg=cfg):
+                try:
+                    await to_thread_heavy(_run_goal_profile_cycle, False, timeout=max(600, int(interval_sec * 0.75)))
+                except Exception:
+                    pass
     except Exception:
         return
 
@@ -24473,7 +24494,7 @@ def make_setup(
             balance_reversal_override = False
             try:
                 if str(session_name).upper() == 'ASIA' and balance_reversal_mode:
-                    balance_reversal_override = (ratio >= 0.35) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
+                    balance_reversal_override = (ratio >= 0.25) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
                         abs(float(ch24 or 0.0)) >= 5.0 or abs(float(ch4_used or 0.0)) >= 0.25
                     )
             except Exception:
@@ -24490,8 +24511,8 @@ def make_setup(
         try:
             if balance_reversal_mode:
                 rev_vol_floor = 7_000_000.0 if str(session_name).upper() == 'ASIA' else 9_000_000.0
-                up_ext = float(ch24 or 0.0) >= (7.0 if str(session_name).upper() == 'ASIA' else 9.0)
-                dn_ext = float(ch24 or 0.0) <= (-(7.0 if str(session_name).upper() == 'ASIA' else 9.0))
+                up_ext = float(ch24 or 0.0) >= (5.5 if str(session_name).upper() == 'ASIA' else 9.0)
+                dn_ext = float(ch24 or 0.0) <= (-(5.5 if str(session_name).upper() == 'ASIA' else 9.0))
                 fade_long = dn_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) >= -0.02 or float(ch1 or 0.0) >= -0.10)
                 fade_short = up_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) <= 0.02 or float(ch1 or 0.0) <= 0.10)
                 if fade_long:
@@ -24534,8 +24555,8 @@ def make_setup(
                 min1, min4 = tf_align_mins_for_session(session_name)
                 balance_reversal_mode = _research_balance_reversal_mode(session_name)
                 if balance_reversal_mode:
-                    min1 = max(0.18, float(min1) * 0.45)
-                    min4 = max(0.10, float(min4) * 0.28)
+                    min1 = max(0.14, float(min1) * 0.35)
+                    min4 = max(0.08, float(min4) * 0.20)
                 if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                     if side == "BUY":
                         asia_ok = bool(float(ch24 or 0.0) <= -6.0 and (float(ch15 or 0.0) >= -0.02 or float(ch1 or 0.0) >= -0.12))
@@ -24919,7 +24940,7 @@ def make_setup(
             sess_min = int(_session_generation_conf_floor(session_name))
             if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                 if str(session_name or '').upper() == 'ASIA':
-                    sess_min = min(int(sess_min), 71)
+                    sess_min = min(int(sess_min), 69)
                 else:
                     sess_min = min(int(sess_min), 72)
             if str(session_name or '').upper() == 'NY' and require_pullback and family_id_hint != 'F4_SWEEP_RECLAIM':
@@ -24975,9 +24996,9 @@ def make_setup(
             sess_rr_min = float(_session_generation_rr_floor(session_name))
             if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                 if str(session_name or '').upper() == 'ASIA':
-                    sess_rr_min = min(float(sess_rr_min), 1.22)
+                    sess_rr_min = min(float(sess_rr_min), 1.15)
                 else:
-                    sess_rr_min = min(float(sess_rr_min), 1.24)
+                    sess_rr_min = min(float(sess_rr_min), 1.20)
             if str(session_name or '').upper() == 'NY' and require_pullback and family_id_hint != 'F4_SWEEP_RECLAIM':
                 sess_rr_min = max(float(sess_rr_min), float(_session_generation_rr_floor('NY')) + 0.05)
             if float(rr_final) < float(sess_rr_min):
@@ -31116,8 +31137,8 @@ def user_location_and_time(user: dict):
 # =========================================================
 # /screen fast cache (per-instance)
 # =========================================================
-SCREEN_CACHE_TTL_SEC = 45  # seconds
-SCREEN_STALE_CACHE_MAX_SEC = 180  # allow a slightly stale /screen when background jobs are busy
+SCREEN_CACHE_TTL_SEC = 90  # seconds
+SCREEN_STALE_CACHE_MAX_SEC = 420  # allow a more generous stale /screen when background jobs are busy
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 _SCREEN_CACHE: dict[str, dict] = {}
 _SCREEN_LOCK = asyncio.Lock()
@@ -31838,9 +31859,42 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Send immediate response (fast perceived UX)
         status_msg = await update.message.reply_text("🔎 Scanning market… Please wait")
 
+        # Compute header/session without hitting the exchange first.
+        uid = update.effective_user.id
+        user = get_user(uid)
+        live_session = current_session_utc()
+        scan_session = scan_session_name_utc()
+        loc_label, loc_time = user_location_and_time(user)
+        cache_key = f"uid:{int(uid)}::{str(scan_session or '').upper()}"
+        now_ts = time.time()
+        cache_entry = _SCREEN_CACHE.get(cache_key) or {}
+        if (cache_entry.get("body") and (now_ts - float(cache_entry.get("ts", 0.0)) <= float(SCREEN_CACHE_TTL_SEC))):
+            header = (
+                f"*PulseFutures — Market Scan*\n"
+                f"{HDR}\n"
+                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                f"_Showing recent cached scan for faster response._\n"
+            )
+            keyboard = [
+                [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                for (sym, sid) in (cache_entry.get("kb") or [])
+            ]
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            await send_long_message(
+                update,
+                (header + "\n" + str(cache_entry.get("body") or "")).strip(),
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            )
+            return
+
         reset_reject_tracker()
 
-        best_fut = await to_thread_heavy(fetch_futures_tickers, timeout=15)
+        best_fut = await to_thread_heavy(_screen_best_fut_fast, timeout=10)
         if not best_fut:
             await status_msg.edit_text("❌ Failed to fetch futures data.")
             return
@@ -32640,15 +32694,15 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "28"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "85"))
-ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "135"))
-ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "3"))
-ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "18"))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "55"))
+ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "210"))
+ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "1"))
+ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "10"))
 ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING", True)
 ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.25") or 0.25)
-EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "240"))
+EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "600"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
 PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "60"))
@@ -33041,13 +33095,15 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             cache_age = float(time.time()) - float(cache_entry.get('ts') or 0.0)
             cached_setups = list(cache_entry.get('setups') or []) if cache_entry else []
 
-            # Cache-first: avoid rebuilding the full email pool every 60s when a recent
-            # authoritative session pool already exists. This is the main guard against
-            # alert_job overrunning its own schedule on Render.
-            if cached_setups and cache_age <= float(_alert_job_limit('EMAIL_POOL_REBUILD_MIN_SEC', 180)):
+            # Cache-first: avoid rebuilding the full email pool every cycle when a recent
+            # authoritative session pool already exists. Under runtime pressure, prefer
+            # reusing cache over starting another expensive scan.
+            busy_runtime = bool(goal_running) or SCAN_LOCK.locked() or _SCREEN_LOCK.locked()
+            cache_ttl_for_email = float(max(_alert_job_limit('EMAIL_POOL_REBUILD_MIN_SEC', 180), 600 if busy_runtime else 0))
+            if cached_setups and cache_age <= cache_ttl_for_email:
                 setups = list(cached_setups)
                 try:
-                    db_log_setup_pipeline_event(0, stage='email_pool_session_cache', status='ok', session=str(sess_name or ''), mode='email', details={'setups': len(setups or []), 'cache_age_sec': round(cache_age, 1)})
+                    db_log_setup_pipeline_event(0, stage='email_pool_session_cache', status='busy_cache_hit' if busy_runtime else 'ok', session=str(sess_name or ''), mode='email', details={'setups': len(setups or []), 'cache_age_sec': round(cache_age, 1)})
                 except Exception:
                     pass
             else:
@@ -33071,7 +33127,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     pool = {"setups": []}
 
                 setups = list(pool.get("setups", []) or [])
-                if (not setups) and str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
+                if (not setups) and (not busy_runtime) and str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
                     try:
                         fallback_pool = await asyncio.wait_for(
                             build_priority_pool(
@@ -33081,7 +33137,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                                 scan_profile="aggressive",
                                 uid=None,
                             ),
-                            timeout=max(20, int(EMAIL_BUILD_POOL_TIMEOUT_SEC)),
+                            timeout=max(15, int(EMAIL_BUILD_POOL_TIMEOUT_SEC)),
                         )
                         setups = list((fallback_pool or {}).get("setups", []) or [])
                         try:
@@ -35152,13 +35208,13 @@ def main():
         # AutoTrade live protection guardian (repairs missing SL / TP stacks continuously)
         app.job_queue.run_repeating(
             autotrade_exit_guardian_job,
-            interval=60,
-            first=20,
+            interval=90,
+            first=30,
             name="autotrade_exit_guardian_job",
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
-                "misfire_grace_time": 45,
+                "misfire_grace_time": 120,
             },
         )
 
@@ -35288,8 +35344,8 @@ def main():
                 )
             app.job_queue.run_repeating(
                 research_framework_watchdog_job,
-                interval=600,
-                first=180,
+                interval=900,
+                first=300,
                 name="research_framework_watchdog_job",
                 job_kwargs={
                     "max_instances": 1,
