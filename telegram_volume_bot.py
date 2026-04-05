@@ -6543,7 +6543,7 @@ def _session_generation_conf_floor(session_name: str) -> int:
                 if sess == 'ASIA' and _research_balance_reversal_mode(sess):
                     floor = min(floor, 66)
                 elif sess in {'LON', 'NY'} and _research_balance_reversal_mode(sess):
-                    floor = min(floor, 69)
+                    floor = min(floor, 67)
             except Exception:
                 pass
             return int(floor)
@@ -6567,7 +6567,7 @@ def _session_generation_rr_floor(session_name: str) -> float:
                     if sess == 'ASIA':
                         floor = min(floor, 0.98)
                     elif sess in {'LON', 'NY'}:
-                        floor = min(floor, 1.08)
+                        floor = min(floor, 1.00)
             except Exception:
                 pass
             return float(floor)
@@ -20495,7 +20495,7 @@ def _scan_intel_classify(bucket: str, mfe_pct: float, mae_pct: float, reject_rea
     if str(bucket or "") == "top_setups":
         return "setup_worked" if float(mfe_pct) >= float(SCAN_INTELLIGENCE_MIN_MFE_PCT) else "setup_failed"
     if float(mfe_pct) >= float(SCAN_INTELLIGENCE_MIN_MFE_PCT) and float(mae_pct) <= float(SCAN_INTELLIGENCE_MAX_MAE_PCT):
-        if rr in {"ch1_below_trigger", "no_breakout_trigger", "below_min_confidence", "no_engine_passed", "smc_structure_mismatch"}:
+        if rr in {"ch1_below_trigger", "no_breakout_trigger", "below_min_confidence", "no_engine_passed", "smc_structure_mismatch", "15m_weak_and_not_early", "pro_structure_trend_conflict"}:
             return "missed_due_to_over_filtering"
         return "missed_but_good"
     if float(mfe_pct) >= float(SCAN_INTELLIGENCE_MIN_MFE_PCT) * 0.70:
@@ -24545,8 +24545,8 @@ def make_setup(
                             abs(float(ch24 or 0.0)) >= 3.5 or abs(float(ch4_used or 0.0)) >= 0.14
                         )
                     elif sess_u in {'LON', 'NY'}:
-                        balance_reversal_override = (ratio >= 0.24) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
-                            abs(float(ch24 or 0.0)) >= 5.5 or abs(float(ch4_used or 0.0)) >= 0.22
+                        balance_reversal_override = (ratio >= 0.18) and (float(fut_vol or 0.0) >= 4_500_000.0) and (
+                            abs(float(ch24 or 0.0)) >= 4.5 or abs(float(ch4_used or 0.0)) >= 0.18
                         )
             except Exception:
                 balance_reversal_override = False
@@ -24561,11 +24561,11 @@ def make_setup(
         balance_reversal_side = ""
         try:
             if balance_reversal_mode:
-                rev_vol_floor = 5_000_000.0 if str(session_name).upper() == 'ASIA' else 7_000_000.0
-                up_ext = float(ch24 or 0.0) >= (3.5 if str(session_name).upper() == 'ASIA' else 6.5)
-                dn_ext = float(ch24 or 0.0) <= (-(3.5 if str(session_name).upper() == 'ASIA' else 6.5))
-                fade_long = dn_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) >= -0.08 or float(ch1 or 0.0) >= -0.24 or float(ch4_used or 0.0) >= -0.45)
-                fade_short = up_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) <= 0.08 or float(ch1 or 0.0) <= 0.24 or float(ch4_used or 0.0) <= 0.45)
+                rev_vol_floor = 4_500_000.0 if str(session_name).upper() == 'ASIA' else 6_000_000.0
+                up_ext = float(ch24 or 0.0) >= (3.5 if str(session_name).upper() == 'ASIA' else 5.5)
+                dn_ext = float(ch24 or 0.0) <= (-(3.5 if str(session_name).upper() == 'ASIA' else 5.5))
+                fade_long = dn_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) >= -0.12 or float(ch1 or 0.0) >= -0.30 or float(ch4_used or 0.0) >= -0.55)
+                fade_short = up_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) <= 0.12 or float(ch1 or 0.0) <= 0.30 or float(ch4_used or 0.0) <= 0.55)
                 if fade_long:
                     balance_reversal_side = 'BUY'
                     family_id_hint = 'F4_SWEEP_RECLAIM'
@@ -24847,7 +24847,7 @@ def make_setup(
             if structure == opposite_trend and trend == opposite_trend:
                 if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                     notes.append(f"smc_structure_trend_soft_conflict={structure}/{trend}")
-                    conf = max(0.0, float(conf) - 3.0)
+                    conf = max(0.0, float(conf) - 2.0)
                 else:
                     _rej("pro_structure_trend_conflict", base, mv, f"side={side} structure={structure} trend={trend}")
                     return None
@@ -24977,8 +24977,12 @@ def make_setup(
 
         if strict_15m:
             if (not is_confirm_15m) and (not is_early_allowed):
-                _rej("15m_weak_and_not_early", base, mv, f"ch15={ch15:+.2f}% ch1={ch1:+.2f}%")
-                return None
+                if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
+                    notes.append('🟡 f4_weak15m_soft')
+                    conf = max(0.0, float(conf) - 4.0)
+                else:
+                    _rej("15m_weak_and_not_early", base, mv, f"ch15={ch15:+.2f}% ch1={ch1:+.2f}%")
+                    return None
 
         if strict_15m and (not is_confirm_15m):
             conf = max(0, int(conf) - int(EARLY_CONF_PENALTY))
@@ -25231,13 +25235,18 @@ def make_breakout_setup(
                     side = "BUY"
                 elif (ch4_used <= -4.0 and ch24 <= -12.0):
                     side = "SELL"
-                elif _research_balance_reversal_mode(session_name) and abs(float(ch24 or 0.0)) >= 7.0:
+                elif _research_balance_reversal_mode(session_name) and abs(float(ch24 or 0.0)) >= 5.5:
                     # In BALANCE / reclaim regimes, allow a fade-style trigger when the 24h move is extreme
                     # but the 1h/15m move is already stalling, instead of demanding a fresh HH/LL breakout.
-                    if float(ch24 or 0.0) >= 7.0 and float(ch15 or 0.0) <= 0.12 and float(ch1 or 0.0) <= 0.30:
+                    if float(ch24 or 0.0) >= 5.5 and float(ch15 or 0.0) <= 0.18 and float(ch1 or 0.0) <= 0.40:
                         side = "SELL"
-                    elif float(ch24 or 0.0) <= -7.0 and float(ch15 or 0.0) >= -0.12 and float(ch1 or 0.0) >= -0.30:
+                        family_id_hint = family_id_hint or 'F4_SWEEP_RECLAIM'
+                    elif float(ch24 or 0.0) <= -5.5 and float(ch15 or 0.0) >= -0.18 and float(ch1 or 0.0) >= -0.40:
                         side = "BUY"
+                        family_id_hint = family_id_hint or 'F4_SWEEP_RECLAIM'
+                    elif family_id_hint == 'F4_SWEEP_RECLAIM':
+                        notes.append('🟡 f4_no_breakout_soft')
+                        conf = max(0.0, float(conf) - 4.0)
                     else:
                         _rej("no_breakout_trigger", base, mv)
                         return None
@@ -30979,7 +30988,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             adaptive_allowed = _adaptive_ema_anchor_limit_pct(s, session_name=session_name, fallback_allowed=allowed)
             try:
                 if _research_balance_reversal_mode(session_name):
-                    adaptive_allowed = float(clamp(float(adaptive_allowed) * 1.22, float(adaptive_allowed), max(float(allowed) * 1.35, float(adaptive_allowed))))
+                    adaptive_allowed = float(clamp(float(adaptive_allowed) * 1.30, float(adaptive_allowed), max(float(allowed) * 1.45, float(adaptive_allowed))))
             except Exception:
                 pass
             leader_base_ok = _setup_leader_base_override_ok(s, session_name=session_name)
