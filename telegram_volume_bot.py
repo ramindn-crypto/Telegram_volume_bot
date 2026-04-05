@@ -6541,9 +6541,9 @@ def _session_generation_conf_floor(session_name: str) -> int:
             floor = int(SESSION_MIN_CONF.get(sess, MIN_SETUP_CONF))
             try:
                 if sess == 'ASIA' and _research_balance_reversal_mode(sess):
-                    floor = min(floor, 58)
+                    floor = min(floor, 54)
                 elif sess in {'LON', 'NY'} and _research_balance_reversal_mode(sess):
-                    floor = min(floor, 60)
+                    floor = min(floor, 56)
             except Exception:
                 pass
             return int(floor)
@@ -6565,9 +6565,9 @@ def _session_generation_rr_floor(session_name: str) -> float:
             try:
                 if _research_balance_reversal_mode(sess):
                     if sess == 'ASIA':
-                        floor = min(floor, 0.84)
+                        floor = min(floor, 0.78)
                     elif sess in {'LON', 'NY'}:
-                        floor = min(floor, 0.88)
+                        floor = min(floor, 0.82)
             except Exception:
                 pass
             return float(floor)
@@ -23899,37 +23899,57 @@ def is_executable_setup_eligible(
         ch24_abs = abs(float(getattr(s, "ch24", 0.0) or 0.0))
 
         if sess == "NY":
-            if pb_dist > 0.75:
-                return (False, "ny_entry_too_far_from_ema")
-            if ch15_abs > 0.82 or (ch15_abs > 0.72 and ch1_abs > 1.55):
-                return (False, "ny_late_extension_exec")
-            if ch4_abs < 0.62 or ch1_abs < 0.32:
-                return (False, "ny_context_too_weak_exec")
-            if fut_vol < max(MIN_FUT_VOL_USD, 10_500_000.0):
-                return (False, "ny_below_liquidity")
+            if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
+                if pb_dist > 1.10:
+                    return (False, "ny_entry_too_far_from_ema")
+                if ch15_abs > 1.05 or ch1_abs > 1.90:
+                    return (False, "ny_late_extension_exec")
+                if ch24_abs < 4.0:
+                    return (False, "ny_context_too_weak_exec")
+                if fut_vol < float(max(MIN_FUT_VOL_USD * 0.68, 7_500_000.0)):
+                    return (False, "ny_below_liquidity")
+            else:
+                if pb_dist > 0.75:
+                    return (False, "ny_entry_too_far_from_ema")
+                if ch15_abs > 0.82 or (ch15_abs > 0.72 and ch1_abs > 1.55):
+                    return (False, "ny_late_extension_exec")
+                if ch4_abs < 0.62 or ch1_abs < 0.32:
+                    return (False, "ny_context_too_weak_exec")
+                if fut_vol < max(MIN_FUT_VOL_USD, 10_500_000.0):
+                    return (False, "ny_below_liquidity")
         elif sess == "LON":
-            lon_pb_max = 0.74 if reach_mode else 0.60
-            lon_ch15_cap = 0.68 if reach_mode else 0.54
-            lon_ch1_cap = 1.35 if reach_mode else 1.18
-            lon_ctx_ch4_min = 0.40 if reach_mode else 0.52
-            lon_ctx_ch1_min = 0.16 if reach_mode else 0.24
-            lon_liq_floor = max(MIN_FUT_VOL_USD * (0.82 if reach_mode else 1.0), 8_500_000.0 if reach_mode else 11_000_000.0)
-            if engine == 'C':
-                lon_pb_max = max(lon_pb_max, engine_c_exec_pb_dist_lon)
-                lon_ch1_cap = max(lon_ch1_cap, engine_c_exec_ch1_cap_lon)
-                lon_liq_floor = max(MIN_FUT_VOL_USD * engine_c_exec_liq_mult, ENGINE_C_MIN_FUT_VOL_USD)
-                lon_ctx_ch4_min = min(lon_ctx_ch4_min, 0.48)
-                lon_ctx_ch1_min = min(lon_ctx_ch1_min, 0.22)
-            if pb_dist > lon_pb_max:
-                return (False, "lon_entry_too_far_from_ema")
-            if ch15_abs > lon_ch15_cap or ch1_abs > lon_ch1_cap:
-                return (False, "lon_late_extension_exec")
-            if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
-                return (False, "lon_context_too_weak_exec")
-            if ch4_abs > (2.85 if reach_mode else 2.55) or ch24_abs > (15.2 if reach_mode else 13.8):
-                return (False, "lon_trend_overheated_exec")
-            if fut_vol < lon_liq_floor:
-                return (False, "lon_below_liquidity")
+            if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
+                if pb_dist > 1.00:
+                    return (False, "lon_entry_too_far_from_ema")
+                if ch15_abs > 0.96 or ch1_abs > 1.75:
+                    return (False, "lon_late_extension_exec")
+                if ch24_abs < 4.2:
+                    return (False, "lon_context_too_weak_exec")
+                if fut_vol < float(max(MIN_FUT_VOL_USD * 0.66, 7_000_000.0)):
+                    return (False, "lon_below_liquidity")
+            else:
+                lon_pb_max = 0.74 if reach_mode else 0.60
+                lon_ch15_cap = 0.68 if reach_mode else 0.54
+                lon_ch1_cap = 1.35 if reach_mode else 1.18
+                lon_ctx_ch4_min = 0.40 if reach_mode else 0.52
+                lon_ctx_ch1_min = 0.16 if reach_mode else 0.24
+                lon_liq_floor = max(MIN_FUT_VOL_USD * (0.82 if reach_mode else 1.0), 8_500_000.0 if reach_mode else 11_000_000.0)
+                if engine == 'C':
+                    lon_pb_max = max(lon_pb_max, engine_c_exec_pb_dist_lon)
+                    lon_ch1_cap = max(lon_ch1_cap, engine_c_exec_ch1_cap_lon)
+                    lon_liq_floor = max(MIN_FUT_VOL_USD * engine_c_exec_liq_mult, ENGINE_C_MIN_FUT_VOL_USD)
+                    lon_ctx_ch4_min = min(lon_ctx_ch4_min, 0.48)
+                    lon_ctx_ch1_min = min(lon_ctx_ch1_min, 0.22)
+                if pb_dist > lon_pb_max:
+                    return (False, "lon_entry_too_far_from_ema")
+                if ch15_abs > lon_ch15_cap or ch1_abs > lon_ch1_cap:
+                    return (False, "lon_late_extension_exec")
+                if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
+                    return (False, "lon_context_too_weak_exec")
+                if ch4_abs > (2.85 if reach_mode else 2.55) or ch24_abs > (15.2 if reach_mode else 13.8):
+                    return (False, "lon_trend_overheated_exec")
+                if fut_vol < lon_liq_floor:
+                    return (False, "lon_below_liquidity")
         elif sess == "ASIA":
             if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
                 if pb_dist > 1.05:
@@ -24560,11 +24580,11 @@ def make_setup(
         balance_reversal_side = ""
         try:
             if balance_reversal_mode:
-                rev_vol_floor = 2_500_000.0 if str(session_name).upper() == 'ASIA' else 3_000_000.0
-                up_ext = float(ch24 or 0.0) >= (2.2 if str(session_name).upper() == 'ASIA' else 3.2)
-                dn_ext = float(ch24 or 0.0) <= (-(2.2 if str(session_name).upper() == 'ASIA' else 3.2))
-                fade_long = dn_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) >= -0.30 or float(ch1 or 0.0) >= -0.55 or float(ch4_used or 0.0) >= -0.90)
-                fade_short = up_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) <= 0.30 or float(ch1 or 0.0) <= 0.55 or float(ch4_used or 0.0) <= 0.90)
+                rev_vol_floor = 2_000_000.0 if str(session_name).upper() == 'ASIA' else 2_500_000.0
+                up_ext = float(ch24 or 0.0) >= (1.8 if str(session_name).upper() == 'ASIA' else 2.6)
+                dn_ext = float(ch24 or 0.0) <= (-(1.8 if str(session_name).upper() == 'ASIA' else 2.6))
+                fade_long = dn_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) >= -0.45 or float(ch1 or 0.0) >= -0.85 or float(ch4_used or 0.0) >= -1.10)
+                fade_short = up_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) <= 0.45 or float(ch1 or 0.0) <= 0.85 or float(ch4_used or 0.0) <= 1.10)
                 if fade_long:
                     balance_reversal_side = 'BUY'
                     family_id_hint = 'F4_SWEEP_RECLAIM'
@@ -25006,9 +25026,9 @@ def make_setup(
             sess_min = int(_session_generation_conf_floor(session_name))
             if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                 if str(session_name or '').upper() == 'ASIA':
-                    sess_min = min(int(sess_min), 56)
+                    sess_min = min(int(sess_min), 52)
                 else:
-                    sess_min = min(int(sess_min), 58)
+                    sess_min = min(int(sess_min), 54)
             if str(session_name or '').upper() == 'NY' and require_pullback and family_id_hint != 'F4_SWEEP_RECLAIM':
                 sess_min = max(int(sess_min), int(_session_generation_conf_floor('NY')) + 2)
             if int(conf) < int(sess_min):
@@ -25246,13 +25266,13 @@ def make_breakout_setup(
                     side = "BUY"
                 elif (ch4_used <= -4.0 and ch24 <= -12.0):
                     side = "SELL"
-                elif _research_balance_reversal_mode(session_name) and abs(float(ch24 or 0.0)) >= 3.2:
+                elif _research_balance_reversal_mode(session_name) and abs(float(ch24 or 0.0)) >= 2.6:
                     # In BALANCE / reclaim regimes, allow a fade-style trigger when the 24h move is extended
                     # and the 1h/15m move is stalling, instead of demanding a fresh HH/LL breakout.
-                    if float(ch24 or 0.0) >= 3.2 and (float(ch15 or 0.0) <= 0.30 or float(ch1 or 0.0) <= 0.60 or float(ch4_used or 0.0) <= 0.85):
+                    if float(ch24 or 0.0) >= 2.6 and (float(ch15 or 0.0) <= 0.45 or float(ch1 or 0.0) <= 0.85 or float(ch4_used or 0.0) <= 1.10):
                         side = "SELL"
                         family_id_hint = family_id_hint or 'F4_SWEEP_RECLAIM'
-                    elif float(ch24 or 0.0) <= -3.2 and (float(ch15 or 0.0) >= -0.30 or float(ch1 or 0.0) >= -0.60 or float(ch4_used or 0.0) >= -0.85):
+                    elif float(ch24 or 0.0) <= -2.6 and (float(ch15 or 0.0) >= -0.45 or float(ch1 or 0.0) >= -0.85 or float(ch4_used or 0.0) >= -1.10):
                         side = "BUY"
                         family_id_hint = family_id_hint or 'F4_SWEEP_RECLAIM'
                     elif family_id_hint == 'F4_SWEEP_RECLAIM' or _research_balance_reversal_mode(session_name):
@@ -25260,7 +25280,7 @@ def make_breakout_setup(
                         family_id_hint = family_id_hint or 'F4_SWEEP_RECLAIM'
                         side = balance_reversal_side or side
                         notes.append('🟡 f4_no_breakout_soft')
-                        conf = max(0.0, float(conf) - 2.0)
+                        conf = max(0.0, float(conf) - 1.0)
                     else:
                         _rej("no_breakout_trigger", base, mv)
                         return None
