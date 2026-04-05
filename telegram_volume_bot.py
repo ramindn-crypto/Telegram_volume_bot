@@ -417,6 +417,24 @@ async def to_thread_fast(fn, *args, timeout: int | None = None, **kwargs):
 async def to_thread_heavy(fn, *args, timeout: int | None = None, **kwargs):
     return await _run_in_executor(_HEAVY_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
 
+# Fast-command activity hint so background jobs can yield briefly to user-facing commands.
+_USER_ACTIVITY_TS = 0.0
+USER_ACTIVITY_COOLDOWN_SEC = int(os.getenv("USER_ACTIVITY_COOLDOWN_SEC", "20") or 20)
+
+def _mark_user_activity() -> None:
+    global _USER_ACTIVITY_TS
+    try:
+        _USER_ACTIVITY_TS = float(time.time())
+    except Exception:
+        _USER_ACTIVITY_TS = 0.0
+
+def _recent_user_activity(window_sec: int | None = None) -> bool:
+    try:
+        win = int(window_sec if window_sec is not None else USER_ACTIVITY_COOLDOWN_SEC)
+        return (float(time.time()) - float(_USER_ACTIVITY_TS or 0.0)) <= max(1, win)
+    except Exception:
+        return False
+
 
 import re
 import sqlite3
@@ -814,6 +832,7 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         cmd = txt.split()[0][1:].split("@")[0].strip().lower()
+        _mark_user_activity()
 
         # --- STATIC (function-local) caches to reduce DB hits / lag ---
         # Cache entries: { uid: {"ts": float, "access_ok": bool, "is_pro": bool} }
@@ -6497,15 +6516,15 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 74,
-    "LON": 73,
-    "ASIA": 75,
+    "NY": 73,
+    "LON": 72,
+    "ASIA": 72,
 }
 
 SESSION_MIN_RR_FINAL = {
-    "NY": 1.42,
-    "LON": 1.32,
-    "ASIA": 1.36,
+    "NY": 1.34,
+    "LON": 1.28,
+    "ASIA": 1.26,
 }
 
 SESSION_MIN_RR_TP = SESSION_MIN_RR_FINAL  # legacy compatibility only
@@ -6522,7 +6541,7 @@ def _session_generation_conf_floor(session_name: str) -> int:
             floor = int(SESSION_MIN_CONF.get(sess, MIN_SETUP_CONF))
             try:
                 if sess == 'ASIA' and _research_balance_reversal_mode(sess):
-                    floor = min(floor, 72)
+                    floor = min(floor, 69)
                 elif sess in {'LON', 'NY'} and _research_balance_reversal_mode(sess):
                     floor = min(floor, 72)
             except Exception:
@@ -6546,7 +6565,7 @@ def _session_generation_rr_floor(session_name: str) -> float:
             try:
                 if _research_balance_reversal_mode(sess):
                     if sess == 'ASIA':
-                        floor = min(floor, 1.24)
+                        floor = min(floor, 1.12)
                     elif sess in {'LON', 'NY'}:
                         floor = min(floor, 1.26)
             except Exception:
@@ -23334,6 +23353,8 @@ async def goal_profile_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def goal_profile_job(context: ContextTypes.DEFAULT_TYPE):
     try:
+        if _recent_user_activity(25):
+            return
         cfg = load_strategy_config(force=False)
         tgt = _goal_profile_targets(cfg)
         if not tgt['enabled']:
@@ -23357,6 +23378,8 @@ async def research_framework_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
     This watchdog must stay light so it cannot starve user commands on small Render instances.
     """
     try:
+        if _recent_user_activity(25):
+            return
         now_ts = float(time.time())
         cfg = load_strategy_config(force=False)
         if ALERT_LOCK.locked() or SCAN_LOCK.locked() or _SCREEN_LOCK.locked() or _goal_profile_is_running():
@@ -24494,8 +24517,8 @@ def make_setup(
             balance_reversal_override = False
             try:
                 if str(session_name).upper() == 'ASIA' and balance_reversal_mode:
-                    balance_reversal_override = (ratio >= 0.25) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
-                        abs(float(ch24 or 0.0)) >= 5.0 or abs(float(ch4_used or 0.0)) >= 0.25
+                    balance_reversal_override = (ratio >= 0.18) and (float(fut_vol or 0.0) >= 4_000_000.0) and (
+                        abs(float(ch24 or 0.0)) >= 4.0 or abs(float(ch4_used or 0.0)) >= 0.18
                     )
             except Exception:
                 balance_reversal_override = False
@@ -24510,11 +24533,11 @@ def make_setup(
         balance_reversal_side = ""
         try:
             if balance_reversal_mode:
-                rev_vol_floor = 7_000_000.0 if str(session_name).upper() == 'ASIA' else 9_000_000.0
-                up_ext = float(ch24 or 0.0) >= (5.5 if str(session_name).upper() == 'ASIA' else 9.0)
-                dn_ext = float(ch24 or 0.0) <= (-(5.5 if str(session_name).upper() == 'ASIA' else 9.0))
-                fade_long = dn_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) >= -0.02 or float(ch1 or 0.0) >= -0.10)
-                fade_short = up_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) <= 0.02 or float(ch1 or 0.0) <= 0.10)
+                rev_vol_floor = 5_500_000.0 if str(session_name).upper() == 'ASIA' else 9_000_000.0
+                up_ext = float(ch24 or 0.0) >= (4.0 if str(session_name).upper() == 'ASIA' else 9.0)
+                dn_ext = float(ch24 or 0.0) <= (-(4.0 if str(session_name).upper() == 'ASIA' else 9.0))
+                fade_long = dn_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) >= -0.04 or float(ch1 or 0.0) >= -0.16 or float(ch4_used or 0.0) >= -0.30)
+                fade_short = up_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) <= 0.04 or float(ch1 or 0.0) <= 0.16 or float(ch4_used or 0.0) <= 0.30)
                 if fade_long:
                     balance_reversal_side = 'BUY'
                     family_id_hint = 'F4_SWEEP_RECLAIM'
@@ -24555,26 +24578,26 @@ def make_setup(
                 min1, min4 = tf_align_mins_for_session(session_name)
                 balance_reversal_mode = _research_balance_reversal_mode(session_name)
                 if balance_reversal_mode:
-                    min1 = max(0.14, float(min1) * 0.35)
-                    min4 = max(0.08, float(min4) * 0.20)
+                    min1 = max(0.10, float(min1) * 0.28)
+                    min4 = max(0.05, float(min4) * 0.14)
                 if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                     if side == "BUY":
-                        asia_ok = bool(float(ch24 or 0.0) <= -6.0 and (float(ch15 or 0.0) >= -0.02 or float(ch1 or 0.0) >= -0.12))
+                        asia_ok = bool(float(ch24 or 0.0) <= -4.0 and (float(ch15 or 0.0) >= -0.05 or float(ch1 or 0.0) >= -0.18 or float(ch4 or 0.0) >= -0.35))
                         if not asia_ok:
                             _rej("asia_tf_align_fail_long", base, mv, f"f4_balance ch1={ch1:+.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}%")
                             return None
                     else:
-                        asia_ok = bool(float(ch24 or 0.0) >= 6.0 and (float(ch15 or 0.0) <= 0.02 or float(ch1 or 0.0) <= 0.12))
+                        asia_ok = bool(float(ch24 or 0.0) >= 4.0 and (float(ch15 or 0.0) <= 0.05 or float(ch1 or 0.0) <= 0.18 or float(ch4 or 0.0) <= 0.35))
                         if not asia_ok:
                             _rej("asia_tf_align_fail_short", base, mv, f"f4_balance ch1={ch1:+.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}%")
                             return None
                 elif side == "BUY":
-                    asia_ok = bool(ch1 >= min1 and (ch4 >= min4 or balance_reversal_mode and ch24 >= 6.0))
+                    asia_ok = bool(ch1 >= min1 and (ch4 >= min4 or balance_reversal_mode and ch24 >= 4.0))
                     if not asia_ok:
                         _rej("asia_tf_align_fail_long", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need>=({min1},{min4})")
                         return None
                 else:
-                    asia_ok = bool(ch1 <= -min1 and (ch4 <= -min4 or balance_reversal_mode and ch24 <= -6.0))
+                    asia_ok = bool(ch1 <= -min1 and (ch4 <= -min4 or balance_reversal_mode and ch24 <= -4.0))
                     if not asia_ok:
                         _rej("asia_tf_align_fail_short", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need<=(-{min1},-{min4})")
                         return None
@@ -24796,7 +24819,7 @@ def make_setup(
             if structure == opposite_trend and trend == opposite_trend:
                 if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                     notes.append(f"smc_structure_trend_soft_conflict={structure}/{trend}")
-                    conf = max(0.0, float(conf) - 6.0)
+                    conf = max(0.0, float(conf) - 3.0)
                 else:
                     _rej("pro_structure_trend_conflict", base, mv, f"side={side} structure={structure} trend={trend}")
                     return None
@@ -24940,7 +24963,7 @@ def make_setup(
             sess_min = int(_session_generation_conf_floor(session_name))
             if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                 if str(session_name or '').upper() == 'ASIA':
-                    sess_min = min(int(sess_min), 69)
+                    sess_min = min(int(sess_min), 66)
                 else:
                     sess_min = min(int(sess_min), 72)
             if str(session_name or '').upper() == 'NY' and require_pullback and family_id_hint != 'F4_SWEEP_RECLAIM':
@@ -24996,7 +25019,7 @@ def make_setup(
             sess_rr_min = float(_session_generation_rr_floor(session_name))
             if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                 if str(session_name or '').upper() == 'ASIA':
-                    sess_rr_min = min(float(sess_rr_min), 1.15)
+                    sess_rr_min = min(float(sess_rr_min), 1.08)
                 else:
                     sess_rr_min = min(float(sess_rr_min), 1.20)
             if str(session_name or '').upper() == 'NY' and require_pullback and family_id_hint != 'F4_SWEEP_RECLAIM':
@@ -31137,7 +31160,7 @@ def user_location_and_time(user: dict):
 # =========================================================
 # /screen fast cache (per-instance)
 # =========================================================
-SCREEN_CACHE_TTL_SEC = 90  # seconds
+SCREEN_CACHE_TTL_SEC = 150  # seconds
 SCREEN_STALE_CACHE_MAX_SEC = 420  # allow a more generous stale /screen when background jobs are busy
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 _SCREEN_CACHE: dict[str, dict] = {}
@@ -32694,12 +32717,12 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "28"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "20"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "55"))
-ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "210"))
-ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "1"))
-ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "10"))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "40"))
+ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "300"))
+ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "0"))
+ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "6"))
 ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING", True)
 ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.25") or 0.25)
 EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "600"))
@@ -32762,13 +32785,20 @@ def _alert_job_limit(name: str, default: int) -> int:
     """Safe lookup for alert-job limits and cache windows."""
     try:
         val = globals().get(name, default)
-        return max(1, int(val if val is not None else default))
+        limit = int(val if val is not None else default)
+        if 'BIGMOVE' in str(name or '').upper():
+            return max(0, limit)
+        return max(1, limit)
     except Exception:
+        if 'BIGMOVE' in str(name or '').upper():
+            return max(0, int(default))
         return max(1, int(default))
 
 async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
     # Prevent overlapping runs (JobQueue can overlap if a run is slow)
     if ALERT_LOCK.locked():
+        return
+    if _recent_user_activity(20):
         return
 
     async with ALERT_LOCK:
@@ -32848,7 +32878,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     users_bigmove = []
         except Exception:
             pass
-        users_bigmove = list(users_bigmove or [])[:_alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 3)]
+        users_bigmove = list(users_bigmove or [])[:_alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 0)]
         for u in users_bigmove:
             if _job_budget_exhausted():
                 logger.warning("alert_job bigmove loop budget exhausted after %.1fs", time.time() - job_started_ts)
@@ -33197,7 +33227,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # -----------------------------------------------------
         # Per-user send / skip logic
         # -----------------------------------------------------
-        notify_runtime = list(notify_runtime or [])[:_alert_job_limit('ALERT_JOB_NOTIFY_MAX_USERS', 18)]
+        notify_runtime = list(notify_runtime or [])[:_alert_job_limit('ALERT_JOB_NOTIFY_MAX_USERS', 6)]
         for meta in notify_runtime:
             if _job_budget_exhausted():
                 logger.warning("alert_job notify loop budget exhausted after %.1fs", time.time() - job_started_ts)
