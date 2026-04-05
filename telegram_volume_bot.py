@@ -6516,15 +6516,15 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 73,
-    "LON": 72,
-    "ASIA": 72,
+    "NY": 72,
+    "LON": 71,
+    "ASIA": 69,
 }
 
 SESSION_MIN_RR_FINAL = {
-    "NY": 1.34,
-    "LON": 1.28,
-    "ASIA": 1.26,
+    "NY": 1.30,
+    "LON": 1.24,
+    "ASIA": 1.18,
 }
 
 SESSION_MIN_RR_TP = SESSION_MIN_RR_FINAL  # legacy compatibility only
@@ -6541,9 +6541,9 @@ def _session_generation_conf_floor(session_name: str) -> int:
             floor = int(SESSION_MIN_CONF.get(sess, MIN_SETUP_CONF))
             try:
                 if sess == 'ASIA' and _research_balance_reversal_mode(sess):
-                    floor = min(floor, 69)
+                    floor = min(floor, 66)
                 elif sess in {'LON', 'NY'} and _research_balance_reversal_mode(sess):
-                    floor = min(floor, 72)
+                    floor = min(floor, 69)
             except Exception:
                 pass
             return int(floor)
@@ -6565,9 +6565,9 @@ def _session_generation_rr_floor(session_name: str) -> float:
             try:
                 if _research_balance_reversal_mode(sess):
                     if sess == 'ASIA':
-                        floor = min(floor, 1.12)
+                        floor = min(floor, 0.98)
                     elif sess in {'LON', 'NY'}:
-                        floor = min(floor, 1.26)
+                        floor = min(floor, 1.08)
             except Exception:
                 pass
             return float(floor)
@@ -19669,13 +19669,18 @@ async def learning_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
+    cached = _admin_status_cache_get('learning_status', ttl=45.0)
+    if cached:
+        await send_long_message(update, cached, parse_mode=None)
+        return
     try:
-        txt = await to_thread_heavy(_learning_status_text, False, False, timeout=45)
+        txt = await to_thread_heavy(_learning_status_text, False, False, timeout=30)
     except asyncio.TimeoutError:
         try:
             txt = _learning_status_text(False, True)
         except Exception:
             txt = "⚠️ Learning/optimizer status timed out. Try again shortly."
+    _admin_status_cache_put('learning_status', txt)
     await send_long_message(update, txt, parse_mode=None)
 
 
@@ -22360,7 +22365,12 @@ async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAU
     if not _is_admin(update):
         await update.message.reply_text('⛔ Admin only.')
         return
-    snap = await to_thread_heavy(_market_adaptive_status_snapshot, timeout=20)
+    snap = None
+    cached_text = _admin_status_cache_get('adaptive_status_text', ttl=45.0)
+    if cached_text:
+        await send_long_message(update, cached_text, parse_mode=None)
+        return
+    snap = await to_thread_heavy(_market_adaptive_status_snapshot, timeout=12)
     cfg = load_strategy_config(force=False)
     hb_state, hb_reason = _component_runtime_state('market_adaptive', max(7200, int(float((cfg or {}).get('market_adaptive_interval_hours', 24.0) or 24.0) * 7200)), enabled=_cfg_bool((cfg or {}).get('market_adaptive_enabled', True), True), no_data=False, waiting_text='waiting_for_daily_market_adaptive_cycle')
     last_run = snap.get('last_run') or {}
@@ -23660,11 +23670,11 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 77.0, 79, 1.40
+        quality, conf, rr = 76.0, 78, 1.36
     elif sess == "LON":
-        quality, conf, rr = 74.0, 76, 1.30
+        quality, conf, rr = 73.0, 75, 1.28
     elif sess == "ASIA":
-        quality, conf, rr = 75.0, 76, 1.30
+        quality, conf, rr = 73.0, 74, 1.24
     else:
         quality, conf, rr = 76.0, 78, 1.34
 
@@ -23678,9 +23688,21 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     except Exception:
         pass
 
-    quality = float(clamp(quality, 72.0, 92.0))
-    conf = int(max(74, min(95, conf)))
-    rr = float(clamp(rr, 1.30, 2.30))
+    try:
+        if _research_balance_reversal_mode(sess):
+            if sess == 'ASIA':
+                quality -= 2.0
+                conf -= 2
+                rr -= 0.08
+            elif sess in {'LON', 'NY'}:
+                quality -= 1.5
+                conf -= 1
+                rr -= 0.05
+    except Exception:
+        pass
+    quality = float(clamp(quality, 69.0, 92.0))
+    conf = int(max(72, min(95, conf)))
+    rr = float(clamp(rr, 1.18, 2.30))
     return (quality, conf, rr)
 
 
@@ -23818,13 +23840,13 @@ def is_executable_setup_eligible(
         # into a loose screen lane.
         if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
             if sess in {'LON', 'NY'}:
-                score_floor -= 2.25
-                conf_floor -= 1
-                rr_floor -= 0.04
-            else:
-                score_floor -= 2.00
+                score_floor -= 3.00
                 conf_floor -= 2
-                rr_floor -= 0.06
+                rr_floor -= 0.08
+            else:
+                score_floor -= 3.25
+                conf_floor -= 3
+                rr_floor -= 0.12
         elif fam == 'F2_MOMENTUM_IGNITION' and regime == 'EXPANSION':
             if sess in {'LON', 'NY'}:
                 score_floor -= 1.50
@@ -23911,13 +23933,13 @@ def is_executable_setup_eligible(
                 return (False, "lon_below_liquidity")
         elif sess == "ASIA":
             if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
-                if pb_dist > 0.92:
+                if pb_dist > 1.05:
                     return (False, "asia_entry_too_far_from_ema")
-                if ch15_abs > 0.88 or ch1_abs > 1.55:
+                if ch15_abs > 0.98 or ch1_abs > 1.70:
                     return (False, "asia_late_extension_exec")
-                if ch24_abs < 8.0:
+                if ch24_abs < 5.5:
                     return (False, "asia_context_too_weak_exec")
-                if fut_vol < float(max(MIN_FUT_VOL_USD * 0.82, 8_000_000.0)):
+                if fut_vol < float(max(MIN_FUT_VOL_USD * 0.70, 6_500_000.0)):
                     return (False, "asia_below_liquidity")
             else:
                 if pb_dist > 0.58:
@@ -23931,7 +23953,7 @@ def is_executable_setup_eligible(
 
         if engine == "A":
             if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
-                if sess == 'ASIA' and ch24_abs < 8.0:
+                if sess == 'ASIA' and ch24_abs < 5.0:
                     return (False, 'asia_balance_reclaim_too_weak')
                 return (True, "ok")
             if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
@@ -24516,10 +24538,16 @@ def make_setup(
             balance_reversal_mode = _research_balance_reversal_mode(session_name)
             balance_reversal_override = False
             try:
-                if str(session_name).upper() == 'ASIA' and balance_reversal_mode:
-                    balance_reversal_override = (ratio >= 0.18) and (float(fut_vol or 0.0) >= 4_000_000.0) and (
-                        abs(float(ch24 or 0.0)) >= 4.0 or abs(float(ch4_used or 0.0)) >= 0.18
-                    )
+                sess_u = str(session_name).upper()
+                if balance_reversal_mode:
+                    if sess_u == 'ASIA':
+                        balance_reversal_override = (ratio >= 0.15) and (float(fut_vol or 0.0) >= 3_500_000.0) and (
+                            abs(float(ch24 or 0.0)) >= 3.5 or abs(float(ch4_used or 0.0)) >= 0.14
+                        )
+                    elif sess_u in {'LON', 'NY'}:
+                        balance_reversal_override = (ratio >= 0.24) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
+                            abs(float(ch24 or 0.0)) >= 5.5 or abs(float(ch4_used or 0.0)) >= 0.22
+                        )
             except Exception:
                 balance_reversal_override = False
 
@@ -24533,11 +24561,11 @@ def make_setup(
         balance_reversal_side = ""
         try:
             if balance_reversal_mode:
-                rev_vol_floor = 5_500_000.0 if str(session_name).upper() == 'ASIA' else 9_000_000.0
-                up_ext = float(ch24 or 0.0) >= (4.0 if str(session_name).upper() == 'ASIA' else 9.0)
-                dn_ext = float(ch24 or 0.0) <= (-(4.0 if str(session_name).upper() == 'ASIA' else 9.0))
-                fade_long = dn_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) >= -0.04 or float(ch1 or 0.0) >= -0.16 or float(ch4_used or 0.0) >= -0.30)
-                fade_short = up_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) <= 0.04 or float(ch1 or 0.0) <= 0.16 or float(ch4_used or 0.0) <= 0.30)
+                rev_vol_floor = 5_000_000.0 if str(session_name).upper() == 'ASIA' else 7_000_000.0
+                up_ext = float(ch24 or 0.0) >= (3.5 if str(session_name).upper() == 'ASIA' else 6.5)
+                dn_ext = float(ch24 or 0.0) <= (-(3.5 if str(session_name).upper() == 'ASIA' else 6.5))
+                fade_long = dn_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) >= -0.08 or float(ch1 or 0.0) >= -0.24 or float(ch4_used or 0.0) >= -0.45)
+                fade_short = up_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) <= 0.08 or float(ch1 or 0.0) <= 0.24 or float(ch4_used or 0.0) <= 0.45)
                 if fade_long:
                     balance_reversal_side = 'BUY'
                     family_id_hint = 'F4_SWEEP_RECLAIM'
@@ -24582,12 +24610,12 @@ def make_setup(
                     min4 = max(0.05, float(min4) * 0.14)
                 if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                     if side == "BUY":
-                        asia_ok = bool(float(ch24 or 0.0) <= -4.0 and (float(ch15 or 0.0) >= -0.05 or float(ch1 or 0.0) >= -0.18 or float(ch4 or 0.0) >= -0.35))
+                        asia_ok = bool(float(ch24 or 0.0) <= -3.0 and (float(ch15 or 0.0) >= -0.10 or float(ch1 or 0.0) >= -0.28 or float(ch4 or 0.0) >= -0.50))
                         if not asia_ok:
                             _rej("asia_tf_align_fail_long", base, mv, f"f4_balance ch1={ch1:+.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}%")
                             return None
                     else:
-                        asia_ok = bool(float(ch24 or 0.0) >= 4.0 and (float(ch15 or 0.0) <= 0.05 or float(ch1 or 0.0) <= 0.18 or float(ch4 or 0.0) <= 0.35))
+                        asia_ok = bool(float(ch24 or 0.0) >= 3.0 and (float(ch15 or 0.0) <= 0.10 or float(ch1 or 0.0) <= 0.28 or float(ch4 or 0.0) <= 0.50))
                         if not asia_ok:
                             _rej("asia_tf_align_fail_short", base, mv, f"f4_balance ch1={ch1:+.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}%")
                             return None
@@ -24751,7 +24779,7 @@ def make_setup(
                 engine_c_ok = False
 
         if not engine_a_ok and not engine_b_ok and not engine_c_ok:
-            if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode and float(fut_vol or 0.0) >= 5_000_000.0 and abs(float(ch24 or 0.0)) >= 6.0:
+            if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode and float(fut_vol or 0.0) >= 4_000_000.0 and abs(float(ch24 or 0.0)) >= 4.5:
                 engine_a_ok = True
                 notes.append("🟡 f4_balance_reclaim_fallback")
             else:
@@ -25019,9 +25047,9 @@ def make_setup(
             sess_rr_min = float(_session_generation_rr_floor(session_name))
             if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                 if str(session_name or '').upper() == 'ASIA':
-                    sess_rr_min = min(float(sess_rr_min), 1.08)
+                    sess_rr_min = min(float(sess_rr_min), 0.98)
                 else:
-                    sess_rr_min = min(float(sess_rr_min), 1.20)
+                    sess_rr_min = min(float(sess_rr_min), 1.08)
             if str(session_name or '').upper() == 'NY' and require_pullback and family_id_hint != 'F4_SWEEP_RECLAIM':
                 sess_rr_min = max(float(sess_rr_min), float(_session_generation_rr_floor('NY')) + 0.05)
             if float(rr_final) < float(sess_rr_min):
@@ -25203,6 +25231,16 @@ def make_breakout_setup(
                     side = "BUY"
                 elif (ch4_used <= -4.0 and ch24 <= -12.0):
                     side = "SELL"
+                elif _research_balance_reversal_mode(session_name) and abs(float(ch24 or 0.0)) >= 7.0:
+                    # In BALANCE / reclaim regimes, allow a fade-style trigger when the 24h move is extreme
+                    # but the 1h/15m move is already stalling, instead of demanding a fresh HH/LL breakout.
+                    if float(ch24 or 0.0) >= 7.0 and float(ch15 or 0.0) <= 0.12 and float(ch1 or 0.0) <= 0.30:
+                        side = "SELL"
+                    elif float(ch24 or 0.0) <= -7.0 and float(ch15 or 0.0) >= -0.12 and float(ch1 or 0.0) >= -0.30:
+                        side = "BUY"
+                    else:
+                        _rej("no_breakout_trigger", base, mv)
+                        return None
                 else:
                     _rej("no_breakout_trigger", base, mv)
                     return None
@@ -32717,7 +32755,7 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "20"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "16"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
 ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "40"))
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "300"))
