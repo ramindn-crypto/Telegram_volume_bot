@@ -6541,9 +6541,9 @@ def _session_generation_conf_floor(session_name: str) -> int:
             floor = int(SESSION_MIN_CONF.get(sess, MIN_SETUP_CONF))
             try:
                 if sess == 'ASIA' and _research_balance_reversal_mode(sess):
-                    floor = min(floor, 66)
+                    floor = min(floor, 64)
                 elif sess in {'LON', 'NY'} and _research_balance_reversal_mode(sess):
-                    floor = min(floor, 67)
+                    floor = min(floor, 65)
             except Exception:
                 pass
             return int(floor)
@@ -6565,9 +6565,9 @@ def _session_generation_rr_floor(session_name: str) -> float:
             try:
                 if _research_balance_reversal_mode(sess):
                     if sess == 'ASIA':
-                        floor = min(floor, 0.98)
+                        floor = min(floor, 0.92)
                     elif sess in {'LON', 'NY'}:
-                        floor = min(floor, 1.00)
+                        floor = min(floor, 0.94)
             except Exception:
                 pass
             return float(floor)
@@ -23840,13 +23840,13 @@ def is_executable_setup_eligible(
         # into a loose screen lane.
         if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
             if sess in {'LON', 'NY'}:
-                score_floor -= 3.00
-                conf_floor -= 2
-                rr_floor -= 0.08
+                score_floor -= 4.50
+                conf_floor -= 4
+                rr_floor -= 0.14
             else:
-                score_floor -= 3.25
-                conf_floor -= 3
-                rr_floor -= 0.12
+                score_floor -= 4.75
+                conf_floor -= 5
+                rr_floor -= 0.18
         elif fam == 'F2_MOMENTUM_IGNITION' and regime == 'EXPANSION':
             if sess in {'LON', 'NY'}:
                 score_floor -= 1.50
@@ -23861,9 +23861,9 @@ def is_executable_setup_eligible(
             score_floor -= 0.75
             rr_floor -= 0.02
 
-        score_floor = float(clamp(score_floor, 65.0 if active_profile.startswith('GLOBAL_') else 68.0, 92.0))
-        conf_floor = int(max(74, min(95, conf_floor)))
-        rr_floor = float(clamp(rr_floor, 1.20 if active_profile.startswith('GLOBAL_') else 1.24, 2.30))
+        score_floor = float(clamp(score_floor, 63.0 if active_profile.startswith('GLOBAL_') else 68.0, 92.0))
+        conf_floor = int(max(70 if active_profile.startswith('GLOBAL_') else 74, min(95, conf_floor)))
+        rr_floor = float(clamp(rr_floor, 1.05 if active_profile.startswith('GLOBAL_') else 1.24, 2.30))
 
         if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
             pass
@@ -23872,8 +23872,7 @@ def is_executable_setup_eligible(
         elif 'TREND' not in regime and 'EXPANSION' not in regime:
             return (False, 'regime_not_trend')
         if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
-            if want and (want not in trend and want not in structure):
-                return (False, 'trend_structure_not_aligned')
+            pass
         elif want and (want not in trend or want not in structure):
             return (False, 'trend_structure_not_aligned')
 
@@ -24541,12 +24540,12 @@ def make_setup(
                 sess_u = str(session_name).upper()
                 if balance_reversal_mode:
                     if sess_u == 'ASIA':
-                        balance_reversal_override = (ratio >= 0.15) and (float(fut_vol or 0.0) >= 3_500_000.0) and (
-                            abs(float(ch24 or 0.0)) >= 3.5 or abs(float(ch4_used or 0.0)) >= 0.14
+                        balance_reversal_override = (ratio >= 0.10) and (float(fut_vol or 0.0) >= 2_500_000.0) and (
+                            abs(float(ch24 or 0.0)) >= 2.5 or abs(float(ch4_used or 0.0)) >= 0.10
                         )
                     elif sess_u in {'LON', 'NY'}:
-                        balance_reversal_override = (ratio >= 0.18) and (float(fut_vol or 0.0) >= 4_500_000.0) and (
-                            abs(float(ch24 or 0.0)) >= 4.5 or abs(float(ch4_used or 0.0)) >= 0.18
+                        balance_reversal_override = (ratio >= 0.10) and (float(fut_vol or 0.0) >= 3_000_000.0) and (
+                            abs(float(ch24 or 0.0)) >= 3.5 or abs(float(ch4_used or 0.0)) >= 0.12
                         )
             except Exception:
                 balance_reversal_override = False
@@ -24561,11 +24560,11 @@ def make_setup(
         balance_reversal_side = ""
         try:
             if balance_reversal_mode:
-                rev_vol_floor = 4_500_000.0 if str(session_name).upper() == 'ASIA' else 6_000_000.0
-                up_ext = float(ch24 or 0.0) >= (3.5 if str(session_name).upper() == 'ASIA' else 5.5)
-                dn_ext = float(ch24 or 0.0) <= (-(3.5 if str(session_name).upper() == 'ASIA' else 5.5))
-                fade_long = dn_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) >= -0.12 or float(ch1 or 0.0) >= -0.30 or float(ch4_used or 0.0) >= -0.55)
-                fade_short = up_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) <= 0.12 or float(ch1 or 0.0) <= 0.30 or float(ch4_used or 0.0) <= 0.55)
+                rev_vol_floor = 3_000_000.0 if str(session_name).upper() == 'ASIA' else 4_000_000.0
+                up_ext = float(ch24 or 0.0) >= (2.8 if str(session_name).upper() == 'ASIA' else 4.2)
+                dn_ext = float(ch24 or 0.0) <= (-(2.8 if str(session_name).upper() == 'ASIA' else 4.2))
+                fade_long = dn_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) >= -0.18 or float(ch1 or 0.0) >= -0.36 or float(ch4_used or 0.0) >= -0.70)
+                fade_short = up_ext and float(fut_vol or 0.0) >= rev_vol_floor and (float(ch15 or 0.0) <= 0.18 or float(ch1 or 0.0) <= 0.36 or float(ch4_used or 0.0) <= 0.70)
                 if fade_long:
                     balance_reversal_side = 'BUY'
                     family_id_hint = 'F4_SWEEP_RECLAIM'
@@ -24779,7 +24778,7 @@ def make_setup(
                 engine_c_ok = False
 
         if not engine_a_ok and not engine_b_ok and not engine_c_ok:
-            if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode and float(fut_vol or 0.0) >= 4_000_000.0 and abs(float(ch24 or 0.0)) >= 4.5:
+            if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode and float(fut_vol or 0.0) >= 2_500_000.0 and abs(float(ch24 or 0.0)) >= 3.0:
                 engine_a_ok = True
                 notes.append("🟡 f4_balance_reclaim_fallback")
             else:
@@ -24847,7 +24846,7 @@ def make_setup(
             if structure == opposite_trend and trend == opposite_trend:
                 if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                     notes.append(f"smc_structure_trend_soft_conflict={structure}/{trend}")
-                    conf = max(0.0, float(conf) - 2.0)
+                    conf = max(0.0, float(conf) - 1.0)
                 else:
                     _rej("pro_structure_trend_conflict", base, mv, f"side={side} structure={structure} trend={trend}")
                     return None
@@ -24891,9 +24890,13 @@ def make_setup(
                 conf += 2 + min(2, max(0, smf_score - 2))
             elif (side == "BUY" and smf_sell) or (side == "SELL" and smf_buy):
                 # Strong opposite smart-money signature: avoid
-                _rej("smart_money_opposes_side_soft", base, mv, f"side={side} smf={smf_event} score={smf_score} structure={structure} trend={trend}")
-                conf -= 6
-                notes.append("smf_opposes_soft")
+                if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
+                    notes.append("smf_opposes_soft")
+                    conf -= 3
+                else:
+                    _rej("smart_money_opposes_side_soft", base, mv, f"side={side} smf={smf_event} score={smf_score} structure={structure} trend={trend}")
+                    conf -= 6
+                    notes.append("smf_opposes_soft")
             # Require at least 2 of 3 core confirmations for aggressive momentum setups.
             if engine == "B":
                 core_hits = 0
@@ -24966,11 +24969,19 @@ def make_setup(
 
         thr = clamp(max(12.0, 2.5 * ((atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0)), 12.0, 22.0)
         if side == "BUY" and ch24 <= -thr:
-            _rej("24h_contradiction_for_long", base, mv, f"ch24={ch24:+.1f}% <= -{thr:.1f}%")
-            return None
+            if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
+                notes.append("f4_24h_contradiction_soft")
+                conf = max(0.0, float(conf) - 2.0)
+            else:
+                _rej("24h_contradiction_for_long", base, mv, f"ch24={ch24:+.1f}% <= -{thr:.1f}%")
+                return None
         if side == "SELL" and ch24 >= +thr:
-            _rej("24h_contradiction_for_short", base, mv, f"ch24={ch24:+.1f}% >= +{thr:.1f}%")
-            return None
+            if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
+                notes.append("f4_24h_contradiction_soft")
+                conf = max(0.0, float(conf) - 2.0)
+            else:
+                _rej("24h_contradiction_for_short", base, mv, f"ch24={ch24:+.1f}% >= +{thr:.1f}%")
+                return None
 
         is_confirm_15m = abs(ch15) >= CONFIRM_15M_ABS_MIN
         is_early_allowed = (abs(ch1) >= EARLY_1H_ABS_MIN)
@@ -24979,7 +24990,7 @@ def make_setup(
             if (not is_confirm_15m) and (not is_early_allowed):
                 if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                     notes.append('🟡 f4_weak15m_soft')
-                    conf = max(0.0, float(conf) - 4.0)
+                    conf = max(0.0, float(conf) - 2.0)
                 else:
                     _rej("15m_weak_and_not_early", base, mv, f"ch15={ch15:+.2f}% ch1={ch1:+.2f}%")
                     return None
@@ -24995,9 +25006,9 @@ def make_setup(
             sess_min = int(_session_generation_conf_floor(session_name))
             if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                 if str(session_name or '').upper() == 'ASIA':
-                    sess_min = min(int(sess_min), 66)
+                    sess_min = min(int(sess_min), 62)
                 else:
-                    sess_min = min(int(sess_min), 72)
+                    sess_min = min(int(sess_min), 64)
             if str(session_name or '').upper() == 'NY' and require_pullback and family_id_hint != 'F4_SWEEP_RECLAIM':
                 sess_min = max(int(sess_min), int(_session_generation_conf_floor('NY')) + 2)
             if int(conf) < int(sess_min):
@@ -25051,9 +25062,9 @@ def make_setup(
             sess_rr_min = float(_session_generation_rr_floor(session_name))
             if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                 if str(session_name or '').upper() == 'ASIA':
-                    sess_rr_min = min(float(sess_rr_min), 0.98)
+                    sess_rr_min = min(float(sess_rr_min), 0.88)
                 else:
-                    sess_rr_min = min(float(sess_rr_min), 1.08)
+                    sess_rr_min = min(float(sess_rr_min), 0.94)
             if str(session_name or '').upper() == 'NY' and require_pullback and family_id_hint != 'F4_SWEEP_RECLAIM':
                 sess_rr_min = max(float(sess_rr_min), float(_session_generation_rr_floor('NY')) + 0.05)
             if float(rr_final) < float(sess_rr_min):
