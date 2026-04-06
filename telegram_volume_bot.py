@@ -1193,7 +1193,7 @@ def _strategy_config_defaults() -> dict:
         "governor_target_hi": 3.0,
         "governor_step_score": 1.0,         # +/- points applied to quality_score_min_email when adjusting
         "governor_score_min": 52.0,         # absolute lower bound for quality_score_min_email
-        "governor_score_max": 82.0,         # absolute upper bound for quality_score_min_email
+        "governor_score_max": 70.0,         # absolute upper bound for quality_score_min_email
         "governor_apply_to": "email",       # 'email' (safe) or 'email+screen'
         "governor_last_adjust_ts": 0.0,
 
@@ -1616,22 +1616,22 @@ def _strategy_config_bootstrap_recommendations() -> None:
         # silently keep the bot above the 1–3 setups/day target after redeploy.
         try:
             q_screen = float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
-            if q_screen > 66.0:
-                cfg['quality_score_min_screen'] = 66.0
+            if q_screen > 64.0:
+                cfg['quality_score_min_screen'] = 64.0
                 changed = True
         except Exception:
             pass
         try:
             q_email = float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
-            if q_email > 70.0:
-                cfg['quality_score_min_email'] = 70.0
+            if q_email > 68.0:
+                cfg['quality_score_min_email'] = 68.0
                 changed = True
         except Exception:
             pass
         try:
             rr_live = float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP)
-            if rr_live > 1.46:
-                cfg['min_rr_tp'] = 1.46
+            if rr_live > 1.40:
+                cfg['min_rr_tp'] = 1.40
                 changed = True
         except Exception:
             pass
@@ -4996,15 +4996,18 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
 
     if float(live_open_risk_charged_today or 0.0) <= 0.0:
         live_open_risk_charged_today = float(current_day_open_risk)
-    daily_used_total = max(0.0, float(live_open_risk_charged_today) - float(realized_pnl_today))
-    remaining_raw = float("inf") if cap <= 0 else (float(cap) - float(daily_used_total))
+    raw_daily_used_total = max(0.0, float(live_open_risk_charged_today) - float(realized_pnl_today))
+    effective_daily_used_total, reset_credit = _risk_day_reset_effective_used(int(uid), user, raw_daily_used_total)
+    remaining_raw = float("inf") if cap <= 0 else (float(cap) - float(effective_daily_used_total))
     over_by = abs(float(remaining_raw)) if cap > 0 and remaining_raw < 0 else 0.0
 
     return {
         "cap": float(cap),
         "open_risk": float(current_total_open_risk),
         "used_risk": float(current_day_open_risk),
-        "used_total": float(daily_used_total),
+        "used_total": float(effective_daily_used_total),
+        "used_total_raw": float(raw_daily_used_total),
+        "risk_reset_credit": float(reset_credit),
         "open_pnl": float(open_pnl),
         "realized_pnl_today": float(realized_pnl_today),
         "realized_loss_today": float(realized_loss_today),
@@ -9548,6 +9551,17 @@ def db_init():
     """)
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS risk_day_reset_credits (
+        user_id INTEGER NOT NULL,
+        day_local TEXT NOT NULL,
+        credit_usd REAL NOT NULL DEFAULT 0.0,
+        reset_ts REAL NOT NULL DEFAULT 0.0,
+        note TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (user_id, day_local)
+    )
+    """)
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS setup_counter (
         day_yyyymmdd TEXT PRIMARY KEY,
         seq INTEGER NOT NULL
@@ -10696,6 +10710,47 @@ def _risk_daily_inc(user_id: int, day_local: str, inc_usd: float):
     con.commit()
     con.close()
 
+def _risk_day_reset_credit_get(user_id: int, day_local: str) -> float:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT credit_usd FROM risk_day_reset_credits WHERE user_id=? AND day_local=?", (int(user_id), str(day_local)))
+    row = cur.fetchone()
+    con.close()
+    try:
+        return float((row["credit_usd"] if row and "credit_usd" in row.keys() else (row[0] if row else 0.0)) or 0.0)
+    except Exception:
+        return 0.0
+
+def _risk_day_reset_credit_set(user_id: int, day_local: str, credit_usd: float, note: str = ""):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO risk_day_reset_credits (user_id, day_local, credit_usd, reset_ts, note)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, day_local) DO UPDATE SET
+            credit_usd=excluded.credit_usd,
+            reset_ts=excluded.reset_ts,
+            note=excluded.note
+    """, (int(user_id), str(day_local), float(max(0.0, credit_usd or 0.0)), float(time.time()), str(note or "")))
+    con.commit()
+    con.close()
+
+def _risk_day_reset_credit_clear(user_id: int, day_local: str):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("DELETE FROM risk_day_reset_credits WHERE user_id=? AND day_local=?", (int(user_id), str(day_local)))
+    con.commit()
+    con.close()
+
+def _risk_day_reset_effective_used(user_id: int, user: dict, raw_used_usd: float) -> tuple[float, float]:
+    try:
+        day_local = _user_day_local(user)
+    except Exception:
+        day_local = datetime.now(_user_tzinfo(user)).date().isoformat()
+    credit = float(_risk_day_reset_credit_get(int(user_id), str(day_local)) or 0.0)
+    effective = max(0.0, float(raw_used_usd or 0.0) - credit)
+    return float(effective), float(credit)
+
 def _user_day_local(user: dict) -> str:
     start_local, _, _ = _user_today_window(user)
     return start_local.date().isoformat()
@@ -10804,18 +10859,19 @@ def _pnl_today_closed_trades(user_id: int, user: dict) -> float:
     return float(total)
 
 def _risk_used_total_today(user_id: int, user: dict) -> float:
-    """Daily used risk = current open risk minus realized net PnL for the active day window.
+    """Daily used risk = current open risk minus realized net PnL, with optional admin reset credit.
 
     Governance model:
     - losses reduce remaining capacity
     - profits restore capacity
-    - remaining risk is never shown above the daily cap
+    - admins can baseline-reset the current day without deleting exchange history
     """
     day_local = _user_day_local(user)
     open_risk = _risk_used_today_from_open_trades(user_id, user, day_local)
     pnl_today = _pnl_today_closed_trades(user_id, user)
-    used = float(open_risk) - float(pnl_today)
-    return float(max(0.0, used))
+    raw_used = float(max(0.0, float(open_risk) - float(pnl_today)))
+    effective_used, _credit = _risk_day_reset_effective_used(int(user_id), user, raw_used)
+    return float(effective_used)
 
 def _admin_today_window_utc(now_utc: Optional[datetime] = None, uid: Optional[int] = None, user: Optional[dict] = None) -> tuple[datetime, datetime]:
     """Admin active trading day in UTC, derived from the admin user's timezone + /dayreset."""
@@ -11023,6 +11079,8 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["inherited_open_positions"] = int(m.get("inherited_open_positions") or 0)
         snap["realized_loss_today"] = float(m.get("realized_loss_today") or 0.0)
         snap["used_today"] = float(m.get("used_total") or 0.0)
+        snap["used_today_raw"] = float(m.get("used_total_raw") or m.get("used_total") or 0.0)
+        snap["risk_reset_credit"] = float(m.get("risk_reset_credit") or 0.0)
         snap["live_open_risk_charged_today"] = float(m.get("live_open_risk_charged_today") or m.get("current_day_open_risk") or 0.0)
         rem = float(m.get("remaining")) if snap["cap"] > 0 else float("inf")
         snap["remaining_today"] = max(0.0, rem) if math.isfinite(rem) and snap["cap"] > 0 else rem
@@ -11038,7 +11096,8 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         current_day_open_risk = float(pm.get('current_day_open_risk') or 0.0)
         current_total_open_risk = float(pm.get('current_total_open_risk') or 0.0)
         carried_open_risk = float(pm.get('carried_open_risk') or 0.0)
-        used_today = float(max(0.0, current_day_open_risk - pnl_today))
+        raw_used_today = float(max(0.0, current_day_open_risk - pnl_today))
+        used_today, reset_credit = _risk_day_reset_effective_used(int(uid), user, raw_used_today)
         remaining_raw = float("inf") if cap <= 0 else (cap - used_today)
         opened_today = int(pm.get('opened_today_count') or 0)
         closed_today = int(pm.get('closed_today_count') or 0)
@@ -11058,6 +11117,8 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
             "remaining_new_positions_today": max(0, trade_limit - opened_today) if trade_limit > 0 else 0,
             "realized_loss_today": max(0.0, -pnl_today),
             "used_today": used_today,
+            "used_today_raw": raw_used_today,
+            "risk_reset_credit": float(reset_credit),
             "remaining_today": max(0.0, remaining_raw) if cap > 0 else float("inf"),
             "over_by": max(0.0, -remaining_raw) if cap > 0 else 0.0,
             "pnl_today": pnl_today,
@@ -15997,8 +16058,8 @@ def rr_to_tp(entry: float, sl: float, tp: float) -> float:
 # - Used by both /screen and email selection, and by backtests.
 # =========================================================
 
-QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "66"))
-QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "74"))
+QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "64"))
+QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "68"))
 
 # Soft throttling: how many candidates we score before slicing (keeps compute bounded)
 QUALITY_SCORE_CAND_MULT_SCREEN = int(os.environ.get("QUALITY_SCORE_CAND_MULT_SCREEN", "8"))
@@ -21899,12 +21960,13 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
             return float(lo), float(hi)
 
     qlo, qhi = _rng('quality_score_min_screen', 52.0, 70.0)
-    out['quality_score_min_screen'] = float(clamp(float(out.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), max(qlo, 60.0), qhi))
-    email_lo = max(qlo + 8.0, 72.0)
-    email_hi = min(qhi + 14.0, 90.0)
+    screen_hi = min(qhi, 66.0)
+    out['quality_score_min_screen'] = float(clamp(float(out.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), max(qlo, 58.0), screen_hi))
+    email_lo = max(qlo + 4.0, 64.0)
+    email_hi = min(screen_hi + 4.0, 70.0)
     out['quality_score_min_email'] = float(clamp(float(out.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), email_lo, email_hi))
     rrlo, rrhi = _rng('min_rr_tp', 1.3, 2.4)
-    out['min_rr_tp'] = float(clamp(float(out.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), rrlo, rrhi))
+    out['min_rr_tp'] = float(clamp(float(out.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), rrlo, min(rrhi, 1.55)))
     alo, ahi = _rng('atr_min_pct', 0.4, 1.5)
     out['atr_min_pct'] = float(clamp(float(out.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT), alo, ahi))
     tlo, thi = _rng('tf_align_1h_min_abs', 0.3, 1.2)
@@ -23568,9 +23630,9 @@ def _family_autotune_clamp_cfg(cfg: dict) -> dict:
     cfg['family_f4_balance_pb_relax'] = round(_clamp(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0), 0.0, 0.60), 3)
     cfg['family_f4_balance_ch1_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0), 0.0, 1.10), 3)
     cfg['family_f4_balance_ch15_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0), 0.0, 0.55), 3)
-    cfg['quality_score_min_screen'] = round(_clamp(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), 50.0, 80.0), 2)
-    cfg['quality_score_min_email'] = round(_clamp(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), 58.0, 86.0), 2)
-    cfg['min_rr_tp'] = round(_clamp(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), 0.96, 1.80), 3)
+    cfg['quality_score_min_screen'] = round(_clamp(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), 50.0, 66.0), 2)
+    cfg['quality_score_min_email'] = round(_clamp(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), 58.0, 70.0), 2)
+    cfg['min_rr_tp'] = round(_clamp(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), 0.96, 1.55), 3)
     cfg['tf_align_1h_min_abs'] = round(_clamp(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), 0.20, 1.20), 3)
     return cfg
 
@@ -23849,11 +23911,11 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
 
         if engine == 'A':
             if sess == 'LON':
-                lon_ctx_ch4_min = 0.48 if reach_mode else 0.64
-                lon_ctx_ch1_min = 0.18 if reach_mode else 0.30
+                lon_ctx_ch4_min = 0.42 if reach_mode else 0.56
+                lon_ctx_ch1_min = 0.14 if reach_mode else 0.24
                 if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                     return (False, 'lon_pullback_context_too_weak')
-            if sess == 'NY' and (ch4_abs < 0.80 or ch1_abs < 0.42):
+            if sess == 'NY' and (ch4_abs < 0.72 or ch1_abs < 0.36):
                 return (False, 'ny_pullback_context_too_weak')
             if sess == 'ASIA':
                 if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
@@ -27919,6 +27981,7 @@ async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Per-trade risk is separate: /riskmode\n\n"
             "Set examples:\n"
             "• /dailycap pct 5\n"
+            "• /dailycap pct 100\n"
             "• /dailycap usd 60"
         )
         return
@@ -27933,8 +27996,8 @@ async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode not in {"PCT", "USD"}:
         await update.message.reply_text("Mode must be pct or usd")
         return
-    if mode == "PCT" and not (0.0 <= val <= 30):
-        await update.message.reply_text("pct/day should be between 0 and 30")
+    if mode == "PCT" and not (0.0 <= val <= 100):
+        await update.message.reply_text("pct/day should be between 0 and 100")
         return
     if mode == "USD" and val < 0:
         await update.message.reply_text("usd/day must be >= 0")
@@ -27944,6 +28007,61 @@ async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
     await update.message.reply_text(
         f"✅ Daily risk cap updated: {mode} {float(val):.2f} (≈ ${daily_cap_usd(user):.2f} per day)"
+    )
+
+
+
+async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: baseline-reset current day risk so remaining daily cap is restored."""
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    user = reset_daily_if_needed(get_user(uid) or {})
+    day_local = _user_day_local(user)
+    cap = float(daily_cap_usd(user) or 0.0)
+    snap = _accounting_snapshot(uid, user, is_admin=True)
+    raw_used = float(snap.get('used_today_raw', snap.get('used_today', 0.0)) or 0.0)
+    effective_used = float(snap.get('used_today', 0.0) or 0.0)
+    existing_credit = float(snap.get('risk_reset_credit', 0.0) or 0.0)
+
+    action = str((context.args[0] if context.args else "reset") or "reset").strip().lower()
+    if action in {"show", "status"}:
+        await update.message.reply_text(
+            "🧮 Daily Risk Reset Status\n"
+            f"• Trading day: {snap.get('today_window_label')}\n"
+            f"• Daily cap: {str(user.get('daily_cap_mode','PCT')).upper()} {float(user.get('daily_cap_value',0.0) or 0.0):.2f} (≈ ${cap:.2f})\n"
+            f"• Raw used today: ${raw_used:.2f}\n"
+            f"• Reset credit: ${existing_credit:.2f}\n"
+            f"• Effective used today: ${effective_used:.2f}\n"
+            f"• Remaining today: {'∞' if cap <= 0 else f'${max(0.0, cap - effective_used):.2f}'}\n\n"
+            "Commands:\n"
+            "• /dayrisk_reset\n"
+            "• /dayrisk_reset clear"
+        )
+        return
+
+    if action in {"clear", "restore", "undo"}:
+        _risk_day_reset_credit_clear(uid, day_local)
+        snap2 = _accounting_snapshot(uid, user, is_admin=True)
+        await update.message.reply_text(
+            "✅ Daily risk reset cleared.\n"
+            f"• Trading day: {snap2.get('today_window_label')}\n"
+            f"• Daily risk used: ${float(snap2.get('used_today', 0.0) or 0.0):.2f}\n"
+            f"• Daily risk remaining: {'∞' if not math.isfinite(float(snap2.get('remaining_today', float('inf')))) else f'${float(snap2.get('remaining_today', 0.0) or 0.0):.2f}'}"
+        )
+        return
+
+    _risk_day_reset_credit_set(uid, day_local, raw_used, note="admin_dayrisk_reset")
+    snap2 = _accounting_snapshot(uid, user, is_admin=True)
+    await update.message.reply_text(
+        "✅ Daily risk baseline reset for the active trading day.\n"
+        f"• Trading day: {snap2.get('today_window_label')}\n"
+        f"• Previous raw used: ${raw_used:.2f}\n"
+        f"• Reset credit now applied: ${float(snap2.get('risk_reset_credit', 0.0) or 0.0):.2f}\n"
+        f"• Daily risk used now: ${float(snap2.get('used_today', 0.0) or 0.0):.2f}\n"
+        f"• Daily risk remaining now: {'∞' if not math.isfinite(float(snap2.get('remaining_today', float('inf')))) else f'${float(snap2.get('remaining_today', 0.0) or 0.0):.2f}'}\n\n"
+        "Use /dayrisk_reset clear to restore the original day accounting."
     )
 
 
@@ -28981,6 +29099,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Total open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
         f"• Realised net today: ${pnl_today:+.2f}",
         f"• Daily risk used (open risk - realised net): ${used_today:.2f}",
+        f"• Daily risk reset credit: ${float(snap.get('risk_reset_credit', 0.0) or 0.0):.2f}" if float(snap.get('risk_reset_credit', 0.0) or 0.0) > 0 else None,
         f"• Daily risk remaining: {'∞' if not math.isfinite(float(remaining_today)) else f'${float(remaining_today):.2f}'}",
         SEP,
         'Alerts & sessions',
@@ -28997,6 +29116,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Trade window: {tw_txt}",
         f"• Today basis: {snap.get('today_basis')}",
     ]
+    lines = [ln for ln in lines if ln]
     if over_by > 0:
         lines.append(f"⚠️ Over daily cap by ${over_by:.2f}")
 
@@ -34473,6 +34593,7 @@ async def _post_init(app: Application):
             BotCommand("equity", "Set your equity"),
             BotCommand("riskmode", "Set your per-trade risk (used by /size)"),
             BotCommand("dailycap", "Set your total daily risk cap"),
+            BotCommand("dayrisk_reset", "Admin: reset today risk usage"),
             BotCommand("size", "Position size calculator"),
 
             BotCommand("trade_open", "Log an opened position"),
@@ -35599,6 +35720,7 @@ def main():
     app.add_handler(CommandHandler("equity_reset", equity_reset_cmd, block=False))
     app.add_handler(CommandHandler("riskmode", riskmode_cmd, block=False))
     app.add_handler(CommandHandler("dailycap", dailycap_cmd, block=False))
+    app.add_handler(CommandHandler("dayrisk_reset", dayrisk_reset_cmd, block=False))
     app.add_handler(CommandHandler("limits", limits_cmd, block=False))
 
     app.add_handler(CommandHandler("trade_sl", trade_sl_cmd, block=False))
