@@ -23473,16 +23473,16 @@ def _family_autotune_data_snapshot(hours: int = 24) -> dict:
 
 def _family_autotune_clamp_cfg(cfg: dict) -> dict:
     cfg = dict(cfg or {})
-    cfg['family_f4_balance_score_relax'] = round(_clamp(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0), 0.0, 4.0), 2)
-    cfg['family_f4_balance_conf_relax'] = int(_clamp(int(float(cfg.get('family_f4_balance_conf_relax', 0) or 0)), 0, 6))
-    cfg['family_f4_balance_rr_relax'] = round(_clamp(float(cfg.get('family_f4_balance_rr_relax', 0.0) or 0.0), 0.0, 0.25), 3)
-    cfg['family_f4_balance_pb_relax'] = round(_clamp(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0), 0.0, 0.40), 3)
-    cfg['family_f4_balance_ch1_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0), 0.0, 0.80), 3)
-    cfg['family_f4_balance_ch15_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0), 0.0, 0.40), 3)
-    cfg['quality_score_min_screen'] = round(_clamp(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), 60.0, 80.0), 2)
-    cfg['quality_score_min_email'] = round(_clamp(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), 66.0, 86.0), 2)
-    cfg['min_rr_tp'] = round(_clamp(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), 1.20, 1.80), 3)
-    cfg['tf_align_1h_min_abs'] = round(_clamp(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), 0.30, 1.20), 3)
+    cfg['family_f4_balance_score_relax'] = round(_clamp(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0), 0.0, 6.0), 2)
+    cfg['family_f4_balance_conf_relax'] = int(_clamp(int(float(cfg.get('family_f4_balance_conf_relax', 0) or 0)), 0, 8))
+    cfg['family_f4_balance_rr_relax'] = round(_clamp(float(cfg.get('family_f4_balance_rr_relax', 0.0) or 0.0), 0.0, 0.35), 3)
+    cfg['family_f4_balance_pb_relax'] = round(_clamp(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0), 0.0, 0.60), 3)
+    cfg['family_f4_balance_ch1_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0), 0.0, 1.10), 3)
+    cfg['family_f4_balance_ch15_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0), 0.0, 0.55), 3)
+    cfg['quality_score_min_screen'] = round(_clamp(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), 56.0, 80.0), 2)
+    cfg['quality_score_min_email'] = round(_clamp(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), 64.0, 86.0), 2)
+    cfg['min_rr_tp'] = round(_clamp(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), 1.12, 1.80), 3)
+    cfg['tf_align_1h_min_abs'] = round(_clamp(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), 0.20, 1.20), 3)
     return cfg
 
 
@@ -23503,7 +23503,10 @@ def _run_family_autotune_cycle(force: bool = False) -> dict:
         snap = _family_autotune_data_snapshot(24)
         rejects = _family_autotune_latest_reject_agg()
         plans = {s: _research_latest_allocator_plan(s, '') or {} for s in ['ASIA', 'LON', 'NY']}
+        active_champions = {str((plans.get(s) or {}).get('champion_family_id') or '') for s in plans}
+        active_regimes = {str((plans.get(s) or {}).get('regime_cell') or '').upper() for s in plans}
         balance_f4 = any(str((plans.get(s) or {}).get('champion_family_id') or '') == 'F4_SWEEP_RECLAIM' and str((plans.get(s) or {}).get('regime_cell') or '').upper() in {'BALANCE', 'EXHAUSTION'} for s in plans)
+        trend_active = bool(active_regimes & {'TREND_UP', 'TREND_DOWN', 'EXPANSION'})
         mrep = load_goal_profile_report() or {}
         final = dict((mrep or {}).get('final') or {})
         m30 = dict(final.get('metrics_30d') or {})
@@ -23511,7 +23514,7 @@ def _run_family_autotune_cycle(force: bool = False) -> dict:
         spd30 = float(m30.get('setups_per_day') or 0.0)
 
         actions = []
-        max_actions = int((cfg or {}).get('family_autotune_max_actions_per_run', 4) or 4)
+        max_actions = int((cfg or {}).get('family_autotune_max_actions_per_run', 6) or 6)
         def act(key, new_val, why):
             nonlocal actions, cfg
             if len(actions) >= max_actions:
@@ -23522,21 +23525,35 @@ def _run_family_autotune_cycle(force: bool = False) -> dict:
             cfg[key] = new_val
             actions.append({'key': key, 'old': old, 'new': new_val, 'why': why})
 
-        low_flow = int(snap.get('signals', 0) or 0) < 1 and int(snap.get('emailed', 0) or 0) < 1
+        total_flow = max(int(snap.get('signals', 0) or 0), int(snap.get('executable', 0) or 0), int(snap.get('emailed', 0) or 0))
+        low_flow = total_flow < 2
+        severe_drought = total_flow < 1
+
         if balance_f4 and low_flow:
-            if int(rejects.get('no_breakout_trigger', 0) or 0) >= 3 or int(rejects.get('no_engine_passed', 0) or 0) >= 3:
-                act('family_f4_balance_score_relax', round(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0) + 0.5, 2), 'low_flow_balance_no_breakout')
-                act('family_f4_balance_pb_relax', round(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0) + 0.05, 3), 'low_flow_balance_no_breakout')
-                act('family_f4_balance_ch1_relax', round(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0) + 0.08, 3), 'low_flow_balance_no_breakout')
-                act('family_f4_balance_ch15_relax', round(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0) + 0.04, 3), 'low_flow_balance_no_breakout')
+            if int(rejects.get('no_breakout_trigger', 0) or 0) >= 1 or int(rejects.get('no_engine_passed', 0) or 0) >= 2:
+                act('family_f4_balance_score_relax', round(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0) + 0.75, 2), 'balance_low_flow_breakout')
+                act('family_f4_balance_pb_relax', round(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0) + 0.08, 3), 'balance_low_flow_breakout')
+                act('family_f4_balance_ch1_relax', round(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0) + 0.12, 3), 'balance_low_flow_breakout')
+                act('family_f4_balance_ch15_relax', round(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0) + 0.06, 3), 'balance_low_flow_breakout')
             if int(rejects.get('below_min_confidence', 0) or 0) >= 2:
-                act('family_f4_balance_conf_relax', int(float(cfg.get('family_f4_balance_conf_relax', 0) or 0)) + 1, 'low_flow_balance_conf')
-                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.0, 2), 'low_flow_balance_conf')
-            if int(rejects.get('below_min_rr_tp_session', 0) or 0) >= 2:
-                act('family_f4_balance_rr_relax', round(float(cfg.get('family_f4_balance_rr_relax', 0.0) or 0.0) + 0.03, 3), 'low_flow_balance_rr')
-                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.03, 3), 'low_flow_balance_rr')
+                act('family_f4_balance_conf_relax', int(float(cfg.get('family_f4_balance_conf_relax', 0) or 0)) + 1, 'balance_low_flow_conf')
+                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.5, 2), 'balance_low_flow_conf')
+            if int(rejects.get('below_min_rr_tp_session', 0) or 0) >= 1:
+                act('family_f4_balance_rr_relax', round(float(cfg.get('family_f4_balance_rr_relax', 0.0) or 0.0) + 0.04, 3), 'balance_low_flow_rr')
+                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.04, 3), 'balance_low_flow_rr')
             if int(rejects.get('far_from_ema_anchor_1h', 0) or 0) >= 2 or int(rejects.get('pullback_required_not_met', 0) or 0) >= 2:
-                act('family_f4_balance_pb_relax', round(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0) + 0.05, 3), 'low_flow_balance_ema')
+                act('family_f4_balance_pb_relax', round(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0) + 0.08, 3), 'balance_low_flow_ema')
+            if int(rejects.get('smc_choch_against_long', 0) or 0) >= 2 or int(rejects.get('pro_structure_trend_conflict', 0) or 0) >= 2:
+                act('family_f4_balance_score_relax', round(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0) + 0.5, 2), 'balance_low_flow_structure')
+        elif trend_active and low_flow:
+            if int(rejects.get('ch1_below_trigger', 0) or 0) >= 2 or int(rejects.get('15m_weak_and_not_early', 0) or 0) >= 2 or int(rejects.get('no_breakout_trigger', 0) or 0) >= 3:
+                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.0, 2), 'trend_low_flow_trigger')
+                act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 1.0, 2), 'trend_low_flow_trigger')
+            if int(rejects.get('far_from_ema_anchor_1h', 0) or 0) >= 2 or int(rejects.get('pullback_required_not_met', 0) or 0) >= 2:
+                act('tf_align_1h_min_abs', round(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS) - 0.05, 3), 'trend_low_flow_align')
+            if int(rejects.get('below_min_confidence', 0) or 0) >= 2 or severe_drought:
+                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.0, 2), 'trend_low_flow_conf')
+                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.03, 3), 'trend_low_flow_conf')
         elif spd30 > 4.5 and wr30 < 42.0:
             act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) + 1.0, 2), 'tighten_high_flow_low_wr')
             act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) + 0.03, 3), 'tighten_high_flow_low_wr')
@@ -23547,7 +23564,7 @@ def _run_family_autotune_cycle(force: bool = False) -> dict:
         report = {
             'ts': now_ts, 'status': 'ADJUSTED' if actions else 'NO_CHANGE',
             'actions': actions, 'snapshot': snap, 'rejects': dict(sorted(rejects.items(), key=lambda kv: int(kv[1]), reverse=True)[:8]),
-            'goal_30d': {'setups_per_day': spd30, 'win_rate': wr30},
+            'goal_30d': {'setups_per_day': spd30, 'win_rate': wr30}, 'active_regimes': sorted(list(active_regimes)), 'active_champions': sorted([x for x in active_champions if x]),
         }
         save_family_autotune_report(report)
         return report
@@ -34154,7 +34171,7 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Goal 7d: {float(m7.get('setups_per_day', 0.0) or 0.0):.2f}/day | setups={int(m7.get('setups', 0) or 0)} | WR={float(m7.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R', 0.0) or 0.0):.3f}",
         SEP,
         f"Family allocator: {'ON' if _cfg_bool((cfg or {}).get('family_allocator_enabled', True), True) else 'OFF'} | shadow={'ON' if _cfg_bool((cfg or {}).get('family_allocator_shadow_mode', True), True) else 'OFF'} | live_enforce={'ON' if _cfg_bool((cfg or {}).get('family_allocator_enforce_live', False), False) else 'OFF'} | max_active={int((cfg or {}).get('family_allocator_max_active_per_cell', 2) or 2)}",
-        f"Family autotune: {'ON' if _cfg_bool((cfg or {}).get('family_autotune_enabled', True), True) else 'OFF'} | every {float((cfg or {}).get('family_autotune_interval_hours', 6.0) or 6.0):.1f}h | f4_relax(score/conf/rr)={float((cfg or {}).get('family_f4_balance_score_relax', 0.0) or 0.0):.1f}/{int(float((cfg or {}).get('family_f4_balance_conf_relax', 0) or 0))}/{float((cfg or {}).get('family_f4_balance_rr_relax', 0.0) or 0.0):.2f}",
+        f"Family autotune: {'ON' if _cfg_bool((cfg or {}).get('family_autotune_enabled', True), True) else 'OFF'} | every {float((cfg or {}).get('family_autotune_interval_hours', 6.0) or 6.0):.1f}h | f4_relax(score/conf/rr)={float((cfg or {}).get('family_f4_balance_score_relax', 0.0) or 0.0):.1f}/{int(float((cfg or {}).get('family_f4_balance_conf_relax', 0) or 0))}/{float((cfg or {}).get('family_f4_balance_rr_relax', 0.0) or 0.0):.2f} | last={(load_family_autotune_report() or {}).get('status', '-') }",
         f"Regime refresh: {'ON' if _cfg_bool((cfg or {}).get('family_regime_refresh_enabled', True), True) else 'OFF'} | every {float((cfg or {}).get('family_regime_refresh_interval_hours', 4.0) or 4.0):.1f}h",
         'Daily regimes: ' + ' | '.join([_fmt_regime('daily', s) for s in ['ASIA', 'LON', 'NY']]),
         '4h regimes: ' + ' | '.join([_fmt_regime('4h', s) for s in ['ASIA', 'LON', 'NY']]),
