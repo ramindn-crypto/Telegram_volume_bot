@@ -76,7 +76,6 @@ CHANGELOG (2026-03-06)
 # =========================================================
 
 import os
-import threading
 
 
 # --- generic env helpers (added for leader-base patch safety) ---
@@ -400,11 +399,40 @@ from telegram.ext import (
 # - HEAVY pool: market scans, signal building, email job work
 # This prevents long scans from starving quick commands like /start, /status, /size.
 # =========================================================
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import functools as _functools
 
 _FAST_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("FAST_EXECUTOR_WORKERS", "8")))
-_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "6")))
+_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "8")))
+
+# Background backtests can temporarily saturate the heavy pool and make the
+# email loop look unhealthy even when the scheduler is alive. Track them so
+# live email/screen jobs can adapt their cache/timeout behavior.
+_UNIVERSE_BACKTEST_ACTIVE = 0
+_UNIVERSE_BACKTEST_LOCK = threading.Lock()
+
+def _mark_universe_backtest_start() -> None:
+    global _UNIVERSE_BACKTEST_ACTIVE
+    try:
+        with _UNIVERSE_BACKTEST_LOCK:
+            _UNIVERSE_BACKTEST_ACTIVE = int(_UNIVERSE_BACKTEST_ACTIVE or 0) + 1
+    except Exception:
+        pass
+
+def _mark_universe_backtest_end() -> None:
+    global _UNIVERSE_BACKTEST_ACTIVE
+    try:
+        with _UNIVERSE_BACKTEST_LOCK:
+            _UNIVERSE_BACKTEST_ACTIVE = max(0, int(_UNIVERSE_BACKTEST_ACTIVE or 0) - 1)
+    except Exception:
+        pass
+
+def _backtest_runtime_busy() -> bool:
+    try:
+        return int(_UNIVERSE_BACKTEST_ACTIVE or 0) > 0
+    except Exception:
+        return False
 
 async def _run_in_executor(executor, fn, *args, timeout: int | None = None, **kwargs):
     loop = asyncio.get_running_loop()
@@ -8117,7 +8145,7 @@ def _admin_assurance_verdict(uid: int | None = None) -> tuple[str, list[str]]:
     owner = int(uid or AUTOTRADE_OWNER_UID or 0)
     market_cfg = load_strategy_config(force=False)
     market_ttl = max(7200, int(float((market_cfg or {}).get("market_adaptive_interval_hours", 24.0) or 24.0) * 7200))
-    for name, ttl in (("autotrade", 180), ("email", max(180, int(CHECK_INTERVAL_MIN * 120))), ("learning_hourly", max(1800, int(EVOLUTION_HOURLY_INTERVAL_MIN * 180))), ("optimizer", max(7200, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 7200))), ("market_adaptive", market_ttl)):
+    for name, ttl in (("autotrade", 180), ("email", _email_health_ttl_sec()), ("learning_hourly", max(1800, int(EVOLUTION_HOURLY_INTERVAL_MIN * 180))), ("optimizer", max(7200, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 7200))), ("market_adaptive", market_ttl)):
         st, _ = _effective_hb_status_line(name, ttl, uid=owner)
         if name == "optimizer" and not AUTONOMOUS_OPT_ENABLED:
             continue
@@ -8163,6 +8191,19 @@ def _status_label(status: str) -> str:
         "ERROR": "ERROR",
     }
     return m.get(str(status).upper(), str(status).upper())
+
+
+def _email_health_ttl_sec() -> int:
+    """Email loop health should tolerate temporary thread-pool starvation.
+
+    Manual universe backtests and optimizer work can delay the background email
+    job for several minutes without indicating a real scheduler failure.
+    """
+    try:
+        base = max(180, int(CHECK_INTERVAL_MIN * 120))
+    except Exception:
+        base = 180
+    return int(max(600, base))
 
 
 def _format_last_run_line(title: str, run: dict) -> str:
@@ -8274,7 +8315,10 @@ def _learning_status_text(use_live_refresh: bool = False, sync_lifecycle: bool =
     opt_state, opt_reason = _component_runtime_state("optimizer", max(7200, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 7200)), enabled=bool(AUTONOMOUS_OPT_ENABLED), no_data=opt_no_data, waiting_text="waiting_for_optimizer_window")
     market_cfg = load_strategy_config(force=False)
     market_adaptive_state, market_adaptive_reason = _component_runtime_state("market_adaptive", max(7200, int(float((market_cfg or {}).get("market_adaptive_interval_hours", 24.0) or 24.0) * 7200)), enabled=_cfg_bool((market_cfg or {}).get("market_adaptive_enabled", True), True), no_data=False, waiting_text="waiting_for_daily_market_adaptive_cycle")
-    email_state, _ = _component_runtime_state("email", max(180, int(CHECK_INTERVAL_MIN * 120)), enabled=bool(EMAIL_ENABLED and email_config_ok()), no_data=False, waiting_text="waiting_for_email_loop")
+    if EMAIL_ENABLED and email_config_ok():
+        email_state, _email_line = _effective_hb_status_line("email", _email_health_ttl_sec(), label="Email loop", uid=owner)
+    else:
+        email_state, _email_line = ("DISABLED", "disabled_in_config")
 
     optimizer_live_changes = []
     if auto_last and isinstance(auto_last.get("actions"), list):
@@ -18697,100 +18741,103 @@ def _run_backtest_on_ohlcv_detailed(symbol: str, ohlcv: list, days: int, tf: str
 
 
 def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | None = None, top_n: int | None = None, min_vol_usd: float | None = None, persist: bool = True, promoted_context: bool = False) -> dict:
-    _opt_migrate_tables()
-    cfg = load_strategy_config(force=False)
-    exec_tf = str(tf or cfg.get('universe_backtest_exec_tf') or cfg.get('exec_tf_default') or '15m').strip().lower()
-    d = max(3, int(days or 7))
-    top_n = int(max(10, top_n or cfg.get('universe_backtest_top_n', 80) or 80))
-    min_vol_usd = float(min_vol_usd or cfg.get('universe_backtest_min_vol_usd', 10000000.0) or 10000000.0)
-    session_mode = str(session_mode or 'ALL').upper().strip()
-    snap = _build_universe_snapshot_top_volume(top_n=top_n, min_vol_usd=min_vol_usd)
-    universe = list(snap.get('market_symbols') or [])[:top_n]
-    tf_min = _tf_to_minutes(exec_tf)
-    warmup_bars = 300
-    since_ms, until_ms, eval_since_ms, eval_until_ms = _backtest_window_bounds(d, end_days_ago=0, warmup_bars=warmup_bars, tf=exec_tf)
-    page_limit = 1000 if tf_min <= 60 else 500
-    rows = []
-    symbol_reports = []
-    reject_acc = Counter()
-    live_reject_acc = Counter()
-    fetch_errors = 0
-    for sym in universe:
-        try:
-            ohl = fetch_ohlcv_paged(sym, exec_tf, since_ms=since_ms, until_ms=until_ms, limit=page_limit)
-            if not ohl:
-                bars = int(min(12000, max(1200, ((d * 1440) / max(1, tf_min)) + 450)))
-                ohl = fetch_ohlcv(sym, exec_tf, limit=bars)
-        except Exception:
-            ohl = []
-            fetch_errors += 1
-        ohl = _sanitize_ohlcv_rows(ohl)
-        try:
-            rep = _run_backtest_on_ohlcv_detailed(sym, ohl, days=d, tf=exec_tf, session_name=session_mode, eval_since_ts=(eval_since_ms / 1000.0), eval_until_ts=(eval_until_ms / 1000.0))
-        except Exception as e:
-            rep = {'ok': False, 'symbol': sym, 'tf': exec_tf, 'days': d, 'rows': [], 'error': f'{type(e).__name__}: {e}'}
-        symbol_reports.append(rep)
-        try:
-            rb = rep.get('reject_breakdown') or {}
-            if isinstance(rb, dict):
-                reject_acc.update(rb)
-        except Exception:
-            pass
-        for rr in (rep.get('rows') or []):
-            if _session_mode_matches(session_mode, rr.get('session')):
-                rows.append(dict(rr))
-                if not bool(rr.get('live_equivalent', False)):
-                    why = str(rr.get('live_reason') or '')
-                    if why:
-                        live_reject_acc[why] += 1
-    raw_overall, raw_per_day, raw_by_session = _summarize_universe_rows(rows, days=float(d), live_only=False)
-    live_overall, live_per_day, live_by_session = _summarize_universe_rows(rows, days=float(d), live_only=True)
-    metrics = {
-        'days': d,
-        'session_mode': session_mode,
-        'exec_tf': exec_tf,
-        'preferred_view': 'live_equivalent',
-        'overall': dict(live_overall),
-        'live_equivalent_overall': dict(live_overall),
-        'raw_overall': dict(raw_overall),
-        'overall_win_rate': float(live_overall.get('win_rate', 0.0) or 0.0),
-        'total_setups': int(live_overall.get('setups', 0) or 0),
-        'avg_setups_per_day': float(live_overall.get('setups_per_day', 0.0) or 0.0),
-        'raw_total_setups': int(raw_overall.get('setups', 0) or 0),
-        'raw_avg_setups_per_day': float(raw_overall.get('setups_per_day', 0.0) or 0.0),
-        'by_session': dict(live_by_session),
-        'live_equivalent_by_session': dict(live_by_session),
-        'raw_by_session': dict(raw_by_session),
-        'universe_size': int(len(universe)),
-        'top_n': int(top_n),
-        'min_vol_usd': float(min_vol_usd),
-        'reject_breakdown': dict(reject_acc),
-        'live_equivalent_reject_breakdown': dict(live_reject_acc),
-        'eval_since_ts': float(eval_since_ms / 1000.0),
-        'eval_until_ts': float(eval_until_ms / 1000.0),
-        'fetch_errors': int(fetch_errors),
-    }
-    run_id = ''
-    if persist:
-        run_id = _db_save_universe_backtest_run(days=d, session_mode=session_mode, exec_tf=exec_tf, universe_snap_id=str(snap.get('snap_id') or ''), universe_size=len(universe), metrics=metrics, per_day=live_per_day, per_session=live_by_session, notes='auto' if promoted_context else 'manual', promoted_context=bool(promoted_context))
-    return {
-        'ok': True,
-        'run_id': run_id,
-        'days': d,
-        'session_mode': session_mode,
-        'exec_tf': exec_tf,
-        'universe_snap_id': str(snap.get('snap_id') or ''),
-        'universe_size': int(len(universe)),
-        'metrics': metrics,
-        'overall': dict(live_overall),
-        'raw_overall': dict(raw_overall),
-        'per_day': live_per_day,
-        'raw_per_day': raw_per_day,
-        'per_session': live_by_session,
-        'raw_per_session': raw_by_session,
-        'symbol_reports': symbol_reports,
-    }
-
+    _mark_universe_backtest_start()
+    try:
+        _opt_migrate_tables()
+        cfg = load_strategy_config(force=False)
+        exec_tf = str(tf or cfg.get('universe_backtest_exec_tf') or cfg.get('exec_tf_default') or '15m').strip().lower()
+        d = max(3, int(days or 7))
+        top_n = int(max(10, top_n or cfg.get('universe_backtest_top_n', 80) or 80))
+        min_vol_usd = float(min_vol_usd or cfg.get('universe_backtest_min_vol_usd', 10000000.0) or 10000000.0)
+        session_mode = str(session_mode or 'ALL').upper().strip()
+        snap = _build_universe_snapshot_top_volume(top_n=top_n, min_vol_usd=min_vol_usd)
+        universe = list(snap.get('market_symbols') or [])[:top_n]
+        tf_min = _tf_to_minutes(exec_tf)
+        warmup_bars = 300
+        since_ms, until_ms, eval_since_ms, eval_until_ms = _backtest_window_bounds(d, end_days_ago=0, warmup_bars=warmup_bars, tf=exec_tf)
+        page_limit = 1000 if tf_min <= 60 else 500
+        rows = []
+        symbol_reports = []
+        reject_acc = Counter()
+        live_reject_acc = Counter()
+        fetch_errors = 0
+        for sym in universe:
+            try:
+                ohl = fetch_ohlcv_paged(sym, exec_tf, since_ms=since_ms, until_ms=until_ms, limit=page_limit)
+                if not ohl:
+                    bars = int(min(12000, max(1200, ((d * 1440) / max(1, tf_min)) + 450)))
+                    ohl = fetch_ohlcv(sym, exec_tf, limit=bars)
+            except Exception:
+                ohl = []
+                fetch_errors += 1
+            ohl = _sanitize_ohlcv_rows(ohl)
+            try:
+                rep = _run_backtest_on_ohlcv_detailed(sym, ohl, days=d, tf=exec_tf, session_name=session_mode, eval_since_ts=(eval_since_ms / 1000.0), eval_until_ts=(eval_until_ms / 1000.0))
+            except Exception as e:
+                rep = {'ok': False, 'symbol': sym, 'tf': exec_tf, 'days': d, 'rows': [], 'error': f'{type(e).__name__}: {e}'}
+            symbol_reports.append(rep)
+            try:
+                rb = rep.get('reject_breakdown') or {}
+                if isinstance(rb, dict):
+                    reject_acc.update(rb)
+            except Exception:
+                pass
+            for rr in (rep.get('rows') or []):
+                if _session_mode_matches(session_mode, rr.get('session')):
+                    rows.append(dict(rr))
+                    if not bool(rr.get('live_equivalent', False)):
+                        why = str(rr.get('live_reason') or '')
+                        if why:
+                            live_reject_acc[why] += 1
+        raw_overall, raw_per_day, raw_by_session = _summarize_universe_rows(rows, days=float(d), live_only=False)
+        live_overall, live_per_day, live_by_session = _summarize_universe_rows(rows, days=float(d), live_only=True)
+        metrics = {
+            'days': d,
+            'session_mode': session_mode,
+            'exec_tf': exec_tf,
+            'preferred_view': 'live_equivalent',
+            'overall': dict(live_overall),
+            'live_equivalent_overall': dict(live_overall),
+            'raw_overall': dict(raw_overall),
+            'overall_win_rate': float(live_overall.get('win_rate', 0.0) or 0.0),
+            'total_setups': int(live_overall.get('setups', 0) or 0),
+            'avg_setups_per_day': float(live_overall.get('setups_per_day', 0.0) or 0.0),
+            'raw_total_setups': int(raw_overall.get('setups', 0) or 0),
+            'raw_avg_setups_per_day': float(raw_overall.get('setups_per_day', 0.0) or 0.0),
+            'by_session': dict(live_by_session),
+            'live_equivalent_by_session': dict(live_by_session),
+            'raw_by_session': dict(raw_by_session),
+            'universe_size': int(len(universe)),
+            'top_n': int(top_n),
+            'min_vol_usd': float(min_vol_usd),
+            'reject_breakdown': dict(reject_acc),
+            'live_equivalent_reject_breakdown': dict(live_reject_acc),
+            'eval_since_ts': float(eval_since_ms / 1000.0),
+            'eval_until_ts': float(eval_until_ms / 1000.0),
+            'fetch_errors': int(fetch_errors),
+        }
+        run_id = ''
+        if persist:
+            run_id = _db_save_universe_backtest_run(days=d, session_mode=session_mode, exec_tf=exec_tf, universe_snap_id=str(snap.get('snap_id') or ''), universe_size=len(universe), metrics=metrics, per_day=live_per_day, per_session=live_by_session, notes='auto' if promoted_context else 'manual', promoted_context=bool(promoted_context))
+        return {
+            'ok': True,
+            'run_id': run_id,
+            'days': d,
+            'session_mode': session_mode,
+            'exec_tf': exec_tf,
+            'universe_snap_id': str(snap.get('snap_id') or ''),
+            'universe_size': int(len(universe)),
+            'metrics': metrics,
+            'overall': dict(live_overall),
+            'raw_overall': dict(raw_overall),
+            'per_day': live_per_day,
+            'raw_per_day': raw_per_day,
+            'per_session': live_by_session,
+            'raw_per_session': raw_by_session,
+            'symbol_reports': symbol_reports,
+        }
+    finally:
+        _mark_universe_backtest_end()
 
 def _format_universe_backtest_report(rep: dict) -> str:
     if not rep:
@@ -22357,12 +22404,23 @@ def _market_adaptive_status_snapshot() -> dict:
         lifecycle = _trade_lifecycle_analytics(owner, days=max(7, life_days), session='ALL', sync=False, force=False) if owner > 0 else {}
     except Exception:
         lifecycle = {}
+    current_live = {
+        'quality_score_min_email': float((cfg or {}).get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL),
+        'quality_score_min_screen': float((cfg or {}).get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN),
+        'min_rr_tp': float((cfg or {}).get('min_rr_tp', (cfg or {}).get('min_rr_tp', MIN_RR_TP)) or MIN_RR_TP),
+        'tf_align_1h_min_abs': float((cfg or {}).get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS),
+        'atr_min_pct': float((cfg or {}).get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT),
+        'execution_asia_enabled': _strategy_cfg_execution_asia_enabled(cfg),
+        'execution_engine_b_email_enabled': _cfg_bool((cfg or {}).get('execution_engine_b_email_enabled', EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED)),
+        'session_exec_overrides': (cfg or {}).get('session_exec_overrides') or {},
+    }
     return {
         'enabled': _cfg_bool((cfg or {}).get('market_adaptive_enabled', True), True),
         'interval_hours': float((cfg or {}).get('market_adaptive_interval_hours', 24.0) or 24.0),
         'days': int((cfg or {}).get('market_adaptive_days', 30) or 30),
         'last_run': last_run,
         'last_report': last_report,
+        'current_live': current_live,
         'runtime_profile': _runtime_profile_get_current() or profile or {},
         'runtime_profile_review': review or {},
         'lifecycle': lifecycle or {},
@@ -22592,7 +22650,7 @@ async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAU
         lines.append('Last actions:')
         for a in actions[:6]:
             lines.append(f"• {a.get('param')} {a.get('from')}→{a.get('to')} | {a.get('reason')}")
-    current_live = rep.get('current_live') or {}
+    current_live = snap.get('current_live') or (rep.get('current_live') or {})
     profile = snap.get('runtime_profile') or {}
     profile_review = snap.get('runtime_profile_review') or {}
     if current_live:
@@ -23699,16 +23757,18 @@ def _run_family_autotune_cycle(force: bool = False) -> dict:
                 act('family_f4_balance_score_relax', round(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0) + 0.75, 2), 'balance_low_flow_structure')
         elif trend_active and low_flow:
             if int(rejects.get('ch1_below_trigger', 0) or 0) >= 1 or int(rejects.get('15m_weak_and_not_early', 0) or 0) >= 1 or int(rejects.get('no_breakout_trigger', 0) or 0) >= 2:
-                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 2.0, 2), 'trend_low_flow_trigger')
-                act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 1.5, 2), 'trend_low_flow_trigger')
-                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.05, 3), 'trend_low_flow_trigger')
+                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 0.75, 2), 'trend_low_flow_trigger')
+                act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 0.50, 2), 'trend_low_flow_trigger')
+                if severe_drought:
+                    act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.03, 3), 'trend_low_flow_trigger')
             if int(rejects.get('asia_tf_align_fail_long', 0) or 0) >= 1 or int(rejects.get('asia_tf_align_fail_short', 0) or 0) >= 1 or int(rejects.get('far_from_ema_anchor_1h', 0) or 0) >= 1 or int(rejects.get('pullback_required_not_met', 0) or 0) >= 1:
                 act('tf_align_1h_min_abs', round(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS) - 0.10, 3), 'trend_low_flow_align')
                 act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.0, 2), 'trend_low_flow_align')
             if int(rejects.get('below_min_confidence', 0) or 0) >= 1 or severe_drought:
-                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 2.0, 2), 'trend_low_flow_conf')
-                act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 1.0, 2), 'trend_low_flow_conf')
-                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.05, 3), 'trend_low_flow_conf')
+                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 0.75, 2), 'trend_low_flow_conf')
+                act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 0.50, 2), 'trend_low_flow_conf')
+                if severe_drought:
+                    act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.03, 3), 'trend_low_flow_conf')
             if int(rejects.get('below_min_rr_tp_session', 0) or 0) >= 1:
                 act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.05, 3), 'trend_low_flow_rr')
         elif spd30 > 4.5 and wr30 < 42.0:
@@ -24032,7 +24092,9 @@ def is_top_setup_eligible(
             if sess in {'LON', 'NY'}:
                 min_score -= 1.25 if src == 'exec' else (0.60 if src == 'email' else 0.50)
         elif fam == 'F1_PULLBACK_CONT' and 'TREND' in regime and sess == 'LON':
-            min_score -= 0.75 if src == 'exec' else 0.50
+            # LON was over-converting weak pullback-continuation ideas.
+            # Keep NY broad, but require slightly better LON scores here.
+            min_score += 0.50 if src == 'exec' else (0.50 if src == 'email' else 0.25)
 
         min_score = float(clamp(min_score, 56.0 if reach_mode and sess == 'LON' else 60.0, 90.0))
 
@@ -24164,9 +24226,9 @@ def is_executable_setup_eligible(
 
         if engine == 'A':
             if sess == 'LON':
-                score_floor = max((66.0 if reach_mode else 69.5), score_floor)
-                conf_floor = max((71 if reach_mode else 73), conf_floor)
-                rr_floor = max((1.10 if reach_mode else 1.18), rr_floor)
+                score_floor = max((67.0 if reach_mode else 70.5), score_floor)
+                conf_floor = max((72 if reach_mode else 74), conf_floor)
+                rr_floor = max((1.12 if reach_mode else 1.22), rr_floor)
             elif sess == 'NY':
                 score_floor = max(73.5, score_floor)
                 conf_floor = max(74, conf_floor)
@@ -24177,9 +24239,9 @@ def is_executable_setup_eligible(
                 rr_floor = max(1.20, rr_floor)
         elif engine == 'C':
             if sess == 'LON':
-                score_floor = max((65.5 if reach_mode else 69.0), score_floor - 1.25 + engine_c_exec_quality_add)
-                conf_floor = max((72 if reach_mode else 75), conf_floor + engine_c_exec_conf_add)
-                rr_floor = max((1.08 if reach_mode else 1.16), rr_floor - 0.08 + engine_c_exec_rr_add)
+                score_floor = max((66.5 if reach_mode else 70.0), score_floor - 0.50 + engine_c_exec_quality_add)
+                conf_floor = max((73 if reach_mode else 76), conf_floor + engine_c_exec_conf_add)
+                rr_floor = max((1.10 if reach_mode else 1.20), rr_floor - 0.02 + engine_c_exec_rr_add)
             elif sess == 'NY':
                 score_floor = max(72.5, score_floor + 0.25 + engine_c_exec_quality_add)
                 conf_floor = max(76, conf_floor + 1 + engine_c_exec_conf_add)
@@ -24220,14 +24282,18 @@ def is_executable_setup_eligible(
             active_fams = []
 
         if active_profile.startswith('GLOBAL_') and fam and fam in set(active_fams):
-            if engine in {'A', 'C'} and sess in {'LON', 'NY'} and ('TREND' in regime or 'EXPANSION' in regime):
+            # Keep the broader NY reach, but do not let active-family relaxations over-loosen LON.
+            if engine in {'A', 'C'} and sess == 'NY' and ('TREND' in regime or 'EXPANSION' in regime):
                 score_floor -= 1.5
                 conf_floor -= 1
                 rr_floor -= 0.03
-            elif engine == 'B' and sess in {'LON', 'NY'} and 'EXPANSION' in regime:
+            elif engine == 'B' and sess == 'NY' and 'EXPANSION' in regime:
                 score_floor -= 2.5
                 conf_floor -= 1
                 rr_floor -= 0.05
+            elif engine in {'A', 'C'} and sess == 'LON' and ('TREND' in regime or 'EXPANSION' in regime):
+                score_floor -= 0.25
+                rr_floor -= 0.01
 
         # Family-aware executable calibration. These are deliberately modest and only help
         # regime-consistent families convert a little better without turning the email lane
@@ -24242,18 +24308,24 @@ def is_executable_setup_eligible(
                 conf_floor -= 5
                 rr_floor -= 0.18
         elif fam == 'F2_MOMENTUM_IGNITION' and regime == 'EXPANSION':
-            if sess in {'LON', 'NY'}:
+            if sess == 'NY':
                 score_floor -= 1.50
                 conf_floor -= 1
                 rr_floor -= 0.03
+            elif sess == 'LON':
+                score_floor -= 0.50
+                rr_floor -= 0.01
         elif fam == 'F3_IMPULSE_BASE_CONT' and regime in {'EXPANSION', 'SQUEEZE'}:
-            if sess in {'LON', 'NY'}:
+            if sess == 'NY':
                 score_floor -= 1.25
                 conf_floor -= 1
                 rr_floor -= 0.03
+            elif sess == 'LON':
+                score_floor -= 0.40
+                rr_floor -= 0.01
         elif fam == 'F1_PULLBACK_CONT' and 'TREND' in regime and sess == 'LON':
-            score_floor -= 0.75
-            rr_floor -= 0.02
+            score_floor += 0.50
+            rr_floor += 0.02
 
         score_floor = float(clamp(score_floor, 58.0 if active_profile.startswith('GLOBAL_') else 62.0, 92.0))
         conf_floor = int(max(68 if active_profile.startswith('GLOBAL_') else 71, min(95, conf_floor)))
@@ -24322,12 +24394,12 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.66, 7_000_000.0)):
                     return (False, "lon_below_liquidity")
             else:
-                lon_pb_max = 0.88 if reach_mode else 0.78
-                lon_ch15_cap = 0.84 if reach_mode else 0.70
-                lon_ch1_cap = 1.58 if reach_mode else 1.38
-                lon_ctx_ch4_min = 0.26 if reach_mode else 0.34
-                lon_ctx_ch1_min = 0.06 if reach_mode else 0.12
-                lon_liq_floor = max(MIN_FUT_VOL_USD * (0.68 if reach_mode else 0.74), 6_500_000.0 if reach_mode else 7_500_000.0)
+                lon_pb_max = 0.84 if reach_mode else 0.74
+                lon_ch15_cap = 0.78 if reach_mode else 0.64
+                lon_ch1_cap = 1.48 if reach_mode else 1.30
+                lon_ctx_ch4_min = 0.32 if reach_mode else 0.40
+                lon_ctx_ch1_min = 0.10 if reach_mode else 0.16
+                lon_liq_floor = max(MIN_FUT_VOL_USD * (0.72 if reach_mode else 0.80), 7_000_000.0 if reach_mode else 8_500_000.0)
                 if engine == 'C':
                     lon_pb_max = max(lon_pb_max, engine_c_exec_pb_dist_lon)
                     lon_ch1_cap = max(lon_ch1_cap, engine_c_exec_ch1_cap_lon)
@@ -24373,7 +24445,7 @@ def is_executable_setup_eligible(
                 return (False, "pullback_not_ready")
             if pb_dist > ((0.84 if reach_mode else 0.70) if sess == 'LON' else (0.74 if sess == 'NY' else 0.68)):
                 return (False, "pullback_still_too_shallow")
-            if sess == 'LON' and (ch15_abs > (0.80 if reach_mode else 0.64) or ch1_abs < (0.06 if reach_mode else 0.12) or ch1_abs > (1.50 if reach_mode else 1.28) or ch4_abs < (0.30 if reach_mode else 0.40)):
+            if sess == 'LON' and (ch15_abs > (0.74 if reach_mode else 0.58) or ch1_abs < (0.10 if reach_mode else 0.16) or ch1_abs > (1.38 if reach_mode else 1.18) or ch4_abs < (0.34 if reach_mode else 0.44)):
                 return (False, 'lon_pullback_not_clean_enough')
             return (True, "ok")
 
@@ -33334,7 +33406,7 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "40"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "75"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
 ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "40"))
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "300"))
@@ -33746,7 +33818,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # Cache-first: avoid rebuilding the full email pool every cycle when a recent
             # authoritative session pool already exists. Under runtime pressure, prefer
             # reusing cache over starting another expensive scan.
-            busy_runtime = bool(goal_running) or SCAN_LOCK.locked() or _SCREEN_LOCK.locked()
+            busy_runtime = bool(goal_running) or SCAN_LOCK.locked() or _SCREEN_LOCK.locked() or _backtest_runtime_busy()
             cache_ttl_for_email = float(max(_alert_job_limit('EMAIL_POOL_REBUILD_MIN_SEC', 180), 600 if busy_runtime else 0))
             if cached_setups and cache_age <= cache_ttl_for_email:
                 setups = list(cached_setups)
