@@ -695,18 +695,9 @@ def enforce_access_or_block_legacy(update: Update, command: str) -> bool:
             "👉 /billing"
         ))
     except Exception:
-        try:
-            # Fallback (best effort)
-            update.message.reply_text(
-                "⛔ Access locked.\n\n"
-                "Your 7-day free trial has ended.\n\n"
-                "To continue, choose a plan:\n"
-                "• Standard — $49/month\n"
-                "• Pro — $99/month\n\n"
-                "👉 /billing"
-            )
-        except Exception:
-            pass
+        # No running loop available here; avoid calling async telegram methods without await.
+        # Best-effort fallback is silent because this guard is also called from worker threads.
+        pass
     return False
 
 
@@ -1193,7 +1184,7 @@ def _strategy_config_defaults() -> dict:
         "governor_target_hi": 3.0,
         "governor_step_score": 1.0,         # +/- points applied to quality_score_min_email when adjusting
         "governor_score_min": 52.0,         # absolute lower bound for quality_score_min_email
-        "governor_score_max": 82.0,         # absolute upper bound for quality_score_min_email
+        "governor_score_max": 70.0,         # absolute upper bound for quality_score_min_email
         "governor_apply_to": "email",       # 'email' (safe) or 'email+screen'
         "governor_last_adjust_ts": 0.0,
 
@@ -1616,22 +1607,22 @@ def _strategy_config_bootstrap_recommendations() -> None:
         # silently keep the bot above the 1–3 setups/day target after redeploy.
         try:
             q_screen = float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
-            if q_screen > 66.0:
-                cfg['quality_score_min_screen'] = 66.0
+            if q_screen > 64.0:
+                cfg['quality_score_min_screen'] = 64.0
                 changed = True
         except Exception:
             pass
         try:
             q_email = float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
-            if q_email > 70.0:
-                cfg['quality_score_min_email'] = 70.0
+            if q_email > 68.0:
+                cfg['quality_score_min_email'] = 68.0
                 changed = True
         except Exception:
             pass
         try:
             rr_live = float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP)
-            if rr_live > 1.46:
-                cfg['min_rr_tp'] = 1.46
+            if rr_live > 1.40:
+                cfg['min_rr_tp'] = 1.40
                 changed = True
         except Exception:
             pass
@@ -4996,15 +4987,18 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
 
     if float(live_open_risk_charged_today or 0.0) <= 0.0:
         live_open_risk_charged_today = float(current_day_open_risk)
-    daily_used_total = max(0.0, float(live_open_risk_charged_today) - float(realized_pnl_today))
-    remaining_raw = float("inf") if cap <= 0 else (float(cap) - float(daily_used_total))
+    raw_daily_used_total = max(0.0, float(live_open_risk_charged_today) - float(realized_pnl_today))
+    effective_daily_used_total, reset_credit = _risk_day_reset_effective_used(int(uid), user, raw_daily_used_total)
+    remaining_raw = float("inf") if cap <= 0 else (float(cap) - float(effective_daily_used_total))
     over_by = abs(float(remaining_raw)) if cap > 0 and remaining_raw < 0 else 0.0
 
     return {
         "cap": float(cap),
         "open_risk": float(current_total_open_risk),
         "used_risk": float(current_day_open_risk),
-        "used_total": float(daily_used_total),
+        "used_total": float(effective_daily_used_total),
+        "used_total_raw": float(raw_daily_used_total),
+        "risk_reset_credit": float(reset_credit),
         "open_pnl": float(open_pnl),
         "realized_pnl_today": float(realized_pnl_today),
         "realized_loss_today": float(realized_loss_today),
@@ -7619,6 +7613,27 @@ def cache_valid(key: str, ttl: int) -> bool:
     ts, _ = v
     return (time.time() - ts) <= ttl
 
+# Lightweight admin status text cache used by /learning_status, /optimizer_status, /adaptive_status.
+# Keep it process-local and TTL based so expensive diagnostic commands stay responsive without
+# introducing another DB dependency.
+_ADMIN_STATUS_CACHE_PREFIX = "admin_status_cache:"
+
+def _admin_status_cache_get(name: str, ttl: float = 45.0):
+    try:
+        key = f"{_ADMIN_STATUS_CACHE_PREFIX}{str(name or '').strip()}"
+        if ttl is not None and ttl > 0 and cache_valid(key, int(max(1, round(float(ttl))))):
+            return cache_get(key)
+    except Exception:
+        return None
+    return None
+
+def _admin_status_cache_put(name: str, value: Any) -> None:
+    try:
+        key = f"{_ADMIN_STATUS_CACHE_PREFIX}{str(name or '').strip()}"
+        cache_set(key, value)
+    except Exception:
+        return
+
 # =========================================================
 # MATH / INDICATORS HELPERS (MISSING FIX)
 # =========================================================
@@ -9527,6 +9542,17 @@ def db_init():
     """)
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS risk_day_reset_credits (
+        user_id INTEGER NOT NULL,
+        day_local TEXT NOT NULL,
+        credit_usd REAL NOT NULL DEFAULT 0.0,
+        reset_ts REAL NOT NULL DEFAULT 0.0,
+        note TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (user_id, day_local)
+    )
+    """)
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS setup_counter (
         day_yyyymmdd TEXT PRIMARY KEY,
         seq INTEGER NOT NULL
@@ -9709,6 +9735,11 @@ def has_active_access_legacy(user: dict) -> bool:
 
 
 def enforce_access_or_block(update: Update, command: str) -> bool:
+    """Synchronous access guard used by fast thread-offloaded checks.
+
+    Never call Telegram async reply methods directly here; the async caller is responsible
+    for sending any user-facing access-locked message.
+    """
     uid = update.effective_user.id
     if is_admin_user(uid):
         return True
@@ -9721,14 +9752,6 @@ def enforce_access_or_block(update: Update, command: str) -> bool:
     if command in ALLOWED_WHEN_LOCKED:
         return True
 
-    update.message.reply_text(
-        "⛔ Access locked.\n\n"
-        "Your 7-day free trial has ended.\n\n"
-        "Plans:\n"
-        "• Standard — $50/month\n"
-        "• Pro — $99/month\n\n"
-        "👉 /billing"
-    )
     return False
 
 def update_user(user_id: int, **kwargs):
@@ -10675,6 +10698,47 @@ def _risk_daily_inc(user_id: int, day_local: str, inc_usd: float):
     con.commit()
     con.close()
 
+def _risk_day_reset_credit_get(user_id: int, day_local: str) -> float:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT credit_usd FROM risk_day_reset_credits WHERE user_id=? AND day_local=?", (int(user_id), str(day_local)))
+    row = cur.fetchone()
+    con.close()
+    try:
+        return float((row["credit_usd"] if row and "credit_usd" in row.keys() else (row[0] if row else 0.0)) or 0.0)
+    except Exception:
+        return 0.0
+
+def _risk_day_reset_credit_set(user_id: int, day_local: str, credit_usd: float, note: str = ""):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO risk_day_reset_credits (user_id, day_local, credit_usd, reset_ts, note)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, day_local) DO UPDATE SET
+            credit_usd=excluded.credit_usd,
+            reset_ts=excluded.reset_ts,
+            note=excluded.note
+    """, (int(user_id), str(day_local), float(max(0.0, credit_usd or 0.0)), float(time.time()), str(note or "")))
+    con.commit()
+    con.close()
+
+def _risk_day_reset_credit_clear(user_id: int, day_local: str):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("DELETE FROM risk_day_reset_credits WHERE user_id=? AND day_local=?", (int(user_id), str(day_local)))
+    con.commit()
+    con.close()
+
+def _risk_day_reset_effective_used(user_id: int, user: dict, raw_used_usd: float) -> tuple[float, float]:
+    try:
+        day_local = _user_day_local(user)
+    except Exception:
+        day_local = datetime.now(_user_tzinfo(user)).date().isoformat()
+    credit = float(_risk_day_reset_credit_get(int(user_id), str(day_local)) or 0.0)
+    effective = max(0.0, float(raw_used_usd or 0.0) - credit)
+    return float(effective), float(credit)
+
 def _user_day_local(user: dict) -> str:
     start_local, _, _ = _user_today_window(user)
     return start_local.date().isoformat()
@@ -10783,18 +10847,19 @@ def _pnl_today_closed_trades(user_id: int, user: dict) -> float:
     return float(total)
 
 def _risk_used_total_today(user_id: int, user: dict) -> float:
-    """Daily used risk = current open risk minus realized net PnL for the active day window.
+    """Daily used risk = current open risk minus realized net PnL, with optional admin reset credit.
 
     Governance model:
     - losses reduce remaining capacity
     - profits restore capacity
-    - remaining risk is never shown above the daily cap
+    - admins can baseline-reset the current day without deleting exchange history
     """
     day_local = _user_day_local(user)
     open_risk = _risk_used_today_from_open_trades(user_id, user, day_local)
     pnl_today = _pnl_today_closed_trades(user_id, user)
-    used = float(open_risk) - float(pnl_today)
-    return float(max(0.0, used))
+    raw_used = float(max(0.0, float(open_risk) - float(pnl_today)))
+    effective_used, _credit = _risk_day_reset_effective_used(int(user_id), user, raw_used)
+    return float(effective_used)
 
 def _admin_today_window_utc(now_utc: Optional[datetime] = None, uid: Optional[int] = None, user: Optional[dict] = None) -> tuple[datetime, datetime]:
     """Admin active trading day in UTC, derived from the admin user's timezone + /dayreset."""
@@ -11002,6 +11067,8 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["inherited_open_positions"] = int(m.get("inherited_open_positions") or 0)
         snap["realized_loss_today"] = float(m.get("realized_loss_today") or 0.0)
         snap["used_today"] = float(m.get("used_total") or 0.0)
+        snap["used_today_raw"] = float(m.get("used_total_raw") or m.get("used_total") or 0.0)
+        snap["risk_reset_credit"] = float(m.get("risk_reset_credit") or 0.0)
         snap["live_open_risk_charged_today"] = float(m.get("live_open_risk_charged_today") or m.get("current_day_open_risk") or 0.0)
         rem = float(m.get("remaining")) if snap["cap"] > 0 else float("inf")
         snap["remaining_today"] = max(0.0, rem) if math.isfinite(rem) and snap["cap"] > 0 else rem
@@ -11017,7 +11084,8 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         current_day_open_risk = float(pm.get('current_day_open_risk') or 0.0)
         current_total_open_risk = float(pm.get('current_total_open_risk') or 0.0)
         carried_open_risk = float(pm.get('carried_open_risk') or 0.0)
-        used_today = float(max(0.0, current_day_open_risk - pnl_today))
+        raw_used_today = float(max(0.0, current_day_open_risk - pnl_today))
+        used_today, reset_credit = _risk_day_reset_effective_used(int(uid), user, raw_used_today)
         remaining_raw = float("inf") if cap <= 0 else (cap - used_today)
         opened_today = int(pm.get('opened_today_count') or 0)
         closed_today = int(pm.get('closed_today_count') or 0)
@@ -11037,6 +11105,8 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
             "remaining_new_positions_today": max(0, trade_limit - opened_today) if trade_limit > 0 else 0,
             "realized_loss_today": max(0.0, -pnl_today),
             "used_today": used_today,
+            "used_today_raw": raw_used_today,
+            "risk_reset_credit": float(reset_credit),
             "remaining_today": max(0.0, remaining_raw) if cap > 0 else float("inf"),
             "over_by": max(0.0, -remaining_raw) if cap > 0 else 0.0,
             "pnl_today": pnl_today,
@@ -15976,8 +16046,8 @@ def rr_to_tp(entry: float, sl: float, tp: float) -> float:
 # - Used by both /screen and email selection, and by backtests.
 # =========================================================
 
-QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "66"))
-QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "74"))
+QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "64"))
+QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "68"))
 
 # Soft throttling: how many candidates we score before slicing (keeps compute bounded)
 QUALITY_SCORE_CAND_MULT_SCREEN = int(os.environ.get("QUALITY_SCORE_CAND_MULT_SCREEN", "8"))
@@ -21878,12 +21948,13 @@ def _market_adaptive_clamp_cfg(cfg: dict) -> dict:
             return float(lo), float(hi)
 
     qlo, qhi = _rng('quality_score_min_screen', 52.0, 70.0)
-    out['quality_score_min_screen'] = float(clamp(float(out.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), max(qlo, 60.0), qhi))
-    email_lo = max(qlo + 8.0, 72.0)
-    email_hi = min(qhi + 14.0, 90.0)
+    screen_hi = min(qhi, 66.0)
+    out['quality_score_min_screen'] = float(clamp(float(out.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), max(qlo, 58.0), screen_hi))
+    email_lo = max(qlo + 4.0, 64.0)
+    email_hi = min(screen_hi + 4.0, 70.0)
     out['quality_score_min_email'] = float(clamp(float(out.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), email_lo, email_hi))
     rrlo, rrhi = _rng('min_rr_tp', 1.3, 2.4)
-    out['min_rr_tp'] = float(clamp(float(out.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), rrlo, rrhi))
+    out['min_rr_tp'] = float(clamp(float(out.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), rrlo, min(rrhi, 1.55)))
     alo, ahi = _rng('atr_min_pct', 0.4, 1.5)
     out['atr_min_pct'] = float(clamp(float(out.get('atr_min_pct', ATR_MIN_PCT) or ATR_MIN_PCT), alo, ahi))
     tlo, thi = _rng('tf_align_1h_min_abs', 0.3, 1.2)
@@ -23547,9 +23618,9 @@ def _family_autotune_clamp_cfg(cfg: dict) -> dict:
     cfg['family_f4_balance_pb_relax'] = round(_clamp(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0), 0.0, 0.60), 3)
     cfg['family_f4_balance_ch1_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0), 0.0, 1.10), 3)
     cfg['family_f4_balance_ch15_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0), 0.0, 0.55), 3)
-    cfg['quality_score_min_screen'] = round(_clamp(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), 50.0, 80.0), 2)
-    cfg['quality_score_min_email'] = round(_clamp(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), 58.0, 86.0), 2)
-    cfg['min_rr_tp'] = round(_clamp(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), 0.96, 1.80), 3)
+    cfg['quality_score_min_screen'] = round(_clamp(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), 50.0, 66.0), 2)
+    cfg['quality_score_min_email'] = round(_clamp(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), 58.0, 70.0), 2)
+    cfg['min_rr_tp'] = round(_clamp(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), 0.96, 1.55), 3)
     cfg['tf_align_1h_min_abs'] = round(_clamp(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), 0.20, 1.20), 3)
     return cfg
 
@@ -23828,11 +23899,11 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
 
         if engine == 'A':
             if sess == 'LON':
-                lon_ctx_ch4_min = 0.48 if reach_mode else 0.64
-                lon_ctx_ch1_min = 0.18 if reach_mode else 0.30
+                lon_ctx_ch4_min = 0.42 if reach_mode else 0.56
+                lon_ctx_ch1_min = 0.14 if reach_mode else 0.24
                 if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                     return (False, 'lon_pullback_context_too_weak')
-            if sess == 'NY' and (ch4_abs < 0.80 or ch1_abs < 0.42):
+            if sess == 'NY' and (ch4_abs < 0.72 or ch1_abs < 0.36):
                 return (False, 'ny_pullback_context_too_weak')
             if sess == 'ASIA':
                 if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
@@ -24970,17 +25041,17 @@ def make_setup(
                             _rej("asia_tf_align_fail_short", base, mv, f"f4_balance ch1={ch1:+.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}%")
                             return None
                 elif side == "BUY":
-                    trend_soft_asia = (not balance_reversal_mode) and (float(ch24 or 0.0) >= 4.5) and (float(fut_vol or 0.0) >= 3_000_000.0) and (
-                        float(ch4 or 0.0) >= max(0.14, float(min4) * 0.45)
-                    ) and (float(ch1 or 0.0) >= max(0.06, float(min1) * 0.35) or float(ch15 or 0.0) >= -0.08)
+                    trend_soft_asia = (not balance_reversal_mode) and (float(ch24 or 0.0) >= 3.8) and (float(fut_vol or 0.0) >= 2_500_000.0) and (
+                        float(ch4 or 0.0) >= max(0.10, float(min4) * 0.32)
+                    ) and (float(ch1 or 0.0) >= max(0.04, float(min1) * 0.28) or float(ch15 or 0.0) >= -0.12)
                     asia_ok = bool(ch1 >= min1 and (ch4 >= min4 or balance_reversal_mode and ch24 >= 4.0)) or trend_soft_asia
                     if not asia_ok:
                         _rej("asia_tf_align_fail_long", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need>=({min1},{min4})")
                         return None
                 else:
-                    trend_soft_asia = (not balance_reversal_mode) and (float(ch24 or 0.0) <= -4.5) and (float(fut_vol or 0.0) >= 3_000_000.0) and (
-                        float(ch4 or 0.0) <= -max(0.14, float(min4) * 0.45)
-                    ) and (float(ch1 or 0.0) <= -max(0.06, float(min1) * 0.35) or float(ch15 or 0.0) <= 0.08)
+                    trend_soft_asia = (not balance_reversal_mode) and (float(ch24 or 0.0) <= -3.8) and (float(fut_vol or 0.0) >= 2_500_000.0) and (
+                        float(ch4 or 0.0) <= -max(0.10, float(min4) * 0.32)
+                    ) and (float(ch1 or 0.0) <= -max(0.04, float(min1) * 0.28) or float(ch15 or 0.0) <= 0.12)
                     asia_ok = bool(ch1 <= -min1 and (ch4 <= -min4 or balance_reversal_mode and ch24 <= -4.0)) or trend_soft_asia
                     if not asia_ok:
                         _rej("asia_tf_align_fail_short", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need<=(-{min1},-{min4})")
@@ -25621,13 +25692,13 @@ def make_breakout_setup(
                     else:
                         _rej("no_breakout_trigger", base, mv)
                         return None
-                elif trend_up and float(ch24 or 0.0) >= (3.2 if str(session_name).upper() == 'ASIA' else 4.0) and float(ch4_used or 0.0) >= (0.22 if str(session_name).upper() == 'ASIA' else 0.35) and (float(ch1 or 0.0) >= (-0.35 if str(session_name).upper() == 'ASIA' else -0.25) or float(ch15 or 0.0) >= (-0.22 if str(session_name).upper() == 'ASIA' else -0.15)):
+                elif trend_up and float(ch24 or 0.0) >= (2.8 if str(session_name).upper() == 'ASIA' else 3.6) and float(ch4_used or 0.0) >= (0.10 if str(session_name).upper() == 'ASIA' else 0.28) and (float(ch1 or 0.0) >= (-0.45 if str(session_name).upper() == 'ASIA' else -0.30) or float(ch15 or 0.0) >= (-0.30 if str(session_name).upper() == 'ASIA' else -0.20)):
                     # Trend-continuation soft path: permit F1/F3 style continuation candidates even without a fresh HH breakout.
                     side = "BUY"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) >= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_buy')
                     conf = max(0.0, float(conf) - 0.5)
-                elif trend_dn and float(ch24 or 0.0) <= ( -3.2 if str(session_name).upper() == 'ASIA' else -4.0) and float(ch4_used or 0.0) <= (-0.22 if str(session_name).upper() == 'ASIA' else -0.35) and (float(ch1 or 0.0) <= (0.35 if str(session_name).upper() == 'ASIA' else 0.25) or float(ch15 or 0.0) <= (0.22 if str(session_name).upper() == 'ASIA' else 0.15)):
+                elif trend_dn and float(ch24 or 0.0) <= (-2.8 if str(session_name).upper() == 'ASIA' else -3.6) and float(ch4_used or 0.0) <= (-0.10 if str(session_name).upper() == 'ASIA' else -0.28) and (float(ch1 or 0.0) <= (0.45 if str(session_name).upper() == 'ASIA' else 0.30) or float(ch15 or 0.0) <= (0.30 if str(session_name).upper() == 'ASIA' else 0.20)):
                     side = "SELL"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) <= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_sell')
@@ -27898,6 +27969,7 @@ async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Per-trade risk is separate: /riskmode\n\n"
             "Set examples:\n"
             "• /dailycap pct 5\n"
+            "• /dailycap pct 100\n"
             "• /dailycap usd 60"
         )
         return
@@ -27912,8 +27984,8 @@ async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode not in {"PCT", "USD"}:
         await update.message.reply_text("Mode must be pct or usd")
         return
-    if mode == "PCT" and not (0.0 <= val <= 30):
-        await update.message.reply_text("pct/day should be between 0 and 30")
+    if mode == "PCT" and not (0.0 <= val <= 100):
+        await update.message.reply_text("pct/day should be between 0 and 100")
         return
     if mode == "USD" and val < 0:
         await update.message.reply_text("usd/day must be >= 0")
@@ -27923,6 +27995,61 @@ async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid)
     await update.message.reply_text(
         f"✅ Daily risk cap updated: {mode} {float(val):.2f} (≈ ${daily_cap_usd(user):.2f} per day)"
+    )
+
+
+
+async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: baseline-reset current day risk so remaining daily cap is restored."""
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    user = reset_daily_if_needed(get_user(uid) or {})
+    day_local = _user_day_local(user)
+    cap = float(daily_cap_usd(user) or 0.0)
+    snap = _accounting_snapshot(uid, user, is_admin=True)
+    raw_used = float(snap.get('used_today_raw', snap.get('used_today', 0.0)) or 0.0)
+    effective_used = float(snap.get('used_today', 0.0) or 0.0)
+    existing_credit = float(snap.get('risk_reset_credit', 0.0) or 0.0)
+
+    action = str((context.args[0] if context.args else "reset") or "reset").strip().lower()
+    if action in {"show", "status"}:
+        await update.message.reply_text(
+            "🧮 Daily Risk Reset Status\n"
+            f"• Trading day: {snap.get('today_window_label')}\n"
+            f"• Daily cap: {str(user.get('daily_cap_mode','PCT')).upper()} {float(user.get('daily_cap_value',0.0) or 0.0):.2f} (≈ ${cap:.2f})\n"
+            f"• Raw used today: ${raw_used:.2f}\n"
+            f"• Reset credit: ${existing_credit:.2f}\n"
+            f"• Effective used today: ${effective_used:.2f}\n"
+            f"• Remaining today: {'∞' if cap <= 0 else f'${max(0.0, cap - effective_used):.2f}'}\n\n"
+            "Commands:\n"
+            "• /dayrisk_reset\n"
+            "• /dayrisk_reset clear"
+        )
+        return
+
+    if action in {"clear", "restore", "undo"}:
+        _risk_day_reset_credit_clear(uid, day_local)
+        snap2 = _accounting_snapshot(uid, user, is_admin=True)
+        await update.message.reply_text(
+            "✅ Daily risk reset cleared.\n"
+            f"• Trading day: {snap2.get('today_window_label')}\n"
+            f"• Daily risk used: ${float(snap2.get('used_today', 0.0) or 0.0):.2f}\n"
+            f"• Daily risk remaining: {'∞' if not math.isfinite(float(snap2.get('remaining_today', float('inf')))) else f'${float(snap2.get('remaining_today', 0.0) or 0.0):.2f}'}"
+        )
+        return
+
+    _risk_day_reset_credit_set(uid, day_local, raw_used, note="admin_dayrisk_reset")
+    snap2 = _accounting_snapshot(uid, user, is_admin=True)
+    await update.message.reply_text(
+        "✅ Daily risk baseline reset for the active trading day.\n"
+        f"• Trading day: {snap2.get('today_window_label')}\n"
+        f"• Previous raw used: ${raw_used:.2f}\n"
+        f"• Reset credit now applied: ${float(snap2.get('risk_reset_credit', 0.0) or 0.0):.2f}\n"
+        f"• Daily risk used now: ${float(snap2.get('used_today', 0.0) or 0.0):.2f}\n"
+        f"• Daily risk remaining now: {'∞' if not math.isfinite(float(snap2.get('remaining_today', float('inf')))) else f'${float(snap2.get('remaining_today', 0.0) or 0.0):.2f}'}\n\n"
+        "Use /dayrisk_reset clear to restore the original day accounting."
     )
 
 
@@ -28919,7 +29046,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     realized_loss_today = float(snap.get('realized_loss_today') or 0.0)
     used_today = float(snap.get('used_today') or 0.0)
     remaining_today = snap.get('remaining_today', float('inf'))
-    daily_remaining_display = '∞' if not math.isfinite(float(remaining_today)) else '$' + f"{float(remaining_today):.2f}"
     over_by = float(snap.get('over_by') or 0.0)
     enabled = user_enabled_sessions(user)
     now_s = in_session_now(user)
@@ -28961,7 +29087,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Total open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
         f"• Realised net today: ${pnl_today:+.2f}",
         f"• Daily risk used (open risk - realised net): ${used_today:.2f}",
-        f"• Daily risk remaining: {daily_remaining_display}",
+        f"• Daily risk reset credit: ${float(snap.get('risk_reset_credit', 0.0) or 0.0):.2f}" if float(snap.get('risk_reset_credit', 0.0) or 0.0) > 0 else None,
+        f"• Daily risk remaining: {'∞' if not math.isfinite(float(remaining_today)) else f'${float(remaining_today):.2f}'}",
         SEP,
         'Alerts & sessions',
         f"• Email alerts: {email_alerts_on}",
@@ -28977,6 +29104,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Trade window: {tw_txt}",
         f"• Today basis: {snap.get('today_basis')}",
     ]
+    lines = [ln for ln in lines if ln]
     if over_by > 0:
         lines.append(f"⚠️ Over daily cap by ${over_by:.2f}")
 
@@ -30935,12 +31063,18 @@ def _adaptive_ema_anchor_limit_pct(setup: "Setup", session_name: str, fallback_a
         else:
             limit = max(base, 0.60 + min(0.85, atr_pct * 0.20))
 
+        fam = str(getattr(setup, "family_id", "") or _family_id_from_engine(engine, setup)).upper().strip()
+
         if sess == "ASIA":
-            limit *= 0.92
+            # ASIA was still over-tight even after the dynamic anchor migration.
+            # Keep it disciplined, but stop shrinking the limit below the adaptive base.
+            limit *= 1.02 if fam in {"F1_PULLBACK_CONT", "F3_IMPULSE_BASE_CONT", "F6_VWAP_RECLAIM"} else 0.98
         elif sess == "NY":
             limit *= 1.08
+        elif sess == "LON" and fam in {"F1_PULLBACK_CONT", "F3_IMPULSE_BASE_CONT"}:
+            limit *= 1.02
 
-        return float(clamp(limit, 0.55, 1.85))
+        return float(clamp(limit, 0.60, 1.95))
     except Exception:
         return float(fallback_allowed or EMA_ANCHOR_BASE_MAX_DIST_PCT or 0.80)
 
@@ -30972,10 +31106,14 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     }
     """
 
-    # Setup-count governor (authoritative executable lane): keep flow near target without
-    # making /screen and email diverge.
+    mode = str(mode or '').lower().strip() or 'screen'
+    if mode not in {'screen', 'exec', 'email'}:
+        mode = 'screen'
+
+    # Setup-count governor should only react to the background email lane.
+    # A manual /screen refresh must never silently tighten/loosen live config.
     try:
-        if str(mode or '').lower().strip() in {'email', 'exec'}:
+        if mode == 'email':
             _governor_adjust_quality_floor(session_name=session_name)
     except Exception:
         pass
@@ -31012,6 +31150,20 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         directional_take = 12
         market_take = 15
         trend_take = 12
+    elif mode == "exec":
+        # Authoritative executable pool: broader than email, stricter than screen.
+        # This pool feeds /screen, email and autotrade, so it must not inherit the
+        # tightest email-generation settings or it self-starves before final gating.
+        n_target = int(max(EMAIL_SETUPS_N * 4, 10))
+        strict_15m = True
+        universe_cap = int(max(80, SCREEN_UNIVERSE_N))
+        trigger_loosen = float(min(0.92, max(SCREEN_TRIGGER_LOOSEN, 0.88)))
+        waiting_near = float(SCREEN_WAITING_NEAR_PCT)
+        allow_no_pullback = True
+        scan_multiplier = 12
+        directional_take = 16
+        market_take = 20
+        trend_take = 10
     else:  # email
         # Build a broader candidate pool for the downstream executable gate.
         # The final email/autotrade lane remains strict; the pool itself should not be starved.
@@ -31043,6 +31195,17 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             trend_take = 16
             strict_15m = True
             allow_no_pullback = True
+        elif mode == "exec":
+            n_target = int(max(EMAIL_SETUPS_N * 4, 12))
+            universe_cap = int(max(90, universe_cap))
+            trigger_loosen = 0.88
+            waiting_near = float(min(0.75, SCREEN_WAITING_NEAR_PCT))
+            strict_15m = True
+            allow_no_pullback = True
+            scan_multiplier = 13
+            directional_take = 18
+            market_take = 22
+            trend_take = 10
         else:
             # Email pool becomes broader, but final email gates still apply
             n_target = int(max(EMAIL_SETUPS_N * 3, 9))
@@ -31194,14 +31357,20 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
     trend_watch = []
     trend_bases = []
-    for base in watch_bases:
-        mv = (best_fut or {}).get(base)
-        if not mv:
-            continue
-        r = await to_thread_heavy(trend_watch_for_symbol, base, mv, session_name)
-        if r:
-            trend_watch.append(r)
-            trend_bases.append(base)
+    if mode == 'screen':
+        for base in watch_bases:
+            mv = (best_fut or {}).get(base)
+            if not mv:
+                continue
+            r = await to_thread_heavy(trend_watch_for_symbol, base, mv, session_name)
+            if r:
+                trend_watch.append(r)
+                trend_bases.append(base)
+    else:
+        # The trend-watch cards are a /screen UX feature. Rebuilding them during the
+        # background email/executable pool path wastes OHLCV budget and is a major source
+        # of timeouts without improving the final executable gate.
+        trend_bases = list(watch_bases[:max(6, int(trend_take))])
 
     if trend_bases:
         sub = _subset_best(best_fut, trend_bases[:trend_take])
@@ -31437,7 +31606,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Important: this remains SCREEN-ONLY and still goes through the shared gate below.
     # The setup-generation mismatch fixed in this patch is the session floor override,
     # not a quality bypass for fallback rows.
-    if not ordered and mode == "screen":
+    if not ordered and mode in {"screen", "exec"}:
         try:
             ordered = _fallback_setups_from_universe(best_fut, leaders, losers, market_bases, session_name, max_items=max(4, n_target))
         except Exception:
@@ -34412,6 +34581,7 @@ async def _post_init(app: Application):
             BotCommand("equity", "Set your equity"),
             BotCommand("riskmode", "Set your per-trade risk (used by /size)"),
             BotCommand("dailycap", "Set your total daily risk cap"),
+            BotCommand("dayrisk_reset", "Admin: reset today risk usage"),
             BotCommand("size", "Position size calculator"),
 
             BotCommand("trade_open", "Log an opened position"),
@@ -35538,6 +35708,7 @@ def main():
     app.add_handler(CommandHandler("equity_reset", equity_reset_cmd, block=False))
     app.add_handler(CommandHandler("riskmode", riskmode_cmd, block=False))
     app.add_handler(CommandHandler("dailycap", dailycap_cmd, block=False))
+    app.add_handler(CommandHandler("dayrisk_reset", dayrisk_reset_cmd, block=False))
     app.add_handler(CommandHandler("limits", limits_cmd, block=False))
 
     app.add_handler(CommandHandler("trade_sl", trade_sl_cmd, block=False))
