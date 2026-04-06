@@ -28032,23 +28032,27 @@ async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action in {"clear", "restore", "undo"}:
         _risk_day_reset_credit_clear(uid, day_local)
         snap2 = _accounting_snapshot(uid, user, is_admin=True)
+        remaining2 = float(snap2.get('remaining_today', float('inf')))
+        remaining2_txt = '∞' if not math.isfinite(remaining2) else f'${float(remaining2 or 0.0):.2f}'
         await update.message.reply_text(
             "✅ Daily risk reset cleared.\n"
             f"• Trading day: {snap2.get('today_window_label')}\n"
             f"• Daily risk used: ${float(snap2.get('used_today', 0.0) or 0.0):.2f}\n"
-            f"• Daily risk remaining: {'∞' if not math.isfinite(float(snap2.get('remaining_today', float('inf')))) else f'${float(snap2.get('remaining_today', 0.0) or 0.0):.2f}'}"
+            f"• Daily risk remaining: {remaining2_txt}"
         )
         return
 
     _risk_day_reset_credit_set(uid, day_local, raw_used, note="admin_dayrisk_reset")
     snap2 = _accounting_snapshot(uid, user, is_admin=True)
+    remaining2 = float(snap2.get('remaining_today', float('inf')))
+    remaining2_txt = '∞' if not math.isfinite(remaining2) else f'${float(remaining2 or 0.0):.2f}'
     await update.message.reply_text(
         "✅ Daily risk baseline reset for the active trading day.\n"
         f"• Trading day: {snap2.get('today_window_label')}\n"
         f"• Previous raw used: ${raw_used:.2f}\n"
         f"• Reset credit now applied: ${float(snap2.get('risk_reset_credit', 0.0) or 0.0):.2f}\n"
         f"• Daily risk used now: ${float(snap2.get('used_today', 0.0) or 0.0):.2f}\n"
-        f"• Daily risk remaining now: {'∞' if not math.isfinite(float(snap2.get('remaining_today', float('inf')))) else f'${float(snap2.get('remaining_today', 0.0) or 0.0):.2f}'}\n\n"
+        f"• Daily risk remaining now: {remaining2_txt}\n\n"
         "Use /dayrisk_reset clear to restore the original day accounting."
     )
 
