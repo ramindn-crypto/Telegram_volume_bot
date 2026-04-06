@@ -7619,6 +7619,27 @@ def cache_valid(key: str, ttl: int) -> bool:
     ts, _ = v
     return (time.time() - ts) <= ttl
 
+# Lightweight admin status text cache used by /learning_status, /optimizer_status, /adaptive_status.
+# Keep it process-local and TTL based so expensive diagnostic commands stay responsive without
+# introducing another DB dependency.
+_ADMIN_STATUS_CACHE_PREFIX = "admin_status_cache:"
+
+def _admin_status_cache_get(name: str, ttl: float = 45.0):
+    try:
+        key = f"{_ADMIN_STATUS_CACHE_PREFIX}{str(name or '').strip()}"
+        if ttl is not None and ttl > 0 and cache_valid(key, int(max(1, round(float(ttl))))):
+            return cache_get(key)
+    except Exception:
+        return None
+    return None
+
+def _admin_status_cache_put(name: str, value: Any) -> None:
+    try:
+        key = f"{_ADMIN_STATUS_CACHE_PREFIX}{str(name or '').strip()}"
+        cache_set(key, value)
+    except Exception:
+        return
+
 # =========================================================
 # MATH / INDICATORS HELPERS (MISSING FIX)
 # =========================================================
@@ -24970,17 +24991,17 @@ def make_setup(
                             _rej("asia_tf_align_fail_short", base, mv, f"f4_balance ch1={ch1:+.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}%")
                             return None
                 elif side == "BUY":
-                    trend_soft_asia = (not balance_reversal_mode) and (float(ch24 or 0.0) >= 4.5) and (float(fut_vol or 0.0) >= 3_000_000.0) and (
-                        float(ch4 or 0.0) >= max(0.14, float(min4) * 0.45)
-                    ) and (float(ch1 or 0.0) >= max(0.06, float(min1) * 0.35) or float(ch15 or 0.0) >= -0.08)
+                    trend_soft_asia = (not balance_reversal_mode) and (float(ch24 or 0.0) >= 3.8) and (float(fut_vol or 0.0) >= 2_500_000.0) and (
+                        float(ch4 or 0.0) >= max(0.10, float(min4) * 0.32)
+                    ) and (float(ch1 or 0.0) >= max(0.04, float(min1) * 0.28) or float(ch15 or 0.0) >= -0.12)
                     asia_ok = bool(ch1 >= min1 and (ch4 >= min4 or balance_reversal_mode and ch24 >= 4.0)) or trend_soft_asia
                     if not asia_ok:
                         _rej("asia_tf_align_fail_long", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need>=({min1},{min4})")
                         return None
                 else:
-                    trend_soft_asia = (not balance_reversal_mode) and (float(ch24 or 0.0) <= -4.5) and (float(fut_vol or 0.0) >= 3_000_000.0) and (
-                        float(ch4 or 0.0) <= -max(0.14, float(min4) * 0.45)
-                    ) and (float(ch1 or 0.0) <= -max(0.06, float(min1) * 0.35) or float(ch15 or 0.0) <= 0.08)
+                    trend_soft_asia = (not balance_reversal_mode) and (float(ch24 or 0.0) <= -3.8) and (float(fut_vol or 0.0) >= 2_500_000.0) and (
+                        float(ch4 or 0.0) <= -max(0.10, float(min4) * 0.32)
+                    ) and (float(ch1 or 0.0) <= -max(0.04, float(min1) * 0.28) or float(ch15 or 0.0) <= 0.12)
                     asia_ok = bool(ch1 <= -min1 and (ch4 <= -min4 or balance_reversal_mode and ch24 <= -4.0)) or trend_soft_asia
                     if not asia_ok:
                         _rej("asia_tf_align_fail_short", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need<=(-{min1},-{min4})")
@@ -25621,13 +25642,13 @@ def make_breakout_setup(
                     else:
                         _rej("no_breakout_trigger", base, mv)
                         return None
-                elif trend_up and float(ch24 or 0.0) >= (3.2 if str(session_name).upper() == 'ASIA' else 4.0) and float(ch4_used or 0.0) >= (0.22 if str(session_name).upper() == 'ASIA' else 0.35) and (float(ch1 or 0.0) >= (-0.35 if str(session_name).upper() == 'ASIA' else -0.25) or float(ch15 or 0.0) >= (-0.22 if str(session_name).upper() == 'ASIA' else -0.15)):
+                elif trend_up and float(ch24 or 0.0) >= (2.8 if str(session_name).upper() == 'ASIA' else 3.6) and float(ch4_used or 0.0) >= (0.10 if str(session_name).upper() == 'ASIA' else 0.28) and (float(ch1 or 0.0) >= (-0.45 if str(session_name).upper() == 'ASIA' else -0.30) or float(ch15 or 0.0) >= (-0.30 if str(session_name).upper() == 'ASIA' else -0.20)):
                     # Trend-continuation soft path: permit F1/F3 style continuation candidates even without a fresh HH breakout.
                     side = "BUY"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) >= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_buy')
                     conf = max(0.0, float(conf) - 0.5)
-                elif trend_dn and float(ch24 or 0.0) <= ( -3.2 if str(session_name).upper() == 'ASIA' else -4.0) and float(ch4_used or 0.0) <= (-0.22 if str(session_name).upper() == 'ASIA' else -0.35) and (float(ch1 or 0.0) <= (0.35 if str(session_name).upper() == 'ASIA' else 0.25) or float(ch15 or 0.0) <= (0.22 if str(session_name).upper() == 'ASIA' else 0.15)):
+                elif trend_dn and float(ch24 or 0.0) <= (-2.8 if str(session_name).upper() == 'ASIA' else -3.6) and float(ch4_used or 0.0) <= (-0.10 if str(session_name).upper() == 'ASIA' else -0.28) and (float(ch1 or 0.0) <= (0.45 if str(session_name).upper() == 'ASIA' else 0.30) or float(ch15 or 0.0) <= (0.30 if str(session_name).upper() == 'ASIA' else 0.20)):
                     side = "SELL"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) <= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_sell')
@@ -30934,12 +30955,18 @@ def _adaptive_ema_anchor_limit_pct(setup: "Setup", session_name: str, fallback_a
         else:
             limit = max(base, 0.60 + min(0.85, atr_pct * 0.20))
 
+        fam = str(getattr(setup, "family_id", "") or _family_id_from_engine(engine, setup)).upper().strip()
+
         if sess == "ASIA":
-            limit *= 0.92
+            # ASIA was still over-tight even after the dynamic anchor migration.
+            # Keep it disciplined, but stop shrinking the limit below the adaptive base.
+            limit *= 1.02 if fam in {"F1_PULLBACK_CONT", "F3_IMPULSE_BASE_CONT", "F6_VWAP_RECLAIM"} else 0.98
         elif sess == "NY":
             limit *= 1.08
+        elif sess == "LON" and fam in {"F1_PULLBACK_CONT", "F3_IMPULSE_BASE_CONT"}:
+            limit *= 1.02
 
-        return float(clamp(limit, 0.55, 1.85))
+        return float(clamp(limit, 0.60, 1.95))
     except Exception:
         return float(fallback_allowed or EMA_ANCHOR_BASE_MAX_DIST_PCT or 0.80)
 
@@ -30971,10 +30998,14 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     }
     """
 
-    # Setup-count governor (authoritative executable lane): keep flow near target without
-    # making /screen and email diverge.
+    mode = str(mode or '').lower().strip() or 'screen'
+    if mode not in {'screen', 'exec', 'email'}:
+        mode = 'screen'
+
+    # Setup-count governor should only react to the background email lane.
+    # A manual /screen refresh must never silently tighten/loosen live config.
     try:
-        if str(mode or '').lower().strip() in {'email', 'exec'}:
+        if mode == 'email':
             _governor_adjust_quality_floor(session_name=session_name)
     except Exception:
         pass
@@ -31011,6 +31042,20 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         directional_take = 12
         market_take = 15
         trend_take = 12
+    elif mode == "exec":
+        # Authoritative executable pool: broader than email, stricter than screen.
+        # This pool feeds /screen, email and autotrade, so it must not inherit the
+        # tightest email-generation settings or it self-starves before final gating.
+        n_target = int(max(EMAIL_SETUPS_N * 4, 10))
+        strict_15m = True
+        universe_cap = int(max(80, SCREEN_UNIVERSE_N))
+        trigger_loosen = float(min(0.92, max(SCREEN_TRIGGER_LOOSEN, 0.88)))
+        waiting_near = float(SCREEN_WAITING_NEAR_PCT)
+        allow_no_pullback = True
+        scan_multiplier = 12
+        directional_take = 16
+        market_take = 20
+        trend_take = 10
     else:  # email
         # Build a broader candidate pool for the downstream executable gate.
         # The final email/autotrade lane remains strict; the pool itself should not be starved.
@@ -31042,6 +31087,17 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             trend_take = 16
             strict_15m = True
             allow_no_pullback = True
+        elif mode == "exec":
+            n_target = int(max(EMAIL_SETUPS_N * 4, 12))
+            universe_cap = int(max(90, universe_cap))
+            trigger_loosen = 0.88
+            waiting_near = float(min(0.75, SCREEN_WAITING_NEAR_PCT))
+            strict_15m = True
+            allow_no_pullback = True
+            scan_multiplier = 13
+            directional_take = 18
+            market_take = 22
+            trend_take = 10
         else:
             # Email pool becomes broader, but final email gates still apply
             n_target = int(max(EMAIL_SETUPS_N * 3, 9))
@@ -31193,14 +31249,20 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
     trend_watch = []
     trend_bases = []
-    for base in watch_bases:
-        mv = (best_fut or {}).get(base)
-        if not mv:
-            continue
-        r = await to_thread_heavy(trend_watch_for_symbol, base, mv, session_name)
-        if r:
-            trend_watch.append(r)
-            trend_bases.append(base)
+    if mode == 'screen':
+        for base in watch_bases:
+            mv = (best_fut or {}).get(base)
+            if not mv:
+                continue
+            r = await to_thread_heavy(trend_watch_for_symbol, base, mv, session_name)
+            if r:
+                trend_watch.append(r)
+                trend_bases.append(base)
+    else:
+        # The trend-watch cards are a /screen UX feature. Rebuilding them during the
+        # background email/executable pool path wastes OHLCV budget and is a major source
+        # of timeouts without improving the final executable gate.
+        trend_bases = list(watch_bases[:max(6, int(trend_take))])
 
     if trend_bases:
         sub = _subset_best(best_fut, trend_bases[:trend_take])
@@ -31436,7 +31498,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Important: this remains SCREEN-ONLY and still goes through the shared gate below.
     # The setup-generation mismatch fixed in this patch is the session floor override,
     # not a quality bypass for fallback rows.
-    if not ordered and mode == "screen":
+    if not ordered and mode in {"screen", "exec"}:
         try:
             ordered = _fallback_setups_from_universe(best_fut, leaders, losers, market_bases, session_name, max_items=max(4, n_target))
         except Exception:
