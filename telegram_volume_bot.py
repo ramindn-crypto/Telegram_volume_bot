@@ -436,6 +436,26 @@ def _recent_user_activity(window_sec: int | None = None) -> bool:
         return False
 
 
+def _goal_profile_quiet_window_ok(now_ts: float | None = None) -> bool:
+    """Allow scheduled goal-profile work mainly during quiet local hours.
+
+    Manual /goal_run remains available any time; this only affects background scheduling so it does
+    not steal OHLCV bandwidth from live setup generation during the trading day.
+    """
+    try:
+        ts = float(now_ts if now_ts is not None else time.time())
+        tz_local = ZoneInfo(TIMEZONE)
+        dt_local = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz_local)
+        start_h = int(os.getenv('GOAL_PROFILE_QUIET_START_HOUR', '1') or 1)
+        end_h = int(os.getenv('GOAL_PROFILE_QUIET_END_HOUR', '6') or 6)
+        hour = int(dt_local.hour)
+        if start_h <= end_h:
+            return start_h <= hour < end_h
+        return hour >= start_h or hour < end_h
+    except Exception:
+        return True
+
+
 import re
 import sqlite3
 
@@ -15033,11 +15053,50 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
 _OHLCV_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 _OHLCV_TF_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 _OHLCV_RATE_LIMIT_WARN_UNTIL: Dict[str, float] = {}
+_OHLCV_LAST_KEY: Dict[str, str] = {}
 OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "60") or 60)
 OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "90") or 90)
 BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC", "6") or 6)
 BYBIT_OPEN_ORDERS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_ORDERS_CACHE_TTL_SEC", "6") or 6)
 SCREEN_DIRECTIONAL_CACHE_TTL_SEC = int(os.getenv("SCREEN_DIRECTIONAL_CACHE_TTL_SEC", "45") or 45)
+
+
+def _ohlcv_best_effort_cached(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
+    """Return the best cached OHLCV rows for a symbol/timeframe even if the exact limit key is cold.
+
+    This prevents setup generation from collapsing into ohlcv_missing_or_insufficient when one exact
+    cache key was rate-limited but another nearby key already exists.
+    """
+    try:
+        exact = cache_get(f"ohlcv:{symbol}:{timeframe}:{limit}")
+        if isinstance(exact, list) and exact:
+            return exact[-int(limit):] if len(exact) > int(limit) else exact
+    except Exception:
+        pass
+    best = []
+    best_len = 0
+    try:
+        lk = _OHLCV_LAST_KEY.get(f"{symbol}|{timeframe}")
+        if lk:
+            rows = cache_get(lk)
+            if isinstance(rows, list) and len(rows) > best_len:
+                best = rows
+                best_len = len(rows)
+    except Exception:
+        pass
+    prefix = f"ohlcv:{symbol}:{timeframe}:"
+    try:
+        for k, (_ts, rows) in list(_CACHE.items()):
+            if not str(k).startswith(prefix):
+                continue
+            if isinstance(rows, list) and len(rows) > best_len:
+                best = rows
+                best_len = len(rows)
+    except Exception:
+        pass
+    if isinstance(best, list) and best:
+        return best[-int(limit):] if len(best) > int(limit) else best
+    return []
 
 
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
@@ -15058,13 +15117,18 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     cool_until = float(_OHLCV_RATE_LIMIT_UNTIL.get(key) or 0.0)
     tf_cool_until = float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0)
     if cool_until > now_ts or tf_cool_until > now_ts:
-        stale = cache_get(key)
+        stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
         return stale if isinstance(stale, list) else []
 
     ex = get_exchange()
     try:
         data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
         cache_set(key, data)
+        try:
+            if isinstance(data, list) and data:
+                _OHLCV_LAST_KEY[f"{symbol}|{timeframe}"] = key
+        except Exception:
+            pass
         _OHLCV_RATE_LIMIT_UNTIL.pop(key, None)
         _OHLCV_TF_RATE_LIMIT_UNTIL.pop(tf_key, None)
         return data
@@ -15083,7 +15147,7 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
                     logger.warning('fetch_ohlcv rate-limited for %s %s x%s; cooling %ss and using stale cache if available', symbol, timeframe, limit, int(tf_cd))
                 except Exception:
                     pass
-        stale = cache_get(key)
+        stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
         if isinstance(stale, list):
             return stale
         return []
@@ -15519,7 +15583,9 @@ def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float
     """
     need_1h = max(ATR_PERIOD + 6, 35)
     c1 = fetch_ohlcv(market_symbol, "1h", limit=need_1h)
-    if not c1 or len(c1) < 25:
+    if (not c1 or len(c1) < 25):
+        c1 = _ohlcv_best_effort_cached(market_symbol, "1h", need_1h)
+    if not c1 or len(c1) < 20:
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0, [], []
 
     closes_1h = [float(x[4]) for x in c1]
@@ -15531,8 +15597,10 @@ def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float
     ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
     atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
 
-    c15 = fetch_ohlcv(market_symbol, "15m", limit=80)
-    if not c15 or len(c15) < 20:
+    c15 = fetch_ohlcv(market_symbol, "15m", limit=60)
+    if (not c15 or len(c15) < 20):
+        c15 = _ohlcv_best_effort_cached(market_symbol, "15m", 60)
+    if not c15 or len(c15) < 16:
         return ch1, ch4, 0.0, atr_1h, 0.0, 0, [], c1
 
     closes_15 = [float(x[4]) for x in c15]
@@ -23479,9 +23547,9 @@ def _family_autotune_clamp_cfg(cfg: dict) -> dict:
     cfg['family_f4_balance_pb_relax'] = round(_clamp(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0), 0.0, 0.60), 3)
     cfg['family_f4_balance_ch1_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0), 0.0, 1.10), 3)
     cfg['family_f4_balance_ch15_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0), 0.0, 0.55), 3)
-    cfg['quality_score_min_screen'] = round(_clamp(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), 54.0, 80.0), 2)
-    cfg['quality_score_min_email'] = round(_clamp(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), 62.0, 86.0), 2)
-    cfg['min_rr_tp'] = round(_clamp(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), 1.06, 1.80), 3)
+    cfg['quality_score_min_screen'] = round(_clamp(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), 50.0, 80.0), 2)
+    cfg['quality_score_min_email'] = round(_clamp(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), 58.0, 86.0), 2)
+    cfg['min_rr_tp'] = round(_clamp(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), 0.96, 1.80), 3)
     cfg['tf_align_1h_min_abs'] = round(_clamp(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), 0.20, 1.20), 3)
     return cfg
 
@@ -23528,6 +23596,18 @@ def _run_family_autotune_cycle(force: bool = False) -> dict:
         total_flow = max(int(snap.get('signals', 0) or 0), int(snap.get('executable', 0) or 0), int(snap.get('emailed', 0) or 0))
         low_flow = total_flow < 2
         severe_drought = total_flow < 1
+        missing_data = int(rejects.get('ohlcv_missing_or_insufficient', 0) or 0)
+
+        if missing_data >= 4 and low_flow:
+            report = {
+                'ts': now_ts, 'status': 'DATA_STARVED', 'actions': [], 'snapshot': snap,
+                'rejects': dict(sorted(rejects.items(), key=lambda kv: int(kv[1]), reverse=True)[:8]),
+                'goal_30d': {'setups_per_day': spd30, 'win_rate': wr30},
+                'active_regimes': sorted(list(active_regimes)), 'active_champions': sorted([x for x in active_champions if x]),
+                'note': 'Dominant OHLCV starvation detected; threshold autotune skipped.'
+            }
+            save_family_autotune_report(report)
+            return report
 
         if balance_f4 and low_flow:
             if int(rejects.get('no_breakout_trigger', 0) or 0) >= 1 or int(rejects.get('no_engine_passed', 0) or 0) >= 1:
@@ -23549,17 +23629,18 @@ def _run_family_autotune_cycle(force: bool = False) -> dict:
                 act('family_f4_balance_score_relax', round(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0) + 0.75, 2), 'balance_low_flow_structure')
         elif trend_active and low_flow:
             if int(rejects.get('ch1_below_trigger', 0) or 0) >= 1 or int(rejects.get('15m_weak_and_not_early', 0) or 0) >= 1 or int(rejects.get('no_breakout_trigger', 0) or 0) >= 2:
-                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.5, 2), 'trend_low_flow_trigger')
-                act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 1.0, 2), 'trend_low_flow_trigger')
-                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.03, 3), 'trend_low_flow_trigger')
-            if int(rejects.get('far_from_ema_anchor_1h', 0) or 0) >= 1 or int(rejects.get('pullback_required_not_met', 0) or 0) >= 1:
-                act('tf_align_1h_min_abs', round(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS) - 0.07, 3), 'trend_low_flow_align')
+                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 2.0, 2), 'trend_low_flow_trigger')
+                act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 1.5, 2), 'trend_low_flow_trigger')
+                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.05, 3), 'trend_low_flow_trigger')
+            if int(rejects.get('asia_tf_align_fail_long', 0) or 0) >= 1 or int(rejects.get('asia_tf_align_fail_short', 0) or 0) >= 1 or int(rejects.get('far_from_ema_anchor_1h', 0) or 0) >= 1 or int(rejects.get('pullback_required_not_met', 0) or 0) >= 1:
+                act('tf_align_1h_min_abs', round(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS) - 0.10, 3), 'trend_low_flow_align')
+                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.0, 2), 'trend_low_flow_align')
             if int(rejects.get('below_min_confidence', 0) or 0) >= 1 or severe_drought:
-                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.5, 2), 'trend_low_flow_conf')
-                act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 0.5, 2), 'trend_low_flow_conf')
-                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.04, 3), 'trend_low_flow_conf')
+                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 2.0, 2), 'trend_low_flow_conf')
+                act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 1.0, 2), 'trend_low_flow_conf')
+                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.05, 3), 'trend_low_flow_conf')
             if int(rejects.get('below_min_rr_tp_session', 0) or 0) >= 1:
-                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.04, 3), 'trend_low_flow_rr')
+                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.05, 3), 'trend_low_flow_rr')
         elif spd30 > 4.5 and wr30 < 42.0:
             act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) + 1.0, 2), 'tighten_high_flow_low_wr')
             act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) + 0.03, 3), 'tighten_high_flow_low_wr')
@@ -23603,7 +23684,10 @@ async def goal_profile_job(context: ContextTypes.DEFAULT_TYPE):
             return
         if ALERT_LOCK.locked() or SCAN_LOCK.locked() or _SCREEN_LOCK.locked():
             return
-        if not _goal_profile_is_due(time.time(), cfg=cfg):
+        now_ts = float(time.time())
+        if not _goal_profile_is_due(now_ts, cfg=cfg):
+            return
+        if not _goal_profile_quiet_window_ok(now_ts):
             return
         await to_thread_heavy(_run_goal_profile_cycle, False, timeout=max(900, int(float(tgt.get('interval_hours', 24.0) or 24.0) * 1800)))
     except Exception:
@@ -23635,7 +23719,9 @@ async def research_framework_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
             last_ts = float(rep.get('ts', 0.0) or 0.0)
             interval_sec = max(21600.0, float(tgt.get('interval_hours', 24.0) or 24.0) * 3600.0)
             overdue = (last_ts <= 0.0) or ((now_ts - last_ts) >= (interval_sec + 5400.0))
-            if overdue and _goal_profile_is_due(now_ts, cfg=cfg):
+            quiet_ok = _goal_profile_quiet_window_ok(now_ts)
+            hard_overdue = (last_ts <= 0.0) or ((now_ts - last_ts) >= (interval_sec + 43200.0))
+            if overdue and _goal_profile_is_due(now_ts, cfg=cfg) and (quiet_ok or hard_overdue):
                 try:
                     await to_thread_heavy(_run_goal_profile_cycle, False, timeout=max(600, int(interval_sec * 0.75)))
                 except Exception:
@@ -24789,9 +24875,16 @@ def make_setup(
                 ratio = (abs(float(ch1)) / float(trig_min)) if float(trig_min) > 0 else 0.0
             except Exception:
                 ratio = 0.0
+            trend_active_mode = not _research_balance_reversal_mode(session_name)
             soft_override = (ratio >= 0.70) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
                 abs(float(ch4_used or 0.0)) >= 0.50 or abs(float(ch24 or 0.0)) >= 12.0
             )
+            if trend_active_mode and str(session_name).upper() == 'ASIA':
+                soft_override = soft_override or (
+                    ratio >= 0.38 and float(fut_vol or 0.0) >= 3_000_000.0 and (
+                        abs(float(ch4_used or 0.0)) >= 0.24 or abs(float(ch24 or 0.0)) >= 5.0 or abs(float(ch15 or 0.0)) >= 0.08
+                    )
+                )
             balance_reversal_mode = _research_balance_reversal_mode(session_name)
             balance_reversal_override = False
             try:
@@ -24877,12 +24970,18 @@ def make_setup(
                             _rej("asia_tf_align_fail_short", base, mv, f"f4_balance ch1={ch1:+.2f}% ch4={ch4:+.2f}% ch24={ch24:+.2f}%")
                             return None
                 elif side == "BUY":
-                    asia_ok = bool(ch1 >= min1 and (ch4 >= min4 or balance_reversal_mode and ch24 >= 4.0))
+                    trend_soft_asia = (not balance_reversal_mode) and (float(ch24 or 0.0) >= 4.5) and (float(fut_vol or 0.0) >= 3_000_000.0) and (
+                        float(ch4 or 0.0) >= max(0.14, float(min4) * 0.45)
+                    ) and (float(ch1 or 0.0) >= max(0.06, float(min1) * 0.35) or float(ch15 or 0.0) >= -0.08)
+                    asia_ok = bool(ch1 >= min1 and (ch4 >= min4 or balance_reversal_mode and ch24 >= 4.0)) or trend_soft_asia
                     if not asia_ok:
                         _rej("asia_tf_align_fail_long", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need>=({min1},{min4})")
                         return None
                 else:
-                    asia_ok = bool(ch1 <= -min1 and (ch4 <= -min4 or balance_reversal_mode and ch24 <= -4.0))
+                    trend_soft_asia = (not balance_reversal_mode) and (float(ch24 or 0.0) <= -4.5) and (float(fut_vol or 0.0) >= 3_000_000.0) and (
+                        float(ch4 or 0.0) <= -max(0.14, float(min4) * 0.45)
+                    ) and (float(ch1 or 0.0) <= -max(0.06, float(min1) * 0.35) or float(ch15 or 0.0) <= 0.08)
+                    asia_ok = bool(ch1 <= -min1 and (ch4 <= -min4 or balance_reversal_mode and ch24 <= -4.0)) or trend_soft_asia
                     if not asia_ok:
                         _rej("asia_tf_align_fail_short", base, mv, f"ch1={ch1:+.2f}% ch4={ch4:+.2f}% need<=(-{min1},-{min4})")
                         return None
@@ -25500,9 +25599,9 @@ def make_breakout_setup(
         else:
             # Balanced fallback: strong momentum continuation (not a fresh HH/LL break)
             if vol_ok:
-                if (ch4_used >= 4.0 and ch24 >= 12.0):
+                if (ch4_used >= 2.5 and ch24 >= 8.0):
                     side = "BUY"
-                elif (ch4_used <= -4.0 and ch24 <= -12.0):
+                elif (ch4_used <= -2.5 and ch24 <= -8.0):
                     side = "SELL"
                 elif _research_balance_reversal_mode(session_name) and abs(float(ch24 or 0.0)) >= 2.6:
                     # In BALANCE / reclaim regimes, allow a fade-style trigger when the 24h move is extended
@@ -25522,13 +25621,13 @@ def make_breakout_setup(
                     else:
                         _rej("no_breakout_trigger", base, mv)
                         return None
-                elif trend_up and float(ch24 or 0.0) >= 4.0 and float(ch4_used or 0.0) >= 0.45 and (float(ch1 or 0.0) >= -0.20 or float(ch15 or 0.0) >= -0.12):
+                elif trend_up and float(ch24 or 0.0) >= (3.2 if str(session_name).upper() == 'ASIA' else 4.0) and float(ch4_used or 0.0) >= (0.22 if str(session_name).upper() == 'ASIA' else 0.35) and (float(ch1 or 0.0) >= (-0.35 if str(session_name).upper() == 'ASIA' else -0.25) or float(ch15 or 0.0) >= (-0.22 if str(session_name).upper() == 'ASIA' else -0.15)):
                     # Trend-continuation soft path: permit F1/F3 style continuation candidates even without a fresh HH breakout.
                     side = "BUY"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) >= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_buy')
                     conf = max(0.0, float(conf) - 0.5)
-                elif trend_dn and float(ch24 or 0.0) <= -4.0 and float(ch4_used or 0.0) <= -0.45 and (float(ch1 or 0.0) <= 0.20 or float(ch15 or 0.0) <= 0.12):
+                elif trend_dn and float(ch24 or 0.0) <= ( -3.2 if str(session_name).upper() == 'ASIA' else -4.0) and float(ch4_used or 0.0) <= (-0.22 if str(session_name).upper() == 'ASIA' else -0.35) and (float(ch1 or 0.0) <= (0.35 if str(session_name).upper() == 'ASIA' else 0.25) or float(ch15 or 0.0) <= (0.22 if str(session_name).upper() == 'ASIA' else 0.15)):
                     side = "SELL"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) <= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_sell')
