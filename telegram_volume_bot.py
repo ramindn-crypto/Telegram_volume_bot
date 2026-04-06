@@ -23439,23 +23439,22 @@ def _family_autotune_latest_reject_agg() -> dict:
         pass
     if not cand:
         return {}
-    try:
-        rec = max(cand, key=lambda r: float((r or {}).get('ts') or 0.0))
-    except Exception:
-        rec = cand[-1]
-    agg = dict((rec or {}).get('__agg__') or {})
-    if agg:
-        return agg
-    counts = dict((rec or {}).get('counts') or {})
     out = {}
-    for k, v in counts.items():
-        rr = str(k).split(':', 1)[-1]
-        out[rr] = int(out.get(rr, 0) or 0) + int(v or 0)
+    for rec in cand:
+        agg = dict((rec or {}).get('__agg__') or {})
+        if agg:
+            for k, v in agg.items():
+                out[str(k)] = int(out.get(str(k), 0) or 0) + int(v or 0)
+            continue
+        counts = dict((rec or {}).get('counts') or {})
+        for k, v in counts.items():
+            rr = str(k).split(':', 1)[-1]
+            out[rr] = int(out.get(rr, 0) or 0) + int(v or 0)
     return out
 
 
 def _family_autotune_data_snapshot(hours: int = 24) -> dict:
-    out = {'signals': 0, 'exec': 0, 'emailed': 0, 'trading_day': _research_trading_day_label(time.time())}
+    out = {'signals': 0, 'exec': 0, 'executable': 0, 'emailed': 0, 'trading_day': _research_trading_day_label(time.time())}
     since_ts = float(time.time() - max(1, int(hours)) * 3600.0)
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -23464,6 +23463,7 @@ def _family_autotune_data_snapshot(hours: int = 24) -> dict:
             out['signals'] = int((cur.fetchone() or [0])[0] or 0)
             cur.execute('SELECT COUNT(1) FROM executable_setups WHERE executable_ts>=?', (since_ts,))
             out['exec'] = int((cur.fetchone() or [0])[0] or 0)
+            out['executable'] = int(out['exec'] or 0)
             cur.execute('SELECT COUNT(1) FROM emailed_setups WHERE emailed_ts>=?', (since_ts,))
             out['emailed'] = int((cur.fetchone() or [0])[0] or 0)
     except Exception:
@@ -23479,9 +23479,9 @@ def _family_autotune_clamp_cfg(cfg: dict) -> dict:
     cfg['family_f4_balance_pb_relax'] = round(_clamp(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0), 0.0, 0.60), 3)
     cfg['family_f4_balance_ch1_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0), 0.0, 1.10), 3)
     cfg['family_f4_balance_ch15_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0), 0.0, 0.55), 3)
-    cfg['quality_score_min_screen'] = round(_clamp(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), 56.0, 80.0), 2)
-    cfg['quality_score_min_email'] = round(_clamp(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), 64.0, 86.0), 2)
-    cfg['min_rr_tp'] = round(_clamp(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), 1.12, 1.80), 3)
+    cfg['quality_score_min_screen'] = round(_clamp(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), 54.0, 80.0), 2)
+    cfg['quality_score_min_email'] = round(_clamp(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), 62.0, 86.0), 2)
+    cfg['min_rr_tp'] = round(_clamp(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), 1.06, 1.80), 3)
     cfg['tf_align_1h_min_abs'] = round(_clamp(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), 0.20, 1.20), 3)
     return cfg
 
@@ -23530,30 +23530,36 @@ def _run_family_autotune_cycle(force: bool = False) -> dict:
         severe_drought = total_flow < 1
 
         if balance_f4 and low_flow:
-            if int(rejects.get('no_breakout_trigger', 0) or 0) >= 1 or int(rejects.get('no_engine_passed', 0) or 0) >= 2:
-                act('family_f4_balance_score_relax', round(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0) + 0.75, 2), 'balance_low_flow_breakout')
-                act('family_f4_balance_pb_relax', round(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0) + 0.08, 3), 'balance_low_flow_breakout')
-                act('family_f4_balance_ch1_relax', round(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0) + 0.12, 3), 'balance_low_flow_breakout')
-                act('family_f4_balance_ch15_relax', round(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0) + 0.06, 3), 'balance_low_flow_breakout')
-            if int(rejects.get('below_min_confidence', 0) or 0) >= 2:
+            if int(rejects.get('no_breakout_trigger', 0) or 0) >= 1 or int(rejects.get('no_engine_passed', 0) or 0) >= 1:
+                act('family_f4_balance_score_relax', round(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0) + 1.00, 2), 'balance_low_flow_breakout')
+                act('family_f4_balance_pb_relax', round(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0) + 0.10, 3), 'balance_low_flow_breakout')
+                act('family_f4_balance_ch1_relax', round(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0) + 0.16, 3), 'balance_low_flow_breakout')
+                act('family_f4_balance_ch15_relax', round(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0) + 0.08, 3), 'balance_low_flow_breakout')
+            if int(rejects.get('below_min_confidence', 0) or 0) >= 1:
                 act('family_f4_balance_conf_relax', int(float(cfg.get('family_f4_balance_conf_relax', 0) or 0)) + 1, 'balance_low_flow_conf')
-                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.5, 2), 'balance_low_flow_conf')
+                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 2.0, 2), 'balance_low_flow_conf')
+                act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 1.0, 2), 'balance_low_flow_conf')
             if int(rejects.get('below_min_rr_tp_session', 0) or 0) >= 1:
-                act('family_f4_balance_rr_relax', round(float(cfg.get('family_f4_balance_rr_relax', 0.0) or 0.0) + 0.04, 3), 'balance_low_flow_rr')
-                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.04, 3), 'balance_low_flow_rr')
-            if int(rejects.get('far_from_ema_anchor_1h', 0) or 0) >= 2 or int(rejects.get('pullback_required_not_met', 0) or 0) >= 2:
-                act('family_f4_balance_pb_relax', round(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0) + 0.08, 3), 'balance_low_flow_ema')
-            if int(rejects.get('smc_choch_against_long', 0) or 0) >= 2 or int(rejects.get('pro_structure_trend_conflict', 0) or 0) >= 2:
-                act('family_f4_balance_score_relax', round(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0) + 0.5, 2), 'balance_low_flow_structure')
+                act('family_f4_balance_rr_relax', round(float(cfg.get('family_f4_balance_rr_relax', 0.0) or 0.0) + 0.05, 3), 'balance_low_flow_rr')
+                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.05, 3), 'balance_low_flow_rr')
+            if int(rejects.get('far_from_ema_anchor_1h', 0) or 0) >= 1 or int(rejects.get('pullback_required_not_met', 0) or 0) >= 1:
+                act('family_f4_balance_pb_relax', round(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0) + 0.10, 3), 'balance_low_flow_ema')
+                act('tf_align_1h_min_abs', round(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS) - 0.05, 3), 'balance_low_flow_ema')
+            if int(rejects.get('smc_choch_against_long', 0) or 0) >= 1 or int(rejects.get('pro_structure_trend_conflict', 0) or 0) >= 1:
+                act('family_f4_balance_score_relax', round(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0) + 0.75, 2), 'balance_low_flow_structure')
         elif trend_active and low_flow:
-            if int(rejects.get('ch1_below_trigger', 0) or 0) >= 2 or int(rejects.get('15m_weak_and_not_early', 0) or 0) >= 2 or int(rejects.get('no_breakout_trigger', 0) or 0) >= 3:
-                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.0, 2), 'trend_low_flow_trigger')
+            if int(rejects.get('ch1_below_trigger', 0) or 0) >= 1 or int(rejects.get('15m_weak_and_not_early', 0) or 0) >= 1 or int(rejects.get('no_breakout_trigger', 0) or 0) >= 2:
+                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.5, 2), 'trend_low_flow_trigger')
                 act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 1.0, 2), 'trend_low_flow_trigger')
-            if int(rejects.get('far_from_ema_anchor_1h', 0) or 0) >= 2 or int(rejects.get('pullback_required_not_met', 0) or 0) >= 2:
-                act('tf_align_1h_min_abs', round(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS) - 0.05, 3), 'trend_low_flow_align')
-            if int(rejects.get('below_min_confidence', 0) or 0) >= 2 or severe_drought:
-                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.0, 2), 'trend_low_flow_conf')
-                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.03, 3), 'trend_low_flow_conf')
+                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.03, 3), 'trend_low_flow_trigger')
+            if int(rejects.get('far_from_ema_anchor_1h', 0) or 0) >= 1 or int(rejects.get('pullback_required_not_met', 0) or 0) >= 1:
+                act('tf_align_1h_min_abs', round(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS) - 0.07, 3), 'trend_low_flow_align')
+            if int(rejects.get('below_min_confidence', 0) or 0) >= 1 or severe_drought:
+                act('quality_score_min_screen', round(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN) - 1.5, 2), 'trend_low_flow_conf')
+                act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) - 0.5, 2), 'trend_low_flow_conf')
+                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.04, 3), 'trend_low_flow_conf')
+            if int(rejects.get('below_min_rr_tp_session', 0) or 0) >= 1:
+                act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) - 0.04, 3), 'trend_low_flow_rr')
         elif spd30 > 4.5 and wr30 < 42.0:
             act('quality_score_min_email', round(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL) + 1.0, 2), 'tighten_high_flow_low_wr')
             act('min_rr_tp', round(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP) + 0.03, 3), 'tighten_high_flow_low_wr')
@@ -25516,6 +25522,17 @@ def make_breakout_setup(
                     else:
                         _rej("no_breakout_trigger", base, mv)
                         return None
+                elif trend_up and float(ch24 or 0.0) >= 4.0 and float(ch4_used or 0.0) >= 0.45 and (float(ch1 or 0.0) >= -0.20 or float(ch15 or 0.0) >= -0.12):
+                    # Trend-continuation soft path: permit F1/F3 style continuation candidates even without a fresh HH breakout.
+                    side = "BUY"
+                    family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) >= 0 else 'F3_IMPULSE_BASE_CONT')
+                    notes.append('🟡 trend_no_breakout_soft_buy')
+                    conf = max(0.0, float(conf) - 0.5)
+                elif trend_dn and float(ch24 or 0.0) <= -4.0 and float(ch4_used or 0.0) <= -0.45 and (float(ch1 or 0.0) <= 0.20 or float(ch15 or 0.0) <= 0.12):
+                    side = "SELL"
+                    family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) <= 0 else 'F3_IMPULSE_BASE_CONT')
+                    notes.append('🟡 trend_no_breakout_soft_sell')
+                    conf = max(0.0, float(conf) - 0.5)
                 else:
                     _rej("no_breakout_trigger", base, mv)
                     return None
