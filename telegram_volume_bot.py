@@ -27340,10 +27340,13 @@ ADMIN_HELP_DESCRIPTIONS = {
     "goal_set": "Set goal targets: setups/day low-high, WR target, optional AvgR target",
     "goal_abort": "Abort a running goal-profile optimizer cycle safely after the current evaluation step",
     "trade_id_reset": "Reset your own Trade ID numbering",
+    "dailycap": "Set daily risk cap, including /dailycap pct 100 for full-account daily cap",
+    "dayrisk_reset": "Reset today’s used-risk baseline for the active day. Use /dayrisk_reset, /dayrisk_reset show, or /dayrisk_reset clear",
 }
 
 ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
+    ("⚖️ RISK / DAY RESET", ["dailycap", "dayrisk_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "adaptive_run", "goal_status", "goal_run", "goal_set", "goal_abort", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
