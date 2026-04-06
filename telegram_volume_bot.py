@@ -1052,7 +1052,7 @@ EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FU
 
 # ✅ /screen scan breadth + loosened trigger only for screen (NOT email)
 SCREEN_UNIVERSE_N = 70          # was effectively 35 (inside pick_setups)
-SCREEN_TRIGGER_LOOSEN = 0.85    # 15% easier trigger on /screen only
+SCREEN_TRIGGER_LOOSEN = 0.82    # 15% easier trigger on /screen only
 SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
 SCREEN_WAITING_N = 10
 
@@ -1607,22 +1607,22 @@ def _strategy_config_bootstrap_recommendations() -> None:
         # silently keep the bot above the 1–3 setups/day target after redeploy.
         try:
             q_screen = float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
-            if q_screen > 64.0:
-                cfg['quality_score_min_screen'] = 63.0
+            if q_screen > 62.0:
+                cfg['quality_score_min_screen'] = 62.0
                 changed = True
         except Exception:
             pass
         try:
             q_email = float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
-            if q_email > 68.0:
-                cfg['quality_score_min_email'] = 67.0
+            if q_email > 66.0:
+                cfg['quality_score_min_email'] = 66.0
                 changed = True
         except Exception:
             pass
         try:
             rr_live = float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP)
-            if rr_live > 1.40:
-                cfg['min_rr_tp'] = 1.40
+            if rr_live > 1.34:
+                cfg['min_rr_tp'] = 1.34
                 changed = True
         except Exception:
             pass
@@ -9959,7 +9959,8 @@ def list_users_notify_on() -> List[dict]:
 def list_users_with_email() -> List[dict]:
     """
     Users eligible for email sends (have a saved recipient email).
-    This is used for Big-Move Alerts so it works even if notify_on=0.
+    This is used for Big-Move Alerts so it works even if notify_on=0 and even if
+    the user has trade-signal email delivery switched off.
 
     IMPORTANT:
     Some DB versions don't have users.email (only users.email_to).
@@ -9985,7 +9986,6 @@ def list_users_with_email() -> List[dict]:
 
         has_email_to = ("email_to" in cols)
         has_email = ("email" in cols)
-        has_email_enabled = ("email_alerts_enabled" in cols)
 
         # Build safe WHERE clause
         where_parts = []
@@ -9999,8 +9999,6 @@ def list_users_with_email() -> List[dict]:
             return []
 
         where_sql = " OR ".join(where_parts)
-        if has_email_enabled:
-            where_sql = f"({where_sql}) AND (COALESCE(email_alerts_enabled, 1) = 1)"
 
         cur.execute(f"""
             SELECT *
@@ -16046,8 +16044,8 @@ def rr_to_tp(entry: float, sl: float, tp: float) -> float:
 # - Used by both /screen and email selection, and by backtests.
 # =========================================================
 
-QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "62"))
-QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "66"))
+QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "60"))
+QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "64"))
 
 # Soft throttling: how many candidates we score before slicing (keeps compute bounded)
 QUALITY_SCORE_CAND_MULT_SCREEN = int(os.environ.get("QUALITY_SCORE_CAND_MULT_SCREEN", "8"))
@@ -23851,10 +23849,10 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
         max_ch1 = float(limits['max_ch1_abs']) + (0.50 if engine == 'B' else 0.0)
         max_atr = float(limits['max_atr_pct']) + (0.60 if engine == 'B' else 0.0)
         if reach_mode and sess == 'LON' and engine in {'A', 'C'}:
-            max_pb += 0.14
-            max_ch15 += 0.16
-            max_ch1 += 0.18
-            max_atr += 0.45
+            max_pb += 0.18
+            max_ch15 += 0.20
+            max_ch1 += 0.24
+            max_atr += 0.55
 
         # Family-aware calibration: modest session/regime tuning only.
         # Keep ASIA tighter, allow a little more conversion in LON/NY where the allocator
@@ -23864,25 +23862,25 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
         f4_ch15_relax = float((cfg_live or {}).get('family_f4_balance_ch15_relax', 0.0) or 0.0)
         if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
             if sess in {'LON', 'NY'}:
-                max_pb += 0.10 + f4_pb_relax
-                max_ch15 += 0.08 + f4_ch15_relax
-                max_ch1 += 0.10 + f4_ch1_relax
+                max_pb += 0.14 + f4_pb_relax
+                max_ch15 += 0.12 + f4_ch15_relax
+                max_ch1 += 0.14 + f4_ch1_relax
             else:
-                max_pb += 0.03 + f4_pb_relax
-                max_ch15 += 0.02 + f4_ch15_relax
-                max_ch1 += f4_ch1_relax
+                max_pb += 0.06 + f4_pb_relax
+                max_ch15 += 0.04 + f4_ch15_relax
+                max_ch1 += 0.04 + f4_ch1_relax
         elif fam == 'F2_MOMENTUM_IGNITION' and regime == 'EXPANSION':
             if sess in {'LON', 'NY'}:
-                max_pb += 0.08
-                max_ch15 += 0.10
-                max_ch1 += 0.18
-                max_atr += 0.18
+                max_pb += 0.12
+                max_ch15 += 0.14
+                max_ch1 += 0.24
+                max_atr += 0.24
         elif fam == 'F3_IMPULSE_BASE_CONT' and regime in {'EXPANSION', 'SQUEEZE'}:
             if sess in {'LON', 'NY'}:
-                max_pb += 0.06
-                max_ch15 += 0.08
-                max_ch1 += 0.14
-                max_atr += 0.12
+                max_pb += 0.10
+                max_ch15 += 0.12
+                max_ch1 += 0.20
+                max_atr += 0.18
         elif fam == 'F1_PULLBACK_CONT' and 'TREND' in regime and sess == 'LON':
             max_pb += 0.04
             max_ch15 += 0.05
@@ -23899,21 +23897,21 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
 
         if engine == 'A':
             if sess == 'LON':
-                lon_ctx_ch4_min = 0.42 if reach_mode else 0.56
-                lon_ctx_ch1_min = 0.14 if reach_mode else 0.24
+                lon_ctx_ch4_min = 0.32 if reach_mode else 0.46
+                lon_ctx_ch1_min = 0.08 if reach_mode else 0.16
                 if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                     return (False, 'lon_pullback_context_too_weak')
-            if sess == 'NY' and (ch4_abs < 0.72 or ch1_abs < 0.36):
+            if sess == 'NY' and (ch4_abs < 0.58 or ch1_abs < 0.24):
                 return (False, 'ny_pullback_context_too_weak')
             if sess == 'ASIA':
                 if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
-                    if ch24_abs < 6.0 or ch15_abs < 0.01:
+                    if ch24_abs < 5.0 or ch15_abs < 0.01:
                         return (False, 'asia_pullback_context_too_weak')
-                elif (ch4_abs < 0.95 or ch1_abs < 0.50):
+                elif (ch4_abs < 0.72 or ch1_abs < 0.34):
                     return (False, 'asia_pullback_context_too_weak')
-            if sess == 'LON' and ch24_abs > (13.6 if reach_mode else 11.5) and pb_dist > (0.48 if reach_mode else 0.34):
+            if sess == 'LON' and ch24_abs > (14.8 if reach_mode else 12.8) and pb_dist > (0.56 if reach_mode else 0.40):
                 return (False, 'lon_trend_overheated')
-        if sess == 'NY' and ch1_abs >= 1.55 and ch15_abs >= 0.70 and conf < 86 and score < 82.0:
+        if sess == 'NY' and ch1_abs >= 1.72 and ch15_abs >= 0.82 and conf < 85 and score < 80.0:
             return (False, 'ny_breakout_chase_risk')
         return (True, 'ok')
     except Exception:
@@ -24065,11 +24063,11 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 72.0, 75, 1.28
+        quality, conf, rr = 70.5, 74, 1.24
     elif sess == "LON":
-        quality, conf, rr = 69.5, 73, 1.20
+        quality, conf, rr = 68.0, 72, 1.16
     elif sess == "ASIA":
-        quality, conf, rr = 68.5, 72, 1.16
+        quality, conf, rr = 67.0, 71, 1.12
     else:
         quality, conf, rr = 71.0, 74, 1.24
 
@@ -24095,9 +24093,9 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
                 rr -= 0.05
     except Exception:
         pass
-    quality = float(clamp(quality, 69.0, 92.0))
-    conf = int(max(70, min(95, conf)))
-    rr = float(clamp(rr, 1.08, 2.30))
+    quality = float(clamp(quality, 66.0, 92.0))
+    conf = int(max(68, min(95, conf)))
+    rr = float(clamp(rr, 1.02, 2.30))
     return (quality, conf, rr)
 
 
@@ -24165,45 +24163,45 @@ def is_executable_setup_eligible(
 
         if engine == 'A':
             if sess == 'LON':
-                score_floor = max((67.5 if reach_mode else 72.0), score_floor)
-                conf_floor = max((72 if reach_mode else 75), conf_floor)
-                rr_floor = max((1.16 if reach_mode else 1.24), rr_floor)
+                score_floor = max((66.0 if reach_mode else 69.5), score_floor)
+                conf_floor = max((71 if reach_mode else 73), conf_floor)
+                rr_floor = max((1.10 if reach_mode else 1.18), rr_floor)
             elif sess == 'NY':
-                score_floor = max(76.0, score_floor)
-                conf_floor = max(78, conf_floor)
-                rr_floor = max(1.34, rr_floor)
+                score_floor = max(73.5, score_floor)
+                conf_floor = max(74, conf_floor)
+                rr_floor = max(1.26, rr_floor)
             else:
-                score_floor = max(75.0, score_floor)
-                conf_floor = max(76, conf_floor)
-                rr_floor = max(1.28, rr_floor)
+                score_floor = max(72.5, score_floor)
+                conf_floor = max(74, conf_floor)
+                rr_floor = max(1.20, rr_floor)
         elif engine == 'C':
             if sess == 'LON':
-                score_floor = max((67.0 if reach_mode else 71.5), score_floor - 0.75 + engine_c_exec_quality_add)
+                score_floor = max((65.5 if reach_mode else 69.0), score_floor - 1.25 + engine_c_exec_quality_add)
                 conf_floor = max((72 if reach_mode else 75), conf_floor + engine_c_exec_conf_add)
-                rr_floor = max((1.14 if reach_mode else 1.22), rr_floor - 0.05 + engine_c_exec_rr_add)
+                rr_floor = max((1.08 if reach_mode else 1.16), rr_floor - 0.08 + engine_c_exec_rr_add)
             elif sess == 'NY':
-                score_floor = max(75.0, score_floor + 0.5 + engine_c_exec_quality_add)
-                conf_floor = max(78, conf_floor + 1 + engine_c_exec_conf_add)
-                rr_floor = max(1.32, rr_floor + 0.03 + engine_c_exec_rr_add)
+                score_floor = max(72.5, score_floor + 0.25 + engine_c_exec_quality_add)
+                conf_floor = max(76, conf_floor + 1 + engine_c_exec_conf_add)
+                rr_floor = max(1.24, rr_floor + 0.02 + engine_c_exec_rr_add)
             else:
-                score_floor = max(74.0, score_floor + 0.75 + engine_c_exec_quality_add)
-                conf_floor = max(75, conf_floor + 1 + engine_c_exec_conf_add)
-                rr_floor = max(1.26, rr_floor + 0.04 + engine_c_exec_rr_add)
+                score_floor = max(72.0, score_floor + 0.50 + engine_c_exec_quality_add)
+                conf_floor = max(74, conf_floor + 1 + engine_c_exec_conf_add)
+                rr_floor = max(1.20, rr_floor + 0.03 + engine_c_exec_rr_add)
         elif engine == 'B':
             if not exec_engine_b_enabled:
                 return (False, 'engine_b_disabled')
             if sess == 'LON':
+                score_floor = max(74.5, score_floor + 0.5)
+                conf_floor = max(77, conf_floor + 1)
+                rr_floor = max(1.30, rr_floor + 0.04)
+            elif sess == 'NY':
+                score_floor = max(76.0, score_floor + 0.75)
+                conf_floor = max(78, conf_floor + 1)
+                rr_floor = max(1.38, rr_floor + 0.05)
+            else:
                 score_floor = max(77.0, score_floor + 1.0)
                 conf_floor = max(79, conf_floor + 1)
-                rr_floor = max(1.38, rr_floor + 0.05)
-            elif sess == 'NY':
-                score_floor = max(79.0, score_floor + 1.25)
-                conf_floor = max(81, conf_floor + 1)
-                rr_floor = max(1.46, rr_floor + 0.06)
-            else:
-                score_floor = max(80.0, score_floor + 1.5)
-                conf_floor = max(81, conf_floor + 2)
-                rr_floor = max(1.48, rr_floor + 0.07)
+                rr_floor = max(1.40, rr_floor + 0.05)
         else:
             return (False, 'engine_not_supported')
 
@@ -24256,9 +24254,9 @@ def is_executable_setup_eligible(
             score_floor -= 0.75
             rr_floor -= 0.02
 
-        score_floor = float(clamp(score_floor, 60.0 if active_profile.startswith('GLOBAL_') else 64.0, 92.0))
-        conf_floor = int(max(69 if active_profile.startswith('GLOBAL_') else 72, min(95, conf_floor)))
-        rr_floor = float(clamp(rr_floor, 1.00 if active_profile.startswith('GLOBAL_') else 1.14, 2.30))
+        score_floor = float(clamp(score_floor, 58.0 if active_profile.startswith('GLOBAL_') else 62.0, 92.0))
+        conf_floor = int(max(68 if active_profile.startswith('GLOBAL_') else 71, min(95, conf_floor)))
+        rr_floor = float(clamp(rr_floor, 0.98 if active_profile.startswith('GLOBAL_') else 1.08, 2.30))
 
         if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
             pass
@@ -24304,13 +24302,13 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.68, 7_500_000.0)):
                     return (False, "ny_below_liquidity")
             else:
-                if pb_dist > 0.86:
+                if pb_dist > 0.92:
                     return (False, "ny_entry_too_far_from_ema")
-                if ch15_abs > 0.92 or (ch15_abs > 0.80 and ch1_abs > 1.68):
+                if ch15_abs > 1.00 or (ch15_abs > 0.86 and ch1_abs > 1.82):
                     return (False, "ny_late_extension_exec")
-                if ch4_abs < 0.52 or ch1_abs < 0.24:
+                if ch4_abs < 0.46 or ch1_abs < 0.18:
                     return (False, "ny_context_too_weak_exec")
-                if fut_vol < max(MIN_FUT_VOL_USD * 0.82, 8_500_000.0):
+                if fut_vol < max(MIN_FUT_VOL_USD * 0.74, 7_500_000.0):
                     return (False, "ny_below_liquidity")
         elif sess == "LON":
             if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
@@ -24323,12 +24321,12 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.66, 7_000_000.0)):
                     return (False, "lon_below_liquidity")
             else:
-                lon_pb_max = 0.82 if reach_mode else 0.70
-                lon_ch15_cap = 0.76 if reach_mode else 0.62
-                lon_ch1_cap = 1.48 if reach_mode else 1.28
-                lon_ctx_ch4_min = 0.32 if reach_mode else 0.42
-                lon_ctx_ch1_min = 0.10 if reach_mode else 0.18
-                lon_liq_floor = max(MIN_FUT_VOL_USD * (0.72 if reach_mode else 0.82), 7_000_000.0 if reach_mode else 9_000_000.0)
+                lon_pb_max = 0.88 if reach_mode else 0.78
+                lon_ch15_cap = 0.84 if reach_mode else 0.70
+                lon_ch1_cap = 1.58 if reach_mode else 1.38
+                lon_ctx_ch4_min = 0.26 if reach_mode else 0.34
+                lon_ctx_ch1_min = 0.06 if reach_mode else 0.12
+                lon_liq_floor = max(MIN_FUT_VOL_USD * (0.68 if reach_mode else 0.74), 6_500_000.0 if reach_mode else 7_500_000.0)
                 if engine == 'C':
                     lon_pb_max = max(lon_pb_max, engine_c_exec_pb_dist_lon)
                     lon_ch1_cap = max(lon_ch1_cap, engine_c_exec_ch1_cap_lon)
@@ -24341,7 +24339,7 @@ def is_executable_setup_eligible(
                     return (False, "lon_late_extension_exec")
                 if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                     return (False, "lon_context_too_weak_exec")
-                if ch4_abs > (3.05 if reach_mode else 2.75) or ch24_abs > (16.5 if reach_mode else 15.0):
+                if ch4_abs > (3.30 if reach_mode else 2.95) or ch24_abs > (17.5 if reach_mode else 15.8):
                     return (False, "lon_trend_overheated_exec")
                 if fut_vol < lon_liq_floor:
                     return (False, "lon_below_liquidity")
@@ -24356,13 +24354,13 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.70, 6_500_000.0)):
                     return (False, "asia_below_liquidity")
             else:
-                if pb_dist > 0.70:
+                if pb_dist > 0.78:
                     return (False, "asia_entry_too_far_from_ema")
-                if ch15_abs > 0.70 or ch1_abs > 1.36:
+                if ch15_abs > 0.78 or ch1_abs > 1.46:
                     return (False, "asia_late_extension_exec")
-                if ch4_abs < 0.54 or ch1_abs < 0.24:
+                if ch4_abs < 0.44 or ch1_abs < 0.18:
                     return (False, "asia_context_too_weak_exec")
-                if fut_vol < float(max(MIN_FUT_VOL_USD * 0.75, ASIA_MIN_FUT_VOL_USD)):
+                if fut_vol < float(max(MIN_FUT_VOL_USD * 0.68, ASIA_MIN_FUT_VOL_USD)):
                     return (False, "asia_below_liquidity")
 
         if engine == "A":
@@ -24372,18 +24370,18 @@ def is_executable_setup_eligible(
                 return (True, "ok")
             if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
                 return (False, "pullback_not_ready")
-            if pb_dist > ((0.78 if reach_mode else 0.64) if sess == 'LON' else (0.68 if sess == 'NY' else 0.62)):
+            if pb_dist > ((0.84 if reach_mode else 0.70) if sess == 'LON' else (0.74 if sess == 'NY' else 0.68)):
                 return (False, "pullback_still_too_shallow")
-            if sess == 'LON' and (ch15_abs > (0.72 if reach_mode else 0.56) or ch1_abs < (0.10 if reach_mode else 0.18) or ch1_abs > (1.42 if reach_mode else 1.18) or ch4_abs < (0.38 if reach_mode else 0.48)):
+            if sess == 'LON' and (ch15_abs > (0.80 if reach_mode else 0.64) or ch1_abs < (0.06 if reach_mode else 0.12) or ch1_abs > (1.50 if reach_mode else 1.28) or ch4_abs < (0.30 if reach_mode else 0.40)):
                 return (False, 'lon_pullback_not_clean_enough')
             return (True, "ok")
 
         if engine == "C":
-            c_quality_floor = score_floor + (0.00 if reach_mode and sess == 'LON' else 0.15)
+            c_quality_floor = score_floor + (0.00 if reach_mode and sess == 'LON' else 0.05)
             c_conf_floor = max(73 if (reach_mode and sess == 'LON') else conf_floor, conf_floor - (1 if reach_mode and sess == 'LON' else 0))
-            c_rr_floor = max(1.14 if (reach_mode and sess == 'LON') else rr_floor, rr_floor - (0.05 if reach_mode and sess == 'LON' else 0.0))
-            c_liq_floor = float(max(MIN_FUT_VOL_USD * (engine_c_exec_liq_mult if not (reach_mode and sess == 'LON') else 0.78), 6_500_000.0 if (reach_mode and sess == 'LON') else ENGINE_C_MIN_FUT_VOL_USD * 0.90))
-            c_ch1_cap = (max(engine_c_exec_ch1_cap_lon, 1.68) if (reach_mode and sess == 'LON') else max(engine_c_exec_ch1_cap_lon, 1.34)) if sess == 'LON' else (1.58 if sess == 'NY' else 1.24)
+            c_rr_floor = max(1.08 if (reach_mode and sess == 'LON') else rr_floor, rr_floor - (0.06 if reach_mode and sess == 'LON' else 0.02))
+            c_liq_floor = float(max(MIN_FUT_VOL_USD * (engine_c_exec_liq_mult if not (reach_mode and sess == 'LON') else 0.72), 6_000_000.0 if (reach_mode and sess == 'LON') else ENGINE_C_MIN_FUT_VOL_USD * 0.82))
+            c_ch1_cap = (max(engine_c_exec_ch1_cap_lon, 1.76) if (reach_mode and sess == 'LON') else max(engine_c_exec_ch1_cap_lon, 1.44)) if sess == 'LON' else (1.66 if sess == 'NY' else 1.32)
             if score < c_quality_floor:
                 return (False, "engine_c_below_quality")
             if conf < c_conf_floor:
@@ -24397,13 +24395,13 @@ def is_executable_setup_eligible(
             return (True, "ok")
 
         if engine == "B":
-            if score < (score_floor + 1.5):
+            if score < (score_floor + 1.0):
                 return (False, "engine_b_below_quality")
             if conf < (conf_floor + 1):
                 return (False, "engine_b_below_conf")
-            if rr_final < (rr_floor + 0.05):
+            if rr_final < (rr_floor + 0.03):
                 return (False, "engine_b_below_rr")
-            if fut_vol < float(max(MIN_FUT_VOL_USD * (1.10 if sess != 'ASIA' else 1.18), 15_000_000.0 if sess != 'ASIA' else ASIA_MIN_FUT_VOL_USD)):
+            if fut_vol < float(max(MIN_FUT_VOL_USD * (1.00 if sess != 'ASIA' else 1.05), 12_000_000.0 if sess != 'ASIA' else ASIA_MIN_FUT_VOL_USD)):
                 return (False, "engine_b_below_liquidity")
             return (True, "ok")
 
@@ -26161,7 +26159,8 @@ def send_email(
     body: str,
     body_html: Optional[str] = None,
     user_id_for_debug: Optional[int] = None,
-    enforce_trade_window: bool = True
+    enforce_trade_window: bool = True,
+    bypass_user_email_master: bool = False,
 ) -> bool:
     """
     Sends an email.
@@ -26183,7 +26182,7 @@ def send_email(
     # Per-user master email alerts switch
     if uid is not None:
         u = get_user(int(uid))
-        if u and not user_email_alerts_enabled(u):
+        if (not bypass_user_email_master) and u and not user_email_alerts_enabled(u):
             _LAST_EMAIL_DECISION[int(uid)] = {
                 "status": "SKIP",
                 "reason": "user_email_alerts_disabled",
@@ -33334,14 +33333,14 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "24"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "40"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
 ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "40"))
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "300"))
 ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "0"))
 ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "6"))
-ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING", True)
-ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.25") or 0.25)
+ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING", False)
+ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.70") or 0.70)
 EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "600"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
@@ -33660,7 +33659,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     subject,
                     body,
                     user_id_for_debug=uid,
-                    enforce_trade_window=False
+                    enforce_trade_window=False,
+                    bypass_user_email_master=True,
                 )
 
 
