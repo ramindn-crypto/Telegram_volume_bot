@@ -34238,11 +34238,11 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
 async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    user = get_user(uid) or {}
 
     # User timezone for consistent debug display (show local + UTC)
     try:
         from zoneinfo import ZoneInfo
-        user = get_user(uid) or {}
         tz_name = str(user.get("tz") or "UTC")
         tz_disp = ZoneInfo(tz_name)
     except Exception:
@@ -34327,6 +34327,31 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if rs:
             lines.append("Reasons:\n- " + "\n- ".join([str(x) for x in rs]))
 
+
+    # Mirror the current /bigmove_alert settings here so /email_decision shows
+    # both the live pipeline outcome and the user's active big-move alert config.
+    try:
+        bigm_on = int(user.get("bigmove_alert_on", 1) or 0)
+    except Exception:
+        bigm_on = 1
+    try:
+        bigm_p4 = float(user.get("bigmove_alert_4h", 20) or 20)
+    except Exception:
+        bigm_p4 = 20.0
+    try:
+        bigm_p1 = float(user.get("bigmove_alert_1h", 10) or 10)
+    except Exception:
+        bigm_p1 = 10.0
+    try:
+        bigm_min_vol = float(user.get("bigmove_min_vol_usd", 10_000_000) or 10_000_000)
+    except Exception:
+        bigm_min_vol = 10_000_000.0
+
+    lines.append("")
+    lines.append("⚡ Big-Move Alert Settings")
+    lines.append(f"Status: {'ON' if bigm_on else 'OFF'}")
+    lines.append(f"Thresholds: |4H| ≥ {bigm_p4:.0f}% OR |1H| ≥ {bigm_p1:.0f}%")
+    lines.append(f"Min Vol (24H): {bigm_min_vol/1e6:.1f}M")
 
     if bigm:
         lines.append("")
