@@ -34494,8 +34494,13 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             lines.append("Reasons:\n- " + "\n- ".join(rs))
 
     try:
-        pipe_build = _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or {}
-        pipe_exec = _latest_setup_pipeline_event(uid, stage='email_executable_pool', mode='email') or {}
+        sess_now = str(current_session_name() or '').upper().strip()
+        pipe_build = _latest_setup_pipeline_event(0, stage='build_priority_pool', session=sess_now, mode='email') or {}
+        if not pipe_build:
+            pipe_build = _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or {}
+        pipe_exec = _latest_setup_pipeline_event(uid, stage='email_executable_pool', session=sess_now, mode='email') or {}
+        if not pipe_exec:
+            pipe_exec = _latest_setup_pipeline_event(uid, stage='email_executable_pool', mode='email') or {}
         if pipe_build or pipe_exec:
             def _pipe_summary(row: dict) -> str:
                 if not row:
@@ -34505,7 +34510,14 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 except Exception:
                     details = {}
                 status = str(row.get('status') or '-')
-                parts = [status]
+                row_sess = str(row.get('session') or '-').upper()
+                parts = [status, f"session={row_sess}"]
+                try:
+                    evt = float(row.get('event_ts') or 0.0)
+                    if evt > 0:
+                        parts.append(_fmt_when_both(evt))
+                except Exception:
+                    pass
                 try:
                     if details.get('timeout_sec'):
                         parts.append(f"timeout={details.get('timeout_sec')}s")
@@ -34536,6 +34548,8 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return ' | '.join(parts)
             lines.append("")
             lines.append("🛠️ Setup Email Pipeline")
+            lines.append(f"Current session: {sess_now or '-'}")
+            lines.append(f"Configured build timeout: {float(EMAIL_BUILD_POOL_TIMEOUT_SEC):.1f}s")
             if pipe_build:
                 lines.append("Build pool: " + _pipe_summary(pipe_build))
             if pipe_exec:
@@ -34648,10 +34662,19 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     try:
-        pipeline_latest['email_latest'] = _latest_setup_pipeline_event(uid, stage='latest', mode='email') or {}
-        pipeline_latest['email_build'] = _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or {}
-        pipeline_latest['email_exec'] = _latest_setup_pipeline_event(uid, stage='email_executable_pool', mode='email') or {}
-        pipeline_latest['screen_exec'] = _latest_setup_pipeline_event(uid, stage='screen_executable_pool', mode='screen') or {}
+        sess_now = str(current_session_name() or '').upper().strip()
+        pipeline_latest['email_latest'] = _latest_setup_pipeline_event(uid, stage='latest', session=sess_now, mode='email') or {}
+        if not pipeline_latest['email_latest']:
+            pipeline_latest['email_latest'] = _latest_setup_pipeline_event(uid, stage='latest', mode='email') or {}
+        pipeline_latest['email_build'] = _latest_setup_pipeline_event(0, stage='build_priority_pool', session=sess_now, mode='email') or {}
+        if not pipeline_latest['email_build']:
+            pipeline_latest['email_build'] = _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or {}
+        pipeline_latest['email_exec'] = _latest_setup_pipeline_event(uid, stage='email_executable_pool', session=sess_now, mode='email') or {}
+        if not pipeline_latest['email_exec']:
+            pipeline_latest['email_exec'] = _latest_setup_pipeline_event(uid, stage='email_executable_pool', mode='email') or {}
+        pipeline_latest['screen_exec'] = _latest_setup_pipeline_event(uid, stage='screen_executable_pool', session=sess_now, mode='screen') or {}
+        if not pipeline_latest['screen_exec']:
+            pipeline_latest['screen_exec'] = _latest_setup_pipeline_event(uid, stage='screen_executable_pool', mode='screen') or {}
     except Exception:
         pass
 
