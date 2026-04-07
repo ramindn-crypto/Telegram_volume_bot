@@ -33684,71 +33684,12 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 pass
         MARKET_VOL_MEDIAN_USD = _median(_all_vols)
 
-        # -----------------------------------------------------
-        # Big-Move Alert Emails (independent of full trade setups)
-        # Trigger: |4H| >= user.bigmove_alert_4h  OR  |1H| >= user.bigmove_alert_1h
-        # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 10M)
-        # Defaults: 1H=7.5%, 4H=15%
-        # -----------------------------------------------------
-        try:
-            if bool(ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING) and goal_running:
-                users_bigmove = []
-            else:
-                used_pct = (time.time() - job_started_ts) / max(1.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 1))
-                if float(ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT or 0.0) > 0 and used_pct >= float(ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT):
-                    users_bigmove = []
-        except Exception:
-            pass
-        users_bigmove = list(users_bigmove or [])
-        try:
-            users_bigmove = [u for u in users_bigmove if int((u or {}).get('bigmove_alert_on', 1) or 0) == 1]
-        except Exception:
-            users_bigmove = list(users_bigmove or [])
-        _bigmove_user_limit = _alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 0)
-        if int(_bigmove_user_limit or 0) > 0:
-            users_bigmove = users_bigmove[:int(_bigmove_user_limit)]
-        for u in users_bigmove:
-            if _job_budget_exhausted():
-                logger.warning("alert_job bigmove loop budget exhausted after %.1fs", time.time() - job_started_ts)
-                break
-            if _bigmove_session_reserve_hit():
-                logger.info("alert_job stopped bigmove loop early to reserve runtime for session pools after %.1fs", time.time() - job_started_ts)
-                break
-            # Pro/trial-only email features
+        def _build_bigmove_payload_for_user(uid: int, tz):
             try:
-                uid = int(u.get("user_id") or u.get("id") or 0)
-            except Exception:
-                uid = 0
-            if uid and (not user_has_pro(uid)):
-                continue
-
-            tz = timezone.utc
-            uid = 0
-            try:
-                try:
-                    uid = int(u.get("user_id") or u.get("id") or 0)
-                except Exception:
-                    uid = 0
-                if not uid:
-                    continue
-
-                uu = get_user(uid) or {}
-
-                tz_name = str((uu or {}).get("tz") or "UTC")
-                try:
-                    tz = ZoneInfo(tz_name)
-                except Exception:
-                    tz = timezone.utc
-
-                # Respect per-user ON/OFF
+                uu = get_user(int(uid)) or {}
                 on = int(uu.get("bigmove_alert_on", 1) or 0)
                 if not on:
-                    _LAST_BIGMOVE_DECISION[uid] = {
-                        "status": "SKIP",
-                        "when": datetime.now(tz).isoformat(timespec="seconds"),
-                        "reasons": ["bigmove_alert_off"],
-                    }
-                    continue
+                    return {"status": "SKIP", "reasons": ["bigmove_alert_off"]}
 
                 try:
                     p4 = float(uu.get("bigmove_alert_4h", 15.0) or 15.0)
@@ -33763,7 +33704,6 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
                 candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, min_vol_usd=min_vol, max_items=12)
 
-                # Debug counts from the SAME dataset used for bigmove (same field-name logic)
                 def _pick_pct(_mv, _keys) -> float:
                     for _k in _keys:
                         try:
@@ -33792,17 +33732,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     bm_any_1h = -1
 
                 if not candidates:
-                    _LAST_BIGMOVE_DECISION[uid] = {
+                    return {
                         "status": "SKIP",
-                        "when": datetime.now(tz).isoformat(timespec="seconds"),
                         "reasons": [
                             f"no_candidates (p4={p4}, p1={p1})",
                             f"debug_raw_hits:4h={bm_any_4h},1h={bm_any_1h}",
                         ],
                     }
-                    continue
 
-                # Volume gate (default 10M) + remove ones emailed recently (per symbol + direction)
                 filtered = []
                 volume_filtered_out = 0
                 cooldown_filtered_out = 0
@@ -33817,7 +33754,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                     try:
-                        if bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
+                        if bigmove_recently_emailed(int(uid), c["symbol"], c["direction"]):
                             cooldown_filtered_out += 1
                             continue
                         filtered.append(c)
@@ -33825,9 +33762,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         filtered.append(c)
 
                 if not filtered:
-                    _LAST_BIGMOVE_DECISION[uid] = {
+                    return {
                         "status": "SKIP",
-                        "when": datetime.now(tz).isoformat(timespec="seconds"),
                         "reasons": [
                             f"no_candidates_after_filters (min_vol={min_vol/1e6:.1f}M)",
                             f"raw_candidates={len(candidates)}",
@@ -33835,9 +33771,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                             f"cooldown_filtered={int(cooldown_filtered_out)}",
                         ],
                     }
-                    continue
 
-                # Build email body
                 lines = []
                 lines.append("⚡ PulseFutures — BIG MOVE ALERT")
                 lines.append(HDR)
@@ -33861,16 +33795,20 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     ch1 = float(c.get("ch1", 0.0) or 0.0)
                     vol = float(c.get("vol", 0.0) or 0.0)
                     arrow = "🟢" if c.get("direction") == "UP" else "🔴"
-
                     lines.append(f"{arrow} {sym}: 4H {ch4:+.0f}% | 1H {ch1:+.0f}% | Vol ~{vol/1e6:.1f}M")
                     lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
                     lines.append("")
 
                 body = "\n".join(lines).strip()
-
-                _LAST_BIGMOVE_DECISION[uid] = {
-                    "status": "TRY_SEND",
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                return {
+                    "status": "READY",
+                    "subject": str(subject or ""),
+                    "body": str(body or ""),
+                    "filtered": list(filtered or []),
+                    "top_sym": str(top_sym or ""),
+                    "top_dir": str(top_dir or ""),
+                    "top_tf": str(top_tf or ""),
+                    "top_move": float(top_move or 0.0),
                     "reasons": [
                         f"candidates={len(filtered)}",
                         f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%",
@@ -33881,59 +33819,60 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         f"cooldown_filtered={int(cooldown_filtered_out)}",
                     ],
                 }
-
-                if _bigmove_session_reserve_hit():
-                    deferred_bigmove_jobs.append({
-                        "uid": int(uid),
-                        "tz": tz,
-                        "subject": str(subject or ""),
-                        "body": str(body or ""),
-                        "filtered": list(filtered or []),
-                        "top_sym": str(top_sym or ""),
-                        "top_dir": str(top_dir or ""),
-                        "top_tf": str(top_tf or ""),
-                        "top_move": float(top_move or 0.0),
-                    })
-                    _LAST_BIGMOVE_DECISION[uid] = {
-                        "status": "DEFER",
-                        "when": datetime.now(tz).isoformat(timespec="seconds"),
-                        "reasons": ["deferred_to_preserve_setup_email_runtime", "will_retry_after_session_pools"],
-                    }
-                    logger.info("alert_job deferred bigmove send for uid=%s to preserve session-pool runtime", uid)
-                    continue
-
-                ok = await _send_email_async(
-                    EMAIL_SEND_TIMEOUT_SEC,
-                    subject,
-                    body,
-                    user_id_for_debug=uid,
-                    enforce_trade_window=False,
-                    bypass_user_email_master=True,
-                )
-
-
-                _LAST_BIGMOVE_DECISION[uid] = {
-                    "status": "SENT" if ok else "FAIL",
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "reasons": ([f"ok ({len(filtered)} candidate(s))", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%"] if ok else [_LAST_SMTP_ERROR.get(uid, "send_email_failed")]),
-                }
-
-                if ok:
-                    for c in filtered[:8]:
-                        try:
-                            mark_bigmove_emailed(uid, c["symbol"], c["direction"])
-                        except Exception:
-                            pass
-
             except Exception as e:
-                logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
-                _LAST_BIGMOVE_DECISION[uid] = {
-                    "status": "ERROR",
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "reasons": [f"{type(e).__name__}: {e}"],
-                }
+                return {"status": "ERROR", "reasons": [f"{type(e).__name__}: {e}"]}
+
+        # -----------------------------------------------------
+        # Big-Move Alert Emails (independent of full trade setups)
+        # Trigger: |4H| >= user.bigmove_alert_4h  OR  |1H| >= user.bigmove_alert_1h
+        # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 10M)
+        # Defaults: 1H=7.5%, 4H=15%
+        # -----------------------------------------------------
+        try:
+            if bool(ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING) and goal_running:
+                users_bigmove = []
+            else:
+                used_pct = (time.time() - job_started_ts) / max(1.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 1))
+                if float(ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT or 0.0) > 0 and used_pct >= float(ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT):
+                    users_bigmove = []
+        except Exception:
+            pass
+        users_bigmove = list(users_bigmove or [])
+        try:
+            users_bigmove = [u for u in users_bigmove if int((u or {}).get('bigmove_alert_on', 1) or 0) == 1]
+        except Exception:
+            users_bigmove = list(users_bigmove or [])
+        _bigmove_user_limit = _alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 0)
+        if int(_bigmove_user_limit or 0) > 0:
+            users_bigmove = users_bigmove[:int(_bigmove_user_limit)]
+        for u in users_bigmove:
+            if _job_budget_exhausted():
+                logger.warning("alert_job bigmove queue budget exhausted after %.1fs", time.time() - job_started_ts)
+                break
+            try:
+                uid = int(u.get("user_id") or u.get("id") or 0)
+            except Exception:
+                uid = 0
+            if not uid:
                 continue
-        
+            if not user_has_pro(uid):
+                continue
+            try:
+                tz_name = str((u or {}).get("tz") or (get_user(uid) or {}).get("tz") or "UTC")
+                tz = ZoneInfo(tz_name)
+            except Exception:
+                tz = timezone.utc
+            deferred_bigmove_jobs.append({
+                "uid": int(uid),
+                "tz": tz,
+                "pre_session_build": True,
+            })
+            _LAST_BIGMOVE_DECISION[uid] = {
+                "status": "DEFER",
+                "when": datetime.now(tz).isoformat(timespec="seconds"),
+                "reasons": ["queued_until_after_session_pools"],
+            }
+
 
         # -----------------------------------------------------
         # Build only the session pools that are actually needed right now.
@@ -34433,17 +34372,27 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 _LAST_BIGMOVE_DECISION[uid] = {
                     "status": "SKIP",
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "reasons": ["deferred_to_preserve_setup_email_runtime", "retry_budget_exhausted_after_session_pools"],
+                    "reasons": ["queued_until_after_session_pools", "retry_budget_exhausted_after_session_pools"],
                 }
                 continue
             try:
-                subject = str(job.get('subject') or '')
-                body = str(job.get('body') or '')
-                filtered = list(job.get('filtered') or [])
-                top_sym = str(job.get('top_sym') or '')
-                top_dir = str(job.get('top_dir') or '')
-                top_tf = str(job.get('top_tf') or '')
-                top_move = float(job.get('top_move') or 0.0)
+                payload = _build_bigmove_payload_for_user(int(uid), tz)
+                pstatus = str((payload or {}).get('status') or '').upper().strip()
+                if pstatus != 'READY':
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": pstatus or "SKIP",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": list((payload or {}).get('reasons') or ["bigmove_payload_not_ready"]),
+                    }
+                    continue
+
+                subject = str(payload.get('subject') or '')
+                body = str(payload.get('body') or '')
+                filtered = list(payload.get('filtered') or [])
+                top_sym = str(payload.get('top_sym') or '')
+                top_dir = str(payload.get('top_dir') or '')
+                top_tf = str(payload.get('top_tf') or '')
+                top_move = float(payload.get('top_move') or 0.0)
 
                 ok = await _send_email_async(
                     EMAIL_SEND_TIMEOUT_SEC,
