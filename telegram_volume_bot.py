@@ -8385,10 +8385,17 @@ def _learning_status_text(use_live_refresh: bool = False, sync_lifecycle: bool =
         if oos:
             lines.append(f"Latest optimizer OOS: setups/day={float(oos.get('setups_per_day', 0.0) or 0.0):.2f} | WR={float(oos.get('win_rate', 0.0) or 0.0):.1f}% | avgR={float(oos.get('avg_R', 0.0) or 0.0):.3f}")
 
+    market_adaptive_enabled_now = _cfg_bool((market_cfg or {}).get('market_adaptive_enabled', True), True)
+    market_adaptive_bullet = (
+        "• Daily market-adaptive tuning runs a bounded 30d universe backtest loop and auto-adjusts live runtime parameters with automatic revert if the score gets worse."
+        if market_adaptive_enabled_now
+        else "• Daily market-adaptive tuning is currently disabled in live config, so no new adaptive changes are being auto-applied."
+    )
+
     lines.extend([
         SEP,
         "Outcome learning (last 60d)",
-        f"Stage-learning source: emailed setup outcomes with TP-stage resolution | sample {int(stage.get('decided') or 0)} decided",
+        f"Stage-learning source: emailed setup outcomes with single-TP / SL resolution | sample {int(stage.get('decided') or 0)} decided",
         f"TP: {int(stage.get('tp_only') or 0) + int(stage.get('alt_target_a_plus') or 0)} | SL: {int(stage.get('losses') or 0)} | OPEN: {int(stage.get('open') or 0)}",
         f"Weighted TP accuracy: {float(stage.get('weighted_win_rate') or 0.0):.1f}% | Avg staged credit/trade: {float(stage.get('avg_weighted_credit') or 0.0):.2f}",
         f"Live autotrade closes available: {int(live.get('closed') or 0)} | Net PnL: ${float(live.get('net_pnl') or 0.0):+.2f} | Win rate: {float(live.get('win_rate') or 0.0):.1f}%",
@@ -8402,7 +8409,7 @@ def _learning_status_text(use_live_refresh: bool = False, sync_lifecycle: bool =
         "• Closed-trade PnL is already used automatically for day-risk accounting and admin reports.",
         "• Signal learning now uses a simpler TP / SL outcome model.",
         "• Zero-touch autopilot now re-tests shortlisted parameter sets across 7d / 14d / 21d / 30d windows before any live promotion.",
-        "• Daily market-adaptive tuning now runs a bounded 30d universe backtest loop and auto-adjusts live runtime parameters with automatic revert if the score gets worse.",
+        market_adaptive_bullet,
         "• The bot does NOT rewrite its own source code or GitHub file.",
     ])
 
@@ -19910,7 +19917,7 @@ def _signal_report_live_backed_only(user_id: int, meta: dict | None, canon: str)
 
 def _display_signal_outcome(raw) -> str:
     lab = str(_canon_signal_outcome_label(raw) or '').upper().strip()
-    if lab in {'TP', 'TP', 'TP', 'SL', 'OPEN'}:
+    if lab in {'TP', 'SL', 'OPEN'}:
         return lab
     if lab in {'UNTRACKED', 'NONE', ''}:
         return 'None'
@@ -19929,29 +19936,26 @@ def _canonical_wr_stats(rows: list[dict]) -> dict:
         sess = str(r.get('session') or '?').upper().strip() or '?'
         counts[out] += 1
         by_session[sess][out] += 1
-        if out in {'TP', 'TP', 'TP', 'SL'}:
+        if out in {'TP', 'SL'}:
             decided += 1
-        if out in {'TP'}:
+        if out == 'TP':
             wins += 1
-        if out in {'TP', 'TP'}:
             tp_full_wins += 1
         elif out == 'SL':
             losses += 1
     wr = (wins / decided * 100.0) if decided > 0 else 0.0
     by_sess = {}
     for sess, ctr in by_session.items():
-        s_tp_full = int(ctr.get('TP', 0) + ctr.get('TP', 0))
-        s_dec = int(ctr.get('TP', 0) + ctr.get('TP', 0) + ctr.get('TP', 0) + ctr.get('SL', 0))
-        s_win = int(ctr.get('TP', 0) + ctr.get('TP', 0) + ctr.get('TP', 0))
+        s_dec = int(ctr.get('TP', 0) + ctr.get('SL', 0))
+        s_win = int(ctr.get('TP', 0))
         by_sess[sess] = {
             'total': int(sum(ctr.values())),
             'decided': s_dec,
             'wins': s_win,
-            'alt_target_a_wins': s_tp_full,
+            'alt_target_a_wins': s_win,
             'losses': int(ctr.get('SL', 0)),
             'tp': int(ctr.get('TP', 0)),
-            'tp': int(ctr.get('TP', 0)),
-            'alt_target_a': s_tp_full,
+            'alt_target_a': s_win,
             'sl': int(ctr.get('SL', 0)),
             'open': int(ctr.get('OPEN', 0)),
             'untracked': int(ctr.get('None', 0)),
@@ -19976,16 +19980,21 @@ async def learning_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if cached:
         await send_long_message(update, cached, parse_mode=None)
         return
+    if _backtest_runtime_busy():
+        busy_txt = _admin_status_cache_get('learning_status', ttl=600.0)
+        if busy_txt:
+            await send_long_message(update, busy_txt + "\n\n⏳ Note: a universe backtest is running, so this is the latest cached snapshot.", parse_mode=None)
+            return
     try:
-        txt = await to_thread_heavy(_learning_status_text, False, False, timeout=30)
+        txt = await to_thread_heavy(_learning_status_text, False, False, timeout=20)
     except asyncio.TimeoutError:
         try:
             txt = _learning_status_text(False, True)
         except Exception:
-            txt = "⚠️ Learning/optimizer status timed out. Try again shortly."
+            fallback = _admin_status_cache_get('learning_status', ttl=600.0)
+            txt = (fallback + "\n\n⏳ Note: heavy runtime work is still in progress.") if fallback else "⚠️ Learning/optimizer status timed out. Try again shortly."
     _admin_status_cache_put('learning_status', txt)
     await send_long_message(update, txt, parse_mode=None)
-
 
 def _signal_outcome_summary(user_id: int, session: str | None = None, days: int | None = None) -> dict:
     """Canonical signal outcome summary from emailed setups, optionally live-synced for admin autotrade rows."""
@@ -22685,8 +22694,22 @@ async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAU
     if cached_text:
         await send_long_message(update, cached_text, parse_mode=None)
         return
-    snap = await to_thread_heavy(_market_adaptive_status_snapshot, timeout=12)
+    if _backtest_runtime_busy():
+        stale = _admin_status_cache_get('adaptive_status_text', ttl=600.0)
+        if stale:
+            await send_long_message(update, stale + "\n\n⏳ Note: a universe backtest is running, so this is the latest cached snapshot.", parse_mode=None)
+            return
+    try:
+        snap = await to_thread_heavy(_market_adaptive_status_snapshot, timeout=12)
+    except asyncio.TimeoutError:
+        stale = _admin_status_cache_get('adaptive_status_text', ttl=600.0)
+        if stale:
+            await send_long_message(update, stale + "\n\n⏳ Note: heavy runtime work is still in progress.", parse_mode=None)
+            return
+        await update.message.reply_text('⚠️ Adaptive status timed out. Try again shortly.')
+        return
     cfg = load_strategy_config(force=False)
+
     hb_state, hb_reason = _component_runtime_state('market_adaptive', max(7200, int(float((cfg or {}).get('market_adaptive_interval_hours', 24.0) or 24.0) * 7200)), enabled=_cfg_bool((cfg or {}).get('market_adaptive_enabled', True), True), no_data=False, waiting_text='waiting_for_daily_market_adaptive_cycle')
     last_run = snap.get('last_run') or {}
     rep = snap.get('last_report') or {}
