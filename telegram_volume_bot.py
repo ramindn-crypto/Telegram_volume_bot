@@ -33488,6 +33488,8 @@ EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
 ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "40"))
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "300"))
 ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "0"))
+ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "3"))
+ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC", "12"))
 ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "6"))
 ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING", False)
 ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.70") or 0.70)
@@ -33618,6 +33620,16 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 return (time.time() - job_started_ts) >= max(5.0, allowed)
             except Exception:
                 return False
+
+        def _bigmove_deferred_budget_exhausted() -> bool:
+            try:
+                max_runtime = max(1.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 45))
+                grace = max(0.0, float(ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC or 0))
+                return (time.time() - job_started_ts) >= (max_runtime + grace)
+            except Exception:
+                return _job_budget_exhausted()
+
+        deferred_bigmove_jobs = []
 
         # Keep it quiet if email is off or not configured
         if not EMAIL_ENABLED:
@@ -33871,13 +33883,24 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 }
 
                 if _bigmove_session_reserve_hit():
+                    deferred_bigmove_jobs.append({
+                        "uid": int(uid),
+                        "tz": tz,
+                        "subject": str(subject or ""),
+                        "body": str(body or ""),
+                        "filtered": list(filtered or []),
+                        "top_sym": str(top_sym or ""),
+                        "top_dir": str(top_dir or ""),
+                        "top_tf": str(top_tf or ""),
+                        "top_move": float(top_move or 0.0),
+                    })
                     _LAST_BIGMOVE_DECISION[uid] = {
-                        "status": "SKIP",
+                        "status": "DEFER",
                         "when": datetime.now(tz).isoformat(timespec="seconds"),
-                        "reasons": ["deferred_to_preserve_setup_email_runtime"],
+                        "reasons": ["deferred_to_preserve_setup_email_runtime", "will_retry_after_session_pools"],
                     }
                     logger.info("alert_job deferred bigmove send for uid=%s to preserve session-pool runtime", uid)
-                    break
+                    continue
 
                 ok = await _send_email_async(
                     EMAIL_SEND_TIMEOUT_SEC,
@@ -34387,6 +34410,73 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 }
                 _LAST_EMAIL_DECISION[uid] = _tmp_dec
                 _LAST_EMAIL_ERROR[uid] = dict(_tmp_dec)
+
+
+        # -----------------------------------------------------
+        # Post-session-pools retry for Big-Move emails that were deferred
+        # to preserve setup-email runtime. This prevents Big-Move from
+        # being starved forever whenever session pools are busy.
+        # -----------------------------------------------------
+        deferred_limit = _alert_job_limit('ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS', int(ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS or 0))
+        deferred_jobs_to_run = list(deferred_bigmove_jobs or [])
+        if int(deferred_limit or 0) > 0:
+            deferred_jobs_to_run = deferred_jobs_to_run[:int(deferred_limit)]
+        for job in deferred_jobs_to_run:
+            try:
+                uid = int(job.get('uid') or 0)
+            except Exception:
+                uid = 0
+            tz = job.get('tz') or timezone.utc
+            if not uid:
+                continue
+            if _bigmove_deferred_budget_exhausted():
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "SKIP",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": ["deferred_to_preserve_setup_email_runtime", "retry_budget_exhausted_after_session_pools"],
+                }
+                continue
+            try:
+                subject = str(job.get('subject') or '')
+                body = str(job.get('body') or '')
+                filtered = list(job.get('filtered') or [])
+                top_sym = str(job.get('top_sym') or '')
+                top_dir = str(job.get('top_dir') or '')
+                top_tf = str(job.get('top_tf') or '')
+                top_move = float(job.get('top_move') or 0.0)
+
+                ok = await _send_email_async(
+                    EMAIL_SEND_TIMEOUT_SEC,
+                    subject,
+                    body,
+                    user_id_for_debug=uid,
+                    enforce_trade_window=False,
+                    bypass_user_email_master=True,
+                )
+
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "SENT" if ok else "FAIL",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": (
+                        [f"ok ({len(filtered)} candidate(s))", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%", "sent_after_session_pools"]
+                        if ok else
+                        ["send_email_failed_or_timeout_after_defer", _LAST_SMTP_ERROR.get(uid, "send_email_failed")]
+                    ),
+                }
+
+                if ok:
+                    for c in filtered[:8]:
+                        try:
+                            mark_bigmove_emailed(uid, c["symbol"], c["direction"])
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.exception("Deferred big-move alert failed for uid=%s: %s", uid, e)
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "ERROR",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": [f"deferred_retry_{type(e).__name__}: {e}"],
+                }
 
 async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
