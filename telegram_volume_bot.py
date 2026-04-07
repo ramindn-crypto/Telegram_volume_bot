@@ -9878,7 +9878,7 @@ def ensure_email_column():
             pass
 
         try:
-            cur.execute("ALTER TABLE users ADD COLUMN bigmove_min_usd REAL DEFAULT 5000000")
+            cur.execute("ALTER TABLE users ADD COLUMN bigmove_min_usd REAL DEFAULT 10000000")
             con.commit()
             logger.info("Added bigmove_min_usd column to users table")
         except sqlite3.OperationalError:
@@ -10236,7 +10236,12 @@ def mark_bigmove_emailed(uid: int, symbol: str, direction: str) -> None:
         pass
 
 def _user_bigmove_min_vol_usd(user: dict | None, default: float = 10_000_000.0) -> float:
-    """Resolve big-move min volume with backward-compatible fallback."""
+    """Resolve big-move min volume with backward-compatible fallback.
+
+    Commercial floor: keep big-move alerts at or above 10M 24h volume unless a
+    future code change intentionally introduces a lower supported floor.
+    """
+    floor = 10_000_000.0
     try:
         u = dict(user or {})
     except Exception:
@@ -10248,10 +10253,13 @@ def _user_bigmove_min_vol_usd(user: dict | None, default: float = 10_000_000.0) 
                 continue
             val = float(raw or 0.0)
             if val > 0:
-                return float(val)
+                return float(max(floor, val))
         except Exception:
             continue
-    return float(default or 10_000_000.0)
+    try:
+        return float(max(floor, float(default or floor)))
+    except Exception:
+        return float(floor)
 
 
 def _record_bigmove_settings_change(uid: int, on: bool, p4: float, p1: float, min_vol: float, reason: str) -> None:
@@ -28345,7 +28353,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur_on = int(user.get("bigmove_alert_on", 1) or 0)
     cur_p4 = float(user.get("bigmove_alert_4h", 20) or 20)
     cur_p1 = float(user.get("bigmove_alert_1h", 10) or 10)
-    cur_min_vol = _user_bigmove_min_vol_usd(user, 10_000_000.0)
+    cur_min_vol = max(10_000_000.0, _user_bigmove_min_vol_usd(user, 10_000_000.0))
 
     if not context.args:
         updated_ts = float(user.get("bigmove_alert_updated_ts", 0.0) or 0.0)
@@ -28379,6 +28387,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode in {"on", "1", "enable"}:
         p4 = cur_p4 if cur_p4 > 0 else 20.0
         p1 = cur_p1 if cur_p1 > 0 else 10.0
+        min_vol = 10_000_000.0
         if len(context.args) >= 3:
             try:
                 p4 = float(context.args[1])
@@ -28386,8 +28395,8 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)")
                 return
-        _record_bigmove_settings_change(uid, True, p4, p1, cur_min_vol, f"command_on via /bigmove_alert (4H>={p4:.2f}% OR 1H>={p1:.2f}%, min_vol={cur_min_vol/1e6:.1f}M)")
-        await update.message.reply_text(f"✅ Big-move alert emails: ON (4H≥{p4:.0f}% OR 1H≥{p1:.0f}% | Min Vol {cur_min_vol/1e6:.1f}M)")
+        _record_bigmove_settings_change(uid, True, p4, p1, min_vol, f"command_on via /bigmove_alert (4H>={p4:.2f}% OR 1H>={p1:.2f}%, min_vol={min_vol/1e6:.1f}M)")
+        await update.message.reply_text(f"✅ Big-move alert emails: ON (4H≥{p4:.0f}% OR 1H≥{p1:.0f}% | Min Vol {min_vol/1e6:.1f}M)")
         return
 
     await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)  OR  /bigmove_alert off")
@@ -34534,16 +34543,22 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         pass
 
+    lines.append("")
+    lines.append("🧠 Market Scan Decision")
     if scan:
-        lines.append("")
-        lines.append("🧠 Market Scan Decision")
         lines.append(f"Status: {scan.get('status')}")
         lines.append("When: " + _fmt_when_both(scan.get("when") or scan.get("ts")))
         rs = scan.get("reasons") or scan.get("reason")
-        if isinstance(rs, list):
-            lines.append("Reasons:\n- " + "\n- ".join(rs))
+        if isinstance(rs, list) and rs:
+            lines.append("Reasons:\n- " + "\n- ".join([str(x) for x in rs]))
         elif rs:
             lines.append(f"Reason: {rs}")
+        else:
+            lines.append("Reason: -")
+    else:
+        lines.append("Status: -")
+        lines.append("When: -")
+        lines.append("Reason: no_market_scan_decision_recorded_yet")
 
     await update.message.reply_text("\n".join(lines).strip())
 
