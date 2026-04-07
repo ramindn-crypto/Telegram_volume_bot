@@ -33491,6 +33491,8 @@ ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", 
 ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "6"))
 ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING", False)
 ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.70") or 0.70)
+ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT = float(os.environ.get("ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT", "0.45") or 0.45)
+ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT = float(os.environ.get("ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT", "0.55") or 0.55)
 EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "600"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
@@ -33605,6 +33607,18 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 return False
 
+        def _bigmove_session_reserve_hit() -> bool:
+            try:
+                if not users_notify:
+                    return False
+                max_runtime = max(1.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 45))
+                reserve_pct = max(0.05, min(0.90, float(ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT or 0.45)))
+                share_pct = max(0.10, min(0.95, float(ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT or 0.55)))
+                allowed = min(max_runtime * share_pct, max_runtime * max(0.05, 1.0 - reserve_pct))
+                return (time.time() - job_started_ts) >= max(5.0, allowed)
+            except Exception:
+                return False
+
         # Keep it quiet if email is off or not configured
         if not EMAIL_ENABLED:
             return
@@ -33674,13 +33688,20 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         users_bigmove = list(users_bigmove or [])
+        try:
+            users_bigmove = [u for u in users_bigmove if int((u or {}).get('bigmove_alert_on', 1) or 0) == 1]
+        except Exception:
+            users_bigmove = list(users_bigmove or [])
         _bigmove_user_limit = _alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 0)
         if int(_bigmove_user_limit or 0) > 0:
             users_bigmove = users_bigmove[:int(_bigmove_user_limit)]
         for u in users_bigmove:
             if _job_budget_exhausted():
                 logger.warning("alert_job bigmove loop budget exhausted after %.1fs", time.time() - job_started_ts)
-                return
+                break
+            if _bigmove_session_reserve_hit():
+                logger.info("alert_job stopped bigmove loop early to reserve runtime for session pools after %.1fs", time.time() - job_started_ts)
+                break
             # Pro/trial-only email features
             try:
                 uid = int(u.get("user_id") or u.get("id") or 0)
@@ -33848,6 +33869,15 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         f"cooldown_filtered={int(cooldown_filtered_out)}",
                     ],
                 }
+
+                if _bigmove_session_reserve_hit():
+                    _LAST_BIGMOVE_DECISION[uid] = {
+                        "status": "SKIP",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": ["deferred_to_preserve_setup_email_runtime"],
+                    }
+                    logger.info("alert_job deferred bigmove send for uid=%s to preserve session-pool runtime", uid)
+                    break
 
                 ok = await _send_email_async(
                     EMAIL_SEND_TIMEOUT_SEC,
