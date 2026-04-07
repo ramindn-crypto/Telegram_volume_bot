@@ -9280,6 +9280,17 @@ def db_init():
         cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_4h REAL NOT NULL DEFAULT 20")
     if "bigmove_alert_1h" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_1h REAL NOT NULL DEFAULT 10")
+    if "bigmove_min_vol_usd" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_min_vol_usd REAL NOT NULL DEFAULT 10000000")
+        if "bigmove_min_usd" in cols:
+            try:
+                cur.execute("UPDATE users SET bigmove_min_vol_usd = COALESCE(NULLIF(bigmove_min_usd, 0), bigmove_min_vol_usd)")
+            except Exception:
+                pass
+    if "bigmove_alert_updated_ts" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_updated_ts REAL NOT NULL DEFAULT 0")
+    if "bigmove_alert_update_reason" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_update_reason TEXT NOT NULL DEFAULT ''")
 
     # NEW: Spike Reversal Alerts
     if "spike_alert_on" not in cols:
@@ -10223,6 +10234,50 @@ def mark_bigmove_emailed(uid: int, symbol: str, direction: str) -> None:
             conn.commit()
     except Exception:
         pass
+
+def _user_bigmove_min_vol_usd(user: dict | None, default: float = 10_000_000.0) -> float:
+    """Resolve big-move min volume with backward-compatible fallback."""
+    try:
+        u = dict(user or {})
+    except Exception:
+        u = {}
+    for key in ("bigmove_min_vol_usd", "bigmove_min_usd"):
+        try:
+            raw = u.get(key, None)
+            if raw in (None, ""):
+                continue
+            val = float(raw or 0.0)
+            if val > 0:
+                return float(val)
+        except Exception:
+            continue
+    return float(default or 10_000_000.0)
+
+
+def _record_bigmove_settings_change(uid: int, on: bool, p4: float, p1: float, min_vol: float, reason: str) -> None:
+    ts_now = float(time.time())
+    try:
+        update_user(
+            int(uid),
+            bigmove_alert_on=(1 if on else 0),
+            bigmove_alert_4h=float(p4),
+            bigmove_alert_1h=float(p1),
+            bigmove_min_vol_usd=float(min_vol),
+            bigmove_alert_updated_ts=ts_now,
+            bigmove_alert_update_reason=str(reason or '').strip(),
+        )
+    except Exception:
+        try:
+            update_user(
+                int(uid),
+                bigmove_alert_on=(1 if on else 0),
+                bigmove_alert_4h=float(p4),
+                bigmove_alert_1h=float(p1),
+                bigmove_alert_updated_ts=ts_now,
+                bigmove_alert_update_reason=str(reason or '').strip(),
+            )
+        except Exception:
+            pass
 
 SPIKE_COOLDOWN_SEC = 60 * 60 * 3  # 3 hours
 
@@ -28277,7 +28332,7 @@ async def sessions_unlimited_off_cmd(update: Update, context: ContextTypes.DEFAU
 
 async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = get_user(uid)
+    user = get_user(uid) or {}
 
     if not has_active_access(uid, user):
         await update.message.reply_text(
@@ -28285,32 +28340,45 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
             "👉 /billing"
         )
-        return   
-        
+        return
+
+    cur_on = int(user.get("bigmove_alert_on", 1) or 0)
+    cur_p4 = float(user.get("bigmove_alert_4h", 20) or 20)
+    cur_p1 = float(user.get("bigmove_alert_1h", 10) or 10)
+    cur_min_vol = _user_bigmove_min_vol_usd(user, 10_000_000.0)
+
     if not context.args:
-        on = int(user.get("bigmove_alert_on", 1) or 0)
-        p4 = float(user.get("bigmove_alert_4h", 20) or 20)
-        p1 = float(user.get("bigmove_alert_1h", 10) or 10)
-        await update.message.reply_text(
-            "📣 Big-Move Alert Emails\n"
-            f"{HDR}\n"
-            f"Status: {'ON' if on else 'OFF'}\n"
-            f"Thresholds: |4H| ≥ {p4:.0f}% OR |1H| ≥ {p1:.0f}% (both directions)\n\n"
-            "Set: /bigmove_alert on 20 10\n"
-            "Off: /bigmove_alert off"
-        )
+        updated_ts = float(user.get("bigmove_alert_updated_ts", 0.0) or 0.0)
+        updated_reason = str(user.get("bigmove_alert_update_reason", "") or "").strip()
+        lines = [
+            "📣 Big-Move Alert Emails",
+            f"{HDR}",
+            f"Status: {'ON' if cur_on else 'OFF'}",
+            f"Thresholds: |4H| ≥ {cur_p4:.0f}% OR |1H| ≥ {cur_p1:.0f}% (both directions)",
+            f"Min Vol (24H): {cur_min_vol/1e6:.1f}M",
+        ]
+        if updated_ts > 0:
+            lines.append(f"Updated: {_fmt_when(updated_ts)}")
+        if updated_reason:
+            lines.append(f"Reason: {updated_reason}")
+        lines.extend([
+            "",
+            "Set: /bigmove_alert on 20 10",
+            "Off: /bigmove_alert off",
+        ])
+        await update.message.reply_text("\n".join(lines))
         return
 
     mode = context.args[0].strip().lower()
 
     if mode in {"off", "0", "disable"}:
-        update_user(uid, bigmove_alert_on=0)
+        _record_bigmove_settings_change(uid, False, cur_p4, cur_p1, cur_min_vol, "command_off via /bigmove_alert")
         await update.message.reply_text("✅ Big-move alert emails: OFF")
         return
 
     if mode in {"on", "1", "enable"}:
-        p4 = 20.0
-        p1 = 10.0
+        p4 = cur_p4 if cur_p4 > 0 else 20.0
+        p1 = cur_p1 if cur_p1 > 0 else 10.0
         if len(context.args) >= 3:
             try:
                 p4 = float(context.args[1])
@@ -28318,8 +28386,8 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)")
                 return
-        update_user(uid, bigmove_alert_on=1, bigmove_alert_4h=p4, bigmove_alert_1h=p1)
-        await update.message.reply_text(f"✅ Big-move alert emails: ON (4H≥{p4:.0f}% OR 1H≥{p1:.0f}%)")
+        _record_bigmove_settings_change(uid, True, p4, p1, cur_min_vol, f"command_on via /bigmove_alert (4H>={p4:.2f}% OR 1H>={p1:.2f}%, min_vol={cur_min_vol/1e6:.1f}M)")
+        await update.message.reply_text(f"✅ Big-move alert emails: ON (4H≥{p4:.0f}% OR 1H≥{p1:.0f}% | Min Vol {cur_min_vol/1e6:.1f}M)")
         return
 
     await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)  OR  /bigmove_alert off")
@@ -33462,11 +33530,40 @@ async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
     Runs send_email() in a worker thread with a hard timeout so SMTP/network stalls
     can't block the Telegram event loop (Render lag fix).
     """
+    uid = None
+    try:
+        raw_uid = kwargs.get('user_id_for_debug', None)
+        if raw_uid is not None:
+            uid = int(raw_uid)
+    except Exception:
+        uid = None
     try:
         return bool(await _to_thread_with_timeout(send_email, timeout_sec, *args, **kwargs))
     except asyncio.TimeoutError:
+        if uid is not None:
+            err = f"async_email_timeout ({int(timeout_sec)}s)"
+            try:
+                _LAST_SMTP_ERROR[uid] = err
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "FAIL",
+                    "reasons": [err],
+                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                }
+            except Exception:
+                pass
         return False
-    except Exception:
+    except Exception as e:
+        if uid is not None:
+            err = f"async_email_error ({type(e).__name__}: {e})"
+            try:
+                _LAST_SMTP_ERROR[uid] = err
+                _LAST_EMAIL_DECISION[uid] = {
+                    "status": "FAIL",
+                    "reasons": [err],
+                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                }
+            except Exception:
+                pass
         return False
 
 
@@ -33567,7 +33664,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     users_bigmove = []
         except Exception:
             pass
-        users_bigmove = list(users_bigmove or [])[:_alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 0)]
+        users_bigmove = list(users_bigmove or [])
+        _bigmove_user_limit = _alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 0)
+        if int(_bigmove_user_limit or 0) > 0:
+            users_bigmove = users_bigmove[:int(_bigmove_user_limit)]
         for u in users_bigmove:
             if _job_budget_exhausted():
                 logger.warning("alert_job bigmove loop budget exhausted after %.1fs", time.time() - job_started_ts)
@@ -33615,7 +33715,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     p4, p1 = 15.0, 7.5
 
                 try:
-                    min_vol = float(uu.get("bigmove_min_vol_usd", 10_000_000) or 10_000_000)
+                    min_vol = _user_bigmove_min_vol_usd(uu, 10_000_000.0)
                 except Exception:
                     min_vol = 10_000_000.0
 
@@ -33662,6 +33762,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
                 # Volume gate (default 10M) + remove ones emailed recently (per symbol + direction)
                 filtered = []
+                volume_filtered_out = 0
+                cooldown_filtered_out = 0
                 for c in candidates:
                     try:
                         vol = float(c.get("vol", 0.0) or 0.0)
@@ -33669,11 +33771,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         vol = 0.0
 
                     if vol > 0.0 and vol < float(min_vol):
+                        volume_filtered_out += 1
                         continue
 
                     try:
-                        if not bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
-                            filtered.append(c)
+                        if bigmove_recently_emailed(uid, c["symbol"], c["direction"]):
+                            cooldown_filtered_out += 1
+                            continue
+                        filtered.append(c)
                     except Exception:
                         filtered.append(c)
 
@@ -33681,7 +33786,12 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     _LAST_BIGMOVE_DECISION[uid] = {
                         "status": "SKIP",
                         "when": datetime.now(tz).isoformat(timespec="seconds"),
-                        "reasons": [f"no_candidates_after_volume_or_cooldown (min_vol={min_vol/1e6:.1f}M)"],
+                        "reasons": [
+                            f"no_candidates_after_filters (min_vol={min_vol/1e6:.1f}M)",
+                            f"raw_candidates={len(candidates)}",
+                            f"volume_filtered={int(volume_filtered_out)}",
+                            f"cooldown_filtered={int(cooldown_filtered_out)}",
+                        ],
                     }
                     continue
 
@@ -33721,9 +33831,12 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                     "reasons": [
                         f"candidates={len(filtered)}",
+                        f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%",
                         f"p4={p4}",
                         f"p1={p1}",
                         f"min_vol={min_vol}",
+                        f"volume_filtered={int(volume_filtered_out)}",
+                        f"cooldown_filtered={int(cooldown_filtered_out)}",
                     ],
                 }
 
@@ -33740,7 +33853,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 _LAST_BIGMOVE_DECISION[uid] = {
                     "status": "SENT" if ok else "FAIL",
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "reasons": ["ok"] if ok else [_LAST_SMTP_ERROR.get(uid, "send_email_failed")],
+                    "reasons": ([f"ok ({len(filtered)} candidate(s))", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%"] if ok else [_LAST_SMTP_ERROR.get(uid, "send_email_failed")]),
                 }
 
                 if ok:
@@ -34343,15 +34456,24 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         bigm_p1 = 10.0
     try:
-        bigm_min_vol = float(user.get("bigmove_min_vol_usd", 10_000_000) or 10_000_000)
+        bigm_min_vol = _user_bigmove_min_vol_usd(user, 10_000_000.0)
     except Exception:
         bigm_min_vol = 10_000_000.0
+    try:
+        bigm_updated_ts = float(user.get("bigmove_alert_updated_ts", 0.0) or 0.0)
+    except Exception:
+        bigm_updated_ts = 0.0
+    bigm_updated_reason = str(user.get("bigmove_alert_update_reason", "") or "").strip()
 
     lines.append("")
     lines.append("⚡ Big-Move Alert Settings")
     lines.append(f"Status: {'ON' if bigm_on else 'OFF'}")
     lines.append(f"Thresholds: |4H| ≥ {bigm_p4:.0f}% OR |1H| ≥ {bigm_p1:.0f}%")
     lines.append(f"Min Vol (24H): {bigm_min_vol/1e6:.1f}M")
+    if bigm_updated_ts > 0:
+        lines.append("Updated: " + _fmt_when_both(bigm_updated_ts))
+    if bigm_updated_reason:
+        lines.append(f"Reason: {bigm_updated_reason}")
 
     if bigm:
         lines.append("")
@@ -34361,6 +34483,56 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         rs = bigm.get("reasons") or []
         if rs:
             lines.append("Reasons:\n- " + "\n- ".join(rs))
+
+    try:
+        pipe_build = _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or {}
+        pipe_exec = _latest_setup_pipeline_event(uid, stage='email_executable_pool', mode='email') or {}
+        if pipe_build or pipe_exec:
+            def _pipe_summary(row: dict) -> str:
+                if not row:
+                    return '-'
+                try:
+                    details = json.loads(str(row.get('details_json') or '{}')) if row.get('details_json') else {}
+                except Exception:
+                    details = {}
+                status = str(row.get('status') or '-')
+                parts = [status]
+                try:
+                    if details.get('timeout_sec'):
+                        parts.append(f"timeout={details.get('timeout_sec')}s")
+                except Exception:
+                    pass
+                try:
+                    if details.get('setups') is not None:
+                        parts.append(f"setups={int(details.get('setups') or 0)}")
+                except Exception:
+                    pass
+                try:
+                    if details.get('eligible') is not None:
+                        parts.append(f"eligible={int(details.get('eligible') or 0)}")
+                except Exception:
+                    pass
+                try:
+                    top = details.get('top_reasons') or []
+                    if top:
+                        parts.append('top=' + ', '.join([str(x) for x in top[:3]]))
+                except Exception:
+                    pass
+                try:
+                    err = str(details.get('error') or '').strip()
+                    if err:
+                        parts.append(err[:160])
+                except Exception:
+                    pass
+                return ' | '.join(parts)
+            lines.append("")
+            lines.append("🛠️ Setup Email Pipeline")
+            if pipe_build:
+                lines.append("Build pool: " + _pipe_summary(pipe_build))
+            if pipe_exec:
+                lines.append("Executable pool: " + _pipe_summary(pipe_exec))
+    except Exception:
+        pass
 
     if scan:
         lines.append("")
