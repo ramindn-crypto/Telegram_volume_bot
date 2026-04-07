@@ -5879,9 +5879,11 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         out = sorted(
             out,
             key=lambda x: (
-                float(getattr(x, 'email_logged_ts', 0.0) or 0.0),
+                float(getattr(x, 'executable_ts', 0.0) or getattr(x, 'created_ts', 0.0) or 0.0),
                 float(getattr(x, 'created_ts', 0.0) or 0.0),
+                float(getattr(x, 'quality_score', 0.0) or 0.0),
                 int(getattr(x, 'conf', 0) or 0),
+                float(getattr(x, 'email_logged_ts', 0.0) or 0.0),
             ),
             reverse=True,
         )[:max(1, int(limit))]
@@ -5909,6 +5911,112 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             logger.error(f"_autotrade_select_db_setups failed: {type(e).__name__}: {e}")
         except Exception:
             pass
+        return []
+
+
+def _autotrade_refresh_owner_executable_pool(uid: int, session_label: str, lookback_hours: int = 12) -> list:
+    """Best-effort self-refresh of the owner's executable pool.
+
+    This keeps autotrade independent from the email loop and /screen.
+    If the persisted executable queue is empty or stale, rebuild the current
+    executable pool for the owner directly from the live market snapshot,
+    persist it, then re-read the same authoritative queue.
+    """
+    try:
+        owner_uid = int(uid or 0)
+    except Exception:
+        owner_uid = 0
+    sess = str(session_label or '').upper().strip()
+    if owner_uid <= 0 or sess not in {'ASIA', 'LON', 'NY'}:
+        return []
+    now_ts = float(time.time())
+    try:
+        existing_rows = db_list_executable_setups(owner_uid, session_name=sess, ts_from=float(now_ts - max(3600.0, float(lookback_hours) * 3600.0)), limit=6)
+    except Exception:
+        existing_rows = []
+    if existing_rows:
+        try:
+            return _autotrade_select_db_setups(owner_uid, sess, lookback_hours=lookback_hours, limit=5)
+        except Exception:
+            return []
+
+    try:
+        best_fut = fetch_futures_tickers() or {}
+    except Exception as e:
+        try:
+            db_log_setup_pipeline_event(owner_uid, stage='autotrade_exec_refresh', status='error', session=sess, mode='autotrade', details={'step': 'fetch_futures_tickers', 'error': f'{type(e).__name__}: {e}'})
+        except Exception:
+            pass
+        return []
+    if not best_fut:
+        try:
+            db_log_setup_pipeline_event(owner_uid, stage='autotrade_exec_refresh', status='empty', session=sess, mode='autotrade', details={'step': 'fetch_futures_tickers'})
+        except Exception:
+            pass
+        return []
+
+    try:
+        pool = _run_coro_in_thread(
+            build_priority_pool(
+                best_fut,
+                sess,
+                mode='exec',
+                scan_profile=str(DEFAULT_SCAN_PROFILE),
+                uid=owner_uid,
+            )
+        ) or {}
+    except Exception as e:
+        try:
+            db_log_setup_pipeline_event(owner_uid, stage='autotrade_exec_refresh', status='error', session=sess, mode='autotrade', details={'step': 'build_priority_pool', 'error': f'{type(e).__name__}: {e}'})
+        except Exception:
+            pass
+        return []
+
+    raw_pool = list((pool or {}).get('setups') or [])
+    executable_ready = []
+    reject_counts = Counter()
+    for s in (raw_pool or []):
+        try:
+            ok, why = is_executable_setup_eligible(s, session_name=sess)
+        except Exception:
+            ok, why = False, 'autotrade_exec_gate_exception'
+        if ok:
+            executable_ready.append(s)
+        else:
+            reject_counts[str(why)] += 1
+
+    persisted = 0
+    if executable_ready:
+        try:
+            stats = _persist_executable_candidates(owner_uid, sess, executable_ready, source_kind='executable_setups', mode='autotrade') or {}
+            persisted = int(stats.get('persisted') or 0)
+        except Exception as e:
+            try:
+                db_log_setup_pipeline_event(owner_uid, stage='autotrade_exec_refresh', status='error', session=sess, mode='autotrade', details={'step': 'persist_executable', 'error': f'{type(e).__name__}: {e}', 'raw_pool': len(raw_pool), 'eligible': len(executable_ready)})
+            except Exception:
+                pass
+            return []
+
+    try:
+        db_log_setup_pipeline_event(
+            owner_uid,
+            stage='autotrade_exec_refresh',
+            status='ok' if executable_ready else 'empty',
+            session=sess,
+            mode='autotrade',
+            details={
+                'raw_pool': len(raw_pool),
+                'eligible': len(executable_ready),
+                'persisted': persisted,
+                'top_exec_rejects': _pipeline_top_reasons(reject_counts, 5),
+            },
+        )
+    except Exception:
+        pass
+
+    try:
+        return _autotrade_select_db_setups(owner_uid, sess, lookback_hours=lookback_hours, limit=5)
+    except Exception:
         return []
 
 def _autotrade_clear_debug_state(uid: int | None = None) -> None:
@@ -35936,11 +36044,32 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 pass
 
             db_setups = await to_thread_fast(_autotrade_select_db_setups, uid, sess, lookback_hours=12, limit=5, timeout=8)
+            if not db_setups and not _job_budget_exhausted():
+                remaining_budget = max(4.0, float(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40) - (time.time() - job_started_ts))
+                refresh_timeout = min(12.0, remaining_budget)
+                try:
+                    refreshed = await to_thread_heavy(_autotrade_refresh_owner_executable_pool, uid, sess, 12, timeout=refresh_timeout)
+                except asyncio.TimeoutError:
+                    refreshed = []
+                    try:
+                        db_log_setup_pipeline_event(uid, stage='autotrade_exec_refresh', status='timeout', session=str(sess or ''), mode='autotrade', details={'timeout_sec': float(refresh_timeout)})
+                    except Exception:
+                        pass
+                except Exception as e:
+                    refreshed = []
+                    try:
+                        db_log_setup_pipeline_event(uid, stage='autotrade_exec_refresh', status='error', session=str(sess or ''), mode='autotrade', details={'error': f'{type(e).__name__}: {e}'})
+                    except Exception:
+                        pass
+                if refreshed:
+                    db_setups = list(refreshed or [])
+
             attempt_summaries = [{
                 'setup_id': str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or ''),
                 'symbol': str(getattr(x, 'symbol', '') or ''),
                 'side': str(getattr(x, 'side', '') or ''),
                 'created_ts': float(getattr(x, 'created_ts', 0.0) or 0.0),
+                'executable_ts': float(getattr(x, 'executable_ts', 0.0) or 0.0),
                 'source_kind': str(getattr(x, 'source_kind', '') or ''),
                 'source_session': str(getattr(x, 'source_session', '') or ''),
             } for x in (db_setups or [])]
