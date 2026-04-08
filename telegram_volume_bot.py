@@ -4882,6 +4882,9 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     closed_today_count = 0
     closed_today_rows = []
     position_classifications = []
+    total_exchange_open_positions = 0
+    unmanaged_open_positions = 0
+    unmanaged_open_risk = 0.0
 
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -4930,15 +4933,20 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
             positions = _bybit_get_open_positions_linear()
         except Exception:
             positions = []
-        open_positions_now = len(positions)
-        open_pnl = float(sum(_pos_unreal_pnl(p) for p in positions) or 0.0) if positions else 0.0
+        total_exchange_open_positions = int(len(positions))
+        managed_open_positions = 0
+        unmanaged_open_positions = 0
+        unmanaged_open_risk = 0.0
+        open_pnl = 0.0
 
         for p in positions:
             est = float(_estimate_position_risk_usd(p) or 0.0)
-            info = _autotrade_resolve_live_position_open_info(int(uid), p, journal_open=journal_open)
-            opened_ts = float(info.get('opened_ts') or 0.0)
             psym = _pos_symbol(p)
             pside = _pos_side_text(p)
+            trade_row = _autotrade_find_open_trade_for_live_position(int(uid), p, journal_open=journal_open) or {}
+            managed = bool(trade_row)
+            info = _autotrade_resolve_live_position_open_info(int(uid), p, journal_open=([trade_row] if trade_row else journal_open))
+            opened_ts = float(info.get('opened_ts') or 0.0)
             if est <= 0:
                 try:
                     matches = [t for t in journal_open
@@ -4954,15 +4962,22 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
                 except Exception:
                     pass
             est = max(0.0, float(est or 0.0))
-            current_total_open_risk += est
 
-            if opened_ts > 0 and opened_ts < start_ts:
-                bucket = 'carried'
-                carried_open_risk += est
-                inherited_open_positions += 1
+            if managed:
+                managed_open_positions += 1
+                open_pnl += float(_pos_unreal_pnl(p) or 0.0)
+                current_total_open_risk += est
+                if opened_ts > 0 and opened_ts < start_ts:
+                    bucket = 'carried'
+                    carried_open_risk += est
+                    inherited_open_positions += 1
+                else:
+                    bucket = 'current_day'
+                    current_day_open_risk += est
             else:
-                bucket = 'current_day'
-                current_day_open_risk += est
+                unmanaged_open_positions += 1
+                unmanaged_open_risk += est
+                bucket = 'unmanaged'
 
             position_classifications.append({
                 'symbol': psym,
@@ -4970,21 +4985,21 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
                 'risk': float(est),
                 'opened_ts': float(opened_ts or 0.0),
                 'bucket': bucket,
-                'source': str(info.get('source') or 'unknown'),
+                'managed': bool(managed),
+                'trade_id': str((trade_row or {}).get('trade_id') or ''),
+                'source': str(info.get('source') or ('unmanaged' if not managed else 'unknown')),
                 'journal_ts': float(info.get('journal_ts') or 0.0),
                 'position_created_ts': float(info.get('position_created_ts') or 0.0),
                 'exchange_order_ts': float(info.get('exchange_order_ts') or 0.0),
                 'notes': str(info.get('notes') or ''),
             })
+        open_positions_now = int(managed_open_positions)
         inherited_open_positions = min(int(inherited_open_positions), int(open_positions_now))
         current_day_open_positions = max(0, int(open_positions_now) - int(inherited_open_positions))
-        # Live day-cap accounting should charge only positions opened inside the current
-        # anchored trading day. Carried exposure is shown separately but must not consume
-        # today's new-trade budget again.
+        # Live day-cap accounting should charge only bot-managed positions opened inside the current
+        # anchored trading day. Unmanaged/manual exchange positions are shown separately but must not
+        # consume the bot's daily new-trade budget or max-open-trades cap.
         live_open_risk_charged_today = float(current_day_open_risk)
-        # Keep the day-open count anchored to confirmed current-day opens, but if the
-        # local journal is incomplete, never understate day activity versus confirmed
-        # exchange closes plus current-day live positions.
         opened_today_count = max(int(opened_today_count), int(current_day_open_positions))
         opened_today_count = max(int(opened_today_count), int(closed_today_count) + int(current_day_open_positions))
     else:
@@ -5038,6 +5053,9 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         "live_open_risk_charged_today": float(live_open_risk_charged_today),
         "carried_open_risk": float(carried_open_risk),
         "open_positions_now": int(open_positions_now),
+        "live_exchange_open_positions_now": int(total_exchange_open_positions) if mode == "live" else int(open_positions_now),
+        "unmanaged_open_positions_now": int(unmanaged_open_positions) if mode == "live" else 0,
+        "unmanaged_open_risk": float(unmanaged_open_risk) if mode == "live" else 0.0,
         "inherited_open_positions": int(inherited_open_positions),
         "opened_today_count": int(opened_today_count),
         "closed_today_count": int(closed_today_count),
@@ -11282,6 +11300,9 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["current_day_open_risk"] = float(m.get("current_day_open_risk") or 0.0)
         snap["carried_open_risk"] = float(m.get("carried_open_risk") or 0.0)
         snap["open_positions_now"] = int(m.get("open_positions_now") or 0)
+        snap["live_exchange_open_positions_now"] = int(m.get("live_exchange_open_positions_now") or m.get("open_positions_now") or 0)
+        snap["unmanaged_open_positions_now"] = int(m.get("unmanaged_open_positions_now") or 0)
+        snap["unmanaged_open_risk"] = float(m.get("unmanaged_open_risk") or 0.0)
         snap["positions_opened_today"] = int(m.get("opened_today_count") or 0)
         snap["positions_closed_today"] = int(m.get("closed_today_count") or 0)
         snap["closed_today_rows"] = list(m.get("closed_today_rows") or [])
@@ -24200,6 +24221,10 @@ def is_top_setup_eligible(
         except Exception:
             pass
 
+        src = str(source or "screen").strip().lower()
+        if src not in {"screen", "email", "exec"}:
+            src = "screen"
+
         score, comps = compute_setup_quality_score(s, session_name=session_name, source=src)
         setattr(s, "quality_score", float(score))
         try:
@@ -24209,9 +24234,6 @@ def is_top_setup_eligible(
 
         cfg_live = load_strategy_config(force=False)
         engine_c_base_score_add = float((cfg_live or {}).get('engine_c_base_score_add', 0.0) or 0.0)
-        src = str(source or "screen").strip().lower()
-        if src not in {"screen", "email", "exec"}:
-            src = "screen"
         sess = str(session_name or 'LON').upper().strip()
         engine = str(getattr(s, 'engine', '') or '').upper().strip()
         fam = str(getattr(s, 'family_id', '') or _family_id_from_engine(engine, s)).upper().strip()
@@ -31127,11 +31149,12 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         SEP,
         f"Equity: ${equity:.2f}",
         f"Daily cap: ${float(snap.get('cap') or 0.0):.2f}",
-        f"Opened today: {int(snap.get('positions_opened_today', 0) or 0)} | Closed today: {int(snap.get('positions_closed_today', 0) or 0)} | Open now: {int(snap.get('open_positions_now', 0) or 0)}",
-        f"Open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
+        f"Opened today: {int(snap.get('positions_opened_today', 0) or 0)} | Closed today: {int(snap.get('positions_closed_today', 0) or 0)} | Bot-managed open now: {int(snap.get('open_positions_now', 0) or 0)}",
+        f"Bot-managed open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
         f"Realised net today: ${float(snap.get('pnl_today') or 0.0):+.2f}",
         f"Daily risk used (open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
         ('Daily risk remaining: ∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f"Daily risk remaining: ${float(snap.get('remaining_today')):.2f}"),
+        f"Exchange open positions (all): {int(snap.get('live_exchange_open_positions_now', snap.get('open_positions_now', 0)) or 0)} | Unmanaged/manual: {int(snap.get('unmanaged_open_positions_now', 0) or 0)} | Unmanaged risk est: ${float(snap.get('unmanaged_open_risk', 0.0)):.2f}",
         SEP,
         'Email → executable lane',
         f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
@@ -31165,10 +31188,16 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if class_rows:
         lines.extend([SEP, 'Position day buckets'])
         live_positions = {f"{_pos_symbol(p)}|{_pos_side_text(p)}": float(_pos_unreal_pnl(p) or 0.0) for p in (_bybit_get_open_positions_linear() or [])}
-        for row in class_rows[:10]:
+        managed_rows = [r for r in class_rows if bool(r.get('managed', True))]
+        unmanaged_rows = [r for r in class_rows if not bool(r.get('managed', True))]
+        for row in managed_rows[:10]:
             key = f"{row.get('symbol')}|{row.get('side')}"
             pnl = float(live_positions.get(key, 0.0) or 0.0)
-            lines.append(f"• {row.get('symbol')} | {row.get('side')} | ${pnl:+.2f}")
+            lines.append(f"• {row.get('symbol')} | {row.get('side')} | ${pnl:+.2f} | {row.get('bucket')}")
+        for row in unmanaged_rows[:5]:
+            key = f"{row.get('symbol')}|{row.get('side')}"
+            pnl = float(live_positions.get(key, 0.0) or 0.0)
+            lines.append(f"• {row.get('symbol')} | {row.get('side')} | ${pnl:+.2f} | unmanaged/manual")
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
