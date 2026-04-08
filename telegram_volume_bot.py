@@ -1636,22 +1636,22 @@ def _strategy_config_bootstrap_recommendations() -> None:
         # silently keep the bot above the 1–3 setups/day target after redeploy.
         try:
             q_screen = float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
-            if q_screen > 62.0:
-                cfg['quality_score_min_screen'] = 62.0
+            if q_screen > 60.0:
+                cfg['quality_score_min_screen'] = 60.0
                 changed = True
         except Exception:
             pass
         try:
             q_email = float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
-            if q_email > 66.0:
-                cfg['quality_score_min_email'] = 66.0
+            if q_email > 64.0:
+                cfg['quality_score_min_email'] = 64.0
                 changed = True
         except Exception:
             pass
         try:
             rr_live = float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP)
-            if rr_live > 1.34:
-                cfg['min_rr_tp'] = 1.34
+            if rr_live > 1.30:
+                cfg['min_rr_tp'] = 1.30
                 changed = True
         except Exception:
             pass
@@ -1943,12 +1943,12 @@ ENGINE_B_MOMENTUM_ENABLED = True     # pump / expansion
 # =========================================================
 # Base floor (still used), but we now scale it per session:
 TRIGGER_1H_ABS_MIN_BASE = 0.12        # global floor
-CONFIRM_15M_ABS_MIN = 0.25
+CONFIRM_15M_ABS_MIN = 0.18
 ALIGN_4H_MIN = 0.0
 ALIGN_4H_NEUTRAL_ZONE = 0.35  # if |4H| < this, treat regime as neutral (avoid blocking leaders)
 
 # "EARLY" filler (email only)
-EARLY_1H_ABS_MIN = 1.8
+EARLY_1H_ABS_MIN = 1.45
 EARLY_CONF_PENALTY = 3
 EARLY_EMAIL_EXTRA_CONF = 4
 EARLY_EMAIL_MAX_FILL = 1
@@ -16310,7 +16310,7 @@ def _mid_pref(x: float, lo: float, hi: float, mid: float | None = None) -> float
     except Exception:
         return 0.0
 
-def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[float, dict]:
+def compute_setup_quality_score(s: "Setup", session_name: str = "LON", source: str = "screen") -> tuple[float, dict]:
     """Return (score, components). Score is 0..100."""
     conf = float(getattr(s, "conf", 0) or 0)
     fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
@@ -16422,7 +16422,7 @@ def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[
     if tp_valid <= 0:
         score = min(score, 35.0)
 
-    limits = _session_entry_quality_limits(session_name, source='email')
+    limits = _session_entry_quality_limits(session_name, source=source)
     extension_penalty = 0.0
     weak_context_penalty = 0.0
     if not leader_base_override:
@@ -16876,17 +16876,11 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
             setattr(s, "session", _session_label_from_ts(getattr(s, "created_ts", 0.0)))
         except Exception:
             pass
-        score, _ = compute_setup_quality_score(s, session_name=session_name)
+        score, _ = compute_setup_quality_score(s, session_name=session_name, source='screen')
         setattr(s, "quality_score", float(score))
         s = _research_finalize_setup(s, session_name=session_name)
 
-        if float(score) >= float(QUALITY_SCORE_MIN_SCREEN):
-            setups.append(s)
-        else:
-            try:
-                _BT_LAST_REJECTS["score_below_min"] += 1
-            except Exception:
-                pass
+        setups.append(s)
 
     return setups
 
@@ -23156,12 +23150,12 @@ def _goal_profile_profile_bundles(profile_name: str, bundles: list[dict]) -> lis
 
 def _goal_profile_apply_candidate(base_cfg: dict, profile: dict, bundle: dict) -> dict:
     cfg = json.loads(json.dumps(base_cfg or {}))
-    cfg['quality_score_min_screen'] = float(bundle.get('quality_score_min_screen', cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN)))
-    cfg['quality_score_min_email'] = float(bundle.get('quality_score_min_email', cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL)))
-    cfg['tf_align_1h_min_abs'] = float(bundle.get('tf_align_1h_min_abs', cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS)))
-    cfg['tf_align_4h_min_abs'] = float(bundle.get('tf_align_4h_min_abs', cfg.get('tf_align_4h_min_abs', TF_ALIGN_4H_MIN_ABS)))
-    cfg['atr_min_pct'] = float(bundle.get('atr_min_pct', cfg.get('atr_min_pct', ATR_MIN_PCT)))
-    cfg['min_rr_tp'] = float(bundle.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP)))
+    cfg['quality_score_min_screen'] = float(_clamp(float(bundle.get('quality_score_min_screen', cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN))), 56.0, 60.0))
+    cfg['quality_score_min_email'] = float(_clamp(float(bundle.get('quality_score_min_email', cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL))), 60.0, 66.0))
+    cfg['tf_align_1h_min_abs'] = float(_clamp(float(bundle.get('tf_align_1h_min_abs', cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS))), 0.30, 0.55))
+    cfg['tf_align_4h_min_abs'] = float(_clamp(float(bundle.get('tf_align_4h_min_abs', cfg.get('tf_align_4h_min_abs', TF_ALIGN_4H_MIN_ABS))), 0.28, 0.50))
+    cfg['atr_min_pct'] = float(_clamp(float(bundle.get('atr_min_pct', cfg.get('atr_min_pct', ATR_MIN_PCT))), 0.70, 1.05))
+    cfg['min_rr_tp'] = float(_clamp(float(bundle.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP))), 1.12, 1.34))
     cfg['regime_slope_trend_min_pct'] = float(bundle.get('regime_slope_trend_min_pct', cfg.get('regime_slope_trend_min_pct', 0.06)))
     cfg['execution_sessions_allowed'] = [str(x).upper().strip() for x in (profile.get('execution_sessions_allowed') or ['LON']) if str(x).strip()]
     cfg['execution_engines_allowed'] = [str(x).upper().strip() for x in (profile.get('execution_engines_allowed') or ['A']) if str(x).strip()]
@@ -24057,21 +24051,21 @@ async def research_framework_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
 def _session_entry_quality_limits(session_name: str, source: str = 'email') -> dict:
     sess = str(session_name or '').upper().strip() or 'NY'
     base = {
-        'NY': {'max_pb_ema_dist': 0.66, 'max_ch15_abs': 0.58, 'max_ch1_abs': 1.22, 'max_atr_pct': 4.4},
-        'LON': {'max_pb_ema_dist': 0.68, 'max_ch15_abs': 0.58, 'max_ch1_abs': 1.22, 'max_atr_pct': 4.8},
-        'ASIA': {'max_pb_ema_dist': 0.54, 'max_ch15_abs': 0.46, 'max_ch1_abs': 1.00, 'max_atr_pct': 3.8},
-    }.get(sess, {'max_pb_ema_dist': 0.58, 'max_ch15_abs': 0.50, 'max_ch1_abs': 1.08, 'max_atr_pct': 4.2}).copy()
+        'NY': {'max_pb_ema_dist': 0.72, 'max_ch15_abs': 0.64, 'max_ch1_abs': 1.32, 'max_atr_pct': 4.8},
+        'LON': {'max_pb_ema_dist': 0.74, 'max_ch15_abs': 0.64, 'max_ch1_abs': 1.32, 'max_atr_pct': 5.0},
+        'ASIA': {'max_pb_ema_dist': 0.60, 'max_ch15_abs': 0.52, 'max_ch1_abs': 1.08, 'max_atr_pct': 4.1},
+    }.get(sess, {'max_pb_ema_dist': 0.62, 'max_ch15_abs': 0.54, 'max_ch1_abs': 1.14, 'max_atr_pct': 4.4}).copy()
     src = str(source or '').strip().lower()
     if src == 'screen':
-        base['max_pb_ema_dist'] *= (1.07 if sess != 'ASIA' else 1.04)
-        base['max_ch15_abs'] *= (1.05 if sess != 'ASIA' else 1.03)
-        base['max_ch1_abs'] *= (1.05 if sess != 'ASIA' else 1.03)
-        base['max_atr_pct'] *= (1.04 if sess != 'ASIA' else 1.02)
+        base['max_pb_ema_dist'] *= (1.10 if sess != 'ASIA' else 1.06)
+        base['max_ch15_abs'] *= (1.08 if sess != 'ASIA' else 1.05)
+        base['max_ch1_abs'] *= (1.08 if sess != 'ASIA' else 1.05)
+        base['max_atr_pct'] *= (1.06 if sess != 'ASIA' else 1.03)
     elif src == 'exec':
-        base['max_pb_ema_dist'] *= (1.05 if sess == 'LON' else (1.03 if sess != 'ASIA' else 1.01))
-        base['max_ch15_abs'] *= (1.05 if sess == 'LON' else (1.02 if sess != 'ASIA' else 1.01))
-        base['max_ch1_abs'] *= (1.04 if sess == 'LON' else (1.02 if sess != 'ASIA' else 1.01))
-        base['max_atr_pct'] *= (1.03 if sess == 'LON' else (1.02 if sess != 'ASIA' else 1.01))
+        base['max_pb_ema_dist'] *= (1.08 if sess == 'LON' else (1.06 if sess != 'ASIA' else 1.04))
+        base['max_ch15_abs'] *= (1.08 if sess == 'LON' else (1.05 if sess != 'ASIA' else 1.03))
+        base['max_ch1_abs'] *= (1.06 if sess == 'LON' else (1.04 if sess != 'ASIA' else 1.02))
+        base['max_atr_pct'] *= (1.05 if sess == 'LON' else (1.03 if sess != 'ASIA' else 1.02))
     return base
 
 
@@ -24152,19 +24146,19 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
 
         if engine == 'A':
             if sess == 'LON':
-                lon_ctx_ch4_min = 0.32 if reach_mode else 0.46
-                lon_ctx_ch1_min = 0.08 if reach_mode else 0.16
+                lon_ctx_ch4_min = 0.26 if reach_mode else 0.38
+                lon_ctx_ch1_min = 0.06 if reach_mode else 0.12
                 if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                     return (False, 'lon_pullback_context_too_weak')
-            if sess == 'NY' and (ch4_abs < 0.58 or ch1_abs < 0.24):
+            if sess == 'NY' and (ch4_abs < 0.50 or ch1_abs < 0.18):
                 return (False, 'ny_pullback_context_too_weak')
             if sess == 'ASIA':
                 if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
-                    if ch24_abs < 5.0 or ch15_abs < 0.01:
+                    if ch24_abs < 4.5 or ch15_abs < 0.01:
                         return (False, 'asia_pullback_context_too_weak')
-                elif (ch4_abs < 0.72 or ch1_abs < 0.34):
+                elif (ch4_abs < 0.60 or ch1_abs < 0.24):
                     return (False, 'asia_pullback_context_too_weak')
-            if sess == 'LON' and ch24_abs > (14.8 if reach_mode else 12.8) and pb_dist > (0.56 if reach_mode else 0.40):
+            if sess == 'LON' and ch24_abs > (15.5 if reach_mode else 13.6) and pb_dist > (0.62 if reach_mode else 0.46):
                 return (False, 'lon_trend_overheated')
         if sess == 'NY' and ch1_abs >= 1.72 and ch15_abs >= 0.82 and conf < 85 and score < 80.0:
             return (False, 'ny_breakout_chase_risk')
@@ -24206,7 +24200,7 @@ def is_top_setup_eligible(
         except Exception:
             pass
 
-        score, comps = compute_setup_quality_score(s, session_name=session_name)
+        score, comps = compute_setup_quality_score(s, session_name=session_name, source=src)
         setattr(s, "quality_score", float(score))
         try:
             setattr(s, "quality_components", comps)
@@ -24228,7 +24222,7 @@ def is_top_setup_eligible(
         if src == "screen":
             min_score = float(QUALITY_SCORE_MIN_SCREEN)
         elif src == "exec":
-            min_score = float(max(QUALITY_SCORE_MIN_SCREEN + 3.0, QUALITY_SCORE_MIN_EMAIL - 2.0))
+            min_score = float(max(QUALITY_SCORE_MIN_SCREEN + 0.5, QUALITY_SCORE_MIN_EMAIL - 4.0))
         else:
             min_score = float(QUALITY_SCORE_MIN_EMAIL)
 
@@ -24320,13 +24314,13 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 70.5, 74, 1.24
+        quality, conf, rr = 68.5, 72, 1.18
     elif sess == "LON":
-        quality, conf, rr = 68.0, 72, 1.16
+        quality, conf, rr = 65.5, 70, 1.08
     elif sess == "ASIA":
-        quality, conf, rr = 67.0, 71, 1.12
+        quality, conf, rr = 65.0, 69, 1.06
     else:
-        quality, conf, rr = 71.0, 74, 1.24
+        quality, conf, rr = 69.0, 72, 1.18
 
     try:
         cfg = load_strategy_config(force=False)
@@ -24420,45 +24414,45 @@ def is_executable_setup_eligible(
 
         if engine == 'A':
             if sess == 'LON':
-                score_floor = max((67.0 if reach_mode else 70.5), score_floor)
-                conf_floor = max((72 if reach_mode else 74), conf_floor)
-                rr_floor = max((1.12 if reach_mode else 1.22), rr_floor)
+                score_floor = max((64.5 if reach_mode else 67.5), score_floor)
+                conf_floor = max((70 if reach_mode else 72), conf_floor)
+                rr_floor = max((1.06 if reach_mode else 1.14), rr_floor)
             elif sess == 'NY':
-                score_floor = max(73.5, score_floor)
-                conf_floor = max(74, conf_floor)
-                rr_floor = max(1.26, rr_floor)
-            else:
-                score_floor = max(72.5, score_floor)
-                conf_floor = max(74, conf_floor)
+                score_floor = max(70.5, score_floor)
+                conf_floor = max(72, conf_floor)
                 rr_floor = max(1.20, rr_floor)
+            else:
+                score_floor = max(69.0, score_floor)
+                conf_floor = max(71, conf_floor)
+                rr_floor = max(1.14, rr_floor)
         elif engine == 'C':
             if sess == 'LON':
-                score_floor = max((66.5 if reach_mode else 70.0), score_floor - 0.50 + engine_c_exec_quality_add)
-                conf_floor = max((73 if reach_mode else 76), conf_floor + engine_c_exec_conf_add)
-                rr_floor = max((1.10 if reach_mode else 1.20), rr_floor - 0.02 + engine_c_exec_rr_add)
+                score_floor = max((64.0 if reach_mode else 67.0), score_floor - 1.00 + engine_c_exec_quality_add)
+                conf_floor = max((71 if reach_mode else 73), conf_floor + engine_c_exec_conf_add)
+                rr_floor = max((1.04 if reach_mode else 1.12), rr_floor - 0.04 + engine_c_exec_rr_add)
             elif sess == 'NY':
-                score_floor = max(72.5, score_floor + 0.25 + engine_c_exec_quality_add)
-                conf_floor = max(76, conf_floor + 1 + engine_c_exec_conf_add)
-                rr_floor = max(1.24, rr_floor + 0.02 + engine_c_exec_rr_add)
+                score_floor = max(69.5, score_floor + engine_c_exec_quality_add)
+                conf_floor = max(73, conf_floor + engine_c_exec_conf_add)
+                rr_floor = max(1.18, rr_floor + engine_c_exec_rr_add)
             else:
-                score_floor = max(72.0, score_floor + 0.50 + engine_c_exec_quality_add)
-                conf_floor = max(74, conf_floor + 1 + engine_c_exec_conf_add)
-                rr_floor = max(1.20, rr_floor + 0.03 + engine_c_exec_rr_add)
+                score_floor = max(68.5, score_floor + 0.25 + engine_c_exec_quality_add)
+                conf_floor = max(71, conf_floor + engine_c_exec_conf_add)
+                rr_floor = max(1.12, rr_floor + 0.02 + engine_c_exec_rr_add)
         elif engine == 'B':
             if not exec_engine_b_enabled:
                 return (False, 'engine_b_disabled')
             if sess == 'LON':
-                score_floor = max(74.5, score_floor + 0.5)
-                conf_floor = max(77, conf_floor + 1)
-                rr_floor = max(1.30, rr_floor + 0.04)
+                score_floor = max(71.5, score_floor)
+                conf_floor = max(75, conf_floor)
+                rr_floor = max(1.24, rr_floor + 0.02)
             elif sess == 'NY':
-                score_floor = max(76.0, score_floor + 0.75)
-                conf_floor = max(78, conf_floor + 1)
-                rr_floor = max(1.38, rr_floor + 0.05)
+                score_floor = max(73.0, score_floor + 0.25)
+                conf_floor = max(76, conf_floor)
+                rr_floor = max(1.30, rr_floor + 0.03)
             else:
-                score_floor = max(77.0, score_floor + 1.0)
-                conf_floor = max(79, conf_floor + 1)
-                rr_floor = max(1.40, rr_floor + 0.05)
+                score_floor = max(72.5, score_floor + 0.35)
+                conf_floor = max(75, conf_floor)
+                rr_floor = max(1.28, rr_floor + 0.03)
         else:
             return (False, 'engine_not_supported')
 
@@ -24569,13 +24563,13 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.68, 7_500_000.0)):
                     return (False, "ny_below_liquidity")
             else:
-                if pb_dist > 0.92:
+                if pb_dist > 0.98:
                     return (False, "ny_entry_too_far_from_ema")
-                if ch15_abs > 1.00 or (ch15_abs > 0.86 and ch1_abs > 1.82):
+                if ch15_abs > 1.08 or (ch15_abs > 0.92 and ch1_abs > 1.90):
                     return (False, "ny_late_extension_exec")
-                if ch4_abs < 0.46 or ch1_abs < 0.18:
+                if ch4_abs < 0.36 or ch1_abs < 0.14:
                     return (False, "ny_context_too_weak_exec")
-                if fut_vol < max(MIN_FUT_VOL_USD * 0.74, 7_500_000.0):
+                if fut_vol < max(MIN_FUT_VOL_USD * 0.68, 7_000_000.0):
                     return (False, "ny_below_liquidity")
         elif sess == "LON":
             if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
@@ -24588,12 +24582,12 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.66, 7_000_000.0)):
                     return (False, "lon_below_liquidity")
             else:
-                lon_pb_max = 0.84 if reach_mode else 0.74
-                lon_ch15_cap = 0.78 if reach_mode else 0.64
-                lon_ch1_cap = 1.48 if reach_mode else 1.30
-                lon_ctx_ch4_min = 0.32 if reach_mode else 0.40
-                lon_ctx_ch1_min = 0.10 if reach_mode else 0.16
-                lon_liq_floor = max(MIN_FUT_VOL_USD * (0.72 if reach_mode else 0.80), 7_000_000.0 if reach_mode else 8_500_000.0)
+                lon_pb_max = 0.90 if reach_mode else 0.80
+                lon_ch15_cap = 0.86 if reach_mode else 0.72
+                lon_ch1_cap = 1.60 if reach_mode else 1.40
+                lon_ctx_ch4_min = 0.24 if reach_mode else 0.30
+                lon_ctx_ch1_min = 0.06 if reach_mode else 0.10
+                lon_liq_floor = max(MIN_FUT_VOL_USD * (0.66 if reach_mode else 0.72), 6_500_000.0 if reach_mode else 7_500_000.0)
                 if engine == 'C':
                     lon_pb_max = max(lon_pb_max, engine_c_exec_pb_dist_lon)
                     lon_ch1_cap = max(lon_ch1_cap, engine_c_exec_ch1_cap_lon)
@@ -24621,13 +24615,13 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.70, 6_500_000.0)):
                     return (False, "asia_below_liquidity")
             else:
-                if pb_dist > 0.78:
+                if pb_dist > 0.84:
                     return (False, "asia_entry_too_far_from_ema")
-                if ch15_abs > 0.78 or ch1_abs > 1.46:
+                if ch15_abs > 0.86 or ch1_abs > 1.54:
                     return (False, "asia_late_extension_exec")
-                if ch4_abs < 0.44 or ch1_abs < 0.18:
+                if ch4_abs < 0.34 or ch1_abs < 0.12:
                     return (False, "asia_context_too_weak_exec")
-                if fut_vol < float(max(MIN_FUT_VOL_USD * 0.68, ASIA_MIN_FUT_VOL_USD)):
+                if fut_vol < float(max(MIN_FUT_VOL_USD * 0.62, 7_500_000.0)):
                     return (False, "asia_below_liquidity")
 
         if engine == "A":
@@ -24637,17 +24631,17 @@ def is_executable_setup_eligible(
                 return (True, "ok")
             if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
                 return (False, "pullback_not_ready")
-            if pb_dist > ((0.84 if reach_mode else 0.70) if sess == 'LON' else (0.74 if sess == 'NY' else 0.68)):
+            if pb_dist > ((0.92 if reach_mode else 0.78) if sess == 'LON' else (0.82 if sess == 'NY' else 0.74)):
                 return (False, "pullback_still_too_shallow")
-            if sess == 'LON' and (ch15_abs > (0.74 if reach_mode else 0.58) or ch1_abs < (0.10 if reach_mode else 0.16) or ch1_abs > (1.38 if reach_mode else 1.18) or ch4_abs < (0.34 if reach_mode else 0.44)):
+            if sess == 'LON' and (ch15_abs > (0.82 if reach_mode else 0.66) or ch1_abs < (0.06 if reach_mode else 0.10) or ch1_abs > (1.48 if reach_mode else 1.26) or ch4_abs < (0.24 if reach_mode else 0.34)):
                 return (False, 'lon_pullback_not_clean_enough')
             return (True, "ok")
 
         if engine == "C":
-            c_quality_floor = score_floor + (0.00 if reach_mode and sess == 'LON' else 0.05)
-            c_conf_floor = max(73 if (reach_mode and sess == 'LON') else conf_floor, conf_floor - (1 if reach_mode and sess == 'LON' else 0))
-            c_rr_floor = max(1.08 if (reach_mode and sess == 'LON') else rr_floor, rr_floor - (0.06 if reach_mode and sess == 'LON' else 0.02))
-            c_liq_floor = float(max(MIN_FUT_VOL_USD * (engine_c_exec_liq_mult if not (reach_mode and sess == 'LON') else 0.72), 6_000_000.0 if (reach_mode and sess == 'LON') else ENGINE_C_MIN_FUT_VOL_USD * 0.82))
+            c_quality_floor = score_floor + (0.00 if reach_mode and sess == 'LON' else 0.00)
+            c_conf_floor = max(71 if (reach_mode and sess == 'LON') else conf_floor, conf_floor - (1 if reach_mode and sess == 'LON' else 0))
+            c_rr_floor = max(1.04 if (reach_mode and sess == 'LON') else rr_floor, rr_floor - (0.08 if reach_mode and sess == 'LON' else 0.04))
+            c_liq_floor = float(max(MIN_FUT_VOL_USD * (engine_c_exec_liq_mult if not (reach_mode and sess == 'LON') else 0.66), 5_500_000.0 if (reach_mode and sess == 'LON') else ENGINE_C_MIN_FUT_VOL_USD * 0.72))
             c_ch1_cap = (max(engine_c_exec_ch1_cap_lon, 1.76) if (reach_mode and sess == 'LON') else max(engine_c_exec_ch1_cap_lon, 1.44)) if sess == 'LON' else (1.66 if sess == 'NY' else 1.32)
             if score < c_quality_floor:
                 return (False, "engine_c_below_quality")
@@ -25961,13 +25955,13 @@ def make_breakout_setup(
                     else:
                         _rej("no_breakout_trigger", base, mv)
                         return None
-                elif trend_up and float(ch24 or 0.0) >= (2.8 if str(session_name).upper() == 'ASIA' else 3.6) and float(ch4_used or 0.0) >= (0.10 if str(session_name).upper() == 'ASIA' else 0.28) and (float(ch1 or 0.0) >= (-0.45 if str(session_name).upper() == 'ASIA' else -0.30) or float(ch15 or 0.0) >= (-0.30 if str(session_name).upper() == 'ASIA' else -0.20)):
+                elif trend_up and float(ch24 or 0.0) >= (2.4 if str(session_name).upper() == 'ASIA' else 3.0) and float(ch4_used or 0.0) >= (0.08 if str(session_name).upper() == 'ASIA' else 0.18) and (float(ch1 or 0.0) >= (-0.55 if str(session_name).upper() == 'ASIA' else -0.40) or float(ch15 or 0.0) >= (-0.36 if str(session_name).upper() == 'ASIA' else -0.28)):
                     # Trend-continuation soft path: permit F1/F3 style continuation candidates even without a fresh HH breakout.
                     side = "BUY"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) >= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_buy')
                     conf = max(0.0, float(conf) - 0.5)
-                elif trend_dn and float(ch24 or 0.0) <= (-2.8 if str(session_name).upper() == 'ASIA' else -3.6) and float(ch4_used or 0.0) <= (-0.10 if str(session_name).upper() == 'ASIA' else -0.28) and (float(ch1 or 0.0) <= (0.45 if str(session_name).upper() == 'ASIA' else 0.30) or float(ch15 or 0.0) <= (0.30 if str(session_name).upper() == 'ASIA' else 0.20)):
+                elif trend_dn and float(ch24 or 0.0) <= (-2.4 if str(session_name).upper() == 'ASIA' else -3.0) and float(ch4_used or 0.0) <= (-0.08 if str(session_name).upper() == 'ASIA' else -0.18) and (float(ch1 or 0.0) <= (0.55 if str(session_name).upper() == 'ASIA' else 0.40) or float(ch15 or 0.0) <= (0.36 if str(session_name).upper() == 'ASIA' else 0.28)):
                     side = "SELL"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) <= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_sell')
@@ -26037,7 +26031,7 @@ def make_breakout_setup(
     setattr(s, 'trend', 'BULLISH' if side == 'BUY' else 'BEARISH')
     setattr(s, 'structure', getattr(s, 'trend'))
     try:
-        score, _ = compute_setup_quality_score(s, session_name=session_name)
+        score, _ = compute_setup_quality_score(s, session_name=session_name, source='screen')
         setattr(s, 'quality_score', float(score))
     except Exception:
         pass
@@ -31373,7 +31367,7 @@ def _adaptive_ema_anchor_limit_pct(setup: "Setup", session_name: str, fallback_a
 def _recalibrate_public_confidence(setup: "Setup", session_name: str) -> tuple[int, float, dict]:
     """Blend legacy confidence with quality score so displayed confidence matches real quality better."""
     try:
-        score, comps = compute_setup_quality_score(setup, session_name=session_name)
+        score, comps = compute_setup_quality_score(setup, session_name=session_name, source='screen')
         raw_conf = float(getattr(setup, "conf", 0) or 0.0)
         blended = (0.35 * raw_conf) + (0.65 * float(score))
         if str(getattr(setup, "engine", "") or "").upper() == "B" and abs(float(getattr(setup, "ch15", 0.0) or 0.0)) >= 1.0:
@@ -31448,7 +31442,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         n_target = int(max(EMAIL_SETUPS_N * 4, 10))
         strict_15m = True
         universe_cap = int(max(80, SCREEN_UNIVERSE_N))
-        trigger_loosen = float(min(0.92, max(SCREEN_TRIGGER_LOOSEN, 0.88)))
+        trigger_loosen = float(min(0.88, max(SCREEN_TRIGGER_LOOSEN, 0.82)))
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
         allow_no_pullback = True
         scan_multiplier = 12
@@ -31461,7 +31455,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         n_target = int(max(EMAIL_SETUPS_N * 4, 12))
         strict_15m = True
         universe_cap = int(max(60, SCREEN_UNIVERSE_N))
-        trigger_loosen = 1.0
+        trigger_loosen = 0.94
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
         allow_no_pullback = False
         scan_multiplier = 12
