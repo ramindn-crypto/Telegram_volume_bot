@@ -484,6 +484,38 @@ def _goal_profile_quiet_window_ok(now_ts: float | None = None) -> bool:
     except Exception:
         return True
 
+def _maintenance_runtime_ok(now_ts: float | None = None, require_quiet_window: bool = False, user_window_sec: int = 30) -> bool:
+    """Guard background maintenance jobs so they do not steal live runtime capacity."""
+    try:
+        ts = float(now_ts if now_ts is not None else time.time())
+    except Exception:
+        ts = float(time.time())
+    try:
+        if _recent_user_activity(int(user_window_sec or 30)):
+            return False
+    except Exception:
+        pass
+    for _lock_name in ('ALERT_LOCK', 'SCAN_LOCK', '_SCREEN_LOCK'):
+        try:
+            _lock = globals().get(_lock_name)
+            if _lock is not None and getattr(_lock, 'locked', lambda: False)():
+                return False
+        except Exception:
+            continue
+    try:
+        if _backtest_runtime_busy() or _goal_profile_is_running() or (_SELF_OPT_STATE.get('stop_event') is not None):
+            return False
+    except Exception:
+        pass
+    if require_quiet_window:
+        try:
+            if not _goal_profile_quiet_window_ok(ts):
+                return False
+        except Exception:
+            return False
+    return True
+
+
 
 import re
 import sqlite3
@@ -1636,22 +1668,22 @@ def _strategy_config_bootstrap_recommendations() -> None:
         # silently keep the bot above the 1–3 setups/day target after redeploy.
         try:
             q_screen = float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
-            if q_screen > 60.0:
-                cfg['quality_score_min_screen'] = 60.0
+            if q_screen > 62.0:
+                cfg['quality_score_min_screen'] = 62.0
                 changed = True
         except Exception:
             pass
         try:
             q_email = float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
-            if q_email > 64.0:
-                cfg['quality_score_min_email'] = 64.0
+            if q_email > 66.0:
+                cfg['quality_score_min_email'] = 66.0
                 changed = True
         except Exception:
             pass
         try:
             rr_live = float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP)
-            if rr_live > 1.30:
-                cfg['min_rr_tp'] = 1.30
+            if rr_live > 1.34:
+                cfg['min_rr_tp'] = 1.34
                 changed = True
         except Exception:
             pass
@@ -1943,12 +1975,12 @@ ENGINE_B_MOMENTUM_ENABLED = True     # pump / expansion
 # =========================================================
 # Base floor (still used), but we now scale it per session:
 TRIGGER_1H_ABS_MIN_BASE = 0.12        # global floor
-CONFIRM_15M_ABS_MIN = 0.18
+CONFIRM_15M_ABS_MIN = 0.25
 ALIGN_4H_MIN = 0.0
 ALIGN_4H_NEUTRAL_ZONE = 0.35  # if |4H| < this, treat regime as neutral (avoid blocking leaders)
 
 # "EARLY" filler (email only)
-EARLY_1H_ABS_MIN = 1.45
+EARLY_1H_ABS_MIN = 1.8
 EARLY_CONF_PENALTY = 3
 EARLY_EMAIL_EXTRA_CONF = 4
 EARLY_EMAIL_MAX_FILL = 1
@@ -4882,9 +4914,6 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     closed_today_count = 0
     closed_today_rows = []
     position_classifications = []
-    total_exchange_open_positions = 0
-    unmanaged_open_positions = 0
-    unmanaged_open_risk = 0.0
 
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -4933,20 +4962,15 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
             positions = _bybit_get_open_positions_linear()
         except Exception:
             positions = []
-        total_exchange_open_positions = int(len(positions))
-        managed_open_positions = 0
-        unmanaged_open_positions = 0
-        unmanaged_open_risk = 0.0
-        open_pnl = 0.0
+        open_positions_now = len(positions)
+        open_pnl = float(sum(_pos_unreal_pnl(p) for p in positions) or 0.0) if positions else 0.0
 
         for p in positions:
             est = float(_estimate_position_risk_usd(p) or 0.0)
+            info = _autotrade_resolve_live_position_open_info(int(uid), p, journal_open=journal_open)
+            opened_ts = float(info.get('opened_ts') or 0.0)
             psym = _pos_symbol(p)
             pside = _pos_side_text(p)
-            trade_row = _autotrade_find_open_trade_for_live_position(int(uid), p, journal_open=journal_open) or {}
-            managed = bool(trade_row)
-            info = _autotrade_resolve_live_position_open_info(int(uid), p, journal_open=([trade_row] if trade_row else journal_open))
-            opened_ts = float(info.get('opened_ts') or 0.0)
             if est <= 0:
                 try:
                     matches = [t for t in journal_open
@@ -4962,22 +4986,15 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
                 except Exception:
                     pass
             est = max(0.0, float(est or 0.0))
+            current_total_open_risk += est
 
-            if managed:
-                managed_open_positions += 1
-                open_pnl += float(_pos_unreal_pnl(p) or 0.0)
-                current_total_open_risk += est
-                if opened_ts > 0 and opened_ts < start_ts:
-                    bucket = 'carried'
-                    carried_open_risk += est
-                    inherited_open_positions += 1
-                else:
-                    bucket = 'current_day'
-                    current_day_open_risk += est
+            if opened_ts > 0 and opened_ts < start_ts:
+                bucket = 'carried'
+                carried_open_risk += est
+                inherited_open_positions += 1
             else:
-                unmanaged_open_positions += 1
-                unmanaged_open_risk += est
-                bucket = 'unmanaged'
+                bucket = 'current_day'
+                current_day_open_risk += est
 
             position_classifications.append({
                 'symbol': psym,
@@ -4985,21 +5002,21 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
                 'risk': float(est),
                 'opened_ts': float(opened_ts or 0.0),
                 'bucket': bucket,
-                'managed': bool(managed),
-                'trade_id': str((trade_row or {}).get('trade_id') or ''),
-                'source': str(info.get('source') or ('unmanaged' if not managed else 'unknown')),
+                'source': str(info.get('source') or 'unknown'),
                 'journal_ts': float(info.get('journal_ts') or 0.0),
                 'position_created_ts': float(info.get('position_created_ts') or 0.0),
                 'exchange_order_ts': float(info.get('exchange_order_ts') or 0.0),
                 'notes': str(info.get('notes') or ''),
             })
-        open_positions_now = int(managed_open_positions)
         inherited_open_positions = min(int(inherited_open_positions), int(open_positions_now))
         current_day_open_positions = max(0, int(open_positions_now) - int(inherited_open_positions))
-        # Live day-cap accounting should charge only bot-managed positions opened inside the current
-        # anchored trading day. Unmanaged/manual exchange positions are shown separately but must not
-        # consume the bot's daily new-trade budget or max-open-trades cap.
+        # Live day-cap accounting should charge only positions opened inside the current
+        # anchored trading day. Carried exposure is shown separately but must not consume
+        # today's new-trade budget again.
         live_open_risk_charged_today = float(current_day_open_risk)
+        # Keep the day-open count anchored to confirmed current-day opens, but if the
+        # local journal is incomplete, never understate day activity versus confirmed
+        # exchange closes plus current-day live positions.
         opened_today_count = max(int(opened_today_count), int(current_day_open_positions))
         opened_today_count = max(int(opened_today_count), int(closed_today_count) + int(current_day_open_positions))
     else:
@@ -5053,9 +5070,6 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         "live_open_risk_charged_today": float(live_open_risk_charged_today),
         "carried_open_risk": float(carried_open_risk),
         "open_positions_now": int(open_positions_now),
-        "live_exchange_open_positions_now": int(total_exchange_open_positions) if mode == "live" else int(open_positions_now),
-        "unmanaged_open_positions_now": int(unmanaged_open_positions) if mode == "live" else 0,
-        "unmanaged_open_risk": float(unmanaged_open_risk) if mode == "live" else 0.0,
         "inherited_open_positions": int(inherited_open_positions),
         "opened_today_count": int(opened_today_count),
         "closed_today_count": int(closed_today_count),
@@ -6741,15 +6755,15 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 70,
-    "LON": 69,
-    "ASIA": 67,
+    "NY": 72,
+    "LON": 71,
+    "ASIA": 69,
 }
 
 SESSION_MIN_RR_FINAL = {
-    "NY": 1.22,
-    "LON": 1.16,
-    "ASIA": 1.12,
+    "NY": 1.30,
+    "LON": 1.24,
+    "ASIA": 1.18,
 }
 
 SESSION_MIN_RR_TP = SESSION_MIN_RR_FINAL  # legacy compatibility only
@@ -7736,8 +7750,12 @@ def _research_run_daily_refresh(force: bool = False) -> dict:
 
 async def research_regime_refresh_job(context: ContextTypes.DEFAULT_TYPE):
     try:
+        if not _maintenance_runtime_ok(time.time(), require_quiet_window=False, user_window_sec=30):
+            return
         best_fut = await to_thread_heavy(fetch_futures_tickers)
         for sess in ('ASIA', 'LON', 'NY'):
+            if not _maintenance_runtime_ok(time.time(), require_quiet_window=False, user_window_sec=30):
+                return
             snap = await to_thread_heavy(_research_market_regime_from_best_fut, best_fut or {}, sess, '4h')
             await to_thread_fast(_research_store_regime_snapshot, snap)
     except Exception:
@@ -7746,6 +7764,8 @@ async def research_regime_refresh_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def research_allocator_job(context: ContextTypes.DEFAULT_TYPE):
     try:
+        if not _maintenance_runtime_ok(time.time(), require_quiet_window=False, user_window_sec=30):
+            return
         await to_thread_heavy(_research_run_daily_refresh, True)
     except Exception:
         return
@@ -11300,9 +11320,6 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["current_day_open_risk"] = float(m.get("current_day_open_risk") or 0.0)
         snap["carried_open_risk"] = float(m.get("carried_open_risk") or 0.0)
         snap["open_positions_now"] = int(m.get("open_positions_now") or 0)
-        snap["live_exchange_open_positions_now"] = int(m.get("live_exchange_open_positions_now") or m.get("open_positions_now") or 0)
-        snap["unmanaged_open_positions_now"] = int(m.get("unmanaged_open_positions_now") or 0)
-        snap["unmanaged_open_risk"] = float(m.get("unmanaged_open_risk") or 0.0)
         snap["positions_opened_today"] = int(m.get("opened_today_count") or 0)
         snap["positions_closed_today"] = int(m.get("closed_today_count") or 0)
         snap["closed_today_rows"] = list(m.get("closed_today_rows") or [])
@@ -15368,32 +15385,94 @@ _OHLCV_RATE_LIMIT_WARN_UNTIL: Dict[str, float] = {}
 _OHLCV_LAST_KEY: Dict[str, str] = {}
 OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "60") or 60)
 OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "90") or 90)
+OHLCV_MAX_CONCURRENT_FETCHES = int(os.getenv("OHLCV_MAX_CONCURRENT_FETCHES", "2") or 2)
+OHLCV_FETCH_SEMAPHORE_TIMEOUT_SEC = float(os.getenv("OHLCV_FETCH_SEMAPHORE_TIMEOUT_SEC", "1.5") or 1.5)
+OHLCV_TTL_BY_TIMEFRAME_SEC = {
+    '5m': int(os.getenv('OHLCV_TTL_5M_SEC', '90') or 90),
+    '15m': int(os.getenv('OHLCV_TTL_15M_SEC', '150') or 150),
+    '1h': int(os.getenv('OHLCV_TTL_1H_SEC', '420') or 420),
+    '4h': int(os.getenv('OHLCV_TTL_4H_SEC', '900') or 900),
+}
+OHLCV_BUSY_STALE_MAX_AGE_SEC = {
+    '5m': int(os.getenv('OHLCV_BUSY_STALE_5M_SEC', '180') or 180),
+    '15m': int(os.getenv('OHLCV_BUSY_STALE_15M_SEC', '360') or 360),
+    '1h': int(os.getenv('OHLCV_BUSY_STALE_1H_SEC', '1800') or 1800),
+    '4h': int(os.getenv('OHLCV_BUSY_STALE_4H_SEC', '7200') or 7200),
+}
+OHLCV_RATE_LIMIT_COOLDOWN_BY_TIMEFRAME_SEC = {
+    '5m': int(os.getenv('OHLCV_RATE_LIMIT_CD_5M_SEC', '45') or 45),
+    '15m': int(os.getenv('OHLCV_RATE_LIMIT_CD_15M_SEC', '60') or 60),
+    '1h': int(os.getenv('OHLCV_RATE_LIMIT_CD_1H_SEC', '150') or 150),
+    '4h': int(os.getenv('OHLCV_RATE_LIMIT_CD_4H_SEC', '300') or 300),
+}
+_OHLCV_FETCH_SEMAPHORE = threading.BoundedSemaphore(max(1, int(OHLCV_MAX_CONCURRENT_FETCHES or 1)))
 BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC", "6") or 6)
 BYBIT_OPEN_ORDERS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_ORDERS_CACHE_TTL_SEC", "6") or 6)
 SCREEN_DIRECTIONAL_CACHE_TTL_SEC = int(os.getenv("SCREEN_DIRECTIONAL_CACHE_TTL_SEC", "45") or 45)
 
 
 def _ohlcv_best_effort_cached(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
-    """Return the best cached OHLCV rows for a symbol/timeframe even if the exact limit key is cold.
+    """Return the best cached OHLCV rows for a symbol/timeframe even if the exact limit key is cold."""
+    rows, _age = _ohlcv_best_effort_cached_with_age(symbol, timeframe, limit)
+    return list(rows or [])
 
-    This prevents setup generation from collapsing into ohlcv_missing_or_insufficient when one exact
-    cache key was rate-limited but another nearby key already exists.
-    """
+
+def _ohlcv_cache_age_sec(key: str) -> float:
     try:
-        exact = cache_get(f"ohlcv:{symbol}:{timeframe}:{limit}")
+        v = _CACHE.get(str(key))
+        if not v:
+            return 1e12
+        ts, _obj = v
+        return max(0.0, float(time.time()) - float(ts or 0.0))
+    except Exception:
+        return 1e12
+
+
+def _ohlcv_ttl_for_timeframe(timeframe: str) -> int:
+    tf = str(timeframe or '').lower().strip() or 'na'
+    try:
+        return int(OHLCV_TTL_BY_TIMEFRAME_SEC.get(tf, OHLCV_TTL_SEC) or OHLCV_TTL_SEC)
+    except Exception:
+        return int(OHLCV_TTL_SEC)
+
+
+def _ohlcv_busy_stale_max_age_sec(timeframe: str) -> int:
+    tf = str(timeframe or '').lower().strip() or 'na'
+    try:
+        return int(OHLCV_BUSY_STALE_MAX_AGE_SEC.get(tf, max(3 * int(OHLCV_TTL_SEC), 300)) or max(3 * int(OHLCV_TTL_SEC), 300))
+    except Exception:
+        return max(3 * int(OHLCV_TTL_SEC), 300)
+
+
+def _ohlcv_rate_limit_cooldown_sec(timeframe: str) -> float:
+    tf = str(timeframe or '').lower().strip() or 'na'
+    try:
+        base = float(OHLCV_RATE_LIMIT_COOLDOWN_BY_TIMEFRAME_SEC.get(tf, OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC) or OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC)
+    except Exception:
+        base = float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 60.0)
+    return max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 20.0), float(base or 0.0))
+
+
+def _ohlcv_best_effort_cached_with_age(symbol: str, timeframe: str, limit: int) -> tuple[List[List[float]], float]:
+    best = []
+    best_age = 1e12
+    best_len = 0
+    exact_key = f"ohlcv:{symbol}:{timeframe}:{limit}"
+    try:
+        exact = cache_get(exact_key)
         if isinstance(exact, list) and exact:
-            return exact[-int(limit):] if len(exact) > int(limit) else exact
+            return (exact[-int(limit):] if len(exact) > int(limit) else exact, _ohlcv_cache_age_sec(exact_key))
     except Exception:
         pass
-    best = []
-    best_len = 0
     try:
         lk = _OHLCV_LAST_KEY.get(f"{symbol}|{timeframe}")
         if lk:
             rows = cache_get(lk)
-            if isinstance(rows, list) and len(rows) > best_len:
+            age = _ohlcv_cache_age_sec(lk)
+            if isinstance(rows, list) and (len(rows) > best_len or (len(rows) == best_len and age < best_age)):
                 best = rows
                 best_len = len(rows)
+                best_age = age
     except Exception:
         pass
     prefix = f"ohlcv:{symbol}:{timeframe}:"
@@ -15401,35 +15480,72 @@ def _ohlcv_best_effort_cached(symbol: str, timeframe: str, limit: int) -> List[L
         for k, (_ts, rows) in list(_CACHE.items()):
             if not str(k).startswith(prefix):
                 continue
-            if isinstance(rows, list) and len(rows) > best_len:
+            age = _ohlcv_cache_age_sec(k)
+            if isinstance(rows, list) and (len(rows) > best_len or (len(rows) == best_len and age < best_age)):
                 best = rows
                 best_len = len(rows)
+                best_age = age
     except Exception:
         pass
     if isinstance(best, list) and best:
-        return best[-int(limit):] if len(best) > int(limit) else best
-    return []
+        return (best[-int(limit):] if len(best) > int(limit) else best, float(best_age))
+    return ([], 1e12)
 
 
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     """
     Singleton + TTL cached OHLCV fetch.
 
-    Production hardening:
-    - never let a Bybit rate-limit exception crash /screen or other jobs
-    - when the request was recently rate-limited, serve stale cache (if any) instead of hammering Bybit again
+    Performance hardening:
+    - use timeframe-aware TTLs so 1H/4H candles are not refetched every live cycle
+    - prefer recent stale cache while heavy background work is active
+    - cap concurrent network OHLCV calls so Render does not hammer Bybit and stall user commands
     - on transient failures, prefer stale cache over raising
     """
     key = f"ohlcv:{symbol}:{timeframe}:{limit}"
-    if cache_valid(key, OHLCV_TTL_SEC):
+    tf_key = str(timeframe or '').lower().strip() or 'na'
+    ttl = int(_ohlcv_ttl_for_timeframe(tf_key))
+    if cache_valid(key, ttl):
         return cache_get(key)
 
     now_ts = float(time.time())
-    tf_key = str(timeframe or '').lower().strip() or 'na'
+    stale, stale_age = _ohlcv_best_effort_cached_with_age(symbol, timeframe, limit)
+
+    busy_runtime = False
+    try:
+        if _recent_user_activity(18):
+            busy_runtime = True
+    except Exception:
+        pass
+    try:
+        if _backtest_runtime_busy() or _goal_profile_is_running():
+            busy_runtime = True
+    except Exception:
+        pass
+    for _lock_name in ('ALERT_LOCK', 'SCAN_LOCK', '_SCREEN_LOCK'):
+        try:
+            _lock = globals().get(_lock_name)
+            if _lock is not None and getattr(_lock, 'locked', lambda: False)():
+                busy_runtime = True
+                break
+        except Exception:
+            continue
+
     cool_until = float(_OHLCV_RATE_LIMIT_UNTIL.get(key) or 0.0)
     tf_cool_until = float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0)
     if cool_until > now_ts or tf_cool_until > now_ts:
-        stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
+        return stale if isinstance(stale, list) else []
+
+    if isinstance(stale, list) and stale and busy_runtime and float(stale_age) <= float(_ohlcv_busy_stale_max_age_sec(tf_key)):
+        return stale
+
+    acquired = False
+    timeout_sec = max(0.25, float(OHLCV_FETCH_SEMAPHORE_TIMEOUT_SEC or 1.5) * (1.0 if stale else 4.0))
+    try:
+        acquired = bool(_OHLCV_FETCH_SEMAPHORE.acquire(timeout=timeout_sec))
+    except Exception:
+        acquired = True
+    if not acquired:
         return stale if isinstance(stale, list) else []
 
     ex = get_exchange()
@@ -15448,8 +15564,8 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         name = type(e).__name__
         msg = str(e or '')
         if 'RateLimitExceeded' in name or '10006' in msg or 'rate limit' in msg.lower() or 'too many visits' in msg.lower():
-            key_cd = max(3.0, float(OHLCV_TTL_SEC))
-            tf_cd = max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 20.0), min(key_cd, 30.0))
+            key_cd = max(6.0, float(ttl))
+            tf_cd = max(float(_ohlcv_rate_limit_cooldown_sec(tf_key) or 20.0), min(key_cd, float(_ohlcv_busy_stale_max_age_sec(tf_key))))
             _OHLCV_RATE_LIMIT_UNTIL[key] = now_ts + key_cd
             _OHLCV_TF_RATE_LIMIT_UNTIL[tf_key] = max(float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0), now_ts + tf_cd)
             warn_key = f'{tf_key}:rate_limit'
@@ -15459,10 +15575,13 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
                     logger.warning('fetch_ohlcv rate-limited for %s %s x%s; cooling %ss and using stale cache if available', symbol, timeframe, limit, int(tf_cd))
                 except Exception:
                     pass
-        stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
-        if isinstance(stale, list):
-            return stale
-        return []
+        return stale if isinstance(stale, list) else []
+    finally:
+        if acquired:
+            try:
+                _OHLCV_FETCH_SEMAPHORE.release()
+            except Exception:
+                pass
 
 
 def ema7_1h_distance_pct(market_symbol: str) -> Tuple[float, float, float]:
@@ -16331,7 +16450,7 @@ def _mid_pref(x: float, lo: float, hi: float, mid: float | None = None) -> float
     except Exception:
         return 0.0
 
-def compute_setup_quality_score(s: "Setup", session_name: str = "LON", source: str = "screen") -> tuple[float, dict]:
+def compute_setup_quality_score(s: "Setup", session_name: str = "LON") -> tuple[float, dict]:
     """Return (score, components). Score is 0..100."""
     conf = float(getattr(s, "conf", 0) or 0)
     fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
@@ -16443,7 +16562,7 @@ def compute_setup_quality_score(s: "Setup", session_name: str = "LON", source: s
     if tp_valid <= 0:
         score = min(score, 35.0)
 
-    limits = _session_entry_quality_limits(session_name, source=source)
+    limits = _session_entry_quality_limits(session_name, source='email')
     extension_penalty = 0.0
     weak_context_penalty = 0.0
     if not leader_base_override:
@@ -16897,11 +17016,17 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
             setattr(s, "session", _session_label_from_ts(getattr(s, "created_ts", 0.0)))
         except Exception:
             pass
-        score, _ = compute_setup_quality_score(s, session_name=session_name, source='screen')
+        score, _ = compute_setup_quality_score(s, session_name=session_name)
         setattr(s, "quality_score", float(score))
         s = _research_finalize_setup(s, session_name=session_name)
 
-        setups.append(s)
+        if float(score) >= float(QUALITY_SCORE_MIN_SCREEN):
+            setups.append(s)
+        else:
+            try:
+                _BT_LAST_REJECTS["score_below_min"] += 1
+            except Exception:
+                pass
 
     return setups
 
@@ -22086,10 +22211,14 @@ def _autonomous_opt_should_run() -> tuple[bool, str]:
 
 async def _refresh_universe_backtests_for_autopilot() -> None:
     try:
+        now_ts = float(time.time())
+        if not _maintenance_runtime_ok(now_ts, require_quiet_window=True, user_window_sec=60):
+            return
         cfg = load_strategy_config(force=False)
         windows = list(cfg.get('universe_backtest_windows') or [7, 30])
         tf = str(cfg.get('universe_backtest_exec_tf') or cfg.get('exec_tf_default') or '15m')
         top_n = int(cfg.get('universe_backtest_top_n', 80) or 80)
+        top_n = min(top_n, int(os.getenv('AUTOPILOT_UNIVERSE_BACKTEST_TOP_N_CAP', '60') or 60))
         for d in windows[:4]:
             try:
                 dd = int(d or 0)
@@ -22101,6 +22230,8 @@ async def _refresh_universe_backtests_for_autopilot() -> None:
             age_h = (time.time() - float(last.get('created_ts', 0.0) or 0.0)) / 3600.0 if last else 1e9
             if age_h <= 6.0:
                 continue
+            if not _maintenance_runtime_ok(time.time(), require_quiet_window=True, user_window_sec=60):
+                return
             await to_thread_heavy(run_universe_backtest, dd, 'ALL', tf, top_n, None, True, True)
     except Exception:
         return
@@ -22782,6 +22913,8 @@ def _run_market_adaptive_cycle(force: bool = False) -> dict:
 
 async def market_adaptive_daily_job(context: ContextTypes.DEFAULT_TYPE):
     try:
+        if not _maintenance_runtime_ok(time.time(), require_quiet_window=True, user_window_sec=45):
+            return
         _hb_touch('market_adaptive', ok=True, details='cycle_start')
         res = await to_thread_heavy(_run_market_adaptive_cycle)
         if isinstance(res, dict) and res.get('ok'):
@@ -22945,6 +23078,8 @@ async def market_adaptive_run_cmd(update: Update, context: ContextTypes.DEFAULT_
 
 async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
     """Internal autonomous optimizer. No manual trigger required."""
+    if not _maintenance_runtime_ok(time.time(), require_quiet_window=True, user_window_sec=60):
+        return
     await _refresh_universe_backtests_for_autopilot()
     should_run, reason = _autonomous_opt_should_run()
     if not should_run:
@@ -23171,12 +23306,12 @@ def _goal_profile_profile_bundles(profile_name: str, bundles: list[dict]) -> lis
 
 def _goal_profile_apply_candidate(base_cfg: dict, profile: dict, bundle: dict) -> dict:
     cfg = json.loads(json.dumps(base_cfg or {}))
-    cfg['quality_score_min_screen'] = float(_clamp(float(bundle.get('quality_score_min_screen', cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN))), 56.0, 60.0))
-    cfg['quality_score_min_email'] = float(_clamp(float(bundle.get('quality_score_min_email', cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL))), 60.0, 66.0))
-    cfg['tf_align_1h_min_abs'] = float(_clamp(float(bundle.get('tf_align_1h_min_abs', cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS))), 0.30, 0.55))
-    cfg['tf_align_4h_min_abs'] = float(_clamp(float(bundle.get('tf_align_4h_min_abs', cfg.get('tf_align_4h_min_abs', TF_ALIGN_4H_MIN_ABS))), 0.28, 0.50))
-    cfg['atr_min_pct'] = float(_clamp(float(bundle.get('atr_min_pct', cfg.get('atr_min_pct', ATR_MIN_PCT))), 0.70, 1.05))
-    cfg['min_rr_tp'] = float(_clamp(float(bundle.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP))), 1.12, 1.34))
+    cfg['quality_score_min_screen'] = float(bundle.get('quality_score_min_screen', cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN)))
+    cfg['quality_score_min_email'] = float(bundle.get('quality_score_min_email', cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL)))
+    cfg['tf_align_1h_min_abs'] = float(bundle.get('tf_align_1h_min_abs', cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS)))
+    cfg['tf_align_4h_min_abs'] = float(bundle.get('tf_align_4h_min_abs', cfg.get('tf_align_4h_min_abs', TF_ALIGN_4H_MIN_ABS)))
+    cfg['atr_min_pct'] = float(bundle.get('atr_min_pct', cfg.get('atr_min_pct', ATR_MIN_PCT)))
+    cfg['min_rr_tp'] = float(bundle.get('min_rr_tp', cfg.get('min_rr_tp', MIN_RR_TP)))
     cfg['regime_slope_trend_min_pct'] = float(bundle.get('regime_slope_trend_min_pct', cfg.get('regime_slope_trend_min_pct', 0.06)))
     cfg['execution_sessions_allowed'] = [str(x).upper().strip() for x in (profile.get('execution_sessions_allowed') or ['LON']) if str(x).strip()]
     cfg['execution_engines_allowed'] = [str(x).upper().strip() for x in (profile.get('execution_engines_allowed') or ['A']) if str(x).strip()]
@@ -23716,21 +23851,6 @@ async def goal_profile_run_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     final = rep.get('final') or {}
     m30 = final.get('metrics_30d') or {}
     m7 = final.get('metrics_7d') or {}
-    last_final = dict(rep.get('last_final') or {})
-    last_final_final = dict((last_final.get('final') or {}))
-    last_final_30 = dict(last_final_final.get('metrics_30d') or {})
-    last_final_7 = dict(last_final_final.get('metrics_7d') or {})
-    try:
-        current_setups = int(m30.get('setups', 0) or 0) + int(m7.get('setups', 0) or 0)
-    except Exception:
-        current_setups = 0
-    try:
-        prev_setups = int(last_final_30.get('setups', 0) or 0) + int(last_final_7.get('setups', 0) or 0)
-    except Exception:
-        prev_setups = 0
-    if current_setups <= 0 and prev_setups > 0 and str(rep.get('status') or '').upper().strip() in {'TIMEOUT_NO_BETTER_PROFILE', 'ERROR', 'ABORTED'}:
-        m30 = last_final_30 or m30
-        m7 = last_final_7 or m7
     lines = [
         '🎯 Goal-Profile Optimizer',
         HDR,
@@ -23761,21 +23881,6 @@ async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_
     current = rep.get('current') or {}
     m30 = final.get('metrics_30d') or {}
     m7 = final.get('metrics_7d') or {}
-    last_final = dict(rep.get('last_final') or {})
-    last_final_final = dict((last_final.get('final') or {}))
-    last_final_30 = dict(last_final_final.get('metrics_30d') or {})
-    last_final_7 = dict(last_final_final.get('metrics_7d') or {})
-    try:
-        current_setups = int(m30.get('setups', 0) or 0) + int(m7.get('setups', 0) or 0)
-    except Exception:
-        current_setups = 0
-    try:
-        prev_setups = int(last_final_30.get('setups', 0) or 0) + int(last_final_7.get('setups', 0) or 0)
-    except Exception:
-        prev_setups = 0
-    if current_setups <= 0 and prev_setups > 0 and str(rep.get('status') or '').upper().strip() in {'TIMEOUT_NO_BETTER_PROFILE', 'ERROR', 'ABORTED'}:
-        m30 = last_final_30 or m30
-        m7 = last_final_7 or m7
     current_profile = str(cfg.get('goal_profile_active_profile') or current.get('goal_profile_active_profile') or 'BASELINE')
     current_sessions = ','.join(cfg.get('execution_sessions_allowed') or current.get('execution_sessions_allowed') or []) or '-'
     current_engines = ','.join(cfg.get('execution_engines_allowed') or current.get('execution_engines_allowed') or []) or '-'
@@ -23821,8 +23926,6 @@ async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_
         elif final:
             lines.append(f"30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}")
             lines.append(f"7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}")
-            if current_setups <= 0 and prev_setups > 0 and str(rep.get('status') or '').upper().strip() in {'TIMEOUT_NO_BETTER_PROFILE', 'ERROR', 'ABORTED'}:
-                lines.append("Note: showing the last finalized goal-profile metrics because the most recent run did not produce a valid finalized sample.")
         if rep.get('error') and str(rep.get('status') or '').upper().strip() not in {'TIMEOUT_PROMOTED', 'TIMEOUT_NO_BETTER_PROFILE'}:
             lines.append(f"Error: {rep.get('error')}")
     await send_long_message(update, '\n'.join(lines), parse_mode=None)
@@ -24038,6 +24141,8 @@ def _run_family_autotune_cycle(force: bool = False) -> dict:
 
 
 async def family_autotune_job(context: ContextTypes.DEFAULT_TYPE):
+    if not _maintenance_runtime_ok(time.time(), require_quiet_window=True, user_window_sec=45):
+        return
     await to_thread_heavy(_run_family_autotune_cycle)
 
 
@@ -24104,21 +24209,21 @@ async def research_framework_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
 def _session_entry_quality_limits(session_name: str, source: str = 'email') -> dict:
     sess = str(session_name or '').upper().strip() or 'NY'
     base = {
-        'NY': {'max_pb_ema_dist': 0.72, 'max_ch15_abs': 0.64, 'max_ch1_abs': 1.32, 'max_atr_pct': 4.8},
-        'LON': {'max_pb_ema_dist': 0.74, 'max_ch15_abs': 0.64, 'max_ch1_abs': 1.32, 'max_atr_pct': 5.0},
-        'ASIA': {'max_pb_ema_dist': 0.60, 'max_ch15_abs': 0.52, 'max_ch1_abs': 1.08, 'max_atr_pct': 4.1},
-    }.get(sess, {'max_pb_ema_dist': 0.62, 'max_ch15_abs': 0.54, 'max_ch1_abs': 1.14, 'max_atr_pct': 4.4}).copy()
+        'NY': {'max_pb_ema_dist': 0.66, 'max_ch15_abs': 0.58, 'max_ch1_abs': 1.22, 'max_atr_pct': 4.4},
+        'LON': {'max_pb_ema_dist': 0.68, 'max_ch15_abs': 0.58, 'max_ch1_abs': 1.22, 'max_atr_pct': 4.8},
+        'ASIA': {'max_pb_ema_dist': 0.54, 'max_ch15_abs': 0.46, 'max_ch1_abs': 1.00, 'max_atr_pct': 3.8},
+    }.get(sess, {'max_pb_ema_dist': 0.58, 'max_ch15_abs': 0.50, 'max_ch1_abs': 1.08, 'max_atr_pct': 4.2}).copy()
     src = str(source or '').strip().lower()
     if src == 'screen':
-        base['max_pb_ema_dist'] *= (1.10 if sess != 'ASIA' else 1.06)
-        base['max_ch15_abs'] *= (1.08 if sess != 'ASIA' else 1.05)
-        base['max_ch1_abs'] *= (1.08 if sess != 'ASIA' else 1.05)
-        base['max_atr_pct'] *= (1.06 if sess != 'ASIA' else 1.03)
+        base['max_pb_ema_dist'] *= (1.07 if sess != 'ASIA' else 1.04)
+        base['max_ch15_abs'] *= (1.05 if sess != 'ASIA' else 1.03)
+        base['max_ch1_abs'] *= (1.05 if sess != 'ASIA' else 1.03)
+        base['max_atr_pct'] *= (1.04 if sess != 'ASIA' else 1.02)
     elif src == 'exec':
-        base['max_pb_ema_dist'] *= (1.08 if sess == 'LON' else (1.06 if sess != 'ASIA' else 1.04))
-        base['max_ch15_abs'] *= (1.08 if sess == 'LON' else (1.05 if sess != 'ASIA' else 1.03))
-        base['max_ch1_abs'] *= (1.06 if sess == 'LON' else (1.04 if sess != 'ASIA' else 1.02))
-        base['max_atr_pct'] *= (1.05 if sess == 'LON' else (1.03 if sess != 'ASIA' else 1.02))
+        base['max_pb_ema_dist'] *= (1.05 if sess == 'LON' else (1.03 if sess != 'ASIA' else 1.01))
+        base['max_ch15_abs'] *= (1.05 if sess == 'LON' else (1.02 if sess != 'ASIA' else 1.01))
+        base['max_ch1_abs'] *= (1.04 if sess == 'LON' else (1.02 if sess != 'ASIA' else 1.01))
+        base['max_atr_pct'] *= (1.03 if sess == 'LON' else (1.02 if sess != 'ASIA' else 1.01))
     return base
 
 
@@ -24199,19 +24304,19 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
 
         if engine == 'A':
             if sess == 'LON':
-                lon_ctx_ch4_min = 0.26 if reach_mode else 0.38
-                lon_ctx_ch1_min = 0.06 if reach_mode else 0.12
+                lon_ctx_ch4_min = 0.32 if reach_mode else 0.46
+                lon_ctx_ch1_min = 0.08 if reach_mode else 0.16
                 if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                     return (False, 'lon_pullback_context_too_weak')
-            if sess == 'NY' and (ch4_abs < 0.50 or ch1_abs < 0.18):
+            if sess == 'NY' and (ch4_abs < 0.58 or ch1_abs < 0.24):
                 return (False, 'ny_pullback_context_too_weak')
             if sess == 'ASIA':
                 if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
-                    if ch24_abs < 4.5 or ch15_abs < 0.01:
+                    if ch24_abs < 5.0 or ch15_abs < 0.01:
                         return (False, 'asia_pullback_context_too_weak')
-                elif (ch4_abs < 0.60 or ch1_abs < 0.24):
+                elif (ch4_abs < 0.72 or ch1_abs < 0.34):
                     return (False, 'asia_pullback_context_too_weak')
-            if sess == 'LON' and ch24_abs > (15.5 if reach_mode else 13.6) and pb_dist > (0.62 if reach_mode else 0.46):
+            if sess == 'LON' and ch24_abs > (14.8 if reach_mode else 12.8) and pb_dist > (0.56 if reach_mode else 0.40):
                 return (False, 'lon_trend_overheated')
         if sess == 'NY' and ch1_abs >= 1.72 and ch15_abs >= 0.82 and conf < 85 and score < 80.0:
             return (False, 'ny_breakout_chase_risk')
@@ -24253,11 +24358,7 @@ def is_top_setup_eligible(
         except Exception:
             pass
 
-        src = str(source or "screen").strip().lower()
-        if src not in {"screen", "email", "exec"}:
-            src = "screen"
-
-        score, comps = compute_setup_quality_score(s, session_name=session_name, source=src)
+        score, comps = compute_setup_quality_score(s, session_name=session_name)
         setattr(s, "quality_score", float(score))
         try:
             setattr(s, "quality_components", comps)
@@ -24266,6 +24367,9 @@ def is_top_setup_eligible(
 
         cfg_live = load_strategy_config(force=False)
         engine_c_base_score_add = float((cfg_live or {}).get('engine_c_base_score_add', 0.0) or 0.0)
+        src = str(source or "screen").strip().lower()
+        if src not in {"screen", "email", "exec"}:
+            src = "screen"
         sess = str(session_name or 'LON').upper().strip()
         engine = str(getattr(s, 'engine', '') or '').upper().strip()
         fam = str(getattr(s, 'family_id', '') or _family_id_from_engine(engine, s)).upper().strip()
@@ -24276,7 +24380,7 @@ def is_top_setup_eligible(
         if src == "screen":
             min_score = float(QUALITY_SCORE_MIN_SCREEN)
         elif src == "exec":
-            min_score = float(max(QUALITY_SCORE_MIN_SCREEN + 0.5, QUALITY_SCORE_MIN_EMAIL - 4.0))
+            min_score = float(max(QUALITY_SCORE_MIN_SCREEN + 3.0, QUALITY_SCORE_MIN_EMAIL - 2.0))
         else:
             min_score = float(QUALITY_SCORE_MIN_EMAIL)
 
@@ -24368,13 +24472,13 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 67.0, 70, 1.12
+        quality, conf, rr = 70.5, 74, 1.24
     elif sess == "LON":
-        quality, conf, rr = 64.0, 68, 1.04
+        quality, conf, rr = 68.0, 72, 1.16
     elif sess == "ASIA":
-        quality, conf, rr = 63.5, 67, 1.02
+        quality, conf, rr = 67.0, 71, 1.12
     else:
-        quality, conf, rr = 69.0, 72, 1.18
+        quality, conf, rr = 71.0, 74, 1.24
 
     try:
         cfg = load_strategy_config(force=False)
@@ -24468,45 +24572,45 @@ def is_executable_setup_eligible(
 
         if engine == 'A':
             if sess == 'LON':
-                score_floor = max((64.5 if reach_mode else 67.5), score_floor)
-                conf_floor = max((70 if reach_mode else 72), conf_floor)
-                rr_floor = max((1.06 if reach_mode else 1.14), rr_floor)
+                score_floor = max((67.0 if reach_mode else 70.5), score_floor)
+                conf_floor = max((72 if reach_mode else 74), conf_floor)
+                rr_floor = max((1.12 if reach_mode else 1.22), rr_floor)
             elif sess == 'NY':
-                score_floor = max(70.5, score_floor)
-                conf_floor = max(72, conf_floor)
-                rr_floor = max(1.20, rr_floor)
+                score_floor = max(73.5, score_floor)
+                conf_floor = max(74, conf_floor)
+                rr_floor = max(1.26, rr_floor)
             else:
-                score_floor = max(69.0, score_floor)
-                conf_floor = max(71, conf_floor)
-                rr_floor = max(1.14, rr_floor)
+                score_floor = max(72.5, score_floor)
+                conf_floor = max(74, conf_floor)
+                rr_floor = max(1.20, rr_floor)
         elif engine == 'C':
             if sess == 'LON':
-                score_floor = max((64.0 if reach_mode else 67.0), score_floor - 1.00 + engine_c_exec_quality_add)
-                conf_floor = max((71 if reach_mode else 73), conf_floor + engine_c_exec_conf_add)
-                rr_floor = max((1.04 if reach_mode else 1.12), rr_floor - 0.04 + engine_c_exec_rr_add)
+                score_floor = max((66.5 if reach_mode else 70.0), score_floor - 0.50 + engine_c_exec_quality_add)
+                conf_floor = max((73 if reach_mode else 76), conf_floor + engine_c_exec_conf_add)
+                rr_floor = max((1.10 if reach_mode else 1.20), rr_floor - 0.02 + engine_c_exec_rr_add)
             elif sess == 'NY':
-                score_floor = max(69.5, score_floor + engine_c_exec_quality_add)
-                conf_floor = max(73, conf_floor + engine_c_exec_conf_add)
-                rr_floor = max(1.18, rr_floor + engine_c_exec_rr_add)
+                score_floor = max(72.5, score_floor + 0.25 + engine_c_exec_quality_add)
+                conf_floor = max(76, conf_floor + 1 + engine_c_exec_conf_add)
+                rr_floor = max(1.24, rr_floor + 0.02 + engine_c_exec_rr_add)
             else:
-                score_floor = max(68.5, score_floor + 0.25 + engine_c_exec_quality_add)
-                conf_floor = max(71, conf_floor + engine_c_exec_conf_add)
-                rr_floor = max(1.12, rr_floor + 0.02 + engine_c_exec_rr_add)
+                score_floor = max(72.0, score_floor + 0.50 + engine_c_exec_quality_add)
+                conf_floor = max(74, conf_floor + 1 + engine_c_exec_conf_add)
+                rr_floor = max(1.20, rr_floor + 0.03 + engine_c_exec_rr_add)
         elif engine == 'B':
             if not exec_engine_b_enabled:
                 return (False, 'engine_b_disabled')
             if sess == 'LON':
-                score_floor = max(71.5, score_floor)
-                conf_floor = max(75, conf_floor)
-                rr_floor = max(1.24, rr_floor + 0.02)
+                score_floor = max(74.5, score_floor + 0.5)
+                conf_floor = max(77, conf_floor + 1)
+                rr_floor = max(1.30, rr_floor + 0.04)
             elif sess == 'NY':
-                score_floor = max(73.0, score_floor + 0.25)
-                conf_floor = max(76, conf_floor)
-                rr_floor = max(1.30, rr_floor + 0.03)
+                score_floor = max(76.0, score_floor + 0.75)
+                conf_floor = max(78, conf_floor + 1)
+                rr_floor = max(1.38, rr_floor + 0.05)
             else:
-                score_floor = max(72.5, score_floor + 0.35)
-                conf_floor = max(75, conf_floor)
-                rr_floor = max(1.28, rr_floor + 0.03)
+                score_floor = max(77.0, score_floor + 1.0)
+                conf_floor = max(79, conf_floor + 1)
+                rr_floor = max(1.40, rr_floor + 0.05)
         else:
             return (False, 'engine_not_supported')
 
@@ -24617,13 +24721,13 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.68, 7_500_000.0)):
                     return (False, "ny_below_liquidity")
             else:
-                if pb_dist > 0.98:
+                if pb_dist > 0.92:
                     return (False, "ny_entry_too_far_from_ema")
-                if ch15_abs > 1.08 or (ch15_abs > 0.92 and ch1_abs > 1.90):
+                if ch15_abs > 1.00 or (ch15_abs > 0.86 and ch1_abs > 1.82):
                     return (False, "ny_late_extension_exec")
-                if ch4_abs < 0.36 or ch1_abs < 0.14:
+                if ch4_abs < 0.46 or ch1_abs < 0.18:
                     return (False, "ny_context_too_weak_exec")
-                if fut_vol < max(MIN_FUT_VOL_USD * 0.68, 7_000_000.0):
+                if fut_vol < max(MIN_FUT_VOL_USD * 0.74, 7_500_000.0):
                     return (False, "ny_below_liquidity")
         elif sess == "LON":
             if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
@@ -24636,12 +24740,12 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.66, 7_000_000.0)):
                     return (False, "lon_below_liquidity")
             else:
-                lon_pb_max = 0.90 if reach_mode else 0.80
-                lon_ch15_cap = 0.86 if reach_mode else 0.72
-                lon_ch1_cap = 1.60 if reach_mode else 1.40
-                lon_ctx_ch4_min = 0.24 if reach_mode else 0.30
-                lon_ctx_ch1_min = 0.06 if reach_mode else 0.10
-                lon_liq_floor = max(MIN_FUT_VOL_USD * (0.66 if reach_mode else 0.72), 6_500_000.0 if reach_mode else 7_500_000.0)
+                lon_pb_max = 0.84 if reach_mode else 0.74
+                lon_ch15_cap = 0.78 if reach_mode else 0.64
+                lon_ch1_cap = 1.48 if reach_mode else 1.30
+                lon_ctx_ch4_min = 0.32 if reach_mode else 0.40
+                lon_ctx_ch1_min = 0.10 if reach_mode else 0.16
+                lon_liq_floor = max(MIN_FUT_VOL_USD * (0.72 if reach_mode else 0.80), 7_000_000.0 if reach_mode else 8_500_000.0)
                 if engine == 'C':
                     lon_pb_max = max(lon_pb_max, engine_c_exec_pb_dist_lon)
                     lon_ch1_cap = max(lon_ch1_cap, engine_c_exec_ch1_cap_lon)
@@ -24669,13 +24773,13 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.70, 6_500_000.0)):
                     return (False, "asia_below_liquidity")
             else:
-                if pb_dist > 0.84:
+                if pb_dist > 0.78:
                     return (False, "asia_entry_too_far_from_ema")
-                if ch15_abs > 0.86 or ch1_abs > 1.54:
+                if ch15_abs > 0.78 or ch1_abs > 1.46:
                     return (False, "asia_late_extension_exec")
-                if ch4_abs < 0.34 or ch1_abs < 0.12:
+                if ch4_abs < 0.44 or ch1_abs < 0.18:
                     return (False, "asia_context_too_weak_exec")
-                if fut_vol < float(max(MIN_FUT_VOL_USD * 0.62, 7_500_000.0)):
+                if fut_vol < float(max(MIN_FUT_VOL_USD * 0.68, ASIA_MIN_FUT_VOL_USD)):
                     return (False, "asia_below_liquidity")
 
         if engine == "A":
@@ -24685,17 +24789,17 @@ def is_executable_setup_eligible(
                 return (True, "ok")
             if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
                 return (False, "pullback_not_ready")
-            if pb_dist > ((0.92 if reach_mode else 0.78) if sess == 'LON' else (0.82 if sess == 'NY' else 0.74)):
+            if pb_dist > ((0.84 if reach_mode else 0.70) if sess == 'LON' else (0.74 if sess == 'NY' else 0.68)):
                 return (False, "pullback_still_too_shallow")
-            if sess == 'LON' and (ch15_abs > (0.82 if reach_mode else 0.66) or ch1_abs < (0.06 if reach_mode else 0.10) or ch1_abs > (1.48 if reach_mode else 1.26) or ch4_abs < (0.24 if reach_mode else 0.34)):
+            if sess == 'LON' and (ch15_abs > (0.74 if reach_mode else 0.58) or ch1_abs < (0.10 if reach_mode else 0.16) or ch1_abs > (1.38 if reach_mode else 1.18) or ch4_abs < (0.34 if reach_mode else 0.44)):
                 return (False, 'lon_pullback_not_clean_enough')
             return (True, "ok")
 
         if engine == "C":
-            c_quality_floor = score_floor + (0.00 if reach_mode and sess == 'LON' else 0.00)
-            c_conf_floor = max(71 if (reach_mode and sess == 'LON') else conf_floor, conf_floor - (1 if reach_mode and sess == 'LON' else 0))
-            c_rr_floor = max(1.04 if (reach_mode and sess == 'LON') else rr_floor, rr_floor - (0.08 if reach_mode and sess == 'LON' else 0.04))
-            c_liq_floor = float(max(MIN_FUT_VOL_USD * (engine_c_exec_liq_mult if not (reach_mode and sess == 'LON') else 0.66), 5_500_000.0 if (reach_mode and sess == 'LON') else ENGINE_C_MIN_FUT_VOL_USD * 0.72))
+            c_quality_floor = score_floor + (0.00 if reach_mode and sess == 'LON' else 0.05)
+            c_conf_floor = max(73 if (reach_mode and sess == 'LON') else conf_floor, conf_floor - (1 if reach_mode and sess == 'LON' else 0))
+            c_rr_floor = max(1.08 if (reach_mode and sess == 'LON') else rr_floor, rr_floor - (0.06 if reach_mode and sess == 'LON' else 0.02))
+            c_liq_floor = float(max(MIN_FUT_VOL_USD * (engine_c_exec_liq_mult if not (reach_mode and sess == 'LON') else 0.72), 6_000_000.0 if (reach_mode and sess == 'LON') else ENGINE_C_MIN_FUT_VOL_USD * 0.82))
             c_ch1_cap = (max(engine_c_exec_ch1_cap_lon, 1.76) if (reach_mode and sess == 'LON') else max(engine_c_exec_ch1_cap_lon, 1.44)) if sess == 'LON' else (1.66 if sess == 'NY' else 1.32)
             if score < c_quality_floor:
                 return (False, "engine_c_below_quality")
@@ -26009,13 +26113,13 @@ def make_breakout_setup(
                     else:
                         _rej("no_breakout_trigger", base, mv)
                         return None
-                elif trend_up and float(ch24 or 0.0) >= (2.2 if str(session_name).upper() == 'ASIA' else 2.6) and float(ch4_used or 0.0) >= (0.06 if str(session_name).upper() == 'ASIA' else 0.12) and (float(ch1 or 0.0) >= (-0.65 if str(session_name).upper() == 'ASIA' else -0.50) or float(ch15 or 0.0) >= (-0.44 if str(session_name).upper() == 'ASIA' else -0.34)):
+                elif trend_up and float(ch24 or 0.0) >= (2.8 if str(session_name).upper() == 'ASIA' else 3.6) and float(ch4_used or 0.0) >= (0.10 if str(session_name).upper() == 'ASIA' else 0.28) and (float(ch1 or 0.0) >= (-0.45 if str(session_name).upper() == 'ASIA' else -0.30) or float(ch15 or 0.0) >= (-0.30 if str(session_name).upper() == 'ASIA' else -0.20)):
                     # Trend-continuation soft path: permit F1/F3 style continuation candidates even without a fresh HH breakout.
                     side = "BUY"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) >= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_buy')
                     conf = max(0.0, float(conf) - 0.5)
-                elif trend_dn and float(ch24 or 0.0) <= (-2.2 if str(session_name).upper() == 'ASIA' else -2.6) and float(ch4_used or 0.0) <= (-0.06 if str(session_name).upper() == 'ASIA' else -0.12) and (float(ch1 or 0.0) <= (0.65 if str(session_name).upper() == 'ASIA' else 0.50) or float(ch15 or 0.0) <= (0.44 if str(session_name).upper() == 'ASIA' else 0.34)):
+                elif trend_dn and float(ch24 or 0.0) <= (-2.8 if str(session_name).upper() == 'ASIA' else -3.6) and float(ch4_used or 0.0) <= (-0.10 if str(session_name).upper() == 'ASIA' else -0.28) and (float(ch1 or 0.0) <= (0.45 if str(session_name).upper() == 'ASIA' else 0.30) or float(ch15 or 0.0) <= (0.30 if str(session_name).upper() == 'ASIA' else 0.20)):
                     side = "SELL"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) <= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_sell')
@@ -26085,7 +26189,7 @@ def make_breakout_setup(
     setattr(s, 'trend', 'BULLISH' if side == 'BUY' else 'BEARISH')
     setattr(s, 'structure', getattr(s, 'trend'))
     try:
-        score, _ = compute_setup_quality_score(s, session_name=session_name, source='screen')
+        score, _ = compute_setup_quality_score(s, session_name=session_name)
         setattr(s, 'quality_score', float(score))
     except Exception:
         pass
@@ -31181,12 +31285,11 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         SEP,
         f"Equity: ${equity:.2f}",
         f"Daily cap: ${float(snap.get('cap') or 0.0):.2f}",
-        f"Opened today: {int(snap.get('positions_opened_today', 0) or 0)} | Closed today: {int(snap.get('positions_closed_today', 0) or 0)} | Bot-managed open now: {int(snap.get('open_positions_now', 0) or 0)}",
-        f"Bot-managed open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
+        f"Opened today: {int(snap.get('positions_opened_today', 0) or 0)} | Closed today: {int(snap.get('positions_closed_today', 0) or 0)} | Open now: {int(snap.get('open_positions_now', 0) or 0)}",
+        f"Open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
         f"Realised net today: ${float(snap.get('pnl_today') or 0.0):+.2f}",
         f"Daily risk used (open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
         ('Daily risk remaining: ∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f"Daily risk remaining: ${float(snap.get('remaining_today')):.2f}"),
-        f"Exchange open positions (all): {int(snap.get('live_exchange_open_positions_now', snap.get('open_positions_now', 0)) or 0)} | Unmanaged/manual: {int(snap.get('unmanaged_open_positions_now', 0) or 0)} | Unmanaged risk est: ${float(snap.get('unmanaged_open_risk', 0.0)):.2f}",
         SEP,
         'Email → executable lane',
         f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
@@ -31220,16 +31323,10 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if class_rows:
         lines.extend([SEP, 'Position day buckets'])
         live_positions = {f"{_pos_symbol(p)}|{_pos_side_text(p)}": float(_pos_unreal_pnl(p) or 0.0) for p in (_bybit_get_open_positions_linear() or [])}
-        managed_rows = [r for r in class_rows if bool(r.get('managed', True))]
-        unmanaged_rows = [r for r in class_rows if not bool(r.get('managed', True))]
-        for row in managed_rows[:10]:
+        for row in class_rows[:10]:
             key = f"{row.get('symbol')}|{row.get('side')}"
             pnl = float(live_positions.get(key, 0.0) or 0.0)
-            lines.append(f"• {row.get('symbol')} | {row.get('side')} | ${pnl:+.2f} | {row.get('bucket')}")
-        for row in unmanaged_rows[:5]:
-            key = f"{row.get('symbol')}|{row.get('side')}"
-            pnl = float(live_positions.get(key, 0.0) or 0.0)
-            lines.append(f"• {row.get('symbol')} | {row.get('side')} | ${pnl:+.2f} | unmanaged/manual")
+            lines.append(f"• {row.get('symbol')} | {row.get('side')} | ${pnl:+.2f}")
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -31401,29 +31498,26 @@ def _adaptive_ema_anchor_limit_pct(setup: "Setup", session_name: str, fallback_a
         base = float(fallback_allowed or EMA_ANCHOR_BASE_MAX_DIST_PCT or 0.80)
 
         if engine == "B":
-            limit = max(base, 0.88 + min(1.28, atr_pct * 0.26))
+            limit = max(base, 0.82 + min(1.18, atr_pct * 0.24))
         elif engine == "A":
-            limit = max(base, 0.68 + min(0.95, atr_pct * 0.22))
+            limit = max(base, 0.62 + min(0.85, atr_pct * 0.20))
         elif engine == "C":
-            limit = max(base, 0.78 + min(1.08, atr_pct * 0.24))
+            limit = max(base, 0.72 + min(1.02, atr_pct * 0.22))
         else:
-            limit = max(base, 0.72 + min(0.98, atr_pct * 0.24))
+            limit = max(base, 0.66 + min(0.92, atr_pct * 0.22))
 
         fam = str(getattr(setup, "family_id", "") or _family_id_from_engine(engine, setup)).upper().strip()
 
         if sess == "ASIA":
             # ASIA was still over-tight even after the dynamic anchor migration.
             # Keep it disciplined, but stop shrinking the limit below the adaptive base.
-            limit *= 1.08 if fam in {"F1_PULLBACK_CONT", "F3_IMPULSE_BASE_CONT", "F6_VWAP_RECLAIM"} else 1.03
+            limit *= 1.06 if fam in {"F1_PULLBACK_CONT", "F3_IMPULSE_BASE_CONT", "F6_VWAP_RECLAIM"} else 1.02
         elif sess == "NY":
-            limit *= 1.12
-        elif sess == "LON":
-            if fam in {"F1_PULLBACK_CONT", "F3_IMPULSE_BASE_CONT", "F2_MOMENTUM_IGNITION"}:
-                limit *= 1.06
-            else:
-                limit *= 1.03
+            limit *= 1.08
+        elif sess == "LON" and fam in {"F1_PULLBACK_CONT", "F3_IMPULSE_BASE_CONT"}:
+            limit *= 1.02
 
-        return float(clamp(limit, 0.74, 2.35))
+        return float(clamp(limit, 0.68, 2.15))
     except Exception:
         return float(fallback_allowed or EMA_ANCHOR_BASE_MAX_DIST_PCT or 0.80)
 
@@ -31431,7 +31525,7 @@ def _adaptive_ema_anchor_limit_pct(setup: "Setup", session_name: str, fallback_a
 def _recalibrate_public_confidence(setup: "Setup", session_name: str) -> tuple[int, float, dict]:
     """Blend legacy confidence with quality score so displayed confidence matches real quality better."""
     try:
-        score, comps = compute_setup_quality_score(setup, session_name=session_name, source='screen')
+        score, comps = compute_setup_quality_score(setup, session_name=session_name)
         raw_conf = float(getattr(setup, "conf", 0) or 0.0)
         blended = (0.35 * raw_conf) + (0.65 * float(score))
         if str(getattr(setup, "engine", "") or "").upper() == "B" and abs(float(getattr(setup, "ch15", 0.0) or 0.0)) >= 1.0:
@@ -31506,7 +31600,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         n_target = int(max(EMAIL_SETUPS_N * 4, 10))
         strict_15m = True
         universe_cap = int(max(80, SCREEN_UNIVERSE_N))
-        trigger_loosen = float(min(0.88, max(SCREEN_TRIGGER_LOOSEN, 0.82)))
+        trigger_loosen = float(min(0.92, max(SCREEN_TRIGGER_LOOSEN, 0.88)))
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
         allow_no_pullback = True
         scan_multiplier = 12
@@ -31519,7 +31613,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         n_target = int(max(EMAIL_SETUPS_N * 4, 12))
         strict_15m = True
         universe_cap = int(max(60, SCREEN_UNIVERSE_N))
-        trigger_loosen = 0.94
+        trigger_loosen = 1.0
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
         allow_no_pullback = False
         scan_multiplier = 12
