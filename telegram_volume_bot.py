@@ -14028,32 +14028,40 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
         'errors': [],
     }
     try:
-        if int(user_id or 0) <= 0:
+        uid = int(user_id or 0)
+        if uid < 0:
             return stats
         now_ts = float(time.time())
         sess = str(session_name or '').upper().strip()
-        target_uids = [int(user_id)]
+
+        # user_id=0 is the shared authoritative executable lane used by the email pool
+        # builder before any per-user fan-out. It must be persisted even though there is no
+        # corresponding user-scoped signals row for uid=0. Positive user ids keep the normal
+        # signal+queue path, and admin callers may still fan out to the autotrade owner.
+        target_uids = [int(uid)]
         try:
             owner_uid = int(AUTOTRADE_OWNER_UID or 0)
         except Exception:
             owner_uid = 0
         try:
-            if owner_uid > 0 and owner_uid not in target_uids and is_admin_user(int(user_id)):
+            if uid > 0 and owner_uid > 0 and owner_uid not in target_uids and is_admin_user(int(uid)):
                 target_uids.append(owner_uid)
         except Exception:
             pass
+
         for s in (setups or []):
             sid = str(getattr(s, 'setup_id', '') or '').strip()
             sym = str(getattr(s, 'symbol', '') or '').upper()
             side = str(getattr(s, 'side', '') or '').upper()
             for _target_uid in target_uids:
                 stats['attempted'] += 1
-                try:
-                    db_insert_signal(s, user_id=int(_target_uid))
-                except Exception as e:
-                    stats['signal_errors'] += 1
-                    if len(stats['errors']) < 6:
-                        stats['errors'].append(f"signal:{sid or sym}:{type(e).__name__}")
+                if int(_target_uid) > 0:
+                    try:
+                        db_insert_signal(s, user_id=int(_target_uid))
+                    except Exception as e:
+                        stats['signal_errors'] += 1
+                        if len(stats['errors']) < 6:
+                            stats['errors'].append(f"signal:{sid or sym}:{type(e).__name__}")
                 try:
                     db_mark_executable_setup(int(_target_uid), sid, sess, float(now_ts), s=s, source_kind=str(source_kind or 'executable_setups'))
                     stats['persisted'] += 1
@@ -14074,7 +14082,7 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
                     )
         if stats['queue_errors'] or stats['signal_errors']:
             db_log_setup_pipeline_event(
-                int(user_id),
+                int(uid),
                 stage='executable_queue_write',
                 status='partial_error' if stats['persisted'] > 0 else 'error',
                 session=sess,
@@ -14083,7 +14091,7 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
             )
         elif stats['persisted'] > 0:
             db_log_setup_pipeline_event(
-                int(user_id),
+                int(uid),
                 stage='executable_queue_write',
                 status='ok',
                 session=sess,
@@ -24080,16 +24088,31 @@ def _session_entry_quality_limits(session_name: str, source: str = 'email') -> d
         base['max_ch1_abs'] *= (1.08 if sess != 'ASIA' else 1.04)
         base['max_atr_pct'] *= (1.06 if sess != 'ASIA' else 1.03)
     elif src == 'exec':
-        base['max_pb_ema_dist'] *= (1.08 if sess == 'LON' else (1.05 if sess != 'ASIA' else 1.03))
-        base['max_ch15_abs'] *= (1.08 if sess == 'LON' else (1.04 if sess != 'ASIA' else 1.02))
-        base['max_ch1_abs'] *= (1.07 if sess == 'LON' else (1.04 if sess != 'ASIA' else 1.02))
-        base['max_atr_pct'] *= (1.05 if sess == 'LON' else (1.03 if sess != 'ASIA' else 1.02))
+        # The executable lane has its own stricter family/session gate later.
+        # Keep this pre-gate slightly broader so live generation is not starved by
+        # duplicated early-extension / pullback-distance checks before final exec truth runs.
+        if sess == 'LON':
+            base['max_pb_ema_dist'] *= 1.16
+            base['max_ch15_abs'] *= 1.14
+            base['max_ch1_abs'] *= 1.12
+            base['max_atr_pct'] *= 1.08
+        elif sess == 'NY':
+            base['max_pb_ema_dist'] *= 1.12
+            base['max_ch15_abs'] *= 1.10
+            base['max_ch1_abs'] *= 1.09
+            base['max_atr_pct'] *= 1.05
+        else:
+            base['max_pb_ema_dist'] *= 1.08
+            base['max_ch15_abs'] *= 1.06
+            base['max_ch1_abs'] *= 1.06
+            base['max_atr_pct'] *= 1.03
     return base
 
 
 def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str = 'email') -> tuple[bool, str]:
     try:
         limits = _session_entry_quality_limits(session_name, source=source)
+        src = str(source or '').strip().lower()
         leader_base = bool(getattr(s, 'leader_base_override', False))
         engine = str(getattr(s, 'engine', '') or '').upper().strip()
         cfg_live = load_strategy_config(force=False)
@@ -24164,20 +24187,33 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
 
         if engine == 'A':
             if sess == 'LON':
-                lon_ctx_ch4_min = 0.32 if reach_mode else 0.46
-                lon_ctx_ch1_min = 0.08 if reach_mode else 0.16
+                if src == 'exec':
+                    lon_ctx_ch4_min = 0.24 if reach_mode else 0.38
+                    lon_ctx_ch1_min = 0.06 if reach_mode else 0.12
+                else:
+                    lon_ctx_ch4_min = 0.32 if reach_mode else 0.46
+                    lon_ctx_ch1_min = 0.08 if reach_mode else 0.16
                 if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                     return (False, 'lon_pullback_context_too_weak')
-            if sess == 'NY' and (ch4_abs < 0.58 or ch1_abs < 0.24):
-                return (False, 'ny_pullback_context_too_weak')
+            if sess == 'NY':
+                ny_ctx_ch4_min = 0.48 if src == 'exec' else 0.58
+                ny_ctx_ch1_min = 0.18 if src == 'exec' else 0.24
+                if ch4_abs < ny_ctx_ch4_min or ch1_abs < ny_ctx_ch1_min:
+                    return (False, 'ny_pullback_context_too_weak')
             if sess == 'ASIA':
                 if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
                     if ch24_abs < 5.0 or ch15_abs < 0.01:
                         return (False, 'asia_pullback_context_too_weak')
-                elif (ch4_abs < 0.72 or ch1_abs < 0.34):
-                    return (False, 'asia_pullback_context_too_weak')
-            if sess == 'LON' and ch24_abs > (14.8 if reach_mode else 12.8) and pb_dist > (0.56 if reach_mode else 0.40):
-                return (False, 'lon_trend_overheated')
+                else:
+                    asia_ctx_ch4_min = 0.60 if src == 'exec' else 0.72
+                    asia_ctx_ch1_min = 0.24 if src == 'exec' else 0.34
+                    if ch4_abs < asia_ctx_ch4_min or ch1_abs < asia_ctx_ch1_min:
+                        return (False, 'asia_pullback_context_too_weak')
+            if sess == 'LON':
+                lon_hot_ch24 = 16.2 if (reach_mode or src == 'exec') else 12.8
+                lon_hot_pb = 0.62 if (reach_mode or src == 'exec') else 0.40
+                if ch24_abs > lon_hot_ch24 and pb_dist > lon_hot_pb:
+                    return (False, 'lon_trend_overheated')
         if sess == 'NY' and ch1_abs >= 1.72 and ch15_abs >= 0.82 and conf < 85 and score < 80.0:
             return (False, 'ny_breakout_chase_risk')
         return (True, 'ok')
@@ -24240,7 +24276,10 @@ def is_top_setup_eligible(
         if src == "screen":
             min_score = float(QUALITY_SCORE_MIN_SCREEN)
         elif src == "exec":
-            min_score = float(max(QUALITY_SCORE_MIN_SCREEN + 3.0, QUALITY_SCORE_MIN_EMAIL - 2.0))
+            # Exec has a second, stricter gate in is_executable_setup_eligible().
+            # Keep this source-truth pre-gate only moderately above screen so the
+            # executable lane is not self-starved before family/engine/session checks run.
+            min_score = float(max(QUALITY_SCORE_MIN_SCREEN + 1.0, QUALITY_SCORE_MIN_EMAIL - 4.0))
         else:
             min_score = float(QUALITY_SCORE_MIN_EMAIL)
 
@@ -24258,11 +24297,11 @@ def is_top_setup_eligible(
                 min_score += (1.5 if sess != 'ASIA' else 2.0) + engine_c_base_score_add
         elif src == 'exec':
             if engine == 'A':
-                min_score += -0.75 if sess == 'LON' else (-0.10 if sess == 'NY' else 0.35)
+                min_score += -1.25 if sess == 'LON' else (-0.60 if sess == 'NY' else -0.10)
             elif engine == 'B':
-                min_score += 1.5 if sess in {'NY', 'ASIA'} else 1.0
+                min_score += 1.0 if sess in {'NY', 'ASIA'} else 0.75
             elif engine == 'C':
-                min_score += (1.0 if sess != 'ASIA' else 1.5) + engine_c_base_score_add
+                min_score += (0.50 if sess != 'ASIA' else 1.0) + engine_c_base_score_add
         else:
             if engine == 'A':
                 min_score += 0.0 if sess == 'LON' else (0.5 if sess == 'NY' else 1.0)
@@ -24302,7 +24341,8 @@ def is_top_setup_eligible(
             # Keep NY broad, but require slightly better LON scores here.
             min_score += 0.50 if src == 'exec' else (0.50 if src == 'email' else 0.25)
 
-        min_score = float(clamp(min_score, 56.0 if reach_mode and sess == 'LON' else 60.0, 90.0))
+        min_floor = 58.0 if src == 'exec' else (56.0 if reach_mode and sess == 'LON' else 60.0)
+        min_score = float(clamp(min_score, min_floor, 90.0))
 
         if float(score) < float(min_score):
             return (False, f"below_score_{int(round(min_score))}")
@@ -24540,6 +24580,8 @@ def is_executable_setup_eligible(
         if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
             pass
         elif fam == 'F5_ORB_RETEST' and regime in {'SQUEEZE', 'EXPANSION'}:
+            pass
+        elif fam == 'F3_IMPULSE_BASE_CONT' and regime in {'EXPANSION', 'SQUEEZE'}:
             pass
         elif 'TREND' not in regime and 'EXPANSION' not in regime:
             return (False, 'regime_not_trend')
