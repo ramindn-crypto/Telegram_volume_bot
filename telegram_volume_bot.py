@@ -24089,23 +24089,23 @@ def _session_entry_quality_limits(session_name: str, source: str = 'email') -> d
         base['max_atr_pct'] *= (1.06 if sess != 'ASIA' else 1.03)
     elif src == 'exec':
         # The executable lane has its own stricter family/session gate later.
-        # Keep this pre-gate slightly broader so live generation is not starved by
-        # duplicated early-extension / pullback-distance checks before final exec truth runs.
+        # Keep this pre-gate somewhat broader than email, but not so broad that it
+        # floods NY/ASIA with low-quality converts.
         if sess == 'LON':
-            base['max_pb_ema_dist'] *= 1.16
-            base['max_ch15_abs'] *= 1.14
-            base['max_ch1_abs'] *= 1.12
-            base['max_atr_pct'] *= 1.08
-        elif sess == 'NY':
-            base['max_pb_ema_dist'] *= 1.12
-            base['max_ch15_abs'] *= 1.10
-            base['max_ch1_abs'] *= 1.09
+            base['max_pb_ema_dist'] *= 1.10
+            base['max_ch15_abs'] *= 1.08
+            base['max_ch1_abs'] *= 1.07
             base['max_atr_pct'] *= 1.05
-        else:
-            base['max_pb_ema_dist'] *= 1.08
-            base['max_ch15_abs'] *= 1.06
-            base['max_ch1_abs'] *= 1.06
+        elif sess == 'NY':
+            base['max_pb_ema_dist'] *= 1.06
+            base['max_ch15_abs'] *= 1.05
+            base['max_ch1_abs'] *= 1.04
             base['max_atr_pct'] *= 1.03
+        else:
+            base['max_pb_ema_dist'] *= 1.02
+            base['max_ch15_abs'] *= 1.02
+            base['max_ch1_abs'] *= 1.02
+            base['max_atr_pct'] *= 1.01
     return base
 
 
@@ -24188,16 +24188,16 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
         if engine == 'A':
             if sess == 'LON':
                 if src == 'exec':
-                    lon_ctx_ch4_min = 0.24 if reach_mode else 0.38
-                    lon_ctx_ch1_min = 0.06 if reach_mode else 0.12
+                    lon_ctx_ch4_min = 0.30 if reach_mode else 0.42
+                    lon_ctx_ch1_min = 0.08 if reach_mode else 0.14
                 else:
                     lon_ctx_ch4_min = 0.32 if reach_mode else 0.46
                     lon_ctx_ch1_min = 0.08 if reach_mode else 0.16
                 if ch4_abs < lon_ctx_ch4_min or ch1_abs < lon_ctx_ch1_min:
                     return (False, 'lon_pullback_context_too_weak')
             if sess == 'NY':
-                ny_ctx_ch4_min = 0.48 if src == 'exec' else 0.58
-                ny_ctx_ch1_min = 0.18 if src == 'exec' else 0.24
+                ny_ctx_ch4_min = 0.54 if src == 'exec' else 0.58
+                ny_ctx_ch1_min = 0.20 if src == 'exec' else 0.24
                 if ch4_abs < ny_ctx_ch4_min or ch1_abs < ny_ctx_ch1_min:
                     return (False, 'ny_pullback_context_too_weak')
             if sess == 'ASIA':
@@ -24205,13 +24205,13 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
                     if ch24_abs < 5.0 or ch15_abs < 0.01:
                         return (False, 'asia_pullback_context_too_weak')
                 else:
-                    asia_ctx_ch4_min = 0.60 if src == 'exec' else 0.72
-                    asia_ctx_ch1_min = 0.24 if src == 'exec' else 0.34
+                    asia_ctx_ch4_min = 0.68 if src == 'exec' else 0.72
+                    asia_ctx_ch1_min = 0.28 if src == 'exec' else 0.34
                     if ch4_abs < asia_ctx_ch4_min or ch1_abs < asia_ctx_ch1_min:
                         return (False, 'asia_pullback_context_too_weak')
             if sess == 'LON':
-                lon_hot_ch24 = 16.2 if (reach_mode or src == 'exec') else 12.8
-                lon_hot_pb = 0.62 if (reach_mode or src == 'exec') else 0.40
+                lon_hot_ch24 = 14.8 if (reach_mode or src == 'exec') else 12.8
+                lon_hot_pb = 0.54 if (reach_mode or src == 'exec') else 0.40
                 if ch24_abs > lon_hot_ch24 and pb_dist > lon_hot_pb:
                     return (False, 'lon_trend_overheated')
         if sess == 'NY' and ch1_abs >= 1.72 and ch15_abs >= 0.82 and conf < 85 and score < 80.0:
@@ -24297,11 +24297,11 @@ def is_top_setup_eligible(
                 min_score += (1.5 if sess != 'ASIA' else 2.0) + engine_c_base_score_add
         elif src == 'exec':
             if engine == 'A':
-                min_score += -1.25 if sess == 'LON' else (-0.60 if sess == 'NY' else -0.10)
+                min_score += -0.75 if sess == 'LON' else (-0.25 if sess == 'NY' else 0.20)
             elif engine == 'B':
-                min_score += 1.0 if sess in {'NY', 'ASIA'} else 0.75
+                min_score += 1.25 if sess in {'NY', 'ASIA'} else 1.00
             elif engine == 'C':
-                min_score += (0.50 if sess != 'ASIA' else 1.0) + engine_c_base_score_add
+                min_score += (0.75 if sess != 'ASIA' else 1.25) + engine_c_base_score_add
         else:
             if engine == 'A':
                 min_score += 0.0 if sess == 'LON' else (0.5 if sess == 'NY' else 1.0)
@@ -24311,7 +24311,7 @@ def is_top_setup_eligible(
                 min_score += (0.8 if sess != 'ASIA' else 1.2) + engine_c_base_score_add
         if reach_mode and sess == 'LON' and engine in {'A', 'C'}:
             if src == 'exec':
-                min_score -= 4.0 if engine == 'A' else 3.0
+                min_score -= 2.75 if engine == 'A' else 2.00
             elif src == 'email':
                 min_score -= 1.5 if engine == 'A' else 1.0
             else:
@@ -24327,21 +24327,21 @@ def is_top_setup_eligible(
         f4_ch15_relax = float((cfg_live or {}).get('family_f4_balance_ch15_relax', 0.0) or 0.0)
         if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
             if sess in {'LON', 'NY'}:
-                min_score -= (2.0 if src == 'exec' else (1.5 if src == 'email' else 1.0)) + f4_score_relax
+                min_score -= (1.25 if src == 'exec' else (1.5 if src == 'email' else 1.0)) + f4_score_relax
             else:
-                min_score -= (2.75 if src == 'exec' else (1.5 if src == 'email' else 1.0)) + f4_score_relax
+                min_score -= (1.75 if src == 'exec' else (1.5 if src == 'email' else 1.0)) + f4_score_relax
         elif fam == 'F2_MOMENTUM_IGNITION' and regime == 'EXPANSION':
             if sess in {'LON', 'NY'}:
-                min_score -= 1.5 if src == 'exec' else (0.75 if src == 'email' else 0.50)
+                min_score -= 0.90 if src == 'exec' else (0.75 if src == 'email' else 0.50)
         elif fam == 'F3_IMPULSE_BASE_CONT' and regime in {'EXPANSION', 'SQUEEZE'}:
             if sess in {'LON', 'NY'}:
-                min_score -= 1.25 if src == 'exec' else (0.60 if src == 'email' else 0.50)
+                min_score -= 0.80 if src == 'exec' else (0.60 if src == 'email' else 0.50)
         elif fam == 'F1_PULLBACK_CONT' and 'TREND' in regime and sess == 'LON':
             # LON was over-converting weak pullback-continuation ideas.
             # Keep NY broad, but require slightly better LON scores here.
             min_score += 0.50 if src == 'exec' else (0.50 if src == 'email' else 0.25)
 
-        min_floor = 58.0 if src == 'exec' else (56.0 if reach_mode and sess == 'LON' else 60.0)
+        min_floor = 60.0 if src == 'exec' else (56.0 if reach_mode and sess == 'LON' else 60.0)
         min_score = float(clamp(min_score, min_floor, 90.0))
 
         if float(score) < float(min_score):
@@ -24372,11 +24372,11 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 68.5, 72, 1.18
+        quality, conf, rr = 69.5, 73, 1.20
     elif sess == "LON":
-        quality, conf, rr = 66.5, 70, 1.12
+        quality, conf, rr = 67.0, 71, 1.14
     elif sess == "ASIA":
-        quality, conf, rr = 65.5, 69, 1.08
+        quality, conf, rr = 67.5, 71, 1.14
     else:
         quality, conf, rr = 71.0, 74, 1.24
 
@@ -24530,52 +24530,52 @@ def is_executable_setup_eligible(
         if active_profile.startswith('GLOBAL_') and fam and fam in set(active_fams):
             # Keep the broader NY reach, but do not let active-family relaxations over-loosen LON.
             if engine in {'A', 'C'} and sess == 'NY' and ('TREND' in regime or 'EXPANSION' in regime):
-                score_floor -= 1.5
+                score_floor -= 0.75
+                conf_floor -= 1
+                rr_floor -= 0.02
+            elif engine == 'B' and sess == 'NY' and 'EXPANSION' in regime:
+                score_floor -= 1.25
                 conf_floor -= 1
                 rr_floor -= 0.03
-            elif engine == 'B' and sess == 'NY' and 'EXPANSION' in regime:
-                score_floor -= 2.5
-                conf_floor -= 1
-                rr_floor -= 0.05
             elif engine in {'A', 'C'} and sess == 'LON' and ('TREND' in regime or 'EXPANSION' in regime):
-                score_floor -= 0.25
-                rr_floor -= 0.01
+                score_floor -= 0.10
+                rr_floor -= 0.00
 
         # Family-aware executable calibration. These are deliberately modest and only help
         # regime-consistent families convert a little better without turning the email lane
         # into a loose screen lane.
         if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
             if sess in {'LON', 'NY'}:
-                score_floor -= 4.50
-                conf_floor -= 4
-                rr_floor -= 0.14
+                score_floor -= 2.75
+                conf_floor -= 2
+                rr_floor -= 0.08
             else:
-                score_floor -= 4.75
-                conf_floor -= 5
-                rr_floor -= 0.18
+                score_floor -= 3.25
+                conf_floor -= 3
+                rr_floor -= 0.10
         elif fam == 'F2_MOMENTUM_IGNITION' and regime == 'EXPANSION':
             if sess == 'NY':
-                score_floor -= 1.50
+                score_floor -= 0.90
                 conf_floor -= 1
-                rr_floor -= 0.03
+                rr_floor -= 0.02
             elif sess == 'LON':
-                score_floor -= 0.50
-                rr_floor -= 0.01
+                score_floor -= 0.25
+                rr_floor -= 0.00
         elif fam == 'F3_IMPULSE_BASE_CONT' and regime in {'EXPANSION', 'SQUEEZE'}:
             if sess == 'NY':
-                score_floor -= 1.25
+                score_floor -= 0.80
                 conf_floor -= 1
-                rr_floor -= 0.03
+                rr_floor -= 0.02
             elif sess == 'LON':
-                score_floor -= 0.40
-                rr_floor -= 0.01
+                score_floor -= 0.20
+                rr_floor -= 0.00
         elif fam == 'F1_PULLBACK_CONT' and 'TREND' in regime and sess == 'LON':
             score_floor += 0.50
             rr_floor += 0.02
 
-        score_floor = float(clamp(score_floor, 58.0 if active_profile.startswith('GLOBAL_') else 62.0, 92.0))
-        conf_floor = int(max(68 if active_profile.startswith('GLOBAL_') else 71, min(95, conf_floor)))
-        rr_floor = float(clamp(rr_floor, 0.98 if active_profile.startswith('GLOBAL_') else 1.08, 2.30))
+        score_floor = float(clamp(score_floor, 60.0 if active_profile.startswith('GLOBAL_') else 62.0, 92.0))
+        conf_floor = int(max(70 if active_profile.startswith('GLOBAL_') else 71, min(95, conf_floor)))
+        rr_floor = float(clamp(rr_floor, 1.05 if active_profile.startswith('GLOBAL_') else 1.08, 2.30))
 
         if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
             pass
@@ -29425,7 +29425,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Open positions now: {int(snap.get('open_positions_now', 0))}",
         f"• Carried from prior day: {int(snap.get('inherited_open_positions', 0))}",
         f"• Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f}",
-        f"• Daily cap: {user.get('daily_cap_mode','PCT')} {float(user.get('daily_cap_value',0.0)):.2f} (≈ ${cap:.2f})",
+        (
+            f"• Daily cap: {'AUTOTRADE' if is_admin else str(user.get('daily_cap_mode','PCT')).upper()} "
+            f"{(float(AUTOTRADE_DAILY_RISK_CAP_PCT) if is_admin else float(user.get('daily_cap_value',0.0))):.2f}"
+            f"{'%' if is_admin else ''} (≈ ${cap:.2f})"
+        ),
         f"• Current-day open risk: ${float(snap.get('current_day_open_risk', 0.0)):.2f}",
         f"• Live open risk charged today: ${float(snap.get('live_open_risk_charged_today', snap.get('current_day_open_risk', 0.0))):.2f}",
         f"• Carried open risk: ${float(snap.get('carried_open_risk', 0.0)):.2f}",
