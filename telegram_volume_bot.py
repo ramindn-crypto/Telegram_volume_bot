@@ -484,38 +484,6 @@ def _goal_profile_quiet_window_ok(now_ts: float | None = None) -> bool:
     except Exception:
         return True
 
-def _maintenance_runtime_ok(now_ts: float | None = None, require_quiet_window: bool = False, user_window_sec: int = 30) -> bool:
-    """Guard background maintenance jobs so they do not steal live runtime capacity."""
-    try:
-        ts = float(now_ts if now_ts is not None else time.time())
-    except Exception:
-        ts = float(time.time())
-    try:
-        if _recent_user_activity(int(user_window_sec or 30)):
-            return False
-    except Exception:
-        pass
-    for _lock_name in ('ALERT_LOCK', 'SCAN_LOCK', '_SCREEN_LOCK'):
-        try:
-            _lock = globals().get(_lock_name)
-            if _lock is not None and getattr(_lock, 'locked', lambda: False)():
-                return False
-        except Exception:
-            continue
-    try:
-        if _backtest_runtime_busy() or _goal_profile_is_running() or (_SELF_OPT_STATE.get('stop_event') is not None):
-            return False
-    except Exception:
-        pass
-    if require_quiet_window:
-        try:
-            if not _goal_profile_quiet_window_ok(ts):
-                return False
-        except Exception:
-            return False
-    return True
-
-
 
 import re
 import sqlite3
@@ -1118,7 +1086,7 @@ SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
 SCREEN_WAITING_N = 10
 
 # EMA proximity gate: never generate setups if price is far from EMA7 (1H)
-EMA7_1H_MAX_DIST_PCT = float(os.environ.get("EMA7_1H_MAX_DIST_PCT", "0.75") or 0.75)  # adaptive base anchor distance (%)
+EMA7_1H_MAX_DIST_PCT = float(os.environ.get("EMA7_1H_MAX_DIST_PCT", "0.95") or 0.95)  # adaptive base anchor distance (%)
 
 # Directional Leaders/Losers thresholds
 MOVER_VOL_USD_MIN = 5_000_000
@@ -1975,12 +1943,12 @@ ENGINE_B_MOMENTUM_ENABLED = True     # pump / expansion
 # =========================================================
 # Base floor (still used), but we now scale it per session:
 TRIGGER_1H_ABS_MIN_BASE = 0.12        # global floor
-CONFIRM_15M_ABS_MIN = 0.25
+CONFIRM_15M_ABS_MIN = 0.18
 ALIGN_4H_MIN = 0.0
 ALIGN_4H_NEUTRAL_ZONE = 0.35  # if |4H| < this, treat regime as neutral (avoid blocking leaders)
 
 # "EARLY" filler (email only)
-EARLY_1H_ABS_MIN = 1.8
+EARLY_1H_ABS_MIN = 1.25
 EARLY_CONF_PENALTY = 3
 EARLY_EMAIL_EXTRA_CONF = 4
 EARLY_EMAIL_MAX_FILL = 1
@@ -6755,15 +6723,15 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 72,
-    "LON": 71,
-    "ASIA": 69,
+    "NY": 70,
+    "LON": 69,
+    "ASIA": 67,
 }
 
 SESSION_MIN_RR_FINAL = {
-    "NY": 1.30,
-    "LON": 1.24,
-    "ASIA": 1.18,
+    "NY": 1.22,
+    "LON": 1.16,
+    "ASIA": 1.10,
 }
 
 SESSION_MIN_RR_TP = SESSION_MIN_RR_FINAL  # legacy compatibility only
@@ -7750,12 +7718,8 @@ def _research_run_daily_refresh(force: bool = False) -> dict:
 
 async def research_regime_refresh_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        if not _maintenance_runtime_ok(time.time(), require_quiet_window=False, user_window_sec=30):
-            return
         best_fut = await to_thread_heavy(fetch_futures_tickers)
         for sess in ('ASIA', 'LON', 'NY'):
-            if not _maintenance_runtime_ok(time.time(), require_quiet_window=False, user_window_sec=30):
-                return
             snap = await to_thread_heavy(_research_market_regime_from_best_fut, best_fut or {}, sess, '4h')
             await to_thread_fast(_research_store_regime_snapshot, snap)
     except Exception:
@@ -7764,8 +7728,6 @@ async def research_regime_refresh_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def research_allocator_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        if not _maintenance_runtime_ok(time.time(), require_quiet_window=False, user_window_sec=30):
-            return
         await to_thread_heavy(_research_run_daily_refresh, True)
     except Exception:
         return
@@ -15383,133 +15345,34 @@ _OHLCV_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 _OHLCV_TF_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 _OHLCV_RATE_LIMIT_WARN_UNTIL: Dict[str, float] = {}
 _OHLCV_LAST_KEY: Dict[str, str] = {}
-_OHLCV_INFLIGHT_EVENTS: Dict[str, threading.Event] = {}
-_OHLCV_INFLIGHT_LOCK = threading.Lock()
 OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "60") or 60)
 OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "90") or 90)
-OHLCV_MAX_CONCURRENT_FETCHES = int(os.getenv("OHLCV_MAX_CONCURRENT_FETCHES", "2") or 2)
-OHLCV_FETCH_SEMAPHORE_TIMEOUT_SEC = float(os.getenv("OHLCV_FETCH_SEMAPHORE_TIMEOUT_SEC", "1.5") or 1.5)
-OHLCV_INFLIGHT_WAIT_SEC = float(os.getenv("OHLCV_INFLIGHT_WAIT_SEC", "1.8") or 1.8)
-OHLCV_TTL_BY_TIMEFRAME_SEC = {
-    '5m': int(os.getenv('OHLCV_TTL_5M_SEC', '90') or 90),
-    '15m': int(os.getenv('OHLCV_TTL_15M_SEC', '150') or 150),
-    '1h': int(os.getenv('OHLCV_TTL_1H_SEC', '420') or 420),
-    '4h': int(os.getenv('OHLCV_TTL_4H_SEC', '900') or 900),
-}
-OHLCV_BUSY_STALE_MAX_AGE_SEC = {
-    '5m': int(os.getenv('OHLCV_BUSY_STALE_5M_SEC', '180') or 180),
-    '15m': int(os.getenv('OHLCV_BUSY_STALE_15M_SEC', '360') or 360),
-    '1h': int(os.getenv('OHLCV_BUSY_STALE_1H_SEC', '1800') or 1800),
-    '4h': int(os.getenv('OHLCV_BUSY_STALE_4H_SEC', '7200') or 7200),
-}
-OHLCV_RATE_LIMIT_COOLDOWN_BY_TIMEFRAME_SEC = {
-    '5m': int(os.getenv('OHLCV_RATE_LIMIT_CD_5M_SEC', '45') or 45),
-    '15m': int(os.getenv('OHLCV_RATE_LIMIT_CD_15M_SEC', '60') or 60),
-    '1h': int(os.getenv('OHLCV_RATE_LIMIT_CD_1H_SEC', '150') or 150),
-    '4h': int(os.getenv('OHLCV_RATE_LIMIT_CD_4H_SEC', '300') or 300),
-}
-_OHLCV_FETCH_SEMAPHORE = threading.BoundedSemaphore(max(1, int(OHLCV_MAX_CONCURRENT_FETCHES or 1)))
 BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC", "6") or 6)
 BYBIT_OPEN_ORDERS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_ORDERS_CACHE_TTL_SEC", "6") or 6)
 SCREEN_DIRECTIONAL_CACHE_TTL_SEC = int(os.getenv("SCREEN_DIRECTIONAL_CACHE_TTL_SEC", "45") or 45)
 
 
 def _ohlcv_best_effort_cached(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
-    """Return the best cached OHLCV rows for a symbol/timeframe even if the exact limit key is cold."""
-    rows, _age = _ohlcv_best_effort_cached_with_age(symbol, timeframe, limit)
-    return list(rows or [])
+    """Return the best cached OHLCV rows for a symbol/timeframe even if the exact limit key is cold.
 
-
-def _ohlcv_cache_age_sec(key: str) -> float:
+    This prevents setup generation from collapsing into ohlcv_missing_or_insufficient when one exact
+    cache key was rate-limited but another nearby key already exists.
+    """
     try:
-        v = _CACHE.get(str(key))
-        if not v:
-            return 1e12
-        ts, _obj = v
-        return max(0.0, float(time.time()) - float(ts or 0.0))
-    except Exception:
-        return 1e12
-
-
-def _ohlcv_ttl_for_timeframe(timeframe: str) -> int:
-    tf = str(timeframe or '').lower().strip() or 'na'
-    try:
-        return int(OHLCV_TTL_BY_TIMEFRAME_SEC.get(tf, OHLCV_TTL_SEC) or OHLCV_TTL_SEC)
-    except Exception:
-        return int(OHLCV_TTL_SEC)
-
-
-def _ohlcv_busy_stale_max_age_sec(timeframe: str) -> int:
-    tf = str(timeframe or '').lower().strip() or 'na'
-    try:
-        return int(OHLCV_BUSY_STALE_MAX_AGE_SEC.get(tf, max(3 * int(OHLCV_TTL_SEC), 300)) or max(3 * int(OHLCV_TTL_SEC), 300))
-    except Exception:
-        return max(3 * int(OHLCV_TTL_SEC), 300)
-
-
-def _ohlcv_rate_limit_cooldown_sec(timeframe: str) -> float:
-    tf = str(timeframe or '').lower().strip() or 'na'
-    try:
-        base = float(OHLCV_RATE_LIMIT_COOLDOWN_BY_TIMEFRAME_SEC.get(tf, OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC) or OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC)
-    except Exception:
-        base = float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 60.0)
-    return max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 20.0), float(base or 0.0))
-
-
-def _ohlcv_inflight_bucket(symbol: str, timeframe: str) -> str:
-    try:
-        return f"{str(symbol or '').upper()}|{str(timeframe or '').lower().strip() or 'na'}"
-    except Exception:
-        return f"{symbol}|{timeframe}"
-
-
-def _ohlcv_try_join_inflight(symbol: str, timeframe: str) -> tuple[bool, threading.Event | None]:
-    bucket = _ohlcv_inflight_bucket(symbol, timeframe)
-    with _OHLCV_INFLIGHT_LOCK:
-        ev = _OHLCV_INFLIGHT_EVENTS.get(bucket)
-        if ev is not None:
-            return False, ev
-        ev = threading.Event()
-        _OHLCV_INFLIGHT_EVENTS[bucket] = ev
-        return True, ev
-
-
-def _ohlcv_finish_inflight(symbol: str, timeframe: str, ev: threading.Event | None) -> None:
-    try:
-        if ev is not None:
-            ev.set()
-    except Exception:
-        pass
-    try:
-        bucket = _ohlcv_inflight_bucket(symbol, timeframe)
-        with _OHLCV_INFLIGHT_LOCK:
-            cur = _OHLCV_INFLIGHT_EVENTS.get(bucket)
-            if cur is ev:
-                _OHLCV_INFLIGHT_EVENTS.pop(bucket, None)
-    except Exception:
-        pass
-
-
-def _ohlcv_best_effort_cached_with_age(symbol: str, timeframe: str, limit: int) -> tuple[List[List[float]], float]:
-    best = []
-    best_age = 1e12
-    best_len = 0
-    exact_key = f"ohlcv:{symbol}:{timeframe}:{limit}"
-    try:
-        exact = cache_get(exact_key)
+        exact = cache_get(f"ohlcv:{symbol}:{timeframe}:{limit}")
         if isinstance(exact, list) and exact:
-            return (exact[-int(limit):] if len(exact) > int(limit) else exact, _ohlcv_cache_age_sec(exact_key))
+            return exact[-int(limit):] if len(exact) > int(limit) else exact
     except Exception:
         pass
+    best = []
+    best_len = 0
     try:
         lk = _OHLCV_LAST_KEY.get(f"{symbol}|{timeframe}")
         if lk:
             rows = cache_get(lk)
-            age = _ohlcv_cache_age_sec(lk)
-            if isinstance(rows, list) and (len(rows) > best_len or (len(rows) == best_len and age < best_age)):
+            if isinstance(rows, list) and len(rows) > best_len:
                 best = rows
                 best_len = len(rows)
-                best_age = age
     except Exception:
         pass
     prefix = f"ohlcv:{symbol}:{timeframe}:"
@@ -15517,90 +15380,35 @@ def _ohlcv_best_effort_cached_with_age(symbol: str, timeframe: str, limit: int) 
         for k, (_ts, rows) in list(_CACHE.items()):
             if not str(k).startswith(prefix):
                 continue
-            age = _ohlcv_cache_age_sec(k)
-            if isinstance(rows, list) and (len(rows) > best_len or (len(rows) == best_len and age < best_age)):
+            if isinstance(rows, list) and len(rows) > best_len:
                 best = rows
                 best_len = len(rows)
-                best_age = age
     except Exception:
         pass
     if isinstance(best, list) and best:
-        return (best[-int(limit):] if len(best) > int(limit) else best, float(best_age))
-    return ([], 1e12)
+        return best[-int(limit):] if len(best) > int(limit) else best
+    return []
 
 
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     """
     Singleton + TTL cached OHLCV fetch.
 
-    Performance hardening:
-    - use timeframe-aware TTLs so 1H/4H candles are not refetched every live cycle
-    - prefer recent stale cache while heavy background work is active
-    - cap concurrent network OHLCV calls so Render does not hammer Bybit and stall user commands
+    Production hardening:
+    - never let a Bybit rate-limit exception crash /screen or other jobs
+    - when the request was recently rate-limited, serve stale cache (if any) instead of hammering Bybit again
     - on transient failures, prefer stale cache over raising
     """
     key = f"ohlcv:{symbol}:{timeframe}:{limit}"
-    tf_key = str(timeframe or '').lower().strip() or 'na'
-    ttl = int(_ohlcv_ttl_for_timeframe(tf_key))
-    if cache_valid(key, ttl):
+    if cache_valid(key, OHLCV_TTL_SEC):
         return cache_get(key)
 
     now_ts = float(time.time())
-    stale, stale_age = _ohlcv_best_effort_cached_with_age(symbol, timeframe, limit)
-
-    busy_runtime = False
-    try:
-        if _recent_user_activity(18):
-            busy_runtime = True
-    except Exception:
-        pass
-    try:
-        if _backtest_runtime_busy() or _goal_profile_is_running():
-            busy_runtime = True
-    except Exception:
-        pass
-    for _lock_name in ('ALERT_LOCK', 'SCAN_LOCK', '_SCREEN_LOCK'):
-        try:
-            _lock = globals().get(_lock_name)
-            if _lock is not None and getattr(_lock, 'locked', lambda: False)():
-                busy_runtime = True
-                break
-        except Exception:
-            continue
-
+    tf_key = str(timeframe or '').lower().strip() or 'na'
     cool_until = float(_OHLCV_RATE_LIMIT_UNTIL.get(key) or 0.0)
     tf_cool_until = float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0)
     if cool_until > now_ts or tf_cool_until > now_ts:
-        return stale if isinstance(stale, list) else []
-
-    if isinstance(stale, list) and stale and busy_runtime and float(stale_age) <= float(_ohlcv_busy_stale_max_age_sec(tf_key)):
-        return stale
-
-    i_am_leader, inflight_ev = _ohlcv_try_join_inflight(symbol, tf_key)
-    if not i_am_leader:
-        wait_sec = max(0.35, float(OHLCV_INFLIGHT_WAIT_SEC or 1.8) * (0.75 if stale else 1.5))
-        try:
-            inflight_ev.wait(timeout=wait_sec)
-        except Exception:
-            pass
-        if cache_valid(key, ttl):
-            return cache_get(key)
-        joined_stale, joined_age = _ohlcv_best_effort_cached_with_age(symbol, timeframe, limit)
-        if isinstance(joined_stale, list) and joined_stale:
-            if float(joined_age) <= float(_ohlcv_busy_stale_max_age_sec(tf_key)) or busy_runtime:
-                return joined_stale
-        if cool_until > float(time.time()) or float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0) > float(time.time()):
-            return joined_stale if isinstance(joined_stale, list) else []
-
-    acquired = False
-    timeout_sec = max(0.25, float(OHLCV_FETCH_SEMAPHORE_TIMEOUT_SEC or 1.5) * (1.0 if stale else 4.0))
-    try:
-        acquired = bool(_OHLCV_FETCH_SEMAPHORE.acquire(timeout=timeout_sec))
-    except Exception:
-        acquired = True
-    if not acquired:
-        if i_am_leader:
-            _ohlcv_finish_inflight(symbol, tf_key, inflight_ev)
+        stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
         return stale if isinstance(stale, list) else []
 
     ex = get_exchange()
@@ -15619,9 +15427,8 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         name = type(e).__name__
         msg = str(e or '')
         if 'RateLimitExceeded' in name or '10006' in msg or 'rate limit' in msg.lower() or 'too many visits' in msg.lower():
-            base_cd = float(_ohlcv_rate_limit_cooldown_sec(tf_key) or 20.0)
-            key_cd = max(12.0, min(float(ttl), max(base_cd * 1.25, 45.0)))
-            tf_cd = max(base_cd, min(key_cd, float(_ohlcv_busy_stale_max_age_sec(tf_key))))
+            key_cd = max(3.0, float(OHLCV_TTL_SEC))
+            tf_cd = max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 20.0), min(key_cd, 30.0))
             _OHLCV_RATE_LIMIT_UNTIL[key] = now_ts + key_cd
             _OHLCV_TF_RATE_LIMIT_UNTIL[tf_key] = max(float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0), now_ts + tf_cd)
             warn_key = f'{tf_key}:rate_limit'
@@ -15631,15 +15438,10 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
                     logger.warning('fetch_ohlcv rate-limited for %s %s x%s; cooling %ss and using stale cache if available', symbol, timeframe, limit, int(tf_cd))
                 except Exception:
                     pass
-        return stale if isinstance(stale, list) else []
-    finally:
-        if acquired:
-            try:
-                _OHLCV_FETCH_SEMAPHORE.release()
-            except Exception:
-                pass
-        if i_am_leader:
-            _ohlcv_finish_inflight(symbol, tf_key, inflight_ev)
+        stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
+        if isinstance(stale, list):
+            return stale
+        return []
 
 
 def ema7_1h_distance_pct(market_symbol: str) -> Tuple[float, float, float]:
@@ -22269,14 +22071,10 @@ def _autonomous_opt_should_run() -> tuple[bool, str]:
 
 async def _refresh_universe_backtests_for_autopilot() -> None:
     try:
-        now_ts = float(time.time())
-        if not _maintenance_runtime_ok(now_ts, require_quiet_window=True, user_window_sec=60):
-            return
         cfg = load_strategy_config(force=False)
         windows = list(cfg.get('universe_backtest_windows') or [7, 30])
         tf = str(cfg.get('universe_backtest_exec_tf') or cfg.get('exec_tf_default') or '15m')
         top_n = int(cfg.get('universe_backtest_top_n', 80) or 80)
-        top_n = min(top_n, int(os.getenv('AUTOPILOT_UNIVERSE_BACKTEST_TOP_N_CAP', '60') or 60))
         for d in windows[:4]:
             try:
                 dd = int(d or 0)
@@ -22288,8 +22086,6 @@ async def _refresh_universe_backtests_for_autopilot() -> None:
             age_h = (time.time() - float(last.get('created_ts', 0.0) or 0.0)) / 3600.0 if last else 1e9
             if age_h <= 6.0:
                 continue
-            if not _maintenance_runtime_ok(time.time(), require_quiet_window=True, user_window_sec=60):
-                return
             await to_thread_heavy(run_universe_backtest, dd, 'ALL', tf, top_n, None, True, True)
     except Exception:
         return
@@ -22971,8 +22767,6 @@ def _run_market_adaptive_cycle(force: bool = False) -> dict:
 
 async def market_adaptive_daily_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        if not _maintenance_runtime_ok(time.time(), require_quiet_window=True, user_window_sec=45):
-            return
         _hb_touch('market_adaptive', ok=True, details='cycle_start')
         res = await to_thread_heavy(_run_market_adaptive_cycle)
         if isinstance(res, dict) and res.get('ok'):
@@ -23136,8 +22930,6 @@ async def market_adaptive_run_cmd(update: Update, context: ContextTypes.DEFAULT_
 
 async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
     """Internal autonomous optimizer. No manual trigger required."""
-    if not _maintenance_runtime_ok(time.time(), require_quiet_window=True, user_window_sec=60):
-        return
     await _refresh_universe_backtests_for_autopilot()
     should_run, reason = _autonomous_opt_should_run()
     if not should_run:
@@ -23937,8 +23729,18 @@ async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_
     rep = load_goal_profile_report() or {}
     final = rep.get('final') or {}
     current = rep.get('current') or {}
-    m30 = final.get('metrics_30d') or {}
-    m7 = final.get('metrics_7d') or {}
+    m30 = dict(final.get('metrics_30d') or {})
+    m7 = dict(final.get('metrics_7d') or {})
+    _goal_status_u = str(rep.get('status') or '').upper().strip()
+    _goal_metrics_missing = (int(m30.get('setups', 0) or 0) <= 0 and int(m7.get('setups', 0) or 0) <= 0)
+    if _goal_metrics_missing and _goal_status_u in {'TIMEOUT_NO_BETTER_PROFILE', 'TIMEOUT', 'NO_BETTER_PROFILE', 'TIMEOUT_PROMOTED'}:
+        _last_final = dict(rep.get('last_final') or {})
+        _lf_final = dict(_last_final.get('final') or {})
+        _m30_fallback = dict(_lf_final.get('metrics_30d') or {})
+        _m7_fallback = dict(_lf_final.get('metrics_7d') or {})
+        if _m30_fallback or _m7_fallback:
+            m30 = _m30_fallback or m30
+            m7 = _m7_fallback or m7
     current_profile = str(cfg.get('goal_profile_active_profile') or current.get('goal_profile_active_profile') or 'BASELINE')
     current_sessions = ','.join(cfg.get('execution_sessions_allowed') or current.get('execution_sessions_allowed') or []) or '-'
     current_engines = ','.join(cfg.get('execution_engines_allowed') or current.get('execution_engines_allowed') or []) or '-'
@@ -23984,6 +23786,8 @@ async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_
         elif final:
             lines.append(f"30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}")
             lines.append(f"7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}")
+        if _goal_metrics_missing and _goal_status_u in {'TIMEOUT_NO_BETTER_PROFILE', 'TIMEOUT', 'NO_BETTER_PROFILE', 'TIMEOUT_PROMOTED'} and (int(m30.get('setups', 0) or 0) > 0 or int(m7.get('setups', 0) or 0) > 0):
+            lines.append('Note: showing the last finalized goal-profile metrics because the most recent run did not produce a valid finalized sample.')
         if rep.get('error') and str(rep.get('status') or '').upper().strip() not in {'TIMEOUT_PROMOTED', 'TIMEOUT_NO_BETTER_PROFILE'}:
             lines.append(f"Error: {rep.get('error')}")
     await send_long_message(update, '\n'.join(lines), parse_mode=None)
@@ -24199,8 +24003,6 @@ def _run_family_autotune_cycle(force: bool = False) -> dict:
 
 
 async def family_autotune_job(context: ContextTypes.DEFAULT_TYPE):
-    if not _maintenance_runtime_ok(time.time(), require_quiet_window=True, user_window_sec=45):
-        return
     await to_thread_heavy(_run_family_autotune_cycle)
 
 
@@ -24267,21 +24069,21 @@ async def research_framework_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
 def _session_entry_quality_limits(session_name: str, source: str = 'email') -> dict:
     sess = str(session_name or '').upper().strip() or 'NY'
     base = {
-        'NY': {'max_pb_ema_dist': 0.66, 'max_ch15_abs': 0.58, 'max_ch1_abs': 1.22, 'max_atr_pct': 4.4},
-        'LON': {'max_pb_ema_dist': 0.68, 'max_ch15_abs': 0.58, 'max_ch1_abs': 1.22, 'max_atr_pct': 4.8},
-        'ASIA': {'max_pb_ema_dist': 0.54, 'max_ch15_abs': 0.46, 'max_ch1_abs': 1.00, 'max_atr_pct': 3.8},
-    }.get(sess, {'max_pb_ema_dist': 0.58, 'max_ch15_abs': 0.50, 'max_ch1_abs': 1.08, 'max_atr_pct': 4.2}).copy()
+        'NY': {'max_pb_ema_dist': 0.76, 'max_ch15_abs': 0.70, 'max_ch1_abs': 1.38, 'max_atr_pct': 5.1},
+        'LON': {'max_pb_ema_dist': 0.78, 'max_ch15_abs': 0.70, 'max_ch1_abs': 1.38, 'max_atr_pct': 5.4},
+        'ASIA': {'max_pb_ema_dist': 0.62, 'max_ch15_abs': 0.54, 'max_ch1_abs': 1.12, 'max_atr_pct': 4.2},
+    }.get(sess, {'max_pb_ema_dist': 0.66, 'max_ch15_abs': 0.58, 'max_ch1_abs': 1.20, 'max_atr_pct': 4.6}).copy()
     src = str(source or '').strip().lower()
     if src == 'screen':
-        base['max_pb_ema_dist'] *= (1.07 if sess != 'ASIA' else 1.04)
-        base['max_ch15_abs'] *= (1.05 if sess != 'ASIA' else 1.03)
-        base['max_ch1_abs'] *= (1.05 if sess != 'ASIA' else 1.03)
-        base['max_atr_pct'] *= (1.04 if sess != 'ASIA' else 1.02)
+        base['max_pb_ema_dist'] *= (1.10 if sess != 'ASIA' else 1.06)
+        base['max_ch15_abs'] *= (1.08 if sess != 'ASIA' else 1.04)
+        base['max_ch1_abs'] *= (1.08 if sess != 'ASIA' else 1.04)
+        base['max_atr_pct'] *= (1.06 if sess != 'ASIA' else 1.03)
     elif src == 'exec':
-        base['max_pb_ema_dist'] *= (1.05 if sess == 'LON' else (1.03 if sess != 'ASIA' else 1.01))
-        base['max_ch15_abs'] *= (1.05 if sess == 'LON' else (1.02 if sess != 'ASIA' else 1.01))
-        base['max_ch1_abs'] *= (1.04 if sess == 'LON' else (1.02 if sess != 'ASIA' else 1.01))
-        base['max_atr_pct'] *= (1.03 if sess == 'LON' else (1.02 if sess != 'ASIA' else 1.01))
+        base['max_pb_ema_dist'] *= (1.08 if sess == 'LON' else (1.05 if sess != 'ASIA' else 1.03))
+        base['max_ch15_abs'] *= (1.08 if sess == 'LON' else (1.04 if sess != 'ASIA' else 1.02))
+        base['max_ch1_abs'] *= (1.07 if sess == 'LON' else (1.04 if sess != 'ASIA' else 1.02))
+        base['max_atr_pct'] *= (1.05 if sess == 'LON' else (1.03 if sess != 'ASIA' else 1.02))
     return base
 
 
@@ -24456,7 +24258,7 @@ def is_top_setup_eligible(
                 min_score += (1.5 if sess != 'ASIA' else 2.0) + engine_c_base_score_add
         elif src == 'exec':
             if engine == 'A':
-                min_score += -0.25 if sess == 'LON' else (0.50 if sess == 'NY' else 0.75)
+                min_score += -0.75 if sess == 'LON' else (-0.10 if sess == 'NY' else 0.35)
             elif engine == 'B':
                 min_score += 1.5 if sess in {'NY', 'ASIA'} else 1.0
             elif engine == 'C':
@@ -24530,11 +24332,11 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 70.5, 74, 1.24
+        quality, conf, rr = 68.5, 72, 1.18
     elif sess == "LON":
-        quality, conf, rr = 68.0, 72, 1.16
+        quality, conf, rr = 66.5, 70, 1.12
     elif sess == "ASIA":
-        quality, conf, rr = 67.0, 71, 1.12
+        quality, conf, rr = 65.5, 69, 1.08
     else:
         quality, conf, rr = 71.0, 74, 1.24
 
@@ -24634,9 +24436,9 @@ def is_executable_setup_eligible(
                 conf_floor = max((72 if reach_mode else 74), conf_floor)
                 rr_floor = max((1.12 if reach_mode else 1.22), rr_floor)
             elif sess == 'NY':
-                score_floor = max(73.5, score_floor)
-                conf_floor = max(74, conf_floor)
-                rr_floor = max(1.26, rr_floor)
+                score_floor = max(71.0, score_floor)
+                conf_floor = max(72, conf_floor)
+                rr_floor = max(1.18, rr_floor)
             else:
                 score_floor = max(72.5, score_floor)
                 conf_floor = max(74, conf_floor)
@@ -24779,11 +24581,11 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.68, 7_500_000.0)):
                     return (False, "ny_below_liquidity")
             else:
-                if pb_dist > 0.92:
+                if pb_dist > 1.06:
                     return (False, "ny_entry_too_far_from_ema")
-                if ch15_abs > 1.00 or (ch15_abs > 0.86 and ch1_abs > 1.82):
+                if ch15_abs > 1.12 or (ch15_abs > 0.94 and ch1_abs > 1.96):
                     return (False, "ny_late_extension_exec")
-                if ch4_abs < 0.46 or ch1_abs < 0.18:
+                if ch4_abs < 0.36 or ch1_abs < 0.10:
                     return (False, "ny_context_too_weak_exec")
                 if fut_vol < max(MIN_FUT_VOL_USD * 0.74, 7_500_000.0):
                     return (False, "ny_below_liquidity")
@@ -24798,11 +24600,11 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.66, 7_000_000.0)):
                     return (False, "lon_below_liquidity")
             else:
-                lon_pb_max = 0.84 if reach_mode else 0.74
-                lon_ch15_cap = 0.78 if reach_mode else 0.64
-                lon_ch1_cap = 1.48 if reach_mode else 1.30
-                lon_ctx_ch4_min = 0.32 if reach_mode else 0.40
-                lon_ctx_ch1_min = 0.10 if reach_mode else 0.16
+                lon_pb_max = 0.90 if reach_mode else 0.82
+                lon_ch15_cap = 0.86 if reach_mode else 0.74
+                lon_ch1_cap = 1.60 if reach_mode else 1.42
+                lon_ctx_ch4_min = 0.24 if reach_mode else 0.34
+                lon_ctx_ch1_min = 0.06 if reach_mode else 0.10
                 lon_liq_floor = max(MIN_FUT_VOL_USD * (0.72 if reach_mode else 0.80), 7_000_000.0 if reach_mode else 8_500_000.0)
                 if engine == 'C':
                     lon_pb_max = max(lon_pb_max, engine_c_exec_pb_dist_lon)
@@ -25912,8 +25714,8 @@ def make_setup(
                     sess_min = min(int(sess_min), 52)
                 else:
                     sess_min = min(int(sess_min), 54)
-            if str(session_name or '').upper() == 'NY' and require_pullback and family_id_hint != 'F4_SWEEP_RECLAIM':
-                sess_min = max(int(sess_min), int(_session_generation_conf_floor('NY')) + 2)
+            if str(session_name or '').upper() == 'NY' and require_pullback and family_id_hint not in {'F4_SWEEP_RECLAIM', 'F1_PULLBACK_CONT', 'F3_IMPULSE_BASE_CONT'}:
+                sess_min = max(int(sess_min), int(_session_generation_conf_floor('NY')) + 1)
             if int(conf) < int(sess_min):
                 _rej("below_min_confidence", base, mv, f"conf={int(conf)} min={int(sess_min)} sess={session_name}")
                 return None
@@ -26171,13 +25973,13 @@ def make_breakout_setup(
                     else:
                         _rej("no_breakout_trigger", base, mv)
                         return None
-                elif trend_up and float(ch24 or 0.0) >= (2.8 if str(session_name).upper() == 'ASIA' else 3.6) and float(ch4_used or 0.0) >= (0.10 if str(session_name).upper() == 'ASIA' else 0.28) and (float(ch1 or 0.0) >= (-0.45 if str(session_name).upper() == 'ASIA' else -0.30) or float(ch15 or 0.0) >= (-0.30 if str(session_name).upper() == 'ASIA' else -0.20)):
+                elif trend_up and float(ch24 or 0.0) >= (2.4 if str(session_name).upper() == 'ASIA' else 2.8) and float(ch4_used or 0.0) >= (0.06 if str(session_name).upper() == 'ASIA' else 0.16) and (float(ch1 or 0.0) >= (-0.60 if str(session_name).upper() == 'ASIA' else -0.45) or float(ch15 or 0.0) >= (-0.42 if str(session_name).upper() == 'ASIA' else -0.30)):
                     # Trend-continuation soft path: permit F1/F3 style continuation candidates even without a fresh HH breakout.
                     side = "BUY"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) >= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_buy')
                     conf = max(0.0, float(conf) - 0.5)
-                elif trend_dn and float(ch24 or 0.0) <= (-2.8 if str(session_name).upper() == 'ASIA' else -3.6) and float(ch4_used or 0.0) <= (-0.10 if str(session_name).upper() == 'ASIA' else -0.28) and (float(ch1 or 0.0) <= (0.45 if str(session_name).upper() == 'ASIA' else 0.30) or float(ch15 or 0.0) <= (0.30 if str(session_name).upper() == 'ASIA' else 0.20)):
+                elif trend_dn and float(ch24 or 0.0) <= (-2.4 if str(session_name).upper() == 'ASIA' else -2.8) and float(ch4_used or 0.0) <= (-0.06 if str(session_name).upper() == 'ASIA' else -0.16) and (float(ch1 or 0.0) <= (0.60 if str(session_name).upper() == 'ASIA' else 0.45) or float(ch15 or 0.0) <= (0.42 if str(session_name).upper() == 'ASIA' else 0.30)):
                     side = "SELL"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) <= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_sell')
@@ -34270,6 +34072,26 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             cache_age = float(time.time()) - float(cache_entry.get('ts') or 0.0)
             cached_setups = list(cache_entry.get('setups') or []) if cache_entry else []
 
+            # Authoritative source first: persisted executable queue for this session.
+            # This prevents transient rebuild droughts from suppressing email/autotrade when
+            # executable setups were already produced in a recent prior cycle.
+            try:
+                exec_rows_cached = db_list_executable_setups(0, session_name=str(sess_name or ''), ts_from=float(time.time() - 7200), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
+            except Exception:
+                exec_rows_cached = []
+            try:
+                persisted_setups = _executable_rows_to_setup_objects(list(exec_rows_cached or []), session_name=str(sess_name or ''))
+            except Exception:
+                persisted_setups = []
+            persisted_setups = [s for s in (persisted_setups or []) if s is not None]
+            if persisted_setups:
+                try:
+                    db_log_setup_pipeline_event(0, stage='email_pool_session_db', status='ok', session=str(sess_name or ''), mode='email', details={'setups': len(persisted_setups or []), 'source': 'exec_db_2h'})
+                except Exception:
+                    pass
+                _email_pool_cache_set(sess_name, persisted_setups)
+                return str(sess_name).upper(), list(persisted_setups or [])
+
             # Cache-first: avoid rebuilding the full email pool every cycle when a recent
             # authoritative session pool already exists. Under runtime pressure, prefer
             # reusing cache over starting another expensive scan.
@@ -34396,13 +34218,6 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             sess_name = str(sess.get("name") or "").upper()
             display_sess = sess_name
             setups_all = setups_by_session.get(sess_name, []) or []
-            if not setups_all:
-                _LAST_EMAIL_DECISION[uid] = {
-                    "status": "SKIP",
-                    "reasons": [f"no_setups_generated_for_session ({display_sess})"],
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                }
-                continue
 
             # state init must not crash job
             try:
@@ -34546,7 +34361,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='empty', session=str(sess_name or ''), mode='email', details={'eligible': 0, 'persisted': persisted_count, 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
-                    "reasons": ["no_setups_after_filters", f"top_reasons={top_reasons}"],
+                    "reasons": ([f"no_setups_generated_for_session ({display_sess})"] if not setups_all else ["no_setups_after_filters"]) + [f"top_reasons={top_reasons}"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
@@ -35169,6 +34984,15 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     goal_ts = float(goal_rep.get('ts', 0.0) or 0.0)
     goal_ts_txt = _fmt_dt_local(datetime.fromtimestamp(goal_ts, tz=timezone.utc)) if goal_ts > 0 else '—'
+    _goal_final = dict((goal_rep or {}).get('final') or {})
+    m30 = dict(_goal_final.get('metrics_30d') or {})
+    m7 = dict(_goal_final.get('metrics_7d') or {})
+    _goal_status_u = str((goal_rep or {}).get('status') or '').upper().strip()
+    if int(m30.get('setups', 0) or 0) <= 0 and int(m7.get('setups', 0) or 0) <= 0 and _goal_status_u in {'TIMEOUT_NO_BETTER_PROFILE', 'TIMEOUT', 'NO_BETTER_PROFILE', 'TIMEOUT_PROMOTED'}:
+        _last_final = dict((goal_rep or {}).get('last_final') or {})
+        _lf_final = dict(_last_final.get('final') or {})
+        m30 = dict(_lf_final.get('metrics_30d') or m30)
+        m7 = dict(_lf_final.get('metrics_7d') or m7)
     ad_last = dict(adaptive.get('last_run') or {})
     ad_last_ts = float(ad_last.get('finished_ts', 0.0) or ad_last.get('started_ts', 0.0) or 0.0)
     ad_last_txt = _fmt_dt_local(datetime.fromtimestamp(ad_last_ts, tz=timezone.utc)) if ad_last_ts > 0 else '—'
