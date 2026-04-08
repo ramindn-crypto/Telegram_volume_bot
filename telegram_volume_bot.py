@@ -6741,15 +6741,15 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 72,
-    "LON": 71,
-    "ASIA": 69,
+    "NY": 70,
+    "LON": 69,
+    "ASIA": 67,
 }
 
 SESSION_MIN_RR_FINAL = {
-    "NY": 1.30,
-    "LON": 1.24,
-    "ASIA": 1.18,
+    "NY": 1.22,
+    "LON": 1.16,
+    "ASIA": 1.12,
 }
 
 SESSION_MIN_RR_TP = SESSION_MIN_RR_FINAL  # legacy compatibility only
@@ -23716,6 +23716,21 @@ async def goal_profile_run_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     final = rep.get('final') or {}
     m30 = final.get('metrics_30d') or {}
     m7 = final.get('metrics_7d') or {}
+    last_final = dict(rep.get('last_final') or {})
+    last_final_final = dict((last_final.get('final') or {}))
+    last_final_30 = dict(last_final_final.get('metrics_30d') or {})
+    last_final_7 = dict(last_final_final.get('metrics_7d') or {})
+    try:
+        current_setups = int(m30.get('setups', 0) or 0) + int(m7.get('setups', 0) or 0)
+    except Exception:
+        current_setups = 0
+    try:
+        prev_setups = int(last_final_30.get('setups', 0) or 0) + int(last_final_7.get('setups', 0) or 0)
+    except Exception:
+        prev_setups = 0
+    if current_setups <= 0 and prev_setups > 0 and str(rep.get('status') or '').upper().strip() in {'TIMEOUT_NO_BETTER_PROFILE', 'ERROR', 'ABORTED'}:
+        m30 = last_final_30 or m30
+        m7 = last_final_7 or m7
     lines = [
         '🎯 Goal-Profile Optimizer',
         HDR,
@@ -23746,6 +23761,21 @@ async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_
     current = rep.get('current') or {}
     m30 = final.get('metrics_30d') or {}
     m7 = final.get('metrics_7d') or {}
+    last_final = dict(rep.get('last_final') or {})
+    last_final_final = dict((last_final.get('final') or {}))
+    last_final_30 = dict(last_final_final.get('metrics_30d') or {})
+    last_final_7 = dict(last_final_final.get('metrics_7d') or {})
+    try:
+        current_setups = int(m30.get('setups', 0) or 0) + int(m7.get('setups', 0) or 0)
+    except Exception:
+        current_setups = 0
+    try:
+        prev_setups = int(last_final_30.get('setups', 0) or 0) + int(last_final_7.get('setups', 0) or 0)
+    except Exception:
+        prev_setups = 0
+    if current_setups <= 0 and prev_setups > 0 and str(rep.get('status') or '').upper().strip() in {'TIMEOUT_NO_BETTER_PROFILE', 'ERROR', 'ABORTED'}:
+        m30 = last_final_30 or m30
+        m7 = last_final_7 or m7
     current_profile = str(cfg.get('goal_profile_active_profile') or current.get('goal_profile_active_profile') or 'BASELINE')
     current_sessions = ','.join(cfg.get('execution_sessions_allowed') or current.get('execution_sessions_allowed') or []) or '-'
     current_engines = ','.join(cfg.get('execution_engines_allowed') or current.get('execution_engines_allowed') or []) or '-'
@@ -23791,6 +23821,8 @@ async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_
         elif final:
             lines.append(f"30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}")
             lines.append(f"7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}")
+            if current_setups <= 0 and prev_setups > 0 and str(rep.get('status') or '').upper().strip() in {'TIMEOUT_NO_BETTER_PROFILE', 'ERROR', 'ABORTED'}:
+                lines.append("Note: showing the last finalized goal-profile metrics because the most recent run did not produce a valid finalized sample.")
         if rep.get('error') and str(rep.get('status') or '').upper().strip() not in {'TIMEOUT_PROMOTED', 'TIMEOUT_NO_BETTER_PROFILE'}:
             lines.append(f"Error: {rep.get('error')}")
     await send_long_message(update, '\n'.join(lines), parse_mode=None)
@@ -24336,11 +24368,11 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 68.5, 72, 1.18
+        quality, conf, rr = 67.0, 70, 1.12
     elif sess == "LON":
-        quality, conf, rr = 65.5, 70, 1.08
+        quality, conf, rr = 64.0, 68, 1.04
     elif sess == "ASIA":
-        quality, conf, rr = 65.0, 69, 1.06
+        quality, conf, rr = 63.5, 67, 1.02
     else:
         quality, conf, rr = 69.0, 72, 1.18
 
@@ -25977,13 +26009,13 @@ def make_breakout_setup(
                     else:
                         _rej("no_breakout_trigger", base, mv)
                         return None
-                elif trend_up and float(ch24 or 0.0) >= (2.4 if str(session_name).upper() == 'ASIA' else 3.0) and float(ch4_used or 0.0) >= (0.08 if str(session_name).upper() == 'ASIA' else 0.18) and (float(ch1 or 0.0) >= (-0.55 if str(session_name).upper() == 'ASIA' else -0.40) or float(ch15 or 0.0) >= (-0.36 if str(session_name).upper() == 'ASIA' else -0.28)):
+                elif trend_up and float(ch24 or 0.0) >= (2.2 if str(session_name).upper() == 'ASIA' else 2.6) and float(ch4_used or 0.0) >= (0.06 if str(session_name).upper() == 'ASIA' else 0.12) and (float(ch1 or 0.0) >= (-0.65 if str(session_name).upper() == 'ASIA' else -0.50) or float(ch15 or 0.0) >= (-0.44 if str(session_name).upper() == 'ASIA' else -0.34)):
                     # Trend-continuation soft path: permit F1/F3 style continuation candidates even without a fresh HH breakout.
                     side = "BUY"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) >= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_buy')
                     conf = max(0.0, float(conf) - 0.5)
-                elif trend_dn and float(ch24 or 0.0) <= (-2.4 if str(session_name).upper() == 'ASIA' else -3.0) and float(ch4_used or 0.0) <= (-0.08 if str(session_name).upper() == 'ASIA' else -0.18) and (float(ch1 or 0.0) <= (0.55 if str(session_name).upper() == 'ASIA' else 0.40) or float(ch15 or 0.0) <= (0.36 if str(session_name).upper() == 'ASIA' else 0.28)):
+                elif trend_dn and float(ch24 or 0.0) <= (-2.2 if str(session_name).upper() == 'ASIA' else -2.6) and float(ch4_used or 0.0) <= (-0.06 if str(session_name).upper() == 'ASIA' else -0.12) and (float(ch1 or 0.0) <= (0.65 if str(session_name).upper() == 'ASIA' else 0.50) or float(ch15 or 0.0) <= (0.44 if str(session_name).upper() == 'ASIA' else 0.34)):
                     side = "SELL"
                     family_id_hint = family_id_hint or ('F1_PULLBACK_CONT' if float(ch1 or 0.0) <= 0 else 'F3_IMPULSE_BASE_CONT')
                     notes.append('🟡 trend_no_breakout_soft_sell')
@@ -31369,26 +31401,29 @@ def _adaptive_ema_anchor_limit_pct(setup: "Setup", session_name: str, fallback_a
         base = float(fallback_allowed or EMA_ANCHOR_BASE_MAX_DIST_PCT or 0.80)
 
         if engine == "B":
-            limit = max(base, 0.82 + min(1.18, atr_pct * 0.24))
+            limit = max(base, 0.88 + min(1.28, atr_pct * 0.26))
         elif engine == "A":
-            limit = max(base, 0.62 + min(0.85, atr_pct * 0.20))
+            limit = max(base, 0.68 + min(0.95, atr_pct * 0.22))
         elif engine == "C":
-            limit = max(base, 0.72 + min(1.02, atr_pct * 0.22))
+            limit = max(base, 0.78 + min(1.08, atr_pct * 0.24))
         else:
-            limit = max(base, 0.66 + min(0.92, atr_pct * 0.22))
+            limit = max(base, 0.72 + min(0.98, atr_pct * 0.24))
 
         fam = str(getattr(setup, "family_id", "") or _family_id_from_engine(engine, setup)).upper().strip()
 
         if sess == "ASIA":
             # ASIA was still over-tight even after the dynamic anchor migration.
             # Keep it disciplined, but stop shrinking the limit below the adaptive base.
-            limit *= 1.06 if fam in {"F1_PULLBACK_CONT", "F3_IMPULSE_BASE_CONT", "F6_VWAP_RECLAIM"} else 1.02
+            limit *= 1.08 if fam in {"F1_PULLBACK_CONT", "F3_IMPULSE_BASE_CONT", "F6_VWAP_RECLAIM"} else 1.03
         elif sess == "NY":
-            limit *= 1.08
-        elif sess == "LON" and fam in {"F1_PULLBACK_CONT", "F3_IMPULSE_BASE_CONT"}:
-            limit *= 1.02
+            limit *= 1.12
+        elif sess == "LON":
+            if fam in {"F1_PULLBACK_CONT", "F3_IMPULSE_BASE_CONT", "F2_MOMENTUM_IGNITION"}:
+                limit *= 1.06
+            else:
+                limit *= 1.03
 
-        return float(clamp(limit, 0.68, 2.15))
+        return float(clamp(limit, 0.74, 2.35))
     except Exception:
         return float(fallback_allowed or EMA_ANCHOR_BASE_MAX_DIST_PCT or 0.80)
 
