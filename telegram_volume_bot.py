@@ -15383,10 +15383,13 @@ _OHLCV_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 _OHLCV_TF_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 _OHLCV_RATE_LIMIT_WARN_UNTIL: Dict[str, float] = {}
 _OHLCV_LAST_KEY: Dict[str, str] = {}
+_OHLCV_INFLIGHT_EVENTS: Dict[str, threading.Event] = {}
+_OHLCV_INFLIGHT_LOCK = threading.Lock()
 OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "60") or 60)
 OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "90") or 90)
 OHLCV_MAX_CONCURRENT_FETCHES = int(os.getenv("OHLCV_MAX_CONCURRENT_FETCHES", "2") or 2)
 OHLCV_FETCH_SEMAPHORE_TIMEOUT_SEC = float(os.getenv("OHLCV_FETCH_SEMAPHORE_TIMEOUT_SEC", "1.5") or 1.5)
+OHLCV_INFLIGHT_WAIT_SEC = float(os.getenv("OHLCV_INFLIGHT_WAIT_SEC", "1.8") or 1.8)
 OHLCV_TTL_BY_TIMEFRAME_SEC = {
     '5m': int(os.getenv('OHLCV_TTL_5M_SEC', '90') or 90),
     '15m': int(os.getenv('OHLCV_TTL_15M_SEC', '150') or 150),
@@ -15451,6 +15454,40 @@ def _ohlcv_rate_limit_cooldown_sec(timeframe: str) -> float:
     except Exception:
         base = float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 60.0)
     return max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 20.0), float(base or 0.0))
+
+
+def _ohlcv_inflight_bucket(symbol: str, timeframe: str) -> str:
+    try:
+        return f"{str(symbol or '').upper()}|{str(timeframe or '').lower().strip() or 'na'}"
+    except Exception:
+        return f"{symbol}|{timeframe}"
+
+
+def _ohlcv_try_join_inflight(symbol: str, timeframe: str) -> tuple[bool, threading.Event | None]:
+    bucket = _ohlcv_inflight_bucket(symbol, timeframe)
+    with _OHLCV_INFLIGHT_LOCK:
+        ev = _OHLCV_INFLIGHT_EVENTS.get(bucket)
+        if ev is not None:
+            return False, ev
+        ev = threading.Event()
+        _OHLCV_INFLIGHT_EVENTS[bucket] = ev
+        return True, ev
+
+
+def _ohlcv_finish_inflight(symbol: str, timeframe: str, ev: threading.Event | None) -> None:
+    try:
+        if ev is not None:
+            ev.set()
+    except Exception:
+        pass
+    try:
+        bucket = _ohlcv_inflight_bucket(symbol, timeframe)
+        with _OHLCV_INFLIGHT_LOCK:
+            cur = _OHLCV_INFLIGHT_EVENTS.get(bucket)
+            if cur is ev:
+                _OHLCV_INFLIGHT_EVENTS.pop(bucket, None)
+    except Exception:
+        pass
 
 
 def _ohlcv_best_effort_cached_with_age(symbol: str, timeframe: str, limit: int) -> tuple[List[List[float]], float]:
@@ -15539,6 +15576,22 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     if isinstance(stale, list) and stale and busy_runtime and float(stale_age) <= float(_ohlcv_busy_stale_max_age_sec(tf_key)):
         return stale
 
+    i_am_leader, inflight_ev = _ohlcv_try_join_inflight(symbol, tf_key)
+    if not i_am_leader:
+        wait_sec = max(0.35, float(OHLCV_INFLIGHT_WAIT_SEC or 1.8) * (0.75 if stale else 1.5))
+        try:
+            inflight_ev.wait(timeout=wait_sec)
+        except Exception:
+            pass
+        if cache_valid(key, ttl):
+            return cache_get(key)
+        joined_stale, joined_age = _ohlcv_best_effort_cached_with_age(symbol, timeframe, limit)
+        if isinstance(joined_stale, list) and joined_stale:
+            if float(joined_age) <= float(_ohlcv_busy_stale_max_age_sec(tf_key)) or busy_runtime:
+                return joined_stale
+        if cool_until > float(time.time()) or float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0) > float(time.time()):
+            return joined_stale if isinstance(joined_stale, list) else []
+
     acquired = False
     timeout_sec = max(0.25, float(OHLCV_FETCH_SEMAPHORE_TIMEOUT_SEC or 1.5) * (1.0 if stale else 4.0))
     try:
@@ -15546,6 +15599,8 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     except Exception:
         acquired = True
     if not acquired:
+        if i_am_leader:
+            _ohlcv_finish_inflight(symbol, tf_key, inflight_ev)
         return stale if isinstance(stale, list) else []
 
     ex = get_exchange()
@@ -15564,8 +15619,9 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         name = type(e).__name__
         msg = str(e or '')
         if 'RateLimitExceeded' in name or '10006' in msg or 'rate limit' in msg.lower() or 'too many visits' in msg.lower():
-            key_cd = max(6.0, float(ttl))
-            tf_cd = max(float(_ohlcv_rate_limit_cooldown_sec(tf_key) or 20.0), min(key_cd, float(_ohlcv_busy_stale_max_age_sec(tf_key))))
+            base_cd = float(_ohlcv_rate_limit_cooldown_sec(tf_key) or 20.0)
+            key_cd = max(12.0, min(float(ttl), max(base_cd * 1.25, 45.0)))
+            tf_cd = max(base_cd, min(key_cd, float(_ohlcv_busy_stale_max_age_sec(tf_key))))
             _OHLCV_RATE_LIMIT_UNTIL[key] = now_ts + key_cd
             _OHLCV_TF_RATE_LIMIT_UNTIL[tf_key] = max(float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0), now_ts + tf_cd)
             warn_key = f'{tf_key}:rate_limit'
@@ -15582,6 +15638,8 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
                 _OHLCV_FETCH_SEMAPHORE.release()
             except Exception:
                 pass
+        if i_am_leader:
+            _ohlcv_finish_inflight(symbol, tf_key, inflight_ev)
 
 
 def ema7_1h_distance_pct(market_symbol: str) -> Tuple[float, float, float]:
