@@ -7384,7 +7384,12 @@ def _research_default_family_for_cell(session_name: str, regime_primary: str) ->
     if regime in {'TREND_UP', 'TREND_DOWN'}:
         return ['F1_PULLBACK_CONT', 'F6_VWAP_RECLAIM'] if sess == 'NY' else ['F1_PULLBACK_CONT', 'F3_IMPULSE_BASE_CONT']
     if regime == 'EXPANSION':
-        return ['F2_MOMENTUM_IGNITION', 'F3_IMPULSE_BASE_CONT']
+        # ASIA cannot use the default LON/NY expansion families (F2/F3) because they are not
+        # eligible for that session. Returning them here produced empty allocator plans such as
+        # "ASIA:EXPANSION | champion=- | active=-", which silently removes any active-family
+        # support during live ASIA scans. Keep ASIA on the continuation family instead of an
+        # impossible expansion pair.
+        return ['F1_PULLBACK_CONT'] if sess == 'ASIA' else ['F2_MOMENTUM_IGNITION', 'F3_IMPULSE_BASE_CONT']
     if regime in {'BALANCE', 'SQUEEZE'}:
         return ['F4_SWEEP_RECLAIM', 'F5_ORB_RETEST']
     if regime in {'EXHAUSTION', 'UNSTABLE_HIGH_VOL'}:
@@ -7597,10 +7602,20 @@ def _research_build_allocator_plans(best_fut: dict | None = None, trading_day: s
                 candidates = sorted(candidates, key=lambda x: (float(x.get('shrunk_score') or 0.0), float(x.get('expectancy_r') or 0.0), float(x.get('wr') or 0.0)), reverse=True)
                 if not candidates:
                     defaults = [f for f in _research_default_family_for_cell(sess, regime) if _research_family_eligible_for_cell(f, sess, regime)]
+                    if not defaults:
+                        # Generic safety fallback: never leave a live session/regime cell with an
+                        # impossible default family list. This preserves allocator observability and
+                        # active-family support even when the session/regime mapping evolves.
+                        defaults = [
+                            str(item.get('family_id') or '').upper().strip()
+                            for item in _research_family_registry_defaults()
+                            if str(item.get('status') or 'active').strip().lower() in {'active', 'experimental'}
+                            and _research_family_eligible_for_cell(str(item.get('family_id') or ''), sess, regime)
+                        ]
                     champion = defaults[0] if defaults else ''
                     challenger = defaults[1] if len(defaults) > 1 else ''
                     active = [x for x in defaults[:max_active] if x]
-                    rationale = {'source': 'heuristic_default', 'shadow_mode': bool(shadow), 'regime': regime, 'regime_confidence': float(snap.confidence)}
+                    rationale = {'source': 'heuristic_default', 'shadow_mode': bool(shadow), 'regime': regime, 'regime_confidence': float(snap.confidence), 'fallback_used': bool(not candidates and bool(defaults))}
                 else:
                     champion = str(candidates[0].get('family_id') or '')
                     challenger = str(candidates[1].get('family_id') or '') if len(candidates) > 1 else ''
