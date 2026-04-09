@@ -14414,6 +14414,7 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
                 pullback_ema_dist_pct=float(row.get('pullback_ema_dist_pct') or 0.0),
                 ema_support_period=int(row.get('ema_support_period') or 0),
                 ema_support_dist_pct=float(row.get('ema_support_dist_pct') or 0.0),
+                is_trailing_alt_target_b=bool(int(row.get('is_trailing_alt_target_b') or 0)) if str(row.get('is_trailing_alt_target_b') or '').strip() not in {'', 'None'} else False,
                 created_ts=float(row.get('signal_created_ts') or row.get('emailed_ts') or 0.0),
                 signal_created_ts=float(row.get('signal_created_ts') or 0.0),
                 executable_ts=float(row.get('emailed_ts') or 0.0),
@@ -23509,7 +23510,7 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
                 best_profile = {'name': str(row.get('profile') or '')}
                 best_bundle = {'name': str(row.get('bundle') or '')}
 
-        promoted = float(best_eval.get('score', -1e9)) > float(baseline_eval.get('score', -1e9)) + 0.5
+        promoted = bool(best_eval.get('feasible')) and float(best_eval.get('score', -1e9)) > float(baseline_eval.get('score', -1e9)) + 0.5
         final_cfg = json.loads(json.dumps(best_cfg if promoted else base_cfg))
         final_eval = dict(best_eval if promoted else baseline_eval)
         final_cfg['goal_profile_last_run_ts'] = float(time.time())
@@ -23584,7 +23585,7 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
                     pass
         baseline_score = float((baseline_eval or {}).get('score', -1e9) if isinstance(locals().get('baseline_eval'), dict) else -1e9)
         best_score = float((partial_best_eval or {}).get('score', -1e9) if isinstance(partial_best_eval, dict) else -1e9)
-        promote_partial = bool(timed_out and isinstance(partial_best_cfg, dict) and best_score > baseline_score + 0.5)
+        promote_partial = bool(timed_out and isinstance(partial_best_cfg, dict) and isinstance(partial_best_eval, dict) and bool(partial_best_eval.get('feasible')) and best_score > baseline_score + 0.5)
         final_cfg = json.loads(json.dumps(partial_best_cfg if promote_partial else (cfg0 or {})))
         try:
             final_cfg['goal_profile_last_run_ts'] = float(time.time())
@@ -23597,6 +23598,10 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
             pass
         final_eval = dict(partial_best_eval) if (promote_partial and isinstance(partial_best_eval, dict)) else (dict(baseline_eval) if isinstance(locals().get('baseline_eval'), dict) else {})
         final_status = 'TIMEOUT_PROMOTED' if promote_partial else ('TIMEOUT_NO_BETTER_PROFILE' if timed_out and baseline_score >= best_score else status)
+        if timed_out and isinstance(partial_best_eval, dict) and (not bool(partial_best_eval.get('feasible'))):
+            status_note = 'best_timeout_candidate_infeasible_not_promoted'
+        else:
+            status_note = ''
         err_report = {
             'ok': False,
             'status': final_status,
@@ -23605,6 +23610,7 @@ def _run_goal_profile_cycle(force: bool = False) -> dict:
             'finished_ts': float(time.time()),
             'targets': tgt,
             'error': str(e),
+            'note': str(status_note or ''),
             'current': {
                 'goal_profile_active_profile': str(final_cfg.get('goal_profile_active_profile') or current_profile),
                 'execution_sessions_allowed': list(final_cfg.get('execution_sessions_allowed') or current_sessions),
@@ -33240,7 +33246,7 @@ def _email_body_pretty_html(
 
         card.append(f"<div style='margin-top:4px'>TP: <code>{esc(fmt_price_email(_tp))}</code></div>")
 
-        if s.is_trailing_alt_target_b:
+        if getattr(s, 'is_trailing_alt_target_b', False):
             pass
 
         card.append(
@@ -33308,7 +33314,7 @@ def _email_body_pretty_html(
 
         card.append(f"<div style='margin-top:4px'>TP: <code>{esc(fmt_price_email(_tp))}</code></div>")
 
-        if s.is_trailing_alt_target_b:
+        if getattr(s, 'is_trailing_alt_target_b', False):
             pass
 
         card.append(
