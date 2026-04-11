@@ -4925,32 +4925,37 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         except Exception:
             return 0.0
 
+    external_open_positions = 0
+    external_open_risk = 0.0
+    external_open_pnl = 0.0
+
     if mode == "live":
         try:
             positions = _bybit_get_open_positions_linear()
         except Exception:
             positions = []
-        open_positions_now = len(positions)
-        open_pnl = float(sum(_pos_unreal_pnl(p) for p in positions) or 0.0) if positions else 0.0
+        bot_positions = []
+        for p in (positions or []):
+            tr = _autotrade_live_position_owner_trade(int(uid), p, journal_open=journal_open)
+            if tr:
+                bot_positions.append((p, tr))
+            else:
+                external_open_positions += 1
+                external_open_pnl += float(_pos_unreal_pnl(p) or 0.0)
+                external_open_risk += max(0.0, float(_estimate_position_risk_usd(p) or 0.0))
 
-        for p in positions:
+        open_positions_now = len(bot_positions)
+        open_pnl = float(sum(_pos_unreal_pnl(p) for p, _tr in bot_positions) or 0.0) if bot_positions else 0.0
+
+        for p, matched_trade in bot_positions:
             est = float(_estimate_position_risk_usd(p) or 0.0)
-            info = _autotrade_resolve_live_position_open_info(int(uid), p, journal_open=journal_open)
-            opened_ts = float(info.get('opened_ts') or 0.0)
+            info = _autotrade_resolve_live_position_open_info(int(uid), p, journal_open=[matched_trade] if matched_trade else journal_open)
+            opened_ts = float(info.get('opened_ts') or float(matched_trade.get('opened_ts') or 0.0) or 0.0)
             psym = _pos_symbol(p)
             pside = _pos_side_text(p)
             if est <= 0:
                 try:
-                    matches = [t for t in journal_open
-                               if str(t.get('symbol') or '').upper() == str(psym).upper()
-                               and str(t.get('side') or '').upper() == str(pside).upper()]
-                    if matches:
-                        matched_journal = [t for t in matches if abs(float(t.get('opened_ts') or 0.0) - float(info.get('journal_ts') or 0.0)) <= 1.0]
-                        risk_pool = matched_journal or matches
-                        est = max(
-                            float(_autotrade_estimated_risk_usd(float(t.get('entry') or 0.0), float(t.get('sl') or 0.0), float(t.get('qty') or 0.0)) or 0.0)
-                            for t in risk_pool
-                        )
+                    est = float(_autotrade_estimated_risk_usd(float(matched_trade.get('entry') or 0.0), float(matched_trade.get('sl') or 0.0), float(matched_trade.get('qty') or 0.0)) or 0.0)
                 except Exception:
                     pass
             est = max(0.0, float(est or 0.0))
@@ -4970,21 +4975,18 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
                 'risk': float(est),
                 'opened_ts': float(opened_ts or 0.0),
                 'bucket': bucket,
-                'source': str(info.get('source') or 'unknown'),
-                'journal_ts': float(info.get('journal_ts') or 0.0),
+                'source': str(info.get('source') or 'autotrade_journal'),
+                'journal_ts': float(info.get('journal_ts') or float(matched_trade.get('opened_ts') or 0.0) or 0.0),
                 'position_created_ts': float(info.get('position_created_ts') or 0.0),
                 'exchange_order_ts': float(info.get('exchange_order_ts') or 0.0),
                 'notes': str(info.get('notes') or ''),
             })
         inherited_open_positions = min(int(inherited_open_positions), int(open_positions_now))
         current_day_open_positions = max(0, int(open_positions_now) - int(inherited_open_positions))
-        # Live day-cap accounting should charge only positions opened inside the current
-        # anchored trading day. Carried exposure is shown separately but must not consume
-        # today's new-trade budget again.
+        # Live day-cap accounting should charge only bot positions opened inside the current
+        # anchored trading day. Manual/external positions are shown separately and must not
+        # consume AutoTrade day budget.
         live_open_risk_charged_today = float(current_day_open_risk)
-        # Keep the day-open count anchored to confirmed current-day opens, but if the
-        # local journal is incomplete, never understate day activity versus confirmed
-        # exchange closes plus current-day live positions.
         opened_today_count = max(int(opened_today_count), int(current_day_open_positions))
         opened_today_count = max(int(opened_today_count), int(closed_today_count) + int(current_day_open_positions))
     else:
@@ -5045,6 +5047,9 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         "day_start_ts": float(start_ts),
         "day_end_ts": float(end_ts),
         "position_classifications": position_classifications,
+        "external_open_positions": int(external_open_positions),
+        "external_open_risk": float(external_open_risk),
+        "external_open_pnl": float(external_open_pnl),
     }
 
 def _autotrade_user_settings(uid: int) -> dict:
@@ -7733,17 +7738,25 @@ def _research_run_daily_refresh(force: bool = False) -> dict:
 
 async def research_regime_refresh_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        best_fut = await to_thread_heavy(fetch_futures_tickers)
+        if _recent_user_activity(20) or _backtest_runtime_busy():
+            return
+        if ALERT_LOCK.locked() or SCAN_LOCK.locked() or _SCREEN_LOCK.locked() or _goal_profile_is_running():
+            return
+        best_fut = await to_thread_heavy(fetch_futures_tickers, timeout=25)
         for sess in ('ASIA', 'LON', 'NY'):
-            snap = await to_thread_heavy(_research_market_regime_from_best_fut, best_fut or {}, sess, '4h')
-            await to_thread_fast(_research_store_regime_snapshot, snap)
+            snap = await to_thread_heavy(_research_market_regime_from_best_fut, best_fut or {}, sess, '4h', timeout=20)
+            await to_thread_fast(_research_store_regime_snapshot, snap, timeout=10)
     except Exception:
         return
 
 
 async def research_allocator_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        await to_thread_heavy(_research_run_daily_refresh, True)
+        if _recent_user_activity(20) or _backtest_runtime_busy():
+            return
+        if ALERT_LOCK.locked() or SCAN_LOCK.locked() or _SCREEN_LOCK.locked() or _goal_profile_is_running():
+            return
+        await to_thread_heavy(_research_run_daily_refresh, True, timeout=35)
     except Exception:
         return
 
@@ -11273,6 +11286,9 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         "positions_closed_today": 0,
         "closed_today_rows": [],
         "inherited_open_positions": 0,
+        "external_open_positions": 0,
+        "external_open_risk": 0.0,
+        "external_open_pnl": 0.0,
         "remaining_new_positions_today": 0,
         "realized_loss_today": 0.0,
         "used_today": 0.0,
@@ -11301,6 +11317,9 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["positions_closed_today"] = int(m.get("closed_today_count") or 0)
         snap["closed_today_rows"] = list(m.get("closed_today_rows") or [])
         snap["inherited_open_positions"] = int(m.get("inherited_open_positions") or 0)
+        snap["external_open_positions"] = int(m.get("external_open_positions") or 0)
+        snap["external_open_risk"] = float(m.get("external_open_risk") or 0.0)
+        snap["external_open_pnl"] = float(m.get("external_open_pnl") or 0.0)
         snap["realized_loss_today"] = float(m.get("realized_loss_today") or 0.0)
         snap["used_today"] = float(m.get("used_total") or 0.0)
         snap["used_today_raw"] = float(m.get("used_total_raw") or m.get("used_total") or 0.0)
@@ -15369,11 +15388,54 @@ _OHLCV_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 _OHLCV_TF_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 _OHLCV_RATE_LIMIT_WARN_UNTIL: Dict[str, float] = {}
 _OHLCV_LAST_KEY: Dict[str, str] = {}
+_OHLCV_INFLIGHT: Dict[str, threading.Event] = {}
+_OHLCV_INFLIGHT_LOCK = threading.Lock()
 OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "60") or 60)
 OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "90") or 90)
+OHLCV_INFLIGHT_WAIT_SEC = float(os.getenv("OHLCV_INFLIGHT_WAIT_SEC", "2.5") or 2.5)
 BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC", "6") or 6)
 BYBIT_OPEN_ORDERS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_ORDERS_CACHE_TTL_SEC", "6") or 6)
 SCREEN_DIRECTIONAL_CACHE_TTL_SEC = int(os.getenv("SCREEN_DIRECTIONAL_CACHE_TTL_SEC", "45") or 45)
+
+
+
+def _ohlcv_superset_cache_key(symbol: str, timeframe: str) -> str:
+    return f"ohlcv_sup:{symbol}:{timeframe}"
+
+
+def _ohlcv_fresh_superset_cached(symbol: str, timeframe: str, limit: int, ttl: int | float | None = None) -> List[List[float]]:
+    """Return a fresh cached superset for symbol/timeframe regardless of exact limit key.
+
+    This dramatically cuts duplicate OHLCV pulls when the bot asks for the same symbol/timeframe
+    with nearby limits (for example 60, 80, 140, 220, 240, 1200) inside overlapping jobs.
+    """
+    try:
+        sup_key = _ohlcv_superset_cache_key(symbol, timeframe)
+        v = _CACHE.get(sup_key)
+        if not v:
+            return []
+        ts, rows = v
+        age_ttl = float(ttl if ttl is not None else OHLCV_TTL_SEC)
+        if (time.time() - float(ts or 0.0)) > max(3.0, age_ttl):
+            return []
+        if isinstance(rows, list) and len(rows) >= int(limit):
+            return rows[-int(limit):]
+    except Exception:
+        return []
+    return []
+
+
+def _ohlcv_update_superset_cache(symbol: str, timeframe: str, rows: List[List[float]]) -> None:
+    try:
+        if not isinstance(rows, list) or not rows:
+            return
+        sup_key = _ohlcv_superset_cache_key(symbol, timeframe)
+        existing = cache_get(sup_key)
+        if isinstance(existing, list) and len(existing) > len(rows):
+            return
+        cache_set(sup_key, rows)
+    except Exception:
+        return
 
 
 def _ohlcv_best_effort_cached(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
@@ -15386,6 +15448,12 @@ def _ohlcv_best_effort_cached(symbol: str, timeframe: str, limit: int) -> List[L
         exact = cache_get(f"ohlcv:{symbol}:{timeframe}:{limit}")
         if isinstance(exact, list) and exact:
             return exact[-int(limit):] if len(exact) > int(limit) else exact
+    except Exception:
+        pass
+    try:
+        sup = cache_get(_ohlcv_superset_cache_key(symbol, timeframe))
+        if isinstance(sup, list) and sup:
+            return sup[-int(limit):] if len(sup) > int(limit) else sup
     except Exception:
         pass
     best = []
@@ -15421,17 +15489,49 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     Production hardening:
     - never let a Bybit rate-limit exception crash /screen or other jobs
     - when the request was recently rate-limited, serve stale cache (if any) instead of hammering Bybit again
+    - reuse a fresh superset cache across nearby limits for the same symbol/timeframe
+    - coalesce concurrent identical symbol/timeframe requests so background jobs stop dog-piling Bybit
     - on transient failures, prefer stale cache over raising
     """
     key = f"ohlcv:{symbol}:{timeframe}:{limit}"
+    tf_key = str(timeframe or '').lower().strip() or 'na'
+    group_key = f"{symbol}|{tf_key}"
+
     if cache_valid(key, OHLCV_TTL_SEC):
         return cache_get(key)
 
+    fresh_sup = _ohlcv_fresh_superset_cached(symbol, timeframe, limit, ttl=OHLCV_TTL_SEC)
+    if isinstance(fresh_sup, list) and fresh_sup:
+        return fresh_sup
+
     now_ts = float(time.time())
-    tf_key = str(timeframe or '').lower().strip() or 'na'
     cool_until = float(_OHLCV_RATE_LIMIT_UNTIL.get(key) or 0.0)
     tf_cool_until = float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0)
     if cool_until > now_ts or tf_cool_until > now_ts:
+        stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
+        return stale if isinstance(stale, list) else []
+
+    wait_event = None
+    owner_event = None
+    with _OHLCV_INFLIGHT_LOCK:
+        ev = _OHLCV_INFLIGHT.get(group_key)
+        if ev is None:
+            ev = threading.Event()
+            _OHLCV_INFLIGHT[group_key] = ev
+            owner_event = ev
+        else:
+            wait_event = ev
+
+    if wait_event is not None and owner_event is None:
+        try:
+            wait_event.wait(timeout=max(0.5, min(4.0, float(OHLCV_INFLIGHT_WAIT_SEC or 2.5))))
+        except Exception:
+            pass
+        if cache_valid(key, OHLCV_TTL_SEC):
+            return cache_get(key)
+        fresh_sup = _ohlcv_fresh_superset_cached(symbol, timeframe, limit, ttl=OHLCV_TTL_SEC)
+        if isinstance(fresh_sup, list) and fresh_sup:
+            return fresh_sup
         stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
         return stale if isinstance(stale, list) else []
 
@@ -15439,6 +15539,7 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     try:
         data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
         cache_set(key, data)
+        _ohlcv_update_superset_cache(symbol, timeframe, data)
         try:
             if isinstance(data, list) and data:
                 _OHLCV_LAST_KEY[f"{symbol}|{timeframe}"] = key
@@ -15451,8 +15552,8 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         name = type(e).__name__
         msg = str(e or '')
         if 'RateLimitExceeded' in name or '10006' in msg or 'rate limit' in msg.lower() or 'too many visits' in msg.lower():
-            key_cd = max(3.0, float(OHLCV_TTL_SEC))
-            tf_cd = max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 20.0), min(key_cd, 30.0))
+            key_cd = max(6.0, float(OHLCV_TTL_SEC))
+            tf_cd = max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 20.0), min(key_cd, 60.0))
             _OHLCV_RATE_LIMIT_UNTIL[key] = now_ts + key_cd
             _OHLCV_TF_RATE_LIMIT_UNTIL[tf_key] = max(float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0), now_ts + tf_cd)
             warn_key = f'{tf_key}:rate_limit'
@@ -15466,6 +15567,16 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         if isinstance(stale, list):
             return stale
         return []
+    finally:
+        if owner_event is not None:
+            try:
+                owner_event.set()
+            except Exception:
+                pass
+            with _OHLCV_INFLIGHT_LOCK:
+                cur = _OHLCV_INFLIGHT.get(group_key)
+                if cur is owner_event:
+                    _OHLCV_INFLIGHT.pop(group_key, None)
 
 
 def ema7_1h_distance_pct(market_symbol: str) -> Tuple[float, float, float]:
@@ -19896,6 +20007,11 @@ def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | 
                 used_trade_ids.add(str(matched.get('trade_id') or ''))
                 canon = _canon_outcome_from_autotrade_trade(matched, live_pos=live_pos, exchange_events=exchange_events_by_key.get((symbol, side), []))
                 meta = {'source': 'matched_trade_by_symbol_side_time', 'trade': matched}
+            elif str(base_meta.get('source') or '').strip().lower() in {'signal_outcomes', 'signal_outcomes_sync'} and _canon_signal_outcome_label(base_canon) in {'TP', 'SL', 'OPEN'}:
+                # Price-path evaluation from Bybit OHLCV should still drive /signal_report even when
+                # the user received an email signal but no bot trade/journal row exists for it.
+                canon = _canon_signal_outcome_label(base_canon)
+                meta = {'source': str(base_meta.get('source') or 'signal_outcomes_sync')}
             else:
                 # 3) No direct trade found. Use current live position or exchange close events as a last resort.
                 evs = exchange_events_by_key.get((symbol, side), []) if symbol and side else []
@@ -19974,7 +20090,7 @@ def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | 
                         r['outcome'] = 'None'
                         r['source'] = 'stale_open_demoted'
                         hidden_untracked_open += 1
-            elif src not in {'fallback_live_symbol_side', 'fallback_live_with_exchange_partial', 'matched_open_trade', 'matched_live_symbol_side'}:
+            elif src not in {'fallback_live_symbol_side', 'fallback_live_with_exchange_partial', 'matched_open_trade', 'matched_live_symbol_side', 'signal_outcomes', 'signal_outcomes_sync'}:
                 r['outcome'] = 'None'
                 r['source'] = 'untracked_open_demoted'
                 hidden_untracked_open += 1
@@ -22477,10 +22593,6 @@ def _runtime_profile_create_from_cfg(cfg: dict, source: str, status: str = 'PROB
 def _signal_outcome_summary_since(user_id: int, since_ts: float, session: str | None = None) -> dict:
     user_id = int(user_id or 0)
     try:
-        _signal_outcome_sync_for_user(user_id, days=None, limit=1200, force=False)
-    except Exception:
-        pass
-    try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
@@ -22493,6 +22605,11 @@ def _signal_outcome_summary_since(user_id: int, since_ts: float, session: str | 
             emailed = [dict(r) for r in (c.execute(q, tuple(params)).fetchall() or [])]
     except Exception:
         emailed = []
+    try:
+        sync_limit = int(max(50, min(300, len(emailed) + 24)))
+        _signal_outcome_sync_for_user(user_id, days=None, limit=sync_limit, force=False)
+    except Exception:
+        pass
     user = get_user(user_id) or {}
     rows, hidden = _signal_report_resolve_rows(user_id, emailed, user=user)
     stats = _canonical_wr_stats(rows)
@@ -24060,12 +24177,14 @@ async def goal_profile_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def research_framework_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
-    """Cheap safety net for daily research refresh and overdue goal cycles.
+    """Cheap safety net for daily research refresh only.
 
-    This watchdog must stay light so it cannot starve user commands on small Render instances.
+    Keep this watchdog intentionally light. It must never run the full goal-profile search itself,
+    because long optimizer work here causes APScheduler overlap warnings and steals executor budget
+    from /screen, /autotrade_report, and other user-facing commands on small Render instances.
     """
     try:
-        if _recent_user_activity(25):
+        if _recent_user_activity(25) or _backtest_runtime_busy():
             return
         now_ts = float(time.time())
         cfg = load_strategy_config(force=False)
@@ -24074,23 +24193,14 @@ async def research_framework_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
 
         if _cfg_bool((cfg or {}).get('family_allocator_enabled', True), True) and _research_daily_refresh_due(now_ts):
             try:
-                await to_thread_heavy(_research_run_daily_refresh, True, timeout=45)
+                await to_thread_heavy(_research_run_daily_refresh, True, timeout=25)
             except Exception:
                 pass
 
-        tgt = _goal_profile_targets(cfg)
-        if _cfg_bool((cfg or {}).get('goal_profile_enabled', True), True) and _SELF_OPT_STATE.get('stop_event') is None:
-            rep = load_goal_profile_report() or {}
-            last_ts = float(rep.get('ts', 0.0) or 0.0)
-            interval_sec = max(21600.0, float(tgt.get('interval_hours', 24.0) or 24.0) * 3600.0)
-            overdue = (last_ts <= 0.0) or ((now_ts - last_ts) >= (interval_sec + 5400.0))
-            quiet_ok = _goal_profile_quiet_window_ok(now_ts)
-            hard_overdue = (last_ts <= 0.0) or ((now_ts - last_ts) >= (interval_sec + 43200.0))
-            if overdue and _goal_profile_is_due(now_ts, cfg=cfg) and (quiet_ok or hard_overdue):
-                try:
-                    await to_thread_heavy(_run_goal_profile_cycle, False, timeout=max(600, int(interval_sec * 0.75)))
-                except Exception:
-                    pass
+        # Intentionally do not run _run_goal_profile_cycle() here. The dedicated scheduled
+        # goal_profile_job already owns that responsibility, and keeping the watchdog light
+        # materially reduces Render lag and APScheduler overlap warnings.
+        return
     except Exception:
         return
 
@@ -29444,6 +29554,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Opened today: {int(snap.get('positions_opened_today', 0))}" + (f"/{int(snap.get('trades_today_limit', 0))}" if int(snap.get('trades_today_limit', 0)) > 0 else ' (no count cap)'),
         f"• Closed today: {int(snap.get('positions_closed_today', 0))}",
         f"• Open positions now: {int(snap.get('open_positions_now', 0))}",
+        (f"• Manual/external positions ignored by AutoTrade: {int(snap.get('external_open_positions', 0))} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
         f"• Carried from prior day: {int(snap.get('inherited_open_positions', 0))}",
         f"• Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f}",
         (
@@ -29492,12 +29603,22 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     continue
         live_positions = _bybit_get_open_positions_linear()
-        lines.extend([SEP, f"Open positions list: {len(live_positions)}"])
-        if not live_positions:
+        journal_open = _autotrade_db_open_trades(int(uid)) or []
+        bot_positions = []
+        external_positions = []
+        for p in (live_positions or []):
+            if _autotrade_live_position_owner_trade(int(uid), p, journal_open=journal_open):
+                bot_positions.append(p)
+            else:
+                external_positions.append(p)
+        lines.extend([SEP, f"Open positions list (AutoTrade-owned): {len(bot_positions)}"])
+        if not bot_positions:
             lines.append('• None')
         else:
-            for p in live_positions[:12]:
+            for p in bot_positions[:12]:
                 lines.append(f"• {_pos_side_text(p)} {_pos_symbol(p)} | PnL {_pos_unreal_pnl(p):+.2f} USDT")
+        if external_positions:
+            lines.append(f"• Manual/external ignored: {len(external_positions)}")
     else:
         opens = db_open_trades(uid)
         lines.extend([SEP, f"Open trades list: {len(opens)}"])
@@ -30176,7 +30297,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Signal Report (last {lookback_h}h)",
         HDR,
         f"Total: {len(rows)} | Decided: {int(stats.get('decided') or 0)} | TP wins: {int(stats.get('wins') or 0)} | Losses: {int(stats.get('losses') or 0)} | Win rate: {float(stats.get('win_rate') or 0.0):.1f}%",
-        f"TP: {int(counts.get('TP',0)) + int(counts.get('TP',0)) + int(counts.get('TP',0))} | SL: {counts.get('SL',0)} | Open: {counts.get('OPEN',0)} | None: {counts.get('None',0)}",
+        f"TP: {int(counts.get('TP',0))} | SL: {int(counts.get('SL',0))} | Open: {int(counts.get('OPEN',0))} | None: {int(counts.get('None',0))}",
         HDR,
     ]
     life_lines = _trade_lifecycle_analytics_lines(lifecycle_recent, heading=f"Exchange-backed lifecycle ({lookback_h}h)", include_sessions=True, include_engines=True, include_buckets=False, include_symbols=True, include_signs=True, max_signs=2)
@@ -30184,7 +30305,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     table = tabulate(table_rows, headers=['Session','Time','Trade','Confidence','Outcome'], tablefmt='plain', colalign=('left','left','left','right','left'))
     sess_lines = ['Session breakdown:']
     for sname, c in sorted((stats.get('by_session') or {}).items(), key=lambda kv: kv[0]):
-        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP {int(c.get('tp') or 0) + int(c.get('alt_target_a') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
+        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP {int(c.get('tp') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
     if int(hidden_untracked_open or 0) > 0:
         sess_lines.append(f"• Hidden untracked rows: {int(hidden_untracked_open)} (no current live Bybit/autotrade match)")
     body_text = '\n'.join(header + life_lines + sess_lines)
@@ -30413,6 +30534,24 @@ def _autotrade_find_open_trade_for_live_position(uid: int, live_pos: dict, journ
         entry_delta = abs(entry - live_entry) if entry > 0 and live_entry > 0 else 10**18
         return (open_delta, entry_delta, -opened)
     return dict(sorted(matches, key=_score)[0])
+
+
+def _autotrade_live_position_owner_trade(uid: int, live_pos: dict, journal_open: list[dict] | None = None) -> dict:
+    """Return the matched OPEN bot trade for a live Bybit position, or {} for manual/external positions."""
+    try:
+        tr = _autotrade_find_open_trade_for_live_position(int(uid), live_pos, journal_open=journal_open)
+    except Exception:
+        tr = {}
+    if not tr:
+        return {}
+    try:
+        trade_id = str((tr or {}).get('trade_id') or '').strip()
+        status = str((tr or {}).get('status') or '').upper().strip()
+        if trade_id and status in {'', 'OPEN'}:
+            return dict(tr)
+    except Exception:
+        pass
+    return {}
 
 
 def _autotrade_live_position_status(uid: int, live_pos: dict, trade_row: dict | None = None, lifecycle_row: dict | None = None, open_orders: list[dict] | None = None) -> dict:
@@ -30783,16 +30922,23 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         journal_open = _autotrade_db_open_trades(owner_uid) or []
     except Exception:
         journal_open = []
+    bot_positions = []
+    external_positions = []
+    for p in (open_positions or []):
+        tr = _autotrade_live_position_owner_trade(owner_uid, p, journal_open=journal_open)
+        if tr:
+            bot_positions.append((p, tr))
+        else:
+            external_positions.append(p)
 
     lines.extend([SEP, 'Open positions'])
-    if not open_positions:
+    if not bot_positions:
         lines.append('• None')
     else:
         total_u = 0.0
         total_risk = 0.0
         open_order_cache = {}
-        for i, p in enumerate(open_positions, 1):
-            tr = _autotrade_find_open_trade_for_live_position(owner_uid, p, journal_open=journal_open)
+        for i, (p, tr) in enumerate(bot_positions, 1):
             sym = _bybit_linear_symbol(_pos_symbol(p))
             if sym not in open_order_cache:
                 try:
@@ -30803,9 +30949,11 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             total_u += float(snap.get('pnl') or 0.0)
             total_risk += float(snap.get('risk_est') or 0.0)
             lines.extend(_autotrade_render_live_position_snapshot(snap, index=i))
-            if i != len(open_positions):
+            if i != len(bot_positions):
                 lines.append(SEP)
         lines.append(f"Total open PnL: {total_u:+.2f} USDT | Total risk est: {total_risk:.2f} USDT")
+    if external_positions:
+        lines.append(f"Ignored manual/external live positions: {len(external_positions)}")
 
     lines.extend([SEP, 'Closed positions'])
     now_ts = float(time.time())
@@ -31214,6 +31362,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Daily cap: ${float(snap.get('cap') or 0.0):.2f}",
         f"Opened today: {int(snap.get('positions_opened_today', 0) or 0)} | Closed today: {int(snap.get('positions_closed_today', 0) or 0)} | Open now: {int(snap.get('open_positions_now', 0) or 0)}",
         f"Open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
+        (f"Ignored manual/external positions: {int(snap.get('external_open_positions', 0) or 0)} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
         f"Realised net today: ${float(snap.get('pnl_today') or 0.0):+.2f}",
         f"Daily risk used (open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
         ('Daily risk remaining: ∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f"Daily risk remaining: ${float(snap.get('remaining_today')):.2f}"),
@@ -31248,7 +31397,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.append(f"• {dec.get('status','')} | {dec_reason}")
     class_rows = mday.get('position_classifications') or []
     if class_rows:
-        lines.extend([SEP, 'Position day buckets'])
+        lines.extend([SEP, 'Position day buckets (AutoTrade-owned only)'])
         live_positions = {f"{_pos_symbol(p)}|{_pos_side_text(p)}": float(_pos_unreal_pnl(p) or 0.0) for p in (_bybit_get_open_positions_linear() or [])}
         for row in class_rows[:10]:
             key = f"{row.get('symbol')}|{row.get('side')}"
@@ -31293,22 +31442,37 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         journal_open = _autotrade_db_open_trades(owner_uid) or []
     except Exception:
         journal_open = []
+    bot_positions = []
+    external_positions = []
+    for p in (positions or []):
+        tr = _autotrade_live_position_owner_trade(owner_uid, p, journal_open=journal_open)
+        if tr:
+            bot_positions.append((p, tr))
+        else:
+            external_positions.append(p)
 
-    for i, p in enumerate(positions, 1):
-        tr = _autotrade_find_open_trade_for_live_position(owner_uid, p, journal_open=journal_open)
-        snap = _autotrade_live_position_status(owner_uid, p, trade_row=tr)
-        total_pnl += float(snap.get('pnl') or 0.0)
-        total_risk += float(snap.get('risk_est') or 0.0)
-        lines.extend(_autotrade_render_live_position_snapshot(snap, index=i))
-        ut = p.get("updatedTime") or p.get("updated_time") or ""
-        if ut:
-            lines.append(f"   • Updated: {_ms_to_local_str(ut)}")
-        if i != len(positions):
-            lines.append(SEP)
+    lines.append('AutoTrade-owned positions')
+    if not bot_positions:
+        lines.append('• None')
+    else:
+        for i, (p, tr) in enumerate(bot_positions, 1):
+            snap = _autotrade_live_position_status(owner_uid, p, trade_row=tr)
+            total_pnl += float(snap.get('pnl') or 0.0)
+            total_risk += float(snap.get('risk_est') or 0.0)
+            lines.extend(_autotrade_render_live_position_snapshot(snap, index=i))
+            ut = p.get("updatedTime") or p.get("updated_time") or ""
+            if ut:
+                lines.append(f"   • Updated: {_ms_to_local_str(ut)}")
+            if i != len(bot_positions):
+                lines.append(SEP)
+    if external_positions:
+        lines.extend([SEP, f"Manual / external positions (ignored by AutoTrade risk): {len(external_positions)}"])
+        for p in external_positions[:12]:
+            lines.append(f"• {_pos_side_text(p)} {_pos_symbol(p)} | PnL {_pos_unreal_pnl(p):+.2f} USDT")
 
     lines.append(HDR)
-    lines.append(f"TOTAL unrealised PnL: {total_pnl:+.2f} USDT")
-    lines.append(f"TOTAL risk est: {total_risk:.2f} USDT")
+    lines.append(f"AutoTrade unrealised PnL: {total_pnl:+.2f} USDT")
+    lines.append(f"AutoTrade risk est: {total_risk:.2f} USDT")
 
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
@@ -36521,7 +36685,7 @@ def main():
                 job_kwargs={
                     "max_instances": 1,
                     "coalesce": True,
-                    "misfire_grace_time": 300,
+                    "misfire_grace_time": 180,
                 },
             )
 
@@ -36624,8 +36788,8 @@ def main():
                 )
             app.job_queue.run_repeating(
                 research_framework_watchdog_job,
-                interval=900,
-                first=300,
+                interval=1800,
+                first=480,
                 name="research_framework_watchdog_job",
                 job_kwargs={
                     "max_instances": 1,
