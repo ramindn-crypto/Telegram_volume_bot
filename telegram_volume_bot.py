@@ -20095,6 +20095,13 @@ def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | 
                 r['source'] = 'untracked_open_demoted'
                 hidden_untracked_open += 1
 
+    # Final normalization so table rows and aggregate counts always use the same canonical labels.
+    for _r in rows:
+        try:
+            _r['outcome'] = _display_signal_outcome(_r.get('outcome'))
+        except Exception:
+            _r['outcome'] = 'None'
+
     return rows, hidden_untracked_open
 
 
@@ -20282,6 +20289,7 @@ def _signal_outcome_summary(user_id: int, session: str | None = None, days: int 
         pass
     user = get_user(user_id) or {}
     rows, hidden_untracked_open = _signal_report_resolve_rows(user_id, emailed, user=user)
+    rows = [dict(r, outcome=_display_signal_outcome((r or {}).get('outcome'))) for r in (rows or [])]
     stats = _canonical_wr_stats(rows)
     return {
         'rows': rows,
@@ -22612,6 +22620,7 @@ def _signal_outcome_summary_since(user_id: int, since_ts: float, session: str | 
         pass
     user = get_user(user_id) or {}
     rows, hidden = _signal_report_resolve_rows(user_id, emailed, user=user)
+    rows = [dict(r, outcome=_display_signal_outcome((r or {}).get('outcome'))) for r in (rows or [])]
     stats = _canonical_wr_stats(rows)
     return {
         'rows': rows,
@@ -30301,7 +30310,7 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         HDR,
     ]
     life_lines = _trade_lifecycle_analytics_lines(lifecycle_recent, heading=f"Exchange-backed lifecycle ({lookback_h}h)", include_sessions=True, include_engines=True, include_buckets=False, include_symbols=True, include_signs=True, max_signs=2)
-    table_rows = [[r['session'], r['time'], r['trade'], r['confidence'], r['outcome']] for r in rows]
+    table_rows = [[r['session'], r['time'], r['trade'], r['confidence'], _display_signal_outcome(r.get('outcome'))] for r in rows]
     table = tabulate(table_rows, headers=['Session','Time','Trade','Confidence','Outcome'], tablefmt='plain', colalign=('left','left','left','right','left'))
     sess_lines = ['Session breakdown:']
     for sname, c in sorted((stats.get('by_session') or {}).items(), key=lambda kv: kv[0]):
