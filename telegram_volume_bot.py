@@ -4424,6 +4424,32 @@ def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[d
     except Exception:
         journal_trades = []
 
+    trade_state_by_id: dict[str, dict] = {}
+    for t in (journal_trades or []):
+        try:
+            tid = str((t or {}).get('trade_id') or '').strip()
+            if not tid:
+                continue
+            trade_state_by_id[tid] = {
+                'status': str((t or {}).get('status') or '').upper().strip(),
+                'closed_ts': float((t or {}).get('closed_ts') or 0.0),
+                'symbol': str(_bybit_linear_symbol((t or {}).get('symbol') or '')).upper(),
+                'side': str((t or {}).get('side') or '').upper().strip(),
+            }
+        except Exception:
+            continue
+
+    live_keys = set()
+    if str(AUTOTRADE_MODE).lower() == 'live':
+        try:
+            for p in (_bybit_get_open_positions_linear() or []):
+                sym = str(_bybit_linear_symbol(_pos_symbol(p)) or '').upper()
+                side = str(_pos_side_text(p) or '').upper().strip()
+                if sym and side:
+                    live_keys.add((sym, side))
+        except Exception:
+            live_keys = set()
+
     closed_rows = _bybit_get_closed_pnl_linear(max(0.0, start_ts - 86400.0 * 5.0), end_ts, limit=300) or []
     if not closed_rows:
         return []
@@ -4542,10 +4568,15 @@ def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[d
             continue
         for i, srow in enumerate(setups):
             try:
-                if str(srow.get('trade_id') or '').strip():
-                    continue
+                row_trade_id = str(srow.get('trade_id') or '').strip()
                 if float(srow.get('lifecycle_closed_ts') or 0.0) > 0:
                     continue
+                if row_trade_id:
+                    st = dict(trade_state_by_id.get(row_trade_id) or {})
+                    if float(st.get('closed_ts') or 0.0) > 0 or str(st.get('status') or '').upper().strip() == 'CLOSED':
+                        continue
+                    if st and (str(sym or '').upper(), setup_side) in live_keys:
+                        continue
                 base_ts = float(srow.get('_base_ts') or 0.0)
                 if base_ts <= 0:
                     continue
@@ -20255,6 +20286,16 @@ def _canonical_signal_outcome_for_setup(user_id: int, setup_id: str) -> tuple[st
                     refreshed = _load_trade(trade_id)
                     if refreshed and (str(refreshed.get('status') or '').upper().strip() == 'CLOSED' or float(refreshed.get('closed_ts') or 0.0) > 0):
                         return _canon_outcome_from_autotrade_trade(refreshed, exchange_events=_signal_report_exchange_events_by_key(float(trade.get('opened_ts') or 0.0)).get((_bybit_linear_symbol(str(refreshed.get('symbol') or '')), _norm_trade_side(str(refreshed.get('side') or ''))), [])), {'source': 'autotrade_trade_sync', 'trade': refreshed, 'lifecycle': life}
+                except Exception:
+                    pass
+                try:
+                    for prov in (_autotrade_reconstruct_provisional_closes(int(user_id), days=7) or []):
+                        if str((prov or {}).get('setup_id') or '').strip() != sid:
+                            continue
+                        pnl = float((prov or {}).get('pnl_usdt') if (prov or {}).get('pnl_usdt') is not None else (prov or {}).get('pnl') or 0.0)
+                        canon = _canon_signal_outcome_label(str((prov or {}).get('outcome') or ''), pnl)
+                        if canon in {'TP', 'SL'}:
+                            return canon, {'source': 'provisional_setup_close', 'trade': prov, 'lifecycle': life}
                 except Exception:
                     pass
             return 'OPEN', {'source': 'autotrade_open_trade', 'trade': trade, 'lifecycle': life}
