@@ -14743,41 +14743,146 @@ def _market_symbol_from_base(base: str) -> Optional[str]:
         return None
     return None
 
+def _ohlcv_paged_cache_get(symbol: str, timeframe: str, since_ms: int, until_ms: int, limit: int) -> List[List[float]]:
+    try:
+        key = f"{symbol}|{timeframe}|{int(since_ms)}|{int(until_ms)}|{int(limit)}"
+        with _OHLCV_PAGED_CACHE_LOCK:
+            rec = _OHLCV_PAGED_CACHE.get(key)
+        if not rec:
+            return []
+        ts, rows = rec
+        if (float(time.time()) - float(ts or 0.0)) > float(OHLCV_PAGED_CACHE_TTL_SEC or 120):
+            return []
+        return list(rows or []) if isinstance(rows, list) else []
+    except Exception:
+        return []
+
+
+def _ohlcv_paged_cache_set(symbol: str, timeframe: str, since_ms: int, until_ms: int, limit: int, rows: List[List[float]]) -> None:
+    try:
+        key = f"{symbol}|{timeframe}|{int(since_ms)}|{int(until_ms)}|{int(limit)}"
+        with _OHLCV_PAGED_CACHE_LOCK:
+            _OHLCV_PAGED_CACHE[key] = (float(time.time()), list(rows or []))
+    except Exception:
+        return
+
+
 def fetch_ohlcv_paged(symbol: str, timeframe: str, since_ms: int, until_ms: int, limit: int = 1000) -> List[List[float]]:
-    """Fetch OHLCV with pagination (best effort). Returns candles in ascending time."""
+    """Fetch OHLCV with pagination (best effort). Returns candles in ascending time.
+
+    Performance hardening:
+    - caches full paged windows for recent re-reads (signal reports / lifecycle checks)
+    - when exact page pulls are rate-limited, falls back to cached latest OHLCV where possible
+    """
+    cached = _ohlcv_paged_cache_get(symbol, timeframe, since_ms, until_ms, limit)
+    if cached:
+        return cached
+
     ex = get_exchange()
     out: List[List[float]] = []
     cur_since = int(since_ms)
-    # Safety limits
     max_loops = 40
     for _ in range(max_loops):
         try:
             chunk = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=cur_since, limit=limit) or []
         except Exception:
+            try:
+                proxy_limit = max(int(limit), 300)
+                latest = fetch_ohlcv(symbol, timeframe, proxy_limit) or []
+                latest = [c for c in latest if int(c[0]) >= int(since_ms) and int(c[0]) <= int(until_ms)]
+                if latest:
+                    latest = sorted(latest, key=lambda r: r[0])
+                    _ohlcv_paged_cache_set(symbol, timeframe, since_ms, until_ms, limit, latest)
+                    return latest
+            except Exception:
+                pass
             break
         if not chunk:
             break
-        # ensure ascending
         chunk = sorted(chunk, key=lambda r: r[0])
-        # stop if stuck
         if out and chunk[0][0] <= out[-1][0] and len(chunk) == 1:
             break
-        # append new only
         for c in chunk:
+            if int(c[0]) > int(until_ms):
+                break
             if not out or c[0] > out[-1][0]:
                 out.append(c)
+        if not out:
+            break
         last_ts = out[-1][0]
         if last_ts >= until_ms:
             break
-        # advance since by 1 ms to avoid duplicates
         cur_since = int(last_ts + 1)
-        # If chunk is tiny, likely end
         if len(chunk) < max(10, int(limit * 0.2)):
             break
+    out = [c for c in out if int(c[0]) >= int(since_ms) and int(c[0]) <= int(until_ms)]
+    if out:
+        _ohlcv_paged_cache_set(symbol, timeframe, since_ms, until_ms, limit, out)
     return out
 
+def _signal_hit_order_from_candles(side: str, sl: float, tp: float, candles: List[List[float]]) -> dict:
+    t_sl_ts = t_tp_ts = None
+    mixed_first_ts = None
+    max_hi = None
+    min_lo = None
+    first_tp_ts = None
+    first_sl_ts = None
+    for c in (candles or []):
+        try:
+            ts_ms, _o, h, l, _cl, _v = c
+            hi = float(h)
+            lo = float(l)
+        except Exception:
+            continue
+        ts_s = float(ts_ms) / 1000.0
+        max_hi = hi if max_hi is None else max(max_hi, hi)
+        min_lo = lo if min_lo is None else min(min_lo, lo)
+        if side == 'BUY':
+            hit_sl = lo <= sl
+            hit_tp = hi >= tp
+        else:
+            hit_sl = hi >= sl
+            hit_tp = lo <= tp
+        if hit_sl and t_sl_ts is None:
+            t_sl_ts = ts_s
+            first_sl_ts = ts_s
+        if hit_tp and t_tp_ts is None:
+            t_tp_ts = ts_s
+            first_tp_ts = ts_s
+        if hit_sl and hit_tp and mixed_first_ts is None:
+            mixed_first_ts = ts_s
+        if (t_sl_ts is not None) and (t_tp_ts is not None):
+            break
+
+    if t_sl_ts is None and t_tp_ts is None:
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "horizon_not_hit"}
+    if mixed_first_ts is not None and ((t_sl_ts is not None and abs(mixed_first_ts - t_sl_ts) < 0.9) or (t_tp_ts is not None and abs(mixed_first_ts - t_tp_ts) < 0.9)):
+        if side == 'BUY':
+            only_tp = (max_hi is not None and max_hi >= tp) and (min_lo is None or min_lo > sl)
+            only_sl = (min_lo is not None and min_lo <= sl) and (max_hi is None or max_hi < tp)
+        else:
+            only_tp = (min_lo is not None and min_lo <= tp) and (max_hi is None or max_hi < sl)
+            only_sl = (max_hi is not None and max_hi >= sl) and (min_lo is None or min_lo > tp)
+        if only_tp:
+            return {"outcome": "TP", "hit_level": "TP", "hit_ts": first_tp_ts or mixed_first_ts, "best_level": "TP", "best_ts": first_tp_ts or mixed_first_ts, "note": "resolved_from_extrema"}
+        if only_sl:
+            return {"outcome": "SL", "hit_level": "SL", "hit_ts": first_sl_ts or mixed_first_ts, "best_level": "SL", "best_ts": first_sl_ts or mixed_first_ts, "note": "resolved_from_extrema"}
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "tp_and_sl_same_candle"}
+    if t_tp_ts is not None and (t_sl_ts is None or t_tp_ts < t_sl_ts):
+        return {"outcome": "TP", "hit_level": "TP", "hit_ts": t_tp_ts, "best_level": "TP", "best_ts": t_tp_ts, "note": ""}
+    if t_sl_ts is not None:
+        return {"outcome": "SL", "hit_level": "SL", "hit_ts": t_sl_ts, "best_level": "SL", "best_ts": t_sl_ts, "note": ""}
+    return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "edge_case"}
+
+
 def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: str = "1m") -> dict:
-    """Evaluate a setup using the single-TP model (TP, SL, OPEN)."""
+    """Evaluate a setup using the single-TP model (TP, SL, OPEN).
+
+    Resolution order:
+    1) try the requested timeframe first (usually 1m)
+    2) fall back to 5m/15m when 1m is unavailable or rate-limited
+    3) use price-extrema-only disambiguation when the coarser candle set clearly crossed only TP or only SL
+    """
     side = str(setup.get("side") or "").upper().strip()
     entry = float(setup.get("entry") or 0.0)
     sl = float(setup.get("sl") or 0.0)
@@ -14794,47 +14899,29 @@ def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: s
 
     since_ms = int(created_ts * 1000)
     until_ms = int(min(time.time(), created_ts + horizon_hours * 3600) * 1000)
-    candles = fetch_ohlcv_paged(market_symbol, timeframe, since_ms=since_ms, until_ms=until_ms, limit=1000)
-    if not candles:
-        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "no_ohlcv"}
+    if until_ms <= since_ms:
+        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "empty_window"}
 
-    t_sl_ts = t_tp_ts = None
-    mixed_first_ts = None
-    for c in candles:
+    tf_candidates = []
+    for tf in [str(timeframe or '1m').strip() or '1m', '5m', '15m']:
+        if tf not in tf_candidates:
+            tf_candidates.append(tf)
+
+    last_open = {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "no_ohlcv"}
+    for tf in tf_candidates:
         try:
-            ts_ms, _o, h, l, _cl, _v = c
-            hi = float(h)
-            lo = float(l)
+            candles = fetch_ohlcv_paged(market_symbol, tf, since_ms=since_ms, until_ms=until_ms, limit=1000)
         except Exception:
+            candles = []
+        if not candles:
+            last_open = {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": f"no_ohlcv_{tf}"}
             continue
-        ts_s = ts_ms / 1000.0
-        if side == 'BUY':
-            hit_sl = lo <= sl
-            hit_tp = hi >= tp
-        else:
-            hit_sl = hi >= sl
-            hit_tp = lo <= tp
-        if hit_sl and t_sl_ts is None:
-            t_sl_ts = ts_s
-        if hit_tp and t_tp_ts is None:
-            t_tp_ts = ts_s
-        if hit_sl and hit_tp and mixed_first_ts is None:
-            mixed_first_ts = ts_s
-        if (t_sl_ts is not None) and (t_tp_ts is not None):
-            break
-
-    if t_sl_ts is None and t_tp_ts is None:
-        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "horizon_not_hit"}
-    if mixed_first_ts is not None and ((t_sl_ts is not None and abs(mixed_first_ts - t_sl_ts) < 0.9) or (t_tp_ts is not None and abs(mixed_first_ts - t_tp_ts) < 0.9)):
-        return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "tp_and_sl_same_candle"}
-    if t_tp_ts is not None and (t_sl_ts is None or t_tp_ts < t_sl_ts):
-        return {"outcome": "TP", "hit_level": "TP", "hit_ts": t_tp_ts, "best_level": "TP", "best_ts": t_tp_ts, "note": ""}
-    if t_sl_ts is not None:
-        return {"outcome": "SL", "hit_level": "SL", "hit_ts": t_sl_ts, "best_level": "SL", "best_ts": t_sl_ts, "note": ""}
-    return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "edge_case"}
-
-
-
+        res = _signal_hit_order_from_candles(side, sl, tp, candles)
+        if str(res.get('outcome') or '').upper().strip() in {'TP', 'SL'}:
+            res['note'] = str(res.get('note') or '') or f'resolved_{tf}'
+            return res
+        last_open = dict(res or {})
+    return last_open
 
 def _signal_setup_eval_payload(setup_id: str) -> dict:
     sid = str(setup_id or '').strip()
@@ -15390,9 +15477,12 @@ _OHLCV_RATE_LIMIT_WARN_UNTIL: Dict[str, float] = {}
 _OHLCV_LAST_KEY: Dict[str, str] = {}
 _OHLCV_INFLIGHT: Dict[str, threading.Event] = {}
 _OHLCV_INFLIGHT_LOCK = threading.Lock()
-OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "60") or 60)
-OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "90") or 90)
+_OHLCV_PAGED_CACHE: Dict[str, tuple[float, list]] = {}
+_OHLCV_PAGED_CACHE_LOCK = threading.Lock()
+OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "180") or 180)
+OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "300") or 300)
 OHLCV_INFLIGHT_WAIT_SEC = float(os.getenv("OHLCV_INFLIGHT_WAIT_SEC", "2.5") or 2.5)
+OHLCV_PAGED_CACHE_TTL_SEC = float(os.getenv("OHLCV_PAGED_CACHE_TTL_SEC", "120") or 120)
 BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC", "6") or 6)
 BYBIT_OPEN_ORDERS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_ORDERS_CACHE_TTL_SEC", "6") or 6)
 SCREEN_DIRECTIONAL_CACHE_TTL_SEC = int(os.getenv("SCREEN_DIRECTIONAL_CACHE_TTL_SEC", "45") or 45)
@@ -15552,8 +15642,8 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         name = type(e).__name__
         msg = str(e or '')
         if 'RateLimitExceeded' in name or '10006' in msg or 'rate limit' in msg.lower() or 'too many visits' in msg.lower():
-            key_cd = max(6.0, float(OHLCV_TTL_SEC))
-            tf_cd = max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 20.0), min(key_cd, 60.0))
+            key_cd = max(12.0, float(OHLCV_TTL_SEC))
+            tf_cd = max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 60.0), min(max(key_cd, 120.0), 180.0))
             _OHLCV_RATE_LIMIT_UNTIL[key] = now_ts + key_cd
             _OHLCV_TF_RATE_LIMIT_UNTIL[tf_key] = max(float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0), now_ts + tf_cd)
             warn_key = f'{tf_key}:rate_limit'
@@ -15585,7 +15675,7 @@ def ema7_1h_distance_pct(market_symbol: str) -> Tuple[float, float, float]:
     dist_pct is absolute percent distance between last close and EMA7 on 1H candles.
     """
     try:
-        c1 = fetch_ohlcv(market_symbol, "1h", limit=40)
+        c1 = fetch_ohlcv(market_symbol, "1h", limit=20)
         if not c1 or len(c1) < 10:
             return 999.0, 0.0, 0.0
         closes = [float(x[4]) for x in c1]
@@ -30292,6 +30382,13 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     def _eval_all():
+        for _e in (emailed or []):
+            try:
+                sid = str((_e or {}).get('setup_id') or '').strip()
+                if sid:
+                    _signal_outcome_sync_for_setup(int(uid), sid, force=True)
+            except Exception:
+                continue
         return _signal_report_resolve_rows(int(uid), emailed, user=user)
 
     rows, hidden_untracked_open = await to_thread_heavy(_eval_all, timeout=120)
@@ -30784,7 +30881,7 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
 
     user = _autotrade_user_settings(owner_uid)
     seen_out = set()
-    enrich_budget = 8
+    enrich_budget = 0
 
     def _out_key(row: dict) -> tuple:
         sym = str(_bybit_linear_symbol((row or {}).get('symbol') or '')).upper()
@@ -30912,16 +31009,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
 
     _autotrade_migrate_tables()
 
-    # Keep report requests lightweight. Exit guardian already runs on its own schedule,
-    # so the report path should not trigger another expensive protection sweep.
-    sync_days = max(3, min(10, int(math.ceil(float(lookback_h) / 24.0)) + 2))
-    sync_gate = f"autotrade_report_sync_gate:{owner_uid}:{sync_days}"
-    try:
-        if not cache_valid(sync_gate, 300):
-            _trade_lifecycle_sync(owner_uid, days=sync_days, force=False)
-            cache_set(sync_gate, {'ts': time.time()})
-    except Exception:
-        pass
+    # Keep report requests lightweight. The report path must stay read-only and fast on Render.
 
     lines = ["📒 AutoTrade Journal", HDR, f"Window: last {lookback_h}h (Melbourne)"]
 
@@ -31151,14 +31239,28 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
 
+    cache_key = f"autotrade_report_text:{owner_uid}:{lookback_h}"
+    stale_cached = ''
     try:
-        text_out = await to_thread_heavy(_autotrade_report_text_cached, owner_uid, lookback_h, timeout=AUTOTRADE_REPORT_TIMEOUT_SEC)
+        raw_cached = cache_get(cache_key)
+        stale_cached = raw_cached if isinstance(raw_cached, str) else ''
+    except Exception:
+        stale_cached = ''
+
+    try:
+        text_out = await to_thread_fast(_autotrade_report_text_cached, owner_uid, lookback_h, timeout=max(12, min(25, int(AUTOTRADE_REPORT_TIMEOUT_SEC))))
     except asyncio.TimeoutError:
-        await update.message.reply_text(f"⚠️ /autotrade_report timed out after {int(AUTOTRADE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
-        return
+        if stale_cached:
+            text_out = stale_cached + "\n" + SEP + "Showing cached snapshot while a fresh report rebuild is still busy."
+        else:
+            await update.message.reply_text(f"⚠️ /autotrade_report timed out after {int(AUTOTRADE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
+            return
     except Exception as e:
-        await update.message.reply_text(f"❌ /autotrade_report failed: {type(e).__name__}: {e}")
-        return
+        if stale_cached:
+            text_out = stale_cached + "\n" + SEP + f"Showing cached snapshot after refresh failure ({type(e).__name__})."
+        else:
+            await update.message.reply_text(f"❌ /autotrade_report failed: {type(e).__name__}: {e}")
+            return
 
     await send_long_message(update, text_out, parse_mode=None)
 
