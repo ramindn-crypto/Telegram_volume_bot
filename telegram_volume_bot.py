@@ -5461,6 +5461,59 @@ def _autotrade_log_symbol_block(uid: int, symbol: str, side: str, reason: str, e
         pass
 
 
+def _autotrade_live_symbol_conflict(uid: int, symbol: str, side: str | None = None) -> dict:
+    """Return same-symbol live-position conflict detail for AutoTrade.
+
+    Manual/external positions should not contaminate bot risk or reporting, but a same-symbol
+    live position in the same Bybit account is still an execution conflict because Bybit one-way
+    mode merges the exposure and makes bot/manual ownership impossible to enforce cleanly.
+    """
+    sym = _bybit_linear_symbol(symbol)
+    requested_side = str(side or '').upper().strip()
+    out = {
+        'has_conflict': False,
+        'symbol': sym,
+        'requested_side': requested_side,
+        'position_side': '',
+        'position_qty': 0.0,
+        'owner_kind': '',
+        'trade_id': '',
+        'setup_id': '',
+        'reason': '',
+    }
+    if not sym:
+        return out
+    try:
+        journal_open = _autotrade_db_open_trades(int(uid)) or []
+    except Exception:
+        journal_open = []
+    try:
+        for p in (_bybit_get_open_positions_linear() or []):
+            try:
+                if _pos_symbol(p) != sym:
+                    continue
+                qty = abs(float(_pos_size(p) or 0.0))
+                if qty <= 0:
+                    continue
+                pos_side = str(_pos_side_text(p) or '').upper().strip()
+                owner_trade = _autotrade_live_position_owner_trade(int(uid), p, journal_open=journal_open)
+                out.update({
+                    'has_conflict': True,
+                    'position_side': pos_side,
+                    'position_qty': float(qty),
+                    'owner_kind': 'bot' if owner_trade else 'external',
+                    'trade_id': str((owner_trade or {}).get('trade_id') or ''),
+                    'setup_id': str((owner_trade or {}).get('setup_id') or ''),
+                })
+                out['reason'] = 'blocked_duplicate_open_position' if owner_trade else 'blocked_manual_same_symbol_position'
+                return out
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
 def _autotrade_can_open_symbol(uid: int, symbol: str, side: str, session_label: str) -> tuple[bool, str, dict]:
     """Single hardened gatekeeper for symbol tradability."""
     sym = _bybit_linear_symbol(symbol)
@@ -5470,6 +5523,10 @@ def _autotrade_can_open_symbol(uid: int, symbol: str, side: str, session_label: 
         'side': sd,
         'session': str(session_label or '').upper(),
         'live_open_position': False,
+        'live_position_owner': '',
+        'live_position_side': '',
+        'live_position_qty': 0.0,
+        'live_position_trade_id': '',
         'local_open_trade': False,
         'live_open_order': False,
         'pending_guard': False,
@@ -5491,13 +5548,19 @@ def _autotrade_can_open_symbol(uid: int, symbol: str, side: str, session_label: 
 
     if str(AUTOTRADE_MODE).lower() == 'live':
         try:
-            for p in _bybit_get_open_positions_linear():
-                if _pos_symbol(p) == sym and abs(float(_pos_size(p) or 0.0)) > 0:
-                    detail['live_open_position'] = True
-                    _autotrade_log_symbol_block(uid, sym, sd, 'blocked_duplicate_open_position', 'live_position_present')
-                    return (False, 'blocked_duplicate_open_position', detail)
+            conflict = _autotrade_live_symbol_conflict(uid, sym, side=sd)
         except Exception:
-            pass
+            conflict = {}
+        if bool((conflict or {}).get('has_conflict')):
+            detail['live_open_position'] = True
+            detail['live_position_owner'] = str((conflict or {}).get('owner_kind') or '')
+            detail['live_position_side'] = str((conflict or {}).get('position_side') or '')
+            detail['live_position_qty'] = float((conflict or {}).get('position_qty') or 0.0)
+            detail['live_position_trade_id'] = str((conflict or {}).get('trade_id') or '')
+            block_reason = str((conflict or {}).get('reason') or 'blocked_duplicate_open_position')
+            extra = f"owner={detail['live_position_owner'] or '?'} pos_side={detail['live_position_side'] or '?'} qty={detail['live_position_qty']:.6g}"
+            _autotrade_log_symbol_block(uid, sym, sd, block_reason, extra)
+            return (False, block_reason, detail)
 
     local_activity = _autotrade_get_local_symbol_activity(uid, sym)
     local_opens = local_activity.get('open_trades') or []
@@ -31966,6 +32029,15 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if dec_reason:
             result += f" | {dec_reason}"
         lines.append(f"Result: {result}")
+    try:
+        can_open_detail = dict(det.get('can_open_detail') or {})
+    except Exception:
+        can_open_detail = {}
+    if can_open_detail.get('live_open_position'):
+        owner_kind = str(can_open_detail.get('live_position_owner') or '').strip() or 'unknown'
+        pos_side = str(can_open_detail.get('live_position_side') or '').strip() or '—'
+        pos_qty = float(can_open_detail.get('live_position_qty') or 0.0)
+        lines.append(f"Conflict: {owner_kind} same-symbol live position | side {pos_side} | qty {pos_qty:.6g}")
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -32068,6 +32140,15 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not dec_reason and isinstance(dec.get('reasons'), list):
             dec_reason = ', '.join([str(r) for r in (dec.get('reasons') or [])[:3]])
         lines.append(f"• {dec.get('status','')} | {dec_reason}")
+        try:
+            last_det = dict(_LAST_AUTOTRADE_DETAIL.get(owner) or {})
+            cod = dict(last_det.get('can_open_detail') or {})
+        except Exception:
+            cod = {}
+        if cod.get('live_open_position'):
+            lines.append(
+                f"• Conflict detail: owner={str(cod.get('live_position_owner') or '?')} | pos_side={str(cod.get('live_position_side') or '?')} | qty={float(cod.get('live_position_qty') or 0.0):.6g}"
+            )
     class_rows = mday.get('position_classifications') or []
     if class_rows:
         lines.extend([SEP, 'Position day buckets (AutoTrade-owned only)'])
@@ -35295,6 +35376,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             cooldown_blocked = 0
             flip_blocked = 0
             diversify_blocked = Counter()
+            owner_manual_same_symbol_blocked = 0
 
             for s in picks:
                 if len(chosen_list) >= int(EMAIL_SETUPS_N):
@@ -35330,6 +35412,15 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     cooldown_blocked += 1
                     continue
 
+                if int(uid) == int(AUTOTRADE_OWNER_UID or 0) and str(AUTOTRADE_MODE).lower() == 'live':
+                    try:
+                        _conflict = _autotrade_live_symbol_conflict(int(uid), sym, side=side)
+                    except Exception:
+                        _conflict = {}
+                    if bool((_conflict or {}).get('has_conflict')) and str((_conflict or {}).get('owner_kind') or '') == 'external':
+                        owner_manual_same_symbol_blocked += 1
+                        continue
+
                 chosen_list.append(s)
 
             if not chosen_list:
@@ -35340,6 +35431,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     reasons.append(f"flip_guard_blocked={flip_blocked}")
                 if diversify_blocked:
                     reasons.append(f"diversified_blocked={dict(diversify_blocked.most_common(3))}")
+                if owner_manual_same_symbol_blocked:
+                    reasons.append(f"owner_manual_same_symbol_blocked={owner_manual_same_symbol_blocked}")
                 reasons.append("all_candidates_blocked")
 
                 _LAST_EMAIL_DECISION[uid] = {
@@ -37045,6 +37138,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     break
                 if reason not in {
                     'blocked_duplicate_open_position',
+                    'blocked_manual_same_symbol_position',
                     'blocked_duplicate_pending_order',
                     'blocked_duplicate_inflight_lock',
                     'blocked_by_cooldown',
