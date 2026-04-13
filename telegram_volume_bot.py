@@ -21588,7 +21588,8 @@ async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         rec = str(r.get("recommendation") or "").strip()
         if rec:
             lines.append(f"  Insight: {rec}")
-    await send_long_message(update, "\n".join(lines), parse_mode=None)
+    safe_lines = [str(x) for x in lines if x is not None]
+    await send_long_message(update, "\n".join(safe_lines), parse_mode=None)
 
 
 # =========================================================
