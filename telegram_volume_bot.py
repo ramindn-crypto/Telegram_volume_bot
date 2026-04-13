@@ -348,6 +348,66 @@ def _autotrade_set_sessions(val: str):
             conn.commit()
     except Exception:
         pass
+
+AUTOTRADE_DAILY_CAP_MODE_KEY = 'daily_cap_at_mode'
+AUTOTRADE_DAILY_CAP_VALUE_KEY = 'daily_cap_at_value'
+
+def _autotrade_daily_cap_settings() -> tuple[str, float]:
+    default_mode = 'PCT'
+    default_value = float(AUTOTRADE_DAILY_RISK_CAP_PCT)
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS autotrade_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.execute(
+                "SELECT key, value FROM autotrade_config WHERE key IN (?, ?)",
+                (AUTOTRADE_DAILY_CAP_MODE_KEY, AUTOTRADE_DAILY_CAP_VALUE_KEY)
+            )
+            rows = c.fetchall() or []
+        data = {str(k or ''): v for k, v in rows}
+        mode = str(data.get(AUTOTRADE_DAILY_CAP_MODE_KEY, default_mode) or default_mode).strip().upper()
+        if mode not in {'PCT', 'USD'}:
+            mode = default_mode
+        try:
+            value = float(data.get(AUTOTRADE_DAILY_CAP_VALUE_KEY, default_value) or default_value)
+        except Exception:
+            value = float(default_value)
+        if value < 0:
+            value = 0.0
+        return mode, float(value)
+    except Exception:
+        return default_mode, float(default_value)
+
+def _autotrade_set_daily_cap_settings(mode: str, value: float) -> None:
+    mode_u = str(mode or 'PCT').strip().upper()
+    if mode_u not in {'PCT', 'USD'}:
+        mode_u = 'PCT'
+    val_f = max(0.0, float(value or 0.0))
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS autotrade_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.execute(
+                "INSERT OR REPLACE INTO autotrade_config(key,value) VALUES(?,?)",
+                (AUTOTRADE_DAILY_CAP_MODE_KEY, mode_u)
+            )
+            c.execute(
+                "INSERT OR REPLACE INTO autotrade_config(key,value) VALUES(?,?)",
+                (AUTOTRADE_DAILY_CAP_VALUE_KEY, str(float(val_f)))
+            )
+            conn.commit()
+    except Exception:
+        pass
 # =============================================================
 
 import asyncio
@@ -4724,7 +4784,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
         pass
 
     try:
-        cap = float(daily_cap_usd(user) or 0.0) if equity and equity > 0 else 0.0
+        cap = float(_autotrade_daily_cap_usd(int(uid), float(equity or 0.0)) or 0.0) if equity and equity > 0 else 0.0
     except Exception:
         cap = 0.0
 
@@ -4960,7 +5020,13 @@ def _autotrade_daily_cap_usd(uid: int, equity: float) -> float:
             user["equity"] = float(equity)
     except Exception:
         pass
-    return float(daily_cap_usd(user) or 0.0)
+    mode, val = _autotrade_daily_cap_settings()
+    if mode == 'USD':
+        return max(0.0, float(val or 0.0))
+    eq = _effective_equity_for_risk(user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
+    if eq <= 0:
+        return 0.0
+    return _risk_amount_from_pct(eq, float(val or 0.0))
 
 def _autotrade_remaining_risk_usd(uid: int, equity: float) -> float:
     user = _autotrade_user_settings(uid)
@@ -11503,7 +11569,7 @@ def _autotrade_day_risk_metrics_quick(uid: int, equity: float) -> dict:
         pass
 
     try:
-        cap = float(daily_cap_usd(user) or 0.0) if equity and equity > 0 else 0.0
+        cap = float(_autotrade_daily_cap_usd(int(uid), float(equity or 0.0)) or 0.0) if equity and equity > 0 else 0.0
     except Exception:
         cap = 0.0
 
@@ -11853,7 +11919,7 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["trades_today_limit"] = 0
         snap["remaining_new_positions_today"] = 0
     else:
-        cap = float(daily_cap_usd(user) or 0.0)
+        cap = float(_autotrade_daily_cap_usd(uid, float(_effective_equity_for_risk(user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live')) or 0.0)) or 0.0)
         pnl_today = float(_pnl_today_closed_trades(uid, user) or 0.0)
         pm = _manual_position_metrics(uid, user)
         current_day_open_risk = float(pm.get('current_day_open_risk') or 0.0)
@@ -28558,12 +28624,13 @@ ADMIN_HELP_DESCRIPTIONS = {
     "goal_abort": "Abort a running goal-profile optimizer cycle safely after the current evaluation step",
     "trade_id_reset": "Reset your own Trade ID numbering",
     "dailycap": "Set daily risk cap, including /dailycap pct 100 for full-account daily cap",
+    "dailycapAT": "Set AutoTrade daily risk cap separately from manual /dailycap",
     "dayrisk_reset": "Reset today’s used-risk baseline for the active day. Use /dayrisk_reset, /dayrisk_reset show, or /dayrisk_reset clear",
 }
 
 ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
-    ("⚖️ RISK / DAY RESET", ["dailycap", "dayrisk_reset"]),
+    ("⚖️ RISK / DAY RESET", ["dailycap", "dailycapAT", "dayrisk_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "adaptive_run", "goal_status", "goal_run", "goal_set", "goal_abort", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
@@ -29218,6 +29285,67 @@ async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def dailycapAT_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only AutoTrade daily risk cap, separate from manual /dailycap."""
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    owner = int(AUTOTRADE_OWNER_UID or uid)
+    user = _autotrade_user_settings(owner)
+    eq = _effective_equity_for_risk(user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
+    mode_now, val_now = _autotrade_daily_cap_settings()
+    cap_now = float(_autotrade_daily_cap_usd(owner, float(eq or 0.0)) or 0.0)
+
+    if len(context.args) != 2:
+        mode_txt = str(mode_now or 'PCT').upper()
+        suffix = '%' if mode_txt == 'PCT' else ''
+        await update.message.reply_text(
+            f"AutoTrade daily risk cap: {mode_txt} {float(val_now or 0.0):.2f}{suffix} (≈ ${cap_now:.2f} per day)\n"
+            "Manual trading daily cap is separate: /dailycap\n\n"
+            "Set examples:\n"
+            "• /dailycapAT pct 5\n"
+            "• /dailycapAT pct 100\n"
+            "• /dailycapAT usd 60"
+        )
+        return
+
+    mode = str(context.args[0] or '').strip().upper()
+    try:
+        val = float(context.args[1])
+    except Exception:
+        await update.message.reply_text("Usage: /dailycapAT pct 5  OR  /dailycapAT usd 60")
+        return
+
+    if mode not in {"PCT", "USD"}:
+        await update.message.reply_text("Mode must be pct or usd")
+        return
+    if mode == "PCT" and not (0.0 <= val <= 100):
+        await update.message.reply_text("pct/day should be between 0 and 100")
+        return
+    if mode == "USD" and val < 0:
+        await update.message.reply_text("usd/day must be >= 0")
+        return
+
+    _autotrade_set_daily_cap_settings(mode, val)
+    mode_txt, val_txt = _autotrade_daily_cap_settings()
+    cap_txt = float(_autotrade_daily_cap_usd(owner, float(eq or 0.0)) or 0.0)
+    suffix = '%' if mode_txt == 'PCT' else ''
+    try:
+        cache_delete(f'accounting_snapshot_fast:{int(owner)}')
+    except Exception:
+        pass
+    try:
+        cache_delete(f'autotrade_day_metrics_fast:{int(owner)}')
+    except Exception:
+        pass
+    await update.message.reply_text(
+        f"✅ AutoTrade daily risk cap updated: {mode_txt} {float(val_txt or 0.0):.2f}{suffix} (≈ ${cap_txt:.2f} per day)\n"
+        "Manual trading /dailycap remains separate."
+    )
+
+
 
 async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: baseline-reset current day risk so remaining daily cap is restored."""
@@ -29227,7 +29355,7 @@ async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = reset_daily_if_needed(get_user(uid) or {})
     day_local = _user_day_local(user)
-    cap = float(daily_cap_usd(user) or 0.0)
+    cap = float(_autotrade_daily_cap_usd(uid, float(_effective_equity_for_risk(user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live')) or 0.0)) or 0.0)
     snap = _accounting_snapshot(uid, user, is_admin=True)
     raw_used = float(snap.get('used_today_raw', snap.get('used_today', 0.0)) or 0.0)
     effective_used = float(snap.get('used_today', 0.0) or 0.0)
@@ -29238,7 +29366,7 @@ async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🧮 Daily Risk Reset Status\n"
             f"• Trading day: {snap.get('today_window_label')}\n"
-            f"• Daily cap: {str(user.get('daily_cap_mode','PCT')).upper()} {float(user.get('daily_cap_value',0.0) or 0.0):.2f} (≈ ${cap:.2f})\n"
+            f"• Daily cap: {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${cap:.2f})\n"
             f"• Raw used today: ${raw_used:.2f}\n"
             f"• Reset credit: ${existing_credit:.2f}\n"
             f"• Effective used today: ${effective_used:.2f}\n"
@@ -30329,9 +30457,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Carried from prior day: {int(snap.get('inherited_open_positions', 0))}",
         f"• Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f}",
         (
-            f"• Daily cap: {'AUTOTRADE' if is_admin else str(user.get('daily_cap_mode','PCT')).upper()} "
-            f"{(float(AUTOTRADE_DAILY_RISK_CAP_PCT) if is_admin else float(user.get('daily_cap_value',0.0))):.2f}"
-            f"{'%' if is_admin else ''} (≈ ${cap:.2f})"
+            f"• Daily cap: {(str(_autotrade_daily_cap_settings()[0]).upper() if is_admin else str(user.get('daily_cap_mode','PCT')).upper())} "
+            f"{((float(_autotrade_daily_cap_settings()[1] or 0.0)) if is_admin else float(user.get('daily_cap_value',0.0))):.2f}"
+            f"{('%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else '') if is_admin else ''} (≈ ${cap:.2f})"
         ),
         f"• Current-day open risk: ${float(snap.get('current_day_open_risk', 0.0)):.2f}",
         f"• Live open risk charged today: ${float(snap.get('live_open_risk_charged_today', snap.get('current_day_open_risk', 0.0))):.2f}",
@@ -32158,7 +32286,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Trading day: {snap.get('today_window_label')}",
         SEP,
         f"Equity: ${equity:.2f}",
-        f"Daily cap: ${float(snap.get('cap') or 0.0):.2f}",
+        f"Daily cap: {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
         f"Opened today: {int(snap.get('positions_opened_today', 0) or 0)} | Closed today: {int(snap.get('positions_closed_today', 0) or 0)} | Open now: {int(snap.get('open_positions_now', 0) or 0)}",
         f"Open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
         (f"Ignored manual/external positions: {int(snap.get('external_open_positions', 0) or 0)} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
@@ -32209,6 +32337,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         for row in class_rows[:10]:
             bucket = str(row.get('bucket') or '').strip() or 'current_day'
             lines.append(f"• {row.get('symbol')} | {row.get('side')} | {bucket}")
+    lines = [str(ln) for ln in lines if ln is not None and str(ln) != '']
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -37333,6 +37462,8 @@ def main():
     app.add_handler(CommandHandler("equity_reset", equity_reset_cmd, block=False))
     app.add_handler(CommandHandler("riskmode", riskmode_cmd, block=False))
     app.add_handler(CommandHandler("dailycap", dailycap_cmd, block=False))
+    app.add_handler(CommandHandler("dailycapAT", dailycapAT_cmd, block=False))
+    app.add_handler(CommandHandler("dailycapat", dailycapAT_cmd, block=False))
     app.add_handler(CommandHandler("dayrisk_reset", dayrisk_reset_cmd, block=False))
     app.add_handler(CommandHandler("limits", limits_cmd, block=False))
 
