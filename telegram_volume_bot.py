@@ -455,6 +455,9 @@ async def to_thread_bg(fn, *args, timeout: int | None = None, **kwargs):
 # Fast-command activity hint so background jobs can yield briefly to user-facing commands.
 _USER_ACTIVITY_TS = 0.0
 USER_ACTIVITY_COOLDOWN_SEC = int(os.getenv("USER_ACTIVITY_COOLDOWN_SEC", "20") or 20)
+FAST_ADMIN_SNAPSHOT_TTL_SEC = int(os.getenv("FAST_ADMIN_SNAPSHOT_TTL_SEC", "20") or 20)
+FAST_ADMIN_METRICS_TTL_SEC = int(os.getenv("FAST_ADMIN_METRICS_TTL_SEC", "20") or 20)
+FAST_ADMIN_COMMAND_TIMEOUT_SEC = int(os.getenv("FAST_ADMIN_COMMAND_TIMEOUT_SEC", "4") or 4)
 
 def _mark_user_activity() -> None:
     global _USER_ACTIVITY_TS
@@ -2472,7 +2475,7 @@ def _effective_equity_for_risk(user: dict | None = None, prefer_live: bool = Tru
         eq = 0.0
     if prefer_live:
         try:
-            live_eq = _live_equity_usdt()
+            live_eq = _live_equity_usdt_cached(ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
             if live_eq is not None and float(live_eq) > 0:
                 return float(live_eq)
         except Exception:
@@ -2620,6 +2623,35 @@ def _live_equity_usdt() -> float | None:
         return eq if eq > 0 else None
     except Exception:
         return None
+
+
+def _live_equity_usdt_cached(ttl: int | None = None, force_refresh: bool = False) -> float | None:
+    """Short cache for live equity so fast admin commands do not hit Bybit every time."""
+    try:
+        cache_key = 'live_equity_usdt'
+        ttl_i = max(2, int(ttl if ttl is not None else FAST_ADMIN_SNAPSHOT_TTL_SEC))
+        if (not force_refresh) and cache_valid(cache_key, ttl_i):
+            val = cache_get(cache_key)
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except Exception:
+                return None
+        eq = _live_equity_usdt()
+        if eq is not None and float(eq) > 0:
+            cache_set(cache_key, float(eq))
+            return float(eq)
+        stale = cache_get(cache_key)
+        if stale is None:
+            return None
+        return float(stale)
+    except Exception:
+        try:
+            stale = cache_get('live_equity_usdt')
+            return float(stale) if stale is not None else None
+        except Exception:
+            return None
 
 
 
@@ -11343,6 +11375,308 @@ def _autotrade_trades_today_count(uid: int, now_utc: Optional[datetime] = None) 
         return 0
 
 
+def _autotrade_day_risk_metrics_quick(uid: int, equity: float) -> dict:
+    """Fast admin-only day metrics for hot commands.
+
+    Intentionally avoids slow exchange-history reconciliation and uses journal + current
+    live positions for a quick operational snapshot.
+    """
+    cap = 0.0
+    open_pnl = 0.0
+    realized_pnl_today = 0.0
+    realized_loss_today = 0.0
+    mode = str(AUTOTRADE_MODE).lower()
+    user = _autotrade_user_settings(uid)
+
+    try:
+        if equity and equity > 0:
+            user = dict(user)
+            user["equity"] = float(equity)
+    except Exception:
+        pass
+
+    try:
+        cap = float(daily_cap_usd(user) or 0.0) if equity and equity > 0 else 0.0
+    except Exception:
+        cap = 0.0
+
+    start_utc, end_utc = _admin_today_window_utc(uid=int(uid), user=user)
+    start_ts = float(start_utc.timestamp())
+    end_ts = float(end_utc.timestamp())
+
+    current_total_open_risk = 0.0
+    current_day_open_risk = 0.0
+    live_open_risk_charged_today = 0.0
+    carried_open_risk = 0.0
+    open_positions_now = 0
+    inherited_open_positions = 0
+    opened_today_count = 0
+    closed_today_count = 0
+    closed_today_rows = []
+    position_classifications = []
+    external_open_positions = 0
+    external_open_risk = 0.0
+    external_open_pnl = 0.0
+
+    try:
+        closed_today_rows = _autotrade_closed_activity_rows_window(int(uid), float(start_ts), float(end_ts)) or []
+        closed_today_count = int(len(closed_today_rows))
+        realized_pnl_today = float(sum(
+            float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0)
+            for r in closed_today_rows
+        ))
+        realized_loss_today = float(sum(
+            abs(float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0))
+            for r in closed_today_rows
+            if float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0) < 0.0
+        ))
+    except Exception:
+        closed_today_rows = []
+        closed_today_count = 0
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM autotrade_trades WHERE uid=? AND opened_ts>=? AND opened_ts<?",
+                (int(uid), int(start_ts), int(end_ts)),
+            )
+            row = cur.fetchone()
+            opened_today_count = int((row[0] if row else 0) or 0)
+    except Exception:
+        opened_today_count = 0
+
+    try:
+        journal_open = _autotrade_db_open_trades(int(uid)) or []
+    except Exception:
+        journal_open = []
+
+    def _opened_ts_from_trade(t: dict) -> float:
+        try:
+            return float(t.get('opened_ts') or 0.0)
+        except Exception:
+            return 0.0
+
+    if mode == 'live':
+        try:
+            positions = _bybit_get_open_positions_linear()
+        except Exception:
+            positions = []
+        bot_positions = []
+        for p in (positions or []):
+            tr = _autotrade_live_position_owner_trade(int(uid), p, journal_open=journal_open)
+            if tr:
+                bot_positions.append((p, tr))
+            else:
+                external_open_positions += 1
+                external_open_pnl += float(_pos_unreal_pnl(p) or 0.0)
+                external_open_risk += max(0.0, float(_estimate_position_risk_usd(p) or 0.0))
+
+        open_positions_now = len(bot_positions)
+        open_pnl = float(sum(_pos_unreal_pnl(p) for p, _tr in bot_positions) or 0.0) if bot_positions else 0.0
+
+        for p, matched_trade in bot_positions:
+            est = float(_estimate_position_risk_usd(p) or 0.0)
+            opened_ts = float(matched_trade.get('opened_ts') or 0.0)
+            if opened_ts <= 0:
+                try:
+                    opened_ts = float(_ts_seconds_from_any((p or {}).get('createdTime') or (p or {}).get('created_time')) or 0.0)
+                except Exception:
+                    opened_ts = 0.0
+            psym = _pos_symbol(p)
+            pside = _pos_side_text(p)
+            if est <= 0:
+                try:
+                    est = float(_autotrade_estimated_risk_usd(float(matched_trade.get('entry') or 0.0), float(matched_trade.get('sl') or 0.0), float(matched_trade.get('qty') or 0.0)) or 0.0)
+                except Exception:
+                    pass
+            est = max(0.0, float(est or 0.0))
+            current_total_open_risk += est
+
+            if opened_ts > 0 and opened_ts < start_ts:
+                bucket = 'carried'
+                carried_open_risk += est
+                inherited_open_positions += 1
+            else:
+                bucket = 'current_day'
+                current_day_open_risk += est
+
+            position_classifications.append({
+                'symbol': psym,
+                'side': pside,
+                'risk': float(est),
+                'opened_ts': float(opened_ts or 0.0),
+                'bucket': bucket,
+                'source': 'autotrade_journal',
+            })
+        inherited_open_positions = min(int(inherited_open_positions), int(open_positions_now))
+        current_day_open_positions = max(0, int(open_positions_now) - int(inherited_open_positions))
+        live_open_risk_charged_today = float(current_day_open_risk)
+        opened_today_count = max(int(opened_today_count), int(closed_today_count) + int(current_day_open_positions))
+    else:
+        open_positions_now = len(journal_open)
+        for t in journal_open:
+            est = max(0.0, float(_autotrade_estimated_risk_usd(float(t.get('entry') or 0.0), float(t.get('sl') or 0.0), float(t.get('qty') or 0.0)) or 0.0))
+            opened_ts = _opened_ts_from_trade(t)
+            current_total_open_risk += est
+            if opened_ts and opened_ts < start_ts:
+                bucket = 'carried'
+                carried_open_risk += est
+                inherited_open_positions += 1
+            else:
+                bucket = 'current_day'
+                current_day_open_risk += est
+            position_classifications.append({
+                'symbol': str(t.get('symbol') or '').upper(),
+                'side': str(t.get('side') or '').upper(),
+                'risk': float(est),
+                'opened_ts': float(opened_ts or 0.0),
+                'bucket': bucket,
+                'source': 'autotrade_journal',
+            })
+        open_pnl = 0.0
+
+    if float(live_open_risk_charged_today or 0.0) <= 0.0:
+        live_open_risk_charged_today = float(current_day_open_risk)
+    raw_daily_used_total = max(0.0, float(live_open_risk_charged_today) - float(realized_pnl_today))
+    effective_daily_used_total, reset_credit = _risk_day_reset_effective_used(int(uid), user, raw_daily_used_total)
+    remaining_raw = float('inf') if cap <= 0 else (float(cap) - float(effective_daily_used_total))
+    over_by = abs(float(remaining_raw)) if cap > 0 and remaining_raw < 0 else 0.0
+
+    return {
+        'cap': float(cap),
+        'open_risk': float(current_total_open_risk),
+        'used_risk': float(current_day_open_risk),
+        'used_total': float(effective_daily_used_total),
+        'used_total_raw': float(raw_daily_used_total),
+        'risk_reset_credit': float(reset_credit),
+        'open_pnl': float(open_pnl),
+        'realized_pnl_today': float(realized_pnl_today),
+        'realized_loss_today': float(realized_loss_today),
+        'remaining': float(remaining_raw),
+        'over_by': float(over_by),
+        'current_total_open_risk': float(current_total_open_risk),
+        'current_day_open_risk': float(current_day_open_risk),
+        'live_open_risk_charged_today': float(live_open_risk_charged_today),
+        'carried_open_risk': float(carried_open_risk),
+        'open_positions_now': int(open_positions_now),
+        'inherited_open_positions': int(inherited_open_positions),
+        'opened_today_count': int(opened_today_count),
+        'closed_today_count': int(closed_today_count),
+        'closed_today_rows': closed_today_rows,
+        'day_start_ts': float(start_ts),
+        'day_end_ts': float(end_ts),
+        'position_classifications': position_classifications,
+        'external_open_positions': int(external_open_positions),
+        'external_open_risk': float(external_open_risk),
+        'external_open_pnl': float(external_open_pnl),
+    }
+
+
+def _autotrade_day_risk_metrics_cached(uid: int, equity: float, ttl: int | None = None, force_refresh: bool = False) -> dict:
+    cache_key = f'autotrade_day_metrics_fast:{int(uid)}:{round(float(equity or 0.0), 2)}:{str(AUTOTRADE_MODE).lower()}'
+    ttl_i = max(3, int(ttl if ttl is not None else FAST_ADMIN_METRICS_TTL_SEC))
+    try:
+        if (not force_refresh) and cache_valid(cache_key, ttl_i):
+            obj = cache_get(cache_key)
+            if isinstance(obj, dict):
+                return dict(obj)
+        obj = _autotrade_day_risk_metrics_quick(int(uid), float(equity or 0.0))
+        cache_set(cache_key, dict(obj or {}))
+        return dict(obj or {})
+    except Exception:
+        stale = cache_get(cache_key)
+        return dict(stale or {}) if isinstance(stale, dict) else {}
+
+
+def _accounting_snapshot_cached(uid: int, user: dict, is_admin: Optional[bool] = None, ttl: int | None = None, force_refresh: bool = False) -> dict:
+    is_admin = is_admin_user(int(uid)) if is_admin is None else bool(is_admin)
+    try:
+        user = dict(user or {})
+    except Exception:
+        user = {}
+    if not is_admin:
+        return _accounting_snapshot(uid, user, is_admin=is_admin)
+    cache_key = f'accounting_snapshot_fast:{int(uid)}'
+    ttl_i = max(3, int(ttl if ttl is not None else FAST_ADMIN_SNAPSHOT_TTL_SEC))
+    try:
+        if (not force_refresh) and cache_valid(cache_key, ttl_i):
+            obj = cache_get(cache_key)
+            if isinstance(obj, dict):
+                return dict(obj)
+        snap = _accounting_snapshot(uid, user, is_admin=is_admin)
+        cache_set(cache_key, dict(snap or {}))
+        return dict(snap or {})
+    except Exception:
+        stale = cache_get(cache_key)
+        if isinstance(stale, dict):
+            return dict(stale)
+        ctx = _trading_day_context(user)
+        snap = {
+            'is_admin': True,
+            'plan': str(effective_plan(uid, user)).upper(),
+            'equity': float(user.get('equity') or 0.0),
+            'pnl_today': 0.0,
+            'trades_today': 0,
+            'trades_today_limit': 0,
+            'cap': 0.0,
+            'open_risk_today': 0.0,
+            'current_day_open_risk': 0.0,
+            'carried_open_risk': 0.0,
+            'current_total_open_risk': 0.0,
+            'open_positions_now': 0,
+            'positions_opened_today': 0,
+            'positions_closed_today': 0,
+            'closed_today_rows': [],
+            'inherited_open_positions': 0,
+            'external_open_positions': 0,
+            'external_open_risk': 0.0,
+            'external_open_pnl': 0.0,
+            'remaining_new_positions_today': 0,
+            'realized_loss_today': 0.0,
+            'used_today': 0.0,
+            'remaining_today': float('inf'),
+            'over_by': 0.0,
+            'today_basis': f"Anchored trading day ({ctx['tz_name']}, starts {ctx['anchor_hhmm']})",
+            'today_key': ctx['start_local'].date().isoformat(),
+            'today_window_label': f"{ctx['start_local'].strftime('%Y-%m-%d %H:%M')} → {ctx['end_local'].strftime('%Y-%m-%d %H:%M')} {ctx['tz_name']}",
+        }
+        try:
+            live_eq = _live_equity_usdt_cached(ttl=ttl_i)
+            if live_eq is not None:
+                snap['equity'] = float(live_eq)
+        except Exception:
+            pass
+        try:
+            m = _autotrade_day_risk_metrics_cached(int(uid), float(snap['equity'] or 0.0), ttl=ttl_i)
+            snap['cap'] = float(m.get('cap') or 0.0)
+            snap['current_total_open_risk'] = float(m.get('current_total_open_risk') or 0.0)
+            snap['open_risk_today'] = float(m.get('current_day_open_risk') or 0.0)
+            snap['current_day_open_risk'] = float(m.get('current_day_open_risk') or 0.0)
+            snap['carried_open_risk'] = float(m.get('carried_open_risk') or 0.0)
+            snap['open_positions_now'] = int(m.get('open_positions_now') or 0)
+            snap['positions_opened_today'] = int(m.get('opened_today_count') or 0)
+            snap['positions_closed_today'] = int(m.get('closed_today_count') or 0)
+            snap['closed_today_rows'] = list(m.get('closed_today_rows') or [])
+            snap['inherited_open_positions'] = int(m.get('inherited_open_positions') or 0)
+            snap['external_open_positions'] = int(m.get('external_open_positions') or 0)
+            snap['external_open_risk'] = float(m.get('external_open_risk') or 0.0)
+            snap['external_open_pnl'] = float(m.get('external_open_pnl') or 0.0)
+            snap['realized_loss_today'] = float(m.get('realized_loss_today') or 0.0)
+            snap['used_today'] = float(m.get('used_total') or 0.0)
+            snap['used_today_raw'] = float(m.get('used_total_raw') or m.get('used_total') or 0.0)
+            snap['risk_reset_credit'] = float(m.get('risk_reset_credit') or 0.0)
+            snap['live_open_risk_charged_today'] = float(m.get('live_open_risk_charged_today') or m.get('current_day_open_risk') or 0.0)
+            rem = float(m.get('remaining')) if snap['cap'] > 0 else float('inf')
+            snap['remaining_today'] = max(0.0, rem) if math.isfinite(rem) and snap['cap'] > 0 else rem
+            snap['over_by'] = max(0.0, -rem) if math.isfinite(rem) and snap['cap'] > 0 else 0.0
+            snap['pnl_today'] = float(m.get('realized_pnl_today') or 0.0)
+            snap['trades_today'] = int(m.get('opened_today_count') or 0)
+        except Exception:
+            pass
+        return snap
+
+
 def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) -> dict:
     """Single source of truth for status/debug/accounting fields."""
     is_admin = is_admin_user(int(uid)) if is_admin is None else bool(is_admin)
@@ -11378,14 +11712,14 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         "today_window_label": f"{ctx['start_local'].strftime('%Y-%m-%d %H:%M')} → {ctx['end_local'].strftime('%Y-%m-%d %H:%M')} {ctx['tz_name']}",
     }
     if is_admin:
-        live_eq = _live_equity_usdt()
+        live_eq = _live_equity_usdt_cached(ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
         if live_eq is not None:
             snap["equity"] = float(live_eq)
             try:
                 update_user(int(uid), equity=float(live_eq))
             except Exception:
                 pass
-        m = _autotrade_day_risk_metrics(int(uid), float(snap["equity"]))
+        m = _autotrade_day_risk_metrics_cached(int(uid), float(snap["equity"]), ttl=FAST_ADMIN_METRICS_TTL_SEC)
         snap["cap"] = float(m.get("cap") or 0.0)
         snap["current_total_open_risk"] = float(m.get("current_total_open_risk") or 0.0)
         snap["open_risk_today"] = float(m.get("current_day_open_risk") or 0.0)
@@ -28654,7 +28988,7 @@ async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ✅ Admin: /equity is LIVE-synced with Bybit (same as /status)
     if not context.args:
         if is_admin_user(int(uid)):
-            live_eq = _live_equity_usdt()
+            live_eq = _live_equity_usdt_cached(ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
             if live_eq is not None:
                 eq = float(live_eq)
                 try:
@@ -29571,7 +29905,7 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # - Admin: keep equity synced with Bybit (if live equity is available)
     # - Others: manual equity updated by /trade_close pnl
     if is_admin_user(int(uid)):
-        live_eq = _live_equity_usdt()
+        live_eq = _live_equity_usdt_cached(ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
         if live_eq is not None:
             try:
                 update_user(int(uid), equity=float(live_eq))
@@ -29836,9 +30170,15 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        snap = await to_thread_heavy(_accounting_snapshot, uid, user, is_admin=is_admin, timeout=(12 if is_admin else 8))
+        if is_admin:
+            snap = await to_thread_fast(_accounting_snapshot_cached, uid, user, is_admin=is_admin, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
+        else:
+            snap = await to_thread_heavy(_accounting_snapshot, uid, user, is_admin=is_admin, timeout=8)
     except Exception:
-        snap = _accounting_snapshot(uid, user, is_admin=is_admin)
+        if is_admin:
+            snap = _accounting_snapshot_cached(uid, user, is_admin=is_admin, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
+        else:
+            snap = _accounting_snapshot(uid, user, is_admin=is_admin)
     equity = float(snap.get('equity') or 0.0)
     cap = float(snap.get('cap') or 0.0)
     pnl_today = float(snap.get('pnl_today') or 0.0)
@@ -29925,23 +30265,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     lines.append(f"• {side} {sym} | {outcome} | PnL {pnl_val:+.2f} USDT")
                 except Exception:
                     continue
-        live_positions = _bybit_get_open_positions_linear()
-        journal_open = _autotrade_db_open_trades(int(uid)) or []
-        bot_positions = []
-        external_positions = []
-        for p in (live_positions or []):
-            if _autotrade_live_position_owner_trade(int(uid), p, journal_open=journal_open):
-                bot_positions.append(p)
-            else:
-                external_positions.append(p)
-        lines.extend([SEP, f"Open positions list (AutoTrade-owned): {len(bot_positions)}"])
-        if not bot_positions:
+        lines.extend([SEP, f"Open positions list (AutoTrade-owned): {int(snap.get('open_positions_now', 0) or 0)}"])
+        if int(snap.get('open_positions_now', 0) or 0) <= 0:
             lines.append('• None')
-        else:
-            for p in bot_positions[:12]:
-                lines.append(f"• {_pos_side_text(p)} {_pos_symbol(p)} | PnL {_pos_unreal_pnl(p):+.2f} USDT")
-        if external_positions:
-            lines.append(f"• Manual/external ignored: {len(external_positions)}")
+        if int(snap.get('external_open_positions', 0) or 0) > 0:
+            lines.append(f"• Manual/external ignored: {int(snap.get('external_open_positions', 0) or 0)}")
     else:
         opens = db_open_trades(uid)
         lines.extend([SEP, f"Open trades list: {len(opens)}"])
@@ -31654,14 +31982,14 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     ready = _autotrade_ready()
     sess_allowed = (sess != 'NONE') and _autotrade_allowed_session(sess)
     try:
-        snap = await to_thread_heavy(_accounting_snapshot, owner, user, is_admin=True, timeout=12)
+        snap = await to_thread_fast(_accounting_snapshot_cached, owner, user, is_admin=True, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
     except Exception:
-        snap = _accounting_snapshot(owner, user, is_admin=True)
+        snap = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
     equity = float(snap.get('equity') or 0.0)
     try:
-        mday = await to_thread_heavy(_autotrade_day_risk_metrics, int(owner), float(equity), timeout=12)
+        mday = await to_thread_fast(_autotrade_day_risk_metrics_cached, int(owner), float(equity), ttl=FAST_ADMIN_METRICS_TTL_SEC, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
     except Exception:
-        mday = _autotrade_day_risk_metrics(int(owner), float(equity))
+        mday = _autotrade_day_risk_metrics_cached(int(owner), float(equity), ttl=FAST_ADMIN_METRICS_TTL_SEC)
     dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
     email_gate = _email_runtime_limits_snapshot(int(owner), user)
 
@@ -31743,11 +32071,9 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     class_rows = mday.get('position_classifications') or []
     if class_rows:
         lines.extend([SEP, 'Position day buckets (AutoTrade-owned only)'])
-        live_positions = {f"{_pos_symbol(p)}|{_pos_side_text(p)}": float(_pos_unreal_pnl(p) or 0.0) for p in (_bybit_get_open_positions_linear() or [])}
         for row in class_rows[:10]:
-            key = f"{row.get('symbol')}|{row.get('side')}"
-            pnl = float(live_positions.get(key, 0.0) or 0.0)
-            lines.append(f"• {row.get('symbol')} | {row.get('side')} | ${pnl:+.2f}")
+            bucket = str(row.get('bucket') or '').strip() or 'current_day'
+            lines.append(f"• {row.get('symbol')} | {row.get('side')} | {bucket}")
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
