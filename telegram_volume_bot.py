@@ -30881,12 +30881,24 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"⚠️ Over daily cap by ${over_by:.2f}")
 
     opens = db_open_trades(uid)
-    lines.extend([SEP, f"Open trades list: {len(opens)}"])
+    lines.extend([SEP, f"Open Trades: {len(opens)}"])
     if not opens:
         lines.append('• None')
     else:
         for t in opens[:12]:
-            lines.append(f"• {t.get('symbol')} {t.get('side')} | Risk ${float(t.get('risk_usd') or 0.0):.2f}")
+            public_id = t.get('public_id')
+            tid_txt = '-'
+            try:
+                if public_id is not None and str(public_id).strip() != '':
+                    tid_txt = str(int(public_id))
+            except Exception:
+                try:
+                    tid_txt = str(public_id)
+                except Exception:
+                    tid_txt = '-'
+            lines.append(
+                f"• ID {tid_txt} | {t.get('symbol')} {t.get('side')} | Risk ${float(t.get('risk_usd') or 0.0):.2f}"
+            )
 
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
