@@ -12117,9 +12117,12 @@ def _accounting_snapshot_cached(uid: int, user: dict, is_admin: Optional[bool] =
         user = dict(user or {})
     except Exception:
         user = {}
+    # Keep MANUAL /status and admin/autotrade diagnostics on separate cache lanes.
+    # Otherwise a cached live/autotrade snapshot can leak into /status for admin users.
+    lane = 'admin' if bool(is_admin) else 'manual'
     if not is_admin:
         return _accounting_snapshot(uid, user, is_admin=is_admin)
-    cache_key = f'accounting_snapshot_fast:{int(uid)}'
+    cache_key = f'accounting_snapshot_fast:{int(uid)}:{lane}'
     ttl_i = max(3, int(ttl if ttl is not None else FAST_ADMIN_SNAPSHOT_TTL_SEC))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -16085,6 +16088,30 @@ def db_trade_close(user_id: int, trade_id: int, pnl: float) -> Optional[dict]:
 def db_open_trades(user_id: int) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
+
+    # Self-heal missing public Trade IDs so /status can always show the Trade ID
+    # required by /trade_close, even on older DB rows.
+    try:
+        cols_trades = [r[1] for r in cur.execute("PRAGMA table_info(trades)").fetchall()]
+        if "public_id" not in cols_trades:
+            cur.execute("ALTER TABLE trades ADD COLUMN public_id INTEGER")
+            cols_trades.append("public_id")
+        missing = cur.execute(
+            "SELECT id FROM trades WHERE user_id=? AND (public_id IS NULL OR TRIM(CAST(public_id AS TEXT))='') ORDER BY opened_ts ASC, id ASC",
+            (int(user_id),),
+        ).fetchall()
+        if missing:
+            cur.execute("CREATE TABLE IF NOT EXISTS trade_id_seq (user_id INTEGER PRIMARY KEY, last_id INTEGER NOT NULL)")
+            rmax = cur.execute("SELECT MAX(public_id) FROM trades WHERE user_id=?", (int(user_id),)).fetchone()
+            n = int(rmax[0]) if rmax and rmax[0] is not None else 0
+            for (rid,) in missing:
+                n += 1
+                cur.execute("UPDATE trades SET public_id=? WHERE id=? AND user_id=?", (int(n), int(rid), int(user_id)))
+            cur.execute("INSERT OR REPLACE INTO trade_id_seq(user_id,last_id) VALUES(?,?)", (int(user_id), int(n)))
+            con.commit()
+    except Exception:
+        pass
+
     cur.execute("SELECT * FROM trades WHERE user_id=? AND closed_ts IS NULL ORDER BY opened_ts ASC", (user_id,))
     rows = cur.fetchall()
     con.close()
@@ -30897,7 +30924,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     tid_txt = '-'
             lines.append(
-                f"• ID {tid_txt} | {t.get('symbol')} {t.get('side')} | Risk ${float(t.get('risk_usd') or 0.0):.2f}"
+                f"• Trade ID {tid_txt} | {t.get('symbol')} {t.get('side')} | Risk ${float(t.get('risk_usd') or 0.0):.2f}"
             )
 
     await send_long_message(update, "\n".join(lines), parse_mode=None)
