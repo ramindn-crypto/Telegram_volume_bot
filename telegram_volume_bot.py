@@ -414,7 +414,7 @@ AUTOTRADE_CFG_LEVERAGE_KEY = 'leverage'
 AUTOTRADE_CFG_ISOLATED_KEY = 'isolated'
 AUTOTRADE_CFG_MODE_KEY = 'mode'
 AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
-AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = max(6.0, float(max_cooldown_hours()))
+AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 6.0
 SCREEN_FALLBACK_MAX_AGE_MIN = 8
 
 
@@ -2403,6 +2403,11 @@ def max_cooldown_hours() -> int:
         return int(max(list(SESSION_SYMBOL_COOLDOWN_HOURS.values()) + [SYMBOL_COOLDOWN_HOURS]))
     except Exception:
         return int(SYMBOL_COOLDOWN_HOURS)
+
+try:
+    AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = max(6.0, float(max_cooldown_hours()))
+except Exception:
+    AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 6.0
 
 # Multi-TP
 ATR_PERIOD = 14
