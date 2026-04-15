@@ -6760,7 +6760,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (False, 'equity_unavailable_or_zero')
     try:
         if str(_autotrade_runtime_mode()).lower() == 'live' and equity > 0:
-            update_user(int(uid), equity=float(equity))
+            pass  # keep manual /equity isolated from AutoTrade live equity
     except Exception:
         pass
 
@@ -12237,10 +12237,6 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         live_eq = _live_equity_usdt_cached(ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
         if live_eq is not None:
             snap["equity"] = float(live_eq)
-            try:
-                update_user(int(uid), equity=float(live_eq))
-            except Exception:
-                pass
         m = _autotrade_day_risk_metrics_cached(int(uid), float(snap["equity"]), ttl=FAST_ADMIN_METRICS_TTL_SEC)
         snap["cap"] = float(m.get("cap") or 0.0)
         snap["current_total_open_risk"] = float(m.get("current_total_open_risk") or 0.0)
@@ -12268,7 +12264,7 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["trades_today_limit"] = 0
         snap["remaining_new_positions_today"] = 0
     else:
-        cap = float(_autotrade_daily_cap_usd(uid, float(_effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)) or 0.0)
+        cap = float(daily_cap_usd(user) or 0.0)
         pnl_today = float(_pnl_today_closed_trades(uid, user) or 0.0)
         pm = _manual_position_metrics(uid, user)
         current_day_open_risk = float(pm.get('current_day_open_risk') or 0.0)
