@@ -414,7 +414,7 @@ AUTOTRADE_CFG_LEVERAGE_KEY = 'leverage'
 AUTOTRADE_CFG_ISOLATED_KEY = 'isolated'
 AUTOTRADE_CFG_MODE_KEY = 'mode'
 AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
-AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 6.0
+AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = max(6.0, float(max_cooldown_hours()))
 SCREEN_FALLBACK_MAX_AGE_MIN = 8
 
 
@@ -28487,14 +28487,13 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # RISK
 # =========================================================
 def _prefer_live_equity_for_user(user: dict | None = None) -> bool:
-    try:
-        uid = int((user or {}).get("user_id") or 0)
-    except Exception:
-        uid = 0
-    if uid <= 0 or not is_admin_user(uid):
-        return False
-    return bool(AUTOTRADE_ENABLED) and str(_autotrade_runtime_mode()).lower() == "live"
+    """Manual-trading equity must always come from /equity, never live Bybit.
 
+    AutoTrade uses its own Bybit-backed equity lane under /autotrade_debug and related
+    AutoTrade diagnostics. Manual sizing, manual /status, /dailycap, /riskmode, /trade_open,
+    and /trade_close must stay fully separated from AutoTrade/live exchange equity.
+    """
+    return False
 
 def compute_risk_usd(user: dict, mode: str, value: float) -> float:
     mode = str(mode or "").upper()
@@ -28777,7 +28776,7 @@ Market & Signals
 ⚖️ RISK & POSITION SIZING
 ────────────────────
 /equity
-• Set your equity
+• Set your MANUAL trading equity
 
 /dailycap
 • Set your TOTAL daily risk cap for your anchored trading day
@@ -28787,7 +28786,7 @@ Market & Signals
 
 /size <symbol> <side> <entry> <sl>
 • Calculates position size based on your per-trade risk
-• /status shows current-day risk, live cap-charged risk, carried risk, and remaining daily risk for new trades
+• /status shows manual current-day risk, carried risk, and remaining daily risk for new trades
 
 ────────────────────
 Trade Journal
@@ -29512,29 +29511,8 @@ async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid) or {}
 
-    # ✅ Admin: /equity is LIVE-synced with Bybit (same as /status)
     if not context.args:
-        if is_admin_user(int(uid)):
-            live_eq = _live_equity_usdt_cached(ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
-            if live_eq is not None:
-                eq = float(live_eq)
-                try:
-                    update_user(int(uid), equity=eq)
-                except Exception:
-                    pass
-                await update.message.reply_text(f"Equity (Bybit): ${eq:.2f}")
-                return
-
-        await update.message.reply_text(f"Equity: ${float(user.get('equity') or 0.0):.2f}")
-        return
-
-    # ✅ Non-admins: manual equity setting (used for /size and journaling)
-    if is_admin_user(int(uid)):
-        await update.message.reply_text(
-            "Admin equity is LIVE-synced with Bybit.\n"
-            "Manual override is disabled for Admin.\n\n"
-            "Tip: If you want manual equity, switch AutoTrade to paper or disable live sync."
-        )
+        await update.message.reply_text(f"Manual Equity: ${float(user.get('equity') or 0.0):.2f}")
         return
 
     try:
@@ -29542,9 +29520,10 @@ async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if eq < 0:
             raise ValueError()
         update_user(int(uid), equity=eq)
-        await update.message.reply_text(f"✅ Equity set: ${eq:.2f}")
+        await update.message.reply_text(f"✅ Manual Equity set: ${eq:.2f}")
     except Exception:
         await update.message.reply_text("Usage: /equity 1000")
+
 async def equity_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     update_user(uid, equity=0.0)
@@ -30052,7 +30031,7 @@ async def notify_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Email alerts: OFF")
 
 def _equity_risk_pct_from_usd(user: dict, risk_usd: float) -> Optional[float]:
-    eq = _effective_equity_for_risk(user, prefer_live=True)
+    eq = _effective_equity_for_risk(user, prefer_live=_prefer_live_equity_for_user(user))
     if eq <= 0:
         return None
     return _risk_pct_from_amount(eq, risk_usd)
@@ -30568,28 +30547,12 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Trade not found or already closed.")
         return
     
-    # Sync daily risk from CURRENT open positions (closing frees capacity instantly)
+    # Sync daily risk from CURRENT manual open positions (closing frees capacity instantly)
     _risk_daily_sync(uid, user)
-    # ✅ Equity handling:
-    # - Admin: keep equity synced with Bybit (if live equity is available)
-    # - Others: manual equity updated by /trade_close pnl
-    if is_admin_user(int(uid)):
-        live_eq = _live_equity_usdt_cached(ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
-        if live_eq is not None:
-            try:
-                update_user(int(uid), equity=float(live_eq))
-            except Exception:
-                pass
-            user = get_user(uid)
-        else:
-            # fallback to manual equity update (only if live equity unavailable)
-            new_eq = float(user["equity"]) + float(pnl)
-            update_user(uid, equity=new_eq)
-            user = get_user(uid)
-    else:
-        new_eq = float(user["equity"]) + float(pnl)
-        update_user(uid, equity=new_eq)
-        user = get_user(uid)
+    # Manual trading equity is always journal-managed via /equity + /trade_close.
+    new_eq = float(user["equity"]) + float(pnl)
+    update_user(uid, equity=new_eq)
+    user = get_user(uid)
 
     r_mult = t.get("r_mult")
     r_txt = f"{r_mult:+.2f}R" if r_mult is not None else "-"
@@ -30838,20 +30801,21 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # /status is the MANUAL trading lane for every user, including admin.
+    status_is_admin = False
     try:
         if is_admin:
-            snap = await to_thread_fast(_accounting_snapshot_cached, uid, user, is_admin=is_admin, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
+            snap = await to_thread_fast(_accounting_snapshot_cached, uid, user, is_admin=status_is_admin, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
         else:
-            snap = await to_thread_heavy(_accounting_snapshot, uid, user, is_admin=is_admin, timeout=8)
+            snap = await to_thread_heavy(_accounting_snapshot, uid, user, is_admin=status_is_admin, timeout=8)
     except Exception:
         if is_admin:
-            snap = _accounting_snapshot_cached(uid, user, is_admin=is_admin, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
+            snap = _accounting_snapshot_cached(uid, user, is_admin=status_is_admin, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
         else:
-            snap = _accounting_snapshot(uid, user, is_admin=is_admin)
+            snap = _accounting_snapshot(uid, user, is_admin=status_is_admin)
     equity = float(snap.get('equity') or 0.0)
     cap = float(snap.get('cap') or 0.0)
     pnl_today = float(snap.get('pnl_today') or 0.0)
-    realized_loss_today = float(snap.get('realized_loss_today') or 0.0)
     used_today = float(snap.get('used_today') or 0.0)
     remaining_today = snap.get('remaining_today', float('inf'))
     over_by = float(snap.get('over_by') or 0.0)
@@ -30879,23 +30843,17 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'Account',
         f"• Plan: {snap.get('plan')}",
         f"• Trading day: {snap.get('today_window_label')}",
-        f"• Equity: ${equity:.2f}",
+        f"• Manual Equity: ${equity:.2f}",
         f"• PnL today (closed): ${pnl_today:+.2f}",
         SEP,
         'Risk',
         f"• Opened today: {int(snap.get('positions_opened_today', 0))}" + (f"/{int(snap.get('trades_today_limit', 0))}" if int(snap.get('trades_today_limit', 0)) > 0 else ' (no count cap)'),
         f"• Closed today: {int(snap.get('positions_closed_today', 0))}",
         f"• Open positions now: {int(snap.get('open_positions_now', 0))}",
-        (f"• Manual/external positions ignored by AutoTrade: {int(snap.get('external_open_positions', 0))} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
         f"• Carried from prior day: {int(snap.get('inherited_open_positions', 0))}",
         f"• Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f}",
-        (
-            f"• Daily cap: {(str(_autotrade_daily_cap_settings()[0]).upper() if is_admin else str(user.get('daily_cap_mode','PCT')).upper())} "
-            f"{((float(_autotrade_daily_cap_settings()[1] or 0.0)) if is_admin else float(user.get('daily_cap_value',0.0))):.2f}"
-            f"{('%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else '') if is_admin else ''} (≈ ${cap:.2f})"
-        ),
+        f"• Daily cap: {str(user.get('daily_cap_mode','PCT')).upper()} {float(user.get('daily_cap_value',0.0)):.2f}{'%' if str(user.get('daily_cap_mode','PCT')).upper() == 'PCT' else ''} (≈ ${cap:.2f})",
         f"• Current-day open risk: ${float(snap.get('current_day_open_risk', 0.0)):.2f}",
-        f"• Live open risk charged today: ${float(snap.get('live_open_risk_charged_today', snap.get('current_day_open_risk', 0.0))):.2f}",
         f"• Carried open risk: ${float(snap.get('carried_open_risk', 0.0)):.2f}",
         f"• Total open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
         f"• Realised net today: ${pnl_today:+.2f}",
@@ -30921,32 +30879,13 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if over_by > 0:
         lines.append(f"⚠️ Over daily cap by ${over_by:.2f}")
 
-    if is_admin:
-        closed_today_rows = list(snap.get('closed_today_rows') or [])
-        if closed_today_rows:
-            lines.extend([SEP, f"Closed today list: {len(closed_today_rows)}"])
-            for t in closed_today_rows[:8]:
-                try:
-                    sym = str(t.get('symbol') or '').upper()
-                    side = str(t.get('side') or '').upper()
-                    outcome = str(t.get('outcome') or 'NONE').upper() or 'NONE'
-                    pnl_val = float(t.get('pnl_usdt') if t.get('pnl_usdt') is not None else t.get('pnl') or 0.0)
-                    lines.append(f"• {side} {sym} | {outcome} | PnL {pnl_val:+.2f} USDT")
-                except Exception:
-                    continue
-        lines.extend([SEP, f"Open positions list (AutoTrade-owned): {int(snap.get('open_positions_now', 0) or 0)}"])
-        if int(snap.get('open_positions_now', 0) or 0) <= 0:
-            lines.append('• None')
-        if int(snap.get('external_open_positions', 0) or 0) > 0:
-            lines.append(f"• Manual/external ignored: {int(snap.get('external_open_positions', 0) or 0)}")
+    opens = db_open_trades(uid)
+    lines.extend([SEP, f"Open trades list: {len(opens)}"])
+    if not opens:
+        lines.append('• None')
     else:
-        opens = db_open_trades(uid)
-        lines.extend([SEP, f"Open trades list: {len(opens)}"])
-        if not opens:
-            lines.append('• None')
-        else:
-            for t in opens[:12]:
-                lines.append(f"• {t.get('symbol')} {t.get('side')} | Risk ${float(t.get('risk_usd') or 0.0):.2f}")
+        for t in opens[:12]:
+            lines.append(f"• {t.get('symbol')} {t.get('side')} | Risk ${float(t.get('risk_usd') or 0.0):.2f}")
 
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
@@ -32718,14 +32657,14 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
         f"Trading day: {snap.get('today_window_label')}",
         SEP,
-        f"Equity: ${equity:.2f}",
-        f"Daily cap: {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
-        f"Opened today: {int(snap.get('positions_opened_today', 0) or 0)} | Closed today: {int(snap.get('positions_closed_today', 0) or 0)} | Open now: {int(snap.get('open_positions_now', 0) or 0)}",
-        f"Open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
-        (f"Ignored manual/external positions: {int(snap.get('external_open_positions', 0) or 0)} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
-        f"Realised net today: ${float(snap.get('pnl_today') or 0.0):+.2f}",
-        f"Daily risk used (open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
-        ('Daily risk remaining: ∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f"Daily risk remaining: ${float(snap.get('remaining_today')):.2f}"),
+        f"EquityAT: ${equity:.2f}",
+        f"Daily cap (AT): {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
+        f"Opened today (AT): {int(snap.get('positions_opened_today', 0) or 0)} | Closed today (AT): {int(snap.get('positions_closed_today', 0) or 0)} | Open now (AT): {int(snap.get('open_positions_now', 0) or 0)}",
+        f"Open risk now (AT): ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
+        (f"Ignored manual/external positions (AT): {int(snap.get('external_open_positions', 0) or 0)} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
+        f"Realised net today (AT): ${float(snap.get('pnl_today') or 0.0):+.2f}",
+        f"Daily risk used (AT) (open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
+        ('Daily risk remaining (AT): ∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f"Daily risk remaining (AT): ${float(snap.get('remaining_today')):.2f}"),
         SEP,
         'Email → executable lane',
         f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
