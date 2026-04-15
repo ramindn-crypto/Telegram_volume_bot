@@ -11881,7 +11881,7 @@ def _accounting_snapshot_cached(uid: int, user: dict, is_admin: Optional[bool] =
             obj = cache_get(cache_key)
             if isinstance(obj, dict):
                 return dict(obj)
-        snap = _accounting_snapshot(uid, user, is_admin=is_admin)
+        snap = _accounting_snapshot(uid, user, is_admin=False)
         cache_set(cache_key, dict(snap or {}))
         return dict(snap or {})
     except Exception:
@@ -12023,7 +12023,7 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         snap["trades_today_limit"] = 0
         snap["remaining_new_positions_today"] = 0
     else:
-        cap = float(_autotrade_daily_cap_usd(uid, float(_effective_equity_for_risk(user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live')) or 0.0)) or 0.0)
+        cap = float(daily_cap_usd(user) or 0.0)
         pnl_today = float(_pnl_today_closed_trades(uid, user) or 0.0)
         pm = _manual_position_metrics(uid, user)
         current_day_open_risk = float(pm.get('current_day_open_risk') or 0.0)
@@ -28240,20 +28240,27 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # RISK
 # =========================================================
 def _prefer_live_equity_for_user(user: dict | None = None) -> bool:
+    """Manual-trading equity is always user-managed.
+
+    Live Bybit equity is reserved for AutoTrade-only diagnostics and execution.
+    Manual commands such as /equity, /riskmode, /dailycap, /trade_open, /trade_close,
+    and /status must never switch to Bybit equity automatically.
+    """
+    return False
+
+
+def _manual_equity_usd(user: dict | None = None) -> float:
     try:
-        uid = int((user or {}).get("user_id") or 0)
+        return max(0.0, float((user or {}).get("equity") or 0.0))
     except Exception:
-        uid = 0
-    if uid <= 0 or not is_admin_user(uid):
-        return False
-    return bool(AUTOTRADE_ENABLED) and str(AUTOTRADE_MODE).lower() == "live"
+        return 0.0
 
 
 def compute_risk_usd(user: dict, mode: str, value: float) -> float:
     mode = str(mode or "").upper()
     if mode == "USD":
         return max(0.0, float(value))
-    eq = _effective_equity_for_risk(user, prefer_live=_prefer_live_equity_for_user(user))
+    eq = _manual_equity_usd(user)
     if eq <= 0:
         return 0.0
     return _risk_amount_from_pct(eq, float(value))
@@ -28321,7 +28328,7 @@ def daily_cap_usd(user: dict) -> float:
     val = float(user.get("daily_cap_value", DEFAULT_DAILY_CAP_VALUE) or DEFAULT_DAILY_CAP_VALUE)
     if mode == "USD":
         return max(0.0, val)
-    eq = _effective_equity_for_risk(user, prefer_live=_prefer_live_equity_for_user(user))
+    eq = _manual_equity_usd(user)
     if eq <= 0:
         return 0.0
     return _risk_amount_from_pct(eq, val)
@@ -30500,6 +30507,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
     is_admin = is_admin_user(int(uid))
+    manual_view = True
 
     if not has_active_access(uid, user):
         await update.message.reply_text(
@@ -30511,14 +30519,14 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if is_admin:
-            snap = await to_thread_fast(_accounting_snapshot_cached, uid, user, is_admin=is_admin, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
+            snap = await to_thread_fast(_accounting_snapshot, uid, user, is_admin=False, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
         else:
-            snap = await to_thread_heavy(_accounting_snapshot, uid, user, is_admin=is_admin, timeout=8)
+            snap = await to_thread_heavy(_accounting_snapshot, uid, user, is_admin=False, timeout=8)
     except Exception:
         if is_admin:
-            snap = _accounting_snapshot_cached(uid, user, is_admin=is_admin, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
+            snap = _accounting_snapshot(uid, user, is_admin=False)
         else:
-            snap = _accounting_snapshot(uid, user, is_admin=is_admin)
+            snap = _accounting_snapshot(uid, user, is_admin=False)
     equity = float(snap.get('equity') or 0.0)
     cap = float(snap.get('cap') or 0.0)
     pnl_today = float(snap.get('pnl_today') or 0.0)
@@ -30550,7 +30558,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'Account',
         f"• Plan: {snap.get('plan')}",
         f"• Trading day: {snap.get('today_window_label')}",
-        f"• Equity: ${equity:.2f}",
+        f"• Manual Equity: ${equity:.2f}",
         f"• PnL today (closed): ${pnl_today:+.2f}",
         SEP,
         'Risk',
@@ -30561,9 +30569,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Carried from prior day: {int(snap.get('inherited_open_positions', 0))}",
         f"• Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f}",
         (
-            f"• Daily cap: {(str(_autotrade_daily_cap_settings()[0]).upper() if is_admin else str(user.get('daily_cap_mode','PCT')).upper())} "
-            f"{((float(_autotrade_daily_cap_settings()[1] or 0.0)) if is_admin else float(user.get('daily_cap_value',0.0))):.2f}"
-            f"{('%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else '') if is_admin else ''} (≈ ${cap:.2f})"
+            f"• Daily cap: {str(user.get('daily_cap_mode','PCT')).upper()} "
+            f"{float(user.get('daily_cap_value',0.0)):.2f}"
+            f"{'%' if str(user.get('daily_cap_mode','PCT')).upper() == 'PCT' else ''} (≈ ${cap:.2f})"
         ),
         f"• Current-day open risk: ${float(snap.get('current_day_open_risk', 0.0)):.2f}",
         f"• Live open risk charged today: ${float(snap.get('live_open_risk_charged_today', snap.get('current_day_open_risk', 0.0))):.2f}",
@@ -30592,35 +30600,30 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if over_by > 0:
         lines.append(f"⚠️ Over daily cap by ${over_by:.2f}")
 
-    if is_admin:
-        closed_today_rows = list(snap.get('closed_today_rows') or [])
-        if closed_today_rows:
-            lines.extend([SEP, f"Closed today list: {len(closed_today_rows)}"])
-            for t in closed_today_rows[:8]:
-                try:
-                    sym = str(t.get('symbol') or '').upper()
-                    side = str(t.get('side') or '').upper()
-                    outcome = str(t.get('outcome') or 'NONE').upper() or 'NONE'
-                    pnl_val = float(t.get('pnl_usdt') if t.get('pnl_usdt') is not None else t.get('pnl') or 0.0)
-                    lines.append(f"• {side} {sym} | {outcome} | PnL {pnl_val:+.2f} USDT")
-                except Exception:
-                    continue
-        lines.extend([SEP, f"Open positions list (AutoTrade-owned): {int(snap.get('open_positions_now', 0) or 0)}"])
-        if int(snap.get('open_positions_now', 0) or 0) <= 0:
-            lines.append('• None')
-        if int(snap.get('external_open_positions', 0) or 0) > 0:
-            lines.append(f"• Manual/external ignored: {int(snap.get('external_open_positions', 0) or 0)}")
+    closed_today_rows = db_trades_closed_today(uid, user)
+    if closed_today_rows:
+        lines.extend([SEP, f"Closed today list: {len(closed_today_rows)}"])
+        for t in closed_today_rows[:8]:
+            try:
+                sym = str(t.get('symbol') or '').upper()
+                side = str(t.get('side') or '').upper()
+                pnl_val = float(t.get('pnl') or 0.0)
+                outcome = 'WIN' if pnl_val > 0 else ('LOSS' if pnl_val < 0 else 'BREAKEVEN')
+                trade_id_txt = str(t.get('public_id') or t.get('trade_id') or '').strip() or '-'
+                lines.append(f"• {side} {sym} | Trade ID: {trade_id_txt} | {outcome} | PnL {pnl_val:+.2f}")
+            except Exception:
+                continue
+
+    opens = db_open_trades(uid)
+    lines.extend([SEP, f"Open trades list: {len(opens)}"])
+    if not opens:
+        lines.append('• None')
     else:
-        opens = db_open_trades(uid)
-        lines.extend([SEP, f"Open trades list: {len(opens)}"])
-        if not opens:
-            lines.append('• None')
-        else:
-            for t in opens[:12]:
-                trade_id_txt = str(t.get('trade_id') or '').strip() or '-'
-                lines.append(
-                    f"• {t.get('symbol')} {t.get('side')} | Trade ID: {trade_id_txt} | Risk ${float(t.get('risk_usd') or 0.0):.2f}"
-                )
+        for t in opens[:12]:
+            trade_id_txt = str(t.get('public_id') or t.get('trade_id') or '').strip() or '-'
+            lines.append(
+                f"• {str(t.get('symbol') or '').upper()} {str(t.get('side') or '').upper()} | Trade ID: {trade_id_txt} | Risk ${float(t.get('risk_usd') or 0.0):.2f}"
+            )
 
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
