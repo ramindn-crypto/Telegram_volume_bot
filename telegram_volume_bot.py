@@ -408,6 +408,236 @@ def _autotrade_set_daily_cap_settings(mode: str, value: float) -> None:
             conn.commit()
     except Exception:
         pass
+AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY = 'risk_per_trade_pct'
+AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY = 'open_risk_cap_pct'
+AUTOTRADE_CFG_LEVERAGE_KEY = 'leverage'
+AUTOTRADE_CFG_ISOLATED_KEY = 'isolated'
+AUTOTRADE_CFG_MODE_KEY = 'mode'
+AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
+AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = max(6.0, float(max_cooldown_hours()))
+SCREEN_FALLBACK_MAX_AGE_MIN = 8
+
+
+def _autotrade_config_get(key: str, default=None):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS autotrade_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            row = c.execute("SELECT value FROM autotrade_config WHERE key=?", (str(key or ''),)).fetchone()
+            if not row:
+                return default
+            val = row[0]
+            return default if val is None or str(val).strip() == '' else val
+    except Exception:
+        return default
+
+
+def _autotrade_config_set(key: str, value) -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS autotrade_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.execute(
+                "INSERT OR REPLACE INTO autotrade_config(key,value) VALUES(?,?)",
+                (str(key or ''), '' if value is None else str(value)),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _autotrade_bootstrap_runtime_config() -> None:
+    defaults = {
+        AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: float(AUTOTRADE_RISK_PER_TRADE_PCT),
+        AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY: float(AUTOTRADE_OPEN_RISK_CAP_PCT),
+        AUTOTRADE_DAILY_CAP_MODE_KEY: 'PCT',
+        AUTOTRADE_DAILY_CAP_VALUE_KEY: float(AUTOTRADE_DAILY_RISK_CAP_PCT),
+        AUTOTRADE_CFG_LEVERAGE_KEY: int(AUTOTRADE_LEVERAGE),
+        AUTOTRADE_CFG_ISOLATED_KEY: 1 if bool(AUTOTRADE_ISOLATED) else 0,
+        AUTOTRADE_CFG_MODE_KEY: str(AUTOTRADE_MODE or 'paper').strip().lower(),
+        AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: int(_autotrade_runtime_max_open_trades()),
+    }
+    for k, v in defaults.items():
+        try:
+            cur = _autotrade_config_get(k, None)
+            if cur is None or str(cur).strip() == '':
+                _autotrade_config_set(k, v)
+        except Exception:
+            pass
+
+
+def _autotrade_risk_per_trade_pct() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, AUTOTRADE_RISK_PER_TRADE_PCT) or AUTOTRADE_RISK_PER_TRADE_PCT)
+    except Exception:
+        val = float(AUTOTRADE_RISK_PER_TRADE_PCT)
+    return max(0.0, float(val))
+
+
+def _autotrade_open_risk_cap_pct() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, AUTOTRADE_OPEN_RISK_CAP_PCT) or AUTOTRADE_OPEN_RISK_CAP_PCT)
+    except Exception:
+        val = float(AUTOTRADE_OPEN_RISK_CAP_PCT)
+    return max(0.0, float(val))
+
+
+def _autotrade_runtime_mode() -> str:
+    try:
+        mode = str(_autotrade_config_get(AUTOTRADE_CFG_MODE_KEY, AUTOTRADE_MODE) or AUTOTRADE_MODE).strip().lower()
+    except Exception:
+        mode = str(AUTOTRADE_MODE or 'paper').strip().lower()
+    return mode if mode in {'paper', 'live'} else str(AUTOTRADE_MODE or 'paper').strip().lower()
+
+
+def _autotrade_runtime_max_open_trades() -> int:
+    try:
+        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, AUTOTRADE_MAX_OPEN_TRADES) or AUTOTRADE_MAX_OPEN_TRADES))
+    except Exception:
+        val = int(_autotrade_runtime_max_open_trades())
+    return max(1, int(val))
+
+
+def _autotrade_runtime_leverage() -> int:
+    try:
+        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_LEVERAGE_KEY, AUTOTRADE_LEVERAGE) or AUTOTRADE_LEVERAGE))
+    except Exception:
+        val = int(AUTOTRADE_LEVERAGE)
+    return max(1, int(val))
+
+
+def _autotrade_runtime_isolated() -> bool:
+    try:
+        raw = _autotrade_config_get(AUTOTRADE_CFG_ISOLATED_KEY, 1 if AUTOTRADE_ISOLATED else 0)
+        return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
+    except Exception:
+        return bool(AUTOTRADE_ISOLATED)
+
+
+def _autotrade_runtime_summary_dict() -> dict:
+    mode_txt, daily_val = _autotrade_daily_cap_settings()
+    return {
+        'AUTOTRADE_RISK_PER_TRADE_PCT': float(_autotrade_risk_per_trade_pct()),
+        'AUTOTRADE_OPEN_RISK_CAP_PCT': float(_autotrade_open_risk_cap_pct()),
+        'AUTOTRADE_DAILY_RISK_CAP_PCT': float(daily_val or 0.0),
+        'AUTOTRADE_DAILY_RISK_CAP_MODE': str(mode_txt or 'PCT').upper(),
+        'AUTOTRADE_MODE': str(_autotrade_runtime_mode()).lower(),
+        'AUTOTRADE_MAX_OPEN_TRADES': int(_autotrade_runtime_max_open_trades()),
+        'AUTOTRADE_LEVERAGE': int(_autotrade_runtime_leverage()),
+        'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
+    }
+
+
+def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
+    try:
+        sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
+    except Exception:
+        sym = str(symbol or '').upper().strip()
+    sd = str(side or '').upper().strip()
+    eng = str(engine or '').upper().strip()
+    try:
+        e = round(float(entry or 0.0), 8)
+        s = round(float(sl or 0.0), 8)
+        t = round(float(tp or 0.0), 8)
+    except Exception:
+        e, s, t = 0.0, 0.0, 0.0
+    return f"{sym}|{sd}|{eng}|{e:.8f}|{s:.8f}|{t:.8f}"
+
+
+def _setup_identity_from_obj(setup) -> str:
+    try:
+        if isinstance(setup, dict):
+            return _setup_identity_key(
+                setup.get('symbol', ''),
+                setup.get('side', ''),
+                setup.get('entry', 0.0),
+                setup.get('sl', 0.0),
+                _resolve_single_tp(float(setup.get('entry') or 0.0), float(setup.get('sl') or 0.0), setup.get('tp'), setup.get('alt_target_a'), setup.get('alt_target_b'), str(setup.get('side') or '')),
+                setup.get('engine', ''),
+            )
+        return _setup_identity_key(
+            getattr(setup, 'symbol', ''),
+            getattr(setup, 'side', ''),
+            getattr(setup, 'entry', 0.0),
+            getattr(setup, 'sl', 0.0),
+            _setup_target_tp(setup, 0.0),
+            getattr(setup, 'engine', ''),
+        )
+    except Exception:
+        return ''
+
+
+def _email_setup_identity_recently_sent(user_id: int, setup, lookback_hours: float | None = None) -> bool:
+    cutoff_hours = float(lookback_hours or AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS)
+    ident = _setup_identity_from_obj(setup)
+    if not ident:
+        return False
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("""CREATE TABLE IF NOT EXISTS emailed_setup_identities (
+                user_id INTEGER NOT NULL,
+                identity_key TEXT NOT NULL,
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                setup_id TEXT NOT NULL DEFAULT '',
+                emailed_ts REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id, identity_key)
+            )""")
+            row = cur.execute(
+                "SELECT emailed_ts FROM emailed_setup_identities WHERE user_id=? AND identity_key=?",
+                (int(user_id), str(ident)),
+            ).fetchone()
+            if not row:
+                return False
+            last_ts = float(row[0] or 0.0)
+            return (time.time() - last_ts) < max(0.0, cutoff_hours * 3600.0)
+    except Exception:
+        return False
+
+
+def _mark_emailed_setup_identity(user_id: int, setup, emailed_ts: float | None = None) -> None:
+    ident = _setup_identity_from_obj(setup)
+    if not ident:
+        return
+    ts = float(emailed_ts or time.time())
+    try:
+        sym = str(_bybit_linear_symbol(setup.get('symbol', '') if isinstance(setup, dict) else getattr(setup, 'symbol', '')) or '').upper().strip()
+    except Exception:
+        sym = str((setup.get('symbol', '') if isinstance(setup, dict) else getattr(setup, 'symbol', '')) or '').upper().strip()
+    side = str((setup.get('side', '') if isinstance(setup, dict) else getattr(setup, 'side', '')) or '').upper().strip()
+    setup_id = str((setup.get('setup_id', '') if isinstance(setup, dict) else getattr(setup, 'setup_id', '')) or '').strip()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("""CREATE TABLE IF NOT EXISTS emailed_setup_identities (
+                user_id INTEGER NOT NULL,
+                identity_key TEXT NOT NULL,
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                setup_id TEXT NOT NULL DEFAULT '',
+                emailed_ts REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id, identity_key)
+            )""")
+            cur.execute(
+                "INSERT OR REPLACE INTO emailed_setup_identities(user_id, identity_key, symbol, side, setup_id, emailed_ts) VALUES(?,?,?,?,?,?)",
+                (int(user_id), str(ident), str(sym), str(side), str(setup_id), float(ts)),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 # =============================================================
 
 import asyncio
@@ -475,105 +705,6 @@ _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_
 _UNIVERSE_BACKTEST_ACTIVE = 0
 _UNIVERSE_BACKTEST_LOCK = threading.Lock()
 
-
-AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY = 'risk_per_trade_pct'
-AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY = 'open_risk_cap_pct'
-AUTOTRADE_CFG_LEVERAGE_KEY = 'leverage'
-AUTOTRADE_CFG_ISOLATED_KEY = 'isolated'
-AUTOTRADE_CFG_MODE_KEY = 'mode'
-AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
-
-def _autotrade_config_get(key: str, default=None):
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS autotrade_config (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-            """)
-            row = c.execute("SELECT value FROM autotrade_config WHERE key=?", (str(key or ''),)).fetchone()
-            if not row:
-                return default
-            val = row[0]
-            return default if val is None or str(val).strip() == '' else val
-    except Exception:
-        return default
-
-def _autotrade_config_set(key: str, value) -> None:
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS autotrade_config (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-            """)
-            c.execute(
-                "INSERT OR REPLACE INTO autotrade_config(key,value) VALUES(?,?)",
-                (str(key or ''), '' if value is None else str(value)),
-            )
-            conn.commit()
-    except Exception:
-        pass
-
-def _autotrade_bootstrap_runtime_config() -> None:
-    defaults = {
-        AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: float(AUTOTRADE_RISK_PER_TRADE_PCT),
-        AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY: float(AUTOTRADE_OPEN_RISK_CAP_PCT),
-        AUTOTRADE_DAILY_CAP_MODE_KEY: 'PCT',
-        AUTOTRADE_DAILY_CAP_VALUE_KEY: float(AUTOTRADE_DAILY_RISK_CAP_PCT),
-        AUTOTRADE_CFG_LEVERAGE_KEY: int(AUTOTRADE_LEVERAGE),
-        AUTOTRADE_CFG_ISOLATED_KEY: 1 if bool(AUTOTRADE_ISOLATED) else 0,
-        AUTOTRADE_CFG_MODE_KEY: str(AUTOTRADE_MODE or 'paper').strip().lower(),
-        AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: int(AUTOTRADE_MAX_OPEN_TRADES),
-    }
-    for k, v in defaults.items():
-        try:
-            cur = _autotrade_config_get(k, None)
-            if cur is None or str(cur).strip() == '':
-                _autotrade_config_set(k, v)
-        except Exception:
-            pass
-
-def _autotrade_risk_per_trade_pct() -> float:
-    try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, AUTOTRADE_RISK_PER_TRADE_PCT) or AUTOTRADE_RISK_PER_TRADE_PCT)
-    except Exception:
-        val = float(AUTOTRADE_RISK_PER_TRADE_PCT)
-    return max(0.0, float(val))
-
-def _autotrade_open_risk_cap_pct() -> float:
-    try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, AUTOTRADE_OPEN_RISK_CAP_PCT) or AUTOTRADE_OPEN_RISK_CAP_PCT)
-    except Exception:
-        val = float(AUTOTRADE_OPEN_RISK_CAP_PCT)
-    return max(0.0, float(val))
-
-def _autotrade_open_risk_cap_usd(equity: float) -> float:
-    try:
-        eq = float(equity or 0.0)
-        if eq <= 0:
-            return 0.0
-        return _risk_amount_from_pct(eq, _autotrade_open_risk_cap_pct())
-    except Exception:
-        return 0.0
-
-def _autotrade_runtime_mode() -> str:
-    try:
-        mode = str(_autotrade_config_get(AUTOTRADE_CFG_MODE_KEY, AUTOTRADE_MODE) or AUTOTRADE_MODE).strip().lower()
-    except Exception:
-        mode = str(AUTOTRADE_MODE or 'paper').strip().lower()
-    return mode if mode in {'paper', 'live'} else str(AUTOTRADE_MODE or 'paper').strip().lower()
-
-def _autotrade_runtime_max_open_trades() -> int:
-    try:
-        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, AUTOTRADE_MAX_OPEN_TRADES) or AUTOTRADE_MAX_OPEN_TRADES))
-    except Exception:
-        val = int(AUTOTRADE_MAX_OPEN_TRADES)
-    return max(1, int(val))
 def _mark_universe_backtest_start() -> None:
     global _UNIVERSE_BACKTEST_ACTIVE
     try:
@@ -2346,6 +2477,11 @@ try:
 except Exception:
     AUTOTRADE_TP_SPLIT = [0.4, 0.4, 0.2]
 
+try:
+    _autotrade_bootstrap_runtime_config()
+except Exception:
+    pass
+
 # Live exit architecture: keep the stop-loss on Bybit's position-level trading-stop and
 # attach TP / TP as native exchange exits. The primary lane uses reduce-only close-trigger
 # orders; if Bybit accepts the request but the TP orders are not actually visible, the bot
@@ -2378,8 +2514,6 @@ BYBIT_TESTNET = str(os.environ.get("BYBIT_TESTNET", "0")).strip() in ("1", "true
 AUTOTRADE_ENTRY_WINDOW_MIN = int(os.environ.get("AUTOTRADE_ENTRY_WINDOW_MIN", "45") or 45)
 
 # Email
-_autotrade_bootstrap_runtime_config()
-
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
 EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "465"))
@@ -2728,9 +2862,9 @@ def _autotrade_ready() -> bool:
         return False
     if AUTOTRADE_OWNER_UID <= 0:
         return False
-    if _autotrade_runtime_mode() not in ("paper", "live"):
+    if AUTOTRADE_MODE not in ("paper", "live"):
         return False
-    if _autotrade_runtime_mode() == "live" and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
+    if AUTOTRADE_MODE == "live" and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
         return False
     return True
 
@@ -2776,7 +2910,7 @@ def _live_equity_usdt() -> float | None:
     try:
         if not AUTOTRADE_ENABLED:
             return None
-        if str(AUTOTRADE_MODE).lower() != "live":
+        if str(_autotrade_runtime_mode()).lower() != "live":
             return None
         if not BYBIT_API_KEY or not BYBIT_API_SECRET:
             return None
@@ -4964,7 +5098,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     open_pnl = 0.0
     realized_pnl_today = 0.0
     realized_loss_today = 0.0
-    mode = str(AUTOTRADE_MODE).lower()
+    mode = str(_autotrade_runtime_mode()).lower()
     user = _autotrade_user_settings(uid)
 
     try:
@@ -5192,18 +5326,15 @@ def _autotrade_user_settings(uid: int) -> dict:
 
 def _autotrade_per_trade_risk_usd(uid: int, equity: float) -> float:
     user = _autotrade_user_settings(uid)
+    mode = str(user.get("risk_mode", DEFAULT_RISK_MODE)).upper()
+    val = float(user.get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
+    # compute_risk_usd uses live equity when available, but we pass user updated equity anyway
     try:
         if equity and equity > 0:
             user = dict(user)
             user["equity"] = float(equity)
     except Exception:
         pass
-    eq = _effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live'))
-    pct = _autotrade_risk_per_trade_pct()
-    if eq > 0 and pct > 0:
-        return float(_risk_amount_from_pct(eq, pct) or 0.0)
-    mode = str(user.get("risk_mode", DEFAULT_RISK_MODE)).upper()
-    val = float(user.get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
     return float(compute_risk_usd(user, mode, val) or 0.0)
 
 def _autotrade_daily_cap_usd(uid: int, equity: float) -> float:
@@ -6112,8 +6243,8 @@ def _autotrade_qty_from_risk(entry: float, sl: float, equity_usdt: float, risk_u
     if dist <= 0 or cs <= 0:
         return 0.0
     if risk_usd is None:
-        # Backward-compat fallback only. Runtime autotrade sizing now comes from persisted config.
-        risk_usd = (float(equity_usdt) * (_autotrade_risk_per_trade_pct() / 100.0))
+        # Backward-compat fallback only. Live sizing should pass explicit /riskmode-derived risk_usd.
+        risk_usd = (float(equity_usdt) * (AUTOTRADE_RISK_PER_TRADE_PCT / 100.0))
     qty = float(risk_usd) / (dist * cs)
     if qty <= 0 or (not math.isfinite(qty)):
         return 0.0
@@ -6424,7 +6555,7 @@ def _autotrade_effective_risk_usd(uid: int, setup, equity: float, base_risk_usd:
     """Return (effective_risk_usd, multiplier, regime).
 
     Best approach used here:
-    - persisted autotrade_config is the base risk source of truth
+    - /riskmode remains the user-selected base risk
     - dynamic multiplier scales size up/down based on setup quality
     - never exceed remaining daily capacity
     - if the clipped risk becomes too small, block the trade upstream
@@ -6446,11 +6577,6 @@ def _autotrade_effective_risk_usd(uid: int, setup, equity: float, base_risk_usd:
         mult = min(float(mult), 1.0)
         target_risk = max(0.0, float(base_risk_usd) * float(mult))
         target_risk = min(target_risk, float(base_risk_usd))
-
-        open_cap_usd = _autotrade_open_risk_cap_usd(equity)
-        if open_cap_usd > 0:
-            open_cap_left = max(0.0, float(open_cap_usd) - max(0.0, float(open_risk_usd)))
-            target_risk = min(target_risk, open_cap_left)
 
         if daily_cap_usd > 0:
             cap_left = max(0.0, float(daily_cap_usd) - max(0.0, float(open_risk_usd)))
@@ -6669,13 +6795,13 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         except Exception:
             pass
         return (False, 'max_trades_day_reached')
-    if int(_autotrade_runtime_max_open_trades() or 0) > 0 and live_open_count >= int(AUTOTRADE_MAX_OPEN_TRADES):
+    if int(AUTOTRADE_MAX_OPEN_TRADES or 0) > 0 and live_open_count >= int(_autotrade_runtime_max_open_trades()):
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_open_trades_reached', 'open_positions_now': int(live_open_count)})
         except Exception:
             pass
         try:
-            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'max_open_trades_reached ({live_open_count}/{int(AUTOTRADE_MAX_OPEN_TRADES)})')
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'max_open_trades_reached ({live_open_count}/{int(_autotrade_runtime_max_open_trades())})')
         except Exception:
             pass
         return (False, 'max_open_trades_reached')
@@ -10803,12 +10929,6 @@ def _email_symbol_recently_sent(user_id: int, symbol: str, side: str, session_na
     except Exception:
         pass
     try:
-        probe = {'symbol': symbol, 'side': side, 'setup_id': setup_id}
-        if _same_setup_identity_recently_emailed(int(user_id), probe, ttl_hours=EMAIL_SETUP_IDENTITY_TTL_HOURS):
-            return True
-    except Exception:
-        pass
-    try:
         cooldown_sec = float(cooldown_hours_for_session(session_name)) * 3600.0
         cutoff = float(time.time() - cooldown_sec)
         sym = str(_bybit_linear_symbol(symbol) or '').upper()
@@ -10838,127 +10958,6 @@ def _email_symbol_recently_sent(user_id: int, symbol: str, side: str, session_na
         pass
     return False
 
-EMAIL_SETUP_IDENTITY_TTL_HOURS = int(os.getenv("EMAIL_SETUP_IDENTITY_TTL_HOURS", "12") or 12)
-SCREEN_FALLBACK_STALE_MAX_MIN = int(os.getenv("SCREEN_FALLBACK_STALE_MAX_MIN", "8") or 8)
-
-def _email_identity_migrate() -> None:
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS emailed_setup_identities (
-                    user_id INTEGER NOT NULL,
-                    symbol TEXT NOT NULL DEFAULT '',
-                    side TEXT NOT NULL DEFAULT '',
-                    identity_key TEXT NOT NULL DEFAULT '',
-                    last_setup_id TEXT NOT NULL DEFAULT '',
-                    emailed_ts REAL NOT NULL DEFAULT 0,
-                    PRIMARY KEY (user_id, symbol, side, identity_key)
-                )
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_emailed_setup_identities_ts ON emailed_setup_identities(user_id, symbol, side, emailed_ts)")
-            conn.commit()
-    except Exception:
-        pass
-
-def _setup_identity_key(setup_or_obj) -> str:
-    try:
-        if isinstance(setup_or_obj, dict):
-            sym = str(_bybit_linear_symbol(setup_or_obj.get('symbol') or setup_or_obj.get('market_symbol') or '')).upper()
-            side = str(setup_or_obj.get('side') or '').upper().strip()
-            entry = round(float(setup_or_obj.get('entry') or 0.0), 8)
-            sl = round(float(setup_or_obj.get('sl') or 0.0), 8)
-            tp = round(float(_setup_target_tp(setup_or_obj, 0.0) or 0.0), 8)
-            engine = str(setup_or_obj.get('engine') or '').upper().strip()
-        else:
-            sym = str(_bybit_linear_symbol(getattr(setup_or_obj, 'symbol', '') or getattr(setup_or_obj, 'market_symbol', '') or '')).upper()
-            side = str(getattr(setup_or_obj, 'side', '') or '').upper().strip()
-            entry = round(float(getattr(setup_or_obj, 'entry', 0.0) or 0.0), 8)
-            sl = round(float(getattr(setup_or_obj, 'sl', 0.0) or 0.0), 8)
-            tp = round(float(_setup_target_tp(setup_or_obj, 0.0) or 0.0), 8)
-            engine = str(getattr(setup_or_obj, 'engine', '') or '').upper().strip()
-        if not sym or not side:
-            return ''
-        return f"{sym}|{side}|{engine}|{entry:.8f}|{sl:.8f}|{tp:.8f}"
-    except Exception:
-        return ''
-
-def _mark_setup_identity_emailed(user_id: int, setup_obj, emailed_ts: float | None = None) -> None:
-    try:
-        _email_identity_migrate()
-        key = _setup_identity_key(setup_obj)
-        if not key:
-            return
-        if isinstance(setup_obj, dict):
-            sym = str(_bybit_linear_symbol(setup_obj.get('symbol') or '')).upper()
-            side = str(setup_obj.get('side') or '').upper().strip()
-            sid = str(setup_obj.get('setup_id') or '').strip()
-        else:
-            sym = str(_bybit_linear_symbol(getattr(setup_obj, 'symbol', '') or '')).upper()
-            side = str(getattr(setup_obj, 'side', '') or '').upper().strip()
-            sid = str(getattr(setup_obj, 'setup_id', '') or '').strip()
-        ts = float(emailed_ts or time.time())
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """INSERT OR REPLACE INTO emailed_setup_identities(user_id, symbol, side, identity_key, last_setup_id, emailed_ts) VALUES(?,?,?,?,?,?)""",
-                (int(user_id), sym, side, key, sid, ts),
-            )
-            cur.execute(
-                "DELETE FROM emailed_setup_identities WHERE user_id=? AND emailed_ts<?",
-                (int(user_id), float(time.time()) - float(max(6, EMAIL_SETUP_IDENTITY_TTL_HOURS)) * 3600.0),
-            )
-            conn.commit()
-    except Exception:
-        pass
-
-def _same_setup_identity_recently_emailed(user_id: int, setup_obj, ttl_hours: int | None = None) -> bool:
-    try:
-        _email_identity_migrate()
-        ttl = float(ttl_hours if ttl_hours is not None else EMAIL_SETUP_IDENTITY_TTL_HOURS)
-        key = _setup_identity_key(setup_obj)
-        if not key:
-            return False
-        if isinstance(setup_obj, dict):
-            sym = str(_bybit_linear_symbol(setup_obj.get('symbol') or '')).upper()
-            side = str(setup_obj.get('side') or '').upper().strip()
-        else:
-            sym = str(_bybit_linear_symbol(getattr(setup_obj, 'symbol', '') or '')).upper()
-            side = str(getattr(setup_obj, 'side', '') or '').upper().strip()
-        cutoff = float(time.time()) - ttl * 3600.0
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            row = cur.execute(
-                "SELECT emailed_ts FROM emailed_setup_identities WHERE user_id=? AND symbol=? AND side=? AND identity_key=? AND emailed_ts>=? LIMIT 1",
-                (int(user_id), sym, side, key, float(cutoff)),
-            ).fetchone()
-            return bool(row)
-    except Exception:
-        return False
-
-def _dedupe_fallback_setup_objects(items: list, max_age_min: int = SCREEN_FALLBACK_STALE_MAX_MIN) -> list:
-    cutoff = float(time.time()) - float(max(1, int(max_age_min))) * 60.0
-    out = []
-    seen_identity = set()
-    seen_symbol_side = set()
-    for item in (items or []):
-        try:
-            ts = float(getattr(item, 'email_logged_ts', 0.0) or getattr(item, 'emailed_ts', 0.0) or getattr(item, 'executable_ts', 0.0) or 0.0)
-            if ts <= 0 or ts < cutoff:
-                continue
-            sym = str(_bybit_linear_symbol(getattr(item, 'symbol', '') or getattr(item, 'market_symbol', '') or '')).upper()
-            side = str(getattr(item, 'side', '') or '').upper().strip()
-            if not sym or not side:
-                continue
-            key = _setup_identity_key(item) or f"{sym}|{side}"
-            if key in seen_identity or (sym, side) in seen_symbol_side:
-                continue
-            seen_identity.add(key)
-            seen_symbol_side.add((sym, side))
-            out.append(item)
-        except Exception:
-            continue
-    return out
 def _safe_float(x, default: float = 0.0) -> float:
     try:
         if x is None:
@@ -10972,7 +10971,7 @@ def _safe_float(x, default: float = 0.0) -> float:
 
 
 
-BIGMOVE_COOLDOWN_SEC = 60 * 60 * 2  # 2 hours persistent same-symbol cooldown
+BIGMOVE_COOLDOWN_SEC = 60 * 60 * 2  # 2 hours
 
 def bigmove_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
     try:
@@ -11116,10 +11115,16 @@ def mark_earlywarn_emailed(uid: int, symbol: str, side: str) -> None:
         pass
 
 def _bigmove_candidates(best_fut: dict, p4: float, p1: float, min_vol_usd: float = 0.0, max_items: int = 12) -> list:
-    """Same-direction 1H/4H big-move candidates only.
+    """
+    Returns list of dicts: {symbol, ch4, ch1, vol, direction, score}
 
-    We suppress mixed-direction cases entirely. A symbol is eligible only when
-    both 4H and 1H exceed their thresholds in the same direction.
+    direction:
+      - "UP"   → strong positive move
+      - "DOWN" → strong negative move
+
+    Triggers:
+      - UP   if ch4 >= +p4 AND ch1 >= +p1
+      - DOWN if ch4 <= -p4 AND ch1 <= -p1
     """
 
     def _pick_pct(mv, keys) -> float:
@@ -11134,11 +11139,17 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, min_vol_usd: float
         return 0.0
 
     out = []
+
     for sym, mv in (best_fut or {}).items():
         try:
+            # Try multiple possible field names (fixes "different field names" issue)
             ch4 = _pick_pct(mv, ["ch4", "pct_4h", "change_4h", "chg_4h", "percentage_4h", "p4", "h4"])
             ch1 = _pick_pct(mv, ["ch1", "pct_1h", "change_1h", "chg_1h", "percentage_1h", "p1", "h1"])
+
+            # ✅ FIX: correct 24H USD volume (MarketVol does NOT have fut_vol_usd)
             vol = float(usd_notional(mv) or 0.0)
+
+            # If still missing, compute from 1h candles (same logic as compute_metrics-style)
             if (abs(ch4) < 1e-9 and abs(ch1) < 1e-9) and getattr(mv, "symbol", None):
                 try:
                     c1 = fetch_ohlcv(mv.symbol, "1h", 6)
@@ -11151,28 +11162,55 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, min_vol_usd: float
                         ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
                 except Exception:
                     pass
+
         except Exception:
             continue
 
+        same_up = (ch4 > 0 and ch1 > 0)
+        same_down = (ch4 < 0 and ch1 < 0)
+        if not (same_up or same_down):
+            continue
+
+        up_hit = same_up and (ch4 >= float(p4)) and (ch1 >= float(p1))
+        down_hit = same_down and (ch4 <= -float(p4)) and (ch1 <= -float(p1))
+
+        if not (up_hit or down_hit):
+            continue
+
+        # ✅ NEW: volume gate (skip low-volume coins completely)
         if float(min_vol_usd or 0.0) > 0.0 and vol < float(min_vol_usd):
             continue
-        if ch4 == 0.0 or ch1 == 0.0:
-            continue
 
-        same_up = ch4 > 0 and ch1 > 0
-        same_down = ch4 < 0 and ch1 < 0
-        if same_up and ch4 >= float(p4) and ch1 >= float(p1):
-            direction = 'UP'
-        elif same_down and ch4 <= -float(p4) and ch1 <= -float(p1):
-            direction = 'DOWN'
+        if down_hit and not up_hit:
+            direction = "DOWN"
+        elif up_hit and not down_hit:
+            direction = "UP"
         else:
-            continue
+            direction = "UP" if ch1 >= 0 else "DOWN"
 
-        score = min(abs(ch4) / max(float(p4), 1e-9), abs(ch1) / max(float(p1), 1e-9))
-        out.append({'symbol': sym, 'ch4': ch4, 'ch1': ch1, 'vol': vol, 'direction': direction, 'score': score, 'same_direction': True})
+        score_up = max(
+            (abs(ch4) / max(p4, 1e-9)) if ch4 > 0 else 0.0,
+            (abs(ch1) / max(p1, 1e-9)) if ch1 > 0 else 0.0,
+        )
+        score_dn = max(
+            (abs(ch4) / max(p4, 1e-9)) if ch4 < 0 else 0.0,
+            (abs(ch1) / max(p1, 1e-9)) if ch1 < 0 else 0.0,
+        )
+        score = max(score_up, score_dn)
 
-    out.sort(key=lambda x: (x['score'], x['vol']), reverse=True)
+        out.append({
+            "symbol": sym,
+            "ch4": ch4,
+            "ch1": ch1,
+            "vol": vol,
+            "direction": direction,
+            "score": score,
+        })
+
+    out.sort(key=lambda x: (x["score"], x["vol"]), reverse=True)
     return out[:max_items]
+
+
 def _spike_reversal_candidates(
     best_fut: Dict[str, Any],
     min_vol_usd: float = 15_000_000.0,
@@ -11864,7 +11902,7 @@ def _autotrade_day_risk_metrics_quick(uid: int, equity: float) -> dict:
     open_pnl = 0.0
     realized_pnl_today = 0.0
     realized_loss_today = 0.0
-    mode = str(AUTOTRADE_MODE).lower()
+    mode = str(_autotrade_runtime_mode()).lower()
     user = _autotrade_user_settings(uid)
 
     try:
@@ -12053,7 +12091,7 @@ def _autotrade_day_risk_metrics_quick(uid: int, equity: float) -> dict:
 
 
 def _autotrade_day_risk_metrics_cached(uid: int, equity: float, ttl: int | None = None, force_refresh: bool = False) -> dict:
-    cache_key = f'autotrade_day_metrics_fast:{int(uid)}:{round(float(equity or 0.0), 2)}:{str(AUTOTRADE_MODE).lower()}'
+    cache_key = f'autotrade_day_metrics_fast:{int(uid)}:{round(float(equity or 0.0), 2)}:{str(_autotrade_runtime_mode()).lower()}'
     ttl_i = max(3, int(ttl if ttl is not None else FAST_ADMIN_METRICS_TTL_SEC))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -15159,7 +15197,7 @@ def _cache_recent_emailed_setup(user_id: int, setup: Any, session: str = '', ema
     _RECENT_EMAILED_SETUP_CACHE[uid] = bucket[:50]
     _recent_emailed_cache_prune(uid)
 
-def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_min: int = 20, limit: int = 3) -> list:
+def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_min: int = SCREEN_FALLBACK_MAX_AGE_MIN, limit: int = 3) -> list:
     from types import SimpleNamespace
     try:
         uid = int(user_id or 0)
@@ -15175,7 +15213,9 @@ def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_
     for row in list(_RECENT_EMAILED_SETUP_CACHE.get(uid, []) or []):
         try:
             sid = str(row.get('setup_id') or '').strip()
-            if not sid or sid in seen:
+            ident = _setup_identity_from_obj(dict(row))
+            dedupe_key = ident or sid
+            if not sid or dedupe_key in seen:
                 continue
             ts = float(row.get('emailed_ts', 0.0) or 0.0)
             if ts < cutoff:
@@ -15183,7 +15223,7 @@ def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_
             src_session_u = str(row.get('source_session') or '').upper().strip()
             if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
                 continue
-            seen.add(sid)
+            seen.add(dedupe_key)
             item = SimpleNamespace(**row)
             item = _research_finalize_setup(item, session_name=str(row.get('session') or req_session_u or ''))
             out.append(item)
@@ -15193,7 +15233,7 @@ def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_
             continue
     return out[:int(limit)]
 
-def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_age_min: int = 20, limit: int = 3) -> list:
+def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_age_min: int = SCREEN_FALLBACK_MAX_AGE_MIN, limit: int = 3) -> list:
     """Hydrate recently emailed setups from DB for screen/autotrade recovery.
 
     This is the durable fallback when the in-memory recent-email cache is empty
@@ -15209,7 +15249,7 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
     try:
         cutoff = float(time.time()) - float(max_age_min) * 60.0
     except Exception:
-        cutoff = float(time.time()) - 1200.0
+        cutoff = float(time.time()) - float(SCREEN_FALLBACK_MAX_AGE_MIN) * 60.0
     req_session_u = str(session_name or '').upper().strip()
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -15270,9 +15310,11 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
         try:
             row = dict(row)
             sid = str(row.get('setup_id') or '').strip()
-            if not sid or sid in seen:
+            ident = _setup_identity_from_obj(row)
+            dedupe_key = ident or sid
+            if not sid or dedupe_key in seen:
                 continue
-            seen.add(sid)
+            seen.add(dedupe_key)
             src_session_u = str(row.get('session') or '').upper().strip()
             if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
                 continue
@@ -15318,13 +15360,13 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
     return out[:int(limit)]
 
 
-def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', max_age_min: int = 20, limit: int = 3) -> list:
+def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', max_age_min: int = SCREEN_FALLBACK_MAX_AGE_MIN, limit: int = 3) -> list:
     """Return recent emailed/executable setups with cache -> DB fallback order."""
     out = []
     seen = set()
     for getter in (
-        lambda: _dedupe_fallback_setup_objects(_recent_cached_emailed_setups(user_id, session_name=session_name, max_age_min=min(max_age_min, SCREEN_FALLBACK_STALE_MAX_MIN), limit=max(1, int(limit) * 2)), max_age_min=min(max_age_min, SCREEN_FALLBACK_STALE_MAX_MIN)),
-        lambda: _dedupe_fallback_setup_objects(_db_recent_emailed_setup_objects(user_id, session_name=session_name, max_age_min=min(max_age_min, SCREEN_FALLBACK_STALE_MAX_MIN), limit=max(1, int(limit) * 2)), max_age_min=min(max_age_min, SCREEN_FALLBACK_STALE_MAX_MIN)),
+        lambda: _recent_cached_emailed_setups(user_id, session_name=session_name, max_age_min=max_age_min, limit=limit),
+        lambda: _db_recent_emailed_setup_objects(user_id, session_name=session_name, max_age_min=max_age_min, limit=limit),
     ):
         try:
             rows = getter() or []
@@ -15333,11 +15375,14 @@ def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', ma
         for item in rows:
             try:
                 sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
+                ident = _setup_identity_from_obj(item)
             except Exception:
                 sid = ''
-            if not sid or sid in seen:
+                ident = ''
+            dedupe_key = ident or sid
+            if not sid or dedupe_key in seen:
                 continue
-            seen.add(sid)
+            seen.add(dedupe_key)
             out.append(item)
             if len(out) >= int(limit):
                 return out[:int(limit)]
@@ -28352,7 +28397,7 @@ KNOWN_COMMANDS = sorted(set([
     "health", "health_sys",
 
     # AutoTrade (admin)
-    "open_trades", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_debug_reset", "autotrade_report_overall", "autotrade_sessions", "trade_lifecycle", "trade_lifecycle_detail",
+    "open_trades", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_debug_reset", "autotrade_report_overall", "autotrade_sessions", "autotrade_config", "trade_lifecycle", "trade_lifecycle_detail",
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
@@ -28448,7 +28493,7 @@ def _prefer_live_equity_for_user(user: dict | None = None) -> bool:
         uid = 0
     if uid <= 0 or not is_admin_user(uid):
         return False
-    return bool(AUTOTRADE_ENABLED) and str(AUTOTRADE_MODE).lower() == "live"
+    return bool(AUTOTRADE_ENABLED) and str(_autotrade_runtime_mode()).lower() == "live"
 
 
 def compute_risk_usd(user: dict, mode: str, value: float) -> float:
@@ -28931,6 +28976,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "trade_id_reset": "Reset your own Trade ID numbering",
     "dailycap": "Set daily risk cap, including /dailycap pct 100 for full-account daily cap",
     "dailycapAT": "Set AutoTrade daily risk cap separately from manual /dailycap",
+    "autotrade_config": "Show or set persistent AutoTrade runtime config: risk, caps, mode, max opens, leverage, isolated",
     "dayrisk_reset": "Reset today’s used-risk baseline for the active day. Use /dayrisk_reset, /dayrisk_reset show, or /dayrisk_reset clear",
 }
 
@@ -28940,7 +28986,7 @@ ADMIN_HELP_GROUPS = [
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "adaptive_run", "goal_status", "goal_run", "goal_set", "goal_abort", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
-    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "open_trades"]),
+    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
 ]
@@ -29653,6 +29699,87 @@ async def dailycapAT_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only persistent AutoTrade runtime config manager."""
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    summary = _autotrade_runtime_summary_dict()
+    if not context.args:
+        lines = [
+            "🤖 AutoTrade Runtime Config",
+            HDR,
+            f"AUTOTRADE_RISK_PER_TRADE_PCT = {float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']):.2f}",
+            f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
+            f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
+            f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
+            f"AUTOTRADE_MAX_OPEN_TRADES = {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])}",
+            f"AUTOTRADE_LEVERAGE = {int(summary['AUTOTRADE_LEVERAGE'])}",
+            f"AUTOTRADE_ISOLATED = {'true' if bool(summary['AUTOTRADE_ISOLATED']) else 'false'}",
+            "",
+            "Examples:",
+            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.5",
+            "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
+            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
+            "• /autotrade_config AUTOTRADE_MODE live",
+            "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 3",
+            "• /autotrade_config AUTOTRADE_LEVERAGE 10",
+            "• /autotrade_config AUTOTRADE_ISOLATED true",
+            "",
+            "Note: daily cap mode stays under /dailycapAT pct|usd <value>.",
+        ]
+        await send_long_message(update, "\n".join(lines), parse_mode=None)
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /autotrade_config <KEY> <VALUE>")
+        return
+
+    key = str(context.args[0] or '').strip().upper()
+    value_raw = " ".join(context.args[1:]).strip()
+    if key not in {
+        'AUTOTRADE_RISK_PER_TRADE_PCT', 'AUTOTRADE_OPEN_RISK_CAP_PCT', 'AUTOTRADE_DAILY_RISK_CAP_PCT',
+        'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_ISOLATED'
+    }:
+        await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
+        return
+
+    try:
+        if key == 'AUTOTRADE_RISK_PER_TRADE_PCT':
+            val = max(0.0, float(value_raw))
+            _autotrade_config_set(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, val)
+        elif key == 'AUTOTRADE_OPEN_RISK_CAP_PCT':
+            val = max(0.0, float(value_raw))
+            _autotrade_config_set(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, val)
+        elif key == 'AUTOTRADE_DAILY_RISK_CAP_PCT':
+            val = max(0.0, float(value_raw))
+            _autotrade_set_daily_cap_settings('PCT', val)
+        elif key == 'AUTOTRADE_MODE':
+            val = str(value_raw or '').strip().lower()
+            if val not in {'paper', 'live'}:
+                raise ValueError('mode must be paper or live')
+            _autotrade_config_set(AUTOTRADE_CFG_MODE_KEY, val)
+        elif key == 'AUTOTRADE_MAX_OPEN_TRADES':
+            val = max(1, int(float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, val)
+        elif key == 'AUTOTRADE_LEVERAGE':
+            val = max(1, int(float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_LEVERAGE_KEY, val)
+        elif key == 'AUTOTRADE_ISOLATED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_ISOLATED_KEY, 1 if val else 0)
+        else:
+            raise ValueError('unsupported key')
+    except Exception as e:
+        await update.message.reply_text(f"Invalid value for {key}: {e}")
+        return
+
+    summary = _autotrade_runtime_summary_dict()
+    await update.message.reply_text(f"✅ Updated {key}. Current value: {summary.get(key)}")
+
+
 async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: baseline-reset current day risk so remaining daily cap is restored."""
     uid = int(update.effective_user.id)
@@ -29874,7 +30001,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📣 Big-Move Alert Emails",
             f"{HDR}",
             f"Status: {'ON' if cur_on else 'OFF'}",
-            f"Thresholds: |4H| ≥ {cur_p4:.0f}% OR |1H| ≥ {cur_p1:.0f}% (both directions)",
+            f"Thresholds: |4H| ≥ {cur_p4:.0f}% AND |1H| ≥ {cur_p1:.0f}% (same direction only)",
             f"Min Vol (24H): {cur_min_vol/1e6:.1f}M",
         ]
         if updated_ts > 0:
@@ -29883,7 +30010,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"Reason: {updated_reason}")
         lines.extend([
             "",
-            "Set: /bigmove_alert on 20 10",
+            "Set: /bigmove_alert on 10 5",
             "Off: /bigmove_alert off",
         ])
         await update.message.reply_text("\n".join(lines))
@@ -29905,13 +30032,13 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 p4 = float(context.args[1])
                 p1 = float(context.args[2])
             except Exception:
-                await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)")
+                await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 10 5)")
                 return
-        _record_bigmove_settings_change(uid, True, p4, p1, min_vol, f"command_on via /bigmove_alert (4H>={p4:.2f}% OR 1H>={p1:.2f}%, min_vol={min_vol/1e6:.1f}M)")
-        await update.message.reply_text(f"✅ Big-move alert emails: ON (4H≥{p4:.0f}% OR 1H≥{p1:.0f}% | Min Vol {min_vol/1e6:.1f}M)")
+        _record_bigmove_settings_change(uid, True, p4, p1, min_vol, f"command_on via /bigmove_alert (4H>={p4:.2f}% AND 1H>={p1:.2f}%, same_direction_only, min_vol={min_vol/1e6:.1f}M)")
+        await update.message.reply_text(f"✅ Big-move alert emails: ON (4H≥{p4:.0f}% AND 1H≥{p1:.0f}% | same direction only | Min Vol {min_vol/1e6:.1f}M)")
         return
 
-    await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)  OR  /bigmove_alert off")
+    await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 10 5)  OR  /bigmove_alert off")
 
 
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -32588,7 +32715,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines = [
         '🧪 AutoTrade Debug',
         HDR,
-        f"Ready: {'✅' if ready else '❌'} | Mode: {str(AUTOTRADE_MODE).lower()} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
+        f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
         f"Trading day: {snap.get('today_window_label')}",
         SEP,
         f"Equity: ${equity:.2f}",
@@ -32653,7 +32780,7 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ Admin only.")
         return
 
-    if str(AUTOTRADE_MODE).lower() != "live":
+    if str(_autotrade_runtime_mode()).lower() != "live":
         await update.message.reply_text("AutoTrade is not in LIVE mode. No live positions to display.")
         return
 
@@ -33656,7 +33783,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     """
     from types import SimpleNamespace
 
-    def _recent_email_lane_screen_setups(_uid: int, _session: str, max_age_min: int = 20, limit: int = 3):
+    def _recent_email_lane_screen_setups(_uid: int, _session: str, max_age_min: int = SCREEN_FALLBACK_MAX_AGE_MIN, limit: int = 3):
         try:
             req_session_u = str(_session or '').upper().strip()
             out = []
@@ -33743,7 +33870,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         _exec_ready = []
 
     try:
-        setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=min(max(6, int(max(1, AUTOTRADE_ENTRY_WINDOW_MIN) / 3)), SCREEN_FALLBACK_STALE_MAX_MIN), limit=max(1, int(SETUPS_N))))
+        setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=max(1, int(SETUPS_N))))
     except Exception:
         setups = []
 
@@ -34031,7 +34158,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     screen_lane_note = ""
     try:
         if setups and any(str(getattr(s, 'source_kind', '') or '') not in {'', 'executable_setups'} for s in (setups or [])):
-            screen_lane_note = f"_Showing very recent fallback setups only (max {int(SCREEN_FALLBACK_STALE_MAX_MIN)} min) while the executable scan rebuilds._"
+            screen_lane_note = "_Showing only very recent fallback setups while the executable lane rebuilds. Stale duplicates are suppressed._"
     except Exception:
         screen_lane_note = ""
 
@@ -34148,6 +34275,9 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             side = str(getattr(s, 'side', '') or '').upper()
             if symbol_flip_guard_active(int(uid), sym, side, target_session):
                 skipped.append('flip_guard_blocked')
+                continue
+            if _email_setup_identity_recently_sent(int(uid), s):
+                skipped.append('duplicate_setup_identity')
                 continue
             if _email_symbol_recently_sent(int(uid), sym, side, target_session, setup_id=sid):
                 skipped.append('cooldown_blocked')
@@ -34832,22 +34962,18 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                     except Exception:
                         pass
                     try:
-                        # Keep the executable lane authoritative. Seed a missing row only for
-                        # recovery; do not refresh emailed fallback rows as if they were newly executable.
-                        if not db_has_executable_setup(int(_target_uid), getattr(s, "setup_id", ""), lookback_hours=max(1, int(math.ceil(float(AUTOTRADE_ENTRY_WINDOW_MIN or 45) / 60.0)))):
-                            db_mark_executable_setup(
-                                int(_target_uid),
-                                getattr(s, "setup_id", ""),
-                                str(display_session),
-                                float(getattr(s, 'created_ts', 0.0) or now_ts),
-                                s=s,
-                                source_kind='executable_setups',
-                                state='executable_pending',
-                            )
-                    except Exception:
-                        pass
-                    try:
-                        _mark_setup_identity_emailed(int(_target_uid), s, emailed_ts=float(now_ts))
+                        # Re-assert the exact emailed setup into the executable lane so
+                        # /screen and autotrade consume the same authoritative row even if
+                        # an earlier pool-write was missed or a cache branch went stale.
+                        db_mark_executable_setup(
+                            int(_target_uid),
+                            getattr(s, "setup_id", ""),
+                            str(display_session),
+                            float(now_ts),
+                            s=s,
+                            source_kind='emailed_setups',
+                            state='executable_pending',
+                        )
                     except Exception:
                         pass
                     try:
@@ -34856,6 +34982,10 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                         pass
                     try:
                         _cache_recent_emailed_setup(int(_target_uid), s, session=str(display_session or ''), emailed_ts=float(now_ts), source_kind='recent_email_cache')
+                    except Exception:
+                        pass
+                    try:
+                        _mark_emailed_setup_identity(int(_target_uid), s, emailed_ts=float(now_ts))
                     except Exception:
                         pass
         except Exception:
@@ -35350,31 +35480,18 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     bm_any_1h = -1
 
-                mismatch_direction = 0
-                try:
-                    for _sym, _mv in (best_fut or {}).items():
-                        _ch4 = _pick_pct(_mv, ["ch4", "pct_4h", "change_4h", "chg_4h", "percentage_4h", "p4", "h4"])
-                        _ch1 = _pick_pct(_mv, ["ch1", "pct_1h", "change_1h", "chg_1h", "percentage_1h", "p1", "h1"])
-                        if (_ch4 > 0 > _ch1) or (_ch4 < 0 < _ch1):
-                            if abs(_ch4) >= float(p4) or abs(_ch1) >= float(p1):
-                                mismatch_direction += 1
-                except Exception:
-                    mismatch_direction = -1
-
                 if not candidates:
                     return {
                         "status": "SKIP",
                         "reasons": [
                             f"no_candidates (p4={p4}, p1={p1})",
                             f"debug_raw_hits:4h={bm_any_4h},1h={bm_any_1h}",
-                            f"mismatch_direction_1h_4h={mismatch_direction}",
                         ],
                     }
 
                 filtered = []
                 volume_filtered_out = 0
                 cooldown_filtered_out = 0
-                cooldown_filtered_symbols = []
                 for c in candidates:
                     try:
                         vol = float(c.get("vol", 0.0) or 0.0)
@@ -35386,9 +35503,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                     try:
+                        ch4 = float(c.get("ch4", 0.0) or 0.0)
+                        ch1 = float(c.get("ch1", 0.0) or 0.0)
+                        if not ((ch4 > 0 and ch1 > 0) or (ch4 < 0 and ch1 < 0)):
+                            c['suppression_reason'] = 'mismatch_direction_1h_4h'
+                            continue
                         if bigmove_recently_emailed(int(uid), c["symbol"], c["direction"]):
                             cooldown_filtered_out += 1
-                            cooldown_filtered_symbols.append(f"{c['symbol']}:bigmove_symbol_cooldown_active")
+                            c['suppression_reason'] = 'bigmove_symbol_cooldown_active'
                             continue
                         filtered.append(c)
                     except Exception:
@@ -35402,14 +35524,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                             f"raw_candidates={len(candidates)}",
                             f"volume_filtered={int(volume_filtered_out)}",
                             f"cooldown_filtered={int(cooldown_filtered_out)}",
-                            (f"suppressed={','.join(cooldown_filtered_symbols[:4])}" if cooldown_filtered_symbols else None),
+                            "suppression_reasons:mismatch_direction_1h_4h,bigmove_symbol_cooldown_active",
                         ],
                     }
 
                 lines = []
                 lines.append("⚡ PulseFutures — BIG MOVE ALERT")
                 lines.append(HDR)
-                lines.append(f"Triggers: same-direction only | 4H ≥ {p4:.1f}% and 1H ≥ {p1:.1f}%")
+                lines.append(f"Triggers: |4H| ≥ {p4:.1f}% AND |1H| ≥ {p1:.1f}% (same direction only)")
                 lines.append(f"Min Vol (24H): {min_vol/1e6:.1f}M")
                 lines.append("")
 
@@ -35916,6 +36038,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     diversify_blocked[str(why_div)] += 1
                     continue
 
+                if _email_setup_identity_recently_sent(uid, s):
+                    cooldown_blocked += 1
+                    continue
                 if _email_symbol_recently_sent(uid, sym, side, sess_name, setup_id=str(getattr(s, 'setup_id', '') or '')):
                     cooldown_blocked += 1
                     continue
@@ -37789,6 +37914,8 @@ def main():
     app.add_handler(CommandHandler("dailycap", dailycap_cmd, block=False))
     app.add_handler(CommandHandler("dailycapAT", dailycapAT_cmd, block=False))
     app.add_handler(CommandHandler("dailycapat", dailycapAT_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_config", autotrade_config_cmd, block=False))
+    app.add_handler(CommandHandler("autotradecfg", autotrade_config_cmd, block=False))
     app.add_handler(CommandHandler("dayrisk_reset", dayrisk_reset_cmd, block=False))
     app.add_handler(CommandHandler("limits", limits_cmd, block=False))
 
