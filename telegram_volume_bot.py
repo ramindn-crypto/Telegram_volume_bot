@@ -408,6 +408,236 @@ def _autotrade_set_daily_cap_settings(mode: str, value: float) -> None:
             conn.commit()
     except Exception:
         pass
+AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY = 'risk_per_trade_pct'
+AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY = 'open_risk_cap_pct'
+AUTOTRADE_CFG_LEVERAGE_KEY = 'leverage'
+AUTOTRADE_CFG_ISOLATED_KEY = 'isolated'
+AUTOTRADE_CFG_MODE_KEY = 'mode'
+AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
+AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 6.0
+SCREEN_FALLBACK_MAX_AGE_MIN = 8
+
+
+def _autotrade_config_get(key: str, default=None):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS autotrade_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            row = c.execute("SELECT value FROM autotrade_config WHERE key=?", (str(key or ''),)).fetchone()
+            if not row:
+                return default
+            val = row[0]
+            return default if val is None or str(val).strip() == '' else val
+    except Exception:
+        return default
+
+
+def _autotrade_config_set(key: str, value) -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS autotrade_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.execute(
+                "INSERT OR REPLACE INTO autotrade_config(key,value) VALUES(?,?)",
+                (str(key or ''), '' if value is None else str(value)),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _autotrade_bootstrap_runtime_config() -> None:
+    defaults = {
+        AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: float(AUTOTRADE_RISK_PER_TRADE_PCT),
+        AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY: float(AUTOTRADE_OPEN_RISK_CAP_PCT),
+        AUTOTRADE_DAILY_CAP_MODE_KEY: 'PCT',
+        AUTOTRADE_DAILY_CAP_VALUE_KEY: float(AUTOTRADE_DAILY_RISK_CAP_PCT),
+        AUTOTRADE_CFG_LEVERAGE_KEY: int(AUTOTRADE_LEVERAGE),
+        AUTOTRADE_CFG_ISOLATED_KEY: 1 if bool(AUTOTRADE_ISOLATED) else 0,
+        AUTOTRADE_CFG_MODE_KEY: str(AUTOTRADE_MODE or 'paper').strip().lower(),
+        AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: int(_autotrade_runtime_max_open_trades()),
+    }
+    for k, v in defaults.items():
+        try:
+            cur = _autotrade_config_get(k, None)
+            if cur is None or str(cur).strip() == '':
+                _autotrade_config_set(k, v)
+        except Exception:
+            pass
+
+
+def _autotrade_risk_per_trade_pct() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, AUTOTRADE_RISK_PER_TRADE_PCT) or AUTOTRADE_RISK_PER_TRADE_PCT)
+    except Exception:
+        val = float(AUTOTRADE_RISK_PER_TRADE_PCT)
+    return max(0.0, float(val))
+
+
+def _autotrade_open_risk_cap_pct() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, AUTOTRADE_OPEN_RISK_CAP_PCT) or AUTOTRADE_OPEN_RISK_CAP_PCT)
+    except Exception:
+        val = float(AUTOTRADE_OPEN_RISK_CAP_PCT)
+    return max(0.0, float(val))
+
+
+def _autotrade_runtime_mode() -> str:
+    try:
+        mode = str(_autotrade_config_get(AUTOTRADE_CFG_MODE_KEY, AUTOTRADE_MODE) or AUTOTRADE_MODE).strip().lower()
+    except Exception:
+        mode = str(AUTOTRADE_MODE or 'paper').strip().lower()
+    return mode if mode in {'paper', 'live'} else str(AUTOTRADE_MODE or 'paper').strip().lower()
+
+
+def _autotrade_runtime_max_open_trades() -> int:
+    try:
+        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, AUTOTRADE_MAX_OPEN_TRADES) or AUTOTRADE_MAX_OPEN_TRADES))
+    except Exception:
+        val = int(_autotrade_runtime_max_open_trades())
+    return max(1, int(val))
+
+
+def _autotrade_runtime_leverage() -> int:
+    try:
+        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_LEVERAGE_KEY, AUTOTRADE_LEVERAGE) or AUTOTRADE_LEVERAGE))
+    except Exception:
+        val = int(AUTOTRADE_LEVERAGE)
+    return max(1, int(val))
+
+
+def _autotrade_runtime_isolated() -> bool:
+    try:
+        raw = _autotrade_config_get(AUTOTRADE_CFG_ISOLATED_KEY, 1 if AUTOTRADE_ISOLATED else 0)
+        return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
+    except Exception:
+        return bool(AUTOTRADE_ISOLATED)
+
+
+def _autotrade_runtime_summary_dict() -> dict:
+    mode_txt, daily_val = _autotrade_daily_cap_settings()
+    return {
+        'AUTOTRADE_RISK_PER_TRADE_PCT': float(_autotrade_risk_per_trade_pct()),
+        'AUTOTRADE_OPEN_RISK_CAP_PCT': float(_autotrade_open_risk_cap_pct()),
+        'AUTOTRADE_DAILY_RISK_CAP_PCT': float(daily_val or 0.0),
+        'AUTOTRADE_DAILY_RISK_CAP_MODE': str(mode_txt or 'PCT').upper(),
+        'AUTOTRADE_MODE': str(_autotrade_runtime_mode()).lower(),
+        'AUTOTRADE_MAX_OPEN_TRADES': int(_autotrade_runtime_max_open_trades()),
+        'AUTOTRADE_LEVERAGE': int(_autotrade_runtime_leverage()),
+        'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
+    }
+
+
+def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
+    try:
+        sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
+    except Exception:
+        sym = str(symbol or '').upper().strip()
+    sd = str(side or '').upper().strip()
+    eng = str(engine or '').upper().strip()
+    try:
+        e = round(float(entry or 0.0), 8)
+        s = round(float(sl or 0.0), 8)
+        t = round(float(tp or 0.0), 8)
+    except Exception:
+        e, s, t = 0.0, 0.0, 0.0
+    return f"{sym}|{sd}|{eng}|{e:.8f}|{s:.8f}|{t:.8f}"
+
+
+def _setup_identity_from_obj(setup) -> str:
+    try:
+        if isinstance(setup, dict):
+            return _setup_identity_key(
+                setup.get('symbol', ''),
+                setup.get('side', ''),
+                setup.get('entry', 0.0),
+                setup.get('sl', 0.0),
+                _resolve_single_tp(float(setup.get('entry') or 0.0), float(setup.get('sl') or 0.0), setup.get('tp'), setup.get('alt_target_a'), setup.get('alt_target_b'), str(setup.get('side') or '')),
+                setup.get('engine', ''),
+            )
+        return _setup_identity_key(
+            getattr(setup, 'symbol', ''),
+            getattr(setup, 'side', ''),
+            getattr(setup, 'entry', 0.0),
+            getattr(setup, 'sl', 0.0),
+            _setup_target_tp(setup, 0.0),
+            getattr(setup, 'engine', ''),
+        )
+    except Exception:
+        return ''
+
+
+def _email_setup_identity_recently_sent(user_id: int, setup, lookback_hours: float | None = None) -> bool:
+    cutoff_hours = float(lookback_hours or AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS)
+    ident = _setup_identity_from_obj(setup)
+    if not ident:
+        return False
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("""CREATE TABLE IF NOT EXISTS emailed_setup_identities (
+                user_id INTEGER NOT NULL,
+                identity_key TEXT NOT NULL,
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                setup_id TEXT NOT NULL DEFAULT '',
+                emailed_ts REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id, identity_key)
+            )""")
+            row = cur.execute(
+                "SELECT emailed_ts FROM emailed_setup_identities WHERE user_id=? AND identity_key=?",
+                (int(user_id), str(ident)),
+            ).fetchone()
+            if not row:
+                return False
+            last_ts = float(row[0] or 0.0)
+            return (time.time() - last_ts) < max(0.0, cutoff_hours * 3600.0)
+    except Exception:
+        return False
+
+
+def _mark_emailed_setup_identity(user_id: int, setup, emailed_ts: float | None = None) -> None:
+    ident = _setup_identity_from_obj(setup)
+    if not ident:
+        return
+    ts = float(emailed_ts or time.time())
+    try:
+        sym = str(_bybit_linear_symbol(setup.get('symbol', '') if isinstance(setup, dict) else getattr(setup, 'symbol', '')) or '').upper().strip()
+    except Exception:
+        sym = str((setup.get('symbol', '') if isinstance(setup, dict) else getattr(setup, 'symbol', '')) or '').upper().strip()
+    side = str((setup.get('side', '') if isinstance(setup, dict) else getattr(setup, 'side', '')) or '').upper().strip()
+    setup_id = str((setup.get('setup_id', '') if isinstance(setup, dict) else getattr(setup, 'setup_id', '')) or '').strip()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("""CREATE TABLE IF NOT EXISTS emailed_setup_identities (
+                user_id INTEGER NOT NULL,
+                identity_key TEXT NOT NULL,
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                setup_id TEXT NOT NULL DEFAULT '',
+                emailed_ts REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id, identity_key)
+            )""")
+            cur.execute(
+                "INSERT OR REPLACE INTO emailed_setup_identities(user_id, identity_key, symbol, side, setup_id, emailed_ts) VALUES(?,?,?,?,?,?)",
+                (int(user_id), str(ident), str(sym), str(side), str(setup_id), float(ts)),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 # =============================================================
 
 import asyncio
@@ -2174,6 +2404,11 @@ def max_cooldown_hours() -> int:
     except Exception:
         return int(SYMBOL_COOLDOWN_HOURS)
 
+try:
+    AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = max(6.0, float(max_cooldown_hours()))
+except Exception:
+    AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 6.0
+
 # Multi-TP
 ATR_PERIOD = 14
 ATR_MIN_PCT = 1.0
@@ -2246,6 +2481,11 @@ try:
         AUTOTRADE_TP_SPLIT = [x/_s for x in AUTOTRADE_TP_SPLIT]
 except Exception:
     AUTOTRADE_TP_SPLIT = [0.4, 0.4, 0.2]
+
+try:
+    _autotrade_bootstrap_runtime_config()
+except Exception:
+    pass
 
 # Live exit architecture: keep the stop-loss on Bybit's position-level trading-stop and
 # attach TP / TP as native exchange exits. The primary lane uses reduce-only close-trigger
@@ -2675,7 +2915,7 @@ def _live_equity_usdt() -> float | None:
     try:
         if not AUTOTRADE_ENABLED:
             return None
-        if str(AUTOTRADE_MODE).lower() != "live":
+        if str(_autotrade_runtime_mode()).lower() != "live":
             return None
         if not BYBIT_API_KEY or not BYBIT_API_SECRET:
             return None
@@ -3791,7 +4031,7 @@ def _autotrade_clear_position_full_tp_sl(symbol: str, side: str | None = None, l
 def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: dict | None = None) -> dict:
     result = {'checked': False, 'sl_fixed': False, 'tp_fixed': False, 'tp_order_fixed': False, 'be_applied': False, 'symbol': '', 'side': ''}
     try:
-        if str(AUTOTRADE_MODE).lower() != 'live':
+        if str(_autotrade_runtime_mode()).lower() != 'live':
             return result
         if not trade_row:
             return result
@@ -4158,7 +4398,7 @@ def _bybit_get_closed_pnl_linear(start_ts: float, end_ts: float, symbol: str | N
 
     Best-effort pagination is used because the exchange may return a cursor.
     """
-    if str(AUTOTRADE_MODE).lower() != 'live' or not BYBIT_API_KEY or not BYBIT_API_SECRET:
+    if str(_autotrade_runtime_mode()).lower() != 'live' or not BYBIT_API_KEY or not BYBIT_API_SECRET:
         return []
     start_ms = int(max(0.0, float(start_ts or 0.0)) * 1000)
     end_ms = int(max(float(end_ts or 0.0), float(start_ts or 0.0)) * 1000)
@@ -4291,7 +4531,7 @@ def _autotrade_sync_closed_trades_from_exchange(uid: int, now_utc: Optional[date
     whatever was manually written into autotrade_trades.
     """
     summary = {'checked': 0, 'closed': 0, 'matched_events': 0}
-    if str(AUTOTRADE_MODE).lower() != 'live':
+    if str(_autotrade_runtime_mode()).lower() != 'live':
         return summary
     try:
         open_rows = _autotrade_db_open_trades(int(uid)) or []
@@ -4428,7 +4668,7 @@ def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[d
     missing. This is only used to avoid a useless all-zero performance report after upgrades.
     It never overrides journal-confirmed bot trades.
     """
-    if str(AUTOTRADE_MODE).lower() != 'live':
+    if str(_autotrade_runtime_mode()).lower() != 'live':
         return []
     days = int(max(2, min(int(days or 7), 3650)))
     user = _autotrade_user_settings(int(uid))
@@ -4459,7 +4699,7 @@ def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[d
             continue
 
     live_keys = set()
-    if str(AUTOTRADE_MODE).lower() == 'live':
+    if str(_autotrade_runtime_mode()).lower() == 'live':
         try:
             for p in (_bybit_get_open_positions_linear() or []):
                 sym = str(_bybit_linear_symbol(_pos_symbol(p)) or '').upper()
@@ -4649,7 +4889,7 @@ def _autotrade_exchange_close_fallback_rows(uid: int, days: int = 7) -> list[dic
     It aggregates raw Bybit closed-PnL events inside the anchored trading-day window and
     excludes any events already represented by journal-confirmed or provisional matches.
     """
-    if str(AUTOTRADE_MODE).lower() != 'live':
+    if str(_autotrade_runtime_mode()).lower() != 'live':
         return []
     days = int(max(2, min(int(days or 7), 3650)))
     user = _autotrade_user_settings(int(uid))
@@ -4863,7 +5103,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     open_pnl = 0.0
     realized_pnl_today = 0.0
     realized_loss_today = 0.0
-    mode = str(AUTOTRADE_MODE).lower()
+    mode = str(_autotrade_runtime_mode()).lower()
     user = _autotrade_user_settings(uid)
 
     try:
@@ -5113,7 +5353,7 @@ def _autotrade_daily_cap_usd(uid: int, equity: float) -> float:
     mode, val = _autotrade_daily_cap_settings()
     if mode == 'USD':
         return max(0.0, float(val or 0.0))
-    eq = _effective_equity_for_risk(user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
+    eq = _effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live'))
     if eq <= 0:
         return 0.0
     return _risk_amount_from_pct(eq, float(val or 0.0))
@@ -5719,7 +5959,7 @@ def _autotrade_can_open_symbol(uid: int, symbol: str, side: str, session_label: 
         _autotrade_log_symbol_block(uid, sym, sd, 'blocked_duplicate_inflight_lock', 'runtime_lock_active')
         return (False, 'blocked_duplicate_inflight_lock', detail)
 
-    if str(AUTOTRADE_MODE).lower() == 'live':
+    if str(_autotrade_runtime_mode()).lower() == 'live':
         try:
             conflict = _autotrade_live_symbol_conflict(uid, sym, side=sd)
         except Exception:
@@ -5751,7 +5991,7 @@ def _autotrade_can_open_symbol(uid: int, symbol: str, side: str, session_label: 
         _autotrade_log_symbol_block(uid, sym, sd, 'blocked_duplicate_pending_order', f"guards={len(pending_guards)} statuses={statuses}")
         return (False, 'blocked_duplicate_pending_order', detail)
 
-    if str(AUTOTRADE_MODE).lower() == 'live':
+    if str(_autotrade_runtime_mode()).lower() == 'live':
         try:
             if _autotrade_has_live_open_order(sym, side=None):
                 detail['live_open_order'] = True
@@ -6474,7 +6714,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (False, 'sl_not_above_entry_for_sell')
 
     price_ref = intended_entry
-    if str(AUTOTRADE_MODE).lower() == 'live':
+    if str(_autotrade_runtime_mode()).lower() == 'live':
         live_ref = _autotrade_live_reference_price(sym, fallback_entry=intended_entry)
         if live_ref > 0:
             price_ref = live_ref
@@ -6485,7 +6725,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             entry_drift_pct = abs((float(price_ref) - float(intended_entry)) / float(intended_entry)) * 100.0
     except Exception:
         entry_drift_pct = 0.0
-    if str(AUTOTRADE_MODE).lower() == 'live' and float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT) > 0 and entry_drift_pct > float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT):
+    if str(_autotrade_runtime_mode()).lower() == 'live' and float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT) > 0 and entry_drift_pct > float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT):
         try:
             _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
@@ -6515,12 +6755,12 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     if side == 'SELL' and sl_for_order <= price_ref:
         return (False, 'stop_invalid_after_tick_rounding_for_sell')
 
-    equity = _effective_equity_for_risk(get_user(uid) or {}, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
+    equity = _effective_equity_for_risk(get_user(uid) or {}, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live'))
     if equity <= 0:
         return (False, 'equity_unavailable_or_zero')
     try:
-        if str(AUTOTRADE_MODE).lower() == 'live' and equity > 0:
-            update_user(int(uid), equity=float(equity))
+        if str(_autotrade_runtime_mode()).lower() == 'live' and equity > 0:
+            pass  # keep manual /equity isolated from AutoTrade live equity
     except Exception:
         pass
 
@@ -6560,13 +6800,13 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         except Exception:
             pass
         return (False, 'max_trades_day_reached')
-    if int(AUTOTRADE_MAX_OPEN_TRADES or 0) > 0 and live_open_count >= int(AUTOTRADE_MAX_OPEN_TRADES):
+    if int(AUTOTRADE_MAX_OPEN_TRADES or 0) > 0 and live_open_count >= int(_autotrade_runtime_max_open_trades()):
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_open_trades_reached', 'open_positions_now': int(live_open_count)})
         except Exception:
             pass
         try:
-            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'max_open_trades_reached ({live_open_count}/{int(AUTOTRADE_MAX_OPEN_TRADES)})')
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'max_open_trades_reached ({live_open_count}/{int(_autotrade_runtime_max_open_trades())})')
         except Exception:
             pass
         return (False, 'max_open_trades_reached')
@@ -6598,7 +6838,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
             'entry': float(price_ref),
             'sl': float(sl_for_order),
-            'entry_source': 'live_ref' if str(AUTOTRADE_MODE).lower() == 'live' else 'setup',
+            'entry_source': 'live_ref' if str(_autotrade_runtime_mode()).lower() == 'live' else 'setup',
             'sl_source': 'tick_rounded',
             'setup_entry_vs_live_delta_pct': (((float(price_ref) - float(intended_entry)) / float(intended_entry)) * 100.0) if float(intended_entry) > 0 else 0.0,
             'contractSize': float(contract_size),
@@ -6743,7 +6983,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         pass
 
     try:
-        if str(AUTOTRADE_MODE).lower() != 'live':
+        if str(_autotrade_runtime_mode()).lower() != 'live':
             s_paper = replace(s, entry=float(price_ref), sl=float(sl_for_order), tp=float(live_final_tp or 0.0), alt_target_a=0.0, alt_target_b=0.0)
             trade_id = _autotrade_db_add_trade(uid, session_label, s_paper, float(qty), lifecycle_state='executed_open', lifecycle_reason='paper_opened')
             _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
@@ -10736,7 +10976,7 @@ def _safe_float(x, default: float = 0.0) -> float:
 
 
 
-BIGMOVE_COOLDOWN_SEC = 60 * 60 * 3  # 3 hours
+BIGMOVE_COOLDOWN_SEC = 60 * 60 * 2  # 2 hours
 
 def bigmove_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
     try:
@@ -10888,8 +11128,8 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, min_vol_usd: float
       - "DOWN" → strong negative move
 
     Triggers:
-      - UP   if ch4 >= +p4 OR ch1 >= +p1
-      - DOWN if ch4 <= -p4 OR ch1 <= -p1
+      - UP   if ch4 >= +p4 AND ch1 >= +p1
+      - DOWN if ch4 <= -p4 AND ch1 <= -p1
     """
 
     def _pick_pct(mv, keys) -> float:
@@ -10931,8 +11171,13 @@ def _bigmove_candidates(best_fut: dict, p4: float, p1: float, min_vol_usd: float
         except Exception:
             continue
 
-        up_hit = (ch4 >= float(p4)) or (ch1 >= float(p1))
-        down_hit = (ch4 <= -float(p4)) or (ch1 <= -float(p1))
+        same_up = (ch4 > 0 and ch1 > 0)
+        same_down = (ch4 < 0 and ch1 < 0)
+        if not (same_up or same_down):
+            continue
+
+        up_hit = same_up and (ch4 >= float(p4)) and (ch1 >= float(p1))
+        down_hit = same_down and (ch4 <= -float(p4)) and (ch1 <= -float(p1))
 
         if not (up_hit or down_hit):
             continue
@@ -11662,7 +11907,7 @@ def _autotrade_day_risk_metrics_quick(uid: int, equity: float) -> dict:
     open_pnl = 0.0
     realized_pnl_today = 0.0
     realized_loss_today = 0.0
-    mode = str(AUTOTRADE_MODE).lower()
+    mode = str(_autotrade_runtime_mode()).lower()
     user = _autotrade_user_settings(uid)
 
     try:
@@ -11851,7 +12096,7 @@ def _autotrade_day_risk_metrics_quick(uid: int, equity: float) -> dict:
 
 
 def _autotrade_day_risk_metrics_cached(uid: int, equity: float, ttl: int | None = None, force_refresh: bool = False) -> dict:
-    cache_key = f'autotrade_day_metrics_fast:{int(uid)}:{round(float(equity or 0.0), 2)}:{str(AUTOTRADE_MODE).lower()}'
+    cache_key = f'autotrade_day_metrics_fast:{int(uid)}:{round(float(equity or 0.0), 2)}:{str(_autotrade_runtime_mode()).lower()}'
     ttl_i = max(3, int(ttl if ttl is not None else FAST_ADMIN_METRICS_TTL_SEC))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -11881,7 +12126,7 @@ def _accounting_snapshot_cached(uid: int, user: dict, is_admin: Optional[bool] =
             obj = cache_get(cache_key)
             if isinstance(obj, dict):
                 return dict(obj)
-        snap = _accounting_snapshot(uid, user, is_admin=False)
+        snap = _accounting_snapshot(uid, user, is_admin=is_admin)
         cache_set(cache_key, dict(snap or {}))
         return dict(snap or {})
     except Exception:
@@ -11992,10 +12237,6 @@ def _accounting_snapshot(uid: int, user: dict, is_admin: Optional[bool] = None) 
         live_eq = _live_equity_usdt_cached(ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
         if live_eq is not None:
             snap["equity"] = float(live_eq)
-            try:
-                update_user(int(uid), equity=float(live_eq))
-            except Exception:
-                pass
         m = _autotrade_day_risk_metrics_cached(int(uid), float(snap["equity"]), ttl=FAST_ADMIN_METRICS_TTL_SEC)
         snap["cap"] = float(m.get("cap") or 0.0)
         snap["current_total_open_risk"] = float(m.get("current_total_open_risk") or 0.0)
@@ -13792,7 +14033,7 @@ def _trade_lifecycle_sync(owner_uid: int, days: int = 30, force: bool = False) -
     sync_cutoff = start_ts - 86400.0 * 5.0
 
     try:
-        if str(AUTOTRADE_MODE).lower() == 'live' and owner_uid == int(AUTOTRADE_OWNER_UID or owner_uid):
+        if str(_autotrade_runtime_mode()).lower() == 'live' and owner_uid == int(AUTOTRADE_OWNER_UID or owner_uid):
             _autotrade_sync_closed_trades_from_exchange(owner_uid, lookback_days=max(14, int(days) + 5))
     except Exception:
         pass
@@ -13833,7 +14074,7 @@ def _trade_lifecycle_sync(owner_uid: int, days: int = 30, force: bool = False) -
             rng['start'] = st if rng['start'] is None else min(float(rng['start']), st)
             rng['end'] = et if rng['end'] is None else max(float(rng['end']), et)
 
-    live_mode = bool(str(AUTOTRADE_MODE).lower() == 'live' and owner_uid == int(AUTOTRADE_OWNER_UID or owner_uid))
+    live_mode = bool(str(_autotrade_runtime_mode()).lower() == 'live' and owner_uid == int(AUTOTRADE_OWNER_UID or owner_uid))
     position_map = {}
     if live_mode:
         try:
@@ -14957,7 +15198,7 @@ def _cache_recent_emailed_setup(user_id: int, setup: Any, session: str = '', ema
     _RECENT_EMAILED_SETUP_CACHE[uid] = bucket[:50]
     _recent_emailed_cache_prune(uid)
 
-def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_min: int = 20, limit: int = 3) -> list:
+def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_min: int = SCREEN_FALLBACK_MAX_AGE_MIN, limit: int = 3) -> list:
     from types import SimpleNamespace
     try:
         uid = int(user_id or 0)
@@ -14973,7 +15214,9 @@ def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_
     for row in list(_RECENT_EMAILED_SETUP_CACHE.get(uid, []) or []):
         try:
             sid = str(row.get('setup_id') or '').strip()
-            if not sid or sid in seen:
+            ident = _setup_identity_from_obj(dict(row))
+            dedupe_key = ident or sid
+            if not sid or dedupe_key in seen:
                 continue
             ts = float(row.get('emailed_ts', 0.0) or 0.0)
             if ts < cutoff:
@@ -14981,7 +15224,7 @@ def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_
             src_session_u = str(row.get('source_session') or '').upper().strip()
             if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
                 continue
-            seen.add(sid)
+            seen.add(dedupe_key)
             item = SimpleNamespace(**row)
             item = _research_finalize_setup(item, session_name=str(row.get('session') or req_session_u or ''))
             out.append(item)
@@ -14991,7 +15234,7 @@ def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_
             continue
     return out[:int(limit)]
 
-def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_age_min: int = 20, limit: int = 3) -> list:
+def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_age_min: int = SCREEN_FALLBACK_MAX_AGE_MIN, limit: int = 3) -> list:
     """Hydrate recently emailed setups from DB for screen/autotrade recovery.
 
     This is the durable fallback when the in-memory recent-email cache is empty
@@ -15007,7 +15250,7 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
     try:
         cutoff = float(time.time()) - float(max_age_min) * 60.0
     except Exception:
-        cutoff = float(time.time()) - 1200.0
+        cutoff = float(time.time()) - float(SCREEN_FALLBACK_MAX_AGE_MIN) * 60.0
     req_session_u = str(session_name or '').upper().strip()
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -15068,9 +15311,11 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
         try:
             row = dict(row)
             sid = str(row.get('setup_id') or '').strip()
-            if not sid or sid in seen:
+            ident = _setup_identity_from_obj(row)
+            dedupe_key = ident or sid
+            if not sid or dedupe_key in seen:
                 continue
-            seen.add(sid)
+            seen.add(dedupe_key)
             src_session_u = str(row.get('session') or '').upper().strip()
             if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
                 continue
@@ -15116,7 +15361,7 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
     return out[:int(limit)]
 
 
-def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', max_age_min: int = 20, limit: int = 3) -> list:
+def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', max_age_min: int = SCREEN_FALLBACK_MAX_AGE_MIN, limit: int = 3) -> list:
     """Return recent emailed/executable setups with cache -> DB fallback order."""
     out = []
     seen = set()
@@ -15131,11 +15376,14 @@ def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', ma
         for item in rows:
             try:
                 sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
+                ident = _setup_identity_from_obj(item)
             except Exception:
                 sid = ''
-            if not sid or sid in seen:
+                ident = ''
+            dedupe_key = ident or sid
+            if not sid or dedupe_key in seen:
                 continue
-            seen.add(sid)
+            seen.add(dedupe_key)
             out.append(item)
             if len(out) >= int(limit):
                 return out[:int(limit)]
@@ -15919,7 +16167,7 @@ def _admin_report_uses_live_autotrade(uid: int) -> bool:
         owner = int(AUTOTRADE_OWNER_UID or 0)
     except Exception:
         owner = 0
-    return bool(str(AUTOTRADE_MODE).lower() == 'live' and owner > 0 and (int(uid) == owner or is_admin_user(uid)))
+    return bool(str(_autotrade_runtime_mode()).lower() == 'live' and owner > 0 and (int(uid) == owner or is_admin_user(uid)))
 
 
 def _report_closed_activity_stats(rows: List[dict]) -> dict:
@@ -15991,7 +16239,7 @@ async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Admin/owner should always use the live autotrade/Bybit reporting lane when AutoTrade is live.
     # Do not require AUTOTRADE_OWNER_UID to be configured for admin reads, because /autotrade_report
     # already works for admins via the same exchange-backed lane.
-    live_admin = bool(str(AUTOTRADE_MODE).lower() == 'live' and (is_admin_user(uid) or int(uid) == int(AUTOTRADE_OWNER_UID or 0)))
+    live_admin = bool(str(_autotrade_runtime_mode()).lower() == 'live' and (is_admin_user(uid) or int(uid) == int(AUTOTRADE_OWNER_UID or 0)))
     if live_admin:
         owner = int(AUTOTRADE_OWNER_UID or uid)
         owner_user = get_user(owner) or user or {}
@@ -20747,7 +20995,7 @@ def _signal_report_find_trade_by_setup_id(user_id: int, setup_id: str, ref_ts: f
 
 def _signal_report_exchange_events_by_key(ts_from: float) -> dict[tuple[str, str], list[dict]]:
     out: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    if str(AUTOTRADE_MODE).lower() != 'live':
+    if str(_autotrade_runtime_mode()).lower() != 'live':
         return out
     try:
         rows = _bybit_get_closed_pnl_linear(max(0.0, float(ts_from) - 86400.0 * 3.0), float(time.time()) + 3600.0, limit=500) or []
@@ -20779,7 +21027,7 @@ def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | 
         tz = ZoneInfo(str((user or {}).get('tz') or 'UTC'))
     except Exception:
         tz = timezone.utc
-    live_mode = str(AUTOTRADE_MODE).lower() == 'live' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0)
+    live_mode = str(_autotrade_runtime_mode()).lower() == 'live' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0)
     current_positions = []
     exchange_events_by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
     if live_mode:
@@ -21011,7 +21259,7 @@ def _canonical_signal_outcome_for_setup(user_id: int, setup_id: str) -> tuple[st
     if trade:
         status = str(trade.get('status') or '').upper().strip()
         if status == 'OPEN':
-            if str(AUTOTRADE_MODE).lower() == 'live':
+            if str(_autotrade_runtime_mode()).lower() == 'live':
                 pos = _autotrade_find_live_position(str(trade.get('symbol') or ''), side=str(trade.get('side') or ''))
                 if pos:
                     return 'OPEN', {'source': 'live_position', 'trade': trade, 'lifecycle': life}
@@ -21080,7 +21328,7 @@ def _signal_report_live_backed_only(user_id: int, meta: dict | None, canon: str)
     # Local journal rows that still say OPEN are not enough, otherwise /signal_report can show
     # stale OPEN items after the exchange position was already closed outside the bot.
     try:
-        if str(AUTOTRADE_MODE).lower() != 'live':
+        if str(_autotrade_runtime_mode()).lower() != 'live':
             return False
         if int(user_id) != int(AUTOTRADE_OWNER_UID or 0):
             return False
@@ -21184,7 +21432,7 @@ def _signal_outcome_summary(user_id: int, session: str | None = None, days: int 
             ts_from = None
     user_id = int(user_id)
     try:
-        if str(AUTOTRADE_MODE).lower() == 'live' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0):
+        if str(_autotrade_runtime_mode()).lower() == 'live' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0):
             _autotrade_sync_closed_trades_from_exchange(int(user_id), lookback_days=max(14, int(days or 30)))
     except Exception:
         pass
@@ -21649,7 +21897,7 @@ async def performance_chart_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         return
     uid = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
     owner_user = _autotrade_user_settings(uid)
-    equity_now = _effective_equity_for_risk(owner_user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
+    equity_now = _effective_equity_for_risk(owner_user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live'))
     days = _autotrade_history_days_available(uid)
     rows = _autotrade_performance_rows(uid, days=max(7, days))
     if not rows:
@@ -28150,7 +28398,7 @@ KNOWN_COMMANDS = sorted(set([
     "health", "health_sys",
 
     # AutoTrade (admin)
-    "open_trades", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_debug_reset", "autotrade_report_overall", "autotrade_sessions", "trade_lifecycle", "trade_lifecycle_detail",
+    "open_trades", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_debug_reset", "autotrade_report_overall", "autotrade_sessions", "autotrade_config", "trade_lifecycle", "trade_lifecycle_detail",
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
@@ -28240,27 +28488,19 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # RISK
 # =========================================================
 def _prefer_live_equity_for_user(user: dict | None = None) -> bool:
-    """Manual-trading equity is always user-managed.
+    """Manual-trading equity must always come from /equity, never live Bybit.
 
-    Live Bybit equity is reserved for AutoTrade-only diagnostics and execution.
-    Manual commands such as /equity, /riskmode, /dailycap, /trade_open, /trade_close,
-    and /status must never switch to Bybit equity automatically.
+    AutoTrade uses its own Bybit-backed equity lane under /autotrade_debug and related
+    AutoTrade diagnostics. Manual sizing, manual /status, /dailycap, /riskmode, /trade_open,
+    and /trade_close must stay fully separated from AutoTrade/live exchange equity.
     """
     return False
-
-
-def _manual_equity_usd(user: dict | None = None) -> float:
-    try:
-        return max(0.0, float((user or {}).get("equity") or 0.0))
-    except Exception:
-        return 0.0
-
 
 def compute_risk_usd(user: dict, mode: str, value: float) -> float:
     mode = str(mode or "").upper()
     if mode == "USD":
         return max(0.0, float(value))
-    eq = _manual_equity_usd(user)
+    eq = _effective_equity_for_risk(user, prefer_live=_prefer_live_equity_for_user(user))
     if eq <= 0:
         return 0.0
     return _risk_amount_from_pct(eq, float(value))
@@ -28328,7 +28568,7 @@ def daily_cap_usd(user: dict) -> float:
     val = float(user.get("daily_cap_value", DEFAULT_DAILY_CAP_VALUE) or DEFAULT_DAILY_CAP_VALUE)
     if mode == "USD":
         return max(0.0, val)
-    eq = _manual_equity_usd(user)
+    eq = _effective_equity_for_risk(user, prefer_live=_prefer_live_equity_for_user(user))
     if eq <= 0:
         return 0.0
     return _risk_amount_from_pct(eq, val)
@@ -28537,7 +28777,7 @@ Market & Signals
 ⚖️ RISK & POSITION SIZING
 ────────────────────
 /equity
-• Set your equity
+• Set your MANUAL trading equity
 
 /dailycap
 • Set your TOTAL daily risk cap for your anchored trading day
@@ -28547,7 +28787,7 @@ Market & Signals
 
 /size <symbol> <side> <entry> <sl>
 • Calculates position size based on your per-trade risk
-• /status shows current-day risk, live cap-charged risk, carried risk, and remaining daily risk for new trades
+• /status shows manual current-day risk, carried risk, and remaining daily risk for new trades
 
 ────────────────────
 Trade Journal
@@ -28736,6 +28976,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "trade_id_reset": "Reset your own Trade ID numbering",
     "dailycap": "Set daily risk cap, including /dailycap pct 100 for full-account daily cap",
     "dailycapAT": "Set AutoTrade daily risk cap separately from manual /dailycap",
+    "autotrade_config": "Show or set persistent AutoTrade runtime config: risk, caps, mode, max opens, leverage, isolated",
     "dayrisk_reset": "Reset today’s used-risk baseline for the active day. Use /dayrisk_reset, /dayrisk_reset show, or /dayrisk_reset clear",
 }
 
@@ -28745,7 +28986,7 @@ ADMIN_HELP_GROUPS = [
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "adaptive_run", "goal_status", "goal_run", "goal_set", "goal_abort", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
-    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "open_trades"]),
+    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
 ]
@@ -29271,29 +29512,8 @@ async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = get_user(uid) or {}
 
-    # ✅ Admin: /equity is LIVE-synced with Bybit (same as /status)
     if not context.args:
-        if is_admin_user(int(uid)):
-            live_eq = _live_equity_usdt_cached(ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
-            if live_eq is not None:
-                eq = float(live_eq)
-                try:
-                    update_user(int(uid), equity=eq)
-                except Exception:
-                    pass
-                await update.message.reply_text(f"Equity (Bybit): ${eq:.2f}")
-                return
-
-        await update.message.reply_text(f"Equity: ${float(user.get('equity') or 0.0):.2f}")
-        return
-
-    # ✅ Non-admins: manual equity setting (used for /size and journaling)
-    if is_admin_user(int(uid)):
-        await update.message.reply_text(
-            "Admin equity is LIVE-synced with Bybit.\n"
-            "Manual override is disabled for Admin.\n\n"
-            "Tip: If you want manual equity, switch AutoTrade to paper or disable live sync."
-        )
+        await update.message.reply_text(f"Manual Equity: ${float(user.get('equity') or 0.0):.2f}")
         return
 
     try:
@@ -29301,9 +29521,10 @@ async def equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if eq < 0:
             raise ValueError()
         update_user(int(uid), equity=eq)
-        await update.message.reply_text(f"✅ Equity set: ${eq:.2f}")
+        await update.message.reply_text(f"✅ Manual Equity set: ${eq:.2f}")
     except Exception:
         await update.message.reply_text("Usage: /equity 1000")
+
 async def equity_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     update_user(uid, equity=0.0)
@@ -29405,7 +29626,7 @@ async def dailycapAT_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     owner = int(AUTOTRADE_OWNER_UID or uid)
     user = _autotrade_user_settings(owner)
-    eq = _effective_equity_for_risk(user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
+    eq = _effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live'))
     mode_now, val_now = _autotrade_daily_cap_settings()
     cap_now = float(_autotrade_daily_cap_usd(owner, float(eq or 0.0)) or 0.0)
 
@@ -29458,6 +29679,87 @@ async def dailycapAT_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only persistent AutoTrade runtime config manager."""
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    summary = _autotrade_runtime_summary_dict()
+    if not context.args:
+        lines = [
+            "🤖 AutoTrade Runtime Config",
+            HDR,
+            f"AUTOTRADE_RISK_PER_TRADE_PCT = {float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']):.2f}",
+            f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
+            f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
+            f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
+            f"AUTOTRADE_MAX_OPEN_TRADES = {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])}",
+            f"AUTOTRADE_LEVERAGE = {int(summary['AUTOTRADE_LEVERAGE'])}",
+            f"AUTOTRADE_ISOLATED = {'true' if bool(summary['AUTOTRADE_ISOLATED']) else 'false'}",
+            "",
+            "Examples:",
+            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.5",
+            "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
+            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
+            "• /autotrade_config AUTOTRADE_MODE live",
+            "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 3",
+            "• /autotrade_config AUTOTRADE_LEVERAGE 10",
+            "• /autotrade_config AUTOTRADE_ISOLATED true",
+            "",
+            "Note: daily cap mode stays under /dailycapAT pct|usd <value>.",
+        ]
+        await send_long_message(update, "\n".join(lines), parse_mode=None)
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /autotrade_config <KEY> <VALUE>")
+        return
+
+    key = str(context.args[0] or '').strip().upper()
+    value_raw = " ".join(context.args[1:]).strip()
+    if key not in {
+        'AUTOTRADE_RISK_PER_TRADE_PCT', 'AUTOTRADE_OPEN_RISK_CAP_PCT', 'AUTOTRADE_DAILY_RISK_CAP_PCT',
+        'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_ISOLATED'
+    }:
+        await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
+        return
+
+    try:
+        if key == 'AUTOTRADE_RISK_PER_TRADE_PCT':
+            val = max(0.0, float(value_raw))
+            _autotrade_config_set(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, val)
+        elif key == 'AUTOTRADE_OPEN_RISK_CAP_PCT':
+            val = max(0.0, float(value_raw))
+            _autotrade_config_set(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, val)
+        elif key == 'AUTOTRADE_DAILY_RISK_CAP_PCT':
+            val = max(0.0, float(value_raw))
+            _autotrade_set_daily_cap_settings('PCT', val)
+        elif key == 'AUTOTRADE_MODE':
+            val = str(value_raw or '').strip().lower()
+            if val not in {'paper', 'live'}:
+                raise ValueError('mode must be paper or live')
+            _autotrade_config_set(AUTOTRADE_CFG_MODE_KEY, val)
+        elif key == 'AUTOTRADE_MAX_OPEN_TRADES':
+            val = max(1, int(float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, val)
+        elif key == 'AUTOTRADE_LEVERAGE':
+            val = max(1, int(float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_LEVERAGE_KEY, val)
+        elif key == 'AUTOTRADE_ISOLATED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_ISOLATED_KEY, 1 if val else 0)
+        else:
+            raise ValueError('unsupported key')
+    except Exception as e:
+        await update.message.reply_text(f"Invalid value for {key}: {e}")
+        return
+
+    summary = _autotrade_runtime_summary_dict()
+    await update.message.reply_text(f"✅ Updated {key}. Current value: {summary.get(key)}")
+
+
 async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: baseline-reset current day risk so remaining daily cap is restored."""
     uid = int(update.effective_user.id)
@@ -29466,7 +29768,7 @@ async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = reset_daily_if_needed(get_user(uid) or {})
     day_local = _user_day_local(user)
-    cap = float(_autotrade_daily_cap_usd(uid, float(_effective_equity_for_risk(user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live')) or 0.0)) or 0.0)
+    cap = float(_autotrade_daily_cap_usd(uid, float(_effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)) or 0.0)
     snap = _accounting_snapshot(uid, user, is_admin=True)
     raw_used = float(snap.get('used_today_raw', snap.get('used_today', 0.0)) or 0.0)
     effective_used = float(snap.get('used_today', 0.0) or 0.0)
@@ -29679,7 +29981,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📣 Big-Move Alert Emails",
             f"{HDR}",
             f"Status: {'ON' if cur_on else 'OFF'}",
-            f"Thresholds: |4H| ≥ {cur_p4:.0f}% OR |1H| ≥ {cur_p1:.0f}% (both directions)",
+            f"Thresholds: |4H| ≥ {cur_p4:.0f}% AND |1H| ≥ {cur_p1:.0f}% (same direction only)",
             f"Min Vol (24H): {cur_min_vol/1e6:.1f}M",
         ]
         if updated_ts > 0:
@@ -29688,7 +29990,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"Reason: {updated_reason}")
         lines.extend([
             "",
-            "Set: /bigmove_alert on 20 10",
+            "Set: /bigmove_alert on 10 5",
             "Off: /bigmove_alert off",
         ])
         await update.message.reply_text("\n".join(lines))
@@ -29710,13 +30012,13 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 p4 = float(context.args[1])
                 p1 = float(context.args[2])
             except Exception:
-                await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)")
+                await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 10 5)")
                 return
-        _record_bigmove_settings_change(uid, True, p4, p1, min_vol, f"command_on via /bigmove_alert (4H>={p4:.2f}% OR 1H>={p1:.2f}%, min_vol={min_vol/1e6:.1f}M)")
-        await update.message.reply_text(f"✅ Big-move alert emails: ON (4H≥{p4:.0f}% OR 1H≥{p1:.0f}% | Min Vol {min_vol/1e6:.1f}M)")
+        _record_bigmove_settings_change(uid, True, p4, p1, min_vol, f"command_on via /bigmove_alert (4H>={p4:.2f}% AND 1H>={p1:.2f}%, same_direction_only, min_vol={min_vol/1e6:.1f}M)")
+        await update.message.reply_text(f"✅ Big-move alert emails: ON (4H≥{p4:.0f}% AND 1H≥{p1:.0f}% | same direction only | Min Vol {min_vol/1e6:.1f}M)")
         return
 
-    await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 20 10)  OR  /bigmove_alert off")
+    await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 10 5)  OR  /bigmove_alert off")
 
 
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -29730,7 +30032,7 @@ async def notify_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Email alerts: OFF")
 
 def _equity_risk_pct_from_usd(user: dict, risk_usd: float) -> Optional[float]:
-    eq = _effective_equity_for_risk(user, prefer_live=True)
+    eq = _effective_equity_for_risk(user, prefer_live=_prefer_live_equity_for_user(user))
     if eq <= 0:
         return None
     return _risk_pct_from_amount(eq, risk_usd)
@@ -30246,28 +30548,12 @@ async def trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Trade not found or already closed.")
         return
     
-    # Sync daily risk from CURRENT open positions (closing frees capacity instantly)
+    # Sync daily risk from CURRENT manual open positions (closing frees capacity instantly)
     _risk_daily_sync(uid, user)
-    # ✅ Equity handling:
-    # - Admin: keep equity synced with Bybit (if live equity is available)
-    # - Others: manual equity updated by /trade_close pnl
-    if is_admin_user(int(uid)):
-        live_eq = _live_equity_usdt_cached(ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
-        if live_eq is not None:
-            try:
-                update_user(int(uid), equity=float(live_eq))
-            except Exception:
-                pass
-            user = get_user(uid)
-        else:
-            # fallback to manual equity update (only if live equity unavailable)
-            new_eq = float(user["equity"]) + float(pnl)
-            update_user(uid, equity=new_eq)
-            user = get_user(uid)
-    else:
-        new_eq = float(user["equity"]) + float(pnl)
-        update_user(uid, equity=new_eq)
-        user = get_user(uid)
+    # Manual trading equity is always journal-managed via /equity + /trade_close.
+    new_eq = float(user["equity"]) + float(pnl)
+    update_user(uid, equity=new_eq)
+    user = get_user(uid)
 
     r_mult = t.get("r_mult")
     r_txt = f"{r_mult:+.2f}R" if r_mult is not None else "-"
@@ -30507,7 +30793,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = reset_daily_if_needed(get_user(uid))
     is_admin = is_admin_user(int(uid))
-    manual_view = True
 
     if not has_active_access(uid, user):
         await update.message.reply_text(
@@ -30517,20 +30802,21 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # /status is the MANUAL trading lane for every user, including admin.
+    status_is_admin = False
     try:
         if is_admin:
-            snap = await to_thread_fast(_accounting_snapshot, uid, user, is_admin=False, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
+            snap = await to_thread_fast(_accounting_snapshot_cached, uid, user, is_admin=status_is_admin, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
         else:
-            snap = await to_thread_heavy(_accounting_snapshot, uid, user, is_admin=False, timeout=8)
+            snap = await to_thread_heavy(_accounting_snapshot, uid, user, is_admin=status_is_admin, timeout=8)
     except Exception:
         if is_admin:
-            snap = _accounting_snapshot(uid, user, is_admin=False)
+            snap = _accounting_snapshot_cached(uid, user, is_admin=status_is_admin, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
         else:
-            snap = _accounting_snapshot(uid, user, is_admin=False)
+            snap = _accounting_snapshot(uid, user, is_admin=status_is_admin)
     equity = float(snap.get('equity') or 0.0)
     cap = float(snap.get('cap') or 0.0)
     pnl_today = float(snap.get('pnl_today') or 0.0)
-    realized_loss_today = float(snap.get('realized_loss_today') or 0.0)
     used_today = float(snap.get('used_today') or 0.0)
     remaining_today = snap.get('remaining_today', float('inf'))
     over_by = float(snap.get('over_by') or 0.0)
@@ -30565,16 +30851,10 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Opened today: {int(snap.get('positions_opened_today', 0))}" + (f"/{int(snap.get('trades_today_limit', 0))}" if int(snap.get('trades_today_limit', 0)) > 0 else ' (no count cap)'),
         f"• Closed today: {int(snap.get('positions_closed_today', 0))}",
         f"• Open positions now: {int(snap.get('open_positions_now', 0))}",
-        (f"• Manual/external positions ignored by AutoTrade: {int(snap.get('external_open_positions', 0))} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
         f"• Carried from prior day: {int(snap.get('inherited_open_positions', 0))}",
         f"• Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f}",
-        (
-            f"• Daily cap: {str(user.get('daily_cap_mode','PCT')).upper()} "
-            f"{float(user.get('daily_cap_value',0.0)):.2f}"
-            f"{'%' if str(user.get('daily_cap_mode','PCT')).upper() == 'PCT' else ''} (≈ ${cap:.2f})"
-        ),
+        f"• Daily cap: {str(user.get('daily_cap_mode','PCT')).upper()} {float(user.get('daily_cap_value',0.0)):.2f}{'%' if str(user.get('daily_cap_mode','PCT')).upper() == 'PCT' else ''} (≈ ${cap:.2f})",
         f"• Current-day open risk: ${float(snap.get('current_day_open_risk', 0.0)):.2f}",
-        f"• Live open risk charged today: ${float(snap.get('live_open_risk_charged_today', snap.get('current_day_open_risk', 0.0))):.2f}",
         f"• Carried open risk: ${float(snap.get('carried_open_risk', 0.0)):.2f}",
         f"• Total open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
         f"• Realised net today: ${pnl_today:+.2f}",
@@ -30600,30 +30880,13 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if over_by > 0:
         lines.append(f"⚠️ Over daily cap by ${over_by:.2f}")
 
-    closed_today_rows = db_trades_closed_today(uid, user)
-    if closed_today_rows:
-        lines.extend([SEP, f"Closed today list: {len(closed_today_rows)}"])
-        for t in closed_today_rows[:8]:
-            try:
-                sym = str(t.get('symbol') or '').upper()
-                side = str(t.get('side') or '').upper()
-                pnl_val = float(t.get('pnl') or 0.0)
-                outcome = 'WIN' if pnl_val > 0 else ('LOSS' if pnl_val < 0 else 'BREAKEVEN')
-                trade_id_txt = str(t.get('public_id') or t.get('trade_id') or '').strip() or '-'
-                lines.append(f"• {side} {sym} | Trade ID: {trade_id_txt} | {outcome} | PnL {pnl_val:+.2f}")
-            except Exception:
-                continue
-
     opens = db_open_trades(uid)
     lines.extend([SEP, f"Open trades list: {len(opens)}"])
     if not opens:
         lines.append('• None')
     else:
         for t in opens[:12]:
-            trade_id_txt = str(t.get('public_id') or t.get('trade_id') or '').strip() or '-'
-            lines.append(
-                f"• {str(t.get('symbol') or '').upper()} {str(t.get('side') or '').upper()} | Trade ID: {trade_id_txt} | Risk ${float(t.get('risk_usd') or 0.0):.2f}"
-            )
+            lines.append(f"• {t.get('symbol')} {t.get('side')} | Risk ${float(t.get('risk_usd') or 0.0):.2f}")
 
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
@@ -30857,7 +31120,7 @@ async def report_weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return   
     
-    if bool(str(AUTOTRADE_MODE).lower() == 'live' and (is_admin_user(uid) or int(uid) == int(AUTOTRADE_OWNER_UID or 0))):
+    if bool(str(_autotrade_runtime_mode()).lower() == 'live' and (is_admin_user(uid) or int(uid) == int(AUTOTRADE_OWNER_UID or 0))):
         owner = int(AUTOTRADE_OWNER_UID or uid)
         ts_from = max(0.0, time.time() - 7.0 * 86400.0)
         try:
@@ -31910,7 +32173,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
 
     lines = ["📒 AutoTrade Journal", HDR, f"Window: last {lookback_h}h (Melbourne)"]
 
-    open_positions = _bybit_get_open_positions_linear() if str(AUTOTRADE_MODE).lower() == 'live' else []
+    open_positions = _bybit_get_open_positions_linear() if str(_autotrade_runtime_mode()).lower() == 'live' else []
     journal_open = []
     try:
         journal_open = _autotrade_db_open_trades(owner_uid) or []
@@ -31999,7 +32262,7 @@ def _autotrade_report_overall_text_cached(owner: int) -> str:
     weighted = _autotrade_weighted_outcome_summary(owner, days=days)
     perf_rows = _autotrade_performance_rows(owner, days=days)
     perf = _autotrade_performance_summary(perf_rows)
-    live_open_positions = _bybit_get_open_positions_linear() if str(AUTOTRADE_MODE).lower() == 'live' else []
+    live_open_positions = _bybit_get_open_positions_linear() if str(_autotrade_runtime_mode()).lower() == 'live' else []
     journal_open = []
     try:
         journal_open = _autotrade_db_open_trades(owner) or []
@@ -32074,7 +32337,7 @@ def _performance_report_payload_cached(owner: int, days: int) -> dict:
     overall_rows = _autotrade_performance_rows(owner, days=overall_days)
     overall_summary = _autotrade_performance_summary(overall_rows)
     owner_user = _autotrade_user_settings(owner)
-    equity_now = _effective_equity_for_risk(owner_user, prefer_live=(str(AUTOTRADE_MODE).lower() == 'live'))
+    equity_now = _effective_equity_for_risk(owner_user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live'))
     weighted_recent = _autotrade_weighted_outcome_summary(owner, days=days)
     weighted_overall = _autotrade_weighted_outcome_summary(owner, days=overall_days)
     try:
@@ -32362,7 +32625,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         reasons.append('AUTOTRADE_ENABLED=0')
     if owner <= 0:
         reasons.append('AUTOTRADE_OWNER_UID missing/0')
-    if str(AUTOTRADE_MODE).lower() == 'live' and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
+    if str(_autotrade_runtime_mode()).lower() == 'live' and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
         reasons.append('missing BYBIT_API_KEY/SECRET')
 
     session_cap_txt = '∞' if int(email_gate.get('session_cap', 0) or 0) <= 0 else str(int(email_gate.get('session_cap', 0) or 0))
@@ -32392,17 +32655,17 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines = [
         '🧪 AutoTrade Debug',
         HDR,
-        f"Ready: {'✅' if ready else '❌'} | Mode: {str(AUTOTRADE_MODE).lower()} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
+        f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
         f"Trading day: {snap.get('today_window_label')}",
         SEP,
-        f"Equity: ${equity:.2f}",
-        f"Daily cap: {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
-        f"Opened today: {int(snap.get('positions_opened_today', 0) or 0)} | Closed today: {int(snap.get('positions_closed_today', 0) or 0)} | Open now: {int(snap.get('open_positions_now', 0) or 0)}",
-        f"Open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
-        (f"Ignored manual/external positions: {int(snap.get('external_open_positions', 0) or 0)} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
-        f"Realised net today: ${float(snap.get('pnl_today') or 0.0):+.2f}",
-        f"Daily risk used (open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
-        ('Daily risk remaining: ∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f"Daily risk remaining: ${float(snap.get('remaining_today')):.2f}"),
+        f"EquityAT: ${equity:.2f}",
+        f"Daily cap (AT): {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
+        f"Opened today (AT): {int(snap.get('positions_opened_today', 0) or 0)} | Closed today (AT): {int(snap.get('positions_closed_today', 0) or 0)} | Open now (AT): {int(snap.get('open_positions_now', 0) or 0)}",
+        f"Open risk now (AT): ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
+        (f"Ignored manual/external positions (AT): {int(snap.get('external_open_positions', 0) or 0)} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
+        f"Realised net today (AT): ${float(snap.get('pnl_today') or 0.0):+.2f}",
+        f"Daily risk used (AT) (open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
+        ('Daily risk remaining (AT): ∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f"Daily risk remaining (AT): ${float(snap.get('remaining_today')):.2f}"),
         SEP,
         'Email → executable lane',
         f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
@@ -32457,7 +32720,7 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ Admin only.")
         return
 
-    if str(AUTOTRADE_MODE).lower() != "live":
+    if str(_autotrade_runtime_mode()).lower() != "live":
         await update.message.reply_text("AutoTrade is not in LIVE mode. No live positions to display.")
         return
 
@@ -33460,7 +33723,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     """
     from types import SimpleNamespace
 
-    def _recent_email_lane_screen_setups(_uid: int, _session: str, max_age_min: int = 20, limit: int = 3):
+    def _recent_email_lane_screen_setups(_uid: int, _session: str, max_age_min: int = SCREEN_FALLBACK_MAX_AGE_MIN, limit: int = 3):
         try:
             req_session_u = str(_session or '').upper().strip()
             out = []
@@ -33835,7 +34098,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     screen_lane_note = ""
     try:
         if setups and any(str(getattr(s, 'source_kind', '') or '') not in {'', 'executable_setups'} for s in (setups or [])):
-            screen_lane_note = "_Showing recent emailed fallback setups while the current executable scan rebuilds._"
+            screen_lane_note = "_Showing only very recent fallback setups while the executable lane rebuilds. Stale duplicates are suppressed._"
     except Exception:
         screen_lane_note = ""
 
@@ -33952,6 +34215,9 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             side = str(getattr(s, 'side', '') or '').upper()
             if symbol_flip_guard_active(int(uid), sym, side, target_session):
                 skipped.append('flip_guard_blocked')
+                continue
+            if _email_setup_identity_recently_sent(int(uid), s):
+                skipped.append('duplicate_setup_identity')
                 continue
             if _email_symbol_recently_sent(int(uid), sym, side, target_session, setup_id=sid):
                 skipped.append('cooldown_blocked')
@@ -34658,6 +34924,10 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                         _cache_recent_emailed_setup(int(_target_uid), s, session=str(display_session or ''), emailed_ts=float(now_ts), source_kind='recent_email_cache')
                     except Exception:
                         pass
+                    try:
+                        _mark_emailed_setup_identity(int(_target_uid), s, emailed_ts=float(now_ts))
+                    except Exception:
+                        pass
         except Exception:
             pass
     else:
@@ -35173,8 +35443,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                     try:
+                        ch4 = float(c.get("ch4", 0.0) or 0.0)
+                        ch1 = float(c.get("ch1", 0.0) or 0.0)
+                        if not ((ch4 > 0 and ch1 > 0) or (ch4 < 0 and ch1 < 0)):
+                            c['suppression_reason'] = 'mismatch_direction_1h_4h'
+                            continue
                         if bigmove_recently_emailed(int(uid), c["symbol"], c["direction"]):
                             cooldown_filtered_out += 1
+                            c['suppression_reason'] = 'bigmove_symbol_cooldown_active'
                             continue
                         filtered.append(c)
                     except Exception:
@@ -35188,13 +35464,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                             f"raw_candidates={len(candidates)}",
                             f"volume_filtered={int(volume_filtered_out)}",
                             f"cooldown_filtered={int(cooldown_filtered_out)}",
+                            "suppression_reasons:mismatch_direction_1h_4h,bigmove_symbol_cooldown_active",
                         ],
                     }
 
                 lines = []
                 lines.append("⚡ PulseFutures — BIG MOVE ALERT")
                 lines.append(HDR)
-                lines.append(f"Triggers: |4H| ≥ {p4:.1f}%  OR  |1H| ≥ {p1:.1f}%")
+                lines.append(f"Triggers: |4H| ≥ {p4:.1f}% AND |1H| ≥ {p1:.1f}% (same direction only)")
                 lines.append(f"Min Vol (24H): {min_vol/1e6:.1f}M")
                 lines.append("")
 
@@ -35701,11 +35978,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     diversify_blocked[str(why_div)] += 1
                     continue
 
+                if _email_setup_identity_recently_sent(uid, s):
+                    cooldown_blocked += 1
+                    continue
                 if _email_symbol_recently_sent(uid, sym, side, sess_name, setup_id=str(getattr(s, 'setup_id', '') or '')):
                     cooldown_blocked += 1
                     continue
 
-                if int(uid) == int(AUTOTRADE_OWNER_UID or 0) and str(AUTOTRADE_MODE).lower() == 'live':
+                if int(uid) == int(AUTOTRADE_OWNER_UID or 0) and str(_autotrade_runtime_mode()).lower() == 'live':
                     try:
                         _conflict = _autotrade_live_symbol_conflict(int(uid), sym, side=side)
                     except Exception:
@@ -37242,7 +37522,7 @@ async def autotrade_exit_guardian_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         if not _autotrade_ready():
             return
-        if str(AUTOTRADE_MODE).lower() != 'live':
+        if str(_autotrade_runtime_mode()).lower() != 'live':
             return
         uid = int(AUTOTRADE_OWNER_UID or 0)
         if uid <= 0:
@@ -37574,6 +37854,8 @@ def main():
     app.add_handler(CommandHandler("dailycap", dailycap_cmd, block=False))
     app.add_handler(CommandHandler("dailycapAT", dailycapAT_cmd, block=False))
     app.add_handler(CommandHandler("dailycapat", dailycapAT_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_config", autotrade_config_cmd, block=False))
+    app.add_handler(CommandHandler("autotradecfg", autotrade_config_cmd, block=False))
     app.add_handler(CommandHandler("dayrisk_reset", dayrisk_reset_cmd, block=False))
     app.add_handler(CommandHandler("limits", limits_cmd, block=False))
 
