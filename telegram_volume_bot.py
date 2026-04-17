@@ -1396,14 +1396,14 @@ PUBLIC_DIAGNOSTICS_MODE = os.environ.get("PUBLIC_DIAGNOSTICS_MODE", "off").strip
 LEADERS_N = 10
 
 # ✅ More setups on /screen (UX), while email stays strict
-SETUPS_N = 6
-EMAIL_SETUPS_N = 3
+SETUPS_N = 8
+EMAIL_SETUPS_N = 4
 
 # ✅ Global setup quality floor (Premium & Selective)
-MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "78"))
+MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "76"))
 
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
-MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "12000000"))
+MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
 MIN_RR_FINAL = float(os.environ.get("MIN_RR_FINAL", os.environ.get("MIN_RR_TP", os.environ.get("MIN_RR_TP", "1.45"))))
 MIN_RR_TP = MIN_RR_FINAL  # legacy compatibility only; live model uses TP as final target
 
@@ -1411,7 +1411,7 @@ MIN_RR_TP = MIN_RR_FINAL  # legacy compatibility only; live model uses TP as fin
 EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
 
 # ✅ /screen scan breadth + loosened trigger only for screen (NOT email)
-SCREEN_UNIVERSE_N = 70          # was effectively 35 (inside pick_setups)
+SCREEN_UNIVERSE_N = 100          # widened universe for better throughput without disabling quality gates
 SCREEN_TRIGGER_LOOSEN = 0.82    # 15% easier trigger on /screen only
 SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
 SCREEN_WAITING_N = 10
@@ -1523,8 +1523,8 @@ def _strategy_config_defaults() -> dict:
         "score_w_smf": 0.01,
 
         # Frequency targeting (used in /optimize objective)
-        "target_setups_per_day_lo": 3.0,
-        "target_setups_per_day_hi": 5.0,
+        "target_setups_per_day_lo": 5.0,
+        "target_setups_per_day_hi": 8.0,
 
         # Self-optimization governance
         "session_weights": {"NY": 0.45, "LON": 0.40, "ASIA": 0.15},  # optimizer weighting (cross-session executable pool with NY/LON preference)
@@ -1540,8 +1540,8 @@ def _strategy_config_defaults() -> dict:
         # Setup-count governor (live engine + optimizer)
         "governor_enabled": True,
         "governor_window_hours": 24,
-        "governor_target_lo": 3.0,
-        "governor_target_hi": 5.0,
+        "governor_target_lo": 5.0,
+        "governor_target_hi": 8.0,
         "governor_step_score": 1.0,         # +/- points applied to quality_score_min_email when adjusting
         "governor_score_min": 52.0,         # absolute lower bound for quality_score_min_email
         "governor_score_max": 70.0,         # absolute upper bound for quality_score_min_email
@@ -1572,7 +1572,7 @@ def _strategy_config_defaults() -> dict:
         "autotune_learning_guard_enabled": True,
 
         # Universe backtest autopilot (zero-touch telemetry feeding learning/optimizer)
-        "universe_backtest_top_n": 80,
+        "universe_backtest_top_n": 100,
         "universe_backtest_min_vol_usd": 10000000.0,
         "universe_backtest_windows": [7, 30],
         "universe_backtest_exec_tf": "15m",
@@ -1581,9 +1581,9 @@ def _strategy_config_defaults() -> dict:
         "goal_profile_enabled": True,
         "goal_profile_interval_hours": 24.0,
         "goal_profile_cooldown_hours": 20.0,
-        "goal_profile_target_setups_per_day_lo": 3.0,
-        "goal_profile_target_setups_per_day_hi": 5.0,
-        "goal_profile_target_win_rate": 50.0,
+        "goal_profile_target_setups_per_day_lo": 5.0,
+        "goal_profile_target_setups_per_day_hi": 8.0,
+        "goal_profile_target_win_rate": 60.0,
         "goal_profile_target_avg_r": 0.10,
         "goal_profile_min_live_setups_30d": 8,
         "goal_profile_min_live_setups_7d": 2,
@@ -1622,8 +1622,8 @@ def _strategy_config_defaults() -> dict:
         "market_adaptive_days": 30,
         "market_adaptive_max_passes": 2,
         "market_adaptive_min_improvement": 0.35,
-        "market_adaptive_target_setups_per_day_lo": 3.0,
-        "market_adaptive_target_setups_per_day_hi": 5.0,
+        "market_adaptive_target_setups_per_day_lo": 5.0,
+        "market_adaptive_target_setups_per_day_hi": 8.0,
         "market_adaptive_session_wr_floor_ny": 46.0,
         "market_adaptive_session_wr_floor_lon": 48.0,
         "market_adaptive_cooldown_hours": 20.0,
@@ -1658,7 +1658,7 @@ def _strategy_config_defaults() -> dict:
         "family_allocator_interval_hours": 24.0,
         "family_regime_refresh_enabled": True,
         "family_regime_refresh_interval_hours": 4.0,
-        "family_allocator_max_active_per_cell": 2,
+        "family_allocator_max_active_per_cell": 3,
         "family_allocator_min_score": -999.0,
         "family_allocator_min_sample": 0,
         "family_allocator_plan_ttl_hours": 36.0,
@@ -1893,42 +1893,42 @@ def _strategy_config_bootstrap_recommendations() -> None:
             lo = float(cfg.get('target_setups_per_day_lo', 0.0) or 0.0)
             hi = float(cfg.get('target_setups_per_day_hi', 0.0) or 0.0)
             if lo <= 0 or abs(lo - 3.0) > 0.001:
-                cfg['target_setups_per_day_lo'] = 3.0
+                cfg['target_setups_per_day_lo'] = 5.0
                 changed = True
             if hi <= 0 or abs(hi - 5.0) > 0.001:
-                cfg['target_setups_per_day_hi'] = 5.0
+                cfg['target_setups_per_day_hi'] = 8.0
                 changed = True
         except Exception:
-            cfg['target_setups_per_day_lo'] = 3.0
-            cfg['target_setups_per_day_hi'] = 5.0
+            cfg['target_setups_per_day_lo'] = 5.0
+            cfg['target_setups_per_day_hi'] = 8.0
             changed = True
 
         try:
             glo = float(cfg.get('governor_target_lo', 0.0) or 0.0)
             ghi = float(cfg.get('governor_target_hi', 0.0) or 0.0)
             if glo <= 0 or abs(glo - 3.0) > 0.001:
-                cfg['governor_target_lo'] = 3.0
+                cfg['governor_target_lo'] = 5.0
                 changed = True
             if ghi <= 0 or abs(ghi - 5.0) > 0.001:
-                cfg['governor_target_hi'] = 5.0
+                cfg['governor_target_hi'] = 8.0
                 changed = True
         except Exception:
-            cfg['governor_target_lo'] = 3.0
-            cfg['governor_target_hi'] = 5.0
+            cfg['governor_target_lo'] = 5.0
+            cfg['governor_target_hi'] = 8.0
             changed = True
 
         try:
             mlo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 0.0) or 0.0)
             mhi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 0.0) or 0.0)
             if mlo <= 0 or abs(mlo - 3.0) > 0.001:
-                cfg['market_adaptive_target_setups_per_day_lo'] = 3.0
+                cfg['market_adaptive_target_setups_per_day_lo'] = 5.0
                 changed = True
             if mhi <= 0 or abs(mhi - 5.0) > 0.001:
-                cfg['market_adaptive_target_setups_per_day_hi'] = 5.0
+                cfg['market_adaptive_target_setups_per_day_hi'] = 8.0
                 changed = True
         except Exception:
-            cfg['market_adaptive_target_setups_per_day_lo'] = 3.0
-            cfg['market_adaptive_target_setups_per_day_hi'] = 5.0
+            cfg['market_adaptive_target_setups_per_day_lo'] = 5.0
+            cfg['market_adaptive_target_setups_per_day_hi'] = 8.0
             changed = True
 
         manual_asia = _cfg_bool(cfg.get('execution_asia_user_override', False), False)
@@ -2021,16 +2021,26 @@ def _strategy_config_bootstrap_recommendations() -> None:
 
         try:
             if 'goal_profile_target_setups_per_day_lo' not in cfg:
-                cfg['goal_profile_target_setups_per_day_lo'] = 3.0
+                cfg['goal_profile_target_setups_per_day_lo'] = 5.0
                 changed = True
             if 'goal_profile_target_setups_per_day_hi' not in cfg:
-                cfg['goal_profile_target_setups_per_day_hi'] = 5.0
+                cfg['goal_profile_target_setups_per_day_hi'] = 8.0
                 changed = True
             if 'goal_profile_target_win_rate' not in cfg:
-                cfg['goal_profile_target_win_rate'] = 50.0
+                cfg['goal_profile_target_win_rate'] = 60.0
                 changed = True
             if 'goal_profile_target_avg_r' not in cfg:
                 cfg['goal_profile_target_avg_r'] = 0.10
+                changed = True
+        except Exception:
+            pass
+
+        try:
+            if not _cfg_bool(cfg.get('market_adaptive_enabled', True), True):
+                cfg['market_adaptive_enabled'] = True
+                changed = True
+            if not _cfg_bool(cfg.get('goal_profile_enabled', True), True):
+                cfg['goal_profile_enabled'] = True
                 changed = True
         except Exception:
             pass
@@ -18807,8 +18817,8 @@ def _objective(oos: list[dict], days: int, cfg: dict) -> float:
     win_rate = (wr_num / w_sum) if w_sum else 0.0
 
     # Frequency penalty (target band)
-    lo = float(cfg.get("target_setups_per_day_lo", 1.0))
-    hi = float(cfg.get("target_setups_per_day_hi", 3.0))
+    lo = float(cfg.get("target_setups_per_day_lo", 5.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 8.0))
     freq_pen = 0.0
     if setups_day < lo:
         freq_pen = (lo - setups_day) * 4.0
@@ -18922,8 +18932,8 @@ def _objective(oos: list[dict], days: int, cfg: dict) -> float:
     pf /= n
     dd /= n
 
-    lo = float(cfg.get("target_setups_per_day_lo", 1.0))
-    hi = float(cfg.get("target_setups_per_day_hi", 3.0))
+    lo = float(cfg.get("target_setups_per_day_lo", 5.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 8.0))
     freq_pen = 0.0
     if setups_day < lo:
         freq_pen = (lo - setups_day) * 2.0
@@ -20946,7 +20956,7 @@ def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = Non
     raw = str(trade.get('outcome') or '').upper().strip()
     status = str(trade.get('status') or '').upper().strip()
 
-    if raw in {'WIN_TP', 'WIN_TP', 'WIN_TP', 'TP', 'TP', 'TP'}:
+    if raw in {'WIN_TP', 'TP'}:
         return 'TP'
     if raw in {'LOSS', 'SL', 'SL_FIRST', 'TP_SL'}:
         return 'SL'
@@ -20954,13 +20964,6 @@ def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = Non
     if live_pos is not None or status == 'OPEN':
         return 'OPEN'
 
-    if pnl > 0:
-        return 'TP'
-    if pnl < 0:
-        return 'SL'
-    return 'OPEN'
-
-    # Closed trade with no explicit TP-stage label: use exchange events and realized pnl.
     if abs(pnl) < 1e-9 and exchange_events:
         try:
             pnl = float(sum(float((ev or {}).get('pnl') or 0.0) for ev in (exchange_events or [])))
@@ -20968,6 +20971,8 @@ def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = Non
             pnl = 0.0
     if pnl < 0:
         return 'SL'
+    if pnl > 0:
+        return 'TP'
     if abs(pnl) < 1e-9:
         return 'OPEN'
 
@@ -20993,7 +20998,6 @@ def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = Non
         if tp_credit > 0 and r_mult >= max(tp_credit * 0.55, 0.05):
             return 'TP'
     return 'TP'
-
 
 def _signal_report_setup_meta(setup_id: str) -> dict:
     sid = str(setup_id or '').strip()
@@ -22096,7 +22100,11 @@ async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
-    rows = await to_thread_heavy(_evolution_latest_lessons, 8, 45, False, timeout=20)
+    try:
+        await to_thread_heavy(_evolution_process_new_diagnostics, timeout=18)
+    except Exception:
+        pass
+    rows = await to_thread_heavy(_evolution_latest_lessons, 8, 45, True, timeout=24)
     if not rows:
         await update.message.reply_text("No lessons learned diagnostics recorded yet.")
         return
@@ -22800,8 +22808,8 @@ def _self_opt_stability_gates(metrics: dict, cfg: dict) -> tuple[bool, list[str]
     if total_setups < min_setups:
         reasons.append(f"oos_sample_too_small ({total_setups} < {min_setups})")
 
-    lo = float(cfg.get("target_setups_per_day_lo", 1.0))
-    hi = float(cfg.get("target_setups_per_day_hi", 3.0))
+    lo = float(cfg.get("target_setups_per_day_lo", 5.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 8.0))
     if setups_day < lo:
         reasons.append(f"frequency_too_low ({setups_day:.2f} < {lo:.2f})")
     if setups_day > hi * 1.25:
@@ -23543,8 +23551,8 @@ def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
     avg_r = float(overall.get('avg_R', 0.0) or 0.0)
     pf = float(overall.get('profit_factor', 0.0) or 0.0)
 
-    lo = float((cfg or {}).get('market_adaptive_target_setups_per_day_lo', 1.0) or 1.0)
-    hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 3.0) or 3.0)
+    lo = float((cfg or {}).get('market_adaptive_target_setups_per_day_lo', 5.0) or 5.0)
+    hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 8.0) or 8.0)
     ny_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
     lon_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
 
@@ -24503,9 +24511,9 @@ def _goal_profile_targets(cfg: dict | None = None) -> dict:
         'enabled': _cfg_bool((cfg or {}).get('goal_profile_enabled', True), True),
         'interval_hours': float((cfg or {}).get('goal_profile_interval_hours', 24.0) or 24.0),
         'cooldown_hours': float((cfg or {}).get('goal_profile_cooldown_hours', 20.0) or 20.0),
-        'target_lo': float((cfg or {}).get('goal_profile_target_setups_per_day_lo', 1.0) or 1.0),
-        'target_hi': float((cfg or {}).get('goal_profile_target_setups_per_day_hi', 3.0) or 3.0),
-        'target_wr': float((cfg or {}).get('goal_profile_target_win_rate', 50.0) or 50.0),
+        'target_lo': float((cfg or {}).get('goal_profile_target_setups_per_day_lo', 5.0) or 5.0),
+        'target_hi': float((cfg or {}).get('goal_profile_target_setups_per_day_hi', 8.0) or 8.0),
+        'target_wr': float((cfg or {}).get('goal_profile_target_win_rate', 60.0) or 60.0),
         'target_avg_r': float((cfg or {}).get('goal_profile_target_avg_r', 0.10) or 0.10),
         'min_live_30d': int((cfg or {}).get('goal_profile_min_live_setups_30d', 8) or 8),
         'min_live_7d': int((cfg or {}).get('goal_profile_min_live_setups_7d', 2) or 2),
@@ -25264,7 +25272,7 @@ async def goal_profile_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         wr = float(args[2])
         avg_r = float(args[3]) if len(args) >= 4 else None
     except Exception:
-        await update.message.reply_text('Invalid numbers. Example: /goal_set 1 3 50 0.10')
+        await update.message.reply_text('Invalid numbers. Example: /goal_set 5 8 60 0.10')
         return
     cfg = load_strategy_config(force=True)
     cfg['goal_profile_target_setups_per_day_lo'] = float(max(0.1, lo))
@@ -25335,14 +25343,14 @@ def _family_autotune_clamp_cfg(cfg: dict) -> dict:
     cfg = dict(cfg or {})
     cfg['family_f4_balance_score_relax'] = round(_clamp(float(cfg.get('family_f4_balance_score_relax', 0.0) or 0.0), 0.0, 6.0), 2)
     cfg['family_f4_balance_conf_relax'] = int(_clamp(int(float(cfg.get('family_f4_balance_conf_relax', 0) or 0)), 0, 8))
-    cfg['family_f4_balance_rr_relax'] = round(_clamp(float(cfg.get('family_f4_balance_rr_relax', 0.0) or 0.0), 0.0, 0.35), 3)
-    cfg['family_f4_balance_pb_relax'] = round(_clamp(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0), 0.0, 0.60), 3)
-    cfg['family_f4_balance_ch1_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0), 0.0, 1.10), 3)
-    cfg['family_f4_balance_ch15_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0), 0.0, 0.55), 3)
-    cfg['quality_score_min_screen'] = round(_clamp(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), 50.0, 66.0), 2)
-    cfg['quality_score_min_email'] = round(_clamp(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), 58.0, 70.0), 2)
-    cfg['min_rr_tp'] = round(_clamp(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), 0.96, 1.55), 3)
-    cfg['tf_align_1h_min_abs'] = round(_clamp(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), 0.20, 1.20), 3)
+    cfg['family_f4_balance_rr_relax'] = round(_clamp(float(cfg.get('family_f4_balance_rr_relax', 0.0) or 0.0), 0.0, 0.40), 3)
+    cfg['family_f4_balance_pb_relax'] = round(_clamp(float(cfg.get('family_f4_balance_pb_relax', 0.0) or 0.0), 0.0, 0.70), 3)
+    cfg['family_f4_balance_ch1_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch1_relax', 0.0) or 0.0), 0.0, 1.25), 3)
+    cfg['family_f4_balance_ch15_relax'] = round(_clamp(float(cfg.get('family_f4_balance_ch15_relax', 0.0) or 0.0), 0.0, 0.65), 3)
+    cfg['quality_score_min_screen'] = round(_clamp(float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN), 48.0, 66.0), 2)
+    cfg['quality_score_min_email'] = round(_clamp(float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL), 56.0, 70.0), 2)
+    cfg['min_rr_tp'] = round(_clamp(float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP), 0.94, 1.55), 3)
+    cfg['tf_align_1h_min_abs'] = round(_clamp(float(cfg.get('tf_align_1h_min_abs', TF_ALIGN_1H_MIN_ABS) or TF_ALIGN_1H_MIN_ABS), 0.15, 1.20), 3)
     return cfg
 
 
@@ -25522,10 +25530,10 @@ async def research_framework_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
 def _session_entry_quality_limits(session_name: str, source: str = 'email') -> dict:
     sess = str(session_name or '').upper().strip() or 'NY'
     base = {
-        'NY': {'max_pb_ema_dist': 0.76, 'max_ch15_abs': 0.70, 'max_ch1_abs': 1.38, 'max_atr_pct': 5.1},
-        'LON': {'max_pb_ema_dist': 0.78, 'max_ch15_abs': 0.70, 'max_ch1_abs': 1.38, 'max_atr_pct': 5.4},
-        'ASIA': {'max_pb_ema_dist': 0.62, 'max_ch15_abs': 0.54, 'max_ch1_abs': 1.12, 'max_atr_pct': 4.2},
-    }.get(sess, {'max_pb_ema_dist': 0.66, 'max_ch15_abs': 0.58, 'max_ch1_abs': 1.20, 'max_atr_pct': 4.6}).copy()
+        'NY': {'max_pb_ema_dist': 0.86, 'max_ch15_abs': 0.78, 'max_ch1_abs': 1.55, 'max_atr_pct': 5.8},
+        'LON': {'max_pb_ema_dist': 0.88, 'max_ch15_abs': 0.80, 'max_ch1_abs': 1.58, 'max_atr_pct': 5.9},
+        'ASIA': {'max_pb_ema_dist': 0.70, 'max_ch15_abs': 0.62, 'max_ch1_abs': 1.22, 'max_atr_pct': 4.6},
+    }.get(sess, {'max_pb_ema_dist': 0.74, 'max_ch15_abs': 0.64, 'max_ch1_abs': 1.28, 'max_atr_pct': 4.9}).copy()
     src = str(source or '').strip().lower()
     if src == 'screen':
         base['max_pb_ema_dist'] *= (1.10 if sess != 'ASIA' else 1.06)
@@ -25817,13 +25825,13 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 68.5, 72, 1.18
+        quality, conf, rr = 67.0, 70, 1.14
     elif sess == "LON":
-        quality, conf, rr = 66.0, 70, 1.10
+        quality, conf, rr = 64.5, 68, 1.08
     elif sess == "ASIA":
-        quality, conf, rr = 66.5, 70, 1.10
+        quality, conf, rr = 64.5, 68, 1.06
     else:
-        quality, conf, rr = 71.0, 74, 1.24
+        quality, conf, rr = 69.0, 72, 1.18
 
     try:
         cfg = load_strategy_config(force=False)
@@ -25847,9 +25855,9 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
                 rr -= 0.05
     except Exception:
         pass
-    quality = float(clamp(quality, 66.0, 92.0))
-    conf = int(max(68, min(95, conf)))
-    rr = float(clamp(rr, 1.02, 2.30))
+    quality = float(clamp(quality, 62.0, 92.0))
+    conf = int(max(66, min(95, conf)))
+    rr = float(clamp(rr, 0.98, 2.30))
     return (quality, conf, rr)
 
 
@@ -25917,30 +25925,30 @@ def is_executable_setup_eligible(
 
         if engine == 'A':
             if sess == 'LON':
-                score_floor = max((67.0 if reach_mode else 70.5), score_floor)
-                conf_floor = max((72 if reach_mode else 74), conf_floor)
-                rr_floor = max((1.12 if reach_mode else 1.22), rr_floor)
+                score_floor = max((65.5 if reach_mode else 68.5), score_floor)
+                conf_floor = max((70 if reach_mode else 72), conf_floor)
+                rr_floor = max((1.08 if reach_mode else 1.16), rr_floor)
             elif sess == 'NY':
-                score_floor = max(71.0, score_floor)
-                conf_floor = max(72, conf_floor)
-                rr_floor = max(1.18, rr_floor)
+                score_floor = max(68.5, score_floor)
+                conf_floor = max(70, conf_floor)
+                rr_floor = max(1.14, rr_floor)
             else:
-                score_floor = max(72.5, score_floor)
-                conf_floor = max(74, conf_floor)
-                rr_floor = max(1.20, rr_floor)
+                score_floor = max(69.5, score_floor)
+                conf_floor = max(71, conf_floor)
+                rr_floor = max(1.12, rr_floor)
         elif engine == 'C':
             if sess == 'LON':
-                score_floor = max((66.5 if reach_mode else 70.0), score_floor - 0.50 + engine_c_exec_quality_add)
-                conf_floor = max((73 if reach_mode else 76), conf_floor + engine_c_exec_conf_add)
-                rr_floor = max((1.10 if reach_mode else 1.20), rr_floor - 0.02 + engine_c_exec_rr_add)
+                score_floor = max((64.5 if reach_mode else 67.5), score_floor - 0.75 + engine_c_exec_quality_add)
+                conf_floor = max((70 if reach_mode else 73), conf_floor + engine_c_exec_conf_add)
+                rr_floor = max((1.06 if reach_mode else 1.14), rr_floor - 0.03 + engine_c_exec_rr_add)
             elif sess == 'NY':
-                score_floor = max(72.5, score_floor + 0.25 + engine_c_exec_quality_add)
-                conf_floor = max(76, conf_floor + 1 + engine_c_exec_conf_add)
-                rr_floor = max(1.24, rr_floor + 0.02 + engine_c_exec_rr_add)
+                score_floor = max(69.0, score_floor + 0.10 + engine_c_exec_quality_add)
+                conf_floor = max(72, conf_floor + engine_c_exec_conf_add)
+                rr_floor = max(1.16, rr_floor + 0.01 + engine_c_exec_rr_add)
             else:
-                score_floor = max(72.0, score_floor + 0.50 + engine_c_exec_quality_add)
-                conf_floor = max(74, conf_floor + 1 + engine_c_exec_conf_add)
-                rr_floor = max(1.20, rr_floor + 0.03 + engine_c_exec_rr_add)
+                score_floor = max(68.5, score_floor + 0.20 + engine_c_exec_quality_add)
+                conf_floor = max(71, conf_floor + engine_c_exec_conf_add)
+                rr_floor = max(1.12, rr_floor + 0.01 + engine_c_exec_rr_add)
         elif engine == 'B':
             if not exec_engine_b_enabled:
                 return (False, 'engine_b_disabled')
@@ -26018,9 +26026,9 @@ def is_executable_setup_eligible(
             score_floor += 0.50
             rr_floor += 0.02
 
-        score_floor = float(clamp(score_floor, 60.0 if active_profile.startswith('GLOBAL_') else 62.0, 92.0))
-        conf_floor = int(max(70 if active_profile.startswith('GLOBAL_') else 71, min(95, conf_floor)))
-        rr_floor = float(clamp(rr_floor, 1.05 if active_profile.startswith('GLOBAL_') else 1.08, 2.30))
+        score_floor = float(clamp(score_floor, 58.0 if active_profile.startswith('GLOBAL_') else 60.0, 92.0))
+        conf_floor = int(max(68 if active_profile.startswith('GLOBAL_') else 69, min(95, conf_floor)))
+        rr_floor = float(clamp(rr_floor, 0.98 if active_profile.startswith('GLOBAL_') else 1.02, 2.30))
 
         if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
             pass
@@ -26068,13 +26076,13 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.68, 7_500_000.0)):
                     return (False, "ny_below_liquidity")
             else:
-                if pb_dist > 1.06:
+                if pb_dist > 1.18:
                     return (False, "ny_entry_too_far_from_ema")
-                if ch15_abs > 1.12 or (ch15_abs > 0.94 and ch1_abs > 1.96):
+                if ch15_abs > 1.24 or (ch15_abs > 1.02 and ch1_abs > 2.08):
                     return (False, "ny_late_extension_exec")
-                if ch4_abs < 0.36 or ch1_abs < 0.10:
+                if ch4_abs < 0.28 or ch1_abs < 0.08:
                     return (False, "ny_context_too_weak_exec")
-                if fut_vol < max(MIN_FUT_VOL_USD * 0.74, 7_500_000.0):
+                if fut_vol < max(MIN_FUT_VOL_USD * 0.68, 6_500_000.0):
                     return (False, "ny_below_liquidity")
         elif sess == "LON":
             if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
@@ -26087,12 +26095,12 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.66, 7_000_000.0)):
                     return (False, "lon_below_liquidity")
             else:
-                lon_pb_max = 0.90 if reach_mode else 0.82
-                lon_ch15_cap = 0.86 if reach_mode else 0.74
-                lon_ch1_cap = 1.60 if reach_mode else 1.42
-                lon_ctx_ch4_min = 0.24 if reach_mode else 0.34
-                lon_ctx_ch1_min = 0.06 if reach_mode else 0.10
-                lon_liq_floor = max(MIN_FUT_VOL_USD * (0.72 if reach_mode else 0.80), 7_000_000.0 if reach_mode else 8_500_000.0)
+                lon_pb_max = 0.98 if reach_mode else 0.90
+                lon_ch15_cap = 0.96 if reach_mode else 0.84
+                lon_ch1_cap = 1.72 if reach_mode else 1.54
+                lon_ctx_ch4_min = 0.18 if reach_mode else 0.26
+                lon_ctx_ch1_min = 0.04 if reach_mode else 0.08
+                lon_liq_floor = max(MIN_FUT_VOL_USD * (0.66 if reach_mode else 0.72), 6_000_000.0 if reach_mode else 7_000_000.0)
                 if engine == 'C':
                     lon_pb_max = max(lon_pb_max, engine_c_exec_pb_dist_lon)
                     lon_ch1_cap = max(lon_ch1_cap, engine_c_exec_ch1_cap_lon)
@@ -26120,13 +26128,13 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.70, 6_500_000.0)):
                     return (False, "asia_below_liquidity")
             else:
-                if pb_dist > 0.78:
+                if pb_dist > 0.88:
                     return (False, "asia_entry_too_far_from_ema")
-                if ch15_abs > 0.78 or ch1_abs > 1.46:
+                if ch15_abs > 0.88 or ch1_abs > 1.56:
                     return (False, "asia_late_extension_exec")
-                if ch4_abs < 0.44 or ch1_abs < 0.18:
+                if ch4_abs < 0.34 or ch1_abs < 0.12:
                     return (False, "asia_context_too_weak_exec")
-                if fut_vol < float(max(MIN_FUT_VOL_USD * 0.68, ASIA_MIN_FUT_VOL_USD)):
+                if fut_vol < float(max(MIN_FUT_VOL_USD * 0.60, 8_000_000.0)):
                     return (False, "asia_below_liquidity")
 
         if engine == "A":
@@ -26136,18 +26144,18 @@ def is_executable_setup_eligible(
                 return (True, "ok")
             if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
                 return (False, "pullback_not_ready")
-            if pb_dist > ((0.84 if reach_mode else 0.70) if sess == 'LON' else (0.74 if sess == 'NY' else 0.68)):
+            if pb_dist > ((0.96 if reach_mode else 0.82) if sess == 'LON' else (0.86 if sess == 'NY' else 0.78)):
                 return (False, "pullback_still_too_shallow")
-            if sess == 'LON' and (ch15_abs > (0.74 if reach_mode else 0.58) or ch1_abs < (0.10 if reach_mode else 0.16) or ch1_abs > (1.38 if reach_mode else 1.18) or ch4_abs < (0.34 if reach_mode else 0.44)):
+            if sess == 'LON' and (ch15_abs > (0.86 if reach_mode else 0.66) or ch1_abs < (0.06 if reach_mode else 0.12) or ch1_abs > (1.52 if reach_mode else 1.28) or ch4_abs < (0.24 if reach_mode else 0.34)):
                 return (False, 'lon_pullback_not_clean_enough')
             return (True, "ok")
 
         if engine == "C":
-            c_quality_floor = score_floor + (0.00 if reach_mode and sess == 'LON' else 0.05)
-            c_conf_floor = max(73 if (reach_mode and sess == 'LON') else conf_floor, conf_floor - (1 if reach_mode and sess == 'LON' else 0))
-            c_rr_floor = max(1.08 if (reach_mode and sess == 'LON') else rr_floor, rr_floor - (0.06 if reach_mode and sess == 'LON' else 0.02))
-            c_liq_floor = float(max(MIN_FUT_VOL_USD * (engine_c_exec_liq_mult if not (reach_mode and sess == 'LON') else 0.72), 6_000_000.0 if (reach_mode and sess == 'LON') else ENGINE_C_MIN_FUT_VOL_USD * 0.82))
-            c_ch1_cap = (max(engine_c_exec_ch1_cap_lon, 1.76) if (reach_mode and sess == 'LON') else max(engine_c_exec_ch1_cap_lon, 1.44)) if sess == 'LON' else (1.66 if sess == 'NY' else 1.32)
+            c_quality_floor = score_floor + (0.00 if reach_mode and sess == 'LON' else 0.00)
+            c_conf_floor = max(71 if (reach_mode and sess == 'LON') else conf_floor, conf_floor - (1 if reach_mode and sess == 'LON' else 0))
+            c_rr_floor = max(1.04 if (reach_mode and sess == 'LON') else rr_floor, rr_floor - (0.08 if reach_mode and sess == 'LON' else 0.03))
+            c_liq_floor = float(max(MIN_FUT_VOL_USD * ((max(0.96, engine_c_exec_liq_mult - 0.08)) if not (reach_mode and sess == 'LON') else 0.68), 5_500_000.0 if (reach_mode and sess == 'LON') else 7_500_000.0))
+            c_ch1_cap = (max(engine_c_exec_ch1_cap_lon, 1.88) if (reach_mode and sess == 'LON') else max(engine_c_exec_ch1_cap_lon, 1.56)) if sess == 'LON' else (1.78 if sess == 'NY' else 1.42)
             if score < c_quality_floor:
                 return (False, "engine_c_below_quality")
             if conf < c_conf_floor:
@@ -30280,7 +30288,7 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Usage:\n"
             "/size <SYMBOL> <long|short> entry <PRICE> sl <STOP>\n"
-            "Optional: risk <usd|pct> <VALUE> (default: 1.5%)"
+            "Optional: risk <usd|pct> <VALUE> (default: your /riskmode setting)"
         )
         return
     
@@ -30332,8 +30340,13 @@ async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entry = None
     sl = None
 
-    risk_mode = "PCT"
-    risk_val = 1.5  # <- DEFAULT: 1.5% of equity if user does not provide risk
+    # Default risk must stay synced to the user's saved /riskmode settings.
+    # Only fall back to global defaults if the user has never set a custom risk mode.
+    risk_mode = str((user or {}).get("risk_mode", DEFAULT_RISK_MODE) or DEFAULT_RISK_MODE).strip().upper()
+    try:
+        risk_val = float((user or {}).get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
+    except Exception:
+        risk_val = float(DEFAULT_RISK_VALUE)
 
     i = 0
     while i < len(tokens):
@@ -32164,6 +32177,12 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
     end_ts = float(end_ts or 0.0)
     limit = int(max(1, min(int(limit or 80), 200)))
 
+    try:
+        sync_days = max(14, int(math.ceil(float(lookback_h or 24) / 24.0)) + 5)
+        _autotrade_sync_closed_trades_from_exchange(owner_uid, lookback_days=sync_days)
+    except Exception:
+        pass
+
     def _payload_fill(row: dict) -> dict:
         row = dict(row or {})
         sid = str(row.get('setup_id') or '').strip()
@@ -32232,6 +32251,17 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
     except Exception:
         lifecycle_rows = []
 
+
+    exchange_fallback_rows = []
+    try:
+        exchange_fallback_rows = [
+            _payload_fill(dict(r)) for r in (_autotrade_exchange_close_fallback_rows(owner_uid, days=prov_days) or [])
+            if float((r or {}).get('closed_ts') or 0.0) >= start_ts
+            and float((r or {}).get('closed_ts') or 0.0) < end_ts
+        ]
+    except Exception:
+        exchange_fallback_rows = []
+
     life_by_ident = {}
     life_by_key = {}
     for r in (lifecycle_rows or []):
@@ -32282,7 +32312,7 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
             return raw_path, _trade_lifecycle_result_label(raw_path)
         return 'MANUAL_OR_UNKNOWN_CLOSE', _trade_lifecycle_result_label('MANUAL_OR_UNKNOWN_CLOSE')
 
-    seed_rows = list(lifecycle_rows or []) + list(journal_rows or []) + list(provisional_rows or [])
+    seed_rows = list(lifecycle_rows or []) + list(journal_rows or []) + list(provisional_rows or []) + list(exchange_fallback_rows or [])
     for base in seed_rows:
         try:
             b = _payload_fill(dict(base or {}))
@@ -32330,7 +32360,7 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                 row['result_path'] = result_path
             if not str(row.get('result_label') or '').strip() or str(row.get('result_label') or '').lower().strip() == 'manual / unknown exchange close':
                 row['result_label'] = result_label
-            if not str(row.get('close_reason') or '').strip() or str(row.get('close_reason') or '').strip() == 'exchange_closed_pnl_fallback':
+            if not str(row.get('close_reason') or '').strip() or str(row.get('close_reason') or '').strip() in {'exchange_closed_pnl_fallback', 'exchange_only_fallback_close'}:
                 row['close_reason'] = 'signal_path_close' if result_path in {'TP', 'SL'} else str(row.get('close_reason') or result_label or 'closed')
             ok = _out_key(row)
             if ok not in seen_out:
