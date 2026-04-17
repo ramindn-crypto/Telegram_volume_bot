@@ -742,6 +742,31 @@ async def to_thread_heavy(fn, *args, timeout: int | None = None, **kwargs):
 async def to_thread_bg(fn, *args, timeout: int | None = None, **kwargs):
     return await _run_in_executor(_BACKGROUND_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
 
+
+def _run_async_in_new_loop(coro_fn, *args, **kwargs):
+    """Run an async callable inside its own event loop from a worker thread.
+
+    This is used when background schedulers need to execute async orchestration without
+    blocking the main Telegram event loop. It keeps slow scan/build logic off the loop
+    that serves user commands.
+    """
+    try:
+        return asyncio.run(coro_fn(*args, **kwargs))
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro_fn(*args, **kwargs))
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
+
 # Fast-command activity hint so background jobs can yield briefly to user-facing commands.
 _USER_ACTIVITY_TS = 0.0
 USER_ACTIVITY_COOLDOWN_SEC = int(os.getenv("USER_ACTIVITY_COOLDOWN_SEC", "20") or 20)
@@ -8438,6 +8463,21 @@ def _interactive_runtime_busy(window_sec: int | None = None) -> bool:
             return True
         if _backtest_runtime_busy() or _goal_profile_is_running():
             return True
+        return False
+    except Exception:
+        return False
+
+
+def _ohlcv_timeframe_cooling(*timeframes: str) -> bool:
+    """True when any requested OHLCV timeframe is inside the shared rate-limit cooldown."""
+    try:
+        now_ts = float(time.time())
+        for tf in (timeframes or []):
+            tf_key = str(tf or '').lower().strip()
+            if not tf_key:
+                continue
+            if float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0) > now_ts:
+                return True
         return False
     except Exception:
         return False
@@ -35839,7 +35879,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
     # Prevent overlapping runs (JobQueue can overlap if a run is slow)
     if ALERT_LOCK.locked():
         return
-    if _recent_user_activity(HEAVY_USER_ACTIVITY_DEFER_SEC):
+    if _interactive_runtime_busy(HEAVY_USER_ACTIVITY_DEFER_SEC):
         return
 
     async with ALERT_LOCK:
@@ -36210,48 +36250,55 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
             else:
-                try:
-                    # build_priority_pool is already async and internally offloads heavy work.
-                    pool = await asyncio.wait_for(
-                        build_priority_pool(
+                tf_cooling = _ohlcv_timeframe_cooling('15m', '1h', '4h')
+                if tf_cooling and cached_setups:
+                    setups = list(cached_setups)
+                    try:
+                        db_log_setup_pipeline_event(0, stage='email_pool_session_cache', status='rate_limit_cooldown_hit', session=str(sess_name or ''), mode='email', details={'setups': len(setups or []), 'cache_age_sec': round(cache_age, 1)})
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        pool = await to_thread_bg(
+                            _run_async_in_new_loop,
+                            build_priority_pool,
                             best_fut,
                             sess_name,
                             mode="exec",
                             scan_profile=str(DEFAULT_SCAN_PROFILE),
                             uid=None,
-                        ),
-                        timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
-                    )
-                except asyncio.TimeoutError:
-                    db_log_setup_pipeline_event(0, stage='build_priority_pool', status='timeout', session=str(sess_name or ''), mode='email', details={'timeout_sec': float(EMAIL_BUILD_POOL_TIMEOUT_SEC)})
-                    pool = {"setups": []}
-                except Exception as e:
-                    db_log_setup_pipeline_event(0, stage='build_priority_pool', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(e).__name__}: {e}'})
-                    pool = {"setups": []}
+                            timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
+                        )
+                    except asyncio.TimeoutError:
+                        db_log_setup_pipeline_event(0, stage='build_priority_pool', status='timeout', session=str(sess_name or ''), mode='email', details={'timeout_sec': float(EMAIL_BUILD_POOL_TIMEOUT_SEC)})
+                        pool = {"setups": []}
+                    except Exception as e:
+                        db_log_setup_pipeline_event(0, stage='build_priority_pool', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(e).__name__}: {e}'})
+                        pool = {"setups": []}
 
-                setups = list(pool.get("setups", []) or [])
-                if (not setups) and (not busy_runtime) and str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
-                    try:
-                        fallback_pool = await asyncio.wait_for(
-                            build_priority_pool(
+                    setups = list(pool.get("setups", []) or [])
+                    if (not setups) and (not busy_runtime) and (not tf_cooling) and str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
+                        try:
+                            fallback_pool = await to_thread_bg(
+                                _run_async_in_new_loop,
+                                build_priority_pool,
                                 best_fut,
                                 sess_name,
                                 mode="screen",
                                 scan_profile="aggressive",
                                 uid=None,
-                            ),
-                            timeout=max(15, int(EMAIL_BUILD_POOL_TIMEOUT_SEC)),
-                        )
-                        setups = list((fallback_pool or {}).get("setups", []) or [])
-                        try:
-                            db_log_setup_pipeline_event(0, stage='build_priority_pool_fallback', status='ok' if setups else 'empty', session=str(sess_name or ''), mode='email', details={'fallback_mode': 'screen_aggressive', 'setups': len(setups or [])})
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        try:
-                            db_log_setup_pipeline_event(0, stage='build_priority_pool_fallback', status='error', session=str(sess_name or ''), mode='email', details={'fallback_mode': 'screen_aggressive', 'error': f'{type(e).__name__}: {e}'})
-                        except Exception:
-                            pass
+                                timeout=max(15, int(EMAIL_BUILD_POOL_TIMEOUT_SEC)),
+                            )
+                            setups = list((fallback_pool or {}).get("setups", []) or [])
+                            try:
+                                db_log_setup_pipeline_event(0, stage='build_priority_pool_fallback', status='ok' if setups else 'empty', session=str(sess_name or ''), mode='email', details={'fallback_mode': 'screen_aggressive', 'setups': len(setups or [])})
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            try:
+                                db_log_setup_pipeline_event(0, stage='build_priority_pool_fallback', status='error', session=str(sess_name or ''), mode='email', details={'fallback_mode': 'screen_aggressive', 'error': f'{type(e).__name__}: {e}'})
+                            except Exception:
+                                pass
                 if setups:
                     _email_pool_cache_set(sess_name, setups)
                 elif cached_setups:
@@ -38170,7 +38217,7 @@ def main():
     app.add_handler(CommandHandler("support_close", admin_support_close_cmd, block=False))
     app.add_handler(CommandHandler("tz", tz_cmd, block=False))
     app.add_handler(CommandHandler("dayreset", dayreset_cmd, block=False))
-    app.add_handler(CommandHandler("screen", screen_cmd))
+    app.add_handler(CommandHandler("screen", screen_cmd, block=False))
     app.add_handler(CommandHandler("equity", equity_cmd, block=False))
     app.add_handler(CommandHandler("equity_reset", equity_reset_cmd, block=False))
     app.add_handler(CommandHandler("riskmode", riskmode_cmd, block=False))
