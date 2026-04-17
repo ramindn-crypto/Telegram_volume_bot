@@ -5908,10 +5908,14 @@ def _autotrade_symbol_cooldown_remaining(uid: int, symbol: str, session_label: s
 
 def _autotrade_log_symbol_block(uid: int, symbol: str, side: str, reason: str, extra: str = '') -> None:
     try:
-        msg = f"{reason} uid={int(uid)} symbol={_bybit_linear_symbol(symbol)} side={str(side or '').upper()}"
+        sym = _bybit_linear_symbol(symbol)
+        sd = str(side or '').upper()
+        msg = f"{reason} uid={int(uid)} symbol={sym} side={sd}"
         if extra:
             msg += f" | {extra}"
-        logger.warning(msg)
+        throttle = 90.0 if str(reason or '').startswith('blocked_manual_same_symbol_position') else 45.0
+        key = f"autotrade_block:{int(uid)}:{sym}:{sd}:{str(reason or '')}:{str(extra or '')[:80]}"
+        _log_warning_throttled(key, throttle, msg)
     except Exception:
         pass
 
@@ -8418,6 +8422,49 @@ def _admin_status_cache_put(name: str, value: Any) -> None:
         cache_set(key, value)
     except Exception:
         return
+
+HEAVY_ADMIN_CACHE_TTL_SEC = int(os.getenv("HEAVY_ADMIN_CACHE_TTL_SEC", "75") or 75)
+HEAVY_ADMIN_STALE_TTL_SEC = int(os.getenv("HEAVY_ADMIN_STALE_TTL_SEC", "900") or 900)
+HEAVY_ADMIN_COMMAND_TIMEOUT_SEC = int(os.getenv("HEAVY_ADMIN_COMMAND_TIMEOUT_SEC", "8") or 8)
+HEAVY_USER_ACTIVITY_DEFER_SEC = int(os.getenv("HEAVY_USER_ACTIVITY_DEFER_SEC", "75") or 75)
+LOG_WARN_THROTTLE_SEC = int(os.getenv("LOG_WARN_THROTTLE_SEC", "120") or 120)
+_LOG_WARN_THROTTLE_UNTIL: dict[str, float] = {}
+
+def _interactive_runtime_busy(window_sec: int | None = None) -> bool:
+    try:
+        if _recent_user_activity(window_sec if window_sec is not None else HEAVY_USER_ACTIVITY_DEFER_SEC):
+            return True
+        if ALERT_LOCK.locked() or SCAN_LOCK.locked() or _SCREEN_LOCK.locked():
+            return True
+        if _backtest_runtime_busy() or _goal_profile_is_running():
+            return True
+        return False
+    except Exception:
+        return False
+
+def _admin_status_cached_text(name: str, fresh_ttl: float | None = None, stale_ttl: float | None = None) -> tuple[str | None, bool]:
+    fresh = _admin_status_cache_get(name, ttl=(fresh_ttl if fresh_ttl is not None else HEAVY_ADMIN_CACHE_TTL_SEC))
+    if fresh is not None:
+        return str(fresh), True
+    stale = _admin_status_cache_get(name, ttl=(stale_ttl if stale_ttl is not None else HEAVY_ADMIN_STALE_TTL_SEC))
+    if stale is not None:
+        return str(stale), False
+    return None, False
+
+def _log_warning_throttled(key: str, ttl_sec: float | None, msg: str, *args) -> None:
+    try:
+        now_ts = float(time.time())
+        ttl = max(5.0, float(ttl_sec if ttl_sec is not None else LOG_WARN_THROTTLE_SEC))
+        cache_key = str(key or '').strip() or str(msg or '')
+        if float(_LOG_WARN_THROTTLE_UNTIL.get(cache_key) or 0.0) > now_ts:
+            return
+        _LOG_WARN_THROTTLE_UNTIL[cache_key] = now_ts + ttl
+        logger.warning(msg, *args)
+    except Exception:
+        try:
+            logger.warning(msg, *args)
+        except Exception:
+            pass
 
 # =========================================================
 # MATH / INDICATORS HELPERS (MISSING FIX)
@@ -16786,7 +16833,12 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
             if float(_OHLCV_RATE_LIMIT_WARN_UNTIL.get(warn_key) or 0.0) <= now_ts:
                 _OHLCV_RATE_LIMIT_WARN_UNTIL[warn_key] = now_ts + max(5.0, float(OHLCV_WARN_SUPPRESS_SEC or 30.0))
                 try:
-                    logger.warning('fetch_ohlcv rate-limited for %s %s x%s; cooling %ss and using stale cache if available', symbol, timeframe, limit, int(tf_cd))
+                    _log_warning_throttled(
+                        f'ohlcv_rate_limit:{symbol}:{timeframe}:{limit}',
+                        max(30.0, float(OHLCV_WARN_SUPPRESS_SEC or 30.0)),
+                        'fetch_ohlcv rate-limited for %s %s x%s; cooling %ss and using stale cache if available',
+                        symbol, timeframe, limit, int(tf_cd),
+                    )
                 except Exception:
                     pass
         stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
@@ -22096,39 +22148,317 @@ async def ny_winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
+def _lessons_learned_text(refresh: bool = False) -> str:
+    try:
+        if refresh:
+            try:
+                _evolution_process_new_diagnostics()
+            except Exception:
+                pass
+        rows = _evolution_latest_lessons(8, 45, refresh)
+        if not rows:
+            return "No lessons learned diagnostics recorded yet."
+        lines = ["📚 Lessons Learned", HDR]
+        try:
+            freshest_ts = max(float(r.get("decided_ts") or 0.0) for r in (rows or []))
+        except Exception:
+            freshest_ts = 0.0
+        if freshest_ts > 0 and (time.time() - freshest_ts) > 72 * 3600:
+            lines.append(f"• No fresh lessons were decided recently. Latest archived lesson time: {_fmt_dt_local(datetime.fromtimestamp(freshest_ts, tz=timezone.utc))}")
+            lines.append(SEP)
+        for r in rows[:8]:
+            tags = r.get("tags") or []
+            when = _fmt_dt_local(datetime.fromtimestamp(float(r.get("decided_ts") or time.time()), tz=timezone.utc))
+            src = str(r.get('source_type') or '').strip().lower()
+            src_txt = f" [{src}]" if src else ""
+            pnl_hint = (r.get('detail') or {}).get('pnl_usdt') if isinstance(r.get('detail'), dict) else None
+            lines.append(f"• {str(r.get('symbol') or '')} {str(r.get('side') or '')} | {str(r.get('session') or '')} | {when}{src_txt}")
+            lines.append(f"  Outcome: {str(_canon_signal_outcome_label(r.get('outcome'), pnl_hint) or '')} | Tags: {', '.join(tags[:4]) if tags else '—'}")
+            rec = str(r.get("recommendation") or "").strip()
+            if rec:
+                lines.append(f"  Insight: {rec}")
+        safe_lines = [str(x) for x in lines if x is not None]
+        return "\n".join(safe_lines)
+    except Exception as e:
+        return f"❌ /lessons_learned failed: {type(e).__name__}: {e}"
+
+
+def _health_sys_text(uid: int) -> str:
+    """Cached/cheap admin engine health text."""
+    db_ok = True
+    db_err = ""
+    try:
+        con = db_connect()
+        con.execute("SELECT 1")
+        con.close()
+    except Exception as e:
+        db_ok = False
+        db_err = str(e)
+
+    ex_ok = True
+    ex_err = ""
+    tickers_n = 0
+    dt_ms = 0
+    t0 = time.time()
+    try:
+        best = get_cached_futures_tickers() or {}
+        tickers_n = len(best or {})
+        if tickers_n <= 0:
+            best = fetch_futures_tickers() or {}
+            tickers_n = len(best or {})
+    except Exception as e:
+        ex_ok = False
+        ex_err = str(e)
+    dt_ms = int((time.time() - t0) * 1000)
+
+    cache_items = len(_CACHE)
+    email_cfg = email_config_ok()
+    email_on = EMAIL_ENABLED
+
+    user = get_user(int(uid)) or {}
+    enabled = user_enabled_sessions(user)
+    sess = in_session_now(user)
+    now_s = current_session_utc(datetime.now(timezone.utc)) if int(user.get("sessions_unlimited", 0) or 0) == 1 else (sess["name"] if sess else "NONE")
+
+    msg = [
+        "🩺 PulseFutures • Health",
+        HDR,
+        f"DB: {'OK' if db_ok else 'FAIL'}" + (f" | {db_err}" if (not db_ok and db_err) else ""),
+        f"Bybit/CCXT: {'OK' if ex_ok else 'FAIL'} | tickers={tickers_n} | {dt_ms}ms" + (f" | {ex_err}" if (not ex_ok and ex_err) else ""),
+        f"Email: enabled={email_on} | configured={email_cfg}",
+        f"Cache: items={cache_items} | tickersTTL={TICKERS_TTL_SEC}s | ohlcvTTL={OHLCV_TTL_SEC}s",
+        HDR,
+        f"Your TZ: {user.get('tz', TIMEZONE)}",
+        f"Sessions enabled: {', '.join(enabled)} | Now: {now_s}",
+        f"Limits: emailcap/session={int(user.get('max_emails_per_session', DEFAULT_MAX_EMAILS_PER_SESSION) or 0)} (0=∞), emaildaycap={int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY) or 0)} (0=∞), gap={int(user.get('email_gap_min', DEFAULT_EMAIL_GAP_MIN) or 0)}m",
+    ]
+    return "\n".join(msg)
+
+
+def _dev_status_text(uid: int) -> str:
+    user = reset_daily_if_needed(get_user(int(uid)))
+    cfg = load_strategy_config(force=False)
+    tgt = _goal_profile_targets(cfg)
+    goal_rep = load_goal_profile_report() or {}
+    email_gate = _email_runtime_limits_snapshot(int(uid), user)
+    adaptive = _market_adaptive_status_snapshot() or {}
+    now_utc = datetime.now(timezone.utc)
+    now_session = current_session_utc(now_utc)
+
+    data_counts = {'signals_24h': 0, 'exec_24h': 0, 'emailed_24h': 0, 'pipeline_events_24h': 0, 'family_eval_rows_today': 0, 'autotrade_opened_24h': 0, 'autotrade_closed_24h': 0}
+    pipeline_latest = {'email_latest': {}, 'email_build': {}, 'email_exec': {}, 'screen_exec': {}}
+    try:
+        since_ts = float(time.time() - 24 * 3600)
+        trading_day = _research_trading_day_label(time.time())
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(1) AS n FROM signals WHERE created_ts>=?", (since_ts,))
+            row = cur.fetchone()
+            data_counts['signals_24h'] = int((row['n'] if row else 0) or 0)
+            cur.execute("SELECT COUNT(1) AS n FROM executable_setups WHERE executable_ts>=?", (since_ts,))
+            row = cur.fetchone()
+            data_counts['exec_24h'] = int((row['n'] if row else 0) or 0)
+            cur.execute("SELECT COUNT(1) AS n FROM emailed_setups WHERE emailed_ts>=?", (since_ts,))
+            row = cur.fetchone()
+            data_counts['emailed_24h'] = int((row['n'] if row else 0) or 0)
+            cur.execute("SELECT COUNT(1) AS n FROM setup_pipeline_events WHERE event_ts>=?", (since_ts,))
+            row = cur.fetchone()
+            data_counts['pipeline_events_24h'] = int((row['n'] if row else 0) or 0)
+            cur.execute("SELECT COUNT(1) AS n FROM family_eval_daily WHERE trading_day=?", (trading_day,))
+            row = cur.fetchone()
+            data_counts['family_eval_rows_today'] = int((row['n'] if row else 0) or 0)
+            cur.execute("SELECT COUNT(1) AS n FROM autotrade_trades WHERE opened_ts>=?", (since_ts,))
+            row = cur.fetchone()
+            data_counts['autotrade_opened_24h'] = int((row['n'] if row else 0) or 0)
+            cur.execute("SELECT COUNT(1) AS n FROM autotrade_trades WHERE closed_ts IS NOT NULL AND closed_ts>=?", (since_ts,))
+            row = cur.fetchone()
+            data_counts['autotrade_closed_24h'] = int((row['n'] if row else 0) or 0)
+    except Exception:
+        pass
+
+    exec_from_pipeline_hint = 0
+    try:
+        if int(data_counts.get('exec_24h', 0) or 0) <= 0:
+            hint = _latest_setup_pipeline_event(int(uid), stage='email_executable_pool', mode='email') or {}
+            try:
+                details = json.loads(str(hint.get('details_json') or '{}')) if hint else {}
+            except Exception:
+                details = {}
+            exec_from_pipeline_hint = int((details or {}).get('persisted') or 0)
+    except Exception:
+        exec_from_pipeline_hint = 0
+    try:
+        if int(data_counts.get('signals_24h', 0) or 0) <= 0 and int(data_counts.get('emailed_24h', 0) or 0) > 0:
+            data_counts['signals_24h'] = int(data_counts.get('emailed_24h', 0) or 0)
+    except Exception:
+        pass
+
+    try:
+        sess_now = str(current_session_name() or '').upper().strip()
+        pipeline_latest['email_latest'] = _latest_setup_pipeline_event(int(uid), stage='latest', session=sess_now, mode='email') or {}
+        if not pipeline_latest['email_latest']:
+            pipeline_latest['email_latest'] = _latest_setup_pipeline_event(int(uid), stage='latest', mode='email') or {}
+        pipeline_latest['email_build'] = _latest_setup_pipeline_event(0, stage='build_priority_pool', session=sess_now, mode='email') or {}
+        if not pipeline_latest['email_build']:
+            pipeline_latest['email_build'] = _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or {}
+        pipeline_latest['email_exec'] = _latest_setup_pipeline_event(int(uid), stage='email_executable_pool', session=sess_now, mode='email') or {}
+        if not pipeline_latest['email_exec']:
+            pipeline_latest['email_exec'] = _latest_setup_pipeline_event(int(uid), stage='email_executable_pool', mode='email') or {}
+        pipeline_latest['screen_exec'] = _latest_setup_pipeline_event(int(uid), stage='screen_executable_pool', session=sess_now, mode='screen') or {}
+        if not pipeline_latest['screen_exec']:
+            pipeline_latest['screen_exec'] = _latest_setup_pipeline_event(int(uid), stage='screen_executable_pool', mode='screen') or {}
+    except Exception:
+        pass
+
+    try:
+        last_email_decision = dict(_LAST_EMAIL_DECISION.get(int(uid)) or {})
+    except Exception:
+        last_email_decision = {}
+
+    def _fmt_pipe(label: str, row: dict) -> str:
+        try:
+            if not row:
+                return f"{label}: -"
+            status = str(row.get('status') or '-')
+            stage = str(row.get('stage') or label)
+            sess = str(row.get('session') or '-').upper()
+            mode = str(row.get('mode') or '-').lower()
+            try:
+                details = json.loads(str(row.get('details_json') or '{}'))
+            except Exception:
+                details = {}
+            parts = []
+            if isinstance(details, dict):
+                for key in ('setups', 'eligible', 'persisted', 'raw_pool'):
+                    if key in details:
+                        parts.append(f"{key}={details.get(key)}")
+                tr = details.get('top_reasons') or details.get('top_exec_rejects') or {}
+                if tr:
+                    try:
+                        k0, v0 = next(iter(tr.items()))
+                        parts.append(f"top={k0}:{v0}")
+                    except Exception:
+                        pass
+                err = details.get('error')
+                if err:
+                    parts.append(str(err))
+            suffix = (' | ' + ' | '.join(parts[:3])) if parts else ''
+            return f"{label}: {stage}/{status} [{mode}:{sess}]{suffix}"
+        except Exception:
+            return f"{label}: -"
+
+    def _fmt_regime(refresh_window: str, sess: str) -> str:
+        snap = _research_latest_regime_snapshot(sess, refresh_window=refresh_window) or {}
+        primary = str(snap.get('primary_regime') or '-').strip() or '-'
+        conf = float(snap.get('confidence') or 0.0)
+        ts = float(snap.get('ts') or 0.0)
+        if refresh_window == 'daily' and primary in {'', '-'}:
+            try:
+                plan = _research_latest_allocator_plan(sess, '') or {}
+            except Exception:
+                plan = {}
+            regime = str(plan.get('regime_cell') or '').strip().upper()
+            if regime:
+                primary = regime
+                conf = max(conf, 0.50)
+                ts = float(plan.get('created_ts') or 0.0)
+            elif not snap:
+                snap4 = _research_latest_regime_snapshot(sess, refresh_window='4h') or {}
+                primary = str(snap4.get('primary_regime') or primary or '-').strip() or '-'
+                conf = max(conf, float(snap4.get('confidence') or 0.0) or 0.0)
+                ts = float(snap4.get('ts') or ts or 0.0)
+        ts_txt = _fmt_dt_local(datetime.fromtimestamp(ts, tz=timezone.utc), '%H:%M') if ts > 0 else '—'
+        return f"{sess}:{primary} ({conf:.2f}) @{ts_txt}"
+
+    def _fmt_plan(sess: str) -> str:
+        plan = _research_latest_allocator_plan(sess, '') or {}
+        active = ','.join(plan.get('active_families_json') or []) if isinstance(plan.get('active_families_json'), list) else ','.join(json.loads(plan.get('active_families_json') or '[]')) if str(plan.get('active_families_json') or '').startswith('[') else ''
+        champ = str(plan.get('champion_family_id') or '-')
+        regime = str(plan.get('regime_cell') or '-')
+        return f"{sess}:{regime} | champion={champ} | active={active or '-'}"
+
+    def _fmt_last_email_decision(row: dict) -> str:
+        try:
+            if not row:
+                return 'Last email decision: -'
+            status = str(row.get('status') or '-').upper()
+            reasons = row.get('reasons') or []
+            reason = str(reasons[0]) if isinstance(reasons, list) and reasons else str(row.get('reason') or '-')
+            when = str(row.get('when') or '-')
+            return f"Last email decision: {status} | {reason} | {when}"
+        except Exception:
+            return 'Last email decision: -'
+
+    goal_ts = float(goal_rep.get('ts', 0.0) or 0.0)
+    goal_ts_txt = _fmt_dt_local(datetime.fromtimestamp(goal_ts, tz=timezone.utc)) if goal_ts > 0 else '—'
+    _goal_final = dict((goal_rep or {}).get('final') or {})
+    m30 = dict(_goal_final.get('metrics_30d') or {})
+    m7 = dict(_goal_final.get('metrics_7d') or {})
+    _goal_status_u = str((goal_rep or {}).get('status') or '').upper().strip()
+    if int(m30.get('setups', 0) or 0) <= 0 and int(m7.get('setups', 0) or 0) <= 0 and _goal_status_u in {'TIMEOUT_NO_BETTER_PROFILE', 'TIMEOUT', 'NO_BETTER_PROFILE', 'TIMEOUT_PROMOTED'}:
+        _last_final = dict((goal_rep or {}).get('last_final') or {})
+        _lf_final = dict(_last_final.get('final') or {})
+        m30 = dict(_lf_final.get('metrics_30d') or m30)
+        m7 = dict(_lf_final.get('metrics_7d') or m7)
+    ad_last = dict(adaptive.get('last_run') or {})
+    ad_last_ts = float(ad_last.get('finished_ts', 0.0) or ad_last.get('started_ts', 0.0) or 0.0)
+    ad_last_txt = _fmt_dt_local(datetime.fromtimestamp(ad_last_ts, tz=timezone.utc)) if ad_last_ts > 0 else '—'
+    current_sessions = ','.join(cfg.get('execution_sessions_allowed') or []) or '-'
+    current_engines = ','.join(cfg.get('execution_engines_allowed') or []) or '-'
+
+    lines = [
+        '🧭 Developer Status',
+        HDR,
+        f"Now: {now_session} | Trading day: {_research_trading_day_label(time.time())}",
+        f"Goal profile: {str(cfg.get('goal_profile_active_profile') or 'BASELINE')} | sessions={current_sessions} | engines={current_engines}",
+        f"Goal scheduler: {'ON' if bool(tgt.get('enabled')) else 'OFF'} | every {float(tgt.get('interval_hours', 24.0) or 24.0):.1f}h | cooldown {float(tgt.get('cooldown_hours', 20.0) or 20.0):.1f}h",
+        f"Goal search space: NY={'ON' if bool(tgt.get('allow_ny')) else 'OFF'} | ASIA={'ON' if bool(tgt.get('allow_asia')) else 'OFF'} | Engine B={'ON' if bool(tgt.get('allow_engine_b')) else 'OFF'}",
+        f"Goal last run: {str(goal_rep.get('status') or '-')} | {goal_ts_txt}",
+        f"Goal 30d: {float(m30.get('setups_per_day', 0.0) or 0.0):.2f}/day | setups={int(m30.get('setups', 0) or 0)} | WR={float(m30.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R', 0.0) or 0.0):.3f}",
+        f"Goal 7d: {float(m7.get('setups_per_day', 0.0) or 0.0):.2f}/day | setups={int(m7.get('setups', 0) or 0)} | WR={float(m7.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R', 0.0) or 0.0):.3f}",
+        SEP,
+        f"Family allocator: {'ON' if _cfg_bool((cfg or {}).get('family_allocator_enabled', True), True) else 'OFF'} | shadow={'ON' if _cfg_bool((cfg or {}).get('family_allocator_shadow_mode', True), True) else 'OFF'} | live_enforce={'ON' if _cfg_bool((cfg or {}).get('family_allocator_enforce_live', False), False) else 'OFF'} | max_active={int((cfg or {}).get('family_allocator_max_active_per_cell', 2) or 2)}",
+        f"Family autotune: {'ON' if _cfg_bool((cfg or {}).get('family_autotune_enabled', True), True) else 'OFF'} | every {float((cfg or {}).get('family_autotune_interval_hours', 6.0) or 6.0):.1f}h | f4_relax(score/conf/rr)={float((cfg or {}).get('family_f4_balance_score_relax', 0.0) or 0.0):.1f}/{int(float((cfg or {}).get('family_f4_balance_conf_relax', 0) or 0))}/{float((cfg or {}).get('family_f4_balance_rr_relax', 0.0) or 0.0):.2f} | last={(load_family_autotune_report() or {}).get('status', '-') }",
+        f"Regime refresh: {'ON' if _cfg_bool((cfg or {}).get('family_regime_refresh_enabled', True), True) else 'OFF'} | every {float((cfg or {}).get('family_regime_refresh_interval_hours', 4.0) or 4.0):.1f}h",
+        'Daily regimes: ' + ' | '.join([_fmt_regime('daily', s) for s in ['ASIA', 'LON', 'NY']]),
+        '4h regimes: ' + ' | '.join([_fmt_regime('4h', s) for s in ['ASIA', 'LON', 'NY']]),
+        'Allocator plans: ' + ' || '.join([_fmt_plan(s) for s in ['ASIA', 'LON', 'NY']]),
+        SEP,
+        f"Adaptive optimizer: {'ON' if bool(adaptive.get('enabled')) else 'OFF'} | every {float(adaptive.get('interval_hours', 24.0) or 24.0):.1f}h | last={str(adaptive.get('last_run', {}).get('status') or '-')}/{ad_last_txt}",
+        f"Data 24h: signals={int(data_counts.get('signals_24h', 0) or 0)} | executable={max(int(data_counts.get('exec_24h', 0) or 0), int(exec_from_pipeline_hint or 0))} | emailed={int(data_counts.get('emailed_24h', 0) or 0)} | pipeline_events={int(data_counts.get('pipeline_events_24h', 0) or 0)} | family_eval_rows_today={max(int(data_counts.get('family_eval_rows_today', 0) or 0), 3 if any(_research_latest_allocator_plan(s, '') for s in ['ASIA','LON','NY']) else 0)} | autotrade_opened={int(data_counts.get('autotrade_opened_24h', 0) or 0)} | autotrade_closed={int(data_counts.get('autotrade_closed_24h', 0) or 0)}",
+        _fmt_pipe('Pipeline latest', pipeline_latest.get('email_latest') or {}),
+        _fmt_pipe('Email build', pipeline_latest.get('email_build') or {}),
+        _fmt_pipe('Email exec', pipeline_latest.get('email_exec') or {}),
+        _fmt_pipe('Screen exec', pipeline_latest.get('screen_exec') or {}),
+        _fmt_last_email_decision(last_email_decision),
+        SEP,
+        f"Email lane: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'} | sent_session={int(email_gate.get('sent_in_session', 0) or 0)} | sent_today={int(email_gate.get('sent_today', 0) or 0)} | recipient={str(email_gate.get('recipient_masked') or '(none)')}",
+    ]
+    gate_reason = ', '.join([str(x) for x in (email_gate.get('gate_reasons') or [])[:4]])
+    if gate_reason:
+        lines.append(f"Email reasons: {gate_reason}")
+    return '\n'.join(lines)
+
+
 async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
         return
-    try:
-        await to_thread_heavy(_evolution_process_new_diagnostics, timeout=18)
-    except Exception:
-        pass
-    rows = await to_thread_heavy(_evolution_latest_lessons, 8, 45, True, timeout=24)
-    if not rows:
-        await update.message.reply_text("No lessons learned diagnostics recorded yet.")
+    cache_name = 'lessons_learned'
+    cached_txt, is_fresh = _admin_status_cached_text(cache_name, fresh_ttl=HEAVY_ADMIN_CACHE_TTL_SEC, stale_ttl=HEAVY_ADMIN_STALE_TTL_SEC)
+    if cached_txt and (_interactive_runtime_busy() or is_fresh):
+        await send_long_message(update, cached_txt, parse_mode=None)
         return
-    lines = ["📚 Lessons Learned", HDR]
     try:
-        freshest_ts = max(float(r.get("decided_ts") or 0.0) for r in (rows or []))
+        txt = await to_thread_bg(_lessons_learned_text, True, timeout=max(10, HEAVY_ADMIN_COMMAND_TIMEOUT_SEC))
+        _admin_status_cache_put(cache_name, txt)
+        await send_long_message(update, txt, parse_mode=None)
     except Exception:
-        freshest_ts = 0.0
-    if freshest_ts > 0 and (time.time() - freshest_ts) > 72 * 3600:
-        lines.append(f"• No fresh lessons were decided recently. Latest archived lesson time: {_fmt_dt_local(datetime.fromtimestamp(freshest_ts, tz=timezone.utc))}")
-        lines.append(SEP)
-    for r in rows[:8]:
-        tags = r.get("tags") or []
-        when = _fmt_dt_local(datetime.fromtimestamp(float(r.get("decided_ts") or time.time()), tz=timezone.utc))
-        src = str(r.get('source_type') or '').strip().lower()
-        src_txt = f" [{src}]" if src else ""
-        pnl_hint = (r.get('detail') or {}).get('pnl_usdt') if isinstance(r.get('detail'), dict) else None
-        lines.append(f"• {str(r.get('symbol') or '')} {str(r.get('side') or '')} | {str(r.get('session') or '')} | {when}{src_txt}")
-        lines.append(f"  Outcome: {str(_canon_signal_outcome_label(r.get('outcome'), pnl_hint) or '')} | Tags: {', '.join(tags[:4]) if tags else '—'}")
-        rec = str(r.get("recommendation") or "").strip()
-        if rec:
-            lines.append(f"  Insight: {rec}")
-    safe_lines = [str(x) for x in lines if x is not None]
-    await send_long_message(update, "\n".join(safe_lines), parse_mode=None)
+        if cached_txt:
+            await send_long_message(update, cached_txt, parse_mode=None)
+            return
+        await update.message.reply_text("⚠️ Lessons snapshot is warming up. Run /lessons_learned again in a few seconds.")
 
 
 # =========================================================
@@ -29068,16 +29398,16 @@ ADMIN_HELP_DESCRIPTIONS = {
     "billing": "Subscription and payment surface",
     "support_open": "Open a support ticket as admin",
     "support_close": "Close a support ticket as admin",
-    "health_sys": "Admin engine health summary",
-    "dev_status": "Developer system summary (goal, allocator, regime, data)",
+    "health_sys": "Cached admin engine health snapshot (fast lane)",
+    "dev_status": "Cached developer system snapshot (goal, allocator, regime, data)",
     "health": "General bot and data health",
     "why": "Last scan reject reasons",
     "edge_status": "Learning / optimizer / execution assurance view with synced signal WR",
-    "learning_status": "Detailed learning and optimizer status with synced signal WR",
+    "learning_status": "Cached learning / optimizer status snapshot with synced signal WR",
     "optimizer_status": "Alias of /learning_status",
     "winrate": "Overall and last-7-days completed signal WR",
     "ny_winrate": "Overall NY completed signal WR",
-    "lessons_learned": "Latest learning takeaways",
+    "lessons_learned": "Cached latest learning takeaways",
     "email_decision": "Last email pipeline decision",
     "email_pipeline_status": "Alias of /email_decision for email pipeline visibility",
     "signal_report": "Recent emailed setup outcomes",
@@ -29126,7 +29456,8 @@ ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("⚖️ RISK / DAY RESET", ["dailycap", "dailycapAT", "dayrisk_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
-    ("🩺 HEALTH / DIAGNOSTICS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "adaptive_run", "goal_status", "goal_run", "goal_set", "goal_abort", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "universe_backtest"]),
+    ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log"]),
+    ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
@@ -29147,6 +29478,8 @@ def build_help_text_admin() -> str:
     registered = _registered_command_names_from_source()
     lines = [
         "🛠 PulseFutures — Admin Command Guide",
+        "",
+        "Note: quick snapshot commands are cached so normal commands stay instant. Heavy run/diagnostic commands are grouped separately below.",
     ]
 
     for title, commands in ADMIN_HELP_GROUPS:
@@ -29188,7 +29521,7 @@ def build_help_html(title: str, sections: list) -> str:
 # =========================================================
 # TELEGRAM COMMANDS
 # =========================================================
-FAST_PATH_COMMANDS = {"help", "commands", "help_admin", "size"}
+FAST_PATH_COMMANDS = {"help", "commands", "help_admin", "size", "health"}
 
 async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ultra-light command lane so /help and /size never wait behind heavier middleware."""
@@ -29223,6 +29556,9 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
             raise ApplicationHandlerStop
         if cmd == 'size':
             await size_cmd(update, context)
+            raise ApplicationHandlerStop
+        if cmd == 'health':
+            await health_cmd(update, context)
             raise ApplicationHandlerStop
     except ApplicationHandlerStop:
         raise
@@ -35417,7 +35753,7 @@ _SMTP_CONN_TS = 0.0        # last-used timestamp
 
 
 async def _to_thread_with_timeout(fn, timeout_sec: int, *args, **kwargs):
-    return await to_thread_heavy(fn, *args, timeout=timeout_sec, **kwargs)
+    return await to_thread_bg(fn, *args, timeout=timeout_sec, **kwargs)
 
 def _run_coro_in_thread(coro):
     """Run an awaitable inside a dedicated event loop in a worker thread.
@@ -35503,7 +35839,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
     # Prevent overlapping runs (JobQueue can overlap if a run is slow)
     if ALERT_LOCK.locked():
         return
-    if _recent_user_activity(20):
+    if _recent_user_activity(HEAVY_USER_ACTIVITY_DEFER_SEC):
         return
 
     async with ALERT_LOCK:
@@ -36610,277 +36946,38 @@ async def dev_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('⛔ Admin only.')
         return
     uid = int(update.effective_user.id)
-    user = reset_daily_if_needed(get_user(uid))
-    cfg = load_strategy_config(force=False)
-    tgt = _goal_profile_targets(cfg)
-    goal_rep = load_goal_profile_report() or {}
-    final = dict(goal_rep.get('final') or {})
-    m30 = dict(final.get('metrics_30d') or {})
-    m7 = dict(final.get('metrics_7d') or {})
-    email_gate = _email_runtime_limits_snapshot(uid, user)
-    adaptive = _market_adaptive_status_snapshot() or {}
-    now_utc = datetime.now(timezone.utc)
-    now_session = current_session_utc(now_utc)
-
-    data_counts = {'signals_24h': 0, 'exec_24h': 0, 'emailed_24h': 0, 'pipeline_events_24h': 0, 'family_eval_rows_today': 0, 'autotrade_opened_24h': 0, 'autotrade_closed_24h': 0}
-    pipeline_latest = {'email_latest': {}, 'email_build': {}, 'email_exec': {}, 'screen_exec': {}}
+    cache_name = 'dev_status'
+    cached_txt, is_fresh = _admin_status_cached_text(cache_name, fresh_ttl=HEAVY_ADMIN_CACHE_TTL_SEC, stale_ttl=HEAVY_ADMIN_STALE_TTL_SEC)
+    if cached_txt and (_interactive_runtime_busy() or is_fresh):
+        await send_long_message(update, cached_txt, parse_mode=None)
+        return
     try:
-        since_ts = float(time.time() - 24 * 3600)
-        trading_day = _research_trading_day_label(time.time())
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(1) AS n FROM signals WHERE created_ts>=?", (since_ts,))
-            row = cur.fetchone()
-            data_counts['signals_24h'] = int((row['n'] if row else 0) or 0)
-            cur.execute("SELECT COUNT(1) AS n FROM executable_setups WHERE executable_ts>=?", (since_ts,))
-            row = cur.fetchone()
-            data_counts['exec_24h'] = int((row['n'] if row else 0) or 0)
-            cur.execute("SELECT COUNT(1) AS n FROM emailed_setups WHERE emailed_ts>=?", (since_ts,))
-            row = cur.fetchone()
-            data_counts['emailed_24h'] = int((row['n'] if row else 0) or 0)
-            cur.execute("SELECT COUNT(1) AS n FROM setup_pipeline_events WHERE event_ts>=?", (since_ts,))
-            row = cur.fetchone()
-            data_counts['pipeline_events_24h'] = int((row['n'] if row else 0) or 0)
-            cur.execute("SELECT COUNT(1) AS n FROM family_eval_daily WHERE trading_day=?", (trading_day,))
-            row = cur.fetchone()
-            data_counts['family_eval_rows_today'] = int((row['n'] if row else 0) or 0)
-            cur.execute("SELECT COUNT(1) AS n FROM autotrade_trades WHERE opened_ts>=?", (since_ts,))
-            row = cur.fetchone()
-            data_counts['autotrade_opened_24h'] = int((row['n'] if row else 0) or 0)
-            cur.execute("SELECT COUNT(1) AS n FROM autotrade_trades WHERE closed_ts IS NOT NULL AND closed_ts>=?", (since_ts,))
-            row = cur.fetchone()
-            data_counts['autotrade_closed_24h'] = int((row['n'] if row else 0) or 0)
+        txt = await to_thread_bg(_dev_status_text, uid, timeout=max(12, HEAVY_ADMIN_COMMAND_TIMEOUT_SEC))
+        _admin_status_cache_put(cache_name, txt)
+        await send_long_message(update, txt, parse_mode=None)
     except Exception:
-        pass
-
-    exec_from_pipeline_hint = 0
-    try:
-        if int(data_counts.get('exec_24h', 0) or 0) <= 0:
-            hint = _latest_setup_pipeline_event(uid, stage='email_executable_pool', mode='email') or {}
-            try:
-                details = json.loads(str(hint.get('details_json') or '{}')) if hint else {}
-            except Exception:
-                details = {}
-            exec_from_pipeline_hint = int((details or {}).get('persisted') or 0)
-    except Exception:
-        exec_from_pipeline_hint = 0
-    try:
-        if int(data_counts.get('signals_24h', 0) or 0) <= 0 and int(data_counts.get('emailed_24h', 0) or 0) > 0:
-            data_counts['signals_24h'] = int(data_counts.get('emailed_24h', 0) or 0)
-    except Exception:
-        pass
-
-    try:
-        sess_now = str(current_session_name() or '').upper().strip()
-        pipeline_latest['email_latest'] = _latest_setup_pipeline_event(uid, stage='latest', session=sess_now, mode='email') or {}
-        if not pipeline_latest['email_latest']:
-            pipeline_latest['email_latest'] = _latest_setup_pipeline_event(uid, stage='latest', mode='email') or {}
-        pipeline_latest['email_build'] = _latest_setup_pipeline_event(0, stage='build_priority_pool', session=sess_now, mode='email') or {}
-        if not pipeline_latest['email_build']:
-            pipeline_latest['email_build'] = _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or {}
-        pipeline_latest['email_exec'] = _latest_setup_pipeline_event(uid, stage='email_executable_pool', session=sess_now, mode='email') or {}
-        if not pipeline_latest['email_exec']:
-            pipeline_latest['email_exec'] = _latest_setup_pipeline_event(uid, stage='email_executable_pool', mode='email') or {}
-        pipeline_latest['screen_exec'] = _latest_setup_pipeline_event(uid, stage='screen_executable_pool', session=sess_now, mode='screen') or {}
-        if not pipeline_latest['screen_exec']:
-            pipeline_latest['screen_exec'] = _latest_setup_pipeline_event(uid, stage='screen_executable_pool', mode='screen') or {}
-    except Exception:
-        pass
-
-    try:
-        last_email_decision = dict(_LAST_EMAIL_DECISION.get(uid) or {})
-    except Exception:
-        last_email_decision = {}
-
-    def _fmt_pipe(label: str, row: dict) -> str:
-        try:
-            if not row:
-                return f"{label}: -"
-            status = str(row.get('status') or '-')
-            stage = str(row.get('stage') or label)
-            sess = str(row.get('session') or '-').upper()
-            mode = str(row.get('mode') or '-').lower()
-            try:
-                details = json.loads(str(row.get('details_json') or '{}'))
-            except Exception:
-                details = {}
-            parts = []
-            if isinstance(details, dict):
-                for key in ('setups', 'eligible', 'persisted', 'raw_pool'):
-                    if key in details:
-                        parts.append(f"{key}={details.get(key)}")
-                tr = details.get('top_reasons') or details.get('top_exec_rejects') or {}
-                if tr:
-                    try:
-                        k0, v0 = next(iter(tr.items()))
-                        parts.append(f"top={k0}:{v0}")
-                    except Exception:
-                        pass
-                err = details.get('error')
-                if err:
-                    parts.append(str(err))
-            suffix = (' | ' + ' | '.join(parts[:3])) if parts else ''
-            return f"{label}: {stage}/{status} [{mode}:{sess}]{suffix}"
-        except Exception:
-            return f"{label}: -"
-
-    def _fmt_regime(refresh_window: str, sess: str) -> str:
-        snap = _research_latest_regime_snapshot(sess, refresh_window=refresh_window) or {}
-        primary = str(snap.get('primary_regime') or '-').strip() or '-'
-        conf = float(snap.get('confidence') or 0.0)
-        ts = float(snap.get('ts') or 0.0)
-        if refresh_window == 'daily' and primary in {'', '-'}:
-            try:
-                plan = _research_latest_allocator_plan(sess, '') or {}
-            except Exception:
-                plan = {}
-            regime = str(plan.get('regime_cell') or '').strip().upper()
-            if regime:
-                primary = regime
-                conf = max(conf, 0.50)
-                ts = float(plan.get('created_ts') or 0.0)
-            elif not snap:
-                snap4 = _research_latest_regime_snapshot(sess, refresh_window='4h') or {}
-                primary = str(snap4.get('primary_regime') or primary or '-').strip() or '-'
-                conf = max(conf, float(snap4.get('confidence') or 0.0) or 0.0)
-                ts = float(snap4.get('ts') or ts or 0.0)
-        ts_txt = _fmt_dt_local(datetime.fromtimestamp(ts, tz=timezone.utc), '%H:%M') if ts > 0 else '—'
-        return f"{sess}:{primary} ({conf:.2f}) @{ts_txt}"
-
-    def _fmt_plan(sess: str) -> str:
-        plan = _research_latest_allocator_plan(sess, '') or {}
-        active = ','.join(plan.get('active_families_json') or []) if isinstance(plan.get('active_families_json'), list) else ','.join(json.loads(plan.get('active_families_json') or '[]')) if str(plan.get('active_families_json') or '').startswith('[') else ''
-        champ = str(plan.get('champion_family_id') or '-')
-        regime = str(plan.get('regime_cell') or '-')
-        return f"{sess}:{regime} | champion={champ} | active={active or '-'}"
-
-    def _fmt_last_email_decision(row: dict) -> str:
-        try:
-            if not row:
-                return 'Last email decision: -'
-            status = str(row.get('status') or '-').upper()
-            reasons = row.get('reasons') or []
-            reason = str(reasons[0]) if isinstance(reasons, list) and reasons else str(row.get('reason') or '-')
-            when = str(row.get('when') or '-')
-            return f"Last email decision: {status} | {reason} | {when}"
-        except Exception:
-            return 'Last email decision: -'
-
-    goal_ts = float(goal_rep.get('ts', 0.0) or 0.0)
-    goal_ts_txt = _fmt_dt_local(datetime.fromtimestamp(goal_ts, tz=timezone.utc)) if goal_ts > 0 else '—'
-    _goal_final = dict((goal_rep or {}).get('final') or {})
-    m30 = dict(_goal_final.get('metrics_30d') or {})
-    m7 = dict(_goal_final.get('metrics_7d') or {})
-    _goal_status_u = str((goal_rep or {}).get('status') or '').upper().strip()
-    if int(m30.get('setups', 0) or 0) <= 0 and int(m7.get('setups', 0) or 0) <= 0 and _goal_status_u in {'TIMEOUT_NO_BETTER_PROFILE', 'TIMEOUT', 'NO_BETTER_PROFILE', 'TIMEOUT_PROMOTED'}:
-        _last_final = dict((goal_rep or {}).get('last_final') or {})
-        _lf_final = dict(_last_final.get('final') or {})
-        m30 = dict(_lf_final.get('metrics_30d') or m30)
-        m7 = dict(_lf_final.get('metrics_7d') or m7)
-    ad_last = dict(adaptive.get('last_run') or {})
-    ad_last_ts = float(ad_last.get('finished_ts', 0.0) or ad_last.get('started_ts', 0.0) or 0.0)
-    ad_last_txt = _fmt_dt_local(datetime.fromtimestamp(ad_last_ts, tz=timezone.utc)) if ad_last_ts > 0 else '—'
-    current_sessions = ','.join(cfg.get('execution_sessions_allowed') or []) or '-'
-    current_engines = ','.join(cfg.get('execution_engines_allowed') or []) or '-'
-
-    lines = [
-        '🧭 Developer Status',
-        HDR,
-        f"Now: {now_session} | Trading day: {_research_trading_day_label(time.time())}",
-        f"Goal profile: {str(cfg.get('goal_profile_active_profile') or 'BASELINE')} | sessions={current_sessions} | engines={current_engines}",
-        f"Goal scheduler: {'ON' if bool(tgt.get('enabled')) else 'OFF'} | every {float(tgt.get('interval_hours', 24.0) or 24.0):.1f}h | cooldown {float(tgt.get('cooldown_hours', 20.0) or 20.0):.1f}h",
-        f"Goal search space: NY={'ON' if bool(tgt.get('allow_ny')) else 'OFF'} | ASIA={'ON' if bool(tgt.get('allow_asia')) else 'OFF'} | Engine B={'ON' if bool(tgt.get('allow_engine_b')) else 'OFF'}",
-        f"Goal last run: {str(goal_rep.get('status') or '-')} | {goal_ts_txt}",
-        f"Goal 30d: {float(m30.get('setups_per_day', 0.0) or 0.0):.2f}/day | setups={int(m30.get('setups', 0) or 0)} | WR={float(m30.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R', 0.0) or 0.0):.3f}",
-        f"Goal 7d: {float(m7.get('setups_per_day', 0.0) or 0.0):.2f}/day | setups={int(m7.get('setups', 0) or 0)} | WR={float(m7.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R', 0.0) or 0.0):.3f}",
-        SEP,
-        f"Family allocator: {'ON' if _cfg_bool((cfg or {}).get('family_allocator_enabled', True), True) else 'OFF'} | shadow={'ON' if _cfg_bool((cfg or {}).get('family_allocator_shadow_mode', True), True) else 'OFF'} | live_enforce={'ON' if _cfg_bool((cfg or {}).get('family_allocator_enforce_live', False), False) else 'OFF'} | max_active={int((cfg or {}).get('family_allocator_max_active_per_cell', 2) or 2)}",
-        f"Family autotune: {'ON' if _cfg_bool((cfg or {}).get('family_autotune_enabled', True), True) else 'OFF'} | every {float((cfg or {}).get('family_autotune_interval_hours', 6.0) or 6.0):.1f}h | f4_relax(score/conf/rr)={float((cfg or {}).get('family_f4_balance_score_relax', 0.0) or 0.0):.1f}/{int(float((cfg or {}).get('family_f4_balance_conf_relax', 0) or 0))}/{float((cfg or {}).get('family_f4_balance_rr_relax', 0.0) or 0.0):.2f} | last={(load_family_autotune_report() or {}).get('status', '-') }",
-        f"Regime refresh: {'ON' if _cfg_bool((cfg or {}).get('family_regime_refresh_enabled', True), True) else 'OFF'} | every {float((cfg or {}).get('family_regime_refresh_interval_hours', 4.0) or 4.0):.1f}h",
-        'Daily regimes: ' + ' | '.join([_fmt_regime('daily', s) for s in ['ASIA', 'LON', 'NY']]),
-        '4h regimes: ' + ' | '.join([_fmt_regime('4h', s) for s in ['ASIA', 'LON', 'NY']]),
-        'Allocator plans: ' + ' || '.join([_fmt_plan(s) for s in ['ASIA', 'LON', 'NY']]),
-        SEP,
-        f"Adaptive optimizer: {'ON' if bool(adaptive.get('enabled')) else 'OFF'} | every {float(adaptive.get('interval_hours', 24.0) or 24.0):.1f}h | last={str(ad_last.get('status') or '-')}/{ad_last_txt}",
-        f"Data 24h: signals={int(data_counts.get('signals_24h', 0) or 0)} | executable={max(int(data_counts.get('exec_24h', 0) or 0), int(exec_from_pipeline_hint or 0))} | emailed={int(data_counts.get('emailed_24h', 0) or 0)} | pipeline_events={int(data_counts.get('pipeline_events_24h', 0) or 0)} | family_eval_rows_today={max(int(data_counts.get('family_eval_rows_today', 0) or 0), 3 if any(_research_latest_allocator_plan(s, '') for s in ['ASIA','LON','NY']) else 0)} | autotrade_opened={int(data_counts.get('autotrade_opened_24h', 0) or 0)} | autotrade_closed={int(data_counts.get('autotrade_closed_24h', 0) or 0)}",
-        _fmt_pipe('Pipeline latest', pipeline_latest.get('email_latest') or {}),
-        _fmt_pipe('Email build', pipeline_latest.get('email_build') or {}),
-        _fmt_pipe('Email exec', pipeline_latest.get('email_exec') or {}),
-        _fmt_pipe('Screen exec', pipeline_latest.get('screen_exec') or {}),
-        _fmt_last_email_decision(last_email_decision),
-        SEP,
-        f"Email lane: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'} | sent_session={int(email_gate.get('sent_in_session', 0) or 0)} | sent_today={int(email_gate.get('sent_today', 0) or 0)} | recipient={str(email_gate.get('recipient_masked') or '(none)')}",
-    ]
-    gate_reason = ', '.join([str(x) for x in (email_gate.get('gate_reasons') or [])[:4]])
-    if gate_reason:
-        lines.append(f"Email reasons: {gate_reason}")
-    await send_long_message(update, "\n".join(lines), parse_mode=None)
-
+        if cached_txt:
+            await send_long_message(update, cached_txt, parse_mode=None)
+            return
+        await update.message.reply_text('⚠️ Dev-status snapshot is warming up. Run /dev_status again in a few seconds.')
 
 async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Transparent health check:
-    - DB reachable
-    - Exchange tickers reachable
-    - Email configured/enabled status
-    - Cache stats
-    - Blackout status
-    """
-    # DB check
-    db_ok = True
-    db_err = ""
+    """Transparent cached health check for admin diagnostics."""
+    uid = int(update.effective_user.id)
+    cache_name = 'health_sys'
+    cached_txt, is_fresh = _admin_status_cached_text(cache_name, fresh_ttl=HEAVY_ADMIN_CACHE_TTL_SEC, stale_ttl=HEAVY_ADMIN_STALE_TTL_SEC)
+    if cached_txt and (_interactive_runtime_busy() or is_fresh):
+        await send_long_message(update, cached_txt, parse_mode=None)
+        return
     try:
-        con = db_connect()
-        con.execute("SELECT 1")
-        con.close()
-    except Exception as e:
-        db_ok = False
-        db_err = str(e)
-
-    # Exchange check (quick)
-    ex_ok = True
-    ex_err = ""
-    tickers_n = 0
-    t0 = time.time()
-    try:
-        best = await to_thread_heavy(fetch_futures_tickers)
-        tickers_n = len(best or {})
-    except Exception as e:
-        ex_ok = False
-        ex_err = str(e)
-    dt_ms = int((time.time() - t0) * 1000)
-
-    # Cache stats
-    cache_items = len(_CACHE)
-
-    # Email status
-    email_cfg = email_config_ok()
-    email_on = EMAIL_ENABLED
-
-    # Sessions
-    uid = update.effective_user.id
-    user = get_user(uid)
-    enabled = user_enabled_sessions(user)
-    sess = in_session_now(user)
-    # Display the *live market session* (NY/LON/ASIA), not "UNLIMITED" access mode
-    now_s = current_session_utc(datetime.now(timezone.utc)) if int(user.get("sessions_unlimited", 0) or 0) == 1 else (sess["name"] if sess else "NONE")
-
-    # Blackout
-
-    msg = [
-        "🩺 PulseFutures • Health",
-        HDR,
-        f"DB: {'OK' if db_ok else 'FAIL'}" + (f" | {db_err}" if (not db_ok and db_err) else ""),
-        f"Bybit/CCXT: {'OK' if ex_ok else 'FAIL'} | tickers={tickers_n} | {dt_ms}ms" + (f" | {ex_err}" if (not ex_ok and ex_err) else ""),
-        f"Email: enabled={email_on} | configured={email_cfg}",
-        f"Cache: items={cache_items} | tickersTTL={TICKERS_TTL_SEC}s | ohlcvTTL={OHLCV_TTL_SEC}s",
-        HDR,
-        f"Your TZ: {user['tz']}",
-        f"Sessions enabled: {', '.join(enabled)} | Now: {now_s}",
-        f"Limits: emailcap/session={int(user['max_emails_per_session'])} (0=∞), emaildaycap={int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))} (0=∞), gap={int(user['email_gap_min'])}m",
-    ]
-    await update.message.reply_text("\n".join(msg))
+        txt = await to_thread_bg(_health_sys_text, uid, timeout=max(8, HEAVY_ADMIN_COMMAND_TIMEOUT_SEC))
+        _admin_status_cache_put(cache_name, txt)
+        await send_long_message(update, txt, parse_mode=None)
+    except Exception:
+        if cached_txt:
+            await send_long_message(update, cached_txt, parse_mode=None)
+            return
+        await update.message.reply_text('⚠️ Health snapshot is warming up. Run /health_sys again in a few seconds.')
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     # Always log
@@ -37737,6 +37834,9 @@ def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
 
 async def autotrade_exit_guardian_job(context: ContextTypes.DEFAULT_TYPE):
     try:
+        if _interactive_runtime_busy():
+            _hb_touch('autotrade_guardian', ok=True, details='deferred_user_activity')
+            return
         if not _autotrade_ready():
             return
         if str(_autotrade_runtime_mode()).lower() != 'live':
@@ -37753,7 +37853,7 @@ async def autotrade_exit_guardian_job(context: ContextTypes.DEFAULT_TYPE):
 
         async with AUTOTRADE_GUARDIAN_LOCK:
             try:
-                repaired = await to_thread_heavy(
+                repaired = await to_thread_bg(
                     _autotrade_monitor_live_exit_protection,
                     int(uid),
                     timeout=AUTOTRADE_GUARDIAN_TIMEOUT_SEC,
@@ -37789,6 +37889,9 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
     """
     try:
         _hb_touch('autotrade', ok=True, details='job_tick')
+        if _interactive_runtime_busy():
+            _hb_touch('autotrade', ok=True, details='deferred_user_activity')
+            return
         if not _autotrade_ready():
             return
 
@@ -37867,7 +37970,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 remaining_budget = max(4.0, float(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40) - (time.time() - job_started_ts))
                 refresh_timeout = min(12.0, remaining_budget)
                 try:
-                    refreshed = await to_thread_heavy(_autotrade_refresh_owner_executable_pool, uid, sess, 12, timeout=refresh_timeout)
+                    refreshed = await to_thread_bg(_autotrade_refresh_owner_executable_pool, uid, sess, 12, timeout=refresh_timeout)
                 except asyncio.TimeoutError:
                     refreshed = []
                     try:
@@ -37915,7 +38018,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 remaining_budget = max(3.0, float(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40) - (time.time() - job_started_ts))
                 per_candidate_timeout = min(float(AUTOTRADE_JOB_TIMEOUT_SEC or 25), remaining_budget)
                 try:
-                    ok, reason = await to_thread_heavy(
+                    ok, reason = await to_thread_bg(
                         _autotrade_place_trade,
                         uid,
                         sess,
