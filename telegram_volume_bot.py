@@ -7294,6 +7294,7 @@ AUTOTRADE_GUARDIAN_LOCK = asyncio.Lock()
 SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
 AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "25") or 25)
+AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "75") or 75)
 AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "40") or 40)
 AUTOTRADE_GUARDIAN_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_TIMEOUT_SEC", "15") or 15)
 AUTOTRADE_GUARDIAN_INTERVAL_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_INTERVAL_SEC", "150") or 150)
