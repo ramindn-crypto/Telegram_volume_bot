@@ -5268,61 +5268,20 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
 
     if mode == "live":
         try:
-            positions = _bybit_get_open_positions_linear()
+            buckets = _autotrade_live_position_bucket_rows(int(uid), journal_open=journal_open, fallback_unmatched_as_owned=True)
         except Exception:
-            positions = []
-        bot_positions = []
-        for p in (positions or []):
-            tr = _autotrade_live_position_owner_trade(int(uid), p, journal_open=journal_open)
-            if tr:
-                bot_positions.append((p, tr))
-            else:
-                external_open_positions += 1
-                external_open_pnl += float(_pos_unreal_pnl(p) or 0.0)
-                external_open_risk += max(0.0, float(_estimate_position_risk_usd(p) or 0.0))
-
-        open_positions_now = len(bot_positions)
-        open_pnl = float(sum(_pos_unreal_pnl(p) for p, _tr in bot_positions) or 0.0) if bot_positions else 0.0
-
-        for p, matched_trade in bot_positions:
-            est = float(_estimate_position_risk_usd(p) or 0.0)
-            info = _autotrade_resolve_live_position_open_info(int(uid), p, journal_open=[matched_trade] if matched_trade else journal_open)
-            opened_ts = float(info.get('opened_ts') or float(matched_trade.get('opened_ts') or 0.0) or 0.0)
-            psym = _pos_symbol(p)
-            pside = _pos_side_text(p)
-            if est <= 0:
-                try:
-                    est = float(_autotrade_estimated_risk_usd(float(matched_trade.get('entry') or 0.0), float(matched_trade.get('sl') or 0.0), float(matched_trade.get('qty') or 0.0)) or 0.0)
-                except Exception:
-                    pass
-            est = max(0.0, float(est or 0.0))
-            current_total_open_risk += est
-
-            if opened_ts > 0 and opened_ts < start_ts:
-                bucket = 'carried'
-                carried_open_risk += est
-                inherited_open_positions += 1
-            else:
-                bucket = 'current_day'
-                current_day_open_risk += est
-
-            position_classifications.append({
-                'symbol': psym,
-                'side': pside,
-                'risk': float(est),
-                'opened_ts': float(opened_ts or 0.0),
-                'bucket': bucket,
-                'source': str(info.get('source') or 'autotrade_journal'),
-                'journal_ts': float(info.get('journal_ts') or float(matched_trade.get('opened_ts') or 0.0) or 0.0),
-                'position_created_ts': float(info.get('position_created_ts') or 0.0),
-                'exchange_order_ts': float(info.get('exchange_order_ts') or 0.0),
-                'notes': str(info.get('notes') or ''),
-            })
-        inherited_open_positions = min(int(inherited_open_positions), int(open_positions_now))
+            buckets = {}
+        open_positions_now = int(buckets.get('open_positions_now') or 0)
+        open_pnl = float(buckets.get('open_pnl') or 0.0)
+        current_total_open_risk = float(buckets.get('current_total_open_risk') or 0.0)
+        current_day_open_risk = float(buckets.get('current_day_open_risk') or 0.0)
+        carried_open_risk = float(buckets.get('carried_open_risk') or 0.0)
+        inherited_open_positions = int(buckets.get('inherited_open_positions') or 0)
+        position_classifications = list(buckets.get('position_classifications') or [])
+        external_open_positions = int(buckets.get('external_open_positions') or 0)
+        external_open_risk = float(buckets.get('external_open_risk') or 0.0)
+        external_open_pnl = float(buckets.get('external_open_pnl') or 0.0)
         current_day_open_positions = max(0, int(open_positions_now) - int(inherited_open_positions))
-        # Live day-cap accounting should charge only bot positions opened inside the current
-        # anchored trading day. Manual/external positions are shown separately and must not
-        # consume AutoTrade day budget.
         live_open_risk_charged_today = float(current_day_open_risk)
         opened_today_count = max(int(opened_today_count), int(current_day_open_positions))
         opened_today_count = max(int(opened_today_count), int(closed_today_count) + int(current_day_open_positions))
@@ -6390,7 +6349,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         cur = con.cursor()
         cur.execute(
             """
-            SELECT x.*, COALESCE(MAX(e.emailed_ts), 0) AS emailed_ts
+            SELECT x.*, COALESCE(e.emailed_ts, 0) AS emailed_ts
             FROM executable_setups x
             LEFT JOIN emailed_setups e
                    ON e.user_id = x.user_id
@@ -6400,11 +6359,10 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
               AND x.executable_ts >= ?
               AND (? = '' OR UPPER(COALESCE(x.session, '')) = ?)
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-            GROUP BY x.user_id, x.setup_id
             ORDER BY x.executable_ts DESC, x.setup_id DESC
             LIMIT ?
             """,
-            (int(uid), float(cutoff), req_session_u, req_session_u, int(max(limit * 6, limit))),
+            (int(uid), float(cutoff), req_session_u, req_session_u, int(max(limit * 4, limit))),
         )
         rows = [dict(r) for r in (cur.fetchall() or [])]
         con.close()
@@ -6508,6 +6466,22 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         return []
 
 
+
+
+def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
+    cache_key = f"autotrade_db_setups:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    ttl_i = max(3, int(ttl or 15))
+    try:
+        if (not force_refresh) and cache_valid(cache_key, ttl_i):
+            cached = cache_get(cache_key)
+            if isinstance(cached, list):
+                return list(cached)
+        out = _autotrade_select_db_setups(int(uid), session_label, lookback_hours=int(lookback_hours or 12), limit=int(limit or 1))
+        cache_set(cache_key, list(out or []))
+        return list(out or [])
+    except Exception:
+        stale = cache_get(cache_key)
+        return list(stale or []) if isinstance(stale, list) else []
 def _autotrade_refresh_owner_executable_pool(uid: int, session_label: str, lookback_hours: int = 12) -> list:
     """Best-effort self-refresh of the owner's executable pool.
 
@@ -10338,6 +10312,7 @@ def db_init():
                 x_cols.add(_col)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_executable_setups_uid_ts ON executable_setups(user_id, executable_ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_executable_setups_uid_session_ts ON executable_setups(user_id, session, executable_ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_emailed_setups_uid_setup_ts ON emailed_setups(user_id, setup_id, emailed_ts)")
     except Exception:
         pass
 
@@ -10411,6 +10386,11 @@ def db_init():
         note TEXT
     )
     """)
+
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_outcomes_setup_outcome ON signal_outcomes(setup_id, outcome)")
+    except Exception:
+        pass
 
     # Add new columns for best TP tracking (backward-compatible)
     try:
@@ -12166,57 +12146,19 @@ def _autotrade_day_risk_metrics_quick(uid: int, equity: float) -> dict:
 
     if mode == 'live':
         try:
-            positions = _bybit_get_open_positions_linear()
+            buckets = _autotrade_live_position_bucket_rows(int(uid), journal_open=journal_open, fallback_unmatched_as_owned=True)
         except Exception:
-            positions = []
-        bot_positions = []
-        for p in (positions or []):
-            tr = _autotrade_live_position_owner_trade(int(uid), p, journal_open=journal_open)
-            if tr:
-                bot_positions.append((p, tr))
-            else:
-                external_open_positions += 1
-                external_open_pnl += float(_pos_unreal_pnl(p) or 0.0)
-                external_open_risk += max(0.0, float(_estimate_position_risk_usd(p) or 0.0))
-
-        open_positions_now = len(bot_positions)
-        open_pnl = float(sum(_pos_unreal_pnl(p) for p, _tr in bot_positions) or 0.0) if bot_positions else 0.0
-
-        for p, matched_trade in bot_positions:
-            est = float(_estimate_position_risk_usd(p) or 0.0)
-            opened_ts = float(matched_trade.get('opened_ts') or 0.0)
-            if opened_ts <= 0:
-                try:
-                    opened_ts = float(_ts_seconds_from_any((p or {}).get('createdTime') or (p or {}).get('created_time')) or 0.0)
-                except Exception:
-                    opened_ts = 0.0
-            psym = _pos_symbol(p)
-            pside = _pos_side_text(p)
-            if est <= 0:
-                try:
-                    est = float(_autotrade_estimated_risk_usd(float(matched_trade.get('entry') or 0.0), float(matched_trade.get('sl') or 0.0), float(matched_trade.get('qty') or 0.0)) or 0.0)
-                except Exception:
-                    pass
-            est = max(0.0, float(est or 0.0))
-            current_total_open_risk += est
-
-            if opened_ts > 0 and opened_ts < start_ts:
-                bucket = 'carried'
-                carried_open_risk += est
-                inherited_open_positions += 1
-            else:
-                bucket = 'current_day'
-                current_day_open_risk += est
-
-            position_classifications.append({
-                'symbol': psym,
-                'side': pside,
-                'risk': float(est),
-                'opened_ts': float(opened_ts or 0.0),
-                'bucket': bucket,
-                'source': 'autotrade_journal',
-            })
-        inherited_open_positions = min(int(inherited_open_positions), int(open_positions_now))
+            buckets = {}
+        open_positions_now = int(buckets.get('open_positions_now') or 0)
+        open_pnl = float(buckets.get('open_pnl') or 0.0)
+        current_total_open_risk = float(buckets.get('current_total_open_risk') or 0.0)
+        current_day_open_risk = float(buckets.get('current_day_open_risk') or 0.0)
+        carried_open_risk = float(buckets.get('carried_open_risk') or 0.0)
+        inherited_open_positions = int(buckets.get('inherited_open_positions') or 0)
+        position_classifications = list(buckets.get('position_classifications') or [])
+        external_open_positions = int(buckets.get('external_open_positions') or 0)
+        external_open_risk = float(buckets.get('external_open_risk') or 0.0)
+        external_open_pnl = float(buckets.get('external_open_pnl') or 0.0)
         current_day_open_positions = max(0, int(open_positions_now) - int(inherited_open_positions))
         live_open_risk_charged_today = float(current_day_open_risk)
         opened_today_count = max(int(opened_today_count), int(closed_today_count) + int(current_day_open_positions))
@@ -32416,6 +32358,229 @@ def _autotrade_live_position_owner_trade(uid: int, live_pos: dict, journal_open:
         pass
     return {}
 
+
+def _autotrade_trade_public_ident(trade_row: dict) -> str:
+    """Best-effort public identifier for autotrade/manual status lines."""
+    try:
+        row = dict(trade_row or {})
+    except Exception:
+        row = {}
+    for key in ('setup_id', 'trade_id', 'public_id'):
+        try:
+            val = str(row.get(key) or '').strip()
+        except Exception:
+            val = ''
+        if not val:
+            continue
+        if key == 'trade_id' and val.startswith(('exchange::', 'report::', 'prov::', 'manual::', 'AT-LIVE-')):
+            continue
+        return val
+    return '-'
+
+
+def _autotrade_synthetic_live_trade_row(uid: int, live_pos: dict) -> dict:
+    """Synthetic owner row for live Bybit positions when journal linkage is missing.
+
+    This keeps admin AutoTrade views authoritative even if the OPEN journal row was lost
+    after the exchange entry succeeded.
+    """
+    try:
+        sym = str(_pos_symbol(live_pos) or '').upper().strip()
+        side = str(_pos_side_text(live_pos) or '').upper().strip()
+        if not sym or side not in {'BUY', 'SELL'}:
+            return {}
+        live_entry = float(_pos_entry(live_pos) or 0.0)
+        live_qty = abs(float(_pos_size(live_pos) or 0.0))
+        current_sl = float(_pos_stop(live_pos) or _bybit_detect_open_sl_price(sym, side=side) or 0.0)
+        visible_tps = _autotrade_visible_tp_targets(sym, side)
+        current_tp = float((visible_tps[0] if visible_tps else 0.0) or _pos_take_profit(live_pos) or 0.0)
+        info = _autotrade_resolve_live_position_open_info(int(uid), live_pos, journal_open=[])
+        opened_ts = float(info.get('opened_ts') or _ts_seconds_from_any((live_pos or {}).get('createdTime') or (live_pos or {}).get('created_time')) or time.time())
+        payload = {}
+        life_trade_id = ''
+        life_setup_id = ''
+        life_session = ''
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                row = cur.execute(
+                    """SELECT * FROM admin_setup_lifecycle
+                       WHERE uid=? AND UPPER(COALESCE(symbol,''))=? AND UPPER(COALESCE(side,''))=?
+                       ORDER BY COALESCE(executed_ts, attempted_ts, executable_ts, emailed_ts, signal_created_ts, generated_logged_ts, 0) DESC
+                       LIMIT 1""",
+                    (int(uid), sym, side),
+                ).fetchone()
+                life = dict(row) if row else {}
+        except Exception:
+            life = {}
+        try:
+            life_trade_id = str((life or {}).get('trade_id') or '').strip()
+            life_setup_id = str((life or {}).get('setup_id') or '').strip()
+            life_session = str((life or {}).get('session') or '').strip()
+            if life_setup_id:
+                payload = _signal_setup_eval_payload(life_setup_id) or {}
+        except Exception:
+            payload = {}
+        payload_sl = float((payload or {}).get('sl') or 0.0)
+        payload_tp = float(_resolve_single_tp(float((payload or {}).get('entry') or live_entry or 0.0), payload_sl, (payload or {}).get('tp'), (payload or {}).get('alt_target_a'), (payload or {}).get('alt_target_b'), side) or 0.0)
+        row = {
+            'trade_id': life_trade_id or f'AT-LIVE-{sym}-{side}',
+            'setup_id': life_setup_id,
+            'opened_ts': float(opened_ts or 0.0),
+            'session': life_session,
+            'symbol': sym,
+            'side': side,
+            'entry': float(live_entry or float((payload or {}).get('entry') or 0.0) or 0.0),
+            'sl': float(current_sl or payload_sl or 0.0),
+            'tp': float(current_tp or payload_tp or 0.0),
+            'alt_target_a': 0.0,
+            'alt_target_b': 0.0,
+            'qty': float(live_qty or 0.0),
+            'conf': int((payload or {}).get('conf') or 0),
+            'quality_score': float((payload or {}).get('quality_score') or 0.0),
+            'atr_pct': float((payload or {}).get('atr_pct') or 0.0),
+            'engine': str((payload or {}).get('engine') or ''),
+            'status': 'OPEN',
+            'note': 'synthetic_live_position_owner_fallback',
+        }
+        return row
+    except Exception:
+        return {}
+
+
+def _autotrade_collect_live_position_rows(uid: int, positions: list[dict] | None = None, journal_open: list[dict] | None = None, fallback_unmatched_as_owned: bool = True) -> tuple[list[tuple[dict, dict]], list[dict], list[dict]]:
+    """Classify live Bybit positions into bot-owned rows plus any unmatched leftovers."""
+    try:
+        pos_rows = list(positions or _bybit_get_open_positions_linear() or [])
+    except Exception:
+        pos_rows = []
+    try:
+        open_rows = [dict(r) for r in (journal_open or _autotrade_db_open_trades(int(uid)) or [])]
+    except Exception:
+        open_rows = []
+    bot_positions: list[tuple[dict, dict]] = []
+    external_positions: list[dict] = []
+    for p in (pos_rows or []):
+        tr = _autotrade_live_position_owner_trade(int(uid), p, journal_open=open_rows)
+        if not tr and fallback_unmatched_as_owned:
+            tr = _autotrade_synthetic_live_trade_row(int(uid), p)
+        if tr:
+            bot_positions.append((p, dict(tr)))
+        else:
+            external_positions.append(p)
+    return bot_positions, external_positions, open_rows
+
+
+def _autotrade_live_position_bucket_rows(uid: int, positions: list[dict] | None = None, journal_open: list[dict] | None = None, fallback_unmatched_as_owned: bool = True) -> dict:
+    """Shared live-position bucketing for AutoTrade metrics and admin views."""
+    bot_positions, external_positions, open_rows = _autotrade_collect_live_position_rows(
+        int(uid), positions=positions, journal_open=journal_open, fallback_unmatched_as_owned=fallback_unmatched_as_owned
+    )
+    current_total_open_risk = 0.0
+    current_day_open_risk = 0.0
+    carried_open_risk = 0.0
+    inherited_open_positions = 0
+    position_classifications = []
+    open_pnl = 0.0
+    external_open_risk = 0.0
+    external_open_pnl = 0.0
+    open_positions_now = len(bot_positions)
+    user = _autotrade_user_settings(int(uid))
+    start_utc, _end_utc = _admin_today_window_utc(uid=int(uid), user=user)
+    start_ts = float(start_utc.timestamp())
+    for p, matched_trade in (bot_positions or []):
+        est = float(_estimate_position_risk_usd(p) or 0.0)
+        info = _autotrade_resolve_live_position_open_info(int(uid), p, journal_open=[matched_trade] if matched_trade else open_rows)
+        opened_ts = float(info.get('opened_ts') or float((matched_trade or {}).get('opened_ts') or 0.0) or 0.0)
+        psym = _pos_symbol(p)
+        pside = _pos_side_text(p)
+        if est <= 0:
+            try:
+                est = float(_autotrade_estimated_risk_usd(float((matched_trade or {}).get('entry') or 0.0), float((matched_trade or {}).get('sl') or 0.0), float((matched_trade or {}).get('qty') or 0.0)) or 0.0)
+            except Exception:
+                pass
+        est = max(0.0, float(est or 0.0))
+        current_total_open_risk += est
+        open_pnl += float(_pos_unreal_pnl(p) or 0.0)
+        if opened_ts > 0 and opened_ts < start_ts:
+            bucket = 'carried'
+            carried_open_risk += est
+            inherited_open_positions += 1
+        else:
+            bucket = 'current_day'
+            current_day_open_risk += est
+        position_classifications.append({
+            'symbol': psym,
+            'side': pside,
+            'risk': float(est),
+            'opened_ts': float(opened_ts or 0.0),
+            'bucket': bucket,
+            'source': str(info.get('source') or ('synthetic_live_position_owner_fallback' if str((matched_trade or {}).get('note') or '').strip() == 'synthetic_live_position_owner_fallback' else 'autotrade_journal')),
+            'journal_ts': float(info.get('journal_ts') or float((matched_trade or {}).get('opened_ts') or 0.0) or 0.0),
+            'position_created_ts': float(info.get('position_created_ts') or 0.0),
+            'exchange_order_ts': float(info.get('exchange_order_ts') or 0.0),
+            'notes': str(info.get('notes') or ''),
+        })
+    for p in (external_positions or []):
+        external_open_pnl += float(_pos_unreal_pnl(p) or 0.0)
+        external_open_risk += max(0.0, float(_estimate_position_risk_usd(p) or 0.0))
+    return {
+        'bot_positions': list(bot_positions or []),
+        'external_positions': list(external_positions or []),
+        'journal_open': list(open_rows or []),
+        'open_positions_now': int(open_positions_now),
+        'open_pnl': float(open_pnl),
+        'current_total_open_risk': float(current_total_open_risk),
+        'current_day_open_risk': float(current_day_open_risk),
+        'carried_open_risk': float(carried_open_risk),
+        'inherited_open_positions': int(min(int(inherited_open_positions), int(open_positions_now))),
+        'position_classifications': list(position_classifications or []),
+        'external_open_positions': int(len(external_positions or [])),
+        'external_open_risk': float(external_open_risk),
+        'external_open_pnl': float(external_open_pnl),
+    }
+
+
+def _autotrade_render_open_position_compact_line(trade_row: dict, live_pos: dict | None = None, index: int | None = None) -> str:
+    try:
+        row = dict(trade_row or {})
+    except Exception:
+        row = {}
+    prefix = f"{int(index)}) " if index is not None else "• "
+    sym = str(row.get('symbol') or (_pos_symbol(live_pos) if live_pos else '') or '?').upper()
+    side = str(row.get('side') or (_pos_side_text(live_pos) if live_pos else '') or '?').upper()
+    ident = _autotrade_trade_public_ident(row)
+    risk_usd = 0.0
+    try:
+        if live_pos is not None:
+            risk_usd = float(_estimate_position_risk_usd(live_pos) or 0.0)
+        if risk_usd <= 0:
+            risk_usd = float(_autotrade_estimated_risk_usd(float(row.get('entry') or 0.0), float(row.get('sl') or 0.0), float(row.get('qty') or 0.0)) or 0.0)
+    except Exception:
+        risk_usd = 0.0
+    out = f"{prefix}Trade ID {ident} | {sym} {side} | Risk ${float(risk_usd or 0.0):.2f}"
+    try:
+        if live_pos is not None:
+            out += f" | PnL {float(_pos_unreal_pnl(live_pos) or 0.0):+.2f} USDT"
+    except Exception:
+        pass
+    return out
+
+
+def _manual_open_trade_compact_line(t: dict) -> str:
+    public_id = t.get('public_id')
+    tid_txt = '-'
+    try:
+        if public_id is not None and str(public_id).strip() != '':
+            tid_txt = str(int(public_id))
+    except Exception:
+        try:
+            tid_txt = str(public_id)
+        except Exception:
+            tid_txt = '-'
+    return f"• Trade ID {tid_txt} | {t.get('symbol')} {t.get('side')} | Risk ${float(t.get('risk_usd') or 0.0):.2f}"
+
 def _autotrade_live_position_status(uid: int, live_pos: dict, trade_row: dict | None = None, lifecycle_row: dict | None = None, open_orders: list[dict] | None = None) -> dict:
     sym = _bybit_linear_symbol(_pos_symbol(live_pos))
     side = str(_pos_side_text(live_pos) or '').upper().strip()
@@ -32545,43 +32710,20 @@ def _autotrade_report_friendly_close_reason(row: dict) -> str:
 def _autotrade_render_closed_lifecycle_row_compact(row: dict, index: int | None = None) -> list[str]:
     sym = str(row.get('symbol') or '?')
     side = str(row.get('side') or '?')
-    result_txt = str(row.get('result_label') or row.get('result_path') or '—')
     try:
         pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
     except Exception:
         pnl = 0.0
-    trade_id = str(row.get('trade_id') or '').strip()
-    setup_id = str(row.get('setup_id') or '').strip()
     label = f"{int(index)}) " if index is not None else "• "
     header = f"{label}{side} {sym}"
-    public_ident = ''
-    if setup_id:
-        public_ident = setup_id
-    elif trade_id and not trade_id.startswith(('exchange::', 'report::', 'prov::', 'manual::')):
-        public_ident = trade_id
-    if public_ident:
-        header += f" | {public_ident}"
     lines = [header]
-    lines.append(
-        f"   • Entry: {fmt_price(float(row.get('entry') or 0.0)) if float(row.get('entry') or 0.0) > 0 else '—'} | Result: {result_txt} | PnL: {pnl:+.2f} USDT | R: {_trade_lifecycle_fmt_value(row.get('r_multiple'), '.2f')}"
-    )
-    lines.append(
-        f"   • SL: {fmt_price(float(row.get('sl') or 0.0)) if float(row.get('sl') or 0.0) > 0 else '—'} | Hit: {_autotrade_checkbox(float(row.get('sl_hit_ts') or 0.0) > 0)}"
-    )
-    tp_val = _resolve_single_tp(float(row.get('entry') or 0.0), float(row.get('sl') or 0.0), row.get('tp'), row.get('alt_target_a'), row.get('alt_target_b'), str(row.get('side') or ''))
-    tp_hit = bool(float(row.get('tp_hit_ts') or 0.0) > 0 or float(row.get('alt_target_a_hit_ts') or 0.0) > 0)
-    lines.append(
-        f"   • TP: {fmt_price(float(tp_val or 0.0)) if float(tp_val or 0.0) > 0 else '—'} | Hit: {_autotrade_checkbox(tp_hit)}"
-    )
-    lines.append(
-        f"   • Close reason: {_autotrade_report_friendly_close_reason(row)}"
-    )
     if float(row.get('opened_ts') or 0.0) > 0:
         lines.append(f"   • Opened: {_trade_lifecycle_time_text(float(row.get('opened_ts') or 0.0))}")
+    lines.append(f"   • Close reason: {_autotrade_report_friendly_close_reason(row)}")
     if float(row.get('closed_ts') or 0.0) > 0:
         lines.append(f"   • Closed: {_trade_lifecycle_time_text(float(row.get('closed_ts') or 0.0))}")
+    lines.append(f"   • PnL: {pnl:+.2f} USDT")
     return lines
-
 
 def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float, lookback_h: int = 24, limit: int = 80) -> list[dict]:
     owner_uid = int(owner_uid)
@@ -32835,49 +32977,22 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         pass
 
     _autotrade_migrate_tables()
-
-    # Keep report requests lightweight. The report path must stay read-only and fast on Render.
-
     lines = ["📒 AutoTrade Journal", HDR, f"Window: last {lookback_h}h (Melbourne)"]
 
     open_positions = _bybit_get_open_positions_linear() if str(_autotrade_runtime_mode()).lower() == 'live' else []
-    journal_open = []
-    try:
-        journal_open = _autotrade_db_open_trades(owner_uid) or []
-    except Exception:
-        journal_open = []
-    bot_positions = []
-    external_positions = []
-    for p in (open_positions or []):
-        tr = _autotrade_live_position_owner_trade(owner_uid, p, journal_open=journal_open)
-        if tr:
-            bot_positions.append((p, tr))
-        else:
-            external_positions.append(p)
+    bot_positions, external_positions, _journal_open = _autotrade_collect_live_position_rows(owner_uid, positions=open_positions, fallback_unmatched_as_owned=True)
 
     lines.extend([SEP, 'Open positions'])
     if not bot_positions:
         lines.append('• None')
     else:
         total_u = 0.0
-        total_risk = 0.0
-        open_order_cache = {}
         for i, (p, tr) in enumerate(bot_positions, 1):
-            sym = _bybit_linear_symbol(_pos_symbol(p))
-            if sym not in open_order_cache:
-                try:
-                    open_order_cache[sym] = _bybit_get_open_orders_linear(sym) or []
-                except Exception:
-                    open_order_cache[sym] = []
-            snap = _autotrade_live_position_status(owner_uid, p, trade_row=tr, open_orders=open_order_cache.get(sym) or [])
-            total_u += float(snap.get('pnl') or 0.0)
-            total_risk += float(snap.get('risk_est') or 0.0)
-            lines.extend(_autotrade_render_live_position_snapshot(snap, index=i))
-            if i != len(bot_positions):
-                lines.append(SEP)
-        lines.append(f"Total open PnL: {total_u:+.2f} USDT | Total risk est: {total_risk:.2f} USDT")
+            total_u += float(_pos_unreal_pnl(p) or 0.0)
+            lines.append(_autotrade_render_open_position_compact_line(tr, live_pos=p, index=i))
+        lines.append(f"Total open PnL: {total_u:+.2f} USDT")
     if external_positions:
-        lines.append(f"Ignored manual/external live positions: {len(external_positions)}")
+        lines.append(f"Ignored unmatched live positions: {len(external_positions)}")
 
     lines.extend([SEP, 'Closed positions'])
     now_ts = float(time.time())
@@ -32911,7 +33026,6 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     except Exception:
         pass
     return out
-
 
 def _autotrade_report_overall_text_cached(owner: int) -> str:
     owner = int(owner)
@@ -33302,10 +33416,10 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     exec_recent = 0
     emailed_recent = 0
+    since_ts = time.time() - 12 * 3600
     try:
         con = db_connect()
         cur = con.cursor()
-        since_ts = time.time() - 12 * 3600
         cur.execute("SELECT COUNT(1) AS n FROM executable_setups WHERE user_id IN (?,0) AND executable_ts>=?", (int(owner), float(since_ts)))
         row = cur.fetchone()
         exec_recent = int((row or {}).get('n', 0) or 0)
@@ -33329,7 +33443,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Daily cap (AT): {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
         f"Opened today (AT): {int(snap.get('positions_opened_today', 0) or 0)} | Closed today (AT): {int(snap.get('positions_closed_today', 0) or 0)} | Open now (AT): {int(snap.get('open_positions_now', 0) or 0)}",
         f"Open risk now (AT): ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
-        (f"Ignored manual/external positions (AT): {int(snap.get('external_open_positions', 0) or 0)} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
+        (f"Ignored unmatched live positions (AT): {int(snap.get('external_open_positions', 0) or 0)} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
         f"Realised net today (AT): ${float(snap.get('pnl_today') or 0.0):+.2f}",
         f"Daily risk used (AT) (open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
         ('Daily risk remaining (AT): ∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f"Daily risk remaining (AT): ${float(snap.get('remaining_today')):.2f}"),
@@ -33377,77 +33491,80 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         for row in class_rows[:10]:
             bucket = str(row.get('bucket') or '').strip() or 'current_day'
             lines.append(f"• {row.get('symbol')} | {row.get('side')} | {bucket}")
+
+    try:
+        bot_positions, _external_positions, _journal_open = _autotrade_collect_live_position_rows(owner, fallback_unmatched_as_owned=True)
+    except Exception:
+        bot_positions, _external_positions, _journal_open = [], [], []
+    lines.extend([SEP, f"Open AutoTrade Positions: {len(bot_positions)}"])
+    if not bot_positions:
+        lines.append('• None')
+    else:
+        for p, tr in bot_positions[:12]:
+            lines.append(_autotrade_render_open_position_compact_line(tr, live_pos=p))
+
     lines = [str(ln) for ln in lines if ln is not None and str(ln) != '']
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show all open Bybit positions (admin only) with explicit SL / TP state."""
+    """Show open positions. Admin sees AutoTrade live + manual journal; others see manual only."""
     uid = update.effective_user.id
-    if not is_admin_user(uid):
-        await update.message.reply_text("⛔️ Admin only.")
-        return
-
-    if str(_autotrade_runtime_mode()).lower() != "live":
-        await update.message.reply_text("AutoTrade is not in LIVE mode. No live positions to display.")
-        return
-
-    owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-    try:
-        _autotrade_monitor_live_exit_protection(owner_uid)
-    except Exception:
-        pass
-    try:
-        _trade_lifecycle_sync(owner_uid, days=7, force=False)
-    except Exception:
-        pass
-
-    positions = _bybit_get_open_positions_linear()
-    if not positions:
-        await update.message.reply_text("✅ No open positions found.")
-        return
+    is_admin = is_admin_user(uid)
 
     lines: list[str] = []
     lines.append("📌 Open Positions (Bybit)")
     lines.append(HDR)
 
-    total_pnl = 0.0
-    total_risk = 0.0
-    journal_open = []
-    try:
-        journal_open = _autotrade_db_open_trades(owner_uid) or []
-    except Exception:
-        journal_open = []
-    bot_positions = []
-    external_positions = []
-    for p in (positions or []):
-        tr = _autotrade_live_position_owner_trade(owner_uid, p, journal_open=journal_open)
-        if tr:
-            bot_positions.append((p, tr))
+    if is_admin:
+        owner_uid = int(AUTOTRADE_OWNER_UID or uid)
+        if str(_autotrade_runtime_mode()).lower() == "live":
+            try:
+                _autotrade_monitor_live_exit_protection(owner_uid)
+            except Exception:
+                pass
+            try:
+                _trade_lifecycle_sync(owner_uid, days=7, force=False)
+            except Exception:
+                pass
+            positions = _bybit_get_open_positions_linear() or []
+            bot_positions, external_positions, _journal_open = _autotrade_collect_live_position_rows(owner_uid, positions=positions, fallback_unmatched_as_owned=True)
         else:
-            external_positions.append(p)
+            bot_positions, external_positions = [], []
 
-    lines.append('AutoTrade-owned positions')
-    if not bot_positions:
-        lines.append('• None')
+        total_pnl = 0.0
+        total_risk = 0.0
+        lines.append('AutoTrade-owned positions')
+        if not bot_positions:
+            lines.append('• None')
+        else:
+            for p, tr in bot_positions:
+                total_pnl += float(_pos_unreal_pnl(p) or 0.0)
+                total_risk += max(0.0, float(_estimate_position_risk_usd(p) or 0.0))
+                lines.append(_autotrade_render_open_position_compact_line(tr, live_pos=p))
+            lines.append(SEP)
+            lines.append(f"AutoTrade unrealised PnL: {total_pnl:+.2f} USDT")
+            lines.append(f"AutoTrade risk est: {total_risk:.2f} USDT")
+
+        manual_opens = db_open_trades(uid)
+        lines.extend([SEP, f"Manual positions: {len(manual_opens)}"])
+        if not manual_opens:
+            lines.append('• None')
+        else:
+            for t in manual_opens[:12]:
+                lines.append(_manual_open_trade_compact_line(t))
+
+        if external_positions:
+            lines.extend([SEP, f"Unmatched live positions: {len(external_positions)}"])
+            for p in external_positions[:12]:
+                lines.append(f"• {_pos_side_text(p)} {_pos_symbol(p)} | PnL {_pos_unreal_pnl(p):+.2f} USDT")
     else:
-        for i, (p, tr) in enumerate(bot_positions, 1):
-            snap = _autotrade_live_position_status(owner_uid, p, trade_row=tr)
-            total_pnl += float(snap.get('pnl') or 0.0)
-            total_risk += float(snap.get('risk_est') or 0.0)
-            lines.extend(_autotrade_render_live_position_snapshot(snap, index=i))
-            ut = p.get("updatedTime") or p.get("updated_time") or ""
-            if ut:
-                lines.append(f"   • Updated: {_ms_to_local_str(ut)}")
-            if i != len(bot_positions):
-                lines.append(SEP)
-    if external_positions:
-        lines.extend([SEP, f"Manual / external positions (ignored by AutoTrade risk): {len(external_positions)}"])
-        for p in external_positions[:12]:
-            lines.append(f"• {_pos_side_text(p)} {_pos_symbol(p)} | PnL {_pos_unreal_pnl(p):+.2f} USDT")
-
-    lines.append(HDR)
-    lines.append(f"AutoTrade unrealised PnL: {total_pnl:+.2f} USDT")
-    lines.append(f"AutoTrade risk est: {total_risk:.2f} USDT")
+        manual_opens = db_open_trades(uid)
+        lines.append('Manual positions')
+        if not manual_opens:
+            lines.append('• None')
+        else:
+            for t in manual_opens[:12]:
+                lines.append(_manual_open_trade_compact_line(t))
 
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
@@ -38089,7 +38206,21 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            db_setups = await to_thread_fast(_autotrade_select_db_setups, uid, sess, lookback_hours=12, limit=5, timeout=8)
+
+            try:
+                db_setups = await to_thread_bg(_autotrade_select_db_setups_cached, uid, sess, lookback_hours=12, limit=5, timeout=6)
+            except asyncio.TimeoutError:
+                db_setups = _autotrade_select_db_setups_cached(uid, sess, lookback_hours=12, limit=5, ttl=45)
+                try:
+                    db_log_setup_pipeline_event(uid, stage='autotrade_exec_select', status='timeout', session=str(sess or ''), mode='autotrade', details={'timeout_sec': 6})
+                except Exception:
+                    pass
+            except Exception as e:
+                db_setups = _autotrade_select_db_setups_cached(uid, sess, lookback_hours=12, limit=5, ttl=45)
+                try:
+                    db_log_setup_pipeline_event(uid, stage='autotrade_exec_select', status='error', session=str(sess or ''), mode='autotrade', details={'error': f'{type(e).__name__}: {e}'})
+                except Exception:
+                    pass
             tf_cooling = _ohlcv_timeframe_cooling('15m', '1h', '4h')
             if not db_setups and tf_cooling:
                 reason = 'autotrade_refresh_deferred_rate_limit_cooldown'
