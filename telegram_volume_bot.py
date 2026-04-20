@@ -1425,7 +1425,7 @@ SETUPS_N = 8
 EMAIL_SETUPS_N = 4
 
 # ✅ Global setup quality floor (Premium & Selective)
-MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "74"))
+MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "76"))
 
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
 MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
@@ -1436,8 +1436,8 @@ MIN_RR_TP = MIN_RR_FINAL  # legacy compatibility only; live model uses TP as fin
 EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
 
 # ✅ /screen scan breadth + loosened trigger only for screen (NOT email)
-SCREEN_UNIVERSE_N = 140          # widened universe for better throughput without disabling quality gates
-SCREEN_TRIGGER_LOOSEN = 0.78    # looser trigger to support 8–12 setups/day target
+SCREEN_UNIVERSE_N = 100          # widened universe for better throughput without disabling quality gates
+SCREEN_TRIGGER_LOOSEN = 0.82    # 15% easier trigger on /screen only
 SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
 SCREEN_WAITING_N = 10
 
@@ -1503,7 +1503,7 @@ def _strategy_config_defaults() -> dict:
     return {
         # Universe / liquidity
         "min_fut_vol_usd": float(MIN_FUT_VOL_USD),
-        "universe_top_n": int(140),
+        "universe_top_n": int(120),
 
         # Execution timeframes (matrix is used by /optimize; live uses exec_tf_default unless overridden)
         "exec_tf_default": "15m",
@@ -1548,8 +1548,8 @@ def _strategy_config_defaults() -> dict:
         "score_w_smf": 0.01,
 
         # Frequency targeting (used in /optimize objective)
-        "target_setups_per_day_lo": 8.0,
-        "target_setups_per_day_hi": 12.0,
+        "target_setups_per_day_lo": 5.0,
+        "target_setups_per_day_hi": 8.0,
 
         # Self-optimization governance
         "session_weights": {"NY": 0.45, "LON": 0.40, "ASIA": 0.15},  # optimizer weighting (cross-session executable pool with NY/LON preference)
@@ -1565,10 +1565,10 @@ def _strategy_config_defaults() -> dict:
         # Setup-count governor (live engine + optimizer)
         "governor_enabled": True,
         "governor_window_hours": 24,
-        "governor_target_lo": 8.0,
-        "governor_target_hi": 12.0,
+        "governor_target_lo": 5.0,
+        "governor_target_hi": 8.0,
         "governor_step_score": 1.0,         # +/- points applied to quality_score_min_email when adjusting
-        "governor_score_min": 50.0,         # absolute lower bound for quality_score_min_email
+        "governor_score_min": 52.0,         # absolute lower bound for quality_score_min_email
         "governor_score_max": 70.0,         # absolute upper bound for quality_score_min_email
         "governor_apply_to": "email",       # 'email' (safe) or 'email+screen'
         "governor_last_adjust_ts": 0.0,
@@ -1606,8 +1606,8 @@ def _strategy_config_defaults() -> dict:
         "goal_profile_enabled": True,
         "goal_profile_interval_hours": 24.0,
         "goal_profile_cooldown_hours": 20.0,
-        "goal_profile_target_setups_per_day_lo": 8.0,
-        "goal_profile_target_setups_per_day_hi": 12.0,
+        "goal_profile_target_setups_per_day_lo": 5.0,
+        "goal_profile_target_setups_per_day_hi": 8.0,
         "goal_profile_target_win_rate": 60.0,
         "goal_profile_target_avg_r": 0.10,
         "goal_profile_min_live_setups_30d": 8,
@@ -1647,8 +1647,8 @@ def _strategy_config_defaults() -> dict:
         "market_adaptive_days": 30,
         "market_adaptive_max_passes": 2,
         "market_adaptive_min_improvement": 0.35,
-        "market_adaptive_target_setups_per_day_lo": 8.0,
-        "market_adaptive_target_setups_per_day_hi": 12.0,
+        "market_adaptive_target_setups_per_day_lo": 5.0,
+        "market_adaptive_target_setups_per_day_hi": 8.0,
         "market_adaptive_session_wr_floor_ny": 46.0,
         "market_adaptive_session_wr_floor_lon": 48.0,
         "market_adaptive_cooldown_hours": 20.0,
@@ -1917,43 +1917,43 @@ def _strategy_config_bootstrap_recommendations() -> None:
         try:
             lo = float(cfg.get('target_setups_per_day_lo', 0.0) or 0.0)
             hi = float(cfg.get('target_setups_per_day_hi', 0.0) or 0.0)
-            if lo <= 0 or abs(lo - 8.0) > 0.001:
-                cfg['target_setups_per_day_lo'] = 8.0
+            if lo <= 0 or abs(lo - 3.0) > 0.001:
+                cfg['target_setups_per_day_lo'] = 5.0
                 changed = True
-            if hi <= 0 or abs(hi - 12.0) > 0.001:
-                cfg['target_setups_per_day_hi'] = 12.0
+            if hi <= 0 or abs(hi - 5.0) > 0.001:
+                cfg['target_setups_per_day_hi'] = 8.0
                 changed = True
         except Exception:
-            cfg['target_setups_per_day_lo'] = 8.0
-            cfg['target_setups_per_day_hi'] = 12.0
+            cfg['target_setups_per_day_lo'] = 5.0
+            cfg['target_setups_per_day_hi'] = 8.0
             changed = True
 
         try:
             glo = float(cfg.get('governor_target_lo', 0.0) or 0.0)
             ghi = float(cfg.get('governor_target_hi', 0.0) or 0.0)
-            if glo <= 0 or abs(glo - 8.0) > 0.001:
-                cfg['governor_target_lo'] = 8.0
+            if glo <= 0 or abs(glo - 3.0) > 0.001:
+                cfg['governor_target_lo'] = 5.0
                 changed = True
-            if ghi <= 0 or abs(ghi - 12.0) > 0.001:
-                cfg['governor_target_hi'] = 12.0
+            if ghi <= 0 or abs(ghi - 5.0) > 0.001:
+                cfg['governor_target_hi'] = 8.0
                 changed = True
         except Exception:
-            cfg['governor_target_lo'] = 8.0
-            cfg['governor_target_hi'] = 12.0
+            cfg['governor_target_lo'] = 5.0
+            cfg['governor_target_hi'] = 8.0
             changed = True
 
         try:
             mlo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 0.0) or 0.0)
             mhi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 0.0) or 0.0)
-            if mlo <= 0 or abs(mlo - 8.0) > 0.001:
-                cfg['market_adaptive_target_setups_per_day_lo'] = 8.0
+            if mlo <= 0 or abs(mlo - 3.0) > 0.001:
+                cfg['market_adaptive_target_setups_per_day_lo'] = 5.0
                 changed = True
-            if mhi <= 0 or abs(mhi - 12.0) > 0.001:
-                cfg['market_adaptive_target_setups_per_day_hi'] = 12.0
+            if mhi <= 0 or abs(mhi - 5.0) > 0.001:
+                cfg['market_adaptive_target_setups_per_day_hi'] = 8.0
                 changed = True
         except Exception:
-            cfg['market_adaptive_target_setups_per_day_lo'] = 8.0
-            cfg['market_adaptive_target_setups_per_day_hi'] = 12.0
+            cfg['market_adaptive_target_setups_per_day_lo'] = 5.0
+            cfg['market_adaptive_target_setups_per_day_hi'] = 8.0
             changed = True
 
         manual_asia = _cfg_bool(cfg.get('execution_asia_user_override', False), False)
@@ -1992,22 +1992,22 @@ def _strategy_config_bootstrap_recommendations() -> None:
         # silently keep the bot above the 1–3 setups/day target after redeploy.
         try:
             q_screen = float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
-            if q_screen > 60.0:
-                cfg['quality_score_min_screen'] = 60.0
+            if q_screen > 62.0:
+                cfg['quality_score_min_screen'] = 62.0
                 changed = True
         except Exception:
             pass
         try:
             q_email = float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL)
-            if q_email > 63.0:
-                cfg['quality_score_min_email'] = 63.0
+            if q_email > 65.0:
+                cfg['quality_score_min_email'] = 65.0
                 changed = True
         except Exception:
             pass
         try:
             rr_live = float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP)
-            if rr_live > 1.24:
-                cfg['min_rr_tp'] = 1.24
+            if rr_live > 1.28:
+                cfg['min_rr_tp'] = 1.28
                 changed = True
         except Exception:
             pass
@@ -2046,10 +2046,10 @@ def _strategy_config_bootstrap_recommendations() -> None:
 
         try:
             if 'goal_profile_target_setups_per_day_lo' not in cfg:
-                cfg['goal_profile_target_setups_per_day_lo'] = 8.0
+                cfg['goal_profile_target_setups_per_day_lo'] = 5.0
                 changed = True
             if 'goal_profile_target_setups_per_day_hi' not in cfg:
-                cfg['goal_profile_target_setups_per_day_hi'] = 12.0
+                cfg['goal_profile_target_setups_per_day_hi'] = 8.0
                 changed = True
             if 'goal_profile_target_win_rate' not in cfg:
                 cfg['goal_profile_target_win_rate'] = 60.0
@@ -2430,8 +2430,8 @@ FLIP_GUARD_MULT = 1.0  # 1.0 = same as session cooldown hours; try 1.5–2.0 to 
 
 # 2) Higher-TF alignment: require 1H + 4H momentum to agree with the signal direction
 TF_ALIGN_ENABLED = True
-TF_ALIGN_1H_MIN_ABS = 0.40   # percent
-TF_ALIGN_4H_MIN_ABS = 0.40   # percent
+TF_ALIGN_1H_MIN_ABS = 0.5   # percent
+TF_ALIGN_4H_MIN_ABS = 0.5   # percent
 
 # ✅ Approach A: session-aware TF alignment floors (higher win-rate, esp. ASIA)
 TF_ALIGN_1H_MIN_ABS_BY_SESSION = {
@@ -2478,7 +2478,7 @@ except Exception:
 
 # Multi-TP
 ATR_PERIOD = 14
-ATR_MIN_PCT = 0.85
+ATR_MIN_PCT = 1.0
 ATR_MAX_PCT = 8.0
 MULTI_TP_MIN_CONF = 78
 TP_ALLOCS = (40, 40, 20)
@@ -10126,12 +10126,10 @@ def db_init():
     
     # Aligned defaults (per your request): 24H >= 40 OR 4H >= 15
     # Aligned defaults: 4H >= 20 OR 1H >= 10
-    if "bigmove_alert_15m" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_15m REAL NOT NULL DEFAULT 2")
     if "bigmove_alert_4h" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_4h REAL NOT NULL DEFAULT 4")
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_4h REAL NOT NULL DEFAULT 20")
     if "bigmove_alert_1h" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_1h REAL NOT NULL DEFAULT 3")
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_1h REAL NOT NULL DEFAULT 10")
     if "bigmove_min_vol_usd" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN bigmove_min_vol_usd REAL NOT NULL DEFAULT 10000000")
         if "bigmove_min_usd" in cols:
@@ -11218,13 +11216,12 @@ def _user_bigmove_min_vol_usd(user: dict | None, default: float = 10_000_000.0) 
         return float(floor)
 
 
-def _record_bigmove_settings_change(uid: int, on: bool, p15: float, p4: float, p1: float, min_vol: float, reason: str) -> None:
+def _record_bigmove_settings_change(uid: int, on: bool, p4: float, p1: float, min_vol: float, reason: str) -> None:
     ts_now = float(time.time())
     try:
         update_user(
             int(uid),
             bigmove_alert_on=(1 if on else 0),
-            bigmove_alert_15m=float(p15),
             bigmove_alert_4h=float(p4),
             bigmove_alert_1h=float(p1),
             bigmove_min_vol_usd=float(min_vol),
@@ -11236,7 +11233,6 @@ def _record_bigmove_settings_change(uid: int, on: bool, p15: float, p4: float, p
             update_user(
                 int(uid),
                 bigmove_alert_on=(1 if on else 0),
-                bigmove_alert_15m=float(p15),
                 bigmove_alert_4h=float(p4),
                 bigmove_alert_1h=float(p1),
                 bigmove_alert_updated_ts=ts_now,
@@ -11306,17 +11302,17 @@ def mark_earlywarn_emailed(uid: int, symbol: str, side: str) -> None:
     except Exception:
         pass
 
-def _bigmove_candidates(best_fut: dict, p15: float, p4: float, p1: float, min_vol_usd: float = 0.0, max_items: int = 12) -> list:
+def _bigmove_candidates(best_fut: dict, p4: float, p1: float, min_vol_usd: float = 0.0, max_items: int = 12) -> list:
     """
-    Returns list of dicts: {symbol, ch15, ch4, ch1, vol, direction, score}
+    Returns list of dicts: {symbol, ch4, ch1, vol, direction, score}
 
     direction:
       - "UP"   → strong positive move
       - "DOWN" → strong negative move
 
     Triggers:
-      - UP   if ch15 >= +p15 AND ch1 >= +p1 AND ch4 >= +p4
-      - DOWN if ch15 <= -p15 AND ch1 <= -p1 AND ch4 <= -p4
+      - UP   if ch4 >= +p4 AND ch1 >= +p1
+      - DOWN if ch4 <= -p4 AND ch1 <= -p1
     """
 
     def _pick_pct(mv, keys) -> float:
@@ -11334,71 +11330,74 @@ def _bigmove_candidates(best_fut: dict, p15: float, p4: float, p1: float, min_vo
 
     for sym, mv in (best_fut or {}).items():
         try:
-            ch15 = _pick_pct(mv, ["ch15", "pct_15m", "change_15m", "chg_15m", "percentage_15m", "p15", "m15", "tf15m"])
+            # Try multiple possible field names (fixes "different field names" issue)
             ch4 = _pick_pct(mv, ["ch4", "pct_4h", "change_4h", "chg_4h", "percentage_4h", "p4", "h4"])
             ch1 = _pick_pct(mv, ["ch1", "pct_1h", "change_1h", "chg_1h", "percentage_1h", "p1", "h1"])
+
+            # ✅ FIX: correct 24H USD volume (MarketVol does NOT have fut_vol_usd)
             vol = float(usd_notional(mv) or 0.0)
 
-            ref_symbol = getattr(mv, "symbol", None)
-            if ref_symbol and (abs(ch15) < 1e-9 or abs(ch1) < 1e-9 or abs(ch4) < 1e-9):
+            # If still missing, compute from 1h candles (same logic as compute_metrics-style)
+            if (abs(ch4) < 1e-9 and abs(ch1) < 1e-9) and getattr(mv, "symbol", None):
                 try:
-                    if abs(ch15) < 1e-9:
-                        c15 = fetch_ohlcv(ref_symbol, "15m", 3)
-                        if c15 and len(c15) >= 2:
-                            c_last15 = float(c15[-1][4])
-                            c_prev15 = float(c15[-2][4])
-                            ch15 = ((c_last15 - c_prev15) / c_prev15) * 100.0 if c_prev15 else 0.0
+                    c1 = fetch_ohlcv(mv.symbol, "1h", 6)
+                    if c1 and len(c1) >= 2:
+                        closes_1h = [float(x[4]) for x in c1]
+                        c_last = closes_1h[-1]
+                        c_prev1 = closes_1h[-2]
+                        c_prev4 = closes_1h[-5] if len(closes_1h) >= 5 else closes_1h[0]
+                        ch1 = ((c_last - c_prev1) / c_prev1) * 100.0 if c_prev1 else 0.0
+                        ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
                 except Exception:
                     pass
-                try:
-                    if abs(ch1) < 1e-9 or abs(ch4) < 1e-9:
-                        c1 = fetch_ohlcv(ref_symbol, "1h", 6)
-                        if c1 and len(c1) >= 2:
-                            closes_1h = [float(x[4]) for x in c1]
-                            c_last = closes_1h[-1]
-                            if abs(ch1) < 1e-9:
-                                c_prev1 = closes_1h[-2]
-                                ch1 = ((c_last - c_prev1) / c_prev1) * 100.0 if c_prev1 else 0.0
-                            if abs(ch4) < 1e-9:
-                                c_prev4 = closes_1h[-5] if len(closes_1h) >= 5 else closes_1h[0]
-                                ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
-                except Exception:
-                    pass
+
         except Exception:
             continue
 
-        same_up = (ch15 > 0 and ch4 > 0 and ch1 > 0)
-        same_down = (ch15 < 0 and ch4 < 0 and ch1 < 0)
+        same_up = (ch4 > 0 and ch1 > 0)
+        same_down = (ch4 < 0 and ch1 < 0)
         if not (same_up or same_down):
             continue
 
-        up_hit = same_up and (ch15 >= float(p15)) and (ch4 >= float(p4)) and (ch1 >= float(p1))
-        down_hit = same_down and (ch15 <= -float(p15)) and (ch4 <= -float(p4)) and (ch1 <= -float(p1))
+        up_hit = same_up and (ch4 >= float(p4)) and (ch1 >= float(p1))
+        down_hit = same_down and (ch4 <= -float(p4)) and (ch1 <= -float(p1))
+
         if not (up_hit or down_hit):
             continue
 
+        # ✅ NEW: volume gate (skip low-volume coins completely)
         if float(min_vol_usd or 0.0) > 0.0 and vol < float(min_vol_usd):
             continue
 
-        direction = "DOWN" if down_hit and not up_hit else "UP"
-        score = max(
-            (abs(ch15) / max(float(p15 or 0.0), 1e-9)),
-            (abs(ch1) / max(float(p1 or 0.0), 1e-9)),
-            (abs(ch4) / max(float(p4 or 0.0), 1e-9)),
+        if down_hit and not up_hit:
+            direction = "DOWN"
+        elif up_hit and not down_hit:
+            direction = "UP"
+        else:
+            direction = "UP" if ch1 >= 0 else "DOWN"
+
+        score_up = max(
+            (abs(ch4) / max(p4, 1e-9)) if ch4 > 0 else 0.0,
+            (abs(ch1) / max(p1, 1e-9)) if ch1 > 0 else 0.0,
         )
+        score_dn = max(
+            (abs(ch4) / max(p4, 1e-9)) if ch4 < 0 else 0.0,
+            (abs(ch1) / max(p1, 1e-9)) if ch1 < 0 else 0.0,
+        )
+        score = max(score_up, score_dn)
 
         out.append({
             "symbol": sym,
-            "ch15": float(ch15),
-            "ch4": float(ch4),
-            "ch1": float(ch1),
-            "vol": float(vol),
+            "ch4": ch4,
+            "ch1": ch1,
+            "vol": vol,
             "direction": direction,
-            "score": float(score),
+            "score": score,
         })
 
-    out.sort(key=lambda x: (float(x.get("score", 0.0) or 0.0), float(x.get("vol", 0.0) or 0.0)), reverse=True)
+    out.sort(key=lambda x: (x["score"], x["vol"]), reverse=True)
     return out[:max_items]
+
 
 def _spike_reversal_candidates(
     best_fut: Dict[str, Any],
@@ -17721,8 +17720,8 @@ def rr_to_tp(entry: float, sl: float, tp: float) -> float:
 # - Used by both /screen and email selection, and by backtests.
 # =========================================================
 
-QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "58"))
-QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "62"))
+QUALITY_SCORE_MIN_SCREEN = float(os.environ.get("QUALITY_SCORE_MIN_SCREEN", "60"))
+QUALITY_SCORE_MIN_EMAIL  = float(os.environ.get("QUALITY_SCORE_MIN_EMAIL",  "64"))
 
 # Soft throttling: how many candidates we score before slicing (keeps compute bounded)
 QUALITY_SCORE_CAND_MULT_SCREEN = int(os.environ.get("QUALITY_SCORE_CAND_MULT_SCREEN", "8"))
@@ -29361,7 +29360,7 @@ Trade Journal
 /limits emaildaycap 
 • Set max number of emails per day
 
-/bigmove_alert on|off [15M%] [1H%] [4H%]
+/bigmove_alert on|off [4H%] [1H%]
 • Big move alerts in either direction (UP or DOWN)
 
 ────────────────────
@@ -30530,9 +30529,8 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cur_on = int(user.get("bigmove_alert_on", 1) or 0)
-    cur_p15 = float(user.get("bigmove_alert_15m", 2) or 2)
-    cur_p1 = float(user.get("bigmove_alert_1h", 3) or 3)
-    cur_p4 = float(user.get("bigmove_alert_4h", 4) or 4)
+    cur_p4 = float(user.get("bigmove_alert_4h", 20) or 20)
+    cur_p1 = float(user.get("bigmove_alert_1h", 10) or 10)
     cur_min_vol = max(10_000_000.0, _user_bigmove_min_vol_usd(user, 10_000_000.0))
 
     if not context.args:
@@ -30542,7 +30540,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📣 Big-Move Alert Emails",
             f"{HDR}",
             f"Status: {'ON' if cur_on else 'OFF'}",
-            f"Thresholds: |15M| ≥ {cur_p15:.1f}% AND |1H| ≥ {cur_p1:.1f}% AND |4H| ≥ {cur_p4:.1f}% (same direction only)",
+            f"Thresholds: |4H| ≥ {cur_p4:.0f}% AND |1H| ≥ {cur_p1:.0f}% (same direction only)",
             f"Min Vol (24H): {cur_min_vol/1e6:.1f}M",
         ]
         if updated_ts > 0:
@@ -30551,8 +30549,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"Reason: {updated_reason}")
         lines.extend([
             "",
-            "Set: /bigmove_alert on 2 3 4",
-            "Legacy: /bigmove_alert on 4 3   (treated as 4H then 1H; 15M stays current/default)",
+            "Set: /bigmove_alert on 10 5",
             "Off: /bigmove_alert off",
         ])
         await update.message.reply_text("\n".join(lines))
@@ -30561,33 +30558,27 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.args[0].strip().lower()
 
     if mode in {"off", "0", "disable"}:
-        _record_bigmove_settings_change(uid, False, cur_p15, cur_p4, cur_p1, cur_min_vol, "command_off via /bigmove_alert")
+        _record_bigmove_settings_change(uid, False, cur_p4, cur_p1, cur_min_vol, "command_off via /bigmove_alert")
         await update.message.reply_text("✅ Big-move alert emails: OFF")
         return
 
     if mode in {"on", "1", "enable"}:
-        p15 = cur_p15 if cur_p15 > 0 else 2.0
-        p1 = cur_p1 if cur_p1 > 0 else 3.0
-        p4 = cur_p4 if cur_p4 > 0 else 4.0
-        min_vol = cur_min_vol
-        try:
-            if len(context.args) >= 4:
-                p15 = float(context.args[1])
-                p1 = float(context.args[2])
-                p4 = float(context.args[3])
-            elif len(context.args) == 3:
+        p4 = cur_p4 if cur_p4 > 0 else 20.0
+        p1 = cur_p1 if cur_p1 > 0 else 10.0
+        min_vol = 10_000_000.0
+        if len(context.args) >= 3:
+            try:
                 p4 = float(context.args[1])
                 p1 = float(context.args[2])
-            elif len(context.args) not in (1,):
-                raise ValueError("invalid_arg_count")
-        except Exception:
-            await update.message.reply_text("Usage: /bigmove_alert on <15M%> <1H%> <4H%>  (e.g., /bigmove_alert on 2 3 4)  OR legacy /bigmove_alert on <4H%> <1H%>")
-            return
-        _record_bigmove_settings_change(uid, True, p15, p4, p1, min_vol, f"command_on via /bigmove_alert (15M>={p15:.2f}% AND 1H>={p1:.2f}% AND 4H>={p4:.2f}%, same_direction_only, min_vol={min_vol/1e6:.1f}M)")
-        await update.message.reply_text(f"✅ Big-move alert emails: ON (15M≥{p15:.1f}% AND 1H≥{p1:.1f}% AND 4H≥{p4:.1f}% | same direction only | Min Vol {min_vol/1e6:.1f}M)")
+            except Exception:
+                await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 10 5)")
+                return
+        _record_bigmove_settings_change(uid, True, p4, p1, min_vol, f"command_on via /bigmove_alert (4H>={p4:.2f}% AND 1H>={p1:.2f}%, same_direction_only, min_vol={min_vol/1e6:.1f}M)")
+        await update.message.reply_text(f"✅ Big-move alert emails: ON (4H≥{p4:.0f}% AND 1H≥{p1:.0f}% | same direction only | Min Vol {min_vol/1e6:.1f}M)")
         return
 
-    await update.message.reply_text("Usage: /bigmove_alert on <15M%> <1H%> <4H%>  (e.g., /bigmove_alert on 2 3 4)  OR  /bigmove_alert off")
+    await update.message.reply_text("Usage: /bigmove_alert on <4H%> <1H%>  (e.g., /bigmove_alert on 10 5)  OR  /bigmove_alert off")
+
 
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -30649,7 +30640,15 @@ def _typo_hint_for_token(tok: str) -> str:
 
 async def size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = await get_user_cached_fast_async(uid)
+    user = {}
+    try:
+        cached_user = cache_get(_user_cache_key(int(uid)))
+        if isinstance(cached_user, dict) and cached_user:
+            user = dict(cached_user)
+    except Exception:
+        user = {}
+    if not user:
+        user = await get_user_cached_fast_async(uid, ttl=max(5, int(FAST_USER_CACHE_TTL_SEC or 20)))
 
     if not has_active_access(uid, user):
         await update.message.reply_text(
@@ -32518,11 +32517,37 @@ def _autotrade_render_live_position_snapshot(snapshot: dict, index: int | None =
     return lines
 
 
+def _autotrade_report_friendly_close_reason(row: dict) -> str:
+    try:
+        reason = str((row or {}).get('close_reason') or '').strip()
+        result_path = str((row or {}).get('result_path') or '').upper().strip()
+        result_label = str((row or {}).get('result_label') or '').strip()
+        generic = {'', 'signal_path_close', 'exchange_closed_pnl_fallback', 'exchange_only_fallback_close'}
+        if reason not in generic:
+            return reason
+        if result_path in {'HIT_TP_WIN', 'TP'}:
+            return 'hit TP'
+        if result_path in {'HIT_SL_LOSS', 'SL'}:
+            return 'hit SL'
+        if result_path == 'HIT_TP_THEN_BE_SL':
+            return 'hit TP then BE stop'
+        if result_path == 'HIT_TP_THEN_SL':
+            return 'hit TP then SL'
+        if result_path == 'OPEN':
+            return 'open'
+        return result_label or reason or 'closed'
+    except Exception:
+        return str((row or {}).get('close_reason') or (row or {}).get('result_label') or 'closed')
+
+
 def _autotrade_render_closed_lifecycle_row_compact(row: dict, index: int | None = None) -> list[str]:
     sym = str(row.get('symbol') or '?')
     side = str(row.get('side') or '?')
     result_txt = str(row.get('result_label') or row.get('result_path') or '—')
-    pnl = float(row.get('pnl_usdt') or 0.0) if row.get('pnl_usdt') is not None else 0.0
+    try:
+        pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
+    except Exception:
+        pnl = 0.0
     trade_id = str(row.get('trade_id') or '').strip()
     setup_id = str(row.get('setup_id') or '').strip()
     label = f"{int(index)}) " if index is not None else "• "
@@ -32547,7 +32572,7 @@ def _autotrade_render_closed_lifecycle_row_compact(row: dict, index: int | None 
         f"   • TP: {fmt_price(float(tp_val or 0.0)) if float(tp_val or 0.0) > 0 else '—'} | Hit: {_autotrade_checkbox(tp_hit)}"
     )
     lines.append(
-        f"   • Close reason: {str(row.get('close_reason') or result_txt or '—')}"
+        f"   • Close reason: {_autotrade_report_friendly_close_reason(row)}"
     )
     if float(row.get('opened_ts') or 0.0) > 0:
         lines.append(f"   • Opened: {_trade_lifecycle_time_text(float(row.get('opened_ts') or 0.0))}")
@@ -32667,7 +32692,33 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
     user = _autotrade_user_settings(owner_uid)
     out = []
     seen_out = set()
-    enrich_budget = min(max(limit // 2, 4), 8)
+    enrich_budget = min(max(limit, 10), 20)
+    lifecycle_order_cache: dict[str, list[dict]] = {}
+    lifecycle_closed_pnl_rows = []
+    if str(_autotrade_runtime_mode()).lower() == 'live':
+        try:
+            lifecycle_closed_pnl_rows = _bybit_get_closed_pnl_linear(max(0.0, float(start_ts) - 86400.0), float(end_ts) + 21600.0, limit=max(200, int(limit) * 30)) or []
+        except Exception:
+            lifecycle_closed_pnl_rows = []
+
+    def _needs_lifecycle_enrichment(row: dict) -> bool:
+        try:
+            result_path = str((row or {}).get('result_path') or '').upper().strip()
+            close_reason = str((row or {}).get('close_reason') or '').strip()
+            if float((row or {}).get('entry') or 0.0) <= 0 or float((row or {}).get('sl') or 0.0) <= 0:
+                return True
+            if float(_resolve_single_tp(float((row or {}).get('entry') or 0.0), float((row or {}).get('sl') or 0.0), (row or {}).get('tp'), (row or {}).get('alt_target_a'), (row or {}).get('alt_target_b'), str((row or {}).get('side') or '')) or 0.0) <= 0:
+                return True
+            if result_path in {'TP', 'SL', 'HIT_TP_WIN', 'HIT_SL_LOSS', 'HIT_TP_THEN_BE_SL', 'HIT_TP_THEN_SL'}:
+                if float((row or {}).get('tp_hit_ts') or 0.0) <= 0 and float((row or {}).get('sl_hit_ts') or 0.0) <= 0 and float((row or {}).get('alt_target_a_hit_ts') or 0.0) <= 0:
+                    return True
+            if close_reason in {'', 'signal_path_close', 'exchange_closed_pnl_fallback', 'exchange_only_fallback_close'}:
+                return True
+            if (row or {}).get('pnl_usdt') is None and (row or {}).get('pnl') is not None:
+                return True
+            return False
+        except Exception:
+            return True
 
     def _out_key(row: dict) -> tuple:
         sid = str((row or {}).get('setup_id') or '').strip()
@@ -32724,8 +32775,15 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                 row['pnl_usdt'] = float(b.get('pnl_usdt') if b.get('pnl_usdt') is not None else pnl)
             if sid and not str(row.get('setup_id') or '').strip():
                 row['setup_id'] = sid
-            if enrich_budget > 0 and sid:
+            if enrich_budget > 0 and _needs_lifecycle_enrichment(row) and (sid or tid or sym):
                 try:
+                    order_rows = lifecycle_order_cache.get(sym)
+                    if order_rows is None:
+                        try:
+                            order_rows = _bybit_get_recent_filled_orders_linear(sym, lookback_hours=max(48, int(lookback_h or 24) + 24), limit=max(120, int(limit) * 12)) or []
+                        except Exception:
+                            order_rows = []
+                        lifecycle_order_cache[sym] = list(order_rows or [])
                     row, _events = _trade_lifecycle_build_trade_row(
                         owner_uid,
                         row,
@@ -32733,8 +32791,8 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                         next_open_ts=0.0,
                         live_mode=False,
                         live_pos=None,
-                        order_rows=[],
-                        closed_pnl_rows=[],
+                        order_rows=order_rows or [],
+                        closed_pnl_rows=lifecycle_closed_pnl_rows or [],
                     )
                 except Exception:
                     row = dict(row)
@@ -32745,8 +32803,13 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
                 row['result_path'] = result_path
             if not str(row.get('result_label') or '').strip() or str(row.get('result_label') or '').lower().strip() == 'manual / unknown exchange close':
                 row['result_label'] = result_label
-            if not str(row.get('close_reason') or '').strip() or str(row.get('close_reason') or '').strip() in {'exchange_closed_pnl_fallback', 'exchange_only_fallback_close'}:
-                row['close_reason'] = 'signal_path_close' if result_path in {'TP', 'SL'} else str(row.get('close_reason') or result_label or 'closed')
+            if not str(row.get('close_reason') or '').strip() or str(row.get('close_reason') or '').strip() in {'signal_path_close', 'exchange_closed_pnl_fallback', 'exchange_only_fallback_close'}:
+                row['close_reason'] = _autotrade_report_friendly_close_reason({**row, 'result_path': result_path, 'result_label': result_label})
+            if row.get('pnl_usdt') is None and row.get('pnl') is not None:
+                try:
+                    row['pnl_usdt'] = float(row.get('pnl') or 0.0)
+                except Exception:
+                    pass
             ok = _out_key(row)
             if ok not in seen_out:
                 out.append(row)
@@ -33024,7 +33087,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         stale_cached = ''
 
     try:
-        text_out = await to_thread_fast(_autotrade_report_text_cached, owner_uid, lookback_h, timeout=max(12, min(25, int(AUTOTRADE_REPORT_TIMEOUT_SEC))))
+        text_out = await to_thread_heavy(_autotrade_report_text_cached, owner_uid, lookback_h, timeout=max(12, min(25, int(AUTOTRADE_REPORT_TIMEOUT_SEC))))
     except asyncio.TimeoutError:
         if stale_cached:
             text_out = stale_cached + "\n" + SEP + "Showing cached snapshot while a fresh report rebuild is still busy."
@@ -35983,18 +36046,17 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     return {"status": "SKIP", "reasons": ["bigmove_alert_off"]}
 
                 try:
-                    p15 = float(uu.get("bigmove_alert_15m", 2.0) or 2.0)
-                    p4 = float(uu.get("bigmove_alert_4h", 4.0) or 4.0)
-                    p1 = float(uu.get("bigmove_alert_1h", 3.0) or 3.0)
+                    p4 = float(uu.get("bigmove_alert_4h", 15.0) or 15.0)
+                    p1 = float(uu.get("bigmove_alert_1h", 7.5) or 7.5)
                 except Exception:
-                    p15, p4, p1 = 2.0, 4.0, 3.0
+                    p4, p1 = 15.0, 7.5
 
                 try:
                     min_vol = _user_bigmove_min_vol_usd(uu, 10_000_000.0)
                 except Exception:
                     min_vol = 10_000_000.0
 
-                candidates = _bigmove_candidates(best_fut, p15=p15, p4=p4, p1=p1, min_vol_usd=min_vol, max_items=12)
+                candidates = _bigmove_candidates(best_fut, p4=p4, p1=p1, min_vol_usd=min_vol, max_items=12)
 
                 def _pick_pct(_mv, _keys) -> float:
                     for _k in _keys:
@@ -36006,14 +36068,6 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         except Exception:
                             continue
                     return 0.0
-
-                try:
-                    bm_any_15m = sum(
-                        1 for _sym, _mv in (best_fut or {}).items()
-                        if abs(_pick_pct(_mv, ["ch15", "pct_15m", "change_15m", "chg_15m", "percentage_15m", "p15", "m15", "tf15m"])) >= float(p15)
-                    )
-                except Exception:
-                    bm_any_15m = -1
 
                 try:
                     bm_any_4h = sum(
@@ -36035,8 +36089,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     return {
                         "status": "SKIP",
                         "reasons": [
-                            f"no_candidates (p15={p15}, p4={p4}, p1={p1})",
-                            f"debug_raw_hits:15m={bm_any_15m},4h={bm_any_4h},1h={bm_any_1h}",
+                            f"no_candidates (p4={p4}, p1={p1})",
+                            f"debug_raw_hits:4h={bm_any_4h},1h={bm_any_1h}",
                         ],
                     }
 
@@ -36054,11 +36108,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                     try:
-                        ch15 = float(c.get("ch15", 0.0) or 0.0)
                         ch4 = float(c.get("ch4", 0.0) or 0.0)
                         ch1 = float(c.get("ch1", 0.0) or 0.0)
-                        if not ((ch15 > 0 and ch4 > 0 and ch1 > 0) or (ch15 < 0 and ch4 < 0 and ch1 < 0)):
-                            c['suppression_reason'] = 'mismatch_direction_15m_1h_4h'
+                        if not ((ch4 > 0 and ch1 > 0) or (ch4 < 0 and ch1 < 0)):
+                            c['suppression_reason'] = 'mismatch_direction_1h_4h'
                             continue
                         if bigmove_recently_emailed(int(uid), c["symbol"], c["direction"]):
                             cooldown_filtered_out += 1
@@ -36076,28 +36129,22 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                             f"raw_candidates={len(candidates)}",
                             f"volume_filtered={int(volume_filtered_out)}",
                             f"cooldown_filtered={int(cooldown_filtered_out)}",
-                            "suppression_reasons:mismatch_direction_15m_1h_4h,bigmove_symbol_cooldown_active",
+                            "suppression_reasons:mismatch_direction_1h_4h,bigmove_symbol_cooldown_active",
                         ],
                     }
 
                 lines = []
                 lines.append("⚡ PulseFutures — BIG MOVE ALERT")
                 lines.append(HDR)
-                lines.append(f"Triggers: |15M| ≥ {p15:.1f}% AND |1H| ≥ {p1:.1f}% AND |4H| ≥ {p4:.1f}% (same direction only)")
+                lines.append(f"Triggers: |4H| ≥ {p4:.1f}% AND |1H| ≥ {p1:.1f}% (same direction only)")
                 lines.append(f"Min Vol (24H): {min_vol/1e6:.1f}M")
                 lines.append("")
 
                 top = filtered[0]
                 top_sym = top["symbol"]
                 top_dir = "UP" if top.get("direction") == "UP" else "DOWN"
-                top_move = top.get("ch4", 0.0)
-                top_tf = "4H"
-                if abs(top.get("ch1", 0.0)) > abs(top_move):
-                    top_move = top.get("ch1", 0.0)
-                    top_tf = "1H"
-                if abs(top.get("ch15", 0.0)) > abs(top_move):
-                    top_move = top.get("ch15", 0.0)
-                    top_tf = "15M"
+                top_move = top["ch4"] if abs(top.get("ch4", 0.0)) >= abs(top.get("ch1", 0.0)) else top.get("ch1", 0.0)
+                top_tf = "4H" if abs(top.get("ch4", 0.0)) >= abs(top.get("ch1", 0.0)) else "1H"
 
                 subject = f"⚡ Big Move Alert • {top_sym} {top_dir} • {top_tf} {top_move:+.0f}%"
                 if len(filtered) > 1:
@@ -36875,17 +36922,13 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         bigm_on = 1
     try:
-        bigm_p15 = float(user.get("bigmove_alert_15m", 2) or 2)
+        bigm_p4 = float(user.get("bigmove_alert_4h", 20) or 20)
     except Exception:
-        bigm_p15 = 2.0
+        bigm_p4 = 20.0
     try:
-        bigm_p4 = float(user.get("bigmove_alert_4h", 4) or 4)
+        bigm_p1 = float(user.get("bigmove_alert_1h", 10) or 10)
     except Exception:
-        bigm_p4 = 4.0
-    try:
-        bigm_p1 = float(user.get("bigmove_alert_1h", 3) or 3)
-    except Exception:
-        bigm_p1 = 3.0
+        bigm_p1 = 10.0
     try:
         bigm_min_vol = _user_bigmove_min_vol_usd(user, 10_000_000.0)
     except Exception:
@@ -36899,7 +36942,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines.append("")
     lines.append("⚡ Big-Move Alert Settings")
     lines.append(f"Status: {'ON' if bigm_on else 'OFF'}")
-    lines.append(f"Thresholds: |15M| ≥ {bigm_p15:.1f}% AND |1H| ≥ {bigm_p1:.1f}% AND |4H| ≥ {bigm_p4:.1f}%")
+    lines.append(f"Thresholds: |4H| ≥ {bigm_p4:.0f}% OR |1H| ≥ {bigm_p1:.0f}%")
     lines.append(f"Min Vol (24H): {bigm_min_vol/1e6:.1f}M")
     if bigm_updated_ts > 0:
         lines.append("Updated: " + _fmt_when_both(bigm_updated_ts))
@@ -37972,7 +38015,10 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             return
 
         uid = int(AUTOTRADE_OWNER_UID)
-        user = get_user(uid) or {}
+        try:
+            user = await to_thread_fast(get_user, uid, timeout=2)
+        except Exception:
+            user = get_user(uid) or {}
         if not user:
             return
 
@@ -38042,9 +38088,12 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 pass
 
             db_setups = await to_thread_fast(_autotrade_select_db_setups, uid, sess, lookback_hours=12, limit=5, timeout=8)
-            if not db_setups and not _job_budget_exhausted():
+            tf_cooling = _ohlcv_timeframe_cooling('15m', '1h', '4h')
+            if not db_setups and tf_cooling:
+                reason = 'autotrade_refresh_deferred_rate_limit_cooldown'
+            if not db_setups and not tf_cooling and not _job_budget_exhausted():
                 remaining_budget = max(4.0, float(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40) - (time.time() - job_started_ts))
-                refresh_timeout = min(12.0, remaining_budget)
+                refresh_timeout = min(10.0, remaining_budget)
                 try:
                     refreshed = await to_thread_bg(_autotrade_refresh_owner_executable_pool, uid, sess, 12, timeout=refresh_timeout)
                 except asyncio.TimeoutError:
@@ -38072,10 +38121,11 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 'source_session': str(getattr(x, 'source_session', '') or ''),
             } for x in (db_setups or [])]
             if not db_setups:
+                skip_reason = 'autotrade_refresh_deferred_rate_limit_cooldown' if tf_cooling else 'no_setups'
                 _LAST_AUTOTRADE_DECISION[uid] = {
                     "status": "SKIP",
                     "when": now_utc.isoformat(timespec="seconds"),
-                    "reason": "no_setups",
+                    "reason": skip_reason,
                     "session": sess,
                     "mode": AUTOTRADE_MODE,
                     "attempted_candidates": attempt_summaries,
@@ -38393,7 +38443,7 @@ def main():
         # AutoTrade live protection guardian (repairs missing SL / TP stacks continuously)
         app.job_queue.run_repeating(
             autotrade_exit_guardian_job,
-            interval=90,
+            interval=max(int(AUTOTRADE_GUARDIAN_INTERVAL_SEC or 150), int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 10) + 45),
             first=30,
             name="autotrade_exit_guardian_job",
             job_kwargs={
@@ -38406,7 +38456,7 @@ def main():
         # AutoTrade loop (owner-only)
         app.job_queue.run_repeating(
             autotrade_job,
-            interval=60,
+            interval=max(int(AUTOTRADE_JOB_INTERVAL_SEC or 75), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 28) + 20),
             first=35,
             name="autotrade_job",
             job_kwargs={
