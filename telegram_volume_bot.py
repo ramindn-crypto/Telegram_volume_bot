@@ -7644,6 +7644,14 @@ def _research_family_registry_defaults() -> list[dict]:
             "eligible_regimes_json": json.dumps(["EXHAUSTION", "UNSTABLE_HIGH_VOL"]),
             "thesis": "Parabolic exhaustion followed by failed continuation and reversal.",
         },
+        {
+            "family_id": BIGMOVE_FAMILY_ID,
+            "family_name": BIGMOVE_FAMILY_NAME,
+            "status": "active",
+            "eligible_sessions_json": json.dumps(["ASIA", "LON", "NY"]),
+            "eligible_regimes_json": json.dumps(["EXPANSION", "TREND_UP", "TREND_DOWN", "UNSTABLE_HIGH_VOL"]),
+            "thesis": "Multi-timeframe big-move continuation using 15m/1H/4H aligned expansion with high liquidity.",
+        },
     ]
 
 
@@ -7674,6 +7682,7 @@ def _family_name_from_id(family_id: str) -> str:
         'F5_ORB_RETEST': 'Opening Range Breakout Retest',
         'F6_VWAP_RECLAIM': 'VWAP Reclaim',
         'F7_EXHAUSTION_FAILURE': 'Exhaustion Failure Reversal',
+        'F8_BIGMOVE_CONT': BIGMOVE_FAMILY_NAME,
     }
     return mapping.get(fam, fam or 'Unknown Family')
 
@@ -7994,18 +8003,18 @@ def _research_default_family_for_cell(session_name: str, regime_primary: str) ->
     sess = str(session_name or '').upper().strip()
     regime = str(regime_primary or '').upper().strip()
     if regime in {'TREND_UP', 'TREND_DOWN'}:
-        return ['F1_PULLBACK_CONT', 'F6_VWAP_RECLAIM'] if sess == 'NY' else ['F1_PULLBACK_CONT', 'F3_IMPULSE_BASE_CONT']
+        return ['F1_PULLBACK_CONT', 'F6_VWAP_RECLAIM', BIGMOVE_FAMILY_ID] if sess == 'NY' else ['F1_PULLBACK_CONT', 'F3_IMPULSE_BASE_CONT', BIGMOVE_FAMILY_ID]
     if regime == 'EXPANSION':
         # ASIA cannot use the default LON/NY expansion families (F2/F3) because they are not
         # eligible for that session. Returning them here produced empty allocator plans such as
         # "ASIA:EXPANSION | champion=- | active=-", which silently removes any active-family
         # support during live ASIA scans. Keep ASIA on the continuation family instead of an
         # impossible expansion pair.
-        return ['F1_PULLBACK_CONT'] if sess == 'ASIA' else ['F2_MOMENTUM_IGNITION', 'F3_IMPULSE_BASE_CONT']
+        return ['F1_PULLBACK_CONT', BIGMOVE_FAMILY_ID] if sess == 'ASIA' else ['F2_MOMENTUM_IGNITION', BIGMOVE_FAMILY_ID, 'F3_IMPULSE_BASE_CONT']
     if regime in {'BALANCE', 'SQUEEZE'}:
         return ['F4_SWEEP_RECLAIM', 'F5_ORB_RETEST']
     if regime in {'EXHAUSTION', 'UNSTABLE_HIGH_VOL'}:
-        return ['F7_EXHAUSTION_FAILURE', 'F4_SWEEP_RECLAIM']
+        return ['F7_EXHAUSTION_FAILURE', BIGMOVE_FAMILY_ID, 'F4_SWEEP_RECLAIM']
     return ['F1_PULLBACK_CONT', 'F3_IMPULSE_BASE_CONT']
 
 
@@ -11169,6 +11178,12 @@ BIGMOVE_DEFAULT_4H_PCT = 6.0
 BIGMOVE_DEFAULT_MIN_VOL_USD = 15_000_000.0
 BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
 BIGMOVE_COOLDOWN_SEC = 60 * 60 * 2  # 2 hours
+BIGMOVE_FAMILY_ID = "F8_BIGMOVE_CONT"
+BIGMOVE_FAMILY_NAME = "Big Move Continuation"
+BIGMOVE_SIGNAL_TP1_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP1_RR", "2.0") or 2.0)
+BIGMOVE_SIGNAL_TP2_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP2_RR", "4.0") or 4.0)
+BIGMOVE_SIGNAL_MAX_SCAN = int(os.environ.get("BIGMOVE_SIGNAL_MAX_SCAN", "14") or 14)
+BIGMOVE_SIGNAL_MAX_ITEMS = int(os.environ.get("BIGMOVE_SIGNAL_MAX_ITEMS", "6") or 6)
 
 def bigmove_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
     try:
@@ -18353,6 +18368,100 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
                 _BT_LAST_REJECTS["score_below_min"] += 1
             except Exception:
                 pass
+
+    # Big Move Continuation family (historical proxy)
+    if tf_min <= 15:
+        for i in range(warm, len(ohlcv) - 2):
+            try:
+                ts_raw = float(ohlcv[i][0] or 0.0)
+                ts_sec = (ts_raw / 1000.0) if ts_raw > 1e12 else ts_raw
+            except Exception:
+                ts_sec = 0.0
+            if session_name and (not _ts_in_session(ts_sec, session_name)):
+                continue
+            entry = float(opens[i + 1] or 0.0)
+            if entry <= 0:
+                continue
+            ch15 = _hist_pct_change(closes, i, bars_15m)
+            ch1 = _hist_pct_change(closes, i, bars_1h)
+            ch4 = _hist_pct_change(closes, i, bars_4h)
+            ch24 = _hist_pct_change(closes, i, bars_24h)
+            fut_vol_usd = _hist_quote_volume_usd(ohlcv, closes, i, tf)
+            if float(fut_vol_usd or 0.0) < float(BIGMOVE_DEFAULT_MIN_VOL_USD):
+                continue
+            same_up = float(ch15) >= float(BIGMOVE_DEFAULT_15M_PCT) and float(ch1) >= float(BIGMOVE_DEFAULT_1H_PCT) and float(ch4) >= float(BIGMOVE_DEFAULT_4H_PCT)
+            same_down = float(ch15) <= -float(BIGMOVE_DEFAULT_15M_PCT) and float(ch1) <= -float(BIGMOVE_DEFAULT_1H_PCT) and float(ch4) <= -float(BIGMOVE_DEFAULT_4H_PCT)
+            if not (same_up or same_down):
+                continue
+            side = 'BUY' if same_up else 'SELL'
+            ema_dist_pct = abs(entry - ema13[i]) / entry * 100.0 if entry > 0 and ema13[i] > 0 else 999.0
+            if ema_dist_pct > 1.10:
+                continue
+            if side == 'BUY':
+                swing = min(lows[max(0, i - 5):i + 1]) if i >= 1 else lows[i]
+                sl = min(float(entry) - max((atr[i] * 0.92 if atr and atr[i] else entry * 0.0032), entry * 0.0032), float(swing) - max((atr[i] * 0.10 if atr and atr[i] else entry * 0.0008), entry * 0.0008))
+                if sl >= entry:
+                    continue
+            else:
+                swing = max(highs[max(0, i - 5):i + 1]) if i >= 1 else highs[i]
+                sl = max(float(entry) + max((atr[i] * 0.92 if atr and atr[i] else entry * 0.0032), entry * 0.0032), float(swing) + max((atr[i] * 0.10 if atr and atr[i] else entry * 0.0008), entry * 0.0008))
+                if sl <= entry:
+                    continue
+            R = abs(entry - sl)
+            if R <= 0:
+                continue
+            tp_target = entry + float(BIGMOVE_SIGNAL_TP2_RR) * R if side == 'BUY' else entry - float(BIGMOVE_SIGNAL_TP2_RR) * R
+            conf = _bigmove_signal_confidence(side, ch24, ch4, ch1, ch15, fut_vol_usd, ema_dist_pct)
+            s = Setup(
+                setup_id=f"BT-BM-{i}",
+                symbol=str(symbol).upper().replace('USDT', ''),
+                market_symbol=str(symbol).upper(),
+                side=side,
+                conf=int(conf),
+                entry=float(entry),
+                sl=float(sl),
+                tp=float(tp_target),
+                alt_target_a=0.0,
+                alt_target_b=0.0,
+                fut_vol_usd=float(fut_vol_usd),
+                ch24=float(ch24),
+                ch4=float(ch4),
+                ch1=float(ch1),
+                ch15=float(ch15),
+                ema_support_period=13,
+                ema_support_dist_pct=float(ema_dist_pct),
+                pullback_ema_period=13,
+                pullback_ema_dist_pct=float(ema_dist_pct),
+                pullback_ready=bool(ema_dist_pct <= 0.85),
+                pullback_bypass_hot=bool(fut_vol_usd >= 35_000_000.0),
+                leader_base_override=False,
+                engine='B',
+                is_trailing_alt_target_b=False,
+                created_ts=float(ohlcv[i][0]) / 1000.0 if float(ohlcv[i][0] or 0) > 1e12 else float(ohlcv[i][0] or 0.0),
+                family_id=BIGMOVE_FAMILY_ID,
+            )
+            setattr(s, 'atr_pct', float(((float(atr[i] or 0.0) / float(entry) * 100.0) if entry > 0 and atr and atr[i] else 0.0)))
+            setattr(s, 'regime', 'EXPANSION')
+            setattr(s, 'trend', 'BULLISH' if side == 'BUY' else 'BEARISH')
+            setattr(s, 'structure', getattr(s, 'trend'))
+            setattr(s, 'bigmove_signal', True)
+            setattr(s, 'bigmove_tp1_rr_hint', float(BIGMOVE_SIGNAL_TP1_RR))
+            setattr(s, 'bigmove_tp2_rr_hint', float(BIGMOVE_SIGNAL_TP2_RR))
+            score, _ = compute_setup_quality_score(s, session_name=session_name)
+            score = float(clamp(float(score or 0.0) + 2.0, 0.0, 100.0))
+            setattr(s, 'quality_score', float(score))
+            s = _research_finalize_setup(s, session_name=session_name)
+            if float(score) >= float(QUALITY_SCORE_MIN_SCREEN):
+                setups.append(s)
+        try:
+            dedup = {}
+            for s in setups:
+                k = (str(getattr(s, 'setup_id', '') or ''), str(getattr(s, 'family_id', '') or ''), str(getattr(s, 'side', '') or ''))
+                if k not in dedup or float(getattr(s, 'quality_score', 0.0) or 0.0) > float(getattr(dedup[k], 'quality_score', 0.0) or 0.0):
+                    dedup[k] = s
+            setups = list(dedup.values())
+        except Exception:
+            pass
 
     return setups
 
@@ -26007,6 +26116,17 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
                 max_ch15 += 0.12
                 max_ch1 += 0.20
                 max_atr += 0.18
+        elif fam == BIGMOVE_FAMILY_ID:
+            if sess in {'LON', 'NY'}:
+                max_pb += 0.16
+                max_ch15 += 0.18
+                max_ch1 += 0.34
+                max_atr += 0.30
+            else:
+                max_pb += 0.10
+                max_ch15 += 0.10
+                max_ch1 += 0.18
+                max_atr += 0.18
         elif fam == 'F1_PULLBACK_CONT' and 'TREND' in regime and sess == 'LON':
             max_pb += 0.04
             max_ch15 += 0.05
@@ -26552,6 +26672,18 @@ def is_executable_setup_eligible(
             return (True, "ok")
 
         if engine == "B":
+            if fam == BIGMOVE_FAMILY_ID:
+                if score < max(score_floor + 0.5, 66.5 if sess != 'ASIA' else 67.5):
+                    return (False, "bigmove_below_quality")
+                if conf < max(conf_floor, 78 if sess != 'ASIA' else 80):
+                    return (False, "bigmove_below_conf")
+                if rr_final < max(rr_floor + 0.10, 1.80):
+                    return (False, "bigmove_below_rr")
+                if fut_vol < float(max(BIGMOVE_DEFAULT_MIN_VOL_USD, MIN_FUT_VOL_USD * (1.05 if sess != 'ASIA' else 1.10))):
+                    return (False, "bigmove_below_liquidity")
+                if abs(ch15_abs) < float(BIGMOVE_DEFAULT_15M_PCT) or abs(ch1_abs) < float(BIGMOVE_DEFAULT_1H_PCT) or abs(ch4_abs) < float(BIGMOVE_DEFAULT_4H_PCT):
+                    return (False, "bigmove_thresholds_not_held")
+                return (True, "ok")
             if score < (score_floor + 1.0):
                 return (False, "engine_b_below_quality")
             if conf < (conf_floor + 1):
@@ -28033,6 +28165,191 @@ def pick_breakout_setups(
 
 
 
+
+
+def _setup_display_label(s: Any) -> str:
+    try:
+        fam = str(getattr(s, 'family_id', '') or '').upper().strip()
+        if fam == BIGMOVE_FAMILY_ID:
+            return BIGMOVE_FAMILY_NAME
+        name = str(getattr(s, 'family_name', '') or '').strip()
+        if name:
+            return name
+    except Exception:
+        pass
+    eng = str(getattr(s, 'engine', '') or '').upper().strip()
+    if eng == 'A':
+        return 'Pullback'
+    if eng == 'B':
+        return 'Momentum Breakout'
+    if eng == 'C':
+        return 'Impulse Base Continuation'
+    if eng == 'F':
+        return 'Fallback'
+    return 'Setup'
+
+
+def _bigmove_signal_confidence(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol_usd: float, ema_dist_pct: float) -> int:
+    try:
+        p15 = float(BIGMOVE_DEFAULT_15M_PCT)
+        p1 = float(BIGMOVE_DEFAULT_1H_PCT)
+        p4 = float(BIGMOVE_DEFAULT_4H_PCT)
+        conf = 72.0
+        conf += min(7.0, max(0.0, (abs(float(ch15 or 0.0)) - p15) * 2.2))
+        conf += min(8.0, max(0.0, (abs(float(ch1 or 0.0)) - p1) * 1.7))
+        conf += min(9.0, max(0.0, (abs(float(ch4 or 0.0)) - p4) * 1.2))
+        conf += min(4.0, max(0.0, (abs(float(ch24 or 0.0)) - max(p4, 6.0)) * 0.35))
+        if float(fut_vol_usd or 0.0) >= 25_000_000.0:
+            conf += 3.0
+        elif float(fut_vol_usd or 0.0) >= 18_000_000.0:
+            conf += 2.0
+        if float(ema_dist_pct or 999.0) <= 0.70:
+            conf += 4.0
+        elif float(ema_dist_pct or 999.0) <= 1.05:
+            conf += 2.0
+        else:
+            conf -= min(5.0, (float(ema_dist_pct or 0.0) - 1.05) * 4.0)
+        if str(side or '').upper().strip() == 'BUY' and float(ch15 or 0.0) > 0 and float(ch1 or 0.0) > 0 and float(ch4 or 0.0) > 0:
+            conf += 1.0
+        if str(side or '').upper().strip() == 'SELL' and float(ch15 or 0.0) < 0 and float(ch1 or 0.0) < 0 and float(ch4 or 0.0) < 0:
+            conf += 1.0
+        return int(clamp(conf, 68.0, 96.0))
+    except Exception:
+        return 82
+
+
+def make_bigmove_family_setup(base: str, mv: Any, session_name: str = 'LON', scan_profile: str = DEFAULT_SCAN_PROFILE) -> Optional[Setup]:
+    try:
+        fut_vol = float(usd_notional(mv) or 0.0)
+        if fut_vol < float(BIGMOVE_DEFAULT_MIN_VOL_USD):
+            return None
+
+        ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
+        if (not c15) or len(c15) < 12 or atr_1h <= 0:
+            return None
+
+        same_up = float(ch15 or 0.0) >= float(BIGMOVE_DEFAULT_15M_PCT) and float(ch1 or 0.0) >= float(BIGMOVE_DEFAULT_1H_PCT) and float(ch4 or 0.0) >= float(BIGMOVE_DEFAULT_4H_PCT)
+        same_down = float(ch15 or 0.0) <= -float(BIGMOVE_DEFAULT_15M_PCT) and float(ch1 or 0.0) <= -float(BIGMOVE_DEFAULT_1H_PCT) and float(ch4 or 0.0) <= -float(BIGMOVE_DEFAULT_4H_PCT)
+        if not (same_up or same_down):
+            return None
+
+        side = 'BUY' if same_up else 'SELL'
+        entry = float(c15[-1][4] or getattr(mv, 'last', 0.0) or 0.0)
+        if entry <= 0:
+            return None
+
+        ema_dist_pct = abs(entry - float(ema_support_15m or 0.0)) / entry * 100.0 if float(ema_support_15m or 0.0) > 0 else 999.0
+        sess = str(session_name or '').upper().strip() or 'NY'
+        max_pb = 1.08 if sess in {'LON', 'NY'} else 0.96
+        if ema_dist_pct > max_pb:
+            return None
+
+        last = c15[-1]
+        last_o = float(last[1] or 0.0); last_h = float(last[2] or 0.0); last_l = float(last[3] or 0.0); last_c = float(last[4] or 0.0)
+        prev_chunk = c15[-6:] if len(c15) >= 6 else c15
+        lows_recent = [float(x[3] or 0.0) for x in prev_chunk if float(x[3] or 0.0) > 0]
+        highs_recent = [float(x[2] or 0.0) for x in prev_chunk if float(x[2] or 0.0) > 0]
+        if side == 'BUY':
+            if float(last_c) < max(float(last_o), float(ema_support_15m or 0.0) * 0.992):
+                return None
+            swing = min(lows_recent) if lows_recent else float(last_l or entry)
+            sl = min(float(entry) - max(float(atr_1h) * 0.92, float(entry) * 0.0032), float(swing) - max(float(atr_1h) * 0.12, float(entry) * 0.0008))
+            trend = 'BULLISH'
+        else:
+            if float(last_c) > min(float(last_o), float(ema_support_15m or entry) * 1.008):
+                return None
+            swing = max(highs_recent) if highs_recent else float(last_h or entry)
+            sl = max(float(entry) + max(float(atr_1h) * 0.92, float(entry) * 0.0032), float(swing) + max(float(atr_1h) * 0.12, float(entry) * 0.0008))
+            trend = 'BEARISH'
+        if side == 'BUY' and sl >= entry:
+            return None
+        if side == 'SELL' and sl <= entry:
+            return None
+
+        R = abs(float(entry) - float(sl))
+        if R <= 0:
+            return None
+        tp1 = float(entry) + float(BIGMOVE_SIGNAL_TP1_RR) * R if side == 'BUY' else float(entry) - float(BIGMOVE_SIGNAL_TP1_RR) * R
+        tp2 = float(entry) + float(BIGMOVE_SIGNAL_TP2_RR) * R if side == 'BUY' else float(entry) - float(BIGMOVE_SIGNAL_TP2_RR) * R
+        conf = _bigmove_signal_confidence(side, float(getattr(mv, 'percentage', 0.0) or 0.0), float(ch4), float(ch1), float(ch15), float(fut_vol), float(ema_dist_pct))
+
+        s = Setup(
+            setup_id=make_setup_id(base, side),
+            symbol=str(base or '').upper().strip(),
+            market_symbol=str(getattr(mv, 'symbol', '') or str(base or '')).upper(),
+            side=side,
+            conf=int(conf),
+            entry=float(entry),
+            sl=float(sl),
+            tp=float(tp2),
+            alt_target_a=0.0,
+            alt_target_b=0.0,
+            fut_vol_usd=float(fut_vol),
+            ch24=float(getattr(mv, 'percentage', 0.0) or 0.0),
+            ch4=float(ch4),
+            ch1=float(ch1),
+            ch15=float(ch15),
+            ema_support_period=int(ema_period or 0),
+            ema_support_dist_pct=float(ema_dist_pct),
+            pullback_ema_period=int(ema_period or 0),
+            pullback_ema_dist_pct=float(ema_dist_pct),
+            pullback_ready=bool(ema_dist_pct <= 0.85),
+            pullback_bypass_hot=bool(fut_vol >= 35_000_000.0),
+            leader_base_override=False,
+            engine='B',
+            is_trailing_alt_target_b=False,
+            created_ts=time.time(),
+            family_id=BIGMOVE_FAMILY_ID,
+        )
+        setattr(s, 'atr_pct', float((float(atr_1h) / float(entry) * 100.0) if float(entry) > 0 and float(atr_1h) > 0 else 0.0))
+        setattr(s, 'regime', 'EXPANSION' if abs(float(ch1 or 0.0)) >= max(1.0, float(BIGMOVE_DEFAULT_1H_PCT) * 0.75) else 'TRENDING')
+        setattr(s, 'trend', trend)
+        setattr(s, 'structure', trend)
+        setattr(s, 'bigmove_signal', True)
+        setattr(s, 'bigmove_tp1_rr_hint', float(BIGMOVE_SIGNAL_TP1_RR))
+        setattr(s, 'bigmove_tp2_rr_hint', float(BIGMOVE_SIGNAL_TP2_RR))
+        setattr(s, 'bigmove_tp1_hint', float(tp1))
+        setattr(s, 'bigmove_direction', 'UP' if side == 'BUY' else 'DOWN')
+        try:
+            score, comps = compute_setup_quality_score(s, session_name=session_name)
+            score = float(clamp(float(score or 0.0) + 2.0, 0.0, 100.0))
+            setattr(s, 'quality_score', float(score))
+            setattr(s, 'quality_components', comps or {})
+        except Exception:
+            pass
+        return _research_finalize_setup(s, session_name=session_name)
+    except Exception:
+        return None
+
+
+def pick_bigmove_family_setups(best_fut: Dict[str, MarketVol], n: int, session_name: str, universe_cap: int, scan_profile: str = DEFAULT_SCAN_PROFILE) -> List[Setup]:
+    items = list((best_fut or {}).items())
+    if not items:
+        return []
+    ranked = []
+    for base, mv in items:
+        try:
+            vol = float(usd_notional(mv) or 0.0)
+            if vol < float(BIGMOVE_DEFAULT_MIN_VOL_USD):
+                continue
+            pct24 = abs(float(getattr(mv, 'percentage', 0.0) or 0.0))
+            if pct24 < 4.0:
+                continue
+            ranked.append((pct24, vol, str(base or '').upper().strip(), mv))
+        except Exception:
+            continue
+    ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    scan_cap = min(len(ranked), max(6, min(int(BIGMOVE_SIGNAL_MAX_SCAN), int(max(3, n)) * 3)))
+    out: List[Setup] = []
+    for pct24, vol, base, mv in ranked[:scan_cap]:
+        try:
+            s = make_bigmove_family_setup(base, mv, session_name=session_name, scan_profile=scan_profile)
+            if s:
+                out.append(s)
+        except Exception:
+            continue
+    out.sort(key=lambda s: (float(getattr(s, 'quality_score', 0.0) or 0.0), int(getattr(s, 'conf', 0) or 0), float(getattr(s, 'fut_vol_usd', 0.0) or 0.0)), reverse=True)
+    return out[:max(0, int(n))]
 
 
 def _email_market_regime(best_fut: dict) -> str:
@@ -34139,8 +34456,24 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     if mom:
         priority_setups.extend(mom)
 
+    # ------------------------------------------------
+    # Big Move Continuation family (15m/1H/4H aligned expansion)
+    # ------------------------------------------------
+    try:
+        bm_take = max(3, min(int(BIGMOVE_SIGNAL_MAX_ITEMS), int(max(4, n_target))))
+        bm_setups = pick_bigmove_family_setups(
+            universe_best,
+            bm_take,
+            session_name,
+            int(universe_cap),
+            scan_profile=prof,
+        )
+    except Exception:
+        bm_setups = []
+    if bm_setups:
+        priority_setups.extend(bm_setups)
 
-    
+
     # -----------------------------------------------------
     # BALANCE MODE: If strict_15m produces too few candidates,
     # add a relaxed 15m pass to avoid starving /screen and email pools.
@@ -34234,6 +34567,13 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
 
             ok, dist_pct, last_close, ema_val, ema_p, allowed = ema_anchor_cache[mk]
             adaptive_allowed = _adaptive_ema_anchor_limit_pct(s, session_name=session_name, fallback_allowed=allowed)
+            try:
+                fam = str(getattr(s, 'family_id', '') or '').upper().strip()
+                if fam == BIGMOVE_FAMILY_ID:
+                    bm_floor = 1.12 if str(session_name or '').upper().strip() in {'LON', 'NY'} else 0.98
+                    adaptive_allowed = max(float(adaptive_allowed), float(bm_floor))
+            except Exception:
+                pass
             try:
                 if _research_balance_reversal_mode(session_name):
                     mult = 1.45
@@ -34702,16 +35042,6 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 return "🟡"
             return "🟢" if p >= 0 else "🔴"
 
-        def _engine_label(e: str) -> str:
-            ee = str(e or "").strip().upper()
-            if ee == "A":
-                return "Pullback"
-            if ee == "B":
-                return "Momentum Breakout"
-            if ee == "F":
-                return "Fallback"
-            return "Setup"
-
         lines2 = []
         for s in setups:
             try:
@@ -34741,7 +35071,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
 
                 emoji = "🟢" if side == "BUY" else "🔴"
-                typ = _engine_label(getattr(s, "engine", ""))
+                typ = _setup_display_label(s)
 
                 # Card-style formatting (same as previous detailed preview) + /size command
                 block = []
@@ -35489,6 +35819,7 @@ def _email_body_pretty(
 
         # ✅ "ID-" prefix
         parts.append(f"ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
+        parts.append(f"   Type: {_setup_display_label(s)}")
         _tp = _resolve_single_tp(s.entry, s.sl, getattr(s, 'tp', None), getattr(s, 'alt_target_a', None), getattr(s, 'alt_target_b', None), getattr(s, 'side', ''))
         parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP): {rr_to_tp(s.entry, s.sl, float(_tp or 0.0)):.2f}")
 
@@ -35570,6 +35901,7 @@ def _email_body_pretty_html(
         card = []
         card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
         card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
+        card.append(f"<div style='margin-top:4px'>Type: <b>{esc(_setup_display_label(s))}</b></div>")
         _tp = _resolve_single_tp(s.entry, s.sl, getattr(s, 'tp', None), getattr(s, 'alt_target_a', None), getattr(s, 'alt_target_b', None), getattr(s, 'side', ''))
         card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP): <code>{rr_to_tp(s.entry, s.sl, float(_tp or 0.0)):.2f}</code></div>")
 
