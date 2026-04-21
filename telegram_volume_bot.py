@@ -15107,6 +15107,29 @@ def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executab
         ),
     )
     try:
+        cur.execute(
+            """UPDATE executable_setups
+                   SET family_id=?, family_version=?, regime_id=?, regime_primary=?, allocator_plan_id=?, param_set_id=?,
+                       family_score=?, exec_score=?, validation_state=?, challenger_flag=?
+                   WHERE user_id=? AND setup_id=?
+            """,
+            (
+                str(getattr(s, 'family_id', '') or '') if s is not None else '',
+                str(getattr(s, 'family_version', '') or RESEARCH_FAMILY_VERSION) if s is not None else RESEARCH_FAMILY_VERSION,
+                str(getattr(s, 'regime_id', '') or '') if s is not None else '',
+                str(getattr(s, 'regime_primary', '') or '') if s is not None else '',
+                str(getattr(s, 'allocator_plan_id', '') or '') if s is not None else '',
+                str(getattr(s, 'param_set_id', '') or '') if s is not None else '',
+                float(getattr(s, 'family_score', 0.0) or 0.0) if s is not None else 0.0,
+                float(getattr(s, 'exec_score', 0.0) or 0.0) if s is not None else 0.0,
+                str(getattr(s, 'validation_state', '') or 'approved') if s is not None else 'approved',
+                int(bool(getattr(s, 'challenger_flag', False))) if s is not None else 0,
+                int(user_id), sid,
+            ),
+        )
+    except Exception:
+        pass
+    try:
         cutoff_ts = float(time.time()) - float(max(86400, int(AUTOTRADE_ENTRY_WINDOW_MIN) * 60 + 21600))
         cur.execute(
             """DELETE FROM executable_setups
@@ -15685,6 +15708,21 @@ def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
                 int(getattr(s, "conf", 0) or 0),
             ),
         )
+        try:
+            cur.execute(
+                """UPDATE generated_setups
+                       SET family_id=?, regime_primary=?, allocator_plan_id=?, param_set_id=?
+                       WHERE rowid = last_insert_rowid()
+                """,
+                (
+                    str(getattr(s, 'family_id', '') or ''),
+                    str(getattr(s, 'regime_primary', '') or ''),
+                    str(getattr(s, 'allocator_plan_id', '') or ''),
+                    str(getattr(s, 'param_set_id', '') or ''),
+                ),
+            )
+        except Exception:
+            pass
         con.commit()
     except Exception:
         pass
@@ -26292,6 +26330,14 @@ def is_top_setup_eligible(
         elif fam == 'F3_IMPULSE_BASE_CONT' and regime in {'EXPANSION', 'SQUEEZE'}:
             if sess in {'LON', 'NY'}:
                 min_score -= 0.80 if src == 'exec' else (0.60 if src == 'email' else 0.50)
+        elif fam == BIGMOVE_FAMILY_ID:
+            # Big Move is a separate family that shares engine B, but it should not inherit
+            # the exact same source-truth score pressure as generic breakouts or it gets
+            # silently starved before the executable gate can evaluate its multi-timeframe edge.
+            if sess in {'LON', 'NY'}:
+                min_score -= 1.60 if src == 'exec' else (1.30 if src == 'email' else 1.00)
+            else:
+                min_score -= 1.20 if src == 'exec' else (1.00 if src == 'email' else 0.80)
         elif fam == 'F1_PULLBACK_CONT' and 'TREND' in regime and sess == 'LON':
             # LON was over-converting weak pullback-continuation ideas.
             # Keep NY broad, but require slightly better LON scores here.
@@ -34624,14 +34670,24 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # de-dupe by (symbol, side, engine) keeping highest conf, preserving priority order
     best = {}
     for s in priority_setups:
-        k = (str(s.symbol).upper(), str(s.side), str(getattr(s, "engine", "")))
+        k = (
+            str(s.symbol).upper(),
+            str(s.side),
+            str(getattr(s, "engine", "")),
+            str(getattr(s, "family_id", "") or _family_id_from_engine(getattr(s, "engine", ""), s)).upper().strip(),
+        )
         if k not in best or int(s.conf) > int(best[k].conf):
             best[k] = s
 
     ordered = []
     seen = set()
     for s in priority_setups:
-        k = (str(s.symbol).upper(), str(s.side), str(getattr(s, "engine", "")))
+        k = (
+            str(s.symbol).upper(),
+            str(s.side),
+            str(getattr(s, "engine", "")),
+            str(getattr(s, "family_id", "") or _family_id_from_engine(getattr(s, "engine", ""), s)).upper().strip(),
+        )
         if k in seen:
             continue
         if k in best:
