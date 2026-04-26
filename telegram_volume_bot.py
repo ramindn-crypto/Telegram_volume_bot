@@ -10444,6 +10444,36 @@ def db_init():
     )
     """)
 
+    # Full setup payload for future report reconstruction. Older DBs only had symbol/side/conf,
+    # which made emailed signals impossible to evaluate after signals cleanup.
+    try:
+        g_cols = {r[1] for r in cur.execute("PRAGMA table_info(generated_setups)").fetchall()}
+        gen_add_cols = {
+            'market_symbol': "TEXT NOT NULL DEFAULT ''",
+            'entry': 'REAL NOT NULL DEFAULT 0',
+            'sl': 'REAL NOT NULL DEFAULT 0',
+            'tp': 'REAL NOT NULL DEFAULT 0',
+            'alt_target_a': 'REAL NOT NULL DEFAULT 0',
+            'alt_target_b': 'REAL NOT NULL DEFAULT 0',
+            'fut_vol_usd': 'REAL NOT NULL DEFAULT 0',
+            'ch24': 'REAL NOT NULL DEFAULT 0',
+            'ch4': 'REAL NOT NULL DEFAULT 0',
+            'ch1': 'REAL NOT NULL DEFAULT 0',
+            'ch15': 'REAL NOT NULL DEFAULT 0',
+            'engine': "TEXT NOT NULL DEFAULT ''",
+            'family_id': "TEXT NOT NULL DEFAULT ''",
+            'regime_primary': "TEXT NOT NULL DEFAULT ''",
+            'allocator_plan_id': "TEXT NOT NULL DEFAULT ''",
+            'param_set_id': "TEXT NOT NULL DEFAULT ''",
+        }
+        for _col, _ddl in gen_add_cols.items():
+            if _col not in g_cols:
+                cur.execute(f"ALTER TABLE generated_setups ADD COLUMN {_col} {_ddl}")
+                g_cols.add(_col)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_generated_setups_setup_ts ON generated_setups(setup_id, created_ts)")
+    except Exception:
+        pass
+
     try:
         _research_db_migrate(cur)
     except Exception:
@@ -15755,8 +15785,9 @@ def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
         cur = con.cursor()
         cur.execute(
             """INSERT INTO generated_setups
-               (user_id, source, created_ts, session, setup_id, symbol, side, conf)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (user_id, source, created_ts, session, setup_id, symbol, market_symbol, side, conf,
+                entry, sl, tp, alt_target_a, alt_target_b, fut_vol_usd, ch24, ch4, ch1, ch15, engine)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(user_id),
                 str(source or "").strip().lower(),
@@ -15764,8 +15795,20 @@ def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
                 str(session or ""),
                 str(getattr(s, "setup_id", "") or ""),
                 str(getattr(s, "symbol", "") or ""),
+                str(getattr(s, "market_symbol", "") or ""),
                 str(getattr(s, "side", "") or ""),
                 int(getattr(s, "conf", 0) or 0),
+                float(getattr(s, "entry", 0.0) or 0.0),
+                float(getattr(s, "sl", 0.0) or 0.0),
+                float(_setup_target_tp(s, 0.0) or 0.0),
+                0.0,
+                0.0,
+                float(getattr(s, "fut_vol_usd", 0.0) or 0.0),
+                float(getattr(s, "ch24", 0.0) or 0.0),
+                float(getattr(s, "ch4", 0.0) or 0.0),
+                float(getattr(s, "ch1", 0.0) or 0.0),
+                float(getattr(s, "ch15", 0.0) or 0.0),
+                str(getattr(s, "engine", "") or ""),
             ),
         )
         try:
@@ -16147,52 +16190,116 @@ def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: s
             res['note'] = str(res.get('note') or '') or f'resolved_{tf}'
             return res
         last_open = dict(res or {})
+
+    # If the signal horizon has already expired and neither TP nor SL was hit, it is not OPEN.
+    # This prevents /signal_report_overall from falsely reporting old signals as open forever.
+    try:
+        horizon_end = float(created_ts) + float(horizon_hours) * 3600.0
+        if float(time.time()) >= horizon_end - 60.0:
+            note = str((last_open or {}).get('note') or 'horizon_expired_no_hit')
+            return {"outcome": "HORIZON_EXPIRED_NO_HIT", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": note if note else "horizon_expired_no_hit"}
+    except Exception:
+        pass
     return last_open
 
 def _signal_setup_eval_payload(setup_id: str) -> dict:
+    """Return a complete setup payload for outcome evaluation.
+
+    Fix: older report logic only trusted signals, then tried generated_setups even though
+    generated_setups often did not store entry/sl/tp. That made historical emailed setups
+    impossible to evaluate and left them shown as OPEN forever.
+    """
     sid = str(setup_id or '').strip()
     if not sid:
         return {}
-    try:
-        sig = db_get_signal(sid) or {}
-    except Exception:
-        sig = {}
-    if sig:
-        out = dict(sig)
+
+    def _clean_payload(row: dict | None) -> dict:
+        out = dict(row or {})
+        if not out:
+            return {}
         out['setup_id'] = sid
         out['symbol'] = _bybit_linear_symbol(str(out.get('symbol') or ''))
         out['market_symbol'] = str(out.get('market_symbol') or '').strip() or _market_symbol_from_base(out.get('symbol'))
-        try:
-            out['created_ts'] = float(out.get('created_ts') or 0.0)
-        except Exception:
-            out['created_ts'] = 0.0
+        for k in ('created_ts', 'entry', 'sl', 'tp', 'alt_target_a', 'alt_target_b'):
+            try:
+                out[k] = float(out.get(k) or 0.0)
+            except Exception:
+                out[k] = 0.0
+        out['side'] = _norm_trade_side(str(out.get('side') or ''))
         return out
+
+    try:
+        sig = db_get_signal(sid) or {}
+        out = _clean_payload(sig)
+        if out and float(out.get('entry') or 0) > 0 and float(out.get('sl') or 0) > 0:
+            return out
+    except Exception:
+        pass
+
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             row = cur.execute(
-                """SELECT setup_id, symbol, side, entry, sl, tp, alt_target_a, alt_target_b, created_ts, market_symbol
-                   FROM generated_setups
+                """SELECT setup_id, symbol, market_symbol, side, entry, sl, tp, alt_target_a, alt_target_b,
+                          COALESCE(NULLIF(signal_created_ts,0), executable_ts) AS created_ts, conf
+                   FROM executable_setups
                    WHERE setup_id=?
-                   ORDER BY created_ts DESC
+                   ORDER BY executable_ts DESC
                    LIMIT 1""",
                 (sid,),
             ).fetchone()
-            if row:
-                out = dict(row)
-                out['setup_id'] = sid
-                out['symbol'] = _bybit_linear_symbol(str(out.get('symbol') or ''))
-                out['market_symbol'] = str(out.get('market_symbol') or '').strip() or _market_symbol_from_base(out.get('symbol'))
-                try:
-                    out['created_ts'] = float(out.get('created_ts') or 0.0)
-                except Exception:
-                    out['created_ts'] = 0.0
+            out = _clean_payload(dict(row) if row else {})
+            if out and float(out.get('entry') or 0) > 0 and float(out.get('sl') or 0) > 0:
+                if not float(out.get('created_ts') or 0):
+                    try:
+                        life = _admin_setup_lifecycle_get(sid) or {}
+                        out['created_ts'] = float(life.get('signal_created_ts') or life.get('emailed_ts') or 0.0)
+                    except Exception:
+                        pass
                 return out
     except Exception:
         pass
-    return {}
 
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            row = cur.execute(
+                """SELECT * FROM signals_archive
+                   WHERE setup_id=?
+                   ORDER BY COALESCE(archived_at, created_ts, 0) DESC
+                   LIMIT 1""",
+                (sid,),
+            ).fetchone()
+            out = _clean_payload(dict(row) if row else {})
+            if out and float(out.get('entry') or 0) > 0 and float(out.get('sl') or 0) > 0:
+                return out
+    except Exception:
+        pass
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cols = {r[1] for r in cur.execute('PRAGMA table_info(generated_setups)').fetchall()}
+            wanted = {'symbol', 'side', 'created_ts', 'conf', 'entry', 'sl', 'tp', 'alt_target_a', 'alt_target_b', 'market_symbol'}
+            if wanted.issubset(cols):
+                row = cur.execute(
+                    """SELECT setup_id, symbol, market_symbol, side, entry, sl, tp, alt_target_a, alt_target_b, created_ts, conf
+                       FROM generated_setups
+                       WHERE setup_id=?
+                       ORDER BY created_ts DESC
+                       LIMIT 1""",
+                    (sid,),
+                ).fetchone()
+                out = _clean_payload(dict(row) if row else {})
+                if out and float(out.get('entry') or 0) > 0 and float(out.get('sl') or 0) > 0:
+                    return out
+    except Exception:
+        pass
+
+    return {}
 
 def _signal_outcome_sync_for_setup(user_id: int, setup_id: str, horizon_hours: int = 24, min_age_min: int = 25, force: bool = False) -> dict:
     sid = str(setup_id or '').strip()
@@ -21209,20 +21316,22 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _canon_signal_outcome_label(outcome: str, pnl: float | None = None) -> str:
-    """Canonical user-facing outcome model: TP, SL, OPEN, UNTRACKED."""
+    """Canonical user-facing outcome model: TP, SL, OPEN, UNTRACKED.
+
+    Important fix: unknown / expired / no-hit rows must NOT silently become OPEN.
+    OPEN is reserved only for genuinely live/pending signals still inside the evaluation window
+    or backed by a current live/open trade.
+    """
     o = str(outcome or '').upper().strip()
-    if o in {'UNTRACKED', 'UNTRACKED_OPEN', 'SKIPPED', 'NOT_TRADED'}:
-        return 'UNTRACKED'
     try:
         pnl_f = None if pnl is None else float(pnl)
     except Exception:
         pnl_f = None
-    if o in {'TP', 'TP', 'TP', 'WIN_TP', 'WIN_TP', 'WIN_TP', 'WIN'}:
+
+    if o in {'TP', 'WIN_TP', 'WIN', 'TAKE_PROFIT', 'TAKEPROFIT', 'PROFIT'}:
         return 'TP'
-    if o in {'SL', 'LOSS', 'SL_FIRST', 'TP_SL'}:
+    if o in {'SL', 'LOSS', 'STOP_LOSS', 'STOPLOSS', 'SL_FIRST', 'TP_SL'}:
         return 'SL'
-    if o in {'BREAKEVEN', 'BE'}:
-        return 'OPEN'
     if o.startswith('MANUAL_CLOSE_POSITIVE'):
         return 'TP'
     if o.startswith('MANUAL_CLOSE_NEGATIVE'):
@@ -21232,120 +21341,43 @@ def _canon_signal_outcome_label(outcome: str, pnl: float | None = None) -> str:
             return 'SL'
         if pnl_f > 0:
             return 'TP'
-    return 'OPEN'
-    if o.startswith('MANUAL_CLOSE_POSITIVE'):
-        return 'TP'
-    if o.startswith('MANUAL_CLOSE_NEGATIVE'):
-        return 'SL'
-    if pnl_f is not None:
-        if pnl_f < 0:
-            return 'SL'
-        if pnl_f > 0:
-            return 'TP'
-    return 'OPEN'
 
-
-def _estimate_trade_r_multiple(trade: dict) -> float | None:
-    try:
-        entry = float(trade.get('entry') or 0.0)
-        sl = float(trade.get('sl') or 0.0)
-        qty = abs(float(trade.get('qty') or 0.0))
-        pnl = float(trade.get('pnl_usdt') if trade.get('pnl_usdt') is not None else trade.get('pnl') or 0.0)
-        risk = abs(entry - sl) * qty
-        if entry <= 0 or sl <= 0 or qty <= 0 or risk <= 0:
-            return None
-        return float(pnl / risk)
-    except Exception:
-        return None
-
-
-def _canon_outcome_from_autotrade_trade(trade: dict, live_pos: dict | None = None, exchange_events: list[dict] | None = None) -> str:
-    """Classify a trade into TP / SL / OPEN using journal + live Bybit state."""
-    try:
-        pnl = float(trade.get('pnl_usdt') if trade.get('pnl_usdt') is not None else trade.get('pnl') or 0.0)
-    except Exception:
-        pnl = 0.0
-    raw = str(trade.get('outcome') or '').upper().strip()
-    status = str(trade.get('status') or '').upper().strip()
-
-    if raw in {'WIN_TP', 'TP'}:
-        return 'TP'
-    if raw in {'LOSS', 'SL', 'SL_FIRST', 'TP_SL'}:
-        return 'SL'
-
-    if live_pos is not None or status == 'OPEN':
+    if o in {'OPEN', 'LIVE', 'PENDING', 'RUNNING', 'ACTIVE', 'BREAKEVEN', 'BE'}:
         return 'OPEN'
 
-    if abs(pnl) < 1e-9 and exchange_events:
-        try:
-            pnl = float(sum(float((ev or {}).get('pnl') or 0.0) for ev in (exchange_events or [])))
-        except Exception:
-            pnl = 0.0
-    if pnl < 0:
-        return 'SL'
-    if pnl > 0:
-        return 'TP'
-    if abs(pnl) < 1e-9:
-        return 'OPEN'
+    # Evaluated/no-hit/expired/not-traded rows display as None, not OPEN.
+    if o in {'', 'NONE', 'NULL', 'N/A', 'NA', 'UNTRACKED', 'UNTRACKED_OPEN', 'SKIPPED',
+             'NOT_TRADED', 'NO_TRADE', 'NO_HIT', 'EXPIRED', 'HORIZON_EXPIRED',
+             'HORIZON_EXPIRED_NO_HIT', 'MISSING_MARKET_SYMBOL', 'MISSING_CREATED_TS',
+             'INVALID_TRADE_LEVELS', 'EMPTY_WINDOW'}:
+        return 'UNTRACKED'
 
-    r_mult = _estimate_trade_r_multiple(trade)
-    try:
-        entry = float(trade.get('entry') or 0.0)
-        sl = float(trade.get('sl') or 0.0)
-        tp = float(trade.get('tp') or 0.0)
-        alt_target_a = float(trade.get('alt_target_a') or 0.0)
-        risk_per_unit = abs(entry - sl)
-        rr1 = (abs(tp - entry) / risk_per_unit) if risk_per_unit > 0 and tp > 0 else 0.0
-        rr2 = (abs(alt_target_a - entry) / risk_per_unit) if risk_per_unit > 0 and alt_target_a > 0 else 0.0
-        partial_fraction = max(0.25, min(0.85, float(AUTOTRADE_LIVE_TP_FRACTION or 0.65)))
-        tp_credit = partial_fraction * rr1 if rr1 > 0 else 0.0
-        alt_target_a_credit = tp_credit + ((1.0 - partial_fraction) * rr2 if rr2 > 0 else 0.0)
-    except Exception:
-        tp_credit = 0.0
-        alt_target_a_credit = 0.0
-
-    if r_mult is not None:
-        if alt_target_a_credit > 0 and r_mult >= max(alt_target_a_credit * 0.80, tp_credit + 0.05):
-            return 'TP'
-        if tp_credit > 0 and r_mult >= max(tp_credit * 0.55, 0.05):
-            return 'TP'
-    return 'TP'
+    return 'UNTRACKED'
 
 def _signal_report_setup_meta(setup_id: str) -> dict:
     sid = str(setup_id or '').strip()
     if not sid:
         return {}
-    try:
-        sig = db_get_signal(sid) or {}
-    except Exception:
-        sig = {}
-    if sig:
+    payload = _signal_setup_eval_payload(sid)
+    if payload:
         return {
-            'symbol': _bybit_linear_symbol(str(sig.get('symbol') or '')),
-            'side': _norm_trade_side(str(sig.get('side') or '')),
-            'created_ts': float(sig.get('created_ts') or 0.0),
-            'conf': sig.get('conf'),
+            'symbol': _bybit_linear_symbol(str(payload.get('symbol') or '')),
+            'side': _norm_trade_side(str(payload.get('side') or '')),
+            'created_ts': float(payload.get('created_ts') or 0.0),
+            'conf': payload.get('conf'),
         }
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            row = cur.execute(
-                """SELECT symbol, side, created_ts, conf FROM generated_setups
-                   WHERE setup_id=? ORDER BY created_ts DESC LIMIT 1""",
-                (sid,),
-            ).fetchone()
-            if row:
-                return {
-                    'symbol': _bybit_linear_symbol(str(row['symbol'] or '')),
-                    'side': _norm_trade_side(str(row['side'] or '')),
-                    'created_ts': float(row['created_ts'] or 0.0),
-                    'conf': row['conf'],
-                }
+        life = _admin_setup_lifecycle_get(sid) or {}
+        if life:
+            return {
+                'symbol': _bybit_linear_symbol(str(life.get('symbol') or '')),
+                'side': _norm_trade_side(str(life.get('side') or '')),
+                'created_ts': float(life.get('signal_created_ts') or life.get('emailed_ts') or life.get('generated_logged_ts') or 0.0),
+                'conf': None,
+            }
     except Exception:
         pass
     return {}
-
 
 def _signal_report_load_recent_trades(user_id: int, limit: int = 1000) -> list[dict]:
     rows_out: list[dict] = []
@@ -21724,9 +21756,13 @@ def _canonical_signal_outcome_for_setup(user_id: int, setup_id: str) -> tuple[st
             best = _canon_signal_outcome_label(row.get('best_level') or row.get('hit_level'))
             best_ts = float(row.get('best_ts') or row.get('hit_ts') or 0.0) if row.get('best_ts') is not None or row.get('hit_ts') is not None else 0.0
             note = str(row.get('note') or '').lower()
-            weak_note = note.startswith('no_ohlcv') or note in {'missing_market_symbol', 'missing_created_ts', 'invalid_trade_levels', 'empty_window', 'horizon_not_hit'}
+            weak_note = note.startswith('no_ohlcv') or note in {'missing_market_symbol', 'missing_created_ts', 'invalid_trade_levels', 'empty_window', 'horizon_not_hit', 'horizon_expired_no_hit'}
             if best in {'TP', 'SL'} and (best_ts > 0 or age_sec >= 3600.0) and not weak_note:
                 return best
+            # Stored OPEN rows with weak/missing evaluation evidence should not remain OPEN forever.
+            # They display as None until a future forced sync can prove TP or SL.
+            if weak_note or (created <= 0 and best not in {'TP', 'SL'}):
+                return 'UNTRACKED'
         return canon
 
     try:
@@ -33005,16 +33041,35 @@ def _signal_report_overall_text_build(target_uid: int, force_sync: bool = True) 
         lines.extend([SEP, f'Hidden untracked rows: {hidden_untracked_open} (no current live Bybit/autotrade match)'])
     out = '\n'.join(lines)
     try:
-        cache_set(f"signal_report_overall_text:{target_uid}", out)
+        # Do not keep the old bad all-open snapshot in cache; force the next call to rebuild.
+        if not _signal_report_text_is_suspicious_all_open(out):
+            cache_set(f"signal_report_overall_text:{target_uid}", out)
     except Exception:
         pass
     return out
+
+def _signal_report_text_is_suspicious_all_open(val: str | None) -> bool:
+    """Detect the old bad cached report that showed every emailed setup as OPEN forever."""
+    try:
+        s = str(val or '')
+        if not s:
+            return False
+        m_total = re.search(r'Total emailed setups:\s*(\d+)', s)
+        m_open = re.search(r'TP:\s*0\s*\|\s*SL:\s*0\s*\|\s*Open:\s*(\d+)', s, flags=re.I)
+        m_done = re.search(r'Completed outcomes:\s*0\b', s)
+        if m_total and m_open and m_done and int(m_total.group(1)) > 0 and int(m_open.group(1)) >= int(m_total.group(1)):
+            return True
+    except Exception:
+        return False
+    return False
 
 def _signal_report_overall_cached_text(target_uid: int, ttl_sec: int = 900) -> str | None:
     try:
         key = f"signal_report_overall_text:{int(target_uid)}"
         if cache_valid(key, int(max(1, ttl_sec))):
             val = cache_get(key)
+            if _signal_report_text_is_suspicious_all_open(str(val or '')):
+                return None
             return str(val) if val else None
     except Exception:
         return None
