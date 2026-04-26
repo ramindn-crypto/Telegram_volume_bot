@@ -743,6 +743,36 @@ async def to_thread_bg(fn, *args, timeout: int | None = None, **kwargs):
     return await _run_in_executor(_BACKGROUND_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
 
 
+def _safe_task_done(task: asyncio.Task, label: str = "background") -> None:
+    """Consume exceptions from fire-and-forget tasks so asyncio never logs
+    Task exception was never retrieved. Background refresh failures are recorded
+    but they must never pollute Render logs or delay Telegram commands.
+    """
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except TimeoutError as e:
+        try:
+            logger.warning("background task %s timed out: %s", label, e)
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            logger.warning("background task %s failed: %s: %s", label, type(e).__name__, e)
+        except Exception:
+            pass
+
+
+def _safe_create_task(coro, label: str = "background"):
+    try:
+        task = asyncio.create_task(coro, name=str(label or "background"))
+        task.add_done_callback(lambda t, _label=str(label or "background"): _safe_task_done(t, _label))
+        return task
+    except Exception:
+        return None
+
+
 def _run_async_in_new_loop(coro_fn, *args, **kwargs):
     """Run an async callable inside its own event loop from a worker thread.
 
@@ -2674,10 +2704,15 @@ def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> di
     }
 
     try:
+        try:
+            http_timeout = float(os.getenv("BYBIT_HTTP_TIMEOUT_SEC", "7") or 7)
+        except Exception:
+            http_timeout = 7.0
+        http_timeout = max(2.0, min(15.0, float(http_timeout)))
         if method == "GET":
-            r = requests.get(url, headers=headers, timeout=15)
+            r = requests.get(url, headers=headers, timeout=http_timeout)
         else:
-            r = requests.post(url, headers=headers, data=body.encode("utf-8"), timeout=15)
+            r = requests.post(url, headers=headers, data=body.encode("utf-8"), timeout=http_timeout)
         return r.json()
     except Exception as e:
         return {"retCode": -1, "retMsg": f"{type(e).__name__}: {e}", "result": None}
@@ -6111,7 +6146,15 @@ def _bybit_get_open_orders_linear(symbol: str | None = None) -> list[dict]:
             return []
         merged: list[dict] = []
         seen: set[str] = set()
-        order_filters = [None, 'Order', 'StopOrder', 'tpslOrder', 'TPSLOrder']
+        # Keep the live guardian responsive: the old scan made up to 5 Bybit
+        # realtime-order requests per symbol, which could exceed the guardian timeout
+        # and create command lag under exchange slowness. Default to the filters that
+        # carry active protection orders; enable BYBIT_FULL_OPEN_ORDER_SCAN=1 only for
+        # deep debugging.
+        if env_bool('BYBIT_FULL_OPEN_ORDER_SCAN', False):
+            order_filters = [None, 'Order', 'StopOrder', 'tpslOrder', 'TPSLOrder']
+        else:
+            order_filters = [None, 'StopOrder', 'tpslOrder']
         for order_filter in order_filters:
             payload = {'category': 'linear', 'openOnly': 0, 'limit': 200}
             if sym:
@@ -24987,7 +25030,7 @@ async def market_adaptive_run_cmd(update: Update, context: ContextTypes.DEFAULT_
         except Exception as e:
             _hb_touch('market_adaptive', ok=False, error=f"{type(e).__name__}: {e}", details='manual_run_error')
     try:
-        asyncio.create_task(_runner())
+        _safe_create_task(_runner(), 'manual_optimizer_runner')
     except Exception:
         pass
 
@@ -25768,7 +25811,7 @@ async def goal_profile_run_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception as e:
             _hb_touch('goal_profile', ok=False, error=f"{type(e).__name__}: {e}", details='manual_run_error')
     try:
-        asyncio.create_task(_runner())
+        _safe_create_task(_runner(), 'manual_optimizer_runner')
     except Exception:
         pass
 
@@ -30199,7 +30242,7 @@ async def _reply_later_when_done(task: asyncio.Task, bot: Bot, chat_id: int, max
 
 async def _instant_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(update.effective_user.id)
-    task = asyncio.create_task(to_thread_fast(_instant_status_text_sync, uid))
+    task = _safe_create_task(to_thread_fast(_instant_status_text_sync, uid), 'instant_status')
     try:
         txt = await asyncio.wait_for(asyncio.shield(task), timeout=max(1.0, float(os.getenv('INSTANT_STATUS_TIMEOUT_SEC', '1.2') or 1.2)))
         await send_long_message(update, txt, parse_mode=None)
@@ -30209,7 +30252,7 @@ async def _instant_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             await send_long_message(update, cached + "\n\n⏳ Fresh status is still refreshing in the background.", parse_mode=None)
         else:
             await update.message.reply_text("⏳ Status is refreshing in the background. I’ll send it as soon as it is ready.")
-            asyncio.create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)))
+            _safe_create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)), 'reply_later')
     except Exception:
         cached = _instant_cache_get(_INSTANT_STATUS_TEXT_CACHE, uid, max_age_sec=900)
         if cached:
@@ -30222,7 +30265,7 @@ async def _instant_equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     uid = int(update.effective_user.id)
     if not context.args:
         try:
-            user = await asyncio.wait_for(asyncio.shield(asyncio.create_task(get_user_cached_fast_async(uid, ttl=30))), timeout=0.8)
+            user = await asyncio.wait_for(asyncio.shield(_safe_create_task(get_user_cached_fast_async(uid, ttl=30), 'instant_equity_user_lookup')), timeout=0.8)
         except Exception:
             user = get_user_cached_fast(uid, ttl=300) or {}
         txt = f"Manual Equity: ${float((user or {}).get('equity') or 0.0):.2f}"
@@ -30245,25 +30288,25 @@ async def _instant_equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         _instant_cache_set(_INSTANT_EQUITY_TEXT_CACHE, uid, txt)
         return txt
 
-    task = asyncio.create_task(_write_equity())
+    task = _safe_create_task(_write_equity(), 'instant_equity_write')
     try:
         txt = await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
         await update.message.reply_text(txt)
     except asyncio.TimeoutError:
         await update.message.reply_text("⏳ Equity update is queued. I’ll confirm as soon as it is saved.")
-        asyncio.create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)))
+        _safe_create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)), 'reply_later')
 
 
 async def _instant_trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(update.effective_user.id)
     raw = " ".join(context.args).strip()
-    task = asyncio.create_task(to_thread_fast(_instant_trade_close_sync, uid, raw))
+    task = _safe_create_task(to_thread_fast(_instant_trade_close_sync, uid, raw), 'instant_trade_close')
     try:
         txt = await asyncio.wait_for(asyncio.shield(task), timeout=max(1.0, float(os.getenv('INSTANT_TRADE_CLOSE_TIMEOUT_SEC', '1.5') or 1.5)))
         await update.message.reply_text(txt)
     except asyncio.TimeoutError:
         await update.message.reply_text("⏳ Trade close is queued. I’ll confirm as soon as the journal write finishes.")
-        asyncio.create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)))
+        _safe_create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)), 'reply_later')
     except Exception:
         await update.message.reply_text("⚠️ Could not close the trade instantly. Please try again.")
 
@@ -33088,7 +33131,7 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
     if cached:
         await send_long_message(update, cached + "\n\n⏳ Refreshing the latest outcomes in the background…", parse_mode=None)
         try:
-            asyncio.create_task(to_thread_bg(_signal_report_overall_text_build, target_uid, True, timeout=300))
+            _safe_create_task(to_thread_bg(_signal_report_overall_text_build, target_uid, True, timeout=300), 'signal_report_overall_refresh')
         except Exception:
             pass
         return
@@ -33099,7 +33142,7 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         if stale:
             await send_long_message(update, stale + "\n\n⏳ Heavy outcome sync is still running; showing the latest cached snapshot.", parse_mode=None)
             try:
-                asyncio.create_task(to_thread_bg(_signal_report_overall_text_build, target_uid, True, timeout=300))
+                _safe_create_task(to_thread_bg(_signal_report_overall_text_build, target_uid, True, timeout=300), 'signal_report_overall_refresh')
             except Exception:
                 pass
             return
@@ -34165,7 +34208,7 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
                         except Exception:
                             pass
                     try:
-                        asyncio.create_task(to_thread_bg(_performance_report_payload_cached, owner, days, timeout=300))
+                        _safe_create_task(to_thread_bg(_performance_report_payload_cached, owner, days, timeout=300), 'performance_report_refresh')
                     except Exception:
                         pass
                     return
@@ -34181,7 +34224,7 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
         if isinstance(stale, dict) and stale.get('text'):
             await send_long_message(update, str(stale.get('text') or '') + "\n\n⏳ Heavy refresh is still running; showing the latest cached snapshot.", parse_mode=None)
             try:
-                asyncio.create_task(to_thread_bg(_performance_report_payload_cached, owner, days, timeout=300))
+                _safe_create_task(to_thread_bg(_performance_report_payload_cached, owner, days, timeout=300), 'performance_report_refresh')
             except Exception:
                 pass
             return
@@ -35428,7 +35471,7 @@ def _schedule_screen_cache_refresh(uid: int, session: str | None = None) -> None
     try:
         if _SCREEN_REFRESH_TASK is not None and not _SCREEN_REFRESH_TASK.done():
             return
-        _SCREEN_REFRESH_TASK = asyncio.create_task(_refresh_screen_cache_for_user_async(int(uid or 0), session))
+        _SCREEN_REFRESH_TASK = _safe_create_task(_refresh_screen_cache_for_user_async(int(uid or 0), session), 'screen_cache_refresh')
     except Exception:
         _SCREEN_REFRESH_TASK = None
 
@@ -36287,7 +36330,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             logger.warning("screen_sync failed uid=%s: %s", uid, sync_e)
                         except Exception:
                             pass
-                asyncio.create_task(_run_screen_sync_once())
+                _safe_create_task(_run_screen_sync_once(), 'screen_sync_once')
             except Exception:
                 pass
 
@@ -39023,45 +39066,79 @@ async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
-    repaired = []
-    try:
-        live_positions = _bybit_get_open_positions_linear() or []
-        journal_open = _autotrade_db_open_trades(int(uid)) or []
-        used_trade_ids = set()
+    """Lean live SL/TP guardian.
 
+    This must never monopolise the background executor. The previous version could call
+    Bybit open-order endpoints repeatedly per position and then time out after 15s,
+    leaving a noisy asyncio task exception in Render. This version is budget-aware,
+    limits work per tick, reuses the position snapshot, and avoids extra diagnostic
+    status calls inside the guardian loop.
+    """
+    repaired = []
+    started = time.time()
+    try:
+        budget = float(os.getenv('AUTOTRADE_GUARDIAN_BUDGET_SEC', str(max(4, int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 12) - 2))) or 10)
+    except Exception:
+        budget = 10.0
+    try:
+        max_items = int(os.getenv('AUTOTRADE_GUARDIAN_MAX_ITEMS', '3') or 3)
+    except Exception:
+        max_items = 3
+
+    def _budget_left() -> bool:
+        try:
+            return (time.time() - started) < max(2.0, float(budget))
+        except Exception:
+            return False
+
+    try:
+        live_positions = list(_bybit_get_open_positions_linear() or [])
+        journal_open = list(_autotrade_db_open_trades(int(uid)) or [])
+        if not live_positions or not journal_open:
+            return repaired
+
+        pos_map = {}
         for p in live_positions:
+            try:
+                pos_map[(str(_pos_symbol(p) or '').upper(), str(_pos_side_text(p) or '').upper())] = p
+            except Exception:
+                continue
+
+        work = []
+        used_trade_ids = set()
+        for p in live_positions:
+            if not _budget_left() or len(work) >= max_items:
+                break
             tr = _autotrade_find_open_trade_for_live_position(int(uid), p, journal_open=journal_open)
-            if tr:
-                tid = str(tr.get('trade_id') or '').strip()
-                if tid:
-                    used_trade_ids.add(tid)
-                rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
-                snap = _autotrade_live_position_status(int(uid), p, trade_row=tr)
-                if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp_order_fixed', 'be_applied')) or any(bool(snap.get(k)) for k in ('missing_sl', 'missing_tp', 'missing_alt_target_a')):
-                    if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp_order_fixed', 'be_applied')):
-                        repaired.append(rr)
-                    else:
-                        repaired.append({
-                            'checked': True,
-                            'symbol': str(snap.get('symbol') or ''),
-                            'side': str(snap.get('side') or ''),
-                            'sl_fixed': False,
-                            'tp_fixed': False,
-                            'tp_order_fixed': False,
-                            'be_applied': bool(snap.get('be_active')),
-                            'pending_missing': [name for name, flag in (('SL', snap.get('missing_sl')), ('TP', snap.get('missing_tp') or snap.get('missing_tp'))) if bool(flag)],
-                        })
+            if not tr:
+                continue
+            tid = str(tr.get('trade_id') or '').strip()
+            if tid:
+                used_trade_ids.add(tid)
+            work.append((tr, p))
 
         for tr in journal_open:
+            if not _budget_left() or len(work) >= max_items:
+                break
             tid = str(tr.get('trade_id') or '').strip()
             if tid and tid in used_trade_ids:
                 continue
-            p = _autotrade_find_live_position(str(tr.get('symbol') or ''), side=str(tr.get('side') or ''))
+            sym = _bybit_linear_symbol(str(tr.get('symbol') or ''))
+            side = str(tr.get('side') or '').upper().strip()
+            p = pos_map.get((sym, side))
             if not p:
                 continue
-            rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
-            if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp_order_fixed', 'be_applied')):
-                repaired.append(rr)
+            work.append((tr, p))
+
+        for tr, p in work:
+            if not _budget_left():
+                break
+            try:
+                rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
+                if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp_order_fixed', 'be_applied')):
+                    repaired.append(rr)
+            except Exception:
+                continue
     except Exception:
         return repaired
     return repaired
@@ -39095,7 +39172,8 @@ async def autotrade_exit_guardian_job(context: ContextTypes.DEFAULT_TYPE):
                 )
             except asyncio.TimeoutError:
                 _hb_touch('autotrade_guardian', ok=False, error=f'timeout>{AUTOTRADE_GUARDIAN_TIMEOUT_SEC}s', details='guardian_timeout')
-                logger.warning('autotrade_exit_guardian_job timed out after %ss', AUTOTRADE_GUARDIAN_TIMEOUT_SEC)
+                logger.info('autotrade_exit_guardian_job skipped: timed out after %ss (will retry later)', AUTOTRADE_GUARDIAN_TIMEOUT_SEC)
+                _autotrade_guardian_touch(0)
                 return
 
         repaired = list(repaired or [])
