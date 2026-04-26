@@ -29957,7 +29957,279 @@ def build_help_html(title: str, sections: list) -> str:
 # =========================================================
 # TELEGRAM COMMANDS
 # =========================================================
-FAST_PATH_COMMANDS = {"help", "commands", "help_admin", "size", "health"}
+FAST_PATH_COMMANDS = {"help", "commands", "help_admin", "size", "health", "status", "equity", "trade_close"}
+
+# =========================================================
+# INSTANT COMMAND LANE
+# =========================================================
+# These commands must never sit behind /screen, optimizers, Bybit calls, or OHLCV scans.
+# They render from DB/cache in the FAST executor and return stale/latest text rather than
+# blocking the Telegram event loop. Fresh work can finish in the background.
+_INSTANT_STATUS_TEXT_CACHE: dict[int, tuple[float, str]] = {}
+_INSTANT_EQUITY_TEXT_CACHE: dict[int, tuple[float, str]] = {}
+
+
+def _instant_cache_get(cache: dict, uid: int, max_age_sec: float = 600.0) -> str:
+    try:
+        ts, text = cache.get(int(uid), (0.0, ""))
+        if text and (time.time() - float(ts or 0.0)) <= float(max_age_sec):
+            return str(text)
+    except Exception:
+        pass
+    return ""
+
+
+def _instant_cache_set(cache: dict, uid: int, text: str) -> None:
+    try:
+        cache[int(uid)] = (float(time.time()), str(text or ""))
+    except Exception:
+        pass
+
+
+def _instant_status_text_sync(uid: int) -> str:
+    """Build the manual /status text in a worker thread.
+
+    This deliberately avoids any live Bybit calls. /status is manual-only and should be
+    responsive even when scans/backtests/autotrade are under pressure.
+    """
+    user = reset_daily_if_needed(get_user(int(uid)) or {})
+    if not has_active_access(int(uid), user):
+        return (
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+
+    status_is_admin = False  # /status is always MANUAL lane, even for admin
+    snap = _accounting_snapshot_cached(int(uid), user, is_admin=status_is_admin, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
+
+    equity = float(snap.get('equity') or 0.0)
+    cap = float(snap.get('cap') or 0.0)
+    pnl_today = float(snap.get('pnl_today') or 0.0)
+    used_today = float(snap.get('used_today') or 0.0)
+    remaining_today = snap.get('remaining_today', float('inf'))
+    over_by = float(snap.get('over_by') or 0.0)
+    enabled = user_enabled_sessions(user)
+    now_s = in_session_now(user)
+    now_live = current_session_utc(datetime.now(timezone.utc))
+    now_txt = now_live if int(user.get('sessions_unlimited', 0) or 0) == 1 else (now_s['name'] if now_s else 'NONE')
+    cur_s = (user.get('trade_window_start') or '').strip()
+    cur_e = (user.get('trade_window_end') or '').strip()
+    tw_txt = 'OFF' if (not cur_s or not cur_e) else f"{cur_s} → {cur_e} (local)"
+
+    try:
+        email_gate = _email_runtime_limits_snapshot(int(uid), user)
+    except Exception:
+        email_gate = {}
+    email_alerts_on = 'ON' if bool(email_gate.get('alerts_on')) else 'OFF'
+    session_cap_txt = '∞' if int(email_gate.get('session_cap', 0) or 0) <= 0 else str(int(email_gate.get('session_cap', 0) or 0))
+    day_cap_txt = '∞' if int(email_gate.get('day_cap', 0) or 0) <= 0 else str(int(email_gate.get('day_cap', 0) or 0))
+    gap_remaining = int(email_gate.get('gap_remaining_sec', 0) or 0)
+    gap_txt = f"{int(email_gate.get('gap_min', 0) or 0)}m"
+    if gap_remaining > 0:
+        gap_txt += f" (remaining {_fmt_dur(gap_remaining)})"
+    email_lane_txt = 'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'
+    email_lane_reason = ', '.join([str(r) for r in (email_gate.get('gate_reasons') or [])[:3]])
+
+    lines = [
+        '📌 Status',
+        HDR,
+        'Account',
+        f"• Plan: {snap.get('plan')}",
+        f"• Trading day: {snap.get('today_window_label')}",
+        f"• Manual Equity: ${equity:.2f}",
+        f"• PnL today (closed): ${pnl_today:+.2f}",
+        SEP,
+        'Risk',
+        f"• Opened today: {int(snap.get('positions_opened_today', 0))}" + (f"/{int(snap.get('trades_today_limit', 0))}" if int(snap.get('trades_today_limit', 0)) > 0 else ' (no count cap)'),
+        f"• Closed today: {int(snap.get('positions_closed_today', 0))}",
+        f"• Open positions now: {int(snap.get('open_positions_now', 0))}",
+        f"• Carried from prior day: {int(snap.get('inherited_open_positions', 0))}",
+        f"• Risk per trade: {str(user.get('risk_mode','PCT')).upper()} {float(user.get('risk_value',0.0)):.2f}",
+        f"• Daily cap: {str(user.get('daily_cap_mode','PCT')).upper()} {float(user.get('daily_cap_value',0.0)):.2f}{'%' if str(user.get('daily_cap_mode','PCT')).upper() == 'PCT' else ''} (≈ ${cap:.2f})",
+        f"• Current-day open risk: ${float(snap.get('current_day_open_risk', 0.0)):.2f}",
+        f"• Carried open risk: ${float(snap.get('carried_open_risk', 0.0)):.2f}",
+        f"• Total open risk now: ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
+        f"• Realised net today: ${pnl_today:+.2f}",
+        f"• Daily risk used (open risk - realised net): ${used_today:.2f}",
+        f"• Daily risk reset credit: ${float(snap.get('risk_reset_credit', 0.0) or 0.0):.2f}" if float(snap.get('risk_reset_credit', 0.0) or 0.0) > 0 else None,
+        f"• Daily risk remaining: {'∞' if not math.isfinite(float(remaining_today)) else f'${float(remaining_today):.2f}'}",
+        SEP,
+        'Alerts & sessions',
+        f"• Email alerts: {email_alerts_on}",
+        f"• Email recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
+        f"• Email cap/session: {session_cap_txt} (configured)",
+        f"• Emails sent this session: {int(email_gate.get('sent_in_session', 0) or 0)}",
+        f"• Email day cap: {day_cap_txt} (configured)",
+        f"• Emails sent today: {int(email_gate.get('sent_today', 0) or 0)}",
+        f"• Email gap: {gap_txt}",
+        f"• Email lane: {email_lane_txt}" + (f" | {email_lane_reason}" if email_lane_reason else ''),
+        f"• Sessions enabled: {' | '.join(enabled)}",
+        f"• Now: {now_txt}",
+        f"• Trade window: {tw_txt}",
+        f"• Today basis: {snap.get('today_basis')}",
+    ]
+    lines = [ln for ln in lines if ln]
+    if over_by > 0:
+        lines.append(f"⚠️ Over daily cap by ${over_by:.2f}")
+
+    try:
+        opens = db_open_trades(int(uid))
+    except Exception:
+        opens = []
+    lines.extend([SEP, f"Open Trades: {len(opens)}"])
+    if not opens:
+        lines.append('• None')
+    else:
+        for t in opens[:12]:
+            public_id = t.get('public_id')
+            try:
+                tid_txt = str(int(public_id)) if public_id is not None and str(public_id).strip() != '' else '-'
+            except Exception:
+                tid_txt = str(public_id or '-')
+            lines.append(f"• Trade ID {tid_txt} | {t.get('symbol')} {t.get('side')} | Risk ${float(t.get('risk_usd') or 0.0):.2f}")
+
+    text = "\n".join(lines)
+    _instant_cache_set(_INSTANT_STATUS_TEXT_CACHE, int(uid), text)
+    return text
+
+
+def _instant_trade_close_sync(uid: int, raw: str) -> str:
+    user = get_user(int(uid)) or {}
+    if not has_active_access(int(uid), user):
+        return (
+            "⛔️ Trial finished.\n\n"
+            "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
+            "👉 /billing"
+        )
+    raw = str(raw or '').strip()
+    if not raw:
+        return "Usage: /trade_close <TRADE_ID> pnl <PNL>"
+    tokens = raw.split()
+    if len(tokens) < 3:
+        return "Usage: /trade_close <TRADE_ID> pnl <PNL>"
+    try:
+        trade_id = int(tokens[0])
+        if tokens[1].lower() != 'pnl':
+            raise ValueError()
+        pnl = float(tokens[2])
+    except Exception:
+        return "Usage: /trade_close <TRADE_ID> pnl <PNL>  (example: /trade_close 12 pnl +85.5)"
+
+    t = db_trade_close(int(uid), int(trade_id), float(pnl))
+    if not t:
+        return "Trade not found or already closed."
+
+    try:
+        _risk_daily_sync(int(uid), user)
+    except Exception:
+        pass
+    try:
+        new_eq = float(user.get('equity') or 0.0) + float(pnl)
+        update_user(int(uid), equity=new_eq)
+        invalidate_user_cache(int(uid))
+        user = get_user(int(uid)) or user
+    except Exception:
+        pass
+    try:
+        _INSTANT_STATUS_TEXT_CACHE.pop(int(uid), None)
+        _INSTANT_EQUITY_TEXT_CACHE.pop(int(uid), None)
+    except Exception:
+        pass
+
+    r_mult = t.get('r_mult')
+    r_txt = f"{float(r_mult):+.2f}R" if r_mult is not None else '-'
+    return (
+        "✅ Trade CLOSED\n"
+        f"- ID: {trade_id}\n"
+        f"- PnL: {float(pnl):+.2f}\n"
+        f"- R: {r_txt}\n"
+        f"- New Equity: ${float((user or {}).get('equity') or 0.0):.2f}"
+    )
+
+
+async def _reply_later_when_done(task: asyncio.Task, bot: Bot, chat_id: int, max_len: int = 3900) -> None:
+    """Send a result to Telegram when a shielded worker finishes."""
+    try:
+        txt = await task
+        if not txt:
+            return
+        s = str(txt)
+        for i in range(0, len(s), max_len):
+            await bot.send_message(chat_id=chat_id, text=s[i:i+max_len])
+    except Exception:
+        pass
+
+
+async def _instant_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    task = asyncio.create_task(to_thread_fast(_instant_status_text_sync, uid))
+    try:
+        txt = await asyncio.wait_for(asyncio.shield(task), timeout=max(1.0, float(os.getenv('INSTANT_STATUS_TIMEOUT_SEC', '1.2') or 1.2)))
+        await send_long_message(update, txt, parse_mode=None)
+    except asyncio.TimeoutError:
+        cached = _instant_cache_get(_INSTANT_STATUS_TEXT_CACHE, uid, max_age_sec=900)
+        if cached:
+            await send_long_message(update, cached + "\n\n⏳ Fresh status is still refreshing in the background.", parse_mode=None)
+        else:
+            await update.message.reply_text("⏳ Status is refreshing in the background. I’ll send it as soon as it is ready.")
+            asyncio.create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)))
+    except Exception:
+        cached = _instant_cache_get(_INSTANT_STATUS_TEXT_CACHE, uid, max_age_sec=900)
+        if cached:
+            await send_long_message(update, cached, parse_mode=None)
+        else:
+            await update.message.reply_text("⚠️ Status snapshot is warming up. Try again in a few seconds.")
+
+
+async def _instant_equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not context.args:
+        try:
+            user = await asyncio.wait_for(asyncio.shield(asyncio.create_task(get_user_cached_fast_async(uid, ttl=30))), timeout=0.8)
+        except Exception:
+            user = get_user_cached_fast(uid, ttl=300) or {}
+        txt = f"Manual Equity: ${float((user or {}).get('equity') or 0.0):.2f}"
+        _instant_cache_set(_INSTANT_EQUITY_TEXT_CACHE, uid, txt)
+        await update.message.reply_text(txt)
+        return
+    try:
+        eq = float(context.args[0])
+        if eq < 0:
+            raise ValueError()
+    except Exception:
+        await update.message.reply_text("Usage: /equity 1000")
+        return
+
+    async def _write_equity():
+        await to_thread_fast(update_user, int(uid), equity=float(eq))
+        invalidate_user_cache(int(uid))
+        _INSTANT_STATUS_TEXT_CACHE.pop(int(uid), None)
+        txt = f"✅ Manual Equity set: ${float(eq):.2f}"
+        _instant_cache_set(_INSTANT_EQUITY_TEXT_CACHE, uid, txt)
+        return txt
+
+    task = asyncio.create_task(_write_equity())
+    try:
+        txt = await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+        await update.message.reply_text(txt)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏳ Equity update is queued. I’ll confirm as soon as it is saved.")
+        asyncio.create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)))
+
+
+async def _instant_trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    raw = " ".join(context.args).strip()
+    task = asyncio.create_task(to_thread_fast(_instant_trade_close_sync, uid, raw))
+    try:
+        txt = await asyncio.wait_for(asyncio.shield(task), timeout=max(1.0, float(os.getenv('INSTANT_TRADE_CLOSE_TIMEOUT_SEC', '1.5') or 1.5)))
+        await update.message.reply_text(txt)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏳ Trade close is queued. I’ll confirm as soon as the journal write finishes.")
+        asyncio.create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)))
+    except Exception:
+        await update.message.reply_text("⚠️ Could not close the trade instantly. Please try again.")
 
 async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ultra-light command lane so /help and /size never wait behind heavier middleware."""
@@ -29989,6 +30261,15 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
                 await update.message.reply_text('Admin only.')
                 raise ApplicationHandlerStop
             await send_long_message(update, HELP_TEXT_ADMIN, parse_mode=None, disable_web_page_preview=True)
+            raise ApplicationHandlerStop
+        if cmd == 'status':
+            await _instant_status_cmd(update, context)
+            raise ApplicationHandlerStop
+        if cmd == 'equity':
+            await _instant_equity_cmd(update, context)
+            raise ApplicationHandlerStop
+        if cmd == 'trade_close':
+            await _instant_trade_close_cmd(update, context)
             raise ApplicationHandlerStop
         if cmd == 'size':
             await size_cmd(update, context)
@@ -35055,6 +35336,47 @@ async def _refresh_screen_cache_async():
         _SCREEN_REFRESH_TASK = None
 
 
+async def _refresh_screen_cache_for_user_async(uid: int, session: str | None = None):
+    """Refresh a user/session scoped /screen cache in the background only.
+
+    /screen itself must return instantly with the latest available result. This task can
+    take as long as needed without blocking /status, /equity, /trade_close, or /size.
+    """
+    global _SCREEN_REFRESH_TASK
+    try:
+        if _SCREEN_LOCK.locked() or SCAN_LOCK.locked():
+            return
+        async with _SCREEN_LOCK:
+            best_fut = await to_thread_bg(_screen_best_fut_fast, timeout=25)
+            if not best_fut:
+                return
+            sess = str(session or scan_session_name_utc(datetime.now(timezone.utc)) or '').upper()
+            body, kb, _setups = await to_thread_heavy(_build_screen_body_and_kb, best_fut, sess, int(uid or 0), timeout=45)
+            _SCREEN_CACHE[f"uid:{int(uid or 0)}::{sess}"] = {
+                "ts": time.time(),
+                "body": body,
+                "kb": list(kb or []),
+            }
+            _SCREEN_CACHE[f"global::{sess}"] = {
+                "ts": time.time(),
+                "body": body,
+                "kb": list(kb or []),
+            }
+    except Exception:
+        return
+    finally:
+        _SCREEN_REFRESH_TASK = None
+
+
+def _schedule_screen_cache_refresh(uid: int, session: str | None = None) -> None:
+    global _SCREEN_REFRESH_TASK
+    try:
+        if _SCREEN_REFRESH_TASK is not None and not _SCREEN_REFRESH_TASK.done():
+            return
+        _SCREEN_REFRESH_TASK = asyncio.create_task(_refresh_screen_cache_for_user_async(int(uid or 0), session))
+    except Exception:
+        _SCREEN_REFRESH_TASK = None
+
 
 # =========================================================
 # /screen
@@ -35638,6 +35960,54 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👉 /billing"
         )
         return
+
+    # ULTRA-LOW-LATENCY /screen:
+    # Never wait for OHLCV/Bybit scans inside the user command. Return the latest cached
+    # snapshot immediately and refresh the cache in the background.
+    try:
+        live_session = current_session_utc()
+        scan_session = str(scan_session_name_utc() or '').upper()
+        loc_label, loc_time = user_location_and_time(user)
+        cache_keys = [
+            f"uid:{int(uid)}::{scan_session}",
+            f"global::{scan_session}",
+        ]
+        cache_entry = {}
+        age = 999999.0
+        for _ck in cache_keys:
+            _ce = _SCREEN_CACHE.get(_ck) or {}
+            if _ce.get('body'):
+                _age = time.time() - float(_ce.get('ts', 0.0) or 0.0)
+                if _age < age:
+                    cache_entry = _ce
+                    age = _age
+        _schedule_screen_cache_refresh(int(uid), scan_session)
+        if cache_entry.get('body') and age <= float(SCREEN_STALE_CACHE_MAX_SEC):
+            note = "_Showing latest cached scan. Fresh scan is refreshing in the background._\n"
+            if age <= float(SCREEN_CACHE_TTL_SEC):
+                note = "_Showing latest cached scan._\n"
+            header = (
+                f"*PulseFutures — Market Scan*\n"
+                f"{HDR}\n"
+                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                f"{note}"
+            )
+            keyboard = [
+                [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                for (sym, sid) in (cache_entry.get('kb') or [])
+            ]
+            await send_long_message(
+                update,
+                (header + "\n" + str(cache_entry.get('body') or '')).strip(),
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            )
+            return
+        await update.message.reply_text("🔎 No cached /screen snapshot yet. Fresh scan started in the background — run /screen again shortly.")
+        return
+    except Exception:
+        pass
 
     # Avoid long scans blocking other commands on small instances
     if SCAN_LOCK.locked():
@@ -38978,7 +39348,18 @@ def main():
     ensure_email_column()
     _evolution_migrate_tables()
     
-    app = Application.builder().token(TOKEN).post_init(_post_init).concurrent_updates(32).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(_post_init)
+        .concurrent_updates(int(os.getenv('TELEGRAM_CONCURRENT_UPDATES', '64') or 64))
+        .connection_pool_size(int(os.getenv('TELEGRAM_CONNECTION_POOL_SIZE', '256') or 256))
+        .pool_timeout(float(os.getenv('TELEGRAM_POOL_TIMEOUT_SEC', '1.0') or 1.0))
+        .connect_timeout(float(os.getenv('TELEGRAM_CONNECT_TIMEOUT_SEC', '3.0') or 3.0))
+        .read_timeout(float(os.getenv('TELEGRAM_READ_TIMEOUT_SEC', '10.0') or 10.0))
+        .write_timeout(float(os.getenv('TELEGRAM_WRITE_TIMEOUT_SEC', '10.0') or 10.0))
+        .build()
+    )
 
     # Fast-lane for ultra-light commands that must feel instant (/help, /size, etc.)
     app.add_handler(MessageHandler(filters.COMMAND, _fast_path_command_router), group=-2)
