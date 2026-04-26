@@ -695,9 +695,9 @@ import functools as _functools
 
 _FAST_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("FAST_EXECUTOR_WORKERS", "8")))
 # User-facing heavy work: /screen, reports, diagnostics, manual runs.
-_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "6")))
+_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "4")))
 # Background research / optimization work must not starve interactive commands.
-_BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "3")))
+_BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
 
 # Background backtests can temporarily saturate the heavy pool and make the
 # email loop look unhealthy even when the scheduler is alive. Track them so
@@ -832,6 +832,16 @@ def _heavy_background_defer(reason_only: bool = False) -> bool | str:
             return 'recent_user_activity' if reason_only else True
         if ALERT_LOCK.locked() or SCAN_LOCK.locked() or _SCREEN_LOCK.locked():
             return 'interactive_runtime_busy' if reason_only else True
+        try:
+            if _MARKET_ADAPTIVE_LOCK.locked():
+                return 'market_adaptive_running' if reason_only else True
+        except Exception:
+            pass
+        try:
+            if _SELF_OPT_STATE.get('stop_event') is not None:
+                return 'autonomous_optimizer_running' if reason_only else True
+        except Exception:
+            pass
         if _backtest_runtime_busy() or _goal_profile_is_running():
             return 'backtest_or_goal_running' if reason_only else True
         if not _heavy_background_window_ok():
@@ -5122,6 +5132,45 @@ def _autotrade_performance_rows(uid: int, days: int = 7) -> list[dict]:
         except Exception:
             continue
 
+    # Exchange-truth fallback: if local journal/provisional rows miss live Bybit closes,
+    # add the missing close count/PnL by anchored day so /performance_report does not stay at zero.
+    try:
+        if str(_autotrade_runtime_mode()).lower() == 'live' and BYBIT_API_KEY and BYBIT_API_SECRET:
+            start_ts = float(day_starts[0].astimezone(timezone.utc).timestamp())
+            end_ts = float((day_starts[-1] + timedelta(days=1)).astimezone(timezone.utc).timestamp())
+            raw_rows = _bybit_get_closed_pnl_linear(start_ts, end_ts, limit=max(200, days * 80)) or []
+            raw_by_day = defaultdict(lambda: {'closed': 0, 'wins': 0, 'losses': 0, 'net': 0.0, 'gp': 0.0, 'gl': 0.0})
+            for ev in raw_rows:
+                ts_ev = float(_bybit_closed_pnl_event_ts(ev) or 0.0)
+                if ts_ev <= 0:
+                    continue
+                lab = _label(ts_ev)
+                if lab not in by_day:
+                    continue
+                pnl = float((ev or {}).get('closedPnl') or (ev or {}).get('closed_pnl') or 0.0)
+                raw_by_day[lab]['closed'] += 1
+                raw_by_day[lab]['net'] += pnl
+                if pnl > 0:
+                    raw_by_day[lab]['wins'] += 1
+                    raw_by_day[lab]['gp'] += pnl
+                elif pnl < 0:
+                    raw_by_day[lab]['losses'] += 1
+                    raw_by_day[lab]['gl'] += abs(pnl)
+            for lab, raw in raw_by_day.items():
+                row = by_day.get(lab)
+                if not row:
+                    continue
+                if int(raw.get('closed') or 0) > int(row.get('closed') or 0):
+                    row['exchange_only_fallback_closes'] += int(raw.get('closed') or 0) - int(row.get('closed') or 0)
+                    row['closed'] = int(raw.get('closed') or 0)
+                    row['wins'] = int(raw.get('wins') or 0)
+                    row['losses'] = int(raw.get('losses') or 0)
+                    row['net_pnl'] = float(raw.get('net') or 0.0)
+                    row['gross_profit'] = float(raw.get('gp') or 0.0)
+                    row['gross_loss'] = float(raw.get('gl') or 0.0)
+    except Exception:
+        pass
+
     for row in by_day.values():
         win_n = int(row.get('wins') or 0)
         loss_n = int(row.get('losses') or 0)
@@ -8446,6 +8495,16 @@ def _interactive_runtime_busy(window_sec: int | None = None) -> bool:
             return True
         if ALERT_LOCK.locked() or SCAN_LOCK.locked() or _SCREEN_LOCK.locked():
             return True
+        try:
+            if _MARKET_ADAPTIVE_LOCK.locked():
+                return True
+        except Exception:
+            pass
+        try:
+            if _SELF_OPT_STATE.get('stop_event') is not None:
+                return True
+        except Exception:
+            pass
         if _backtest_runtime_busy() or _goal_profile_is_running():
             return True
         return False
@@ -10109,7 +10168,7 @@ def db_init():
     if "bigmove_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_on INTEGER NOT NULL DEFAULT 1")
     
-    # Big-move alert defaults: 15m >= 2%, 1H >= 4%, 4H >= 6% in the same direction.
+    # Big-move alert defaults: 15m >= 1.5%, 1H >= 3%, 4H >= 5% in the same direction.
     if "bigmove_alert_15m" not in cols:
         cur.execute(f"ALTER TABLE users ADD COLUMN bigmove_alert_15m REAL NOT NULL DEFAULT {BIGMOVE_DEFAULT_15M_PCT}")
     if "bigmove_alert_4h" not in cols:
@@ -10127,15 +10186,15 @@ def db_init():
     # Migrate obvious legacy defaults to the new commercial defaults without touching custom values.
     try:
         cur.execute(
-            "UPDATE users SET bigmove_alert_15m=? WHERE bigmove_alert_15m IS NULL OR ABS(bigmove_alert_15m) < 1e-9",
+            "UPDATE users SET bigmove_alert_15m=? WHERE bigmove_alert_15m IS NULL OR ABS(bigmove_alert_15m) < 1e-9 OR ABS(bigmove_alert_15m-2.0) < 1e-9",
             (float(BIGMOVE_DEFAULT_15M_PCT),),
         )
         cur.execute(
-            "UPDATE users SET bigmove_alert_1h=? WHERE bigmove_alert_1h IS NULL OR ABS(bigmove_alert_1h) < 1e-9 OR ABS(bigmove_alert_1h-10.0) < 1e-9 OR ABS(bigmove_alert_1h-7.5) < 1e-9",
+            "UPDATE users SET bigmove_alert_1h=? WHERE bigmove_alert_1h IS NULL OR ABS(bigmove_alert_1h) < 1e-9 OR ABS(bigmove_alert_1h-10.0) < 1e-9 OR ABS(bigmove_alert_1h-7.5) < 1e-9 OR ABS(bigmove_alert_1h-4.0) < 1e-9",
             (float(BIGMOVE_DEFAULT_1H_PCT),),
         )
         cur.execute(
-            "UPDATE users SET bigmove_alert_4h=? WHERE bigmove_alert_4h IS NULL OR ABS(bigmove_alert_4h) < 1e-9 OR ABS(bigmove_alert_4h-20.0) < 1e-9 OR ABS(bigmove_alert_4h-15.0) < 1e-9",
+            "UPDATE users SET bigmove_alert_4h=? WHERE bigmove_alert_4h IS NULL OR ABS(bigmove_alert_4h) < 1e-9 OR ABS(bigmove_alert_4h-20.0) < 1e-9 OR ABS(bigmove_alert_4h-15.0) < 1e-9 OR ABS(bigmove_alert_4h-6.0) < 1e-9",
             (float(BIGMOVE_DEFAULT_4H_PCT),),
         )
         cur.execute(
@@ -11172,18 +11231,19 @@ def _safe_float(x, default: float = 0.0) -> float:
 
 
 
-BIGMOVE_DEFAULT_15M_PCT = 2.0
-BIGMOVE_DEFAULT_1H_PCT = 4.0
-BIGMOVE_DEFAULT_4H_PCT = 6.0
+BIGMOVE_DEFAULT_15M_PCT = 1.5
+BIGMOVE_DEFAULT_1H_PCT = 3.0
+BIGMOVE_DEFAULT_4H_PCT = 5.0
 BIGMOVE_DEFAULT_MIN_VOL_USD = 15_000_000.0
 BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
-BIGMOVE_COOLDOWN_SEC = 60 * 60 * 2  # 2 hours
+BIGMOVE_COOLDOWN_SEC = 60 * 60  # 1 hour
 BIGMOVE_FAMILY_ID = "F8_BIGMOVE_CONT"
 BIGMOVE_FAMILY_NAME = "Big Move Continuation"
-BIGMOVE_SIGNAL_TP1_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP1_RR", "2.0") or 2.0)
-BIGMOVE_SIGNAL_TP2_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP2_RR", "4.0") or 4.0)
-BIGMOVE_SIGNAL_MAX_SCAN = int(os.environ.get("BIGMOVE_SIGNAL_MAX_SCAN", "14") or 14)
-BIGMOVE_SIGNAL_MAX_ITEMS = int(os.environ.get("BIGMOVE_SIGNAL_MAX_ITEMS", "6") or 6)
+BIGMOVE_SIGNAL_FINAL_RR = float(os.environ.get("BIGMOVE_SIGNAL_FINAL_RR", "3.0") or 3.0)
+BIGMOVE_SIGNAL_TP1_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP1_RR", str(BIGMOVE_SIGNAL_FINAL_RR)) or BIGMOVE_SIGNAL_FINAL_RR)
+BIGMOVE_SIGNAL_TP2_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP2_RR", str(BIGMOVE_SIGNAL_FINAL_RR)) or BIGMOVE_SIGNAL_FINAL_RR)
+BIGMOVE_SIGNAL_MAX_SCAN = int(os.environ.get("BIGMOVE_SIGNAL_MAX_SCAN", "36") or 36)
+BIGMOVE_SIGNAL_MAX_ITEMS = int(os.environ.get("BIGMOVE_SIGNAL_MAX_ITEMS", "8") or 8)
 
 def bigmove_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
     try:
@@ -18433,22 +18493,22 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
                 continue
             side = 'BUY' if same_up else 'SELL'
             ema_dist_pct = abs(entry - ema13[i]) / entry * 100.0 if entry > 0 and ema13[i] > 0 else 999.0
-            if ema_dist_pct > 1.10:
+            if ema_dist_pct > 1.70:
                 continue
             if side == 'BUY':
                 swing = min(lows[max(0, i - 5):i + 1]) if i >= 1 else lows[i]
-                sl = min(float(entry) - max((atr[i] * 0.92 if atr and atr[i] else entry * 0.0032), entry * 0.0032), float(swing) - max((atr[i] * 0.10 if atr and atr[i] else entry * 0.0008), entry * 0.0008))
+                sl = min(float(entry) - max((atr[i] * 1.35 if atr and atr[i] else entry * 0.0060), entry * 0.0060), float(swing) - max((atr[i] * 0.18 if atr and atr[i] else entry * 0.0015), entry * 0.0015))
                 if sl >= entry:
                     continue
             else:
                 swing = max(highs[max(0, i - 5):i + 1]) if i >= 1 else highs[i]
-                sl = max(float(entry) + max((atr[i] * 0.92 if atr and atr[i] else entry * 0.0032), entry * 0.0032), float(swing) + max((atr[i] * 0.10 if atr and atr[i] else entry * 0.0008), entry * 0.0008))
+                sl = max(float(entry) + max((atr[i] * 1.35 if atr and atr[i] else entry * 0.0060), entry * 0.0060), float(swing) + max((atr[i] * 0.18 if atr and atr[i] else entry * 0.0015), entry * 0.0015))
                 if sl <= entry:
                     continue
             R = abs(entry - sl)
             if R <= 0:
                 continue
-            tp_target = entry + float(BIGMOVE_SIGNAL_TP2_RR) * R if side == 'BUY' else entry - float(BIGMOVE_SIGNAL_TP2_RR) * R
+            tp_target = entry + float(BIGMOVE_SIGNAL_FINAL_RR) * R if side == 'BUY' else entry - float(BIGMOVE_SIGNAL_FINAL_RR) * R
             conf = _bigmove_signal_confidence(side, ch24, ch4, ch1, ch15, fut_vol_usd, ema_dist_pct)
             s = Setup(
                 setup_id=f"BT-BM-{i}",
@@ -18486,7 +18546,7 @@ def _backtest_generate_setups(symbol: str, ohlcv: list, tf: str, session_name: s
             setattr(s, 'bigmove_tp1_rr_hint', float(BIGMOVE_SIGNAL_TP1_RR))
             setattr(s, 'bigmove_tp2_rr_hint', float(BIGMOVE_SIGNAL_TP2_RR))
             score, _ = compute_setup_quality_score(s, session_name=session_name)
-            score = float(clamp(float(score or 0.0) + 2.0, 0.0, 100.0))
+            score = float(clamp(float(score or 0.0) + (4.0 if str(getattr(s, 'family_id', '') or '') == BIGMOVE_FAMILY_ID else 2.0), 0.0, 100.0))
             setattr(s, 'quality_score', float(score))
             s = _research_finalize_setup(s, session_name=session_name)
             if float(score) >= float(QUALITY_SCORE_MIN_SCREEN):
@@ -22020,16 +22080,16 @@ def _weighted_rollup_from_outcomes(outcomes: list[tuple[str, str]]) -> dict:
     counts = stats.get('counts') or Counter()
     decided = int(stats.get('decided') or 0)
     tp = int(counts.get('TP', 0))
-    tp_full = int(counts.get('TP', 0) + counts.get('TP', 0))
-    weighted_credit = (tp * 0.50) + (tp_full * 1.00)
+    tp_full = tp
+    weighted_credit = float(tp)
     weighted_wr = float((weighted_credit / decided) * 100.0) if decided > 0 else 0.0
 
     by_session_out = {}
     for sess, item in (stats.get('by_session') or {}).items():
         s_dec = int(item.get('decided') or 0)
         s_tp = int(item.get('tp') or 0)
-        s_tp_full = int(item.get('tp') or 0) + int(item.get('alt_target_a') or 0)
-        s_weighted_credit = (s_tp * 0.50) + (s_tp_full * 1.00)
+        s_tp_full = s_tp
+        s_weighted_credit = float(s_tp)
         by_session_out[sess] = {
             'total': int(item.get('total') or 0),
             'decided': s_dec,
@@ -24879,40 +24939,21 @@ async def market_adaptive_run_cmd(update: Update, context: ContextTypes.DEFAULT_
         force = bool(args and str(args[0]).strip().lower() in ('force', 'now', 'override'))
     except Exception:
         force = False
-    await update.message.reply_text('⏳ Running market-adaptive 30d optimization now…')
-    _hb_touch('market_adaptive', ok=True, details='manual_run_start')
-    res = await to_thread_heavy(_run_market_adaptive_cycle, force)
-    if isinstance(res, dict) and res.get('ok'):
-        _hb_touch('market_adaptive', ok=True, details='manual_run_ok')
-        rep = (res.get('report') or {})
-        base = ((rep.get('baseline') or {}).get('overall') or {})
-        final = ((rep.get('final') or {}).get('overall') or {})
-        actions = list(rep.get('actions') or [])
-        lines = [
-            '📈 Market-Adaptive Optimization Completed',
-            HDR,
-            f"Run: {rep.get('run_id','')}",
-            f"Baseline live: setups/day={float(base.get('setups_per_day', 0.0) or 0.0):.2f} | WR={float(base.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(base.get('avg_R', 0.0) or 0.0):.3f}",
-            f"Final live: setups/day={float(final.get('setups_per_day', 0.0) or 0.0):.2f} | WR={float(final.get('win_rate', 0.0) or 0.0):.1f}% | AvgR={float(final.get('avg_R', 0.0) or 0.0):.3f}",
-            f"Actions applied: {len(actions)}",
-        ]
-        if actions:
-            lines.append('Actions:')
-            for a in actions[:8]:
-                lines.append(f"• {a.get('param')} {a.get('from')}→{a.get('to')} | {a.get('reason')}")
-        await send_long_message(update, '\n'.join(lines), parse_mode=None)
-        return
-    status = str((res or {}).get('status') or 'UNKNOWN').upper()
-    reason_map = {
-        'COOLDOWN': 'cooldown is active since the last cycle',
-        'BUSY': 'another market-adaptive cycle is already running',
-        'OPTIMIZER_BUSY': 'the autonomous optimizer is running right now',
-        'DISABLED': 'market-adaptive optimization is disabled in config',
-    }
-    detail = reason_map.get(status, 'no changes were applied this time')
-    _hb_touch('market_adaptive', ok=True, details=f'manual_run_{status.lower()}')
-    await update.message.reply_text(f'ℹ️ /adaptive_run did not start a new cycle: {detail}.')
-
+    await update.message.reply_text('✅ Market-adaptive optimization has been queued in the background. Commands stay responsive while it runs. Use /adaptive_status for the latest snapshot.')
+    _hb_touch('market_adaptive', ok=True, details='manual_run_queued')
+    async def _runner():
+        try:
+            res = await to_thread_bg(_run_market_adaptive_cycle, force, timeout=3600)
+            if isinstance(res, dict) and res.get('ok'):
+                _hb_touch('market_adaptive', ok=True, details='manual_run_ok')
+            else:
+                _hb_touch('market_adaptive', ok=True, details=f"manual_run_{str((res or {}).get('status') or 'skipped').lower()}")
+        except Exception as e:
+            _hb_touch('market_adaptive', ok=False, error=f"{type(e).__name__}: {e}", details='manual_run_error')
+    try:
+        asyncio.create_task(_runner())
+    except Exception:
+        pass
 
 async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
     """Internal autonomous optimizer. No manual trigger required."""
@@ -25680,41 +25721,20 @@ async def goal_profile_run_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         force = bool(args and str(args[0]).strip().lower() in ('force', 'now', 'override'))
     except Exception:
         force = False
-    await update.message.reply_text('⏳ Running goal-profile optimizer now…')
+    await update.message.reply_text('✅ Goal-profile optimizer has been queued in the background. Use /goal_status for the latest cached/progress snapshot.')
+    async def _runner():
+        try:
+            rep = await to_thread_bg(_run_goal_profile_cycle, force, timeout=3600)
+            if isinstance(rep, dict) and rep.get('ok'):
+                _hb_touch('goal_profile', ok=True, details='manual_run_ok')
+            else:
+                _hb_touch('goal_profile', ok=True, details=f"manual_run_{str((rep or {}).get('status') or 'skipped').lower()}")
+        except Exception as e:
+            _hb_touch('goal_profile', ok=False, error=f"{type(e).__name__}: {e}", details='manual_run_error')
     try:
-        rep = await to_thread_heavy(_run_goal_profile_cycle, force)
-    except Exception as e:
-        await update.message.reply_text(f'Goal-profile optimizer failed: {type(e).__name__}: {e}')
-        return
-    if not isinstance(rep, dict):
-        await update.message.reply_text('Goal-profile optimizer returned no report.')
-        return
-    if not rep.get('ok'):
-        status = str(rep.get('status') or 'UNKNOWN')
-        extra = str(rep.get('error') or '').strip()
-        await update.message.reply_text(f"Goal-profile optimizer status: {status}{(' | ' + extra) if extra else ''}")
-        return
-    final = rep.get('final') or {}
-    m30 = final.get('metrics_30d') or {}
-    m7 = final.get('metrics_7d') or {}
-    lines = [
-        '🎯 Goal-Profile Optimizer',
-        HDR,
-        f"Status: {rep.get('status','')}",
-        f"Final profile: {final.get('goal_profile_active_profile','BASELINE')} | sessions={','.join(final.get('execution_sessions_allowed') or []) or '-'} | engines={','.join(final.get('execution_engines_allowed') or []) or '-'}",
-        f"30d live: setups/day={float(m30.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m30.get('setups',0) or 0)} | WR={float(m30.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m30.get('avg_R',0.0) or 0.0):.3f}",
-        f"7d live: setups/day={float(m7.get('setups_per_day',0.0) or 0.0):.2f} | setups={int(m7.get('setups',0) or 0)} | WR={float(m7.get('win_rate',0.0) or 0.0):.1f}% | AvgR={float(m7.get('avg_R',0.0) or 0.0):.3f}",
-    ]
-    top = list(rep.get('top_candidates') or [])[:5]
-    if top:
-        lines.append('Top candidates:')
-        for row in top:
-            m30c = row.get('metrics_30d') or {}
-            lines.append(f"• {row.get('profile')}/{row.get('bundle')} | score={float(row.get('score',0.0) or 0.0):.2f} | 30d {float(m30c.get('setups_per_day',0.0) or 0.0):.2f}/day @ WR {float(m30c.get('win_rate',0.0) or 0.0):.1f}%")
-    try:
-        await send_long_message(update, '\n'.join(lines), parse_mode=None)
+        asyncio.create_task(_runner())
     except Exception:
-        await update.message.reply_text('\n'.join(lines))
+        pass
 
 async def goal_profile_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
@@ -28286,7 +28306,7 @@ def make_bigmove_family_setup(base: str, mv: Any, session_name: str = 'LON', sca
 
         ema_dist_pct = abs(entry - float(ema_support_15m or 0.0)) / entry * 100.0 if float(ema_support_15m or 0.0) > 0 else 999.0
         sess = str(session_name or '').upper().strip() or 'NY'
-        max_pb = 1.08 if sess in {'LON', 'NY'} else 0.96
+        max_pb = 1.60 if sess in {'LON', 'NY'} else 1.40
         if ema_dist_pct > max_pb:
             return None
 
@@ -28299,13 +28319,13 @@ def make_bigmove_family_setup(base: str, mv: Any, session_name: str = 'LON', sca
             if float(last_c) < max(float(last_o), float(ema_support_15m or 0.0) * 0.992):
                 return None
             swing = min(lows_recent) if lows_recent else float(last_l or entry)
-            sl = min(float(entry) - max(float(atr_1h) * 0.92, float(entry) * 0.0032), float(swing) - max(float(atr_1h) * 0.12, float(entry) * 0.0008))
+            sl = min(float(entry) - max(float(atr_1h) * 1.35, float(entry) * 0.0060), float(swing) - max(float(atr_1h) * 0.20, float(entry) * 0.0015))
             trend = 'BULLISH'
         else:
             if float(last_c) > min(float(last_o), float(ema_support_15m or entry) * 1.008):
                 return None
             swing = max(highs_recent) if highs_recent else float(last_h or entry)
-            sl = max(float(entry) + max(float(atr_1h) * 0.92, float(entry) * 0.0032), float(swing) + max(float(atr_1h) * 0.12, float(entry) * 0.0008))
+            sl = max(float(entry) + max(float(atr_1h) * 1.35, float(entry) * 0.0060), float(swing) + max(float(atr_1h) * 0.20, float(entry) * 0.0015))
             trend = 'BEARISH'
         if side == 'BUY' and sl >= entry:
             return None
@@ -28315,8 +28335,8 @@ def make_bigmove_family_setup(base: str, mv: Any, session_name: str = 'LON', sca
         R = abs(float(entry) - float(sl))
         if R <= 0:
             return None
-        tp1 = float(entry) + float(BIGMOVE_SIGNAL_TP1_RR) * R if side == 'BUY' else float(entry) - float(BIGMOVE_SIGNAL_TP1_RR) * R
-        tp2 = float(entry) + float(BIGMOVE_SIGNAL_TP2_RR) * R if side == 'BUY' else float(entry) - float(BIGMOVE_SIGNAL_TP2_RR) * R
+        tp1 = 0.0  # single-TP model; kept only for backward-compatible display fields
+        tp2 = float(entry) + float(BIGMOVE_SIGNAL_FINAL_RR) * R if side == 'BUY' else float(entry) - float(BIGMOVE_SIGNAL_FINAL_RR) * R
         conf = _bigmove_signal_confidence(side, float(getattr(mv, 'percentage', 0.0) or 0.0), float(ch4), float(ch1), float(ch15), float(fut_vol), float(ema_dist_pct))
 
         s = Setup(
@@ -28358,7 +28378,7 @@ def make_bigmove_family_setup(base: str, mv: Any, session_name: str = 'LON', sca
         setattr(s, 'bigmove_direction', 'UP' if side == 'BUY' else 'DOWN')
         try:
             score, comps = compute_setup_quality_score(s, session_name=session_name)
-            score = float(clamp(float(score or 0.0) + 2.0, 0.0, 100.0))
+            score = float(clamp(float(score or 0.0) + (4.0 if str(getattr(s, 'family_id', '') or '') == BIGMOVE_FAMILY_ID else 2.0), 0.0, 100.0))
             setattr(s, 'quality_score', float(score))
             setattr(s, 'quality_components', comps or {})
         except Exception:
@@ -30915,7 +30935,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📣 Big-Move Alert Emails",
             f"{HDR}",
             f"Status: {'ON' if cur_on else 'OFF'}",
-            f"Thresholds: |15m| ≥ {cur_p15:.0f}% AND |1H| ≥ {cur_p1:.0f}% AND |4H| ≥ {cur_p4:.0f}% (same direction only)",
+            f"Thresholds: |15m| ≥ {cur_p15:g}% AND |1H| ≥ {cur_p1:g}% AND |4H| ≥ {cur_p4:g}% (same direction only)",
             f"Min Vol (24H): {cur_min_vol/1e6:.1f}M",
         ]
         if updated_ts > 0:
@@ -30924,7 +30944,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"Reason: {updated_reason}")
         lines.extend([
             "",
-            "Set: /bigmove_alert on 2 4 6",
+            "Set: /bigmove_alert on 1.5 3 5",
             "Off: /bigmove_alert off",
         ])
         await update.message.reply_text("\n".join(lines))
@@ -30948,10 +30968,10 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 p1 = float(context.args[2])
                 p4 = float(context.args[3])
             except Exception:
-                await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 2 4 6)")
+                await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 1.5 3 5)")
                 return
         _record_bigmove_settings_change(uid, True, p15, p1, p4, min_vol, f"command_on via /bigmove_alert (15m>={p15:.2f}% AND 1H>={p1:.2f}% AND 4H>={p4:.2f}%, same_direction_only, min_vol={min_vol/1e6:.1f}M)")
-        await update.message.reply_text(f"✅ Big-move alert emails: ON (15m≥{p15:.0f}% AND 1H≥{p1:.0f}% AND 4H≥{p4:.0f}% | same direction only | Min Vol {min_vol/1e6:.1f}M)")
+        await update.message.reply_text(f"✅ Big-move alert emails: ON (15m≥{p15:g}% AND 1H≥{p1:g}% AND 4H≥{p4:g}% | same direction only | Min Vol {min_vol/1e6:.1f}M)")
         return
 
     await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 2 4 6)  OR  /bigmove_alert off")
@@ -32658,30 +32678,30 @@ async def admin_reset_signal_reports_cmd(update: Update, context: ContextTypes.D
         await update.message.reply_text(f"❌ admin_reset_signal_reports failed: {e}")
 
 
-async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/signal_report_overall — overall canonical 2-TP summary with live sync for admin/autotrade rows."""
-    uid = update.effective_user.id
-    target_uid = int(AUTOTRADE_OWNER_UID or uid) if is_admin_user(uid) else int(uid)
+def _signal_report_overall_text_build(target_uid: int, force_sync: bool = True) -> str:
+    target_uid = int(target_uid)
     all_emailed = db_list_emailed_setups_all(target_uid)
     total = len(all_emailed)
     if total == 0:
-        await update.message.reply_text("No emailed setups found yet for this account.")
-        return
-
-    summary = _signal_outcome_summary(target_uid)
-    rows = summary.get('rows') or []
+        return "No emailed setups found yet for this account."
+    try:
+        _signal_outcome_sync_for_user(target_uid, days=None, limit=max(200, min(2500, total + 100)), force=bool(force_sync))
+    except Exception:
+        pass
+    user = get_user(target_uid) or {}
+    rows, hidden_untracked_open = _signal_report_resolve_rows(target_uid, all_emailed, user=user)
+    rows = [dict(r, outcome=_display_signal_outcome((r or {}).get('outcome'))) for r in (rows or [])]
     stats = _canonical_wr_stats(rows)
     counts = stats.get('counts') or Counter()
     by_session = stats.get('by_session') or {}
     evaluated = len(rows)
     coverage = (evaluated / total * 100.0) if total > 0 else 0.0
-
     try:
         life_days = max(7, min(90, int(_autotrade_history_days_available(target_uid) or 30)))
     except Exception:
         life_days = 30
     try:
-        lifecycle = _trade_lifecycle_analytics(target_uid, days=life_days, session='ALL', sync=True, force=False)
+        lifecycle = _trade_lifecycle_analytics(target_uid, days=life_days, session='ALL', sync=True, force=bool(force_sync))
     except Exception:
         lifecycle = {}
     lines = [
@@ -32692,17 +32712,67 @@ async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAUL
         SEP,
         f'Completed outcomes: {int(stats.get("decided") or 0)}',
         f'TP wins: {int(stats.get("wins") or 0)} | Losses: {int(stats.get("losses") or 0)} | Signal WR: {float(stats.get("win_rate") or 0.0):.1f}%',
-        f'TP: {int(counts.get("TP",0)) + int(counts.get("TP",0)) + int(counts.get("TP",0))} | SL: {counts.get("SL",0)} | Open: {counts.get("OPEN",0)}',
+        f'TP: {int(counts.get("TP",0))} | SL: {int(counts.get("SL",0))} | Open: {int(counts.get("OPEN",0))} | None: {int(counts.get("None",0))}',
     ]
     lines.extend([SEP, *_trade_lifecycle_analytics_lines(lifecycle, heading=f'Exchange-backed lifecycle ({life_days}d)', include_sessions=True, include_engines=True, include_buckets=True, include_symbols=True, include_signs=True, max_signs=2)])
     if by_session:
         lines.extend([SEP, 'By session'])
         for sname, c in sorted(by_session.items(), key=lambda kv: kv[0]):
-            lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP {int(c.get('tp') or 0) + int(c.get('alt_target_a') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
-    hidden_untracked_open = int(summary.get('hidden_untracked_open') or 0)
+            lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP {int(c.get('tp') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
+    hidden_untracked_open = int(hidden_untracked_open or 0)
     if hidden_untracked_open > 0:
         lines.extend([SEP, f'Hidden untracked rows: {hidden_untracked_open} (no current live Bybit/autotrade match)'])
-    await send_long_message(update, '\n'.join(lines), parse_mode=None)
+    out = '\n'.join(lines)
+    try:
+        cache_set(f"signal_report_overall_text:{target_uid}", out)
+    except Exception:
+        pass
+    return out
+
+def _signal_report_overall_cached_text(target_uid: int, ttl_sec: int = 900) -> str | None:
+    try:
+        key = f"signal_report_overall_text:{int(target_uid)}"
+        if cache_valid(key, int(max(1, ttl_sec))):
+            val = cache_get(key)
+            return str(val) if val else None
+    except Exception:
+        return None
+    return None
+
+async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/signal_report_overall — overall single-TP summary with live sync and instant cached fallback."""
+    uid = update.effective_user.id
+    target_uid = int(AUTOTRADE_OWNER_UID or uid) if is_admin_user(uid) else int(uid)
+    force = False
+    try:
+        force = bool(context.args and str(context.args[0]).strip().lower() in {'force', 'refresh', 'now'})
+    except Exception:
+        force = False
+    cached = None if force else _signal_report_overall_cached_text(target_uid, ttl_sec=900)
+    if cached:
+        await send_long_message(update, cached + "\n\n⏳ Refreshing the latest outcomes in the background…", parse_mode=None)
+        try:
+            asyncio.create_task(to_thread_bg(_signal_report_overall_text_build, target_uid, True, timeout=300))
+        except Exception:
+            pass
+        return
+    try:
+        text_out = await to_thread_heavy(_signal_report_overall_text_build, target_uid, True, timeout=90)
+    except asyncio.TimeoutError:
+        stale = _signal_report_overall_cached_text(target_uid, ttl_sec=86400)
+        if stale:
+            await send_long_message(update, stale + "\n\n⏳ Heavy outcome sync is still running; showing the latest cached snapshot.", parse_mode=None)
+            try:
+                asyncio.create_task(to_thread_bg(_signal_report_overall_text_build, target_uid, True, timeout=300))
+            except Exception:
+                pass
+            return
+        await update.message.reply_text('⚠️ /signal_report_overall sync is still running. Try again shortly.')
+        return
+    except Exception as e:
+        await update.message.reply_text(f"❌ /signal_report_overall failed: {type(e).__name__}: {e}")
+        return
+    await send_long_message(update, str(text_out or ''), parse_mode=None)
 
 def _autotrade_checkbox(flag: bool) -> str:
     return '✅' if bool(flag) else '—'
@@ -33731,25 +33801,59 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text("⛔️ Owner/admin only.")
         return
-
     days = 7
+    force = False
     try:
-        if context.args and str(context.args[0]).strip():
-            days = int(float(context.args[0]))
+        args = list(context.args or [])
+        if args and str(args[0]).strip().lower() in {'force', 'refresh', 'now'}:
+            force = True
+            args = args[1:]
+        if args and str(args[0]).strip():
+            days = int(float(args[0]))
     except Exception:
         days = 7
     days = int(clamp(days, 3, 30))
-
     owner = int(AUTOTRADE_OWNER_UID or uid)
+    cache_key = f"performance_report_payload:{owner}:{days}"
+    if not force:
+        try:
+            if cache_valid(cache_key, 900):
+                cached = cache_get(cache_key)
+                if isinstance(cached, dict) and cached.get('text'):
+                    await send_long_message(update, str(cached.get('text') or '') + "\n\n⏳ Refreshing the latest performance data in the background…", parse_mode=None)
+                    chart_path = str(cached.get('chart_path') or '')
+                    if chart_path:
+                        try:
+                            with open(chart_path, 'rb') as f:
+                                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=f, caption='📉 Equity & daily PnL trend')
+                        except Exception:
+                            pass
+                    try:
+                        asyncio.create_task(to_thread_bg(_performance_report_payload_cached, owner, days, timeout=300))
+                    except Exception:
+                        pass
+                    return
+        except Exception:
+            pass
     try:
-        payload = await to_thread_heavy(_performance_report_payload_cached, owner, days, timeout=PERFORMANCE_REPORT_TIMEOUT_SEC)
+        payload = await to_thread_heavy(_performance_report_payload_cached, owner, days, timeout=min(int(PERFORMANCE_REPORT_TIMEOUT_SEC), 45))
     except asyncio.TimeoutError:
-        await update.message.reply_text(f"⚠️ /performance_report timed out after {int(PERFORMANCE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
+        try:
+            stale = cache_get(cache_key)
+        except Exception:
+            stale = None
+        if isinstance(stale, dict) and stale.get('text'):
+            await send_long_message(update, str(stale.get('text') or '') + "\n\n⏳ Heavy refresh is still running; showing the latest cached snapshot.", parse_mode=None)
+            try:
+                asyncio.create_task(to_thread_bg(_performance_report_payload_cached, owner, days, timeout=300))
+            except Exception:
+                pass
+            return
+        await update.message.reply_text(f"⚠️ /performance_report timed out after {min(int(PERFORMANCE_REPORT_TIMEOUT_SEC), 45)}s. Try again in a few seconds.")
         return
     except Exception as e:
         await update.message.reply_text(f"❌ /performance_report failed: {type(e).__name__}: {e}")
         return
-
     await send_long_message(update, str(payload.get('text') or ''), parse_mode=None)
     chart_path = str(payload.get('chart_path') or '')
     if chart_path:
@@ -36429,8 +36533,8 @@ ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT = float(os.environ.get("ALER
 EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "600"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
-PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "60"))
-PERFORMANCE_REPORT_TIMEOUT_SEC = int(os.environ.get("PERFORMANCE_REPORT_TIMEOUT_SEC", "75"))
+PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "300"))
+PERFORMANCE_REPORT_TIMEOUT_SEC = int(os.environ.get("PERFORMANCE_REPORT_TIMEOUT_SEC", "45"))
 
 # SMTP connection reuse (Render speed fix)
 SMTP_REUSE_TTL_SEC = int(os.environ.get("SMTP_REUSE_TTL_SEC", "240"))  # 4 minutes
