@@ -17316,10 +17316,10 @@ OHLCV_PAGED_CACHE_TTL_SEC = float(os.getenv("OHLCV_PAGED_CACHE_TTL_SEC", "120") 
 # User commands still answer from DB/stale cache/tickers; cold OHLCV is paced in the background.
 PROCESS_START_TS = float(time.time())
 OHLCV_BOOT_GRACE_SEC = float(os.getenv("OHLCV_BOOT_GRACE_SEC", "150") or 150)
-OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "10") or 10)
-OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "2.0") or 2.0)
-BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK = env_bool("BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK", False)
-BIGMOVE_ALLOW_COLD_CONFIRM_FETCH = env_bool("BIGMOVE_ALLOW_COLD_CONFIRM_FETCH", False)
+OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "18") or 18)
+OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "1.25") or 1.25)
+BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK = env_bool("BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK", True)
+BIGMOVE_ALLOW_COLD_CONFIRM_FETCH = env_bool("BIGMOVE_ALLOW_COLD_CONFIRM_FETCH", True)
 _OHLCV_COLD_FETCH_LOCK = threading.Lock()
 _OHLCV_COLD_FETCH_WINDOW_TS = 0.0
 _OHLCV_COLD_FETCH_COUNT = 0
@@ -37589,11 +37589,11 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "75"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "40"))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "70"))
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "300"))
-ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "0"))
+ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "3"))
 ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "3"))
 ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC", "12"))
 ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "6"))
@@ -37601,6 +37601,7 @@ ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN
 ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.70") or 0.70)
 ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT = float(os.environ.get("ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT", "0.45") or 0.45)
 ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT = float(os.environ.get("ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT", "0.55") or 0.55)
+BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "14") or 14)
 EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "600"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
@@ -37700,10 +37701,12 @@ def _alert_job_limit(name: str, default: int) -> int:
         return max(1, int(default))
 
 async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
-    # Prevent overlapping runs (JobQueue can overlap if a run is slow)
+    # Prevent overlapping runs (JobQueue can overlap if a run is slow).
+    # Do NOT skip the whole email loop because a user command ran recently or
+    # a heavy optimizer/screen task is active. That silently starves emails for
+    # a full session. Heavy scans are gated later; DB-lane consumption and
+    # Big-Move pending confirmations must still run.
     if ALERT_LOCK.locked():
-        return
-    if _interactive_runtime_busy(HEAVY_USER_ACTIVITY_DEFER_SEC):
         return
 
     async with ALERT_LOCK:
@@ -37974,6 +37977,76 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 return {"status": "ERROR", "reasons": [f"{type(e).__name__}: {e}"]}
 
+
+        async def _send_bigmove_payload_for_user(uid: int, tz, tag: str = 'pre_session') -> None:
+            """Build and send one user's Big-Move email without waiting behind setup scans.
+
+            This keeps /bigmove_alert independent from slow / blocked executable-pool
+            rebuilds. It still respects confirmation, volume, cooldown, and SMTP status.
+            """
+            try:
+                payload_timeout = max(6, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 14))
+                try:
+                    payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, timeout=payload_timeout)
+                except asyncio.TimeoutError:
+                    payload = {"status": "SKIP", "reasons": [f"bigmove_payload_timeout>{payload_timeout}s"]}
+                pstatus = str((payload or {}).get('status') or '').upper().strip()
+                if pstatus != 'READY':
+                    _LAST_BIGMOVE_DECISION[int(uid)] = {
+                        "status": pstatus or "SKIP",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": list((payload or {}).get('reasons') or ["bigmove_payload_not_ready"]),
+                    }
+                    return
+
+                subject = str(payload.get('subject') or '')
+                body = str(payload.get('body') or '')
+                filtered = list(payload.get('filtered') or [])
+                top_sym = str(payload.get('top_sym') or '')
+                top_dir = str(payload.get('top_dir') or '')
+                top_tf = str(payload.get('top_tf') or '')
+                top_move = float(payload.get('top_move') or 0.0)
+
+                try:
+                    ok = await _send_email_async(
+                        int(EMAIL_SEND_TIMEOUT_SEC),
+                        subject,
+                        body,
+                        user_id_for_debug=int(uid),
+                        bypass_user_email_master=True,
+                        enforce_trade_window=False,
+                    )
+                except Exception as e:
+                    ok = False
+                    try:
+                        _LAST_SMTP_ERROR[int(uid)] = f"{type(e).__name__}: {e}"
+                    except Exception:
+                        pass
+
+                _LAST_BIGMOVE_DECISION[int(uid)] = {
+                    "status": "SENT" if ok else "ERROR",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "subject": subject,
+                    "reasons": (
+                        [f"candidates={len(filtered)}", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%", f"sent_{tag}"]
+                        if ok else
+                        [f"send_email_failed_or_timeout_{tag}", _LAST_SMTP_ERROR.get(int(uid), "send_email_failed")]
+                    ),
+                }
+                if ok:
+                    for c in filtered[:8]:
+                        try:
+                            mark_bigmove_emailed(int(uid), c["symbol"], c["direction"])
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
+                _LAST_BIGMOVE_DECISION[int(uid)] = {
+                    "status": "ERROR",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": [f"{tag}_{type(e).__name__}: {e}"],
+                }
+
         # -----------------------------------------------------
         # Big-Move Alert Emails (independent of full trade setups)
         # Trigger: |15m| >= user.bigmove_alert_15m AND |1H| >= user.bigmove_alert_1h
@@ -38015,16 +38088,18 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 tz = ZoneInfo(tz_name)
             except Exception:
                 tz = timezone.utc
-            deferred_bigmove_jobs.append({
-                "uid": int(uid),
-                "tz": tz,
-                "pre_session_build": True,
-            })
-            _LAST_BIGMOVE_DECISION[uid] = {
-                "status": "DEFER",
-                "when": datetime.now(tz).isoformat(timespec="seconds"),
-                "reasons": ["queued_until_after_session_pools"],
-            }
+            # Big-Move must not wait behind the session setup pool. DELAYFIX4
+            # deferred it until after heavy scans; if scans timed out or exhausted
+            # the runtime budget, no Big-Move email was ever sent even though
+            # /email_test worked. Run it now in the dedicated email executor.
+            if _job_budget_exhausted():
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "SKIP",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": ["pre_session_bigmove_budget_exhausted"],
+                }
+                continue
+            await _send_bigmove_payload_for_user(int(uid), tz, tag='pre_session')
 
 
         # -----------------------------------------------------
@@ -38105,7 +38180,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # Cache-first: avoid rebuilding the full email pool every cycle when a recent
             # authoritative session pool already exists. Under runtime pressure, prefer
             # reusing cache over starting another expensive scan.
-            busy_runtime = bool(goal_running) or SCAN_LOCK.locked() or _SCREEN_LOCK.locked() or _backtest_runtime_busy()
+            busy_runtime = SCAN_LOCK.locked() or _SCREEN_LOCK.locked() or _backtest_runtime_busy()
             cache_ttl_for_email = float(max(_alert_job_limit('EMAIL_POOL_REBUILD_MIN_SEC', 180), 600 if busy_runtime else 0))
             if cached_setups and cache_age <= cache_ttl_for_email:
                 setups = list(cached_setups)
@@ -38129,7 +38204,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         pass
                 else:
                     try:
-                        pool = await to_thread_bg(
+                        pool = await to_thread_email(
                             _run_async_in_new_loop,
                             build_priority_pool,
                             best_fut,
@@ -38147,9 +38222,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         pool = {"setups": []}
 
                     setups = list(pool.get("setups", []) or [])
-                    if (not setups) and (not busy_runtime) and (not tf_cooling) and str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
+                    if (not setups) and (not busy_runtime) and (not tf_cooling) and ((time.time() - job_started_ts) < max(10.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 70) - 20.0)) and str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
                         try:
-                            fallback_pool = await to_thread_bg(
+                            fallback_pool = await to_thread_email(
                                 _run_async_in_new_loop,
                                 build_priority_pool,
                                 best_fut,
@@ -38739,7 +38814,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines.append("")
     lines.append("⚡ Big-Move Alert Settings")
     lines.append(f"Status: {'ON' if bigm_on else 'OFF'}")
-    lines.append(f"Thresholds: |15m| ≥ {bigm_p15:.0f}% AND |1H| ≥ {bigm_p1:.0f}% AND |4H| ≥ {bigm_p4:.0f}% (same direction only)")
+    lines.append(f"Thresholds: |15m| ≥ {bigm_p15:g}% AND |1H| ≥ {bigm_p1:g}% AND |4H| ≥ {bigm_p4:g}% (same direction only)")
     lines.append(f"Min Vol (24H): {bigm_min_vol/1e6:.1f}M")
     if bigm_updated_ts > 0:
         lines.append("Updated: " + _fmt_when_both(bigm_updated_ts))
