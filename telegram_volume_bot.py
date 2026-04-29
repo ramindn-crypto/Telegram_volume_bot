@@ -804,7 +804,7 @@ def _run_async_in_new_loop(coro_fn, *args, **kwargs):
 
 # Fast-command activity hint so background jobs can yield briefly to user-facing commands.
 _USER_ACTIVITY_TS = 0.0
-USER_ACTIVITY_COOLDOWN_SEC = int(os.getenv("USER_ACTIVITY_COOLDOWN_SEC", "20") or 20)
+USER_ACTIVITY_COOLDOWN_SEC = int(os.getenv("USER_ACTIVITY_COOLDOWN_SEC", "60") or 60)
 FAST_ADMIN_SNAPSHOT_TTL_SEC = int(os.getenv("FAST_ADMIN_SNAPSHOT_TTL_SEC", "20") or 20)
 FAST_ADMIN_METRICS_TTL_SEC = int(os.getenv("FAST_ADMIN_METRICS_TTL_SEC", "20") or 20)
 FAST_ADMIN_COMMAND_TIMEOUT_SEC = int(os.getenv("FAST_ADMIN_COMMAND_TIMEOUT_SEC", "4") or 4)
@@ -832,7 +832,7 @@ def _goal_profile_quiet_window_ok(now_ts: float | None = None) -> bool:
     """
     try:
         ts = float(now_ts if now_ts is not None else time.time())
-        tz_local = ZoneInfo(TIMEZONE)
+        tz_local = ZoneInfo(str(globals().get('TIMEZONE') or os.environ.get('TIMEZONE') or 'Australia/Melbourne'))
         dt_local = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz_local)
         start_h = int(os.getenv('GOAL_PROFILE_QUIET_START_HOUR', '1') or 1)
         end_h = int(os.getenv('GOAL_PROFILE_QUIET_END_HOUR', '6') or 6)
@@ -841,14 +841,14 @@ def _goal_profile_quiet_window_ok(now_ts: float | None = None) -> bool:
             return start_h <= hour < end_h
         return hour >= start_h or hour < end_h
     except Exception:
-        return True
+        return False
 
 
 def _heavy_background_window_ok(now_ts: float | None = None) -> bool:
     """Run paged OHLCV / backtest style background jobs only during quiet local hours."""
     try:
         ts = float(now_ts if now_ts is not None else time.time())
-        tz_local = ZoneInfo(TIMEZONE)
+        tz_local = ZoneInfo(str(globals().get('TIMEZONE') or os.environ.get('TIMEZONE') or 'Australia/Melbourne'))
         dt_local = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz_local)
         start_h = int(os.getenv('HEAVY_BACKGROUND_START_HOUR', os.getenv('GOAL_PROFILE_QUIET_START_HOUR', '1')) or 1)
         end_h = int(os.getenv('HEAVY_BACKGROUND_END_HOUR', os.getenv('GOAL_PROFILE_QUIET_END_HOUR', '6')) or 6)
@@ -857,13 +857,13 @@ def _heavy_background_window_ok(now_ts: float | None = None) -> bool:
             return start_h <= hour < end_h
         return hour >= start_h or hour < end_h
     except Exception:
-        return True
+        return False
 
 
 def _heavy_background_defer(reason_only: bool = False) -> bool | str:
     """Shared defer gate for heavy background jobs so simple commands stay responsive."""
     try:
-        if _recent_user_activity(150):
+        if _recent_user_activity(int(HEAVY_USER_ACTIVITY_DEFER_SEC)):
             return 'recent_user_activity' if reason_only else True
         if ALERT_LOCK.locked() or SCAN_LOCK.locked() or _SCREEN_LOCK.locked():
             return 'interactive_runtime_busy' if reason_only else True
@@ -1388,6 +1388,9 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 DEFAULT_TYPE = "swap"  # bybit futures
 DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
+# Global local timezone used by quiet-hour gates.
+# If this is missing, heavy optimizer jobs may incorrectly run during active trading hours.
+TIMEZONE = os.environ.get("TIMEZONE", "Australia/Melbourne").strip() or "Australia/Melbourne"
 
 CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "1"))
 MANUAL_SCREEN_SYNC_ENABLED = True  # /screen uses the executable lane and may sync shown setups into email/autotrade
@@ -7364,9 +7367,12 @@ ALERT_LOCK = asyncio.Lock()
 AUTOTRADE_GUARDIAN_LOCK = asyncio.Lock()
 SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
-AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "25") or 25)
-AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "75") or 75)
-AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "40") or 40)
+AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "10") or 10)
+AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "180") or 180)
+AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "22") or 22)
+# Keep autotrade execution lightweight: consume the executable DB lane only by default.
+# Full pool refresh is owned by /screen/email scan lanes to avoid scheduler starvation.
+AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", False)
 AUTOTRADE_GUARDIAN_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_TIMEOUT_SEC", "15") or 15)
 AUTOTRADE_GUARDIAN_INTERVAL_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_INTERVAL_SEC", "150") or 150)
 AUTOTRADE_GUARDIAN_MIN_GAP_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_MIN_GAP_SEC", "20") or 20)
@@ -8533,7 +8539,7 @@ def _admin_status_cache_put(name: str, value: Any) -> None:
 HEAVY_ADMIN_CACHE_TTL_SEC = int(os.getenv("HEAVY_ADMIN_CACHE_TTL_SEC", "75") or 75)
 HEAVY_ADMIN_STALE_TTL_SEC = int(os.getenv("HEAVY_ADMIN_STALE_TTL_SEC", "900") or 900)
 HEAVY_ADMIN_COMMAND_TIMEOUT_SEC = int(os.getenv("HEAVY_ADMIN_COMMAND_TIMEOUT_SEC", "8") or 8)
-HEAVY_USER_ACTIVITY_DEFER_SEC = int(os.getenv("HEAVY_USER_ACTIVITY_DEFER_SEC", "75") or 75)
+HEAVY_USER_ACTIVITY_DEFER_SEC = int(os.getenv("HEAVY_USER_ACTIVITY_DEFER_SEC", "180") or 180)
 LOG_WARN_THROTTLE_SEC = int(os.getenv("LOG_WARN_THROTTLE_SEC", "120") or 120)
 _LOG_WARN_THROTTLE_UNTIL: dict[str, float] = {}
 
@@ -19853,6 +19859,7 @@ AUTONOMOUS_OPT_SESSION_MODE = str(os.environ.get("AUTONOMOUS_OPT_SESSION_MODE", 
 AUTONOMOUS_OPT_LOOKBACK_HOURS = float(os.environ.get("AUTONOMOUS_OPT_LOOKBACK_HOURS", "72") or 72)
 AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS = int(os.environ.get("AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS", "18") or 18)
 AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW = float(os.environ.get("AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW", "70") or 70)
+AUTONOMOUS_OPT_STALE_RUNNING_SEC = int(os.environ.get("AUTONOMOUS_OPT_STALE_RUNNING_SEC", "900") or 900)
 
 def _opt_migrate_tables():
     """Create/extend self-optimization tables (backward compatible)."""
@@ -23668,8 +23675,38 @@ def _db_save_opt_result(run_id: str, promoted: bool, chosen_exec_tf: str, best_s
     except Exception:
         pass
 
+def _db_cleanup_stale_opt_runs(max_age_sec: int | None = None) -> None:
+    """Mark orphaned RUNNING optimizer rows as STALE.
+
+    Render restarts/timeouts can leave optimization_runs stuck as RUNNING. That makes
+    /learning_status and /self_optimize_report look blocked and encourages more heavy
+    work. Cleanup is cheap and safe because active in-process runs keep _SELF_OPT_STATE set.
+    """
+    try:
+        cur_task = _SELF_OPT_STATE.get("task")
+        if cur_task and not cur_task.done():
+            return
+    except Exception:
+        pass
+    try:
+        cutoff = float(time.time()) - float(max_age_sec or AUTONOMOUS_OPT_STALE_RUNNING_SEC or 900)
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "UPDATE optimization_runs SET status='STALE_TIMEOUT', finished_ts=?, notes=? WHERE status='RUNNING' AND COALESCE(started_ts,0) < ?",
+                (float(time.time()), 'auto-cleaned stale RUNNING optimizer after redeploy/timeout', float(cutoff)),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 def _db_get_last_opt_run() -> Optional[dict]:
     _opt_migrate_tables()
+    try:
+        _db_cleanup_stale_opt_runs()
+    except Exception:
+        pass
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
@@ -24492,18 +24529,27 @@ def _autonomous_opt_performance_snapshot(window_hours: float = 72.0) -> dict:
 
 
 def _autonomous_opt_should_run() -> tuple[bool, str]:
-    """Decision gate for the zero-touch optimizer."""
+    """Decision gate for the zero-touch optimizer.
+
+    Do not launch expensive 7/14/21/30d searches when there is not enough real
+    closed signal data. Running optimizer/backtests with 0-6 outcomes creates load
+    without reliable improvement and can delay Telegram polling on Render.
+    """
     try:
         if not bool(AUTONOMOUS_OPT_ENABLED):
             return (False, "disabled")
         cur_task = _SELF_OPT_STATE.get("task")
         if cur_task and not cur_task.done():
             return (False, "already_running")
+
+        snap = _autonomous_opt_performance_snapshot(window_hours=float(AUTONOMOUS_OPT_LOOKBACK_HOURS))
+        min_closed = int(AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS)
+        wr_floor = float(AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW)
+        if int(snap.get("closed", 0) or 0) < min_closed:
+            return (False, f"not_enough_closed_signals ({int(snap.get('closed', 0) or 0)}/{min_closed})")
+
         if _autonomous_opt_recent_enough(float(AUTONOMOUS_OPT_MIN_INTERVAL_HOURS)):
-            snap = _autonomous_opt_performance_snapshot(window_hours=float(AUTONOMOUS_OPT_LOOKBACK_HOURS))
-            min_closed = int(AUTONOMOUS_OPT_MIN_CLOSED_SIGNALS)
-            wr_floor = float(AUTONOMOUS_OPT_TRIGGER_WIN_RATE_BELOW)
-            if int(snap.get("closed", 0) or 0) >= min_closed and float(snap.get("win_rate", 0.0) or 0.0) >= wr_floor:
+            if float(snap.get("win_rate", 0.0) or 0.0) >= wr_floor:
                 ub7 = _db_get_latest_universe_backtest(7) or {}
                 met7 = ub7.get('metrics') or {}
                 ov7 = met7.get('overall') or {}
@@ -25374,13 +25420,18 @@ async def market_adaptive_run_cmd(update: Update, context: ContextTypes.DEFAULT_
 
 async def autonomous_optimize_job(context: ContextTypes.DEFAULT_TYPE):
     """Internal autonomous optimizer. No manual trigger required."""
-    if _heavy_background_defer():
+    defer_reason = _heavy_background_defer(reason_only=True)
+    if defer_reason:
+        _hb_touch('optimizer', ok=True, details=f'deferred_{defer_reason}')
         return
-    await _refresh_universe_backtests_for_autopilot()
     should_run, reason = _autonomous_opt_should_run()
     if not should_run:
+        _hb_touch('optimizer', ok=True, details=f'skipped_{reason}')
         return
-    if _heavy_background_defer():
+    await _refresh_universe_backtests_for_autopilot()
+    defer_reason = _heavy_background_defer(reason_only=True)
+    if defer_reason:
+        _hb_touch('optimizer', ok=True, details=f'deferred_{defer_reason}')
         return
 
     bot = getattr(context, "bot", None)
@@ -35682,7 +35733,9 @@ def user_location_and_time(user: dict):
 # /screen fast cache (per-instance)
 # =========================================================
 SCREEN_CACHE_TTL_SEC = 150  # seconds
-SCREEN_STALE_CACHE_MAX_SEC = 420  # allow a more generous stale /screen when background jobs are busy
+SCREEN_STALE_CACHE_MAX_SEC = 900  # keep stale /screen available instead of making users wait during warmup/rate-limit pressure
+SCREEN_CACHE_WARMUP_INTERVAL_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_INTERVAL_SEC", "300") or 300)
+SCREEN_CACHE_WARMUP_MIN_AGE_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_MIN_AGE_SEC", "600") or 600)
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 _SCREEN_CACHE: dict[str, dict] = {}
 _SCREEN_LOCK = asyncio.Lock()
@@ -36533,9 +36586,23 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await update.message.reply_text("🔎 /screen cache is warming up. Fresh scan is queued in the dedicated screen lane — run /screen again shortly.")
         return
-    except Exception:
-        pass
+    except Exception as e:
+        try:
+            logger.warning("screen fast path failed; returning queued refresh message: %s", e)
+        except Exception:
+            pass
+        try:
+            _schedule_screen_cache_refresh(int(uid), str(scan_session_name_utc() or '').upper())
+        except Exception:
+            pass
+        try:
+            await update.message.reply_text("🔎 /screen snapshot is refreshing in the background. Commands remain responsive — run /screen again shortly.")
+        except Exception:
+            pass
+        return
 
+    # Legacy slow path below is kept only as unreachable fallback for old deployments;
+    # current /screen returns above and must never block on OHLCV scans.
     # Avoid long scans blocking other commands on small instances
     if SCAN_LOCK.locked():
         try:
@@ -39662,15 +39729,26 @@ async def autotrade_exit_guardian_job(context: ContextTypes.DEFAULT_TYPE):
 async def screen_cache_warmup_job(context: ContextTypes.DEFAULT_TYPE):
     """Periodic global /screen cache warmer.
 
-    Keeps /screen instant after deploys and prevents user commands from triggering the
-    first expensive scan. Runs in the dedicated screen executor and never blocks Telegram.
+    Throttled by design: a full executable scan is expensive and can starve Telegram
+    polling on small Render instances. This job only queues a refresh when the existing
+    global cache is old/missing and the runtime is quiet. User /screen still replies
+    instantly from stale cache or quick ticker context.
     """
     try:
-        if _recent_user_activity(8):
+        if _recent_user_activity(120):
             return
         if _SCREEN_REFRESH_TASK is not None and not _SCREEN_REFRESH_TASK.done():
             return
+        if _interactive_runtime_busy(120):
+            return
         sess = str(scan_session_name_utc(datetime.now(timezone.utc)) or '').upper()
+        cache_key = f"global::{sess}"
+        ce = _SCREEN_CACHE.get(cache_key) or {}
+        age = time.time() - float(ce.get('ts', 0.0) or 0.0) if ce.get('body') else 1e9
+        if age < float(SCREEN_CACHE_WARMUP_MIN_AGE_SEC):
+            return
+        if _ohlcv_timeframe_cooling('15m', '1h', '4h'):
+            return
         _schedule_screen_cache_refresh(0, sess)
     except Exception:
         return
@@ -39768,13 +39846,13 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             try:
                 db_setups = await to_thread_bg(_autotrade_select_db_setups_cached, uid, sess, lookback_hours=12, limit=5, timeout=6)
             except asyncio.TimeoutError:
-                db_setups = _autotrade_select_db_setups_cached(uid, sess, lookback_hours=12, limit=5, ttl=45)
+                db_setups = []
                 try:
                     db_log_setup_pipeline_event(uid, stage='autotrade_exec_select', status='timeout', session=str(sess or ''), mode='autotrade', details={'timeout_sec': 6})
                 except Exception:
                     pass
             except Exception as e:
-                db_setups = _autotrade_select_db_setups_cached(uid, sess, lookback_hours=12, limit=5, ttl=45)
+                db_setups = []
                 try:
                     db_log_setup_pipeline_event(uid, stage='autotrade_exec_select', status='error', session=str(sess or ''), mode='autotrade', details={'error': f'{type(e).__name__}: {e}'})
                 except Exception:
@@ -39782,9 +39860,16 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             tf_cooling = _ohlcv_timeframe_cooling('15m', '1h', '4h')
             if not db_setups and tf_cooling:
                 reason = 'autotrade_refresh_deferred_rate_limit_cooldown'
-            if not db_setups and not tf_cooling and not _job_budget_exhausted():
-                remaining_budget = max(4.0, float(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40) - (time.time() - job_started_ts))
-                refresh_timeout = min(10.0, remaining_budget)
+            if (
+                not db_setups
+                and not tf_cooling
+                and not _job_budget_exhausted()
+                and bool(AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY)
+                and not _interactive_runtime_busy(240)
+                and _heavy_background_window_ok()
+            ):
+                remaining_budget = max(4.0, float(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 22) - (time.time() - job_started_ts))
+                refresh_timeout = min(8.0, remaining_budget)
                 try:
                     refreshed = await to_thread_bg(_autotrade_refresh_owner_executable_pool, uid, sess, 12, timeout=refresh_timeout)
                 except asyncio.TimeoutError:
@@ -39972,7 +40057,7 @@ def main():
         .connection_pool_size(int(os.getenv('TELEGRAM_CONNECTION_POOL_SIZE', '256') or 256))
         .pool_timeout(float(os.getenv('TELEGRAM_POOL_TIMEOUT_SEC', '1.0') or 1.0))
         .connect_timeout(float(os.getenv('TELEGRAM_CONNECT_TIMEOUT_SEC', '3.0') or 3.0))
-        .read_timeout(float(os.getenv('TELEGRAM_READ_TIMEOUT_SEC', '10.0') or 10.0))
+        .read_timeout(float(os.getenv('TELEGRAM_READ_TIMEOUT_SEC', '30.0') or 30.0))
         .write_timeout(float(os.getenv('TELEGRAM_WRITE_TIMEOUT_SEC', '10.0') or 10.0))
         .build()
     )
@@ -40144,7 +40229,7 @@ def main():
 
         app.job_queue.run_repeating(
             screen_cache_warmup_job,
-            interval=int(os.environ.get("SCREEN_CACHE_WARMUP_INTERVAL_SEC", "90") or 90),
+            interval=int(SCREEN_CACHE_WARMUP_INTERVAL_SEC),
             first=8,
             name="screen_cache_warmup_job",
             job_kwargs={
@@ -40347,6 +40432,11 @@ def main():
             drop_pending_updates=True,
             close_loop=False,
             allowed_updates=Update.ALL_TYPES,
+            poll_interval=float(os.getenv("TELEGRAM_POLL_INTERVAL_SEC", "0.2") or 0.2),
+            timeout=int(os.getenv("TELEGRAM_LONG_POLL_TIMEOUT_SEC", "25") or 25),
+            read_timeout=float(os.getenv("TELEGRAM_POLL_READ_TIMEOUT_SEC", "35") or 35),
+            write_timeout=float(os.getenv("TELEGRAM_POLL_WRITE_TIMEOUT_SEC", "20") or 20),
+            connect_timeout=float(os.getenv("TELEGRAM_POLL_CONNECT_TIMEOUT_SEC", "10") or 10),
         )
     except Conflict:
         logger.error("Another instance is polling. Sleeping forever.")
