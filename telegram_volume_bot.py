@@ -504,7 +504,12 @@ def _autotrade_runtime_max_open_trades() -> int:
     try:
         val = int(float(_autotrade_config_get(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, AUTOTRADE_MAX_OPEN_TRADES) or AUTOTRADE_MAX_OPEN_TRADES))
     except Exception:
-        val = int(_autotrade_runtime_max_open_trades())
+        # Production safety: a corrupted DB/env value must fall back to the static
+        # default, not recurse into this function and crash the bot.
+        try:
+            val = int(AUTOTRADE_MAX_OPEN_TRADES)
+        except Exception:
+            val = 1
     return max(1, int(val))
 
 
@@ -8578,6 +8583,36 @@ def _interactive_runtime_busy(window_sec: int | None = None) -> bool:
         return False
 
 
+def _live_trade_runtime_busy(window_sec: int | None = None) -> bool:
+    """True when live trade/guardian work should defer.
+
+    Unlike _interactive_runtime_busy(), this intentionally ignores ALERT_LOCK so
+    the email loop cannot starve admin autotrade or live SL/TP repair. Trading
+    remains deferred during direct user activity, screen/scan pressure, and
+    optimizer/backtest work.
+    """
+    try:
+        if _recent_user_activity(window_sec if window_sec is not None else HEAVY_USER_ACTIVITY_DEFER_SEC):
+            return True
+        if SCAN_LOCK.locked() or _SCREEN_LOCK.locked():
+            return True
+        try:
+            if _MARKET_ADAPTIVE_LOCK.locked():
+                return True
+        except Exception:
+            pass
+        try:
+            if _SELF_OPT_STATE.get('stop_event') is not None:
+                return True
+        except Exception:
+            pass
+        if _backtest_runtime_busy() or _goal_profile_is_running():
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def _ohlcv_timeframe_cooling(*timeframes: str) -> bool:
     """True when OHLCV fetching is in a shared rate-limit cooldown.
 
@@ -11850,7 +11885,35 @@ def _bigmove_candidates(best_fut: dict, p15: float, p1: float, p4: float, min_vo
 
     out = []
 
-    for sym, mv in (best_fut or {}).items():
+    # Production safety: Big-Move requires 15m + 1h + 4h context, but the raw
+    # ticker universe can contain hundreds of symbols. Pre-filter by 24h volume
+    # and rank by 24h movement before any optional OHLCV fallback so one alert
+    # cycle cannot create a Bybit cold-fetch storm.
+    try:
+        ranked_items = []
+        for sym0, mv0 in (best_fut or {}).items():
+            try:
+                vol0 = float(usd_notional(mv0) or 0.0)
+            except Exception:
+                vol0 = 0.0
+            if float(min_vol_usd or 0.0) > 0 and vol0 < float(min_vol_usd):
+                continue
+            try:
+                pct24 = abs(float(getattr(mv0, "percentage", 0.0) or 0.0))
+            except Exception:
+                pct24 = 0.0
+            ranked_items.append((pct24, vol0, str(sym0 or "").upper(), mv0))
+        ranked_items.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        scan_limit = max(int(max_items or 12) * 3, 6)
+        try:
+            scan_limit = min(int(BIGMOVE_SIGNAL_MAX_SCAN), max(scan_limit, int(max_items or 12)))
+        except Exception:
+            pass
+        items_iter = [(sym0, mv0) for _pct24, _vol0, sym0, mv0 in ranked_items[:scan_limit]]
+    except Exception:
+        items_iter = list((best_fut or {}).items())[:max(6, int(max_items or 12) * 3)]
+
+    for sym, mv in items_iter:
         try:
             # Try multiple possible field names (fixes "different field names" issue)
             ch4 = _pick_pct(mv, ["ch4", "pct_4h", "change_4h", "chg_4h", "percentage_4h", "p4", "h4"])
@@ -27265,10 +27328,43 @@ def is_executable_setup_eligible(
 
         fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
         pb_dist = float(getattr(s, "pullback_ema_dist_pct", 999.0) or 999.0)
-        ch15_abs = abs(float(getattr(s, "ch15", 0.0) or 0.0))
-        ch1_abs = abs(float(getattr(s, "ch1", 0.0) or 0.0))
-        ch4_abs = abs(float(getattr(s, "ch4", 0.0) or 0.0))
+        ch15_val = float(getattr(s, "ch15", 0.0) or 0.0)
+        ch1_val = float(getattr(s, "ch1", 0.0) or 0.0)
+        ch4_val = float(getattr(s, "ch4", 0.0) or 0.0)
+        ch15_abs = abs(ch15_val)
+        ch1_abs = abs(ch1_val)
+        ch4_abs = abs(ch4_val)
         ch24_abs = abs(float(getattr(s, "ch24", 0.0) or 0.0))
+
+        # Big-Move is a confirmed impulse family. It must not be killed by the
+        # generic late-extension/pullback gates used for normal A/B/C setups; those
+        # gates are exactly where a valid Big-Move signal is expected to be large.
+        if fam == BIGMOVE_FAMILY_ID:
+            same_dir = (
+                (side == 'BUY' and ch15_val > 0 and ch1_val > 0 and ch4_val > 0) or
+                (side == 'SELL' and ch15_val < 0 and ch1_val < 0 and ch4_val < 0)
+            )
+            if not same_dir:
+                return (False, "bigmove_direction_mismatch")
+
+            bm_quality_floor = max(68.0 if sess != 'ASIA' else 69.0, float(score_floor) - 4.0)
+            bm_conf_floor = max(78 if sess != 'ASIA' else 80, int(conf_floor))
+            bm_rr_floor = max(1.65 if low_flow_recovery else 1.75, float(rr_floor) + 0.05)
+            bm_vol_floor = max(float(BIGMOVE_DEFAULT_MIN_VOL_USD), float(MIN_FUT_VOL_USD) * (1.10 if sess == 'ASIA' else 1.05))
+
+            if score < bm_quality_floor:
+                return (False, f"bigmove_below_quality_{bm_quality_floor:.0f}")
+            if conf < bm_conf_floor:
+                return (False, f"bigmove_below_conf_{bm_conf_floor}")
+            if rr_final < bm_rr_floor:
+                return (False, f"bigmove_rr_below_{bm_rr_floor:.2f}")
+            if fut_vol < bm_vol_floor:
+                return (False, f"bigmove_liquidity_below_{bm_vol_floor/1e6:.1f}M")
+            if ch15_abs < float(BIGMOVE_DEFAULT_15M_PCT) or ch1_abs < float(BIGMOVE_DEFAULT_1H_PCT) or ch4_abs < float(BIGMOVE_DEFAULT_4H_PCT):
+                return (False, "bigmove_thresholds_not_met")
+            if want and ((trend and want not in trend) or (structure and want not in structure)):
+                return (False, "bigmove_structure_not_aligned")
+            return (True, "ok")
 
         if sess == "NY":
             if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
@@ -38016,10 +38112,13 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 top_ch15_display = float(top.get("confirm_15m_pct", top_ch15_trigger) or 0.0)
                 top_ch1 = float(top.get("ch1", 0.0) or 0.0)
                 top_ch4 = float(top.get("ch4", 0.0) or 0.0)
-                top_tf = max((("Confirm15m", abs(top_ch15_display)), ("1H", abs(top_ch1)), ("4H", abs(top_ch4))), key=lambda x: x[1])[0]
-                top_move = {"Confirm15m": top_ch15_display, "1H": top_ch1, "4H": top_ch4}[top_tf]
+                # Alert headline must show the confirmation candle move only.
+                # 1H/4H remain in the body as trigger context; they are not the
+                # post-stage confirmation value.
+                top_tf = "Confirm15m"
+                top_move = top_ch15_display
 
-                subject = f"⚡ Big Move Alert • {top_sym} {top_dir} • {top_tf} {top_move:+.1f}%"
+                subject = f"⚡ Big Move Alert • {top_sym} {top_dir} • Confirm15m {top_move:+.1f}%"
                 if len(filtered) > 1:
                     subject += f" (+{len(filtered)-1} more)"
 
@@ -39948,8 +40047,8 @@ def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
 
 async def autotrade_exit_guardian_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        if _interactive_runtime_busy():
-            _hb_touch('autotrade_guardian', ok=True, details='deferred_user_activity')
+        if _live_trade_runtime_busy():
+            _hb_touch('autotrade_guardian', ok=True, details='live_trade_runtime_busy')
             return
         if not _autotrade_ready():
             return
@@ -40042,8 +40141,8 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
     """
     try:
         _hb_touch('autotrade', ok=True, details='job_tick')
-        if _interactive_runtime_busy():
-            _hb_touch('autotrade', ok=True, details='deferred_user_activity')
+        if _live_trade_runtime_busy():
+            _hb_touch('autotrade', ok=True, details='live_trade_runtime_busy')
             return
         if not _autotrade_ready():
             return
