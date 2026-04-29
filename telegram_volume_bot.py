@@ -11373,9 +11373,20 @@ BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
 BIGMOVE_COOLDOWN_SEC = 60 * 60  # 1 hour
 BIGMOVE_FAMILY_ID = "F8_BIGMOVE_CONT"
 BIGMOVE_FAMILY_NAME = "Big Move Continuation"
-BIGMOVE_SIGNAL_FINAL_RR = float(os.environ.get("BIGMOVE_SIGNAL_FINAL_RR", "3.0") or 3.0)
+BIGMOVE_SIGNAL_FINAL_RR = float(os.environ.get("BIGMOVE_SIGNAL_FINAL_RR", "1.8") or 1.8)
 BIGMOVE_SIGNAL_TP1_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP1_RR", str(BIGMOVE_SIGNAL_FINAL_RR)) or BIGMOVE_SIGNAL_FINAL_RR)
 BIGMOVE_SIGNAL_TP2_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP2_RR", str(BIGMOVE_SIGNAL_FINAL_RR)) or BIGMOVE_SIGNAL_FINAL_RR)
+
+# Low-flow setup generation recovery. This is deliberately modest: it only softens
+# final executable gates when the bot has produced too few executable/email setups
+# recently. It does not bypass direction, RR, SL/TP, liquidity, or session checks.
+SETUP_LOW_FLOW_RECOVERY_ENABLED = env_bool("SETUP_LOW_FLOW_RECOVERY_ENABLED", True)
+SETUP_LOW_FLOW_LOOKBACK_HOURS = float(os.environ.get("SETUP_LOW_FLOW_LOOKBACK_HOURS", "24") or 24)
+SETUP_LOW_FLOW_MIN_EXECUTABLES = int(os.environ.get("SETUP_LOW_FLOW_MIN_EXECUTABLES", "3") or 3)
+SETUP_LOW_FLOW_MIN_EMAILED = int(os.environ.get("SETUP_LOW_FLOW_MIN_EMAILED", "2") or 2)
+EMAIL_SETUP_SCAN_PROFILE = str(os.environ.get("EMAIL_SETUP_SCAN_PROFILE", "aggressive") or "aggressive").strip().lower()
+if EMAIL_SETUP_SCAN_PROFILE not in SCAN_PROFILES:
+    EMAIL_SETUP_SCAN_PROFILE = "aggressive"
 BIGMOVE_SIGNAL_MAX_SCAN = int(os.environ.get("BIGMOVE_SIGNAL_MAX_SCAN", "36") or 36)
 BIGMOVE_SIGNAL_MAX_ITEMS = int(os.environ.get("BIGMOVE_SIGNAL_MAX_ITEMS", "8") or 8)
 
@@ -26960,6 +26971,40 @@ def is_top_setup_eligible(
     except Exception:
         return (False, "eligibility_exception")
 
+def _setup_low_flow_recovery_active(session_name: str = '', lookback_hours: float | None = None) -> bool:
+    """True when setup generation is below target and a small recovery relax is allowed.
+
+    Counts DB-backed executable and emailed setups. This keeps normal strict behaviour when
+    the bot is already producing enough signals, while preventing full-session droughts.
+    """
+    if not SETUP_LOW_FLOW_RECOVERY_ENABLED:
+        return False
+    try:
+        sess = str(session_name or '').upper().strip()
+        hours = float(lookback_hours if lookback_hours is not None else SETUP_LOW_FLOW_LOOKBACK_HOURS)
+        since_ts = float(time.time()) - max(1.0, hours) * 3600.0
+        exec_count = 0
+        email_count = 0
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            if sess:
+                cur.execute("SELECT COUNT(1) FROM executable_setups WHERE executable_ts>=? AND UPPER(session)=?", (since_ts, sess))
+            else:
+                cur.execute("SELECT COUNT(1) FROM executable_setups WHERE executable_ts>=?", (since_ts,))
+            exec_count = int((cur.fetchone() or [0])[0] or 0)
+            try:
+                if sess:
+                    cur.execute("SELECT COUNT(1) FROM emailed_setups WHERE emailed_ts>=? AND UPPER(session)=?", (since_ts, sess))
+                else:
+                    cur.execute("SELECT COUNT(1) FROM emailed_setups WHERE emailed_ts>=?", (since_ts,))
+                email_count = int((cur.fetchone() or [0])[0] or 0)
+            except Exception:
+                email_count = 0
+        return bool(exec_count < int(SETUP_LOW_FLOW_MIN_EXECUTABLES) and email_count < int(SETUP_LOW_FLOW_MIN_EMAILED))
+    except Exception:
+        return False
+
+
 def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]:
     """Moderately strict executable thresholds for a shared cross-session pool.
 
@@ -27033,6 +27078,7 @@ def is_executable_setup_eligible(
         engine_c_exec_pb_dist_lon = float((cfg_live or {}).get('engine_c_exec_pb_dist_lon', 0.68) or 0.68)
         active_profile = str((cfg_live or {}).get('goal_profile_active_profile', '') or '').upper().strip()
         reach_mode = bool(_cfg_bool((cfg_live or {}).get('goal_profile_reach_mode', False), False) or ('REACH' in active_profile) or active_profile.endswith('_SCOUT'))
+        low_flow_recovery = _setup_low_flow_recovery_active(sess)
         allowed_sessions = _strategy_cfg_execution_sessions_allowed(cfg_live)
         if allowed_sessions and sess not in allowed_sessions:
             return (False, 'execution_profile_session_disabled')
@@ -27169,6 +27215,22 @@ def is_executable_setup_eligible(
             score_floor += 0.50
             rr_floor += 0.02
 
+        # Low-flow recovery: when the last 24h has too few executable/email setups,
+        # soften final executable gates slightly. This targets droughts only and avoids
+        # opening a generic low-quality momentum lane.
+        if low_flow_recovery:
+            if fam == BIGMOVE_FAMILY_ID:
+                score_floor -= 1.25
+                conf_floor -= 1
+                rr_floor -= 0.12
+            elif engine in {'A', 'C'}:
+                score_floor -= 1.10 if sess in {'NY', 'LON'} else 0.75
+                conf_floor -= 1
+                rr_floor -= 0.04 if sess in {'NY', 'LON'} else 0.03
+            elif engine == 'B' and sess == 'NY' and regime == 'EXPANSION':
+                score_floor -= 0.60
+                rr_floor -= 0.02
+
         score_floor = float(clamp(score_floor, 58.0 if active_profile.startswith('GLOBAL_') else 60.0, 92.0))
         conf_floor = int(max(68 if active_profile.startswith('GLOBAL_') else 69, min(95, conf_floor)))
         rr_floor = float(clamp(rr_floor, 0.98 if active_profile.startswith('GLOBAL_') else 1.02, 2.30))
@@ -27219,11 +27281,17 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.68, 7_500_000.0)):
                     return (False, "ny_below_liquidity")
             else:
-                if pb_dist > 1.18:
+                ny_pb_cap = 1.28 if low_flow_recovery else 1.18
+                ny_ch15_cap = 1.34 if low_flow_recovery else 1.24
+                ny_ch15_pair_cap = 1.12 if low_flow_recovery else 1.02
+                ny_ch1_cap = 2.22 if low_flow_recovery else 2.08
+                ny_ctx_ch4_min = 0.22 if low_flow_recovery else 0.28
+                ny_ctx_ch1_min = 0.06 if low_flow_recovery else 0.08
+                if pb_dist > ny_pb_cap:
                     return (False, "ny_entry_too_far_from_ema")
-                if ch15_abs > 1.24 or (ch15_abs > 1.02 and ch1_abs > 2.08):
+                if ch15_abs > ny_ch15_cap or (ch15_abs > ny_ch15_pair_cap and ch1_abs > ny_ch1_cap):
                     return (False, "ny_late_extension_exec")
-                if ch4_abs < 0.28 or ch1_abs < 0.08:
+                if ch4_abs < ny_ctx_ch4_min or ch1_abs < ny_ctx_ch1_min:
                     return (False, "ny_context_too_weak_exec")
                 if fut_vol < max(MIN_FUT_VOL_USD * 0.68, 6_500_000.0):
                     return (False, "ny_below_liquidity")
@@ -27244,6 +27312,12 @@ def is_executable_setup_eligible(
                 lon_ctx_ch4_min = 0.18 if reach_mode else 0.26
                 lon_ctx_ch1_min = 0.04 if reach_mode else 0.08
                 lon_liq_floor = max(MIN_FUT_VOL_USD * (0.66 if reach_mode else 0.72), 6_000_000.0 if reach_mode else 7_000_000.0)
+                if low_flow_recovery:
+                    lon_pb_max += 0.08
+                    lon_ch15_cap += 0.07
+                    lon_ch1_cap += 0.12
+                    lon_ctx_ch4_min = max(0.12, lon_ctx_ch4_min - 0.06)
+                    lon_ctx_ch1_min = max(0.03, lon_ctx_ch1_min - 0.03)
                 if engine == 'C':
                     lon_pb_max = max(lon_pb_max, engine_c_exec_pb_dist_lon)
                     lon_ch1_cap = max(lon_ch1_cap, engine_c_exec_ch1_cap_lon)
@@ -27271,11 +27345,16 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.70, 6_500_000.0)):
                     return (False, "asia_below_liquidity")
             else:
-                if pb_dist > 0.88:
+                asia_pb_cap = 0.96 if low_flow_recovery else 0.88
+                asia_ch15_cap = 0.96 if low_flow_recovery else 0.88
+                asia_ch1_cap = 1.66 if low_flow_recovery else 1.56
+                asia_ctx_ch4_min = 0.28 if low_flow_recovery else 0.34
+                asia_ctx_ch1_min = 0.09 if low_flow_recovery else 0.12
+                if pb_dist > asia_pb_cap:
                     return (False, "asia_entry_too_far_from_ema")
-                if ch15_abs > 0.88 or ch1_abs > 1.56:
+                if ch15_abs > asia_ch15_cap or ch1_abs > asia_ch1_cap:
                     return (False, "asia_late_extension_exec")
-                if ch4_abs < 0.34 or ch1_abs < 0.12:
+                if ch4_abs < asia_ctx_ch4_min or ch1_abs < asia_ctx_ch1_min:
                     return (False, "asia_context_too_weak_exec")
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.60, 8_000_000.0)):
                     return (False, "asia_below_liquidity")
@@ -27313,11 +27392,14 @@ def is_executable_setup_eligible(
 
         if engine == "B":
             if fam == BIGMOVE_FAMILY_ID:
-                if score < max(score_floor + 0.5, 66.5 if sess != 'ASIA' else 67.5):
+                bm_quality_floor = max(score_floor + 0.5, 66.5 if sess != 'ASIA' else 67.5)
+                bm_conf_floor = max(conf_floor, 78 if sess != 'ASIA' else 80)
+                bm_rr_floor = max(rr_floor + 0.08, 1.65 if low_flow_recovery else 1.75)
+                if score < bm_quality_floor:
                     return (False, "bigmove_below_quality")
-                if conf < max(conf_floor, 78 if sess != 'ASIA' else 80):
+                if conf < bm_conf_floor:
                     return (False, "bigmove_below_conf")
-                if rr_final < max(rr_floor + 0.10, 1.80):
+                if rr_final < bm_rr_floor:
                     return (False, "bigmove_below_rr")
                 if fut_vol < float(max(BIGMOVE_DEFAULT_MIN_VOL_USD, MIN_FUT_VOL_USD * (1.05 if sess != 'ASIA' else 1.10))):
                     return (False, "bigmove_below_liquidity")
@@ -38210,7 +38292,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                             best_fut,
                             sess_name,
                             mode="exec",
-                            scan_profile=str(DEFAULT_SCAN_PROFILE),
+                            scan_profile=str(EMAIL_SETUP_SCAN_PROFILE),
                             uid=None,
                             timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
                         )
