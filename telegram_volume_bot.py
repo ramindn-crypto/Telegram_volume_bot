@@ -698,6 +698,10 @@ _FAST_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("FAST_EXECUTOR_WOR
 _HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "4")))
 # Dedicated /screen lane: must not be starved by backtests, optimizer, email, or autotrade.
 _SCREEN_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("SCREEN_EXECUTOR_WORKERS", "2")))
+# Dedicated email/network lane: SMTP/ticker calls must not wait behind research jobs.
+_EMAIL_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("EMAIL_EXECUTOR_WORKERS", "2")))
+# Dedicated autotrade lane: live entry/risk checks must never queue behind optimizers or scans.
+_AUTOTRADE_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("AUTOTRADE_EXECUTOR_WORKERS", "1")))
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
 
@@ -743,6 +747,12 @@ async def to_thread_heavy(fn, *args, timeout: int | None = None, **kwargs):
 
 async def to_thread_screen(fn, *args, timeout: int | None = None, **kwargs):
     return await _run_in_executor(_SCREEN_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
+
+async def to_thread_email(fn, *args, timeout: int | None = None, **kwargs):
+    return await _run_in_executor(_EMAIL_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
+
+async def to_thread_autotrade(fn, *args, timeout: int | None = None, **kwargs):
+    return await _run_in_executor(_AUTOTRADE_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
 
 async def to_thread_bg(fn, *args, timeout: int | None = None, **kwargs):
     return await _run_in_executor(_BACKGROUND_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
@@ -7367,9 +7377,11 @@ ALERT_LOCK = asyncio.Lock()
 AUTOTRADE_GUARDIAN_LOCK = asyncio.Lock()
 SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
-AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "10") or 10)
-AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "180") or 180)
-AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "22") or 22)
+AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "6") or 6)
+# Keep this job intentionally less frequent and very short; it consumes the DB executable lane.
+# Heavy pool refreshes belong to /screen/email lanes, otherwise Render misses scheduler ticks.
+AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "300") or 300)
+AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "10") or 10)
 # Keep autotrade execution lightweight: consume the executable DB lane only by default.
 # Full pool refresh is owned by /screen/email scan lanes to avoid scheduler starvation.
 AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", False)
@@ -8567,9 +8579,16 @@ def _interactive_runtime_busy(window_sec: int | None = None) -> bool:
 
 
 def _ohlcv_timeframe_cooling(*timeframes: str) -> bool:
-    """True when any requested OHLCV timeframe is inside the shared rate-limit cooldown."""
+    """True when OHLCV fetching is in a shared rate-limit cooldown.
+
+    A single Bybit OHLCV 10006 event usually means the whole endpoint is congested for this
+    Render instance, not only one symbol/timeframe. Treat it as a global circuit breaker so
+    background jobs do not keep probing new symbols and delaying Telegram commands.
+    """
     try:
         now_ts = float(time.time())
+        if float(globals().get('_OHLCV_GLOBAL_COOL_UNTIL', 0.0) or 0.0) > now_ts:
+            return True
         for tf in (timeframes or []):
             tf_key = str(tf or '').lower().strip()
             if not tf_key:
@@ -10222,7 +10241,7 @@ def db_init():
     if "bigmove_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_on INTEGER NOT NULL DEFAULT 1")
     
-    # Big-move alert defaults: 15m >= 2%, 1H >= 4%, 4H >= 6% in the same direction.
+    # Big-move alert defaults: 15m >= 1.5%, 1H >= 3%, 4H >= 5% in the same direction.
     if "bigmove_alert_15m" not in cols:
         cur.execute(f"ALTER TABLE users ADD COLUMN bigmove_alert_15m REAL NOT NULL DEFAULT {BIGMOVE_DEFAULT_15M_PCT}")
     if "bigmove_alert_4h" not in cols:
@@ -10244,16 +10263,25 @@ def db_init():
             (float(BIGMOVE_DEFAULT_15M_PCT),),
         )
         cur.execute(
-            "UPDATE users SET bigmove_alert_1h=? WHERE bigmove_alert_1h IS NULL OR ABS(bigmove_alert_1h) < 1e-9 OR ABS(bigmove_alert_1h-10.0) < 1e-9 OR ABS(bigmove_alert_1h-7.5) < 1e-9 OR ABS(bigmove_alert_1h-4.0) < 1e-9",
+            "UPDATE users SET bigmove_alert_1h=? WHERE bigmove_alert_1h IS NULL OR ABS(bigmove_alert_1h) < 1e-9 OR ABS(bigmove_alert_1h-10.0) < 1e-9 OR ABS(bigmove_alert_1h-7.5) < 1e-9 OR ABS(bigmove_alert_1h-4.0) < 1e-9 OR ABS(bigmove_alert_1h-3.0) < 1e-9",
             (float(BIGMOVE_DEFAULT_1H_PCT),),
         )
         cur.execute(
-            "UPDATE users SET bigmove_alert_4h=? WHERE bigmove_alert_4h IS NULL OR ABS(bigmove_alert_4h) < 1e-9 OR ABS(bigmove_alert_4h-20.0) < 1e-9 OR ABS(bigmove_alert_4h-15.0) < 1e-9 OR ABS(bigmove_alert_4h-6.0) < 1e-9",
+            "UPDATE users SET bigmove_alert_4h=? WHERE bigmove_alert_4h IS NULL OR ABS(bigmove_alert_4h) < 1e-9 OR ABS(bigmove_alert_4h-20.0) < 1e-9 OR ABS(bigmove_alert_4h-15.0) < 1e-9 OR ABS(bigmove_alert_4h-6.0) < 1e-9 OR ABS(bigmove_alert_4h-5.0) < 1e-9",
             (float(BIGMOVE_DEFAULT_4H_PCT),),
         )
         cur.execute(
-            "UPDATE users SET bigmove_min_vol_usd=? WHERE bigmove_min_vol_usd IS NULL OR bigmove_min_vol_usd<=0 OR ABS(bigmove_min_vol_usd-10000000.0) < 1e-6 OR ABS(bigmove_min_vol_usd-15000000.0) < 1e-6",
+            "UPDATE users SET bigmove_min_vol_usd=? WHERE bigmove_min_vol_usd IS NULL OR bigmove_min_vol_usd<=0 OR ABS(bigmove_min_vol_usd-10000000.0) < 1e-6 OR ABS(bigmove_min_vol_usd-15000000.0) < 1e-6 OR ABS(bigmove_min_vol_usd-18000000.0) < 1e-6",
             (float(BIGMOVE_DEFAULT_MIN_VOL_USD),),
+        )
+        cur.execute(
+            """UPDATE users
+               SET bigmove_alert_update_reason=?
+               WHERE bigmove_alert_update_reason IS NULL
+                  OR bigmove_alert_update_reason=''
+                  OR bigmove_alert_update_reason LIKE '%2 4 6%'
+                  OR bigmove_alert_update_reason LIKE '%15m>=%'""",
+            (f"defaults_migrated: 15m>={BIGMOVE_DEFAULT_15M_PCT:.2f}% AND 1H>={BIGMOVE_DEFAULT_1H_PCT:.2f}% AND 4H>={BIGMOVE_DEFAULT_4H_PCT:.2f}%, same_direction_only, min_vol={BIGMOVE_DEFAULT_MIN_VOL_USD/1e6:.1f}M",),
         )
     except Exception:
         pass
@@ -11337,10 +11365,10 @@ def _safe_float(x, default: float = 0.0) -> float:
 
 
 
-BIGMOVE_DEFAULT_15M_PCT = float(os.environ.get("BIGMOVE_DEFAULT_15M_PCT", "2.0") or 2.0)
-BIGMOVE_DEFAULT_1H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_1H_PCT", "4.0") or 4.0)
-BIGMOVE_DEFAULT_4H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_4H_PCT", "6.0") or 6.0)
-BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "18000000") or 18_000_000.0)
+BIGMOVE_DEFAULT_15M_PCT = float(os.environ.get("BIGMOVE_DEFAULT_15M_PCT", "1.5") or 1.5)
+BIGMOVE_DEFAULT_1H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_1H_PCT", "3.0") or 3.0)
+BIGMOVE_DEFAULT_4H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_4H_PCT", "5.0") or 5.0)
+BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "15000000") or 15_000_000.0)
 BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
 BIGMOVE_COOLDOWN_SEC = 60 * 60  # 1 hour
 BIGMOVE_FAMILY_ID = "F8_BIGMOVE_CONT"
@@ -17272,13 +17300,14 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
 
 _OHLCV_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 _OHLCV_TF_RATE_LIMIT_UNTIL: Dict[str, float] = {}
+_OHLCV_GLOBAL_COOL_UNTIL = 0.0
 _OHLCV_RATE_LIMIT_WARN_UNTIL: Dict[str, float] = {}
 _OHLCV_LAST_KEY: Dict[str, str] = {}
 _OHLCV_INFLIGHT: Dict[str, threading.Event] = {}
 _OHLCV_INFLIGHT_LOCK = threading.Lock()
 _OHLCV_PAGED_CACHE: Dict[str, tuple[float, list]] = {}
 _OHLCV_PAGED_CACHE_LOCK = threading.Lock()
-OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "240") or 240)
+OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "600") or 600)
 OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "900") or 900)
 OHLCV_INFLIGHT_WAIT_SEC = float(os.getenv("OHLCV_INFLIGHT_WAIT_SEC", "2.5") or 2.5)
 OHLCV_PAGED_CACHE_TTL_SEC = float(os.getenv("OHLCV_PAGED_CACHE_TTL_SEC", "120") or 120)
@@ -17396,7 +17425,8 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     now_ts = float(time.time())
     cool_until = float(_OHLCV_RATE_LIMIT_UNTIL.get(key) or 0.0)
     tf_cool_until = float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0)
-    if cool_until > now_ts or tf_cool_until > now_ts:
+    global_cool_until = float(globals().get('_OHLCV_GLOBAL_COOL_UNTIL', 0.0) or 0.0)
+    if cool_until > now_ts or tf_cool_until > now_ts or global_cool_until > now_ts:
         stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
         return stale if isinstance(stale, list) else []
 
@@ -17445,6 +17475,7 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
             tf_cd = max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 60.0), min(max(key_cd, 120.0), 180.0))
             _OHLCV_RATE_LIMIT_UNTIL[key] = now_ts + key_cd
             _OHLCV_TF_RATE_LIMIT_UNTIL[tf_key] = max(float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0), now_ts + tf_cd)
+            globals()['_OHLCV_GLOBAL_COOL_UNTIL'] = max(float(globals().get('_OHLCV_GLOBAL_COOL_UNTIL', 0.0) or 0.0), now_ts + tf_cd)
             warn_key = f'{tf_key}:rate_limit'
             if float(_OHLCV_RATE_LIMIT_WARN_UNTIL.get(warn_key) or 0.0) <= now_ts:
                 _OHLCV_RATE_LIMIT_WARN_UNTIL[warn_key] = now_ts + max(5.0, float(OHLCV_WARN_SUPPRESS_SEC or 30.0))
@@ -31695,7 +31726,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"Reason: {updated_reason}")
         lines.extend([
             "",
-            "Set: /bigmove_alert on 2 4 6",
+            "Set: /bigmove_alert on 1.5 3 5",
             "Off: /bigmove_alert off",
         ])
         await update.message.reply_text("\n".join(lines))
@@ -31719,13 +31750,13 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 p1 = float(context.args[2])
                 p4 = float(context.args[3])
             except Exception:
-                await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 2 4 6)")
+                await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 1.5 3 5)")
                 return
         _record_bigmove_settings_change(uid, True, p15, p1, p4, min_vol, f"command_on via /bigmove_alert (15m>={p15:.2f}% AND 1H>={p1:.2f}% AND 4H>={p4:.2f}%, same_direction_only, min_vol={min_vol/1e6:.1f}M)")
         await update.message.reply_text(f"✅ Big-move alert emails: ON (15m≥{p15:g}% AND 1H≥{p1:g}% AND 4H≥{p4:g}% | same direction only | Min Vol {min_vol/1e6:.1f}M)")
         return
 
-    await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 2 4 6)  OR  /bigmove_alert off")
+    await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 1.5 3 5)  OR  /bigmove_alert off")
 
 
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -37511,7 +37542,7 @@ _SMTP_CONN_TS = 0.0        # last-used timestamp
 
 
 async def _to_thread_with_timeout(fn, timeout_sec: int, *args, **kwargs):
-    return await to_thread_bg(fn, *args, timeout=timeout_sec, **kwargs)
+    return await to_thread_email(fn, *args, timeout=timeout_sec, **kwargs)
 
 def _run_coro_in_thread(coro):
     """Run an awaitable inside a dedicated event loop in a worker thread.
@@ -37819,30 +37850,28 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 top = filtered[0]
                 top_sym = top["symbol"]
                 top_dir = "UP" if top.get("direction") == "UP" else "DOWN"
-                top_ch15 = float(top.get("ch15", 0.0) or 0.0)
+                # For confirmed big-move emails, the displayed 15m value must be the
+                # confirmation candle move, not the original rolling trigger move.
+                top_ch15_trigger = float(top.get("ch15", 0.0) or 0.0)
+                top_ch15_display = float(top.get("confirm_15m_pct", top_ch15_trigger) or 0.0)
                 top_ch1 = float(top.get("ch1", 0.0) or 0.0)
                 top_ch4 = float(top.get("ch4", 0.0) or 0.0)
-                top_tf = max((("15m", abs(top_ch15)), ("1H", abs(top_ch1)), ("4H", abs(top_ch4))), key=lambda x: x[1])[0]
-                top_move = {"15m": top_ch15, "1H": top_ch1, "4H": top_ch4}[top_tf]
+                top_tf = max((("Confirm15m", abs(top_ch15_display)), ("1H", abs(top_ch1)), ("4H", abs(top_ch4))), key=lambda x: x[1])[0]
+                top_move = {"Confirm15m": top_ch15_display, "1H": top_ch1, "4H": top_ch4}[top_tf]
 
-                subject = f"⚡ Big Move Alert • {top_sym} {top_dir} • {top_tf} {top_move:+.0f}%"
+                subject = f"⚡ Big Move Alert • {top_sym} {top_dir} • {top_tf} {top_move:+.1f}%"
                 if len(filtered) > 1:
                     subject += f" (+{len(filtered)-1} more)"
 
                 for c in filtered[:8]:
                     sym = c["symbol"]
-                    ch15 = float(c.get("ch15", 0.0) or 0.0)
+                    ch15_trigger = float(c.get("ch15", 0.0) or 0.0)
+                    ch15_display = float(c.get("confirm_15m_pct", ch15_trigger) or 0.0)
                     ch4 = float(c.get("ch4", 0.0) or 0.0)
                     ch1 = float(c.get("ch1", 0.0) or 0.0)
                     vol = float(c.get("vol", 0.0) or 0.0)
                     arrow = "🟢" if c.get("direction") == "UP" else "🔴"
-                    confirm_txt = ""
-                    try:
-                        if 'confirm_15m_pct' in c:
-                            confirm_txt = f" | Next15m {float(c.get('confirm_15m_pct') or 0.0):+.1f}%"
-                    except Exception:
-                        confirm_txt = ""
-                    lines.append(f"{arrow} {sym}: 15m {ch15:+.0f}% | 1H {ch1:+.0f}% | 4H {ch4:+.0f}%{confirm_txt} | Vol ~{vol/1e6:.1f}M")
+                    lines.append(f"{arrow} {sym}: Confirm15m {ch15_display:+.1f}% | 1H {ch1:+.1f}% | 4H {ch4:+.1f}% | Vol ~{vol/1e6:.1f}M")
                     lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
                     lines.append("")
 
@@ -37875,7 +37904,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # Trigger: |15m| >= user.bigmove_alert_15m AND |1H| >= user.bigmove_alert_1h
         #          AND |4H| >= user.bigmove_alert_4h, all in the same direction.
         # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 15M)
-        # Defaults: 15m=2%, 1H=4%, 4H=6%
+        # Defaults: 15m=1.5%, 1H=3%, 4H=5%
         # -----------------------------------------------------
         try:
             if bool(ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING) and goal_running:
@@ -38015,6 +38044,12 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     setups = list(cached_setups)
                     try:
                         db_log_setup_pipeline_event(0, stage='email_pool_session_cache', status='rate_limit_cooldown_hit', session=str(sess_name or ''), mode='email', details={'setups': len(setups or []), 'cache_age_sec': round(cache_age, 1)})
+                    except Exception:
+                        pass
+                elif tf_cooling:
+                    setups = []
+                    try:
+                        db_log_setup_pipeline_event(0, stage='email_pool_session_skip', status='rate_limit_cooldown_no_cache', session=str(sess_name or ''), mode='email', details={'reason': 'ohlcv_global_or_tf_cooling'})
                     except Exception:
                         pass
                 else:
@@ -38460,7 +38495,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 }
                 continue
             try:
-                payload = _build_bigmove_payload_for_user(int(uid), tz)
+                try:
+                    payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, timeout=min(8, int(EMAIL_SEND_TIMEOUT_SEC or 10)))
+                except asyncio.TimeoutError:
+                    payload = {"status": "SKIP", "reasons": ["bigmove_payload_timeout"]}
                 pstatus = str((payload or {}).get('status') or '').upper().strip()
                 if pstatus != 'READY':
                     _LAST_BIGMOVE_DECISION[uid] = {
@@ -39844,11 +39882,11 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
 
 
             try:
-                db_setups = await to_thread_bg(_autotrade_select_db_setups_cached, uid, sess, lookback_hours=12, limit=5, timeout=6)
+                db_setups = await to_thread_autotrade(_autotrade_select_db_setups_cached, uid, sess, lookback_hours=12, limit=5, timeout=3)
             except asyncio.TimeoutError:
                 db_setups = []
                 try:
-                    db_log_setup_pipeline_event(uid, stage='autotrade_exec_select', status='timeout', session=str(sess or ''), mode='autotrade', details={'timeout_sec': 6})
+                    db_log_setup_pipeline_event(uid, stage='autotrade_exec_select', status='timeout', session=str(sess or ''), mode='autotrade', details={'timeout_sec': 3})
                 except Exception:
                     pass
             except Exception as e:
@@ -39920,7 +39958,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 remaining_budget = max(3.0, float(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40) - (time.time() - job_started_ts))
                 per_candidate_timeout = min(float(AUTOTRADE_JOB_TIMEOUT_SEC or 25), remaining_budget)
                 try:
-                    ok, reason = await to_thread_bg(
+                    ok, reason = await to_thread_autotrade(
                         _autotrade_place_trade,
                         uid,
                         sess,
@@ -40049,7 +40087,7 @@ def main():
     ensure_email_column()
     _evolution_migrate_tables()
     
-    app = (
+    builder = (
         Application.builder()
         .token(TOKEN)
         .post_init(_post_init)
@@ -40059,8 +40097,20 @@ def main():
         .connect_timeout(float(os.getenv('TELEGRAM_CONNECT_TIMEOUT_SEC', '3.0') or 3.0))
         .read_timeout(float(os.getenv('TELEGRAM_READ_TIMEOUT_SEC', '30.0') or 30.0))
         .write_timeout(float(os.getenv('TELEGRAM_WRITE_TIMEOUT_SEC', '10.0') or 10.0))
-        .build()
     )
+    # PTB >=20.6 deprecates passing getUpdates timeouts to run_polling().
+    # Configure them on ApplicationBuilder to remove the warning and keep polling stable.
+    for _method, _value in (
+        ('get_updates_connect_timeout', float(os.getenv('TELEGRAM_POLL_CONNECT_TIMEOUT_SEC', '10') or 10)),
+        ('get_updates_read_timeout', float(os.getenv('TELEGRAM_POLL_READ_TIMEOUT_SEC', '35') or 35)),
+        ('get_updates_write_timeout', float(os.getenv('TELEGRAM_POLL_WRITE_TIMEOUT_SEC', '20') or 20)),
+        ('get_updates_pool_timeout', float(os.getenv('TELEGRAM_POOL_TIMEOUT_SEC', '1.0') or 1.0)),
+    ):
+        try:
+            builder = getattr(builder, _method)(_value)
+        except Exception:
+            pass
+    app = builder.build()
 
     # Fast-lane for ultra-light commands that must feel instant (/help, /size, etc.)
     app.add_handler(MessageHandler(filters.COMMAND, _fast_path_command_router), group=-2)
@@ -40255,13 +40305,13 @@ def main():
         # AutoTrade loop (owner-only)
         app.job_queue.run_repeating(
             autotrade_job,
-            interval=max(int(AUTOTRADE_JOB_INTERVAL_SEC or 75), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 28) + 20),
+            interval=max(int(AUTOTRADE_JOB_INTERVAL_SEC or 300), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 10) + 45),
             first=35,
             name="autotrade_job",
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
-                "misfire_grace_time": 90,
+                "misfire_grace_time": 300,
             },
         )
 
@@ -40434,9 +40484,6 @@ def main():
             allowed_updates=Update.ALL_TYPES,
             poll_interval=float(os.getenv("TELEGRAM_POLL_INTERVAL_SEC", "0.2") or 0.2),
             timeout=int(os.getenv("TELEGRAM_LONG_POLL_TIMEOUT_SEC", "25") or 25),
-            read_timeout=float(os.getenv("TELEGRAM_POLL_READ_TIMEOUT_SEC", "35") or 35),
-            write_timeout=float(os.getenv("TELEGRAM_POLL_WRITE_TIMEOUT_SEC", "20") or 20),
-            connect_timeout=float(os.getenv("TELEGRAM_POLL_CONNECT_TIMEOUT_SEC", "10") or 10),
         )
     except Conflict:
         logger.error("Another instance is polling. Sleeping forever.")
