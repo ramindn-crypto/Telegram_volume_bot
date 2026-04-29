@@ -694,8 +694,10 @@ from concurrent.futures import ThreadPoolExecutor
 import functools as _functools
 
 _FAST_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("FAST_EXECUTOR_WORKERS", "8")))
-# User-facing heavy work: /screen, reports, diagnostics, manual runs.
+# User-facing heavy work: reports, diagnostics, manual runs.
 _HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "4")))
+# Dedicated /screen lane: must not be starved by backtests, optimizer, email, or autotrade.
+_SCREEN_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("SCREEN_EXECUTOR_WORKERS", "2")))
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
 
@@ -738,6 +740,9 @@ async def to_thread_fast(fn, *args, timeout: int | None = None, **kwargs):
 
 async def to_thread_heavy(fn, *args, timeout: int | None = None, **kwargs):
     return await _run_in_executor(_HEAVY_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
+
+async def to_thread_screen(fn, *args, timeout: int | None = None, **kwargs):
+    return await _run_in_executor(_SCREEN_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
 
 async def to_thread_bg(fn, *args, timeout: int | None = None, **kwargs):
     return await _run_in_executor(_BACKGROUND_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
@@ -10211,7 +10216,7 @@ def db_init():
     if "bigmove_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_on INTEGER NOT NULL DEFAULT 1")
     
-    # Big-move alert defaults: 15m >= 1.5%, 1H >= 3%, 4H >= 5% in the same direction.
+    # Big-move alert defaults: 15m >= 2%, 1H >= 4%, 4H >= 6% in the same direction.
     if "bigmove_alert_15m" not in cols:
         cur.execute(f"ALTER TABLE users ADD COLUMN bigmove_alert_15m REAL NOT NULL DEFAULT {BIGMOVE_DEFAULT_15M_PCT}")
     if "bigmove_alert_4h" not in cols:
@@ -10229,7 +10234,7 @@ def db_init():
     # Migrate obvious legacy defaults to the new commercial defaults without touching custom values.
     try:
         cur.execute(
-            "UPDATE users SET bigmove_alert_15m=? WHERE bigmove_alert_15m IS NULL OR ABS(bigmove_alert_15m) < 1e-9 OR ABS(bigmove_alert_15m-2.0) < 1e-9",
+            "UPDATE users SET bigmove_alert_15m=? WHERE bigmove_alert_15m IS NULL OR ABS(bigmove_alert_15m) < 1e-9 OR ABS(bigmove_alert_15m-1.5) < 1e-9 OR ABS(bigmove_alert_15m-2.0) < 1e-9",
             (float(BIGMOVE_DEFAULT_15M_PCT),),
         )
         cur.execute(
@@ -10241,7 +10246,7 @@ def db_init():
             (float(BIGMOVE_DEFAULT_4H_PCT),),
         )
         cur.execute(
-            "UPDATE users SET bigmove_min_vol_usd=? WHERE bigmove_min_vol_usd IS NULL OR bigmove_min_vol_usd<=0 OR ABS(bigmove_min_vol_usd-10000000.0) < 1e-6",
+            "UPDATE users SET bigmove_min_vol_usd=? WHERE bigmove_min_vol_usd IS NULL OR bigmove_min_vol_usd<=0 OR ABS(bigmove_min_vol_usd-10000000.0) < 1e-6 OR ABS(bigmove_min_vol_usd-15000000.0) < 1e-6",
             (float(BIGMOVE_DEFAULT_MIN_VOL_USD),),
         )
     except Exception:
@@ -10617,6 +10622,28 @@ def db_init():
             direction   TEXT    NOT NULL,   -- "UP" or "DOWN"
             emailed_ts  REAL    NOT NULL,
             PRIMARY KEY (user_id, symbol, direction)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_bigmoves (
+            user_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            trigger_ts REAL NOT NULL DEFAULT 0,
+            trigger_candle_ts REAL NOT NULL DEFAULT 0,
+            p15 REAL NOT NULL DEFAULT 0,
+            p1 REAL NOT NULL DEFAULT 0,
+            p4 REAL NOT NULL DEFAULT 0,
+            min_vol_usd REAL NOT NULL DEFAULT 0,
+            ch15 REAL NOT NULL DEFAULT 0,
+            ch1 REAL NOT NULL DEFAULT 0,
+            ch4 REAL NOT NULL DEFAULT 0,
+            vol REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            note TEXT NOT NULL DEFAULT '',
+            updated_ts REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY(user_id, symbol, direction)
         )
     """)
 
@@ -11304,10 +11331,10 @@ def _safe_float(x, default: float = 0.0) -> float:
 
 
 
-BIGMOVE_DEFAULT_15M_PCT = 1.5
-BIGMOVE_DEFAULT_1H_PCT = 3.0
-BIGMOVE_DEFAULT_4H_PCT = 5.0
-BIGMOVE_DEFAULT_MIN_VOL_USD = 15_000_000.0
+BIGMOVE_DEFAULT_15M_PCT = float(os.environ.get("BIGMOVE_DEFAULT_15M_PCT", "2.0") or 2.0)
+BIGMOVE_DEFAULT_1H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_1H_PCT", "4.0") or 4.0)
+BIGMOVE_DEFAULT_4H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_4H_PCT", "6.0") or 6.0)
+BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "18000000") or 18_000_000.0)
 BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
 BIGMOVE_COOLDOWN_SEC = 60 * 60  # 1 hour
 BIGMOVE_FAMILY_ID = "F8_BIGMOVE_CONT"
@@ -11345,6 +11372,273 @@ def mark_bigmove_emailed(uid: int, symbol: str, direction: str) -> None:
             conn.commit()
     except Exception:
         pass
+
+
+# Big-move email confirmation gate:
+# 1) first scan that meets 15m/1H/4H same-direction criteria records a pending trigger;
+# 2) only the NEXT closed 15m candle can release the email;
+# 3) if that next 15m candle is not in the same direction, the pending trigger is cancelled.
+BIGMOVE_CONFIRM_NEXT_15M_ENABLED = env_bool("BIGMOVE_CONFIRM_NEXT_15M_ENABLED", True)
+BIGMOVE_PENDING_TTL_SEC = int(os.environ.get("BIGMOVE_PENDING_TTL_SEC", str(3 * 60 * 60)) or (3 * 60 * 60))
+
+
+def _bigmove_pending_migrate() -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pending_bigmoves (
+                    user_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    trigger_ts REAL NOT NULL DEFAULT 0,
+                    trigger_candle_ts REAL NOT NULL DEFAULT 0,
+                    p15 REAL NOT NULL DEFAULT 0,
+                    p1 REAL NOT NULL DEFAULT 0,
+                    p4 REAL NOT NULL DEFAULT 0,
+                    min_vol_usd REAL NOT NULL DEFAULT 0,
+                    ch15 REAL NOT NULL DEFAULT 0,
+                    ch1 REAL NOT NULL DEFAULT 0,
+                    ch4 REAL NOT NULL DEFAULT 0,
+                    vol REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    note TEXT NOT NULL DEFAULT '',
+                    updated_ts REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY(user_id, symbol, direction)
+                )
+            """)
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _bigmove_pending_get(uid: int, symbol: str, direction: str) -> dict | None:
+    _bigmove_pending_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT * FROM pending_bigmoves WHERE user_id=? AND symbol=? AND direction=? AND status='PENDING'",
+                (int(uid), str(symbol).upper().strip(), str(direction).upper().strip()),
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def _bigmove_pending_list(uid: int | None = None) -> list[dict]:
+    _bigmove_pending_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            if uid is None:
+                rows = cur.execute(
+                    "SELECT * FROM pending_bigmoves WHERE status='PENDING' ORDER BY trigger_ts ASC LIMIT 100"
+                ).fetchall() or []
+            else:
+                rows = cur.execute(
+                    "SELECT * FROM pending_bigmoves WHERE user_id=? AND status='PENDING' ORDER BY trigger_ts ASC LIMIT 100",
+                    (int(uid),),
+                ).fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _bigmove_pending_upsert(uid: int, c: dict, p15: float, p1: float, p4: float, min_vol: float, trigger_candle_ts: float) -> None:
+    _bigmove_pending_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT OR REPLACE INTO pending_bigmoves(
+                    user_id, symbol, direction, trigger_ts, trigger_candle_ts,
+                    p15, p1, p4, min_vol_usd, ch15, ch1, ch4, vol, status, note, updated_ts
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    int(uid),
+                    str(c.get('symbol') or '').upper().strip(),
+                    str(c.get('direction') or '').upper().strip(),
+                    float(time.time()),
+                    float(trigger_candle_ts or 0.0),
+                    float(p15 or 0.0), float(p1 or 0.0), float(p4 or 0.0), float(min_vol or 0.0),
+                    float(c.get('ch15') or 0.0), float(c.get('ch1') or 0.0), float(c.get('ch4') or 0.0), float(c.get('vol') or 0.0),
+                    'PENDING',
+                    'waiting_for_next_15m_confirmation',
+                    float(time.time()),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _bigmove_pending_close(uid: int, symbol: str, direction: str, status: str, note: str = '') -> None:
+    _bigmove_pending_migrate()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE pending_bigmoves SET status=?, note=?, updated_ts=? WHERE user_id=? AND symbol=? AND direction=?",
+                (str(status or '').upper().strip(), str(note or '')[:500], float(time.time()), int(uid), str(symbol).upper().strip(), str(direction).upper().strip()),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _bigmove_prune_pending(uid: int | None = None) -> None:
+    _bigmove_pending_migrate()
+    try:
+        cutoff = float(time.time()) - float(max(900, BIGMOVE_PENDING_TTL_SEC))
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            if uid is None:
+                cur.execute("UPDATE pending_bigmoves SET status='EXPIRED', note='pending_ttl_expired', updated_ts=? WHERE status='PENDING' AND trigger_ts<?", (float(time.time()), cutoff))
+            else:
+                cur.execute("UPDATE pending_bigmoves SET status='EXPIRED', note='pending_ttl_expired', updated_ts=? WHERE user_id=? AND status='PENDING' AND trigger_ts<?", (float(time.time()), int(uid), cutoff))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _bigmove_last_closed_15m_candle(symbol: str) -> dict | None:
+    """Return the latest fully closed 15m candle for a Bybit/ccxt symbol.
+
+    Bybit/CCXT may include the currently forming candle as the last row, so we choose
+    the most recent candle whose open timestamp is at least 15 minutes behind now.
+    """
+    try:
+        sym = str(symbol or '').strip()
+        if not sym:
+            return None
+        # Accept both base (TAO) and market symbol (TAO/USDT:USDT).
+        if '/' not in sym and ':' not in sym:
+            sym = f"{sym}/USDT:USDT"
+        rows = fetch_ohlcv(sym, "15m", 4)
+        if not rows:
+            return None
+        now_ms = int(time.time() * 1000)
+        tf_ms = 15 * 60 * 1000
+        closed = []
+        for r in rows:
+            try:
+                ts = int(float(r[0]))
+                if ts + tf_ms <= now_ms - 5_000:
+                    closed.append(r)
+            except Exception:
+                continue
+        if not closed:
+            closed = rows[:-1] if len(rows) >= 2 else rows
+        if not closed:
+            return None
+        r = closed[-1]
+        ts = int(float(r[0])); o = float(r[1]); c = float(r[4])
+        pct = ((c - o) / o * 100.0) if o else 0.0
+        return {"ts": float(ts / 1000.0), "open": o, "close": c, "pct": float(pct)}
+    except Exception:
+        return None
+
+
+def _bigmove_confirm_next_15m_for_user(uid: int, candidates: list, p15: float, p1: float, p4: float, min_vol: float) -> tuple[list, dict]:
+    """Gate big-move alert candidates on the next closed 15m candle.
+
+    First-time criteria hits are staged. On a later scan, the pending trigger is confirmed
+    from the next fully closed 15m candle even if the symbol has dropped out of the raw
+    current candidate list; the original criteria already passed when the pending row was
+    created. This prevents missing alerts solely because the confirmation candle changed
+    the rolling 15m/1h/4h metrics.
+    """
+    stats = {"pending_new": 0, "pending_wait": 0, "confirmed": 0, "cancelled": 0, "no_candle": 0, "cooldown": 0, "pending_checked": 0}
+    if not BIGMOVE_CONFIRM_NEXT_15M_ENABLED:
+        return list(candidates or []), stats
+    _bigmove_prune_pending(int(uid))
+    confirmed = []
+    seen: set[tuple[str, str]] = set()
+
+    def _confirm_pending_row(row: dict, current_candidate: dict | None = None) -> None:
+        try:
+            sym = str((row or {}).get('symbol') or (current_candidate or {}).get('symbol') or '').upper().strip()
+            direction = str((row or {}).get('direction') or (current_candidate or {}).get('direction') or '').upper().strip()
+            if not sym or direction not in {'UP', 'DOWN'}:
+                return
+            if bigmove_recently_emailed(int(uid), sym, direction):
+                stats['cooldown'] += 1
+                return
+            candle = _bigmove_last_closed_15m_candle(sym)
+            if not candle:
+                stats['no_candle'] += 1
+                return
+            candle_ts = float(candle.get('ts') or 0.0)
+            trigger_candle_ts = float((row or {}).get('trigger_candle_ts') or 0.0)
+            if candle_ts <= trigger_candle_ts + 1:
+                stats['pending_wait'] += 1
+                return
+            pct = float(candle.get('pct') or 0.0)
+            same_direction = (pct > 0.0) if direction == 'UP' else (pct < 0.0)
+            if same_direction:
+                cc = dict(current_candidate or {})
+                cc.setdefault('symbol', sym)
+                cc.setdefault('direction', direction)
+                cc.setdefault('ch15', float((row or {}).get('ch15') or 0.0))
+                cc.setdefault('ch1', float((row or {}).get('ch1') or 0.0))
+                cc.setdefault('ch4', float((row or {}).get('ch4') or 0.0))
+                cc.setdefault('vol', float((row or {}).get('vol') or 0.0))
+                cc['confirm_15m_pct'] = pct
+                cc['confirm_15m_ts'] = candle_ts
+                confirmed.append(cc)
+                _bigmove_pending_close(int(uid), sym, direction, 'CONFIRMED', f'next_15m_same_direction:{pct:+.2f}%')
+                stats['confirmed'] += 1
+            else:
+                _bigmove_pending_close(int(uid), sym, direction, 'CANCELLED', f'next_15m_failed:{pct:+.2f}%')
+                stats['cancelled'] += 1
+        except Exception:
+            return
+
+    # Stage or confirm current raw candidates.
+    for c in list(candidates or []):
+        try:
+            sym = str(c.get('symbol') or '').upper().strip()
+            direction = str(c.get('direction') or '').upper().strip()
+            if not sym or direction not in {'UP', 'DOWN'}:
+                continue
+            seen.add((sym, direction))
+            if bigmove_recently_emailed(int(uid), sym, direction):
+                stats['cooldown'] += 1
+                continue
+            candle = _bigmove_last_closed_15m_candle(sym)
+            if not candle:
+                stats['no_candle'] += 1
+                continue
+            candle_ts = float(candle.get('ts') or 0.0)
+            pending = _bigmove_pending_get(int(uid), sym, direction)
+            if not pending:
+                _bigmove_pending_upsert(int(uid), c, p15, p1, p4, min_vol, candle_ts)
+                stats['pending_new'] += 1
+                continue
+            _confirm_pending_row(pending, c)
+        except Exception:
+            continue
+
+    # Confirm already-staged symbols even if they are no longer in this scan's raw candidate list.
+    try:
+        for row in _bigmove_pending_list(int(uid)):
+            try:
+                sym = str((row or {}).get('symbol') or '').upper().strip()
+                direction = str((row or {}).get('direction') or '').upper().strip()
+                key = (sym, direction)
+                if key in seen:
+                    continue
+                stats['pending_checked'] += 1
+                _confirm_pending_row(row, None)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return confirmed, stats
 
 def _user_bigmove_thresholds(user: dict | None) -> tuple[float, float, float]:
     """Return (15m, 1h, 4h) thresholds for big-move alerts."""
@@ -17749,40 +18043,78 @@ async def send_long_message(
     if max_len < 500:
         max_len = 2000
 
-    chunks = [s[i : i + max_len] for i in range(0, len(s), max_len)]
+    # Prefer line-aware chunking so Markdown/HTML/code blocks are less likely to be split.
+    chunks = []
+    buf = ""
+    for line in str(s).splitlines(True):
+        if len(buf) + len(line) > max_len and buf:
+            chunks.append(buf)
+            buf = ""
+        while len(line) > max_len:
+            chunks.append(line[:max_len])
+            line = line[max_len:]
+        buf += line
+    if buf:
+        chunks.append(buf)
+    if not chunks:
+        chunks = [""]
+
+    def _is_parse_entity_error(exc: Exception) -> bool:
+        msg = str(exc or '').lower()
+        return ('parse entities' in msg) or ('can\'t parse entities' in msg) or ('entity' in msg and 'parse' in msg)
 
     first = True
     for ch in chunks:
 
-        async def _send(pm: Optional[str]):
+        async def _send(pm: Optional[str], body: Optional[str] = None):
             await update.message.reply_text(
-                ch,
+                ch if body is None else body,
                 parse_mode=pm,
                 disable_web_page_preview=disable_web_page_preview,
                 reply_markup=reply_markup if first else None,
             )
 
-        # Try with requested parse_mode first (or None)
+        # Try with requested parse_mode first (or None). If Telegram rejects entities,
+        # immediately fall back to plain text. This fixes admin JSON/report outputs where
+        # underscores/brackets or chunked code fences can break Markdown parsing.
         try:
             await _send(parse_mode)
 
         except RetryAfter as e:
-            # Telegram rate limit: wait then retry once
             wait_s = int(getattr(e, "retry_after", 1)) + 1
             await asyncio.sleep(wait_s)
-            await _send(parse_mode)
-
-        except (TimedOut, NetworkError) as e:
-            # transient network: retry once
-            logger.warning("Telegram send failed (network): %s", e)
-            await asyncio.sleep(2)
             try:
                 await _send(parse_mode)
             except Exception as e2:
-                logger.warning("Telegram retry failed (network): %s", e2)
+                if _is_parse_entity_error(e2):
+                    try:
+                        await _send(None)
+                    except Exception as e3:
+                        logger.warning("Telegram plain fallback after RetryAfter failed: %s", e3)
+                else:
+                    logger.warning("Telegram retry failed after RetryAfter: %s", e2)
+
+        except (TimedOut, NetworkError) as e:
+            logger.warning("Telegram send failed (network): %s", e)
+            if _is_parse_entity_error(e):
+                try:
+                    await _send(None)
+                except Exception as e2:
+                    logger.warning("Telegram plain fallback failed: %s", e2)
+            else:
+                await asyncio.sleep(2)
+                try:
+                    await _send(parse_mode)
+                except Exception as e2:
+                    if _is_parse_entity_error(e2):
+                        try:
+                            await _send(None)
+                        except Exception as e3:
+                            logger.warning("Telegram plain fallback after network retry failed: %s", e3)
+                    else:
+                        logger.warning("Telegram retry failed (network): %s", e2)
 
         except BadRequest as e:
-            # Usually formatting issue -> fallback to plain text
             logger.warning("Telegram BadRequest (parse_mode=%s): %s | Falling back to plain text.", parse_mode, e)
             try:
                 await _send(None)
@@ -17790,7 +18122,13 @@ async def send_long_message(
                 logger.warning("Telegram fallback send failed: %s", e2)
 
         except Exception as e:
-            logger.exception("Telegram send failed: %s", e)
+            if _is_parse_entity_error(e):
+                try:
+                    await _send(None)
+                except Exception as e2:
+                    logger.warning("Telegram plain fallback failed: %s", e2)
+            else:
+                logger.exception("Telegram send failed: %s", e)
 
         first = False
 
@@ -23164,7 +23502,7 @@ async def scan_intelligence_job(context: ContextTypes.DEFAULT_TYPE):
     if not SCAN_INTELLIGENCE_ENABLED:
         return
     try:
-        best_fut = await to_thread_bg(fetch_futures_tickers)
+        best_fut = await to_thread_screen(fetch_futures_tickers, timeout=20)
         if not best_fut:
             return
 
@@ -26442,7 +26780,7 @@ def is_top_setup_eligible(
             # Keep NY broad, but require slightly better LON scores here.
             min_score += 0.50 if src == 'exec' else (0.50 if src == 'email' else 0.25)
 
-        min_floor = 60.0 if src == 'exec' else (56.0 if reach_mode and sess == 'LON' else 60.0)
+        min_floor = 58.0 if src == 'exec' else (55.0 if reach_mode and sess == 'LON' else 58.0)
         min_score = float(clamp(min_score, min_floor, 90.0))
 
         if float(score) < float(min_score):
@@ -26473,11 +26811,11 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
     """
     sess = str(session_name or "").upper().strip()
     if sess == "NY":
-        quality, conf, rr = 67.0, 70, 1.14
+        quality, conf, rr = 65.5, 69, 1.10
     elif sess == "LON":
-        quality, conf, rr = 64.5, 68, 1.08
+        quality, conf, rr = 63.0, 67, 1.04
     elif sess == "ASIA":
-        quality, conf, rr = 64.5, 68, 1.06
+        quality, conf, rr = 63.0, 67, 1.03
     else:
         quality, conf, rr = 69.0, 72, 1.18
 
@@ -26503,9 +26841,9 @@ def _execution_session_thresholds(session_name: str) -> tuple[float, int, float]
                 rr -= 0.05
     except Exception:
         pass
-    quality = float(clamp(quality, 62.0, 92.0))
-    conf = int(max(66, min(95, conf)))
-    rr = float(clamp(rr, 0.98, 2.30))
+    quality = float(clamp(quality, 60.0, 92.0))
+    conf = int(max(65, min(95, conf)))
+    rr = float(clamp(rr, 0.95, 2.30))
     return (quality, conf, rr)
 
 
@@ -29837,6 +30175,8 @@ Trade Journal
 
 /bigmove_alert on|off [15m%] [1H%] [4H%]
 • Big move alerts in either direction (UP or DOWN)
+• Defaults: 15m=2%, 1H=4%, 4H=6%, Min Vol=18M
+• Email sends only after the next 15m candle confirms the same direction
 
 ────────────────────
 ⏰ TIMEZONE (LOCAL TIME IN EMAILS)
@@ -31304,7 +31644,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"Reason: {updated_reason}")
         lines.extend([
             "",
-            "Set: /bigmove_alert on 1.5 3 5",
+            "Set: /bigmove_alert on 2 4 6",
             "Off: /bigmove_alert off",
         ])
         await update.message.reply_text("\n".join(lines))
@@ -31328,7 +31668,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 p1 = float(context.args[2])
                 p4 = float(context.args[3])
             except Exception:
-                await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 1.5 3 5)")
+                await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 2 4 6)")
                 return
         _record_bigmove_settings_change(uid, True, p15, p1, p4, min_vol, f"command_on via /bigmove_alert (15m>={p15:.2f}% AND 1H>={p1:.2f}% AND 4H>={p4:.2f}%, same_direction_only, min_vol={min_vol/1e6:.1f}M)")
         await update.message.reply_text(f"✅ Big-move alert emails: ON (15m≥{p15:g}% AND 1H≥{p1:g}% AND 4H≥{p4:g}% | same direction only | Min Vol {min_vol/1e6:.1f}M)")
@@ -35349,6 +35689,8 @@ _SCREEN_LOCK = asyncio.Lock()
 
 # Background refresh task for /screen (keeps UX instant)
 _SCREEN_REFRESH_TASK = None  # asyncio.Task
+_SCREEN_REFRESH_TASK_TS = 0.0
+SCREEN_REFRESH_STUCK_SEC = int(os.environ.get("SCREEN_REFRESH_STUCK_SEC", "90") or 90)
 
 # Keep recent screen cards in memory for PF- lookup.
 # /screen is built from the executable lane, but these cached cards themselves are
@@ -35407,19 +35749,67 @@ def _recent_screen_signal_lookup(setup_id: str) -> Optional[dict]:
     except Exception:
         return None
 
+
+
+def _screen_quick_ticker_snapshot_body(best_fut: Dict[str, MarketVol], session: str = '') -> tuple[str, list, list]:
+    """No-OHLCV fallback for /screen when the full executable scan is warming up.
+
+    It gives the user an instant market snapshot instead of the annoying
+    "No cached /screen snapshot yet" message. It does not create trade setups.
+    """
+    try:
+        items = list((best_fut or {}).items())
+        items = [(str(b).upper(), mv) for b, mv in items if mv]
+        items.sort(key=lambda kv: abs(float(getattr(kv[1], 'percentage', 0.0) or 0.0)), reverse=True)
+        leaders = sorted(items, key=lambda kv: float(getattr(kv[1], 'percentage', 0.0) or 0.0), reverse=True)[:5]
+        losers = sorted(items, key=lambda kv: float(getattr(kv[1], 'percentage', 0.0) or 0.0))[:5]
+
+        def _row(kv):
+            b, mv = kv
+            try:
+                pct = float(getattr(mv, 'percentage', 0.0) or 0.0)
+            except Exception:
+                pct = 0.0
+            try:
+                vol = float(usd_notional(mv) or 0.0) / 1e6
+            except Exception:
+                vol = 0.0
+            dot = '🟢' if pct >= 0 else '🔴'
+            return f"{b} {pct:+.1f}% {dot} ({vol:.1f}M)"
+
+        btc = float(getattr((best_fut or {}).get('BTC') or MarketVol('BTC','BTC','USDT',0,0,0,0,0,0), 'percentage', 0.0) or 0.0)
+        eth = float(getattr((best_fut or {}).get('ETH') or MarketVol('ETH','ETH','USDT',0,0,0,0,0,0), 'percentage', 0.0) or 0.0)
+        body = []
+        body.append("*Top Trade Setups*")
+        body.append("━━━━━━━━━━━━━━━━━━━━")
+        body.append("_Executable scan is warming up. No confirmed setup shown from the quick ticker snapshot._")
+        body.append("")
+        body.append("*Market Context*")
+        body.append("━━━━━━━━━━━━━━━━━━━━")
+        body.append(f"Pulse: BTC {btc:+.1f}% | ETH {eth:+.1f}%")
+        body.append("")
+        body.append("*Leaders:* " + (", ".join(_row(x) for x in leaders) if leaders else "—"))
+        body.append("*Losers:* " + (", ".join(_row(x) for x in losers) if losers else "—"))
+        body.append("")
+        body.append("_A full executable-family refresh has been queued in the dedicated /screen lane._")
+        return "\n".join(body), [], []
+    except Exception:
+        return "_Screen cache is warming up. A fresh scan has been queued._", [], []
+
 async def _refresh_screen_cache_async():
     """Refreshes _SCREEN_CACHE in the background (best effort)."""
     global _SCREEN_REFRESH_TASK
     try:
-        best_fut = await to_thread_bg(fetch_futures_tickers)
+        best_fut = await to_thread_screen(fetch_futures_tickers, timeout=20)
         if not best_fut:
             return
         now_utc = datetime.now(timezone.utc)
         session = scan_session_name_utc(now_utc)
-        body, kb, _setups = await to_thread_heavy(_build_screen_body_and_kb,
+        body, kb, _setups = await to_thread_screen(_build_screen_body_and_kb,
             best_fut,
             session,
             0,
+            timeout=35,
         )
         cache_key = f"global::{str(session or '').upper()}"
         _SCREEN_CACHE[cache_key] = {
@@ -35445,11 +35835,14 @@ async def _refresh_screen_cache_for_user_async(uid: int, session: str | None = N
         if _SCREEN_LOCK.locked() or SCAN_LOCK.locked():
             return
         async with _SCREEN_LOCK:
-            best_fut = await to_thread_bg(_screen_best_fut_fast, timeout=25)
+            best_fut = await to_thread_screen(_screen_best_fut_fast, timeout=10)
             if not best_fut:
                 return
             sess = str(session or scan_session_name_utc(datetime.now(timezone.utc)) or '').upper()
-            body, kb, _setups = await to_thread_heavy(_build_screen_body_and_kb, best_fut, sess, int(uid or 0), timeout=45)
+            try:
+                body, kb, _setups = await to_thread_screen(_build_screen_body_and_kb, best_fut, sess, int(uid or 0), timeout=35)
+            except Exception:
+                body, kb, _setups = _screen_quick_ticker_snapshot_body(best_fut, sess)
             _SCREEN_CACHE[f"uid:{int(uid or 0)}::{sess}"] = {
                 "ts": time.time(),
                 "body": body,
@@ -35467,10 +35860,18 @@ async def _refresh_screen_cache_for_user_async(uid: int, session: str | None = N
 
 
 def _schedule_screen_cache_refresh(uid: int, session: str | None = None) -> None:
-    global _SCREEN_REFRESH_TASK
+    global _SCREEN_REFRESH_TASK, _SCREEN_REFRESH_TASK_TS
     try:
+        now_ts = float(time.time())
         if _SCREEN_REFRESH_TASK is not None and not _SCREEN_REFRESH_TASK.done():
-            return
+            # If a refresh is genuinely stuck, cancel and replace it; otherwise do not pile up tasks.
+            if (now_ts - float(_SCREEN_REFRESH_TASK_TS or 0.0)) < float(SCREEN_REFRESH_STUCK_SEC):
+                return
+            try:
+                _SCREEN_REFRESH_TASK.cancel()
+            except Exception:
+                pass
+        _SCREEN_REFRESH_TASK_TS = now_ts
         _SCREEN_REFRESH_TASK = _safe_create_task(_refresh_screen_cache_for_user_async(int(uid or 0), session), 'screen_cache_refresh')
     except Exception:
         _SCREEN_REFRESH_TASK = None
@@ -36070,6 +36471,13 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"uid:{int(uid)}::{scan_session}",
             f"global::{scan_session}",
         ]
+        # If this session has no cache after a restart, reuse the freshest cache from any session.
+        try:
+            for _k, _v in list(_SCREEN_CACHE.items()):
+                if str(_k).startswith((f"uid:{int(uid)}::", "global::")) and (_v or {}).get('body'):
+                    cache_keys.append(_k)
+        except Exception:
+            pass
         cache_entry = {}
         age = 999999.0
         for _ck in cache_keys:
@@ -36102,7 +36510,28 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
             )
             return
-        await update.message.reply_text("🔎 No cached /screen snapshot yet. Fresh scan started in the background — run /screen again shortly.")
+        # Last-resort instant ticker snapshot from cached tickers. No network call here.
+        try:
+            quick_best = get_cached_futures_tickers() or {}
+            if quick_best:
+                body, kb, _ = _screen_quick_ticker_snapshot_body(quick_best, scan_session)
+                _SCREEN_CACHE[f"uid:{int(uid)}::{scan_session}"] = {"ts": time.time(), "body": body, "kb": list(kb or [])}
+                header = (
+                    f"*PulseFutures — Market Scan*\n"
+                    f"{HDR}\n"
+                    f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                    f"_Showing instant ticker snapshot while full executable scan warms up._\n"
+                )
+                await send_long_message(
+                    update,
+                    (header + "\n" + body).strip(),
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                )
+                return
+        except Exception:
+            pass
+        await update.message.reply_text("🔎 /screen cache is warming up. Fresh scan is queued in the dedicated screen lane — run /screen again shortly.")
         return
     except Exception:
         pass
@@ -36264,11 +36693,12 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Heavy build MUST NOT run on the asyncio event loop.
             # Only /screen is allowed to take longer; everything here runs in a worker thread.
-            body, kb, shown_setups = await to_thread_heavy(
+            body, kb, shown_setups = await to_thread_screen(
                 _build_screen_body_and_kb,
                 best_fut,
                 scan_session,
                 int(update.effective_user.id),
+                timeout=45,
             )
 
             # /screen now renders from the executable lane. After the message is sent,
@@ -37204,7 +37634,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     min_vol = BIGMOVE_DEFAULT_MIN_VOL_USD
 
-                candidates = _bigmove_candidates(best_fut, p15=p15, p1=p1, p4=p4, min_vol_usd=min_vol, max_items=12)
+                raw_candidates = _bigmove_candidates(best_fut, p15=p15, p1=p1, p4=p4, min_vol_usd=min_vol, max_items=12)
+                candidates = list(raw_candidates or [])
 
                 def _pick_pct(_mv, _keys) -> float:
                     for _k in _keys:
@@ -37241,12 +37672,31 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     bm_any_15m = -1
 
+                # Confirmation gate requested by admin: first criteria hit only stages the symbol.
+                # Email is sent only after the next closed 15m candle closes in the same direction.
+                confirm_stats = {}
+                try:
+                    candidates, confirm_stats = _bigmove_confirm_next_15m_for_user(int(uid), list(raw_candidates or []), p15, p1, p4, min_vol)
+                except Exception:
+                    candidates = list(raw_candidates or [])
+                    confirm_stats = {"error": "confirmation_gate_exception"}
+
                 if not candidates:
+                    if BIGMOVE_CONFIRM_NEXT_15M_ENABLED and (raw_candidates or int((confirm_stats or {}).get('pending_checked') or 0) > 0 or int((confirm_stats or {}).get('pending_new') or 0) > 0 or int((confirm_stats or {}).get('pending_wait') or 0) > 0):
+                        return {
+                            "status": "SKIP",
+                            "reasons": [
+                                "waiting_for_next_15m_confirmation",
+                                f"confirmation_stats={confirm_stats}",
+                                f"raw_hits={bm_any_15m}/{bm_any_1h}/{bm_any_4h}",
+                            ],
+                        }
                     return {
                         "status": "SKIP",
                         "reasons": [
                             f"no_candidates (p15={p15}, p1={p1}, p4={p4})",
                             f"debug_raw_hits:15m={bm_any_15m},1h={bm_any_1h},4h={bm_any_4h}",
+                            f"confirmation_stats={confirm_stats}",
                         ],
                     }
 
@@ -37294,6 +37744,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 lines.append("⚡ PulseFutures — BIG MOVE ALERT")
                 lines.append(HDR)
                 lines.append(f"Triggers: |15m| ≥ {p15:.1f}% AND |1H| ≥ {p1:.1f}% AND |4H| ≥ {p4:.1f}% (same direction only)")
+                if BIGMOVE_CONFIRM_NEXT_15M_ENABLED:
+                    lines.append("Confirmation: next closed 15m candle also closed in the same direction")
                 lines.append(f"Min Vol (24H): {min_vol/1e6:.1f}M")
                 lines.append("")
 
@@ -37317,7 +37769,13 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     ch1 = float(c.get("ch1", 0.0) or 0.0)
                     vol = float(c.get("vol", 0.0) or 0.0)
                     arrow = "🟢" if c.get("direction") == "UP" else "🔴"
-                    lines.append(f"{arrow} {sym}: 15m {ch15:+.0f}% | 1H {ch1:+.0f}% | 4H {ch4:+.0f}% | Vol ~{vol/1e6:.1f}M")
+                    confirm_txt = ""
+                    try:
+                        if 'confirm_15m_pct' in c:
+                            confirm_txt = f" | Next15m {float(c.get('confirm_15m_pct') or 0.0):+.1f}%"
+                    except Exception:
+                        confirm_txt = ""
+                    lines.append(f"{arrow} {sym}: 15m {ch15:+.0f}% | 1H {ch1:+.0f}% | 4H {ch4:+.0f}%{confirm_txt} | Vol ~{vol/1e6:.1f}M")
                     lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
                     lines.append("")
 
@@ -39172,7 +39630,14 @@ async def autotrade_exit_guardian_job(context: ContextTypes.DEFAULT_TYPE):
                 )
             except asyncio.TimeoutError:
                 _hb_touch('autotrade_guardian', ok=False, error=f'timeout>{AUTOTRADE_GUARDIAN_TIMEOUT_SEC}s', details='guardian_timeout')
-                logger.info('autotrade_exit_guardian_job skipped: timed out after %ss (will retry later)', AUTOTRADE_GUARDIAN_TIMEOUT_SEC)
+                try:
+                    _key = 'autotrade_guardian_timeout'
+                    _now = float(time.time())
+                    if _LOG_WARN_THROTTLE_UNTIL.get(_key, 0.0) <= _now:
+                        _LOG_WARN_THROTTLE_UNTIL[_key] = _now + max(60, int(LOG_WARN_THROTTLE_SEC or 120))
+                        logger.info('autotrade_exit_guardian_job skipped: timed out after %ss (will retry later)', AUTOTRADE_GUARDIAN_TIMEOUT_SEC)
+                except Exception:
+                    pass
                 _autotrade_guardian_touch(0)
                 return
 
@@ -39191,6 +39656,24 @@ async def autotrade_exit_guardian_job(context: ContextTypes.DEFAULT_TYPE):
         _hb_touch('autotrade_guardian', ok=False, error=f"{type(e).__name__}: {e}", details='guardian_error')
         logger.exception('autotrade_exit_guardian_job crashed: %s', e)
 
+
+
+
+async def screen_cache_warmup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic global /screen cache warmer.
+
+    Keeps /screen instant after deploys and prevents user commands from triggering the
+    first expensive scan. Runs in the dedicated screen executor and never blocks Telegram.
+    """
+    try:
+        if _recent_user_activity(8):
+            return
+        if _SCREEN_REFRESH_TASK is not None and not _SCREEN_REFRESH_TASK.done():
+            return
+        sess = str(scan_session_name_utc(datetime.now(timezone.utc)) or '').upper()
+        _schedule_screen_cache_refresh(0, sess)
+    except Exception:
+        return
 
 async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
     """Background AutoTrade loop.
@@ -39656,6 +40139,18 @@ def main():
                 "max_instances": 1,
                 "coalesce": True,
                 "misfire_grace_time": 90,
+            },
+        )
+
+        app.job_queue.run_repeating(
+            screen_cache_warmup_job,
+            interval=int(os.environ.get("SCREEN_CACHE_WARMUP_INTERVAL_SEC", "90") or 90),
+            first=8,
+            name="screen_cache_warmup_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 60,
             },
         )
 
