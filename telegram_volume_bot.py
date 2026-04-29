@@ -37601,7 +37601,7 @@ ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN
 ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.70") or 0.70)
 ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT = float(os.environ.get("ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT", "0.45") or 0.45)
 ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT = float(os.environ.get("ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT", "0.55") or 0.55)
-BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "14") or 14)
+BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "35") or 35)
 EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "600"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
@@ -37985,7 +37985,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             rebuilds. It still respects confirmation, volume, cooldown, and SMTP status.
             """
             try:
-                payload_timeout = max(6, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 14))
+                payload_timeout = max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 35))
                 try:
                     payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, timeout=payload_timeout)
                 except asyncio.TimeoutError:
@@ -38646,9 +38646,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 continue
             try:
                 try:
-                    payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, timeout=min(8, int(EMAIL_SEND_TIMEOUT_SEC or 10)))
+                    payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, timeout=max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 35)))
                 except asyncio.TimeoutError:
-                    payload = {"status": "SKIP", "reasons": ["bigmove_payload_timeout"]}
+                    payload = {"status": "SKIP", "reasons": [f"bigmove_payload_timeout>{max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 35))}s"]}
                 pstatus = str((payload or {}).get('status') or '').upper().strip()
                 if pstatus != 'READY':
                     _LAST_BIGMOVE_DECISION[uid] = {
@@ -38703,16 +38703,21 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     uid = update.effective_user.id
     user = get_user(uid) or {}
 
-    # User timezone for consistent debug display (show local + UTC)
+    # User timezone for consistent debug display.
+    # Admin request: do not print duplicate UTC in /email_decision; show all times
+    # in the user's own timezone (Melbourne for the owner/admin deployment).
     try:
         from zoneinfo import ZoneInfo
-        tz_name = str(user.get("tz") or "UTC")
+        tz_name = str(user.get("tz") or user.get("timezone") or os.environ.get("DEFAULT_USER_TZ") or TIMEZONE or "Australia/Melbourne")
         tz_disp = ZoneInfo(tz_name)
     except Exception:
-        tz_name = "UTC"
-        tz_disp = timezone.utc
+        tz_name = "Australia/Melbourne"
+        try:
+            tz_disp = ZoneInfo(tz_name)
+        except Exception:
+            tz_disp = timezone.utc
 
-    def _fmt_when_both(v) -> str:
+    def _fmt_when_local(v) -> str:
         try:
             if v is None:
                 return ""
@@ -38725,16 +38730,17 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 if not s:
                     return ""
                 try:
-                    dt = _dt.datetime.fromisoformat(s)
+                    # Python handles offsets like +10:00. If the timestamp is naive,
+                    # treat it as UTC because internal DB/runtime timestamps are UTC-ish.
+                    dt = _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
                 except Exception:
                     return s
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=_dt.timezone.utc)
             else:
                 return str(v)
-            utc = dt.astimezone(_dt.timezone.utc).isoformat(timespec="seconds")
-            loc = dt.astimezone(tz_disp).isoformat(timespec="seconds")
-            return f"{loc} | UTC {utc}"
+            loc = dt.astimezone(tz_disp)
+            return f"{loc.strftime('%Y-%m-%d %H:%M:%S')} {tz_name}"
         except Exception:
             try:
                 return str(v)
@@ -38761,9 +38767,9 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append("🫀 Email Loop")
         lines.append(f"Alive: {'YES' if alive else 'NO'}")
         if last_tick > 0:
-            lines.append("Last tick: " + _fmt_when(last_tick))
+            lines.append("Last tick: " + _fmt_when_local(last_tick))
         if next_tick > 0:
-            lines.append("Next tick: " + _fmt_when(next_tick))
+            lines.append("Next tick: " + _fmt_when_local(next_tick))
         if last_err:
             lines.append("Last error: " + last_err)
     except Exception:
@@ -38774,7 +38780,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if sent:
         lines.append("")
         lines.append("✅ Last SENT Email")
-        lines.append(f"When: {_fmt_when_both(sent.get('when') or sent.get('ts'))}")
+        lines.append(f"When: {_fmt_when_local(sent.get('when') or sent.get('ts'))}")
         if sent.get('picked'):
             lines.append("Picked: " + str(sent.get('picked')))
         rs = sent.get('reasons') or []
@@ -38785,7 +38791,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if err:
         lines.append("")
         lines.append("❌ Last Email ERROR")
-        lines.append(f"When: {_fmt_when_both(err.get('when') or err.get('ts'))}")
+        lines.append(f"When: {_fmt_when_local(err.get('when') or err.get('ts'))}")
         rs = err.get('reasons') or []
         if rs:
             lines.append("Reasons:\n- " + "\n- ".join([str(x) for x in rs]))
@@ -38816,8 +38822,9 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines.append(f"Status: {'ON' if bigm_on else 'OFF'}")
     lines.append(f"Thresholds: |15m| ≥ {bigm_p15:g}% AND |1H| ≥ {bigm_p1:g}% AND |4H| ≥ {bigm_p4:g}% (same direction only)")
     lines.append(f"Min Vol (24H): {bigm_min_vol/1e6:.1f}M")
+    lines.append(f"Payload timeout: {int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 35)}s")
     if bigm_updated_ts > 0:
-        lines.append("Updated: " + _fmt_when_both(bigm_updated_ts))
+        lines.append("Updated: " + _fmt_when_local(bigm_updated_ts))
     if bigm_updated_reason:
         lines.append(f"Reason: {bigm_updated_reason}")
 
@@ -38825,7 +38832,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append("")
         lines.append("⚡ Big-Move Alert Decision")
         lines.append(f"Status: {bigm.get('status')}")
-        lines.append("When: " + _fmt_when_both(bigm.get("when") or bigm.get("ts")))
+        lines.append("When: " + _fmt_when_local(bigm.get("when") or bigm.get("ts")))
         rs = bigm.get("reasons") or []
         if rs:
             lines.append("Reasons:\n- " + "\n- ".join(rs))
@@ -38852,7 +38859,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 try:
                     evt = float(row.get('event_ts') or 0.0)
                     if evt > 0:
-                        parts.append(_fmt_when_both(evt))
+                        parts.append(_fmt_when_local(evt))
                 except Exception:
                     pass
                 try:
@@ -38898,7 +38905,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines.append("🧠 Market Scan Decision")
     if scan:
         lines.append(f"Status: {scan.get('status')}")
-        lines.append("When: " + _fmt_when_both(scan.get("when") or scan.get("ts")))
+        lines.append("When: " + _fmt_when_local(scan.get("when") or scan.get("ts")))
         rs = scan.get("reasons") or scan.get("reason")
         if isinstance(rs, list) and rs:
             lines.append("Reasons:\n- " + "\n- ".join([str(x) for x in rs]))
