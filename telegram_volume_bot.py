@@ -11551,7 +11551,7 @@ def _bigmove_last_closed_15m_candle(symbol: str) -> dict | None:
         # Accept both base (TAO) and market symbol (TAO/USDT:USDT).
         if '/' not in sym and ':' not in sym:
             sym = f"{sym}/USDT:USDT"
-        rows = fetch_ohlcv(sym, "15m", 4)
+        rows = _ohlcv_cached_or_optional_fetch(sym, "15m", 4, allow_cold=bool(BIGMOVE_ALLOW_COLD_CONFIRM_FETCH))
         if not rows:
             return None
         now_ms = int(time.time() * 1000)
@@ -11853,7 +11853,7 @@ def _bigmove_candidates(best_fut: dict, p15: float, p1: float, p4: float, min_vo
             if getattr(mv, "symbol", None):
                 try:
                     if abs(ch15) < 1e-9:
-                        c15 = fetch_ohlcv(mv.symbol, "15m", 4)
+                        c15 = _ohlcv_cached_or_optional_fetch(mv.symbol, "15m", 4, allow_cold=bool(BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK))
                         if c15 and len(c15) >= 2:
                             c15_last = float(c15[-1][4])
                             c15_prev = float(c15[-2][4])
@@ -11862,7 +11862,7 @@ def _bigmove_candidates(best_fut: dict, p15: float, p1: float, p4: float, min_vo
                     pass
                 try:
                     if abs(ch4) < 1e-9 or abs(ch1) < 1e-9:
-                        c1 = fetch_ohlcv(mv.symbol, "1h", 6)
+                        c1 = _ohlcv_cached_or_optional_fetch(mv.symbol, "1h", 6, allow_cold=bool(BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK))
                         if c1 and len(c1) >= 2:
                             closes_1h = [float(x[4]) for x in c1]
                             c_last = closes_1h[-1]
@@ -17311,10 +17311,81 @@ OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_
 OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "900") or 900)
 OHLCV_INFLIGHT_WAIT_SEC = float(os.getenv("OHLCV_INFLIGHT_WAIT_SEC", "2.5") or 2.5)
 OHLCV_PAGED_CACHE_TTL_SEC = float(os.getenv("OHLCV_PAGED_CACHE_TTL_SEC", "120") or 120)
+# Cold-start / cold-cache protection. Render restarts clear memory cache; without this guard
+# several background jobs can immediately request many OHLCV candles and trigger Bybit 10006.
+# User commands still answer from DB/stale cache/tickers; cold OHLCV is paced in the background.
+PROCESS_START_TS = float(time.time())
+OHLCV_BOOT_GRACE_SEC = float(os.getenv("OHLCV_BOOT_GRACE_SEC", "150") or 150)
+OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "10") or 10)
+OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "2.0") or 2.0)
+BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK = env_bool("BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK", False)
+BIGMOVE_ALLOW_COLD_CONFIRM_FETCH = env_bool("BIGMOVE_ALLOW_COLD_CONFIRM_FETCH", False)
+_OHLCV_COLD_FETCH_LOCK = threading.Lock()
+_OHLCV_COLD_FETCH_WINDOW_TS = 0.0
+_OHLCV_COLD_FETCH_COUNT = 0
+_OHLCV_COLD_FETCH_LAST_TS = 0.0
 BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC", "6") or 6)
 BYBIT_OPEN_ORDERS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_ORDERS_CACHE_TTL_SEC", "6") or 6)
 SCREEN_DIRECTIONAL_CACHE_TTL_SEC = int(os.getenv("SCREEN_DIRECTIONAL_CACHE_TTL_SEC", "45") or 45)
 
+
+
+def _ohlcv_boot_grace_active() -> bool:
+    try:
+        return (float(time.time()) - float(globals().get('PROCESS_START_TS', 0.0) or 0.0)) < max(0.0, float(OHLCV_BOOT_GRACE_SEC or 0.0))
+    except Exception:
+        return False
+
+
+def _ohlcv_cold_fetch_permitted(symbol: str, timeframe: str, limit: int) -> bool:
+    """Rate-limit cold OHLCV calls before they hit Bybit.
+
+    Fresh/stale cache is always allowed. This guard only controls brand-new exchange pulls
+    after cache misses. It prevents startup/background bursts from blocking Telegram polling.
+    """
+    global _OHLCV_COLD_FETCH_WINDOW_TS, _OHLCV_COLD_FETCH_COUNT, _OHLCV_COLD_FETCH_LAST_TS
+    try:
+        now_ts = float(time.time())
+        if _ohlcv_boot_grace_active():
+            return False
+        if _ohlcv_timeframe_cooling(str(timeframe or '')):
+            return False
+        burst = max(0, int(OHLCV_COLD_FETCH_BURST_PER_MIN or 0))
+        if burst <= 0:
+            return False
+        min_gap = max(0.0, float(OHLCV_COLD_FETCH_MIN_INTERVAL_SEC or 0.0))
+        with _OHLCV_COLD_FETCH_LOCK:
+            if now_ts - float(_OHLCV_COLD_FETCH_WINDOW_TS or 0.0) >= 60.0:
+                _OHLCV_COLD_FETCH_WINDOW_TS = now_ts
+                _OHLCV_COLD_FETCH_COUNT = 0
+            if _OHLCV_COLD_FETCH_COUNT >= burst:
+                return False
+            if min_gap > 0 and (now_ts - float(_OHLCV_COLD_FETCH_LAST_TS or 0.0)) < min_gap:
+                return False
+            _OHLCV_COLD_FETCH_COUNT += 1
+            _OHLCV_COLD_FETCH_LAST_TS = now_ts
+            return True
+    except Exception:
+        return False
+
+
+def _ohlcv_cached_or_optional_fetch(symbol: str, timeframe: str, limit: int, allow_cold: bool = False) -> List[List[float]]:
+    """Return cached OHLCV, with optional paced cold fetch.
+
+    Used by big-move alert code so it cannot fan out hundreds of 15m x4 fallback pulls.
+    """
+    try:
+        rows = _ohlcv_best_effort_cached(symbol, timeframe, limit)
+        if isinstance(rows, list) and rows:
+            return rows[-int(limit):] if int(limit or 0) > 0 and len(rows) > int(limit) else rows
+    except Exception:
+        pass
+    if not allow_cold:
+        return []
+    try:
+        return fetch_ohlcv(symbol, timeframe, limit) or []
+    except Exception:
+        return []
 
 
 def _ohlcv_superset_cache_key(symbol: str, timeframe: str) -> str:
@@ -17454,6 +17525,10 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
         return stale if isinstance(stale, list) else []
 
+    if not _ohlcv_cold_fetch_permitted(symbol, timeframe, limit):
+        stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
+        return stale if isinstance(stale, list) else []
+
     ex = get_exchange()
     try:
         data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
@@ -17472,7 +17547,7 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
         msg = str(e or '')
         if 'RateLimitExceeded' in name or '10006' in msg or 'rate limit' in msg.lower() or 'too many visits' in msg.lower():
             key_cd = max(12.0, float(OHLCV_TTL_SEC))
-            tf_cd = max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 60.0), min(max(key_cd, 120.0), 180.0))
+            tf_cd = max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 900.0), min(max(key_cd, 180.0), 240.0))
             _OHLCV_RATE_LIMIT_UNTIL[key] = now_ts + key_cd
             _OHLCV_TF_RATE_LIMIT_UNTIL[tf_key] = max(float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0), now_ts + tf_cd)
             globals()['_OHLCV_GLOBAL_COOL_UNTIL'] = max(float(globals().get('_OHLCV_GLOBAL_COOL_UNTIL', 0.0) or 0.0), now_ts + tf_cd)
@@ -17480,9 +17555,9 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
             if float(_OHLCV_RATE_LIMIT_WARN_UNTIL.get(warn_key) or 0.0) <= now_ts:
                 _OHLCV_RATE_LIMIT_WARN_UNTIL[warn_key] = now_ts + max(5.0, float(OHLCV_WARN_SUPPRESS_SEC or 30.0))
                 try:
-                    _log_warning_throttled(
-                        f'ohlcv_rate_limit:{symbol}:{timeframe}:{limit}',
-                        max(30.0, float(OHLCV_WARN_SUPPRESS_SEC or 30.0)),
+                    # Rate-limit events are expected under Bybit 10006; log as INFO so
+                    # Render does not look unhealthy, then rely on the circuit breaker.
+                    logger.info(
                         'fetch_ohlcv rate-limited for %s %s x%s; cooling %ss and using stale cache if available',
                         symbol, timeframe, limit, int(tf_cd),
                     )
@@ -39773,6 +39848,8 @@ async def screen_cache_warmup_job(context: ContextTypes.DEFAULT_TYPE):
     instantly from stale cache or quick ticker context.
     """
     try:
+        if _ohlcv_boot_grace_active():
+            return
         if _recent_user_activity(120):
             return
         if _SCREEN_REFRESH_TASK is not None and not _SCREEN_REFRESH_TASK.done():
@@ -40268,7 +40345,7 @@ def main():
         app.job_queue.run_repeating(
             alert_job,
             interval=interval_sec,
-            first=min(20, max(5, interval_sec // 2)),
+            first=max(120, min(240, interval_sec // 2)),
             name="alert_job",
             job_kwargs={
                 "max_instances": 1,
@@ -40280,7 +40357,7 @@ def main():
         app.job_queue.run_repeating(
             screen_cache_warmup_job,
             interval=int(SCREEN_CACHE_WARMUP_INTERVAL_SEC),
-            first=8,
+            first=max(180, min(300, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
             name="screen_cache_warmup_job",
             job_kwargs={
                 "max_instances": 1,
@@ -40293,7 +40370,7 @@ def main():
         app.job_queue.run_repeating(
             autotrade_exit_guardian_job,
             interval=max(int(AUTOTRADE_GUARDIAN_INTERVAL_SEC or 150), int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 10) + 45),
-            first=30,
+            first=90,
             name="autotrade_exit_guardian_job",
             job_kwargs={
                 "max_instances": 1,
@@ -40306,7 +40383,7 @@ def main():
         app.job_queue.run_repeating(
             autotrade_job,
             interval=max(int(AUTOTRADE_JOB_INTERVAL_SEC or 300), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 10) + 45),
-            first=35,
+            first=120,
             name="autotrade_job",
             job_kwargs={
                 "max_instances": 1,
@@ -40483,7 +40560,6 @@ def main():
             close_loop=False,
             allowed_updates=Update.ALL_TYPES,
             poll_interval=float(os.getenv("TELEGRAM_POLL_INTERVAL_SEC", "0.2") or 0.2),
-            timeout=int(os.getenv("TELEGRAM_LONG_POLL_TIMEOUT_SEC", "25") or 25),
         )
     except Conflict:
         logger.error("Another instance is polling. Sleeping forever.")
