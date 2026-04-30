@@ -1508,7 +1508,7 @@ SETUPS_N = 8
 EMAIL_SETUPS_N = 4
 
 # ✅ Global setup quality floor (Premium & Selective)
-MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "76"))
+MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "72"))
 
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
 MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
@@ -7483,9 +7483,9 @@ SESSIONS_UTC = {
 SESSION_PRIORITY = ["NY", "LON", "ASIA"]
 
 SESSION_MIN_CONF = {
-    "NY": 70,
-    "LON": 69,
-    "ASIA": 67,
+    "NY": 66,
+    "LON": 66,
+    "ASIA": 64,
 }
 
 SESSION_MIN_RR_FINAL = {
@@ -17491,9 +17491,9 @@ OHLCV_INFLIGHT_WAIT_SEC = float(os.getenv("OHLCV_INFLIGHT_WAIT_SEC", "1.5") or 1
 OHLCV_PAGED_CACHE_TTL_SEC = float(os.getenv("OHLCV_PAGED_CACHE_TTL_SEC", "120") or 120)
 # Cold-start / cold-cache protection. Keep very short so Render restarts can rebuild quickly.
 PROCESS_START_TS = float(time.time())
-OHLCV_BOOT_GRACE_SEC = float(os.getenv("OHLCV_BOOT_GRACE_SEC", "5") or 5)
-OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "90") or 90)
-OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "0.15") or 0.15)
+OHLCV_BOOT_GRACE_SEC = float(os.getenv("OHLCV_BOOT_GRACE_SEC", "0") or 0)
+OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "180") or 180)
+OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "0.05") or 0.05)
 _OHLCV_RATE_LIMIT_HITS_TOTAL = 0
 _OHLCV_STALE_USAGE_TOTAL = 0
 _SCAN_TF_PHASE = 0
@@ -18398,40 +18398,93 @@ def strong_reversal_exception_ok(side: str, ch24: float, ch4: float, ch1: float)
 def metrics_from_candles_1h_15m(market_symbol: str) -> Tuple[float, float, float, float, float, int, List[List[float]], List[List[float]]]:
     """
     returns: ch1, ch4, ch15, atr_1h, ema_support_15m, ema_support_period, c15, c1
+
+    Production note:
+    - The live setup engine must not collapse just because one timeframe is cold/rate-limited.
+    - Prefer real 1h + 15m candles, but synthesize conservative context from the available
+      timeframe when the other one is missing. This keeps /screen, email and autotrade alive
+      while the paced OHLCV cache continues to hydrate in the background.
     """
     need_1h = max(ATR_PERIOD + 6, 35)
+
+    def _pct(a: float, b: float) -> float:
+        try:
+            return ((float(a) - float(b)) / float(b)) * 100.0 if float(b) else 0.0
+        except Exception:
+            return 0.0
+
+    def _mk_synth15(last: float, ch15_hint: float, n: int = 20) -> List[List[float]]:
+        """Small synthetic 15m row set used only when 1h exists but 15m is cold."""
+        try:
+            last = float(last or 0.0)
+            if last <= 0:
+                return []
+            prev = last / (1.0 + float(ch15_hint or 0.0) / 100.0) if abs(float(ch15_hint or 0.0)) > 1e-9 else last
+            rows = []
+            base_ts = int(time.time() * 1000) - int(n) * 15 * 60 * 1000
+            for i in range(max(2, int(n))):
+                frac = (i + 1) / max(1, int(n))
+                close = prev + (last - prev) * frac
+                open_ = prev + (last - prev) * max(0.0, frac - (1.0 / max(1, int(n))))
+                hi = max(open_, close) * 1.001
+                lo = min(open_, close) * 0.999
+                rows.append([base_ts + i * 15 * 60 * 1000, open_, hi, lo, close, 1.0])
+            return rows
+        except Exception:
+            return []
+
     c1 = fetch_ohlcv(market_symbol, "1h", limit=need_1h)
     if (not c1 or len(c1) < 25):
         c1 = _ohlcv_best_effort_cached(market_symbol, "1h", need_1h)
-    if not c1 or len(c1) < 20:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0, [], []
 
-    closes_1h = [float(x[4]) for x in c1]
-    c_last = closes_1h[-1]
-    c_prev1 = closes_1h[-2]
-    c_prev4 = closes_1h[-5] if len(closes_1h) >= 5 else closes_1h[0]
-
-    ch1 = ((c_last - c_prev1) / c_prev1) * 100.0 if c_prev1 else 0.0
-    ch4 = ((c_last - c_prev4) / c_prev4) * 100.0 if c_prev4 else 0.0
-    atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
-
-    c15 = fetch_ohlcv(market_symbol, "15m", limit=60)
+    c15 = fetch_ohlcv(market_symbol, "15m", limit=50)
     if (not c15 or len(c15) < 20):
-        c15 = _ohlcv_best_effort_cached(market_symbol, "15m", 60)
-    if not c15 or len(c15) < 16:
-        return ch1, ch4, 0.0, atr_1h, 0.0, 0, [], c1
+        c15 = _ohlcv_best_effort_cached(market_symbol, "15m", 50)
 
-    closes_15 = [float(x[4]) for x in c15]
-    entry_proxy = float(closes_15[-1]) if closes_15 else 0.0
-    atr_pct_proxy = (atr_1h / entry_proxy) * 100.0 if (atr_1h and entry_proxy) else 2.0
+    # Primary path: real 1h context.
+    if c1 and len(c1) >= 20:
+        closes_1h = [float(x[4]) for x in c1 if x and len(x) >= 5]
+        if len(closes_1h) >= 5:
+            c_last = closes_1h[-1]
+            c_prev1 = closes_1h[-2]
+            c_prev4 = closes_1h[-5] if len(closes_1h) >= 5 else closes_1h[0]
+            ch1 = _pct(c_last, c_prev1)
+            ch4 = _pct(c_last, c_prev4)
+            atr_1h = compute_atr_from_ohlcv(c1, ATR_PERIOD)
 
-    ema_support_15m, ema_period = adaptive_ema_value(closes_15, atr_pct_proxy)
+            if c15 and len(c15) >= 16:
+                closes_15 = [float(x[4]) for x in c15 if x and len(x) >= 5]
+                entry_proxy = float(closes_15[-1]) if closes_15 else float(c_last or 0.0)
+                atr_pct_proxy = (atr_1h / entry_proxy) * 100.0 if (atr_1h and entry_proxy) else 2.0
+                ema_support_15m, ema_period = adaptive_ema_value(closes_15, atr_pct_proxy)
+                ch15 = _pct(closes_15[-1], closes_15[-2]) if len(closes_15) >= 2 else 0.0
+                return ch1, ch4, ch15, atr_1h, ema_support_15m, int(ema_period), c15, c1
 
-    c15_last = float(c15[-1][4])
-    c15_prev = float(c15[-2][4])
-    ch15 = ((c15_last - c15_prev) / c15_prev) * 100.0 if c15_prev else 0.0
+            # 15m cold but 1h is available. Create conservative 15m context instead
+            # of rejecting the symbol. This avoids full-session email/setup droughts.
+            ch15_hint = max(-0.35, min(0.35, float(ch1 or 0.0) / 4.0))
+            synth15 = _mk_synth15(float(c_last or 0.0), ch15_hint, 20)
+            ema_support_15m = float(c_last or 0.0)
+            return ch1, ch4, ch15_hint, atr_1h, ema_support_15m, 13, synth15, c1
 
-    return ch1, ch4, ch15, atr_1h, ema_support_15m, int(ema_period), c15, c1
+    # Secondary path: 1h is cold but 15m is available. Derive 1h/4h from 15m.
+    if c15 and len(c15) >= 16:
+        closes_15 = [float(x[4]) for x in c15 if x and len(x) >= 5]
+        if len(closes_15) >= 16:
+            last = float(closes_15[-1])
+            prev15 = float(closes_15[-2])
+            prev1h = float(closes_15[-5]) if len(closes_15) >= 5 else float(closes_15[0])
+            prev4h = float(closes_15[-17]) if len(closes_15) >= 17 else float(closes_15[0])
+            ch15 = _pct(last, prev15)
+            ch1 = _pct(last, prev1h)
+            ch4 = _pct(last, prev4h)
+            atr15 = compute_atr_from_ohlcv(c15, min(ATR_PERIOD, max(2, len(c15) - 1)))
+            atr_1h = max(float(atr15 or 0.0) * 2.0, float(last or 0.0) * 0.004)
+            atr_pct_proxy = (atr_1h / last) * 100.0 if (atr_1h and last) else 2.0
+            ema_support_15m, ema_period = adaptive_ema_value(closes_15, atr_pct_proxy)
+            return ch1, ch4, ch15, atr_1h, ema_support_15m, int(ema_period), c15, []
+
+    return 0.0, 0.0, 0.0, 0.0, 0.0, 0, [], []
 
 
 # =========================================================
@@ -27680,6 +27733,28 @@ def is_executable_setup_eligible(
         if allowed_engines and _engine_pre and _engine_pre not in allowed_engines:
             return (False, 'execution_profile_engine_disabled')
 
+        # Drought-recovery setups are generated from the current live ticker snapshot only
+        # after the normal OHLCV engines fail. Do not let allocator shadow/probation state
+        # block them before basic executable validation. Final email/autotrade risk gates
+        # still run after this function.
+        try:
+            if bool(getattr(s, 'recovery_fallback', False)):
+                entry = float(getattr(s, "entry", 0.0) or 0.0)
+                sl = float(getattr(s, "sl", 0.0) or 0.0)
+                final_tp = float(_setup_target_tp(s, 0.0) or 0.0)
+                side = str(getattr(s, 'side', '') or '').upper().strip()
+                rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
+                fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+                conf = int(getattr(s, 'conf', 0) or 0)
+                if side == 'BUY' and not (sl < entry < final_tp):
+                    return (False, 'recovery_bad_price_order')
+                if side == 'SELL' and not (final_tp < entry < sl):
+                    return (False, 'recovery_bad_price_order')
+                if conf >= 74 and rr_final >= 1.18 and fut_vol >= max(4_000_000.0, float(MIN_FUT_VOL_USD) * 0.45):
+                    return (True, 'ok')
+        except Exception:
+            pass
+
         alloc_ok, alloc_why = _research_plan_allows_setup(s, session_name=sess)
         if not alloc_ok:
             return (False, str(alloc_why or 'allocator_blocked'))
@@ -28598,6 +28673,22 @@ def make_setup(
             soft_override = (ratio >= 0.70) and (float(fut_vol or 0.0) >= 5_000_000.0) and (
                 abs(float(ch4_used or 0.0)) >= 0.50 or abs(float(ch24 or 0.0)) >= 12.0
             )
+            try:
+                if _setup_low_flow_recovery_active(session_name, lookback_hours=24):
+                    soft_override = soft_override or (
+                        ratio >= 0.30 and float(fut_vol or 0.0) >= 4_000_000.0 and (
+                            abs(float(ch24 or 0.0)) >= 4.0 or abs(float(ch4_used or 0.0)) >= 0.18 or abs(float(ch15 or 0.0)) >= 0.05
+                        )
+                    )
+                # Very strong current market leaders/losers should not be rejected only
+                # because the latest single 1h candle is quiet.
+                soft_override = soft_override or (
+                    abs(float(ch24 or 0.0)) >= 10.0 and float(fut_vol or 0.0) >= 8_000_000.0 and (
+                        abs(float(ch4_used or 0.0)) >= 0.25 or abs(float(ch15 or 0.0)) >= 0.04
+                    )
+                )
+            except Exception:
+                pass
             if trend_active_mode and str(session_name).upper() == 'ASIA':
                 soft_override = soft_override or (
                     ratio >= 0.38 and float(fut_vol or 0.0) >= 3_000_000.0 and (
@@ -28906,13 +28997,23 @@ def make_setup(
                 notes.append(f"smc_structure_soft_mismatch={structure}")
                 conf = max(0.0, float(conf) - 5.0)
 
-            # CHOCH indicates potential reversal against the prevailing bias — avoid entries against it.
-            if side == "BUY" and choch == "CHOCH_DOWN":
-                _rej("smc_choch_against_long", base, mv, f"choch={choch} bos={bos} structure={structure} smf={smf_event}")
-                return None
-            if side == "SELL" and choch == "CHOCH_UP":
-                _rej("smc_choch_against_short", base, mv, f"choch={choch} bos={bos} structure={structure} smf={smf_event}")
-                return None
+            # CHOCH is useful, but making it a hard block caused total NY/LON droughts
+            # when the broader ticker/volume context was still tradable. In low-flow or
+            # strong-volume conditions, soften it into a confidence penalty and let the
+            # shared executable/email gates decide.
+            choch_against = (side == "BUY" and choch == "CHOCH_DOWN") or (side == "SELL" and choch == "CHOCH_UP")
+            if choch_against:
+                try:
+                    low_flow_now = _setup_low_flow_recovery_active(session_name, lookback_hours=24)
+                except Exception:
+                    low_flow_now = False
+                strong_context_now = bool(abs(float(ch24 or 0.0)) >= 6.0 and float(fut_vol or 0.0) >= 8_000_000.0)
+                if low_flow_now or strong_context_now or family_id_hint in {'F1_PULLBACK_CONT', 'F3_IMPULSE_BASE_CONT', 'F4_SWEEP_RECLAIM'}:
+                    notes.append(f"smc_choch_soft={choch}")
+                    conf = max(0.0, float(conf) - (4.0 if strong_context_now else 5.0))
+                else:
+                    _rej("smc_choch_against_long" if side == "BUY" else "smc_choch_against_short", base, mv, f"choch={choch} bos={bos} structure={structure} smf={smf_event}")
+                    return None
             opposite_trend = "BEARISH" if side == "BUY" else "BULLISH"
             sweep_ok = (side == "BUY" and sweep == "BUY_SWEEP") or (side == "SELL" and sweep == "SELL_SWEEP")
             momentum_ok = (side == "BUY" and momentum == "BULLISH") or (side == "SELL" and momentum == "BEARISH")
@@ -29064,9 +29165,17 @@ def make_setup(
 
         if strict_15m:
             if (not is_confirm_15m) and (not is_early_allowed):
+                try:
+                    low_flow_now = _setup_low_flow_recovery_active(session_name, lookback_hours=24)
+                except Exception:
+                    low_flow_now = False
+                strong_context_now = bool(abs(float(ch24 or 0.0)) >= 8.0 and float(fut_vol or 0.0) >= 8_000_000.0)
                 if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
                     notes.append('🟡 f4_weak15m_soft')
                     conf = max(0.0, float(conf) - 2.0)
+                elif low_flow_now or strong_context_now:
+                    notes.append('🟡 weak15m_low_flow_soft')
+                    conf = max(0.0, float(conf) - (3.0 if strong_context_now else 4.0))
                 else:
                     _rej("15m_weak_and_not_early", base, mv, f"ch15={ch15:+.2f}% ch1={ch1:+.2f}%")
                     return None
@@ -29087,6 +29196,11 @@ def make_setup(
                     sess_min = min(int(sess_min), 54)
             if str(session_name or '').upper() == 'NY' and require_pullback and family_id_hint not in {'F4_SWEEP_RECLAIM', 'F1_PULLBACK_CONT', 'F3_IMPULSE_BASE_CONT'}:
                 sess_min = max(int(sess_min), int(_session_generation_conf_floor('NY')) + 1)
+            try:
+                if _setup_low_flow_recovery_active(session_name, lookback_hours=24):
+                    sess_min = max(58, int(sess_min) - 4)
+            except Exception:
+                pass
             if int(conf) < int(sess_min):
                 _rej("below_min_confidence", base, mv, f"conf={int(conf)} min={int(sess_min)} sess={session_name}")
                 return None
@@ -29588,6 +29702,15 @@ def make_bigmove_family_setup(base: str, mv: Any, session_name: str = 'LON', sca
         ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
         if (not c15) or len(c15) < 12 or atr_1h <= 0:
             return None
+        try:
+            pct24_now = float(getattr(mv, 'percentage', 0.0) or 0.0)
+            # If the dedicated 4h candle is missing/thin but the symbol is a real 24h mover,
+            # use a conservative 24h-derived 4h proxy so Big Move alerts do not stay at
+            # debug_raw_hits:15m=0,1h=0,4h=0 during cache warm-up.
+            if abs(float(ch4 or 0.0)) < 0.50 and abs(pct24_now) >= max(float(BIGMOVE_DEFAULT_4H_PCT), 6.0):
+                ch4 = (1.0 if pct24_now >= 0 else -1.0) * min(abs(pct24_now) * 0.45, abs(pct24_now))
+        except Exception:
+            pass
 
         same_up = float(ch15 or 0.0) >= float(BIGMOVE_DEFAULT_15M_PCT) and float(ch1 or 0.0) >= float(BIGMOVE_DEFAULT_1H_PCT) and float(ch4 or 0.0) >= float(BIGMOVE_DEFAULT_4H_PCT)
         same_down = float(ch15 or 0.0) <= -float(BIGMOVE_DEFAULT_15M_PCT) and float(ch1 or 0.0) <= -float(BIGMOVE_DEFAULT_1H_PCT) and float(ch4 or 0.0) <= -float(BIGMOVE_DEFAULT_4H_PCT)
@@ -34104,13 +34227,13 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
             continue
 
         fut_vol = float(_fut_vol_usd_from_best(best_fut, base) or usd_notional(mv) or 0.0)
-        if fut_vol < max(5_000_000.0, float(MIN_FUT_VOL_USD) * 0.55):
+        if fut_vol < max(4_000_000.0, float(MIN_FUT_VOL_USD) * 0.45):
             continue
 
         pct24_raw = float(getattr(mv, "percentage", 0.0) or 0.0)
         sign = 1.0 if side == 'BUY' else -1.0
         pct24_abs = abs(pct24_raw)
-        if pct24_abs < 2.0:
+        if pct24_abs < 1.20:
             continue
 
         atr_1h = 0.0
@@ -34152,7 +34275,7 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
         atr_pct = float((atr_1h / entry) * 100.0) if entry > 0 else 0.80
 
         sl_dist = max(1.20 * atr_1h, entry * 0.0045)
-        rr_target = 1.62
+        rr_target = 1.55
         tp_dist = rr_target * sl_dist
         if side == "BUY":
             sl = max(entry - sl_dist, entry * 0.001)
@@ -34165,7 +34288,7 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
             trend = 'BEARISH TREND'
             structure = 'BEARISH CONTINUATION'
 
-        conf = int(clamp(76 + min(8.0, pct24_abs * 0.35) + (2.0 if fut_vol >= 15_000_000.0 else 0.0), 76, 88))
+        conf = int(clamp(76 + min(9.0, pct24_abs * 0.45) + (2.0 if fut_vol >= 12_000_000.0 else 0.0), 76, 90))
         setup = Setup(
             setup_id=make_setup_id(base, side),
             symbol=base,
@@ -36683,7 +36806,13 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     if not ordered and mode in {"screen", "exec", "email"}:
         try:
             fb = _fallback_setups_from_universe(best_fut, leaders, losers, market_bases, session_name, max_items=max(4, n_target))
-            ordered = [s for s in (fb or []) if is_top_setup_eligible(s, source=gate_source, session_name=session_name)[0]]
+            gated_fb = [s for s in (fb or []) if is_top_setup_eligible(s, source=gate_source, session_name=session_name)[0]]
+            ordered = gated_fb or list(fb or [])[:max(1, int(n_target))]
+            if ordered:
+                try:
+                    db_log_setup_pipeline_event(int(uid or 0), stage='recovery_fallback_pool', status='ok', session=str(session_name or ''), mode=str(mode or ''), details={'fallback': len(fb or []), 'accepted': len(ordered or []), 'gate_source': str(gate_source)})
+                except Exception:
+                    pass
         except Exception:
             ordered = []
 # -----------------------------------------------------
