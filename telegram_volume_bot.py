@@ -66,7 +66,7 @@ CHANGELOG (2026-03-06)
   - report now displays reject breakdown for faster tuning
 - Added autonomous optimization governance with retained internal reporting:
   - bounded deterministic grid search across TF matrix and top-volume universe (≥$10M 24h volume)
-  - walk-forward (train/test split) and OOS-first objective with frequency targeting (3–5 setups/day)
+  - walk-forward (train/test split) and OOS-first objective with frequency targeting (3–6 setups/day)
   - persists chosen TF + params into StrategyConfig and saves an optimization report
 
 """
@@ -1518,8 +1518,14 @@ MIN_RR_TP = MIN_RR_FINAL  # legacy compatibility only; live model uses TP as fin
 # Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
 EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
 
-# ✅ /screen scan breadth + loosened trigger only for screen (NOT email)
-SCREEN_UNIVERSE_N = 100          # widened universe for better throughput without disabling quality gates
+# ✅ Production scan breadth + loosened trigger only for screen (NOT email)
+# Hard API-load guard: live setup generation must never fan out across hundreds of symbols.
+# The active scan universe is capped to the top symbols by true futures volume.
+SCAN_SYMBOL_LIMIT = int(os.environ.get("SCAN_SYMBOL_LIMIT", "40") or 40)
+BIGMOVE_SYMBOL_LIMIT = int(os.environ.get("BIGMOVE_SYMBOL_LIMIT", "30") or 30)
+MAX_OHLCV_LIMIT = int(os.environ.get("MAX_OHLCV_LIMIT", "50") or 50)
+MAX_STALE_SCAN_SEC = int(os.environ.get("MAX_STALE_SCAN_SEC", "120") or 120)
+SCREEN_UNIVERSE_N = int(os.environ.get("SCREEN_UNIVERSE_N", str(SCAN_SYMBOL_LIMIT)) or SCAN_SYMBOL_LIMIT)
 SCREEN_TRIGGER_LOOSEN = 0.82    # 15% easier trigger on /screen only
 SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
 SCREEN_WAITING_N = 10
@@ -1582,7 +1588,7 @@ def _goal_profile_expanded_candidate_profiles() -> list[dict]:
     ]
 
 def _strategy_config_defaults() -> dict:
-    """Defaults are chosen to target ~3–5 setups/day across universe with robust quality."""
+    """Defaults are chosen to target ~3–6 setups/day across universe with robust quality."""
     return {
         # Universe / liquidity
         "min_fut_vol_usd": float(MIN_FUT_VOL_USD),
@@ -1631,8 +1637,8 @@ def _strategy_config_defaults() -> dict:
         "score_w_smf": 0.01,
 
         # Frequency targeting (used in /optimize objective)
-        "target_setups_per_day_lo": 5.0,
-        "target_setups_per_day_hi": 8.0,
+        "target_setups_per_day_lo": 3.0,
+        "target_setups_per_day_hi": 6.0,
 
         # Self-optimization governance
         "session_weights": {"NY": 0.45, "LON": 0.40, "ASIA": 0.15},  # optimizer weighting (cross-session executable pool with NY/LON preference)
@@ -1648,8 +1654,8 @@ def _strategy_config_defaults() -> dict:
         # Setup-count governor (live engine + optimizer)
         "governor_enabled": True,
         "governor_window_hours": 24,
-        "governor_target_lo": 5.0,
-        "governor_target_hi": 8.0,
+        "governor_target_lo": 3.0,
+        "governor_target_hi": 6.0,
         "governor_step_score": 1.0,         # +/- points applied to quality_score_min_email when adjusting
         "governor_score_min": 52.0,         # absolute lower bound for quality_score_min_email
         "governor_score_max": 70.0,         # absolute upper bound for quality_score_min_email
@@ -1689,8 +1695,8 @@ def _strategy_config_defaults() -> dict:
         "goal_profile_enabled": True,
         "goal_profile_interval_hours": 24.0,
         "goal_profile_cooldown_hours": 20.0,
-        "goal_profile_target_setups_per_day_lo": 5.0,
-        "goal_profile_target_setups_per_day_hi": 8.0,
+        "goal_profile_target_setups_per_day_lo": 3.0,
+        "goal_profile_target_setups_per_day_hi": 6.0,
         "goal_profile_target_win_rate": 60.0,
         "goal_profile_target_avg_r": 0.10,
         "goal_profile_min_live_setups_30d": 8,
@@ -1730,8 +1736,8 @@ def _strategy_config_defaults() -> dict:
         "market_adaptive_days": 30,
         "market_adaptive_max_passes": 2,
         "market_adaptive_min_improvement": 0.35,
-        "market_adaptive_target_setups_per_day_lo": 5.0,
-        "market_adaptive_target_setups_per_day_hi": 8.0,
+        "market_adaptive_target_setups_per_day_lo": 3.0,
+        "market_adaptive_target_setups_per_day_hi": 6.0,
         "market_adaptive_session_wr_floor_ny": 46.0,
         "market_adaptive_session_wr_floor_lon": 48.0,
         "market_adaptive_cooldown_hours": 20.0,
@@ -1983,7 +1989,7 @@ def _strategy_config_bootstrap_recommendations() -> None:
     This migration is intentionally non-destructive:
     - it preserves user/runtime tuning when config already looks intentional
     - it only neutralizes the old hidden starvation profile
-    - it keeps target setup frequency aligned to ~1–3/day
+    - it keeps target setup frequency aligned to ~3–6/day
     """
     try:
         cfg = load_strategy_config(force=True)
@@ -2001,42 +2007,42 @@ def _strategy_config_bootstrap_recommendations() -> None:
             lo = float(cfg.get('target_setups_per_day_lo', 0.0) or 0.0)
             hi = float(cfg.get('target_setups_per_day_hi', 0.0) or 0.0)
             if lo <= 0 or abs(lo - 3.0) > 0.001:
-                cfg['target_setups_per_day_lo'] = 5.0
+                cfg['target_setups_per_day_lo'] = 3.0
                 changed = True
-            if hi <= 0 or abs(hi - 5.0) > 0.001:
-                cfg['target_setups_per_day_hi'] = 8.0
+            if hi <= 0 or abs(hi - 6.0) > 0.001:
+                cfg['target_setups_per_day_hi'] = 6.0
                 changed = True
         except Exception:
-            cfg['target_setups_per_day_lo'] = 5.0
-            cfg['target_setups_per_day_hi'] = 8.0
+            cfg['target_setups_per_day_lo'] = 3.0
+            cfg['target_setups_per_day_hi'] = 6.0
             changed = True
 
         try:
             glo = float(cfg.get('governor_target_lo', 0.0) or 0.0)
             ghi = float(cfg.get('governor_target_hi', 0.0) or 0.0)
             if glo <= 0 or abs(glo - 3.0) > 0.001:
-                cfg['governor_target_lo'] = 5.0
+                cfg['governor_target_lo'] = 3.0
                 changed = True
-            if ghi <= 0 or abs(ghi - 5.0) > 0.001:
-                cfg['governor_target_hi'] = 8.0
+            if ghi <= 0 or abs(ghi - 6.0) > 0.001:
+                cfg['governor_target_hi'] = 6.0
                 changed = True
         except Exception:
-            cfg['governor_target_lo'] = 5.0
-            cfg['governor_target_hi'] = 8.0
+            cfg['governor_target_lo'] = 3.0
+            cfg['governor_target_hi'] = 6.0
             changed = True
 
         try:
             mlo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 0.0) or 0.0)
             mhi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 0.0) or 0.0)
             if mlo <= 0 or abs(mlo - 3.0) > 0.001:
-                cfg['market_adaptive_target_setups_per_day_lo'] = 5.0
+                cfg['market_adaptive_target_setups_per_day_lo'] = 3.0
                 changed = True
-            if mhi <= 0 or abs(mhi - 5.0) > 0.001:
-                cfg['market_adaptive_target_setups_per_day_hi'] = 8.0
+            if mhi <= 0 or abs(mhi - 6.0) > 0.001:
+                cfg['market_adaptive_target_setups_per_day_hi'] = 6.0
                 changed = True
         except Exception:
-            cfg['market_adaptive_target_setups_per_day_lo'] = 5.0
-            cfg['market_adaptive_target_setups_per_day_hi'] = 8.0
+            cfg['market_adaptive_target_setups_per_day_lo'] = 3.0
+            cfg['market_adaptive_target_setups_per_day_hi'] = 6.0
             changed = True
 
         manual_asia = _cfg_bool(cfg.get('execution_asia_user_override', False), False)
@@ -2072,7 +2078,7 @@ def _strategy_config_bootstrap_recommendations() -> None:
             changed = True
 
         # Cap stale live-tightened floors so a previous adaptive/governor run cannot
-        # silently keep the bot above the 1–3 setups/day target after redeploy.
+        # silently keep the bot above the 3–6 setups/day target after redeploy.
         try:
             q_screen = float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN)
             if q_screen > 62.0:
@@ -2129,10 +2135,10 @@ def _strategy_config_bootstrap_recommendations() -> None:
 
         try:
             if 'goal_profile_target_setups_per_day_lo' not in cfg:
-                cfg['goal_profile_target_setups_per_day_lo'] = 5.0
+                cfg['goal_profile_target_setups_per_day_lo'] = 3.0
                 changed = True
             if 'goal_profile_target_setups_per_day_hi' not in cfg:
-                cfg['goal_profile_target_setups_per_day_hi'] = 8.0
+                cfg['goal_profile_target_setups_per_day_hi'] = 6.0
                 changed = True
             if 'goal_profile_target_win_rate' not in cfg:
                 cfg['goal_profile_target_win_rate'] = 60.0
@@ -6634,7 +6640,7 @@ def _autotrade_refresh_owner_executable_pool(uid: int, session_label: str, lookb
         return []
     now_ts = float(time.time())
     try:
-        existing_rows = db_list_executable_setups(owner_uid, session_name=sess, ts_from=float(now_ts - max(3600.0, float(lookback_hours) * 3600.0)), limit=6)
+        existing_rows = db_list_executable_setups(owner_uid, session_name=sess, ts_from=float(now_ts - float(MAX_STALE_SCAN_SEC)), limit=6)
     except Exception:
         existing_rows = []
     if existing_rows:
@@ -8634,25 +8640,13 @@ def _live_trade_runtime_busy(window_sec: int | None = None) -> bool:
 
 
 def _ohlcv_timeframe_cooling(*timeframes: str) -> bool:
-    """True when OHLCV fetching is in a shared rate-limit cooldown.
+    """Compatibility shim: no global OHLCV circuit breaker.
 
-    A single Bybit OHLCV 10006 event usually means the whole endpoint is congested for this
-    Render instance, not only one symbol/timeframe. Treat it as a global circuit breaker so
-    background jobs do not keep probing new symbols and delaying Telegram commands.
+    Rate limits are now isolated per symbol+timeframe in fetch_ohlcv(). Returning False
+    here prevents one Bybit 10006 on a single coin from freezing the whole executable
+    pipeline, /screen, email, and Big-Move engine.
     """
-    try:
-        now_ts = float(time.time())
-        if float(globals().get('_OHLCV_GLOBAL_COOL_UNTIL', 0.0) or 0.0) > now_ts:
-            return True
-        for tf in (timeframes or []):
-            tf_key = str(tf or '').lower().strip()
-            if not tf_key:
-                continue
-            if float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0) > now_ts:
-                return True
-        return False
-    except Exception:
-        return False
+    return False
 
 def _admin_status_cached_text(name: str, fresh_ttl: float | None = None, stale_ttl: float | None = None) -> tuple[str | None, bool]:
     fresh = _admin_status_cache_get(name, ttl=(fresh_ttl if fresh_ttl is not None else HEAVY_ADMIN_CACHE_TTL_SEC))
@@ -11987,25 +11981,18 @@ def _bigmove_candidates(best_fut: dict, p15: float, p1: float, p4: float, min_vo
             except Exception:
                 pct24 = 0.0
             ranked_items.append((pct24, vol0, str(sym0 or "").upper(), mv0))
-        ranked_items.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        try:
-            scan_mult = max(1, int(BIGMOVE_CANDIDATE_SCAN_MULT or 2))
-        except Exception:
-            scan_mult = 2
-        scan_limit = max(int(max_items or 12) * scan_mult, 6)
-        try:
-            scan_limit = min(int(BIGMOVE_SIGNAL_MAX_SCAN), max(scan_limit, int(max_items or 12)))
-        except Exception:
-            pass
+        # Big-Move is independent of the setup pool and scans only top-volume symbols.
+        ranked_items.sort(key=lambda x: x[1], reverse=True)
+        scan_limit = min(len(ranked_items), max(1, int(BIGMOVE_SYMBOL_LIMIT or 30)))
         items_iter = [(sym0, mv0) for _pct24, _vol0, sym0, mv0 in ranked_items[:scan_limit]]
     except Exception:
-        items_iter = list((best_fut or {}).items())[:max(6, int(max_items or 12) * 3)]
+        items_iter = list((best_fut or {}).items())[:max(1, int(BIGMOVE_SYMBOL_LIMIT or 30))]
 
     fallback_symbols_checked = 0
     try:
-        fallback_symbol_budget = max(0, int(BIGMOVE_OHLCV_FALLBACK_MAX_SYMBOLS or 0))
+        fallback_symbol_budget = max(0, int(os.getenv("BIGMOVE_OHLCV_FALLBACK_MAX_SYMBOLS", str(BIGMOVE_SYMBOL_LIMIT)) or BIGMOVE_SYMBOL_LIMIT))
     except Exception:
-        fallback_symbol_budget = 0
+        fallback_symbol_budget = max(0, int(BIGMOVE_SYMBOL_LIMIT or 30))
 
     for sym, mv in items_iter:
         try:
@@ -15883,6 +15870,10 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
                         stats['signal_errors'] += 1
                         if len(stats['errors']) < 6:
                             stats['errors'].append(f"signal:{sid or sym}:{type(e).__name__}")
+                    try:
+                        db_log_generated_setup(int(_target_uid), "exec", sess, s)
+                    except Exception:
+                        pass
                 try:
                     db_mark_executable_setup(int(_target_uid), sid, sess, float(now_ts), s=s, source_kind=str(source_kind or 'executable_setups'))
                     stats['persisted'] += 1
@@ -17482,6 +17473,7 @@ def fetch_futures_tickers() -> Dict[str, MarketVol]:
 
 _OHLCV_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 _OHLCV_TF_RATE_LIMIT_UNTIL: Dict[str, float] = {}
+# Legacy placeholders kept for compatibility only. Live fetching now uses per-symbol cooldowns.
 _OHLCV_GLOBAL_COOL_UNTIL = 0.0
 _OHLCV_RATE_LIMIT_WARN_UNTIL: Dict[str, float] = {}
 _OHLCV_LAST_KEY: Dict[str, str] = {}
@@ -17489,17 +17481,69 @@ _OHLCV_INFLIGHT: Dict[str, threading.Event] = {}
 _OHLCV_INFLIGHT_LOCK = threading.Lock()
 _OHLCV_PAGED_CACHE: Dict[str, tuple[float, list]] = {}
 _OHLCV_PAGED_CACHE_LOCK = threading.Lock()
-OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "600") or 600)
-OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "900") or 900)
-OHLCV_INFLIGHT_WAIT_SEC = float(os.getenv("OHLCV_INFLIGHT_WAIT_SEC", "2.5") or 2.5)
+OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MIN_SEC = float(os.getenv("OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MIN_SEC", "60") or 60)
+OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MAX_SEC = float(os.getenv("OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MAX_SEC", "120") or 120)
+OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "90") or 90)
+OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "120") or 120)
+OHLCV_INFLIGHT_WAIT_SEC = float(os.getenv("OHLCV_INFLIGHT_WAIT_SEC", "1.5") or 1.5)
 OHLCV_PAGED_CACHE_TTL_SEC = float(os.getenv("OHLCV_PAGED_CACHE_TTL_SEC", "120") or 120)
-# Cold-start / cold-cache protection. Render restarts clear memory cache; without this guard
-# several background jobs can immediately request many OHLCV candles and trigger Bybit 10006.
-# User commands still answer from DB/stale cache/tickers; cold OHLCV is paced in the background.
+# Cold-start / cold-cache protection. Keep very short so Render restarts can rebuild quickly.
 PROCESS_START_TS = float(time.time())
-OHLCV_BOOT_GRACE_SEC = float(os.getenv("OHLCV_BOOT_GRACE_SEC", "150") or 150)
-OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "18") or 18)
-OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "1.25") or 1.25)
+OHLCV_BOOT_GRACE_SEC = float(os.getenv("OHLCV_BOOT_GRACE_SEC", "20") or 20)
+OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "40") or 40)
+OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "0.35") or 0.35)
+_OHLCV_RATE_LIMIT_HITS_TOTAL = 0
+_OHLCV_STALE_USAGE_TOTAL = 0
+_SCAN_TF_PHASE = 0
+_SCAN_HEALTH = {
+    "last_scan_ts": 0.0,
+    "last_scan_mode": "",
+    "last_scan_session": "",
+    "last_tf_phase": "",
+    "symbols_processed": 0,
+    "rate_limit_hits": 0,
+    "stale_usage": 0,
+    "ohlcv_limit": int(MAX_OHLCV_LIMIT),
+}
+
+def _ohlcv_symbol_tf_key(symbol: str, timeframe: str) -> str:
+    try:
+        return f"{str(symbol or '').upper()}|{str(timeframe or '').lower()}"
+    except Exception:
+        return f"{symbol}|{timeframe}"
+
+def _scan_health_touch(mode: str = '', session: str = '', symbols_processed: int | None = None, tf_phase: str = '') -> None:
+    try:
+        _SCAN_HEALTH["last_scan_ts"] = float(time.time())
+        if mode:
+            _SCAN_HEALTH["last_scan_mode"] = str(mode)
+        if session:
+            _SCAN_HEALTH["last_scan_session"] = str(session)
+        if tf_phase:
+            _SCAN_HEALTH["last_tf_phase"] = str(tf_phase)
+        if symbols_processed is not None:
+            _SCAN_HEALTH["symbols_processed"] = int(symbols_processed or 0)
+        _SCAN_HEALTH["rate_limit_hits"] = int(globals().get('_OHLCV_RATE_LIMIT_HITS_TOTAL', 0) or 0)
+        _SCAN_HEALTH["stale_usage"] = int(globals().get('_OHLCV_STALE_USAGE_TOTAL', 0) or 0)
+        _SCAN_HEALTH["ohlcv_limit"] = int(MAX_OHLCV_LIMIT)
+    except Exception:
+        pass
+
+def _scan_health_snapshot() -> dict:
+    try:
+        snap = dict(_SCAN_HEALTH)
+        snap["rate_limit_hits"] = int(globals().get('_OHLCV_RATE_LIMIT_HITS_TOTAL', 0) or 0)
+        snap["stale_usage"] = int(globals().get('_OHLCV_STALE_USAGE_TOTAL', 0) or 0)
+        return snap
+    except Exception:
+        return {}
+
+def _current_scan_tf_phase() -> str:
+    try:
+        phases = ("15m", "1h", "4h")
+        return phases[int(globals().get('_SCAN_TF_PHASE', 0) or 0) % len(phases)]
+    except Exception:
+        return "15m"
 BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK = env_bool("BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK", True)
 BIGMOVE_ALLOW_COLD_CONFIRM_FETCH = env_bool("BIGMOVE_ALLOW_COLD_CONFIRM_FETCH", True)
 _OHLCV_COLD_FETCH_LOCK = threading.Lock()
@@ -17655,33 +17699,53 @@ def _ohlcv_best_effort_cached(symbol: str, timeframe: str, limit: int) -> List[L
 
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     """
-    Singleton + TTL cached OHLCV fetch.
+    Singleton + TTL cached OHLCV fetch with production-safe API load controls.
 
-    Production hardening:
-    - never let a Bybit rate-limit exception crash /screen or other jobs
-    - when the request was recently rate-limited, serve stale cache (if any) instead of hammering Bybit again
-    - reuse a fresh superset cache across nearby limits for the same symbol/timeframe
-    - coalesce concurrent identical symbol/timeframe requests so background jobs stop dog-piling Bybit
-    - on transient failures, prefer stale cache over raising
+    Current live rules:
+    - hard cap candle requests to MAX_OHLCV_LIMIT (default 50)
+    - no global cooldown; rate limits cool only the affected symbol+timeframe
+    - cooldown duration is bounded to 60–120s
+    - non-active timeframe phases prefer cache/stale data to stagger 15m/1h/4h refreshes
+    - stale cache is always preferred over hammering Bybit
     """
-    key = f"ohlcv:{symbol}:{timeframe}:{limit}"
+    global _OHLCV_RATE_LIMIT_HITS_TOTAL, _OHLCV_STALE_USAGE_TOTAL
+    try:
+        req_limit = int(limit or MAX_OHLCV_LIMIT)
+    except Exception:
+        req_limit = int(MAX_OHLCV_LIMIT)
+    req_limit = max(2, min(int(req_limit), int(MAX_OHLCV_LIMIT)))
+
+    symbol_u = str(symbol or '').strip()
     tf_key = str(timeframe or '').lower().strip() or 'na'
-    group_key = f"{symbol}|{tf_key}"
+    key = f"ohlcv:{symbol_u}:{tf_key}:{req_limit}"
+    symtf_key = _ohlcv_symbol_tf_key(symbol_u, tf_key)
+    group_key = f"{symbol_u}|{tf_key}"
 
     if cache_valid(key, OHLCV_TTL_SEC):
         return cache_get(key)
 
-    fresh_sup = _ohlcv_fresh_superset_cached(symbol, timeframe, limit, ttl=OHLCV_TTL_SEC)
+    fresh_sup = _ohlcv_fresh_superset_cached(symbol_u, tf_key, req_limit, ttl=OHLCV_TTL_SEC)
     if isinstance(fresh_sup, list) and fresh_sup:
         return fresh_sup
 
     now_ts = float(time.time())
-    cool_until = float(_OHLCV_RATE_LIMIT_UNTIL.get(key) or 0.0)
-    tf_cool_until = float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0)
-    global_cool_until = float(globals().get('_OHLCV_GLOBAL_COOL_UNTIL', 0.0) or 0.0)
-    if cool_until > now_ts or tf_cool_until > now_ts or global_cool_until > now_ts:
-        stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
-        return stale if isinstance(stale, list) else []
+    cool_until = float(_OHLCV_RATE_LIMIT_UNTIL.get(symtf_key) or 0.0)
+    if cool_until > now_ts:
+        stale = _ohlcv_best_effort_cached(symbol_u, tf_key, req_limit)
+        if isinstance(stale, list) and stale:
+            _OHLCV_STALE_USAGE_TOTAL += 1
+            return stale
+        return []
+
+    # Stagger cold refreshes across 15m / 1h / 4h phases. If a non-active timeframe
+    # already has stale/superset data, use it and let the active phase refresh first.
+    active_phase = _current_scan_tf_phase()
+    if tf_key in {'15m', '1h', '4h'} and tf_key != active_phase:
+        stale = _ohlcv_best_effort_cached(symbol_u, tf_key, req_limit)
+        if isinstance(stale, list) and stale:
+            _OHLCV_STALE_USAGE_TOTAL += 1
+            return stale
+        return []
 
     wait_event = None
     owner_event = None
@@ -17696,57 +17760,62 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
 
     if wait_event is not None and owner_event is None:
         try:
-            wait_event.wait(timeout=max(0.5, min(4.0, float(OHLCV_INFLIGHT_WAIT_SEC or 2.5))))
+            wait_event.wait(timeout=max(0.25, min(2.0, float(OHLCV_INFLIGHT_WAIT_SEC or 1.5))))
         except Exception:
             pass
         if cache_valid(key, OHLCV_TTL_SEC):
             return cache_get(key)
-        fresh_sup = _ohlcv_fresh_superset_cached(symbol, timeframe, limit, ttl=OHLCV_TTL_SEC)
+        fresh_sup = _ohlcv_fresh_superset_cached(symbol_u, tf_key, req_limit, ttl=OHLCV_TTL_SEC)
         if isinstance(fresh_sup, list) and fresh_sup:
             return fresh_sup
-        stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
-        return stale if isinstance(stale, list) else []
+        stale = _ohlcv_best_effort_cached(symbol_u, tf_key, req_limit)
+        if isinstance(stale, list) and stale:
+            _OHLCV_STALE_USAGE_TOTAL += 1
+            return stale
+        return []
 
-    if not _ohlcv_cold_fetch_permitted(symbol, timeframe, limit):
-        stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
-        return stale if isinstance(stale, list) else []
+    if not _ohlcv_cold_fetch_permitted(symbol_u, tf_key, req_limit):
+        stale = _ohlcv_best_effort_cached(symbol_u, tf_key, req_limit)
+        if isinstance(stale, list) and stale:
+            _OHLCV_STALE_USAGE_TOTAL += 1
+            return stale
+        return []
 
     ex = get_exchange()
     try:
-        data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) or []
+        data = ex.fetch_ohlcv(symbol_u, timeframe=tf_key, limit=req_limit) or []
         cache_set(key, data)
-        _ohlcv_update_superset_cache(symbol, timeframe, data)
+        _ohlcv_update_superset_cache(symbol_u, tf_key, data)
         try:
             if isinstance(data, list) and data:
-                _OHLCV_LAST_KEY[f"{symbol}|{timeframe}"] = key
+                _OHLCV_LAST_KEY[f"{symbol_u}|{tf_key}"] = key
         except Exception:
             pass
-        _OHLCV_RATE_LIMIT_UNTIL.pop(key, None)
-        _OHLCV_TF_RATE_LIMIT_UNTIL.pop(tf_key, None)
+        _OHLCV_RATE_LIMIT_UNTIL.pop(symtf_key, None)
         return data
     except Exception as e:
         name = type(e).__name__
         msg = str(e or '')
         if 'RateLimitExceeded' in name or '10006' in msg or 'rate limit' in msg.lower() or 'too many visits' in msg.lower():
-            key_cd = max(12.0, float(OHLCV_TTL_SEC))
-            tf_cd = max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 900.0), min(max(key_cd, 180.0), 240.0))
-            _OHLCV_RATE_LIMIT_UNTIL[key] = now_ts + key_cd
-            _OHLCV_TF_RATE_LIMIT_UNTIL[tf_key] = max(float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(tf_key) or 0.0), now_ts + tf_cd)
-            globals()['_OHLCV_GLOBAL_COOL_UNTIL'] = max(float(globals().get('_OHLCV_GLOBAL_COOL_UNTIL', 0.0) or 0.0), now_ts + tf_cd)
-            warn_key = f'{tf_key}:rate_limit'
+            _OHLCV_RATE_LIMIT_HITS_TOTAL += 1
+            cd_min = max(10.0, float(OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MIN_SEC or 60.0))
+            cd_max = max(cd_min, float(OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MAX_SEC or 120.0))
+            jitter = float(abs(hash(symtf_key)) % int(max(1, cd_max - cd_min + 1)))
+            cd = min(cd_max, cd_min + jitter)
+            _OHLCV_RATE_LIMIT_UNTIL[symtf_key] = now_ts + cd
+            warn_key = f'{symtf_key}:rate_limit'
             if float(_OHLCV_RATE_LIMIT_WARN_UNTIL.get(warn_key) or 0.0) <= now_ts:
-                _OHLCV_RATE_LIMIT_WARN_UNTIL[warn_key] = now_ts + max(5.0, float(OHLCV_WARN_SUPPRESS_SEC or 30.0))
+                _OHLCV_RATE_LIMIT_WARN_UNTIL[warn_key] = now_ts + max(10.0, float(OHLCV_WARN_SUPPRESS_SEC or 120.0))
                 try:
-                    # Rate-limit events are expected under Bybit 10006; log as INFO so
-                    # Render does not look unhealthy, then rely on the circuit breaker.
                     logger.info(
-                        'fetch_ohlcv rate-limited for %s %s x%s; cooling %ss and using stale cache if available',
-                        symbol, timeframe, limit, int(tf_cd),
+                        'fetch_ohlcv rate-limited for %s %s x%s; symbol cooling %ss and using stale cache if available',
+                        symbol_u, tf_key, req_limit, int(cd),
                     )
                 except Exception:
                     pass
-        stale = _ohlcv_best_effort_cached(symbol, timeframe, limit)
-        if isinstance(stale, list):
+        stale = _ohlcv_best_effort_cached(symbol_u, tf_key, req_limit)
+        if isinstance(stale, list) and stale:
+            _OHLCV_STALE_USAGE_TOTAL += 1
             return stale
         return []
     finally:
@@ -17759,7 +17828,6 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
                 cur = _OHLCV_INFLIGHT.get(group_key)
                 if cur is owner_event:
                     _OHLCV_INFLIGHT.pop(group_key, None)
-
 
 def ema7_1h_distance_pct(market_symbol: str) -> Tuple[float, float, float]:
     """
@@ -20032,7 +20100,7 @@ def _objective(oos: list[dict], days: int, cfg: dict) -> float:
     """OOS-first objective with anti-overfitting safeguards.
 
     - Primary: OOS expectancy (Avg R) + Profit Factor (PF)
-    - Enforces frequency target (3–5 setups/day) via penalty
+    - Enforces frequency target (3–6 setups/day) via penalty
     - Penalizes: drawdown, low sample size, symbol concentration, session imbalance/instability
     - WIN definition used in win_rate: TP hit before SL (TP/TP/TP outcomes are wins)
     """
@@ -20074,8 +20142,8 @@ def _objective(oos: list[dict], days: int, cfg: dict) -> float:
     win_rate = (wr_num / w_sum) if w_sum else 0.0
 
     # Frequency penalty (target band)
-    lo = float(cfg.get("target_setups_per_day_lo", 5.0))
-    hi = float(cfg.get("target_setups_per_day_hi", 8.0))
+    lo = float(cfg.get("target_setups_per_day_lo", 3.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 6.0))
     freq_pen = 0.0
     if setups_day < lo:
         freq_pen = (lo - setups_day) * 4.0
@@ -20189,8 +20257,8 @@ def _objective(oos: list[dict], days: int, cfg: dict) -> float:
     pf /= n
     dd /= n
 
-    lo = float(cfg.get("target_setups_per_day_lo", 5.0))
-    hi = float(cfg.get("target_setups_per_day_hi", 8.0))
+    lo = float(cfg.get("target_setups_per_day_lo", 3.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 6.0))
     freq_pen = 0.0
     if setups_day < lo:
         freq_pen = (lo - setups_day) * 2.0
@@ -24286,7 +24354,7 @@ def _governor_adjust_quality_floor(session_name: str = "NY") -> Optional[dict]:
     try:
         window_h = float(cfg.get("governor_window_hours", 24) or 24)
         target_lo = float(cfg.get("governor_target_lo", cfg.get("target_setups_per_day_lo", 3.0)) or 3.0)
-        target_hi = float(cfg.get("governor_target_hi", cfg.get("target_setups_per_day_hi", 5.0)) or 5.0)
+        target_hi = float(cfg.get("governor_target_hi", cfg.get("target_setups_per_day_hi", 6.0)) or 6.0)
         step = float(cfg.get("governor_step_score", 1.0) or 1.0)
         smin = float(cfg.get("governor_score_min", 52.0) or 52.0)
         smax = float(cfg.get("governor_score_max", 82.0) or 82.0)
@@ -24359,8 +24427,8 @@ def _self_opt_stability_gates(metrics: dict, cfg: dict) -> tuple[bool, list[str]
     if total_setups < min_setups:
         reasons.append(f"oos_sample_too_small ({total_setups} < {min_setups})")
 
-    lo = float(cfg.get("target_setups_per_day_lo", 5.0))
-    hi = float(cfg.get("target_setups_per_day_hi", 8.0))
+    lo = float(cfg.get("target_setups_per_day_lo", 3.0))
+    hi = float(cfg.get("target_setups_per_day_hi", 6.0))
     if setups_day < lo:
         reasons.append(f"frequency_too_low ({setups_day:.2f} < {lo:.2f})")
     if setups_day > hi * 1.25:
@@ -24407,7 +24475,7 @@ def _self_opt_format_report(res: dict) -> str:
         f"Decision: {'✅ PROMOTED' if promoted else '❌ NOT PROMOTED'}",
         f"Chosen exec TF: {chosen_tf} | Objective: {score:.3f}",
         SEP,
-        f"OOS setups/day: {float(oos.get('setups_per_day',0.0) or 0.0):.2f} (target {float(p.get('target_setups_per_day_lo',1.0) or 1.0):.0f}–{float(p.get('target_setups_per_day_hi',3.0) or 3.0):.0f})",
+        f"OOS setups/day: {float(oos.get('setups_per_day',0.0) or 0.0):.2f} (target {float(p.get('target_setups_per_day_lo',3.0) or 3.0):.0f}–{float(p.get('target_setups_per_day_hi',6.0) or 6.0):.0f})",
         f"OOS setups: {int(oos.get('setups',0) or 0)} | Win rate: {float(oos.get('win_rate',0.0) or 0.0):.1f}%",
         f"OOS Avg R: {float(oos.get('avg_R',0.0) or 0.0):.3f} | PF: {float(oos.get('profit_factor',0.0) or 0.0):.2f} | MaxDD(R): {float(oos.get('max_drawdown_R',0.0) or 0.0):.2f}",
         f"Concentration: top_symbol_share={float(oos.get('top_symbol_share',0.0) or 0.0):.1%}",
@@ -25111,8 +25179,8 @@ def _market_adaptive_objective(rep: dict, cfg: dict | None = None) -> float:
     avg_r = float(overall.get('avg_R', 0.0) or 0.0)
     pf = float(overall.get('profit_factor', 0.0) or 0.0)
 
-    lo = float((cfg or {}).get('market_adaptive_target_setups_per_day_lo', 5.0) or 5.0)
-    hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 8.0) or 8.0)
+    lo = float((cfg or {}).get('market_adaptive_target_setups_per_day_lo', 3.0) or 3.0)
+    hi = float((cfg or {}).get('market_adaptive_target_setups_per_day_hi', 6.0) or 6.0)
     ny_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
     lon_floor = float((cfg or {}).get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
 
@@ -25223,8 +25291,8 @@ def _market_adaptive_propose_actions(rep: dict, cfg: dict) -> tuple[list[dict], 
     wr = float(overall.get('win_rate', 0.0) or 0.0)
     avg_r = float(overall.get('avg_R', 0.0) or 0.0)
     total_setups = int(overall.get('setups', 0) or 0)
-    lo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 1.0) or 1.0)
-    hi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 3.0) or 3.0)
+    lo = float(cfg.get('market_adaptive_target_setups_per_day_lo', 3.0) or 3.0)
+    hi = float(cfg.get('market_adaptive_target_setups_per_day_hi', 6.0) or 6.0)
     ny_floor = float(cfg.get('market_adaptive_session_wr_floor_ny', 46.0) or 46.0)
     lon_floor = float(cfg.get('market_adaptive_session_wr_floor_lon', 48.0) or 48.0)
 
@@ -26057,8 +26125,8 @@ def _goal_profile_targets(cfg: dict | None = None) -> dict:
         'enabled': _cfg_bool((cfg or {}).get('goal_profile_enabled', True), True),
         'interval_hours': float((cfg or {}).get('goal_profile_interval_hours', 24.0) or 24.0),
         'cooldown_hours': float((cfg or {}).get('goal_profile_cooldown_hours', 20.0) or 20.0),
-        'target_lo': float((cfg or {}).get('goal_profile_target_setups_per_day_lo', 5.0) or 5.0),
-        'target_hi': float((cfg or {}).get('goal_profile_target_setups_per_day_hi', 8.0) or 8.0),
+        'target_lo': float((cfg or {}).get('goal_profile_target_setups_per_day_lo', 3.0) or 3.0),
+        'target_hi': float((cfg or {}).get('goal_profile_target_setups_per_day_hi', 6.0) or 6.0),
         'target_wr': float((cfg or {}).get('goal_profile_target_win_rate', 60.0) or 60.0),
         'target_avg_r': float((cfg or {}).get('goal_profile_target_avg_r', 0.10) or 0.10),
         'min_live_30d': int((cfg or {}).get('goal_profile_min_live_setups_30d', 8) or 8),
@@ -29483,33 +29551,45 @@ def make_bigmove_family_setup(base: str, mv: Any, session_name: str = 'LON', sca
 
 
 def pick_bigmove_family_setups(best_fut: Dict[str, MarketVol], n: int, session_name: str, universe_cap: int, scan_profile: str = DEFAULT_SCAN_PROFILE) -> List[Setup]:
-    items = list((best_fut or {}).items())
-    if not items:
-        return []
-    ranked = []
-    for base, mv in items:
-        try:
-            vol = float(usd_notional(mv) or 0.0)
-            if vol < float(BIGMOVE_DEFAULT_MIN_VOL_USD):
-                continue
-            pct24 = abs(float(getattr(mv, 'percentage', 0.0) or 0.0))
-            if pct24 < 4.0:
-                continue
-            ranked.append((pct24, vol, str(base or '').upper().strip(), mv))
-        except Exception:
-            continue
-    ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    scan_cap = min(len(ranked), max(6, min(int(BIGMOVE_SIGNAL_MAX_SCAN), int(max(3, n)) * 3)))
+    """Independent Big-Move setup family over the top-volume universe only."""
     out: List[Setup] = []
-    for pct24, vol, base, mv in ranked[:scan_cap]:
-        try:
-            s = make_bigmove_family_setup(base, mv, session_name=session_name, scan_profile=scan_profile)
-            if s:
-                out.append(s)
-        except Exception:
-            continue
-    out.sort(key=lambda s: (float(getattr(s, 'quality_score', 0.0) or 0.0), int(getattr(s, 'conf', 0) or 0), float(getattr(s, 'fut_vol_usd', 0.0) or 0.0)), reverse=True)
-    return out[:max(0, int(n))]
+    try:
+        items = list((best_fut or {}).items())
+        ranked = []
+        for base, mv in items:
+            try:
+                b = str(base or '').upper().strip()
+                if not b:
+                    continue
+                vol = float(usd_notional(mv) or getattr(mv, 'quoteVolume', 0.0) or 0.0)
+                if vol < float(BIGMOVE_MIN_FUT_VOL_USD):
+                    continue
+                ranked.append((vol, b, mv))
+            except Exception:
+                continue
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        scan_cap = min(len(ranked), max(1, int(BIGMOVE_SYMBOL_LIMIT or 30)))
+        for _vol, base, mv in ranked[:scan_cap]:
+            try:
+                setup = make_bigmove_family_setup(base, mv, session_name=session_name)
+                if setup:
+                    out.append(setup)
+                    _rej("ok_bigmove", base, mv, "big-move family setup")
+            except Exception as e:
+                try:
+                    _rej("bigmove_family_exception", base, mv, f"{type(e).__name__}: {e}")
+                except Exception:
+                    pass
+                continue
+        out.sort(key=lambda s: (
+            int(getattr(s, 'conf', 0) or 0),
+            float(getattr(s, 'quality_score', 0.0) or 0.0),
+            abs(float(getattr(s, 'ch15', 0.0) or 0.0)) + abs(float(getattr(s, 'ch1', 0.0) or 0.0)),
+            float(getattr(s, 'fut_vol_usd', 0.0) or 0.0),
+        ), reverse=True)
+        return out[:int(max(0, n))]
+    except Exception:
+        return out[:int(max(0, n))]
 
 
 def _email_market_regime(best_fut: dict) -> str:
@@ -35650,6 +35730,119 @@ def _recalibrate_public_confidence(setup: "Setup", session_name: str) -> tuple[i
         return raw, float(raw), {}
 
 
+
+def _top_volume_allowed_bases(best_fut: dict, limit: int = SCAN_SYMBOL_LIMIT) -> set[str]:
+    try:
+        lim = max(1, int(limit or SCAN_SYMBOL_LIMIT))
+        items = sorted((best_fut or {}).items(), key=lambda kv: float(usd_notional(kv[1]) or 0.0), reverse=True)
+        return {str(b or '').upper().strip() for b, _mv in items[:lim] if str(b or '').strip()}
+    except Exception:
+        return set()
+
+
+def _limit_bases_to_top_volume(best_fut: dict, bases: list, limit: int = SCAN_SYMBOL_LIMIT) -> list:
+    try:
+        allowed = _top_volume_allowed_bases(best_fut, limit)
+        if not allowed:
+            return list(dict.fromkeys([str(b).upper().strip() for b in (bases or []) if str(b).strip()]))[:max(1, int(limit or SCAN_SYMBOL_LIMIT))]
+        out = []
+        for b in (bases or []):
+            bb = str(b or '').upper().strip()
+            if bb and bb in allowed and bb not in out:
+                out.append(bb)
+        if len(out) < int(limit or SCAN_SYMBOL_LIMIT):
+            ranked = sorted((best_fut or {}).items(), key=lambda kv: float(usd_notional(kv[1]) or 0.0), reverse=True)
+            for b, _mv in ranked:
+                bb = str(b or '').upper().strip()
+                if bb and bb in allowed and bb not in out:
+                    out.append(bb)
+                if len(out) >= int(limit or SCAN_SYMBOL_LIMIT):
+                    break
+        return out[:max(1, int(limit or SCAN_SYMBOL_LIMIT))]
+    except Exception:
+        return list(dict.fromkeys([str(b).upper().strip() for b in (bases or []) if str(b).strip()]))[:max(1, int(limit or SCAN_SYMBOL_LIMIT))]
+
+
+def _db_recent_candidate_setup_objects(user_id: int, session_name: str = '', max_age_min: int = 30, limit: int = 5) -> list:
+    """Recent generated candidates only; deliberately does not read old email rows."""
+    from types import SimpleNamespace
+    out = []
+    seen = set()
+    try:
+        uid = int(user_id or 0)
+        cutoff = float(time.time()) - float(max(1, int(max_age_min))) * 60.0
+        sess_u = str(session_name or '').upper().strip()
+        con = db_connect()
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        where_sess = ''
+        params = [uid, float(cutoff)]
+        if sess_u:
+            where_sess = ' AND UPPER(COALESCE(session, "")) = ? '
+            params.append(sess_u)
+        params.append(int(max(1, limit * 4)))
+        cur.execute(f"""
+            SELECT *
+            FROM generated_setups
+            WHERE user_id = ?
+              AND LOWER(COALESCE(source, '')) IN ('screen','exec','candidate','generated')
+              AND created_ts >= ?
+              {where_sess}
+            ORDER BY created_ts DESC
+            LIMIT ?
+        """, tuple(params))
+        rows = cur.fetchall() or []
+        con.close()
+        for row in rows:
+            try:
+                d = dict(row)
+                sid = str(d.get('setup_id') or '').strip()
+                if not sid or sid in seen:
+                    continue
+                item = SimpleNamespace(
+                    setup_id=sid,
+                    id=sid,
+                    symbol=str(d.get('symbol') or ''),
+                    market_symbol=str(d.get('market_symbol') or ''),
+                    side=str(d.get('side') or ''),
+                    conf=int(d.get('conf') or 0),
+                    entry=float(d.get('entry') or 0.0),
+                    sl=float(d.get('sl') or 0.0),
+                    tp=float(_setup_target_tp(d, 0.0) or 0.0),
+                    alt_target_a=0.0,
+                    alt_target_b=0.0,
+                    fut_vol_usd=float(d.get('fut_vol_usd') or 0.0),
+                    ch24=float(d.get('ch24') or 0.0),
+                    ch4=float(d.get('ch4') or 0.0),
+                    ch1=float(d.get('ch1') or 0.0),
+                    ch15=float(d.get('ch15') or 0.0),
+                    quality_score=float(d.get('quality_score') or d.get('conf') or 0.0),
+                    atr_pct=float(d.get('atr_pct') or 0.0),
+                    engine=str(d.get('engine') or ''),
+                    created_ts=float(d.get('created_ts') or 0.0),
+                    signal_created_ts=float(d.get('created_ts') or 0.0),
+                    executable_ts=float(d.get('created_ts') or 0.0),
+                    email_logged_ts=0.0,
+                    generated_logged_ts=float(d.get('created_ts') or 0.0),
+                    source_kind='recent_candidate',
+                    source_session=str(d.get('session') or ''),
+                    family_id=str(d.get('family_id') or ''),
+                )
+                try:
+                    item = _research_finalize_setup(item, session_name=sess_u)
+                except Exception:
+                    pass
+                out.append(item)
+                seen.add(sid)
+                if len(out) >= int(limit):
+                    break
+            except Exception:
+                continue
+    except Exception:
+        return out[:int(limit)]
+    return out[:int(limit)]
+
+
 async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan_profile: str = DEFAULT_SCAN_PROFILE, uid: int | None = None) -> dict:
     """
     mode: "screen", "exec", or "email"
@@ -35697,7 +35890,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     if mode == "screen":
         n_target = int(SETUPS_N)
         strict_15m = True
-        universe_cap = int(max(SCREEN_UNIVERSE_N, 35))
+        universe_cap = int(min(SCAN_SYMBOL_LIMIT, max(SCREEN_UNIVERSE_N, 35)))
         # Ensure /screen is not stricter than email engine
         trigger_loosen = float(min(SCREEN_TRIGGER_LOOSEN, 1.0))
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
@@ -35712,7 +35905,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         # tightest email-generation settings or it self-starves before final gating.
         n_target = int(max(EMAIL_SETUPS_N * 4, 10))
         strict_15m = True
-        universe_cap = int(max(80, SCREEN_UNIVERSE_N))
+        universe_cap = int(SCAN_SYMBOL_LIMIT)
         trigger_loosen = float(min(0.92, max(SCREEN_TRIGGER_LOOSEN, 0.88)))
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
         allow_no_pullback = True
@@ -35725,7 +35918,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         # The final email/autotrade lane remains strict; the pool itself should not be starved.
         n_target = int(max(EMAIL_SETUPS_N * 4, 12))
         strict_15m = True
-        universe_cap = int(max(60, SCREEN_UNIVERSE_N))
+        universe_cap = int(SCAN_SYMBOL_LIMIT)
         trigger_loosen = 1.0
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
         allow_no_pullback = False
@@ -35742,7 +35935,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     if prof == "aggressive":
         if mode == "screen":
             n_target = int(max(SETUPS_N, 8))
-            universe_cap = int(max(SCREEN_UNIVERSE_N, 110))
+            universe_cap = int(SCAN_SYMBOL_LIMIT)
             trigger_loosen = float(min(0.80, SCREEN_TRIGGER_LOOSEN))
             waiting_near = float(min(0.70, SCREEN_WAITING_NEAR_PCT))
             scan_multiplier = 12
@@ -35753,7 +35946,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             allow_no_pullback = True
         elif mode == "exec":
             n_target = int(max(EMAIL_SETUPS_N * 4, 12))
-            universe_cap = int(max(90, universe_cap))
+            universe_cap = int(SCAN_SYMBOL_LIMIT)
             trigger_loosen = 0.88
             waiting_near = float(min(0.75, SCREEN_WAITING_NEAR_PCT))
             strict_15m = True
@@ -35765,7 +35958,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         else:
             # Email pool becomes broader, but final email gates still apply
             n_target = int(max(EMAIL_SETUPS_N * 3, 9))
-            universe_cap = int(max(60, universe_cap))
+            universe_cap = int(SCAN_SYMBOL_LIMIT)
             trigger_loosen = 0.95
             waiting_near = float(SCREEN_WAITING_NEAR_PCT)
             strict_15m = True
@@ -35804,6 +35997,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         extra_top_volume_bases = []
 
     universe_bases = list(dict.fromkeys(display_universe_bases + extra_top_volume_bases))
+    # Production API guard: only scan the top symbols by futures volume.
+    universe_bases = _limit_bases_to_top_volume(best_fut, universe_bases, int(SCAN_SYMBOL_LIMIT))
     universe_best = _subset_best(best_fut, universe_bases) if universe_bases else {}
 
     # Diagnostics: keep /why focused on this scan universe
@@ -35820,6 +36015,19 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         pass
 
     priority_setups = []
+
+    # Rotate active OHLCV timeframe phase so cold refreshes are staggered across scan cycles.
+    try:
+        global _SCAN_TF_PHASE
+        _SCAN_TF_PHASE = (int(_SCAN_TF_PHASE or 0) + 1) % 3
+        _scan_health_touch(
+            mode=mode,
+            session=session_name,
+            symbols_processed=len(universe_bases or []),
+            tf_phase=_current_scan_tf_phase(),
+        )
+    except Exception:
+        pass
 
     # Leaders pass
     if leaders:
@@ -36304,6 +36512,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                 'spike_warnings': len(spike_warnings or []),
                 'top_rejects': _pipeline_top_reasons(dict((_rej_ctx or {}).get('__agg__') or {}), 5),
                 'make_setup_exception_count': int(((_rej_ctx or {}).get('__agg__') or {}).get('make_setup_exception', 0) or 0),
+                'scan_health': _scan_health_snapshot(),
             },
         )
     except Exception:
@@ -36350,10 +36559,10 @@ def user_location_and_time(user: dict):
 # =========================================================
 # /screen fast cache (per-instance)
 # =========================================================
-SCREEN_CACHE_TTL_SEC = 150  # seconds
-SCREEN_STALE_CACHE_MAX_SEC = 900  # keep stale /screen available instead of making users wait during warmup/rate-limit pressure
-SCREEN_CACHE_WARMUP_INTERVAL_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_INTERVAL_SEC", "300") or 300)
-SCREEN_CACHE_WARMUP_MIN_AGE_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_MIN_AGE_SEC", "600") or 600)
+SCREEN_CACHE_TTL_SEC = int(os.environ.get("SCREEN_CACHE_TTL_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)  # seconds
+SCREEN_STALE_CACHE_MAX_SEC = int(os.environ.get("SCREEN_STALE_CACHE_MAX_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)  # force fresh rebuild when stale
+SCREEN_CACHE_WARMUP_INTERVAL_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_INTERVAL_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)
+SCREEN_CACHE_WARMUP_MIN_AGE_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_MIN_AGE_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 _SCREEN_CACHE: dict[str, dict] = {}
 _SCREEN_LOCK = asyncio.Lock()
@@ -36589,8 +36798,8 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 if len(out) >= int(limit):
                     return out[:int(limit)]
 
-            # Recovery fallback only: recent delivery-lane objects.
-            for item in (_recent_delivery_lane_setup_objects(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(1, int(limit * 2))) or []):
+            # Recovery fallback only: recent generated candidates, never old emailed setups.
+            for item in (_db_recent_candidate_setup_objects(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(1, int(limit * 2))) or []):
                 try:
                     sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
                     if not sid or sid in seen:
@@ -36653,7 +36862,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         _exec_ready = []
 
     try:
-        setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=max(12, int(AUTOTRADE_ENTRY_WINDOW_MIN)), limit=max(1, int(SETUPS_N))))
+        setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=max(2, int(math.ceil(float(MAX_STALE_SCAN_SEC) / 60.0))), limit=max(1, int(SETUPS_N))))
     except Exception:
         setups = []
 
@@ -38641,7 +38850,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # This prevents transient rebuild droughts from suppressing email/autotrade when
             # executable setups were already produced in a recent prior cycle.
             try:
-                exec_rows_cached = db_list_executable_setups(0, session_name=str(sess_name or ''), ts_from=float(time.time() - 7200), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
+                exec_rows_cached = db_list_executable_setups(0, session_name=str(sess_name or ''), ts_from=float(time.time() - float(MAX_STALE_SCAN_SEC)), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
             except Exception:
                 exec_rows_cached = []
             try:
@@ -38651,7 +38860,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             persisted_setups = [s for s in (persisted_setups or []) if s is not None]
             if persisted_setups:
                 try:
-                    db_log_setup_pipeline_event(0, stage='email_pool_session_db', status='ok', session=str(sess_name or ''), mode='email', details={'setups': len(persisted_setups or []), 'source': 'exec_db_2h'})
+                    db_log_setup_pipeline_event(0, stage='email_pool_session_db', status='ok', session=str(sess_name or ''), mode='email', details={'setups': len(persisted_setups or []), 'source': f'exec_db_{int(MAX_STALE_SCAN_SEC)}s'})
                 except Exception:
                     pass
                 _email_pool_cache_set(sess_name, persisted_setups)
@@ -38661,7 +38870,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # authoritative session pool already exists. Under runtime pressure, prefer
             # reusing cache over starting another expensive scan.
             busy_runtime = SCAN_LOCK.locked() or _SCREEN_LOCK.locked() or _backtest_runtime_busy()
-            cache_ttl_for_email = float(max(_alert_job_limit('EMAIL_POOL_REBUILD_MIN_SEC', 180), 600 if busy_runtime else 0))
+            cache_ttl_for_email = float(max(20, min(float(MAX_STALE_SCAN_SEC), float(_alert_job_limit('EMAIL_POOL_REBUILD_MIN_SEC', 60)))))
             if cached_setups and cache_age <= cache_ttl_for_email:
                 setups = list(cached_setups)
                 try:
@@ -38726,7 +38935,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                                 pass
                 if setups:
                     _email_pool_cache_set(sess_name, setups)
-                elif cached_setups:
+                elif cached_setups and cache_age <= float(MAX_STALE_SCAN_SEC):
                     setups = list(cached_setups)
                     try:
                         db_log_setup_pipeline_event(0, stage='email_pool_session_cache', status='stale_fallback', session=str(sess_name or ''), mode='email', details={'setups': len(setups or []), 'cache_age_sec': round(cache_age, 1)})
@@ -38909,7 +39118,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(e).__name__}: {e}', 'eligible': len(eligible or []), 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
 
             try:
-                exec_rows = db_list_executable_setups(int(uid), session_name=str(sess_name or ''), ts_from=float(time.time() - 1800), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
+                exec_rows = db_list_executable_setups(int(uid), session_name=str(sess_name or ''), ts_from=float(time.time() - float(MAX_STALE_SCAN_SEC)), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
             except Exception:
                 exec_rows = []
             try:
@@ -38920,17 +39129,18 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
             if (not eligible) and str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
                 try:
-                    exec_rows_fallback = db_list_executable_setups(int(uid), session_name=str(sess_name or ''), ts_from=float(time.time() - 7200), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
+                    recent_candidates = _db_recent_candidate_setup_objects(
+                        int(uid),
+                        session_name=str(sess_name or ''),
+                        max_age_min=max(2, int(math.ceil(float(MAX_STALE_SCAN_SEC) / 60.0))),
+                        limit=max(int(EMAIL_SETUPS_N) * 4, 12),
+                    )
                 except Exception:
-                    exec_rows_fallback = []
-                try:
-                    hydrated_fallback = _executable_rows_to_setup_objects(list(exec_rows_fallback or []), session_name=str(sess_name or ''))
-                except Exception:
-                    hydrated_fallback = []
-                if hydrated_fallback:
-                    eligible = [s for s in (hydrated_fallback or []) if s is not None]
+                    recent_candidates = []
+                if recent_candidates:
+                    eligible = [s for s in (recent_candidates or []) if s is not None and is_executable_setup_eligible(s, session_name=sess_name)[0]]
                     try:
-                        db_log_setup_pipeline_event(int(uid), stage='email_executable_pool_fallback', status='ok', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'source': 'exec_db_2h'})
+                        db_log_setup_pipeline_event(int(uid), stage='email_executable_pool_fallback', status='ok' if eligible else 'empty', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'source': f'recent_candidates_{int(MAX_STALE_SCAN_SEC)}s'})
                     except Exception:
                         pass
 
@@ -39385,6 +39595,18 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 lines.append("Build pool: " + _pipe_summary(pipe_build))
             if pipe_exec:
                 lines.append("Executable pool: " + _pipe_summary(pipe_exec))
+    except Exception:
+        pass
+
+    try:
+        h = _scan_health_snapshot()
+        last_ts = float(h.get('last_scan_ts') or 0.0)
+        lines.append("")
+        lines.append("🩺 Scan Health")
+        lines.append("Last scan: " + (_fmt_when_local(last_ts) if last_ts > 0 else "-"))
+        lines.append(f"Mode/session: {str(h.get('last_scan_mode') or '-')}/{str(h.get('last_scan_session') or '-')}")
+        lines.append(f"TF phase: {str(h.get('last_tf_phase') or '-')} | Symbols processed: {int(h.get('symbols_processed') or 0)}")
+        lines.append(f"Rate-limit hits: {int(h.get('rate_limit_hits') or 0)} | Stale uses: {int(h.get('stale_usage') or 0)} | OHLCV limit: {int(h.get('ohlcv_limit') or MAX_OHLCV_LIMIT)}")
     except Exception:
         pass
 
@@ -40490,11 +40712,11 @@ async def screen_cache_warmup_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         if _ohlcv_boot_grace_active():
             return
-        if _recent_user_activity(120):
+        if _recent_user_activity(20):
             return
         if _SCREEN_REFRESH_TASK is not None and not _SCREEN_REFRESH_TASK.done():
             return
-        if _interactive_runtime_busy(120):
+        if _interactive_runtime_busy(30):
             return
         sess = str(scan_session_name_utc(datetime.now(timezone.utc)) or '').upper()
         cache_key = f"global::{sess}"
@@ -40997,7 +41219,7 @@ def main():
         app.job_queue.run_repeating(
             screen_cache_warmup_job,
             interval=int(SCREEN_CACHE_WARMUP_INTERVAL_SEC),
-            first=max(180, min(300, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
+            first=max(20, min(60, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
             name="screen_cache_warmup_job",
             job_kwargs={
                 "max_instances": 1,
