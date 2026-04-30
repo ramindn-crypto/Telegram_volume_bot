@@ -39313,21 +39313,92 @@ async def health_sys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text('⚠️ Health snapshot is warming up. Run /health_sys again in a few seconds.')
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    # Always log
-    logger.exception("Telegram error", exc_info=context.error)
+# =========================================================
+# TELEGRAM POLLING TRANSIENT ERROR GUARD
+# =========================================================
+_TELEGRAM_TRANSIENT_ERROR_LAST_LOG_TS = 0.0
+_TELEGRAM_TRANSIENT_ERROR_SUPPRESSED = 0
 
-    # Also tell the user (otherwise it looks like "nothing happened")
+def _telegram_transient_log_window_sec() -> int:
+    try:
+        return max(30, int(os.getenv("TELEGRAM_TRANSIENT_ERROR_LOG_WINDOW_SEC", "300") or 300))
+    except Exception:
+        return 300
+
+def _is_transient_telegram_network_error(update: object, err: Exception | None) -> bool:
+    """Return True for expected Telegram getUpdates/network blips.
+
+    PTB calls the global error handler when polling getUpdates receives transient
+    Telegram/API edge errors such as 502 Bad Gateway. Those errors do not mean a
+    command handler crashed and PTB will retry automatically, so logging a full
+    traceback on every retry creates noisy Render logs and can look like a bot
+    failure. Keep real update/job exceptions fully logged.
+    """
+    try:
+        if err is None:
+            return False
+        if update is not None and getattr(update, "effective_message", None):
+            return False
+        if isinstance(err, (RetryAfter, TimedOut)):
+            return True
+        if isinstance(err, NetworkError):
+            msg = str(err or "").lower()
+            transient_patterns = (
+                "bad gateway",
+                "gateway",
+                "timed out",
+                "timeout",
+                "connection",
+                "temporary",
+                "reset by peer",
+                "server disconnected",
+                "httpx",
+                "pool timeout",
+            )
+            return any(pat in msg for pat in transient_patterns)
+    except Exception:
+        return False
+    return False
+
+def _log_transient_telegram_error(err: Exception | None) -> None:
+    global _TELEGRAM_TRANSIENT_ERROR_LAST_LOG_TS, _TELEGRAM_TRANSIENT_ERROR_SUPPRESSED
+    try:
+        now = time.time()
+        window = float(_telegram_transient_log_window_sec())
+        if now - float(_TELEGRAM_TRANSIENT_ERROR_LAST_LOG_TS or 0.0) >= window:
+            suppressed = int(_TELEGRAM_TRANSIENT_ERROR_SUPPRESSED or 0)
+            suffix = f" | suppressed={suppressed}" if suppressed else ""
+            logger.warning(
+                "Telegram polling transient network error ignored; polling will retry automatically: %s: %s%s",
+                type(err).__name__ if err else "UnknownError",
+                err,
+                suffix,
+            )
+            _TELEGRAM_TRANSIENT_ERROR_LAST_LOG_TS = now
+            _TELEGRAM_TRANSIENT_ERROR_SUPPRESSED = 0
+        else:
+            _TELEGRAM_TRANSIENT_ERROR_SUPPRESSED = int(_TELEGRAM_TRANSIENT_ERROR_SUPPRESSED or 0) + 1
+    except Exception:
+        pass
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = getattr(context, "error", None)
+
+    if _is_transient_telegram_network_error(update, err):
+        _log_transient_telegram_error(err)
+        return
+
+    exc_info = (type(err), err, getattr(err, "__traceback__", None)) if err else True
+    logger.exception("Telegram handler/job error", exc_info=exc_info)
+
     try:
         if update and getattr(update, "effective_message", None):
             msg = "⚠️ Something crashed while handling your request."
-            # If admin, show the exception text as well
             uid = getattr(getattr(update, "effective_user", None), "id", None)
             if uid is not None and is_admin_user(int(uid)):
-                msg += f"\n\nError: {type(context.error).__name__}: {context.error}"
+                msg += f"\n\nError: {type(err).__name__}: {err}"
             await update.effective_message.reply_text(msg)
     except Exception:
-        # never let error handler crash
         pass
 
 # =========================================================
