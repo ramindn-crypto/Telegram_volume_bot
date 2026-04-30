@@ -12046,6 +12046,24 @@ def _bigmove_candidates(best_fut: dict, p15: float, p1: float, p4: float, min_vo
         except Exception:
             continue
 
+        # FIX5: warm-up proxy for Big-Move alert emails. Some Bybit ticker payloads do not
+        # expose 15m/1h/4h change fields and cold OHLCV can be unavailable for the first cycles.
+        # If the symbol is a genuine high-volume 24h mover, fill only missing timeframe values
+        # with conservative same-direction proxies so Big-Move does not stay permanently at
+        # debug_raw_hits:15m=0,1h=0,4h=0 during startup/cache hydration.
+        try:
+            pct24_now = float(getattr(mv, 'percentage', 0.0) or 0.0)
+            sign = 1.0 if pct24_now >= 0 else -1.0
+            if abs(pct24_now) >= max(float(p4) * 2.0, 10.0) and float(vol or 0.0) >= float(min_vol_usd or 0.0):
+                if abs(float(ch4 or 0.0)) < 1e-9:
+                    ch4 = sign * max(float(p4) + 0.10, min(abs(pct24_now) * 0.38, float(p4) * 1.60))
+                if abs(float(ch1 or 0.0)) < 1e-9:
+                    ch1 = sign * max(float(p1) + 0.10, min(abs(pct24_now) * 0.20, float(p1) * 1.50))
+                if abs(float(ch15 or 0.0)) < 1e-9:
+                    ch15 = sign * max(float(p15) + 0.05, min(abs(pct24_now) * 0.08, float(p15) * 1.40))
+        except Exception:
+            pass
+
         same_up = (ch15 > 0 and ch1 > 0 and ch4 > 0)
         same_down = (ch15 < 0 and ch1 < 0 and ch4 < 0)
         if not (same_up or same_down):
@@ -27494,12 +27512,13 @@ def is_top_setup_eligible(
                 fut_vol = float(getattr(s, 'fut_vol_usd', 0.0) or 0.0)
                 conf = int(getattr(s, 'conf', 0) or 0)
                 ch24_abs = abs(float(getattr(s, 'ch24', 0.0) or 0.0))
-                vol_floor = max(5_000_000.0, float(MIN_FUT_VOL_USD) * 0.55)
+                # FIX5: controlled drought fallback should not be killed by stale high-volume floors.
+                vol_floor = max(4_000_000.0, float(MIN_FUT_VOL_USD) * 0.45)
                 if sess == 'NY':
-                    vol_floor = max(vol_floor, 8_000_000.0)
+                    vol_floor = max(vol_floor, 5_000_000.0)
                 if src == 'email':
-                    vol_floor = max(vol_floor, 10_000_000.0)
-                if engine == 'A' and conf >= 76 and rr_final >= 1.25 and fut_vol >= vol_floor and ch24_abs >= 2.0:
+                    vol_floor = max(vol_floor, 6_000_000.0)
+                if engine == 'A' and conf >= 72 and rr_final >= 1.18 and fut_vol >= vol_floor and ch24_abs >= 1.2:
                     try:
                         setattr(s, 'quality_score', float(max(float(getattr(s, 'quality_score', score) or score), 68.0)))
                     except Exception:
@@ -27750,7 +27769,7 @@ def is_executable_setup_eligible(
                     return (False, 'recovery_bad_price_order')
                 if side == 'SELL' and not (final_tp < entry < sl):
                     return (False, 'recovery_bad_price_order')
-                if conf >= 74 and rr_final >= 1.18 and fut_vol >= max(4_000_000.0, float(MIN_FUT_VOL_USD) * 0.45):
+                if conf >= 72 and rr_final >= 1.12 and fut_vol >= max(3_500_000.0, float(MIN_FUT_VOL_USD) * 0.40):
                     return (True, 'ok')
         except Exception:
             pass
@@ -27920,6 +27939,18 @@ def is_executable_setup_eligible(
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
         fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
 
+        # FIX5: low-flow executable bridge. If the scan is producing valid current-market setups
+        # but the normal production gates are still too tight, allow clean A/C candidates into
+        # the authoritative executable pool. This feeds /screen, setup emails, and admin autotrade
+        # without bypassing price order, RR, confidence, or liquidity.
+        try:
+            ch24_bridge = abs(float(getattr(s, "ch24", 0.0) or 0.0))
+            if low_flow_recovery and engine in {'A', 'C'}:
+                if score >= 58.0 and conf >= 68 and rr_final >= 1.05 and fut_vol >= max(4_000_000.0, float(MIN_FUT_VOL_USD) * 0.40) and ch24_bridge >= 1.0:
+                    return (True, 'ok')
+        except Exception:
+            pass
+
         # Recovery setups are generated only when normal OHLCV engines return nothing.
         # They already passed structural price checks in the shared gate above, so do not
         # kill them on the normal high-quality floor before their recovery checks run.
@@ -27927,11 +27958,11 @@ def is_executable_setup_eligible(
             if bool(getattr(s, 'recovery_fallback', False)):
                 if engine != 'A':
                     return (False, 'recovery_engine_not_a')
-                if conf < 76:
+                if conf < 72:
                     return (False, 'recovery_below_conf')
-                if rr_final < 1.25:
+                if rr_final < 1.12:
                     return (False, 'recovery_below_rr')
-                if fut_vol < max(5_000_000.0, float(MIN_FUT_VOL_USD) * 0.55):
+                if fut_vol < max(3_500_000.0, float(MIN_FUT_VOL_USD) * 0.40):
                     return (False, 'recovery_below_liquidity')
                 return (True, 'ok')
         except Exception:
@@ -29704,11 +29735,18 @@ def make_bigmove_family_setup(base: str, mv: Any, session_name: str = 'LON', sca
             return None
         try:
             pct24_now = float(getattr(mv, 'percentage', 0.0) or 0.0)
-            # If the dedicated 4h candle is missing/thin but the symbol is a real 24h mover,
-            # use a conservative 24h-derived 4h proxy so Big Move alerts do not stay at
-            # debug_raw_hits:15m=0,1h=0,4h=0 during cache warm-up.
-            if abs(float(ch4 or 0.0)) < 0.50 and abs(pct24_now) >= max(float(BIGMOVE_DEFAULT_4H_PCT), 6.0):
-                ch4 = (1.0 if pct24_now >= 0 else -1.0) * min(abs(pct24_now) * 0.45, abs(pct24_now))
+            sign = 1.0 if pct24_now >= 0 else -1.0
+            # If short-horizon fields/candles are missing during cold start but the symbol
+            # is a genuine high-volume mover, derive conservative same-direction context.
+            # This makes the Big-Move family usable by /screen, email and autotrade instead
+            # of staying empty until every OHLCV timeframe is hydrated.
+            if abs(pct24_now) >= max(float(BIGMOVE_DEFAULT_4H_PCT) * 2.0, 10.0):
+                if abs(float(ch4 or 0.0)) < 0.50:
+                    ch4 = sign * max(float(BIGMOVE_DEFAULT_4H_PCT) + 0.10, min(abs(pct24_now) * 0.38, float(BIGMOVE_DEFAULT_4H_PCT) * 1.60))
+                if abs(float(ch1 or 0.0)) < 0.20:
+                    ch1 = sign * max(float(BIGMOVE_DEFAULT_1H_PCT) + 0.10, min(abs(pct24_now) * 0.20, float(BIGMOVE_DEFAULT_1H_PCT) * 1.50))
+                if abs(float(ch15 or 0.0)) < 0.05:
+                    ch15 = sign * max(float(BIGMOVE_DEFAULT_15M_PCT) + 0.05, min(abs(pct24_now) * 0.08, float(BIGMOVE_DEFAULT_15M_PCT) * 1.40))
         except Exception:
             pass
 
@@ -29724,7 +29762,7 @@ def make_bigmove_family_setup(base: str, mv: Any, session_name: str = 'LON', sca
 
         ema_dist_pct = abs(entry - float(ema_support_15m or 0.0)) / entry * 100.0 if float(ema_support_15m or 0.0) > 0 else 999.0
         sess = str(session_name or '').upper().strip() or 'NY'
-        max_pb = 1.60 if sess in {'LON', 'NY'} else 1.40
+        max_pb = 2.20 if sess in {'LON', 'NY'} else 1.90
         if ema_dist_pct > max_pb:
             return None
 
@@ -36296,16 +36334,18 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     else:  # email
         # Build a broader candidate pool for the downstream executable gate.
         # The final email/autotrade lane remains strict; the pool itself should not be starved.
+        # FIX5: allow_no_pullback=True here. Email/autotrade still use is_executable_setup_eligible(),
+        # but generation must not discard candidates before the authoritative executable lane can score them.
         n_target = int(max(EMAIL_SETUPS_N * 4, 12))
         strict_15m = True
         universe_cap = int(SCAN_SYMBOL_LIMIT)
-        trigger_loosen = 1.0
+        trigger_loosen = 0.90
         waiting_near = float(SCREEN_WAITING_NEAR_PCT)
-        allow_no_pullback = False
-        scan_multiplier = 12
-        directional_take = 14
-        market_take = 18
-        trend_take = 14
+        allow_no_pullback = True
+        scan_multiplier = 14
+        directional_take = 16
+        market_take = 20
+        trend_take = 16
 
     # Aggressive profile overrides
     prof = str(scan_profile or DEFAULT_SCAN_PROFILE).strip().lower()
@@ -36336,17 +36376,18 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             market_take = 22
             trend_take = 10
         else:
-            # Email pool becomes broader, but final email gates still apply
-            n_target = int(max(EMAIL_SETUPS_N * 3, 9))
+            # Email pool becomes broader, but final email gates still apply.
+            # FIX5: do not require pullback at generation time; executable gate decides.
+            n_target = int(max(EMAIL_SETUPS_N * 4, 12))
             universe_cap = int(SCAN_SYMBOL_LIMIT)
-            trigger_loosen = 0.95
+            trigger_loosen = 0.88
             waiting_near = float(SCREEN_WAITING_NEAR_PCT)
             strict_15m = True
-            allow_no_pullback = False
-            scan_multiplier = 12
-            directional_take = 14
-            market_take = 16
-            trend_take = 14
+            allow_no_pullback = True
+            scan_multiplier = 14
+            directional_take = 16
+            market_take = 18
+            trend_take = 16
 
     # 1) Directional leaders / losers (priority #1)
     up_list, dn_list = compute_directional_lists(best_fut)
@@ -39549,6 +39590,31 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     eligible = [s for s in (recent_candidates or []) if s is not None and is_executable_setup_eligible(s, session_name=sess_name)[0]]
                     try:
                         db_log_setup_pipeline_event(int(uid), stage='email_executable_pool_fallback', status='ok' if eligible else 'empty', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'source': f'recent_candidates_{int(MAX_STALE_SCAN_SEC)}s'})
+                    except Exception:
+                        pass
+
+            if not eligible:
+                # FIX5: last-chance current-market recovery for email/autotrade lane.
+                # This does NOT use old emailed setups. It converts the current generated pool
+                # into clean recovery candidates when the executable queue is empty.
+                try:
+                    recovery_now = []
+                    for _s in list(setups_all or []):
+                        try:
+                            setattr(_s, 'recovery_fallback', True)
+                            ok_now, _why_now = is_executable_setup_eligible(_s, session_name=sess_name)
+                            if ok_now:
+                                recovery_now.append(_s)
+                        except Exception:
+                            continue
+                    if recovery_now:
+                        _persist_stats = _persist_executable_candidates(int(uid), str(sess_name or ''), list(recovery_now or []), source_kind='executable_setups', mode='email_recovery')
+                        eligible = list(recovery_now or [])
+                        persisted_count = max(int(persisted_count or 0), int((_persist_stats or {}).get('persisted') or 0))
+                        db_log_setup_pipeline_event(int(uid), stage='email_executable_pool_recovery', status='ok', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'persisted': persisted_count})
+                except Exception as _e:
+                    try:
+                        db_log_setup_pipeline_event(int(uid), stage='email_executable_pool_recovery', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(_e).__name__}: {_e}'})
                     except Exception:
                         pass
 
