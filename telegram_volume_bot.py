@@ -18330,6 +18330,101 @@ def tv_chart_url(symbol_base: str) -> str:
 def table_md(rows: List[List[Any]], headers: List[str]) -> str:
     return "```\n" + tabulate(rows, headers=headers, tablefmt="github") + "\n```"
 
+
+def _screen_market_context_table(best_fut: dict, leaders=None, losers=None, tone: str | None = None) -> str:
+    """Pretty /screen Market Context tables only.
+
+    Visual formatting helper; does not scan, rank, gate, or change any trading logic.
+    """
+    try:
+        best_fut = best_fut or {}
+
+        def _mv_for(sym: str):
+            sym_u = str(sym or '').upper().strip()
+            return best_fut.get(sym_u) or best_fut.get(sym_u.replace('USDT', ''))
+
+        def _price(mv) -> str:
+            try:
+                return fmt_price(float(getattr(mv, 'last', 0.0) or 0.0))
+            except Exception:
+                return '—'
+
+        def _pct(v) -> str:
+            try:
+                return f"{float(v):+.1f}%"
+            except Exception:
+                return '—'
+
+        def _vol_m(v) -> str:
+            try:
+                return f"{float(v) / 1e6:.1f}M"
+            except Exception:
+                return '—'
+
+        def _pick_row(pick):
+            try:
+                # Regular /screen path passes (sym, vol_usd, ch24).
+                if isinstance(pick, (list, tuple)) and len(pick) >= 3:
+                    sym = str(pick[0]).upper().strip()
+                    vol_usd = float(pick[1] or 0.0)
+                    ch24 = float(pick[2] or 0.0)
+                    mv = _mv_for(sym)
+                    return [sym, _price(mv), _vol_m(vol_usd), _pct(ch24)]
+
+                # Quick ticker fallback passes (sym, MarketVol).
+                if isinstance(pick, (list, tuple)) and len(pick) >= 2:
+                    sym = str(pick[0]).upper().strip()
+                    mv = pick[1]
+                    vol_usd = float(usd_notional(mv) or 0.0)
+                    ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0)
+                    return [sym, _price(mv), _vol_m(vol_usd), _pct(ch24)]
+            except Exception:
+                pass
+            return None
+
+        pulse_rows = []
+        for sym in ('BTC', 'ETH', 'SOL', 'BNB'):
+            try:
+                mv = _mv_for(sym)
+                if not mv:
+                    continue
+                pulse_rows.append([
+                    sym,
+                    _price(mv),
+                    _pct(float(getattr(mv, 'percentage', 0.0) or 0.0)),
+                ])
+            except Exception:
+                continue
+
+        leader_rows = []
+        for item in list(leaders or [])[:5]:
+            row = _pick_row(item)
+            if row:
+                leader_rows.append(row)
+
+        loser_rows = []
+        for item in list(losers or [])[:5]:
+            row = _pick_row(item)
+            if row:
+                loser_rows.append(row)
+
+        lines = ["*Market Context*", SEP]
+        if tone:
+            lines.extend([f"*Risk Tone:* {tone}", ""])
+
+        lines.append("*Pulse*")
+        lines.append(table_md(pulse_rows, ["SYM", "Price", "24H"]) if pulse_rows else "_No pulse data._")
+
+        lines.extend(["", "*🟢 Leaders*"])
+        lines.append(table_md(leader_rows, ["SYM", "Price", "Vol24h", "24H"]) if leader_rows else "_None_")
+
+        lines.extend(["", "*🔴 Losers*"])
+        lines.append(table_md(loser_rows, ["SYM", "Price", "Vol24h", "24H"]) if loser_rows else "_None_")
+
+        return "\n".join(lines).strip()
+    except Exception:
+        return ""
+
 # Email-specific price formatting (less noisy)
 def fmt_price(x: float) -> str:
     """
@@ -36278,12 +36373,9 @@ def _screen_quick_ticker_snapshot_body(best_fut: Dict[str, MarketVol], session: 
         body.append("━━━━━━━━━━━━━━━━━━━━")
         body.append("_Executable scan is warming up. No confirmed setup shown from the quick ticker snapshot._")
         body.append("")
-        body.append("*Market Context*")
-        body.append("━━━━━━━━━━━━━━━━━━━━")
-        body.append(f"Pulse: BTC {btc:+.1f}% | ETH {eth:+.1f}%")
-        body.append("")
-        body.append("*Leaders:* " + (", ".join(_row(x) for x in leaders) if leaders else "—"))
-        body.append("*Losers:* " + (", ".join(_row(x) for x in losers) if losers else "—"))
+        market_txt = _screen_market_context_table(best_fut, leaders=leaders, losers=losers)
+        if market_txt:
+            body.append(market_txt)
         body.append("")
         body.append("_A full executable-family refresh has been queued in the dedicated /screen lane._")
         return "\n".join(body), [], []
@@ -36710,40 +36802,17 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         up_picks = _pick_top(movers, "up")
         dn_picks = _pick_top(movers, "dn")
 
-        up_top = [f"*{str(sym).upper()}* {pct_with_emoji(c24)} ({v/1e6:.1f}M)" for sym, v, c24 in up_picks]
-        dn_top = [f"*{str(sym).upper()}* {pct_with_emoji(c24)} ({v/1e6:.1f}M)" for sym, v, c24 in dn_picks]
         # Tone heuristic (based on strict directional thresholds)
         upn = sum(1 for _sym, _v, _c24 in movers if _c24 >= float(MOVER_UP_24H_MIN))
         dnn = sum(1 for _sym, _v, _c24 in movers if _c24 <= float(MOVER_DN_24H_MAX))
         if upn >= max(2, int(dnn * 1.5)):
-            tone = "🟢 Bullish"
+            tone = "\U0001F7E2 Bullish"
         elif dnn >= max(2, int(upn * 1.5)):
-            tone = "🔴 Bearish"
+            tone = "\U0001F534 Bearish"
         else:
-            tone = "🟡 Mixed"
+            tone = "\U0001F7E1 Mixed"
 
-        # BTC/ETH pulse (if available)
-        btc = (best_fut or {}).get("BTC")
-        eth = (best_fut or {}).get("ETH")
-        btc24 = pct_with_emoji(float(getattr(btc, "percentage", 0.0) or 0.0)) if btc else "—"
-        eth24 = pct_with_emoji(float(getattr(eth, "percentage", 0.0) or 0.0)) if eth else "—"
-
-        lines = [
-            f"*Market Context*",
-            SEP,
-            f"*Risk Tone:* {tone}",
-            "",
-            f"*Pulse:* *BTC* {btc24} | *ETH* {eth24}",
-            "",
-        ]
-        if up_top:
-            lines.append(f"*Leaders:* " + ", ".join(up_top))
-            lines.append("")
-        if dn_top:
-            lines.append(f"*Losers:* " + ", ".join(dn_top))
-            lines.append("")
-
-        market_txt = "\n".join(lines).strip()
+        market_txt = _screen_market_context_table(best_fut, leaders=up_picks, losers=dn_picks, tone=tone)
     except Exception:
         market_txt = ""
 
