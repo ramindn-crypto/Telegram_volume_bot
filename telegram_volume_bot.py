@@ -6783,6 +6783,62 @@ def _autotrade_effective_risk_usd(uid: int, setup, equity: float, base_risk_usd:
         return (max(0.0, float(base_risk_usd or 0.0)), 1.0, 'UNKNOWN')
 
 
+
+
+def _autotrade_clone_setup_for_execution(setup, **overrides):
+    """Return a setup-like object with execution prices updated.
+
+    Some DB/email hydrated candidates are SimpleNamespace objects, not dataclass Setup
+    instances. dataclasses.replace() raises TypeError on those objects, which previously
+    opened a live Bybit position and then crashed before writing the autotrade journal.
+    """
+    try:
+        fields = getattr(setup, '__dataclass_fields__', None)
+        if fields:
+            safe = {k: v for k, v in (overrides or {}).items() if k in fields}
+            return replace(setup, **safe)
+    except Exception:
+        pass
+    try:
+        data = dict(getattr(setup, '__dict__', {}) or {})
+    except Exception:
+        data = {}
+    # Minimum attributes needed by _autotrade_db_add_trade and reporting.
+    defaults = {
+        'setup_id': str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or ''),
+        'id': str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or ''),
+        'symbol': str(getattr(setup, 'symbol', '') or ''),
+        'market_symbol': str(getattr(setup, 'market_symbol', '') or ''),
+        'side': str(getattr(setup, 'side', '') or ''),
+        'conf': int(getattr(setup, 'conf', 0) or 0),
+        'entry': float(getattr(setup, 'entry', 0.0) or 0.0),
+        'sl': float(getattr(setup, 'sl', 0.0) or 0.0),
+        'tp': float(_setup_target_tp(setup, 0.0) or 0.0),
+        'alt_target_a': 0.0,
+        'alt_target_b': 0.0,
+        'fut_vol_usd': float(getattr(setup, 'fut_vol_usd', 0.0) or 0.0),
+        'ch24': float(getattr(setup, 'ch24', 0.0) or 0.0),
+        'ch4': float(getattr(setup, 'ch4', 0.0) or 0.0),
+        'ch1': float(getattr(setup, 'ch1', 0.0) or 0.0),
+        'ch15': float(getattr(setup, 'ch15', 0.0) or 0.0),
+        'quality_score': float(getattr(setup, 'quality_score', 0.0) or 0.0),
+        'atr_pct': float(getattr(setup, 'atr_pct', 0.0) or 0.0),
+        'engine': str(getattr(setup, 'engine', '') or ''),
+        'created_ts': float(getattr(setup, 'created_ts', 0.0) or time.time()),
+        'family_id': str(getattr(setup, 'family_id', '') or ''),
+        'regime_primary': str(getattr(setup, 'regime_primary', '') or ''),
+        'allocator_plan_id': str(getattr(setup, 'allocator_plan_id', '') or ''),
+        'param_set_id': str(getattr(setup, 'param_set_id', '') or ''),
+    }
+    for k, v in defaults.items():
+        data.setdefault(k, v)
+    data.update(overrides or {})
+    try:
+        from types import SimpleNamespace
+        return SimpleNamespace(**data)
+    except Exception:
+        return setup
+
 def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
     if not _autotrade_ready():
         return (False, 'autotrade_not_ready_or_disabled')
@@ -7172,7 +7228,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
     try:
         if str(_autotrade_runtime_mode()).lower() != 'live':
-            s_paper = replace(s, entry=float(price_ref), sl=float(sl_for_order), tp=float(live_final_tp or 0.0), alt_target_a=0.0, alt_target_b=0.0)
+            s_paper = _autotrade_clone_setup_for_execution(s, entry=float(price_ref), sl=float(sl_for_order), tp=float(live_final_tp or 0.0), alt_target_a=0.0, alt_target_b=0.0)
             trade_id = _autotrade_db_add_trade(uid, session_label, s_paper, float(qty), lifecycle_state='executed_open', lifecycle_reason='paper_opened')
             _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
             try:
@@ -7299,7 +7355,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 pass
             return (False, 'live_position_visibility_pending_for_sltp_attach')
 
-        s_live = replace(s, entry=float(filled_entry or price_ref), sl=float(sl_for_order), tp=float(live_final_tp or 0.0), alt_target_a=0.0, alt_target_b=0.0)
+        s_live = _autotrade_clone_setup_for_execution(s, entry=float(filled_entry or price_ref), sl=float(sl_for_order), tp=float(live_final_tp or 0.0), alt_target_a=0.0, alt_target_b=0.0)
         trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened_pending_exit_attach')
         _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
         try:
@@ -7385,11 +7441,25 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (True, f"[LIVE] Opened {trade_id}: {side} {sym} qty={qty_for_db:.8g} SL={sl_for_order:g} TP={live_final_tp:g}{suffix}")
 
     except Exception as e:
+        err_txt = f'{type(e).__name__}: {e}'
         try:
-            _autotrade_exec_mark(reserved_keys, 'FAILED', f'{type(e).__name__}: {e}')
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': f'autotrade_execution_error:{err_txt}', 'exception': err_txt})
         except Exception:
             pass
-        return (False, f'autotrade_execution_error:{type(e).__name__}')
+        try:
+            logger.exception('autotrade execution failed uid=%s setup=%s symbol=%s: %s', uid, setup_id, sym, err_txt)
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason=f'autotrade_execution_error:{err_txt}')
+        except Exception:
+            pass
+        try:
+            _autotrade_exec_mark(reserved_keys, 'FAILED', err_txt)
+        except Exception:
+            pass
+        return (False, f'autotrade_execution_error:{err_txt[:160]}')
     finally:
         if runtime_lock_acquired:
             _autotrade_runtime_symbol_lock_release(uid, sym)
@@ -16280,6 +16350,57 @@ def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', ma
                 return out[:int(limit)]
     return out[:int(limit)]
 
+
+
+
+def _latest_recent_delivery_ts(user_id: int, session_name: str = '', max_age_min: int = 45) -> float:
+    """Latest setup-email delivery timestamp for /screen cache invalidation.
+
+    /screen can have a valid but older executable snapshot while a newer setup email has
+    already been sent. In that case /screen must show the latest emailed setup set, not
+    the old cache or a quick ticker snapshot.
+    """
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        uid = 0
+    if uid <= 0:
+        return 0.0
+    req_session_u = str(session_name or '').upper().strip()
+    cutoff = float(time.time()) - float(max(2, int(max_age_min or 45))) * 60.0
+    latest = 0.0
+    try:
+        _recent_emailed_cache_prune(uid)
+        for row in list(_RECENT_EMAILED_SETUP_CACHE.get(uid, []) or []):
+            try:
+                src = str(row.get('source_session') or row.get('session') or '').upper().strip()
+                if req_session_u and src and src not in {'', req_session_u}:
+                    continue
+                ts = float(row.get('emailed_ts') or row.get('email_logged_ts') or 0.0)
+                if ts >= cutoff:
+                    latest = max(latest, ts)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            if req_session_u:
+                row = cur.execute(
+                    "SELECT MAX(emailed_ts) FROM emailed_setups WHERE user_id=? AND emailed_ts>=? AND UPPER(COALESCE(session,''))=?",
+                    (uid, float(cutoff), req_session_u),
+                ).fetchone()
+            else:
+                row = cur.execute(
+                    "SELECT MAX(emailed_ts) FROM emailed_setups WHERE user_id=? AND emailed_ts>=?",
+                    (uid, float(cutoff)),
+                ).fetchone()
+            if row and row[0] is not None:
+                latest = max(latest, float(row[0] or 0.0))
+    except Exception:
+        pass
+    return float(latest or 0.0)
 
 def _db_setup_stage_exists(table_name: str, user_id: int, setup_id: str, ts_column: str, lookback_hours: int = 12) -> bool:
     try:
@@ -35850,10 +35971,16 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         cur = con.cursor()
         cur.execute("SELECT COUNT(1) AS n FROM executable_setups WHERE user_id IN (?,0) AND executable_ts>=?", (int(owner), float(since_ts)))
         row = cur.fetchone()
-        exec_recent = int((row or {}).get('n', 0) or 0)
+        try:
+            exec_recent = int(row['n'] if hasattr(row, 'keys') and 'n' in row.keys() else row[0])
+        except Exception:
+            exec_recent = 0
         cur.execute("SELECT COUNT(1) AS n FROM emailed_setups WHERE user_id IN (?,0) AND emailed_ts>=?", (int(owner), float(since_ts)))
         row = cur.fetchone()
-        emailed_recent = int((row or {}).get('n', 0) or 0)
+        try:
+            emailed_recent = int(row['n'] if hasattr(row, 'keys') and 'n' in row.keys() else row[0])
+        except Exception:
+            emailed_recent = 0
         con.close()
     except Exception:
         try:
@@ -37324,7 +37451,11 @@ def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
             block.append(f"{emoji} *{side} — {sym}*")
             block.append(f"`{sid}` | Conf: `{conf}`")
             try:
-                if symbol_recently_emailed(uid, sym, side, session):
+                sk = str(getattr(s, 'source_kind', '') or '').lower().strip()
+                email_ts = float(getattr(s, 'email_logged_ts', 0.0) or getattr(s, 'emailed_ts', 0.0) or 0.0)
+                if sk in {'emailed_setups', 'recent_email_cache', 'recent_email_lane'} or email_ts > 0:
+                    block.append("📩 *Emailed recently*")
+                elif symbol_recently_emailed(uid, sym, side, session):
                     block.append("📩 *Email suppressed:* cooldown active")
             except Exception:
                 pass
@@ -37346,42 +37477,78 @@ def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
 
 
 def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_age_min: int = 30):
-    """Lightweight no-OHLCV /screen fallback from the executable/candidate DB.
+    """Lightweight no-OHLCV /screen fallback from the latest delivery/executable DB.
 
-    Used after a redeploy when memory cache is empty but a setup email or executable
-    queue was just created. It prevents /screen from showing only the ticker snapshot
-    while valid recent setups already exist in SQLite.
+    Priority is deliberate:
+    1) latest setup email delivered to this user/session;
+    2) executable queue;
+    3) recent generated candidates.
+    This keeps /screen, email and autotrade showing the same setups after a deploy or cache refresh.
     """
     try:
         sess = str(session or '').upper().strip()
-        cutoff = float(time.time()) - float(max(2, int(max_age_min))) * 60.0
         out = []
         seen = set()
+
+        def _basic_valid(item) -> bool:
+            try:
+                side = str(getattr(item, 'side', '') or '').upper().strip()
+                entry = float(getattr(item, 'entry', 0.0) or 0.0)
+                sl = float(getattr(item, 'sl', 0.0) or 0.0)
+                tp = float(_setup_target_tp(item, 0.0) or 0.0)
+                if side not in {'BUY', 'SELL'} or entry <= 0 or sl <= 0 or tp <= 0:
+                    return False
+                if side == 'BUY' and not (sl < entry < tp):
+                    return False
+                if side == 'SELL' and not (tp < entry < sl):
+                    return False
+                return True
+            except Exception:
+                return False
+
+        sources = []
         try:
-            rows = db_list_executable_setups(int(uid), session_name=sess, ts_from=cutoff, limit=20)
-            candidates = _executable_rows_to_setup_objects(rows, session_name=sess)
+            sources.append(('emailed', _recent_delivery_lane_setup_objects(int(uid), session_name=sess, max_age_min=max_age_min, limit=20) or []))
         except Exception:
-            candidates = []
-        if not candidates:
-            try:
-                candidates = _db_recent_candidate_setup_objects(int(uid), session_name=sess, max_age_min=max_age_min, limit=20) or []
-            except Exception:
-                candidates = []
-        for item in candidates:
-            try:
-                sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
-                sym = str(getattr(item, 'symbol', '') or '').upper().strip()
-                if not sid or not sym or sid in seen:
+            sources.append(('emailed', []))
+        try:
+            cutoff = float(time.time()) - float(max(2, int(max_age_min))) * 60.0
+            rows = db_list_executable_setups(int(uid), session_name=sess, ts_from=cutoff, limit=20)
+            sources.append(('executable', _executable_rows_to_setup_objects(rows, session_name=sess) or []))
+        except Exception:
+            sources.append(('executable', []))
+        try:
+            sources.append(('candidate', _db_recent_candidate_setup_objects(int(uid), session_name=sess, max_age_min=max_age_min, limit=20) or []))
+        except Exception:
+            sources.append(('candidate', []))
+
+        for source_name, candidates in sources:
+            for item in candidates:
+                try:
+                    sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
+                    sym = str(getattr(item, 'symbol', '') or '').upper().strip()
+                    ident = _setup_identity_from_obj(item)
+                    dedupe_key = ident or sid
+                    if not sid or not sym or dedupe_key in seen:
+                        continue
+                    src_session_u = str(getattr(item, 'source_session', '') or getattr(item, 'session', '') or '').upper().strip()
+                    if sess and src_session_u and src_session_u not in {'', sess}:
+                        continue
+                    if source_name == 'emailed':
+                        ok_exec = _basic_valid(item)
+                    else:
+                        ok_exec, _why_exec = _autotrade_db_signal_structurally_valid(item, session_name=sess)
+                    if not ok_exec:
+                        continue
+                    out.append(item)
+                    seen.add(dedupe_key)
+                    if len(out) >= _screen_display_limit():
+                        break
+                except Exception:
                     continue
-                ok_exec, _why_exec = _autotrade_db_signal_structurally_valid(item, session_name=sess)
-                if not ok_exec:
-                    continue
-                out.append(item)
-                seen.add(sid)
-                if len(out) >= _screen_display_limit():
-                    break
-            except Exception:
-                continue
+            if out:
+                break
+
         if not out:
             return '', [], []
         try:
@@ -37389,20 +37556,20 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
         except Exception:
             up_list, dn_list = [], []
         market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list[:5], losers=dn_list[:5])
+        source_note = '_Showing latest sent setup email while the live scan refreshes._'
         body = "\n".join([
             "",
             "*Top Trade Setups*",
             SEP,
-            "_Showing recent executable setups from the saved queue while the live scan refreshes._",
+            source_note,
             _screen_format_setup_cards(out, int(uid), sess),
             "",
             market_txt or "",
         ]).strip()
-        kb = [(str(getattr(s, 'symbol', '') or '').upper(), str(getattr(s, 'setup_id', '') or '')) for s in out]
+        kb = [(str(getattr(x, 'symbol', '') or '').upper(), str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or '')) for x in out]
         return body, kb, list(out)
     except Exception:
         return '', [], []
-
 
 def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     """Heavy /screen builder (runs in a worker thread).
@@ -37420,48 +37587,77 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     from types import SimpleNamespace
 
     def _recent_email_lane_screen_setups(_uid: int, _session: str, max_age_min: int = SCREEN_FALLBACK_MAX_AGE_MIN, limit: int = 3):
+        """Return the newest visible setup lane for /screen.
+
+        Priority: latest emailed setups first, then executable DB queue, then recent generated
+        candidates. This prevents /screen from showing a different cache than the email that
+        just went out.
+        """
         try:
             req_session_u = str(_session or '').upper().strip()
             out = []
             seen = set()
-            cutoff = float(time.time()) - float(max_age_min) * 60.0
 
-            # Authoritative source first: persisted executable pool shared with autotrade.
-            rows = db_list_executable_setups(int(_uid), session_name=str(_session or ''), ts_from=float(cutoff), limit=max(1, int(limit * 4)))
-            for item in _executable_rows_to_setup_objects(rows, session_name=req_session_u):
-                src_session_u = str(getattr(item, 'source_session', '') or '').upper().strip()
-                sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
-                if not sid or sid in seen:
-                    continue
-                if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
-                    continue
-                ok_exec, _why_exec = _autotrade_db_signal_structurally_valid(item, session_name=req_session_u or src_session_u or _session)
-                if ok_exec:
-                    out.append(item)
-                    seen.add(sid)
-                if len(out) >= int(limit):
-                    return out[:int(limit)]
-
-            # Recovery fallback only: recent generated candidates, never old emailed setups.
-            for item in (_db_recent_candidate_setup_objects(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(1, int(limit * 2))) or []):
+            def _basic_valid(item) -> bool:
                 try:
-                    sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
-                    if not sid or sid in seen:
-                        continue
-                    src_session_u = str(getattr(item, 'source_session', '') or '').upper().strip()
-                    if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
-                        continue
-                    ok_exec, _why_exec = _autotrade_db_signal_structurally_valid(item, session_name=req_session_u or src_session_u or _session)
-                    if ok_exec:
-                        out.append(item)
-                        seen.add(sid)
-                    if len(out) >= int(limit):
-                        return out[:int(limit)]
+                    side = str(getattr(item, 'side', '') or '').upper().strip()
+                    entry = float(getattr(item, 'entry', 0.0) or 0.0)
+                    sl = float(getattr(item, 'sl', 0.0) or 0.0)
+                    tp = float(_setup_target_tp(item, 0.0) or 0.0)
+                    if side not in {'BUY', 'SELL'} or entry <= 0 or sl <= 0 or tp <= 0:
+                        return False
+                    if side == 'BUY' and not (sl < entry < tp):
+                        return False
+                    if side == 'SELL' and not (tp < entry < sl):
+                        return False
+                    return True
                 except Exception:
-                    continue
+                    return False
+
+            sources = []
+            try:
+                sources.append(('emailed', _recent_delivery_lane_setup_objects(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(1, int(limit * 3))) or []))
+            except Exception:
+                sources.append(('emailed', []))
+            try:
+                cutoff = float(time.time()) - float(max_age_min) * 60.0
+                rows = db_list_executable_setups(int(_uid), session_name=str(_session or ''), ts_from=float(cutoff), limit=max(1, int(limit * 4)))
+                sources.append(('executable', _executable_rows_to_setup_objects(rows, session_name=req_session_u) or []))
+            except Exception:
+                sources.append(('executable', []))
+            try:
+                sources.append(('candidate', _db_recent_candidate_setup_objects(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(1, int(limit * 2))) or []))
+            except Exception:
+                sources.append(('candidate', []))
+
+            for source_name, rows in sources:
+                for item in rows:
+                    try:
+                        sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
+                        ident = _setup_identity_from_obj(item)
+                        dedupe_key = ident or sid
+                        if not sid or dedupe_key in seen:
+                            continue
+                        src_session_u = str(getattr(item, 'source_session', '') or '').upper().strip()
+                        if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
+                            continue
+                        if source_name == 'emailed':
+                            ok_exec = _basic_valid(item)
+                        else:
+                            ok_exec, _why_exec = _autotrade_db_signal_structurally_valid(item, session_name=req_session_u or src_session_u or _session)
+                        if ok_exec:
+                            out.append(item)
+                            seen.add(dedupe_key)
+                        if len(out) >= int(limit):
+                            return out[:int(limit)]
+                    except Exception:
+                        continue
+                if out:
+                    break
             return out[:int(limit)]
         except Exception:
             return []
+
 
     # Market context inputs (keep /screen informative without becoming a data terminal)
     leaders_txt = build_leaders_table(best_fut)  # fast (top by futures volume)
@@ -37923,7 +38119,12 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     cache_entry = _ce
                     age = _age
         _schedule_screen_cache_refresh(int(uid), scan_session)
-        if cache_entry.get('body') and age <= float(SCREEN_STALE_CACHE_MAX_SEC):
+        try:
+            latest_delivery_ts = _latest_recent_delivery_ts(int(uid), str(scan_session or '').upper(), max_age_min=max(20, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8)))
+        except Exception:
+            latest_delivery_ts = 0.0
+        cache_ts = float((cache_entry or {}).get('ts', 0.0) or 0.0)
+        if cache_entry.get('body') and age <= float(SCREEN_STALE_CACHE_MAX_SEC) and not (latest_delivery_ts > cache_ts + 1.0):
             note = "_Showing latest cached scan. Fresh scan is refreshing in the background._\n"
             if age <= float(SCREEN_CACHE_TTL_SEC):
                 note = "_Showing latest cached scan._\n"
@@ -38638,6 +38839,13 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
             except Exception:
                 pass
             for s in setups:
+                try:
+                    setattr(s, 'email_logged_ts', float(now_ts))
+                    setattr(s, 'emailed_ts', float(now_ts))
+                    setattr(s, 'source_kind', 'emailed_setups')
+                    setattr(s, 'source_session', str(display_session or ''))
+                except Exception:
+                    pass
                 for _target_uid in target_uids:
                     try:
                         db_mark_emailed_setup(_target_uid, getattr(s, "setup_id", ""), str(display_session), now_ts)
@@ -38670,6 +38878,23 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                         _mark_emailed_setup_identity(int(_target_uid), s, emailed_ts=float(now_ts))
                     except Exception:
                         pass
+                try:
+                    # Keep /screen immediately aligned with the exact setup email just sent.
+                    up_list, dn_list = compute_directional_lists(best_fut or {})
+                    market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list[:5], losers=dn_list[:5])
+                    screen_body = "\n".join([
+                        "",
+                        "*Top Trade Setups*",
+                        SEP,
+                        "_Showing latest sent setup email while the live scan refreshes._",
+                        _screen_format_setup_cards(list(setups or []), int(_target_uid), str(display_session or '')),
+                        "",
+                        market_txt or "",
+                    ]).strip()
+                    screen_kb = [(str(getattr(_s, 'symbol', '') or '').upper(), str(getattr(_s, 'setup_id', '') or getattr(_s, 'id', '') or '')) for _s in list(setups or [])[:_screen_display_limit()]]
+                    _SCREEN_CACHE[f"uid:{int(_target_uid)}::{str(display_session or '').upper()}"] = {'ts': float(now_ts), 'body': screen_body, 'kb': screen_kb}
+                except Exception:
+                    pass
         except Exception:
             pass
     else:
@@ -39966,6 +40191,11 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                             _trigger_autotrade_after_email_async(int(uid), str(sess.get("name") or sess_name or ""), list(chosen_list or [])),
                             "autotrade_after_email",
                         )
+                except Exception:
+                    pass
+
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='sent', session=str(sess.get("name") or sess_name or ''), mode='email', details={'eligible': len(chosen_list or []), 'persisted': int(persisted_count or 0), 'setups': len(chosen_list or []), 'picked': [f"{getattr(_s, 'side', '')} {getattr(_s, 'symbol', '')}" for _s in list(chosen_list or [])[:8]]})
                 except Exception:
                     pass
 
