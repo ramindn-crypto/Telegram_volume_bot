@@ -17885,6 +17885,63 @@ def scan_session_name_utc(now_utc: Optional[datetime] = None) -> str:
     return _session_label_utc(now_utc) or "NY"
 
 
+def current_session_name(now_utc: Optional[datetime] = None) -> str:
+    """Current live market session for displays/diagnostics.
+
+    This intentionally does NOT use the scan-session fallback, so the
+    09:00-10:00 Melbourne gap displays as NONE instead of NY.
+    """
+    return current_session_utc(now_utc)
+
+
+def _session_gap_context(now_utc: Optional[datetime] = None) -> dict:
+    """Return live-session truth plus the scan bucket used during the gap."""
+    try:
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+        live_session = str(current_session_utc(now_utc) or 'NONE').upper().strip()
+        scan_bucket = str(scan_session_name_utc(now_utc) or '').upper().strip()
+        return {
+            'live_session': live_session or 'NONE',
+            'scan_session': scan_bucket or (live_session if live_session != 'NONE' else 'NY'),
+            'is_session_gap': live_session == 'NONE',
+        }
+    except Exception:
+        return {'live_session': 'NONE', 'scan_session': 'NY', 'is_session_gap': True}
+
+
+def _email_session_display_label(sess: dict | None = None, fallback: str = '') -> str:
+    """Human label for email diagnostics.
+
+    In sessions_unlimited mode the executable/email lane may scan the NY bucket
+    during the 1-hour no-session gap. Diagnostics must make that explicit so it
+    does not look like NY is actually open.
+    """
+    try:
+        s = dict(sess or {})
+        live_session = str(s.get('live_session') or '').upper().strip()
+        scan_session = str(s.get('scan_session') or s.get('name') or fallback or '').upper().strip()
+        if str(s.get('access_mode') or '').upper() == 'UNLIMITED' and (live_session == 'NONE' or bool(s.get('is_session_gap'))):
+            return f"NONE (gap; fallback_scan_bucket={scan_session or 'NY'})"
+        name = str(s.get('name') or fallback or live_session or '').upper().strip()
+        return name or '-'
+    except Exception:
+        return str(fallback or '-').upper()
+
+
+def _email_no_setups_reason(sess: dict | None, fallback_session: str = '') -> str:
+    try:
+        s = dict(sess or {})
+        live_session = str(s.get('live_session') or '').upper().strip()
+        scan_session = str(s.get('scan_session') or s.get('name') or fallback_session or '').upper().strip()
+        if str(s.get('access_mode') or '').upper() == 'UNLIMITED' and (live_session == 'NONE' or bool(s.get('is_session_gap'))):
+            return f"outside_live_session_gap; fallback_scan_bucket={scan_session or 'NY'}; no_setups_generated_for_session ({scan_session or 'NY'})"
+        display = _email_session_display_label(s, fallback=fallback_session)
+        return f"no_setups_generated_for_session ({display})"
+    except Exception:
+        return f"no_setups_generated_for_session ({fallback_session or '-'})"
+
+
 # Some mobile apps (Gmail/iOS) may copy-paste commands with invisible Unicode markers
 # (LTR/RTL marks, BOM, etc.) before the leading '/'. Telegram then won't treat it as a command.
 # We strip those so users can paste /size directly from email.
@@ -29971,9 +30028,9 @@ def in_session_now(user: dict) -> Optional[dict]:
     # During the 1-hour gap between NY close and ASIA open, fall back to the
     # scan-session heuristic so 24h emailing can still work.
     if int((user or {}).get("sessions_unlimited", 0) or 0) == 1:
-        name = current_session_utc(now_utc)
-        if name == "NONE":
-            name = scan_session_name_utc(now_utc)
+        ctx = _session_gap_context(now_utc)
+        live_name = str(ctx.get("live_session") or "NONE").upper().strip()
+        name = live_name if live_name != "NONE" else str(ctx.get("scan_session") or "NY").upper().strip()
         session_key = f"{now_utc.strftime('%Y-%m-%d')}_{name}_UNLIMITED"
         return {
             "name": str(name or "NY"),
@@ -29982,6 +30039,9 @@ def in_session_now(user: dict) -> Optional[dict]:
             "end_utc": now_utc,
             "now_local": now_local,
             "access_mode": "UNLIMITED",
+            "live_session": live_name or "NONE",
+            "scan_session": str(ctx.get("scan_session") or name or "NY").upper().strip(),
+            "is_session_gap": bool(ctx.get("is_session_gap", live_name == "NONE")),
         }
 
     enabled = user_enabled_sessions(user or {})
@@ -38495,7 +38555,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             sess_name = str(sess.get("name") or "").upper()
-            display_sess = sess_name
+            display_sess = _email_session_display_label(sess, fallback=sess_name)
             setups_all = setups_by_session.get(sess_name, []) or []
 
             # state init must not crash job
@@ -38640,7 +38700,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='empty', session=str(sess_name or ''), mode='email', details={'eligible': 0, 'persisted': persisted_count, 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
-                    "reasons": ([f"no_setups_generated_for_session ({display_sess})"] if not setups_all else ["no_setups_after_filters"]) + [f"top_reasons={top_reasons}"],
+                    "reasons": ([_email_no_setups_reason(sess, fallback_session=sess_name)] if not setups_all else ["no_setups_after_filters"]) + [f"top_reasons={top_reasons}"],
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
                 }
                 continue
@@ -39019,11 +39079,14 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             lines.append("Reasons:\n- " + "\n- ".join(rs))
 
     try:
-        sess_now = str(current_session_name() or '').upper().strip()
-        pipe_build = _latest_setup_pipeline_event(0, stage='build_priority_pool', session=sess_now, mode='email') or {}
+        ctx_now = _session_gap_context(datetime.now(timezone.utc))
+        sess_now = str(ctx_now.get('live_session') or current_session_name() or 'NONE').upper().strip()
+        scan_bucket_now = str(ctx_now.get('scan_session') or scan_session_name_utc(datetime.now(timezone.utc)) or '').upper().strip()
+        pipe_lookup_sess = scan_bucket_now if sess_now == 'NONE' else sess_now
+        pipe_build = _latest_setup_pipeline_event(0, stage='build_priority_pool', session=pipe_lookup_sess, mode='email') or {}
         if not pipe_build:
             pipe_build = _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or {}
-        pipe_exec = _latest_setup_pipeline_event(uid, stage='email_executable_pool', session=sess_now, mode='email') or {}
+        pipe_exec = _latest_setup_pipeline_event(uid, stage='email_executable_pool', session=pipe_lookup_sess, mode='email') or {}
         if not pipe_exec:
             pipe_exec = _latest_setup_pipeline_event(uid, stage='email_executable_pool', mode='email') or {}
         if pipe_build or pipe_exec:
@@ -39073,7 +39136,11 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return ' | '.join(parts)
             lines.append("")
             lines.append("🛠️ Setup Email Pipeline")
-            lines.append(f"Current session: {sess_now or '-'}")
+            if sess_now == 'NONE':
+                lines.append(f"Current session: NONE (outside live session window / gap)")
+                lines.append(f"Fallback scan bucket: {scan_bucket_now or '-'}")
+            else:
+                lines.append(f"Current session: {sess_now or '-'}")
             lines.append(f"Configured build timeout: {float(EMAIL_BUILD_POOL_TIMEOUT_SEC):.1f}s")
             if pipe_build:
                 lines.append("Build pool: " + _pipe_summary(pipe_build))
