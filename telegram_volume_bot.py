@@ -11424,6 +11424,16 @@ if EMAIL_SETUP_SCAN_PROFILE not in SCAN_PROFILES:
     EMAIL_SETUP_SCAN_PROFILE = "aggressive"
 BIGMOVE_SIGNAL_MAX_SCAN = int(os.environ.get("BIGMOVE_SIGNAL_MAX_SCAN", "36") or 36)
 BIGMOVE_SIGNAL_MAX_ITEMS = int(os.environ.get("BIGMOVE_SIGNAL_MAX_ITEMS", "8") or 8)
+# Production Big-Move runtime guards. Big-Move uses short-horizon OHLCV
+# only as a fallback when ticker payloads do not expose 15m/1h/4h changes.
+# Keep the fallback intentionally bounded so one alert cycle cannot spend
+# 35s+ on cold candles or create Bybit rate-limit storms.
+BIGMOVE_CANDIDATE_SCAN_MULT = int(os.environ.get("BIGMOVE_CANDIDATE_SCAN_MULT", "2") or 2)
+BIGMOVE_OHLCV_FALLBACK_MAX_SYMBOLS = int(os.environ.get("BIGMOVE_OHLCV_FALLBACK_MAX_SYMBOLS", "3") or 3)
+BIGMOVE_CONFIRM_MAX_CANDIDATES = int(os.environ.get("BIGMOVE_CONFIRM_MAX_CANDIDATES", "6") or 6)
+BIGMOVE_CONFIRM_MAX_PENDING = int(os.environ.get("BIGMOVE_CONFIRM_MAX_PENDING", "12") or 12)
+BIGMOVE_CONFIRM_COLD_FETCH_MAX = int(os.environ.get("BIGMOVE_CONFIRM_COLD_FETCH_MAX", "3") or 3)
+BIGMOVE_LAST_CLOSED_15M_CACHE_TTL_SEC = int(os.environ.get("BIGMOVE_LAST_CLOSED_15M_CACHE_TTL_SEC", "90") or 90)
 
 def bigmove_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
     try:
@@ -11584,11 +11594,13 @@ def _bigmove_prune_pending(uid: int | None = None) -> None:
         pass
 
 
-def _bigmove_last_closed_15m_candle(symbol: str) -> dict | None:
+def _bigmove_last_closed_15m_candle(symbol: str, allow_cold: bool | None = None) -> dict | None:
     """Return the latest fully closed 15m candle for a Bybit/ccxt symbol.
 
     Bybit/CCXT may include the currently forming candle as the last row, so we choose
     the most recent candle whose open timestamp is at least 15 minutes behind now.
+    The result is cached briefly because Big-Move confirmation may check the same
+    staged symbols across consecutive email ticks and /email_decision calls.
     """
     try:
         sym = str(symbol or '').strip()
@@ -11597,7 +11609,17 @@ def _bigmove_last_closed_15m_candle(symbol: str) -> dict | None:
         # Accept both base (TAO) and market symbol (TAO/USDT:USDT).
         if '/' not in sym and ':' not in sym:
             sym = f"{sym}/USDT:USDT"
-        rows = _ohlcv_cached_or_optional_fetch(sym, "15m", 4, allow_cold=bool(BIGMOVE_ALLOW_COLD_CONFIRM_FETCH))
+        cache_key = f"bigmove:last_closed_15m:{sym}"
+        try:
+            if cache_valid(cache_key, int(BIGMOVE_LAST_CLOSED_15M_CACHE_TTL_SEC or 90)):
+                cached = cache_get(cache_key)
+                if isinstance(cached, dict) and cached.get('ts'):
+                    return dict(cached)
+        except Exception:
+            pass
+        if allow_cold is None:
+            allow_cold = bool(BIGMOVE_ALLOW_COLD_CONFIRM_FETCH)
+        rows = _ohlcv_cached_or_optional_fetch(sym, "15m", 4, allow_cold=bool(allow_cold))
         if not rows:
             return None
         now_ms = int(time.time() * 1000)
@@ -11617,7 +11639,12 @@ def _bigmove_last_closed_15m_candle(symbol: str) -> dict | None:
         r = closed[-1]
         ts = int(float(r[0])); o = float(r[1]); c = float(r[4])
         pct = ((c - o) / o * 100.0) if o else 0.0
-        return {"ts": float(ts / 1000.0), "open": o, "close": c, "pct": float(pct)}
+        out = {"ts": float(ts / 1000.0), "open": o, "close": c, "pct": float(pct)}
+        try:
+            cache_set(cache_key, dict(out))
+        except Exception:
+            pass
+        return out
     except Exception:
         return None
 
@@ -11631,12 +11658,30 @@ def _bigmove_confirm_next_15m_for_user(uid: int, candidates: list, p15: float, p
     created. This prevents missing alerts solely because the confirmation candle changed
     the rolling 15m/1h/4h metrics.
     """
-    stats = {"pending_new": 0, "pending_wait": 0, "confirmed": 0, "cancelled": 0, "no_candle": 0, "cooldown": 0, "pending_checked": 0}
+    stats = {
+        "pending_new": 0, "pending_wait": 0, "confirmed": 0, "cancelled": 0,
+        "no_candle": 0, "cooldown": 0, "pending_checked": 0,
+        "confirm_limited": 0, "cold_confirm_budget": int(BIGMOVE_CONFIRM_COLD_FETCH_MAX or 0),
+    }
     if not BIGMOVE_CONFIRM_NEXT_15M_ENABLED:
         return list(candidates or []), stats
     _bigmove_prune_pending(int(uid))
     confirmed = []
     seen: set[tuple[str, str]] = set()
+    cold_confirm_used = 0
+
+    def _allow_confirm_cold_fetch() -> bool:
+        nonlocal cold_confirm_used
+        try:
+            if not bool(BIGMOVE_ALLOW_COLD_CONFIRM_FETCH):
+                return False
+            max_cold = max(0, int(BIGMOVE_CONFIRM_COLD_FETCH_MAX or 0))
+            if cold_confirm_used >= max_cold:
+                return False
+            cold_confirm_used += 1
+            return True
+        except Exception:
+            return False
 
     def _confirm_pending_row(row: dict, current_candidate: dict | None = None) -> None:
         try:
@@ -11647,7 +11692,7 @@ def _bigmove_confirm_next_15m_for_user(uid: int, candidates: list, p15: float, p
             if bigmove_recently_emailed(int(uid), sym, direction):
                 stats['cooldown'] += 1
                 return
-            candle = _bigmove_last_closed_15m_candle(sym)
+            candle = _bigmove_last_closed_15m_candle(sym, allow_cold=_allow_confirm_cold_fetch())
             if not candle:
                 stats['no_candle'] += 1
                 return
@@ -11677,8 +11722,17 @@ def _bigmove_confirm_next_15m_for_user(uid: int, candidates: list, p15: float, p
         except Exception:
             return
 
-    # Stage or confirm current raw candidates.
-    for c in list(candidates or []):
+    # Stage or confirm current raw candidates. Keep this bounded so a single
+    # user alert cannot check dozens of candles and time out the email loop.
+    try:
+        _max_cur = max(1, int(BIGMOVE_CONFIRM_MAX_CANDIDATES or 6))
+    except Exception:
+        _max_cur = 6
+    _current_candidates = list(candidates or [])
+    if len(_current_candidates) > _max_cur:
+        stats['confirm_limited'] += int(len(_current_candidates) - _max_cur)
+        _current_candidates = _current_candidates[:_max_cur]
+    for c in _current_candidates:
         try:
             sym = str(c.get('symbol') or '').upper().strip()
             direction = str(c.get('direction') or '').upper().strip()
@@ -11688,7 +11742,7 @@ def _bigmove_confirm_next_15m_for_user(uid: int, candidates: list, p15: float, p
             if bigmove_recently_emailed(int(uid), sym, direction):
                 stats['cooldown'] += 1
                 continue
-            candle = _bigmove_last_closed_15m_candle(sym)
+            candle = _bigmove_last_closed_15m_candle(sym, allow_cold=_allow_confirm_cold_fetch())
             if not candle:
                 stats['no_candle'] += 1
                 continue
@@ -11704,7 +11758,15 @@ def _bigmove_confirm_next_15m_for_user(uid: int, candidates: list, p15: float, p
 
     # Confirm already-staged symbols even if they are no longer in this scan's raw candidate list.
     try:
-        for row in _bigmove_pending_list(int(uid)):
+        _pending_rows = _bigmove_pending_list(int(uid))
+        try:
+            _max_pending = max(0, int(BIGMOVE_CONFIRM_MAX_PENDING or 12))
+        except Exception:
+            _max_pending = 12
+        if _max_pending > 0 and len(_pending_rows) > _max_pending:
+            stats['confirm_limited'] += int(len(_pending_rows) - _max_pending)
+            _pending_rows = _pending_rows[:_max_pending]
+        for row in _pending_rows:
             try:
                 sym = str((row or {}).get('symbol') or '').upper().strip()
                 direction = str((row or {}).get('direction') or '').upper().strip()
@@ -11904,7 +11966,11 @@ def _bigmove_candidates(best_fut: dict, p15: float, p1: float, p4: float, min_vo
                 pct24 = 0.0
             ranked_items.append((pct24, vol0, str(sym0 or "").upper(), mv0))
         ranked_items.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        scan_limit = max(int(max_items or 12) * 3, 6)
+        try:
+            scan_mult = max(1, int(BIGMOVE_CANDIDATE_SCAN_MULT or 2))
+        except Exception:
+            scan_mult = 2
+        scan_limit = max(int(max_items or 12) * scan_mult, 6)
         try:
             scan_limit = min(int(BIGMOVE_SIGNAL_MAX_SCAN), max(scan_limit, int(max_items or 12)))
         except Exception:
@@ -11912,6 +11978,12 @@ def _bigmove_candidates(best_fut: dict, p15: float, p1: float, p4: float, min_vo
         items_iter = [(sym0, mv0) for _pct24, _vol0, sym0, mv0 in ranked_items[:scan_limit]]
     except Exception:
         items_iter = list((best_fut or {}).items())[:max(6, int(max_items or 12) * 3)]
+
+    fallback_symbols_checked = 0
+    try:
+        fallback_symbol_budget = max(0, int(BIGMOVE_OHLCV_FALLBACK_MAX_SYMBOLS or 0))
+    except Exception:
+        fallback_symbol_budget = 0
 
     for sym, mv in items_iter:
         try:
@@ -11923,11 +11995,21 @@ def _bigmove_candidates(best_fut: dict, p15: float, p1: float, p4: float, min_vo
             # ✅ FIX: correct 24H USD volume (MarketVol does NOT have fut_vol_usd)
             vol = float(usd_notional(mv) or 0.0)
 
-            # If still missing, compute from candles.
-            if getattr(mv, "symbol", None):
+            # If still missing, compute from candles for only a tiny ranked subset.
+            # Without this cap, a cold Render instance can spend the whole 35s+ payload
+            # timeout checking candles for every high-volume symbol.
+            need_fallback = (abs(ch15) < 1e-9) or (abs(ch4) < 1e-9) or (abs(ch1) < 1e-9)
+            allow_symbol_fallback = bool(
+                need_fallback
+                and getattr(mv, "symbol", None)
+                and bool(BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK)
+                and fallback_symbols_checked < fallback_symbol_budget
+            )
+            if allow_symbol_fallback:
+                fallback_symbols_checked += 1
                 try:
                     if abs(ch15) < 1e-9:
-                        c15 = _ohlcv_cached_or_optional_fetch(mv.symbol, "15m", 4, allow_cold=bool(BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK))
+                        c15 = _ohlcv_cached_or_optional_fetch(mv.symbol, "15m", 4, allow_cold=True)
                         if c15 and len(c15) >= 2:
                             c15_last = float(c15[-1][4])
                             c15_prev = float(c15[-2][4])
@@ -11936,7 +12018,7 @@ def _bigmove_candidates(best_fut: dict, p15: float, p1: float, p4: float, min_vo
                     pass
                 try:
                     if abs(ch4) < 1e-9 or abs(ch1) < 1e-9:
-                        c1 = _ohlcv_cached_or_optional_fetch(mv.symbol, "1h", 6, allow_cold=bool(BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK))
+                        c1 = _ohlcv_cached_or_optional_fetch(mv.symbol, "1h", 6, allow_cold=True)
                         if c1 and len(c1) >= 2:
                             closes_1h = [float(x[4]) for x in c1]
                             c_last = closes_1h[-1]
@@ -37839,7 +37921,7 @@ ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN
 ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.70") or 0.70)
 ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT = float(os.environ.get("ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT", "0.45") or 0.45)
 ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT = float(os.environ.get("ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT", "0.55") or 0.55)
-BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "35") or 35)
+BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "45") or 45)
 EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "600"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
@@ -38226,7 +38308,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             rebuilds. It still respects confirmation, volume, cooldown, and SMTP status.
             """
             try:
-                payload_timeout = max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 35))
+                payload_timeout = max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 45))
                 try:
                     payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, timeout=payload_timeout)
                 except asyncio.TimeoutError:
@@ -38887,9 +38969,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 continue
             try:
                 try:
-                    payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, timeout=max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 35)))
+                    payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, timeout=max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 45)))
                 except asyncio.TimeoutError:
-                    payload = {"status": "SKIP", "reasons": [f"bigmove_payload_timeout>{max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 35))}s"]}
+                    payload = {"status": "SKIP", "reasons": [f"bigmove_payload_timeout>{max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 45))}s"]}
                 pstatus = str((payload or {}).get('status') or '').upper().strip()
                 if pstatus != 'READY':
                     _LAST_BIGMOVE_DECISION[uid] = {
@@ -39063,7 +39145,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines.append(f"Status: {'ON' if bigm_on else 'OFF'}")
     lines.append(f"Thresholds: |15m| ≥ {bigm_p15:g}% AND |1H| ≥ {bigm_p1:g}% AND |4H| ≥ {bigm_p4:g}% (same direction only)")
     lines.append(f"Min Vol (24H): {bigm_min_vol/1e6:.1f}M")
-    lines.append(f"Payload timeout: {int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 35)}s")
+    lines.append(f"Payload timeout: {int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 45)}s")
     if bigm_updated_ts > 0:
         lines.append("Updated: " + _fmt_when_local(bigm_updated_ts))
     if bigm_updated_reason:
