@@ -1504,8 +1504,8 @@ PUBLIC_DIAGNOSTICS_MODE = os.environ.get("PUBLIC_DIAGNOSTICS_MODE", "off").strip
 LEADERS_N = 10
 
 # ✅ More setups on /screen (UX), while email stays strict
-SETUPS_N = 8
-EMAIL_SETUPS_N = 4
+SETUPS_N = int(os.environ.get("SETUPS_N", "5") or 5)
+EMAIL_SETUPS_N = int(os.environ.get("EMAIL_SETUPS_N", "4") or 4)
 
 # ✅ Global setup quality floor (Premium & Selective)
 MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "72"))
@@ -7413,11 +7413,11 @@ AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and 
 AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "6") or 6)
 # Keep this job intentionally less frequent and very short; it consumes the DB executable lane.
 # Heavy pool refreshes belong to /screen/email lanes, otherwise Render misses scheduler ticks.
-AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "300") or 300)
-AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "10") or 10)
+AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "60") or 60)
+AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "35") or 35)
 # Keep autotrade execution lightweight: consume the executable DB lane only by default.
 # Full pool refresh is owned by /screen/email scan lanes to avoid scheduler starvation.
-AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", False)
+AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", True)
 AUTOTRADE_GUARDIAN_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_TIMEOUT_SEC", "15") or 15)
 AUTOTRADE_GUARDIAN_INTERVAL_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_INTERVAL_SEC", "150") or 150)
 AUTOTRADE_GUARDIAN_MIN_GAP_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_MIN_GAP_SEC", "20") or 20)
@@ -37202,6 +37202,40 @@ def _schedule_screen_cache_refresh(uid: int, session: str | None = None) -> None
 
 
 
+def _screen_plain_cleanup(txt: str) -> str:
+    """Return Telegram-safe plain text for /screen.
+
+    The old /screen body was Markdown-heavy and TradingView URLs/underscores could
+    make Telegram reject Markdown, which then displayed raw * and ` characters.
+    /screen is now intentionally plain text, with the TradingView buttons kept as
+    inline keyboard actions.
+    """
+    try:
+        import re as _re
+        t = str(txt or '')
+        out = []
+        for line in t.splitlines():
+            ls = line.strip()
+            if ls == '```':
+                continue
+            # Remove Telegram Markdown markers, but keep normal text and URLs.
+            line = line.replace('`', '')
+            line = line.replace('*', '')
+            # Remove italics markers only when they wrap the whole line.
+            st = line.strip()
+            if len(st) >= 2 and st.startswith('_') and st.endswith('_'):
+                line = line.replace('_', '')
+            # Compact excessive chart URLs in setup cards; the inline buttons are the main chart action.
+            line = _re.sub(r'^Chart:\s*(https://www\.tradingview\.com/chart/\?symbol=BYBIT:[A-Z0-9]+USDT\.P)\s*$', r'Chart: \1', line)
+            out.append(line.rstrip())
+        # Collapse 3+ blank lines to 2.
+        t = '\n'.join(out)
+        t = _re.sub(r'\n{3,}', '\n\n', t).strip()
+        return t
+    except Exception:
+        return str(txt or '')
+
+
 def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     """Heavy /screen builder (runs in a worker thread).
 
@@ -37311,6 +37345,12 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     if not setups and _exec_ready:
         setups = list(_exec_ready[:max(1, int(SETUPS_N))])
 
+    # Keep /screen readable: show max 5 top trade cards. The executable queue can
+    # still hold more for email/autotrade; /screen is an action dashboard, not a dump.
+    try:
+        setups = list(setups or [])[:min(5, max(1, int(SETUPS_N)))]
+    except Exception:
+        setups = list(setups or [])[:5]
 
     # For UX: do not show the same symbol in Momentum Watch if it's already a Top Setup
     try:
@@ -37580,7 +37620,11 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
     kb = []
     try:
-        kb = [(s.symbol, s.setup_id) for s in (setups or [])]
+        body = _screen_plain_cleanup(body)
+    except Exception:
+        pass
+    try:
+        kb = [(s.symbol, s.setup_id) for s in (setups or [])][:min(5, max(1, int(SETUPS_N)))]
     except Exception:
         kb = []
     return body, kb, list(setups or [])
@@ -37802,8 +37846,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             await send_long_message(
                 update,
-                (header + "\n" + str(cache_entry.get('body') or '')).strip(),
-                parse_mode=ParseMode.MARKDOWN,
+                _screen_plain_cleanup((header + "\n" + str(cache_entry.get('body') or '')).strip()),
+                parse_mode=None,
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
             )
@@ -37827,8 +37871,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await send_long_message(
                     update,
-                    (header + "\n" + body).strip(),
-                    parse_mode=ParseMode.MARKDOWN,
+                    _screen_plain_cleanup((header + "\n" + body).strip()),
+                    parse_mode=None,
                     disable_web_page_preview=True,
                 )
                 return
@@ -37875,8 +37919,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]
                 await send_long_message(
                     update,
-                    (header + "\n" + str(cache_entry.get('body') or '')).strip(),
-                    parse_mode=ParseMode.MARKDOWN,
+                    _screen_plain_cleanup((header + "\n" + str(cache_entry.get('body') or '')).strip()),
+                    parse_mode=None,
                     disable_web_page_preview=True,
                     reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
                 )
@@ -37917,8 +37961,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             await send_long_message(
                 update,
-                (header + "\n" + str(cache_entry.get("body") or "")).strip(),
-                parse_mode=ParseMode.MARKDOWN,
+                _screen_plain_cleanup((header + "\n" + str(cache_entry.get("body") or "")).strip()),
+                parse_mode=None,
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
             )
@@ -37957,7 +38001,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cached_body = str(cache_entry.get("body") or "")
             cached_kb = list(cache_entry.get("kb") or [])
 
-            msg = (header + "\n" + cached_body).strip()
+            msg = _screen_plain_cleanup((header + "\n" + cached_body).strip())
 
             keyboard = [
                 [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
@@ -37972,7 +38016,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_long_message(
                 update,
                 msg,
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=None,
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
             )
@@ -37987,7 +38031,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cached_body = str(cache_entry.get("body") or "")
                 cached_kb = list(cache_entry.get("kb") or [])
 
-                msg = (header + "\n" + cached_body).strip()
+                msg = _screen_plain_cleanup((header + "\n" + cached_body).strip())
                 keyboard = [
                     [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
                     for (sym, sid) in (cached_kb or [])
@@ -38001,7 +38045,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_long_message(
                     update,
                     msg,
-                    parse_mode=ParseMode.MARKDOWN,
+                    parse_mode=None,
                     disable_web_page_preview=True,
                     reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
                 )
@@ -38032,7 +38076,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Send final
         cache_entry = _SCREEN_CACHE.get(cache_key) or {}
-        msg = (header + "\n" + str(cache_entry.get("body") or "")).strip()
+        msg = _screen_plain_cleanup((header + "\n" + str(cache_entry.get("body") or "")).strip())
         keyboard = [
             [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
             for (sym, sid) in (cache_entry.get("kb") or [])
@@ -38046,7 +38090,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_message(
             update,
             msg,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=None,
             disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
         )
@@ -39761,9 +39805,27 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
 
-                # AutoTrade is executed only by the dedicated autotrade_job.
-                # This avoids duplicate live orders from two separate execution paths.
-                autotrade_note = "queued_for_autotrade_job"
+                # AutoTrade: mirror the emailed setups into the owner executable lane and
+                # trigger one immediate execution attempt. The helper uses the same lock and
+                # _autotrade_place_trade path as the scheduled autotrade_job, so risk/duplicate
+                # controls remain centralized.
+                autotrade_note = "queued_for_immediate_autotrade"
+                try:
+                    owner_uid_for_at = int(AUTOTRADE_OWNER_UID or 0)
+                    if owner_uid_for_at > 0 and _autotrade_ready() and (int(uid) == owner_uid_for_at or is_admin_user(int(uid))):
+                        _LAST_AUTOTRADE_DECISION[owner_uid_for_at] = {
+                            "status": "QUEUED",
+                            "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                            "reason": "email_sent_waiting_for_immediate_autotrade",
+                            "session": str(sess.get("name") or sess_name or ""),
+                            "mode": str(_autotrade_runtime_mode()).lower(),
+                        }
+                        _safe_create_task(
+                            _trigger_autotrade_after_email_async(int(uid), str(sess.get("name") or sess_name or ""), list(chosen_list or [])),
+                            "autotrade_after_email",
+                        )
+                except Exception:
+                    pass
 
                 _tmp_dec = {
                     "status": "SENT",
@@ -41421,6 +41483,155 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("autotrade_job crashed: %s", e)
 
 
+async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chosen_list: list):
+    """Run one immediate autotrade attempt after a setup email is sent.
+
+    The previous build waited only for the scheduled autotrade_job (default 5 min),
+    so /autotrade_last could show "No attempts recorded yet" right after an email.
+    This helper uses the same AUTOTRADE_EXEC_LOCK and _autotrade_place_trade path, so
+    it does not create a second execution engine or bypass risk controls.
+    """
+    try:
+        owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+        caller_uid = int(uid or 0)
+        sess = str(session_name or '').upper().strip()
+        now_utc = datetime.now(timezone.utc)
+        if owner_uid <= 0 or sess not in {'ASIA', 'LON', 'NY'}:
+            return
+        if not _autotrade_ready():
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'SKIP',
+                'when': now_utc.isoformat(timespec='seconds'),
+                'reason': 'autotrade_not_ready_or_disabled',
+                'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(),
+            }
+            return
+        # Only the owner or an admin signal feed may trigger owner autotrade.
+        try:
+            if caller_uid != owner_uid and not is_admin_user(caller_uid):
+                return
+        except Exception:
+            if caller_uid != owner_uid:
+                return
+        if not _autotrade_allowed_session(sess):
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
+                'reason': f'session_not_allowed ({sess})', 'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(),
+            }
+            return
+        try:
+            user_owner = get_user(owner_uid) or {}
+            if not trade_window_allows_now(user_owner):
+                _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                    'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
+                    'reason': 'trade_window_block', 'session': sess,
+                    'mode': str(_autotrade_runtime_mode()).lower(),
+                }
+                return
+        except Exception:
+            pass
+        if AUTOTRADE_EXEC_LOCK.locked():
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
+                'reason': 'autotrade_exec_lock_busy_after_email', 'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(),
+            }
+            return
+        async with AUTOTRADE_EXEC_LOCK:
+            # Force selected emailed setups into the owner's executable lane and clear stale empty cache.
+            try:
+                if chosen_list:
+                    for _s in list(chosen_list or []):
+                        try:
+                            setattr(_s, 'source_kind', 'executable_setups')
+                            setattr(_s, 'source_session', sess)
+                            if not float(getattr(_s, 'created_ts', 0.0) or 0.0):
+                                setattr(_s, 'created_ts', time.time())
+                        except Exception:
+                            pass
+                    await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'executable_setups', 'email_autotrade_immediate', timeout=5)
+                    try:
+                        cache_set(f"autotrade_db_setups:{owner_uid}:{sess}:12:5", [])
+                    except Exception:
+                        pass
+            except Exception as e:
+                try:
+                    db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email_persist', status='error', session=sess, mode='autotrade', details={'error': f'{type(e).__name__}: {e}'})
+                except Exception:
+                    pass
+            try:
+                db_setups = await to_thread_autotrade(_autotrade_select_db_setups_cached, owner_uid, sess, 12, 5, 1, True, timeout=6)
+            except Exception:
+                db_setups = []
+            if not db_setups:
+                # Last fallback: use the just-emailed setup objects if structurally executable.
+                db_setups = []
+                for _s in list(chosen_list or []):
+                    try:
+                        ok_s, _why_s = is_executable_setup_eligible(_s, session_name=sess)
+                        if ok_s:
+                            db_setups.append(_s)
+                    except Exception:
+                        continue
+            attempted = 0
+            attempts_meta = []
+            ok = False
+            reason = 'no_setups_after_email'
+            for cand in list(db_setups or [])[:5]:
+                attempted += 1
+                try:
+                    attempts_meta.append({
+                        'setup_id': str(getattr(cand, 'setup_id', '') or getattr(cand, 'id', '') or ''),
+                        'symbol': str(getattr(cand, 'symbol', '') or ''),
+                        'side': str(getattr(cand, 'side', '') or ''),
+                        'source_kind': str(getattr(cand, 'source_kind', '') or ''),
+                    })
+                except Exception:
+                    pass
+                try:
+                    ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=min(35, max(10, int(AUTOTRADE_JOB_TIMEOUT_SEC or 25))))
+                except asyncio.TimeoutError:
+                    ok, reason = False, 'autotrade_place_trade_timeout_after_email'
+                except Exception as e:
+                    ok, reason = False, f'{type(e).__name__}: {e}'
+                if ok:
+                    break
+                if reason not in {
+                    'blocked_duplicate_open_position', 'blocked_manual_same_symbol_position',
+                    'blocked_duplicate_pending_order', 'blocked_duplicate_inflight_lock',
+                    'blocked_by_cooldown', 'blocked_by_recent_symbol_trade',
+                    'blocked_by_existing_local_trade_state', 'setup_expired',
+                }:
+                    break
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'PLACED' if ok else 'SKIP',
+                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                'reason': '' if ok else str(reason or 'no_tradable_setup'),
+                'attempted': int(attempted),
+                'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(),
+                'attempted_candidates': attempts_meta,
+                'latest_candidate': attempts_meta[0] if attempts_meta else {},
+                'trigger': 'email_sent_immediate',
+            }
+            try:
+                db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email', status='placed' if ok else 'skip', session=sess, mode='autotrade', details={'reason': reason, 'attempted': attempted, 'candidates': attempts_meta[:5]})
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+            if owner_uid:
+                _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                    'status': 'ERROR', 'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    'reason': f'{type(e).__name__}: {e}', 'trigger': 'email_sent_immediate',
+                }
+        except Exception:
+            pass
+
+
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     """Background email engine (trade setups + big-move alerts).
 
@@ -41718,7 +41929,7 @@ def main():
         # AutoTrade loop (owner-only)
         app.job_queue.run_repeating(
             autotrade_job,
-            interval=max(int(AUTOTRADE_JOB_INTERVAL_SEC or 300), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 10) + 45),
+            interval=max(int(AUTOTRADE_JOB_INTERVAL_SEC or 60), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 35) + 10),
             first=120,
             name="autotrade_job",
             job_kwargs={
