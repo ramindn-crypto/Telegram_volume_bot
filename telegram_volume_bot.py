@@ -17492,8 +17492,8 @@ OHLCV_PAGED_CACHE_TTL_SEC = float(os.getenv("OHLCV_PAGED_CACHE_TTL_SEC", "120") 
 # Cold-start / cold-cache protection. Keep very short so Render restarts can rebuild quickly.
 PROCESS_START_TS = float(time.time())
 OHLCV_BOOT_GRACE_SEC = float(os.getenv("OHLCV_BOOT_GRACE_SEC", "5") or 5)
-OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "40") or 40)
-OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "0.35") or 0.35)
+OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "90") or 90)
+OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "0.15") or 0.15)
 _OHLCV_RATE_LIMIT_HITS_TOTAL = 0
 _OHLCV_STALE_USAGE_TOTAL = 0
 _SCAN_TF_PHASE = 0
@@ -17657,8 +17657,19 @@ def _ohlcv_cold_fetch_permitted(symbol: str, timeframe: str, limit: int) -> bool
                 _OHLCV_COLD_FETCH_COUNT = 0
             if _OHLCV_COLD_FETCH_COUNT >= burst:
                 return False
-            if min_gap > 0 and (now_ts - float(_OHLCV_COLD_FETCH_LAST_TS or 0.0)) < min_gap:
-                return False
+            # Pace cold fetches instead of instantly denying them. The previous
+            # deny-on-min-gap behavior made a full scan mark almost every symbol as
+            # ohlcv_missing_or_insufficient because 1h/15m/4h calls happen back-to-back.
+            # A very small sleep keeps API pressure controlled while allowing the
+            # background scan to actually hydrate enough candles to build setups.
+            if min_gap > 0:
+                elapsed = now_ts - float(_OHLCV_COLD_FETCH_LAST_TS or 0.0)
+                if elapsed < min_gap:
+                    try:
+                        time.sleep(min(max(min_gap - elapsed, 0.0), 0.25))
+                    except Exception:
+                        pass
+                    now_ts = float(time.time())
             _OHLCV_COLD_FETCH_COUNT += 1
             _OHLCV_COLD_FETCH_LAST_TS = now_ts
             return True
@@ -27419,6 +27430,31 @@ def is_top_setup_eligible(
         active_profile = str((cfg_live or {}).get('goal_profile_active_profile', '') or '').upper().strip()
         reach_mode = bool(_cfg_bool((cfg_live or {}).get('goal_profile_reach_mode', False), False) or ('REACH' in active_profile) or active_profile.endswith('_SCOUT'))
 
+        # Controlled drought recovery: when the normal OHLCV engines are starved by cold
+        # cache/rate limits, fallback setups are created from the current live ticker
+        # snapshot. Let them pass this shared pre-gate if they still have valid price
+        # order, RR, confidence and liquidity. The stricter executable gate below also
+        # re-checks these before email/autotrade consumption.
+        try:
+            if bool(getattr(s, 'recovery_fallback', False)):
+                rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
+                fut_vol = float(getattr(s, 'fut_vol_usd', 0.0) or 0.0)
+                conf = int(getattr(s, 'conf', 0) or 0)
+                ch24_abs = abs(float(getattr(s, 'ch24', 0.0) or 0.0))
+                vol_floor = max(5_000_000.0, float(MIN_FUT_VOL_USD) * 0.55)
+                if sess == 'NY':
+                    vol_floor = max(vol_floor, 8_000_000.0)
+                if src == 'email':
+                    vol_floor = max(vol_floor, 10_000_000.0)
+                if engine == 'A' and conf >= 76 and rr_final >= 1.25 and fut_vol >= vol_floor and ch24_abs >= 2.0:
+                    try:
+                        setattr(s, 'quality_score', float(max(float(getattr(s, 'quality_score', score) or score), 68.0)))
+                    except Exception:
+                        pass
+                    return (True, 'ok')
+        except Exception:
+            pass
+
         if src == "screen":
             min_score = float(QUALITY_SCORE_MIN_SCREEN)
         elif src == "exec":
@@ -33975,7 +34011,21 @@ def _best_fut_vol_usd(best_fut: dict, symbol: str) -> float:
         return 0.0
 
     try:
-        return float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+        v = float(getattr(mv, "fut_vol_usd", 0.0) or 0.0)
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    try:
+        return float(usd_notional(mv) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _fut_vol_usd_from_best(best_fut: dict, symbol: str) -> float:
+    """Backward-compatible alias used by recovery setup generation."""
+    try:
+        return float(_best_fut_vol_usd(best_fut, symbol) or 0.0)
     except Exception:
         return 0.0
 
@@ -34068,7 +34118,7 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
         ch4 = 0.0
         ch15 = 0.0
         try:
-            c1 = fetch_ohlcv(market_symbol, "1h", limit=max(ATR_PERIOD + 6, 35))
+            c1 = _ohlcv_best_effort_cached(market_symbol, "1h", max(ATR_PERIOD + 6, 35))
             if c1 and len(c1) >= 5:
                 closes_1h = [float(x[4]) for x in c1]
                 c_last = closes_1h[-1]
@@ -34085,7 +34135,7 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
         if abs(ch1) < 1e-9:
             ch1 = sign * float(clamp(pct24_abs * 0.035, 0.14 if sess != 'NY' else 0.09, 0.52))
         try:
-            c15 = fetch_ohlcv(market_symbol, "15m", limit=20)
+            c15 = _ohlcv_best_effort_cached(market_symbol, "15m", 20)
             if c15 and len(c15) >= 2:
                 c15_last = float(c15[-1][4])
                 c15_prev = float(c15[-2][4])
@@ -36625,6 +36675,17 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, source=gate_source, session_name=session_name)[0]]
     except Exception:
         pass
+
+    # If the normal engines produced candidates but the shared gate filtered all of them,
+    # still activate the current-ticker recovery lane. Previously the recovery lane only
+    # ran when the pre-gate list was empty, so one weak/invalid normal candidate could
+    # prevent any fallback setup from reaching /screen, email, or autotrade.
+    if not ordered and mode in {"screen", "exec", "email"}:
+        try:
+            fb = _fallback_setups_from_universe(best_fut, leaders, losers, market_bases, session_name, max_items=max(4, n_target))
+            ordered = [s for s in (fb or []) if is_top_setup_eligible(s, source=gate_source, session_name=session_name)[0]]
+        except Exception:
+            ordered = []
 # -----------------------------------------------------
     # NEW: Spike Reversal candidates (15M+ Vol) — for /screen only
     # -----------------------------------------------------
